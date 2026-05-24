@@ -1,11 +1,11 @@
-# Dynamo + ModelExpress v2 (mid-training weight refit) — infra + dev workflow
+# Dynamo + ModelExpress v2 (mid-training weight refit) — infra
 
 This directory holds the pieces needed to run Dynamo as nemo-rl's generation
 backend **with mid-training weight refit via ModelExpress v2 NIXL RDMA**. It's
 the cross-node analog of vLLM's `update_weights_from_collective` — same
 trainer-side `stream_weights_via_mx` (already on `dynamo-k8s-integration` via
-the cherry-pick of `d58dca07`), different receiver: each Dynamo `VllmDecodeWorker`
-pod's vLLM process runs `MxRefitWorkerExtension.update_weights_via_mx`,
+the cherry-pick of `d58dca07`), different receiver: each Dynamo
+`VllmDecodeWorker` pod runs `MxRefitWorkerExtension.update_weights_via_mx`,
 registered as `parallel_config.worker_extension_cls` on the dynamo side.
 
 ## Layout
@@ -14,72 +14,69 @@ registered as `parallel_config.worker_extension_cls` on the dynamo side.
 infra/nrl_k8s/dynamo_mx/
 ├── README.md                 (this file)
 ├── modelexpress-server.yaml  Kubernetes Deployment + Service for the MX server
-├── dev_sync.sh               rsync local dynamo checkout to Lustre for hot-reload
-└── Dockerfile                (TODO) overlay image adding modelexpress + NIXL on
-                              top of the base dynamo worker image
+├── Dockerfile.nemorl         trainer image overlay: nixl + modelexpress + protobuf-6 + wandb 0.26+
+├── Dockerfile                (placeholder) dynamo worker image overlay
+└── DEBUGGING_POSTMORTEM.md   chronology of the bring-up findings (cluster bugs,
+                              version-mismatch failure modes, etc.)
 ```
 
-## How the no-rebuild dev loop works
+## Architecture
 
-`dynamo` is a [PEP 420 namespace
-package](https://peps.python.org/pep-0420/) — there is no `dynamo/__init__.py`
-at the top level. Two distributions contribute to the namespace:
+The trainer drives each refit cycle synchronously over HTTP:
 
-  * `ai-dynamo-runtime` (the Rust pyo3 binding) installs `dynamo._core`,
-    `dynamo.runtime`, `dynamo.llm`, etc. into site-packages.
-  * `ai-dynamo` (the Python components) installs `dynamo.vllm`,
-    `dynamo.frontend`, `dynamo.planner`, etc. into the same `dynamo/` tree.
+1. `GET <dgd-frontend>:8000/health` → enumerate live `VllmDecodeWorker`
+   instances from the `instances[*]` array; pair each pod IP with
+   `DYN_SYSTEM_PORT` (9090) to form `system_url`.
+2. For each new instance:
+     - `POST {system_url}/engine/pause_generation`
+     - `POST {system_url}/engine/update_weights_via_mx` (blocks on NIXL receive)
+     - `POST {system_url}/engine/flush_cache`
+     - `POST {system_url}/engine/resume_generation` (try/finally so always re-enabled)
+3. Re-discover via `/health`; if new `instance_id`s appeared (scale-up
+   mid-cycle), refit those too. Bounded at 5 convergence passes.
 
-Because the top-level `dynamo` is a namespace package, **a directory earlier on
-`sys.path` wins for subpackages it provides** (e.g. `dynamo.vllm.mx_refit`)
-*without* affecting subpackages it doesn't provide (e.g. `dynamo._core` still
-loads from the Rust binding in site-packages). This is the trick that lets us
-develop pure-Python dynamo changes without rebuilding the worker image.
+Code lives at:
 
-### Setup (once per user)
+  * `nemo_rl/models/generation/dynamo/dynamo_generation.py` —
+    `_dispatch_update_weights_via_mx_remote` (the dispatcher above)
+  * `components/src/dynamo/vllm/handlers.py` on
+    `jthomson04/tokenize-endpoint-merge-main-05-07` — adds
+    `pause_generation` / `resume_generation` / `flush_cache` handlers
+  * `components/src/dynamo/vllm/worker_factory.py` (same branch) — registers
+    `/engine/<route>` via `runtime.register_engine_route(...)`
+
+## Image expectations
+
+The dynamo worker image must be built from
+`jthomson04/tokenize-endpoint-merge-main-05-07` (commit `8590c2694e` or later)
+with build args:
 
 ```bash
-# From the nemo-rl repo root, on the dev pod or any machine with Lustre access:
-infra/nrl_k8s/dynamo_mx/dev_sync.sh
+docker buildx build --platform linux/arm64 \
+  --build-arg ENABLE_MODELEXPRESS_P2P=true \
+  --build-arg MODELEXPRESS_REF=8594fd6 \
+  -t <registry>/dynamo-arm-mx:<tag> \
+  -f container/rendered.Dockerfile .
 ```
 
-The script rsyncs `/mnt/rl-workspace/$USER/dynamo/components/src/dynamo/` →
-`/mnt/rl-workspace/$USER/dynamo-dev/dynamo/` so it's on the Lustre PVC every
-worker pod mounts at `/mnt/rl-workspace`.
+The `8590c2694e` commit bundles UCX into the nixl_cu12 wheel — required because
+the dynamo operator hardcodes `NIXL_PLUGIN_DIR` to a path that only has the GDS
+plugin. The DGD spec sets `NIXL_PLUGIN_DIR` explicitly to point at the
+venv-installed nixl plugins.
 
-### Per-iteration loop
-
-```bash
-# 1. Edit dynamo Python files at /mnt/rl-workspace/$USER/dynamo/components/src/dynamo/...
-# 2. Re-sync to the dev path:
-infra/nrl_k8s/dynamo_mx/dev_sync.sh
-# 3. Restart the affected worker pods:
-kubectl delete pod -n default -l <dgd-worker-selector>
-# (the dynamo operator reconciles and recreates them; ~30s vs ~10min for a rebuild)
-```
-
-The DGD manifests in this directory set
-`PYTHONPATH=/mnt/rl-workspace/$USER/dynamo-dev:$PYTHONPATH` on the `VllmDecodeWorker`
-container, so the recreated pods pick up our local code without an image
-rebuild.
-
-### Limits
-
-  * Only Python-only changes hot-reload. Rust changes (the binding, the
-    frontend) still need an image rebuild.
-  * Adding *new* dependencies that aren't in the base image needs an image
-    rebuild. The dev loop only swaps existing module contents.
-  * `modelexpress` itself isn't in the existing dynamo worker image. The
-    Dockerfile in this directory bakes it in. Once that image is built and
-    pushed, subsequent iteration on `dynamo.vllm.mx_refit.*` is hot-reload.
+The trainer image (`Dockerfile.nemorl`) similarly needs
+`--build-arg NIXL_VERSION=0.10.1 --build-arg MX_REF=8594fd6` to align with the
+worker; otherwise the infra YAML has runtime nixl-downgrade + PYTHONPATH
+modelexpress-shadow workarounds.
 
 ## Components
 
 | File | Purpose |
 |---|---|
 | `modelexpress-server.yaml` | K8s Deployment + Service for MX server (gRPC :8001) |
-| `dev_sync.sh` | rsync helper for the hot-reload workflow |
-| `Dockerfile` | (TODO) image overlay: base dynamo worker + `modelexpress` Python + NIXL userspace |
-| `qwen3_4b_thinking_mx.dgd.yaml` | example DGD manifest with `DYN_MX_REFIT_ENABLED=1`, RoCE claim, PYTHONPATH dev override |
+| `Dockerfile.nemorl` | Trainer image overlay (nemo-rl-mx) — pip-installs nixl, modelexpress, protobuf-6, wandb 0.26+ into every venv |
+| `Dockerfile` | Worker image overlay placeholder; superseded by direct rebuild of `ai-dynamo/dynamo` from `jthomson04/tokenize-endpoint-merge-main-05-07` |
+| `DEBUGGING_POSTMORTEM.md` | Bring-up postmortem |
 | `../examples/grpo_workplace_assistant_dynamo_mx.gb300.infra.yaml` | infra YAML pointing at the MX-enabled DGD |
-| `../../../examples/nemo_gym/grpo_workplace_assistant_dynamo_mx.yaml` | recipe with `cluster.weight_sync.method: mx` |
+| `../examples_dgd/qwen3_4b_thinking_gb300_mx.yaml` | Example DGD manifest with `DYN_MX_REFIT_ENABLED=1` + RoCE claim |
+| `../../../examples/nemo_gym/grpo_workplace_assistant_dynamo_mx.yaml` | Recipe with `cluster.weight_sync.method: mx` |
