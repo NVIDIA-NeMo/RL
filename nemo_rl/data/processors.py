@@ -686,6 +686,87 @@ def multichoice_qa_processor(
     return output
 
 
+def xlam_data_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer: TokenizerType,
+    max_seq_length: int,
+    idx: int,
+) -> DatumSpec:
+    """Process an xLAM function-calling datum into a DatumSpec.
+
+    Uses tokenizer.apply_chat_template with tools= to embed tool schemas
+    in the model's native tool-calling format.
+    """
+    query = datum_dict["query"]
+    tools_json = datum_dict["tools"]
+    gold_answers = datum_dict["gold_answers"]
+
+    # Parse tool definitions
+    tool_defs = json.loads(tools_json) if isinstance(tools_json, str) else tools_json
+
+    # Convert tool definitions to the format expected by apply_chat_template
+    # The xLAM dataset uses {"name", "description", "parameters"} format.
+    # HF chat templates expect {"type": "function", "function": {...}} format.
+    formatted_tools = []
+    for tool in tool_defs:
+        if "type" not in tool:
+            formatted_tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.get("name", ""),
+                        "description": tool.get("description", ""),
+                        "parameters": tool.get("parameters", {}),
+                    },
+                }
+            )
+        else:
+            formatted_tools.append(tool)
+
+    extra_env_info = {"gold_answers": gold_answers}
+
+    messages = [{"role": "user", "content": query}]
+
+    # Use the model's native tool-calling format via apply_chat_template
+    message: str = tokenizer.apply_chat_template(
+        messages,
+        tools=formatted_tools if formatted_tools else None,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+    token_ids = tokenizer(
+        message,
+        return_tensors="pt",
+        add_special_tokens=False,
+    )["input_ids"][0]
+    message_log: LLMMessageLogType = [
+        {"role": "user", "content": message, "token_ids": token_ids}
+    ]
+
+    length = sum(len(m["token_ids"]) for m in message_log)
+
+    loss_multiplier = 1.0
+    if length >= max_seq_length:
+        for chat_message in message_log:
+            chat_message["token_ids"] = chat_message["token_ids"][
+                : min(4, max_seq_length // len(message_log))
+            ]
+        loss_multiplier = 0.0
+
+    output: DatumSpec = {
+        "message_log": message_log,
+        "length": length,
+        "extra_env_info": extra_env_info,
+        "loss_multiplier": loss_multiplier,
+        "idx": idx,
+        "task_name": datum_dict.get("task_name", "xlam_function_calling"),
+        "stop_strings": ["</tool_call>"],
+    }
+    return output
+
+
 def nemo_gym_data_processor(
     datum_dict: dict[str, Any],
     task_data_spec: TaskDataSpec,
@@ -724,6 +805,7 @@ PROCESSOR_REGISTRY: Dict[str, TaskDataProcessFnCallable] = cast(
         "sft_processor": sft_processor,
         "vlm_hf_data_processor": vlm_hf_data_processor,
         "nemo_gym_data_processor": nemo_gym_data_processor,
+        "xlam_data_processor": xlam_data_processor,
     },
 )
 

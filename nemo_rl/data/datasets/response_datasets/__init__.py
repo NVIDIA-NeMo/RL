@@ -43,6 +43,9 @@ from nemo_rl.data.datasets.response_datasets.refcoco import RefCOCODataset
 from nemo_rl.data.datasets.response_datasets.response_dataset import ResponseDataset
 from nemo_rl.data.datasets.response_datasets.squad import SquadDataset
 from nemo_rl.data.datasets.response_datasets.tulu3 import Tulu3SftMixtureDataset
+from nemo_rl.data.datasets.response_datasets.xlam_function_calling import (
+    XLAMFunctionCallingDataset,
+)
 
 DATASET_REGISTRY = {
     # built-in datasets
@@ -67,6 +70,7 @@ DATASET_REGISTRY = {
     "openai_format": OpenAIFormatDataset,
     "NemoGymDataset": NemoGymDataset,
     "ResponseDataset": ResponseDataset,
+    "xlam_function_calling": XLAMFunctionCallingDataset,
 }
 
 
@@ -116,5 +120,6 @@ __all__ = [
     "ResponseDataset",
     "SquadDataset",
     "Tulu3SftMixtureDataset",
+    "XLAMFunctionCallingDataset",
     "load_response_dataset",
 ]

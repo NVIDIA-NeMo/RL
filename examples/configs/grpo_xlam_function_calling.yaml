@@ -1,0 +1,51 @@
+defaults: "grpo_math_1B.yaml"
+
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+  max_rollout_turns: 1
+  max_num_steps: 200
+  seed: 42
+
+policy:
+  model_name: "Qwen/Qwen3-0.6B"
+  max_total_sequence_length: 4096
+  dtensor_cfg:
+    enabled: true
+    cpu_offload: false
+    activation_checkpointing: true
+    sequence_parallel: false
+  generation:
+    backend: "vllm"
+    max_new_tokens: 512
+    temperature: 1.0
+    top_p: 0.999
+    top_k: 10000
+    stop_strings: ["</tool_call>"]
+    vllm_cfg:
+      tensor_parallel_size: 1
+      gpu_memory_utilization: 0.6
+      max_model_len: ${policy.max_total_sequence_length}
+
+data:
+  train:
+    dataset_name: "xlam_function_calling"
+    split: "train"
+    split_validation_size: 0.05
+    seed: ${grpo.seed}
+  default:
+    prompt_file: null
+    system_prompt_file: null
+    processor: "xlam_data_processor"
+    env_name: "function_call"
+
+env:
+  function_call:
+    num_workers: 2
+
+logger:
+  log_dir: "logs"
+  wandb_enabled: true
+  wandb:
+    project: "nemo-rl-native-env"
+    name: "grpo-xlam"
