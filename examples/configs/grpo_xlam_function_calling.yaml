@@ -9,6 +9,7 @@ grpo:
 
 policy:
   model_name: "Qwen/Qwen3-0.6B"
+  train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}
   max_total_sequence_length: 4096
   dtensor_cfg:
     cpu_offload: false
