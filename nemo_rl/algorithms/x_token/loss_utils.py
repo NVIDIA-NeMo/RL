@@ -29,12 +29,16 @@ and :mod:`nemo_rl.algorithms.loss.loss_functions`:
       — process-local lazy caches for the materialized projection
       matrix on a given device. Driver processes never trigger a fill;
       each Ray worker populates its own cache on the first loss call.
+    - :func:`build_exact_token_map` — derived common/uncommon vocab
+      partition for the gold-loss path. Cached per
+      ``(path, device, xtoken_loss, teacher_vocab_size)`` because the
+      partition depends on those four inputs.
 """
 
 from __future__ import annotations
 
 import os
-from typing import Any, Tuple, Union
+from typing import Any, Dict, Tuple, Union
 
 import torch
 
@@ -344,3 +348,153 @@ def get_topk_projection(
     likelihoods = data["likelihoods"].float().to(device)
     _TOPK_PROJECTION_CACHE[key] = (indices, likelihoods)
     return indices, likelihoods
+
+
+# Process-local cache. Keyed by every input that affects the partition:
+# the same file with a different ``xtoken_loss`` or ``teacher_vocab_size``
+# would yield a different partition. Lives alongside
+# ``_TOPK_PROJECTION_CACHE`` so the gold-loss build is amortized to one
+# pass per (path, device, knob) on each worker.
+_EXACT_TOKEN_MAP_CACHE: dict[
+    Tuple[str, torch.device, bool, int], Dict[str, torch.Tensor]
+] = {}
+
+
+def build_exact_token_map(
+    path: Union[str, os.PathLike],
+    device: torch.device,
+    *,
+    xtoken_loss: bool,
+    teacher_vocab_size: int,
+) -> Dict[str, torch.Tensor]:
+    """Build the common/uncommon vocab partition for the gold path (cached).
+
+    Ports PT ``compute_KL_loss_optimized`` lines 3493–3594. Reads the
+    dense projection arrays via :func:`get_topk_projection`, sorts each
+    student row's projection weights descending, then picks an exact-token
+    map per the ``xtoken_loss`` flag:
+
+    - ``xtoken_loss=False`` (strict): ``has_exact_map = (sorted_values[:, 0] == 1.0) & (projection_indices[:, 1] == -1)``.
+      On collision (multiple students mapping to the same teacher id),
+      the earliest (lowest) student index wins — matches PT's
+      first-come-first-served loop.
+    - ``xtoken_loss=True`` (relaxed): ``has_exact_map = sorted_values[:, 0] >= 0.6``.
+      On collision, the student with the highest first-projection
+      weight wins; ties are broken by lowest student index (matches
+      PT's ``prev_prob >= new_prob`` skip rule under iteration order).
+
+    Both branches are vectorized via ``scatter_reduce`` so the build is
+    O(V_s) and happens once per ``(path, device, xtoken_loss,
+    teacher_vocab_size)`` for the run.
+
+    Args:
+        path: Path to a ``torch.save``d projection-matrix file (dense
+            top-k format).
+        device: Device the returned tensors must live on.
+        xtoken_loss: Selects strict vs relaxed exact-map rule (see above).
+        teacher_vocab_size: Width of the teacher-side vocab axis. The
+            partition is bounded by this — teacher ids outside the range
+            are dropped.
+
+    Returns:
+        Dict with keys ``common_student``, ``common_teacher`` (paired),
+        ``uncommon_student``, ``uncommon_teacher`` (each independently
+        sorted). All ``[long]`` tensors on ``device``.
+    """
+    key = (str(path), device, bool(xtoken_loss), int(teacher_vocab_size))
+    cached = _EXACT_TOKEN_MAP_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    indices, likelihoods = get_topk_projection(path, device)
+    v_student = indices.shape[0]
+    v_teacher = int(teacher_vocab_size)
+
+    sorted_values, sorted_in_topk = torch.sort(
+        likelihoods, dim=-1, descending=True
+    )
+    if xtoken_loss:
+        has_exact_map = sorted_values[:, 0] >= 0.6
+    else:
+        # Strict: exactly one top-k entry with weight 1.0, no second
+        # mapping. `indices[:, 1] == -1` is the sentinel used by the
+        # `_exact_map_remapped` projection files for "no second
+        # mapping" — matches the PT check at tokenalign.py:3517.
+        has_exact_map = (sorted_values[:, 0] == 1.0) & (
+            indices[:, 1] == -1
+        )
+
+    # Gather (s_idx, t_idx, prob) for each exact-map candidate.
+    s_candidates = torch.where(has_exact_map)[0]
+    if s_candidates.numel() == 0:
+        empty = torch.empty(0, dtype=torch.long, device=device)
+        result = {
+            "common_student": empty,
+            "common_teacher": empty,
+            "uncommon_student": torch.arange(v_student, device=device),
+            "uncommon_teacher": torch.arange(v_teacher, device=device),
+        }
+        _EXACT_TOKEN_MAP_CACHE[key] = result
+        return result
+
+    t_candidates = indices[
+        s_candidates, sorted_in_topk[s_candidates, 0]
+    ]
+    prob_candidates = sorted_values[s_candidates, 0]
+
+    in_bounds = (t_candidates >= 0) & (t_candidates < v_teacher)
+    s_vec = s_candidates[in_bounds]
+    t_vec = t_candidates[in_bounds]
+    prob_vec = prob_candidates[in_bounds]
+
+    # Strict mode: any candidate is eligible (first one wins).
+    # Relaxed mode: only candidates whose prob ties the per-teacher max.
+    if xtoken_loss:
+        max_prob_per_t = torch.full(
+            (v_teacher,),
+            float("-inf"),
+            device=device,
+            dtype=prob_vec.dtype,
+        )
+        max_prob_per_t.scatter_reduce_(
+            0, t_vec, prob_vec, reduce="amax", include_self=True
+        )
+        eligible = prob_vec >= max_prob_per_t[t_vec]
+    else:
+        eligible = torch.ones_like(t_vec, dtype=torch.bool)
+
+    # For each teacher id, pick the smallest student index among the
+    # eligible candidates. Sentinel = v_student so non-eligible rows
+    # lose the amin reduction.
+    sentinel = torch.tensor(v_student, dtype=s_vec.dtype, device=device)
+    eligible_s = torch.where(eligible, s_vec, sentinel.expand_as(s_vec))
+    min_s_per_t = torch.full(
+        (v_teacher,), v_student, device=device, dtype=s_vec.dtype
+    )
+    min_s_per_t.scatter_reduce_(
+        0, t_vec, eligible_s, reduce="amin", include_self=True
+    )
+    winner_mask = eligible & (s_vec == min_s_per_t[t_vec])
+
+    common_student = s_vec[winner_mask]
+    common_teacher = t_vec[winner_mask]
+    # Sort by student index so the paired arrays match.
+    sort_perm = torch.argsort(common_student)
+    common_student = common_student[sort_perm]
+    common_teacher = common_teacher[sort_perm]
+
+    common_s_mask = torch.zeros(v_student, dtype=torch.bool, device=device)
+    common_s_mask[common_student] = True
+    common_t_mask = torch.zeros(v_teacher, dtype=torch.bool, device=device)
+    common_t_mask[common_teacher] = True
+    uncommon_student = (~common_s_mask).nonzero(as_tuple=True)[0]
+    uncommon_teacher = (~common_t_mask).nonzero(as_tuple=True)[0]
+
+    result = {
+        "common_student": common_student,
+        "common_teacher": common_teacher,
+        "uncommon_student": uncommon_student,
+        "uncommon_teacher": uncommon_teacher,
+    }
+    _EXACT_TOKEN_MAP_CACHE[key] = result
+    return result

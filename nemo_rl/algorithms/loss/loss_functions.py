@@ -21,9 +21,9 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType, Loss
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.algorithms.x_token.loss_utils import (
     Fp32SparseMM,
+    build_exact_token_map,
     chunk_average_log_probs,
     get_sparse_projection_matrix,
-    get_topk_projection,
     valid_chunk_mask,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -1183,143 +1183,13 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             )
         self.cfg = cfg
         self.projection_matrix_path = cfg["projection_matrix_path"]
-        # The materialized projection matrix lives in a process-local
-        # cache in ``x_token.loss_utils`` (see ``get_sparse_projection_matrix``
-        # / ``get_topk_projection``), not on this instance. That keeps
-        # the driver-side ``loss_fn`` free of any large CUDA tensors and
-        # lets multiple loss instances on the same worker share one
-        # load. The derived exact-map partition stays on the instance
-        # because it depends on ``xtoken_loss`` and the rest of the
-        # config in addition to the file.
-        self._exact_map_cache: dict[
-            torch.device, dict[str, torch.Tensor]
-        ] = {}
-
-    def _build_exact_token_map(
-        self, device: torch.device
-    ) -> dict[str, torch.Tensor]:
-        """Build the common/uncommon vocab partition for the gold path.
-
-        Ports PT ``compute_KL_loss_optimized`` lines 3493–3594. Reads the
-        dense projection arrays, sorts each student row's projection
-        weights descending, then picks an exact-token map per the
-        ``xtoken_loss`` flag:
-
-        - ``xtoken_loss=False`` (strict): ``has_exact_map = (sorted_values[:, 0] == 1.0) & (projection_indices[:, 1] == -1)``.
-          On collision (multiple students mapping to the same teacher id),
-          the earliest (lowest) student index wins — matches PT's
-          first-come-first-served loop.
-        - ``xtoken_loss=True`` (relaxed): ``has_exact_map = sorted_values[:, 0] >= 0.6``.
-          On collision, the student with the highest first-projection
-          weight wins; ties are broken by lowest student index (matches
-          PT's ``prev_prob >= new_prob`` skip rule under iteration order).
-
-        Both branches are vectorized via ``scatter_reduce`` so the build
-        is O(V_s) and happens once per device for the run.
-
-        Returns:
-            Dict with keys ``common_student``, ``common_teacher`` (paired),
-            ``uncommon_student``, ``uncommon_teacher`` (each independently
-            sorted). All ``[long]`` tensors on ``device``.
-        """
-        if device in self._exact_map_cache:
-            return self._exact_map_cache[device]
-
-        indices, likelihoods = get_topk_projection(
-            self.projection_matrix_path, device
-        )
-        v_student = indices.shape[0]
-        v_teacher = self.cfg["teacher_vocab_size"]
-        xtoken_loss = self.cfg["xtoken_loss"]
-
-        sorted_values, sorted_in_topk = torch.sort(
-            likelihoods, dim=-1, descending=True
-        )
-        if xtoken_loss:
-            has_exact_map = sorted_values[:, 0] >= 0.6
-        else:
-            # Strict: exactly one top-k entry with weight 1.0, no second
-            # mapping. `indices[:, 1] == -1` is the sentinel used by the
-            # `_exact_map_remapped` projection files for "no second
-            # mapping" — matches the PT check at tokenalign.py:3517.
-            has_exact_map = (sorted_values[:, 0] == 1.0) & (
-                indices[:, 1] == -1
-            )
-
-        # Gather (s_idx, t_idx, prob) for each exact-map candidate.
-        s_candidates = torch.where(has_exact_map)[0]
-        if s_candidates.numel() == 0:
-            empty = torch.empty(0, dtype=torch.long, device=device)
-            cache_entry = {
-                "common_student": empty,
-                "common_teacher": empty,
-                "uncommon_student": torch.arange(v_student, device=device),
-                "uncommon_teacher": torch.arange(v_teacher, device=device),
-            }
-            self._exact_map_cache[device] = cache_entry
-            return cache_entry
-
-        t_candidates = indices[
-            s_candidates, sorted_in_topk[s_candidates, 0]
-        ]
-        prob_candidates = sorted_values[s_candidates, 0]
-
-        in_bounds = (t_candidates >= 0) & (t_candidates < v_teacher)
-        s_vec = s_candidates[in_bounds]
-        t_vec = t_candidates[in_bounds]
-        prob_vec = prob_candidates[in_bounds]
-
-        # Strict mode: any candidate is eligible (first one wins).
-        # Relaxed mode: only candidates whose prob ties the per-teacher max.
-        if xtoken_loss:
-            max_prob_per_t = torch.full(
-                (v_teacher,),
-                float("-inf"),
-                device=device,
-                dtype=prob_vec.dtype,
-            )
-            max_prob_per_t.scatter_reduce_(
-                0, t_vec, prob_vec, reduce="amax", include_self=True
-            )
-            eligible = prob_vec >= max_prob_per_t[t_vec]
-        else:
-            eligible = torch.ones_like(t_vec, dtype=torch.bool)
-
-        # For each teacher id, pick the smallest student index among the
-        # eligible candidates. Sentinel = v_student so non-eligible rows
-        # lose the amin reduction.
-        sentinel = torch.tensor(v_student, dtype=s_vec.dtype, device=device)
-        eligible_s = torch.where(eligible, s_vec, sentinel.expand_as(s_vec))
-        min_s_per_t = torch.full(
-            (v_teacher,), v_student, device=device, dtype=s_vec.dtype
-        )
-        min_s_per_t.scatter_reduce_(
-            0, t_vec, eligible_s, reduce="amin", include_self=True
-        )
-        winner_mask = eligible & (s_vec == min_s_per_t[t_vec])
-
-        common_student = s_vec[winner_mask]
-        common_teacher = t_vec[winner_mask]
-        # Sort by student index so the paired arrays match.
-        sort_perm = torch.argsort(common_student)
-        common_student = common_student[sort_perm]
-        common_teacher = common_teacher[sort_perm]
-
-        common_s_mask = torch.zeros(v_student, dtype=torch.bool, device=device)
-        common_s_mask[common_student] = True
-        common_t_mask = torch.zeros(v_teacher, dtype=torch.bool, device=device)
-        common_t_mask[common_teacher] = True
-        uncommon_student = (~common_s_mask).nonzero(as_tuple=True)[0]
-        uncommon_teacher = (~common_t_mask).nonzero(as_tuple=True)[0]
-
-        cache_entry = {
-            "common_student": common_student,
-            "common_teacher": common_teacher,
-            "uncommon_student": uncommon_student,
-            "uncommon_teacher": uncommon_teacher,
-        }
-        self._exact_map_cache[device] = cache_entry
-        return cache_entry
+        # The materialized projection matrix and the derived exact-map
+        # partition both live in process-local caches in
+        # ``x_token.loss_utils`` (see ``get_sparse_projection_matrix``,
+        # ``get_topk_projection``, ``build_exact_token_map``), not on
+        # this instance. That keeps the driver-side ``loss_fn`` free of
+        # any large CUDA tensors and lets multiple loss instances on
+        # the same worker share one load.
 
     @staticmethod
     def _rebuild_teacher_full_logits(
@@ -1606,7 +1476,12 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         T = cfg["temperature"]
         device = logits.device
 
-        exact_map = self._build_exact_token_map(device)
+        exact_map = build_exact_token_map(
+            self.projection_matrix_path,
+            device,
+            xtoken_loss=self.cfg["xtoken_loss"],
+            teacher_vocab_size=self.cfg["teacher_vocab_size"],
+        )
         common_s = exact_map["common_student"]
         common_t = exact_map["common_teacher"]
         uncommon_s = exact_map["uncommon_student"]
