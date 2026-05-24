@@ -22,10 +22,10 @@ import pprint
 from omegaconf import OmegaConf
 
 from nemo_rl.algorithms.utils import get_tokenizer
-from nemo_rl.algorithms.xtoken_distillation import (
+from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     MasterConfig,
     setup,
-    xtoken_distillation_train,
+    xtoken_off_policy_distillation_train,
 )
 from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.virtual_cluster import init_ray
@@ -56,7 +56,7 @@ def main() -> None:
 
     if not args.config:
         args.config = os.path.join(
-            os.path.dirname(__file__), "configs", "xtoken_distillation.yaml"
+            os.path.dirname(__file__), "configs", "xtoken_off_policy_distillation.yaml"
         )
 
     config = load_config(args.config)
@@ -64,6 +64,27 @@ def main() -> None:
         config = parse_hydra_overrides(config, overrides)
 
     config: MasterConfig = OmegaConf.to_container(config, resolve=True)
+
+    # Scope gate: this entrypoint only handles the cross-tokenizer flavor of
+    # off-policy distillation. Same-tokenizer off-policy distillation is
+    # tracked in https://github.com/NVIDIA-NeMo/RL/issues/2545 and will get
+    # its own entrypoint (or a shared `run_off_policy_distillation.py` with
+    # a `cross_tokenizer` switch) once that lands. Until then, fail loudly
+    # if the config doesn't look cross-tokenizer rather than silently
+    # running the wrong code path.
+    policy_tok = config["policy"]["tokenizer"]["name"]
+    teacher_tok = config["teacher"]["tokenizer"]["name"]
+    proj_path = config["loss_fn"].get("projection_matrix_path")
+    assert policy_tok != teacher_tok and proj_path is not None, (
+        "run_xtoken_off_policy_distillation currently supports only the "
+        "cross-tokenizer flavor (distinct policy/teacher tokenizers + a "
+        "non-null loss_fn.projection_matrix_path). Same-tokenizer "
+        "off-policy distillation is tracked in #2545. Got "
+        f"policy.tokenizer.name={policy_tok!r}, "
+        f"teacher.tokenizer.name={teacher_tok!r}, "
+        f"loss_fn.projection_matrix_path={proj_path!r}."
+    )
+
     print("Final config:")
     pprint.pprint(config)
 
@@ -102,7 +123,7 @@ def main() -> None:
         master_config,
     ) = setup(config, student_tokenizer, teacher_tokenizer, train_dataset, val_dataset)
 
-    xtoken_distillation_train(
+    xtoken_off_policy_distillation_train(
         student_policy,
         teacher_policy,
         train_dataloader,

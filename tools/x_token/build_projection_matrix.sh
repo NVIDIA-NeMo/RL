@@ -15,7 +15,7 @@
 
 # Single entrypoint that chains the four projection-prep CLIs under
 # tools/x_token/ to produce a runtime projection matrix from a
-# (student, teacher) tokenizer pair. See docs/guides/xtoken-distillation.md
+# (student, teacher) tokenizer pair. See docs/guides/xtoken-off-policy-distillation.md
 # for the underlying steps.
 
 set -euo pipefail

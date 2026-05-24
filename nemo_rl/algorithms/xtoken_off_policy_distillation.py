@@ -264,7 +264,7 @@ def setup(
     # ==========================
     print("\n▶ Setting up compute cluster...", flush=True)
     cluster = RayVirtualCluster(
-        name="xtoken_distillation_cluster",
+        name="xtoken_off_policy_distillation_cluster",
         bundle_ct_per_node_list=[cluster_config["gpus_per_node"]]
         * cluster_config["num_nodes"],
         use_gpus=True,
@@ -341,7 +341,7 @@ def setup(
 # ===============================================================================
 
 
-def xtoken_distillation_train(
+def xtoken_off_policy_distillation_train(
     student_policy: Policy,
     teacher_policy: Policy,
     dataloader: StatefulDataLoader,

@@ -47,7 +47,8 @@ single `.pt` file. The fourth step is the actual distillation training loop.
                                              │
                                              ▼  projection_matrix.pt
                         ┌──────────────────────────────────────────────┐
-                        │  5. examples/run_xtoken_distillation.py      │
+                        │  5. examples/                                │
+                        │     run_xtoken_off_policy_distillation.py    │
                         │     — student forward + teacher forward      │
                         │       (via CUDA-IPC), x-token KD loss        │
                         └──────────────────────────────────────────────┘
@@ -89,7 +90,7 @@ filenames, etc.).
   be colocated on the same node. No remote-Ray transport for x-token logits.
 - **No sequence packing or dynamic batching for the teacher forward** in v0.
 - The corpus must be served via the `arrow_text` dataset (no chat template,
-  loss on every token — see `examples/configs/xtoken_distillation.yaml`).
+  loss on every token — see `examples/configs/xtoken_off_policy_distillation.yaml`).
 
 ## Step 1 — Generate the base projection matrix
 
@@ -178,14 +179,14 @@ slot. Pass `--preserve_last` or `--no-preserve_last` to override.
 
 ## Step 5 — Launch x-token distillation
 
-The training entrypoint is `examples/run_xtoken_distillation.py` with the
-exemplar config at `examples/configs/xtoken_distillation.yaml`. The exemplar
+The training entrypoint is `examples/run_xtoken_off_policy_distillation.py` with the
+exemplar config at `examples/configs/xtoken_off_policy_distillation.yaml`. The exemplar
 defaults to Llama-3.2-1B (student) ← Qwen3-4B (teacher), an arrow-text
 corpus, and the P-KL loss mode. Override paths via Hydra CLI:
 
 ```bash
-uv run python examples/run_xtoken_distillation.py \
-    --config examples/configs/xtoken_distillation.yaml \
+uv run python examples/run_xtoken_off_policy_distillation.py \
+    --config examples/configs/xtoken_off_policy_distillation.yaml \
     loss_fn.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt \
     data.train.data_files=/path/to/corpus/*.arrow \
     cluster.gpus_per_node=8 \
@@ -231,11 +232,11 @@ training environment so the in-tree HuggingFace implementation is used.
 | Add multi-token | `tools/x_token/minimal_projection_via_multitoken.py` | `<output_dir>/projection_map_<student>_to_<teacher>_multitoken_top_<N>_double[_special].pt` |
 | Reapply exact map | `tools/x_token/reapply_exact_map.py` | `<input>_exact_map_remapped.pt` |
 | Sort and trim | `tools/x_token/sort_and_cut_projection_matrix.py` | `<input_dir>/<basename>_top_<N>_sorted[_preservelast].pt` (or `--output_path`) |
-| Train | `examples/run_xtoken_distillation.py` | per the run's `logger.log_dir` and `checkpointing.checkpoint_dir` |
+| Train | `examples/run_xtoken_off_policy_distillation.py` | per the run's `logger.log_dir` and `checkpointing.checkpoint_dir` |
 
 ## Related
 
-- Config exemplar: [`examples/configs/xtoken_distillation.yaml`](../../examples/configs/xtoken_distillation.yaml)
+- Config exemplar: [`examples/configs/xtoken_off_policy_distillation.yaml`](../../examples/configs/xtoken_off_policy_distillation.yaml)
 - Loss implementation: `nemo_rl/algorithms/loss/loss_functions.py::CrossTokenizerDistillationLossFn`
 - Token alignment: `nemo_rl/algorithms/x_token/token_aligner.py::TokenAligner`
 - Same-tokenizer distillation: [Quantization-Aware RL](quantization-aware-rl.md) (the QA-Distillation workflow uses the same training entrypoint with a same-tokenizer teacher).

@@ -1097,7 +1097,7 @@ class CrossTokenizerDistillationLossConfig(TypedDict):
             magnitude matches CE (P-KL path).
         student_vocab_size: Full student tokenizer vocab size, used to size
             the projection matrix's student-side (V_s) axis. Runtime-injected
-            by ``xtoken_distillation.setup`` from ``len(student_tokenizer)``;
+            by ``xtoken_off_policy_distillation.setup`` from ``len(student_tokenizer)``;
             not a user knob in YAML. Sizing V_s from the configured tokenizer
             vocab (rather than ``max(observed student_id) + 1`` from the
             sparse projection file) keeps V_s in lockstep with
