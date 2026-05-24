@@ -184,6 +184,8 @@ def sft_processor(
         "loss_multiplier": loss_multiplier,
         "idx": idx,
     }
+    if "task_name" in datum_dict:
+        output["task_name"] = datum_dict["task_name"]
     return output
 
 

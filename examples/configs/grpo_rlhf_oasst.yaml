@@ -4,9 +4,13 @@ defaults: "grpo_rm_1B.yaml"
 
 data:
   train:
-    dataset_name: "open_assistant"
+    dataset_name: "ResponseDataset"
+    data_path: "examples/data/oasst_prompts.jsonl"
+    input_key: "messages"
+    split_validation_size: 0.05
+    seed: 42
   default:
-    processor: "sft_processor"
+    processor: "math_hf_data_processor"
     prompt_file: null
     env_name: "reward_model"
 
