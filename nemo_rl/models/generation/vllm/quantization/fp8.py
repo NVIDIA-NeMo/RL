@@ -33,6 +33,11 @@ FP8_BLOCK_QUANT_KWARGS = {
     "weight_block_size": [128, 128],
 }
 
+MXFP8_BLOCK_QUANT_KWARGS = {
+    "quant_method": "modelopt",
+    "quant_algo": "MXFP8",
+}
+
 
 @dataclass(frozen=True)
 class FP8Config:
@@ -43,6 +48,7 @@ class FP8Config:
     model_parallel_size: int = None
     kv_cache_dtype: str = "auto"
     use_fp8_weights: bool = True  # Whether model weights are quantized to FP8
+    is_mx: bool = False
 
 
 @dataclass()
@@ -130,6 +136,18 @@ def apply_fp8_patches(self, fp8_config):
         func2_path = "vllm.model_executor.layers.quantization.fp8.Fp8MoEMethod.process_weights_after_loading"
         patcher2 = patch(func2_path, process_weights_after_loading_moe)
         fp8_state.vllm_patches.append(patcher2)
+        fp8_state.vllm_patches.append(
+            patch(
+                "vllm.model_executor.layers.quantization.modelopt.ModelOptMxFp8LinearMethod.process_weights_after_loading",
+                process_weights_after_loading_mxfp8_linear,
+            )
+        )
+        fp8_state.vllm_patches.append(
+            patch(
+                "vllm.model_executor.layers.quantization.modelopt.ModelOptMxFp8FusedMoE.process_weights_after_loading",
+                process_weights_after_loading_mxfp8_moe,
+            )
+        )
 
         # These patches add support for pow2, e8 dynamic activation scalings factors which are believed to have higher
         # SNR compared to plain fp32 scaling factors. This feature is still under active research.
@@ -173,19 +191,36 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
             "FP8 KV cache can only be used together with FP8 model weights."
         )
 
-    global_fp8_config = FP8Config(
-        use_weight_pow2_scale=vllm_cfg.get("pow2_weight_scaling_factors", False),
-        use_activation_pow2_scale=vllm_cfg.get(
+    if use_fp8_weights:
+        is_mx = vllm_cfg.get("is_mx", False)
+    else:
+        is_mx = False
+    fp8_config_kwargs = {
+        "num_first_layers_in_bf16": vllm_cfg.get("num_first_layers_in_bf16", 0),
+        "num_last_layers_in_bf16": vllm_cfg.get("num_last_layers_in_bf16", 0),
+        "model_parallel_size": model_parallel_size,
+        "kv_cache_dtype": kv_cache_dtype,
+        "use_fp8_weights": use_fp8_weights,
+    }
+    if is_mx:
+        fp8_config_kwargs["is_mx"] = True
+        assert vllm_cfg.get("pow2_weight_scaling_factors", True) == True, (
+            "only pow2 weight scaling factors are supported for MXFP8"
+        )
+        assert vllm_cfg.get("pow2_activation_scaling_factors", True) == True, (
+            "only pow2 activation scaling factors are supported for MXFP8"
+        )
+    else:
+        fp8_config_kwargs["is_mx"] = False
+        fp8_config_kwargs["use_weight_pow2_scale"] = vllm_cfg.get(
+            "pow2_weight_scaling_factors", False
+        )
+        fp8_config_kwargs["use_activation_pow2_scale"] = vllm_cfg.get(
             "pow2_activation_scaling_factors", False
-        ),
-        num_first_layers_in_bf16=vllm_cfg.get("num_first_layers_in_bf16", 0),
-        num_last_layers_in_bf16=vllm_cfg.get("num_last_layers_in_bf16", 0),
-        model_parallel_size=model_parallel_size,
-        kv_cache_dtype=kv_cache_dtype,
-        use_fp8_weights=use_fp8_weights,
-    )
+        )
+    global_fp8_config = FP8Config(**fp8_config_kwargs)
 
-    if vllm_cfg.get("use_deep_gemm", False):
+    if vllm_cfg.get("use_deep_gemm", False) and not is_mx:
         os.environ["VLLM_USE_DEEP_GEMM"] = "1"
         os.environ["VLLM_USE_DEEP_GEMM_E8M0"] = "0"
 
@@ -201,7 +236,10 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     # create fp8 kwargs for vllm's LLM(...)
     num_first_layers_in_bf16 = vllm_cfg.get("num_first_layers_in_bf16", 0)
     num_last_layers_in_bf16 = vllm_cfg.get("num_last_layers_in_bf16", 0)
-    fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
+    if global_fp8_config.is_mx:
+        fp8_block_quant_kwargs = dict(MXFP8_BLOCK_QUANT_KWARGS)
+    else:
+        fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
 
     if num_first_layers_in_bf16 > 0 or num_last_layers_in_bf16 > 0:
         with init_empty_weights():
@@ -211,7 +249,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         bf16_params = []
         if num_first_layers_in_bf16 > 0:
             layers = [l for l in range(num_first_layers_in_bf16)]
-            bf16_params.append(_get_params_in_layers(param_names, layers))
+            bf16_params.extend(_get_params_in_layers(param_names, layers))
 
         if num_last_layers_in_bf16 > 0:
             layers = [
@@ -221,7 +259,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
                     config.num_hidden_layers,
                 )
             ]
-            bf16_params.append(_get_params_in_layers(param_names, layers))
+            bf16_params.extend(_get_params_in_layers(param_names, layers))
 
         fp8_block_quant_kwargs["ignored_layers"] = bf16_params
     quantization_ignored_layer_kws = vllm_cfg.get("quantization_ignored_layer_kws", [])
@@ -229,7 +267,9 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         with init_empty_weights():
             model = AutoModel.from_config(config)
         param_names = [
-            f"model.{name}".removesuffix(".weight")
+            f"model.{name}".removesuffix(".weight").replace(
+                "model.backbone.", "backbone."
+            )
             for name, _ in model.named_parameters()
         ]
         ignored_layers = [
@@ -242,6 +282,8 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         else:
             fp8_block_quant_kwargs["ignored_layers"].extend(ignored_layers)
         print("ignored_layers", fp8_block_quant_kwargs["ignored_layers"])
+    if "ignored_layers" in fp8_block_quant_kwargs:
+        fp8_block_quant_kwargs["ignore"] = fp8_block_quant_kwargs["ignored_layers"]
 
     # Return FP8 kwargs (precision=fp8 is required at this point)
     vllm_kwargs = {
@@ -255,13 +297,15 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
 
 def is_fp8_model(vllm_config):
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptMxFp8Config
 
     if hasattr(vllm_config, "quant_config") and isinstance(
-        vllm_config.quant_config, Fp8Config
+        vllm_config.quant_config, (Fp8Config, ModelOptMxFp8Config)
     ):
-        assert vllm_config.quant_config.weight_block_size is not None, (
-            "Only block scaling is currently supported in NeMo-RL!"
-        )
+        if isinstance(vllm_config.quant_config, Fp8Config):
+            assert vllm_config.quant_config.weight_block_size is not None, (
+                "Only block scaling is currently supported in NeMo-RL!"
+            )
         return True
 
     return False
@@ -293,7 +337,11 @@ def _get_params_in_layers(param_names, layers):
         ):
             # Convert the param name into vllm's module name
             # Vllm wraps the model with an extra 'model'
-            params.append(f"model.{name}".removesuffix(".weight"))
+            params.append(
+                f"model.{name}".removesuffix(".weight").replace(
+                    "model.backbone.", "backbone."
+                )
+            )
     return params
 
 
@@ -311,6 +359,19 @@ def _get_module_from_param_name(model, name: str):
     }
     if module_path[-1] in reversed_mapping.keys():
         module_path[-1] = reversed_mapping[module_path[-1]]
+    if hasattr(model, "hf_to_vllm_mapper") and hasattr(
+        model.hf_to_vllm_mapper, "orig_to_new_prefix"
+    ):
+        if module_path[0] in model.hf_to_vllm_mapper.orig_to_new_prefix:
+            module_path[0] = model.hf_to_vllm_mapper.orig_to_new_prefix[module_path[0]]
+    if hasattr(model, "hf_to_vllm_mapper") and hasattr(
+        model.hf_to_vllm_mapper, "orig_to_new_substr"
+    ):
+        for i in range(len(module_path)):
+            if module_path[i] in model.hf_to_vllm_mapper.orig_to_new_substr:
+                module_path[i] = model.hf_to_vllm_mapper.orig_to_new_substr[
+                    module_path[i]
+                ]
 
     current_module = model
     try:
@@ -348,6 +409,11 @@ def _is_fp8_weight(name, model):
 
 
 def load_weights(weights, model_runner):
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+        mxfp8_e4m3_quantize,
+    )
+
+    global global_fp8_config
     weights_quantized = []
     model = model_runner.model
 
@@ -356,13 +422,20 @@ def load_weights(weights, model_runner):
             weights_quantized.append((k, v))
             continue
         # Cast the weight into fp8 and its scale factor
-        param_lp, param_scale = cast_tensor_to_fp8_blockwise(
-            v.to(torch.float),
-            weight_block_size=FP8_BLOCK_QUANT_KWARGS["weight_block_size"],
-        )
+        if global_fp8_config.is_mx:
+            param_lp, param_scale = mxfp8_e4m3_quantize(v)
+        else:
+            param_lp, param_scale = cast_tensor_to_fp8_blockwise(
+                v.to(torch.float),
+                weight_block_size=FP8_BLOCK_QUANT_KWARGS["weight_block_size"],
+            )
         param_scale = torch.squeeze(param_scale, dim=-1)
-        weights_quantized.append([k, param_lp])
-        weights_quantized.append([k + "_scale_inv", param_scale])
+        if global_fp8_config.is_mx:
+            weights_quantized.append([k, param_lp])
+            weights_quantized.append([k + "_scale_from_checkpoint", param_scale])
+        else:
+            weights_quantized.append([k, param_lp])
+            weights_quantized.append([k + "_scale_inv", param_scale])
     # Finally load the weights into vllm
     model.load_weights(weights_quantized)
 
@@ -523,6 +596,48 @@ def process_weights_after_loading(self, layer) -> None:
         layer.input_scale = None
 
 
+def process_weights_after_loading_mxfp8_linear(self, layer) -> None:
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+        Mxfp8LinearBackend,
+        swizzle_mxfp8_scale,
+    )
+    from vllm.model_executor.parameter import ModelWeightParameter
+
+    if layer.weight.ndim != 2:
+        raise ValueError(
+            f"MXFP8 linear layer weight must be 2D, but got {layer.weight.ndim}D"
+        )
+    assert self.backend == Mxfp8LinearBackend.FLASHINFER_CUTLASS
+    weight = layer.weight.data  # [N, K]
+    N, K = weight.shape
+
+    if not hasattr(layer, "weight_scale_from_checkpoint"):
+        layer.weight_scale_from_checkpoint = ModelWeightParameter(
+            data=layer.weight_scale.data,
+            input_dim=1,
+            output_dim=0,
+            weight_loader=layer.weight_scale.weight_loader,
+        )
+        layer.register_parameter(
+            "weight_scale_from_checkpoint", layer.weight_scale_from_checkpoint
+        )
+        weight_scale = layer.weight_scale.data
+        # Swizzle the weight scales
+        scale_k = K // 32
+        weight_scale_2d = weight_scale[:N, :scale_k].contiguous()
+        weight_scale_swizzled = swizzle_mxfp8_scale(weight_scale_2d, M=N, K=K)
+        layer.weight_scale = torch.nn.Parameter(
+            weight_scale_swizzled.contiguous(), requires_grad=False
+        )
+    else:
+        weight_scale = layer.weight_scale_from_checkpoint.data
+        # Swizzle the weight scales
+        scale_k = K // 32
+        weight_scale_2d = weight_scale[:N, :scale_k].contiguous()
+        weight_scale_swizzled = swizzle_mxfp8_scale(weight_scale_2d, M=N, K=K)
+        layer.weight_scale.copy_(weight_scale_swizzled.contiguous())
+
+
 def process_weights_after_loading_moe(self, layer) -> None:
     """This function is used to process the weights after loading for a FusedMoE layer.
 
@@ -578,6 +693,129 @@ def process_weights_after_loading_moe(self, layer) -> None:
             routing_tables=layer._maybe_init_expert_routing_tables(),
             shared_experts=layer.shared_experts,
         )
+
+
+def process_weights_after_loading_mxfp8_moe(self, layer) -> None:
+    """Shuffle weights and scales into FlashInfer TRTLLM MXFP8 layout."""
+    from flashinfer import (
+        reorder_rows_for_gated_act_gemm,
+        shuffle_matrix_a,
+        shuffle_matrix_sf_a,
+    )
+    from vllm.model_executor.layers.fused_moe.layer import FusedMoeWeightScaleSupported
+    from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+        swap_w13_to_w31,
+    )
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+        MXFP8_SCALE_DTYPE,
+        MXFP8_VALUE_DTYPE,
+    )
+    from vllm.model_executor.parameter import ModelWeightParameter
+    from vllm.model_executor.utils import set_weight_attrs
+
+    epilogue_tile_m = 128
+    num_experts = layer.w13_weight.shape[0]
+    is_gated = self.moe.is_act_and_mul
+    intermediate_size_factor = 2 if is_gated else 1
+
+    w13_weight = layer.w13_weight.data
+    if not hasattr(layer, "w13_weight_scale_from_checkpoint"):
+        w13_scale = layer.w13_weight_scale.data
+    else:
+        w13_scale = layer.w13_weight_scale_from_checkpoint.data
+    if is_gated:
+        # FI TRTLLM gated kernels use W31 ordering. Model checkpoints store
+        # gated projection as W13, so convert once before shuffling.
+        w13_weight = swap_w13_to_w31(w13_weight)
+        w13_scale = swap_w13_to_w31(w13_scale)
+    w2_weight = layer.w2_weight.data
+    if not hasattr(layer, "w2_weight_scale_from_checkpoint"):
+        w2_scale = layer.w2_weight_scale.data
+    else:
+        w2_scale = layer.w2_weight_scale_from_checkpoint.data
+
+    w13_weight_shuffled = []
+    w2_weight_shuffled = []
+    w13_scale_shuffled = []
+    w2_scale_shuffled = []
+    for i in range(num_experts):
+        w13_i = w13_weight[i].reshape(
+            intermediate_size_factor * layer.intermediate_size_per_partition, -1
+        )
+        w13_sf_i = w13_scale[i].reshape(
+            intermediate_size_factor * layer.intermediate_size_per_partition, -1
+        )
+        if is_gated:
+            # Reorder rows for gated activation layout expected by TRTLLM.
+            w13_i = reorder_rows_for_gated_act_gemm(w13_i.clone())
+            w13_sf_i = reorder_rows_for_gated_act_gemm(w13_sf_i.clone())
+
+        w13_shuffled_i = shuffle_matrix_a(w13_i.view(torch.uint8), epilogue_tile_m)
+        w2_shuffled_i = shuffle_matrix_a(
+            w2_weight[i].view(torch.uint8), epilogue_tile_m
+        )
+        w13_weight_shuffled.append(w13_shuffled_i.contiguous().view(MXFP8_VALUE_DTYPE))
+        w2_weight_shuffled.append(w2_shuffled_i.contiguous().view(MXFP8_VALUE_DTYPE))
+        w13_sf_shuffled_i = shuffle_matrix_sf_a(
+            w13_sf_i.view(torch.uint8).reshape(
+                intermediate_size_factor * layer.intermediate_size_per_partition,
+                -1,
+            ),
+            epilogue_tile_m,
+        )
+        w2_sf_shuffled_i = shuffle_matrix_sf_a(
+            w2_scale[i].view(torch.uint8).reshape(layer.hidden_size, -1),
+            epilogue_tile_m,
+        )
+        w13_scale_shuffled.append(
+            w13_sf_shuffled_i.contiguous().view(MXFP8_SCALE_DTYPE)
+        )
+        w2_scale_shuffled.append(w2_sf_shuffled_i.contiguous().view(MXFP8_SCALE_DTYPE))
+
+    if not hasattr(layer, "w13_weight_scale_from_checkpoint"):
+        layer.w13_weight_scale_from_checkpoint = ModelWeightParameter(
+            data=layer.w13_weight_scale.data,
+            input_dim=2,
+            output_dim=1,
+            weight_loader=layer.w13_weight_scale.weight_loader,
+        )
+        layer.w2_weight_scale_from_checkpoint = ModelWeightParameter(
+            data=layer.w2_weight_scale.data,
+            input_dim=2,
+            output_dim=1,
+            weight_loader=layer.w2_weight_scale.weight_loader,
+        )
+        layer.register_parameter(
+            "w13_weight_scale_from_checkpoint", layer.w13_weight_scale_from_checkpoint
+        )
+        layer.register_parameter(
+            "w2_weight_scale_from_checkpoint", layer.w2_weight_scale_from_checkpoint
+        )
+        print(
+            f"layer.w13_weight_scale_from_checkpoint shape: {layer.w13_weight_scale_from_checkpoint.data.shape}"
+        )
+        print(
+            f"layer.w2_weight_scale_from_checkpoint shape: {layer.w2_weight_scale_from_checkpoint.data.shape}"
+        )
+        set_weight_attrs(
+            layer.w13_weight_scale_from_checkpoint,
+            {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value},
+        )
+        set_weight_attrs(
+            layer.w2_weight_scale_from_checkpoint,
+            {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value},
+        )
+        layer.w13_weight_scale = torch.nn.Parameter(
+            torch.stack(w13_scale_shuffled).contiguous(), requires_grad=False
+        )
+        layer.w2_weight_scale = torch.nn.Parameter(
+            torch.stack(w2_scale_shuffled).contiguous(), requires_grad=False
+        )
+    else:
+        layer.w13_weight_scale.copy_(torch.stack(w13_scale_shuffled).contiguous())
+        layer.w2_weight_scale.copy_(torch.stack(w2_scale_shuffled).contiguous())
+    layer.w13_weight.copy_(torch.stack(w13_weight_shuffled).contiguous())
+    layer.w2_weight.copy_(torch.stack(w2_weight_shuffled).contiguous())
 
 
 def process_weights_after_loading_kv(self, layer) -> None:

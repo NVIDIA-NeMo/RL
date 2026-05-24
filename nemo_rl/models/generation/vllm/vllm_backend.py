@@ -351,7 +351,14 @@ class VllmInternalWorkerExtension:
                 post_unpack_func=load_model_weight_func,
             )
 
-            # Process weights after loading for FP8 KV cache
+            # Process weights after loading
+            from vllm.model_executor.model_loader.utils import (
+                process_weights_after_loading,
+            )
+
+            process_weights_after_loading(
+                self.model_runner.model, self.model_config, self.device
+            )
             self._maybe_process_fp8_kv_cache()
 
         except Exception as e:
@@ -360,6 +367,8 @@ class VllmInternalWorkerExtension:
             )
             return False
 
+        gc.collect()
+        torch.cuda.empty_cache()
         return True
 
     def cleanup(self) -> None:
