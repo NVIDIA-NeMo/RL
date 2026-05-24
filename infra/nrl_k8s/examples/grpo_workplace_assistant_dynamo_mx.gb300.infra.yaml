@@ -94,7 +94,7 @@ _shared:
 # MX overlay built from infra/nrl_k8s/dynamo_mx/Dockerfile.nemorl
 # (nixl-cu12 + ai-dynamo-runtime + modelexpress@1d8049d5 + protobuf>=6.31.1
 #  installed into the main venv and all /opt/ray_venvs/*/ actor venvs).
-image: jwillthomson/nemo-rl-mx:latest
+image: jwillthomson/nemo-rl-mx:05-24
 imagePullSecrets: [nvcr-secret]
 serviceAccount: nemo-rl-endpoint-registry
 
@@ -121,27 +121,13 @@ launch:
       exit 1
     fi
 
-    # The nemo-rl-mx image bakes modelexpress@1d8049d5 (pre-rebase head)
-    # into every venv. Shadow it with the Lustre checkout where we have
-    # the rebased kavink/nemo_rl_moe @ 8594fd6 (ucx_utils + sidecar fix
-    # + post-rebase fixups). Drop once the image is rebaked.
-    export PYTHONPATH=/mnt/rl-workspace/${user:}/modelexpress/modelexpress_client/python:.:3rdparty/Megatron-LM-workspace/Megatron-LM
-    # PR #255 (ucx_utils) is no-op unless MX_RDMA_NIC_PIN is set.
+    # The nemo-rl-mx:05-24 image bakes nixl-cu12==0.10.1 + modelexpress
+    # @kavink/nemo_rl_moe @ 8594fd6 directly into every venv; no runtime
+    # downgrade or PYTHONPATH shadow needed.
+    export PYTHONPATH=.:3rdparty/Megatron-LM-workspace/Megatron-LM
+    # modelexpress.ucx_utils.apply_nic_pin_for_device is a no-op unless
+    # MX_RDMA_NIC_PIN is set; "auto" picks the NUMA-local RoCE NIC per rank.
     export MX_RDMA_NIC_PIN=auto
-    # Align trainer NIXL with worker (image bakes 1.1.0; worker has 0.10.1).
-    # Empirically validated 2026-05-23 as load-bearing — dropping this
-    # leaves the publish silently no-op and refit never fires.
-    # See DEBUGGING_POSTMORTEM §15. Drop once image is rebaked with 0.10.1.
-    for VENV in /opt/nemo_rl_venv /opt/ray_venvs/*; do
-      if [ -x "\${VENV}/bin/pip" ] && [ -x "\${VENV}/bin/python" ]; then
-        CUR=$("\${VENV}/bin/python" -c "import importlib.metadata; print(importlib.metadata.version('nixl-cu12'))" 2>/dev/null || echo missing)
-        if [ "\${CUR}" != "0.10.1" ] && [ "\${CUR}" != "missing" ]; then
-          echo "[nixl-align] \${VENV}: downgrading nixl-cu12 from \${CUR} to 0.10.1 ..." >&2
-          "\${VENV}/bin/pip" install --quiet --force-reinstall --no-deps "nixl-cu12==0.10.1" >&2 || \
-            echo "[nixl-align] \${VENV}: downgrade failed" >&2
-        fi
-      fi
-    done
     TIMESTAMP=$(date -u +%Y%m%d-%H%M%S-%N)
     LOG_DIR=/mnt/rl-workspace/${user:}/driver_logs
     LOG=\${LOG_DIR}/${user:}-wpa-dynamo-mx-\${TIMESTAMP}.log
@@ -189,26 +175,6 @@ kuberay:
                 resources: *head_resources
                 ports: *gpu_head_ports
                 volumeMounts: *code_mounts
-                # Downgrade nixl-cu12 from image-baked 1.1.0 to 0.10.1
-                # to match the worker. Empirically validated as load-bearing
-                # (§15 in DEBUGGING_POSTMORTEM). Drop after image rebake.
-                lifecycle: &nixl_010_postStart
-                  postStart:
-                    exec:
-                      command:
-                        - /bin/bash
-                        - -c
-                        - |
-                          set -e
-                          WHEEL_DIR=/mnt/rl-workspace/jothomson/nixl_wheels
-                          for V in /opt/nemo_rl_venv /opt/ray_venvs/*; do
-                            [ -x "$V/bin/pip" ] || continue
-                            CUR=$("$V/bin/python" -c "import importlib.metadata; print(importlib.metadata.version('nixl-cu12'))" 2>/dev/null || echo missing)
-                            if [ "$CUR" != "0.10.1" ] && [ "$CUR" != "missing" ]; then
-                              "$V/bin/pip" install --quiet --force-reinstall --no-deps --no-index --find-links="$WHEEL_DIR" "nixl-cu12==0.10.1" >> /tmp/nixl-align.log 2>&1 || true
-                            fi
-                          done
-                          echo "[nixl-align] postStart done" >> /tmp/nixl-align.log
             volumes: *head_volumes
       workerGroupSpecs:
         - groupName: gpu-workers
@@ -239,7 +205,6 @@ kuberay:
                     capabilities:
                       add: [IPC_LOCK]
                   volumeMounts: *code_mounts
-                  lifecycle: *nixl_010_postStart
               volumes: *worker_volumes
 
 dynamo:
