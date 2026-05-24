@@ -18,7 +18,7 @@ import os
 import time
 from collections import Counter
 from itertools import combinations
-from typing import NotRequired, TypedDict, cast
+from typing import NotRequired, TypedDict
 
 import ray
 import torch
@@ -36,7 +36,7 @@ from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.environments.math_environment import MathEnvConfig
 from nemo_rl.environments.vlm_environment import VLMEnvConfig
 from nemo_rl.models.generation.interfaces import GenerationConfig
-from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy import TokenizerConfig
 
 # ===============================================================================
