@@ -51,7 +51,7 @@ value:
       lr_warmup_iters: 0
 env:
   math:
-    math_verify_impl: gsm8k_verify
+    math_verify_impl: hf_math_verify
 data:
   max_input_seq_length: 512
   train:

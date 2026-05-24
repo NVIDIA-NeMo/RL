@@ -29,7 +29,6 @@ from nemo_rl.data.interfaces import LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
 from nemo_rl.environments.dapo_math_verifier import compute_score as dapo_math_verify
-from nemo_rl.environments.gsm8k_verifier import compute_score as gsm8k_verify
 from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
@@ -104,11 +103,6 @@ class HFVerifyWorker:
                         reward_dict = dapo_math_verify(response, ground_truth)
                         ret_score = reward_dict["score"]
                         extracted_answer = reward_dict["pred"]
-                    elif kwargs.get("math_verify_impl") == "gsm8k_verify":
-                        # This compute_score is from the GSM8K Verifier from Verl
-                        reward_dict = gsm8k_verify(response, ground_truth)
-                        ret_score = reward_dict["score"]
-                        extracted_answer = reward_dict["pred"]
                     elif kwargs.get("math_verify_impl") == "hf_math_verify":
                         ground_truth_parsable = "\\boxed{" + ground_truth + "}"
                         ret_score, extracted_answer = self.verify_func(
@@ -116,7 +110,7 @@ class HFVerifyWorker:
                         )
                     else:
                         raise ValueError(
-                            f"Unknown math_verify_impl: {math_verify_impl}. Expected 'hf_math_verify', 'dapo_math_verify', or 'gsm8k_verify'."
+                            f"Unknown math_verify_impl: {math_verify_impl}. Expected 'hf_math_verify' or 'dapo_math_verify'."
                         )
 
                 results.append(float(ret_score))
