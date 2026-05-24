@@ -1,0 +1,42 @@
+# GRPO training for NeMo-RL technical chatbot with reward model
+defaults: "grpo_rm_1B.yaml"
+
+grpo:
+  max_num_steps: 30
+  max_num_epochs: 100
+  num_prompts_per_step: 20
+  num_generations_per_prompt: 8
+  val_period: 0
+  seed: 42
+
+policy:
+  model_name: "Qwen/Qwen3-0.6B"
+  train_global_batch_size: 160
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs:
+      enable_thinking: false
+
+data:
+  train:
+    dataset_name: "ResponseDataset"
+    data_path: "examples/data/nemorl_questions.jsonl"
+    split_validation_size: 0
+  default:
+    processor: "math_hf_data_processor"
+    env_name: "reward_model"
+    system_prompt_file: null
+    prompt_file: null
+
+checkpointing:
+  enabled: false
+
+cluster:
+  gpus_per_node: 2
+  num_nodes: 1
+
+logger:
+  wandb_enabled: true
+  wandb:
+    project: "nemo-rl-native-env"
+    name: "grpo-nemorl-chatbot"

@@ -1,0 +1,100 @@
+{"messages": [{"role": "user", "content": "How do I add a custom environment to NeMo-RL?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What is the difference between native environments and NeMo-Gym environments?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How does the EnvironmentInterface work in NeMo-RL?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What is the difference between single-turn and multi-turn environments?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I register a new environment in ENV_REGISTRY?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What does the step() method return in an environment?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I implement global_post_process_and_metrics()?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What is EnvironmentReturn and what fields does it contain?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I create a multi-turn environment like the sliding puzzle?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What is the role of metadata in multi-turn environments?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "Why is my GRPO training reward flat at 0?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I configure GRPO hyperparameters for a new task?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What does num_generations_per_prompt control in GRPO?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How does the KL penalty work in GRPO training?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What is the leave-one-out baseline in GRPO?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I enable reward normalization in GRPO?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What is the difference between GRPO and Reinforce++ advantage estimators?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I use dynamic sampling in GRPO?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What does max_rollout_turns control?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I configure the ratio clipping parameters?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I configure multi-GPU training with FSDP?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What is the difference between DTensor and Megatron paths?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I enable tensor parallelism in NeMo-RL?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What does cpu_offload do in the DTensor config?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I configure sequence parallelism?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What is activation checkpointing and when should I use it?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I scale from 1 GPU to 8 GPUs?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What is the difference between colocated and non-colocated generation?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I configure distributed data parallel settings?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What does train_global_batch_size need to be for GRPO?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I use a reward model for RLHF training?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What reward models are compatible with NeMo-RL?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I configure the Skywork reward model?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What is a Bradley-Terry reward model?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I allocate GPUs between policy and reward model?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "Why does the reward model require DTensor to be enabled?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I interpret negative reward scores from the reward model?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What is reward scaling and when should I use it?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I switch from a rule-based environment to a reward model?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What does the reward_model_type parameter control?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "My vLLM generation is running out of memory, how do I fix it?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I configure gpu_memory_utilization for vLLM?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What does max_model_len control in vLLM?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I enable tensor parallel generation with vLLM?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What is the difference between eager and compiled vLLM execution?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I configure stop_strings for generation?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What does the async_engine option do in vLLM?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I set temperature and top_p for generation?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What is the relationship between max_new_tokens and max_total_sequence_length?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I debug vLLM convergence issues?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I add a new dataset to NeMo-RL?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What is the openai_format dataset and how do I use it?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I create a custom data processor?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What is a DatumSpec and what fields does it require?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I configure multiple datasets for training?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What does the sft_processor do?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I handle overlength sequences in a data processor?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What is the PROCESSOR_REGISTRY and how do I register a new processor?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I use a JSONL file as training data?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What is the difference between ResponseDataset and openai_format?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I create a new YAML config for a training run?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What does the defaults field do in a YAML config?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I override config values from the command line?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What are the required sections in a GRPO config?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I configure wandb logging?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What does the checkpointing section control?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I set up validation during training?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What is the cluster config section for?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I configure the learning rate scheduler?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What does precision: bfloat16 mean?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "Which model should I start with for a new RL task?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What is the tradeoff between base and instruct models for RL?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I use Qwen3-0.6B for GRPO training?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What models support the DTensor path?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I configure a model's tokenizer separately?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What does enable_thinking do in chat_template_kwargs?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I use LoRA with GRPO training?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What is the max_total_sequence_length and how do I choose it?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I fine-tune a model that keeps running out of GPU memory?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What is the difference between train_micro_batch_size and train_global_batch_size?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "My training loss is NaN, what should I check?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I debug a data processor that produces incorrect tokenization?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What does 'total batch size is not a multiple of batch_size' mean?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "My reward is oscillating and not converging, what should I do?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I inspect logged samples during training?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What does the seq_logprob_error_threshold parameter do?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I fix 'CPUOffload doesn't work on single GPU for AutoModel'?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "My environment returns all zeros for rewards, how do I debug it?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I check if my data processor formats prompts correctly?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What causes KL divergence to explode during training?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I implement tool-calling in a NeMo-RL environment?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What is sequence packing and when should I enable it?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I configure async GRPO training?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What is importance sampling correction in the loss function?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I use FP8 training in NeMo-RL?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What is the draft model configuration for speculative decoding?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I configure MoE models with NeMo-RL?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "What is the difference between dynamic batching and sequence packing?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I run NeMo-RL on Kubernetes?"}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "How do I save and load checkpoints during GRPO training?"}, {"role": "assistant", "content": ""}]}
