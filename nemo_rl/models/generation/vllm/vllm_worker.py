@@ -152,10 +152,9 @@ class BaseVllmGenerationWorker:
         output_len_or_output_distribution = self.cfg.get(
             "output_len_or_output_distribution", None
         )
-        output_len_generator = get_sequence_length_generator(
+        self.output_len_generator = get_sequence_length_generator(
             output_len_or_output_distribution
         )
-        self.output_len_generator = output_len_generator
 
         # Store the Python executable being used by this worker
         self.py_executable = sys.executable

@@ -153,7 +153,6 @@ def setup(
     # check backend
     backend = generation_config["backend"]
     assert backend == "vllm", "Only vLLM backend is supported for evaluation"
-    generation_config = cast(VllmConfig, generation_config)
 
     # initialize vllm generation
     vllm_generation = VllmGeneration(cluster=cluster, config=generation_config)
