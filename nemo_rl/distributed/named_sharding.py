@@ -15,6 +15,18 @@ from typing import Any, Sequence, Union
 
 import numpy as np
 
+# Canonical axis names that get *replicated* (every rank holds the same
+# data along these axes). Used as the default ``axes`` arg to
+# :meth:`NamedSharding.is_axis_zero` for leader-rank gating — the
+# leader is the worker at coord 0 on every replicated axis. Keep this
+# list as the single source of truth; a typo in a caller's inline list
+# would silently route around the leader gate.
+REPLICATED_AXES: tuple[str, ...] = (
+    "tensor_parallel",
+    "context_parallel",
+    "pipeline_parallel",
+)
+
 
 class NamedSharding:
     """Represents an N-dimensional arrangement of ranks with named axes, facilitating data sharding, replication, and collection based on these axes.
@@ -120,6 +132,17 @@ class NamedSharding:
         for i, axis_name in enumerate(self._names):
             coords[axis_name] = indices[i].item()
         return coords
+
+    @staticmethod
+    def is_axis_zero(coords: dict[str, int], axes: Sequence[str]) -> bool:
+        """Returns True when ``coords`` has value 0 on every ``axes`` entry.
+
+        Shared leader-rank check fed by ``TQWorkerMixin._local_coords``
+        on the worker side; driver-side callers can pair with
+        ``get_worker_coords`` directly. Axes missing from ``coords`` are
+        treated as rank 0.
+        """
+        return all(coords.get(ax, 0) == 0 for ax in axes)
 
     def get_ranks_by_coord(self, **coords: int) -> list[int]:
         """Gets all ranks that match the specified coordinates for named axes.

@@ -17,7 +17,7 @@ import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
+from typing import Any, Callable, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
 import ray
@@ -61,6 +61,7 @@ from nemo_rl.data.llm_message_utils import (
     get_keys_from_message_log,
 )
 from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
+from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
@@ -209,6 +210,7 @@ class MasterConfig(BaseModel, extra="allow"):
     logger: GRPOLoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
+    data_plane: Optional[DataPlaneConfig] = None
 
 
 # ===============================================================================
@@ -222,6 +224,7 @@ def setup(
     dataset: AllTaskProcessedDataset | dict[str, AllTaskProcessedDataset],
     val_dataset: Optional[AllTaskProcessedDataset],
     processor: Optional[AutoProcessor] = None,
+    policy_factory: Optional[Callable[..., ColocatablePolicyInterface]] = None,
 ) -> tuple[
     ColocatablePolicyInterface,
     Optional[GenerationInterface],
@@ -609,10 +612,15 @@ def setup(
             "(reference model is not loaded)."
         )
 
+    # Caller-supplied factory lets the sync trainer swap in a TQ-mediated
+    # Policy subclass without this shared setup needing to know the data
+    # plane exists. Default is the plain Policy class — legacy behavior.
+    _make_policy = policy_factory if policy_factory is not None else Policy
+
     def init_policy():
         """Initialize policy training workers."""
         t0 = time.perf_counter()
-        p = Policy(
+        p = _make_policy(
             cluster=train_cluster,
             config=policy_config,
             tokenizer=tokenizer,
@@ -1542,7 +1550,7 @@ def grpo_train(
         policy_generation = policy  # type: ignore
         NEED_REFIT = False
     POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
-    assert policy_generation is not None  # for mypy type check
+    assert policy_generation is not None
 
     # Check if we need to sync KV cache scales
     # When fallback to policy as the policy_generation, we use getattr to check.
