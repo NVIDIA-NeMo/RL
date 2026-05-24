@@ -91,7 +91,11 @@ dependencies = [
   # than the GitHub release URL — the wheel is byte-identical (verified
   # sha256), and PyPI's CDN is far more reliable than github releases
   # from compute nodes.
-  "mooncake-transfer-engine-cuda13==0.3.10.post2 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  # Upstream publishes both x86_64 and aarch64 wheels (see uv.lock).  CI's
+  # build-container runner is aarch64 (uv reports aarch64-unknown-linux-gnu),
+  # so the marker must include aarch64 — otherwise mooncake is silently
+  # excluded from the resolution during the Docker build.
+  "mooncake-transfer-engine-cuda13==0.3.10.post2 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
 ]
 
 [project.optional-dependencies]
