@@ -52,4 +52,6 @@ uv run python examples/run_grpo.py --config examples/configs/grpo_nemorl_code.ya
 | 4    | 0.633       |
 | 5    | 0.672       |
 
+Training run (5 steps, 1 GPU): https://wandb.ai/nvidia/nemo-rl-native-env/runs/edizc24e
+
 The model achieves ~58-80% accuracy from step 1, confirming the tasks are calibrated for a 0.6B model.
