@@ -1,0 +1,57 @@
+defaults: "grpo_math_1B.yaml"
+
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+  max_rollout_turns: 1
+  max_num_steps: 200
+  seed: 42
+
+policy:
+  model_name: "Qwen/Qwen3-0.6B"
+  max_total_sequence_length: 1024
+  train_global_batch_size: 512
+  train_micro_batch_size: 4
+  dtensor_cfg:
+    enabled: true
+    cpu_offload: false
+    activation_checkpointing: false
+    sequence_parallel: false
+  generation:
+    backend: "vllm"
+    max_new_tokens: 512
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    vllm_cfg:
+      tensor_parallel_size: 1
+      gpu_memory_utilization: 0.6
+      max_model_len: ${policy.max_total_sequence_length}
+
+data:
+  train:
+    dataset_name: "ResponseDataset"
+    data_path: "examples/data/nemorl_code_tasks.jsonl"
+    input_key: "problem"
+    output_key: "test_cases_json"
+    split_validation_size: 0.0
+  validation: null
+  default:
+    prompt_file: "examples/prompts/code_task.txt"
+    system_prompt_file: "examples/prompts/code_task_system.txt"
+    processor: "code_task_data_processor"
+    env_name: "code_task"
+
+env:
+  code_task:
+    num_workers: 2
+
+logger:
+  log_dir: "logs"
+  wandb_enabled: true
+  wandb:
+    project: "nemo-rl-native-env"
+    name: "grpo-nemorl-code"
+
+checkpointing:
+  enabled: false
