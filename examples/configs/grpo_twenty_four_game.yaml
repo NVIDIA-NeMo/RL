@@ -49,4 +49,4 @@ logger:
   wandb_enabled: true
   wandb:
     project: "nemo-rl-native-env"
-    name: "grpo-24-game"
+    name: "grpo-24-game-v2"
