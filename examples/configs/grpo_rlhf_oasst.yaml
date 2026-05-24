@@ -1,0 +1,32 @@
+# GRPO RLHF Configuration: OpenAssistant + Skywork Reward Model
+# Instruction-following RLHF with a Bradley-Terry reward model.
+defaults: "grpo_rm_1B.yaml"
+
+data:
+  train:
+    dataset_name: "open_assistant"
+  default:
+    processor: "sft_processor"
+    prompt_file: null
+    env_name: "reward_model"
+
+policy:
+  model_name: "Qwen/Qwen3-0.6B"
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs:
+      enable_thinking: false
+  train_global_batch_size: 160
+
+grpo:
+  max_num_steps: 30
+  num_prompts_per_step: 20
+  num_generations_per_prompt: 8
+
+cluster:
+  gpus_per_node: 2
+
+logger:
+  wandb:
+    project: "nemo-rl-native-env"
+    name: "grpo-rlhf-oasst"
