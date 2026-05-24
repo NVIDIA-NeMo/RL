@@ -876,6 +876,7 @@ def test_get_pack_sequence_parameters_for_megatron(get_pack_sequence_parameters_
     for test_name in [
         "run_all_get_pack_sequence_parameters_for_megatron_tests",
         "run_all_get_pack_sequence_parameters_for_megatron_fp8_tests",
+        "run_all_get_pack_sequence_parameters_for_megatron_hybridep_tests",
     ]:
         # Run all tests in a single call to the actor
         futures = worker_group.run_all_workers_single_data(test_name)

@@ -36,16 +36,16 @@ print("[TE hello world succeessful]")
 EOF
 
 uv run --extra mcore --no-build-isolation python <<"EOF"
-import is_megatron_installed
-import is_megatron_bridge_installed
-assert is_megatron_installed.INSTALLED, "Megatron is not installed. Please check if the submodule has been initialized. May need to run `git submodule update --init --recursive`"
-assert is_megatron_bridge_installed.INSTALLED, "Megatron Bridge is not installed. Please check if the submodule has been initialized. May need to run `git submodule update --init --recursive`"
+from megatron.core import parallel_state
+print("Megatron INSTALLED=True")
+
+from megatron.bridge import AutoBridge
+print("Megatron Bridge INSTALLED=True")
 
 # This must be the first import to get all of the megatron non-core packages added to the path
 import nemo_rl
 import megatron.core
 from megatron.training.utils import get_ltor_masks_and_position_ids
-from megatron.bridge import AutoBridge
 print("[Megatron-Core/Megatron-Bridge imports successful]")
 EOF
 

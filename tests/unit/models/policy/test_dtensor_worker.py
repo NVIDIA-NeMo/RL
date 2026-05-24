@@ -19,7 +19,7 @@ import ray
 import torch
 from transformers import AutoModelForCausalLM
 
-from nemo_rl.algorithms.loss import ClippedPGLossFn, NLLLossFn
+from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn, NLLLossFn
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -996,22 +996,7 @@ class TestTwoGPUCluster:
         # Test NLLLossFn and ClippedPGLossFn with mbs=1
         nll_loss_fn = NLLLossFn()
         pg_loss_fn = ClippedPGLossFn(
-            {
-                "ratio_clip_min": 0.2,
-                "ratio_clip_max": 0.2,
-                "ratio_clip_c": None,
-                "reference_policy_kl_penalty": 0.1,
-                "reference_policy_kl_type": "k3",
-                "kl_input_clamp_value": 20.0,
-                "kl_output_clamp_value": 10.0,
-                "disable_ppo_ratio": False,
-                "use_on_policy_kl_approximation": False,
-                "use_importance_sampling_correction": False,
-                "truncated_importance_sampling_ratio": None,
-                "sequence_level_importance_ratios": False,
-                "token_level_loss": True,
-                "force_on_policy_ratio": False,
-            }
+            ClippedPGLossConfig(reference_policy_kl_penalty=0.1)
         )
 
         policy_mbs1.prepare_for_training()

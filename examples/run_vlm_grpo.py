@@ -60,7 +60,8 @@ def main() -> None:
         print(f"Overrides: {overrides}")
         config = parse_hydra_overrides(config, overrides)
 
-    config: MasterConfig = OmegaConf.to_container(config, resolve=True)
+    config = OmegaConf.to_container(config, resolve=True)
+    config = MasterConfig(**config)
     print("Applied CLI overrides")
 
     # Print config
@@ -68,28 +69,28 @@ def main() -> None:
     pprint.pprint(config)
 
     # Get the next experiment directory with incremented ID
-    config["logger"]["log_dir"] = get_next_experiment_dir(config["logger"]["log_dir"])
-    print(f"📊 Using log directory: {config['logger']['log_dir']}")
-    if config["checkpointing"]["enabled"]:
+    config.logger["log_dir"] = get_next_experiment_dir(config.logger["log_dir"])
+    print(f"📊 Using log directory: {config.logger['log_dir']}")
+    if config.checkpointing["enabled"]:
         print(
-            f"📊 Using checkpoint directory: {config['checkpointing']['checkpoint_dir']}"
+            f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
         )
 
     init_ray()
 
     # init processor
-    processor = get_tokenizer(config["policy"]["tokenizer"], get_processor=True)
+    processor = get_tokenizer(config.policy["tokenizer"], get_processor=True)
     tokenizer = processor.tokenizer
 
-    assert config["policy"]["generation"] is not None, (
+    assert config.policy["generation"] is not None, (
         "A generation config is required for GRPO"
     )
-    config["policy"]["generation"] = configure_generation_config(
-        config["policy"]["generation"], processor.tokenizer
+    config.policy["generation"] = configure_generation_config(
+        config.policy["generation"], processor.tokenizer
     )
-    if "vllm_cfg" in config["policy"]["generation"]:
+    if "vllm_cfg" in config.policy["generation"]:
         assert (
-            config["policy"]["generation"]["vllm_cfg"]["skip_tokenizer_init"] == False
+            config.policy["generation"]["vllm_cfg"]["skip_tokenizer_init"] == False
         ), (
             "VLMs require tokenizer to be initialized before generation, so skip_tokenizer_init must be set to False."
         )
@@ -101,7 +102,7 @@ def main() -> None:
         val_dataset,
         task_to_env,
         val_task_to_env,
-    ) = setup_response_data(processor, config["data"], config["env"], is_vlm=True)
+    ) = setup_response_data(processor, config.data, config.env, is_vlm=True)
 
     (
         policy,

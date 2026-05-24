@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,9 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-name: "Release NeMo-RL"
+name: "Build, validate, and release NeMo-RL"
 
 on:
+  push:
+    branches:
+      - main
+      - "r**"
+      - "pull-request/**"
+      - "deploy-release/*"
   workflow_dispatch:
     inputs:
       release-ref:
@@ -21,7 +27,7 @@ on:
         required: true
         type: string
       dry-run:
-        description: Do not publish a wheel and GitHub release.
+        description: Compute the release but do not publish wheel, GH release, or docs.
         required: true
         default: true
         type: boolean
@@ -30,25 +36,68 @@ on:
         required: true
         default: true
         type: boolean
+      publish-docs:
+        description: Publish docs
+        required: false
+        default: true
+        type: boolean
       version-bump-branch:
         description: Branch for version bump
         required: true
         type: string
 
+defaults:
+  run:
+    shell: bash -x -e -u -o pipefail {0}
+
+permissions:
+  id-token: write
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
 jobs:
   release:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_library.yml@v0.34.0
+    if: ${{ !cancelled() }}
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_library.yml@v1.0.0
     with:
-      release-ref: ${{ inputs.release-ref }}
+      release-ref: ${{ inputs.release-ref || github.sha }}
       python-package: nemo_rl
       library-name: NeMo-RL
-      dry-run: ${{ inputs.dry-run }}
-      version-bump-branch: ${{ inputs.version-bump-branch }}
-      create-gh-release: ${{ inputs.create-gh-release }}
+      app-id: ${{ vars.BOT_ID }}
+      validate-only: ${{ github.event_name != 'workflow_dispatch' }}
+      dry-run: ${{ inputs.dry-run || false }}
+      version-bump-branch: ${{ inputs.version-bump-branch || github.ref_name }}
+      create-gh-release: ${{ inputs.create-gh-release || true }}
       packaging: uv
-    secrets:
-      TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
-      TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
-      SLACK_WEBHOOK_ADMIN: ${{ secrets.SLACK_WEBHOOK_ADMIN }}
-      SLACK_WEBHOOK: ${{ secrets.SLACK_RELEASE_ENDPOINT }}
-      PAT: ${{ secrets.PAT }}
+      skip-wheel-build: true
+      submodules: recursive
+      publish-docs: ${{ inputs.publish-docs || true }}
+      docs-target-path: nemo/rl
+      publish-as-latest: true
+      run-on-version-tag-only: ${{ github.ref_name != 'main' }}
+      restrict-to-admins: true
+    secrets: inherit  # pragma: allowlist secret
+
+  release-summary:
+    needs: [release]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Result
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --repo ${{ github.repository }} --json jobs --jq '[.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "action_required")] | length')
+
+          if [ "${FAILED_JOBS:-0}" -eq 0 ]; then
+              echo "✅ All previous jobs completed successfully"
+              exit 0
+          else
+              echo "❌ Found $FAILED_JOBS failed job(s)"
+              gh run view $GITHUB_RUN_ID --repo ${{ github.repository }} --json jobs --jq '.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "action_required") | .name'
+              exit 1
+          fi

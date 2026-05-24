@@ -23,7 +23,11 @@ from unittest.mock import MagicMock
 import ray
 import torch
 
-from nemo_rl.algorithms.loss import ClippedPGLossFn, SequencePackingLossWrapper
+from nemo_rl.algorithms.loss import (
+    ClippedPGLossConfig,
+    ClippedPGLossFn,
+    SequencePackingLossWrapper,
+)
 from nemo_rl.algorithms.loss.utils import prepare_loss_input
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
@@ -125,21 +129,10 @@ class SequencePackingGradientTestActor:
             batch_size, max_seq_len, vocab_size, requires_grad=True, device="cuda"
         )
 
-        loss_config = {
-            "reference_policy_kl_penalty": 0.1,
-            "reference_policy_kl_type": "k3",
-            "kl_input_clamp_value": 20.0,
-            "kl_output_clamp_value": 10.0,
-            "ratio_clip_min": 0.2,
-            "ratio_clip_max": 0.2,
-            "ratio_clip_c": 3.0,
-            "use_on_policy_kl_approximation": False,
-            "use_importance_sampling_correction": False,
-            "truncated_importance_sampling_ratio": None,
-            "sequence_level_importance_ratios": False,
-            "token_level_loss": True,
-            "force_on_policy_ratio": False,
-        }
+        loss_config = ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.1,
+            ratio_clip_c=3.0,
+        )
 
         base_loss_fn = ClippedPGLossFn(loss_config)
         data_dict = BatchedDataDict(original_data)
