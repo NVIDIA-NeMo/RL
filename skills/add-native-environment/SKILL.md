@@ -234,15 +234,28 @@ class MyTaskEnvironment(EnvironmentInterface[dict]):
         ...
 ```
 
+#### Tool-calling environments
+
+For environments where the model calls tools (calculator, function calling, APIs), use the **model's native tool-calling format** rather than inventing custom tags:
+
+1. Use `tokenizer.apply_chat_template(messages, tools=tool_definitions, ...)` to format the prompt. This embeds tool schemas in the model's trained format.
+2. The model will generate tool calls in its native format (e.g., Qwen3 uses `<tool_call>{"name": ..., "arguments": ...}</tool_call>`).
+3. Use `stop_strings: ["</tool_call>"]` to stop generation after each tool call.
+4. Parse the tool call using the model's expected format (not custom regex).
+
+This is better than custom tags because the model was **pre-trained** on this format — it doesn't need to learn a new output format through RL.
+
+For production tool-calling with vLLM's native parser (structured decoding, schema validation), use the NeMo-Gym path instead (`expose_http_server: true` + `tool_parser: hermes/nemotron_json` in `vllm_cfg.http_server_serving_chat_kwargs`). See `examples/nemo_gym/` configs for reference.
+
 #### Multi-turn environment
 
 Follow the sliding puzzle pattern in `nemo_rl/environments/games/sliding_puzzle.py`:
 
 1. Define a `TypedDict` for metadata (game state, move count, max moves).
 2. Create game logic class with static methods: `generate()`, `step()`, `render()`.
-3. Create a runner class with `process_turn()` that parses actions from `<action>...</action>` tags.
+3. Create a runner class with `process_turn()` that parses actions from the model's output (use the model's native format where possible).
 4. Create the Ray actor `@ray.remote` class implementing `EnvironmentInterface`.
-5. Use `stop_strings: ["</action>"]` in the datum to delimit action boundaries.
+5. Use appropriate `stop_strings` in the datum to delimit action boundaries.
 
 Key multi-turn differences:
 - `metadata` carries state between turns (not `None`).
@@ -497,6 +510,48 @@ env:
     num_workers: 8  # more env workers to match throughput
 ```
 
+## Stage 10: Write a README
+
+Create a `README.md` in the example directory (e.g., alongside the training script) that documents:
+
+1. **Overview**: What the environment does and what the model learns.
+2. **Data setup**: How to download or generate the dataset.
+3. **Training**: Exact commands for 1-GPU and 8-GPU training.
+4. **Evaluation**: How to check if training worked (expected reward trajectory).
+5. **Results**: Embed wandb.ai links or screenshots showing reward increasing over training steps.
+
+Example structure:
+```markdown
+# <Environment Name> — GRPO Training Example
+
+## Overview
+<1-2 sentence description>
+
+## Quick Start
+
+### 1. Generate/Download Data
+<commands or explanation>
+
+### 2. Train (1 GPU)
+\`\`\`bash
+uv run python examples/run_grpo_<task>.py --config examples/configs/grpo_<task>.yaml \
+  cluster.num_nodes=1 cluster.gpus_per_node=1 ...
+\`\`\`
+
+### 3. Train (8 GPU)
+\`\`\`bash
+uv run python examples/run_grpo_<task>.py --config examples/configs/grpo_<task>.yaml \
+  cluster.num_nodes=1 cluster.gpus_per_node=8 ...
+\`\`\`
+
+## Results
+Training reward trajectory (wandb): <link>
+| Step | Mean Reward |
+|------|-----------|
+| 1    | X%        |
+| 50   | Y%        |
+```
+
 ## Checklist
 
 Use this to verify completeness before declaring the task done:
@@ -511,3 +566,5 @@ Use this to verify completeness before declaring the task done:
 - [ ] `train:mean_reward` increases over training steps
 - [ ] All new files have the Apache 2.0 copyright header
 - [ ] Code passes `uv run --group dev pre-commit run --files <new_files>`
+- [ ] README.md documents data setup, training commands, and results with wandb links
+- [ ] For tool-calling environments: uses model's native tool format via `apply_chat_template(tools=...)`
