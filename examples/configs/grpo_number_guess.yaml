@@ -47,7 +47,7 @@ env:
     cfg:
       max_guesses: 7
       min_number: 1
-      max_number: 50
+      max_number: 20
 
 logger:
   log_dir: "logs"

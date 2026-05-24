@@ -104,7 +104,9 @@ class NumberGuessEnv(EnvironmentInterface[NumberGuessMetadata]):
 
             rewards.append(reward)
             terminateds.append(done)
-            observations.append({"role": "user", "content": obs_content})
+            observations.append(
+                {"role": "environment", "content": f"\n<feedback>{obs_content}</feedback>\n"}
+            )
             answers.append(answer)
             next_stop_strings.append(None if done else ["</guess>"])
 

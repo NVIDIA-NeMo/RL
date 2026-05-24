@@ -37,9 +37,10 @@ from nemo_rl.utils.config import (
 from nemo_rl.utils.logger import get_next_experiment_dir
 
 SYSTEM_PROMPT = (
-    "You are playing a number guessing game. A secret number between 1 and 50 has been chosen. "
-    "Make guesses using <guess>N</guess> tags. After each guess, you'll be told if it's too high "
-    "or too low. You have 7 guesses to find the number."
+    "You are playing a number guessing game. "
+    "Each turn, output exactly one guess inside <guess></guess> tags, like <guess>10</guess>. "
+    "You will receive feedback in <feedback></feedback> tags telling you if your guess is too high or too low. "
+    "Then make another guess. Always use binary search: guess the middle of the remaining range."
 )
 
 
@@ -67,7 +68,7 @@ def generate_number_guess_datum(
 
     prompt_content = (
         f"I'm thinking of a number between {min_number} and {max_number}. "
-        f"Make your first guess using <guess>N</guess> tags."
+        f"You have {max_guesses} guesses. Make your first guess now."
     )
 
     message_list = [
