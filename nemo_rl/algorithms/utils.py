@@ -720,7 +720,7 @@ def print_performance_metrics(
     if colocated_inference:
         training_num_gpus = total_num_gpus
         generation_num_gpus = total_num_gpus
-    elif master_config["policy"]["generation"].get("backend") == "dynamo":
+    elif master_config.policy["generation"].get("backend") == "dynamo":
         # Dynamo runs generation in a separate DGD entirely outside the
         # Ray cluster, so none of `cluster.{num_nodes,gpus_per_node}` is
         # spent on generation. Treat all GPUs as training resources.

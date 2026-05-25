@@ -1102,7 +1102,7 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
         "backend with `async_engine: true`, or the dynamo backend!"
     )
 
-    generation_config = master_config["policy"]["generation"]
+    generation_config = master_config.policy["generation"]
     backend = generation_config.get("backend", "")
 
     # vllm-specific gate: the gym dispatches rollouts to the colocated
@@ -1465,7 +1465,7 @@ def grpo_train(
     # call. _weight_sync_method drives the dispatcher inside
     # refit_policy_generation; _mx_config carries the MX server URL + picker
     # flags through to both the trainer publisher and the inference receiver.
-    _weight_sync_cfg = (master_config.get("cluster") or {}).get("weight_sync", {}) or {}
+    _weight_sync_cfg = (master_config.cluster or {}).get("weight_sync", {}) or {}
     _weight_sync_method = _weight_sync_cfg.get("method")
     _mx_config = (
         MxConfig.from_dict(_weight_sync_cfg.get("mx_config"))
@@ -1485,7 +1485,7 @@ def grpo_train(
     if policy_generation is None:
         policy_generation = policy  # type: ignore
         NEED_REFIT = False
-    elif master_config["policy"]["generation"].get("backend") == "dynamo":
+    elif master_config.policy["generation"].get("backend") == "dynamo":
         # Dynamo backend supports refit via weight_sync_method="mx" (the
         # ModelExpress v2 NIXL RDMA path). Other refit methods aren't
         # implemented for Dynamo and short-circuit here.
@@ -2671,7 +2671,7 @@ def async_grpo_train(
 
     # ---- ModelExpress v2 weight-sync wiring (cfg.cluster.weight_sync) ----
     # Read once so the per-refit call sites don't re-parse the config.
-    _weight_sync_cfg = (master_config.get("cluster") or {}).get("weight_sync", {}) or {}
+    _weight_sync_cfg = (master_config.cluster or {}).get("weight_sync", {}) or {}
     _weight_sync_method = _weight_sync_cfg.get("method")
     _mx_config = (
         MxConfig.from_dict(_weight_sync_cfg.get("mx_config"))
@@ -2685,7 +2685,7 @@ def async_grpo_train(
     if policy_generation is None:
         policy_generation = policy
         NEED_REFIT = False
-    elif master_config["policy"]["generation"].get("backend") == "dynamo":
+    elif master_config.policy["generation"].get("backend") == "dynamo":
         # Dynamo backend supports refit via weight_sync_method="mx" (MX v2
         # NIXL RDMA). Skip refit for other methods, which aren't implemented
         # on the Dynamo path.
