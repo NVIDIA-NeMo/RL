@@ -345,6 +345,10 @@ class TestRayJob:
         monkeypatch.setattr("nrl_k8s.k8s.apply_rayjob", _fake_apply)
         monkeypatch.setattr("nrl_k8s.k8s.wait_for_rayjob_terminal", _fake_wait)
         monkeypatch.setattr("nrl_k8s.submit.is_in_cluster", lambda: True)
+        monkeypatch.setattr(
+            "nrl_k8s.k8s.ensure_rayjob_driver_submitted",
+            lambda *a, **kw: "submission-id",
+        )
 
         runner = CliRunner()
         result = runner.invoke(cli.main, ["run", str(recipe), "--rayjob"])
@@ -367,6 +371,10 @@ class TestRayJob:
             },
         )
         monkeypatch.setattr("nrl_k8s.submit.is_in_cluster", lambda: True)
+        monkeypatch.setattr(
+            "nrl_k8s.k8s.ensure_rayjob_driver_submitted",
+            lambda *a, **kw: "submission-id",
+        )
 
         runner = CliRunner()
         result = runner.invoke(cli.main, ["run", str(recipe), "--rayjob"])
@@ -382,6 +390,10 @@ class TestRayJob:
             lambda *a, **kw: waited.append(1) or {},
         )
         monkeypatch.setattr("nrl_k8s.submit.is_in_cluster", lambda: True)
+        monkeypatch.setattr(
+            "nrl_k8s.k8s.ensure_rayjob_driver_submitted",
+            lambda *a, **kw: "submission-id",
+        )
 
         runner = CliRunner()
         result = runner.invoke(cli.main, ["run", str(recipe), "--rayjob", "--no-wait"])

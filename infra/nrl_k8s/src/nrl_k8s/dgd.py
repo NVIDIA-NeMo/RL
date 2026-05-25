@@ -423,12 +423,36 @@ def _frontend_http_ready(name: str, namespace: str) -> bool:
 
     The pod can be Ready (its kubelet probe is just a TCP connect)
     well before the python ``dynamo.frontend`` process has bound to
-    the OpenAI port. We confirm with an HTTP request via the K8s API
-    server's service proxy — works without standing up our own
-    port-forward, and 503 / 404 / 200 all indicate the listener is
-    accepting connections.
+    the OpenAI port. We confirm with an HTTP request.
+
+    Transport selection:
+    * In-cluster (dev pod, training pod, operator): hit the ClusterIP
+      Service directly via Kubernetes DNS — fast and reliable.
+    * Out-of-cluster: fall back to the API server's service proxy,
+      which works without a port-forward but has been observed
+      returning ``ServiceUnavailable: EOF`` against this frontend
+      even when the listener is healthy — hence the in-cluster
+      preferred path.
     """
+    import os
+    import urllib.error
+    import urllib.request
+
     svc_name = f"{name}-frontend"
+
+    if "KUBERNETES_SERVICE_HOST" in os.environ:
+        # In-cluster: direct ClusterIP via Kubernetes DNS.
+        url = f"http://{svc_name}.{namespace}.svc.cluster.local:8000/v1/models"
+        try:
+            with urllib.request.urlopen(url, timeout=3.0):  # noqa: S310
+                return True
+        except urllib.error.HTTPError:
+            # Any HTTP response means the listener is accepting connections.
+            return True
+        except (urllib.error.URLError, OSError):
+            return False
+
+    # Out-of-cluster: API server service proxy.
     core = client.CoreV1Api()
     try:
         core.connect_get_namespaced_service_proxy_with_path(
@@ -438,10 +462,6 @@ def _frontend_http_ready(name: str, namespace: str) -> bool:
         )
         return True
     except ApiException as e:
-        # 503 (no upstream yet), 502 (proxy can't reach pod), connection
-        # refused — all "not ready". A 404 from the OpenAI endpoint
-        # itself means the listener IS up and answering, just doesn't
-        # recognize the path — treat as ready.
         if e.status == 404:
             return True
         return False

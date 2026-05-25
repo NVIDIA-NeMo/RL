@@ -928,6 +928,24 @@ def _run_rayjob(
                     err=True,
                 )
 
+    # Workaround for a kuberay HTTPMode stall: in some clusters the
+    # rayjob-controller misses the RayCluster's RayClusterProvisioned
+    # transition and never POSTs the driver entrypoint, leaving the job
+    # stuck in jobDeploymentStatus=Running with /api/jobs/ empty
+    # indefinitely. Wait for the cluster to be provisioned, give the
+    # operator a short grace window, and fall back to POSTing ourselves
+    # if it doesn't. Applies in both --wait and --no-wait — without it,
+    # --no-wait silently fails when the operator stalls.
+    try:
+        k8s.ensure_rayjob_driver_submitted(
+            job_name, namespace, log=click.echo,
+        )
+    except (TimeoutError, RuntimeError) as exc:
+        click.echo(
+            f"[run --rayjob] warning: driver-submit guard failed: {exc}",
+            err=True,
+        )
+
     job_id_cmd = f"$(kubectl get rayjob {job_name} -n {namespace} -o jsonpath='{{.status.jobId}}')"
     click.echo(
         f"follow:  kubectl get rayjob {job_name} -n {namespace} -w\n"
