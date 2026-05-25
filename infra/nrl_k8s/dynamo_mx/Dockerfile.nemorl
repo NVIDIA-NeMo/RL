@@ -5,7 +5,7 @@
 # Overlay on the standard nemo-rl image. Adds the three Python deps the
 # MX v2 weight-refit path needs INTO each Ray actor venv + the main venv:
 #
-#   * nixl-cu12          NIXL C++ + Python bindings (compiled .so for cp313/arm64).
+#   * nixl-cu13          NIXL C++ + Python bindings (cu13 wheel matching the base image).
 #                        Used by modelexpress.MxV2TrainingPublisher + MxV2RefitReceiver.
 #   * ai-dynamo-runtime  dynamo._core / dynamo.runtime. The trainer's
 #                        DynamoGeneration._dispatch_dynamo_endpoint Ray task calls
@@ -18,21 +18,29 @@
 # All three are pure pip installs — the base nemo-rl image already has UCX,
 # libibverbs, libcudart, etc.
 #
-# Build:
+# Build (defaults below are what we currently target; override with
+# --build-arg if you need a different base / MX commit / NIXL wheel):
 #   docker buildx build --platform linux/arm64 \
-#     --build-arg BASE_IMAGE=nvcr.io/nvidian/nemo-rl:664d29c-49528955 \
-#     --build-arg MX_REF=1d8049d5 \
-#     -t <your-registry>/nemo-rl-mx:1d8049d5 \
+#     -t <your-registry>/nemo-rl-mx:<your-tag> \
 #     -f infra/nrl_k8s/dynamo_mx/Dockerfile.nemorl .
 #
 # Push & update infra/nrl_k8s/examples/grpo_workplace_assistant_dynamo_mx.gb300.infra.yaml
 # to reference the new image.
 
-ARG BASE_IMAGE=nvcr.io/nvidian/nemo-rl:664d29c-49528955
+ARG BASE_IMAGE=nvcr.io/nvidian/nemo-rl:nightly
 FROM ${BASE_IMAGE}
 
-ARG MX_REF=1d8049d5
-ARG NIXL_VERSION=1.1.0
+# MX commit we currently target — kavink/nemo_rl_moe @ 8594fd6:
+# v2 sidecar fix + post-rebase fixups. Validated end-to-end on Qwen3-4B
+# (mini_swe_big parity + workplace_assistant smoke).
+ARG MX_REF=8594fd6
+# NIXL 0.10.1 is what the dynamo worker image
+# (jwillthomson/dynamo-arm-tokenize-endpoint-8590c26) ships, so trainer
+# + worker stay wire-compatible. Tracks the base's CUDA major: the
+# upstream nemo-rl image flipped to CUDA 13.2 in #2332, so we use
+# nixl-cu13. If you point BASE_IMAGE at a CUDA-12 tag, switch the
+# wheel name below to nixl-cu12.
+ARG NIXL_VERSION=0.10.1
 ARG DYN_RUNTIME_VERSION=1.1.1
 # modelexpress's p2p_pb2.py is generated against protobuf 6.31+ gencode but
 # its pyproject pins `protobuf<6.0.0` — pip resolves to 5.29 and the proto
@@ -50,10 +58,37 @@ ARG PROTOBUF_VERSION=6.31.1
 ARG WANDB_VERSION=0.26.1
 
 # Install into the main venv (used by the training driver entrypoint).
-RUN /opt/nemo_rl_venv/bin/pip install --no-cache-dir \
-      "nixl-cu12==${NIXL_VERSION}" \
-      "ai-dynamo-runtime==${DYN_RUNTIME_VERSION}" \
+# NIXL ships as two wheels: `nixl` (the Python bindings) + `nixl-cu13`
+# (the CUDA-13 native libs sidecar). `nixl[cu13]` is the convenience
+# extra that picks both, but its declared deps drag in nvidia-cudnn-cu13
+# / nvidia-cublas-cu13 / etc — a multi-GB reinstall of the CUDA stack
+# the base image already provides. So install both wheels directly with
+# --no-deps, which gives us the Python module + the cu13 .so and skips
+# the redundant nvidia-* re-resolution.
+# modelexpress's pyproject pins `nixl[cu12]` (wrong CUDA major for us);
+# also install it --no-deps and layer back just the small deps that
+# aren't already in the upstream base (grpcio). modelexpress lists
+# runai-model-streamer too, but we don't exercise the runai-loader path
+# — our v2 refit goes through MxV2RefitReceiver, not the loader — so
+# skipping it avoids another CUDA-stack re-resolution.
+# tensordict is newly required by nemo_rl/data_plane/codec.py (upstream
+# PR #2439); the `:nightly` base can lag the addition, so install it
+# explicitly. tensordict declares `torch` as a runtime dep, and resolving
+# that re-touches the nvidia-cudnn-cu13 / nvidia-cublas-cu13 stack the
+# base already pins — multi-GB reinstall. Of tensordict's other deps
+# (numpy, cloudpickle, packaging, importlib_metadata, pyvers) only
+# pyvers is missing from the base, so install pyvers separately and
+# then tensordict --no-deps.
+RUN /opt/nemo_rl_venv/bin/pip install --no-cache-dir --no-deps \
+      "nixl==${NIXL_VERSION}" \
+      "nixl-cu13==${NIXL_VERSION}" \
       "modelexpress @ git+https://github.com/ai-dynamo/modelexpress.git@${MX_REF}#subdirectory=modelexpress_client/python" \
+ && /opt/nemo_rl_venv/bin/pip install --no-cache-dir \
+      "ai-dynamo-runtime==${DYN_RUNTIME_VERSION}" \
+      "grpcio>=1.66.2" \
+      "pyvers<0.3.0,>=0.2.0" \
+ && /opt/nemo_rl_venv/bin/pip install --no-cache-dir --no-deps \
+      "tensordict" \
  && /opt/nemo_rl_venv/bin/pip install --no-cache-dir --upgrade \
       "protobuf>=${PROTOBUF_VERSION}" \
       "wandb>=${WANDB_VERSION}"
@@ -67,10 +102,16 @@ RUN /opt/nemo_rl_venv/bin/pip install --no-cache-dir \
 RUN set -e; \
     for venv in /opt/ray_venvs/*/; do \
       echo "Installing MX deps into ${venv}"; \
-      "${venv}bin/pip" install --no-cache-dir \
-        "nixl-cu12==${NIXL_VERSION}" \
-        "ai-dynamo-runtime==${DYN_RUNTIME_VERSION}" \
+      "${venv}bin/pip" install --no-cache-dir --no-deps \
+        "nixl==${NIXL_VERSION}" \
+        "nixl-cu13==${NIXL_VERSION}" \
         "modelexpress @ git+https://github.com/ai-dynamo/modelexpress.git@${MX_REF}#subdirectory=modelexpress_client/python"; \
+      "${venv}bin/pip" install --no-cache-dir \
+        "ai-dynamo-runtime==${DYN_RUNTIME_VERSION}" \
+        "grpcio>=1.66.2" \
+        "pyvers<0.3.0,>=0.2.0"; \
+      "${venv}bin/pip" install --no-cache-dir --no-deps \
+        "tensordict"; \
       "${venv}bin/pip" install --no-cache-dir --upgrade \
         "protobuf>=${PROTOBUF_VERSION}" \
         "wandb>=${WANDB_VERSION}"; \
