@@ -453,6 +453,8 @@ class BaseVllmGenerationWorker:
             # Use Ray for distributed execution in parallel mode
             vllm_kwargs["distributed_executor_backend"] = "ray"
         elif self.expert_parallel_size > 1:
+            # when there is data parallelism but no model-parallelism, we need to use
+            # the mp backend, otherwise it will default to ray and cause the worker to hang.
             vllm_kwargs["distributed_executor_backend"] = "mp"
         else:
             # For non-parallel mode, explicitly set executor to None to avoid Ray issues
@@ -481,13 +483,6 @@ class BaseVllmGenerationWorker:
                 os.environ["VLLM_DP_RANK"] = str(vllm_dp_rank)
                 # Always set local rank to 0 because we only expose GPUs belong to this DP rank to the worker; if we set it to the actual local rank, it will cause the worker to hang.
                 os.environ["VLLM_DP_RANK_LOCAL"] = str(0)
-                leader_rank = (
-                    int(os.environ["RANK"])
-                    // world_size_across_dp
-                    * world_size_across_dp
-                )
-                addr_list = eval(os.environ["AVAILABLE_ADDR_LIST"])
-                port_list = eval(os.environ["AVAILABLE_PORT_LIST"])
                 os.environ["VLLM_DP_MASTER_IP"] = str(dp_addr)
                 os.environ["VLLM_DP_MASTER_PORT"] = str(dp_port)
             else:
