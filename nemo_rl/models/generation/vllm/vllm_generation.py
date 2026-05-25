@@ -64,12 +64,7 @@ class VllmGeneration(GenerationInterface):
             "World size must be a multiple of model parallel size. "
             f"Got world size {cluster.world_size()} and model parallel size (TP * PP) {self.model_parallel_size}."
         )
-        assert self.ep_size == 1 or self.ep_size % self.tp_size == 0, (
-            "When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP. "
-            "Please update your configuration to set expert_parallel_size to a multiple of tensor_parallel_size."
-        )
         self.dp_size = cluster.world_size() // self.model_parallel_size
-        self.vllm_dp_size = self.ep_size // self.tp_size if self.ep_size > 1 else 1
 
         if self.pp_size > 1:
             assert self.cfg["vllm_cfg"]["async_engine"], (
@@ -82,6 +77,7 @@ class VllmGeneration(GenerationInterface):
                 "When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP. "
                 "Please update your configuration to set expert_parallel_size to a multiple of tensor_parallel_size."
             )
+        self.vllm_dp_size = self.ep_size // self.tp_size if self.ep_size > 1 else 1
 
         # Validate sampling parameters early to avoid resource allocation with unsupported configs.
         top_k: int | None = self.cfg["top_k"]
