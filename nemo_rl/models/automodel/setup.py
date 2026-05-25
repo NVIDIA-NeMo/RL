@@ -24,7 +24,6 @@ import torch
 from hydra.utils import get_class
 from nemo_automodel import (
     NeMoAutoModelForSequenceClassification,
-    NeMoAutoModelForTokenClassification,
 )
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.registry import ModelRegistry
@@ -341,7 +340,17 @@ def validate_and_prepare_config(
                 )
                 model_config.num_labels = 1
         elif rm_type == "regression":
-            model_class = NeMoAutoModelForTokenClassification
+            # NeMoAutoModelForTokenClassification is not available in the currently
+            # pinned nemo_automodel. To enable regression-type value/reward models on
+            # the DTensor backend, bump the nemo_automodel submodule to a version
+            # that exports this class and reinstate the import at the top of this
+            # file. The Megatron backend uses a custom value head and does not go
+            # through this path.
+            raise NotImplementedError(
+                "Regression-type reward models on the DTensor backend require "
+                "NeMoAutoModelForTokenClassification, which is not available in "
+                "the pinned nemo_automodel. Use the Megatron backend instead."
+            )
             if model_config.num_labels != 1:
                 print(
                     "model_config.num_labels is not 1. Setting it to 1 since this value is used as the out_features "
