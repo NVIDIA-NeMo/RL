@@ -61,6 +61,10 @@ class SglangSpecificArgs(TypedDict):
     enable_mixed_chunk: NotRequired[bool]
     enable_dp_attention: NotRequired[bool]
     enable_ep_moe: NotRequired[bool]
+    # FP8 GEMM backend, e.g. {"auto", "cutlass", "triton", "flashinfer_trtllm"}.
+    fp8_gemm_runner_backend: NotRequired[str]
+    # MoE runner backend, e.g. {"auto", "deep_gemm", "triton", "cutlass"}.
+    moe_runner_backend: NotRequired[str]
     # MoE all-to-all backend. Newer sglang forks replaced ``enable_ep_moe``
     # with this single switch: one of {"none", "deepep", "mooncake", "mori",
     # "ascend_fuseep", "flashinfer"}. Defaults to "none" upstream.

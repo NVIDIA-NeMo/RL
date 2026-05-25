@@ -14,16 +14,19 @@ transport:
 
 1. A Ray actor hosts an ``sglang.srt.entrypoints.engine.Engine``.
 2. The main process is a mock trainer on the same visible GPU.
-3. The trainer loads the sliced Qwen checkpoint, builds HF weight buckets, and
+3. SGLang snapshots its initial weights and randomizes them. Optionally, the
+   ``test offload/onload`` branch offloads weights/KV and onloads weights before
+   the refit.
+4. The trainer loads the sliced Qwen checkpoint, builds HF weight buckets, and
    sends them through ``send_hf_buckets_via_ipc_actor_impl``.
-4. SGLang snapshots its initial weights, randomizes them, receives the IPC
-   refit, post-processes weights, and compares back to the snapshot.
+5. SGLang receives the IPC refit, post-processes weights, and compares back to
+   the snapshot.
 
 Usage inside the nemo-rl container:
 
     CUDA_VISIBLE_DEVICES=0 python \
       tests/unit/models/generation/sglang/repro_pp_colocate_weight_update.py \
-      --pp 1 --tp 1 --dp 1 --dtype bfloat16
+      --pp 1 --tp 1 --dp 1 --dtype bfloat16 --test-offload-onload
 """
 
 from __future__ import annotations
@@ -66,6 +69,20 @@ _SAFETENSORS_TO_TORCH_NAME = {
     "U8": "uint8",
     "BOOL": "bool",
 }
+
+_MOE_RUNNER_BACKEND_CHOICES = (
+    "auto",
+    "deep_gemm",
+    "triton",
+    "triton_kernel",
+    "flashinfer_trtllm",
+    "flashinfer_trtllm_routed",
+    "flashinfer_cutlass",
+    "flashinfer_mxfp4",
+    "flashinfer_cutedsl",
+    "cutlass",
+    "marlin",
+)
 
 
 def _ckpt_path() -> Path:
@@ -162,7 +179,7 @@ class _SGLangEngineActor:
         dp: int,
         dtype: str,
         mem_fraction_static: float,
-        moe_runner_backend: str | None,
+        moe_runner_backend: str,
     ):
         os.environ["SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK"] = "false"
 
@@ -187,18 +204,28 @@ class _SGLangEngineActor:
             "log_level": "info",
             "random_seed": 42,
             "disable_cuda_graph": True,
-            "enable_memory_saver": False,
+            "enable_memory_saver": True,
+            "enable_weights_cpu_backup": False,
+            "moe_runner_backend": moe_runner_backend,
         }
-        if moe_runner_backend is not None:
-            kwargs["moe_runner_backend"] = moe_runner_backend
 
         print(
             f"[actor] starting Engine pp={pp} tp={tp} dp={dp} dtype={dtype} "
+            f"moe_runner_backend={moe_runner_backend} "
             f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}",
             flush=True,
         )
         self.engine = Engine(**kwargs)
         print("[actor] engine up", flush=True)
+        try:
+            server_args = self.engine.tokenizer_manager.server_args
+            print(
+                f"[actor] resolved server_args dtype={getattr(server_args, 'dtype', '<?>')!r} "
+                f"moe_runner_backend={getattr(server_args, 'moe_runner_backend', '<?>')!r}",
+                flush=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[actor] WARN: could not introspect server_args: {exc!r}", flush=True)
 
     def generate(self, prompt: str, sampling_params: dict[str, Any]) -> Any:
         return self.engine.generate(prompt, sampling_params=sampling_params)
@@ -212,6 +239,42 @@ class _SGLangEngineActor:
             )
         )
         return _raise_if_failed(result, f"check_weights({action!r})")
+
+    def offload_weights(self) -> Any:
+        from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
+
+        self.engine.flush_cache()
+        result = self.engine.release_memory_occupation(tags=[GPU_MEMORY_TYPE_WEIGHTS])
+        return _raise_if_failed(result, "offload_weights")
+
+    def offload_kv(self) -> Any:
+        from sglang.srt.constants import (
+            GPU_MEMORY_TYPE_CUDA_GRAPH,
+            GPU_MEMORY_TYPE_KV_CACHE,
+        )
+
+        self.engine.flush_cache()
+        result = self.engine.release_memory_occupation(
+            tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH]
+        )
+        return _raise_if_failed(result, "offload_kv")
+
+    def onload_weights(self) -> Any:
+        from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
+
+        result = self.engine.resume_memory_occupation(tags=[GPU_MEMORY_TYPE_WEIGHTS])
+        return _raise_if_failed(result, "onload_weights")
+
+    def onload_kv(self) -> Any:
+        from sglang.srt.constants import (
+            GPU_MEMORY_TYPE_CUDA_GRAPH,
+            GPU_MEMORY_TYPE_KV_CACHE,
+        )
+
+        result = self.engine.resume_memory_occupation(
+            tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH]
+        )
+        return _raise_if_failed(result, "onload_kv")
 
     def post_process_weights(
         self,
@@ -307,10 +370,18 @@ def main() -> None:
     parser.add_argument("--master-port", type=int, default=29565)
     parser.add_argument("--mem-fraction-static", type=float, default=0.3)
     parser.add_argument(
+        "--test-offload-onload",
+        action="store_true",
+        help="Enable the 'test offload/onload' branch around the IPC weight update.",
+    )
+    parser.add_argument(
         "--moe-runner-backend",
+        "--sglang-moe-runner-backend",
+        dest="moe_runner_backend",
         type=str,
-        default=None,
-        help="Optional pass-through to SGLang Engine, e.g. flashinfer_trtllm_routed.",
+        default="triton",
+        choices=_MOE_RUNNER_BACKEND_CHOICES,
+        help="SGLang MoE runner backend passed as Engine(moe_runner_backend=...).",
     )
     args = parser.parse_args()
 
@@ -329,7 +400,11 @@ def main() -> None:
     print(f"[main] ckpt={ckpt}", flush=True)
     print(
         f"[main] pp={args.pp} tp={args.tp} dp={args.dp} dtype={args.dtype} "
-        f"n_engine={n_engine}",
+        f"n_engine={n_engine} moe_runner_backend={args.moe_runner_backend}",
+        flush=True,
+    )
+    print(
+        f"[main] branch={'test offload/onload' if args.test_offload_onload else 'baseline'}",
         flush=True,
     )
     print(f"[main] CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}", flush=True)
@@ -381,6 +456,12 @@ def main() -> None:
                 flush=True,
             )
 
+        if args.test_offload_onload:
+            print("[main] offload weights...", flush=True)
+            ray.get(engine.offload_weights.remote())
+            print("[main] offload kv+cuda_graph...", flush=True)
+            ray.get(engine.offload_kv.remote())
+
         print("[main] loading trainer tensors...", flush=True)
         trainer = _MockTrainer(
             ckpt=ckpt,
@@ -400,6 +481,10 @@ def main() -> None:
         }
 
         from nemo_rl.models.policy.utils import send_hf_buckets_via_ipc_actor_impl
+
+        if args.test_offload_onload:
+            print("[main] onload weights...", flush=True)
+            ray.get(engine.onload_weights.remote())
 
         print("[main] send_hf_buckets_via_ipc_actor_impl...", flush=True)
         t0 = time.time()
@@ -422,6 +507,10 @@ def main() -> None:
         print("[main] compare against snapshot...", flush=True)
         ray.get(engine.check_weights.remote("compare"))
         print("[main] compare passed.", flush=True)
+
+        if args.test_offload_onload:
+            print("[main] onload kv+cuda_graph...", flush=True)
+            ray.get(engine.onload_kv.remote())
 
         out_post = ray.get(engine.generate.remote(prompt, sampling))
         print(f"[main] post-update text={_text(out_post)!r}", flush=True)
