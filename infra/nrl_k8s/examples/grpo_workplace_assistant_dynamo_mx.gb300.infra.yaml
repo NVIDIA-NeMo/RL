@@ -92,9 +92,11 @@ _shared:
 
 # namespace auto-inferred from kube context.
 # MX overlay built from infra/nrl_k8s/dynamo_mx/Dockerfile.nemorl
-# (nixl-cu12 + ai-dynamo-runtime + modelexpress@1d8049d5 + protobuf>=6.31.1
-#  installed into the main venv and all /opt/ray_venvs/*/ actor venvs).
-image: jwillthomson/nemo-rl-mx:05-24
+# (nixl-cu13 + ai-dynamo-runtime + modelexpress@8594fd6 + protobuf>=6.31.1
+#  installed into the main venv and all /opt/ray_venvs/*/ actor venvs,
+#  on top of nvcr.io/nvidian/nemo-rl:nightly which includes tensordict +
+#  the rest of upstream main's pyproject.toml).
+image: jwillthomson/nemo-rl-mx:05-25-v3
 imagePullSecrets: [nvcr-secret]
 serviceAccount: nemo-rl-endpoint-registry
 
@@ -121,9 +123,10 @@ launch:
       exit 1
     fi
 
-    # The nemo-rl-mx:05-24 image bakes nixl-cu12==0.10.1 + modelexpress
-    # @kavink/nemo_rl_moe @ 8594fd6 directly into every venv; no runtime
-    # downgrade or PYTHONPATH shadow needed.
+    # The nemo-rl-mx:05-25-v3 image bakes nixl-cu13==0.10.1 + modelexpress
+    # @kavink/nemo_rl_moe @ 8594fd6 + tensordict directly into every venv
+    # (on top of nvcr.io/nvidian/nemo-rl:nightly); no runtime downgrade,
+    # PYTHONPATH shadow, or pip install needed.
     export PYTHONPATH=.:3rdparty/Megatron-LM-workspace/Megatron-LM
     # modelexpress.ucx_utils.apply_nic_pin_for_device is a no-op unless
     # MX_RDMA_NIC_PIN is set; "auto" picks the NUMA-local RoCE NIC per rank.
