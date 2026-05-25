@@ -29,6 +29,9 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation.sglang import SGLangConfig, SGLangGeneration
+from nemo_rl.models.generation.sglang.sglang_worker import (
+    _extract_generated_tokens_and_logprobs,
+)
 
 model_name = "Qwen/Qwen3-0.6B"
 
@@ -227,6 +230,38 @@ def get_generation_cluster_separate(num_gpus_per_node: int = 2) -> RayVirtualClu
 # =============================================================================
 # Basic Configuration Tests
 # =============================================================================
+
+
+def test_extract_generated_tokens_and_logprobs_from_output_ids():
+    """SGLang DLLM responses may omit output_token_logprobs."""
+    result = {
+        "output_ids": [319, 1234, 2],
+        "meta_info": {
+            "output_token_logprobs": [],
+        },
+    }
+
+    tokens, logprobs = _extract_generated_tokens_and_logprobs(result)
+
+    assert tokens == [319, 1234, 2]
+    assert logprobs == [0.0, 0.0, 0.0]
+
+
+def test_extract_generated_tokens_and_logprobs_prefers_logprob_tokens():
+    result = {
+        "output_ids": [1, 2],
+        "meta_info": {
+            "output_token_logprobs": [
+                [-0.1, 42, "a"],
+                [-0.2, 43, "b"],
+            ],
+        },
+    }
+
+    tokens, logprobs = _extract_generated_tokens_and_logprobs(result)
+
+    assert tokens == [42, 43]
+    assert logprobs == [-0.1, -0.2]
 
 
 @pytest.mark.sglang

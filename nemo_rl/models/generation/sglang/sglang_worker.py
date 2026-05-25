@@ -15,6 +15,7 @@
 import asyncio
 import logging
 import multiprocessing
+import socket
 import os
 import time
 from typing import Any, Optional
@@ -37,6 +38,50 @@ from nemo_rl.models.generation.sglang.utils import AsyncLoopThread
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 logger = logging.getLogger(__name__)
+
+
+def _is_port_available(port: int) -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("", port))
+        return True
+    except OSError:
+        return False
+
+
+def _choose_sglang_port(base_gpu_id: int, offset: int = 0) -> int:
+    slurm_job_id = int(os.environ.get("SLURM_JOB_ID", "0") or 0)
+    seed = (slurm_job_id % 500) * 80 + base_gpu_id * 2 + offset
+
+    for attempt in range(2500):
+        port = 20000 + ((seed + attempt * 16) % 40000)
+        if _is_port_available(port):
+            return port
+
+    return _get_free_port_local()
+
+
+def _extract_generated_tokens_and_logprobs(
+    result: dict[str, Any],
+) -> tuple[list[int], list[float]]:
+    """Extract generated token IDs and logprobs from an SGLang /generate response."""
+    meta_info = result.get("meta_info", {})
+    output_token_logprobs = meta_info.get("output_token_logprobs", [])
+
+    if output_token_logprobs:
+        new_tokens = [item[1] for item in output_token_logprobs]
+        new_logprobs = [item[0] for item in output_token_logprobs]
+        return new_tokens, new_logprobs
+
+    # SGLang DLLM generation can return output_ids without output_token_logprobs.
+    # Keep the sampled sequence and let policy logprob inference recompute old-policy
+    # logprobs before training.
+    output_ids = result.get("output_ids", meta_info.get("output_ids", []))
+    if output_ids:
+        return output_ids, [0.0] * len(output_ids)
+
+    return [], []
 
 
 def _require_sglang():
@@ -176,9 +221,13 @@ class SGLangGenerationWorker:
             f"bundle_indices={bundle_indices}, global_cvd={global_cvd}"
         )
 
-        # Get current node IP and a free port for the server
+        # Get current node IP and per-actor ports for the server. Avoid random
+        # ephemeral-port races when many SGLang actors start together.
         node_ip = _get_node_ip_local()
-        free_port = _get_free_port_local()
+        free_port = _choose_sglang_port(base_gpu_id, offset=0)
+        grpc_port = _choose_sglang_port(base_gpu_id, offset=1)
+
+        os.environ["SGLANG_GRPC_PORT"] = str(grpc_port)
 
         # Build SGLang server arguments
         kwargs = {
@@ -207,6 +256,7 @@ class SGLangGenerationWorker:
         for key in [
             "dtype",
             "kv_cache_dtype",
+            "skip_tokenizer_init",
             "context_length",
             "max_running_requests",
             "chunked_prefill_size",
@@ -216,8 +266,12 @@ class SGLangGenerationWorker:
             "cpu_offload_gb",
             "log_level",
             "mem_fraction_static",
+            "max_total_tokens",
             "allow_auto_truncate",
+            "attention_backend",
             "disable_piecewise_cuda_graph",
+            "dllm_algorithm",
+            "dllm_algorithm_config",
         ]:
             if key in self.sglang_cfg:
                 kwargs[key] = self.sglang_cfg[key]
@@ -463,19 +517,7 @@ class SGLangGenerationWorker:
             )
             raise
 
-        # Extract generated tokens and logprobs
-        meta_info = result.get("meta_info", {})
-        output_token_logprobs = meta_info.get("output_token_logprobs", [])
-
-        if output_token_logprobs:
-            new_tokens = [item[1] for item in output_token_logprobs]
-            new_logprobs = [item[0] for item in output_token_logprobs]
-        else:
-            # Fallback: empty if token logprobs not available
-            new_tokens = []
-            new_logprobs = []
-
-        return new_tokens, new_logprobs
+        return _extract_generated_tokens_and_logprobs(result)
 
     async def _generate_async(self, tasks):
         """Execute generation tasks with concurrency control.

@@ -1097,6 +1097,27 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         )
 
     @torch.no_grad()
+    @wrap_with_nvtx_name("megatron_policy_worker/stream_weights_via_http")
+    def stream_weights_via_http(
+        self,
+        sglang_url_to_gpu_uuids: dict[str, list[str]],
+    ) -> None:
+        """Stream model weights to SGLang servers via HTTP API.
+
+        Args:
+            sglang_url_to_gpu_uuids: Dict mapping SGLang server URL to GPU UUIDs.
+        """
+        from nemo_rl.models.policy.utils import stream_weights_via_http_impl
+
+        stream_weights_via_http_impl(
+            params_generator=self._iter_params_with_optional_kv_scales(),
+            sglang_url_to_gpu_uuids=sglang_url_to_gpu_uuids,
+            rank=self.rank,
+            worker_name=str(self),
+            current_device_uuid=self.report_device_id(),
+        )
+
+    @torch.no_grad()
     def broadcast_weights_for_collective(
         self, kv_scales: Optional[dict[str, float]] = None
     ) -> None:

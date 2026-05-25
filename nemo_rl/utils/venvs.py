@@ -99,6 +99,58 @@ def create_local_venv(
 
     # Return the path to the python executable in the virtual environment
     python_path = os.path.join(venv_path, "bin", "python")
+    if "SGLangGenerationWorker" in venv_name:
+        sglang_flashinfer_specs = os.environ.get(
+            "NEMO_RL_SGLANG_FLASHINFER_SPECS",
+            "flashinfer_python==0.6.7.post3 flashinfer_cubin==0.6.7.post3",
+        )
+        if sglang_flashinfer_specs:
+            subprocess.run(
+                [
+                    python_path,
+                    "-m",
+                    "pip",
+                    "install",
+                    "--no-deps",
+                    "--force-reinstall",
+                    *shlex.split(sglang_flashinfer_specs),
+                ],
+                env=env,
+                check=True,
+            )
+
+        sglang_kernel_source = os.environ.get("NEMO_RL_SGLANG_KERNEL_SOURCE")
+        if sglang_kernel_source:
+            if sglang_kernel_source.endswith(".whl"):
+                subprocess.run(
+                    [
+                        python_path,
+                        "-m",
+                        "pip",
+                        "install",
+                        "--no-deps",
+                        "--force-reinstall",
+                        sglang_kernel_source,
+                    ],
+                    env=env,
+                    check=True,
+                )
+            else:
+                subprocess.run(
+                    [
+                        "uv",
+                        "pip",
+                        "install",
+                        "--python",
+                        python_path,
+                        "--no-deps",
+                        "--reinstall",
+                        "--no-build-isolation",
+                        sglang_kernel_source,
+                    ],
+                    env=env,
+                    check=True,
+                )
     return python_path
 
 

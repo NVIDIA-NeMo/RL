@@ -59,6 +59,7 @@ class SglangSpecificArgs(TypedDict):
     sampling_backend: NotRequired[str | None]
     context_length: NotRequired[int | None]
     mem_fraction_static: NotRequired[float | None]
+    max_total_tokens: NotRequired[int | None]
     max_running_requests: NotRequired[int | None]
     chunked_prefill_size: NotRequired[int | None]
     max_prefill_tokens: NotRequired[int]
@@ -93,6 +94,11 @@ class SglangSpecificArgs(TypedDict):
     enable_fast_load: NotRequired[bool]
     # Server warmup
     skip_server_warmup: NotRequired[bool]
+    # Diffusion LLM serving. `dllm_algorithm` maps to SGLang's ServerArgs
+    # value, e.g. "FastDiffuser" or "LinearSpec". `dllm_algorithm_config`
+    # is a path to the SGLang YAML file that configures the algorithm.
+    dllm_algorithm: NotRequired[str | None]
+    dllm_algorithm_config: NotRequired[str | None]
 
 
 class SGLangConfig(GenerationConfig):

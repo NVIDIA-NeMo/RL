@@ -50,7 +50,7 @@ dependencies = [
   "swanlab",
   "pyzmq",
   "decord2",
-  "soundfile>=0.13.1",
+  "soundfile==0.13.1",                                                                                                # imported by audio dataset modules
   "nccl4py",                                                                                                          # for non-colocated refit
   "cuda-bindings",                                                                                                    # for non-colocated refit
   "pybase64",                                                                                                         # for sglang refit
@@ -186,9 +186,9 @@ causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", rev = "67e
 mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "d68d16ed7d5d5164eb5a57c0285f3b7eb8394ec1" }
 nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v1.1.4.post7" }
 emerging-optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.2.0" }
-# Official sglang v0.5.10 with transformers v5 support
-sglang = { git = "https://github.com/sgl-project/sglang.git", tag = "v0.5.10", subdirectory = "python" }
-sglang-kernel = { git = "https://github.com/sgl-project/sglang.git", tag = "v0.5.10", subdirectory = "sgl-kernel" }
+# Nemotron-Diffusion DLLM support is carried on this pinned SGLang fork.
+sglang = { git = "ssh://git@github.com/sajadn/slgang-nemotron-diffusion.git", rev = "6e180058ad266cde5b41d8a4f0190f5a2972230c", subdirectory = "python" }
+sglang-kernel = { index = "sglang-kernel-cu129" }
 
 [tool.uv.workspace]
 members = [
@@ -210,6 +210,11 @@ explicit = true
 [[tool.uv.index]]
 name = "pytorch-cu129"
 url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[[tool.uv.index]]
+name = "sglang-kernel-cu129"
+url = "https://docs.sglang.io/whl/cu129"
 explicit = true
 
 [tool.uv]
@@ -394,11 +399,12 @@ requires-dist = ["torch", "scikit-build-core", "wheel"]
 
 [[tool.uv.dependency-metadata]]
 name = "sglang"
-# VCS install from official sgl-project/sglang v0.5.10
+# Dependency metadata for the pinned Nemotron-DLLM SGLang fork.
 # Version is dynamic (setuptools-scm), so uv cannot resolve deps from the VCS source automatically.
-# This requires-dist list must be kept in sync with the official python/pyproject.toml [project].dependencies.
-# Source: https://github.com/sgl-project/sglang/blob/v0.5.10/python/pyproject.toml
-version = "0.5.10"
+# This requires-dist list must be kept in sync with the pinned fork commit's
+# python/pyproject.toml [project].dependencies.
+# Source commit: 6e180058ad266cde5b41d8a4f0190f5a2972230c
+version = "0.0.0.dev1+g6e180058a.d20260504"
 requires-dist = [
   "IPython",
   "aiohttp",
@@ -505,30 +511,11 @@ requires-dist = [
   "torch>=2.6.0",
 ]
 
-# Override logsage metadata to remove numpy<=2.0.2 and pandas<=2.3.3 upper bounds
-# (numpy cap conflicts with onnx>=1.21.0rc4 CVE fix via nvidia-resiliency-ext)
-# Tracking: https://github.com/NVIDIA/nvidia-resiliency-ext/issues/301
+# remove numpy upper-bound to resolve conflict of nvidia-resiliency-ext==0.6.0 and onnx>=1.21.0rc4
 [[tool.uv.dependency-metadata]]
 name = "logsage"
 version = "0.1.5"
-requires-dist = [
-  "drain3>=0.9.11,<0.10.0",
-  "langchain>=0.3.27,<0.4.0",
-  "langchain-core>=0.3.0,<1.0.0",
-  "langchain-nvidia-ai-endpoints>=0.3.18,<0.4.0",
-  "nh3>=0.3.1,<0.4.0",
-  "numpy",
-  "pandas",
-  "pydantic-settings>=2.11.0,<3.0.0",
-  "requests>=2.32.5,<3.0.0",
-]
-
-# Override drain3 to relax cachetools==4.2.1 pin (conflicts with mlflow's cachetools>=5.0.0)
-# Tracking: https://github.com/logpai/Drain3/issues/119
-[[tool.uv.dependency-metadata]]
-name = "drain3"
-version = "0.9.11"
-requires-dist = ["jsonpickle", "cachetools>=4.2.1"]
+requires-dist = []
 
 [tool.black]
 line-length = 120
@@ -553,7 +540,6 @@ markers = [
   "automodel: marks tests that require the automodel extra",
   "vllm: marks tests that require the vllm extra",
   "sglang: marks tests that require the sglang extra",
-  "nemo_gym: marks tests that require the nemo_gym extra",
 ]
 
 [tool.pyrefly]
