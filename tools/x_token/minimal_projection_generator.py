@@ -280,11 +280,11 @@ if __name__ == "__main__":
 
         # Apply canonicalization if requested
         if args.use_canonicalization:
-            from nemo_rl.algorithms.x_token.token_aligner import _canonical_token
+            from nemo_rl.algorithms.x_token.token_aligner import canonical_token
 
             print("Applying token canonicalization before embedding generation...")
-            decoded_tokens_student = [_canonical_token(token) for token in raw_tokens_student]
-            decoded_tokens_teacher = [_canonical_token(token) for token in raw_tokens_teacher]
+            decoded_tokens_student = [canonical_token(token) for token in raw_tokens_student]
+            decoded_tokens_teacher = [canonical_token(token) for token in raw_tokens_teacher]
 
             # Show some examples of canonicalization
             print("Canonicalization examples:")

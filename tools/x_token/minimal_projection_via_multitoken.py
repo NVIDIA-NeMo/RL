@@ -20,8 +20,8 @@ import torch
 import tqdm
 from transformers import AutoConfig, AutoTokenizer
 
+from nemo_rl.algorithms.x_token.token_aligner import canonical_token
 from tools.x_token._shared import (
-    apply_canonicalization_if_enabled,
     clean_model_name_for_filename,
     sinkhorn_one_dim,
 )
@@ -73,7 +73,7 @@ def print_projection_map_examples(
         direction: Human-readable direction label, e.g. "student->teacher".
         num_examples: Number of source tokens to print (highest-id first).
         use_raw_tokens: If True, use ``convert_ids_to_tokens`` instead of ``decode``.
-        use_canonicalization: If True, apply :func:`_canonical_token` after decoding.
+        use_canonicalization: If True, apply :func:`canonical_token` after decoding.
     """
     print(
         f"\n--- Projection map examples {direction} (showing {num_examples} examples) ---"
@@ -93,7 +93,7 @@ def print_projection_map_examples(
                 source_token = source_tokenizer.convert_ids_to_tokens([source_id])[0]
             else:
                 source_token = source_tokenizer.decode([source_id])
-            source_token = apply_canonicalization_if_enabled(source_token, use_canonicalization)
+            source_token = canonical_token(source_token, enabled=use_canonicalization)
             source_token_str = repr(source_token)
         except Exception:
             source_token_str = f"<ID:{source_id}>"
@@ -107,7 +107,7 @@ def print_projection_map_examples(
                     target_token = target_tokenizer.convert_ids_to_tokens([target_id])[0]
                 else:
                     target_token = target_tokenizer.decode([target_id])
-                target_token = apply_canonicalization_if_enabled(target_token, use_canonicalization)
+                target_token = canonical_token(target_token, enabled=use_canonicalization)
                 target_token_str = repr(target_token)
             except Exception:
                 target_token_str = f"<ID:{target_id}>"
@@ -148,7 +148,7 @@ def add_multitoken_mappings(
             weights are accumulated in place.
         tokens_to_cut: Cap the re-encoding at this many target tokens.
         use_raw_tokens: If True, decode via ``convert_ids_to_tokens`` instead of ``decode``.
-        use_canonicalization: If True, apply :func:`_canonical_token` after decoding.
+        use_canonicalization: If True, apply :func:`canonical_token` after decoding.
 
     Returns:
         ``(decoded_source_tokens, examples)`` where ``decoded_source_tokens`` is a
@@ -178,7 +178,7 @@ def add_multitoken_mappings(
             if decoded.startswith("<|") and decoded.endswith("|>"):
                 print(f"Skipping special token: {decoded}")
                 continue
-            decoded = apply_canonicalization_if_enabled(decoded, use_canonicalization)
+            decoded = canonical_token(decoded, enabled=use_canonicalization)
             decoded_source[token_id] = decoded
         except Exception:
             continue
@@ -732,8 +732,8 @@ if __name__ == "__main__":
         print("Checking for exact token matches and setting exact mappings...")
         # check exact match between student and teacher tokens and set those as perfect 1-to-1 mappings
         # Convert all tokens to strings at once for vectorized comparison
-        tokens_student = [apply_canonicalization_if_enabled(tokenizer_student.convert_ids_to_tokens([i])[0], USE_CANONICALIZATION) for i in range(tokenizer_student_total_vocab_size)]
-        tokens_teacher = [apply_canonicalization_if_enabled(tokenizer_teacher.convert_ids_to_tokens([j])[0], USE_CANONICALIZATION) for j in range(tokenizer_teacher_total_vocab_size)]
+        tokens_student = [canonical_token(tokenizer_student.convert_ids_to_tokens([i])[0], enabled=USE_CANONICALIZATION) for i in range(tokenizer_student_total_vocab_size)]
+        tokens_teacher = [canonical_token(tokenizer_teacher.convert_ids_to_tokens([j])[0], enabled=USE_CANONICALIZATION) for j in range(tokenizer_teacher_total_vocab_size)]
 
         map_teacher_token_to_idx = {token: j for j, token in enumerate(tokens_teacher)}
 

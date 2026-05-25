@@ -22,8 +22,6 @@ import re
 
 import torch
 
-from nemo_rl.algorithms.x_token.token_aligner import _canonical_token
-
 
 def sinkhorn_one_dim(A, n_iters=1):
     """One-sided Sinkhorn normalization: scale rows to sum to 1."""
@@ -32,13 +30,6 @@ def sinkhorn_one_dim(A, n_iters=1):
         safe_row_sums = torch.where(row_sums == 0, torch.ones_like(row_sums), row_sums)
         A = A / safe_row_sums
     return A
-
-
-def apply_canonicalization_if_enabled(token_str, use_canonicalization):
-    """Apply :func:`_canonical_token` to ``token_str`` iff ``use_canonicalization``."""
-    if use_canonicalization:
-        return _canonical_token(token_str)
-    return token_str
 
 
 def clean_model_name_for_filename(name: str) -> str:

@@ -17,7 +17,7 @@ import os
 import torch
 from transformers import AutoConfig, AutoTokenizer
 
-from tools.x_token._shared import apply_canonicalization_if_enabled
+from nemo_rl.algorithms.x_token.token_aligner import canonical_token
 
 
 def parse_arguments():
@@ -157,8 +157,8 @@ if __name__ == "__main__":
     model_A_config = AutoConfig.from_pretrained(student_model_name)
     model_B_config = AutoConfig.from_pretrained(teacher_model_name)
 
-    tokens_student = [apply_canonicalization_if_enabled(tokenizer_student.convert_ids_to_tokens([i])[0], USE_CANONICALIZATION) for i in range(tokenizer_student_total_vocab_size)]
-    tokens_teacher = [apply_canonicalization_if_enabled(tokenizer_teacher.convert_ids_to_tokens([j])[0], USE_CANONICALIZATION) for j in range(tokenizer_teacher_total_vocab_size)]
+    tokens_student = [canonical_token(tokenizer_student.convert_ids_to_tokens([i])[0], enabled=USE_CANONICALIZATION) for i in range(tokenizer_student_total_vocab_size)]
+    tokens_teacher = [canonical_token(tokenizer_teacher.convert_ids_to_tokens([j])[0], enabled=USE_CANONICALIZATION) for j in range(tokenizer_teacher_total_vocab_size)]
 
     map_teacher_token_to_idx = {token: j for j, token in enumerate(tokens_teacher)}
 

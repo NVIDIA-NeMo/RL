@@ -431,8 +431,17 @@ class TokenAligner:
 # =====================================================================
 
 
-def _canonical_token(token: str) -> str:
-    """Return a canonical representation of a tokenizer token."""
+def canonical_token(token: str, *, enabled: bool = True) -> str:
+    """Return a canonical representation of a tokenizer token.
+
+    Public helper consumed by the alignment pipeline AND by the
+    projection-prep CLIs in ``tools/x_token/``. The ``enabled`` flag is
+    a passthrough toggle: when ``False`` the input is returned unchanged
+    (lets CLI call sites gate canonicalization via a single flag without
+    branching at every site).
+    """
+    if not enabled:
+        return token
     if not token:
         return token
 
@@ -489,7 +498,7 @@ def _canonical_token(token: str) -> str:
 def _canonicalize_sequence(seq: List[str]) -> List[str]:
     """Canonicalize every token in a sequence, including byte-merging."""
     merged = _merge_encoding_artifacts(seq)
-    canon = [_canonical_token(t) for t in merged]
+    canon = [canonical_token(t) for t in merged]
     return _merge_consecutive_bytes(canon)
 
 
@@ -583,7 +592,7 @@ def _strings_equal_flexible(s1: str, s2: str, ignore_leading_char_diff: bool) ->
     """Compare two strings, optionally after canonicalization."""
     if not ignore_leading_char_diff:
         return s1 == s2
-    return _canonical_token(s1) == _canonical_token(s2)
+    return canonical_token(s1) == canonical_token(s2)
 
 
 def _align_dp(
@@ -731,8 +740,8 @@ def _alignment_mask(aligned_pairs: List[Tuple[Any, ...]]) -> List[bool]:
     """Compute is_correct for each pair using canonicalized text comparison."""
     out: List[bool] = []
     for s_toks, t_toks, *_rest in aligned_pairs:
-        s_canon = "".join(_canonical_token(tk) for tk in s_toks) if s_toks else ""
-        t_canon = "".join(_canonical_token(tk) for tk in t_toks) if t_toks else ""
+        s_canon = "".join(canonical_token(tk) for tk in s_toks) if s_toks else ""
+        t_canon = "".join(canonical_token(tk) for tk in t_toks) if t_toks else ""
         out.append(_strings_equal_flexible(s_canon, t_canon, ignore_leading_char_diff=False))
     return out
 
@@ -798,8 +807,8 @@ def _post_process_alignment(
         for chunk_size in range(2, max_chunk + 1):
             chunk = aligned_pairs[bad_start : bad_start + chunk_size]
             chunk_s1, chunk_s2, s1_idx, s2_idx = _flatten_chunk(chunk)
-            chunk_s1_str = "".join(_canonical_token(t) for t in chunk_s1)
-            chunk_s2_str = "".join(_canonical_token(t) for t in chunk_s2)
+            chunk_s1_str = "".join(canonical_token(t) for t in chunk_s1)
+            chunk_s2_str = "".join(canonical_token(t) for t in chunk_s2)
             if not _strings_equal_flexible(
                 chunk_s1_str, chunk_s2_str, ignore_leading_char_diff=False
             ):
@@ -819,8 +828,8 @@ def _post_process_alignment(
                 )
                 perfect = all(
                     _strings_equal_flexible(
-                        "".join(_canonical_token(t) for t in p[0]),
-                        "".join(_canonical_token(t) for t in p[1]),
+                        "".join(canonical_token(t) for t in p[0]),
+                        "".join(canonical_token(t) for t in p[1]),
                         ignore_leading_char_diff=False,
                     )
                     for p in sub_pairs
@@ -864,8 +873,8 @@ def _build_pair_strings(
     """Precompute (s_str, t_str, is_match) for each pair."""
     out: List[Tuple[str, str, bool]] = []
     for s_toks, t_toks, *_rest in aligned_pairs:
-        s_canon = "".join(_canonical_token(t) for t in s_toks) if s_toks else ""
-        t_canon = "".join(_canonical_token(t) for t in t_toks) if t_toks else ""
+        s_canon = "".join(canonical_token(t) for t in s_toks) if s_toks else ""
+        t_canon = "".join(canonical_token(t) for t in t_toks) if t_toks else ""
         is_match = _strings_equal_flexible(s_canon, t_canon, ignore_leading_char_diff=False)
         out.append((s_canon, t_canon, is_match))
     return out
