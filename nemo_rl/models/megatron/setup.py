@@ -181,8 +181,16 @@ def destroy_parallel_state():
         pass
 
 
-def setup_distributed() -> None:
+def setup_distributed(config: Optional[PolicyConfig] = None) -> None:
     """Handle NCCL settings, dtype mapping, and basic config setup."""
+    if (
+        config is not None
+        and "generation" in config
+        and config["generation"] is not None
+        and config["generation"].get("backend") == "sglang"
+    ):
+        os.environ["NCCL_CUMEM_ENABLE"] = "0"
+
     # Disable dynamo autotune_local_cache to avoid crash when there's already a cache
     # with different order of node_bundles
     configure_dynamo_cache()
@@ -216,24 +224,14 @@ def validate_and_set_config(
             temperature=generation_cfg["temperature"],
         )
 
+    # SGLang's scheduler subprocess defaults to NCCL_CUMEM_ENABLE=0, and the
+    # trainer / engine must agree on the transport selection.
+    if rollout_backend == "sglang":
+        os.environ["NCCL_CUMEM_ENABLE"] = "0"
     # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error
     # for PyNCCLCommunicator (see https://github.com/NVIDIA-NeMo/RL/issues/564).
-    #
-    # SGLang is the exception: its scheduler subprocess defaults to
-    # ``NCCL_CUMEM_ENABLE=0``, and trainer / engine must agree on the
-    # transport selection. Setting the trainer to 1 while sglang stays at
-    # 0 leaves NCCL with mismatched allocator modes on the two sides,
-    # which leads to the same NCCL P2P init error this flag is supposed
-    # to prevent.
-    if not is_generation_colocated:
-        # ``setdefault`` rather than direct assignment so an outer env
-        # override survives — on hosts without inter-GPU P2P (e.g.
-        # IOMMU-isolated PCIe), only ``NCCL_CUMEM_ENABLE=1`` works for
-        # the SGLang case, even though the in-process default is 0.
+    elif not is_generation_colocated:
         os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
-
-    if rollout_backend == "sglang":
-        os.environ.setdefault("NCCL_CUMEM_ENABLE", "0")
 
     # Setup data types
     dtype_map = {

@@ -779,6 +779,9 @@ def _compute_server_args(
         "cpu_offload_gb",
         "log_level",
         "mem_fraction_static",
+        "quantization",
+        "fp8_gemm_runner_backend",
+        "moe_runner_backend",
         "allow_auto_truncate",
         "disable_piecewise_cuda_graph",
         "disable_cuda_graph",
@@ -796,6 +799,9 @@ def _compute_server_args(
         "deepep_mode",
     ]:
         if key in sglang_cfg["sglang_cfg"]:
-            kwargs[key] = sglang_cfg["sglang_cfg"][key]
+            value = sglang_cfg["sglang_cfg"][key]
+            if key == "quantization" and isinstance(value, dict):
+                value = value.get("scheme")
+            kwargs[key] = value
 
     return kwargs

@@ -201,6 +201,7 @@ class SGLangGeneration(GenerationInterface):
                     "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
                 }.items()
             }
+            env_vars["NCCL_CUMEM_ENABLE"] = "0"
 
             # Explicitly pass CUDA_VISIBLE_DEVICES through to the engine actor so
             # all engines see the same global value (Ray would otherwise remap it

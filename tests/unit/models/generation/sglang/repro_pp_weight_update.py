@@ -192,6 +192,12 @@ def main() -> None:
         default=0,
         help="If > 0, only round-trip the first N tensors (faster smoke test).",
     )
+    parser.add_argument(
+        "--moe-runner-backend",
+        type=str,
+        default=None,
+        help="Pass through to sglang Engine (e.g. flashinfer_trtllm_routed, triton, auto).",
+    )
     args = parser.parse_args()
 
     n_engine = args.pp * args.tp * args.dp
@@ -223,6 +229,10 @@ def main() -> None:
 
     from sglang.srt.entrypoints.engine import Engine
 
+    engine_kwargs = {}
+    if args.moe_runner_backend is not None:
+        engine_kwargs["moe_runner_backend"] = args.moe_runner_backend
+
     engine = Engine(
         model_path=str(ckpt),
         tp_size=args.tp,
@@ -232,6 +242,7 @@ def main() -> None:
         log_level="info",
         random_seed=42,
         disable_cuda_graph=True,
+        **engine_kwargs,
     )
     print("[main] engine up", flush=True)
 
@@ -253,12 +264,48 @@ def main() -> None:
     # subsequent refit MUST overwrite them. Without this step the
     # post-update equality check trivially passes regardless of whether
     # the broadcast loop actually delivered anything.
-    from sglang.srt.managers.io_struct import CheckWeightsReqInput
+    from sglang.srt.managers.io_struct import (
+        CheckWeightsReqInput,
+        PostProcessWeightsReqInput,
+    )
 
     def _check_weights(action: str):
-        return engine.loop.run_until_complete(
+        res = engine.loop.run_until_complete(
             engine.tokenizer_manager.check_weights(CheckWeightsReqInput(action=action))
         )
+        # tokenizer_manager.check_weights returns _Communicator.merge_results,
+        # which is a ``(all_success: bool, joined_message: str)`` tuple — NOT
+        # a CheckWeightsReqOutput. The HTTP layer would convert
+        # ``success=False`` to a 400; this in-process path does not, so we
+        # have to raise ourselves to avoid a failed compare masquerading as
+        # success.
+        success, message = res
+        if not success:
+            raise RuntimeError(f"check_weights({action!r}) failed: {message}")
+        return res
+
+    def _post_process_weights():
+        """Re-run sglang's ``process_weights_after_loading`` hook on every module
+        after the broadcast/load loop. Without this, flashinfer trtllm MoE
+        layers keep canonical-shape weights from the broadcast and never get
+        re-packed into the block layout that the kernel expects — so post-
+        update inference crashes / produces garbage. nemo-rl's production
+        refit dispatch path always calls this (see
+        ``megatron_policy_worker.py:1870/1958``); the bare sglang
+        ``update_weights_from_distributed`` API does NOT do it implicitly.
+        """
+        res = engine.loop.run_until_complete(
+            engine.tokenizer_manager.post_process_weights(
+                PostProcessWeightsReqInput(
+                    restore_weights_before_load=False,
+                    post_process_quantization=True,
+                )
+            )
+        )
+        success, message = res
+        if not success:
+            raise RuntimeError(f"post_process_weights failed: {message}")
+        return res
 
     print("[main] snapshot...", flush=True)
     _check_weights("snapshot")
@@ -338,6 +385,16 @@ def main() -> None:
     # script aborts before reaching the snapshot compare below.
     print("[main] destroy_weights_update_group...", flush=True)
     engine.destroy_weights_update_group(group_name=group_name)
+
+    # Re-run ``process_weights_after_loading`` on every module so the
+    # flashinfer trtllm MoE layers re-pack the just-broadcast canonical
+    # weights into the 4-D block layout the kernel expects. nemo-rl's
+    # production refit dispatch does this via
+    # ``policy_generation.post_process_weights()``; bare sglang's
+    # ``update_weights_from_distributed`` does NOT do it implicitly.
+    print("[main] post_process_weights...", flush=True)
+    _post_process_weights()
+    print("[main] post_process_weights done.", flush=True)
 
     p.join(timeout=120)
     if p.is_alive():

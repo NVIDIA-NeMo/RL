@@ -186,12 +186,50 @@ def _check_weights(engine, action: str):
     """Drive sglang's WeightChecker (``snapshot`` / ``reset_tensors`` / ``compare``)
     against an in-process Engine. Production exposes this via the
     ``/weights_checker`` HTTP endpoint; we go straight through tokenizer_manager.
+
+    ``tokenizer_manager.check_weights`` returns ``_Communicator.merge_results``,
+    a ``(all_success: bool, joined_message: str)`` tuple — NOT a
+    ``CheckWeightsReqOutput``. The HTTP layer converts ``success=False`` to a
+    400; this in-process path does not, so raise here to avoid a failed
+    compare masquerading as success.
     """
     from sglang.srt.managers.io_struct import CheckWeightsReqInput
 
-    return engine.loop.run_until_complete(
+    res = engine.loop.run_until_complete(
         engine.tokenizer_manager.check_weights(CheckWeightsReqInput(action=action))
     )
+    success, message = res
+    if not success:
+        raise RuntimeError(f"check_weights({action!r}) failed: {message}")
+    return res
+
+
+def _post_process_weights(engine):
+    """Re-run sglang's ``process_weights_after_loading`` hook on every module.
+
+    Required after any weight refit path (NCCL broadcast or colocate IPC) when
+    the model uses a quant_method whose runtime layout differs from the load-
+    time layout — e.g. flashinfer trtllm BF16 / FP8 / MXFP8 MoE, which pack
+    weights into a block layout that the kernel expects but
+    ``update_weights_from_tensor`` / ``update_weights_from_distributed`` only
+    write back canonical bytes. Without this, post-refit inference crashes or
+    silently produces garbage. nemo-rl's production refit calls this via
+    ``policy_generation.post_process_weights()`` (megatron_policy_worker.py).
+    """
+    from sglang.srt.managers.io_struct import PostProcessWeightsReqInput
+
+    res = engine.loop.run_until_complete(
+        engine.tokenizer_manager.post_process_weights(
+            PostProcessWeightsReqInput(
+                restore_weights_before_load=False,
+                post_process_quantization=True,
+            )
+        )
+    )
+    success, message = res
+    if not success:
+        raise RuntimeError(f"post_process_weights failed: {message}")
+    return res
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +398,14 @@ def main() -> None:
         weight_version=1,
     )
     print(f"[main] send_hf_buckets done in {time.time() - t0:.1f}s", flush=True)
+
+    # Step 4.5: re-run process_weights_after_loading so flashinfer trtllm MoE
+    # layers re-pack the canonical bytes that send_hf_buckets_via_ipc_actor_impl
+    # just wrote. nemo-rl's production refit path always calls this; the bare
+    # update_weights_from_tensor API does NOT do it implicitly.
+    print("[main] post_process_weights...", flush=True)
+    _post_process_weights(engine)
+    print("[main] post_process_weights done.", flush=True)
 
     # Step 5: compare current weights against the snapshot. Raises if any
     # tensor differs — the strongest correctness signal we have.
