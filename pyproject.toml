@@ -43,7 +43,7 @@ dependencies = [
   "sympy>=1.14.0",
   "pillow>=12.1.1",
   "torchvision==0.25.0",
-  "transformers==5.5.0",
+  "transformers==5.8.1",
   "num2words>=0.5.14",                                                                                                # for SmolVLM
   "mlflow>=3.11.1",
   "nvidia-nvshmem-cu12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
@@ -65,7 +65,7 @@ automodel = [
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
   "flash-attn==2.8.1",
-  "transformers>=5.5.0",
+  "transformers==5.8.1",
   "mamba-ssm",
   "causal-conv1d",
   "nv-grouped-gemm",
@@ -82,10 +82,8 @@ vllm = [
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
-  # Prebuilt vLLM wheel from teammate's local build off vllm-project/vllm main @ c0879d948
-  # (post-#40860 "[Feat] DeepSeek V4 Rebased" merge; includes dummy-load fix and full DSV4
-  # rebase). cu129 / cp313. md5 50571679730c1d26196ddb3107d25204.
-  "vllm @ file:///lustre/fsw/portfolios/coreai/users/larkz/nemorl-ds4/dist/vllm-0.19.2rc1.dev219+gc0879d948.cu129-cp313-cp313-linux_x86_64.whl",
+  # Official vLLM CUDA 12.9 wheel. The PyPI default v0.21.0 wheel links against CUDA 13.
+  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.21.0/vllm-0.21.0+cu129-cp38-abi3-manylinux_2_34_x86_64.whl",
   "num2words>=0.5.14",
   "flashinfer-python==0.6.8.post1",
   "flashinfer-cubin==0.6.8.post1",
@@ -242,27 +240,23 @@ default-groups = ["dev", "build"]
 #  --link-mode=symlink (fastest option when uv cache and venv on different file-system; caveat: venv is brittle since it depends on the environment/container)
 link-mode = "copy"
 # The TE override is needed to pin the TE version across all extras
-# The opencv-python-headless override is needed because automodel pins it to 4.10.0.84, whereas vllm>=0.11.0 needs >= 4.11.0
+# The opencv-python-headless override is needed because automodel pins it to 4.10.0.84, whereas vllm>=0.21.0 needs >= 4.13.0
 # The timm override is needed because current automodel pins to 1.0.16. This can be removed once we move ToT automodel
 # The nvidia-modelopt override is needed because mcore is still on 0.33
 override-dependencies = [
   "transformer-engine[pytorch,core_cu12] @ git+https://github.com/NVIDIA/TransformerEngine.git@71bbefbf153418f943640df0f7373625dc93fa46",
   "nvidia-cudnn-cu12==9.19.0.56",
-  "opencv-python-headless>=4.11.0",
+  "opencv-python-headless>=4.13.0",
   "timm<=1.0.22",
   "nvidia-modelopt[torch]>=0.39.0",
-  # Larkz's vllm wheel (c0879d948) was built in a torch==2.10 venv even though
-  # its METADATA reports Requires-Dist: torch==2.11.0. The .so files link
-  # against torch 2.10's libc10 (4-arg MessageLogger constructor); torch 2.11
-  # ships only the SourceLocation-based one. uv override REPLACES the wheel's
-  # claimed pin so the lock can resolve to torch 2.10.
-  "torch==2.10.0",
-  "torchaudio==2.10.0",
-  "torchvision==0.25.0",
+  # Match the official vLLM wheel's PyTorch ABI.
+  "torch==2.11.0",
+  "torchaudio==2.11.0",
+  "torchvision==0.26.0",
   # sglang has conflicting llguidance versions than vllm, so enforcing vllm's version since it's newer
   "llguidance>=1.3.0,<1.4.0",
   # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
-  "setuptools>=80.10.2",
+  "setuptools>=80.10.2,<81.0.0",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
   # The DSV4 vllm wheel pins flashinfer-python/cubin == 0.6.8.post1 directly. uv
   # overrides REPLACE constraints (not merge), so without an exact pin here the
@@ -271,14 +265,12 @@ override-dependencies = [
   # superseded.
   "flashinfer-python==0.6.8.post1",
   "flashinfer-cubin==0.6.8.post1",
-  # vllm DSV4 (post-#40860) requires nvidia-cutlass-dsl>=4.4.2; sglang 0.5.10 requires >=4.4.1.
-  # Override to >=4.4.2 so uv can resolve to a version satisfying both extras.
-  "nvidia-cutlass-dsl>=4.4.2",
+  # Match vLLM's exact CUTLASS DSL requirement while satisfying sglang's lower bound.
+  "nvidia-cutlass-dsl==4.4.2",
   # Relax megatron-core workspace member's opentelemetry-api ceiling (<1.34) for protobuf 6.x compat with ray
   "opentelemetry-api>=1.33.1",
-  # Automodel main + Gemma 4 + DSV4 PR #2039 require transformers>=5.5.0 (gemma4 module added in 5.5.0.dev).
-  # The DSV4 vLLM wheel's PyPI metadata declares transformers<5; this override supersedes it. Runtime smoke required.
-  "transformers==5.5.0",
+  # DSV4 requires the upstream DeepSeek V4 support and fixes added in transformers 5.8.x.
+  "transformers==5.8.1",
   #Override till we can upgrade sglang version to address CVE GHSA-7rgv-gqhr-fxg3
   "xgrammar==0.1.33",
   # Override dependencies to address CVEs
