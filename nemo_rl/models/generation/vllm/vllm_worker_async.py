@@ -312,7 +312,6 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         from vllm.entrypoints.openai.engine.protocol import ErrorResponse
         from vllm.entrypoints.openai.models.protocol import BaseModelPath
         from vllm.entrypoints.openai.models.serving import OpenAIServingModels
-        from vllm.entrypoints.serve.render.serving import OpenAIServingRender
         from vllm.entrypoints.serve.tokenize.protocol import (
             TokenizeChatRequest,
             TokenizeCompletionRequest,
@@ -363,11 +362,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 return super().model_post_init(context)
 
         class NeMoRLOpenAIServingMixin:
-            # NOTE: vLLM 0.20 moved chat preprocessing from
+            # vLLM 0.20 moved chat preprocessing from
             # OpenAIServing._preprocess_chat to OpenAIServingRender.preprocess_chat,
-            # so this override now applies via the render subclass. The new
-            # signature adds `reasoning_parser` and the keyword-only
-            # `skip_mm_cache`; both are forwarded to super().
+            # so this override now applies via the render subclass.
             async def preprocess_chat(
                 self,
                 request,
@@ -435,7 +432,6 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     update={"add_generation_prompt": False}
                 )
 
-                # Call the actual preprocess chat subroutine so we don't miss anything. Whatever they do is whatever we do since we literally do what they do.
                 corresponding_res = await super().preprocess_chat(
                     request=modified_request,
                     messages=messages_to_last_assistant_message,
@@ -476,8 +472,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
         # vLLM 0.20 routes both /v1/chat/completions and /tokenize through
         # OpenAIServingRender.preprocess_chat, so the prefix-token override
-        # belongs on the render. Keep OpenAIServingChat/Tokenization as plain
-        # subclasses.
+        # belongs on the render subclass.
         class NeMoRLOpenAIServingChat(OpenAIServingChat):
             pass
 
@@ -489,12 +484,6 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             request_logger=None,
             chat_template=None,
             chat_template_content_format="auto",
-            # vLLM 0.20's OpenAIServingRender rejects requests with
-            # `tool_choice="auto"` (a common NeMo-Gym default) unless
-            # `enable_auto_tools=True` is set on the serving instance. Enable it
-            # so simple chat requests without a configured tool parser still
-            # validate; if no `tool_parser` is configured the request flow is
-            # unaffected because no parsing actually runs.
             enable_auto_tools=True,
         )
         serving_chat_kwargs = serving_chat_default_kwargs | self.cfg["vllm_cfg"].get(
@@ -585,7 +574,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         ]
 
         # Tokenize path delegates to OpenAIServingRender.preprocess_chat in
-        # vLLM 0.20, where the prefix-token override lives. No mixin needed here.
+        # vLLM 0.20, where the prefix-token override lives.
         class NeMoRLOpenAIServingTokenization(OpenAIServingTokenization):
             pass
 
