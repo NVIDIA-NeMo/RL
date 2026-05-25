@@ -1021,7 +1021,11 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         if (
             self.optimizer is not None
             and not self.cpu_offload
-            and (self.offload_optimizer_for_logprob or self.is_generation_colocated)
+            and (
+                self.offload_optimizer_for_logprob
+                or self.is_generation_colocated
+                or self._optimizer_state_has_cpu_tensors()
+            )
         ):
             self.move_optimizer_to_device("cuda")
 
@@ -1060,6 +1064,45 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 if isinstance(v, (DTensor, torch.Tensor)):
                     state[k] = v.to(device)
 
+    def _optimizer_state_has_cuda_tensors(self) -> bool:
+        if self.optimizer is None:
+            return False
+        return any(
+            v.device.type == "cuda"
+            for state in self.optimizer.state.values()
+            for v in state.values()
+            if isinstance(v, (DTensor, torch.Tensor))
+        )
+
+    def _optimizer_state_has_cpu_tensors(self) -> bool:
+        if self.optimizer is None:
+            return False
+        return any(
+            v.device.type == "cpu"
+            for state in self.optimizer.state.values()
+            for v in state.values()
+            if isinstance(v, (DTensor, torch.Tensor))
+        )
+
+    @contextmanager
+    def _offload_optimizer_state_for_checkpoint(
+        self, optimizer_path: Optional[str]
+    ) -> Generator[None, None, None]:
+        should_offload = (
+            optimizer_path is not None and self._optimizer_state_has_cuda_tensors()
+        )
+        if should_offload:
+            self.move_optimizer_to_device("cpu")
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        try:
+            yield
+        finally:
+            if should_offload and not self.cpu_offload:
+                self.move_optimizer_to_device("cuda")
+                torch.cuda.empty_cache()
+
     def move_to_device(self, model: nn.Module, device: str | torch.device) -> nn.Module:
         model = self.move_buffer_to_device(model, device)
         return model.to(device)
@@ -1096,18 +1139,19 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
 
         the optimizer states are saved only if `optimizer` and `optimizer_path` are provided.
         """
-        self.checkpoint_manager.save_checkpoint(
-            model=self.model,
-            weights_path=weights_path,
-            optimizer=self.optimizer,
-            optimizer_path=optimizer_path,
-            scheduler=self.scheduler,
-            tokenizer=self.tokenizer if tokenizer_path else None,
-            tokenizer_path=tokenizer_path,
-            checkpointing_cfg=checkpointing_cfg,
-            lora_enabled=self.lora_enabled,
-            peft_config=self.peft_config,
-        )
+        with self._offload_optimizer_state_for_checkpoint(optimizer_path):
+            self.checkpoint_manager.save_checkpoint(
+                model=self.model,
+                weights_path=weights_path,
+                optimizer=self.optimizer,
+                optimizer_path=optimizer_path,
+                scheduler=self.scheduler,
+                tokenizer=self.tokenizer if tokenizer_path else None,
+                tokenizer_path=tokenizer_path,
+                checkpointing_cfg=checkpointing_cfg,
+                lora_enabled=self.lora_enabled,
+                peft_config=self.peft_config,
+            )
 
     def load_checkpoint(
         self,

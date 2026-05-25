@@ -119,7 +119,9 @@ class VllmInternalWorkerExtension:
             kv_cache_dtype = getattr(
                 self.model_runner.vllm_config.cache_config, "cache_dtype", None
             )
-            kv_cache_dtype_str = str(kv_cache_dtype).lower() if kv_cache_dtype is not None else ""
+            kv_cache_dtype_str = (
+                str(kv_cache_dtype).lower() if kv_cache_dtype is not None else ""
+            )
             use_fp8_kv_cache = (
                 "fp8" in kv_cache_dtype_str and kv_cache_dtype_str != "fp8_ds_mla"
             )
@@ -200,10 +202,13 @@ class VllmInternalWorkerExtension:
 
                 if payload == IPCProtocol.COMPLETE:
                     # means the update is done
+                    from nemo_rl.models.generation.vllm.quantization import fp8
                     from vllm.model_executor.model_loader.utils import (
                         process_weights_after_loading,
                     )
 
+                    if fp8.is_fp8_model(self.model_runner.vllm_config):
+                        fp8.ensure_fp8_patches_applied(self.model_runner)
                     process_weights_after_loading(
                         self.model_runner.model, self.model_config, self.device
                     )

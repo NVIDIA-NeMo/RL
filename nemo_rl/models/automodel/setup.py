@@ -32,6 +32,7 @@ from nemo_automodel.components.distributed.mesh_utils import create_device_mesh
 from nemo_automodel.components.distributed.tensor_utils import get_cpu_state_dict
 from nemo_automodel.components.moe.config import MoEParallelizerConfig
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
+from torch.distributed.tensor import DTensor
 from transformers import (
     AutoConfig,
     AutoProcessor,
@@ -58,6 +59,91 @@ STRING_TO_DTYPE = {
     "bfloat16": torch.bfloat16,
     "float16": torch.float16,
 }
+
+
+class _ChainedOptimizer(torch.optim.Optimizer):
+    """Minimal optimizer wrapper that steps multiple child optimizers together."""
+
+    def __init__(self, optimizers: list[torch.optim.Optimizer]):
+        if not optimizers:
+            raise ValueError("Expected at least one optimizer")
+        self.optimizers = optimizers
+        self.param_groups = [
+            param_group
+            for optimizer in self.optimizers
+            for param_group in optimizer.param_groups
+        ]
+        self.defaults = {}
+
+    @property
+    def state(self):
+        state = {}
+        for optimizer in self.optimizers:
+            state.update(optimizer.state)
+        return state
+
+    def step(self, closure=None):
+        loss = None
+        for optimizer in self.optimizers:
+            if closure is None:
+                maybe_loss = optimizer.step()
+            else:
+                maybe_loss = optimizer.step(closure)
+            if maybe_loss is not None:
+                loss = maybe_loss
+        return loss
+
+    def zero_grad(self, set_to_none: bool = True):
+        for optimizer in self.optimizers:
+            optimizer.zero_grad(set_to_none=set_to_none)
+
+    def state_dict(self):
+        state = {}
+        param_groups = []
+        offset = 0
+        for optimizer in self.optimizers:
+            optimizer_state_dict = optimizer.state_dict()
+            for param_id, param_state in optimizer_state_dict["state"].items():
+                state[param_id + offset] = param_state
+            for param_group in optimizer_state_dict["param_groups"]:
+                param_group = dict(param_group)
+                param_group["params"] = [
+                    param_id + offset for param_id in param_group["params"]
+                ]
+                param_groups.append(param_group)
+            offset += sum(
+                len(param_group["params"])
+                for param_group in optimizer_state_dict["param_groups"]
+            )
+        return {"state": state, "param_groups": param_groups}
+
+    def load_state_dict(self, state_dict):
+        group_offset = 0
+        for optimizer in self.optimizers:
+            group_count = len(optimizer.param_groups)
+            child_param_groups = [
+                dict(param_group)
+                for param_group in state_dict["param_groups"][
+                    group_offset : group_offset + group_count
+                ]
+            ]
+            child_param_ids = {
+                param_id
+                for param_group in child_param_groups
+                for param_id in param_group["params"]
+            }
+            child_state = {
+                param_id: param_state
+                for param_id, param_state in state_dict["state"].items()
+                if param_id in child_param_ids
+            }
+            optimizer.load_state_dict(
+                {"state": child_state, "param_groups": child_param_groups}
+            )
+            group_offset += group_count
+
+    def add_param_group(self, param_group):
+        raise NotImplementedError("Cannot add parameter groups to _ChainedOptimizer")
 
 
 def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
@@ -133,6 +219,47 @@ def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
         f"`policy.dtensor_cfg.automodel_kwargs.force_hf=true` in your config."
     )
     automodel_kwargs["force_hf"] = True
+
+
+def _local_parameter_dtype(param: torch.nn.Parameter) -> torch.dtype:
+    if isinstance(param, DTensor):
+        return param.to_local().dtype
+    return param.dtype
+
+
+def _split_trainable_params_by_local_dtype(
+    model: torch.nn.Module,
+) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
+    fp32_params: list[torch.nn.Parameter] = []
+    other_params: list[torch.nn.Parameter] = []
+    for param in model.parameters():
+        if not param.requires_grad:
+            continue
+        if _local_parameter_dtype(param) == torch.float32:
+            fp32_params.append(param)
+        else:
+            other_params.append(param)
+    return fp32_params, other_params
+
+
+def _adamw_kwargs_from_optimizer_kwargs(optimizer_kwargs: dict[str, Any]) -> dict[str, Any]:
+    adamw_keys = {
+        "lr",
+        "betas",
+        "eps",
+        "weight_decay",
+        "amsgrad",
+        "foreach",
+        "maximize",
+        "capturable",
+        "differentiable",
+        "fused",
+    }
+    return {
+        key: value
+        for key, value in optimizer_kwargs.items()
+        if key in adamw_keys
+    }
 
 
 def get_tokenizer(
@@ -532,6 +659,7 @@ def setup_model_and_optimizer(
     model_class = runtime_config.model_class
     attn_impl = runtime_config.attn_impl
     cpu_offload = runtime_config.cpu_offload
+    dtype = runtime_config.dtype
     is_reward_model = runtime_config.is_reward_model
 
     # Extract distributed configuration from context
@@ -659,6 +787,16 @@ def setup_model_and_optimizer(
 
     # Create model via from_pretrained - handles meta device init, parallelization,
     # LoRA, and base weight loading internally
+    model_torch_dtype = model_config.torch_dtype
+    if getattr(model_config, "model_type", None) == "deepseek_v4":
+        # NeMo-RL reads AutoConfig above with torch_dtype=float32 so the
+        # master-weight path has an fp32 config object.  Automodel's custom DSV4
+        # constructor also consumes config.torch_dtype for regular trainable
+        # modules, so passing that fp32 value through would build most of the
+        # model in fp32.  Restore the runtime policy dtype here; DSV4's explicit
+        # fp32 submodules are selected inside Automodel itself.
+        model_torch_dtype = dtype
+
     model = model_class.from_pretrained(
         model_name,
         device_mesh=device_mesh,
@@ -668,7 +806,7 @@ def setup_model_and_optimizer(
         activation_checkpointing=config["dtensor_cfg"]["activation_checkpointing"],
         peft_config=peft_config,
         attn_implementation=attn_impl,
-        torch_dtype=str(model_config.torch_dtype),
+        torch_dtype=str(model_torch_dtype),
         trust_remote_code=True,
         sdpa_method=sdpa_method,
         **from_pretrained_kwargs,
@@ -724,15 +862,39 @@ def setup_model_and_optimizer(
     if init_optimizer:
         optimizer_cls = get_class(config["optimizer"]["name"])
         optimizer_kwargs = dict(config["optimizer"]["kwargs"])
+        split_fp32_params_to_torch_adamw = optimizer_kwargs.pop(
+            "split_fp32_params_to_torch_adamw", False
+        )
         # Resolve string-valued torch dtypes from YAML, e.g. "torch.bfloat16".
         for key, value in optimizer_kwargs.items():
             if isinstance(value, str) and value.startswith("torch."):
                 optimizer_kwargs[key] = getattr(torch, value.removeprefix("torch."))
 
-        optimizer = optimizer_cls(
-            (param for param in model.parameters() if param.requires_grad),
-            **optimizer_kwargs,
-        )
+        if split_fp32_params_to_torch_adamw:
+            fp32_params, other_params = _split_trainable_params_by_local_dtype(model)
+            optimizers: list[torch.optim.Optimizer] = []
+            if other_params:
+                optimizers.append(optimizer_cls(other_params, **optimizer_kwargs))
+            if fp32_params:
+                fp32_optimizer_kwargs = _adamw_kwargs_from_optimizer_kwargs(
+                    optimizer_kwargs
+                )
+                optimizers.append(torch.optim.AdamW(fp32_params, **fp32_optimizer_kwargs))
+            optimizer = (
+                optimizers[0]
+                if len(optimizers) == 1
+                else _ChainedOptimizer(optimizers)
+            )
+            if rank == 0:
+                print(
+                    "Split optimizer params by local dtype: "
+                    f"torch.float32={len(fp32_params)}, other={len(other_params)}"
+                )
+        else:
+            optimizer = optimizer_cls(
+                (param for param in model.parameters() if param.requires_grad),
+                **optimizer_kwargs,
+            )
 
     # Initialize scheduler
     scheduler = None
