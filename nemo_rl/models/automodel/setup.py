@@ -663,30 +663,6 @@ def setup_model_and_optimizer(
         **automodel_kwargs,
     )
 
-    # NemotronOmni: route RADIO's timm Attention modules through
-    # F.scaled_dot_product_attention so we don't materialize the full
-    # (B, H, seq, seq) attention tensor (~5 GiB per block at RADIO-v2-H +
-    # dynamic-resolution patch counts). Parity with the Megatron-Bridge path
-    # which sets `vision_config.use_flash_attn=True` via
-    # `attn_implementation="flash_attention_2"`.
-    vision_model = getattr(model, "vision_model", None) or getattr(
-        getattr(model, "model", None), "vision_model", None
-    )
-    vit_blocks = getattr(
-        getattr(getattr(vision_model, "radio_model", None), "model", None),
-        "blocks",
-        None,
-    )
-    if vit_blocks is not None:
-        flipped = 0
-        for block in vit_blocks:
-            attn = getattr(block, "attn", None)
-            if attn is not None:
-                attn.fused_attn = True
-                flipped += 1
-        if rank == 0:
-            print(f"Enabled fused_attn on {flipped} RADIO ViT blocks")
-
     print(model)
 
     # Compute model metadata after from_pretrained
@@ -723,22 +699,6 @@ def setup_model_and_optimizer(
             param.requires_grad_(False)
         if rank == 0:
             print("Froze visual encoder parameters for text-only training")
-
-    # Audio tower freeze is driven by automodel_kwargs.freeze_config.freeze_audio_tower in YAML.
-
-    # NemotronOmni RADIO: patch_generator.video_embedder is only called for
-    # video inputs; image-only training never exercises it. Without freezing,
-    # it sits in the optimizer without state (no grad → no lazy init), so
-    # dcp.load on resume raises "Missing key in checkpoint state_dict:
-    # optim.state.vision_model.radio_model.model.patch_generator.video_embedder.
-    # weight.step". The image encoder itself stays trainable.
-    frozen_dead_params = 0
-    for name, param in model.named_parameters():
-        if "patch_generator.video_embedder" in name:
-            param.requires_grad_(False)
-            frozen_dead_params += 1
-    if frozen_dead_params and rank == 0:
-        print(f"Froze {frozen_dead_params} video_embedder params (image-only training)")
 
     # CPU offload if needed
     if cpu_offload:
