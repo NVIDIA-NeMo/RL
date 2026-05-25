@@ -56,7 +56,7 @@ class PY_EXECUTABLES:
     AUTOMODEL = f"uv run --locked --extra automodel --directory {git_root}"
 
     # Use NeMo-RL direct dependencies and Megatron.
-    MCORE = f"uv run --locked --extra mcore --directory {git_root}"
+    MCORE = f"uv run --locked --extra mcore --extra flashinfer-jit-cache --directory {git_root}"
 
     # Use NeMo-Gym dependencies
     NEMO_GYM = f"uv run --locked --extra nemo_gym --directory {git_root}"

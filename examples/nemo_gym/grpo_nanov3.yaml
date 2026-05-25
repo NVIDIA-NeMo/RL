@@ -171,7 +171,7 @@ policy:
 
   # makes the training sequence length divisible by the tensor parallel size
   # this is useful for sequence parallel training
-  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  make_sequence_length_divisible_by: ${mul:${mul:${policy.megatron_cfg.tensor_model_parallel_size}, ${policy.megatron_cfg.context_parallel_size}}, 2}
   max_grad_norm: 1.0
 
   optimizer: null # remove default FSDP optimizer

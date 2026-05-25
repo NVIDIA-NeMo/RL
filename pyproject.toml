@@ -96,6 +96,7 @@ dependencies = [
   # so the marker must include aarch64 — otherwise mooncake is silently
   # excluded from the resolution during the Docker build.
   "mooncake-transfer-engine-cuda13==0.3.10.post2 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "setuptools_scm",
 ]
 
 [project.optional-dependencies]
@@ -136,11 +137,11 @@ vllm = [
   # https://github.com/vllm-project/vllm/releases/tag/v0.20.0
   "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.20.0/vllm-0.20.0-cp38-abi3-manylinux_2_35_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
   "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.20.0/vllm-0.20.0-cp38-abi3-manylinux_2_35_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-  "vllm==0.20.0 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
   "num2words>=0.5.14",
   "flashinfer-python==0.6.8.post1",
   "flashinfer-cubin==0.6.8.post1",
   "nvidia-cutlass-dsl>=4.4.0.dev1",
+  "vllm",
 ]
 sglang = [
   "sglang==0.5.11",
@@ -161,6 +162,8 @@ mcore = [
   "megatron-bridge",
   "nvidia-modelopt[torch]; sys_platform != 'darwin'",
   "onnxscript",
+  "mamba-ssm",
+  "causal-conv1d",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
@@ -170,12 +173,25 @@ mcore = [
   "emerging-optimizers==0.2.0",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480 ; platform_machine == 'x86_64'",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
+  "quart",
+  "hypercorn",
+  "orjson",
 ]
 modelopt = ["nvidia-modelopt"]
 nvrx = [
   "nvidia-resiliency-ext",
 ] # for ft_launcher (fault-tolerant training launcher)
 nemo_gym = ["nemo_gym"]
+
+flashinfer-jit-cache = [
+  "flashinfer-python==0.6.8.post1",
+  "flashinfer-cubin==0.6.8.post1",
+  "flashinfer-jit-cache==0.6.8.post1",
+]
+nvshmem-cu13 = [
+  "nvshmem4py-cu13>=0.2.1",
+  "cupy-cuda13x",
+]
 
 [dependency-groups]
 
@@ -247,11 +263,13 @@ triton = [
   { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
 causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", rev = "67e0a9dfe1518fc0036444e9ab5fe06ab78299e0" }
-mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "d68d16ed7d5d5164eb5a57c0285f3b7eb8394ec1" }
+mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "35e927b20fd674f0b30a799a6408b7aac6ffe642" }
 nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v1.1.4.post7" }
 emerging-optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.2.0" }
 nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "905018803414702e414a86716484ed4115b37ba6" }
-nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", rev = "15a851565a4ce846c04431ecb0cf09903ab4837e" }
+nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", rev = "b2bb3d728a18795807d9f76c535e005a609a1b01" }
+vllm = { path = "3rdparty/vllm", editable = true }
+flashinfer-jit-cache = { index = "flashinfer-cu130" }
 
 [tool.uv.workspace]
 members = [
@@ -274,6 +292,11 @@ name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
+[[tool.uv.index]]
+name = "flashinfer-cu130"
+url = "https://flashinfer.ai/whl/cu130"
+explicit = true
+
 [tool.uv]
 preview = true # Enable preview features like extra-build-dependencies
 no-build-isolation-package = [
@@ -285,6 +308,7 @@ no-build-isolation-package = [
   "deep_gemm",
   "deep_ep",
   "nv-grouped-gemm",          # from mlm (added here to make sure it's built no isolation since mlm workspace uses setup.py)
+  "vllm",
 ]
 # Always apply the build group since dependencies like TE/mcore/nemo-run require build dependencies
 # and this lets us assume they are implicitly installed with a simply `uv sync`. Ideally, we'd
@@ -314,9 +338,6 @@ override-dependencies = [
   "setuptools>=80.10.2",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480 ; platform_machine == 'x86_64'",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
-  # Override megatron-core's flashinfer~=0.5.0 constraint to allow both vllm and sglang (both use 0.6.8.post1)
-  "flashinfer-python>=0.5.0",
-  "flashinfer-cubin>=0.5.0",
   # Override to >=4.4.1 so uv can resolve to a version satisfying both vllm and sglang.
   "nvidia-cutlass-dsl>=4.4.1",
   # Relax megatron-core workspace member's opentelemetry-api ceiling (<1.34) for protobuf 6.x compat with ray
@@ -337,6 +358,12 @@ override-dependencies = [
   # extra composes with mcore/automodel without version-mirroring TQ's
   # requirements.txt. Forward-compatible across TQ minor bumps.
   "numpy>=2.1.0",
+
+  ### NOTE:
+  # flashinfer-python / flashinfer-cubin are intentionally NOT overridden here.
+  # The three flashinfer packages (python/cubin/jit-cache) must lockstep at the same version inside a single resolution.
+  # An override here is global and replaces all per-extra pins, breaking that lockstep.
+  # The conflicts block below keeps vllm / sglang / mcore (+flashinfer-jit-cache) in separate resolutions.
 ]
 
 # CVE fixes
@@ -389,6 +416,18 @@ conflicts = [
   [
     { extra = "vllm" },
     { extra = "mcore" },
+  ],
+  [
+    { extra = "flashinfer-jit-cache" },
+    { extra = "sglang" },
+  ],
+  [
+    { extra = "flashinfer-jit-cache" },
+    { extra = "vllm" },
+  ],
+  [
+    { extra = "flashinfer-jit-cache" },
+    { extra = "automodel" },
   ],
 ]
 
@@ -457,7 +496,8 @@ name = "megatron-bridge"
 # Must stay in sync with 3rdparty/Megatron-Bridge-workspace/setup.py::CACHED_DEPENDENCIES.
 version = "0.0.0"
 requires-dist = [
-  "transformers>=5.0.0,<=5.3.0",
+  "transformers>=5.5.0,<=5.6.0",
+  "mistral-common>=1.10.0",
   "peft>=0.18.1",
   "datasets>=2.20.0",
   "accelerate",
@@ -476,20 +516,18 @@ requires-dist = [
   "pyyaml>=6.0.2",
   "tqdm>=4.67.1",
   "hydra-core>1.3,<=1.3.2",
-  # megatron-core omitted here: it's a workspace member and already a direct dep of the mcore extra.
-  # Non-workspace path deps cannot depend on workspace members (uv name-shadowing restriction).
   "qwen-vl-utils",
-  # TODO(https://github.com/NVIDIA-NeMo/RL/issues/2111): upgrade to core_cu13 when we move to CUDA 13
-  "transformer-engine[pytorch,core_cu13]",
-  "mamba-ssm",
   "nvidia-resiliency-ext",
-  "causal-conv1d",
   "flash-linear-attention",
   "timm",
   "open-clip-torch>=3.2.0",
   "mlflow>=3.9.0",
   "comet-ml>=3.50.0",
   "torch>=2.6.0",
+  "flashinfer-python==0.6.8.post1",
+  "flashinfer-cubin==0.6.8.post1",
+  # megatron-core omitted here: it's a workspace member and already a direct dep of the mcore extra.
+  # Non-workspace path deps cannot depend on workspace members (uv name-shadowing restriction).
 ]
 
 # Override logsage metadata to remove numpy<=2.0.2 and pandas<=2.3.3 upper bounds
@@ -497,7 +535,7 @@ requires-dist = [
 # Tracking: https://github.com/NVIDIA/nvidia-resiliency-ext/issues/301
 [[tool.uv.dependency-metadata]]
 name = "logsage"
-version = "0.1.5"
+version = "0.1.7"
 requires-dist = [
   "drain3>=0.9.11,<0.10.0",
   "langchain>=0.3.27,<0.4.0",
