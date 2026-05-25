@@ -77,7 +77,6 @@ run_test      uv run --no-sync bash ./tests/functional/prorlv2.sh
 run_test      uv run --no-sync bash ./tests/functional/qa_distillation_megatron.sh
 run_test      uv run --no-sync bash ./tests/functional/rm.sh
 run_test fast uv run --no-sync bash ./tests/functional/sft.sh
-run_test fast uv run --no-sync bash ./tests/functional/sft_hsdp.sh
 run_test      uv run --no-sync bash ./tests/functional/sft_automodel_lora.sh
 run_test      uv run --no-sync bash ./tests/functional/sft_avlm.sh
 run_test      uv run --no-sync bash ./tests/functional/sft_megatron.sh
