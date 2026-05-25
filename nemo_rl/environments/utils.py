@@ -59,6 +59,9 @@ ENV_REGISTRY: Dict[str, EnvRegistryEntry] = {
     "number_guess": {
         "actor_class_fqn": "nemo_rl.environments.games.number_guess.NumberGuessEnv",
     },
+    "wordle": {
+        "actor_class_fqn": "nemo_rl.environments.games.wordle.WordleEnv",
+    },
 }
 
 
