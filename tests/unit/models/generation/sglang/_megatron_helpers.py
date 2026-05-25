@@ -246,6 +246,7 @@ def make_policy_config(
     # size will do.
     dp_size = min_dp_for_megatron(megatron)
     train_global_batch_size = train_micro_batch_size * dp_size
+    use_mxfp8 = weight_update_precision() == "mxfp8"
     return {
         "model_name": model_path,
         "tokenizer": {"name": model_path},
@@ -330,12 +331,16 @@ def make_policy_config(
                 "data_parallel_sharding_strategy": "optim_grads_params",
             },
             "fp8_cfg": {
-                "enabled": False,
+                "enabled": use_mxfp8,
                 "fp8": "e4m3",
-                "fp8_recipe": "blockwise",
+                "fp8_recipe": "mxfp8" if use_mxfp8 else "blockwise",
                 "fp8_param": False,
             },
-            "env_vars": None,
+            "env_vars": (
+                {"NVTE_FP8_BLOCK_SCALING_FP32_SCALES": "1"}
+                if use_mxfp8
+                else None
+            ),
         },
         "dynamic_batching": {"enabled": False},
         "sequence_packing": {

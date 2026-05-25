@@ -6,30 +6,24 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""Standalone repro for the sglang colocate (CUDA-IPC) weight-update path.
+"""Standalone colocate/CUDA-IPC repro for SGLang weight update.
 
-Companion to ``repro_pp_weight_update.py`` (which exercises the disag /
-NCCL-broadcast path). This script exercises ``send_hf_buckets_via_ipc_actor_impl``
-end-to-end **without Megatron / nemo-rl plumbing**: a mock trainer loads
-every weight from the sliced Qwen3-30B-A3B-Instruct-2507 checkpoint into
-GPU memory, builds a dummy ``(name, tensor)`` bucket iterator, and feeds
-it to the production helper. Pre/post ``generate`` outputs must match
-byte-for-byte.
+This is the colocate companion to ``repro_pp_weight_update.py``. It avoids
+Megatron and the nemo-rl policy worker, but it keeps the production colocate
+transport:
 
-The function under test expects an ``ipc_engine`` Ray actor handle whose
-``update_weights_from_tensor.remote(...)`` accepts the
-``serialized_named_tensors`` / ``load_format`` / ``weight_version``
-kwargs (i.e. the SGLangGenerationWorker shape). To avoid the full Ray
-cluster + HTTP-server overhead in this isolated script we wrap an
-in-process ``sglang.srt.entrypoints.engine.Engine`` in a tiny fake-Ray
-shim (see :class:`_FakeRayActorHandle` below) and monkey-patch
-``ray.get`` to recognise the fake refs. Production paths that go through
-the real Ray actor are unaffected.
+1. A Ray actor hosts an ``sglang.srt.entrypoints.engine.Engine``.
+2. The main process is a mock trainer on the same visible GPU.
+3. The trainer loads the sliced Qwen checkpoint, builds HF weight buckets, and
+   sends them through ``send_hf_buckets_via_ipc_actor_impl``.
+4. SGLang snapshots its initial weights, randomizes them, receives the IPC
+   refit, post-processes weights, and compares back to the snapshot.
 
-Usage (inside the sglang-nemorl-e2e-zhw container)::
+Usage inside the nemo-rl container:
 
-    python tests/unit/models/generation/sglang/repro_pp_colocate_weight_update.py --pp 1
-    python tests/unit/models/generation/sglang/repro_pp_colocate_weight_update.py --pp 2
+    CUDA_VISIBLE_DEVICES=0 python \
+      tests/unit/models/generation/sglang/repro_pp_colocate_weight_update.py \
+      --pp 1 --tp 1 --dp 1 --dtype bfloat16
 """
 
 from __future__ import annotations
@@ -39,9 +33,11 @@ import json
 import os
 import sys
 import time
+from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
+import ray
 import torch
 import torch.distributed as dist
 from safetensors import safe_open
@@ -74,358 +70,385 @@ _SAFETENSORS_TO_TORCH_NAME = {
 
 def _ckpt_path() -> Path:
     hf_home = os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface")
-    p = Path(hf_home) / "hub" / "qwen3-30b-a3b-sliced-4"
-    if not p.is_dir():
+    path = Path(hf_home) / "hub" / "qwen3-30b-a3b-sliced-4"
+    if not path.is_dir():
         sys.exit(
-            f"sliced ckpt not found at {p}; produce it first via "
+            f"sliced ckpt not found at {path}; produce it first via "
             "tests/unit/models/generation/sglang/_qwen3_slicer.py"
         )
-    return p
+    return path
 
 
-def _collect_specs(ckpt: Path):
-    """Return ``(name, dtype_str, shape, shard_filename)`` records sorted by name."""
+def _collect_specs(ckpt: Path) -> tuple[list[tuple[str, str, list[int]]], dict[str, str]]:
+    """Return (ordered list of (name, dtype_str, shape), name -> shard file)."""
     index_path = ckpt / "model.safetensors.index.json"
     if index_path.is_file():
         with open(index_path) as f:
             weight_map: dict[str, str] = json.load(f)["weight_map"]
     else:
         single = next(ckpt.glob("*.safetensors")).name
-        with safe_open(ckpt / single, framework="pt") as r:
-            weight_map = {k: single for k in r.keys()}
+        with safe_open(ckpt / single, framework="pt") as reader:
+            weight_map = {name: single for name in reader.keys()}
 
     per_shard: dict[str, list[str]] = {}
     for name, shard in weight_map.items():
         per_shard.setdefault(shard, []).append(name)
 
     specs: list[tuple[str, str, list[int]]] = []
-    for shard in sorted(per_shard.keys()):
-        with safe_open(ckpt / shard, framework="pt") as r:
+    for shard in sorted(per_shard):
+        with safe_open(ckpt / shard, framework="pt") as reader:
             for name in sorted(per_shard[shard]):
-                sl = r.get_slice(name)
-                st_dtype = sl.get_dtype()
+                tensor_slice = reader.get_slice(name)
+                st_dtype = tensor_slice.get_dtype()
                 if st_dtype not in _SAFETENSORS_TO_TORCH_NAME:
                     raise RuntimeError(f"unmapped safetensors dtype {st_dtype!r} for {name}")
-                specs.append((name, _SAFETENSORS_TO_TORCH_NAME[st_dtype], list(sl.get_shape())))
+                specs.append(
+                    (
+                        name,
+                        _SAFETENSORS_TO_TORCH_NAME[st_dtype],
+                        list(tensor_slice.get_shape()),
+                    )
+                )
+
     specs.sort(key=lambda x: x[0])
     return specs, weight_map
 
 
-# ---------------------------------------------------------------------------
-# Fake Ray actor wrapper around an in-process sglang Engine.
-# ---------------------------------------------------------------------------
-class _FakeRef:
-    """Stand-in for ``ray.ObjectRef`` produced by the fake actor's ``.remote()``."""
-
-    __slots__ = ("_value",)
-
-    def __init__(self, value):
-        self._value = value
-
-
-class _FakeRemoteCallable:
-    __slots__ = ("_fn",)
-
-    def __init__(self, fn):
-        self._fn = fn
-
-    def remote(self, *args, **kwargs):
-        return _FakeRef(self._fn(*args, **kwargs))
+def _result_failed(result: Any) -> tuple[bool, str]:
+    if isinstance(result, tuple) and len(result) >= 2:
+        return result[0] is False, str(result[1])
+    if isinstance(result, Mapping):
+        success = result.get("success", True)
+        message = (
+            result.get("error_message")
+            or result.get("error")
+            or result.get("message")
+            or "unknown error"
+        )
+        return success is False, str(message)
+    if hasattr(result, "success"):
+        message = getattr(result, "error_message", None) or getattr(
+            result, "message", "unknown error"
+        )
+        return result.success is False, str(message)
+    return False, ""
 
 
-class _FakeRayActorHandle:
-    """Mimics the production SGLangGenerationWorker handle used by
-    ``send_hf_buckets_via_ipc_actor_impl``: ``handle.update_weights_from_tensor.remote(...)``
-    must return something that ``ray.get`` can resolve.
+def _raise_if_failed(result: Any, action: str) -> Any:
+    failed, message = _result_failed(result)
+    if failed:
+        raise RuntimeError(f"{action} failed: {message}")
+    return result
 
-    Translates the production kwargs (``serialized_named_tensors`` /
-    ``weight_version``) onto sglang's in-process ``Engine.update_weights_from_tensor``
-    (``named_tensors``).
-    """
 
-    def __init__(self, engine):
-        self._engine = engine
+def _text(output: Any) -> str:
+    if isinstance(output, list):
+        output = output[0]
+    if isinstance(output, Mapping):
+        return str(output.get("text", repr(output)))
+    return repr(output)
 
-    @property
-    def update_weights_from_tensor(self):
-        def _call(
-            serialized_named_tensors,
-            load_format=None,
-            flush_cache=False,
-            weight_version=None,
-        ):
-            return self._engine.update_weights_from_tensor(
-                named_tensors=serialized_named_tensors,
-                load_format=load_format,
-                flush_cache=flush_cache,
+
+@ray.remote(num_gpus=1)
+class _SGLangEngineActor:
+    """Ray actor facade matching SGLangGenerationWorker's weight-update API."""
+
+    def __init__(
+        self,
+        *,
+        ckpt: str,
+        pp: int,
+        tp: int,
+        dp: int,
+        dtype: str,
+        mem_fraction_static: float,
+        moe_runner_backend: str | None,
+    ):
+        os.environ["SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK"] = "false"
+
+        try:
+            from nemo_rl.models.generation.sglang.sglang_worker import (
+                _apply_sglang_compat_patches,
             )
 
-        return _FakeRemoteCallable(_call)
+            _apply_sglang_compat_patches()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[actor] WARN: failed to apply nemo-rl SGLang patches: {exc}", flush=True)
 
+        from sglang.srt.entrypoints.engine import Engine
 
-def _patch_ray_get_for_fake_refs() -> None:
-    """Make ``ray.get`` pass-through for our fake refs. Real refs still work."""
-    import ray
+        kwargs: dict[str, Any] = {
+            "model_path": ckpt,
+            "tp_size": tp,
+            "pp_size": pp,
+            "dp_size": dp,
+            "dtype": dtype,
+            "mem_fraction_static": mem_fraction_static,
+            "log_level": "info",
+            "random_seed": 42,
+            "disable_cuda_graph": True,
+            "enable_memory_saver": False,
+        }
+        if moe_runner_backend is not None:
+            kwargs["moe_runner_backend"] = moe_runner_backend
 
-    if getattr(ray.get, "__fake_ray_patched__", False):
-        return
-    _real_get = ray.get
+        print(
+            f"[actor] starting Engine pp={pp} tp={tp} dp={dp} dtype={dtype} "
+            f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}",
+            flush=True,
+        )
+        self.engine = Engine(**kwargs)
+        print("[actor] engine up", flush=True)
 
-    def _patched_get(refs, *args, **kwargs):
-        if isinstance(refs, _FakeRef):
-            return refs._value
-        if isinstance(refs, list) and refs and all(isinstance(r, _FakeRef) for r in refs):
-            return [r._value for r in refs]
-        return _real_get(refs, *args, **kwargs)
+    def generate(self, prompt: str, sampling_params: dict[str, Any]) -> Any:
+        return self.engine.generate(prompt, sampling_params=sampling_params)
 
-    _patched_get.__fake_ray_patched__ = True  # type: ignore[attr-defined]
-    ray.get = _patched_get  # type: ignore[assignment]
+    def check_weights(self, action: str) -> Any:
+        from sglang.srt.managers.io_struct import CheckWeightsReqInput
 
-
-def _check_weights(engine, action: str):
-    """Drive sglang's WeightChecker (``snapshot`` / ``reset_tensors`` / ``compare``)
-    against an in-process Engine. Production exposes this via the
-    ``/weights_checker`` HTTP endpoint; we go straight through tokenizer_manager.
-
-    ``tokenizer_manager.check_weights`` returns ``_Communicator.merge_results``,
-    a ``(all_success: bool, joined_message: str)`` tuple — NOT a
-    ``CheckWeightsReqOutput``. The HTTP layer converts ``success=False`` to a
-    400; this in-process path does not, so raise here to avoid a failed
-    compare masquerading as success.
-    """
-    from sglang.srt.managers.io_struct import CheckWeightsReqInput
-
-    res = engine.loop.run_until_complete(
-        engine.tokenizer_manager.check_weights(CheckWeightsReqInput(action=action))
-    )
-    success, message = res
-    if not success:
-        raise RuntimeError(f"check_weights({action!r}) failed: {message}")
-    return res
-
-
-def _post_process_weights(engine):
-    """Re-run sglang's ``process_weights_after_loading`` hook on every module.
-
-    Required after any weight refit path (NCCL broadcast or colocate IPC) when
-    the model uses a quant_method whose runtime layout differs from the load-
-    time layout — e.g. flashinfer trtllm BF16 / FP8 / MXFP8 MoE, which pack
-    weights into a block layout that the kernel expects but
-    ``update_weights_from_tensor`` / ``update_weights_from_distributed`` only
-    write back canonical bytes. Without this, post-refit inference crashes or
-    silently produces garbage. nemo-rl's production refit calls this via
-    ``policy_generation.post_process_weights()`` (megatron_policy_worker.py).
-    """
-    from sglang.srt.managers.io_struct import PostProcessWeightsReqInput
-
-    res = engine.loop.run_until_complete(
-        engine.tokenizer_manager.post_process_weights(
-            PostProcessWeightsReqInput(
-                restore_weights_before_load=False,
-                post_process_quantization=True,
+        result = self.engine.loop.run_until_complete(
+            self.engine.tokenizer_manager.check_weights(
+                CheckWeightsReqInput(action=action)
             )
         )
-    )
-    success, message = res
-    if not success:
-        raise RuntimeError(f"post_process_weights failed: {message}")
-    return res
+        return _raise_if_failed(result, f"check_weights({action!r})")
 
+    def post_process_weights(
+        self,
+        *,
+        restore_weights_before_load: bool = False,
+        post_process_quantization: bool = True,
+    ) -> Any:
+        from sglang.srt.managers.io_struct import PostProcessWeightsReqInput
 
-# ---------------------------------------------------------------------------
-# Mock trainer: load all weights on one GPU, yield buckets bounded by bytes.
-# ---------------------------------------------------------------------------
-class _MockTrainer:
-    """Loads every safetensors tensor onto ``device`` once, then iterates
-    them in deterministic byte-bounded buckets — mirroring the contract
-    of ``MegatronSGLangHfWeightIterator.iter_hf_weight_buckets`` without
-    pulling in Megatron / AutoBridge.
-    """
-
-    def __init__(self, ckpt: Path, device: str, specs, weight_map):
-        self.device = device
-        self._tensors: list[tuple[str, torch.Tensor]] = []
-        for name, dtype_str, _shape in specs:
-            with safe_open(ckpt / weight_map[name], framework="pt") as r:
-                t = r.get_tensor(name)
-            self._tensors.append(
-                (name, t.to(device=device, dtype=_DTYPE_FROM_STR[dtype_str]).contiguous())
+        result = self.engine.loop.run_until_complete(
+            self.engine.tokenizer_manager.post_process_weights(
+                PostProcessWeightsReqInput(
+                    restore_weights_before_load=restore_weights_before_load,
+                    post_process_quantization=post_process_quantization,
+                )
             )
+        )
+        return _raise_if_failed(result, "post_process_weights")
+
+    def update_weights_from_tensor(
+        self,
+        serialized_named_tensors: list[str],
+        load_format: str | None = None,
+        flush_cache: bool = False,
+        weight_version: str | None = None,
+    ) -> Any:
+        del weight_version
+        result = self.engine.update_weights_from_tensor(
+            named_tensors=serialized_named_tensors,
+            load_format=load_format,
+            flush_cache=flush_cache,
+        )
+        return _raise_if_failed(result, "update_weights_from_tensor")
+
+    def shutdown(self) -> None:
+        if self.engine is not None:
+            self.engine.shutdown()
+            self.engine = None
+
+
+class _MockTrainer:
+    """Load HF checkpoint tensors on one GPU and yield byte-bounded buckets."""
+
+    def __init__(
+        self,
+        *,
+        ckpt: Path,
+        device: str,
+        target_dtype: torch.dtype,
+        specs: list[tuple[str, str, list[int]]],
+        weight_map: dict[str, str],
+    ):
+        self._tensors: list[tuple[str, torch.Tensor]] = []
+        for idx, (name, dtype_str, _shape) in enumerate(specs):
+            with safe_open(ckpt / weight_map[name], framework="pt") as reader:
+                tensor = reader.get_tensor(name)
+            dtype = target_dtype if tensor.is_floating_point() else _DTYPE_FROM_STR[dtype_str]
+            self._tensors.append((name, tensor.to(device=device, dtype=dtype).contiguous()))
+            if idx % 25 == 0 or idx == len(specs) - 1:
+                print(f"[trainer] loaded {idx + 1}/{len(specs)} {name}", flush=True)
 
     def iter_buckets(self, buffer_size_bytes: int) -> Iterable[list[tuple[str, torch.Tensor]]]:
         bucket: list[tuple[str, torch.Tensor]] = []
-        size = 0
+        bucket_size = 0
         for name, tensor in self._tensors:
-            tsize = tensor.numel() * tensor.element_size()
-            if bucket and size + tsize > buffer_size_bytes:
+            tensor_size = tensor.numel() * tensor.element_size()
+            if bucket and bucket_size + tensor_size > buffer_size_bytes:
                 yield bucket
                 bucket = []
-                size = 0
+                bucket_size = 0
             bucket.append((name, tensor))
-            size += tsize
+            bucket_size += tensor_size
         if bucket:
             yield bucket
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+def _init_single_rank_gloo(master_port: int):
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ["MASTER_PORT"] = str(master_port)
+    os.environ["RANK"] = "0"
+    os.environ["WORLD_SIZE"] = "1"
+    dist.init_process_group(backend="gloo", world_size=1, rank=0)
+    return dist.new_group(ranks=[0], backend="gloo")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--pp", type=int, default=2)
+    parser.add_argument("--pp", type=int, default=1)
     parser.add_argument("--tp", type=int, default=1)
     parser.add_argument("--dp", type=int, default=1)
-    parser.add_argument(
-        "--buffer-size-bytes",
-        type=int,
-        default=512 * 1024 * 1024,  # 512 MiB
-        help="Per-chunk byte budget for the dummy bucket iterator.",
-    )
+    parser.add_argument("--dtype", type=str, default="bfloat16", choices=("bfloat16", "float16", "float32"))
+    parser.add_argument("--buffer-size-bytes", type=int, default=512 * 1024 * 1024)
     parser.add_argument("--master-port", type=int, default=29565)
+    parser.add_argument("--mem-fraction-static", type=float, default=0.3)
+    parser.add_argument(
+        "--moe-runner-backend",
+        type=str,
+        default=None,
+        help="Optional pass-through to SGLang Engine, e.g. flashinfer_trtllm_routed.",
+    )
     args = parser.parse_args()
 
     n_engine = args.pp * args.tp * args.dp
     n_avail = torch.cuda.device_count()
     if n_avail < n_engine:
-        sys.exit(f"need at least {n_engine} GPUs visible, have {n_avail}")
+        sys.exit(f"need at least {n_engine} visible GPU(s), have {n_avail}")
+    if args.tp != 1:
+        sys.exit("this standalone single-trainer colocate repro supports --tp 1 only")
 
+    torch.cuda.set_device(0)
     ckpt = _ckpt_path()
+    specs, weight_map = _collect_specs(ckpt)
+    target_dtype = _DTYPE_FROM_STR[args.dtype]
+
     print(f"[main] ckpt={ckpt}", flush=True)
     print(
-        f"[main] pp={args.pp} tp={args.tp} dp={args.dp} n_engine={n_engine}",
+        f"[main] pp={args.pp} tp={args.tp} dp={args.dp} dtype={args.dtype} "
+        f"n_engine={n_engine}",
         flush=True,
     )
     print(f"[main] CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}", flush=True)
-
-    specs, weight_map = _collect_specs(ckpt)
     print(f"[main] {len(specs)} weight tensors to round-trip", flush=True)
 
-    # Trivial single-rank gather group. ``send_hf_buckets_via_ipc_actor_impl``
-    # needs torch.distributed initialised so it can call ``dist.gather_object``;
-    # with world_size=1 the gather is a no-op but the call is still required.
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ["MASTER_PORT"] = str(args.master_port)
-    os.environ["RANK"] = "0"
-    os.environ["WORLD_SIZE"] = "1"
-    dist.init_process_group(backend="gloo", world_size=1, rank=0)
-    gather_group = dist.new_group(ranks=[0], backend="gloo")
+    gather_group = None
+    engine = None
+    try:
+        gather_group = _init_single_rank_gloo(args.master_port)
 
-    # ipc_engine handle path expects a Ray actor; wire up our fake.
-    _patch_ray_get_for_fake_refs()
-
-    # Apply the same monkey-patch the production trainer uses so that
-    # IPC handles encode device-by-UUID — the engine's CUDA_VISIBLE_DEVICES
-    # view may differ from ours.
-    from nemo_rl.models.policy.torch_reductions_utils import (
-        monkey_patch_torch_reductions,
-    )
-
-    monkey_patch_torch_reductions()
-
-    # Stand up the engine in-process (skip the Ray actor / HTTP server).
-    from sglang.srt.entrypoints.engine import Engine
-
-    engine = Engine(
-        model_path=str(ckpt),
-        tp_size=args.tp,
-        pp_size=args.pp,
-        dp_size=args.dp,
-        mem_fraction_static=0.3,
-        log_level="info",
-        random_seed=42,
-        disable_cuda_graph=True,
-        # Required by the colocate IPC path: the engine must keep param
-        # storage alive across update_weights_from_tensor calls (no offload).
-        enable_memory_saver=False,
-    )
-    print("[main] engine up", flush=True)
-
-    sampling = {"max_new_tokens": 16, "temperature": 0.0}
-    prompt = "The capital of France is"
-
-    def _text(x):
-        if isinstance(x, list):
-            x = x[0]
-        if isinstance(x, dict):
-            return x.get("text", repr(x))
-        return repr(x)
-
-    # Step 1: capture a baseline generation with the freshly-loaded weights.
-    out_pre = engine.generate(prompt, sampling_params=sampling)
-    print(f"[main] pre-update text={_text(out_pre)!r}", flush=True)
-
-    # Step 2: snapshot the in-engine weights so we can compare bit-exactly later.
-    print("[main] snapshot...", flush=True)
-    _check_weights(engine, "snapshot")
-
-    # Step 3: randomize the in-engine weights so a no-op refit would visibly
-    # change generation. If we skipped this, pre/post equality would trivially
-    # pass even if send_hf_buckets_via_ipc_actor_impl never copied anything.
-    print("[main] reset_tensors (randomize sglang weights)...", flush=True)
-    _check_weights(engine, "reset_tensors")
-    out_random = engine.generate(prompt, sampling_params=sampling)
-    print(f"[main] post-reset text={_text(out_random)!r}", flush=True)
-    if _text(out_random) == _text(out_pre):
-        # Reset is meant to be visible. If it isn't, the test below isn't
-        # really testing anything.
-        print(
-            "[main] WARN: post-reset output matches pre — reset_tensors may "
-            "have been a no-op for this prompt; proceeding anyway",
-            flush=True,
+        from nemo_rl.models.policy.torch_reductions_utils import (
+            monkey_patch_torch_reductions,
         )
 
-    fake_engine_handle = _FakeRayActorHandle(engine)
-    trainer = _MockTrainer(ckpt, device="cuda:0", specs=specs, weight_map=weight_map)
-    worker_state: dict[str, Any] = {
-        "_ipc_gather_group": gather_group,
-        "_ipc_gather_src": 0,
-        "_ipc_engine_index": 0,
-        "_ipc_layout_key": ((1,), (0,)),
-        "_ipc_monkey_patched": True,
-        "weight_version": 0,
-    }
+        monkey_patch_torch_reductions()
 
-    from nemo_rl.models.policy.utils import send_hf_buckets_via_ipc_actor_impl
+        ray.init(
+            num_gpus=n_avail,
+            include_dashboard=False,
+            ignore_reinit_error=True,
+            log_to_driver=True,
+        )
+        engine = _SGLangEngineActor.options(num_gpus=n_engine).remote(
+            ckpt=str(ckpt),
+            pp=args.pp,
+            tp=args.tp,
+            dp=args.dp,
+            dtype=args.dtype,
+            mem_fraction_static=args.mem_fraction_static,
+            moe_runner_backend=args.moe_runner_backend,
+        )
 
-    # Step 4: refit via the production helper — must overwrite the random
-    # weights with the trainer's authentic copy.
-    print("[main] send_hf_buckets_via_ipc_actor_impl...", flush=True)
-    t0 = time.time()
-    send_hf_buckets_via_ipc_actor_impl(
-        bucket_iterator=trainer.iter_buckets(args.buffer_size_bytes),
-        rollout_engines=[fake_engine_handle],
-        worker_state=worker_state,
-        weight_version=1,
-    )
-    print(f"[main] send_hf_buckets done in {time.time() - t0:.1f}s", flush=True)
+        prompt = "The capital of France is"
+        sampling = {"max_new_tokens": 16, "temperature": 0.0}
 
-    # Step 4.5: re-run process_weights_after_loading so flashinfer trtllm MoE
-    # layers re-pack the canonical bytes that send_hf_buckets_via_ipc_actor_impl
-    # just wrote. nemo-rl's production refit path always calls this; the bare
-    # update_weights_from_tensor API does NOT do it implicitly.
-    print("[main] post_process_weights...", flush=True)
-    _post_process_weights(engine)
-    print("[main] post_process_weights done.", flush=True)
+        out_pre = ray.get(engine.generate.remote(prompt, sampling))
+        print(f"[main] pre-update text={_text(out_pre)!r}", flush=True)
 
-    # Step 5: compare current weights against the snapshot. Raises if any
-    # tensor differs — the strongest correctness signal we have.
-    print("[main] compare against snapshot...", flush=True)
-    _check_weights(engine, "compare")
-    print("[main] compare passed.", flush=True)
+        print("[main] snapshot...", flush=True)
+        ray.get(engine.check_weights.remote("snapshot"))
 
-    # Step 6: generation should now match the pre-snapshot output.
-    out_post = engine.generate(prompt, sampling_params=sampling)
-    print(f"[main] post-update text={_text(out_post)!r}", flush=True)
+        print("[main] reset_tensors (randomize sglang weights)...", flush=True)
+        ray.get(engine.check_weights.remote("reset_tensors"))
+        out_random = ray.get(engine.generate.remote(prompt, sampling))
+        print(f"[main] post-reset text={_text(out_random)!r}", flush=True)
+        if _text(out_random) == _text(out_pre):
+            print(
+                "[main] WARN: post-reset output matches pre; proceeding with weight compare",
+                flush=True,
+            )
 
-    pre_text = _text(out_pre)
-    post_text = _text(out_post)
-    if pre_text == post_text:
-        print("[main] PASS: snapshot+reset+refit+compare roundtrip", flush=True)
-    else:
-        print("[main] FAIL: pre/post generation outputs differ", flush=True)
-        print(f"  pre : {pre_text!r}")
-        print(f"  post: {post_text!r}")
-        sys.exit(1)
+        print("[main] loading trainer tensors...", flush=True)
+        trainer = _MockTrainer(
+            ckpt=ckpt,
+            device="cuda:0",
+            target_dtype=target_dtype,
+            specs=specs,
+            weight_map=weight_map,
+        )
+
+        worker_state: dict[str, Any] = {
+            "_ipc_gather_group": gather_group,
+            "_ipc_gather_src": 0,
+            "_ipc_engine_index": 0,
+            "_ipc_layout_key": ((1,), (0,)),
+            "_ipc_monkey_patched": True,
+            "weight_version": 0,
+        }
+
+        from nemo_rl.models.policy.utils import send_hf_buckets_via_ipc_actor_impl
+
+        print("[main] send_hf_buckets_via_ipc_actor_impl...", flush=True)
+        t0 = time.time()
+        send_hf_buckets_via_ipc_actor_impl(
+            bucket_iterator=trainer.iter_buckets(args.buffer_size_bytes),
+            rollout_engines=[engine],
+            worker_state=worker_state,
+            weight_version=1,
+        )
+        print(f"[main] send_hf_buckets done in {time.time() - t0:.1f}s", flush=True)
+
+        print("[main] post_process_weights...", flush=True)
+        ray.get(
+            engine.post_process_weights.remote(
+                restore_weights_before_load=False,
+                post_process_quantization=True,
+            )
+        )
+
+        print("[main] compare against snapshot...", flush=True)
+        ray.get(engine.check_weights.remote("compare"))
+        print("[main] compare passed.", flush=True)
+
+        out_post = ray.get(engine.generate.remote(prompt, sampling))
+        print(f"[main] post-update text={_text(out_post)!r}", flush=True)
+
+        if _text(out_pre) != _text(out_post):
+            print("[main] FAIL: pre/post generation outputs differ", flush=True)
+            print(f"  pre : {_text(out_pre)!r}", flush=True)
+            print(f"  post: {_text(out_post)!r}", flush=True)
+            sys.exit(1)
+
+        print("[main] PASS: snapshot+reset+refit+compare colocate roundtrip", flush=True)
+    finally:
+        if engine is not None:
+            try:
+                ray.get(engine.shutdown.remote(), timeout=30)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[main] WARN: actor shutdown failed: {exc}", flush=True)
+            try:
+                ray.kill(engine, no_restart=True)
+            except Exception:
+                pass
+        if dist.is_initialized():
+            if gather_group is not None:
+                dist.destroy_process_group(gather_group)
+            dist.destroy_process_group()
+        if ray.is_initialized():
+            ray.shutdown()
 
 
 if __name__ == "__main__":
