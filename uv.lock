@@ -155,7 +155,7 @@ requires-dist = ["setuptools", "wheel", "torch", "numpy"]
 
 [[manifest.dependency-metadata]]
 name = "sglang"
-version = "0.0.0.dev1+g6e180058a.d20260504"
+version = "0.0.0.dev1+ga652eb48.d20260504"
 requires-dist = ["ipython", "aiohttp", "apache-tvm-ffi>=0.1.5,<0.2", "anthropic>=0.20.0", "blobfile==3.0.0", "build", "compressed-tensors", "cuda-python==12.9", "decord2", "datasets", "einops", "fastapi", "flashinfer-python==0.6.7.post2", "flashinfer-cubin==0.6.7.post2", "gguf", "interegular", "llguidance>=0.7.11,<0.8.0", "modelscope", "msgspec", "ninja", "numpy", "nvidia-cutlass-dsl>=4.4.1", "nvidia-ml-py", "openai-harmony==0.0.4", "openai==2.6.1", "orjson", "outlines==0.1.11", "packaging", "partial-json-parser", "pillow", "prometheus-client>=0.20.0", "psutil", "py-spy", "pybase64", "pydantic", "python-multipart", "pyzmq>=25.1.2", "quack-kernels>=0.3.0", "requests", "scipy", "sentencepiece", "setproctitle", "flash-attn-4>=4.0.0b4", "sglang-kernel==0.4.1", "soundfile==0.13.1", "tiktoken", "timm==1.0.16", "torch-memory-saver==0.0.9", "torch==2.9.1", "torchao==0.9.0", "torchaudio==2.9.1", "torchcodec==0.9.1 ; (platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l') or sys_platform != 'linux'", "torchvision", "tqdm", "mistral-common>=1.9.0", "transformers==5.3.0", "uvicorn", "uvloop", "watchfiles", "xgrammar==0.1.32", "smg-grpc-servicer>=0.5.0"]
 
 [[manifest.dependency-metadata]]
@@ -4316,7 +4316,7 @@ requires-dist = [
     { name = "ray", extras = ["default"], specifier = "==2.54.0" },
     { name = "rich" },
     { name = "setuptools" },
-    { name = "sglang", marker = "extra == 'sglang'", git = "ssh://git@github.com/sajadn/slgang-nemotron-diffusion.git?subdirectory=python&rev=6e180058ad266cde5b41d8a4f0190f5a2972230c" },
+    { name = "sglang", marker = "extra == 'sglang'", git = "ssh://git@github.com/sajadn/slgang-nemotron-diffusion.git?subdirectory=python&rev=a652eb48fa69bf0762c7de9f389474abbebe7b9d" },
     { name = "sglang-kernel", marker = "extra == 'sglang'", index = "https://docs.sglang.io/whl/cu129" },
     { name = "soundfile", specifier = "==0.13.1" },
     { name = "swanlab" },
@@ -6929,8 +6929,8 @@ wheels = [
 
 [[package]]
 name = "sglang"
-version = "0.0.0.dev1+g6e180058a.d20260504"
-source = { git = "ssh://git@github.com/sajadn/slgang-nemotron-diffusion.git?subdirectory=python&rev=6e180058ad266cde5b41d8a4f0190f5a2972230c#6e180058ad266cde5b41d8a4f0190f5a2972230c" }
+version = "0.0.0.dev1+ga652eb48.d20260504"
+source = { git = "ssh://git@github.com/sajadn/slgang-nemotron-diffusion.git?subdirectory=python&rev=a652eb48fa69bf0762c7de9f389474abbebe7b9d#a652eb48fa69bf0762c7de9f389474abbebe7b9d" }
 dependencies = [
     { name = "aiohttp" },
     { name = "anthropic" },

@@ -7,7 +7,7 @@ grpo:
   val_period: 100
   val_at_start: true
   val_at_end: true
-  max_val_samples: 128
+  max_val_samples: 2000
   val_batch_size: 128
 
 checkpointing:
@@ -19,7 +19,7 @@ checkpointing:
   save_optimizer: true
 
 policy:
-  model_name: "/lustre/fsw/portfolios/coreai/users/snorouzi/checkpoints/Nemotron-Diffusion-Exp-Ministral-3B-vllm-ar"
+  model_name: "/lustre/fsw/portfolios/coreai/users/snorouzi/checkpoints/Nemotron-Labs-Diffusion-3B"
   tokenizer:
     name: ${policy.model_name}
   train_global_batch_size: 1024
@@ -106,6 +106,7 @@ policy:
       skip_server_warmup: true
       disable_piecewise_cuda_graph: true
       attention_backend: "flashinfer"
+      json_model_override_args: '{"ar_mode": true}'
 
 logger:
   log_dir: "logs/grpo-nemotron-diffusion-3b-instruct-ar-megatron-sglang"
@@ -116,11 +117,39 @@ logger:
     mode: "online"
     name: "grpo-nemotron-diffusion-3b-instruct-ar-megatron-sglang"
 
+runtime_versions:
+  nemo_rl:
+    path: ${oc.env:NEMO_RL_GIT_PATH,unknown}
+    branch: ${oc.env:NEMO_RL_GIT_BRANCH,unknown}
+    commit: ${oc.env:NEMO_RL_GIT_COMMIT,unknown}
+    status_count: ${oc.env:NEMO_RL_GIT_STATUS_COUNT,unknown}
+  sglang:
+    url: ${oc.env:SGLANG_GIT_URL,unknown}
+    commit: ${oc.env:SGLANG_GIT_COMMIT,unknown}
+    subdirectory: ${oc.env:SGLANG_GIT_SUBDIRECTORY,unknown}
+  megatron_bridge:
+    path: ${oc.env:MEGATRON_BRIDGE_GIT_PATH,unknown}
+    branch: ${oc.env:MEGATRON_BRIDGE_GIT_BRANCH,unknown}
+    commit: ${oc.env:MEGATRON_BRIDGE_GIT_COMMIT,unknown}
+    status_count: ${oc.env:MEGATRON_BRIDGE_GIT_STATUS_COUNT,unknown}
+  megatron_lm:
+    path: ${oc.env:MEGATRON_LM_GIT_PATH,unknown}
+    branch: ${oc.env:MEGATRON_LM_GIT_BRANCH,unknown}
+    commit: ${oc.env:MEGATRON_LM_GIT_COMMIT,unknown}
+    status_count: ${oc.env:MEGATRON_LM_GIT_STATUS_COUNT,unknown}
+  env:
+    tag: ${oc.env:ENV_TAG,unknown}
+    uv_project_environment: ${oc.env:UV_PROJECT_ENVIRONMENT,unknown}
+    uv_cache_dir: ${oc.env:UV_CACHE_DIR,unknown}
+    worker_venv_dir: ${oc.env:NEMO_RL_VENV_DIR,unknown}
+
 data:
   train:
-    dataset_name: OpenMathInstruct-2
-    split: train_1M
-    split_validation_size: 0.01
+    dataset_name: gsm8k
+    split: train
+  validation:
+    dataset_name: gsm8k
+    split: test
   max_input_seq_length: 1024
 
 cluster:

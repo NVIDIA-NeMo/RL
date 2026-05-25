@@ -269,6 +269,7 @@ class SGLangGenerationWorker:
             "max_total_tokens",
             "allow_auto_truncate",
             "attention_backend",
+            "json_model_override_args",
             "disable_piecewise_cuda_graph",
             "dllm_algorithm",
             "dllm_algorithm_config",

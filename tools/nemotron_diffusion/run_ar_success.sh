@@ -1,3 +1,0 @@
-RUN_NAME=grpo_nemotron_ar_megatron_sglang_3b_instruct_5k_back_to_old_setup \
-CONFIG=examples/configs/grpo_math_nemotron_diffusion_3b_instruct_ar_megatron_sglang.yaml \
-tools/nemotron_diffusion/submit_grpo_nemotron_ar_megatron_sbatch.sh --sbatch

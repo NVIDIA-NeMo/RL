@@ -57,6 +57,7 @@ class SglangSpecificArgs(TypedDict):
     attention_backend: NotRequired[str | None]
     enable_multimodal: NotRequired[bool]
     sampling_backend: NotRequired[str | None]
+    json_model_override_args: NotRequired[str | None]
     context_length: NotRequired[int | None]
     mem_fraction_static: NotRequired[float | None]
     max_total_tokens: NotRequired[int | None]
