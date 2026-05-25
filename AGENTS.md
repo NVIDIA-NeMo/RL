@@ -5,7 +5,13 @@ NeMo-RL is an RLHF training framework built on Ray and PyTorch (FSDP2 / Megatron
 ## Skills
 
 Coding guidelines and operational procedures are organized as Claude skills in
-`skills/`. **Always read the relevant `SKILL.md` before starting any task it
+two locations:
+
+- `skills/` — customer-facing operational skills (launch-nemo-rl, auto-research, brev-etiquette, docs)
+- `.agents/contributor-skills/` — contributor-facing development guidelines (testing, linting, CI/CD, review, etc.)
+
+All skills are symlinked into `.claude/skills/` for unified discovery.
+**Always read the relevant `SKILL.md` before starting any task it
 covers — skills are mandatory context, not optional background reading.**
 
 **Workflow — mandatory order for every task:**

@@ -160,6 +160,42 @@ class VllmInternalWorkerExtension:
                 policy_weights.append((key, tensor))
         return policy_weights, draft_weights
 
+    @staticmethod
+    def _trim_vocab_padding(
+        draft_model: torch.nn.Module,
+        draft_weights: list[tuple[str, torch.Tensor]],
+    ) -> list[tuple[str, torch.Tensor]]:
+        """Trim padded vocab dimensions from draft weights.
+
+        Megatron pads vocab to a multiple, but vLLM 0.20's autoloader
+        strictly asserts loaded_weight.shape[0] == org_vocab_size on
+        VocabParallelEmbedding layers. Each such layer may have a
+        different org_vocab_size (e.g. embed_tokens uses vocab_size
+        while lm_head uses draft_vocab_size), so we match each weight
+        to its target module by name.
+        """
+        from vllm.model_executor.layers.vocab_parallel_embedding import (
+            VocabParallelEmbedding,
+        )
+
+        vocab_sizes: dict[str, int] = {}
+        for name, module in draft_model.named_modules():
+            if isinstance(module, VocabParallelEmbedding):
+                vocab_sizes[name] = module.org_vocab_size
+
+        if not vocab_sizes:
+            return draft_weights
+
+        trimmed = []
+        for key, tensor in draft_weights:
+            for mod_name, org_vocab_size in vocab_sizes.items():
+                leaf = mod_name.rsplit(".", 1)[-1]
+                if leaf in key and tensor.shape[0] > org_vocab_size:
+                    tensor = tensor[:org_vocab_size]
+                    break
+            trimmed.append((key, tensor))
+        return trimmed
+
     def _load_draft_weights(
         self, draft_weights: list[tuple[str, torch.Tensor]]
     ) -> None:
@@ -174,6 +210,7 @@ class VllmInternalWorkerExtension:
                 "[draft] Received draft weights but vLLM drafter is unavailable; skipping draft update."
             )
             return
+        draft_weights = self._trim_vocab_padding(draft_model, draft_weights)
         draft_model.load_weights(weights=draft_weights)
 
     def _load_weights(self, weights):
