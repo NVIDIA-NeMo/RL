@@ -32,6 +32,7 @@ Exposes:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -43,6 +44,28 @@ from typing import Any
 # importable without spinning up a tokenizer.
 PAD_TOKEN_ID = 151643  # Qwen3 ``<|endoftext|>``
 EOS_TOKEN_ID = 151645  # Qwen3 ``<|im_end|>``
+WEIGHT_UPDATE_PRECISION_ENV = "NEMO_RL_SGLANG_WEIGHT_UPDATE_PRECISION"
+
+
+def weight_update_precision() -> str:
+    precision = os.environ.get(WEIGHT_UPDATE_PRECISION_ENV, "bf16").lower()
+    if precision not in {"bf16", "mxfp8"}:
+        raise ValueError(
+            f"{WEIGHT_UPDATE_PRECISION_ENV} must be 'bf16' or 'mxfp8', "
+            f"got {precision!r}"
+        )
+    return precision
+
+
+def _mxfp8_quantization_cfg() -> dict[str, Any]:
+    from nemo_rl.models.generation.sglang.mxfp8_quantization_core import (
+        MXFP8_QUANTIZATION_CONFIG,
+    )
+
+    return {
+        "scheme": "mxfp8",
+        **MXFP8_QUANTIZATION_CONFIG,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -358,8 +381,21 @@ def make_sglang_cfg(
     ``enable_ep_moe``, ``ep_size``, ``dp_size``, ``pp_size``) match upstream
     ``ServerArgs`` (see ``sglang/python/sglang/srt/server_args.py``).
     """
+    runtime_model_path = model_path
+    quantization_cfg: dict[str, Any] | None = None
+    if weight_update_precision() == "mxfp8":
+        from nemo_rl.models.generation.sglang.mxfp8_setup import (
+            ensure_mxfp8_checkpoint,
+        )
+
+        quantization_cfg = _mxfp8_quantization_cfg()
+        runtime_model_path = ensure_mxfp8_checkpoint(
+            model_path=model_path,
+            quantization_cfg=quantization_cfg,
+        )
+
     sglang_cfg: dict[str, Any] = {
-        "model_path": model_path,
+        "model_path": runtime_model_path,
         "dtype": "bfloat16",
         "random_seed": 42,
         "context_length": max_seq_len,
@@ -378,6 +414,8 @@ def make_sglang_cfg(
     }
     if sglang.enable_dp_attention:
         sglang_cfg["enable_dp_attention"] = True
+    if quantization_cfg is not None:
+        sglang_cfg["quantization"] = quantization_cfg
     # NOTE: ``enable_ep_moe`` was removed in newer sglang versions; EP MoE is
     # now activated implicitly when ``ep_size > 1`` (or explicitly via
     # ``moe_a2a_backend``). We rely on the implicit path here.
@@ -386,9 +424,9 @@ def make_sglang_cfg(
 
     return {
         "backend": "sglang",
-        "model_name": model_path,
-        "model_path": model_path,
-        "tokenizer": {"name": model_path},
+        "model_name": runtime_model_path,
+        "model_path": runtime_model_path,
+        "tokenizer": {"name": runtime_model_path},
         "dtype": "bfloat16",
         "max_new_tokens": 16,
         "temperature": 1.0,
