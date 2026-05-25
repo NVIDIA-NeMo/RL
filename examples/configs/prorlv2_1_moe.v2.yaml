@@ -17,7 +17,7 @@
 # Seq-Mask-TIS: https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda
 # Online IcePop: https://hijkzzz.notion.site/online-ice-pop
 
-defaults: "prorlv2.yaml"
+defaults: "prorlv2.v2.yaml"
 
 grpo:
   # ============================================================================
