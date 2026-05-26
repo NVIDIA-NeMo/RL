@@ -28,6 +28,7 @@ policy:
   logprob_batch_size: 64
   max_total_sequence_length: 1024
   precision: "bfloat16"
+  worker_cls_fqn: "nemo_rl.models.policy.workers.nemotron_diffusion_megatron_policy_worker.NemotronDiffusionMegatronPolicyWorker"
 
   dtensor_cfg:
     enabled: false
@@ -36,7 +37,7 @@ policy:
   scheduler: null
 
   sequence_packing:
-    enabled: true
+    enabled: false
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
     algorithm: "modified_first_fit_decreasing"

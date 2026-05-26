@@ -146,12 +146,16 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
             env_vars = config["dtensor_cfg"].get("env_vars", {})
 
-        # If a worker extension class is provided, use it instead of the default worker builder class
-        if worker_extension_cls_fqn is not None:
+        worker_cls_fqn = config.get("worker_cls_fqn")
+        if worker_cls_fqn is None:
+            worker_cls_fqn = worker_extension_cls_fqn
+
+        # If a worker class is provided, use it instead of the backend default.
+        if worker_cls_fqn is not None:
             print(
-                f"Using worker extension class: {worker_extension_cls_fqn}, please make sure it is a subclass of {worker_builder_cls_fqn}."
+                f"Using policy worker class: {worker_cls_fqn}, please make sure it is a subclass of {worker_builder_cls_fqn}."
             )
-            worker_builder_cls_fqn = worker_extension_cls_fqn
+            worker_builder_cls_fqn = worker_cls_fqn
 
         # Validate world_size compatibility with parallelism configuration
         model_parallel_size = pp_size * cp_size * tp_size

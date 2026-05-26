@@ -476,7 +476,8 @@ name = "megatron-bridge"
 # Must stay in sync with 3rdparty/Megatron-Bridge-workspace/setup.py::CACHED_DEPENDENCIES.
 version = "0.0.0"
 requires-dist = [
-  "transformers>=5.0.0,<=5.3.0",
+  "transformers>=5.5.0,<=5.6.0",
+  "mistral-common>=1.10.0",
   "peft>=0.18.1",
   "datasets>=2.20.0",
   "accelerate",
@@ -498,23 +499,21 @@ requires-dist = [
   # megatron-core omitted here: it's a workspace member and already a direct dep of the mcore extra.
   # Non-workspace path deps cannot depend on workspace members (uv name-shadowing restriction).
   "qwen-vl-utils",
-  # TODO(https://github.com/NVIDIA-NeMo/RL/issues/2111): upgrade to core_cu13 when we move to CUDA 13
-  "transformer-engine[pytorch,core_cu12]",
-  "mamba-ssm",
   "nvidia-resiliency-ext",
-  "causal-conv1d",
   "flash-linear-attention",
   "timm",
   "open-clip-torch>=3.2.0",
   "mlflow>=3.9.0",
   "comet-ml>=3.50.0",
   "torch>=2.6.0",
+  "flashinfer-python==0.6.8.post1",
+  "flashinfer-cubin==0.6.8.post1",
 ]
 
 # remove numpy upper-bound to resolve conflict of nvidia-resiliency-ext==0.6.0 and onnx>=1.21.0rc4
 [[tool.uv.dependency-metadata]]
 name = "logsage"
-version = "0.1.5"
+version = "0.1.8"
 requires-dist = []
 
 [tool.black]

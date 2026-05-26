@@ -48,17 +48,24 @@ export MEGATRON_PATCH_DIR="${MEGATRON_PATCH_DIR:-/lustre/fsw/portfolios/coreai/u
 export WANDB_RUN_NAME="${WANDB_RUN_NAME:-${RUN_NAME}}"
 export WANDB_API_KEY_FILE="${WANDB_API_KEY_FILE:-/home/snorouzi/wandb_api_key.txt}"
 export ENV_TAG="${ENV_TAG:-gsm8k_nd3b_sglang_a652eb48_mb500dac75}"
-export NEMO_RL_VENV_DIR="${NEMO_RL_VENV_DIR:-/lustre/fsw/portfolios/coreai/users/snorouzi/nemo_rl_worker_venvs_${ENV_TAG}}"
+if [[ -z "${NEMO_RL_VENV_DIR:-}" || "${NEMO_RL_VENV_DIR:-}" == "/opt/ray_venvs" ]]; then
+  export NEMO_RL_VENV_DIR="/lustre/fsw/portfolios/coreai/users/snorouzi/nemo_rl_worker_venvs_${ENV_TAG}"
+fi
 export NRL_FORCE_REBUILD_VENVS="${NRL_FORCE_REBUILD_VENVS:-true}"
+export FORCE_REINSTALL_PACKAGES="${FORCE_REINSTALL_PACKAGES:-false}"
 export UV_NO_BINARY_PACKAGE="${UV_NO_BINARY_PACKAGE:-}"
+export UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-300}"
 export NEMO_RL_SGLANG_KERNEL_SOURCE="${NEMO_RL_SGLANG_KERNEL_SOURCE:-/lustre/fsw/portfolios/coreai/users/snorouzi/wheels/sglang_kernel_torch210_cu129_py313/sglang_kernel-0.4.1-cp310-abi3-linux_x86_64.whl}"
 export NEMO_RL_SGLANG_FLASHINFER_SPECS="${NEMO_RL_SGLANG_FLASHINFER_SPECS:-flashinfer_python==0.6.7.post3 flashinfer_cubin==0.6.7.post3}"
+export EXTRA_CONFIG_OVERRIDES="${EXTRA_CONFIG_OVERRIDES:-}"
 
 run_training() {
   mkdir -p "${RUNDIR}"
   cd "${REPO_DIR}"
 
-  export UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-/lustre/fsw/portfolios/coreai/users/snorouzi/nemorl_uv_driver_envs/diffusion_RL_RL_${ENV_TAG}}"
+  if [[ -z "${UV_PROJECT_ENVIRONMENT:-}" || "${UV_PROJECT_ENVIRONMENT:-}" == "/opt/nemo_rl_venv" ]]; then
+    export UV_PROJECT_ENVIRONMENT="/lustre/fsw/portfolios/coreai/users/snorouzi/nemorl_uv_driver_envs/diffusion_RL_RL_${ENV_TAG}"
+  fi
   export UV_CACHE_DIR="${UV_CACHE_DIR:-/lustre/fsw/portfolios/coreai/users/snorouzi/uv_cache_${ENV_TAG}}"
   export NRL_MEGATRON_CHECKPOINT_DIR="${NRL_MEGATRON_CHECKPOINT_DIR:-/lustre/fsw/portfolios/coreai/users/snorouzi/nemo_rl_megatron_ckpts}"
   export MEGATRON_CONFIG_LOCK_DIR="${MEGATRON_CONFIG_LOCK_DIR:-/lustre/fsw/portfolios/coreai/users/snorouzi/hf_home/megatron_config_locks}"
@@ -92,9 +99,10 @@ run_training() {
   export NEMO_RL_GIT_BRANCH="$(git -C "${REPO_DIR}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
   export NEMO_RL_GIT_COMMIT="$(git -C "${REPO_DIR}" rev-parse HEAD 2>/dev/null || echo unknown)"
   export NEMO_RL_GIT_STATUS_COUNT="$(git -C "${REPO_DIR}" status --short 2>/dev/null | wc -l | tr -d ' ')"
-  export SGLANG_GIT_URL="$(awk '/sglang = .*slgang-nemotron-diffusion/ { match($0, /git = "([^"]+)"/, a); print a[1]; exit }' pyproject.toml)"
-  export SGLANG_GIT_COMMIT="$(awk '/sglang = .*slgang-nemotron-diffusion/ { match($0, /rev = "([^"]+)"/, a); print a[1]; exit }' pyproject.toml)"
-  export SGLANG_GIT_SUBDIRECTORY="$(awk '/sglang = .*slgang-nemotron-diffusion/ { match($0, /subdirectory = "([^"]+)"/, a); print a[1]; exit }' pyproject.toml)"
+  sglang_source_line="$(grep 'sglang = .*slgang-nemotron-diffusion' pyproject.toml | head -1)"
+  export SGLANG_GIT_URL="$(printf '%s\n' "${sglang_source_line}" | sed -n 's/.*git = "\([^"]*\)".*/\1/p')"
+  export SGLANG_GIT_COMMIT="$(printf '%s\n' "${sglang_source_line}" | sed -n 's/.*rev = "\([^"]*\)".*/\1/p')"
+  export SGLANG_GIT_SUBDIRECTORY="$(printf '%s\n' "${sglang_source_line}" | sed -n 's/.*subdirectory = "\([^"]*\)".*/\1/p')"
   export MEGATRON_BRIDGE_GIT_PATH="$(realpath 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge)"
   export MEGATRON_BRIDGE_GIT_BRANCH="$(git -C "${MEGATRON_BRIDGE_GIT_PATH}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
   export MEGATRON_BRIDGE_GIT_COMMIT="$(git -C "${MEGATRON_BRIDGE_GIT_PATH}" rev-parse HEAD 2>/dev/null || echo unknown)"
@@ -112,11 +120,23 @@ run_training() {
   git -C 3rdparty/Megatron-LM-workspace/Megatron-LM rev-parse --abbrev-ref HEAD || true
   git -C 3rdparty/Megatron-LM-workspace/Megatron-LM rev-parse HEAD || true
 
+  reinstall_args=()
+  if [[ "${FORCE_REINSTALL_PACKAGES}" == "true" || "${FORCE_REINSTALL_PACKAGES}" == "1" ]]; then
+    reinstall_args=(
+      --reinstall-package nemo-rl
+      --reinstall-package sglang
+      --reinstall-package megatron-bridge
+      --reinstall-package megatron-core
+    )
+  fi
+
+  extra_config_overrides=()
+  if [[ -n "${EXTRA_CONFIG_OVERRIDES}" ]]; then
+    read -r -a extra_config_overrides <<< "${EXTRA_CONFIG_OVERRIDES}"
+  fi
+
   uv run \
-    --reinstall-package nemo-rl \
-    --reinstall-package sglang \
-    --reinstall-package megatron-bridge \
-    --reinstall-package megatron-core \
+    "${reinstall_args[@]}" \
     --extra mcore \
     --with onnx==1.19.1 \
     python examples/run_grpo.py \
@@ -129,6 +149,7 @@ run_training() {
     "logger.wandb.name=${WANDB_RUN_NAME}" \
     policy.generation.vllm_cfg.enforce_eager=true \
     "policy.megatron_cfg.env_vars={PYTHONPATH:${MEGATRON_PATCH_DIR}}" \
+    "${extra_config_overrides[@]}" \
     2>&1 | tee -a "${RUNDIR}/run.log"
 }
 
@@ -172,9 +193,12 @@ export WANDB_API_KEY_FILE="${WANDB_API_KEY_FILE}"
 export ENV_TAG="${ENV_TAG}"
 export NEMO_RL_VENV_DIR="${NEMO_RL_VENV_DIR}"
 export NRL_FORCE_REBUILD_VENVS="${NRL_FORCE_REBUILD_VENVS}"
+export FORCE_REINSTALL_PACKAGES="${FORCE_REINSTALL_PACKAGES}"
 export UV_NO_BINARY_PACKAGE="${UV_NO_BINARY_PACKAGE}"
+export UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT}"
 export NEMO_RL_SGLANG_KERNEL_SOURCE="${NEMO_RL_SGLANG_KERNEL_SOURCE}"
 export NEMO_RL_SGLANG_FLASHINFER_SPECS="${NEMO_RL_SGLANG_FLASHINFER_SPECS}"
+export EXTRA_CONFIG_OVERRIDES="${EXTRA_CONFIG_OVERRIDES}"
 export NEMO_RL_GIT_PATH="${NEMO_RL_GIT_PATH:-}"
 export NEMO_RL_GIT_BRANCH="${NEMO_RL_GIT_BRANCH:-}"
 export NEMO_RL_GIT_COMMIT="${NEMO_RL_GIT_COMMIT:-}"
