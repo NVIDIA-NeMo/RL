@@ -62,6 +62,39 @@ from nemo_rl.models.generation.interfaces import GenerationInterface
 OPT_IN_CARRY_KEYS: tuple[str, ...] = ("turn_roles", "turn_contents")
 
 
+def _flatten_rollout_message_log_for_tq(
+    message_logs: list[Any],
+    prompt_lengths: torch.Tensor,
+    *,
+    pad_token_id: int,
+    make_sequence_length_divisible_by: int,
+) -> tuple[BatchedDataDict[Any], torch.Tensor, BatchedDataDict[Any]]:
+    """Prepare rollout message logs for the TQ payload and driver carry."""
+    from nemo_rl.algorithms.grpo import (
+        add_grpo_token_loss_masks_and_generation_logprobs,
+        extract_initial_prompt_messages,
+    )
+    from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
+
+    pad = {"pad_value_dict": {"token_ids": pad_token_id}}
+    prompt_message_logs = extract_initial_prompt_messages(
+        message_logs,
+        prompt_lengths,
+    )
+    prompt_flat, _ = batched_message_log_to_flat_message(
+        prompt_message_logs,
+        **pad,
+    )
+
+    add_grpo_token_loss_masks_and_generation_logprobs(message_logs)
+    flat, input_lengths = batched_message_log_to_flat_message(
+        message_logs,
+        **pad,
+        make_sequence_length_divisible_by=make_sequence_length_divisible_by,
+    )
+    return flat, input_lengths, prompt_flat
+
+
 @ray.remote  # pragma: no cover
 class SyncRolloutActor:
     """Per-step rollout dispatcher.
@@ -170,15 +203,12 @@ class SyncRolloutActor:
         """
         # Lazy imports — avoid pulling grpo into this module at load.
         from nemo_rl.algorithms.grpo import (
-            _extract_prompt_only_messages,
             _should_use_async_rollouts,
             _should_use_nemo_gym,
         )
         from nemo_rl.algorithms.utils import get_gdpo_reward_component_keys
         from nemo_rl.data.llm_message_utils import (
             MESSAGE_LOG_BULK_FIELDS,
-            add_loss_mask_to_message_log,
-            batched_message_log_to_flat_message,
             decompose_message_log,
         )
 
@@ -228,29 +258,16 @@ class SyncRolloutActor:
         fb = final_batch.to("cpu")
         del final_batch
 
-        # Assistant-only loss mask (shared helper); seed missing
-        # generation_logprobs (e.g. when the env wraps assistant turns
-        # without a backing logprob, or for greedy/replay rollouts).
-        add_loss_mask_to_message_log(fb["message_log"])
-        for ml in fb["message_log"]:
-            for msg in ml:
-                msg.setdefault(
-                    "generation_logprobs",
-                    torch.zeros_like(msg["token_ids"], dtype=torch.float32),
-                )
-
-        # Flatten message_log → bulk tensors + extract prompt-only ids.
-        pad = {"pad_value_dict": {"token_ids": self.tokenizer.pad_token_id}}
-        flat, input_lengths = batched_message_log_to_flat_message(
+        # Flatten message_log → bulk tensors + extract original prompt ids.
+        # GRPO masks only generated assistant turns, even if the dataset
+        # prompt itself contains assistant messages as conversation history.
+        flat, input_lengths, prompt_flat = _flatten_rollout_message_log_for_tq(
             fb["message_log"],
-            **pad,
+            fb["length"],
+            pad_token_id=self.tokenizer.pad_token_id,
             make_sequence_length_divisible_by=cfg.policy[
                 "make_sequence_length_divisible_by"
             ],
-        )
-        prompt_flat, _ = batched_message_log_to_flat_message(
-            _extract_prompt_only_messages(fb["message_log"]),
-            **pad,
         )
 
         # TQ bulk payload — DP_TRAIN_FIELDS + multimodal extras.
