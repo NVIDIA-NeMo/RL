@@ -60,7 +60,7 @@ from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from transformers import PreTrainedTokenizerBase
+from transformers import AutoConfig, PreTrainedTokenizerBase
 
 from nemo_rl.distributed.model_utils import patch_gpt_model_forward_for_linear_ce_fusion
 
@@ -303,6 +303,15 @@ def setup_model_config(
             "This usually means that the one-time HF->mcore conversion on rank=0 saved to a directory "
             "not being mounted on this node. Please check"
         )
+
+    # The converted run_config can reference HF dynamic modules under
+    # transformers_modules.*. Loading the HF config once registers those modules
+    # before Megatron-Bridge instantiates the saved config tree.
+    AutoConfig.from_pretrained(
+        hf_model_name,
+        trust_remote_code=True,
+        **(config.get("hf_config_overrides") or {}),
+    )
 
     try:
         cfg_from_pretrained = ConfigContainer.from_yaml(

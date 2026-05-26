@@ -508,15 +508,29 @@ class SGLangGenerationWorker:
 
         session = await self._ensure_session()
 
-        try:
-            async with session.post(url, json=payload, headers=headers) as response:
-                response.raise_for_status()
-                result = await response.json()
-        except Exception as e:
-            logger.error(
-                f"[SGLang Worker] Rank {self.global_rank} Request failed for input_len={len(input_ids)}: {e}"
-            )
-            raise
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                async with session.post(url, json=payload, headers=headers) as response:
+                    response.raise_for_status()
+                    result = await response.json()
+                break
+            except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
+                if attempt == max_attempts:
+                    logger.error(
+                        f"[SGLang Worker] Rank {self.global_rank} Request failed for input_len={len(input_ids)} after {attempt} attempts: {e}"
+                    )
+                    raise
+                wait_s = 0.5 * attempt
+                logger.warning(
+                    f"[SGLang Worker] Rank {self.global_rank} Request failed for input_len={len(input_ids)} on attempt {attempt}/{max_attempts}: {e}; retrying in {wait_s:.1f}s"
+                )
+                await asyncio.sleep(wait_s)
+            except Exception as e:
+                logger.error(
+                    f"[SGLang Worker] Rank {self.global_rank} Request failed for input_len={len(input_ids)}: {e}"
+                )
+                raise
 
         return _extract_generated_tokens_and_logprobs(result)
 

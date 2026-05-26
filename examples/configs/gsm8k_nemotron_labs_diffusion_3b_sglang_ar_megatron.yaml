@@ -4,8 +4,9 @@ grpo:
   num_prompts_per_step: 128
   num_generations_per_prompt: 8
   max_num_steps: 5000
+  max_num_epochs: 1000
   val_period: 100
-  val_at_start: true
+  val_at_start: false
   val_at_end: true
   max_val_samples: 2000
   val_batch_size: 128
@@ -23,9 +24,9 @@ policy:
   tokenizer:
     name: ${policy.model_name}
   train_global_batch_size: 1024
-  train_micro_batch_size: 128
+  train_micro_batch_size: 16
   generation_batch_size: 32
-  logprob_batch_size: 64
+  logprob_batch_size: 32
   max_total_sequence_length: 1024
   precision: "bfloat16"
   worker_cls_fqn: "nemo_rl.models.policy.workers.nemotron_diffusion_megatron_policy_worker.NemotronDiffusionMegatronPolicyWorker"
@@ -49,7 +50,7 @@ policy:
     enabled: true
     force_reconvert_from_hf: false
     empty_unused_memory_level: 1
-    activation_checkpointing: false
+    activation_checkpointing: true
     converter_type: "Ministral3ForCausalLM"
     tensor_model_parallel_size: 1
     expert_tensor_parallel_size: 1
@@ -101,9 +102,9 @@ policy:
       dp_size: 1
       pp_size: 1
       ep_size: 1
-      max_running_requests: 32
+      max_running_requests: 8
       mem_fraction_static: 0.55
-      max_total_tokens: 160000
+      max_total_tokens: 20000
       skip_server_warmup: true
       disable_piecewise_cuda_graph: true
       attention_backend: "flashinfer"
