@@ -23,7 +23,8 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoConfig, AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.grpo import _should_use_async_rollouts, refit_policy_generation
+from nemo_rl.algorithms.grpo import _should_use_async_rollouts
+from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
 from nemo_rl.algorithms.loss import (
     DistillationLossConfig,
     DistillationLossDataDict,
@@ -49,12 +50,11 @@ from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
 )
-from nemo_rl.models.generation.interfaces import (
-    GenerationInterface,
-)
-from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation import create_generation
+from nemo_rl.models.generation.constants import MEGATRON_BACKEND, VLLM_BACKEND
+from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.policy import PolicyConfig
-from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
+from nemo_rl.models.policy.interfaces import OffloadMode, PolicyTrainerInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import (
@@ -162,9 +162,10 @@ def setup(
     train_dataset: AllTaskProcessedDataset,
     val_dataset: Optional[AllTaskProcessedDataset],
 ) -> tuple[
-    ColocatablePolicyInterface,  # student_policy
-    ColocatablePolicyInterface,  # teacher_policy
+    PolicyTrainerInterface,  # student_policy
+    PolicyTrainerInterface,  # teacher_policy
     Optional[GenerationInterface],  # student_generation
+    Optional[WeightSynchronizer],  # weight_sync
     StatefulDataLoader,
     Optional[StatefulDataLoader],
     DistillationLossFn,
@@ -176,7 +177,7 @@ def setup(
     """Main entry point for distillation algorithm.
 
     Returns:
-        tuple of student_policy, teacher_policy, student_generation,
+        tuple of student_policy, teacher_policy, student_generation, weight_sync,
         train_dataloader, val_dataloader,
         loss_fn, logger, checkpointer, distillation_save_state, master_config
     """
@@ -296,7 +297,7 @@ def setup(
             use_gpus=True,
             num_gpus_per_node=cluster_config["gpus_per_node"],
             max_colocated_worker_groups=1
-            if generation_config["backend"] == "megatron"
+            if generation_config["backend"] == MEGATRON_BACKEND
             else 3,
         )
         train_cluster = cluster
@@ -306,7 +307,7 @@ def setup(
             flush=True,
         )
     else:
-        assert generation_config["backend"] != "megatron", (
+        assert generation_config["backend"] != MEGATRON_BACKEND, (
             "Non-colocated inference is not supported for Megatron generation backends. "
             "Please use vLLM backend for generation."
         )
@@ -402,7 +403,7 @@ def setup(
         init_optimizer=False,
         init_reference_model=False,
     )
-    teacher_policy.offload_after_refit()
+    teacher_policy.finish_training()
 
     # ==========================
     #    Student Generation Interface
@@ -410,21 +411,22 @@ def setup(
     backend = generation_config["backend"]
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
 
-    if backend == "megatron":
+    if backend == MEGATRON_BACKEND:
         student_generation = None
-    elif backend == "vllm":
-        generation_config = cast(VllmConfig, generation_config)
-        if "vllm_cfg" in generation_config:
-            ## make vllm hf overrides match the training policy
-            generation_config["vllm_kwargs"]["hf_overrides"] = policy_config.get(
+    else:
+        if backend == VLLM_BACKEND and "vllm_cfg" in generation_config:
+            generation_config["vllm_cfg"]["hf_overrides"] = policy_config.get(
                 "hf_config_overrides", {}
             )
-        student_generation = VllmGeneration(
-            cluster=inference_cluster, config=generation_config
+
+        student_generation = create_generation(
+            backend=backend,
+            cluster=inference_cluster,
+            config=generation_config,
         )
         student_generation.finish_generation()
         print(
-            f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}",
+            f"  ✓ Using {backend} backend for generation with {policy_config['model_name']}",
             flush=True,
         )
 
@@ -455,26 +457,18 @@ def setup(
         init_reference_model=False,
     )
 
+    # Create weight synchronizer and initialize communication channels
+    weight_sync: Optional[WeightSynchronizer] = None
     if student_generation is not None:
-        state_dict_info = student_policy.prepare_refit_info()
-        student_generation.prepare_refit_info(state_dict_info)
-
-    # if it is not colocated inference, initialize collective communication for update weights
-    if not colocated_inference:
-        ip, port = train_cluster.get_master_address_and_port()
-        print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
-        train_world_size = train_cluster.world_size()
-        # inference cluster + head node of the train cluster
-        world_size = train_world_size + inference_nodes * inference_gpus_per_node
-        # init collective
-        futures_train = student_policy.init_collective(
-            ip, port, world_size, train_world_size=train_world_size
+        weight_sync = create_weight_synchronizer(
+            policy=student_policy,
+            generation=student_generation,
+            generation_backend=backend,
+            colocated=colocated_inference,
+            train_cluster=train_cluster if not colocated_inference else None,
+            inference_cluster=inference_cluster if not colocated_inference else None,
         )
-        futures_inference = student_generation.init_collective(
-            ip, port, world_size, train_world_size=train_world_size
-        )  # type: ignore
-        # wait for all futures to complete
-        ray.get(futures_train + futures_inference)
+        weight_sync.init_communicator()
 
     loss_fn = DistillationLossFn(loss_config)
 
@@ -486,6 +480,7 @@ def setup(
         student_policy,
         teacher_policy,
         student_generation,
+        weight_sync,
         dataloader,
         val_dataloader,
         loss_fn,
@@ -502,8 +497,8 @@ def setup(
 
 
 def distillation_train(
-    student_policy: ColocatablePolicyInterface,
-    teacher_policy: ColocatablePolicyInterface,
+    student_policy: PolicyTrainerInterface,
+    teacher_policy: PolicyTrainerInterface,
     student_generation: Optional[GenerationInterface],
     dataloader: StatefulDataLoader,
     val_dataloader: Optional[StatefulDataLoader],
@@ -515,6 +510,7 @@ def distillation_train(
     checkpointer: CheckpointManager,
     distillation_save_state: DistillationSaveState,
     master_config: MasterConfig,
+    weight_sync: Optional[WeightSynchronizer] = None,
 ) -> None:
     """Run Distillation training algorithm."""
     timer = Timer()
@@ -524,13 +520,10 @@ def distillation_train(
     )
     timeout.start_iterations()
 
-    NEED_REFIT = True
     # If student_generation is None, use the student_policy as the generation interface (megatron framework backend)
     if student_generation is None:
         student_generation = student_policy  # type: ignore
-        NEED_REFIT = False
-    POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
-    assert student_generation is not None
+    assert student_generation is not None  # for mypy type check
 
     # common config/state items
     current_epoch = distillation_save_state["current_epoch"]  # current epoch
@@ -556,11 +549,8 @@ def distillation_train(
     # Run validation at the start if configured
     if val_at_start and total_steps == 0:
         print("\n🔍 Running initial validation...", flush=True)
-        if NEED_REFIT and POLICY_GENERATION_STALE:
-            refit_policy_generation(
-                student_policy, student_generation, colocated_inference
-            )
-            POLICY_GENERATION_STALE = False
+        if weight_sync is not None and weight_sync.is_stale:
+            weight_sync.sync_weights()
         else:
             student_generation.prepare_for_generation()
         val_metrics, validation_timings = validate(
@@ -611,14 +601,8 @@ def distillation_train(
                     flush=True,
                 )
                 with timer.time("prepare_for_generation"):
-                    if NEED_REFIT and POLICY_GENERATION_STALE:
-                        refit_policy_generation(
-                            student_policy,
-                            student_generation,
-                            colocated_inference,
-                            timer=timer,
-                        )
-                        POLICY_GENERATION_STALE = False
+                    if weight_sync is not None and weight_sync.is_stale:
+                        weight_sync.sync_weights(timer=timer)
                     else:
                         student_generation.prepare_for_generation()
 
@@ -696,7 +680,7 @@ def distillation_train(
 
                 print("▶ Preparing for teacher logprob inference...", flush=True)
                 with timer.time("teacher_logprob_inference_prep"):
-                    teacher_policy.prepare_for_lp_inference()
+                    teacher_policy.finish_training(offload_mode=OffloadMode.EVAL_ONLY)
 
                 print("▶ Computing teacher logprobs...", flush=True)
                 with timer.time("teacher_logprob_inference"):
@@ -710,9 +694,10 @@ def distillation_train(
 
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
-                    teacher_policy.offload_after_refit()
+                    teacher_policy.finish_training()
                     student_policy.prepare_for_training()  # set model train and reload optim to GPU
-                    POLICY_GENERATION_STALE = True
+                    if weight_sync is not None:
+                        weight_sync.mark_stale()
 
                 print("▶ Training policy...", flush=True)
                 with timer.time("policy_training"):
@@ -731,11 +716,8 @@ def distillation_train(
                 if (val_period > 0 and (total_steps + 1) % val_period == 0) or (
                     val_at_end and is_last_step
                 ):
-                    if NEED_REFIT and POLICY_GENERATION_STALE:
-                        refit_policy_generation(
-                            student_policy, student_generation, colocated_inference
-                        )
-                        POLICY_GENERATION_STALE = False
+                    if weight_sync is not None and weight_sync.is_stale:
+                        weight_sync.sync_weights()
                     else:
                         student_generation.prepare_for_generation()
                     val_metrics, validation_timings = validate(

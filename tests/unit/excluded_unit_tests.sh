@@ -24,8 +24,6 @@ EXCLUDED_UNIT_TESTS=(
     --deselect=tests/unit/algorithms/test_grpo.py::test_calculate_rewards_multiple_tasks
     --deselect=tests/unit/algorithms/test_grpo.py::test_calculate_rewards_missing_environment
     --deselect=tests/unit/algorithms/test_grpo.py::test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node
-    --deselect=tests/unit/algorithms/test_grpo.py::test_refit_policy_generation_sglang_colocated_http
-    --deselect=tests/unit/algorithms/test_grpo.py::test_refit_policy_generation_sglang_non_colocated_raises
 
     # test_utils.py — exclude only HF gated tokenizer tests
     --deselect=tests/unit/algorithms/test_utils.py::test_get_tokenizer_no_chat_template

@@ -343,7 +343,9 @@ def _test_dtensor_worker_logprob(policy, data, logprobs):
 
     # Generate logprobs
     print("\nGenerating logprobs...")
-    policy.prepare_for_lp_inference()
+    from nemo_rl.models.policy.interfaces import OffloadMode
+
+    policy.finish_training(offload_mode=OffloadMode.EVAL_ONLY)
     policy_logprobs = policy.get_logprobs(data)["logprobs"]
 
     print("## MAX DIFF ###", torch.max(torch.abs(policy_logprobs - logprobs)))
@@ -492,7 +494,9 @@ class TestSingleGPUCluster:
             expected_logprobs = calculate_token_logprobs(tiny_llama_model_path, data)
 
             # Test logprob computation
-            policy.prepare_for_lp_inference()
+            from nemo_rl.models.policy.interfaces import OffloadMode
+
+            policy.finish_training(offload_mode=OffloadMode.EVAL_ONLY)
             policy_logprobs = policy.get_logprobs(data)["logprobs"]
 
             max_diff = torch.max(torch.abs(policy_logprobs - expected_logprobs))

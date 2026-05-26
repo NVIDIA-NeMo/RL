@@ -42,8 +42,7 @@ from nemo_rl.weight_sync.ipc_weight_synchronizer import (
 
 def _mock_policy(**overrides):
     policy = MagicMock()
-    policy.offload_before_refit.return_value = None
-    policy.offload_after_refit.return_value = None
+    policy.finish_training.return_value = None
     policy.prepare_refit_info.return_value = {"layer_0": {"shape": [4096, 4096]}}
     policy.stream_weights_via_ipc_zmq.return_value = [MagicMock()]
     policy.stream_weights_via_http.return_value = [MagicMock()]
@@ -114,11 +113,13 @@ class TestIPCWeightSynchronizer:
         sync.sync_weights()
         assert not sync.is_stale
 
-        policy.offload_before_refit.assert_called_once()
+        from nemo_rl.models.policy.interfaces import OffloadMode
+
+        policy.finish_training.assert_any_call(offload_mode=OffloadMode.OPTIMIZER_ONLY)
         gen.prepare_for_generation.assert_any_call(tags=["weights"])
         policy.stream_weights_via_ipc_zmq.assert_called_once()
         gen.update_weights_via_ipc_zmq.assert_called_once()
-        policy.offload_after_refit.assert_called_once()
+        policy.finish_training.assert_any_call(offload_mode=OffloadMode.FULL)
         gen.prepare_for_generation.assert_any_call(tags=["kv_cache"])
 
     @patch("nemo_rl.weight_sync.ipc_weight_synchronizer.ray")
@@ -236,12 +237,14 @@ class TestHTTPWeightSynchronizer:
         sync.sync_weights()
         assert not sync.is_stale
 
-        policy.offload_before_refit.assert_called_once()
+        from nemo_rl.models.policy.interfaces import OffloadMode
+
+        policy.finish_training.assert_any_call(offload_mode=OffloadMode.OPTIMIZER_ONLY)
         gen.prepare_for_generation.assert_any_call(tags=["weights"])
         gen.get_sglang_url_to_gpu_uuids.assert_called_once()
         gen.invalidate_kv_cache.assert_called_once()
         policy.stream_weights_via_http.assert_called_once()
-        policy.offload_after_refit.assert_called_once()
+        policy.finish_training.assert_any_call(offload_mode=OffloadMode.FULL)
         gen.prepare_for_generation.assert_any_call(tags=["kv_cache"])
 
     @patch("nemo_rl.weight_sync.http_weight_synchronizer.ray")

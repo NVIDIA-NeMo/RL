@@ -19,12 +19,12 @@ backend using ZMQ IPC sockets and CUDA IPC handles. This is the primary
 transport for colocated vLLM deployments.
 
 Lifecycle per sync:
-  1. policy.offload_before_refit()       -- free GPU for weight staging
-  2. generation.prepare_for_generation(tags=["weights"])  -- allocate buffers
-  3. policy.stream_weights_via_ipc_zmq() -- send weights via ZMQ
+  1. policy.finish_training(OPTIMIZER_ONLY)  -- free optimizer for weight staging
+  2. generation.prepare_for_generation()     -- allocate weight buffers
+  3. policy.stream_weights_via_ipc_zmq()     -- send weights via ZMQ
      generation.update_weights_via_ipc_zmq() -- receive weights
-  4. policy.offload_after_refit()        -- restore optimizer state
-  5. generation.prepare_for_generation(tags=["kv_cache"]) -- rebuild KV cache
+  4. policy.finish_training(FULL)            -- exit training phase (offload model)
+  5. generation.prepare_for_generation()     -- rebuild KV cache
 """
 
 import os
@@ -33,6 +33,7 @@ from typing import Any, Optional
 
 import ray
 
+from nemo_rl.models.policy.interfaces import OffloadMode
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
@@ -45,7 +46,7 @@ class IPCWeightSynchronizer(WeightSynchronizer):
     any network overhead.
 
     Args:
-        policy: Policy object implementing ColocatablePolicyInterface.
+        policy: Policy object implementing PolicyTrainerInterface.
         generation: Generation object implementing GenerationInterface
             (concretely a VllmGeneration instance).
         refit_buffer_size_gb: Fixed buffer size in GB for weight staging.
@@ -69,7 +70,7 @@ class IPCWeightSynchronizer(WeightSynchronizer):
         timer: Optional[Timer] = None,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> None:
-        self._policy.offload_before_refit()
+        self._policy.finish_training(offload_mode=OffloadMode.OPTIMIZER_ONLY)
         self._generation.prepare_for_generation(tags=["weights"])
 
         sync_succeeded = False
@@ -98,7 +99,7 @@ class IPCWeightSynchronizer(WeightSynchronizer):
                     )
             sync_succeeded = True
         finally:
-            self._policy.offload_after_refit()
+            self._policy.finish_training(offload_mode=OffloadMode.FULL)
             self._generation.prepare_for_generation(tags=["kv_cache"])
 
         self._stale = not sync_succeeded

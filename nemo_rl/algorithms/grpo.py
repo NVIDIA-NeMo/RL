@@ -17,6 +17,7 @@ import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from pathlib import Path
 from typing import Any, Callable, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
@@ -69,11 +70,15 @@ from nemo_rl.experience.rollouts import (
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
 )
+from nemo_rl.models.generation import create_generation
+from nemo_rl.models.generation.constants import (
+    MEGATRON_BACKEND,
+    SGLANG_BACKEND,
+    VLLM_BACKEND,
+)
 from nemo_rl.models.generation.interfaces import GenerationInterface
-from nemo_rl.models.generation.sglang import SGLangConfig, SGLangGeneration
-from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.policy import PolicyConfig
-from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
+from nemo_rl.models.policy.interfaces import OffloadMode, PolicyTrainerInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 from nemo_rl.utils.logger import (
@@ -85,6 +90,7 @@ from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
+from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
 
 # ===============================================================================
 # Configuration
@@ -224,9 +230,10 @@ def setup(
     processor: Optional[AutoProcessor] = None,
     policy_factory: Optional[Callable[..., ColocatablePolicyInterface]] = None,
 ) -> tuple[
-    ColocatablePolicyInterface,
+    PolicyTrainerInterface,
     Optional[GenerationInterface],
     tuple[RayVirtualCluster, RayVirtualCluster],
+    Optional[WeightSynchronizer],
     StatefulDataLoader | MultipleDataloaderWrapper,
     Optional[StatefulDataLoader],
     ClippedPGLossFn,
@@ -238,7 +245,8 @@ def setup(
     """Main entry point for running GRPO algorithm.
 
     Returns:
-        tuple of policy, cluster, dataloader, tokenizer, loss_fn, math_env, logger, master_config, val_dataloader
+        tuple of policy, policy_generation, clusters, weight_sync, dataloader,
+        val_dataloader, loss_fn, logger, checkpointer, grpo_save_state, master_config
     """
     # Start timing the entire setup process
     setup_start_time = time.perf_counter()
@@ -449,7 +457,7 @@ def setup(
             use_gpus=True,
             num_gpus_per_node=policy_gpus_per_node,
             max_colocated_worker_groups=1
-            if generation_config["backend"] == "megatron"
+            if generation_config["backend"] == MEGATRON_BACKEND
             else 2,
         )
         train_cluster = cluster
@@ -460,7 +468,7 @@ def setup(
         )
 
     else:
-        assert generation_config["backend"] != "megatron", (
+        assert generation_config["backend"] != MEGATRON_BACKEND, (
             "Non-colocated inference is not supported for Megatron generation backends. "
             "Please use vLLM backend for generation."
         )
@@ -603,17 +611,14 @@ def setup(
         )
         return p, time.perf_counter() - t0
 
-    def init_vllm():
-        """Initialize vLLM generation workers."""
+    def init_generation():
+        """Initialize generation backend workers via the registry."""
         t0 = time.perf_counter()
-        pg = VllmGeneration(cluster=inference_cluster, config=generation_config)
-        pg.finish_generation()
-        return pg, time.perf_counter() - t0
-
-    def init_sglang():
-        """Initialize SGLang generation workers."""
-        t0 = time.perf_counter()
-        pg = SGLangGeneration(cluster=inference_cluster, config=generation_config)
+        pg = create_generation(
+            backend=backend,
+            cluster=inference_cluster,
+            config=generation_config,
+        )
         pg.finish_generation()
         return pg, time.perf_counter() - t0
 
@@ -679,7 +684,7 @@ def setup(
         return policy_generation, policy
 
     # Handle generation-specific setup
-    if backend == "megatron":
+    if backend == MEGATRON_BACKEND:
         # Megatron generation: policy_generation is None, only initialize policy
         policy_generation = None
         print(
@@ -690,65 +695,46 @@ def setup(
         policy, policy_time = init_policy()
         worker_init_timing_metrics["policy_init_time_s"] = policy_time
 
-    elif backend == "vllm":
-        # vLLM generation: setup config, then initialize with policy
-        generation_config = cast(VllmConfig, generation_config)
-        if generation_config["vllm_cfg"]["precision"] == "fp8":
-            assert loss_config.use_importance_sampling_correction, (
-                "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
-            )
-        if generation_config["vllm_cfg"]["kv_cache_dtype"].startswith("fp8"):
-            # FP8 KV cache requires FP8 model precision
-            assert generation_config["vllm_cfg"]["precision"] == "fp8", (
-                f"kv_cache_dtype='{generation_config['vllm_cfg']['kv_cache_dtype']}' requires precision='fp8'. "
-                "FP8 KV cache can only be used together with FP8 model weights."
-            )
-            # FP8 KV cache compatibility checks
-            assert policy_config["dtensor_cfg"]["enabled"] == False, (
-                "DTensor backend is not supported with kv cache fp8 enabled."
-            )
-            assert not _should_use_async_rollouts(master_config), (
-                "Async rollouts is not supported with kv cache fp8 enabled."
-            )
-            assert policy_config["megatron_cfg"]["pipeline_model_parallel_size"] == 1, (
-                "Currently when using FP8 KV cache in generation, then in megatron we only support pipeline_model_parallel_size=1. We will add more support in future."
+    else:
+        # Backend-specific config validation / defaults
+        if backend == VLLM_BACKEND:
+            if generation_config["vllm_cfg"]["precision"] == "fp8":
+                assert loss_config["use_importance_sampling_correction"] is True, (
+                    "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
+                )
+            if generation_config["vllm_cfg"]["kv_cache_dtype"].startswith("fp8"):
+                assert generation_config["vllm_cfg"]["precision"] == "fp8", (
+                    f"kv_cache_dtype='{generation_config['vllm_cfg']['kv_cache_dtype']}' requires precision='fp8'. "
+                    "FP8 KV cache can only be used together with FP8 model weights."
+                )
+                assert policy_config["dtensor_cfg"]["enabled"] == False, (
+                    "DTensor backend is not supported with kv cache fp8 enabled."
+                )
+                assert not _should_use_async_rollouts(master_config), (
+                    "Async rollouts is not supported with kv cache fp8 enabled."
+                )
+                assert policy_config["megatron_cfg"]["pipeline_model_parallel_size"] == 1, (
+                    "Currently when using FP8 KV cache in generation, then in megatron we only support pipeline_model_parallel_size=1. We will add more support in future."
+                )
+
+            generation_config["vllm_cfg"]["hf_overrides"] = policy_config.get(
+                "hf_config_overrides", {}
             )
 
-        ## make vllm hf overrides match the training policy
-        generation_config["vllm_kwargs"]["hf_overrides"] = policy_config.get(
-            "hf_config_overrides", {}
-        )
+        elif backend == SGLANG_BACKEND:
+            if "model_path" not in generation_config["sglang_cfg"]:
+                generation_config["sglang_cfg"]["model_path"] = policy_config["model_name"]
 
         policy_generation, policy = initialize_generation_with_policy(
-            init_generation_fn=init_vllm,
-            generation_name="vLLM",
-            init_time_key="vllm_init_time_s",
+            init_generation_fn=init_generation,
+            generation_name=backend,
+            init_time_key=f"{backend}_init_time_s",
             colocated_inference=colocated_inference,
             worker_init_timing_metrics=worker_init_timing_metrics,
         )
 
         print(
-            f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}",
-            flush=True,
-        )
-
-    elif backend == "sglang":
-        generation_config = cast(SGLangConfig, generation_config)
-
-        # Set model_path if not already set
-        if "model_path" not in generation_config["sglang_cfg"]:
-            generation_config["sglang_cfg"]["model_path"] = policy_config["model_name"]
-
-        policy_generation, policy = initialize_generation_with_policy(
-            init_generation_fn=init_sglang,
-            generation_name="SGLang",
-            init_time_key="sglang_init_time_s",
-            colocated_inference=colocated_inference,
-            worker_init_timing_metrics=worker_init_timing_metrics,
-        )
-
-        print(
-            f"  ✓ Using SGLang backend for generation with {policy_config['model_name']}",
+            f"  ✓ Using {backend} backend for generation with {policy_config['model_name']}",
             flush=True,
         )
 
@@ -758,30 +744,23 @@ def setup(
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
-    # if it is not colocated inference, initialize collective communication for update weights
-    if not colocated_inference:
-        t0 = time.perf_counter()
-        ip, port = train_cluster.get_master_address_and_port()
-        print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
-        # world includes all training workers and all inference workers
-        train_world_size = train_cluster.world_size()
-        inference_world_size = inference_nodes * inference_gpus_per_node
-        world_size = train_world_size + inference_world_size
-        # init collective
-        futures_train = policy.init_collective(
-            ip, port, world_size, train_world_size=train_world_size
-        )
-        futures_inference = policy_generation.init_collective(
-            ip, port, world_size, train_world_size=train_world_size
-        )  # type: ignore
-        # wait for all futures to complete
-        ray.get(futures_train + futures_inference)
-        worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
-
-    # prepare refit info
-    state_dict_info = policy.prepare_refit_info()
+    # Create weight synchronizer and initialize communication channels
+    weight_sync: Optional[WeightSynchronizer] = None
     if policy_generation is not None:
-        policy_generation.prepare_refit_info(state_dict_info)
+        weight_sync = create_weight_synchronizer(
+            policy=policy,
+            generation=policy_generation,
+            generation_backend=backend,
+            colocated=colocated_inference,
+            train_cluster=train_cluster if not colocated_inference else None,
+            inference_cluster=inference_cluster if not colocated_inference else None,
+        )
+        t0 = time.perf_counter()
+        weight_sync.init_communicator()
+        if not colocated_inference:
+            worker_init_timing_metrics["collective_init_time_s"] = (
+                time.perf_counter() - t0
+            )
 
     # Calculate total setup time
     total_setup_time = time.perf_counter() - setup_start_time
@@ -791,12 +770,13 @@ def setup(
     if worker_init_timing_metrics:
         print("\n▶ Worker Initialization Timing:")
 
-        vllm_time = worker_init_timing_metrics.get("vllm_init_time_s", 0)
+        gen_time_key = f"{backend}_init_time_s"
+        gen_time = worker_init_timing_metrics.get(gen_time_key, 0)
         policy_time = worker_init_timing_metrics.get("policy_init_time_s", 0)
         total_setup = worker_init_timing_metrics.get("total_setup_time_s", 0)
 
-        if vllm_time:
-            print(f"  vLLM init: {vllm_time:.1f}s")
+        if gen_time:
+            print(f"  {backend} init: {gen_time:.1f}s")
 
         if policy_time:
             print(f"  Policy init: {policy_time:.1f}s")
@@ -820,6 +800,7 @@ def setup(
         policy,
         policy_generation,
         (train_cluster, inference_cluster),
+        weight_sync,
         dataloader,
         val_dataloader,
         loss_fn,
@@ -1020,7 +1001,7 @@ def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
         return False
 
     backend = generation_config.get("backend", "")
-    if backend != "vllm":
+    if backend != VLLM_BACKEND:
         return False
 
     vllm_cfg = generation_config.get("vllm_cfg", {})
@@ -1127,102 +1108,6 @@ def _extract_prompt_only_messages(message_logs: list) -> list:
         prompt_only_message_logs.append(prompt_only_log)
     return prompt_only_message_logs
 
-
-def refit_policy_generation(
-    policy: ColocatablePolicyInterface,
-    policy_generation: GenerationInterface,
-    colocated_inference: bool,
-    _refit_buffer_size_gb: Optional[int] = None,
-    timer: Optional[Timer] = None,
-    kv_scales: Optional[dict[str, float]] = None,
-) -> None:
-    """Refit the policy generation interface with the latest policy weights.
-
-    Args:
-        policy: The policy to provide weights to the inference engine.
-        policy_generation: The inference engine to refit.
-        _refit_buffer_size_gb: The size of the buffer to use for refitting.
-            If it is None, the buffer size will be computed by the remaining memory.
-            This parameter is primarily used for testing.
-        timer: Optional Timer used to time the prepare/transfer/update phase
-        kv_scales: Optional dictionary of KV cache scales for FP8 quantization.
-    """
-    if colocated_inference:
-        policy.offload_before_refit()
-        policy_generation.prepare_for_generation(tags=["weights"])
-
-    # Create a context manager that does nothing when timer is None
-    timer_context = (
-        timer.time("prepare_for_generation/transfer_and_update_weights")
-        if timer is not None
-        else nullcontext()
-    )
-    with timer_context:
-        # update weights
-        update_success = False
-        if colocated_inference:
-            # get model param keys, which is grouped by size
-            if _refit_buffer_size_gb is not None:
-                buffer_size_bytes = _refit_buffer_size_gb * (1024**3)
-            else:
-                # Empirically sets ratio as 30% to maximize efficiency.
-                # The remaining 70% is a necessary buffer reserved for the parameter all-gathering across the expert-parallelism dimension.
-                memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.3")
-                buffer_size_bytes = int(
-                    policy.get_free_memory_bytes() * float(memory_ratio)
-                )
-
-            if isinstance(policy_generation, SGLangGeneration):
-                sglang_url_to_gpu_uuids = (
-                    policy_generation.get_sglang_url_to_gpu_uuids()
-                )
-                # Stream weights via HTTP
-                flush_success = policy_generation.invalidate_kv_cache()
-                if not flush_success:
-                    print("SGLang KV cache invalidation failed before weight update. ")
-                futures_train = policy.stream_weights_via_http(
-                    sglang_url_to_gpu_uuids=sglang_url_to_gpu_uuids,
-                )
-                # Wait for all workers to complete
-                ray.get(futures_train)
-                update_success = True
-            else:
-                # Original ZMQ IPC path for vLLM
-                futures_train = policy.stream_weights_via_ipc_zmq(
-                    buffer_size_bytes=buffer_size_bytes
-                )
-                futures_inference = policy_generation.update_weights_via_ipc_zmq()
-                # wait for all futures to complete
-                ray.get(futures_train)
-                results = ray.get(futures_inference)
-                update_success = all(result for result in results if result is not None)
-        else:
-            # update weights through nccl
-            # SGLang haven't implemented non-colocated inference mode.
-            if isinstance(policy_generation, SGLangGeneration):
-                raise NotImplementedError(
-                    "SGLang haven't implemented non-colocated inference mode. "
-                )
-            futures_train = policy.broadcast_weights_for_collective(kv_scales=kv_scales)
-            futures_inference = policy_generation.update_weights_from_collective()
-            # wait for all futures to complete
-            ray.get(futures_train)
-            results = ray.get(futures_inference)
-            update_success = all(result for result in results if result is not None)
-
-        # check if update is successful
-        if not update_success:
-            error_tag = "cuda-ipc" if colocated_inference else "nccl"
-            error_message = (
-                "❌ Error: Updating weights for the generation policy failed during refit.\n"
-                f"This often indicates an issue with {error_tag} or "
-                "a problem within the generation backend (e.g., vLLM worker).\n"
-            )
-            raise RuntimeError(error_message)
-
-    if colocated_inference:
-        policy.offload_after_refit()
-        policy_generation.prepare_for_generation(tags=["kv_cache"])
 
 
 def _log_mixed_rewards_and_advantages_information(
@@ -1338,7 +1223,7 @@ def compute_and_apply_seq_logprob_error_masking(
 
 
 def grpo_train(
-    policy: ColocatablePolicyInterface,
+    policy: PolicyTrainerInterface,
     policy_generation: Optional[GenerationInterface],
     wrapped_dataloader: StatefulDataLoader | MultipleDataloaderWrapper,
     val_dataloader: Optional[StatefulDataLoader],
@@ -1350,6 +1235,7 @@ def grpo_train(
     checkpointer: CheckpointManager,
     grpo_save_state: GRPOSaveState,
     master_config: MasterConfig,
+    weight_sync: Optional[WeightSynchronizer] = None,
 ) -> None:
     """Run GRPO training algorithm."""
     timer = Timer()
@@ -1362,13 +1248,10 @@ def grpo_train(
 
     kv_scales_cache = None  # Cache reused for computed kv scales
 
-    NEED_REFIT = True
     # If policy_generation is None, use the policy as the generation interface (megatron framework backend)
     if policy_generation is None:
         policy_generation = policy  # type: ignore
-        NEED_REFIT = False
-    POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
-    assert policy_generation is not None
+    assert policy_generation is not None  # for mypy type check
 
     # Check if we need to sync KV cache scales
     # When fallback to policy as the policy_generation, we use getattr to check.
@@ -1404,9 +1287,8 @@ def grpo_train(
         print("\n🔍 Running initial validation...", flush=True)
         memory_tracker.snapshot_start_of_stage("Initial validation", dir())
 
-        if NEED_REFIT and POLICY_GENERATION_STALE:
-            refit_policy_generation(policy, policy_generation, colocated_inference)
-            POLICY_GENERATION_STALE = False
+        if weight_sync is not None and weight_sync.is_stale:
+            weight_sync.sync_weights()
         else:
             policy_generation.prepare_for_generation()
         val_metrics, validation_timings = validate(
@@ -1483,11 +1365,11 @@ def grpo_train(
                     flush=True,
                 )
                 with timer.time("prepare_for_generation/total"):
-                    if NEED_REFIT and POLICY_GENERATION_STALE:
+                    if weight_sync is not None and weight_sync.is_stale:
                         # Compute KV scales if needed for FP8 quantization
                         if sync_kv_scales and kv_scales_cache is None:
                             print("▶ Computing KV cache scales...", flush=True)
-                            policy.prepare_for_lp_inference()
+                            policy.finish_training(offload_mode=OffloadMode.EVAL_ONLY)
                             # Align with training data processing to ensure parallel training compatibility
                             calib_flat, calib_input_lengths = (
                                 batched_message_log_to_flat_message(
@@ -1515,17 +1397,13 @@ def grpo_train(
                                 calibration_data, include_q=True
                             )["layers"]
 
-                        refit_policy_generation(
-                            policy,
-                            policy_generation,
-                            colocated_inference,
+                        weight_sync.sync_weights(
                             timer=timer,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
-                        POLICY_GENERATION_STALE = False
                     else:
                         if colocated_inference:
-                            policy.offload_after_refit()  # unload optimizer to make space for generation
+                            policy.finish_training()
                         policy_generation.prepare_for_generation()
 
                 dynamic_sampling_num_gen_batches += 1
@@ -1785,7 +1663,7 @@ def grpo_train(
                 else:
                     print("▶ Preparing for logprob inference...", flush=True)
                     with timer.time("logprob_inference_prep"):
-                        policy.prepare_for_lp_inference()
+                        policy.finish_training(offload_mode=OffloadMode.EVAL_ONLY)
 
                 print("▶ Computing logprobs...", flush=True)
                 with timer.time("policy_and_reference_logprobs"):
@@ -1881,7 +1759,8 @@ def grpo_train(
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
                     policy.prepare_for_training()  # set model train and reload optim to GPU
-                    POLICY_GENERATION_STALE = True
+                    if weight_sync is not None:
+                        weight_sync.mark_stale()
 
                 print("▶ Training policy...", flush=True)
                 with timer.time("policy_training"):
@@ -1902,7 +1781,8 @@ def grpo_train(
                             train_data, include_q=True
                         )["layers"]
                         # Set generation as stale to force refit with new scales
-                        POLICY_GENERATION_STALE = True
+                        if weight_sync is not None:
+                            weight_sync.mark_stale()
 
                 is_last_step = total_steps + 1 >= max_num_steps
                 if not master_config.data["use_multiple_dataloader"]:
@@ -1916,17 +1796,13 @@ def grpo_train(
                     val_at_end and is_last_step
                 ):
                     memory_tracker.snapshot_start_of_stage("Validation", dir())
-                    if NEED_REFIT and POLICY_GENERATION_STALE:
-                        refit_policy_generation(
-                            policy,
-                            policy_generation,
-                            colocated_inference,
+                    if weight_sync is not None and weight_sync.is_stale:
+                        weight_sync.sync_weights(
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
-                        POLICY_GENERATION_STALE = False
                     else:
                         if colocated_inference:
-                            policy.offload_after_refit()  # unload optimizer to make space for generation
+                            policy.finish_training()
                         policy_generation.prepare_for_generation()
                     val_metrics, validation_timings = validate(
                         policy_generation,
@@ -2475,7 +2351,7 @@ def aggregate_rollout_metrics(
 
 
 def async_grpo_train(
-    policy: ColocatablePolicyInterface,
+    policy: PolicyTrainerInterface,
     policy_generation: Optional[GenerationInterface],
     dataloader: StatefulDataLoader,
     val_dataloader: Optional[StatefulDataLoader],
@@ -2488,6 +2364,7 @@ def async_grpo_train(
     grpo_save_state: GRPOSaveState,
     master_config: MasterConfig,
     max_trajectory_age_steps: int = 1,
+    weight_sync: Optional[WeightSynchronizer] = None,
 ) -> None:
     """Run asynchronous GRPO training with replay buffer.
 
@@ -2505,6 +2382,7 @@ def async_grpo_train(
         grpo_save_state: Training state
         master_config: Master configuration
         max_trajectory_age_steps: Maximum age (in training steps) for trajectories to be used in training
+        weight_sync: Optional WeightSynchronizer for weight transfer
     """
     # Ensure we are running with a compatible async generation backend
     assert _should_use_async_rollouts(master_config), (
@@ -2531,13 +2409,10 @@ def async_grpo_train(
         fit_last_save_time=True,
     )
     timeout.start_iterations()
-    NEED_REFIT = True
 
     # Setup generation interface
     if policy_generation is None:
         policy_generation = policy
-        NEED_REFIT = False
-    POLICY_GENERATION_STALE = True
     assert policy_generation is not None
 
     # Training state
@@ -2658,12 +2533,11 @@ def async_grpo_train(
     )
 
     print("⏳ Preparing policy generation for training...")
-    if NEED_REFIT and POLICY_GENERATION_STALE:
+    if weight_sync is not None and weight_sync.is_stale:
         print("🔄 Refitting policy generation with actual model weights...")
         try:
-            refit_policy_generation(policy, policy_generation, colocated_inference)
+            weight_sync.sync_weights()
             print("✅ Policy generation refit completed successfully")
-            POLICY_GENERATION_STALE = False
         except Exception as e:
             print(f"❌ Policy generation refit failed: {e}")
             import traceback
@@ -2906,7 +2780,7 @@ def async_grpo_train(
                 else:
                     print("▶ Preparing for logprob inference...")
                     with timer.time("logprob_inference_prep"):
-                        policy.prepare_for_lp_inference()
+                        policy.finish_training(offload_mode=OffloadMode.EVAL_ONLY)
 
                 print("▶ Computing logprobs...", flush=True)
                 with timer.time("policy_and_reference_logprobs"):
@@ -2984,7 +2858,8 @@ def async_grpo_train(
                 print("▶ Preparing for training...")
                 with timer.time("training_prep"):
                     policy.prepare_for_training()
-                    POLICY_GENERATION_STALE = True
+                    if weight_sync is not None:
+                        weight_sync.mark_stale()
 
                 print("▶ Training policy...")
                 with timer.time("policy_training"):
@@ -2996,7 +2871,7 @@ def async_grpo_train(
 
                 print("🔄 Synchronizing policy weights to trajectory collector…")
                 generation_logger_metrics = None
-                if NEED_REFIT:
+                if weight_sync is not None:
                     # Measure pending-generation wait as exposed_generation time
                     print("🔄 Coordinating with trajectory collector before refit...")
                     with timer.time("exposed_generation"):
@@ -3012,10 +2887,7 @@ def async_grpo_train(
                     # Only the actual refit/weight transfer should be counted as weight_sync
                     print("🔄 Performing policy generation refit...")
                     with timer.time("weight_sync"):
-                        refit_policy_generation(
-                            policy, policy_generation, colocated_inference
-                        )
-                        POLICY_GENERATION_STALE = False
+                        weight_sync.sync_weights()
 
                         # Update weight version before resuming trajectory collection so that all trajectories are updated with the new correct weight version
                         weight_version += 1
@@ -3037,11 +2909,8 @@ def async_grpo_train(
                     # Pause trajectory collection during validation to reduce memory pressure
                     trajectory_collector.pause.remote()
 
-                    if NEED_REFIT and POLICY_GENERATION_STALE:
-                        refit_policy_generation(
-                            policy, policy_generation, colocated_inference
-                        )
-                        POLICY_GENERATION_STALE = False
+                    if weight_sync is not None and weight_sync.is_stale:
+                        weight_sync.sync_weights()
                     else:
                         policy_generation.prepare_for_generation()
                     val_metrics, validation_timings = validate(
@@ -3213,6 +3082,7 @@ def async_grpo_train(
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )
                         checkpointer.finalize_checkpoint(checkpoint_path)
+                    policy.finish_training()
 
             # Logging
             # Log training data (match sync GRPO logging payload for parity)

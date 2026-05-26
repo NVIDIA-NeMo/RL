@@ -419,10 +419,7 @@ def mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics):
         )
     )
 
-    # Patch refit and validate functions
-    stack.enter_context(
-        patch("nemo_rl.algorithms.grpo.refit_policy_generation", return_value=None)
-    )
+    # Patch validate function
     stack.enter_context(
         patch("nemo_rl.algorithms.grpo.validate", return_value=({}, {}))
     )
@@ -1256,6 +1253,10 @@ def test_setup_sglang_sets_model_path_and_parallel_flag(
         "SGLangGeneration",
         lambda *_args, **_kwargs: DummySGLangGeneration(),
     )
+    mock_weight_sync = MagicMock()
+    monkeypatch.setattr(
+        grpo_mod, "create_weight_synchronizer", lambda **_kwargs: mock_weight_sync
+    )
     monkeypatch.setattr(grpo_mod.ray, "get", lambda x: x)
 
     generation_resources = {
@@ -1338,75 +1339,6 @@ def test_setup_sglang_sets_model_path_and_parallel_flag(
     assert logged["metrics"]["parallel_init_enabled"] == expected_parallel
 
 
-def test_refit_policy_generation_sglang_colocated_http(monkeypatch):
-    from nemo_rl.algorithms import grpo as grpo_mod
-
-    calls = {
-        "prepare_for_generation_tags": [],
-        "invalidate_kv_cache": 0,
-        "stream_weights_via_http": [],
-        "offload_before_refit": 0,
-        "offload_after_refit": 0,
-    }
-
-    class DummySGLangGeneration:
-        def prepare_for_generation(self, tags=None):
-            calls["prepare_for_generation_tags"].append(tags)
-
-        def get_sglang_url_to_gpu_uuids(self):
-            return {"http://localhost:12345": ["gpu-uuid-0"]}
-
-        def invalidate_kv_cache(self):
-            calls["invalidate_kv_cache"] += 1
-            return True
-
-    class DummyPolicy:
-        def offload_before_refit(self):
-            calls["offload_before_refit"] += 1
-
-        def offload_after_refit(self):
-            calls["offload_after_refit"] += 1
-
-        def get_free_memory_bytes(self):
-            return 1024 * 1024 * 1024
-
-        def stream_weights_via_http(self, sglang_url_to_gpu_uuids):
-            calls["stream_weights_via_http"].append(sglang_url_to_gpu_uuids)
-            return ["ok"]
-
-    monkeypatch.setattr(grpo_mod, "SGLangGeneration", DummySGLangGeneration)
-    monkeypatch.setattr(grpo_mod.ray, "get", lambda x: x)
-
-    grpo_mod.refit_policy_generation(
-        policy=DummyPolicy(),
-        policy_generation=DummySGLangGeneration(),
-        colocated_inference=True,
-    )
-
-    assert calls["offload_before_refit"] == 1
-    assert calls["offload_after_refit"] == 1
-    assert calls["invalidate_kv_cache"] == 1
-    assert calls["stream_weights_via_http"] == [
-        {"http://localhost:12345": ["gpu-uuid-0"]}
-    ]
-    assert calls["prepare_for_generation_tags"] == [["weights"], ["kv_cache"]]
-
-
-def test_refit_policy_generation_sglang_non_colocated_raises(monkeypatch):
-    from nemo_rl.algorithms import grpo as grpo_mod
-
-    class DummySGLangGeneration:
-        pass
-
-    monkeypatch.setattr(grpo_mod, "SGLangGeneration", DummySGLangGeneration)
-
-    with pytest.raises(NotImplementedError):
-        grpo_mod.refit_policy_generation(
-            policy=object(),
-            policy_generation=DummySGLangGeneration(),
-            colocated_inference=False,
-        )
-
 
 def test_grpo_train_collects_generation_logger_metrics(
     monkeypatch, mock_grpo_components
@@ -1460,9 +1392,6 @@ def test_grpo_train_collects_generation_logger_metrics(
         lambda *_args, **_kwargs: (torch.tensor([0.1]), torch.tensor([1.0])),
     )
     monkeypatch.setattr(
-        grpo_mod, "refit_policy_generation", lambda *_args, **_kwargs: None
-    )
-    monkeypatch.setattr(
         grpo_mod, "print_performance_metrics", lambda *_args, **_kwargs: {}
     )
     monkeypatch.setattr(
@@ -1481,6 +1410,9 @@ def test_grpo_train_collects_generation_logger_metrics(
     master_config.grpo["val_at_start"] = False
     master_config.grpo["use_dynamic_sampling"] = False
 
+    mock_weight_sync = MagicMock()
+    mock_weight_sync.is_stale = True
+
     grpo_mod.grpo_train(
         mock_grpo_components["policy"],
         policy_generation,
@@ -1494,8 +1426,10 @@ def test_grpo_train_collects_generation_logger_metrics(
         mock_grpo_components["checkpointer"],
         _default_grpo_save_state(),
         master_config,
+        weight_sync=mock_weight_sync,
     )
 
+    assert mock_weight_sync.sync_weights.called
     assert policy_generation.clear_logger_metrics.called
     policy_generation.finish_generation.assert_called_once_with(discard_weights=True)
     assert policy_generation.get_logger_metrics.called
