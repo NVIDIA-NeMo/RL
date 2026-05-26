@@ -135,11 +135,6 @@ class AlignmentBatch:
     V2 can shard on dim 0 without knowing about cross-tokenizer specifics.
 
     Attributes:
-        student_spans: ``[B, max_pairs, 2]`` long tensor with
-            ``(start, end)`` indices into the student-tokenized sequence.
-            Empty side of an alignment pair (insertion/deletion) gets
-            ``(-1, -1)``.
-        teacher_spans: Like ``student_spans`` but for teacher positions.
         pair_valid: ``[B, max_pairs]`` bool. False on padding entries.
         pair_is_correct: ``[B, max_pairs]`` bool. True when canonicalized
             student span text matches canonicalized teacher span text.
@@ -153,8 +148,6 @@ class AlignmentBatch:
         num_chunks: ``[B]`` long. Number of valid chunks in each sample.
     """
 
-    student_spans: torch.Tensor
-    teacher_spans: torch.Tensor
     pair_valid: torch.Tensor
     pair_is_correct: torch.Tensor
     student_exact_partition_mask: torch.Tensor
@@ -248,8 +241,6 @@ class TokenAligner:
         # Guarantee at least one slot so downstream tensor shapes stay sane.
         max_pairs = max(max_pairs, 1)
 
-        student_spans = torch.full((b, max_pairs, 2), -1, dtype=torch.long)
-        teacher_spans = torch.full((b, max_pairs, 2), -1, dtype=torch.long)
         pair_valid = torch.zeros((b, max_pairs), dtype=torch.bool)
         pair_is_correct = torch.zeros((b, max_pairs), dtype=torch.bool)
         student_partition = torch.zeros((b, t_s), dtype=torch.bool)
@@ -262,13 +253,9 @@ class TokenAligner:
             num_chunks[batch_i] = len(pairs)
             for pair_i, pair in enumerate(pairs):
                 if pair.s_start != -1 and pair.s_end != -1:
-                    student_spans[batch_i, pair_i, 0] = pair.s_start
-                    student_spans[batch_i, pair_i, 1] = pair.s_end
                     if 0 <= pair.s_start < t_s and 0 < pair.s_end <= t_s:
                         student_chunk_id[batch_i, pair.s_start : pair.s_end] = pair_i
                 if pair.t_start != -1 and pair.t_end != -1:
-                    teacher_spans[batch_i, pair_i, 0] = pair.t_start
-                    teacher_spans[batch_i, pair_i, 1] = pair.t_end
                     if 0 <= pair.t_start < t_t and 0 < pair.t_end <= t_t:
                         teacher_chunk_id[batch_i, pair.t_start : pair.t_end] = pair_i
                 pair_valid[batch_i, pair_i] = True
@@ -287,8 +274,6 @@ class TokenAligner:
                         teacher_partition[batch_i, pair.t_start] = True
 
         return AlignmentBatch(
-            student_spans=student_spans,
-            teacher_spans=teacher_spans,
             pair_valid=pair_valid,
             pair_is_correct=pair_is_correct,
             student_exact_partition_mask=student_partition,

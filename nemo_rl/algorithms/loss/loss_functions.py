@@ -21,6 +21,7 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType, Loss
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.algorithms.x_token.loss_utils import (
     Fp32SparseMM,
+    alignment_from_flat_batch,
     build_exact_token_map,
     chunk_average_log_probs,
     get_sparse_projection_matrix,
@@ -1373,11 +1374,12 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         )  # [B, T_t, k] (renormalized within the [k] subset, matching PT).
 
         # Chunk-average both sides via the shared helper.
-        student_chunk_id = data["alignment_student_chunk_id"]  # [B, T_s] long
-        teacher_chunk_id = data["alignment_teacher_chunk_id"]  # [B, T_t] long
-        pair_valid = data["alignment_pair_valid"]              # [B, max_pairs]
+        alignment = alignment_from_flat_batch(data)
+        student_chunk_id = alignment.student_chunk_id  # [B, T_s] long
+        teacher_chunk_id = alignment.teacher_chunk_id  # [B, T_t] long
+        pair_valid = alignment.pair_valid              # [B, max_pairs]
         if cfg["exact_token_match_only"]:
-            pair_valid = pair_valid & data["alignment_pair_is_correct"]
+            pair_valid = pair_valid & alignment.pair_is_correct
         max_chunks = pair_valid.shape[1]
         proj_chunks, proj_sizes = chunk_average_log_probs(
             projected_topk, student_chunk_id, max_chunks
@@ -1488,9 +1490,10 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         student_log_probs = torch.log_softmax(logits.float() / T, dim=-1)  # [B, T_s, V_s]
         teacher_log_probs = torch.log_softmax(teacher_full_logits / T, dim=-1)  # [B, T_t, V_t]
 
-        student_chunk_id = data["alignment_student_chunk_id"]
-        teacher_chunk_id = data["alignment_teacher_chunk_id"]
-        pair_valid = data["alignment_pair_valid"]
+        alignment = alignment_from_flat_batch(data)
+        student_chunk_id = alignment.student_chunk_id
+        teacher_chunk_id = alignment.teacher_chunk_id
+        pair_valid = alignment.pair_valid
         max_chunks = pair_valid.shape[1]
         student_chunks, s_sizes = chunk_average_log_probs(
             student_log_probs, student_chunk_id, max_chunks

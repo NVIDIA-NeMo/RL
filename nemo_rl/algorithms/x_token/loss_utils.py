@@ -33,14 +33,31 @@ and :mod:`nemo_rl.algorithms.loss.loss_functions`:
       partition for the gold-loss path. Cached per
       ``(path, device, xtoken_loss, teacher_vocab_size)`` because the
       partition depends on those four inputs.
+    - :func:`alignment_from_flat_batch` — rehydrate the flat
+      ``alignment_*`` transport keys on the loss data dict into a single
+      :class:`AlignmentBatch` so the loss bodies access alignment via
+      attributes instead of repeating flat field names.
 """
 
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Tuple, Union
+from dataclasses import fields
+from typing import Any, Dict, Mapping, Tuple, Union
 
 import torch
+
+from nemo_rl.algorithms.x_token.token_aligner import AlignmentBatch
+
+
+def alignment_from_flat_batch(data: Mapping[str, Any]) -> AlignmentBatch:
+    """Rebuild :class:`AlignmentBatch` from the flat ``alignment_*`` keys
+    on the loss data dict. The field set is driven off
+    :class:`AlignmentBatch` so the helper can't drift from the schema.
+    """
+    return AlignmentBatch(
+        **{f.name: data[f"alignment_{f.name}"] for f in fields(AlignmentBatch)}
+    )
 
 
 class Fp32SparseMM(torch.autograd.Function):
