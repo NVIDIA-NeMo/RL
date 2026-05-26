@@ -27,7 +27,7 @@ policy:
     mcore_generation_config:
       transformer_impl: "inference_optimized"
       cuda_graph_impl: "local"
-      cuda_graph_scope: "full_iteration_inference"
+      inference_cuda_graph_scope: "block"
       activation_checkpointing: false
       tensor_model_parallel_size: 2
       expert_model_parallel_size: 8

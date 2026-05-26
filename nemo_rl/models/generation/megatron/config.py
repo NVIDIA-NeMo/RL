@@ -35,6 +35,12 @@ class MCoreGenerationConfig(TypedDict):
     num_cuda_graphs: int
     use_cuda_graphs_for_non_decode_steps: bool
     cuda_graph_impl: NotRequired[str]
+    # Inference CUDA-graph scope. Options:
+    # - 'none': inference runs in eager mode (no CUDA graphs).
+    # - 'layer': graphs are owned at the per-layer boundary (TransformerLayer / MambaLayer).
+    # - 'block': graphs are owned at the enclosing block (TransformerBlock / HybridBlock).
+    # Only meaningful when cuda_graph_impl='local'.
+    inference_cuda_graph_scope: NotRequired[str]
 
     use_flashinfer_sampling: NotRequired[bool]
     materialize_only_last_token_logits: bool

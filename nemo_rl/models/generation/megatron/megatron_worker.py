@@ -28,6 +28,7 @@ from megatron.core.inference.config import (
 )
 from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.utils import toggle_cuda_graphs
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -157,6 +158,11 @@ class MegatronGenerationMixin:
             num_speculative_tokens=num_speculative_tokens,
             max_requests=max_requests,
         )
+
+        if "inference_cuda_graph_scope" in mcore_generation_config:
+            self.model.config.inference_cuda_graph_scope = InferenceCudaGraphScope[
+                mcore_generation_config["inference_cuda_graph_scope"]
+            ]
 
         self.inference_context = DynamicInferenceContext(self.model.config, inference_config)
         self.inference_wrapped_model = GPTInferenceWrapper(self.model, self.inference_context)

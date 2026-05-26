@@ -193,7 +193,7 @@ policy:
       # megatron_cfg for inference workers before model setup runs.
       transformer_impl: "inference_optimized"
       cuda_graph_impl: "local"
-      cuda_graph_scope: "full_iteration_inference"
+      inference_cuda_graph_scope: "block"
       activation_checkpointing: false
       mamba_inference_ssm_states_dtype: "float32"
       inference_moe_token_dispatcher_type: "nccl"  # Fall back to NCCL for now
