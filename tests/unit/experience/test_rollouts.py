@@ -39,8 +39,9 @@ from nemo_rl.environments.games.sliding_puzzle import (
 )
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.rollout_manager import (
-    AsyncNemoGymRolloutManager,
-    AsyncRolloutManager,
+    AsyncNemoGymRolloutImpl,
+    AsyncRolloutImpl,
+    RolloutManager,
 )
 from nemo_rl.experience.rollouts import (
     _calculate_single_metric,
@@ -964,6 +965,25 @@ def test_run_async_nemo_gym_rollout(
 
 
 # ---------------------------------------------------------------------------
+# Tests for RolloutManager
+# ---------------------------------------------------------------------------
+
+
+def test_rollout_manager_raises_without_impl_params():
+    """RolloutManager raises AssertionError when required params are missing."""
+    common = dict(tokenizer=None, task_to_env={}, num_generations_per_prompt=1)
+
+    with pytest.raises(AssertionError, match="policy_generation is required"):
+        RolloutManager(**common, use_nemo_gym=False, max_seq_len=1024)
+
+    with pytest.raises(AssertionError, match="max_seq_len is required"):
+        RolloutManager(**common, use_nemo_gym=False, policy_generation=object())
+
+    with pytest.raises(AssertionError, match="generation_config is required"):
+        RolloutManager(**common, use_nemo_gym=True)
+
+
+# ---------------------------------------------------------------------------
 # Tests for AsyncRolloutManager (native async path)
 # ---------------------------------------------------------------------------
 
@@ -1041,7 +1061,7 @@ def test_async_rollout_manager(
     max_seq_len = 1024
     max_rollout_turns = input_sample["extra_env_info"]["max_steps"] + 1
 
-    manager = AsyncRolloutManager(
+    manager = AsyncRolloutImpl(
         policy_generation=vllm_generation,
         tokenizer=rollout_tokenizer,
         task_to_env=task_to_env,
@@ -1163,7 +1183,7 @@ def test_async_rollout_manager_matches_original(
         max_rollout_turns=max_rollout_turns,
     )
 
-    manager = AsyncRolloutManager(
+    manager = AsyncRolloutImpl(
         policy_generation=vllm_generation,
         tokenizer=rollout_tokenizer,
         task_to_env=task_to_env,
@@ -1281,7 +1301,7 @@ def test_async_nemo_gym_rollout_manager(
     }
     num_generations = 2
 
-    manager = AsyncNemoGymRolloutManager(
+    manager = AsyncNemoGymRolloutImpl(
         tokenizer=nemo_gym_tokenizer,
         task_to_env={"nemo_gym": nemo_gym},
         generation_config=nemo_gym_vllm_generation.cfg,
@@ -1391,7 +1411,7 @@ def test_async_nemo_gym_rollout_manager_matches_original(
         max_rollout_turns=None,
     )
 
-    manager = AsyncNemoGymRolloutManager(
+    manager = AsyncNemoGymRolloutImpl(
         tokenizer=nemo_gym_tokenizer,
         task_to_env={"nemo_gym": nemo_gym},
         generation_config=nemo_gym_vllm_generation.cfg,

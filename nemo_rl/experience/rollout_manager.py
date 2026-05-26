@@ -41,7 +41,7 @@ from nemo_rl.utils.timer import Timer
 TokenizerType = PreTrainedTokenizerBase
 
 
-class AsyncRolloutManager:
+class AsyncRolloutImpl:
     """Manages per-prompt multi-turn rollouts, producing a PromptGroupRecord per call.
 
     Each run_rollout takes one prompt and returns num_generations_per_prompt completions
@@ -56,6 +56,7 @@ class AsyncRolloutManager:
         max_seq_len: int,
         num_generations_per_prompt: int,
         max_rollout_turns: int = 999999,
+        **kwargs: Any,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
@@ -405,7 +406,7 @@ class AsyncRolloutManager:
         return metrics
 
 
-class AsyncNemoGymRolloutManager:
+class AsyncNemoGymRolloutImpl:
     """Manages per-prompt NeMo-Gym rollouts, producing a PromptGroupRecord per call.
 
     Each run_rollout takes one prompt and returns num_generations_per_prompt completions
@@ -420,6 +421,7 @@ class AsyncNemoGymRolloutManager:
         num_generations_per_prompt: int,
         max_seq_len: Optional[int] = None,
         max_rollout_turns: Optional[int] = None,
+        **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
         self._task_to_env = task_to_env
@@ -632,3 +634,51 @@ class AsyncNemoGymRolloutManager:
             "gen_tokens_per_sample/mean"
         ]
         return rollout_metrics
+
+
+class RolloutManager:
+    """Factory that routes to AsyncRolloutImpl (native async) or AsyncNemoGymRolloutImpl (NeMo-Gym).
+
+    Pass ``policy_generation`` for the native async path, or ``generation_config``
+    for the NeMo-Gym path. Exactly one must be provided.
+    """
+
+    def __init__(
+        self,
+        tokenizer: TokenizerType,
+        task_to_env: dict[str, EnvironmentInterface],
+        num_generations_per_prompt: int,
+        use_nemo_gym: bool = False,
+        max_seq_len: Optional[int] = None,
+        max_rollout_turns: Optional[int] = None,
+        policy_generation: Optional[GenerationInterface] = None,
+        generation_config: Optional[GenerationConfig] = None,
+    ) -> None:
+        if not use_nemo_gym:
+            rollout_cls = AsyncRolloutImpl
+            assert max_seq_len is not None, (
+                "max_seq_len is required for the native async path"
+            )
+            assert policy_generation is not None, (
+                "policy_generation is required for the native async path"
+            )
+            if max_rollout_turns is None:
+                max_rollout_turns = 999999  # use AsyncRolloutImpl's default value
+        else:
+            rollout_cls = AsyncNemoGymRolloutImpl
+            assert generation_config is not None, (
+                "generation_config is required for the NeMo-Gym path"
+            )
+
+        self._impl: AsyncRolloutImpl | AsyncNemoGymRolloutImpl = rollout_cls(
+            tokenizer=tokenizer,
+            task_to_env=task_to_env,
+            num_generations_per_prompt=num_generations_per_prompt,
+            max_seq_len=max_seq_len,
+            max_rollout_turns=max_rollout_turns,
+            policy_generation=policy_generation,
+            generation_config=generation_config,
+        )
+
+    async def run_rollout(self, input_sample: DatumSpec) -> PromptGroupRecord:
+        return await self._impl.run_rollout(input_sample)
