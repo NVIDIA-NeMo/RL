@@ -78,8 +78,8 @@ class AsyncRolloutManager:
             results = list(
                 await asyncio.gather(
                     *[
-                        self._run_single_rollout(input_sample, gen_idx)
-                        for gen_idx in range(self._num_generations_per_prompt)
+                        self._run_single_rollout(input_sample, traj_idx)
+                        for traj_idx in range(self._num_generations_per_prompt)
                     ]
                 )
             )
@@ -104,7 +104,7 @@ class AsyncRolloutManager:
         )
 
     async def _run_single_rollout(
-        self, input_sample: DatumSpec, gen_idx: int
+        self, input_sample: DatumSpec, traj_idx: int
     ) -> tuple[Completion, dict]:
         """Run one multi-turn rollout for a single generation index."""
         current_message_log = copy.deepcopy(input_sample["message_log"])
@@ -114,16 +114,21 @@ class AsyncRolloutManager:
 
         total_reward = 0.0
         turn_count = 0
-        token_count = 0
+        # token statistics
+        total_token_count = 0
         assistant_token_count = 0
         env_token_count = 0
+        # truncated statistics
         terminated = False
         truncated = False
         max_turns_reached = False
-        turn_gen_tokens: list[int] = []
-        turn_input_tokens: list[int] = []
-        turn_total_tokens: list[int] = []
-        per_worker_token_counts: dict[int, int] = {}
+
+        # Track per-turn metrics
+        turn_gen_tokens = []
+        turn_input_tokens = []
+        turn_total_tokens = []
+        # Track per-turn per-worker token accounting if available
+        per_worker_token_counts = {}  # worker_idx -> token_count
 
         for _ in range(self._max_rollout_turns):
             if terminated or truncated:
@@ -131,6 +136,7 @@ class AsyncRolloutManager:
 
             turn_count += 1
 
+            # Generate response for this sample using async generation
             try:
                 (
                     updated_message_log,
@@ -146,16 +152,19 @@ class AsyncRolloutManager:
                 )
                 current_message_log = updated_message_log
 
+                # Check if response was truncated (hit max_tokens without stop token)
                 response_truncated = gen_metrics.pop("_response_truncated", None)
                 if response_truncated is not None and response_truncated[0]:
                     truncated = True
 
+                # Update token counts
                 gen_token_count = len(generated_tokens)
                 assistant_token_count += gen_token_count
-                token_count += gen_token_count
+                total_token_count += gen_token_count
                 turn_gen_tokens.append(gen_token_count)
                 turn_input_tokens.append(int(input_lengths))
                 turn_total_tokens.append(int(input_lengths) + gen_token_count)
+                # Per-worker load accounting
                 if "gen_leader_worker_idx" in gen_metrics:
                     worker_idx = int(gen_metrics["gen_leader_worker_idx"])
                     per_worker_token_counts[worker_idx] = (
@@ -163,9 +172,10 @@ class AsyncRolloutManager:
                     )
 
             except Exception as e:
-                print(f"Error generating response for gen_idx {gen_idx}: {e}")
+                print(f"Error generating response for prompt_idx {input_sample['idx']}, traj_idx {traj_idx}: {e}")
                 break
 
+            # Create single-sample batch for environment interaction
             sample_batch = BatchedDataDict[DatumSpec](
                 {
                     "message_log": [current_message_log],
@@ -173,10 +183,17 @@ class AsyncRolloutManager:
                     "task_name": [task_name],
                 }
             )
+            # Get environment feedback.
+            # calculate_rewards uses blocking ray.get internally. Running it
+            # directly on the asyncio event loop (which this coroutine runs on)
+            # blocks every other in-flight rollout coroutine for the entire env
+            # step. In this case, need to wrap with asyncio.to_thread to make
+            # this function yieldable.
             env_output = await asyncio.to_thread(
                 calculate_rewards, sample_batch, self._task_to_env
             )
 
+            # Update reward and termination statistics
             total_reward += float(env_output.rewards[0].item())
             terminated = env_output.terminateds[0].item()
             env_obs_content = env_output.observations[0]["content"]
@@ -184,10 +201,12 @@ class AsyncRolloutManager:
                 env_obs_content, return_tensors="pt", add_special_tokens=False
             ).input_ids[0]
 
+            # Check for sequence length overflow
             if (
                 input_lengths + gen_token_count + len(tokenized_obs)
                 >= self._max_seq_len
             ):
+                # Truncate environment observation
                 max_env_tokens = self._max_seq_len - input_lengths - gen_token_count
                 if max_env_tokens > 0:
                     tokenized_obs = tokenized_obs[:max_env_tokens]
@@ -202,9 +221,12 @@ class AsyncRolloutManager:
                     "token_ids": tokenized_obs,
                 }
             )
-            env_token_count += len(tokenized_obs)
-            token_count += len(tokenized_obs)
 
+            # Update token counts
+            env_token_count += len(tokenized_obs)
+            total_token_count += len(tokenized_obs)
+
+            # Update sample state for next turn
             if not terminated and not truncated:
                 if env_output.next_stop_strings[0] is not None:
                     current_stop_strings = env_output.next_stop_strings[0]
@@ -223,7 +245,7 @@ class AsyncRolloutManager:
         )
         sample_metrics = {
             "turn_count": turn_count,
-            "total_tokens": token_count,
+            "total_tokens": total_token_count,
             "assistant_tokens": assistant_token_count,
             "env_tokens": env_token_count,
             "terminated": terminated,
