@@ -12,22 +12,171 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import copy
 import json
 import warnings
 from typing import Any, Optional
 
+import torch
 from transformers import PreTrainedTokenizerBase
 from wandb import Table
 
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
-from nemo_rl.experience.rollouts import _calculate_single_metric, _tensorize_by_key
-from nemo_rl.models.generation.interfaces import GenerationConfig
+from nemo_rl.experience.rollouts import (
+    _calculate_single_metric,
+    _tensorize_by_key,
+    run_sample_multi_turn_rollout,
+)
+from nemo_rl.models.generation.interfaces import GenerationConfig, GenerationInterface
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
+
+
+class AsyncRolloutManager:
+    """Manages per-prompt multi-turn rollouts, producing a PromptGroupRecord per call.
+
+    Each run_rollout takes one prompt and returns num_generations_per_prompt completions
+    generated concurrently via asyncio.gather.
+    """
+
+    def __init__(
+        self,
+        policy_generation: GenerationInterface,
+        tokenizer: TokenizerType,
+        task_to_env: dict[str, EnvironmentInterface],
+        max_seq_len: int,
+        num_generations_per_prompt: int,
+        max_rollout_turns: int = 999999,
+    ) -> None:
+        self._policy_generation = policy_generation
+        self._tokenizer = tokenizer
+        self._task_to_env = task_to_env
+        self._max_seq_len = max_seq_len
+        self._num_generations_per_prompt = num_generations_per_prompt
+        self._max_rollout_turns = max_rollout_turns
+
+    async def run_rollout(self, input_sample: DatumSpec) -> PromptGroupRecord:
+        """Run num_generations_per_prompt rollouts for one prompt.
+
+        Args:
+            input_sample: A single prompt (one DatumSpec entry).
+
+        Returns:
+            PromptGroupRecord with num_generations_per_prompt completions.
+        """
+        timer = Timer()
+        timer_prefix = "timing/rollout"
+        timer.start(f"{timer_prefix}/total")
+
+        with timer.time(f"{timer_prefix}/run_rollouts"):
+            completions = list(
+                await asyncio.gather(
+                    *[
+                        self._generate_single_completion(input_sample, gen_idx)
+                        for gen_idx in range(self._num_generations_per_prompt)
+                    ]
+                )
+            )
+
+        with timer.time(f"{timer_prefix}/compute_metrics"):
+            rollout_metrics = self._compute_rollout_metrics(completions)
+
+        timer.stop(f"{timer_prefix}/total")
+        rollout_metrics.update(timer.get_timing_metrics("sum"))
+
+        return PromptGroupRecord(
+            prompt_idx=input_sample["idx"],
+            prompt=copy.deepcopy(input_sample["message_log"]),
+            extra_env_info=input_sample["extra_env_info"],
+            metadata={"task_name": input_sample["task_name"]},
+            completions=completions,
+            rollout_metrics=rollout_metrics,
+        )
+
+    async def _generate_single_completion(
+        self, input_sample: DatumSpec, gen_idx: int
+    ) -> Completion:
+        """Run one rollout for a single generation index and return a Completion."""
+        sample_state = {
+            "message_log": copy.deepcopy(input_sample["message_log"]),
+            "extra_env_info": copy.deepcopy(input_sample["extra_env_info"]),
+            "task_name": input_sample["task_name"],
+            "stop_strings": input_sample.get("stop_strings", None),
+            "idx": gen_idx,
+        }
+        final_state, sample_metrics = await run_sample_multi_turn_rollout(
+            sample_idx=gen_idx,
+            initial_sample_state=sample_state,
+            policy_generation=self._policy_generation,
+            tokenizer=self._tokenizer,
+            task_to_env=self._task_to_env,
+            max_seq_len=self._max_seq_len,
+            max_rollout_turns=self._max_rollout_turns,
+        )
+
+        env_extras: dict[str, Any] = dict(final_state["extra_env_info"])
+        for k, v in final_state.items():
+            if isinstance(k, str) and k.startswith("reward") and k[6:].isdigit():
+                env_extras[k] = (
+                    float(v.item()) if isinstance(v, torch.Tensor) else float(v)
+                )
+
+        return Completion(
+            message_log=final_state["message_log"],
+            env_extras=env_extras,
+            truncated=sample_metrics["truncated"],
+            reward=float(final_state["total_reward"].item()),
+        )
+
+    def _compute_rollout_metrics(
+        self, completions: list[Completion]
+    ) -> dict[str, Any]:
+        """Aggregate per-sample metrics across all completions."""
+        n = len(completions)
+        rollout_metrics: dict[str, Any] = {
+            **_calculate_single_metric(
+                [
+                    sum(1 for m in c.message_log if m["role"] == "user")
+                    for c in completions
+                ],
+                n,
+                "turns_per_sample",
+            ),
+            **_calculate_single_metric(
+                [sum(len(m["token_ids"]) for m in c.message_log) for c in completions],
+                n,
+                "total_tokens_per_sample",
+            ),
+            **_calculate_single_metric(
+                [
+                    sum(
+                        len(m["token_ids"])
+                        for m in c.message_log
+                        if m["role"] == "assistant"
+                    )
+                    for c in completions
+                ],
+                n,
+                "gen_tokens_per_sample",
+            ),
+            **_calculate_single_metric(
+                [c.reward for c in completions],
+                n,
+                "total_reward",
+            ),
+            "natural_termination_rate": sum(not c.truncated for c in completions) / n,
+            "truncation_rate": sum(c.truncated for c in completions) / n,
+        }
+
+        # Necessary for downstream nemo rl logging/printing.
+        rollout_metrics["mean_gen_tokens_per_sample"] = rollout_metrics[
+            "gen_tokens_per_sample/mean"
+        ]
+        return rollout_metrics
 
 
 class AsyncNemoGymRolloutManager:
