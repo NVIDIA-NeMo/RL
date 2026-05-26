@@ -38,11 +38,7 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleMetadata,
 )
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
-from nemo_rl.experience.rollout_manager import (
-    AsyncNemoGymRolloutImpl,
-    AsyncRolloutImpl,
-    RolloutManager,
-)
+from nemo_rl.experience.rollout_manager import RolloutManager
 from nemo_rl.experience.rollouts import (
     _calculate_single_metric,
     run_async_multi_turn_rollout,
@@ -1061,7 +1057,8 @@ def test_async_rollout_manager(
     max_seq_len = 1024
     max_rollout_turns = input_sample["extra_env_info"]["max_steps"] + 1
 
-    manager = AsyncRolloutImpl(
+    manager = RolloutManager(
+        use_nemo_gym=False,
         policy_generation=vllm_generation,
         tokenizer=rollout_tokenizer,
         task_to_env=task_to_env,
@@ -1183,7 +1180,8 @@ def test_async_rollout_manager_matches_original(
         max_rollout_turns=max_rollout_turns,
     )
 
-    manager = AsyncRolloutImpl(
+    manager = RolloutManager(
+        use_nemo_gym=False,
         policy_generation=vllm_generation,
         tokenizer=rollout_tokenizer,
         task_to_env=task_to_env,
@@ -1301,7 +1299,8 @@ def test_async_nemo_gym_rollout_manager(
     }
     num_generations = 2
 
-    manager = AsyncNemoGymRolloutImpl(
+    manager = RolloutManager(
+        use_nemo_gym=True,
         tokenizer=nemo_gym_tokenizer,
         task_to_env={"nemo_gym": nemo_gym},
         generation_config=nemo_gym_vllm_generation.cfg,
@@ -1411,7 +1410,8 @@ def test_async_nemo_gym_rollout_manager_matches_original(
         max_rollout_turns=None,
     )
 
-    manager = AsyncNemoGymRolloutImpl(
+    manager = RolloutManager(
+        use_nemo_gym=True,
         tokenizer=nemo_gym_tokenizer,
         task_to_env={"nemo_gym": nemo_gym},
         generation_config=nemo_gym_vllm_generation.cfg,
