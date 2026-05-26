@@ -637,11 +637,7 @@ class AsyncNemoGymRolloutImpl:
 
 
 class RolloutManager:
-    """Factory that routes to AsyncRolloutImpl (native async) or AsyncNemoGymRolloutImpl (NeMo-Gym).
-
-    Pass ``policy_generation`` for the native async path, or ``generation_config``
-    for the NeMo-Gym path. Exactly one must be provided.
-    """
+    """Factory that routes to AsyncRolloutImpl (native async) or AsyncNemoGymRolloutImpl (NeMo-Gym)."""
 
     def __init__(
         self,
