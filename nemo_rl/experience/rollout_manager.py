@@ -29,10 +29,13 @@ from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.rollouts import (
     _calculate_single_metric,
     _tensorize_by_key,
-    async_generate_response_for_sample_turn,
     calculate_rewards,
 )
-from nemo_rl.models.generation.interfaces import GenerationConfig, GenerationInterface
+from nemo_rl.models.generation.interfaces import (
+    GenerationConfig,
+    GenerationDatumSpec,
+    GenerationInterface,
+)
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
@@ -139,18 +142,14 @@ class AsyncRolloutManager:
             # Generate response for this sample using async generation
             try:
                 (
-                    updated_message_log,
-                    generated_tokens,
+                    assistant_message,
                     input_lengths,
                     gen_metrics,
-                ) = await async_generate_response_for_sample_turn(
-                    self._policy_generation,
+                ) = await self._generate_response(
                     current_message_log,
                     current_stop_strings,
-                    self._tokenizer,
-                    self._max_seq_len,
                 )
-                current_message_log = updated_message_log
+                current_message_log.append(assistant_message)
 
                 # Check if response was truncated (hit max_tokens without stop token)
                 response_truncated = gen_metrics.pop("_response_truncated", None)
@@ -158,7 +157,7 @@ class AsyncRolloutManager:
                     truncated = True
 
                 # Update token counts
-                gen_token_count = len(generated_tokens)
+                gen_token_count = len(assistant_message["token_ids"])
                 assistant_token_count += gen_token_count
                 total_token_count += gen_token_count
                 turn_gen_tokens.append(gen_token_count)
@@ -172,7 +171,9 @@ class AsyncRolloutManager:
                     )
 
             except Exception as e:
-                print(f"Error generating response for prompt_idx {input_sample['idx']}, traj_idx {traj_idx}: {e}")
+                print(
+                    f"Error generating response for prompt_idx {input_sample['idx']}, traj_idx {traj_idx}: {e}"
+                )
                 break
 
             # Create single-sample batch for environment interaction
@@ -256,6 +257,66 @@ class AsyncRolloutManager:
             "per_worker_token_counts": per_worker_token_counts,
         }
         return completion, sample_metrics
+
+    async def _generate_response(
+        self,
+        message_log: list[dict],
+        stop_strings: list[str] | None,
+    ) -> tuple[dict, torch.Tensor, dict[str, Any]]:
+        """Generate a single-turn response for one sample.
+
+        Returns:
+            Tuple of (assistant_message, input_lengths, gen_metrics)
+        """
+        # Prepare generation input
+        input_ids = torch.cat([m["token_ids"] for m in message_log]).unsqueeze(0)
+        input_lengths = torch.tensor([input_ids.shape[1]], dtype=torch.int32)
+        generation_input_data = BatchedDataDict[GenerationDatumSpec](
+            {
+                "input_ids": input_ids,
+                "input_lengths": input_lengths,
+                "stop_strings": [stop_strings],
+            }
+        )
+
+        # Generate response
+        # TODO: update generate_async to return a single item directly
+        output = None
+        async for _idx, output in self._policy_generation.generate_async(
+            generation_input_data
+        ):
+            pass
+
+        # Build assistant message
+        input_len = int(input_lengths[0].item())
+        total_len = int(output["unpadded_sequence_lengths"][0].item())
+        output_ids = output["output_ids"]
+        generated_ids = output_ids[0, input_len:total_len]
+
+        assistant_message: dict = {
+            "role": "assistant",
+            "content": self._tokenizer.decode(generated_ids, skip_special_tokens=True),
+            "token_ids": generated_ids,
+        }
+        if "logprobs" in output:
+            assistant_message["generation_logprobs"] = output["logprobs"][
+                0, input_len:total_len
+            ]
+
+        # Calculate generation metrics
+        gen_metrics: dict[str, Any] = {}
+        if "gen_leader_worker_idx" in output:
+            v = output["gen_leader_worker_idx"][0]
+            try:
+                gen_metrics["gen_leader_worker_idx"] = (
+                    int(v[0]) if isinstance(v, list) else int(v)
+                )
+            except Exception as e:
+                print(f"Error extracting gen_leader_worker_idx: {e}")
+        if "truncated" in output:
+            gen_metrics["_response_truncated"] = output["truncated"]
+
+        return assistant_message, input_lengths, gen_metrics
 
     def _aggregate_rollout_metrics(
         self, completions: list[Completion], all_sample_metrics: list[dict]
