@@ -24,6 +24,7 @@ class MCoreGenerationConfig(TypedDict):
     For example, Megatron inference might want `transformer_impl: "inference_optimized"`,
     while Megatron training might want `transformer_impl: "transformer_engine"`.
     """
+
     async_engine: NotRequired[bool]
     expose_http_server: NotRequired[bool]
     parsers: NotRequired[list[str]]

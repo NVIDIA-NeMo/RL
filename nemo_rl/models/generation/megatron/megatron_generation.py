@@ -140,7 +140,7 @@ class MegatronGeneration(GenerationInterface):
         self.dp_openai_server_base_urls: list[Optional[str]] = []
 
         # Need to update the megatron_cfg with the mcore_generation_config parameters.
-        self.cfg['megatron_cfg'].update(config['generation']['mcore_generation_config'])
+        self.cfg["megatron_cfg"].update(config["generation"]["mcore_generation_config"])
 
         # Create a Policy object configured for inference only:
         # - No optimizer (not training on this cluster)
@@ -161,7 +161,12 @@ class MegatronGeneration(GenerationInterface):
         self.prepare_for_generation()
 
     def init_collective(
-        self, ip: str, port: int, world_size: int, *, train_world_size: int,
+        self,
+        ip: str,
+        port: int,
+        world_size: int,
+        *,
+        train_world_size: int,
         refit_backend: str = "gloo",
     ) -> list[ray.ObjectRef]:
         """Initialize the refit collective for weight synchronization.
@@ -244,8 +249,7 @@ class MegatronGeneration(GenerationInterface):
         return True
 
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
-        """Clean up after generation: sleep the engine, toggle off CUDA graphs,
-        clear rotary caches. Fans out to every worker's mixin method."""
+        """Clean up after generation."""
         futures = self._policy.worker_group.run_all_workers_single_data(
             "finish_generation"
         )
