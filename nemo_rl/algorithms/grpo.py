@@ -1341,7 +1341,7 @@ def compute_and_apply_seq_logprob_error_masking(
             masked_correct_pct = masked_correct_count / num_masked_seqs
 
         # Compute after-mask metrics (only for sequences that passed the threshold)
-        kept_mask = seq_error_mask.bool()
+        kept_mask = seq_error_mask.bool() & valid_seq_mask
         if kept_mask.sum() > 0:
             kept_errors = seq_mult_prob_error[kept_mask]
             max_seq_mult_prob_error_after_mask = kept_errors.max().item()

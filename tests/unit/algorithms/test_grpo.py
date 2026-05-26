@@ -67,6 +67,14 @@ def _mock_seq_logprob_error_result() -> dict[str, object]:
     }
 
 
+def _logged_train_metrics_with_key(logger, key: str):
+    for call in logger.log_metrics.call_args_list:
+        metrics = call.args[0]
+        if call.kwargs.get("prefix") == "train" and key in metrics:
+            return metrics
+    raise AssertionError(f"No train metrics payload contained {key}")
+
+
 # ============================================================================
 # Stub classes for async GRPO testing (non-Ray versions for easy mocking)
 # ============================================================================
@@ -356,7 +364,9 @@ def mock_grpo_components():
     }
 
 
-def mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics):
+def mock_async_grpo_infrastructure(
+    mock_batch, mock_rollout_metrics, seq_logprob_error_result=None
+):
     """
     Context manager that mocks all async GRPO infrastructure (Ray actors, venv, etc).
 
@@ -447,10 +457,13 @@ def mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics):
     )
 
     # Mock compute_and_apply_seq_logprob_error_masking to avoid needing real logprob data
+    seq_logprob_error_result = (
+        seq_logprob_error_result or _mock_seq_logprob_error_result()
+    )
     stack.enter_context(
         patch(
             "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
-            return_value=_mock_seq_logprob_error_result(),
+            return_value=seq_logprob_error_result,
         )
     )
 
@@ -1422,15 +1435,29 @@ def test_refit_policy_generation_sglang_non_colocated_raises(monkeypatch):
         )
 
 
-def test_grpo_train_collects_generation_logger_metrics(
+def test_grpo_train_collects_generation_logger_and_seq_metrics(
     monkeypatch, mock_grpo_components
 ):
     from nemo_rl.algorithms import grpo as grpo_mod
 
+    generation_logger_metrics = {
+        "inflight_batch_sizes": {0: [0, 1, 2]},
+        "num_pending_samples": {0: [3, 2, 0]},
+    }
+    seq_logprob_error_result = {
+        "max_seq_mult_prob_error": 2.5,
+        "mean_seq_mult_prob_error": 1.5,
+        "min_seq_mult_prob_error": 1.0,
+        "max_seq_mult_prob_error_after_mask": 1.2,
+        "mean_seq_mult_prob_error_after_mask": 1.1,
+        "min_seq_mult_prob_error_after_mask": 1.0,
+        "num_masked_seqs": 2,
+        "masked_correct_pct": 0.5,
+    }
     policy_generation = MagicMock()
     policy_generation.clear_logger_metrics = MagicMock()
     policy_generation.get_logger_metrics = MagicMock(
-        return_value={"pending_requests": 1}
+        return_value=generation_logger_metrics
     )
     policy_generation.prepare_for_generation = MagicMock()
     policy_generation.finish_generation = MagicMock()
@@ -1485,7 +1512,7 @@ def test_grpo_train_collects_generation_logger_metrics(
     monkeypatch.setattr(
         grpo_mod,
         "compute_and_apply_seq_logprob_error_masking",
-        lambda *_args, **_kwargs: (0.0, 0, 0.0),
+        lambda *_args, **_kwargs: seq_logprob_error_result,
     )
 
     master_config = mock_grpo_components["master_config"]
@@ -1513,10 +1540,18 @@ def test_grpo_train_collects_generation_logger_metrics(
     assert policy_generation.clear_logger_metrics.called
     policy_generation.finish_generation.assert_called_once_with(discard_weights=True)
     assert policy_generation.get_logger_metrics.called
-    assert any(
-        "generation_logger_metrics" in call.args[0]
-        for call in mock_grpo_components["logger"].log_metrics.call_args_list
+    train_metrics = _logged_train_metrics_with_key(
+        mock_grpo_components["logger"], "generation_logger_metrics"
     )
+    assert train_metrics["generation_logger_metrics"] == generation_logger_metrics
+    assert train_metrics["max_seq_mult_prob_error"] == 2.5
+    assert train_metrics["mean_seq_mult_prob_error"] == 1.5
+    assert train_metrics["min_seq_mult_prob_error"] == 1.0
+    assert train_metrics["max_seq_mult_prob_error_after_mask"] == 1.2
+    assert train_metrics["mean_seq_mult_prob_error_after_mask"] == 1.1
+    assert train_metrics["min_seq_mult_prob_error_after_mask"] == 1.0
+    assert train_metrics["num_masked_seqs_by_logprob_error"] == 2
+    assert train_metrics["masked_correct_pct"] == 0.5
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
@@ -2722,6 +2757,46 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         assert result["masked_correct_pct"] == 0.0, "Masked sequence had reward=0"
         assert train_data["sample_mask"][0] == 1.0, "Sequence 0 should remain unmasked"
         assert train_data["sample_mask"][1] == 0.0, "Sequence 1 should be masked"
+
+    def test_fully_token_masked_sequences_are_excluded_from_metrics(self):
+        """Fully token-masked sequences should not drag reported error metrics to 0."""
+        batch_size, seq_length = 3, 3
+
+        prev_logprobs = torch.zeros(batch_size, seq_length)
+        generation_logprobs = torch.zeros(batch_size, seq_length)
+        generation_logprobs[0, 1] = torch.log(torch.tensor(2.0))
+        generation_logprobs[1, 1] = torch.log(torch.tensor(4.0))
+        generation_logprobs[2, 1] = torch.log(torch.tensor(16.0))
+
+        token_mask = torch.tensor(
+            [
+                [0.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ]
+        )
+        train_data = self._create_train_data(
+            batch_size,
+            seq_length,
+            prev_logprobs,
+            generation_logprobs,
+            token_mask=token_mask,
+        )
+        rewards = torch.tensor([0.0, 1.0, 1.0])
+
+        result = compute_and_apply_seq_logprob_error_masking(
+            train_data, rewards, seq_logprob_error_threshold=3.0
+        )
+
+        assert result["max_seq_mult_prob_error"] == pytest.approx(4.0)
+        assert result["mean_seq_mult_prob_error"] == pytest.approx(3.0)
+        assert result["min_seq_mult_prob_error"] == pytest.approx(2.0)
+        assert result["num_masked_seqs"] == 1
+        assert result["masked_correct_pct"] == 1.0
+        assert result["max_seq_mult_prob_error_after_mask"] == pytest.approx(2.0)
+        assert result["mean_seq_mult_prob_error_after_mask"] == pytest.approx(2.0)
+        assert result["min_seq_mult_prob_error_after_mask"] == pytest.approx(2.0)
+        assert torch.equal(train_data["sample_mask"], torch.tensor([1.0, 0.0, 1.0]))
 
     def test_empty_batch_returns_zero_metrics(self):
         """Test handling of edge case with empty batch."""
