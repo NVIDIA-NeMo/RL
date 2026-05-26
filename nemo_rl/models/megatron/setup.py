@@ -148,6 +148,11 @@ def setup_distributed() -> None:
     # Disable dynamo autotune_local_cache to avoid crash when there's already a cache
     # with different order of node_bundles
     configure_dynamo_cache()
+    # Ensure each rank binds to its assigned GPU before NCCL collectives.
+    if torch.cuda.is_available():
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank % torch.cuda.device_count())
+
     # Ensure clean slate before import
     destroy_parallel_state()
     # Need to initialize the process group before calling into Megatron-Bridge, otherwise Megatron-Bridge will try to set an incorrect device

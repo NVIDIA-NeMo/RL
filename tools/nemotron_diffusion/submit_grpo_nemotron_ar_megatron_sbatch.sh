@@ -51,7 +51,15 @@ export ENV_TAG="${ENV_TAG:-gsm8k_nd3b_sglang_a652eb48_mb500dac75}"
 if [[ -z "${NEMO_RL_VENV_DIR:-}" || "${NEMO_RL_VENV_DIR:-}" == "/opt/ray_venvs" ]]; then
   export NEMO_RL_VENV_DIR="/lustre/fsw/portfolios/coreai/users/snorouzi/nemo_rl_worker_venvs_${ENV_TAG}"
 fi
-export NRL_FORCE_REBUILD_VENVS="${NRL_FORCE_REBUILD_VENVS:-true}"
+if [[ -z "${NRL_FORCE_REBUILD_VENVS+x}" ]]; then
+  if [[ "${MODE}" == "sbatch" ]]; then
+    export NRL_FORCE_REBUILD_VENVS="true"
+  else
+    export NRL_FORCE_REBUILD_VENVS="false"
+  fi
+else
+  export NRL_FORCE_REBUILD_VENVS
+fi
 export FORCE_REINSTALL_PACKAGES="${FORCE_REINSTALL_PACKAGES:-false}"
 export UV_NO_BINARY_PACKAGE="${UV_NO_BINARY_PACKAGE:-}"
 export UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-300}"

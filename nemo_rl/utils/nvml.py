@@ -42,7 +42,7 @@ def device_id_to_physical_device_id(device_id: int) -> int:
     if "CUDA_VISIBLE_DEVICES" in os.environ:
         device_ids = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
         try:
-            physical_device_id = int(device_ids[device_id])
+            physical_device_id = int(device_ids[device_id % len(device_ids)])
             return physical_device_id
         except ValueError:
             raise RuntimeError(
