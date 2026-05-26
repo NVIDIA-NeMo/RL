@@ -62,6 +62,7 @@ The performance data includes:
 | GRPO      |Qwen3-30B3A|On policy    |4,096                |3,203            |32    |2,048|512  |[2,1]             |[1,1,8,1,n/a]             |1102               | 192|
 | GRPO      |Qwen3-30B3A|1-step Off   |4,096                |3,201            |32    |2,048|512  |[2,1]             |[1,1,8,2,n/a]             |1414               | 152|
 | GRPO      |Qwen3-30B3A|8-step Off   |4,096                |3,206            |192   |2,048|512  |[2,1]             |[1,1,8,1,n/a]             |1025               | 34.5|
+| SWE       |Nemotron-3-Nano-30B-A3B|1-step Off   |131,072  |31,599           |128   |512  |512  |[8,1]             |[8,8,8,1,n/a]             |37.5               | 430|
 
 ### H100 FP8 Benchmarks
 * GRPO Dataset: [OpenMathInstruct-2](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2)
@@ -89,7 +90,6 @@ The performance data includes:
 | GRPO      |Qwen3-235B |1-step Off   |8,192                |5,705            |128   |512  |512  |[8,1]             |[4,1,16,4,n/a]            |85.5              | 278|
 | GRPO      |Qwen3-30B3A|On policy    |4,096                |3,199            |16    |2,048|512  |[1,1]             |[1,1,16,1,n/a]             |1,910               | 221|
 | GRPO      |Qwen3-30B3A|1-step Off   |4,096                |3,197            |16    |2,048|512  |[1,1]             |[1,1,16,1,n/a]             |1,406               | 301|
-| SWE       |Nemotron-3-Nano-30B-A3B|1-step Off   |131,072  |31,599           |128   |512  |512  |[8,1]             |[8,8,8,1,n/a]             |37.5               | 430|
 
 Note:
 
