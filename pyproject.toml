@@ -139,6 +139,8 @@ mcore = [
   # Required by flash-linear-attention's gated_delta_rule chunk_bwd_dqkwg path on Hopper with Triton >= 3.4.0
   # (see https://github.com/fla-org/flash-linear-attention/issues/640). Used by Megatron-Core's gated_delta_net.
   "tilelang ; sys_platform == 'linux'",
+  "mamba-ssm",
+  "causal-conv1d",
 ]
 modelopt = ["nvidia-modelopt"]
 nvrx = [
