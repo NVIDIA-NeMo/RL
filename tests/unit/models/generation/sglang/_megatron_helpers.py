@@ -45,6 +45,8 @@ from typing import Any
 PAD_TOKEN_ID = 151643  # Qwen3 ``<|endoftext|>``
 EOS_TOKEN_ID = 151645  # Qwen3 ``<|im_end|>``
 WEIGHT_UPDATE_PRECISION_ENV = "NEMO_RL_SGLANG_WEIGHT_UPDATE_PRECISION"
+SGLANG_MOE_RUNNER_BACKEND_ENV = "NEMO_RL_SGLANG_MOE_RUNNER_BACKEND"
+SGLANG_FP8_GEMM_RUNNER_BACKEND_ENV = "NEMO_RL_SGLANG_FP8_GEMM_RUNNER_BACKEND"
 
 
 def weight_update_precision() -> str:
@@ -419,6 +421,10 @@ def make_sglang_cfg(
     }
     if sglang.enable_dp_attention:
         sglang_cfg["enable_dp_attention"] = True
+    if moe_runner_backend := os.environ.get(SGLANG_MOE_RUNNER_BACKEND_ENV):
+        sglang_cfg["moe_runner_backend"] = moe_runner_backend
+    if fp8_gemm_runner_backend := os.environ.get(SGLANG_FP8_GEMM_RUNNER_BACKEND_ENV):
+        sglang_cfg["fp8_gemm_runner_backend"] = fp8_gemm_runner_backend
     if quantization_cfg is not None:
         sglang_cfg["quantization"] = quantization_cfg
     # NOTE: ``enable_ep_moe`` was removed in newer sglang versions; EP MoE is

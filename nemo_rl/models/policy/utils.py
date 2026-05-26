@@ -695,15 +695,15 @@ def send_hf_buckets_via_ipc_actor_impl(
     dtype, ``dist.gather_object`` to the gather source rank, then on the
     source rank call ``ipc_engine.update_weights_from_tensor.remote(...)``
     once per dtype, **block on ``ray.get(refs)`` per chunk**, validate
-    engine return values, then drop the trainer-side
-    ``flattened_tensor`` references before moving on.
+    engine return values, synchronize all trainer ranks, then drop the
+    trainer-side ``flattened_tensor`` references before moving on.
 
     The trainer-side topology (``_ipc_gather_group`` / ``_ipc_gather_src`` /
     ``_ipc_engine_index``) must already have been set up by
     :func:`connect_colocate_topology`. Placeholder ranks (no covering engine)
     return immediately — they must not call ``gather_object``. Non-source
-    trainer ranks participate only in the gather collective; they don't
-    issue Ray RPCs and don't ``ray.get``.
+    trainer ranks participate in the gather and completion broadcast; they
+    don't issue Ray RPCs and don't ``ray.get``.
 
     Returns ``None``. Raises ``RuntimeError`` if any chunk fails on the
     engine side.
@@ -779,12 +779,30 @@ def send_hf_buckets_via_ipc_actor_impl(
                         )
                     )
 
-            # Block until the engine has copied this chunk through the IPC
-            # handles, surface any per-chunk failure, then release the
-            # trainer-side GPU tensors before the next chunk allocates.
-            results = ray.get(refs)
-            _check_weight_sync_results(results)
-            del long_lived_tensors, refs, results
+            # The serialized IPC handles gathered on the source may point at
+            # flattened tensors owned by non-source trainer ranks. Keep every
+            # rank's tensors alive until the source finishes the engine RPCs.
+            sync_error: Optional[str] = None
+            source_exc: Optional[BaseException] = None
+            if my_rank == gather_src:
+                try:
+                    results = ray.get(refs)
+                    _check_weight_sync_results(results)
+                except BaseException as exc:
+                    source_exc = exc
+                    sync_error = repr(exc)
+
+            sync_state = [sync_error]
+            dist.broadcast_object_list(sync_state, src=gather_src, group=gather_group)
+            del long_lived_tensors, refs
+
+            if source_exc is not None:
+                raise source_exc
+            if sync_state[0] is not None:
+                raise RuntimeError(
+                    f"SGLang IPC weight update failed on gather src rank "
+                    f"{gather_src}: {sync_state[0]}"
+                )
     finally:
         gc.collect()
         torch.cuda.empty_cache()

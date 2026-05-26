@@ -27,6 +27,11 @@ Usage inside the nemo-rl container:
     CUDA_VISIBLE_DEVICES=0 python \
       tests/unit/models/generation/sglang/repro_pp_colocate_weight_update.py \
       --pp 1 --tp 1 --dp 1 --dtype bfloat16 --test-offload-onload
+
+    CUDA_VISIBLE_DEVICES=0,1,2,3 python \
+      tests/unit/models/generation/sglang/repro_pp_colocate_weight_update.py \
+      --pp 2 --tp 2 --ep 2 --dp 2 --enable-dp-attention \
+      --dtype bfloat16 --moe-runner-backend triton --test-offload-onload
 """
 
 from __future__ import annotations
@@ -36,6 +41,7 @@ import json
 import os
 import sys
 import time
+import traceback
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
@@ -43,6 +49,7 @@ from typing import Any
 import ray
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
 from safetensors import safe_open
 
 _DTYPE_FROM_STR = {
@@ -85,7 +92,13 @@ _MOE_RUNNER_BACKEND_CHOICES = (
 )
 
 
-def _ckpt_path() -> Path:
+def _ckpt_path(model_path: str | None = None) -> Path:
+    if model_path is not None:
+        path = Path(model_path).expanduser()
+        if not path.is_dir():
+            sys.exit(f"model path not found: {path}")
+        return path
+
     hf_home = os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface")
     path = Path(hf_home) / "hub" / "qwen3-30b-a3b-sliced-4"
     if not path.is_dir():
@@ -176,7 +189,9 @@ class _SGLangEngineActor:
         ckpt: str,
         pp: int,
         tp: int,
+        ep: int,
         dp: int,
+        enable_dp_attention: bool,
         dtype: str,
         mem_fraction_static: float,
         moe_runner_backend: str,
@@ -198,6 +213,7 @@ class _SGLangEngineActor:
             "model_path": ckpt,
             "tp_size": tp,
             "pp_size": pp,
+            "ep_size": ep,
             "dp_size": dp,
             "dtype": dtype,
             "mem_fraction_static": mem_fraction_static,
@@ -208,9 +224,12 @@ class _SGLangEngineActor:
             "enable_weights_cpu_backup": False,
             "moe_runner_backend": moe_runner_backend,
         }
+        if enable_dp_attention:
+            kwargs["enable_dp_attention"] = True
 
         print(
-            f"[actor] starting Engine pp={pp} tp={tp} dp={dp} dtype={dtype} "
+            f"[actor] starting Engine pp={pp} tp={tp} ep={ep} dp={dp} "
+            f"enable_dp_attention={enable_dp_attention} dtype={dtype} "
             f"moe_runner_backend={moe_runner_backend} "
             f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}",
             flush=True,
@@ -351,24 +370,121 @@ class _MockTrainer:
             yield bucket
 
 
-def _init_single_rank_gloo(master_port: int):
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ["MASTER_PORT"] = str(master_port)
-    os.environ["RANK"] = "0"
-    os.environ["WORLD_SIZE"] = "1"
-    dist.init_process_group(backend="gloo", world_size=1, rank=0)
-    return dist.new_group(ranks=[0], backend="gloo")
+def _mock_trainer_rank_main(
+    *,
+    rank: int,
+    world_size: int,
+    master_addr: str,
+    master_port: int,
+    ckpt_str: str,
+    specs: list[tuple[str, str, list[int]]],
+    weight_map: dict[str, str],
+    target_dtype_name: str,
+    buffer_size_bytes: int,
+    ray_address: str,
+    ray_namespace: str,
+    engine_name: str,
+    engine_gpu_counts: list[int],
+    engine_gpu_offsets: list[int],
+) -> None:
+    """Mock one Megatron rank and use the production colocated IPC topology."""
+    try:
+        torch.cuda.set_device(rank % torch.cuda.device_count())
+
+        from nemo_rl.models.policy.torch_reductions_utils import (
+            monkey_patch_torch_reductions,
+        )
+        from nemo_rl.models.policy.utils import (
+            connect_colocate_topology,
+            send_hf_buckets_via_ipc_actor_impl,
+        )
+
+        ray.init(
+            address=ray_address,
+            namespace=ray_namespace,
+            ignore_reinit_error=True,
+            log_to_driver=True,
+        )
+        engine = ray.get_actor(engine_name, namespace=ray_namespace)
+
+        dist.init_process_group(
+            backend="gloo",
+            init_method=f"tcp://{master_addr}:{master_port}",
+            world_size=world_size,
+            rank=rank,
+        )
+
+        worker_state: dict[str, Any] = {}
+        connect_colocate_topology(
+            engine_gpu_counts=engine_gpu_counts,
+            engine_gpu_offsets=engine_gpu_offsets,
+            worker_state=worker_state,
+            monkey_patch_fn=monkey_patch_torch_reductions,
+        )
+
+        device = f"cuda:{rank % torch.cuda.device_count()}"
+        print(
+            f"[trainer rank={rank}] connected colocate topology "
+            f"engine_gpu_counts={engine_gpu_counts} offsets={engine_gpu_offsets} "
+            f"device={device}",
+            flush=True,
+        )
+        trainer = _MockTrainer(
+            ckpt=Path(ckpt_str),
+            device=device,
+            target_dtype=_DTYPE_FROM_STR[target_dtype_name],
+            specs=specs,
+            weight_map=weight_map,
+        )
+
+        print(f"[trainer rank={rank}] send_hf_buckets_via_ipc_actor_impl...", flush=True)
+        t0 = time.time()
+        send_hf_buckets_via_ipc_actor_impl(
+            bucket_iterator=trainer.iter_buckets(buffer_size_bytes),
+            rollout_engines=[engine],
+            worker_state=worker_state,
+            weight_version=1,
+        )
+        print(
+            f"[trainer rank={rank}] send_hf_buckets done in {time.time() - t0:.1f}s",
+            flush=True,
+        )
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+        os._exit(1)
+    finally:
+        if dist.is_initialized():
+            try:
+                group = locals().get("worker_state", {}).get("_ipc_gather_group")
+                if group is not None:
+                    dist.destroy_process_group(group)
+            except Exception:
+                pass
+            try:
+                dist.destroy_process_group()
+            except Exception:
+                pass
+        if ray.is_initialized():
+            ray.shutdown()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--pp", type=int, default=1)
     parser.add_argument("--tp", type=int, default=1)
+    parser.add_argument("--ep", type=int, default=1)
     parser.add_argument("--dp", type=int, default=1)
+    parser.add_argument("--enable-dp-attention", action="store_true")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=("bfloat16", "float16", "float32"))
     parser.add_argument("--buffer-size-bytes", type=int, default=512 * 1024 * 1024)
     parser.add_argument("--master-port", type=int, default=29565)
     parser.add_argument("--mem-fraction-static", type=float, default=0.3)
+    parser.add_argument(
+        "--model-path",
+        type=str,
+        default=None,
+        help="HF model/checkpoint directory. Defaults to the sliced Qwen repro checkpoint.",
+    )
     parser.add_argument(
         "--test-offload-onload",
         action="store_true",
@@ -385,22 +501,22 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    n_engine = args.pp * args.tp * args.dp
+    n_engine = args.pp * args.tp if args.enable_dp_attention else args.pp * args.tp * args.dp
+    n_trainer = n_engine
     n_avail = torch.cuda.device_count()
     if n_avail < n_engine:
         sys.exit(f"need at least {n_engine} visible GPU(s), have {n_avail}")
-    if args.tp != 1:
-        sys.exit("this standalone single-trainer colocate repro supports --tp 1 only")
 
     torch.cuda.set_device(0)
-    ckpt = _ckpt_path()
+    ckpt = _ckpt_path(args.model_path)
     specs, weight_map = _collect_specs(ckpt)
-    target_dtype = _DTYPE_FROM_STR[args.dtype]
 
     print(f"[main] ckpt={ckpt}", flush=True)
     print(
-        f"[main] pp={args.pp} tp={args.tp} dp={args.dp} dtype={args.dtype} "
-        f"n_engine={n_engine} moe_runner_backend={args.moe_runner_backend}",
+        f"[main] pp={args.pp} tp={args.tp} ep={args.ep} dp={args.dp} "
+        f"enable_dp_attention={args.enable_dp_attention} dtype={args.dtype} "
+        f"n_engine={n_engine} n_trainer={n_trainer} "
+        f"moe_runner_backend={args.moe_runner_backend}",
         flush=True,
     )
     print(
@@ -410,28 +526,47 @@ def main() -> None:
     print(f"[main] CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}", flush=True)
     print(f"[main] {len(specs)} weight tensors to round-trip", flush=True)
 
-    gather_group = None
     engine = None
+    trainer_procs: list[mp.Process] = []
+    ray_namespace = f"repro_pp_colocate_{os.getpid()}"
+    engine_name = f"sglang_engine_{os.getpid()}"
     try:
-        gather_group = _init_single_rank_gloo(args.master_port)
-
-        from nemo_rl.models.policy.torch_reductions_utils import (
-            monkey_patch_torch_reductions,
-        )
-
-        monkey_patch_torch_reductions()
-
-        ray.init(
+        ray_ctx = ray.init(
             num_gpus=n_avail,
+            namespace=ray_namespace,
             include_dashboard=False,
             ignore_reinit_error=True,
             log_to_driver=True,
         )
-        engine = _SGLangEngineActor.options(num_gpus=n_engine).remote(
+        ray_address = (
+            ray_ctx.address_info.get("gcs_address")
+            or ray_ctx.address_info.get("address")
+            or "auto"
+        )
+        from nemo_rl.models.generation.sglang.utils.ray_utils import (
+            NOSET_VISIBLE_DEVICES_ENV_VARS_LIST,
+        )
+
+        env_vars = {name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST} | {
+            "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
+            "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
+            "NCCL_CUMEM_ENABLE": "0",
+        }
+        if os.environ.get("CUDA_VISIBLE_DEVICES"):
+            env_vars["CUDA_VISIBLE_DEVICES"] = os.environ["CUDA_VISIBLE_DEVICES"]
+
+        engine = _SGLangEngineActor.options(
+            num_gpus=0.2,
+            name=engine_name,
+            lifetime="detached",
+            runtime_env={"env_vars": env_vars},
+        ).remote(
             ckpt=str(ckpt),
             pp=args.pp,
             tp=args.tp,
+            ep=args.ep,
             dp=args.dp,
+            enable_dp_attention=args.enable_dp_attention,
             dtype=args.dtype,
             mem_fraction_static=args.mem_fraction_static,
             moe_runner_backend=args.moe_runner_backend,
@@ -462,39 +597,51 @@ def main() -> None:
             print("[main] offload kv+cuda_graph...", flush=True)
             ray.get(engine.offload_kv.remote())
 
-        print("[main] loading trainer tensors...", flush=True)
-        trainer = _MockTrainer(
-            ckpt=ckpt,
-            device="cuda:0",
-            target_dtype=target_dtype,
-            specs=specs,
-            weight_map=weight_map,
-        )
-
-        worker_state: dict[str, Any] = {
-            "_ipc_gather_group": gather_group,
-            "_ipc_gather_src": 0,
-            "_ipc_engine_index": 0,
-            "_ipc_layout_key": ((1,), (0,)),
-            "_ipc_monkey_patched": True,
-            "weight_version": 0,
-        }
-
-        from nemo_rl.models.policy.utils import send_hf_buckets_via_ipc_actor_impl
-
         if args.test_offload_onload:
             print("[main] onload weights...", flush=True)
             ray.get(engine.onload_weights.remote())
 
-        print("[main] send_hf_buckets_via_ipc_actor_impl...", flush=True)
+        print("[main] starting mock trainer ranks...", flush=True)
         t0 = time.time()
-        send_hf_buckets_via_ipc_actor_impl(
-            bucket_iterator=trainer.iter_buckets(args.buffer_size_bytes),
-            rollout_engines=[engine],
-            worker_state=worker_state,
-            weight_version=1,
+        ctx = mp.get_context("spawn")
+        for rank in range(n_trainer):
+            proc = ctx.Process(
+                target=_mock_trainer_rank_main,
+                kwargs={
+                    "rank": rank,
+                    "world_size": n_trainer,
+                    "master_addr": "127.0.0.1",
+                    "master_port": args.master_port,
+                    "ckpt_str": str(ckpt),
+                    "specs": specs,
+                    "weight_map": weight_map,
+                    "target_dtype_name": args.dtype,
+                    "buffer_size_bytes": args.buffer_size_bytes,
+                    "ray_address": ray_address,
+                    "ray_namespace": ray_namespace,
+                    "engine_name": engine_name,
+                    "engine_gpu_counts": [n_engine],
+                    "engine_gpu_offsets": [0],
+                },
+            )
+            proc.start()
+            trainer_procs.append(proc)
+
+        failed = False
+        for proc in trainer_procs:
+            proc.join()
+            if proc.exitcode != 0:
+                failed = True
+                print(
+                    f"[main] trainer process pid={proc.pid} failed exitcode={proc.exitcode}",
+                    flush=True,
+                )
+        if failed:
+            sys.exit(1)
+        print(
+            f"[main] all mock trainer ranks sent buckets in {time.time() - t0:.1f}s",
+            flush=True,
         )
-        print(f"[main] send_hf_buckets done in {time.time() - t0:.1f}s", flush=True)
 
         print("[main] post_process_weights...", flush=True)
         ray.get(
@@ -523,6 +670,10 @@ def main() -> None:
 
         print("[main] PASS: snapshot+reset+refit+compare colocate roundtrip", flush=True)
     finally:
+        for proc in trainer_procs:
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=10)
         if engine is not None:
             try:
                 ray.get(engine.shutdown.remote(), timeout=30)
@@ -532,10 +683,6 @@ def main() -> None:
                 ray.kill(engine, no_restart=True)
             except Exception:
                 pass
-        if dist.is_initialized():
-            if gather_group is not None:
-                dist.destroy_process_group(gather_group)
-            dist.destroy_process_group()
         if ray.is_initialized():
             ray.shutdown()
 
