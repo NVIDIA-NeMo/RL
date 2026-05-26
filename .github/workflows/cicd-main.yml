@@ -301,7 +301,7 @@ jobs:
       build-args: |
         MAX_JOBS=4
         NEMO_RL_COMMIT=${{ needs.pre-flight.outputs.test_sha }}
-        ${{ needs.org-member-pre-flight.outputs.is_member != 'true' && 'SKIP_SGLANG_BUILD=1' || '' }}
+        SKIP_SGLANG_BUILD=1
 
   update-uv-cache:
     name: Update uv build cache

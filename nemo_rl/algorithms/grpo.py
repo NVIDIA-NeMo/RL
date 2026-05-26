@@ -17,7 +17,7 @@ import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
+from typing import Any, Callable, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
 import ray
@@ -59,6 +59,7 @@ from nemo_rl.data.llm_message_utils import (
     get_keys_from_message_log,
 )
 from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
+from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
@@ -207,6 +208,7 @@ class MasterConfig(BaseModel, extra="allow"):
     logger: GRPOLoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
+    data_plane: Optional[DataPlaneConfig] = None
 
 
 # ===============================================================================
@@ -220,6 +222,7 @@ def setup(
     dataset: AllTaskProcessedDataset | dict[str, AllTaskProcessedDataset],
     val_dataset: Optional[AllTaskProcessedDataset],
     processor: Optional[AutoProcessor] = None,
+    policy_factory: Optional[Callable[..., ColocatablePolicyInterface]] = None,
 ) -> tuple[
     ColocatablePolicyInterface,
     Optional[GenerationInterface],
@@ -580,10 +583,15 @@ def setup(
             "(reference model is not loaded)."
         )
 
+    # Caller-supplied factory lets the sync trainer swap in a TQ-mediated
+    # Policy subclass without this shared setup needing to know the data
+    # plane exists. Default is the plain Policy class — legacy behavior.
+    _make_policy = policy_factory if policy_factory is not None else Policy
+
     def init_policy():
         """Initialize policy training workers."""
         t0 = time.perf_counter()
-        p = Policy(
+        p = _make_policy(
             cluster=train_cluster,
             config=policy_config,
             tokenizer=tokenizer,
@@ -1360,7 +1368,7 @@ def grpo_train(
         policy_generation = policy  # type: ignore
         NEED_REFIT = False
     POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
-    assert policy_generation is not None  # for mypy type check
+    assert policy_generation is not None
 
     # Check if we need to sync KV cache scales
     # When fallback to policy as the policy_generation, we use getattr to check.
@@ -2433,6 +2441,39 @@ def validate(
     return val_metrics, timing_metrics
 
 
+def aggregate_rollout_metrics(
+    per_group_metrics: dict[str, list],
+) -> dict[str, Any]:
+    """Aggregate rollout metrics from multiple trajectory groups.
+
+    Different metric types are aggregated according to their semantics:
+    - Metrics ending with "/min" or starting with "min_" (excluding "_rate" suffix): take the minimum
+    - Metrics ending with "/max" or starting with "max_" (excluding "_rate" suffix): take the maximum
+    - "total_turns": summed
+    - Non-numeric values: passed through as-is
+    - All other numeric metrics: averaged
+
+    Args:
+        per_group_metrics: A dict mapping metric names to lists of per-group values.
+
+    Returns:
+        A dict mapping metric names to their aggregated scalar values.
+    """
+    aggregated = {}
+    for k, v in per_group_metrics.items():
+        if not isinstance(v[0], (int, float)):
+            aggregated[k] = v
+        elif k.endswith("/min") or (k.startswith("min_") and not k.endswith("_rate")):
+            aggregated[k] = min(v)
+        elif k.endswith("/max") or (k.startswith("max_") and not k.endswith("_rate")):
+            aggregated[k] = max(v)
+        elif k == "total_turns":
+            aggregated[k] = sum(v)
+        else:
+            aggregated[k] = sum(v) / len(v)
+    return aggregated
+
+
 def async_grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -2765,16 +2806,12 @@ def async_grpo_train(
                     # Concatenate per-prompt groups into a single training batch
                     per_prompt_batches = [t["batch"] for t in trajectories]
                     repeated_batch = BatchedDataDict.from_batches(per_prompt_batches)
-                    # Aggregate rollout metrics across groups (simple mean where applicable)
-                    rollout_metrics = {}
+                    # Aggregate rollout metrics across groups with proper aggregation per metric type
+                    per_group_metrics = {}
                     for t in trajectories:
                         for k, v in t["rollout_metrics"].items():
-                            rollout_metrics.setdefault(k, []).append(v)
-                    # TODO: this simple averaging might cause misleading information for such data as max_gen_tokens, etc.
-                    rollout_metrics = {
-                        k: (sum(v) / len(v) if isinstance(v[0], (int, float)) else v)
-                        for k, v in rollout_metrics.items()
-                    }
+                            per_group_metrics.setdefault(k, []).append(v)
+                    rollout_metrics = aggregate_rollout_metrics(per_group_metrics)
 
                 # Enforce fixed training batch: num_prompts_per_step * num_generations_per_prompt
                 expected_batch_size = (

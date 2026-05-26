@@ -51,6 +51,8 @@ run_test fast uv run --no-sync bash ./tests/functional/eval_audio.sh
 run_test fast uv run --no-sync bash ./tests/functional/gdpo.sh
 run_test fast uv run --no-sync bash ./tests/functional/gdpo_async_grpo.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_simple.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_mooncake.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym.sh
 run_test      uv run --no-sync bash ./tests/functional/grpo_automodel_lora.sh
 run_test      uv run --no-sync bash ./tests/functional/grpo_automodel_lora_async.sh
