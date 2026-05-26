@@ -978,6 +978,11 @@ def test_run_async_nemo_gym_rollout(
     """
 
 
+# ---------------------------------------------------------------------------
+# Tests for AsyncRolloutManager (native async path)
+# ---------------------------------------------------------------------------
+
+
 @pytest.fixture(scope="function")
 def single_multi_step_calculator_input_sample(rollout_tokenizer):
     """Returns a single DatumSpec prompt dict (problem 0) for AsyncRolloutManager tests."""
@@ -1030,11 +1035,6 @@ def single_multi_step_calculator_input_sample(rollout_tokenizer):
         "stop_strings": ["<call: calculator>"],
         "idx": 0,
     }
-
-
-# ---------------------------------------------------------------------------
-# Tests for AsyncRolloutManager (native async path)
-# ---------------------------------------------------------------------------
 
 
 def test_async_rollout_manager(

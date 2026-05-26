@@ -76,7 +76,7 @@ class AsyncRolloutManager:
             results = list(
                 await asyncio.gather(
                     *[
-                        self._generate_single_completion(input_sample, gen_idx)
+                        self._run_single_rollout(input_sample, gen_idx)
                         for gen_idx in range(self._num_generations_per_prompt)
                     ]
                 )
@@ -92,14 +92,14 @@ class AsyncRolloutManager:
 
         return PromptGroupRecord(
             prompt_idx=input_sample["idx"],
-            prompt=copy.deepcopy(input_sample["message_log"]),
+            prompt=input_sample["message_log"],
             extra_env_info=input_sample["extra_env_info"],
             metadata={"task_name": input_sample["task_name"]},
             completions=completions,
             rollout_metrics=rollout_metrics,
         )
 
-    async def _generate_single_completion(
+    async def _run_single_rollout(
         self, input_sample: DatumSpec, gen_idx: int
     ) -> tuple[Completion, dict]:
         """Run one rollout for a single generation index and return a Completion with its sample_metrics."""
@@ -120,6 +120,14 @@ class AsyncRolloutManager:
             max_rollout_turns=self._max_rollout_turns,
         )
 
+        completion = self._result_to_completion(final_state, sample_metrics)
+        return completion, sample_metrics
+
+    def _result_to_completion(
+        self, final_state: dict, sample_metrics: dict
+    ) -> Completion:
+        """Convert one run_rollouts result dict and sample metrics into a Completion."""
+        # Handle multiple rewards used by GDPO.
         env_extras: dict[str, Any] = dict(final_state["extra_env_info"])
         for k, v in final_state.items():
             if isinstance(k, str) and k.startswith("reward") and k[6:].isdigit():
@@ -127,13 +135,12 @@ class AsyncRolloutManager:
                     float(v.item()) if isinstance(v, torch.Tensor) else float(v)
                 )
 
-        completion = Completion(
+        return Completion(
             message_log=final_state["message_log"],
             env_extras=env_extras,
             truncated=sample_metrics["truncated"],
-            reward=float(final_state["total_reward"].item()),
+            reward=sample_metrics["total_reward"],
         )
-        return completion, sample_metrics
 
     def _aggregate_rollout_metrics(
         self, all_sample_metrics: list[dict]
