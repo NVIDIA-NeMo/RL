@@ -73,7 +73,7 @@ class AsyncRolloutManager:
         timer.start(f"{timer_prefix}/total")
 
         with timer.time(f"{timer_prefix}/run_rollouts"):
-            completions = list(
+            results = list(
                 await asyncio.gather(
                     *[
                         self._generate_single_completion(input_sample, gen_idx)
@@ -81,9 +81,11 @@ class AsyncRolloutManager:
                     ]
                 )
             )
+            completions = [c for c, _ in results]
+            all_sample_metrics = [m for _, m in results]
 
-        with timer.time(f"{timer_prefix}/compute_metrics"):
-            rollout_metrics = self._compute_rollout_metrics(completions)
+        with timer.time(f"{timer_prefix}/aggregate_metrics"):
+            rollout_metrics = self._aggregate_rollout_metrics(all_sample_metrics)
 
         timer.stop(f"{timer_prefix}/total")
         rollout_metrics.update(timer.get_timing_metrics("sum"))
@@ -99,8 +101,8 @@ class AsyncRolloutManager:
 
     async def _generate_single_completion(
         self, input_sample: DatumSpec, gen_idx: int
-    ) -> Completion:
-        """Run one rollout for a single generation index and return a Completion."""
+    ) -> tuple[Completion, dict]:
+        """Run one rollout for a single generation index and return a Completion with its sample_metrics."""
         sample_state = {
             "message_log": copy.deepcopy(input_sample["message_log"]),
             "extra_env_info": copy.deepcopy(input_sample["extra_env_info"]),
@@ -125,57 +127,68 @@ class AsyncRolloutManager:
                     float(v.item()) if isinstance(v, torch.Tensor) else float(v)
                 )
 
-        return Completion(
+        completion = Completion(
             message_log=final_state["message_log"],
             env_extras=env_extras,
             truncated=sample_metrics["truncated"],
             reward=float(final_state["total_reward"].item()),
         )
+        return completion, sample_metrics
 
-    def _compute_rollout_metrics(
-        self, completions: list[Completion]
+    def _aggregate_rollout_metrics(
+        self, all_sample_metrics: list[dict]
     ) -> dict[str, Any]:
         """Aggregate per-sample metrics across all completions."""
-        n = len(completions)
+        n = len(all_sample_metrics)
         rollout_metrics: dict[str, Any] = {
-            **_calculate_single_metric(
-                [
-                    sum(1 for m in c.message_log if m["role"] == "user")
-                    for c in completions
-                ],
-                n,
-                "turns_per_sample",
+            "total_turns": sum(m["turn_count"] for m in all_sample_metrics),
+            "avg_turns_per_sample": sum(m["turn_count"] for m in all_sample_metrics)
+            / n,
+            "max_turns_per_sample": max(m["turn_count"] for m in all_sample_metrics),
+            "natural_termination_rate": sum(m["terminated"] for m in all_sample_metrics)
+            / n,
+            "truncation_rate": sum(m["truncated"] for m in all_sample_metrics) / n,
+            "max_turns_reached_rate": sum(
+                m["max_turns_reached"] for m in all_sample_metrics
+            )
+            / n,
+            "mean_total_tokens_per_sample": sum(
+                m["total_tokens"] for m in all_sample_metrics
+            )
+            / n,
+            "mean_gen_tokens_per_sample": sum(
+                m["assistant_tokens"] for m in all_sample_metrics
+            )
+            / n,
+            "max_gen_tokens_per_sample": max(
+                m["assistant_tokens"] for m in all_sample_metrics
             ),
-            **_calculate_single_metric(
-                [sum(len(m["token_ids"]) for m in c.message_log) for c in completions],
-                n,
-                "total_tokens_per_sample",
-            ),
-            **_calculate_single_metric(
-                [
-                    sum(
-                        len(m["token_ids"])
-                        for m in c.message_log
-                        if m["role"] == "assistant"
-                    )
-                    for c in completions
-                ],
-                n,
-                "gen_tokens_per_sample",
-            ),
-            **_calculate_single_metric(
-                [c.reward for c in completions],
-                n,
-                "total_reward",
-            ),
-            "natural_termination_rate": sum(not c.truncated for c in completions) / n,
-            "truncation_rate": sum(c.truncated for c in completions) / n,
+            "mean_env_tokens_per_sample": sum(
+                m["env_tokens"] for m in all_sample_metrics
+            )
+            / n,
+            "mean_total_reward": sum(m["total_reward"] for m in all_sample_metrics) / n,
+            "max_total_reward": max(m["total_reward"] for m in all_sample_metrics),
+            "min_total_reward": min(m["total_reward"] for m in all_sample_metrics),
         }
 
-        # Necessary for downstream nemo rl logging/printing.
-        rollout_metrics["mean_gen_tokens_per_sample"] = rollout_metrics[
-            "gen_tokens_per_sample/mean"
+        if "per_worker_token_counts" in all_sample_metrics[0]:
+            per_worker_token_counts: dict[int, int] = {}
+            for m in all_sample_metrics:
+                for k, v in m["per_worker_token_counts"].items():
+                    per_worker_token_counts[k] = per_worker_token_counts.get(k, 0) + v
+            rollout_metrics["per_worker_token_counts"] = per_worker_token_counts
+
+        rollout_metrics["histogram/gen_tokens_length"] = [
+            t for m in all_sample_metrics for t in m["turn_gen_tokens"]
         ]
+        rollout_metrics["histogram/input_tokens_length"] = [
+            t for m in all_sample_metrics for t in m["turn_input_tokens"]
+        ]
+        rollout_metrics["histogram/total_tokens_length"] = [
+            t for m in all_sample_metrics for t in m["turn_total_tokens"]
+        ]
+
         return rollout_metrics
 
 

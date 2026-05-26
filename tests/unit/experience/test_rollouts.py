@@ -38,11 +38,13 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleMetadata,
 )
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
-from nemo_rl.experience.rollout_manager import AsyncNemoGymRolloutManager
+from nemo_rl.experience.rollout_manager import (
+    AsyncNemoGymRolloutManager,
+    AsyncRolloutManager,
+)
 from nemo_rl.experience.rollouts import (
     _calculate_single_metric,
     run_async_multi_turn_rollout,
-    run_async_multi_turn_rollout_by_prompt,
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
 )
@@ -1031,20 +1033,20 @@ def single_multi_step_calculator_input_sample(rollout_tokenizer):
 
 
 # ---------------------------------------------------------------------------
-# Tests for run_async_multi_turn_rollout_by_prompt
+# Tests for AsyncRolloutManager (native async path)
 # ---------------------------------------------------------------------------
 
 
-def test_run_async_multi_turn_rollout_by_prompt(
+def test_async_rollout_manager(
     multi_step_setup_vllm_async,
     single_multi_step_calculator_input_sample,
 ):
-    """Standalone test for run_async_multi_turn_rollout_by_prompt.
+    """Standalone test for AsyncRolloutManager.
 
     Given 1 prompt with num_generations_per_prompt=N, asserts:
     - output is a PromptGroupRecord with N Completion objects
-    - each Completion has a reward (float)
-    - each Completion's message_log has at least 2 messages (prompt + response)
+    - each Completion has a reward (float) and a non-empty message_log
+    - rollout_metrics has the expected keys with correct types
     - completions hold independent (not aliased) message_log objects
     """
     vllm_generation, rollout_tokenizer, task_to_env, _, _ = multi_step_setup_vllm_async
@@ -1053,18 +1055,17 @@ def test_run_async_multi_turn_rollout_by_prompt(
     max_seq_len = 1024
     max_rollout_turns = input_sample["extra_env_info"]["max_steps"] + 1
 
-    vllm_generation.prepare_for_generation()
-    record = asyncio.run(
-        run_async_multi_turn_rollout_by_prompt(
-            policy_generation=vllm_generation,
-            input_sample=input_sample,
-            tokenizer=rollout_tokenizer,
-            task_to_env=task_to_env,
-            max_seq_len=max_seq_len,
-            num_generations_per_prompt=num_generations,
-            max_rollout_turns=max_rollout_turns,
-        )
+    manager = AsyncRolloutManager(
+        policy_generation=vllm_generation,
+        tokenizer=rollout_tokenizer,
+        task_to_env=task_to_env,
+        max_seq_len=max_seq_len,
+        num_generations_per_prompt=num_generations,
+        max_rollout_turns=max_rollout_turns,
     )
+
+    vllm_generation.prepare_for_generation()
+    record = asyncio.run(manager.run_rollout(input_sample))
     vllm_generation.finish_generation()
 
     assert isinstance(record, PromptGroupRecord)
@@ -1096,19 +1097,20 @@ def test_run_async_multi_turn_rollout_by_prompt(
             f"Completion {i}: reward {completion.reward} != 1.0"
         )
 
-    # completions hold independent (not aliased) message_log objects
+    # completions must be independent objects
     assert record.completions[0].message_log is not record.completions[1].message_log
 
 
-def test_run_async_multi_turn_rollout_by_prompt_matches_original(
+def test_async_rollout_manager_matches_original(
     multi_step_setup_vllm_async,
     single_multi_step_calculator_input_sample,
 ):
-    """Comparison test: _by_prompt output is structurally equivalent to the original.
+    """Comparison test: AsyncRolloutManager output is structurally equivalent to the original.
 
     Calls run_async_multi_turn_rollout with a batch of N identical prompts,
-    then calls run_async_multi_turn_rollout_by_prompt with 1 prompt and N generations.
-    Asserts that both produce N results with the same message-log depth and reward range.
+    then calls AsyncRolloutManager with 1 prompt and N generations.
+    Asserts that both produce N results with matching message-log depth, rewards,
+    and rollout_metrics numeric values.
     """
     vllm_generation, rollout_tokenizer, task_to_env, _, _ = multi_step_setup_vllm_async
     input_sample = single_multi_step_calculator_input_sample
@@ -1133,7 +1135,7 @@ def test_run_async_multi_turn_rollout_by_prompt_matches_original(
     )
 
     vllm_generation.prepare_for_generation()
-    original_batch, _ = run_async_multi_turn_rollout(
+    original_batch, original_metrics = run_async_multi_turn_rollout(
         policy_generation=vllm_generation,
         input_batch=batch,
         tokenizer=rollout_tokenizer,
@@ -1142,22 +1144,20 @@ def test_run_async_multi_turn_rollout_by_prompt_matches_original(
         max_rollout_turns=max_rollout_turns,
     )
 
-    record = asyncio.run(
-        run_async_multi_turn_rollout_by_prompt(
-            policy_generation=vllm_generation,
-            input_sample=input_sample,
-            tokenizer=rollout_tokenizer,
-            task_to_env=task_to_env,
-            max_seq_len=max_seq_len,
-            num_generations_per_prompt=num_generations,
-            max_rollout_turns=max_rollout_turns,
-        )
+    manager = AsyncRolloutManager(
+        policy_generation=vllm_generation,
+        tokenizer=rollout_tokenizer,
+        task_to_env=task_to_env,
+        max_seq_len=max_seq_len,
+        num_generations_per_prompt=num_generations,
+        max_rollout_turns=max_rollout_turns,
     )
+    record = asyncio.run(manager.run_rollout(input_sample))
     vllm_generation.finish_generation()
 
     # Both should produce N results
-    assert len(record.completions) == num_generations
     assert len(original_batch["message_log"]) == num_generations
+    assert len(record.completions) == num_generations
 
     for i in range(num_generations):
         orig_msg_log = original_batch["message_log"][i]
@@ -1180,14 +1180,35 @@ def test_run_async_multi_turn_rollout_by_prompt_matches_original(
         assert orig_last == new_last, (
             f"Completion {i}: last assistant content mismatch\n"
             f"  original:  {orig_last!r}\n"
-            f"  by_prompt: {new_last!r}"
+            f"  manager:   {new_last!r}"
         )
 
         # 3. reward matches
         orig_reward = original_batch["total_reward"][i].item()
         new_reward = record.completions[i].reward
         assert orig_reward == new_reward, (
-            f"Completion {i}: reward mismatch — original {orig_reward}, by_prompt {new_reward}"
+            f"Completion {i}: reward mismatch — original {orig_reward}, manager {new_reward}"
+        )
+
+    # 4. rollout_metrics numeric values match (timing and histogram fields are excluded)
+    new_metrics = record.rollout_metrics
+    for key in original_metrics.keys():
+        if key.startswith("timing/") or key.startswith("histogram/"):
+            continue
+
+        assert key in new_metrics, f"rollout_metrics[{key!r}] missing from manager"
+
+        orig_val = original_metrics[key]
+        new_val = new_metrics[key]
+
+        assert type(orig_val) == type(new_val), (
+            f"rollout_metrics[{key!r}] type mismatch: {type(orig_val)} != {type(new_val)}"
+        )
+        if not isinstance(orig_val, (bool, int, float)):
+            continue
+
+        assert orig_val == pytest.approx(new_val), (
+            f"rollout_metrics[{key!r}] mismatch — original {orig_val}, manager {new_val}"
         )
 
 
