@@ -87,7 +87,9 @@ class AsyncRolloutManager:
             all_sample_metrics = [m for _, m in results]
 
         with timer.time(f"{timer_prefix}/aggregate_metrics"):
-            rollout_metrics = self._aggregate_rollout_metrics(all_sample_metrics)
+            rollout_metrics = self._aggregate_rollout_metrics(
+                completions, all_sample_metrics
+            )
 
         timer.stop(f"{timer_prefix}/total")
         rollout_metrics.update(timer.get_timing_metrics("sum"))
@@ -209,7 +211,8 @@ class AsyncRolloutManager:
                 if env_output.metadata[0] is not None:
                     current_extra_env_info = env_output.metadata[0]
 
-        if turn_count >= self._max_rollout_turns:
+        else:
+            # Reached max turns without termination or truncation.
             max_turns_reached = True
 
         completion = Completion(
@@ -224,9 +227,7 @@ class AsyncRolloutManager:
             "assistant_tokens": assistant_token_count,
             "env_tokens": env_token_count,
             "terminated": terminated,
-            "truncated": truncated,
             "max_turns_reached": max_turns_reached,
-            "total_reward": total_reward,
             "turn_gen_tokens": turn_gen_tokens,
             "turn_input_tokens": turn_input_tokens,
             "turn_total_tokens": turn_total_tokens,
@@ -235,40 +236,46 @@ class AsyncRolloutManager:
         return completion, sample_metrics
 
     def _aggregate_rollout_metrics(
-        self, all_sample_metrics: list[dict]
+        self, completions: list[Completion], all_sample_metrics: list[dict]
     ) -> dict[str, Any]:
         """Aggregate per-sample metrics across all completions."""
+        # Prepare lists of values for each metric.
+        total_reward = [c.reward for c in completions]
+        turn_count = [m["turn_count"] for m in all_sample_metrics]
+        # token metrics
+        total_tokens = [m["total_tokens"] for m in all_sample_metrics]
+        assistant_tokens = [m["assistant_tokens"] for m in all_sample_metrics]
+        env_tokens = [m["env_tokens"] for m in all_sample_metrics]
+        # truncated metrics
+        truncated = [c.truncated for c in completions]
+        terminated = [m["terminated"] for m in all_sample_metrics]
+        max_turns_reached = [m["max_turns_reached"] for m in all_sample_metrics]
+
+        # Aggregate metrics across all samples.
         n = len(all_sample_metrics)
         rollout_metrics: dict[str, Any] = {
-            "total_turns": sum(m["turn_count"] for m in all_sample_metrics),
-            "avg_turns_per_sample": sum(m["turn_count"] for m in all_sample_metrics)
-            / n,
-            "max_turns_per_sample": max(m["turn_count"] for m in all_sample_metrics),
-            "natural_termination_rate": sum(m["terminated"] for m in all_sample_metrics)
-            / n,
-            "truncation_rate": sum(m["truncated"] for m in all_sample_metrics) / n,
-            "max_turns_reached_rate": sum(
-                m["max_turns_reached"] for m in all_sample_metrics
-            )
-            / n,
-            "mean_total_tokens_per_sample": sum(
-                m["total_tokens"] for m in all_sample_metrics
-            )
-            / n,
-            "mean_gen_tokens_per_sample": sum(
-                m["assistant_tokens"] for m in all_sample_metrics
-            )
-            / n,
-            "max_gen_tokens_per_sample": max(
-                m["assistant_tokens"] for m in all_sample_metrics
+            **self._aggregate_single_metric(
+                "total_reward", total_reward, ["mean", "max", "min"], n
             ),
-            "mean_env_tokens_per_sample": sum(
-                m["env_tokens"] for m in all_sample_metrics
-            )
-            / n,
-            "mean_total_reward": sum(m["total_reward"] for m in all_sample_metrics) / n,
-            "max_total_reward": max(m["total_reward"] for m in all_sample_metrics),
-            "min_total_reward": min(m["total_reward"] for m in all_sample_metrics),
+            # turn metrics
+            "total_turns": sum(turn_count),
+            **self._aggregate_single_metric(
+                "turns_per_sample", turn_count, ["mean", "max"], n
+            ),
+            # token metrics
+            **self._aggregate_single_metric(
+                "total_tokens_per_sample", total_tokens, ["mean"], n
+            ),
+            **self._aggregate_single_metric(
+                "gen_tokens_per_sample", assistant_tokens, ["mean", "max"], n
+            ),
+            **self._aggregate_single_metric(
+                "env_tokens_per_sample", env_tokens, ["mean"], n
+            ),
+            # truncated metrics
+            "truncation_rate": sum(truncated) / n,
+            "natural_termination_rate": sum(terminated) / n,
+            "max_turns_reached_rate": sum(max_turns_reached) / n,
         }
 
         if "per_worker_token_counts" in all_sample_metrics[0]:
@@ -290,6 +297,26 @@ class AsyncRolloutManager:
         ]
 
         return rollout_metrics
+
+    @staticmethod
+    def _aggregate_single_metric(
+        name: str,
+        values: list[float],
+        agg_method: list[str],
+        n: Optional[int] = None,
+    ) -> dict:
+        """Calculate a single metric across a list of values."""
+        metrics = {}
+
+        if "mean" in agg_method:
+            assert n is not None, "n must be provided for mean aggregation"
+            metrics[f"mean_{name}"] = sum(values) / n
+        if "max" in agg_method:
+            metrics[f"max_{name}"] = max(values)
+        if "min" in agg_method:
+            metrics[f"min_{name}"] = min(values)
+
+        return metrics
 
 
 class AsyncNemoGymRolloutManager:

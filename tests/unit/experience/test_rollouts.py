@@ -1196,10 +1196,14 @@ def test_async_rollout_manager_matches_original(
         if key.startswith("timing/") or key.startswith("histogram/"):
             continue
 
-        assert key in new_metrics, f"rollout_metrics[{key!r}] missing from manager"
+        # renamed in new impl
+        new_key = "mean_turns_per_sample" if key == "avg_turns_per_sample" else key
+        assert new_key in new_metrics, (
+            f"rollout_metrics[{new_key!r}] missing from manager"
+        )
 
         orig_val = original_metrics[key]
-        new_val = new_metrics[key]
+        new_val = new_metrics[new_key]
 
         assert type(orig_val) == type(new_val), (
             f"rollout_metrics[{key!r}] type mismatch: {type(orig_val)} != {type(new_val)}"
