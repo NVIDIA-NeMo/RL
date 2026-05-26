@@ -23,12 +23,14 @@ from transformers import PreTrainedTokenizerBase
 from wandb import Table
 
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.rollouts import (
     _calculate_single_metric,
     _tensorize_by_key,
-    run_sample_multi_turn_rollout,
+    async_generate_response_for_sample_turn,
+    calculate_rewards,
 )
 from nemo_rl.models.generation.interfaces import GenerationConfig, GenerationInterface
 from nemo_rl.utils.timer import Timer
@@ -102,45 +104,135 @@ class AsyncRolloutManager:
     async def _run_single_rollout(
         self, input_sample: DatumSpec, gen_idx: int
     ) -> tuple[Completion, dict]:
-        """Run one rollout for a single generation index and return a Completion with its sample_metrics."""
-        sample_state = {
-            "message_log": copy.deepcopy(input_sample["message_log"]),
-            "extra_env_info": copy.deepcopy(input_sample["extra_env_info"]),
-            "task_name": input_sample["task_name"],
-            "stop_strings": input_sample.get("stop_strings", None),
-            "idx": gen_idx,
-        }
-        final_state, sample_metrics = await run_sample_multi_turn_rollout(
-            sample_idx=gen_idx,
-            initial_sample_state=sample_state,
-            policy_generation=self._policy_generation,
-            tokenizer=self._tokenizer,
-            task_to_env=self._task_to_env,
-            max_seq_len=self._max_seq_len,
-            max_rollout_turns=self._max_rollout_turns,
-        )
+        """Run one multi-turn rollout for a single generation index."""
+        current_message_log = copy.deepcopy(input_sample["message_log"])
+        current_extra_env_info = copy.deepcopy(input_sample["extra_env_info"])
+        current_stop_strings = input_sample.get("stop_strings", None)
+        task_name = input_sample["task_name"]
 
-        completion = self._result_to_completion(final_state, sample_metrics)
-        return completion, sample_metrics
+        total_reward = 0.0
+        turn_count = 0
+        token_count = 0
+        assistant_token_count = 0
+        env_token_count = 0
+        terminated = False
+        truncated = False
+        max_turns_reached = False
+        turn_gen_tokens: list[int] = []
+        turn_input_tokens: list[int] = []
+        turn_total_tokens: list[int] = []
+        per_worker_token_counts: dict[int, int] = {}
 
-    def _result_to_completion(
-        self, final_state: dict, sample_metrics: dict
-    ) -> Completion:
-        """Convert one run_rollouts result dict and sample metrics into a Completion."""
-        # Handle multiple rewards used by GDPO.
-        env_extras: dict[str, Any] = dict(final_state["extra_env_info"])
-        for k, v in final_state.items():
-            if isinstance(k, str) and k.startswith("reward") and k[6:].isdigit():
-                env_extras[k] = (
-                    float(v.item()) if isinstance(v, torch.Tensor) else float(v)
+        for _ in range(self._max_rollout_turns):
+            if terminated or truncated:
+                break
+
+            turn_count += 1
+
+            try:
+                (
+                    updated_message_log,
+                    generated_tokens,
+                    input_lengths,
+                    gen_metrics,
+                ) = await async_generate_response_for_sample_turn(
+                    self._policy_generation,
+                    current_message_log,
+                    current_stop_strings,
+                    self._tokenizer,
+                    self._max_seq_len,
                 )
+                current_message_log = updated_message_log
 
-        return Completion(
-            message_log=final_state["message_log"],
-            env_extras=env_extras,
-            truncated=sample_metrics["truncated"],
-            reward=sample_metrics["total_reward"],
+                response_truncated = gen_metrics.pop("_response_truncated", None)
+                if response_truncated is not None and response_truncated[0]:
+                    truncated = True
+
+                gen_token_count = len(generated_tokens)
+                assistant_token_count += gen_token_count
+                token_count += gen_token_count
+                turn_gen_tokens.append(gen_token_count)
+                turn_input_tokens.append(int(input_lengths))
+                turn_total_tokens.append(int(input_lengths) + gen_token_count)
+                if "gen_leader_worker_idx" in gen_metrics:
+                    worker_idx = int(gen_metrics["gen_leader_worker_idx"])
+                    per_worker_token_counts[worker_idx] = (
+                        per_worker_token_counts.get(worker_idx, 0) + gen_token_count
+                    )
+
+            except Exception as e:
+                print(f"Error generating response for gen_idx {gen_idx}: {e}")
+                break
+
+            sample_batch = BatchedDataDict[DatumSpec](
+                {
+                    "message_log": [current_message_log],
+                    "extra_env_info": [current_extra_env_info],
+                    "task_name": [task_name],
+                }
+            )
+            env_output = await asyncio.to_thread(
+                calculate_rewards, sample_batch, self._task_to_env
+            )
+
+            total_reward += float(env_output.rewards[0].item())
+            terminated = env_output.terminateds[0].item()
+            env_obs_content = env_output.observations[0]["content"]
+            tokenized_obs = self._tokenizer(
+                env_obs_content, return_tensors="pt", add_special_tokens=False
+            ).input_ids[0]
+
+            if (
+                input_lengths + gen_token_count + len(tokenized_obs)
+                >= self._max_seq_len
+            ):
+                max_env_tokens = self._max_seq_len - input_lengths - gen_token_count
+                if max_env_tokens > 0:
+                    tokenized_obs = tokenized_obs[:max_env_tokens]
+                else:
+                    tokenized_obs = torch.empty(0, dtype=tokenized_obs.dtype)
+                truncated = True
+
+            current_message_log.append(
+                {
+                    "role": env_output.observations[0]["role"],
+                    "content": env_obs_content,
+                    "token_ids": tokenized_obs,
+                }
+            )
+            env_token_count += len(tokenized_obs)
+            token_count += len(tokenized_obs)
+
+            if not terminated and not truncated:
+                if env_output.next_stop_strings[0] is not None:
+                    current_stop_strings = env_output.next_stop_strings[0]
+                if env_output.metadata[0] is not None:
+                    current_extra_env_info = env_output.metadata[0]
+
+        if turn_count >= self._max_rollout_turns:
+            max_turns_reached = True
+
+        completion = Completion(
+            message_log=current_message_log,
+            env_extras=current_extra_env_info,
+            truncated=truncated,
+            reward=total_reward,
         )
+        sample_metrics = {
+            "turn_count": turn_count,
+            "total_tokens": token_count,
+            "assistant_tokens": assistant_token_count,
+            "env_tokens": env_token_count,
+            "terminated": terminated,
+            "truncated": truncated,
+            "max_turns_reached": max_turns_reached,
+            "total_reward": total_reward,
+            "turn_gen_tokens": turn_gen_tokens,
+            "turn_input_tokens": turn_input_tokens,
+            "turn_total_tokens": turn_total_tokens,
+            "per_worker_token_counts": per_worker_token_counts,
+        }
+        return completion, sample_metrics
 
     def _aggregate_rollout_metrics(
         self, all_sample_metrics: list[dict]
@@ -186,6 +278,7 @@ class AsyncRolloutManager:
                     per_worker_token_counts[k] = per_worker_token_counts.get(k, 0) + v
             rollout_metrics["per_worker_token_counts"] = per_worker_token_counts
 
+        # Histogram metrics.
         rollout_metrics["histogram/gen_tokens_length"] = [
             t for m in all_sample_metrics for t in m["turn_gen_tokens"]
         ]
