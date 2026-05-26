@@ -1030,7 +1030,7 @@ def single_multi_step_calculator_input_sample(rollout_tokenizer):
 
 
 # ---------------------------------------------------------------------------
-# Tests for run_async_nemo_gym_rollout_by_prompt
+# Tests for AsyncNemoGymRolloutManager
 # ---------------------------------------------------------------------------
 
 
@@ -1213,19 +1213,19 @@ def test_async_nemo_gym_rollout_manager_matches_original(
             f"Completion {i}: no assistant message in original"
         )
         assert new_token_ids is not None, (
-            f"Completion {i}: no assistant message in by_prompt"
+            f"Completion {i}: no assistant message in manager"
         )
         assert torch.equal(orig_token_ids, new_token_ids), (
             f"Completion {i}: last assistant token_ids mismatch\n"
             f"  original:  {orig_token_ids.tolist()}\n"
-            f"  by_prompt: {new_token_ids.tolist()}"
+            f"  manager:   {new_token_ids.tolist()}"
         )
 
         # 3. reward matches
         orig_reward = original_result.final_batch["total_reward"][i].item()
         new_reward = record.completions[i].reward
         assert orig_reward == new_reward, (
-            f"Completion {i}: reward mismatch — original {orig_reward}, by_prompt {new_reward}"
+            f"Completion {i}: reward mismatch — original {orig_reward}, manager {new_reward}"
         )
 
     # 4. rollout_metrics numeric values match (timing and Table fields are excluded)
@@ -1237,7 +1237,7 @@ def test_async_nemo_gym_rollout_manager_matches_original(
             continue
 
         # Check that the key is present in the new metrics
-        assert key in new_metrics, f"rollout_metrics[{key!r}] missing in original"
+        assert key in new_metrics, f"rollout_metrics[{key!r}] missing from manager"
 
         orig_val = orig_metrics[key]
         new_val = new_metrics[key]
@@ -1251,5 +1251,5 @@ def test_async_nemo_gym_rollout_manager_matches_original(
 
         # Check equal
         assert orig_val == pytest.approx(new_val), (
-            f"rollout_metrics[{key!r}] mismatch — original {orig_val}, by_prompt {new_val}"
+            f"rollout_metrics[{key!r}] mismatch — original {orig_val}, manager {new_val}"
         )

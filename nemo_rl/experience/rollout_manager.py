@@ -69,9 +69,9 @@ class AsyncNemoGymRolloutManager:
         timer_prefix = "timing/rollout"
         timer.start(f"{timer_prefix}/total")
 
-        rows = self._build_rows(input_sample)
+        rollout_inputs = self._build_inputs(input_sample)
         completions, rollout_metrics = await self._run_rollouts(
-            rows, timer, timer_prefix
+            rollout_inputs, timer, timer_prefix
         )
 
         timer.stop(f"{timer_prefix}/total")
@@ -111,7 +111,7 @@ class AsyncNemoGymRolloutManager:
             "`max_rollout_turns` is not supported in NeMo-Gym path!"
         )
 
-    def _build_rows(self, input_sample: DatumSpec) -> list[dict]:
+    def _build_inputs(self, input_sample: DatumSpec) -> list[dict]:
         """Build N row dicts from input_sample, applying generation config params."""
         # Build a template row from the input_sample's extra_env_info, applying generation params.
         template_row: dict = input_sample["extra_env_info"]  # type: ignore
@@ -138,7 +138,7 @@ class AsyncNemoGymRolloutManager:
         return rows
 
     async def _run_rollouts(
-        self, rows: list[dict], timer: Timer, timer_prefix: str
+        self, inputs: list[dict], timer: Timer, timer_prefix: str
     ) -> tuple[list[Completion], dict[str, Any]]:
         """Dispatch rows to NeMo-Gym and return completions + metrics."""
         nemo_gym_env = self._task_to_env["nemo_gym"]
@@ -146,7 +146,7 @@ class AsyncNemoGymRolloutManager:
         # Run generation.
         with timer.time(f"{timer_prefix}/run_rollouts"):
             results, env_timing_metrics = await nemo_gym_env.run_rollouts.remote(
-                rows, self._tokenizer, timer_prefix
+                inputs, self._tokenizer, timer_prefix
             )
             # Convert results to completions.
             completions = [self._result_to_completion(r) for r in results]
@@ -154,7 +154,7 @@ class AsyncNemoGymRolloutManager:
         # Compute rollout metrics.
         with timer.time(f"{timer_prefix}/compute_metrics"):
             rollout_metrics = self._compute_rollout_metrics(
-                completions, rows[0]["agent_ref"]["name"]
+                completions, inputs[0]["agent_ref"]["name"]
             )
 
         rollout_metrics.update(env_timing_metrics)
