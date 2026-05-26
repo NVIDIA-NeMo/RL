@@ -1218,6 +1218,12 @@ class DTensorPolicyWorkerV2Impl(
 
         torch.cuda.empty_cache()
 
+    def finish_inference(self, *args, **kwargs) -> None:
+        pass
+
+    def finish_training(self, *args, **kwargs) -> None:
+        pass
+
     @torch.no_grad()
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/offload_before_refit")
     def offload_before_refit(self) -> None:
