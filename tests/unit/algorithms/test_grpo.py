@@ -28,6 +28,7 @@ from nemo_rl.algorithms.advantage_estimator import (
 from nemo_rl.algorithms.grpo import (
     MasterConfig,
     _default_grpo_save_state,
+    aggregate_rollout_metrics,
     async_grpo_train,
     compute_and_apply_seq_logprob_error_masking,
     dynamic_sampling,
@@ -35,6 +36,11 @@ from nemo_rl.algorithms.grpo import (
     validate,
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
+from nemo_rl.algorithms.reward_functions import (
+    RewardShapingConfig,
+    apply_reward_shaping,
+)
+from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import (
@@ -934,6 +940,99 @@ def test_dapo_dynamic_sampling_disabled():
     assert result_batch.size == 6
     assert is_batch_complete == True
     assert batch_cache is None  # No caching when disabled
+
+
+def test_dapo_dynamic_sampling_filters_on_raw_metric_after_overlong_shaping():
+    """Regression test for the issue where DAPO dynamic sampling filtered on
+    shaped reward std instead of the raw task metric.
+
+    The first prompt group: all responses are raw-wrong (acc=0) but lengths
+    differ, so the overlong penalty produces non-zero shaped std. The fix
+    must recompute std on the raw (pre-shaping) reward so this group is
+    filtered out. The second prompt group has genuinely varied raw rewards
+    and must be kept.
+    """
+    batch_size = 6
+    # Vary the assistant response length for the first group so the overlong
+    # penalty creates spurious shaped-reward variance.
+    response_lengths = [10, 22, 30, 10, 20, 10]
+    message_logs = []
+    for i, length in enumerate(response_lengths):
+        message_logs.append(
+            [
+                {
+                    "role": "user",
+                    "content": f"prompt_{i // 3}",
+                    "token_ids": torch.tensor([100 + (i // 3), 101, 102]),
+                },
+                {
+                    "role": "assistant",
+                    "content": f"response_{i}",
+                    "token_ids": torch.arange(length, dtype=torch.long),
+                },
+            ]
+        )
+    task_names = ["math"] * batch_size
+    repeated_batch = create_mock_batch(batch_size, task_names, message_logs)
+    # Group 0: all raw-wrong (acc=0). Group 1: mixed.
+    repeated_batch["total_reward"] = torch.tensor([0.0, 0.0, 0.0, 1.0, 0.0, 1.0])
+
+    shaping_cfg = RewardShapingConfig(
+        enabled=True,
+        overlong_buffer_length=5,
+        overlong_buffer_penalty=0.5,
+        max_response_length=25,
+    )
+    repeated_batch = apply_reward_shaping(repeated_batch, shaping_cfg)
+
+    # Shaped reward of group 0 is now [0.0, -0.2, -1.0] -> non-zero std.
+    shaped_std = repeated_batch["total_reward"][:3].std(unbiased=False)
+    assert shaped_std.item() > 0.0
+
+    # Use prompt-only token_ids to identify groups, mirroring the grpo.py
+    # call site.
+    input_ids = torch.stack([m[0]["token_ids"] for m in repeated_batch["message_log"]])
+    rewards = repeated_batch["total_reward"]
+    baseline, raw_std = calculate_baseline_and_std_per_prompt(
+        input_ids,
+        rewards,
+        torch.ones_like(rewards),
+        leave_one_out_baseline=False,
+        std_rewards=repeated_batch["unshaped_total_reward"],
+    )
+
+    # Raw std is 0 for the homogeneous group, non-zero for the mixed group.
+    assert torch.allclose(raw_std[:3], torch.zeros(3))
+    assert (raw_std[3:] > 0).all()
+
+    master_config = MasterConfig.model_construct(
+        **{
+            "grpo": {
+                "use_dynamic_sampling": True,
+                "num_prompts_per_step": 1,
+                "num_generations_per_prompt": 3,
+                "dynamic_sampling_max_gen_batches": 5,
+            }
+        }
+    )
+
+    result_batch, is_batch_complete, _, _ = dynamic_sampling(
+        repeated_batch,
+        raw_std,
+        baseline,
+        dynamic_sampling_num_gen_batches=1,
+        master_config=master_config,
+        timer=Timer(),
+    )
+
+    # Only the second group should survive — the first group's raw rewards are
+    # identical, so filtering on the raw metric drops it.
+    assert is_batch_complete is True
+    assert result_batch.size == 3
+    surviving_prompts = [
+        result_batch["message_log"][i][0]["content"] for i in range(result_batch.size)
+    ]
+    assert surviving_prompts == ["prompt_1", "prompt_1", "prompt_1"]
 
 
 def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
@@ -2672,3 +2771,76 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         # At least sequence 2 should be masked
         assert num_masked >= 1, "At least one sequence should be masked"
         assert train_data["sample_mask"][0] == 1.0, "Sequence 0 should be kept"
+
+
+class TestAggregateRolloutMetrics:
+    """Tests for aggregate_rollout_metrics which aggregates per-group metrics by semantic type."""
+
+    def test_min_metrics_take_minimum(self):
+        metrics = {
+            "gen_tokens/min": [10, 5, 8],
+            "min_reward": [0.3, 0.1, 0.5],
+        }
+        result = aggregate_rollout_metrics(metrics)
+        assert result["gen_tokens/min"] == 5
+        assert result["min_reward"] == 0.1
+
+    def test_max_metrics_take_maximum(self):
+        metrics = {
+            "gen_tokens/max": [10, 50, 30],
+            "max_reward": [0.3, 0.9, 0.5],
+        }
+        result = aggregate_rollout_metrics(metrics)
+        assert result["gen_tokens/max"] == 50
+        assert result["max_reward"] == 0.9
+
+    def test_rate_suffix_excluded_from_min_max(self):
+        """min_*_rate and max_*_rate should be averaged, not min/maxed."""
+        metrics = {
+            "min_completion_rate": [0.2, 0.8, 0.5],
+            "max_completion_rate": [0.3, 0.9, 0.6],
+        }
+        result = aggregate_rollout_metrics(metrics)
+        assert result["min_completion_rate"] == pytest.approx(0.5)
+        assert result["max_completion_rate"] == pytest.approx(0.6)
+
+    def test_total_turns_summed(self):
+        metrics = {"total_turns": [10, 20, 30]}
+        result = aggregate_rollout_metrics(metrics)
+        assert result["total_turns"] == 60
+
+    def test_mean_metrics_averaged(self):
+        metrics = {
+            "mean_gen_tokens_per_sample": [100, 200, 300],
+            "reward/mean": [0.5, 0.7, 0.9],
+        }
+        result = aggregate_rollout_metrics(metrics)
+        assert result["mean_gen_tokens_per_sample"] == pytest.approx(200.0)
+        assert result["reward/mean"] == pytest.approx(0.7)
+
+    def test_non_numeric_passed_through(self):
+        metrics = {"some_list_metric": [["a", "b"], ["c", "d"]]}
+        result = aggregate_rollout_metrics(metrics)
+        assert result["some_list_metric"] == [["a", "b"], ["c", "d"]]
+
+    def test_mixed_metrics(self):
+        """Full integration test with a realistic mix of metric types."""
+        metrics = {
+            "gen_tokens/min": [5, 3, 7],
+            "gen_tokens/max": [100, 200, 150],
+            "gen_tokens/mean": [50, 60, 70],
+            "min_reward": [0.1, 0.2, 0.05],
+            "max_reward": [0.9, 0.8, 0.95],
+            "total_turns": [10, 15, 20],
+            "accuracy": [0.8, 0.9, 0.7],
+            "min_accuracy_rate": [0.1, 0.2, 0.3],
+        }
+        result = aggregate_rollout_metrics(metrics)
+        assert result["gen_tokens/min"] == 3
+        assert result["gen_tokens/max"] == 200
+        assert result["gen_tokens/mean"] == pytest.approx(60.0)
+        assert result["min_reward"] == 0.05
+        assert result["max_reward"] == 0.95
+        assert result["total_turns"] == 45
+        assert result["accuracy"] == pytest.approx(0.8)
+        assert result["min_accuracy_rate"] == pytest.approx(0.2)
