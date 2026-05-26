@@ -339,7 +339,7 @@ def validate_and_prepare_config(
                     "for the linear head of Bradley-Terry reward models."
                 )
                 model_config.num_labels = 1
-        elif rm_type == "regression":
+        elif rm_type == "regression":  # pragma: no cover
             # NeMoAutoModelForTokenClassification is not available in the currently
             # pinned nemo_automodel. To enable regression-type value/reward models on
             # the DTensor backend, bump the nemo_automodel submodule to a version
