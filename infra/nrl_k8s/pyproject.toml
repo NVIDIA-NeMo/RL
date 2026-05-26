@@ -15,7 +15,7 @@ dependencies = [
   "pydantic>=2.5",
   "omegaconf>=2.3",
   "pyyaml>=6.0",
-  "kubernetes>=29.0",
+  "kubernetes>=29.0,<36",
   "ray[default]>=2.52",
   "tenacity>=8.2",
 ]
