@@ -1227,7 +1227,19 @@ def ppo_train(
     - GAE advantage estimation with value bootstrap
     - Multiple training steps per rollout (steps_per_epoch)
     - Configurable policy training start epoch
+
+    Note: only synchronous PPO is implemented. The ``async_ppo`` config schema
+    exists as a scaffold for future work but is not wired up yet.
     """
+    if master_config.ppo.get("async_ppo", {}).get(  # pragma: no cover
+        "enabled", False
+    ):
+        raise NotImplementedError(
+            "Async PPO is not implemented yet. The async_ppo config schema "
+            "exists as a placeholder; remove or set async_ppo.enabled=false "
+            "to run synchronous PPO."
+        )
+
     timer = Timer()
     timeout = TimeoutChecker(
         timeout=master_config.checkpointing["checkpoint_must_save_by"],
