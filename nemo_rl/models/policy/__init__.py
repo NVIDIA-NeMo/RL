@@ -245,7 +245,7 @@ class MegatronConfig(TypedDict):
     # Options are 'allgather','alltoall' and 'flex'
     # Use 'flex' when using DeepEP
     moe_token_dispatcher_type: str
-    # Inference-only MoE dispatcher selection used when EP > 1 and the
+    # Inference-only MoE dispatcher selection.
     # Options are 'nvls' (requires Hopper+ NVLink) and 'nccl' (fallback for non-NVLS systems).
     inference_moe_token_dispatcher_type: NotRequired[str]
     # Backend for grouped-GEMM during inference-optimized MoE forward.
@@ -255,9 +255,8 @@ class MegatronConfig(TypedDict):
     # (used when transformer_impl='inference_optimized')
     moe_router_num_groups: NotRequired[int | None]
     moe_router_group_topk: NotRequired[int | None]
-    # Transformer implementation backing the model.
+    # Transformer implementation backing the model. Only valid on generation workers.
     # Options are 'transformer_engine' and 'inference_optimized'.
-    # Only valid on generation workers.
     transformer_impl: NotRequired[str]
     # CUDA-graph implementation.
     # Options: 'none', 'local', 'transformer_engine', 'full_iteration'.

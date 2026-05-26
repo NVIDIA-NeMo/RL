@@ -291,13 +291,18 @@ policy:
     stop_token_ids: null
     stop_strings: null
     mcore_generation_config:
+      cuda_graph_impl: "local"  # CUDA-graph implementation. Options: "none", "local", "transformer_engine", "full_iteration".
+      cuda_graph_scope: "full_iteration_inference"  # CUDA-graph scope.
       buffer_size_gb: 10
       num_cuda_graphs: 4  # Number of CUDA graphs to pre-compile for different batch sizes
       block_size_tokens: 256  # Size of each KV cache block in tokens (affects memory granularity)
       use_cuda_graphs_for_non_decode_steps: true  # Enable CUDA graphs for prefill/context processing
       enable_chunked_prefill: true  # Split long prefills into chunks for better memory management
-      unified_memory_level: 0  # Unified memory usage level (0=disabled, higher values enable more aggressive paging)
       max_tokens: 16384 # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens
+      kv_cache_management_mode: "persist"  # KV cache lifecycle across suspend/resume. Options: "persist", "offload". To select "recompute", set grpo.async_grpo.recompute_kv_cache_after_weight_updates=true.
+      materialize_only_last_token_logits: true
+      num_speculative_tokens: 0
+      use_flashinfer_sampling: true  # Use FlashInfer kernels for top-k/top-p sampling.
       refit_backend: "nvshmem"  # Copy-service backend for non-colocated megatron weight refit. Options: "gloo" or "nvshmem".
     vllm_cfg:
       async_engine: false

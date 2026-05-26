@@ -71,6 +71,9 @@ from nemo_rl.experience.rollouts import (
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.megatron import MegatronGeneration
+from nemo_rl.models.generation.megatron.megatron_generation import (
+    MegatronRefitController,
+)
 from nemo_rl.models.generation.sglang import SGLangConfig, SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.policy import PolicyConfig
@@ -565,6 +568,21 @@ def setup(
         )
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
+        # When the user opts into recompute-after-refit on the megatron side,
+        # override mcore's kv_cache_management_mode to "recompute" directly.
+        if (
+            "async_grpo" in grpo_config
+            and grpo_config["async_grpo"].get("recompute_kv_cache_after_weight_updates", False)
+        ):
+            mcore_cfg = policy_config["generation"]["mcore_generation_config"]
+            prior_mode = mcore_cfg.get("kv_cache_management_mode", "persist")
+            if prior_mode != "recompute":
+                print(
+                    f"kv_cache_management_mode overridden '{prior_mode}' -> 'recompute' by "
+                    f"grpo.async_grpo.recompute_kv_cache_after_weight_updates=True."
+                )
+            mcore_cfg["kv_cache_management_mode"] = "recompute"
+
     # Define initialization functions that will be used in all paths
     init_reference_model = loss_config.reference_policy_kl_penalty > 0
 
@@ -688,17 +706,12 @@ def setup(
 
     # Handle generation-specific setup
     if backend == "megatron":
-        # Megatron generation: policy_generation is None for colocated;
-        # for non-colocated, MegatronGeneration runs on a dedicated cluster.
         if colocated_inference:
             policy_generation = None
             policy, policy_time = init_policy()
             worker_init_timing_metrics["policy_init_time_s"] = policy_time
         else:
-            # Non-colocated Megatron: initialize training first so HF→Megatron
-            # checkpoint conversion completes before inference workers start.
-            # Both sides target the same checkpoint path, so parallel init
-            # causes a write race during conversion.
+            # Initialize training first so checkpoint conversion completes before inference starts.
             policy, policy_time = init_policy()
             worker_init_timing_metrics["policy_init_time_s"] = policy_time
 
@@ -790,25 +803,30 @@ def setup(
         world_size = train_world_size + inference_world_size
 
         if backend == "megatron":
-            # Non-colocated Megatron: use init_refit_collective with the
-            # configured refit backend (gloo or nvshmem).
             refit_backend = policy_config["generation"]["mcore_generation_config"][
                 "refit_backend"
             ]
-            futures_train = policy.init_refit_collective(
-                ip, port, world_size,
+            # Stash a controller on the training Policy so later refit calls
+            # (preinit_nvshmem, send_weights_via_reshard) go through the same
+            # instance and see the dst_rank_offset recorded here.
+            policy._megatron_refit = MegatronRefitController(policy)
+            futures_train = policy._megatron_refit.init_refit_collective(
+                ip,
+                port,
+                world_size,
                 rank_offset=0,
                 dst_rank_offset=train_world_size,
                 refit_backend=refit_backend,
             )
             futures_inference = policy_generation.init_collective(
-                ip, port, world_size,
+                ip,
+                port,
+                world_size,
                 train_world_size=train_world_size,
                 refit_backend=refit_backend,
             )
             ray.get(futures_train + futures_inference)
         else:
-            # vLLM/SGLang path: init_collective
             futures_train = policy.init_collective(
                 ip, port, world_size, train_world_size=train_world_size
             )
@@ -1120,8 +1138,7 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
 def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
     """Determine if async rollouts should be used based on the configuration.
 
-    Returns True if vLLM backend is used with async_engine enabled,
-    or if Megatron backend is used with async engine enabled.
+    Returns True if async_engine is enabled.
     """
     generation_config = master_config.policy["generation"]
     if generation_config is None:
@@ -1233,7 +1250,6 @@ def refit_policy_generation(
     _refit_buffer_size_gb: Optional[int] = None,
     timer: Optional[Timer] = None,
     kv_scales: Optional[dict[str, float]] = None,
-    recompute_kv_cache: bool = False,
 ) -> None:
     """Refit the policy generation interface with the latest policy weights.
 
@@ -1245,17 +1261,15 @@ def refit_policy_generation(
             This parameter is primarily used for testing.
         timer: Optional Timer used to time the prepare/transfer/update phase
         kv_scales: Optional dictionary of KV cache scales for FP8 quantization.
-        recompute_kv_cache: Used by `MegatronGeneration` to determine whether to offload/recompute.
     """
     # Megatron generation backend needs explicit suspend/resume around refits.
     if isinstance(policy_generation, MegatronGeneration):
-        policy_generation.suspend_for_refit(recompute_kv_cache=recompute_kv_cache)
+        policy_generation.suspend_for_refit()
 
     if colocated_inference:
         policy.offload_before_refit()
     # Colocated inference needs to prepare for generation.
-    # Megatron non-colocated inference needs to prepare a different way:
-    # enter inference mode after refit.
+    # Megatron non-colocated inference needs to enter inference mode after refit.
     if colocated_inference or isinstance(policy_generation, MegatronGeneration):
         policy_generation.prepare_for_generation(tags=["weights"])
 
@@ -1267,7 +1281,7 @@ def refit_policy_generation(
         )
         == "nvshmem"
     ):
-        futures_train = policy.preinit_nvshmem_collective()
+        futures_train = policy._megatron_refit.preinit_nvshmem()
         futures_inference = policy_generation.preinit_nvshmem_collective()
         ray.get(futures_train + futures_inference)
 
@@ -1317,13 +1331,18 @@ def refit_policy_generation(
                 results = ray.get(futures_inference)
                 update_success = all(result for result in results if result is not None)
         else:
-            # update weights through nccl
+            # update weights through nccl (vLLM) or megatron reshard
             # SGLang haven't implemented non-colocated inference mode.
             if isinstance(policy_generation, SGLangGeneration):
                 raise NotImplementedError(
                     "SGLang haven't implemented non-colocated inference mode. "
                 )
-            futures_train = policy.broadcast_weights_for_collective(kv_scales=kv_scales)
+            if isinstance(policy_generation, MegatronGeneration):
+                futures_train = policy._megatron_refit.send_weights_via_reshard()
+            else:
+                futures_train = policy.broadcast_weights_for_collective(
+                    kv_scales=kv_scales
+                )
             futures_inference = policy_generation.update_weights_from_collective()
             # wait for all futures to complete
             ray.get(futures_train)
@@ -1343,13 +1362,12 @@ def refit_policy_generation(
     if colocated_inference:
         policy.offload_after_refit()
     # Colocated inference needs to prepare for generation.
-    # Megatron non-colocated inference needs to prepare a different way:
-    # enter inference mode after refit.
+    # Megatron non-colocated inference needs to enter inference mode after refit.
     if colocated_inference or isinstance(policy_generation, MegatronGeneration):
         policy_generation.prepare_for_generation(tags=["kv_cache"])
 
     if isinstance(policy_generation, MegatronGeneration):
-        policy_generation.resume_after_refit(recompute_kv_cache=recompute_kv_cache)
+        policy_generation.resume_after_refit()
 
 
 def _log_mixed_rewards_and_advantages_information(
@@ -2685,8 +2703,9 @@ def async_grpo_train(
     """
     # Ensure we are running with a compatible async generation backend
     assert _should_use_async_rollouts(master_config), (
-        "Async GRPO requires vLLM backend with vllm_cfg.async_engine=True. "
-        "Set policy.generation.vllm_cfg.async_engine to true in your config."
+        "Async GRPO requires an async generation engine. "
+        "Set either policy.generation.vllm_cfg.async_engine=true (vLLM) or "
+        "policy.generation.mcore_generation_config.async_engine=true (Megatron)."
     )
     assert master_config.loss_fn.use_importance_sampling_correction, (
         "Importance sampling correction must be enabled for async GRPO for good convergence due to off-policy samples!"
@@ -3194,12 +3213,6 @@ def async_grpo_train(
                             policy_generation.get_logger_metrics()
                         )
 
-                    recompute_kv_cache = (
-                        master_config.grpo
-                        .get("async_grpo", {})
-                        .get("recompute_kv_cache_after_weight_updates", False)
-                    )
-
                     # Only the actual refit/weight transfer should be counted as weight_sync
                     print("🔄 Performing policy generation refit...")
                     with timer.time("weight_sync"):
@@ -3207,7 +3220,6 @@ def async_grpo_train(
                             policy,
                             policy_generation,
                             colocated_inference,
-                            recompute_kv_cache=recompute_kv_cache,
                         )
                         POLICY_GENERATION_STALE = False
 

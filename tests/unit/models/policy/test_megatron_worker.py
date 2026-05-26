@@ -79,7 +79,6 @@ def create_megatron_test_config(
                 "block_size_tokens": 1024,
                 "use_cuda_graphs_for_non_decode_steps": True,
                 "enable_chunked_prefill": True,
-                "unified_memory_level": 0,
                 "max_tokens": 65536,
             },
             "colocated": {

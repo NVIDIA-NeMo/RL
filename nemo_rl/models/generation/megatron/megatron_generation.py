@@ -12,16 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MegatronGeneration: A GenerationInterface implementation for non-colocated
-Megatron-based inference.
-
-This module wraps a Policy object (configured for inference only, without
-optimizer or reference model) and exposes it through the GenerationInterface.
-It enables non-colocated inference where training and generation run on
-separate GPU clusters, with weights synchronized via Megatron's
-swap_model_weights resharding API.
-"""
-
 from typing import Any, Optional, AsyncGenerator
 
 import ray
@@ -38,17 +28,90 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.policy import PolicyConfig
 
 
+class MegatronRefitController:
+    """Controller-side fan-outs for megatron refit, scoped to one policy."""
+
+    def __init__(self, policy):
+        """Bind to a policy.
+
+        Args:
+            policy: Object exposing a Ray `worker_group` with `run_all_workers_single_data`.
+        """
+        self._policy = policy
+        self._dst_rank_offset: int = 0
+
+    def init_refit_collective(
+        self,
+        ip: str,
+        port: int,
+        world_size: int,
+        *,
+        rank_offset: int,
+        dst_rank_offset: int,
+        refit_backend: str = "gloo",
+    ) -> list[ray.ObjectRef]:
+        """Fan out refit-collective initialization across the policy's workers.
+
+        Args:
+            ip: IP for the process group rendezvous.
+            port: Port for the process group rendezvous.
+            world_size: Total world size (train + inference workers).
+            rank_offset: Offset for this side's ranks.
+            dst_rank_offset: Rank offset of the destination (inference) side.
+            refit_backend: `"gloo"` or `"nvshmem"`.
+
+        Returns:
+            Ray futures for the per-worker init calls.
+        """
+        self._dst_rank_offset = dst_rank_offset
+        return self._policy.worker_group.run_all_workers_single_data(
+            "init_refit_collective",
+            ip=ip,
+            port=port,
+            world_size=world_size,
+            rank_offset=rank_offset,
+            refit_backend=refit_backend,
+        )
+
+    def preinit_nvshmem(self) -> list[ray.ObjectRef]:
+        """Fan out NVSHMEM pre-initialization across the policy's workers."""
+        return self._policy.worker_group.run_all_workers_single_data(
+            "preinit_nvshmem_collective"
+        )
+
+    def send_weights_via_reshard(self) -> list[ray.ObjectRef]:
+        """Source side: stream weights from training workers to the inference cluster."""
+        return self._policy.worker_group.run_all_workers_single_data(
+            "swap_weights_via_reshard",
+            is_source=True,
+            dst_rank_offset=self._dst_rank_offset,
+        )
+
+    def receive_weights_via_reshard(self) -> list[ray.ObjectRef]:
+        """Destination side: receive weights from the training cluster."""
+        return self._policy.worker_group.run_all_workers_single_data(
+            "swap_weights_via_reshard",
+            is_source=False,
+            dst_rank_offset=self._dst_rank_offset,
+        )
+
+    def suspend_inference_for_refit(self) -> None:
+        """Pause + suspend the inference engine on all workers before a weight refit."""
+        futures = self._policy.worker_group.run_all_workers_single_data(
+            "suspend_for_refit"
+        )
+        ray.get(futures)
+
+    def resume_inference_after_refit(self) -> None:
+        """Resume + unpause the inference engine on all workers after a weight refit."""
+        futures = self._policy.worker_group.run_all_workers_single_data(
+            "resume_after_refit"
+        )
+        ray.get(futures)
+
+
 class MegatronGeneration(GenerationInterface):
-    """Generation interface backed by Megatron for non-colocated inference.
-
-    This class creates a Policy instance configured for inference only
-    (no optimizer, no reference model) on a dedicated inference cluster.
-    It implements the GenerationInterface so it can be used as a drop-in
-    replacement for VllmGeneration in the non-colocated inference flow.
-
-    Weight synchronization uses Megatron's swap_model_weights resharding API
-    with GlooCopyService or NVSHMEMCopyService for data transfer.
-    """
+    """Generation interface backed by Megatron for non-colocated inference."""
 
     def __init__(
         self,
@@ -73,8 +136,10 @@ class MegatronGeneration(GenerationInterface):
         from nemo_rl.models.policy.lm_policy import Policy
 
         self.cfg = config
+        # Populated from worker return values during prepare_for_generation.
+        self.dp_openai_server_base_urls: list[Optional[str]] = []
 
-        # We're in Generation, so we need to update the megatron_cfg with the mcore_generation_config parameters.
+        # Need to update the megatron_cfg with the mcore_generation_config parameters.
         self.cfg['megatron_cfg'].update(config['generation']['mcore_generation_config'])
 
         # Create a Policy object configured for inference only:
@@ -90,29 +155,16 @@ class MegatronGeneration(GenerationInterface):
             init_reference_model=False,
             weights_path=weights_path,
         )
+        self._refit = MegatronRefitController(self._policy)
 
         # Start the inference engine + HTTP server during construction.
         self.prepare_for_generation()
-
-    @property
-    def dp_openai_server_base_urls(self) -> list[Optional[str]]:
-        return self._policy.report_dp_openai_server_base_urls()
 
     def init_collective(
         self, ip: str, port: int, world_size: int, *, train_world_size: int,
         refit_backend: str = "gloo",
     ) -> list[ray.ObjectRef]:
         """Initialize the refit collective for weight synchronization.
-
-        Creates a Gloo-backed ProcessGroup spanning training and
-        inference workers so that updated model weights can be transferred
-        from the training cluster to the inference cluster using Megatron's
-        resharding API.
-
-        Uses init_refit_collective on workers with rank_offset set to
-        train_world_size, so inference workers get globally unique ranks
-        (rank = train_world_size + worker_rank) that don't collide with
-        training workers' ranks.
 
         Args:
             ip: IP address for the process group rendezvous.
@@ -124,40 +176,31 @@ class MegatronGeneration(GenerationInterface):
         Returns:
             List of Ray ObjectRefs for the collective init futures.
         """
-        self._train_world_size = train_world_size
-        futures = self._policy.worker_group.run_all_workers_single_data(
-            "init_refit_collective",
-            ip=ip,
-            port=port,
-            world_size=world_size,
+        return self._refit.init_refit_collective(
+            ip,
+            port,
+            world_size,
             rank_offset=train_world_size,
+            dst_rank_offset=train_world_size,
             refit_backend=refit_backend,
         )
-        return futures
 
     def update_weights_from_collective(self) -> list[ray.ObjectRef]:
         """Receive updated weights from the training cluster via collective communication.
 
-        Uses Megatron's swap_model_weights resharding API with PyNcclCommunicator.
-        Each inference worker calls swap_weights_via_reshard(is_source=False) which
-        receives weights from training workers via the refit collective.
-
         Returns:
             List of Ray ObjectRefs for the weight update futures.
         """
-        futures = self._policy.worker_group.run_all_workers_single_data(
-            "swap_weights_via_reshard",
-            is_source=False,
-            dst_rank_offset=self._train_world_size,
-        )
-        return futures
+        return self._refit.receive_weights_via_reshard()
 
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
         """Generate a batch of data using the Megatron generation backend.
 
-        Delegates to the internal Policy's generate method.
+        mcore's data-parallel coordinator only accepts requests from DP rank 0 —
+        the other workers' engine loops drain the coordinator queue but never
+        receive a Python-side call. So we dispatch straight to worker 0.
 
         Args:
             data: BatchedDataDict containing input_ids and input_lengths.
@@ -166,13 +209,26 @@ class MegatronGeneration(GenerationInterface):
         Returns:
             BatchedDataDict conforming to GenerationOutputSpec.
         """
-        return self._policy.generate(data, greedy=greedy)
+        future = self._policy.worker_group.run_single_worker_single_data(
+            method_name="generate",
+            worker_idx=0,
+            data=data,
+            greedy=greedy,
+        )
+        return ray.get(future)
 
     async def generate_async(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
-        async for result in self._policy.generate_async(data, greedy=greedy):
-            yield result
+        """Generate asynchronously, yielding `(index, batch)` tuples as they complete."""
+        worker = self._policy.worker_group.workers[0]
+        futures = worker.generate_async.options(num_returns="streaming").remote(
+            data=data, greedy=greedy
+        )
+        async for result_ref in futures:
+            index, result_batch = await result_ref
+            result_batch["gen_leader_worker_idx"] = [0]
+            yield index, result_batch
 
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Initialize / re-enter inference mode on every worker.
@@ -183,54 +239,39 @@ class MegatronGeneration(GenerationInterface):
         futures = self._policy.worker_group.run_all_workers_single_data(
             "prepare_for_generation", **kwargs
         )
-        ray.get(futures)
+        results = ray.get(futures)
+        self.dp_openai_server_base_urls = [url for url in results if url is not None]
         return True
 
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
-        """Clean up after generation.
-
-        For Megatron generation, this is a no-op.
-        """
-        return self._policy.finish_generation(*args, **kwargs)
+        """Clean up after generation: sleep the engine, toggle off CUDA graphs,
+        clear rotary caches. Fans out to every worker's mixin method."""
+        futures = self._policy.worker_group.run_all_workers_single_data(
+            "finish_generation"
+        )
+        ray.get(futures)
+        return True
 
     def preinit_nvshmem_collective(self) -> list[ray.ObjectRef]:
         """Pre-initialize NVShmem collectively after CUDA graph capture.
 
-        Must be called simultaneously on both training and inference workers
-        (both sides call it at the same time so NVShmem collective barriers
-        inside init() are satisfied).  No-op for non-NVShmem backends.
+        Must be called simultaneously on both training and inference workers.
         """
-        return self._policy.preinit_nvshmem_collective()
+        return self._refit.preinit_nvshmem()
 
-    def suspend_for_refit(self, recompute_kv_cache: bool = False) -> None:
-        """Suspend the inference engine for safe weight updates.
+    def suspend_for_refit(self) -> None:
+        """Suspend the inference engine for safe weight updates."""
+        self._refit.suspend_inference_for_refit()
 
-        Args:
-            recompute_kv_cache: If True, fully suspends the engine to
-                invalidate KV cache (AREAL-style). If False, pauses between
-                decode iterations preserving KV cache (Magistral-style).
-        """
-        return self._policy.suspend_for_refit(recompute_kv_cache=recompute_kv_cache)
-
-    def resume_after_refit(self, recompute_kv_cache: bool = False) -> None:
-        """Resume the inference engine after weight updates.
-
-        Args:
-            recompute_kv_cache: Must match the value passed to suspend_for_refit.
-                If True, performs a full resume reallocating KV cache.
-        """
-        return self._policy.resume_after_refit(recompute_kv_cache=recompute_kv_cache)
+    def resume_after_refit(self) -> None:
+        """Resume the inference engine after weight updates."""
+        self._refit.resume_inference_after_refit()
 
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Prepare state dict metadata for weight refitting.
 
-        Calls prepare_refit_info on the workers with the state_dict_info
-        argument, which triggers the inference-side storage path (as opposed
-        to the training-side calculation path when called without arguments).
-
         Args:
-            state_dict_info: Dictionary mapping tensor names to (shape, dtype) tuples,
-                as returned by the training-side prepare_refit_info().
+            state_dict_info: Dictionary mapping tensor names to (shape, dtype) tuples.
         """
         futures = self._policy.worker_group.run_all_workers_single_data(
             "prepare_refit_info",

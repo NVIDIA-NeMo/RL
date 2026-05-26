@@ -12,8 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from nemo_rl.models.generation.megatron.config import (
+    MCoreGenerationConfig,
+    MegatronGenerationConfig,
+)
 from nemo_rl.models.generation.megatron.megatron_generation import (
     MegatronGeneration,
 )
 
-__all__ = ["MegatronGeneration"]
+__all__ = [
+    "MCoreGenerationConfig",
+    "MegatronGeneration",
+    "MegatronGenerationConfig",
+]

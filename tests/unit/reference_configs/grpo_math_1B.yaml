@@ -71,7 +71,6 @@ loss_fn:
   token_level_loss: true
   force_on_policy_ratio: false  # Set to true to force ratio=1.0 (requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt)
   use_kl_in_reward: false  # Reinforce++: add KL penalty to reward instead of loss
-  disable_ppo_ratio: false
 
 checkpointing:
   enabled: true
@@ -90,7 +89,7 @@ policy:
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
     chat_template_kwargs: null # can be used to pass kwargs to the chat template, e.g., enable_thinking=true
-  hf_config_overrides: {} 
+  hf_config_overrides: {}
   train_global_batch_size: 512
   train_micro_batch_size: 4
   generation_batch_size: 32 # Only used when generating using HF backend
@@ -129,7 +128,7 @@ policy:
       dropout_position: "post"  # Where to apply dropout: "pre" (before LoRA) or "post" (after LoRA)
       lora_A_init: "xavier"  # Initialization method for LoRA A matrix: "xavier" or "uniform"
       use_triton: true  # Use Triton-optimized kernels for LoRA (faster but requires flash-attn). Disable when tensor_parallel_size > 1
-  
+
   megatron_cfg:
     enabled: false
     force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
@@ -219,7 +218,7 @@ policy:
       use_custom_fsdp: false
       data_parallel_sharding_strategy: "optim_grads_params"
 
-    fp8_cfg: 
+    fp8_cfg:
       enabled: false
       fp8: "e4m3"
       fp8_recipe: "blockwise"
@@ -234,7 +233,7 @@ policy:
     num_layers: null
     aux_layer_indices: null
 
-  # See docs/design-docs/sequence-packing-and-dynamic-batching.md 
+  # See docs/design-docs/sequence-packing-and-dynamic-batching.md
   # for more details on dynamic batching and sequence packing.
   dynamic_batching:
     enabled: False
@@ -287,13 +286,19 @@ policy:
     stop_token_ids: null
     stop_strings: null
     mcore_generation_config:
-      buffer_size_gb: 10  # Total buffer size is 2x this value (active requests + paused requests)
+      cuda_graph_impl: "local"  # CUDA-graph implementation. Options: "none", "local", "transformer_engine", "full_iteration".
+      cuda_graph_scope: "full_iteration_inference"  # CUDA-graph scope. Inference workers can override the training value.
+      buffer_size_gb: 10
       num_cuda_graphs: 4  # Number of CUDA graphs to pre-compile for different batch sizes
       block_size_tokens: 256  # Size of each KV cache block in tokens (affects memory granularity)
       use_cuda_graphs_for_non_decode_steps: true  # Enable CUDA graphs for prefill/context processing
       enable_chunked_prefill: true  # Split long prefills into chunks for better memory management
-      unified_memory_level: 0  # Unified memory usage level (0=disabled, higher values enable more aggressive paging)
       max_tokens: 16384 # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens
+      kv_cache_management_mode: "persist"  # KV cache lifecycle across suspend/resume. Options: "persist", "offload". To select "recompute", set grpo.async_grpo.recompute_kv_cache_after_weight_updates=true.
+      materialize_only_last_token_logits: true  # Materialize logits only for the last token of each sequence during decode.
+      num_speculative_tokens: 0
+      use_flashinfer_sampling: true  # Use FlashInfer kernels for top-k/top-p sampling.
+      refit_backend: "nvshmem"  # Copy-service backend for non-colocated megatron weight refit. Options: "gloo" or "nvshmem".
     vllm_cfg:
       async_engine: false
       precision: ${policy.precision}

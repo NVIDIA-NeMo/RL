@@ -324,9 +324,9 @@ class AsyncTrajectoryCollector:
     def prepare_for_refit(self) -> None:
         """Pause new generation starts and optionally wait for pending generations.
 
-        For vLLM V1 async engine, leverages in-flight weight updates via collective_rpc,
-        allowing ongoing generations to continue with their current KV caches while
-        weights are updated. This significantly improves async performance.
+        For backends with an async engine in-flight weight updates allows ongoing generations
+        to continue with their current KV caches while weights are updated.
+        This significantly improves async performance.
 
         For non-async engines, waits for all pending generations to complete before refit.
         """
@@ -337,19 +337,29 @@ class AsyncTrajectoryCollector:
         self._refit_pause_cleared.clear()
         print("⏸️ New generation starts paused")
 
-        # Check if we're using vLLM async engine
-        vllm_cfg = self.master_config.policy.get("generation", {}).get("vllm_cfg", {})
-        is_async_engine = vllm_cfg.get("async_engine", False)
+        # Check if we're using async engine
+        generation_cfg = self.master_config.policy.get("generation", {})
+        backend = generation_cfg.get("backend", "")
+        if backend == "vllm":
+            is_async_engine = generation_cfg.get("vllm_cfg", {}).get(
+                "async_engine", False
+            )
+        elif backend == "megatron":
+            is_async_engine = generation_cfg.get(
+                "mcore_generation_config", {}
+            ).get("async_engine", False)
+        else:
+            is_async_engine = False
         in_flight_weight_updates = self.master_config.grpo.get("async_grpo", {}).get(
             "in_flight_weight_updates", False
         )
 
         if is_async_engine and in_flight_weight_updates:
-            # vLLM V1 async engine supports in-flight weight updates
+            # async engines support in-flight weight updates
             # Ongoing generations will continue with their current KV caches
             # New generations (after weight update) will use the updated weights
             print(
-                "🚀 Using vLLM V1 in-flight weight update - skipping wait for pending generations"
+                f"🚀 Using {backend} in-flight weight update - skipping wait for pending generations"
             )
             print(
                 f"   {len(self._inflight_threads)} ongoing generations will complete with current weights"
