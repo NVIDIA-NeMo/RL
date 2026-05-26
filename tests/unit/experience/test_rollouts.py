@@ -975,60 +975,6 @@ def test_run_async_nemo_gym_rollout(
     """
 
 
-@pytest.fixture(scope="function")
-def single_multi_step_calculator_input_sample(rollout_tokenizer):
-    """Returns a single DatumSpec prompt dict (problem 0) for _by_prompt tests."""
-    problem_text = "(5 + 3) * 2"
-    expected_answer = 16.0
-    max_steps = 5
-
-    tool_instructions = (
-        "You have a calculator tool. To use it, respond with:\n"
-        "'[operand1, operand2, operation_name]<call: calculator>'\n"
-        "The valid 'operation_name' values are exactly: 'sum', 'diff', 'prod', 'div'.\n"
-        "Example: [5, 3, sum]<call: calculator>\n"
-        "You will receive the result of your calculation as <result>...</result>\n"
-        "Use this result to make the next calculation if needed.\n"
-        "IMPORTANT: Only perform one calculation step (one tool call) before waiting for a result and making a new tool call.\n"
-        "IMPORTANT: Do not perform any other calculations or operations aside from the tool call and result. Doing so will result in failure.\n"
-        "To give the final answer, just output the number. numbers inside of <result> don't count, so output just the final number yourself outside of this.\n"
-        "Example full output: [2, 4, sum]<call: calculator>\n<result>6.0</result>\n[6, 6, diff]<call: calculator>\n<result>0.0</result> 0\n(note how you have to output the final 0 outside of the tags)"
-        "------\n"
-        f"Solve: {problem_text}"
-    )
-
-    initial_prompt_content = rollout_tokenizer.apply_chat_template(
-        [{"role": "user", "content": tool_instructions}],
-        tokenize=False,
-        add_system_prompt=False,
-        add_generation_prompt=True,
-        add_special_tokens=False,
-    )
-    tokenized_prompt = rollout_tokenizer(
-        initial_prompt_content, return_tensors="pt", add_special_tokens=False
-    )["input_ids"][0]
-    message_log = [
-        {
-            "role": "user",
-            "content": initial_prompt_content,
-            "token_ids": tokenized_prompt,
-        }
-    ]
-    metadata = MultiStepCalcMetadata(
-        problem=problem_text,
-        expected_final_answer=expected_answer,
-        max_steps=max_steps,
-        current_step=0,
-    )
-    return {
-        "message_log": message_log,
-        "extra_env_info": metadata,
-        "task_name": "multi_step_calculator_game",
-        "stop_strings": ["<call: calculator>"],
-        "idx": 0,
-    }
-
-
 # ---------------------------------------------------------------------------
 # Tests for AsyncNemoGymRolloutManager
 # ---------------------------------------------------------------------------
