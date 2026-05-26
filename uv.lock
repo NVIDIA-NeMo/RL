@@ -982,7 +982,7 @@ name = "cuda-bindings"
 version = "13.0.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cuda-pathfinder", marker = "sys_platform != 'darwin' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore')" },
+    { name = "cuda-pathfinder" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/2f/36/41ccc303eb6be8ae82c5edd2ccae938876e8a794660e8bb96a193174a978/cuda_bindings-13.0.3-cp313-cp313-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:fb16a7f769c9c67469add7a1d9f6c14dd44637f6921cb6b9eb82cb5015b35c3d", size = 11537064, upload-time = "2025-10-21T15:09:07.84Z" },
@@ -3401,6 +3401,29 @@ wheels = [
 ]
 
 [[package]]
+name = "mpi4py"
+version = "4.1.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/75/83/231445bbcf7ef10864746c244ff2d82000011449b79275642c5d4ed8c8f4/mpi4py-4.1.2.tar.gz", hash = "sha256:56860286dc45f20e8821e93cb06669e30462348bf866f685553fa4b712d58d02", size = 501709, upload-time = "2026-05-16T10:35:23.618Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/bf/7e/1524baa98c3b4e3ddc030ec2ad5f6e5a362930317ed3e561d6da1c2e97b1/mpi4py-4.1.2-cp310-abi3-macosx_10_9_x86_64.whl", hash = "sha256:ceb3b6e6f27ba7a39f7721583c04514013b860b829e721769e77398dee97bfa3", size = 1411317, upload-time = "2026-05-16T10:33:56.706Z" },
+    { url = "https://files.pythonhosted.org/packages/2f/73/5918e062a65f40e3bd82a2dccf0c8ba22a284d327ccda46d84d2717985cc/mpi4py-4.1.2-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:251e8880f4cb98e9c8f63c6f6b2c7e819e22b5e4949d47767a0092eed6f814c2", size = 1304635, upload-time = "2026-05-16T10:33:58.685Z" },
+    { url = "https://files.pythonhosted.org/packages/a3/0a/1da7f403e0d8ce0e26d541f7538302cec00cf5b0a98a7a52b929f938a25c/mpi4py-4.1.2-cp310-abi3-manylinux1_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:2ef63b2e3083e6062fd90e4de8c4e3acbf81e0772406e0226eb8dde6a48cab8e", size = 1327130, upload-time = "2026-05-16T10:34:00.269Z" },
+    { url = "https://files.pythonhosted.org/packages/e6/f9/65999152ae82bad914c6a083821ee774afefd6d0544e633b940c9a9ebf3f/mpi4py-4.1.2-cp310-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:6508e654b9c8ff9f611b19548b2a17d1e323b520a15168189f92221e6757b8ff", size = 1182268, upload-time = "2026-05-16T10:34:02.206Z" },
+    { url = "https://files.pythonhosted.org/packages/66/8f/90de8d5e0676f86f7866fd4665193252ea17764a54800d9545c7b53ac00a/mpi4py-4.1.2-cp310-abi3-win_amd64.whl", hash = "sha256:eb69f6273ad155f191850a593deebdf52aed6722979ba0693e02db5663e59699", size = 1466751, upload-time = "2026-05-16T10:34:04.278Z" },
+    { url = "https://files.pythonhosted.org/packages/35/15/324cfa61674b8f73aa3347590df937232d898a993f3348121f9003f43b16/mpi4py-4.1.2-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:632a94e355cf1960eaae2b668d88399f53680207f5a4777e15fdaf7d96c72d09", size = 1660517, upload-time = "2026-05-16T10:34:33.836Z" },
+    { url = "https://files.pythonhosted.org/packages/00/ec/b670c9250b59ed255571e679f1e0ae7bd4e08c67f2f7f7f11a928b4becd7/mpi4py-4.1.2-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:0aedf3e6c937b48d244e7c6bb72d0b068a1b1adf99ec6001bc9c7e381c581806", size = 1426478, upload-time = "2026-05-16T10:34:35.342Z" },
+    { url = "https://files.pythonhosted.org/packages/0d/5e/493415cdb0da0c1c0b6ec9a1fb65ab57a174e8111b25c87f7507f663d0b4/mpi4py-4.1.2-cp313-cp313-manylinux1_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:085e0cb05427398fe2281856f27a87984b9f234cd6d98a2a384a6fbfe679a56f", size = 1358571, upload-time = "2026-05-16T10:34:37.478Z" },
+    { url = "https://files.pythonhosted.org/packages/6f/51/3822e834fc9cafd96811501b85232e02bd9b31596d42965536a269a6c112/mpi4py-4.1.2-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:429437883b4511583d56a57bc58ad0d02965fb6c19f84f39e30c0646e6c0cab9", size = 1226562, upload-time = "2026-05-16T10:34:39.652Z" },
+    { url = "https://files.pythonhosted.org/packages/72/27/919831e5c843890b1a5b475ca1a8d83d8eb3453c1fe66f6bbdaca35ee548/mpi4py-4.1.2-cp313-cp313-win_amd64.whl", hash = "sha256:f984aa35d61fd95c7aa49829f94c3d61bb9ec2272bd8e404ae8d1ea84b620b58", size = 1703612, upload-time = "2026-05-16T10:34:41.133Z" },
+    { url = "https://files.pythonhosted.org/packages/ef/ee/3c1128b5c393a8a2abeb9db6cc2aba2d3d604fee20d0fa99c02ba5aab5c6/mpi4py-4.1.2-cp313-cp313t-macosx_10_13_x86_64.whl", hash = "sha256:16ae4d0fac11e60056ec7c46ce101f70f4941634ad8165c54a24304820a816b0", size = 1740466, upload-time = "2026-05-16T10:34:42.566Z" },
+    { url = "https://files.pythonhosted.org/packages/17/ed/7a163be7da48ace29ab4c54407e7f2e510953df14dea90e122f9ca7310c7/mpi4py-4.1.2-cp313-cp313t-macosx_11_0_arm64.whl", hash = "sha256:364da611dda94e8a26e418ccfc4c8ff2a1492e74f4c28b24df09521fe888de3b", size = 1518426, upload-time = "2026-05-16T10:34:44.081Z" },
+    { url = "https://files.pythonhosted.org/packages/ec/5e/d358fadb8672d58abd6dce16c95eda56f497b378dec5642a31cd6ededfc4/mpi4py-4.1.2-cp313-cp313t-manylinux1_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:85e332feaac3323d8ed1c71f17478fe3f529468f28f6f9bb4c9133ad2d3a3a6d", size = 1419007, upload-time = "2026-05-16T10:34:45.47Z" },
+    { url = "https://files.pythonhosted.org/packages/27/eb/5cd53880337009cab9a9d17a007ad5aec731f3a55e211bdcc99dbb98a0e3/mpi4py-4.1.2-cp313-cp313t-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:3e05dba75f6ad17ae761bdc01ee5c5271d15cd296e8a508e22c99c91b540dc99", size = 1298482, upload-time = "2026-05-16T10:34:46.858Z" },
+    { url = "https://files.pythonhosted.org/packages/13/d9/eb35b0e8328a02c4d6288bf2bcd156b387f08ff6146a5c8f3f2abd75a078/mpi4py-4.1.2-cp313-cp313t-win_amd64.whl", hash = "sha256:2d0a131a255f61a2d313623f91b496c345abd5976147f866b39383264f275449", size = 1835283, upload-time = "2026-05-16T10:34:48.899Z" },
+]
+
+[[package]]
 name = "mpmath"
 version = "1.3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3913,6 +3936,10 @@ sglang = [
     { name = "sglang" },
     { name = "sglang-kernel" },
 ]
+trtllm = [
+    { name = "mpi4py" },
+    { name = "nvidia-cutlass-dsl-libs-base" },
+]
 vllm = [
     { name = "cuda-python" },
     { name = "deep-ep", version = "1.2.1+bfded34", source = { git = "https://github.com/deepseek-ai/DeepEP.git?rev=a48493600c4886c1b297aaa78db0e1ebc2d8dd6c#a48493600c4886c1b297aaa78db0e1ebc2d8dd6c" }, marker = "(platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (platform_machine == 'aarch64' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
@@ -4006,6 +4033,7 @@ requires-dist = [
     { name = "megatron-core", marker = "extra == 'mcore'", editable = "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM" },
     { name = "mlflow", specifier = ">=3.11.1" },
     { name = "mooncake-transfer-engine-cuda13", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", specifier = "==0.3.10.post2" },
+    { name = "mpi4py", marker = "extra == 'trtllm'" },
     { name = "nccl4py", marker = "sys_platform != 'darwin'" },
     { name = "nemo-automodel", extras = ["moe"], marker = "extra == 'automodel'", editable = "3rdparty/Automodel-workspace/Automodel" },
     { name = "nemo-gym", marker = "extra == 'nemo-gym'", editable = "3rdparty/Gym-workspace/Gym" },
@@ -4016,6 +4044,7 @@ requires-dist = [
     { name = "nv-grouped-gemm", marker = "extra == 'automodel'", git = "https://github.com/fanshiqing/grouped_gemm?tag=v1.1.4.post7" },
     { name = "nvidia-cudnn-cu13", marker = "sys_platform != 'darwin'", specifier = "==9.20.0.48" },
     { name = "nvidia-cutlass-dsl", marker = "extra == 'vllm'", specifier = ">=4.4.0.dev1" },
+    { name = "nvidia-cutlass-dsl-libs-base", marker = "extra == 'trtllm'", specifier = "==4.5.0" },
     { name = "nvidia-ml-py" },
     { name = "nvidia-modelopt", marker = "extra == 'modelopt'", git = "https://github.com/NVIDIA/Model-Optimizer?rev=905018803414702e414a86716484ed4115b37ba6" },
     { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin' and extra == 'mcore'", git = "https://github.com/NVIDIA/Model-Optimizer?rev=905018803414702e414a86716484ed4115b37ba6" },
@@ -4057,7 +4086,7 @@ requires-dist = [
     { name = "vllm", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'vllm') or (sys_platform != 'linux' and extra == 'vllm')", specifier = "==0.20.0" },
     { name = "wandb", specifier = ">=0.25.1" },
 ]
-provides-extras = ["fsdp", "automodel", "vllm", "sglang", "mcore", "modelopt", "nvrx", "nemo-gym"]
+provides-extras = ["fsdp", "automodel", "vllm", "sglang", "trtllm", "mcore", "modelopt", "nvrx", "nemo-gym"]
 
 [package.metadata.requires-dev]
 build = [

@@ -146,6 +146,14 @@ sglang = [
   "sglang",
   "sglang-kernel", # Must be a direct dep so [tool.uv.sources] VCS override applies (transitive deps don't use sources)
 ]
+trtllm = [
+  # NOTE: tensorrt-llm itself is built from source in docker/Dockerfile because
+  # there is no cp313/cu13/aarch64 wheel on PyPI for v1.3.0rc15. This extra
+  # only declares the runtime deps trtllm needs at import time so that
+  # `uv sync --extra trtllm` warms the cache before the from-source build.
+  "mpi4py",
+  "nvidia-cutlass-dsl-libs-base==4.5.0",
+]
 mcore = [
   # also need cudnn (https://developer.nvidia.com/cudnn-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=deb_network)
   # wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-keyring_1.1-1_all.deb
