@@ -425,63 +425,11 @@ class BaseVllmGenerationWorker:
 
             logger.info("Successfully patched hermes tool parser for thread-safety.")
 
-        def _patch_vllm_mamba_prefill_decode_sync():
-            """Fence Mamba prefill state writes before same-step decode reads.
-
-            On NemotronH_Nano_VL_V2 + vLLM 0.20 we observed an async CUDA
-            fault that is avoided by synchronizing after Mamba2 prefill SSM
-            state writeback and before decode consumes those states. This is a
-            narrow workaround for that handoff, unlike CUDA_LAUNCH_BLOCKING.
-            """
-            enabled = os.environ.get("NRL_MAMBA_PREFILL_DECODE_SYNC", "1")
-            if enabled.lower() not in ("1", "true", "yes", "on"):
-                return
-
-            file_to_patch = _get_vllm_file(
-                "model_executor/layers/mamba/mamba_mixer2.py"
-            )
-
-            with open(file_to_patch, "r") as f:
-                content = f.read()
-
-            if "NRL_MAMBA_PREFILL_DECODE_SYNC" in content:
-                logger.info("Mamba prefill/decode sync patch already applied.")
-                return
-
-            decode_branch = (
-                "        # Process decode requests\n        if has_decode:\n"
-            )
-
-            sync_snippet = (
-                "        if has_prefill and has_decode:\n"
-                "            # NRL_MAMBA_PREFILL_DECODE_SYNC: local fence for the\n"
-                "            # prefill SSM state writeback -> decode state read handoff.\n"
-                "            torch.cuda.synchronize()\n"
-                "\n"
-            )
-
-            if decode_branch not in content:
-                logger.warning(
-                    "Could not apply Mamba prefill/decode sync patch: "
-                    "decode branch marker not found in %s. "
-                    "The vLLM version may have changed.",
-                    file_to_patch,
-                )
-                return
-
-            content = content.replace(decode_branch, sync_snippet + decode_branch, 1)
-
-            with open(file_to_patch, "w") as f:
-                f.write(content)
-
-            logger.info("Successfully patched Mamba prefill/decode local sync.")
-
         _patch_vllm_init_workers_ray()
         logger.info("Successfully patched vllm _init_workers_ray.")
 
         _patch_vllm_llama_eagle3_own_lm_head()
         _patch_vllm_hermes_tool_parser_thread_safety()
-        _patch_vllm_mamba_prefill_decode_sync()
 
         try:
             import vllm
