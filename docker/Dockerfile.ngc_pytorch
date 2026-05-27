@@ -134,6 +134,7 @@ ENV NVIDIA_BUILD_REF=${NVIDIA_BUILD_REF:-<unknown>}
 ENV NEMO_RL_PY_EXECUTABLES_SYSTEM=1
 # The 25.06 Pytorch container is not compatible with vllm standalone compile so we disable it
 ENV VLLM_USE_STANDALONE_COMPILE=0
+ENV VLLM_USE_FLASHINFER_MOE_FP16=0
 LABEL com.nvidia.build.id="${NVIDIA_BUILD_ID}"
 LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
 
