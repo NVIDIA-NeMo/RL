@@ -54,6 +54,20 @@ def test_sync_rollout_actor_registered_under_vllm_tier() -> None:
     )
 
 
+def test_distillation_rollout_actor_registered_under_vllm_tier() -> None:
+    """Distillation TQ runs need the same env tier as sync rollout actors."""
+    from nemo_rl.distributed.ray_actor_environment_registry import (
+        get_actor_python_env,
+    )
+    from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
+
+    fqn = "nemo_rl.experience.distillation_rollout_actor.DistillationRolloutActor"
+    env = get_actor_python_env(fqn)
+    assert env in (PY_EXECUTABLES.VLLM, PY_EXECUTABLES.SYSTEM), (
+        f"unexpected env tier for {fqn}: {env!r}"
+    )
+
+
 def test_kvbatchmeta_schema_unchanged() -> None:
     """Schema break check — KVBatchMeta is the cross-process boundary;
     adding/removing a field silently would break adapters that pickle it."""

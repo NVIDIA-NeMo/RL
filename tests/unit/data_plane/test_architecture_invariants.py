@@ -48,6 +48,25 @@ def test_run_grpo_dispatches_both_trainers():
     assert _select_trainer(cfg_sync) is grpo_train_sync
 
 
+def test_run_distillation_dispatches_both_trainers():
+    """``examples/run_distillation._select_trainer`` mirrors GRPO dispatch."""
+    import sys
+
+    sys.path.insert(0, str(REPO / "examples"))
+    try:
+        from run_distillation import _select_trainer
+    finally:
+        sys.path.pop(0)
+    from nemo_rl.algorithms.distillation import MasterConfig, distillation_train
+    from nemo_rl.algorithms.distillation_sync import distillation_train_sync
+
+    cfg_legacy = MasterConfig.model_construct(data_plane=None)
+    assert _select_trainer(cfg_legacy) is distillation_train
+
+    cfg_sync = MasterConfig.model_construct(data_plane={"enabled": True})
+    assert _select_trainer(cfg_sync) is distillation_train_sync
+
+
 @pytest.mark.parametrize(
     "method",
     [
