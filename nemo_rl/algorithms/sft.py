@@ -14,6 +14,7 @@
 import os
 import warnings
 from pathlib import Path
+from collections.abc import Callable
 from typing import NotRequired, Optional, TypedDict, cast
 
 import numpy as np
@@ -21,6 +22,7 @@ import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
+from nemo_rl.algorithms.interfaces import LossFunction
 from nemo_rl.algorithms.loss_functions import (
     NLLLoss,
 )
@@ -98,6 +100,9 @@ def setup(
     tokenizer: AutoTokenizer,
     train_dataset: AllTaskProcessedDataset,
     val_dataset: Optional[AllTaskProcessedDataset],
+    loss_fn_factory: Optional[Callable[[MasterConfig], LossFunction]] = None,
+    train_dataloader_override: Optional[StatefulDataLoader] = None,
+    val_dataloader_override: Optional[StatefulDataLoader] = None,
 ) -> tuple[
     Policy,
     RayVirtualCluster,
@@ -141,14 +146,17 @@ def setup(
     # ==========================
     #           Data
     # ==========================
-    train_dataloader = StatefulDataLoader(
-        train_dataset,
-        batch_size=policy_config["train_global_batch_size"],
-        shuffle=data_config["shuffle"],
-        collate_fn=rl_collate_fn,
-        drop_last=True,
-        num_workers=data_config["num_workers"],
-    )
+    if train_dataloader_override is not None:
+        train_dataloader = train_dataloader_override
+    else:
+        train_dataloader = StatefulDataLoader(
+            train_dataset,
+            batch_size=policy_config["train_global_batch_size"],
+            shuffle=data_config["shuffle"],
+            collate_fn=rl_collate_fn,
+            drop_last=True,
+            num_workers=data_config["num_workers"],
+        )
 
     if last_checkpoint_path is not None:
         dataloader_state_dict = torch.load(
@@ -156,7 +164,9 @@ def setup(
         )
         train_dataloader.load_state_dict(dataloader_state_dict)
 
-    if val_dataset is not None:
+    if val_dataloader_override is not None:
+        val_dataloader = val_dataloader_override
+    elif val_dataset is not None:
         val_dataloader = StatefulDataLoader(
             val_dataset,
             batch_size=sft_config["val_global_batch_size"],
@@ -218,7 +228,10 @@ def setup(
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
-    loss_fn = NLLLoss()
+    if loss_fn_factory is not None:
+        loss_fn = loss_fn_factory(master_config)
+    else:
+        loss_fn = NLLLoss()
     print("  ✓ Model initialized")
 
     print("\n" + "=" * 60)
@@ -369,6 +382,7 @@ def sft_train(
     logger,
     checkpointer,
     sft_save_state: SFTSaveState,
+    on_checkpoint_save: Optional[Callable[[str, int, MasterConfig], None]] = None,
 ) -> None:
     # Run basic sft training
     timer = Timer()
@@ -461,6 +475,20 @@ def sft_train(
                     train_data.update(
                         cat_and_padded.get_multimodal_dict(as_tensors=False)
                     )
+                    # Forward any extra batch keys (e.g. multi-LoRA `adapter_names`)
+                    # so custom loss functions / worker patches can read them
+                    # without forking the train loop.
+                    _reserved_keys = {
+                        "input_ids",
+                        "input_lengths",
+                        "token_mask",
+                        "sample_mask",
+                        "message_log",
+                        "loss_multiplier",
+                    }
+                    for _k, _v in batch.items():
+                        if _k not in _reserved_keys and _k not in train_data:
+                            train_data[_k] = _v
 
                 print("▶ Taking a training step...")
                 with timer.time("policy_training"):
@@ -588,6 +616,14 @@ def sft_train(
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
                         )
                         checkpointer.finalize_checkpoint(checkpoint_path)
+
+                        # Optional post-save hook for callers that need to write
+                        # additional artifacts alongside the checkpoint (e.g.
+                        # multi-LoRA splits each adapter into its own HF dir).
+                        if on_checkpoint_save is not None:
+                            on_checkpoint_save(
+                                checkpoint_path, total_steps + 1, master_config
+                            )
 
             timing_metrics = timer.get_timing_metrics(reduction_op="sum")
 
