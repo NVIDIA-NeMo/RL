@@ -1047,15 +1047,11 @@ class SDPOLossFn(LossFunction):
         self.mixed_kl_weight: float = cfg.get("mixed_kl_weight", 0.5)
         self.zero_outside_topk: bool = cfg.get("zero_outside_topk", True)
         self.log_infinitesimal: float = -100.0
-        self.reference_policy_kl_penalty: float = cfg.get(
-            "reference_policy_kl_penalty", 0.0
-        )
+        self.reference_policy_kl_penalty: float = cfg.get("reference_policy_kl_penalty", 0.0)
         self.reference_policy_kl_type: str = cfg.get("reference_policy_kl_type", "k3")
 
         if self.kl_type not in {"forward", "reverse", "mixed", "js"}:
-            raise ValueError(
-                f"SDPOLossFn: kl_type must be one of forward/reverse/mixed/js, got {self.kl_type}"
-            )
+            raise ValueError(f"SDPOLossFn: kl_type must be one of forward/reverse/mixed/js, got {self.kl_type}")
         if not 0.0 <= self.mixed_kl_weight <= 1.0:
             raise ValueError(f"SDPOLossFn: mixed_kl_weight must be in [0, 1], got {self.mixed_kl_weight}")
         if self.reference_policy_kl_penalty < 0.0:
@@ -1102,9 +1098,8 @@ class SDPOLossFn(LossFunction):
             # this is the recommended SDPO loss for stability.
             m_probs = 0.5 * (student_probs + teacher_probs)
             log_m = m_probs.clamp_min(1e-12).log()
-            per_token_kl = (
-                0.5 * student_probs * (student_topk_logprobs - log_m)
-                + 0.5 * teacher_probs * (teacher_topk_logprobs - log_m)
+            per_token_kl = 0.5 * student_probs * (student_topk_logprobs - log_m) + 0.5 * teacher_probs * (
+                teacher_topk_logprobs - log_m
             )
         else:
             kl_forward = teacher_probs * (teacher_topk_logprobs - student_topk_logprobs)
@@ -1139,11 +1134,7 @@ class SDPOLossFn(LossFunction):
         # sdpo_mask so that even samples without a teacher demonstration are
         # still anchored to the init policy.
         ref_kl_per_token: Optional[torch.Tensor] = None
-        if (
-            self.reference_policy_kl_penalty > 0.0
-            and "prev_logprobs" in data
-            and "reference_policy_logprobs" in data
-        ):
+        if self.reference_policy_kl_penalty > 0.0 and "prev_logprobs" in data and "reference_policy_logprobs" in data:
             max_len = per_token_kl.shape[1]
             student_lp = data["prev_logprobs"][:, 1:][:, :max_len]  # [B, S-1]
             ref_lp = data["reference_policy_logprobs"][:, 1:][:, :max_len]
@@ -1185,5 +1176,124 @@ class SDPOLossFn(LossFunction):
             # sample regardless of whether a teacher demonstration is available.
             ref_mask = token_mask * sample_mask.unsqueeze(-1)
             metrics["sdpo/ref_kl"] = masked_mean(ref_kl_per_token, ref_mask).item()
+
+        return loss, metrics
+
+
+# ============================================================================
+# SDPO + GRPO hybrid loss (paper §4.5)
+# ============================================================================
+
+
+class SDPOHybridLossConfig(TypedDict):
+    """Configuration for the SDPO+GRPO hybrid loss (paper §4.5).
+
+    The hybrid blends a clipped policy-gradient (GRPO) term with the SDPO
+    logit-level KL distillation term:
+
+        L(θ) = grpo_weight · L_GRPO(θ)  +  (1 − grpo_weight) · L_SDPO(θ)
+
+    Note on fidelity: the paper combines the two *advantages*
+    (A = λ·A_GRPO + (1−λ)·A_SDPO). Because this codebase realizes SDPO as a KL
+    distillation loss rather than an advantage, we blend at the *loss* level
+    instead. Mixing the losses mixes their gradients, which captures the same
+    bias/variance trade-off the paper describes, but is not bit-identical to
+    the advantage-space formula.
+
+    The two component configs are nested (rather than flattened) so the
+    `reference_policy_kl_penalty` key — which means different things for SDPO
+    (anchor to the frozen-init policy) and GRPO (KL penalty in the PG loss) —
+    does not collide.
+
+    Fields:
+        grpo_weight: λ ∈ [0, 1]. 0 ⇒ pure SDPO, 1 ⇒ pure GRPO clipped-PG.
+        sdpo: an SDPOLossConfig (see SDPOLossFn).
+        grpo: a ClippedPGLossConfig (see ClippedPGLossFn).
+    """
+
+    grpo_weight: float
+    sdpo: SDPOLossConfig
+    grpo: ClippedPGLossConfig
+
+
+class SDPOHybridLossFn(LossFunction):
+    """SDPO+GRPO hybrid loss (paper §4.5), blended at the loss level.
+
+    Composes an inner SDPOLossFn and ClippedPGLossFn and returns
+
+        grpo_weight · L_GRPO + (1 − grpo_weight) · L_SDPO
+
+    The combined training forward (LossInputType.DISTILLATION_AND_LOGPROB)
+    produces both the distillation top-k logprobs (for the SDPO term) and the
+    next-token logprobs (for the clipped-PG term); see
+    nemo_rl/algorithms/loss/utils.py:prepare_loss_input.
+
+    The SDPO term only affects samples that have a teacher demonstration
+    (sdpo_mask=1); the GRPO term affects every valid sample. This means even
+    demonstration-less samples still receive the policy-gradient signal.
+
+    References:
+        Hübotter et al. (2026) "Reinforcement Learning via Self-Distillation"
+        arXiv:2601.20802 §4.5
+    """
+
+    loss_type = LossType.TOKEN_LEVEL
+    input_type = LossInputType.DISTILLATION_AND_LOGPROB
+
+    def __init__(self, cfg: SDPOHybridLossConfig):
+        self.grpo_weight: float = float(cfg["grpo_weight"])
+        if not 0.0 <= self.grpo_weight <= 1.0:
+            raise ValueError(f"SDPOHybridLossFn: grpo_weight must be in [0, 1], got {self.grpo_weight}")
+        # prepare_loss_input reads .sdpo_loss / .grpo_loss off this object.
+        self.sdpo_loss = SDPOLossFn(cfg["sdpo"])
+        self.grpo_loss = ClippedPGLossFn(cfg["grpo"])
+
+    def __call__(
+        self,
+        student_topk_logprobs: torch.Tensor,
+        teacher_topk_logprobs: torch.Tensor,
+        H_all: Optional[torch.Tensor],
+        next_token_logprobs: torch.Tensor,
+        data: BatchedDataDict,
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        sdpo_loss, sdpo_metrics = self.sdpo_loss(
+            student_topk_logprobs,
+            teacher_topk_logprobs,
+            H_all,
+            data,
+            global_valid_seqs,
+            global_valid_toks,
+        )
+        grpo_loss, grpo_metrics = self.grpo_loss(
+            next_token_logprobs,
+            data,
+            global_valid_seqs,
+            global_valid_toks,
+        )
+
+        loss = self.grpo_weight * grpo_loss + (1.0 - self.grpo_weight) * sdpo_loss
+
+        metrics: dict[str, Any] = {
+            "loss": loss.item(),
+            # Both component losses mask by sample_mask, so either count works.
+            "num_valid_samples": grpo_metrics["num_valid_samples"],
+            # loss-like values aggregate correctly under the worker's
+            # divide-by-num_global_batches-then-sum scheme (like "loss").
+            # grpo_weight is a constant and would be corrupted by it, so it is
+            # logged once per step in sdpo_train instead.
+            "hybrid/loss_grpo": grpo_loss.item(),
+            "hybrid/loss_sdpo": sdpo_loss.item(),
+        }
+        # Namespace the GRPO component metrics; keep SDPO's (already sdpo/*).
+        for k, v in grpo_metrics.items():
+            if k in ("loss", "num_valid_samples"):
+                continue
+            metrics[f"grpo/{k}"] = v
+        for k, v in sdpo_metrics.items():
+            if k in ("loss", "num_valid_samples"):
+                continue
+            metrics[k] = v
 
         return loss, metrics

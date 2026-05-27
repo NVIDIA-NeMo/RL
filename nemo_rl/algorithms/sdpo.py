@@ -18,7 +18,7 @@ This module implements SDPO in NeMo-RL.  The key idea is:
 
 import os
 import re
-from typing import Any, NotRequired, Optional, TypedDict, TypeVar
+from typing import Any, NotRequired, Optional, TypedDict, TypeVar, Union
 
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -30,7 +30,10 @@ from nemo_rl.algorithms.grpo import (
     refit_policy_generation,
     validate,
 )
+from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
 from nemo_rl.algorithms.loss import (
+    SDPOHybridLossConfig,
+    SDPOHybridLossFn,
     SDPOLossConfig,
     SDPOLossFn,
 )
@@ -93,9 +96,7 @@ _DEFAULT_COMBINED_TEMPLATE = (
 # Combined teacher template for *successful* rollouts: peer demo only, no env
 # feedback line (the attempt didn't fail). Placeholders: {prompt}, {solution}.
 _DEFAULT_COMBINED_SUCCESS_TEMPLATE = (
-    "{prompt}\n\n"
-    "Correct solution:\n\n{solution}\n\n"
-    "Correctly solve the original question."
+    "{prompt}\n\n" "Correct solution:\n\n{solution}\n\n" "Correctly solve the original question."
 )
 
 
@@ -143,6 +144,11 @@ class SDPOConfig(TypedDict):
     # 0 = never log samples; 1 = every step; N = every N steps.
     log_sample_every_n_steps: NotRequired[int]
     log_sample_max_chars: NotRequired[int]
+    # Advantage estimator config for the SDPO+GRPO hybrid (paper §4.5). Only
+    # used when loss_fn carries grpo_weight. Keys: name ("grpo"),
+    # use_leave_one_out_baseline (bool), normalize_rewards (bool). Defaults to a
+    # leave-one-out, reward-normalized GRPO estimator.
+    adv_estimator: NotRequired[dict[str, Any]]
 
 
 class SDPOSaveState(TypedDict):
@@ -167,7 +173,9 @@ def _default_sdpo_save_state() -> SDPOSaveState:
 
 class MasterConfig(TypedDict):
     policy: PolicyConfig
-    loss_fn: SDPOLossConfig
+    # SDPOLossConfig for pure SDPO; SDPOHybridLossConfig (carrying grpo_weight,
+    # nested sdpo/grpo blocks) for the SDPO+GRPO hybrid (paper §4.5).
+    loss_fn: Union[SDPOLossConfig, SDPOHybridLossConfig]
     env: dict[str, Any]
     data: DataConfig
     sdpo: SDPOConfig
@@ -804,8 +812,12 @@ def setup(
         _,
     ) = grpo_setup(grpo_master_config, tokenizer, dataset, val_dataset)
 
-    # Replace GRPO loss with SDPO loss
-    loss_fn = SDPOLossFn(loss_config)
+    # Replace GRPO loss with SDPO loss (or the SDPO+GRPO hybrid when the
+    # loss_fn config carries grpo_weight, paper §4.5).
+    if "grpo_weight" in loss_config:
+        loss_fn: LossFunction = SDPOHybridLossFn(loss_config)
+    else:
+        loss_fn = SDPOLossFn(loss_config)
 
     # Convert grpo save state to sdpo save state (same fields)
     sdpo_save_state: SDPOSaveState = {
@@ -888,16 +900,31 @@ def sdpo_train(
     remove_thinking = sdpo_cfg.get("remove_thinking_from_demo", False)
     dont_self = sdpo_cfg.get("dont_reprompt_on_self_success", False)
     feedback_source = sdpo_cfg.get("feedback_source", "peer_rollout")
-    env_feedback_template = sdpo_cfg.get(
-        "env_feedback_template", _DEFAULT_ENV_FEEDBACK_TEMPLATE
-    )
+    env_feedback_template = sdpo_cfg.get("env_feedback_template", _DEFAULT_ENV_FEEDBACK_TEMPLATE)
     combined_template = sdpo_cfg.get("combined_template", _DEFAULT_COMBINED_TEMPLATE)
-    combined_success_template = sdpo_cfg.get(
-        "combined_success_template", _DEFAULT_COMBINED_SUCCESS_TEMPLATE
-    )
+    combined_success_template = sdpo_cfg.get("combined_success_template", _DEFAULT_COMBINED_SUCCESS_TEMPLATE)
     use_ema_teacher = sdpo_cfg.get("use_ema_teacher", False)
     ema_alpha = sdpo_cfg.get("ema_alpha", 0.01)
     make_div_by = policy_cfg.get("make_sequence_length_divisible_by", 1)
+
+    # SDPO+GRPO hybrid (paper §4.5): build the GRPO advantage estimator used by
+    # the policy-gradient term. Only active when loss_fn is the hybrid.
+    is_hybrid = isinstance(loss_fn, SDPOHybridLossFn)
+    adv_estimator: Optional[GRPOAdvantageEstimator] = None
+    if is_hybrid:
+        adv_cfg = dict(sdpo_cfg.get("adv_estimator", {}))
+        adv_cfg.setdefault("name", "grpo")
+        adv_cfg.setdefault("use_leave_one_out_baseline", True)
+        adv_cfg.setdefault("normalize_rewards", True)
+        if adv_cfg["name"] != "grpo":
+            raise ValueError(f"SDPO+GRPO hybrid only supports adv_estimator name 'grpo', " f"got {adv_cfg['name']!r}.")
+        adv_estimator = GRPOAdvantageEstimator(adv_cfg, master_config["loss_fn"])
+        print(
+            f"  ✓ SDPO+GRPO hybrid: grpo_weight={loss_fn.grpo_weight}, "
+            f"adv_estimator=grpo (loo={adv_cfg['use_leave_one_out_baseline']}, "
+            f"normalize={adv_cfg['normalize_rewards']})",
+            flush=True,
+        )
 
     # Run initial validation if requested
     if val_at_start and current_step == 0:
@@ -1110,15 +1137,25 @@ def sdpo_train(
                     teacher_topk_indices_aligned,
                 )
 
-                # ── Trust-region anchor to init policy (paper Table 4) ────────
-                # When loss_fn.reference_policy_kl_penalty > 0, plumb the
-                # student's snapshot logprobs (prev) and the frozen-init
-                # reference logprobs at sampled tokens. The SDPO loss adds
-                # beta * KL(student || ref) summed over response positions.
-                ref_kl_penalty = master_config["loss_fn"].get(
-                    "reference_policy_kl_penalty", 0.0
-                )
-                if ref_kl_penalty > 0.0:
+                # ── prev / reference logprobs ─────────────────────────────────
+                # Two consumers need these:
+                #  • SDPO trust-region anchor to the frozen-init policy (paper
+                #    Table 4): the SDPO term adds beta*KL(student||ref) when its
+                #    reference_policy_kl_penalty > 0.
+                #  • GRPO policy-gradient term (hybrid, paper §4.5): always needs
+                #    prev_logprobs; needs reference logprobs when GRPO's KL
+                #    penalty is on.
+                if is_hybrid:
+                    sdpo_ref_penalty = loss_fn.sdpo_loss.reference_policy_kl_penalty
+                    grpo_ref_penalty = loss_fn.grpo_loss.reference_policy_kl_penalty
+                else:
+                    sdpo_ref_penalty = getattr(loss_fn, "reference_policy_kl_penalty", 0.0)
+                    grpo_ref_penalty = 0.0
+
+                need_prev_logprobs = is_hybrid or sdpo_ref_penalty > 0.0
+                need_ref_logprobs = (sdpo_ref_penalty > 0.0) or (grpo_ref_penalty > 0.0)
+
+                if need_prev_logprobs or need_ref_logprobs:
                     print("Computing prev + reference logprobs...", flush=True)
                     logprob_data = BatchedDataDict(
                         {
@@ -1128,17 +1165,37 @@ def sdpo_train(
                             "sample_mask": train_data["sample_mask"],
                         }
                     )
-                    with timer.time("prev_logprobs"):
-                        train_data["prev_logprobs"] = policy.get_logprobs(
-                            logprob_data, timer=timer
-                        )["logprobs"]
-                    with timer.time("reference_policy_logprobs"):
-                        train_data["reference_policy_logprobs"] = (
-                            policy.get_reference_policy_logprobs(
+                    if need_prev_logprobs:
+                        with timer.time("prev_logprobs"):
+                            train_data["prev_logprobs"] = policy.get_logprobs(logprob_data, timer=timer)["logprobs"]
+                    if need_ref_logprobs:
+                        with timer.time("reference_policy_logprobs"):
+                            train_data["reference_policy_logprobs"] = policy.get_reference_policy_logprobs(
                                 logprob_data, timer=timer
                             )["reference_logprobs"]
-                        )
                     del logprob_data
+
+                # ── GRPO advantages (hybrid, paper §4.5) ──────────────────────
+                # Samples are prompt-major (repeat_interleave(num_generations)),
+                # so a synthetic per-group index groups the G rollouts of each
+                # prompt together. calculate_baseline_and_std_per_prompt expects
+                # a 2-D (b, s) tensor (it groups via torch.unique(dim=0) and
+                # reduces with .all(1)), so the index is shaped [B, 1].
+                if is_hybrid:
+                    assert adv_estimator is not None
+                    with timer.time("advantage_calculation"):
+                        batch_size = train_data["input_ids"].shape[0]
+                        num_prompts = batch_size // num_generations
+                        prompt_ids = torch.arange(num_prompts).repeat_interleave(num_generations).unsqueeze(-1)
+                        adv_mask = train_data["token_mask"] * train_data["sample_mask"].unsqueeze(-1)
+                        train_data["advantages"] = adv_estimator.compute_advantage(
+                            prompt_ids=prompt_ids,
+                            rewards=rewards,
+                            mask=adv_mask,
+                        )
+                    metrics["hybrid/grpo_weight"] = loss_fn.grpo_weight
+                    if adv_mask.bool().any():
+                        metrics["train/advantages_mean"] = train_data["advantages"][adv_mask.bool()].mean().item()
 
                 # ── Train ────────────────────────────────────────────────────
                 print("Preparing for training...", flush=True)
@@ -1165,9 +1222,10 @@ def sdpo_train(
                 metrics["train/mean_reward"] = rewards.mean().item()
                 metrics["train/success_fraction"] = (rewards >= success_threshold).float().mean().item()
 
-                # Aggregate SDPO-specific metrics from the loss function
+                # Aggregate SDPO-specific (and, for the hybrid, GRPO/hybrid)
+                # metrics from the loss function.
                 for k, v in train_results.get("all_mb_metrics", {}).items():
-                    if "sdpo" in k:
+                    if "sdpo" in k or "hybrid" in k or k.startswith("grpo/"):
                         metrics[k] = sum(v) / len(v) if isinstance(v, list) else v
 
                 num_valid_tokens = int(

@@ -90,10 +90,7 @@ def prepare_loss_input(
             logprobs = mask_out_neg_inf_logprobs(logprobs, mask[:, 1:], "curr_logprobs")
 
             # compute unfiltered logprobs for reference policy KL penalty
-            if (
-                hasattr(loss_fn, "reference_policy_kl_penalty")
-                and loss_fn.reference_policy_kl_penalty != 0
-            ):
+            if hasattr(loss_fn, "reference_policy_kl_penalty") and loss_fn.reference_policy_kl_penalty != 0:
                 data["curr_logprobs_unfiltered"] = get_next_token_logprobs_from_logits(
                     input_ids=data["input_ids"],
                     next_token_logits=logits,
@@ -108,23 +105,71 @@ def prepare_loss_input(
 
     elif loss_fn.input_type == LossInputType.DISTILLATION:
         calculate_entropy = loss_fn.zero_outside_topk and loss_fn.kl_type != "forward"
-        student_topk_logprobs, teacher_topk_logprobs, H_all = (
-            get_distillation_topk_logprobs_from_logits(
-                student_logits=logits,
-                teacher_topk_logits=data["teacher_topk_logits"],
-                teacher_topk_indices=data["teacher_topk_indices"],
-                zero_outside_topk=loss_fn.zero_outside_topk,
-                calculate_entropy=calculate_entropy,
-                vocab_parallel_rank=vocab_parallel_rank,
-                vocab_parallel_group=vocab_parallel_group,
-                context_parallel_group=context_parallel_group,
-            )
+        student_topk_logprobs, teacher_topk_logprobs, H_all = get_distillation_topk_logprobs_from_logits(
+            student_logits=logits,
+            teacher_topk_logits=data["teacher_topk_logits"],
+            teacher_topk_indices=data["teacher_topk_indices"],
+            zero_outside_topk=loss_fn.zero_outside_topk,
+            calculate_entropy=calculate_entropy,
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
         )
 
         loss_input = {
             "student_topk_logprobs": student_topk_logprobs,
             "teacher_topk_logprobs": teacher_topk_logprobs,
             "H_all": H_all,
+        }
+    elif loss_fn.input_type == LossInputType.DISTILLATION_AND_LOGPROB:
+        # Hybrid SDPO+GRPO (paper §4.5): emit both the distillation top-k
+        # outputs (consumed by the SDPO KL term) and the next-token logprobs
+        # (consumed by the clipped-PG term) from the same forward. The hybrid
+        # loss fn exposes its inner SDPOLossFn / ClippedPGLossFn as
+        # `sdpo_loss` / `grpo_loss`; we read the distillation/filtering knobs
+        # from those, mirroring the DISTILLATION and LOGPROB branches above.
+        sdpo_loss = loss_fn.sdpo_loss
+        calculate_entropy = sdpo_loss.zero_outside_topk and sdpo_loss.kl_type != "forward"
+        student_topk_logprobs, teacher_topk_logprobs, H_all = get_distillation_topk_logprobs_from_logits(
+            student_logits=logits,
+            teacher_topk_logits=data["teacher_topk_logits"],
+            teacher_topk_indices=data["teacher_topk_indices"],
+            zero_outside_topk=sdpo_loss.zero_outside_topk,
+            calculate_entropy=calculate_entropy,
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+        )
+
+        logprobs = get_next_token_logprobs_from_logits(
+            input_ids=data["input_ids"],
+            next_token_logits=logits,
+            seq_index=data.get("seq_index", None),
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+            sampling_params=sampling_params,
+        )
+        if need_top_k_or_top_p_filtering(sampling_params):
+            mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
+            logprobs = mask_out_neg_inf_logprobs(logprobs, mask[:, 1:], "curr_logprobs")
+            # GRPO reference-policy KL needs unfiltered current logprobs.
+            if loss_fn.grpo_loss.reference_policy_kl_penalty != 0:
+                data["curr_logprobs_unfiltered"] = get_next_token_logprobs_from_logits(
+                    input_ids=data["input_ids"],
+                    next_token_logits=logits,
+                    seq_index=data.get("seq_index", None),
+                    vocab_parallel_rank=vocab_parallel_rank,
+                    vocab_parallel_group=vocab_parallel_group,
+                    context_parallel_group=context_parallel_group,
+                    sampling_params=None,  # no filtering
+                )
+
+        loss_input = {
+            "student_topk_logprobs": student_topk_logprobs,
+            "teacher_topk_logprobs": teacher_topk_logprobs,
+            "H_all": H_all,
+            "next_token_logprobs": logprobs,
         }
     elif loss_fn.input_type == LossInputType.DRAFT:
         from megatron.core.transformer.multi_token_prediction import roll_tensor
@@ -135,22 +180,15 @@ def prepare_loss_input(
             dims=1,
             cp_group=context_parallel_group,
         )[0]
-        token_mask = roll_tensor(
-            data["token_mask"], shifts=-1, dims=1, cp_group=context_parallel_group
-        )[0]
+        token_mask = roll_tensor(data["token_mask"], shifts=-1, dims=1, cp_group=context_parallel_group)[0]
         if d2t is not None:
-            reverse_mapping = (
-                torch.arange(len(d2t), device=teacher_logits.device, dtype=d2t.dtype)
-                + d2t
-            )
+            reverse_mapping = torch.arange(len(d2t), device=teacher_logits.device, dtype=d2t.dtype) + d2t
             if vocab_parallel_group is not None:
                 from megatron.core.tensor_parallel import (
                     gather_from_tensor_model_parallel_region,
                 )
 
-                teacher_logits = gather_from_tensor_model_parallel_region(
-                    teacher_logits, vocab_parallel_group
-                )
+                teacher_logits = gather_from_tensor_model_parallel_region(teacher_logits, vocab_parallel_group)
                 tp_size = torch.distributed.get_world_size(vocab_parallel_group)
                 local_draft_size = len(d2t) // tp_size
                 assert vocab_parallel_rank is not None
@@ -197,9 +235,7 @@ def _pack_input_ids(
     """
     batch_size = input_ids.shape[0]
     total_packed_len = int(cu_seqlens_q_padded[-1].item()) // cp_size
-    packed = torch.zeros(
-        total_packed_len, dtype=input_ids.dtype, device=input_ids.device
-    )
+    packed = torch.zeros(total_packed_len, dtype=input_ids.dtype, device=input_ids.device)
     for i in range(batch_size):
         actual_len = int((cu_seqlens_q[i + 1] - cu_seqlens_q[i]).item())
         padded_len = int((cu_seqlens_q_padded[i + 1] - cu_seqlens_q_padded[i]).item())
@@ -209,9 +245,7 @@ def _pack_input_ids(
         if roll_shift != 0:
             seq = seq.roll(shifts=roll_shift, dims=0)
         sharded = _get_tokens_on_this_cp_rank(seq, cp_rank, cp_size, seq_dim=0)
-        packed[packed_start // cp_size : (packed_start + padded_len) // cp_size] = (
-            sharded
-        )
+        packed[packed_start // cp_size : (packed_start + padded_len) // cp_size] = sharded
     return packed.unsqueeze(0)
 
 
@@ -249,30 +283,23 @@ def prepare_packed_loss_input(
         tuple(loss_input, maybe_updated_data)
     """
     if loss_fn.input_type != LossInputType.LOGPROB:
+        hint = (
+            " Set sequence_packing.fuse_loss=false to route through the " "non-fused SequencePackingLossWrapper path."
+            if loss_fn.input_type == LossInputType.DISTILLATION_AND_LOGPROB
+            else ""
+        )
         raise ValueError(
             f"prepare_packed_loss_input only supports LossInputType.LOGPROB, "
             f"got {loss_fn.input_type}. Use SequencePackingLossWrapper with "
-            f"prepare_loss_input for other types."
+            f"prepare_loss_input for other types.{hint}"
         )
-    assert vocab_parallel_group is not None, (
-        "prepare_packed_loss_input requires vocab_parallel_group (Megatron TP)."
-    )
-    assert vocab_parallel_rank is not None, (
-        "vocab_parallel_rank must be provided with vocab_parallel_group."
-    )
+    assert vocab_parallel_group is not None, "prepare_packed_loss_input requires vocab_parallel_group (Megatron TP)."
+    assert vocab_parallel_rank is not None, "vocab_parallel_rank must be provided with vocab_parallel_group."
 
     input_ids = data["input_ids"]
     unpacked_seqlen = input_ids.shape[1]
-    cp_size = (
-        1
-        if context_parallel_group is None
-        else torch.distributed.get_world_size(context_parallel_group)
-    )
-    cp_rank = (
-        0
-        if context_parallel_group is None
-        else torch.distributed.get_rank(context_parallel_group)
-    )
+    cp_size = 1 if context_parallel_group is None else torch.distributed.get_world_size(context_parallel_group)
+    cp_rank = 0 if context_parallel_group is None else torch.distributed.get_rank(context_parallel_group)
 
     packed_rolled_targets = _pack_input_ids(
         input_ids,
@@ -303,24 +330,19 @@ def prepare_packed_loss_input(
         mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
         logprobs = mask_out_neg_inf_logprobs(logprobs, mask[:, 1:], "curr_logprobs")
 
-        if (
-            hasattr(loss_fn, "reference_policy_kl_penalty")
-            and loss_fn.reference_policy_kl_penalty != 0
-        ):
-            data["curr_logprobs_unfiltered"] = (
-                from_parallel_logits_to_logprobs_packed_sequences(
-                    logits.to(torch.float32),
-                    packed_rolled_targets,
-                    cu_seqlens_q_padded,
-                    unpacked_seqlen,
-                    vocab_start_index=vocab_parallel_rank * logits.shape[-1],
-                    vocab_end_index=(vocab_parallel_rank + 1) * logits.shape[-1],
-                    group=vocab_parallel_group,
-                    inference_only=False,
-                    cp_group=context_parallel_group,
-                    sampling_params=None,
-                    target_is_pre_rolled=True,
-                )
+        if hasattr(loss_fn, "reference_policy_kl_penalty") and loss_fn.reference_policy_kl_penalty != 0:
+            data["curr_logprobs_unfiltered"] = from_parallel_logits_to_logprobs_packed_sequences(
+                logits.to(torch.float32),
+                packed_rolled_targets,
+                cu_seqlens_q_padded,
+                unpacked_seqlen,
+                vocab_start_index=vocab_parallel_rank * logits.shape[-1],
+                vocab_end_index=(vocab_parallel_rank + 1) * logits.shape[-1],
+                group=vocab_parallel_group,
+                inference_only=False,
+                cp_group=context_parallel_group,
+                sampling_params=None,
+                target_is_pre_rolled=True,
             )
 
     return {"next_token_logprobs": logprobs}, data
