@@ -347,27 +347,27 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
-        # Multi-LoRA per-row routing. When the batch carries `adapter_names`
-        # (one entry per row), call into the downstream multi-adapter helper
-        # to write the routing buffer onto every MultiLinearLoRA layer before
-        # forward. Stock single-LoRA batches don't carry this key, so the
-        # block is a no-op.
-        adapter_names = None
+        # Multi-LoRA per-row routing. When the batch carries `adapter_ids`
+        # (LongTensor[B], one global id per row), call into the downstream
+        # multi-adapter helper to write the routing buffer onto every
+        # MultiLinearLoRA layer before forward. Stock single-LoRA batches
+        # don't carry this key, so the block is a no-op.
+        adapter_ids = None
         if hasattr(data, "get"):
-            adapter_names = data.get("adapter_names")
-        if adapter_names is not None:
+            adapter_ids = data.get("adapter_ids")
+        if adapter_ids is not None:
             try:
                 from nousnet.rl.lora.multi.routing import seed_microbatch_routing
             except ImportError:
-                # nousnet not installed but batch carries adapter_names —
+                # nousnet not installed but batch carries adapter_ids —
                 # this is a misconfiguration. Fail loudly rather than train
                 # silently against the wrong adapter slot.
                 raise RuntimeError(
-                    "Batch carries `adapter_names` but nousnet multi-LoRA "
+                    "Batch carries `adapter_ids` but nousnet multi-LoRA "
                     "routing helpers are not importable. Install nousnet or "
-                    "remove `adapter_names` from the batch."
+                    "remove `adapter_ids` from the batch."
                 )
-            seed_microbatch_routing(self.model, list(adapter_names))
+            seed_microbatch_routing(self.model, adapter_ids)
 
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]

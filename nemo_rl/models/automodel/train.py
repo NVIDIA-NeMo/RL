@@ -75,6 +75,16 @@ def model_forward(
         use_cache=False,
     )
 
+    # NemotronH / CP fix: when context parallel is active, the model's own
+    # ``_update_causal_mask`` indexes the (CP-sharded) causal mask against the
+    # FULL-length attention_mask and crashes with a shape mismatch. NeMo-RL's
+    # data path already builds CP correctly without a mask (see data.py), but
+    # ``processed_inputs.attention_mask`` can still be non-None here from
+    # upstream generation prep. Force-None it under CP — the model still gets
+    # causal masking via SDPA's ``is_causal=True``.
+    if getattr(processed_inputs, "has_context_parallel", False):
+        model_args["attention_mask"] = None
+
     # Add flash attention kwargs if applicable
     if processed_inputs.has_flash_attention:
         model_args["flash_attn_kwargs"] = processed_inputs.flash_attn_kwargs
