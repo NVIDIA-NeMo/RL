@@ -178,7 +178,7 @@ mcore = [
 ]
 modelopt = ["nvidia-modelopt"]
 nvrx = [
-  "nvidia-resiliency-ext",
+  "nvidia-resiliency-ext==0.6.0",
 ] # for ft_launcher (fault-tolerant training launcher)
 nemo_gym = ["nemo_gym"]
 
@@ -266,7 +266,7 @@ mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "35e927b2
 nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v1.1.4.post7" }
 emerging-optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.2.0" }
 nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "c897fbeaaff66d53d61033f107885b7c5432f235" }
-nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", rev = "b2bb3d728a18795807d9f76c535e005a609a1b01" }
+nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", rev = "6c5f2a13c7688d92a7ac7ee6e464721eb8b7345d" }
 flashinfer-jit-cache = { index = "flashinfer-cu130" }
 
 [tool.uv.workspace]
@@ -516,7 +516,7 @@ requires-dist = [
   "tqdm>=4.67.1",
   "hydra-core>1.3,<=1.3.2",
   "qwen-vl-utils",
-  "nvidia-resiliency-ext",
+  "nvidia-resiliency-ext==0.6.0",
   "flash-linear-attention",
   "timm",
   "open-clip-torch>=3.2.0",

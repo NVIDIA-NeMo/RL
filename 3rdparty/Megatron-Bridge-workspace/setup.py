@@ -49,7 +49,7 @@ CACHED_DEPENDENCIES = [
     "hydra-core>1.3,<=1.3.2",
     "megatron-core[dev,mlm]",
     "qwen-vl-utils",
-    "nvidia-resiliency-ext",
+    "nvidia-resiliency-ext==0.6.0",
     "flash-linear-attention",
     "timm",
     "open-clip-torch>=3.2.0",
