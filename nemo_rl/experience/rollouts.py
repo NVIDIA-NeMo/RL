@@ -55,6 +55,48 @@ from nemo_rl.utils.timer import Timer
 TokenizerType = PreTrainedTokenizerBase
 
 
+def _attach_routed_experts_to_message_log_prefix(
+    message_log: list[dict],
+    routed_experts: torch.Tensor,
+) -> int:
+    """Attach routed-expert slices to existing messages and return prefix length."""
+    cursor = 0
+    for msg in message_log:
+        token_ids = msg.get("token_ids")
+        if not isinstance(token_ids, torch.Tensor):
+            continue
+        msg_len = int(token_ids.shape[0])
+        msg["routed_experts"] = routed_experts[cursor : cursor + msg_len]
+        cursor += msg_len
+    return cursor
+
+
+def _find_routed_experts_template(message_log: list[dict]) -> Optional[torch.Tensor]:
+    for msg in message_log:
+        routed_experts = msg.get("routed_experts")
+        if isinstance(routed_experts, torch.Tensor):
+            return routed_experts
+    return None
+
+
+def _dummy_routed_experts_for_tokens(
+    token_ids: torch.Tensor,
+    template: torch.Tensor,
+) -> torch.Tensor:
+    if template.dim() != 3:
+        raise ValueError(
+            "routed_experts messages must have shape [tokens, layers, topk], "
+            f"got {tuple(template.shape)}"
+        )
+    topk = template.shape[2]
+    default_route = torch.arange(topk, dtype=template.dtype, device=template.device)
+    return (
+        default_route.view(1, 1, topk)
+        .expand(int(token_ids.shape[0]), template.shape[1], topk)
+        .clone()
+    )
+
+
 def generate_responses(
     policy_generation: GenerationInterface,
     generation_input_data: BatchedDataDict[GenerationDatumSpec],
@@ -109,6 +151,19 @@ def generate_responses(
         if include_logprobs and "logprobs" in generation_outputs:
             assistant_message["generation_logprobs"] = generation_outputs["logprobs"][
                 i, input_length:total_length
+            ]
+        if "routed_experts" in generation_outputs:
+            routed_experts = generation_outputs["routed_experts"][i]
+            prefix_length = _attach_routed_experts_to_message_log_prefix(
+                batch["message_log"][i], routed_experts
+            )
+            if prefix_length != int(input_length.item()):
+                raise RuntimeError(
+                    "message_log token length does not match generation input_length "
+                    f"({prefix_length} != {int(input_length.item())})."
+                )
+            assistant_message["routed_experts"] = routed_experts[
+                input_length:total_length
             ]
 
         batch["message_log"][i].append(assistant_message)
@@ -211,6 +266,19 @@ async def generate_responses_async(
         if include_logprobs and "logprobs" in generation_outputs:
             assistant_message["generation_logprobs"] = generation_outputs["logprobs"][
                 i, input_length:total_length
+            ]
+        if "routed_experts" in generation_outputs:
+            routed_experts = generation_outputs["routed_experts"][i]
+            prefix_length = _attach_routed_experts_to_message_log_prefix(
+                batch["message_log"][i], routed_experts
+            )
+            if prefix_length != int(input_length.item()):
+                raise RuntimeError(
+                    "message_log token length does not match generation input_length "
+                    f"({prefix_length} != {int(input_length.item())})."
+                )
+            assistant_message["routed_experts"] = routed_experts[
+                input_length:total_length
             ]
 
         batch["message_log"][i].append(assistant_message)
@@ -527,6 +595,13 @@ def run_multi_turn_rollout(
                 "content": env_obs_content,
                 "token_ids": tokenized_obs,
             }
+            routed_template = _find_routed_experts_template(
+                current_batch["message_log"][global_idx]
+            )
+            if routed_template is not None:
+                tokenized_env_obs_message["routed_experts"] = (
+                    _dummy_routed_experts_for_tokens(tokenized_obs, routed_template)
+                )
             current_batch["message_log"][global_idx].append(tokenized_env_obs_message)
 
             # Record token usage - environment
@@ -819,6 +894,11 @@ async def run_sample_multi_turn_rollout(
             "content": env_obs_content,
             "token_ids": tokenized_obs,
         }
+        routed_template = _find_routed_experts_template(current_message_log)
+        if routed_template is not None:
+            env_message["routed_experts"] = _dummy_routed_experts_for_tokens(
+                tokenized_obs, routed_template
+            )
         current_message_log.append(env_message)
 
         # Update token counts

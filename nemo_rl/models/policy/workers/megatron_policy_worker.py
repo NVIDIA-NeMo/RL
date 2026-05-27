@@ -66,6 +66,7 @@ from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_obj_from_pp_rank,
     broadcast_tensors_from_last_stage,
 )
+from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.megatron.setup import (
     finalize_megatron_setup,
     handle_model_import,
@@ -86,14 +87,36 @@ from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
+    ReferenceLogprobOutputSpec,
 )
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+from nemo_rl.utils.r3_trace import maybe_r3_trace_stage
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+
+
+def _should_use_router_replay(
+    *,
+    enabled: bool,
+    data: BatchedDataDict[Any],
+    stage: str,
+    require: bool,
+) -> bool:
+    if not enabled or not require:
+        return False
+    if "routed_experts" in data:
+        return True
+    raise RuntimeError(
+        "policy.router_replay.enabled=true requires routed_experts for "
+        f"{stage}, but the fetched batch does not contain that field. This "
+        "usually means the TQ schema, field selection, or rollout write path "
+        "stopped carrying routed_experts. Reference-logprob intentionally skips "
+        "routed_experts; prev-logprob and train must not."
+    )
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
@@ -188,6 +211,7 @@ class MegatronPolicyWorkerImpl(
         apply_transformer_engine_patch()
 
         self.cfg = config
+        self._router_replay_enabled = router_replay_enabled(config)
 
         # Set rank for non-collocated to check which ranks to broadcast from
         self.rank = get_rank_safe()
@@ -418,25 +442,34 @@ class MegatronPolicyWorkerImpl(
 
                     # Forward pass.
                     draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
-                    losses_reduced = megatron_forward_backward(
-                        model=self.model,
-                        data_iterator=data_iterator,
-                        num_microbatches=num_microbatches,
-                        seq_length=padded_seq_length,
-                        mbs=micro_batch_size,
-                        post_processing_fn=loss_post_processor,
-                        forward_only=eval_mode,
-                        defer_fp32_logits=self.defer_fp32_logits,
-                        global_valid_seqs=global_valid_seqs,
-                        global_valid_toks=global_valid_toks,
-                        sampling_params=self.sampling_params,
-                        straggler_timer=self.mcore_state.straggler_timer,
-                        draft_model=self.draft_model,
-                        enable_hidden_capture=draft_enabled,
-                        use_linear_ce_fusion_loss=self.cfg["megatron_cfg"].get(
-                            "use_linear_ce_fusion_loss", False
-                        ),
+                    use_router_replay = _should_use_router_replay(
+                        enabled=self._router_replay_enabled,
+                        data=batch,
+                        stage="train",
+                        require=True,
                     )
+                    with maybe_r3_trace_stage("train", enabled=use_router_replay):
+                        losses_reduced = megatron_forward_backward(
+                            model=self.model,
+                            data_iterator=data_iterator,
+                            num_microbatches=num_microbatches,
+                            seq_length=padded_seq_length,
+                            mbs=micro_batch_size,
+                            post_processing_fn=loss_post_processor,
+                            forward_only=eval_mode,
+                            defer_fp32_logits=self.defer_fp32_logits,
+                            global_valid_seqs=global_valid_seqs,
+                            global_valid_toks=global_valid_toks,
+                            sampling_params=self.sampling_params,
+                            straggler_timer=self.mcore_state.straggler_timer,
+                            draft_model=self.draft_model,
+                            enable_hidden_capture=draft_enabled,
+                            use_linear_ce_fusion_loss=self.cfg["megatron_cfg"].get(
+                                "use_linear_ce_fusion_loss", False
+                            ),
+                            use_router_replay=use_router_replay,
+                            router_replay_train=not eval_mode,
+                        )
 
                 # Empty unused memory.
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
@@ -539,9 +572,31 @@ class MegatronPolicyWorkerImpl(
                 metrics["moe_metrics"] = moe_metrics
         return metrics
 
+    @wrap_with_nvtx_name("megatron_policy_worker/get_reference_policy_logprobs")
+    def get_reference_policy_logprobs(
+        self,
+        *,
+        data: BatchedDataDict[Any],
+        micro_batch_size: Optional[int] = None,
+    ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
+        with self.use_reference_model():
+            reference_logprobs = self.get_logprobs(
+                data=data,
+                micro_batch_size=micro_batch_size,
+                require_router_replay=False,
+            )
+
+        return_data = BatchedDataDict[ReferenceLogprobOutputSpec]()
+        return_data["reference_logprobs"] = reference_logprobs["logprobs"].cpu()
+        return return_data
+
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs")
     def get_logprobs(
-        self, *, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
+        self,
+        *,
+        data: BatchedDataDict[Any],
+        micro_batch_size: Optional[int] = None,
+        require_router_replay: bool = True,
     ) -> BatchedDataDict[LogprobOutputSpec]:
         """Get the logprobs of the model for a batch of data.
 
@@ -587,20 +642,29 @@ class MegatronPolicyWorkerImpl(
             sampling_params=self.sampling_params,
             use_linear_ce_fusion=use_linear_ce_fusion,
         )
-
-        list_of_logprobs = megatron_forward_backward(
-            model=self.model,
-            data_iterator=mb_iterator,
-            seq_length=padded_seq_length,
-            mbs=micro_batch_size,
-            num_microbatches=num_microbatches,
-            post_processing_fn=logprobs_post_processor,
-            forward_only=True,
-            defer_fp32_logits=self.defer_fp32_logits,
-            sampling_params=self.sampling_params,
-            straggler_timer=self.mcore_state.straggler_timer,
-            use_linear_ce_fusion_loss=use_linear_ce_fusion,
+        use_router_replay = _should_use_router_replay(
+            enabled=self._router_replay_enabled,
+            data=data,
+            stage="prev-logprob",
+            require=require_router_replay,
         )
+
+        with maybe_r3_trace_stage("prev-logprob", enabled=use_router_replay):
+            list_of_logprobs = megatron_forward_backward(
+                model=self.model,
+                data_iterator=mb_iterator,
+                seq_length=padded_seq_length,
+                mbs=micro_batch_size,
+                num_microbatches=num_microbatches,
+                post_processing_fn=logprobs_post_processor,
+                forward_only=True,
+                defer_fp32_logits=self.defer_fp32_logits,
+                sampling_params=self.sampling_params,
+                straggler_timer=self.mcore_state.straggler_timer,
+                use_linear_ce_fusion_loss=use_linear_ce_fusion,
+                use_router_replay=use_router_replay,
+                router_replay_train=False,
+            )
 
         if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
             all_log_probs_padded = []

@@ -45,6 +45,7 @@ import torch
 
 from nemo_rl.data_plane.column_io import kv_first_write
 from nemo_rl.data_plane.interfaces import KVBatchMeta
+from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import (
@@ -270,6 +271,17 @@ class SyncRolloutActor:
             ],
         )
 
+        router_replay_enabled = bool(
+            (cfg.policy.get("router_replay") or {}).get("enabled", False)
+        )
+        if router_replay_enabled and ROUTED_EXPERTS_FIELD not in flat:
+            raise RuntimeError(
+                "policy.router_replay.enabled=true requires routed_experts in "
+                "the rollout bulk payload, but rollout flattening did not "
+                "produce that field. Check vLLM routed-expert capture and the "
+                "message-log flattening path."
+            )
+
         # TQ bulk payload — DP_TRAIN_FIELDS + multimodal extras.
         bulk_batch = BatchedDataDict[Any](
             {
@@ -280,6 +292,8 @@ class SyncRolloutActor:
                 "sample_mask": fb["loss_multiplier"],
             }
         )
+        if ROUTED_EXPERTS_FIELD in flat:
+            bulk_batch[ROUTED_EXPERTS_FIELD] = flat[ROUTED_EXPERTS_FIELD]
         for k, v in flat.get_multimodal_dict(as_tensors=False).items():
             if isinstance(v, torch.Tensor):
                 bulk_batch[k] = v

@@ -22,6 +22,7 @@ from nemo_rl.models.generation.vllm.utils import (
     aggregate_spec_decode_counters,
     compute_spec_decode_metrics,
     format_prompt_for_vllm_generation,
+    normalize_routed_experts_for_generation_output,
 )
 
 
@@ -116,6 +117,129 @@ def test_vllm_utils_vlm_with_none_content_fallback_to_tokens_and_sample_idx():
     p1 = format_prompt_for_vllm_generation(data, sample_idx=1)
     assert isinstance(p0, dict) and isinstance(p1, dict)
     assert "prompt_token_ids" in p0 and "prompt_token_ids" in p1
+
+
+def test_normalize_routed_experts_full_sequence_alignment():
+    class Output:
+        pass
+
+    request_output = Output()
+    completion_output = Output()
+    completion_output.routed_experts = torch.arange(5 * 3 * 2).reshape(5, 3, 2)
+
+    routed_experts = normalize_routed_experts_for_generation_output(
+        request_output,
+        completion_output,
+        valid_length=6,
+        padded_length=8,
+        device=torch.device("cpu"),
+    )
+
+    assert routed_experts.shape == (8, 3, 2)
+    assert routed_experts.dtype == torch.int32
+    assert torch.equal(
+        routed_experts[:5], completion_output.routed_experts.to(torch.int32)
+    )
+    expected_default_route = torch.tensor([0, 1], dtype=torch.int32).view(1, 1, 2)
+    assert torch.equal(routed_experts[5:], expected_default_route.expand(3, 3, 2))
+
+
+def test_normalize_routed_experts_concatenates_prompt_and_decode():
+    class Output:
+        pass
+
+    request_output = Output()
+    completion_output = Output()
+    request_output.prompt_routed_experts = torch.ones(2, 1, 2, dtype=torch.int32)
+    completion_output.routed_experts = 2 * torch.ones(3, 1, 2, dtype=torch.int32)
+
+    routed_experts = normalize_routed_experts_for_generation_output(
+        request_output,
+        completion_output,
+        valid_length=5,
+        padded_length=5,
+        device=torch.device("cpu"),
+    )
+
+    expected_default_route = torch.tensor([0, 1], dtype=torch.int32).view(1, 1, 2)
+    assert torch.equal(routed_experts[:2], request_output.prompt_routed_experts)
+    assert torch.equal(routed_experts[2:4], completion_output.routed_experts[:2])
+    assert torch.equal(routed_experts[4:], expected_default_route.expand(1, 1, 2))
+
+
+def test_normalize_routed_experts_uses_valid_dummy_route_for_missing_last_token():
+    class Output:
+        pass
+
+    request_output = Output()
+    completion_output = Output()
+    completion_output.routed_experts = torch.tensor(
+        [
+            [[4, 5, 6], [7, 8, 9]],
+            [[1, 2, 3], [10, 11, 12]],
+        ],
+        dtype=torch.int32,
+    )
+
+    routed_experts = normalize_routed_experts_for_generation_output(
+        request_output,
+        completion_output,
+        valid_length=3,
+        padded_length=5,
+        device=torch.device("cpu"),
+    )
+
+    expected_default_route = torch.tensor([0, 1, 2], dtype=torch.int32).view(1, 1, 3)
+    assert torch.equal(routed_experts[:2], completion_output.routed_experts)
+    assert torch.equal(routed_experts[2:], expected_default_route.expand(3, 2, 3))
+
+
+def test_normalize_routed_experts_keeps_final_token_dummy_even_if_vllm_returns_row():
+    class Output:
+        pass
+
+    request_output = Output()
+    completion_output = Output()
+    completion_output.routed_experts = torch.tensor(
+        [
+            [[4, 5, 6], [7, 8, 9]],
+            [[1, 2, 3], [10, 11, 12]],
+            [[0, 0, 0], [0, 0, 0]],
+        ],
+        dtype=torch.int32,
+    )
+
+    routed_experts = normalize_routed_experts_for_generation_output(
+        request_output,
+        completion_output,
+        valid_length=3,
+        padded_length=3,
+        device=torch.device("cpu"),
+    )
+
+    expected_default_route = torch.tensor([0, 1, 2], dtype=torch.int32).view(1, 1, 3)
+    assert torch.equal(routed_experts[:2], completion_output.routed_experts[:2])
+    assert torch.equal(routed_experts[2:], expected_default_route.expand(1, 2, 3))
+
+
+def test_normalize_routed_experts_strict_mode_rejects_missing_rows():
+    class Output:
+        pass
+
+    request_output = Output()
+    request_output.num_cached_tokens = 4
+    completion_output = Output()
+    completion_output.routed_experts = torch.ones(2, 1, 2, dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="incomplete routed_experts"):
+        normalize_routed_experts_for_generation_output(
+            request_output,
+            completion_output,
+            valid_length=6,
+            padded_length=6,
+            device=torch.device("cpu"),
+            require_complete_routed_experts=True,
+        )
 
 
 @pytest.mark.vllm

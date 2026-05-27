@@ -36,7 +36,10 @@ from nemo_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
-from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generation
+from nemo_rl.models.generation.vllm.utils import (
+    format_prompt_for_vllm_generation,
+    normalize_routed_experts_for_generation_output,
+)
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
@@ -799,10 +802,14 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         # Process the outputs - but preserve the original input padding structure
         output_ids_list = []
         logprobs_list = []
+        routed_experts_list = []
         generation_lengths = []
         unpadded_sequence_lengths = []
         truncated_list = []  # Track if response was truncated (hit max_tokens)
         max_length = 0
+        return_routed_experts = bool(
+            self.cfg.get("vllm_kwargs", {}).get("enable_return_routed_experts", False)
+        )
         for output in outputs:
             max_length = max(max_length, len(output.outputs[0].token_ids))
 
@@ -846,6 +853,22 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             logprobs_list.append(full_logprobs)
 
             response_length = sequence_length + len(generated_tokens)
+            full_routed_experts = normalize_routed_experts_for_generation_output(
+                output,
+                generation,
+                valid_length=response_length,
+                padded_length=total_length,
+                device=input_ids.device,
+                require_complete_routed_experts=return_routed_experts,
+            )
+            if return_routed_experts and full_routed_experts is None:
+                raise RuntimeError(
+                    "vLLM was asked to return routed experts but the generation output "
+                    "did not include routed_experts."
+                )
+            if full_routed_experts is not None:
+                routed_experts_list.append(full_routed_experts)
+
             generation_lengths.append(len(generated_tokens))
             unpadded_sequence_lengths.append(response_length)
 
@@ -874,6 +897,8 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
                 "truncated": torch.tensor(truncated_list, dtype=torch.bool),
             }
         )
+        if routed_experts_list:
+            return_data["routed_experts"] = torch.stack(routed_experts_list)
 
         return return_data
 

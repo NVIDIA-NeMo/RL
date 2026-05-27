@@ -45,7 +45,7 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
-    allgather_cp_sharded_tensor,
+    allgather_packed_thd_cp_sharded_tensor,
     distributed_vocab_topk,
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
@@ -54,6 +54,11 @@ from nemo_rl.models.megatron.config import MegatronModule
 from nemo_rl.models.megatron.data import ProcessedMicrobatch
 from nemo_rl.models.megatron.draft.hidden_capture import (
     get_capture_context,
+)
+from nemo_rl.models.megatron.router_replay import (
+    clear_router_replay,
+    set_router_replay_backward,
+    set_router_replay_forward,
 )
 from nemo_rl.models.policy import PolicyConfig
 
@@ -151,6 +156,8 @@ def forward_with_post_processing_fn(
     draft_model: Optional[MegatronModule] = None,
     enable_hidden_capture: Optional[bool] = False,
     use_linear_ce_fusion_loss: bool = False,
+    use_router_replay: bool = False,
+    router_replay_train: bool = False,
 ) -> Tuple[torch.Tensor, Callable]:
     """Perform forward pass with pre-processed microbatch and return output tensor and post-processing function.
 
@@ -186,21 +193,40 @@ def forward_with_post_processing_fn(
     position_ids = processed_mb.position_ids
     packed_seq_params = processed_mb.packed_seq_params
     cu_seqlens_padded = processed_mb.cu_seqlens_padded
+    routed_experts_cp_sharded = processed_mb.routed_experts_cp_sharded
+
+    if use_router_replay:
+        if routed_experts_cp_sharded is None:
+            raise RuntimeError(
+                "Router replay is enabled but routed_experts is missing from the microbatch."
+            )
+        set_router_replay_forward(model, routed_experts_cp_sharded)
 
     # Insert hook to capture hidden states and embeddings for draft model training if draft_model is provided
     capture_context, capture = get_capture_context(model, enable_hidden_capture)
-    with capture_context:
-        output_tensor = model_forward(
-            model=model,
-            data_dict=data_dict,
-            input_ids_cp_sharded=input_ids_cp_sharded,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            packed_seq_params=packed_seq_params,
-            defer_fp32_logits=defer_fp32_logits,
-            straggler_timer=straggler_timer,
-            use_linear_ce_fusion_loss=use_linear_ce_fusion_loss,
-        )
+    try:
+        with capture_context:
+            output_tensor = model_forward(
+                model=model,
+                data_dict=data_dict,
+                input_ids_cp_sharded=input_ids_cp_sharded,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                packed_seq_params=packed_seq_params,
+                defer_fp32_logits=defer_fp32_logits,
+                straggler_timer=straggler_timer,
+                use_linear_ce_fusion_loss=use_linear_ce_fusion_loss,
+            )
+    except Exception:
+        if use_router_replay:
+            clear_router_replay(model)
+        raise
+
+    if use_router_replay:
+        if router_replay_train:
+            set_router_replay_backward(model)
+        else:
+            clear_router_replay(model)
 
     if capture is not None:
         from megatron.core.transformer.multi_token_prediction import roll_tensor
@@ -272,6 +298,8 @@ def megatron_forward_backward(
     draft_model: Optional[MegatronModule] = None,
     enable_hidden_capture: Optional[bool] = False,
     use_linear_ce_fusion_loss: bool = False,
+    use_router_replay: bool = False,
+    router_replay_train: bool = False,
 ) -> Any:
     """Execute forward and backward passes using Megatron's utilities.
 
@@ -309,18 +337,26 @@ def megatron_forward_backward(
         draft_model=draft_model,
         enable_hidden_capture=enable_hidden_capture,
         use_linear_ce_fusion_loss=use_linear_ce_fusion_loss,
+        use_router_replay=use_router_replay,
+        router_replay_train=router_replay_train,
     )
     forward_backward_func = get_forward_backward_func()
-    return forward_backward_func(
-        forward_step_func=forward_step,
-        data_iterator=data_iterator,
-        model=model,
-        num_microbatches=num_microbatches,
-        seq_length=seq_length,
-        micro_batch_size=mbs,
-        decoder_seq_length=seq_length,
-        forward_only=forward_only,
-    )
+    if use_router_replay:
+        clear_router_replay(model)
+    try:
+        return forward_backward_func(
+            forward_step_func=forward_step,
+            data_iterator=data_iterator,
+            model=model,
+            num_microbatches=num_microbatches,
+            seq_length=seq_length,
+            micro_batch_size=mbs,
+            decoder_seq_length=seq_length,
+            forward_only=forward_only,
+        )
+    finally:
+        if use_router_replay:
+            clear_router_replay(model)
 
 
 class LossPostProcessor:
@@ -557,7 +593,6 @@ class TopkLogitsPostProcessor:
                       (dummy_loss, {"topk_logits": values, "topk_indices": indices})
         """
         pack = self.cfg["sequence_packing"]["enabled"]
-        cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
         unpacked_seqlen = data_dict["input_ids"].shape[1]
         seq_lengths = data_dict["input_lengths"]
 
@@ -583,56 +618,12 @@ class TopkLogitsPostProcessor:
             if self.cfg["megatron_cfg"]["context_parallel_size"] > 1:
                 cp_grp = get_context_parallel_group()
                 if pack:
-                    # Per-sequence CP allgather following packed-sequence logic
-                    batch_size = data_dict["input_ids"].shape[0]
-                    total_packed_len = int(cu_seqlens_padded[-1].item())
-
-                    topk_vals_full = torch.zeros(
-                        (1, total_packed_len, self.k),
-                        dtype=topk_vals_local.dtype,
-                        device=topk_vals_local.device,
+                    topk_vals_full = allgather_packed_thd_cp_sharded_tensor(
+                        topk_vals_local, cu_seqlens_padded, cp_grp, seq_dim=1
                     )
-                    topk_idx_full = torch.zeros(
-                        (1, total_packed_len, self.k),
-                        dtype=topk_idx_local.dtype,
-                        device=topk_idx_local.device,
+                    topk_idx_full = allgather_packed_thd_cp_sharded_tensor(
+                        topk_idx_local, cu_seqlens_padded, cp_grp, seq_dim=1
                     )
-
-                    for i in range(batch_size):
-                        start_idx = int(cu_seqlens_padded[i].item())
-                        end_idx = int(cu_seqlens_padded[i + 1].item())
-                        if end_idx > start_idx:
-                            local_vals_slice = topk_vals_local[
-                                :, start_idx // cp_size : end_idx // cp_size, :
-                            ]
-                            local_idx_slice = topk_idx_local[
-                                :, start_idx // cp_size : end_idx // cp_size, :
-                            ]
-                            gathered_vals = allgather_cp_sharded_tensor(
-                                local_vals_slice, cp_grp, seq_dim=1
-                            )
-                            gathered_idx = allgather_cp_sharded_tensor(
-                                local_idx_slice, cp_grp, seq_dim=1
-                            )
-                            # Some kernels may return [X, Y, k] where X*Y = (end_idx - start_idx).
-                            # Flatten leading dims and reshape to [1, expected_len, k] to match target.
-                            expected_len = end_idx - start_idx
-                            if (
-                                gathered_vals.dim() == 3
-                                and gathered_vals.shape[1] != expected_len
-                            ):
-                                gathered_vals = gathered_vals.reshape(
-                                    1, expected_len, gathered_vals.shape[-1]
-                                )
-                            if (
-                                gathered_idx.dim() == 3
-                                and gathered_idx.shape[1] != expected_len
-                            ):
-                                gathered_idx = gathered_idx.reshape(
-                                    1, expected_len, gathered_idx.shape[-1]
-                                )
-                            topk_vals_full[:, start_idx:end_idx, :] = gathered_vals
-                            topk_idx_full[:, start_idx:end_idx, :] = gathered_idx
                 else:
                     # Sequence packing must be enabled when CP > 1
                     raise RuntimeError(

@@ -15,6 +15,8 @@
 from collections import defaultdict
 from typing import Any, Optional
 
+import torch
+
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 
@@ -93,6 +95,68 @@ def format_prompt_for_vllm_generation(
             prompts.append(_get_regular_prompt(i))
 
     return prompts if return_all else prompts[0]
+
+
+def normalize_routed_experts_for_generation_output(
+    request_output: Any,
+    completion_output: Any,
+    *,
+    valid_length: int,
+    padded_length: int,
+    device: torch.device,
+    require_complete_routed_experts: bool = False,
+) -> Optional[torch.Tensor]:
+    """Return full-sequence-aligned routed experts as ``[S, L, topk]`` int32."""
+    routed = getattr(completion_output, "routed_experts", None)
+    prompt_routed = getattr(request_output, "prompt_routed_experts", None)
+
+    if prompt_routed is not None:
+        prompt_routed = torch.as_tensor(
+            prompt_routed, dtype=torch.int32, device=device
+        )
+    if routed is not None:
+        routed = torch.as_tensor(routed, dtype=torch.int32, device=device)
+
+    if prompt_routed is not None and routed is not None:
+        routed = torch.cat((prompt_routed, routed), dim=0)
+    elif prompt_routed is not None:
+        routed = prompt_routed
+
+    if routed is None:
+        return None
+    if routed.dim() != 3:
+        raise ValueError(
+            "vLLM routed_experts must have shape [tokens, num_moe_layers, topk], "
+            f"got {tuple(routed.shape)}"
+        )
+
+    expected_rows = min(max(valid_length - 1, 0), padded_length)
+    if require_complete_routed_experts and routed.shape[0] < expected_rows:
+        num_cached_tokens = getattr(request_output, "num_cached_tokens", None)
+        raise ValueError(
+            "vLLM returned incomplete routed_experts for router replay: "
+            f"rows={routed.shape[0]}, expected_at_least={expected_rows}, "
+            f"valid_length={valid_length}, padded_length={padded_length}, "
+            f"num_cached_tokens={num_cached_tokens}. This usually means the "
+            "generation backend did not return routed experts for every "
+            "non-final token in the prompt+response sequence."
+        )
+
+    default_route = torch.arange(
+        routed.shape[2],
+        dtype=torch.int32,
+        device=device,
+    )
+    full = (
+        default_route.view(1, 1, -1)
+        .expand(padded_length, routed.shape[1], routed.shape[2])
+        .clone()
+    )
+    full = full.to(dtype=torch.int32)
+    rows_to_copy = min(expected_rows, routed.shape[0])
+    if rows_to_copy > 0:
+        full[:rows_to_copy] = routed[:rows_to_copy].to(device=device)
+    return full
 
 
 def aggregate_spec_decode_counters(

@@ -39,7 +39,10 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     verify_right_padding,
 )
-from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generation
+from nemo_rl.models.generation.vllm.utils import (
+    format_prompt_for_vllm_generation,
+    normalize_routed_experts_for_generation_output,
+)
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 
 
@@ -941,6 +944,11 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             generation_details = final_request_output.outputs[0]
             generated_token_ids = list(generation_details.token_ids)
             num_generated_tokens = len(generated_token_ids)
+            return_routed_experts = bool(
+                self.cfg.get("vllm_kwargs", {}).get(
+                    "enable_return_routed_experts", False
+                )
+            )
 
             original_input_ids_single_row = input_ids_batch[sample_idx]
             final_output_tensor_len = current_input_actual_length + num_generated_tokens
@@ -1016,15 +1024,30 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 device=original_input_ids_single_row.device,
             )
 
-            result_batch = BatchedDataDict[GenerationOutputSpec](
-                {
-                    "output_ids": output_ids_single_item_batched,
-                    "logprobs": logprobs_single_item,
-                    "generation_lengths": generation_lengths_tensor,
-                    "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
-                    "truncated": truncated_tensor,
-                }
+            result_dict = {
+                "output_ids": output_ids_single_item_batched,
+                "logprobs": logprobs_single_item,
+                "generation_lengths": generation_lengths_tensor,
+                "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
+                "truncated": truncated_tensor,
+            }
+            routed_experts = normalize_routed_experts_for_generation_output(
+                final_request_output,
+                generation_details,
+                valid_length=unpadded_total_length,
+                padded_length=final_output_tensor_len,
+                device=original_input_ids_single_row.device,
+                require_complete_routed_experts=return_routed_experts,
             )
+            if return_routed_experts and routed_experts is None:
+                raise RuntimeError(
+                    "vLLM was asked to return routed experts but the generation output "
+                    "did not include routed_experts."
+                )
+            if routed_experts is not None:
+                result_dict["routed_experts"] = routed_experts.unsqueeze(0)
+
+            result_batch = BatchedDataDict[GenerationOutputSpec](result_dict)
 
             return (sample_idx, result_batch)
 
