@@ -25,7 +25,6 @@ sdpo:
   max_reprompt_len: 4096             # max tokens in the reprompted teacher prompt
   topk_logits_k: 100                 # K in top-k logit distillation (paper §A.2)
   remove_thinking_from_demo: false   # strip <think>…</think> from demonstrations
-  dont_reprompt_on_self_success: true  # don't use own success as demo
 
 loss_fn:
   success_reward_threshold: 1.0      # kept in sync with sdpo.success_reward_threshold

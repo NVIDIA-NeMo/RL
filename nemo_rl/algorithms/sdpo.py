@@ -120,7 +120,6 @@ class SDPOConfig(TypedDict):
     topk_logits_k: int  # K in top-k logit distillation (paper: 100)
     reprompt_template: NotRequired[str]  # uses {prompt} and {solution} placeholders
     remove_thinking_from_demo: NotRequired[bool]  # strip <think>…</think> from demos
-    dont_reprompt_on_self_success: NotRequired[bool]  # exclude own success as demo
     # "peer_rollout" (default): teacher conditions on a successful peer rollout.
     # "env_feedback": teacher conditions on the failed attempt's env feedback.
     # "combined": full paper Table 2 form — peer rollout + env feedback together
@@ -272,7 +271,6 @@ def _log_env_feedback_sample(
     env_feedback_template: str,
     combined_template: str,
     combined_success_template: str,
-    dont_reprompt_on_self_success: bool,
     max_chars: int,
     metrics: dict,
 ) -> None:
@@ -304,12 +302,11 @@ def _log_env_feedback_sample(
         response = _extract_last_assistant_content(msg_log)
         env_feedback = _extract_environment_output(msg_log)
 
-        # Find a peer demo (successful peer in the same prompt group)
+        # Find a peer demo (successful peer in the same prompt group; a
+        # successful sample may use its own attempt, per paper Table 2).
         group_start = (idx // num_generations) * num_generations
         peer_demo: Optional[str] = None
         for j in range(group_start, group_start + num_generations):
-            if j == idx and dont_reprompt_on_self_success:
-                continue
             if rewards[j].item() >= success_threshold:
                 peer_demo = _extract_last_assistant_content(message_logs[j])
                 if peer_demo:
@@ -378,7 +375,6 @@ def build_sdpo_teacher_data(
     success_reward_threshold: float = 1.0,
     reprompt_template: str = _DEFAULT_REPROMPT_TEMPLATE,
     remove_thinking_from_demo: bool = False,
-    dont_reprompt_on_self_success: bool = False,
     max_reprompt_len: int = 8192,
     pad_token_id: int = 0,
     make_seq_len_divisible_by: int = 1,
@@ -475,8 +471,6 @@ def build_sdpo_teacher_data(
             if feedback_source in ("peer_rollout", "combined"):
                 if len(success_indices) > 0:
                     for demo_idx in success_indices:
-                        if dont_reprompt_on_self_success and demo_idx == i:
-                            continue
                         for m in reversed(group_logs[demo_idx]):
                             if m["role"] == "assistant":
                                 peer_demo = m.get("content", "")
@@ -898,7 +892,6 @@ def sdpo_train(
     topk_logits_k = sdpo_cfg["topk_logits_k"]
     reprompt_template = sdpo_cfg.get("reprompt_template", _DEFAULT_REPROMPT_TEMPLATE)
     remove_thinking = sdpo_cfg.get("remove_thinking_from_demo", False)
-    dont_self = sdpo_cfg.get("dont_reprompt_on_self_success", False)
     feedback_source = sdpo_cfg.get("feedback_source", "peer_rollout")
     env_feedback_template = sdpo_cfg.get("env_feedback_template", _DEFAULT_ENV_FEEDBACK_TEMPLATE)
     combined_template = sdpo_cfg.get("combined_template", _DEFAULT_COMBINED_TEMPLATE)
@@ -1060,7 +1053,6 @@ def sdpo_train(
                         success_reward_threshold=success_threshold,
                         reprompt_template=reprompt_template,
                         remove_thinking_from_demo=remove_thinking,
-                        dont_reprompt_on_self_success=dont_self,
                         max_reprompt_len=max_reprompt_len,
                         pad_token_id=tokenizer.pad_token_id,
                         make_seq_len_divisible_by=make_div_by,
@@ -1093,7 +1085,6 @@ def sdpo_train(
                         env_feedback_template=env_feedback_template,
                         combined_template=combined_template,
                         combined_success_template=combined_success_template,
-                        dont_reprompt_on_self_success=dont_self,
                         max_chars=sdpo_cfg.get("log_sample_max_chars", 2000),
                         metrics=metrics,
                     )

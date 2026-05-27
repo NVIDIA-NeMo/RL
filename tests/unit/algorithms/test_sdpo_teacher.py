@@ -146,7 +146,6 @@ def test_combined_mode_signals_both_successes_and_failures():
         tokenizer=tokenizer,
         success_reward_threshold=1.0,
         feedback_source="combined",
-        dont_reprompt_on_self_success=True,
     )
 
     assert sdpo_mask.tolist() == [True, True, True, True]
@@ -168,7 +167,6 @@ def test_combined_mode_failed_sample_renders_peer_and_env():
         tokenizer=tokenizer,
         success_reward_threshold=1.0,
         feedback_source="combined",
-        dont_reprompt_on_self_success=True,
     )
     # The last call rendered the teacher for sample index 1 (the failed one).
     rendered = tokenizer.last_rendered[0]["content"]

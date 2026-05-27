@@ -33,7 +33,6 @@ sdpo:
   max_reprompt_len: 12288            # teacher prompt may include long error logs
   topk_logits_k: 20                  # paper Table 12 (Section 4 / LCBv6): K=20
   remove_thinking_from_demo: true    # strip <think>...</think> from peer demos so {solution} slot stays content-only
-  dont_reprompt_on_self_success: true
   feedback_source: "combined"        # paper Table 2: peer-rollout demo + env feedback
   use_ema_teacher: true              # paper Table 12: EMA-regularized self-teacher
   ema_alpha: 0.01                    # paper Table 12 (Section 4 / LCBv6)
