@@ -48,19 +48,27 @@ export MEGATRON_PATCH_DIR="${MEGATRON_PATCH_DIR:-/lustre/fsw/portfolios/coreai/u
 export WANDB_RUN_NAME="${WANDB_RUN_NAME:-${RUN_NAME}}"
 export WANDB_API_KEY_FILE="${WANDB_API_KEY_FILE:-/home/snorouzi/wandb_api_key.txt}"
 export ENV_TAG="${ENV_TAG:-gsm8k_nd3b_sglang_a652eb48_mb500dac75}"
+export RUST_DIR="${RUST_DIR:-/lustre/fsw/portfolios/coreai/users/snorouzi/rust}"
+export RUSTUP_HOME="${RUSTUP_HOME:-${RUST_DIR}/rustup}"
+export CARGO_HOME="${CARGO_HOME:-${RUST_DIR}/cargo}"
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${RUST_DIR}/target}"
+export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-stable}"
+export PROTOC_HOME="${PROTOC_HOME:-/lustre/fsw/portfolios/coreai/users/snorouzi/protoc}"
+export PROTOC="${PROTOC:-${PROTOC_HOME}/bin/protoc}"
+export PATH="${CARGO_HOME}/bin:${PROTOC_HOME}/bin:${PATH}"
 if [[ -z "${NEMO_RL_VENV_DIR:-}" || "${NEMO_RL_VENV_DIR:-}" == "/opt/ray_venvs" ]]; then
   export NEMO_RL_VENV_DIR="/lustre/fsw/portfolios/coreai/users/snorouzi/nemo_rl_worker_venvs_${ENV_TAG}"
 fi
 if [[ -z "${NRL_FORCE_REBUILD_VENVS+x}" ]]; then
-  if [[ "${MODE}" == "sbatch" ]]; then
-    export NRL_FORCE_REBUILD_VENVS="true"
-  else
-    export NRL_FORCE_REBUILD_VENVS="false"
-  fi
+  export NRL_FORCE_REBUILD_VENVS="false"
 else
   export NRL_FORCE_REBUILD_VENVS
 fi
 export FORCE_REINSTALL_PACKAGES="${FORCE_REINSTALL_PACKAGES:-false}"
+export FORCE_REINSTALL_NEMO_RL="${FORCE_REINSTALL_NEMO_RL:-${FORCE_REINSTALL_PACKAGES}}"
+export FORCE_REINSTALL_SGLANG="${FORCE_REINSTALL_SGLANG:-${FORCE_REINSTALL_PACKAGES}}"
+export FORCE_REINSTALL_MEGATRON_BRIDGE="${FORCE_REINSTALL_MEGATRON_BRIDGE:-${FORCE_REINSTALL_PACKAGES}}"
+export FORCE_REINSTALL_MEGATRON_CORE="${FORCE_REINSTALL_MEGATRON_CORE:-${FORCE_REINSTALL_PACKAGES}}"
 export UV_NO_BINARY_PACKAGE="${UV_NO_BINARY_PACKAGE:-}"
 export UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-300}"
 export NEMO_RL_SGLANG_KERNEL_SOURCE="${NEMO_RL_SGLANG_KERNEL_SOURCE:-/lustre/fsw/portfolios/coreai/users/snorouzi/wheels/sglang_kernel_torch210_cu129_py313/sglang_kernel-0.4.1-cp310-abi3-linux_x86_64.whl}"
@@ -129,13 +137,17 @@ run_training() {
   git -C 3rdparty/Megatron-LM-workspace/Megatron-LM rev-parse HEAD || true
 
   reinstall_args=()
-  if [[ "${FORCE_REINSTALL_PACKAGES}" == "true" || "${FORCE_REINSTALL_PACKAGES}" == "1" ]]; then
-    reinstall_args=(
-      --reinstall-package nemo-rl
-      --reinstall-package sglang
-      --reinstall-package megatron-bridge
-      --reinstall-package megatron-core
-    )
+  if [[ "${FORCE_REINSTALL_NEMO_RL}" == "true" || "${FORCE_REINSTALL_NEMO_RL}" == "1" ]]; then
+    reinstall_args+=(--reinstall-package nemo-rl)
+  fi
+  if [[ "${FORCE_REINSTALL_SGLANG}" == "true" || "${FORCE_REINSTALL_SGLANG}" == "1" ]]; then
+    reinstall_args+=(--reinstall-package sglang)
+  fi
+  if [[ "${FORCE_REINSTALL_MEGATRON_BRIDGE}" == "true" || "${FORCE_REINSTALL_MEGATRON_BRIDGE}" == "1" ]]; then
+    reinstall_args+=(--reinstall-package megatron-bridge)
+  fi
+  if [[ "${FORCE_REINSTALL_MEGATRON_CORE}" == "true" || "${FORCE_REINSTALL_MEGATRON_CORE}" == "1" ]]; then
+    reinstall_args+=(--reinstall-package megatron-core)
   fi
 
   extra_config_overrides=()
@@ -199,9 +211,21 @@ export MEGATRON_PATCH_DIR="${MEGATRON_PATCH_DIR}"
 export WANDB_RUN_NAME="${WANDB_RUN_NAME}"
 export WANDB_API_KEY_FILE="${WANDB_API_KEY_FILE}"
 export ENV_TAG="${ENV_TAG}"
+export RUST_DIR="${RUST_DIR}"
+export RUSTUP_HOME="${RUSTUP_HOME}"
+export CARGO_HOME="${CARGO_HOME}"
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR}"
+export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN}"
+export PROTOC_HOME="${PROTOC_HOME}"
+export PROTOC="${PROTOC}"
+export PATH="${CARGO_HOME}/bin:${PROTOC_HOME}/bin:${PATH}"
 export NEMO_RL_VENV_DIR="${NEMO_RL_VENV_DIR}"
 export NRL_FORCE_REBUILD_VENVS="${NRL_FORCE_REBUILD_VENVS}"
 export FORCE_REINSTALL_PACKAGES="${FORCE_REINSTALL_PACKAGES}"
+export FORCE_REINSTALL_NEMO_RL="${FORCE_REINSTALL_NEMO_RL}"
+export FORCE_REINSTALL_SGLANG="${FORCE_REINSTALL_SGLANG}"
+export FORCE_REINSTALL_MEGATRON_BRIDGE="${FORCE_REINSTALL_MEGATRON_BRIDGE}"
+export FORCE_REINSTALL_MEGATRON_CORE="${FORCE_REINSTALL_MEGATRON_CORE}"
 export UV_NO_BINARY_PACKAGE="${UV_NO_BINARY_PACKAGE}"
 export UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT}"
 export NEMO_RL_SGLANG_KERNEL_SOURCE="${NEMO_RL_SGLANG_KERNEL_SOURCE}"
