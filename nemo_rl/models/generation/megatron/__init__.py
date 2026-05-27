@@ -14,7 +14,7 @@
 
 from nemo_rl.models.generation.megatron.config import (
     MCoreGenerationConfig,
-    MegatronGenerationConfig,
+    MCoreGenerationSpecificArgs,
 )
 from nemo_rl.models.generation.megatron.megatron_generation import (
     MegatronGeneration,
@@ -22,6 +22,6 @@ from nemo_rl.models.generation.megatron.megatron_generation import (
 
 __all__ = [
     "MCoreGenerationConfig",
+    "MCoreGenerationSpecificArgs",
     "MegatronGeneration",
-    "MegatronGenerationConfig",
 ]

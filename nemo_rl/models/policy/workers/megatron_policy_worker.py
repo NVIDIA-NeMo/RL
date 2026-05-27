@@ -801,6 +801,7 @@ class MegatronPolicyWorkerImpl(
             post_processing_fn=TopkLogitsPostProcessor(cfg=self.cfg, k=k),
             forward_only=True,
             defer_fp32_logits=self.defer_fp32_logits,
+            sampling_params=self.sampling_params,
             straggler_timer=self.mcore_state.straggler_timer,
         )
 
@@ -868,9 +869,11 @@ class MegatronPolicyWorkerImpl(
         Returns:
             List of (parameter_name, size_in_bytes) tuples.
         """
-        self.refit_conversion_tasks = self.megatron_bridge.get_conversion_tasks(
-            [self.model]
-        )
+        self.refit_conversion_tasks = [
+            task
+            for task in self.megatron_bridge.get_conversion_tasks([self.model])
+            if task is not None
+        ]
         param_info = []
 
         def calculate_size_in_bytes(param, tp_size, ep_size):
@@ -1178,13 +1181,6 @@ class MegatronPolicyWorkerImpl(
     ):
         """Save a training checkpoint.
 
-        With async_save=True, this method returns after D2H staging.
-        The actual disk write continues in a background persistent worker process.
-        Callers must call finalize_async_save() before renaming the directory or
-        starting another save.
-
-        With async_save=False (default), this blocks until the write is complete.
-
         Args:
             weights_path: The specific directory path where the checkpoint will be saved.
             optimizer_path: If not None, optimizer and scheduler states are saved if they exist.
@@ -1221,6 +1217,9 @@ class MegatronPolicyWorkerImpl(
                 if self.scheduler is not None:
                     scheduler_to_save = self.scheduler
 
+            # Ensure model is in eval mode for consistent saving, unless actively training
+            # This is a common practice, though NeMo's save might handle this.
+            # For safety, if not in training loop, setting to eval.
             is_training = self.model.training
             if not is_training:
                 self.model.eval()
@@ -1254,29 +1253,6 @@ class MegatronPolicyWorkerImpl(
             raise
         finally:
             self.mcore_state.cfg.checkpoint.save = original_save_path
-
-    def finalize_async_save(self):
-        """Block until the in-flight async write completes and run finalize_fns.
-
-        Safe to call when async_save is disabled (no-op).
-        Does NOT terminate the persistent worker — it stays alive for the next save.
-        """
-        maybe_finalize_async_save(
-            self.mcore_state,
-            ckpt_cfg=self.mcore_state.cfg.checkpoint,
-            blocking=True,
-        )
-
-    def terminate_async_checkpoint_worker(self):
-        """Block until any in-flight write completes, then shut down the persistent worker.
-
-        Directly closes the async queue on GlobalState, bypassing
-        maybe_finalize_async_save's early-return guard on ckpt_cfg.async_save.
-        Safe to call regardless of whether async_save is enabled.
-        """
-        async_queue = getattr(self.mcore_state, "async_calls_queue", None)
-        if async_queue is not None:
-            async_queue.close()
 
     def load_checkpoint(self, weights_path: str, optimizer_path: Optional[str] = None):
         """Load a training checkpoint.

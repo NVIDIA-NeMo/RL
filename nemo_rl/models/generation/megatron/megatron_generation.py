@@ -40,7 +40,7 @@ class MegatronRefitController:
         self._policy = policy
         self._dst_rank_offset: int = 0
 
-    def init_refit_collective(
+    def init_collective(
         self,
         ip: str,
         port: int,
@@ -65,7 +65,7 @@ class MegatronRefitController:
         """
         self._dst_rank_offset = dst_rank_offset
         return self._policy.worker_group.run_all_workers_single_data(
-            "init_refit_collective",
+            "init_collective_mcore_generation",
             ip=ip,
             port=port,
             world_size=world_size,
@@ -181,7 +181,7 @@ class MegatronGeneration(GenerationInterface):
         Returns:
             List of Ray ObjectRefs for the collective init futures.
         """
-        return self._refit.init_refit_collective(
+        return self._refit.init_collective(
             ip,
             port,
             world_size,

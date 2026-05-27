@@ -98,56 +98,37 @@ class MegatronGenerationMixin:
         buffer_size_gb = mcore_generation_config["buffer_size_gb"]
         num_cuda_graphs = mcore_generation_config["num_cuda_graphs"]
         block_size_tokens = mcore_generation_config["block_size_tokens"]
-        enable_chunked_prefill = mcore_generation_config.get(
-            "enable_chunked_prefill", True
-        )
+        enable_chunked_prefill = mcore_generation_config["enable_chunked_prefill"]
         use_cuda_graphs_for_non_decode_steps = mcore_generation_config[
             "use_cuda_graphs_for_non_decode_steps"
         ]
         max_tokens = mcore_generation_config["max_tokens"]
 
         # The value may be overwritten by `recompute_kv_cache_after_weight_updates`.
-        kv_cache_management_mode = mcore_generation_config.get(
-            "kv_cache_management_mode", "persist"
-        )
+        kv_cache_management_mode = mcore_generation_config["kv_cache_management_mode"]
         persist_cuda_graphs = kv_cache_management_mode != "persist"
-        cuda_graph_impl = mcore_generation_config.get("cuda_graph_impl", "local")
 
         materialize_only_last_token_logits = mcore_generation_config[
             "materialize_only_last_token_logits"
         ]
         num_speculative_tokens = mcore_generation_config["num_speculative_tokens"]
-        max_requests = mcore_generation_config.get("max_requests", None)
-        use_flashinfer_sampling = mcore_generation_config.get(
-            "use_flashinfer_sampling", True
-        )
-        sampling_backend = "flashinfer" if use_flashinfer_sampling else "torch"
+        max_requests = mcore_generation_config.get("max_requests")
 
         mamba_inference_state_config = MambaInferenceStateConfig.from_model(self.model)
-        if (
-            mcore_generation_config.get("mamba_inference_ssm_states_dtype", None)
-            is not None
-        ):
+        if mcore_generation_config.get("mamba_inference_ssm_states_dtype") is not None:
             mamba_inference_state_config.ssm_states_dtype = resolve_torch_dtype(
                 mcore_generation_config["mamba_inference_ssm_states_dtype"]
             )
-        if (
-            mcore_generation_config.get("mamba_inference_conv_states_dtype", None)
-            is not None
-        ):
+        if mcore_generation_config.get("mamba_inference_conv_states_dtype") is not None:
             mamba_inference_state_config.conv_states_dtype = resolve_torch_dtype(
                 mcore_generation_config["mamba_inference_conv_states_dtype"]
             )
 
-        enable_prefix_caching = mcore_generation_config.get(
-            "enable_prefix_caching", False
-        )
-        prefix_caching_coordinator_policy = mcore_generation_config.get(
-            "prefix_caching_coordinator_policy", "first_prefix_block"
-        )
-        mamba_memory_ratio = mcore_generation_config.get(
-            "mamba_memory_ratio", 0.1 + 0.1 * num_speculative_tokens
-        )
+        # logging_step_interval is a power-user argument that should be NotRequired. 
+        logging_step_interval = mcore_generation_config.get("logging_step_interval")
+        # This will be fixed in upstream MCore, allowing an argument of `None`.
+        if logging_step_interval is None:
+            logging_step_interval = 0
 
         inference_config = InferenceConfig(
             block_size_tokens=block_size_tokens,
@@ -159,20 +140,19 @@ class MegatronGenerationMixin:
             static_kv_memory_pointers=persist_cuda_graphs,
             use_cuda_graphs_for_non_decode_steps=use_cuda_graphs_for_non_decode_steps,
             use_flashinfer_fused_rope=True,
-            sampling_backend=sampling_backend,
+            sampling_backend="flashinfer",
             use_synchronous_zmq_collectives=True,
             materialize_only_last_token_logits=materialize_only_last_token_logits,
             enable_chunked_prefill=enable_chunked_prefill,
-            enable_prefix_caching=enable_prefix_caching,
+            enable_prefix_caching=mcore_generation_config["enable_prefix_caching"],
             prefix_caching_coordinator_policy=PrefixCachingCoordinatorPolicy(
-                prefix_caching_coordinator_policy
+                "first_prefix_block"
             ),
             pg_collection=pg_collection,
             mamba_inference_state_config=mamba_inference_state_config,
-            mamba_memory_ratio=mamba_memory_ratio,
-            logging_step_interval=mcore_generation_config.get(
-                "logging_step_interval", 0
-            ),
+            # Reserve more KV-cache space when speculative decoding is enabled.
+            mamba_memory_ratio=0.1 + 0.1 * num_speculative_tokens,
+            logging_step_interval=logging_step_interval,
             num_speculative_tokens=num_speculative_tokens,
             max_requests=max_requests,
         )
@@ -200,10 +180,10 @@ class MegatronGenerationMixin:
         self._inference_engine_asleep = True
         print(f"[Rank {self.rank}] Initialized persistent inference engine")
 
-    async def _start_inference_coordinator(self, coordinator_port: int):
+    async def _start_inference_coordinator(self):
         """Start the inference coordinator and engine loop."""
         self.coordinator_addr = await self.dynamic_inference_engine.start_listening_to_data_parallel_coordinator(
-            inference_coordinator_port=coordinator_port,
+            inference_coordinator_port=None,
             launch_inference_coordinator=True,
         )
         if torch.distributed.get_rank() == 0:
@@ -293,9 +273,7 @@ class MegatronGenerationMixin:
             tokenizer=self.megatron_tokenizer,
             rank=torch.distributed.get_rank(),
             server_port=free_port,
-            parsers=self.cfg["generation"]["mcore_generation_config"].get(
-                "parsers", []
-            ),
+            parsers=self.cfg["generation"]["mcore_generation_config"]["parsers"],
             verbose=False,
         )
 
@@ -318,13 +296,13 @@ class MegatronGenerationMixin:
                 time.sleep(2)
         return base_url
 
-    def _run_async_coordinator_start(self, coordinator_port: int):
+    def _run_async_coordinator_start(self):
         """Start the coordinator and engine loop in the background thread."""
         if self._inference_loop is None:
             self._start_inference_loop_thread()
 
         future = asyncio.run_coroutine_threadsafe(
-            self._start_inference_coordinator(coordinator_port), self._inference_loop
+            self._start_inference_coordinator(), self._inference_loop
         )
         # _start_inference_coordinator awaits RUNNING, so future.result() only returns once
         # this rank's engine is fully warmed up. Cross-rank sync is handled by Ray's actor
@@ -333,9 +311,7 @@ class MegatronGenerationMixin:
         print(f"[Rank {torch.distributed.get_rank()}] Coordinator started")
 
         if (
-            self.cfg["generation"]["mcore_generation_config"].get(
-                "expose_http_server", False
-            )
+            self.cfg["generation"]["mcore_generation_config"]["expose_http_server"]
             and torch.distributed.get_rank() == 0
         ):
             print(f"[Rank {torch.distributed.get_rank()}] Starting HTTP Server")
@@ -354,9 +330,9 @@ class MegatronGenerationMixin:
         if self.is_generation_colocated:
             if self._inference_engine_initialized and not self._inference_engine_asleep:
                 self._sleep()
-            cuda_graph_impl = self.cfg["generation"]["mcore_generation_config"].get(
-                "cuda_graph_impl", "local"
-            )
+            cuda_graph_impl = self.cfg["generation"]["mcore_generation_config"][
+                "cuda_graph_impl"
+            ]
             if cuda_graph_impl != "none":
                 toggle_cuda_graphs(lang_module, set_to="none")
 
@@ -397,7 +373,7 @@ class MegatronGenerationMixin:
         ):
             rotary_module.forward.cache_clear()
 
-        cuda_graph_impl = mcore_generation_config.get("cuda_graph_impl", "local")
+        cuda_graph_impl = mcore_generation_config["cuda_graph_impl"]
         if cuda_graph_impl != "none":
             toggle_cuda_graphs(lang_module, set_to=cuda_graph_impl)
 
@@ -409,10 +385,7 @@ class MegatronGenerationMixin:
         if tags is None or "weights" not in tags:
             if not self._inference_engine_initialized:
                 self._initialize_inference_engine(mcore_generation_config)
-                coordinator_port = mcore_generation_config.get(
-                    "inference_coordinator_port", 5995
-                )
-                self._run_async_coordinator_start(coordinator_port)
+                self._run_async_coordinator_start()
             else:
                 self._wake()
 
@@ -626,7 +599,7 @@ class MegatronGenerationMixin:
 class MegatronGenerationRefitMixin:
     """Refit collective, weight transfer, and engine suspend/resume around refits."""
 
-    def init_refit_collective(
+    def init_collective_mcore_generation(
         self,
         ip: str,
         port: int,
@@ -652,7 +625,6 @@ class MegatronGenerationRefitMixin:
 
         local_rank = torch.distributed.get_rank()
         global_rank = local_rank + rank_offset
-        self.refit_rank_offset = rank_offset
 
         # port+1 to avoid collision with the caller's rendezvous on `port`.
         store = torch.distributed.TCPStore(

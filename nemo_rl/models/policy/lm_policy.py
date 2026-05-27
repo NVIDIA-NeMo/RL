@@ -775,6 +775,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # We don't need to do anything here
         return True
 
+    def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
+        # We don't need to do anything here
+        return True
+
     def prepare_for_training(self, *args: Any, **kwargs: Any) -> None:
         # onload everything to the GPU
         futures = self.worker_group.run_all_workers_single_data("prepare_for_training")

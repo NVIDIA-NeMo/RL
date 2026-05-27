@@ -802,6 +802,7 @@ def setup(
         inference_world_size = inference_nodes * inference_gpus_per_node
         world_size = train_world_size + inference_world_size
 
+        # init collective
         if backend == "megatron":
             refit_backend = policy_config["generation"]["mcore_generation_config"][
                 "refit_backend"
@@ -810,7 +811,7 @@ def setup(
             # (preinit_nvshmem, send_weights_via_reshard) go through the same
             # instance and see the dst_rank_offset recorded here.
             policy._megatron_refit = MegatronRefitController(policy)
-            futures_train = policy._megatron_refit.init_refit_collective(
+            futures_train = policy._megatron_refit.init_collective(
                 ip,
                 port,
                 world_size,
@@ -3223,10 +3224,10 @@ def async_grpo_train(
                         )
                         POLICY_GENERATION_STALE = False
 
-                    # Update weight version before resuming trajectory collection so that all trajectories are updated with the new correct weight version
-                    weight_version += 1
-                    trajectory_collector.set_weight_version.remote(weight_version)
-                    trajectory_collector.resume_after_refit.remote()
+                        # Update weight version before resuming trajectory collection so that all trajectories are updated with the new correct weight version
+                        weight_version += 1
+                        trajectory_collector.set_weight_version.remote(weight_version)
+                        trajectory_collector.resume_after_refit.remote()
 
                 # Clear logger metrics after each refit (weight sync), starting a new logging cycle
                 if policy_generation is not None:

@@ -39,6 +39,8 @@ run_test      uv run --no-sync bash ./tests/functional/grpo_megatron.sh
 run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_mbridge_restore.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_eagle3_online.sh
 run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation.sh
+run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_non_colocated.sh
+run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_async_gym.sh
 
 cd ${PROJECT_ROOT}/tests
 coverage combine .coverage*

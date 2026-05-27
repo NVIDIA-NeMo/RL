@@ -1,0 +1,51 @@
+defaults: ../../../nemo_gym/grpo_nanov3.yaml
+
+grpo:
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: true
+
+checkpointing:
+  checkpoint_dir: results/grpo-nanov3-30BA3B-2n8g-megatron_generation-async-gym
+
+policy:
+  model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16
+  tokenizer:
+    name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  train_global_batch_size: 16
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 2048
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    bias_activation_fusion: false
+    tensor_model_parallel_size: 2
+    expert_model_parallel_size: 8
+    sequence_parallel: true
+  sequence_packing:
+    enabled: false
+  generation:
+    backend: megatron
+    mcore_generation_config:
+      tensor_model_parallel_size: 2
+      expert_model_parallel_size: 8
+      sequence_parallel: true
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 1
+
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-nanov3-30BA3B-2n8g-megatron_generation-async-gym
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2
