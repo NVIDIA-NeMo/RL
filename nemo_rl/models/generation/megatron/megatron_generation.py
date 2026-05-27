@@ -28,88 +28,6 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.policy import PolicyConfig
 
 
-class MegatronRefitController:
-    """Controller-side fan-outs for megatron refit, scoped to one policy."""
-
-    def __init__(self, policy):
-        """Bind to a policy.
-
-        Args:
-            policy: Object exposing a Ray `worker_group` with `run_all_workers_single_data`.
-        """
-        self._policy = policy
-        self._dst_rank_offset: int = 0
-
-    def init_collective(
-        self,
-        ip: str,
-        port: int,
-        world_size: int,
-        *,
-        rank_offset: int,
-        dst_rank_offset: int,
-        refit_backend: str = "gloo",
-    ) -> list[ray.ObjectRef]:
-        """Fan out refit-collective initialization across the policy's workers.
-
-        Args:
-            ip: IP for the process group rendezvous.
-            port: Port for the process group rendezvous.
-            world_size: Total world size (train + inference workers).
-            rank_offset: Offset for this side's ranks.
-            dst_rank_offset: Rank offset of the destination (inference) side.
-            refit_backend: `"gloo"` or `"nvshmem"`.
-
-        Returns:
-            Ray futures for the per-worker init calls.
-        """
-        self._dst_rank_offset = dst_rank_offset
-        return self._policy.worker_group.run_all_workers_single_data(
-            "init_collective_mcore_generation",
-            ip=ip,
-            port=port,
-            world_size=world_size,
-            rank_offset=rank_offset,
-            refit_backend=refit_backend,
-        )
-
-    def preinit_nvshmem(self) -> list[ray.ObjectRef]:
-        """Fan out NVSHMEM pre-initialization across the policy's workers."""
-        return self._policy.worker_group.run_all_workers_single_data(
-            "preinit_nvshmem_collective"
-        )
-
-    def send_weights_via_reshard(self) -> list[ray.ObjectRef]:
-        """Source side: stream weights from training workers to the inference cluster."""
-        return self._policy.worker_group.run_all_workers_single_data(
-            "swap_weights_via_reshard",
-            is_source=True,
-            dst_rank_offset=self._dst_rank_offset,
-        )
-
-    def receive_weights_via_reshard(self) -> list[ray.ObjectRef]:
-        """Destination side: receive weights from the training cluster."""
-        return self._policy.worker_group.run_all_workers_single_data(
-            "swap_weights_via_reshard",
-            is_source=False,
-            dst_rank_offset=self._dst_rank_offset,
-        )
-
-    def suspend_inference_for_refit(self) -> None:
-        """Pause + suspend the inference engine on all workers before a weight refit."""
-        futures = self._policy.worker_group.run_all_workers_single_data(
-            "suspend_for_refit"
-        )
-        ray.get(futures)
-
-    def resume_inference_after_refit(self) -> None:
-        """Resume + unpause the inference engine on all workers after a weight refit."""
-        futures = self._policy.worker_group.run_all_workers_single_data(
-            "resume_after_refit"
-        )
-        ray.get(futures)
-
-
 class MegatronGeneration(GenerationInterface):
     """Generation interface backed by Megatron for non-colocated inference."""
 
@@ -155,7 +73,6 @@ class MegatronGeneration(GenerationInterface):
             init_reference_model=False,
             weights_path=weights_path,
         )
-        self._refit = MegatronRefitController(self._policy)
 
         # Start the inference engine + HTTP server during construction.
         self.prepare_for_generation()
@@ -181,22 +98,17 @@ class MegatronGeneration(GenerationInterface):
         Returns:
             List of Ray ObjectRefs for the collective init futures.
         """
-        return self._refit.init_collective(
+        return self._policy.init_collective_mcore_generation(
             ip,
             port,
             world_size,
             rank_offset=train_world_size,
-            dst_rank_offset=train_world_size,
             refit_backend=refit_backend,
         )
 
     def update_weights_from_collective(self) -> list[ray.ObjectRef]:
-        """Receive updated weights from the training cluster via collective communication.
-
-        Returns:
-            List of Ray ObjectRefs for the weight update futures.
-        """
-        return self._refit.receive_weights_via_reshard()
+        """Receive updated weights from the training cluster via collective communication."""
+        return self._policy.swap_weights_via_reshard(is_source=False)
 
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
@@ -261,15 +173,19 @@ class MegatronGeneration(GenerationInterface):
 
         Must be called simultaneously on both training and inference workers.
         """
-        return self._refit.preinit_nvshmem()
+        return self._policy.preinit_nvshmem()
 
     def suspend_for_refit(self) -> None:
         """Suspend the inference engine for safe weight updates."""
-        self._refit.suspend_inference_for_refit()
+        ray.get(
+            self._policy.worker_group.run_all_workers_single_data("suspend_for_refit")
+        )
 
     def resume_after_refit(self) -> None:
         """Resume the inference engine after weight updates."""
-        self._refit.resume_inference_after_refit()
+        ray.get(
+            self._policy.worker_group.run_all_workers_single_data("resume_after_refit")
+        )
 
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Prepare state dict metadata for weight refitting.

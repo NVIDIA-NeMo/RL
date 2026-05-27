@@ -376,6 +376,38 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # this function should co-work with vllm, so we should wait for all futures to complete outside
         return futures
 
+    def init_collective_mcore_generation(
+        self,
+        ip: str,
+        port: int,
+        world_size: int,
+        *,
+        rank_offset: int,
+        refit_backend: str = "gloo",
+    ) -> list[ray.ObjectRef]:
+        """Initialize the megatron refit collective on this policy's workers."""
+        return self.worker_group.run_all_workers_single_data(
+            "init_collective_mcore_generation",
+            ip=ip,
+            port=port,
+            world_size=world_size,
+            rank_offset=rank_offset,
+            refit_backend=refit_backend,
+        )
+
+    def preinit_nvshmem(self) -> list[ray.ObjectRef]:
+        """Pre-initialize NVSHMEM on this policy's workers (no-op when not using nvshmem)."""
+        return self.worker_group.run_all_workers_single_data(
+            "preinit_nvshmem_collective"
+        )
+
+    def swap_weights_via_reshard(self, *, is_source: bool) -> list[ray.ObjectRef]:
+        """Send (`is_source=True`) or receive (`is_source=False`) weights via megatron reshard."""
+        return self.worker_group.run_all_workers_single_data(
+            "swap_weights_via_reshard",
+            is_source=is_source,
+        )
+
     # ── DP-shard helpers ────────────────────────────────────────────────
     # DRY for Policy's logprob/train methods only. The data-plane sibling
     # TQPolicy shards KVBatchMeta via ``shard_meta_for_dp``; the

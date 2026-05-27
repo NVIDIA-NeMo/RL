@@ -71,9 +71,6 @@ from nemo_rl.experience.rollouts import (
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.megatron import MegatronGeneration
-from nemo_rl.models.generation.megatron.megatron_generation import (
-    MegatronRefitController,
-)
 from nemo_rl.models.generation.sglang import SGLangConfig, SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.policy import PolicyConfig
@@ -807,16 +804,11 @@ def setup(
             refit_backend = policy_config["generation"]["mcore_generation_config"][
                 "refit_backend"
             ]
-            # Stash a controller on the training Policy so later refit calls
-            # (preinit_nvshmem, send_weights_via_reshard) go through the same
-            # instance and see the dst_rank_offset recorded here.
-            policy._megatron_refit = MegatronRefitController(policy)
-            futures_train = policy._megatron_refit.init_collective(
+            futures_train = policy.init_collective_mcore_generation(
                 ip,
                 port,
                 world_size,
                 rank_offset=0,
-                dst_rank_offset=train_world_size,
                 refit_backend=refit_backend,
             )
             futures_inference = policy_generation.init_collective(
@@ -1282,7 +1274,7 @@ def refit_policy_generation(
         )
         == "nvshmem"
     ):
-        futures_train = policy._megatron_refit.preinit_nvshmem()
+        futures_train = policy.preinit_nvshmem()
         futures_inference = policy_generation.preinit_nvshmem_collective()
         ray.get(futures_train + futures_inference)
 
@@ -1339,7 +1331,7 @@ def refit_policy_generation(
                     "SGLang haven't implemented non-colocated inference mode. "
                 )
             if isinstance(policy_generation, MegatronGeneration):
-                futures_train = policy._megatron_refit.send_weights_via_reshard()
+                futures_train = policy.swap_weights_via_reshard(is_source=True)
             else:
                 futures_train = policy.broadcast_weights_for_collective(
                     kv_scales=kv_scales

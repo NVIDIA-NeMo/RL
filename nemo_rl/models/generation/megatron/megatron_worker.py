@@ -678,7 +678,8 @@ class MegatronGenerationRefitMixin:
         from megatron.core.resharding.refit import prepare_swap_model_weights
 
         is_source = rank_offset == 0
-        dst_rank_offset = (
+        # Cache for later refit calls (swap_weights_via_reshard).
+        self.refit_dst_rank_offset = (
             torch.distributed.get_world_size() if is_source else rank_offset
         )
 
@@ -689,7 +690,7 @@ class MegatronGenerationRefitMixin:
             target_model=None if is_source else self.model,
             group=self.refit_pg,
             src_rank_offset=0,
-            dst_rank_offset=dst_rank_offset,
+            dst_rank_offset=self.refit_dst_rank_offset,
         )
 
     def preinit_nvshmem_collective(self) -> None:
@@ -705,14 +706,11 @@ class MegatronGenerationRefitMixin:
             return
         self.refit_copy_service._ensure_initialized()
 
-    def swap_weights_via_reshard(
-        self, is_source: bool, dst_rank_offset: int = 0
-    ) -> bool:
-        """Transfer weights using Megatron's ``swap_model_weights`` API.
+    def swap_weights_via_reshard(self, is_source: bool) -> bool:
+        """Transfer weights using Megatron's `swap_model_weights` API.
 
         Args:
             is_source: True for training workers (senders), False for inference workers (receivers).
-            dst_rank_offset: Rank offset of the inference (destination) side.
 
         Returns:
             True on success.
@@ -728,7 +726,7 @@ class MegatronGenerationRefitMixin:
             refit_method=self.refit_copy_service,
             group=self.refit_pg,
             src_rank_offset=0,
-            dst_rank_offset=dst_rank_offset,
+            dst_rank_offset=self.refit_dst_rank_offset,
         )
 
         return True
