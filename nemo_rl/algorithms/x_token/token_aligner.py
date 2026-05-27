@@ -299,10 +299,13 @@ class TokenAligner:
 
         Returns:
             A list of :class:`AlignmentPair`. Insertions/deletions use
-            ``-1`` for the empty side's start/end.
+            ``-1`` for the empty side's start/end. Pair start/end indices
+            address the **original** token sequences (not canonical
+            space), so they can be written straight into the chunk-id
+            tensors in :meth:`_pairs_to_batch`.
         """
-        student_canon = _canonicalize_sequence(student_tokens)
-        teacher_canon = _canonicalize_sequence(teacher_tokens)
+        student_canon, student_canon_to_orig = _canonicalize_sequence(student_tokens)
+        teacher_canon, teacher_canon_to_orig = _canonicalize_sequence(teacher_tokens)
 
         aligned, _ = self._align_with_anchors(
             student_canon,
@@ -321,11 +324,43 @@ class TokenAligner:
             gap_penalty=gap_penalty,
             max_combination_len=self.max_combination_len,
         )
-        # Attach is_correct mask using canonicalized comparison so that
-        # ignore_leading_char_diff=True semantics are baked in upstream.
+        # Remap canonical-space span indices back onto the original token
+        # axis BEFORE the is_correct mask write — the mask reads
+        # pair.s_tokens (canonical strings) and is order-independent, but
+        # everything downstream of _align_single (the chunk_id writes in
+        # _pairs_to_batch) needs original-space indices.
+        self._remap_pairs_to_original(
+            aligned,
+            student_canon_to_orig=student_canon_to_orig,
+            teacher_canon_to_orig=teacher_canon_to_orig,
+        )
         for pair, m in zip(aligned, self._alignment_mask(aligned)):
             pair.is_correct = m
         return aligned
+
+    @staticmethod
+    def _remap_pairs_to_original(
+        pairs: List[AlignmentPair],
+        *,
+        student_canon_to_orig: List[Tuple[int, int]],
+        teacher_canon_to_orig: List[Tuple[int, int]],
+    ) -> None:
+        """Remap pair start/end indices from canonical to original space.
+
+        Mutates ``pairs`` in place. Insertion/deletion pairs (where the
+        empty side already has ``-1`` start/end) keep the sentinel.
+        ``s_end - 1`` / ``t_end - 1`` indexes the last canonical token in
+        the span; its ``orig_end`` is the new exclusive end.
+        """
+        for pair in pairs:
+            if pair.s_start != -1:
+                s0 = student_canon_to_orig[pair.s_start][0]
+                s1 = student_canon_to_orig[pair.s_end - 1][1]
+                pair.s_start, pair.s_end = s0, s1
+            if pair.t_start != -1:
+                t0 = teacher_canon_to_orig[pair.t_start][0]
+                t1 = teacher_canon_to_orig[pair.t_end - 1][1]
+                pair.t_start, pair.t_end = t0, t1
 
     # ------------------------------------------------------------------ #
     # Anchor-based segmentation
@@ -951,32 +986,63 @@ def canonical_token(token: str, *, enabled: bool = True) -> str:
     return token
 
 
-def _canonicalize_sequence(seq: List[str]) -> List[str]:
-    """Canonicalize every token in a sequence, including byte-merging."""
-    merged = _merge_encoding_artifacts(seq)
+def _canonicalize_sequence(
+    seq: List[str],
+) -> Tuple[List[str], List[Tuple[int, int]]]:
+    """Canonicalize every token in a sequence, including byte-merging.
+
+    Returns:
+        ``(canon, canon_to_orig)``. ``canon_to_orig[k]`` is a half-open
+        ``[orig_start, orig_end)`` range giving the original-token positions
+        that canonical token ``k`` was built from. Ranges are
+        non-overlapping, strictly increasing, and jointly cover
+        ``range(len(seq))`` — required so that DP-output indices over
+        ``canon`` can be remapped to positions on the original input-id
+        axis (see :meth:`TokenAligner._remap_pairs_to_original`).
+    """
+    merged, ranges = _merge_encoding_artifacts(seq)
     canon = [canonical_token(t) for t in merged]
-    return _merge_consecutive_bytes(canon)
+    return _merge_consecutive_bytes(canon, ranges)
 
 
-def _merge_encoding_artifacts(tokens: List[str]) -> List[str]:
-    """Merge known multi-token mojibake patterns into single tokens."""
+def _merge_encoding_artifacts(
+    tokens: List[str],
+) -> Tuple[List[str], List[Tuple[int, int]]]:
+    """Merge known multi-token mojibake patterns into single tokens.
+
+    Returns:
+        ``(merged, ranges)`` with one ``(orig_start, orig_end)`` entry per
+        output token. Every entry in :data:`_MULTI_TOKEN_ARTIFACT_FIXES`
+        rewrites to a single replacement token, so each merge contributes
+        exactly one range covering the matched pattern.
+    """
     if not tokens:
-        return tokens
+        return [], []
     result: List[str] = []
+    ranges: List[Tuple[int, int]] = []
     i = 0
     while i < len(tokens):
         matched = False
         for pattern, replacement in _MULTI_TOKEN_ARTIFACT_FIXES:
             pl = len(pattern)
             if i + pl <= len(tokens) and tokens[i : i + pl] == pattern:
+                # Every fix in _MULTI_TOKEN_ARTIFACT_FIXES is N→1; the
+                # remap relies on that to attach the matched original
+                # range to a single output token.
+                assert len(replacement) == 1, (
+                    "Multi-token artifact fix replacement must be a single "
+                    f"token; got {replacement!r}"
+                )
                 result.extend(replacement)
+                ranges.append((i, i + pl))
                 i += pl
                 matched = True
                 break
         if not matched:
             result.append(tokens[i])
+            ranges.append((i, i + 1))
             i += 1
-    return result
+    return result, ranges
 
 
 def _get_byte_value(token_char: str) -> int | None:
@@ -989,13 +1055,26 @@ def _get_byte_value(token_char: str) -> int | None:
     return VISUAL_BYTE_MAP.get(token_char)
 
 
-def _merge_consecutive_bytes(tokens: List[str]) -> List[str]:
-    """Merge consecutive byte-fallback tokens back into Unicode characters."""
+def _merge_consecutive_bytes(
+    tokens: List[str],
+    in_ranges: List[Tuple[int, int]],
+) -> Tuple[List[str], List[Tuple[int, int]]]:
+    """Merge consecutive byte-fallback tokens back into Unicode characters.
+
+    Propagates ``in_ranges`` parallel to ``tokens``: when a byte buffer
+    collapses to one character, its parallel range slice is collapsed to a
+    single ``(start, end)``; otherwise ranges pass through unchanged.
+    """
     if not tokens:
-        return tokens
+        return [], []
+    assert len(tokens) == len(in_ranges), (
+        f"tokens/ranges length mismatch: {len(tokens)} vs {len(in_ranges)}"
+    )
     result: List[str] = []
+    result_ranges: List[Tuple[int, int]] = []
     byte_buffer: List[str] = []
-    for token in tokens:
+    byte_buffer_ranges: List[Tuple[int, int]] = []
+    for token, rng in zip(tokens, in_ranges):
         clean = token.lstrip("Ġ")
         if not clean:
             all_bytes = False
@@ -1003,25 +1082,44 @@ def _merge_consecutive_bytes(tokens: List[str]) -> List[str]:
             all_bytes = all(_get_byte_value(c) is not None for c in clean)
         if all_bytes:
             byte_buffer.append(token)
+            byte_buffer_ranges.append(rng)
         else:
             if byte_buffer:
-                result.extend(_try_merge_byte_buffer(byte_buffer))
+                merged, merged_ranges = _try_merge_byte_buffer(
+                    byte_buffer, byte_buffer_ranges
+                )
+                result.extend(merged)
+                result_ranges.extend(merged_ranges)
                 byte_buffer = []
+                byte_buffer_ranges = []
             result.append(token)
+            result_ranges.append(rng)
     if byte_buffer:
-        result.extend(_try_merge_byte_buffer(byte_buffer))
-    return result
+        merged, merged_ranges = _try_merge_byte_buffer(
+            byte_buffer, byte_buffer_ranges
+        )
+        result.extend(merged)
+        result_ranges.extend(merged_ranges)
+    return result, result_ranges
 
 
-def _try_merge_byte_buffer(byte_tokens: List[str]) -> List[str]:
-    """Decode 2-4 buffered byte tokens as a single UTF-8 character."""
+def _try_merge_byte_buffer(
+    byte_tokens: List[str],
+    byte_ranges: List[Tuple[int, int]],
+) -> Tuple[List[str], List[Tuple[int, int]]]:
+    """Decode 2-4 buffered byte tokens as a single UTF-8 character.
+
+    Returns the merged single-character token plus a single collapsed
+    range covering the whole buffer, or the unchanged buffer + ranges
+    when no merge is possible.
+    """
     if not byte_tokens:
-        return []
+        return [], []
     if len(byte_tokens) == 1:
         token = byte_tokens[0]
         clean = token.lstrip("Ġ")
         if len(clean) <= 1:
-            return byte_tokens
+            return byte_tokens, byte_ranges
 
     space_prefix = "Ġ" if byte_tokens[0].startswith("Ġ") else ""
     raw_bytes: List[int] = []
@@ -1030,18 +1128,21 @@ def _try_merge_byte_buffer(byte_tokens: List[str]) -> List[str]:
         for c in clean:
             v = _get_byte_value(c)
             if v is None:
-                return byte_tokens
+                return byte_tokens, byte_ranges
             raw_bytes.append(v)
 
     if len(raw_bytes) < 2 or len(raw_bytes) > 4:
-        return byte_tokens
+        return byte_tokens, byte_ranges
     try:
         decoded = bytes(raw_bytes).decode("utf-8")
         if len(decoded) == 1 and ord(decoded) > 127:
-            return [space_prefix + decoded]
-        return byte_tokens
+            return (
+                [space_prefix + decoded],
+                [(byte_ranges[0][0], byte_ranges[-1][1])],
+            )
+        return byte_tokens, byte_ranges
     except UnicodeDecodeError:
-        return byte_tokens
+        return byte_tokens, byte_ranges
 
 
 def _strings_equal_flexible(s1: str, s2: str, ignore_leading_char_diff: bool) -> bool:
