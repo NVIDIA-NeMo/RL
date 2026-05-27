@@ -128,7 +128,7 @@ automodel = [
 ]
 vllm = [
   "cuda-python",
-  "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@c9f8b34dcdacc20aa746b786f983492c51072870",
+  "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@67fc64863d43521080bf2005e6528d0fceee9510",
   # deep_ep also needs libibverbs-dev
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
@@ -450,7 +450,7 @@ requires-dist = ["torch", "packaging", "ninja"]
 [[tool.uv.dependency-metadata]]
 name = "deep_gemm"
 # This version has to match the version in the commit/rev/tag used
-version = "v2.0.0+7b6b556"
+version = "2.5.0"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [[tool.uv.dependency-metadata]]
