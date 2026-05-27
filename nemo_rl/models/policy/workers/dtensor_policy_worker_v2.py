@@ -1017,7 +1017,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         return self.nccl_reshard_refit_info
 
     def get_src_dtensor(self, param_name):
-        """Get a DTensorRef for a source parameter to use with xferdtensor_golden.
+        """Get a DTensorRef for a source parameter to use with xferdtensor.
 
         Handles DTensor state_dict quirks: DTensor.state_dict() returns float32
         params even when model dtype is bfloat16, so this converts to the
@@ -1039,10 +1039,10 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
 
     @torch.no_grad()
     def nccl_reshard_refit(self, kv_scales=None):
-        """Transfer weights to generation workers via xferdtensor_golden."""
+        """Transfer weights to generation workers via xferdtensor."""
         from torch.distributed.tensor.placement_types import Replicate
 
-        from nemo_rl.distributed.nccl_reshard_utils import xferdtensor_golden
+        from nemo_rl.distributed.xferdtensor import xferdtensor
 
         if self.model_update_group.rank == 0:
             print("[DTensor nccl_reshard_refit] started", flush=True)
@@ -1065,9 +1065,9 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 src_tensor = self.get_src_dtensor(param_info["name"])
                 # DTensor path: get_src_dtensor calls .full_tensor(), so every
                 # src rank holds the complete tensor.  Use all-Replicate for src
-                # so xferdtensor_golden does a single broadcast.
+                # so xferdtensor does a single broadcast.
                 src_placements = [Replicate() for _ in param_info["src_placements"]]
-                xferdtensor_golden(
+                xferdtensor(
                     src_tensor,
                     param_info["src_mesh_info"],
                     src_placements,

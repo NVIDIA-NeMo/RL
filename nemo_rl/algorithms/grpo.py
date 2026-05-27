@@ -1259,7 +1259,7 @@ def refit_policy_generation(
                     "SGLang haven't implemented non-colocated inference mode. "
                 )
             if nccl_reshard_refit:
-                # nccl_reshard path: per-parameter xferdtensor_golden transfer
+                # nccl_reshard path: per-parameter xferdtensor transfer
                 futures_train = policy.nccl_reshard_refit(kv_scales=kv_scales)
                 futures_inference = policy_generation.nccl_reshard_refit()
                 ray.get(futures_train)

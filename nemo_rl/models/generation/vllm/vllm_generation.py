@@ -904,7 +904,7 @@ class VllmGeneration(GenerationInterface):
         ray.get(futures)
 
     def nccl_reshard_refit(self) -> list[ray.ObjectRef]:
-        """Receive weights from training workers via nccl_reshard (xferdtensor_golden)."""
+        """Receive weights from training workers via nccl_reshard (xferdtensor)."""
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
 

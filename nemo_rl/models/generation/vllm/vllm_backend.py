@@ -355,24 +355,24 @@ class VllmInternalWorkerExtension:
     def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
         """Store per-layer param metadata for nccl_reshard-based refit."""
         from nemo_rl.distributed.nccl_reshard_utils import (
-            normalize_refit_info_placements,
+            restore_refit_info_placements,
         )
 
-        # Normalize placements that may have been dict-serialized by msgspec
-        # during vLLM's collective_rpc transport.
+        # Restore placements + meshes flattened by msgspec during vLLM's
+        # collective_rpc transport.
         self.nccl_reshard_refit_info = (  # pyrefly: ignore[implicitly-defined-attribute]
-            normalize_refit_info_placements(refit_info)
+            restore_refit_info_placements(refit_info)
         )
 
         # HF→vLLM mapping depends only on model structure and the (now
-        # normalized) refit_info — cache it here so each refit step doesn't
+        # restored) refit_info — cache it here so each refit step doesn't
         # repeat the per-param suffix matching against vLLM params.
         self._hf_to_vllm = self._build_hf_to_vllm_mapping(  # pyrefly: ignore[implicitly-defined-attribute]
             self.nccl_reshard_refit_info
         )
 
     def _build_hf_to_vllm_mapping(self, refit_info):
-        """Build mapping from HF param names to vLLM (param, dim0_slice).
+        """Build mapping from HF param names to vLLM (param, merged_param_slice).
 
         vLLM merges certain HF params into combined tensors:
           - q_proj + k_proj + v_proj  → qkv_proj  (concat along dim 0)
@@ -384,9 +384,10 @@ class VllmInternalWorkerExtension:
         global offsets proportionally: local_offset = global_offset * local_dim0 / global_dim0.
 
         Returns:
-            dict: hf_name → (vllm_param_tensor, dim0_slice or None)
-                  If dim0_slice is None, the HF param maps 1:1 to the vLLM param.
-                  If dim0_slice is a slice, the HF param occupies that LOCAL slice.
+            dict: hf_name → (vllm_param_tensor, merged_param_slice or None)
+                  If merged_param_slice is None, the HF param maps 1:1 to the
+                  vLLM param.  Otherwise it is the LOCAL slice into the merged
+                  vLLM param that this HF piece occupies.
         """
         vllm_params = dict(self.model_runner.model.named_parameters())
         mapping = {}
@@ -537,32 +538,34 @@ class VllmInternalWorkerExtension:
             return full_tensor[start : start + shard_size]
 
     def get_dst_dtensor(self, param_name, param_info):
-        """Get destination tensor info for xferdtensor_golden.
+        """Get destination tensor info for xferdtensor.
 
         Takes an HF parameter name and returns a tuple suitable for calling
-        the canonical 7-arg xferdtensor_golden. Handles three cases:
+        the canonical 7-arg xferdtensor. Handles three cases:
 
         1. **Direct param**: HF name maps 1:1 to a vLLM parameter.
            Returns DTensorRef wrapping the vLLM param with global shape.
         2. **Merged param**: HF name is part of a merged vLLM tensor
            (qkv_proj, gate_up_proj). Returns DTensorRef wrapping a full-size
-           buffer with all-Replicate placement, plus a finalize callback.
+           buffer with all-Replicate placement, plus a post_refit_hook.
         3. **Unmapped param**: No vLLM parameter (e.g., tied lm_head).
            Returns DTensorRef wrapping a dummy buffer for broadcast participation.
 
         Must be called after ``_hf_to_vllm`` is populated (inside ``nccl_reshard_refit``).
 
         Returns:
-            ``(dst_tensor, dst_placements, finalize_fn)`` where:
-            - ``dst_tensor``: DTensorRef to pass to xferdtensor_golden
+            ``(dst_tensor, dst_placements, post_refit_hook)`` where:
+            - ``dst_tensor``: DTensorRef to pass to xferdtensor
             - ``dst_placements``: placement list to use (may differ from param_info)
-            - ``finalize_fn``: callable to run after xferdtensor_golden, or None
+            - ``post_refit_hook``: callable to run after xferdtensor
+              (copies the TP-local slice from the temp buffer into the live
+              vLLM merged param), or None for direct/unmapped params
         """
         from torch.distributed.tensor.placement_types import Replicate
 
         from nemo_rl.distributed.nccl_reshard_utils import _STR_TO_DTYPE, DTensorRef
 
-        vllm_param, dim0_slice = self._hf_to_vllm.get(param_name, (None, None))
+        vllm_param, merged_param_slice = self._hf_to_vllm.get(param_name, (None, None))
         global_shape = param_info["global_shape"]
         dst_placements = param_info["dst_placements"]
 
@@ -572,7 +575,7 @@ class VllmInternalWorkerExtension:
             buf = torch.empty(global_shape, device=self.device, dtype=dtype)
             return DTensorRef(buf, global_shape), dst_placements, None
 
-        if dim0_slice is not None:
+        if merged_param_slice is not None:
             # Merged param — receive full global tensor with all-Replicate
             buf = torch.empty(global_shape, device=self.device, dtype=vllm_param.dtype)
             all_replicate = [Replicate() for _ in dst_placements]
@@ -582,13 +585,15 @@ class VllmInternalWorkerExtension:
             # rank (e.g. MergedColumnParallelLinear with disable_tp=True), the
             # slice into vllm_param covers the FULL global tensor — no TP
             # local-slicing needed.
-            is_replicated_merge = dim0_slice.stop - dim0_slice.start == global_shape[0]
+            is_replicated_merge = (
+                merged_param_slice.stop - merged_param_slice.start == global_shape[0]
+            )
 
-            def finalize(
+            def post_refit_hook(
                 _buf=buf,
                 _name=param_name,
                 _vllm_param=vllm_param,
-                _slice=dim0_slice,
+                _slice=merged_param_slice,
                 _tp_rank=tp_rank,
                 _tp_size=tp_size,
                 _replicated=is_replicated_merge,
@@ -601,21 +606,21 @@ class VllmInternalWorkerExtension:
                     )
                 _vllm_param.data[_slice].copy_(local_data)
 
-            return DTensorRef(buf, global_shape), all_replicate, finalize
+            return DTensorRef(buf, global_shape), all_replicate, post_refit_hook
 
-        # Direct 1:1 mapping — xferdtensor_golden handles TP sharding.
+        # Direct 1:1 mapping — xferdtensor handles TP sharding.
         # Use .data to avoid "leaf Variable that requires grad" error from
-        # in-place copy_ inside xferdtensor_golden.
+        # in-place copy_ inside xferdtensor.
         return DTensorRef(vllm_param.data, global_shape), dst_placements, None
 
     def nccl_reshard_refit(self) -> bool:
-        """Receive weights from training workers via xferdtensor_golden.
+        """Receive weights from training workers via xferdtensor.
 
         Uses ``get_dst_dtensor`` to prepare each parameter, then calls the
-        canonical 7-arg ``xferdtensor_golden``. For merged params (qkv_proj,
-        gate_up_proj), a finalize callback copies the TP-local slice.
+        canonical 7-arg ``xferdtensor``. For merged params (qkv_proj,
+        gate_up_proj), a post_refit_hook copies the TP-local slice.
         """
-        from nemo_rl.distributed.nccl_reshard_utils import xferdtensor_golden
+        from nemo_rl.distributed.xferdtensor import xferdtensor
 
         # self._hf_to_vllm is built once in prepare_nccl_reshard_refit_info.
         use_per_stage = hasattr(self, "pp_comm_groups") and self.pp_comm_groups
@@ -629,10 +634,10 @@ class VllmInternalWorkerExtension:
                 else:
                     group = self.model_update_group
 
-                dst_tensor, dst_placements, finalize = self.get_dst_dtensor(
+                dst_tensor, dst_placements, post_refit_hook = self.get_dst_dtensor(
                     param_info["name"], param_info
                 )
-                xferdtensor_golden(
+                xferdtensor(
                     None,
                     param_info["src_mesh_info"],
                     param_info["src_placements"],
@@ -641,8 +646,8 @@ class VllmInternalWorkerExtension:
                     dst_placements,
                     group,
                 )
-                if finalize:
-                    finalize()
+                if post_refit_hook:
+                    post_refit_hook()
 
         # Ensure all NCCL broadcasts and copy_ ops complete before vLLM resumes.
         torch.cuda.synchronize()

@@ -12,14 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Utilities for nccl_reshard-based refit between disaggregated train/gen meshes.
+"""Refit metadata builders and lightweight wrapper types for nccl_reshard.
 
 This module provides:
-- xferdtensor_golden: canonical broadcast-based reference implementation of XferDTensor
-- DTensorRef: lightweight DTensor-compatible wrapper for xferdtensor_golden
-- MeshInfo / TensorWrapper: lightweight wrappers for cross-world communication
+- MeshInfo: lightweight DeviceMesh-compatible wrapper that doesn't require a
+  shared torch.distributed process group (needed for cross-world transfers)
+- DTensorRef: lightweight DTensor-compatible wrapper that xferdtensor
+  reads via duck typing (``.shape``, ``._local_tensor``)
 - Placement rules: mapping param names to TP/EP sharding strategies
 - build_nccl_reshard_refit_info: compute per-layer param metadata for refit
+- restore_refit_info_placements: undo msgspec dict-flattening of placements
+  and meshes on the receiving side
+
+The transfer kernel itself (``xferdtensor``) lives in
+``nemo_rl/distributed/xferdtensor.py`` — import from there directly.
 """
 
 import re
@@ -31,15 +37,15 @@ from torch.distributed._tensor import Shard
 from torch.distributed.tensor.placement_types import Replicate
 
 # =========================================================================
-# MeshInfo / TensorWrapper / DTensorRef
+# MeshInfo / DTensorRef — lightweight wrapper types
 # =========================================================================
 
 
 class MeshInfo:
-    """Lightweight mesh metadata compatible with xferdtensor_golden.
+    """Lightweight mesh metadata compatible with xferdtensor.
 
     Provides the same .mesh / ._mesh interface as DeviceMesh but without
-    requiring torch.distributed process groups -- allowing xferdtensor_golden
+    requiring torch.distributed process groups -- allowing xferdtensor
     to read mesh topology across separate torch.distributed worlds.
     """
 
@@ -52,25 +58,10 @@ class MeshInfo:
         return self.mesh.ndim
 
 
-class TensorWrapper:
-    """Wraps a plain GPU tensor with a DTensor-like interface.
-
-    xferdtensor_golden writes into ``dst_tensor._local_tensor`` on the
-    destination side.  This wrapper lets plain vLLM parameters satisfy that
-    interface.
-    """
-
-    def __init__(self, tensor: torch.Tensor):
-        self._local_tensor = tensor
-        self.dtype = tensor.dtype
-        self.shape = tensor.shape
-        self.device = tensor.device
-
-
 class DTensorRef:
-    """DTensor-compatible reference for xferdtensor_golden.
+    """DTensor-compatible reference for xferdtensor.
 
-    Provides the interface expected by the canonical xferdtensor_golden:
+    Provides the interface expected by the canonical xferdtensor:
     - ``.shape``: global tensor shape (torch.Size)
     - ``._local_tensor``: local shard (src side) or dst buffer (dst side)
     - ``.dtype``, ``.device``: tensor metadata
@@ -97,7 +88,7 @@ class DTensorRef:
         self.device = device if device is not None else local_tensor.device
 
     def full_tensor(self):
-        """Return the underlying tensor (used on src side by xferdtensor_golden)."""
+        """Return the underlying tensor (used on src side by xferdtensor)."""
         return self._local_tensor
 
 
@@ -181,11 +172,8 @@ def _get_expert_tp_shard_dim(param_name: str) -> Optional[int]:
 
 
 # =========================================================================
-# xferdtensor_golden: canonical implementation from xferdtensor repo
+# Dtype lookup (used when receiving msgspec'd dtype names over the wire)
 # =========================================================================
-# The functions below are copied verbatim from xferdtensor/src/xferdtensor.py.
-# The 7-argument signature of xferdtensor_golden matches the real
-# nccl_reshard.XferDTensor API for trivial future replacement.
 
 _STR_TO_DTYPE = {
     "torch.bfloat16": torch.bfloat16,
@@ -197,177 +185,18 @@ _STR_TO_DTYPE = {
 }
 
 
-def _flatten_mesh_ranks(mesh):
-    mesh_tensor = getattr(mesh, "mesh", None)
-    if mesh_tensor is None:
-        mesh_tensor = getattr(mesh, "_mesh", None)
-    if mesh_tensor is None:
-        raise ValueError("DeviceMesh does not expose mesh ranks.")
-    return [int(rank) for rank in mesh_tensor.flatten().tolist()]
+# =========================================================================
+# Placement restoration (undo msgspec dict-serialization on the wire)
+# =========================================================================
 
 
-def _get_tensor_meta(src_tensor, dst_tensor):
-    if src_tensor is not None:
-        return src_tensor.shape, src_tensor.device
-    if dst_tensor is not None:
-        return dst_tensor.shape, dst_tensor.device
-    device = torch.device("cuda", torch.cuda.current_device())
-    return None, device
+def _restore_placement(p):
+    """Reconstruct a single placement object after msgspec round-trip.
 
-
-def _get_mesh_coords(mesh, rank):
-    mesh_tensor = getattr(mesh, "mesh", None)
-    if mesh_tensor is None:
-        mesh_tensor = getattr(mesh, "_mesh", None)
-    if mesh_tensor is None:
-        raise ValueError("DeviceMesh does not expose mesh ranks.")
-    coords = (mesh_tensor == rank).nonzero(as_tuple=False)
-    if coords.numel() == 0:
-        return None
-    return coords[0].tolist()
-
-
-def _compute_shard_slices(global_shape, mesh_shape, mesh_coords, placements):
-    slices = [slice(None) for _ in range(len(global_shape))]
-    shard_map = {}
-    for mesh_dim, placement in enumerate(placements):
-        if isinstance(placement, Shard):
-            shard_map.setdefault(placement.dim, []).append(
-                (mesh_dim, mesh_shape[mesh_dim], mesh_coords[mesh_dim])
-            )
-
-    for tensor_dim, shard_info in shard_map.items():
-        shard_info.sort(key=lambda item: item[0])
-        num_chunks = 1
-        for _, size, _ in shard_info:
-            num_chunks *= size
-
-        total_size = int(global_shape[tensor_dim])
-        base = total_size // num_chunks
-        remainder = total_size % num_chunks
-        sizes = [base + 1 if i < remainder else base for i in range(num_chunks)]
-
-        strides = []
-        running = 1
-        for _, size, _ in reversed(shard_info):
-            strides.append(running)
-            running *= size
-        strides.reverse()
-
-        linear_index = 0
-        for (mesh_dim, size, coord), stride in zip(shard_info, strides):
-            if coord >= size:
-                raise ValueError(f"Invalid mesh coord {coord} for mesh dim {mesh_dim}.")
-            linear_index += coord * stride
-
-        start = sum(sizes[:linear_index])
-        end = start + sizes[linear_index]
-        slices[tensor_dim] = slice(start, end)
-
-    return slices
-
-
-def xferdtensor_golden(
-    src_tensor,
-    src_mesh,
-    src_placement,
-    dst_tensor,
-    dst_mesh,
-    dst_placement,
-    process_group,
-):
-    """Broadcast-based reference implementation of XferDTensor.
-
-    Reconstructs the full (global) tensor from TP-local shards on the source
-    mesh, then each destination rank extracts its local shard based on
-    ``dst_placement``.
-
-    When all ``src_placement`` entries are ``Replicate``, a single broadcast
-    from ``src_ranks[0]`` suffices.  Otherwise, one broadcast per unique shard
-    region reconstructs the full tensor.
-
-    This is the canonical 7-argument signature matching the real
-    ``nccl_reshard.XferDTensor`` API.  Callers must wrap raw tensors in
-    ``DTensorRef`` so that ``.shape`` reports the global shape and
-    ``._local_tensor`` holds the local shard.
+    vLLM's collective_rpc serializes ``Shard(N)`` to ``{"dim": N}`` and
+    ``Replicate()`` to ``{}``; this restores them to real instances. No-op
+    if the input is already a Shard/Replicate.
     """
-    rank = process_group.rank
-    src_ranks = _flatten_mesh_ranks(src_mesh)
-    dst_ranks = _flatten_mesh_ranks(dst_mesh)
-
-    global_shape, device = _get_tensor_meta(src_tensor, dst_tensor)
-    if global_shape is None:
-        raise ValueError("Unable to infer tensor shape/dtype from src or dst tensor.")
-    dtype = src_tensor.dtype if src_tensor is not None else dst_tensor.dtype
-
-    has_shard = any(isinstance(p, Shard) for p in src_placement)
-
-    if not has_shard:
-        # Fast path: all Replicate — single broadcast from src_ranks[0]
-        if src_tensor is not None:
-            full_tensor = src_tensor._local_tensor.clone()
-        else:
-            full_tensor = torch.empty(global_shape, device=device, dtype=dtype)
-        process_group.broadcast(full_tensor, src=src_ranks[0])
-    else:
-        # Reconstruct the full tensor from per-rank shards.
-        # Deduplicate: DP-replicated ranks hold the same shard, so only one
-        # representative rank broadcasts per unique shard region.
-        full_tensor = torch.empty(global_shape, device=device, dtype=dtype)
-        src_mesh_tensor = getattr(src_mesh, "mesh")
-        mesh_shape = list(src_mesh_tensor.shape)
-
-        seen_slices: dict[tuple, tuple] = {}
-        for src_rank in src_ranks:
-            coords = _get_mesh_coords(src_mesh, src_rank)
-            shard_slices = _compute_shard_slices(
-                global_shape, mesh_shape, coords, src_placement
-            )
-            slice_key = tuple((s.start, s.stop) for s in shard_slices)
-            if slice_key not in seen_slices:
-                seen_slices[slice_key] = (src_rank, shard_slices)
-
-        for src_rank, shard_slices in seen_slices.values():
-            shard_shape = tuple(
-                (s.stop - s.start) if s.start is not None else global_shape[i]
-                for i, s in enumerate(shard_slices)
-            )
-            shard_buf = torch.empty(shard_shape, device=device, dtype=dtype)
-            if rank == src_rank and src_tensor is not None:
-                shard_buf.copy_(src_tensor._local_tensor)
-            process_group.broadcast(shard_buf, src=src_rank)
-            full_tensor[tuple(shard_slices)] = shard_buf
-
-    # Destination side: extract local shard
-    if rank in dst_ranks:
-        mesh_coords = _get_mesh_coords(dst_mesh, rank)
-        if mesh_coords is None:
-            raise RuntimeError(f"Rank {rank} expected in dst_mesh but not found.")
-        mesh_tensor = getattr(dst_mesh, "mesh")
-        mesh_shape = list(mesh_tensor.shape)
-        shard_slices = _compute_shard_slices(
-            global_shape=full_tensor.shape,
-            mesh_shape=mesh_shape,
-            mesh_coords=mesh_coords,
-            placements=dst_placement,
-        )
-        resharded_local = full_tensor[tuple(shard_slices)]
-        if dst_tensor is not None:
-            if hasattr(dst_tensor, "_local_tensor"):
-                dst_tensor._local_tensor.copy_(resharded_local)
-            else:
-                dst_tensor_local = dst_tensor.to_local()
-                dst_tensor_local.copy_(resharded_local)
-    return
-
-
-# =========================================================================
-# Placement normalization (for msgspec serialization compatibility)
-# =========================================================================
-
-
-def _normalize_placement(p):
-    """Convert a single placement (possibly dict-serialized) to Shard/Replicate."""
     if isinstance(p, (Shard, Replicate)):
         return p
     if isinstance(p, dict):
@@ -377,23 +206,22 @@ def _normalize_placement(p):
     return Replicate()
 
 
-def normalize_refit_info_placements(refit_info: dict) -> dict:
-    """Normalize all placements in refit_info to Shard/Replicate objects.
+def restore_refit_info_placements(refit_info: dict) -> dict:
+    """Restore placements and meshes in ``refit_info`` after msgspec transit.
 
-    vLLM's collective_rpc may serialize ``Shard(N)`` to ``{"dim": N}`` and
-    ``Replicate()`` to ``{}``.  This function converts them back so that the
-    canonical ``xferdtensor_golden`` (which uses ``isinstance(p, Shard)``)
-    works correctly.
-
-    Also reconstructs MeshInfo objects if they were serialized to dicts.
+    vLLM's collective_rpc encodes ``Shard``/``Replicate`` as plain dicts and
+    ``MeshInfo`` as a dict with a nested mesh list.  This rebuilds the
+    original Python objects in place so that the canonical
+    ``xferdtensor`` (which relies on ``isinstance(p, Shard)``) works
+    correctly.  Idempotent — safe to call on already-restored ``refit_info``.
     """
     for layer_name in refit_info.get("layer_names", []):
         for param_info in refit_info.get("per_layer_params", {}).get(layer_name, []):
             param_info["src_placements"] = [
-                _normalize_placement(p) for p in param_info["src_placements"]
+                _restore_placement(p) for p in param_info["src_placements"]
             ]
             param_info["dst_placements"] = [
-                _normalize_placement(p) for p in param_info["dst_placements"]
+                _restore_placement(p) for p in param_info["dst_placements"]
             ]
             # Reconstruct MeshInfo if serialized to dict
             for key in ("src_mesh_info", "dst_mesh_info"):
@@ -556,7 +384,7 @@ def fuse_expert_params_in_metadata(
         fused_metadata[fused_name] = {
             "shape": fused_shape,
             "dtype": gate_entries[0][1]["dtype"],
-            "_moe_kind": "w13",
+            "fused_expert_param_type": "w13",
         }
 
     # Create w2_weight entries (down)
@@ -570,7 +398,7 @@ def fuse_expert_params_in_metadata(
         fused_metadata[fused_name] = {
             "shape": fused_shape,
             "dtype": entries[0][1]["dtype"],
-            "_moe_kind": "w2",
+            "fused_expert_param_type": "w2",
         }
 
     return fused_metadata
@@ -728,9 +556,9 @@ def build_nccl_reshard_refit_info(
                 "dst_placements": get_placements(name, dst_dim_map, ndim),
             }
 
-        # Propagate MoE fusion kind ("w13" or "w2") for train-side expert stacking
-        if "_moe_kind" in meta:
-            info["_moe_kind"] = meta["_moe_kind"]
+        # Propagate fused-expert type ("w13" or "w2") for train-side expert stacking
+        if "fused_expert_param_type" in meta:
+            info["fused_expert_param_type"] = meta["fused_expert_param_type"]
 
         per_layer_params.setdefault(layer, []).append(info)
 

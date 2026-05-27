@@ -96,7 +96,7 @@ TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
 @contextmanager
-def _meta_metadata_context():
+def _meta_tensor_alloc_context():
     """Skip real GPU work during metadata enumeration.
 
     Bridge's ``export_hf_weights`` does PP/TP/EP gathers to materialize
@@ -1008,7 +1008,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         # Collect tensor metadata for refit / hf side info
         refit_param_info_hf = {}
         # Reuse shared iterator that appends FP8 KV/Q scales when enabled
-        with _meta_metadata_context():
+        with _meta_tensor_alloc_context():
             for name, tensor in self._iter_params_with_optional_kv_scales():
                 refit_param_info_hf[name] = (tensor.shape, tensor.dtype)
 
@@ -1395,7 +1395,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             self.refit_param_info_mcore = self._calculate_refit_param_info()
 
         state_dict_metadata = {}
-        with _meta_metadata_context():
+        with _meta_tensor_alloc_context():
             for name, tensor in self._iter_params_with_optional_kv_scales():
                 state_dict_metadata[name] = {
                     "shape": list(tensor.shape),
@@ -1403,10 +1403,12 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                 }
 
         pp_size = train_parallelism.get("pp_size", 1)
+        # Construct a dict[layer_name:str] -> pp_stage:int
         layer_to_pp_stage = (
             self._build_layer_to_pp_stage(pp_size) if pp_size > 1 else None
         )
 
+        # The key metadata, which should shared with generation workers
         self.nccl_reshard_refit_info = build_nccl_reshard_refit_info(
             state_dict_metadata,
             train_parallelism,
@@ -1416,12 +1418,13 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             layer_to_pp_stage=layer_to_pp_stage,
         )
 
-        # Cache the param map + expert grouping now (depends only on model
-        # topology, not weight values, so it can be computed once at setup
-        # and reused for every refit).
+        # _param_map is a Dict[hf_name:str] -> local_tensor:Torch.Tensor
         self._param_map = {
             name: tensor for name, tensor in self._iter_local_hf_params()
         }
+        # _expert_groups is a
+        # Dict[(hf_layer_name.layer_id.expert:str, expert_param_susfix:str)]
+        # -> List[(expert_id:int, hf_param_name:str)]
         self._expert_groups = self._build_expert_groups()
 
         return self.nccl_reshard_refit_info
@@ -1429,16 +1432,18 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
     def _get_src_local_tensor(self, param_info, expert_groups, gen_tp_size):
         """Get the TP/EP-local source tensor for one param.
 
-        For fused MoE entries (``_moe_kind`` set), build the fused tensor on
-        demand from ``_param_map``.  For everything else, return the existing
-        ``_param_map`` view directly.  Returns ``None`` if not on this rank
-        (e.g. layer owned by a different PP stage and PP filtering didn't
-        already skip the param).
+        For fused MoE entries (``fused_expert_param_type`` set), build the
+        fused tensor on demand from ``_param_map``.  For everything else,
+        return the existing ``_param_map`` view directly.  Returns ``None``
+        if not on this rank (e.g. layer owned by a different PP stage and
+        PP filtering didn't already skip the param).
         """
         name = param_info["name"]
-        kind = param_info.get("_moe_kind")
-        if kind:
-            return self._fuse_one_moe_param(kind, name, expert_groups, gen_tp_size)
+        fused_expert_param_type = param_info.get("fused_expert_param_type")
+        if fused_expert_param_type:
+            return self._fuse_one_moe_param(
+                fused_expert_param_type, name, expert_groups, gen_tp_size
+            )
         return self._param_map.get(name)
 
     def _build_expert_groups(self):
@@ -1462,7 +1467,9 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             groups[key].sort()
         return groups
 
-    def _fuse_one_moe_param(self, kind, fused_name, expert_groups, gen_tp_size):
+    def _fuse_one_moe_param(
+        self, fused_expert_param_type, fused_name, expert_groups, gen_tp_size
+    ):
         """Build a single fused MoE tensor (w13 or w2) on demand.
 
         Returns the local (TP/EP) shard of the fused tensor, or ``None`` if
@@ -1472,7 +1479,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         peak memory stay at ~one fused tensor instead of the full
         ``_fused_expert_map``.
         """
-        if kind == "w13":
+        if fused_expert_param_type == "w13":
             # vLLM expects per-rank w13[:, :P] = gate[r*P:(r+1)*P] and
             # w13[:, P:2P] = up[r*P:(r+1)*P] (P = intermediate / gen_tp_size).
             # Build the global tensor so that contiguous Shard(1) slicing
@@ -1505,23 +1512,25 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                     expert_tensors.append(torch.cat([gate, up], dim=0))
             return torch.stack(expert_tensors) if expert_tensors else None
 
-        if kind == "w2":
+        if fused_expert_param_type == "w2":
             prefix = fused_name.rsplit(".w2_weight", 1)[0]
             down_group = expert_groups.get((prefix, "down_proj"), [])
             expert_tensors = [self._param_map[n] for _, n in down_group]
             return torch.stack(expert_tensors) if expert_tensors else None
 
-        raise ValueError(f"Unknown _moe_kind: {kind!r}")
+        raise ValueError(
+            f"Unknown fused_expert_param_type: {fused_expert_param_type!r}"
+        )
 
     @torch.no_grad()
     def nccl_reshard_refit(self, kv_scales=None):
-        """Transfer weights to generation workers via xferdtensor_golden.
+        """Transfer weights to generation workers via xferdtensor.
 
         Uses TP-local shards directly from Megatron parameters, bypassing
-        the Bridge's PP broadcast + TP gather.  The modified xferdtensor_golden
+        the Bridge's PP broadcast + TP gather.  The modified xferdtensor
         reconstructs the full tensor from per-rank shards internally.
         """
-        from nemo_rl.distributed.nccl_reshard_utils import xferdtensor_golden
+        from nemo_rl.distributed.xferdtensor import xferdtensor
 
         if kv_scales is not None:
             raise NotImplementedError(
@@ -1557,7 +1566,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                     if local is not None
                     else None
                 )
-                xferdtensor_golden(
+                xferdtensor(
                     src_tensor,
                     param_info["src_mesh_info"],
                     param_info["src_placements"],

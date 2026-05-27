@@ -998,7 +998,7 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         self.llm.collective_rpc("prepare_nccl_reshard_refit_info", args=(refit_info,))
 
     def nccl_reshard_refit(self) -> bool:
-        """Receive weights from training workers via nccl_reshard (xferdtensor_golden)."""
+        """Receive weights from training workers via nccl_reshard (xferdtensor)."""
         try:
             assert self.llm is not None, (
                 "Attempting to update weights with either an uninitialized vLLM or non-model-owner"
