@@ -124,6 +124,20 @@ def _maybe_merge_lora_weight(
         return tensor
     module_name = fqn[: -len(".weight")]
     module = module_map.get(module_name)
+
+    # Multi-LoRA: stacked [N, ...] adapter params cannot be merged into a single
+    # base weight (each row in a batch uses a different adapter, so N different
+    # merges would be required). Recognized explicitly so the LinearLoRA fusion
+    # below doesn't try to access nonexistent ``.weight`` attributes on the raw
+    # stacked Parameters. Per-adapter checkpoint export is handled separately
+    # by the downstream multi-adapter splitter.
+    try:
+        from nousnet.rl.lora.multi.adapter import MultiLinearLoRA
+    except ImportError:
+        MultiLinearLoRA = None  # nousnet not installed — no multi-LoRA modules exist
+    if MultiLinearLoRA is not None and isinstance(module, MultiLinearLoRA):
+        return tensor
+
     if not isinstance(module, LinearLoRA):
         return tensor
     if not (hasattr(module, "lora_A") and hasattr(module, "lora_B")):
@@ -333,6 +347,28 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
+        # Multi-LoRA per-row routing. When the batch carries `adapter_names`
+        # (one entry per row), call into the downstream multi-adapter helper
+        # to write the routing buffer onto every MultiLinearLoRA layer before
+        # forward. Stock single-LoRA batches don't carry this key, so the
+        # block is a no-op.
+        adapter_names = None
+        if hasattr(data, "get"):
+            adapter_names = data.get("adapter_names")
+        if adapter_names is not None:
+            try:
+                from nousnet.rl.lora.multi.routing import seed_microbatch_routing
+            except ImportError:
+                # nousnet not installed but batch carries adapter_names —
+                # this is a misconfiguration. Fail loudly rather than train
+                # silently against the wrong adapter slot.
+                raise RuntimeError(
+                    "Batch carries `adapter_names` but nousnet multi-LoRA "
+                    "routing helpers are not importable. Install nousnet or "
+                    "remove `adapter_names` from the batch."
+                )
+            seed_microbatch_routing(self.model, list(adapter_names))
+
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:
