@@ -53,6 +53,8 @@ ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
     # (2) same-node colocation with VllmGenerationWorker avoids duplicate
     # venv caches.
     "nemo_rl.experience.sync_rollout_actor.SyncRolloutActor": PY_EXECUTABLES.VLLM,
+    # DistillationRolloutActor has the same vLLM/TQ dependency surface as SyncRolloutActor
+    "nemo_rl.experience.distillation_rollout_actor.DistillationRolloutActor": PY_EXECUTABLES.VLLM,
     "nemo_rl.environments.tools.retriever.RAGEnvironment": PY_EXECUTABLES.SYSTEM,
     "nemo_rl.environments.nemo_gym.NemoGym": PY_EXECUTABLES.NEMO_GYM,
 }
