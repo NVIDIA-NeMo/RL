@@ -22,14 +22,17 @@ from typing import Any, Callable, NotRequired, Optional, TypedDict, TypeVar, cas
 import numpy as np
 import ray
 import torch
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from pydantic import BaseModel
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
+from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.advantage_estimator import (
     GDPOAdvantageEstimator,
     GRPOAdvantageEstimator,
+    OPDAdvantageEstimator,
     ReinforcePlusPlusAdvantageEstimator,
 )
 from nemo_rl.algorithms.loss import (
@@ -64,6 +67,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemo_gym import NemoGym, NemoGymConfig
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
@@ -254,6 +258,16 @@ def setup(
     cluster_config = master_config.cluster
     checkpointing_config = master_config.checkpointing
 
+    # NeMo-Gym node accounting. Needed so policy + non-colocated OPD teachers can
+    # reserve their share of nodes without claiming the gym judge nodes.
+    enable_nemo_gym = _should_use_nemo_gym(master_config)
+    if enable_nemo_gym:
+        nemo_gym_num_nodes = env_configs.get("nemo_gym", {}).get("num_gpu_nodes", 0)
+        nemo_gym_num_gpus_per_node = cluster_config["gpus_per_node"]
+    else:
+        nemo_gym_num_nodes = 0
+        nemo_gym_num_gpus_per_node = 0
+
     checkpointing_pretrained = checkpointing_config.get("pretrained_checkpoint")
     if checkpointing_pretrained is not None:
         policy_config["pretrained_checkpoint"] = checkpointing_pretrained
@@ -423,14 +437,45 @@ def setup(
         rm_nodes = 0
         rm_gpus_per_node = 0
 
+    # Initialize policy_nodes (matches the HEAD-side logic that was overwritten
+    # by the MOPD cherry-pick conflict resolution). On ultra, this assignment
+    # lives upstream of MOPD via c722c915a; on main, we need it here.
+    policy_nodes = total_nodes
     if total_nodes == 1:
-        policy_nodes = total_nodes
-    else:
-        policy_nodes = total_nodes - rm_nodes
-        assert policy_nodes > 0, (
-            "policy_nodes must be > 0, but got "
-            f"policy_nodes:{policy_nodes} + rm_nodes:{rm_nodes} = total_nodes:{total_nodes}"
+        # TODO: special case for colocated policy + reward model.
+        pass
+    elif rm_nodes:
+        policy_nodes -= rm_nodes
+
+    # Reserve nodes for non-colocated OPD teachers so training doesn't claim them
+    opd_teacher_nodes = 0
+    enable_opd_teachers = opd_module.is_non_colocated_teachers_enabled(master_config)
+    if enable_opd_teachers:
+        assert _should_use_async_rollouts(master_config), (
+            "Non-colocated OPD teachers require async GRPO (vLLM backend with async_engine enabled)."
         )
+        from nemo_rl.models.policy.teacher_worker_group import create_teacher_configs_from_opd_config
+        opd_cfg = getattr(master_config, "on_policy_distillation", None) or {}
+        teacher_configs = create_teacher_configs_from_opd_config(opd_cfg)
+        for tcfg in teacher_configs:
+            opd_teacher_nodes += tcfg.get("num_nodes", 1)
+        policy_nodes -= opd_teacher_nodes
+
+    print(
+        f"policy_nodes:{policy_nodes} + nemo_gym_nodes:{nemo_gym_num_nodes} + rm_nodes:{rm_nodes} + opd_teacher_nodes:{opd_teacher_nodes} = total_nodes:{total_nodes}",
+        flush=True,
+    )
+
+    assert policy_nodes > 0, (
+        "policy_nodes must be > 0, but got "
+        f"policy_nodes:{policy_nodes} + nemo_gym_nodes:{nemo_gym_num_nodes} + rm_nodes:{rm_nodes} + opd_teacher_nodes:{opd_teacher_nodes} = total_nodes:{total_nodes}"
+    )
+
+    ray_runtime_ctx = ray.get_runtime_context()
+    ray_cur_node_id = ray_runtime_ctx.get_node_id()
+    ray_namespace = ray_runtime_ctx.namespace
+
+    segment_size = cluster_config.get("segment_size")
 
     if colocated_inference:
         if total_nodes == 1:
@@ -678,6 +723,9 @@ def setup(
 
         return policy_generation, policy
 
+    teacher_worker_groups: dict[str, Any] = {}
+    alias_to_group_alias: dict[str, str] = {}
+
     # Handle generation-specific setup
     if backend == "megatron":
         # Megatron generation: policy_generation is None, only initialize policy
@@ -719,13 +767,136 @@ def setup(
             "hf_config_overrides", {}
         )
 
-        policy_generation, policy = initialize_generation_with_policy(
-            init_generation_fn=init_vllm,
-            generation_name="vLLM",
-            init_time_key="vllm_init_time_s",
-            colocated_inference=colocated_inference,
-            worker_init_timing_metrics=worker_init_timing_metrics,
+        # ---- NeMo Gym: pre-compute vLLM server URLs for overlapped init ----
+        # When NeMo Gym is enabled, we do a lightweight deferred VllmGeneration
+        # init (binds ports only, no model loading) so we can pass the URLs to
+        # NeMo Gym immediately. init_vllm() then completes the heavy loading.
+        deferred_vllm = None
+        if enable_nemo_gym:
+            print(
+                "  ⚡ Deferred model load: reserving vLLM ports for overlapped NeMo Gym init",
+                flush=True,
+            )
+            deferred_vllm = VllmGeneration(
+                cluster=inference_cluster,
+                config=generation_config,
+                defer_model_load=True,
+            )
+            print(
+                f"  ✓ Reserved {len(deferred_vllm.dp_openai_server_base_urls)} vLLM server URLs: "
+                f"{deferred_vllm.dp_openai_server_base_urls}",
+                flush=True,
+            )
+
+        # ---- Init functions ----
+        def init_vllm():
+            """Initialize vLLM generation workers.
+
+            When NeMo Gym is enabled, completes the deferred model loading
+            started above (ports already reserved). Otherwise creates
+            VllmGeneration from scratch.
+            """
+            t0 = time.perf_counter()
+            if deferred_vllm is not None:
+                deferred_vllm.load_and_start()
+                pg = deferred_vllm
+            else:
+                pg = VllmGeneration(
+                    cluster=inference_cluster, config=generation_config
+                )
+            pg.finish_generation()
+            return pg, time.perf_counter() - t0
+
+        # ---- Build init task list ----
+        # Colocated: vLLM and policy share GPUs -> must be sequential
+        # Non-colocated: separate GPU pools -> can run in parallel
+        init_tasks = {}
+
+        if colocated_inference:
+            def init_vllm_then_policy():
+                pg, vllm_t = init_vllm()
+                p, policy_t = init_policy()
+                return pg, vllm_t, p, policy_t
+            init_tasks["vllm_policy"] = init_vllm_then_policy
+        else:
+            init_tasks["vllm"] = init_vllm
+            init_tasks["policy"] = init_policy
+
+        if enable_nemo_gym:
+            def init_nemo_gym():
+                """Build NeMo Gym venv and spin up all servers with pre-assigned URLs."""
+                t0 = time.perf_counter()
+                nemo_gym_py_exec = get_actor_python_env(
+                    "nemo_rl.environments.nemo_gym.NemoGym"
+                )
+                if nemo_gym_py_exec.startswith("uv"):
+                    nemo_gym_py_exec = create_local_venv_on_each_node(
+                        nemo_gym_py_exec, "nemo_rl.environments.nemo_gym.NemoGym"
+                    )
+                nemo_gym_py_venv = os.path.dirname(os.path.dirname(nemo_gym_py_exec)) # to remove the "bin/python" suffix
+                nemo_gym_dict = env_configs["nemo_gym"]
+                uv_cache_dir = get_nemo_gym_uv_cache_dir()
+                if uv_cache_dir is not None:
+                    nemo_gym_dict.setdefault("uv_cache_dir", uv_cache_dir)
+                uv_venv_dir = get_nemo_gym_venv_dir()
+                if uv_venv_dir is not None:
+                    nemo_gym_dict.setdefault("uv_venv_dir", uv_venv_dir)
+                nemo_gym_cfg = NemoGymConfig(
+                    model_name=generation_config["model_name"],
+                    base_urls=deferred_vllm.dp_openai_server_base_urls,
+                    ray_num_gpus_per_node=nemo_gym_num_gpus_per_node,
+                    ray_namespace=ray_namespace,
+                    initial_global_config_dict=nemo_gym_dict,
+                    invalid_tool_call_patterns=env_configs.get("nemo_gym", {}).get("invalid_tool_call_patterns", None),
+                )
+                nemo_gym_opts = {}
+                if nemo_gym_num_nodes:
+                    nemo_gym_opts["scheduling_strategy"] = (
+                        NodeAffinitySchedulingStrategy(
+                            node_id=ray_cur_node_id,
+                            soft=True,
+                        )
+                    )
+                nemo_gym_opts["runtime_env"] = {
+                    "py_executable": nemo_gym_py_exec,
+                    "env_vars": {
+                        **os.environ,
+                        "VIRTUAL_ENV": nemo_gym_py_venv,
+                        "UV_PROJECT_ENVIRONMENT": nemo_gym_py_venv,
+                    },
+                }
+                actor = NemoGym.options(**nemo_gym_opts).remote(nemo_gym_cfg)
+                # On main, NemoGym does spinup inside __init__. health_check is
+                # the conventional readiness probe (ultra used _spinup as a
+                # separate phase, which doesn't exist on main).
+                ray.get(actor.health_check.remote())
+                return actor, time.perf_counter() - t0
+
+            init_tasks["nemo_gym"] = init_nemo_gym
+
+        if enable_opd_teachers:
+            def init_teachers():
+                t0 = time.perf_counter()
+                twg, a2g = opd_module.create_teacher_worker_groups(
+                    master_config, policy_config, tokenizer
+                )
+                return twg, a2g, time.perf_counter() - t0
+
+            init_tasks["teachers"] = init_teachers
+
+        # ---- Execute all tasks ----
+        print(
+            f"  ⚡ Init tasks: {', '.join(init_tasks.keys())}",
+            flush=True,
         )
+
+        if enable_opd_teachers:
+            teacher_worker_groups, alias_to_group_alias, teacher_time = results["teachers"]
+            worker_init_timing_metrics["teacher_init_time_s"] = teacher_time
+
+        if enable_opd_teachers:
+            teacher_worker_groups, alias_to_group_alias, teacher_time = results["teachers"]
+            worker_init_timing_metrics["teacher_init_time_s"] = teacher_time
 
         print(
             f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}",
@@ -801,6 +972,14 @@ def setup(
         if policy_time:
             print(f"  Policy init: {policy_time:.1f}s")
 
+        nemo_gym_time = worker_init_timing_metrics.get("nemo_gym_init_time_s", 0)
+        if nemo_gym_time:
+            print(f"  NeMo Gym init: {nemo_gym_time:.1f}s (overlapped)")
+
+        teacher_time = worker_init_timing_metrics.get("teacher_init_time_s", 0)
+        if teacher_time:
+            print(f"  Teacher init: {teacher_time:.1f}s (overlapped)")
+
         # Calculate "other" time (time after worker init completes)
         other_time = total_setup - worker_init_complete_time
         worker_init_timing_metrics["other_setup_time_s"] = other_time
@@ -819,6 +998,7 @@ def setup(
     return (
         policy,
         policy_generation,
+        nemo_gym_actor,
         (train_cluster, inference_cluster),
         dataloader,
         val_dataloader,
@@ -827,6 +1007,8 @@ def setup(
         checkpointer,
         grpo_save_state,
         master_config,
+        teacher_worker_groups,
+        alias_to_group_alias,
     )
 
 
@@ -1164,6 +1346,32 @@ def _create_advantage_estimator(master_config: MasterConfig):
             adv_estimator_config, loss_config
         )
         print("  ✓ Using Reinforce++ advantage estimator")
+    elif adv_estimator_name == "opd":
+        opd_cfg = getattr(master_config, "on_policy_distillation", None) or {}
+        opd_estimator_config = {
+            "name": "opd",
+            "use_orm_advantage": opd_cfg.get("use_orm_advantage", False),
+            "orm_advantage_weight": opd_cfg.get("orm_advantage_weight", 0.0),
+        }
+        adv_estimator = OPDAdvantageEstimator(opd_estimator_config, loss_config)
+        print("  ✓ Using OPD advantage estimator")
+
+        # Warn if loss_fn is not configured per MOPD paper recommendations.
+        # Fields are declared in ClippedPGLossConfig, so use attribute access
+        # (matches main's convention; loss_config is a Pydantic BaseModel).
+        if not loss_config.disable_ppo_ratio:
+            warnings.warn(
+                "OPD recommends loss_fn.disable_ppo_ratio: true (REINFORCE-style, MOPD Eq. 7)"
+            )
+        if not loss_config.use_importance_sampling_correction:
+            warnings.warn(
+                "OPD recommends loss_fn.use_importance_sampling_correction: true (MOPD Eq. 8 w_t)"
+            )
+        if loss_config.truncated_importance_sampling_type != "icepop":
+            warnings.warn(
+                "OPD recommends loss_fn.truncated_importance_sampling_type: 'icepop' "
+                "(hard gate, MOPD Eq. 8)"
+            )
     else:
         raise ValueError(f"Invalid adv_estimator name: {adv_estimator_name}")
 
@@ -2520,6 +2728,8 @@ def async_grpo_train(
     grpo_save_state: GRPOSaveState,
     master_config: MasterConfig,
     max_trajectory_age_steps: int = 1,
+    teacher_worker_groups: Optional[dict[str, Any]] = None,
+    alias_to_group_alias: Optional[dict[str, str]] = None,
 ) -> None:
     """Run asynchronous GRPO training with replay buffer.
 
@@ -2537,6 +2747,8 @@ def async_grpo_train(
         grpo_save_state: Training state
         master_config: Master configuration
         max_trajectory_age_steps: Maximum age (in training steps) for trajectories to be used in training
+        teacher_worker_groups: Teacher worker groups for OPD (optional)
+        alias_to_group_alias: Mapping from agent alias to teacher group alias (optional)
     """
     # Ensure we are running with a compatible async generation backend
     assert _should_use_async_rollouts(master_config), (
@@ -2675,6 +2887,9 @@ def async_grpo_train(
         master_config=master_config,
         replay_buffer=replay_buffer,
         start_step=step,
+        teacher_worker_groups=teacher_worker_groups,
+        alias_to_group_alias=alias_to_group_alias,
+        on_policy_distillation_cfg=dict(getattr(master_config, "on_policy_distillation", None) or {}),
     )
 
     # Start trajectory collection in background
@@ -2838,6 +3053,13 @@ def async_grpo_train(
                     # Concatenate per-prompt groups into a single training batch
                     per_prompt_batches = [t["batch"] for t in trajectories]
                     repeated_batch = BatchedDataDict.from_batches(per_prompt_batches)
+                    # Teacher logprobs are stored in batch dict by collection-time
+                    # computation and padded by from_batches. Extract here.
+                    trajectory_teacher_logprobs = None
+                    if opd_module.is_opd_enabled(master_config):
+                        if "teacher_reference_logprobs" in repeated_batch:
+                            trajectory_teacher_logprobs = repeated_batch["teacher_reference_logprobs"]
+
                     # Aggregate rollout metrics across groups with proper aggregation per metric type
                     per_group_metrics = {}
                     for t in trajectories:
@@ -2917,6 +3139,26 @@ def async_grpo_train(
                     )
                     train_data.to("cpu")
 
+                # Pad teacher logprobs to match train_data sequence length.
+                # from_batches pads to max(S_i); train_data may be longer
+                # due to make_sequence_length_divisible_by. Zero-pad is safe
+                # because the mask zeros out padding in advantage computation.
+                if trajectory_teacher_logprobs is not None:
+                    train_S = train_data["input_ids"].shape[1]
+                    teacher_S = trajectory_teacher_logprobs.shape[1]
+                    if teacher_S > train_S:
+                        raise ValueError(
+                            f"Teacher logprobs seq length ({teacher_S}) > train_data seq length ({train_S}). "
+                            f"This should not happen — teacher logprobs are padded to max(S_i) by from_batches, "
+                            f"and train_data is padded to roundup(max(S_i), make_sequence_length_divisible_by)."
+                        )
+                    if teacher_S < train_S:
+                        trajectory_teacher_logprobs = torch.nn.functional.pad(
+                            trajectory_teacher_logprobs,
+                            (0, train_S - teacher_S),
+                            value=0.0,
+                        )
+
                 # Training phase (same as sync version)
                 # Skip prev_logprobs computation when force_on_policy_ratio=True
                 skip_prev_logprobs = master_config.loss_fn.force_on_policy_ratio
@@ -2991,6 +3233,11 @@ def async_grpo_train(
                         repeated_batch=repeated_batch,
                         logprobs_policy=train_data["prev_logprobs"],
                         logprobs_reference=train_data.get("reference_policy_logprobs"),
+                        # OPD kwargs (ignored by non-OPD estimators via **kwargs)
+                        teacher_logprobs=trajectory_teacher_logprobs.to(train_data["prev_logprobs"].device) if trajectory_teacher_logprobs is not None else None,
+                        prev_logprobs=train_data["prev_logprobs"],
+                        generation_logprobs=train_data["generation_logprobs"],
+                        sample_mask=train_data["sample_mask"],
                     )
                     del prompt_ids_for_adv
 
@@ -3147,6 +3394,13 @@ def async_grpo_train(
                     else:
                         metrics[k] = np.sum(v).item()
                 metrics.update(rollout_metrics)
+                
+                if hasattr(adv_estimator, "last_metrics") and adv_estimator.last_metrics:
+                    metrics.update(adv_estimator.last_metrics)
+                if hasattr(policy_generation, "get_step_metrics"):
+                    gen_step_metrics = policy_generation.get_step_metrics()
+                    metrics.update(gen_step_metrics)
+                    policy_generation.snapshot_step_metrics()
                 if generation_logger_metrics is not None:
                     metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
@@ -3238,26 +3492,31 @@ def async_grpo_train(
                         checkpointer.finalize_checkpoint(checkpoint_path)
 
             # Logging
-            # Log training data (match sync GRPO logging payload for parity)
-            log_data = {}
-            if "agent_ref" in repeated_batch:
-                log_data["agent_ref"] = repeated_batch["agent_ref"]
-            log_data["content"] = flat_messages_content
-            log_data["rewards"] = rewards.tolist()
-            if master_config.grpo["use_dynamic_sampling"]:
-                # In dynamic sampling, `rewards` corresponds to filtered rewards
-                log_data["filtered_rewards"] = rewards.tolist()
-                log_data["rewards"] = repeated_batch["total_reward"].tolist()
-            log_data["input_lengths"] = input_lengths.tolist()
-            log_data["token_ids"] = train_data["input_ids"].tolist()
-            log_data["token_loss_mask"] = train_data["token_mask"].tolist()
-            log_data["sample_loss_mask"] = train_data["sample_mask"].tolist()
-            log_data["advantages"] = train_data["advantages"].tolist()
-            log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
-            log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
-            logger.log_batched_dict_as_jsonl(
-                log_data, f"train_data_step{step + 1}.jsonl"
-            )
+            # NeMo Gym responses can be very large and expensive to log; when
+            # env.should_log_nemo_gym_responses is true, skip this jsonl (see
+            # _should_log_nemo_gym_responses).
+            if not _should_log_nemo_gym_responses(master_config):
+                log_data = {}
+                if "agent_ref" in repeated_batch:
+                    log_data["agent_ref"] = repeated_batch["agent_ref"]
+                log_data["content"] = flat_messages_content
+                log_data["rewards"] = rewards.tolist()
+                if master_config.grpo["use_dynamic_sampling"]:
+                    log_data["filtered_rewards"] = rewards.tolist()
+                    log_data["rewards"] = repeated_batch["total_reward"].tolist()
+                log_data["input_lengths"] = input_lengths.tolist()
+                log_data["token_ids"] = train_data["input_ids"].tolist()
+                log_data["token_loss_mask"] = train_data["token_mask"].tolist()
+                log_data["sample_loss_mask"] = train_data["sample_mask"].tolist()
+                log_data["advantages"] = train_data["advantages"].tolist()
+                log_data["generation_logprobs"] = train_data[
+                    "generation_logprobs"
+                ].tolist()
+                log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
+                logger.log_batched_dict_as_jsonl(
+                    log_data, f"train_data_step{step + 1}.jsonl"
+                )
+                del log_data
             del train_data
             del flat_messages_content
 
@@ -3299,6 +3558,7 @@ def async_grpo_train(
                             f"generation_metrics/{metric_name}",
                         )
 
+            # Console prints — immediate feedback on main thread
             print("\n📊 Training Results:")
             print(f"  • Loss: {metrics['loss']:.4f}")
             if "draft_loss" in metrics:
@@ -3325,13 +3585,24 @@ def async_grpo_train(
             timing_metrics["valid_tokens_per_sec_per_gpu"] = (
                 metrics["global_valid_toks"] / total_time / total_num_gpus
             )
+
+            # print_performance_metrics reads generation_logger_metrics and
+            # per_worker_token_counts from metrics dict, then deletes per_worker_token_counts.
             performance_metrics = print_performance_metrics(
                 train_results, metrics, timing_metrics, master_config
             )
 
+            # Remove non-scalar generation metrics that are logged separately.
+            metrics.pop("generation_logger_metrics", None)
+            for _hk in [k for k in metrics if k.startswith("histogram/")]:
+                del metrics[_hk]
+
             logger.log_metrics(performance_metrics, step + 1, prefix="performance")
             logger.log_metrics(metrics, step + 1, prefix="train")
-            logger.log_metrics(timing_metrics, step + 1, prefix="timing/train")
+            # step_finished=True here since this is the final log of our current step.
+            logger.log_metrics(
+                timing_metrics, step + 1, prefix="timing/train", step_finished=True
+            )
 
             timer.reset()
             step += 1
@@ -3352,6 +3623,10 @@ def async_grpo_train(
         traceback.print_exc()
 
     finally:
+        try:
+            checkpointer.shutdown()
+        except Exception as e:
+            print(f"Error finalizing pending checkpoint: {e}")
         # Clean up
         print("🛑 Stopping trajectory collection...")
         try:

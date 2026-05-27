@@ -130,24 +130,38 @@ def main() -> None:
     else:
         _policy_factory = None  # setup() defaults to plain Policy
 
-    (
-        policy,
-        policy_generation,
-        cluster,
-        dataloader,
-        val_dataloader,
-        loss_fn,
-        logger,
-        checkpointer,
-        grpo_state,
-        master_config,
-    ) = setup(
-        config,
-        tokenizer,
-        dataset,
-        val_dataset,
-        policy_factory=_policy_factory,
-    )
+    with rl_init_timer.time("setup"):
+        (
+            policy,
+            policy_generation,
+            _nemo_gym_actor,
+            cluster,
+            dataloader,
+            val_dataloader,
+            loss_fn,
+            logger,
+            checkpointer,
+            grpo_state,
+            master_config,
+            _teacher_worker_groups,
+            _alias_to_group_alias,
+        ) = setup(
+            config,
+            tokenizer,
+            dataset,
+            val_dataset,
+            policy_factory=_policy_factory,
+        )
+
+    rl_init_timer.record("total", time.perf_counter() - main_start)
+
+    rl_init_metrics = rl_init_timer.get_timing_metrics(reduction_op="sum")
+    print("\n" + "=" * 60)
+    print(" " * 14 + "RL INIT TIMING BREAKDOWN")
+    for label, value in sorted(rl_init_metrics.items()):
+        if isinstance(value, (int, float)):
+            print(f"  {label}: {value:.1f}s")
+    print("=" * 60 + "\n", flush=True)
 
     # Check if async mode is enabled
     if "async_grpo" in config.grpo and config.grpo["async_grpo"]["enabled"]:

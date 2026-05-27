@@ -174,7 +174,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         self._deferred_bundle_indices = None
         self._deferred_seed = None
 
-        super().__init__(config, bundle_indices, fraction_of_gpus, seed, defer_model_load)
+        super().__init__(config, bundle_indices, fraction_of_gpus, seed, defer_model_load=defer_model_load)
 
         if not self.is_model_owner or not defer_model_load:
             return
@@ -260,9 +260,6 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
         self.server_thread, self.base_url, self.http_server = None, None, None
         if self.cfg["vllm_cfg"].get("expose_http_server"):
-            # Must run after AsyncLLM.from_engine_args and before
-            # _setup_vllm_server spawns the uvicorn thread.
-            self._install_engine_input_socket_lock()
             self.server_thread, self.base_url, self.http_server = (
                 self._setup_vllm_server()
             )
@@ -272,24 +269,6 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         self._vllm_metrics_lock = threading.Lock()
         if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
             self._start_vllm_metrics_logger()
-
-    def _install_engine_input_socket_lock(self) -> None:
-        """Serialise sends on AsyncMPClient.input_socket across OS threads
-        to prevent race conditions that block the vLLM engine (e.g. during
-        in flight weight updates in async grpo).
-        """
-        shadow_sock = self.llm.engine_core.input_socket._shadow_sock
-
-        lock = threading.Lock()
-        original_send_multipart = shadow_sock.send_multipart
-
-        def locked_send_multipart(*args: Any, **kwargs: Any) -> Any:
-            with lock:
-                return original_send_multipart(*args, **kwargs)
-
-        # Replace the bound method on this socket instance only; other zmq
-        # sockets in the process are unaffected.
-        shadow_sock.send_multipart = locked_send_multipart  # type: ignore[assignment]
 
     def _start_vllm_metrics_logger(self) -> None:
         """Start a background thread that periodically collects vLLM logger metrics.
@@ -450,18 +429,38 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         )
         openai_serving_models = OpenAIServingModels(**openai_serving_models_kwargs)
 
-        class NeMoRLOpenAIChatRequestMixin:
-            def model_post_init(self, context):
-                # NeMo-Gym specific processing. This is just how NeMo-Gym returns the extra token information.
-                if self.required_prefix_token_ids is None:
-                    for message in reversed(self.messages):
-                        if "prompt_token_ids" in message:
-                            self.required_prefix_token_ids = (
-                                message["prompt_token_ids"]
-                                + message["generation_token_ids"]
-                            )
-                            break
+        from pydantic import model_validator as _nrl_model_validator
 
+        class NeMoRLOpenAIChatRequestMixin:
+            # vLLM 0.20 tightens ChatCompletionMessageParam validation:
+            # CustomChatCompletionMessageParam / OpenAI's TypedDicts don't
+            # accept the gym's training-only fields (prompt_token_ids,
+            # generation_token_ids, generation_log_probs). They cause a
+            # FastAPI 422 before model_post_init runs. Strip them out at the
+            # mode='before' stage and stash on required_prefix_token_ids.
+            @_nrl_model_validator(mode="before")
+            @classmethod
+            def _nrl_extract_gym_token_extras(cls, data):
+                if not isinstance(data, dict):
+                    return data
+                messages = data.get("messages")
+                if not isinstance(messages, list):
+                    return data
+                already_set = data.get("required_prefix_token_ids") is not None
+                last_pair = None
+                for msg in messages:
+                    if not isinstance(msg, dict):
+                        continue
+                    pt = msg.pop("prompt_token_ids", None)
+                    gt = msg.pop("generation_token_ids", None)
+                    msg.pop("generation_log_probs", None)
+                    if pt is not None and gt is not None:
+                        last_pair = (pt, gt)
+                if not already_set and last_pair is not None:
+                    data["required_prefix_token_ids"] = last_pair[0] + last_pair[1]
+                return data
+
+            def model_post_init(self, context):
                 return super().model_post_init(context)
 
         class NeMoRLOpenAIServingMixin:
@@ -761,6 +760,28 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         # We initialize the FastAPI app here in case we want to do some generic configuration before the subsequent server inits
         # e.g. last-run middleware.
         app = FastAPI()
+
+        # Debug: log 422 validation errors with the body so we can see what
+        # vLLM 0.20.0 is rejecting.
+        from fastapi import Request as _DbgReq
+        from fastapi.exceptions import RequestValidationError as _DbgValErr
+        from fastapi.responses import JSONResponse as _DbgJSON
+
+        @app.exception_handler(_DbgValErr)
+        async def _log_validation_error(request: _DbgReq, exc: _DbgValErr):
+            try:
+                body = await request.body()
+                body_preview = body[:2000].decode(errors="replace")
+            except Exception:  # noqa: BLE001
+                body_preview = "<unreadable>"
+            print(
+                f"[VLLM 422] path={request.url.path} errors={exc.errors()[:5]} body_preview={body_preview}",
+                flush=True,
+            )
+            return _DbgJSON(
+                status_code=422,
+                content={"detail": exc.errors()[:10]},
+            )
 
         app = self._setup_vllm_openai_api_server(app)
 
