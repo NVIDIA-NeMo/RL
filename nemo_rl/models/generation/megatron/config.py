@@ -71,7 +71,7 @@ class MCoreGenerationConfig(TypedDict):
     inference_coordinator_port: NotRequired[int]
 
 
-class MegatronGenerationConfig(GenerationConfig):
+class MCoreGenerationConfig(GenerationConfig):
     """Generation config for Megatron Inference."""
 
-    mcore_generation_config: MCoreGenerationConfig
+    mcore_generation_config: MCoreGenerationSpecificArgs

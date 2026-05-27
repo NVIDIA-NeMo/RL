@@ -623,7 +623,7 @@ class MegatronGenerationMixin:
         return results
 
 
-class MegatronRefitMixin:
+class MegatronGenerationRefitMixin:
     """Refit collective, weight transfer, and engine suspend/resume around refits."""
 
     def init_refit_collective(
