@@ -1593,7 +1593,7 @@ def grpo_train(
                         )
                     # We cannot discard generation weights and make it stale when using dynamic sampling
                     # because if this batch is not complete, we need to continue generation without refit
-                    # and making it stale will trigger refit and crash. 
+                    # and making it stale will trigger refit and crash.
                     # TODO(guyueh): a proper fix to not sleep the engine if batch is incomplete
                     make_generation_stale_by_discard_weights = (
                         not master_config.grpo["use_dynamic_sampling"]
