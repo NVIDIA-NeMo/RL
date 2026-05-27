@@ -3614,6 +3614,7 @@ requires-dist = [
     { name = "albumentations", marker = "extra == 'vlm'" },
     { name = "backoff", marker = "extra == 'vlm'" },
     { name = "bitsandbytes", marker = "extra == 'cuda-source'" },
+    { name = "boto3", marker = "extra == 's3'", specifier = ">=1.34" },
     { name = "causal-conv1d", marker = "extra == 'cuda'" },
     { name = "databricks-sql-connector", marker = "extra == 'delta-databricks'", specifier = ">=3.0.0" },
     { name = "datasets", specifier = ">=4.0.0" },
@@ -3632,6 +3633,7 @@ requires-dist = [
     { name = "mistral-common", extras = ["audio", "hf-hub", "image", "sentencepiece"] },
     { name = "mistral-common", extras = ["opencv"], marker = "extra == 'vlm'", specifier = ">=1.11.0" },
     { name = "mlflow" },
+    { name = "multi-storage-client", marker = "extra == 'msc'", specifier = ">=0.13" },
     { name = "nemo-automodel", extras = ["cuda"], marker = "extra == 'all'" },
     { name = "nemo-automodel", extras = ["cuda"], marker = "extra == 'moe'" },
     { name = "nemo-automodel", extras = ["delta-databricks"], marker = "extra == 'all'" },
@@ -3640,6 +3642,7 @@ requires-dist = [
     { name = "nemo-automodel", extras = ["extra"], marker = "extra == 'all'" },
     { name = "nemo-automodel", extras = ["fla"], marker = "extra == 'all'" },
     { name = "nemo-automodel", extras = ["fla"], marker = "extra == 'moe'" },
+    { name = "nemo-automodel", extras = ["s3"], marker = "extra == 'all'" },
     { name = "nemo-automodel", extras = ["vlm"], marker = "extra == 'all'" },
     { name = "numba", marker = "extra == 'vlm'" },
     { name = "numpy", marker = "extra == 'vlm'" },
@@ -3656,6 +3659,7 @@ requires-dist = [
     { name = "qwen-omni-utils", marker = "extra == 'vlm'" },
     { name = "qwen-vl-utils", extras = ["decord"], marker = "platform_machine == 'x86_64' and sys_platform != 'darwin' and extra == 'vlm'" },
     { name = "sentencepiece", marker = "extra == 'extra'" },
+    { name = "soundfile", marker = "extra == 'vlm'" },
     { name = "tiktoken" },
     { name = "timm", marker = "extra == 'vlm'", specifier = "<=1.0.22" },
     { name = "torch", marker = "sys_platform != 'darwin' and sys_platform != 'linux'", specifier = ">=2.6.0", index = "https://download.pytorch.org/whl/cpu" },
@@ -3669,9 +3673,9 @@ requires-dist = [
     { name = "torchvision", marker = "sys_platform == 'linux' and extra == 'diffusion'", index = "https://download.pytorch.org/whl/cu129" },
     { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'cuda'", specifier = "<=2.11.0" },
     { name = "transformers", specifier = "==5.5.0" },
-    { name = "wandb" },
+    { name = "wandb", specifier = ">=0.26.1" },
 ]
-provides-extras = ["diffusion", "diffusion-kernels", "cuda", "cuda-source", "extra", "fa", "fla", "delta-databricks", "moe", "vlm", "cli", "all"]
+provides-extras = ["diffusion", "diffusion-kernels", "cuda", "cuda-source", "extra", "fa", "fla", "delta-databricks", "moe", "vlm", "cli", "s3", "msc", "all"]
 
 [package.metadata.requires-dev]
 build = [
@@ -3707,6 +3711,7 @@ test = [
     { name = "onnxruntime-gpu", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", index = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-13/pypi/simple/" },
     { name = "peft", specifier = ">=0.18.1" },
     { name = "pytest" },
+    { name = "ruamel-yaml" },
 ]
 
 [[package]]
