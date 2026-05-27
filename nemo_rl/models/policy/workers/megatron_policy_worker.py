@@ -1025,11 +1025,16 @@ class MegatronPolicyWorkerImpl(
 
         return BatchedDataDict.from_batches([out_dict]).to("cpu")
 
+    def set_fp8_param_names(self, fp8_param_names: set[str]) -> None:
+        """Cache the set of FP8-quantized param names obtained from vLLM."""
+        self._fp8_param_names = fp8_param_names
+
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/prepare_refit_info")
     def prepare_refit_info(self) -> None:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
-        self.refit_param_info_mcore = self._calculate_refit_param_info()
+        if not hasattr(self, "refit_param_info_mcore") or self.refit_param_info_mcore is None:
+            self.refit_param_info_mcore = self._calculate_refit_param_info()
 
         # Collect tensor metadata for refit / hf side info
         refit_param_info_hf = {}
@@ -1098,12 +1103,25 @@ class MegatronPolicyWorkerImpl(
     ) -> Iterator[tuple[str, torch.Tensor]]:
         """Yield exported HF parameters and optionally append FP8 KV/Q scale tensors.
 
+        When ``_fp8_param_names`` is populated (synced once from vLLM at init),
+        eligible weights are quantized to FP8 on the training worker and yielded
+        as (name, fp8_data) + (name + "_scale_inv", scale) pairs.  This reduces
+        the broadcast payload from bf16 to fp8.
+
         This helper is used by both IPC-based streaming and collective broadcast
         so that the logic for adding KV scales stays consistent in one place.
         """
         from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
+            FP8_WEIGHT_BLOCK_SIZE,
+            cast_tensor_to_fp8_blockwise,
             get_vllm_qkv_scale_names,
         )
+
+        fp8_param_names = getattr(self, "_fp8_param_names", set())
+        use_pow2_scale = False
+        if fp8_param_names:
+            vllm_cfg = self.cfg["generation"].get("vllm_cfg", {})
+            use_pow2_scale = vllm_cfg.get("pow2_weight_scaling_factors", False)
 
         base_iter = self.megatron_bridge.export_hf_weights(
             [self.model],
@@ -1111,9 +1129,18 @@ class MegatronPolicyWorkerImpl(
             conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
         )
 
-        # Yield the original parameters first.
         for name, tensor in base_iter:
-            yield name, tensor
+            if name in fp8_param_names:
+                fp8_data, scale = cast_tensor_to_fp8_blockwise(
+                    tensor.to(torch.float),
+                    weight_block_size=FP8_WEIGHT_BLOCK_SIZE,
+                    use_pow2_scale=use_pow2_scale,
+                )
+                scale = torch.squeeze(scale, dim=-1)
+                yield name, fp8_data
+                yield name + "_scale_inv", scale
+            else:
+                yield name, tensor
 
         if self.draft_model is not None:
             from nemo_rl.models.megatron.draft import export_eagle_weights_to_hf

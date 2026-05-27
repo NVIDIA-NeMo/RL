@@ -248,6 +248,13 @@ class GenerationInterface(ABC):
         """Whether the generation backend requires KV cache scales synchronization."""
         return False
 
+    def get_fp8_param_names(self, param_names: list[str]) -> set[str]:
+        """Classify which HF param names are FP8-quantized by the generation backend.
+
+        Returns an empty set when FP8 is not enabled.
+        """
+        return set()
+
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Prepare the info for refit."""
         raise NotImplementedError

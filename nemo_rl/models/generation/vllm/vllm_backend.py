@@ -98,6 +98,18 @@ class VllmInternalWorkerExtension:
             self.zmq_socket.setsockopt(zmq.LINGER, 0)
             self.zmq_socket.connect(self.get_zmq_address())
 
+    def get_fp8_param_names(self, param_names: list[str]) -> set[str]:
+        """Classify which HF param names are FP8-quantized using vLLM's model.
+
+        This is the authoritative source of truth — it inspects the actual vLLM
+        model structure rather than relying on name-matching heuristics.
+        """
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        if not fp8.is_fp8_model(self.model_runner.vllm_config):
+            return set()
+        return fp8.get_fp8_param_names(param_names, self.model_runner)
+
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Prepare state dict metadata for weight refitting and IPC streaming.
 
@@ -106,6 +118,9 @@ class VllmInternalWorkerExtension:
                 e.g. {tensor_name: (shape, dtype)}
         """
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
+        self._weights_pre_quantized = any(  # pyrefly: ignore[implicitly-defined-attribute]
+            k.endswith("_scale_inv") for k in state_dict_info
+        )
 
     def _maybe_process_fp8_kv_cache(self) -> None:
         """Process weights after loading for FP8 KV cache (static scales)."""
@@ -301,9 +316,9 @@ class VllmInternalWorkerExtension:
                 assert offset == used_bytes, (
                     "Offset is not equal to used bytes, usually indicate inaccurate info like keys or cached dtype in state_dict_info"
                 )
-
-                # Load weights into the model
-                self._load_weights(weights)
+                # Load weights into the model (re-uses the shared helper that
+                # skips FP8 quantization when weights arrive pre-quantized).
+                self._load_model_weights(weights)
 
                 torch.cuda.current_stream().synchronize()
 
@@ -330,6 +345,22 @@ class VllmInternalWorkerExtension:
                 f"{traceback.format_exc()}"
             )
             return False
+
+    def _load_model_weights(self, weights):
+        """Load model weights, skipping FP8 quantization when pre-quantized.
+
+        Uses the ``_weights_pre_quantized`` flag cached at ``prepare_refit_info``
+        time instead of scanning every batch for ``_scale_inv`` entries.
+        """
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        if fp8.is_fp8_model(self.model_runner.vllm_config):
+            if self._weights_pre_quantized:
+                self.model_runner.model.load_weights(weights=weights)
+            else:
+                fp8.load_weights(weights, self.model_runner)
+        else:
+            self.model_runner.model.load_weights(weights=weights)
 
     @wrap_with_nvtx_name(
         "vllm_internal_worker_extension/update_weights_from_collective"

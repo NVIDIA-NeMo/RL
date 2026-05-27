@@ -347,6 +347,26 @@ def _is_fp8_weight(name, model):
     return name in fp8_state.fp8_param_names
 
 
+def get_fp8_param_names(param_names: list[str], model_runner) -> set[str]:
+    """Classify which HF param names correspond to FP8-quantized weights.
+
+    Uses vLLM's model structure (LinearBase/FusedMoE with FP8 dtype) as the
+    single source of truth.  The result is cached in ``fp8_state`` so that
+    subsequent ``_is_fp8_weight`` calls during refit are free.
+
+    Args:
+        param_names: HF-style parameter names (e.g. from export_hf_weights).
+        model_runner: vLLM ModelRunner with a loaded model.
+
+    Returns:
+        Set of param names that should be block-quantized to FP8.
+    """
+    model = model_runner.model
+    for name in param_names:
+        _is_fp8_weight(name, model)
+    return set(fp8_state.fp8_param_names)
+
+
 def load_weights(weights, model_runner):
     weights_quantized = []
     model = model_runner.model
