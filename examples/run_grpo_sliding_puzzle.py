@@ -241,14 +241,20 @@ def main():
         * config.grpo["num_generations_per_prompt"]
         * config.grpo["max_num_steps"]
     )
+    puzzle_task_name = "sliding_puzzle_game"
     dataset, val_dataset, task_to_env, val_task_to_env = setup_puzzle_data(
         tokenizer=tokenizer,
         env_cfg=config.env,
-        task_name="sliding_puzzle_game",
+        task_name=puzzle_task_name,
         length=ds_length,
         val_length=config.grpo["max_val_samples"],
         add_system_prompt=config.data["add_system_prompt"],
     )
+    # Algorithm setup expects val_dataset as a name->dataset dict so validate()
+    # can emit per-dataset metrics. The puzzle generator produces a single
+    # iterable; wrap it under its task name.
+    if val_dataset is not None:
+        val_dataset = {puzzle_task_name: val_dataset}
 
     (
         policy,

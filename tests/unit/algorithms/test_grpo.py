@@ -225,13 +225,15 @@ def mock_grpo_components():
     train_dataloader.__iter__ = train_iter
     train_dataloader.__len__ = MagicMock(return_value=10)
 
-    val_dataloader = MagicMock(spec=StatefulDataLoader)
+    val_dataloader_single = MagicMock(spec=StatefulDataLoader)
 
     def val_iter(self):
         return iter([mock_batch] * 10)
 
-    val_dataloader.__iter__ = val_iter
-    val_dataloader.__len__ = MagicMock(return_value=10)
+    val_dataloader_single.__iter__ = val_iter
+    val_dataloader_single.__len__ = MagicMock(return_value=10)
+    # validate() now takes a dict[name -> StatefulDataLoader] for per-dataset metrics.
+    val_dataloader = {"test_dataset": val_dataloader_single}
 
     tokenizer = MagicMock()
     tokenizer.pad_token_id = 0
@@ -2254,9 +2256,11 @@ class TestValidateFunction:
             }
         )
 
-        # Create mock dataloader that yields mock_batch
-        mock_dataloader = MagicMock(spec=StatefulDataLoader)
-        mock_dataloader.__iter__ = MagicMock(return_value=iter([mock_batch]))
+        # Create mock dataloader that yields mock_batch. validate() now takes a dict.
+        single_dl = MagicMock(spec=StatefulDataLoader)
+        single_dl.__iter__ = MagicMock(return_value=iter([mock_batch]))
+        single_dl.__len__ = MagicMock(return_value=1)
+        mock_dataloader = {"math": single_dl}
 
         # Create mock environment
         mock_env = MagicMock(spec=EnvironmentInterface)
@@ -2362,9 +2366,11 @@ class TestValidateFunction:
             }
         )
 
-        # Create mock dataloader
-        mock_dataloader = MagicMock(spec=StatefulDataLoader)
-        mock_dataloader.__iter__ = MagicMock(return_value=iter([mock_batch]))
+        # Create mock dataloader. validate() now takes a dict.
+        single_dl = MagicMock(spec=StatefulDataLoader)
+        single_dl.__iter__ = MagicMock(return_value=iter([mock_batch]))
+        single_dl.__len__ = MagicMock(return_value=1)
+        mock_dataloader = {"math": single_dl}
 
         # Create mock environment
         mock_env = MagicMock(spec=EnvironmentInterface)
@@ -2445,6 +2451,177 @@ class TestValidateFunction:
 
         assert val_metrics == {}
         assert timing == {}
+
+    def test_validate_emits_per_dataset_prefixed_metrics_and_logs(self):
+        """validate() splits metrics per dataset and logs each under validation-<name>."""
+        mock_policy_gen = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token_id = 0
+
+        def make_batch(reward: float):
+            return BatchedDataDict[DatumSpec](
+                {
+                    "message_log": [
+                        [
+                            {"role": "user", "content": "q", "token_ids": torch.tensor([1, 2])},
+                            {"role": "assistant", "content": "a", "token_ids": torch.tensor([3, 4])},
+                        ],
+                    ],
+                    "task_name": ["dummy"],
+                    "extra_env_info": [{}],
+                    "loss_multiplier": torch.tensor([1.0]),
+                    "idx": torch.tensor([0]),
+                    "length": torch.tensor([4]),
+                    "total_reward": torch.tensor([reward]),
+                }
+            )
+
+        def make_loader(batch):
+            dl = MagicMock(spec=StatefulDataLoader)
+            dl.__iter__ = MagicMock(side_effect=lambda: iter([batch]))
+            dl.__len__ = MagicMock(return_value=1)
+            return dl
+
+        batch_a = make_batch(1.0)
+        batch_b = make_batch(0.0)
+        val_dataloader = {"gsm8k": make_loader(batch_a), "math500": make_loader(batch_b)}
+
+        mock_env = MagicMock(spec=EnvironmentInterface)
+        mock_env.global_post_process_and_metrics.return_value = (batch_a, {})
+
+        mock_config = MasterConfig.model_construct(
+            **{
+                "grpo": {
+                    "max_val_samples": 1,
+                    "val_batch_size": 1,
+                    "max_rollout_turns": 1,
+                },
+                "policy": {
+                    "max_total_sequence_length": 2048,
+                    "generation": {
+                        "temperature": 1.0,
+                        "top_p": 1.0,
+                        "top_k": None,
+                        "backend": "vllm",
+                        "colocated": {"enabled": True},
+                        "vllm_cfg": {"async_engine": False},
+                    },
+                },
+                "logger": {"num_val_samples_to_print": 1},
+            }
+        )
+
+        rollout_returns = iter(
+            [
+                (batch_a, {"mean_gen_tokens_per_sample": 10.0}),
+                (batch_b, {"mean_gen_tokens_per_sample": 12.0}),
+            ]
+        )
+        logger = MagicMock()
+
+        with patch("nemo_rl.algorithms.grpo.run_multi_turn_rollout") as mock_rollout:
+            mock_rollout.side_effect = lambda *a, **k: next(rollout_returns)
+            with patch("nemo_rl.algorithms.grpo._should_use_nemo_gym", return_value=False):
+                with patch(
+                    "nemo_rl.algorithms.grpo._should_use_async_rollouts",
+                    return_value=False,
+                ):
+                    with patch("nemo_rl.algorithms.grpo.print_message_log_samples"):
+                        val_metrics, validation_timings = validate(
+                            mock_policy_gen,
+                            val_dataloader,
+                            mock_tokenizer,
+                            {"math": mock_env},
+                            step=0,
+                            master_config=mock_config,
+                            logger=logger,
+                        )
+
+        assert val_metrics["validation-gsm8k_accuracy"] == 1.0
+        assert val_metrics["validation-math500_accuracy"] == 0.0
+        # Aggregated key is the macro-mean across datasets (preserved for save_state).
+        assert val_metrics["accuracy"] == pytest.approx(0.5)
+        logged_prefixes = {
+            call.kwargs.get("prefix") for call in logger.log_metrics.call_args_list
+        }
+        assert "validation-gsm8k" in logged_prefixes
+        assert "validation-math500" in logged_prefixes
+        assert "timing/validation" in logged_prefixes
+        assert "total_validation_time" in validation_timings
+
+    def test_validate_iterates_full_dataloader_when_max_val_samples_is_none(self):
+        """When max_val_samples is None, validate iterates the entire val_dataloader."""
+        mock_policy_gen = MagicMock()
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.pad_token_id = 0
+
+        mock_batch = BatchedDataDict[DatumSpec](
+            {
+                "message_log": [
+                    [
+                        {"role": "user", "content": "q", "token_ids": torch.tensor([1, 2])},
+                        {"role": "assistant", "content": "a", "token_ids": torch.tensor([3, 4])},
+                    ],
+                ],
+                "task_name": ["dummy"],
+                "extra_env_info": [{}],
+                "loss_multiplier": torch.tensor([1.0]),
+                "idx": torch.tensor([0]),
+                "length": torch.tensor([4]),
+                "total_reward": torch.tensor([1.0]),
+            }
+        )
+
+        num_batches = 3
+        single_dl = MagicMock(spec=StatefulDataLoader)
+        single_dl.__iter__ = MagicMock(return_value=iter([mock_batch] * num_batches))
+        single_dl.__len__ = MagicMock(return_value=num_batches)
+        mock_dataloader = {"only": single_dl}
+
+        mock_env = MagicMock(spec=EnvironmentInterface)
+        mock_env.global_post_process_and_metrics.return_value = (mock_batch, {})
+
+        mock_config = MasterConfig.model_construct(
+            **{
+                "grpo": {
+                    "max_val_samples": None,
+                    "val_batch_size": 1,
+                    "max_rollout_turns": 1,
+                },
+                "policy": {
+                    "max_total_sequence_length": 2048,
+                    "generation": {
+                        "temperature": 1.0,
+                        "top_p": 1.0,
+                        "top_k": None,
+                        "backend": "vllm",
+                        "colocated": {"enabled": True},
+                        "vllm_cfg": {"async_engine": False},
+                    },
+                },
+                "logger": {"num_val_samples_to_print": 1},
+            }
+        )
+
+        with patch("nemo_rl.algorithms.grpo.run_multi_turn_rollout") as mock_rollout:
+            mock_rollout.return_value = (mock_batch, {"mean_gen_tokens_per_sample": 10.0})
+            with patch("nemo_rl.algorithms.grpo._should_use_nemo_gym", return_value=False):
+                with patch(
+                    "nemo_rl.algorithms.grpo._should_use_async_rollouts",
+                    return_value=False,
+                ):
+                    with patch("nemo_rl.algorithms.grpo.print_message_log_samples"):
+                        validate(
+                            mock_policy_gen,
+                            mock_dataloader,
+                            mock_tokenizer,
+                            {"math": mock_env},
+                            step=0,
+                            master_config=mock_config,
+                            logger=None,
+                        )
+
+        assert mock_rollout.call_count == num_batches
 
 
 # ============================================================================
