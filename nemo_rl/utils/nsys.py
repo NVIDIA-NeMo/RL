@@ -13,6 +13,7 @@
 # limitations under the License.
 import atexit
 import os
+from functools import wraps
 from typing import Protocol
 
 import rich
@@ -83,11 +84,13 @@ def wrap_with_nvtx_name(name: str):
     """A decorator to wrap a function with an NVTX range with the given name."""
 
     def decorator(func):
+        @wraps(func)
         def wrapper(*args, **kwargs):
             torch.cuda.nvtx.range_push(name)
-            ret = func(*args, **kwargs)
-            torch.cuda.nvtx.range_pop()
-            return ret
+            try:
+                return func(*args, **kwargs)
+            finally:
+                torch.cuda.nvtx.range_pop()
 
         return wrapper
 

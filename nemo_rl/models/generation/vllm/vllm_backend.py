@@ -193,8 +193,9 @@ class VllmInternalWorkerExtension:
         """Load weights with GptOss transpose fix, FP8, and draft-weight support.
 
         Applies GPT-OSS down_proj transpose if needed, splits policy/draft
-        weights, applies FP8 conversion if needed, and loads draft weights
-        into the drafter model.
+        weights, skips vLLM-side FP8 quantization when policy weights already
+        include ``_scale_inv`` tensors, and loads draft weights into the drafter
+        model.
         """
         from nemo_rl.models.generation.vllm.quantization import fp8
 
@@ -208,7 +209,10 @@ class VllmInternalWorkerExtension:
 
         policy_weights, draft_weights = self._split_policy_and_draft_weights(weights)
         if fp8.is_fp8_model(self.model_runner.vllm_config):
-            fp8.load_weights(policy_weights, self.model_runner)
+            if getattr(self, "_weights_pre_quantized", False):
+                self.model_runner.model.load_weights(weights=policy_weights)
+            else:
+                fp8.load_weights(policy_weights, self.model_runner)
         else:
             self.model_runner.model.load_weights(weights=policy_weights)
 
@@ -260,12 +264,6 @@ class VllmInternalWorkerExtension:
                         .view(dtype=dtype)
                         .view(shape)
                     )
-                    # apply gpt-oss transpose fix
-                    if (
-                        "GptOssForCausalLM"
-                        in self.model_runner.vllm_config.model_config.architectures
-                    ):
-                        weight = fix_gpt_oss_export_transpose(key, weight)
                     weights.append((key, weight))
 
                     # Move offset to the next weight
@@ -277,7 +275,7 @@ class VllmInternalWorkerExtension:
                 )
                 # Load weights into the model (re-uses the shared helper that
                 # skips FP8 quantization when weights arrive pre-quantized).
-                self._load_model_weights(weights)
+                self._load_weights(weights)
 
                 torch.cuda.current_stream().synchronize()
 
@@ -304,22 +302,6 @@ class VllmInternalWorkerExtension:
                 f"{traceback.format_exc()}"
             )
             return False
-
-    def _load_model_weights(self, weights):
-        """Load model weights, skipping FP8 quantization when pre-quantized.
-
-        Uses the ``_weights_pre_quantized`` flag cached at ``prepare_refit_info``
-        time instead of scanning every batch for ``_scale_inv`` entries.
-        """
-        from nemo_rl.models.generation.vllm.quantization import fp8
-
-        if fp8.is_fp8_model(self.model_runner.vllm_config):
-            if self._weights_pre_quantized:
-                self.model_runner.model.load_weights(weights=weights)
-            else:
-                fp8.load_weights(weights, self.model_runner)
-        else:
-            self.model_runner.model.load_weights(weights=weights)
 
     @wrap_with_nvtx_name(
         "vllm_internal_worker_extension/update_weights_from_collective"

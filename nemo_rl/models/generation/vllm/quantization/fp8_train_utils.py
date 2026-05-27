@@ -54,6 +54,9 @@ def cast_tensor_to_fp8_blockwise(
     data_hp = data_hp.reshape(blk_m, block_size0, blk_n, block_size1)
     data_hp = data_hp.permute(0, 2, 1, 3)
     data_hp = data_hp.to(torch.float32).contiguous().flatten(start_dim=2)
+    data_hp = torch.nan_to_num(
+        data_hp, nan=0.0, posinf=max_dtype, neginf=-max_dtype
+    )
 
     max_abs = torch.amax(torch.abs(data_hp), dim=-1, keepdim=True)
 

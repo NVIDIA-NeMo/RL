@@ -185,9 +185,12 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         use_fp8_weights=use_fp8_weights,
     )
 
-    if vllm_cfg.get("use_deep_gemm", False):
-        os.environ["VLLM_USE_DEEP_GEMM"] = "1"
-        os.environ["VLLM_USE_DEEP_GEMM_E8M0"] = "0"
+    use_deep_gemm = vllm_cfg.get("use_deep_gemm", False)
+    # Newer vLLM defaults VLLM_USE_DEEP_GEMM to enabled, so make the
+    # Nemo-RL config authoritative instead of relying on the process env.
+    os.environ["VLLM_USE_DEEP_GEMM"] = "1" if use_deep_gemm else "0"
+    os.environ["VLLM_MOE_USE_DEEP_GEMM"] = "1" if use_deep_gemm else "0"
+    os.environ["VLLM_USE_DEEP_GEMM_E8M0"] = "0"
 
     if vllm_cfg["async_engine"]:
         # for async engine, vllm spawns a process for each DP, so we patch
@@ -428,6 +431,9 @@ def cast_tensor_to_fp8_blockwise(
     data_hp = data_hp.permute(0, 2, 1, 3)
     # Flatten to (BLK_M, BLK_N, BLOCK_SIZE_M * BLOCK_SIZE_N)
     data_hp = data_hp.to(torch.float32).contiguous().flatten(start_dim=2)
+    data_hp = torch.nan_to_num(
+        data_hp, nan=0.0, posinf=max_dtype, neginf=-max_dtype
+    )
 
     # Calculate max absolute value per block
     max_abs = torch.amax(torch.abs(data_hp), dim=-1, keepdim=True)
@@ -494,8 +500,8 @@ def maybe_post_process_fp8_weight_block(layer: torch.nn.Module):
     # On Blackwell or Hopper, if E8M0 for DeepGemm is used, we need to
     # requantize the weight and input to the specific scale
     # at the same time.
-    should_use_deepgemm = should_use_deepgemm_for_fp8_linear(
-        layer.orig_dtype, layer.weight
+    should_use_deepgemm = _should_use_deepgemm_for_fp8_linear(
+        should_use_deepgemm_for_fp8_linear, layer.orig_dtype, layer.weight
     )
     if should_use_deepgemm:
         dg_weight, dg_weight_scale = deepgemm_post_process_fp8_weight_block(
@@ -508,6 +514,24 @@ def maybe_post_process_fp8_weight_block(layer: torch.nn.Module):
         # Instead of creating new torch.nn.Parameter, we update the data in place.
         layer.weight.data.copy_(dg_weight)
         layer.weight_scale.data.copy_(dg_weight_scale)
+
+
+def _should_use_deepgemm_for_fp8_linear(
+    should_use_deepgemm_for_fp8_linear, output_dtype, weight
+):
+    import inspect
+
+    try:
+        parameters = list(
+            inspect.signature(should_use_deepgemm_for_fp8_linear).parameters
+        )
+    except (TypeError, ValueError):
+        parameters = []
+
+    if len(parameters) >= 2 and parameters[1] == "weight_shape":
+        return should_use_deepgemm_for_fp8_linear(output_dtype, tuple(weight.shape))
+
+    return should_use_deepgemm_for_fp8_linear(output_dtype, weight)
 
 
 def process_weights_after_loading(self, layer) -> None:
