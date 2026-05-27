@@ -133,7 +133,7 @@ overrides = [
     { name = "llguidance", specifier = ">=1.3.0,<1.4.0" },
     { name = "mlflow", specifier = ">=3.12.0" },
     { name = "numpy", specifier = ">=2.1.0" },
-    { name = "nvidia-cublas", marker = "sys_platform != 'darwin'", specifier = "==13.3.0.5" },
+    { name = "nvidia-cublas", marker = "sys_platform != 'darwin'", specifier = "==13.5.1.27" },
     { name = "nvidia-cudnn-cu13", marker = "sys_platform != 'darwin'", specifier = "==9.20.0.48" },
     { name = "nvidia-cudnn-frontend", specifier = "==1.23.0" },
     { name = "nvidia-cutlass-dsl", extras = ["cu13"], specifier = ">=4.4.1" },
@@ -676,7 +676,7 @@ wheels = [
 [[package]]
 name = "causal-conv1d"
 version = "1.5.4"
-source = { git = "https://github.com/Dao-AILab/causal-conv1d?rev=67e0a9dfe1518fc0036444e9ab5fe06ab78299e0#67e0a9dfe1518fc0036444e9ab5fe06ab78299e0" }
+source = { git = "https://github.com/Dao-AILab/causal-conv1d?rev=4f6ae4e26ae5fe8af9372f8d312ab25cc4595223#4f6ae4e26ae5fe8af9372f8d312ab25cc4595223" }
 dependencies = [
     { name = "ninja", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-fsdp' or extra == 'extra-7-nemo-rl-mcore' or (extra == 'extra-7-nemo-rl-flashinfer-jit-cache' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-flashinfer-jit-cache' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "packaging", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-fsdp' or extra == 'extra-7-nemo-rl-mcore' or (extra == 'extra-7-nemo-rl-flashinfer-jit-cache' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-flashinfer-jit-cache' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
@@ -2922,7 +2922,7 @@ wheels = [
 [[package]]
 name = "mamba-ssm"
 version = "2.2.6.post3"
-source = { git = "https://github.com/state-spaces/mamba.git?rev=35e927b20fd674f0b30a799a6408b7aac6ffe642#35e927b20fd674f0b30a799a6408b7aac6ffe642" }
+source = { git = "https://github.com/state-spaces/mamba.git?rev=a14b1dff0454a3bc27d9eb31355dc01e4b2490ec#a14b1dff0454a3bc27d9eb31355dc01e4b2490ec" }
 dependencies = [
     { name = "causal-conv1d", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-fsdp' or extra == 'extra-7-nemo-rl-mcore' or (extra == 'extra-7-nemo-rl-flashinfer-jit-cache' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-flashinfer-jit-cache' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "ninja", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-fsdp' or extra == 'extra-7-nemo-rl-mcore' or (extra == 'extra-7-nemo-rl-flashinfer-jit-cache' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-flashinfer-jit-cache' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
@@ -4060,9 +4060,9 @@ test = [
 requires-dist = [
     { name = "accelerate", specifier = ">=0.26" },
     { name = "blobfile" },
-    { name = "causal-conv1d", marker = "extra == 'automodel'", git = "https://github.com/Dao-AILab/causal-conv1d?rev=67e0a9dfe1518fc0036444e9ab5fe06ab78299e0" },
-    { name = "causal-conv1d", marker = "extra == 'fsdp'", git = "https://github.com/Dao-AILab/causal-conv1d?rev=67e0a9dfe1518fc0036444e9ab5fe06ab78299e0" },
-    { name = "causal-conv1d", marker = "extra == 'mcore'", git = "https://github.com/Dao-AILab/causal-conv1d?rev=67e0a9dfe1518fc0036444e9ab5fe06ab78299e0" },
+    { name = "causal-conv1d", marker = "extra == 'automodel'", git = "https://github.com/Dao-AILab/causal-conv1d?rev=4f6ae4e26ae5fe8af9372f8d312ab25cc4595223" },
+    { name = "causal-conv1d", marker = "extra == 'fsdp'", git = "https://github.com/Dao-AILab/causal-conv1d?rev=4f6ae4e26ae5fe8af9372f8d312ab25cc4595223" },
+    { name = "causal-conv1d", marker = "extra == 'mcore'", git = "https://github.com/Dao-AILab/causal-conv1d?rev=4f6ae4e26ae5fe8af9372f8d312ab25cc4595223" },
     { name = "colored", specifier = "==2.2.3" },
     { name = "cuda-bindings", marker = "sys_platform != 'darwin'" },
     { name = "cuda-python", marker = "extra == 'vllm'" },
@@ -4094,9 +4094,9 @@ requires-dist = [
     { name = "flashinfer-python", marker = "extra == 'vllm'", specifier = "==0.6.8.post1" },
     { name = "hydra-core" },
     { name = "hypercorn", marker = "extra == 'mcore'" },
-    { name = "mamba-ssm", marker = "extra == 'automodel'", git = "https://github.com/state-spaces/mamba.git?rev=35e927b20fd674f0b30a799a6408b7aac6ffe642" },
-    { name = "mamba-ssm", marker = "extra == 'fsdp'", git = "https://github.com/state-spaces/mamba.git?rev=35e927b20fd674f0b30a799a6408b7aac6ffe642" },
-    { name = "mamba-ssm", marker = "extra == 'mcore'", git = "https://github.com/state-spaces/mamba.git?rev=35e927b20fd674f0b30a799a6408b7aac6ffe642" },
+    { name = "mamba-ssm", marker = "extra == 'automodel'", git = "https://github.com/state-spaces/mamba.git?rev=a14b1dff0454a3bc27d9eb31355dc01e4b2490ec" },
+    { name = "mamba-ssm", marker = "extra == 'fsdp'", git = "https://github.com/state-spaces/mamba.git?rev=a14b1dff0454a3bc27d9eb31355dc01e4b2490ec" },
+    { name = "mamba-ssm", marker = "extra == 'mcore'", git = "https://github.com/state-spaces/mamba.git?rev=a14b1dff0454a3bc27d9eb31355dc01e4b2490ec" },
     { name = "math-verify" },
     { name = "matplotlib" },
     { name = "megatron-bridge", marker = "extra == 'mcore'", editable = "3rdparty/Megatron-Bridge-workspace" },
@@ -4129,7 +4129,7 @@ requires-dist = [
     { name = "pybase64" },
     { name = "pyzmq" },
     { name = "quart", marker = "extra == 'mcore'" },
-    { name = "ray", extras = ["default"], specifier = ">=2.54.0" },
+    { name = "ray", extras = ["default"], specifier = ">=2.55.1" },
     { name = "rich" },
     { name = "setuptools" },
     { name = "sglang", marker = "extra == 'sglang'", git = "https://github.com/sgl-project/sglang.git?subdirectory=python&tag=v0.5.10" },
@@ -4313,12 +4313,15 @@ dependencies = [
 
 [[package]]
 name = "nvidia-cublas"
-version = "13.3.0.5"
+version = "13.5.1.27"
 source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "nvidia-cuda-nvrtc", marker = "sys_platform != 'darwin' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-flashinfer-jit-cache') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-flashinfer-jit-cache' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-flashinfer-jit-cache' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e8/5c/08177998e1234459e46b2cdad73738b5516f84b8fa28a8379c678b95c6c0/nvidia_cublas-13.3.0.5-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:48308e7f44feb337ca24d95efdceeac5703fb5dcf9bfb0c23f1eb48015fdd8a1", size = 505057164, upload-time = "2026-03-09T09:43:27.897Z" },
-    { url = "https://files.pythonhosted.org/packages/3c/7c/ae5d1751819acff18b0fac29c0a4e93d06d36cfabebe36365ddacc7c32a9/nvidia_cublas-13.3.0.5-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:366568e2dc59e6fe71ffd179f9f2a38b8b2772aed626320a64008651b1e72974", size = 403287501, upload-time = "2026-03-09T09:47:05.046Z" },
-    { url = "https://files.pythonhosted.org/packages/f8/6f/7ed17e69ac6799098d7ab9ff46789c10ea58d49f75726ba351badc5f109d/nvidia_cublas-13.3.0.5-py3-none-win_amd64.whl", hash = "sha256:065b944083560334e02299050979b7cfd91ec79e5fc5c23d602f7f35c0d1356c", size = 387823761, upload-time = "2026-03-09T10:05:43.442Z" },
+    { url = "https://files.pythonhosted.org/packages/9c/da/45f78bb61f93a467ccaccf2eafbf23483bdcb29d3c5d16f8cb918be1aea0/nvidia_cublas-13.5.1.27-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:bc355b10e35b01cf88e8dcc0fbe0fd1ef86a05fddae78a44dc133d7e63eaf973", size = 515580892, upload-time = "2026-05-26T16:43:17.967Z" },
+    { url = "https://files.pythonhosted.org/packages/ce/0d/cc77458e8fb0634597e3994650c2853ee785f2fc61bf370bbb304021cca1/nvidia_cublas-13.5.1.27-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:db3a1f0c8bc24945a4d195ba199d83f27e650ffdfc0c32e6b8362c314f14d553", size = 407748877, upload-time = "2026-05-26T16:44:19.938Z" },
+    { url = "https://files.pythonhosted.org/packages/99/73/2c08fc3802d72931af348e8f1cf3a0b013e5dd91a6dcc235af8f52cfcb87/nvidia_cublas-13.5.1.27-py3-none-win_amd64.whl", hash = "sha256:234a2e89682080421431d2f2ea422fc2ad7d0b462336ccdfde76c559c906c670", size = 391875500, upload-time = "2026-05-26T17:06:29.178Z" },
 ]
 
 [[package]]
