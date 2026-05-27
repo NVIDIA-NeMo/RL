@@ -192,30 +192,9 @@ The validation set you pass in will directly be used for validation with no addi
 
     init_ray()
 
-    (
-        policy,
-        policy_generation,
-        cluster,
-        dataloader,
-        val_dataloader,
-        loss_fn,
-        logger,
-        checkpointer,
-        grpo_state,
-        master_config,
-    ) = setup(config, tokenizer, train_dataset, val_dataset)
-
     is_trajectory_collection = (
         config.env["nemo_gym"].pop("is_trajectory_collection", False) or False
     )
-    nemo_gym_config = NemoGymConfig(
-        model_name=policy_generation.cfg["model_name"],
-        base_urls=policy_generation.dp_openai_server_base_urls,
-        initial_global_config_dict=config.env["nemo_gym"],
-    )
-    nemo_gym = create_env(env_name="nemo_gym", env_config=nemo_gym_config)
-    # Blocking wait for NeMo-Gym to spin up
-    ray.get(nemo_gym.health_check.remote())
 
     with rl_init_timer.time("setup"):
         (

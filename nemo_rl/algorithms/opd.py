@@ -49,15 +49,25 @@ class OnPolicyDistillationConfig(TypedDict):
 # ---------------------------------------------------------------------------
 
 
-def is_opd_enabled(master_config: dict[str, Any]) -> bool:
-    return bool(master_config.get("on_policy_distillation", {}).get("enabled", False))
+def _opd_cfg(master_config: Any) -> dict[str, Any]:
+    """Return the on_policy_distillation sub-config as a plain dict.
+
+    Accepts either a Pydantic MasterConfig (main's `setup()` passes this) or a
+    plain dict (which ultra-side callers used).
+    """
+    if hasattr(master_config, "on_policy_distillation"):
+        return getattr(master_config, "on_policy_distillation", None) or {}
+    return master_config.get("on_policy_distillation", {})
 
 
-def is_non_colocated_teachers_enabled(master_config: dict[str, Any]) -> bool:
+def is_opd_enabled(master_config: Any) -> bool:
+    return bool(_opd_cfg(master_config).get("enabled", False))
+
+
+def is_non_colocated_teachers_enabled(master_config: Any) -> bool:
     if not is_opd_enabled(master_config):
         return False
-    opd_cfg = master_config.get("on_policy_distillation", {})
-    return bool(opd_cfg.get("non_colocated_teachers", {}).get("enabled", False))
+    return bool(_opd_cfg(master_config).get("non_colocated_teachers", {}).get("enabled", False))
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +127,7 @@ def get_teacher_routing_metrics(
 
 
 def create_teacher_worker_groups(
-    master_config: dict[str, Any],
+    master_config: Any,
     policy_config: dict[str, Any],
     tokenizer: Any,
 ) -> tuple[dict[str, Any], dict[str, str]]:
@@ -131,7 +141,7 @@ def create_teacher_worker_groups(
         create_teacher_configs_from_opd_config,
     )
 
-    opd_cfg = master_config.get("on_policy_distillation", {})
+    opd_cfg = _opd_cfg(master_config)
     non_coloc_cfg = opd_cfg.get("non_colocated_teachers", {})
     teacher_configs = create_teacher_configs_from_opd_config(opd_cfg)
 

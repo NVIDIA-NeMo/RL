@@ -437,6 +437,10 @@ def setup(
         rm_nodes = 0
         rm_gpus_per_node = 0
 
+    # Initialize policy_nodes (matches the HEAD-side logic that was overwritten
+    # by the MOPD cherry-pick conflict resolution). On ultra, this assignment
+    # lives upstream of MOPD via c722c915a; on main, we need it here.
+    policy_nodes = total_nodes
     if total_nodes == 1:
         # TODO: special case for colocated policy + reward model.
         pass
@@ -451,7 +455,7 @@ def setup(
             "Non-colocated OPD teachers require async GRPO (vLLM backend with async_engine enabled)."
         )
         from nemo_rl.models.policy.teacher_worker_group import create_teacher_configs_from_opd_config
-        opd_cfg = master_config.get("on_policy_distillation", {})
+        opd_cfg = getattr(master_config, "on_policy_distillation", None) or {}
         teacher_configs = create_teacher_configs_from_opd_config(opd_cfg)
         for tcfg in teacher_configs:
             opd_teacher_nodes += tcfg.get("num_nodes", 1)
@@ -862,7 +866,10 @@ def setup(
                     },
                 }
                 actor = NemoGym.options(**nemo_gym_opts).remote(nemo_gym_cfg)
-                ray.get(actor._spinup.remote())
+                # On main, NemoGym does spinup inside __init__. health_check is
+                # the conventional readiness probe (ultra used _spinup as a
+                # separate phase, which doesn't exist on main).
+                ray.get(actor.health_check.remote())
                 return actor, time.perf_counter() - t0
 
             init_tasks["nemo_gym"] = init_nemo_gym
@@ -991,6 +998,7 @@ def setup(
     return (
         policy,
         policy_generation,
+        nemo_gym_actor,
         (train_cluster, inference_cluster),
         dataloader,
         val_dataloader,
@@ -1339,7 +1347,7 @@ def _create_advantage_estimator(master_config: MasterConfig):
         )
         print("  ✓ Using Reinforce++ advantage estimator")
     elif adv_estimator_name == "opd":
-        opd_cfg = master_config.get("on_policy_distillation", {})
+        opd_cfg = getattr(master_config, "on_policy_distillation", None) or {}
         opd_estimator_config = {
             "name": "opd",
             "use_orm_advantage": opd_cfg.get("use_orm_advantage", False),
@@ -1348,16 +1356,18 @@ def _create_advantage_estimator(master_config: MasterConfig):
         adv_estimator = OPDAdvantageEstimator(opd_estimator_config, loss_config)
         print("  ✓ Using OPD advantage estimator")
 
-        # Warn if loss_fn is not configured per MOPD paper recommendations
-        if not loss_config.get("disable_ppo_ratio", False):
+        # Warn if loss_fn is not configured per MOPD paper recommendations.
+        # Fields are declared in ClippedPGLossConfig, so use attribute access
+        # (matches main's convention; loss_config is a Pydantic BaseModel).
+        if not loss_config.disable_ppo_ratio:
             warnings.warn(
                 "OPD recommends loss_fn.disable_ppo_ratio: true (REINFORCE-style, MOPD Eq. 7)"
             )
-        if not loss_config.get("use_importance_sampling_correction", False):
+        if not loss_config.use_importance_sampling_correction:
             warnings.warn(
                 "OPD recommends loss_fn.use_importance_sampling_correction: true (MOPD Eq. 8 w_t)"
             )
-        if loss_config.get("truncated_importance_sampling_type", "default") != "icepop":
+        if loss_config.truncated_importance_sampling_type != "icepop":
             warnings.warn(
                 "OPD recommends loss_fn.truncated_importance_sampling_type: 'icepop' "
                 "(hard gate, MOPD Eq. 8)"
@@ -2879,7 +2889,7 @@ def async_grpo_train(
         start_step=step,
         teacher_worker_groups=teacher_worker_groups,
         alias_to_group_alias=alias_to_group_alias,
-        on_policy_distillation_cfg=dict(master_config.get("on_policy_distillation", {})),
+        on_policy_distillation_cfg=dict(getattr(master_config, "on_policy_distillation", None) or {}),
     )
 
     # Start trajectory collection in background
@@ -3491,7 +3501,7 @@ def async_grpo_train(
                     log_data["agent_ref"] = repeated_batch["agent_ref"]
                 log_data["content"] = flat_messages_content
                 log_data["rewards"] = rewards.tolist()
-                if master_config["grpo"]["use_dynamic_sampling"]:
+                if master_config.grpo["use_dynamic_sampling"]:
                     log_data["filtered_rewards"] = rewards.tolist()
                     log_data["rewards"] = repeated_batch["total_reward"].tolist()
                 log_data["input_lengths"] = input_lengths.tolist()
@@ -3587,35 +3597,11 @@ def async_grpo_train(
             for _hk in [k for k in metrics if k.startswith("histogram/")]:
                 del metrics[_hk]
 
-            # Merge collector-side efficiency metrics and print summary
-            collector_efficiency = ray.get(
-                trajectory_collector.get_efficiency_metrics.remote()
-            )
-            driver_efficiency = {
-                cat: timer.reduce(cat, "sum")
-                for cat in [
-                    "init/total",
-                    "idle/buffer_starvation",
-                    "idle/refit_bubble",
-                    "idle/validation",
-                ]
-                if cat in timer._timers
-            }
-            merged_efficiency = {**driver_efficiency}
-            for cat, dur in collector_efficiency.items():
-                merged_efficiency[cat] = merged_efficiency.get(cat, 0.0) + dur
-
-            total_wall_time = time.perf_counter() - training_wall_start
-            efficiency_loggable = print_efficiency_summary(
-                merged_efficiency, total_wall_time, step + 1
-            )
-
             logger.log_metrics(performance_metrics, step + 1, prefix="performance")
             logger.log_metrics(metrics, step + 1, prefix="train")
-            logger.log_metrics(timing_metrics, step + 1, prefix="timing/train")
             # step_finished=True here since this is the final log of our current step.
             logger.log_metrics(
-                efficiency_loggable, step + 1, prefix="", step_finished=True
+                timing_metrics, step + 1, prefix="timing/train", step_finished=True
             )
 
             timer.reset()

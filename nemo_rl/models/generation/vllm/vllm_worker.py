@@ -137,6 +137,11 @@ class BaseVllmGenerationWorker:
             defer_model_load: If True, skip model loading during init. Call
                 _load_model() later to perform the heavy model loading.
         """
+        # Store extra_env_vars on self so the nested patch closure inside
+        # _patch_vllm_init_workers_ray can reach it. The eb401ba48 refactor
+        # moved patching into _init_config/_apply_vllm_patches, which broke
+        # the original closure-via-__init__-locals path.
+        self.extra_env_vars = extra_env_vars
         self._init_config(config, bundle_indices, fraction_of_gpus, seed)
 
         if not self.is_model_owner:
@@ -239,7 +244,7 @@ class BaseVllmGenerationWorker:
                 'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"}',
             ]
             extra_env_str = ", ".join(
-                [f'"{env_var}"' for env_var in (extra_env_vars or [])]
+                [f'"{env_var}"' for env_var in (self.extra_env_vars or [])]
             )
 
             new_lines = [
