@@ -166,11 +166,12 @@ def verl_geo3k_reward(
     format_reward_value = 1.0 if has_format else 0.0
 
     try:
-        # Extract \boxed{} content and grade using math_verify (already a nemo-rl dependency)
-        boxed_match = re.search(r"\\boxed\{", response)
-        if boxed_match:
-            # Find matching closing brace
-            start = boxed_match.end()
+        # Extract last \boxed{} content and grade using math_verify (already a nemo-rl dependency).
+        # Use rfind so intermediate guesses don't override the model's final answer (matches verl/mathruler).
+        boxed_token = "\\boxed{"
+        boxed_start = response.rfind(boxed_token)
+        if boxed_start != -1:
+            start = boxed_start + len(boxed_token)
             depth = 1
             for i, ch in enumerate(response[start:]):
                 if ch == "{":
