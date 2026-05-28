@@ -482,12 +482,63 @@ fixture for the ABC contract tests.
 
 ---
 
-## Async path (proposed)
+## Async path
 
-The data-plane interface covers both sync and async, but the **sync
-trainer uses only half of it**. The task-mediated half
-(`claim_meta` / `get_data` / `check_consumption_status`) is reserved
-for the async trainer, which is not yet wired into production.
+In the async path, rollout and training run concurrently on separate
+Ray actors. The trainer doesn't know which samples are ready ahead of
+time, so it uses the **task-mediated** half of the API
+(`claim_meta` / `get_data` / `check_consumption_status`) instead of
+the direct-by-key path the sync trainer uses.
 
-Design proposal, filtering / staleness strategies, and open questions:
-see [`docs/data-plane-async-proposal.md`](docs/data-plane-async-proposal.md).
+The deciding question is **"does the caller already know the keys?"**
+
+- **Yes** → direct-by-key (`kv_batch_get`). Sync trainer is always
+  here: `SyncRolloutActor` returns `meta.keys` from the rollout.
+- **No** → task-mediated (`claim_meta` → `get_data`). Async trainer
+  is here: the consumer cursor (`task_name`) prevents the same sample
+  from being claimed twice.
+
+### E2E flow — one async GRPO step
+
+```
+PRODUCER (continuous)             CONSUMER (async trainer)
+AsyncTrajectoryCollector loop:    1. claim_meta(task="train", GBS)
+  rollout → flatten → mask           ↑ blocks until GBS ready;
+  kv_first_write(bulk, keys=…)         cursor advances atomically.
+  → dp_client.kv_batch_put         2. filter on meta.tags (driver)
+                                   3. shard_meta_for_dp + DP fan-out
+                                   4. workers fetch per-rank via
+                                      dp_client.kv_batch_get
+                                   5. check_consumption_status —
+                                      assert drain before cleanup
+                                   6. kv_clear(meta.keys)
+```
+
+### Filtering without fetching bulk
+
+Rollout writes continuously; many samples are discarded (off-policy
+beyond tolerance, DAPO `std == 0`, format failures, length thresholds).
+The filter decision **must not require reading bulk tensor data**.
+
+Recommended pattern: producers stamp primitive scalars
+(`weight_version`, `std`, `total_reward`, …) as **tags** on each key.
+Tags travel back with `meta.tags` (1:1 with `meta.sample_ids`) so the
+consumer filters in-memory after `claim_meta`:
+
+```python
+meta = dp_client.claim_meta(task_name="train",
+                            required_fields=[...], batch_size=GBS)
+keep_ix = [i for i, t in enumerate(meta.tags)
+           if current_version - t["weight_version"] <= MAX_AGE]
+keep = meta.subset(keep_ix)
+drop = meta.subset([i for i in range(meta.size) if i not in set(keep_ix)])
+dp_client.clear_samples(drop.sample_ids, partition_id="train")
+# train with keep via shard_meta_for_dp + DP fan-out
+```
+
+Zero data fetch, works for time-varying filters, no TQ patch needed.
+Canonical example:
+[`tests/unit/data_plane/test_async_rl_with_producer_actor.py`](../../tests/unit/data_plane/test_async_rl_with_producer_actor.py)
+— Ray producer actor + driver claim/filter/shard/clear flow, with the
+swappable `BaseRolloutFilter` / `StalenessFilter` example in
+[`_rollout_filters.py`](../../tests/unit/data_plane/_rollout_filters.py).

@@ -37,6 +37,9 @@ from tensordict import TensorDict
 
 transfer_queue = pytest.importorskip("transfer_queue")  # noqa: F841
 
+import numpy as np  # noqa: E402
+import ray  # noqa: E402
+
 from nemo_rl.data_plane import build_data_plane_client  # noqa: E402
 from nemo_rl.data_plane.preshard import shard_meta_for_dp  # noqa: E402
 from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS  # noqa: E402
@@ -44,13 +47,11 @@ from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS  # noqa: E402
 from ._rollout_filters import StalenessFilter  # noqa: E402
 from ._rollout_shapes import (  # noqa: E402
     keys_from_uids,
+    make_multi_turn_message_log,
     make_realistic_tags,
     make_rollout_batch,
     register_train_partition,
 )
-
-import ray  # noqa: E402
-
 
 # ── producer actor ────────────────────────────────────────────────────────────
 
@@ -82,6 +83,14 @@ class _ProducerActor:
 
         n = len(sample_ids)
         bulk = make_rollout_batch(n=n, max_seqlen=max_seqlen)
+        # Add ``content`` as an np.ndarray(object) of per-row message_logs
+        # — matches SyncRolloutActor's production write shape (see
+        # nemo_rl/experience/sync_rollout_actor.py:271-273). Object
+        # fields ride through TQ via the codec's NonTensorStack path.
+        content = np.empty(n, dtype=object)
+        for i, ml in enumerate(make_multi_turn_message_log(n=n)):
+            content[i] = ml
+        bulk["content"] = content
         tags = make_realistic_tags(n=n)
         for i, t in enumerate(tags):
             t["weight_version"] = weight_version
@@ -126,19 +135,26 @@ def test_async_rl_filter_with_producer_actor(tq_client) -> None:
     """Producer actor writes mixed-version rollouts → driver claims, filters, clears."""
     pid = "async-rl-flow"
     current_weight_version = 3  # max_age=1 → keep where v >= 2
-    keys_stale = keys_from_uids([f"v1_p{i}" for i in range(4)])  # weight_version=1 → drop
-    keys_fresh = keys_from_uids([f"v3_p{i}" for i in range(4)])  # weight_version=3 → keep
+    keys_stale = keys_from_uids(
+        [f"v1_p{i}" for i in range(4)]
+    )  # weight_version=1 → drop
+    keys_fresh = keys_from_uids(
+        [f"v3_p{i}" for i in range(4)]
+    )  # weight_version=3 → keep
     n = len(keys_stale) + len(keys_fresh)
 
-    # Driver registers the partition; producer attaches and writes.
-    register_train_partition(tq_client, num_samples=n)
+    # Driver pre-registers the partition with pid (the helper defaults
+    # to 'train' which would leave 'async-rl-flow' unregistered).
+    register_train_partition(tq_client, num_samples=n, partition_id=pid)
 
     # ── Pipeline (no asserts) ────────────────────────────────────────────────
     producer = _ProducerActor.remote()
     ray.get(
         [
             producer.produce.remote(pid, keys_stale, weight_version=1),
-            producer.produce.remote(pid, keys_fresh, weight_version=current_weight_version),
+            producer.produce.remote(
+                pid, keys_fresh, weight_version=current_weight_version
+            ),
         ]
     )
     sample_meta = tq_client.claim_meta(
@@ -153,9 +169,7 @@ def test_async_rl_filter_with_producer_actor(tq_client) -> None:
     )
     shards, _ = shard_meta_for_dp(keep_meta, dp_world=2)
     shard_fetches: list[Any] = [
-        tq_client.get_data(s, select_fields=["input_ids"])
-        for s in shards
-        if s.size > 0
+        tq_client.get_data(s, select_fields=["input_ids"]) for s in shards if s.size > 0
     ]
     tq_client.clear_samples(drop_meta.sample_ids, partition_id=pid)
     fully_consumed = tq_client.check_consumption_status(
@@ -198,5 +212,7 @@ def test_async_rl_filter_with_producer_actor(tq_client) -> None:
     # Clear targeted only drop set → keep set still fetchable.
     assert survivors_td["input_ids"].shape[0] == keep_meta.size
 
-    # Teardown so the partition doesn't leak across tests.
-    tq_client.clear_samples(keep_meta.sample_ids, partition_id=pid)
+    # Partition / actor cleanup is the conftest's job: session-scope
+    # init_ray_cluster (tests/unit/conftest.py:380) calls ray.shutdown()
+    # at the end of the session, and the tq_client fixture's client.close()
+    # kills the TQ controller actor.
