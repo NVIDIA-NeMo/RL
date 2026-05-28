@@ -12,9 +12,10 @@
 #   Local NeMo RL source override:
 #     docker buildx build --build-context nemo-rl=. -f docker/Dockerfile --tag <registry>/nemo-rl:latest --push .
 #
-# Optional build args to skip vLLM or SGLang dependencies:
+# Optional build args to skip vLLM, SGLang, or TensorRT-LLM dependencies:
 #   --build-arg SKIP_VLLM_BUILD=1    # Skip vLLM dependencies
 #   --build-arg SKIP_SGLANG_BUILD=1  # Skip SGLang dependencies
+#   --build-arg SKIP_TRTLLM_BUILD=1  # Skip TensorRT-LLM (defaults to skip in CI)
 
 ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.03-cuda13.2-devel-ubuntu24.04
 FROM scratch AS nemo-rl
@@ -44,6 +45,11 @@ apt-get install -y --no-install-recommends \
     wget \
     less \
     vim \
+    python3-dev \
+    libopenmpi-dev \
+    libzmq3-dev \
+    pkg-config \
+    ninja-build \
 
 # Nsight
 apt install -y --no-install-recommends gnupg
@@ -108,6 +114,11 @@ ARG BUILD_CUSTOM_FLASHINFER_REF
 # Skip building vLLM or SGLang dependencies (set to any non-empty value to skip)
 ARG SKIP_VLLM_BUILD
 ARG SKIP_SGLANG_BUILD
+# Skip building TensorRT-LLM (set to any non-empty value to skip). Defaults to skip in CI.
+ARG SKIP_TRTLLM_BUILD
+# Pin TensorRT-LLM source for from-source build (no cp313/cu13/aarch64 wheel on PyPI)
+ARG TRTLLM_GIT_URL=https://github.com/NVIDIA/TensorRT-LLM.git
+ARG TRTLLM_GIT_REF=v1.3.0rc15
 ARG BASE_IMAGE
 ARG UV_VERSION
 
@@ -172,6 +183,41 @@ uv sync --link-mode symlink --locked --extra automodel --no-install-project
 uv sync --link-mode symlink --locked --extra modelopt --no-install-project
 uv sync --link-mode symlink --locked --all-groups --no-install-project
 
+# TensorRT-LLM: no cp313/cu13/aarch64 wheel exists on PyPI, must from-source build.
+# Skipped by default in CI (SKIP_TRTLLM_BUILD=1). Set BUILD env to enable.
+if [[ -z "${SKIP_TRTLLM_BUILD:-}" ]]; then
+    # Sync trtllm runtime deps (mpi4py, cutlass-dsl) into the venv first.
+    uv sync --link-mode symlink --locked --extra trtllm --no-install-project
+
+    # Clone + build trtllm into the venv. build_wheel.py runs cmake + ninja then
+    # invokes `pip install` itself when --install is passed, which lands the
+    # wheel into the active venv (UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv).
+    git clone --depth=1 --branch "${TRTLLM_GIT_REF}" "${TRTLLM_GIT_URL}" /tmp/TensorRT-LLM
+    pushd /tmp/TensorRT-LLM
+    # Activate venv so build_wheel.py's `pip install` lands inside the project env.
+    . /opt/nemo_rl_venv/bin/activate
+    python3 scripts/build_wheel.py \
+        -a "100-real" \
+        -G Ninja \
+        --clean \
+        --use_ccache \
+        --nvrtc_dynamic_linking \
+        -D "ENABLE_UCX=OFF" \
+        --install
+    deactivate
+    popd
+    rm -rf /tmp/TensorRT-LLM
+
+    # Fix nvjitlink double-shipping: the nvidia-cu13 wheel bundles libnvJitLink.so.13
+    # at version 13.0, which is older than what trtllm needs (>=13.1). Base image
+    # ships 13.2.51 under /usr/local/cuda-13.2. Symlink the venv copy to the new one.
+    NVJIT_NEW=/usr/local/cuda-13.2/targets/sbsa-linux/lib/libnvJitLink.so.13.2.51
+    NVJIT_OLD=/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cu13/lib/libnvJitLink.so.13
+    if [ -f "$NVJIT_NEW" ] && [ -e "$NVJIT_OLD" ]; then
+        ln -sf "$NVJIT_NEW" "$NVJIT_OLD"
+    fi
+fi
+
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8
 # The ray install will include the older aiohttp version in its cache
 find /root/.cache/uv -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
@@ -198,6 +244,7 @@ FROM hermetic AS release
 # Re-declare build args for this stage
 ARG SKIP_VLLM_BUILD
 ARG SKIP_SGLANG_BUILD
+ARG SKIP_TRTLLM_BUILD
 ARG NEMO_RL_COMMIT
 ARG NVIDIA_BUILD_ID
 ARG NVIDIA_BUILD_REF
@@ -225,6 +272,9 @@ if [[ -n "${SKIP_VLLM_BUILD:-}" ]]; then
 fi
 if [[ -n "${SKIP_SGLANG_BUILD:-}" ]]; then
     NEGATIVE_FILTERS="$NEGATIVE_FILTERS sglang"
+fi
+if [[ -n "${SKIP_TRTLLM_BUILD:-}" ]]; then
+    NEGATIVE_FILTERS="$NEGATIVE_FILTERS trtllm"
 fi
 if [[ -n "$NEGATIVE_FILTERS" ]]; then
     UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py --negative-filters $NEGATIVE_FILTERS
