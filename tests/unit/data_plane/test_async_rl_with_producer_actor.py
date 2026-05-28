@@ -64,12 +64,11 @@ class _TQBackedAsyncCollector:
 
     The production codebase has these pieces SEPARATELY but not fused:
 
-    * ``AsyncTrajectoryCollector`` (``async_utils/trajectory_collector.py``)
-      — the async rollout loop with weight-version tracking + pause/refit
-      semantics. Today writes to an in-memory ``ReplayBuffer``, not TQ.
-    * ``SyncRolloutActor`` (``experience/sync_rollout_actor.py``) — the TQ
-      write path (``kv_first_write`` into a ``DataPlaneClient``). Today
-      only used by sync GRPO.
+    * ``AsyncTrajectoryCollector`` — the async rollout loop with
+      weight-version tracking + pause/refit semantics. Today writes to
+      an in-memory ``ReplayBuffer``, not TQ.
+    * ``SyncRolloutActor`` — the TQ write path (``kv_first_write``
+      into a ``DataPlaneClient``). Today only used by sync GRPO.
 
     A real async-RL deployment that uses TQ as the rollout buffer would
     fuse these two: the async loop's weight-version state + sync's TQ
@@ -88,9 +87,8 @@ class _TQBackedAsyncCollector:
     """
 
     def __init__(self) -> None:
-        # Attach to the existing TQ controller (driver bootstrapped it).
-        # ``bootstrap=False`` matches every production rollout-side caller
-        # — ``sync_rollout_actor.py:94`` and ``worker_mixin.py:142``.
+        # Attach to the existing TQ controller (driver bootstrapped it);
+        # ``bootstrap=False`` matches what production rollout-side actors do.
         self._dp_client = build_data_plane_client(
             simple_backend_dp_config(), bootstrap=False
         )
@@ -99,22 +97,21 @@ class _TQBackedAsyncCollector:
     def set_weight_version(self, version: int) -> None:
         """Trainer-driven initial seed of the producer's version state.
 
-        Mirrors the one-shot setup call at ``grpo.py:2652`` ("Ensure
-        collector knows initial weight version"). For *subsequent*
-        version changes (real refit events), prefer ``policy_refit`` —
-        the producer should own its version transitions, not have them
-        written from outside.
+        One-shot setup call after the trainer launches the collector.
+        For *subsequent* version changes (real refit events), prefer
+        ``policy_refit`` — the producer should own its version
+        transitions, not have them written from outside.
         """
         self.current_weight_version = int(version)
 
     def policy_refit(self, new_version: int) -> None:
         """Producer-side refit: swap in new weights, bump version.
 
-        Models the real refit event (``grpo.py:3022-3023`` does
-        ``set_weight_version`` + ``resume_after_refit``). Body delegates
-        to ``set_weight_version`` so both paths share a single source
-        of truth for the version write; when a fuller implementation
-        adds weight reload / resume semantics, diverge here.
+        Models a real refit event — in production this would also reload
+        weights and resume the collector. Body delegates to
+        ``set_weight_version`` so both paths share a single source of
+        truth for the version write; when a fuller implementation adds
+        weight reload / resume semantics, diverge here.
         """
         self.set_weight_version(new_version)
 
@@ -134,9 +131,8 @@ class _TQBackedAsyncCollector:
         n = len(sample_ids)
         bulk = make_rollout_batch(n=n, max_seqlen=max_seqlen)
         # Add ``content`` as np.ndarray(object) of per-row message_logs —
-        # matches SyncRolloutActor's production write shape (see
-        # nemo_rl/experience/sync_rollout_actor.py:271-273). Object fields
-        # ride through TQ via the codec's NonTensorStack path.
+        # matches SyncRolloutActor's production write shape. Object
+        # fields ride through TQ via the codec's NonTensorStack path.
         content = np.empty(n, dtype=object)
         for i, ml in enumerate(make_multi_turn_message_log(n=n)):
             content[i] = ml
@@ -145,8 +141,8 @@ class _TQBackedAsyncCollector:
         for i, t in enumerate(tags):
             t["weight_version"] = self.current_weight_version
             t["input_lengths"] = int(bulk["input_lengths"][i])
-        # Same write helper SyncRolloutActor uses (column_io.py:123) —
-        # single flat put_samples of every tensor field, jagged-packed.
+        # Same write helper SyncRolloutActor uses — single flat
+        # put_samples of every tensor field, jagged-packed.
         kv_first_write(
             BatchedDataDict(bulk),
             sample_ids=list(sample_ids),
@@ -193,15 +189,15 @@ def test_async_rl_filter_with_producer_actor(dp_client) -> None:
     register_train_partition(dp_client, num_samples=n, partition_id=pid)
 
     # ── Pipeline (no asserts) ────────────────────────────────────────────────
-    # Mirror the async-RL trainer pattern in grpo.py:2649 — fire-and-forget
-    # rollout calls into the collector; the driver does NOT wait on them.
-    # Version state is producer-owned: set_weight_version is the one-shot
-    # initial seed (grpo.py:2652); subsequent transitions go through the
-    # producer's policy_refit (grpo.py:3022-3023). Driver never writes
-    # the version directly mid-stream. Ray serializes actor methods on
-    # the main thread → keys_stale lands with v=1 and keys_fresh with v=3
-    # after the refit. Trainer blocks on claim_meta(timeout_s=...) — the
-    # way the production trainer blocks on replay_buffer.size().
+    # Mirror the async-RL trainer pattern — fire-and-forget rollout
+    # calls into the collector; the driver does NOT wait on them.
+    # Version state is producer-owned: set_weight_version is the
+    # one-shot initial seed; subsequent transitions go through the
+    # producer's policy_refit. Driver never writes the version
+    # directly mid-stream. Ray serializes actor methods on the main
+    # thread → keys_stale lands with v=1 and keys_fresh with v=3 after
+    # the refit. Trainer blocks on claim_meta(timeout_s=...) the way
+    # the production trainer blocks on its replay buffer.
     producer = _TQBackedAsyncCollector.remote()
     producer.set_weight_version.remote(1)
     producer.rollout_to_tq.remote(pid, keys_stale)
@@ -219,8 +215,8 @@ def test_async_rl_filter_with_producer_actor(dp_client) -> None:
         sample_meta, current_weight_version=current_weight_version
     )
     shards, _ = shard_meta_for_dp(keep_meta, dp_world=2)
-    # Same per-rank fetch helper grpo_sync.py uses (column_io.py:51) —
-    # wraps get_samples + materialize (jagged unpack, object decode).
+    # Same per-rank fetch helper grpo_sync.py uses — wraps
+    # get_samples + materialize (jagged unpack, object decode).
     shard_fetches: list[Any] = [
         read_columns(dp_client, s, select_fields=["input_ids"])
         for s in shards
@@ -274,6 +270,6 @@ def test_async_rl_filter_with_producer_actor(dp_client) -> None:
     assert survivors_td["input_ids"].shape[0] == keep_meta.size
 
     # Partition / actor cleanup is the conftest's job: session-scope
-    # init_ray_cluster (tests/unit/conftest.py:380) calls ray.shutdown()
-    # at the end of the session, and the dp_client fixture's client.close()
-    # kills the TQ controller actor.
+    # init_ray_cluster calls ray.shutdown() at the end of the session,
+    # and the dp_client fixture's client.close() kills the TQ
+    # controller actor.
