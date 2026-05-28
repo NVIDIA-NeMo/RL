@@ -304,6 +304,38 @@ def validate_sync(
     return val_metrics, timing_metrics
 
 
+def _compute_seq_logprob_error_metrics(
+    *,
+    token_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+    prev_logprobs: torch.Tensor,
+    generation_logprobs: torch.Tensor,
+    rewards: torch.Tensor,
+    seq_logprob_error_threshold: Optional[float],
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    # Thin BDD for the data-driven masking call: take
+    # the slice you need, transform, write delta back.
+    masking_data = BatchedDataDict[ClippedPGLossDataDict](
+        {
+            "token_mask": token_mask,
+            "sample_mask": sample_mask,
+            "prev_logprobs": prev_logprobs,
+            "generation_logprobs": generation_logprobs,
+        }
+    )
+    seq_error_result = compute_and_apply_seq_logprob_error_masking(
+        train_data=masking_data,
+        rewards=rewards,
+        seq_logprob_error_threshold=seq_logprob_error_threshold,
+    )
+    seq_logprob_error_metrics = seq_error_result
+    if "num_masked_seqs" in seq_logprob_error_metrics:
+        seq_logprob_error_metrics["num_masked_seqs_by_logprob_error"] = (
+            seq_logprob_error_metrics.pop("num_masked_seqs")
+        )
+    return masking_data["sample_mask"], seq_logprob_error_metrics
+
+
 def grpo_train_sync(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -758,31 +790,18 @@ def grpo_train_sync(
                         extras_bdd["reference_policy_logprobs"] if compute_ref else None
                     )
 
-                    # Thin BDD for the data-driven masking call: take
-                    # the slice you need, transform, write delta back.
-                    masking_data = BatchedDataDict[ClippedPGLossDataDict](
-                        {
-                            "token_mask": token_mask,
-                            "sample_mask": loss_multiplier,
-                            "prev_logprobs": prev_logprobs,
-                            "generation_logprobs": generation_logprobs,
-                        }
+                    sample_mask, seq_logprob_error_metrics = (
+                        _compute_seq_logprob_error_metrics(
+                            token_mask=token_mask,
+                            sample_mask=loss_multiplier,
+                            prev_logprobs=prev_logprobs,
+                            generation_logprobs=generation_logprobs,
+                            rewards=rewards,
+                            seq_logprob_error_threshold=master_config.grpo[
+                                "seq_logprob_error_threshold"
+                            ],
+                        )
                     )
-
-                    (
-                        max_seq_mult_prob_error,
-                        num_masked_seqs,
-                        masked_correct_pct,
-                    ) = compute_and_apply_seq_logprob_error_masking(
-                        train_data=masking_data,
-                        rewards=rewards,
-                        seq_logprob_error_threshold=master_config.grpo[
-                            "seq_logprob_error_threshold"
-                        ],
-                    )
-                    # masking may have mutated sample_mask in place —
-                    # capture the post-masking value for delta-write.
-                    sample_mask = masking_data["sample_mask"]
 
                 with timer.time("advantage_calculation"):
                     print("▶ Computing advantages...", flush=True)
@@ -1011,9 +1030,7 @@ def grpo_train_sync(
                 metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
 
-                metrics["max_seq_mult_prob_error"] = max_seq_mult_prob_error
-                metrics["num_masked_seqs_by_logprob_error"] = num_masked_seqs
-                metrics["masked_correct_pct"] = masked_correct_pct
+                metrics.update(seq_logprob_error_metrics)
 
                 consumed_samples += master_config.grpo["num_prompts_per_step"]
                 timeout.mark_iteration()
