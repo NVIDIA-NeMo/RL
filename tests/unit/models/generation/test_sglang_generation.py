@@ -232,8 +232,8 @@ def get_generation_cluster_separate(num_gpus_per_node: int = 2) -> RayVirtualClu
 # =============================================================================
 
 
-def test_extract_generated_tokens_and_logprobs_from_output_ids():
-    """SGLang DLLM responses may omit output_token_logprobs."""
+def test_extract_generated_tokens_and_logprobs_requires_output_logprobs():
+    """Do not silently train with zero-filled SGLang generation logprobs."""
     result = {
         "output_ids": [319, 1234, 2],
         "meta_info": {
@@ -241,10 +241,24 @@ def test_extract_generated_tokens_and_logprobs_from_output_ids():
         },
     }
 
+    with pytest.raises(RuntimeError, match="without generation logprobs"):
+        _extract_generated_tokens_and_logprobs(result)
+
+
+def test_extract_generated_tokens_and_logprobs_from_split_fields():
+    result = {
+        "output_ids": [319, 1234, 2],
+        "meta_info": {
+            "output_token_logprobs": [],
+            "output_token_logprobs_val": [-0.3, -0.4, -0.5],
+            "output_token_logprobs_idx": [319, 1234, 2],
+        },
+    }
+
     tokens, logprobs = _extract_generated_tokens_and_logprobs(result)
 
     assert tokens == [319, 1234, 2]
-    assert logprobs == [0.0, 0.0, 0.0]
+    assert logprobs == [-0.3, -0.4, -0.5]
 
 
 def test_extract_generated_tokens_and_logprobs_prefers_logprob_tokens():

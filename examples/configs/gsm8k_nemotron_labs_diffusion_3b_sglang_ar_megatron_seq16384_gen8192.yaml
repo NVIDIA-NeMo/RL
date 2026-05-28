@@ -1,0 +1,159 @@
+defaults: "grpo_math_1B_megatron.yaml"
+
+grpo:
+  num_prompts_per_step: 128
+  num_generations_per_prompt: 8
+  max_num_steps: 5000
+  max_num_epochs: 1000
+  val_period: 100
+  val_at_start: false
+  val_at_end: true
+  max_val_samples: 2000
+  val_batch_size: 128
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/grpo-nemotron-diffusion-3b-ar-megatron"
+  save_period: 100
+  model_save_format: "safetensors"
+  save_consolidated: false
+  save_optimizer: true
+
+policy:
+  model_name: "/lustre/fsw/portfolios/coreai/users/snorouzi/checkpoints/Nemotron-Labs-Diffusion-3B"
+  tokenizer:
+    name: ${policy.model_name}
+  train_global_batch_size: 1024
+  train_micro_batch_size: 16
+  generation_batch_size: 32
+  logprob_batch_size: 16
+  max_total_sequence_length: 16384
+  precision: "bfloat16"
+  worker_cls_fqn: "nemo_rl.models.policy.workers.nemotron_diffusion_megatron_policy_worker.NemotronDiffusionMegatronPolicyWorker"
+
+  dtensor_cfg:
+    enabled: false
+
+  optimizer: null
+  scheduler: null
+
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+
+  megatron_cfg:
+    enabled: true
+    force_reconvert_from_hf: false
+    empty_unused_memory_level: 1
+    activation_checkpointing: true
+    converter_type: "Ministral3ForCausalLM"
+    tensor_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    pipeline_dtype: ${policy.precision}
+    sequence_parallel: false
+
+    optimizer:
+      optimizer: "adam"
+      lr: 3.0e-7
+      min_lr: 3.0e-8
+      weight_decay: 0.01
+      bf16: true
+      fp16: false
+      params_dtype: "float32"
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1e-8
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      clip_grad: ${policy.max_grad_norm}
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"
+      lr_decay_iters: 1000
+      lr_warmup_iters: 13
+      lr_warmup_init: 3.0e-8
+
+  generation:
+    backend: "sglang"
+    max_new_tokens: 8192
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    sglang_cfg:
+      model_path: ${policy.model_name}
+      gpus_per_server: 1
+      dtype: ${policy.precision}
+      context_length: ${policy.max_total_sequence_length}
+      allow_auto_truncate: true
+      enable_memory_saver: false
+      dp_size: 1
+      pp_size: 1
+      ep_size: 1
+      max_running_requests: 8
+      mem_fraction_static: 0.55
+      max_total_tokens: 20000
+      skip_server_warmup: true
+      disable_piecewise_cuda_graph: true
+      attention_backend: "flashinfer"
+      json_model_override_args: '{"ar_mode": true}'
+
+logger:
+  log_dir: "logs/grpo-nemotron-diffusion-3b-instruct-ar-megatron-sglang"
+  wandb_enabled: true
+  tensorboard_enabled: false
+  wandb:
+    project: "diffusion_rl"
+    mode: "online"
+    name: "grpo-nemotron-diffusion-3b-instruct-ar-megatron-sglang"
+
+runtime_versions:
+  nemo_rl:
+    path: ${oc.env:NEMO_RL_GIT_PATH,unknown}
+    branch: ${oc.env:NEMO_RL_GIT_BRANCH,unknown}
+    commit: ${oc.env:NEMO_RL_GIT_COMMIT,unknown}
+    status_count: ${oc.env:NEMO_RL_GIT_STATUS_COUNT,unknown}
+  sglang:
+    url: ${oc.env:SGLANG_GIT_URL,unknown}
+    commit: ${oc.env:SGLANG_GIT_COMMIT,unknown}
+    subdirectory: ${oc.env:SGLANG_GIT_SUBDIRECTORY,unknown}
+  megatron_bridge:
+    path: ${oc.env:MEGATRON_BRIDGE_GIT_PATH,unknown}
+    branch: ${oc.env:MEGATRON_BRIDGE_GIT_BRANCH,unknown}
+    commit: ${oc.env:MEGATRON_BRIDGE_GIT_COMMIT,unknown}
+    status_count: ${oc.env:MEGATRON_BRIDGE_GIT_STATUS_COUNT,unknown}
+  megatron_lm:
+    path: ${oc.env:MEGATRON_LM_GIT_PATH,unknown}
+    branch: ${oc.env:MEGATRON_LM_GIT_BRANCH,unknown}
+    commit: ${oc.env:MEGATRON_LM_GIT_COMMIT,unknown}
+    status_count: ${oc.env:MEGATRON_LM_GIT_STATUS_COUNT,unknown}
+  env:
+    tag: ${oc.env:ENV_TAG,unknown}
+    uv_project_environment: ${oc.env:UV_PROJECT_ENVIRONMENT,unknown}
+    uv_cache_dir: ${oc.env:UV_CACHE_DIR,unknown}
+    worker_venv_dir: ${oc.env:NEMO_RL_VENV_DIR,unknown}
+
+data:
+  train:
+    dataset_name: gsm8k
+    split: train
+  validation:
+    dataset_name: gsm8k
+    split: test
+  max_input_seq_length: 16384
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1

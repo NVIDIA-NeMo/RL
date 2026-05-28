@@ -196,6 +196,25 @@ if [[ -n "${DEPENDENCY}" ]]; then
   SBATCH_ARGS+=(--dependency="${DEPENDENCY}")
 fi
 
+if [[ "${NODES}" -gt 1 ]]; then
+  # NeMo RL ray.sub owns multi-node Ray bringup. This script only defines
+  # the driver command and environment used once ray.sub has started the cluster.
+  export COMMAND="cd ${REPO_DIR} && tools/nemotron_diffusion/submit_grpo_nemotron_ar_megatron_sbatch.sh --run"
+  export CONTAINER="${CONTAINER:-${CONTAINER_IMAGE}}"
+  export MOUNTS="${MOUNTS:-${CONTAINER_MOUNTS}}"
+  export CPUS_PER_WORKER="${CPUS_PER_WORKER:-${CPUS_PER_TASK}}"
+  export BASE_LOG_DIR="${BASE_LOG_DIR:-${RUNDIR}}"
+  export UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-/lustre/fsw/portfolios/coreai/users/snorouzi/nemorl_uv_driver_envs/diffusion_RL_RL_${ENV_TAG}}"
+  export UV_CACHE_DIR_OVERRIDE="${UV_CACHE_DIR_OVERRIDE:-/lustre/fsw/portfolios/coreai/users/snorouzi/uv_cache_${ENV_TAG}}"
+  export RAY_raylet_start_wait_time_s="${RAY_raylet_start_wait_time_s:-240}"
+  export RAY_START_CMD="${RAY_START_CMD:-RAY_raylet_start_wait_time_s=${RAY_raylet_start_wait_time_s} UV_PROJECT_ENVIRONMENT=${UV_PROJECT_ENVIRONMENT} UV_CACHE_DIR=/root/.cache/uv uv run --locked --directory ${REPO_DIR} ray start}"
+  export RAY_STATUS_CMD="${RAY_STATUS_CMD:-UV_PROJECT_ENVIRONMENT=${UV_PROJECT_ENVIRONMENT} UV_CACHE_DIR=/root/.cache/uv uv run --locked --directory ${REPO_DIR} ray status}"
+
+  cd "${REPO_DIR}"
+  sbatch "${SBATCH_ARGS[@]}" ray.sub
+  exit 0
+fi
+
 sbatch "${SBATCH_ARGS[@]}" <<SBATCH
 #!/usr/bin/env bash
 set -euo pipefail
@@ -247,9 +266,9 @@ export MEGATRON_LM_GIT_BRANCH="${MEGATRON_LM_GIT_BRANCH:-}"
 export MEGATRON_LM_GIT_COMMIT="${MEGATRON_LM_GIT_COMMIT:-}"
 export MEGATRON_LM_GIT_STATUS_COUNT="${MEGATRON_LM_GIT_STATUS_COUNT:-}"
 
-srun --kill-on-bad-exit=1 \\
-  --container-image="${CONTAINER_IMAGE}" \\
-  --container-mounts="${CONTAINER_MOUNTS}" \\
-  --container-workdir="${REPO_DIR}" \\
-  bash -lc 'cd "\${REPO_DIR}" && tools/nemotron_diffusion/submit_grpo_nemotron_ar_megatron_sbatch.sh --run'
+srun --kill-on-bad-exit=1 \
+  --container-image="${CONTAINER_IMAGE}" \
+  --container-mounts="${CONTAINER_MOUNTS}" \
+  --container-workdir="${REPO_DIR}" \
+  bash -lc 'cd "${REPO_DIR}" && tools/nemotron_diffusion/submit_grpo_nemotron_ar_megatron_sbatch.sh --run'
 SBATCH

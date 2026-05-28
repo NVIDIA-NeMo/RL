@@ -154,6 +154,8 @@ def init_ray(log_dir: Optional[str] = None) -> None:
             return
 
     except ConnectionError:
+        if os.environ.get("RAY_ADDRESS"):
+            raise
         logger.debug("No existing Ray cluster found, will start a new one.")
         # If ConnectionError, proceed to start a new local cluster without further action here.
         # Clear driver-side package cache so working_dir is re-uploaded

@@ -70,16 +70,57 @@ def _extract_generated_tokens_and_logprobs(
     output_token_logprobs = meta_info.get("output_token_logprobs", [])
 
     if output_token_logprobs:
-        new_tokens = [item[1] for item in output_token_logprobs]
-        new_logprobs = [item[0] for item in output_token_logprobs]
+        new_tokens = []
+        new_logprobs = []
+        for item in output_token_logprobs:
+            if isinstance(item, dict):
+                token_id = item.get("token_id", item.get("id"))
+                logprob = item.get("logprob")
+            else:
+                logprob = item[0]
+                token_id = item[1]
+            if token_id is None or logprob is None:
+                raise RuntimeError(
+                    "Malformed SGLang output_token_logprobs entry: "
+                    f"{item!r}"
+                )
+            new_tokens.append(int(token_id))
+            new_logprobs.append(float(logprob))
         return new_tokens, new_logprobs
 
-    # SGLang DLLM generation can return output_ids without output_token_logprobs.
-    # Keep the sampled sequence and let policy logprob inference recompute old-policy
-    # logprobs before training.
     output_ids = result.get("output_ids", meta_info.get("output_ids", []))
+    output_token_logprobs_val = meta_info.get(
+        "output_token_logprobs_val", result.get("output_token_logprobs_val", [])
+    )
+    output_token_logprobs_idx = meta_info.get(
+        "output_token_logprobs_idx", result.get("output_token_logprobs_idx", [])
+    )
+    if output_token_logprobs_val:
+        new_tokens = (
+            output_token_logprobs_idx if output_token_logprobs_idx else output_ids
+        )
+        if len(new_tokens) != len(output_token_logprobs_val):
+            raise RuntimeError(
+                "SGLang returned mismatched generation logprob fields: "
+                f"{len(new_tokens)} token ids vs "
+                f"{len(output_token_logprobs_val)} logprobs"
+            )
+        return [int(x) for x in new_tokens], [
+            float(x) for x in output_token_logprobs_val
+        ]
+
     if output_ids:
-        return output_ids, [0.0] * len(output_ids)
+        meta_keys = sorted(meta_info.keys()) if isinstance(meta_info, dict) else []
+        result_keys = sorted(result.keys())
+        raise RuntimeError(
+            "SGLang returned output_ids without generation logprobs. "
+            "NemoRL refuses to silently fill generation_logprobs with zeros. "
+            "Use an SGLang build/mode that returns output_token_logprobs "
+            "(for DLLM/FastDiffuser this currently requires the leftmost "
+            "logprob path), or disable training features that require "
+            "generation_logprobs. "
+            f"result keys={result_keys}, meta_info keys={meta_keys}"
+        )
 
     return [], []
 
@@ -270,6 +311,7 @@ class SGLangGenerationWorker:
             "allow_auto_truncate",
             "attention_backend",
             "json_model_override_args",
+            "disable_cuda_graph",
             "disable_piecewise_cuda_graph",
             "dllm_algorithm",
             "dllm_algorithm_config",
@@ -498,6 +540,7 @@ class SGLangGenerationWorker:
         payload = {
             "sampling_params": sampling_params,
             "return_logprob": True,
+            "logprob_start_len": -1,
             "input_ids": input_ids,
         }
 

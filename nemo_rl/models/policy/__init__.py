@@ -313,12 +313,33 @@ class DynamicBatchingConfig(TypedDict):
     sequence_length_round: int
 
 
+class JustGRPOLeftmostRevealLogprobEstimationConfig(TypedDict):
+    """Estimate token logprobs with the JustGRPO leftmost-reveal objective."""
+
+    type: Literal["just_grpo_leftmost_reveal"]
+    reveal_schedule: Literal["sparse", "fixed_response_window"]
+    megatron_attention_mode: Literal[
+        "training", "inference_bidirectional", "inference_block_bidirectional"
+    ]
+    mask_token_id: int
+    max_reveal_positions: NotRequired[int]
+    reveal_batch_size: int
+    train_reveal_batch_size: int
+    logits_position_shift: NotRequired[int]
+
+
+LogprobEstimationConfig = JustGRPOLeftmostRevealLogprobEstimationConfig
+
+
 class PolicyConfig(TypedDict):
     model_name: str
     tokenizer: TokenizerConfig
     train_global_batch_size: int
     train_micro_batch_size: int
     logprob_batch_size: NotRequired[int]
+    # If omitted, policy workers use the default autoregressive next-token
+    # logprob path. Set this only when a policy needs alternate logprob semantics.
+    logprob_estimation: NotRequired[LogprobEstimationConfig]
     # If set, log probability computation is chunked along the sequence dimension to avoid GPU OOM (especially during backward pass).
     # Within each chunk loop, logits casting (from float16/bfloat16 to float32) is done to prevent holding the entire float32 logits tensor in memory.
     # If None, chunking is disabled and the full sequence is processed at once.
