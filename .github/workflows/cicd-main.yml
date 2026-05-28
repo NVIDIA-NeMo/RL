@@ -295,6 +295,10 @@ jobs:
       image-label: ${{ vars.CI_CONTAINER_NAME }}
       target: release
       registry: ${{ needs.org-member-pre-flight.outputs.registry }}
+      # Ephemeral build runners cannot rely on local Docker state or inline cache
+      # from previous jobs. Use the template's registry cache so the uv sync
+      # dependency layer is shared across fresh runners.
+      use-inline-cache: false
       build-contexts: |
         nemo-rl=${{ github.run_id }}/
         ${{ vars.UV_BUILD_CACHE == 'enabled' && format('uv-cache-seed=docker-image://{0}/{1}-uv-cache:latest', needs.org-member-pre-flight.outputs.registry, vars.CI_CONTAINER_NAME) || '' }}
