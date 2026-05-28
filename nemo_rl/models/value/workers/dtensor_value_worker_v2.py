@@ -613,6 +613,21 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
         self.model.eval()
         torch.cuda.empty_cache()
 
+    # NOTE(ppo-dtensor port): bg51717/ppo's pre-Path-A worker didn't define
+    # finish_training / finish_inference, but this fork's PPO algorithm loop
+    # (nemo_rl/algorithms/ppo.py L667, L1519, L1617, L1929) calls them on
+    # value_model every step. Without these no-op overrides the run dies at
+    # the first step with:
+    #   AttributeError: 'ActorHandle' object has no attribute 'finish_inference'
+    # Path A's worker has the same no-op overrides; the corresponding
+    # dtensor_policy_worker_v2.py also has them (added in cross-backend
+    # infra fixes commit 3610022).
+    def finish_training(self, *args, **kwargs) -> None:
+        pass
+
+    def finish_inference(self, *args, **kwargs) -> None:
+        pass
+
     def move_optimizer_to_device(self, device: str | torch.device) -> None:
         """Move optimizer state to specified device."""
         from torch.distributed.tensor import DTensor
