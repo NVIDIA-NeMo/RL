@@ -1,1 +1,58 @@
-[]
+[
+  {
+    "id": "session-memory-positive-001",
+    "question": "Save a checkpoint of our current session so I can resume later after a disconnect.",
+    "expected_skill": "session-memory",
+    "ground_truth": "The agent loads the session-memory skill, creates a timestamped session directory, and writes session_state.md, timeline.md, files.md, and handoff.md.",
+    "expected_behavior": [
+      "The agent read session-memory/SKILL.md before acting",
+      "The agent created a timestamped directory under session/",
+      "The agent wrote session_state.md with the current goal and status",
+      "The agent wrote handoff.md with resume instructions"
+    ]
+  },
+  {
+    "id": "session-memory-positive-002",
+    "question": "I just reconnected after VS Code crashed. Can you pick up where we left off?",
+    "expected_skill": "session-memory",
+    "ground_truth": "The agent loads the session-memory skill, finds the latest session directory, reads handoff.md and session_state.md, verifies git state, and resumes from the last verified next action.",
+    "expected_behavior": [
+      "The agent read session-memory/SKILL.md before acting",
+      "The agent found and read the latest session directory",
+      "The agent read handoff.md first, then session_state.md",
+      "The agent verified git state before continuing"
+    ]
+  },
+  {
+    "id": "session-memory-positive-003",
+    "question": "This is going to be a long debugging session. Please preserve context periodically.",
+    "expected_skill": "session-memory",
+    "ground_truth": "The agent loads the session-memory skill, creates a session directory, and commits to checkpointing at regular intervals during the long-running work.",
+    "expected_behavior": [
+      "The agent read session-memory/SKILL.md before acting",
+      "The agent created a session directory",
+      "The agent wrote an initial session_state.md",
+      "The agent planned to checkpoint at least every 30 minutes"
+    ]
+  },
+  {
+    "id": "session-memory-negative-001",
+    "question": "What is the difference between GRPO and DPO algorithms?",
+    "expected_skill": null,
+    "should_trigger": false,
+    "ground_truth": "The agent should not activate the session-memory skill for a simple knowledge question.",
+    "expected_behavior": [
+      "The agent did not read or activate session-memory/SKILL.md"
+    ]
+  },
+  {
+    "id": "session-memory-negative-002",
+    "question": "Run the linter on the nemo_rl/ directory and fix any issues.",
+    "expected_skill": null,
+    "should_trigger": false,
+    "ground_truth": "The agent should not activate the session-memory skill for a short linting task.",
+    "expected_behavior": [
+      "The agent did not read or activate session-memory/SKILL.md"
+    ]
+  }
+]

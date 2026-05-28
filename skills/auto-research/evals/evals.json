@@ -1,1 +1,60 @@
-[]
+[
+  {
+    "id": "auto-research-positive-001",
+    "question": "Run 10 experiments to improve GRPO accuracy on the Qwen 2.5 math recipe.",
+    "expected_skill": "auto-research",
+    "ground_truth": "The agent loads the auto-research skill, creates a branch prefix, reads the target recipe, sets up a TSV log, runs a baseline, and iterates through experiment hypotheses tracking results in git.",
+    "expected_behavior": [
+      "The agent read auto-research/SKILL.md before acting",
+      "The agent inspected the git state and created a branch under a shared prefix",
+      "The agent read the target recipe and relevant code paths",
+      "The agent created a TSV log for tracking experiments",
+      "The agent ran a baseline experiment first"
+    ]
+  },
+  {
+    "id": "auto-research-positive-002",
+    "question": "Test these hypotheses: try increasing the batch size, try a different learning rate schedule, and try prompt compaction. Run each as a separate experiment.",
+    "expected_skill": "auto-research",
+    "ground_truth": "The agent loads the auto-research skill, creates separate branches for each hypothesis, runs each experiment, and records results in the TSV log.",
+    "expected_behavior": [
+      "The agent read auto-research/SKILL.md before acting",
+      "The agent created a separate branch for each hypothesis",
+      "The agent committed each hypothesis before launching",
+      "The agent recorded results in the TSV log after each run"
+    ]
+  },
+  {
+    "id": "auto-research-positive-003",
+    "question": "Find a better recipe configuration to improve reward scores. You have 5 hours total and 1 hour per experiment.",
+    "expected_skill": "auto-research",
+    "ground_truth": "The agent loads the auto-research skill, converts the time budget into explicit stop conditions, enforces per-experiment timeouts, and monitors campaign time remaining.",
+    "expected_behavior": [
+      "The agent read auto-research/SKILL.md before acting",
+      "The agent converted the time budget into an absolute deadline",
+      "The agent enforced a 1-hour per-experiment timeout",
+      "The agent checked remaining campaign time after each experiment"
+    ]
+  },
+  {
+    "id": "auto-research-negative-001",
+    "question": "Fix a bug in the GRPO loss calculation where the KL penalty is applied incorrectly.",
+    "expected_skill": null,
+    "should_trigger": false,
+    "ground_truth": "The agent should not activate the auto-research skill for a bug fix task. It should investigate the bug directly.",
+    "expected_behavior": [
+      "The agent did not read or activate auto-research/SKILL.md",
+      "The agent investigated the bug in the GRPO code directly"
+    ]
+  },
+  {
+    "id": "auto-research-negative-002",
+    "question": "Add a docstring to the GRPOAlgorithm class.",
+    "expected_skill": null,
+    "should_trigger": false,
+    "ground_truth": "The agent should not activate the auto-research skill for a documentation task.",
+    "expected_behavior": [
+      "The agent did not read or activate auto-research/SKILL.md"
+    ]
+  }
+]
