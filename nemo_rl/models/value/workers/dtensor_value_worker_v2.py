@@ -667,10 +667,14 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
     ) -> None:
         """Initialize the AutomodelCheckpointManager for this worker."""
         if self.checkpoint_manager is None:
+            # NOTE(ppo-dtensor port): bg51717/ppo's worker passed a
+            # `model_state_dict_keys` kwarg that the current
+            # nemo_rl.models.automodel.checkpoint.AutomodelCheckpointManager
+            # signature (dp_mesh, tp_mesh, moe_mesh) does not accept; drop it
+            # so the constructor doesn't raise TypeError at worker startup.
             self.checkpoint_manager = AutomodelCheckpointManager(
                 dp_mesh=self.dp_mesh,
                 tp_mesh=self.tp_mesh,
-                model_state_dict_keys=getattr(self, "model_state_dict_keys", None),
                 moe_mesh=self.moe_mesh,
             )
             self.checkpoint_manager.init_checkpointer(
