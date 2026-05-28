@@ -29,8 +29,9 @@ caller drives :func:`shard_meta_for_dp` on ``keep`` and
 Contract notes
 --------------
 - Both ``(keep, drop)`` are fresh ``KVBatchMeta`` instances (via
-  ``meta.subset(...)``) — never aliases of the input. Caller can mutate
-  either half without affecting the source.
+  ``meta.subset(...)`` — outer lists are fresh; per-sample tag dicts
+  may be shared references with the input. Don't mutate tag dicts on
+  either half if the source still matters.
 - Filters that need driver state (e.g. ``current_weight_version``)
   accept it via ``**kwargs``; they MUST raise a clear error when the
   required kwarg is missing rather than relying on Python's default
@@ -45,6 +46,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from typing import Any
+
+import numpy as np
 
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 
@@ -119,6 +122,11 @@ class StalenessFilter(BaseRolloutFilter):
                 "'weight_version'; got meta.tags=None. Stamp the tag at "
                 "rollout time."
             )
+        if len(meta.tags) != meta.size:
+            raise ValueError(
+                f"meta.tags length {len(meta.tags)} != meta.size {meta.size}; "
+                f"refusing to silently drop the trailing rows."
+            )
 
         keep_ix: list[int] = []
         for i, t in enumerate(meta.tags):
@@ -128,9 +136,10 @@ class StalenessFilter(BaseRolloutFilter):
                     f"'weight_version'"
                 )
             v = t["weight_version"]
-            if v is None or not isinstance(v, int) or isinstance(v, bool):
-                # bool is an int subclass — reject it explicitly to avoid
-                # confusing True/False arithmetic.
+            # Accept Python int and numpy integer scalars; reject bool
+            # (which is an int subclass) so True/False can't sneak through
+            # as 1/0 arithmetic.
+            if v is None or isinstance(v, bool) or not isinstance(v, (int, np.integer)):
                 raise ValueError(
                     f"sample {meta.sample_ids[i]!r} has "
                     f"weight_version={v!r}; expected non-None int"

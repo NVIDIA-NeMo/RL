@@ -90,13 +90,34 @@ class _TQBackedAsyncCollector:
 
     def __init__(self) -> None:
         # Attach to the existing TQ controller (driver bootstrapped it).
-        # Same dp_client surface SyncRolloutActor's workers hold.
-        self._dp_client = build_data_plane_client(simple_backend_dp_config())
+        # ``bootstrap=False`` matches every production rollout-side caller
+        # — ``sync_rollout_actor.py:94`` and ``worker_mixin.py:142``.
+        self._dp_client = build_data_plane_client(
+            simple_backend_dp_config(), bootstrap=False
+        )
         self.current_weight_version: int = 0
 
     def set_weight_version(self, version: int) -> None:
-        """Mirrors ``AsyncTrajectoryCollector.set_weight_version``."""
+        """Trainer-driven initial seed of the producer's version state.
+
+        Mirrors the one-shot setup call at ``grpo.py:2652`` ("Ensure
+        collector knows initial weight version"). For *subsequent*
+        version changes (real refit events), prefer ``policy_refit`` —
+        the producer should own its version transitions, not have them
+        written from outside.
+        """
         self.current_weight_version = int(version)
+
+    def policy_refit(self, new_version: int) -> None:
+        """Producer-side refit: swap in new weights, bump version.
+
+        Models the real refit event (``grpo.py:3022-3023`` does
+        ``set_weight_version`` + ``resume_after_refit``). Body delegates
+        to ``set_weight_version`` so both paths share a single source
+        of truth for the version write; when a fuller implementation
+        adds weight reload / resume semantics, diverge here.
+        """
+        self.set_weight_version(new_version)
 
     def rollout_to_tq(
         self,
@@ -105,7 +126,12 @@ class _TQBackedAsyncCollector:
         *,
         max_seqlen: int = 16,
     ) -> list[str]:
-        """Mocked rollout + flat TQ write, mirroring ``SyncRolloutActor.rollout_to_tq``."""
+        """Mocked rollout + flat TQ write, mirroring ``SyncRolloutActor.rollout_to_tq``.
+
+        Stamps each sample with ``self.current_weight_version`` — owned by
+        the producer, updated only via ``set_weight_version``. The
+        version never crosses the driver/producer boundary as a call arg.
+        """
         n = len(sample_ids)
         bulk = make_rollout_batch(n=n, max_seqlen=max_seqlen)
         # Add ``content`` as np.ndarray(object) of per-row message_logs —
@@ -168,16 +194,20 @@ def test_async_rl_filter_with_producer_actor(dp_client) -> None:
     register_train_partition(dp_client, num_samples=n, partition_id=pid)
 
     # ── Pipeline (no asserts) ────────────────────────────────────────────────
-    # Producer mimics a future TQ-backed async rollout actor: stateful
-    # current_weight_version, single-RPC rollout_to_tq per pass. Ray
-    # serializes actor methods so the four calls below execute in
-    # submission order on the actor's main thread.
+    # Mirror the async-RL trainer pattern in grpo.py:2649 — fire-and-forget
+    # rollout calls into the collector; the driver does NOT wait on them.
+    # Version state is producer-owned: set_weight_version is the one-shot
+    # initial seed (grpo.py:2652); subsequent transitions go through the
+    # producer's policy_refit (grpo.py:3022-3023). Driver never writes
+    # the version directly mid-stream. Ray serializes actor methods on
+    # the main thread → keys_stale lands with v=1 and keys_fresh with v=3
+    # after the refit. Trainer blocks on claim_meta(timeout_s=...) — the
+    # way the production trainer blocks on replay_buffer.size().
     producer = _TQBackedAsyncCollector.remote()
     producer.set_weight_version.remote(1)
-    stale_done = producer.rollout_to_tq.remote(pid, keys_stale)
-    producer.set_weight_version.remote(current_weight_version)
-    fresh_done = producer.rollout_to_tq.remote(pid, keys_fresh)
-    ray.get([stale_done, fresh_done])
+    producer.rollout_to_tq.remote(pid, keys_stale)
+    producer.policy_refit.remote(current_weight_version)
+    producer.rollout_to_tq.remote(pid, keys_fresh)
 
     sample_meta = dp_client.claim_meta(
         partition_id=pid,
@@ -221,6 +251,12 @@ def test_async_rl_filter_with_producer_actor(dp_client) -> None:
     assert drop_meta.size == len(keys_stale)
     assert set(keep_meta.sample_ids) == set(keys_fresh)
     assert set(drop_meta.sample_ids) == set(keys_stale)
+
+    # Tags must propagate onto both halves — a regression in meta.subset()
+    # that dropped tags would leave the existing tag-by-id checks above
+    # silently green (those read sample_meta, not keep/drop).
+    assert keep_meta.tags is not None and len(keep_meta.tags) == keep_meta.size
+    assert drop_meta.tags is not None and len(drop_meta.tags) == drop_meta.size
 
     # DP shards cover keep set exactly — Counter catches dup-and-drop swaps.
     flat = [s for shard in shards for s in shard.sample_ids]

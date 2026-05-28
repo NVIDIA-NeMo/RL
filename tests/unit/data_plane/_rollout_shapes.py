@@ -35,7 +35,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
+from nemo_rl.data_plane.interfaces import DataPlaneClient
 from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
 
 
@@ -208,7 +208,7 @@ def keys_from_uids(uids: list[str], n_gen: int = 1) -> list[str]:
 
 
 def register_train_partition(
-    client: NoOpDataPlaneClient,
+    client: DataPlaneClient,
     *,
     num_samples: int,
     fields: list[str] | None = None,
@@ -252,6 +252,10 @@ def simple_backend_dp_config() -> dict[str, Any]:
     full_cfg = OmegaConf.load(cfg_path)
     dp_cfg = OmegaConf.to_container(full_cfg.data_plane, resolve=True)
     dp_cfg["enabled"] = True
+    # Pin impl/backend — the helper's name promises simple-backend TQ;
+    # the reference YAML's defaults could drift to mooncake_cpu otherwise.
+    dp_cfg["impl"] = "transfer_queue"
+    dp_cfg["backend"] = "simple"
     dp_cfg["storage_capacity"] = 1024
     dp_cfg["num_storage_units"] = 1
     return dp_cfg  # type: ignore[return-value]
