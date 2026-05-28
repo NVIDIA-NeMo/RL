@@ -9,7 +9,7 @@ grpo:
 
 checkpointing:
   enabled: false
-  checkpoint_dir: results/grpo-qwen3-30ba3b-4n4g-megatron-qa-nvfp4
+  checkpoint_dir: results/qa_grpo_qwen3_30ba3b_megatron
 
 policy:
   train_global_batch_size: 16
@@ -39,9 +39,9 @@ policy:
         backend: "eager"
 
 logger:
-  log_dir: logs/grpo-qwen3-30ba3b-4n4g-megatron-qa-nvfp4
+  log_dir: logs/qa_grpo_qwen3_30ba3b_megatron
   wandb_enabled: true
   tensorboard_enabled: true
   wandb:
     project: nemo-rl
-    name: grpo-qwen3-30ba3b-4n4g-megatron-qa-nvfp4
+    name: qa-grpo-qwen3-30ba3b-megatron

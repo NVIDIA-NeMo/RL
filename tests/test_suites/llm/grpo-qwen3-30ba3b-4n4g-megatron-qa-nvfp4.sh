@@ -13,7 +13,7 @@ LOG_DIR=$EXP_DIR/logs
 CKPT_DIR=$EXP_DIR/ckpts
 JSON_METRICS=$EXP_DIR/metrics.json
 RUN_LOG=$EXP_DIR/run.log
-CONFIG_PATH=$PROJECT_ROOT/examples/modelopt/grpo-qwen3-30ba3b-4n4g-megatron-qa-nvfp4.yaml
+CONFIG_PATH=$PROJECT_ROOT/examples/modelopt/qa_grpo_qwen3_30ba3b_megatron.yaml
 
 export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
 
