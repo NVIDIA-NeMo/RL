@@ -1,27 +1,24 @@
 [
   {
     "id": "brev-etiquette-positive-001",
-    "question": "I'm on a Brev instance. Set up the environment and run a GRPO training experiment with checkpoints and W&B logging.",
+    "question": "I'm on a Brev instance. What environment variables and directory structure should I set up before running a training experiment?",
     "expected_skill": "brev-etiquette",
-    "ground_truth": "The agent loads the brev-etiquette skill, checks disk space, sets up /ephemeral paths for experiment outputs, loads .env secrets, and configures cache directories before launching.",
+    "ground_truth": "The agent loads the brev-etiquette skill and describes setting up /ephemeral paths for experiment outputs, the shared cache root structure, and environment variables like HF_HOME, TORCH_HOME, RAY_TMPDIR pointing to /ephemeral.",
     "expected_behavior": [
       "The agent read brev-etiquette/SKILL.md before acting",
-      "The agent checked disk space with df -h /home/ubuntu/RL /ephemeral",
-      "The agent created experiment directories under /ephemeral",
-      "The agent loaded /home/ubuntu/RL/.env for secrets",
-      "The agent set cache environment variables pointing to /ephemeral"
+      "The agent described the /ephemeral directory structure",
+      "The agent listed the cache environment variables to set"
     ]
   },
   {
     "id": "brev-etiquette-positive-002",
-    "question": "Download the Qwen 2.5 model from Hugging Face on this Brev machine for an upcoming training run.",
+    "question": "On this Brev machine, where should I store Hugging Face model caches and W&B logs so they don't fill up the workspace disk?",
     "expected_skill": "brev-etiquette",
-    "ground_truth": "The agent loads the brev-etiquette skill, sets HF_HOME and cache paths to /ephemeral, loads HF_TOKEN from .env, and downloads the model to the shared cache root.",
+    "ground_truth": "The agent loads the brev-etiquette skill and explains storing caches under a shared /ephemeral cache root and W&B logs under the experiment directory on /ephemeral.",
     "expected_behavior": [
       "The agent read brev-etiquette/SKILL.md before acting",
-      "The agent set HF_HOME to a path under /ephemeral",
-      "The agent loaded .env for the HF_TOKEN",
-      "The agent used a shared cache root rather than per-experiment cache"
+      "The agent recommended /ephemeral for caches and logs",
+      "The agent mentioned the shared cache root pattern"
     ]
   },
   {
