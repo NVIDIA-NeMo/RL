@@ -87,6 +87,8 @@ policy:
     num_layers_in_first_pipeline_stage: null
     num_layers_in_last_pipeline_stage: null
     sequence_parallel: false
+    virtual_pipeline_model_parallel_size: null
+    pipeline_model_parallel_layout: null
     gradient_accumulation_fusion: false
 
     optimizer:

@@ -528,6 +528,8 @@ class TestApplyParallelismConfig:
                 "pipeline_model_parallel_size": 2,
                 "num_layers_in_first_pipeline_stage": None,
                 "num_layers_in_last_pipeline_stage": None,
+                "virtual_pipeline_model_parallel_size": None,
+                "pipeline_model_parallel_layout": None,
                 "sequence_parallel": True,
                 "context_parallel_size": 1,
             },
@@ -540,6 +542,9 @@ class TestApplyParallelismConfig:
         assert model_cfg.pipeline_model_parallel_size == 2
         assert model_cfg.sequence_parallel is True
         assert model_cfg.context_parallel_size == 1
+        assert model_cfg.virtual_pipeline_model_parallel_size is None
+        assert model_cfg.pipeline_model_parallel_layout is None
+        assert model_cfg.microbatch_group_size_per_vp_stage == 2
 
     def test_context_parallel_requires_sequence_packing(self):
         """Test that context parallelism > 1 requires sequence packing."""
@@ -552,6 +557,8 @@ class TestApplyParallelismConfig:
                 "pipeline_model_parallel_size": 1,
                 "num_layers_in_first_pipeline_stage": None,
                 "num_layers_in_last_pipeline_stage": None,
+                "virtual_pipeline_model_parallel_size": None,
+                "pipeline_model_parallel_layout": None,
                 "sequence_parallel": False,
                 "context_parallel_size": 2,
             },
@@ -574,6 +581,8 @@ class TestApplyParallelismConfig:
                 "pipeline_model_parallel_size": 1,
                 "num_layers_in_first_pipeline_stage": None,
                 "num_layers_in_last_pipeline_stage": None,
+                "virtual_pipeline_model_parallel_size": None,
+                "pipeline_model_parallel_layout": None,
                 "sequence_parallel": False,
                 "context_parallel_size": 4,
             },
@@ -583,6 +592,32 @@ class TestApplyParallelismConfig:
         _apply_parallelism_config(model_cfg, config)
 
         assert model_cfg.context_parallel_size == 4
+
+    def test_virtual_pipeline_config(self):
+        """Test that virtual_pipeline_model_parallel_size is correctly applied."""
+        from nemo_rl.models.megatron.setup import _apply_parallelism_config
+
+        model_cfg = MagicMock()
+        config = {
+            "megatron_cfg": {
+                "tensor_model_parallel_size": 1,
+                "pipeline_model_parallel_size": 2,
+                "num_layers_in_first_pipeline_stage": None,
+                "num_layers_in_last_pipeline_stage": None,
+                "virtual_pipeline_model_parallel_size": 2,
+                "pipeline_model_parallel_layout": None,
+                "sequence_parallel": False,
+                "context_parallel_size": 1,
+            },
+            "sequence_packing": {"enabled": False},
+        }
+
+        _apply_parallelism_config(model_cfg, config)
+
+        assert model_cfg.pipeline_model_parallel_size == 2
+        assert model_cfg.virtual_pipeline_model_parallel_size == 2
+        assert model_cfg.pipeline_model_parallel_layout is None
+        assert model_cfg.microbatch_group_size_per_vp_stage == 2
 
 
 @pytest.mark.mcore
@@ -1902,6 +1937,8 @@ class TestSetupModelAndOptimizer:
         mock_megatron_cfg.model.vocab_size = 32000
         mock_megatron_cfg.model.make_vocab_size_divisible_by = 128
         mock_megatron_cfg.model.tensor_model_parallel_size = 1
+        mock_megatron_cfg.model.virtual_pipeline_model_parallel_size = None
+        mock_megatron_cfg.model.pipeline_model_parallel_layout = None
         # Enable param gather overlap
         mock_megatron_cfg.ddp.overlap_param_gather = True
         mock_megatron_cfg.ddp.align_param_gather = True
@@ -1942,6 +1979,7 @@ class TestSetupModelAndOptimizer:
         assert len(call_kwargs.get("pre_wrap_hook", [])) > 0
 
         assert result.param_sync_func == mock_model_chunk.start_param_sync
+        assert result.model is mock_model
 
 
 @pytest.mark.mcore
@@ -2005,14 +2043,61 @@ class TestSetupReferenceModelState:
 
         # Verify state dict is returned
         assert isinstance(result, dict)
-        assert "layer1.weight" in result
-        assert "layer1.bias" in result
+        assert "0/layer1.weight" in result
+        assert "0/layer1.bias" in result
 
         # Verify tensors are on CPU
-        assert result["layer1.weight"].device.type == "cpu"
+        assert result["0/layer1.weight"].device.type == "cpu"
 
         captured = capsys.readouterr()
         assert "Reference model loaded" in captured.out
+
+    @patch("nemo_rl.models.megatron.setup.ProcessGroupCollection")
+    @patch("nemo_rl.models.megatron.setup.init_checkpointing_context")
+    @patch("nemo_rl.models.megatron.setup.GlobalState")
+    @patch("nemo_rl.models.megatron.setup.get_model")
+    @patch("nemo_rl.models.megatron.setup.checkpoint_exists")
+    @patch("nemo_rl.models.megatron.setup.load_checkpoint")
+    @patch("nemo_rl.models.megatron.setup.HAVE_FSDP2", False)
+    def test_setup_reference_model_merges_all_model_chunks(
+        self,
+        mock_load_checkpoint,
+        mock_checkpoint_exists,
+        mock_get_model,
+        mock_global_state,
+        mock_init_ckpt_context,
+        mock_pg_collection,
+    ):
+        """Reference-state setup should collect CPU state from every VPP chunk."""
+        from nemo_rl.models.megatron.setup import setup_reference_model_state
+
+        mock_global_state.return_value = MagicMock()
+        mock_megatron_cfg = MagicMock()
+        mock_megatron_cfg.dist.use_torch_fsdp2 = False
+
+        chunk_0 = MagicMock()
+        chunk_0.state_dict.return_value = {
+            "chunk0.layer.weight": torch.tensor([1.0, 2.0]),
+        }
+        chunk_1 = MagicMock()
+        chunk_1.state_dict.return_value = {
+            "chunk1.layer.weight": torch.tensor([3.0, 4.0]),
+        }
+        mock_get_model.return_value = [chunk_0, chunk_1]
+        mock_checkpoint_exists.return_value = True
+
+        result = setup_reference_model_state(
+            config={"megatron_cfg": {"freeze_moe_router": False}},
+            megatron_cfg=mock_megatron_cfg,
+            pretrained_path="/path/to/pretrained",
+        )
+
+        mock_load_checkpoint.assert_called_once()
+        chunk_0.eval.assert_called_once()
+        chunk_1.eval.assert_called_once()
+        assert set(result) == {"0/chunk0.layer.weight", "1/chunk1.layer.weight"}
+        assert result["0/chunk0.layer.weight"].device.type == "cpu"
+        assert result["1/chunk1.layer.weight"].device.type == "cpu"
 
 
 @pytest.mark.mcore

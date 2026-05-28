@@ -69,15 +69,20 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         self._pre_load_checkpoint_hook = self._restore_modelopt_state_pre_load
         super().__init__(config, *args, **kwargs)
 
+        # ``self.model`` is a list of VPP model chunks; reference_state_dict
+        # keys are prefixed with the chunk index to avoid collisions between
+        # chunks that share identical local layer names.
         if hasattr(self, "reference_state_dict"):
-            for name, item in self.model.state_dict().items():
-                if "_quantizer." in name:
-                    self.reference_state_dict[name] = item.detach().to(
-                        device="cpu", non_blocking=True, copy=True
-                    )
+            for chunk_idx, chunk in enumerate(self.model):
+                for name, item in chunk.state_dict().items():
+                    if "_quantizer." in name:
+                        self.reference_state_dict[f"{chunk_idx}/{name}"] = (
+                            item.detach().to(device="cpu", non_blocking=True, copy=True)
+                        )
         if self.rank == 0:
-            print(f"Quantized model: {self.model}")
-            mtq.print_quant_summary(self.model)
+            for chunk_idx, chunk in enumerate(self.model):
+                print(f"Quantized model chunk {chunk_idx}: {chunk}")
+                mtq.print_quant_summary(chunk)
 
     def _quantize(self, model):
         """Quantize the model if the model is not quantized yet."""
@@ -183,26 +188,34 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
 
     @contextmanager
     def hide_tensor_quantizers(self):
-        """Context manager that temporarily hides TensorQuantizer modules from module iteration."""
+        """Context manager that temporarily hides TensorQuantizer modules from module iteration.
+
+        ``self.model`` is a list of DDP-wrapped VPP chunks; we patch
+        ``named_modules`` on the inner ``.module`` of each chunk.
+        """
         from megatron.core.distributed import DistributedDataParallel
 
-        if not isinstance(self.model, DistributedDataParallel):
-            yield
-            return
+        def make_filtered(original):
+            def filtered_named_modules(*args, **kwargs):
+                for name, module in original(*args, **kwargs):
+                    if not isinstance(module, TensorQuantizer):
+                        yield name, module
 
-        inner_module = self.model.module
-        original_named_modules = inner_module.named_modules
+            return filtered_named_modules
 
-        def filtered_named_modules(*args, **kwargs):
-            for name, module in original_named_modules(*args, **kwargs):
-                if not isinstance(module, TensorQuantizer):
-                    yield name, module
-
+        patched = []
         try:
-            inner_module.named_modules = filtered_named_modules
+            for chunk in self.model:
+                if not isinstance(chunk, DistributedDataParallel):
+                    continue
+                inner_module = chunk.module
+                original = inner_module.named_modules
+                patched.append((inner_module, original))
+                inner_module.named_modules = make_filtered(original)
             yield
         finally:
-            inner_module.named_modules = original_named_modules
+            for inner_module, original in patched:
+                inner_module.named_modules = original
 
     def enable_forward_pre_hook(self):
         """Enable forward pre-hook, hiding TensorQuantizer modules."""
@@ -216,13 +229,14 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
 
     @contextmanager
     def disable_quantization(self):
-        """Context manager that temporarily disables quantization."""
+        """Context manager that temporarily disables quantization across all VPP chunks."""
         quantizers = []
         try:
-            for _, module in self.model.named_modules():
-                if isinstance(module, TensorQuantizer) and module.is_enabled:
-                    quantizers.append(module)
-                    module.disable()
+            for chunk in self.model:
+                for _, module in chunk.named_modules():
+                    if isinstance(module, TensorQuantizer) and module.is_enabled:
+                        quantizers.append(module)
+                        module.disable()
             yield
         finally:
             for module in quantizers:
@@ -230,7 +244,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
 
     @contextmanager
     def _hide_extra_state(self):
-        """Patch model.state_dict() to exclude _extra_state keys.
+        """Patch each VPP chunk's state_dict() to exclude _extra_state keys.
 
         ModelOpt appends quantization calibration data (amax/scale) to TE's
         serialized extra state, making it larger than the non-quantized
@@ -238,17 +252,24 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         weights, and can also be resized by TE during forward passes.
         Filtering them out lets the base class swap/restore skip them cleanly.
         """
-        original_state_dict = self.model.state_dict
 
-        def filtered_state_dict(*args, **kwargs):
-            sd = original_state_dict(*args, **kwargs)
-            return {k: v for k, v in sd.items() if not k.endswith("._extra_state")}
+        def make_filtered(original):
+            def filtered_state_dict(*args, **kwargs):
+                sd = original(*args, **kwargs)
+                return {k: v for k, v in sd.items() if not k.endswith("._extra_state")}
 
+            return filtered_state_dict
+
+        patched = []
         try:
-            self.model.state_dict = filtered_state_dict
+            for chunk in self.model:
+                original = chunk.state_dict
+                patched.append((chunk, original))
+                chunk.state_dict = make_filtered(original)
             yield
         finally:
-            self.model.state_dict = original_state_dict
+            for chunk, original in patched:
+                chunk.state_dict = original
 
     @contextmanager
     def use_reference_model(self) -> Generator[None, None, None]:
@@ -271,37 +292,44 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         on ``TensorQuantizer`` instances is detected as a model config and
         triggers spurious validation/serialization errors. We strip it for
         the duration of the call and restore it on exit.
+
+        Records ``(module, config)`` pairs by object identity so we can
+        restore across all VPP chunks in ``self.model``.
         """
-        configs = {}
+        configs = []
         try:
-            for name, module in self.model.named_modules():
-                if isinstance(module, TensorQuantizer):
-                    if hasattr(module, "config"):
-                        configs[name] = module.config
+            for chunk in self.model:
+                for _, module in chunk.named_modules():
+                    if isinstance(module, TensorQuantizer) and hasattr(
+                        module, "config"
+                    ):
+                        configs.append((module, module.config))
                         delattr(module, "config")
             yield
         finally:
-            for name, config in configs.items():
-                setattr(self.model.get_submodule(name), "config", config)
+            for module, config in configs:
+                setattr(module, "config", config)
 
     def get_quantizer_stats(self) -> dict:
         """Return summary statistics for all enabled TensorQuantizers.
 
         Useful for verifying that calibration ran and amax values are valid.
+        Aggregates across all VPP model chunks in ``self.model``.
         """
         total = 0
         enabled = 0
         with_amax = 0
         positive_amax = 0
-        for _, module in self.model.named_modules():
-            if isinstance(module, TensorQuantizer):
-                total += 1
-                if module.is_enabled:
-                    enabled += 1
-                    if hasattr(module, "amax") and module.amax is not None:
-                        with_amax += 1
-                        if (module.amax > 0).all():
-                            positive_amax += 1
+        for chunk in self.model:
+            for _, module in chunk.named_modules():
+                if isinstance(module, TensorQuantizer):
+                    total += 1
+                    if module.is_enabled:
+                        enabled += 1
+                        if hasattr(module, "amax") and module.amax is not None:
+                            with_amax += 1
+                            if (module.amax > 0).all():
+                                positive_amax += 1
         return {
             "total": total,
             "enabled": enabled,

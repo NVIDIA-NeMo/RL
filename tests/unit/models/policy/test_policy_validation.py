@@ -145,6 +145,8 @@ def create_megatron_config(
             "tensor_model_parallel_size": tp,
             "pipeline_model_parallel_size": pp,
             "context_parallel_size": cp,
+            "virtual_pipeline_model_parallel_size": None,
+            "pipeline_model_parallel_layout": None,
         },
         "dynamic_batching": {
             "enabled": pp == 1,  # Only enable for single pipeline parallel stage
