@@ -23,25 +23,25 @@ single `.pt` file. The final step is the actual distillation training loop.
                         │  Offline projection-matrix preparation       │
                         │                                              │
                         │  ┌────────────────────────────────────┐      │
-  (student, teacher)    │  │ 2. minimal_projection_via_         │      │
+  (student, teacher)    │  │ 1. minimal_projection_via_         │      │
   tokenizers       ────▶│  │    multitoken.py                   │      │
                         │  │    — multi-token mappings          │      │
                         │  └─────────────────┬──────────────────┘      │
                         │                    │                         │
                         │  ┌─────────────────▼──────────────────┐      │
-                        │  │ 3. (optional) reapply_exact_map.py │      │
+                        │  │ 2. (optional) reapply_exact_map.py │      │
                         │  │    — pin exact 1-to-1 matches      │      │
                         │  └─────────────────┬──────────────────┘      │
                         │                    │                         │
                         │  ┌─────────────────▼──────────────────┐      │
-                        │  │ 4. sort_and_cut_projection_matrix  │      │
+                        │  │ 3. sort_and_cut_projection_matrix  │      │
                         │  │    .py — trim to runtime top_k     │      │
                         │  └─────────────────┬──────────────────┘      │
                         └────────────────────│─────────────────────────┘
                                              │
                                              ▼  projection_matrix.pt
                         ┌──────────────────────────────────────────────┐
-                        │  5. examples/                                │
+                        │  4. examples/                                │
                         │     run_xtoken_off_policy_distillation.py    │
                         │     — student forward + teacher forward      │
                         │       (via CUDA-IPC), x-token KD loss        │
@@ -54,12 +54,12 @@ the teacher's vocab space (or vice versa, depending on the loss mode).
 
 ### Which prep steps are essential?
 
-Of the three prep steps, **Step 2 (multi-token mappings)** and
-**Step 4 (sort and trim)** are required — Step 2 builds the cross-vocab
-mapping itself, and Step 4 produces the runtime-format `.pt` the training
-loss expects. **Step 3 (reapply exact map) is optional** and pins exact
-1-to-1 token mappings on top of Step 2, but we found the best results
-on this branch by running **Steps 2 → 3 → 4**.
+Of the three prep steps, **Step 1 (multi-token mappings)** and
+**Step 3 (sort and trim)** are required — Step 1 builds the cross-vocab
+mapping itself, and Step 3 produces the runtime-format `.pt` the training
+loss expects. **Step 2 (reapply exact map) is optional** and pins exact
+1-to-1 token mappings on top of Step 1, but we found the best results
+on this branch by running **Steps 1 → 2 → 3**.
 
 ## Quickstart — single command
 
@@ -76,8 +76,8 @@ the prep steps with auto-derived intermediate paths:
 The wrapper writes the final matrix to
 `cross_tokenizer_data/projection_matrix_<student>_<teacher>_top<N>.pt`
 (override with `--final-output`). Pass `--skip-exact-map` to skip the
-optional Step 3, or `--no-{scale-trick,reverse-pass,special-token-mapping}`
-to tweak Step 2 defaults. Run `./tools/x_token/build_projection_matrix.sh
+optional Step 2, or `--no-{scale-trick,reverse-pass,special-token-mapping}`
+to tweak Step 1 defaults. Run `./tools/x_token/build_projection_matrix.sh
 --help` for the full flag list.
 
 The per-step recipes below are for advanced customization (non-default
@@ -86,15 +86,14 @@ weight thresholds, hand-picked intermediate filenames, etc.).
 ## Backend and scope
 
 - **DTensor V2 only.** Set `policy.dtensor_cfg.enabled=true` and
-  `policy.dtensor_cfg._v2=true`. The Megatron path is intentionally stubbed
-  with `NotImplementedError`.
+  `policy.dtensor_cfg._v2=true`. The Megatron policy worker is not wired
+  for cross-tokenizer distillation.
 - **Teacher logits travel via CUDA IPC**, so student and teacher policies must
   be colocated on the same node. No remote-Ray transport for x-token logits.
-- **No sequence packing or dynamic batching for the teacher forward** in v0.
 - The corpus must be served via the `arrow_text` dataset (no chat template,
   loss on every token — see `examples/configs/xtoken_off_policy_distillation.yaml`).
 
-## Step 2 — Build multi-token mappings
+## Step 1 — Build multi-token mappings
 
 Many student tokens (e.g., `"12"`) tokenize into multiple teacher tokens
 (e.g., `"1"`, `"2"`). `minimal_projection_via_multitoken.py` walks the
@@ -119,13 +118,13 @@ the matrix is built — useful for spot-checking that special tokens, numerals,
 and punctuation map to sensible teacher tokens.
 
 When `--enable-scale-trick` is set, the script records `enable_scale_trick=True`
-in the saved `.pt` so Step 4 can auto-enable `--preserve_last`.
+in the saved `.pt` so Step 3 can auto-enable `--preserve_last`.
 
-## Step 3 (optional) — Reapply exact-token map
+## Step 2 (optional) — Reapply exact-token map
 
 Some token pairs are *literally identical* (e.g., common punctuation, single
 ASCII characters). `reapply_exact_map.py` pins those to 1-to-1 mappings with
-weight 1.0, overwriting whatever Step 2 produced for them.
+weight 1.0, overwriting whatever Step 1 produced for them.
 
 ```bash
 uv run python -m tools.x_token.reapply_exact_map \
@@ -136,7 +135,7 @@ uv run python -m tools.x_token.reapply_exact_map \
 
 Output is written next to the input as `<basename>_exact_map_remapped.pt`.
 
-## Step 4 — Sort and trim to runtime `top_k`
+## Step 3 — Sort and trim to runtime `top_k`
 
 The training loss only needs a small `top_k` per row (typical: 4–8). This
 step sorts each row by weight and trims to the chosen runtime cap.
@@ -150,10 +149,10 @@ uv run python -m tools.x_token.sort_and_cut_projection_matrix \
 
 `--preserve_last` is `argparse.BooleanOptionalAction` with default `None`. When
 unspecified, the script reads `enable_scale_trick` from the input matrix's
-metadata (set in Step 2) and auto-enables preservation of the last column
+metadata (set in Step 1) and auto-enables preservation of the last column
 slot. Pass `--preserve_last` or `--no-preserve_last` to override.
 
-## Step 5 — Launch x-token distillation
+## Step 4 — Launch x-token distillation
 
 The training entrypoint is `examples/run_xtoken_off_policy_distillation.py` with the
 exemplar config at `examples/configs/xtoken_off_policy_distillation.yaml`. The exemplar
@@ -180,25 +179,15 @@ makes the config reusable across (student, teacher) pairs.
 | `gold_loss` | `xtoken_loss` | Behavior |
 |---|---|---|
 | `false` | (inert) | **P-KL** — full-vocab teacher logits via CUDA IPC; the loss derives a microbatch-global top-k inside, projects the student into teacher vocab via the projection matrix, and chunk-averages KL on the top-k subset. CE term is added. |
-| `true` | `false` | **Gold loss** (PT-faithful) — split the vocab into an *exact-token-mapped* common set (KL) and an *uncommon* tail (sorted L1). |
+| `true` | `false` | **Gold loss** — split the vocab into an *exact-token-mapped* common set (KL) and an *uncommon* tail (sorted L1). |
 | `true` | `true`  | **Gold + x-token loss** — same as gold, but relax the exact-map threshold to `>= 0.6` and allow multi-token projections to count as exact maps via a collision-replacement rule. |
 
 Other relevant fields:
 
 - `loss_fn.temperature` — softmax temperature applied symmetrically to student and teacher logits before KL.
 - `loss_fn.vocab_topk` — microbatch-global top-k size for the P-KL path (inert when `gold_loss=true`).
-- `loss_fn.uncommon_topk` — cap on the L1 uncommon-tail sort in the gold path (defaults to PT's hardcoded 8192).
+- `loss_fn.uncommon_topk` — cap on the L1 uncommon-tail sort in the gold path (defaults to 8192).
 - `loss_fn.reverse_kl` — compute `KL(student || teacher)` instead of `KL(teacher || student)`.
-
-## Other (student, teacher) pairs
-
-The same pipeline works for any HuggingFace tokenizer pair. Two worked
-examples — Llama → Gemma and Llama → Phi — only differ in the
-`--student-model` / `--teacher-model` arguments to Step 2.
-
-For Phi-3 / Phi-4 family teachers, also export
-`NRL_TRUST_REMOTE_CODE=false` and `NRL_SKIP_PHI_ROPE_FIX=1` in the
-training environment so the in-tree HuggingFace implementation is used.
 
 ## Where files live
 
@@ -214,4 +203,3 @@ training environment so the in-tree HuggingFace implementation is used.
 - Config exemplar: [`examples/configs/xtoken_off_policy_distillation.yaml`](../../examples/configs/xtoken_off_policy_distillation.yaml)
 - Loss implementation: `nemo_rl/algorithms/loss/loss_functions.py::CrossTokenizerDistillationLossFn`
 - Token alignment: `nemo_rl/algorithms/x_token/token_aligner.py::TokenAligner`
-- Same-tokenizer distillation: [Quantization-Aware RL](quantization-aware-rl.md) (the QA-Distillation workflow uses the same training entrypoint with a same-tokenizer teacher).
