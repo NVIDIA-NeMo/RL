@@ -229,18 +229,32 @@ def register_train_partition(
 
 
 def simple_backend_dp_config() -> dict[str, Any]:
-    """Load the test SimpleStorage ``DataPlaneConfig`` from YAML.
+    """Load the SimpleStorage ``DataPlaneConfig`` from the test reference YAML.
 
-    Mirrors the production load path (``master_config.data_plane`` via
-    OmegaConf) — keeps test config in YAML alongside production configs
-    rather than duplicating a hardcoded dict in Python.
+    Reuses the ``data_plane:`` section of
+    ``tests/unit/reference_configs/grpo_math_1B.yaml`` (canonical test
+    config, mirrored from ``examples/configs/grpo_math_1B.yaml``) so test
+    config flows through the same OmegaConf path production uses.
+
+    Overrides applied for the unit-test scenario:
+    - ``enabled: true`` (production default is False; tests need the
+      ``build_data_plane_client`` factory to actually build a client).
+    - ``storage_capacity: 1024`` / ``num_storage_units: 1`` — trimmed
+      from production's 1_000_000 / 2 for fast in-process setup.
     """
     from pathlib import Path
 
     from omegaconf import OmegaConf
 
-    cfg_path = Path(__file__).with_name("_simple_backend_dp.yaml")
-    return OmegaConf.to_container(OmegaConf.load(cfg_path), resolve=True)  # type: ignore[return-value]
+    cfg_path = (
+        Path(__file__).resolve().parents[1] / "reference_configs" / "grpo_math_1B.yaml"
+    )
+    full_cfg = OmegaConf.load(cfg_path)
+    dp_cfg = OmegaConf.to_container(full_cfg.data_plane, resolve=True)
+    dp_cfg["enabled"] = True
+    dp_cfg["storage_capacity"] = 1024
+    dp_cfg["num_storage_units"] = 1
+    return dp_cfg  # type: ignore[return-value]
 
 
 def mooncake_available() -> bool:
