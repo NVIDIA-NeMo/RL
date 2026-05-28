@@ -504,36 +504,6 @@ def _format_tensor_for_weight_load_debug(tensor) -> str:
     return f"shape={tuple(tensor.shape)} dtype={tensor.dtype} device={tensor.device}"
 
 
-def _vllm_param_names_for_refit(model: torch.nn.Module) -> set[str]:
-    param_names = set()
-    for name, _ in model.named_parameters():
-        param_names.add(name)
-        if name.startswith("model."):
-            param_names.add(name[len("model.") :])
-    return param_names
-
-
-def _map_vllm_weight_name_for_refit(model: torch.nn.Module, name: str) -> str | None:
-    hf_to_vllm_mapper = getattr(model, "hf_to_vllm_mapper", None)
-    map_name = getattr(hf_to_vllm_mapper, "_map_name", None)
-    if map_name is None:
-        return name
-    return map_name(name)
-
-
-def _should_skip_missing_deepseek_v4_gate_bias(
-    name: str,
-    model: torch.nn.Module,
-    vllm_param_names: set[str],
-) -> bool:
-    mapped_name = _map_vllm_weight_name_for_refit(model, name)
-    if mapped_name is None:
-        return True
-    if not mapped_name.endswith(".ffn.gate.e_score_correction_bias"):
-        return False
-    return mapped_name not in vllm_param_names
-
-
 def _get_param_module_name(param_name: str) -> str | None:
     for suffix in (".weight_scale_inv", ".weight_scale", ".weight"):
         if param_name.endswith(suffix):
@@ -791,11 +761,8 @@ def load_weights(weights, model_runner):
     weights_quantized = []
     model = model_runner.model
     fp8_config = _resolve_fp8_config(model_runner)
-    vllm_param_names = _vllm_param_names_for_refit(model)
 
     for k, v in weights:
-        if _should_skip_missing_deepseek_v4_gate_bias(k, model, vllm_param_names):
-            continue
         if not _is_fp8_weight(k, model):
             weights_quantized.append((k, v))
             continue

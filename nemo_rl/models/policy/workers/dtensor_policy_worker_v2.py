@@ -75,6 +75,17 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
 
+def _resolve_refit_transfer_dtype(
+    src_dtype: torch.dtype, base_dtype: torch.dtype
+) -> torch.dtype:
+    """Pick the dtype used to transfer a tensor during refit."""
+    if not src_dtype.is_floating_point:
+        return src_dtype
+    if src_dtype == torch.float32:
+        return torch.float32
+    return base_dtype
+
+
 def dtensor_params_generator(
     model: nn.Module, target_dtype: torch.dtype
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
@@ -97,10 +108,12 @@ def dtensor_params_generator(
 
         adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(model, name, merged_tensor)
         for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
-            # Convert to target dtype
+            transfer_dtype = _resolve_refit_transfer_dtype(
+                adapted_tensor.dtype, target_dtype
+            )
             yield (
                 adapted_fqn,
-                adapted_tensor.to(target_dtype, non_blocking=True).contiguous(),
+                adapted_tensor.to(transfer_dtype, non_blocking=True).contiguous(),
             )
             del adapted_tensor
         del adapted_fqn_tensors
@@ -860,7 +873,10 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 self.model, name, full_tensor
             )
             for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
-                state_dict_info[adapted_fqn] = (adapted_tensor.shape, self.dtype)
+                transfer_dtype = _resolve_refit_transfer_dtype(
+                    adapted_tensor.dtype, self.dtype
+                )
+                state_dict_info[adapted_fqn] = (adapted_tensor.shape, transfer_dtype)
 
         return state_dict_info
 
@@ -933,17 +949,16 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 self.model.state_dict().items(), key=lambda x: x[0]
             )
             for name, tensor in state_dict_items:
-                if isinstance(tensor, DTensor):
-                    # Convert DTensor to full tensor for streaming
-                    full_tensor = tensor.full_tensor()
-                    # Convert to target dtype
-                    yield (
-                        name,
-                        full_tensor.to(self.dtype, non_blocking=True).contiguous(),
-                    )
-                else:
-                    # Convert to target dtype
-                    yield name, tensor.to(self.dtype, non_blocking=True).contiguous()
+                full_tensor = (
+                    tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
+                )
+                transfer_dtype = _resolve_refit_transfer_dtype(
+                    full_tensor.dtype, self.dtype
+                )
+                yield (
+                    name,
+                    full_tensor.to(transfer_dtype, non_blocking=True).contiguous(),
+                )
 
         # Use the HTTP implementation
         stream_weights_via_http_impl(
