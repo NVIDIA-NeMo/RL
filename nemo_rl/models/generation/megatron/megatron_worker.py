@@ -106,7 +106,7 @@ class MegatronGenerationMixin:
 
         # The value may be overwritten by `recompute_kv_cache_after_weight_updates`.
         kv_cache_management_mode = mcore_generation_config["kv_cache_management_mode"]
-        persist_cuda_graphs = kv_cache_management_mode != "persist"
+        needs_static_kv_pointers = kv_cache_management_mode != "persist"
 
         materialize_only_last_token_logits = mcore_generation_config[
             "materialize_only_last_token_logits"
@@ -137,7 +137,7 @@ class MegatronGenerationMixin:
             max_tokens=max_tokens,
             max_sequence_length=self.cfg["max_total_sequence_length"],
             kv_cache_management_mode=KVCacheManagementMode(kv_cache_management_mode),
-            static_kv_memory_pointers=persist_cuda_graphs,
+            static_kv_memory_pointers=needs_static_kv_pointers,
             use_cuda_graphs_for_non_decode_steps=use_cuda_graphs_for_non_decode_steps,
             use_flashinfer_fused_rope=True,
             sampling_backend="flashinfer",
@@ -348,11 +348,12 @@ class MegatronGenerationMixin:
 
         log_gpu_memory("finish_generation END")
 
-    def prepare_for_generation(self, tags=None, **kwargs) -> Optional[str]:
+    def prepare_for_generation(self, tags=None, **kwargs) -> None:
         """Enter inference mode and start (or wake) the inference engine.
 
-        Returns:
-            The OpenAI server base URL for this worker (or `None` if this worker is not the leader).
+        Called in both colocated and non-colocated setups.
+        Even in non-colocated mode, Megatron's engine has to be intentionally paused before a refit
+        (and its weights are not detachable), so we have to switch modes around every refit.
         """
         log_gpu_memory("prepare_for_generation START")
         mcore_generation_config = self.cfg["generation"]["mcore_generation_config"]
@@ -390,6 +391,9 @@ class MegatronGenerationMixin:
                 self._wake()
 
         log_gpu_memory("prepare_for_generation END")
+
+    def report_dp_openai_server_base_url(self) -> Optional[str]:
+        """Return this worker's OpenAI server base URL (None if not the leader)."""
         return self.base_url
 
     def _prepare_data_for_generation(

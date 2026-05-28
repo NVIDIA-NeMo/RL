@@ -54,7 +54,7 @@ class MegatronGeneration(GenerationInterface):
         from nemo_rl.models.policy.lm_policy import Policy
 
         self.cfg = config
-        # Populated from worker return values during prepare_for_generation.
+        # Populated after the first prepare_for_generation (which starts the HTTP server).
         self.dp_openai_server_base_urls: list[Optional[str]] = []
 
         # Need to update the megatron_cfg with the mcore_generation_config parameters.
@@ -76,6 +76,13 @@ class MegatronGeneration(GenerationInterface):
 
         # Start the inference engine + HTTP server during construction.
         self.prepare_for_generation()
+
+        url_futures = self._policy.worker_group.run_all_workers_single_data(
+            "report_dp_openai_server_base_url"
+        )
+        self.dp_openai_server_base_urls = [
+            url for url in ray.get(url_futures) if url is not None
+        ]
 
     def init_collective(
         self,
@@ -156,8 +163,7 @@ class MegatronGeneration(GenerationInterface):
         futures = self._policy.worker_group.run_all_workers_single_data(
             "prepare_for_generation", **kwargs
         )
-        results = ray.get(futures)
-        self.dp_openai_server_base_urls = [url for url in results if url is not None]
+        ray.get(futures)
         return True
 
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:

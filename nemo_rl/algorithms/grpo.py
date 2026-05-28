@@ -830,9 +830,7 @@ def setup(
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
 
     # prepare refit info (not needed for non-colocated megatron, which uses swap_model_weights)
-    if not colocated_inference and backend == "megatron":
-        pass
-    else:
+    if colocated_inference or backend != "megatron":
         state_dict_info = policy.prepare_refit_info()
         if policy_generation is not None:
             policy_generation.prepare_refit_info(state_dict_info)
