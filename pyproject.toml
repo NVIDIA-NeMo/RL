@@ -187,10 +187,7 @@ flashinfer-jit-cache = [
   "flashinfer-cubin==0.6.8.post1",
   "flashinfer-jit-cache==0.6.8.post1",
 ]
-nvshmem-cu13 = [
-  "nvshmem4py-cu13>=0.2.1",
-  "cupy-cuda13x",
-]
+nvshmem-cu13 = ["nvshmem4py-cu13>=0.2.1", "cupy-cuda13x"]
 
 [dependency-groups]
 
@@ -350,8 +347,8 @@ override-dependencies = [
   "outlines>=0.2.0",
   # Upgrade pytest to 9.0.3
   "pytest>=9.0.3",
-  "langchain>=0.3.28",        # Address CVE-2025-65106
-  "langchain-core>=0.3.80",   # Address CVE-2025-65106
+  "langchain>=0.3.28",      # Address CVE-2025-65106
+  "langchain-core>=0.3.80", # Address CVE-2025-65106
   # TransferQueue (data-plane extra) pins numpy<2.0.0; megatron-core needs
   # numpy>=2.1.0 via onnx → ml-dtypes. Override globally so the data-plane
   # extra composes with mcore/automodel without version-mirroring TQ's
