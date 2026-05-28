@@ -141,6 +141,16 @@ def normalize_routed_experts_for_generation_output(
             "generation backend did not return routed experts for every "
             "non-final token in the prompt+response sequence."
         )
+    max_allowed_rows = expected_rows + 1
+    if require_complete_routed_experts and routed.shape[0] > max_allowed_rows:
+        num_cached_tokens = getattr(request_output, "num_cached_tokens", None)
+        raise ValueError(
+            "vLLM returned too many routed_experts rows for router replay: "
+            f"rows={routed.shape[0]}, expected={expected_rows}, "
+            f"max_allowed={max_allowed_rows}, valid_length={valid_length}, "
+            f"padded_length={padded_length}, num_cached_tokens={num_cached_tokens}. "
+            "Router replay allows at most one surplus final-token route row."
+        )
 
     default_route = torch.arange(
         routed.shape[2],

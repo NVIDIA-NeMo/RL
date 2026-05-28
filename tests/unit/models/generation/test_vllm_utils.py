@@ -242,6 +242,26 @@ def test_normalize_routed_experts_strict_mode_rejects_missing_rows():
         )
 
 
+def test_normalize_routed_experts_strict_mode_rejects_surplus_rows():
+    class Output:
+        pass
+
+    request_output = Output()
+    request_output.num_cached_tokens = 0
+    completion_output = Output()
+    completion_output.routed_experts = torch.ones(4, 1, 2, dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="too many routed_experts rows"):
+        normalize_routed_experts_for_generation_output(
+            request_output,
+            completion_output,
+            valid_length=3,
+            padded_length=3,
+            device=torch.device("cpu"),
+            require_complete_routed_experts=True,
+        )
+
+
 @pytest.mark.vllm
 def test_vllm_speculative_decoding_patch_removed():
     # The speculative decoding patch was fixed upstream in vLLM >= 0.14.0:
