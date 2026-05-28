@@ -456,6 +456,48 @@ def sft_train(
                         roles_to_train_on=["assistant"],
                     )
 
+                    # [NOUSNET DEBUG] dump first batch's message_log structure once
+                    # so we can see WHY token_mask comes out all zeros on Super-120B.
+                    if current_step == 0:
+                        print("\n=== [NOUSNET DEBUG] batch['message_log'] shapes ===")
+                        ml = batch["message_log"]
+                        print(f"  batch size: {len(ml)}")
+                        # Tokenizer state diag
+                        print(f"  tokenizer.chat_template len: "
+                              f"{len(tokenizer.chat_template) if tokenizer.chat_template else 0}")
+                        print(f"  tokenizer.bos_token: {tokenizer.bos_token!r}")
+                        print(f"  tokenizer.eos_token: {tokenizer.eos_token!r}")
+                        print(f"  tokenizer.pad_token_id: {tokenizer.pad_token_id}")
+                        # Try rendering a fresh sample directly to compare
+                        test_msgs = [
+                            {"role": "user", "content": "What is 1 + 2?"},
+                            {"role": "assistant", "content": "The answer is 3."},
+                        ]
+                        try:
+                            r = tokenizer.apply_chat_template(
+                                test_msgs, tokenize=False, add_generation_prompt=False
+                            )
+                            print(f"  [direct render test] 2-msg result: {len(r)} chars")
+                            print(f"  [direct render test] text: {r!r}")
+                        except Exception as e:
+                            print(f"  [direct render test] FAILED: {type(e).__name__}: {e}")
+                        # Per-sample dump
+                        for s_idx, sample in enumerate(ml[:3]):
+                            print(f"  sample[{s_idx}]: {len(sample)} messages")
+                            for m_idx, msg in enumerate(sample):
+                                role = msg.get("role", "<MISSING>")
+                                content = msg.get("content", "<MISSING>")
+                                tok_ids = msg.get("token_ids")
+                                tlm = msg.get("token_loss_mask")
+                                print(
+                                    f"    msg[{m_idx}] role={role!r} "
+                                    f"token_ids.shape={tuple(tok_ids.shape) if tok_ids is not None else None} "
+                                    f"loss_mask.sum={tlm.sum().item() if tlm is not None else None} "
+                                    f"content.snippet={(content[:80] if isinstance(content, str) else type(content).__name__)!r}"
+                                )
+                        print(f"  batch['loss_multiplier']={batch['loss_multiplier'].tolist()}")
+                        print("=== [END NOUSNET DEBUG] ===\n")
+
                     cat_and_padded, input_lengths = batched_message_log_to_flat_message(
                         batch["message_log"],
                         pad_value_dict={"token_ids": tokenizer.pad_token_id},
@@ -472,6 +514,16 @@ def sft_train(
                             "sample_mask": batch["loss_multiplier"],
                         }
                     )
+                    # [NOUSNET DEBUG] dump train_data masks on step 0
+                    if current_step == 0:
+                        tm = train_data["token_mask"]
+                        sm = train_data["sample_mask"]
+                        print(f"\n=== [NOUSNET DEBUG] train_data masks ===")
+                        print(f"  input_ids.shape={tuple(train_data['input_ids'].shape)}")
+                        print(f"  token_mask.shape={tuple(tm.shape)} sum={tm.sum().item()} "
+                              f"per_row_sums={tm.sum(dim=-1).tolist()[:8]}")
+                        print(f"  sample_mask={sm.tolist()}")
+                        print(f"=== [END NOUSNET DEBUG] ===\n")
                     train_data.update(
                         cat_and_padded.get_multimodal_dict(as_tensors=False)
                     )
