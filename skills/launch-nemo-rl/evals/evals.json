@@ -1,47 +1,35 @@
 [
   {
     "id": "launch-nemo-rl-positive-001",
-    "question": "Run the Qwen 3 30B math recipe on the Kubernetes cluster as a one-shot RayJob.",
+    "question": "What is the difference between ephemeral and long-lived mode in nrl-k8s? When should I use each?",
     "expected_skill": "launch-nemo-rl",
-    "ground_truth": "The agent loads the launch-nemo-rl skill, identifies the recipe and infra files, validates with nrl-k8s check, and launches with nrl-k8s run --rayjob.",
+    "ground_truth": "The agent loads the launch-nemo-rl skill and explains ephemeral mode (default, one-shot RayJob, auto-teardown) vs long-lived mode (--raycluster, reuses cluster, good for iteration).",
     "expected_behavior": [
       "The agent read launch-nemo-rl/SKILL.md before acting",
-      "The agent identified the recipe and matching infra YAML files",
-      "The agent ran nrl-k8s check to validate before launching",
-      "The agent used nrl-k8s run with --rayjob for ephemeral mode"
+      "The agent explained both ephemeral and long-lived modes",
+      "The agent described when to use each mode"
     ]
   },
   {
     "id": "launch-nemo-rl-positive-002",
-    "question": "The training job seems stuck. How do I get the logs for the running job?",
+    "question": "How do I get the driver logs for a training job that already finished on the cluster?",
     "expected_skill": "launch-nemo-rl",
-    "ground_truth": "The agent loads the launch-nemo-rl skill and guides the user through checking status with nrl-k8s status and fetching logs with nrl-k8s job logs.",
+    "ground_truth": "The agent loads the launch-nemo-rl skill and explains using kubectl port-forward to the head service and curling the Ray dashboard API at /api/jobs/<submission_id>/logs.",
     "expected_behavior": [
       "The agent read launch-nemo-rl/SKILL.md before acting",
-      "The agent used nrl-k8s status to check the cluster state",
-      "The agent used nrl-k8s job list and nrl-k8s job logs to fetch driver logs"
+      "The agent described using kubectl port-forward and the Ray dashboard API",
+      "The agent mentioned the difference between DRIVER and SUBMISSION job types"
     ]
   },
   {
     "id": "launch-nemo-rl-positive-003",
-    "question": "Tear down the training cluster after the run is done.",
+    "question": "What Kubernetes prerequisites do I need to verify before applying an infra YAML with nrl-k8s?",
     "expected_skill": "launch-nemo-rl",
-    "ground_truth": "The agent loads the launch-nemo-rl skill and uses nrl-k8s cluster down to tear down the RayCluster.",
+    "ground_truth": "The agent loads the launch-nemo-rl skill and lists checking the PVC, secrets (wandb, image pull), and service account exist in the target namespace.",
     "expected_behavior": [
       "The agent read launch-nemo-rl/SKILL.md before acting",
-      "The agent confirmed the run was complete before tearing down",
-      "The agent used nrl-k8s cluster down with the appropriate target"
-    ]
-  },
-  {
-    "id": "launch-nemo-rl-positive-004",
-    "question": "I want to iterate on this recipe quickly. Launch it in long-lived mode so I can resubmit without recreating the cluster.",
-    "expected_skill": "launch-nemo-rl",
-    "ground_truth": "The agent loads the launch-nemo-rl skill and uses nrl-k8s run with --raycluster for long-lived mode.",
-    "expected_behavior": [
-      "The agent read launch-nemo-rl/SKILL.md before acting",
-      "The agent used --raycluster flag for long-lived mode",
-      "The agent explained that re-running reuses the existing cluster"
+      "The agent mentioned checking PVC, secrets, and service account",
+      "The agent provided kubectl commands to verify prerequisites"
     ]
   },
   {
