@@ -65,9 +65,16 @@ class PY_EXECUTABLES:
     SGLANG = f"uv run --locked --extra sglang --directory {git_root}"
 
 
+DEFAULT_PORT_RANGE_LOW = 10001
+DEFAULT_PORT_RANGE_HIGH = 20000
+
+
 @ray.remote  # pragma: no cover
-def _get_node_ip_and_free_port() -> tuple[str, int]:
-    return _get_node_ip_local(), _get_free_port_local()
+def _get_node_ip_and_free_port(
+    port_range_low: int = DEFAULT_PORT_RANGE_LOW,
+    port_range_high: int = DEFAULT_PORT_RANGE_HIGH,
+) -> tuple[str, int]:
+    return _get_node_ip_local(), _get_free_port_local(port_range_low, port_range_high)
 
 
 def _get_node_ip_local() -> str:
@@ -77,15 +84,44 @@ def _get_node_ip_local() -> str:
     return node_ip
 
 
-def _get_free_port_local() -> int:
+def _get_free_port_local(
+    port_range_low: int = DEFAULT_PORT_RANGE_LOW,
+    port_range_high: int = DEFAULT_PORT_RANGE_HIGH,
+    max_retries: int = 50,
+) -> int:
+    """Find a free port within the specified range.
+
+    Uses a random probe-and-bind approach within [port_range_low, port_range_high]
+    to avoid collisions with Ray's worker port range and the OS ephemeral range.
+
+    Args:
+        port_range_low: Lower bound of the port range (inclusive). Default: 10001.
+        port_range_high: Upper bound of the port range (inclusive). Default: 20000.
+        max_retries: Maximum number of attempts to find a free port.
+
+    Returns:
+        A free port number within the specified range.
+
+    Raises:
+        RuntimeError: If no free port is found after max_retries attempts.
+    """
     import socket
+    from random import randint
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))  # Bind to port 0 to get a random free port
-        s.listen(1)
-        port = s.getsockname()[1]
+        for _ in range(max_retries):
+            port = randint(port_range_low, port_range_high)
+            try:
+                s.bind(("", port))
+                return port
+            except OSError:
+                pass
 
-    return port
+    raise RuntimeError(
+        f"Unable to find an open port in range {port_range_low}-{port_range_high} "
+        f"after {max_retries} attempts. Consider widening the range via "
+        f"cluster.port_range_low / cluster.port_range_high."
+    )
 
 
 def init_ray(log_dir: Optional[str] = None) -> None:
