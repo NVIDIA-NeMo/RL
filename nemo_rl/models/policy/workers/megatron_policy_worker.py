@@ -1236,7 +1236,7 @@ class MegatronPolicyWorkerImpl(
 
     @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
     def offload_before_refit(self):
-        """Ensure model params are on CUDA and offload grad buffers and optimizer to the CPU."""
+        """Offload the optimizer and buffers to the CPU."""
         no_grad = torch.no_grad()
         no_grad.__enter__()
         # Ensure model params are on CUDA for weight streaming. With colocated inference and

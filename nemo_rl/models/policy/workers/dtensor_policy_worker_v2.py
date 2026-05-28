@@ -1043,12 +1043,7 @@ class DTensorPolicyWorkerV2Impl(
     @torch.no_grad()
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/offload_before_refit")
     def offload_before_refit(self) -> None:
-        """Ensure model is on CUDA and offload the optimizer to the CPU.
-
-        The model must be on CUDA for weight streaming. With colocated inference and
-        dynamic sampling, offload_after_refit() may have placed it on CPU between
-        consecutive refit calls (when no training step ran in between).
-        """
+        """Ensure model is on CUDA and offload the optimizer to the CPU."""
         # Ensure model is on CUDA for weight streaming. With colocated inference and
         # dynamic sampling, offload_after_refit() may have placed it on CPU between
         # consecutive refit calls when no training step ran in between. model.to("cuda")
