@@ -52,21 +52,8 @@ from ._rollout_shapes import (  # noqa: E402
     make_realistic_tags,
     make_rollout_batch,
     register_train_partition,
+    simple_backend_dp_config,
 )
-
-# Shared TQ client config — driver fixture builds it; actor uses the same
-# values so build_data_plane_client inside the Ray worker attaches to the
-# existing controller (no new bootstrap).
-_TQ_CLIENT_CONFIG = {
-    "enabled": True,
-    "impl": "transfer_queue",
-    "backend": "simple",
-    "storage_capacity": 1024,
-    "num_storage_units": 1,
-    "claim_meta_poll_interval_s": 0.5,
-    "global_segment_size": 8589934592,
-    "local_buffer_size": 1073741824,
-}
 
 
 # ── producer actor ────────────────────────────────────────────────────────────
@@ -104,7 +91,7 @@ class _TQBackedAsyncCollector:
     def __init__(self) -> None:
         # Attach to the existing TQ controller (driver bootstrapped it).
         # Same dp_client surface SyncRolloutActor's workers hold.
-        self._dp_client = build_data_plane_client(_TQ_CLIENT_CONFIG)
+        self._dp_client = build_data_plane_client(simple_backend_dp_config())
         self.current_weight_version: int = 0
 
     def set_weight_version(self, version: int) -> None:
@@ -156,7 +143,7 @@ def dp_client():
     if not ray.is_initialized():
         ray.init(local_mode=False, include_dashboard=False)
 
-    client = build_data_plane_client(_TQ_CLIENT_CONFIG)
+    client = build_data_plane_client(simple_backend_dp_config())
     yield client
     client.close()
 

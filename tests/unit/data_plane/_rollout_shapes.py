@@ -228,6 +228,21 @@ def register_train_partition(
     )
 
 
+def simple_backend_dp_config() -> dict[str, Any]:
+    """Load the test SimpleStorage ``DataPlaneConfig`` from YAML.
+
+    Mirrors the production load path (``master_config.data_plane`` via
+    OmegaConf) — keeps test config in YAML alongside production configs
+    rather than duplicating a hardcoded dict in Python.
+    """
+    from pathlib import Path
+
+    from omegaconf import OmegaConf
+
+    cfg_path = Path(__file__).with_name("_simple_backend_dp.yaml")
+    return OmegaConf.to_container(OmegaConf.load(cfg_path), resolve=True)  # type: ignore[return-value]
+
+
 def mooncake_available() -> bool:
     """Return True if the ``mooncake`` wheel is importable.
 
