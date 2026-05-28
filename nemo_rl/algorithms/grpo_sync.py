@@ -769,17 +769,18 @@ def grpo_train_sync(
                         }
                     )
 
-                    (
-                        max_seq_mult_prob_error,
-                        num_masked_seqs,
-                        masked_correct_pct,
-                    ) = compute_and_apply_seq_logprob_error_masking(
+                    seq_error_result = compute_and_apply_seq_logprob_error_masking(
                         train_data=masking_data,
                         rewards=rewards,
                         seq_logprob_error_threshold=master_config.grpo[
                             "seq_logprob_error_threshold"
                         ],
                     )
+                    max_seq_mult_prob_error = seq_error_result[
+                        "max_seq_mult_prob_error"
+                    ]
+                    num_masked_seqs = seq_error_result["num_masked_seqs"]
+                    masked_correct_pct = seq_error_result["masked_correct_pct"]
                     # masking may have mutated sample_mask in place —
                     # capture the post-masking value for delta-write.
                     sample_mask = masking_data["sample_mask"]
