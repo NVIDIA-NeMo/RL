@@ -37,10 +37,9 @@
     "question": "Fix a bug in the GRPO loss calculation where the KL penalty is applied incorrectly.",
     "expected_skill": null,
     "should_trigger": false,
-    "ground_truth": "The agent should not activate the auto-research skill for a bug fix task.",
+    "ground_truth": "The agent should not activate the auto-research skill for a bug fix task. It should investigate the bug directly without starting a research campaign.",
     "expected_behavior": [
-      "The agent did not read or activate auto-research/SKILL.md",
-      "The agent investigated the bug in the GRPO code directly"
+      "The agent did not activate the auto-research skill"
     ]
   },
   {
@@ -48,9 +47,9 @@
     "question": "Add a docstring to the GRPOAlgorithm class.",
     "expected_skill": null,
     "should_trigger": false,
-    "ground_truth": "The agent should not activate the auto-research skill for a documentation task.",
+    "ground_truth": "The agent should not activate the auto-research skill for a documentation task. It should find the class and add the docstring directly.",
     "expected_behavior": [
-      "The agent did not read or activate auto-research/SKILL.md"
+      "The agent did not activate the auto-research skill"
     ]
   }
 ]
