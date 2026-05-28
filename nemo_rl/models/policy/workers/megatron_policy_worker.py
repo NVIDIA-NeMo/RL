@@ -1236,9 +1236,15 @@ class MegatronPolicyWorkerImpl(
 
     @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
     def offload_before_refit(self):
-        """Offload the optimizer and buffers to the CPU."""
+        """Ensure model params are on CUDA and offload grad buffers and optimizer to the CPU."""
         no_grad = torch.no_grad()
         no_grad.__enter__()
+        # Ensure model params are on CUDA for weight streaming. With colocated inference and
+        # dynamic sampling, offload_after_refit() may have placed them on CPU between
+        # consecutive refit calls when no training step ran in between.
+        # reload_from_cpu checks param_data.storage().size() == 0, so this is a no-op
+        # when the model is already on CUDA.
+        self.model = self.move_model(self.model, "cuda", move_params=True, move_grads=False)
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
         reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
         print(
