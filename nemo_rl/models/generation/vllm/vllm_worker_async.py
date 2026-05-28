@@ -378,9 +378,13 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 self, request, request_max_tokens: int, prompt_token_ids: list[int]
             ) -> None:
                 """Clamp the request's max output tokens so that input + output <= max_model_len."""
-                remaining = max(
-                    0, self.model_config.max_model_len - len(prompt_token_ids)
-                )
+                remaining = self.model_config.max_model_len - len(prompt_token_ids)
+                if remaining <= 0:
+                    raise ValueError(
+                        f"Prompt length ({len(prompt_token_ids)}) fills or exceeds "
+                        f"max_model_len ({self.model_config.max_model_len}). "
+                        f"No room for output tokens."
+                    )
                 max_tokens = min(request_max_tokens, remaining)
                 self._set_max_tokens(request, max_tokens)
 
@@ -411,7 +415,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 actual_request_max_tokens = None
                 if isinstance(request, NeMoRLChatCompletionRequest):
                     actual_request_max_tokens = (
-                        request.max_completion_tokens or request.max_tokens
+                        request.max_completion_tokens
+                        if request.max_completion_tokens is not None
+                        else request.max_tokens
                     )
                     # If max_completion_tokens or max_tokens is not set, we don't need to do _clamp_max_tokens.
                     # So we don't need to set the request's max output tokens to 1 here.
