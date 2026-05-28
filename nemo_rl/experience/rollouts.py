@@ -1115,6 +1115,10 @@ def run_async_nemo_gym_rollout(
     )
     if "vllm_cfg" in policy_generation.cfg:
         engine_max_model_len = policy_generation.cfg["vllm_cfg"]["max_model_len"]
+    elif "mcore_generation_config" in policy_generation.cfg:
+        engine_max_model_len = policy_generation.cfg["mcore_generation_config"][
+            "max_model_len"
+        ]
     else:
         engine_max_model_len = policy_generation.cfg["max_total_sequence_length"]
     if max_seq_len is not None and max_seq_len > engine_max_model_len:
@@ -1182,6 +1186,10 @@ def run_async_nemo_gym_rollout(
             max_total_tokens_per_sample = policy_generation.cfg["vllm_cfg"][
                 "max_model_len"
             ]
+        elif "mcore_generation_config" in policy_generation.cfg:
+            max_total_tokens_per_sample = policy_generation.cfg[
+                "mcore_generation_config"
+            ]["max_model_len"]
         else:
             max_total_tokens_per_sample = policy_generation.cfg[
                 "max_total_sequence_length"

@@ -191,6 +191,7 @@ policy:
       # Scoped to generation workers only; training keeps its own defaults
       # via the base yaml. The mcore_generation_config block is merged into
       # megatron_cfg for inference workers before model setup runs.
+      max_model_len: ${policy.max_total_sequence_length}
       transformer_impl: "inference_optimized"
       cuda_graph_impl: "local"
       inference_cuda_graph_scope: "block"

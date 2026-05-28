@@ -25,6 +25,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     GenerationOutputSpec,
 )
+from nemo_rl.models.generation.megatron.config import MCoreGenerationConfig
 from nemo_rl.models.policy import PolicyConfig
 
 
@@ -53,19 +54,22 @@ class MegatronGeneration(GenerationInterface):
         # Import here to avoid circular imports
         from nemo_rl.models.policy.lm_policy import Policy
 
-        self.cfg = config
+        # `self.cfg` exposes the `generation` that matches the `GenerationInterface` contract.
+        # `self._policy_config` keeps a reference to the full PolicyConfig.
+        self._policy_config = config
+        self.cfg: MCoreGenerationConfig = config["generation"]
         # Populated after the first prepare_for_generation (which starts the HTTP server).
         self.dp_openai_server_base_urls: list[Optional[str]] = []
 
         # Need to update the megatron_cfg with the mcore_generation_config parameters.
-        self.cfg["megatron_cfg"].update(config["generation"]["mcore_generation_config"])
+        self._policy_config["megatron_cfg"].update(self.cfg["mcore_generation_config"])
 
         # Create a Policy object configured for inference only:
         # - No optimizer (not training on this cluster)
         # - No reference model (not needed for generation)
         self._policy = Policy(
             cluster=cluster,
-            config=config,
+            config=self._policy_config,
             tokenizer=tokenizer,
             name_prefix=name_prefix,
             processor=processor,

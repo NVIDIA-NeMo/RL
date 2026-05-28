@@ -1267,9 +1267,7 @@ def refit_policy_generation(
     if (
         not colocated_inference
         and isinstance(policy_generation, MegatronGeneration)
-        and policy_generation.cfg["generation"]["mcore_generation_config"].get(
-            "refit_backend"
-        )
+        and policy_generation.cfg["mcore_generation_config"]["refit_backend"]
         == "nvshmem"
     ):
         futures_train = policy.preinit_nvshmem()

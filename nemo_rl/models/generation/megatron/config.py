@@ -32,6 +32,7 @@ class MCoreGenerationSpecificArgs(TypedDict):
     buffer_size_gb: int
     block_size_tokens: int
     max_tokens: int
+    max_model_len: int
 
     num_cuda_graphs: int
     use_cuda_graphs_for_non_decode_steps: bool

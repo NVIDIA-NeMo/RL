@@ -135,7 +135,7 @@ class MegatronGenerationMixin:
             buffer_size_gb=buffer_size_gb,
             num_cuda_graphs=num_cuda_graphs,
             max_tokens=max_tokens,
-            max_sequence_length=self.cfg["max_total_sequence_length"],
+            max_sequence_length=mcore_generation_config["max_model_len"],
             kv_cache_management_mode=KVCacheManagementMode(kv_cache_management_mode),
             static_kv_memory_pointers=needs_static_kv_pointers,
             use_cuda_graphs_for_non_decode_steps=use_cuda_graphs_for_non_decode_steps,
