@@ -37,7 +37,7 @@
     "question": "Fix the flaky test in test_grpo_algorithm.py that times out intermittently.",
     "expected_skill": null,
     "should_trigger": false,
-    "ground_truth": "The agent should not activate the docs skill for a test fix that does not involve documentation.",
+    "ground_truth": "The agent should not activate the docs skill for a test fix.",
     "expected_behavior": [
       "The agent did not read or activate docs/SKILL.md"
     ]
