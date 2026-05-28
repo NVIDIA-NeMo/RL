@@ -429,6 +429,144 @@ def _extract_layer_name(param_name: str) -> str:
     return param_name.split(".")[0]
 
 
+def check_nccl_reshard_refit_support(master_config: dict) -> None:
+    """Validate ``master_config`` against every precondition of nccl_reshard_refit.
+
+    Collects all violations and raises a single ``ValueError`` listing them, so
+    a user fixing their config can address everything in one pass rather than
+    re-running after each individual failure.  No-op on success.
+
+    Conditions checked here are everything that can be decided from
+    ``master_config`` alone (no model loading, no GPU work).  The following
+    additional constraint cannot be checked from config and is enforced at
+    runtime by the MoE fusion regex:
+
+      - MoE models must use the standard Llama/Qwen/DeepSeek SwiGLU naming
+        (``...experts.N.{gate_proj,up_proj,down_proj}.weight``).  Other MoE
+        activations (e.g. plain ReLU MLP) will fall through the fusion path
+        with no fused entries produced, which vLLM's ``w13_weight`` /
+        ``w2_weight`` consumers will then reject.
+
+    Raises:
+        ValueError: if any precondition is violated.
+    """
+    policy = master_config.get("policy", {}) or {}
+    generation = policy.get("generation", {}) or {}
+    megatron_cfg = policy.get("megatron_cfg", {}) or {}
+    dtensor_cfg = policy.get("dtensor_cfg", {}) or {}
+    vllm_cfg = generation.get("vllm_cfg", {}) or {}
+
+    violations: list[str] = []
+
+    # Non-colocated — refit happens cross-world; colocated path uses IPC.
+    if generation.get("colocated", {}).get("enabled", False):
+        violations.append(
+            "policy.generation.colocated.enabled must be False "
+            "(nccl_reshard_refit is only for disaggregated train/gen)."
+        )
+
+    # Gen backend = vLLM — only backend with prepare_nccl_reshard_refit_info.
+    backend = generation.get("backend")
+    if backend != "vllm":
+        violations.append(
+            f"policy.generation.backend must be 'vllm' (got {backend!r})."
+        )
+
+    # Train backend must be Megatron — DTensor support is deferred for the
+    # initial version (no FP8 export path on DTensor side).
+    megatron_enabled = megatron_cfg.get("enabled", False)
+    dtensor_enabled = dtensor_cfg.get("enabled", False)
+    if not megatron_enabled:
+        violations.append(
+            "policy.megatron_cfg.enabled must be True "
+            "(DTensor train backend is not supported yet for nccl_reshard_refit)."
+        )
+    if dtensor_enabled:
+        violations.append(
+            "policy.dtensor_cfg.enabled must be False "
+            "(DTensor train backend is not supported yet for nccl_reshard_refit)."
+        )
+
+    if megatron_enabled:
+        etp = megatron_cfg.get("expert_tensor_parallel_size", 1)
+
+        # ETP is not supported yet.
+        if etp not in (1, None):
+            violations.append(
+                f"Megatron expert_tensor_parallel_size is not supported yet "
+                f"(got etp={etp})."
+            )
+
+        # PP-layout knobs that _build_layer_to_pp_stage doesn't yet handle.
+        if megatron_cfg.get("pipeline_model_parallel_layout") is not None:
+            violations.append(
+                "policy.megatron_cfg.pipeline_model_parallel_layout must be unset."
+            )
+        vpp = megatron_cfg.get("virtual_pipeline_model_parallel_size")
+        if vpp not in (None, 1):
+            violations.append(
+                "policy.megatron_cfg.virtual_pipeline_model_parallel_size must be "
+                f"None or 1 (got {vpp})."
+            )
+        if megatron_cfg.get("account_for_embedding_in_pipeline_split", False):
+            violations.append(
+                "policy.megatron_cfg.account_for_embedding_in_pipeline_split must be False."
+            )
+        if megatron_cfg.get("account_for_loss_in_pipeline_split", False):
+            violations.append(
+                "policy.megatron_cfg.account_for_loss_in_pipeline_split must be False."
+            )
+
+        # Precision compatibility (train ↔ gen).  Supported combinations:
+        #   BF16 train  ↔ BF16 gen   (default, tested)
+        #   FP8  train  ↔ FP8  gen   (fp8_param=True + blockwise + vllm quantization=fp8)
+        # BF16→FP8 (train-side quant on the fly) is not implemented; FP8→BF16
+        # has no consumer (vLLM doesn't accept FP8 bytes into a BF16 param).
+        fp8_cfg = megatron_cfg.get("fp8_cfg", {}) or {}
+        fp8_param = fp8_cfg.get("fp8_param", False)
+        fp8_recipe = fp8_cfg.get("fp8_recipe", None)
+        gen_quantization = vllm_cfg.get("quantization", None)
+
+        if gen_quantization == "fp8":
+            if not fp8_param:
+                violations.append(
+                    "policy.generation.vllm_cfg.quantization='fp8' requires "
+                    "policy.megatron_cfg.fp8_cfg.fp8_param=True "
+                    "(BF16→FP8 train-side quantization is not implemented yet)."
+                )
+            elif fp8_recipe != "blockwise":
+                violations.append(
+                    "policy.megatron_cfg.fp8_cfg.fp8_recipe must be 'blockwise' "
+                    f"when fp8_param=True (got {fp8_recipe!r}); other recipes "
+                    "don't produce export-ready scale_inv tensors."
+                )
+        elif fp8_param:
+            violations.append(
+                "policy.megatron_cfg.fp8_cfg.fp8_param=True requires "
+                "policy.generation.vllm_cfg.quantization='fp8' "
+                "(FP8 storage on train side has no BF16 gen consumer)."
+            )
+
+    # vllm related restricions. NCCL reshard only support TP & DP for the vllm-side
+    if generation.get("backend") == "vllm":
+        gen_ep = vllm_cfg.get("expert_parallel_size", 1)
+        gen_pp = vllm_cfg.get("pipeline_parallel_size", 1)
+        if gen_ep != 1:
+            violations.append(
+                f"policy.generation.vllm_cfg.expert_parallel_size must be 1 (got {gen_ep})."
+            )
+        if gen_pp != 1:
+            violations.append(
+                f"policy.generation.vllm_cfg.pipeline_parallel_size must be 1 (got {gen_pp})."
+            )
+
+    if violations:
+        raise ValueError(
+            "nccl_reshard_refit cannot be enabled with the current config:\n"
+            + "\n".join(f"  - {v}" for v in violations)
+        )
+
+
 def build_nccl_reshard_refit_info(
     state_dict_metadata: dict[str, dict[str, Any]],
     train_parallelism: dict[str, int],

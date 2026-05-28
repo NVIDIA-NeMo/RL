@@ -746,9 +746,11 @@ def setup(
     # prepare refit info
     nccl_reshard_refit_enabled = policy_config.get("nccl_reshard_refit", False)
     if nccl_reshard_refit_enabled:
-        assert not colocated_inference, (
-            "nccl_reshard_refit is only supported for non-colocated inference"
+        from nemo_rl.distributed.nccl_reshard_utils import (
+            check_nccl_reshard_refit_support,
         )
+
+        check_nccl_reshard_refit_support(master_config)
     if nccl_reshard_refit_enabled and not colocated_inference:
         if policy_config.get("megatron_cfg", {}).get("enabled", False):
             train_parallelism = {
