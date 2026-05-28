@@ -130,7 +130,7 @@ launch:
       exit 1
     fi
     export RAY_enable_infeasible_task_early_exit=true
-    export PYTHONPATH=.:3rdparty/Megatron-LM-workspace/Megatron-LM
+    export PYTHONPATH=.:3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM
     TIMESTAMP=$(date -u +%Y%m%d-%H%M%S-%N)
     LOG_DIR=/mnt/rl-workspace/${user:}/driver_logs
     LOG=\${LOG_DIR}/${user:}-raycluster-qwen3-30b-math-gb300-training-\${TIMESTAMP}.log
@@ -156,7 +156,7 @@ kuberay:
     labels:
       disagg.nemo-rl/cluster: qwen3-30b-math-gb300
       disagg.nemo-rl/run: qwen3-30b-math-gb300
-      kai.scheduler/queue: default-queue
+      kai.scheduler/queue: rl
     spec:
       rayVersion: "2.52.0"
       headGroupSpec:

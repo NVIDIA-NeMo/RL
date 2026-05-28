@@ -24,13 +24,48 @@ import re
 import shutil
 import warnings
 from pathlib import Path
-from typing import Any, Mapping, NotRequired, Optional, TypedDict, Union
+from typing import Any, Literal, Mapping, NotRequired, Optional, TypedDict, Union
 
 import numpy as np
 import torch
 import yaml
+from pydantic import BaseModel
 
 PathLike = Union[str, "os.PathLike[Any]"]
+
+
+class PretrainedCheckpointConfig(TypedDict):
+    """Configuration for restoring initial weights from a pre-existing Megatron checkpoint.
+
+    When set, the policy will restore its initial weights from this checkpoint
+    instead of loading them from ``model_name``. Supported by the Megatron backend
+    only; DTensor backends continue to use HuggingFace weights via ``model_name``.
+
+    Attributes:
+        path: Filesystem path to the checkpoint to load.
+
+            * For ``"megatron_bridge"`` format: may be either a **specific
+              iteration directory** that contains a ``run_config.yaml`` file
+              (e.g. ``/checkpoints/iter_0005000/``) or a **checkpoint root
+              directory** that contains ``iter_*`` subdirectories.  When a
+              root directory is given the latest ``iter_*`` subdirectory is
+              used automatically.
+            * For ``"megatron_lm"`` format: may be the checkpoint root directory
+              (containing ``iter_*`` subdirectories and a
+              ``latest_checkpointed_iteration.txt`` tracker file) or a specific
+              iteration directory (e.g. ``/mlm_checkpoints/iter_0005000/``).
+              The checkpoint must use the ``torch_dist`` format (i.e. contain a
+              ``metadata.json`` file); the legacy ``torch`` format is not
+              supported.
+
+        format: Checkpoint format.  Use ``"megatron_bridge"`` for checkpoints
+            saved by megatron-bridge (e.g. produced by a prior NeMo-RL run) and
+            ``"megatron_lm"`` for checkpoints saved by upstream Megatron-LM.
+
+    """
+
+    path: str
+    format: Literal["megatron_bridge", "megatron_lm"]
 
 
 class CheckpointingConfig(TypedDict):
@@ -59,6 +94,7 @@ class CheckpointingConfig(TypedDict):
     save_period: int
     keep_top_k: NotRequired[int]
     checkpoint_must_save_by: NotRequired[str | None]
+    pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
     save_optimizer: NotRequired[bool]  # Default: True
     # New nemo-automodel integration fields
     model_save_format: NotRequired[str | None]  # Default: "safetensors"
@@ -155,7 +191,7 @@ class CheckpointManager:
         self,
         step: int,
         training_info: Mapping[str, Any],
-        run_config: Optional[Mapping[str, Any]] = None,
+        run_config: Optional[BaseModel] = None,
     ) -> PathLike:
         """Initialize a temporary checkpoint directory.
 
@@ -168,7 +204,7 @@ class CheckpointManager:
         Args:
             step (int): The training step number.
             training_info (dict[str, Any]): Dictionary containing training metrics and info.
-            run_config (Optional[dict[str, Any]]): Optional configuration for the training run.
+            run_config (Optional[BaseModel]): Optional configuration for the training run.
 
         Returns:
             PathLike: Path to the temporary checkpoint directory.
@@ -189,7 +225,7 @@ class CheckpointManager:
         # save config
         if run_config is not None:
             with open(save_dir / "config.yaml", "w") as f:
-                yaml.safe_dump(run_config, f)
+                yaml.safe_dump(run_config.model_dump(), f)
 
         return Path(os.path.abspath(save_dir))
 

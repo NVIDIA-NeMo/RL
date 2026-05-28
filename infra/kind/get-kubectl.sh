@@ -17,31 +17,31 @@ set -eou pipefail
 
 KUBECTL_VERSION=${KUBECTL_VERSION:-latest}
 
-echo ==============================================
-echo "Currently installed versions of kubectl:"
-ls ~/bin/kubectl* 2>/dev/null || true
-echo ==============================================
+KUBECTL_BIN="$HOME/bin/kubectl"
+mkdir -p "$HOME/bin"
 
-mkdir -p ~/bin
-NAMED_KUBECTL=~/bin/kubectl-$KUBECTL_VERSION
+ARCH=$(uname -m)
+case $ARCH in
+  x86_64)  ARCH=amd64 ;;
+  aarch64|arm64) ARCH=arm64 ;;
+  *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;;
+esac
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 
-if [[ ! -f $NAMED_KUBECTL ]]; then
-  ARCH=$(uname -m)
-  case $ARCH in
-    x86_64)  ARCH=amd64 ;;
-    aarch64) ARCH=arm64 ;;
-    *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;;
-  esac
-  if [[ $KUBECTL_VERSION == latest ]]; then
-    curl -L "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/$ARCH/kubectl" -o "$NAMED_KUBECTL"
-  else
-    curl -L "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/$ARCH/kubectl" -o "$NAMED_KUBECTL"
-  fi
+if [[ $KUBECTL_VERSION == latest ]]; then
+  curl -L "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/${OS}/${ARCH}/kubectl" -o "$KUBECTL_BIN"
+else
+  curl -L "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/${OS}/${ARCH}/kubectl" -o "$KUBECTL_BIN"
 fi
-chmod +x "$NAMED_KUBECTL"
+chmod +x "$KUBECTL_BIN"
 
-echo "Installed kubectl at $NAMED_KUBECTL"
-echo "To use, you may set 'alias kubectl=$NAMED_KUBECTL'"
+echo "Installed kubectl at $KUBECTL_BIN"
+if command -v kubectl &>/dev/null; then
+  echo "kubectl is already on your PATH: $(command -v kubectl)"
+else
+  echo "kubectl is not on your PATH. To add it, run:"
+  echo "  export PATH=\"\$HOME/bin:\$PATH\""
+fi
 
 if [[ ! -f ~/.krew/bin/kubectl-krew ]]; then
   (
@@ -59,11 +59,11 @@ fi
 
 export PATH="${KREW_ROOT:-$HOME/.krew}/bin:$PATH"
 
-$NAMED_KUBECTL krew install ctx
-$NAMED_KUBECTL krew install ns
-$NAMED_KUBECTL krew install stern
-$NAMED_KUBECTL krew install view-allocations
-$NAMED_KUBECTL krew install whoami
+$KUBECTL_BIN krew install ctx
+$KUBECTL_BIN krew install ns
+$KUBECTL_BIN krew install stern
+$KUBECTL_BIN krew install view-allocations
+$KUBECTL_BIN krew install whoami
 
 cat <<EOF
 Installed krew at $HOME/.krew
