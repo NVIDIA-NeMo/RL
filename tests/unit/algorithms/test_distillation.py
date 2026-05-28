@@ -20,13 +20,14 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 
 import nemo_rl.algorithms.distillation as distil_mod
 from nemo_rl.algorithms.distillation import (
+    DistillationConfig,
     MasterConfig,
     _default_distillation_save_state,
     check_vocab_equality,
     distillation_train,
     validate,
 )
-from nemo_rl.algorithms.loss import DistillationLossFn
+from nemo_rl.algorithms.loss import DistillationLossConfig, DistillationLossFn
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
@@ -107,11 +108,11 @@ def mock_components():
     tokenizer.pad_token_id = 0
 
     loss_fn = DistillationLossFn(
-        {
-            "kl_type": "forward",
-            "mixed_kl_weight": 0.5,
-            "zero_outside_topk": False,
-        }
+        DistillationLossConfig(
+            kl_type="forward",
+            mixed_kl_weight=0.5,
+            zero_outside_topk=False,
+        )
     )
 
     logger = MagicMock()
@@ -124,20 +125,20 @@ def mock_components():
     # Create mock master config
     master_config = MasterConfig.model_construct(
         **{
-            "distillation": {
-                "max_num_steps": 5,
-                "max_num_epochs": 10,
-                "val_period": 100,
-                "val_batch_size": 1,
-                "val_at_start": False,
-                "val_at_end": False,
-                "max_val_samples": 10,
-                "topk_logits_k": 64,
-                "num_prompts_per_step": 1,
-                "num_generations_per_prompt": 1,
-                "max_rollout_turns": 0,  # No environment interaction needed for distillation
-                "seed": 42,
-            },
+            "distillation": DistillationConfig.model_construct(
+                max_num_steps=5,
+                max_num_epochs=10,
+                val_period=100,
+                val_batch_size=1,
+                val_at_start=False,
+                val_at_end=False,
+                max_val_samples=10,
+                topk_logits_k=64,
+                num_prompts_per_step=1,
+                num_generations_per_prompt=1,
+                max_rollout_turns=0,
+                seed=42,
+            ),
             "policy": {
                 "train_global_batch_size": 1,
                 "make_sequence_length_divisible_by": 8,
@@ -154,11 +155,11 @@ def mock_components():
             "teacher": {
                 "model_name": "test-teacher",
             },
-            "loss_fn": {
-                "kl_type": "forward",
-                "mixed_kl_weight": 0.5,
-                "zero_outside_topk": False,
-            },
+            "loss_fn": DistillationLossConfig(
+                kl_type="forward",
+                mixed_kl_weight=0.5,
+                zero_outside_topk=False,
+            ),
             "data": {
                 "dataset_name": "test_dataset",
             },
@@ -196,7 +197,7 @@ def mock_components():
 
 def test_distillation_train_max_steps(mock_components):
     """Test that training terminates correctly when maximum steps are reached."""
-    mock_components["master_config"].distillation["max_num_steps"] = 5
+    mock_components["master_config"].distillation.max_num_steps = 5
 
     distillation_save_state = _default_distillation_save_state()
 
@@ -223,7 +224,7 @@ def test_distillation_train_max_steps(mock_components):
 def test_exit_on_timeout(mock_components, capsys):
     """Test that training loop exits when timeout is reached"""
     # Set max steps to large number
-    mock_components["master_config"].distillation["max_num_steps"] = 100
+    mock_components["master_config"].distillation.max_num_steps = 100
 
     distillation_save_state = _default_distillation_save_state()
 
@@ -448,15 +449,19 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
                     "enabled": False,
                 },
             },
-            "loss_fn": {},
-            "distillation": {
-                "seed": 42,
-                "topk_logits_k": 64,
-                "num_prompts_per_step": 1,  # Config extraction requires this key
-                "val_period": 0,  # Config extraction requires this key
-                "val_at_start": False,  # Config extraction requires this key
-                "val_at_end": False,  # Config extraction requires this key
-            },
+            "loss_fn": DistillationLossConfig(
+                kl_type="forward",
+                mixed_kl_weight=0.5,
+                zero_outside_topk=False,
+            ),
+            "distillation": DistillationConfig.model_construct(
+                seed=42,
+                topk_logits_k=64,
+                num_prompts_per_step=1,
+                val_period=0,
+                val_at_start=False,
+                val_at_end=False,
+            ),
             "data": {"shuffle": False},
             "logger": {},  # Config extraction requires this key
             "checkpointing": {},  # Config extraction requires this key
@@ -520,21 +525,21 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch):
                     "enabled": False,
                 },
             },
-            "loss_fn": {
-                "kl_type": "forward",
-                "mixed_kl_weight": 0.5,
-                "zero_outside_topk": False,
-            },
-            "distillation": {
-                "seed": 42,
-                "topk_logits_k": 64,
-                "num_prompts_per_step": 1,
-                "max_num_epochs": 10,
-                "max_num_steps": 100,
-                "val_period": 0,
-                "val_at_start": False,
-                "val_at_end": False,
-            },
+            "loss_fn": DistillationLossConfig(
+                kl_type="forward",
+                mixed_kl_weight=0.5,
+                zero_outside_topk=False,
+            ),
+            "distillation": DistillationConfig.model_construct(
+                seed=42,
+                topk_logits_k=64,
+                num_prompts_per_step=1,
+                max_num_epochs=10,
+                max_num_steps=100,
+                val_period=0,
+                val_at_start=False,
+                val_at_end=False,
+            ),
             "data": {"shuffle": False},
             "logger": {},
             "checkpointing": {},
@@ -639,17 +644,21 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
                     "enabled": False,
                 },
             },
-            "loss_fn": {},
-            "distillation": {
-                "seed": 42,
-                "topk_logits_k": 64,
-                "max_num_epochs": 10,
-                "max_num_steps": 100,
-                "num_prompts_per_step": 1,  # Config extraction requires this key
-                "val_period": 0,  # Config extraction requires this key
-                "val_at_start": False,  # Config extraction requires this key
-                "val_at_end": False,  # Config extraction requires this key
-            },
+            "loss_fn": DistillationLossConfig(
+                kl_type="forward",
+                mixed_kl_weight=0.5,
+                zero_outside_topk=False,
+            ),
+            "distillation": DistillationConfig.model_construct(
+                seed=42,
+                topk_logits_k=64,
+                max_num_epochs=10,
+                max_num_steps=100,
+                num_prompts_per_step=1,
+                val_period=0,
+                val_at_start=False,
+                val_at_end=False,
+            ),
             "data": {"shuffle": False},
             "logger": {},  # Config extraction requires this key
             "checkpointing": {},  # Config extraction requires this key
