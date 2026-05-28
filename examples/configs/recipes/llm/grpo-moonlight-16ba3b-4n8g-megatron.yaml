@@ -13,6 +13,12 @@ policy:
   generation_batch_size: 64
   logprob_batch_size: 1
   max_total_sequence_length: 8192
+  generation:
+    vllm_kwargs:
+      # vLLM 0.20's FlashInfer TRTLLM MoE backend stores bf16 expert
+      # weights in a blocked runtime layout that its load_weights path cannot
+      # refit. Use TRITON to keep the refit-compatible 3D MoE layout.
+      moe_backend: triton
   dtensor_cfg:
     enabled: false
   sequence_packing:
