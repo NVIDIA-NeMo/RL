@@ -1,0 +1,47 @@
+[
+  {
+    "id": "brev-etiquette-positive-001",
+    "question": "I'm on a Brev instance. Set up the environment and run a GRPO training experiment with checkpoints and W&B logging.",
+    "expected_skill": "brev-etiquette",
+    "ground_truth": "The agent loads the brev-etiquette skill, checks disk space, sets up /ephemeral paths for experiment outputs, loads .env secrets, and configures cache directories before launching.",
+    "expected_behavior": [
+      "The agent read brev-etiquette/SKILL.md before acting",
+      "The agent checked disk space with df -h /home/ubuntu/RL /ephemeral",
+      "The agent created experiment directories under /ephemeral",
+      "The agent loaded /home/ubuntu/RL/.env for secrets",
+      "The agent set cache environment variables pointing to /ephemeral"
+    ]
+  },
+  {
+    "id": "brev-etiquette-positive-002",
+    "question": "Download the Qwen 2.5 model from Hugging Face on this Brev machine for an upcoming training run.",
+    "expected_skill": "brev-etiquette",
+    "ground_truth": "The agent loads the brev-etiquette skill, sets HF_HOME and cache paths to /ephemeral, loads HF_TOKEN from .env, and downloads the model to the shared cache root.",
+    "expected_behavior": [
+      "The agent read brev-etiquette/SKILL.md before acting",
+      "The agent set HF_HOME to a path under /ephemeral",
+      "The agent loaded .env for the HF_TOKEN",
+      "The agent used a shared cache root rather than per-experiment cache"
+    ]
+  },
+  {
+    "id": "brev-etiquette-negative-001",
+    "question": "Run the unit tests for the GRPO algorithm locally on my laptop.",
+    "expected_skill": null,
+    "should_trigger": false,
+    "ground_truth": "The agent should not activate the brev-etiquette skill when not on a Brev instance.",
+    "expected_behavior": [
+      "The agent did not read or activate brev-etiquette/SKILL.md"
+    ]
+  },
+  {
+    "id": "brev-etiquette-negative-002",
+    "question": "Deploy the training job to the Kubernetes cluster using nrl-k8s.",
+    "expected_skill": null,
+    "should_trigger": false,
+    "ground_truth": "The agent should not activate the brev-etiquette skill for a Kubernetes deployment task.",
+    "expected_behavior": [
+      "The agent did not read or activate brev-etiquette/SKILL.md"
+    ]
+  }
+]

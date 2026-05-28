@@ -1,5 +1,6 @@
 ---
 name: brev-etiquette
+license: Apache-2.0
 description: Brev instance operating guidance for NeMo-RL agents working in /home/ubuntu/RL with limited workspace disk, a larger /ephemeral volume, and optional /home/ubuntu/RL/.env secrets. Use when running auto-research campaigns, experiments, training jobs, model or dataset downloads, shared cache-heavy commands, log-producing runs, checkpoint generation, W&B or Hugging Face authenticated workflows, or any workflow that may create large files on Brev.
 when_to_use: Running on a Brev instance; launching auto-research campaigns or long jobs; managing large logs, checkpoints, caches, datasets, Ray temp files, W&B files, or Hugging Face auth on Brev.
 ---
