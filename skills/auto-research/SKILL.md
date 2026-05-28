@@ -1,5 +1,6 @@
 ---
 name: auto-research
+license: Apache-2.0
 description: "Autonomous NeMo-RL research agent workflow for directed hypothesis testing and open-ended discovery. Guides agents through the full experiment lifecycle: understanding recipes and environments, wiring RL or NeMo-gym runs, launching reproducible baselines and iterations, analyzing results, preserving human oversight, and using git plus TSV logs as the research ledger."
 when_to_use: auto research; run experiments; test these hypotheses; find a better recipe; improve accuracy; long-running NeMo-RL or NeMo-gym research campaigns; autonomous discovery; directed execution.
 ---
