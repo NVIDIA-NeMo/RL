@@ -395,6 +395,13 @@ def _pack_sequences_for_megatron(
         seq_len = (
             seq_lengths[b].item() if torch.is_tensor(seq_lengths[b]) else seq_lengths[b]
         )
+        # Defensive clip: in async-GRPO, seq_lengths can occasionally exceed
+        # input_ids.shape[1] (replay-buffer / microbatch sizing path mismatch).
+        # PyTorch silently clamps `input_ids[b, :seq_len]` to the available
+        # width, but `cu_seqlens` would then be inconsistent and crash
+        # downstream packing.  Clip seq_len to the available data so all
+        # metadata is honest about what's actually present.
+        seq_len = min(seq_len, input_ids.shape[1])
 
         # Extract valid tokens for this sequence
         valid_tokens.append(input_ids[b, :seq_len])
@@ -442,6 +449,9 @@ def _pack_sequences_for_megatron(
                 if torch.is_tensor(seq_lengths[b])
                 else seq_lengths[b]
             )
+            # Same defensive clip as the first loop above — keep both paths
+            # consistent when seq_lengths exceeds input_ids.shape[1].
+            seq_len = min(seq_len, input_ids.shape[1])
             # if last element, pad to the max sequence length
             if b == batch_size - 1 and needs_padding:
                 if pad_packed_seq_to is not None:
