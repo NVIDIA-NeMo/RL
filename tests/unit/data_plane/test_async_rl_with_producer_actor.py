@@ -33,7 +33,6 @@ from collections import Counter
 from typing import Any
 
 import pytest
-from tensordict import TensorDict
 
 transfer_queue = pytest.importorskip("transfer_queue")  # noqa: F841
 
@@ -41,8 +40,10 @@ import numpy as np  # noqa: E402
 import ray  # noqa: E402
 
 from nemo_rl.data_plane import build_data_plane_client  # noqa: E402
+from nemo_rl.data_plane.column_io import kv_first_write, read_columns  # noqa: E402
 from nemo_rl.data_plane.preshard import shard_meta_for_dp  # noqa: E402
 from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS  # noqa: E402
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict  # noqa: E402
 
 from ._rollout_filters import StalenessFilter  # noqa: E402
 from ._rollout_shapes import (  # noqa: E402
@@ -53,6 +54,21 @@ from ._rollout_shapes import (  # noqa: E402
     register_train_partition,
 )
 
+# Shared TQ client config — driver fixture builds it; actor uses the same
+# values so build_data_plane_client inside the Ray worker attaches to the
+# existing controller (no new bootstrap).
+_TQ_CLIENT_CONFIG = {
+    "enabled": True,
+    "impl": "transfer_queue",
+    "backend": "simple",
+    "storage_capacity": 1024,
+    "num_storage_units": 1,
+    "claim_meta_poll_interval_s": 0.5,
+    "global_segment_size": 8589934592,
+    "local_buffer_size": 1073741824,
+}
+
+
 # ── producer actor ────────────────────────────────────────────────────────────
 
 
@@ -60,17 +76,18 @@ from ._rollout_shapes import (  # noqa: E402
 class _ProducerActor:
     """Stand-in for ``AsyncTrajectoryCollector`` — writes rollout batches to TQ.
 
-    Each ``produce`` call writes ``len(sample_ids)`` samples stamped with
-    a single ``weight_version`` so the driver-side filter has something
-    to discriminate on. The actor attaches to the existing TQ controller
-    (initialized by the driver fixture) via ``tq.init()`` — same path
-    production workers use.
+    Uses the same write path as ``SyncRolloutActor``: a ``DataPlaneClient``
+    built via ``build_data_plane_client`` (which attaches to the existing
+    TQ controller in the Ray worker process), then a single flat
+    ``kv_first_write`` per produce call. Each call stamps one
+    ``weight_version`` so the driver's filter has something to discriminate
+    on.
     """
 
     def __init__(self) -> None:
-        import transfer_queue as tq
-
-        tq.init()  # no config → attach to existing controller
+        # Attach to the existing TQ controller (driver bootstrapped it).
+        # Same dp_client surface SyncRolloutActor's workers hold.
+        self._dp_client = build_data_plane_client(_TQ_CLIENT_CONFIG)
 
     def produce(
         self,
@@ -79,14 +96,12 @@ class _ProducerActor:
         weight_version: int,
         max_seqlen: int = 16,
     ) -> list[str]:
-        import transfer_queue as tq
-
         n = len(sample_ids)
         bulk = make_rollout_batch(n=n, max_seqlen=max_seqlen)
-        # Add ``content`` as an np.ndarray(object) of per-row message_logs
-        # — matches SyncRolloutActor's production write shape (see
-        # nemo_rl/experience/sync_rollout_actor.py:271-273). Object
-        # fields ride through TQ via the codec's NonTensorStack path.
+        # Add ``content`` as np.ndarray(object) of per-row message_logs —
+        # matches SyncRolloutActor's production write shape (see
+        # nemo_rl/experience/sync_rollout_actor.py:271-273). Object fields
+        # ride through TQ via the codec's NonTensorStack path.
         content = np.empty(n, dtype=object)
         for i, ml in enumerate(make_multi_turn_message_log(n=n)):
             content[i] = ml
@@ -95,35 +110,30 @@ class _ProducerActor:
         for i, t in enumerate(tags):
             t["weight_version"] = weight_version
             t["input_lengths"] = int(bulk["input_lengths"][i])
-        tq.kv_batch_put(
-            keys=list(sample_ids),
+        # Same write helper SyncRolloutActor uses (column_io.py:123) —
+        # single flat put_samples of every tensor field, jagged-packed.
+        kv_first_write(
+            BatchedDataDict(bulk),
+            sample_ids=list(sample_ids),
+            dp_client=self._dp_client,
             partition_id=partition_id,
-            fields=TensorDict(bulk, batch_size=[n]),
+            task_name="train",
             tags=tags,
         )
         return sample_ids
 
 
-# ── driver fixture (mirrors test_tq_lifecycle.py::tq_client) ──────────────────
+# ── driver fixture ────────────────────────────────────────────────────────────
+# Named ``dp_client`` (not ``tq_client``) since the test exercises the
+# backend-agnostic DataPlaneClient surface, not TQ specifics.
 
 
 @pytest.fixture
-def tq_client():
+def dp_client():
     if not ray.is_initialized():
         ray.init(local_mode=False, include_dashboard=False)
 
-    client = build_data_plane_client(
-        {
-            "enabled": True,
-            "impl": "transfer_queue",
-            "backend": "simple",
-            "storage_capacity": 1024,
-            "num_storage_units": 1,
-            "claim_meta_poll_interval_s": 0.5,
-            "global_segment_size": 8589934592,
-            "local_buffer_size": 1073741824,
-        }
-    )
+    client = build_data_plane_client(_TQ_CLIENT_CONFIG)
     yield client
     client.close()
 
@@ -131,7 +141,7 @@ def tq_client():
 # ── test ──────────────────────────────────────────────────────────────────────
 
 
-def test_async_rl_filter_with_producer_actor(tq_client) -> None:
+def test_async_rl_filter_with_producer_actor(dp_client) -> None:
     """Producer actor writes mixed-version rollouts → driver claims, filters, clears."""
     pid = "async-rl-flow"
     current_weight_version = 3  # max_age=1 → keep where v >= 2
@@ -145,7 +155,7 @@ def test_async_rl_filter_with_producer_actor(tq_client) -> None:
 
     # Driver pre-registers the partition with pid (the helper defaults
     # to 'train' which would leave 'async-rl-flow' unregistered).
-    register_train_partition(tq_client, num_samples=n, partition_id=pid)
+    register_train_partition(dp_client, num_samples=n, partition_id=pid)
 
     # ── Pipeline (no asserts) ────────────────────────────────────────────────
     producer = _ProducerActor.remote()
@@ -157,7 +167,7 @@ def test_async_rl_filter_with_producer_actor(tq_client) -> None:
             ),
         ]
     )
-    sample_meta = tq_client.claim_meta(
+    sample_meta = dp_client.claim_meta(
         partition_id=pid,
         task_name="train",
         required_fields=list(DP_TRAIN_FIELDS),
@@ -168,14 +178,18 @@ def test_async_rl_filter_with_producer_actor(tq_client) -> None:
         sample_meta, current_weight_version=current_weight_version
     )
     shards, _ = shard_meta_for_dp(keep_meta, dp_world=2)
+    # Same per-rank fetch helper grpo_sync.py uses (column_io.py:51) —
+    # wraps get_samples + materialize (jagged unpack, object decode).
     shard_fetches: list[Any] = [
-        tq_client.get_data(s, select_fields=["input_ids"]) for s in shards if s.size > 0
+        read_columns(dp_client, s, select_fields=["input_ids"])
+        for s in shards
+        if s.size > 0
     ]
-    tq_client.clear_samples(drop_meta.sample_ids, partition_id=pid)
-    fully_consumed = tq_client.check_consumption_status(
+    dp_client.clear_samples(drop_meta.sample_ids, partition_id=pid)
+    fully_consumed = dp_client.check_consumption_status(
         partition_id=pid, task_names=["train"]
     )
-    survivors_td = tq_client.get_samples(
+    survivors_td = dp_client.get_samples(
         keep_meta.sample_ids, partition_id=pid, select_fields=["input_ids"]
     )
 
@@ -214,5 +228,5 @@ def test_async_rl_filter_with_producer_actor(tq_client) -> None:
 
     # Partition / actor cleanup is the conftest's job: session-scope
     # init_ray_cluster (tests/unit/conftest.py:380) calls ray.shutdown()
-    # at the end of the session, and the tq_client fixture's client.close()
+    # at the end of the session, and the dp_client fixture's client.close()
     # kills the TQ controller actor.
