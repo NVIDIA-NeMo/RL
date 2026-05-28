@@ -1,5 +1,6 @@
 ---
 name: add-native-environment
+license: Apache-2.0
 description: Interactive skill for building a new native RL environment in NeMo-RL. Guides through creating the full stack — dataset, data processor, environment, config, and training script — then validates end-to-end with a GRPO training run.
 when_to_use: "add environment", "new RL environment", "create a native environment", "build a training task", "add a new game", "add a new reward function", "new GRPO task", "add native env".
 allowed-tools: Bash Read Grep Glob Edit Write Agent AskUserQuestion
