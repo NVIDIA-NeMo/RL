@@ -16,7 +16,7 @@
 #   --build-arg SKIP_VLLM_BUILD=1    # Skip vLLM dependencies
 #   --build-arg SKIP_SGLANG_BUILD=1  # Skip SGLang dependencies
 
-ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.03-cuda13.2-devel-ubuntu24.04
+ARG BASE_IMAGE=nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc13
 FROM scratch AS nemo-rl
 ARG NRL_GIT_REF=main
 ADD --keep-git-dir=true https://github.com/NVIDIA-NeMo/RL.git#${NRL_GIT_REF} /
@@ -73,7 +73,7 @@ RUN GITHUB_ARTIFACTORY=github.com \
 
 # Install uv and python
 ARG UV_VERSION=0.11.6
-ARG PYTHON_VERSION=3.13.13
+ARG PYTHON_VERSION=3.12.3
 ENV PATH="/root/.local/bin:$PATH"
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
     uv python install ${PYTHON_VERSION}
@@ -187,8 +187,8 @@ ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 # version mismatch crash (e.g. system 9.10.1 vs pip 9.19.0). CUDNN_HOME makes TE's Python
 # code find the pip version first, and LD_LIBRARY_PATH makes the dynamic linker resolve
 # cuDNN sub-libraries from pip when loading libtransformer_engine.so.
-ENV CUDNN_HOME=/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn
-ENV LD_LIBRARY_PATH="/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH}"
+ENV CUDNN_HOME=/opt/nemo_rl_venv/lib/python3.12/site-packages/nvidia/cudnn
+ENV LD_LIBRARY_PATH="/opt/nemo_rl_venv/lib/python3.12/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH}"
 # Verify with: python -c "import transformer_engine.pytorch as te; print(te.get_cudnn_version())"
 
 WORKDIR /opt/nemo-rl
