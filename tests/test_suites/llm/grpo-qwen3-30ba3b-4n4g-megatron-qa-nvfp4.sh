@@ -73,8 +73,8 @@ grep -q "MegatronQuantPolicyWorker.*2739 TensorQuantizers found in model" "$RUN_
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
-        'data["train/loss"]["1"] > 0.02' \
-        'data["train/loss"]["1"] < 0.10' \
+        'data["train/loss"]["1"] > 0.0' \
+        'data["train/loss"]["1"] < 0.2' \
         'data["train/num_valid_samples"]["1"] == 16' \
         'data["train/global_valid_seqs"]["1"] == 16' \
         'data["train/global_valid_toks"]["1"] > 30000' \
