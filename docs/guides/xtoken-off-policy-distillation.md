@@ -14,24 +14,18 @@ This guide explains how to:
 
 ## How it works
 
-A full run has two phases. The first three steps are *offline data prep* —
+A full run has two phases. The three prep steps are *offline data prep* —
 small CLI tools you run once per (student, teacher) pair — and the result is a
-single `.pt` file. The fourth step is the actual distillation training loop.
+single `.pt` file. The final step is the actual distillation training loop.
 
 ```
                         ┌──────────────────────────────────────────────┐
                         │  Offline projection-matrix preparation       │
                         │                                              │
-  (student, teacher)    │  ┌────────────────────────────────────┐      │
-  tokenizers + base ───▶│  │ 1. minimal_projection_generator.py │      │
-  embedding model       │  │    — embedding-similarity top-k    │      │
-                        │  └─────────────────┬──────────────────┘      │
-                        │                    │                         │
-                        │                    ▼                         │
                         │  ┌────────────────────────────────────┐      │
-                        │  │ 2. minimal_projection_via_         │      │
-                        │  │    multitoken.py                   │      │
-                        │  │    — add multi-token mappings      │      │
+  (student, teacher)    │  │ 2. minimal_projection_via_         │      │
+  tokenizers       ────▶│  │    multitoken.py                   │      │
+                        │  │    — multi-token mappings          │      │
                         │  └─────────────────┬──────────────────┘      │
                         │                    │                         │
                         │  ┌─────────────────▼──────────────────┐      │
@@ -58,10 +52,19 @@ The projection matrix is a sparse `[V_student, top_k]` tensor that the
 training-time loss multiplies against the student logits to project them into
 the teacher's vocab space (or vice versa, depending on the loss mode).
 
+### Which prep steps are essential?
+
+Of the three prep steps, **Step 2 (multi-token mappings)** and
+**Step 4 (sort and trim)** are required — Step 2 builds the cross-vocab
+mapping itself, and Step 4 produces the runtime-format `.pt` the training
+loss expects. **Step 3 (reapply exact map) is optional** and pins exact
+1-to-1 token mappings on top of Step 2, but we found the best results
+on this branch by running **Steps 2 → 3 → 4**.
+
 ## Quickstart — single command
 
 For the typical case, `tools/x_token/build_projection_matrix.sh` chains
-the four prep steps with auto-derived intermediate paths:
+the prep steps with auto-derived intermediate paths:
 
 ```bash
 ./tools/x_token/build_projection_matrix.sh \
@@ -78,8 +81,7 @@ to tweak Step 2 defaults. Run `./tools/x_token/build_projection_matrix.sh
 --help` for the full flag list.
 
 The per-step recipes below are for advanced customization (non-default
-weight thresholds, custom embedding model, hand-picked intermediate
-filenames, etc.).
+weight thresholds, hand-picked intermediate filenames, etc.).
 
 ## Backend and scope
 
@@ -92,32 +94,7 @@ filenames, etc.).
 - The corpus must be served via the `arrow_text` dataset (no chat template,
   loss on every token — see `examples/configs/xtoken_off_policy_distillation.yaml`).
 
-## Step 1 — Generate the base projection matrix
-
-`minimal_projection_generator.py` walks both vocabularies, embeds every token
-with a small embedding LLM (or a sentence-transformers model), and stores the
-top-`k` teacher tokens by cosine similarity for each student token.
-
-```bash
-uv run python -m tools.x_token.minimal_projection_generator \
-    --student-model "meta-llama/Llama-3.2-1B" \
-    --teacher-model "Qwen/Qwen3-4B" \
-    --top_k 32 \
-    --force_recompute \
-    --data_dir cross_tokenizer_data/
-```
-
-Both `--student-model` and `--teacher-model` are required and **not swapped**
-— the projection direction follows the CLI args exactly. Output lands at
-`cross_tokenizer_data/temp_projection_map_Llama-3.2_to_Qwen3_top_32.pt`.
-
-If you pick an `embedding_model_type == "sbert"` choice from
-`EMBEDDING_MODEL_CHOICES`, install `sentence-transformers` first; the script
-falls back to a clear `ImportError` otherwise. The default
-`embedding_model_index = 3` uses `Qwen/Qwen3-Embedding-4B` and does not need
-`sentence-transformers`.
-
-## Step 2 — Add multi-token mappings
+## Step 2 — Build multi-token mappings
 
 Many student tokens (e.g., `"12"`) tokenize into multiple teacher tokens
 (e.g., `"1"`, `"2"`). `minimal_projection_via_multitoken.py` walks the
@@ -129,7 +106,6 @@ does the symmetric teacher → student walk.
 uv run python -m tools.x_token.minimal_projection_via_multitoken \
     --student-model "meta-llama/Llama-3.2-1B" \
     --teacher-model "Qwen/Qwen3-4B" \
-    --initial-projection-path cross_tokenizer_data/temp_projection_map_Llama-3.2_to_Qwen3_top_32.pt \
     --top-k 32 \
     --enable-scale-trick \
     --enable-reverse-pass \
@@ -149,7 +125,7 @@ in the saved `.pt` so Step 4 can auto-enable `--preserve_last`.
 
 Some token pairs are *literally identical* (e.g., common punctuation, single
 ASCII characters). `reapply_exact_map.py` pins those to 1-to-1 mappings with
-weight 1.0, overwriting whatever Steps 1–2 produced for them.
+weight 1.0, overwriting whatever Step 2 produced for them.
 
 ```bash
 uv run python -m tools.x_token.reapply_exact_map \
@@ -218,7 +194,7 @@ Other relevant fields:
 
 The same pipeline works for any HuggingFace tokenizer pair. Two worked
 examples — Llama → Gemma and Llama → Phi — only differ in the
-`--student-model` / `--teacher-model` arguments to Steps 1 and 2.
+`--student-model` / `--teacher-model` arguments to Step 2.
 
 For Phi-3 / Phi-4 family teachers, also export
 `NRL_TRUST_REMOTE_CODE=false` and `NRL_SKIP_PHI_ROPE_FIX=1` in the
@@ -228,8 +204,7 @@ training environment so the in-tree HuggingFace implementation is used.
 
 | Stage | Tool | Default output |
 |---|---|---|
-| Generate base | `tools/x_token/minimal_projection_generator.py` | `<data_dir>/temp_projection_map_<student>_to_<teacher>_top_<N>.pt` |
-| Add multi-token | `tools/x_token/minimal_projection_via_multitoken.py` | `<output_dir>/projection_map_<student>_to_<teacher>_multitoken_top_<N>_double[_special].pt` |
+| Build multi-token | `tools/x_token/minimal_projection_via_multitoken.py` | `<output_dir>/projection_map_<student>_to_<teacher>_multitoken_top_<N>_double[_special].pt` |
 | Reapply exact map | `tools/x_token/reapply_exact_map.py` | `<input>_exact_map_remapped.pt` |
 | Sort and trim | `tools/x_token/sort_and_cut_projection_matrix.py` | `<input_dir>/<basename>_top_<N>_sorted[_preservelast].pt` (or `--output_path`) |
 | Train | `examples/run_xtoken_off_policy_distillation.py` | per the run's `logger.log_dir` and `checkpointing.checkpoint_dir` |
