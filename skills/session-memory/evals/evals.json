@@ -39,7 +39,7 @@
     "should_trigger": false,
     "ground_truth": "The agent should not activate the session-memory skill for a simple knowledge question.",
     "expected_behavior": [
-      "The agent did not read or activate session-memory/SKILL.md"
+      "The agent did not activate the session-memory skill"
     ]
   },
   {
@@ -49,7 +49,7 @@
     "should_trigger": false,
     "ground_truth": "The agent should not activate the session-memory skill for a short linting task.",
     "expected_behavior": [
-      "The agent did not read or activate session-memory/SKILL.md"
+      "The agent did not activate the session-memory skill"
     ]
   }
 ]
