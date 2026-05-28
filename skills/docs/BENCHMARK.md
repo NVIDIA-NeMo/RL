@@ -53,17 +53,17 @@ Task composition is derived from the evaluation dataset when possible. Entries w
 
 | Dimension | Num | `claude-code` | `codex` |
 |---|---:|---:|---:|
-| Security | 8 | 83% (-17%) | 50% (-13%) |
-| Correctness | 8 | 91% (+4%) | 82% (+10%) |
-| Discoverability | 8 | 99% (+13%) | 88% (+4%) |
-| Effectiveness | 8 | 88% (-4%) | 63% (-1%) |
-| Efficiency | 8 | 88% (+17%) | 78% (+5%) |
+| Security | 8 | 93% (-3%) | 50% (-13%) |
+| Correctness | 8 | 90% (+3%) | 84% (+12%) |
+| Discoverability | 8 | 98% (+13%) | 91% (+7%) |
+| Effectiveness | 8 | 86% (-7%) | 67% (+5%) |
+| Efficiency | 8 | 85% (+15%) | 83% (+8%) |
 
 Score values show skill-assisted performance. Values in parentheses show uplift versus the no-skill baseline when baseline data is available.
 
 ## Tier 1: Static Validation Summary
 
-Tier 1 validation passed with observations. NVSkills-Eval ran 9 checks and found 13 total findings.
+Tier 1 validation passed with observations. NVSkills-Eval ran 9 checks and found 16 total findings.
 
 Top findings:
 

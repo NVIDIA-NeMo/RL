@@ -9,7 +9,7 @@ NVIDIA <br>
 ### License/Terms of Use: <br>
 Apache 2.0 <br>
 ## Use Case: <br>
-Developers and engineers working on NeMo-RL who need to add or update documentation, maintain docs/index.md, or follow docstring format conventions. <br>
+Developers and engineers adding or updating documentation in NeMo-RL, including maintaining docs/index.md, writing Google-style docstrings, and documenting new features. <br>
 
 ### Deployment Geography for Use: <br>
 Global <br>
@@ -20,23 +20,22 @@ Mitigation: Review and scan skill before deployment. <br>
 
 ## Reference(s): <br>
 - [Google Python Style Guide — Docstrings](https://google.github.io/styleguide/pyguide.html) <br>
-- [NeMo RL Documentation](https://docs.nvidia.com/nemo/rl/latest/index.html) <br>
 
 
 ## Skill Output: <br>
-**Output Type(s):** [Documentation guidance, File update instructions] <br>
+**Output Type(s):** [Configuration instructions, Code] <br>
 **Output Format:** [Markdown] <br>
 **Output Parameters:** [1D] <br>
 **Other Properties Related to Output:** [None] <br>
 
 ## Evaluation Agents Used: <br>
-- `claude-code` <br>
-- `codex` <br>
+- Claude Code (`claude-code`) <br>
+- Codex (`codex`) <br>
 
 
 
 ## Evaluation Tasks: <br>
-5 evaluation tasks (3 positive skill-activation, 2 negative activation); 2 attempts per task; 50% pass threshold. <br>
+Evaluated against 5 evaluation tasks (3 positive, 2 negative) with 2 attempts per task at a 50% pass threshold. <br>
 
 ## Evaluation Metrics Used: <br>
 Reported benchmark dimensions: <br>
@@ -59,14 +58,14 @@ Underlying evaluation signals used in this run: <br>
 ## Evaluation Results: <br>
 | Dimension | Num | `claude-code` | `codex` |
 |---|---:|---:|---:|
-| Security | 8 | 83% (-17%) | 50% (-13%) |
-| Correctness | 8 | 91% (+4%) | 82% (+10%) |
-| Discoverability | 8 | 99% (+13%) | 88% (+4%) |
-| Effectiveness | 8 | 88% (-4%) | 63% (-1%) |
-| Efficiency | 8 | 88% (+17%) | 78% (+5%) |
+| Security | 8 | 93% (-3%) | 50% (-13%) |
+| Correctness | 8 | 90% (+3%) | 84% (+12%) |
+| Discoverability | 8 | 98% (+13%) | 91% (+7%) |
+| Effectiveness | 8 | 86% (-7%) | 67% (+5%) |
+| Efficiency | 8 | 85% (+15%) | 83% (+8%) |
 
 ## Skill Version(s): <br>
-1.5.4 (source: pyproject.toml) <br>
+0d7818673 (source: git SHA, committed 2026-05-28) <br>
 
 ## Ethical Considerations: <br>
 NVIDIA believes Trustworthy AI is a shared responsibility and we have established policies and practices to enable development for a wide array of AI applications. When downloaded or used in accordance with our terms of service, developers should work with their internal team to ensure this skill meets requirements for the relevant industry and use case and addresses unforeseen product misuse. <br>
