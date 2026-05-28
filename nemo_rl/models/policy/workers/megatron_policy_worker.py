@@ -317,6 +317,28 @@ class MegatronPolicyWorkerImpl(
         assert isinstance(self.model, DistributedDataParallel)
         self.model.disable_forward_pre_hook(param_sync=param_sync)
 
+    def _assert_weights_on_device(self, method_name: str) -> None:
+        """Surface a clear error when weights are still offloaded to CPU.
+
+        Without this guard, a follow-up CUDA op against the CPU-resident
+        weights crashes with an opaque "illegal memory access" — see
+        issue #1141.
+        """
+        if getattr(self, "_weights_offloaded", False):
+            prepare_method = (
+                "prepare_for_training()"
+                if method_name == "train"
+                else "prepare_for_lp_inference()"
+            )
+            raise RuntimeError(
+                f"{method_name}() was called while the policy weights are "
+                "offloaded to CPU. This usually means a custom training loop "
+                f"forgot to call {prepare_method} after offload_after_refit(). "
+                "Call the appropriate prepare step before invoking "
+                f"{method_name}(); otherwise the underlying CUDA op will fail "
+                'with "illegal memory access". See issue #1141.'
+            )
+
     @wrap_with_nvtx_name("megatron_policy_worker/train")
     def train(
         self,
@@ -327,6 +349,7 @@ class MegatronPolicyWorkerImpl(
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
+        self._assert_weights_on_device("train")
         # Note: zero_grad_buffer is called at the start of each global batch iteration
         # in the loop below, so we don't need to call it here.
         if hasattr(self.model, "inference_params"):
@@ -545,6 +568,7 @@ class MegatronPolicyWorkerImpl(
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
+        self._assert_weights_on_device("get_logprobs")
         no_grad = torch.no_grad()
         no_grad.__enter__()
         logprob_batch_size = (
@@ -748,6 +772,7 @@ class MegatronPolicyWorkerImpl(
                 - topk_logits: Tensor of top-k logits for each position in the sequence
                 - topk_indices: Tensor of top-k indices for each position in the sequence
         """
+        self._assert_weights_on_device("get_topk_logits")
         no_grad = torch.no_grad()
         no_grad.__enter__()
 
@@ -835,6 +860,7 @@ class MegatronPolicyWorkerImpl(
                 - ``logprobs``: Log probabilities for each token
                 - ``generation_lengths``: Lengths of each response
         """
+        self._assert_weights_on_device("generate")
         # 512 bATCH SIZE (200 tokens)
         no_grad = torch.no_grad()
         no_grad.__enter__()
@@ -1193,6 +1219,11 @@ class MegatronPolicyWorkerImpl(
         )
 
     def prepare_for_lp_inference(self):
+        """Onload weights to GPU and switch the model to eval mode.
+
+        Must be called before ``get_logprobs()`` whenever the worker has been
+        offloaded by ``offload_after_refit()`` (issue #1141).
+        """
         self.model = self.move_model(self.model, "cuda", move_grads=False)
         self.model.eval()
 
@@ -1213,8 +1244,14 @@ class MegatronPolicyWorkerImpl(
 
         gc.collect()
         torch.cuda.empty_cache()
+        self._weights_offloaded = False
 
     def prepare_for_training(self, *args, **kwargs):
+        """Onload weights and optimizer state to GPU and switch to train mode.
+
+        Must be called before ``train()`` whenever the worker has been
+        offloaded by ``offload_after_refit()`` (issue #1141).
+        """
         # onload models and optimizer state to cuda
         self.model = self.move_model(
             self.model, "cuda", move_grads=True, move_params=True
@@ -1233,6 +1270,7 @@ class MegatronPolicyWorkerImpl(
 
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
             torch.cuda.empty_cache()
+        self._weights_offloaded = False
 
     @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
     def offload_before_refit(self):
@@ -1268,7 +1306,14 @@ class MegatronPolicyWorkerImpl(
 
     @wrap_with_nvtx_name("megatron_policy_worker/offload_after_refit")
     def offload_after_refit(self):
-        """Offload as much as possible on the CPU."""
+        """Offload as much as possible on the CPU.
+
+        After this returns, weights live on CPU. Callers must invoke
+        ``prepare_for_training()`` or ``prepare_for_lp_inference()`` before
+        any subsequent ``train()``/``get_logprobs()`` call; otherwise the
+        entry-guard on those methods raises a clear ``RuntimeError``
+        (issue #1141).
+        """
         no_grad = torch.no_grad()
         no_grad.__enter__()
         self.model = self.move_model(self.model, "cpu")
@@ -1282,6 +1327,7 @@ class MegatronPolicyWorkerImpl(
             f"GPU Memory after refit complete: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
         )
         no_grad.__exit__(None, None, None)
+        self._weights_offloaded = True
 
     @torch.no_grad()
     def move_model(
