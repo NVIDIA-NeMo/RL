@@ -55,7 +55,6 @@ from ._rollout_shapes import (  # noqa: E402
     simple_backend_dp_config,
 )
 
-
 # ── producer actor ────────────────────────────────────────────────────────────
 
 
