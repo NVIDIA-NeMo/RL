@@ -796,6 +796,10 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             )
             allowed_new_tokens = max(0, min(self.cfg["max_new_tokens"], remaining_ctx))
 
+            allowed_new_tokens = self._resolve_max_tokens(
+                allowed_new_tokens, sample_idx
+            )
+
             # Handle case where no tokens can be generated due to length constraints
             if allowed_new_tokens == 0:
                 # Access the input data directly from the function parameters
@@ -1015,14 +1019,21 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 [per_prompt_stop_strings] if per_prompt_stop_strings else None
             )
 
+            # Resolve max tokens
+            allowed_new_tokens = max(0, self.cfg["max_new_tokens"])
+            allowed_new_tokens = self._resolve_max_tokens(
+                allowed_new_tokens, prompt_idx
+            )
+
             # Create sampling parameters
             top_k = self.cfg["top_k"] if self.cfg["top_k"] is not None else -1
             sampling_params = self.SamplingParams(
                 temperature=self.cfg["temperature"] if not greedy else 0,
                 top_p=self.cfg["top_p"],
                 top_k=top_k if not greedy else 1,
-                max_tokens=self.cfg["max_new_tokens"],
+                max_tokens=allowed_new_tokens,
                 stop_token_ids=self.cfg["stop_token_ids"],
+                ignore_eos=self.cfg["ignore_eos"],
                 stop=final_stop_strings,
                 include_stop_str_in_output=True,  # returning stop strings like hf
             )

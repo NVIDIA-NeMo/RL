@@ -707,6 +707,49 @@ def nemo_gym_data_processor(
     return output
 
 
+def random_input_len_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer: TokenizerType,
+    max_seq_length: int | None,
+    idx: int,
+) -> DatumSpec:
+    """Process a datum dictionary (directly loaded from dataset) into a DatumSpec for random input length."""
+    input_len_generator = task_data_spec.input_len_generator
+    if input_len_generator is None:
+        raise ValueError(
+            "input_len_generator must be provided if you are using random_input_len_processor"
+        )
+
+    input_len = input_len_generator(idx)
+    assert input_len is not None, (
+        "input_len_or_input_distribution must be provided when data.dataset_name == 'random'"
+    )
+    if max_seq_length is not None:
+        assert input_len <= max_seq_length
+
+    vocab_size = getattr(tokenizer, "vocab_size", None)
+    if vocab_size is None:
+        raise ValueError("tokenizer.vocab_size must be available for random data")
+
+    message_log: LLMMessageLogType = []
+    user_message = {
+        "role": "user",
+        "content": "Synthetic random input data",
+        "token_ids": torch.randint(0, vocab_size, (input_len,)),
+    }
+    message_log.append(user_message)
+    output: DatumSpec = {
+        "message_log": message_log,
+        "length": input_len,
+        "loss_multiplier": 1.0,
+        "idx": idx,
+        "extra_env_info": {},
+        "task_name": "random",
+    }
+    return output
+
+
 # Processor registry. Key is the processor name, value is the processor function.
 # Note: We cast the literal dict to Dict[str, TaskDataProcessFnCallable] because
 # type checkers see each concrete function's signature as a distinct callable type.
@@ -724,6 +767,7 @@ PROCESSOR_REGISTRY: Dict[str, TaskDataProcessFnCallable] = cast(
         "sft_processor": sft_processor,
         "vlm_hf_data_processor": vlm_hf_data_processor,
         "nemo_gym_data_processor": nemo_gym_data_processor,
+        "random_input_len_processor": random_input_len_processor,
     },
 )
 

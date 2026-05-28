@@ -40,6 +40,7 @@ large_model_vllm_config: VllmConfig = {
     "top_k": None,
     "stop_token_ids": None,
     "stop_strings": None,
+    "ignore_eos": False,
     "vllm_cfg": {
         "precision": "bfloat16",
         "tensor_parallel_size": 8,

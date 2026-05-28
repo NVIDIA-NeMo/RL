@@ -15,6 +15,7 @@
 import asyncio
 import json
 import os
+import time
 from collections import Counter
 from itertools import combinations
 from typing import NotRequired, TypedDict
@@ -26,7 +27,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.utils import set_seed
-from nemo_rl.data import EvalDataConfigType
+from nemo_rl.data import EvalDataConfigType, RandomEvalDataConfig
 from nemo_rl.data.collate_fn import eval_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.llm_message_utils import get_keys_from_message_log
@@ -61,7 +62,7 @@ class MasterConfig(BaseModel, extra="allow"):
     eval: EvalConfig
     generation: GenerationConfig  # Fixed: was 'generate'
     tokenizer: TokenizerConfig  # Added missing tokenizer key
-    data: EvalDataConfigType
+    data: EvalDataConfigType | RandomEvalDataConfig
     env: _PassThroughEnvConfig
     cluster: ClusterConfig
 
@@ -320,6 +321,7 @@ async def _run_env_eval_impl(
     # Run evaluation loop
     score = 0.0
     for batch in dataloader:
+        start_time = time.time()
         # measure multiple samples
         if num_tests_per_prompt > 1:
             batch = batch.repeat_interleave(num_tests_per_prompt)
@@ -411,7 +413,8 @@ async def _run_env_eval_impl(
             )
         else:
             raise ValueError(f"Invalid metric: {metric}")
-
+        step_time = time.time() - start_time
+        print(f"Step time: {step_time:.2f}s")
     # Cleanup before printing results
     ray.get(env.shutdown.remote())
     vllm_generation.shutdown()

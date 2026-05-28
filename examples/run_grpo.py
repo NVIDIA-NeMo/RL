@@ -17,10 +17,11 @@ import os
 import pprint
 
 from omegaconf import OmegaConf
+from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup
 from nemo_rl.algorithms.utils import get_tokenizer
-from nemo_rl.data.utils import setup_response_data
+from nemo_rl.data.utils import setup_random_data, setup_response_data
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import (
@@ -29,6 +30,8 @@ from nemo_rl.utils.config import (
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.logger import get_next_experiment_dir
+
+TokenizerType = PreTrainedTokenizerBase
 
 
 def _select_trainer(master_config: MasterConfig):
@@ -108,13 +111,21 @@ def main() -> None:
         has_refit_draft_weights=has_refit_draft_weights,
     )
 
-    # setup data
-    (
-        dataset,
-        val_dataset,
-        task_to_env,
-        val_task_to_env,
-    ) = setup_response_data(tokenizer, config.data, config.env)
+    # setup data — branch on synthetic random-data path for benchmarking
+    if config.data.get("dataset_name") == "random":
+        (
+            dataset,
+            val_dataset,
+            task_to_env,
+            val_task_to_env,
+        ) = setup_random_data(tokenizer, config.data)
+    else:
+        (
+            dataset,
+            val_dataset,
+            task_to_env,
+            val_task_to_env,
+        ) = setup_response_data(tokenizer, config.data, config.env)
 
     # Pick the policy factory at the launcher level so the legacy trainer
     # stays data-plane-agnostic (architectural invariant — see

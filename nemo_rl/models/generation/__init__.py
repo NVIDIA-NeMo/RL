@@ -69,4 +69,8 @@ def configure_generation_config(
             else:
                 config["vllm_cfg"]["skip_tokenizer_init"] = True
 
+        # set stop_token_ids to empty list if ignore_eos is True
+        if config["ignore_eos"]:
+            config["stop_token_ids"] = []
+
     return config

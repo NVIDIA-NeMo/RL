@@ -22,13 +22,21 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from omegaconf import OmegaConf
 
 from nemo_rl.algorithms.utils import get_tokenizer
-from nemo_rl.data.datasets import AllTaskProcessedDataset, load_eval_dataset
+from nemo_rl.data.datasets import (
+    AllTaskProcessedDataset,
+    load_eval_dataset,
+)
 from nemo_rl.data.datasets.eval_datasets import _is_multimodal_dataset
+from nemo_rl.data.utils import setup_random_data
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.utils import create_env
 from nemo_rl.evals.eval import MasterConfig, run_env_eval, setup
 from nemo_rl.models.generation import configure_generation_config
-from nemo_rl.utils.config import load_config
+from nemo_rl.utils.config import (
+    load_config,
+    parse_hydra_overrides,
+    register_omegaconf_resolvers,
+)
 
 
 def parse_args():
@@ -39,10 +47,7 @@ def parse_args():
     )
 
     # Parse known args for the script
-    args, remaining = parser.parse_known_args()
-
-    # Convert remaining args to OmegaConf format
-    overrides = OmegaConf.from_dotlist(remaining)
+    args, overrides = parser.parse_known_args()
 
     return args, overrides
 
@@ -75,6 +80,7 @@ def setup_data(tokenizer, data_config, env_configs):
 def main():
     """Main entry point."""
     # Parse arguments
+    register_omegaconf_resolvers()
     args, overrides = parse_args()
 
     if not args.config:
@@ -86,9 +92,8 @@ def main():
     print(f"Loaded configuration from: {args.config}")
 
     if overrides:
-        override_conf = OmegaConf.from_cli()
-        print(f"Overrides: {override_conf}")
-        config = OmegaConf.merge(config, override_conf)
+        print(f"Overrides: {overrides}")
+        config = parse_hydra_overrides(config, overrides)
 
     config = OmegaConf.to_container(config, resolve=True)
     config = MasterConfig(**config)
@@ -101,6 +106,8 @@ def main():
     # Init ray
     init_ray()
 
+    is_random_dataset = config.data.get("dataset_name") == "random"
+
     # Setup tokenizer — get_tokenizer handles both text-only and multimodal
     is_multimodal = _is_multimodal_dataset(config.data["dataset_name"])
     tokenizer = get_tokenizer(config.tokenizer, get_processor=is_multimodal)
@@ -108,12 +115,22 @@ def main():
         config.generation, tokenizer, is_eval=True
     )
 
+    # configure_generation_config sets load_format to 'auto' based on is_eval.
+    # But for the random dataset case, we don't need real model weights — vLLM can use dummy
+    # weights since outputs are not validated against any ground truth.
+    if is_random_dataset:
+        config.generation["vllm_cfg"]["load_format"] = "dummy"
+
     # Setup data
-    (
-        dataset,
-        env,
-        tokenizer,
-    ) = setup_data(tokenizer, config.data, config.env)
+    if is_random_dataset:
+        (dataset, _, task_to_env, _) = setup_random_data(tokenizer, config.data)
+        env = task_to_env["random"]
+    else:
+        (
+            dataset,
+            env,
+            tokenizer,
+        ) = setup_data(tokenizer, config.data, config.env)
 
     # Setup
     (

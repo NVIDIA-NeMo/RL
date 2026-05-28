@@ -145,6 +145,17 @@ class BaseVllmGenerationWorker:
         self.fraction_of_gpus = fraction_of_gpus
         self.is_model_owner = bundle_indices is not None
 
+        from nemo_rl.utils.sequence_length_generator import (
+            get_sequence_length_generator,
+        )
+
+        output_len_or_output_distribution = self.cfg.get(
+            "output_len_or_output_distribution", None
+        )
+        self.output_len_generator = get_sequence_length_generator(
+            output_len_or_output_distribution
+        )
+
         # Store the Python executable being used by this worker
         self.py_executable = sys.executable
 
@@ -596,6 +607,38 @@ class BaseVllmGenerationWorker:
 
         return list(stop_set) if stop_set else None
 
+    def _resolve_max_tokens(
+        self, max_new_tokens: Optional[int] = None, sample_idx: int | None = None
+    ) -> int:
+        """Resolve the maximum number of tokens to generate.
+
+        When max_new_tokens is provided, max_new_tokens is used as the maximum number of tokens to generate.
+        Otherwise, the output_len_generator is used as the maximum number of tokens to generate.
+        In the latter case, it is only used in benchmarking scenarios when we want to fix the output length.
+
+        Args:
+            max_new_tokens: The maximum number of tokens to generate.
+            sample_idx: The index of the sample.
+
+        Returns:
+            The maximum number of tokens to generate.
+        """
+        max_tokens = (
+            max_new_tokens if max_new_tokens is not None else self.cfg["max_new_tokens"]
+        )
+        output_len = self.output_len_generator(sample_idx)
+        if output_len is None:
+            return max_tokens
+        if output_len > max_tokens:
+            print(
+                f"the output length derived by output_len_generator={output_len}, which is greater than max_new_tokens={max_tokens}. max_new_tokens overrides output_len_generator."
+            )
+        elif output_len < max_tokens:
+            print(
+                f"the output length derived by output_len_generator={output_len}, which is less than max_new_tokens={max_tokens}. output_len_generator overrides max_new_tokens."
+            )
+        return min(max_tokens, output_len)
+
     def _build_sampling_params(
         self,
         *,
@@ -609,7 +652,7 @@ class BaseVllmGenerationWorker:
         temperature = 0.0 if greedy else self.cfg["temperature"]
 
         max_tokens = (
-            max_new_tokens if max_new_tokens is not None else self.cfg["max_new_tokens"]
+            max_new_tokens if max_new_tokens is not None else self._resolve_max_tokens()
         )
 
         return self.SamplingParams(
@@ -619,6 +662,7 @@ class BaseVllmGenerationWorker:
             max_tokens=max_tokens,
             logprobs=0,
             stop_token_ids=self.cfg["stop_token_ids"],
+            ignore_eos=self.cfg["ignore_eos"],
             stop=stop_strings,
             include_stop_str_in_output=True,
         )
@@ -871,8 +915,9 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             temperature=self.cfg["temperature"] if not greedy else 0,
             top_p=self.cfg["top_p"],
             top_k=top_k if not greedy else 1,
-            max_tokens=self.cfg["max_new_tokens"],
+            max_tokens=self._resolve_max_tokens(),
             stop_token_ids=self.cfg["stop_token_ids"],
+            ignore_eos=self.cfg["ignore_eos"],
             stop=stop_strings,
             include_stop_str_in_output=True,  # returning stop strings like hf
         )

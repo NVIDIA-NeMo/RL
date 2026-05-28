@@ -13,7 +13,7 @@
 # limitations under the License.
 import os
 from dataclasses import dataclass
-from typing import Any, NotRequired, Optional, Protocol, TypedDict, Union
+from typing import Any, Callable, NotRequired, Optional, Protocol, TypedDict, Union
 
 import torch
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -59,6 +59,8 @@ class TaskDataSpec:
     prompt_file: Optional[PathLike] = None
 
     system_prompt_file: Optional[PathLike] = None
+
+    input_len_generator: Optional[Callable[[int | None], int | None]] = None
 
     def __post_init__(self) -> None:
         def load_prompt_file(

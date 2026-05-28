@@ -25,6 +25,7 @@ policy:
       lr: 5.0e-07
   generation:
     max_new_tokens: 1024
+    ignore_eos: false
     vllm_cfg:
       skip_tokenizer_init: false
     vllm_kwargs:

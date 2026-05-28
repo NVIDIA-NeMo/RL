@@ -62,6 +62,7 @@ basic_vllm_test_config: VllmConfig = {
     "top_k": None,
     "stop_token_ids": None,
     "stop_strings": None,
+    "ignore_eos": False,
     "vllm_cfg": {
         "precision": "bfloat16",
         "tensor_parallel_size": 1,
@@ -84,6 +85,32 @@ basic_vllm_test_config: VllmConfig = {
     },
     "vllm_kwargs": {},
 }
+
+
+def test_base_vllm_worker_converts_output_len_generator_dict():
+    from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
+
+    config = deepcopy(basic_vllm_test_config)
+    config["output_len_or_output_distribution"] = {"mean": 3, "std": 0}
+
+    worker = BaseVllmGenerationWorker(config=config, bundle_indices=None)
+
+    output_len_generator = worker.output_len_generator
+    assert callable(output_len_generator)
+    assert output_len_generator(0) == 3
+
+
+def test_base_vllm_worker_rejects_invalid_output_len_generator():
+    from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
+
+    config = deepcopy(basic_vllm_test_config)
+    config["output_len_or_output_distribution"] = "bad"
+
+    with pytest.raises(
+        ValueError, match="Invalid constant_length_or_length_distribution: bad"
+    ):
+        BaseVllmGenerationWorker(config=config, bundle_indices=None)
+
 
 basic_dtensor_test_config: PolicyConfig = {
     "model_name": basic_vllm_test_config["model_name"],
@@ -268,6 +295,15 @@ def test_configure_generation_config_keeps_dummy_startup_weights_with_draft_refi
     )
 
     assert configured["vllm_cfg"]["load_format"] == "dummy"
+
+
+def test_configure_generation_config_sets_stop_token_ids_to_empty_list_if_ignore_eos_is_true():
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["ignore_eos"] = True
+    tokenizer = MagicMock(pad_token_id=0, eos_token_id=1)
+
+    configured = configure_generation_config(vllm_config, tokenizer)
+    assert configured["stop_token_ids"] == []
 
 
 def get_basic_megatron_test_config(
