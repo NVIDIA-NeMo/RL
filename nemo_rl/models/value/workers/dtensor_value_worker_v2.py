@@ -268,7 +268,11 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
             config=config,
             tokenizer=tokenizer,
             runtime_config=runtime_config,
-            distributed_manager=distributed_manager,
+            # NOTE(ppo-dtensor port): this fork's setup_model_and_optimizer
+            # kwarg is `distributed_context` (was `distributed_manager` in
+            # upstream bg51717/ppo). Pre-fix: TypeError: setup_model_and_optimizer
+            # () got an unexpected keyword argument 'distributed_manager'.
+            distributed_context=distributed_manager,
             checkpoint_manager=self.checkpoint_manager,
             is_vlm=False,  # Value models don't use vision
             init_optimizer=init_optimizer,
@@ -277,10 +281,17 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
             # optimizer_module_filter=["score."],
         )
 
-        # Set instance attributes from model and optimizer state
+        # Set instance attributes from model and optimizer state.
+        # NOTE(ppo-dtensor port): bg51717/ppo unpacked an extra
+        # `self.model_state_dict_keys` slot, but this fork's
+        # ModelAndOptimizerState NamedTuple (nemo_rl/models/automodel/config.py)
+        # only has 10 fields and does not include model_state_dict_keys.
+        # Without this fix:
+        #   ValueError: not enough values to unpack (expected 11, got 10)
+        # would fire here. Nothing else in this file reads
+        # self.model_state_dict_keys.
         (
             self.model,
-            self.model_state_dict_keys,
             self.optimizer,
             self.scheduler,
             self.is_hf_model,
@@ -292,7 +303,15 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
             self.autocast_enabled,
         ) = model_and_optimizer_state
 
-        # Set instance attributes from runtime config
+        # Set instance attributes from runtime config.
+        # NOTE(ppo-dtensor port): bg51717/ppo skipped the `sampling_params`
+        # slot here, but RuntimeConfig in this fork
+        # (nemo_rl/models/automodel/config.py) has 13 fields including
+        # sampling_params right before is_reward_model. Without this fix:
+        #   ValueError: too many values to unpack (expected 12)
+        # would fire. bg51717 also stripped all references to
+        # self.sampling_params from train()/get_values(), so we discard the
+        # value into `_runtime_sampling_params` rather than assigning it.
         (
             self.model_class,
             self.model_config,
@@ -305,6 +324,7 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
             self.cpu_offload,
             self.offload_optimizer_for_logprob,
             self.is_generation_colocated,
+            _runtime_sampling_params,  # bg51717 stripped this slot
             _runtime_is_reward_model,
         ) = runtime_config
 
