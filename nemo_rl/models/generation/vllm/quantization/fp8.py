@@ -475,7 +475,7 @@ def maybe_post_process_fp8_weight_block(layer: torch.nn.Module):
     # requantize the weight and input to the specific scale
     # at the same time.
     should_use_deepgemm = should_use_deepgemm_for_fp8_linear(
-        layer.orig_dtype, layer.weight
+        layer.orig_dtype, layer.weight.shape
     )
     if should_use_deepgemm:
         dg_weight, dg_weight_scale = deepgemm_post_process_fp8_weight_block(
