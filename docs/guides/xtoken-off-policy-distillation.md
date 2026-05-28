@@ -50,7 +50,7 @@ single `.pt` file. The final step is the actual distillation training loop.
 
 The projection matrix is a sparse `[V_student, top_k]` tensor that the
 training-time loss multiplies against the student logits to project them into
-the teacher's vocab space (or vice versa, depending on the loss mode).
+the teacher's vocab space.
 
 ### Which prep steps are essential?
 
@@ -90,8 +90,6 @@ weight thresholds, hand-picked intermediate filenames, etc.).
   for cross-tokenizer distillation.
 - **Teacher logits travel via CUDA IPC**, so student and teacher policies must
   be colocated on the same node. No remote-Ray transport for x-token logits.
-- The corpus must be served via the `arrow_text` dataset (no chat template,
-  loss on every token — see `examples/configs/xtoken_off_policy_distillation.yaml`).
 
 ## Step 1 — Build multi-token mappings
 
