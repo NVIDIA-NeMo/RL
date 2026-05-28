@@ -3,9 +3,10 @@
 NeMo RL supports off-policy distillation between a student and a teacher that
 **do not share a tokenizer** — for example, distilling a Qwen3-4B teacher into
 a Llama-3.2-1B student. Cross-tokenizer ("x-token") distillation handles the
-vocabulary mismatch by routing teacher logits through a precomputed
+vocabulary mismatch by routing student logits through a precomputed
 **projection matrix** that maps each student token to the teacher tokens it
-most plausibly corresponds to.
+most plausibly corresponds to, projecting the student into the teacher's
+vocab space so the two distributions can be compared.
 
 This guide explains how to:
 
