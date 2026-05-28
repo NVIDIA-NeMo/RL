@@ -73,6 +73,7 @@ if python -c "import sglang" 2>/dev/null; then
     run_test      uv run --no-sync bash ./tests/functional/grpo_sglang.sh
 fi
 run_test fast uv run --no-sync bash ./tests/functional/grpo_topp_topk.sh
+run_test fast uv run --no-sync bash ./tests/functional/online_dpo.sh
 run_test      uv run --no-sync bash ./tests/functional/prorlv2.sh
 run_test      uv run --no-sync bash ./tests/functional/qa_distillation_megatron.sh
 run_test      uv run --no-sync bash ./tests/functional/rm.sh

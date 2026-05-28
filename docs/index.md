@@ -62,7 +62,7 @@ Learn about DTensor and Megatron Core training backends, their capabilities, and
 :link: about/algorithms/index
 :link-type: doc
 
-Discover supported algorithms including GRPO, SFT, DPO, RM, and on-policy distillation with detailed guides and examples.
+Discover supported algorithms including GRPO, SFT, DPO, Online DPO, RM, and on-policy distillation with detailed guides and examples.
 :::
 
 :::{grid-item-card} {octicon}`graph` Evaluation
@@ -236,6 +236,7 @@ guides/nemotron-3-nano.md
 adding-new-models.md
 guides/sft.md
 guides/dpo.md
+guides/online-dpo.md
 guides/dapo.md
 guides/prorlv2.md
 guides/grpo.md
