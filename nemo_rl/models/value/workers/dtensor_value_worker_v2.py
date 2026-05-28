@@ -432,9 +432,12 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
                 )
 
                 # Use automodel_forward_backward for the training loop
+                # NOTE(ppo-dtensor port): this fork's automodel_forward_backward
+                # no longer accepts a cfg kwarg (it was removed in PR #2027).
+                # Pre-fix: TypeError: automodel_forward_backward() got an
+                # unexpected keyword argument 'cfg'.
                 mb_results = automodel_forward_backward(
                     model=self.model,
-                    cfg=self.cfg,
                     data_iterator=processed_iterator,
                     post_processing_fn=loss_post_processor,
                     forward_only=eval_mode,
@@ -556,9 +559,10 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
                     autocast_enabled=self.autocast_enabled,
                 ):
                     # Use forward_with_post_processing_fn for forward pass
+                    # NOTE(ppo-dtensor port): same cfg-kwarg removal as the train()
+                    # automodel_forward_backward call above (PR #2027).
                     values, _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
-                        cfg=self.cfg,
                         post_processing_fn=value_post_processor,
                         processed_mb=processed_mb,
                         is_reward_model=True,  # Value models use reward model architecture
