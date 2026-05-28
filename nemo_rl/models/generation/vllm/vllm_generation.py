@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import logging
 import os
 import warnings
 from collections import defaultdict
@@ -29,7 +30,7 @@ from ray.util.placement_group import PlacementGroup
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SlicedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
-from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.distributed.virtual_cluster import NVLINK_DOMAIN_UNKNOWN, RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
@@ -43,8 +44,39 @@ from nemo_rl.models.generation.vllm.utils import (
     resolve_generation_worker_cls,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class VllmGeneration(GenerationInterface):
+    @staticmethod
+    def init_cluster_placement_groups(
+        cluster: RayVirtualCluster,
+        config: VllmConfig,
+    ) -> None:
+        """Pre-initialize placement groups matching the strategy VllmGeneration expects.
+
+        Call this *before* constructing ``VllmGeneration`` when other components
+        compete for the same Ray resources and you need deterministic ordering —
+        topology-constrained inference PGs should be created before unconstrained
+        ones so they claim domain-aligned nodes first.
+
+        ``VllmGeneration.__init__`` calls ``_init_placement_groups`` internally,
+        but that call early-returns when PGs already exist, so calling this
+        method first is safe.
+        """
+        tp = config["vllm_cfg"]["tensor_parallel_size"]
+        pp = config["vllm_cfg"]["pipeline_parallel_size"]
+        model_parallel_size = tp * pp
+        colocated = config["colocated"]["enabled"]
+
+        strategy = None if colocated else "PACK"
+        needs_cross_node = model_parallel_size > cluster.num_gpus_per_node
+
+        cluster._init_placement_groups(
+            strategy=strategy,
+            use_unified_pg=needs_cross_node,
+        )
+
     def __init__(
         self,
         cluster: RayVirtualCluster,
@@ -255,53 +287,109 @@ class VllmGeneration(GenerationInterface):
                 return dict(node_bundles)
 
             def allocate_worker_groups(
-                pg: PlacementGroup, tp_size: int, pp_size: int
+                pg: PlacementGroup,
+                tp_size: int,
+                pp_size: int,
+                sorted_bundle_indices: list[int] | None = None,
+                nvlink_domain_per_bundle_index: tuple[str, ...] | None = None,
             ) -> list[tuple[int, list[int]]]:
-                # Allocate worker groups for TP and PP training, assuming all nodes have identical bundle counts.
+                """Partition a unified PG's bundles into model-parallel worker groups.
 
-                # Retrieve both bundle mapping and per-node bundles
+                Slices the flat bundle list into consecutive chunks of ``tp_size * pp_size``
+                bundles. Each chunk becomes one DP replica (one vLLM engine instance).
+
+                Args:
+                    pg: The single unified placement group containing all inference bundles.
+                    tp_size: Tensor-parallel degree.
+                    pp_size: Pipeline-parallel degree.
+                    sorted_bundle_indices: Topology-sorted bundle order from
+                        ``RayVirtualCluster._sorted_bundle_indices``. When provided, bundles
+                        are ordered by (NVLink domain, topo_rank, gpu_id) so consecutive
+                        slices of TP*PP stay within the same NVLink domain (when the domain
+                        GPU count is divisible by TP*PP). When None, bundles are sorted by
+                        (node_id, bundle_idx) as a deterministic fallback.
+                    nvlink_domain_per_bundle_index: Per-bundle NVLink domain from
+                        ``RayVirtualCluster._nvlink_domain_per_bundle_index``. Used only
+                        for logging a warning when a worker group straddles multiple
+                        NVLink domains.
+
+                Returns:
+                    List of (node_idx, bundle_indices) tuples — one per DP replica.
+                    ``node_idx`` is the index of the first bundle's physical node within the
+                    PG's sorted unique node set.
+                """
                 pg_table = ray.util.placement_group_table(pg)
                 bundle_to_node = pg_table["bundles_to_node_id"]
-                node_bundles = get_node_bundles(pg)
 
-                if not node_bundles:
-                    raise ValueError("Placement group contains no bundles")
-
-                # Ensure all nodes have the same number of bundles
-                counts = [len(b) for b in node_bundles.values()]
-                assert len(set(counts)) == 1, (
-                    "All nodes must have identical bundle counts"
-                )
-
-                total = sum(counts)
                 model_parallel_size = tp_size * pp_size
-                num_groups = total // model_parallel_size
+
+                if sorted_bundle_indices is not None:
+                    # Topology-aware: bundles sorted by (domain, topo_rank, gpu_id).
+                    # Each model-parallel group is a consecutive slice of that list; it
+                    # stays within one NVLink domain only when TP*PP divides the usable
+                    # GPU count per domain in this ordering (see topology logs).
+                    flat = list(sorted_bundle_indices)
+                else:
+                    # Fallback: sort by node ID for deterministic ordering.
+                    node_bundles = get_node_bundles(pg)
+                    if not node_bundles:
+                        raise ValueError("Placement group contains no bundles")
+                    counts = [len(b) for b in node_bundles.values()]
+                    assert len(set(counts)) == 1, (
+                        "All nodes must have identical bundle counts"
+                    )
+                    sorted_nodes = sorted(node_bundles)
+                    flat = []
+                    for nid in sorted_nodes:
+                        flat.extend(node_bundles[nid])
+
+                num_groups = len(flat) // model_parallel_size
                 if num_groups == 0:
                     raise ValueError(
                         "Unable to allocate any worker groups with the available resources."
                     )
 
-                # Create reproducible node indices
-                sorted_nodes = sorted(node_bundles)
-                node_idx = {nid: idx for idx, nid in enumerate(sorted_nodes)}
+                unique_nodes = sorted(set(bundle_to_node.values()))
+                node_idx = {nid: idx for idx, nid in enumerate(unique_nodes)}
 
-                # Flatten bundles in node order
-                flat: list[int] = []
-                for nid in sorted_nodes:
-                    flat.extend(node_bundles[nid])
-
-                # Slice into groups and assign logical index
                 groups: list[tuple[int, list[int]]] = []
                 for i in range(num_groups):
                     slice_ = flat[
                         i * model_parallel_size : (i + 1) * model_parallel_size
                     ]
+                    if (
+                        nvlink_domain_per_bundle_index is not None
+                        and sorted_bundle_indices is not None
+                    ):
+                        domains: set[str] = set()
+                        for bidx in slice_:
+                            if 0 <= bidx < len(nvlink_domain_per_bundle_index):
+                                d = nvlink_domain_per_bundle_index[bidx]
+                                if d != NVLINK_DOMAIN_UNKNOWN:
+                                    domains.add(d)
+                        if len(domains) > 1:
+                            logger.warning(
+                                "[TOPOLOGY] Model-parallel group %s (TP*PP=%s) spans %s NVLink "
+                                "domains %s; cross-domain collectives may use slower links (e.g. "
+                                "IB). Prefer TP*PP that divides usable GPUs per domain, or adjust "
+                                "segment/domain allocation.",
+                                i,
+                                model_parallel_size,
+                                len(domains),
+                                sorted(domains),
+                            )
                     first_node = bundle_to_node[slice_[0]]
                     groups.append((node_idx[first_node], slice_))
 
                 return groups
 
-            tied_groups = allocate_worker_groups(unified_pg, tp_size, pp_size)
+            tied_groups = allocate_worker_groups(
+                unified_pg,
+                tp_size,
+                pp_size,
+                sorted_bundle_indices=cluster._sorted_bundle_indices,
+                nvlink_domain_per_bundle_index=cluster._nvlink_domain_per_bundle_index,
+            )
         else:
             tied_groups = []
             # For per-node PGs, each PG represents a node
