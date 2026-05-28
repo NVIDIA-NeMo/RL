@@ -73,29 +73,52 @@ _TQ_CLIENT_CONFIG = {
 
 
 @ray.remote  # pragma: no cover
-class _ProducerActor:
-    """Stand-in for ``AsyncTrajectoryCollector`` — writes rollout batches to TQ.
+class _TQBackedAsyncCollector:
+    """Stand-in for a not-yet-built TQ-backed async rollout actor.
 
-    Uses the same write path as ``SyncRolloutActor``: a ``DataPlaneClient``
-    built via ``build_data_plane_client`` (which attaches to the existing
-    TQ controller in the Ray worker process), then a single flat
-    ``kv_first_write`` per produce call. Each call stamps one
-    ``weight_version`` so the driver's filter has something to discriminate
-    on.
+    The production codebase has these pieces SEPARATELY but not fused:
+
+    * ``AsyncTrajectoryCollector`` (``async_utils/trajectory_collector.py``)
+      — the async rollout loop with weight-version tracking + pause/refit
+      semantics. Today writes to an in-memory ``ReplayBuffer``, not TQ.
+    * ``SyncRolloutActor`` (``experience/sync_rollout_actor.py``) — the TQ
+      write path (``kv_first_write`` into a ``DataPlaneClient``). Today
+      only used by sync GRPO.
+
+    A real async-RL deployment that uses TQ as the rollout buffer would
+    fuse these two: the async loop's weight-version state + sync's TQ
+    write path. This class pretends that fusion exists so the integration
+    test can pin its shape today.
+
+    API surface (subset):
+
+    * ``set_weight_version(v)`` — mirrors ``AsyncTrajectoryCollector``.
+    * ``rollout_to_tq(partition_id, sample_ids)`` — mirrors
+      ``SyncRolloutActor.rollout_to_tq``: one Ray RPC, single flat
+      ``kv_first_write`` of every tensor field, returns the sample_ids
+      that landed. Rollout content itself is mocked via
+      ``make_rollout_batch`` / ``make_multi_turn_message_log`` — the
+      test exercises the wire shape, not real generation.
     """
 
     def __init__(self) -> None:
         # Attach to the existing TQ controller (driver bootstrapped it).
         # Same dp_client surface SyncRolloutActor's workers hold.
         self._dp_client = build_data_plane_client(_TQ_CLIENT_CONFIG)
+        self.current_weight_version: int = 0
 
-    def produce(
+    def set_weight_version(self, version: int) -> None:
+        """Mirrors ``AsyncTrajectoryCollector.set_weight_version``."""
+        self.current_weight_version = int(version)
+
+    def rollout_to_tq(
         self,
         partition_id: str,
         sample_ids: list[str],
-        weight_version: int,
+        *,
         max_seqlen: int = 16,
     ) -> list[str]:
+        """Mocked rollout + flat TQ write, mirroring ``SyncRolloutActor.rollout_to_tq``."""
         n = len(sample_ids)
         bulk = make_rollout_batch(n=n, max_seqlen=max_seqlen)
         # Add ``content`` as np.ndarray(object) of per-row message_logs —
@@ -108,7 +131,7 @@ class _ProducerActor:
         bulk["content"] = content
         tags = make_realistic_tags(n=n)
         for i, t in enumerate(tags):
-            t["weight_version"] = weight_version
+            t["weight_version"] = self.current_weight_version
             t["input_lengths"] = int(bulk["input_lengths"][i])
         # Same write helper SyncRolloutActor uses (column_io.py:123) —
         # single flat put_samples of every tensor field, jagged-packed.
@@ -158,15 +181,17 @@ def test_async_rl_filter_with_producer_actor(dp_client) -> None:
     register_train_partition(dp_client, num_samples=n, partition_id=pid)
 
     # ── Pipeline (no asserts) ────────────────────────────────────────────────
-    producer = _ProducerActor.remote()
-    ray.get(
-        [
-            producer.produce.remote(pid, keys_stale, weight_version=1),
-            producer.produce.remote(
-                pid, keys_fresh, weight_version=current_weight_version
-            ),
-        ]
-    )
+    # Producer mimics a future TQ-backed async rollout actor: stateful
+    # current_weight_version, single-RPC rollout_to_tq per pass. Ray
+    # serializes actor methods so the four calls below execute in
+    # submission order on the actor's main thread.
+    producer = _TQBackedAsyncCollector.remote()
+    producer.set_weight_version.remote(1)
+    stale_done = producer.rollout_to_tq.remote(pid, keys_stale)
+    producer.set_weight_version.remote(current_weight_version)
+    fresh_done = producer.rollout_to_tq.remote(pid, keys_fresh)
+    ray.get([stale_done, fresh_done])
+
     sample_meta = dp_client.claim_meta(
         partition_id=pid,
         task_name="train",
