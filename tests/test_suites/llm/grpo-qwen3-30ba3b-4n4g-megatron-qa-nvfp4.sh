@@ -67,16 +67,25 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 # logprob-consistency benchmark. The matching BF16 Qwen3 one-step control can
 # also produce very large token_mult_prob_error from a single long outlier, so
 # the multi-step Qwen3 performance tests keep ownership of that metric.
-grep -q "VllmQuantGenerationWorker.*TensorQuantizers found in model" "$RUN_LOG"
-grep -q "MegatronQuantPolicyWorker.*TensorQuantizers found in model" "$RUN_LOG"
+grep -q "VllmQuantGenerationWorker.*720 TensorQuantizers found in model" "$RUN_LOG"
+grep -q "MegatronQuantPolicyWorker.*2739 TensorQuantizers found in model" "$RUN_LOG"
 
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
-        'data["train/loss"]["1"] > 0' \
-        'data["train/loss"]["1"] < 10' \
+        'data["train/loss"]["1"] > 0.02' \
+        'data["train/loss"]["1"] < 0.10' \
         'data["train/num_valid_samples"]["1"] == 16' \
-        'data["train/mean_gen_tokens_per_sample"]["1"] > 0' \
-        'data["train/probs_ratio"]["1"] > 0.9' \
-        'data["train/probs_ratio"]["1"] < 1.1'
+        'data["train/global_valid_seqs"]["1"] == 16' \
+        'data["train/global_valid_toks"]["1"] > 30000' \
+        'data["train/mean_gen_tokens_per_sample"]["1"] > 2000' \
+        'data["train/mean_gen_tokens_per_sample"]["1"] < 4096' \
+        'data["train/reward"]["1"] > 0.2' \
+        'data["train/reward"]["1"] < 0.6' \
+        'data["train/gen_kl_error"]["1"] > 0.05' \
+        'data["train/gen_kl_error"]["1"] < 1.0' \
+        'data["train/probs_ratio"]["1"] > 0.99' \
+        'data["train/probs_ratio"]["1"] < 1.01' \
+        'data["train/sampling_importance_ratio"]["1"] > 0.95' \
+        'data["train/sampling_importance_ratio"]["1"] < 1.02'
 fi
