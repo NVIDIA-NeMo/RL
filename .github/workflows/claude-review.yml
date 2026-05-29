@@ -13,7 +13,7 @@ permissions:
 jobs:
   claude-review:
     if: github.event.issue.pull_request != null && contains(fromJson('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_claude_review.yml@v0.79.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_claude_review.yml@v0.88.0
     with:
       prompt: |
         Mandatory workflow — never skip or reorder:
