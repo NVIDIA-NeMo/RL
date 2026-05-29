@@ -239,6 +239,7 @@ guides/rm.md
 guides/environments.md
 guides/eval.md
 guides/deepseek.md
+guides/deepseek-v4.md
 model-quirks.md
 guides/async-grpo.md
 guides/eagle3-speculative-decoding.md
