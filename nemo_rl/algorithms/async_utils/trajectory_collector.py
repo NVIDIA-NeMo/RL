@@ -123,6 +123,9 @@ class AsyncTrajectoryCollector:
         """Get the next target weight that needs generation (if any)."""
         target_weights = self._calculate_target_weights(generation_weight_version)
         num_prompts = int(self.master_config.grpo["num_prompts_per_step"])
+        max_age_steps = int(
+            self.master_config.grpo["async_grpo"]["max_trajectory_age_steps"]
+        )
         last_target_weight_already_generated = ray.get(
             self.replay_buffer.get_last_target_weight_already_generated.remote()
         )
@@ -136,7 +139,7 @@ class AsyncTrajectoryCollector:
 
                 trajectories_needed = ray.get(
                     self.replay_buffer.get_trajectories_needed.remote(
-                        target_weight, num_prompts
+                        target_weight, num_prompts, max_age_steps
                     )
                 )
                 if trajectories_needed <= 0:
@@ -170,6 +173,9 @@ class AsyncTrajectoryCollector:
         try:
             target_weights = self._calculate_target_weights(self.current_weight_version)
             num_prompts = int(self.master_config.grpo["num_prompts_per_step"])
+            max_age_steps = int(
+                self.master_config.grpo["async_grpo"]["max_trajectory_age_steps"]
+            )
             last_target_weight_already_generated = ray.get(
                 self.replay_buffer.get_last_target_weight_already_generated.remote()
             )
@@ -183,7 +189,7 @@ class AsyncTrajectoryCollector:
                         continue
                     trajectories_needed = ray.get(
                         self.replay_buffer.get_trajectories_needed.remote(
-                            target_weight, num_prompts
+                            target_weight, num_prompts, max_age_steps
                         )
                     )
                     if trajectories_needed > 0:
@@ -273,6 +279,9 @@ class AsyncTrajectoryCollector:
             num_generations = self.master_config.grpo["num_generations_per_prompt"]
             num_prompts_in_batch = batch.size
             num_prompts_per_step = int(self.master_config.grpo["num_prompts_per_step"])
+            max_age_steps = int(
+                self.master_config.grpo["async_grpo"]["max_trajectory_age_steps"]
+            )
 
             # Get the next target weight that needs generation
             target_weight = self._get_next_target_for_generation(
@@ -291,7 +300,7 @@ class AsyncTrajectoryCollector:
 
             trajectories_needed = ray.get(
                 self.replay_buffer.get_trajectories_needed.remote(
-                    target_weight, num_prompts_per_step
+                    target_weight, num_prompts_per_step, max_age_steps
                 )
             )
             num_prompts_to_generate = min(num_prompts_in_batch, trajectories_needed)

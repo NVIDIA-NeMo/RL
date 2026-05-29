@@ -576,7 +576,7 @@ class StubReplayBuffer:
         """Return a mock that reports how many prompt groups are still needed."""
         mock = MagicMock()
         mock.remote = MagicMock(
-            side_effect=lambda _target_step, num_prompts_per_step: max(
+            side_effect=lambda _target_step, num_prompts_per_step, *_args: max(
                 0, num_prompts_per_step - self._size
             )
         )
@@ -587,7 +587,7 @@ class StubReplayBuffer:
         """Return a mock that reports whether the current step can train."""
         mock = MagicMock()
         mock.remote = MagicMock(
-            side_effect=lambda _target_step, num_prompts_per_step: self._size
+            side_effect=lambda _target_step, num_prompts_per_step, *_args: self._size
             >= num_prompts_per_step
         )
         return mock

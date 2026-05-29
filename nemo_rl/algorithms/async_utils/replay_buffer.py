@@ -418,6 +418,24 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         )
         self._remove_indices(indices_to_remove)
 
+    def _count_for_target(
+        self, target_step: int, max_age_steps: int | None = None
+    ) -> int:
+        """Count trajectories usable for ``target_step``.
+
+        Must be called while holding ``self._lock``.
+        """
+        return sum(
+            1
+            for trajectory_version, target in zip(
+                self.trajectory_versions, self.target_weight_versions
+            )
+            if target == target_step
+            and self._is_valid_for_target(
+                trajectory_version, target_step, max_age_steps
+            )
+        )
+
     def _truncate_to_max_size(self, current_training_step: int | None = None) -> None:
         """Truncate restored state to ``max_size`` after resume cleanup.
 
@@ -450,21 +468,25 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         ]
 
     def get_trajectories_needed(
-        self, target_step: int, num_prompts_per_step: int
+        self,
+        target_step: int,
+        num_prompts_per_step: int,
+        max_age_steps: int | None = None,
     ) -> int:
         """Return additional trajectories needed for ``target_step``."""
         with self._lock:
-            current_count = sum(
-                1 for target in self.target_weight_versions if target == target_step
-            )
+            current_count = self._count_for_target(target_step, max_age_steps)
             return max(0, num_prompts_per_step - current_count)
 
-    def has_complete_batch(self, target_step: int, num_prompts_per_step: int) -> bool:
+    def has_complete_batch(
+        self,
+        target_step: int,
+        num_prompts_per_step: int,
+        max_age_steps: int | None = None,
+    ) -> bool:
         """Return whether ``target_step`` has enough trajectories to train."""
         with self._lock:
-            current_count = sum(
-                1 for target in self.target_weight_versions if target == target_step
-            )
+            current_count = self._count_for_target(target_step, max_age_steps)
             return current_count >= num_prompts_per_step
 
     def _remove_incomplete_target_steps(self, num_prompts_per_step: int) -> None:
