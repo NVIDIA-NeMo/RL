@@ -42,4 +42,6 @@ run_test      uv run --no-sync bash ./tests/functional/sft_automodel_lora.sh
 run_test      uv run --no-sync bash ./tests/functional/test_automodel_extra_installed_correctly.sh
 
 cd ${PROJECT_ROOT}/tests
-coverage combine .coverage*
+if compgen -G ".coverage*" > /dev/null; then
+    coverage combine .coverage*
+fi
