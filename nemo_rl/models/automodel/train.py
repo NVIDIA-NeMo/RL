@@ -452,6 +452,26 @@ def automodel_forward_backward(
                     loss = result * dp_size * cp_size
                     loss.backward()
 
+                    # nousnet bit-eq diag: dump every trainable param's grad on the
+                    # first microbatch of the first step (gated by env var).
+                    # The smoking-gun probe for "weights frozen": if multi-LoRA
+                    # `lora_A`/`lora_B` show grad=None while singles show non-zero norm,
+                    # autograd is severed somewhere on the loss path.
+                    import os as _os
+                    if (
+                        _os.environ.get("NOUSNET_FORWARD_BACKWARD_DIAG") == "1"
+                        and mb_idx == 0
+                        and not getattr(automodel_forward_backward, "_nousnet_fp_dumped", False)
+                    ):
+                        try:
+                            from nousnet.debug.forward_backward_fingerprint import (
+                                log_all_param_grads,
+                            )
+                            log_all_param_grads(model, step=1, log_rank=0)
+                            automodel_forward_backward._nousnet_fp_dumped = True
+                        except Exception as _e:
+                            print(f"[PARAM_GRAD_LOG] failed: {_e}", flush=True)
+
         results.append((result, metrics))
 
     return results

@@ -234,6 +234,18 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         **kwargs: Any,
     ):
         """Initialize the DTensorPolicyWorkerV2."""
+        # Bit-equivalence determinism (no-op unless NOUSNET_DIAG_ENABLED=1).
+        # Workers are separate Ray processes so this must be re-applied per worker.
+        import os as _diag_os
+        if _diag_os.environ.get("NOUSNET_DIAG_ENABLED", "0") == "1":
+            try:
+                from nousnet.rl.lora.multi.diag import enable_absolute_determinism
+                _seed = int(_diag_os.environ.get("NOUSNET_DETERMINISTIC_SEED", "42"))
+                _det_status = enable_absolute_determinism(seed=_seed)
+                print(f"[DIAG] worker determinism: {_det_status}", flush=True)
+            except Exception as _e:
+                print(f"[DIAG] worker determinism setup failed: {_e}", flush=True)
+
         # Apply TE patch until TE is upgraded to 2.10.0
         apply_transformer_engine_patch()
         # Apply patch to work around 'NotImplementedError: Operator aten.alias.default does not have a sharding strategy registered'
@@ -517,7 +529,59 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                     )
 
                     # Update parameters
+                    # ---- BIT-EQ DIAG (no-op unless NOUSNET_DIAG_ENABLED=1) ----
+                    # Capture LoRA weight + grad fingerprints around optimizer.step
+                    # so we can compare:
+                    #   - pre-step weight (matches across runs at step 1 init iff same seed)
+                    #   - grad (proves backward reached this slice)
+                    #   - post-step weight (proves optimizer wrote updates)
+                    # The aggregate is per-adapter for multi (using stacked slicing).
+                    import os as _diag_os
+                    _diag_step_metrics: dict[str, Any] = {}
+                    if _diag_os.environ.get("NOUSNET_DIAG_ENABLED", "0") == "1":
+                        try:
+                            from nousnet.rl.lora.multi import diag as _diag
+                            # Try to get the canonical adapter order. The
+                            # MultiAdapterDataLoader stores it on the run
+                            # context; for now we infer from the model's first
+                            # MultiLinearLoRA's n_adapters and rely on the YAML
+                            # order being stable (a,b,c,d in our configs).
+                            _diag_adapter_names = _diag_os.environ.get(
+                                "NOUSNET_DIAG_ADAPTER_NAMES", ""
+                            ).split(",")
+                            _diag_adapter_names = [n for n in _diag_adapter_names if n]
+                            _diag_pre = _diag.aggregate_lora_fingerprints(
+                                self.model, _diag_adapter_names or None, grads=True,
+                            )
+                            # Prefix pre-step keys.
+                            _diag_step_metrics = {
+                                k.replace("diag/", "diag_pre/"): v
+                                for k, v in _diag_pre.items()
+                            }
+                        except Exception as _e:
+                            print(f"[DIAG] pre-step capture failed: {_e}", flush=True)
+
                     self.optimizer.step()
+
+                    if _diag_os.environ.get("NOUSNET_DIAG_ENABLED", "0") == "1":
+                        try:
+                            from nousnet.rl.lora.multi import diag as _diag
+                            _diag_adapter_names = _diag_os.environ.get(
+                                "NOUSNET_DIAG_ADAPTER_NAMES", ""
+                            ).split(",")
+                            _diag_adapter_names = [n for n in _diag_adapter_names if n]
+                            _diag_post = _diag.aggregate_lora_fingerprints(
+                                self.model, _diag_adapter_names or None, grads=False,
+                            )
+                            for k, v in _diag_post.items():
+                                _diag_step_metrics[k.replace("diag/", "diag_post/")] = v
+                            # Attach to the LAST microbatch's metrics so the
+                            # aggregator includes it in step-level reduction.
+                            if all_mb_metrics:
+                                all_mb_metrics[-1].update(_diag_step_metrics)
+                        except Exception as _e:
+                            print(f"[DIAG] post-step capture failed: {_e}", flush=True)
+                    # ---- END BIT-EQ DIAG ----
 
                 losses.append(torch.tensor(mb_losses).sum().item())
 
@@ -1041,6 +1105,39 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
             self.move_optimizer_to_device("cuda")
 
         torch.cuda.empty_cache()
+
+        # nousnet bit-eq fingerprint hooks (gated by NOUSNET_FORWARD_BACKWARD_DIAG=1).
+        # Installed AFTER FSDP wrap + LoRA injection + optimizer is bound, so the
+        # hooked params are the exact ones the optimizer will update.
+        # See: ~/.hermes/skills/ml-training/multi-lora-bit-equivalence-debugging/
+        #      references/per-layer-activation-grad-fingerprint-bisection.md
+        import os as _os
+        if _os.environ.get("NOUSNET_FORWARD_BACKWARD_DIAG") == "1":
+            try:
+                from nousnet.debug.forward_backward_fingerprint import (
+                    install_fingerprint_hooks,
+                )
+                install_fingerprint_hooks(
+                    self.model,
+                    log_rank=0,
+                    module_filters=(
+                        "NemotronHBlock",
+                        "shared_experts",
+                        "MultiLinearLoRA",
+                        "LinearLoRA",
+                        "lm_head",
+                    ),
+                    param_filters=(
+                        "lora_A.weight",
+                        "lora_B.weight",
+                        "_lora_A_stacked",
+                        "_lora_B_stacked",
+                        "_lora_A_extras_merged",
+                        "_lora_B_extras_merged",
+                    ),
+                )
+            except Exception as _e:
+                print(f"[FP_INSTALL] failed to install fingerprint hooks: {_e}", flush=True)
 
     @torch.no_grad()
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/offload_before_refit")

@@ -33,6 +33,58 @@ from nemo_rl.distributed.model_utils import (
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
 
+# ---------------------------------------------------------------------------
+# Bit-equivalence diagnostic hook for NLLLoss (singles path).
+# Symmetric with nousnet.rl.lora.multi.diag's MultiAdapterLoss hook so a
+# direct compare of single_X step N vs multi_adapter_X step N is meaningful.
+# No-op unless NOUSNET_DIAG_ENABLED=1. Reads `who` from NOUSNET_DIAG_WHO.
+# ---------------------------------------------------------------------------
+
+
+def _nllloss_diag_metrics(
+    *,
+    input_ids: torch.Tensor,
+    token_logprobs: torch.Tensor,
+    loss_mask: torch.Tensor,
+    global_valid_toks: torch.Tensor | float | None,
+) -> dict[str, Any]:
+    """Per-step forward fingerprints for a single-LoRA NLLLoss call."""
+    import os as _os
+    if _os.environ.get("NOUSNET_DIAG_ENABLED", "0") != "1":
+        return {}
+    try:
+        from nousnet.rl.lora.multi import diag as _diag
+    except ImportError:
+        return {}
+    who = _os.environ.get("NOUSNET_DIAG_WHO", "single_unknown")
+    try:
+        step = _diag.next_step("NLLLoss")
+        rank = int(_os.environ.get("RANK", "0"))
+        gvt_val = (
+            float(global_valid_toks.item())
+            if hasattr(global_valid_toks, "item")
+            else float(global_valid_toks or 0.0)
+        )
+        out: dict[str, Any] = {
+            "diag/global/global_valid_toks": gvt_val,
+            "diag/global/loss_mask_sum_local": float(loss_mask.sum().item()),
+        }
+        out.update(_diag.build_step_scalars(
+            "diag", who,
+            input_ids=input_ids,
+            token_logprobs=token_logprobs,
+            loss_mask=loss_mask,
+        ))
+        _diag.dump_tensors(step, rank, who,
+            input_ids=input_ids,
+            token_logprobs=token_logprobs,
+            loss_mask=loss_mask,
+        )
+        return out
+    except Exception:
+        return {}
+
+
 class ClippedPGLossConfig(TypedDict):
     reference_policy_kl_penalty: float
     reference_policy_kl_type: str
@@ -686,6 +738,12 @@ class NLLLoss(LossFunction):
             "loss": loss.item() if loss.ndim == 0 else loss,
             "num_unmasked_tokens": mask.sum().item(),
             "num_valid_samples": sample_mask.sum().item(),
+            **_nllloss_diag_metrics(
+                input_ids=data["input_ids"],
+                token_logprobs=token_logprobs,
+                loss_mask=mask,
+                global_valid_toks=global_valid_toks,
+            ),
         }
 
 
