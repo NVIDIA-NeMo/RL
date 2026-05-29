@@ -2999,7 +2999,9 @@ def async_grpo_train(
     while True:
         buffer_size_current = ray.get(replay_buffer.size.remote())
         current_step_ready = ray.get(
-            replay_buffer.has_complete_batch.remote(step, num_prompts_per_step)
+            replay_buffer.has_complete_batch.remote(
+                step, num_prompts_per_step, max_trajectory_age_steps
+            )
         )
 
         print(
@@ -3011,7 +3013,9 @@ def async_grpo_train(
             break
 
         trajectories_needed = ray.get(
-            replay_buffer.get_trajectories_needed.remote(step, num_prompts_per_step)
+            replay_buffer.get_trajectories_needed.remote(
+                step, num_prompts_per_step, max_trajectory_age_steps
+            )
         )
         if buffer_size_current >= min_trajectories_needed and trajectories_needed > 0:
             print(

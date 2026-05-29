@@ -74,11 +74,19 @@ class ReplayBufferProtocol(Protocol):
         ...
 
     def get_trajectories_needed(
-        self, target_step: int, num_prompts_per_step: int
+        self,
+        target_step: int,
+        num_prompts_per_step: int,
+        max_age_steps: int | None = None,
     ) -> int:
         """Return additional trajectories needed for ``target_step``."""
         ...
 
-    def has_complete_batch(self, target_step: int, num_prompts_per_step: int) -> bool:
+    def has_complete_batch(
+        self,
+        target_step: int,
+        num_prompts_per_step: int,
+        max_age_steps: int | None = None,
+    ) -> bool:
         """Return whether ``target_step`` has enough trajectories to train."""
         ...
