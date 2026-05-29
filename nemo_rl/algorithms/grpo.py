@@ -53,7 +53,7 @@ from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.dataloader import MultipleDataloaderWrapper
 from nemo_rl.data.datasets import AllTaskProcessedDataset
-from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType, VLMMessageLogType
 from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
@@ -1010,6 +1010,70 @@ def scale_rewards(
     return repeated_batch
 
 
+def extract_initial_prompt_messages(
+    message_logs: list,
+    original_prompt_lengths: torch.Tensor,
+) -> list:
+    """Extract the original prompt messages from message logs using token length.
+
+    This function correctly identifies original prompt messages even when the prompt
+    contains assistant messages (e.g., multi-turn conversation history).
+
+    Args:
+        message_logs: List of message logs, where each log is a list of messages.
+        original_prompt_lengths: Tensor of original prompt token lengths per sample.
+
+    Returns:
+        List of message logs containing only the original prompt messages.
+    """
+    initial_prompt_message_logs = []
+    for i, message_log in enumerate(message_logs):
+        initial_prompt_log = []
+        cumulative_length = 0
+        target_length = original_prompt_lengths[i].item()
+
+        for message in message_log:
+            if cumulative_length >= target_length:
+                break
+            initial_prompt_log.append(message)
+            cumulative_length += len(message["token_ids"])
+
+        initial_prompt_message_logs.append(initial_prompt_log)
+
+    return initial_prompt_message_logs
+
+
+def add_grpo_token_loss_masks_and_generation_logprobs(
+    message_logs: list[LLMMessageLogType | VLMMessageLogType],
+) -> None:
+    """Add GRPO loss masks and ensure generation logprobs exist in message logs.
+
+    Assistant messages can be part of the original multi-turn prompt history. Only
+    generated assistant messages have generation_logprobs, so use that field as the
+    trainable-token marker. This function mutates each message in-place by adding a
+    token_loss_mask and, when missing, a zero-valued generation_logprobs tensor.
+
+    Args:
+        message_logs: Batch of tokenized message logs. Each message must contain a
+            ``role`` and ``token_ids`` field. Messages that already contain
+            ``generation_logprobs`` are treated as rollout-generated messages.
+    """
+    for message_log in message_logs:
+        for message in message_log:
+            role = cast(str, message["role"])
+            token_ids = cast(torch.Tensor, message["token_ids"])
+
+            if role == "assistant" and "generation_logprobs" in message:
+                message["token_loss_mask"] = torch.ones_like(token_ids)
+            else:
+                message["token_loss_mask"] = torch.zeros_like(token_ids)
+
+            if "generation_logprobs" not in message:
+                message["generation_logprobs"] = torch.zeros_like(
+                    token_ids, dtype=torch.float32
+                )
+
+
 def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
     """Determine if async rollouts should be used based on the configuration.
 
@@ -1104,28 +1168,6 @@ def _create_advantage_estimator(master_config: MasterConfig):
         raise ValueError(f"Invalid adv_estimator name: {adv_estimator_name}")
 
     return adv_estimator
-
-
-def _extract_prompt_only_messages(message_logs: list) -> list:
-    """Extract only prompt messages (user/system) from message logs.
-
-    This is used to get prompt IDs for advantage estimation, excluding
-    any assistant responses.
-
-    Args:
-        message_logs: List of message logs, where each log is a list of messages.
-
-    Returns:
-        List of message logs containing only user and system messages.
-    """
-    prompt_only_message_logs = []
-    for message_log in message_logs:
-        prompt_only_log = []
-        for message in message_log:
-            if message["role"] == "user" or message["role"] == "system":
-                prompt_only_log.append(message)
-        prompt_only_message_logs.append(prompt_only_log)
-    return prompt_only_message_logs
 
 
 def refit_policy_generation(
@@ -1253,7 +1295,7 @@ def compute_and_apply_seq_logprob_error_masking(
     train_data: BatchedDataDict,
     rewards: torch.Tensor,
     seq_logprob_error_threshold: Optional[float],
-) -> tuple[float, int, float]:
+) -> dict:
     """Compute sequence-level logprob error metrics and optionally mask high-error sequences.
 
     This function computes the multiplicative probability error per sequence
@@ -1269,7 +1311,9 @@ def compute_and_apply_seq_logprob_error_masking(
                                     exceeding this threshold. If None, only compute metrics.
 
     Returns:
-        Tuple of (max_seq_mult_prob_error, num_masked_seqs, masked_correct_pct)
+        Dict with keys: max_seq_mult_prob_error, mean_seq_mult_prob_error,
+        min_seq_mult_prob_error, max/mean/min_seq_mult_prob_error_after_mask,
+        num_masked_seqs, masked_correct_pct
     """
     # Compute sequence-level logprob error metrics (always)
     token_mask = train_data["token_mask"][:, 1:]
@@ -1281,18 +1325,39 @@ def compute_and_apply_seq_logprob_error_masking(
     # Use combined mask exactly as in loss function
     mask = token_mask * sample_mask.unsqueeze(-1)
 
-    # Calculate sequence-level multiplicative prob error
-    # EXACT same calculation as token_mult_prob_error but per-sequence
-    seq_mult_prob_error = (torch.exp(lp_error * mask) * mask).sum(dim=-1) / mask.sum(
-        dim=-1
-    ).clamp(min=1)
-    max_seq_mult_prob_error = (
-        seq_mult_prob_error.max().item() if seq_mult_prob_error.numel() > 0 else 0.0
-    )
+    # Calculate sequence-level multiplicative prob error.
+    #
+    # NOTE: When a sequence is fully masked (mask.sum == 0), it should not contribute to
+    # min/mean/max statistics; otherwise, it would yield a spurious 0 due to denominator
+    # clamping and incorrectly drag min_seq_mult_prob_error to 0.
+    denom = mask.sum(dim=-1)
+    valid_seq_mask = denom > 0
+
+    # EXACT same calculation as token_mult_prob_error but per-sequence (for valid sequences)
+    seq_mult_prob_error = torch.zeros_like(denom, dtype=lp_error.dtype)
+    if valid_seq_mask.any():
+        num = (torch.exp(lp_error * mask) * mask).sum(dim=-1)
+        seq_mult_prob_error[valid_seq_mask] = num[valid_seq_mask] / denom[
+            valid_seq_mask
+        ].clamp(min=1)
+
+        valid_errors = seq_mult_prob_error[valid_seq_mask]
+        max_seq_mult_prob_error = valid_errors.max().item()
+        mean_seq_mult_prob_error = valid_errors.mean().item()
+        min_seq_mult_prob_error = valid_errors.min().item()
+    else:
+        max_seq_mult_prob_error = 0.0
+        mean_seq_mult_prob_error = 0.0
+        min_seq_mult_prob_error = 0.0
 
     # Apply sequence-level masking if configured
     num_masked_seqs = 0
     masked_correct_pct = 0.0
+
+    # After-mask metrics (same as before if no threshold)
+    max_seq_mult_prob_error_after_mask = max_seq_mult_prob_error
+    mean_seq_mult_prob_error_after_mask = mean_seq_mult_prob_error
+    min_seq_mult_prob_error_after_mask = min_seq_mult_prob_error
 
     if seq_logprob_error_threshold is not None:
         print(
@@ -1312,8 +1377,23 @@ def compute_and_apply_seq_logprob_error_masking(
 
         if num_masked_seqs > 0:
             diff_mask_bool = diff_mask.bool()
-            masked_correct_count = (rewards.view(-1)[diff_mask_bool] == 1).sum().item()
+            masked_correct_count = int(
+                (rewards.view(-1)[diff_mask_bool] == 1).sum().item()
+            )
             masked_correct_pct = masked_correct_count / num_masked_seqs
+
+        # Compute after-mask metrics (only for sequences that passed the threshold)
+        kept_mask = seq_error_mask.bool() & valid_seq_mask
+        if kept_mask.sum() > 0:
+            kept_errors = seq_mult_prob_error[kept_mask]
+            max_seq_mult_prob_error_after_mask = kept_errors.max().item()
+            mean_seq_mult_prob_error_after_mask = kept_errors.mean().item()
+            min_seq_mult_prob_error_after_mask = kept_errors.min().item()
+        else:
+            # All sequences were masked
+            max_seq_mult_prob_error_after_mask = 0.0
+            mean_seq_mult_prob_error_after_mask = 0.0
+            min_seq_mult_prob_error_after_mask = 0.0
 
         # Update sample_mask in train_data
         train_data["sample_mask"] = seq_error_mask
@@ -1329,7 +1409,16 @@ def compute_and_apply_seq_logprob_error_masking(
                 flush=True,
             )
 
-    return max_seq_mult_prob_error, num_masked_seqs, masked_correct_pct
+    return {
+        "max_seq_mult_prob_error": max_seq_mult_prob_error,
+        "mean_seq_mult_prob_error": mean_seq_mult_prob_error,
+        "min_seq_mult_prob_error": min_seq_mult_prob_error,
+        "max_seq_mult_prob_error_after_mask": max_seq_mult_prob_error_after_mask,
+        "mean_seq_mult_prob_error_after_mask": mean_seq_mult_prob_error_after_mask,
+        "min_seq_mult_prob_error_after_mask": min_seq_mult_prob_error_after_mask,
+        "num_masked_seqs": num_masked_seqs,
+        "masked_correct_pct": masked_correct_pct,
+    }
 
 
 # ===============================================================================
@@ -1702,16 +1791,18 @@ def grpo_train(
                     # Save baseline for logging (before deletion)
                     baseline_for_log = baseline.clone()
 
-                    # Extract prompt-only messages for advantage estimation
-                    prompt_only_message_logs = _extract_prompt_only_messages(
-                        repeated_batch["message_log"]
+                    # Extract original prompt messages using the length field
+                    # This correctly handles multi-turn prompts that contain assistant messages
+                    initial_prompt_message_logs = extract_initial_prompt_messages(
+                        repeated_batch["message_log"],
+                        repeated_batch["length"],
                     )
                     prompt_batched_flat, _ = batched_message_log_to_flat_message(
-                        prompt_only_message_logs,
+                        initial_prompt_message_logs,
                         pad_value_dict={"token_ids": tokenizer.pad_token_id},
                     )
                     prompt_ids_for_adv = prompt_batched_flat["token_ids"]
-                    del prompt_only_message_logs
+                    del initial_prompt_message_logs
                     del prompt_batched_flat
                     del input_ids
                     del baseline
@@ -1728,21 +1819,9 @@ def grpo_train(
 
                         loss_multiplier[truncated] = 0
                         repeated_batch["loss_multiplier"] = loss_multiplier
-                    # Add loss mask to each message in LLMMessageLogType
-                    for i, message_log in enumerate(repeated_batch["message_log"]):
-                        for j, message in enumerate(message_log):
-                            if message["role"] == "assistant":
-                                message["token_loss_mask"] = torch.ones_like(
-                                    message["token_ids"]
-                                )
-                            else:
-                                message["token_loss_mask"] = torch.zeros_like(
-                                    message["token_ids"]
-                                )
-                            if "generation_logprobs" not in message:
-                                message["generation_logprobs"] = torch.zeros_like(
-                                    message["token_ids"], dtype=torch.float32
-                                )
+                    add_grpo_token_loss_masks_and_generation_logprobs(
+                        repeated_batch["message_log"]
+                    )
 
                     # Convert updated LLMMessageLogType to FlatMessagesType for training
                     flat_messages, input_lengths = batched_message_log_to_flat_message(
@@ -1776,7 +1855,21 @@ def grpo_train(
 
                 memory_tracker.snapshot_start_of_stage("Computing logprobs", dir())
                 # Skip prev_logprobs computation when force_on_policy_ratio=True
-                skip_prev_logprobs = master_config.loss_fn.force_on_policy_ratio
+                # unless seq_logprob_error_threshold is set (which requires prev_logprobs)
+                seq_logprob_error_threshold = master_config.grpo.get(
+                    "seq_logprob_error_threshold", None
+                )
+                force_on_policy_ratio = master_config.loss_fn.force_on_policy_ratio
+                skip_prev_logprobs = (
+                    force_on_policy_ratio and seq_logprob_error_threshold is None
+                )
+                # todo @jiaqi: is there a better way to skip prev_logprobs computation while still computing the seq-level error metrics?
+                if force_on_policy_ratio and seq_logprob_error_threshold is not None:
+                    warnings.warn(
+                        "force_on_policy_ratio=True but seq_logprob_error_threshold is set. "
+                        "Computing prev_logprobs anyway for seq-level error masking."
+                    )
+
                 if skip_prev_logprobs:
                     print(
                         "▶ Skipping prev_logprobs (force_on_policy_ratio=True)...",
@@ -1826,28 +1919,29 @@ def grpo_train(
                     del extra_multimodal_data
 
                 # Seq-level logprob error metrics/masking require real prev_logprobs
-                seq_logprob_error_threshold = master_config.grpo.get(
-                    "seq_logprob_error_threshold", None
-                )
                 if skip_prev_logprobs:
                     # Cannot compute seq-level metrics with placeholder prev_logprobs
-                    assert seq_logprob_error_threshold is None, (
-                        "seq_logprob_error_threshold requires prev_logprobs computation; "
-                        "cannot use with force_on_policy_ratio=True"
-                    )
-                    max_seq_mult_prob_error = 0.0
-                    num_masked_seqs = 0
-                    masked_correct_pct = 0.0
+                    seq_logprob_error_metrics = {
+                        "max_seq_mult_prob_error": 0.0,
+                        "mean_seq_mult_prob_error": 0.0,
+                        "min_seq_mult_prob_error": 0.0,
+                        "max_seq_mult_prob_error_after_mask": 0.0,
+                        "mean_seq_mult_prob_error_after_mask": 0.0,
+                        "min_seq_mult_prob_error_after_mask": 0.0,
+                        "num_masked_seqs_by_logprob_error": 0,
+                        "masked_correct_pct": 0.0,
+                    }
                 else:
-                    (
-                        max_seq_mult_prob_error,
-                        num_masked_seqs,
-                        masked_correct_pct,
-                    ) = compute_and_apply_seq_logprob_error_masking(
+                    seq_error_result = compute_and_apply_seq_logprob_error_masking(
                         train_data=train_data,
                         rewards=rewards,
                         seq_logprob_error_threshold=seq_logprob_error_threshold,
                     )
+                    seq_logprob_error_metrics = seq_error_result
+                    if "num_masked_seqs" in seq_logprob_error_metrics:
+                        seq_logprob_error_metrics[
+                            "num_masked_seqs_by_logprob_error"
+                        ] = seq_logprob_error_metrics.pop("num_masked_seqs")
 
                 # Compute advantages with adv_estimator using correct mask and logprobs
                 with timer.time("advantage_calculation"):
@@ -2015,9 +2109,7 @@ def grpo_train(
                 total_valid_tokens += metrics["global_valid_toks"]
 
                 # Always log sequence-level error metrics (useful for deciding threshold)
-                metrics["max_seq_mult_prob_error"] = max_seq_mult_prob_error
-                metrics["num_masked_seqs_by_logprob_error"] = num_masked_seqs
-                metrics["masked_correct_pct"] = masked_correct_pct
+                metrics.update(seq_logprob_error_metrics)
 
                 ## Checkpointing
                 consumed_samples += master_config.grpo["num_prompts_per_step"]
@@ -2836,16 +2928,19 @@ def async_grpo_train(
 
                 print("▶ Processing rewards...")
                 with timer.time("reward_calculation"):
-                    # Extract prompt-only messages for advantage estimation
-                    prompt_only_message_logs = _extract_prompt_only_messages(
-                        repeated_batch["message_log"]
+                    # Extract original prompt messages using the length field
+                    # This correctly handles multi-turn prompts that contain assistant messages
+                    initial_prompt_message_logs = extract_initial_prompt_messages(
+                        repeated_batch["message_log"],
+                        repeated_batch["length"],
                     )
+
                     prompt_batched_flat, _ = batched_message_log_to_flat_message(
-                        prompt_only_message_logs,
+                        initial_prompt_message_logs,
                         pad_value_dict={"token_ids": tokenizer.pad_token_id},
                     )
                     prompt_ids_for_adv = prompt_batched_flat["token_ids"]
-                    del prompt_only_message_logs
+                    del initial_prompt_message_logs
                     del prompt_batched_flat
 
                     rewards = repeated_batch["total_reward"]
@@ -2856,21 +2951,9 @@ def async_grpo_train(
 
                 # Prepare training data (same as sync version)
                 with timer.time("data_processing"):
-                    # Add loss mask to each message
-                    for i, message_log in enumerate(repeated_batch["message_log"]):
-                        for j, message in enumerate(message_log):
-                            if message["role"] == "assistant":
-                                message["token_loss_mask"] = torch.ones_like(
-                                    message["token_ids"]
-                                )
-                            else:
-                                message["token_loss_mask"] = torch.zeros_like(
-                                    message["token_ids"]
-                                )
-                            if "generation_logprobs" not in message:
-                                message["generation_logprobs"] = torch.zeros_like(
-                                    message["token_ids"], dtype=torch.float32
-                                )
+                    add_grpo_token_loss_masks_and_generation_logprobs(
+                        repeated_batch["message_log"]
+                    )
 
                     # Convert to flat format for training
                     flat_messages, input_lengths = batched_message_log_to_flat_message(
@@ -2896,7 +2979,22 @@ def async_grpo_train(
 
                 # Training phase (same as sync version)
                 # Skip prev_logprobs computation when force_on_policy_ratio=True
-                skip_prev_logprobs = master_config.loss_fn.force_on_policy_ratio
+                # unless seq_logprob_error_threshold is set (which requires prev_logprobs)
+                seq_logprob_error_threshold = master_config.grpo.get(
+                    "seq_logprob_error_threshold", None
+                )
+                force_on_policy_ratio = master_config.loss_fn.force_on_policy_ratio
+                skip_prev_logprobs = (
+                    force_on_policy_ratio and seq_logprob_error_threshold is None
+                )
+
+                # todo @jiaqi: is there a better way to skip prev_logprobs computation while still computing the seq-level error metrics?
+                if force_on_policy_ratio and seq_logprob_error_threshold is not None:
+                    warnings.warn(
+                        "force_on_policy_ratio=True but seq_logprob_error_threshold is set. "
+                        "Computing prev_logprobs anyway for seq-level error masking."
+                    )
+
                 if skip_prev_logprobs:
                     print(
                         "▶ Skipping prev_logprobs (force_on_policy_ratio=True)...",
@@ -2931,27 +3029,29 @@ def async_grpo_train(
                         )
 
                 # Seq-level logprob error metrics/masking require real prev_logprobs
-                seq_logprob_error_threshold = master_config.grpo.get(
-                    "seq_logprob_error_threshold", None
-                )
                 if skip_prev_logprobs:
-                    assert seq_logprob_error_threshold is None, (
-                        "seq_logprob_error_threshold requires prev_logprobs computation; "
-                        "cannot use with force_on_policy_ratio=True"
-                    )
-                    max_seq_mult_prob_error = 0.0
-                    num_masked_seqs = 0
-                    masked_correct_pct = 0.0
+                    # Cannot compute seq-level metrics with placeholder prev_logprobs
+                    seq_logprob_error_metrics = {
+                        "max_seq_mult_prob_error": 0.0,
+                        "mean_seq_mult_prob_error": 0.0,
+                        "min_seq_mult_prob_error": 0.0,
+                        "max_seq_mult_prob_error_after_mask": 0.0,
+                        "mean_seq_mult_prob_error_after_mask": 0.0,
+                        "min_seq_mult_prob_error_after_mask": 0.0,
+                        "num_masked_seqs_by_logprob_error": 0,
+                        "masked_correct_pct": 0.0,
+                    }
                 else:
-                    (
-                        max_seq_mult_prob_error,
-                        num_masked_seqs,
-                        masked_correct_pct,
-                    ) = compute_and_apply_seq_logprob_error_masking(
+                    seq_error_result = compute_and_apply_seq_logprob_error_masking(
                         train_data=train_data,
                         rewards=rewards,
                         seq_logprob_error_threshold=seq_logprob_error_threshold,
                     )
+                    seq_logprob_error_metrics = seq_error_result
+                    if "num_masked_seqs" in seq_logprob_error_metrics:
+                        seq_logprob_error_metrics[
+                            "num_masked_seqs_by_logprob_error"
+                        ] = seq_logprob_error_metrics.pop("num_masked_seqs")
 
                 # Compute advantages with adv_estimator using correct mask and logprobs
                 with timer.time("advantage_calculation"):
@@ -3129,9 +3229,7 @@ def async_grpo_train(
                 total_valid_tokens += metrics["global_valid_toks"]
 
                 # Always log sequence-level error metrics (useful for deciding threshold)
-                metrics["max_seq_mult_prob_error"] = max_seq_mult_prob_error
-                metrics["num_masked_seqs_by_logprob_error"] = num_masked_seqs
-                metrics["masked_correct_pct"] = masked_correct_pct
+                metrics.update(seq_logprob_error_metrics)
 
                 # Checkpointing (same as sync version)
                 consumed_samples += master_config.grpo["num_prompts_per_step"]

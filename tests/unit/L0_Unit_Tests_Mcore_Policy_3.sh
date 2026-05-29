@@ -11,19 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-name: Sync skills → agent dirs
 
-on:
-  workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - "skills/**"
-      - "AGENTS.md"
+#!/bin/bash
+# Shard: mcore-marked policy worker tests (test_megatron_worker.py)
 
-jobs:
-  sync:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_sync_skills.yml@v0.91.0
-    secrets:
-      PAT: ${{ secrets.PAT }}
+source "$(dirname "${BASH_SOURCE[0]}")/run_unit_shard_common.sh"
+
+uv run --extra mcore bash -x ./tests/run_unit.sh "unit/models/policy/" "${EXCLUDED_UNIT_TESTS[@]}" --shard-id=2 --num-shards=3 --cov=nemo_rl --cov-report=term-missing --cov-report=json --hf-gated --mcore-only

@@ -1,6 +1,7 @@
 ---
 name: auto-research
-description: "Autonomous NeMo-RL research agent workflow for directed hypothesis testing and open-ended discovery. Guides agents through the full experiment lifecycle: understanding recipes and environments, wiring RL or NeMo-gym runs, launching reproducible baselines and iterations, analyzing results, preserving human oversight, and using git plus TSV logs as the research ledger."
+license: Apache-2.0
+description: "Autonomous NeMo-RL research agent workflow for directed hypothesis testing and open-ended discovery. Guides agents through the full experiment lifecycle: understanding recipes and environments, wiring RL or NeMo-gym runs, launching reproducible baselines and iterations, analyzing results, preserving human oversight, and using git plus TSV logs as the research ledger. Do NOT use for: bug fixes, code review, documentation, refactoring, dependency updates, or single-file changes."
 when_to_use: auto research; run experiments; test these hypotheses; find a better recipe; improve accuracy; long-running NeMo-RL or NeMo-gym research campaigns; autonomous discovery; directed execution.
 ---
 
@@ -9,6 +10,8 @@ when_to_use: auto research; run experiments; test these hypotheses; find a bette
 Run iterative NeMo-RL experiments in this repository against the user's stated objective, such as accuracy, reward, throughput, latency, stability, or another recipe-specific metric, with git as the research ledger.
 
 Treat dependencies as ready, but choose the runtime deliberately. Use the recipe's authoritative metric as the source of truth. Keep changes small, reproducible, and simple. Preserve unrelated user work.
+
+**Safety:** This skill creates git branches, writes files to disk, and executes shell commands including training jobs that may consume GPU resources. Always confirm the campaign plan with the user before creating branches or launching jobs. Do not execute destructive git operations (reset, force-push) or launch compute-intensive jobs without explicit user approval.
 
 Use the `session-memory` skill for every auto-research campaign. Start or resume a session record before branching, then checkpoint after forming the plan, before and after meaningful edits or long-running launches, when the user changes direction, and before handoff or final summary.
 
