@@ -122,19 +122,35 @@ class AsyncTrajectoryCollector:
     ) -> Optional[int]:
         """Get the next target weight that needs generation (if any)."""
         target_weights = self._calculate_target_weights(generation_weight_version)
+        num_prompts = int(self.master_config.grpo["num_prompts_per_step"])
         last_target_weight_already_generated = ray.get(
             self.replay_buffer.get_last_target_weight_already_generated.remote()
         )
 
         with self._generation_check_lock:
             for target_weight in target_weights:
-                if (
-                    target_weight > last_target_weight_already_generated
-                    and target_weight not in self._generating_targets
-                ):
-                    self._generating_targets.add(target_weight)
+                if target_weight <= last_target_weight_already_generated:
+                    continue
+                if target_weight in self._generating_targets:
+                    continue
+
+                trajectories_needed = ray.get(
+                    self.replay_buffer.get_trajectories_needed.remote(
+                        target_weight, num_prompts
+                    )
+                )
+                if trajectories_needed <= 0:
+                    continue
+
+                self._generating_targets.add(target_weight)
+                if trajectories_needed < num_prompts:
+                    print(
+                        f"🎯 Reserved target weight {target_weight} for gap-filling "
+                        f"(need {trajectories_needed}/{num_prompts} more trajectories)"
+                    )
+                else:
                     print(f"🎯 Reserved target weight {target_weight} for generation")
-                    return target_weight
+                return target_weight
 
         return None
 
@@ -153,6 +169,7 @@ class AsyncTrajectoryCollector:
         """Check if collection should be paused due to generation limits."""
         try:
             target_weights = self._calculate_target_weights(self.current_weight_version)
+            num_prompts = int(self.master_config.grpo["num_prompts_per_step"])
             last_target_weight_already_generated = ray.get(
                 self.replay_buffer.get_last_target_weight_already_generated.remote()
             )
@@ -160,10 +177,16 @@ class AsyncTrajectoryCollector:
             # Check if any target weight in our range needs generation
             with self._generation_check_lock:
                 for target_weight in target_weights:
-                    if (
-                        target_weight > last_target_weight_already_generated
-                        and target_weight not in self._generating_targets
-                    ):
+                    if target_weight <= last_target_weight_already_generated:
+                        continue
+                    if target_weight in self._generating_targets:
+                        continue
+                    trajectories_needed = ray.get(
+                        self.replay_buffer.get_trajectories_needed.remote(
+                            target_weight, num_prompts
+                        )
+                    )
+                    if trajectories_needed > 0:
                         return False  # Found a target that needs generation
 
             print(
@@ -248,7 +271,8 @@ class AsyncTrajectoryCollector:
         try:
             generation_weight_version = self.current_weight_version
             num_generations = self.master_config.grpo["num_generations_per_prompt"]
-            num_prompts = batch.size
+            num_prompts_in_batch = batch.size
+            num_prompts_per_step = int(self.master_config.grpo["num_prompts_per_step"])
 
             # Get the next target weight that needs generation
             target_weight = self._get_next_target_for_generation(
@@ -265,8 +289,29 @@ class AsyncTrajectoryCollector:
                 f"🎯 Generating for target weight {target_weight} from generation_weight_version {generation_weight_version}"
             )
 
-            # Generate for all prompts in this batch for the target weight
-            for prompt_idx in range(num_prompts):
+            trajectories_needed = ray.get(
+                self.replay_buffer.get_trajectories_needed.remote(
+                    target_weight, num_prompts_per_step
+                )
+            )
+            num_prompts_to_generate = min(num_prompts_in_batch, trajectories_needed)
+            if num_prompts_to_generate == 0:
+                print(
+                    f"🔄 Target {target_weight} already has enough trajectories, skipping"
+                )
+                with self._generation_check_lock:
+                    self._generating_targets.discard(target_weight)
+                return
+
+            if num_prompts_to_generate < num_prompts_in_batch:
+                print(
+                    f"🎯 Gap-filling for target weight {target_weight}: "
+                    f"generating {num_prompts_to_generate}/{num_prompts_in_batch} "
+                    f"prompts (need {trajectories_needed} more trajectories)"
+                )
+
+            # Generate only the prompt groups needed for this target.
+            for prompt_idx in range(num_prompts_to_generate):
                 # Wait for refit to complete if in progress
                 if not self._refit_pause_cleared.is_set() and self.running:
                     with self._threads_lock:
