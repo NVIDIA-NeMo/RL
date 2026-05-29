@@ -325,7 +325,7 @@ class MegatronPolicyWorkerImpl(
         if not self._forward_pre_hook_enabled():
             return
         if param_sync:
-            self._copy_main_params_to_param_buffer_for_mxfp8_overlap(
+            self._copy_main_params_to_param_buffer(
                 zero_grad_buffer=True
             )
         self.model.disable_forward_pre_hook(param_sync=param_sync)
@@ -344,7 +344,7 @@ class MegatronPolicyWorkerImpl(
         model_config.param_sync_func = None
         self._first_train_step_forward_pre_hook_disabled = True
 
-    def _copy_main_params_to_param_buffer_for_mxfp8_overlap(
+    def _copy_main_params_to_param_buffer(
         self, zero_grad_buffer: bool = False
     ) -> None:
         if not isinstance(self.model, DistributedDataParallel):
@@ -496,7 +496,7 @@ class MegatronPolicyWorkerImpl(
                     ):
                         self.model.zero_grad_buffer()
                         self.optimizer.zero_grad()
-                        self._copy_main_params_to_param_buffer_for_mxfp8_overlap()
+                        self._copy_main_params_to_param_buffer()
 
                     # Forward pass.
                     draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
