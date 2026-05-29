@@ -7,11 +7,8 @@ loss_fn:
   use_importance_sampling_correction: true
 checkpointing:
   checkpoint_dir: results/grpo-glm5.1-64n8g-megatron-2048
-  save_period: 10
 policy:
   model_name: zai-org/GLM-5.1
-  tokenizer:
-    name: ${policy.model_name}
   train_global_batch_size: 64
   train_micro_batch_size: 1
   logprob_batch_size: 1
