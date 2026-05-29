@@ -152,7 +152,9 @@ def setup_distributed() -> None:
     destroy_parallel_state()
     # Pin the communicator to the correct GPU explicitly.
     local_rank = int(os.environ["LOCAL_RANK"])
-    torch.distributed.init_process_group("nccl", device_id=torch.device(f"cuda:{local_rank}"))
+    torch.distributed.init_process_group(
+        "nccl", device_id=torch.device(f"cuda:{local_rank}")
+    )
 
 
 def validate_and_set_config(
@@ -544,12 +546,14 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.context_parallel_size = config["megatron_cfg"]["context_parallel_size"]
 
     if model_cfg.context_parallel_size > 1:
-        assert config["sequence_packing"]["enabled"], (
-            "Sequence Packing must be enabled to use Context Parallelism with MCore"
-        )
-        assert not config["megatron_cfg"].get("use_linear_ce_fusion_loss", False), (
-            "Context Parallelism is not supported with linear CE fusion loss, please set use_linear_ce_fusion_loss to false"
-        )
+        assert config["sequence_packing"][
+            "enabled"
+        ], "Sequence Packing must be enabled to use Context Parallelism with MCore"
+        assert not config[
+            "megatron_cfg"
+        ].get(
+            "use_linear_ce_fusion_loss", False
+        ), "Context Parallelism is not supported with linear CE fusion loss, please set use_linear_ce_fusion_loss to false"
 
 
 def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
@@ -775,9 +779,9 @@ def _validate_optimizer_config(config: PolicyConfig) -> None:
     if optimizer_cpu_offload:
         # Currently, hybrid optimizer (partly on GPU and partly on CPU) is not supported because it conflicts with the way
         # Nemo-rl handles the optimizer offload/onload between generation and training. So if using CPU optimizer the offload_fraction should be 1.0.
-        assert optimizer_offload_fraction == 1.0, (
-            "Currently for optimizer offloading, only optimizer_offload_fraction=1.0 is supported"
-        )
+        assert (
+            optimizer_offload_fraction == 1.0
+        ), "Currently for optimizer offloading, only optimizer_offload_fraction=1.0 is supported"
 
 
 def _validate_chunking_config(config: PolicyConfig) -> None:
@@ -787,9 +791,9 @@ def _validate_chunking_config(config: PolicyConfig) -> None:
         and config["logprob_chunk_size"] is not None
         and config["logprob_chunk_size"] > 0
     ):
-        assert config["megatron_cfg"]["defer_fp32_logits"], (
-            "defer_fp32_logits must be True if logprob_chunk_size is set"
-        )
+        assert config["megatron_cfg"][
+            "defer_fp32_logits"
+        ], "defer_fp32_logits must be True if logprob_chunk_size is set"
 
 
 def _create_checkpoint_config(
@@ -839,32 +843,28 @@ def _validate_dtype_config(
 ) -> None:
     # TODO: this validation should happen inside mbridge: https://github.com/NVIDIA-NeMo/Megatron-Bridge/issues/1665
     if dtype == torch.bfloat16:
-        assert model_cfg.bf16 == True, (
-            "policy.megatron_cfg.model.bf16=True must be set if policy.precision=bfloat16. This is handled by nemo-rl so this indicates something is misconfigured."
-        )
+        assert (
+            model_cfg.bf16 == True
+        ), "policy.megatron_cfg.model.bf16=True must be set if policy.precision=bfloat16. This is handled by nemo-rl so this indicates something is misconfigured."
         assert (
             optimizer_cfg.use_precision_aware_optimizer == False
             or optimizer_cfg.bf16 == True
-        ), (
-            "policy.megatron_cfg.optimizer.bf16=True must be set if policy.precision=bfloat16 when using use_precision_aware_optimizer=True"
-        )
+        ), "policy.megatron_cfg.optimizer.bf16=True must be set if policy.precision=bfloat16 when using use_precision_aware_optimizer=True"
     elif dtype == torch.float16:
-        assert model_cfg.fp16 == True, (
-            "policy.megatron_cfg.model.fp16=True must be set if policy.precision=float16. This is handled by nemo-rl so this indicates something is misconfigured."
-        )
+        assert (
+            model_cfg.fp16 == True
+        ), "policy.megatron_cfg.model.fp16=True must be set if policy.precision=float16. This is handled by nemo-rl so this indicates something is misconfigured."
         assert (
             optimizer_cfg.use_precision_aware_optimizer == False
             or optimizer_cfg.fp16 == True
-        ), (
-            "policy.megatron_cfg.optimizer.fp16=True must be set if policy.precision=float16 when using use_precision_aware_optimizer=True"
-        )
+        ), "policy.megatron_cfg.optimizer.fp16=True must be set if policy.precision=float16 when using use_precision_aware_optimizer=True"
     elif dtype == torch.float32:
-        assert model_cfg.bf16 == False and model_cfg.fp16 == False, (
-            "policy.megatron_cfg.model.bf16=False and policy.megatron_cfg.model.fp16=False must be set if policy.precision=float32. This is handled by nemo-rl so this indicates something is misconfigured."
-        )
-        assert optimizer_cfg.bf16 == False and optimizer_cfg.fp16 == False, (
-            "policy.megatron_cfg.optimizer.bf16=False and policy.megatron_cfg.optimizer.fp16=False must be set if policy.precision=float32"
-        )
+        assert (
+            model_cfg.bf16 == False and model_cfg.fp16 == False
+        ), "policy.megatron_cfg.model.bf16=False and policy.megatron_cfg.model.fp16=False must be set if policy.precision=float32. This is handled by nemo-rl so this indicates something is misconfigured."
+        assert (
+            optimizer_cfg.bf16 == False and optimizer_cfg.fp16 == False
+        ), "policy.megatron_cfg.optimizer.bf16=False and policy.megatron_cfg.optimizer.fp16=False must be set if policy.precision=float32"
 
 
 def _create_megatron_config(

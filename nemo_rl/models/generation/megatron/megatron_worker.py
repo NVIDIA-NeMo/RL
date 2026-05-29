@@ -125,7 +125,7 @@ class MegatronGenerationMixin:
                 mcore_generation_config["mamba_inference_conv_states_dtype"]
             )
 
-        # logging_step_interval is a power-user argument that should be NotRequired. 
+        # logging_step_interval is a power-user argument that should be NotRequired.
         logging_step_interval = mcore_generation_config.get("logging_step_interval")
         # This will be fixed in upstream MCore, allowing an argument of `None`.
         if logging_step_interval is None:

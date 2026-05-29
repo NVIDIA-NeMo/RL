@@ -259,9 +259,9 @@ def setup(
     if checkpointing_pretrained is not None:
         policy_config["pretrained_checkpoint"] = checkpointing_pretrained
 
-    assert generation_config is not None, (
-        "A generation config in the PolicyConfig is required for GRPO"
-    )
+    assert (
+        generation_config is not None
+    ), "A generation config in the PolicyConfig is required for GRPO"
 
     # Set seed for all random number generators
     set_seed(grpo_config["seed"])
@@ -299,9 +299,9 @@ def setup(
         num_prompts_per_step = int(num_prompts_per_step * batch_multiplier)
         dataloader_batch_size = int(dataloader_batch_size * batch_multiplier)
     else:
-        assert batch_multiplier == 1, (
-            "batch_multiplier>1 can only be used if use_dynamic_sampling=True"
-        )
+        assert (
+            batch_multiplier == 1
+        ), "batch_multiplier>1 can only be used if use_dynamic_sampling=True"
 
     # Validate number of prompts per step
     if data_config["use_multiple_dataloader"]:
@@ -364,9 +364,9 @@ def setup(
         or grpo_config["val_at_start"]
         or grpo_config["val_at_end"]
     ):
-        assert val_dataset is not None, (
-            "Validation dataset is required if validation is enabled"
-        )
+        assert (
+            val_dataset is not None
+        ), "Validation dataset is required if validation is enabled"
         val_dataloader = StatefulDataLoader(
             val_dataset,
             batch_size=grpo_config["val_batch_size"],
@@ -390,9 +390,7 @@ def setup(
             grpo_config["num_prompts_per_step"]
             * grpo_config["num_generations_per_prompt"]
             == policy_config["train_global_batch_size"]
-        ), (
-            "force_on_policy_ratio requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt"
-        )
+        ), "force_on_policy_ratio requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt"
         os.environ["NRL_IGNORE_TP_ACCURACY_CHECK"] = "1"
         print("  ✓ force_on_policy_ratio enabled")
 
@@ -567,9 +565,8 @@ def setup(
 
         # When the user opts into recompute-after-refit on the megatron side,
         # override mcore's kv_cache_management_mode to "recompute" directly.
-        if (
-            "async_grpo" in grpo_config
-            and grpo_config["async_grpo"].get("recompute_kv_cache_after_weight_updates", False)
+        if "async_grpo" in grpo_config and grpo_config["async_grpo"].get(
+            "recompute_kv_cache_after_weight_updates", False
         ):
             mcore_cfg = policy_config["generation"]["mcore_generation_config"]
             prior_mode = mcore_cfg.get("kv_cache_management_mode", "persist")
@@ -725,9 +722,7 @@ def setup(
         # vLLM generation: setup config, then initialize with policy
         generation_config = cast(VllmConfig, generation_config)
         if generation_config["vllm_cfg"]["precision"] == "fp8":
-            assert loss_config.use_importance_sampling_correction, (
-                "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
-            )
+            assert loss_config.use_importance_sampling_correction, "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
         if generation_config["vllm_cfg"]["kv_cache_dtype"].startswith("fp8"):
             # FP8 KV cache requires FP8 model precision
             assert generation_config["vllm_cfg"]["precision"] == "fp8", (
@@ -735,15 +730,15 @@ def setup(
                 "FP8 KV cache can only be used together with FP8 model weights."
             )
             # FP8 KV cache compatibility checks
-            assert policy_config["dtensor_cfg"]["enabled"] == False, (
-                "DTensor backend is not supported with kv cache fp8 enabled."
-            )
-            assert not _should_use_async_rollouts(master_config), (
-                "Async rollouts is not supported with kv cache fp8 enabled."
-            )
-            assert policy_config["megatron_cfg"]["pipeline_model_parallel_size"] == 1, (
-                "Currently when using FP8 KV cache in generation, then in megatron we only support pipeline_model_parallel_size=1. We will add more support in future."
-            )
+            assert (
+                policy_config["dtensor_cfg"]["enabled"] == False
+            ), "DTensor backend is not supported with kv cache fp8 enabled."
+            assert not _should_use_async_rollouts(
+                master_config
+            ), "Async rollouts is not supported with kv cache fp8 enabled."
+            assert (
+                policy_config["megatron_cfg"]["pipeline_model_parallel_size"] == 1
+            ), "Currently when using FP8 KV cache in generation, then in megatron we only support pipeline_model_parallel_size=1. We will add more support in future."
 
         ## make vllm hf overrides match the training policy
         generation_config["vllm_kwargs"]["hf_overrides"] = policy_config.get(
@@ -985,9 +980,9 @@ def dynamic_sampling(
                 dynamic_sampling_max_gen_batches = master_config.grpo[
                     "dynamic_sampling_max_gen_batches"
                 ]
-                assert dynamic_sampling_max_gen_batches > 0, (
-                    "When using grpo.use_dynamic_sampling, grpo.dynamic_sampling_max_gen_batches must be > 0"
-                )
+                assert (
+                    dynamic_sampling_max_gen_batches > 0
+                ), "When using grpo.use_dynamic_sampling, grpo.dynamic_sampling_max_gen_batches must be > 0"
                 if dynamic_sampling_num_gen_batches <= dynamic_sampling_max_gen_batches:
                     print(
                         f"Generation sample buffer size: {filtered_prompts_size} is smaller than train_prompts_size: {train_prompts_size}. Processed {dynamic_sampling_num_gen_batches} batches so far out of {dynamic_sampling_max_gen_batches}."
@@ -1154,9 +1149,9 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
         return should_use_nemo_gym
 
     # Validate the setup for training with NeMo-Gym
-    assert _should_use_async_rollouts(master_config), (
-        "❌ Error: In order to use NeMo-Gym, you must use a generation backend with `async_engine: true`!"
-    )
+    assert _should_use_async_rollouts(
+        master_config
+    ), "❌ Error: In order to use NeMo-Gym, you must use a generation backend with `async_engine: true`!"
 
     # We piggyback off of `_should_use_async_rollouts` to guarantee the existence of these configs.
     generation_config = master_config.policy["generation"]
@@ -1170,9 +1165,7 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
         )
     else:
         should_expose_http_server = False
-    assert should_expose_http_server, (
-        "In order to use NeMo-Gym, you must expose the generation server via `expose_http_server: true`!"
-    )
+    assert should_expose_http_server, "In order to use NeMo-Gym, you must expose the generation server via `expose_http_server: true`!"
 
     return should_use_nemo_gym
 
@@ -2484,9 +2477,9 @@ def validate(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run validation on the validation dataset."""
     if val_dataloader is None:
-        assert val_dataloader is not None or master_config.grpo["val_period"] == 0, (
-            "val_dataloader is None, so grpo.val_period must be 0"
-        )
+        assert (
+            val_dataloader is not None or master_config.grpo["val_period"] == 0
+        ), "val_dataloader is None, so grpo.val_period must be 0"
         print("  ⚠️ No validation dataloader provided, skipping validation", flush=True)
         return {}, {}
 
@@ -2696,9 +2689,7 @@ def async_grpo_train(
         "Set either policy.generation.vllm_cfg.async_engine=true (vLLM) or "
         "policy.generation.mcore_generation_config.async_engine=true (Megatron)."
     )
-    assert master_config.loss_fn.use_importance_sampling_correction, (
-        "Importance sampling correction must be enabled for async GRPO for good convergence due to off-policy samples!"
-    )
+    assert master_config.loss_fn.use_importance_sampling_correction, "Importance sampling correction must be enabled for async GRPO for good convergence due to off-policy samples!"
 
     if master_config.grpo["async_grpo"]["max_trajectory_age_steps"] > 1:
         if not master_config.grpo["async_grpo"].get("in_flight_weight_updates", False):
@@ -2740,9 +2731,7 @@ def async_grpo_train(
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
 
-    assert not colocated_inference, (
-        "Colocated inference is not supported for async GRPO. Please use non-colocated inference."
-    )
+    assert not colocated_inference, "Colocated inference is not supported for async GRPO. Please use non-colocated inference."
 
     # Calculate minimum buffer size from training requirements
     # In per-prompt buffer mode, one buffer entry is 1 prompt * num_generations_per_prompt

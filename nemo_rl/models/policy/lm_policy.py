@@ -271,9 +271,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             )
 
         if config["dynamic_batching"]["enabled"]:
-            assert pp_size == 1, (
-                "Dynamic batching is only supported for single pipeline parallel stage"
-            )
+            assert (
+                pp_size == 1
+            ), "Dynamic batching is only supported for single pipeline parallel stage"
             self.use_dynamic_batches = True
             self.dynamic_batching_args: DynamicBatchingArgs = {
                 "input_key": "input_ids",
@@ -283,9 +283,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 ],
                 "max_tokens_per_microbatch": 0,  # Override this in each different call (presumably different sizes)
             }
-            assert not config["sequence_packing"]["enabled"], (
-                "Dynamic Batching is exclusive of Sequence Packing. Please disable Sequence Packing to use Dynamic Batching"
-            )
+            assert not config[
+                "sequence_packing"
+            ][
+                "enabled"
+            ], "Dynamic Batching is exclusive of Sequence Packing. Please disable Sequence Packing to use Dynamic Batching"
         else:
             self.use_dynamic_batches = False
 
@@ -307,9 +309,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "input_lengths_key": "input_lengths",
                 "sequence_length_pad_multiple": sequence_length_pad_multiple,
             }
-            assert not config["dynamic_batching"]["enabled"], (
-                "Sequence Packing is exclusive of Dynamic Batching. Please disable Dynamic Batching"
-            )
+            assert not config[
+                "dynamic_batching"
+            ][
+                "enabled"
+            ], "Sequence Packing is exclusive of Dynamic Batching. Please disable Dynamic Batching"
         else:
             self.use_sequence_packing = False
 
@@ -712,12 +716,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
         """Generate a batch of data using the policy."""
-        assert isinstance(data, BatchedDataDict), (
-            f"data must be a BatchedDataDict, got type: {type(data)}"
-        )
-        assert "input_ids" in data and "input_lengths" in data, (
-            "Missing required input fields"
-        )
+        assert isinstance(
+            data, BatchedDataDict
+        ), f"data must be a BatchedDataDict, got type: {type(data)}"
+        assert (
+            "input_ids" in data and "input_lengths" in data
+        ), "Missing required input fields"
         assert self.cfg["generation"] is not None, "Generation config is not set"
 
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
@@ -754,12 +758,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     ) -> BatchedDataDict[ScoreOutputSpec]:
         """Score a batch of data using the policy."""
         # Verify input data is right-padded
-        assert isinstance(data, BatchedDataDict), (
-            f"data must be a BatchedDataDict, got type: {type(data)}"
-        )
-        assert "input_ids" in data and "input_lengths" in data, (
-            "Missing required input fields"
-        )
+        assert isinstance(
+            data, BatchedDataDict
+        ), f"data must be a BatchedDataDict, got type: {type(data)}"
+        assert (
+            "input_ids" in data and "input_lengths" in data
+        ), "Missing required input fields"
 
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
         sharded_data = data.shard_by_batch_size(dp_size, batch_size=None)

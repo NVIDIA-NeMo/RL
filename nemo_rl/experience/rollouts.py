@@ -151,9 +151,7 @@ async def generate_responses_async(
         and hasattr(policy_generation, "generate_async")
     )
 
-    assert use_async_generation, (
-        "Async generation is not enabled. Please enable async generation by setting async_engine=True in the vllm_cfg section of the policy config."
-    )
+    assert use_async_generation, "Async generation is not enabled. Please enable async generation by setting async_engine=True in the vllm_cfg section of the policy config."
 
     # Use async generation with per-sample streaming
     collected_indexed_outputs: list[
@@ -170,9 +168,9 @@ async def generate_responses_async(
     # Extract in correct order
     ordered_batched_data_dicts = [item for _, item in collected_indexed_outputs]
 
-    assert ordered_batched_data_dicts, (
-        "Generation returned no outputs for a non-empty batch."
-    )
+    assert (
+        ordered_batched_data_dicts
+    ), "Generation returned no outputs for a non-empty batch."
 
     generation_outputs = BatchedDataDict.from_batches(
         ordered_batched_data_dicts,
@@ -513,9 +511,9 @@ def run_multi_turn_rollout(
                 tokens_left_for_obs = max_seq_len - (
                     len(generated_ids[i]) + active_input_lengths[i]
                 )
-                assert tokens_left_for_obs >= 0, (
-                    f"tokens_left_for_obs={tokens_left_for_obs} should not be negative. This should not happen if the inference engine respects the max sequence length."
-                )
+                assert (
+                    tokens_left_for_obs >= 0
+                ), f"tokens_left_for_obs={tokens_left_for_obs} should not be negative. This should not happen if the inference engine respects the max sequence length."
                 # truncate
                 tokenized_obs = tokenized_obs[:tokens_left_for_obs]
                 truncation_mask[i] = True
@@ -1110,9 +1108,9 @@ def run_async_nemo_gym_rollout(
     # Handle generation parameters up front so we don't hide anything inside here to avoid being unintuitive to the user.
     # NeMo-Gym policy is "What you see is what you get".
     assert not greedy, "`greedy` is not supported in NeMo-Gym path!"
-    assert max_rollout_turns is None, (
-        "`max_rollout_turns` is not supported in NeMo-Gym path!"
-    )
+    assert (
+        max_rollout_turns is None
+    ), "`max_rollout_turns` is not supported in NeMo-Gym path!"
     if "vllm_cfg" in policy_generation.cfg:
         engine_max_model_len = policy_generation.cfg["vllm_cfg"]["max_model_len"]
     elif "mcore_generation_config" in policy_generation.cfg:
@@ -1129,16 +1127,16 @@ def run_async_nemo_gym_rollout(
             "honored. Lower max_total_sequence_length or raise the engine's max_model_len."
         )
     # We don't use these stop criteria
-    assert not generation_config["stop_strings"], (
-        "Stop strings is not supported in the generation config in NeMo-Gym path!"
-    )
-    assert not generation_config["stop_token_ids"], (
-        "Stop strings is not supported in the generation config in NeMo-Gym path!"
-    )
+    assert not generation_config[
+        "stop_strings"
+    ], "Stop strings is not supported in the generation config in NeMo-Gym path!"
+    assert not generation_config[
+        "stop_token_ids"
+    ], "Stop strings is not supported in the generation config in NeMo-Gym path!"
     # Top k is not OpenAI compatible, so NeMo-Gym does not guarantee support over it.
-    assert not generation_config["top_k"], (
-        "Top k is not supported in the generation config in NeMo-Gym path!"
-    )
+    assert not generation_config[
+        "top_k"
+    ], "Top k is not supported in the generation config in NeMo-Gym path!"
 
     timer = Timer()
     timer_prefix = "timing/rollout"

@@ -14,7 +14,6 @@
 import gc
 import os
 import re
-import time
 import warnings
 
 from collections import defaultdict
@@ -82,7 +81,7 @@ from nemo_rl.models.policy.interfaces import (
 )
 from nemo_rl.models.generation.megatron.megatron_worker import (
     MegatronGenerationMixin,
-    MegatronRefitMixin,
+    MegatronGenerationRefitMixin,
 )
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
@@ -97,7 +96,7 @@ TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 # This is useful when using worker extension classes.
 class MegatronPolicyWorkerImpl(
     MegatronGenerationMixin,
-    MegatronRefitMixin,
+    MegatronGenerationRefitMixin,
     TQWorkerMixin,
     AbstractPolicyWorker,
     ColocatablePolicyInterface,
@@ -259,7 +258,9 @@ class MegatronPolicyWorkerImpl(
         # Step 3: Setup model configuration
         # Training workers cannot use inference_optimized transformer spec.
         if init_optimizer:
-            assert config["megatron_cfg"].get("transformer_impl") != "inference_optimized", (
+            assert (
+                config["megatron_cfg"].get("transformer_impl") != "inference_optimized"
+            ), (
                 "transformer_impl=inference_optimized must not be set on training workers. "
                 "Use policy.generation.mcore_generation_config.transformer_impl=inference_optimized instead."
             )
@@ -362,8 +363,6 @@ class MegatronPolicyWorkerImpl(
         self._held_gather_buffer = None
 
         self._init_inference_engine_state()
-
-
 
     def enable_forward_pre_hook(self):
         assert isinstance(self.model, DistributedDataParallel)
@@ -706,9 +705,9 @@ class MegatronPolicyWorkerImpl(
                 continue
 
             # Case 2: _extra_state (shape mismatch or non-Tensor) → set_extra_state()
-            assert "extra_state" in state_dict_key, (
-                f"the {state_dict_key} is not an extra_state, but the param_or_buf is mismatched with the reference_state_dict {source_value.shape} != {param_or_buf.shape}."
-            )
+            assert (
+                "extra_state" in state_dict_key
+            ), f"the {state_dict_key} is not an extra_state, but the param_or_buf is mismatched with the reference_state_dict {source_value.shape} != {param_or_buf.shape}."
 
             submodule_path = state_dict_key.rsplit("._extra_state", 1)[0]
             base_module = getattr(self.model, "module", self.model)
