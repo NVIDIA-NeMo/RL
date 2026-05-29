@@ -550,8 +550,12 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                                 "NOUSNET_DIAG_ADAPTER_NAMES", ""
                             ).split(",")
                             _diag_adapter_names = [n for n in _diag_adapter_names if n]
+                            # Use module-level step counter so disk dumps land in
+                            # the same step_NNNN directories as loss-side dumps.
+                            _diag_pre_step = _diag.next_step("LoraStep")
                             _diag_pre = _diag.aggregate_lora_fingerprints(
                                 self.model, _diag_adapter_names or None, grads=True,
+                                dump_phase="pre_step", step=_diag_pre_step,
                             )
                             # Prefix pre-step keys.
                             _diag_step_metrics = {
@@ -570,8 +574,10 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
                                 "NOUSNET_DIAG_ADAPTER_NAMES", ""
                             ).split(",")
                             _diag_adapter_names = [n for n in _diag_adapter_names if n]
+                            # Reuse _diag_pre_step so pre/post dumps share a step_NNNN dir.
                             _diag_post = _diag.aggregate_lora_fingerprints(
                                 self.model, _diag_adapter_names or None, grads=False,
+                                dump_phase="post_step", step=_diag_pre_step,
                             )
                             for k, v in _diag_post.items():
                                 _diag_step_metrics[k.replace("diag/", "diag_post/")] = v
