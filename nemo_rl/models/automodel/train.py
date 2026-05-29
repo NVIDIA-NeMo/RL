@@ -435,6 +435,16 @@ def automodel_forward_backward(
                     for k in metrics.keys():
                         if "_min" in k or "_max" in k:
                             continue
+                        # nousnet: skip non-numeric scalars (str sha16/shape/
+                        # dtype emitted by diag hooks, list/tuple payloads).
+                        # Stock dividend `metrics[k] /= num_global_batches`
+                        # crashes on strings. Mirror the existing _min/_max
+                        # skip semantic so logging stays one-to-one.
+                        v = metrics[k]
+                        if not isinstance(v, (int, float, torch.Tensor)):
+                            continue
+                        if isinstance(v, bool):  # bool is int subclass
+                            continue
 
                         metrics[k] /= num_global_batches
                 else:
