@@ -1,0 +1,67 @@
+[
+  {
+    "id": "launch-nemo-rl-positive-001",
+    "question": "Run the Qwen 3 30B math recipe on the Kubernetes cluster as a one-shot RayJob.",
+    "expected_skill": "launch-nemo-rl",
+    "ground_truth": "The agent loads the launch-nemo-rl skill, identifies the recipe and infra files, validates with nrl-k8s check, and launches with nrl-k8s run --rayjob.",
+    "expected_behavior": [
+      "The agent read launch-nemo-rl/SKILL.md before acting",
+      "The agent identified the recipe and matching infra YAML files",
+      "The agent ran nrl-k8s check to validate before launching",
+      "The agent used nrl-k8s run with --rayjob for ephemeral mode"
+    ]
+  },
+  {
+    "id": "launch-nemo-rl-positive-002",
+    "question": "The training job seems stuck. How do I get the logs for the running job?",
+    "expected_skill": "launch-nemo-rl",
+    "ground_truth": "The agent loads the launch-nemo-rl skill and guides the user through checking status with nrl-k8s status and fetching logs with nrl-k8s job logs.",
+    "expected_behavior": [
+      "The agent read launch-nemo-rl/SKILL.md before acting",
+      "The agent used nrl-k8s status to check the cluster state",
+      "The agent used nrl-k8s job list and nrl-k8s job logs to fetch driver logs"
+    ]
+  },
+  {
+    "id": "launch-nemo-rl-positive-003",
+    "question": "Tear down the training cluster after the run is done.",
+    "expected_skill": "launch-nemo-rl",
+    "ground_truth": "The agent loads the launch-nemo-rl skill and uses nrl-k8s cluster down to tear down the RayCluster.",
+    "expected_behavior": [
+      "The agent read launch-nemo-rl/SKILL.md before acting",
+      "The agent confirmed the run was complete before tearing down",
+      "The agent used nrl-k8s cluster down with the appropriate target"
+    ]
+  },
+  {
+    "id": "launch-nemo-rl-positive-004",
+    "question": "I want to iterate on this recipe quickly. Launch it in long-lived mode so I can resubmit without recreating the cluster.",
+    "expected_skill": "launch-nemo-rl",
+    "ground_truth": "The agent loads the launch-nemo-rl skill and uses nrl-k8s run with --raycluster for long-lived mode.",
+    "expected_behavior": [
+      "The agent read launch-nemo-rl/SKILL.md before acting",
+      "The agent used --raycluster flag for long-lived mode",
+      "The agent explained that re-running reuses the existing cluster"
+    ]
+  },
+  {
+    "id": "launch-nemo-rl-negative-001",
+    "question": "Add a new config field to the GRPOConfig TypedDict for controlling the entropy bonus.",
+    "expected_skill": null,
+    "should_trigger": false,
+    "ground_truth": "The agent should not activate the launch-nemo-rl skill for a code change task.",
+    "expected_behavior": [
+      "The agent did not read or activate launch-nemo-rl/SKILL.md"
+    ]
+  },
+  {
+    "id": "launch-nemo-rl-negative-002",
+    "question": "Review PR #1234 for correctness issues in the reward calculation.",
+    "expected_skill": null,
+    "should_trigger": false,
+    "ground_truth": "The agent should not activate the launch-nemo-rl skill for a code review task.",
+    "expected_behavior": [
+      "The agent did not read or activate launch-nemo-rl/SKILL.md"
+    ]
+  }
+]
