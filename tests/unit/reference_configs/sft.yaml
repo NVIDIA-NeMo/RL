@@ -12,6 +12,7 @@ sft:
   val_at_start: true
   val_at_end: false
   seed: 42
+  only_unmask_final: false
 
 checkpointing:
   enabled: true
@@ -105,6 +106,8 @@ policy:
     env_vars: {}
     empty_unused_memory_level: 1
     activation_checkpointing: false
+    recompute_granularity: "full"
+    recompute_modules: null
     tensor_model_parallel_size: 1
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 1

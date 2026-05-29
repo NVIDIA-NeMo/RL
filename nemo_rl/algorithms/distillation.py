@@ -38,6 +38,7 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
+from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
     ClusterConfig,
@@ -253,10 +254,7 @@ def setup(
     )
 
     if last_checkpoint_path:
-        dataloader_state_dict = torch.load(
-            os.path.join(last_checkpoint_path, "train_dataloader.pt")
-        )
-        dataloader.load_state_dict(dataloader_state_dict)
+        load_dataloader_state(dataloader, last_checkpoint_path, data_config)
 
     print(
         f"  ✓ Training dataloader loaded with {len(train_dataset)} samples", flush=True
@@ -532,7 +530,7 @@ def distillation_train(
         student_generation = student_policy  # type: ignore
         NEED_REFIT = False
     POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
-    assert student_generation is not None  # for mypy type check
+    assert student_generation is not None
 
     # common config/state items
     current_epoch = distillation_save_state["current_epoch"]  # current epoch

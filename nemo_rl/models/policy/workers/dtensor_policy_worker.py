@@ -59,6 +59,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
 from nemo_rl.algorithms.loss import SequencePackingLossWrapper, prepare_loss_input
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
+from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
@@ -171,7 +172,9 @@ def get_cpu_state_dict(
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
-class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
+class DTensorPolicyWorkerImpl(
+    TQWorkerMixin, AbstractPolicyWorker, ColocatablePolicyInterface
+):
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
 
@@ -181,6 +184,16 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
             return f"{self.__class__.__qualname__}[rank={torch.distributed.get_rank()}]"
         else:
             return f"{self.__class__.__qualname__}"
+
+    def _get_replica_group(self) -> Optional[Any]:
+        """Replica group = flattened (cp, tp) sub-mesh, for NCCL broadcast in ``_fetch``."""
+        return self.device_mesh[("cp", "tp")]._flatten().get_group()
+
+    def _local_coords(self) -> dict[str, int]:
+        return {
+            "tensor_parallel": self.device_mesh["tp"].get_local_rank(),
+            "context_parallel": self.device_mesh["cp"].get_local_rank(),
+        }
 
     def __init__(
         self,

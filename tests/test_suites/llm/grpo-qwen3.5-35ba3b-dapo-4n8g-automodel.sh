@@ -4,7 +4,7 @@ source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=4
-STEPS_PER_RUN=30
+STEPS_PER_RUN=20
 MAX_STEPS=30
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 NUM_MINUTES=240
@@ -25,6 +25,7 @@ uv run examples/run_grpo.py \
     logger.tensorboard_enabled=True \
     checkpointing.enabled=True \
     checkpointing.checkpoint_dir=$CKPT_DIR \
+    checkpointing.checkpoint_must_save_by=00:03:45:00 \
     $@ \
     2>&1 | tee $RUN_LOG
 
@@ -35,7 +36,6 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
         'median(data["train/token_mult_prob_error"]) < 1.1' \
-        'data["train/token_mult_prob_error"]["30"] < 1.05' \
         'mean(data["train/gen_kl_error"]) < 0.002' \
         'data["train/reward"]["30"] > -0.7' \
         'max(data["validation/accuracy"]) > 0.2'

@@ -711,7 +711,20 @@ def setup_model_and_optimizer(
     optimizer = None
     if init_optimizer:
         optimizer_cls = get_class(config["optimizer"]["name"])
-        optimizer = optimizer_cls(model.parameters(), **config["optimizer"]["kwargs"])
+        optimizer_kwargs = dict(config["optimizer"]["kwargs"])
+        # Resolve string-valued torch dtypes (e.g. "torch.bfloat16" -> torch.bfloat16)
+        for key, value in optimizer_kwargs.items():
+            if isinstance(value, str) and value.startswith("torch."):
+                optimizer_kwargs[key] = getattr(torch, value.removeprefix("torch."))
+        # Only pass trainable params to the optimizer. TE FusedAdam's step()
+        # allocates per-param state (exp_avg/exp_avg_sq/master_param) before the
+        # p.grad-is-None check, so passing frozen params (e.g. the visual
+        # encoder in text-only training) causes DCP to save unused state that
+        # later fails to reshard on resume.
+        optimizer = optimizer_cls(
+            (p for p in model.parameters() if p.requires_grad),
+            **optimizer_kwargs,
+        )
 
     # Initialize scheduler
     scheduler = None

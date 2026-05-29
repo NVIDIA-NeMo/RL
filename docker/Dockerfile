@@ -59,7 +59,7 @@ apt-get clean
 rm -rf /var/lib/apt/lists/*
 EOF
 
-# CMake (for sglang build)
+# CMake (for CUDA extension builds: transformer-engine, mamba-ssm, etc.)
 RUN GITHUB_ARTIFACTORY=github.com \
     && CMAKE_VERSION=3.31.1 \
     && ARCH=$(uname -m) \
@@ -116,6 +116,9 @@ ENV UV_LINK_MODE=copy
 
 # Ensure DeepEP is built for H100 and B200 (also mcore inference unified memory API now invokes a torch API that requires these to be set)
 ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
+
+# Ensure HybridEP/DeepEP JIT compilation can find nvcc at runtime
+ENV CUDA_HOME=/usr/local/cuda
 
 ## CUDA 13 moved standard library headers under include/cccl; expose that path so
 ## builds that include <cuda/std/...> (e.g., deep_gemm) can find them.
