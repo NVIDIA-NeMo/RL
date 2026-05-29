@@ -353,10 +353,7 @@ class MegatronPolicyWorkerImpl(
         if not self._uses_mxfp8_overlap_shared_param_buffer():
             return
 
-        forward_pre_hook_enabled = (
-            len(getattr(self.model, "remove_forward_pre_hook_handles", {})) > 0
-        )
-        if not forward_pre_hook_enabled:
+        if not self._forward_pre_hook_enabled():
             return
 
         if zero_grad_buffer:
@@ -380,6 +377,9 @@ class MegatronPolicyWorkerImpl(
         )
 
     def _get_model_extra_state_dict(self) -> dict[str, Any]:
+        fp8_enabled = self.fp8_cfg and self.fp8_cfg.get("enabled", False)
+        if not fp8_enabled:
+            return {}
         extra_state = {}
         for key, value in self.model.state_dict().items():
             if "._extra_state" not in key:
@@ -393,16 +393,7 @@ class MegatronPolicyWorkerImpl(
     def _restore_model_extra_state_dict(self, extra_state: dict[str, Any]) -> None:
         if not extra_state:
             return
-
-        base_module = getattr(self.model, "module", self.model)
-        for state_dict_key, source_value in extra_state.items():
-            submodule_path = state_dict_key.rsplit("._extra_state", 1)[0]
-            target_base = base_module
-            top_level_name = submodule_path.split(".", 1)[0]
-            if top_level_name and not hasattr(target_base, top_level_name):
-                target_base = getattr(target_base, "module", target_base)
-            target_module = target_base.get_submodule(submodule_path)
-            target_module.set_extra_state(source_value)
+        self.model.load_state_dict(extra_state, strict=False)
 
     @wrap_with_nvtx_name("megatron_policy_worker/train")
     def train(
