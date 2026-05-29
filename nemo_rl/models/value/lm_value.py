@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
-import warnings
 from contextlib import nullcontext
 from typing import Any, Optional, Union
 
@@ -95,12 +94,11 @@ class Value(ValueInterface):
 
             env_vars = config["megatron_cfg"].get("env_vars", {})
         else:
-            # NOTE(ppo-dtensor port): bg51717/ppo originally raised
-            # NotImplementedError here, but the surrounding code is fully
-            # wired (dtensor_value_worker_v2.py exists; setup/train/data
-            # modules are aligned). We mirror Nemo-RL-ppo (PR #2027)'s
-            # dispatch: V2 is the only supported DTensor path for the
-            # value worker; V1 is not implemented anywhere.
+            # Dispatch to DTensorValueWorkerV2. The original baseline raised
+            # NotImplementedError here; the right-shift fix inside
+            # DTensorValueWorkerV2 aligns its temporal semantics with the
+            # MegatronValueWorker (V[t] = V(s_t) rather than V(s_{t+1})), so
+            # GAE / MseValueLossFn / value clipping are self-consistent.
             if not dtensor_enable:
                 raise ValueError(
                     "Please set value.dtensor_cfg.enabled=true to use DTensor "
@@ -108,31 +106,14 @@ class Value(ValueInterface):
                     "Megatron-Core)."
                 )
 
-            use_v2 = bool(config.get("dtensor_cfg", {}).get("_v2", False))
-            if use_v2:
-                worker_builder_cls = (
-                    "nemo_rl.models.value.workers."
-                    "dtensor_value_worker_v2.DTensorValueWorkerV2"
-                )
-
-                if "TORCH_CUDA_ARCH_LIST" not in os.environ:
-                    warnings.warn(
-                        "TORCH_CUDA_ARCH_LIST is not set. This is needed if "
-                        "using DeepEP in DTensorValueWorker V2. The variable "
-                        "is set in our container, but if you are running a "
-                        "custom container or baremetal, you may need to set "
-                        "it manually. Example: "
-                        "export TORCH_CUDA_ARCH_LIST='9.0 10.0'"
-                    )
-            else:
-                raise NotImplementedError(
-                    "DTensor V1 backend is not implemented for Value models. "
-                    "Please set value.dtensor_cfg._v2=true to use DTensor V2."
-                )
+            worker_builder_cls = (
+                "nemo_rl.models.value.workers."
+                "dtensor_value_worker_v2.DTensorValueWorkerV2"
+            )
 
             tp_size = config["dtensor_cfg"]["tensor_parallel_size"]
-            # DTensor V2 doesn't pipeline-parallel; pp_size stays at its
-            # default of 1 (initialised above).
+            # DTensor V2 does not pipeline-parallel; pp_size stays at the
+            # default of 1 initialised above.
             cp_size = config["dtensor_cfg"]["context_parallel_size"]
 
             env_vars = config["dtensor_cfg"].get("env_vars", {})
