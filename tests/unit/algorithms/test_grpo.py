@@ -353,6 +353,61 @@ class StubReplayBuffer:
         )
         return mock
 
+    @property
+    def state_dict(self):
+        """Return a mock that returns checkpointable buffer state."""
+        trajectories = self._trajectories or [
+            {
+                "batch": self._mock_batch,
+                "rollout_metrics": self._mock_rollout_metrics,
+            }
+            for _ in range(self._size)
+        ]
+        mock = MagicMock()
+        mock.remote = MagicMock(
+            return_value={
+                "trajectories": list(trajectories),
+                "trajectory_versions": [0] * len(trajectories),
+                "target_weight_versions": [0] * len(trajectories),
+                "last_target_weight_already_generated": 0,
+                "max_size": self._size,
+            }
+        )
+        return mock
+
+    @property
+    def load_state_dict(self):
+        """Return a mock that accepts restored buffer state."""
+
+        def _load_state_dict(state, *args, **kwargs):
+            self._trajectories = list(state["trajectories"])
+            self._size = len(self._trajectories)
+
+        mock = MagicMock()
+        mock.remote = MagicMock(side_effect=_load_state_dict)
+        return mock
+
+    @property
+    def get_trajectories_needed(self):
+        """Return a mock that reports how many prompt groups are still needed."""
+        mock = MagicMock()
+        mock.remote = MagicMock(
+            side_effect=lambda _target_step, num_prompts_per_step: max(
+                0, num_prompts_per_step - self._size
+            )
+        )
+        return mock
+
+    @property
+    def has_complete_batch(self):
+        """Return a mock that reports whether the current step can train."""
+        mock = MagicMock()
+        mock.remote = MagicMock(
+            side_effect=lambda _target_step, num_prompts_per_step: self._size
+            >= num_prompts_per_step
+        )
+        return mock
+
 
 class StubAsyncTrajectoryCollector:
     """Non-Ray stub of AsyncTrajectoryCollector for unit testing
@@ -480,6 +535,7 @@ def mock_grpo_components():
     loss_fn = ClippedPGLossFn(loss_config)
     logger = MagicMock()
     checkpointer = MagicMock()
+    checkpointer.get_latest_checkpoint_path.return_value = None
 
     # Create mock environment
     task_to_env = {"math": MagicMock()}
