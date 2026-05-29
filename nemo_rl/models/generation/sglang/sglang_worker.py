@@ -179,6 +179,9 @@ class SGLangGenerationWorker:
         # Get current node IP and a free port for the server
         node_ip = _get_node_ip_local()
         free_port = _get_free_port_local()
+        # sglang derives grpc_port = port + 10000, so cap at 55535 to stay within valid range
+        while free_port > 55535:
+            free_port = _get_free_port_local()
 
         # Build SGLang server arguments
         kwargs = {

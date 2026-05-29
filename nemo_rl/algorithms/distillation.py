@@ -530,7 +530,7 @@ def distillation_train(
         student_generation = student_policy  # type: ignore
         NEED_REFIT = False
     POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
-    assert student_generation is not None  # for mypy type check
+    assert student_generation is not None
 
     # common config/state items
     current_epoch = distillation_save_state["current_epoch"]  # current epoch

@@ -135,22 +135,34 @@ def apply_reward_shaping(
     # Calculate the expected response length
     expected_response_length = max_response_length - overlong_buffer_length
 
-    assert len(batch["message_log"]) == len(rewards), (
+    # Prefer slim per-sample tensor (data-plane path: message_log lives in
+    # TQ, slice carries response_token_lengths). Fall back to scanning
+    # message_log for the legacy non-data-plane caller.
+    response_token_lengths = batch.get("response_token_lengths")
+    if response_token_lengths is not None:
+        if isinstance(response_token_lengths, torch.Tensor):
+            response_lengths = response_token_lengths.tolist()
+        else:
+            response_lengths = list(response_token_lengths)
+    else:
+        response_lengths = []
+        for message_log in batch["message_log"]:
+            length = None
+            for message in message_log:
+                if message["role"] == "assistant":
+                    length = message["token_ids"].shape[0]
+                    break
+            assert length is not None, (
+                "Assistant response not found during reward shaping"
+            )
+            response_lengths.append(length)
+
+    assert len(response_lengths) == len(rewards), (
         "The number of messages in the batch must match the number of rewards"
     )
 
     updated_rewards = torch.zeros_like(rewards)
-    for i, message_log in enumerate(batch["message_log"]):
-        # Get the assistant response length (index 1 is the assistant response)
-        message_response_length = None
-        for message in message_log:
-            if message["role"] == "assistant":
-                message_response_length = message["token_ids"].shape[0]
-                break
-        assert message_response_length is not None, (
-            "Assistant response not found during reward shaping"
-        )
-
+    for i, message_response_length in enumerate(response_lengths):
         # Calculate the exceed length and the corresponding reward penalty
         exceed_length = message_response_length - expected_response_length
         overlong_reward = min(

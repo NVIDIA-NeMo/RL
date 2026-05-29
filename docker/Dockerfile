@@ -59,7 +59,7 @@ apt-get clean
 rm -rf /var/lib/apt/lists/*
 EOF
 
-# CMake (for sglang build)
+# CMake (for CUDA extension builds: transformer-engine, mamba-ssm, etc.)
 RUN GITHUB_ARTIFACTORY=github.com \
     && CMAKE_VERSION=3.31.1 \
     && ARCH=$(uname -m) \
