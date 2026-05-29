@@ -54,6 +54,7 @@ from nemo_rl.experience.rollouts import (
     run_multi_turn_rollout,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.utils.r3_trace import trace_rollout_payload
 
 # Carry keys producible by the rollout actor only when the caller opts in.
 # These are np.ndarray(object) per-row arrays from decompose_message_log; the
@@ -376,6 +377,7 @@ class SyncRolloutActor:
         n_per_prompt = n_samples // n_prompts
         uids = [str(uuid.uuid4()) for _ in range(n_prompts)]
         sample_ids = [f"{uid}_g{i}" for uid in uids for i in range(n_per_prompt)]
+        trace_rollout_payload(keys=sample_ids, data=bulk_batch)
         meta = kv_first_write(
             bulk_batch,
             sample_ids=sample_ids,
