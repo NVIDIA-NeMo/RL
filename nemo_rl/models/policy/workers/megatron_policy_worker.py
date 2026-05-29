@@ -15,7 +15,6 @@ import gc
 import os
 import re
 import warnings
-
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Iterator, Optional, TypeVar, cast
@@ -47,6 +46,10 @@ from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
+from nemo_rl.models.generation.megatron.megatron_worker import (
+    MegatronGenerationMixin,
+    MegatronGenerationRefitMixin,
+)
 from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.megatron.common import get_moe_metrics
 from nemo_rl.models.megatron.data import (
@@ -78,10 +81,6 @@ from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
-)
-from nemo_rl.models.generation.megatron.megatron_worker import (
-    MegatronGenerationMixin,
-    MegatronGenerationRefitMixin,
 )
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
@@ -705,9 +704,9 @@ class MegatronPolicyWorkerImpl(
                 continue
 
             # Case 2: _extra_state (shape mismatch or non-Tensor) → set_extra_state()
-            assert (
-                "extra_state" in state_dict_key
-            ), f"the {state_dict_key} is not an extra_state, but the param_or_buf is mismatched with the reference_state_dict {source_value.shape} != {param_or_buf.shape}."
+            assert "extra_state" in state_dict_key, (
+                f"the {state_dict_key} is not an extra_state, but the param_or_buf is mismatched with the reference_state_dict {source_value.shape} != {param_or_buf.shape}."
+            )
 
             submodule_path = state_dict_key.rsplit("._extra_state", 1)[0]
             base_module = getattr(self.model, "module", self.model)

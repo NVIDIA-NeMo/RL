@@ -406,9 +406,9 @@ class MegatronGenerationMixin:
     ) -> tuple[torch.Tensor, torch.Tensor, SamplingParams]:
         """Build the prompt tensors and sampling params for one batch of requests."""
         if data is not None:
-            assert isinstance(
-                data, BatchedDataDict
-            ), f"data must be a BatchedDataDict, got type: {type(data)}"
+            assert isinstance(data, BatchedDataDict), (
+                f"data must be a BatchedDataDict, got type: {type(data)}"
+            )
             is_right_padded, error_msg = verify_right_padding(
                 data, pad_value=self.tokenizer.pad_token_id
             )
@@ -585,9 +585,9 @@ class MegatronGenerationMixin:
         from megatron.core.inference.inference_request import DynamicInferenceRequest
 
         dist_rank = torch.distributed.get_rank()
-        assert (
-            dist_rank == 0
-        ), "Only rank 0 creates a client to communicate with the coordinator"
+        assert dist_rank == 0, (
+            "Only rank 0 creates a client to communicate with the coordinator"
+        )
 
         print(
             f"[Rank {dist_rank}] Submitting {prompt_tokens_tensor.size(0)} requests to coordinator"
