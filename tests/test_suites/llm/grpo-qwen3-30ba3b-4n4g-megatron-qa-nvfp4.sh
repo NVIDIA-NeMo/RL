@@ -4,27 +4,7 @@
 # NVFP4 calibration, Megatron Qwen3 MoE expert weights, quantized vLLM
 # generation, logprobs, and the quantized policy train step.
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
-set -eou pipefail
-
-PROJECT_ROOT=$(realpath $SCRIPT_DIR/../../..)
-EXP_NAME=$(basename $0 .sh)
-EXP_DIR=$SCRIPT_DIR/$EXP_NAME
-LOG_DIR=$EXP_DIR/logs
-CKPT_DIR=$EXP_DIR/ckpts
-JSON_METRICS=$EXP_DIR/metrics.json
-RUN_LOG=$EXP_DIR/run.log
-CONFIG_PATH=$PROJECT_ROOT/examples/modelopt/qa_grpo_qwen3_30ba3b_megatron.yaml
-
-export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
-
-exit_if_max_steps_reached() {
-  STEPS_SO_FAR=$(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS || echo 0)
-  if [[ $STEPS_SO_FAR -ge $MAX_STEPS ]]; then
-      echo "[INFO] Target step $MAX_STEPS reached, skipping run"
-      exit 0
-  fi
-  echo "[INFO] Steps so far: $STEPS_SO_FAR, running till $MAX_STEPS steps"
-}
+source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=4
@@ -34,13 +14,6 @@ MAX_STEPS=1
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 NUM_MINUTES=45
 # ===== END CONFIG =====
-
-if [[ -n "${TEST_DRYRUN:-}" ]]; then
-  echo "[INFO] TEST_DRYRUN mode: used for testing"
-  exit
-fi
-
-mkdir -p $EXP_DIR $LOG_DIR $CKPT_DIR
 
 exit_if_max_steps_reached
 
