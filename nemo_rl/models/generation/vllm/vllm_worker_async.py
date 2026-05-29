@@ -383,6 +383,32 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 return super().model_post_init(context)
 
         class NeMoRLOpenAIServingMixin:
+            @staticmethod
+            def _set_max_tokens(request, max_tokens: int) -> None:
+                """Set the request's max output tokens.
+
+                Mutates the request in place. Handles both max_completion_tokens (newer OpenAI API)
+                and max_tokens (deprecated but still supported by vLLM).
+                """
+                if request.max_completion_tokens is not None:
+                    request.max_completion_tokens = max_tokens
+                elif request.max_tokens is not None:
+                    request.max_tokens = max_tokens
+
+            def _clamp_max_tokens(
+                self, request, request_max_tokens: int, prompt_token_ids: list[int]
+            ) -> None:
+                """Clamp the request's max output tokens so that input + output <= max_model_len."""
+                remaining = self.model_config.max_model_len - len(prompt_token_ids)
+                if remaining <= 0:
+                    raise ValueError(
+                        f"Prompt length ({len(prompt_token_ids)}) fills or exceeds "
+                        f"max_model_len ({self.model_config.max_model_len}). "
+                        f"No room for output tokens."
+                    )
+                max_tokens = min(request_max_tokens, remaining)
+                self._set_max_tokens(request, max_tokens)
+
             # vLLM 0.20 moved chat preprocessing from
             # OpenAIServing._preprocess_chat to OpenAIServingRender.preprocess_chat,
             # so this override now applies via the render subclass.
@@ -404,6 +430,20 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                         message["tool_calls"] = list(message["tool_calls"])
 
                 messages_for_replace_prefix_tokens = deepcopy(messages)
+
+                # Temporarily set to 1 so vLLM's pre-tokenization length check passes;
+                # the actual value will be set through _clamp_max_tokens later.
+                actual_request_max_tokens = None
+                if isinstance(request, NeMoRLChatCompletionRequest):
+                    actual_request_max_tokens = (
+                        request.max_completion_tokens
+                        if request.max_completion_tokens is not None
+                        else request.max_tokens
+                    )
+                    # If max_completion_tokens or max_tokens is not set, we don't need to do _clamp_max_tokens.
+                    # So we don't need to set the request's max output tokens to 1 here.
+                    if actual_request_max_tokens is not None:
+                        self._set_max_tokens(request, 1)
 
                 try:
                     res = await super().preprocess_chat(
@@ -430,6 +470,13 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     not hasattr(request, "required_prefix_token_ids")
                     or request.required_prefix_token_ids is None
                 ):
+                    # Clamp the request's max output tokens so that input + output <= max_model_len.
+                    if actual_request_max_tokens is not None:
+                        self._clamp_max_tokens(
+                            request,
+                            actual_request_max_tokens,
+                            res[1][0]["prompt_token_ids"],
+                        )
                     return res
 
                 last_assistant_message_idx = None
@@ -478,6 +525,14 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 )
 
                 engine_prompt["prompt_token_ids"] = final_prompt_token_ids
+
+                # Clamp after prefix replacement since the prompt length may have changed.
+                if actual_request_max_tokens is not None:
+                    self._clamp_max_tokens(
+                        request,
+                        actual_request_max_tokens,
+                        final_prompt_token_ids,
+                    )
 
                 return res
 
