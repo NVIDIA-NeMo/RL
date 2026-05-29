@@ -315,7 +315,7 @@ default-groups = ["dev", "build"]
 link-mode = "copy"
 # The TE override is needed to pin the TE version across all extras
 # The opencv-python-headless override is needed because automodel pins it to 4.10.0.84, whereas vllm>=0.11.0 needs >= 4.11.0
-# The timm override is needed because current automodel pins to 1.0.16. This can be removed once we move ToT automodel
+# The timm override is needed because sglang requires timm==1.0.16.
 override-dependencies = [
   "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@release_v2.15",
   "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
