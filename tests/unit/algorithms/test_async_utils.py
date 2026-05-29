@@ -541,6 +541,38 @@ class TestReplayBuffer:
 
         ray.kill(buffer)
 
+    def test_replay_buffer_readiness_ignores_stale_trajectories(self):
+        """Test readiness helpers match sample's age-window filtering."""
+        buffer = ReplayBuffer.remote(max_size=10)
+
+        for version in [0, 1, 4]:
+            ray.get(
+                buffer.add.remote(
+                    {"batch": {"data": f"version_{version}"}},
+                    weight_version=version,
+                    target_weight_version=5,
+                )
+            )
+
+        assert ray.get(buffer.has_complete_batch.remote(5, 3))
+        assert ray.get(buffer.get_trajectories_needed.remote(5, 3)) == 0
+
+        assert not ray.get(buffer.has_complete_batch.remote(5, 3, 1))
+        assert ray.get(buffer.get_trajectories_needed.remote(5, 3, 1)) == 2
+
+        assert (
+            ray.get(
+                buffer.sample.remote(
+                    num_prompt_groups=3,
+                    current_weight_version=5,
+                    max_age_steps=1,
+                )
+            )
+            is None
+        )
+
+        ray.kill(buffer)
+
     def test_replay_buffer_load_state_dict_missing_keys(self):
         """Test load_state_dict raises for missing required keys."""
         buffer = ReplayBuffer.remote(max_size=10)
