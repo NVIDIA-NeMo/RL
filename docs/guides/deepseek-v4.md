@@ -4,13 +4,12 @@ This guide describes the current state of DeepSeek V4 support in NeMo-RL: what
 works today, how to reproduce a reference run, the limitations you should expect,
 and what we are working on next.
 
-:::{warning}
-**Status: Functional Ready.** DeepSeek V4 Flash Base is runnable and has been numerically
-validated with a short run, but it is **not yet validated for long-run
-convergence**. Expect the known issues described [below](#known-issues) — in
-particular, long runs can crash around step ~100 due to a train/inference
-mismatch. Treat this as an early-access integration, not a production recipe.
-:::
+> [!WARNING]
+> **Status: Functional Ready.** DeepSeek V4 Flash Base is runnable and has been numerically
+> validated with a short run, but it is **not yet validated for long-run
+> convergence**. Expect the known issues described [below](#known-issues) — in
+> particular, long runs can crash around step ~100 due to a train/inference
+> mismatch. Treat this as an early-access integration, not a production recipe.
 
 ## Support Status
 
