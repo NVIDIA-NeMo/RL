@@ -1285,6 +1285,8 @@ def sdpo_train(
                 should_save_by_timeout = timeout.check_save()
 
                 if master_config["checkpointing"]["enabled"] and (should_save_by_step or should_save_by_timeout):
+                    policy.prepare_for_training()
+
                     # Track metric for top-k checkpointing
                     full_metric_name = master_config["checkpointing"]["metric_name"]
                     if ":" in full_metric_name:

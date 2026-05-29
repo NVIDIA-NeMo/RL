@@ -1163,6 +1163,7 @@ class SDPOLossFn(LossFunction):
         )
 
         metrics = {
+            "loss": loss.item() if loss.ndim == 0 else loss,
             "num_valid_samples": sample_mask.sum().item(),
             "sdpo/per_pos_kl": masked_mean(per_token_kl, effective_mask).item(),
             # sdpo/frac_with_demo removed: the per-microbatch fraction breaks
