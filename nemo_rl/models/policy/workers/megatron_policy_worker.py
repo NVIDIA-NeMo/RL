@@ -1672,9 +1672,15 @@ class MegatronPolicyWorkerImpl(
                     )
                     raise
 
-        # Run a forward pass to trigger hooks (reuse get_logprobs forward path)
+        # Run a forward pass to trigger hooks (reuse get_logprobs forward path).
+        # Calibration batches are prompt-only model inputs, not rollout replay
+        # batches, so they intentionally do not carry routed_experts.
         try:
-            _ = self.get_logprobs(data=data, micro_batch_size=micro_batch_size)
+            _ = self.get_logprobs(
+                data=data,
+                micro_batch_size=micro_batch_size,
+                require_router_replay=False,
+            )
         finally:
             for h in hook_handles:
                 try:
