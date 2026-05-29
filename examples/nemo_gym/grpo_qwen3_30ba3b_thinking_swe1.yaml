@@ -1,0 +1,236 @@
+# Async GRPO SWE pivot (single-step tool use) recipe for Qwen3-30B-A3B-Thinking
+
+defaults: "grpo_qwen3_30ba3b_instruct.yaml"
+
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30b-thinking-swe1
+  metric_name: train:total_reward/mean
+  keep_top_k: 2
+  save_period: 5
+  checkpoint_must_save_by: 00:03:35:00
+  model_save_format: safetensors
+  save_consolidated: false
+grpo:
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 8
+  num_val_generations_per_prompt: 1
+  max_num_epochs: 100
+  advantage_clip_low: -100
+  advantage_clip_high: 100
+  val_period: 1000
+  val_at_start: false
+  overlong_filtering: true
+  val_batch_size: 256
+  invalid_tool_call_strategy: mask
+  penalize_invalid_tool_call: true
+  invalid_tool_call_advantage: -5.0
+  penalize_malformed_thinking: true
+  malformed_thinking_advantage: -5.0
+  reward_shaping:
+    stop_properly_penalty_coef: null
+  async_grpo:
+    enabled: true
+    in_flight_weight_updates: true
+loss_fn:
+  kl_input_clamp_value: null
+  kl_output_clamp_value: null
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  use_on_policy_kl_approximation: true
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_ratio: 5.0
+  truncated_importance_sampling_ratio_min: null
+  truncated_importance_sampling_type: tis
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  force_on_policy_ratio: true
+  use_kl_in_reward: false
+policy:
+  model_name: Qwen/Qwen3-30B-A3B-Thinking-2507
+  tokenizer:
+    chat_template_kwargs:
+      enable_thinking: true
+  train_global_batch_size: 512
+  generation_batch_size: 64
+  max_total_sequence_length: 131072
+  logprob_chunk_size: 2048
+  offload_optimizer_for_logprob: true
+  dtensor_cfg:
+    _v2: true
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+  megatron_cfg:
+    empty_unused_memory_level: 2
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 2
+    context_parallel_size: 4
+    freeze_moe_router: true
+    moe_router_bias_update_rate: 0.001
+    moe_aux_loss_coeff: 0.0
+    moe_router_enable_expert_bias: true
+    bias_activation_fusion: false
+    mtp_loss_scaling_factor: 0.0
+    mtp_use_repeated_layer: false
+    mtp_num_layers: 0
+    mtp_detach_heads: false
+    optimizer:
+      lr: 1.0e-06
+      min_lr: 1.0e-06
+      weight_decay: 0.0
+    scheduler:
+      lr_decay_iters: 1000000
+      lr_warmup_init: 0
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+    fp8_cfg:
+      enabled: false
+      fp8: e4m3
+      fp8_recipe: blockwise
+      fp8_param: false
+  make_sequence_length_divisible_by: 16
+  generation:
+    port_range_low: 11001
+    port_range_high: 15000
+    max_new_tokens: ${policy.max_total_sequence_length}
+    vllm_cfg:
+      enable_prefix_caching: true
+      tensor_parallel_size: 2
+      gpu_memory_utilization: 0.8
+      enforce_monotonicity: false
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 0.5
+      enable_thinking: true
+      http_server_serving_chat_kwargs:
+        reasoning_parser: deepseek_r1
+        chat_template: |
+          {%- if tools %}
+              {{- '<|im_start|>system\n' }}
+              {%- if messages[0].role == 'system' %}
+                  {{- messages[0].content + '\n\n' }}
+              {%- endif %}
+              {{- "# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>" }}
+              {%- for tool in tools %}
+                  {{- "\n" }}
+                  {{- tool | tojson }}
+              {%- endfor %}
+              {{- "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n" }}
+          {%- else %}
+              {%- if messages[0].role == 'system' %}
+                  {{- '<|im_start|>system\n' + messages[0].content + '<|im_end|>\n' }}
+              {%- endif %}
+          {%- endif %}
+          {%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}
+          {%- for message in messages[::-1] %}
+              {%- set index = (messages|length - 1) - loop.index0 %}
+              {%- if ns.multi_step_tool and message.role == "user" and message.content is string and not(message.content.startswith('<tool_response>') and message.content.endswith('</tool_response>')) %}
+                  {%- set ns.multi_step_tool = false %}
+                  {%- set ns.last_query_index = index %}
+              {%- endif %}
+          {%- endfor %}
+          {%- for message in messages %}
+              {%- if message.content is string %}
+                  {%- set content = message.content %}
+              {%- else %}
+                  {%- set content = '' %}
+              {%- endif %}
+              {%- if (message.role == "user") or (message.role == "system" and not loop.first) %}
+                  {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}
+              {%- elif message.role == "assistant" %}
+                  {%- set reasoning_content = '' %}
+                  {%- if message.reasoning_content is string %}
+                      {%- set reasoning_content = message.reasoning_content %}
+                  {%- else %}
+                      {%- if '</think>' in content %}
+                          {%- set reasoning_content = content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n') %}
+                          {%- set content = content.split('</think>')[-1].lstrip('\n') %}
+                      {%- endif %}
+                  {%- endif %}
+                  {%- if reasoning_content %}
+                      {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content.strip('\n') + '\n</think>\n\n' + content.lstrip('\n') }}
+                  {%- else %}
+                      {{- '<|im_start|>' + message.role + '\n' + content }}
+                  {%- endif %}
+                  {%- if message.tool_calls %}
+                      {%- for tool_call in message.tool_calls %}
+                          {%- if (loop.first and content) or (not loop.first) %}
+                              {{- '\n' }}
+                          {%- endif %}
+                          {%- if tool_call.function %}
+                              {%- set tool_call = tool_call.function %}
+                          {%- endif %}
+                          {{- '<tool_call>\n{"name": "' }}
+                          {{- tool_call.name }}
+                          {{- '", "arguments": ' }}
+                          {%- if tool_call.arguments is string %}
+                              {{- tool_call.arguments }}
+                          {%- else %}
+                              {{- tool_call.arguments | tojson }}
+                          {%- endif %}
+                          {{- '}\n</tool_call>' }}
+                      {%- endfor %}
+                  {%- endif %}
+                  {{- '<|im_end|>\n' }}
+              {%- elif message.role == "tool" %}
+                  {%- if loop.first or (messages[loop.index0 - 1].role != "tool") %}
+                      {{- '<|im_start|>user' }}
+                  {%- endif %}
+                  {{- '\n<tool_response>\n' }}
+                  {{- content }}
+                  {{- '\n</tool_response>' }}
+                  {%- if loop.last or (messages[loop.index0 + 1].role != "tool") %}
+                      {{- '<|im_end|>\n' }}
+                  {%- endif %}
+              {%- endif %}
+          {%- endfor %}
+          {%- if add_generation_prompt %}
+              {{- '<|im_start|>assistant\n<think>\n' }}
+          {%- endif %}
+        default_chat_template_kwargs:
+          enable_thinking: true
+          truncate_history_thinking: false
+    vllm_kwargs:
+      compilation_config:
+        cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 64]
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 8
+data:
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 1
+  use_multiple_dataloader: false
+  train:
+    data_path: /path/to/data/swe1/train-split.jsonl
+  validation:
+    data_path: /path/to/data/swe1/val-split.jsonl
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    system_prompt_file: null
+    processor: nemo_gym_data_processor
+  _override_: true
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: false
+  nemo_gym:
+    skip_venv_if_present: true
+    port_range_low: 15001
+    port_range_high: 20000
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/single_step_tool_use_with_argument_comparison/configs/swe_pivot_single_step_tool_use_with_argument_comparison.yaml
+  _override_: true
+logger:
+  log_dir: logs
+  wandb:
+    project: nemo-rl-swe
+    name: qwen3-30b-thinking-swe1-pivot
+  mlflow:
+    experiment_name: qwen3-30b-thinking-swe1-pivot
+    run_name: qwen3-30b-thinking-swe1-pivot
+cluster:
+  num_nodes: 16

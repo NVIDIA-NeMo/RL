@@ -121,6 +121,13 @@ Configure offline and online Eagle3 draft-model workflows to accelerate rollout 
 Train Qwen2.5-Omni-3B with GRPO on AVQA and evaluate on MMAU, following the R1-AQA approach.
 :::
 
+:::{grid-item-card} {octicon}`terminal` Two-Stage SWE RL (Qwen3 Thinking)
+:link: guides/swe-rl-qwen3
+:link-type: doc
+
+Train Qwen3-30B-A3B-Thinking into a SWE agent with a pivot stage plus end-to-end agentic RL on SWE-bench.
+:::
+
 :::{grid-item-card} {octicon}`plus-circle` Adding New Models
 :link: adding-new-models
 :link-type: doc
@@ -238,6 +245,7 @@ guides/sft.md
 guides/dpo.md
 guides/dapo.md
 guides/prorlv2.md
+guides/swe-rl-qwen3.md
 guides/grpo.md
 guides/grpo-deepscaler.md
 guides/grpo-sliding-puzzle.md
