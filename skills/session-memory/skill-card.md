@@ -1,5 +1,5 @@
 ## Description: <br>
-Manage durable working-session memory for coding agents. Use when a user asks to preserve or recover agent context across disconnects, VS Code restarts, long-running work, handoffs, or any session where important state should be written periodically under the repo's session directory. <br>
+Manage durable working-session memory for coding agents, enabling context preservation and recovery across disconnects, restarts, long-running work, and handoffs. <br>
 
 This skill is ready for commercial/non-commercial use. <br>
 
@@ -9,7 +9,7 @@ NVIDIA <br>
 ### License/Terms of Use: <br>
 Apache 2.0 <br>
 ## Use Case: <br>
-Developers and engineers who need to preserve and recover coding-agent context across disconnects, VS Code restarts, branch switches, and long-running work sessions. <br>
+Developers and engineers preserving or recovering coding-agent context across disconnects, VS Code restarts, long-running work, handoffs, or branch switches. <br>
 
 ### Deployment Geography for Use: <br>
 Global <br>
@@ -20,23 +20,23 @@ Mitigation: Review and scan skill before deployment. <br>
 
 ## Reference(s): <br>
 - [SKILL.md](skills/session-memory/SKILL.md) <br>
-- [BENCHMARK.md](skills/session-memory/BENCHMARK.md) <br>
+- [Evaluation Report](skills/session-memory/BENCHMARK.md) <br>
 
 
 ## Skill Output: <br>
-**Output Type(s):** [Files, Shell commands] <br>
-**Output Format:** [Markdown with inline bash code blocks] <br>
+**Output Type(s):** [Files, Configuration instructions] <br>
+**Output Format:** [Markdown files in a timestamped session directory] <br>
 **Output Parameters:** [1D] <br>
 **Other Properties Related to Output:** [None] <br>
 
 ## Evaluation Agents Used: <br>
-- Claude Code (`claude-code`) <br>
-- Codex (`codex`) <br>
+- `claude-code` <br>
+- `codex` <br>
 
 
 
 ## Evaluation Tasks: <br>
-Evaluated against 5 evaluation tasks (3 positive skill-activation, 2 negative) with 2 attempts per task. <br>
+Evaluated against 5 internal evaluation tasks (3 positive skill-activation, 2 negative) with 2 attempts per task at 50% pass threshold. <br>
 
 ## Evaluation Metrics Used: <br>
 Reported benchmark dimensions: <br>
@@ -47,6 +47,7 @@ Reported benchmark dimensions: <br>
 - Efficiency: Checks whether the agent uses fewer tokens and avoids redundant work. <br>
 
 Underlying evaluation signals used in this run: <br>
+- `security`: Checks for unsafe operations, secret leakage, and unauthorized access. <br>
 - `skill_execution`: Verifies that the agent loaded the expected skill and workflow. <br>
 - `skill_efficiency`: Checks routing quality, decoy avoidance, and redundant tool usage. <br>
 - `accuracy`: Grades final-answer correctness against the reference answer. <br>
@@ -59,14 +60,14 @@ Underlying evaluation signals used in this run: <br>
 ## Evaluation Results: <br>
 | Dimension | Num | `claude-code` | `codex` |
 |---|---:|---:|---:|
-| Security | 8 | 60% (+0%) | 53% (+8%) |
-| Correctness | 8 | 99% (+11%) | 85% (+28%) |
-| Discoverability | 8 | 91% (+12%) | 92% (+25%) |
-| Effectiveness | 8 | 81% (+8%) | 60% (+18%) |
-| Efficiency | 8 | 76% (+10%) | 84% (+17%) |
+| Security | 8 | 100% (+0%) | 90% (-10%) |
+| Correctness | 8 | 95% (-1%) | 92% (+18%) |
+| Discoverability | 8 | 100% (+0%) | 92% (+6%) |
+| Effectiveness | 8 | 89% (+0%) | 87% (+29%) |
+| Efficiency | 8 | 92% (+0%) | 85% (+7%) |
 
 ## Skill Version(s): <br>
-75705855a (source: git SHA, committed 2026-05-28) <br>
+4f9e7d2b (source: git SHA, committed 2026-05-28) <br>
 
 ## Ethical Considerations: <br>
 NVIDIA believes Trustworthy AI is a shared responsibility and we have established policies and practices to enable development for a wide array of AI applications. When downloaded or used in accordance with our terms of service, developers should work with their internal team to ensure this skill meets requirements for the relevant industry and use case and addresses unforeseen product misuse. <br>

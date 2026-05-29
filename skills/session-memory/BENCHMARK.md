@@ -7,7 +7,7 @@ This benchmark summarizes 3-Tier Evaluation from NVSkills-Eval results for the s
 ## Evaluation Summary
 
 - Skill: `session-memory`
-- Evaluation date: 2026-05-28
+- Evaluation date: 2026-05-29
 - NVSkills-Eval profile: `external`
 - Environment: `local`
 - Dataset: 5 evaluation tasks
@@ -32,6 +32,7 @@ Reported benchmark dimensions:
 
 Underlying evaluation signals used in this run:
 
+- `security` (Security): checks for unsafe operations, secret leakage, and unauthorized access.
 - `skill_execution` (Skill Execution): verifies that the agent loaded the expected skill and workflow.
 - `skill_efficiency` (Efficiency): checks routing quality, decoy avoidance, and redundant tool usage.
 - `accuracy` (Accuracy): grades final-answer correctness against the reference answer.
@@ -53,17 +54,17 @@ Task composition is derived from the evaluation dataset when possible. Entries w
 
 | Dimension | Num | `claude-code` | `codex` |
 |---|---:|---:|---:|
-| Security | 8 | 60% (+0%) | 53% (+8%) |
-| Correctness | 8 | 99% (+11%) | 85% (+28%) |
-| Discoverability | 8 | 91% (+12%) | 92% (+25%) |
-| Effectiveness | 8 | 81% (+8%) | 60% (+18%) |
-| Efficiency | 8 | 76% (+10%) | 84% (+17%) |
+| Security | 8 | 100% (+0%) | 90% (-10%) |
+| Correctness | 8 | 95% (-1%) | 92% (+18%) |
+| Discoverability | 8 | 100% (+0%) | 92% (+6%) |
+| Effectiveness | 8 | 89% (+0%) | 87% (+29%) |
+| Efficiency | 8 | 92% (+0%) | 85% (+7%) |
 
 Score values show skill-assisted performance. Values in parentheses show uplift versus the no-skill baseline when baseline data is available.
 
 ## Tier 1: Static Validation Summary
 
-Tier 1 validation passed with observations. NVSkills-Eval ran 9 checks and found 11 total findings.
+Tier 1 validation passed with observations. NVSkills-Eval ran 9 checks and found 10 total findings.
 
 Top findings:
 
@@ -80,7 +81,7 @@ Tier 2 validation passed. NVSkills-Eval ran 2 checks and found 0 total findings.
 Notable observations:
 
 - Context Deduplication: Collected 1 file(s)
-- Inter-Skill Deduplication: Parsed skill 'session-memory': 285 char description
+- Inter-Skill Deduplication: Parsed skill 'session-memory': 375 char description
 
 ## Publication Recommendation
 
