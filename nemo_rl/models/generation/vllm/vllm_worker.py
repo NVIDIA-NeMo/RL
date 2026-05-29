@@ -37,6 +37,13 @@ from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
+def _resolve_enable_prefix_caching(vllm_cfg: dict[str, Any]) -> bool:
+    enable_prefix_caching = vllm_cfg.get("enable_prefix_caching", None)
+    if enable_prefix_caching is None:
+        enable_prefix_caching = torch.cuda.get_device_capability()[0] >= 8
+    return enable_prefix_caching
+
+
 # Use a base class to share some functions to avoid code duplication.
 class BaseVllmGenerationWorker:
     def __repr__(self) -> str:
@@ -554,9 +561,7 @@ class BaseVllmGenerationWorker:
             pipeline_parallel_size=self.pipeline_parallel_size,
             enable_expert_parallel=self.enable_expert_parallel,
             gpu_memory_utilization=self.gpu_memory_utilization,
-            enable_prefix_caching=self.cfg["vllm_cfg"].get(
-                "enable_prefix_caching", torch.cuda.get_device_capability()[0] >= 8
-            ),
+            enable_prefix_caching=_resolve_enable_prefix_caching(self.cfg["vllm_cfg"]),
             dtype=self.precision,
             seed=seed,
             enforce_eager=self.cfg["vllm_cfg"]["enforce_eager"],
