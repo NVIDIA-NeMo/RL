@@ -729,23 +729,16 @@ def tau_bench_data_processor(
     messages = datum_dict["messages"]
     extra_env_info = datum_dict["extra_env_info"]
 
-    formatted: str = tokenizer.apply_chat_template(  # type: ignore[assignment]
+    message_log: LLMMessageLogType = get_formatted_message_log(
         messages,
-        tokenize=False,
+        tokenizer,
+        task_data_spec,
+        add_bos_token=True,
+        add_eos_token=False,
         add_generation_prompt=True,
-        add_special_tokens=False,
     )
-    token_ids = tokenizer(
-        formatted,
-        return_tensors="pt",
-        add_special_tokens=False,
-    )["input_ids"][0]
 
-    message_log: LLMMessageLogType = [
-        {"role": "user", "content": formatted, "token_ids": token_ids}
-    ]
-
-    length = len(token_ids)
+    length = sum(len(msg["token_ids"]) for msg in message_log)
     loss_multiplier = 1.0
     if length >= max_seq_length:
         for msg in message_log:

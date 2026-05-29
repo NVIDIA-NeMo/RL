@@ -15,8 +15,10 @@ import json
 import os
 import random
 import re
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, NotRequired, Optional, Tuple, TypedDict
 
 import ray
@@ -88,6 +90,8 @@ class TauBenchEnvConfig(TypedDict):
     mock_user_latency_s: NotRequired[float | None]
     mock_judge_latency_s: NotRequired[float | None]
     mock_stop_prob: NotRequired[float | None]
+    worker_stagger_delay_s: NotRequired[float]
+    max_concurrent_api_requests: NotRequired[int]
 
 
 class TauBenchEnvMetadata(TypedDict):
@@ -131,7 +135,15 @@ class TauBenchWorker:
         mock_user_latency_s: Optional[float] = None,
         mock_judge_latency_s: Optional[float] = None,
         mock_stop_prob: Optional[float] = None,
+        worker_id: int = 0,
+        worker_stagger_delay_s: float = 0.0,
+        max_concurrent_api_requests: int = 1,
     ) -> None:
+        self._worker_id = worker_id
+        self._worker_stagger_delay_s = worker_stagger_delay_s
+        self._stagger_done = False
+        self._max_concurrent = max_concurrent_api_requests
+        self._env_lock = threading.Lock()
         self._env_name = env_name
         self._task_split = task_split
         self._user_strategy = user_strategy
@@ -256,9 +268,12 @@ class TauBenchWorker:
         if match:
             try:
                 payload = json.loads(match.group(1).strip())
+                kwargs = payload.get("arguments", payload.get("kwargs", {}))
+                if not isinstance(kwargs, dict):
+                    kwargs = {}
                 return Action(
                     name=payload["name"],
-                    kwargs=payload.get("arguments", payload.get("kwargs", {})),
+                    kwargs=kwargs,
                 )
             except (json.JSONDecodeError, KeyError):
                 pass
@@ -310,6 +325,170 @@ class TauBenchWorker:
             print(f"[TauBench] judge call failed: {e}")
             return 0.0
 
+    def _execute_one(
+        self,
+        agent_text: str,
+        meta: TauBenchEnvMetadata,
+        judge_weight: float,
+    ) -> Tuple[Dict[str, str], bool, float, TauBenchEnvMetadata]:
+        """Process one episode step; safe to call from multiple threads concurrently."""
+        task_index: int = meta["task_index"]
+        step_count: int = meta.get("step_count", 0)
+        episode_id: str = meta.get("episode_id") or str(uuid.uuid4())
+
+        if episode_id not in self._active_envs:
+            last_exc: Exception = RuntimeError("unreachable")
+            for attempt in range(5):
+                try:
+                    tau_env, initial_obs = self._make_env(task_index)
+                    break
+                except Exception as e:
+                    last_exc = e
+                    delay = 2 ** attempt + random.uniform(0, 1)
+                    print(
+                        f"[TauBench worker] _make_env attempt {attempt + 1}/5 failed "
+                        f"({type(e).__name__}: {e}); retrying in {delay:.1f}s",
+                        flush=True,
+                    )
+                    time.sleep(delay)
+            else:
+                raise last_exc
+            with self._env_lock:
+                self._active_envs[episode_id] = {
+                    "env": tau_env,
+                    "initial_obs": initial_obs,
+                }
+
+        env_state = self._active_envs[episode_id]
+        tau_env = env_state["env"]
+
+        if env_state.get("initial_obs") is not None:
+            # Pre-step: return the user simulator's actual opening message
+            # as the first observation.  The agent's generation at this point
+            # was based on a placeholder user message in the dataset and is
+            # discarded here; the agent will generate its real first response
+            # on the next turn after seeing the customer's actual message.
+            with self._env_lock:
+                initial_obs = self._active_envs[episode_id].pop("initial_obs")
+            return (
+                {"role": "user", "content": initial_obs},
+                False,
+                0.0,
+                {
+                    "task_index": task_index,
+                    "episode_id": episode_id,
+                    "step_count": step_count,  # not incremented: no real action taken
+                    "tau_reward": None,
+                    "judge_score": None,
+                },
+            )
+
+        action = self._parse_action(agent_text)
+        last_exc: Exception = RuntimeError("unreachable")
+        env_response = None
+        for attempt in range(5):
+            try:
+                if self._mock_user:
+                    from unittest.mock import patch
+                    with patch("litellm.completion", self._mock_completion):
+                        env_response = tau_env.step(action)
+                else:
+                    env_response = tau_env.step(action)
+                break
+            except Exception as e:
+                last_exc = e
+                delay = 2 ** attempt + random.uniform(0, 1)
+                print(
+                    f"[TauBench worker] tau_env.step attempt {attempt + 1}/5 failed "
+                    f"({type(e).__name__}: {e}); retrying in {delay:.1f}s",
+                    flush=True,
+                )
+                time.sleep(delay)
+        if env_response is None:
+            print(
+                f"[TauBench worker] tau_env.step failed after 5 attempts "
+                f"({type(last_exc).__name__}); force-terminating episode {episode_id}",
+                flush=True,
+            )
+            with self._env_lock:
+                self._active_envs.pop(episode_id, None)
+            return (
+                {"role": "user", "content": "[user simulator unavailable]"},
+                True,
+                0.0,
+                {
+                    "task_index": task_index,
+                    "episode_id": episode_id,
+                    "step_count": step_count,
+                    "tau_reward": 0.0,
+                    "judge_score": None,
+                },
+            )
+        step_count += 1
+
+        done = bool(env_response.done) or step_count >= self._max_steps
+        reward = 0.0
+        tau_reward: Optional[float] = None
+        judge_score: Optional[float] = None
+
+        if done:
+            if env_response.done:
+                # tau_env.step() already called calculate_reward() internally when
+                # the episode ended naturally; reuse that result.  Calling it again
+                # would compare the gold-replayed DB state against itself, always
+                # returning 1.0.
+                tau_reward = float(env_response.reward)
+            else:
+                # Force-terminated by max_steps — task incomplete.
+                tau_reward = 0.0
+            if self._judge_model and judge_weight > 0.0:
+                rules = "\n".join(getattr(tau_env, "rules", []))
+                tasks = getattr(tau_env, "tasks", [])
+                instruction = tasks[tau_env.task_index].instruction if tasks else ""
+                user_sim = getattr(tau_env, "user", None)
+                user_msgs = getattr(user_sim, "messages", []) if user_sim else []
+                # From the user sim's POV, role="user" is the agent speaking and
+                # role="assistant" is the customer speaking — flip for judge.
+                convo = [
+                    {"role": "assistant" if m["role"] == "user" else "user", "content": m["content"]}
+                    for m in user_msgs
+                    if m.get("role") in ("user", "assistant")
+                ]
+                judge_score = self._call_judge(convo, rules, instruction)
+                reward = (1.0 - judge_weight) * tau_reward + judge_weight * judge_score
+                print(
+                    f"[TauBench] episode={episode_id} steps={step_count} "
+                    f"tau_reward={tau_reward:.4f} judge_score={judge_score:.4f} "
+                    f"combined={reward:.4f}",
+                    flush=True,
+                )
+            else:
+                reward = tau_reward
+                print(
+                    f"[TauBench] episode={episode_id} steps={step_count} "
+                    f"tau_reward={tau_reward:.4f} (no judge)",
+                    flush=True,
+                )
+
+            with self._env_lock:
+                del self._active_envs[episode_id]
+
+        # Use "user" for user-simulator responses and "tool" for tool results
+        # so rollouts.py can apply the correct chat-template role markers.
+        obs_role = "user" if action.name == "respond" else "tool"
+        return (
+            {"role": obs_role, "content": str(env_response.observation)},
+            done,
+            reward,
+            {
+                "task_index": task_index,
+                "episode_id": episode_id,
+                "step_count": step_count,
+                "tau_reward": tau_reward,
+                "judge_score": judge_score,
+            },
+        )
+
     def execute(
         self,
         message_batch: List[str],
@@ -331,106 +510,24 @@ class TauBenchWorker:
         Returns:
             Tuple of (observations, terminateds, rewards, updated_metadata).
         """
-        observations: List[Dict[str, str]] = []
-        terminateds: List[bool] = []
-        rewards: List[float] = []
-        new_metadata: List[TauBenchEnvMetadata] = []
+        if not self._stagger_done and self._worker_stagger_delay_s > 0:
+            delay = self._worker_id * self._worker_stagger_delay_s
+            if delay > 0:
+                time.sleep(delay)
+            self._stagger_done = True
 
-        for agent_text, meta in zip(message_batch, metadata_batch):
-            task_index: int = meta["task_index"]
-            step_count: int = meta.get("step_count", 0)
-            episode_id: str = meta.get("episode_id") or str(uuid.uuid4())
+        with ThreadPoolExecutor(max_workers=self._max_concurrent) as executor:
+            # Submit all episodes; preserve ordering so results align with inputs.
+            futures_ordered = [
+                executor.submit(self._execute_one, agent_text, meta, judge_weight)
+                for agent_text, meta in zip(message_batch, metadata_batch)
+            ]
+            results = [f.result() for f in futures_ordered]
 
-            if episode_id not in self._active_envs:
-                tau_env, initial_obs = self._make_env(task_index)
-                self._active_envs[episode_id] = {
-                    "env": tau_env,
-                    "initial_obs": initial_obs,
-                }
-
-            env_state = self._active_envs[episode_id]
-            tau_env = env_state["env"]
-
-            if env_state.get("initial_obs") is not None:
-                # Pre-step: return the user simulator's actual opening message
-                # as the first observation.  The agent's generation at this point
-                # was based on a placeholder user message in the dataset and is
-                # discarded here; the agent will generate its real first response
-                # on the next turn after seeing the customer's actual message.
-                initial_obs = env_state.pop("initial_obs")
-                observations.append({"role": "user", "content": initial_obs})
-                terminateds.append(False)
-                rewards.append(0.0)
-                new_metadata.append({
-                    "task_index": task_index,
-                    "episode_id": episode_id,
-                    "step_count": step_count,  # not incremented: no real action taken
-                    "tau_reward": None,
-                    "judge_score": None,
-                })
-                continue
-
-            action = self._parse_action(agent_text)
-            if self._mock_user:
-                from unittest.mock import patch
-                with patch("litellm.completion", self._mock_completion):
-                    env_response = tau_env.step(action)
-            else:
-                env_response = tau_env.step(action)
-            step_count += 1
-
-            done = bool(env_response.done) or step_count >= self._max_steps
-            reward = 0.0
-            tau_reward: Optional[float] = None
-            judge_score: Optional[float] = None
-
-            if done:
-                if env_response.done:
-                    # tau_env.step() already called calculate_reward() internally when
-                    # the episode ended naturally; reuse that result.  Calling it again
-                    # would compare the gold-replayed DB state against itself, always
-                    # returning 1.0.
-                    tau_reward = float(env_response.reward)
-                else:
-                    # Force-terminated by max_steps — task incomplete.
-                    tau_reward = 0.0
-                if self._judge_model and judge_weight > 0.0:
-                    rules = "\n".join(getattr(tau_env, "rules", []))
-                    tasks = getattr(tau_env, "tasks", [])
-                    instruction = tasks[tau_env.task_index].instruction if tasks else ""
-                    user_sim = getattr(tau_env, "user", None)
-                    user_msgs = getattr(user_sim, "messages", []) if user_sim else []
-                    # From the user sim's POV, role="user" is the agent speaking and
-                    # role="assistant" is the customer speaking — flip for judge.
-                    convo = [
-                        {"role": "assistant" if m["role"] == "user" else "user", "content": m["content"]}
-                        for m in user_msgs
-                        if m.get("role") in ("user", "assistant")
-                    ]
-                    judge_score = self._call_judge(convo, rules, instruction)
-                    reward = (1.0 - judge_weight) * tau_reward + judge_weight * judge_score
-                else:
-                    reward = tau_reward
-
-                del self._active_envs[episode_id]
-
-            # Use "user" for user-simulator responses and "tool" for tool results
-            # so rollouts.py can apply the correct chat-template role markers.
-            obs_role = "user" if action.name == "respond" else "tool"
-            observations.append(
-                {"role": obs_role, "content": str(env_response.observation)}
-            )
-            terminateds.append(done)
-            rewards.append(reward)
-            new_metadata.append(
-                {
-                    "task_index": task_index,
-                    "episode_id": episode_id,
-                    "step_count": step_count,
-                    "tau_reward": tau_reward,
-                    "judge_score": judge_score,
-                }
-            )
+        observations = [r[0] for r in results]
+        terminateds = [r[1] for r in results]
+        rewards = [r[2] for r in results]
+        new_metadata = [r[3] for r in results]
 
         return observations, terminateds, rewards, new_metadata
 
@@ -483,8 +580,11 @@ class TauBenchEnvironment(EnvironmentInterface[TauBenchEnvMetadata]):
                 mock_user_latency_s=cfg.get("mock_user_latency_s"),
                 mock_judge_latency_s=cfg.get("mock_judge_latency_s"),
                 mock_stop_prob=cfg.get("mock_stop_prob"),
+                worker_id=i,
+                worker_stagger_delay_s=cfg.get("worker_stagger_delay_s", 0.0),
+                max_concurrent_api_requests=cfg.get("max_concurrent_api_requests", 1),
             )
-            for _ in range(self._num_workers)
+            for i in range(self._num_workers)
         ]
 
     def obs_use_chat_template(self) -> bool:

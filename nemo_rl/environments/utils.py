@@ -103,6 +103,9 @@ def chunk_list_to_workers(to_chunk: list[Any], num_workers: int) -> list[list[An
     if len(chunks) > num_workers:
         chunks[num_workers - 1 :] = [sum(chunks[num_workers - 1 :], [])]
 
+    if len(chunks) < num_workers:
+        chunks.extend([[] for _ in range(num_workers - len(chunks))])
+
     return chunks
 
 

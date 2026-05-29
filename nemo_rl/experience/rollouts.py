@@ -100,7 +100,8 @@ def _tokenize_env_observation(
     #      This holds for all models using special tokens for role markers
     #      (e.g. <|im_start|>, <|eot_id|>), which cannot be merged with
     #      adjacent text by BPE.
-    _dummy = [{"role": "user", "content": "x"}]
+    _dummy_content = "x"
+    _dummy = [{"role": "user", "content": _dummy_content}]
     _with_obs = tokenizer.apply_chat_template(
         _dummy + [{"role": obs_role, "content": obs_content}],
         tokenize=False,
@@ -119,7 +120,18 @@ def _tokenize_env_observation(
         "trailing separator of a non-final message, so _without_obs is not a strict "
         "prefix of _with_obs and the slice would produce incorrect tokens."
     )
-    obs_chunk = _with_obs[len(_without_obs):]
+    # Extract the turn-closing separator from the template.  _without_obs ends
+    # with: <BOS> + <user_header> + _dummy_content + <turn_separator>.
+    # We prepend that separator to obs_chunk so the model sees a well-formed
+    # context where the preceding assistant turn is properly closed before the
+    # new observation begins.  This is model-agnostic: Qwen uses "<|im_end|>\n",
+    # Llama 3 uses "<|eot_id|>", etc.  It requires that stop_strings in the
+    # generation config does NOT include the turn separator, so that vLLM stops
+    # on the EOS token ID (which it does not include in the output) rather than
+    # on a stop string (which it would include via include_stop_str_in_output).
+    _sep_start = _without_obs.rfind(_dummy_content) + len(_dummy_content)
+    _turn_separator = _without_obs[_sep_start:]
+    obs_chunk = _turn_separator + _with_obs[len(_without_obs):]
     return tokenizer(
         obs_chunk, return_tensors="pt", add_special_tokens=False
     ).input_ids[0]

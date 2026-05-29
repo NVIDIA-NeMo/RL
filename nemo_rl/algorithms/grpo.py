@@ -861,6 +861,26 @@ def dynamic_sampling(
                 len(non_zero_std_mask), device=std.device
             )[non_zero_std_mask].tolist()
 
+            # Log rewards of filtered-out (zero-std) samples so we can see whether
+            # they were all-correct (reward≈1) or all-wrong (reward≈0).
+            zero_std_mask = ~non_zero_std_mask
+            num_filtered = zero_std_mask.sum().item()
+            if num_filtered > 0:
+                filtered_out_rewards = total_rewards[zero_std_mask]
+                print(
+                    f"[dynamic_sampling] {num_filtered} samples filtered out (zero-std groups): "
+                    f"reward mean={filtered_out_rewards.mean():.4f}, "
+                    f"min={filtered_out_rewards.min():.4f}, "
+                    f"max={filtered_out_rewards.max():.4f}",
+                    flush=True,
+                )
+                unique_r, counts = filtered_out_rewards.unique(return_counts=True)
+                if len(unique_r) <= 10:
+                    breakdown = ", ".join(
+                        f"{r:.4f}×{c}" for r, c in zip(unique_r.tolist(), counts.tolist())
+                    )
+                    print(f"[dynamic_sampling]   reward breakdown: {breakdown}", flush=True)
+
             # Only select the inputs that have non-zero std
             # total_reward is already a part of repeated_batch so we don't need to add it again
             filtered_repeated_batch = repeated_batch.select_indices(keep_prompt_indices)
@@ -1936,7 +1956,7 @@ def grpo_train(
 
                 metrics.update(rollout_metrics)
                 metrics["generation_logger_metrics"] = generation_logger_metrics
-                total_valid_tokens += metrics["global_valid_toks"]
+                total_valid_tokens += metrics.get("global_valid_toks", 0)
 
                 # Always log sequence-level error metrics (useful for deciding threshold)
                 metrics["max_seq_mult_prob_error"] = max_seq_mult_prob_error
@@ -2075,7 +2095,7 @@ def grpo_train(
                 reduction_op="sum"
             )  # type: ignore
             # track example with high token mult prob error above 1.05
-            if metrics["token_mult_prob_error"] > 1.05:
+            if metrics.get("token_mult_prob_error", 0.0) > 1.05:
                 logger.log_plot_token_mult_prob_error(
                     {
                         "prompt_lengths": repeated_batch["length"],
@@ -2157,7 +2177,7 @@ def grpo_train(
                     print(f"  • {k}: {v:.2f}s ({percent:.1f}%)", flush=True)
 
             timing_metrics["valid_tokens_per_sec_per_gpu"] = (
-                metrics["global_valid_toks"] / total_time / total_num_gpus
+                metrics.get("global_valid_toks", 0) / total_time / total_num_gpus
             )
             performance_metrics = print_performance_metrics(
                 train_results, metrics, timing_metrics, master_config
@@ -2991,7 +3011,7 @@ def async_grpo_train(
                 metrics.update(rollout_metrics)
                 if generation_logger_metrics is not None:
                     metrics["generation_logger_metrics"] = generation_logger_metrics
-                total_valid_tokens += metrics["global_valid_toks"]
+                total_valid_tokens += metrics.get("global_valid_toks", 0)
 
                 # Always log sequence-level error metrics (useful for deciding threshold)
                 metrics["max_seq_mult_prob_error"] = max_seq_mult_prob_error
@@ -3162,7 +3182,7 @@ def async_grpo_train(
                 * master_config["cluster"]["gpus_per_node"]
             )
             timing_metrics["valid_tokens_per_sec_per_gpu"] = (
-                metrics["global_valid_toks"] / total_time / total_num_gpus
+                metrics.get("global_valid_toks", 0) / total_time / total_num_gpus
             )
             performance_metrics = print_performance_metrics(
                 train_results, metrics, timing_metrics, master_config
