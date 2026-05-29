@@ -14,6 +14,7 @@
 import os
 import warnings
 from collections import defaultdict
+from dataclasses import asdict, dataclass
 from functools import partial
 from typing import Optional
 
@@ -42,14 +43,13 @@ from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 
-class DPOSaveState(BaseModel, extra="allow"):
+@dataclass
+class DPOSaveState:
     epoch: int = 0  # Track current epoch
     step: int = 0  # Track step within current epoch
     total_steps: int = 0  # Track total number of steps across all epochs
     consumed_samples: int = 0
-    total_valid_tokens: int = (
-        0  # Track total number of non-padding tokens during training
-    )
+    total_valid_tokens: int = 0  # Track total number of non-padding tokens during training
 
 
 def _default_dpo_save_state() -> DPOSaveState:
@@ -95,16 +95,17 @@ class MasterConfig(BaseModel, extra="allow"):
     checkpointing: CheckpointingConfig
 
 
-class DPOValMetrics(BaseModel, extra="allow"):
-    loss: float = 0.0
-    sft_loss: float = 0.0
-    preference_loss: float = 0.0
-    accuracy: float = 0.0
-    rewards_chosen_mean: float = 0.0
-    rewards_rejected_mean: float = 0.0
-    num_valid_samples: float = 0.0
-    global_valid_seqs: float = 0.0
-    global_valid_toks: float = 0.0
+@dataclass
+class DPOValMetrics:
+    loss: float
+    sft_loss: float
+    preference_loss: float
+    accuracy: float
+    rewards_chosen_mean: float
+    rewards_rejected_mean: float
+    num_valid_samples: float
+    global_valid_seqs: float
+    global_valid_toks: float
 
 
 # =======================================================
@@ -362,7 +363,7 @@ def validate(
         )
         prefix = f"validation-{val_dataset_name}"
 
-        logger.log_metrics(k_val_metrics.model_dump(), step, prefix=prefix)
+        logger.log_metrics(asdict(k_val_metrics), step, prefix=prefix)
         logger.log_metrics(k_validation_timings, step, prefix=f"timing/{prefix}")
 
         for metric_name in DPOValMetrics.__annotations__.keys():
@@ -490,7 +491,7 @@ def validate_one_dataset(
     timing_metrics = timer.get_timing_metrics(reduction_op="sum")
     validation_time = timing_metrics.get("total_validation_time", 0)
 
-    if len(val_metrics.model_dump()) == 0:
+    if len(val_metrics) == 0:
         warnings.warn(
             "No validation metrics were collected."
             " This is likely because there were no valid samples in the validation set."
@@ -667,7 +668,7 @@ def dpo_train(
                     dpo_save_state.epoch = current_epoch
                     dpo_save_state.total_valid_tokens = total_valid_tokens
                     # Remove outdated validation metrics
-                    for key in list(dpo_save_state.model_dump().keys()):
+                    for key in list(vars(dpo_save_state).keys()):
                         if (
                             key.startswith("val")
                             and any(
@@ -677,7 +678,7 @@ def dpo_train(
                                     if metric_name != "num_valid_samples"
                                 ]
                             )
-                            and (val_metrics is None or not hasattr(val_metrics, key))
+                            and (val_metrics is None or key not in val_metrics)
                         ):
                             if hasattr(dpo_save_state, key):
                                 delattr(dpo_save_state, key)
