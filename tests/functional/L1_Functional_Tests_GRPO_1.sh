@@ -44,4 +44,6 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_simple.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_mooncake.sh
 
 cd ${PROJECT_ROOT}/tests
-coverage combine .coverage*
+if compgen -G ".coverage*" > /dev/null; then
+    coverage combine .coverage*
+fi

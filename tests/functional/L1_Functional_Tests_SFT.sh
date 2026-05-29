@@ -39,4 +39,6 @@ run_test      uv run --no-sync bash ./tests/functional/sft_avlm.sh
 run_test      uv run --no-sync bash ./tests/functional/sft_resume_diamond.sh
 
 cd ${PROJECT_ROOT}/tests
-coverage combine .coverage*
+if compgen -G ".coverage*" > /dev/null; then
+    coverage combine .coverage*
+fi
