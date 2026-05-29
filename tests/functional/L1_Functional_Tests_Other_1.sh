@@ -13,26 +13,7 @@
 # limitations under the License.
 
 #!/bin/bash
-set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
-
-SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
-PROJECT_ROOT=$(realpath ${SCRIPT_DIR}/../..)
-
-cd ${PROJECT_ROOT}
-
-# run_test [fast] <command...>
-# - "run_test fast <cmd>" = always runs (both fast and full modes)
-# - "run_test <cmd>"      = only runs in full mode; skipped when FAST=1
-run_test() {
-    if [[ "$1" == "fast" ]]; then
-        shift
-        time "$@"
-    elif [[ "${FAST:-0}" == "1" ]]; then
-        echo "FAST: Skipping: $*"
-    else
-        time "$@"
-    fi
-}
+source "$(dirname "${BASH_SOURCE[0]}")/run_functional_shard_common.sh"
 
 # This test is intentionally not run with uv run --no-sync to verify that the frozen environment is working correctly.
 run_test      bash ./tests/functional/test_frozen_env.sh
@@ -51,5 +32,4 @@ if [[ "${FAST:-0}" != "1" ]]; then
     done
 fi
 
-cd ${PROJECT_ROOT}/tests
-coverage combine .coverage*
+combine_functional_coverage
