@@ -58,7 +58,6 @@ jobs:
       head_label: ${{ steps.base-head-ref.outputs.head_label }}
       has_skip_cicd: ${{ steps.base-head-ref.outputs.has_skip_cicd }}
       test_sha: ${{ steps.base-head-ref.outputs.test_sha }}
-      skip_sglang: ${{ steps.evaluate.outputs.skip_sglang }}
     steps:
       - name: Get PR info
         id: get-pr-info
@@ -127,7 +126,6 @@ jobs:
           IS_PULLREQUEST: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
           LABEL: ${{ steps.base-head-ref.outputs.ci_label }}
           MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
-          SKIP_SGLANG_VAR: ${{ vars.SKIP_SGLANG }}
         run: |
           # Some output that's helpful for debugging
           echo "Docs changed: $CHANGED_DOCS"
@@ -135,13 +133,6 @@ jobs:
           echo "LABEL: $LABEL"
           echo "IS_PULLREQUEST: $IS_PULLREQUEST"
           echo "DOCS_ONLY: $DOCS_ONLY"
-          echo "SKIP_SGLANG variable: ${SKIP_SGLANG_VAR:-unset}"
-
-          SKIP_SGLANG="true"
-          if [[ "${SKIP_SGLANG_VAR,,}" == "false" ]]; then
-            SKIP_SGLANG="false"
-          fi
-          echo "skip_sglang=$SKIP_SGLANG" | tee -a "$GITHUB_OUTPUT"
 
           # Run CI only (on main or if label is attached) and if it's not only docs
           # Determine test level based on conditions
@@ -365,11 +356,10 @@ jobs:
       target: release
       build-contexts: |
         nemo-rl=.
-        ${{ (vars.UV_BUILD_CACHE == 'true' && needs.pre-flight.outputs.skip_sglang != 'true' && needs.org-member-pre-flight.outputs.is_member == 'true') && format('uv-cache-seed=docker-image://{0}/{1}:uv-cache', needs.org-member-pre-flight.outputs.registry, vars.CI_CONTAINER_NAME) || '' }}
+        ${{ vars.UV_BUILD_CACHE == 'enabled' && format('uv-cache-seed=docker-image://{0}/{1}:uv-cache', needs.org-member-pre-flight.outputs.registry, vars.CI_CONTAINER_NAME) || '' }}
       build-args: |
         MAX_JOBS=4
         NEMO_RL_COMMIT=${{ needs.pre-flight.outputs.test_sha }}
-        ${{ (needs.pre-flight.outputs.skip_sglang == 'true' || needs.org-member-pre-flight.outputs.is_member != 'true') && 'SKIP_SGLANG_BUILD=1' || '' }}
 
   build-container-gb200:
     name: Build GB200/GCP container
@@ -404,11 +394,10 @@ jobs:
       target: release
       build-contexts: |
         nemo-rl=.
-        ${{ (vars.UV_BUILD_CACHE == 'true' && needs.pre-flight.outputs.skip_sglang != 'true' && needs.org-member-pre-flight.outputs.is_member == 'true') && format('uv-cache-seed=docker-image://{0}/{1}:uv-cache', needs.gb200-config.outputs.registry, vars.CI_CONTAINER_NAME) || '' }}
+        ${{ vars.UV_BUILD_CACHE == 'enabled' && format('uv-cache-seed=docker-image://{0}/{1}:uv-cache', needs.gb200-config.outputs.registry, vars.CI_CONTAINER_NAME) || '' }}
       build-args: |
         MAX_JOBS=4
         NEMO_RL_COMMIT=${{ needs.pre-flight.outputs.test_sha }}
-        ${{ (needs.pre-flight.outputs.skip_sglang == 'true' || needs.org-member-pre-flight.outputs.is_member != 'true') && 'SKIP_SGLANG_BUILD=1' || '' }}
 
   update-uv-cache:
     name: Update uv build cache
@@ -416,7 +405,7 @@ jobs:
     if: >-
       ${{
         github.ref == 'refs/heads/main' &&
-        vars.UV_BUILD_CACHE == 'true' &&
+        vars.UV_BUILD_CACHE == 'enabled' &&
         needs.build-container.result == 'success'
       }}
     runs-on: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
@@ -449,7 +438,7 @@ jobs:
     if: >-
       ${{
         github.ref == 'refs/heads/main' &&
-        vars.UV_BUILD_CACHE == 'true' &&
+        vars.UV_BUILD_CACHE == 'enabled' &&
         needs.build-container-gb200.result == 'success'
       }}
     runs-on: ${{ vars.GB200_RUNNER }}
@@ -530,7 +519,6 @@ jobs:
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L0_Unit_Tests_Sglang
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-            uses_sglang: true
           - script: L0_Unit_Tests_Mcore
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L0_Unit_Tests_Mcore_Policy_1
@@ -589,13 +577,8 @@ jobs:
     name: ${{ matrix.script }}
     steps:
       - name: Checkout
-        if: ${{ matrix.uses_sglang != true || needs.pre-flight.outputs.skip_sglang != 'true' }}
         uses: actions/checkout@v6
-      - name: Skip SGLang test
-        if: ${{ matrix.uses_sglang == true && needs.pre-flight.outputs.skip_sglang == 'true' }}
-        run: echo "Skipping ${{ matrix.script }} because SKIP_SGLANG is enabled."
       - name: main
-        if: ${{ matrix.uses_sglang != true || needs.pre-flight.outputs.skip_sglang != 'true' }}
         uses: ./.github/actions/test-template
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -718,7 +701,6 @@ jobs:
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_SGLang
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-            uses_sglang: true
           - script: L1_Functional_Tests_Gym
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_GRPO_1
@@ -755,13 +737,8 @@ jobs:
     name: ${{ matrix.is_optional && 'PLEASEFIXME_' || '' }}${{ matrix.script }}
     steps:
       - name: Checkout
-        if: ${{ matrix.uses_sglang != true || needs.pre-flight.outputs.skip_sglang != 'true' }}
         uses: actions/checkout@v6
-      - name: Skip SGLang test
-        if: ${{ matrix.uses_sglang == true && needs.pre-flight.outputs.skip_sglang == 'true' }}
-        run: echo "Skipping ${{ matrix.script }} because SKIP_SGLANG is enabled."
       - name: main
-        if: ${{ matrix.uses_sglang != true || needs.pre-flight.outputs.skip_sglang != 'true' }}
         uses: ./.github/actions/test-template
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -789,7 +766,6 @@ jobs:
             runner: ${{ vars.GB200_RUNNER }}
           - script: L1_Functional_Tests_SGLang
             runner: ${{ vars.GB200_RUNNER }}
-            uses_sglang: true
           - script: L1_Functional_Tests_Gym
             runner: ${{ vars.GB200_RUNNER }}
           - script: L1_Functional_Tests_GRPO_1
@@ -827,13 +803,8 @@ jobs:
     name: gb200_${{ matrix.is_optional && 'PLEASEFIXME_' || '' }}${{ matrix.script }}
     steps:
       - name: Checkout
-        if: ${{ matrix.uses_sglang != true || needs.pre-flight.outputs.skip_sglang != 'true' }}
         uses: actions/checkout@v6
-      - name: Skip SGLang test
-        if: ${{ matrix.uses_sglang == true && needs.pre-flight.outputs.skip_sglang == 'true' }}
-        run: echo "Skipping ${{ matrix.script }} because SKIP_SGLANG is enabled."
       - name: main
-        if: ${{ matrix.uses_sglang != true || needs.pre-flight.outputs.skip_sglang != 'true' }}
         uses: ./.github/actions/test-template
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
