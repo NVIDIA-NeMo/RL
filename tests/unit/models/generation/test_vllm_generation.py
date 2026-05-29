@@ -146,17 +146,20 @@ basic_lora_test_config: LoRAConfig = {
 }
 
 
-def skip_fp8_if_unsupported() -> None:
+def skip_fp8_vllm_if_unavailable() -> None:
     device_name = torch.cuda.get_device_name()
     if any(gpu_name in device_name for gpu_name in ("H100", "GB200")):
+        # TODO(https://github.com/NVIDIA-NeMo/RL/issues/2081): Re-enable these
+        # FP8 vLLM tests once the known H100/GB200 failures are fixed.
         pytest.skip(
-            f"Skipping FP8 test on {device_name} until fixed. See https://github.com/NVIDIA-NeMo/RL/issues/2081"
+            f"Skipping FP8 vLLM test on {device_name} due to a known failure. "
+            "See https://github.com/NVIDIA-NeMo/RL/issues/2081"
         )
 
     major_capability, _ = torch.cuda.get_device_capability()
     if major_capability < 9:
         pytest.skip(
-            f"Skipping FP8 test. GPU compute capability {major_capability}.0 is < 9.0 (H100 required)."
+            f"Skipping FP8 vLLM test. GPU compute capability {major_capability}.0 is < 9.0."
         )
 
 
@@ -1025,7 +1028,7 @@ async def test_vllm_generation_with_hf_training_colocated(
 ):
     """This test validates that DTensor policy can work together with colocated vLLM policy."""
     if vllm_precision == "fp8":
-        skip_fp8_if_unsupported()
+        skip_fp8_vllm_if_unavailable()
 
     # Create VllmGeneration Policy
     print("Creating vLLM policy...")
@@ -1102,7 +1105,7 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     enable_lora,
 ):
     if vllm_precision == "fp8":
-        skip_fp8_if_unsupported()
+        skip_fp8_vllm_if_unavailable()
 
     """This test validates that DTensor policy can work together with non-colocated vLLM policy."""
     generation_cluster_separate = get_generation_cluster_separate(1)
@@ -1736,7 +1739,7 @@ def test_vllm_weight_update_and_prefix_cache_reset(
 ):
     """Test that the vLLM prefix cache is correctly reset when weights change."""
     if vllm_precision == "fp8":
-        skip_fp8_if_unsupported()
+        skip_fp8_vllm_if_unavailable()
 
     from nemo_rl.models.policy.lm_policy import Policy
 
@@ -2146,7 +2149,7 @@ def test_vllm_generation_with_megatron_training(
     This test validates that vLLM and Megatron policies can work together.
     """
     if vllm_precision == "fp8":
-        skip_fp8_if_unsupported()
+        skip_fp8_vllm_if_unavailable()
 
     # Skip invalid configurations: kv_cache_dtype=fp8 requires precision=fp8
     if kv_cache_dtype == "fp8" and vllm_precision != "fp8":
@@ -2315,7 +2318,7 @@ def test_vllm_generation_with_megatron_training_moe_model(
     This test validates that vLLM and Megatron policies can work together.
     """
     if vllm_precision == "fp8":
-        skip_fp8_if_unsupported()
+        skip_fp8_vllm_if_unavailable()
 
     model_name = "moonshotai/Moonlight-16B-A3B-Instruct"
     expert_parallel_size = 8

@@ -610,6 +610,52 @@ jobs:
           cpu-only: ${{ matrix.cpu-only || false }}
           test-commit-sha: ${{ needs.pre-flight.outputs.test_sha }}
 
+  unit-test-script-check:
+    name: Check unit test script coverage
+    needs: [pre-flight, cicd-wait-in-queue]
+    if: >-
+      ${{
+        always() &&
+        contains('L0 L1 L2 Lfast', needs.pre-flight.outputs.test_level) &&
+        needs.pre-flight.result == 'success' &&
+        (
+          needs.cicd-wait-in-queue.result == 'success' ||
+          !startsWith(github.ref, 'refs/heads/pull-request/')
+        ) &&
+        !cancelled()
+      }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.pre-flight.outputs.test_sha }}
+
+      - name: Verify L0 unit scripts are in the workflow
+        run: |
+          set -euo pipefail
+
+          expected=$(mktemp)
+          configured=$(mktemp)
+
+          find tests/unit -maxdepth 1 -type f -name 'L0_Unit*.sh' \
+            -exec basename {} .sh \; | sort -u > "$expected"
+
+          {
+            grep -E '^[[:space:]]*-[[:space:]]*script:[[:space:]]*L0_Unit' .github/workflows/cicd-main.yml || true
+          } | sed -E 's/^[[:space:]]*-[[:space:]]*script:[[:space:]]*//' | sort -u > "$configured"
+
+          missing=$(comm -23 "$expected" "$configured")
+          if [[ -n "$missing" ]]; then
+            echo "The following tests/unit/L0_Unit*.sh scripts are missing from .github/workflows/cicd-main.yml:"
+            printf '%s\n' "$missing"
+            exit 1
+          fi
+
+          echo "All L0 unit scripts are included in .github/workflows/cicd-main.yml."
+
   functional-test-script-check:
     name: Check functional test script coverage
     needs: [pre-flight, cicd-wait-in-queue]
@@ -876,6 +922,7 @@ jobs:
       - build-container-gb200
       - cicd-doc-tests
       - cicd-unit-tests
+      - unit-test-script-check
       - functional-test-script-check
       - cicd-functional-tests
       - cicd-functional-tests-gb200
@@ -901,6 +948,10 @@ jobs:
                     (
                       !contains('L0 L1 L2 Lfast', needs.pre-flight.outputs.test_level) ||
                       needs.cicd-unit-tests.result == 'success'
+                    ) &&
+                    (
+                      !contains('L0 L1 L2 Lfast', needs.pre-flight.outputs.test_level) ||
+                      needs.unit-test-script-check.result == 'success'
                     ) &&
                     (
                       !contains('L1 L2 Lfast', needs.pre-flight.outputs.test_level) ||
