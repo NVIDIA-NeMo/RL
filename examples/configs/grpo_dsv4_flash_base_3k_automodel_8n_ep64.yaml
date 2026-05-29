@@ -1,16 +1,17 @@
 defaults: grpo_math_1B.yaml
 
 grpo:
-  num_prompts_per_step: 16
+  num_prompts_per_step: 32
   num_generations_per_prompt: 16
-  batch_multiplier: 1
+  batch_multiplier: 4
   max_rollout_turns: 1
-  max_num_steps: 20
+  max_num_epochs: 100
+  max_num_steps: 1000
   use_leave_one_out_baseline: false
   val_period: 5
   max_val_samples: 960
   val_batch_size: 960
-  use_dynamic_sampling: false
+  use_dynamic_sampling: true
   dynamic_sampling_max_gen_batches: 10
   reward_scaling:
     enabled: true
@@ -20,7 +21,7 @@ grpo:
     target_max: 1.0
   reward_shaping:
     enabled: true
-    overlong_buffer_length: 512
+    overlong_buffer_length: 128
     max_response_length: 2048
 
 loss_fn:
@@ -32,9 +33,10 @@ loss_fn:
 
 checkpointing:
   keep_top_k: 1
-  save_period: 10
+  save_period: 5
+  checkpoint_must_save_by: "00:03:45:00"
   model_save_format: null
-  checkpoint_dir: results/grpo-dsv4-base-bf16-4k-automodel-8n-ep64
+  checkpoint_dir: results/grpo-dsv4-flash-base-3k-automodel-8n-ep64/checkpoints
 
 policy:
   model_name: deepseek-ai/DeepSeek-V4-Flash-Base
@@ -46,7 +48,10 @@ policy:
   dequantize_base_checkpoint: true
   hf_config_overrides:
     num_nextn_predict_layers: 0
-  train_global_batch_size: 256
+    freeze_indexer_query_projection: false
+    fp8_ds_mla_fake_quant_kv: false
+    fp8_ds_mla_fake_quant_o_proj: false
+  train_global_batch_size: 512
   train_micro_batch_size: 1
   logprob_batch_size: 1
   precision: bfloat16
@@ -56,15 +61,21 @@ policy:
   make_sequence_length_divisible_by: 64
   max_grad_norm: 1.0
   optimizer:
+    name: "transformer_engine.pytorch.optimizers.fused_adam.FusedAdam"
     kwargs:
       lr: 1.0e-06
       weight_decay: 0.1
-      betas: [0.9, 0.98]
-      eps: 1.0e-05
+      betas: [0.9, 0.999]
+      eps: 1.0e-08
+      master_weights: true
+      store_param_remainders: true
+      exp_avg_dtype: "torch.bfloat16"
+      exp_avg_sq_dtype: "torch.bfloat16"
+      split_fp32_params_to_torch_adamw: true
   scheduler:
   - name: torch.optim.lr_scheduler.LinearLR
     kwargs:
-      start_factor: 1.0e-08
+      start_factor: 1.0e-02
       end_factor: 1.0
       total_iters: 10
   - name: torch.optim.lr_scheduler.ConstantLR
@@ -94,12 +105,14 @@ policy:
         _target_: nemo_automodel.components.models.common.utils.BackendConfig
         attn: sdpa
         linear: torch
-        rms_norm: torch
+        rms_norm: torch_fp32
         experts: torch_mm
-        enable_deepep: false
+        dispatcher: deepep
         fake_balanced_gate: false
         rope_fusion: false
         enable_hf_state_dict_adapter: true
+        enable_fsdp_optimizations: true
+        gate_precision: float32
   megatron_cfg:
     enabled: false
   sequence_packing:
@@ -108,6 +121,7 @@ policy:
     enabled: true
   generation:
     max_new_tokens: 2048
+    temperature: 0.8
     vllm_cfg:
       precision: fp8
       kv_cache_dtype: fp8_ds_mla
@@ -120,9 +134,12 @@ policy:
       use_deep_gemm: true
     vllm_kwargs:
       tokenizer_mode: deepseek_v4
+      hf_overrides:
+        expert_dtype: fp8
 
 data:
   max_input_seq_length: 1024
+  filter_overlong_prompts: true
   train:
     dataset_name: DAPOMath17K
   validation:
@@ -139,14 +156,15 @@ logger:
   wandb_enabled: true
   monitor_gpus: true
   num_val_samples_to_print: 2
+  num_train_samples_to_print: 2
   wandb:
     project: nemo-rl
-    name: grpo-dsv4-base-bf16-4k-automodel-8n-ep64
+    name: grpo-dsv4-flash-base-3k-automodel-8n-ep64
   tensorboard_enabled: true
   tensorboard:
-    log_dir: tb_logs/grpo-dsv4-base-bf16-4k-automodel-8n-ep64
+    log_dir: tb_logs/grpo-dsv4-flash-base-3k-automodel-8n-ep64
   mlflow:
-    run_name: grpo-dsv4-base-bf16-4k-automodel-8n-ep64
+    run_name: grpo-dsv4-flash-base-3k-automodel-8n-ep64
 
 cluster:
   gpus_per_node: 8
