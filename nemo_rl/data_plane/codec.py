@@ -28,6 +28,7 @@ code consumes the padded BatchedDataDict unchanged.
 :func:`response_from_nested` to extract the response slice from a
 (prompt+response) nested tensor.
 
+
 * Non-tensor object fields ride as ``NonTensorStack`` / ``NonTensorData``
 leaves (TQ-native passthrough). :func:`materialize` decodes them back
 to ``np.ndarray(dtype=object)`` for the trainer.
