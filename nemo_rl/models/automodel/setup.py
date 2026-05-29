@@ -68,12 +68,15 @@ class _ChainedOptimizer(torch.optim.Optimizer):
         if not optimizers:
             raise ValueError("Expected at least one optimizer")
         self.optimizers = optimizers
-        self.param_groups = [
+        self.defaults = {}
+
+    @property
+    def param_groups(self):
+        return [
             param_group
             for optimizer in self.optimizers
             for param_group in optimizer.param_groups
         ]
-        self.defaults = {}
 
     @property
     def state(self):
