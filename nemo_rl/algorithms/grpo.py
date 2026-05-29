@@ -666,7 +666,7 @@ def setup(
                         flush=True,
                     )
 
-                # Inference topology: each vLLM/SGLang instance spans
+                # Inference topology: each inference instance spans
                 # nodes_per_instance nodes; keep those within one domain
                 # so cross-node all-reduce uses NVLink, not InfiniBand.
                 #
@@ -674,7 +674,16 @@ def setup(
                 # For SGLang: gpus_per_server already includes all parallelism
                 #   dimensions (TP, DP-attention, PP are internal subdivisions),
                 #   so we use it directly without multiplying by pp_size.
-                if generation_config["backend"] == "vllm":
+                # For Megatron: inference reuses the training megatron_cfg
+                #   parallelism, so an instance spans TP * PP * CP GPUs.
+                if generation_config["backend"] == "megatron":
+                    megatron_cfg = policy_config["megatron_cfg"]
+                    gpus_per_instance = (
+                        megatron_cfg["tensor_model_parallel_size"]
+                        * megatron_cfg["pipeline_model_parallel_size"]
+                        * megatron_cfg["context_parallel_size"]
+                    )
+                elif generation_config["backend"] == "vllm":
                     vllm_cfg = generation_config.get("vllm_cfg", {})
                     gpus_per_instance = vllm_cfg["tensor_parallel_size"] * vllm_cfg.get(
                         "pipeline_parallel_size", 1
@@ -742,9 +751,14 @@ def setup(
             node_resource_constraints=inference_node_resource_constraints,
         )
         if inference_node_resource_constraints is not None:
-            VllmGeneration.init_cluster_placement_groups(
-                inference_cluster, generation_config
-            )
+            if generation_config["backend"] == "megatron":
+                MegatronGeneration.init_cluster_placement_groups(
+                    inference_cluster, policy_config
+                )
+            else:
+                VllmGeneration.init_cluster_placement_groups(
+                    inference_cluster, generation_config
+                )
         print(
             f"  ✓ Ray inference cluster initialized with {inference_nodes} nodes with {inference_gpus_per_node} GPUs per node",
             flush=True,
