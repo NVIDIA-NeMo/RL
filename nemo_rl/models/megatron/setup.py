@@ -150,8 +150,9 @@ def setup_distributed() -> None:
     configure_dynamo_cache()
     # Ensure clean slate before import
     destroy_parallel_state()
-    # Need to initialize the process group before calling into Megatron-Bridge, otherwise Megatron-Bridge will try to set an incorrect device
-    torch.distributed.init_process_group("nccl")
+    # Pin the communicator to the correct GPU explicitly.
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.distributed.init_process_group("nccl", device_id=torch.device(f"cuda:{local_rank}"))
 
 
 def validate_and_set_config(

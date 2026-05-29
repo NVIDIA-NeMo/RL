@@ -172,6 +172,31 @@ class MegatronPolicyWorkerImpl(
         self._replica_group_cache = groups[my_dp_rank]
         return self._replica_group_cache
 
+    @staticmethod
+    def configure_worker(
+        num_gpus: int | float,
+        bundle_indices: Optional[tuple[int, list[int]]] = None,
+    ) -> tuple[dict[str, Any], dict[str, str], dict[str, Any]]:
+        """Worker-controlled Ray actor configuration.
+
+        Ensures that communication via NVLS functions correctly.
+
+        Args:
+            num_gpus: Original GPU allocation for this worker based on the placement group
+            bundle_indices: Tuple of (node_idx, local_bundle_indices) for this server
+
+        Returns:
+            tuple with complete worker configuration:
+              - 'resources': Resource allocation (e.g., num_gpus)
+              - 'env_vars': Environment variables for this worker
+              - 'init_kwargs': Parameters to pass to __init__ of the worker
+        """
+        del num_gpus, bundle_indices  # Megatron policy workers are always parallel.
+        resources: dict[str, Any] = {"num_gpus": 0}
+        env_vars: dict[str, str] = {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}
+        init_kwargs: dict[str, Any] = {}
+        return resources, env_vars, init_kwargs
+
     def __init__(
         self,
         config: PolicyConfig,
@@ -185,6 +210,12 @@ class MegatronPolicyWorkerImpl(
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
+        # Must be the first CUDA-touching call in this process.
+        # With `RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1` (set by `configure_worker()`),
+        # all node GPUs are visible to this actor; LOCAL_RANK selects ours.
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+
         # Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files
         apply_transformer_engine_patch()
 
@@ -195,6 +226,12 @@ class MegatronPolicyWorkerImpl(
 
         # Step 1: Setup distributed
         setup_distributed()
+
+        # Defensive assert to ensure to ensure `local_rank` setter worked correctly.
+        assert torch.cuda.current_device() == local_rank, (
+            f"device drift after setup_distributed: current_device="
+            f"{torch.cuda.current_device()}, LOCAL_RANK={local_rank}."
+        )
 
         # Step 2: Validate and setup model paths
         hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(

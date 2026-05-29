@@ -115,15 +115,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
             env_vars = dict(config["megatron_cfg"].get("env_vars") or {})
 
-            # Megatron's NVLS MoE token dispatcher uses torch.distributed._symmetric_memory.
-            # Under Ray's per-actor CUDA_VISIBLE_DEVICES isolation each rank's only visible GPU is
-            # cuda:0, causing symmetric memory initialization to fail its rendezvous check.
-            # The CUDA symmetric-memory backend on Hopper+ NVLink fabrics exchanges memory via
-            # CUmem fabric handles (not CUDA IPC fds), so it can route correctly despite the
-            # apparent overlap; the check is the only thing in the way.
-            if (config.get("generation") or {}).get("backend") == "megatron":
-                env_vars.setdefault("TORCH_SYMM_MEM_ALLOW_OVERLAPPING_DEVICES", "1")
-
             if "TORCH_CUDA_ARCH_LIST" not in os.environ:
                 raise RuntimeError(
                     "TORCH_CUDA_ARCH_LIST is not set. This is required in Megatron backend. This variable is set in our container, but "

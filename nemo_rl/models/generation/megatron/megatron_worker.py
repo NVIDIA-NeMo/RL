@@ -14,6 +14,7 @@
 
 import asyncio
 import gc
+import os
 import threading
 import time
 import warnings
@@ -242,8 +243,12 @@ class MegatronGenerationMixin:
 
     def _start_inference_loop_thread(self):
         """Start a background thread with a persistent event loop for inference."""
+        # CUDA current_device is per-thread.
+        # The worker's __init__ thread called set_device(LOCAL_RANK), and this thread must match.
+        local_rank = int(os.environ["LOCAL_RANK"])
 
         def run_loop():
+            torch.cuda.set_device(local_rank)
             asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
             self._inference_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._inference_loop)
