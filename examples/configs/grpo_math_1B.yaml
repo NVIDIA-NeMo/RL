@@ -72,11 +72,6 @@ loss_fn:
   force_on_policy_ratio: false  # Set to true to force ratio=1.0 (requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt)
   use_kl_in_reward: false  # Reinforce++: add KL penalty to reward instead of loss
   use_cispo: false  # CISPO (https://arxiv.org/abs/2506.13585): clipped IS-weight policy optimization
-  # Optional CISPO-style diagnostics. Cheap; works on GRPO/DAPO/CISPO arms.
-  # See ClippedPGLossConfig in nemo_rl/algorithms/loss/loss_functions.py.
-  cispo_diagnostics: false
-  cispo_diag_grpo_eps: 0.2          # baseline GRPO eps for would_clip_frac
-  cispo_diag_low_prob_threshold: 0.05  # proxy threshold for rare reflective tokens
 
 checkpointing:
   enabled: true
