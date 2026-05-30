@@ -1127,12 +1127,14 @@ class CrossTokenizerDistillationLossDataDict(TypedDict):
     input_lengths: torch.Tensor
     token_mask: torch.Tensor
     sample_mask: torch.Tensor
-    # Full-vocab teacher logits shipped via CUDA IPC. List[B] of dicts each
-    # carrying a single ``logits_ipc`` handle (rebuilt to ``[T_t, V_t]`` on
-    # the consumer side) plus shape/dtype. Produced by
-    # ``Policy.get_full_logits_ipc``. The loss fn either derives a
-    # microbatch-global top-k subset internally (P-KL path) or uses full
-    # vocab end-to-end (gold-loss path).
+    # Full-vocab teacher logits shipped via CUDA IPC. List[B] of dicts; every
+    # entry within one DP rank carries the same ``rank_logits_ipc`` handle
+    # (taken on the producer's ``[B_r, T_t, V_t]`` tray) plus its own
+    # ``sample_idx_within_rank``. The consumer rebuilds the single rank-level
+    # handle and slices ``[mb_start:mb_end]`` for a contiguous view — no
+    # ``torch.stack``. Produced by ``Policy.get_full_logits_ipc``. The loss
+    # fn either derives a microbatch-global top-k subset internally (P-KL
+    # path) or uses full vocab end-to-end (gold-loss path).
     teacher_full_logits_ipc: list[dict[str, Any]]
     alignment_pair_valid: torch.Tensor         # [B, max_pairs]
     alignment_pair_is_correct: torch.Tensor    # [B, max_pairs]
@@ -1192,22 +1194,48 @@ class CrossTokenizerDistillationLossFn(LossFunction):
     def _rebuild_teacher_full_logits(
         data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
     ) -> torch.Tensor:
-        """Unpack ``teacher_full_logits_ipc`` to a stacked ``[B, T_t, V_t]`` CUDA tensor.
+        """View-only rebuild of the microbatch's teacher-logits slice.
 
-        The IPC handles point at views the teacher worker stashed in its
-        ``_teacher_ipc_buffer``; rebuilding does not allocate new memory
-        on the producer side. Casts to ``float32`` to match the loss math
-        (the producer also writes FP32 via :class:`FullLogitsPostProcessor`).
+        The producer maintains a **persistent** IPC buffer on its GPU
+        sized ``[B_r, T_t, V_t]``; the buffer (and the IPC handle it
+        was captured with) survives across training steps, with fresh
+        logits ``.copy_()``-ed in each step. Because the producer never
+        frees the buffer between steps, holding a view into the
+        IPC-imported storage is safe: the producer-side allocation
+        isn't fighting the consumer's refcount, it's simply alive for
+        the worker's lifetime.
+
+        Every per-sample entry in ``teacher_full_logits_ipc`` carries
+        the same stable rank-level handle plus its rank-local
+        ``sample_idx_within_rank``. We rebuild that single handle once
+        and slice ``[mb_start:mb_end]`` for the current microbatch —
+        zero allocation on the consumer, dtype preserved (caller casts
+        if/where it needs fp32).
         """
         from nemo_rl.models.policy.utils import rebuild_cuda_tensor_from_ipc
 
-        handles = data["teacher_full_logits_ipc"]
+        entries = data["teacher_full_logits_ipc"]
         consumer_device = torch.cuda.current_device()
-        per_sample = [
-            rebuild_cuda_tensor_from_ipc(h["logits_ipc"], consumer_device)
-            for h in handles
-        ]
-        return torch.stack(per_sample, dim=0).float()
+
+        first = entries[0]
+        last = entries[-1]
+        rank_view = rebuild_cuda_tensor_from_ipc(
+            first["rank_logits_ipc"], consumer_device
+        )  # [B_r, T_t, V_t] view into producer's GPU memory
+
+        mb_start = first["sample_idx_within_rank"]
+        mb_end = last["sample_idx_within_rank"] + 1
+        # Contract: BatchedDataDict.slice and shard_by_batch_size preserve
+        # contiguous sample order, so sample_idx_within_rank is monotone in
+        # the microbatch. If a future change ever reorders samples, fall back
+        # to advanced indexing (which DOES copy — defeats the no-copy win);
+        # assert loudly instead of silently regressing.
+        assert mb_end - mb_start == len(entries), (
+            "expected contiguous monotonic sample_idx_within_rank within a "
+            f"microbatch; got entries with indices "
+            f"{[e['sample_idx_within_rank'] for e in entries]}"
+        )
+        return rank_view[mb_start:mb_end]  # [mb_B, T_t, V_t] view, no copy
 
     def __call__(
         self,

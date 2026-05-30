@@ -256,11 +256,16 @@ class DTensorPolicyWorkerV2Impl(
         # Initialize checkpoint manager
         self.checkpoint_manager: Optional[AutomodelCheckpointManager] = None
 
-        # Per-step stash for cross-tokenizer teacher logits exported via
-        # CUDA IPC. Holds references to the [B_r, T_t, k] tensors so they
-        # survive across the student's train call. Released by
-        # release_ipc_buffer().
-        self._teacher_ipc_buffer: Optional[list[torch.Tensor]] = None
+        # Persistent CUDA IPC buffer for cross-tokenizer teacher logits.
+        # Allocated once on first ``get_full_logits_ipc`` call (or
+        # reallocated if dims grow), ``.copy_()``-ed into each step, and
+        # exposed via a stable IPC handle captured at allocation. With a
+        # persistent buffer the producer never tries to free between
+        # steps, so the consumer can safely hold a view into the
+        # IPC-imported storage without keeping a now-orphaned producer
+        # allocation pinned via refcount.
+        self._teacher_ipc_buffer: Optional[torch.Tensor] = None
+        self._teacher_ipc_handle: Optional[tuple] = None
 
         # Validate configuration and prepare runtime settings
         runtime_config = validate_and_prepare_config(
@@ -817,16 +822,22 @@ class DTensorPolicyWorkerV2Impl(
         end; PT non-gold computes its ``global_top_indices`` reduction
         *inside the loss*, not at the worker.
 
-        Lifetime: the source ``[B_r, T_t, V_t]`` CUDA tensor is stashed in
-        ``self._teacher_ipc_buffer`` so per-sample views remain valid
-        across the consumer's :func:`rebuild_cuda_tensor_from_ipc` call.
-        The driver releases it via :meth:`release_ipc_buffer` after the
-        student training step finishes.
+        Lifetime: the source ``[B_r, T_t, V_t]`` CUDA tensor is a
+        **persistent** IPC buffer (``self._teacher_ipc_buffer``)
+        allocated once and reused across every training step. The
+        captured IPC handle (``self._teacher_ipc_handle``) is also
+        stable — each step ``.copy_()``-s fresh logits into the same
+        backing memory. :meth:`release_ipc_buffer` is a no-op kept for
+        driver-side contract compatibility.
 
         Returns:
             dict with:
-              - ``per_sample_handles``: ``list[B_r]`` of dicts each carrying
-                a single ``logits_ipc`` handle tuple plus shape/dtype.
+              - ``per_sample_handles``: ``list[B_r]`` of dicts. Every entry
+                carries the **same** rank-level handle ``rank_logits_ipc``
+                (taken on the whole ``[B_r, T_t, V_t]`` tray) plus its own
+                ``sample_idx_within_rank``. The consumer rebuilds that one
+                handle and slices ``[mb_start:mb_end]`` for the current
+                microbatch — no ``torch.stack``, no extra allocation.
 
         v0 limitation: TP=1, CP=1, no sequence packing.
         """
@@ -893,34 +904,79 @@ class DTensorPolicyWorkerV2Impl(
             torch.cat(out_vals, dim=0) if len(out_vals) > 1 else out_vals[0]
         )  # CUDA [B_r, T_t, V_t]
 
-        # Stash the full tensor so per-sample views remain valid across the
-        # student's train call. Cleared by release_ipc_buffer().
-        if self._teacher_ipc_buffer is None:
-            self._teacher_ipc_buffer = []
-        self._teacher_ipc_buffer.append(final_vals)
+        # Lazy-allocate the persistent IPC buffer (sized at first call,
+        # reallocated only if dims grow). The IPC handle is captured once
+        # at allocation and reused across all training steps — the
+        # consumer's view-only rebuild is safe because this buffer is
+        # never freed between steps.
+        B_r, T_t, V_t = final_vals.shape
+        self._ensure_teacher_ipc_buffer(
+            B_r, T_t, V_t, final_vals.dtype, final_vals.device
+        )
+        self._teacher_ipc_buffer[:B_r, :T_t, :V_t].copy_(final_vals)
+        del final_vals, out_vals  # drop the cat intermediate; only the persistent buffer holds the data now
 
-        per_sample_handles: list[dict[str, Any]] = []
-        for i in range(final_vals.shape[0]):
-            view_i = final_vals[i]  # [T_t, V_t] view; dim-0 slice of row-major
-            per_sample_handles.append(
-                {
-                    "logits_ipc": get_handle_from_tensor(view_i),
-                    "shape": tuple(view_i.shape),
-                    "dtype": view_i.dtype,
-                }
-            )
+        # Every per-sample entry carries the same stable rank-level
+        # handle plus its rank-local sample index. The consumer rebuilds
+        # the single handle once and slices into the contiguous
+        # microbatch range — no torch.stack, no allocation.
+        rank_shape = (B_r, T_t, V_t)
+        rank_dtype = self._teacher_ipc_buffer.dtype
+
+        per_sample_handles: list[dict[str, Any]] = [
+            {
+                "rank_logits_ipc": self._teacher_ipc_handle,
+                "rank_shape": rank_shape,
+                "dtype": rank_dtype,
+                "sample_idx_within_rank": i,
+            }
+            for i in range(B_r)
+        ]
         return {"per_sample_handles": per_sample_handles}
 
-    def release_ipc_buffer(self) -> None:
-        """Drop the stashed teacher logits and reclaim GPU memory.
+    def _ensure_teacher_ipc_buffer(
+        self,
+        B_r: int,
+        T_t: int,
+        V_t: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        """Allocate the persistent teacher-logits IPC buffer if needed.
 
-        Called by the driver after the student finishes consuming the
-        previous step's IPC handles. Must precede the next IPC step or
-        memory grows unboundedly.
+        On first call: allocates ``[B_r, T_t, V_t]`` on ``device`` with
+        ``dtype`` and captures the IPC handle. On subsequent calls:
+        no-op as long as the existing buffer can hold the requested
+        shape and matches dtype/device. If any dim grew or dtype/device
+        changed, reallocates and re-captures the handle (the consumer
+        will receive the new handle in the next ``get_full_logits_ipc``
+        return value).
         """
-        self._teacher_ipc_buffer = None
-        gc.collect()
-        torch.cuda.empty_cache()
+        if (
+            self._teacher_ipc_buffer is not None
+            and self._teacher_ipc_buffer.shape[0] >= B_r
+            and self._teacher_ipc_buffer.shape[1] >= T_t
+            and self._teacher_ipc_buffer.shape[2] >= V_t
+            and self._teacher_ipc_buffer.dtype == dtype
+            and self._teacher_ipc_buffer.device == device
+        ):
+            return
+        self._teacher_ipc_buffer = torch.empty(
+            (B_r, T_t, V_t), dtype=dtype, device=device
+        )
+        self._teacher_ipc_handle = get_handle_from_tensor(self._teacher_ipc_buffer)
+
+    def release_ipc_buffer(self) -> None:
+        """No-op under the persistent IPC buffer design.
+
+        The teacher-logits IPC buffer is allocated once on first
+        ``get_full_logits_ipc`` and lives for the worker's lifetime;
+        each step ``.copy_()``-s fresh logits into the same memory
+        backing the same stable IPC handle. The driver still calls
+        this method in its ``finally`` block — keep that contract,
+        but with persistent storage there is nothing to release.
+        """
+        return
 
     @contextmanager
     def use_reference_model(self) -> Generator[None, None, None]:

@@ -1014,7 +1014,11 @@ class FullLogitsPostProcessor:
                 )
             logits = logits.to_local()
 
-        return logits.to(torch.float32)  # [B, S, V_t]
+        # Teacher is frozen (init_optimizer=False) and the consumer does not
+        # backprop into these logits; downstream log_softmax/KL kernels upcast
+        # to fp32 internally where they need it. Ship native compute dtype
+        # (bf16 under autocast) to halve the IPC buffer footprint.
+        return logits  # [B, S, V_t]
 
 
 class ScorePostProcessor:
