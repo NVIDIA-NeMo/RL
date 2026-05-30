@@ -560,7 +560,7 @@ jobs:
       ${{
         (
           always() &&
-          contains('L0 L1 L2 Lfast', needs.pre-flight.outputs.test_level) &&
+          contains('L0 L1 L2', needs.pre-flight.outputs.test_level) &&
           needs.pre-flight.result == 'success' &&
           needs.org-member-pre-flight.result == 'success' &&
           (
@@ -599,7 +599,7 @@ jobs:
     if: >-
       ${{
         always() &&
-        contains('L0 L1 L2 Lfast', needs.pre-flight.outputs.test_level) &&
+        contains('L0 L1 L2', needs.pre-flight.outputs.test_level) &&
         needs.pre-flight.result == 'success' &&
         (
           needs.cicd-wait-in-queue.result == 'success' ||
@@ -722,7 +722,7 @@ jobs:
     if: >-
       ${{
         always() &&
-        contains('L1 L2', needs.pre-flight.outputs.test_level) &&
+        contains('L1 L2 Lfast', needs.pre-flight.outputs.test_level) &&
         needs.pre-flight.result == 'success' &&
         needs.org-member-pre-flight.result == 'success' &&
         (
@@ -730,7 +730,10 @@ jobs:
           !startsWith(github.ref, 'refs/heads/pull-request/')
         ) &&
         (needs.build-container.result == 'success' || needs.build-container.result == 'skipped') &&
-        needs.cicd-unit-tests.result == 'success' &&
+        (
+          needs.pre-flight.outputs.test_level == 'Lfast' ||
+          needs.cicd-unit-tests.result == 'success'
+        ) &&
         needs.functional-test-script-check.result == 'success' &&
         !cancelled()
       }}
@@ -747,6 +750,7 @@ jobs:
           registry: ${{ needs.org-member-pre-flight.outputs.registry }}
           image: ${{ vars.CI_CONTAINER_NAME }}
           test_data_path: ${{ needs.org-member-pre-flight.outputs.test_data_path }}
+          image-tag: ${{ needs.pre-flight.outputs.image_tag }}
           script: ${{ matrix.script }}
           test-commit-sha: ${{ needs.pre-flight.outputs.test_sha }}
 
@@ -787,7 +791,7 @@ jobs:
     if: >-
       ${{
         always() &&
-        contains('L1 L2', needs.pre-flight.outputs.test_level) &&
+        contains('L1 L2 Lfast', needs.pre-flight.outputs.test_level) &&
         needs.org-member-pre-flight.outputs.is_member == 'true' &&
         needs.pre-flight.result == 'success' &&
         needs.org-member-pre-flight.result == 'success' &&
@@ -796,7 +800,10 @@ jobs:
           !startsWith(github.ref, 'refs/heads/pull-request/')
         ) &&
         (needs.build-container-gb200.result == 'success' || needs.build-container-gb200.result == 'skipped') &&
-        needs.cicd-unit-tests.result == 'success' &&
+        (
+          needs.pre-flight.outputs.test_level == 'Lfast' ||
+          needs.cicd-unit-tests.result == 'success'
+        ) &&
         needs.functional-test-script-check.result == 'success' &&
         !cancelled()
       }}
@@ -815,67 +822,6 @@ jobs:
           test_data_path: ${{ needs.org-member-pre-flight.outputs.test_data_path }}
           image-tag: ${{ needs.pre-flight.outputs.image_tag }}
           script: ${{ matrix.script }}
-          test-commit-sha: ${{ needs.pre-flight.outputs.test_sha }}
-
-  cicd-fast-functional-tests:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - script: L1_Functional_Tests_Megatron_1
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_Megatron_2
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_Megatron_3
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_AutoModel
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_Gym
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_GRPO_1
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_GRPO_2
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_GRPO_3
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_SFT
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_Eval
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_Other_1
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-          - script: L1_Functional_Tests_Other_2
-            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
-    needs: [pre-flight, functional-test-script-check, org-member-pre-flight, cicd-wait-in-queue]
-    if: >-
-      ${{
-        always() &&
-        contains('Lfast', needs.pre-flight.outputs.test_level) &&
-        needs.pre-flight.result == 'success' &&
-        needs.org-member-pre-flight.result == 'success' &&
-        (
-          needs.cicd-wait-in-queue.result == 'success' ||
-          !startsWith(github.ref, 'refs/heads/pull-request/')
-        ) &&
-        needs.functional-test-script-check.result == 'success' &&
-        !cancelled()
-      }}
-    runs-on: ${{ matrix.runner }}
-    name: fast_${{ matrix.script }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-      - name: main
-        uses: ./.github/actions/test-template
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        with:
-          runner: ${{ matrix.runner }}
-          script: ${{ matrix.script }}
-          image-tag: ${{ needs.pre-flight.outputs.image_tag }}
-          registry: ${{ needs.org-member-pre-flight.outputs.registry }}
-          image: ${{ vars.CI_CONTAINER_NAME }}
-          test_data_path: ${{ needs.org-member-pre-flight.outputs.test_data_path }}
           test-commit-sha: ${{ needs.pre-flight.outputs.test_sha }}
 
   CI_QA_Gate:
@@ -897,7 +843,6 @@ jobs:
       - functional-test-script-check
       - cicd-functional-tests
       - cicd-functional-tests-gb200
-      - cicd-fast-functional-tests
     steps:
       - name: main
         env:
@@ -917,11 +862,11 @@ jobs:
                   (
                     (needs.cicd-doc-tests.result == 'success' || needs.cicd-doc-tests.result == 'skipped') &&
                     (
-                      !contains('L0 L1 L2 Lfast', needs.pre-flight.outputs.test_level) ||
+                      !contains('L0 L1 L2', needs.pre-flight.outputs.test_level) ||
                       needs.cicd-unit-tests.result == 'success'
                     ) &&
                     (
-                      !contains('L0 L1 L2 Lfast', needs.pre-flight.outputs.test_level) ||
+                      !contains('L0 L1 L2', needs.pre-flight.outputs.test_level) ||
                       needs.unit-test-script-check.result == 'success'
                     ) &&
                     (
@@ -929,17 +874,13 @@ jobs:
                       needs.functional-test-script-check.result == 'success'
                     ) &&
                     (
-                      !contains('L1 L2', needs.pre-flight.outputs.test_level) ||
+                      !contains('L1 L2 Lfast', needs.pre-flight.outputs.test_level) ||
                       needs.cicd-functional-tests.result == 'success'
                     ) &&
                     (
                       needs.org-member-pre-flight.outputs.is_member != 'true' ||
-                      !contains('L1 L2', needs.pre-flight.outputs.test_level) ||
+                      !contains('L1 L2 Lfast', needs.pre-flight.outputs.test_level) ||
                       needs.cicd-functional-tests-gb200.result == 'success'
-                    ) &&
-                    (
-                      !contains('Lfast', needs.pre-flight.outputs.test_level) ||
-                      needs.cicd-fast-functional-tests.result == 'success'
                     )
                   )
                 )
