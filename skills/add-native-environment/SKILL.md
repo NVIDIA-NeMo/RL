@@ -2,7 +2,15 @@
 name: add-native-environment
 license: Apache-2.0
 description: Interactive skill for building a new native RL environment in NeMo-RL. Guides through creating the full stack — dataset, data processor, environment, config, and training script — then validates end-to-end with a GRPO training run.
-when_to_use: "add environment", "new RL environment", "create a native environment", "build a training task", "add a new game", "add a new reward function", "new GRPO task", "add native env".
+when_to_use:
+  - "add environment"
+  - "new RL environment"
+  - "create a native environment"
+  - "build a training task"
+  - "add a new game"
+  - "add a new reward function"
+  - "new GRPO task"
+  - "add native env"
 allowed-tools: Bash Read Grep Glob Edit Write Agent AskUserQuestion
 ---
 
@@ -11,6 +19,8 @@ allowed-tools: Bash Read Grep Glob Edit Write Agent AskUserQuestion
 This skill walks through building a **native RL environment** in NeMo-RL: a Ray actor implementing `EnvironmentInterface`, paired with a dataset and data processor, wired together with a GRPO training config. At the end, it validates the whole stack by training on 1 GPU and confirming reward increases.
 
 **Native environments** run in-process with the training loop (as Ray actors). They are different from NeMo-Gym environments (external HTTP microservices) — for those, use the `add-benchmark` skill instead.
+
+**Safety:** This skill creates new Python files, config YAMLs, and training scripts, and executes shell commands including GPU training runs. Always confirm the implementation plan with the user before writing files or launching training. Do not execute training jobs without explicit user approval. Do NOT use for: deploying to Kubernetes, modifying existing environments, code review, or infrastructure tasks.
 
 ## Prerequisite knowledge
 
