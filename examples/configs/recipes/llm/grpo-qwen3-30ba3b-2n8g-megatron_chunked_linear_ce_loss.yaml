@@ -1,0 +1,112 @@
+# Small-scale GRPO run on Qwen3-30B-A3B (Megatron policy + colocated vLLM)
+# exercising the chunked linear cross-entropy fusion loss.
+#
+# Footprint: 2 nodes x 8 H200. Megatron TP=2 x EP=8 = 16 GPUs (matches the
+# proven Qwen3-30B-A3B parallelism); vLLM TP=4 colocated gives 4 generation
+# replicas during rollout.
+#
+# Linear CE fusion constraints (enforced in nemo_rl/algorithms/grpo.py):
+#   * sequence_packing must be disabled (the fused forward rolls labels over
+#     the whole sequence and would mix tokens across packed boundaries),
+#   * context parallelism must be 1,
+#   * top-k/top-p training-time filtering must be off (top_k=null, top_p=1.0).
+# The Qwen3-30B-A3B megatron base config already satisfies all three.
+defaults: ../../grpo_math_qwen30ba3b_megatron.yaml
+
+grpo:
+  # Small-scale smoke configuration: 16 prompts x 8 generations = 128
+  # trajectories per step, a handful of steps.
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 8
+  max_num_steps: 20
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+
+policy:
+  model_name: Qwen/Qwen3-30B-A3B
+  tokenizer:
+    name: ${policy.model_name}
+  train_global_batch_size: 64
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 4096
+  dtensor_cfg:
+    enabled: false
+  # Linear CE fusion is incompatible with sequence packing.
+  sequence_packing:
+    enabled: false
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  megatron_cfg:
+    enabled: true
+    use_linear_ce_fusion_loss: true
+    linear_ce_fusion_chunk_size: 256
+    converter_type: LlamaForCausalLM
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 8
+    sequence_parallel: true
+    freeze_moe_router: true
+    moe_router_dtype: fp64
+    moe_router_load_balancing_type: none
+    moe_router_bias_update_rate: 0.0
+    optimizer:
+      lr: 3.0e-7
+      min_lr: 3.0e-8
+    scheduler:
+      lr_decay_iters: 500
+      lr_warmup_iters: 10
+      lr_warmup_init: 3.0e-8
+    # Linear CE fusion runs the decoder but reads output_layer.weight directly
+    # instead of calling output_layer.forward(). Megatron's distributed-optimizer
+    # overlap_param_gather prefetch chain assumes every param-gather bucket (incl.
+    # the output layer) is consumed by a module forward; skipping it leaves a
+    # stale param_gather_handle and trips
+    #   assert self.param_gather_handle is None  (param_and_grad_buffer.py)
+    # on the next iteration. Disable the param-gather overlap for the fused path.
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: true
+      overlap_param_gather: false
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: optim_grads_params
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+  generation:
+    top_k: null
+    top_p: 1.0
+    vllm_cfg:
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.7
+      enforce_eager: false
+    colocated:
+      enabled: true
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  token_level_loss: true
+  use_importance_sampling_correction: false
+  sequence_level_importance_ratios: false
+  force_on_policy_ratio: false
+
+checkpointing:
+  enabled: false
+
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-2n8g-megatron_chunked_linear_ce_loss
+  wandb_enabled: false
+  tensorboard_enabled: true
+  monitor_gpus: false
+  wandb:
+    project: nemo-rl
+    name: grpo-qwen3-30ba3b-2n8g-megatron-chunked-linear-ce-loss
+  tensorboard:
+    log_dir: tb_logs-grpo-qwen3-30ba3b-2n8g-megatron-chunked-linear-ce-loss
+  mlflow:
+    run_name: grpo-qwen3-30ba3b-2n8g-megatron-chunked-linear-ce-loss
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2
