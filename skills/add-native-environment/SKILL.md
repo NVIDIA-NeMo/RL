@@ -111,74 +111,9 @@ Determine the data source:
 
 Skip this stage if using Option B (procedurally generated data with inline processing).
 
-Create a data processor function in `nemo_rl/data/processors.py`. The processor converts a raw dataset row into a `DatumSpec`:
+Create a data processor function in `nemo_rl/data/processors.py` that converts a raw dataset row into a `DatumSpec`. The processor must: (1) extract the prompt, (2) extract ground truth into `extra_env_info`, (3) build a tokenized `message_log`, (4) handle overlength inputs, (5) return a `DatumSpec` dict. Register it in `PROCESSOR_REGISTRY`.
 
-```python
-def my_task_data_processor(
-    datum_dict: dict[str, Any],
-    task_data_spec: TaskDataSpec,
-    tokenizer: TokenizerType,
-    max_seq_length: int,
-    idx: int,
-) -> DatumSpec:
-    # 1. Extract the problem/prompt from datum_dict
-    problem = datum_dict["problem"]
-
-    # 2. Extract ground truth or env metadata for verification
-    extra_env_info = {"ground_truth": datum_dict["answer"]}
-
-    # 3. Build the message log with tokenized content
-    message_list = []
-    if task_data_spec.system_prompt:
-        message_list.append({"role": "system", "content": task_data_spec.system_prompt})
-    formatted_content = (
-        task_data_spec.prompt.format(problem) if task_data_spec.prompt else problem
-    )
-    message_list.append({"role": "user", "content": formatted_content})
-
-    message: str = tokenizer.apply_chat_template(
-        message_list,
-        tokenize=False,
-        add_generation_prompt=True,
-        add_special_tokens=False,
-    )
-    token_ids = tokenizer(message, return_tensors="pt", add_special_tokens=False)["input_ids"][0]
-    message_log: LLMMessageLogType = [
-        {"role": "user", "content": message, "token_ids": token_ids}
-    ]
-
-    # 4. Handle overlength
-    length = sum(len(m["token_ids"]) for m in message_log)
-    loss_multiplier = 1.0
-    if length >= max_seq_length:
-        for chat_message in message_log:
-            chat_message["token_ids"] = chat_message["token_ids"][
-                : min(4, max_seq_length // len(message_log))
-            ]
-        loss_multiplier = 0.0
-
-    # 5. Return DatumSpec
-    return {
-        "message_log": message_log,
-        "length": length,
-        "extra_env_info": extra_env_info,
-        "loss_multiplier": loss_multiplier,
-        "idx": idx,
-        "task_name": datum_dict.get("task_name", "my_task"),
-    }
-```
-
-Register the processor in `PROCESSOR_REGISTRY` at the bottom of `processors.py`:
-
-```python
-PROCESSOR_REGISTRY: Dict[str, TaskDataProcessFnCallable] = cast(
-    Dict[str, TaskDataProcessFnCallable],
-    {
-        ...existing entries...
-        "my_task_data_processor": my_task_data_processor,
-    },
-)
-```
+See `references/code-templates.md` for the full processor template.
 
 ### Stage 5: Environment
 
@@ -186,66 +121,9 @@ Create the environment class. The structure depends on single-turn vs. multi-tur
 
 #### Single-turn environment
 
-Create `nemo_rl/environments/<task_name>_environment.py`:
+Create `nemo_rl/environments/<task_name>_environment.py` as a `@ray.remote` class implementing `EnvironmentInterface[dict]`. Implement `step()` to extract the model's response, verify it against ground truth from metadata, and return `EnvironmentReturn` with rewards and `terminateds=True`. Implement `global_post_process_and_metrics()` to compute accuracy.
 
-```python
-import ray
-import torch
-from nemo_rl.data.interfaces import LLMMessageLogType
-from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.environments.interfaces import EnvironmentInterface, EnvironmentReturn
-
-@ray.remote
-class MyTaskEnvironment(EnvironmentInterface[dict]):
-    def __init__(self, config: dict):
-        self.config = config
-
-    def step(
-        self,
-        message_log_batch: list[LLMMessageLogType],
-        metadata: list[dict],
-    ) -> EnvironmentReturn[dict]:
-        rewards = []
-        answers = []
-        for message_log, meta in zip(message_log_batch, metadata):
-            # Extract model's response (last assistant message)
-            response = message_log[-1]["content"]
-
-            # Extract ground truth from metadata
-            ground_truth = meta["ground_truth"]
-
-            # Verify and compute reward
-            extracted_answer = self._extract_answer(response)
-            reward = 1.0 if self._verify(extracted_answer, ground_truth) else 0.0
-
-            rewards.append(reward)
-            answers.append(extracted_answer)
-
-        batch_size = len(message_log_batch)
-        return EnvironmentReturn(
-            observations=[{"role": "environment", "content": ""}] * batch_size,
-            metadata=[None] * batch_size,  # single-turn: no state to carry
-            next_stop_strings=[None] * batch_size,
-            rewards=torch.tensor(rewards, dtype=torch.float32),
-            terminateds=torch.ones(batch_size, dtype=torch.bool),  # always done
-            answers=answers,
-        )
-
-    def global_post_process_and_metrics(
-        self, batch: BatchedDataDict
-    ) -> tuple[BatchedDataDict, dict]:
-        final_rewards = batch.get("total_reward", torch.tensor([0.0]))
-        accuracy = final_rewards.mean().item() if len(final_rewards) > 0 else 0.0
-        return batch, {"accuracy": accuracy}
-
-    def _extract_answer(self, response: str) -> str:
-        # Task-specific answer extraction logic
-        ...
-
-    def _verify(self, extracted: str, ground_truth: str) -> bool:
-        # Task-specific verification logic
-        ...
-```
+See `references/code-templates.md` for the full single-turn environment template.
 
 #### Tool-calling environments
 
@@ -298,87 +176,9 @@ ENV_REGISTRY: Dict[str, EnvRegistryEntry] = {
 
 ### Stage 6: Config
 
-Create a YAML config at `examples/configs/grpo_<task_name>.yaml`.
+Create a YAML config at `examples/configs/grpo_<task_name>.yaml`. Inherit from `grpo_math_1B.yaml`. Key settings: `max_rollout_turns` (1 for single-turn, N for multi-turn), `num_prompts_per_step`, `num_generations_per_prompt`, model name, dataset/processor/env wiring.
 
-**For single-turn tasks** (HF dataset path), inherit from a base config:
-
-```yaml
-defaults: "grpo_math_1B.yaml"
-
-grpo:
-  num_prompts_per_step: 32
-  num_generations_per_prompt: 16
-  max_rollout_turns: 1
-  max_num_steps: 200
-  seed: 42
-
-policy:
-  model_name: "Qwen/Qwen2.5-1.5B-Instruct"
-  max_total_sequence_length: 2048
-  dtensor_cfg:
-    enabled: true
-    cpu_offload: true
-    activation_checkpointing: true
-    sequence_parallel: true
-  generation:
-    backend: "vllm"
-    max_new_tokens: 1024
-    temperature: 1.0
-    top_p: 0.999
-    top_k: 10000
-    vllm_cfg:
-      tensor_parallel_size: 1
-      gpu_memory_utilization: 0.6
-      max_model_len: ${policy.max_total_sequence_length}
-
-data:
-  train:
-    dataset_name: "<dataset_name>"
-    split: "train"
-  default:
-    processor: "<processor_name>"
-    env_name: "<env_name>"
-
-env:
-  <env_name>:
-    num_workers: 2
-
-logger:
-  log_dir: "logs"
-  wandb_enabled: true
-  wandb:
-    project: "nemo-rl-native-env"
-    name: "grpo-<task_name>"
-```
-
-**For multi-turn tasks** (procedural data), inherit from the sliding puzzle config:
-
-```yaml
-defaults: "grpo_math_1B.yaml"
-
-grpo:
-  num_prompts_per_step: 32
-  num_generations_per_prompt: 16
-  max_rollout_turns: 30
-  max_num_steps: 200
-
-data:
-  add_system_prompt: false
-  shuffle: false
-
-env:
-  <task_name>:
-    cfg:
-      # task-specific config
-      max_moves: 30
-
-logger:
-  log_dir: "logs"
-  wandb_enabled: true
-  wandb:
-    project: "nemo-rl-native-env"
-    name: "grpo-<task_name>"
-```
+See `references/code-templates.md` for single-turn and multi-turn config templates.
 
 ### Stage 7: Training Script
 
@@ -444,126 +244,15 @@ If reward oscillates or doesn't converge:
 
 ### Stage 8b: Using an Existing Reward Model (RLHF)
 
-NeMo-RL has a built-in `reward_model` environment for RLHF training. Instead of writing a custom verification function, you can use a pre-trained reward model (e.g., Skywork, ArmoRM) to score model outputs.
-
-**When to use**: The task has no deterministic verification (e.g., open-ended instruction following, helpfulness, safety alignment).
-
-**How to configure**:
-
-1. Use `env_name: "reward_model"` in the data config.
-2. The reward model environment **requires DTensor** (`dtensor_cfg.enabled: true`). The Megatron path is **not supported**.
-3. The reward model must be a Bradley-Terry model compatible with `AutoModelForSequenceClassification`.
-4. Disable dynamic batching and sequence packing for the reward model.
-
-Example config additions:
-```yaml
-data:
-  default:
-    env_name: "reward_model"
-
-env:
-  reward_model:
-    enabled: true
-    model_name: "Skywork/Skywork-Reward-V2-Qwen3-0.6B"  # or another HF reward model
-    precision: "bfloat16"
-    batch_size: 4
-    reward_model_cfg:
-      enabled: true
-      reward_model_type: "bradley_terry"
-    dtensor_cfg:
-      enabled: true
-      cpu_offload: false
-      activation_checkpointing: false
-    resources:
-      gpus_per_node: 1
-      num_nodes: 1
-    dynamic_batching:
-      enabled: false
-    sequence_packing:
-      enabled: false
-```
-
-**Supported reward models**: Any HuggingFace model that works with `AutoModelForSequenceClassification`, including:
-- `Skywork/Skywork-Reward-V2-Qwen3-0.6B` (small, fast)
-- `Skywork/Skywork-Reward-Llama-3.1-8B-v0.2` (more capable)
-
-**Limitation**: Only the DTensor backend is supported. Megatron-based reward models are not supported (tracked in issue #1154).
-
-**GPU allocation**: The reward model needs its own GPU(s). With 2 GPUs, use 1 for policy + 1 for reward model. With 8 GPUs, split based on model sizes. See `examples/configs/grpo_rm_1B.yaml` for a working example.
-
-**What to expect**: Bradley-Terry reward models output logits that can be large negative numbers (e.g., -10 to -15). A typical RLHF run starts with mean reward around -10 and should trend upward. Validated: mean reward went from -9.9 to +0.5 over 25 steps with Skywork-Reward-V2-Qwen3-0.6B on OpenMathInstruct-2.
-
-**Troubleshooting RLHF**: If reward doesn't increase after 10+ steps:
-- The reward model may not differentiate well for this task. Try a different reward model.
-- Enable `reward_scaling` in the GRPO config to normalize reward range.
-- Reduce learning rate to `1e-6` to prevent policy from diverging too fast.
+For tasks with no deterministic verification (open-ended instruction following, helpfulness), use the built-in `reward_model` environment with a pre-trained Bradley-Terry reward model (e.g., `Skywork/Skywork-Reward-V2-Qwen3-0.6B`). Requirements: DTensor only (no Megatron), `AutoModelForSequenceClassification`-compatible model, separate GPU for the reward model. See `references/code-templates.md` for config and `examples/configs/grpo_rm_1B.yaml` for a working example.
 
 ### Stage 9: Scale to 8 GPU (optional)
 
-Ask the user if they want to scale up. If yes, adjust the config:
-
-```yaml
-cluster:
-  num_nodes: 1
-  gpus_per_node: 8
-
-policy:
-  dtensor_cfg:
-    enabled: true
-  generation:
-    vllm_cfg:
-      tensor_parallel_size: 1  # keep TP=1 per generation worker, more workers in parallel
-
-grpo:
-  num_prompts_per_step: 128  # scale up batch size
-  num_generations_per_prompt: 16
-
-env:
-  <env_name>:
-    num_workers: 8  # more env workers to match throughput
-```
+Ask the user if they want to scale up. Key changes: `gpus_per_node: 8`, increase `num_prompts_per_step` to 128, increase `num_workers` to 8. See `references/code-templates.md` for the scale-up config.
 
 ## Stage 10: Write a README
 
-Create a `README.md` in the example directory (e.g., alongside the training script) that documents:
-
-1. **Overview**: What the environment does and what the model learns.
-2. **Data setup**: How to download or generate the dataset.
-3. **Training**: Exact commands for 1-GPU and 8-GPU training.
-4. **Evaluation**: How to check if training worked (expected reward trajectory).
-5. **Results**: Embed wandb.ai links or screenshots showing reward increasing over training steps.
-
-Example structure:
-```markdown
-# <Environment Name> — GRPO Training Example
-
-## Overview
-<1-2 sentence description>
-
-## Quick Start
-
-### 1. Generate/Download Data
-<commands or explanation>
-
-### 2. Train (1 GPU)
-\`\`\`bash
-uv run python examples/run_grpo_<task>.py --config examples/configs/grpo_<task>.yaml \
-  cluster.num_nodes=1 cluster.gpus_per_node=1 ...
-\`\`\`
-
-### 3. Train (8 GPU)
-\`\`\`bash
-uv run python examples/run_grpo_<task>.py --config examples/configs/grpo_<task>.yaml \
-  cluster.num_nodes=1 cluster.gpus_per_node=8 ...
-\`\`\`
-
-## Results
-Training reward trajectory (wandb): <link>
-| Step | Mean Reward |
-|------|-----------|
-| 1    | X%        |
-| 50   | Y%        |
-```
+Create a `README.md` documenting: overview, data setup, training commands (1-GPU and 8-GPU), expected reward trajectory, and wandb links showing reward increasing over steps.
 
 ## Checklist
 
