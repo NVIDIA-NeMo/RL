@@ -36,6 +36,11 @@ policy:
   max_total_sequence_length: 8192
   logprob_chunk_size: 1024
   offload_optimizer_for_logprob: true
+  # Keep this example on the non-packed CP=1 path covered by the Nano3
+  # QAD smoke. Re-enable CP>1 only with a targeted Nano3 Mamba+distillation
+  # smoke test.
+  sequence_packing:
+    enabled: false
 
   # Nano3 is a hybrid MoE/Mamba model. This recipe keeps attention and the
   # known Nano3-sensitive layers in BF16, while applying NVFP4 to weights and
@@ -51,7 +56,7 @@ policy:
     activation_checkpointing: true
     tensor_model_parallel_size: 4
     pipeline_model_parallel_size: 1
-    context_parallel_size: 4
+    context_parallel_size: 1
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 8
     sequence_parallel: true
@@ -104,6 +109,9 @@ teacher:
   max_total_sequence_length: ${policy.max_total_sequence_length}
   logprob_chunk_size: ${policy.logprob_chunk_size}
   offload_optimizer_for_logprob: true
+  # Keep teacher logprob forwards on the same tested path as policy.
+  sequence_packing:
+    enabled: false
   megatron_cfg:
     empty_unused_memory_level: 1
     activation_checkpointing: true
