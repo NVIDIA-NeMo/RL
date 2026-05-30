@@ -1680,10 +1680,18 @@ def grpo_train(
                             max_rollout_turns=master_config.grpo["max_rollout_turns"],
                             greedy=False,
                         )
-                    policy_generation.finish_generation(
-                        discard_weights=colocated_inference
+                    # We cannot discard generation weights and make it stale when using dynamic sampling
+                    # because if this batch is not complete, we need to continue generation without refit
+                    # and making it stale will trigger refit and crash.
+                    # TODO(guyueh): a proper fix to not sleep the engine if batch is incomplete
+                    make_generation_stale_by_discard_weights = (
+                        not master_config.grpo["use_dynamic_sampling"]
+                        and colocated_inference
                     )
-                    if colocated_inference:
+                    policy_generation.finish_generation(
+                        discard_weights=make_generation_stale_by_discard_weights
+                    )
+                    if make_generation_stale_by_discard_weights:
                         POLICY_GENERATION_STALE = True
                     # Collect generation logger metrics for performance reporting after each generation step
                     # inflight batch sizes and num pending samples are collected from each worker
