@@ -15,13 +15,17 @@ replacing or extending them.
 
 ## The state machine
 
-A policy worker can be in one of three logical states:
+A policy worker can be in one of three logical states. Whether the
+optimizer follows the weights is controlled by the
+`offload_optimizer_for_logprob` config flag (and, for colocated
+generation, by `is_generation_colocated`); the table below shows the
+default behavior when those are enabled.
 
-| State | Weights on | Optimizer on | What you can call |
+| State | Weights on | Optimizer on (default) | What you can call |
 | --- | --- | --- | --- |
 | **Training** | GPU | GPU | `train`, `get_logprobs`, `score`, `save_checkpoint` |
-| **Logprob / inference** | GPU | offloaded (CPU/disk) or absent | `get_logprobs`, `score`, `get_topk_logits`, `generate` |
-| **Offloaded** | CPU/disk | CPU/disk | `prepare_*`, refit helpers — **nothing GPU-bound** |
+| **Logprob / inference** | GPU | CPU (when `offload_optimizer_for_logprob=true`) else GPU | `get_logprobs`, `score`, `get_topk_logits`, `generate` |
+| **Offloaded (refit)** | CPU / device-streamed | CPU | `prepare_*`, refit helpers — **nothing GPU-bound** |
 
 The transitions are:
 
@@ -34,11 +38,11 @@ The transitions are:
         └──────────────────────── Logprob/inference
 ```
 
-The reason this matters: training mode pins the optimizer state on the
-GPU, which can be large. RL pipelines that interleave training with
-generation routinely **offload** the optimizer (and sometimes the
-weights) to make room for the inference engine, then move them back
-before the next training step.
+The reason this matters: training pins both weights and the optimizer
+state on the GPU, which can be large. RL pipelines that interleave
+training with generation routinely **offload** the optimizer (and
+sometimes the weights) to make room for the inference engine, then
+move them back before the next training step.
 
 ## The two preparation methods
 
@@ -54,9 +58,11 @@ Call this **before** any of:
 - `policy.train(...)`
 - `policy.save_checkpoint(...)`
 
-This moves the optimizer state back to the GPU (if it was offloaded)
-and switches the model to train mode. After this call the policy can
-do backward passes and step the optimizer.
+This ensures the model is on the GPU and switches it to train mode.
+When `offload_optimizer_for_logprob=true` or generation is colocated
+(and the optimizer is not configured for permanent CPU offload), it
+also moves the optimizer state back to the GPU. After this call the
+policy can do backward passes and step the optimizer.
 
 ### `prepare_for_lp_inference()`
 
@@ -67,11 +73,12 @@ Call this **before** any of:
 - `policy.get_topk_logits(...)`
 - `policy.generate(...)` (Megatron backend only)
 
-This moves model weights to the GPU (if they were offloaded), switches
-the model to eval mode, and frees optimizer state that is not needed
-for inference. It is cheaper than `prepare_for_training()` and is what
-you want between training steps when you only need forward passes (for
-example to compute reference/policy logprobs against a rollout).
+This ensures the model is on the GPU and switches it to eval mode.
+When `offload_optimizer_for_logprob=true`, it also offloads optimizer
+state to CPU to free GPU memory for inference. It is cheaper than
+`prepare_for_training()` and is what you want between training steps
+when you only need forward passes (for example to compute
+reference/policy logprobs against a rollout).
 
 ### Symmetry
 
