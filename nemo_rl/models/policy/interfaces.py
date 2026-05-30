@@ -148,12 +148,14 @@ class PolicyInterface(ABC):
 
     @abstractmethod
     def prepare_for_training(self, *args: Any, **kwargs: Any) -> None:
-        """Move weights + optimizer state to the GPU and switch to train mode.
+        """Ensure weights are on the GPU and switch the model to train mode.
 
         Must be called before ``train`` or ``save_checkpoint`` whenever the
-        policy may have been offloaded or last used for inference. Skipping
-        this call typically surfaces as an opaque CUDA "illegal memory
-        access" inside the model forward pass. See
+        policy may have been offloaded or last used for inference. Also
+        moves optimizer state back to the GPU when
+        ``offload_optimizer_for_logprob=true`` or generation is colocated.
+        Skipping this call typically surfaces as an opaque CUDA "illegal
+        memory access" inside the model forward pass. See
         ``docs/design-docs/policy-lifecycle.md`` for the full state
         machine.
         """
@@ -286,11 +288,19 @@ class ColocatablePolicyInterface(PolicyInterface):
 
     @abstractmethod
     def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
-        """Put the policy in eval mode for logprob inference.
+        """Ensure weights are on the GPU and switch the model to eval mode.
 
         Must be called before any GPU-bound inference API on the policy:
-        ``get_logprobs``, ``score``, and ``get_topk_logits``. Optimizer
-        state stays offloaded, so this is cheaper than
+        ``get_logprobs``, ``score``, and ``get_topk_logits``. When
+        ``offload_optimizer_for_logprob=true``, also offloads optimizer
+        state to CPU, making this cheaper than ``prepare_for_training``.
+        See ``docs/design-docs/policy-lifecycle.md`` for the full state
+        machine.
+
+        Args:
+            keep_train_buffers: Leave grad buffers and optimizer state on CUDA
+                because a train step is already open and its accumulated
+                gradients must survive this call.
         ``prepare_for_training``. See
         ``docs/design-docs/policy-lifecycle.md`` for the full state
         machine.
