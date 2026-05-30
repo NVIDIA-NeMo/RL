@@ -10,6 +10,8 @@ policy:
   train_micro_batch_size: 1
   logprob_batch_size: 2
   max_total_sequence_length: 4096
+  sequence_packing:
+    fuse_loss: true
   dtensor_cfg:
     enabled: false
   optimizer: null
