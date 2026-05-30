@@ -27,6 +27,17 @@ from nemo_rl.models.generation.vllm.vllm_worker_async import (
 )
 
 
+def _configure_quant_vllm_kwargs(llm_kwargs: dict[str, Any]) -> None:
+    llm_kwargs["worker_cls"] = (
+        "nemo_rl.modelopt.models.generation.vllm_quant_patch.FakeQuantWorker"
+    )
+    llm_kwargs["worker_extension_cls"] = (
+        "nemo_rl.modelopt.models.generation.vllm_quant_backend.VllmQuantInternalWorkerExtension"
+    )
+    # Expert fakequant needs a decomposed MoE path; explicit user config still wins.
+    llm_kwargs.setdefault("moe_backend", "triton")
+
+
 @ray.remote(
     runtime_env={**get_nsight_config_if_pattern_matches("vllm_generation_worker")}
 )  # pragma: no cover
@@ -36,12 +47,7 @@ class VllmQuantGenerationWorker(VllmGenerationWorkerImpl):
         super().__init__(*args, **kwargs)
 
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
-        llm_kwargs["worker_cls"] = (
-            "nemo_rl.modelopt.models.generation.vllm_quant_patch.FakeQuantWorker"
-        )
-        llm_kwargs["worker_extension_cls"] = (
-            "nemo_rl.modelopt.models.generation.vllm_quant_backend.VllmQuantInternalWorkerExtension"
-        )
+        _configure_quant_vllm_kwargs(llm_kwargs)
         if self.cfg["quant_cfg"]:
             print("setting VLLM_QUANT_CFG to: ", self.cfg["quant_cfg"])
             os.environ["VLLM_QUANT_CFG"] = self.cfg["quant_cfg"]
@@ -88,12 +94,7 @@ class VllmQuantAsyncGenerationWorker(VllmAsyncGenerationWorkerImpl):
         super().__init__(*args, **kwargs)
 
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
-        llm_kwargs["worker_cls"] = (
-            "nemo_rl.modelopt.models.generation.vllm_quant_patch.FakeQuantWorker"
-        )
-        llm_kwargs["worker_extension_cls"] = (
-            "nemo_rl.modelopt.models.generation.vllm_quant_backend.VllmQuantInternalWorkerExtension"
-        )
+        _configure_quant_vllm_kwargs(llm_kwargs)
         if self.cfg["quant_cfg"]:
             os.environ["VLLM_QUANT_CFG"] = self.cfg["quant_cfg"]
 
