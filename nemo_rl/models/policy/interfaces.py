@@ -148,6 +148,15 @@ class PolicyInterface(ABC):
 
     @abstractmethod
     def prepare_for_training(self, *args: Any, **kwargs: Any) -> None:
+        """Move weights + optimizer state to the GPU and switch to train mode.
+
+        Must be called before ``train`` or ``save_checkpoint`` whenever the
+        policy may have been offloaded or last used for inference. Skipping
+        this call typically surfaces as an opaque CUDA "illegal memory
+        access" inside the model forward pass. See
+        ``docs/design-docs/policy-lifecycle.md`` for the full state
+        machine.
+        """
         pass
 
     @abstractmethod
@@ -208,4 +217,13 @@ class ColocatablePolicyInterface(PolicyInterface):
 
     @abstractmethod
     def prepare_for_lp_inference(self) -> None:
+        """Move weights to the GPU and switch to eval mode for inference.
+
+        Must be called before any GPU-bound inference API on the policy:
+        ``get_logprobs``, ``score``, ``get_topk_logits``, and (Megatron
+        only) ``generate``. Optimizer state stays offloaded, so this is
+        cheaper than ``prepare_for_training``. See
+        ``docs/design-docs/policy-lifecycle.md`` for the full state
+        machine.
+        """
         pass
