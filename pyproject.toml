@@ -159,6 +159,8 @@ mcore = [
   "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@v2.14.1",
   "megatron-core",
   "megatron-bridge",
+  "mamba-ssm",
+  "causal-conv1d",
   "nvidia-modelopt[torch]; sys_platform != 'darwin'",
   "onnxscript",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
