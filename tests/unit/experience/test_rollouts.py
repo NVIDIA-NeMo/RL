@@ -805,6 +805,81 @@ def test_run_async_nemo_gym_rollout_warns_when_max_seq_len_exceeds_engine():
             )
 
 
+def test_run_async_nemo_gym_rollout_raises_on_silent_agent_failure(monkeypatch):
+    """Regression test for issue #2305.
+
+    When the NeMo-Gym agent crashes silently (e.g. CPU OOM during rollout
+    collection), `run_rollouts.remote(...)` may return fewer results than
+    input rows. Previously this produced "empty epochs" downstream; now we
+    raise a clear RuntimeError naming the size mismatch and OOM as the
+    likely culprit.
+    """
+
+    class _FakePolicyGeneration:
+        cfg = {"vllm_cfg": {"max_model_len": 100}}
+
+    # Two input rows with the minimum fields read before the ray.get call.
+    rows = [
+        {"responses_create_params": {}, "agent_ref": {"name": "a"}},
+        {"responses_create_params": {}, "agent_ref": {"name": "b"}},
+    ]
+
+    class _FakeRunRolloutsHandle:
+        @staticmethod
+        def remote(*args, **kwargs):
+            return "_sentinel_object_ref_"
+
+    class _FakeNemoGymEnv:
+        run_rollouts = _FakeRunRolloutsHandle()
+
+    # Pretend Gym agent silently dropped one row → length mismatch.
+    monkeypatch.setattr(
+        "nemo_rl.experience.rollouts.ray.get",
+        lambda _ref: ([rows[0]], {}),
+    )
+
+    with pytest.raises(RuntimeError, match="NeMo-Gym returned 1 rollout result"):
+        run_async_nemo_gym_rollout(
+            policy_generation=_FakePolicyGeneration(),
+            input_batch={"extra_env_info": rows},
+            tokenizer=None,
+            task_to_env={"nemo_gym": _FakeNemoGymEnv()},
+            generation_config={
+                "stop_strings": None,
+                "stop_token_ids": None,
+                "top_k": None,
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "max_new_tokens": 50,
+            },
+            max_seq_len=None,
+            max_rollout_turns=None,
+        )
+
+    # And: zero results (full agent crash) is also caught.
+    monkeypatch.setattr(
+        "nemo_rl.experience.rollouts.ray.get",
+        lambda _ref: ([], {}),
+    )
+    with pytest.raises(RuntimeError, match="NeMo-Gym returned 0 rollout result"):
+        run_async_nemo_gym_rollout(
+            policy_generation=_FakePolicyGeneration(),
+            input_batch={"extra_env_info": rows},
+            tokenizer=None,
+            task_to_env={"nemo_gym": _FakeNemoGymEnv()},
+            generation_config={
+                "stop_strings": None,
+                "stop_token_ids": None,
+                "top_k": None,
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "max_new_tokens": 50,
+            },
+            max_seq_len=None,
+            max_rollout_turns=None,
+        )
+
+
 @pytest.mark.nemo_gym
 def test_run_async_nemo_gym_rollout(
     nemo_gym,  # noqa: F811

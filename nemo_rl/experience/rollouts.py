@@ -1163,6 +1163,24 @@ def run_async_nemo_gym_rollout(
             )
         )
 
+        # Fail loudly if the NeMo-Gym agent returned fewer (or zero) results
+        # than the number of input rows. Silently producing an empty/partial
+        # batch lets training continue with "empty epochs" downstream
+        # (see issue #2305), which usually masks a CPU OOM or another
+        # silent agent crash inside Gym.
+        expected = len(nemo_gym_rows)
+        got = len(results)
+        if got != expected:
+            raise RuntimeError(
+                f"NeMo-Gym returned {got} rollout result(s) for {expected} "
+                "input row(s). This usually means the Gym agent crashed "
+                "silently (most commonly CPU OOM during rollout collection "
+                "for large batches). Check the Gym agent logs for OOM / "
+                "killed-process messages and consider reducing "
+                "grpo.num_prompts_per_step * grpo.num_generations_per_prompt, "
+                "or the per-row max_output_tokens, to fit available memory."
+            )
+
         # Tensorize all token ids
         for r in results:
             _tensorize_by_key(r["input_message_log"], "token_ids")
