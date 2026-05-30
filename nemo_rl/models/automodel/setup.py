@@ -221,6 +221,7 @@ def validate_and_prepare_config(
     config: PolicyConfig,
     processor: Optional[AutoProcessor],
     rank: int,
+    init_optimizer: bool = True,
 ) -> RuntimeConfig:
     """Validate configuration and prepare runtime settings.
 
@@ -231,6 +232,10 @@ def validate_and_prepare_config(
         config: Policy configuration dictionary
         processor: Optional processor for multimodal models
         rank: Current process rank
+        init_optimizer: Whether the worker will train (and therefore needs an
+            optimizer). Trainable workers must keep their weights in float32 to
+            preserve master-weight precision; this flag is consulted to reject
+            a non-float32 ``dtensor_cfg.load_precision`` on such workers.
 
     Returns:
         RuntimeConfig named tuple containing validated configuration values
@@ -270,6 +275,13 @@ def validate_and_prepare_config(
     model_load_dtype = _precision_to_dtype(
         load_precision, "dtensor_cfg.load_precision"
     )
+    if init_optimizer and model_load_dtype != torch.float32:
+        raise ValueError(
+            "dtensor_cfg.load_precision must be float32 for trainable workers "
+            "(init_optimizer=True) to preserve master-weight precision; it is "
+            "only intended for reference/teacher workers, but got "
+            f"{load_precision!r}."
+        )
 
     # Get other configuration values
     cpu_offload = config["dtensor_cfg"]["cpu_offload"]

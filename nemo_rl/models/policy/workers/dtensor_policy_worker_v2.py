@@ -257,6 +257,7 @@ class DTensorPolicyWorkerV2Impl(
             config=config,
             processor=self.processor,
             rank=0,  # Temporary, will be updated after distributed init
+            init_optimizer=init_optimizer,
         )
 
         # Set up distributed environment (returns DistributedContext)
