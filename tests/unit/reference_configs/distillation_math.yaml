@@ -92,7 +92,6 @@ policy: &POLICY_BASE
         activation_checkpointing: false
         recompute_granularity: "full"
         recompute_modules: null
-        converter_type: "Qwen3ForCausalLM"
         tensor_model_parallel_size: 2
         expert_tensor_parallel_size: 1
         expert_model_parallel_size: 1

@@ -50,7 +50,6 @@ policy: &POLICY_BASE
         # https://github.com/NVIDIA/Megatron-LM/blob/d30c3ae5469fe3f6a64d4fd2e63b6e7f7844ea81/megatron/core/transformer/transformer_config.py#L483
         # Use ["moe"] for MoE models to recompute expert activations only.
         recompute_modules: null
-        converter_type: "Qwen3ForCausalLM"
         tensor_model_parallel_size: 2
         expert_tensor_parallel_size: 1
         expert_model_parallel_size: 1
