@@ -39,6 +39,8 @@ loss_fn:
 
 For example, `ratio_clip_min: 1.0` and `ratio_clip_max: 5.0` clamp ratios to `[0, 6]`. Since policy ratios are non-negative, this is effectively an upper-only clamp at `6`.
 
+When `use_importance_sampling_correction: true`, the shared GRPO loss path additionally multiplies the CISPO token loss by the actor-vs-generation correction `exp(prev_logprobs - generation_logprobs)`. This correction is separate from CISPO's clipped `pi_theta / pi_old` weight.
+
 ## Async Lag-1 Recipe
 
 The nightly CISPO recipe validates the objective in a high-off-policy setting with repeated updates per rollout and non-colocated async vLLM generation:
