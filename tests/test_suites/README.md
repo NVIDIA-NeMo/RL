@@ -51,6 +51,105 @@ Directory placement and naming parity:
 - The script filename should mirror the YAML recipe filename under `examples/configs/recipes/**` but with a `.sh` suffix.
 - Add the relative script path to `tests/test_suites/nightly.txt` for nightly execution.
 
+## Adding a new test
+
+### 1. Create a recipe config
+
+Add a YAML config under `examples/configs/recipes/llm/` (or `vlm/`). The filename becomes the test name.
+
+### 2. Create the test script
+
+Add a `.sh` script under `tests/test_suites/llm/` (or `vlm/`). The filename must match the recipe config (`.sh` instead of `.yaml`).
+
+Every test script **must** contain a CONFIG block — both the nemo-ci GitLab generator (`nemo_rl/generate_rl_dynamic.sh`) and the local launcher (`tools/launch`) parse it to determine SLURM allocation. Scripts without a CONFIG block are silently skipped and will not produce CI jobs.
+
+```sh
+#!/bin/bash
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
+source $SCRIPT_DIR/common.env
+
+# ===== BEGIN CONFIG =====
+NUM_NODES=1                # Number of SLURM nodes
+STEPS_PER_RUN=40           # Steps per SLURM job submission
+MAX_STEPS=40               # Total training steps across all runs
+NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))
+NUM_MINUTES=60             # SLURM time limit per run
+# GPUS_PER_NODE=4          # Uncomment for GB200 (default: 8 for H100)
+# ===== END CONFIG =====
+
+exit_if_max_steps_reached
+
+cd $PROJECT_ROOT
+uv run examples/run_grpo.py \
+    --config $CONFIG_PATH \
+    grpo.max_num_steps=$MAX_STEPS \
+    logger.log_dir=$LOG_DIR \
+    logger.wandb_enabled=True \
+    logger.wandb.project=nemo-rl \
+    logger.wandb.name=$EXP_NAME \
+    checkpointing.enabled=True \
+    checkpointing.checkpoint_dir=$CKPT_DIR \
+    $@ \
+    2>&1 | tee $RUN_LOG
+```
+
+**CONFIG block fields:**
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `NUM_NODES` | Yes | Number of SLURM nodes to allocate |
+| `STEPS_PER_RUN` | Yes | Training steps per SLURM job |
+| `MAX_STEPS` | Yes | Total training steps (across all runs) |
+| `NUM_RUNS` | Yes | Number of SLURM submissions (derived from above) |
+| `NUM_MINUTES` | Yes | SLURM time limit per run (minutes) |
+| `GPUS_PER_NODE` | No | GPUs per node (default: 8 for H100, set to 4 for GB200) |
+
+### 3. Make the script executable
+
+```sh
+chmod +x tests/test_suites/llm/<your-script>.sh
+```
+
+### 4. Register in a test suite
+
+Append the script path to the appropriate `.txt` file:
+
+```sh
+echo "tests/test_suites/llm/<your-script>.sh" >> tests/test_suites/nightly.txt
+```
+
+For GB200 tests, also add to `nightly_gb200.txt`. For release tests, add to `release.txt` / `release_gb200.txt`.
+
+### 5. Verify locally
+
+```sh
+# Dry-run to check GPUhrs estimate
+DRYRUN=1 CONTAINER=... ACCOUNT=... PARTITION=... ../tools/launch ./llm/<your-script>.sh
+
+# Full local run
+uv run ./llm/<your-script>.sh
+```
+
+### Wrapper scripts (variant tests)
+
+For tests that re-run an existing recipe with different overrides (e.g., different data plane backends), use a thin wrapper pattern. Wrappers still **must** include their own CONFIG block:
+
+```sh
+#!/bin/bash
+# ===== BEGIN CONFIG =====
+NUM_NODES=1
+STEPS_PER_RUN=40
+MAX_STEPS=40
+NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))
+NUM_MINUTES=60
+# ===== END CONFIG =====
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
+source "$SCRIPT_DIR/common-<variant>.env"
+bash "$SCRIPT_DIR/$BASE_RECIPE.sh" "${OVERRIDES[@]}" "$@"
+```
+
+Shared setup logic for wrappers can live in a `common-<variant>.env` file in the same directory (see `common-tq.env` for an example).
+
 ## Running manually
 
 Each recipe can be run on the head node:
