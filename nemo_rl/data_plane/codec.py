@@ -165,6 +165,7 @@ def pack_jagged_fields(
     fields: "dict[str, torch.Tensor | np.ndarray]",
     *,
     lengths: torch.Tensor | None,
+    force_jagged_fields: set[str] | frozenset[str] | None = None,
 ) -> TensorDict:
     """Pack a column dict into the wire layout expected by ``put_samples``.
 
@@ -184,12 +185,16 @@ def pack_jagged_fields(
             to decide whether a tensor qualifies for jagged conversion.
             ``None`` disables jagged conversion entirely (every tensor
             passes through rectangular).
+        force_jagged_fields: Field names known to be per-token. These use
+            :func:`pack_per_token_field`, which tolerates extra padded columns
+            and slices each row to ``lengths``.
 
     Returns:
         ``TensorDict`` with ``batch_size=[N]`` (N from ``lengths`` if
         given, else 0) ready for ``put_samples``.
     """
     n = int(lengths.shape[0]) if lengths is not None else 0
+    force_jagged_fields = force_jagged_fields or frozenset()
     packed: dict[str, Any] = {}
     for k, v in fields.items():
         if isinstance(v, np.ndarray) and v.dtype == object:
@@ -199,11 +204,12 @@ def pack_jagged_fields(
             # round-trips intact.
             packed[k] = v
         elif isinstance(v, torch.Tensor):
-            packed[k] = (
-                maybe_pack_jagged(v, lengths)
-                if lengths is not None
-                else v.detach().contiguous()
-            )
+            if lengths is None:
+                packed[k] = v.detach().contiguous()
+            elif k in force_jagged_fields:
+                packed[k] = pack_per_token_field(v, lengths)
+            else:
+                packed[k] = maybe_pack_jagged(v, lengths)
         else:
             raise TypeError(
                 f"pack_jagged_fields: unsupported value type for {k!r}: {type(v)}. "

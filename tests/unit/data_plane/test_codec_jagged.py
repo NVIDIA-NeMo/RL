@@ -26,6 +26,7 @@ from tensordict import TensorDict
 
 from nemo_rl.data_plane.codec import (
     materialize,
+    pack_jagged_fields,
     response_from_nested,
     to_nested_by_length,
 )
@@ -231,3 +232,28 @@ def test_materialize_realistic_full_field_set_preserves_dtypes() -> None:
     assert out["input_ids"].dtype == torch.long
     assert out["generation_logprobs"].dtype == torch.bfloat16
     assert out["token_mask"].dtype == torch.int32
+
+
+def test_pack_jagged_fields_forced_per_token_field_drops_extra_padding() -> None:
+    """Known per-token writebacks can be wider than ``max(input_lengths)``."""
+
+    lengths = torch.tensor([3, 5], dtype=torch.long)
+    advantages = torch.arange(16, dtype=torch.float32).view(2, 8)
+    extra = torch.arange(16, dtype=torch.float32).view(2, 8)
+
+    td = pack_jagged_fields(
+        {
+            "advantages": advantages,
+            "extra_2d": extra,
+        },
+        lengths=lengths,
+        force_jagged_fields=frozenset({"advantages"}),
+    )
+
+    out = materialize(td, layout="padded")
+
+    assert out["advantages"].shape == (2, 5)
+    assert torch.equal(out["advantages"][0, :3], advantages[0, :3])
+    assert torch.equal(out["advantages"][1], advantages[1, :5])
+    assert torch.equal(out["advantages"][0, 3:], torch.zeros(2))
+    assert torch.equal(out["extra_2d"], extra)

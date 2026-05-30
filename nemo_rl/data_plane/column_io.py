@@ -40,6 +40,19 @@ from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 from nemo_rl.data_plane.schema import GLOBAL_FORWARD_PAD_SEQLEN, Layout
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
+TOKEN_ALIGNED_FIELDS = frozenset(
+    {
+        "input_ids",
+        "generation_logprobs",
+        "prev_logprobs",
+        "reference_policy_logprobs",
+        "advantages",
+        "token_mask",
+        "sample_mask",
+        "routed_experts",
+    }
+)
+
 
 def round_up(value: int, multiple: int) -> int:
     """Smallest ``multiple``-aligned int ≥ ``value`` (no-op when ``multiple <= 1``)."""
@@ -112,7 +125,11 @@ def write_columns(
 
     seq_lens = meta.sequence_lengths
     lengths = torch.tensor(seq_lens, dtype=torch.long) if seq_lens is not None else None
-    td = pack_jagged_fields(fields, lengths=lengths)
+    td = pack_jagged_fields(
+        fields,
+        lengths=lengths,
+        force_jagged_fields=TOKEN_ALIGNED_FIELDS,
+    )
     dp_client.put_samples(
         sample_ids=meta.sample_ids,
         partition_id=meta.partition_id,
@@ -176,7 +193,11 @@ def kv_first_write(
         if isinstance(v, torch.Tensor)
         or (isinstance(v, np.ndarray) and v.dtype == object)
     }
-    td = pack_jagged_fields(fields, lengths=lengths)
+    td = pack_jagged_fields(
+        fields,
+        lengths=lengths,
+        force_jagged_fields=TOKEN_ALIGNED_FIELDS,
+    )
     dp_client.put_samples(
         sample_ids=list(sample_ids),
         partition_id=partition_id,
