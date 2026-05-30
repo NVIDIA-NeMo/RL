@@ -61,7 +61,6 @@ policy:
   model_name: "meta-llama/Llama-3.2-1B"
   tokenizer:
     name: "meta-llama/Llama-3.2-1B"
-    chat_template: null
   train_global_batch_size: 64
   train_micro_batch_size: 1
   logprob_batch_size: 1
@@ -111,13 +110,11 @@ policy:
         T_max: 4750
         eta_min: 0.0
     - milestones: [250]
-  generation: null
 
 teacher:
   model_name: "Qwen/Qwen3-4B"
   tokenizer:
     name: "Qwen/Qwen3-4B"
-    chat_template: null
   train_global_batch_size: 64
   train_micro_batch_size: 1
   logprob_batch_size: 1
@@ -156,7 +153,6 @@ teacher:
       eps: 1e-8
       foreach: false
       fused: false
-  generation: null
 
 data:
   max_input_seq_length: 2048

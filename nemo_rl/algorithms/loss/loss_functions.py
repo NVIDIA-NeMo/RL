@@ -1118,8 +1118,8 @@ class CrossTokenizerDistillationLossConfig(TypedDict):
     kl_loss_weight: float
     ce_loss_scale: float
     dynamic_loss_scaling: bool
-    student_vocab_size: int
-    teacher_vocab_size: int
+    student_vocab_size: NotRequired[int]
+    teacher_vocab_size: NotRequired[int]
 
 
 class CrossTokenizerDistillationLossDataDict(TypedDict):

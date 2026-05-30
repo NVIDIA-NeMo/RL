@@ -35,6 +35,8 @@ from __future__ import annotations
 import os
 from typing import Any, NotRequired, Optional, TypedDict, cast
 
+from pydantic import BaseModel
+
 import numpy as np
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -129,7 +131,7 @@ def _default_off_policy_distillation_save_state() -> OffPolicyDistillationSaveSt
     }
 
 
-class MasterConfig(TypedDict):
+class MasterConfig(BaseModel, extra="allow"):
     policy: PolicyConfig    # student
     teacher: PolicyConfig
     loss_fn: CrossTokenizerDistillationLossConfig
@@ -163,13 +165,13 @@ def setup(
     MasterConfig,
 ]:
     """Construct cluster, dataloaders, policies, and loss fn for the run."""
-    policy_config = master_config["policy"]
-    teacher_config = master_config["teacher"]
-    loss_config = master_config["loss_fn"]
-    distillation_config = master_config["distillation"]
-    data_config = master_config["data"]
-    logger_config = master_config["logger"]
-    cluster_config = master_config["cluster"]
+    policy_config = master_config.policy
+    teacher_config = master_config.teacher
+    loss_config = master_config.loss_fn
+    distillation_config = master_config.distillation
+    data_config = master_config.data
+    logger_config = master_config.logger
+    cluster_config = master_config.cluster
 
     # Backend gate: this code path is DTensor V2 only by design.
     assert policy_config["dtensor_cfg"]["enabled"] and policy_config["dtensor_cfg"].get(
@@ -185,12 +187,12 @@ def setup(
     #         Logger
     # ==========================
     logger = Logger(logger_config)
-    logger.log_hyperparams(master_config)
+    logger.log_hyperparams(master_config.model_dump())
 
     # ==========================
     #      Checkpointing
     # ==========================
-    checkpointer = CheckpointManager(master_config["checkpointing"])
+    checkpointer = CheckpointManager(master_config.checkpointing)
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
     off_policy_distillation_state: Optional[OffPolicyDistillationSaveState] = cast(
         Optional[OffPolicyDistillationSaveState],
@@ -355,12 +357,12 @@ def xtoken_off_policy_distillation_train(
     """Off-policy CT distillation training loop."""
     timer = Timer()
     timeout = TimeoutChecker(
-        timeout=master_config["checkpointing"]["checkpoint_must_save_by"],
+        timeout=master_config.checkpointing["checkpoint_must_save_by"],
         fit_last_save_time=True,
     )
     timeout.start_iterations()
 
-    distill_cfg = master_config["distillation"]
+    distill_cfg = master_config.distillation
     current_epoch = off_policy_distillation_state["current_epoch"]
     current_step = off_policy_distillation_state["current_step"]
     total_steps = off_policy_distillation_state["total_steps"]
@@ -521,11 +523,11 @@ def xtoken_off_policy_distillation_train(
                 should_save_by_step = (
                     is_last_step
                     or (total_steps + 1)
-                    % master_config["checkpointing"]["save_period"]
+                    % master_config.checkpointing["save_period"]
                     == 0
                 )
                 should_save_by_timeout = timeout.check_save()
-                if master_config["checkpointing"]["enabled"] and (
+                if master_config.checkpointing["enabled"] and (
                     should_save_by_step or should_save_by_timeout
                 ):
                     student_policy.prepare_for_training()
@@ -539,7 +541,7 @@ def xtoken_off_policy_distillation_train(
                     elif "val_loss" in off_policy_distillation_state:
                         del off_policy_distillation_state["val_loss"]
 
-                    full_metric_name = master_config["checkpointing"]["metric_name"]
+                    full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
                         prefix, metric_name = full_metric_name.split(":", 1)
                         source = metrics if prefix == "train" else (val_metrics or {})
@@ -562,7 +564,7 @@ def xtoken_off_policy_distillation_train(
                             tokenizer_path=os.path.join(
                                 ckpt_path, "policy", "tokenizer"
                             ),
-                            checkpointing_cfg=master_config["checkpointing"],
+                            checkpointing_cfg=master_config.checkpointing,
                         )
                         torch.save(
                             dataloader.state_dict(),
@@ -668,7 +670,7 @@ def validate(
     Reuses the same per-step path as training, but in eval mode so no
     backward / optimizer step runs. Returns mean train-style metrics.
     """
-    distill_cfg = master_config["distillation"]
+    distill_cfg = master_config.distillation
     timer = timer if timer is not None else Timer()
 
     losses: list[float] = []

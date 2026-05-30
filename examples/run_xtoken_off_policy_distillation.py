@@ -63,7 +63,8 @@ def main() -> None:
     if overrides:
         config = parse_hydra_overrides(config, overrides)
 
-    config: MasterConfig = OmegaConf.to_container(config, resolve=True)
+    config = OmegaConf.to_container(config, resolve=True)
+    config = MasterConfig(**config)
 
     # Scope gate: this entrypoint only handles the cross-tokenizer flavor of
     # off-policy distillation. Same-tokenizer off-policy distillation is
@@ -72,9 +73,9 @@ def main() -> None:
     # a `cross_tokenizer` switch) once that lands. Until then, fail loudly
     # if the config doesn't look cross-tokenizer rather than silently
     # running the wrong code path.
-    policy_tok = config["policy"]["tokenizer"]["name"]
-    teacher_tok = config["teacher"]["tokenizer"]["name"]
-    proj_path = config["loss_fn"].get("projection_matrix_path")
+    policy_tok = config.policy["tokenizer"]["name"]
+    teacher_tok = config.teacher["tokenizer"]["name"]
+    proj_path = config.loss_fn.get("projection_matrix_path")
     assert policy_tok != teacher_tok and proj_path is not None, (
         "run_xtoken_off_policy_distillation currently supports only the "
         "cross-tokenizer flavor (distinct policy/teacher tokenizers + a "
@@ -88,19 +89,19 @@ def main() -> None:
     print("Final config:")
     pprint.pprint(config)
 
-    config["logger"]["log_dir"] = get_next_experiment_dir(config["logger"]["log_dir"])
-    if config["checkpointing"]["enabled"]:
+    config.logger["log_dir"] = get_next_experiment_dir(config.logger["log_dir"])
+    if config.checkpointing["enabled"]:
         print(
             f"📊 Using checkpoint directory: "
-            f"{config['checkpointing']['checkpoint_dir']}",
+            f"{config.checkpointing['checkpoint_dir']}",
             flush=True,
         )
 
     init_ray()
 
     # Two tokenizers — one each for student and teacher.
-    student_tokenizer = get_tokenizer(config["policy"]["tokenizer"])
-    teacher_tokenizer = get_tokenizer(config["teacher"]["tokenizer"])
+    student_tokenizer = get_tokenizer(config.policy["tokenizer"])
+    teacher_tokenizer = get_tokenizer(config.teacher["tokenizer"])
 
     # `env_configs=None` skips the env-creation block (no rollout path);
     # `setup_response_data` then handles dataset construction, the optional
@@ -108,7 +109,7 @@ def main() -> None:
     # and validation-from-config — features the prior manual route silently
     # dropped.
     train_dataset, val_dataset = setup_response_data(
-        student_tokenizer, config["data"], env_configs=None
+        student_tokenizer, config.data, env_configs=None
     )
 
     (
