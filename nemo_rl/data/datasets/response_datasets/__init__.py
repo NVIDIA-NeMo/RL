@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
+
 from nemo_rl.data import ResponseDatasetConfig
 from nemo_rl.data.datasets.response_datasets.aime24 import AIME2024Dataset
 from nemo_rl.data.datasets.response_datasets.avqa import AVQADataset
@@ -70,22 +72,71 @@ DATASET_REGISTRY = {
 }
 
 
-def load_response_dataset(data_config: ResponseDatasetConfig):
-    """Loads response dataset."""
-    dataset_name = data_config["dataset_name"]
+def _resolve_external_dataset_class(dataset_name: str) -> type:
+    """Resolve a fully-qualified dotted dataset path to a class.
 
-    # load dataset
-    if dataset_name in DATASET_REGISTRY:
-        dataset_class = DATASET_REGISTRY[dataset_name]
-        dataset = dataset_class(
-            **data_config  # pyrefly: ignore[missing-argument]  `data_path` is required for some classes
-        )
-    else:
+    Supports user-defined datasets that live outside ``nemo_rl`` so users do
+    not have to edit the built-in ``DATASET_REGISTRY`` to plug in their own
+    dataset class. The class must be importable from ``PYTHONPATH`` (or the
+    active virtual environment).
+    """
+    if "." not in dataset_name:
         raise ValueError(
             f"Unsupported {dataset_name=}. "
             "Please either use a built-in dataset "
-            "or set dataset_name=ResponseDataset to load from local JSONL file or HuggingFace."
+            "(see nemo_rl.data.datasets.response_datasets.DATASET_REGISTRY "
+            "for the full list), set dataset_name=ResponseDataset to load "
+            "from a local JSONL file or HuggingFace, or pass a fully "
+            "qualified import path like 'my_pkg.my_module.MyDataset' to a "
+            "class importable from PYTHONPATH."
         )
+
+    module_path, _, class_name = dataset_name.rpartition(".")
+    try:
+        module = importlib.import_module(module_path)
+    except ImportError as e:
+        raise ValueError(
+            f"Could not import module {module_path!r} for "
+            f"dataset_name={dataset_name!r}. Ensure the module is "
+            "installed and importable from PYTHONPATH."
+        ) from e
+    if not hasattr(module, class_name):
+        raise ValueError(
+            f"Module {module_path!r} has no attribute {class_name!r} "
+            f"(referenced by dataset_name={dataset_name!r})."
+        )
+    dataset_class = getattr(module, class_name)
+    if not isinstance(dataset_class, type):
+        raise ValueError(
+            f"dataset_name={dataset_name!r} resolved to {dataset_class!r}, "
+            "which is not a class. Expected a dataset class."
+        )
+    return dataset_class
+
+
+def load_response_dataset(data_config: ResponseDatasetConfig):
+    """Loads response dataset.
+
+    Resolution order for ``data_config["dataset_name"]``:
+
+    1. If the name matches a key in ``DATASET_REGISTRY``, use the built-in
+       class.
+    2. Otherwise, if the name contains a ``.``, treat it as a fully qualified
+       dotted import path (e.g. ``my_pkg.my_module.MyDataset``) and import
+       the class dynamically. This lets users register custom datasets
+       without editing ``nemo_rl``.
+    3. Otherwise, raise ``ValueError`` with a helpful message.
+    """
+    dataset_name = data_config["dataset_name"]
+
+    if dataset_name in DATASET_REGISTRY:
+        dataset_class = DATASET_REGISTRY[dataset_name]
+    else:
+        dataset_class = _resolve_external_dataset_class(dataset_name)
+
+    dataset = dataset_class(
+        **data_config  # pyrefly: ignore[missing-argument]  `data_path` is required for some classes
+    )
 
     # bind prompt, system prompt and data processor
     dataset.set_task_spec(data_config)
