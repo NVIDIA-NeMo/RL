@@ -82,23 +82,24 @@ def main() -> None:
         print(f"Overrides: {overrides}")
         config = parse_hydra_overrides(config, overrides)
 
-    config: MasterConfig = OmegaConf.to_container(config, resolve=True)
+    config = OmegaConf.to_container(config, resolve=True)
+    config = MasterConfig(**config)
     print("Applied CLI overrides")
 
     # Get the next experiment directory with incremented ID
-    config["logger"]["log_dir"] = get_next_experiment_dir(config["logger"]["log_dir"])
-    print(f"📊 Using log directory: {config['logger']['log_dir']}")
-    if config["checkpointing"]["enabled"]:
+    config.logger["log_dir"] = get_next_experiment_dir(config.logger["log_dir"])
+    print(f"📊 Using log directory: {config.logger['log_dir']}")
+    if config.checkpointing["enabled"]:
         print(
-            f"📊 Using checkpoint directory: {config['checkpointing']['checkpoint_dir']}"
+            f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
         )
 
     # setup tokenizer
-    tokenizer = get_tokenizer(config["policy"]["tokenizer"])
+    tokenizer = get_tokenizer(config.policy["tokenizer"])
 
-    if config["policy"]["generation"] is not None:
-        config["policy"]["generation"] = configure_generation_config(
-            config["policy"]["generation"], tokenizer
+    if config.policy["generation"] is not None:
+        config.policy["generation"] = configure_generation_config(
+            config.policy["generation"], tokenizer
         )
     else:
         raise ValueError(
@@ -115,12 +116,12 @@ def main() -> None:
     # student_generation, so we don't setup env here.
     print("\n▶ Setting up data...")
     train_dataset, val_dataset = setup_response_data(
-        tokenizer, config["data"], env_configs=None
+        tokenizer, config.data, env_configs=None
     )
 
     # Validation dataset config setup. Same Gym principle as run_grpo_nemo_gym.py:
     # max_val_samples is derived from len(val_dataset); user-set values are rejected.
-    if config["distillation"]["max_val_samples"] is not None:
+    if config.distillation["max_val_samples"] is not None:
         raise ValueError(
             """A non-null `distillation.max_val_samples` parameter is not supported.
 
@@ -133,10 +134,8 @@ The validation set you pass in will directly be used for validation with no addi
         print(
             f"Setting `distillation.max_val_samples` and `distillation.val_batch_size` to the length of the validation dataset, which is {len(val_dataset)}"
         )
-        config["distillation"]["max_val_samples"] = len(val_dataset)
-        config["distillation"]["val_batch_size"] = config["distillation"][
-            "max_val_samples"
-        ]
+        config.distillation["max_val_samples"] = len(val_dataset)
+        config.distillation["val_batch_size"] = config.distillation["max_val_samples"]
 
     # Print config
     print("Final config:")
@@ -163,7 +162,7 @@ The validation set you pass in will directly be used for validation with no addi
     nemo_gym_config = NemoGymConfig(
         model_name=student_generation.cfg["model_name"],
         base_urls=student_generation.dp_openai_server_base_urls,
-        initial_global_config_dict=config["env"]["nemo_gym"],
+        initial_global_config_dict=config.env["nemo_gym"],
     )
     nemo_gym = create_env(env_name="nemo_gym", env_config=nemo_gym_config)
     # Blocking wait for NeMo-Gym to spin up

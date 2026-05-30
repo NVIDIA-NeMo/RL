@@ -90,7 +90,7 @@ class DistillationConfig(TypedDict):
     # Whether to run validation on the last training step. Setting this to True ensures the
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
     val_at_end: bool
-    max_val_samples: int
+    max_val_samples: int | None  # None for NeMo-Gym compatibility
     topk_logits_k: int
     seed: int
 
@@ -634,7 +634,7 @@ def distillation_train(
                 with timer.time("generation"):
                     # We cascade NeMo-Gym first since NeMo-Gym requires async rollouts.
                     if use_nemo_gym:
-                        generation_config = master_config["policy"]["generation"]
+                        generation_config = master_config.policy["generation"]
                         nemo_gym_rollout_result = run_async_nemo_gym_rollout(
                             policy_generation=student_generation,
                             input_batch=repeated_batch,
@@ -1022,7 +1022,7 @@ def validate(
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
             # We cascade NeMo-Gym first since NeMo-Gym requires async rollouts.
             if use_nemo_gym:
-                generation_config = master_config["policy"]["generation"]
+                generation_config = master_config.policy["generation"]
                 nemo_gym_rollout_result = run_async_nemo_gym_rollout(
                     policy_generation=policy_generation,
                     input_batch=val_batch,
