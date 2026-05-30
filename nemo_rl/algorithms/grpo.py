@@ -32,6 +32,10 @@ from nemo_rl.algorithms.advantage_estimator import (
     GRPOAdvantageEstimator,
     ReinforcePlusPlusAdvantageEstimator,
 )
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    need_top_k_or_top_p_filtering,
+)
 from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
     ClippedPGLossDataDict,
@@ -381,7 +385,41 @@ def setup(
     # ==========================
     #        Loss Function
     # ==========================
-    loss_fn = ClippedPGLossFn(loss_config)
+    # Linear CE fusion loss computes next-token logprobs directly from hidden states
+    # (chunked over the sequence) and never materializes the full
+    # [batch, seq_len, vocab_size] logit tensor, which significantly reduces peak
+    # memory. It is only available on the Megatron backend.
+    use_linear_ce_fusion = policy_config["megatron_cfg"]["enabled"] and policy_config[
+        "megatron_cfg"
+    ].get("use_linear_ce_fusion_loss", False)
+    if use_linear_ce_fusion:
+        # Sequence packing is not yet validated with the fused path: the fused
+        # forward rolls labels over the whole (packed) sequence and would mix
+        # tokens across packed-sequence boundaries.
+        assert not policy_config["sequence_packing"]["enabled"], (
+            "Linear CE fusion loss is not supported with sequence packing for GRPO. "
+            "The fused path has not been validated with cu_seqlens-based logprob "
+            "aggregation. Set policy.megatron_cfg.use_linear_ce_fusion_loss=false "
+            "or policy.sequence_packing.enabled=false."
+        )
+        # The fused forward gathers the logprob of the realized token from the raw
+        # (unfiltered) logits, so top-k/top-p training-time filtering cannot be
+        # applied. This also keeps prev/reference logprobs (computed via the fused
+        # get_logprobs path) consistent with the actor logprobs.
+        assert not need_top_k_or_top_p_filtering(
+            TrainingSamplingParams(
+                top_k=generation_config["top_k"],
+                top_p=generation_config["top_p"],
+            )
+        ), (
+            "Linear CE fusion loss is not supported with top-k/top-p training-time "
+            "filtering for GRPO. The fused path computes logprobs from unfiltered "
+            "logits. Set policy.megatron_cfg.use_linear_ce_fusion_loss=false, or "
+            "disable filtering (policy.generation.top_k=null, "
+            "policy.generation.top_p=1.0)."
+        )
+
+    loss_fn = ClippedPGLossFn(loss_config, use_linear_ce_fusion=use_linear_ce_fusion)
 
     # Validate force_on_policy_ratio
     if loss_config.force_on_policy_ratio:

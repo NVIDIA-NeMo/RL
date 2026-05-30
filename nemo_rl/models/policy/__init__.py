@@ -270,7 +270,8 @@ class MegatronConfig(TypedDict):
     # directly from hidden states, avoiding materialization of the full
     # [batch, seq_len, vocab_size] logit tensor. This significantly reduces peak
     # GPU memory, extending the maximum trainable sequence length (e.g. from <65K
-    # to >100K tokens). Only applicable to SFT with NLLLoss.
+    # to >100K tokens). Supported for SFT, DPO, and GRPO. Not compatible with
+    # context parallelism, sequence packing, or top-k/top-p training-time filtering.
     use_linear_ce_fusion_loss: NotRequired[bool]
     # Number of tokens per chunk when computing the fused linear CE loss.
     # Smaller values reduce peak memory further but may decrease throughput.

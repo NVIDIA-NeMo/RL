@@ -2068,9 +2068,16 @@ def _gpt_forward_with_linear_ce_fusion(
     inference_params: Optional[Any] = None,
     loss_mask: Optional[torch.Tensor] = None,
     padding_mask: Optional[torch.Tensor] = None,
+    is_spec_decode: Optional[bool] = None,
     return_logprobs_for_linear_ce_fusion: bool = False,
 ) -> torch.Tensor:
     if not return_logprobs_for_linear_ce_fusion:
+        passthrough_kwargs: dict[str, Any] = {}
+        # is_spec_decode was added to GPTModel.forward in newer Megatron-LM. Only
+        # forward it when a caller (e.g. mcore inference) actually set it, so we
+        # stay compatible with older signatures that don't accept the kwarg.
+        if is_spec_decode is not None:
+            passthrough_kwargs["is_spec_decode"] = is_spec_decode
         return self._original_forward_for_linear_ce_fusion(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -2084,6 +2091,7 @@ def _gpt_forward_with_linear_ce_fusion(
             inference_params=inference_params,
             loss_mask=loss_mask,
             padding_mask=padding_mask,
+            **passthrough_kwargs,
         )
     """
     original forward function signature:

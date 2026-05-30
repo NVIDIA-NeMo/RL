@@ -348,6 +348,38 @@ GRPO uses temperature, top-p (nucleus sampling), and top-k sampling during rollo
 
 RL generations typically produce highly variable sequence lengths, which result in a significant amount of padding if approached naively. We address this with Sequence Packing and Dynamic Batching, which are techniques to reduce the amount of padding required. You can read more about these in the [design doc](../design-docs/sequence-packing-and-dynamic-batching.md).
 
+### Chunked Linear Cross-Entropy Fusion Loss
+
+During standard GRPO training the model materializes a full logit tensor of shape `[batch_size, seq_length, vocab_size]` for the policy forward-backward pass as well as for the previous-policy and reference-policy logprob computations. This can cause out-of-memory (OOM) errors for long sequences or large vocabularies. The **chunked linear cross-entropy fusion loss** avoids this by computing the per-token log probabilities directly from the hidden states: it chunks the sequence dimension, projects each chunk to logits on the fly, gathers the realized-token log probabilities, and discards the logits before moving to the next chunk.
+
+This works for GRPO because [ClippedPGLossFn](../../nemo_rl/algorithms/loss/loss_functions.py) only consumes the per-token log probability of the realized token (`next_token_logprobs`), which is exactly what the fused forward returns.
+
+**Benefits:**
+
+- Extends the maximum trainable sequence length significantly by eliminating the large logit tensor from GPU memory.
+- Applies to both the training forward-backward pass and the previous/reference-policy logprob computations.
+- Produces numerically equivalent loss values to the standard path.
+
+**How to enable:**
+
+Add the following to your Megatron config in your YAML file:
+
+```yaml
+policy:
+  megatron_cfg:
+    enabled: true
+    use_linear_ce_fusion_loss: true
+    linear_ce_fusion_chunk_size: 256  # tokens per chunk; smaller = less memory, larger = more throughput
+```
+
+**Notes:**
+
+- Only supported on the Megatron backend (`policy.megatron_cfg.enabled: true`).
+- Context parallelism is not supported when linear CE fusion is enabled.
+- Sequence packing is not supported with linear CE fusion; set `policy.sequence_packing.enabled: false`. The fused forward rolls labels over the whole packed sequence and would mix tokens across packed-sequence boundaries.
+- Top-k/top-p training-time filtering is not supported with linear CE fusion (set `policy.generation.top_k: null` and `policy.generation.top_p: 1.0`), because the fused path gathers logprobs from the unfiltered logits.
+- The `linear_ce_fusion_chunk_size` parameter controls the trade-off between memory savings and compute throughput. The default value of 256 is a good starting point.
+
 ## Loss
 We use the [ClippedPGLossFn](../../nemo_rl/algorithms/loss/loss_functions.py) to calculate the loss for GRPO. Formally,
 

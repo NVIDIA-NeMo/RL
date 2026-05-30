@@ -846,6 +846,26 @@ def _create_megatron_config(
     dtype: torch.dtype,
 ) -> ConfigContainer:
     """Create the final Megatron configuration container."""
+    # Linear CE fusion runs the decoder but reads output_layer.weight directly
+    # instead of calling output_layer.forward(). Megatron's distributed-optimizer
+    # overlap_param_gather prefetch chain assumes every param-gather bucket
+    # (including the output layer) is consumed by a module forward; skipping it
+    # leaves a stale param_gather_handle and trips
+    #   assert self.param_gather_handle is None  (param_and_grad_buffer.py)
+    # on the next iteration. Force the param-gather overlap off when fusion is on.
+    overlap_param_gather = config["megatron_cfg"]["distributed_data_parallel_config"][
+        "overlap_param_gather"
+    ]
+    if (
+        config["megatron_cfg"].get("use_linear_ce_fusion_loss", False)
+        and overlap_param_gather
+    ):
+        warnings.warn(
+            "Disabling overlap_param_gather because linear CE fusion loss is enabled: "
+            "the fused forward bypasses output_layer.forward() and is incompatible "
+            "with the distributed-optimizer param-gather prefetch chain."
+        )
+        overlap_param_gather = False
     return ConfigContainer(
         model=model_cfg,
         checkpoint=checkpoint_config,
@@ -864,9 +884,7 @@ def _create_megatron_config(
             overlap_grad_reduce=config["megatron_cfg"][
                 "distributed_data_parallel_config"
             ]["overlap_grad_reduce"],
-            overlap_param_gather=config["megatron_cfg"][
-                "distributed_data_parallel_config"
-            ]["overlap_param_gather"],
+            overlap_param_gather=overlap_param_gather,
             # we need to set average_in_collective=False with calculate_per_token_loss=T
             # otherwise, mcore throws an assertion error.
             average_in_collective=False,  # Required with calculate_per_token_loss=True
@@ -1428,6 +1446,9 @@ def finalize_megatron_setup(
         and config["megatron_cfg"]["distributed_data_parallel_config"][
             "overlap_param_gather"
         ]
+        # Linear CE fusion forces overlap_param_gather off (see
+        # create_megatron_config), so there is no forward pre-hook to disable.
+        and not config["megatron_cfg"].get("use_linear_ce_fusion_loss", False)
     )
 
     return megatron_tokenizer, megatron_bridge, should_disable_forward_pre_hook, dp_size
