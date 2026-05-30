@@ -86,10 +86,22 @@ class FakeDataPlaneActor:
         with self._lock:
             for i, sample_id in enumerate(sample_ids):
                 row_fields = set(fields.keys()) if fields is not None else set()
-                self._rows[sample_id] = {
-                    "fields": row_fields,
-                    "tag": dict(tags[i]) if tags is not None else {},
-                }
+                row = self._rows.setdefault(
+                    sample_id,
+                    {
+                        "fields": set(),
+                        "values": {},
+                        "tag": dict(tags[i]) if tags is not None else {},
+                    },
+                )
+                row["fields"].update(row_fields)
+                if tags is not None:
+                    row["tag"] = dict(tags[i])
+                if fields is not None:
+                    for field_name in fields.keys():
+                        value = fields[field_name]
+                        assert isinstance(value, torch.Tensor)
+                        row["values"][field_name] = value[i].detach().clone()
         return KVBatchMeta(
             partition_id=partition_id,
             task_name=None,
@@ -138,10 +150,16 @@ class FakeDataPlaneActor:
         partition_id: str,
         select_fields: list[str],
     ) -> TensorDict:
-        del select_fields
         assert partition_id == self._partition_id
+        values: dict[str, torch.Tensor] = {}
+        with self._lock:
+            for field_name in select_fields:
+                rows = []
+                for sample_id in sample_ids:
+                    rows.append(self._rows[sample_id]["values"][field_name])
+                values[field_name] = torch.stack(rows, dim=0)
         return TensorDict(
-            {"input_ids": torch.ones((len(sample_ids), 3), dtype=torch.long)},
+            values,
             batch_size=[len(sample_ids)],
         )
 
@@ -189,7 +207,19 @@ class DryRunGenWorker:
             sample_ids=[sample_id],
             partition_id="rollout_data",
             fields=TensorDict(
-                {"input_ids": torch.ones((1, 3), dtype=torch.long)},
+                {
+                    "input_ids": torch.ones((1, 3), dtype=torch.long),
+                    "prompt_ids_for_adv": torch.tensor(
+                        [[self._call_count]],
+                        dtype=torch.long,
+                    ),
+                    "total_reward": torch.tensor(
+                        [float(self._call_count)],
+                        dtype=torch.float32,
+                    ),
+                    "token_mask": torch.ones((1, 3), dtype=torch.float32),
+                    "sample_mask": torch.ones(1, dtype=torch.float32),
+                },
                 batch_size=[1],
             ),
             tags=[
@@ -222,21 +252,32 @@ class DryRunTrainer:
     Uses asyncio.sleep so event loop stays responsive — other pumps continue.
     """
 
-    def __init__(self, train_latency_s: float = 0.2):
+    def __init__(
+        self,
+        train_latency_s: float = 0.2,
+        expect_advantages: bool = False,
+    ):
         self._train_latency_s = train_latency_s
+        self._expect_advantages = expect_advantages
         self._trainer_version = 0
         self._train_count = 0
         self._train_start_times: list[float] = []
+        self._last_advantages: torch.Tensor | None = None
 
     async def train_on_meta(self, meta: KVBatchMeta, dp_client: Any) -> dict:
         """Simulate a training step."""
         self._train_start_times.append(time.monotonic())
         # Fetch records from DataPlane directly — same path as production
-        await dp_client.get_samples.remote(
+        select_fields = ["input_ids"]
+        if self._expect_advantages:
+            select_fields.append("advantages")
+        data = await dp_client.get_samples.remote(
             sample_ids=meta.sample_ids,
             partition_id=meta.partition_id,
-            select_fields=["input_ids"],
+            select_fields=select_fields,
         )
+        if self._expect_advantages:
+            self._last_advantages = data["advantages"].detach().clone()
         await asyncio.sleep(self._train_latency_s)
         self._trainer_version += 1
         self._train_count += 1
@@ -254,6 +295,25 @@ class DryRunTrainer:
 
     def get_train_start_times(self) -> list[float]:
         return list(self._train_start_times)
+
+    def get_last_advantages(self) -> torch.Tensor | None:
+        return self._last_advantages
+
+
+class DryRunAdvantageEstimator:
+    """Small estimator used by the dry-run SC advantage stage test."""
+
+    def compute_advantage(
+        self,
+        prompt_ids,
+        rewards,
+        mask,
+        repeated_batch,
+        **kwargs,
+    ):
+        del prompt_ids, repeated_batch, kwargs
+        centered = rewards - rewards.mean()
+        return centered.unsqueeze(-1).expand(mask.shape)
 
 
 class DryRunWeightSynchronizer:
@@ -323,6 +383,8 @@ class TestSingleControllerDryRun:
         max_buffered_rollouts=4,
         max_inflight_prompts=4,
         max_weight_staleness_versions=1,
+        advantage_enabled=False,
+        advantage_estimator=None,
         diagnostics=False,
     ):
         cfg = SingleControllerConfig(
@@ -333,13 +395,20 @@ class TestSingleControllerDryRun:
             max_buffered_rollouts=max_buffered_rollouts,
             max_inflight_prompts=max_inflight_prompts,
             max_weight_staleness_versions=max_weight_staleness_versions,
+            advantage_enabled=advantage_enabled,
             diagnostics=diagnostics,
         )
         if weight_sync is None:
             weight_sync = DryRunWeightSynchronizer(gen_handle=gen)
         prompts = [f"prompt_{i}" for i in range(10)]
         return SingleControllerActor.remote(
-            cfg, prompts, dp_client, gen, trainer, weight_sync
+            cfg,
+            prompts,
+            dp_client,
+            gen,
+            trainer,
+            weight_sync,
+            advantage_estimator,
         )
 
     def test_dry_run_completes(self, ray_init):
@@ -360,6 +429,43 @@ class TestSingleControllerDryRun:
         result = ray.get(ctrl.run.remote(), timeout=30)
         assert result["train_steps"] == 3
         assert result["trainer_version"] == 3
+
+    def test_advantage_pump_writes_advantages_before_train(self, ray_init):
+        """SC computes advantages from DataPlane inputs and writes them back."""
+        dp_client = FakeDataPlaneActor.remote()
+        gen = DryRunGenWorker.remote(gen_latency_s=0.01)
+        trainer = DryRunTrainer.remote(
+            train_latency_s=0.01,
+            expect_advantages=True,
+        )
+
+        ctrl = self._make_controller(
+            dp_client,
+            gen,
+            trainer,
+            max_train_steps=1,
+            max_rollout_prompts=2,
+            min_prompt_groups_per_batch=2,
+            generations_per_prompt=1,
+            advantage_enabled=True,
+            advantage_estimator=DryRunAdvantageEstimator(),
+        )
+
+        result = ray.get(ctrl.run.remote(), timeout=30)
+        assert result["train_steps"] == 1
+
+        advantages = ray.get(trainer.get_last_advantages.remote())
+        assert advantages is not None
+        assert advantages.shape == (2, 3)
+        assert torch.allclose(
+            advantages,
+            torch.tensor(
+                [
+                    [-0.5, -0.5, -0.5],
+                    [0.5, 0.5, 0.5],
+                ]
+            ),
+        )
 
     def test_rollout_pump_runs_concurrently_with_train(self, ray_init):
         """rollout_pump dispatches while train_pump is sleeping.

@@ -18,14 +18,19 @@ SingleController is a CPU-only Ray actor that owns three concurrent asyncio
 pumps and coordinates all other actors via lightweight RPCs. Other actors
 expose methods and wait to be called.
 
-Key invariant: SC never sees tensor data. It sends control signals
-(``KVBatchMeta`` and actor handles) and reads metadata. All tensor movement
-happens directly between actors via the DataPlane path or NCCL.
+Key invariant: SC does not run model work. It sends control signals
+(``KVBatchMeta`` and actor handles) and reads metadata. When advantage
+calculation is enabled, SC fetches only the configured advantage input
+columns, computes advantages, and writes that small derived column back to
+DataPlane. Model tensors still move through DataPlane or NCCL.
 
 Data flow:
   _rollout_pump  → gen.generate_and_push(prompt, dp_client) ← RPC to GenWorker
                      GenWorker → dp_client.put_samples(...)
   _train_pump    → dp_client.claim_meta(...) → BatchSelectionStrategy
+                 → _advantage_pump(meta) → dp_client.get_samples(...)
+                                        → adv_estimator.compute_advantage(...)
+                                        → dp_client.put_samples(...)
                  → trainer.train_on_meta(meta)
                      Trainer → dp_client.get_samples(...)
                  → dp_client.clear_samples(...)             ← SC clears after train
@@ -41,6 +46,8 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
 
 import ray
+import torch
+from tensordict import TensorDict
 
 from nemo_rl.algorithms.staleness_sampler import (
     BatchSelectionStrategy,
@@ -80,6 +87,17 @@ class SingleControllerConfig:
     claim_required_fields: list[str] = field(default_factory=lambda: ["input_ids"])
     max_claim_prompt_groups: int = 8
 
+    # Advantage calculation
+    advantage_enabled: bool = False
+    advantage_output_field: str = "advantages"
+    advantage_prompt_ids_field: str = "prompt_ids_for_adv"
+    advantage_reward_field: str = "total_reward"
+    advantage_token_mask_field: str = "token_mask"
+    advantage_sample_mask_field: str = "sample_mask"
+    advantage_repeated_batch_fields: list[str] = field(default_factory=list)
+    advantage_policy_logprobs_field: str | None = None
+    advantage_reference_logprobs_field: str | None = None
+
     # Diagnostics
     diagnostics: bool = False
 
@@ -112,6 +130,7 @@ class SingleControllerActor:
         gen_handle: Any,
         trainer_handle: Any,
         weight_synchronizer: Any,
+        advantage_estimator: Any | None = None,
     ) -> None:
         import logging as _logging
 
@@ -126,6 +145,12 @@ class SingleControllerActor:
         self._gen = gen_handle
         self._trainer = trainer_handle
         self._weight_synchronizer = weight_synchronizer
+        self._advantage_estimator = advantage_estimator
+
+        if cfg.advantage_enabled and self._advantage_estimator is None:
+            raise ValueError(
+                "advantage_enabled=True requires an advantage_estimator instance"
+            )
 
         if cfg.batch_selection_strategy == "strict_on_policy":
             self._sampler: BatchSelectionStrategy = StrictOnPolicyBatchSampler()
@@ -264,10 +289,11 @@ class SingleControllerActor:
           1. claim_meta() — temporary consuming metadata acquisition
           2. Evict sample_ids no longer eligible under the selected policy
           3. BatchSelectionStrategy.select_indices() — choose full prompt groups
-          4. trainer.train_on_meta(KVBatchMeta, dp_client) — trainer fetches tensors
-          5. clear_samples(sample_ids) — SC removes consumed rows
-          6. _buffer_capacity.release() — unblock _rollout_pump
-          7. _sync_weights()
+          4. _advantage_pump() — fetch, compute advantages, write back
+          5. trainer.train_on_meta(KVBatchMeta, dp_client) — trainer fetches tensors
+          6. clear_samples(sample_ids) — SC removes consumed rows
+          7. _buffer_capacity.release() — unblock _rollout_pump
+          8. _sync_weights()
         """
         while self._train_steps < self._cfg.max_train_steps:
             await self._claim_available_meta()
@@ -313,6 +339,7 @@ class SingleControllerActor:
                 continue
 
             selected_meta = self._claimed_meta.subset(selected_indices)
+            selected_meta = await self._advantage_pump(selected_meta)
             selected_weight = _min_weight_version(selected_meta)
             lag = (
                 self._trainer_version - selected_weight
@@ -378,7 +405,7 @@ class SingleControllerActor:
             "claim_meta",
             partition_id=self._cfg.partition_id,
             task_name=self._cfg.consumer_task_name,
-            required_fields=list(self._cfg.claim_required_fields),
+            required_fields=self._claim_required_fields(),
             batch_size=batch_size,
             blocking=False,
             timeout_s=0.0,
@@ -386,6 +413,95 @@ class SingleControllerActor:
         if meta.size == 0:
             return
         self._claimed_meta = _concat_meta(self._claimed_meta, meta)
+
+    def _claim_required_fields(self) -> list[str]:
+        fields = list(self._cfg.claim_required_fields)
+        if self._cfg.advantage_enabled:
+            fields.extend(self._advantage_input_fields())
+        return _dedupe(fields)
+
+    def _advantage_input_fields(self) -> list[str]:
+        fields = [
+            self._cfg.advantage_prompt_ids_field,
+            self._cfg.advantage_reward_field,
+            self._cfg.advantage_token_mask_field,
+            self._cfg.advantage_sample_mask_field,
+            *self._cfg.advantage_repeated_batch_fields,
+        ]
+        if self._cfg.advantage_policy_logprobs_field is not None:
+            fields.append(self._cfg.advantage_policy_logprobs_field)
+        if self._cfg.advantage_reference_logprobs_field is not None:
+            fields.append(self._cfg.advantage_reference_logprobs_field)
+        return _dedupe(fields)
+
+    async def _advantage_pump(self, meta: KVBatchMeta) -> KVBatchMeta:
+        """Fetch advantage inputs, compute advantages, and write them back.
+
+        SC owns the prompt-group-scoped advantage stage because the selected
+        ``KVBatchMeta`` still contains complete prompt groups before trainer
+        DP sharding. Tensor payloads still move through DataPlane: SC fetches
+        only the configured advantage input columns and writes the computed
+        ``advantages`` column back under the same ``sample_ids``.
+        """
+        if not self._cfg.advantage_enabled:
+            return meta
+        assert self._advantage_estimator is not None
+
+        data = await self._call_dp(
+            "get_samples",
+            sample_ids=meta.sample_ids,
+            partition_id=meta.partition_id,
+            select_fields=self._advantage_input_fields(),
+        )
+
+        prompt_ids = _tensor_field(data, self._cfg.advantage_prompt_ids_field)
+        rewards = _squeeze_trailing_unit_dim(
+            _tensor_field(data, self._cfg.advantage_reward_field)
+        ).float()
+        token_mask = _tensor_field(data, self._cfg.advantage_token_mask_field).float()
+        sample_mask = _squeeze_trailing_unit_dim(
+            _tensor_field(data, self._cfg.advantage_sample_mask_field)
+        ).float()
+        mask = token_mask * sample_mask.unsqueeze(-1)
+
+        repeated_batch: dict[str, torch.Tensor] = {
+            "total_reward": rewards,
+        }
+        for field_name in self._cfg.advantage_repeated_batch_fields:
+            repeated_batch[field_name] = _squeeze_trailing_unit_dim(
+                _tensor_field(data, field_name)
+            )
+
+        kwargs: dict[str, torch.Tensor] = {}
+        if self._cfg.advantage_policy_logprobs_field is not None:
+            kwargs["logprobs_policy"] = _tensor_field(
+                data,
+                self._cfg.advantage_policy_logprobs_field,
+            )
+        if self._cfg.advantage_reference_logprobs_field is not None:
+            kwargs["logprobs_reference"] = _tensor_field(
+                data,
+                self._cfg.advantage_reference_logprobs_field,
+            )
+
+        advantages = self._advantage_estimator.compute_advantage(
+            prompt_ids=prompt_ids,
+            rewards=rewards,
+            mask=mask,
+            repeated_batch=repeated_batch,
+            **kwargs,
+        )
+
+        await self._call_dp(
+            "put_samples",
+            sample_ids=meta.sample_ids,
+            partition_id=meta.partition_id,
+            fields=_fields_for_put(
+                meta,
+                {self._cfg.advantage_output_field: advantages},
+            ),
+        )
+        return _with_fields(meta, [self._cfg.advantage_output_field])
 
     async def _evict_stale_claimed(self) -> KVBatchMeta | None:
         if self._claimed_meta is None or self._claimed_meta.size == 0:
@@ -471,3 +587,69 @@ def _min_weight_version(meta: KVBatchMeta) -> int | None:
             continue
         versions.append(int(value))
     return min(versions) if versions else None
+
+
+def _dedupe(fields: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for field_name in fields:
+        if field_name in seen:
+            continue
+        seen.add(field_name)
+        deduped.append(field_name)
+    return deduped
+
+
+def _tensor_field(data: TensorDict, field_name: str) -> torch.Tensor:
+    value = data[field_name]
+    if not isinstance(value, torch.Tensor):
+        raise TypeError(
+            f"advantage_pump expected tensor field {field_name!r}; got {type(value)}"
+        )
+    if value.is_nested:
+        return torch.nested.to_padded_tensor(value, padding=0)
+    return value
+
+
+def _squeeze_trailing_unit_dim(value: torch.Tensor) -> torch.Tensor:
+    if value.dim() >= 2 and value.shape[-1] == 1:
+        return value.squeeze(-1)
+    return value
+
+
+def _fields_for_put(meta: KVBatchMeta, fields: dict[str, torch.Tensor]) -> TensorDict:
+    packed: dict[str, torch.Tensor] = {}
+    if meta.sequence_lengths is None:
+        for field_name, value in fields.items():
+            packed[field_name] = value.detach().contiguous()
+        return TensorDict(packed, batch_size=[meta.size])
+
+    lengths = torch.tensor(meta.sequence_lengths, dtype=torch.long)
+    for field_name, value in fields.items():
+        if value.dim() >= 2 and value.shape[1] == int(lengths.max().item()):
+            rows = [
+                value[i, : int(lengths[i].item())].detach().contiguous()
+                for i in range(meta.size)
+            ]
+            packed[field_name] = torch.nested.as_nested_tensor(
+                rows,
+                layout=torch.jagged,
+            )
+        else:
+            packed[field_name] = value.detach().contiguous()
+    return TensorDict(packed, batch_size=[meta.size])
+
+
+def _with_fields(meta: KVBatchMeta, field_names: list[str]) -> KVBatchMeta:
+    fields = _dedupe([*(meta.fields or []), *field_names])
+    return KVBatchMeta(
+        partition_id=meta.partition_id,
+        task_name=meta.task_name,
+        sample_ids=list(meta.sample_ids),
+        fields=fields,
+        sequence_lengths=(
+            list(meta.sequence_lengths) if meta.sequence_lengths is not None else None
+        ),
+        extra_info=dict(meta.extra_info or {}),
+        tags=[dict(tag) for tag in meta.tags] if meta.tags is not None else None,
+    )
