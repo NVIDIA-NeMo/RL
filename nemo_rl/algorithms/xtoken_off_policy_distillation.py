@@ -490,7 +490,10 @@ def xtoken_off_policy_distillation_train(
                         val_timings, total_steps + 1, prefix="timing/validation"
                     )
 
-                metrics: dict[str, Any] = {}
+                metrics: dict[str, Any] = {
+                    "loss": train_results["loss"].numpy(),
+                    "grad_norm": train_results["grad_norm"].numpy(),
+                }
                 metrics.update(train_results["all_mb_metrics"])
                 # Reduce per-microbatch metrics to per-step scalars. The
                 # P-KL path emits kl_loss/ce_loss/kl_loss_scale/proj_accuracy;
@@ -511,8 +514,6 @@ def xtoken_off_policy_distillation_train(
                         metrics[k] = float(np.mean(v))
                     else:
                         metrics[k] = float(np.sum(v))
-                metrics["loss"] = float(train_results["loss"].numpy())
-                metrics["grad_norm"] = float(train_results["grad_norm"].numpy())
                 if "global_valid_toks" in metrics:
                     total_valid_tokens += int(metrics["global_valid_toks"])
 
