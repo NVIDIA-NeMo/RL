@@ -136,6 +136,9 @@ ENV CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl
 # Do not reinstall torch and related dependencies when using the NGC PyTorch base image
 ARG UV_NO_INSTALL_PACKAGES="--no-install-package torch --no-install-package torchvision --no-install-package triton --no-install-package nvidia-cublas --no-install-package nvidia-cuda-cupti --no-install-package nvidia-cuda-nvrtc --no-install-package nvidia-cuda-runtime --no-install-package nvidia-cudnn-cu13 --no-install-package nvidia-cufft --no-install-package nvidia-cufile --no-install-package nvidia-curand --no-install-package nvidia-cusolver --no-install-package nvidia-cusparse --no-install-package nvidia-cusparselt-cu13 --no-install-package nvidia-nccl-cu13 --no-install-package vllm --no-install-package flash-attn --no-install-package numpy --no-install-package cuda-bindings --no-install-package cuda-python"
 ENV UV_NO_INSTALL_PACKAGES=${UV_NO_INSTALL_PACKAGES}
+# Ensure HybridEP/DeepEP JIT compilation can find nvcc at runtime
+ENV CUDA_HOME=/usr/local/cuda
+
 
 # First copy only the dependency files
 COPY --from=nemo-rl pyproject.toml uv.lock ./
@@ -172,20 +175,15 @@ fi
 # Do everything in one layer to prevent large layers.
 
 # The venv is symlinked to avoid bloating the layer size
-uv sync --inexact --link-mode symlink --locked --no-install-project $UV_NO_INSTALL_PACKAGES
-if [[ -z "${SKIP_SGLANG_BUILD:-}" ]]; then
-    MAX_JOBS=2 CMAKE_BUILD_PARALLEL_LEVEL=2 CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1" uv sync --inexact --link-mode symlink --locked --extra sglang --no-install-project $UV_NO_INSTALL_PACKAGES
-fi
-
-uv sync --inexact --link-mode symlink --locked --extra vllm --no-install-project $UV_NO_INSTALL_PACKAGES
-uv sync --inexact --link-mode symlink --locked --extra mcore --no-install-project $UV_NO_INSTALL_PACKAGES
-uv sync --inexact --link-mode symlink --locked --extra automodel --no-install-project $UV_NO_INSTALL_PACKAGES
-uv sync --inexact --link-mode symlink --locked --extra nemo_gym --no-install-project $UV_NO_INSTALL_PACKAGES
-uv sync --inexact --link-mode symlink --locked --all-groups --no-install-project $UV_NO_INSTALL_PACKAGES
-
-# Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8
-# The ray install will include the older aiohttp version in its cache
-find /root/.cache/uv -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
+uv venv --system-site-packages ${UV_PROJECT_ENVIRONMENT}
+uv pip install --no-cache-dir --no-deps /tmp/build_vllm/vllm/vllm*.whl
+# Ensure nvshmem is installed before building DeepEP
+uv sync --link-mode symlink --locked --inexact --no-install-project $UV_NO_INSTALL_PACKAGES
+uv sync --link-mode symlink --locked --inexact --extra vllm --no-install-project $UV_NO_INSTALL_PACKAGES
+uv sync --link-mode symlink --locked --inexact --extra mcore --no-install-project $UV_NO_INSTALL_PACKAGES
+uv sync --link-mode symlink --locked --inexact --extra automodel --no-install-project $UV_NO_INSTALL_PACKAGES
+uv sync --link-mode symlink --locked --inexact --extra modelopt --no-install-project $UV_NO_INSTALL_PACKAGES
+uv sync --link-mode symlink --locked --inexact --all-groups --no-install-project $UV_NO_INSTALL_PACKAGES
 EOF
 
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
@@ -212,6 +210,17 @@ LABEL com.nvidia.build.id="${NVIDIA_BUILD_ID}"
 LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
 
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
+
+# AWS EFA OFI plugin discovery (p4d / p5 / p5en multi-node NCCL via SRD).
+# The host's aws-efa-installer places libnccl-net-ofi.so under
+# /opt/amazon/ofi-nccl/lib and libfabric under /opt/amazon/efa/lib. Without
+# these on the linker search path, NCCL silently falls back to its socket
+# transport. Register both via ld.so.conf.d (so `ldconfig` populates the cache
+# once host paths are mounted at runtime) and LD_LIBRARY_PATH (so NCCL's
+# dlopen resolves the plugin even before `ldconfig` is re-run).
+RUN printf '%s\n' /opt/amazon/ofi-nccl/lib /opt/amazon/efa/lib \
+        > /etc/ld.so.conf.d/aws-efa.conf
+ENV LD_LIBRARY_PATH="/opt/amazon/ofi-nccl/lib:/opt/amazon/efa/lib:${LD_LIBRARY_PATH}"
 
 # Copy in source from build context (defaults to cloned repo, can be overridden)
 # Exclude pyproject.toml and uv.lock since those may be altered by build-custom-vllm.sh

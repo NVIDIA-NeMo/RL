@@ -20,6 +20,7 @@ import copy
 import json
 import math
 import statistics
+import warnings
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -775,8 +776,15 @@ async def run_sample_multi_turn_rollout(
             }
         )
 
-        # Get environment feedback
-        env_output = calculate_rewards(sample_batch, task_to_env)
+        # Get environment feedback.
+        # calculate_rewards uses blocking ray.get internally. Running it
+        # directly on the asyncio event loop (which this coroutine runs on)
+        # blocks every other in-flight rollout coroutine for the entire env
+        # step. In this case, need to wrap with asyncio.to_thread to make
+        # this function yieldable.
+        env_output = await asyncio.to_thread(
+            calculate_rewards, sample_batch, task_to_env
+        )
         # Update total reward and optional per-reward signals (reward1, reward2, ... rewardN)
         if env_output.rewards.ndim == 2 and env_output.rewards.shape[1] >= 1:
             multi_reward_seen = True
@@ -1094,6 +1102,8 @@ def run_async_nemo_gym_rollout(
     greedy: bool = False,
 ) -> AsyncNemoGymRolloutResult:
     """Run multi-turn rollouts with NeMo-Gym. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters."""
+    # We accept max_seq_len for API parity with the other rollout paths, but NeMo-Gym
+    # still relies on the underlying model server's configured context/window limits.
     # We leverage the same `extra_env_info` key as `run_async_multi_turn_rollout`.
     nemo_gym_rows = input_batch["extra_env_info"]
 
@@ -1103,7 +1113,14 @@ def run_async_nemo_gym_rollout(
     assert max_rollout_turns is None, (
         "`max_rollout_turns` is not supported in NeMo-Gym path!"
     )
-    assert max_seq_len is None, "`max_seq_len` is not supported in NeMo-Gym path!"
+    engine_max_model_len = policy_generation.cfg["vllm_cfg"]["max_model_len"]
+    if max_seq_len is not None and max_seq_len > engine_max_model_len:
+        warnings.warn(
+            f"policy max_total_sequence_length ({max_seq_len}) is greater than the "
+            f"generation engine's max_model_len ({engine_max_model_len}). The engine "
+            "will truncate sequences to its own limit, so the policy cap will not be "
+            "honored. Lower max_total_sequence_length or raise the engine's max_model_len."
+        )
     # We don't use these stop criteria
     assert not generation_config["stop_strings"], (
         "Stop strings is not supported in the generation config in NeMo-Gym path!"
@@ -1121,16 +1138,20 @@ def run_async_nemo_gym_rollout(
     timer.start(f"{timer_prefix}/total")
 
     for rowidx, row in enumerate(nemo_gym_rows):
-        # We may need better handling here. The max tokens set here would be the max new generated tokens, not the total max tokens.
-        # Currently, we just rely on the underlying vLLM engine to do the truncation for us using the max model seq len set in the config.
-        # row["max_tokens"] = max_seq_len
-
+        # We do not translate max_seq_len into row-level max_tokens here because that would
+        # change semantics from "total sequence length" to "max new tokens".
         responses_create_params = row["responses_create_params"]
         responses_create_params["temperature"] = generation_config["temperature"]
         responses_create_params["top_p"] = generation_config["top_p"]
 
-        # Max new tokens, just like max_seq_len above is ignored and we rely on the underlying vLLM engine for truncation.
-        # generation_config["max_new_tokens"]
+        # Configure max_output_tokens to respect the max_new_tokens setting.
+        # Will clamp max_output_tokens in vllm_worker_async.py so that input + output <= max_seq_len
+        existing_max_output_tokens = responses_create_params.get("max_output_tokens")
+        responses_create_params["max_output_tokens"] = (
+            min(existing_max_output_tokens, generation_config["max_new_tokens"])
+            if existing_max_output_tokens is not None
+            else generation_config["max_new_tokens"]
+        )
 
         row["_rowidx"] = rowidx
 

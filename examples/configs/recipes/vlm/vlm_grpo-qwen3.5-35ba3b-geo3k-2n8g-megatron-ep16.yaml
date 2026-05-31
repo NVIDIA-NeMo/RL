@@ -5,6 +5,7 @@ loss_fn:
   reference_policy_kl_penalty: 0.0
   use_importance_sampling_correction: true
   truncated_importance_sampling_ratio: 2
+  truncated_importance_sampling_type: tis
 checkpointing:
   checkpoint_dir: results/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-megatron-ep16
 policy:

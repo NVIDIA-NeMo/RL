@@ -121,6 +121,7 @@ class BaseVllmGenerationWorker:
         bundle_indices: Optional[list[int]] = None,
         fraction_of_gpus: float = 1.0,
         seed: Optional[int] = None,
+        extra_env_vars: Optional[list[str]] = None,
     ):
         """Initialize a vLLM worker for distributed inference.
 
@@ -130,6 +131,8 @@ class BaseVllmGenerationWorker:
                           Only needed for the first worker in each tied worker group.
             fraction_of_gpus: Fraction of GPUs to use for this worker
             seed: Random seed for initialization
+            extra_env_vars: Additional environment variable names to forward into
+                          the vLLM worker subprocess (e.g. for quantization configs).
         """
         self.cfg = config
         self.model_name = self.cfg["model_name"]
@@ -212,10 +215,13 @@ class BaseVllmGenerationWorker:
                 "self._init_workers_ray(placement_group)",
                 'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"}',
             ]
+            extra_env_str = ", ".join(
+                [f'"{env_var}"' for env_var in (extra_env_vars or [])]
+            )
 
             new_lines = [
                 f'self._init_workers_ray(placement_group, runtime_env={{"py_executable": "{self.py_executable}"}})',
-                'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "NCCL_CUMEM_ENABLE", "NCCL_NVLS_ENABLE", "RAY_ENABLE_UV_RUN_RUNTIME_ENV"}',
+                f'ADDITIONAL_ENV_VARS = {{"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "NCCL_CUMEM_ENABLE", "NCCL_NVLS_ENABLE", "RAY_ENABLE_UV_RUN_RUNTIME_ENV", {extra_env_str}}}',
             ]
 
             need_replace = False
@@ -253,6 +259,7 @@ class BaseVllmGenerationWorker:
                 "        self.lm_head = ParallelLMHead(\n"
                 "            self.config.draft_vocab_size,\n"
                 "            self.config.hidden_size,\n"
+                "            quant_config=get_draft_quant_config(vllm_config),\n"
                 '            prefix=maybe_prefix(prefix, "lm_head"),\n'
                 "        )\n"
                 "        self.logits_processor = LogitsProcessor(\n"
@@ -262,6 +269,7 @@ class BaseVllmGenerationWorker:
                 "        self.lm_head = ParallelLMHead(\n"
                 "            self.config.draft_vocab_size,\n"
                 "            self.config.hidden_size,\n"
+                "            quant_config=get_draft_quant_config(vllm_config),\n"
                 '            prefix=maybe_prefix(prefix, "lm_head"),\n'
                 "        )\n"
                 "        self.has_own_lm_head = (\n"
@@ -657,10 +665,7 @@ class BaseVllmGenerationWorker:
         return metrics
 
 
-@ray.remote(
-    runtime_env={**get_nsight_config_if_pattern_matches("vllm_generation_worker")}
-)  # pragma: no cover
-class VllmGenerationWorker(BaseVllmGenerationWorker):
+class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
         import vllm
 
@@ -700,10 +705,10 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
         Returns:
             BatchedDataDict conforming to GenerationOutputSpec:
-                - output_ids: input + generated token IDs with proper padding
-                - logprobs: Log probabilities for tokens
-                - generation_lengths: Lengths of each response
-                - unpadded_sequence_lengths: Lengths of each input + generated sequence
+                - ``output_ids``: input + generated token IDs with proper padding
+                - ``logprobs``: Log probabilities for tokens
+                - ``generation_lengths``: Lengths of each response
+                - ``unpadded_sequence_lengths``: Lengths of each input + generated sequence
         """
         # Handle empty input case
         if len(data["input_ids"]) == 0:
@@ -983,7 +988,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         gc.collect()
         torch.cuda.empty_cache()
 
-    def sleep(self):
+    def sleep(self, discard_weights: bool = False):
         """Put the vLLM engine to sleep."""
         assert self.llm is not None, (
             "Attempting to sleep with either an uninitialized vLLM or non-model-owner"
@@ -1006,7 +1011,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
             self.llm.renderer, "clear_mm_cache"
         ):
             self.llm.renderer.clear_mm_cache()
-        self.llm.sleep(level=1)
+        self.llm.sleep(level=2 if discard_weights else 1)
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -1051,3 +1056,10 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         except Exception as e:
             print(f"Error during vLLM shutdown: {e}")
             return False
+
+
+@ray.remote(
+    runtime_env={**get_nsight_config_if_pattern_matches("vllm_generation_worker")}
+)  # pragma: no cover
+class VllmGenerationWorker(VllmGenerationWorkerImpl):
+    pass
