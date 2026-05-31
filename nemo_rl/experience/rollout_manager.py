@@ -111,10 +111,15 @@ class AsyncNemoGymRolloutManager:
             "`max_rollout_turns` is not supported in NeMo-Gym path!"
         )
 
+        # Validate num_generations_per_prompt.
+        assert self._num_generations_per_prompt >= 1, (
+            "`num_generations_per_prompt` must be >= 1!"
+        )
+
     def _build_inputs(self, input_sample: DatumSpec) -> list[dict]:
         """Build N row dicts from input_sample, applying generation config params."""
         # Build a template row from the input_sample's extra_env_info, applying generation params.
-        template_row: dict = input_sample["extra_env_info"]  # type: ignore
+        template_row: dict = copy.deepcopy(input_sample["extra_env_info"])  # type: ignore
 
         # We do not translate max_seq_len into row-level max_tokens here because that would
         # change semantics from "total sequence length" to "max new tokens".
