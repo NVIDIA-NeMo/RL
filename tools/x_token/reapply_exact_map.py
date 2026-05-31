@@ -140,10 +140,15 @@ def parse_arguments():
     return parser.parse_args()
 
 
-if __name__ == "__main__":
-    # Parse command line arguments
-    args = parse_arguments()
-    # Model names from arguments
+def reapply_exact_map(args: argparse.Namespace) -> str:
+    """Overwrite exact-match rows of an existing projection map.
+
+    Rewrites rows of the dense top-k projection so each exact-match
+    student/teacher token pair is encoded as a one-hot assignment
+    (likelihood 1.0 at the matching teacher id, sentinel ``-1`` and
+    weight ``0.0`` everywhere else). Saves the result to
+    ``<input>_exact_map_remapped.pt`` and returns that path.
+    """
     teacher_model_name = args.teacher_model
     student_model_name = args.student_model
     USE_CANONICALIZATION = args.use_canonicalization
@@ -231,3 +236,8 @@ if __name__ == "__main__":
     torch.save(initial_projection_map, save_path)
     print(f"Saved remapped projection map to: {save_path}")
     print(f"remapped {len(match_indices_student)} tokens. Retained remaining {len(non_exact_map_tokens)} tokens as is.")
+    return save_path
+
+
+if __name__ == "__main__":
+    reapply_exact_map(parse_arguments())
