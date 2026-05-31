@@ -43,16 +43,24 @@ logger = logging.getLogger(__name__)
 def _is_port_available(port: int) -> bool:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind(("", port))
         return True
     except OSError:
         return False
 
 
-def _choose_sglang_port(base_gpu_id: int, offset: int = 0) -> int:
+def _choose_sglang_port(
+    base_gpu_id: int, offset: int = 0, launch_attempt: int = 0
+) -> int:
     slurm_job_id = int(os.environ.get("SLURM_JOB_ID", "0") or 0)
-    seed = (slurm_job_id % 500) * 80 + base_gpu_id * 2 + offset
+    rank = int(os.environ.get("RANK", "0") or 0)
+    seed = (
+        (slurm_job_id % 500) * 80
+        + base_gpu_id * 2
+        + offset
+        + rank * 409
+        + launch_attempt * 997
+    )
 
     for attempt in range(2500):
         port = 20000 + ((seed + attempt * 16) % 40000)
@@ -265,12 +273,10 @@ class SGLangGenerationWorker:
         # Get current node IP and per-actor ports for the server. Avoid random
         # ephemeral-port races when many SGLang actors start together.
         node_ip = _get_node_ip_local()
-        free_port = _choose_sglang_port(base_gpu_id, offset=0)
-        grpc_port = _choose_sglang_port(base_gpu_id, offset=1)
 
-        os.environ["SGLANG_GRPC_PORT"] = str(grpc_port)
-
-        # Build SGLang server arguments
+        # Build SGLang server arguments. The HTTP/grpc ports are filled in by the
+        # launch loop below so we can retry with a new pair if a node has a stale
+        # process or another job occupying the first choice.
         kwargs = {
             "model_path": self.sglang_cfg["model_path"],
             "trust_remote_code": True,
@@ -288,9 +294,8 @@ class SGLangGenerationWorker:
             "ep_size": self.sglang_cfg["ep_size"],
             # Always skip warmup to prevent warmup timeout
             "skip_server_warmup": self.sglang_cfg.get("skip_server_warmup", True),
-            # Server network settings - listen on all interfaces, use the free port we found
+            # Server network settings - listen on all interfaces.
             "host": "0.0.0.0",
-            "port": free_port,
             "torchao_config": "",
         }
 
@@ -319,19 +324,40 @@ class SGLangGenerationWorker:
             if key in self.sglang_cfg:
                 kwargs[key] = self.sglang_cfg[key]
 
-        server_args = ServerArgs(**kwargs)
-        # Save server_args and base_url for use in generate() and _make_request()
-        self.server_args = server_args
-        self.base_url = f"http://{node_ip}:{free_port}"
-
-        logger.info(
-            f"[SGLang Worker] Rank {self.global_rank} Starting on {self.base_url}, CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', None)}, base_gpu_id: {base_gpu_id}"
-        )
-
         self.session = None
         self.connector = None
+        launch_error: Optional[Exception] = None
+        max_launch_attempts = int(os.environ.get("NEMO_RL_SGLANG_PORT_RETRIES", "8"))
+        for launch_attempt in range(max_launch_attempts):
+            free_port = _choose_sglang_port(
+                base_gpu_id, offset=0, launch_attempt=launch_attempt
+            )
+            grpc_port = _choose_sglang_port(
+                base_gpu_id, offset=1, launch_attempt=launch_attempt
+            )
+            os.environ["SGLANG_GRPC_PORT"] = str(grpc_port)
+            kwargs["port"] = free_port
 
-        self.server_process = self._launch_server_process(server_args)
+            server_args = ServerArgs(**kwargs)
+            # Save server_args and base_url for use in generate() and _make_request()
+            self.server_args = server_args
+            self.base_url = f"http://{node_ip}:{free_port}"
+
+            logger.info(
+                f"[SGLang Worker] Rank {self.global_rank} Starting on {self.base_url}, CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', None)}, base_gpu_id: {base_gpu_id}, launch_attempt: {launch_attempt}"
+            )
+            try:
+                self.server_process = self._launch_server_process(server_args)
+                break
+            except Exception as exc:
+                launch_error = exc
+                logger.warning(
+                    f"[SGLang Server] Rank {self.global_rank} failed to start on {self.base_url}; retrying with a new port ({launch_attempt + 1}/{max_launch_attempts}): {exc}"
+                )
+        else:
+            raise RuntimeError(
+                f"[SGLang Server] Rank {self.global_rank} failed to start after {max_launch_attempts} port attempts"
+            ) from launch_error
 
     def get_base_url(self) -> str:
         """Get the base URL of this SGLang server."""

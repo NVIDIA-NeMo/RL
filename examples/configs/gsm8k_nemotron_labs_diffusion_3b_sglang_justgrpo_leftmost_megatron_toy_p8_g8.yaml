@@ -1,5 +1,8 @@
 defaults: "gsm8k_nemotron_labs_diffusion_3b_sglang_justgrpo_leftmost_megatron.yaml"
 
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+
 grpo:
   num_prompts_per_step: 8
   num_generations_per_prompt: 8
@@ -10,6 +13,7 @@ grpo:
   val_at_end: false
   max_val_samples: 0
   val_batch_size: 8
+  skip_reference_policy_logprobs_calculation: true
 
 checkpointing:
   save_period: 1
@@ -18,10 +22,10 @@ policy:
   train_global_batch_size: 64
   train_micro_batch_size: 1
   generation_batch_size: 8
-  logprob_batch_size: 1
+  logprob_batch_size: 8
   logprob_estimation:
-    reveal_batch_size: 1
-    train_reveal_batch_size: 1
+    reveal_batch_size: 32
+    train_reveal_batch_size: 8
   generation:
     sglang_cfg:
       max_running_requests: 8

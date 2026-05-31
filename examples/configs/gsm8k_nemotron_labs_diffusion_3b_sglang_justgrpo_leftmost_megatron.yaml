@@ -1,5 +1,8 @@
 defaults: "grpo_math_1B_megatron.yaml"
 
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+
 grpo:
   num_prompts_per_step: 128
   num_generations_per_prompt: 8
@@ -10,11 +13,12 @@ grpo:
   val_at_end: true
   max_val_samples: 2000
   val_batch_size: 128
+  skip_reference_policy_logprobs_calculation: true
 
 checkpointing:
   enabled: true
-  checkpoint_dir: "results/grpo-nemotron-diffusion-3b-ar-megatron"
-  save_period: 100
+  checkpoint_dir: "results/grpo-nemotron-diffusion-3b-justgrpo-leftmost-megatron"
+  save_period: 2
   model_save_format: "safetensors"
   save_consolidated: false
   save_optimizer: true
@@ -24,12 +28,21 @@ policy:
   tokenizer:
     name: ${policy.model_name}
   train_global_batch_size: 1024
-  train_micro_batch_size: 4
+  train_micro_batch_size: 16
   generation_batch_size: 32
-  logprob_batch_size: 4
-  max_total_sequence_length: 16384
+  logprob_batch_size: 32
+  max_total_sequence_length: 1024
   precision: "bfloat16"
-  worker_cls_fqn: "nemo_rl.models.policy.workers.nemotron_diffusion_megatron_policy_worker.NemotronDiffusionMegatronPolicyWorker"
+  worker_cls_fqn: "nemo_rl.models.policy.workers.just_grpo_megatron_policy_worker.JustGRPOMegatronPolicyWorker"
+
+  logprob_estimation:
+    type: "just_grpo_leftmost_reveal"
+    reveal_schedule: "fixed_response_window"
+    megatron_attention_mode: "inference_block_bidirectional"
+    max_reveal_positions: ${policy.generation.max_new_tokens}
+    mask_token_id: 100
+    reveal_batch_size: 32
+    train_reveal_batch_size: 8
 
   dtensor_cfg:
     enabled: false
@@ -86,7 +99,7 @@ policy:
 
   generation:
     backend: "sglang"
-    max_new_tokens: 4096
+    max_new_tokens: 1024
     temperature: 1.0
     top_p: 1.0
     top_k: null
@@ -102,22 +115,25 @@ policy:
       dp_size: 1
       pp_size: 1
       ep_size: 1
-      max_running_requests: 4
-      mem_fraction_static: 0.35
-      max_total_tokens: 12000
+      max_running_requests: 8
+      mem_fraction_static: 0.55
+      max_total_tokens: 20000
       skip_server_warmup: true
+      disable_cuda_graph: true
       disable_piecewise_cuda_graph: true
       attention_backend: "flashinfer"
-      json_model_override_args: '{"ar_mode": true}'
+      json_model_override_args: '{}'
+      dllm_algorithm: "FastDiffuser"
+      dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL/tools/nemotron_diffusion/justgrpo_leftmost_dllm.yaml"
 
 logger:
-  log_dir: "logs/grpo-nemotron-diffusion-3b-instruct-ar-megatron-sglang"
+  log_dir: "logs/grpo-nemotron-diffusion-3b-justgrpo-leftmost-megatron-sglang"
   wandb_enabled: true
   tensorboard_enabled: false
   wandb:
     project: "diffusion_rl"
     mode: "online"
-    name: "grpo-nemotron-diffusion-3b-instruct-ar-megatron-sglang"
+    name: "grpo-nemotron-diffusion-3b-justgrpo-leftmost-megatron-sglang"
 
 runtime_versions:
   nemo_rl:
@@ -152,8 +168,8 @@ data:
   validation:
     dataset_name: gsm8k
     split: test
-  max_input_seq_length: 16384
+  max_input_seq_length: 1024
 
 cluster:
   gpus_per_node: 8
-  num_nodes: 1
+  num_nodes: 8
