@@ -201,10 +201,12 @@ class DTensorConfig(TypedDict):
     # Model config
     lora_cfg: NotRequired[LoRAConfig | LoRAConfigDisabled]
     automodel_kwargs: NotRequired[AutomodelKwargs]
-    # dtype the checkpoint is materialized in, independent of `precision` (the
-    # compute dtype). Defaults to "float32" so the optimizer keeps fp32 master
-    # weights; inference-only workers (a frozen distillation teacher) can set
-    # "bfloat16" to halve initialization and resident parameter memory.
+    # Dtype used when loading weights via from_pretrained. Valid values:
+    # "float32" (default), "bfloat16", "float16". Reference/teacher workers
+    # (init_optimizer=False) can set this to "bfloat16" / "float16" to halve
+    # init-time and resident parameter memory. Trainable workers MUST keep
+    # the default "float32" to preserve master-weight precision; non-float32
+    # is rejected by validate_and_prepare_config when init_optimizer=True.
     load_precision: NotRequired[str]
     # Shard the model before loading its weights instead of loading the
     # unwrapped model first. Lowers peak memory for large checkpoints.
