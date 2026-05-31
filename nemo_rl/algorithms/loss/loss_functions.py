@@ -1237,6 +1237,29 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         )
         return rank_view[mb_start:mb_end]  # [mb_B, T_t, V_t] view, no copy
 
+    @staticmethod
+    def _dp_all_reduce_sum(local: torch.Tensor) -> torch.Tensor:
+        """Sum-reduce a scalar count across the data-parallel group.
+
+        Used to compute ``global_valid_chunks`` from each rank's local
+        chunk count, so the chunk-KL denominator matches the
+        ``sum(global_valid_chunk_kl) / sum(global_valid_chunks)``
+        objective (the same convention CE follows via
+        ``global_valid_toks``). The cross-tokenizer setup asserts
+        ``cp_size=1, tp_size=1`` in
+        ``xtoken_off_policy_distillation.setup``, so the default
+        process group equals the DP group — calling all-reduce on the
+        default group therefore sums across DP only.
+
+        Returns a fresh ``float32`` scalar; the input tensor is not
+        modified. Falls back to a copy of the local value when
+        distributed is not initialized (unit tests).
+        """
+        out = local.detach().to(torch.float32).clone()
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(out)
+        return out
+
     def __call__(
         self,
         data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
@@ -1423,7 +1446,17 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         proj_log_chunks = (proj_chunks + eps).log()
 
         chunk_mask = valid_chunk_mask(proj_sizes, tgt_sizes, pair_valid)
-        if not chunk_mask.any():
+        # Compute the DP-global valid-chunk count BEFORE the early
+        # return so the collective fires on every rank (a local-only
+        # `chunk_mask.any()` check would deadlock when one rank skips
+        # and others do not). The reduction at the bottom uses this
+        # global count so the KL is normalized by
+        # `sum(global_valid_chunks)` rather than a per-rank mean —
+        # mirrors the `global_valid_toks` convention used by CE.
+        sample_mask_bool = data["sample_mask"].bool()
+        valid_bool = chunk_mask & sample_mask_bool.unsqueeze(-1)
+        global_valid_chunks = self._dp_all_reduce_sum(valid_bool.sum())
+        if global_valid_chunks.item() == 0:
             zero = torch.zeros((), device=device, dtype=proj_log_chunks.dtype)
             return (
                 zero,
@@ -1456,7 +1489,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
 
         sample_mask = data["sample_mask"].to(per_chunk_kl.dtype)  # [B]
         valid = chunk_mask.to(per_chunk_kl.dtype) * sample_mask.unsqueeze(-1)
-        denom = valid.sum().clamp(min=1.0)
+        denom = global_valid_chunks.to(per_chunk_kl.dtype).clamp(min=1.0)
         kl_loss = (per_chunk_kl * valid).sum() / denom * (T * T)
         return kl_loss, valid.sum().detach(), proj_acc.detach()
 
@@ -1536,7 +1569,13 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         sample_mask = data["sample_mask"]  # [B]
         valid_chunk = chunk_mask & sample_mask.bool().unsqueeze(-1)
         zero_dtype = student_log_probs.dtype
-        if not valid_chunk.any():
+        # Compute the DP-global valid-chunk count BEFORE any potentially
+        # divergent early return so the collective fires on every rank;
+        # both `kl_common` and `l1_uncommon` use this as their denom so
+        # the loss is normalized by `sum(global_valid_chunks)`, not a
+        # per-rank mean.
+        global_valid_chunks = self._dp_all_reduce_sum(valid_chunk.sum())
+        if global_valid_chunks.item() == 0:
             zero = torch.zeros((), device=device, dtype=zero_dtype)
             return (
                 zero,
@@ -1561,9 +1600,9 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                     reduction="none", log_target=True,
                 )
             kl_per_chunk = kl_per_elem.sum(dim=-1) * valid_chunk  # [B, C]
-            kl_common = kl_per_chunk.sum() / valid_chunk.sum().float().clamp(
-                min=1.0
-            )
+            kl_common = kl_per_chunk.sum() / global_valid_chunks.to(
+                kl_per_chunk.dtype
+            ).clamp(min=1.0)
         else:
             kl_common = torch.zeros(
                 (), device=device, dtype=zero_dtype, requires_grad=True
@@ -1609,7 +1648,9 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 l1_per_chunk = torch.nn.functional.l1_loss(
                     student_sorted, teacher_sorted, reduction="none"
                 ).sum(dim=-1)
-                l1_uncommon = l1_per_chunk.mean()
+                l1_uncommon = l1_per_chunk.sum() / global_valid_chunks.to(
+                    l1_per_chunk.dtype
+                ).clamp(min=1.0)
             else:
                 l1_uncommon = torch.zeros(
                     (), device=device, dtype=zero_dtype, requires_grad=True
