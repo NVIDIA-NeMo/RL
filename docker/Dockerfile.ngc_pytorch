@@ -99,7 +99,7 @@ if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
     cd vllm
     git checkout v$VLLM_VERSION
     python use_existing_torch.py
-    pip install -r requirements/cuda.txt
+    pip install -r requirements/build/cuda.txt
     pip wheel --no-deps --no-build-isolation -v .
 else
     echo "Skipping vLLM build for PyTorch base image"
