@@ -90,7 +90,7 @@ class AsyncNemoGymRolloutManager:
         """Validate initialization parameters."""
         # Validate generation config.
         for key in ["stop_strings", "stop_token_ids", "top_k"]:
-            assert not self._generation_config[key], (
+            assert not self._generation_config[key], (  # type: ignore
                 f"{key} is not supported in the generation config in NeMo-Gym path!"
             )
 

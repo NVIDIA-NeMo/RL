@@ -18,6 +18,8 @@ import ray
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.generation.sglang.config import SglangSpecificArgs
+from nemo_rl.models.generation.vllm.config import VllmSpecificArgs
 
 
 def verify_right_padding(
@@ -127,6 +129,12 @@ class GenerationConfig(TypedDict):
     stop_token_ids: list[int] | None
     stop_strings: list[str] | None
     colocated: NotRequired[ColocationConfig]
+
+    # backend-specific configs
+    vllm_cfg: NotRequired[VllmSpecificArgs]
+    sglang_cfg: NotRequired[SglangSpecificArgs]
+    mcore_generation_config: NotRequired[dict[str, Any]]
+
     # This isn't meant to be passed by the user, but is populated by nemo_rl.models.generation.__init__.configure_generation_config
     _pad_token_id: NotRequired[int]
 
