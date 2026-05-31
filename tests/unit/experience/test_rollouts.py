@@ -993,6 +993,11 @@ def test_async_nemo_gym_rollout_manager(
     - output is a PromptGroupRecord with N Completion objects
     - each Completion has a reward (float) and a non-empty message_log
     - completions hold independent message_log objects
+
+    If the result here does not match, please check the following:
+    1. Test data changed: re-run test_nemo_gym_sanity (tests/unit/environments/test_nemo_gym.py)
+       and use _write_actual_test_data output to refresh test_nemo_gym_sanity.json.
+    2. Logic changed: inspect recent changes to AsyncNemoGymRolloutManager or the gym env.
     """
     with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
         for data in nemo_gym_sanity_test_data["input"]:
@@ -1074,6 +1079,8 @@ def test_async_nemo_gym_rollout_manager_matches_original(
     Calls run_async_nemo_gym_rollout with a batch of N identical rows,
     then calls AsyncNemoGymRolloutManager with 1 prompt, N generations.
     Asserts that both produce N results and rewards are in the same numeric domain.
+
+    TODO: remove this test together with run_async_nemo_gym_rollout when the legacy path is deleted.
     """
     with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
         for data in nemo_gym_sanity_test_data["input"]:
