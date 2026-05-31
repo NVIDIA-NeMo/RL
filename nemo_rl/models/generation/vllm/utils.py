@@ -20,6 +20,8 @@ import torch
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 
+R3_MISSING_ROUTE_SENTINEL = -1
+
 
 def format_prompt_for_vllm_generation(
     data: BatchedDataDict[GenerationDatumSpec], sample_idx: Optional[int] = None
@@ -105,7 +107,9 @@ def normalize_routed_experts_for_generation_output(
     padded_length: int,
     device: torch.device,
     require_complete_routed_experts: bool = False,
-) -> Optional[torch.Tensor]:
+    allow_missing_routed_experts_fallback: bool = True,
+    return_stats: bool = False,
+) -> Optional[torch.Tensor] | tuple[Optional[torch.Tensor], dict[str, int]]:
     """Return full-sequence-aligned routed experts as ``[S, L, topk]`` int32."""
     routed = getattr(completion_output, "routed_experts", None)
     prompt_routed = getattr(request_output, "prompt_routed_experts", None)
@@ -122,16 +126,30 @@ def normalize_routed_experts_for_generation_output(
     elif prompt_routed is not None:
         routed = prompt_routed
 
+    expected_rows = min(max(valid_length - 1, 0), padded_length)
+    stats = {
+        "actual_rows": 0,
+        "expected_rows": expected_rows,
+        "missing_rows": 0,
+        "surplus_rows": 0,
+    }
+
     if routed is None:
-        return None
+        return (None, stats) if return_stats else None
     if routed.dim() != 3:
         raise ValueError(
             "vLLM routed_experts must have shape [tokens, num_moe_layers, topk], "
             f"got {tuple(routed.shape)}"
         )
 
-    expected_rows = min(max(valid_length - 1, 0), padded_length)
-    if require_complete_routed_experts and routed.shape[0] < expected_rows:
+    stats["actual_rows"] = int(routed.shape[0])
+    stats["missing_rows"] = max(expected_rows - int(routed.shape[0]), 0)
+    stats["surplus_rows"] = max(int(routed.shape[0]) - (expected_rows + 1), 0)
+    if (
+        require_complete_routed_experts
+        and stats["missing_rows"] > 0
+        and not allow_missing_routed_experts_fallback
+    ):
         num_cached_tokens = getattr(request_output, "num_cached_tokens", None)
         raise ValueError(
             "vLLM returned incomplete routed_experts for router replay: "
@@ -166,7 +184,9 @@ def normalize_routed_experts_for_generation_output(
     rows_to_copy = min(expected_rows, routed.shape[0])
     if rows_to_copy > 0:
         full[:rows_to_copy] = routed[:rows_to_copy].to(device=device)
-    return full
+    if stats["missing_rows"] > 0:
+        full[rows_to_copy:expected_rows] = R3_MISSING_ROUTE_SENTINEL
+    return (full, stats) if return_stats else full
 
 
 def aggregate_spec_decode_counters(

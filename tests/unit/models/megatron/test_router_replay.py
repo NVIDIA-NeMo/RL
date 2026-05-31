@@ -801,3 +801,76 @@ def test_build_router_replay_tensors_rejects_duplicate_topk_rows_when_enabled(
             build_router_replay_tensors(model, routed_experts)
     finally:
         RouterReplay.clear_global_router_replay_instances()
+
+
+@pytest.mark.mcore
+def test_router_replay_missing_route_sentinel_uses_megatron_topk():
+    from megatron.core.transformer.moe.router_replay import (
+        RouterReplay,
+        RouterReplayAction,
+    )
+
+    from nemo_rl.models.megatron.router_replay import (
+        _install_missing_route_fallback_patch,
+    )
+
+    RouterReplay.clear_global_router_replay_instances()
+
+    def default_compute_topk(scores, topk, num_groups=None, group_topk=None):
+        return torch.topk(scores, k=topk, dim=1)
+
+    try:
+        replay = RouterReplay()
+        scores = torch.tensor(
+            [
+                [0.1, 0.9, 0.2],
+                [0.4, 0.2, 0.8],
+            ],
+            dtype=torch.float32,
+        )
+        target = torch.tensor([[1, 2], [-1, -1]], dtype=torch.long)
+        expected_default = torch.topk(scores, k=2, dim=1).indices
+        expected_mixed = torch.stack([target[0], expected_default[1]])
+
+        _install_missing_route_fallback_patch()
+        replay.set_target_indices(target)
+        replay.set_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+        _, forward_indices = replay.get_replay_topk(
+            scores, 2, default_compute_topk=default_compute_topk
+        )
+
+        assert torch.equal(forward_indices, expected_mixed)
+        assert torch.equal(replay.replay_backward_list[0], expected_mixed)
+
+        replay.set_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
+        _, backward_indices = replay.get_replay_topk(
+            scores, 2, default_compute_topk=default_compute_topk
+        )
+
+        assert torch.equal(backward_indices, expected_mixed)
+        assert replay.replay_backward_list == []
+    finally:
+        RouterReplay.clear_global_router_replay_instances()
+
+
+@pytest.mark.mcore
+def test_router_replay_validation_allows_all_negative_fallback_rows(monkeypatch):
+    from nemo_rl.models.megatron.router_replay import _validate_replay_tensor
+
+    monkeypatch.setenv("NRL_ROUTER_REPLAY_VALIDATE", "1")
+    model_config = SimpleNamespace(num_moe_experts=4)
+
+    _validate_replay_tensor(
+        torch.tensor([[-1, -1], [0, 1]], dtype=torch.long),
+        model_config,
+        layer_number=1,
+        payload_idx=0,
+    )
+
+    with pytest.raises(ValueError, match="all--1 sentinel"):
+        _validate_replay_tensor(
+            torch.tensor([[-1, 1]], dtype=torch.long),
+            model_config,
+            layer_number=1,
+            payload_idx=0,
+        )

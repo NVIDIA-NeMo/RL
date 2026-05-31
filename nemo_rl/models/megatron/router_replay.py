@@ -27,6 +27,8 @@ from nemo_rl.utils.r3_trace import (
 )
 
 _ROUTER_REPLAY_VALIDATE_ENV = "NRL_ROUTER_REPLAY_VALIDATE"
+_MISSING_ROUTE_SENTINEL = -1
+_MISSING_ROUTE_FALLBACK_PATCH_ATTR = "_nrl_missing_route_fallback_patch"
 
 
 def router_replay_enabled(config: PolicyConfig) -> bool:
@@ -60,6 +62,7 @@ def validate_router_replay_config(config: PolicyConfig) -> None:
         raise ValueError(
             "router_replay.enabled does not support virtual pipeline parallelism yet."
         )
+    _install_missing_route_fallback_patch()
 
 
 def _iter_model_modules(model: Any) -> Iterable[Any]:
@@ -199,6 +202,21 @@ def _validate_replay_tensor(
     if replay_tensor.numel() == 0 or not _router_replay_validation_enabled():
         return
 
+    missing_route_mask = replay_tensor.eq(_MISSING_ROUTE_SENTINEL).all(dim=-1)
+    partial_missing_mask = replay_tensor.lt(0).any(dim=-1) & ~missing_route_mask
+    if bool(partial_missing_mask.any().item()):
+        bad_row = int(partial_missing_mask.nonzero()[0].item())
+        bad_sample = replay_tensor[bad_row].detach().cpu().tolist()
+        raise ValueError(
+            "routed_experts fallback rows must use the all--1 sentinel. "
+            f"layer_number={layer_number}, payload_idx={payload_idx}, "
+            f"row={bad_row}, sample={bad_sample}, shape={tuple(replay_tensor.shape)}"
+        )
+
+    replay_tensor = replay_tensor[~missing_route_mask]
+    if replay_tensor.numel() == 0:
+        return
+
     sorted_indices = replay_tensor.sort(dim=-1).values
     duplicate_mask = sorted_indices[..., 1:] == sorted_indices[..., :-1]
     has_duplicate_topk = duplicate_mask.any()
@@ -227,6 +245,107 @@ def _validate_replay_tensor(
             f"layer_number={layer_number}, payload_idx={payload_idx}, "
             f"shape={tuple(replay_tensor.shape)}"
         )
+
+
+def _install_missing_route_fallback_patch() -> None:
+    from megatron.core.transformer.moe.router_replay import (
+        RouterReplay,
+        RouterReplayAction,
+    )
+
+    if getattr(RouterReplay.get_replay_topk, _MISSING_ROUTE_FALLBACK_PATCH_ATTR, False):
+        return
+
+    original_get_replay_topk = RouterReplay.get_replay_topk
+
+    def wrapped_get_replay_topk(
+        replay_instance: Any,
+        scores: torch.Tensor,
+        topk: int,
+        num_groups: Optional[int] = None,
+        group_topk: Optional[int] = None,
+        default_compute_topk: Optional[Any] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        action = getattr(replay_instance, "router_replay_action", None)
+        if action not in {
+            RouterReplayAction.REPLAY_FORWARD,
+            RouterReplayAction.REPLAY_BACKWARD,
+        }:
+            return original_get_replay_topk(
+                replay_instance,
+                scores,
+                topk,
+                num_groups,
+                group_topk,
+                default_compute_topk,
+            )
+
+        if action == RouterReplayAction.REPLAY_FORWARD:
+            target_topk_idx = getattr(replay_instance, "target_topk_idx", None)
+        else:
+            replay_backward_list = getattr(replay_instance, "replay_backward_list", [])
+            target_topk_idx = replay_backward_list[0] if replay_backward_list else None
+
+        if target_topk_idx is None:
+            return original_get_replay_topk(
+                replay_instance,
+                scores,
+                topk,
+                num_groups,
+                group_topk,
+                default_compute_topk,
+            )
+
+        target_topk_idx = target_topk_idx.to(scores.device)
+        fallback_mask = target_topk_idx.eq(_MISSING_ROUTE_SENTINEL).all(dim=-1)
+        if not bool(fallback_mask.any().item()):
+            setattr(replay_instance, "_nrl_last_router_replay_fallback_mask", None)
+            setattr(replay_instance, "_nrl_last_router_replay_effective_topk_idx", None)
+            return original_get_replay_topk(
+                replay_instance,
+                scores,
+                topk,
+                num_groups,
+                group_topk,
+                default_compute_topk,
+            )
+
+        if default_compute_topk is None:
+            raise RuntimeError(
+                "RouterReplay missing-route fallback requires default_compute_topk."
+            )
+
+        _, default_indices = default_compute_topk(
+            scores,
+            topk,
+            num_groups=num_groups,
+            group_topk=group_topk,
+        )
+        effective_topk_idx = target_topk_idx.clone()
+        effective_topk_idx[fallback_mask] = default_indices[fallback_mask]
+        probs = scores.gather(1, effective_topk_idx)
+
+        if action == RouterReplayAction.REPLAY_FORWARD:
+            replay_backward_list = getattr(replay_instance, "replay_backward_list", [])
+            if replay_backward_list:
+                replay_backward_list[-1] = effective_topk_idx.detach()
+        else:
+            getattr(replay_instance, "replay_backward_list").pop(0)
+
+        setattr(
+            replay_instance,
+            "_nrl_last_router_replay_fallback_mask",
+            fallback_mask.detach(),
+        )
+        setattr(
+            replay_instance,
+            "_nrl_last_router_replay_effective_topk_idx",
+            effective_topk_idx.detach(),
+        )
+        return probs, effective_topk_idx
+
+    setattr(wrapped_get_replay_topk, _MISSING_ROUTE_FALLBACK_PATCH_ATTR, True)
+    RouterReplay.get_replay_topk = wrapped_get_replay_topk
 
 
 def _get_tensor_model_parallel_world_size() -> int:
@@ -350,6 +469,7 @@ def build_router_replay_assignments(
 def set_router_replay_forward(model: Any, routed_experts: torch.Tensor) -> None:
     from megatron.core.transformer.moe.router_replay import RouterReplayAction
 
+    _install_missing_route_fallback_patch()
     for replay_instance, replay_tensor in build_router_replay_assignments(
         model, routed_experts
     ):

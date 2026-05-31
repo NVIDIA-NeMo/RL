@@ -55,6 +55,33 @@ from nemo_rl.utils.timer import Timer
 TokenizerType = PreTrainedTokenizerBase
 
 
+def _add_r3_fallback_metrics(
+    gen_metrics: dict[str, float | int],
+    generation_outputs: BatchedDataDict,
+) -> None:
+    missing = generation_outputs.get("r3_routed_experts_missing_rows")
+    if missing is None:
+        return
+
+    missing_cpu = missing.detach().cpu()
+    expected = generation_outputs.get("r3_routed_experts_expected_rows")
+    actual = generation_outputs.get("r3_routed_experts_actual_rows")
+    expected_cpu = expected.detach().cpu() if expected is not None else None
+    actual_cpu = actual.detach().cpu() if actual is not None else None
+
+    missing_rows = int(missing_cpu.sum().item())
+    fallback_samples = int((missing_cpu > 0).sum().item())
+    expected_rows = int(expected_cpu.sum().item()) if expected_cpu is not None else 0
+    actual_rows = int(actual_cpu.sum().item()) if actual_cpu is not None else 0
+    gen_metrics["r3/routed_experts_fallback_samples"] = fallback_samples
+    gen_metrics["r3/routed_experts_fallback_token_rows"] = missing_rows
+    gen_metrics["r3/routed_experts_expected_token_rows"] = expected_rows
+    gen_metrics["r3/routed_experts_actual_token_rows"] = actual_rows
+    gen_metrics["r3/routed_experts_fallback_token_row_fraction"] = (
+        float(missing_rows / expected_rows) if expected_rows > 0 else 0.0
+    )
+
+
 def _attach_routed_experts_to_message_log_prefix(
     message_log: list[dict],
     routed_experts: torch.Tensor,
@@ -173,6 +200,7 @@ def generate_responses(
         "mean_generation_length": generation_lengths.float().mean().item(),
         "total_generated_tokens": generation_lengths.sum().item(),
     }
+    _add_r3_fallback_metrics(gen_metrics, generation_outputs)
 
     # Add response_truncated to gen_metrics for use by caller
     if response_truncated is not None:
@@ -288,6 +316,7 @@ async def generate_responses_async(
         "mean_generation_length": generation_lengths.float().mean().item(),
         "total_generated_tokens": generation_lengths.sum().item(),
     }
+    _add_r3_fallback_metrics(gen_metrics, generation_outputs)
     # Attach worker metadata if present (async vLLM path)
     if "gen_leader_worker_idx" in generation_outputs:
         # generation_outputs carries this as a 1-length list per row; convert to int

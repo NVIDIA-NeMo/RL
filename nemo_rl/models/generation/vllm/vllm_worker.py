@@ -14,6 +14,7 @@
 
 import copy
 import gc
+import logging
 import os
 import sys
 from contextlib import contextmanager
@@ -43,6 +44,8 @@ from nemo_rl.models.generation.vllm.utils import (
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _resolve_enable_prefix_caching(vllm_cfg: dict[str, Any]) -> bool:
@@ -803,6 +806,9 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         output_ids_list = []
         logprobs_list = []
         routed_experts_list = []
+        r3_missing_rows = []
+        r3_expected_rows = []
+        r3_actual_rows = []
         generation_lengths = []
         unpadded_sequence_lengths = []
         truncated_list = []  # Track if response was truncated (hit max_tokens)
@@ -853,19 +859,24 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             logprobs_list.append(full_logprobs)
 
             response_length = sequence_length + len(generated_tokens)
-            full_routed_experts = normalize_routed_experts_for_generation_output(
+            full_routed_experts, r3_stats = normalize_routed_experts_for_generation_output(
                 output,
                 generation,
                 valid_length=response_length,
                 padded_length=total_length,
                 device=input_ids.device,
                 require_complete_routed_experts=return_routed_experts,
+                return_stats=True,
             )
             if return_routed_experts and full_routed_experts is None:
                 raise RuntimeError(
                     "vLLM was asked to return routed experts but the generation output "
                     "did not include routed_experts."
                 )
+            if return_routed_experts:
+                r3_missing_rows.append(r3_stats["missing_rows"])
+                r3_expected_rows.append(r3_stats["expected_rows"])
+                r3_actual_rows.append(r3_stats["actual_rows"])
             if full_routed_experts is not None:
                 routed_experts_list.append(full_routed_experts)
 
@@ -883,6 +894,23 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         # Create return data conforming to GenerationOutputSpec
         output_ids = torch.stack(output_ids_list)
         logprobs = torch.stack(logprobs_list)
+        if r3_missing_rows and sum(r3_missing_rows) > 0:
+            bad_samples = [
+                f"{idx}:missing={missing},actual={actual},expected={expected}"
+                for idx, (missing, actual, expected) in enumerate(
+                    zip(r3_missing_rows, r3_actual_rows, r3_expected_rows)
+                )
+                if missing > 0
+            ][:8]
+            LOGGER.warning(
+                "R3 router replay fallback: vLLM returned incomplete routed_experts "
+                "for %d/%d samples, missing_token_rows=%d. Megatron will use its "
+                "own router for those missing token rows. samples=[%s]",
+                sum(1 for missing in r3_missing_rows if missing > 0),
+                len(r3_missing_rows),
+                sum(r3_missing_rows),
+                "; ".join(bad_samples),
+            )
 
         return_data = BatchedDataDict[GenerationOutputSpec](
             {
@@ -899,6 +927,16 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         )
         if routed_experts_list:
             return_data["routed_experts"] = torch.stack(routed_experts_list)
+        if r3_missing_rows:
+            return_data["r3_routed_experts_missing_rows"] = torch.tensor(
+                r3_missing_rows, dtype=torch.long
+            )
+            return_data["r3_routed_experts_expected_rows"] = torch.tensor(
+                r3_expected_rows, dtype=torch.long
+            )
+            return_data["r3_routed_experts_actual_rows"] = torch.tensor(
+                r3_actual_rows, dtype=torch.long
+            )
 
         return return_data
 

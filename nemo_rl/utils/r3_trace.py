@@ -200,6 +200,23 @@ def _tensors_equal(lhs: Any, rhs: Any) -> bool:
     return bool(torch.equal(lhs, rhs.to(device=lhs.device, dtype=lhs.dtype)))
 
 
+def _expected_with_missing_route_fallback(expected: Any, actual: Any) -> tuple[Any, int]:
+    if expected is None or actual is None:
+        return expected, 0
+    if not hasattr(expected, "shape") or list(expected.shape) != list(actual.shape):
+        return expected, 0
+
+    expected = expected.to(device=actual.device, dtype=actual.dtype)
+    fallback_mask = expected.eq(-1).all(dim=-1)
+    fallback_rows = int(fallback_mask.sum().item())
+    if fallback_rows == 0:
+        return expected, 0
+
+    patched = expected.clone()
+    patched[fallback_mask] = actual[fallback_mask]
+    return patched, fallback_rows
+
+
 def _router_replay_action_name(action: Any) -> str:
     value = getattr(action, "value", None)
     if value is not None:
@@ -223,7 +240,12 @@ def _trace_router_replay_topk_use(
         return
 
     action_name = _router_replay_action_name(action)
-    matches = expected is not None and _tensors_equal(actual, expected)
+    expected_for_match, fallback_rows = _expected_with_missing_route_fallback(
+        expected, actual
+    )
+    matches = expected_for_match is not None and _tensors_equal(
+        actual, expected_for_match
+    )
     record: dict[str, Any] = {
         "event": "router_replay_forward_verify",
         "stage": ctx["stage"],
@@ -234,6 +256,7 @@ def _trace_router_replay_topk_use(
         "scores_shape": _shape(scores),
         "actual": _tensor_record(actual),
         "matches_expected": matches,
+        "fallback_rows": fallback_rows,
     }
     if backward_list_len_before is not None:
         record["replay_backward_list_len_before"] = int(backward_list_len_before)

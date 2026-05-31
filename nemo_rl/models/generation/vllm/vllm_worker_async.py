@@ -15,6 +15,7 @@
 import asyncio
 import copy
 import gc
+import logging
 import threading
 import time
 import uuid
@@ -44,6 +45,8 @@ from nemo_rl.models.generation.vllm.utils import (
     normalize_routed_experts_for_generation_output,
 )
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _replace_prefix_tokens(
@@ -1031,18 +1034,46 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
                 "truncated": truncated_tensor,
             }
-            routed_experts = normalize_routed_experts_for_generation_output(
+            routed_experts, r3_stats = normalize_routed_experts_for_generation_output(
                 final_request_output,
                 generation_details,
                 valid_length=unpadded_total_length,
                 padded_length=final_output_tensor_len,
                 device=original_input_ids_single_row.device,
                 require_complete_routed_experts=return_routed_experts,
+                return_stats=True,
             )
             if return_routed_experts and routed_experts is None:
                 raise RuntimeError(
                     "vLLM was asked to return routed experts but the generation output "
                     "did not include routed_experts."
+                )
+            if return_routed_experts:
+                if r3_stats["missing_rows"] > 0:
+                    LOGGER.warning(
+                        "R3 router replay fallback: vLLM returned incomplete "
+                        "routed_experts for sample_idx=%d, missing_token_rows=%d, "
+                        "actual_rows=%d, expected_rows=%d. Megatron will use its "
+                        "own router for those missing token rows.",
+                        sample_idx,
+                        r3_stats["missing_rows"],
+                        r3_stats["actual_rows"],
+                        r3_stats["expected_rows"],
+                    )
+                result_dict["r3_routed_experts_missing_rows"] = torch.tensor(
+                    [r3_stats["missing_rows"]],
+                    dtype=torch.long,
+                    device=original_input_ids_single_row.device,
+                )
+                result_dict["r3_routed_experts_expected_rows"] = torch.tensor(
+                    [r3_stats["expected_rows"]],
+                    dtype=torch.long,
+                    device=original_input_ids_single_row.device,
+                )
+                result_dict["r3_routed_experts_actual_rows"] = torch.tensor(
+                    [r3_stats["actual_rows"]],
+                    dtype=torch.long,
+                    device=original_input_ids_single_row.device,
                 )
             if routed_experts is not None:
                 result_dict["routed_experts"] = routed_experts.unsqueeze(0)

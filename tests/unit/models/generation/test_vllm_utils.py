@@ -19,6 +19,7 @@ import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.vllm.utils import (
+    R3_MISSING_ROUTE_SENTINEL,
     aggregate_spec_decode_counters,
     compute_spec_decode_metrics,
     format_prompt_for_vllm_generation,
@@ -222,7 +223,41 @@ def test_normalize_routed_experts_keeps_final_token_dummy_even_if_vllm_returns_r
     assert torch.equal(routed_experts[2:], expected_default_route.expand(1, 2, 3))
 
 
-def test_normalize_routed_experts_strict_mode_rejects_missing_rows():
+def test_normalize_routed_experts_strict_mode_marks_missing_rows_for_fallback():
+    class Output:
+        pass
+
+    request_output = Output()
+    request_output.num_cached_tokens = 4
+    completion_output = Output()
+    completion_output.routed_experts = torch.ones(2, 1, 2, dtype=torch.int32)
+
+    routed_experts, stats = normalize_routed_experts_for_generation_output(
+        request_output,
+        completion_output,
+        valid_length=6,
+        padded_length=6,
+        device=torch.device("cpu"),
+        require_complete_routed_experts=True,
+        return_stats=True,
+    )
+
+    assert stats == {
+        "actual_rows": 2,
+        "expected_rows": 5,
+        "missing_rows": 3,
+        "surplus_rows": 0,
+    }
+    assert torch.equal(routed_experts[:2], completion_output.routed_experts)
+    assert torch.equal(
+        routed_experts[2:5],
+        torch.full((3, 1, 2), R3_MISSING_ROUTE_SENTINEL, dtype=torch.int32),
+    )
+    expected_default_route = torch.tensor([0, 1], dtype=torch.int32).view(1, 1, 2)
+    assert torch.equal(routed_experts[5:], expected_default_route)
+
+
+def test_normalize_routed_experts_can_reject_missing_rows_when_fallback_disabled():
     class Output:
         pass
 
@@ -239,6 +274,7 @@ def test_normalize_routed_experts_strict_mode_rejects_missing_rows():
             padded_length=6,
             device=torch.device("cpu"),
             require_complete_routed_experts=True,
+            allow_missing_routed_experts_fallback=False,
         )
 
 
