@@ -1042,6 +1042,7 @@ def from_parallel_logits_to_same_position_logprobs(
     chunk_size: Optional[int] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
     position_shift: int = 0,
+    exclude_token_id: Optional[int] = None,
 ) -> torch.Tensor:
     """Get logprobs for target tokens at selected sequence positions.
 
@@ -1075,6 +1076,12 @@ def from_parallel_logits_to_same_position_logprobs(
     gather_positions = (target_positions + int(position_shift)).clamp(min=0, max=seq_len - 1)
     row_indices = torch.arange(batch_size, device=vocab_parallel_logits.device)
     selected_logits = vocab_parallel_logits[row_indices, gather_positions, :]
+    if (
+        exclude_token_id is not None
+        and vocab_start_index <= exclude_token_id < vocab_end_index
+    ):
+        selected_logits = selected_logits.clone()
+        selected_logits[:, exclude_token_id - vocab_start_index] = -torch.inf
 
     if need_top_k_or_top_p_filtering(sampling_params):
         token_logprobs: torch.Tensor = DistributedLogprobWithSampling.apply(  # type: ignore

@@ -115,10 +115,18 @@ run_training() {
   export NEMO_RL_GIT_BRANCH="$(git -C "${REPO_DIR}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
   export NEMO_RL_GIT_COMMIT="$(git -C "${REPO_DIR}" rev-parse HEAD 2>/dev/null || echo unknown)"
   export NEMO_RL_GIT_STATUS_COUNT="$(git -C "${REPO_DIR}" status --short 2>/dev/null | wc -l | tr -d ' ')"
-  sglang_source_line="$(grep 'sglang = .*slgang-nemotron-diffusion' pyproject.toml | head -1)"
+  sglang_source_line_with_number="$(grep -n -E 'sglang = .*(git =|path =)' pyproject.toml | head -1 || true)"
+  sglang_source_line="${sglang_source_line_with_number#*:}"
+  sglang_path="$(printf '%s\n' "${sglang_source_line}" | sed -n 's/.*path = "\([^"]*\)".*/\1/p')"
   export SGLANG_GIT_URL="$(printf '%s\n' "${sglang_source_line}" | sed -n 's/.*git = "\([^"]*\)".*/\1/p')"
   export SGLANG_GIT_COMMIT="$(printf '%s\n' "${sglang_source_line}" | sed -n 's/.*rev = "\([^"]*\)".*/\1/p')"
   export SGLANG_GIT_SUBDIRECTORY="$(printf '%s\n' "${sglang_source_line}" | sed -n 's/.*subdirectory = "\([^"]*\)".*/\1/p')"
+  if [[ -n "${sglang_path}" ]]; then
+    sglang_repo_path="${sglang_path%/python}"
+    export SGLANG_GIT_URL="${sglang_path}"
+    export SGLANG_GIT_COMMIT="$(git -C "${sglang_repo_path}" rev-parse HEAD 2>/dev/null || echo unknown)"
+    export SGLANG_GIT_SUBDIRECTORY="python"
+  fi
   export MEGATRON_BRIDGE_GIT_PATH="$(realpath 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge)"
   export MEGATRON_BRIDGE_GIT_BRANCH="$(git -C "${MEGATRON_BRIDGE_GIT_PATH}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
   export MEGATRON_BRIDGE_GIT_COMMIT="$(git -C "${MEGATRON_BRIDGE_GIT_PATH}" rev-parse HEAD 2>/dev/null || echo unknown)"
@@ -128,7 +136,7 @@ run_training() {
   export MEGATRON_LM_GIT_COMMIT="$(git -C "${MEGATRON_LM_GIT_PATH}" rev-parse HEAD 2>/dev/null || echo unknown)"
   export MEGATRON_LM_GIT_STATUS_COUNT="$(git -C "${MEGATRON_LM_GIT_PATH}" status --short 2>/dev/null | wc -l | tr -d ' ')"
 
-  echo "SGLANG_SOURCE=$(grep -n 'sglang = .*slgang-nemotron-diffusion' pyproject.toml || true)"
+  echo "SGLANG_SOURCE=${sglang_source_line_with_number}"
   echo "MEGATRON_BRIDGE_WORKSPACE=$(realpath 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge)"
   git -C 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge rev-parse --abbrev-ref HEAD || true
   git -C 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge rev-parse HEAD || true

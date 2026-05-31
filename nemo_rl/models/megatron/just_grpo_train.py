@@ -80,11 +80,9 @@ class JustGRPOLossPostProcessor(LossPostProcessor):
             tp_grp = get_tensor_model_parallel_group()
             tp_rank = get_tensor_model_parallel_rank()
             logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
-            position_shift = int(
-                self.cfg.get("logprob_estimation", {}).get(
-                    "logits_position_shift", 0
-                )
-            )
+            logprob_estimation_cfg = self.cfg.get("logprob_estimation", {})
+            position_shift = int(logprob_estimation_cfg.get("logits_position_shift", 0))
+            mask_token_id = logprob_estimation_cfg.get("mask_token_id", None)
 
             token_logprobs = from_parallel_logits_to_same_position_logprobs(
                 output_tensor,
@@ -97,6 +95,7 @@ class JustGRPOLossPostProcessor(LossPostProcessor):
                 chunk_size=logprob_chunk_size,
                 sampling_params=self.sampling_params,
                 position_shift=position_shift,
+                exclude_token_id=mask_token_id,
             )
 
             loss_mask = data_dict["just_grpo_loss_mask"]
@@ -121,6 +120,7 @@ class JustGRPOLossPostProcessor(LossPostProcessor):
                         chunk_size=logprob_chunk_size,
                         sampling_params=None,
                         position_shift=position_shift,
+                        exclude_token_id=mask_token_id,
                     )
                 )
                 data_dict["curr_logprobs_unfiltered"] = token_logprobs_unfiltered
@@ -197,11 +197,9 @@ class JustGRPOLogprobsPostProcessor(LogprobsPostProcessor):
             tp_grp = get_tensor_model_parallel_group()
             tp_rank = get_tensor_model_parallel_rank()
             logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
-            position_shift = int(
-                self.cfg.get("logprob_estimation", {}).get(
-                    "logits_position_shift", 0
-                )
-            )
+            logprob_estimation_cfg = self.cfg.get("logprob_estimation", {})
+            position_shift = int(logprob_estimation_cfg.get("logits_position_shift", 0))
+            mask_token_id = logprob_estimation_cfg.get("mask_token_id", None)
             token_logprobs = from_parallel_logits_to_same_position_logprobs(
                 output_tensor,
                 target_positions=data_dict["just_grpo_target_positions"],
@@ -213,6 +211,7 @@ class JustGRPOLogprobsPostProcessor(LogprobsPostProcessor):
                 chunk_size=logprob_chunk_size,
                 sampling_params=self.sampling_params,
                 position_shift=position_shift,
+                exclude_token_id=mask_token_id,
             )
             if need_top_k_or_top_p_filtering(self.sampling_params):
                 token_logprobs = mask_out_neg_inf_logprobs(
