@@ -149,3 +149,134 @@ def test_D2_response_dataset_config_declares_arrow_text_keys(key: str):
         f"ResponseDatasetConfig (declared keys: {sorted(declared)}). "
         f"Reviewer asked for explicit declaration."
     )
+
+
+# ---------------------------------------------------------------------------
+# _pack_generator — packing semantics.
+#
+# Important: ``_pack_generator`` packs by **characters_per_sample**
+# (character count, NOT token count or max_seq_length), emits a pack as
+# soon as ``n >= characters_per_sample`` (so a pack can exceed the
+# threshold by the size of the last appended row), and does NOT truncate
+# any individual row. Empty-text filtering lives upstream in
+# ``ArrowTextDataset`` — feeding empty rows directly into
+# ``_pack_generator`` will still emit (empty) packs. The D1 tests above
+# cover the upstream filtering.
+# ---------------------------------------------------------------------------
+
+
+from datasets import Dataset  # noqa: E402
+
+
+def _packs_from(rows: list[dict], chars: int, task_name: str = "kd") -> list[dict]:
+    from nemo_rl.data.datasets.response_datasets.arrow_text_dataset import (
+        _pack_generator,
+    )
+
+    ds = Dataset.from_list(rows)
+    return list(
+        _pack_generator(
+            raw=ds,
+            text_key="text",
+            characters_per_sample=chars,
+            task_name=task_name,
+        )
+    )
+
+
+class TestPackGenerator:
+    def test_emits_when_threshold_met(self):
+        # 3 rows of 4 chars each = 12 total; threshold 10. After row 3
+        # (n=12 >= 10), one pack is emitted with all 3 rows joined.
+        rows = [{"text": "aaaa"}, {"text": "bbbb"}, {"text": "cccc"}]
+        packs = _packs_from(rows, chars=10)
+        assert len(packs) == 1
+        # Pack contains all three texts joined by newline.
+        assert packs[0]["text"] == "aaaa\nbbbb\ncccc"
+        # task_name forwarded into the emitted dict.
+        assert packs[0]["task_name"] == "kd"
+        # `messages` schema mirrors the source contract.
+        assert packs[0]["messages"] == [
+            {"role": "assistant", "content": "aaaa\nbbbb\ncccc"}
+        ]
+
+    def test_pack_may_exceed_threshold(self):
+        # Two rows of 100 chars each, threshold 10 → first row alone
+        # crosses the threshold, so each row becomes its own ~100-char
+        # pack. The emitted pack content is ALLOWED to exceed
+        # characters_per_sample.
+        rows = [{"text": "x" * 100}, {"text": "y" * 100}]
+        packs = _packs_from(rows, chars=10)
+        assert len(packs) == 2
+        assert len(packs[0]["text"]) == 100
+        assert len(packs[1]["text"]) == 100
+
+    def test_long_row_not_truncated(self):
+        # A single row of 10k chars, threshold 10 → one pack containing
+        # the full 10k chars. _pack_generator does NOT truncate rows.
+        rows = [{"text": "z" * 10_000}]
+        packs = _packs_from(rows, chars=10)
+        assert len(packs) == 1
+        assert len(packs[0]["text"]) == 10_000
+
+    def test_trailing_partial_pack_emitted(self):
+        # Three rows of 2 chars each (n=6 total) with threshold 10 — no
+        # pack reaches the threshold mid-loop, so the for-loop emits
+        # nothing. The trailing `if buf:` clause emits the accumulated
+        # partial pack.
+        rows = [{"text": "ab"}, {"text": "cd"}, {"text": "ef"}]
+        packs = _packs_from(rows, chars=10)
+        assert len(packs) == 1
+        assert packs[0]["text"] == "ab\ncd\nef"
+
+    def test_zero_rows_emits_zero_packs(self):
+        # Truly empty input (no rows at all) → no packs, no raise.
+        packs = _packs_from([], chars=10)
+        assert packs == []
+
+    def test_all_empty_text_rows_still_emit_pack(self):
+        # _pack_generator does NOT filter empty strings — that's
+        # ArrowTextDataset's job (covered by test_D1_*). Feeding empty
+        # rows directly emits a (mostly-empty) trailing pack consisting
+        # of newline separators only.
+        rows = [{"text": ""}, {"text": ""}]
+        packs = _packs_from(rows, chars=10)
+        # Exactly one trailing partial pack, containing only the join
+        # separator(s).
+        assert len(packs) == 1
+        assert packs[0]["text"] == "\n"
+
+    def test_schema_version_does_not_change_output(self):
+        # `schema_version` is `del`'d inside the function and only
+        # affects the HF cache fingerprint — it must NOT alter the
+        # emitted rows.
+        rows = [{"text": "aaaa"}, {"text": "bbbb"}, {"text": "cccc"}]
+        from nemo_rl.data.datasets.response_datasets.arrow_text_dataset import (
+            _pack_generator,
+        )
+
+        ds = Dataset.from_list(rows)
+        packs_v1 = list(
+            _pack_generator(
+                raw=ds,
+                text_key="text",
+                characters_per_sample=10,
+                task_name="kd",
+                schema_version="messages-v1",
+            )
+        )
+        packs_v2 = list(
+            _pack_generator(
+                raw=ds,
+                text_key="text",
+                characters_per_sample=10,
+                task_name="kd",
+                schema_version="messages-v9999",
+            )
+        )
+        assert packs_v1 == packs_v2
+
+    def test_task_name_forwarded(self):
+        rows = [{"text": "hello world"}]
+        packs = _packs_from(rows, chars=5, task_name="my-task")
+        assert packs[0]["task_name"] == "my-task"
