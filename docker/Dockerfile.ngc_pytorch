@@ -169,9 +169,6 @@ fi
 # to warm the uv cache, then at the end just sync the default dependencies.
 # Do everything in one layer to prevent large layers.
 
-# The venv is symlinked to avoid bloating the layer size
-uv venv --system-site-packages ${UV_PROJECT_ENVIRONMENT}
-uv pip install --no-cache-dir --no-deps /tmp/build_vllm/vllm/vllm*.whl
 # Ensure nvshmem is installed before building DeepEP
 uv sync --link-mode symlink --locked --inexact --no-install-project $UV_NO_INSTALL_PACKAGES
 uv sync --link-mode symlink --locked --inexact --extra vllm --no-install-project $UV_NO_INSTALL_PACKAGES
