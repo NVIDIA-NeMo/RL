@@ -148,11 +148,6 @@ COPY --from=nemo-rl tools/build-custom-vllm.sh ./tools/build-custom-vllm.sh
 COPY --from=nemo-rl tools/build-custom-flashinfer.sh ./tools/build-custom-flashinfer.sh
 COPY --from=nemo-rl --link research/ ./research/
 COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
-# The NGC base image ships Python 3.12 (cp312); lower the project constraint in all
-# workspace members so uv uses system Python rather than downloading an incompatible one.
-RUN find . -name "pyproject.toml" -exec sed -i 's/requires-python = ">=3\.13\.13"/requires-python = ">=3.12"/' {} \; && \
-    sed -i 's/requires-python = ">=3\.13\.13"/requires-python = ">=3.12"/' uv.lock && \
-    find . -name ".python-version" -exec sed -i 's/3\.13\.13/3.12.3/' {} \;
 
 RUN --mount=type=ssh \
     --mount=type=bind,from=build_vllm,source=/opt,target=/tmp/build_vllm,readonly \
