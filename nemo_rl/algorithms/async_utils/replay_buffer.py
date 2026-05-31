@@ -62,9 +62,8 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             self.trajectories.append(trajectory)
             self.trajectory_versions.append(weight_version)
             self.target_weight_versions.append(target_weight_version)
-            self.last_target_weight_already_generated = max(
-                self.last_target_weight_already_generated, target_weight_version
-            )
+            # Do not advance last_target_weight_already_generated here. A target
+            # is only safe to skip once training consumes a complete batch for it.
             print(
                 f"ReplayBuffer state: {len(self.trajectories)} groups, versions={self.trajectory_versions}, targets={self.target_weight_versions}, last_target_weight_already_generated={self.last_target_weight_already_generated}"
             )
@@ -207,6 +206,20 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             # Remove selected items in reverse order to maintain correct indices
             sampled_items = [self.trajectories[i] for i in selected]
             self._remove_indices(selected)
+
+            old_last_target = self.last_target_weight_already_generated
+            self.last_target_weight_already_generated = max(
+                self.last_target_weight_already_generated,
+                current_weight_version,
+            )
+            if self.last_target_weight_already_generated > old_last_target:
+                print(
+                    "Advanced last_target_weight_already_generated: "
+                    f"{old_last_target} -> "
+                    f"{self.last_target_weight_already_generated} "
+                    f"(consumed batch for step {current_weight_version})"
+                )
+
             print(
                 f"🗑️ Consumed and removed {len(selected)} groups from buffer, old buffer size: {total_trajectories}, new buffer size: {len(self.trajectories)}, new target weight versions {self.target_weight_versions}"
             )

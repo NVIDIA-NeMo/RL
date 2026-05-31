@@ -28,6 +28,7 @@ os.environ["RAY_TEMP_DIR"] = _temp_dir
 os.environ["RAY_TMPDIR"] = _temp_dir  # Alternative env var
 os.environ["TMPDIR"] = _temp_dir  # System temp dir
 
+import nemo_rl.algorithms.async_utils.trajectory_collector as trajectory_collector_mod
 from nemo_rl.algorithms.async_utils import (
     AsyncTrajectoryCollector,
     ReplayBuffer,
@@ -384,6 +385,7 @@ class TestReplayBuffer:
         # But we pushed with target_weight_version=i+1, so trajectory at i=1 has target=2
         sampled_trajectory = sample_result["trajectories"][0]
         assert sampled_trajectory["batch"]["data"] == "test1"
+        assert ray.get(buffer.get_last_target_weight_already_generated.remote()) == 2
 
         ray.kill(buffer)
 
@@ -407,6 +409,45 @@ class TestReplayBuffer:
         )
 
         assert sample_result is None  # Should return None when insufficient
+        assert ray.get(buffer.get_last_target_weight_already_generated.remote()) == -1
+
+        ray.kill(buffer)
+
+    def test_replay_buffer_watermark_advances_only_after_consumption(self):
+        """Test buffering alone does not mark a target as consumed."""
+        buffer = ReplayBuffer.remote(max_size=10)
+
+        trajectory1 = {"batch": {"data": "test1"}, "rollout_metrics": {}}
+        trajectory2 = {"batch": {"data": "test2"}, "rollout_metrics": {}}
+
+        ray.get(
+            buffer.add.remote(trajectory1, weight_version=4, target_weight_version=5)
+        )
+        assert ray.get(buffer.get_last_target_weight_already_generated.remote()) == -1
+
+        sample_result = ray.get(
+            buffer.sample.remote(
+                num_prompt_groups=2,
+                current_weight_version=5,
+                max_age_steps=1,
+            )
+        )
+        assert sample_result is None
+        assert ray.get(buffer.get_last_target_weight_already_generated.remote()) == -1
+
+        ray.get(
+            buffer.add.remote(trajectory2, weight_version=4, target_weight_version=5)
+        )
+        sample_result = ray.get(
+            buffer.sample.remote(
+                num_prompt_groups=2,
+                current_weight_version=5,
+                max_age_steps=1,
+            )
+        )
+
+        assert sample_result is not None
+        assert ray.get(buffer.get_last_target_weight_already_generated.remote()) == 5
 
         ray.kill(buffer)
 
@@ -555,7 +596,7 @@ class TestReplayBuffer:
         assert state["trajectories"][1]["batch"]["data"] == "test2"
         assert state["trajectory_versions"] == [5, 6]
         assert state["target_weight_versions"] == [6, 7]
-        assert state["last_target_weight_already_generated"] == 7
+        assert state["last_target_weight_already_generated"] == -1
         assert state["max_size"] == 10
 
         ray.kill(buffer)
@@ -586,7 +627,7 @@ class TestReplayBuffer:
         debug_info = ray.get(buffer2.get_debug_info.remote())
         assert debug_info["trajectory_versions"] == [5, 6]
         assert debug_info["target_weight_versions"] == [6, 7]
-        assert ray.get(buffer2.get_last_target_weight_already_generated.remote()) == 7
+        assert ray.get(buffer2.get_last_target_weight_already_generated.remote()) == -1
 
         ray.kill(buffer2)
 
@@ -1036,6 +1077,25 @@ class TestReplayBufferNew:
 class TestAsyncTrajectoryCollector:
     """Test cases for AsyncTrajectoryCollector."""
 
+    def create_local_collector(self, replay_buffer=None):
+        """Create a non-Ray collector instance for unit-testing local state."""
+        collector_cls = AsyncTrajectoryCollector.__ray_metadata__.modified_class
+        mock_generation = MockGenerationInterface()
+        mock_tokenizer = mock.MagicMock()
+        task_to_env = {}
+        master_config = self.create_mock_config()
+        if replay_buffer is None:
+            replay_buffer = mock.MagicMock()
+
+        return collector_cls(
+            policy_generation=mock_generation,
+            tokenizer=mock_tokenizer,
+            task_to_env=task_to_env,
+            master_config=master_config,
+            replay_buffer=replay_buffer,
+            start_step=0,
+        )
+
     def create_mock_config(self) -> MasterConfig:
         """Create a mock master config for testing."""
         config = {
@@ -1198,6 +1258,89 @@ class TestAsyncTrajectoryCollector:
         ray.kill(collector)
         ray.kill(buffer)
         ray.kill(mock_env)
+
+    def test_maybe_release_target_waits_for_spawning_to_close(self):
+        """Test fast workers do not release a target while spawning is open."""
+        collector = self.create_local_collector()
+        target_weight = 5
+
+        collector._generating_targets.add(target_weight)
+        collector._spawning_targets.add(target_weight)
+        collector._spawned_per_target[target_weight] = 1
+        collector._completed_per_target[target_weight] = 1
+        collector._buffered_per_target[target_weight] = 1
+
+        collector._maybe_release_target(target_weight)
+
+        assert target_weight in collector._generating_targets
+        assert collector._spawned_per_target[target_weight] == 1
+        assert collector._completed_per_target[target_weight] == 1
+        assert collector._buffered_per_target[target_weight] == 1
+
+        collector._spawning_targets.remove(target_weight)
+        collector._maybe_release_target(target_weight)
+
+        assert target_weight not in collector._generating_targets
+        assert target_weight not in collector._spawned_per_target
+        assert target_weight not in collector._completed_per_target
+        assert target_weight not in collector._buffered_per_target
+
+    def test_process_batch_releases_target_when_worker_start_fails(self, monkeypatch):
+        """Test start failures do not leave a target reserved forever."""
+
+        class RemoteMethod:
+            def __init__(self, value):
+                self.value = value
+
+            def remote(self, *args, **kwargs):
+                return self.value
+
+        class FakeReplayBuffer:
+            def __init__(self):
+                self.get_trajectories_needed = RemoteMethod(1)
+
+        class FakeBatch:
+            size = 1
+
+            def slice(self, start, end):
+                return self
+
+            def repeat_interleave(self, repeats):
+                return self
+
+        class FailingThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                raise RuntimeError("thread start failed")
+
+            def is_alive(self):
+                return False
+
+        target_weight = 5
+        collector = self.create_local_collector(replay_buffer=FakeReplayBuffer())
+        collector.running = True
+
+        def reserve_target(generation_weight_version):
+            collector._generating_targets.add(target_weight)
+            return target_weight
+
+        collector._get_next_target_for_generation = reserve_target
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
+        monkeypatch.setattr(
+            trajectory_collector_mod._threading,
+            "Thread",
+            FailingThread,
+        )
+
+        collector._process_batch(FakeBatch())
+
+        assert target_weight not in collector._generating_targets
+        assert target_weight not in collector._spawning_targets
+        assert target_weight not in collector._spawned_per_target
+        assert target_weight not in collector._completed_per_target
+        assert target_weight not in collector._buffered_per_target
 
     def test_dataloader_state_retrieval(self):
         """Test getting dataloader state for checkpointing."""
