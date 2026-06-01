@@ -51,6 +51,7 @@ policy:
     freeze_indexer_query_projection: false
     fp8_ds_mla_fake_quant_kv: false
     fp8_ds_mla_fake_quant_o_proj: false
+    expert_dtype: fp8
   train_global_batch_size: 512
   train_micro_batch_size: 1
   logprob_batch_size: 1
@@ -125,17 +126,20 @@ policy:
     vllm_cfg:
       precision: fp8
       kv_cache_dtype: fp8_ds_mla
+      # vLLM internal data-parallel = expert_parallel_size / tensor_parallel_size.
+      # EP=32/TP=8 -> internal DP=4, which may deadlock generation
+      # under DP load imbalance (vLLM V1 DP dummy-batch lockstep hangs on a gloo
+      # collective; see vllm-project/vllm#41530). EP=8/TP=8 -> DP=1 removes the
+      # lockstep and avoids the hang (tradeoff: 32 experts/rank, more memory).
       tensor_parallel_size: 8
-      expert_parallel_size: 32
+      expert_parallel_size: 8
       enable_expert_parallel: true
-      gpu_memory_utilization: 0.5
+      gpu_memory_utilization: 0.6
       enforce_eager: true
       max_model_len: ${policy.max_total_sequence_length}
       use_deep_gemm: true
     vllm_kwargs:
       tokenizer_mode: deepseek_v4
-      hf_overrides:
-        expert_dtype: fp8
 
 data:
   max_input_seq_length: 1024

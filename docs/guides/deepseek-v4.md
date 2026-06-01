@@ -5,8 +5,8 @@ works today, how to reproduce a reference run, the limitations you should expect
 and what we are working on next.
 
 > [!WARNING]
-> **Status: Functional Ready.** DeepSeek V4 Flash Base is runnable and has been numerically
-> validated with a short run, but it is **not yet validated for long-run
+> **Status: Functional Ready.** DeepSeek V4 Flash is runnable and has been numerically
+> validated with a short run on both base and non-base checkpoints, but it is **not yet validated for long-run
 > convergence**. Expect the known issues described [below](#known-issues) — in
 > particular, long runs can crash around step ~100 due to a train/inference
 > mismatch. Treat this as an early-access integration, not a production recipe.
@@ -20,7 +20,7 @@ We track model support in two stages:
 | **Functional Ready** | Runnable end-to-end and numerically validated with a short run. |
 | **Long-run convergence validated** | Trains stably over a full-length run with a healthy, reproducible reward curve. |
 
-DeepSeek V4 Flash Base is currently **Functional Ready**. Reaching long-run convergence is
+DeepSeek V4 Flash is currently **Functional Ready**. Reaching long-run convergence is
 our top priority — see [What's Next](#whats-next).
 
 ## What's Supported
@@ -28,7 +28,7 @@ our top priority — see [What's Next](#whats-next).
 | Model | Training backend | Parallelism | Inference backend | Status |
 | --- | --- | --- | --- | --- |
 | `deepseek-ai/DeepSeek-V4-Flash-Base` | AutoModel (DTensor) | Expert Parallel (EP) only | vLLM (FP8) | ✅ Functional Ready |
-| `deepseek-ai/DeepSeek-V4-Flash` | AutoModel (DTensor) | Expert Parallel (EP) only | vLLM (FP8) | 🚧 Expected to work; short run in progress |
+| `deepseek-ai/DeepSeek-V4-Flash` | AutoModel (DTensor) | Expert Parallel (EP) only | vLLM (FP8) | ✅ Functional Ready |
 
 Current scope and limitations:
 
@@ -101,6 +101,22 @@ The following curves were produced with the reference recipe above
 (DeepSeek-V4-Flash-Base, DAPO Math, 8× H100 nodes):
 
 ![DeepSeek-V4-Flash-Base GRPO reward curve on DAPO Math](../assets/dsv4-flash-base-dapo.png)
+
+### Running the non-base Flash (FP4) checkpoint
+
+The reference recipe targets `DeepSeek-V4-Flash-Base`, whose experts are stored in
+**FP8**. The non-base `deepseek-ai/DeepSeek-V4-Flash` checkpoint stores experts in
+**FP4 (mxfp4)** instead, so two settings differ from the reference recipe:
+
+- **Set `policy.hf_config_overrides.expert_dtype: fp8`.** This forces vLLM to
+  dummy-load the FP8 (base) expert layout so the BF16→FP8 weight refit can write into
+  it. Without it, vLLM defaults to FP4 experts and refit fails with a shape/dtype mismatch (packed-`int32` params vs `bfloat16` loaded weights).
+- **Do not pin the training-side layout to `base`.** Leave
+  `NEMO_AUTOMODEL_DSV4_EXPERT_LAYOUT` unset so AutoModel auto-detects FP4 from the
+  checkpoint (or set it explicitly to `flash`); `base` is only for the FP8 checkpoint.
+
+In short: AutoModel loads the FP4 checkpoint (dequantized to BF16 for training), vLLM
+serves the FP8/base layout, and the FP8 refit bridges the two each step.
 
 ## Known Issues
 
