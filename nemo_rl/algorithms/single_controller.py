@@ -268,9 +268,7 @@ class SingleControllerActor:
                     self._inflight_rollouts -= 1
 
         tasks = [
-            asyncio.ensure_future(
-                _one_group(self._prompts[i % len(self._prompts)])
-            )
+            asyncio.ensure_future(_one_group(self._prompts[i % len(self._prompts)]))
             for i in range(n)
         ]
         await asyncio.gather(*tasks)

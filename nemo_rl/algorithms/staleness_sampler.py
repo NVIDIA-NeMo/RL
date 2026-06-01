@@ -164,9 +164,7 @@ def count_prompt_groups(
 ) -> int:
     """Count complete prompt groups represented by ``meta``."""
     return sum(
-        1
-        for group in _prompt_groups(meta, generations_per_prompt)
-        if group.is_complete
+        1 for group in _prompt_groups(meta, generations_per_prompt) if group.is_complete
     )
 
 
