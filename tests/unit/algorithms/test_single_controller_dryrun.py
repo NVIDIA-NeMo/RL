@@ -51,10 +51,7 @@ from nemo_rl.algorithms.single_controller import (
     SingleControllerActor,
     SingleControllerConfig,
 )
-from nemo_rl.algorithms.staleness_sampler import (
-    StalenessSampler,
-    StrictOnPolicyBatchSampler,
-)
+from nemo_rl.algorithms.staleness_sampler import StalenessSampler
 from nemo_rl.data_plane import KVBatchMeta
 
 # ── Fake in-memory DataPlane ──────────────────────────────────────────────
@@ -655,7 +652,7 @@ class TestSingleControllerDryRun:
 
     def test_strict_on_policy_batch_sampler_requires_exact_version(self):
         """Strict sampler waits for a full batch at the trainer version."""
-        sampler = StrictOnPolicyBatchSampler()
+        sampler = StalenessSampler(max_staleness_versions=0)
         meta = _meta_with_versions([4, 5, 5, 6])
 
         assert (
@@ -676,7 +673,7 @@ class TestSingleControllerDryRun:
 
     def test_strict_on_policy_batch_sampler_evicts_old_groups(self):
         """Strict sampler marks complete old-version groups for eviction."""
-        sampler = StrictOnPolicyBatchSampler()
+        sampler = StalenessSampler(max_staleness_versions=0)
         meta = _meta_with_versions([4, 5, 4])
 
         assert sampler.evictable_indices(

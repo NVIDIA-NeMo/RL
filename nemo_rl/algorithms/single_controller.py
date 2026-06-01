@@ -27,7 +27,7 @@ DataPlane. Model tensors still move through DataPlane or NCCL.
 Data flow:
   _rollout_pump  → gen.generate_and_push(prompt, dp_client) ← RPC to GenWorker
                      GenWorker → dp_client.put_samples(...)
-  _train_pump    → dp_client.claim_meta(...) → BatchSelectionStrategy
+  _train_pump    → dp_client.claim_meta(...) → StalenessSampler
                  → _advantage_pump(meta) → dp_client.get_samples(...)
                                         → adv_estimator.compute_advantage(...)
                                         → dp_client.put_samples(...)
@@ -50,9 +50,7 @@ import torch
 from tensordict import TensorDict
 
 from nemo_rl.algorithms.staleness_sampler import (
-    BatchSelectionStrategy,
-    StalenessWindowSelection,
-    StrictOnPolicyBatchSampler,
+    StalenessSampler,
     count_prompt_groups,
     min_weight_version,
 )
@@ -153,14 +151,18 @@ class SingleControllerActor:
                 "advantage_enabled=True requires an advantage_estimator instance"
             )
 
+        # Initialize sampler
+        assert cfg.batch_selection_strategy in [
+            "strict_on_policy",
+            "staleness_window",
+        ], f"Unknown batch_selection_strategy: {cfg.batch_selection_strategy}"
+
         if cfg.batch_selection_strategy == "strict_on_policy":
-            self._sampler: BatchSelectionStrategy = StrictOnPolicyBatchSampler()
-        elif cfg.batch_selection_strategy == "staleness_window":
-            self._sampler = StalenessWindowSelection(cfg.max_weight_staleness_versions)
-        else:
-            raise ValueError(
-                f"Unknown batch_selection_strategy: {cfg.batch_selection_strategy}"
+            cfg.max_weight_staleness_versions = 0
+            print(
+                "Using strict_on_policy, auto setting max_weight_staleness_versions to 0."
             )
+        self._sampler = StalenessSampler(cfg.max_weight_staleness_versions)
 
         # ── asyncio state ──────────────────────────────────────────────────
         # Gate: cleared during _sync_weights, set when generation may proceed
@@ -287,7 +289,7 @@ class SingleControllerActor:
         Flow per step:
           1. claim_meta() — temporary consuming metadata acquisition
           2. Evict sample_ids no longer eligible under the selected policy
-          3. BatchSelectionStrategy.select_indices() — choose full prompt groups
+          3. StalenessSampler.select_indices() — choose full prompt groups
           4. _advantage_pump() — fetch, compute advantages, write back
           5. trainer.train_on_meta(KVBatchMeta, dp_client) — trainer fetches tensors
           6. clear_samples(sample_ids) — SC removes consumed rows
