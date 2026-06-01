@@ -8,8 +8,8 @@ source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=3
-STEPS_PER_RUN=100
-MAX_STEPS=100
+STEPS_PER_RUN=10
+MAX_STEPS=10
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))
 NUM_MINUTES=240
 # ===== END CONFIG =====
@@ -30,3 +30,12 @@ uv run examples/run_grpo.py \
     2>&1 | tee $RUN_LOG
 
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
+
+# Only run metrics if the target step is reached
+if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
+    uv run tests/check_metrics.py $JSON_METRICS \
+        'mean(data["train/reward"]) > 0.50' \
+        'median(data["train/token_mult_prob_error"]) < 1.1' \
+        "data[\"train/token_mult_prob_error\"][\"${MAX_STEPS}\"] < 1.1" \
+        'mean(data["timing/train/total_step_time"], -6, -1) < 300'
+fi
