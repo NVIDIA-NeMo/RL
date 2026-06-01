@@ -42,7 +42,7 @@ def configure_generation_config(
 
     # vllm setting
     if config["backend"] == "vllm":
-        config = cast(VllmConfig, config)
+        config = cast(VllmConfig, config)  # type: ignore
         # set load_format
         config["vllm_cfg"]["load_format"] = "auto" if is_eval else "dummy"
         speculative_config = config.get("vllm_kwargs", {}).get("speculative_config")
