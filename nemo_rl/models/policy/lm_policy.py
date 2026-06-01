@@ -145,6 +145,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     config["dtensor_cfg"].get("lora_cfg", {}).get("enabled", False)
                     is False
                 ), "LoRA is not supported for DTensorPolicyWorker V1"
+                if config["dtensor_cfg"].get("dp_replicate_size", 1) > 1:
+                    raise ValueError(
+                        "dp_replicate_size > 1 requires policy.dtensor_cfg._v2: true "
+                        "(Automodel DTensor v2 backend). HSDP is not supported with the "
+                        "V1 DTensor worker."
+                    )
                 worker_builder_cls_fqn = resolve_policy_worker_cls(
                     "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker",
                     config,
