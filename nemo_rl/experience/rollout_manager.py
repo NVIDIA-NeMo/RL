@@ -126,13 +126,15 @@ class AsyncNemoGymRolloutManager:
         responses_create_params = template_row["responses_create_params"]
         responses_create_params["temperature"] = self._generation_config["temperature"]
         responses_create_params["top_p"] = self._generation_config["top_p"]
-        if self._generation_config["max_new_tokens"] is not None:
-            existing = responses_create_params.get("max_output_tokens")
-            responses_create_params["max_output_tokens"] = (
-                min(existing, self._generation_config["max_new_tokens"])
-                if existing is not None
-                else self._generation_config["max_new_tokens"]
-            )
+
+        # Configure max_output_tokens to respect the max_new_tokens setting.
+        # Will clamp max_output_tokens in vllm_worker_async.py so that input + output <= max_seq_len
+        existing = responses_create_params.get("max_output_tokens")
+        responses_create_params["max_output_tokens"] = (
+            min(existing, self._generation_config["max_new_tokens"])
+            if existing is not None
+            else self._generation_config["max_new_tokens"]
+        )
 
         # Build N rows with distinct rowidxs so run_rollouts can sort them correctly.
         rows = []
