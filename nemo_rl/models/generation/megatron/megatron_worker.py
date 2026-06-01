@@ -401,10 +401,46 @@ class MegatronGenerationMixin:
         """Return this worker's OpenAI server base URL (None if not the leader)."""
         return self.base_url
 
+    def _build_sampling_params(
+        self, greedy: bool, stop_words: Optional[list[str]]
+    ) -> SamplingParams:
+        """Build mcore SamplingParams for a single request."""
+        top_k_cfg = self.cfg["generation"]["top_k"]
+        top_k_val = 1 if greedy else (int(top_k_cfg) if top_k_cfg is not None else 0)
+
+        top_p_cfg = self.cfg["generation"]["top_p"]
+        top_p_val = (
+            0.0 if greedy else (float(top_p_cfg) if top_p_cfg is not None else 0.0)
+        )
+
+        return SamplingParams(
+            temperature=self.cfg["generation"]["temperature"] if not greedy else 0,
+            top_k=top_k_val,
+            top_p=top_p_val,
+            skip_prompt_log_probs=False,
+            return_log_probs=True,
+            num_tokens_to_generate=self.cfg["generation"]["max_new_tokens"],
+            termination_id=self.megatron_tokenizer.eod,
+            stop_words=stop_words,
+        )
+
+    def _merge_stop_strings(
+        self, batch_stop_strings: Optional[list[Optional[list[str]]]]
+    ) -> Optional[list[str]]:
+        """Union the config's stop_strings with the given per-sample stop strings."""
+        stop_set: set[str] = set()
+        if self.cfg["generation"]["stop_strings"]:
+            stop_set.update(self.cfg["generation"]["stop_strings"])
+        if batch_stop_strings is not None:
+            for sample_ss in batch_stop_strings:
+                if sample_ss:
+                    stop_set.update(sample_ss)
+        return list(stop_set) if stop_set else None
+
     def _prepare_data_for_generation(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
-    ) -> tuple[torch.Tensor, torch.Tensor, SamplingParams]:
-        """Build the prompt tensors and sampling params for one batch of requests."""
+    ) -> tuple[torch.Tensor, torch.Tensor, list[SamplingParams]]:
+        """Build the prompt tensors and a per-request SamplingParams for each sample."""
         if data is not None:
             assert isinstance(data, BatchedDataDict), (
                 f"data must be a BatchedDataDict, got type: {type(data)}"
@@ -417,26 +453,19 @@ class MegatronGenerationMixin:
                     f"Input to Megatron Generation worker is not properly right-padded: {error_msg}"
                 )
 
-        top_k_cfg = self.cfg["generation"]["top_k"]
-        top_k_val = 1 if greedy else (int(top_k_cfg) if top_k_cfg is not None else 0)
-
-        top_p_cfg = self.cfg["generation"]["top_p"]
-        top_p_val = (
-            0.0 if greedy else (float(top_p_cfg) if top_p_cfg is not None else 0.0)
-        )
-
-        sampling_params = SamplingParams(
-            temperature=self.cfg["generation"]["temperature"] if not greedy else 0,
-            top_k=top_k_val,
-            top_p=top_p_val,
-            skip_prompt_log_probs=False,
-            return_log_probs=True,
-            num_tokens_to_generate=self.cfg["generation"]["max_new_tokens"],
-            termination_id=self.megatron_tokenizer.eod,
-        )
-
         prompt_tokens_tensor = data["input_ids"].cuda()
         prompt_lengths_tensor = data["input_lengths"]
+
+        batch_stop_strings = data.get("stop_strings", [])
+        sampling_params = []
+        for i in range(prompt_tokens_tensor.size(0)):
+            sample_stop_strings = (
+                batch_stop_strings[i] if i < len(batch_stop_strings) else None
+            )
+            stop_words = self._merge_stop_strings(
+                [sample_stop_strings] if sample_stop_strings else None
+            )
+            sampling_params.append(self._build_sampling_params(greedy, stop_words))
 
         return prompt_tokens_tensor, prompt_lengths_tensor, sampling_params
 
@@ -579,7 +608,7 @@ class MegatronGenerationMixin:
         self,
         prompt_tokens_tensor: torch.Tensor,
         prompt_lengths_tensor: torch.Tensor,
-        sampling_params: SamplingParams,
+        sampling_params: list[SamplingParams],
     ) -> list:
         """Submit requests through the persistent inference client (rank 0 only)."""
         from megatron.core.inference.inference_request import DynamicInferenceRequest
@@ -594,11 +623,13 @@ class MegatronGenerationMixin:
         )
 
         futures = []
-        for prompt_tokens, prompt_len in zip(
-            prompt_tokens_tensor, prompt_lengths_tensor, strict=True
+        for prompt_tokens, prompt_len, request_sampling_params in zip(
+            prompt_tokens_tensor, prompt_lengths_tensor, sampling_params, strict=True
         ):
             prompt = prompt_tokens[: prompt_len.item()].tolist()
-            futures.append(self.inference_client.add_request(prompt, sampling_params))
+            futures.append(
+                self.inference_client.add_request(prompt, request_sampling_params)
+            )
 
         results: list[DynamicInferenceRequest] = await asyncio.gather(*futures)
         print(f"[Rank {dist_rank}] Completed {len(results)} requests")
