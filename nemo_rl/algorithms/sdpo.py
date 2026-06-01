@@ -1317,6 +1317,9 @@ def sdpo_train(
                     print("Timeout reached, stopping training early.", flush=True)
                     return
 
+                if total_steps >= max_num_steps:
+                    break
+
         current_epoch += 1
         current_step = 0
         sdpo_save_state["current_epoch"] = current_epoch
