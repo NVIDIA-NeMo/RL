@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, AsyncGenerator, Optional
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
 
 import ray
 from transformers import AutoProcessor
@@ -28,31 +28,42 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.megatron.config import MCoreGenerationConfig
 from nemo_rl.models.policy import PolicyConfig
 
+if TYPE_CHECKING:
+    from nemo_rl.models.policy.lm_policy import Policy
+
 
 class MegatronGeneration(GenerationInterface):
-    """Generation interface backed by Megatron for non-colocated inference."""
+    """Generation interface backed by Megatron (colocated or non-colocated)."""
 
     def __init__(
         self,
-        cluster: RayVirtualCluster,
         config: PolicyConfig,
         tokenizer: PreTrainedTokenizerBase,
+        cluster: Optional[RayVirtualCluster] = None,
+        policy: Optional["Policy"] = None,
         name_prefix: str = "megatron_generation",
         processor: Optional[AutoProcessor] = None,
         weights_path: Optional[str] = None,
     ):
         """Initialize a MegatronGeneration instance.
 
+        Exactly one of `cluster` or `policy` must be provided.
+
         Args:
-            cluster: The RayVirtualCluster to deploy inference workers on.
             config: PolicyConfig for the Megatron model.
             tokenizer: The tokenizer for the model.
-            name_prefix: Prefix for naming the worker group.
-            processor: Optional processor for VLMs.
-            weights_path: Optional path to model weights for initialization.
+            cluster: Cluster to deploy a dedicated inference Policy on.
+            policy: Existing training Policy to reuse for generation.
+            name_prefix: Prefix for naming the worker group (non-colocated only).
+            processor: Optional processor for VLMs (non-colocated only).
+            weights_path: Optional path to model weights (non-colocated only).
         """
         # Import here to avoid circular imports
         from nemo_rl.models.policy.lm_policy import Policy
+
+        assert (cluster is None) != (policy is None), (
+            "Provide exactly one of `cluster` or `policy`."
+        )
 
         # `self.cfg` exposes the `generation` that matches the `GenerationInterface` contract.
         # `self._policy_config` keeps a reference to the full PolicyConfig.
@@ -61,12 +72,15 @@ class MegatronGeneration(GenerationInterface):
         # Populated after the first prepare_for_generation (which starts the HTTP server).
         self.dp_openai_server_base_urls: list[Optional[str]] = []
 
-        # Need to update the megatron_cfg with the mcore_generation_config parameters.
-        self._policy_config["megatron_cfg"].update(self.cfg["mcore_generation_config"])
+        if policy is not None:
+            # Reuse the existing training policy.
+            self._policy = policy
+            self._owns_policy = False
+            return
 
-        # Create a Policy object configured for inference only:
-        # - No optimizer (not training on this cluster)
-        # - No reference model (not needed for generation)
+        # Stand up a dedicated inference-only policy.
+        self._owns_policy = True
+        self._policy_config["megatron_cfg"].update(self.cfg["mcore_generation_config"])
         self._policy = Policy(
             cluster=cluster,
             config=self._policy_config,
@@ -78,7 +92,7 @@ class MegatronGeneration(GenerationInterface):
             weights_path=weights_path,
         )
 
-        # Start the inference engine + HTTP server during construction.
+        # Start the persistent inference engine + HTTP server during construction.
         self.prepare_for_generation()
 
         url_futures = self._policy.worker_group.run_all_workers_single_data(
@@ -211,9 +225,11 @@ class MegatronGeneration(GenerationInterface):
 
     def shutdown(self) -> bool:
         """Shut down all inference workers and clean up resources."""
+        if not self._owns_policy:
+            return True
         return self._policy.shutdown()
 
     def __del__(self) -> None:
         """Safety net to ensure workers are shut down."""
-        if hasattr(self, "_policy"):
+        if hasattr(self, "_policy") and self._owns_policy:
             self._policy.shutdown()

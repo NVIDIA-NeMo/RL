@@ -143,16 +143,24 @@ async def generate_responses_async(
         # Ensure the key exists even if it's None, matching GenerationDatumSpec
         generation_input_data["stop_strings"] = [None] * len(input_lengths)
 
-    # Check if this is vLLM with async_engine enabled
+    # Check if this is a supported inference engine with async_engine enabled.
     use_async_generation = (
         hasattr(policy_generation, "cfg")
-        and "vllm_cfg" in policy_generation.cfg
-        and policy_generation.cfg["vllm_cfg"]["async_engine"]
+        and (
+            (
+                "vllm_cfg" in policy_generation.cfg
+                and policy_generation.cfg["vllm_cfg"]["async_engine"]
+            )
+            or (
+                "mcore_generation_config" in policy_generation.cfg
+                and policy_generation.cfg["mcore_generation_config"]["async_engine"]
+            )
+        )
         and hasattr(policy_generation, "generate_async")
     )
 
     assert use_async_generation, (
-        "Async generation is not enabled. Please enable async generation by setting async_engine=True in the vllm_cfg section of the policy config."
+        "Async generation is not enabled for the configured generation backend. "
     )
 
     # Use async generation with per-sample streaming

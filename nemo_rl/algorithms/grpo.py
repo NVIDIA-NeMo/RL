@@ -627,16 +627,24 @@ def setup(
         pg.finish_generation()
         return pg, time.perf_counter() - t0
 
-    def init_megatron_generation():
-        """Initialize Megatron generation workers for non-colocated inference."""
+    def init_megatron_generation(policy=None):
+        """Initialize Megatron generation."""
         t0 = time.perf_counter()
-        mg = MegatronGeneration(
-            cluster=inference_cluster,
-            config=policy_config,
-            tokenizer=tokenizer,
-            processor=processor,
-            weights_path=weights_path,
-        )
+        if colocated_inference:
+            mg = MegatronGeneration(
+                policy=policy,
+                config=policy_config,
+                tokenizer=tokenizer,
+                processor=processor,
+            )
+        else:
+            mg = MegatronGeneration(
+                cluster=inference_cluster,
+                config=policy_config,
+                tokenizer=tokenizer,
+                processor=processor,
+                weights_path=weights_path,
+            )
         return mg, time.perf_counter() - t0
 
     def initialize_generation_with_policy(
@@ -702,19 +710,15 @@ def setup(
 
     # Handle generation-specific setup
     if backend == "megatron":
-        if colocated_inference:
-            policy_generation = None
-            policy, policy_time = init_policy()
-            worker_init_timing_metrics["policy_init_time_s"] = policy_time
-        else:
-            # Initialize training first so checkpoint conversion completes before inference starts.
-            policy, policy_time = init_policy()
-            worker_init_timing_metrics["policy_init_time_s"] = policy_time
+        # Initialize training first so checkpoint conversion completes before inference starts.
+        policy, policy_time = init_policy()
+        worker_init_timing_metrics["policy_init_time_s"] = policy_time
 
-            policy_generation, megatron_gen_time = init_megatron_generation()
-            worker_init_timing_metrics["megatron_generation_init_time_s"] = (
-                megatron_gen_time
-            )
+        # Colocated wraps the training policy; non-colocated builds a dedicated inference policy.
+        policy_generation, megatron_gen_time = init_megatron_generation(policy)
+        worker_init_timing_metrics["megatron_generation_init_time_s"] = (
+            megatron_gen_time
+        )
         print(
             f"  ✓ Using {backend} backend for generation with {policy_config['model_name']}",
             flush=True,
@@ -1542,11 +1546,10 @@ def grpo_train(
 
     kv_scales_cache = None  # Cache reused for computed kv scales
 
-    NEED_REFIT = True
-    # If policy_generation is None, use the policy as the generation interface (megatron framework backend)
-    if policy_generation is None:
-        policy_generation = policy  # type: ignore
-        NEED_REFIT = False
+    NEED_REFIT = not (
+        isinstance(policy_generation, MegatronGeneration)
+        and master_config.policy["generation"]["colocated"]["enabled"]
+    )
     POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
     assert policy_generation is not None
 
@@ -2715,12 +2718,10 @@ def async_grpo_train(
         fit_last_save_time=True,
     )
     timeout.start_iterations()
-    NEED_REFIT = True
-
-    # Setup generation interface
-    if policy_generation is None:
-        policy_generation = policy
-        NEED_REFIT = False
+    NEED_REFIT = not (
+        isinstance(policy_generation, MegatronGeneration)
+        and master_config.policy["generation"]["colocated"]["enabled"]
+    )
     POLICY_GENERATION_STALE = True
     assert policy_generation is not None
 
