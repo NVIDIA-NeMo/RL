@@ -15,7 +15,7 @@ import gc
 import os
 import re
 import warnings
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Iterator, Optional, TypeVar, cast
 
@@ -1103,20 +1103,28 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
     def _iter_params_with_optional_kv_scales(
         self,
         kv_scales: Optional[dict[str, float]] = None,
+        conversion_tasks=None,
     ) -> Iterator[tuple[str, torch.Tensor]]:
         """Yield exported HF parameters and optionally append FP8 KV/Q scale tensors.
 
         This helper is used by both IPC-based streaming and collective broadcast
         so that the logic for adding KV scales stays consistent in one place.
+
+        ``conversion_tasks`` (optional) overrides ``self.refit_conversion_tasks``
+        — used by the misc-refit path to pass a filtered subset so Bridge only
+        does TP/EP all-gather for those tasks instead of the full model.
         """
         from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
             get_vllm_qkv_scale_names,
         )
 
+        if conversion_tasks is None:
+            conversion_tasks = self.refit_conversion_tasks
+
         base_iter = self.megatron_bridge.export_hf_weights(
             [self.model],
             show_progress=False,
-            conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
+            conversion_tasks=conversion_tasks,  # used for metadata caching
         )
 
         # Yield the original parameters first.
@@ -1394,13 +1402,27 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         if self.refit_conversion_tasks is None:
             self.refit_param_info_mcore = self._calculate_refit_param_info()
 
+        # Single pass over Bridge's stream: classify each param as bulk
+        # (xferdtensor) or misc (load_weights), preserve yield order so
+        # producer/consumer agree on the packed-broadcast iteration.
+        from nemo_rl.distributed.nccl_reshard_utils import is_misc_param
+
         state_dict_metadata = {}
+        misc_meta = OrderedDict()
         with _meta_tensor_alloc_context():
             for name, tensor in self._iter_params_with_optional_kv_scales():
-                state_dict_metadata[name] = {
+                meta = {
+                    # tensor.dtype is honest about per-entry dtype: model
+                    # weights use self.dtype (bf16/fp16), FP8 blockwise
+                    # weight_scale_inv siblings yielded by the iterator are
+                    # float32.
                     "shape": list(tensor.shape),
-                    "dtype": str(self.dtype),
+                    "dtype": str(tensor.dtype),
                 }
+                if is_misc_param(name):
+                    misc_meta[name] = meta
+                else:
+                    state_dict_metadata[name] = meta
 
         pp_size = train_parallelism.get("pp_size", 1)
         # Construct a dict[layer_name:str] -> pp_stage:int
@@ -1426,6 +1448,34 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         # Dict[(hf_layer_name.layer_id.expert:str, expert_param_susfix:str)]
         # -> List[(expert_id:int, hf_param_name:str)]
         self._expert_groups = self._build_expert_groups()
+
+        # Misc-param plan: rank 0 packs and broadcasts misc tensors (FP8
+        # scale_inv siblings, FP8 KV/activation scales) via packed_broadcast.
+        # Source iterator is the Bridge stream over a FILTERED conversion
+        # task list — only tasks whose Megatron ``global_param_name`` ends
+        # in ``_scale_inv`` are included, so Bridge skips TP/EP all-gather
+        # for bulk weights.  Consumer on the gen side feeds the unpacked
+        # (name, tensor) stream into vLLM's load_weights.  ``misc_meta``
+        # preserves Bridge's yield order — required by packed_broadcast so
+        # producer and consumer agree on the per-batch layout.
+        self.nccl_reshard_refit_info["misc_meta"] = misc_meta
+        # Filter conversion_tasks to only the misc subset so Bridge skips
+        # TP/EP all-gather for bulk weights at refit time.  ``is_misc_param``
+        # works on the Megatron-side ``global_param_name`` because Bridge
+        # preserves the suffixes (``_scale_inv``, ``.k_scale``, ...) through
+        # ``megatron_to_hf``.  Note: FP8 KV-cache scales are appended
+        # outside the task list, so this filter only covers the
+        # ``_scale_inv`` family today; that's all the current misc rule
+        # sees in ``refit_conversion_tasks``.
+        # Drop non-misc entries entirely — Bridge's stream loop accesses
+        # ``task.param_weight`` without a None check, so the list must
+        # contain Task objects only (cross-PP placeholders carry
+        # ``param_weight=None`` but are still Task instances).
+        self._misc_conversion_tasks = [
+            task
+            for task in self.refit_conversion_tasks
+            if task is not None and is_misc_param(task.global_param_name)
+        ]
 
         return self.nccl_reshard_refit_info
 
@@ -1489,9 +1539,9 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             gate_group = expert_groups.get((prefix, "gate_proj"), [])
             up_group = expert_groups.get((prefix, "up_proj"), [])
             expert_tensors = []
-            for (_, gn), (_, un) in zip(gate_group, up_group):
-                gate = self._param_map[gn]
-                up = self._param_map[un]
+            for (_, gate_name), (_, up_name) in zip(gate_group, up_group):
+                gate = self._param_map[gate_name]
+                up = self._param_map[up_name]
                 if gen_tp_size > 1:
                     inter, hidden = gate.shape
                     assert inter % gen_tp_size == 0, (
@@ -1579,6 +1629,30 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                 # memory returns to the caching allocator before the next
                 # iteration's fusion allocates.
                 del local, src_tensor
+
+        self._broadcast_misc_params_packed()
+
+    def _broadcast_misc_params_packed(self) -> None:
+        """Broadcast misc params via the existing packed_broadcast machinery.
+
+        Uses the misc-only conversion task list pre-computed at prepare time,
+        so Bridge skips TP/EP all-gather for bulk weights — only the
+        relatively small misc subset is gathered + broadcast.
+        """
+        misc_meta = self.nccl_reshard_refit_info.get("misc_meta", {})
+        if not misc_meta:
+            return
+
+        misc_iter = self._iter_params_with_optional_kv_scales(
+            conversion_tasks=self._misc_conversion_tasks,
+        )
+
+        packed_broadcast_producer(
+            iterator=misc_iter,
+            group=self.model_update_group,
+            src=0,
+            post_iter_func=lambda x: x[1].contiguous(),
+        )
 
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)

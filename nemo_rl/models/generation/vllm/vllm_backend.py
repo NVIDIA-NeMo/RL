@@ -353,20 +353,18 @@ class VllmInternalWorkerExtension:
         return True
 
     def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
-        """Store per-layer param metadata for nccl_reshard-based refit."""
+        """Restore per-layer param metadata and build the HF→vLLM mapping.
+
+        Done once ahead of refit; the cached mapping is reused by every
+        ``nccl_reshard_refit`` call.
+        """
         from nemo_rl.distributed.nccl_reshard_utils import (
             restore_refit_info_placements,
         )
 
-        # Restore placements + meshes flattened by msgspec during vLLM's
-        # collective_rpc transport.
         self.nccl_reshard_refit_info = (  # pyrefly: ignore[implicitly-defined-attribute]
             restore_refit_info_placements(refit_info)
         )
-
-        # HF→vLLM mapping depends only on model structure and the (now
-        # restored) refit_info — cache it here so each refit step doesn't
-        # repeat the per-param suffix matching against vLLM params.
         self._hf_to_vllm = self._build_hf_to_vllm_mapping(  # pyrefly: ignore[implicitly-defined-attribute]
             self.nccl_reshard_refit_info
         )
@@ -618,11 +616,11 @@ class VllmInternalWorkerExtension:
 
         Uses ``get_dst_dtensor`` to prepare each parameter, then calls the
         canonical 7-arg ``xferdtensor``. For merged params (qkv_proj,
-        gate_up_proj), a post_refit_hook copies the TP-local slice.
+        gate_up_proj), a post_refit_hook copies the TP-local slice. The
+        HF→vLLM mapping is built once in ``prepare_nccl_reshard_refit_info``.
         """
         from nemo_rl.distributed.xferdtensor import xferdtensor
 
-        # self._hf_to_vllm is built once in prepare_nccl_reshard_refit_info.
         use_per_stage = hasattr(self, "pp_comm_groups") and self.pp_comm_groups
 
         for layer_name in self.nccl_reshard_refit_info["layer_names"]:
@@ -649,10 +647,45 @@ class VllmInternalWorkerExtension:
                 if post_refit_hook:
                     post_refit_hook()
 
-        # Ensure all NCCL broadcasts and copy_ ops complete before vLLM resumes.
+        self._receive_and_load_misc_params()
+
         torch.cuda.synchronize()
-        self._maybe_process_fp8_kv_cache()
+
+        # process_weights_after_loading is intentionally disabled for the
+        # FP8-weight refit path: bulk FP8 weights arrive kernel-ready via
+        # xferdtensor and misc params go through vLLM's own load_weights, so no
+        # extra post-load finalization is needed (verified on 30B FP8 MoE:
+        # byte-identical generation/rewards with and without this call).  It is
+        # kept (commented) rather than deleted because enabling FP8 *KV cache*
+        # will need it to finalize the per-layer k/v scales after refit;
+        # uncomment it (guarded on kv_cache_dtype) as part of that work.
+        # from vllm.model_executor.model_loader.utils import (
+        #     process_weights_after_loading,
+        # )
+        # process_weights_after_loading(
+        #     self.model_runner.model, self.model_config, self.device
+        # )
         return True
+
+    def _receive_and_load_misc_params(self) -> None:
+        """Receive misc params via packed_broadcast and load via vLLM."""
+        from nemo_rl.distributed.nccl_reshard_utils import _STR_TO_DTYPE
+
+        misc_meta = self.nccl_reshard_refit_info.get("misc_meta", {})
+        if not misc_meta:
+            return
+
+        misc_state_dict_info = {
+            name: (tuple(meta["shape"]), _STR_TO_DTYPE[meta["dtype"]])
+            for name, meta in misc_meta.items()
+        }
+
+        packed_broadcast_consumer(
+            iterator=iter(misc_state_dict_info.items()),
+            group=self.model_update_group,
+            src=0,
+            post_unpack_func=self._load_weights,
+        )
 
     def cleanup(self) -> None:
         """Shutdown and cleanup resources."""

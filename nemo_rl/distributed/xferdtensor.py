@@ -177,7 +177,7 @@ def xferdtensor_golden(
             full_tensor = src_tensor._local_tensor.clone()
         else:
             full_tensor = torch.empty(global_shape, device=device, dtype=dtype)
-        process_group.broadcast(full_tensor, src=src_ranks[0])
+        process_group.broadcast(full_tensor.view(torch.uint8), src=src_ranks[0])
     else:
         # Reconstruct the full tensor from per-rank shards.
         # Deduplicate: DP-replicated ranks hold the same shard, so only one
@@ -204,7 +204,7 @@ def xferdtensor_golden(
             shard_buf = torch.empty(shard_shape, device=device, dtype=dtype)
             if rank == src_rank and src_tensor is not None:
                 shard_buf.copy_(src_tensor._local_tensor)
-            process_group.broadcast(shard_buf, src=src_rank)
+            process_group.broadcast(shard_buf.view(torch.uint8), src=src_rank)
             full_tensor[tuple(shard_slices)] = shard_buf
 
     # Destination side: extract local shard

@@ -96,7 +96,10 @@ class DTensorRef:
 # Placement rules (from xferdtensor/src/placement_rules.py)
 # =========================================================================
 
-# Column-parallel suffixes: TP shards along dim 0 (output dimension)
+# Column-parallel suffixes: TP shards along dim 0 (output dimension).
+# FP8 ``_scale_inv`` siblings are NOT listed here — they take the misc
+# refit path (see ``is_misc_param``), so vLLM's load_weights handles the
+# Parameter-specific FP8 blockwise quant layout.
 COLUMN_PARALLEL_SUFFIXES = [
     "q_proj.weight",
     "k_proj.weight",
@@ -116,7 +119,7 @@ COLUMN_PARALLEL_SUFFIXES = [
 # unsharded, so leaving them out of COLUMN_PARALLEL_SUFFIXES gives the right
 # "all Replicate" placement on both sides.
 
-# Row-parallel suffixes: TP shards along dim 1 (input dimension)
+# Row-parallel suffixes: TP shards along dim 1 (input dimension).
 ROW_PARALLEL_SUFFIXES = [
     "o_proj.weight",
     "down_proj.weight",
@@ -124,7 +127,7 @@ ROW_PARALLEL_SUFFIXES = [
     "w2_weight",
 ]
 
-# Vocabulary-parallel: TP shards along dim 0 (vocab dimension)
+# Vocabulary-parallel: TP shards along dim 0 (vocab dimension).
 VOCAB_PARALLEL_NAMES = [
     "embed_tokens.weight",
     "lm_head.weight",
@@ -160,6 +163,55 @@ def is_expert_param(param_name: str) -> bool:
     return ".experts." in param_name
 
 
+def is_misc_param(param_name: str) -> bool:
+    """Return True if the parameter should be routed to the misc refit path.
+
+    Misc params are transferred by all-gathering the full HF-shaped tensor on
+    the train side and feeding it to vLLM's ``model.load_weights`` on the gen
+    side, rather than going through xferdtensor.  This lets vLLM handle
+    Parameter-specific quirks (FP8 blockwise quant layout, FusedMoE per-expert
+    fusion, FP8 KV-cache name remap) instead of us reimplementing them.
+
+    Bulk params (vanilla 2D linear weights) still take the xferdtensor fast
+    path; misc params are a small share of bytes but carry most of the
+    Parameter-specific complexity.
+
+    Rules — narrow on purpose; only add cases we've confirmed need it:
+    * ``*_scale_inv`` siblings of FP8 blockwise weights.
+    * FP8 KV-cache and activation scales (``.k_scale``, ``.v_scale``,
+      ``.q_scale``, ``.weight_scale``, ``.input_scale``).
+    * The MoE router/gate Linear weight.
+
+    Suffix-based check works on both HF and Megatron names (Bridge preserves
+    these suffixes through ``megatron_to_hf``), so the same classifier is
+    used by the gen-side metadata partition (HF names) and the train-side
+    ``conversion_tasks`` filter (Megatron names).
+    """
+    if param_name.endswith("_scale_inv"):
+        return True
+    if param_name.endswith(
+        (".k_scale", ".v_scale", ".q_scale", ".weight_scale", ".input_scale")
+    ):
+        return True
+    # MoE router/gate: vLLM blockwise-FP8 *quantizes* the router Linear (its
+    # dummy/loaded weight is ``float8_e4m3fn`` with a ``weight_scale_inv``
+    # companion), but Megatron keeps the router in bf16 with no scale.  That
+    # dtype disagreement would desync the xferdtensor broadcast — train sends
+    # bf16 (one byte-width) while gen posts the matching receive as fp8
+    # (another) on the same NCCL collective, deadlocking it.  Route the router
+    # through misc so vLLM's ``load_weights`` quantizes the bf16 weight and
+    # computes the scale itself.  The router is tiny and not an expert weight,
+    # so this costs negligible bandwidth.  Match both the HF name
+    # (``mlp.gate.weight``) and the Megatron-Core name (``mlp.router.weight``)
+    # so the gen-side (HF) ``misc_meta`` and the train-side (Megatron)
+    # conversion-task filter classify the same param identically.  Dense
+    # models have neither suffix (their FFN gate is ``mlp.gate_proj.weight``),
+    # so this rule is a no-op for them.
+    if param_name.endswith(("mlp.gate.weight", "mlp.router.weight")):
+        return True
+    return False
+
+
 def _get_expert_tp_shard_dim(param_name: str) -> Optional[int]:
     """Like get_tp_shard_dim but does NOT skip .experts. params."""
     for suffix in COLUMN_PARALLEL_SUFFIXES:
@@ -179,9 +231,13 @@ _STR_TO_DTYPE = {
     "torch.bfloat16": torch.bfloat16,
     "torch.float16": torch.float16,
     "torch.float32": torch.float32,
+    "torch.float8_e4m3fn": torch.float8_e4m3fn,
+    "torch.float8_e5m2": torch.float8_e5m2,
     "bfloat16": torch.bfloat16,
     "float16": torch.float16,
     "float32": torch.float32,
+    "float8_e4m3fn": torch.float8_e4m3fn,
+    "float8_e5m2": torch.float8_e5m2,
 }
 
 
@@ -318,8 +374,11 @@ def get_placements(param_name: str, dim_map: dict, ndim: int) -> list:
 # =========================================================================
 
 # Matches individual expert params: model.layers.X.mlp.experts.Y.proj.weight
+# Anchored with ``$`` so it doesn't prefix-match FP8 ``_scale_inv`` siblings
+# (scale_inv siblings take the misc refit path via ``is_misc_param`` and
+# must not appear in the per-expert weight fusion groups).
 _INDIVIDUAL_EXPERT_RE = re.compile(
-    r"(.+\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight"
+    r"(.+\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$"
 )
 
 
@@ -519,18 +578,18 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
 
         # Precision compatibility (train ↔ gen).  Supported combinations:
         #   BF16 train  ↔ BF16 gen   (default, tested)
-        #   FP8  train  ↔ FP8  gen   (fp8_param=True + blockwise + vllm quantization=fp8)
+        #   FP8  train  ↔ FP8  gen   (fp8_param=True + blockwise + vllm precision=fp8)
         # BF16→FP8 (train-side quant on the fly) is not implemented; FP8→BF16
         # has no consumer (vLLM doesn't accept FP8 bytes into a BF16 param).
         fp8_cfg = megatron_cfg.get("fp8_cfg", {}) or {}
         fp8_param = fp8_cfg.get("fp8_param", False)
         fp8_recipe = fp8_cfg.get("fp8_recipe", None)
-        gen_quantization = vllm_cfg.get("quantization", None)
+        gen_precision = vllm_cfg.get("precision", None)
 
-        if gen_quantization == "fp8":
+        if gen_precision == "fp8":
             if not fp8_param:
                 violations.append(
-                    "policy.generation.vllm_cfg.quantization='fp8' requires "
+                    "policy.generation.vllm_cfg.precision='fp8' requires "
                     "policy.megatron_cfg.fp8_cfg.fp8_param=True "
                     "(BF16→FP8 train-side quantization is not implemented yet)."
                 )
@@ -543,7 +602,7 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
         elif fp8_param:
             violations.append(
                 "policy.megatron_cfg.fp8_cfg.fp8_param=True requires "
-                "policy.generation.vllm_cfg.quantization='fp8' "
+                "policy.generation.vllm_cfg.precision='fp8' "
                 "(FP8 storage on train side has no BF16 gen consumer)."
             )
 
@@ -594,6 +653,9 @@ def build_nccl_reshard_refit_info(
         ``{"layer_names": [...], "per_layer_params": {layer: [param_info, ...]},
            "pp_size": int}``
     """
+    # state_dict_metadata is already pre-filtered to exclude misc params
+    # (caller separates misc into a parallel dict for the
+    # packed_broadcast-based misc refit path).
     state_dict_metadata = fuse_expert_params_in_metadata(state_dict_metadata)
 
     pp_size = train_parallelism.get("pp_size", 1)
