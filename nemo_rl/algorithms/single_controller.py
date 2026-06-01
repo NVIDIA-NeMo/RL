@@ -371,9 +371,7 @@ class SingleControllerActor:
                     sample_ids=selected_meta.sample_ids,
                     partition_id=selected_meta.partition_id,
                 )
-                self._claimed_meta = _drop_indices(
-                    self._claimed_meta, selected_indices
-                )
+                self._claimed_meta = self._claimed_meta.drop(selected_indices)
                 self._trainer_version = result["trainer_version"]
                 selected_groups = count_prompt_groups(
                     selected_meta,
@@ -412,7 +410,10 @@ class SingleControllerActor:
         )
         if meta.size == 0:
             return
-        self._claimed_meta = _concat_meta(self._claimed_meta, meta)
+        if self._claimed_meta is None or self._claimed_meta.size == 0:
+            self._claimed_meta = meta
+        else:
+            self._claimed_meta = self._claimed_meta.concat(meta)
 
     def _claim_required_fields(self) -> list[str]:
         fields = list(self._cfg.claim_required_fields)
@@ -501,7 +502,7 @@ class SingleControllerActor:
                 {self._cfg.advantage_output_field: advantages},
             ),
         )
-        return _with_fields(meta, [self._cfg.advantage_output_field])
+        return meta.with_fields([self._cfg.advantage_output_field])
 
     async def _evict_stale_claimed(self) -> KVBatchMeta | None:
         if self._claimed_meta is None or self._claimed_meta.size == 0:
@@ -527,7 +528,7 @@ class SingleControllerActor:
             sample_ids=evicted_meta.sample_ids,
             partition_id=evicted_meta.partition_id,
         )
-        self._claimed_meta = _drop_indices(self._claimed_meta, indices)
+        self._claimed_meta = self._claimed_meta.drop(indices)
         return evicted_meta
 
     async def _sync_weights(self) -> None:
@@ -563,20 +564,6 @@ class SingleControllerActor:
 
         log.info("  _sync_weights: sync done in %.3fs", elapsed)
         self._rollout_permitted.set()
-
-
-def _concat_meta(left: KVBatchMeta | None, right: KVBatchMeta) -> KVBatchMeta:
-    if left is None or left.size == 0:
-        return right
-    return left.concat(right)
-
-
-def _drop_indices(meta: KVBatchMeta, indices: list[int]) -> KVBatchMeta | None:
-    dropped = set(indices)
-    keep = [i for i in range(meta.size) if i not in dropped]
-    if not keep:
-        return None
-    return meta.subset(keep)
 
 
 def _min_weight_version(meta: KVBatchMeta) -> int | None:
@@ -638,18 +625,3 @@ def _fields_for_put(meta: KVBatchMeta, fields: dict[str, torch.Tensor]) -> Tenso
         else:
             packed[field_name] = value.detach().contiguous()
     return TensorDict(packed, batch_size=[meta.size])
-
-
-def _with_fields(meta: KVBatchMeta, field_names: list[str]) -> KVBatchMeta:
-    fields = _dedupe([*(meta.fields or []), *field_names])
-    return KVBatchMeta(
-        partition_id=meta.partition_id,
-        task_name=meta.task_name,
-        sample_ids=list(meta.sample_ids),
-        fields=fields,
-        sequence_lengths=(
-            list(meta.sequence_lengths) if meta.sequence_lengths is not None else None
-        ),
-        extra_info=dict(meta.extra_info or {}),
-        tags=[dict(tag) for tag in meta.tags] if meta.tags is not None else None,
-    )
