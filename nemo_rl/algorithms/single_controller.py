@@ -54,6 +54,7 @@ from nemo_rl.algorithms.staleness_sampler import (
     StalenessWindowSelection,
     StrictOnPolicyBatchSampler,
     count_prompt_groups,
+    min_weight_version,
 )
 from nemo_rl.data_plane import KVBatchMeta
 
@@ -338,7 +339,7 @@ class SingleControllerActor:
 
             selected_meta = self._claimed_meta.subset(selected_indices)
             selected_meta = await self._advantage_pump(selected_meta)
-            selected_weight = _min_weight_version(selected_meta)
+            selected_weight = min_weight_version(selected_meta)
             lag = (
                 self._trainer_version - selected_weight
                 if selected_weight is not None
@@ -417,7 +418,7 @@ class SingleControllerActor:
         fields = list(self._cfg.claim_required_fields)
         if self._cfg.advantage_enabled:
             fields.extend(self._advantage_input_fields())
-        return _dedupe(fields)
+        return list(dict.fromkeys(fields))
 
     def _advantage_input_fields(self) -> list[str]:
         fields = [
@@ -431,7 +432,7 @@ class SingleControllerActor:
             fields.append(self._cfg.advantage_policy_logprobs_field)
         if self._cfg.advantage_reference_logprobs_field is not None:
             fields.append(self._cfg.advantage_reference_logprobs_field)
-        return _dedupe(fields)
+        return list(dict.fromkeys(fields))
 
     async def _advantage_pump(self, meta: KVBatchMeta) -> KVBatchMeta:
         """Fetch advantage inputs, compute advantages, and write them back.
@@ -562,27 +563,6 @@ class SingleControllerActor:
 
         log.info("  _sync_weights: sync done in %.3fs", elapsed)
         self._rollout_permitted.set()
-
-
-def _min_weight_version(meta: KVBatchMeta) -> int | None:
-    versions = []
-    for tag in meta.tags or []:
-        value = tag.get("weight_version", tag.get("version"))
-        if value is None:
-            continue
-        versions.append(int(value))
-    return min(versions) if versions else None
-
-
-def _dedupe(fields: list[str]) -> list[str]:
-    seen: set[str] = set()
-    deduped: list[str] = []
-    for field_name in fields:
-        if field_name in seen:
-            continue
-        seen.add(field_name)
-        deduped.append(field_name)
-    return deduped
 
 
 def _tensor_field(data: TensorDict, field_name: str) -> torch.Tensor:

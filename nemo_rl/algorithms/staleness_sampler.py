@@ -168,6 +168,14 @@ def count_prompt_groups(
     )
 
 
+def min_weight_version(meta: KVBatchMeta) -> int | None:
+    """Smallest ``weight_version`` across per-sample tags, or None if absent."""
+    versions = [
+        v for v in (_weight_version(tag) for tag in meta.tags or []) if v is not None
+    ]
+    return min(versions) if versions else None
+
+
 def _prompt_groups(
     meta: KVBatchMeta,
     generations_per_prompt: int,
