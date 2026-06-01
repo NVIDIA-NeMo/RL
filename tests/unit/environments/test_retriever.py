@@ -21,8 +21,7 @@ from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.environments.tools.retriever import RAGEnvConfig, RAGEnvironment
 from nemo_rl.experience.rollouts import run_multi_turn_rollout
 from nemo_rl.models.generation import configure_generation_config
-from nemo_rl.models.generation.interfaces import GenerationConfig as VllmConfig
-from nemo_rl.models.generation.vllm import VllmGeneration
+from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 
 MODEL_NAME = "meta-llama/Llama-3.2-1B"
 

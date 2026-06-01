@@ -27,7 +27,8 @@ from nemo_rl.data.llm_message_utils import (
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES, RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface, EnvironmentReturn
-from nemo_rl.models.generation.interfaces import GenerationConfig, GenerationDatumSpec
+from nemo_rl.models.generation.interfaces import GenerationDatumSpec
+from nemo_rl.models.generation.vllm import VllmConfig
 from nemo_rl.models.policy import DynamicBatchingConfig, SequencePackingConfig
 from nemo_rl.models.policy.lm_policy import Policy
 
@@ -64,7 +65,7 @@ class RewardModelEnvironmentConfig(TypedDict):
     dynamic_batching: DynamicBatchingConfig = {"enabled": False}
     sequence_packing: NotRequired[SequencePackingConfig] = {"enabled": False}
     max_grad_norm: Optional[float] = None
-    generation: Optional[GenerationConfig] = None
+    generation: Optional[VllmConfig] = None
 
 
 @ray.remote

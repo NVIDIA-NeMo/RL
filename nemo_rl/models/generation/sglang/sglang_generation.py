@@ -27,12 +27,12 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SlicedDataDic
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
-from nemo_rl.models.generation.interfaces import GenerationConfig as SGLangConfig
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
 )
+from nemo_rl.models.generation.sglang.config import SGLangConfig
 
 # Global thresholds for top_k and top_p validation.
 # While top-k/p are not supported, these values allow for token filtering while the logprobs should be compatible.

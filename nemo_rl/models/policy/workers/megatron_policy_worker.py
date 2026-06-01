@@ -54,6 +54,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     verify_right_padding,
 )
+from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.megatron.common import get_moe_metrics
 from nemo_rl.models.megatron.config import MegatronGenerationConfig
 from nemo_rl.models.megatron.data import (
@@ -1130,7 +1131,7 @@ class MegatronPolicyWorkerImpl(
             and self.cfg["generation"] is not None
             and self.cfg["generation"]["backend"] == "vllm"
         ):
-            generation_cfg = self.cfg["generation"]
+            generation_cfg = cast(VllmConfig, self.cfg["generation"])
             use_fp8_kv_cache = (
                 "vllm_cfg" in generation_cfg
                 and "kv_cache_dtype" in generation_cfg["vllm_cfg"]
