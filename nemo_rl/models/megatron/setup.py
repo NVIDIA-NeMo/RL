@@ -742,12 +742,6 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
         except KeyError as e:
             raise KeyError(f"Missing key in fp8_cfg: {e}")
 
-        if model_cfg.fp8_param:
-            warnings.warn(
-                "Setting fp8_param=True sometimes causes NaN token_mult_prob_error, please use with caution. "
-                "Refer to https://github.com/NVIDIA-NeMo/RL/issues/1164 for latest updates with this issue."
-            )
-
 
 def _validate_optimizer_config(config: PolicyConfig) -> None:
     """Validate optimizer configuration."""
