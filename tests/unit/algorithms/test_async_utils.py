@@ -32,7 +32,10 @@ from nemo_rl.algorithms.async_utils import (
     AsyncTrajectoryCollector,
     ReplayBuffer,
 )
-from nemo_rl.algorithms.async_utils.replay_buffer import ReplayBufferNew
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    ReplayBufferImpl,
+    ReplayBufferNew,
+)
 from nemo_rl.algorithms.grpo import (
     MasterConfig,
     add_grpo_token_loss_masks_and_generation_logprobs,
@@ -92,6 +95,179 @@ class MockGenerationInterface:
 
     def finish_generation(self):
         self.finish_calls += 1
+
+
+class TestReplayBufferImplCheckpointing:
+    """Direct implementation tests for checkpoint coverage.
+
+    Ray actor execution is not reliably attributed to source coverage, so these
+    tests cover the checkpoint/restore helpers on the local implementation class.
+    """
+
+    def _state(
+        self,
+        trajectory_versions: list[int],
+        target_weight_versions: list[int],
+        last_target_weight_already_generated: int,
+        max_size: int = 10,
+    ) -> dict:
+        return {
+            "trajectories": [
+                {"batch": {"data": f"traj_{idx}"}, "rollout_metrics": {}}
+                for idx in range(len(trajectory_versions))
+            ],
+            "trajectory_versions": trajectory_versions,
+            "target_weight_versions": target_weight_versions,
+            "last_target_weight_already_generated": (
+                last_target_weight_already_generated
+            ),
+            "max_size": max_size,
+        }
+
+    def test_local_restore_prepares_current_step_for_gap_fill(self):
+        buffer = ReplayBufferImpl(max_size=10)
+        state = self._state(
+            trajectory_versions=[0, 1, 1, 2],
+            target_weight_versions=[1, 2, 2, 3],
+            last_target_weight_already_generated=3,
+        )
+
+        buffer.load_state_dict(
+            state,
+            num_prompts_per_step=2,
+            current_training_step=2,
+        )
+
+        assert buffer.get_debug_info()["trajectory_versions"] == [1, 1, 2]
+        assert buffer.get_debug_info()["target_weight_versions"] == [2, 2, 3]
+        assert buffer.get_last_target_weight_already_generated() == 1
+        assert buffer.has_complete_batch(2, 2)
+        assert not buffer.has_complete_batch(3, 2)
+        assert buffer.get_trajectories_needed(2, 2) == 0
+        assert buffer.get_trajectories_needed(3, 2) == 1
+
+    def test_local_restore_empty_state_resets_generation_watermark(self):
+        buffer = ReplayBufferImpl(max_size=10)
+        state = self._state(
+            trajectory_versions=[],
+            target_weight_versions=[],
+            last_target_weight_already_generated=7,
+        )
+
+        buffer.load_state_dict(
+            state,
+            num_prompts_per_step=2,
+            current_training_step=5,
+        )
+
+        assert buffer.size() == 0
+        assert buffer.get_last_target_weight_already_generated() == 4
+        assert buffer.get_trajectories_needed(5, 2) == 2
+
+    def test_local_restore_removes_stale_trajectories(self):
+        buffer = ReplayBufferImpl(max_size=10)
+        state = self._state(
+            trajectory_versions=[0, 1, 4],
+            target_weight_versions=[5, 5, 5],
+            last_target_weight_already_generated=5,
+        )
+
+        buffer.load_state_dict(
+            state,
+            num_prompts_per_step=2,
+            current_training_step=5,
+            max_age_steps=1,
+        )
+
+        assert buffer.get_debug_info()["trajectory_versions"] == [4]
+        assert buffer.get_debug_info()["target_weight_versions"] == [5]
+        assert not buffer.has_complete_batch(5, 2)
+        assert buffer.get_trajectories_needed(5, 2) == 1
+
+    def test_local_restore_truncates_after_resume_cleanup(self):
+        buffer = ReplayBufferImpl(max_size=2)
+        state = self._state(
+            trajectory_versions=[0, 1, 2, 3],
+            target_weight_versions=[1, 2, 3, 4],
+            last_target_weight_already_generated=4,
+            max_size=4,
+        )
+
+        buffer.load_state_dict(
+            state,
+            num_prompts_per_step=1,
+            current_training_step=2,
+        )
+
+        assert buffer.get_debug_info()["trajectory_versions"] == [1, 2]
+        assert buffer.get_debug_info()["target_weight_versions"] == [2, 3]
+
+    def test_local_restore_without_current_step_rechecks_after_stale_removal(self):
+        buffer = ReplayBufferImpl(max_size=10)
+        state = self._state(
+            trajectory_versions=[0, 4, 4],
+            target_weight_versions=[5, 5, 6],
+            last_target_weight_already_generated=6,
+        )
+
+        buffer.load_state_dict(
+            state,
+            num_prompts_per_step=2,
+            max_age_steps=1,
+        )
+
+        assert buffer.size() == 0
+        assert buffer.get_last_target_weight_already_generated() == -1
+
+    def test_local_sample_evicts_stale_restored_trajectories(self):
+        buffer = ReplayBufferImpl(max_size=10)
+        assert (
+            buffer.add(
+                {"batch": {"data": "stale"}, "rollout_metrics": {}},
+                weight_version=0,
+                target_weight_version=5,
+            )
+            == "success"
+        )
+        assert (
+            buffer.add(
+                {"batch": {"data": "valid"}, "rollout_metrics": {}},
+                weight_version=4,
+                target_weight_version=5,
+            )
+            == "success"
+        )
+
+        sample_result = buffer.sample(
+            num_prompt_groups=1,
+            current_weight_version=5,
+            max_age_steps=1,
+        )
+
+        assert sample_result is not None
+        assert sample_result["trajectories"][0]["batch"]["data"] == "valid"
+        assert buffer.size() == 0
+
+    def test_local_load_state_dict_validates_checkpoint_shape(self):
+        buffer = ReplayBufferImpl(max_size=10)
+
+        with pytest.raises(ValueError, match="Checkpoint missing required keys"):
+            buffer.load_state_dict(
+                {
+                    "trajectories": [],
+                    "trajectory_versions": [],
+                }
+            )
+
+        with pytest.raises(ValueError, match="inconsistent replay buffer lengths"):
+            buffer.load_state_dict(
+                {
+                    "trajectories": [{"batch": {"data": "test"}}],
+                    "trajectory_versions": [0, 1],
+                    "target_weight_versions": [1],
+                    "last_target_weight_already_generated": 1,
+                }
+            )
 
 
 class TestReplayBuffer:
