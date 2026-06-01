@@ -190,6 +190,13 @@ ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 ENV CUDNN_HOME=/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn
 ENV LD_LIBRARY_PATH="/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH}"
 # Verify with: python -c "import transformer_engine.pytorch as te; print(te.get_cudnn_version())"
+# Make z3 (bundled by tilelang's TVM) findable by the dynamic linker. z3-solver installs
+# libz3.so.4.15 into Python site-packages, which is not on the default linker search path.
+# Without this, fla's tilelang.is_available() raises OSError instead of ImportError,
+# crashing worker venvs that co-install flash-linear-attention (via megatron-bridge) + tilelang.
+RUN /opt/nemo_rl_venv/bin/python -c \
+    "import z3, os; print(os.path.join(os.path.dirname(z3.__file__), 'lib'))" \
+    > /etc/ld.so.conf.d/z3-solver.conf && ldconfig
 
 WORKDIR /opt/nemo-rl
 
