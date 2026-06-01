@@ -210,6 +210,11 @@ class TestRewardModelEnvironment:
         assert output.rewards is not None
         assert output.rewards.shape == (2,)
         assert output.rewards.dtype == torch.float32
-        # Verify expected reward values (with tolerance for floating point precision)
-        expected_rewards = torch.tensor([-5.2500, 2.6094])
-        assert torch.allclose(output.rewards, expected_rewards, atol=1e-1)
+        # Verify relative reward ordering: the correct answer (Paris) should score
+        # higher than the incorrect answer (Brasilia). Absolute reward values are
+        # not asserted because they drift across PyTorch versions, hardware, and
+        # precision, making hardcoded values brittle for a unit test.
+        assert output.rewards[1] > output.rewards[0], (
+            f"Expected correct answer reward ({output.rewards[1]:.4f}) to be greater "
+            f"than incorrect answer reward ({output.rewards[0]:.4f})"
+        )
