@@ -83,28 +83,28 @@ ENV RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 
 # Build vLLM from source to use with the NVIDIA PyTorch base image
-FROM base AS build_vllm
+# FROM base AS build_vllm
 
-ARG MAX_JOBS=32
-ARG SKIP_VLLM_BUILD
-WORKDIR /opt
-COPY --from=nemo-rl uv.lock /tmp/uv.lock
+# ARG MAX_JOBS=32
+# ARG SKIP_VLLM_BUILD
+# WORKDIR /opt
+# COPY --from=nemo-rl uv.lock /tmp/uv.lock
 
-RUN <<"EOF" bash -exu
-if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
-    echo "Building vLLM from source for PyTorch base image"
-    VLLM_VERSION=$(grep -A 1 '^name = "vllm"$' /tmp/uv.lock | grep '^version = ' | head -1 | sed 's/version = "\(.*\)"/\1/' | cut -d+ -f1) && \
-    echo "Building vLLM version: $VLLM_VERSION"
-    git clone https://github.com/vllm-project/vllm.git
-    cd vllm
-    git checkout v$VLLM_VERSION
-    python use_existing_torch.py
-    pip install -r requirements/build/cuda.txt
-    pip wheel --no-deps --no-build-isolation -v .
-else
-    echo "Skipping vLLM build for PyTorch base image"
-fi
-EOF
+# RUN <<"EOF" bash -exu
+# if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
+#     echo "Building vLLM from source for PyTorch base image"
+#     VLLM_VERSION=$(grep -A 1 '^name = "vllm"$' /tmp/uv.lock | grep '^version = ' | head -1 | sed 's/version = "\(.*\)"/\1/' | cut -d+ -f1) && \
+#     echo "Building vLLM version: $VLLM_VERSION"
+#     git clone https://github.com/vllm-project/vllm.git
+#     cd vllm
+#     git checkout v$VLLM_VERSION
+#     python use_existing_torch.py
+#     pip install -r requirements/build/cuda.txt
+#     pip wheel --no-deps --no-build-isolation -v .
+# else
+#     echo "Skipping vLLM build for PyTorch base image"
+# fi
+# EOF
 
 FROM base AS hermetic
 
@@ -150,7 +150,7 @@ COPY --from=nemo-rl --link research/ ./research/
 COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
 
 RUN --mount=type=ssh \
-    --mount=type=bind,from=build_vllm,source=/opt,target=/tmp/build_vllm,readonly \
+    # --mount=type=bind,from=build_vllm,source=/opt,target=/tmp/build_vllm,readonly \
     <<"EOF" bash -exu
 uv venv --seed --system-site-packages --python python3
 export VIRTUAL_ENV=/opt/nemo_rl_venv
@@ -159,9 +159,9 @@ if [[ -n "${BUILD_CUSTOM_FLASHINFER:-}" ]]; then
 fi
 
 # Install vllm built from source
-if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
-    uv pip install --no-cache-dir --no-deps /tmp/build_vllm/vllm/vllm*.whl
-fi
+# if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
+#     uv pip install --no-cache-dir --no-deps /tmp/build_vllm/vllm/vllm*.whl
+# fi
 
 # uv sync has a more reliable resolver than simple uv pip install which can fail
 
