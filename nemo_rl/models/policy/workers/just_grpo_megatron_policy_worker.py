@@ -84,16 +84,18 @@ class JustGRPOMegatronPolicyWorkerImpl(MegatronPolicyWorkerImpl):
             yield
             return
         if attention_mode not in {
+            "inference_causal",
             "inference_bidirectional",
             "inference_block_bidirectional",
         }:
             raise ValueError(f"Unsupported megatron_attention_mode: {attention_mode}")
 
         attention_modules = self._diffusion_attention_modules(self.model)
+        causal = attention_mode == "inference_causal"
         for module in attention_modules:
             module.clear_kv_cache()
             module.set_inference_mode(True)
-            module.set_inference_params(causal=False, cache_enabled=False)
+            module.set_inference_params(causal=causal, cache_enabled=False)
         try:
             yield
         finally:
@@ -112,10 +114,12 @@ class JustGRPOMegatronPolicyWorkerImpl(MegatronPolicyWorkerImpl):
     ) -> None:
         target_positions = data["just_grpo_target_positions"]
         response_starts = data["just_grpo_response_starts"]
+        response_ends = data["just_grpo_response_ends"]
         device = target_positions.device
         relative_positions = (target_positions - response_starts).clamp_min(0)
         block_starts = response_starts + (relative_positions // block_size) * block_size
-        block_ends = (block_starts + block_size).clamp(max=seq_len)
+        response_ends = response_ends.clamp(max=seq_len)
+        block_ends = torch.minimum(block_starts + block_size, response_ends)
         block_starts = block_starts.to(device=device, dtype=torch.long)
         block_ends = block_ends.to(device=device, dtype=torch.long)
 
@@ -125,8 +129,34 @@ class JustGRPOMegatronPolicyWorkerImpl(MegatronPolicyWorkerImpl):
                     "Megatron diffusion attention does not support "
                     "set_block_bidirectional_mask. Ensure the Megatron-Bridge "
                     "block-bidirectional attention patch is on PYTHONPATH."
-                )
+            )
             module.set_block_bidirectional_mask(block_starts, block_ends)
+
+    def _maybe_print_diffusion_block_size(self, source: str, block_size: int) -> None:
+        printed = getattr(self, "_just_grpo_block_size_printed", set())
+        if source in printed:
+            return
+        try:
+            rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else self.rank
+            )
+        except Exception:
+            rank = self.rank
+        if rank != 0:
+            return
+
+        model_config = getattr(self.model, "config", None)
+        config_block_size = getattr(model_config, "block_size", None)
+        print(
+            "JUSTGRPO_BLOCK_SIZE "
+            f"source={source} rank={rank} "
+            f"block_size_used={block_size} model_config_block_size={config_block_size}",
+            flush=True,
+        )
+        printed.add(source)
+        self._just_grpo_block_size_printed = printed
 
     def _with_block_bidirectional_attention(
         self,
@@ -276,9 +306,11 @@ class JustGRPOMegatronPolicyWorkerImpl(MegatronPolicyWorkerImpl):
                     straggler_timer=self.mcore_state.straggler_timer,
                 )
                 if attention_mode == "inference_block_bidirectional":
+                    block_size = self._diffusion_block_size()
+                    self._maybe_print_diffusion_block_size("train", block_size)
                     data_iterator = self._with_block_bidirectional_attention(
                         data_iterator,
-                        block_size=self._diffusion_block_size(),
+                        block_size=block_size,
                     )
                 total_num_microbatches += int(num_microbatches)
 
@@ -442,9 +474,11 @@ class JustGRPOMegatronPolicyWorkerImpl(MegatronPolicyWorkerImpl):
             straggler_timer=self.mcore_state.straggler_timer,
         )
         if attention_mode == "inference_block_bidirectional":
+            block_size = self._diffusion_block_size()
+            self._maybe_print_diffusion_block_size("get_logprobs", block_size)
             mb_iterator = self._with_block_bidirectional_attention(
                 mb_iterator,
-                block_size=self._diffusion_block_size(),
+                block_size=block_size,
             )
 
         logprobs_post_processor = JustGRPOLogprobsPostProcessor(

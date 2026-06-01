@@ -319,7 +319,10 @@ class JustGRPOLeftmostRevealLogprobEstimationConfig(TypedDict):
     type: Literal["just_grpo_leftmost_reveal"]
     reveal_schedule: Literal["sparse", "fixed_response_window"]
     megatron_attention_mode: Literal[
-        "training", "inference_bidirectional", "inference_block_bidirectional"
+        "training",
+        "inference_causal",
+        "inference_bidirectional",
+        "inference_block_bidirectional",
     ]
     mask_token_id: int
     max_reveal_positions: NotRequired[int]

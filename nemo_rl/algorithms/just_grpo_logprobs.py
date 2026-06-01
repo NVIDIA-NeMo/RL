@@ -76,16 +76,24 @@ def build_leftmost_reveal_batch(
     else:
         sample_mask_bool = torch.ones(batch_size, device=device, dtype=torch.bool)
 
-    length_mask = torch.arange(seq_len, device=device).unsqueeze(0) < input_lengths.to(
-        device=device
-    ).unsqueeze(1)
+    input_lengths_device = input_lengths.to(device=device)
+    length_mask = torch.arange(seq_len, device=device).unsqueeze(0) < (
+        input_lengths_device.unsqueeze(1)
+    )
     token_mask_bool = token_mask_bool & length_mask
+    # Logprob replay should match generation-time context. Environment replies or
+    # other non-generated suffix tokens can be present after the response in
+    # input_ids/input_lengths, but SGLang did not condition on them while
+    # generating response tokens. Shorten reveal rows to the last generated
+    # token so those suffix tokens are outside the attention length.
+    scoring_input_lengths = input_lengths_device.clone()
 
     row_tensors = []
     batch_indices = []
     target_positions = []
     target_tokens = []
     response_starts = []
+    response_ends = []
 
     if reveal_schedule == "fixed_response_window" and max_reveal_positions is None:
         raise ValueError(
@@ -101,6 +109,14 @@ def build_leftmost_reveal_batch(
         valid_positions = torch.nonzero(
             token_mask_bool[batch_idx], as_tuple=False
         ).flatten()
+        if valid_positions.numel() > 0:
+            response_end = int(valid_positions[-1].item()) + 1
+            scoring_input_lengths[batch_idx] = response_end
+        else:
+            response_end = int(
+                min(max(input_lengths[batch_idx].item(), 0), seq_len)
+            )
+
         if reveal_schedule == "fixed_response_window":
             if valid_positions.numel() > 0:
                 response_start = int(valid_positions[0].item())
@@ -137,11 +153,12 @@ def build_leftmost_reveal_batch(
             response_starts.append(
                 response_start if reveal_schedule == "fixed_response_window" else position
             )
+            response_ends.append(response_end)
             row_mask_values.append(row_is_valid)
 
     if row_tensors:
         expanded_input_ids = torch.stack(row_tensors, dim=0)
-        expanded_input_lengths = input_lengths.to(device=device)[
+        expanded_input_lengths = scoring_input_lengths[
             torch.tensor(batch_indices, device=device, dtype=torch.long)
         ]
         batch_indices_tensor = torch.tensor(
@@ -153,6 +170,9 @@ def build_leftmost_reveal_batch(
         target_tokens_tensor = torch.stack(target_tokens).to(device=device)
         response_starts_tensor = torch.tensor(
             response_starts, device=device, dtype=torch.long
+        )
+        response_ends_tensor = torch.tensor(
+            response_ends, device=device, dtype=torch.long
         )
         row_mask_tensor = torch.tensor(
             row_mask_values, device=device, dtype=torch.float32
@@ -167,6 +187,7 @@ def build_leftmost_reveal_batch(
         target_positions_tensor = torch.empty(0, device=device, dtype=torch.long)
         target_tokens_tensor = torch.empty(0, device=device, dtype=input_ids.dtype)
         response_starts_tensor = torch.empty(0, device=device, dtype=torch.long)
+        response_ends_tensor = torch.empty(0, device=device, dtype=torch.long)
         row_mask_tensor = torch.empty(0, device=device, dtype=torch.float32)
         output_shape_tensor = torch.empty(0, 2, device=device, dtype=torch.long)
 
@@ -178,6 +199,7 @@ def build_leftmost_reveal_batch(
             "just_grpo_target_positions": target_positions_tensor,
             "just_grpo_target_tokens": target_tokens_tensor,
             "just_grpo_response_starts": response_starts_tensor,
+            "just_grpo_response_ends": response_ends_tensor,
             "just_grpo_row_mask": row_mask_tensor,
             "just_grpo_output_shape": output_shape_tensor,
         }
@@ -241,6 +263,7 @@ def build_leftmost_reveal_loss_batch(
         "just_grpo_target_positions",
         "just_grpo_target_tokens",
         "just_grpo_response_starts",
+        "just_grpo_response_ends",
         "just_grpo_row_mask",
         "just_grpo_loss_mask",
         "just_grpo_output_shape",
