@@ -236,7 +236,7 @@ class SingleControllerActor:
             return await result
         return result
 
-    # ── the three pumps ────────────────────────────────────────────────────
+    # ── the four pumps (three main pumps + advantage pump) ─────────────────
 
     async def _rollout_pump(self) -> None:
         """Dispatch prompts as concurrent coroutines, one per prompt group.
@@ -388,51 +388,39 @@ class SingleControllerActor:
                 )
                 self._train_steps += 1
 
-    async def _claim_available_meta(self) -> None:
-        """Claim currently-ready rows and append them to the local scheduler cache.
+    async def _sync_weights(self) -> None:
+        """Drain in-flight rollouts then synchronize weights.
 
-        TODO: replace this with a non-consuming metadata listing API.
-        ``claim_meta`` advances TQ's per-task cursor, so SC must keep a
-        local cache of claimed-but-not-yet-trained samples for now.
+        SC owns the drain gate (when to sync); WeightSynchronizer owns how.
+
+        Flow:
+          1. _rollout_permitted.clear()  — no new dispatches
+          2. drain _inflight_rollouts → 0  (5ms poll)
+          3. weight_synchronizer.sync_weights(trainer_version)
+          4. _rollout_permitted.set()   — resume
         """
-        batch_size = (
-            self._cfg.max_claim_prompt_groups * self._cfg.generations_per_prompt
-        )
-        meta = await self._call_dp(
-            "claim_meta",
-            partition_id=self._cfg.partition_id,
-            task_name=self._cfg.consumer_task_name,
-            required_fields=self._claim_required_fields(),
-            batch_size=batch_size,
-            blocking=False,
-            timeout_s=0.0,
-        )
-        if meta.size == 0:
-            return
-        if self._claimed_meta is None or self._claimed_meta.size == 0:
-            self._claimed_meta = meta
-        else:
-            self._claimed_meta = self._claimed_meta.concat(meta)
+        self._rollout_permitted.clear()
 
-    def _claim_required_fields(self) -> list[str]:
-        fields = list(self._cfg.claim_required_fields)
-        if self._cfg.advantage_enabled:
-            fields.extend(self._advantage_input_fields())
-        return list(dict.fromkeys(fields))
+        # Drain: wait for all in-flight rollouts to complete before NCCL
+        # Critical: if GenWorker has queued calls when NCCL init is dispatched,
+        # the init sits behind them — trainer blocks in rendezvous → deadlock
+        drain_start = time.monotonic()
+        while self._inflight_rollouts > 0:
+            await asyncio.sleep(0.005)
 
-    def _advantage_input_fields(self) -> list[str]:
-        fields = [
-            self._cfg.advantage_prompt_ids_field,
-            self._cfg.advantage_reward_field,
-            self._cfg.advantage_token_mask_field,
-            self._cfg.advantage_sample_mask_field,
-            *self._cfg.advantage_repeated_batch_fields,
-        ]
-        if self._cfg.advantage_policy_logprobs_field is not None:
-            fields.append(self._cfg.advantage_policy_logprobs_field)
-        if self._cfg.advantage_reference_logprobs_field is not None:
-            fields.append(self._cfg.advantage_reference_logprobs_field)
-        return list(dict.fromkeys(fields))
+        drain_elapsed = time.monotonic() - drain_start
+        log.info(
+            "  _sync_weights: drained in %.3fs, syncing weights v%d",
+            drain_elapsed,
+            self._trainer_version,
+        )
+
+        t0 = time.monotonic()
+        await self._weight_synchronizer.sync_weights(self._trainer_version)
+        elapsed = time.monotonic() - t0
+
+        log.info("  _sync_weights: sync done in %.3fs", elapsed)
+        self._rollout_permitted.set()
 
     async def _advantage_pump(self, meta: KVBatchMeta) -> KVBatchMeta:
         """Fetch advantage inputs, compute advantages, and write them back.
@@ -503,6 +491,54 @@ class SingleControllerActor:
         )
         return meta.with_fields([self._cfg.advantage_output_field])
 
+    # ── utility helpers ────────────────────────────────────────────────────
+
+    async def _claim_available_meta(self) -> None:
+        """Claim currently-ready rows and append them to the local scheduler cache.
+
+        TODO: replace this with a non-consuming metadata listing API.
+        ``claim_meta`` advances TQ's per-task cursor, so SC must keep a
+        local cache of claimed-but-not-yet-trained samples for now.
+        """
+        batch_size = (
+            self._cfg.max_claim_prompt_groups * self._cfg.generations_per_prompt
+        )
+        meta = await self._call_dp(
+            "claim_meta",
+            partition_id=self._cfg.partition_id,
+            task_name=self._cfg.consumer_task_name,
+            required_fields=self._claim_required_fields(),
+            batch_size=batch_size,
+            blocking=False,
+            timeout_s=0.0,
+        )
+        if meta.size == 0:
+            return
+        if self._claimed_meta is None or self._claimed_meta.size == 0:
+            self._claimed_meta = meta
+        else:
+            self._claimed_meta = self._claimed_meta.concat(meta)
+
+    def _claim_required_fields(self) -> list[str]:
+        fields = list(self._cfg.claim_required_fields)
+        if self._cfg.advantage_enabled:
+            fields.extend(self._advantage_input_fields())
+        return list(dict.fromkeys(fields))
+
+    def _advantage_input_fields(self) -> list[str]:
+        fields = [
+            self._cfg.advantage_prompt_ids_field,
+            self._cfg.advantage_reward_field,
+            self._cfg.advantage_token_mask_field,
+            self._cfg.advantage_sample_mask_field,
+            *self._cfg.advantage_repeated_batch_fields,
+        ]
+        if self._cfg.advantage_policy_logprobs_field is not None:
+            fields.append(self._cfg.advantage_policy_logprobs_field)
+        if self._cfg.advantage_reference_logprobs_field is not None:
+            fields.append(self._cfg.advantage_reference_logprobs_field)
+        return list(dict.fromkeys(fields))
+
     async def _evict_stale_claimed(self) -> KVBatchMeta | None:
         if self._claimed_meta is None or self._claimed_meta.size == 0:
             return None
@@ -529,40 +565,6 @@ class SingleControllerActor:
         )
         self._claimed_meta = self._claimed_meta.drop(indices)
         return evicted_meta
-
-    async def _sync_weights(self) -> None:
-        """Drain in-flight rollouts then synchronize weights.
-
-        SC owns the drain gate (when to sync); WeightSynchronizer owns how.
-
-        Flow:
-          1. _rollout_permitted.clear()  — no new dispatches
-          2. drain _inflight_rollouts → 0  (5ms poll)
-          3. weight_synchronizer.sync_weights(trainer_version)
-          4. _rollout_permitted.set()   — resume
-        """
-        self._rollout_permitted.clear()
-
-        # Drain: wait for all in-flight rollouts to complete before NCCL
-        # Critical: if GenWorker has queued calls when NCCL init is dispatched,
-        # the init sits behind them — trainer blocks in rendezvous → deadlock
-        drain_start = time.monotonic()
-        while self._inflight_rollouts > 0:
-            await asyncio.sleep(0.005)
-
-        drain_elapsed = time.monotonic() - drain_start
-        log.info(
-            "  _sync_weights: drained in %.3fs, syncing weights v%d",
-            drain_elapsed,
-            self._trainer_version,
-        )
-
-        t0 = time.monotonic()
-        await self._weight_synchronizer.sync_weights(self._trainer_version)
-        elapsed = time.monotonic() - t0
-
-        log.info("  _sync_weights: sync done in %.3fs", elapsed)
-        self._rollout_permitted.set()
 
 
 def _tensor_field(data: TensorDict, field_name: str) -> torch.Tensor:
