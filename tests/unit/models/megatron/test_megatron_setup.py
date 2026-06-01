@@ -1240,6 +1240,140 @@ class TestCreateCheckpointConfig:
         assert checkpoint_config.fully_parallel_load is True
         assert checkpoint_config.load_rng is False
 
+    def test_async_save_default_when_config_absent(self, tmp_path):
+        """When no config is passed, async_save must remain disabled
+        (matches the historical hard-coded default).
+        """
+        from nemo_rl.models.megatron.setup import _create_checkpoint_config
+
+        checkpoint_config = _create_checkpoint_config(
+            str(tmp_path / "pretrained"),
+            str(tmp_path / "weights"),
+            str(tmp_path / "optimizer"),
+        )
+        assert checkpoint_config.async_save is False
+
+    def test_async_save_default_when_key_absent(self, tmp_path):
+        """When megatron_cfg is present but lacks async_save, the flag
+        must remain disabled (don't surprise existing configs).
+        """
+        from nemo_rl.models.megatron.setup import _create_checkpoint_config
+
+        config = {"megatron_cfg": {}}
+        checkpoint_config = _create_checkpoint_config(
+            str(tmp_path / "pretrained"),
+            str(tmp_path / "weights"),
+            str(tmp_path / "optimizer"),
+            config,
+        )
+        assert checkpoint_config.async_save is False
+
+    def test_async_save_enabled_via_config(self, tmp_path):
+        """When config sets ``async_save: true``, the value flows through
+        to the underlying CheckpointConfig — issue #2229.
+        """
+        from nemo_rl.models.megatron.setup import _create_checkpoint_config
+
+        config = {"megatron_cfg": {"async_save": True}}
+        checkpoint_config = _create_checkpoint_config(
+            str(tmp_path / "pretrained"),
+            str(tmp_path / "weights"),
+            str(tmp_path / "optimizer"),
+            config,
+        )
+        assert checkpoint_config.async_save is True
+
+    def test_parallelism_and_rng_flags_default_when_absent(self, tmp_path):
+        """When the new parallelism/RNG keys are absent the historical
+        defaults must hold — fully_parallel_save/load default True,
+        load_rng defaults False."""
+        from nemo_rl.models.megatron.setup import _create_checkpoint_config
+
+        checkpoint_config = _create_checkpoint_config(
+            str(tmp_path / "pretrained"),
+            str(tmp_path / "weights"),
+            str(tmp_path / "optimizer"),
+            {"megatron_cfg": {}},
+        )
+        assert checkpoint_config.fully_parallel_save is True
+        assert checkpoint_config.fully_parallel_load is True
+        assert checkpoint_config.load_rng is False
+
+    def test_parallelism_and_rng_flags_overridable_via_config(self, tmp_path):
+        """User config can flip the parallelism/RNG knobs — issue #2229."""
+        from nemo_rl.models.megatron.setup import _create_checkpoint_config
+
+        config = {
+            "megatron_cfg": {
+                "fully_parallel_save": False,
+                "fully_parallel_load": False,
+                "load_rng": True,
+            }
+        }
+        checkpoint_config = _create_checkpoint_config(
+            str(tmp_path / "pretrained"),
+            str(tmp_path / "weights"),
+            str(tmp_path / "optimizer"),
+            config,
+        )
+        assert checkpoint_config.fully_parallel_save is False
+        assert checkpoint_config.fully_parallel_load is False
+        assert checkpoint_config.load_rng is True
+
+
+@pytest.mark.mcore
+class TestSetupDistributedTimeout:
+    """Tests for the optional distributed_timeout_minutes config knob."""
+
+    def test_no_timeout_kwarg_when_config_absent(self):
+        """Without a config argument, ``init_process_group`` is called with
+        no extra kwargs — preserving the historical default timeout.
+        """
+        from nemo_rl.models.megatron import setup as setup_mod
+
+        with (
+            patch.object(setup_mod, "configure_dynamo_cache"),
+            patch.object(setup_mod, "destroy_parallel_state"),
+            patch.object(setup_mod.torch.distributed, "init_process_group") as ipg,
+        ):
+            setup_mod.setup_distributed()
+
+        ipg.assert_called_once_with("nccl")
+
+    def test_no_timeout_kwarg_when_key_absent(self):
+        """A megatron_cfg block without distributed_timeout_minutes must
+        not cause a timeout to be set — protects existing user configs.
+        """
+        from nemo_rl.models.megatron import setup as setup_mod
+
+        config = {"megatron_cfg": {}}
+        with (
+            patch.object(setup_mod, "configure_dynamo_cache"),
+            patch.object(setup_mod, "destroy_parallel_state"),
+            patch.object(setup_mod.torch.distributed, "init_process_group") as ipg,
+        ):
+            setup_mod.setup_distributed(config)
+
+        ipg.assert_called_once_with("nccl")
+
+    def test_timeout_forwarded_when_set(self):
+        """``distributed_timeout_minutes`` must be forwarded as a
+        ``timedelta`` on the ``timeout`` kwarg — issue #2229.
+        """
+        from datetime import timedelta
+
+        from nemo_rl.models.megatron import setup as setup_mod
+
+        config = {"megatron_cfg": {"distributed_timeout_minutes": 120}}
+        with (
+            patch.object(setup_mod, "configure_dynamo_cache"),
+            patch.object(setup_mod, "destroy_parallel_state"),
+            patch.object(setup_mod.torch.distributed, "init_process_group") as ipg,
+        ):
+            setup_mod.setup_distributed(config)
+
+        ipg.assert_called_once_with("nccl", timeout=timedelta(minutes=120))
+
 
 @pytest.mark.mcore
 class TestValidateTrainingConfig:

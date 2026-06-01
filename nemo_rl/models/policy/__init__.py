@@ -277,6 +277,33 @@ class MegatronConfig(TypedDict):
     linear_ce_fusion_chunk_size: NotRequired[int]
     # When mtp_num_layers=0, Multi-Token Prediction is disabled.
     mtp_num_layers: NotRequired[int]
+    # Timeout (in minutes) passed to torch.distributed.init_process_group.
+    # Increase from the framework default when initial weight conversion or
+    # checkpoint load can exceed the default NCCL timeout (e.g. very large
+    # models on slow storage). When unset, the upstream default is used.
+    distributed_timeout_minutes: NotRequired[int]
+    # When True, save checkpoints asynchronously so training does not block on
+    # filesystem I/O. Defaults to False when unset (matching the historical
+    # behavior). The async save plumbing already exists in Megatron-Core; this
+    # toggle exposes it to the user.
+    async_save: NotRequired[bool]
+    # When True, Megatron-LM's DDP performs a per-step NaN/Inf grad check.
+    # Useful for debugging numerical stability but adds non-trivial overhead
+    # in steady-state training. Defaults to True when unset (matching the
+    # historical behavior).
+    check_for_nan_in_grad: NotRequired[bool]
+    # Verbosity level forwarded to Megatron-LM's LoggerConfig (0 = quiet).
+    # Defaults to 0 when unset.
+    logging_level: NotRequired[int]
+    # When True, checkpoint save/load uses Megatron-Core's fully-parallel
+    # path. Defaults to True when unset (matching the historical behavior).
+    # Setting to False can simplify debugging at the cost of throughput.
+    fully_parallel_save: NotRequired[bool]
+    fully_parallel_load: NotRequired[bool]
+    # When True, RNG state is included in saved checkpoints and restored on
+    # load — needed for bit-exact resume. Defaults to False when unset
+    # (matching the historical behavior).
+    load_rng: NotRequired[bool]
 
 
 class DraftConfigDisabled(TypedDict):

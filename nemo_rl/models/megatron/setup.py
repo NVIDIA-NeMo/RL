@@ -17,6 +17,7 @@ import json
 import os
 import time
 import warnings
+from datetime import timedelta
 from typing import Any, Callable, Optional, TypeVar
 
 import torch
@@ -143,15 +144,34 @@ def destroy_parallel_state():
         pass
 
 
-def setup_distributed() -> None:
-    """Handle NCCL settings, dtype mapping, and basic config setup."""
+def setup_distributed(config: Optional[Any] = None) -> None:
+    """Handle NCCL settings, dtype mapping, and basic config setup.
+
+    Args:
+        config: Optional ``PolicyConfig``. When provided and
+            ``config["megatron_cfg"]["distributed_timeout_minutes"]`` is set,
+            that value is forwarded as the ``timeout`` argument to
+            ``torch.distributed.init_process_group``. The default NCCL timeout
+            (currently ~10 minutes) can be too short for very large models on
+            slow storage during initial checkpoint conversion, so this knob
+            lets users extend it.
+    """
     # Disable dynamo autotune_local_cache to avoid crash when there's already a cache
     # with different order of node_bundles
     configure_dynamo_cache()
     # Ensure clean slate before import
     destroy_parallel_state()
     # Need to initialize the process group before calling into Megatron-Bridge, otherwise Megatron-Bridge will try to set an incorrect device
-    torch.distributed.init_process_group("nccl")
+    init_kwargs: dict[str, Any] = {}
+    if (
+        config is not None
+        and "megatron_cfg" in config
+        and "distributed_timeout_minutes" in config["megatron_cfg"]
+    ):
+        init_kwargs["timeout"] = timedelta(
+            minutes=config["megatron_cfg"]["distributed_timeout_minutes"]
+        )
+    torch.distributed.init_process_group("nccl", **init_kwargs)
 
 
 def validate_and_set_config(
@@ -507,7 +527,7 @@ def setup_model_config(
 
     # Create checkpoint configs
     checkpoint_config = _create_checkpoint_config(
-        pretrained_path, weights_path, optimizer_path
+        pretrained_path, weights_path, optimizer_path, config
     )
 
     # Validate training configuration
@@ -764,19 +784,40 @@ def _validate_chunking_config(config: PolicyConfig) -> None:
 
 
 def _create_checkpoint_config(
-    pretrained_path: str, weights_path: Optional[str], optimizer_path: Optional[str]
+    pretrained_path: str,
+    weights_path: Optional[str],
+    optimizer_path: Optional[str],
+    config: Optional[Any] = None,
 ) -> CheckpointConfig:
-    """Create checkpoint configurations."""
+    """Create checkpoint configurations.
+
+    The ``async_save``, ``fully_parallel_save``, ``fully_parallel_load``, and
+    ``load_rng`` flags are read from ``config["megatron_cfg"]`` when set, so
+    users can override Megatron-Core's checkpoint I/O behavior without
+    patching this module. When a key is absent, the historical hard-coded
+    default is used.
+    """
+    megatron_cfg = (
+        config["megatron_cfg"]
+        if config is not None and "megatron_cfg" in config
+        else {}
+    )
+
+    async_save: bool = megatron_cfg.get("async_save", False)
+    fully_parallel_save: bool = megatron_cfg.get("fully_parallel_save", True)
+    fully_parallel_load: bool = megatron_cfg.get("fully_parallel_load", True)
+    load_rng: bool = megatron_cfg.get("load_rng", False)
+
     return CheckpointConfig(
         save_interval=100,
         save=weights_path,
         load=weights_path,
         load_optim=optimizer_path is not None,
         pretrained_checkpoint=pretrained_path,
-        async_save=False,
-        fully_parallel_save=True,
-        fully_parallel_load=True,
-        load_rng=False,
+        async_save=async_save,
+        fully_parallel_save=fully_parallel_save,
+        fully_parallel_load=fully_parallel_load,
+        load_rng=load_rng,
     )
 
 
@@ -846,10 +887,21 @@ def _create_megatron_config(
     dtype: torch.dtype,
 ) -> ConfigContainer:
     """Create the final Megatron configuration container."""
+    # Read optional infrastructure knobs from megatron_cfg, falling back to the
+    # values that were previously hard-coded so behavior is unchanged for any
+    # config that doesn't set them.
+    logging_level: int = 0
+    if "logging_level" in config["megatron_cfg"]:
+        logging_level = config["megatron_cfg"]["logging_level"]
+
+    check_for_nan_in_grad: bool = True
+    if "check_for_nan_in_grad" in config["megatron_cfg"]:
+        check_for_nan_in_grad = config["megatron_cfg"]["check_for_nan_in_grad"]
+
     return ConfigContainer(
         model=model_cfg,
         checkpoint=checkpoint_config,
-        logger=LoggerConfig(logging_level=0),
+        logger=LoggerConfig(logging_level=logging_level),
         train=TrainingConfig(
             micro_batch_size=1,  # ignored
             global_batch_size=config["train_global_batch_size"],  # ignored
@@ -857,7 +909,7 @@ def _create_megatron_config(
         ),
         optimizer=OptimizerConfig(**config["megatron_cfg"]["optimizer"]),
         ddp=DistributedDataParallelConfig(
-            check_for_nan_in_grad=True,
+            check_for_nan_in_grad=check_for_nan_in_grad,
             grad_reduce_in_fp32=config["megatron_cfg"][
                 "distributed_data_parallel_config"
             ]["grad_reduce_in_fp32"],
@@ -1254,13 +1306,20 @@ def setup_reference_model_state(
     pre_load_checkpoint_hook: Optional[Callable] = None,
 ) -> dict:
     """Setup the reference model for inference and return its state dict."""
+    # Mirror the user-overridable knobs from _create_checkpoint_config so the
+    # reference model honors the same checkpoint-I/O preferences. When a key
+    # is absent, the historical hard-coded default is used.
+    user_megatron_cfg = config.get("megatron_cfg", {}) or {}
+    fully_parallel_load: bool = user_megatron_cfg.get("fully_parallel_load", True)
+    load_rng: bool = user_megatron_cfg.get("load_rng", False)
+
     # Create reference checkpoint config
     ref_checkpoint_config = CheckpointConfig(
         pretrained_checkpoint=pretrained_path,
         save=None,
         load=None,
-        fully_parallel_load=True,
-        load_rng=False,
+        fully_parallel_load=fully_parallel_load,
+        load_rng=load_rng,
     )
 
     ref_ckpt_context = init_checkpointing_context(ref_checkpoint_config)
