@@ -12,9 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, NotRequired, TypedDict
-
-from nemo_rl.models.generation.interfaces import GenerationConfig
+from typing import NotRequired, TypedDict
 
 
 class SglangSpecificArgs(TypedDict):
@@ -93,10 +91,3 @@ class SglangSpecificArgs(TypedDict):
     enable_fast_load: NotRequired[bool]
     # Server warmup
     skip_server_warmup: NotRequired[bool]
-
-
-class SGLangConfig(GenerationConfig):
-    """Configuration for SGLang runtime."""
-
-    sglang_cfg: SglangSpecificArgs
-    sglang_kwargs: NotRequired[dict[str, Any]]

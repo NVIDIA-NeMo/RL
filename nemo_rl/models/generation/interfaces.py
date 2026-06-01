@@ -131,8 +131,14 @@ class GenerationConfig(TypedDict):
     colocated: NotRequired[ColocationConfig]
 
     # backend-specific configs
+    # vllm
     vllm_cfg: NotRequired[VllmSpecificArgs]
+    vllm_kwargs: NotRequired[dict[str, Any]]
+    quant_cfg: NotRequired[str | None]
+    # sglang
     sglang_cfg: NotRequired[SglangSpecificArgs]
+    sglang_kwargs: NotRequired[dict[str, Any]]
+    # megatron inference
     mcore_generation_config: NotRequired[dict[str, Any]]
 
     # This isn't meant to be passed by the user, but is populated by nemo_rl.models.generation.__init__.configure_generation_config
