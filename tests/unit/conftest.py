@@ -203,32 +203,6 @@ def pytest_collection_modifyitems(config, items):
     items[:] = new_items
 
 
-@pytest.fixture(autouse=True)
-def _vllm_force_spawn(request):
-    """Force vLLM's worker multiprocessing start method to ``spawn`` for vllm tests.
-
-    Tests that build a bare in-process ``vllm.LLM`` (rather than going through a
-    Ray actor) crash with "Cannot re-initialize CUDA in forked subprocess" when
-    CUDA is already initialized in the parent pytest process and vLLM forks its
-    EngineCore. This happens whenever such a test runs first/alone in a shard
-    (e.g. under FAST mode, where most other vLLM tests are deselected). Forcing
-    ``spawn`` makes these tests robust to ordering.
-    """
-    if request.node.get_closest_marker("vllm") is None:
-        yield
-        return
-
-    prev = os.environ.get("VLLM_WORKER_MULTIPROC_METHOD")
-    os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-    try:
-        yield
-    finally:
-        if prev is None:
-            os.environ.pop("VLLM_WORKER_MULTIPROC_METHOD", None)
-        else:
-            os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = prev
-
-
 TEST_ASSETS_DIR = os.path.join(dir_path, "test_assets")
 UNIT_RESULTS_FILE = os.path.join(dir_path, "unit_results.json")
 UNIT_RESULTS_FILE_DATED = os.path.join(
