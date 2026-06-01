@@ -161,8 +161,15 @@ data:
   train:
     dataset_name: "arrow_text"
     processor: "kd_data_processor"
-    data_files: null             # set via Hydra CLI, e.g. data.train.data_files=/path/glob/*.arrow
-                                 # (matches the HF `load_dataset("arrow", data_files=...)` arg name; accepts globs or HTTP URLs)
+    # Default: an ungated, CC-BY-4.0 NVIDIA raw-text corpus, pointed straight at
+    # its parquet shards over hf:// so the recipe runs with no auth and no extra
+    # setup. `data_files` accepts a path/glob/URL to .arrow/.parquet/.json/.txt
+    # files (format inferred from the extension) OR a bare HuggingFace dataset id
+    # (loaded by name; in that case set `subset` to pick a config). To train on
+    # your own .arrow corpus, override only:
+    #   data.train.data_files=/path/glob/*.arrow
+    data_files: "hf://datasets/nvidia/Nemotron-Pretraining-Specialized-v1.1/Nemotron-Pretraining-Formal-Logic/*.parquet"
+    split: "train"
     text_key: "text"
     characters_per_sample: 16384
   validation: null

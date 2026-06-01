@@ -136,7 +136,7 @@ def test_D1_packed_unpacked_emit_same_valid_row_set(mixed_arrow_file):
 
 @pytest.mark.parametrize(
     "key",
-    ["data_files", "text_key", "characters_per_sample"],
+    ["data_files", "subset", "split", "text_key", "characters_per_sample"],
 )
 def test_D2_response_dataset_config_declares_arrow_text_keys(key: str):
     """Class B. Reviewer flagged that ArrowTextDataset reads undeclared

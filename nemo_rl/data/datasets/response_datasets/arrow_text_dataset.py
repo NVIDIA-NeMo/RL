@@ -24,19 +24,30 @@ from __future__ import annotations
 
 from typing import Any, Iterable
 
-from datasets import Dataset, load_dataset
+from datasets import Dataset
 
 from nemo_rl.data.datasets.raw_dataset import RawDataset
+from nemo_rl.data.datasets.utils import load_dataset_from_path
 
 
 class ArrowTextDataset(RawDataset):
-    """Load arrow shards as a stream of raw text strings.
+    """Load a stream of raw text strings for cross-tokenizer distillation.
+
+    The source is resolved by ``load_dataset_from_path``, which infers the
+    loader from ``data_files``: a ``.arrow`` / ``.parquet`` / ``.json`` /
+    ``.txt`` path (local, glob, or HTTP/``hf://`` URL) uses the matching
+    file-format builder, while a bare HuggingFace dataset id (no extension)
+    is loaded by name. This lets the same recipe run on a packaged HF dataset
+    by default and on user-supplied ``.arrow`` files via a single override.
 
     Args:
-        data_files: Path or glob to one or more ``.arrow`` files (local
-            paths, globs, or HTTP URLs). Forwarded verbatim to
-            ``datasets.load_dataset("arrow", data_files=...)``; the
-            parameter name mirrors the HuggingFace API.
+        data_files: Path, glob, or URL to a data file (``.arrow``/``.parquet``
+            /``.json``/``.txt``), or a HuggingFace dataset id to load by name.
+            A single string (globs allowed); not a list.
+        subset: HuggingFace config/subset name. Only valid when ``data_files``
+            is a dataset id (not a file path); selects the config for datasets
+            that define multiple.
+        split: Split to load (default ``"train"``).
         text_key: Column on the loaded dataset that contains the raw text.
         characters_per_sample: If set, pack consecutive rows together until
             the running character count reaches this threshold; emit a packed
@@ -48,7 +59,9 @@ class ArrowTextDataset(RawDataset):
 
     def __init__(
         self,
-        data_files: str | list[str],
+        data_files: str,
+        subset: str | None = None,
+        split: str = "train",
         text_key: str = "text",
         characters_per_sample: int | None = None,
         split_validation_size: float = 0.0,
@@ -58,7 +71,7 @@ class ArrowTextDataset(RawDataset):
         self.text_key = text_key
         self.task_name = "x_token"
 
-        raw = load_dataset("arrow", data_files=data_files, split="train")
+        raw = load_dataset_from_path(data_files, subset, split)
         # Drop rows whose text column is non-string or empty. Applied at the
         # source so the packed and non-packed branches below see the same
         # corpus; without this filter the non-packed branch passed ``None``
