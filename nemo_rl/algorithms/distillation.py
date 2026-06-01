@@ -52,7 +52,7 @@ from nemo_rl.experience.rollouts import (
 from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
 )
-from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
@@ -413,7 +413,6 @@ def setup(
     if backend == "megatron":
         student_generation = None
     elif backend == "vllm":
-        generation_config = cast(VllmConfig, generation_config)
         if "vllm_cfg" in generation_config:
             ## make vllm hf overrides match the training policy
             generation_config["vllm_kwargs"]["hf_overrides"] = policy_config.get(

@@ -17,7 +17,6 @@ from typing import cast
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
-from nemo_rl.models.generation.vllm import VllmConfig
 
 TokenizerType = PreTrainedTokenizerBase
 
@@ -42,7 +41,6 @@ def configure_generation_config(
 
     # vllm setting
     if config["backend"] == "vllm":
-        config = cast(VllmConfig, config)  # type: ignore
         # set load_format
         config["vllm_cfg"]["load_format"] = "auto" if is_eval else "dummy"
         speculative_config = config.get("vllm_kwargs", {}).get("speculative_config")

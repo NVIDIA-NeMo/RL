@@ -43,7 +43,8 @@ from nemo_rl.experience.rollouts import (
     run_multi_turn_rollout,
 )
 from nemo_rl.models.generation import configure_generation_config
-from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation.interfaces import GenerationConfig as VllmConfig
+from nemo_rl.models.generation.vllm import VllmGeneration
 
 # These are all fixtures
 from tests.unit.environments.test_nemo_gym import (

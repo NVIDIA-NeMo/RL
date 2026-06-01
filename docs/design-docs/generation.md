@@ -155,7 +155,8 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import configure_generation_config
-from nemo_rl.models.generation.vllm import VllmGeneration, VllmConfig
+from nemo_rl.models.generation.interfaces import GenerationConfig as VllmConfig
+from nemo_rl.models.generation.vllm import VllmGeneration
 
 # Set up the configuration
 config = VllmConfig(

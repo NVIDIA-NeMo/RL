@@ -28,7 +28,8 @@ import torch
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
-from nemo_rl.models.generation.sglang import SGLangConfig, SGLangGeneration
+from nemo_rl.models.generation.interfaces import GenerationConfig as SGLangConfig
+from nemo_rl.models.generation.sglang import SGLangGeneration
 
 model_name = "Qwen/Qwen3-0.6B"
 
