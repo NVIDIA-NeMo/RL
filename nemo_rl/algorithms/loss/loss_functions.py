@@ -244,10 +244,6 @@ class ClippedPGLossFn(LossFunction):
                 "the dual-clip block runs after the CISPO loss assembly and would "
                 "silently overwrite it. Set ratio_clip_c=null when use_cispo=True."
             )
-        if self.truncated_importance_sampling_ratio is not None:
-            assert self.use_importance_sampling_correction, (
-                "truncated_importance_sampling_ratio is only supported when use_importance_sampling_correction is True"
-            )
         if self.truncated_importance_sampling_type is not None:
             assert self.use_importance_sampling_correction, (
                 "truncated importance sampling is only supported when use_importance_sampling_correction is True"
