@@ -15,7 +15,7 @@
 from typing import Any, Optional, Protocol
 
 
-class ReplayBufferProtocol(Protocol):
+class ReplayBufferProtocol(Protocol):  # pragma: no cover
     """Interface for the replay buffer used in async RL training."""
 
     def add(
