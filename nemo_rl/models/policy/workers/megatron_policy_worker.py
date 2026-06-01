@@ -919,7 +919,9 @@ class MegatronPolicyWorkerImpl(
 
             # Handle None values for top_k - convert to integer as required by Megatron
             top_k_cfg = self.cfg["generation"]["top_k"]
-            top_k_val = 1 if greedy else (int(top_k_cfg) if top_k_cfg is not None else 0)
+            top_k_val = (
+                1 if greedy else (int(top_k_cfg) if top_k_cfg is not None else 0)
+            )
 
             top_p_cfg = self.cfg["generation"]["top_p"]
             top_p_val = (
