@@ -52,7 +52,7 @@ class AsyncNemoGymRolloutManager:
         self._num_generations_per_prompt = num_generations_per_prompt
         self._max_seq_len = max_seq_len
         self._max_rollout_turns = max_rollout_turns
-        self._engine_max_model_len = generation_config["vllm_cfg"]["max_model_len"]
+        self._engine_max_model_len = generation_config["vllm_cfg"]["max_model_len"]  # type: ignore
 
         self._validate_init_params()
 
