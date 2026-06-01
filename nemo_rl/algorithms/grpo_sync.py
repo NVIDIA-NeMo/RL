@@ -84,6 +84,36 @@ from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import make_actor_runtime_env
 
+
+def _raise_if_message_level_advantage_penalties_enabled(
+    master_config: MasterConfig,
+) -> None:
+    """Raise if message-level advantage penalties are set in the sync trainer.
+
+    Message-level advantage penalties are not supported with
+    ``data_plane.enabled=true``. Raises NotImplementedError listing the
+    offending keys so the user can disable them or switch to the legacy GRPO
+    trainer.
+    """
+    unsupported_keys = [
+        key
+        for key in (
+            "invalid_tool_call_advantage",
+            "malformed_thinking_advantage",
+        )
+        if master_config.grpo.get(key) is not None
+    ]
+    if not unsupported_keys:
+        return
+
+    raise NotImplementedError(
+        "Message-level advantage penalties are not supported with "
+        "data_plane.enabled=true yet. Disable "
+        f"{', '.join(f'grpo.{key}' for key in unsupported_keys)} or use the "
+        "legacy GRPO trainer."
+    )
+
+
 # ── DAPO non-zero-std dynamic sampling, slice-only ─────────────────────
 # Slice-only formulation of nemo_rl.algorithms.grpo.dynamic_sampling: filter
 # on std != 0, accumulate survivors across iterations, slice on overflow.
@@ -402,8 +432,6 @@ def grpo_train_sync(
     val_period = master_config.grpo["val_period"]
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
 
-    adv_estimator = _create_advantage_estimator(master_config)
-
     # ── Data-plane setup (mandatory in the sync trainer) ───────────────
     # Sync trainer requires a TQ-mediated policy. The TQPolicy actor
     # bootstraps the controller and attaches workers; ``policy.dp_cfg``
@@ -417,6 +445,8 @@ def grpo_train_sync(
             "Use the legacy nemo_rl.algorithms.grpo.grpo_train trainer if you don't "
             "want TransferQueue."
         )
+    _raise_if_message_level_advantage_penalties_enabled(master_config)
+    adv_estimator = _create_advantage_estimator(master_config)
 
     # Driver-side pad-value dict for materialize() — the wire emits
     # jagged tensors for variable-length token fields (input_ids,

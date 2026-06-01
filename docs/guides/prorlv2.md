@@ -248,7 +248,7 @@ In addition to task rewards/accuracy, a few stability signals are particularly u
 
 - **Dynamic sampling efficiency**: if enabled, watch how often batches need multiple generation rounds (see `dapo.md` for detailed guidance).
 - **Training–generation mismatch**: `token_mult_prob_error`, `gen_kl_error`, `policy_kl_error`, `js_divergence_error` are computed in `ClippedPGLossFn` (see the [GRPO metrics section](grpo.md#metrics)).
-- **IS out-of-bounds ratio** (`is_oob_ratio`): the fraction of tokens (ICE-POP) or sequences (seq-mask-tis) filtered out by truncated IS. A persistently high value suggests large backend mismatch — check precision settings or relax the bounds.
+- **IS out-of-bounds ratio** (`is_oob_ratio`): the fraction of tokens (TIS clamped above the max, ICE-POP outside [min, max]) or sequences (seq-mask-tis) whose importance weight falls outside the truncation bounds. A persistently high value suggests large backend mismatch — check precision settings or relax the bounds.
 - **Truncation rate**: if high, either increase `policy.max_total_sequence_length`/`policy.generation.max_model_len` or relax truncation penalty (`stop_properly_penalty_coef`).
 
 ## References
