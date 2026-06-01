@@ -36,6 +36,84 @@ from .config import LoadedConfig, load_recipe_with_infra
 from .orchestrate import ALL_ROLES
 from .schema import ClusterSpec, CodeSource, RunMode, SubmitterMode
 
+
+class _VerbatimEpilogCommand(click.Command):
+    """Click command that prints the epilog as-is, without word-wrapping."""
+
+    def format_epilog(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
+        if self.epilog:
+            formatter.write("\n")
+            formatter.write(self.epilog)
+            formatter.write("\n")
+
+
+_DEV_POD_RBAC_YAML = """\
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: nrl-k8s-edit-aggregate
+aggregationRule:
+  clusterRoleSelectors:
+    - matchLabels:
+        rbac.authorization.k8s.io/aggregate-to-edit: "true"
+rules: []  # auto-filled by aggregation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: nrl-k8s-edit
+  labels:
+    rbac.authorization.k8s.io/aggregate-to-edit: "true"
+rules:
+  - apiGroups: [ray.io]
+    resources: [rayjobs, rayclusters]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [resource.nvidia.com]
+    resources: [computedomains]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [nvidia.com]
+    resources: [dynamographdeployments]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [resource.k8s.io]
+    resources: [resourceclaimtemplates]
+    verbs: [get, list, watch, create, update, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: node-reader
+rules:
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: default-sa-nrl-k8s-edit
+  namespace: <NAMESPACE>
+subjects:
+  - kind: ServiceAccount
+    name: default
+    namespace: <NAMESPACE>
+roleRef:
+  kind: ClusterRole
+  name: nrl-k8s-edit-aggregate
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: default-sa-nrl-k8s-node-reader-<NAMESPACE>
+subjects:
+  - kind: ServiceAccount
+    name: default
+    namespace: <NAMESPACE>
+roleRef:
+  kind: ClusterRole
+  name: node-reader
+  apiGroup: rbac.authorization.k8s.io"""
+
 _INFRA_OPTION = click.option(
     "--infra",
     "infra_path",
@@ -580,6 +658,15 @@ def run(
     invocations. ``--mode interactive`` (default) uses port-forward +
     working_dir upload and tails logs; ``--mode batch`` uses kubectl exec +
     in-image code and returns as soon as the driver is running via nohup.
+
+    **Recipe path substitution.** ``nrl-k8s run RECIPE`` rewrites
+    ``--config <path>.yaml`` in the training entrypoint to point at
+    the user-supplied RECIPE (translated to its in-pod path:
+    ``nrl_k8s_run.yaml`` in ``--code-source upload``, repo-relative in
+    ``image`` / ``lustre``). Without this, the pod would silently run
+    whatever recipe the infra entrypoint hardcoded; with it, the CLI
+    argument is authoritative and existing infras keep working
+    unchanged. Daemon entrypoints (gym/generation) are not rewritten.
     """
     from . import orchestrate
     from . import submit as submit_mod
@@ -1362,7 +1449,15 @@ def dev():
     """Manage a lightweight dev pod on the cluster."""
 
 
-@dev.command("connect")
+@dev.command(
+    "connect",
+    cls=_VerbatimEpilogCommand,
+    epilog=(
+        "Required RBAC:\n\n"
+        "NAMESPACE=default  # change as needed\n"
+        f"kubectl apply -f - <<EOF\n{_DEV_POD_RBAC_YAML}\nEOF"
+    ).replace("<NAMESPACE>", "${NAMESPACE}"),
+)
 @click.option(
     "--image",
     default="nvcr.io/nvidian/nemo-rl:nightly",
@@ -1648,6 +1743,30 @@ def _check_stale_rayjobs(loaded: LoadedConfig, namespace: str) -> None:
     _error_on_stale(_find_stale_resources(checks), namespace)
 
 
+def _rolebinding_exists(name: str, namespace: str) -> bool | None:
+    """Check whether a RoleBinding exists in *namespace* via the K8s API.
+
+    Returns True/False when the check succeeds, or None when the caller
+    lacks permission to read RoleBindings (403).
+    """
+    from kubernetes import client as k8s_client
+
+    from . import k8s
+
+    k8s.load_kubeconfig()
+    try:
+        k8s_client.RbacAuthorizationV1Api().read_namespaced_role_binding(
+            name, namespace
+        )
+        return True
+    except ApiException as exc:
+        if exc.status == 404:
+            return False
+        if exc.status == 403:
+            return None
+        raise
+
+
 def _check_dev_pod_rbac(namespace: str) -> None:
     """Verify the current user has edit access in the namespace."""
     import subprocess
@@ -1659,50 +1778,24 @@ def _check_dev_pod_rbac(namespace: str) -> None:
     )
     if result.stdout.strip() == "yes":
         return
-    heredoc = (
-        f"kubectl apply -f - <<'EOF'\n"
-        f"apiVersion: rbac.authorization.k8s.io/v1\n"
-        f"kind: ClusterRole\n"
-        f"metadata:\n"
-        f"  name: edit-with-ray\n"
-        f"aggregationRule:\n"
-        f"  clusterRoleSelectors:\n"
-        f"    - matchLabels:\n"
-        f'        rbac.authorization.k8s.io/aggregate-to-edit: "true"\n'
-        f"rules: []  # auto-filled by aggregation\n"
-        f"---\n"
-        f"apiVersion: rbac.authorization.k8s.io/v1\n"
-        f"kind: ClusterRole\n"
-        f"metadata:\n"
-        f"  name: ray-edit\n"
-        f"  labels:\n"
-        f'    rbac.authorization.k8s.io/aggregate-to-edit: "true"\n'
-        f"rules:\n"
-        f"  - apiGroups: [ray.io]\n"
-        f"    resources: [rayjobs, rayclusters]\n"
-        f"    verbs: [get, list, watch, create, update, patch, delete]\n"
-        f"  - apiGroups: [resource.nvidia.com]\n"
-        f"    resources: [computedomains]\n"
-        f"    verbs: [get, list, watch, create, update, patch, delete]\n"
-        f"  - apiGroups: [resource.k8s.io]\n"
-        f"    resources: [resourceclaimtemplates]\n"
-        f"    verbs: [get, list, watch, create, update, patch, delete]\n"
-        f"---\n"
-        f"apiVersion: rbac.authorization.k8s.io/v1\n"
-        f"kind: RoleBinding\n"
-        f"metadata:\n"
-        f"  name: default-sa-edit\n"
-        f"  namespace: {namespace}\n"
-        f"subjects:\n"
-        f"  - kind: ServiceAccount\n"
-        f"    name: default\n"
-        f"    namespace: {namespace}\n"
-        f"roleRef:\n"
-        f"  kind: ClusterRole\n"
-        f"  name: edit-with-ray\n"
-        f"  apiGroup: rbac.authorization.k8s.io\n"
-        f"EOF"
-    )
+
+    if "cannot impersonate" in result.stderr or "Forbidden" in result.stderr:
+        # User lacks impersonation privileges (e.g. engineer role).
+        # Fall back to checking whether the expected RoleBinding exists.
+        rb = _rolebinding_exists("default-sa-nrl-k8s-edit", namespace)
+        if rb is True:
+            return
+        if rb is None:
+            # Can't impersonate *or* read RBAC — skip the check with a warning.
+            click.echo(
+                "warning: cannot verify default SA permissions (impersonate + "
+                "RBAC read both denied) — assuming they are configured correctly",
+                err=True,
+            )
+            return
+
+    manifest = _DEV_POD_RBAC_YAML.replace("<NAMESPACE>", namespace)
+    heredoc = f"kubectl apply -f - <<'EOF'\n{manifest}\nEOF"
     _cli_error(
         f"the default service account in {namespace} lacks edit permissions — "
         f"kubectl won't work inside the dev pod",

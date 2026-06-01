@@ -186,6 +186,80 @@ def test_reward_shaping_with_penalties():
     assert torch.allclose(result_batch["total_reward"], expected_rewards, atol=1e-6)
 
 
+def test_reward_shaping_preserves_unshaped_reward_overlong():
+    """Reward shaping must save the pre-shaping reward so dynamic sampling can
+    filter prompt groups on the raw task metric, not on shaped reward whose
+    std is corrupted by length-dependent overlong penalties.
+    """
+    raw_rewards = [0.0, 0.0, 0.0, 0.0]
+    batch = create_mock_batch_with_responses(
+        num_samples=4,
+        response_lengths=[10, 22, 25, 30],
+        initial_rewards=raw_rewards,
+    )
+
+    config = RewardShapingConfig(
+        enabled=True,
+        overlong_buffer_length=5,
+        overlong_buffer_penalty=0.5,
+        max_response_length=25,
+    )
+
+    result_batch = apply_reward_shaping(batch, config)
+
+    # Shaped rewards differ across the group due to length-based penalty even
+    # though all raw rewards are 0 (i.e. all responses are wrong).
+    expected_shaped = torch.tensor([0.0, -0.2, -0.5, -1.0])
+    assert torch.allclose(result_batch["total_reward"], expected_shaped, atol=1e-6)
+
+    # The unshaped reward must be retained verbatim.
+    assert "unshaped_total_reward" in result_batch
+    assert torch.allclose(
+        result_batch["unshaped_total_reward"], torch.tensor(raw_rewards)
+    )
+    # The two tensors must be independent — mutating one must not affect the other.
+    assert (
+        result_batch["unshaped_total_reward"].data_ptr()
+        != result_batch["total_reward"].data_ptr()
+    )
+
+
+def test_reward_shaping_preserves_unshaped_reward_stop_properly():
+    """The stop-properly penalty path must also preserve the raw reward."""
+    raw_rewards = [1.0, 0.8, 0.6, 0.4]
+    batch = create_mock_batch_with_responses(
+        num_samples=4,
+        response_lengths=[10, 20, 30, 40],
+        initial_rewards=raw_rewards,
+    )
+    batch["truncated"] = torch.tensor([False, True, False, True])
+
+    config = RewardShapingConfig(enabled=True, stop_properly_penalty_coef=0.5)
+    result_batch = apply_reward_shaping(batch, config)
+
+    assert "unshaped_total_reward" in result_batch
+    assert torch.allclose(
+        result_batch["unshaped_total_reward"], torch.tensor(raw_rewards)
+    )
+
+
+def test_reward_shaping_disabled_does_not_save_unshaped_reward():
+    """When shaping is disabled, the unshaped_total_reward field should not be added."""
+    batch = create_mock_batch_with_responses(
+        num_samples=3, response_lengths=[10, 20, 30], initial_rewards=[1.0, 0.5, 0.8]
+    )
+
+    config = RewardShapingConfig(
+        enabled=False,
+        overlong_buffer_length=5,
+        overlong_buffer_penalty=0.1,
+        max_response_length=25,
+    )
+
+    result_batch = apply_reward_shaping(batch, config)
+    assert "unshaped_total_reward" not in result_batch
+
+
 def test_reward_shaping_missing_config_values():
     """Test that missing required config values raise ValueError."""
     batch = create_mock_batch_with_responses(

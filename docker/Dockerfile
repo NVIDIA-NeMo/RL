@@ -16,10 +16,13 @@
 #   --build-arg SKIP_VLLM_BUILD=1    # Skip vLLM dependencies
 #   --build-arg SKIP_SGLANG_BUILD=1  # Skip SGLang dependencies
 
-ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:25.05-cuda12.9-devel-ubuntu24.04
+ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.03-cuda13.2-devel-ubuntu24.04
 FROM scratch AS nemo-rl
 ARG NRL_GIT_REF=main
 ADD --keep-git-dir=true https://github.com/NVIDIA-NeMo/RL.git#${NRL_GIT_REF} /
+
+# Empty default; CI overrides with --build-context to inject pre-compiled wheels
+FROM scratch AS uv-cache-seed
 
 FROM ${BASE_IMAGE} AS base
 # An environment variable to indicate that we are in a container.
@@ -56,7 +59,7 @@ apt-get clean
 rm -rf /var/lib/apt/lists/*
 EOF
 
-# CMake (for sglang build)
+# CMake (for CUDA extension builds: transformer-engine, mamba-ssm, etc.)
 RUN GITHUB_ARTIFACTORY=github.com \
     && CMAKE_VERSION=3.31.1 \
     && ARCH=$(uname -m) \
@@ -105,12 +108,21 @@ ARG BUILD_CUSTOM_FLASHINFER_REF
 # Skip building vLLM or SGLang dependencies (set to any non-empty value to skip)
 ARG SKIP_VLLM_BUILD
 ARG SKIP_SGLANG_BUILD
+ARG BASE_IMAGE
+ARG UV_VERSION
 
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
 
 # Ensure DeepEP is built for H100 and B200 (also mcore inference unified memory API now invokes a torch API that requires these to be set)
 ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
+
+# Ensure HybridEP/DeepEP JIT compilation can find nvcc at runtime
+ENV CUDA_HOME=/usr/local/cuda
+
+## CUDA 13 moved standard library headers under include/cccl; expose that path so
+## builds that include <cuda/std/...> (e.g., deep_gemm) can find them.
+ENV CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl
 
 # First copy only the dependency files
 COPY --from=nemo-rl pyproject.toml uv.lock ./
@@ -121,7 +133,18 @@ COPY --from=nemo-rl tools/build-custom-flashinfer.sh ./tools/build-custom-flashi
 COPY --from=nemo-rl --link research/ ./research/
 COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
 
-RUN --mount=type=ssh <<"EOF" bash -exu
+RUN --mount=type=ssh \
+    --mount=type=bind,from=uv-cache-seed,source=.,target=/tmp/uv-cache-seed <<"EOF" bash -exu
+CACHE_KEY=$(echo "${BASE_IMAGE}-${UV_VERSION}" | md5sum | cut -c1-12)
+SEED_KEY=$(cat /tmp/uv-cache-seed/.cache-key 2>/dev/null || echo "")
+if [ -n "$SEED_KEY" ] && [ "$SEED_KEY" != "$CACHE_KEY" ]; then
+    echo "Cache key mismatch (base image or uv version changed) — skipping stale seed"
+elif [ -n "$SEED_KEY" ]; then
+    echo "Seeding uv cache (key=${CACHE_KEY})"
+    mkdir -p /root/.cache/uv
+    rsync -a --exclude='.cache-key' /tmp/uv-cache-seed/ /root/.cache/uv/ 2>/dev/null || true
+fi
+
 uv venv --seed
 if [[ -n "${BUILD_CUSTOM_VLLM:-}" ]]; then
     bash tools/build-custom-vllm.sh ${BUILD_CUSTOM_VLLM_URL} ${BUILD_CUSTOM_VLLM_REF} ${BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION}
@@ -152,6 +175,8 @@ uv sync --link-mode symlink --locked --all-groups --no-install-project
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8
 # The ray install will include the older aiohttp version in its cache
 find /root/.cache/uv -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
+
+echo "${CACHE_KEY}" > /root/.cache/uv/.cache-key
 EOF
 
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
@@ -185,6 +210,17 @@ LABEL com.nvidia.build.id="${NVIDIA_BUILD_ID}"
 LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
 
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
+
+# AWS EFA OFI plugin discovery (p4d / p5 / p5en multi-node NCCL via SRD).
+# The host's aws-efa-installer places libnccl-net-ofi.so under
+# /opt/amazon/ofi-nccl/lib and libfabric under /opt/amazon/efa/lib. Without
+# these on the linker search path, NCCL silently falls back to its socket
+# transport. Register both via ld.so.conf.d (so `ldconfig` populates the cache
+# once host paths are mounted at runtime) and LD_LIBRARY_PATH (so NCCL's
+# dlopen resolves the plugin even before `ldconfig` is re-run).
+RUN printf '%s\n' /opt/amazon/ofi-nccl/lib /opt/amazon/efa/lib \
+        > /etc/ld.so.conf.d/aws-efa.conf
+ENV LD_LIBRARY_PATH="/opt/amazon/ofi-nccl/lib:/opt/amazon/efa/lib:${LD_LIBRARY_PATH}"
 
 # Copy in source from build context (defaults to cloned repo, can be overridden)
 # Exclude pyproject.toml and uv.lock since those may be altered by build-custom-vllm.sh

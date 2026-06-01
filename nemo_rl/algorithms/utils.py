@@ -88,6 +88,7 @@ def calculate_baseline_and_std_per_prompt(
     rewards: torch.Tensor,
     valid_mask: torch.Tensor,
     leave_one_out_baseline: bool = True,
+    std_rewards: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Function to compute a baseline for each (prompt, response) pair in the batch.
 
@@ -99,10 +100,17 @@ def calculate_baseline_and_std_per_prompt(
     valid_mask: tensor (b,)       Vector of 0/1, where 0 is to ignore and 1 is to keep
     leave_one_out_baseline: bool  Compute an unbiased baseline by leaving out the sample that
                                   the baseline is for (from RLOO https://arxiv.org/abs/2402.14740)
+    std_rewards: tensor (b,)      Optional separate reward tensor used only for the std
+                                  calculation. Defaults to `rewards`. Useful for DAPO,
+                                  which needs std on the raw task metric for dynamic
+                                  sampling filtering while keeping baseline on the
+                                  shaped reward.
 
     Returns:
     tensor (b,), tensor (b,) of baselines and std on the same device as 'rewards'
     """
+    if std_rewards is None:
+        std_rewards = rewards
     unique_prompts = torch.unique(prompts, dim=0)
 
     baseline = torch.zeros_like(rewards)
@@ -141,19 +149,28 @@ def calculate_baseline_and_std_per_prompt(
                 )
                 / num_valid
             )
-            prompt_baseline_square = (
+            std_prompt_baseline = (
+                prompt_baseline
+                if std_rewards is rewards
+                else torch.matmul(
+                    baseline_mask_matrix,
+                    std_rewards[prompt_idx] * valid_mask[prompt_idx],
+                )
+                / num_valid
+            )
+            std_prompt_baseline_square = (
                 torch.matmul(
                     baseline_mask_matrix,
-                    torch.pow(rewards[prompt_idx], 2) * valid_mask[prompt_idx],
+                    torch.pow(std_rewards[prompt_idx], 2) * valid_mask[prompt_idx],
                 )
                 / num_valid
             )
 
             baseline[prompt_idx] = prompt_baseline
-            sq_baseline[prompt_idx] = prompt_baseline_square
+            sq_baseline[prompt_idx] = std_prompt_baseline_square
             std[prompt_idx] = (
                 (
-                    (prompt_baseline_square - prompt_baseline.square())
+                    (std_prompt_baseline_square - std_prompt_baseline.square())
                     * (num_valid / (num_valid - 1))
                 )
                 .sqrt()
@@ -594,9 +611,9 @@ def print_performance_metrics(
             else:
                 print(f"    - Generation Worker {dp_idx:3.0f}: {''.join(timeline)}")
 
-    is_vllm_metrics_logger_enabled = master_config["policy"]["generation"].get(
+    is_vllm_metrics_logger_enabled = master_config.policy["generation"].get(
         "vllm_cfg", {}
-    ).get("enable_vllm_metrics_logger", False) and master_config["policy"][
+    ).get("enable_vllm_metrics_logger", False) and master_config.policy[
         "generation"
     ].get("vllm_cfg", {}).get("async_engine", False)
     generation_logger_metrics = metrics.get("generation_logger_metrics", {})
@@ -618,9 +635,9 @@ def print_performance_metrics(
             "num_pending_samples must be a dictionary"
         )
 
-        vllm_metrics_logger_interval = master_config["policy"]["generation"][
-            "vllm_cfg"
-        ]["vllm_metrics_logger_interval"]
+        vllm_metrics_logger_interval = master_config.policy["generation"]["vllm_cfg"][
+            "vllm_metrics_logger_interval"
+        ]
         print("  • vLLM Logger Metrics:")
         # Visualize the inflight batch sizes timeline
         if len(vllm_logger_metrics["inflight_batch_sizes"].values()) > 0:
@@ -666,14 +683,15 @@ def print_performance_metrics(
             + timing_metrics["policy_training"]
         )
 
-    num_nodes = master_config["cluster"]["num_nodes"]
-    gpus_per_node = master_config["cluster"]["gpus_per_node"]
+    num_nodes = master_config.cluster["num_nodes"]
+    gpus_per_node = master_config.cluster["gpus_per_node"]
     total_num_gpus = num_nodes * gpus_per_node
-    colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
+    colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
 
     # Idle Time from Training Worker (Async GRPO only)
+    grpo_config = master_config.grpo
     if (
-        "async_grpo" in master_config and master_config["async_grpo"]["enabled"]
+        "async_grpo" in grpo_config and grpo_config["async_grpo"]["enabled"]
     ) and not colocated_inference:
         # async grpo
         exposed_generation_time = timing_metrics["exposed_generation"]
@@ -696,8 +714,7 @@ def print_performance_metrics(
         )
 
     number_of_samples_per_step = (
-        master_config["grpo"]["num_prompts_per_step"]
-        * master_config["grpo"]["num_generations_per_prompt"]
+        grpo_config["num_prompts_per_step"] * grpo_config["num_generations_per_prompt"]
     )
 
     if colocated_inference:
@@ -705,11 +722,11 @@ def print_performance_metrics(
         generation_num_gpus = total_num_gpus
     else:
         generation_num_nodes = (
-            master_config["policy"]["generation"]["colocated"]["resources"]["num_nodes"]
+            master_config.policy["generation"]["colocated"]["resources"]["num_nodes"]
             or 1
         )
         generation_num_gpus = (
-            master_config["policy"]["generation"]["colocated"]["resources"][
+            master_config.policy["generation"]["colocated"]["resources"][
                 "gpus_per_node"
             ]
             * generation_num_nodes
