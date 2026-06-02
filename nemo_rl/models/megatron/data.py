@@ -205,6 +205,18 @@ def get_microbatch_iterator(
     )
 
 
+def get_ltor_masks_and_position_ids(*args: Any, **kwargs: Any) -> Any:
+    """Lazy proxy for `megatron.training.utils.get_ltor_masks_and_position_ids`.
+
+    The underlying import is deferred to call time so that importing this module does
+    not pull in `megatron.training` -> modelopt -> transformers -> torchvision, which
+    can crash on a duplicate torchvision ``roi_align` meta-kernel registration in the mcore venv.
+    """
+    from megatron.training.utils import get_ltor_masks_and_position_ids as _impl
+
+    return _impl(*args, **kwargs)
+
+
 def process_microbatch(
     data_dict: BatchedDataDict[Any],
     seq_length_key: Optional[str] = None,
@@ -270,11 +282,6 @@ def process_microbatch(
             attention_mask = None
         else:
             input_ids_cp_sharded = input_ids
-            # Prevent modelopt import from crashing due to duplicate torchvision
-            # roi_align meta-kernel registration, through the path
-            # `megatron.training` -> modelopt -> transformers -> torchvision.
-            from megatron.training.utils import get_ltor_masks_and_position_ids
-
             attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
                 data=input_ids,
                 eod_token=0,  # used for loss_mask, which we don't use
