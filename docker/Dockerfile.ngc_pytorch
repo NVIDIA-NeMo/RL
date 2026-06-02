@@ -65,7 +65,7 @@ git clone https://github.com/vllm-project/vllm.git
 cd vllm
 git checkout v$VLLM_VERSION
 python use_existing_torch.py
-pip install -r requirements/build.txt
+pip install -r requirements/build/cuda.txt
 pip wheel --no-deps --no-build-isolation -v .
 EOF
 
