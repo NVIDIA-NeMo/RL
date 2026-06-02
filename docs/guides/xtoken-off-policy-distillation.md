@@ -41,17 +41,27 @@ single `.pt` file. The final step is the actual distillation training loop.
                         └────────────────────│─────────────────────────┘
                                              │
                                              ▼  projection_matrix.pt
-                        ┌──────────────────────────────────────────────┐
-                        │  4. examples/                                │
-                        │     run_xtoken_off_policy_distillation.py    │
-                        │     — student forward + teacher forward      │
-                        │       (via CUDA-IPC), x-token KD loss        │
-                        └──────────────────────────────────────────────┘
+                        ┌────────────────────────────────────────────────────┐
+                        │  4. examples/                                        │
+                        │     run_xtoken_off_policy_distillation.py            │
+                        │     — align student & teacher tokens, then           │
+                        │       teacher forward + student forward,             │
+                        │       then x-token KD loss                           │
+                        └────────────────────────────────────────────────────┘
 ```
 
 The projection matrix is a sparse `[V_student, top_k]` tensor that the
 training-time loss multiplies against the student logits to project them into
 the teacher's vocab space.
+
+<img src="../assets/projection_matrix_colour_matching.png" alt="Projection-matrix weights mapping student tokens (rows) to teacher tokens (columns)" width="600">
+
+Each row of the matrix holds the weights `W_{s,t}` that distribute a student
+token `s ∈ V_S` over the teacher tokens `t ∈ V_T` it corresponds to. Tokens
+shared by both vocabularies map 1-to-1 (e.g., `_the`, `_cat`, `_run`), while a
+student token that the teacher splits into pieces spreads its weight across
+those pieces (e.g., `201` → `2`, `0`, `1`). Rows are trimmed to the runtime
+`top_k` in Step 3, so low-weight tail entries are dropped (hatched cell).
 
 ### Which prep steps are essential?
 
@@ -91,6 +101,10 @@ weight thresholds, hand-picked intermediate filenames, etc.).
   for cross-tokenizer distillation.
 - **Teacher logits travel via CUDA IPC**, so student and teacher policies must
   be colocated on the same node. No remote-Ray transport for x-token logits.
+
+Future work will ease these requirements. A transport such as TransferQueue,
+for instance, would carry teacher logits across nodes — removing the
+colocation requirement and the dependence on CUDA IPC.
 
 ## Step 1 — Build multi-token mappings
 
@@ -155,21 +169,28 @@ slot. Pass `--preserve_last` or `--no-preserve_last` to override.
 
 The training entrypoint is `examples/run_xtoken_off_policy_distillation.py` with the
 exemplar config at `examples/configs/xtoken_off_policy_distillation.yaml`. The exemplar
-defaults to Llama-3.2-1B (student) ← Qwen3-4B (teacher), an arrow-text
-corpus, and the P-KL loss mode. Override paths via Hydra CLI:
+defaults to Llama-3.2-1B (student) ← Qwen3-4B (teacher) and the P-KL loss
+mode. For data it points `data.train.data_files` at the ungated, CC-BY-4.0
+NVIDIA **Nemotron-Pretraining-Specialized-v1.1** corpus
+(`Nemotron-Pretraining-Formal-Logic` subset) over `hf://`, so the recipe runs
+out of the box with no auth or extra setup. The `projection_matrix_path` below
+points at the `cross_tokenizer_data/` directory that Steps 1–3 create, so run
+those first (or the `build_projection_matrix.sh` wrapper). Override paths via
+Hydra CLI:
 
 ```bash
 uv run python examples/run_xtoken_off_policy_distillation.py \
     --config examples/configs/xtoken_off_policy_distillation.yaml \
     loss_fn.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt \
-    data.train.data_files=/path/to/corpus/*.arrow \
     cluster.gpus_per_node=8 \
     cluster.num_nodes=1
 ```
 
-The exemplar config keeps `loss_fn.projection_matrix_path` and
-`data.train.data_files` as `null` so they must be supplied at the CLI — this
-makes the config reusable across (student, teacher) pairs.
+The exemplar config keeps only `loss_fn.projection_matrix_path` as `null`, so
+the projection matrix must always be supplied at the CLI — this keeps the
+config reusable across (student, teacher) pairs. `data.train.data_files`
+already points at the default NVIDIA corpus described above; override it only
+to train on your own `.arrow`/`.parquet`/`.json`/`.txt` corpus.
 
 ### Loss-mode knobs
 
