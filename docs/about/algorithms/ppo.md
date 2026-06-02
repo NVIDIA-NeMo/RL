@@ -78,9 +78,9 @@ ppo:
   steps_per_epoch: 4
   policy_training_start_step: 0
 
-loss_fn:
-  value_loss_scale: 0.4
-  value_cliprange: 0.2
+value_loss:
+  scale: 0.4
+  cliprange: 0.2
 
 value:
   model_name: "Qwen/Qwen2.5-1.5B"

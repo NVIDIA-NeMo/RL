@@ -16,8 +16,9 @@ ppo:
 loss_fn:
   ratio_clip_max: 0.2
   ratio_clip_c: 3
-  value_loss_scale: 1.0
-  value_cliprange: 0.5
+value_loss:
+  scale: 1.0
+  cliprange: 0.5
 checkpointing:
   checkpoint_dir: results/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron
 policy:
@@ -32,6 +33,10 @@ policy:
       max_model_len: 1024
       gpu_memory_utilization: 0.4
   megatron_cfg:
+    # Exercise TP + SP + CP code paths (1n8g: TP=2 × CP=2 × DP=2 = 8)
+    tensor_model_parallel_size: 2
+    context_parallel_size: 2
+    sequence_parallel: true
     optimizer:
       weight_decay: 0.01
     scheduler:
@@ -43,7 +48,15 @@ value:
   model_name: Qwen/Qwen2.5-1.5B-Instruct
   tokenizer:
     name: Qwen/Qwen2.5-1.5B-Instruct
+  # Bump mbs so sequence_packing actually packs multiple samples per micro-batch
+  train_micro_batch_size: 4
   megatron_cfg:
+    # Match policy parallelism + enable packing to exercise the unpack path
+    tensor_model_parallel_size: 2
+    context_parallel_size: 2
+    sequence_parallel: true
+    sequence_packing:
+      enabled: true
     optimizer:
       lr: 1.0e-05
       weight_decay: 0.01

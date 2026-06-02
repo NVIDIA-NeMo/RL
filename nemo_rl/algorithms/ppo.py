@@ -16,7 +16,6 @@ import os
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
@@ -30,14 +29,14 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.advantage_estimator import (
     GeneralizedAdvantageEstimator,
-    GRPOAdvantageEstimator,
     RawRewardAdvantageEstimator,
-    ReinforcePlusPlusAdvantageEstimator,
 )
 from nemo_rl.algorithms.grpo import (
+    _extract_prompt_only_messages,
     _should_log_nemo_gym_responses,
     _should_use_async_rollouts,
     _should_use_nemo_gym,
+    refit_policy_generation,
 )
 from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
@@ -45,7 +44,7 @@ from nemo_rl.algorithms.loss import (
     ClippedPGLossFn,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
-from nemo_rl.algorithms.loss.loss_functions import MseValueLossFn
+from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig, MseValueLossFn
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_reward_shaping,
@@ -200,6 +199,7 @@ class MasterConfig(BaseModel, extra="allow"):
     policy: PolicyConfig
     value: Optional[ValueConfig] = None
     loss_fn: ClippedPGLossConfig
+    value_loss: Optional[MseValueLossConfig] = None
     env: dict[str, Any]
     data: DataConfig
     ppo: PPOConfig
@@ -331,10 +331,10 @@ def setup(
     #        Loss Function
     # ==========================
     loss_fn = ClippedPGLossFn(loss_config)
-    value_loss_fn = MseValueLossFn(
-        scale=loss_config.value_loss_scale,
-        cliprange=loss_config.value_cliprange,
+    assert master_config.value_loss is not None, (
+        "PPO requires the `value_loss:` config block to construct the MSE value loss."
     )
+    value_loss_fn = MseValueLossFn(master_config.value_loss)
 
     # Validate force_on_policy_ratio
     if loss_config.force_on_policy_ratio:
@@ -397,7 +397,6 @@ def setup(
         )
         train_cluster = cluster
         inference_cluster = cluster
-        value_cluster = cluster
         print(
             f"  ✓ Ray cluster for policy initialized with {policy_nodes} nodes",
             flush=True,
@@ -634,7 +633,15 @@ def setup(
             worker_init_timing_metrics["parallel_wall_time_s"] = parallel_wall_time
             worker_init_timing_metrics["parallel_init_enabled"] = True
 
-            # Value model not supported in non-colocated mode yet
+            # Value model is not yet supported in non-colocated mode (the
+            # parallel-init ThreadPoolExecutor only has slots for policy and
+            # generation). Fail loudly if a value_config was passed so users
+            # don't silently fall back to actor-only training.
+            assert value_config is None, (
+                "Value model is not yet supported in non-colocated mode. "
+                "Either set generation.colocated.enabled=true or remove the "
+                "'value' config block."
+            )
             value_model = None
 
         else:
@@ -684,7 +691,14 @@ def setup(
         policy, policy_time = init_policy()
         worker_init_timing_metrics["policy_init_time_s"] = policy_time
 
-        # Value model not supported for megatron backend yet
+        # Value model is not yet supported with the megatron generation backend.
+        # Same rationale as the non-colocated assert above: fail loudly instead
+        # of silently dropping the user's value_config.
+        assert value_config is None, (
+            "Value model is not yet supported with the megatron generation "
+            "backend. Use the vllm or sglang backend, or remove the 'value' "
+            "config block."
+        )
         value_model = None
 
     elif backend == "vllm":
@@ -1006,11 +1020,16 @@ def scale_rewards(
 def _create_advantage_estimator(master_config: MasterConfig):
     """Create and return an advantage estimator based on configuration.
 
+    PPO's training loop consumes a `(advantages, returns)` pair from a
+    value-model-based estimator, so only `gae` and `raw_reward` are supported
+    here. Group-relative estimators like GRPO / Reinforce++ are not compatible
+    with PPO's loop and live in `grpo.py`.
+
     Args:
         master_config: The master configuration dictionary.
 
     Returns:
-        An advantage estimator instance (GRPOAdvantageEstimator, ReinforcePlusPlusAdvantageEstimator, or GAEAdvantageEstimator).
+        A `GeneralizedAdvantageEstimator` or `RawRewardAdvantageEstimator` instance.
 
     Raises:
         ValueError: If the advantage estimator name is not recognized.
@@ -1018,31 +1037,10 @@ def _create_advantage_estimator(master_config: MasterConfig):
     ppo_config = master_config.ppo
     loss_config = master_config.loss_fn
 
-    # Provide backward-compatible defaults when adv_estimator is not in config.
-    # Fall back to top-level ppo.normalize_rewards / ppo.use_leave_one_out_baseline
-    # which older configs still use.
-    adv_estimator_config = ppo_config.get(
-        "adv_estimator",
-        {
-            "name": "grpo",
-            "normalize_rewards": ppo_config.get("normalize_rewards", True),
-            "use_leave_one_out_baseline": ppo_config.get(
-                "use_leave_one_out_baseline", False
-            ),
-            "minus_baseline": True,
-        },
-    )
+    adv_estimator_config = ppo_config["adv_estimator"]
 
     adv_estimator_name = adv_estimator_config["name"]
-    if adv_estimator_name == "grpo":
-        adv_estimator = GRPOAdvantageEstimator(adv_estimator_config, loss_config)
-        print("  ✓ Using GRPO advantage estimator")
-    elif adv_estimator_name == "reinforce_plus_plus":
-        adv_estimator = ReinforcePlusPlusAdvantageEstimator(
-            adv_estimator_config, loss_config
-        )
-        print("  ✓ Using Reinforce++ advantage estimator")
-    elif adv_estimator_name == "gae":
+    if adv_estimator_name == "gae":
         adv_estimator = GeneralizedAdvantageEstimator(adv_estimator_config, loss_config)
         gae_lambda = adv_estimator_config.get("gae_lambda", 0.95)
         gae_gamma = adv_estimator_config.get("gae_gamma", 0.99)
@@ -1051,152 +1049,12 @@ def _create_advantage_estimator(master_config: MasterConfig):
         adv_estimator = RawRewardAdvantageEstimator(adv_estimator_config, loss_config)
         print("  ✓ Using raw reward advantage estimator (no value model, no baselines)")
     else:
-        raise ValueError(f"Invalid adv_estimator name: {adv_estimator_name}")
+        raise ValueError(
+            f"Invalid adv_estimator name for PPO: {adv_estimator_name!r}. "
+            f"PPO only supports 'gae' or 'raw_reward'."
+        )
 
     return adv_estimator
-
-
-def _extract_prompt_only_messages(message_logs: list) -> list:
-    """Extract only prompt messages (user/system) from message logs.
-
-    This is used to get prompt IDs for advantage estimation, excluding
-    any assistant responses.
-
-    Args:
-        message_logs: List of message logs, where each log is a list of messages.
-
-    Returns:
-        List of message logs containing only user and system messages.
-    """
-    prompt_only_message_logs = []
-    for message_log in message_logs:
-        prompt_only_log = []
-        for message in message_log:
-            if message["role"] == "user" or message["role"] == "system":
-                prompt_only_log.append(message)
-        prompt_only_message_logs.append(prompt_only_log)
-    return prompt_only_message_logs
-
-
-def refit_policy_generation(
-    policy: ColocatablePolicyInterface,
-    policy_generation: GenerationInterface,
-    colocated_inference: bool,
-    _refit_buffer_size_gb: Optional[int] = None,
-    timer: Optional[Timer] = None,
-    kv_scales: Optional[dict[str, float]] = None,
-) -> None:
-    """Refit the policy generation interface with the latest policy weights.
-
-    Args:
-        policy: The policy to provide weights to the inference engine.
-        policy_generation: The inference engine to refit.
-        _refit_buffer_size_gb: The size of the buffer to use for refitting.
-            If it is None, the buffer size will be computed by the remaining memory.
-            This parameter is primarily used for testing.
-        timer: Optional Timer used to time the prepare/transfer/update phase
-        kv_scales: Optional dictionary of KV cache scales for FP8 quantization.
-    """
-    if colocated_inference:
-        policy.offload_before_refit()
-        policy_generation.prepare_for_generation(tags=["weights"])
-
-    # Create a context manager that does nothing when timer is None
-    timer_context = (
-        timer.time("prepare_for_generation/transfer_and_update_weights")
-        if timer is not None
-        else nullcontext()
-    )
-    with timer_context:
-        # update weights
-        update_success = False
-        if colocated_inference:
-            # get model param keys, which is grouped by size
-            if _refit_buffer_size_gb is not None:
-                buffer_size_bytes = _refit_buffer_size_gb * (1024**3)
-            else:
-                # Empirically sets ratio as 30% to maximize efficiency.
-                # The remaining 70% is a necessary buffer reserved for the parameter all-gathering across the expert-parallelism dimension.
-                memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.3")
-                buffer_size_bytes = int(
-                    policy.get_free_memory_bytes() * float(memory_ratio)
-                )
-
-            if isinstance(policy_generation, SGLangGeneration):
-                sglang_url_to_gpu_uuids = (
-                    policy_generation.get_sglang_url_to_gpu_uuids()
-                )
-                # Stream weights via HTTP
-                flush_success = policy_generation.invalidate_kv_cache()
-                if not flush_success:
-                    print("SGLang KV cache invalidation failed before weight update. ")
-                futures_train = policy.stream_weights_via_http(
-                    sglang_url_to_gpu_uuids=sglang_url_to_gpu_uuids,
-                )
-                # Wait for all workers to complete
-                ray.get(futures_train)
-                update_success = True
-            else:
-                # Original ZMQ IPC path for vLLM
-                futures_train = policy.stream_weights_via_ipc_zmq(
-                    buffer_size_bytes=buffer_size_bytes
-                )
-                futures_inference = policy_generation.update_weights_via_ipc_zmq()
-                # wait for all futures to complete
-                ray.get(futures_train)
-                results = ray.get(futures_inference)
-                update_success = all(result for result in results if result is not None)
-        else:
-            # update weights through nccl
-            # SGLang haven't implemented non-colocated inference mode.
-            if isinstance(policy_generation, SGLangGeneration):
-                raise NotImplementedError(
-                    "SGLang haven't implemented non-colocated inference mode. "
-                )
-            futures_train = policy.broadcast_weights_for_collective(kv_scales=kv_scales)
-            futures_inference = policy_generation.update_weights_from_collective()
-            # wait for all futures to complete
-            ray.get(futures_train)
-            results = ray.get(futures_inference)
-            update_success = all(result for result in results if result is not None)
-
-        # check if update is successful
-        if not update_success:
-            error_tag = "cuda-ipc" if colocated_inference else "nccl"
-            error_message = (
-                "❌ Error: Updating weights for the generation policy failed during refit.\n"
-                f"This often indicates an issue with {error_tag} or "
-                "a problem within the generation backend (e.g., vLLM worker).\n"
-            )
-            raise RuntimeError(error_message)
-
-    if colocated_inference:
-        policy.offload_after_refit()
-        policy_generation.prepare_for_generation(tags=["kv_cache"])
-
-
-def _log_mixed_rewards_and_advantages_information(
-    logger: Logger,
-    total_steps: int,
-    metrics: dict[str, Any],
-    baseline: torch.Tensor,
-    advantages: torch.Tensor,
-) -> None:
-    # The histograms that are logged are logged with a prefix "train/" to the name, since that is what the remaining metrics will be logged with.
-    logger.log_histogram(
-        baseline.numpy(), total_steps + 1, "train/baseline_reward/histogram"
-    )
-    metrics["baseline_reward/pct_0"] = 100 * (baseline == 0).float().mean().item()
-    metrics["baseline_reward/pct_1"] = 100 * (baseline == 1).float().mean().item()
-    metrics["baseline_reward/pct_mixed"] = (
-        100 - metrics["baseline_reward/pct_0"] - metrics["baseline_reward/pct_1"]
-    )
-
-    logger.log_histogram(
-        advantages.numpy(), total_steps + 1, "train/advantages/histogram"
-    )
-    metrics["advantages/sum"] = advantages.float().sum().item()
-    metrics["advantages/mean"] = advantages.float().mean().item()
 
 
 # ===============================================================================

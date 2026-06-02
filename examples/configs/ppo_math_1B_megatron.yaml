@@ -71,10 +71,13 @@ loss_fn:
   token_level_loss: true
   force_on_policy_ratio: false
   use_kl_in_reward: false  # No KL in reward (KL penalty is 0 anyway)
-  value_loss_scale: 0.4
-  value_cliprange: 0.2
   # VAPO: NLL loss on correct samples. 0 = disabled.
   positive_example_nll_weight: 0.0  # VAPO: 0.1
+
+# MSE loss applied to the value model (PPO critic). Required when running PPO with GAE.
+value_loss:
+  scale: 0.4
+  cliprange: 0.2
 
 checkpointing:
   enabled: true
@@ -265,7 +268,6 @@ value:
   reward_model_cfg:
     enabled: false
     reward_model_type: "regression"
-    only_head_unfreeze: true
 
   dtensor_cfg:
     _v2: true

@@ -18,7 +18,7 @@ import torch
 from nemo_rl.algorithms.advantage_estimator import (
     GeneralizedAdvantageEstimator,
 )
-from nemo_rl.algorithms.loss.loss_functions import MseValueLossFn
+from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig, MseValueLossFn
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 # ============================================================================
@@ -329,7 +329,7 @@ def test_mse_value_loss_basic():
     if not torch.cuda.is_available():
         pytest.skip("No GPU available")
 
-    loss_fn = MseValueLossFn(scale=1.0, cliprange=None)
+    loss_fn = MseValueLossFn(MseValueLossConfig(scale=1.0, cliprange=None))
 
     values, data, global_valid_seqs, global_valid_toks = _make_value_loss_data()
     loss, metrics = loss_fn(values, data, global_valid_seqs, global_valid_toks)
@@ -344,7 +344,7 @@ def test_mse_value_loss_with_clipping():
     if not torch.cuda.is_available():
         pytest.skip("No GPU available")
 
-    loss_fn = MseValueLossFn(scale=1.0, cliprange=0.2)
+    loss_fn = MseValueLossFn(MseValueLossConfig(scale=1.0, cliprange=0.2))
 
     values, data, global_valid_seqs, global_valid_toks = _make_value_loss_data()
     loss, metrics = loss_fn(values, data, global_valid_seqs, global_valid_toks)
@@ -354,7 +354,7 @@ def test_mse_value_loss_with_clipping():
 
     # Verify per-token max guarantee: clipped path uses 0.5 * mean(max(unclipped, clipped))
     # while unclipped path uses mean(mse) without the 0.5 factor, so account for that.
-    loss_fn_unclipped = MseValueLossFn(scale=1.0, cliprange=None)
+    loss_fn_unclipped = MseValueLossFn(MseValueLossConfig(scale=1.0, cliprange=None))
     loss_unclipped, _ = loss_fn_unclipped(
         values.detach().requires_grad_(True), data, global_valid_seqs, global_valid_toks
     )
@@ -368,8 +368,8 @@ def test_mse_value_loss_scale():
 
     values, data, global_valid_seqs, global_valid_toks = _make_value_loss_data()
 
-    loss_fn_1x = MseValueLossFn(scale=1.0, cliprange=None)
-    loss_fn_2x = MseValueLossFn(scale=2.0, cliprange=None)
+    loss_fn_1x = MseValueLossFn(MseValueLossConfig(scale=1.0, cliprange=None))
+    loss_fn_2x = MseValueLossFn(MseValueLossConfig(scale=2.0, cliprange=None))
 
     loss_1x, _ = loss_fn_1x(values, data, global_valid_seqs, global_valid_toks)
     loss_2x, _ = loss_fn_2x(
@@ -406,7 +406,7 @@ def test_mse_value_loss_masking():
     global_valid_toks = (token_mask * sample_mask.unsqueeze(-1)).sum()
     global_valid_seqs = sample_mask.sum()
 
-    loss_fn = MseValueLossFn(scale=1.0, cliprange=None)
+    loss_fn = MseValueLossFn(MseValueLossConfig(scale=1.0, cliprange=None))
     loss, _ = loss_fn(values, data, global_valid_seqs, global_valid_toks)
 
     # Loss should only consider first sample: MSE(1, 0) = 1.0
@@ -437,7 +437,7 @@ def test_mse_value_loss_perfect_prediction():
     )
     global_valid_seqs = torch.tensor(batch_size, dtype=torch.float, device=device)
 
-    loss_fn = MseValueLossFn(scale=1.0, cliprange=None)
+    loss_fn = MseValueLossFn(MseValueLossConfig(scale=1.0, cliprange=None))
     loss, _ = loss_fn(values, data, global_valid_seqs, global_valid_toks)
 
     assert loss.item() < 1e-6
@@ -448,7 +448,7 @@ def test_mse_value_loss_metrics():
     if not torch.cuda.is_available():
         pytest.skip("No GPU available")
 
-    loss_fn = MseValueLossFn(scale=0.4, cliprange=0.2)
+    loss_fn = MseValueLossFn(MseValueLossConfig(scale=0.4, cliprange=0.2))
     values, data, global_valid_seqs, global_valid_toks = _make_value_loss_data()
     _, metrics = loss_fn(values, data, global_valid_seqs, global_valid_toks)
 
@@ -490,7 +490,7 @@ def test_mse_value_loss_squeeze_trailing_dim():
     )
     global_valid_seqs = torch.tensor(batch_size, dtype=torch.float, device=device)
 
-    loss_fn = MseValueLossFn(scale=1.0, cliprange=None)
+    loss_fn = MseValueLossFn(MseValueLossConfig(scale=1.0, cliprange=None))
     loss, _ = loss_fn(values_3d, data, global_valid_seqs, global_valid_toks)
 
     assert loss.ndim == 0
@@ -524,20 +524,47 @@ def test_create_advantage_estimator_gae():
     assert isinstance(estimator, GeneralizedAdvantageEstimator)
 
 
-def test_create_advantage_estimator_grpo_fallback():
-    """Test that _create_advantage_estimator falls back to GRPO when adv_estimator is not specified."""
+def test_create_advantage_estimator_raw_reward():
+    """PPO factory accepts raw_reward (other group-relative estimators are rejected)."""
     from types import SimpleNamespace
 
-    from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
+    from nemo_rl.algorithms.advantage_estimator import RawRewardAdvantageEstimator
     from nemo_rl.algorithms.ppo import _create_advantage_estimator
 
     master_config = SimpleNamespace(
-        ppo={
-            "normalize_rewards": True,
-            "use_leave_one_out_baseline": False,
-        },
-        loss_fn={},
+        ppo={"adv_estimator": {"name": "raw_reward"}},
+        loss_fn={"reference_policy_kl_penalty": 0.0},
     )
 
     estimator = _create_advantage_estimator(master_config)
-    assert isinstance(estimator, GRPOAdvantageEstimator)
+    assert isinstance(estimator, RawRewardAdvantageEstimator)
+
+
+def test_create_advantage_estimator_rejects_unsupported_name():
+    """PPO loop only consumes (advantages, returns) from GAE/raw_reward — others must error."""
+    from types import SimpleNamespace
+
+    from nemo_rl.algorithms.ppo import _create_advantage_estimator
+
+    master_config = SimpleNamespace(
+        ppo={"adv_estimator": {"name": "grpo"}},
+        loss_fn={"reference_policy_kl_penalty": 0.0},
+    )
+
+    with pytest.raises(ValueError, match="only supports 'gae' or 'raw_reward'"):
+        _create_advantage_estimator(master_config)
+
+
+def test_create_advantage_estimator_requires_adv_estimator_key():
+    """No more silent default — missing `adv_estimator` should KeyError."""
+    from types import SimpleNamespace
+
+    from nemo_rl.algorithms.ppo import _create_advantage_estimator
+
+    master_config = SimpleNamespace(
+        ppo={},
+        loss_fn={},
+    )
+
+    with pytest.raises(KeyError):
+        _create_advantage_estimator(master_config)

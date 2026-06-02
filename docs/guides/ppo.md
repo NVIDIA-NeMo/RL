@@ -199,8 +199,8 @@ $$L_V = \frac{1}{2} \max\left((V_\theta - R)^2,\; (V_{\text{clipped}} - R)^2\rig
 where $V_{\text{clipped}} = \text{clamp}(V_\theta,\; V_{\text{old}} - \epsilon_v,\; V_{\text{old}} + \epsilon_v)$ and $R$ are the GAE returns. This prevents the value function from changing too drastically in a single update, analogous to the policy ratio clipping in the actor loss.
 
 Key parameters:
-- **`loss_fn.value_loss_scale`**: Scaling factor for the value loss (default: 0.4)
-- **`loss_fn.value_cliprange`**: Clip range $\epsilon_v$ for value predictions (default: 0.2). Set to `null` to disable clipping.
+- **`value_loss.scale`**: Scaling factor for the value loss (default: 0.4)
+- **`value_loss.cliprange`**: Clip range $\epsilon_v$ for value predictions (default: 0.2). Set to `null` to disable clipping.
 - **`loss_fn.positive_example_nll_weight`**: VAPO NLL auxiliary loss weight on correct samples (0 = disabled)
 
 ## Configuration
@@ -255,9 +255,11 @@ loss_fn:
   ratio_clip_max: 0.28
   ratio_clip_c: 10
   token_level_loss: true
-  value_loss_scale: 0.4
-  value_cliprange: 0.2
   positive_example_nll_weight: 0.0
+
+value_loss:
+  scale: 0.4
+  cliprange: 0.2
 ```
 
 **PPO-specific parameters:**
@@ -266,8 +268,8 @@ loss_fn:
 - **`ppo.adv_estimator.name`**: Set to `"gae"` for GAE advantage estimation (PPO default)
 - **`ppo.adv_estimator.gae_lambda`**: GAE $\lambda$ parameter (bias-variance tradeoff, typically 0.95)
 - **`ppo.adv_estimator.gae_gamma`**: Discount factor $\gamma$ (typically 1.0 for outcome-supervised tasks)
-- **`loss_fn.value_loss_scale`**: Scaling factor for the value loss
-- **`loss_fn.value_cliprange`**: Clip range for value function predictions
+- **`value_loss.scale`**: Scaling factor for the value loss
+- **`value_loss.cliprange`**: Clip range for value function predictions
 - **`loss_fn.positive_example_nll_weight`**: VAPO NLL auxiliary loss weight on correct samples (0 = disabled)
 
 All other parameters (clipping, KL, importance sampling, dynamic sampling, reward shaping, reward scaling) work identically to GRPO. See the [GRPO Guide](grpo.md) for details.

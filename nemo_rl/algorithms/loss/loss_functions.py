@@ -1069,6 +1069,15 @@ class DistillationLossFn(LossFunction):
         return kl_loss, metrics
 
 
+class MseValueLossConfig(BaseModel, extra="forbid"):
+    """Config for the MSE value loss used by PPO's value model."""
+
+    # Scaling factor applied to the value loss before it is added to the policy loss.
+    scale: float = 1.0
+    # Clipping range for value predictions (PPO-style). Set to None to disable clipping.
+    cliprange: Optional[float] = None
+
+
 class MseValueLossFn(LossFunction):
     """Mean Squared Error value loss function with optional clipping (PPO-style).
 
@@ -1081,9 +1090,9 @@ class MseValueLossFn(LossFunction):
 
     input_type = LossInputType.LOGIT
 
-    def __init__(self, scale: float = 1.0, cliprange: float | None = None):
-        self.scale = scale
-        self.cliprange = cliprange
+    def __init__(self, cfg: MseValueLossConfig):
+        self.scale = cfg.scale
+        self.cliprange = cfg.cliprange
         self.loss_type = LossType.TOKEN_LEVEL
 
     def __call__(

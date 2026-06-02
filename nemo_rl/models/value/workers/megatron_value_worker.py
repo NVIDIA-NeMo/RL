@@ -66,8 +66,10 @@ from nemo_rl.models.megatron.data import (
 from nemo_rl.models.megatron.setup import (
     finalize_megatron_setup,
     handle_model_import,
+    make_policy_like_config,
     setup_distributed,
     setup_model_and_optimizer,
+    setup_value_head,
     validate_and_set_config,
     validate_model_paths,
 )
@@ -79,6 +81,35 @@ from nemo_rl.models.value.interfaces import ValueOutputSpec
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+
+
+def _unpack_values(
+    values_packed: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+    unpacked_batch_size: int,
+    unpacked_seq_length: int,
+) -> torch.Tensor:
+    """Unpack ``[1, T_packed]`` (or ``[T_packed]``) -> ``[B, S]``.
+
+    Sequence-packed Megatron forward returns values in packed layout. PPO's
+    advantage estimator and value-loss callers expect the unpacked ``[B, S]``
+    shape, so we walk ``cu_seqlens_padded`` and copy each sample's slice back.
+    """
+    if values_packed.dim() == 2 and values_packed.shape[0] == 1:
+        values_packed = values_packed.squeeze(0)
+    out = torch.zeros(
+        unpacked_batch_size,
+        unpacked_seq_length,
+        device=values_packed.device,
+        dtype=values_packed.dtype,
+    )
+    for i in range(unpacked_batch_size):
+        start = int(cu_seqlens_padded[i].item())
+        end = int(cu_seqlens_padded[i + 1].item())
+        seq_len = min(end - start, unpacked_seq_length)
+        if seq_len > 0:
+            out[i, :seq_len] = values_packed[start : start + seq_len]
+    return out
 
 
 class ValueHead(torch.nn.Module):
@@ -316,9 +347,11 @@ class MegatronValueWorker(AbstractPolicyWorker):
         setup_distributed()
 
         # Step 2: Validate and setup model paths
-        # Value config uses the same model_name field as policy config
-        # We need to adapt the config to look like a PolicyConfig for reuse
-        policy_like_cfg = self._make_policy_like_config(config)
+        # Value config uses the same model_name field as policy config.
+        # Adapt it once and cache it — the result is deterministic for `config`,
+        # and downstream `train` / `get_values` calls reuse this attribute.
+        self._policy_like_cfg = make_policy_like_config(config)
+        policy_like_cfg = self._policy_like_cfg
 
         hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(
             policy_like_cfg
@@ -390,42 +423,12 @@ class MegatronValueWorker(AbstractPolicyWorker):
             self.megatron_cfg.param_sync_func = param_sync_func
 
         # Step 5: Create value head
-        hidden_size = self.megatron_cfg.model.hidden_size
-        self.value_head = ValueHead(hidden_size, self.dtype).cuda()
-
-        # Load value head weights: prefer training checkpoint, fall back to HF model
-        value_head_loaded = False
-        if weights_path is not None:
-            value_head_path = os.path.join(weights_path, "value_head.pt")
-            if os.path.exists(value_head_path):
-                value_head_state = torch.load(
-                    value_head_path, map_location="cuda", weights_only=True
-                )
-                self.value_head.load_state_dict(value_head_state)
-                print(f"Loaded value head weights from {value_head_path}")
-                value_head_loaded = True
-
-        if not value_head_loaded and config.get("load_value_head_from_model", False):
-            from nemo_rl.models.megatron.community_import import (
-                extract_value_head_from_hf_checkpoint,
-            )
-
-            score_weights = extract_value_head_from_hf_checkpoint(config["model_name"])
-            if "score.weight" in score_weights:
-                self.value_head.linear.weight.data.copy_(score_weights["score.weight"])
-                print(f"Loaded value head score.weight from {config['model_name']}")
-            if "score.bias" in score_weights:
-                # Add bias to the linear layer if the checkpoint has one
-                if self.value_head.linear.bias is None:
-                    self.value_head.linear.bias = torch.nn.Parameter(
-                        torch.zeros(
-                            self.value_head.linear.out_features,
-                            dtype=self.value_head.dtype,
-                            device=self.value_head.linear.weight.device,
-                        )
-                    )
-                self.value_head.linear.bias.data.copy_(score_weights["score.bias"])
-                print(f"Loaded value head score.bias from {config['model_name']}")
+        self.value_head = setup_value_head(
+            hidden_size=self.megatron_cfg.model.hidden_size,
+            dtype=self.dtype,
+            config=config,
+            weights_path=weights_path,
+        )
 
         # Add value head parameters to the optimizer
         if init_optimizer and self.optimizer is not None:
@@ -458,58 +461,6 @@ class MegatronValueWorker(AbstractPolicyWorker):
         )
 
         print(f"MegatronValueWorker initialized on rank {self.rank}")
-
-    def _make_policy_like_config(self, config: ValueConfig) -> dict:
-        """Adapt ValueConfig to look like a PolicyConfig for reusing setup functions.
-
-        The Megatron setup functions expect PolicyConfig fields. We create a
-        compatible dict from the ValueConfig.
-        """
-        megatron_cfg = dict(config["megatron_cfg"])
-
-        # Ensure required fields have defaults
-        megatron_cfg.setdefault("empty_unused_memory_level", 1)
-        megatron_cfg.setdefault("freeze_moe_router", False)
-        megatron_cfg.setdefault("moe_per_layer_logging", False)
-        megatron_cfg.setdefault("moe_enable_deepep", False)
-        megatron_cfg.setdefault("moe_token_dispatcher_type", "allgather")
-        megatron_cfg.setdefault("moe_shared_expert_overlap", False)
-        megatron_cfg.setdefault("moe_permute_fusion", False)
-        megatron_cfg.setdefault("moe_router_load_balancing_type", "none")
-        megatron_cfg.setdefault("moe_router_bias_update_rate", 0.0)
-        megatron_cfg.setdefault("moe_router_dtype", None)
-        megatron_cfg.setdefault("num_layers_in_first_pipeline_stage", None)
-        megatron_cfg.setdefault("num_layers_in_last_pipeline_stage", None)
-        megatron_cfg.setdefault("apply_rope_fusion", True)
-        megatron_cfg.setdefault("bias_activation_fusion", True)
-        megatron_cfg.setdefault("gradient_accumulation_fusion", False)
-        megatron_cfg.setdefault("defer_fp32_logits", False)
-        megatron_cfg.setdefault("force_overwrite_initial_ckpt", False)
-
-        policy_cfg = {
-            "model_name": config["model_name"],
-            "tokenizer": config["tokenizer"],
-            "train_global_batch_size": config["train_global_batch_size"],
-            "train_micro_batch_size": config["train_micro_batch_size"],
-            "logprob_batch_size": config.get(
-                "logprob_batch_size", config["train_micro_batch_size"]
-            ),
-            "precision": config["precision"],
-            "megatron_cfg": megatron_cfg,
-            "dynamic_batching": config["dynamic_batching"],
-            "sequence_packing": config.get("sequence_packing", {"enabled": False}),
-            "make_sequence_length_divisible_by": config[
-                "make_sequence_length_divisible_by"
-            ],
-            "max_total_sequence_length": config["max_total_sequence_length"],
-            "max_grad_norm": config.get("max_grad_norm", 1.0),
-            "hf_config_overrides": config.get("hf_config_overrides", {}),
-            "offload_optimizer_for_logprob": False,
-            # Value models don't use generation or reference models
-            "generation": None,
-        }
-
-        return policy_cfg
 
     def _add_value_head_to_optimizer(self):
         """Add value head parameters to the Megatron optimizer.
@@ -619,7 +570,7 @@ class MegatronValueWorker(AbstractPolicyWorker):
                     padded_seq_length,
                 ) = get_microbatch_iterator(
                     batch,
-                    self._make_policy_like_config(self.cfg),
+                    self._policy_like_cfg,
                     mbs,
                     straggler_timer=self.mcore_state.straggler_timer,
                 )
@@ -826,7 +777,7 @@ class MegatronValueWorker(AbstractPolicyWorker):
         self.value_head.eval()
 
         pp_grp = get_pipeline_model_parallel_group()
-        policy_like_cfg = self._make_policy_like_config(self.cfg)
+        policy_like_cfg = self._policy_like_cfg
 
         (
             mb_iterator,
@@ -886,21 +837,42 @@ class MegatronValueWorker(AbstractPolicyWorker):
                     # Non-last PP stage: return dummy
                     values = torch.zeros(1, device=output_tensor.device)
 
-                # Handle sequence parallelism: gather across TP
+                # Handle sequence parallelism: gather across TP.
+                # SP shards the seq dim *contiguously* per TP rank, so we just
+                # all-gather and concat — do NOT use `allgather_cp_sharded_tensor`
+                # here, which is hardcoded for CP's 2*cp load-balanced interleave
+                # and would scramble the sequence.
                 tp_size = parallel_state.get_tensor_model_parallel_world_size()
                 if tp_size > 1 and self.megatron_cfg.model.sequence_parallel:
                     tp_group = get_tensor_model_parallel_group()
-                    values = allgather_cp_sharded_tensor(
-                        values.unsqueeze(0) if values.dim() == 1 else values,
-                        tp_group,
-                        seq_dim=1,
+                    if values.dim() == 1:
+                        values = values.unsqueeze(0)
+                    gathered = [torch.empty_like(values) for _ in range(tp_size)]
+                    torch.distributed.all_gather(
+                        gathered, values.contiguous(), group=tp_group
                     )
+                    values = torch.cat(gathered, dim=1)
 
-                # Handle context parallelism: gather across CP
+                # Handle context parallelism: gather across CP.
+                # CP uses Megatron's 2*cp load-balanced interleave layout, so
+                # `allgather_cp_sharded_tensor` is the correct helper here.
                 cp_size = parallel_state.get_context_parallel_world_size()
                 if cp_size > 1:
                     cp_group = get_context_parallel_group()
                     values = allgather_cp_sharded_tensor(values, cp_group, seq_dim=1)
+
+                # Unpack from packed [1, T_packed] back to [B, S] when sequence
+                # packing was used in the forward. Callers (GAE / MseValueLossFn)
+                # expect [B, S]; doing this before the shift-right also keeps the
+                # shift from crossing sample boundaries.
+                if packed_seq_params is not None:
+                    unpacked_input_ids = data_dict["input_ids"]
+                    values = _unpack_values(
+                        values_packed=values,
+                        cu_seqlens_padded=packed_seq_params.cu_seqlens_q_padded,
+                        unpacked_batch_size=unpacked_input_ids.shape[0],
+                        unpacked_seq_length=unpacked_input_ids.shape[1],
+                    )
 
                 # Prepend 0 value for first token to maintain sequence length
                 values = torch.cat(
