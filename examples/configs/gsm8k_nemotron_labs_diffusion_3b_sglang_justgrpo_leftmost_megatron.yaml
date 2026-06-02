@@ -8,7 +8,7 @@ grpo:
   num_generations_per_prompt: 8
   max_num_steps: 5000
   max_num_epochs: 1000
-  val_period: 100
+  val_period: 5
   val_at_start: false
   val_at_end: true
   max_val_samples: 2000
@@ -115,7 +115,7 @@ policy:
       dp_size: 1
       pp_size: 1
       ep_size: 1
-      max_running_requests: 8
+      max_running_requests: 4
       mem_fraction_static: 0.55
       max_total_tokens: 20000
       skip_server_warmup: true
