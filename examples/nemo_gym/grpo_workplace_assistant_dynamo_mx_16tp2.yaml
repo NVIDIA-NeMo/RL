@@ -1,0 +1,53 @@
+# Weight-transfer perf benchmark — Dynamo + ModelExpress v2 (NIXL RDMA) refit.
+#
+# Sibling of grpo_workplace_assistant_dynamo_mx.yaml, scaled up to measure
+# refit (weight-transfer) latency at a realistic fan-out:
+#   * 4 training GPUs (DTensor FSDP, TP=1 → DP=4) instead of 1.
+#   * Generation runs on the 16 × TP=2 MX DGD
+#     (examples_dgd/qwen3_4b_thinking_gb300_mx_16tp2.yaml) → 32 inference ranks.
+#   * mx_config.tree_scale_out = true so the 16 receivers republish and pull
+#     from peers instead of all contending on the 4 trainer NICs.
+#
+# The metric of interest is the driver-log timing line
+#   prepare_for_generation/transfer_and_update_weights
+# logged once per refit (see nemo_rl/algorithms/grpo.py:1230). 3 steps → 2
+# refits so we get a steady-state number, not just the cold first transfer.
+
+defaults: grpo_workplace_assistant_dynamo_mx.yaml
+
+grpo:
+  # 3 steps → refit at step boundaries 1→2 and 2→3 (the version-0 refit at
+  # start plus two mid-training refits). Enough to read a warm transfer time.
+  max_num_steps: 3
+  # A few more rollouts than the smoke so all 16 decode workers see traffic;
+  # still tiny so the run is dominated by refit, not generation.
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 4
+
+policy:
+  dtensor_cfg:
+    # MX v2 is rank-to-rank: each trainer rank publishes its local shard and
+    # the same-rank inference peer pulls it. So the trainer's TP layout MUST
+    # match the receiver's. The DGD decode workers are TP=2, so the trainer
+    # must also be TP=2 (publishing tp_world_size=2) — otherwise receivers
+    # report "no v2 source available for version>=1 on rank N" because a TP1
+    # source (the parent recipe's default) is incompatible with a TP2 puller.
+    # With 4 training GPUs: TP=2 → DP=2.
+    tensor_parallel_size: 2
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 1
+  weight_sync:
+    method: "mx"
+    mx_config:
+      enabled: true
+      mx_server_url: "modelexpress-server.default.svc.cluster.local:8001"
+      timeout_seconds: 300.0
+      same_rank_only: true
+      # 16 receivers — enable peer republish/pull fan-out.
+      tree_scale_out: true
+      # Qwen3-4B is dense; expert filter is a no-op but harmless.
+      moe_expert_filter: false
+      nic_pin: "auto"
+      retain_latest_k: 1
