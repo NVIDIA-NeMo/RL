@@ -60,6 +60,57 @@ def alignment_from_flat_batch(data: Mapping[str, Any]) -> AlignmentBatch:
     )
 
 
+def rebuild_teacher_full_logits_from_ipc(data: Mapping[str, Any]) -> torch.Tensor:
+    """View-only rebuild of the microbatch's teacher-logits slice from IPC.
+
+    The producer maintains a **persistent** IPC buffer on its GPU sized
+    ``[B_r, T_t, V_t]``; the buffer (and the IPC handle it was captured
+    with) survives across training steps, with fresh logits ``.copy_()``-ed
+    in each step. Because the producer never frees the buffer between steps,
+    holding a view into the IPC-imported storage is safe: the producer-side
+    allocation isn't fighting the consumer's refcount, it's simply alive for
+    the worker's lifetime.
+
+    Every per-sample entry in ``teacher_full_logits_ipc`` carries the same
+    stable rank-level handle plus its rank-local ``sample_idx_within_rank``.
+    We rebuild that single handle once and slice ``[mb_start:mb_end]`` for
+    the current microbatch -- zero allocation on the consumer, dtype
+    preserved (the loss fn casts if/where it needs fp32).
+
+    Args:
+        data: The loss data dict, carrying ``teacher_full_logits_ipc`` -- a
+            list of per-sample IPC handle dicts produced by
+            ``Policy.get_full_logits_ipc``.
+
+    Returns:
+        A ``[mb_B, T_t, V_t]`` view into the producer's GPU memory (no copy).
+    """
+    from nemo_rl.models.policy.utils import rebuild_cuda_tensor_from_ipc
+
+    entries = data["teacher_full_logits_ipc"]
+    consumer_device = torch.cuda.current_device()
+
+    first = entries[0]
+    last = entries[-1]
+    rank_view = rebuild_cuda_tensor_from_ipc(
+        first["rank_logits_ipc"], consumer_device
+    )  # [B_r, T_t, V_t] view into producer's GPU memory
+
+    mb_start = first["sample_idx_within_rank"]
+    mb_end = last["sample_idx_within_rank"] + 1
+    # Contract: BatchedDataDict.slice and shard_by_batch_size preserve
+    # contiguous sample order, so sample_idx_within_rank is monotone in
+    # the microbatch. If a future change ever reorders samples, fall back
+    # to advanced indexing (which DOES copy -- defeats the no-copy win);
+    # assert loudly instead of silently regressing.
+    assert mb_end - mb_start == len(entries), (
+        "expected contiguous monotonic sample_idx_within_rank within a "
+        f"microbatch; got entries with indices "
+        f"{[e['sample_idx_within_rank'] for e in entries]}"
+    )
+    return rank_view[mb_start:mb_end]  # [mb_B, T_t, V_t] view, no copy
+
+
 class Fp32SparseMM(torch.autograd.Function):
     """FP32 ``M.t() @ dense`` (sparse-dense matmul) ignoring surrounding autocast.
 

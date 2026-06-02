@@ -1157,8 +1157,11 @@ class CrossTokenizerDistillationLossFn(LossFunction):
     - ``(False, True)``  -> xtoken-loss: chunk-aggregated KL using
       multi-token spans. **NotImplementedError in v0.**
 
-    Inputs (via ``LossInputType.LOGIT``):
+    Inputs (via ``LossInputType.DISTILLATION_CROSS_TOKENIZER``):
         logits: ``[B, T_s, V_s]`` raw student logits from the worker forward.
+        teacher_full_logits: ``[B, T_t, V_t]`` full-vocab teacher logits,
+            rebuilt from the CUDA IPC handles by ``prepare_loss_input`` (see
+            :func:`nemo_rl.algorithms.x_token.loss_utils.rebuild_teacher_full_logits_from_ipc`).
 
     Inputs (via ``data: BatchedDataDict``):
         See :class:`CrossTokenizerDistillationLossDataDict`.
@@ -1170,7 +1173,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
     """
 
     loss_type = LossType.TOKEN_LEVEL
-    input_type = LossInputType.LOGIT
+    input_type = LossInputType.DISTILLATION_CROSS_TOKENIZER
 
     def __init__(self, cfg: CrossTokenizerDistillationLossConfig):
         if cfg["xtoken_loss"] and not cfg["gold_loss"]:
@@ -1189,53 +1192,6 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         # this instance. That keeps the driver-side ``loss_fn`` free of
         # any large CUDA tensors and lets multiple loss instances on
         # the same worker share one load.
-
-    @staticmethod
-    def _rebuild_teacher_full_logits(
-        data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
-    ) -> torch.Tensor:
-        """View-only rebuild of the microbatch's teacher-logits slice.
-
-        The producer maintains a **persistent** IPC buffer on its GPU
-        sized ``[B_r, T_t, V_t]``; the buffer (and the IPC handle it
-        was captured with) survives across training steps, with fresh
-        logits ``.copy_()``-ed in each step. Because the producer never
-        frees the buffer between steps, holding a view into the
-        IPC-imported storage is safe: the producer-side allocation
-        isn't fighting the consumer's refcount, it's simply alive for
-        the worker's lifetime.
-
-        Every per-sample entry in ``teacher_full_logits_ipc`` carries
-        the same stable rank-level handle plus its rank-local
-        ``sample_idx_within_rank``. We rebuild that single handle once
-        and slice ``[mb_start:mb_end]`` for the current microbatch —
-        zero allocation on the consumer, dtype preserved (caller casts
-        if/where it needs fp32).
-        """
-        from nemo_rl.models.policy.utils import rebuild_cuda_tensor_from_ipc
-
-        entries = data["teacher_full_logits_ipc"]
-        consumer_device = torch.cuda.current_device()
-
-        first = entries[0]
-        last = entries[-1]
-        rank_view = rebuild_cuda_tensor_from_ipc(
-            first["rank_logits_ipc"], consumer_device
-        )  # [B_r, T_t, V_t] view into producer's GPU memory
-
-        mb_start = first["sample_idx_within_rank"]
-        mb_end = last["sample_idx_within_rank"] + 1
-        # Contract: BatchedDataDict.slice and shard_by_batch_size preserve
-        # contiguous sample order, so sample_idx_within_rank is monotone in
-        # the microbatch. If a future change ever reorders samples, fall back
-        # to advanced indexing (which DOES copy — defeats the no-copy win);
-        # assert loudly instead of silently regressing.
-        assert mb_end - mb_start == len(entries), (
-            "expected contiguous monotonic sample_idx_within_rank within a "
-            f"microbatch; got entries with indices "
-            f"{[e['sample_idx_within_rank'] for e in entries]}"
-        )
-        return rank_view[mb_start:mb_end]  # [mb_B, T_t, V_t] view, no copy
 
     @staticmethod
     def _dp_all_reduce_sum(local: torch.Tensor) -> torch.Tensor:
@@ -1266,13 +1222,14 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         global_valid_seqs: torch.Tensor,
         global_valid_toks: torch.Tensor,
         logits: torch.Tensor,
+        teacher_full_logits: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute the cross-tokenizer distillation loss for one microbatch."""
         cfg = self.cfg
 
         if cfg["gold_loss"]:
             loss, kl_common, l1_uncommon, num_valid_chunks, top1_acc = (
-                self._compute_gold(logits, data)
+                self._compute_gold(logits, data, teacher_full_logits)
             )
             metrics = {
                 "loss": loss.item(),
@@ -1284,7 +1241,9 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             }
             return loss, metrics
 
-        kl_loss, num_valid_pairs, proj_acc = self._compute_p_kl(logits, data)
+        kl_loss, num_valid_pairs, proj_acc = self._compute_p_kl(
+            logits, data, teacher_full_logits
+        )
         ce_loss = self._compute_ce(logits, data, global_valid_toks)
 
         # Next-token accuracy on the student side, masked to valid tokens.
@@ -1346,6 +1305,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         self,
         logits: torch.Tensor,
         data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
+        teacher_full_logits: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """P-KL: chunk-averaged KL over a microbatch-global top-k teacher subset.
 
@@ -1353,7 +1313,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         ``tokenalign.py:3901–4100``:
 
         1. Project full-vocab student probs through ``M`` to teacher vocab.
-        2. Rebuild full teacher logits from the IPC handles.
+        2. Use the full teacher logits materialized by ``prepare_loss_input``.
         3. Compute one ``global_top_indices [k]`` per microbatch from the
            teacher's importance: ``max`` over flat ``(B*T_t)``, ``topk``
            over ``V_t``. Same vocab subset across every sample/position —
@@ -1393,10 +1353,10 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         v_t = projected_full.shape[-1]
         projected_full = projected_full.reshape(b, t_s, v_t)   # [B, T_s, V_t]
 
-        # Rebuild full teacher logits from the IPC handles. Same transport
+        # `teacher_full_logits` [B, T_t, V_t_model] is materialized by
+        # `prepare_loss_input` (rebuilt from the IPC handles). Same transport
         # as the gold path consumes; here we additionally compute a
         # microbatch-global top-k inline to match PT.
-        teacher_full_logits = self._rebuild_teacher_full_logits(data)  # [B, T_t, V_t_model]
         # HF models commonly pad lm_head out_features beyond len(tokenizer)
         # for embedding/FFN alignment (e.g. Qwen3: tokenizer 151669,
         # lm_head 151936). The projection matrix is sized to the real
@@ -1497,6 +1457,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         self,
         logits: torch.Tensor,
         data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
+        teacher_full_logits: torch.Tensor,
     ) -> tuple[
         torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
     ]:
@@ -1505,7 +1466,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         Ports PT ``compute_KL_loss_optimized`` lines 3494–3829.
 
         1. Lazy-build the exact-token map (cached per device).
-        2. Rebuild full teacher logits from the IPC handles.
+        2. Use the full teacher logits materialized by ``prepare_loss_input``.
         3. ``log_softmax`` on full vocab both sides; chunk-average via the
            shared helper.
         4. Slice each chunk-averaged tensor to ``common_*`` indices and
@@ -1539,7 +1500,8 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         uncommon_t = exact_map["uncommon_teacher"]
         v_teacher = self.cfg["teacher_vocab_size"]
 
-        teacher_full_logits = self._rebuild_teacher_full_logits(data)  # [B, T_t, V_t_model]
+        # `teacher_full_logits` [B, T_t, V_t_model] is materialized by
+        # `prepare_loss_input` (rebuilt from the IPC handles).
         # Drop any padded lm_head vocab beyond the real tokenizer vocab —
         # the exact-token map's t-axis is bounded by `teacher_vocab_size`,
         # so chunked teacher log-probs must use the same axis. See the
