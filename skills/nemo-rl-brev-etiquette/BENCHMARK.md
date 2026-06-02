@@ -1,13 +1,13 @@
 # Evaluation Report
 
-Evaluation of the `brev-etiquette` skill before publication through NVSkills-Eval.
+Evaluation of the `nemo-rl-brev-etiquette` skill before publication through NVSkills-Eval.
 
 This benchmark summarizes 3-Tier Evaluation from NVSkills-Eval results for the skill. The goal is to document whether the skill is safe, discoverable, effective, and useful for agents before it is published for broader workflow use.
 
 ## Evaluation Summary
 
-- Skill: `brev-etiquette`
-- Evaluation date: 2026-05-29
+- Skill: `nemo-rl-brev-etiquette`
+- Evaluation date: 2026-06-01
 - NVSkills-Eval profile: `external`
 - Environment: `local`
 - Dataset: 4 evaluation tasks
@@ -55,10 +55,10 @@ Task composition is derived from the evaluation dataset when possible. Entries w
 | Dimension | Num | `claude-code` | `codex` |
 |---|---:|---:|---:|
 | Security | 8 | 100% (+0%) | 100% (+0%) |
-| Correctness | 8 | 86% (+8%) | 81% (+3%) |
-| Discoverability | 8 | 100% (+0%) | 90% (+3%) |
-| Effectiveness | 8 | 88% (+5%) | 77% (+5%) |
-| Efficiency | 8 | 90% (+2%) | 83% (+6%) |
+| Correctness | 8 | 81% (+6%) | 84% (+12%) |
+| Discoverability | 8 | 100% (+0%) | 86% (+2%) |
+| Effectiveness | 8 | 84% (+9%) | 72% (+12%) |
+| Efficiency | 8 | 88% (+1%) | 78% (+3%) |
 
 Score values show skill-assisted performance. Values in parentheses show uplift versus the no-skill baseline when baseline data is available.
 
@@ -68,11 +68,11 @@ Tier 1 validation passed with observations. NVSkills-Eval ran 9 checks and found
 
 Top findings:
 
-- MEDIUM QUALITY/quality_correctness: SKILL_SPEC recommended field missing: 'metadata.author' (`skills/brev-etiquette/SKILL.md`)
-- MEDIUM QUALITY/quality_correctness: SKILL_SPEC recommended field missing: 'metadata.tags' (`skills/brev-etiquette/SKILL.md`)
-- MEDIUM SCHEMA/body_recommended_section: Missing recommended section: '## Instructions' (`skills/brev-etiquette/SKILL.md`)
-- MEDIUM SCHEMA/body_recommended_section: Missing recommended section: '## Examples' (`skills/brev-etiquette/SKILL.md`)
-- MEDIUM SCHEMA/author_missing: Author not specified in metadata (`skills/brev-etiquette/SKILL.md`)
+- MEDIUM QUALITY/quality_correctness: SKILL_SPEC recommended field missing: 'metadata.author' (`skills/nemo-rl-brev-etiquette/SKILL.md`)
+- MEDIUM QUALITY/quality_correctness: SKILL_SPEC recommended field missing: 'metadata.tags' (`skills/nemo-rl-brev-etiquette/SKILL.md`)
+- MEDIUM SCHEMA/body_recommended_section: Missing recommended section: '## Instructions' (`skills/nemo-rl-brev-etiquette/SKILL.md`)
+- MEDIUM SCHEMA/body_recommended_section: Missing recommended section: '## Examples' (`skills/nemo-rl-brev-etiquette/SKILL.md`)
+- MEDIUM SCHEMA/author_missing: Author not specified in metadata (`skills/nemo-rl-brev-etiquette/SKILL.md`)
 
 ## Tier 2: Deduplication Summary
 
@@ -81,7 +81,7 @@ Tier 2 validation passed. NVSkills-Eval ran 2 checks and found 0 total findings.
 Notable observations:
 
 - Context Deduplication: Collected 1 file(s)
-- Inter-Skill Deduplication: Parsed skill 'brev-etiquette': 446 char description
+- Inter-Skill Deduplication: Parsed skill 'nemo-rl-brev-etiquette': 454 char description
 
 ## Publication Recommendation
 

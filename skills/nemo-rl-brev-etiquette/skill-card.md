@@ -1,5 +1,5 @@
 ## Description: <br>
-Brev instance operating guidance for NeMo-RL agents working in /home/ubuntu/RL with limited workspace disk, a larger /ephemeral volume, and optional .env secrets. <br>
+Brev instance operating guidance for NeMo-RL agents working in /home/ubuntu/RL with limited workspace disk, a larger /ephemeral volume, and optional /home/ubuntu/RL/.env secrets. <br>
 
 This skill is ready for commercial/non-commercial use. <br>
 
@@ -9,7 +9,7 @@ NVIDIA <br>
 ### License/Terms of Use: <br>
 Apache 2.0 <br>
 ## Use Case: <br>
-Developers and engineers running NeMo-RL experiments, training jobs, auto-research campaigns, and authenticated workflows on Brev instances who need guidance on disk layout, cache management, and secret handling. <br>
+Developers and engineers running NeMo-RL training experiments, auto-research campaigns, and model downloads on Brev instances who need guidance on disk layout, cache management, and secret handling to avoid filling the workspace volume. <br>
 
 ### Deployment Geography for Use: <br>
 Global <br>
@@ -19,12 +19,12 @@ Risk: Review before execution as proposals could introduce incorrect or misleadi
 Mitigation: Review and scan skill before deployment. <br>
 
 ## Reference(s): <br>
-- [SKILL.md](skills/brev-etiquette/SKILL.md) <br>
 - [NeMo RL Documentation](https://docs.nvidia.com/nemo/rl/latest/index.html) <br>
+- [NeMo RL GitHub Repository](https://github.com/NVIDIA-NeMo/RL) <br>
 
 
 ## Skill Output: <br>
-**Output Type(s):** [Shell commands, Configuration instructions] <br>
+**Output Type(s):** [Configuration instructions, Shell commands] <br>
 **Output Format:** [Markdown with inline bash code blocks] <br>
 **Output Parameters:** [1D] <br>
 **Other Properties Related to Output:** [None] <br>
@@ -36,7 +36,7 @@ Mitigation: Review and scan skill before deployment. <br>
 
 
 ## Evaluation Tasks: <br>
-Evaluated against 4 internal skill tasks (2 positive activation, 2 negative activation) with 2 attempts per task via NVSkills-Eval. <br>
+Evaluated against 4 evaluation tasks (2 positive skill-activation, 2 negative) with 2 attempts per task via NVSkills-Eval. <br>
 
 ## Evaluation Metrics Used: <br>
 Reported benchmark dimensions: <br>
@@ -61,13 +61,13 @@ Underlying evaluation signals used in this run: <br>
 | Dimension | Num | `claude-code` | `codex` |
 |---|---:|---:|---:|
 | Security | 8 | 100% (+0%) | 100% (+0%) |
-| Correctness | 8 | 86% (+8%) | 81% (+3%) |
-| Discoverability | 8 | 100% (+0%) | 90% (+3%) |
-| Effectiveness | 8 | 88% (+5%) | 77% (+5%) |
-| Efficiency | 8 | 90% (+2%) | 83% (+6%) |
+| Correctness | 8 | 81% (+6%) | 84% (+12%) |
+| Discoverability | 8 | 100% (+0%) | 86% (+2%) |
+| Effectiveness | 8 | 84% (+9%) | 72% (+12%) |
+| Efficiency | 8 | 88% (+1%) | 78% (+3%) |
 
 ## Skill Version(s): <br>
-d40694481 (source: git SHA, committed 2026-05-28) <br>
+1.5.4 (source: pyproject.toml) <br>
 
 ## Ethical Considerations: <br>
 NVIDIA believes Trustworthy AI is a shared responsibility and we have established policies and practices to enable development for a wide array of AI applications. When downloaded or used in accordance with our terms of service, developers should work with their internal team to ensure this skill meets requirements for the relevant industry and use case and addresses unforeseen product misuse. <br>
