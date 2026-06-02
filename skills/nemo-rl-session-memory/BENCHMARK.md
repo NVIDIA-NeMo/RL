@@ -1,13 +1,13 @@
 # Evaluation Report
 
-Evaluation of the `session-memory` skill before publication through NVSkills-Eval.
+Evaluation of the `nemo-rl-session-memory` skill before publication through NVSkills-Eval.
 
 This benchmark summarizes 3-Tier Evaluation from NVSkills-Eval results for the skill. The goal is to document whether the skill is safe, discoverable, effective, and useful for agents before it is published for broader workflow use.
 
 ## Evaluation Summary
 
-- Skill: `session-memory`
-- Evaluation date: 2026-05-29
+- Skill: `nemo-rl-session-memory`
+- Evaluation date: 2026-06-01
 - NVSkills-Eval profile: `external`
 - Environment: `local`
 - Dataset: 5 evaluation tasks
@@ -54,11 +54,11 @@ Task composition is derived from the evaluation dataset when possible. Entries w
 
 | Dimension | Num | `claude-code` | `codex` |
 |---|---:|---:|---:|
-| Security | 8 | 100% (+0%) | 90% (-10%) |
-| Correctness | 8 | 95% (-1%) | 92% (+18%) |
-| Discoverability | 8 | 100% (+0%) | 92% (+6%) |
-| Effectiveness | 8 | 89% (+0%) | 87% (+29%) |
-| Efficiency | 8 | 92% (+0%) | 85% (+7%) |
+| Security | 8 | 100% (+0%) | 100% (+0%) |
+| Correctness | 8 | 96% (+3%) | 84% (+5%) |
+| Discoverability | 8 | 99% (+1%) | 91% (+5%) |
+| Effectiveness | 8 | 82% (-5%) | 81% (+22%) |
+| Efficiency | 8 | 89% (+1%) | 86% (+10%) |
 
 Score values show skill-assisted performance. Values in parentheses show uplift versus the no-skill baseline when baseline data is available.
 
@@ -68,11 +68,11 @@ Tier 1 validation passed with observations. NVSkills-Eval ran 9 checks and found
 
 Top findings:
 
-- MEDIUM QUALITY/quality_correctness: SKILL_SPEC recommended field missing: 'metadata.author' (`skills/session-memory/SKILL.md`)
-- MEDIUM QUALITY/quality_correctness: SKILL_SPEC recommended field missing: 'metadata.tags' (`skills/session-memory/SKILL.md`)
-- MEDIUM SCHEMA/body_recommended_section: Missing recommended section: '## Instructions' (`skills/session-memory/SKILL.md`)
-- MEDIUM SCHEMA/body_recommended_section: Missing recommended section: '## Examples' (`skills/session-memory/SKILL.md`)
-- MEDIUM SCHEMA/author_missing: Author not specified in metadata (`skills/session-memory/SKILL.md`)
+- MEDIUM QUALITY/quality_correctness: SKILL_SPEC recommended field missing: 'metadata.author' (`skills/nemo-rl-session-memory/SKILL.md`)
+- MEDIUM QUALITY/quality_correctness: SKILL_SPEC recommended field missing: 'metadata.tags' (`skills/nemo-rl-session-memory/SKILL.md`)
+- MEDIUM SCHEMA/body_recommended_section: Missing recommended section: '## Instructions' (`skills/nemo-rl-session-memory/SKILL.md`)
+- MEDIUM SCHEMA/body_recommended_section: Missing recommended section: '## Examples' (`skills/nemo-rl-session-memory/SKILL.md`)
+- MEDIUM SCHEMA/author_missing: Author not specified in metadata (`skills/nemo-rl-session-memory/SKILL.md`)
 
 ## Tier 2: Deduplication Summary
 
@@ -81,7 +81,7 @@ Tier 2 validation passed. NVSkills-Eval ran 2 checks and found 0 total findings.
 Notable observations:
 
 - Context Deduplication: Collected 1 file(s)
-- Inter-Skill Deduplication: Parsed skill 'session-memory': 375 char description
+- Inter-Skill Deduplication: Parsed skill 'nemo-rl-session-memory': 375 char description
 
 ## Publication Recommendation
 
