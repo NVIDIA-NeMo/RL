@@ -1,0 +1,33 @@
+defaults: "gsm8k_nemotron_labs_diffusion_3b_sglang_ar_megatron.yaml"
+
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
+  max_num_steps: 200
+  max_num_epochs: 1
+  val_period: 50
+  val_at_start: false
+  val_at_end: false
+  max_val_samples: 2000
+  val_batch_size: 128
+
+checkpointing:
+  save_period: 50
+
+policy:
+  train_global_batch_size: 64
+  train_micro_batch_size: 1
+  generation_batch_size: 8
+  logprob_batch_size: 8
+  generation:
+    sglang_cfg:
+      max_running_requests: 8
+
+logger:
+  log_dir: "logs/grpo-nemotron-diffusion-3b-ar-megatron-sglang-toy-p8-g8"
+  wandb:
+    name: "grpo-nemotron-diffusion-3b-ar-megatron-sglang-toy-p8-g8"
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1
