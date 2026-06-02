@@ -102,13 +102,62 @@ spec:
           volumeMounts:
             - mountPath: /mnt/rl-workspace
               name: rl-workspace
+          # Overlay the modified modelexpress checkout (with v2-aware loader)
+          # over the baked-in install BEFORE dynamo.vllm starts. Inlined
+          # into command (not postStart) because postStart races the main
+          # process — the baked modelexpress would already be loaded before
+          # the overlay landed. vLLM v1 strips PYTHONPATH from the
+          # EngineCore subprocess (DEBUGGING_POSTMORTEM §12a), so we have
+          # to write into the venv's site-packages, not just set PYTHONPATH.
           command:
-            - python3
-            - -m
-            - dynamo.vllm
+            - /bin/bash
+            - -c
+            - |
+              echo "[mx-debug] start $(date -u +%FT%TZ)"
+              # Copy the modelexpress source to container-local /tmp first.
+              # pip's egg-info update fails on Lustre with "Cannot update time
+              # stamp of directory" when installing in place, so we install
+              # from a writable copy instead.
+              MX_SRC=/tmp/mx-src
+              rm -rf "$MX_SRC"
+              cp -a /mnt/rl-workspace/jothomson/modelexpress/modelexpress_client/python "$MX_SRC"
+              # Remove any prior egg-info from the copy so pip rebuilds fresh.
+              rm -rf "$MX_SRC"/modelexpress.egg-info "$MX_SRC"/build "$MX_SRC"/__pycache__
+              echo "[mx-debug] installing overlay from $MX_SRC"
+              /opt/dynamo/venv/bin/pip install --force-reinstall --no-deps "$MX_SRC"
+              INSTALL_RC=$?
+              echo "[mx-debug] pip install exit=$INSTALL_RC"
+              if [ "$INSTALL_RC" -ne 0 ]; then
+                echo "[mx-debug] FATAL: overlay install failed"
+                exit "$INSTALL_RC"
+              fi
+              echo "[mx-debug] verifying modelexpress overlay:"
+              /opt/dynamo/venv/bin/python -c "import modelexpress; print('modelexpress at', modelexpress.__file__)"
+              /opt/dynamo/venv/bin/python -c "from modelexpress.engines.vllm.registration import _PLUGIN_LOAD_FORMATS; print('_PLUGIN_LOAD_FORMATS =', _PLUGIN_LOAD_FORMATS)"
+              # Overlay the modified dynamo mx_refit extension (smaller diff,
+              # not a full package replace). copy from Lustre to the venv site-packages.
+              MXRX_SRC=/mnt/rl-workspace/jothomson/dynamo/components/src/dynamo/vllm/mx_refit/extension.py
+              MXRX_DST=/opt/dynamo/venv/lib/python3.12/site-packages/dynamo/vllm/mx_refit/extension.py
+              if [ -f "$MXRX_SRC" ]; then
+                cp "$MXRX_SRC" "$MXRX_DST"
+                echo "[mx-debug] overlaid extension.py: $(md5sum $MXRX_DST | cut -d' ' -f1)"
+              else
+                echo "[mx-debug] WARN: $MXRX_SRC missing; not overlaying extension.py"
+              fi
+              echo "[mx-debug] handoff to dynamo.vllm $(date -u +%FT%TZ)"
+              exec python3 -m dynamo.vllm "$@"
+            - --   # script-name placeholder so dynamo args land as $1, $2, ...
           args:
             - --model
             - Qwen/Qwen3-4B-Thinking-2507
+            # Engage MxModelLoader so the worker discovers v2 sources at boot.
+            # The trainer publishes via MxV2TrainingPublisher; an autoscaled
+            # pod here picks the freshest v2 trainer/replica via the
+            # version-aware RdmaStrategy and pulls it via NIXL RDMA. Cold
+            # start (no v2 source published yet) falls through the strategy
+            # chain to the disk loader — same shape as today's HF boot.
+            - --load-format
+            - mx-target
             - --tensor-parallel-size
             - "1"
             - --gpu-memory-utilization

@@ -145,6 +145,7 @@ launch:
     python -u examples/nemo_gym/run_grpo_nemo_gym.py \
       --config examples/nemo_gym/grpo_workplace_assistant_dynamo_mx.yaml \
       +policy.generation.dynamo_cfg.dgd_name=${user:}-dynamo-wpa-mx \
+      grpo.max_num_steps=10 \
       > "\${PIPE}" 2>&1 || RC=$?
 
     wait "\${TEE_PID}" || true

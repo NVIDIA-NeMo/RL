@@ -72,9 +72,10 @@ cluster:
       # Required on multi-subnet RDMA fabrics (GB200/EFA). Safe on single-subnet
       # because the trainer also publishes for its own rank.
       same_rank_only: true
-      # Disable for the smoke — only one inference replica, no second receiver
-      # to fan out to.
-      tree_scale_out: false
+      # Enable so the decode worker republishes itself as a v2
+      # inference_replica after each refit — autoscaled pods can then
+      # pull v=K via the v2 path (not just v1 fall-back).
+      tree_scale_out: true
       # Qwen3-4B is dense; the filter is a no-op but harmless.
       moe_expert_filter: false
       nic_pin: "auto"
