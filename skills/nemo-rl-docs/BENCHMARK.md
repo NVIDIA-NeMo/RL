@@ -1,13 +1,13 @@
 # Evaluation Report
 
-Evaluation of the `docs` skill before publication through NVSkills-Eval.
+Evaluation of the `nemo-rl-docs` skill before publication through NVSkills-Eval.
 
 This benchmark summarizes 3-Tier Evaluation from NVSkills-Eval results for the skill. The goal is to document whether the skill is safe, discoverable, effective, and useful for agents before it is published for broader workflow use.
 
 ## Evaluation Summary
 
-- Skill: `docs`
-- Evaluation date: 2026-05-28
+- Skill: `nemo-rl-docs`
+- Evaluation date: 2026-06-01
 - NVSkills-Eval profile: `external`
 - Environment: `local`
 - Dataset: 5 evaluation tasks
@@ -32,6 +32,7 @@ Reported benchmark dimensions:
 
 Underlying evaluation signals used in this run:
 
+- `security` (Security): checks for unsafe operations, secret leakage, and unauthorized access.
 - `skill_execution` (Skill Execution): verifies that the agent loaded the expected skill and workflow.
 - `skill_efficiency` (Efficiency): checks routing quality, decoy avoidance, and redundant tool usage.
 - `accuracy` (Accuracy): grades final-answer correctness against the reference answer.
@@ -53,25 +54,25 @@ Task composition is derived from the evaluation dataset when possible. Entries w
 
 | Dimension | Num | `claude-code` | `codex` |
 |---|---:|---:|---:|
-| Security | 8 | 93% (-3%) | 50% (-13%) |
-| Correctness | 8 | 90% (+3%) | 84% (+12%) |
-| Discoverability | 8 | 98% (+13%) | 91% (+7%) |
-| Effectiveness | 8 | 86% (-7%) | 67% (+5%) |
-| Efficiency | 8 | 85% (+15%) | 83% (+8%) |
+| Security | 8 | 100% (+0%) | 100% (+0%) |
+| Correctness | 8 | 91% (+7%) | 83% (+11%) |
+| Discoverability | 8 | 99% (-1%) | 90% (+5%) |
+| Effectiveness | 8 | 81% (+8%) | 80% (+18%) |
+| Efficiency | 8 | 85% (-0%) | 79% (+3%) |
 
 Score values show skill-assisted performance. Values in parentheses show uplift versus the no-skill baseline when baseline data is available.
 
 ## Tier 1: Static Validation Summary
 
-Tier 1 validation passed with observations. NVSkills-Eval ran 9 checks and found 16 total findings.
+Tier 1 validation passed with observations. NVSkills-Eval ran 9 checks and found 13 total findings.
 
 Top findings:
 
-- MEDIUM QUALITY/quality_correctness: Guide-only skill has very little content (15 lines) (`skills/docs/SKILL.md`)
-- MEDIUM QUALITY/quality_correctness: SKILL_SPEC recommended field missing: 'metadata.author' (`skills/docs/SKILL.md`)
-- MEDIUM QUALITY/quality_correctness: SKILL_SPEC recommended field missing: 'metadata.tags' (`skills/docs/SKILL.md`)
-- MEDIUM QUALITY/quality_discoverability: Skill name very short: 'docs' (`skills/docs/SKILL.md`)
-- MEDIUM SCHEMA/body_recommended_section: Missing recommended section: '## Instructions' (`skills/docs/SKILL.md`)
+- MEDIUM QUALITY/quality_correctness: Guide-only skill has very little content (15 lines) (`skills/nemo-rl-docs/SKILL.md`)
+- MEDIUM QUALITY/quality_correctness: SKILL_SPEC recommended field missing: 'metadata.author' (`skills/nemo-rl-docs/SKILL.md`)
+- MEDIUM QUALITY/quality_correctness: SKILL_SPEC recommended field missing: 'metadata.tags' (`skills/nemo-rl-docs/SKILL.md`)
+- MEDIUM SCHEMA/body_recommended_section: Missing recommended section: '## Instructions' (`skills/nemo-rl-docs/SKILL.md`)
+- MEDIUM SCHEMA/body_recommended_section: Missing recommended section: '## Examples' (`skills/nemo-rl-docs/SKILL.md`)
 
 ## Tier 2: Deduplication Summary
 
@@ -80,7 +81,7 @@ Tier 2 validation passed. NVSkills-Eval ran 2 checks and found 0 total findings.
 Notable observations:
 
 - Context Deduplication: Collected 1 file(s)
-- Inter-Skill Deduplication: Parsed skill 'docs': 89 char description
+- Inter-Skill Deduplication: Parsed skill 'nemo-rl-docs': 263 char description
 
 ## Publication Recommendation
 
