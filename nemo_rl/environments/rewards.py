@@ -142,6 +142,67 @@ def bbox_giou_reward(
     return giou, giou > 0.5
 
 
+def verl_geo3k_reward(
+    ground_truth: str,
+    response: str,
+    format_score: float = 0.1,
+) -> tuple[float, bool]:
+    r"""Reward function for MMPR-Tiny task following verl's geo3k implementation.
+
+    Combines format checking and accuracy checking in a single function.
+    Format check looks for </think> tag and \\boxed{} pattern.
+    Accuracy check uses math_verify (HuggingFace math-verify) to grade the boxed answer.
+
+    Args:
+        ground_truth: The correct answer.
+        response: Model's complete response (with <think> and \\boxed{}).
+        format_score: Weight for format check (default 0.1 = 10%).
+
+    Returns:
+        (reward, is_correct) where reward = (1-format_score)*accuracy + format_score*format.
+    """
+    format_pattern = re.compile(r"</think>.*\\boxed\{.*\}", re.DOTALL)
+    has_format = bool(re.search(format_pattern, response))
+    format_reward_value = 1.0 if has_format else 0.0
+
+    try:
+        # Extract last \boxed{} content and grade using math_verify (already a nemo-rl dependency).
+        # Use rfind so intermediate guesses don't override the model's final answer (matches verl/mathruler).
+        boxed_token = "\\boxed{"
+        boxed_start = response.rfind(boxed_token)
+        if boxed_start != -1:
+            start = boxed_start + len(boxed_token)
+            depth = 1
+            for i, ch in enumerate(response[start:]):
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                if depth == 0:
+                    answer = response[start : start + i].strip()
+                    break
+            else:
+                answer = None
+        else:
+            answer = None
+
+        if answer is not None:
+            score, _ = math_verify_func([boxed(ground_truth)], [boxed(answer)])
+            is_correct = score > 0.1
+            acc_reward_value = 1.0 if is_correct else 0.0
+        else:
+            acc_reward_value = 0.0
+            is_correct = False
+    except (Exception, TimeoutException):
+        acc_reward_value = 0.0
+        is_correct = False
+
+    final_reward = (
+        1.0 - format_score
+    ) * acc_reward_value + format_score * format_reward_value
+    return final_reward, is_correct
+
+
 def combine_reward_functions(
     reward_functions: list[tuple[Callable[[str, str], tuple[float, bool]], float]],
 ) -> Callable[[str, str], tuple[float, bool]]:

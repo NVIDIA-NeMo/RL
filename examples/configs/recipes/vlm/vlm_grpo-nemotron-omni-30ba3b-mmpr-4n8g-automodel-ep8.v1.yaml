@@ -1,0 +1,9 @@
+defaults: ../../vlm_grpo_nemotron_omni_mmpr.yaml
+checkpointing:
+  checkpoint_dir: results/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-automodel-ep8.v1
+logger:
+  wandb:
+    project: nemo-rl
+    name: vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-automodel-ep8.v1
+cluster:
+  num_nodes: 4

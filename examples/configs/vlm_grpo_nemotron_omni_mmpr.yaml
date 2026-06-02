@@ -1,0 +1,144 @@
+# GRPO training for Nemotron-Omni (MoE ~30B) on MMPR-Tiny
+# Inherits from vlm_grpo_3B.yaml; encodes all Nemotron-Omni MoE EP=8 settings
+# plus the MMPR-Tiny dataset recipe.
+#
+# Aligned with the Megatron-Bridge reference recipe at
+#   /lustre/fsw/portfolios/coreai/users/yuekaiz/omni/RL-day0/examples/omni/nanov3_vision_rl.yaml
+# Notes on intentional divergence from that ref:
+# - num_prompts_per_step / train_global_batch_size kept at 32 (ref: 512 / 2048)
+#   because ref runs on 16 nodes (TP=8 EP=16, ~128 GPUs) and we run on 4 nodes (32 GPUs).
+# - Megatron-only knobs (megatron_cfg.*, freeze_vision_encoder, freeze_audio_encoder, etc.)
+#   are NOT mirrored — this run uses the AutoModel/DTensor backend.
+defaults: "vlm_grpo_3B.yaml"
+
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+  val_at_start: false                   # ref
+  overlong_filtering: true              # ref
+  seq_logprob_error_threshold: 2        # ref
+  reward_shaping:
+    overlong_buffer_length: 512
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0      # ref (no KL penalty in loss)
+  kl_input_clamp_value: null            # ref
+  kl_output_clamp_value: null           # ref
+  ratio_clip_max: 0.28                  # ref: Clip-Higher (DAPO/JustRL)
+  use_on_policy_kl_approximation: true  # ref
+  sequence_level_importance_ratios: true # ref
+  token_level_loss: false               # ref: per-sequence loss
+
+checkpointing:
+  checkpoint_dir: results/vlm_grpo_nemotron_omni_mmpr
+  save_optimizer: true
+  keep_top_k: 1000000                   # ref: keep all
+  checkpoint_must_save_by: "00:03:45:00"
+
+policy:
+  model_name: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 8192       # ref (was 10000)
+  logprob_chunk_size: 1024              # ref
+  max_grad_norm: 1.0                    # ref
+  dynamic_batching:
+    enabled: false
+  sequence_packing:
+    enabled: false                      # ref has true (Megatron supports VLM packing); AutoModel/DTensor does NOT support packing for VLM yet — must be false
+  optimizer:
+    kwargs:
+      lr: 3.0e-06
+      weight_decay: 0.0                 # ref (was 0.01)
+      betas: [0.9, 0.99]                # ref (was [0.9, 0.999])
+      eps: 1e-8
+      foreach: False
+      fused: False
+  scheduler:                             # ref: warmup 10 iters from 0.3e-7 (~1% of base lr), then constant
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.01              # 0.3e-7 / 3e-6 ≈ 0.01
+        end_factor: 1.0
+        total_iters: 10                 # ref: lr_warmup_iters
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [10]
+  dtensor_cfg:
+    expert_parallel_size: 8
+    activation_checkpointing: true
+    moe_parallelizer:
+      ignore_router_for_ac: true
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+      NRL_DEBUG_PICKLE: "1"
+    automodel_kwargs:
+      backend:
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
+        attn: sdpa
+        linear: torch
+        rms_norm: torch_fp32
+        enable_deepep: true
+        fake_balanced_gate: false
+        rope_fusion: false
+        enable_hf_state_dict_adapter: true
+      freeze_config:
+        freeze_vision_tower: false     # NemotronOmni: freeze RADIO vision tower (also covers patch_generator.video_embedder on image-only data)
+        freeze_audio_tower: true      # NemotronOmni: freeze sound_encoder/sound_projection on image-only data
+        freeze_video_embedder: true  # NemotronOmni: flip to true when vision tower is unfrozen but video branch is still unused
+        freeze_language_model: false
+  generation:
+    max_new_tokens: ${policy.max_total_sequence_length}  # ref pattern
+    bad_words: ["<image>", "<img>", "</img>", "<so_embedding>", "<so_start>", "<so_end>"]
+    vllm_cfg:
+      skip_tokenizer_init: false
+      tensor_parallel_size: 8
+      enforce_eager: true
+      max_model_len: ${policy.max_total_sequence_length}
+      gpu_memory_utilization: 0.5
+      enable_prefix_caching: false
+    vllm_kwargs:
+      limit_mm_per_prompt: {"image": 2}
+      max_num_batched_tokens: 16384
+      mm_processor_cache_gb: 0
+      mamba_ssm_cache_dtype: "float32"
+      skip_mm_profiling: true
+      # Disable flashinfer MoE autotuner: tactic 36 fails with "Invalid activation
+      # type" on V3 + bf16 + tp=8, leaving GPU in a bad state → CUDA illegal
+      # instruction during generation. Force triton MoE backend to avoid the
+      # illegal-instruction in default backend post-refit; disable prefix caching
+      # so cached KV from old weights can't leak into the next step.
+      kernel_config: {"enable_flashinfer_autotune": false, "moe_backend": "triton"}
+
+data:
+  train:
+    dataset_name: mmpr-tiny
+    download_dir: results/mmpr_tiny_processed
+    split_validation_size: 0.008
+    seed: 42
+  default:
+    prompt_file: null
+    processor: vlm_hf_data_processor
+    env_name: mmpr-tiny
+
+env:
+  mmpr-tiny:
+    num_workers: 8
+    reward_functions:
+    - name: verl_geo3k
+      weight: 1.0
+      kwargs:
+        format_score: 0.1
+
+logger:
+  tensorboard_enabled: true
+  monitor_gpus: false
+  wandb_enabled: true
+  wandb:
+    project: grpo-vlm
+    name: nemotron-omni-grpo-mmpr
+
+cluster:
+  gpus_per_node: 8

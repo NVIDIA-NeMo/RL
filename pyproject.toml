@@ -49,8 +49,10 @@ dependencies = [
   "sympy>=1.14.0",
   "pillow>=12.1.1",
   "torchvision==0.26.0",
-  "transformers==5.3.0",
+  "transformers==5.5.0",
   "num2words>=0.5.14",                                                                                                # for SmolVLM
+  "timm",
+  "open-clip-torch>=3.2.0",
   "mlflow>=3.12.0",
   "nvidia-nvshmem-cu13; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
   "swanlab",
@@ -141,6 +143,7 @@ vllm = [
   "flashinfer-python==0.6.8.post1",
   "flashinfer-cubin==0.6.8.post1",
   "nvidia-cutlass-dsl>=4.4.0.dev1",
+  "vllm==0.20.0",
 ]
 sglang = [
   "sglang==0.5.11",
@@ -323,9 +326,9 @@ override-dependencies = [
   "nvidia-cutlass-dsl>=4.4.1",
   # Relax megatron-core workspace member's opentelemetry-api ceiling (<1.34) for protobuf 6.x compat with ray
   "opentelemetry-api>=1.33.1",
-  # vLLM 0.20.0 excludes transformers 5.0-5.5.0 but our codebase needs 5.3.0.
-  # Override so uv can resolve transformers==5.3.0 for non-vllm extras.
-  "transformers==5.3.0",
+  # vLLM 0.20.0 declares transformers !=5.5.0, but our omni/gemma work needs 5.5.0.
+  # Force-override so uv resolves transformers==5.5.0 across all extras.
+  "transformers==5.5.0",
   # Override sglang's xgrammar==0.1.32 to address CVE GHSA-7rgv-gqhr-fxg3
   "xgrammar==0.1.33",
   # Override dependencies to address CVEs

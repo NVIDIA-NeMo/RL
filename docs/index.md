@@ -233,6 +233,7 @@ guides/sft-openmathinstruct2.md
 :hidden:
 
 guides/nemotron-3-nano.md
+guides/nemotron-3-nano-omni.md
 adding-new-models.md
 guides/sft.md
 guides/dpo.md
