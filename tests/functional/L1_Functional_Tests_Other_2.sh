@@ -35,6 +35,7 @@ run_test() {
 }
 
 run_test fast uv run --no-sync bash ./tests/functional/distillation.sh
+run_test      uv run --no-sync bash ./tests/functional/xtoken_off_policy_distillation.sh
 run_test fast uv run --no-sync bash ./tests/functional/dpo.sh
 run_test      uv run --no-sync bash ./tests/functional/prorlv2.sh
 run_test      uv run --no-sync bash ./tests/functional/rm.sh
