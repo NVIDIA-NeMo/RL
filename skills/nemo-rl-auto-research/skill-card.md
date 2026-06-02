@@ -1,5 +1,5 @@
 ## Description: <br>
-Autonomous NeMo-RL research agent workflow for directed hypothesis testing and open-ended discovery. <br>
+Autonomous NeMo-RL research agent workflow for directed hypothesis testing and open-ended discovery that guides agents through the full experiment lifecycle including launching reproducible baselines and iterations, analyzing results, and using git plus TSV logs as the research ledger. <br>
 
 This skill is ready for commercial/non-commercial use. <br>
 
@@ -9,7 +9,7 @@ NVIDIA <br>
 ### License/Terms of Use: <br>
 Apache 2.0 <br>
 ## Use Case: <br>
-Developers and engineers running iterative NeMo-RL experiments for directed hypothesis testing, open-ended discovery campaigns, and reproducible research workflows. <br>
+Developers and engineers running iterative NeMo-RL experiments to improve model accuracy, reward, throughput, or other recipe-specific metrics through autonomous research campaigns. <br>
 
 ### Deployment Geography for Use: <br>
 Global <br>
@@ -19,26 +19,26 @@ Risk: Review before execution as proposals could introduce incorrect or misleadi
 Mitigation: Review and scan skill before deployment. <br>
 
 ## Reference(s): <br>
-- [experiment-log-template.md](references/experiment-log-template.md) <br>
-- [exploration-ideas.md](references/exploration-ideas.md) <br>
-- [git-workflow.md](references/git-workflow.md) <br>
+- [Git Workflow](references/git-workflow.md) <br>
+- [Exploration Ideas](references/exploration-ideas.md) <br>
+- [Experiment Log Template](references/experiment-log-template.md) <br>
 - [NeMo RL Documentation](https://docs.nvidia.com/nemo/rl/latest/index.html) <br>
 
 
 ## Skill Output: <br>
 **Output Type(s):** [Shell commands, Configuration instructions, Analysis, Files] <br>
-**Output Format:** [Markdown with inline bash code blocks] <br>
+**Output Format:** [Markdown with inline bash code blocks and TSV experiment logs] <br>
 **Output Parameters:** [1D] <br>
-**Other Properties Related to Output:** [TSV experiment logs, per-experiment log directories, git branches] <br>
+**Other Properties Related to Output:** [None] <br>
 
 ## Evaluation Agents Used: <br>
-- Claude Code (`claude-code`) <br>
-- Codex (`codex`) <br>
+- `claude-code` <br>
+- `codex` <br>
 
 
 
 ## Evaluation Tasks: <br>
-Evaluated against 5 internal evaluation tasks (3 positive skill-activation, 2 negative) with 2 attempts per task via NVSkills-Eval external profile. <br>
+Evaluated against 5 evaluation tasks (3 positive skill-activation, 2 negative activation) with 2 attempts per task via NVSkills-Eval external profile. <br>
 
 ## Evaluation Metrics Used: <br>
 Reported benchmark dimensions: <br>
@@ -63,10 +63,10 @@ Underlying evaluation signals used in this run: <br>
 | Dimension | Num | `claude-code` | `codex` |
 |---|---:|---:|---:|
 | Security | 8 | 100% (+0%) | 100% (+0%) |
-| Correctness | 8 | 81% (+5%) | 89% (+13%) |
-| Discoverability | 8 | 69% (+5%) | 82% (+1%) |
-| Effectiveness | 8 | 78% (+3%) | 79% (+18%) |
-| Efficiency | 8 | 56% (+3%) | 72% (+1%) |
+| Correctness | 8 | 76% (-9%) | 90% (+9%) |
+| Discoverability | 8 | 66% (-9%) | 87% (+11%) |
+| Effectiveness | 8 | 76% (-6%) | 79% (+13%) |
+| Efficiency | 8 | 57% (-5%) | 75% (+12%) |
 
 ## Skill Version(s): <br>
 1.5.4 (source: pyproject.toml) <br>

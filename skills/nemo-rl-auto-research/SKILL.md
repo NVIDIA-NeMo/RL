@@ -1,5 +1,5 @@
 ---
-name: auto-research
+name: nemo-rl-auto-research
 license: Apache-2.0
 description: "Autonomous NeMo-RL research agent workflow for directed hypothesis testing and open-ended discovery. Guides agents through the full experiment lifecycle: understanding recipes and environments, wiring RL or NeMo-gym runs, launching reproducible baselines and iterations, analyzing results, preserving human oversight, and using git plus TSV logs as the research ledger. Do NOT use for: bug fixes, code review, documentation, refactoring, dependency updates, or single-file changes."
 when_to_use: auto research; run experiments; test these hypotheses; find a better recipe; improve accuracy; long-running NeMo-RL or NeMo-gym research campaigns; autonomous discovery; directed execution.
@@ -13,9 +13,9 @@ Treat dependencies as ready, but choose the runtime deliberately. Use the recipe
 
 **Safety:** This skill creates git branches, writes files to disk, and executes shell commands including training jobs that may consume GPU resources. Always confirm the campaign plan with the user before creating branches or launching jobs. Do not execute destructive git operations (reset, force-push) or launch compute-intensive jobs without explicit user approval.
 
-Use the `session-memory` skill for every auto-research campaign. Start or resume a session record before branching, then checkpoint after forming the plan, before and after meaningful edits or long-running launches, when the user changes direction, and before handoff or final summary.
+Use the `nemo-rl-session-memory` skill for every auto-research campaign. Start or resume a session record before branching, then checkpoint after forming the plan, before and after meaningful edits or long-running launches, when the user changes direction, and before handoff or final summary.
 
-After context compaction, handoff, disconnect, or a long gap, reload this skill and any companion skills already in use, read the latest `session-memory` handoff, and restate the overall objective, stop rules, current branch, and latest result before continuing. Treat follow-up steering as additive unless the user explicitly changes the main objective.
+After context compaction, handoff, disconnect, or a long gap, reload this skill and any companion skills already in use, read the latest `nemo-rl-session-memory` handoff, and restate the overall objective, stop rules, current branch, and latest result before continuing. Treat follow-up steering as additive unless the user explicitly changes the main objective.
 
 ## Workflow
 
@@ -29,7 +29,7 @@ After context compaction, handoff, disconnect, or a long gap, reload this skill 
 
 For GPU, CPU-heavy, distributed, or long-running work, choose the execution environment deliberately. Run locally when the current machine has suitable GPUs and capacity; otherwise follow the user's requested environment, use `launch-nemo-rl` for nrl-k8s/Kubernetes, use the environment's native launcher for Slurm, or clarify with the user before launching. Use CPU-only local runs only for light inspection, dry runs, and short non-GPU checks.
 
-If the user mentions Brev, or if `/home/ubuntu/RL` exists and `/ephemeral` is available as a volume, treat the machine as a Brev instance and use `brev-etiquette` before creating experiment directories, caches, logs, checkpoints, or authenticated runtime state.
+If the user mentions Brev, or if `/home/ubuntu/RL` exists and `/ephemeral` is available as a volume, treat the machine as a Brev instance and use `nemo-rl-brev-etiquette` before creating experiment directories, caches, logs, checkpoints, or authenticated runtime state.
 
 ## Branching
 
@@ -91,7 +91,7 @@ All else equal, prefer simpler wins and avoid brittle hardware-specific hacks.
 
 - Do not conclude a training idea failed from an underpowered smoke run. If a run uses tiny batch sizes, very few optimizer steps, or otherwise non-representative settings, treat it as plumbing validation only; scale to a meaningful batch size and train long enough to test the hypothesis before marking it `discard`.
 - Do not repeatedly pay batch-scheduler setup costs for tight edit-run-debug loops. If Slurm batch jobs have a large startup tax and failures require quick iteration, use the documented interactive Slurm pattern or ask the user before resubmitting more batch jobs.
-- Do not let context compaction or follow-up steering questions erase the original campaign goal. Refresh `session-memory`, reload active skills, and preserve the main objective unless the user explicitly changes it.
+- Do not let context compaction or follow-up steering questions erase the original campaign goal. Refresh `nemo-rl-session-memory`, reload active skills, and preserve the main objective unless the user explicitly changes it.
 
 ## Stop
 

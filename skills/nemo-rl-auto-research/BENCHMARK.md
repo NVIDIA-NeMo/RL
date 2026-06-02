@@ -1,13 +1,13 @@
 # Evaluation Report
 
-Evaluation of the `auto-research` skill before publication through NVSkills-Eval.
+Evaluation of the `nemo-rl-auto-research` skill before publication through NVSkills-Eval.
 
 This benchmark summarizes 3-Tier Evaluation from NVSkills-Eval results for the skill. The goal is to document whether the skill is safe, discoverable, effective, and useful for agents before it is published for broader workflow use.
 
 ## Evaluation Summary
 
-- Skill: `auto-research`
-- Evaluation date: 2026-05-29
+- Skill: `nemo-rl-auto-research`
+- Evaluation date: 2026-06-01
 - NVSkills-Eval profile: `external`
 - Environment: `local`
 - Dataset: 5 evaluation tasks
@@ -55,10 +55,10 @@ Task composition is derived from the evaluation dataset when possible. Entries w
 | Dimension | Num | `claude-code` | `codex` |
 |---|---:|---:|---:|
 | Security | 8 | 100% (+0%) | 100% (+0%) |
-| Correctness | 8 | 81% (+5%) | 89% (+13%) |
-| Discoverability | 8 | 69% (+5%) | 82% (+1%) |
-| Effectiveness | 8 | 78% (+3%) | 79% (+18%) |
-| Efficiency | 8 | 56% (+3%) | 72% (+1%) |
+| Correctness | 8 | 76% (-9%) | 90% (+9%) |
+| Discoverability | 8 | 66% (-9%) | 87% (+11%) |
+| Effectiveness | 8 | 76% (-6%) | 79% (+13%) |
+| Efficiency | 8 | 57% (-5%) | 75% (+12%) |
 
 Score values show skill-assisted performance. Values in parentheses show uplift versus the no-skill baseline when baseline data is available.
 
@@ -68,11 +68,11 @@ Tier 1 validation passed with observations. NVSkills-Eval ran 9 checks and found
 
 Top findings:
 
-- MEDIUM QUALITY/quality_correctness: SKILL_SPEC recommended field missing: 'metadata.author' (`skills/auto-research/SKILL.md`)
-- MEDIUM QUALITY/quality_correctness: SKILL_SPEC recommended field missing: 'metadata.tags' (`skills/auto-research/SKILL.md`)
-- MEDIUM SCHEMA/body_recommended_section: Missing recommended section: '## Instructions' (`skills/auto-research/SKILL.md`)
-- MEDIUM SCHEMA/body_recommended_section: Missing recommended section: '## Examples' (`skills/auto-research/SKILL.md`)
-- MEDIUM SCHEMA/author_missing: Author not specified in metadata (`skills/auto-research/SKILL.md`)
+- MEDIUM QUALITY/quality_correctness: SKILL_SPEC recommended field missing: 'metadata.author' (`skills/nemo-rl-auto-research/SKILL.md`)
+- MEDIUM QUALITY/quality_correctness: SKILL_SPEC recommended field missing: 'metadata.tags' (`skills/nemo-rl-auto-research/SKILL.md`)
+- MEDIUM SCHEMA/body_recommended_section: Missing recommended section: '## Instructions' (`skills/nemo-rl-auto-research/SKILL.md`)
+- MEDIUM SCHEMA/body_recommended_section: Missing recommended section: '## Examples' (`skills/nemo-rl-auto-research/SKILL.md`)
+- MEDIUM SCHEMA/author_missing: Author not specified in metadata (`skills/nemo-rl-auto-research/SKILL.md`)
 
 ## Tier 2: Deduplication Summary
 
@@ -81,7 +81,7 @@ Tier 2 validation passed. NVSkills-Eval ran 2 checks and found 0 total findings.
 Notable observations:
 
 - Context Deduplication: Collected 4 file(s)
-- Inter-Skill Deduplication: Parsed skill 'auto-research': 481 char description
+- Inter-Skill Deduplication: Parsed skill 'nemo-rl-auto-research': 481 char description
 
 ## Publication Recommendation
 
