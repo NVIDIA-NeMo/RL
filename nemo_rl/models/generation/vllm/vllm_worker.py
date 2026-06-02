@@ -32,10 +32,7 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generation
-from nemo_rl.models.huggingface.common import (
-    ModelFlag,
-    is_nano_nemotron_vl_model,
-)
+from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
@@ -143,14 +140,6 @@ class BaseVllmGenerationWorker:
         """
         self.cfg = config
         self.model_name = self.cfg["model_name"]
-        # NemotronH-Nano-VL / Nemotron-Omni RADIO vision encoder has ls1/ls2
-        # layer-scale params that are not stored in HF state_dict (they default
-        # to 1.0 in __init__). Level=2 sleep discards vLLM weights and wakes
-        # via dummy init, which sets ls1/ls2 to random ~0; the refit then
-        # cannot restore them because they're not in the HF state_dict.
-        # Force level=1 sleep for these models so ls1/ls2 stay in the CPU
-        # snapshot across sleep/wake.
-        self._force_level1_sleep = is_nano_nemotron_vl_model(self.model_name)
         self.tensor_parallel_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
         self.pipeline_parallel_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
         self.expert_parallel_size = self.cfg["vllm_cfg"]["expert_parallel_size"]
@@ -1026,8 +1015,6 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             self.llm.renderer, "clear_mm_cache"
         ):
             self.llm.renderer.clear_mm_cache()
-        if discard_weights and self._force_level1_sleep:
-            discard_weights = False
         self.llm.sleep(level=2 if discard_weights else 1)
 
         gc.collect()
