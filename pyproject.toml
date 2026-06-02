@@ -142,10 +142,7 @@ vllm = [
   "flashinfer-cubin==0.6.8.post1",
   "nvidia-cutlass-dsl>=4.4.0.dev1",
 ]
-sglang = [
-  "sglang==0.5.11",
-  "sglang-kernel==0.4.2", # Direct dep for explicit version control
-]
+sglang = ["sglang==0.5.12.post1", "sglang-kernel==0.4.2.post2"]
 mcore = [
   # also need cudnn (https://developer.nvidia.com/cudnn-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=deb_network)
   # wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-keyring_1.1-1_all.deb
