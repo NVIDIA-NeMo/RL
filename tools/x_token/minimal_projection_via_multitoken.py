@@ -22,7 +22,7 @@ import tqdm
 from transformers import AutoConfig, AutoTokenizer
 
 from nemo_rl.algorithms.x_token.token_aligner import canonical_token
-from tools.x_token._shared import (
+from tools.x_token.utils import (
     clean_model_name_for_filename,
     sinkhorn_one_dim,
 )

@@ -99,7 +99,7 @@ if [[ -z "$STUDENT" || -z "$TEACHER" ]]; then
   exit 2
 fi
 
-# Mirror tools/x_token/_shared.py::clean_model_name_for_filename so the
+# Mirror tools/x_token/utils.py::clean_model_name_for_filename so the
 # wrapper can predict intermediate filenames without spawning Python.
 clean_name() {
   local name="$1" cleaned

@@ -34,11 +34,11 @@ import torch
 
 from nemo_rl.algorithms.x_token.loss_utils import parse_projection_file
 from tools.x_token import (
-    _shared,
     minimal_projection_generator,
     minimal_projection_via_multitoken,
     reapply_exact_map as reapply_mod,
     sort_and_cut_projection_matrix as sort_cut_mod,
+    utils,
 )
 
 
@@ -405,14 +405,14 @@ class TestSortAndCutAutoPreserveFromMetadata:
 
 
 # ---------------------------------------------------------------------------
-# _shared helpers
+# utils helpers
 # ---------------------------------------------------------------------------
 
 
 class TestShared:
     def test_sinkhorn_one_dim_row_normalizes(self):
         A = torch.tensor([[1.0, 1.0, 2.0], [0.0, 0.0, 0.0], [4.0, 0.0, 0.0]])
-        out = _shared.sinkhorn_one_dim(A.clone(), n_iters=1)
+        out = utils.sinkhorn_one_dim(A.clone(), n_iters=1)
         # Row 0 sums to 1.
         assert torch.allclose(out[0].sum(), torch.tensor(1.0), atol=1e-6)
         # Row 1 is all-zero; safe-divide leaves it unchanged.
@@ -421,15 +421,15 @@ class TestShared:
         assert torch.allclose(out[2], torch.tensor([1.0, 0.0, 0.0]))
 
     def test_clean_model_name_strips_param_count_and_suffixes(self):
-        assert _shared.clean_model_name_for_filename(
+        assert utils.clean_model_name_for_filename(
             "meta-llama/Llama-3.2-1B"
         ) == "meta-llama/Llama-3.2"
         assert (
-            _shared.clean_model_name_for_filename("microsoft/phi-4-Base")
+            utils.clean_model_name_for_filename("microsoft/phi-4-Base")
             == "microsoft/phi"
         )
         # "mini" preserved as suffix.
-        cleaned = _shared.clean_model_name_for_filename(
+        cleaned = utils.clean_model_name_for_filename(
             "Qwen2.5-0.5B-mini-Instruct"
         )
         assert "mini" in cleaned
