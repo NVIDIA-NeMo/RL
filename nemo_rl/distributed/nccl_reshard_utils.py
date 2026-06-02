@@ -125,12 +125,16 @@ ROW_PARALLEL_SUFFIXES = [
     "down_proj.weight",
     # Fused MoE expert param (vLLM naming: down proj)
     "w2_weight",
+    # NemotronH Mamba2 output projection
+    "out_proj.weight",
 ]
 
 # Vocabulary-parallel: TP shards along dim 0 (vocab dimension).
 VOCAB_PARALLEL_NAMES = [
     "embed_tokens.weight",
     "lm_head.weight",
+    # NemotronH HF token embedding (vLLM: model.embed_tokens.weight).
+    "embeddings.weight",
 ]
 
 
@@ -166,48 +170,47 @@ def is_expert_param(param_name: str) -> bool:
 def is_misc_param(param_name: str) -> bool:
     """Return True if the parameter should be routed to the misc refit path.
 
-    Misc params are transferred by all-gathering the full HF-shaped tensor on
-    the train side and feeding it to vLLM's ``model.load_weights`` on the gen
-    side, rather than going through xferdtensor.  This lets vLLM handle
-    Parameter-specific quirks (FP8 blockwise quant layout, FusedMoE per-expert
-    fusion, FP8 KV-cache name remap) instead of us reimplementing them.
+    Misc params are all-gathered to their full HF shape on the train side and
+    loaded via vLLM's ``model.load_weights`` on the gen side, letting vLLM
+    handle param-specific quirks (FP8 blockwise layout, Mamba/MoE sharding,
+    ``A_log -> A``) that xferdtensor's uniform column/row sharding can't
+    reproduce.  Everything else takes the xferdtensor bulk fast path.
 
-    Bulk params (vanilla 2D linear weights) still take the xferdtensor fast
-    path; misc params are a small share of bytes but carry most of the
-    Parameter-specific complexity.
-
-    Rules — narrow on purpose; only add cases we've confirmed need it:
-    * ``*_scale_inv`` siblings of FP8 blockwise weights.
-    * FP8 KV-cache and activation scales (``.k_scale``, ``.v_scale``,
-      ``.q_scale``, ``.weight_scale``, ``.input_scale``).
-    * The MoE router/gate Linear weight.
-
-    Suffix-based check works on both HF and Megatron names (Bridge preserves
-    these suffixes through ``megatron_to_hf``), so the same classifier is
-    used by the gen-side metadata partition (HF names) and the train-side
-    ``conversion_tasks`` filter (Megatron names).
+    The same classifier runs on both the gen-side HF names and the train-side
+    Megatron names (Bridge preserves these suffixes through ``megatron_to_hf``).
+    It MUST classify each param identically on both sides, or the bulk/misc
+    split desyncs and packed_broadcast deadlocks.
     """
+    # FP8 blockwise scale siblings + KV-cache/activation scales.
     if param_name.endswith("_scale_inv"):
         return True
     if param_name.endswith(
         (".k_scale", ".v_scale", ".q_scale", ".weight_scale", ".input_scale")
     ):
         return True
-    # MoE router/gate: vLLM blockwise-FP8 *quantizes* the router Linear (its
-    # dummy/loaded weight is ``float8_e4m3fn`` with a ``weight_scale_inv``
-    # companion), but Megatron keeps the router in bf16 with no scale.  That
-    # dtype disagreement would desync the xferdtensor broadcast — train sends
-    # bf16 (one byte-width) while gen posts the matching receive as fp8
-    # (another) on the same NCCL collective, deadlocking it.  Route the router
-    # through misc so vLLM's ``load_weights`` quantizes the bf16 weight and
-    # computes the scale itself.  The router is tiny and not an expert weight,
-    # so this costs negligible bandwidth.  Match both the HF name
-    # (``mlp.gate.weight``) and the Megatron-Core name (``mlp.router.weight``)
-    # so the gen-side (HF) ``misc_meta`` and the train-side (Megatron)
-    # conversion-task filter classify the same param identically.  Dense
-    # models have neither suffix (their FFN gate is ``mlp.gate_proj.weight``),
-    # so this rule is a no-op for them.
-    if param_name.endswith(("mlp.gate.weight", "mlp.router.weight")):
+    # MoE router/gate Linear: vLLM blockwise-FP8 quantizes it to fp8 (+scale)
+    # while Megatron keeps it bf16 — that dtype mismatch would deadlock the
+    # xferdtensor collective, so let vLLM's load_weights quantize it.  Tiny and
+    # not an expert weight, so misc costs negligible bandwidth.  Match the HF
+    # forms (``mlp.gate.weight``, NemotronH ``mixer.gate.weight``) and the
+    # Megatron form (``mlp.router.weight``) so both sides classify it the same.
+    if param_name.endswith(
+        ("mlp.gate.weight", "mlp.router.weight", "mixer.gate.weight")
+    ):
+        return True
+    # NemotronH Mamba2 mixer params:
+    if param_name.endswith(
+        (
+            "mixer.in_proj.weight",
+            "mixer.conv1d.weight",
+            "mixer.conv1d.bias",
+            "mixer.A_log",
+            "mixer.A",
+            "mixer.D",
+            "mixer.dt_bias",
+            "mixer.norm.weight",
+        )
+    ):
         return True
     return False
 
@@ -429,20 +432,31 @@ def fuse_expert_params_in_metadata(
         else:  # down_proj
             w2_groups[prefix] = entries
 
-    # Create w13_weight entries (fused gate+up)
+    # Create w13_weight entries.
+    #  * Gated SwiGLU (gate_proj + up_proj): w13 = [E, 2*intermediate, hidden].
+    #  * Non-gated ReLU^2 (NemotronH: up_proj only, no gate_proj): vLLM builds
+    #    the MoE as SharedFusedMoE(is_act_and_mul=False) and loads up_proj into
+    #    the single w13 slot, so w13 = [E, intermediate, hidden] (no gate half).
     for prefix, projs in w13_groups.items():
         gate_entries = projs.get("gate_proj", [])
-        if not gate_entries:
+        up_entries = projs.get("up_proj", [])
+        if gate_entries:
+            ref_entries = gate_entries
+            dim0_mult = 2  # gate + up concatenated on the intermediate dim
+        elif up_entries:
+            ref_entries = up_entries
+            dim0_mult = 1  # up only (non-gated)
+        else:
             continue
-        num_experts_global = len(gate_entries)
-        gate_shape = gate_entries[0][1]["shape"]  # [intermediate, hidden]
-        intermediate_size = gate_shape[0]
-        hidden_size = gate_shape[1]
-        fused_shape = [num_experts_global, 2 * intermediate_size, hidden_size]
+        num_experts_global = len(ref_entries)
+        proj_shape = ref_entries[0][1]["shape"]  # [intermediate, hidden]
+        intermediate_size = proj_shape[0]
+        hidden_size = proj_shape[1]
+        fused_shape = [num_experts_global, dim0_mult * intermediate_size, hidden_size]
         fused_name = f"{prefix}.w13_weight"
         fused_metadata[fused_name] = {
             "shape": fused_shape,
-            "dtype": gate_entries[0][1]["dtype"],
+            "dtype": ref_entries[0][1]["dtype"],
             "fused_expert_param_type": "w13",
         }
 

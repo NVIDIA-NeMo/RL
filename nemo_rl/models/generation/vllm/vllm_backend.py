@@ -396,6 +396,21 @@ class VllmInternalWorkerExtension:
             for p in refit_info["per_layer_params"][layer_name]:
                 hf_shapes[p["name"]] = tuple(p["global_shape"])
 
+        # NemotronH (nemotron_h): HF param names use the ``backbone.*`` prefix
+        # while vLLM uses ``model.*`` (e.g. ``backbone.layers.N.mixer.experts.
+        # w13_weight`` -> ``model.layers.N.mixer.experts.w13_weight``).  Translate
+        # at the point of vLLM-param lookup so the direct-match / merge rules below
+        # resolve.  Mamba SSM params + embeddings take the misc path instead (see
+        # is_misc_param), so vLLM's load_weights handles their special sharding and
+        # the A_log -> A transform; they never reach this bulk mapping.  For
+        # non-NemotronH models the name is unchanged, so this is a no-op.
+        def _to_vllm_name(n):
+            if n == "backbone.embeddings.weight":
+                return "model.embed_tokens.weight"
+            if n.startswith("backbone."):
+                return "model." + n[len("backbone.") :]
+            return n
+
         # Merge rules: (list of HF suffixes) → vLLM suffix, concat along dim 0
         MERGE_RULES = [
             (["q_proj.weight", "k_proj.weight", "v_proj.weight"], "qkv_proj.weight"),
@@ -428,8 +443,9 @@ class VllmInternalWorkerExtension:
 
         for hf_name in hf_shapes:
             # 1) Direct match (includes fused MoE expert params: w13_weight, w2_weight)
-            if hf_name in vllm_params:
-                mapping[hf_name] = (vllm_params[hf_name], None)
+            vllm_direct = _to_vllm_name(hf_name)
+            if vllm_direct in vllm_params:
+                mapping[hf_name] = (vllm_params[vllm_direct], None)
                 continue
 
             # 2) Check merge rules
@@ -438,7 +454,7 @@ class VllmInternalWorkerExtension:
                 for i, suffix in enumerate(hf_suffixes):
                     if hf_name.endswith(suffix):
                         prefix = hf_name[: -len(suffix)]
-                        vllm_name = prefix + vllm_suffix
+                        vllm_name = _to_vllm_name(prefix + vllm_suffix)
                         if vllm_name in vllm_params:
                             vllm_param = vllm_params[vllm_name]
                             local_dim0 = vllm_param.shape[0]

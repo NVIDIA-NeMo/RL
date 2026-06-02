@@ -1419,6 +1419,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                     "shape": list(tensor.shape),
                     "dtype": str(tensor.dtype),
                 }
+                # filtering hard to handle params as a misc_param
                 if is_misc_param(name):
                     misc_meta[name] = meta
                 else:
@@ -1449,28 +1450,14 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         # -> List[(expert_id:int, hf_param_name:str)]
         self._expert_groups = self._build_expert_groups()
 
-        # Misc-param plan: rank 0 packs and broadcasts misc tensors (FP8
-        # scale_inv siblings, FP8 KV/activation scales) via packed_broadcast.
-        # Source iterator is the Bridge stream over a FILTERED conversion
-        # task list — only tasks whose Megatron ``global_param_name`` ends
-        # in ``_scale_inv`` are included, so Bridge skips TP/EP all-gather
-        # for bulk weights.  Consumer on the gen side feeds the unpacked
-        # (name, tensor) stream into vLLM's load_weights.  ``misc_meta``
-        # preserves Bridge's yield order — required by packed_broadcast so
-        # producer and consumer agree on the per-batch layout.
+        # Misc params are using packed_broadcast path as the same as the
+        # nccl_reshard_refit=False path, which is using per-backend weight
+        # loading functions (e.g., vllm.load_weights) to handle the complexity
         self.nccl_reshard_refit_info["misc_meta"] = misc_meta
-        # Filter conversion_tasks to only the misc subset so Bridge skips
-        # TP/EP all-gather for bulk weights at refit time.  ``is_misc_param``
-        # works on the Megatron-side ``global_param_name`` because Bridge
-        # preserves the suffixes (``_scale_inv``, ``.k_scale``, ...) through
-        # ``megatron_to_hf``.  Note: FP8 KV-cache scales are appended
-        # outside the task list, so this filter only covers the
-        # ``_scale_inv`` family today; that's all the current misc rule
-        # sees in ``refit_conversion_tasks``.
-        # Drop non-misc entries entirely — Bridge's stream loop accesses
-        # ``task.param_weight`` without a None check, so the list must
-        # contain Task objects only (cross-PP placeholders carry
-        # ``param_weight=None`` but are still Task instances).
+        # Filter conversion_tasks to the misc subset (see is_misc_param).
+        # is_misc_param runs on the Megatron global_param_name here; Bridge
+        # preserves the classifying suffixes through megatron_to_hf, so it
+        # agrees with the gen-side (HF-name) split.
         self._misc_conversion_tasks = [
             task
             for task in self.refit_conversion_tasks
@@ -1530,36 +1517,45 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         ``_fused_expert_map``.
         """
         if fused_expert_param_type == "w13":
-            # vLLM expects per-rank w13[:, :P] = gate[r*P:(r+1)*P] and
-            # w13[:, P:2P] = up[r*P:(r+1)*P] (P = intermediate / gen_tp_size).
-            # Build the global tensor so that contiguous Shard(1) slicing
-            # by gen TP yields that layout: dim 1 must be
-            # [gate[0:P], up[0:P], gate[P:2P], up[P:2P], ...].
             prefix = fused_name.rsplit(".w13_weight", 1)[0]
             gate_group = expert_groups.get((prefix, "gate_proj"), [])
             up_group = expert_groups.get((prefix, "up_proj"), [])
             expert_tensors = []
-            for (_, gate_name), (_, up_name) in zip(gate_group, up_group):
-                gate = self._param_map[gate_name]
-                up = self._param_map[up_name]
-                if gen_tp_size > 1:
-                    inter, hidden = gate.shape
-                    assert inter % gen_tp_size == 0, (
-                        f"intermediate {inter} not divisible by gen_tp_size {gen_tp_size}"
-                    )
-                    P = inter // gen_tp_size
-                    stacked = torch.cat(
-                        [
-                            gate.view(gen_tp_size, P, hidden),
-                            up.view(gen_tp_size, P, hidden),
-                        ],
-                        dim=1,
-                    )  # [gen_tp_size, 2P, hidden]
-                    expert_tensors.append(
-                        stacked.reshape(2 * inter, hidden).contiguous()
-                    )
-                else:
-                    expert_tensors.append(torch.cat([gate, up], dim=0))
+            if gate_group:
+                # Gated SwiGLU.  vLLM expects per-rank w13[:, :P] =
+                # gate[r*P:(r+1)*P] and w13[:, P:2P] = up[r*P:(r+1)*P]
+                # (P = intermediate / gen_tp_size).  Build the global tensor so
+                # contiguous Shard(1) slicing by gen TP yields that layout: dim 1
+                # must be [gate[0:P], up[0:P], gate[P:2P], up[P:2P], ...].
+                for (_, gate_name), (_, up_name) in zip(gate_group, up_group):
+                    gate = self._param_map[gate_name]
+                    up = self._param_map[up_name]
+                    if gen_tp_size > 1:
+                        inter, hidden = gate.shape
+                        assert inter % gen_tp_size == 0, (
+                            f"intermediate {inter} not divisible by gen_tp_size {gen_tp_size}"
+                        )
+                        P = inter // gen_tp_size
+                        stacked = torch.cat(
+                            [
+                                gate.view(gen_tp_size, P, hidden),
+                                up.view(gen_tp_size, P, hidden),
+                            ],
+                            dim=1,
+                        )  # [gen_tp_size, 2P, hidden]
+                        expert_tensors.append(
+                            stacked.reshape(2 * inter, hidden).contiguous()
+                        )
+                    else:
+                        expert_tensors.append(torch.cat([gate, up], dim=0))
+            else:
+                # Non-gated ReLU^2 (NemotronH): up_proj only, loaded into vLLM's
+                # single w13 slot (SharedFusedMoE(is_act_and_mul=False)).  No gate
+                # half to interleave — up_proj is already contiguous on the
+                # intermediate dim, so plain gen-TP Shard(1) slicing matches
+                # vLLM's per-rank up[r*P:(r+1)*P].
+                for _, up_name in up_group:
+                    expert_tensors.append(self._param_map[up_name])
             return torch.stack(expert_tensors) if expert_tensors else None
 
         if fused_expert_param_type == "w2":
