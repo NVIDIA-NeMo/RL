@@ -327,6 +327,8 @@ override-dependencies = [
   "xgrammar==0.1.33",
   # Override dependencies to address CVEs
   "mlflow>=3.12.0",
+  # Override langchain-core to address CVE GHSA-qh6h-p6c9-ff54 (path traversal in load_prompt)
+  "langchain-core>=1.2.22",
   # Override outlines for Python 3.13 support
   "outlines>=0.2.0",
   # Upgrade pytest to 9.0.3
@@ -491,17 +493,20 @@ requires-dist = [
   "torch>=2.6.0",
 ]
 
-# Override logsage metadata to remove numpy<=2.0.2 and pandas<=2.3.3 upper bounds
-# (numpy cap conflicts with onnx>=1.21.0rc4 CVE fix via nvidia-resiliency-ext)
+# Override logsage metadata to:
+# 1. Remove numpy<=2.0.2 and pandas<=2.3.3 upper bounds
+#    (numpy cap conflicts with onnx>=1.21.0rc4 CVE fix via nvidia-resiliency-ext)
+# 2. Bump langchain ecosystem to 1.x to address CVE GHSA-qh6h-p6c9-ff54
+#    (langchain-core path traversal in legacy load_prompt, fix requires >=1.2.22)
 # Tracking: https://github.com/NVIDIA/nvidia-resiliency-ext/issues/301
 [[tool.uv.dependency-metadata]]
 name = "logsage"
 version = "0.1.5"
 requires-dist = [
   "drain3>=0.9.11,<0.10.0",
-  "langchain>=0.3.27,<0.4.0",
-  "langchain-core>=0.3.0,<1.0.0",
-  "langchain-nvidia-ai-endpoints>=0.3.18,<0.4.0",
+  "langchain>=1.2.0,<2.0.0",
+  "langchain-core>=1.2.22,<2.0.0",
+  "langchain-nvidia-ai-endpoints>=1.0.0,<2.0.0",
   "nh3>=0.3.1,<0.4.0",
   "numpy",
   "pandas",
