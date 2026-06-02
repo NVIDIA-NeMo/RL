@@ -577,7 +577,8 @@ class VllmInternalWorkerExtension:
         """
         from torch.distributed.tensor.placement_types import Replicate
 
-        from nemo_rl.distributed.nccl_reshard_utils import _STR_TO_DTYPE, DTensorRef
+        from nemo_rl.distributed.nccl_reshard_utils import _STR_TO_DTYPE
+        from nemo_rl.distributed.xferdtensor import DTensorRef
 
         vllm_param, merged_param_slice = self._hf_to_vllm.get(param_name, (None, None))
         global_shape = param_info["global_shape"]

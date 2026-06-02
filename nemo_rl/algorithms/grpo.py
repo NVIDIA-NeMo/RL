@@ -752,28 +752,20 @@ def setup(
 
         check_nccl_reshard_refit_support(master_config)
     if nccl_reshard_refit_enabled and not colocated_inference:
-        if policy_config.get("megatron_cfg", {}).get("enabled", False):
-            train_parallelism = {
-                "tp_size": policy_config["megatron_cfg"].get(
-                    "tensor_model_parallel_size", 1
-                ),
-                "ep_size": policy_config["megatron_cfg"].get(
-                    "expert_model_parallel_size", 1
-                ),
-                "pp_size": policy_config["megatron_cfg"].get(
-                    "pipeline_model_parallel_size", 1
-                ),
-            }
-        else:
-            train_parallelism = {
-                "tp_size": policy_config.get("dtensor_cfg", {}).get(
-                    "tensor_parallel_size", 1
-                ),
-                "ep_size": policy_config.get("dtensor_cfg", {}).get(
-                    "expert_parallel_size", 1
-                ),
-                "pp_size": 1,
-            }
+        # Megatron train backend only — enforced by
+        # check_nccl_reshard_refit_support above (the DTensor train backend
+        # refit path is not supported in this initial version).
+        train_parallelism = {
+            "tp_size": policy_config["megatron_cfg"].get(
+                "tensor_model_parallel_size", 1
+            ),
+            "ep_size": policy_config["megatron_cfg"].get(
+                "expert_model_parallel_size", 1
+            ),
+            "pp_size": policy_config["megatron_cfg"].get(
+                "pipeline_model_parallel_size", 1
+            ),
+        }
         gen_parallelism = {
             "tp_size": generation_config.get("vllm_cfg", {}).get(
                 "tensor_parallel_size", 1

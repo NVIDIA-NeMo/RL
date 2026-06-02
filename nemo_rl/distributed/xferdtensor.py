@@ -14,12 +14,11 @@
 
 """Reference XferDTensor implementation (broadcast-based golden).
 
-This file contains only the transfer kernel and its private helpers.  The
-lightweight wrapper types it expects on its inputs (``MeshInfo``,
-``DTensorRef``) live in ``nccl_reshard_utils.py`` alongside the refit
-metadata builders; ``xferdtensor_golden`` reads them only via duck typing
-(``.mesh`` / ``._local_tensor``) so this module has no import dependency
-on them.
+This file contains the transfer kernel, its private helpers, and the
+``DTensorRef`` wrapper its callers pass as the src/dst tensor.  The
+``MeshInfo`` mesh wrapper still lives in ``nccl_reshard_utils.py`` alongside
+the refit metadata builders; ``xferdtensor_golden`` reads it only via duck
+typing (``.mesh``), so this module needs no import from there.
 
 The 7-argument signature of ``xferdtensor_golden`` matches the real
 ``nccl_reshard.XferDTensor`` API so it can be swapped in trivially later.
@@ -27,6 +26,41 @@ The 7-argument signature of ``xferdtensor_golden`` matches the real
 
 import torch
 from torch.distributed._tensor import Shard
+
+
+class DTensorRef:
+    """DTensor-compatible reference for xferdtensor.
+
+    Provides the interface xferdtensor reads via duck typing:
+    - ``.shape``: global tensor shape (torch.Size)
+    - ``._local_tensor``: local shard (src side) or dst buffer (dst side)
+    - ``.dtype``, ``.device``: tensor metadata
+
+    On the **src side** (train), ``local_tensor`` is the TP-local shard
+    from Megatron parameters (no PP broadcast or TP gather needed).
+    ``global_shape`` is the full unsharded shape.
+
+    On the **dst side** (gen), ``local_tensor`` is either the vLLM local
+    parameter (for direct params) or a temporary buffer (for merged/unmapped
+    params). ``global_shape`` is always the full unsharded shape.
+    """
+
+    def __init__(
+        self, local_tensor: torch.Tensor, global_shape, dtype=None, device=None
+    ):
+        self._local_tensor = local_tensor
+        self.shape = (
+            torch.Size(global_shape)
+            if not isinstance(global_shape, torch.Size)
+            else global_shape
+        )
+        self.dtype = dtype if dtype is not None else local_tensor.dtype
+        self.device = device if device is not None else local_tensor.device
+
+    def local_tensor(self):
+        """Return the local shard / dst buffer this ref wraps."""
+        return self._local_tensor
+
 
 # ===========================================================
 #  NCCL-Xfer-reshard API call

@@ -1479,7 +1479,11 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         fused_expert_param_type = param_info.get("fused_expert_param_type")
         if fused_expert_param_type:
             return self._fuse_one_moe_param(
-                fused_expert_param_type, name, expert_groups, gen_tp_size
+                fused_expert_param_type,
+                name,
+                expert_groups,
+                gen_tp_size,
+                gated=param_info.get("gated", False),
             )
         return self._param_map.get(name)
 
@@ -1505,9 +1509,13 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         return groups
 
     def _fuse_one_moe_param(
-        self, fused_expert_param_type, fused_name, expert_groups, gen_tp_size
+        self, fused_expert_param_type, fused_name, expert_groups, gen_tp_size, gated
     ):
-        """Build a single fused MoE tensor (w13 or w2) on demand.
+        """Build a single fused MoE tensor (up_proj/w13 or down_proj/w2) on demand.
+
+        ``gated`` (from the param metadata) selects the up-projection layout:
+        gated SwiGLU interleaves gate||up into w13 = [E, 2*inter, hidden];
+        non-gated ReLU^2 stacks up only into w13 = [E, inter, hidden].
 
         Returns the local (TP/EP) shard of the fused tensor, or ``None`` if
         no local experts contribute to this fused entry (e.g. the layer is
@@ -1516,12 +1524,16 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         peak memory stay at ~one fused tensor instead of the full
         ``_fused_expert_map``.
         """
-        if fused_expert_param_type == "w13":
+        if fused_expert_param_type == "up_proj":
             prefix = fused_name.rsplit(".w13_weight", 1)[0]
             gate_group = expert_groups.get((prefix, "gate_proj"), [])
             up_group = expert_groups.get((prefix, "up_proj"), [])
+            assert gated == bool(gate_group), (
+                f"gated={gated} disagrees with gate_proj presence "
+                f"({bool(gate_group)}) for {fused_name}"
+            )
             expert_tensors = []
-            if gate_group:
+            if gated:
                 # Gated SwiGLU.  vLLM expects per-rank w13[:, :P] =
                 # gate[r*P:(r+1)*P] and w13[:, P:2P] = up[r*P:(r+1)*P]
                 # (P = intermediate / gen_tp_size).  Build the global tensor so
@@ -1558,7 +1570,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                     expert_tensors.append(self._param_map[up_name])
             return torch.stack(expert_tensors) if expert_tensors else None
 
-        if fused_expert_param_type == "w2":
+        if fused_expert_param_type == "down_proj":
             prefix = fused_name.rsplit(".w2_weight", 1)[0]
             down_group = expert_groups.get((prefix, "down_proj"), [])
             expert_tensors = [self._param_map[n] for _, n in down_group]
@@ -1583,7 +1595,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                 "FP8 kvcache is not currently supported for nccl_reshard refit path."
             )
 
-        from nemo_rl.distributed.nccl_reshard_utils import DTensorRef
+        from nemo_rl.distributed.xferdtensor import DTensorRef
 
         # _param_map and _expert_groups are built once in
         # prepare_nccl_reshard_refit_info; weight values change but the

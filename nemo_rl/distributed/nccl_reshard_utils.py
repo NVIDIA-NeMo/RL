@@ -17,15 +17,13 @@
 This module provides:
 - MeshInfo: lightweight DeviceMesh-compatible wrapper that doesn't require a
   shared torch.distributed process group (needed for cross-world transfers)
-- DTensorRef: lightweight DTensor-compatible wrapper that xferdtensor
-  reads via duck typing (``.shape``, ``._local_tensor``)
 - Placement rules: mapping param names to TP/EP sharding strategies
 - build_nccl_reshard_refit_info: compute per-layer param metadata for refit
 - restore_refit_info_placements: undo msgspec dict-flattening of placements
   and meshes on the receiving side
 
-The transfer kernel itself (``xferdtensor``) lives in
-``nemo_rl/distributed/xferdtensor.py`` — import from there directly.
+The transfer kernel (``xferdtensor``) and its ``DTensorRef`` src/dst wrapper
+live in ``nemo_rl/distributed/xferdtensor.py`` — import both from there.
 """
 
 import re
@@ -37,7 +35,7 @@ from torch.distributed._tensor import Shard
 from torch.distributed.tensor.placement_types import Replicate
 
 # =========================================================================
-# MeshInfo / DTensorRef — lightweight wrapper types
+# MeshInfo — lightweight mesh wrapper type
 # =========================================================================
 
 
@@ -56,40 +54,6 @@ class MeshInfo:
     @property
     def ndim(self):
         return self.mesh.ndim
-
-
-class DTensorRef:
-    """DTensor-compatible reference for xferdtensor.
-
-    Provides the interface expected by the canonical xferdtensor:
-    - ``.shape``: global tensor shape (torch.Size)
-    - ``._local_tensor``: local shard (src side) or dst buffer (dst side)
-    - ``.dtype``, ``.device``: tensor metadata
-
-    On the **src side** (train), ``local_tensor`` is the TP-local shard
-    from Megatron parameters (no PP broadcast or TP gather needed).
-    ``global_shape`` is the full unsharded shape.
-
-    On the **dst side** (gen), ``local_tensor`` is either the vLLM local
-    parameter (for direct params) or a temporary buffer (for merged/unmapped
-    params). ``global_shape`` is always the full unsharded shape.
-    """
-
-    def __init__(
-        self, local_tensor: torch.Tensor, global_shape, dtype=None, device=None
-    ):
-        self._local_tensor = local_tensor
-        self.shape = (
-            torch.Size(global_shape)
-            if not isinstance(global_shape, torch.Size)
-            else global_shape
-        )
-        self.dtype = dtype if dtype is not None else local_tensor.dtype
-        self.device = device if device is not None else local_tensor.device
-
-    def full_tensor(self):
-        """Return the underlying tensor (used on src side by xferdtensor)."""
-        return self._local_tensor
 
 
 # =========================================================================
@@ -391,9 +355,11 @@ def fuse_expert_params_in_metadata(
     """Fuse individual MoE expert params into combined w13/w2 entries.
 
     Converts individual HF expert params (one per expert) into vLLM-style
-    fused params:
-    - gate_proj + up_proj → w13_weight: [num_experts_global, 2*intermediate, hidden]
-    - down_proj → w2_weight: [num_experts_global, hidden, intermediate]
+    fused params (vLLM names them w13_weight / w2_weight; the metadata tags
+    them with the semantic role up_proj / down_proj + a ``gated`` flag):
+    - gated SwiGLU (gate_proj + up_proj) → w13_weight: [E, 2*intermediate, hidden]
+    - non-gated ReLU^2 (up_proj only)    → w13_weight: [E, intermediate, hidden]
+    - down_proj                          → w2_weight:  [E, hidden, intermediate]
 
     The input ``state_dict_metadata`` is required to be EP-gathered, i.e. it
     must already enumerate every expert globally (not just this rank's local
@@ -432,46 +398,38 @@ def fuse_expert_params_in_metadata(
         else:  # down_proj
             w2_groups[prefix] = entries
 
-    # Create w13_weight entries.
-    #  * Gated SwiGLU (gate_proj + up_proj): w13 = [E, 2*intermediate, hidden].
-    #  * Non-gated ReLU^2 (NemotronH: up_proj only, no gate_proj): vLLM builds
-    #    the MoE as SharedFusedMoE(is_act_and_mul=False) and loads up_proj into
-    #    the single w13 slot, so w13 = [E, intermediate, hidden] (no gate half).
+    # Input projection -> vLLM's w13_weight slot.  The fused *name* is always
+    # w13_weight (vLLM's FusedMoE convention), but the tag carries the semantic
+    # role ("up_proj") plus an explicit ``gated`` flag for the layout:
+    #  * gated SwiGLU (gate_proj + up_proj): w13 = [E, 2*intermediate, hidden].
+    #  * non-gated ReLU^2 (NemotronH, SharedFusedMoE(is_act_and_mul=False)):
+    #    up_proj only, w13 = [E, intermediate, hidden] (no gate half).
     for prefix, projs in w13_groups.items():
         gate_entries = projs.get("gate_proj", [])
         up_entries = projs.get("up_proj", [])
-        if gate_entries:
-            ref_entries = gate_entries
-            dim0_mult = 2  # gate + up concatenated on the intermediate dim
-        elif up_entries:
-            ref_entries = up_entries
-            dim0_mult = 1  # up only (non-gated)
-        else:
+        gated = bool(gate_entries)
+        ref_entries = gate_entries if gated else up_entries
+        if not ref_entries:
             continue
         num_experts_global = len(ref_entries)
-        proj_shape = ref_entries[0][1]["shape"]  # [intermediate, hidden]
-        intermediate_size = proj_shape[0]
-        hidden_size = proj_shape[1]
-        fused_shape = [num_experts_global, dim0_mult * intermediate_size, hidden_size]
-        fused_name = f"{prefix}.w13_weight"
-        fused_metadata[fused_name] = {
-            "shape": fused_shape,
+        intermediate_size, hidden_size = ref_entries[0][1]["shape"]
+        dim0 = (2 if gated else 1) * intermediate_size
+        fused_metadata[f"{prefix}.w13_weight"] = {
+            "shape": [num_experts_global, dim0, hidden_size],
             "dtype": ref_entries[0][1]["dtype"],
-            "fused_expert_param_type": "w13",
+            "fused_expert_param_type": "up_proj",
+            "gated": gated,
         }
 
-    # Create w2_weight entries (down)
+    # Output projection -> vLLM's w2_weight slot: [E, hidden, intermediate].
     for prefix, entries in w2_groups.items():
         num_experts_global = len(entries)
-        down_shape = entries[0][1]["shape"]  # [hidden, intermediate]
-        hidden_size = down_shape[0]
-        intermediate_size = down_shape[1]
-        fused_shape = [num_experts_global, hidden_size, intermediate_size]
-        fused_name = f"{prefix}.w2_weight"
-        fused_metadata[fused_name] = {
-            "shape": fused_shape,
+        hidden_size, intermediate_size = entries[0][1]["shape"]
+        fused_metadata[f"{prefix}.w2_weight"] = {
+            "shape": [num_experts_global, hidden_size, intermediate_size],
             "dtype": entries[0][1]["dtype"],
-            "fused_expert_param_type": "w2",
+            "fused_expert_param_type": "down_proj",
+            "gated": False,
         }
 
     return fused_metadata
@@ -514,11 +472,11 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
     additional constraint cannot be checked from config and is enforced at
     runtime by the MoE fusion regex:
 
-      - MoE models must use the standard Llama/Qwen/DeepSeek SwiGLU naming
-        (``...experts.N.{gate_proj,up_proj,down_proj}.weight``).  Other MoE
-        activations (e.g. plain ReLU MLP) will fall through the fusion path
-        with no fused entries produced, which vLLM's ``w13_weight`` /
-        ``w2_weight`` consumers will then reject.
+      - MoE experts must use the ``...experts.N.{up_proj,down_proj}.weight``
+        naming, optionally with a ``gate_proj`` sibling.  Both gated SwiGLU
+        (gate_proj + up_proj) and non-gated ReLU^2 (up_proj only) are fused;
+        an expert naming the fusion regex doesn't recognize falls through and
+        vLLM's ``w13_weight`` / ``w2_weight`` consumers will then reject it.
 
     Raises:
         ValueError: if any precondition is violated.
@@ -545,19 +503,20 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
             f"policy.generation.backend must be 'vllm' (got {backend!r})."
         )
 
-    # Train backend must be Megatron — DTensor support is deferred for the
-    # initial version (no FP8 export path on DTensor side).
+    # This initial version supports only the Megatron train + vLLM gen
+    # combination; the DTensor train backend refit path is intentionally
+    # dropped (Megatron is the path validated end-to-end).
     megatron_enabled = megatron_cfg.get("enabled", False)
     dtensor_enabled = dtensor_cfg.get("enabled", False)
     if not megatron_enabled:
         violations.append(
             "policy.megatron_cfg.enabled must be True "
-            "(DTensor train backend is not supported yet for nccl_reshard_refit)."
+            "(this initial version supports the Megatron train backend only)."
         )
     if dtensor_enabled:
         violations.append(
             "policy.dtensor_cfg.enabled must be False "
-            "(DTensor train backend is not supported yet for nccl_reshard_refit)."
+            "(this initial version supports the Megatron train backend only)."
         )
 
     if megatron_enabled:
@@ -770,9 +729,11 @@ def build_nccl_reshard_refit_info(
                 "dst_placements": get_placements(name, dst_dim_map, ndim),
             }
 
-        # Propagate fused-expert type ("w13" or "w2") for train-side expert stacking
+        # Propagate fused-expert role (up_proj/down_proj) + gating for the
+        # train-side expert stacking in _fuse_one_moe_param.
         if "fused_expert_param_type" in meta:
             info["fused_expert_param_type"] = meta["fused_expert_param_type"]
+            info["gated"] = meta.get("gated", False)
 
         per_layer_params.setdefault(layer, []).append(info)
 
