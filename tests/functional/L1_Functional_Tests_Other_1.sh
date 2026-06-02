@@ -52,4 +52,6 @@ if [[ "${FAST:-0}" != "1" ]]; then
 fi
 
 cd ${PROJECT_ROOT}/tests
-coverage combine .coverage*
+if compgen -G ".coverage*" > /dev/null; then
+    coverage combine .coverage*
+fi

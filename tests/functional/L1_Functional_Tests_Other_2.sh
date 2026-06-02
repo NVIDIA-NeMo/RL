@@ -40,4 +40,6 @@ run_test      uv run --no-sync bash ./tests/functional/prorlv2.sh
 run_test      uv run --no-sync bash ./tests/functional/rm.sh
 
 cd ${PROJECT_ROOT}/tests
-coverage combine .coverage*
+if compgen -G ".coverage*" > /dev/null; then
+    coverage combine .coverage*
+fi

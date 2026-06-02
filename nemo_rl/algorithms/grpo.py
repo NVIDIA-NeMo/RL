@@ -1774,11 +1774,7 @@ def grpo_train(
                             max_rollout_turns=master_config.grpo["max_rollout_turns"],
                             greedy=False,
                         )
-                    policy_generation.finish_generation(
-                        discard_weights=colocated_inference
-                    )
-                    if colocated_inference:
-                        POLICY_GENERATION_STALE = True
+                    policy_generation.finish_generation()
                     # Collect generation logger metrics for performance reporting after each generation step
                     # inflight batch sizes and num pending samples are collected from each worker
                     if policy_generation is not None:

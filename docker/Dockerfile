@@ -211,6 +211,17 @@ LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
 
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 
+# AWS EFA OFI plugin discovery (p4d / p5 / p5en multi-node NCCL via SRD).
+# The host's aws-efa-installer places libnccl-net-ofi.so under
+# /opt/amazon/ofi-nccl/lib and libfabric under /opt/amazon/efa/lib. Without
+# these on the linker search path, NCCL silently falls back to its socket
+# transport. Register both via ld.so.conf.d (so `ldconfig` populates the cache
+# once host paths are mounted at runtime) and LD_LIBRARY_PATH (so NCCL's
+# dlopen resolves the plugin even before `ldconfig` is re-run).
+RUN printf '%s\n' /opt/amazon/ofi-nccl/lib /opt/amazon/efa/lib \
+        > /etc/ld.so.conf.d/aws-efa.conf
+ENV LD_LIBRARY_PATH="/opt/amazon/ofi-nccl/lib:/opt/amazon/efa/lib:${LD_LIBRARY_PATH}"
+
 # Copy in source from build context (defaults to cloned repo, can be overridden)
 # Exclude pyproject.toml and uv.lock since those may be altered by build-custom-vllm.sh
 COPY --from=nemo-rl --exclude=pyproject.toml --exclude=uv.lock . /opt/nemo-rl

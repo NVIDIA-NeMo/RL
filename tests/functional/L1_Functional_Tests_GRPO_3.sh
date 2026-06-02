@@ -39,4 +39,6 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_topp_topk.sh
 run_test      uv run --no-sync bash ./tests/functional/vlm_grpo.sh
 
 cd ${PROJECT_ROOT}/tests
-coverage combine .coverage*
+if compgen -G ".coverage*" > /dev/null; then
+    coverage combine .coverage*
+fi

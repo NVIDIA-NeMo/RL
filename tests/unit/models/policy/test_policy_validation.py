@@ -244,6 +244,110 @@ def test_world_size_validation_dtensor(
         mock_ray_worker_group.assert_not_called()
 
 
+@patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
+def test_dtensor_dp_replicate_size_sets_batching_dp(
+    mock_ray_worker_group,
+    tiny_llama_model_path,
+):
+    """Test that dp_replicate_size is separated from the batching DP axis."""
+    cluster = create_mock_cluster(world_size=8)
+    tokenizer = create_mock_tokenizer()
+    config = create_dtensor_config(tiny_llama_model_path, tp=1)
+    config["dtensor_cfg"]["_v2"] = True
+    config["dtensor_cfg"]["dp_replicate_size"] = 2
+
+    policy = Policy(cluster=cluster, config=config, tokenizer=tokenizer)
+
+    assert policy.sharding_annotations.shape["data_parallel"] == 8
+    assert policy.sharding_annotations.get_axis_size("data_parallel") == 8
+    mock_ray_worker_group.assert_called_once()
+
+
+@patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
+def test_dtensor_hsdp_dispatches_distinct_batches(
+    mock_ray_worker_group,
+    tiny_llama_model_path,
+):
+    """Test that HSDP (dp_replicate_size > 1) dispatches distinct batches to all replicas.
+
+    The bug was that dp_replicate workers received identical batches.
+    By unifying dp_shard and dp_replicate into a single data_parallel axis,
+    we ensure data.shard_by_batch_size is called with the FULL DP product,
+    and run_all_workers_sharded_data shards across all of them.
+    """
+    cluster = create_mock_cluster(world_size=8)
+    tokenizer = create_mock_tokenizer()
+    config = create_dtensor_config(tiny_llama_model_path, tp=1)
+    config["dtensor_cfg"]["_v2"] = True
+    config["dtensor_cfg"]["dp_replicate_size"] = 2  # HSDP enabled
+
+    policy = Policy(cluster=cluster, config=config, tokenizer=tokenizer)
+
+    # Mock data
+    mock_data = MagicMock()
+    # Create 8 distinct shards to prove each of the 8 DP workers gets unique data
+    mock_lengths = MagicMock()
+    mock_lengths.tolist.return_value = [10]
+    mock_shards = [
+        {"input_lengths": mock_lengths, "id": f"shard_{i}"} for i in range(8)
+    ]
+    mock_data.shard_by_batch_size.return_value = (mock_shards, None)
+
+    mock_loss_fn = MagicMock()
+
+    # Call train to trigger data dispatch
+    policy.train(
+        data=mock_data,
+        loss_fn=mock_loss_fn,
+        gbs=32,
+        mbs=4,
+    )
+
+    # 1. Assert data was sharded into 8 distinct pieces (the full DP product)
+    mock_data.shard_by_batch_size.assert_called_once()
+    called_dp_size = mock_data.shard_by_batch_size.call_args[0][0]
+    assert called_dp_size == 8, (
+        f"Data should be sharded into 8 pieces, got {called_dp_size}"
+    )
+
+    # 2. Assert the 8 distinct pieces were sent to the workers sharded across data_parallel
+    mock_worker_group = mock_ray_worker_group.return_value
+    mock_worker_group.run_all_workers_sharded_data.assert_any_call(
+        "train",
+        data=mock_shards,  # The 8 distinct shards are passed directly
+        in_sharded_axes=["data_parallel"],  # They are sharded across the unified axis
+        replicate_on_axes=["context_parallel", "tensor_parallel", "pipeline_parallel"],
+        output_is_replicated=[
+            "context_parallel",
+            "tensor_parallel",
+            "pipeline_parallel",
+        ],
+        common_kwargs={
+            "loss_fn": mock_loss_fn,
+            "eval_mode": False,
+            "gbs": 32,
+            "mbs": 4,
+        },
+    )
+
+
+@patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup")
+def test_dtensor_dp_replicate_size_requires_v2(
+    mock_ray_worker_group,
+    tiny_llama_model_path,
+):
+    """Test that HSDP requires the Automodel DTensor v2 worker."""
+    cluster = create_mock_cluster(world_size=8)
+    tokenizer = create_mock_tokenizer()
+    config = create_dtensor_config(tiny_llama_model_path, tp=1)
+    config["dtensor_cfg"]["dp_replicate_size"] = 2
+
+    with pytest.raises(ValueError, match="_v2: true"):
+        Policy(cluster=cluster, config=config, tokenizer=tokenizer)
+
+    mock_ray_worker_group.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "world_size,tp,pp,cp,should_pass,expected_error_type,description",
     [

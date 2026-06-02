@@ -1584,7 +1584,6 @@ def test_grpo_train_collects_generation_logger_and_seq_metrics(
     )
 
     assert policy_generation.clear_logger_metrics.called
-    policy_generation.finish_generation.assert_called_once_with(discard_weights=True)
     assert policy_generation.get_logger_metrics.called
     train_metrics = _logged_train_metrics_with_key(
         mock_grpo_components["logger"], "generation_logger_metrics"

@@ -40,4 +40,6 @@ run_test      uv run --no-sync bash ./tests/functional/dpo_megatron.sh
 run_test      uv run --no-sync bash ./tests/functional/sft_megatron.sh
 
 cd ${PROJECT_ROOT}/tests
-coverage combine .coverage*
+if compgen -G ".coverage*" > /dev/null; then
+    coverage combine .coverage*
+fi

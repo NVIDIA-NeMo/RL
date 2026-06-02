@@ -37,4 +37,6 @@ run_test() {
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym.sh
 
 cd ${PROJECT_ROOT}/tests
-coverage combine .coverage*
+if compgen -G ".coverage*" > /dev/null; then
+    coverage combine .coverage*
+fi

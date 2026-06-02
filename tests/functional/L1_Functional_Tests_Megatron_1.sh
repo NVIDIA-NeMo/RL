@@ -47,4 +47,6 @@ run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_
 run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_multiturn.sh
 
 cd ${PROJECT_ROOT}/tests
-coverage combine .coverage*
+if compgen -G ".coverage*" > /dev/null; then
+    coverage combine .coverage*
+fi
