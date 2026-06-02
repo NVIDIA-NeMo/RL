@@ -272,9 +272,7 @@ def validate_and_prepare_config(
     precision = config["precision"]
     dtype = _precision_to_dtype(precision, "precision")
     load_precision = config["dtensor_cfg"].get("load_precision", "float32")
-    model_load_dtype = _precision_to_dtype(
-        load_precision, "dtensor_cfg.load_precision"
-    )
+    model_load_dtype = _precision_to_dtype(load_precision, "dtensor_cfg.load_precision")
     if init_optimizer and model_load_dtype != torch.float32:
         raise ValueError(
             "dtensor_cfg.load_precision must be float32 for trainable workers "
