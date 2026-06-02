@@ -31,11 +31,6 @@ def resolve_torch_dtype(val):
     )
 
 
-def get_lang_module(model):
-    """Return the underlying language module, unwrapping precision wrappers."""
-    return model.module.module if hasattr(model.module, "module") else model.module
-
-
 def log_gpu_memory(tag: str) -> None:
     """Print a one-line GPU-memory summary for the calling rank."""
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0

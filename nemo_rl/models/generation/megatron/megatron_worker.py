@@ -31,6 +31,7 @@ from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.utils import toggle_cuda_graphs
+from megatron.core.utils import unwrap_model
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import (
@@ -39,7 +40,6 @@ from nemo_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from nemo_rl.models.generation.megatron.utils import (
-    get_lang_module,
     log_gpu_memory,
     resolve_torch_dtype,
 )
@@ -330,7 +330,7 @@ class MegatronGenerationMixin:
         print(f"[Rank {self.rank}] finishing generation", flush=True)
         log_gpu_memory("finish_generation START")
 
-        lang_module = get_lang_module(self.model)
+        lang_module = unwrap_model(self.model)
 
         if self.is_generation_colocated:
             if self._inference_engine_initialized and not self._inference_engine_asleep:
@@ -370,7 +370,7 @@ class MegatronGenerationMixin:
                 self.model, "cuda", move_params=True, move_grads=False
             )
 
-        lang_module = get_lang_module(self.model)
+        lang_module = unwrap_model(self.model)
         lang_module.eval()
 
         rotary_module = getattr(lang_module, "rotary_pos_emb", None)
