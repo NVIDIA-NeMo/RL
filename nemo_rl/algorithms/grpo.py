@@ -1279,13 +1279,27 @@ def refit_policy_generation(
                         "(cfg.cluster.weight_sync.method='mx', .enabled=True)"
                     )
                 version = int(refit_version) if refit_version is not None else 0
+                # MX v2 is PULL-based: the trainer publishes its shards + calls
+                # mark_ready() on the MX server, then each inference receiver
+                # discovers that source and RDMA-pulls it. So the publish must
+                # fully complete BEFORE we dispatch the receiver refit —
+                # otherwise the receiver's single (non-retrying)
+                # discover_v2_sources races mark_ready() and returns
+                # "no v2 source available for version>=N". This race is benign
+                # with one receiver (timing usually wins) but fatal at scale
+                # (16 workers): the dispatcher hits early receivers before the
+                # publish is visible. Serialize publish → then pull.
+                #
+                # NB: this is the opposite of the NCCL collective path below,
+                # which MUST run trainer-broadcast and receiver-recv
+                # concurrently (a barrier collective) or it deadlocks.
                 futures_train = policy.stream_weights_via_mx(
                     version=version, mx_config=mx_config
                 )
+                ray.get(futures_train)
                 futures_inference = policy_generation.update_weights_via_mx(
                     version=version, mx_config=mx_config
                 )
-                ray.get(futures_train)
                 results = ray.get(futures_inference)
                 update_success = all(
                     result for result in results if result is not None

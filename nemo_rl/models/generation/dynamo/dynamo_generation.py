@@ -184,6 +184,24 @@ def _dispatch_update_weights_via_mx_remote(
     iteration_logs: list[dict[str, Any]] = []
     failures: list[str] = []
 
+    # Shared deadline for retrying transient refit failures across the whole
+    # cycle. The receiver's one-shot discover_v2_sources can miss the brief
+    # (~1s) window between the trainer's mark_ready() and that READY status
+    # propagating into the server's list_sources(status_filter=READY) index —
+    # at 16 workers the first receivers fire inside that lag and get
+    # "no v2 source available". Retrying (rather than raising) is what fixes
+    # it: as long as THIS dispatcher keeps running, the trainer stays blocked
+    # in ray.get(futures_inference) and alive, so its heartbeat holds the
+    # published sources READY (server reaper heartbeat_timeout=90s) — and a
+    # re-issued refit then discovers them. Raising on the first failure
+    # instead crashes the trainer, which immediately STALEs the sources and
+    # dooms every remaining worker. Bounded by mx_config.timeout_seconds so a
+    # genuinely broken refit still surfaces instead of hanging forever.
+    import time as _time
+    _cycle_deadline = _time.monotonic() + float(
+        mx_config_dict.get("timeout_seconds", 300.0)
+    )
+
     for iteration in range(max_convergence_iterations):
         if iteration == 0:
             # On the first pass, the worker pod may be container-Ready but
@@ -242,12 +260,32 @@ def _dispatch_update_weights_via_mx_remote(
                 continue
 
             try:
-                r_refit = _step(
-                    sys_url, "update_weights_via_mx", payload, refit_timeout_s
-                )
-                steps["refit"] = r_refit
-                if r_refit.get("status") != "ok":
-                    failures.append(f"refit@{sys_url}({inst_id}): {r_refit}")
+                # Retry the refit on transient failure (the receiver missing
+                # the mark_ready→READY propagation window) until it succeeds or
+                # the shared cycle deadline expires. Generation stays paused
+                # across retries. The trainer remains alive throughout (this
+                # dispatcher running == trainer blocked in ray.get), so its
+                # heartbeat keeps the sources READY and a re-issued discover
+                # finds them. Backoff capped at 3s covers the ~1s lag with
+                # a little margin.
+                attempt = 0
+                r_refit = {"status": "error", "reason": "not attempted"}
+                while True:
+                    attempt += 1
+                    r_refit = _step(
+                        sys_url, "update_weights_via_mx", payload, refit_timeout_s
+                    )
+                    steps["refit"] = r_refit
+                    if r_refit.get("status") == "ok":
+                        break
+                    if _time.monotonic() >= _cycle_deadline:
+                        failures.append(
+                            f"refit@{sys_url}({inst_id}) after {attempt} attempts "
+                            f"(deadline exceeded): {r_refit}"
+                        )
+                        break
+                    _time.sleep(min(3.0, 0.5 * attempt))
+                steps["refit_attempts"] = attempt
 
                 r_flush = _step(sys_url, "flush_cache", {}, admin_timeout_s)
                 steps["flush"] = r_flush

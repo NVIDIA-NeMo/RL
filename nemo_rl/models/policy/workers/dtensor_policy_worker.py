@@ -1898,9 +1898,12 @@ class DTensorPolicyWorkerImpl(
             ep_size = getattr(self, "ep_size", 1) or 1
             self._mx_publisher = build_v2_publisher(
                 rank=self.rank,
-                device_id=self.local_device_index
-                if hasattr(self, "local_device_index")
-                else self.rank,
+                # Each Ray actor sees exactly one GPU as cuda:0 (CUDA_VISIBLE_DEVICES
+                # isolation — see the LOCAL_RANK=0 note in this file's model load),
+                # so the MX publisher / NIXL agent must bind the *local* device index,
+                # not the global rank. Falling back to self.rank breaks for >1 training
+                # GPU: rank 3 → torch.cuda.set_device(3) → "invalid device ordinal".
+                device_id=torch.cuda.current_device(),
                 fsdp_world_size=self.dp_size,
                 tp_world_size=tp_size,
                 pp_world_size=pp_size,
@@ -1931,8 +1934,20 @@ class DTensorPolicyWorkerImpl(
         self._mx_publisher._registered_tensors.clear()
         for name, tensor in self.model.state_dict().items():
             if isinstance(tensor, DTensor):
-                # *** key: to_local() not full_tensor() ***
-                local = tensor.to_local()
+                # Publish the FULL (gathered) tensor, not the local shard.
+                # The MX shape registry records the GLOBAL shape and the
+                # receiver reshapes the received bytes to it — so the bytes
+                # must actually BE the full tensor. With to_local() an
+                # FSDP/TP-sharded multi-GPU trainer publishes a fractional
+                # shard (e.g. 1/4 for TP2xDP2) tagged with the global shape,
+                # and the receiver's reshape fails ("shape '[151936, 2560]'
+                # invalid for input of size 97239040"). full_tensor()
+                # allgathers across the device mesh (FSDP+TP); the same-rank
+                # receiver then pulls a complete tensor and vLLM's load_weights
+                # applies its own TP sharding. (This trades away the v2
+                # "no-allgather" optimization — revisit for MoE/EP where
+                # per-rank expert publishing is the point.)
+                local = tensor.full_tensor()
             else:
                 local = tensor
             if local.is_floating_point() and local.dtype != self.dtype:
