@@ -14,6 +14,7 @@
 import argparse
 import difflib
 import os
+import re
 from collections import defaultdict
 
 import torch
@@ -922,13 +923,13 @@ if __name__ == "__main__":
 
     # Create a dummy likelihood tensor: [BATCH, SEQ, source_vocab_size]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dummy_tensor = torch.randn(1, 4096, tokenizer_student_total_vocab_size, device=device, dtype=torch.bfloat16)
+    dummy_tensor = torch.randn(1, 4096, tokenizer_student_total_vocab_size, device=device, dtype=torch.float32)
 
     # Transform this tensor using the projection map
     projected_tensor = project_token_likelihoods(
         dummy_tensor,
         top_k_indices.to(device),
-        top_k_likelihoods.to(device),
+        top_k_likelihoods.float().to(device),
         tokenizer_teacher_total_vocab_size,
         device
     )

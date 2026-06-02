@@ -185,6 +185,8 @@ logger:
   wandb:
     project: "x_token"
     name: "xtoken-off-policy-distillation"
+  tensorboard:
+    log_dir: "tb_logs-xtoken-off-policy-distillation"
   gpu_monitoring:
     collection_interval: 10
     flush_interval: 10
