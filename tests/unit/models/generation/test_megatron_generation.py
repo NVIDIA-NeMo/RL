@@ -215,16 +215,16 @@ def _assert_valid_generation_output(outputs, input_data, require_generation=True
         assert key in outputs, f"{key} not found in generation output"
 
     batch_size = len(input_data["input_ids"])
-    assert all(
-        outputs[key].shape[0] == batch_size for key in required_keys
-    ), "Wrong batch size in generation output"
+    assert all(outputs[key].shape[0] == batch_size for key in required_keys), (
+        "Wrong batch size in generation output"
+    )
     # output_ids and logprobs are packed on the same padded width.
     assert outputs["output_ids"].shape == outputs["logprobs"].shape
 
     if require_generation:
-        assert (
-            outputs["generation_lengths"] > 0
-        ).all(), "Some samples generated nothing"
+        assert (outputs["generation_lengths"] > 0).all(), (
+            "Some samples generated nothing"
+        )
 
     # length identity: total (unpadded) == prompt length + generated length.
     expected_unpadded = input_data["input_lengths"].cpu().to(torch.int64) + outputs[
