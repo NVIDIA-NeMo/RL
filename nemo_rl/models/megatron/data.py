@@ -23,7 +23,6 @@ from megatron.core.parallel_state import (
     get_context_parallel_world_size,
 )
 from megatron.core.utils import StragglerDetector
-from megatron.training.utils import get_ltor_masks_and_position_ids
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -271,6 +270,11 @@ def process_microbatch(
             attention_mask = None
         else:
             input_ids_cp_sharded = input_ids
+            # Prevent modelopt import from crashing due to duplicate torchvision
+            # roi_align meta-kernel registration, through the path
+            # `megatron.training` -> modelopt -> transformers -> torchvision.
+            from megatron.training.utils import get_ltor_masks_and_position_ids
+
             attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
                 data=input_ids,
                 eod_token=0,  # used for loss_mask, which we don't use
