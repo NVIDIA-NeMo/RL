@@ -12,6 +12,11 @@ policy:
     enabled: false
   megatron_cfg:
     enabled: true
+    # TP=2 / ETP=1 / SP=True relieves the CUDA OOM on the distributed-logprob path
+    # introduced by the vLLM 0.17.1->0.20.0 bump (#2384). See issue #2619.
+    tensor_model_parallel_size: 2
+    expert_tensor_parallel_size: 1
+    sequence_parallel: true
     expert_model_parallel_size: 16
     moe_token_dispatcher_type: allgather
     apply_rope_fusion: false
