@@ -61,6 +61,7 @@ from nemo_rl.data.llm_message_utils import (
 from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.mx_helpers import MxConfig
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -69,6 +70,7 @@ from nemo_rl.experience.rollouts import (
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
 )
+from nemo_rl.models.generation.dynamo import DynamoConfig, DynamoGeneration
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.sglang import SGLangConfig, SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
@@ -410,6 +412,13 @@ def setup(
     # ==========================
     print("\n▶ Setting up compute cluster...", flush=True)
     colocated_inference = generation_config["colocated"]["enabled"]
+    # The dynamo backend forwards rollouts to an external DynamoGraphDeployment,
+    # so it never colocates and never participates in cross-cluster collective
+    # communication. We track it as a sibling flag so downstream gates stay
+    # readable.
+    is_dynamo = generation_config.get("backend") == "dynamo"
+    if is_dynamo:
+        colocated_inference = False
 
     env_name_list = extract_necessary_env_names(data_config)
     rm_env_enabled = "reward_model" in env_name_list
@@ -432,7 +441,29 @@ def setup(
             f"policy_nodes:{policy_nodes} + rm_nodes:{rm_nodes} = total_nodes:{total_nodes}"
         )
 
-    if colocated_inference:
+    if is_dynamo:
+        # Dynamo: all GPUs go to training. Inference is served by a
+        # DynamoGraphDeployment external to this Ray cluster.
+        if total_nodes == 1:
+            train_gpus_per_node = cluster_config["gpus_per_node"] - rm_gpus_per_node
+        else:
+            train_gpus_per_node = cluster_config["gpus_per_node"]
+
+        train_cluster = RayVirtualCluster(
+            name="grpo_train_cluster",
+            bundle_ct_per_node_list=[train_gpus_per_node] * policy_nodes,
+            use_gpus=True,
+            num_gpus_per_node=train_gpus_per_node,
+            max_colocated_worker_groups=1,
+        )
+        inference_cluster = None
+        print(
+            f"  ✓ Dynamo backend — {policy_nodes} node(s) × {train_gpus_per_node} GPU(s) "
+            f"allocated to training (inference served by DGD)",
+            flush=True,
+        )
+
+    elif colocated_inference:
         if total_nodes == 1:
             policy_gpus_per_node = cluster_config["gpus_per_node"] - rm_gpus_per_node
             assert policy_gpus_per_node > 0, (
@@ -752,14 +783,41 @@ def setup(
             flush=True,
         )
 
+    elif backend == "dynamo":
+        # Dynamo: rollouts forwarded to an external DynamoGraphDeployment over
+        # HTTP. The class itself is a thin URL wrapper; the heavy lifting lives
+        # in the DGD pods.
+        generation_config = cast(DynamoConfig, generation_config)
+
+        def init_dynamo():
+            t0 = time.perf_counter()
+            pg = DynamoGeneration(cluster=inference_cluster, config=generation_config)
+            return pg, time.perf_counter() - t0
+
+        policy_generation, policy = initialize_generation_with_policy(
+            init_generation_fn=init_dynamo,
+            generation_name="Dynamo",
+            init_time_key="dynamo_init_time_s",
+            colocated_inference=False,
+            worker_init_timing_metrics=worker_init_timing_metrics,
+        )
+
+        print(
+            f"  ✓ Using Dynamo backend "
+            f"(frontend: {policy_generation.dp_openai_server_base_urls[0]})",
+            flush=True,
+        )
+
     # Record when worker initialization completes (for calculating other setup time)
     worker_init_complete_time = time.perf_counter() - setup_start_time
 
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
-    # if it is not colocated inference, initialize collective communication for update weights
-    if not colocated_inference:
+    # if it is not colocated inference, initialize collective communication for update weights.
+    # The dynamo backend skips this — the DGD has its own internal communication
+    # and refit is not supported in this phase.
+    if not colocated_inference and not is_dynamo:
         t0 = time.perf_counter()
         ip, port = train_cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
@@ -778,9 +836,9 @@ def setup(
         ray.get(futures_train + futures_inference)
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
 
-    # prepare refit info
+    # prepare refit info (skipped for dynamo: refit not supported in this phase)
     state_dict_info = policy.prepare_refit_info()
-    if policy_generation is not None:
+    if policy_generation is not None and not is_dynamo:
         policy_generation.prepare_refit_info(state_dict_info)
 
     # Calculate total setup time
@@ -1077,13 +1135,17 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
 def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
     """Determine if async rollouts should be used based on the configuration.
 
-    Returns True if vLLM backend is used with async_engine enabled.
+    Returns True for vLLM backend with async_engine enabled, or for the
+    Dynamo backend (which is intrinsically HTTP-only and async — there is
+    no in-process generate() path).
     """
     generation_config = master_config.policy["generation"]
     if generation_config is None:
         return False
 
     backend = generation_config.get("backend", "")
+    if backend == "dynamo":
+        return True
     if backend != "vllm":
         return False
 
@@ -1100,15 +1162,24 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
 
     # Validate the setup for training with NeMo-Gym
     assert _should_use_async_rollouts(master_config), (
-        "❌ Error: In order to use NeMo-Gym, you must use vllm generation backend with `async_engine: true`!"
+        "❌ Error: In order to use NeMo-Gym, you must use the vllm generation "
+        "backend with `async_engine: true`, or the dynamo backend!"
     )
 
-    # We piggyback off of `_should_use_async_rollouts` to guarantee the existence of these configs.
     generation_config = master_config.policy["generation"]
-    should_expose_http_server = generation_config["vllm_cfg"].get("expose_http_server")
-    assert should_expose_http_server, (
-        "In order to use NeMo-Gym, you must expose the vllm server via `expose_http_server: true`!"
-    )
+    backend = generation_config.get("backend", "")
+
+    # vllm-specific gate: the gym dispatches rollouts to the colocated
+    # vLLM's HTTP server, so it has to be exposed. Dynamo always exposes
+    # an HTTP frontend (it's the only path), so no analogous check there.
+    if backend == "vllm":
+        should_expose_http_server = generation_config["vllm_cfg"].get(
+            "expose_http_server"
+        )
+        assert should_expose_http_server, (
+            "In order to use NeMo-Gym with the vllm backend, you must expose "
+            "the server via `expose_http_server: true`!"
+        )
 
     return should_use_nemo_gym
 
@@ -1177,6 +1248,9 @@ def refit_policy_generation(
     _refit_buffer_size_gb: Optional[int] = None,
     timer: Optional[Timer] = None,
     kv_scales: Optional[dict[str, float]] = None,
+    weight_sync_method: Optional[str] = None,
+    mx_config: Optional[Any] = None,
+    refit_version: Optional[int] = None,
 ) -> None:
     """Refit the policy generation interface with the latest policy weights.
 
@@ -1239,18 +1313,56 @@ def refit_policy_generation(
                 results = ray.get(futures_inference)
                 update_success = all(result for result in results if result is not None)
         else:
-            # update weights through nccl
-            # SGLang haven't implemented non-colocated inference mode.
-            if isinstance(policy_generation, SGLangGeneration):
-                raise NotImplementedError(
-                    "SGLang haven't implemented non-colocated inference mode. "
+            # ---- ModelExpress v2 path (rank-to-rank NIXL RDMA, MoE-aware) ----
+            if weight_sync_method == "mx":
+                if mx_config is None or not getattr(mx_config, "enabled", False):
+                    raise RuntimeError(
+                        "weight_sync_method='mx' requires an enabled MxConfig "
+                        "(cfg.cluster.weight_sync.method='mx', .enabled=True)"
+                    )
+                version = int(refit_version) if refit_version is not None else 0
+                # MX v2 is PULL-based: the trainer publishes its shards + calls
+                # mark_ready() on the MX server, then each inference receiver
+                # discovers that source and RDMA-pulls it. So the publish must
+                # fully complete BEFORE we dispatch the receiver refit —
+                # otherwise the receiver's single (non-retrying)
+                # discover_v2_sources races mark_ready() and returns
+                # "no v2 source available for version>=N". This race is benign
+                # with one receiver (timing usually wins) but fatal at scale
+                # (16 workers): the dispatcher hits early receivers before the
+                # publish is visible. Serialize publish → then pull.
+                #
+                # NB: this is the opposite of the NCCL collective path below,
+                # which MUST run trainer-broadcast and receiver-recv
+                # concurrently (a barrier collective) or it deadlocks.
+                futures_train = policy.stream_weights_via_mx(
+                    version=version, mx_config=mx_config
                 )
-            futures_train = policy.broadcast_weights_for_collective(kv_scales=kv_scales)
-            futures_inference = policy_generation.update_weights_from_collective()
-            # wait for all futures to complete
-            ray.get(futures_train)
-            results = ray.get(futures_inference)
-            update_success = all(result for result in results if result is not None)
+                ray.get(futures_train)
+                futures_inference = policy_generation.update_weights_via_mx(
+                    version=version, mx_config=mx_config
+                )
+                results = ray.get(futures_inference)
+                update_success = all(
+                    result for result in results if result is not None
+                )
+            else:
+                # update weights through nccl (default non-colocated path)
+                # SGLang haven't implemented non-colocated inference mode.
+                if isinstance(policy_generation, SGLangGeneration):
+                    raise NotImplementedError(
+                        "SGLang haven't implemented non-colocated inference mode. "
+                    )
+                futures_train = policy.broadcast_weights_for_collective(
+                    kv_scales=kv_scales
+                )
+                futures_inference = policy_generation.update_weights_from_collective()
+                # wait for all futures to complete
+                ray.get(futures_train)
+                results = ray.get(futures_inference)
+                update_success = all(
+                    result for result in results if result is not None
+                )
 
         # check if update is successful
         if not update_success:
@@ -1451,11 +1563,37 @@ def grpo_train(
 
     kv_scales_cache = None  # Cache reused for computed kv scales
 
+    # ---- ModelExpress v2 weight-sync wiring (cfg.cluster.weight_sync) ----
+    # Read once at the top of training so we don't re-parse on every refit
+    # call. _weight_sync_method drives the dispatcher inside
+    # refit_policy_generation; _mx_config carries the MX server URL + picker
+    # flags through to both the trainer publisher and the inference receiver.
+    _weight_sync_cfg = (master_config.cluster or {}).get("weight_sync", {}) or {}
+    _weight_sync_method = _weight_sync_cfg.get("method")
+    _mx_config = (
+        MxConfig.from_dict(_weight_sync_cfg.get("mx_config"))
+        if _weight_sync_method == "mx"
+        else None
+    )
+    if _weight_sync_method == "mx":
+        print(
+            f"  ✓ weight_sync.method='mx' (MxConfig: enabled={_mx_config.enabled}, "
+            f"server={_mx_config.mx_server_url}, same_rank_only={_mx_config.same_rank_only}, "
+            f"tree_scale_out={_mx_config.tree_scale_out})",
+            flush=True,
+        )
+
     NEED_REFIT = True
     # If policy_generation is None, use the policy as the generation interface (megatron framework backend)
     if policy_generation is None:
         policy_generation = policy  # type: ignore
         NEED_REFIT = False
+    elif master_config.policy["generation"].get("backend") == "dynamo":
+        # Dynamo backend supports refit via weight_sync_method="mx" (the
+        # ModelExpress v2 NIXL RDMA path). Other refit methods aren't
+        # implemented for Dynamo and short-circuit here.
+        if _weight_sync_method != "mx":
+            NEED_REFIT = False
     POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
     assert policy_generation is not None
 
@@ -1494,7 +1632,14 @@ def grpo_train(
         memory_tracker.snapshot_start_of_stage("Initial validation", dir())
 
         if NEED_REFIT and POLICY_GENERATION_STALE:
-            refit_policy_generation(policy, policy_generation, colocated_inference)
+            refit_policy_generation(
+                policy,
+                policy_generation,
+                colocated_inference,
+                weight_sync_method=_weight_sync_method,
+                mx_config=_mx_config,
+                refit_version=0,
+            )
             POLICY_GENERATION_STALE = False
         else:
             policy_generation.prepare_for_generation()
@@ -1610,6 +1755,9 @@ def grpo_train(
                             colocated_inference,
                             timer=timer,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
+                            weight_sync_method=_weight_sync_method,
+                            mx_config=_mx_config,
+                            refit_version=int(total_steps + 1),
                         )
                         POLICY_GENERATION_STALE = False
                     else:
@@ -2012,6 +2160,9 @@ def grpo_train(
                             policy_generation,
                             colocated_inference,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
+                            weight_sync_method=_weight_sync_method,
+                            mx_config=_mx_config,
+                            refit_version=int(total_steps + 1),
                         )
                         POLICY_GENERATION_STALE = False
                     else:
@@ -2619,12 +2770,30 @@ def async_grpo_train(
         fit_last_save_time=True,
     )
     timeout.start_iterations()
+
+    # ---- ModelExpress v2 weight-sync wiring (cfg.cluster.weight_sync) ----
+    # Read once so the per-refit call sites don't re-parse the config.
+    _weight_sync_cfg = (master_config.cluster or {}).get("weight_sync", {}) or {}
+    _weight_sync_method = _weight_sync_cfg.get("method")
+    _mx_config = (
+        MxConfig.from_dict(_weight_sync_cfg.get("mx_config"))
+        if _weight_sync_method == "mx"
+        else None
+    )
+
     NEED_REFIT = True
 
     # Setup generation interface
     if policy_generation is None:
         policy_generation = policy
         NEED_REFIT = False
+    elif master_config.policy["generation"].get("backend") == "dynamo":
+        # Dynamo backend supports refit via weight_sync_method="mx" (MX v2
+        # NIXL RDMA). Skip refit for other methods, which aren't implemented
+        # on the Dynamo path.
+        weight_sync_method = _weight_sync_method
+        if weight_sync_method != "mx":
+            NEED_REFIT = False
     POLICY_GENERATION_STALE = True
     assert policy_generation is not None
 
@@ -2749,7 +2918,14 @@ def async_grpo_train(
     if NEED_REFIT and POLICY_GENERATION_STALE:
         print("🔄 Refitting policy generation with actual model weights...")
         try:
-            refit_policy_generation(policy, policy_generation, colocated_inference)
+            refit_policy_generation(
+                policy,
+                policy_generation,
+                colocated_inference,
+                weight_sync_method=_weight_sync_method,
+                mx_config=_mx_config,
+                refit_version=0,
+            )
             print("✅ Policy generation refit completed successfully")
             POLICY_GENERATION_STALE = False
         except Exception as e:
@@ -3109,7 +3285,12 @@ def async_grpo_train(
                     print("🔄 Performing policy generation refit...")
                     with timer.time("weight_sync"):
                         refit_policy_generation(
-                            policy, policy_generation, colocated_inference
+                            policy,
+                            policy_generation,
+                            colocated_inference,
+                            weight_sync_method=_weight_sync_method,
+                            mx_config=_mx_config,
+                            refit_version=int(weight_version + 1),
                         )
                         POLICY_GENERATION_STALE = False
 
@@ -3135,7 +3316,12 @@ def async_grpo_train(
 
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
-                            policy, policy_generation, colocated_inference
+                            policy,
+                            policy_generation,
+                            colocated_inference,
+                            weight_sync_method=_weight_sync_method,
+                            mx_config=_mx_config,
+                            refit_version=int(weight_version),
                         )
                         POLICY_GENERATION_STALE = False
                     else:

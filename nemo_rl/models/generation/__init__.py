@@ -16,6 +16,7 @@ from typing import cast
 
 from transformers import PreTrainedTokenizerBase
 
+from nemo_rl.models.generation.dynamo import DynamoConfig
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.generation.vllm import VllmConfig
 
@@ -68,5 +69,11 @@ def configure_generation_config(
                 config["vllm_cfg"]["skip_tokenizer_init"] = False
             else:
                 config["vllm_cfg"]["skip_tokenizer_init"] = True
+
+    # dynamo setting — engine knobs (load_format, skip_tokenizer_init, etc.)
+    # are owned by the DynamoGraphDeployment, so there's nothing for us to set
+    # here. The cast narrows the type for downstream readers.
+    elif config["backend"] == "dynamo":
+        config = cast(DynamoConfig, config)
 
     return config

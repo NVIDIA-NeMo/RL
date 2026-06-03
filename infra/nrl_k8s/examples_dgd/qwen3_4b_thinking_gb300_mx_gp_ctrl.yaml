@@ -1,0 +1,186 @@
+# Control DGD for the hierarchical (GlobalPlanner + GlobalRouter) MX smoke.
+#
+# This is the public-endpoint half of the
+# grpo_workplace_assistant_dynamo_mx_gp.gb300.infra.yaml smoke. It runs three
+# CPU-only components in the Dynamo namespace `default-jothomson-dyn-gp-ctrl`:
+#
+#   Frontend      — OpenAI-compatible :8000 listener. NeMo-RL's DynamoGeneration
+#                   points dgd_name at this DGD, so all rollout traffic enters
+#                   here. It discovers the single agg model the GlobalRouter
+#                   registers and forwards to it.
+#   GlobalRouter  — agg-mode hierarchical router (see
+#                   dynamo/components/src/dynamo/global_router/README.md). It
+#                   registers as the model's Chat+Completions worker and routes
+#                   each request to a pool's LocalRouter at
+#                   `<pool-ns>.router.generate`. Pool selection is a 2D
+#                   (TTFT x ITL) grid; here the grid is 1x1 and maps EVERYTHING
+#                   to pool 0 (agg_pool_mapping=[[0]]). Pool 1 stays warm but
+#                   idle — enough to exercise multi-pool wiring without
+#                   spreading load.
+#   GlobalPlanner — centralized scale-execution endpoint. Each pool's local
+#                   Planner delegates scaling here (environment=global-planner).
+#                   With the pools pinned at min=max=1 GPU the local planners
+#                   never request a change, so the GlobalPlanner just starts up,
+#                   discovers the pools, and serves its health/scale endpoints —
+#                   wired and exercised, but no replica churn (intended for now).
+#
+# Pool DGDs (applied first; see _pool0.yaml / _pool1.yaml):
+#   default-jothomson-dyn-gp-p0 : LocalRouter + MX VllmDecodeWorker + Planner
+#   default-jothomson-dyn-gp-p1 : LocalRouter + MX VllmDecodeWorker + Planner
+#
+# NAMES ARE HARDCODED for the `default` k8s namespace + `jothomson` user.
+# The operator derives each Dynamo namespace as `{k8s_ns}-{dgd_name}`, and the
+# GlobalRouter config below references the pool namespaces as literal strings
+# (DGD manifests are NOT OmegaConf-interpolated by nrl-k8s — only the infra
+# YAML is). If you reuse this under a different namespace/user, change the
+# metadata.name here AND the agg_pool_dynamo_namespaces below AND the pool
+# manifests' LocalRouter --endpoint / Planner global_planner_namespace together.
+#
+# Prerequisites (see the paired infra YAML header):
+#   * Planner RBAC: ClusterRoleBinding binding ClusterRole
+#     `dynamo-platform-dynamo-operator-planner` to ServiceAccount
+#     `planner-serviceaccount` in `default` (infra/nrl_k8s/dynamo_mx/planner-rbac.yaml).
+#   * Cluster Prometheus scraping the LocalRouter pods (the pool Planners read
+#     `dynamo_component_router_*` from it).
+#
+# Image expectations: the dynamo runtime image must include the
+# dynamo.frontend, dynamo.global_router and dynamo.global_planner modules
+# (all present on jthomson04/tokenize-endpoint-merge-main-05-07). The MX worker
+# image is only needed in the pool DGDs.
+
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: jothomson-dyn-gp-ctrl
+  annotations:
+    nvidia.com/kai-scheduler-queue: backfill
+spec:
+  services:
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      resources:
+        requests:
+          cpu: "2"
+          memory: "4Gi"
+        limits:
+          cpu: "4"
+          memory: "8Gi"
+      extraPodSpec:
+        nodeSelector:
+          nodeGroup: customer-cpu
+          # arm64 — the dynamo image is arm64-only and customer-cpu is mixed-arch.
+          kubernetes.io/arch: arm64
+        mainContainer:
+          image: jwillthomson/dynamo-arm-tokenize-endpoint-8590c26:latest
+          workingDir: /workspace
+          command:
+            - python3
+            - -m
+            - dynamo.frontend
+          args:
+            - --router-mode
+            - round-robin
+            - --namespace
+            - default-jothomson-dyn-gp-ctrl
+            - --model-name
+            - Qwen/Qwen3-4B-Thinking-2507
+
+    GlobalRouter:
+      componentType: default
+      replicas: 1
+      resources:
+        requests:
+          cpu: "2"
+          memory: "4Gi"
+        limits:
+          cpu: "4"
+          memory: "8Gi"
+      extraPodSpec:
+        nodeSelector:
+          nodeGroup: customer-cpu
+          kubernetes.io/arch: arm64
+        mainContainer:
+          image: jwillthomson/dynamo-arm-tokenize-endpoint-8590c26:latest
+          workingDir: /workspace
+          # The global_router needs a JSON config file. nrl-k8s only applies
+          # the DGD doc (not a sibling ConfigMap), so we write the config
+          # inline at container start, then exec the router. Single 1x1 grid
+          # bucket → agg_pool_mapping [[0]] → ALL requests routed to pool 0.
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -eu
+              cat > /tmp/global_router_config.json <<'JSON'
+              {
+                "mode": "agg",
+                "num_agg_pools": 2,
+                "agg_pool_dynamo_namespaces": [
+                  "default-jothomson-dyn-gp-p0",
+                  "default-jothomson-dyn-gp-p1"
+                ],
+                "agg_pool_selection_strategy": {
+                  "ttft_min_ms": 10, "ttft_max_ms": 3000, "ttft_resolution": 1,
+                  "itl_min_ms": 10, "itl_max_ms": 500, "itl_resolution": 1,
+                  "agg_pool_mapping": [[0]]
+                }
+              }
+              JSON
+              echo "[gr] config:"; cat /tmp/global_router_config.json
+              exec python3 -m dynamo.global_router \
+                --config /tmp/global_router_config.json \
+                --model-name Qwen/Qwen3-4B-Thinking-2507 \
+                --namespace default-jothomson-dyn-gp-ctrl
+
+    GlobalPlanner:
+      componentType: planner
+      replicas: 1
+      resources:
+        requests:
+          cpu: "1"
+          memory: "2Gi"
+        limits:
+          cpu: "2"
+          memory: "4Gi"
+      extraPodSpec:
+        nodeSelector:
+          nodeGroup: customer-cpu
+          kubernetes.io/arch: arm64
+        # rl-workspace PVC so the overlay can read requirements.planner.txt.
+        volumes:
+          - name: rl-workspace
+            persistentVolumeClaim:
+              claimName: rl-workspace
+        mainContainer:
+          image: jwillthomson/dynamo-arm-tokenize-endpoint-8590c26:latest
+          workingDir: /workspace
+          volumeMounts:
+            - mountPath: /mnt/rl-workspace
+              name: rl-workspace
+          # dynamo.global_planner imports the planner forecasting stack at load
+          # time (predictors.py → pmdarima/prophet/filterpy/...), which the
+          # 8590c26 image doesn't ship. Install requirements.planner.txt inline
+          # before exec, same as the pool Planners.
+          #
+          # Implicit management mode: accept scale requests from any caller and
+          # count all DGDs in the k8s namespace toward the (unset) GPU budget.
+          # DYN_NAMESPACE is injected by the operator as
+          # default-jothomson-dyn-gp-ctrl; the pools' Planner configs point
+          # global_planner_namespace at it.
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -eu
+              echo "[gp-overlay] pip install requirements.planner.txt $(date -u +%FT%TZ)"
+              /opt/dynamo/venv/bin/pip install -r /mnt/rl-workspace/jothomson/dynamo/container/deps/requirements.planner.txt
+              /opt/dynamo/venv/bin/python -c "import dynamo.global_planner; print('[gp-overlay] dynamo.global_planner OK')"
+              echo "[gp-overlay] handoff to dynamo.global_planner $(date -u +%FT%TZ)"
+              exec python3 -m dynamo.global_planner
+          env:
+            # KubernetesConnector targets this k8s namespace for DGD patches.
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace

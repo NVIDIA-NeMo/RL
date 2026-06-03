@@ -331,6 +331,133 @@ class VllmInternalWorkerExtension:
             )
             return False
 
+    @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_mx")
+    def update_weights_via_mx(self, *, version: int, mx_config: Any) -> bool:
+        """Receive weights via NIXL RDMA from MX server (v2 path).
+
+        Lazy-creates an :class:`MxV2RefitReceiver`, registers our model's
+        live parameters once, then for each version: discover same-rank
+        source, RDMA receive, slice into per-name views via the trainer's
+        published shape registry, hand off to ``_load_weights``, and
+        (optionally) republish self as an inference replica for tree
+        fan-out.
+
+        Returns ``True`` on successful refit.
+        """
+        try:
+            assert self.state_dict_info is not None, (
+                "state_dict_info not prepared; call prepare_refit_info() first"
+            )
+
+            # ---- Lazy-init receiver and register receive buffers (once) ----
+            if not hasattr(self, "_mx_receiver") or self._mx_receiver is None:
+                from nemo_rl.distributed.mx_helpers import build_v2_receiver
+
+                rank = (
+                    torch.distributed.get_rank()
+                    if torch.distributed.is_initialized()
+                    else 0
+                )
+                self._mx_receiver = build_v2_receiver(
+                    rank=rank,
+                    device_id=self.device.index,
+                    mx_config=mx_config,
+                )
+
+                # Build receive buffer dict from current model parameters.
+                # The trainer publishes local DTensor shards; on the inference
+                # side we want vLLM's already-allocated parameters as the
+                # destination buffers (no extra copy). vLLM stores them on
+                # ``self.model_runner.model``; iterate named_parameters to get
+                # them.
+                receive_buffers = {
+                    name: p.data
+                    for name, p in self.model_runner.model.named_parameters()
+                    if p.is_cuda
+                }
+                self._mx_receiver.initialize(model_tensors=receive_buffers)
+                self._mx_recv_buffers = receive_buffers
+
+            # ---- Discover, pick, and pull ----
+            candidates = self._mx_receiver.discover_v2_sources(
+                model_name=self.model_config.model
+                if hasattr(self.model_config, "model")
+                else getattr(self.model_runner.vllm_config.model_config, "model", "unknown"),
+                min_version=int(version),
+                same_rank_only=mx_config.same_rank_only,
+                include_replicas=mx_config.tree_scale_out,
+            )
+            if not candidates:
+                print(
+                    f"[mx] no v2 source available for version>={version} on rank "
+                    f"{self._mx_receiver.worker_rank}"
+                )
+                return False
+
+            chosen = self._mx_receiver.pick_best_source(candidates)
+            if chosen is None:
+                print(
+                    f"[mx] no candidate covers required experts on rank "
+                    f"{self._mx_receiver.worker_rank}"
+                )
+                return False
+            print(
+                f"[mx] rank={self._mx_receiver.worker_rank} chosen source "
+                f"role={chosen.role} src_rank={chosen.worker_rank} "
+                f"version={chosen.ref.training_step}"
+            )
+
+            # Drain RDMA receive into our pre-registered buffers.
+            for _name, _tensor in self._mx_receiver.receive_from(
+                chosen, timeout_seconds=mx_config.timeout_seconds
+            ):
+                # The yielded tensor is a view into the same buffer we
+                # registered. vLLM's model parameters now hold the new bytes;
+                # we still call _load_weights below for FP8 / GptOss /
+                # draft-weight handling.
+                pass
+
+            # Build (name, weight) pairs for _load_weights from buffers.
+            weights = []
+            for name, buf in self._mx_recv_buffers.items():
+                w = buf
+                # apply gpt-oss transpose fix on the way in
+                if (
+                    "GptOssForCausalLM"
+                    in self.model_runner.vllm_config.model_config.architectures
+                ):
+                    w = fix_gpt_oss_export_transpose(name, w)
+                weights.append((name, w))
+
+            self._load_weights(weights)
+            torch.cuda.current_stream().synchronize()
+
+            # FP8 KV cache hook reuse
+            self._maybe_process_fp8_kv_cache()
+
+            # ---- Tree fan-out: republish self as inference_replica ----
+            if mx_config.tree_scale_out:
+                self._mx_receiver.publish_self_as_source(
+                    version=int(version),
+                    model_name=self.model_config.model
+                    if hasattr(self.model_config, "model")
+                    else getattr(
+                        self.model_runner.vllm_config.model_config,
+                        "model",
+                        "unknown",
+                    ),
+                )
+
+            gc.collect()
+            torch.cuda.empty_cache()
+            return True
+        except Exception as e:
+            print(
+                f"Error in VllmInternalWorkerExtension.update_weights_via_mx: {e}\n"
+                f"{traceback.format_exc()}"
+            )
+            return False
+
     @wrap_with_nvtx_name(
         "vllm_internal_worker_extension/update_weights_from_collective"
     )

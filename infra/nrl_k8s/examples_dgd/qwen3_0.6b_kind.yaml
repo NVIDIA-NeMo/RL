@@ -1,0 +1,60 @@
+# A minimal DynamoGraphDeployment sized for a kind cluster.
+#
+# Two services: a Frontend (CPU only) and a single VllmDecodeWorker (1 GPU,
+# round-robin routing — no KV router needed for a one-replica setup).
+#
+# Use as a smoke-test target for nrl-k8s. For real model serving, point
+# infra.dynamo.<key>.manifest at one of dynamo/recipes/<model>/vllm/...
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: nrl-dynamo-smoke
+spec:
+  services:
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      resources:
+        requests:
+          cpu: "2"
+          memory: "4Gi"
+        limits:
+          cpu: "4"
+          memory: "8Gi"
+      extraPodSpec:
+        mainContainer:
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.2
+          workingDir: /workspace
+          command:
+            - python3
+            - -m
+            - dynamo.frontend
+    VllmDecodeWorker:
+      componentType: worker
+      replicas: 1
+      resources:
+        requests:
+          gpu: "1"
+        limits:
+          gpu: "1"
+      extraPodSpec:
+        mainContainer:
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.2
+          workingDir: /workspace
+          command:
+            - python3
+            - -m
+            - dynamo.vllm
+          args:
+            - --model
+            - Qwen/Qwen3-0.6B
+            - --tensor-parallel-size
+            - "1"
+            - --gpu-memory-utilization
+            - "0.85"
+            - --enforce-eager
+            - --max-model-len
+            - "8192"
+          env:
+            - name: DYN_HEALTH_CHECK_ENABLED
+              value: "false"

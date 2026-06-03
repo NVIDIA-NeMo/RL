@@ -942,6 +942,33 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             traceback.print_exc()
             return False
 
+    @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_via_mx")
+    def update_weights_via_mx(self, *, version: int, mx_config: Any) -> bool:
+        """Update weights via ModelExpress / NIXL RDMA (v2 path)."""
+        try:
+            assert self.llm is not None, (
+                "Attempting to update weights with either an uninitialized vLLM or non-model-owner"
+            )
+            if self.cfg["vllm_cfg"]["async_engine"]:
+                raise RuntimeError(
+                    "update_weights_via_mx cannot currently be used with async_engine=True"
+                )
+            result_or_coro = self.llm.collective_rpc(
+                "update_weights_via_mx",
+                kwargs={"version": int(version), "mx_config": mx_config},
+            )
+            worker_result = result_or_coro[0]
+            if not worker_result:
+                print(f"Error: MX refit failed. Result: {worker_result}")
+                return False
+            return True
+        except Exception as e:
+            print(f"Exception during collective_rpc for MX refit: {e}")
+            import traceback as _tb
+
+            _tb.print_exc()
+            return False
+
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_from_collective")
     def update_weights_from_collective(self) -> bool:
         """Update the model weights from collective communication."""

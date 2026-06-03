@@ -1,0 +1,218 @@
+# Workplace-assistant + Dynamo + **ModelExpress v2 mid-training refit** infra
+# for nrl-k8s on a GB300 cluster.
+#
+# Sibling of grpo_workplace_assistant_dynamo_smoke.gb300.infra.yaml. Differences:
+#   1. Points at the MX-enabled DGD manifest (examples_dgd/qwen3_4b_thinking_gb300_mx.yaml).
+#   2. Adds a RoCE DRA resourceClaim to the training worker so MxV2TrainingPublisher
+#      can bind a NIC for NIXL RDMA. The nrl-k8s CLI auto-creates the matching
+#      ResourceClaimTemplate (named "roce-mx-trainer-wpa") at apply time.
+#   3. Adds compute-domain + IPC_LOCK capabilities (NIXL requires pinned host
+#      memory, which needs IPC_LOCK; ComputeDomain is harmless if unused).
+#   4. Entrypoint launches grpo_workplace_assistant_dynamo_mx.yaml — same
+#      generation backend but with weight_sync.method="mx" + an mx_config block.
+#   5. ${user:}-raycluster-wpa-dynamo-mx (separate cluster name from the smoke
+#      so they don't collide).
+#
+# Prerequisites:
+#   * modelexpress-server applied in the namespace (see
+#     infra/nrl_k8s/dynamo_mx/modelexpress-server.yaml).
+#   * Worker image with `modelexpress` Python + NIXL baked in (see
+#     infra/nrl_k8s/dynamo_mx/Dockerfile once built and pushed).
+#   * Dev hot-reload (optional): rsync the local dynamo Python via
+#     infra/nrl_k8s/dynamo_mx/dev_sync.sh — the DGD manifest's
+#     PYTHONPATH points at the Lustre-staged tree.
+#
+# Run mode is --raycluster (long-lived) per the original smoke; --rayjob is
+# out of scope.
+#
+# Usage:
+#   RECIPE=examples/nemo_gym/grpo_workplace_assistant_dynamo_mx.yaml
+#   INFRA=infra/nrl_k8s/examples/grpo_workplace_assistant_dynamo_mx.gb300.infra.yaml
+#
+#   nrl-k8s check $RECIPE --infra $INFRA
+#   nrl-k8s run   $RECIPE --infra $INFRA --raycluster --no-wait
+
+_shared:
+  headNodeSelector: &head_node_selector
+    nodeGroup: customer-cpu
+  workerNodeSelector: &worker_node_selector
+    nvidia.com/gpu.product: NVIDIA-GB300
+  userSecretEnvFrom: &user_secret_env_from
+    - secretRef:
+        name: ${user:}-secrets
+        optional: true
+  headEnv: &shared_head_env
+    - {name: HF_HOME,                       value: "/mnt/rl-workspace/${user:}/hf-cache"}
+    - {name: NCCL_DEBUG,                    value: WARN}
+    - {name: RAY_memory_monitor_refresh_ms, value: "0"}
+  workerEnv: &shared_worker_env
+    - {name: HF_HOME,                       value: "/mnt/rl-workspace/${user:}/hf-cache"}
+    - {name: NCCL_DEBUG,                    value: WARN}
+    - {name: RAY_memory_monitor_refresh_ms, value: "0"}
+    # RDMA over RoCE + cuda_copy for dma-buf staging. Restricted TLS
+    # (rc,cuda_copy only) — broader set caused prep_xfer_dlist failures.
+    # See DEBUGGING_POSTMORTEM §12n.
+    - {name: UCX_TLS,                       value: "rc,cuda_copy"}
+    - {name: NIXL_UCX_TLS,                  value: "rc,cuda_copy"}
+    - {name: UCX_IB_GPU_DIRECT_RDMA,        value: "yes"}
+    - {name: UCX_CUDA_COPY_DMABUF,          value: "yes"}
+    - {name: MX_RDMA_NIC_PIN,               value: "auto"}
+  headResources: &head_resources
+    limits:   {cpu: "8",  memory: "32Gi"}
+    requests: {cpu: "4",  memory: "16Gi"}
+  gpuWorkerResources: &gpu_worker_resources
+    limits:
+      cpu: "16"
+      memory: "100Gi"
+      nvidia.com/gpu: "1"
+    requests:
+      cpu: "8"
+      memory: "50Gi"
+      nvidia.com/gpu: "1"
+    claims:
+      - {name: roce-channel}
+  gpuHeadPorts: &gpu_head_ports
+    - {containerPort: 6379,  name: gcs-server}
+    - {containerPort: 8265,  name: dashboard}
+    - {containerPort: 10001, name: client}
+  codeMounts: &code_mounts
+    - {mountPath: /dev/shm,           name: dshm}
+    - {mountPath: /opt/nemo-rl,       name: rl-workspace, subPath: "${user:}/nemo-rl"}
+    - {mountPath: /mnt/rl-workspace,  name: rl-workspace}
+  headVolumes: &head_volumes
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 8Gi}
+    - name: rl-workspace
+      persistentVolumeClaim: {claimName: rl-workspace}
+  workerVolumes: &worker_volumes
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 16Gi}
+    - name: rl-workspace
+      persistentVolumeClaim: {claimName: rl-workspace}
+
+# namespace auto-inferred from kube context.
+# MX overlay built from infra/nrl_k8s/dynamo_mx/Dockerfile.nemorl
+# (nixl-cu13 + ai-dynamo-runtime + modelexpress@8594fd6 + protobuf>=6.31.1
+#  installed into the main venv and all /opt/ray_venvs/*/ actor venvs,
+#  on top of nvcr.io/nvidian/nemo-rl:nightly which includes tensordict +
+#  the rest of upstream main's pyproject.toml).
+image: jwillthomson/nemo-rl-mx:05-25-v3
+imagePullSecrets: [nvcr-secret]
+serviceAccount: nemo-rl-endpoint-registry
+
+labels:
+  nrl-k8s/owner: ${user:}
+
+submit:
+  submitter: portForward
+
+launch:
+  mode: attach
+  runMode: batch
+  codeSource: image
+  codePath: /opt/nemo-rl
+  attach:
+    training: ${user:}-raycluster-wpa-dynamo-mx
+  peerWatcher: false
+  env: {}
+  entrypoint: |
+    set -eu
+    cd /opt/nemo-rl
+    if [ ! -d /mnt/rl-workspace ]; then
+      echo "ERROR: /mnt/rl-workspace not mounted — is the rl-workspace PVC bound?" >&2
+      exit 1
+    fi
+
+    # The nemo-rl-mx:05-25-v3 image bakes nixl-cu13==0.10.1 + modelexpress
+    # @kavink/nemo_rl_moe @ 8594fd6 + tensordict directly into every venv
+    # (on top of nvcr.io/nvidian/nemo-rl:nightly); no runtime downgrade,
+    # PYTHONPATH shadow, or pip install needed.
+    export PYTHONPATH=.:3rdparty/Megatron-LM-workspace/Megatron-LM
+    # modelexpress.ucx_utils.apply_nic_pin_for_device is a no-op unless
+    # MX_RDMA_NIC_PIN is set; "auto" picks the NUMA-local RoCE NIC per rank.
+    export MX_RDMA_NIC_PIN=auto
+    TIMESTAMP=$(date -u +%Y%m%d-%H%M%S-%N)
+    LOG_DIR=/mnt/rl-workspace/${user:}/driver_logs
+    LOG=\${LOG_DIR}/${user:}-wpa-dynamo-mx-\${TIMESTAMP}.log
+    mkdir -p "\${LOG_DIR}"
+
+    PIPE=$(mktemp -u)
+    mkfifo "\${PIPE}"
+    tee "\${LOG}" < "\${PIPE}" &
+    TEE_PID=$!
+
+    RC=0
+    python -u examples/nemo_gym/run_grpo_nemo_gym.py \
+      --config examples/nemo_gym/grpo_workplace_assistant_dynamo_mx.yaml \
+      +policy.generation.dynamo_cfg.dgd_name=${user:}-dynamo-wpa-mx \
+      grpo.max_num_steps=10 \
+      > "\${PIPE}" 2>&1 || RC=$?
+
+    wait "\${TEE_PID}" || true
+    rm -f "\${PIPE}"
+    exit "\${RC}"
+
+kuberay:
+  training:
+    name: ${user:}-raycluster-wpa-dynamo-mx
+    labels:
+      disagg.nemo-rl/cluster: wpa-dynamo-mx
+      disagg.nemo-rl/run: wpa-dynamo-mx
+      kai.scheduler/queue: backfill
+    spec:
+      rayVersion: "2.52.0"
+      headGroupSpec:
+        rayStartParams:
+          dashboard-host: "0.0.0.0"
+          no-monitor: "true"
+          num-gpus: "0"
+          object-store-memory: "100000000"
+        template:
+          spec:
+            schedulerName: kai-scheduler
+            dnsPolicy: ClusterFirst
+            nodeSelector: *head_node_selector
+            containers:
+              - name: ray-head
+                env: *shared_head_env
+                envFrom: *user_secret_env_from
+                resources: *head_resources
+                ports: *gpu_head_ports
+                volumeMounts: *code_mounts
+            volumes: *head_volumes
+      workerGroupSpecs:
+        - groupName: gpu-workers
+          replicas: 1
+          minReplicas: 1
+          maxReplicas: 1
+          rayStartParams:
+            num-gpus: "1"
+            object-store-memory: "100000000"
+          template:
+            spec:
+              schedulerName: kai-scheduler
+              dnsPolicy: ClusterFirst
+              nodeSelector: *worker_node_selector
+              tolerations:
+                - operator: Exists
+              # RoCE DRA on the trainer side too — needed for NIXL publisher.
+              # nrl-k8s will auto-create the ResourceClaimTemplate.
+              resourceClaims:
+                - name: roce-channel
+                  resourceClaimTemplateName: roce-mx-trainer-wpa
+              containers:
+                - name: ray-worker
+                  env: *shared_worker_env
+                  envFrom: *user_secret_env_from
+                  resources: *gpu_worker_resources
+                  securityContext:
+                    capabilities:
+                      add: [IPC_LOCK]
+                  volumeMounts: *code_mounts
+              volumes: *worker_volumes
+
+dynamo:
+  serving:
+    manifest: ../examples_dgd/qwen3_4b_thinking_gb300_mx.yaml
+    name: ${user:}-dynamo-wpa-mx
+    readyTimeoutS: 900

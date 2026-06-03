@@ -260,6 +260,29 @@ class GenerationInterface(ABC):
         """Update the model weights from collective communication."""
         raise NotImplementedError
 
+    def update_weights_via_mx(
+        self,
+        *,
+        version: int,
+        mx_config: Any,
+    ) -> list[ray.ObjectRef]:
+        """Update inference weights from MX server via NIXL RDMA (v2).
+
+        Each inference rank discovers its same-rank trainer source (or a
+        same-rank inference replica via tree fan-out), pulls weight bytes
+        via NIXL RDMA, and applies them via the existing ``_load_weights``
+        path. Compatible with MoE expert filtering.
+
+        Args:
+            version: minimum version to accept (filters out stale sources).
+            mx_config: an :class:`nemo_rl.distributed.mx_helpers.MxConfig`.
+
+        Returns:
+            List of Ray ObjectRefs — one per inference worker. Driver
+            ``ray.get``s alongside the publisher futures.
+        """
+        raise NotImplementedError
+
     # Optional hook; backends may override to invalidate any reusable caches
     # (e.g., vLLM prefix/KV caches) after weight updates.
     def invalidate_kv_cache(self) -> bool:

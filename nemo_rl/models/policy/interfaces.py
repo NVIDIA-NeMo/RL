@@ -206,6 +206,35 @@ class ColocatablePolicyInterface(PolicyInterface):
     ) -> list[ray.ObjectRef]:
         pass
 
+    def stream_weights_via_mx(
+        self,
+        *,
+        version: int,
+        mx_config: Any,
+    ) -> list[ray.ObjectRef]:
+        """Stream model weights to inference via NIXL RDMA + ModelExpress (v2).
+
+        Each trainer rank publishes ONLY its local DTensor shard (no
+        allgather) to ModelExpress. The same-rank inference peer pulls
+        directly via NIXL RDMA. See ``pensieve/RL/NemoRL/04_design_v2_moe_rank_to_rank.md``
+        for the full design and rationale.
+
+        Args:
+            version: monotonic version (== training step) for this publish.
+                Inference receivers filter on ``version >= last_seen``.
+            mx_config: an :class:`nemo_rl.distributed.mx_helpers.MxConfig`.
+
+        Returns:
+            List of Ray ObjectRefs — one per trainer worker. The driver
+            should ``ray.get`` these alongside the inference receivers.
+
+        Default raises ``NotImplementedError`` so backends that don't
+        support the MX path opt-out cleanly.
+        """
+        raise NotImplementedError(
+            "stream_weights_via_mx is not implemented for this policy worker"
+        )
+
     @abstractmethod
     def prepare_for_lp_inference(self) -> None:
         pass

@@ -914,6 +914,20 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # this function should co-work with vllm, so we should wait for all futures to complete outside
         return futures
 
+    def stream_weights_via_mx(
+        self,
+        *,
+        version: int,
+        mx_config: Any,
+    ) -> list[ray.ObjectRef]:
+        """Publish weights to ModelExpress for NIXL RDMA refit (v2 path)."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "stream_weights_via_mx",
+            version=int(version),
+            mx_config=mx_config,
+        )
+        return futures
+
     def offload_before_refit(self) -> None:
         """Offload the optimizer and buffers to the CPU."""
         futures = self.worker_group.run_all_workers_single_data("offload_before_refit")

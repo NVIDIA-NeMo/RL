@@ -1,0 +1,180 @@
+# Workplace-assistant + Dynamo smoke infra for nrl-k8s on a GB300 cluster.
+#
+# Brings up:
+#   * 1 small training RayCluster (head on customer-cpu + 1 worker × 1 GPU)
+#   * 1 DynamoGraphDeployment (Frontend on customer-cpu + 1× VllmDecodeWorker
+#     on a GB300 node, using a Blackwell-built arm64 image)
+#
+# The recipe sets policy.generation.backend=dynamo, so the policy worker's
+# DynamoGeneration class resolves the DGD's frontend Service URL and the
+# nemo-gym rollout path dispatches HTTP requests to it.
+#
+# Use --raycluster (long-lived) mode — ephemeral --rayjob mode is out of
+# scope for the dynamo path per commit 68a1b401.
+#
+# Usage:
+#   RECIPE=examples/nemo_gym/grpo_workplace_assistant_dynamo_smoke.yaml
+#   INFRA=infra/nrl_k8s/examples/grpo_workplace_assistant_dynamo_smoke.gb300.infra.yaml
+#
+#   nrl-k8s check $RECIPE --infra $INFRA
+#   nrl-k8s run   $RECIPE --infra $INFRA --raycluster --no-wait
+
+_shared:
+  headNodeSelector: &head_node_selector
+    nodeGroup: customer-cpu
+  workerNodeSelector: &worker_node_selector
+    nvidia.com/gpu.product: NVIDIA-GB300
+  userSecretEnvFrom: &user_secret_env_from
+    - secretRef:
+        name: ${user:}-secrets
+        optional: true
+  headEnv: &shared_head_env
+    - {name: HF_HOME,                       value: "/mnt/rl-workspace/${user:}/hf-cache"}
+    - {name: NCCL_DEBUG,                    value: WARN}
+    - {name: RAY_memory_monitor_refresh_ms, value: "0"}
+  workerEnv: &shared_worker_env
+    - {name: HF_HOME,                       value: "/mnt/rl-workspace/${user:}/hf-cache"}
+    - {name: NCCL_DEBUG,                    value: WARN}
+    - {name: RAY_memory_monitor_refresh_ms, value: "0"}
+  headResources: &head_resources
+    limits:   {cpu: "16", memory: "64Gi"}
+    requests: {cpu: "8",  memory: "32Gi"}
+  gpuWorkerResources: &gpu_worker_resources
+    limits:
+      cpu: "32"
+      memory: "200Gi"
+      nvidia.com/gpu: "1"
+    requests:
+      cpu: "16"
+      memory: "100Gi"
+      nvidia.com/gpu: "1"
+  gpuHeadPorts: &gpu_head_ports
+    - {containerPort: 6379,  name: gcs-server}
+    - {containerPort: 8265,  name: dashboard}
+    - {containerPort: 10001, name: client}
+  codeMounts: &code_mounts
+    - {mountPath: /dev/shm,           name: dshm}
+    - {mountPath: /opt/nemo-rl,       name: rl-workspace, subPath: "${user:}/nemo-rl"}
+    - {mountPath: /mnt/rl-workspace,  name: rl-workspace}
+  headVolumes: &head_volumes
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 8Gi}
+    - name: rl-workspace
+      persistentVolumeClaim: {claimName: rl-workspace}
+  workerVolumes: &worker_volumes
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 16Gi}
+    - name: rl-workspace
+      persistentVolumeClaim: {claimName: rl-workspace}
+
+# namespace auto-inferred from kube context (default).
+image: jwillthomson/nemo-rl-mx:05-25-v3
+imagePullSecrets: [nvcr-secret]
+serviceAccount: nemo-rl-endpoint-registry
+
+labels:
+  nrl-k8s/owner: ${user:}
+
+submit:
+  submitter: portForward
+
+launch:
+  mode: attach
+  runMode: batch
+  codeSource: image
+  codePath: /opt/nemo-rl
+  attach:
+    training: ${user:}-raycluster-wpa-dynamo-smoke
+  peerWatcher: false
+  env: {}
+  # In code_source: image mode the orchestrator's auto-inject of dgd_name
+  # is skipped (it only runs alongside working_dir staging in upload mode),
+  # so pass it as an explicit Hydra `+` override matching `dynamo.serving.name`
+  # below.
+  entrypoint: |
+    set -eu
+    cd /opt/nemo-rl
+    if [ ! -d /mnt/rl-workspace ]; then
+      echo "ERROR: /mnt/rl-workspace not mounted — is the rl-workspace PVC bound?" >&2
+      exit 1
+    fi
+    export PYTHONPATH=.:3rdparty/Megatron-LM-workspace/Megatron-LM
+    TIMESTAMP=$(date -u +%Y%m%d-%H%M%S-%N)
+    LOG_DIR=/mnt/rl-workspace/${user:}/driver_logs
+    LOG=\${LOG_DIR}/${user:}-wpa-dynamo-smoke-\${TIMESTAMP}.log
+    mkdir -p "\${LOG_DIR}"
+
+    PIPE=$(mktemp -u)
+    mkfifo "\${PIPE}"
+    tee "\${LOG}" < "\${PIPE}" &
+    TEE_PID=$!
+
+    RC=0
+    python -u examples/nemo_gym/run_grpo_nemo_gym.py \
+      --config examples/nemo_gym/grpo_workplace_assistant_dynamo_smoke.yaml \
+      +policy.generation.dynamo_cfg.dgd_name=${user:}-dynamo-wpa-smoke \
+      > "\${PIPE}" 2>&1 || RC=$?
+
+    wait "\${TEE_PID}" || true
+    rm -f "\${PIPE}"
+    exit "\${RC}"
+
+kuberay:
+  training:
+    name: ${user:}-raycluster-wpa-dynamo-smoke
+    labels:
+      disagg.nemo-rl/cluster: wpa-dynamo-smoke
+      disagg.nemo-rl/run: wpa-dynamo-smoke
+      kai.scheduler/queue: backfill
+    spec:
+      rayVersion: "2.52.0"
+      headGroupSpec:
+        rayStartParams:
+          dashboard-host: "0.0.0.0"
+          no-monitor: "true"
+          num-gpus: "0"
+          object-store-memory: "100000000"
+        template:
+          spec:
+            schedulerName: kai-scheduler
+            dnsPolicy: ClusterFirst
+            nodeSelector: *head_node_selector
+            containers:
+              - name: ray-head
+                env: *shared_head_env
+                envFrom: *user_secret_env_from
+                resources: *head_resources
+                ports: *gpu_head_ports
+                volumeMounts: *code_mounts
+            volumes: *head_volumes
+      workerGroupSpecs:
+        - groupName: gpu-workers
+          replicas: 1
+          minReplicas: 1
+          maxReplicas: 1
+          rayStartParams:
+            num-gpus: "1"
+            object-store-memory: "100000000"
+          template:
+            spec:
+              schedulerName: kai-scheduler
+              dnsPolicy: ClusterFirst
+              nodeSelector: *worker_node_selector
+              tolerations:
+                - operator: Exists
+              containers:
+                - name: ray-worker
+                  env: *shared_worker_env
+                  envFrom: *user_secret_env_from
+                  resources: *gpu_worker_resources
+                  securityContext:
+                    capabilities:
+                      add: [IPC_LOCK]
+                  volumeMounts: *code_mounts
+              volumes: *worker_volumes
+
+dynamo:
+  serving:
+    manifest: ../examples_dgd/qwen3_4b_thinking_gb300.yaml
+    name: ${user:}-dynamo-wpa-smoke
+    readyTimeoutS: 900
