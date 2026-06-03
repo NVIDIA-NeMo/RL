@@ -1,0 +1,251 @@
+# Workplace-assistant + Dynamo + **ModelExpress v2 refit** + **hierarchical
+# GlobalPlanner / GlobalRouter** infra for nrl-k8s on a GB300 cluster.
+#
+# Sibling of grpo_workplace_assistant_dynamo_mx.gb300.infra.yaml. Same trainer
+# (Megatron→DTensor GRPO with MX weight refit), but the single generation DGD
+# is replaced by a three-DGD hierarchical topology:
+#
+#   default-jothomson-dyn-gp-p0   (pool0)  LocalRouter + MX VllmDecodeWorker + Planner
+#   default-jothomson-dyn-gp-p1   (pool1)  LocalRouter + MX VllmDecodeWorker + Planner
+#   default-jothomson-dyn-gp-ctrl (ctrl)   Frontend + GlobalRouter + GlobalPlanner
+#
+# Request path:  trainer → ctrl Frontend → GlobalRouter (agg mode) → pool LocalRouter → worker.
+# Scale path:    each pool Planner → GlobalPlanner (delegated scale execution).
+# Weight path:   trainer publishes to the MX server; BOTH pool workers self-refit.
+#
+# What this exercises beyond the single-pool MX smoke:
+#   * GlobalRouter agg-mode pool selection (1x1 grid → all traffic to pool 0).
+#   * GlobalPlanner as the pools' delegated scale-execution endpoint.
+#   * Two independent MX worker pools refitting off one trainer publish.
+# Both pools are pinned at min=max=1 GPU, so no scaling actually fires (intended
+# for now) — the planner/router control plane is wired and running, not idle.
+#
+# Apply ORDER MATTERS: the GlobalRouter raises at startup if a pool's
+# `<pool-ns>.router.generate` endpoint isn't discoverable. The `dynamo:` block
+# below is ordered pool0, pool1, ctrl so nrl-k8s brings the pools (and their
+# LocalRouters) to Ready before the control DGD. nrl-k8s iterates the dynamo
+# mapping in declaration order.
+#
+# Prerequisites (on top of the MX smoke's prereqs — modelexpress-server +
+# MX/NIXL worker image):
+#   * Pre-provisioned RoCE ResourceClaimTemplate `roce-mx-qwen3-4b` in `default`
+#     (nrl-k8s auto-creates RayCluster RoCE templates but NOT DGD-pod ones; both
+#     pool workers reference this hand-applied template — the same one the
+#     single-pool MX smoke uses). Verify: kubectl get rct roce-mx-qwen3-4b -n default
+#   * Planner RBAC: kubectl apply -f infra/nrl_k8s/dynamo_mx/planner-rbac.yaml
+#     (binds ClusterRole dynamo-platform-dynamo-operator-planner to
+#     ServiceAccount planner-serviceaccount in `default`; the operator runs
+#     componentType:planner pods as that SA, and the GlobalPlanner's
+#     KubernetesConnector needs it to read/patch DGDs).
+#   * Cluster Prometheus scraping the LocalRouter pods (the pool Planners read
+#     dynamo_component_router_* with throughput_metrics_source=router).
+#   * The dynamo runtime image must ship dynamo.global_router / dynamo.global_planner
+#     / dynamo.router / dynamo.planner (all present on
+#     jthomson04/tokenize-endpoint-merge-main-05-07).
+#
+# The dgd_name handed to NeMo-RL points at the CONTROL DGD (its Frontend is the
+# public endpoint). nrl-k8s only auto-injects dgd_name when exactly one DGD is
+# declared; with three we wire it explicitly in the entrypoint below.
+#
+# Usage:
+#   RECIPE=examples/nemo_gym/grpo_workplace_assistant_dynamo_mx_gp.yaml
+#   INFRA=infra/nrl_k8s/examples/grpo_workplace_assistant_dynamo_mx_gp.gb300.infra.yaml
+#
+#   nrl-k8s check $RECIPE --infra $INFRA
+#   nrl-k8s run   $RECIPE --infra $INFRA --raycluster --no-wait
+
+_shared:
+  headNodeSelector: &head_node_selector
+    nodeGroup: customer-cpu
+  workerNodeSelector: &worker_node_selector
+    nvidia.com/gpu.product: NVIDIA-GB300
+  userSecretEnvFrom: &user_secret_env_from
+    - secretRef:
+        name: ${user:}-secrets
+        optional: true
+  headEnv: &shared_head_env
+    - {name: HF_HOME,                       value: "/mnt/rl-workspace/${user:}/hf-cache"}
+    - {name: NCCL_DEBUG,                    value: WARN}
+    - {name: RAY_memory_monitor_refresh_ms, value: "0"}
+  workerEnv: &shared_worker_env
+    - {name: HF_HOME,                       value: "/mnt/rl-workspace/${user:}/hf-cache"}
+    - {name: NCCL_DEBUG,                    value: WARN}
+    - {name: RAY_memory_monitor_refresh_ms, value: "0"}
+    # RDMA over RoCE + cuda_copy for dma-buf staging. Restricted TLS
+    # (rc,cuda_copy only) — broader set caused prep_xfer_dlist failures.
+    # See DEBUGGING_POSTMORTEM §12n.
+    - {name: UCX_TLS,                       value: "rc,cuda_copy"}
+    - {name: NIXL_UCX_TLS,                  value: "rc,cuda_copy"}
+    - {name: UCX_IB_GPU_DIRECT_RDMA,        value: "yes"}
+    - {name: UCX_CUDA_COPY_DMABUF,          value: "yes"}
+    - {name: MX_RDMA_NIC_PIN,               value: "auto"}
+  headResources: &head_resources
+    limits:   {cpu: "8",  memory: "32Gi"}
+    requests: {cpu: "4",  memory: "16Gi"}
+  gpuWorkerResources: &gpu_worker_resources
+    limits:
+      cpu: "16"
+      memory: "100Gi"
+      nvidia.com/gpu: "1"
+    requests:
+      cpu: "8"
+      memory: "50Gi"
+      nvidia.com/gpu: "1"
+    claims:
+      - {name: roce-channel}
+  gpuHeadPorts: &gpu_head_ports
+    - {containerPort: 6379,  name: gcs-server}
+    - {containerPort: 8265,  name: dashboard}
+    - {containerPort: 10001, name: client}
+  codeMounts: &code_mounts
+    - {mountPath: /dev/shm,           name: dshm}
+    - {mountPath: /opt/nemo-rl,       name: rl-workspace, subPath: "${user:}/nemo-rl"}
+    - {mountPath: /mnt/rl-workspace,  name: rl-workspace}
+  headVolumes: &head_volumes
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 8Gi}
+    - name: rl-workspace
+      persistentVolumeClaim: {claimName: rl-workspace}
+  workerVolumes: &worker_volumes
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 16Gi}
+    - name: rl-workspace
+      persistentVolumeClaim: {claimName: rl-workspace}
+
+# namespace auto-inferred from kube context (expected: default).
+image: jwillthomson/nemo-rl-mx:05-25-v3
+imagePullSecrets: [nvcr-secret]
+serviceAccount: nemo-rl-endpoint-registry
+
+labels:
+  nrl-k8s/owner: ${user:}
+
+submit:
+  submitter: portForward
+
+launch:
+  mode: attach
+  runMode: batch
+  codeSource: image
+  codePath: /opt/nemo-rl
+  attach:
+    training: ${user:}-raycluster-wpa-dynamo-mx-gp
+  peerWatcher: false
+  env: {}
+  entrypoint: |
+    set -eu
+    cd /opt/nemo-rl
+    if [ ! -d /mnt/rl-workspace ]; then
+      echo "ERROR: /mnt/rl-workspace not mounted — is the rl-workspace PVC bound?" >&2
+      exit 1
+    fi
+
+    export PYTHONPATH=.:3rdparty/Megatron-LM-workspace/Megatron-LM
+    export MX_RDMA_NIC_PIN=auto
+    TIMESTAMP=$(date -u +%Y%m%d-%H%M%S-%N)
+    LOG_DIR=/mnt/rl-workspace/${user:}/driver_logs
+    LOG=\${LOG_DIR}/${user:}-wpa-dynamo-mx-gp-\${TIMESTAMP}.log
+    mkdir -p "\${LOG_DIR}"
+
+    PIPE=$(mktemp -u)
+    mkfifo "\${PIPE}"
+    tee "\${LOG}" < "\${PIPE}" &
+    TEE_PID=$!
+
+    RC=0
+    # dgd_name points at the CONTROL DGD (its Frontend is the public endpoint).
+    # Hardcoded to match the control manifest's metadata.name (jothomson-dyn-gp-ctrl).
+    #
+    # refit_worker_namespaces lists the POOL Dynamo namespaces that actually hold
+    # the MX VllmDecodeWorkers. The control namespace only has GlobalRouter +
+    # GlobalPlanner, so MX refit discovery must target the pools instead. These
+    # are {k8s_ns}-{pool_dgd_name} = default-jothomson-dyn-gp-p{0,1}.
+    python -u examples/nemo_gym/run_grpo_nemo_gym.py \
+      --config examples/nemo_gym/grpo_workplace_assistant_dynamo_mx_gp.yaml \
+      +policy.generation.dynamo_cfg.dgd_name=jothomson-dyn-gp-ctrl \
+      '+policy.generation.dynamo_cfg.refit_worker_namespaces=[default-jothomson-dyn-gp-p0,default-jothomson-dyn-gp-p1]' \
+      grpo.max_num_steps=10 \
+      > "\${PIPE}" 2>&1 || RC=$?
+
+    wait "\${TEE_PID}" || true
+    rm -f "\${PIPE}"
+    exit "\${RC}"
+
+kuberay:
+  training:
+    name: ${user:}-raycluster-wpa-dynamo-mx-gp
+    labels:
+      disagg.nemo-rl/cluster: wpa-dynamo-mx-gp
+      disagg.nemo-rl/run: wpa-dynamo-mx-gp
+      kai.scheduler/queue: backfill
+    spec:
+      rayVersion: "2.52.0"
+      headGroupSpec:
+        rayStartParams:
+          dashboard-host: "0.0.0.0"
+          no-monitor: "true"
+          num-gpus: "0"
+          object-store-memory: "100000000"
+        template:
+          spec:
+            schedulerName: kai-scheduler
+            dnsPolicy: ClusterFirst
+            nodeSelector: *head_node_selector
+            containers:
+              - name: ray-head
+                env: *shared_head_env
+                envFrom: *user_secret_env_from
+                resources: *head_resources
+                ports: *gpu_head_ports
+                volumeMounts: *code_mounts
+            volumes: *head_volumes
+      workerGroupSpecs:
+        - groupName: gpu-workers
+          replicas: 1
+          minReplicas: 1
+          maxReplicas: 1
+          rayStartParams:
+            num-gpus: "1"
+            object-store-memory: "100000000"
+          template:
+            spec:
+              schedulerName: kai-scheduler
+              dnsPolicy: ClusterFirst
+              nodeSelector: *worker_node_selector
+              tolerations:
+                - operator: Exists
+              # RoCE DRA on the trainer side too — needed for the NIXL MxV2
+              # publisher. Distinct template name from the single-pool MX smoke
+              # so the two don't collide if both are checked/applied.
+              resourceClaims:
+                - name: roce-channel
+                  resourceClaimTemplateName: roce-mx-trainer-wpa-gp
+              containers:
+                - name: ray-worker
+                  env: *shared_worker_env
+                  envFrom: *user_secret_env_from
+                  resources: *gpu_worker_resources
+                  securityContext:
+                    capabilities:
+                      add: [IPC_LOCK]
+                  volumeMounts: *code_mounts
+              volumes: *worker_volumes
+
+# Declaration order = apply order. Pools first (so their LocalRouters are Ready
+# before the GlobalRouter tries to connect), control DGD last.
+dynamo:
+  # Timeouts are generous: the Planner / GlobalPlanner pods pip-install
+  # requirements.planner.txt (pmdarima/prophet/scipy/scikit-learn + a git dep)
+  # at startup before they go Ready, on top of the vLLM+MX worker boot.
+  pool0:
+    manifest: ../examples_dgd/qwen3_4b_thinking_gb300_mx_gp_pool0.yaml
+    name: jothomson-dyn-gp-p0
+    readyTimeoutS: 1800
+  pool1:
+    manifest: ../examples_dgd/qwen3_4b_thinking_gb300_mx_gp_pool1.yaml
+    name: jothomson-dyn-gp-p1
+    readyTimeoutS: 1800
+  ctrl:
+    manifest: ../examples_dgd/qwen3_4b_thinking_gb300_mx_gp_ctrl.yaml
+    name: jothomson-dyn-gp-ctrl
+    readyTimeoutS: 1200

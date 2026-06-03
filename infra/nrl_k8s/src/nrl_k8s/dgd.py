@@ -418,6 +418,22 @@ def _all_dgd_pods_ready(name: str, namespace: str) -> bool:
     return True
 
 
+def _dgd_has_frontend(obj: dict[str, Any] | None) -> bool:
+    """True if the DGD declares at least one ``componentType: frontend`` service.
+
+    Hierarchical global-router deployments split the public ``Frontend`` into
+    its own control DGD; the pool DGDs behind it run only ``LocalRouter`` +
+    worker + ``Planner`` and never bind an OpenAI :8000 listener. For those,
+    there is no ``<name>-frontend`` Service to probe, so ``wait_for_dgd_ready``
+    must skip the HTTP gate and rely on operator state + pod readiness alone.
+    """
+    services = ((obj or {}).get("spec") or {}).get("services") or {}
+    return any(
+        isinstance(svc, dict) and svc.get("componentType") == "frontend"
+        for svc in services.values()
+    )
+
+
 def _frontend_http_ready(name: str, namespace: str) -> bool:
     """True if the DGD frontend's :8000 listener answers a real request.
 
@@ -502,7 +518,9 @@ def wait_for_dgd_ready(
         if (
             state == _DGD_STATE_TERMINAL_GOOD
             and _all_dgd_pods_ready(name, namespace)
-            and _frontend_http_ready(name, namespace)
+            # Frontend-less DGDs (e.g. the pool DGDs behind a GlobalRouter) have
+            # no :8000 listener to probe — gate on operator state + pods only.
+            and (not _dgd_has_frontend(obj) or _frontend_http_ready(name, namespace))
         ):
             return
         time.sleep(poll_s)

@@ -75,7 +75,7 @@ def _discover_worker_instances(
     *,
     frontend_host: str,
     frontend_port: int,
-    dyn_namespace: str,
+    dyn_namespaces: "set[str]",
     dyn_system_port: int,
     timeout_s: float = 15.0,
 ) -> list[dict[str, Any]]:
@@ -117,7 +117,15 @@ def _discover_worker_instances(
     for inst in instances:
         if not isinstance(inst, dict):
             continue
-        if inst.get("namespace") != dyn_namespace:
+        if inst.get("namespace") not in dyn_namespaces:
+            continue
+        # Only the vLLM worker (component "backend") serves the
+        # /engine/update_weights_via_mx admin route. Filter on that endpoint
+        # so we skip the LocalRouter / Planner / GlobalRouter / GlobalPlanner
+        # pods that also register in these namespaces — POSTing /engine/* to
+        # them resets the connection (they don't serve it). This is correct in
+        # the flat topology too (the single worker registers this endpoint).
+        if inst.get("endpoint") != "update_weights_via_mx":
             continue
         inst_id = inst.get("instance_id")
         if inst_id is None or inst_id in seen_ids:
@@ -145,6 +153,7 @@ def _dispatch_update_weights_via_mx_remote(
     dgd_name: str,
     version: int,
     mx_config_dict: dict[str, Any],
+    worker_namespaces: "list[str] | None" = None,
     frontend_port: int = DEFAULT_FRONTEND_PORT,
     dyn_system_port: int = DEFAULT_DYN_SYSTEM_PORT,
     refit_timeout_s: float = 300.0,
@@ -174,7 +183,17 @@ def _dispatch_update_weights_via_mx_remote(
     passes (defense against pathological scale-thrash).
     """
     frontend_host = f"{dgd_name}-frontend.{k8s_namespace}.svc.cluster.local"
-    dyn_namespace = f"{k8s_namespace}-{dgd_name}"
+    # Which Dynamo namespace(s) hold the MX workers to refit:
+    #   * Flat single-DGD deployment: the workers live in the frontend's own
+    #     namespace ({k8s_ns}-{dgd_name}) — the default.
+    #   * Hierarchical GlobalRouter deployment: the public Frontend is in the
+    #     control DGD, but the MX workers live in the *pool* DGD namespaces.
+    #     The caller passes those explicitly via ``worker_namespaces``. /health
+    #     is cluster-wide, so the control frontend can still enumerate them.
+    if worker_namespaces:
+        dyn_namespaces = set(worker_namespaces)
+    else:
+        dyn_namespaces = {f"{k8s_namespace}-{dgd_name}"}
     payload = {"version": version, "mx_config": mx_config_dict}
 
     def _step(sys_url: str, route: str, body: dict[str, Any], timeout_s: float) -> dict[str, Any]:
@@ -213,7 +232,7 @@ def _dispatch_update_weights_via_mx_remote(
                 instances = _discover_worker_instances(
                     frontend_host=frontend_host,
                     frontend_port=frontend_port,
-                    dyn_namespace=dyn_namespace,
+                    dyn_namespaces=dyn_namespaces,
                     dyn_system_port=dyn_system_port,
                 )
                 if instances:
@@ -222,14 +241,16 @@ def _dispatch_update_weights_via_mx_remote(
             if not instances:
                 raise RuntimeError(
                     f"[mx] GET http://{frontend_host}:{frontend_port}/health "
-                    f"returned no instances for namespace={dyn_namespace} "
-                    f"after 20 retries (60s). Verify DGD is healthy. Refit aborted."
+                    f"returned no update_weights_via_mx workers in namespaces="
+                    f"{sorted(dyn_namespaces)} after 20 retries (60s). Verify the "
+                    f"worker DGD(s) are healthy and refit_worker_namespaces is "
+                    f"correct. Refit aborted."
                 )
         else:
             instances = _discover_worker_instances(
                 frontend_host=frontend_host,
                 frontend_port=frontend_port,
-                dyn_namespace=dyn_namespace,
+                dyn_namespaces=dyn_namespaces,
                 dyn_system_port=dyn_system_port,
             )
 
@@ -246,28 +267,37 @@ def _dispatch_update_weights_via_mx_remote(
             iteration_logs.append(iter_log)
             break  # converged: every live worker has been refitted
 
-        for inst in new_instances:
+        # Tree fan-out: fire refits in exponentially-growing waves.
+        # Wave k has up to FANOUT**k pods running in parallel. After
+        # each wave, the freshly-published inference_replicas become
+        # sources for the next wave; the picker random-picks among
+        # them so load spreads across NICs rather than serializing
+        # on the trainer. FANOUT=4 picked to match the receiver-side
+        # observation that a single source NIC saturates around 4
+        # concurrent NIXL pulls. Per-pod work (pause/refit/resume)
+        # is unchanged — only the outer loop becomes wave-parallel.
+        FANOUT = 4
+        import concurrent.futures
+
+        def _refit_one(inst: dict[str, Any]) -> tuple[Any, list[str], dict[str, Any]]:
+            """One pod's pause→refit (with retry)→flush→resume.
+
+            Returns ``(instance_id, failure_msgs, steps)``. Designed to
+            run in a worker thread inside the wave-parallel executor.
+            """
             sys_url = inst["system_url"]
             inst_id = inst["instance_id"]
             steps: dict[str, Any] = {}
+            failure_msgs: list[str] = []
 
             r_pause = _step(sys_url, "pause_generation", {}, admin_timeout_s)
             steps["pause"] = r_pause
             if r_pause.get("status") != "ok":
-                # Resume to undo partial pause (defensive), then record fail.
                 _step(sys_url, "resume_generation", {}, admin_timeout_s)
-                failures.append(f"pause@{sys_url}({inst_id}): {r_pause}")
-                continue
+                failure_msgs.append(f"pause@{sys_url}({inst_id}): {r_pause}")
+                return inst_id, failure_msgs, steps
 
             try:
-                # Retry the refit on transient failure (the receiver missing
-                # the mark_ready→READY propagation window) until it succeeds or
-                # the shared cycle deadline expires. Generation stays paused
-                # across retries. The trainer remains alive throughout (this
-                # dispatcher running == trainer blocked in ray.get), so its
-                # heartbeat keeps the sources READY and a re-issued discover
-                # finds them. Backoff capped at 3s covers the ~1s lag with
-                # a little margin.
                 attempt = 0
                 r_refit = {"status": "error", "reason": "not attempted"}
                 while True:
@@ -279,7 +309,7 @@ def _dispatch_update_weights_via_mx_remote(
                     if r_refit.get("status") == "ok":
                         break
                     if _time.monotonic() >= _cycle_deadline:
-                        failures.append(
+                        failure_msgs.append(
                             f"refit@{sys_url}({inst_id}) after {attempt} attempts "
                             f"(deadline exceeded): {r_refit}"
                         )
@@ -290,22 +320,45 @@ def _dispatch_update_weights_via_mx_remote(
                 r_flush = _step(sys_url, "flush_cache", {}, admin_timeout_s)
                 steps["flush"] = r_flush
                 if r_flush.get("status") not in ("ok", None):
-                    failures.append(f"flush@{sys_url}({inst_id}): {r_flush}")
+                    failure_msgs.append(f"flush@{sys_url}({inst_id}): {r_flush}")
             finally:
                 r_resume = _step(
                     sys_url, "resume_generation", {}, admin_timeout_s
                 )
                 steps["resume"] = r_resume
                 if r_resume.get("status") != "ok":
-                    failures.append(f"resume@{sys_url}({inst_id}): {r_resume}")
+                    failure_msgs.append(f"resume@{sys_url}({inst_id}): {r_resume}")
 
-            # Whether or not the refit step succeeded, we've completed
-            # the cycle on this instance — mark it so we don't re-pause
-            # next iteration. If it failed, it's already in `failures`
-            # and the final aggregate-raise will surface it.
-            refitted_ids.add(inst_id)
+            return inst_id, failure_msgs, steps
+
+        wave_logs: list[dict[str, Any]] = []
+        remaining = list(new_instances)
+        wave_idx = 0
+        while remaining:
+            wave_idx += 1
+            wave_size = min(len(remaining), FANOUT ** wave_idx)
+            wave = remaining[:wave_size]
+            remaining = remaining[wave_size:]
+            wave_start = _time.monotonic()
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=len(wave)
+            ) as ex:
+                futures = [ex.submit(_refit_one, inst) for inst in wave]
+                for fut in concurrent.futures.as_completed(futures):
+                    inst_id, fmsgs, _steps = fut.result()
+                    refitted_ids.add(inst_id)
+                    if fmsgs:
+                        failures.extend(fmsgs)
+            wave_logs.append(
+                {
+                    "wave": wave_idx,
+                    "size": len(wave),
+                    "wall_s": round(_time.monotonic() - wave_start, 3),
+                }
+            )
 
         iter_log["refitted_this_pass"] = len(new_instances)
+        iter_log["waves"] = wave_logs
         iteration_logs.append(iter_log)
     else:
         # Loop hit max iterations without converging — pathological churn.
@@ -520,10 +573,18 @@ class DynamoGeneration(GenerationInterface):
         else:
             mx_config_dict = {}
 
+        # Hierarchical (GlobalRouter) deployments put the MX workers in pool
+        # DGD namespaces distinct from the control DGD's frontend namespace.
+        # When set, refit discovery targets these instead of {namespace}-{dgd_name}.
+        worker_namespaces = dynamo_cfg.get("refit_worker_namespaces") or None
+        if worker_namespaces is not None:
+            worker_namespaces = list(worker_namespaces)
+
         ref = _dispatch_update_weights_via_mx_remote.remote(
             k8s_namespace=namespace,
             dgd_name=dgd_name,
             version=int(version),
             mx_config_dict=mx_config_dict,
+            worker_namespaces=worker_namespaces,
         )
         return [ref]

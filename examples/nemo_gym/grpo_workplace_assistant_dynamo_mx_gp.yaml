@@ -1,0 +1,23 @@
+# Workplace-assistant + Dynamo MX refit smoke, routed through a hierarchical
+# **GlobalPlanner + GlobalRouter** topology.
+#
+# The trainer side is byte-for-byte the single-pool MX smoke
+# (grpo_workplace_assistant_dynamo_mx.yaml): DTensor GRPO with
+# cluster.weight_sync.method="mx" + the mx_config block. Nothing about the
+# trainer changes — DynamoGeneration is still a thin HTTP forwarder and MX
+# refit is receiver-side (the pool workers self-poll the MX server), so the
+# trainer is oblivious to the routing topology in front of it.
+#
+# The ONLY difference is where generation lives: instead of one DGD with a
+# Frontend + worker, this run targets a control DGD (Frontend + GlobalRouter +
+# GlobalPlanner) backed by two agg pools. The dgd_name (→ control Frontend) is
+# injected at launch by the paired infra YAML's entrypoint, so this recipe
+# stays topology-agnostic.
+#
+# Run with:
+#   infra/nrl_k8s/examples/grpo_workplace_assistant_dynamo_mx_gp.gb300.infra.yaml
+
+defaults: grpo_workplace_assistant_dynamo_mx.yaml
+
+logger:
+  log_dir: "logs/grpo-workplace-assistant-dynamo-mx-gp-smoke"

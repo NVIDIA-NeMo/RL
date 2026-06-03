@@ -1,0 +1,261 @@
+# Pool 1 DGD for the hierarchical (GlobalPlanner + GlobalRouter) MX smoke.
+#
+# One agg pool behind the GlobalRouter in jothomson-dyn-gp-ctrl. Dynamo
+# namespace (operator-derived): default-jothomson-dyn-gp-p1. Three components:
+#
+#   LocalRouter       — dynamo.router serving `<pool-ns>.router.generate`, the
+#                       endpoint the GlobalRouter forwards to. It KV-aware-routes
+#                       across this pool's worker(s), pulling from the worker's
+#                       `<pool-ns>.backend.generate`.
+#   VllmDecodeWorker  — the SAME MX-enabled aggregated vLLM worker as the
+#                       single-pool MX smoke (qwen3_4b_thinking_gb300_mx.yaml):
+#                       ModelExpress v2 mid-training refit (self-polling via the
+#                       MX server), NIXL/RoCE, load-format mx-target. No
+#                       --is-prefill-worker → registers at backend.generate and
+#                       handles prefill+decode (agg). The trainer publishes
+#                       weights to the MX server; this worker (and pool 1's)
+#                       self-refit independently — no endpoint topology needed.
+#   Planner           — local SLA planner pinned at min=max=1 GPU (mode=agg).
+#                       Delegates scale execution to the GlobalPlanner
+#                       (environment=global-planner). The 1/1 band blocks all
+#                       scaling decisions, which is what we want for now.
+#
+# This is pool 1 — the GlobalRouter's 1x1 grid maps NO requests here (all go
+# to pool 0). Pool 1 still boots a worker (min=max=1) and self-refits via MX,
+# so it exercises the "both pools have 1 worker" half of the smoke while
+# staying idle on the request path.
+#
+# RoCE: this worker binds a RoCE NIC for NIXL RDMA via the pre-provisioned
+# `roce-mx-qwen3-4b` ResourceClaimTemplate (nrl-k8s does NOT auto-create
+# DGD-side RoCE templates — only RayCluster ones). See the resourceClaims note
+# below.
+#
+# Names hardcoded for the `default` namespace + `jothomson` user — see the
+# header of qwen3_4b_thinking_gb300_mx_gp_ctrl.yaml before reusing.
+
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: jothomson-dyn-gp-p1
+  annotations:
+    nvidia.com/kai-scheduler-queue: backfill
+spec:
+  services:
+    LocalRouter:
+      componentType: default
+      replicas: 1
+      resources:
+        requests:
+          cpu: "2"
+          memory: "4Gi"
+        limits:
+          cpu: "4"
+          memory: "8Gi"
+      extraPodSpec:
+        nodeSelector:
+          nodeGroup: customer-cpu
+          # arm64 — dynamo image is arm64-only.
+          kubernetes.io/arch: arm64
+        # rl-workspace PVC so the overlay can read the patched router source.
+        volumes:
+          - name: rl-workspace
+            persistentVolumeClaim:
+              claimName: rl-workspace
+        mainContainer:
+          image: jwillthomson/dynamo-arm-tokenize-endpoint-8590c26:latest
+          workingDir: /workspace
+          volumeMounts:
+            - mountPath: /mnt/rl-workspace
+              name: rl-workspace
+          env:
+            - name: DYN_SYSTEM_PORT
+              value: "9090"
+          # Overlay the None-guard fix for dynamo/router/__main__.py: an MX refit
+          # aborts in-flight requests → kv_router yields a None chunk → the stock
+          # router .get()s it → AttributeError surfaced as BackendUnknown (500).
+          # cp the patched source into the venv before exec. Trailing "--" makes
+          # the router args land as $1, $2, ...
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -eu
+              SRC=/mnt/rl-workspace/jothomson/dynamo/components/src/dynamo/router/__main__.py
+              DST=/opt/dynamo/venv/lib/python3.12/site-packages/dynamo/router/__main__.py
+              if [ -f "$SRC" ]; then cp "$SRC" "$DST"; echo "[router-overlay] patched $(md5sum "$DST" | cut -d' ' -f1)"; else echo "[router-overlay] WARN: $SRC missing"; fi
+              exec python3 -m dynamo.router "$@"
+            - --
+          args:
+            # Aggregated worker registers at backend.generate (no prefill split).
+            - --endpoint
+            - default-jothomson-dyn-gp-p1.backend.generate
+            - --router-block-size
+            - "16"
+            - --router-kv-overlap-score-credit
+            - "0"
+
+    VllmDecodeWorker:
+      componentType: worker
+      replicas: 1
+      envFromSecret: jothomson-secrets
+      resources:
+        requests:
+          gpu: "1"
+          memory: "64Gi"
+        limits:
+          gpu: "1"
+          memory: "128Gi"
+      extraPodSpec:
+        nodeSelector:
+          nvidia.com/gpu.product: NVIDIA-GB300
+        # RoCE DRA claim — required for NIXL RDMA. Unlike RayCluster claims,
+        # nrl-k8s does NOT auto-create ResourceClaimTemplates for DGD pods, so
+        # this references the pre-provisioned `roce-mx-qwen3-4b` template (the
+        # same generic RoCE NIC claim the single-pool MX smoke uses). Each pod
+        # referencing it gets its own ResourceClaim instance. If it's missing:
+        #   kubectl get resourceclaimtemplate roce-mx-qwen3-4b -n default
+        resourceClaims:
+          - name: roce-channel
+            resourceClaimTemplateName: roce-mx-qwen3-4b
+        volumes:
+          - name: rl-workspace
+            persistentVolumeClaim:
+              claimName: rl-workspace
+        mainContainer:
+          # dynamo worker image baked from
+          # jthomson04/tokenize-endpoint-merge-main-05-07 @ 8590c2694e
+          # (tokenize-endpoint + MX v2 refit + bundled-UCX nixl wheel +
+          #  modelexpress @ kavink/nemo_rl_moe @ 8594fd6). Same image as the
+          # single-pool MX smoke.
+          image: jwillthomson/dynamo-arm-tokenize-endpoint-8590c26:latest
+          workingDir: /workspace
+          volumeMounts:
+            - mountPath: /mnt/rl-workspace
+              name: rl-workspace
+          # Overlay the modified modelexpress checkout (with v2-aware loader)
+          # over the baked-in install BEFORE dynamo.vllm starts. Inlined into
+          # command (not postStart) because postStart races the main process.
+          command:
+            - /bin/bash
+            - -c
+            - |
+              echo "[mx-debug] start $(date -u +%FT%TZ)"
+              MX_SRC=/tmp/mx-src
+              rm -rf "$MX_SRC"
+              cp -a /mnt/rl-workspace/jothomson/modelexpress/modelexpress_client/python "$MX_SRC"
+              rm -rf "$MX_SRC"/modelexpress.egg-info "$MX_SRC"/build "$MX_SRC"/__pycache__
+              echo "[mx-debug] installing overlay from $MX_SRC"
+              /opt/dynamo/venv/bin/pip install --force-reinstall --no-deps "$MX_SRC"
+              INSTALL_RC=$?
+              echo "[mx-debug] pip install exit=$INSTALL_RC"
+              if [ "$INSTALL_RC" -ne 0 ]; then
+                echo "[mx-debug] FATAL: overlay install failed"
+                exit "$INSTALL_RC"
+              fi
+              echo "[mx-debug] verifying modelexpress overlay:"
+              /opt/dynamo/venv/bin/python -c "import modelexpress; print('modelexpress at', modelexpress.__file__)"
+              /opt/dynamo/venv/bin/python -c "from modelexpress.engines.vllm.registration import _PLUGIN_LOAD_FORMATS; print('_PLUGIN_LOAD_FORMATS =', _PLUGIN_LOAD_FORMATS)"
+              MXRX_SRC=/mnt/rl-workspace/jothomson/dynamo/components/src/dynamo/vllm/mx_refit/extension.py
+              MXRX_DST=/opt/dynamo/venv/lib/python3.12/site-packages/dynamo/vllm/mx_refit/extension.py
+              if [ -f "$MXRX_SRC" ]; then
+                cp "$MXRX_SRC" "$MXRX_DST"
+                echo "[mx-debug] overlaid extension.py: $(md5sum $MXRX_DST | cut -d' ' -f1)"
+              else
+                echo "[mx-debug] WARN: $MXRX_SRC missing; not overlaying extension.py"
+              fi
+              echo "[mx-debug] handoff to dynamo.vllm $(date -u +%FT%TZ)"
+              exec python3 -m dynamo.vllm "$@"
+            - --   # script-name placeholder so dynamo args land as $1, $2, ...
+          args:
+            - --model
+            - Qwen/Qwen3-4B-Thinking-2507
+            - --load-format
+            - mx-target
+            - --tensor-parallel-size
+            - "1"
+            - --gpu-memory-utilization
+            - "0.85"
+            - --max-model-len
+            - "16384"
+            - --enforce-eager
+            - --dyn-tool-call-parser
+            - hermes
+            - --dyn-reasoning-parser
+            - qwen3
+          resources:
+            claims:
+              - name: roce-channel
+          env:
+            - name: DYN_HEALTH_CHECK_ENABLED
+              value: "false"
+            - name: HF_HOME
+              value: /tmp/hf-cache
+            - name: NIXL_PLUGIN_DIR
+              value: "/opt/dynamo/venv/lib/python3.12/site-packages/nixl_cu12.libs/nixl"
+            - name: DYN_MX_REFIT_ENABLED
+              value: "1"
+            - name: MODEL_EXPRESS_URL
+              value: "modelexpress-server.default.svc.cluster.local:8001"
+            - name: UCX_TLS
+              value: "rc,cuda_copy"
+            - name: NIXL_UCX_TLS
+              value: "rc,cuda_copy"
+            - name: UCX_IB_GPU_DIRECT_RDMA
+              value: "yes"
+            - name: UCX_CUDA_COPY_DMABUF
+              value: "yes"
+            - name: UCX_LOG_LEVEL
+              value: "info"
+            - name: MX_RDMA_NIC_PIN
+              value: "auto"
+
+    Planner:
+      componentType: planner
+      replicas: 1
+      resources:
+        requests:
+          cpu: "1"
+          memory: "2Gi"
+        limits:
+          cpu: "2"
+          memory: "4Gi"
+      extraPodSpec:
+        nodeSelector:
+          nodeGroup: customer-cpu
+          kubernetes.io/arch: arm64
+        # rl-workspace PVC so the overlay can read the Lustre dynamo checkout's
+        # requirements.planner.txt.
+        volumes:
+          - name: rl-workspace
+            persistentVolumeClaim:
+              claimName: rl-workspace
+        mainContainer:
+          image: jwillthomson/dynamo-arm-tokenize-endpoint-8590c26:latest
+          volumeMounts:
+            - mountPath: /mnt/rl-workspace
+              name: rl-workspace
+          # The 8590c26 image ships the dynamo.planner module but NOT its
+          # forecasting deps (requirements.planner.txt: pmdarima / prophet /
+          # filterpy / scikit-learn / scipy / aiconfigurator). predictors.py
+          # imports them at module load, so the planner can't start without
+          # them. Install inline from the Lustre dynamo checkout, then exec.
+          # The trailing "--" makes the --config arg land as $1.
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -eu
+              echo "[planner-overlay] pip install requirements.planner.txt $(date -u +%FT%TZ)"
+              /opt/dynamo/venv/bin/pip install -r /mnt/rl-workspace/jothomson/dynamo/container/deps/requirements.planner.txt
+              /opt/dynamo/venv/bin/python -c "import dynamo.planner.core; print('[planner-overlay] dynamo.planner.core OK')"
+              echo "[planner-overlay] handoff to dynamo.planner $(date -u +%FT%TZ)"
+              exec python3 -m dynamo.planner "$@"
+            - --
+          # mode=agg → single (decode) engine type. min==max==1 GPU pins the
+          # pool at one worker; the budget band blocks every scale decision.
+          # environment=global-planner delegates execution to the GlobalPlanner
+          # in default-jothomson-dyn-gp-ctrl. throughput_metrics_source=router
+          # reads dynamo_component_router_* from cluster Prometheus.
+          args:
+            - --config
+            - '{"environment":"global-planner","global_planner_namespace":"default-jothomson-dyn-gp-ctrl","backend":"vllm","mode":"agg","enable_load_scaling":false,"enable_throughput_scaling":true,"throughput_metrics_source":"router","ttft_ms":2000,"itl_ms":200,"min_gpu_budget":1,"max_gpu_budget":1,"decode_engine_num_gpu":1,"model_name":"Qwen/Qwen3-4B-Thinking-2507","profile_results_dir":"/workspace/components/src/dynamo/planner/tests/data/profiling_results/H200_TP1P_TP1D"}'
