@@ -16,6 +16,7 @@ grpo:
   skip_reference_policy_logprobs_calculation: true
 
 checkpointing:
+  enabled: false
   save_period: 10
 
 policy:

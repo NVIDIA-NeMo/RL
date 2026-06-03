@@ -74,8 +74,11 @@ Use these deliberately:
 
 - `NRL_FORCE_REBUILD_VENVS=false`: reuse worker venvs. Use this for normal reruns after envs exist.
 - `NRL_FORCE_REBUILD_VENVS=true`: rebuild worker venvs. Use after dependency changes or when stale worker packages are suspected.
+- `FORCE_REINSTALL_NEMO_RL=false`: keep the editable NeMo-RL install. Use this for normal Python-only changes under `nemo_rl/...`; new driver/worker processes import the active worktree directly.
 - `FORCE_REINSTALL_SGLANG=true`: force reinstall SGLang into the driver env. Use after changing the SGLang dependency source in `pyproject.toml` or when validating a new SGLang checkout.
 - `FORCE_REINSTALL_PACKAGES=true`: broad reinstall switch. Avoid unless needed; it can trigger long package builds.
+
+NeMo-RL is installed editable in the usual driver and Ray worker environments, so source-only edits to the active RL worktree do not require `NRL_FORCE_REBUILD_VENVS=true` or `FORCE_REINSTALL_NEMO_RL=true`. Rebuilding the venv can unnecessarily trigger slow dependency builds such as TransformerEngine.
 
 If `sglang` is an editable path dependency in `pyproject.toml`, normal Python edits in that SGLang checkout are picked up by new worker processes after restart. Dependency, metadata, kernel, or compiled-extension changes still require reinstall/rebuild.
 
