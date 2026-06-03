@@ -20,6 +20,7 @@ policy:
   generation_batch_size: 8
   logprob_batch_size: 8
   generation:
+    max_new_tokens: 750
     sglang_cfg:
       max_running_requests: 8
 

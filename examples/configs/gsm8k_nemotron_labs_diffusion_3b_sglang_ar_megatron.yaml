@@ -86,7 +86,7 @@ policy:
 
   generation:
     backend: "sglang"
-    max_new_tokens: 1024
+    max_new_tokens: 750
     temperature: 1.0
     top_p: 1.0
     top_k: null

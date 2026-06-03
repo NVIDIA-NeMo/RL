@@ -42,7 +42,7 @@ export RUN_NAME="${RUN_NAME:-grpo_nemotron_ar_megatron_policy_5k}"
 export RUN_ROOT="${RUN_ROOT:-/lustre/fsw/portfolios/coreai/users/snorouzi/runs/diffusion_rl}"
 export RUNDIR="${RUNDIR:-${RUN_ROOT}/${RUN_NAME}}"
 export CHECKPOINT_DIR="${CHECKPOINT_DIR:-${RUNDIR}/checkpoints}"
-export LOG_DIR="${LOG_DIR:-/tmp/${RUN_NAME}}"
+export LOG_DIR="${LOG_DIR:-${RUNDIR}/logs}"
 
 export MEGATRON_PATCH_DIR="${MEGATRON_PATCH_DIR:-/lustre/fsw/portfolios/coreai/users/snorouzi/nemorl_runtime_patches}"
 export WANDB_RUN_NAME="${WANDB_RUN_NAME:-${RUN_NAME}}"
@@ -207,7 +207,7 @@ fi
 if [[ "${NODES}" -gt 1 ]]; then
   # NeMo RL ray.sub owns multi-node Ray bringup. This script only defines
   # the driver command and environment used once ray.sub has started the cluster.
-  export COMMAND="cd ${REPO_DIR} && tools/nemotron_diffusion/submit_grpo_nemotron_ar_megatron_sbatch.sh --run"
+  export COMMAND="${COMMAND:-cd ${REPO_DIR} && tools/nemotron_diffusion/submit_grpo_nemotron_ar_megatron_sbatch.sh --run}"
   export CONTAINER="${CONTAINER:-${CONTAINER_IMAGE}}"
   export MOUNTS="${MOUNTS:-${CONTAINER_MOUNTS}}"
   export CPUS_PER_WORKER="${CPUS_PER_WORKER:-${CPUS_PER_TASK}}"

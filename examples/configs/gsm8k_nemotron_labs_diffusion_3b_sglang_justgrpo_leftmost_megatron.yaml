@@ -99,7 +99,7 @@ policy:
 
   generation:
     backend: "sglang"
-    max_new_tokens: 1024
+    max_new_tokens: 750
     temperature: 1.0
     top_p: 1.0
     top_k: null
@@ -117,7 +117,7 @@ policy:
       ep_size: 1
       max_running_requests: 4
       mem_fraction_static: 0.55
-      max_total_tokens: 20000
+      max_total_tokens: 10000
       skip_server_warmup: true
       disable_cuda_graph: true
       disable_piecewise_cuda_graph: true

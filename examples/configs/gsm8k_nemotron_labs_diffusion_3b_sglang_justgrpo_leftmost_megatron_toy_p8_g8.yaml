@@ -6,17 +6,17 @@ loss_fn:
 grpo:
   num_prompts_per_step: 8
   num_generations_per_prompt: 8
-  max_num_steps: 5
+  max_num_steps: 200
   max_num_epochs: 1
   val_period: 1000
   val_at_start: false
   val_at_end: false
-  max_val_samples: 0
+  max_val_samples: 2000
   val_batch_size: 8
   skip_reference_policy_logprobs_calculation: true
 
 checkpointing:
-  save_period: 1
+  save_period: 10
 
 policy:
   train_global_batch_size: 64
@@ -27,6 +27,7 @@ policy:
     reveal_batch_size: 32
     train_reveal_batch_size: 8
   generation:
+    max_new_tokens: 750
     sglang_cfg:
       max_running_requests: 8
 
