@@ -476,7 +476,7 @@ name = "megatron-bridge"
 # Must stay in sync with 3rdparty/Megatron-Bridge-workspace/setup.py::CACHED_DEPENDENCIES.
 version = "0.0.0"
 requires-dist = [
-  "transformers>=5.5.0,<=5.6.0",
+  "transformers>=5.8.1,<5.9.0",
   "mistral-common>=1.10.0",
   "peft>=0.18.1",
   "datasets>=2.20.0",
@@ -496,8 +496,6 @@ requires-dist = [
   "pyyaml>=6.0.2",
   "tqdm>=4.67.1",
   "hydra-core>1.3,<=1.3.2",
-  # megatron-core omitted here: it's a workspace member and already a direct dep of the mcore extra.
-  # Non-workspace path deps cannot depend on workspace members (uv name-shadowing restriction).
   "qwen-vl-utils",
   "nvidia-resiliency-ext",
   "flash-linear-attention",
@@ -506,6 +504,8 @@ requires-dist = [
   "mlflow>=3.9.0",
   "comet-ml>=3.50.0",
   "torch>=2.6.0",
+  "flashinfer-python==0.6.8.post1",
+  "flashinfer-cubin==0.6.8.post1",
 ]
 
 # Override logsage metadata to remove numpy<=2.0.2 and pandas<=2.3.3 upper bounds
