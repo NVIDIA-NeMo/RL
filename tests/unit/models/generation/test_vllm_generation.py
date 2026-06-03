@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
 import json
 import os
 import sys
@@ -39,6 +40,7 @@ from nemo_rl.models.generation.vllm.vllm_worker import (
     _resolve_enable_prefix_caching,
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
+    VllmAsyncGenerationWorkerImpl,
     _replace_prefix_tokens,
 )
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
@@ -340,6 +342,86 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
     assert openai_serving_chat.instances[0].kwargs["reasoning_parser"] == "nano_v3"
     # make sure that the config attribute does not leak into `http_server_serving_chat_kwargs`
     assert "reasoning_parser_plugin" not in openai_serving_chat.instances[0].kwargs
+
+
+def test_nano_v3_reasoning_parser_swaps_reasoning_when_thinking_disabled(
+    monkeypatch,
+):
+    registered_reasoning_parsers = {}
+
+    for module_name in (
+        "vllm",
+        "vllm.reasoning",
+    ):
+        monkeypatch.setitem(sys.modules, module_name, types.ModuleType(module_name))
+
+    class ReasoningParserManager:
+        @staticmethod
+        def register_module(name):
+            def decorator(parser_cls):
+                registered_reasoning_parsers[name] = parser_cls
+                return parser_cls
+
+            return decorator
+
+    class DeepSeekR1ReasoningParser:
+        def __init__(self, tokenizer, *args, **kwargs):
+            self.tokenizer = tokenizer
+
+        def extract_reasoning(self, model_output, request):
+            return model_output
+
+    abs_reasoning_parsers = types.ModuleType("vllm.reasoning.abs_reasoning_parsers")
+    abs_reasoning_parsers.ReasoningParserManager = ReasoningParserManager
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.reasoning.abs_reasoning_parsers",
+        abs_reasoning_parsers,
+    )
+
+    deepseek_reasoning_parser = types.ModuleType(
+        "vllm.reasoning.deepseek_r1_reasoning_parser"
+    )
+    deepseek_reasoning_parser.DeepSeekR1ReasoningParser = DeepSeekR1ReasoningParser
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.reasoning.deepseek_r1_reasoning_parser",
+        deepseek_reasoning_parser,
+    )
+
+    repo_root = Path(__file__).resolve().parents[4]
+    parser_path = (
+        repo_root
+        / "nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "test_nano_v3_reasoning_parser",
+        parser_path,
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    parser_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(parser_module)
+
+    assert (
+        registered_reasoning_parsers["nano_v3"] is parser_module.NanoV3ReasoningParser
+    )
+    parser = parser_module.NanoV3ReasoningParser(tokenizer=object())
+
+    request = types.SimpleNamespace(chat_template_kwargs={"enable_thinking": False})
+    assert parser.extract_reasoning(("answer", None), request) == (None, "answer")
+
+    request.chat_template_kwargs["enable_thinking"] = True
+    assert parser.extract_reasoning(("reasoning", None), request) == (
+        "reasoning",
+        None,
+    )
+
+    request.chat_template_kwargs["enable_thinking"] = False
+    assert parser.extract_reasoning(("reasoning", "final"), request) == (
+        "reasoning",
+        "final",
+    )
 
 
 def test_configure_generation_config_uses_real_startup_weights_without_draft_refit():

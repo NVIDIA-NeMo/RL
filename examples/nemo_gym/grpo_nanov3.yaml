@@ -210,10 +210,11 @@ policy:
       num_last_layers_in_bf16: 0
       num_first_layers_in_bf16: 0
       expose_http_server: true
+      reasoning_parser_plugin: nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py
       http_server_serving_chat_kwargs:
         enable_auto_tools: true
         tool_parser: qwen3_coder
-        reasoning_parser: deepseek_r1
+        reasoning_parser: nano_v3
 
     vllm_kwargs:
       mamba_ssm_cache_dtype: "float32"
