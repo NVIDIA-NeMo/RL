@@ -32,10 +32,10 @@ from nemo_rl.algorithms.advantage_estimator import (
     RawRewardAdvantageEstimator,
 )
 from nemo_rl.algorithms.grpo import (
-    _extract_prompt_only_messages,
     _should_log_nemo_gym_responses,
     _should_use_async_rollouts,
     _should_use_nemo_gym,
+    extract_initial_prompt_messages,
     refit_policy_generation,
 )
 from nemo_rl.algorithms.loss import (
@@ -1427,18 +1427,21 @@ def ppo_train(
 
                     policy.finish_inference()
 
-                # Build prompt IDs for advantage estimation (groups responses from same prompt)
+                # Build prompt IDs for advantage estimation (groups responses from same prompt).
+                # Use the token-length-based extractor so multi-turn prompts containing
+                # assistant messages still resolve to the original prompt only.
                 with timer.time("advantage_calculation"):
                     print("▶ Computing advantages...", flush=True)
-                    prompt_only_message_logs = _extract_prompt_only_messages(
-                        repeated_batch["message_log"]
+                    initial_prompt_message_logs = extract_initial_prompt_messages(
+                        repeated_batch["message_log"],
+                        repeated_batch["length"],
                     )
                     prompt_batched_flat, _ = batched_message_log_to_flat_message(
-                        prompt_only_message_logs,
+                        initial_prompt_message_logs,
                         pad_value_dict={"token_ids": tokenizer.pad_token_id},
                     )
                     prompt_ids_for_adv = prompt_batched_flat["token_ids"]
-                    del prompt_only_message_logs
+                    del initial_prompt_message_logs
                     del prompt_batched_flat
 
                     adv_kwargs = dict(
