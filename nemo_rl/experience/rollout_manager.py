@@ -15,7 +15,6 @@
 import asyncio
 import copy
 import json
-import warnings
 from typing import Any, Optional
 
 import torch
@@ -429,7 +428,6 @@ class AsyncNemoGymRolloutImpl:
         self._num_generations_per_prompt = num_generations_per_prompt
         self._max_seq_len = max_seq_len
         self._max_rollout_turns = max_rollout_turns
-        self._engine_max_model_len = generation_config["vllm_cfg"]["max_model_len"]  # type: ignore
 
         self._validate_init_params()
 
@@ -469,18 +467,6 @@ class AsyncNemoGymRolloutImpl:
         for key in ["stop_strings", "stop_token_ids", "top_k"]:
             assert not self._generation_config[key], (  # type: ignore
                 f"{key} is not supported in the generation config in NeMo-Gym path!"
-            )
-
-        # Validate max_seq_len.
-        if (
-            self._max_seq_len is not None
-            and self._max_seq_len > self._engine_max_model_len
-        ):
-            warnings.warn(
-                f"policy max_total_sequence_length ({self._max_seq_len}) is greater than the "
-                f"generation engine's max_model_len ({self._engine_max_model_len}). The engine "
-                "will truncate sequences to its own limit, so the policy cap will not be "
-                "honored. Lower max_total_sequence_length or raise the engine's max_model_len."
             )
 
         # Validate max_rollout_turns.
@@ -557,8 +543,7 @@ class AsyncNemoGymRolloutImpl:
 
         # Calculate truncation.
         truncated = (
-            sum(len(m["token_ids"]) for m in result["message_log"])
-            == self._engine_max_model_len
+            sum(len(m["token_ids"]) for m in result["message_log"]) == self._max_seq_len
         )
 
         return Completion(
@@ -644,17 +629,14 @@ class RolloutManager:
         tokenizer: TokenizerType,
         task_to_env: dict[str, EnvironmentInterface],
         num_generations_per_prompt: int,
-        use_nemo_gym: bool = False,
-        max_seq_len: Optional[int] = None,
+        max_seq_len: int,
         max_rollout_turns: Optional[int] = None,
         policy_generation: Optional[GenerationInterface] = None,
         generation_config: Optional[GenerationConfig] = None,
+        use_nemo_gym: bool = False,
     ) -> None:
         if not use_nemo_gym:
             rollout_cls = AsyncRolloutImpl
-            assert max_seq_len is not None, (
-                "max_seq_len is required for the native async path"
-            )
             assert policy_generation is not None, (
                 "policy_generation is required for the native async path"
             )
