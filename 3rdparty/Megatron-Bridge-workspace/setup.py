@@ -27,7 +27,8 @@ bridge_package_name = "megatron.bridge"
 
 # Default dependencies from pyproject.toml
 CACHED_DEPENDENCIES = [
-    "transformers>=5.0.0,<=5.3.0",
+    "transformers>=5.8.1,<5.9.0",
+    "mistral-common>=1.10.0",
     "peft>=0.18.1",
     "datasets>=2.20.0",
     "accelerate",
@@ -48,17 +49,15 @@ CACHED_DEPENDENCIES = [
     "hydra-core>1.3,<=1.3.2",
     "megatron-core[dev,mlm]",
     "qwen-vl-utils",
-    # TODO(https://github.com/NVIDIA-NeMo/RL/issues/2111): upgrade to core_cu13 when we move to CUDA 13 base container
-    "transformer-engine[pytorch,core_cu13]",
-    "mamba-ssm",
     "nvidia-resiliency-ext",
-    "causal-conv1d",
     "flash-linear-attention",
     "timm",
     "open-clip-torch>=3.2.0",
     "mlflow>=3.9.0",
     "comet-ml>=3.50.0",
     "torch>=2.6.0",
+    "flashinfer-python==0.6.8.post1",
+    "flashinfer-cubin==0.6.8.post1",
 ]
 
 # If the bridge source exists, compare cached dependencies with the submodule's pyproject
