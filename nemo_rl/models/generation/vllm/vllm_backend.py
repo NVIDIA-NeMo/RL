@@ -57,7 +57,9 @@ def fix_gemma3_vision_weight_name(key: str) -> str:
 
     When performing refit, the vision-tower weight paths are flattened. This unflattens them.
     """
-    return re.sub(r"vision_tower\.(?!vision_model\.)", "vision_tower.vision_model.", key)
+    return re.sub(
+        r"vision_tower\.(?!vision_model\.)", "vision_tower.vision_model.", key
+    )
 
 
 class VllmInternalWorkerExtension:
