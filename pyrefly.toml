@@ -122,6 +122,8 @@ project-includes = [
   "nemo_rl/evals/__init__.py",
   "nemo_rl/evals/answer_parsing.py",
   "nemo_rl/experience/__init__.py",
+  "nemo_rl/experience/interfaces.py",
+  "nemo_rl/experience/rollout_manager.py",
   "nemo_rl/experience/rollouts.py",
   "nemo_rl/modelopt/__init__.py",
   "nemo_rl/modelopt/models/__init__.py",
