@@ -49,23 +49,20 @@ class AsyncRolloutImpl:
 
     def __init__(
         self,
-        policy_generation: GenerationInterface,
         tokenizer: TokenizerType,
         task_to_env: dict[str, EnvironmentInterface],
-        max_seq_len: int,
         num_generations_per_prompt: int,
+        max_seq_len: int,
+        policy_generation: GenerationInterface,
         max_rollout_turns: int = 999999,
         **kwargs: Any,
     ) -> None:
-        assert num_generations_per_prompt >= 1, (
-            "num_generations_per_prompt must be >= 1"
-        )
-        self._policy_generation = policy_generation
         self._tokenizer = tokenizer
         self._task_to_env = task_to_env
-        self._max_seq_len = max_seq_len
         self._num_generations_per_prompt = num_generations_per_prompt
+        self._max_seq_len = max_seq_len
         self._max_rollout_turns = max_rollout_turns
+        self._policy_generation = policy_generation
 
     async def run_rollout(self, input_sample: DatumSpec) -> PromptGroupRecord:
         """Run num_generations_per_prompt rollouts for one prompt.
@@ -416,18 +413,18 @@ class AsyncNemoGymRolloutImpl:
         self,
         tokenizer: TokenizerType,
         task_to_env: dict[str, EnvironmentInterface],
-        generation_config: GenerationConfig,
         num_generations_per_prompt: int,
-        max_seq_len: Optional[int] = None,
+        max_seq_len: int,
+        generation_config: GenerationConfig,
         max_rollout_turns: Optional[int] = None,
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
         self._task_to_env = task_to_env
-        self._generation_config = generation_config
         self._num_generations_per_prompt = num_generations_per_prompt
         self._max_seq_len = max_seq_len
         self._max_rollout_turns = max_rollout_turns
+        self._generation_config = generation_config
 
         self._validate_init_params()
 
@@ -472,11 +469,6 @@ class AsyncNemoGymRolloutImpl:
         # Validate max_rollout_turns.
         assert self._max_rollout_turns is None, (
             "`max_rollout_turns` is not supported in NeMo-Gym path!"
-        )
-
-        # Validate num_generations_per_prompt.
-        assert self._num_generations_per_prompt >= 1, (
-            "`num_generations_per_prompt` must be >= 1!"
         )
 
     def _build_inputs(self, input_sample: DatumSpec) -> list[dict]:
@@ -635,6 +627,10 @@ class RolloutManager:
         generation_config: Optional[GenerationConfig] = None,
         use_nemo_gym: bool = False,
     ) -> None:
+        assert num_generations_per_prompt >= 1, (
+            "num_generations_per_prompt must be >= 1"
+        )
+
         if not use_nemo_gym:
             rollout_cls = AsyncRolloutImpl
             assert policy_generation is not None, (
@@ -653,8 +649,8 @@ class RolloutManager:
             task_to_env=task_to_env,
             num_generations_per_prompt=num_generations_per_prompt,
             max_seq_len=max_seq_len,
-            max_rollout_turns=max_rollout_turns,
-            policy_generation=policy_generation,
+            max_rollout_turns=max_rollout_turns,  # type: ignore
+            policy_generation=policy_generation,  # type: ignore
             generation_config=generation_config,
         )
 
