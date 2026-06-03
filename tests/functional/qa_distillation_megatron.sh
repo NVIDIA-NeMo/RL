@@ -96,7 +96,7 @@ MEGATRON_LM_SRC=$PROJECT_ROOT/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge
 PYTHONPATH=$MEGATRON_LM_SRC:${PYTHONPATH:-} \
 uv run --extra mcore --extra modelopt \
     torchrun --nproc_per_node 1 \
-    $PROJECT_ROOT/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/examples/quantization/export.py \
+    $PROJECT_ROOT/examples/modelopt/export_quantized_to_hf.py \
     --hf-model-id $HF_MODEL \
     --megatron-load-path $WEIGHTS_DIR \
     --export-dir $EXPORT_DIR \
