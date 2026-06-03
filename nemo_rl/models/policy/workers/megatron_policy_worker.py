@@ -1249,7 +1249,16 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                     # Split interleaved QKV into separate Q, K, V on TP-local shard.
                     # split_qkv_weights works on local shards with adjusted head counts
                     # since heads_per_group = num_heads/num_query_groups stays constant.
+                    # This requires train TP <= num_query_groups (KV heads).  When
+                    # tp_size > num_query_groups, Megatron channel-splits the KV heads
+                    # (each rank holds a fraction of a KV head, not a whole one), which
+                    # this whole-head reshape cannot represent — so QKV is routed to the
+                    # misc/load_weights path in prepare_nccl_reshard_refit_info (which
+                    # gathers full heads via export_hf_weights).  Skip it here so the
+                    # bulk path doesn't attempt the impossible per-rank split.
                     tp_size = task.mapping.tp_size
+                    if config.num_query_groups < tp_size:
+                        continue
                     local_config = SimpleNamespace(
                         num_attention_heads=config.num_attention_heads // tp_size,
                         num_query_groups=config.num_query_groups // tp_size,
@@ -1379,15 +1388,25 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             else:
                 count = middle_per_stage
             for _ in range(count):
+                # Emit both HF naming conventions so the lookup in
+                # build_nccl_reshard_refit_info hits regardless of model family:
+                # Llama/Qwen use ``model.layers.N``; NemotronH uses
+                # ``backbone.layers.N``.  Keys are looked up (not iterated), so
+                # the unused convention's extra keys are harmless.
                 layer_to_pp_stage[f"model.layers.{layer_idx}"] = stage
+                layer_to_pp_stage[f"backbone.layers.{layer_idx}"] = stage
                 layer_idx += 1
 
         assert layer_idx == num_layers, (
             f"Layer assignment incomplete: assigned {layer_idx} of {num_layers}"
         )
 
+        # Embedding on the first stage, final norm + lm_head on the last.
+        # model.* = Llama/Qwen; backbone.* = NemotronH (embeddings / norm_f).
         layer_to_pp_stage["model.embed_tokens"] = 0
+        layer_to_pp_stage["backbone.embeddings"] = 0
         layer_to_pp_stage["model.norm"] = pp_size - 1
+        layer_to_pp_stage["backbone.norm_f"] = pp_size - 1
         layer_to_pp_stage["lm_head"] = pp_size - 1
         return layer_to_pp_stage
 
@@ -1407,6 +1426,14 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         # producer/consumer agree on the packed-broadcast iteration.
         from nemo_rl.distributed.nccl_reshard_utils import is_misc_param
 
+        # If tp_size > num KV heads, Megatron splits KV weights within heads and
+        # all-gathers at runtime. In this case, we put QKV weights into misc_params
+        # to use packed_broadcast refit.
+        train_tp = train_parallelism.get("tp_size", 1)
+        qkv_to_misc = (
+            self.megatron_bridge.transformer_config.num_query_groups < train_tp
+        )
+
         state_dict_metadata = {}
         misc_meta = OrderedDict()
         with _meta_tensor_alloc_context():
@@ -1420,7 +1447,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                     "dtype": str(tensor.dtype),
                 }
                 # filtering hard to handle params as a misc_param
-                if is_misc_param(name):
+                if is_misc_param(name, qkv_to_misc=qkv_to_misc):
                     misc_meta[name] = meta
                 else:
                     state_dict_metadata[name] = meta
@@ -1457,11 +1484,15 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         # Filter conversion_tasks to the misc subset (see is_misc_param).
         # is_misc_param runs on the Megatron global_param_name here; Bridge
         # preserves the classifying suffixes through megatron_to_hf, so it
-        # agrees with the gen-side (HF-name) split.
+        # agrees with the metadata (HF-name) split above.  qkv_to_misc adds the
+        # fused QKV tasks (self_attention.linear_qkv) to the misc subset so the
+        # broadcast path exports them via export_hf_weights (full TP gather ->
+        # whole-head split) instead of the impossible per-rank split.
         self._misc_conversion_tasks = [
             task
             for task in self.refit_conversion_tasks
-            if task is not None and is_misc_param(task.global_param_name)
+            if task is not None
+            and is_misc_param(task.global_param_name, qkv_to_misc=qkv_to_misc)
         ]
 
         return self.nccl_reshard_refit_info

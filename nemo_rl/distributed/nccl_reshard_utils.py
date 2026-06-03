@@ -131,7 +131,7 @@ def is_expert_param(param_name: str) -> bool:
     return ".experts." in param_name
 
 
-def is_misc_param(param_name: str) -> bool:
+def is_misc_param(param_name: str, qkv_to_misc: bool = False) -> bool:
     """Return True if the parameter should be routed to the misc refit path.
 
     Misc params are all-gathered to their full HF shape on the train side and
@@ -144,7 +144,21 @@ def is_misc_param(param_name: str) -> bool:
     Megatron names (Bridge preserves these suffixes through ``megatron_to_hf``).
     It MUST classify each param identically on both sides, or the bulk/misc
     split desyncs and packed_broadcast deadlocks.
+
+    ``qkv_to_misc`` routes attention QKV to the misc path too.  The bulk path
+    splits the fused QKV on each TP-local shard (split_qkv_weights), which needs
+    every rank to own whole K/V heads; when ``tp_size > num_query_groups`` (GQA
+    with few KV heads) Megatron channel-splits the KV heads and that local split
+    is impossible.
     """
+    if qkv_to_misc and (
+        # Megatron fused QKV *weight* only — not the fused-in input layernorm
+        # (``linear_qkv.layer_norm_weight``), which maps to an HF norm and must
+        # stay on whichever path its HF name selects.
+        param_name.endswith("linear_qkv.weight")
+        or param_name.endswith(("q_proj.weight", "k_proj.weight", "v_proj.weight"))
+    ):
+        return True
     # FP8 blockwise scale siblings + KV-cache/activation scales.
     if param_name.endswith("_scale_inv"):
         return True
@@ -439,8 +453,14 @@ def fuse_expert_params_in_metadata(
 # Layer grouping and refit-info construction
 # =========================================================================
 
-_LAYER_RE = re.compile(r"(model\.layers\.\d+)\.")
-_MODEL_PREFIX_RE = re.compile(r"(model\.\w+)\.")
+# Match the per-layer prefix and the top-level module group for both the
+# Llama/Qwen HF convention (``model.layers.N`` / ``model.embed_tokens`` /
+# ``model.norm``) and the NemotronH convention (``backbone.layers.N`` /
+# ``backbone.embeddings`` / ``backbone.norm_f``).  Keeping these naming-agnostic
+# lets _extract_layer_name produce a stable per-layer key that matches the keys
+# _build_layer_to_pp_stage emits, so PP-stage filtering works for both families.
+_LAYER_RE = re.compile(r"((?:model|backbone)\.layers\.\d+)\.")
+_MODEL_PREFIX_RE = re.compile(r"((?:model|backbone)\.\w+)\.")
 
 
 def _extract_layer_name(param_name: str) -> str:
