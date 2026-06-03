@@ -276,12 +276,23 @@ class TokenAligner:
         self,
         student_ids: torch.Tensor,
         teacher_ids: torch.Tensor,
+        *,
+        student_attention_mask: torch.Tensor | None = None,
+        teacher_attention_mask: torch.Tensor | None = None,
     ) -> AlignmentBatch:
         """Align a batch of student/teacher token id tensors.
 
         Args:
             student_ids: ``[B, T_s]`` long tensor.
             teacher_ids: ``[B, T_t]`` long tensor.
+            student_attention_mask: optional ``[B, T_s]`` mask (1 = real
+                token, 0 = padding). When given, padded positions are forced
+                to the ``chunk_id = -1`` / partition-``False`` sentinels so
+                tokenizer padding never forms a valid chunk. ``align`` runs
+                the DP over the fully padded ids, so without this the pad run
+                on each side can be aligned into chunks that survive
+                :func:`valid_chunk_mask`.
+            teacher_attention_mask: optional ``[B, T_t]`` counterpart.
 
         Returns:
             An :class:`AlignmentBatch` with all fields populated for the
@@ -309,7 +320,40 @@ class TokenAligner:
             pairs = self._align_single(s_toks, t_toks)
             per_sample_pairs.append(pairs)
 
-        return self._pairs_to_batch(per_sample_pairs, b=b, t_s=t_s, t_t=t_t)
+        batch = self._pairs_to_batch(per_sample_pairs, b=b, t_s=t_s, t_t=t_t)
+        self._drop_padding(
+            batch,
+            student_attention_mask=student_attention_mask,
+            teacher_attention_mask=teacher_attention_mask,
+        )
+        return batch
+
+    @staticmethod
+    def _drop_padding(
+        batch: AlignmentBatch,
+        *,
+        student_attention_mask: torch.Tensor | None,
+        teacher_attention_mask: torch.Tensor | None,
+    ) -> None:
+        """Strip tokenizer padding out of the chunk-id / partition tensors.
+
+        Mutates ``batch`` in place. For every position the attention mask
+        marks as padding, reset ``*_chunk_id`` to ``-1`` and
+        ``*_exact_partition_mask`` to ``False``. Gating per position (rather
+        than trimming a contiguous span) keeps this correct under either
+        left- or right-padding. A pair whose tokens are entirely padding on
+        one side then has size 0 there and is dropped by
+        :func:`nemo_rl.algorithms.x_token.loss_utils.valid_chunk_mask`; a pair
+        straddling the real/pad boundary shrinks to its real tokens.
+        """
+        if student_attention_mask is not None:
+            s_pad = student_attention_mask == 0
+            batch.student_chunk_id[s_pad] = -1
+            batch.student_exact_partition_mask[s_pad] = False
+        if teacher_attention_mask is not None:
+            t_pad = teacher_attention_mask == 0
+            batch.teacher_chunk_id[t_pad] = -1
+            batch.teacher_exact_partition_mask[t_pad] = False
 
     @staticmethod
     def _pairs_to_batch(

@@ -98,7 +98,12 @@ class CrossTokenizerCollator:
             self.ctx_length_teacher,
             self.make_seq_div_by_teacher,
         )
-        alignment = self.aligner.align(student_input_ids, teacher_input_ids)
+        alignment = self.aligner.align(
+            student_input_ids,
+            teacher_input_ids,
+            student_attention_mask=student_attention_mask,
+            teacher_attention_mask=teacher_attention_mask,
+        )
 
         sample_mask = torch.tensor(
             [datum["loss_multiplier"] for datum in batch], dtype=torch.float32
