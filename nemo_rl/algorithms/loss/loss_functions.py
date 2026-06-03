@@ -1107,7 +1107,7 @@ class CrossTokenizerDistillationLossConfig(TypedDict):
             ``len(teacher_tokenizer)``; not a user knob in YAML.
     """
 
-    projection_matrix_path: str
+    projection_matrix_path: Optional[str]  # null in the exemplar YAML; set per-run via Hydra CLI, required at runtime
     gold_loss: bool
     xtoken_loss: bool
     temperature: float
