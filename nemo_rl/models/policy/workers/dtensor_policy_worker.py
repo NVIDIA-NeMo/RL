@@ -20,6 +20,7 @@ import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
+from enum import IntEnum
 from typing import Any, Generator, Iterable, Optional, Set, Union, cast
 
 import ray
@@ -115,6 +116,12 @@ def _attach_context_parallel_hooks(model: nn.Module) -> None:
             module.register_forward_pre_hook(_hook, with_kwargs=True, prepend=True)
 
 
+class PreparedState(IntEnum):
+    NOT_READY = 0
+    LOGPROB = 1
+    TRAIN = 2
+
+
 @contextmanager
 def unshard_fsdp2_model(model: nn.Module) -> Generator[None, None, None]:
     """Explicitly unshard and then reshard the FSDP2 modules. Useful for logprob inference."""
@@ -200,6 +207,12 @@ class DTensorPolicyWorkerImpl(
         **kwargs: Any,
     ):
         """Initialize the DTensorPolicyWorker."""
+
+        # Apply patch to work around 'NotImplementedError: Operator aten.alias.default does not have a sharding strategy registered'
+        apply_torch_aten_alias_tensor_patch()
+
+        self.is_prepared = False
+        self.prepared_state = PreparedState.NOT_READY
         self.tokenizer = tokenizer
         self.processor = processor
         self.is_vlm = processor is not None
@@ -577,6 +590,11 @@ class DTensorPolicyWorkerImpl(
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
+        if self.prepared_state != PreparedState.TRAIN:
+            raise RuntimeError(
+                "Model is not prepared for GPU execution. "
+                "Did you forget to call prepare_for_training()?"
+            )
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:
@@ -990,6 +1008,11 @@ class DTensorPolicyWorkerImpl(
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
+        if self.prepared_state == PreparedState.NOT_READY:
+            raise RuntimeError(
+                "Model is not prepared for GPU execution. "
+                "Did you forget to call prepare_for_lp_inference() (or prepare_for_training())?"
+            )
         logprob_batch_size = (
             micro_batch_size
             if micro_batch_size is not None
@@ -1297,6 +1320,11 @@ class DTensorPolicyWorkerImpl(
     # TODO @Rayen Tian: Related Issue: Refactor shared logic between score() and get_logprobs() (https://github.com/NVIDIA-NeMo/RL/issues/1094)
     @wrap_with_nvtx_name("dtensor_policy_worker/score")
     def score(self, data: BatchedDataDict) -> BatchedDataDict[ScoreOutputSpec]:
+        if self.prepared_state == PreparedState.NOT_READY:
+            raise RuntimeError(
+                "Model is not prepared for GPU execution. "
+                "Did you forget to call prepare_for_lp_inference() (or prepare_for_training())?"
+            )
         global_batch_size = min(self.cfg["batch_size"], data.size)
 
         sequence_dim = 1
@@ -1897,6 +1925,9 @@ class DTensorPolicyWorkerImpl(
     @wrap_with_nvtx_name("dtensor_policy_worker/prepare_for_lp_inference")
     def prepare_for_lp_inference(self) -> None:
         # onload model to cuda
+        self.is_prepared = True
+        self.prepared_state = PreparedState.LOGPROB
+
         if not self.cpu_offload:
             self.move_to_cuda(self.model)
         else:
@@ -1914,6 +1945,7 @@ class DTensorPolicyWorkerImpl(
 
     @wrap_with_nvtx_name("dtensor_policy_worker/prepare_for_training")
     def prepare_for_training(self, *args, **kwargs) -> None:
+        self.prepared_state = PreparedState.TRAIN
         # onload models and optimizer state to cuda
         if not self.cpu_offload:
             self.move_to_cuda(self.model)
@@ -1969,7 +2001,19 @@ class DTensorPolicyWorkerImpl(
 
     def move_to_device(self, model: nn.Module, device: str | torch.device) -> nn.Module:
         model = self.move_buffer_to_device(model, device)
-        return model.to(device)
+        model = model.to(device)
+        # Update prepared flag only for parameter moves
+        try:
+            any_on_cuda = any(
+                (hasattr(p, "is_cuda") and p.is_cuda)
+                for p in model.parameters()
+                if isinstance(p, torch.Tensor)
+            )
+            if not any_on_cuda:
+                self.prepared_state = PreparedState.NOT_READY
+        except Exception:
+            pass
+        return model
 
     def move_buffer_to_device(
         self, model: nn.Module, device: str | torch.device
