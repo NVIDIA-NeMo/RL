@@ -76,6 +76,7 @@ def make_processed_microbatch_iterator(
     pad_packed_seq_to_multiple_of: int,
     straggler_timer: StragglerDetector,
     pad_full_seq_to: Optional[int],
+    delegate_pack_to_model: bool = False,
 ) -> Iterator[ProcessedMicrobatch]:
     """Wrap a raw microbatch iterator to yield processed microbatches.
 
@@ -95,9 +96,6 @@ def make_processed_microbatch_iterator(
         ProcessedMicrobatch objects containing processed tensors ready for model forward
     """
     pack_sequences = cfg["sequence_packing"]["enabled"]
-    delegate_pack_to_model = cfg["sequence_packing"].get(
-        "delegate_pack_to_model", False
-    )
 
     for data_dict in raw_iterator:
         # Move to GPU
@@ -132,6 +130,7 @@ def get_microbatch_iterator(
     mbs: int,
     straggler_timer: StragglerDetector,
     seq_length_key: Optional[str] = None,
+    delegate_pack_to_model: bool = False,
 ) -> Tuple[Iterator[ProcessedMicrobatch], int, int, int, int]:
     """Create a processed microbatch iterator from a batch of data.
 
@@ -195,6 +194,7 @@ def get_microbatch_iterator(
         pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
         pad_full_seq_to=pad_full_seq_to,
         straggler_timer=straggler_timer,
+        delegate_pack_to_model=delegate_pack_to_model,
     )
 
     # Compute padded sequence length for pipeline parallelism
@@ -427,7 +427,7 @@ def _prepare_vlm_batch_for_megatron(
         lengths_list = seq_lengths.tolist()
     else:
         lengths_list = list(seq_lengths)
-    padded_lens = [((L + align - 1) // align) * align for L in lengths_list]
+    padded_lens = [_round_up_to_multiple(L, align) for L in lengths_list]
 
     # PP>1: force sum(padded_lens) to a fixed value so every microbatch produces
     # the same decoder-side packed length. We mirror _pack_sequences_for_megatron
@@ -487,19 +487,13 @@ def _prepare_vlm_batch_for_megatron(
     )
 
     # Packed (unsharded) view for downstream logprob / loss code that slices
-    # per-sequence targets via cu_seqlens_padded. If all sequences are already
-    # padded to the same length (common case: input_ids_2d columns == padded_max
-    # and every padded_len == padded_max), we can reshape instead of Python-
-    # loop + cat, which avoids B separate GPU slice ops.
-    if padded_lens and all(p == padded_max for p in padded_lens):
-        packed_input_ids = input_ids_2d.reshape(1, -1)
-    else:
-        packed_segments = [input_ids_2d[i, :p] for i, p in enumerate(padded_lens)]
-        packed_input_ids = (
-            torch.cat(packed_segments, dim=0).unsqueeze(0)
-            if packed_segments
-            else input_ids_2d.new_zeros((1, 0))
-        )
+    # per-sequence targets via cu_seqlens_padded.
+    packed_segments = [input_ids_2d[i, :p] for i, p in enumerate(padded_lens)]
+    packed_input_ids = (
+        torch.cat(packed_segments, dim=0).unsqueeze(0)
+        if packed_segments
+        else input_ids_2d.new_zeros((1, 0))
+    )
 
     # input_ids_cp_sharded keeps the [B, max_seq] layout: the model (mbridge
     # Qwen3VL) runs its own preprocess_packed_seqs to pack + CP-shard.

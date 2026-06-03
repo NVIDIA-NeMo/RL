@@ -96,6 +96,29 @@ from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
+def _model_self_packs_for_cp(model: Any) -> bool:
+    """Whether the model packs sequences + CP-shards inside its own forward.
+
+    Such models (mbridge VLM wrappers) call ``preprocess_packed_seqs`` in their
+    forward, so NeMo-RL must hand them an unpacked ``[B, S]`` batch instead of
+    pre-packing + CP-sharding itself. The only such model today is mbridge's
+    Qwen3VL, which is also the only mbridge VLM that supports context
+    parallelism; classic mcore GPTModel and other VLMs do not self-pack.
+    """
+    try:
+        from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import (
+            Qwen3VLModel,
+        )
+    except ImportError:
+        return False
+
+    from megatron.core.utils import unwrap_model
+
+    unwrapped = unwrap_model(model)
+    chunks = unwrapped if isinstance(unwrapped, (list, tuple)) else [unwrapped]
+    return any(isinstance(chunk, Qwen3VLModel) for chunk in chunks)
+
+
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
 class MegatronPolicyWorkerImpl(
@@ -296,6 +319,11 @@ class MegatronPolicyWorkerImpl(
             self.optimizer,
         )
 
+        # Whether the model packs sequences + CP-shards inside its own forward
+        # (mbridge VLM wrappers like Qwen3VL). If so, NeMo-RL must hand it an
+        # unpacked [B, S] batch rather than pre-packing + CP-sharding itself.
+        self.delegate_pack_to_model = _model_self_packs_for_cp(self.model)
+
         # vars used for refit
         ## will be initialized in prepare_refit_info
         # refit_param_info_mcore combines the conversion tasks with the param memory
@@ -387,6 +415,7 @@ class MegatronPolicyWorkerImpl(
                     self.cfg,
                     mbs,
                     straggler_timer=self.mcore_state.straggler_timer,
+                    delegate_pack_to_model=self.delegate_pack_to_model,
                 )
                 # Track total microbatches for MoE aux-loss averaging
                 total_num_microbatches += int(num_microbatches)
@@ -566,6 +595,7 @@ class MegatronPolicyWorkerImpl(
             self.cfg,
             logprob_batch_size,
             straggler_timer=self.mcore_state.straggler_timer,
+            delegate_pack_to_model=self.delegate_pack_to_model,
         )
 
         use_linear_ce_fusion = self.cfg["megatron_cfg"].get(
@@ -770,6 +800,7 @@ class MegatronPolicyWorkerImpl(
             self.cfg,
             logprob_batch_size,
             straggler_timer=self.mcore_state.straggler_timer,
+            delegate_pack_to_model=self.delegate_pack_to_model,
         )
 
         list_of_outputs = megatron_forward_backward(
