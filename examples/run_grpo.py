@@ -134,6 +134,7 @@ def main() -> None:
         policy,
         policy_generation,
         cluster,
+        weight_sync,
         dataloader,
         val_dataloader,
         loss_fn,
@@ -199,6 +200,7 @@ def main() -> None:
             grpo_save_state=grpo_state,
             master_config=master_config,
             max_trajectory_age_steps=async_config["max_trajectory_age_steps"],
+            weight_sync=weight_sync,
         )
     else:
         # Two parallel synchronous trainers (verl-style — main_ppo.py vs
@@ -217,6 +219,7 @@ def main() -> None:
             checkpointer,
             grpo_state,
             master_config,
+            weight_sync=weight_sync,
         )
 
 

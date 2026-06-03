@@ -26,7 +26,6 @@ from omegaconf import OmegaConf
 from wandb import Table
 
 from nemo_rl.algorithms.grpo import (
-    ColocatablePolicyInterface,
     EnvironmentInterface,
     GenerationInterface,
     Logger,
@@ -71,7 +70,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
 
 # These types are directly imported from grpo_train since if something about the architecture changes we want to immediately fail.
 def collect_trajectories(
-    policy: ColocatablePolicyInterface,
+    policy,
     policy_generation: GenerationInterface,
     val_dataloader: StatefulDataLoader,
     tokenizer: TokenizerType,
@@ -196,6 +195,7 @@ The validation set you pass in will directly be used for validation with no addi
         policy,
         policy_generation,
         cluster,
+        weight_sync,
         dataloader,
         val_dataloader,
         loss_fn,
@@ -282,6 +282,7 @@ The validation set you pass in will directly be used for validation with no addi
             grpo_save_state=grpo_state,
             master_config=master_config,
             max_trajectory_age_steps=async_config["max_trajectory_age_steps"],
+            weight_sync=weight_sync,
         )
     else:
         print("🚀 Running synchronous GRPO training")
@@ -300,6 +301,7 @@ The validation set you pass in will directly be used for validation with no addi
             checkpointer,
             grpo_state,
             master_config,
+            weight_sync=weight_sync,
         )
 
 

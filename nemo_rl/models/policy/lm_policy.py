@@ -40,8 +40,8 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
-    ColocatablePolicyInterface,
     LogprobOutputSpec,
+    PolicyTrainerInterface,
     ReferenceLogprobOutputSpec,
     ScoreOutputSpec,
     TopkLogitsOutputSpec,
@@ -58,7 +58,7 @@ from nemo_rl.utils.timer import Timer
 PathLike = Union[str, "os.PathLike[Any]"]
 
 
-class Policy(ColocatablePolicyInterface, GenerationInterface):
+class Policy(PolicyTrainerInterface, GenerationInterface):
     def __init__(
         self,
         cluster: RayVirtualCluster,
@@ -779,14 +779,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data("prepare_for_training")
         ray.get(futures)
 
-    def prepare_for_lp_inference(self, *args: Any, **kwargs: Any) -> None:
-        futures = self.worker_group.run_all_workers_single_data(
-            "prepare_for_lp_inference"
-        )
-        ray.get(futures)
-
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
-        # We don't need to do anything here
         return True
 
     def invalidate_kv_cache(self, *args: Any, **kwargs: Any) -> bool:
@@ -805,8 +798,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         return results[0]
 
     def finish_training(self, *args: Any, **kwargs: Any) -> None:
-        # Placeholder implementation
-        pass
+        futures = self.worker_group.run_all_workers_single_data(
+            "finish_training", **kwargs
+        )
+        ray.get(futures)
 
     def calibrate_qkv_fp8_scales(
         self,
@@ -914,15 +909,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # this function should co-work with vllm, so we should wait for all futures to complete outside
         return futures
 
-    def offload_before_refit(self) -> None:
-        """Offload the optimizer and buffers to the CPU."""
-        futures = self.worker_group.run_all_workers_single_data("offload_before_refit")
-        ray.get(futures)
-
-    def offload_after_refit(self) -> None:
-        """Offload the optimizer and buffers to the CPU."""
-        futures = self.worker_group.run_all_workers_single_data("offload_after_refit")
-        ray.get(futures)
 
     def save_checkpoint(
         self,

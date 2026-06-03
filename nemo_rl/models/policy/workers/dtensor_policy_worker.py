@@ -77,8 +77,8 @@ from nemo_rl.models.huggingface.common import (
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
-    ColocatablePolicyInterface,
     LogprobOutputSpec,
+    OffloadMode,
     ScoreOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
@@ -1894,37 +1894,14 @@ class DTensorPolicyWorkerImpl(
         if self.cpu_offload:
             self.model = self.move_to_cpu(self.model)
 
-    @wrap_with_nvtx_name("dtensor_policy_worker/prepare_for_lp_inference")
-    def prepare_for_lp_inference(self) -> None:
-        # onload model to cuda
-        if not self.cpu_offload:
-            self.move_to_cuda(self.model)
-        else:
-            self.model = self.move_buffer_to_device(self.model, "cuda")
-
-        self.model.eval()
-
-        # offload optimizer to cpu
-        torch.randn(1).cuda()  # wake up torch allocator
-        if self.optimizer is not None and self.offload_optimizer_for_logprob:
-            self.move_optimizer_to_device("cpu")
-
-        gc.collect()
-        torch.cuda.empty_cache()
-
     @wrap_with_nvtx_name("dtensor_policy_worker/prepare_for_training")
     def prepare_for_training(self, *args, **kwargs) -> None:
-        # onload models and optimizer state to cuda
         if not self.cpu_offload:
             self.move_to_cuda(self.model)
         else:
-            # when cpu offload is enabled, the buffers do not get moved
-            # to cuda automatically, so we need to do that manually
             self.model = self.move_buffer_to_device(self.model, "cuda")
 
         self.model.train()
-        # Move optimizer state to CUDA if it exists
-        # colocated generation will always offload optimizer to cuda before refit
         if (
             self.optimizer is not None
             and not self.cpu_offload
@@ -1935,31 +1912,56 @@ class DTensorPolicyWorkerImpl(
         torch.cuda.empty_cache()
 
     @torch.no_grad()
-    @wrap_with_nvtx_name("dtensor_policy_worker/offload_before_refit")
-    def offload_before_refit(self) -> None:
-        """Offload the optimizer to the CPU."""
-        torch.randn(1).cuda()  # wake up torch allocator
-        if self.optimizer is not None:
-            self.move_optimizer_to_device("cpu")
+    @wrap_with_nvtx_name("dtensor_policy_worker/finish_training")
+    def finish_training(self, *args, **kwargs) -> None:
+        offload_mode = kwargs.get("offload_mode", OffloadMode.FULL)
 
-        gc.collect()
-        torch.cuda.empty_cache()
+        if offload_mode == OffloadMode.EVAL_ONLY:
+            if not self.cpu_offload:
+                self.move_to_cuda(self.model)
+            else:
+                self.model = self.move_buffer_to_device(self.model, "cuda")
+            self.model.eval()
+            torch.randn(1).cuda()
+            if self.optimizer is not None and self.offload_optimizer_for_logprob:
+                self.move_optimizer_to_device("cpu")
+            gc.collect()
+            torch.cuda.empty_cache()
+        elif offload_mode == OffloadMode.OPTIMIZER_ONLY:
+            if not self.is_generation_colocated:
+                return
+            torch.randn(1).cuda()
+            if self.optimizer is not None:
+                self.move_optimizer_to_device("cpu")
+            gc.collect()
+            torch.cuda.empty_cache()
+        else:
+            if self.is_generation_colocated:
+                self.model = self.move_to_cpu(self.model)
+                self.model.eval()
+                torch.randn(1).cuda()
+                if self.optimizer is not None:
+                    self.move_optimizer_to_device("cpu")
+                gc.collect()
+                torch.cuda.empty_cache()
 
-    @torch.no_grad()
-    @wrap_with_nvtx_name("dtensor_policy_worker/offload_after_refit")
-    def offload_after_refit(self) -> None:
-        """Offload as much as possible on the CPU."""
-        self.model = self.move_to_cpu(self.model)
-        self.model.eval()
-        torch.randn(1).cuda()  # wake up torch allocator
-        self.offload_before_refit()  # rerun the old offload function
-
-        # Print memory stats after offloading
-        allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
-        reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
-        print(
-            f"GPU Memory after optimizer offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
-        )
+                allocated = torch.cuda.memory_allocated() / (1024**3)
+                reserved = torch.cuda.memory_reserved() / (1024**3)
+                print(
+                    f"GPU Memory after finish_training (colocated): "
+                    f"{allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
+                )
+            else:
+                if not self.cpu_offload:
+                    self.move_to_cuda(self.model)
+                else:
+                    self.model = self.move_buffer_to_device(self.model, "cuda")
+                self.model.eval()
+                torch.randn(1).cuda()
+                if self.optimizer is not None and self.offload_optimizer_for_logprob:
+                    self.move_optimizer_to_device("cpu")
+                gc.collect()
+                torch.cuda.empty_cache()
 
     def move_optimizer_to_device(self, device: str | torch.device) -> None:
         for state in self.optimizer.state.values():

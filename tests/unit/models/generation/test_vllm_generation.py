@@ -810,7 +810,9 @@ async def run_hf_train_process(
             }
         )
         # Get logprobs from HF policy
-        lm_policy.prepare_for_lp_inference()
+        from nemo_rl.models.policy.interfaces import OffloadMode
+
+        lm_policy.finish_training(offload_mode=OffloadMode.EVAL_ONLY)
         fprop_results = lm_policy.get_logprobs(fprop_logprob_data)
         # Zero out logprobs for input tokens
 
@@ -1801,7 +1803,9 @@ def test_vllm_weight_update_memory(cluster, tokenizer, train_backend):
 
     print("refitting vllm policy...")
     # take it outside statistics to get clean peak memory during refit
-    lm_policy.offload_before_refit()
+    from nemo_rl.models.policy.interfaces import OffloadMode
+
+    lm_policy.finish_training(offload_mode=OffloadMode.OPTIMIZER_ONLY)
     # reset peak memory stats before refit
     workers = lm_policy.worker_group.workers
     ray.get([w.reset_peak_memory_stats.remote() for w in workers])
@@ -2198,7 +2202,6 @@ def test_vllm_generation_with_megatron_training(
         print(f"Training loss: {results['loss']}")
 
         megatron_policy.finish_training()
-        megatron_policy.offload_after_refit()
 
         # Step 4: Use vLLM for generation again
         print("Using vLLM for generation again...")
@@ -2360,7 +2363,6 @@ def test_vllm_generation_with_megatron_training_moe_model(
         print(f"Training loss: {results['loss']}")
 
         megatron_policy.finish_training()
-        megatron_policy.offload_after_refit()
 
         # Step 4: Use vLLM for generation again
         print("Using vLLM for generation again...")
@@ -2425,7 +2427,9 @@ def test_vllm_megatron_weight_update_memory(cluster, tokenizer):
 
     print("Refitting vLLM policy with Megatron...")
     # Take it outside statistics to get clean peak memory during refit
-    megatron_policy.offload_before_refit()
+    from nemo_rl.models.policy.interfaces import OffloadMode
+
+    megatron_policy.finish_training(offload_mode=OffloadMode.OPTIMIZER_ONLY)
     # Reset peak memory stats before refit
     workers = megatron_policy.worker_group.workers
     ray.get([w.reset_peak_memory_stats.remote() for w in workers])

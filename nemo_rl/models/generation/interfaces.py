@@ -220,7 +220,7 @@ class GenerationOutputSpec(TypedDict):
 
 
 class GenerationInterface(ABC):
-    """Abstract base class defining the interface for RL policies."""
+    """Abstract base class defining the interface for generation backends."""
 
     @abstractmethod
     def init_collective(
@@ -237,10 +237,12 @@ class GenerationInterface(ABC):
 
     @abstractmethod
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
+        """Transition to generation phase. Load weights, allocate KV cache, etc."""
         pass
 
     @abstractmethod
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
+        """Transition out of generation phase. Free GPU resources for training."""
         pass
 
     @property

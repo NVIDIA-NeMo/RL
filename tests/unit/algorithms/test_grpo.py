@@ -1329,6 +1329,10 @@ def test_setup_sglang_sets_model_path_and_parallel_flag(
         "SGLangGeneration",
         lambda *_args, **_kwargs: DummySGLangGeneration(),
     )
+    mock_weight_sync = MagicMock()
+    monkeypatch.setattr(
+        grpo_mod, "create_weight_synchronizer", lambda **_kwargs: mock_weight_sync
+    )
     monkeypatch.setattr(grpo_mod.ray, "get", lambda x: x)
 
     generation_resources = {
@@ -1414,12 +1418,13 @@ def test_setup_sglang_sets_model_path_and_parallel_flag(
 def test_refit_policy_generation_sglang_colocated_http(monkeypatch):
     from nemo_rl.algorithms import grpo as grpo_mod
 
+    from nemo_rl.models.policy.interfaces import OffloadMode
+
     calls = {
         "prepare_for_generation_tags": [],
         "invalidate_kv_cache": 0,
         "stream_weights_via_http": [],
-        "offload_before_refit": 0,
-        "offload_after_refit": 0,
+        "finish_training_modes": [],
     }
 
     class DummySGLangGeneration:
@@ -1434,11 +1439,10 @@ def test_refit_policy_generation_sglang_colocated_http(monkeypatch):
             return True
 
     class DummyPolicy:
-        def offload_before_refit(self):
-            calls["offload_before_refit"] += 1
-
-        def offload_after_refit(self):
-            calls["offload_after_refit"] += 1
+        def finish_training(self, **kwargs):
+            calls["finish_training_modes"].append(
+                kwargs.get("offload_mode", OffloadMode.FULL)
+            )
 
         def get_free_memory_bytes(self):
             return 1024 * 1024 * 1024
@@ -1456,8 +1460,10 @@ def test_refit_policy_generation_sglang_colocated_http(monkeypatch):
         colocated_inference=True,
     )
 
-    assert calls["offload_before_refit"] == 1
-    assert calls["offload_after_refit"] == 1
+    assert calls["finish_training_modes"] == [
+        OffloadMode.OPTIMIZER_ONLY,
+        OffloadMode.FULL,
+    ]
     assert calls["invalidate_kv_cache"] == 1
     assert calls["stream_weights_via_http"] == [
         {"http://localhost:12345": ["gpu-uuid-0"]}
@@ -1568,6 +1574,9 @@ def test_grpo_train_collects_generation_logger_and_seq_metrics(
     master_config.grpo["val_at_start"] = False
     master_config.grpo["use_dynamic_sampling"] = False
 
+    mock_weight_sync = MagicMock()
+    mock_weight_sync.is_stale = True
+
     grpo_mod.grpo_train(
         mock_grpo_components["policy"],
         policy_generation,
@@ -1581,8 +1590,10 @@ def test_grpo_train_collects_generation_logger_and_seq_metrics(
         mock_grpo_components["checkpointer"],
         _default_grpo_save_state(),
         master_config,
+        weight_sync=mock_weight_sync,
     )
 
+    assert mock_weight_sync.sync_weights.called
     assert policy_generation.clear_logger_metrics.called
     assert policy_generation.get_logger_metrics.called
     train_metrics = _logged_train_metrics_with_key(

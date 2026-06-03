@@ -24,8 +24,8 @@ Lifecycle per sync:
      generation.update_weights_from_collective()  -- receive via NCCL
   2. Verify transfer success
 
-No offload/restore steps are needed since policy and generation run on
-separate GPUs with dedicated memory.
+No finish_training()/prepare_for_training() calls are needed since policy
+and generation run on separate GPUs with dedicated memory.
 """
 
 from contextlib import nullcontext
@@ -44,7 +44,7 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
     synchronized via NCCL broadcast over a pre-established process group.
 
     Args:
-        policy: Policy object implementing ColocatablePolicyInterface.
+        policy: Policy object implementing PolicyTrainerInterface.
         generation: Generation object implementing GenerationInterface.
         train_cluster: RayVirtualCluster for the training workers, used to
             obtain the master address/port and world size for collective init.
