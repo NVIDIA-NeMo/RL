@@ -1982,8 +1982,8 @@ def grpo_train(
                     del baseline_for_log
 
                     # Clip advantages to prevent extreme values from small std normalization
-                    clip_low = master_config["grpo"].get("advantage_clip_low")
-                    clip_high = master_config["grpo"].get("advantage_clip_high")
+                    clip_low = master_config.grpo.get("advantage_clip_low", None)
+                    clip_high = master_config.grpo.get("advantage_clip_high", None)
                     if clip_low is not None:
                         train_data["advantages"] = train_data["advantages"].clamp(min=clip_low)
                     if clip_high is not None:
@@ -2971,7 +2971,7 @@ def async_grpo_train(
                 with timer.time("data_processing"):
                     # Apply overlong filtering - mask out truncated sequences from loss computation
                     with timer.time("overlong_filter"):
-                        use_overlong_filtering = master_config["grpo"]["overlong_filtering"]
+                        use_overlong_filtering = master_config.grpo.get("overlong_filtering", False)
                         if use_overlong_filtering:
                             loss_multiplier = repeated_batch["loss_multiplier"].clone()
                             truncated = repeated_batch["truncated"]
@@ -3127,8 +3127,8 @@ def async_grpo_train(
                     )
 
                     # Clip advantages to prevent extreme values from small std normalization
-                    clip_low = master_config["grpo"].get("advantage_clip_low")
-                    clip_high = master_config["grpo"].get("advantage_clip_high")
+                    clip_low = master_config.grpo.get("advantage_clip_low", None)
+                    clip_high = master_config.grpo.get("advantage_clip_high", None)
                     if clip_low is not None:
                         train_data["advantages"] = train_data["advantages"].clamp(min=clip_low)
                     if clip_high is not None:
