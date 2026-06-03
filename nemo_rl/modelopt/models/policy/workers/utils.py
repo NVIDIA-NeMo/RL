@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import functools
 import os
 from pathlib import Path
 
@@ -163,19 +164,15 @@ def get_modelopt_checkpoint_dir() -> str:
     return modelopt_checkpoint_dir
 
 
-def quantization_layer_spec(config):
-    """Layer specification for quantization with ModelOpt.
+def get_quantization_layer_spec():
+    """Build the ModelOpt quantization transformer-layer spec as a portable target.
 
-    We need to disable arbitrary attention mask for sequence packing.
+    Returns `partial` function to allow Megatron-Bridge's allowlist to accept the layer spec.
     """
-    disable_modelopt_layer_spec = int(
-        os.environ.get("DISABLE_MODELOPT_LAYER_SPEC", "0")
-    )
-    if disable_modelopt_layer_spec:
-        return transformer_engine_layer_spec(config)
-    print("Using quantization_layer_spec without arbitrary attention mask")
-    return get_gpt_modelopt_spec(
-        config=config,
+    if int(os.environ.get("DISABLE_MODELOPT_LAYER_SPEC", "0")):
+        return transformer_engine_layer_spec
+    return functools.partial(
+        get_gpt_modelopt_spec,
         local_core_attention=False,
         remap_te_layernorm=True,
         real_quant_cfg="None",
