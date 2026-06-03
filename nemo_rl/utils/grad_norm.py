@@ -26,10 +26,10 @@ When fine-tuning on data that includes these tokens the near-zero embeddings pro
 large loss signals and gradient spikes that can destabilize training.
 
 To diagnose, inspect the checkpoint embeddings:
-    uv run tools/reinit_hf_embeddings.py --input <checkpoint_dir> --stats-only
+    uv run tools/model_diagnostics/3.check_and_reinit_hf_model_embeddings_untrained.py --input <checkpoint_dir> --stats-only
 
 If near-zero embeddings are found, reinitialize them before fine-tuning:
-    uv run tools/reinit_hf_embeddings.py --input <checkpoint_dir> --output <output_dir>
+    uv run tools/model_diagnostics/3.check_and_reinit_hf_model_embeddings_untrained.py --input <checkpoint_dir> --output <output_dir>
 """.strip()
 
 

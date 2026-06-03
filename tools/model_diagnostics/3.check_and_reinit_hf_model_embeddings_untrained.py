@@ -31,33 +31,33 @@ unchanged.
 
 Usage:
     # Inspect only (no writes):
-    uv run tools/reinit_hf_embeddings.py \
+    uv run tools/model_diagnostics/3.check_and_reinit_hf_model_embeddings_untrained.py \
         --input  /path/to/hf_checkpoint \
         --dry-run
 
     # Write patched checkpoint to a new directory:
-    uv run tools/reinit_hf_embeddings.py \
+    uv run tools/model_diagnostics/3.check_and_reinit_hf_model_embeddings_untrained.py \
         --input  /path/to/hf_checkpoint \
         --output /path/to/patched_checkpoint
 
     # Patch in-place (overwrites the source shard files):
-    uv run tools/reinit_hf_embeddings.py \
+    uv run tools/model_diagnostics/3.check_and_reinit_hf_model_embeddings_untrained.py \
         --input  /path/to/hf_checkpoint \
         --in-place
 
     # Use a custom norm threshold and seed:
-    uv run tools/reinit_hf_embeddings.py \
+    uv run tools/model_diagnostics/3.check_and_reinit_hf_model_embeddings_untrained.py \
         --input  /path/to/hf_checkpoint \
         --output /path/to/patched_checkpoint \
         --threshold 1e-2 --seed 42
 
     # Inspect embedding health without modifying anything:
-    uv run tools/reinit_hf_embeddings.py \
+    uv run tools/model_diagnostics/3.check_and_reinit_hf_model_embeddings_untrained.py \
         --input  /path/to/hf_checkpoint \
         --stats-only
 
     # Pass a Hub model ID directly (downloads to the HF cache automatically):
-    uv run tools/reinit_hf_embeddings.py \
+    uv run tools/model_diagnostics/3.check_and_reinit_hf_model_embeddings_untrained.py \
         --input  nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-Base-BF16 \
         --output /path/to/patched_checkpoint
 """
