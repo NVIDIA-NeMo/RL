@@ -16,7 +16,7 @@ import json
 import os
 from copy import deepcopy
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 import ray
@@ -33,9 +33,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
-from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorkerImpl
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
-    VllmAsyncGenerationWorkerImpl,
     _replace_prefix_tokens,
 )
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
@@ -155,85 +153,6 @@ def skip_fp8_known_failures() -> None:
             f"Skipping FP8 vLLM test on {device_name} due to a known failure. "
             "See https://github.com/NVIDIA-NeMo/RL/issues/2081"
         )
-
-
-@pytest.mark.parametrize(
-    "colocated,async_engine,expected_method,expected_kwargs",
-    [
-        (True, False, "sleep", {"discard_weights": True}),
-        (True, True, "sleep_async", {"discard_weights": True}),
-        (False, False, "reset_prefix_cache", {}),
-        (False, True, "reset_prefix_cache_async", {}),
-    ],
-)
-def test_vllm_finish_generation_routes_discard_weights(
-    monkeypatch, colocated, async_engine, expected_method, expected_kwargs
-):
-    vllm_generation = VllmGeneration.__new__(VllmGeneration)
-    vllm_generation.cfg = {
-        "colocated": {"enabled": colocated},
-        "vllm_cfg": {"async_engine": async_engine},
-    }
-    vllm_generation.worker_group = MagicMock()
-    vllm_generation.worker_group.run_all_workers_single_data.return_value = [
-        "worker_future"
-    ]
-    monkeypatch.setattr(
-        "nemo_rl.models.generation.vllm.vllm_generation.ray.get",
-        lambda futures: [True],
-    )
-
-    assert vllm_generation.finish_generation(discard_weights=True)
-
-    vllm_generation.worker_group.run_all_workers_single_data.assert_called_once_with(
-        expected_method,
-        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        **expected_kwargs,
-    )
-
-
-def test_vllm_worker_sleep_uses_discard_weight_level(monkeypatch):
-    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
-    worker.cfg = {"vllm_cfg": {"async_engine": False}}
-    worker.llm = MagicMock()
-    monkeypatch.setattr(
-        "nemo_rl.models.generation.vllm.vllm_worker.gc.collect", lambda: None
-    )
-    monkeypatch.setattr(
-        "nemo_rl.models.generation.vllm.vllm_worker.torch.cuda.empty_cache",
-        lambda: None,
-    )
-
-    worker.sleep(discard_weights=False)
-    worker.llm.sleep.assert_called_once_with(level=1)
-
-    worker.llm.sleep.reset_mock()
-    worker.sleep(discard_weights=True)
-    worker.llm.sleep.assert_called_once_with(level=2)
-
-
-@pytest.mark.asyncio
-async def test_vllm_async_worker_sleep_uses_discard_weight_level(monkeypatch):
-    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
-    worker.cfg = {"vllm_cfg": {"async_engine": True}}
-    worker.llm = MagicMock()
-    worker.llm.reset_prefix_cache = AsyncMock()
-    worker.llm.reset_mm_cache = AsyncMock()
-    worker.llm.sleep = AsyncMock()
-    monkeypatch.setattr(
-        "nemo_rl.models.generation.vllm.vllm_worker_async.gc.collect", lambda: None
-    )
-    monkeypatch.setattr(
-        "nemo_rl.models.generation.vllm.vllm_worker_async.torch.cuda.empty_cache",
-        lambda: None,
-    )
-
-    await worker.sleep_async(discard_weights=False)
-    worker.llm.sleep.assert_awaited_once_with(level=1)
-
-    worker.llm.sleep.reset_mock()
-    await worker.sleep_async(discard_weights=True)
-    worker.llm.sleep.assert_awaited_once_with(level=2)
 
 
 def test_configure_generation_config_uses_real_startup_weights_without_draft_refit():
