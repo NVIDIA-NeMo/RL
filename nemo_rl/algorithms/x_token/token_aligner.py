@@ -44,44 +44,127 @@ import torch
 # emojis / non-ASCII bytes). Copied from the PT reference verbatim — these
 # constants are content-coupled to the tokenizers we align across.
 VISUAL_BYTE_MAP = {
-    "ð": 240, "Ɩ": 241, "Ɨ": 242, "Ƙ": 243, "ƙ": 244, "ƚ": 245, "ƛ": 246, "Ɯ": 247,
-    "Ɲ": 248, "ƞ": 249, "Ɵ": 250, "Ơ": 251, "ơ": 252, "Ƣ": 253, "ƣ": 254, "Ƥ": 255,
-    "Ł": 156, "ł": 157, "Ń": 158, "ń": 159, "ĺ": 149, "Ļ": 150, "ļ": 151, "Ľ": 152,
-    "ľ": 153, "Ŀ": 154, "ŀ": 155, "Ĭ": 135, "ĭ": 136, "Į": 137, "į": 138, "İ": 139,
-    "ı": 140, "Ĳ": 141, "ĳ": 142, "Ĵ": 143, "ĵ": 144, "Ķ": 145, "ķ": 146, "ĸ": 147,
-    "Ĺ": 148, "ĥ": 128, "Ħ": 129, "ħ": 130, "Ĩ": 131, "ĩ": 132, "Ī": 133, "ī": 134,
-    "Ģ": 162, "ģ": 163, "Ĝ": 28, "ĝ": 29, "Ğ": 30, "ğ": 31,
+    "ð": 240,
+    "Ɩ": 241,
+    "Ɨ": 242,
+    "Ƙ": 243,
+    "ƙ": 244,
+    "ƚ": 245,
+    "ƛ": 246,
+    "Ɯ": 247,
+    "Ɲ": 248,
+    "ƞ": 249,
+    "Ɵ": 250,
+    "Ơ": 251,
+    "ơ": 252,
+    "Ƣ": 253,
+    "ƣ": 254,
+    "Ƥ": 255,
+    "Ł": 156,
+    "ł": 157,
+    "Ń": 158,
+    "ń": 159,
+    "ĺ": 149,
+    "Ļ": 150,
+    "ļ": 151,
+    "Ľ": 152,
+    "ľ": 153,
+    "Ŀ": 154,
+    "ŀ": 155,
+    "Ĭ": 135,
+    "ĭ": 136,
+    "Į": 137,
+    "į": 138,
+    "İ": 139,
+    "ı": 140,
+    "Ĳ": 141,
+    "ĳ": 142,
+    "Ĵ": 143,
+    "ĵ": 144,
+    "Ķ": 145,
+    "ķ": 146,
+    "ĸ": 147,
+    "Ĺ": 148,
+    "ĥ": 128,
+    "Ħ": 129,
+    "ħ": 130,
+    "Ĩ": 131,
+    "ĩ": 132,
+    "Ī": 133,
+    "ī": 134,
+    "Ģ": 162,
+    "ģ": 163,
+    "Ĝ": 28,
+    "ĝ": 29,
+    "Ğ": 30,
+    "ğ": 31,
 }
 
 # Multi-token encoding artifacts (mojibake patterns) where the broken byte
 # sequence spans tokens. Patterns are checked left-to-right with the first
 # match wins. From PT reference; trimmed to the high-frequency entries.
 _MULTI_TOKEN_ARTIFACT_FIXES = [
-    (["ĠâĪ", "ĳ"], ["Ġ∑"]), (["âĪ", "ĳ"], ["∑"]),
-    (["ĠâĪ", "ı"], ["Ġ∏"]), (["âĪ", "ı"], ["∏"]),
-    (["ĠâĪ", "Ĥ"], ["Ġ∂"]), (["âĪ", "Ĥ"], ["∂"]),
-    (["ĠâĪ", "ĩ"], ["Ġ∇"]), (["âĪ", "ĩ"], ["∇"]),
-    (["ĠâĪ", "ŀ"], ["Ġ∞"]), (["âĪ", "ŀ"], ["∞"]),
-    (["ĠâĪ", "ļ"], ["Ġ√"]), (["âĪ", "ļ"], ["√"]),
-    (["ĠâĪ", "«"], ["Ġ∫"]), (["âĪ", "«"], ["∫"]),
-    (["Ġâī", "ł"], ["Ġ≠"]), (["âī", "ł"], ["≠"]),
-    (["Ġä¸", "Ń"], ["Ġ中"]), (["ä¸", "Ń"], ["中"]),
-    (["æĸ", "ĩ"], ["文"]), (["Ġæĸ", "ĩ"], ["Ġ文"]),
+    (["ĠâĪ", "ĳ"], ["Ġ∑"]),
+    (["âĪ", "ĳ"], ["∑"]),
+    (["ĠâĪ", "ı"], ["Ġ∏"]),
+    (["âĪ", "ı"], ["∏"]),
+    (["ĠâĪ", "Ĥ"], ["Ġ∂"]),
+    (["âĪ", "Ĥ"], ["∂"]),
+    (["ĠâĪ", "ĩ"], ["Ġ∇"]),
+    (["âĪ", "ĩ"], ["∇"]),
+    (["ĠâĪ", "ŀ"], ["Ġ∞"]),
+    (["âĪ", "ŀ"], ["∞"]),
+    (["ĠâĪ", "ļ"], ["Ġ√"]),
+    (["âĪ", "ļ"], ["√"]),
+    (["ĠâĪ", "«"], ["Ġ∫"]),
+    (["âĪ", "«"], ["∫"]),
+    (["Ġâī", "ł"], ["Ġ≠"]),
+    (["âī", "ł"], ["≠"]),
+    (["Ġä¸", "Ń"], ["Ġ中"]),
+    (["ä¸", "Ń"], ["中"]),
+    (["æĸ", "ĩ"], ["文"]),
+    (["Ġæĸ", "ĩ"], ["Ġ文"]),
 ]
 
 # Per-token canonicalizations applied after multi-token artifact fixes.
 _UNICODE_FIXES = {
-    "Ã±": "ñ", "Ã¡": "á", "Ã©": "é", "Ã­": "í", "Ã³": "ó", "Ãº": "ú",
-    "Ã": "À", "Ã¢": "â", "Ã§": "ç",
-    "Ã¨": "è", "Ã«": "ë", "Ã®": "î", "Ã´": "ô",
-    "Ã¹": "ù", "Ã»": "û", "Ã¿": "ÿ",
-    "ä¸Ń": "中", "æĸĩ": "文", "æĹ¥æľ¬": "日本", "èªŀ": "語",
-    "ÐłÑĥÑģ": "Рус", "ÑģÐºÐ¸Ð¹": "ский",
+    "Ã±": "ñ",
+    "Ã¡": "á",
+    "Ã©": "é",
+    "Ã­": "í",
+    "Ã³": "ó",
+    "Ãº": "ú",
+    "Ã": "À",
+    "Ã¢": "â",
+    "Ã§": "ç",
+    "Ã¨": "è",
+    "Ã«": "ë",
+    "Ã®": "î",
+    "Ã´": "ô",
+    "Ã¹": "ù",
+    "Ã»": "û",
+    "Ã¿": "ÿ",
+    "ä¸Ń": "中",
+    "æĸĩ": "文",
+    "æĹ¥æľ¬": "日本",
+    "èªŀ": "語",
+    "ÐłÑĥÑģ": "Рус",
+    "ÑģÐºÐ¸Ð¹": "ский",
     "Ø§ÙĦØ¹Ø±Ø¨ÙĬØ©": "العربية",
-    "à¤¹": "ह", "à¤¿à¤Ĥ": "हिं", "à¤¦à¥Ģ": "दी",
-    "âĪĳ": "∑", "âĪı": "∏", "âĪĤ": "∂", "âĪĩ": "∇",
-    "âĪŀ": "∞", "âĪļ": "√", "âĪ«": "∫", "âīĪ": "≈",
-    "âīł": "≠", "âī¤": "≤", "âī¥": "≥",
+    "à¤¹": "ह",
+    "à¤¿à¤Ĥ": "हिं",
+    "à¤¦à¥Ģ": "दी",
+    "âĪĳ": "∑",
+    "âĪı": "∏",
+    "âĪĤ": "∂",
+    "âĪĩ": "∇",
+    "âĪŀ": "∞",
+    "âĪļ": "√",
+    "âĪ«": "∫",
+    "âīĪ": "≈",
+    "âīł": "≠",
+    "âī¤": "≤",
+    "âī¥": "≥",
 }
 
 _SPECIAL_TOKEN_MAP = {
@@ -403,7 +486,10 @@ class TokenAligner:
                 for j, t in enumerate(teacher_tokens):
                     teacher_counts.setdefault(t, []).append(j)
                 for token in student_counts.keys() & teacher_counts.keys():
-                    if len(student_counts[token]) == 1 and len(teacher_counts[token]) == 1:
+                    if (
+                        len(student_counts[token]) == 1
+                        and len(teacher_counts[token]) == 1
+                    ):
                         all_potential_anchors.append(
                             (student_counts[token][0], teacher_counts[token][0], 1)
                         )
@@ -411,17 +497,25 @@ class TokenAligner:
                 student_ngrams: dict[Tuple[str, ...], List[int]] = {}
                 teacher_ngrams: dict[Tuple[str, ...], List[int]] = {}
                 for i in range(len(student_tokens) - anchor_len + 1):
-                    student_ngrams.setdefault(tuple(student_tokens[i : i + anchor_len]), []).append(i)
+                    student_ngrams.setdefault(
+                        tuple(student_tokens[i : i + anchor_len]), []
+                    ).append(i)
                 for j in range(len(teacher_tokens) - anchor_len + 1):
-                    teacher_ngrams.setdefault(tuple(teacher_tokens[j : j + anchor_len]), []).append(j)
+                    teacher_ngrams.setdefault(
+                        tuple(teacher_tokens[j : j + anchor_len]), []
+                    ).append(j)
                 for ngram in student_ngrams.keys() & teacher_ngrams.keys():
-                    if len(student_ngrams[ngram]) == 1 and len(teacher_ngrams[ngram]) == 1:
+                    if (
+                        len(student_ngrams[ngram]) == 1
+                        and len(teacher_ngrams[ngram]) == 1
+                    ):
                         i = student_ngrams[ngram][0]
                         j = teacher_ngrams[ngram][0]
                         if (
                             i + anchor_len <= len(student_tokens)
                             and j + anchor_len <= len(teacher_tokens)
-                            and student_tokens[i : i + anchor_len] == teacher_tokens[j : j + anchor_len]
+                            and student_tokens[i : i + anchor_len]
+                            == teacher_tokens[j : j + anchor_len]
                         ):
                             all_potential_anchors.append((i, j, anchor_len))
 
@@ -453,9 +547,14 @@ class TokenAligner:
         full_alignment: List[AlignmentPair] = []
         last_i, last_j = 0, 0
         for i, j, k in validated:
-            student_seg, teacher_seg = student_tokens[last_i:i], teacher_tokens[last_j:j]
+            student_seg, teacher_seg = (
+                student_tokens[last_i:i],
+                teacher_tokens[last_j:j],
+            )
             if student_seg or teacher_seg:
-                aligned_segment, _ = self._align_dp(student_seg, teacher_seg, **dp_kwargs)
+                aligned_segment, _ = self._align_dp(
+                    student_seg, teacher_seg, **dp_kwargs
+                )
                 full_alignment.extend(
                     self._shift_pairs(aligned_segment, last_i, last_j)
                 )
@@ -522,7 +621,9 @@ class TokenAligner:
                 student_val, teacher_val = student_tokens[i - 1], teacher_tokens[j - 1]
                 match_score = (
                     exact_match_score
-                    if _strings_equal_flexible(student_val, teacher_val, ignore_leading_char_diff)
+                    if _strings_equal_flexible(
+                        student_val, teacher_val, ignore_leading_char_diff
+                    )
                     else -exact_match_score
                 )
                 score_diag = dp[i - 1, j - 1] + match_score
@@ -683,9 +784,21 @@ class TokenAligner:
         """Compute is_correct for each pair using canonicalized text comparison."""
         out: List[bool] = []
         for pair in aligned_pairs:
-            s_canon = "".join(canonical_token(tk) for tk in pair.s_tokens) if pair.s_tokens else ""
-            t_canon = "".join(canonical_token(tk) for tk in pair.t_tokens) if pair.t_tokens else ""
-            out.append(_strings_equal_flexible(s_canon, t_canon, ignore_leading_char_diff=False))
+            s_canon = (
+                "".join(canonical_token(tk) for tk in pair.s_tokens)
+                if pair.s_tokens
+                else ""
+            )
+            t_canon = (
+                "".join(canonical_token(tk) for tk in pair.t_tokens)
+                if pair.t_tokens
+                else ""
+            )
+            out.append(
+                _strings_equal_flexible(
+                    s_canon, t_canon, ignore_leading_char_diff=False
+                )
+            )
         return out
 
     @staticmethod
@@ -830,9 +943,19 @@ class TokenAligner:
         """Precompute (s_str, t_str, is_match) for each pair."""
         out: List[Tuple[str, str, bool]] = []
         for pair in aligned_pairs:
-            s_canon = "".join(canonical_token(t) for t in pair.s_tokens) if pair.s_tokens else ""
-            t_canon = "".join(canonical_token(t) for t in pair.t_tokens) if pair.t_tokens else ""
-            is_match = _strings_equal_flexible(s_canon, t_canon, ignore_leading_char_diff=False)
+            s_canon = (
+                "".join(canonical_token(t) for t in pair.s_tokens)
+                if pair.s_tokens
+                else ""
+            )
+            t_canon = (
+                "".join(canonical_token(t) for t in pair.t_tokens)
+                if pair.t_tokens
+                else ""
+            )
+            is_match = _strings_equal_flexible(
+                s_canon, t_canon, ignore_leading_char_diff=False
+            )
             out.append((s_canon, t_canon, is_match))
         return out
 
@@ -1095,9 +1218,7 @@ def _merge_consecutive_bytes(
             result.append(token)
             result_ranges.append(rng)
     if byte_buffer:
-        merged, merged_ranges = _try_merge_byte_buffer(
-            byte_buffer, byte_buffer_ranges
-        )
+        merged, merged_ranges = _try_merge_byte_buffer(byte_buffer, byte_buffer_ranges)
         result.extend(merged)
         result_ranges.extend(merged_ranges)
     return result, result_ranges
@@ -1150,5 +1271,3 @@ def _strings_equal_flexible(s1: str, s2: str, ignore_leading_char_diff: bool) ->
     if not ignore_leading_char_diff:
         return s1 == s2
     return canonical_token(s1) == canonical_token(s2)
-
-

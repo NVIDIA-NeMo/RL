@@ -997,8 +997,7 @@ class FullLogitsPostProcessor:
             )
         if self.enable_seq_packing:
             raise NotImplementedError(
-                "FullLogitsPostProcessor: sequence packing is not "
-                "supported in v0."
+                "FullLogitsPostProcessor: sequence packing is not supported in v0."
             )
         if isinstance(logits, DTensor):
             tp_group = self.tp_mesh.get_group() if self.tp_mesh is not None else None

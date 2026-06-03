@@ -79,5 +79,9 @@ def project_token_likelihoods(
     )
 
     reshaped_input = input_likelihoods.reshape(batch_size * seq_len, source_vocab_size)
-    projected_likelihoods_reshaped = torch.matmul(reshaped_input, sparse_projection_matrix)
-    return projected_likelihoods_reshaped.reshape(batch_size, seq_len, target_vocab_size)
+    projected_likelihoods_reshaped = torch.matmul(
+        reshaped_input, sparse_projection_matrix
+    )
+    return projected_likelihoods_reshaped.reshape(
+        batch_size, seq_len, target_vocab_size
+    )

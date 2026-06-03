@@ -51,9 +51,10 @@ from nemo_rl.algorithms.x_token.token_aligner import AlignmentBatch
 
 
 def alignment_from_flat_batch(data: Mapping[str, Any]) -> AlignmentBatch:
-    """Rebuild :class:`AlignmentBatch` from the flat ``alignment_*`` keys
-    on the loss data dict. The field set is driven off
-    :class:`AlignmentBatch` so the helper can't drift from the schema.
+    """Rebuild :class:`AlignmentBatch` from the flat ``alignment_*`` keys.
+
+    The field set is driven off :class:`AlignmentBatch` so the helper
+    can't drift from the schema.
     """
     return AlignmentBatch(
         **{f.name: data[f"alignment_{f.name}"] for f in fields(AlignmentBatch)}
@@ -131,17 +132,13 @@ class Fp32SparseMM(torch.autograd.Function):
 
     @staticmethod
     @torch.amp.custom_fwd(device_type="cuda", cast_inputs=torch.float32)
-    def forward(
-        ctx: Any, sparse_M: torch.Tensor, dense: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(ctx: Any, sparse_M: torch.Tensor, dense: torch.Tensor) -> torch.Tensor:
         ctx.sparse_M = sparse_M
         return torch.sparse.mm(sparse_M.t(), dense)
 
     @staticmethod
     @torch.amp.custom_bwd(device_type="cuda")
-    def backward(
-        ctx: Any, grad_out: torch.Tensor
-    ) -> tuple[None, torch.Tensor]:
+    def backward(ctx: Any, grad_out: torch.Tensor) -> tuple[None, torch.Tensor]:
         sparse_M = ctx.sparse_M
         # out = sparse_M.t() @ dense, so d/d_dense = sparse_M @ grad_out.
         grad_dense = torch.sparse.mm(sparse_M, grad_out)
@@ -175,8 +172,8 @@ def chunk_average_log_probs(
     # [B, T, max_chunks] — -1 entries compare false everywhere.
     chunk_mask = chunk_id.unsqueeze(-1) == chunk_arange
     chunk_mask_f = chunk_mask.transpose(1, 2).to(log_probs.dtype)
-    chunk_sums = torch.bmm(chunk_mask_f, log_probs)        # [B, C, V]
-    chunk_sizes = chunk_mask.sum(dim=1).float()            # [B, C]
+    chunk_sums = torch.bmm(chunk_mask_f, log_probs)  # [B, C, V]
+    chunk_sizes = chunk_mask.sum(dim=1).float()  # [B, C]
     chunk_log_probs = chunk_sums / (chunk_sizes.unsqueeze(-1) + eps)
     return chunk_log_probs, chunk_sizes
 
@@ -239,9 +236,7 @@ def parse_projection_file(
                 f"{top_indices.shape} vs {top_likelihoods.shape}"
             )
         v_student, top_k = top_indices.shape
-        student_idx = (
-            torch.arange(v_student).unsqueeze(1).expand(-1, top_k).reshape(-1)
-        )
+        student_idx = torch.arange(v_student).unsqueeze(1).expand(-1, top_k).reshape(-1)
         teacher_idx = top_indices.reshape(-1)
         values = top_likelihoods.reshape(-1)
         indices = torch.stack([student_idx, teacher_idx], dim=0)
@@ -259,12 +254,8 @@ def parse_projection_file(
         teacher_idx = torch.tensor([k[1] for k in keys], dtype=torch.long)
         indices = torch.stack([student_idx, teacher_idx], dim=0)
         values = torch.tensor(values_list, dtype=torch.float32)
-        v_student = (
-            int(student_idx.max().item()) + 1 if student_idx.numel() > 0 else 0
-        )
-        v_teacher = (
-            int(teacher_idx.max().item()) + 1 if teacher_idx.numel() > 0 else 0
-        )
+        v_student = int(student_idx.max().item()) + 1 if student_idx.numel() > 0 else 0
+        v_teacher = int(teacher_idx.max().item()) + 1 if teacher_idx.numel() > 0 else 0
         return indices, values, v_student, v_teacher
 
     raise ValueError(
@@ -286,9 +277,7 @@ def parse_projection_file(
 # size would build a different tensor. The top-k cache key is
 # ``(path, device)`` — the raw top-k arrays don't depend on a vocab-size
 # knob.
-_SPARSE_PROJECTION_CACHE: dict[
-    Tuple[str, torch.device, int, int], torch.Tensor
-] = {}
+_SPARSE_PROJECTION_CACHE: dict[Tuple[str, torch.device, int, int], torch.Tensor] = {}
 _TOPK_PROJECTION_CACHE: dict[
     Tuple[str, torch.device], Tuple[torch.Tensor, torch.Tensor]
 ] = {}
@@ -365,8 +354,11 @@ def get_sparse_projection_matrix(
     v_teacher = max(int(teacher_vocab_size), projection_max_teacher)
 
     sparse = torch.sparse_coo_tensor(
-        indices, values, (v_student, v_teacher),
-        device=device, dtype=torch.float32,
+        indices,
+        values,
+        (v_student, v_teacher),
+        device=device,
+        dtype=torch.float32,
     ).coalesce()
     _SPARSE_PROJECTION_CACHE[key] = sparse
     return sparse
@@ -402,11 +394,7 @@ def get_topk_projection(
     if not os.path.exists(path):
         raise FileNotFoundError(f"Projection matrix file not found: {path}")
     data = torch.load(path, map_location="cpu", weights_only=False)
-    if not (
-        isinstance(data, dict)
-        and "indices" in data
-        and "likelihoods" in data
-    ):
+    if not (isinstance(data, dict) and "indices" in data and "likelihoods" in data):
         raise ValueError(
             f"gold_loss requires the dense projection-matrix format "
             f"(dict with 'indices' and 'likelihoods' tensors). File "
@@ -478,9 +466,7 @@ def build_exact_token_map(
     v_student = indices.shape[0]
     v_teacher = int(teacher_vocab_size)
 
-    sorted_values, sorted_in_topk = torch.sort(
-        likelihoods, dim=-1, descending=True
-    )
+    sorted_values, sorted_in_topk = torch.sort(likelihoods, dim=-1, descending=True)
     if xtoken_loss:
         has_exact_map = sorted_values[:, 0] >= 0.6
     else:
@@ -488,9 +474,7 @@ def build_exact_token_map(
         # mapping. `indices[:, 1] == -1` is the sentinel used by the
         # `_exact_map_remapped` projection files for "no second
         # mapping" — matches the PT check at tokenalign.py:3517.
-        has_exact_map = (sorted_values[:, 0] == 1.0) & (
-            indices[:, 1] == -1
-        )
+        has_exact_map = (sorted_values[:, 0] == 1.0) & (indices[:, 1] == -1)
 
     # Gather (s_idx, t_idx, prob) for each exact-map candidate.
     s_candidates = torch.where(has_exact_map)[0]
@@ -505,9 +489,7 @@ def build_exact_token_map(
         _EXACT_TOKEN_MAP_CACHE[key] = result
         return result
 
-    t_candidates = indices[
-        s_candidates, sorted_in_topk[s_candidates, 0]
-    ]
+    t_candidates = indices[s_candidates, sorted_in_topk[s_candidates, 0]]
     prob_candidates = sorted_values[s_candidates, 0]
 
     in_bounds = (t_candidates >= 0) & (t_candidates < v_teacher)
@@ -536,12 +518,8 @@ def build_exact_token_map(
     # lose the amin reduction.
     sentinel = torch.tensor(v_student, dtype=s_vec.dtype, device=device)
     eligible_s = torch.where(eligible, s_vec, sentinel.expand_as(s_vec))
-    min_s_per_t = torch.full(
-        (v_teacher,), v_student, device=device, dtype=s_vec.dtype
-    )
-    min_s_per_t.scatter_reduce_(
-        0, t_vec, eligible_s, reduce="amin", include_self=True
-    )
+    min_s_per_t = torch.full((v_teacher,), v_student, device=device, dtype=s_vec.dtype)
+    min_s_per_t.scatter_reduce_(0, t_vec, eligible_s, reduce="amin", include_self=True)
     winner_mask = eligible & (s_vec == min_s_per_t[t_vec])
 
     common_student = s_vec[winner_mask]

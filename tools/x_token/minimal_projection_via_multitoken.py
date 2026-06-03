@@ -27,8 +27,7 @@ from tools.x_token.utils import (
     sinkhorn_one_dim,
 )
 
-
-#remove all special tokens that start with <| and end with |>
+# remove all special tokens that start with <| and end with |>
 
 
 # compare 3 ways to estimate likelihood matrix:
@@ -47,7 +46,7 @@ def create_weight_distribution(num_tokens):
         if i == 0:
             weights.append(base)
         else:
-            weights.append(base * (0.1 ** i))
+            weights.append(base * (0.1**i))
 
     # Normalize to sum to 1
     total = sum(weights)
@@ -99,16 +98,22 @@ def print_projection_map_examples(
         except Exception:
             source_token_str = f"<ID:{source_id}>"
 
-        targets_weights = sorted(source_to_targets[source_id], key=lambda x: x[1], reverse=True)
+        targets_weights = sorted(
+            source_to_targets[source_id], key=lambda x: x[1], reverse=True
+        )
 
         target_parts = []
         for target_id, weight in targets_weights:
             try:
                 if use_raw_tokens:
-                    target_token = target_tokenizer.convert_ids_to_tokens([target_id])[0]
+                    target_token = target_tokenizer.convert_ids_to_tokens([target_id])[
+                        0
+                    ]
                 else:
                     target_token = target_tokenizer.decode([target_id])
-                target_token = canonical_token(target_token, enabled=use_canonicalization)
+                target_token = canonical_token(
+                    target_token, enabled=use_canonicalization
+                )
                 target_token_str = repr(target_token)
             except Exception:
                 target_token_str = f"<ID:{target_id}>"
@@ -161,7 +166,9 @@ def add_multitoken_mappings(
         ValueError: If ``source_role`` is not "student" or "teacher".
     """
     if source_role not in ("student", "teacher"):
-        raise ValueError(f"source_role must be 'student' or 'teacher', got {source_role!r}")
+        raise ValueError(
+            f"source_role must be 'student' or 'teacher', got {source_role!r}"
+        )
     target_role = "teacher" if source_role == "student" else "student"
 
     decoded_source: dict[int, str] = {}
@@ -208,7 +215,9 @@ def add_multitoken_mappings(
             transformation_counts[key] += weight
 
         if len(target_token_ids) >= 2:
-            decoded_targets = [target_tokenizer.decode([tid]) for tid in target_token_ids]
+            decoded_targets = [
+                target_tokenizer.decode([tid]) for tid in target_token_ids
+            ]
             examples.append(
                 {
                     f"{source_role}_token": source_token_str,
@@ -258,17 +267,21 @@ def print_projection_statistics(
     print(f"\nTotal transformation entries: {len(transformation_counts)}")
 
 
-def find_similar_special_tokens(tokenizer_a, tokenizer_b, similarity_threshold=0.4, top_k_matches=3):
+def find_similar_special_tokens(
+    tokenizer_a, tokenizer_b, similarity_threshold=0.4, top_k_matches=3
+):
     """Find similar special tokens between two tokenizers using string similarity."""
 
     def is_special_token(token_str):
-        """Check if a token looks like a special token"""
-        return (token_str.startswith('<|') and token_str.endswith('|>')) or \
-               (token_str.startswith('<') and token_str.endswith('>')) or \
-               token_str in ['<eos>', '<bos>', '<pad>', '<unk>', '<s>', '</s>']
+        """Check if a token looks like a special token."""
+        return (
+            (token_str.startswith("<|") and token_str.endswith("|>"))
+            or (token_str.startswith("<") and token_str.endswith(">"))
+            or token_str in ["<eos>", "<bos>", "<pad>", "<unk>", "<s>", "</s>"]
+        )
 
     def extract_special_tokens(tokenizer):
-        """Extract all special tokens from a tokenizer with their IDs"""
+        """Extract all special tokens from a tokenizer with their IDs."""
         special_tokens = {}
         vocab = tokenizer.get_vocab()
         for token_str, token_id in vocab.items():
@@ -277,14 +290,14 @@ def find_similar_special_tokens(tokenizer_a, tokenizer_b, similarity_threshold=0
         return special_tokens
 
     def calculate_similarity(token_a, token_b):
-        """Calculate similarity between two token strings"""
+        """Calculate similarity between two token strings."""
         # Use difflib for sequence similarity
         seq_similarity = difflib.SequenceMatcher(None, token_a, token_b).ratio()
 
         # Extract key words from special tokens for semantic matching
         def extract_keywords(token):
             # Remove special token markers and split by common separators
-            cleaned = re.sub(r'[<>|_]', ' ', token.lower())
+            cleaned = re.sub(r"[<>|_]", " ", token.lower())
             words = [w for w in cleaned.split() if len(w) > 2]  # Filter short words
             return set(words)
 
@@ -293,7 +306,9 @@ def find_similar_special_tokens(tokenizer_a, tokenizer_b, similarity_threshold=0
 
         # Jaccard similarity for keywords
         if keywords_a or keywords_b:
-            keyword_similarity = len(keywords_a.intersection(keywords_b)) / len(keywords_a.union(keywords_b))
+            keyword_similarity = len(keywords_a.intersection(keywords_b)) / len(
+                keywords_a.union(keywords_b)
+            )
         else:
             keyword_similarity = 0.0
 
@@ -321,13 +336,15 @@ def find_similar_special_tokens(tokenizer_a, tokenizer_b, similarity_threshold=0
         # Sort by similarity and take top-k
         similarities.sort(key=lambda x: x[2], reverse=True)
         for token_id_b, token_str_b, similarity in similarities[:top_k_matches]:
-            special_token_mappings.append({
-                'student_id': token_id_a,
-                'student_token': token_str_a,
-                'teacher_id': token_id_b,
-                'teacher_token': token_str_b,
-                'similarity': similarity
-            })
+            special_token_mappings.append(
+                {
+                    "student_id": token_id_a,
+                    "student_token": token_str_a,
+                    "teacher_id": token_id_b,
+                    "teacher_token": token_str_b,
+                    "similarity": similarity,
+                }
+            )
 
     return special_token_mappings
 
@@ -336,7 +353,7 @@ def parse_arguments():
     """Parse command line arguments for the multi-token projection script."""
     parser = argparse.ArgumentParser(
         description="Generate multi-token projection mappings between tokenizers",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     # Model selection arguments
@@ -367,55 +384,55 @@ def parse_arguments():
         "--enable-scale-trick",
         action="store_true",
         default=True,
-        help="Enable scale trick (set last column likelihood to 0.2)"
+        help="Enable scale trick (set last column likelihood to 0.2)",
     )
     parser.add_argument(
         "--disable-scale-trick",
         action="store_false",
         dest="enable_scale_trick",
-        help="Disable scale trick"
+        help="Disable scale trick",
     )
     parser.add_argument(
         "--enable-reverse-pass",
         action="store_true",
         default=True,
-        help="Enable second pass: student tokens -> teacher tokens"
+        help="Enable second pass: student tokens -> teacher tokens",
     )
     parser.add_argument(
         "--disable-reverse-pass",
         action="store_false",
         dest="enable_reverse_pass",
-        help="Disable reverse pass"
+        help="Disable reverse pass",
     )
     parser.add_argument(
         "--enable-exact-match",
         action="store_true",
         default=False,
-        help="Enable exact match enforcement for identical tokens"
+        help="Enable exact match enforcement for identical tokens",
     )
     parser.add_argument(
         "--use-raw-tokens",
         action="store_true",
         default=False,
-        help="Use convert_ids_to_tokens instead of decode, should be False"
+        help="Use convert_ids_to_tokens instead of decode, should be False",
     )
     parser.add_argument(
         "--enable-special-token-mapping",
         action="store_true",
         default=True,
-        help="Enable mapping of similar special tokens"
+        help="Enable mapping of similar special tokens",
     )
     parser.add_argument(
         "--disable-special-token-mapping",
         action="store_false",
         dest="enable_special_token_mapping",
-        help="Disable special token mapping"
+        help="Disable special token mapping",
     )
     parser.add_argument(
         "--use-canonicalization",
         action="store_true",
         default=False,
-        help="Apply token canonicalization before processing to normalize different tokenizer representations (e.g., Ġ vs ▁ prefixes, Ċ vs \\n)"
+        help="Apply token canonicalization before processing to normalize different tokenizer representations (e.g., Ġ vs ▁ prefixes, Ċ vs \\n)",
     )
 
     # Numeric parameters
@@ -423,25 +440,25 @@ def parse_arguments():
         "--tokens-to-cut",
         type=int,
         default=4,
-        help="Maximum number of tokens to consider for multi-token mappings"
+        help="Maximum number of tokens to consider for multi-token mappings",
     )
     parser.add_argument(
         "--top-k",
         type=int,
         default=32,
-        help="Number of top projections to keep for each token"
+        help="Number of top projections to keep for each token",
     )
     parser.add_argument(
         "--special-token-similarity-threshold",
         type=float,
         default=0.3,
-        help="Minimum similarity threshold for special token matching"
+        help="Minimum similarity threshold for special token matching",
     )
     parser.add_argument(
         "--special-token-top-k",
         type=int,
         default=None,
-        help="Top K matches for each special token (defaults to --top-k value)"
+        help="Top K matches for each special token (defaults to --top-k value)",
     )
 
     # File paths
@@ -449,13 +466,13 @@ def parse_arguments():
         "--initial-projection-path",
         type=str,
         default=None,
-        help="Path to initial projection map to load and extend"
+        help="Path to initial projection map to load and extend",
     )
     parser.add_argument(
         "--output-dir",
         type=str,
         default="cross_tokenizer_data",
-        help="Output directory for saving projection maps"
+        help="Output directory for saving projection maps",
     )
     parser.add_argument(
         "--output-filename",
@@ -487,7 +504,9 @@ if __name__ == "__main__":
     INITIAL_PROJECTION_PATH = args.initial_projection_path
     ENABLE_SPECIAL_TOKEN_MAPPING = args.enable_special_token_mapping
     SPECIAL_TOKEN_SIMILARITY_THRESHOLD = args.special_token_similarity_threshold
-    SPECIAL_TOKEN_TOP_K = args.special_token_top_k if args.special_token_top_k is not None else TOP_K
+    SPECIAL_TOKEN_TOP_K = (
+        args.special_token_top_k if args.special_token_top_k is not None else TOP_K
+    )
     USE_CANONICALIZATION = args.use_canonicalization
 
     # Model names from arguments
@@ -507,7 +526,9 @@ if __name__ == "__main__":
     print(f"Top K: {TOP_K}")
     print(f"Enable special token mapping: {ENABLE_SPECIAL_TOKEN_MAPPING}")
     if ENABLE_SPECIAL_TOKEN_MAPPING:
-        print(f"Special token similarity threshold: {SPECIAL_TOKEN_SIMILARITY_THRESHOLD}")
+        print(
+            f"Special token similarity threshold: {SPECIAL_TOKEN_SIMILARITY_THRESHOLD}"
+        )
         print(f"Special token top K: {SPECIAL_TOKEN_TOP_K}")
     print(f"Initial projection path: {INITIAL_PROJECTION_PATH}")
     print(f"Output directory: {args.output_dir}")
@@ -549,17 +570,23 @@ if __name__ == "__main__":
     else:
         print("Using decoded token representation (decode)")
 
-
     transformation_counts = defaultdict(float)
     import os
+
     if INITIAL_PROJECTION_PATH and os.path.exists(INITIAL_PROJECTION_PATH):
         print(f"Loading initial projection from: {INITIAL_PROJECTION_PATH}")
-        initial_projection_map = torch.load(INITIAL_PROJECTION_PATH, map_location='cpu')
+        initial_projection_map = torch.load(INITIAL_PROJECTION_PATH, map_location="cpu")
 
-        if isinstance(initial_projection_map, dict) and 'indices' in initial_projection_map and 'likelihoods' in initial_projection_map:
-            print("Loading from sparse top-k format and converting to transformation_counts.")
-            indices = initial_projection_map['indices']
-            likelihoods = initial_projection_map['likelihoods']
+        if (
+            isinstance(initial_projection_map, dict)
+            and "indices" in initial_projection_map
+            and "likelihoods" in initial_projection_map
+        ):
+            print(
+                "Loading from sparse top-k format and converting to transformation_counts."
+            )
+            indices = initial_projection_map["indices"]
+            likelihoods = initial_projection_map["likelihoods"]
 
             # Accept the new `student_model_id`/`teacher_model_id` keys and fall back to the
             # legacy `model_A_id`/`model_B_id` keys produced by older generator runs.
@@ -571,14 +598,21 @@ if __name__ == "__main__":
             )
 
             if loaded_student_model and loaded_student_model != student_model_name:
-                print(f"Warning: Student model mismatch. Loaded: {loaded_student_model}, Current: {student_model_name}")
+                print(
+                    f"Warning: Student model mismatch. Loaded: {loaded_student_model}, Current: {student_model_name}"
+                )
             if loaded_teacher_model and loaded_teacher_model != teacher_model_name:
-                print(f"Warning: Teacher model mismatch. Loaded: {loaded_teacher_model}, Current: {teacher_model_name}")
+                print(
+                    f"Warning: Teacher model mismatch. Loaded: {loaded_teacher_model}, Current: {teacher_model_name}"
+                )
 
             num_student_tokens = indices.shape[0]
             top_k = indices.shape[1]
 
-            for student_id in tqdm.tqdm(range(num_student_tokens), desc="Converting initial projection to counts"):
+            for student_id in tqdm.tqdm(
+                range(num_student_tokens),
+                desc="Converting initial projection to counts",
+            ):
                 for k in range(top_k):
                     teacher_id = indices[student_id, k].item()
                     if teacher_id != -1:
@@ -588,31 +622,44 @@ if __name__ == "__main__":
 
         elif torch.is_tensor(initial_projection_map):
             if initial_projection_map.is_sparse:
-                print("Loading from sparse tensor and converting to transformation_counts.")
+                print(
+                    "Loading from sparse tensor and converting to transformation_counts."
+                )
                 sparse_matrix = initial_projection_map.coalesce()
                 map_indices = sparse_matrix.indices()
                 map_values = sparse_matrix.values()
-                for i in tqdm.tqdm(range(map_indices.shape[1]), desc="Converting sparse tensor to counts"):
+                for i in tqdm.tqdm(
+                    range(map_indices.shape[1]),
+                    desc="Converting sparse tensor to counts",
+                ):
                     student_id = map_indices[0, i].item()
                     teacher_id = map_indices[1, i].item()
                     weight = map_values[i].item()
                     if weight > 0:
                         transformation_counts[(student_id, teacher_id)] = weight
             else:
-                print("Loading from dense matrix and converting to transformation_counts.")
+                print(
+                    "Loading from dense matrix and converting to transformation_counts."
+                )
                 dense_matrix = initial_projection_map
                 non_zero_indices = torch.nonzero(dense_matrix, as_tuple=False)
-                for idx in tqdm.tqdm(range(non_zero_indices.shape[0]), desc="Converting dense projection to counts"):
+                for idx in tqdm.tqdm(
+                    range(non_zero_indices.shape[0]),
+                    desc="Converting dense projection to counts",
+                ):
                     student_id = non_zero_indices[idx, 0].item()
                     teacher_id = non_zero_indices[idx, 1].item()
                     weight = dense_matrix[student_id, teacher_id].item()
                     if weight > 0:
                         transformation_counts[(student_id, teacher_id)] = weight
         else:
-            print(f"Warning: Unrecognized format for initial projection map at {INITIAL_PROJECTION_PATH}. Skipping.")
+            print(
+                f"Warning: Unrecognized format for initial projection map at {INITIAL_PROJECTION_PATH}. Skipping."
+            )
 
-        print(f"Initialized transformation_counts with {len(transformation_counts)} entries.")
-
+        print(
+            f"Initialized transformation_counts with {len(transformation_counts)} entries."
+        )
 
     ignore_tokens = ["<|endoftext|>", "<eos>"]
     ignore_student_ids = {
@@ -667,7 +714,7 @@ if __name__ == "__main__":
             tokenizer_student,
             tokenizer_teacher,
             similarity_threshold=SPECIAL_TOKEN_SIMILARITY_THRESHOLD,
-            top_k_matches=SPECIAL_TOKEN_TOP_K
+            top_k_matches=SPECIAL_TOKEN_TOP_K,
         )
     else:
         print("Special token mapping disabled")
@@ -678,9 +725,9 @@ if __name__ == "__main__":
 
         # Add ALL mappings to transformation matrix
         for mapping in special_token_mappings:
-            student_id = mapping['student_id']
-            teacher_id = mapping['teacher_id']
-            similarity = mapping['similarity']
+            student_id = mapping["student_id"]
+            teacher_id = mapping["teacher_id"]
+            similarity = mapping["similarity"]
 
             # Add mapping with weight based on similarity
             weight = similarity * 0.8  # Scale similarity to reasonable weight
@@ -688,25 +735,32 @@ if __name__ == "__main__":
 
         # Group mappings by student token and show top 2 matches per student token
         from collections import defaultdict
+
         student_mappings = defaultdict(list)
         for mapping in special_token_mappings:
-            student_mappings[mapping['student_id']].append(mapping)
+            student_mappings[mapping["student_id"]].append(mapping)
 
         # Sort each student's mappings by similarity and show top 2
         print("Top 2 matches per student special token:")
         shown_count = 0
         for student_id, mappings in student_mappings.items():
             # Sort by similarity (highest first)
-            sorted_mappings = sorted(mappings, key=lambda x: x['similarity'], reverse=True)
+            sorted_mappings = sorted(
+                mappings, key=lambda x: x["similarity"], reverse=True
+            )
 
             # Show top 2 for this student token
-            student_token = sorted_mappings[0]['student_token']  # Get student token name
+            student_token = sorted_mappings[0][
+                "student_token"
+            ]  # Get student token name
             print(f"  {student_token}:")
 
             for mapping in sorted_mappings[:2]:
-                similarity = mapping['similarity']
+                similarity = mapping["similarity"]
                 weight = similarity * 0.8
-                print(f"    -> '{mapping['teacher_token']}' (similarity: {similarity:.3f}, weight: {weight:.3f})")
+                print(
+                    f"    -> '{mapping['teacher_token']}' (similarity: {similarity:.3f}, weight: {weight:.3f})"
+                )
                 shown_count += 1
 
             if len(sorted_mappings) > 2:
@@ -729,12 +783,23 @@ if __name__ == "__main__":
     )
 
     if ENABLE_EXACT_MATCH:
-
         print("Checking for exact token matches and setting exact mappings...")
         # check exact match between student and teacher tokens and set those as perfect 1-to-1 mappings
         # Convert all tokens to strings at once for vectorized comparison
-        tokens_student = [canonical_token(tokenizer_student.convert_ids_to_tokens([i])[0], enabled=USE_CANONICALIZATION) for i in range(tokenizer_student_total_vocab_size)]
-        tokens_teacher = [canonical_token(tokenizer_teacher.convert_ids_to_tokens([j])[0], enabled=USE_CANONICALIZATION) for j in range(tokenizer_teacher_total_vocab_size)]
+        tokens_student = [
+            canonical_token(
+                tokenizer_student.convert_ids_to_tokens([i])[0],
+                enabled=USE_CANONICALIZATION,
+            )
+            for i in range(tokenizer_student_total_vocab_size)
+        ]
+        tokens_teacher = [
+            canonical_token(
+                tokenizer_teacher.convert_ids_to_tokens([j])[0],
+                enabled=USE_CANONICALIZATION,
+            )
+            for j in range(tokenizer_teacher_total_vocab_size)
+        ]
 
         map_teacher_token_to_idx = {token: j for j, token in enumerate(tokens_teacher)}
 
@@ -748,7 +813,9 @@ if __name__ == "__main__":
                 match_indices_teacher.append(j)
 
         if match_indices_student:
-            print(f"Found {len(match_indices_student)} exact matches. Setting perfect 1-to-1 mappings.")
+            print(
+                f"Found {len(match_indices_student)} exact matches. Setting perfect 1-to-1 mappings."
+            )
 
             # For tokens that match exactly, we want their mapping to be 1.0
             # and they should not be mapped to any other token.
@@ -762,9 +829,10 @@ if __name__ == "__main__":
             for key in keys_to_remove:
                 del transformation_counts[key]
             # Then, set the perfect 1-to-1 mappings for exact matches
-            for student_id, teacher_id in zip(match_indices_student, match_indices_teacher):
+            for student_id, teacher_id in zip(
+                match_indices_student, match_indices_teacher
+            ):
                 transformation_counts[(student_id, teacher_id)] = 1.0
-
 
     # Create transformation matrix (student -> teacher projection)
     indices = list(transformation_counts.keys())
@@ -783,12 +851,14 @@ if __name__ == "__main__":
         values_tensor,
         (tokenizer_student_total_vocab_size, tokenizer_teacher_total_vocab_size),
         device="cuda" if torch.cuda.is_available() else "cpu",
-        dtype=torch.bfloat16
+        dtype=torch.bfloat16,
     )
 
     # indices, values = torch.topk(transformation_matrix_sparse, k=1000, dim=1)
 
-    print(f"Created sparse student->teacher projection matrix with shape: {transformation_matrix_sparse.shape}")
+    print(
+        f"Created sparse student->teacher projection matrix with shape: {transformation_matrix_sparse.shape}"
+    )
     print(f"Non-zero elements: {transformation_matrix_sparse._nnz()}")
 
     # Convert sparse matrix to same format as minimal_projection_generator.py
@@ -813,7 +883,9 @@ if __name__ == "__main__":
 
     # Convert sparse matrix to dense and get top-k values per row
     print("Converting to dense matrix on CPU to avoid memory issues...")
-    dense_matrix = transformation_matrix_sparse.cpu().to_dense()  # Move to CPU to handle memory
+    dense_matrix = (
+        transformation_matrix_sparse.cpu().to_dense()
+    )  # Move to CPU to handle memory
     print(f"Dense matrix shape: {dense_matrix.shape}")
 
     # Get top-k values and indices for each row (each source token)
@@ -824,16 +896,37 @@ if __name__ == "__main__":
     dense_matrix = sinkhorn_one_dim(dense_matrix, n_iters=1)
 
     # Extract top-k on CPU
-    top_k_likelihoods, top_k_indices = torch.topk(dense_matrix, k=min(TOP_K, dense_matrix.shape[1]), dim=1)
+    top_k_likelihoods, top_k_indices = torch.topk(
+        dense_matrix, k=min(TOP_K, dense_matrix.shape[1]), dim=1
+    )
     # exit()
     # Handle case where vocabulary has fewer tokens than TOP_K
     actual_k = top_k_indices.shape[1]
     if actual_k < TOP_K:
-        print(f"Warning: Target vocabulary size ({dense_matrix.shape[1]}) is smaller than TOP_K ({TOP_K}). Using k={actual_k}")
+        print(
+            f"Warning: Target vocabulary size ({dense_matrix.shape[1]}) is smaller than TOP_K ({TOP_K}). Using k={actual_k}"
+        )
         # Pad with -1 indices and 0.0 likelihoods to maintain consistent shape
         pad_size = TOP_K - actual_k
-        top_k_indices = torch.cat([top_k_indices, torch.full((top_k_indices.shape[0], pad_size), -1, dtype=top_k_indices.dtype)], dim=1)
-        top_k_likelihoods = torch.cat([top_k_likelihoods, torch.zeros((top_k_likelihoods.shape[0], pad_size), dtype=top_k_likelihoods.dtype)], dim=1)
+        top_k_indices = torch.cat(
+            [
+                top_k_indices,
+                torch.full(
+                    (top_k_indices.shape[0], pad_size), -1, dtype=top_k_indices.dtype
+                ),
+            ],
+            dim=1,
+        )
+        top_k_likelihoods = torch.cat(
+            [
+                top_k_likelihoods,
+                torch.zeros(
+                    (top_k_likelihoods.shape[0], pad_size),
+                    dtype=top_k_likelihoods.dtype,
+                ),
+            ],
+            dim=1,
+        )
 
     # Apply SCALE_TRICK: set last column to -4 if enabled
     if ENABLE_SCALE_TRICK:
@@ -842,12 +935,14 @@ if __name__ == "__main__":
         if ENABLE_EXACT_MATCH:
             for indices in match_indices_student:
                 top_k_likelihoods[indices, -1] = 0.0
-            print(f"Set last column of likelihoods to 0.0 for {len(match_indices_student)} exact matches as exact match is enabled")
+            print(
+                f"Set last column of likelihoods to 0.0 for {len(match_indices_student)} exact matches as exact match is enabled"
+            )
         # Apply sinkhorn normalization on CPU
         print("Applying Sinkhorn normalization on CPU...")
         top_k_likelihoods = sinkhorn_one_dim(top_k_likelihoods, n_iters=1)
 
-    #set indices to -1 where likelihood is 0
+    # set indices to -1 where likelihood is 0
 
     # Build the output filename. If the caller provided an explicit
     # `--output-filename` stem, honor it (recipe-driven runs lock the name);
@@ -857,8 +952,12 @@ if __name__ == "__main__":
     if args.output_filename is not None:
         output_filename = args.output_filename
     else:
-        student_clean_name = clean_model_name_for_filename(student_model_name.split("/")[-1])
-        teacher_clean_name = clean_model_name_for_filename(teacher_model_name.split("/")[-1])
+        student_clean_name = clean_model_name_for_filename(
+            student_model_name.split("/")[-1]
+        )
+        teacher_clean_name = clean_model_name_for_filename(
+            teacher_model_name.split("/")[-1]
+        )
         output_filename = (
             f"projection_map_{student_clean_name}_to_{teacher_clean_name}"
             f"_multitoken_top_{TOP_K}_double"
@@ -876,54 +975,86 @@ if __name__ == "__main__":
     # Metadata keys use the student/teacher framing; legacy `model_A_id`/
     # `model_B_id` produced by older PT-reference artifacts are accepted on
     # the load side (see the fallback near line 574).
-    torch.save({
-        "indices": top_k_indices,
-        "likelihoods": top_k_likelihoods,
-        "student_model_id": student_model_name,
-        "teacher_model_id": teacher_model_name,
-        "enable_scale_trick": ENABLE_SCALE_TRICK,
-    }, output_path)
+    torch.save(
+        {
+            "indices": top_k_indices,
+            "likelihoods": top_k_likelihoods,
+            "student_model_id": student_model_name,
+            "teacher_model_id": teacher_model_name,
+            "enable_scale_trick": ENABLE_SCALE_TRICK,
+        },
+        output_path,
+    )
 
     print(f"Saved projection map to: {output_path}")
-    print(f"Format: indices shape {top_k_indices.shape}, likelihoods shape {top_k_likelihoods.shape}")
-    print(f"Compatible with minimal_projection_generator.py format")
-    print(f"Token processing mode: {'Raw tokens (convert_ids_to_tokens)' if USE_RAW_TOKENS else 'Decoded tokens (decode)'}")
+    print(
+        f"Format: indices shape {top_k_indices.shape}, likelihoods shape {top_k_likelihoods.shape}"
+    )
+    print("Compatible with minimal_projection_generator.py format")
+    print(
+        f"Token processing mode: {'Raw tokens (convert_ids_to_tokens)' if USE_RAW_TOKENS else 'Decoded tokens (decode)'}"
+    )
     if ENABLE_REVERSE_PASS:
-        print("File includes bidirectional mappings (teacher->student and student->teacher)")
+        print(
+            "File includes bidirectional mappings (teacher->student and student->teacher)"
+        )
     if ENABLE_SPECIAL_TOKEN_MAPPING:
-        print(f"File includes special token mappings (similarity_threshold={SPECIAL_TOKEN_SIMILARITY_THRESHOLD}, top_k={SPECIAL_TOKEN_TOP_K})")
+        print(
+            f"File includes special token mappings (similarity_threshold={SPECIAL_TOKEN_SIMILARITY_THRESHOLD}, top_k={SPECIAL_TOKEN_TOP_K})"
+        )
     # exit()
-
 
     # Test projection function compatibility (same as minimal_projection_generator.py)
     print("\n--- Testing projection function compatibility ---")
 
-    def project_token_likelihoods(input_likelihoods, projection_map_indices, projection_map_values, target_vocab_size, device):
+    def project_token_likelihoods(
+        input_likelihoods,
+        projection_map_indices,
+        projection_map_values,
+        target_vocab_size,
+        device,
+    ):
         """Projects token likelihoods from a source to a target vocabulary using a sparse map."""
         batch_size, seq_len, source_vocab_size = input_likelihoods.shape
         if source_vocab_size != projection_map_indices.shape[0]:
-            raise ValueError(f"Source vocab size of input ({source_vocab_size}) mismatches projection map size ({projection_map_indices.shape[0]})")
+            raise ValueError(
+                f"Source vocab size of input ({source_vocab_size}) mismatches projection map size ({projection_map_indices.shape[0]})"
+            )
 
         top_k = projection_map_indices.shape[1]
         input_likelihoods = input_likelihoods.to(device)
         projection_map_indices = projection_map_indices.to(device)
         projection_map_values = projection_map_values.to(device)
 
-        crow_indices = torch.arange(0, (source_vocab_size + 1) * top_k, top_k, device=device, dtype=torch.long)
+        crow_indices = torch.arange(
+            0, (source_vocab_size + 1) * top_k, top_k, device=device, dtype=torch.long
+        )
         col_indices = projection_map_indices.flatten()
         values = projection_map_values.flatten()
 
         sparse_projection_matrix = torch.sparse_csr_tensor(
-            crow_indices, col_indices, values, size=(source_vocab_size, target_vocab_size), device=device
+            crow_indices,
+            col_indices,
+            values,
+            size=(source_vocab_size, target_vocab_size),
+            device=device,
         )
 
-        reshaped_input = input_likelihoods.reshape(batch_size * seq_len, source_vocab_size)
-        projected_likelihoods_reshaped = torch.matmul(reshaped_input, sparse_projection_matrix)
-        return projected_likelihoods_reshaped.reshape(batch_size, seq_len, target_vocab_size)
+        reshaped_input = input_likelihoods.reshape(
+            batch_size * seq_len, source_vocab_size
+        )
+        projected_likelihoods_reshaped = torch.matmul(
+            reshaped_input, sparse_projection_matrix
+        )
+        return projected_likelihoods_reshaped.reshape(
+            batch_size, seq_len, target_vocab_size
+        )
 
     # Create a dummy likelihood tensor: [BATCH, SEQ, source_vocab_size]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dummy_tensor = torch.randn(1, 4096, tokenizer_student_total_vocab_size, device=device, dtype=torch.float32)
+    dummy_tensor = torch.randn(
+        1, 4096, tokenizer_student_total_vocab_size, device=device, dtype=torch.float32
+    )
 
     # Transform this tensor using the projection map
     projected_tensor = project_token_likelihoods(
@@ -931,7 +1062,7 @@ if __name__ == "__main__":
         top_k_indices.to(device),
         top_k_likelihoods.float().to(device),
         tokenizer_teacher_total_vocab_size,
-        device
+        device,
     )
     print(f"Input tensor shape: {dummy_tensor.shape}")
     print(f"Projected tensor shape: {projected_tensor.shape}")

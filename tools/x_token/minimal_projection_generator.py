@@ -24,7 +24,6 @@ from tools.x_token.utils import (
     sinkhorn_one_dim,
 )
 
-
 EXACT_MATCH_ONLY = False
 
 
@@ -86,7 +85,10 @@ def parse_arguments() -> argparse.Namespace:
 
 
 EMBEDDING_MODEL_CHOICES = [
-    {"name": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", "type": "sbert"},
+    {
+        "name": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        "type": "sbert",
+    },
     {"name": "sentence-transformers/all-mpnet-base-v2", "type": "sbert"},
     {"name": "sentence-transformers/all-MiniLM-L6-v2", "type": "sbert"},
     {"name": "Qwen/Qwen3-Embedding-4B", "type": "llm_first_layer"},
@@ -98,6 +100,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # --- Helper Functions ---
+
 
 def load_tokenizer(model_id_or_path):
     """Loads a HuggingFace tokenizer, setting a pad token if necessary."""
@@ -113,21 +116,36 @@ def save_data(data, filename):
     torch.save(data.cpu(), filename)
     print(f"Data saved to {filename}")
 
+
 def load_data(filename):
     """Loads data from a torch file."""
     return torch.load(filename)
 
-def get_llm_first_layer_embeddings(decoded_tokens_list, llm_embedding_tokenizer, llm_embedding_model, max_seq_length_embedding, device, batch_size=32):
+
+def get_llm_first_layer_embeddings(
+    decoded_tokens_list,
+    llm_embedding_tokenizer,
+    llm_embedding_model,
+    max_seq_length_embedding,
+    device,
+    batch_size=32,
+):
     """Generates embeddings using the first layer of a given LLM."""
     all_embeddings = []
     llm_embedding_model.eval()
     embedding_dim = llm_embedding_model.config.hidden_size
 
-    for i in tqdm(range(0, len(decoded_tokens_list), batch_size), desc="Encoding tokens with LLM"):
-        batch_tokens = decoded_tokens_list[i:i + batch_size]
+    for i in tqdm(
+        range(0, len(decoded_tokens_list), batch_size), desc="Encoding tokens with LLM"
+    ):
+        batch_tokens = decoded_tokens_list[i : i + batch_size]
         inputs = llm_embedding_tokenizer(
-            batch_tokens, return_tensors="pt", padding=True, truncation=True,
-            max_length=max_seq_length_embedding, add_special_tokens=False,
+            batch_tokens,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=max_seq_length_embedding,
+            add_special_tokens=False,
         ).to(device)
 
         with torch.no_grad():
@@ -135,9 +153,11 @@ def get_llm_first_layer_embeddings(decoded_tokens_list, llm_embedding_tokenizer,
             first_layer_output = outputs.hidden_states[0]
 
             for k in range(first_layer_output.shape[0]):
-                valid_token_mask = inputs['attention_mask'][k] == 1
+                valid_token_mask = inputs["attention_mask"][k] == 1
                 if valid_token_mask.sum() > 0:
-                    pooled_embedding = first_layer_output[k, valid_token_mask].mean(dim=0)
+                    pooled_embedding = first_layer_output[k, valid_token_mask].mean(
+                        dim=0
+                    )
                     all_embeddings.append(pooled_embedding)
                 else:
                     all_embeddings.append(torch.zeros(embedding_dim, device=device))
@@ -145,7 +165,9 @@ def get_llm_first_layer_embeddings(decoded_tokens_list, llm_embedding_tokenizer,
     return torch.stack(all_embeddings).to(device)
 
 
-def compute_chunked_projection_map(embeddings_query, embeddings_corpus, args, device, chunk_size=1000):
+def compute_chunked_projection_map(
+    embeddings_query, embeddings_corpus, args, device, chunk_size=1000
+):
     """Computes projection map in chunks to save memory."""
     num_queries = embeddings_query.shape[0]
     target_vocab_size = embeddings_corpus.shape[0]
@@ -155,9 +177,13 @@ def compute_chunked_projection_map(embeddings_query, embeddings_corpus, args, de
     all_top_k_likelihoods = torch.zeros((num_queries, args.top_k), dtype=torch.float32)
 
     # Normalize corpus embeddings once
-    embeddings_corpus_norm = torch.nn.functional.normalize(embeddings_corpus.to(device).float(), p=2, dim=1)
+    embeddings_corpus_norm = torch.nn.functional.normalize(
+        embeddings_corpus.to(device).float(), p=2, dim=1
+    )
 
-    for chunk_start in tqdm(range(0, num_queries, chunk_size), desc="Processing chunks"):
+    for chunk_start in tqdm(
+        range(0, num_queries, chunk_size), desc="Processing chunks"
+    ):
         chunk_end = min(chunk_start + chunk_size, num_queries)
         chunk_query = embeddings_query[chunk_start:chunk_end].to(device).float()
 
@@ -167,17 +193,25 @@ def compute_chunked_projection_map(embeddings_query, embeddings_corpus, args, de
             similarities = torch.matmul(chunk_query_norm, embeddings_corpus_norm.t())
 
             # Generate projection map for this chunk
-            chunk_top_k_indices, chunk_top_k_likelihoods = generate_projection_map_chunk(similarities, args)
+            chunk_top_k_indices, chunk_top_k_likelihoods = (
+                generate_projection_map_chunk(similarities, args)
+            )
 
             # Store results
             all_top_k_indices[chunk_start:chunk_end] = chunk_top_k_indices.cpu()
             all_top_k_likelihoods[chunk_start:chunk_end] = chunk_top_k_likelihoods.cpu()
 
             # Clear GPU memory
-            del similarities, chunk_query_norm, chunk_top_k_indices, chunk_top_k_likelihoods
+            del (
+                similarities,
+                chunk_query_norm,
+                chunk_top_k_indices,
+                chunk_top_k_likelihoods,
+            )
             torch.cuda.empty_cache()
 
     return all_top_k_indices, all_top_k_likelihoods
+
 
 def generate_projection_map_chunk(similarities, args):
     """Calculates the sparse likelihood map from a similarity matrix chunk."""
@@ -185,7 +219,7 @@ def generate_projection_map_chunk(similarities, args):
     similarities[similarities > 0.999999999] = 1.0
     max_similarities = torch.max(similarities, dim=1, keepdim=True)[0]
     sharpness = 10.0 * max_similarities
-    likelihood = similarities ** sharpness
+    likelihood = similarities**sharpness
 
     # Normalize rows
     likelihood = sinkhorn_one_dim(likelihood)
@@ -196,9 +230,12 @@ def generate_projection_map_chunk(similarities, args):
     # Apply weight threshold filtering if specified
     if args.weight_threshold > 0.0:
         threshold_mask = top_k_likelihood >= args.weight_threshold
-        top_k_indices = top_k_indices.where(threshold_mask, torch.full_like(top_k_indices, -1))
+        top_k_indices = top_k_indices.where(
+            threshold_mask, torch.full_like(top_k_indices, -1)
+        )
 
     return top_k_indices, top_k_likelihood
+
 
 # --- Main Execution ---
 if __name__ == "__main__":
@@ -240,7 +277,7 @@ if __name__ == "__main__":
     print(f"Target vocab size (full): {target_vocab_size}")
 
     # 2. Select and Load Embedding Model
-    embedding_model_index = 3 # Default to a good LLM embedder
+    embedding_model_index = 3  # Default to a good LLM embedder
     selected_model_info = EMBEDDING_MODEL_CHOICES[embedding_model_index]
     embedding_model_name = selected_model_info["name"]
     embedding_model_type = selected_model_info["type"]
@@ -283,17 +320,25 @@ if __name__ == "__main__":
             from nemo_rl.algorithms.x_token.token_aligner import canonical_token
 
             print("Applying token canonicalization before embedding generation...")
-            decoded_tokens_student = [canonical_token(token) for token in raw_tokens_student]
-            decoded_tokens_teacher = [canonical_token(token) for token in raw_tokens_teacher]
+            decoded_tokens_student = [
+                canonical_token(token) for token in raw_tokens_student
+            ]
+            decoded_tokens_teacher = [
+                canonical_token(token) for token in raw_tokens_teacher
+            ]
 
             # Show some examples of canonicalization
             print("Canonicalization examples:")
             for i in range(min(10, len(raw_tokens_student))):
                 if raw_tokens_student[i] != decoded_tokens_student[i]:
-                    print(f"  student: '{raw_tokens_student[i]}' -> '{decoded_tokens_student[i]}'")
+                    print(
+                        f"  student: '{raw_tokens_student[i]}' -> '{decoded_tokens_student[i]}'"
+                    )
             for i in range(min(10, len(raw_tokens_teacher))):
                 if raw_tokens_teacher[i] != decoded_tokens_teacher[i]:
-                    print(f"  teacher: '{raw_tokens_teacher[i]}' -> '{decoded_tokens_teacher[i]}'")
+                    print(
+                        f"  teacher: '{raw_tokens_teacher[i]}' -> '{decoded_tokens_teacher[i]}'"
+                    )
 
             print(
                 f"Applied canonicalization to {len(decoded_tokens_student)} student tokens "
@@ -314,17 +359,35 @@ if __name__ == "__main__":
                     "or pick an embedding model with type `llm_first_layer` instead."
                 ) from e
             sbert_model = SentenceTransformer(embedding_model_name, device=DEVICE)
-            student["embeddings"] = sbert_model.encode(decoded_tokens_student, convert_to_tensor=True, show_progress_bar=True)
-            teacher["embeddings"] = sbert_model.encode(decoded_tokens_teacher, convert_to_tensor=True, show_progress_bar=True)
+            student["embeddings"] = sbert_model.encode(
+                decoded_tokens_student, convert_to_tensor=True, show_progress_bar=True
+            )
+            teacher["embeddings"] = sbert_model.encode(
+                decoded_tokens_teacher, convert_to_tensor=True, show_progress_bar=True
+            )
         elif embedding_model_type == "llm_first_layer":
-            llm_tokenizer = AutoTokenizer.from_pretrained(embedding_model_name, trust_remote_code=True)
+            llm_tokenizer = AutoTokenizer.from_pretrained(
+                embedding_model_name, trust_remote_code=True
+            )
             if llm_tokenizer.pad_token is None:
                 llm_tokenizer.pad_token = llm_tokenizer.eos_token
             llm_model = AutoModel.from_pretrained(
                 embedding_model_name, torch_dtype=torch.bfloat16, trust_remote_code=True
             ).to(DEVICE)
-            student["embeddings"] = get_llm_first_layer_embeddings(decoded_tokens_student, llm_tokenizer, llm_model, MAX_SEQ_LENGTH_EMBEDDING, DEVICE)
-            teacher["embeddings"] = get_llm_first_layer_embeddings(decoded_tokens_teacher, llm_tokenizer, llm_model, MAX_SEQ_LENGTH_EMBEDDING, DEVICE)
+            student["embeddings"] = get_llm_first_layer_embeddings(
+                decoded_tokens_student,
+                llm_tokenizer,
+                llm_model,
+                MAX_SEQ_LENGTH_EMBEDDING,
+                DEVICE,
+            )
+            teacher["embeddings"] = get_llm_first_layer_embeddings(
+                decoded_tokens_teacher,
+                llm_tokenizer,
+                llm_model,
+                MAX_SEQ_LENGTH_EMBEDDING,
+                DEVICE,
+            )
 
         save_data(student["embeddings"], embeddings_path_student)
         save_data(teacher["embeddings"], embeddings_path_teacher)
@@ -332,8 +395,14 @@ if __name__ == "__main__":
     # 4. Compute Similarity and Generate Projection Maps (chunked to save memory)
     print("\nComputing projection map in chunks to save memory...")
     chunk_size = 500  # Process 500 tokens at a time to avoid OOM
-    top_k_indices_student_to_teacher, top_k_likelihood_student_to_teacher = compute_chunked_projection_map(
-        student["embeddings"], teacher["embeddings"], args, DEVICE, chunk_size=chunk_size
+    top_k_indices_student_to_teacher, top_k_likelihood_student_to_teacher = (
+        compute_chunked_projection_map(
+            student["embeddings"],
+            teacher["embeddings"],
+            args,
+            DEVICE,
+            chunk_size=chunk_size,
+        )
     )
 
     # Note: Exact match enforcement is skipped in chunked mode for simplicity.
@@ -345,7 +414,9 @@ if __name__ == "__main__":
     teacher_clean_name = clean_model_name_for_filename(teacher["name"])
     output_filename = f"temp_projection_map_{student_clean_name}_to_{teacher_clean_name}_top_{args.top_k}.pt"
     if args.weight_threshold > 0.0:
-        output_filename = output_filename.replace(".pt", f"_thresh_{args.weight_threshold:.3f}.pt")
+        output_filename = output_filename.replace(
+            ".pt", f"_thresh_{args.weight_threshold:.3f}.pt"
+        )
     output_path = os.path.join(args.data_dir, output_filename)
 
     # Metadata keys use the student/teacher framing; legacy `model_A_id`/

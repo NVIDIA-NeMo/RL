@@ -628,20 +628,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "or sequence packing in v0."
             )
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
-        with (
-            timer.time("get_full_logits_ipc/shard_data")
-            if timer
-            else nullcontext()
-        ):
+        with timer.time("get_full_logits_ipc/shard_data") if timer else nullcontext():
             sharded_data = data.shard_by_batch_size(  # type: ignore
                 dp_size,
                 batch_size=None,
             )
-        with (
-            timer.time("get_full_logits_ipc/submit")
-            if timer
-            else nullcontext()
-        ):
+        with timer.time("get_full_logits_ipc/submit") if timer else nullcontext():
             futures = self.worker_group.run_all_workers_sharded_data(
                 "get_full_logits_ipc",
                 data=sharded_data,
@@ -666,9 +658,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
     def release_ipc_buffer(self) -> None:
         """Tell all workers to drop their stashed IPC tensors."""
-        futures = self.worker_group.run_all_workers_single_data(
-            "release_ipc_buffer"
-        )
+        futures = self.worker_group.run_all_workers_single_data("release_ipc_buffer")
         ray.get(futures)
 
     def train(

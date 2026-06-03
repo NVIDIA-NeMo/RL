@@ -23,15 +23,24 @@ from tools.x_token.utils import sinkhorn_one_dim
 
 def parse_arguments() -> argparse.Namespace:
     """Parse CLI arguments for the sort-and-cut script."""
-    parser = argparse.ArgumentParser(description="Sort and cut projection matrix by top_k")
+    parser = argparse.ArgumentParser(
+        description="Sort and cut projection matrix by top_k"
+    )
     parser.add_argument(
         "--initial-projection-path",
         type=str,
         required=True,
         help="Path to the input projection matrix .pt file.",
     )
-    parser.add_argument("--top_k", type=int, required=True, help="New top_k value for cutoff")
-    parser.add_argument("--output_path", type=str, default=None, help="Output path (auto-generated if not specified)")
+    parser.add_argument(
+        "--top_k", type=int, required=True, help="New top_k value for cutoff"
+    )
+    parser.add_argument(
+        "--output_path",
+        type=str,
+        default=None,
+        help="Output path (auto-generated if not specified)",
+    )
     parser.add_argument(
         "--preserve_last",
         action=argparse.BooleanOptionalAction,
@@ -42,7 +51,9 @@ def parse_arguments() -> argparse.Namespace:
             "`enable_scale_trick` metadata (and defaults to False if absent)."
         ),
     )
-    parser.add_argument("--quiet", "-q", action="store_true", help="Suppress progress output")
+    parser.add_argument(
+        "--quiet", "-q", action="store_true", help="Suppress progress output"
+    )
     return parser.parse_args()
 
 
@@ -88,26 +99,36 @@ def print_projection_statistics(
     non_zero_counts = (new_likelihoods > 0).sum(dim=1)
     avg_non_zero = non_zero_counts.float().mean().item()
     print(f"Average non-zero entries per row: {avg_non_zero:.2f}")
-    print(f"Rows with max entries ({new_top_k}): {(non_zero_counts == new_top_k).sum().item()}")
+    print(
+        f"Rows with max entries ({new_top_k}): {(non_zero_counts == new_top_k).sum().item()}"
+    )
 
     # Show ordering statistics
-    print(f"\n=== Ordering Statistics ===")
-    print(f"Rows with changed order after sorting: {rows_with_order_change:,} / {vocab_size:,} ({100*rows_with_order_change/vocab_size:.1f}%)")
+    print("\n=== Ordering Statistics ===")
+    print(
+        f"Rows with changed order after sorting: {rows_with_order_change:,} / {vocab_size:,} ({100 * rows_with_order_change / vocab_size:.1f}%)"
+    )
     if preserve_last:
-        print(f"Rows with preserved last element: {rows_with_preserved_last:,} / {vocab_size:,} ({100*rows_with_preserved_last/vocab_size:.1f}%)")
+        print(
+            f"Rows with preserved last element: {rows_with_preserved_last:,} / {vocab_size:,} ({100 * rows_with_preserved_last / vocab_size:.1f}%)"
+        )
 
     # Show last column maximum element statistics
-    print(f"\n=== Last Column Maximum Element Statistics ===")
+    print("\n=== Last Column Maximum Element Statistics ===")
     total_rows_with_data = sum(max_element_positions.values())
     if total_rows_with_data > 0:
         percentage_last_max = 100 * rows_with_max_in_last_column / total_rows_with_data
-        print(f"Rows with maximum element in LAST column: {rows_with_max_in_last_column:,} / {total_rows_with_data:,} ({percentage_last_max:.1f}%)")
-        print(f"Rows with maximum element in NON-LAST columns: {total_rows_with_data - rows_with_max_in_last_column:,} / {total_rows_with_data:,} ({100 - percentage_last_max:.1f}%)")
+        print(
+            f"Rows with maximum element in LAST column: {rows_with_max_in_last_column:,} / {total_rows_with_data:,} ({percentage_last_max:.1f}%)"
+        )
+        print(
+            f"Rows with maximum element in NON-LAST columns: {total_rows_with_data - rows_with_max_in_last_column:,} / {total_rows_with_data:,} ({100 - percentage_last_max:.1f}%)"
+        )
     else:
-        print(f"No valid data found to analyze last column statistics")
+        print("No valid data found to analyze last column statistics")
 
     # Show maximum element position distribution
-    print(f"\n=== Maximum Element Position Distribution (Original Ordering) ===")
+    print("\n=== Maximum Element Position Distribution (Original Ordering) ===")
     total_rows_with_data = sum(max_element_positions.values())
     print(f"Total rows with valid data: {total_rows_with_data:,}")
 
@@ -115,45 +136,93 @@ def print_projection_statistics(
     sorted_positions = sorted(max_element_positions.keys())
     for pos in sorted_positions[:20]:  # Show up to first 20 positions
         count = max_element_positions[pos]
-        percentage = 100 * count / total_rows_with_data if total_rows_with_data > 0 else 0
-        ordinal = ["1st", "2nd", "3rd", "4th", "5th", "6th", "7th", "8th", "9th", "10th"][pos] if pos < 10 else f"{pos+1}th"
-        print(f"Rows with max element in {ordinal} position: {count:,} / {total_rows_with_data:,} ({percentage:.1f}%)")
+        percentage = (
+            100 * count / total_rows_with_data if total_rows_with_data > 0 else 0
+        )
+        ordinal = (
+            ["1st", "2nd", "3rd", "4th", "5th", "6th", "7th", "8th", "9th", "10th"][pos]
+            if pos < 10
+            else f"{pos + 1}th"
+        )
+        print(
+            f"Rows with max element in {ordinal} position: {count:,} / {total_rows_with_data:,} ({percentage:.1f}%)"
+        )
 
     if len(sorted_positions) > 20:
-        remaining_count = sum(max_element_positions[pos] for pos in sorted_positions[20:])
-        remaining_percentage = 100 * remaining_count / total_rows_with_data if total_rows_with_data > 0 else 0
-        print(f"Rows with max element in positions 21+: {remaining_count:,} / {total_rows_with_data:,} ({remaining_percentage:.1f}%)")
+        remaining_count = sum(
+            max_element_positions[pos] for pos in sorted_positions[20:]
+        )
+        remaining_percentage = (
+            100 * remaining_count / total_rows_with_data
+            if total_rows_with_data > 0
+            else 0
+        )
+        print(
+            f"Rows with max element in positions 21+: {remaining_count:,} / {total_rows_with_data:,} ({remaining_percentage:.1f}%)"
+        )
 
     # Show final maximum element position distribution (after sorting and normalization)
-    print(f"\n=== Maximum Element Position Distribution (Final Sorted & Normalized Matrix) ===")
+    print(
+        "\n=== Maximum Element Position Distribution (Final Sorted & Normalized Matrix) ==="
+    )
     total_final_rows_with_data = sum(final_max_element_positions.values())
     print(f"Total rows with valid data: {total_final_rows_with_data:,}")
 
     if total_final_rows_with_data > 0:
         # Sort positions for ordered display
         sorted_final_positions = sorted(final_max_element_positions.keys())
-        for pos in sorted_final_positions[:min(new_top_k, 20)]:  # Show up to new_top_k or 20 positions
+        for pos in sorted_final_positions[
+            : min(new_top_k, 20)
+        ]:  # Show up to new_top_k or 20 positions
             count = final_max_element_positions[pos]
             percentage = 100 * count / total_final_rows_with_data
-            ordinal = ["1st", "2nd", "3rd", "4th", "5th", "6th", "7th", "8th", "9th", "10th"][pos] if pos < 10 else f"{pos+1}th"
-            print(f"Rows with max element in {ordinal} position: {count:,} / {total_final_rows_with_data:,} ({percentage:.1f}%)")
+            ordinal = (
+                ["1st", "2nd", "3rd", "4th", "5th", "6th", "7th", "8th", "9th", "10th"][
+                    pos
+                ]
+                if pos < 10
+                else f"{pos + 1}th"
+            )
+            print(
+                f"Rows with max element in {ordinal} position: {count:,} / {total_final_rows_with_data:,} ({percentage:.1f}%)"
+            )
 
         if len(sorted_final_positions) > min(new_top_k, 20):
-            remaining_count = sum(final_max_element_positions[pos] for pos in sorted_final_positions[min(new_top_k, 20):])
+            remaining_count = sum(
+                final_max_element_positions[pos]
+                for pos in sorted_final_positions[min(new_top_k, 20) :]
+            )
             remaining_percentage = 100 * remaining_count / total_final_rows_with_data
-            print(f"Rows with max element in positions {min(new_top_k, 20)+1}+: {remaining_count:,} / {total_final_rows_with_data:,} ({remaining_percentage:.1f}%)")
+            print(
+                f"Rows with max element in positions {min(new_top_k, 20) + 1}+: {remaining_count:,} / {total_final_rows_with_data:,} ({remaining_percentage:.1f}%)"
+            )
 
     # Show significant components statistics
-    print(f"\n=== Significant Components Statistics (threshold >= {threshold_for_significance}) ===")
-    component_names = ["1st", "2nd", "3rd", "4th", "5th", "6th", "7th", "8th", "9th", "10th"]
+    print(
+        f"\n=== Significant Components Statistics (threshold >= {threshold_for_significance}) ==="
+    )
+    component_names = [
+        "1st",
+        "2nd",
+        "3rd",
+        "4th",
+        "5th",
+        "6th",
+        "7th",
+        "8th",
+        "9th",
+        "10th",
+    ]
     for i, count in enumerate(significant_components_count):
         percentage = 100 * count / vocab_size if vocab_size > 0 else 0
-        print(f"Rows with significant {component_names[i]} component: {count:,} / {vocab_size:,} ({percentage:.1f}%)")
+        print(
+            f"Rows with significant {component_names[i]} component: {count:,} / {vocab_size:,} ({percentage:.1f}%)"
+        )
 
     # Additional analysis: distribution of likelihood values (after normalization)
     all_likelihoods = normalized_likelihoods[normalized_likelihoods > 0]
     if len(all_likelihoods) > 0:
-        print(f"\n=== Likelihood Distribution ===")
+        print("\n=== Likelihood Distribution ===")
         print(f"Total non-zero likelihoods: {len(all_likelihoods):,}")
         print(f"Mean likelihood: {all_likelihoods.mean().item():.4f}")
         print(f"Median likelihood: {all_likelihoods.median().item():.4f}")
@@ -164,22 +233,28 @@ def print_projection_statistics(
         percentiles = [90, 95, 99]
         all_likelihoods_float = all_likelihoods.float()
         for p in percentiles:
-            val = torch.quantile(all_likelihoods_float, p/100.0).item()
+            val = torch.quantile(all_likelihoods_float, p / 100.0).item()
             print(f"{p}th percentile: {val:.4f}")
 
     # Show how many rows have multiple significant components
-    print(f"\n=== Multi-Component Analysis ===")
+    print("\n=== Multi-Component Analysis ===")
     rows_with_multiple_significant = 0
     for row_idx in range(vocab_size):
-        significant_in_row = (normalized_likelihoods[row_idx] >= threshold_for_significance).sum().item()
+        significant_in_row = (
+            (normalized_likelihoods[row_idx] >= threshold_for_significance).sum().item()
+        )
         if significant_in_row >= 2:
             rows_with_multiple_significant += 1
 
-    percentage_multi = 100 * rows_with_multiple_significant / vocab_size if vocab_size > 0 else 0
-    print(f"Rows with 2+ significant components: {rows_with_multiple_significant:,} / {vocab_size:,} ({percentage_multi:.1f}%)")
+    percentage_multi = (
+        100 * rows_with_multiple_significant / vocab_size if vocab_size > 0 else 0
+    )
+    print(
+        f"Rows with 2+ significant components: {rows_with_multiple_significant:,} / {vocab_size:,} ({percentage_multi:.1f}%)"
+    )
 
     # Show normalization effect
-    print(f"\n=== Normalization Effect ===")
+    print("\n=== Normalization Effect ===")
     # Calculate row sums for ALL rows (including zero rows)
     all_row_sums = normalized_likelihoods.sum(dim=1)
     non_zero_rows = (normalized_likelihoods > 0).any(dim=1)
@@ -191,7 +266,7 @@ def print_projection_statistics(
 
     if non_zero_rows.any():
         row_sums_nonzero = all_row_sums[non_zero_rows]
-        print(f"\nNon-zero rows statistics:")
+        print("\nNon-zero rows statistics:")
         print(f"  Mean sum: {row_sums_nonzero.mean().item():.6f}")
         print(f"  Std sum: {row_sums_nonzero.std().item():.6f}")
         print(f"  Min sum: {row_sums_nonzero.min().item():.6f}")
@@ -203,7 +278,9 @@ def print_projection_statistics(
             perfect_rows = (torch.abs(row_sums_nonzero - 1.0) < tol).sum().item()
             imperfect_rows = len(row_sums_nonzero) - perfect_rows
             percentage_imperfect = 100 * imperfect_rows / len(row_sums_nonzero)
-            print(f"  Rows NOT summing to 1.0 (tol={tol}): {imperfect_rows:,}/{len(row_sums_nonzero):,} ({percentage_imperfect:.2f}%)")
+            print(
+                f"  Rows NOT summing to 1.0 (tol={tol}): {imperfect_rows:,}/{len(row_sums_nonzero):,} ({percentage_imperfect:.2f}%)"
+            )
 
     # Show distribution of row sums that deviate from 1.0
     if non_zero_rows.any():
@@ -212,7 +289,9 @@ def print_projection_statistics(
         significant_deviations = deviations > 1e-3
 
         if significant_deviations.any():
-            print(f"\nRows with significant deviations from 1.0 (>0.001): {significant_deviations.sum().item():,}")
+            print(
+                f"\nRows with significant deviations from 1.0 (>0.001): {significant_deviations.sum().item():,}"
+            )
             worst_deviations = deviations[significant_deviations]
             print(f"  Mean deviation: {worst_deviations.mean().item():.6f}")
             print(f"  Max deviation: {worst_deviations.max().item():.6f}")
@@ -224,15 +303,20 @@ def print_projection_statistics(
                 actual_row_idx = torch.nonzero(non_zero_rows)[idx].item()
                 sum_val = row_sums_nonzero[idx].item()
                 deviation = deviations[idx].item()
-                non_zero_count = (normalized_likelihoods[actual_row_idx] > 0).sum().item()
-                print(f"    Row {actual_row_idx}: sum={sum_val:.6f}, deviation={deviation:.6f}, non_zeros={non_zero_count}")
+                non_zero_count = (
+                    (normalized_likelihoods[actual_row_idx] > 0).sum().item()
+                )
+                print(
+                    f"    Row {actual_row_idx}: sum={sum_val:.6f}, deviation={deviation:.6f}, non_zeros={non_zero_count}"
+                )
         else:
-            print(f"\nAll non-zero rows sum very close to 1.0 (deviation < 0.001)")
+            print("\nAll non-zero rows sum very close to 1.0 (deviation < 0.001)")
 
 
-def sort_and_cut_projection_matrix(input_path, output_path, new_top_k, preserve_last=False, verbose=True):
-    """
-    Load a projection matrix, sort each row by weight values, and save with new top_k cutoff.
+def sort_and_cut_projection_matrix(
+    input_path, output_path, new_top_k, preserve_last=False, verbose=True
+):
+    """Load a projection matrix, sort each row by weight values, and save with new top_k cutoff.
 
     Args:
         input_path: Path to input projection matrix file
@@ -245,13 +329,21 @@ def sort_and_cut_projection_matrix(input_path, output_path, new_top_k, preserve_
         print(f"Loading projection matrix from: {input_path}")
 
     # Load the projection matrix
-    projection_data = torch.load(input_path, map_location='cpu', weights_only=False)
+    projection_data = torch.load(input_path, map_location="cpu", weights_only=False)
 
-    if not isinstance(projection_data, dict) or 'indices' not in projection_data or 'likelihoods' not in projection_data:
-        raise ValueError("Input file must contain a dictionary with 'indices' and 'likelihoods' keys")
+    if (
+        not isinstance(projection_data, dict)
+        or "indices" not in projection_data
+        or "likelihoods" not in projection_data
+    ):
+        raise ValueError(
+            "Input file must contain a dictionary with 'indices' and 'likelihoods' keys"
+        )
 
-    original_indices = projection_data['indices']  # Shape: [vocab_size, original_top_k]
-    original_likelihoods = projection_data['likelihoods']  # Shape: [vocab_size, original_top_k]
+    original_indices = projection_data["indices"]  # Shape: [vocab_size, original_top_k]
+    original_likelihoods = projection_data[
+        "likelihoods"
+    ]  # Shape: [vocab_size, original_top_k]
 
     vocab_size, original_top_k = original_indices.shape
 
@@ -262,20 +354,26 @@ def sort_and_cut_projection_matrix(input_path, output_path, new_top_k, preserve_
         print(f"Preserve last column: {preserve_last}")
 
     if new_top_k > original_top_k:
-        print(f"Warning: New top_k ({new_top_k}) is larger than original top_k ({original_top_k})")
-        print(f"Will pad with -1 indices and 0.0 likelihoods")
+        print(
+            f"Warning: New top_k ({new_top_k}) is larger than original top_k ({original_top_k})"
+        )
+        print("Will pad with -1 indices and 0.0 likelihoods")
         effective_top_k = original_top_k
     else:
         effective_top_k = new_top_k
 
     # Initialize new tensors
     new_indices = torch.full((vocab_size, new_top_k), -1, dtype=original_indices.dtype)
-    new_likelihoods = torch.zeros((vocab_size, new_top_k), dtype=original_likelihoods.dtype)
+    new_likelihoods = torch.zeros(
+        (vocab_size, new_top_k), dtype=original_likelihoods.dtype
+    )
 
     # Statistics tracking
     rows_with_order_change = 0
     significant_components_count = [0] * min(new_top_k, 10)  # Track up to 10 components
-    threshold_for_significance = 0.2  # Threshold for considering a component "significant"
+    threshold_for_significance = (
+        0.2  # Threshold for considering a component "significant"
+    )
     # Track position of maximum element in original ordering
     max_element_positions = {}  # position -> count
     # Track preserve_last statistics
@@ -290,7 +388,9 @@ def sort_and_cut_projection_matrix(input_path, output_path, new_top_k, preserve_
 
     # Process each row (each source token)
     last_element_trick_count = 0
-    for row_idx in tqdm.tqdm(range(vocab_size), desc="Processing rows", disable=not verbose):
+    for row_idx in tqdm.tqdm(
+        range(vocab_size), desc="Processing rows", disable=not verbose
+    ):
         row_indices = original_indices[row_idx]  # [original_top_k]
         row_likelihoods = original_likelihoods[row_idx]  # [original_top_k]
 
@@ -337,13 +437,17 @@ def sort_and_cut_projection_matrix(input_path, output_path, new_top_k, preserve_
                     elements_to_sort = min(len(valid_likelihoods), original_top_k - 1)
                     if elements_to_sort > 0:
                         # Get elements excluding the last position in original matrix
-                        sort_mask = torch.arange(len(valid_likelihoods)) < elements_to_sort
+                        sort_mask = (
+                            torch.arange(len(valid_likelihoods)) < elements_to_sort
+                        )
                         if sort_mask.any():
                             sortable_indices = valid_indices[sort_mask]
                             sortable_likelihoods = valid_likelihoods[sort_mask]
 
                             # Sort the non-last elements
-                            sorted_likelihoods, sort_order = torch.sort(sortable_likelihoods, descending=True)
+                            sorted_likelihoods, sort_order = torch.sort(
+                                sortable_likelihoods, descending=True
+                            )
                             sorted_indices = sortable_indices[sort_order]
 
                             # Check if order changed in the sortable portion
@@ -354,12 +458,24 @@ def sort_and_cut_projection_matrix(input_path, output_path, new_top_k, preserve_
                             # Take top (new_top_k - 1) elements from sorted portion
                             num_from_sorted = min(len(sorted_indices), new_top_k - 1)
 
-                            new_indices[row_idx, :num_from_sorted] = sorted_indices[:num_from_sorted]
-                            new_likelihoods[row_idx, :num_from_sorted] = sorted_likelihoods[:num_from_sorted]
+                            new_indices[row_idx, :num_from_sorted] = sorted_indices[
+                                :num_from_sorted
+                            ]
+                            new_likelihoods[row_idx, :num_from_sorted] = (
+                                sorted_likelihoods[:num_from_sorted]
+                            )
 
                             # Count significant components from sorted portion
-                            for comp_idx in range(min(num_from_sorted, len(significant_components_count) - 1)):
-                                if sorted_likelihoods[comp_idx] >= threshold_for_significance:
+                            for comp_idx in range(
+                                min(
+                                    num_from_sorted,
+                                    len(significant_components_count) - 1,
+                                )
+                            ):
+                                if (
+                                    sorted_likelihoods[comp_idx]
+                                    >= threshold_for_significance
+                                ):
                                     significant_components_count[comp_idx] += 1
 
                     # Always put the last element at the end (if valid)
@@ -379,7 +495,9 @@ def sort_and_cut_projection_matrix(input_path, output_path, new_top_k, preserve_
                 # Original logic: sort all elements normally
                 # Check if order changed by comparing original vs sorted order
                 original_order = torch.arange(len(valid_likelihoods))
-                sorted_likelihoods, sort_order = torch.sort(valid_likelihoods, descending=True)
+                sorted_likelihoods, sort_order = torch.sort(
+                    valid_likelihoods, descending=True
+                )
 
                 # Check if the order changed (not just sorted, but actually different)
                 if not torch.equal(sort_order, original_order):
@@ -391,9 +509,13 @@ def sort_and_cut_projection_matrix(input_path, output_path, new_top_k, preserve_
                 num_to_take = min(len(sorted_indices), effective_top_k)
 
                 new_indices[row_idx, :num_to_take] = sorted_indices[:num_to_take]
-                new_likelihoods[row_idx, :num_to_take] = sorted_likelihoods[:num_to_take]
+                new_likelihoods[row_idx, :num_to_take] = sorted_likelihoods[
+                    :num_to_take
+                ]
                 # Count significant components (components above threshold)
-                for comp_idx in range(min(num_to_take, len(significant_components_count))):
+                for comp_idx in range(
+                    min(num_to_take, len(significant_components_count))
+                ):
                     if sorted_likelihoods[comp_idx] >= threshold_for_significance:
                         significant_components_count[comp_idx] += 1
 
@@ -429,13 +551,13 @@ def sort_and_cut_projection_matrix(input_path, output_path, new_top_k, preserve_
 
     # Create output dictionary with same format as input
     output_data = {
-        'indices': new_indices,
-        'likelihoods': normalized_likelihoods,
+        "indices": new_indices,
+        "likelihoods": normalized_likelihoods,
     }
 
     # Copy over any additional metadata
     for key in projection_data:
-        if key not in ['indices', 'likelihoods']:
+        if key not in ["indices", "likelihoods"]:
             output_data[key] = projection_data[key]
 
     # Save the new projection matrix
@@ -466,10 +588,16 @@ def main():
     # Resolve preserve_last from CLI override -> projection-map metadata -> default False.
     if args.preserve_last is None:
         try:
-            meta = torch.load(args.initial_projection_path, map_location="cpu", weights_only=False)
+            meta = torch.load(
+                args.initial_projection_path, map_location="cpu", weights_only=False
+            )
         except (FileNotFoundError, RuntimeError):
             meta = {}
-        preserve_last = bool(meta.get("enable_scale_trick", False)) if isinstance(meta, dict) else False
+        preserve_last = (
+            bool(meta.get("enable_scale_trick", False))
+            if isinstance(meta, dict)
+            else False
+        )
         if preserve_last and not args.quiet:
             print(
                 "Auto-enabling --preserve_last because projection map was generated with "

@@ -39,7 +39,6 @@ from nemo_rl.algorithms.x_token.loss_utils import (
 )
 from nemo_rl.algorithms.x_token.token_aligner import AlignmentBatch
 
-
 # ---------------------------------------------------------------------------
 # alignment_from_flat_batch
 # ---------------------------------------------------------------------------
@@ -91,9 +90,7 @@ class TestChunkAverageLogProbs:
     def test_chunk_id_minus_one_contributes_nothing(self):
         # B=1, T=4, V=2, max_chunks=2. Position 0 in chunk 0, position 1
         # in chunk -1 (skipped), positions 2-3 in chunk 1.
-        log_probs = torch.tensor(
-            [[[1.0, 2.0], [99.0, 99.0], [3.0, 4.0], [5.0, 6.0]]]
-        )
+        log_probs = torch.tensor([[[1.0, 2.0], [99.0, 99.0], [3.0, 4.0], [5.0, 6.0]]])
         chunk_id = torch.tensor([[0, -1, 1, 1]])
         avg, sizes = chunk_average_log_probs(log_probs, chunk_id, max_chunks=2)
 
@@ -142,9 +139,7 @@ class TestValidChunkMask:
 
 class TestParseProjectionFile:
     def test_dense_topk_format(self, synth_topk_projection_path):
-        indices, values, v_s, v_t = parse_projection_file(
-            synth_topk_projection_path
-        )
+        indices, values, v_s, v_t = parse_projection_file(synth_topk_projection_path)
         # COO layout: indices [2, nnz] = (student_idx, teacher_idx).
         assert indices.dim() == 2 and indices.shape[0] == 2
         assert values.dim() == 1 and values.shape[0] == indices.shape[1]
@@ -157,9 +152,7 @@ class TestParseProjectionFile:
         assert (indices[1] == -1).any().item()
 
     def test_sparse_dict_format(self, synth_sparse_projection_path):
-        indices, values, v_s, v_t = parse_projection_file(
-            synth_sparse_projection_path
-        )
+        indices, values, v_s, v_t = parse_projection_file(synth_sparse_projection_path)
         assert indices.shape[0] == 2
         # The synth sparse fixture seeds 3 entries.
         assert indices.shape[1] == 3
@@ -210,41 +203,46 @@ class TestGetSparseProjectionMatrix:
     def test_repeat_call_hits_cache(self, synth_topk_projection_path):
         device = torch.device("cpu")
         out1 = get_sparse_projection_matrix(
-            synth_topk_projection_path, device,
-            student_vocab_size=32, teacher_vocab_size=24,
+            synth_topk_projection_path,
+            device,
+            student_vocab_size=32,
+            teacher_vocab_size=24,
         )
         out2 = get_sparse_projection_matrix(
-            synth_topk_projection_path, device,
-            student_vocab_size=32, teacher_vocab_size=24,
+            synth_topk_projection_path,
+            device,
+            student_vocab_size=32,
+            teacher_vocab_size=24,
         )
         assert out2 is out1  # same tensor object from cache
 
-    def test_different_size_distinct_cache_entries(
-        self, synth_topk_projection_path
-    ):
+    def test_different_size_distinct_cache_entries(self, synth_topk_projection_path):
         device = torch.device("cpu")
         a = get_sparse_projection_matrix(
-            synth_topk_projection_path, device,
-            student_vocab_size=32, teacher_vocab_size=24,
+            synth_topk_projection_path,
+            device,
+            student_vocab_size=32,
+            teacher_vocab_size=24,
         )
         b = get_sparse_projection_matrix(
-            synth_topk_projection_path, device,
-            student_vocab_size=64, teacher_vocab_size=48,
+            synth_topk_projection_path,
+            device,
+            student_vocab_size=64,
+            teacher_vocab_size=48,
         )
         assert a is not b
         assert a.shape == (32, 24)
         assert b.shape == (64, 48)
 
-    def test_negative_teacher_sentinels_dropped(
-        self, synth_topk_projection_path
-    ):
+    def test_negative_teacher_sentinels_dropped(self, synth_topk_projection_path):
         # The dense topk format has sentinel -1 entries (per
         # parse_projection_file test); get_sparse_projection_matrix
         # must drop them — sparse_coo_tensor disallows negative indices.
         out = get_sparse_projection_matrix(
             synth_topk_projection_path,
             torch.device("cpu"),
-            student_vocab_size=32, teacher_vocab_size=24,
+            student_vocab_size=32,
+            teacher_vocab_size=24,
         )
         ind = out.indices()
         assert (ind[1] >= 0).all().item()
@@ -273,9 +271,7 @@ class TestGetTopkProjection:
 
     def test_sparse_format_rejected(self, synth_sparse_projection_path):
         with pytest.raises(ValueError, match="dense"):
-            get_topk_projection(
-                synth_sparse_projection_path, torch.device("cpu")
-            )
+            get_topk_projection(synth_sparse_projection_path, torch.device("cpu"))
 
 
 # ---------------------------------------------------------------------------
@@ -305,12 +301,16 @@ class TestBuildExactTokenMap:
     def test_cache_key_includes_xtoken_loss(self, synth_topk_projection_path):
         device = torch.device("cpu")
         a = build_exact_token_map(
-            synth_topk_projection_path, device,
-            xtoken_loss=False, teacher_vocab_size=24,
+            synth_topk_projection_path,
+            device,
+            xtoken_loss=False,
+            teacher_vocab_size=24,
         )
         b = build_exact_token_map(
-            synth_topk_projection_path, device,
-            xtoken_loss=True, teacher_vocab_size=24,
+            synth_topk_projection_path,
+            device,
+            xtoken_loss=True,
+            teacher_vocab_size=24,
         )
         # Different xtoken_loss → distinct cache entries (different dicts).
         assert a is not b
@@ -323,11 +323,15 @@ class TestBuildExactTokenMap:
     def test_repeat_call_hits_cache(self, synth_topk_projection_path):
         device = torch.device("cpu")
         a = build_exact_token_map(
-            synth_topk_projection_path, device,
-            xtoken_loss=False, teacher_vocab_size=24,
+            synth_topk_projection_path,
+            device,
+            xtoken_loss=False,
+            teacher_vocab_size=24,
         )
         b = build_exact_token_map(
-            synth_topk_projection_path, device,
-            xtoken_loss=False, teacher_vocab_size=24,
+            synth_topk_projection_path,
+            device,
+            xtoken_loss=False,
+            teacher_vocab_size=24,
         )
         assert a is b  # cache returns the same dict object

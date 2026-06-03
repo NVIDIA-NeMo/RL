@@ -28,7 +28,6 @@ import torch
 from nemo_rl.algorithms.x_token.token_aligner import AlignmentBatch, TokenAligner
 from nemo_rl.data.cross_tokenizer_collate import CrossTokenizerCollator
 
-
 # ---------------------------------------------------------------------------
 # Fake tokenizer — deterministic, no HF dependency.
 # ---------------------------------------------------------------------------
@@ -53,18 +52,14 @@ class FakeTokenizer:
         self.pad_token = "<pad>"
         self._prefix = prefix
 
-    def __call__(
-        self, texts, padding, truncation, max_length, return_tensors
-    ):
+    def __call__(self, texts, padding, truncation, max_length, return_tensors):
         assert padding == "max_length"
         assert truncation is True
         assert return_tensors == "pt"
         all_ids = []
         all_mask = []
         for t in texts:
-            ids = [
-                2 + (ord(c) % (self.vocab_size - 2)) for c in t
-            ][:max_length]
+            ids = [2 + (ord(c) % (self.vocab_size - 2)) for c in t][:max_length]
             mask = [1] * len(ids)
             if len(ids) < max_length:
                 pad_n = max_length - len(ids)

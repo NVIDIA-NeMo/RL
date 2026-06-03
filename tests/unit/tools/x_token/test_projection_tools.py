@@ -36,11 +36,14 @@ from nemo_rl.algorithms.x_token.loss_utils import parse_projection_file
 from tools.x_token import (
     minimal_projection_generator,
     minimal_projection_via_multitoken,
-    reapply_exact_map as reapply_mod,
-    sort_and_cut_projection_matrix as sort_cut_mod,
     utils,
 )
-
+from tools.x_token import (
+    reapply_exact_map as reapply_mod,
+)
+from tools.x_token import (
+    sort_and_cut_projection_matrix as sort_cut_mod,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
@@ -124,9 +127,7 @@ class TestSaveDataLoadDataRoundtrip:
         # field round-trip rather than the dict — that's what the helper
         # actually does on disk.
         out_path = tmp_path / "subdir" / "indices.pt"
-        minimal_projection_generator.save_data(
-            projection["indices"], str(out_path)
-        )
+        minimal_projection_generator.save_data(projection["indices"], str(out_path))
         loaded = minimal_projection_generator.load_data(str(out_path))
         assert torch.equal(loaded, projection["indices"])
 
@@ -173,10 +174,8 @@ class TestGenerateProjectionMapChunk:
         # slot becomes -1 sentinel.
         similarities = torch.tensor([[0.1, 0.95, 0.3, 0.5]])
         args = SimpleNamespace(top_k=2, weight_threshold=0.99)
-        top_ind, _top_lik = (
-            minimal_projection_generator.generate_projection_map_chunk(
-                similarities, args
-            )
+        top_ind, _top_lik = minimal_projection_generator.generate_projection_map_chunk(
+            similarities, args
         )
         # The top-1 may or may not survive the threshold (depends on the
         # post-sharpness/sinkhorn likelihood), but any entry below it
@@ -211,24 +210,20 @@ class TestAddMultitokenMappings:
             "de": {"input_ids": [13]},
         }
         target_tokenizer.side_effect = lambda text, **kw: encodings[text]
-        target_tokenizer.decode.side_effect = (
-            lambda ids: f"<tgt-{ids[0]}>"
-        )
+        target_tokenizer.decode.side_effect = lambda ids: f"<tgt-{ids[0]}>"
 
         counts: dict = defaultdict(float)
-        decoded, examples = (
-            minimal_projection_via_multitoken.add_multitoken_mappings(
-                source_tokenizer=source_tokenizer,
-                target_tokenizer=target_tokenizer,
-                source_total_vocab_size=3,
-                source_ignore_ids=set(),
-                target_ignore_ids=set(),
-                source_role="student",
-                transformation_counts=counts,
-                tokens_to_cut=4,
-                use_raw_tokens=False,
-                use_canonicalization=False,
-            )
+        decoded, examples = minimal_projection_via_multitoken.add_multitoken_mappings(
+            source_tokenizer=source_tokenizer,
+            target_tokenizer=target_tokenizer,
+            source_total_vocab_size=3,
+            source_ignore_ids=set(),
+            target_ignore_ids=set(),
+            source_role="student",
+            transformation_counts=counts,
+            tokens_to_cut=4,
+            use_raw_tokens=False,
+            use_canonicalization=False,
         )
         # All three source tokens got decoded.
         assert set(decoded.keys()) == {0, 1, 2}
@@ -293,9 +288,7 @@ class TestSortAndCutProjectionMatrix:
         # After Sinkhorn the absolute values change, but the ordering
         # (descending per row) must hold.
         for r in range(4):
-            assert (
-                out["likelihoods"][r, 0] >= out["likelihoods"][r, 1]
-            ).item()
+            assert (out["likelihoods"][r, 0] >= out["likelihoods"][r, 1]).item()
 
     def test_preserve_last_keeps_last_column(self, tmp_path: Path):
         in_path = tmp_path / "in.pt"
@@ -311,9 +304,7 @@ class TestSortAndCutProjectionMatrix:
         # the original input (per the preserve_last branch).
         original = torch.load(in_path, map_location="cpu", weights_only=False)
         for r in range(4):
-            assert (
-                out["indices"][r, -1].item() == original["indices"][r, -1].item()
-            )
+            assert out["indices"][r, -1].item() == original["indices"][r, -1].item()
 
 
 class TestSortAndCutAutoPreserveFromMetadata:
@@ -346,9 +337,7 @@ class TestSortAndCutAutoPreserveFromMetadata:
         def _record(input_path, output_path, new_top_k, *, preserve_last, verbose):
             recorded["preserve_last"] = preserve_last
 
-        monkeypatch.setattr(
-            sort_cut_mod, "sort_and_cut_projection_matrix", _record
-        )
+        monkeypatch.setattr(sort_cut_mod, "sort_and_cut_projection_matrix", _record)
 
         sort_cut_mod.main()
         assert recorded["preserve_last"] is True
@@ -421,17 +410,16 @@ class TestShared:
         assert torch.allclose(out[2], torch.tensor([1.0, 0.0, 0.0]))
 
     def test_clean_model_name_strips_param_count_and_suffixes(self):
-        assert utils.clean_model_name_for_filename(
-            "meta-llama/Llama-3.2-1B"
-        ) == "meta-llama/Llama-3.2"
+        assert (
+            utils.clean_model_name_for_filename("meta-llama/Llama-3.2-1B")
+            == "meta-llama/Llama-3.2"
+        )
         assert (
             utils.clean_model_name_for_filename("microsoft/phi-4-Base")
             == "microsoft/phi"
         )
         # "mini" preserved as suffix.
-        cleaned = utils.clean_model_name_for_filename(
-            "Qwen2.5-0.5B-mini-Instruct"
-        )
+        cleaned = utils.clean_model_name_for_filename("Qwen2.5-0.5B-mini-Instruct")
         assert "mini" in cleaned
 
 
@@ -474,9 +462,7 @@ class TestReapplyExactMap:
             lambda name: MagicMock(),
         )
         # canonical_token is a passthrough when use_canonicalization=False.
-        monkeypatch.setattr(
-            reapply_mod, "canonical_token", lambda t, *, enabled: t
-        )
+        monkeypatch.setattr(reapply_mod, "canonical_token", lambda t, *, enabled: t)
 
         # Build an input projection with 4 students × top_k=3, all
         # initial likelihoods != 1.0 so we can detect the rewrite.

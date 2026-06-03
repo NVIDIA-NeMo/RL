@@ -39,7 +39,6 @@ from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     xtoken_off_policy_distillation_train,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -96,54 +95,56 @@ def _make_master_config(
     bypass strict TypedDict field validation (matches the pattern used
     in tests/unit/algorithms/test_rm.py).
     """
-    return MasterConfig.model_construct(**{
-        "distillation": {
-            "num_prompts_per_step": 1,
-            "max_num_steps": max_num_steps,
-            "max_num_epochs": max_num_epochs,
-            "seed": 42,
-            "val_period": val_period,
-            "val_at_start": val_at_start,
-            "val_at_end": val_at_end,
-        },
-        "policy": {
-            "dtensor_cfg": {"enabled": True, "_v2": True},
-            "max_total_sequence_length": 64,
-            "make_sequence_length_divisible_by": 8,
-            "tokenizer": {"name": "student-tok"},
-        },
-        "teacher": {
-            "dtensor_cfg": {"enabled": True, "_v2": True},
-            "max_total_sequence_length": 64,
-            "make_sequence_length_divisible_by": 8,
-            "tokenizer": {"name": "teacher-tok"},
-        },
-        "loss_fn": {
-            "projection_matrix_path": "/tmp/dummy-projection.pt",
-            "gold_loss": False,
-            "xtoken_loss": False,
-            "temperature": 1.0,
-            "vocab_topk": 8,
-            "uncommon_topk": 4,
-            "reverse_kl": False,
-            "exact_token_match_only": False,
-            "kl_loss_weight": 1.0,
-            "ce_loss_scale": 1.0,
-            "dynamic_loss_scaling": False,
-        },
-        "data": {
-            "shuffle": False,
-            "num_workers": 0,
-        },
-        "logger": {"log_dir": "/tmp/logger"},
-        "cluster": {"num_nodes": 1, "gpus_per_node": 1},
-        "checkpointing": {
-            "enabled": save_enabled,
-            "checkpoint_must_save_by": None,
-            "save_period": 100,
-            "metric_name": None,
-        },
-    })
+    return MasterConfig.model_construct(
+        **{
+            "distillation": {
+                "num_prompts_per_step": 1,
+                "max_num_steps": max_num_steps,
+                "max_num_epochs": max_num_epochs,
+                "seed": 42,
+                "val_period": val_period,
+                "val_at_start": val_at_start,
+                "val_at_end": val_at_end,
+            },
+            "policy": {
+                "dtensor_cfg": {"enabled": True, "_v2": True},
+                "max_total_sequence_length": 64,
+                "make_sequence_length_divisible_by": 8,
+                "tokenizer": {"name": "student-tok"},
+            },
+            "teacher": {
+                "dtensor_cfg": {"enabled": True, "_v2": True},
+                "max_total_sequence_length": 64,
+                "make_sequence_length_divisible_by": 8,
+                "tokenizer": {"name": "teacher-tok"},
+            },
+            "loss_fn": {
+                "projection_matrix_path": "/tmp/dummy-projection.pt",
+                "gold_loss": False,
+                "xtoken_loss": False,
+                "temperature": 1.0,
+                "vocab_topk": 8,
+                "uncommon_topk": 4,
+                "reverse_kl": False,
+                "exact_token_match_only": False,
+                "kl_loss_weight": 1.0,
+                "ce_loss_scale": 1.0,
+                "dynamic_loss_scaling": False,
+            },
+            "data": {
+                "shuffle": False,
+                "num_workers": 0,
+            },
+            "logger": {"log_dir": "/tmp/logger"},
+            "cluster": {"num_nodes": 1, "gpus_per_node": 1},
+            "checkpointing": {
+                "enabled": save_enabled,
+                "checkpoint_must_save_by": None,
+                "save_period": 100,
+                "metric_name": None,
+            },
+        }
+    )
 
 
 def _make_tokenizer(vocab_size: int) -> MagicMock:
@@ -505,7 +506,9 @@ def _drive_run_main(config_dict: dict):
         patch.object(runner, "get_next_experiment_dir", return_value="/tmp/exp"),
         patch.object(runner, "init_ray"),
         patch.object(runner, "get_tokenizer"),
-        patch.object(runner, "setup_response_data", return_value=(MagicMock(), MagicMock())),
+        patch.object(
+            runner, "setup_response_data", return_value=(MagicMock(), MagicMock())
+        ),
         patch.object(runner, "setup") as mock_setup,
         patch.object(runner, "xtoken_off_policy_distillation_train"),
     ):

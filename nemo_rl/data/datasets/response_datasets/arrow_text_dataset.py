@@ -79,9 +79,7 @@ class ArrowTextDataset(RawDataset):
         # cross-tokenizer collator, while the packed branch dropped them
         # inside ``_pack_generator`` — same corpus produced different
         # samples depending on ``characters_per_sample``.
-        raw = raw.filter(
-            lambda d: isinstance(d[text_key], str) and bool(d[text_key])
-        )
+        raw = raw.filter(lambda d: isinstance(d[text_key], str) and bool(d[text_key]))
 
         if characters_per_sample is None or characters_per_sample <= 0:
             # Emit both `text` (read by kd_data_processor for cross-tokenizer

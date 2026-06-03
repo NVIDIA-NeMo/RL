@@ -24,7 +24,7 @@ def parse_arguments():
     """Parse command line arguments for the multi-token projection script."""
     parser = argparse.ArgumentParser(
         description="Generate multi-token projection mappings between tokenizers",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     # Model selection arguments
@@ -32,13 +32,13 @@ def parse_arguments():
         "--student-model",
         type=str,
         default="meta-llama/Llama-3.2-1B",
-        help="Student model name or path"
+        help="Student model name or path",
     )
     parser.add_argument(
         "--teacher-model",
         type=str,
         default="microsoft/phi-4",
-        help="Teacher model name or path"
+        help="Teacher model name or path",
     )
 
     # Boolean flags
@@ -46,55 +46,55 @@ def parse_arguments():
         "--enable-scale-trick",
         action="store_true",
         default=True,
-        help="Enable scale trick (set last column likelihood to 0.2)"
+        help="Enable scale trick (set last column likelihood to 0.2)",
     )
     parser.add_argument(
         "--disable-scale-trick",
         action="store_false",
         dest="enable_scale_trick",
-        help="Disable scale trick"
+        help="Disable scale trick",
     )
     parser.add_argument(
         "--enable-reverse-pass",
         action="store_true",
         default=True,
-        help="Enable second pass: student tokens -> teacher tokens"
+        help="Enable second pass: student tokens -> teacher tokens",
     )
     parser.add_argument(
         "--disable-reverse-pass",
         action="store_false",
         dest="enable_reverse_pass",
-        help="Disable reverse pass"
+        help="Disable reverse pass",
     )
     parser.add_argument(
         "--enable-exact-match",
         action="store_true",
         default=False,
-        help="Enable exact match enforcement for identical tokens"
+        help="Enable exact match enforcement for identical tokens",
     )
     parser.add_argument(
         "--use-raw-tokens",
         action="store_true",
         default=False,
-        help="Use convert_ids_to_tokens instead of decode, should be False"
+        help="Use convert_ids_to_tokens instead of decode, should be False",
     )
     parser.add_argument(
         "--enable-special-token-mapping",
         action="store_true",
         default=True,
-        help="Enable mapping of similar special tokens"
+        help="Enable mapping of similar special tokens",
     )
     parser.add_argument(
         "--disable-special-token-mapping",
         action="store_false",
         dest="enable_special_token_mapping",
-        help="Disable special token mapping"
+        help="Disable special token mapping",
     )
     parser.add_argument(
         "--use-canonicalization",
         action="store_true",
         default=False,
-        help="Apply token canonicalization before processing to normalize different tokenizer representations (e.g., Ġ vs ▁ prefixes, Ċ vs \\n)"
+        help="Apply token canonicalization before processing to normalize different tokenizer representations (e.g., Ġ vs ▁ prefixes, Ċ vs \\n)",
     )
 
     # Numeric parameters
@@ -102,25 +102,25 @@ def parse_arguments():
         "--tokens-to-cut",
         type=int,
         default=4,
-        help="Maximum number of tokens to consider for multi-token mappings"
+        help="Maximum number of tokens to consider for multi-token mappings",
     )
     parser.add_argument(
         "--top-k",
         type=int,
         default=32,
-        help="Number of top projections to keep for each token"
+        help="Number of top projections to keep for each token",
     )
     parser.add_argument(
         "--special-token-similarity-threshold",
         type=float,
         default=0.3,
-        help="Minimum similarity threshold for special token matching"
+        help="Minimum similarity threshold for special token matching",
     )
     parser.add_argument(
         "--special-token-top-k",
         type=int,
         default=None,
-        help="Top K matches for each special token (defaults to --top-k value)"
+        help="Top K matches for each special token (defaults to --top-k value)",
     )
 
     # File paths
@@ -134,7 +134,7 @@ def parse_arguments():
         "--output-dir",
         type=str,
         default="cross_tokenizer_data",
-        help="Output directory for saving projection maps"
+        help="Output directory for saving projection maps",
     )
 
     return parser.parse_args()
@@ -153,7 +153,6 @@ def reapply_exact_map(args: argparse.Namespace) -> str:
     student_model_name = args.student_model
     USE_CANONICALIZATION = args.use_canonicalization
 
-
     tokenizer_student = AutoTokenizer.from_pretrained(student_model_name)
     tokenizer_teacher = AutoTokenizer.from_pretrained(teacher_model_name)
 
@@ -162,8 +161,20 @@ def reapply_exact_map(args: argparse.Namespace) -> str:
     model_A_config = AutoConfig.from_pretrained(student_model_name)
     model_B_config = AutoConfig.from_pretrained(teacher_model_name)
 
-    tokens_student = [canonical_token(tokenizer_student.convert_ids_to_tokens([i])[0], enabled=USE_CANONICALIZATION) for i in range(tokenizer_student_total_vocab_size)]
-    tokens_teacher = [canonical_token(tokenizer_teacher.convert_ids_to_tokens([j])[0], enabled=USE_CANONICALIZATION) for j in range(tokenizer_teacher_total_vocab_size)]
+    tokens_student = [
+        canonical_token(
+            tokenizer_student.convert_ids_to_tokens([i])[0],
+            enabled=USE_CANONICALIZATION,
+        )
+        for i in range(tokenizer_student_total_vocab_size)
+    ]
+    tokens_teacher = [
+        canonical_token(
+            tokenizer_teacher.convert_ids_to_tokens([j])[0],
+            enabled=USE_CANONICALIZATION,
+        )
+        for j in range(tokenizer_teacher_total_vocab_size)
+    ]
 
     map_teacher_token_to_idx = {token: j for j, token in enumerate(tokens_teacher)}
 
@@ -177,7 +188,9 @@ def reapply_exact_map(args: argparse.Namespace) -> str:
             match_indices_teacher.append(j)
 
     if match_indices_student:
-        print(f"Found {len(match_indices_student)} exact matches. Setting perfect 1-to-1 mappings.")
+        print(
+            f"Found {len(match_indices_student)} exact matches. Setting perfect 1-to-1 mappings."
+        )
 
     # load initial projection map
     initial_projection_path = args.initial_projection_path
@@ -201,7 +214,7 @@ def reapply_exact_map(args: argparse.Namespace) -> str:
     if show_remapping > 0:
         print(f"Showing remapping for the last {show_remapping} exact matches.")
     else:
-        print(f"Not showing remapping.")
+        print("Not showing remapping.")
 
     for i, exact_token_student in enumerate(match_indices_student):
         exact_token_teacher = match_indices_teacher[i]
@@ -221,21 +234,22 @@ def reapply_exact_map(args: argparse.Namespace) -> str:
         remapped_likelihoods[0] = 1.0
         remapped_indices[0] = exact_token_teacher
 
-
         initial_projection_map["likelihoods"][index_] = remapped_likelihoods
         initial_projection_map["indices"][index_] = remapped_indices
 
-
         if len(match_indices_student) - i <= show_remapping:
-            print(f'after remapping {tokens_student[exact_token_student]}:{exact_token_student} -> {tokens_teacher[exact_token_teacher]}:{exact_token_teacher}: likelihoods {initial_projection_map["likelihoods"][index_]} indices {initial_projection_map["indices"][index_]}')
+            print(
+                f"after remapping {tokens_student[exact_token_student]}:{exact_token_student} -> {tokens_teacher[exact_token_teacher]}:{exact_token_teacher}: likelihoods {initial_projection_map['likelihoods'][index_]} indices {initial_projection_map['indices'][index_]}"
+            )
         non_exact_map_tokens.remove(index_)
-
 
     base, ext = os.path.splitext(args.initial_projection_path)
     save_path = base + "_exact_map_remapped" + (ext or ".pt")
     torch.save(initial_projection_map, save_path)
     print(f"Saved remapped projection map to: {save_path}")
-    print(f"remapped {len(match_indices_student)} tokens. Retained remaining {len(non_exact_map_tokens)} tokens as is.")
+    print(
+        f"remapped {len(match_indices_student)} tokens. Retained remaining {len(non_exact_map_tokens)} tokens as is."
+    )
     return save_path
 
 

@@ -40,6 +40,9 @@ class DatumSpec(TypedDict):
     idx: int
     task_name: NotRequired[str]
     stop_strings: NotRequired[list[str]]  # Optional stop strings for generation
+    raw_text: NotRequired[
+        str
+    ]  # raw text carried for cross-tokenizer distillation; consumed by CrossTokenizerCollator
     __extra__: NotRequired[Any]  # This allows additional fields of any type
 
 
