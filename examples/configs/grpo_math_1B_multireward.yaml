@@ -1,0 +1,35 @@
+# Matched GRPO control for the GDPO comparison.
+#
+# This is byte-for-byte identical to gdpo_math_1B.yaml EXCEPT the advantage
+# estimator. It runs standard GRPO on the SAME multi-reward math environment
+# (`math_multi_reward`, which emits correctness / integer-format / structural
+# rewards). GRPO collapses those components into a single summed `total_reward`
+# and normalizes that sum within each prompt group; GDPO instead normalizes each
+# component independently and then aggregates (see advantage_estimator.py).
+#
+# Run both and compare per-reward convergence to reproduce the paper's central
+# result (advantage collapse under GRPO in the multi-reward setting):
+#
+#   uv run examples/run_grpo.py --config examples/configs/gdpo_math_1B.yaml          # GDPO
+#   uv run examples/run_grpo.py --config examples/configs/grpo_math_1B_multireward.yaml  # GRPO control
+defaults: gdpo_math_1B.yaml
+
+grpo:
+  adv_estimator:
+    name: "grpo"
+    normalize_rewards: true
+    use_leave_one_out_baseline: false
+
+checkpointing:
+  checkpoint_dir: "results/grpo_multireward"
+
+logger:
+  wandb:
+    project: "gdpo-dev"
+    name: "grpo-multireward-control"
+  swanlab:
+    project: "gdpo-dev"
+    name: "grpo-multireward-control"
+  mlflow:
+    experiment_name: "gdpo-dev"
+    run_name: "grpo-multireward-control"
