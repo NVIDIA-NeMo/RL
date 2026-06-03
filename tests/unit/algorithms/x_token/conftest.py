@@ -173,9 +173,7 @@ def make_ct_data_dict(
 
     return {
         "input_ids": torch.zeros((batch_size, t_student), dtype=torch.long),
-        "input_lengths": torch.full(
-            (batch_size,), t_student, dtype=torch.long
-        ),
+        "input_lengths": torch.full((batch_size,), t_student, dtype=torch.long),
         "token_mask": torch.ones((batch_size, t_student), dtype=torch.long),
         "sample_mask": sample_mask,
         "teacher_full_logits_ipc": [],

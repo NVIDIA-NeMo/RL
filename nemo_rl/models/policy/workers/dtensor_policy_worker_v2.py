@@ -914,7 +914,10 @@ class DTensorPolicyWorkerV2Impl(
             B_r, T_t, V_t, final_vals.dtype, final_vals.device
         )
         self._teacher_ipc_buffer[:B_r, :T_t, :V_t].copy_(final_vals)
-        del final_vals, out_vals  # drop the cat intermediate; only the persistent buffer holds the data now
+        del (
+            final_vals,
+            out_vals,
+        )  # drop the cat intermediate; only the persistent buffer holds the data now
 
         # Every per-sample entry carries the same stable rank-level
         # handle plus its rank-local sample index. The consumer rebuilds
