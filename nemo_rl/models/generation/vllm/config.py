@@ -39,6 +39,13 @@ class VllmSpecificArgs(TypedDict):
     # Miscellaneous top level vLLM HTTP server arguments.
     # A filepath that can be imported to register a vLLM tool parser
     tool_parser_plugin: NotRequired[str]
+    # Max concurrent load_model calls during init to avoid overwhelming Ray GCS.
+    # When set, workers defer model loading during __init__ and load_and_start()
+    # performs staggered loading with this concurrency limit.
+    # When not set, all workers initialize in parallel (the default).
+    max_concurrent_model_loads: NotRequired[int]
+    # Timeout in seconds for each load_model call. Default 1800 (30 min).
+    model_load_timeout: NotRequired[int]
 
 
 class VllmConfig(GenerationConfig):

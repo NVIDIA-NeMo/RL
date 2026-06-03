@@ -194,3 +194,5 @@ def register_omegaconf_resolvers() -> None:
         OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
     if not OmegaConf.has_resolver("max"):
         OmegaConf.register_new_resolver("max", lambda a, b: max(a, b))
+    if not OmegaConf.has_resolver("add"):
+        OmegaConf.register_new_resolver("add", lambda a, b: a + b)

@@ -22,12 +22,12 @@ import math
 import statistics
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, AsyncGenerator, Optional
 
 import ray
 import torch
 from transformers import PreTrainedTokenizerBase
-from wandb import Histogram, Table
+from wandb import Histogram
 
 from nemo_rl.data.interfaces import (
     DatumSpec,
@@ -50,6 +50,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
 )
 from nemo_rl.utils.timer import Timer
+import numpy as np
 
 TokenizerType = PreTrainedTokenizerBase
 
@@ -790,6 +791,9 @@ async def run_sample_multi_turn_rollout(
         "idx": sample_idx,
     }
 
+    # max_gen_tokens_per_turn: Diagnostic for long single generations
+    max_gen_tokens_per_turn = max(turn_gen_tokens) if turn_gen_tokens else 0
+
     # Sample metrics
     sample_metrics = {
         "turn_count": turn_count,
@@ -803,6 +807,7 @@ async def run_sample_multi_turn_rollout(
         "turn_gen_tokens": turn_gen_tokens,
         "turn_input_tokens": turn_input_tokens,
         "turn_total_tokens": turn_total_tokens,
+        "max_gen_tokens_per_turn": max_gen_tokens_per_turn,
         # Pass-through per-worker per-turn accounting for aggregation at batch level
         "per_worker_token_counts": per_worker_token_counts,
     }
@@ -917,13 +922,27 @@ def run_async_multi_turn_rollout(
             if key not in final_batch:
                 final_batch[key] = input_batch[key]
 
+        # Helper for percentile (buffer starvation diagnostics)
+        def _pct(values: list[float], p: float) -> float:
+            if not values:
+                return 0.0
+            sorted_v = sorted(values)
+            idx = min(int(len(sorted_v) * p / 100), len(sorted_v) - 1)
+            return float(sorted_v[idx])
+
+        turn_counts = [m["turn_count"] for m in all_sample_metrics]
+        max_gen_tokens_per_turn_values = [
+            m["max_gen_tokens_per_turn"] for m in all_sample_metrics
+        ]
+
         # Aggregate metrics across all samples
         rollout_metrics = {
             # Overall metrics
-            "total_turns": sum(m["turn_count"] for m in all_sample_metrics),
-            "avg_turns_per_sample": sum(m["turn_count"] for m in all_sample_metrics)
-            / batch_size,
-            "max_turns_per_sample": max(m["turn_count"] for m in all_sample_metrics),
+            "total_turns": sum(turn_counts),
+            "avg_turns_per_sample": sum(turn_counts) / batch_size,
+            "max_turns_per_sample": max(turn_counts),
+            "turns_per_sample/p95": _pct(turn_counts, 95),
+            "turns_per_sample/p99": _pct(turn_counts, 99),
             "natural_termination_rate": sum(m["terminated"] for m in all_sample_metrics)
             / batch_size,
             "truncation_rate": sum(m["truncated"] for m in all_sample_metrics)
@@ -948,6 +967,11 @@ def run_async_multi_turn_rollout(
                 m["env_tokens"] for m in all_sample_metrics
             )
             / batch_size,
+            # max_gen_tokens_per_turn: Diagnostic for long single generations
+            "max_gen_tokens_per_turn/max": max(max_gen_tokens_per_turn_values),
+            "max_gen_tokens_per_turn/mean": sum(max_gen_tokens_per_turn_values)
+            / batch_size,
+            "max_gen_tokens_per_turn/p95": _pct(max_gen_tokens_per_turn_values, 95),
             # Reward metrics
             "mean_total_reward": sum(m["total_reward"] for m in all_sample_metrics)
             / batch_size,
@@ -992,6 +1016,7 @@ class AsyncNemoGymRolloutResult:
     input_ids: torch.Tensor
     final_batch: BatchedDataDict[DatumSpec]
     rollout_metrics: dict[str, Any]
+    ng_task_index: Optional[int]
 
 
 def _calculate_single_metric(
@@ -1007,16 +1032,209 @@ def _calculate_single_metric(
     }
 
 
-def run_async_nemo_gym_rollout(
+def apply_reward_penalties(results: list[dict], master_config: dict | None) -> dict[str, int]:
+    """Apply reward penalties to results, setting reward to 0.0 when triggered.
+
+    All penalties are gated by master_config flags. Returns a dict of penalty
+    counts keyed by penalty name.
+
+    NOTE: These penalties assume Gym-path message_log structure where roles
+    strictly alternate "user" → "assistant". Tool responses are folded into
+    user prompt tokens by _postprocess_nemo_gym_to_nemo_rl_result and never
+    appear as separate message_log entries. Do not call from non-Gym rollout paths.
+
+    Penalties:
+      1. penalize_duplicated_reasoning (text-based)
+         Checks response["output"] items. If a "reasoning" item's summary text
+         exactly matches the next item's content text (after strip), the model
+         is copying its thinking into the final answer verbatim.
+         Data: full_result["response"]["output"] — reasoning has summary[0]["text"],
+         message has content[0]["text"].
+
+      2. penalize_empty_final_answer (text-based)
+         Walks response["output"] in reverse to find the last message-type item.
+         If no message item exists or its content text is empty, the model failed
+         to produce a final answer. Skipped when the last output item is a
+         function_call (model was mid-agentic-loop, not producing an empty answer).
+         Data: full_result["response"]["output"] — message items have content[0]["text"].
+
+      3. penalize_eos_token (token-based)
+         The EOS token (default id 2, configurable via token_ids.eos) should never
+         appear in any assistant generation. Checks message_log assistant entries.
+         Data: message_log[i]["token_ids"] where role == "assistant".
+
+      4. penalize_malformed_think_tag (token-based + string-based)
+         Two complementary checks to catch malformed think tags:
+         a) Token ID check: infers thinking mode from prompt token counts.
+            If prompt has open==close: enable_thinking=False, expect 0 open
+            and 0 close in generation. If prompt has open==close+1:
+            enable_thinking=True, expect 0 open and 1 close in generation.
+            Any other prompt pattern or mismatched generation counts is a violation.
+            Token IDs configurable via token_ids.think_open / token_ids.think_close.
+         b) String check: the model can spell out <think>/</think> with piecemeal
+            regular tokens (e.g. "<", "/", "thi", "nk", ">") that bypass special
+            token IDs. Checks generation_str (decoded generation text) per output
+            item: "<think>" count must be 0 (always in prompt, never generated),
+            "</think>" count must be 0 or 1.
+         Data: message_log pairs for token IDs, full_result output items for strings.
+    """
+    counts = {
+        "duplicated_reasoning": 0,
+        "empty_final_answer": 0,
+        "eos_token": 0,
+        "malformed_think_tag": 0,
+    }
+    if not master_config or not results:
+        return counts
+
+
+    # Guard: penalties rely on Gym-path message_log (strictly alternating user/assistant roles).
+    # Non-Gym paths may have "environment", "tool", or "system" roles which these checks don't handle.
+    any_penalty_enabled = any(
+        master_config.get(flag, False)
+        for flag in ("penalize_duplicated_reasoning", "penalize_empty_final_answer",
+                     "penalize_eos_token", "penalize_malformed_think_tag")
+    )
+    if any_penalty_enabled:
+        for result in results:
+            roles = {msg.get("role") for msg in result["message_log"]}
+            assert roles <= {"user", "assistant"}, (
+                f"apply_reward_penalties requires Gym-path message_log with only 'user' and 'assistant' roles, "
+                f"but found roles: {roles}. These penalties are not supported for non-Gym rollout paths."
+            )
+
+    # --- Penalty 1: Duplicated reasoning / final answer ---
+    if master_config.get("penalize_duplicated_reasoning", False):
+        for result in results:
+            output_items = result["full_result"].get("response", {}).get("output", [])
+            is_duplicated = False
+            for item1, item2 in zip(output_items, output_items[1:]):
+                if item1.get("type") != "reasoning":
+                    continue
+                summary = item1.get("summary", [])
+                if not summary or "text" not in summary[0]:
+                    continue
+                reasoning_text = summary[0]["text"].strip()
+                content = item2.get("content", "")
+                if isinstance(content, list) and content and "text" in content[0]:
+                    chat_text = content[0]["text"].strip()
+                elif isinstance(content, str):
+                    chat_text = content.strip()
+                else:
+                    continue
+                if reasoning_text and chat_text and reasoning_text == chat_text:
+                    is_duplicated = True
+                    break
+            if is_duplicated:
+                result["full_result"]["reward"] = 0.0
+
+                counts["duplicated_reasoning"] += 1
+
+    # --- Penalty 2: Empty final answer ---
+    if master_config.get("penalize_empty_final_answer", False):
+        for result in results:
+            output_items = result["full_result"].get("response", {}).get("output", [])
+            # Skip if the last output item is a function_call — it is legit for model to
+            # produce reasoning and then a function_call as the last output item in PivotRL
+            if output_items and output_items[-1].get("type") == "function_call":
+                continue
+            final_answer_text = None
+            for item in reversed(output_items):
+                # Skip items without content (function_call, function_call_output, etc.)
+                if "content" not in item:
+                    continue
+                content = item["content"]
+                if isinstance(content, list) and content and "text" in content[0]:
+                    final_answer_text = content[0]["text"].strip()
+                    break
+                elif isinstance(content, str):
+                    final_answer_text = content.strip()
+                    break
+            if final_answer_text is None or final_answer_text == "":
+                result["full_result"]["reward"] = 0.0
+
+                counts["empty_final_answer"] += 1
+
+    # --- Penalty 3: EOS token in generation ---
+    if master_config.get("penalize_eos_token", False):
+        token_ids_cfg = master_config.get("token_ids", {})
+        eos_token_id = token_ids_cfg.get("eos", 2)
+        for result in results:
+            has_eos = False
+            for msg in result["message_log"]:
+                if msg["role"] == "assistant" and eos_token_id in msg["token_ids"]:
+                    has_eos = True
+                    break
+            if has_eos:
+                result["full_result"]["reward"] = 0.0
+
+                counts["eos_token"] += 1
+
+    # --- Penalty 4: Malformed think tags (token ID + string) ---
+    if master_config.get("penalize_malformed_think_tag", False):
+        token_ids_cfg = master_config.get("token_ids", {})
+        think_open_token_id = token_ids_cfg.get("think_open", 12)
+        think_close_token_id = token_ids_cfg.get("think_close", 13)
+        for result in results:
+            has_violation = False
+            # 4a) Token ID check per (user, assistant) turn pair
+            # Infer thinking mode from prompt token counts:
+            #   enable_thinking=True:  prompt has open=close+1 (trailing <think>), expect asst: 0 open, 1 close
+            #   enable_thinking=False: prompt has open=close (balanced), expect asst: 0 open, 0 close
+            msgs = result["message_log"]
+            for i in range(len(msgs) - 1):
+                if msgs[i]["role"] == "user" and msgs[i + 1]["role"] == "assistant":
+                    user_ids = msgs[i]["token_ids"]
+                    asst_ids = msgs[i + 1]["token_ids"]
+                    prompt_open = (user_ids == think_open_token_id).sum().item()
+                    prompt_close = (user_ids == think_close_token_id).sum().item()
+                    asst_open = (asst_ids == think_open_token_id).sum().item()
+                    asst_close = (asst_ids == think_close_token_id).sum().item()
+                    if prompt_open == prompt_close:
+                        # enable_thinking=False: both tags in prompt, none in generation
+                        expected_open, expected_close = 0, 0
+                    elif prompt_open == prompt_close + 1:
+                        # enable_thinking=True: trailing <think> in prompt, expect </think> in generation
+                        expected_open, expected_close = 0, 1
+                    else:
+                        # Unexpected prompt pattern — flag as violation
+                        has_violation = True
+                        break
+                    if asst_open != expected_open or asst_close != expected_close:
+                        has_violation = True
+                        break
+            # 4b) String check on generation_str per output item
+            if not has_violation:
+                output_items = result["full_result"].get("response", {}).get("output", [])
+                for item in output_items:
+                    gen_str = item.get("generation_str", "")
+                    if not gen_str:
+                        continue
+                    if gen_str.count("<think>") > 0 or gen_str.count("</think>") > 1:
+                        has_violation = True
+                        break
+            if has_violation:
+                result["full_result"]["reward"] = 0.0
+
+                counts["malformed_think_tag"] += 1
+
+    return counts
+
+
+async def run_async_nemo_gym_rollout(
     policy_generation: GenerationInterface,
     input_batch: BatchedDataDict[DatumSpec],
     tokenizer: TokenizerType,
     task_to_env: dict[str, EnvironmentInterface],
     generation_config: GenerationConfig,
+    num_generations: int,
     max_seq_len: Optional[int] = None,
     max_rollout_turns: Optional[int] = None,
     greedy: bool = False,
-) -> AsyncNemoGymRolloutResult:
+    master_config = None,
+    group_num: Optional[int] = None,
+    returns_entire_batch: bool = False,
+) -> AsyncGenerator[AsyncNemoGymRolloutResult, None]:
     """Run multi-turn rollouts with NeMo-Gym. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters."""
     # We leverage the same `extra_env_info` key as `run_async_multi_turn_rollout`.
     nemo_gym_rows = input_batch["extra_env_info"]
@@ -1040,10 +1258,13 @@ def run_async_nemo_gym_rollout(
         "Top k is not supported in the generation config in NeMo-Gym path!"
     )
 
-    timer = Timer()
+    assert not returns_entire_batch or len(nemo_gym_rows) == num_generations
+
+    timer = Timer(context={"worker": "rollout"})
     timer_prefix = "timing/rollout"
     timer.start(f"{timer_prefix}/total")
 
+    groupidx_to_row = defaultdict(list)
     for rowidx, row in enumerate(nemo_gym_rows):
         # We may need better handling here. The max tokens set here would be the max new generated tokens, not the total max tokens.
         # Currently, we just rely on the underlying vLLM engine to do the truncation for us using the max model seq len set in the config.
@@ -1053,30 +1274,112 @@ def run_async_nemo_gym_rollout(
         responses_create_params["temperature"] = generation_config["temperature"]
         responses_create_params["top_p"] = generation_config["top_p"]
 
+        if group_num is not None:
+            metadata = responses_create_params.get("metadata") or dict()
+            metadata["group_num"] = str(group_num)
+            responses_create_params["metadata"] = metadata
+
         # Max new tokens, just like max_seq_len above is ignored and we rely on the underlying vLLM engine for truncation.
         # generation_config["max_new_tokens"]
 
         row["_rowidx"] = rowidx
+        # Assume the gym input samples are ordered
+        groupidx_to_row[rowidx // num_generations].append(row)
 
+    # `groupidx_to_rollouts` is ordered in completion order whereas `groupidx_to_row` is the input order
+    groupidx_to_rollouts = defaultdict(list)
+    groupidx_to_agent_refs = defaultdict(list)
+    groupidx_to_rowidx = defaultdict(list)
     with timer.time(f"{timer_prefix}/run_rollouts"):
         nemo_gym_environment = task_to_env["nemo_gym"]
-        results, rollout_loop_timing_metrics = ray.get(
-            nemo_gym_environment.run_rollouts.remote(
-                nemo_gym_rows, tokenizer, timer_prefix
-            )
-        )
+        for future in nemo_gym_environment.run_rollouts.remote(
+            nemo_gym_rows, tokenizer, timer_prefix
+        ):
+            rowidx, result, timing_metrics = await future
 
-        # Tensorize all token ids
-        for r in results:
-            _tensorize_by_key(r["input_message_log"], "token_ids")
-            _tensorize_by_key(r["message_log"], "token_ids")
-            _tensorize_by_key(
-                [m for m in r["message_log"] if m["role"] == "assistant"],
-                "generation_logprobs",
-            )
+            groupidx = rowidx // num_generations
+            groupidx_to_rollouts[groupidx].append(result)
+            groupidx_to_agent_refs[groupidx].append(nemo_gym_rows[rowidx]["agent_ref"]["name"])
+            groupidx_to_rowidx[groupidx].append(rowidx)
+
+            if len(groupidx_to_rollouts[groupidx]) == num_generations:
+                agent_refs = groupidx_to_agent_refs.pop(groupidx)
+                assert returns_entire_batch or len(set(agent_refs)) == 1, agent_refs
+
+                rows = groupidx_to_row.pop(groupidx)
+                rollouts = groupidx_to_rollouts.pop(groupidx)
+                rowidxs = groupidx_to_rowidx.pop(groupidx)
+
+                if returns_entire_batch:  # We expect the rollouts to be heterogenous
+                    rollouts, _ = zip(*sorted(zip(rollouts, rowidxs), key=lambda p: p[1]))
+
+                async_nemo_gym_rollout_result = _postprocess_single_group(
+                    rows,
+                    rollouts,
+                    timer,
+                    timer_prefix,
+                    policy_generation,
+                    input_batch.slice(groupidx * num_generations, (groupidx + 1) * num_generations),
+                    tokenizer,
+                    master_config,
+                )
+                if timing_metrics is not None:
+                    timer.stop(f"{timer_prefix}/total")
+                    async_nemo_gym_rollout_result.rollout_metrics |= timing_metrics | timer.get_timing_metrics("sum")
+
+                yield async_nemo_gym_rollout_result
+
+
+def _postprocess_single_group(
+    nemo_gym_rows: list[dict],
+    results: list[dict],
+    timer: Timer,
+    timer_prefix: str,
+    policy_generation: GenerationInterface,
+    input_batch: BatchedDataDict[DatumSpec],
+    tokenizer: TokenizerType,
+    master_config = None,
+) -> AsyncNemoGymRolloutResult:
+    # for effort level
+    len_reward_low = []
+    reward_low = []
+    lengths3 = [[],[],[]]
+    if master_config and 'effort_levels' in master_config:
+        low_weight = 0.
+        low_penlty = 1.
+        low_ub     = 64000
+        low_string = ""
+        if 'low_weight' in master_config['effort_levels']:
+            low_weight = master_config['effort_levels']['low_weight']
+        if 'low_penalty' in master_config['effort_levels']:
+            low_penlty = master_config['effort_levels']['low_penalty']
+        if 'low_ub' in master_config['effort_levels']:
+            low_ub = master_config['effort_levels']['low_ub']
+        if 'low_string' in master_config['effort_levels']:
+            low_string = master_config['effort_levels']['low_string']
+        if low_weight>0 and low_string:
+            lengths = [len(r["message_log"][-1]["token_ids"]) if r["message_log"][-1]["role"]=="assistant" else 0 for r in results]
+            orig_rewards = [r["full_result"]["reward"] for r in results]
+            for i in range(len(results)):
+                prompt = ''
+                for ii in reversed(nemo_gym_rows[i]['responses_create_params']['input']):
+                    if 'role' in ii and ii['role'] == 'user' and 'content' in ii:
+                        prompt = ii['content']
+                        break
+                if low_string in prompt:
+                    len_reward = min(1.,low_weight * (1. - lengths[i]/low_ub))
+                    new_r = orig_rewards[i] + orig_rewards[i] * max(len_reward,0.) + low_penlty * min(len_reward,0.)
+                    results[i]["full_result"]["reward"] = new_r
+                    len_reward_low.append(len_reward)
+                    reward_low.append(new_r)
+                    lengths3[0].append(lengths[i])
+                else:
+                    lengths3[2].append(lengths[i])
+
+    penalty_counts = apply_reward_penalties(results, master_config)
 
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
-    with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
+    with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation", should_log=False):
         batch_size = len(nemo_gym_rows)
         max_total_tokens_per_sample = policy_generation.cfg["vllm_cfg"]["max_model_len"]
         all_sample_metrics = [
@@ -1091,19 +1394,41 @@ def run_async_nemo_gym_rollout(
                 "turn_count": sum(1 for m in r["message_log"] if m["role"] == "user"),
                 "hit_max_tokens": sum(len(m["token_ids"]) for m in r["message_log"])
                 == max_total_tokens_per_sample,
+                # max_gen_tokens_per_turn: Diagnostic for long single generations
+                "max_gen_tokens_per_turn": max(
+                    (
+                        len(m["token_ids"])
+                        for m in r["message_log"]
+                        if m["role"] == "assistant"
+                    ),
+                    default=0,
+                ),
             }
             for r in results
         ]
 
     # Aggregate metrics across all samples
-    with timer.time(f"{timer_prefix}/aggregate_metrics"):
+    with timer.time(f"{timer_prefix}/aggregate_metrics", should_log=False):
+        turn_counts = [m["turn_count"] for m in all_sample_metrics]
+        max_gen_tokens_per_turn_values = [
+            m["max_gen_tokens_per_turn"] for m in all_sample_metrics
+        ]
+
+        def _pct(values: list[float], p: float) -> float:
+            if not values:
+                return 0.0
+            sorted_v = sorted(values)
+            idx = min(int(len(sorted_v) * p / 100), len(sorted_v) - 1)
+            return float(sorted_v[idx])
+
         rollout_metrics = {
-            **rollout_loop_timing_metrics,
             **_calculate_single_metric(
-                [m["turn_count"] for m in all_sample_metrics],
+                turn_counts,
                 batch_size,
                 "turns_per_sample",
             ),
+            "turns_per_sample/p95": _pct(turn_counts, 95),
+            "turns_per_sample/p99": _pct(turn_counts, 99),
             **_calculate_single_metric(
                 [m["total_tokens"] for m in all_sample_metrics],
                 batch_size,
@@ -1114,6 +1439,12 @@ def run_async_nemo_gym_rollout(
                 batch_size,
                 "gen_tokens_per_sample",
             ),
+            **_calculate_single_metric(
+                max_gen_tokens_per_turn_values,
+                batch_size,
+                "max_gen_tokens_per_turn",
+            ),
+            "max_gen_tokens_per_turn/p95": _pct(max_gen_tokens_per_turn_values, 95),
             **_calculate_single_metric(
                 [m["total_reward"] for m in all_sample_metrics],
                 batch_size,
@@ -1134,7 +1465,7 @@ def run_async_nemo_gym_rollout(
         }
 
     # Per-agent misc metrics
-    with timer.time(f"{timer_prefix}/per_agent_misc_metrics"):
+    with timer.time(f"{timer_prefix}/per_agent_misc_metrics", should_log=False):
         agent_to_results: dict[str, list[dict]] = defaultdict(list)
         for nemo_gym_row, result in zip(nemo_gym_rows, results):
             agent_ref = nemo_gym_row["agent_ref"]
@@ -1158,11 +1489,18 @@ def run_async_nemo_gym_rollout(
                         )
                     )
 
+            # Full trajectory dumps are too large to log as a wandb Table (single
+            # log call can be tens-to-hundreds of MB, which wandb routes through
+            # its Artifact uploader and backs up the metric-commit pipeline,
+            # causing the run to be flipped to CRASHED server-side). The raw
+            # per-prompt data is already persisted by log_batched_dict_as_jsonl
+            # and via the JsonlLogger backend for scalar metrics, so drop the
+            # in-metric full_result Table here to keep wandb healthy.
             # Log the full result
-            to_log = [[json.dumps(r, separators=((",", ":")))] for r in agent_results]
-            per_agent_metrics[f"{agent_name}/full_result"] = Table(
-                data=to_log, columns=["Full result"]
-            )
+            # to_log = [[json.dumps(r, separators=((",", ":")))] for r in agent_results]
+            # per_agent_metrics[f"{agent_name}/full_result"] = Table(
+            #     data=to_log, columns=["Full result"]
+            # )
 
         rollout_metrics.update(per_agent_metrics)
 
@@ -1170,8 +1508,6 @@ def run_async_nemo_gym_rollout(
     rollout_metrics["mean_gen_tokens_per_sample"] = rollout_metrics[
         "gen_tokens_per_sample/mean"
     ]
-    timer.stop(f"{timer_prefix}/total")
-    rollout_metrics.update(timer.get_timing_metrics("sum"))
 
     # Convert LLMMessageLogType to FlatMessagesType for generation
     input_batch_for_input_ids = BatchedDataDict[DatumSpec](
@@ -1205,11 +1541,60 @@ def run_async_nemo_gym_rollout(
             "truncated": torch.tensor(
                 [m["hit_max_tokens"] for m in all_sample_metrics], dtype=torch.bool
             ),
+            # Agent/env-driven mask flag — True means this sample should be masked
+            # from the GRPO gradient (kept for advantage computation).
+            "mask_sample": torch.tensor(
+                [
+                    bool(
+                        (r["full_result"].get("instance_config") or {}).get(
+                            "mask_sample", False
+                        )
+                    )
+                    for r in results
+                ],
+                dtype=torch.bool,
+            ),
         }
     )
+
+    # for effort level
+    if len_reward_low:
+        rollout_metrics['mean_length_reward_low'] = sum(len_reward_low)/len(len_reward_low)
+    if reward_low:
+        rollout_metrics['mean_reward_low'] = sum(reward_low)/len(reward_low)
+    if lengths3[0]:
+        rollout_metrics['mean_length_low'] = sum(lengths3[0])/len(lengths3[0])
+        rollout_metrics['median_length_low'] = float(np.median(lengths3[0]))
+    if lengths3[2]:
+        rollout_metrics['mean_length_high'] = sum(lengths3[2])/len(lengths3[2])
+        rollout_metrics['median_length_high'] = float(np.median(lengths3[2]))
+
+    # Penalty metrics — map count keys to (config flag, metric name)
+    _PENALTY_METRICS = {
+        "duplicated_reasoning": ("penalize_duplicated_reasoning", "reasoning_equal_to_final_answer_rate"),
+        "empty_final_answer": ("penalize_empty_final_answer", "empty_final_answer_rate"),
+        "eos_token": ("penalize_eos_token", "eos_token_rate"),
+        "malformed_think_tag": ("penalize_malformed_think_tag", "malformed_think_tag_rate"),
+    }
+    if master_config and results:
+        for key, (flag, metric_name) in _PENALTY_METRICS.items():
+            if master_config.get(flag, False):
+                rollout_metrics[metric_name] = penalty_counts[key] / len(results)
+
+    ng_task_index = None
+    if nemo_gym_rows and "_ng_task_index" in nemo_gym_rows[0]:
+        ng_task_index = int(nemo_gym_rows[0]["_ng_task_index"])
+        assert all(
+            "_ng_task_index" in row and int(row["_ng_task_index"]) == ng_task_index
+            for row in nemo_gym_rows
+        ), (
+            "Expected a single prompt-group _ng_task_index, got "
+            f"{[row.get('_ng_task_index') for row in nemo_gym_rows]}"
+        )
 
     return AsyncNemoGymRolloutResult(
         input_ids=input_ids,
         final_batch=final_batch,
         rollout_metrics=rollout_metrics,
+        ng_task_index=ng_task_index,
     )

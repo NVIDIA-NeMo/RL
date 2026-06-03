@@ -18,6 +18,7 @@ from pathlib import Path
 
 # Configure logging to show file location
 logging.basicConfig(
+    level=logging.INFO,
     format="%(levelname)s:%(name)s:%(filename)s:%(lineno)d: %(message)s",
 )
 

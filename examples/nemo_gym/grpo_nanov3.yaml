@@ -243,6 +243,8 @@ data:
 
 env:
   should_use_nemo_gym: true
+  # true: skip expensive train_data_step*.jsonl; false: write full jsonl.
+  should_log_nemo_gym_responses: true
   nemo_gym:
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml  # Required! And it must be *for_training

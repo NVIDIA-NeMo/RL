@@ -21,11 +21,11 @@ ckpts/
 # Test
 coverage.json
 .coverage*
-unit_results.json
-unit_results/
 test_assets/
 .nrl_remote_map.json
 .nrl_remote_state.json
+# Test biproducts
+tests/functional/*/
 
 # Cache
 uv_cache/
@@ -46,3 +46,9 @@ code_snapshots*/
 # Runtime env
 *runtime_env.yaml
 !default_runtime_env.yaml
+
+super_models/
+data/
+
+# Local working files (not part of the release)
+internal_only/

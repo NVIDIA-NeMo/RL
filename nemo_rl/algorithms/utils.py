@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+import os
 import random
 import warnings
 from functools import partial, wraps
@@ -25,6 +26,8 @@ from transformers import (
     AutoTokenizer,
     PreTrainedTokenizerBase,
 )
+
+from nemo_rl.utils.fastokens import maybe_patch_fastokens
 
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.models.policy import TokenizerConfig
@@ -264,6 +267,8 @@ def get_tokenizer(
         >>>
         ```
     """
+    maybe_patch_fastokens()
+
     processor = None
 
     if get_processor:
@@ -770,3 +775,67 @@ def log_generation_metrics_to_wandb(
             name=generation_metric,
             timeline_interval=timeline_interval,
         )
+
+
+EFFICIENCY_CATEGORIES = [
+    "init/total",
+    "idle/buffer_starvation",
+    "idle/buffer_full_backoff",
+    "idle/refit_bubble",
+    "idle/generation_limit_pause",
+    "idle/refit_event_wait",
+    "idle/validation",
+    "wasted/failed_trajectory",
+]
+
+
+def print_efficiency_summary(
+    efficiency_metrics: dict[str, float],
+    total_wall_time_s: float,
+    step: int,
+) -> dict[str, float]:
+    """Print a summary table of efficiency metrics and return loggable dict.
+
+    Args:
+        efficiency_metrics: Dict mapping category labels to total seconds spent.
+        total_wall_time_s: Total wall-clock time in seconds since training began.
+        step: Current training step number.
+
+    Returns:
+        Dict of metrics suitable for logging to WandB/TensorBoard, including
+        per-category seconds and percentages, total waste, and efficiency_pct.
+    """
+    print(f"\n📊 Efficiency Summary (Step {step}):")
+    print(f"  {'Category':<35} {'Time (s)':>10} {'% of Wall':>10}")
+    print(f"  {'─' * 57}")
+
+    total_waste = 0.0
+    loggable: dict[str, float] = {}
+
+    for category in EFFICIENCY_CATEGORIES:
+        duration = efficiency_metrics.get(category, 0.0)
+        pct = (duration / total_wall_time_s * 100) if total_wall_time_s > 0 else 0.0
+        total_waste += duration
+        print(f"  {category:<35} {duration:>10.2f} {pct:>9.2f}%")
+        loggable[f"efficiency/{category}_s"] = duration
+        loggable[f"efficiency/{category}_pct"] = pct
+
+    productive = total_wall_time_s - total_waste
+    efficiency_pct = (
+        (productive / total_wall_time_s * 100) if total_wall_time_s > 0 else 100.0
+    )
+
+    print(f"  {'─' * 57}")
+    waste_pct = (
+        (total_waste / total_wall_time_s * 100) if total_wall_time_s > 0 else 0.0
+    )
+    print(f"  {'Total waste':<35} {total_waste:>10.2f} {waste_pct:>9.2f}%")
+    print(f"  {'Productive time':<35} {productive:>10.2f} {efficiency_pct:>9.2f}%")
+    print(f"  {'Efficiency':<35} {'':>10} {efficiency_pct:>9.2f}%")
+
+    loggable["efficiency/total_waste_s"] = total_waste
+    loggable["efficiency/productive_time_s"] = productive
+    loggable["efficiency/efficiency_pct"] = efficiency_pct
+    loggable["efficiency/total_wall_time_s"] = total_wall_time_s
+
+    return loggable

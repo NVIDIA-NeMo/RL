@@ -15,6 +15,7 @@
 import argparse
 import os
 import pprint
+import time
 
 from omegaconf import OmegaConf
 
@@ -28,7 +29,8 @@ from nemo_rl.utils.config import (
     parse_hydra_overrides,
     register_omegaconf_resolvers,
 )
-from nemo_rl.utils.logger import get_next_experiment_dir
+from nemo_rl.utils.logger import get_next_experiment_dir, log_container_init_timing
+from nemo_rl.utils.timer import Timer
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
@@ -46,6 +48,11 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
 
 def main() -> None:
     """Main entry point."""
+    main_start = time.perf_counter()
+    log_container_init_timing()
+
+    rl_init_timer = Timer(context={"worker": "driver"})
+
     # Parse arguments
     register_omegaconf_resolvers()
     args, overrides = parse_args()
@@ -55,15 +62,16 @@ def main() -> None:
             os.path.dirname(__file__), "configs", "grpo_math_1B.yaml"
         )
 
-    config = load_config(args.config)
-    print(f"Loaded configuration from: {args.config}")
+    with rl_init_timer.time("config"):
+        config = load_config(args.config)
+        print(f"Loaded configuration from: {args.config}")
 
-    if overrides:
-        print(f"Overrides: {overrides}")
-        config = parse_hydra_overrides(config, overrides)
+        if overrides:
+            print(f"Overrides: {overrides}")
+            config = parse_hydra_overrides(config, overrides)
 
-    config: MasterConfig = OmegaConf.to_container(config, resolve=True)
-    print("Applied CLI overrides")
+        config: MasterConfig = OmegaConf.to_container(config, resolve=True)
+        print("Applied CLI overrides")
 
     # Print config
     print("Final config:")
@@ -77,37 +85,51 @@ def main() -> None:
             f"📊 Using checkpoint directory: {config['checkpointing']['checkpoint_dir']}"
         )
 
-    init_ray()
+    with rl_init_timer.time("ray_connect"):
+        init_ray()
 
     # setup tokenizer
-    tokenizer = get_tokenizer(config["policy"]["tokenizer"])
-    assert config["policy"]["generation"] is not None, (
-        "A generation config is required for GRPO"
-    )
-    config["policy"]["generation"] = configure_generation_config(
-        config["policy"]["generation"], tokenizer
-    )
+    with rl_init_timer.time("tokenizer"):
+        tokenizer = get_tokenizer(config["policy"]["tokenizer"])
+        assert config["policy"]["generation"] is not None, (
+            "A generation config is required for GRPO"
+        )
+        config["policy"]["generation"] = configure_generation_config(
+            config["policy"]["generation"], tokenizer
+        )
 
     # setup data
-    (
-        dataset,
-        val_dataset,
-        task_to_env,
-        val_task_to_env,
-    ) = setup_response_data(tokenizer, config["data"], config["env"])
+    with rl_init_timer.time("data"):
+        dataset, val_dataset, task_to_env, val_task_to_env = setup_response_data(
+            tokenizer, config["data"], config["env"]
+        )
 
-    (
-        policy,
-        policy_generation,
-        cluster,
-        dataloader,
-        val_dataloader,
-        loss_fn,
-        logger,
-        checkpointer,
-        grpo_state,
-        master_config,
-    ) = setup(config, tokenizer, dataset, val_dataset)
+    with rl_init_timer.time("setup"):
+        (
+            policy,
+            policy_generation,
+            _nemo_gym_actor,
+            cluster,
+            dataloader,
+            val_dataloader,
+            loss_fn,
+            logger,
+            checkpointer,
+            grpo_state,
+            master_config,
+            _teacher_worker_groups,
+            _alias_to_group_alias,
+        ) = setup(config, tokenizer, dataset, val_dataset)
+
+    rl_init_timer.record("total", time.perf_counter() - main_start)
+
+    rl_init_metrics = rl_init_timer.get_timing_metrics(reduction_op="sum")
+    print("\n" + "=" * 60)
+    print(" " * 14 + "RL INIT TIMING BREAKDOWN")
+    for label, value in sorted(rl_init_metrics.items()):
+        if isinstance(value, (int, float)):
+            print(f"  {label}: {value:.1f}s")
+    print("=" * 60 + "\n", flush=True)
 
     # Check if async mode is enabled
     if "async_grpo" in config["grpo"] and config["grpo"]["async_grpo"]["enabled"]:

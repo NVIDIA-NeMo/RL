@@ -17,9 +17,11 @@
 This module provides different advantage estimation strategies:
 - GRPOAdvantageEstimator: Standard GRPO advantage with leave-one-out baseline
 - ReinforcePlusPlusAdvantageEstimator: Reinforce++ with optional baseline subtraction (minus_baseline) and KL penalty in reward
+- OPDAdvantageEstimator: On-Policy Distillation (MOPD) token-level distillation advantages
 Reference papers:
 - ProRLv2: https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/
 - Reinforce++: https://arxiv.org/abs/2501.03262
+- MOPD: https://arxiv.org/abs/2601.02780
 """
 
 import torch
@@ -142,3 +144,94 @@ class ReinforcePlusPlusAdvantageEstimator:
         adv = (adv - adv_mean) * adv_rstd
 
         return adv
+
+
+class OPDAdvantageEstimator:
+    """On-Policy Distillation advantage estimator (MOPD, arXiv:2601.02780).
+
+    Computes token-level distillation advantages:
+        Â_MOPD,t = sg[log π_teacher - log π_student]
+
+    This is Equation 8 from the MOPD paper. The IS truncation (w_t, the
+    hard gate on the training-to-inference ratio) is handled separately by
+    ICE-POP mode in ClippedPGLoss — not here.
+
+    The loss function should be configured with:
+        disable_ppo_ratio: true               (REINFORCE, no PPO ratio)
+        use_importance_sampling_correction: true
+        truncated_importance_sampling_type: icepop
+        truncated_importance_sampling_ratio_min: <eps_low>
+        truncated_importance_sampling_ratio: <eps_high>
+
+    Required kwargs in compute_advantage:
+        teacher_logprobs: [B, S] teacher model log probabilities
+        prev_logprobs: [B, S] student training-engine log probabilities
+    Optional kwargs:
+        orm_advantages: [B, S] ORM advantages to blend in (Equation 9)
+    """
+
+    def __init__(self, estimator_config: dict, loss_config: dict):
+        self.use_orm_advantage = bool(estimator_config.get("use_orm_advantage", False))
+        self.orm_advantage_weight = float(estimator_config.get("orm_advantage_weight", 0.0))
+        self.last_metrics: dict[str, float] = {}
+
+    def compute_advantage(
+        self,
+        prompt_ids,
+        rewards,
+        mask,
+        teacher_logprobs=None,
+        prev_logprobs=None,
+        orm_advantages=None,
+        **kwargs,
+    ):
+        """Compute OPD distillation advantages.
+
+        Args:
+            prompt_ids: [B] prompt IDs (unused, kept for interface compatibility)
+            rewards: [B] rewards (unused for pure distillation)
+            mask: [B, S] token mask
+            teacher_logprobs: [B, S] teacher model logprobs (required)
+            prev_logprobs: [B, S] student training-engine logprobs (required)
+            orm_advantages: [B, S] ORM advantages (optional, Equation 9)
+
+        Returns:
+            [B, S] token-level distillation advantages (stop-gradient)
+        """
+        if teacher_logprobs is None:
+            raise ValueError("OPD requires teacher_logprobs")
+        if prev_logprobs is None:
+            raise ValueError("OPD requires prev_logprobs")
+
+        # Â_MOPD,t = sg[log π_teacher - log π_student]  (Equation 8)
+        distill_advantages = (teacher_logprobs - prev_logprobs).detach()
+
+        # Optional ORM blending (Equation 9)
+        if self.use_orm_advantage and orm_advantages is not None:
+            combined = distill_advantages + self.orm_advantage_weight * orm_advantages.detach()
+        else:
+            combined = distill_advantages
+
+        # Apply mask
+        advantages = combined * mask
+
+        # Metrics
+        self._compute_metrics(distill_advantages, advantages, mask)
+
+        return advantages
+
+    def _compute_metrics(self, distill_advantages, advantages, mask):
+        """Compute OPD logging metrics and store in self.last_metrics."""
+        valid_bool = mask.bool()
+        distill_valid = torch.masked_select(distill_advantages, valid_bool)
+        adv_valid = torch.masked_select(advantages, valid_bool)
+
+        distill_mean = distill_valid.mean().item() if distill_valid.numel() > 0 else 0.0
+        adv_mean = adv_valid.mean().item() if adv_valid.numel() > 0 else 0.0
+        adv_std = adv_valid.std().item() if adv_valid.numel() > 1 else 0.0
+
+        self.last_metrics = {
+            "on_policy_distillation/teacher_student_logprob_gap_mean": distill_mean,
+            "on_policy_distillation/adv_mean": adv_mean,
+            "on_policy_distillation/adv_std": adv_std,
+        }

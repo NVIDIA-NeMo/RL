@@ -26,7 +26,13 @@ import uvicorn
 from fastapi import FastAPI
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
+from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_PORT_RANGE_HIGH,
+    DEFAULT_PORT_RANGE_LOW,
+    _bind_socket_in_range,
+    _get_free_port_local,
+    _get_node_ip_local,
+)
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
@@ -107,9 +113,11 @@ def _replace_prefix_tokens(
             model_cut_end -= 1
 
     # Assert here to prepare for the logic below
-    assert len(template_token_ids) > len(
+    if len(template_token_ids) <= len(
         template_prefix_token_ids
-    ), f"""Found possibly non-monotonically increasing trajectory!
+    ):
+
+        error_message = f"""Found possibly non-monotonically increasing trajectory!
 Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}
 
 Template token IDs (everything that was sent to the model endpoint): {template_token_ids}
@@ -118,6 +126,10 @@ Template prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token
 
 Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}
 """
+        with open(f"non_monotonic_trajectory_{str(uuid.uuid4())}.txt", "w") as f:
+            f.write(error_message)
+
+        raise ValueError(error_message)
 
     # We take everything starting with the EOS token ID.
     template_cut_start = -1
@@ -127,9 +139,10 @@ Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}
             break
 
     # This should never be the case, but
-    assert (
-        template_cut_start >= 0
-    ), f"""No EOS token ID found in the chat-templated messages!
+    if (
+        template_cut_start < 0
+    ):
+        error_message = f"""No EOS token ID found in the chat-templated messages!
 Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}
 
 Template token IDs (everything that was sent to the model endpoint): {template_token_ids}
@@ -137,6 +150,9 @@ Template token IDs (everything that was sent to the model endpoint): {template_t
 Template prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token_ids))}
 
 Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"""
+        with open(f"no_eos_token_id_found_{str(uuid.uuid4())}.txt", "w") as f:
+            f.write(error_message)
+        raise ValueError(error_message)
 
     return (
         model_prefix_token_ids[:model_cut_end] + template_token_ids[template_cut_start:]
@@ -147,6 +163,149 @@ Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"""
     runtime_env={**get_nsight_config_if_pattern_matches("vllm_async_generation_worker")}
 )  # pragma: no cover
 class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
+    def __init__(
+        self,
+        config,
+        bundle_indices=None,
+        fraction_of_gpus: float = 1.0,
+        seed=None,
+        defer_model_load: bool = False,
+    ):
+        """Initialize an async vLLM worker.
+
+        When defer_model_load=True, only stores config and reserves a port
+        for the HTTP server (if expose_http_server is enabled). Call
+        load_model() later to perform the heavy model loading.
+
+        Args:
+            config: Configuration dictionary for the policy
+            bundle_indices: List of local bundle indices within a node for parallelism.
+            fraction_of_gpus: Fraction of GPUs to use for this worker
+            seed: Random seed for initialization
+            defer_model_load: If True, skip model loading and only reserve port
+        """
+        # Deferred-loading state. Always initialized so every instance
+        # has a consistent set of attributes regardless of init path.
+        self._reserved_socket = None
+        self._reserved_port = None
+        self._reserved_node_ip = None
+        self._deferred_bundle_indices = None
+        self._deferred_seed = None
+
+        # Defaults for HTTP server state; overwritten by _create_engine()
+        # when the worker is a model owner and the model is actually loaded.
+        self.server_thread = None
+        self.base_url = None
+        self.http_server = None
+
+        super().__init__(config, bundle_indices, fraction_of_gpus, seed, defer_model_load)
+
+        if not self.is_model_owner or not defer_model_load:
+            return
+
+        self._deferred_bundle_indices = bundle_indices
+        self._deferred_seed = seed
+
+        if self.cfg["vllm_cfg"].get("expose_http_server"):
+            self._reserve_port()
+
+        self.llm = None
+        self.vllm_device_ids = None
+
+    def _reserve_port(self):
+        """Bind and listen on a TCP socket to reserve a free port from the OS.
+
+        The socket is held open in LISTENING state and passed directly to
+        uvicorn via the ``sockets=`` parameter in ``server.serve()``.
+        The socket is never closed and re-opened, so there is zero gap
+        where another process could steal the port.
+        """
+        import socket
+
+        port_range_low = self.cfg.get("port_range_low", DEFAULT_PORT_RANGE_LOW)
+        port_range_high = self.cfg.get("port_range_high", DEFAULT_PORT_RANGE_HIGH)
+
+        self._reserved_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._reserved_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._reserved_port = _bind_socket_in_range(self._reserved_socket, port_range_low, port_range_high)
+        self._reserved_socket.listen(128)
+        self._reserved_socket.setblocking(False)
+        self._reserved_node_ip = _get_node_ip_local()
+        print(
+            f"Reserved port {self._reserved_port} on {self._reserved_node_ip} "
+            f"for vLLM HTTP server"
+        )
+
+    def _seed_vllm_cache(self):
+        """Seed local vLLM compile cache from a warm directory if available.
+
+        Reads NRL_VLLM_CACHE_SEED_DIR and rsyncs it into VLLM_CACHE_ROOT.
+        Both are env vars set by the launch script — keeping them in the
+        same system avoids the inconsistency of mixing env vars and config.
+
+        Retries up to 3 times on transient failures. Timeout is controlled
+        by NRL_VLLM_CACHE_SEED_TIMEOUT (default 300s).
+        """
+        import os
+        import shutil
+        import subprocess
+
+        seed_dir = os.environ.get("NRL_VLLM_CACHE_SEED_DIR", "")
+        local_dst = os.environ.get("VLLM_CACHE_ROOT", "")
+        if not seed_dir or not local_dst or not os.path.isdir(seed_dir):
+            return
+        if not os.listdir(seed_dir):
+            return
+        if not shutil.which("rsync"):
+            print("[CACHE SEED] rsync not found, skipping cache seed", flush=True)
+            return
+
+        timeout = int(os.environ.get("NRL_VLLM_CACHE_SEED_TIMEOUT", "300"))
+        os.makedirs(local_dst, exist_ok=True)
+
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            t0 = time.perf_counter()
+            try:
+                result = subprocess.run(
+                    ["rsync", "-a", "--ignore-existing", "--prune-empty-dirs", f"{seed_dir}/", f"{local_dst}/"],
+                    capture_output=True,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired:
+                elapsed = time.perf_counter() - t0
+                print(
+                    f"[CACHE SEED] rsync timed out after {elapsed:.0f}s "
+                    f"(attempt {attempt}/{max_attempts})",
+                    flush=True,
+                )
+                continue
+
+            elapsed = time.perf_counter() - t0
+            if result.returncode == 0:
+                print(f"[CACHE SEED] vLLM compile cache seeded in {elapsed:.1f}s", flush=True)
+                return
+
+            stderr = result.stderr.decode(errors="replace")[:200]
+            print(
+                f"[CACHE SEED] rsync failed (attempt {attempt}/{max_attempts}, "
+                f"{elapsed:.1f}s): {stderr}",
+                flush=True,
+            )
+
+        print("[CACHE SEED] all attempts failed, proceeding with cold compile", flush=True)
+
+    def load_model(self):
+        """Load the vLLM model and create the engine.
+
+        Called after deferred init to perform the heavy model loading.
+        """
+        if not self.is_model_owner:
+            return
+
+        self._seed_vllm_cache()
+        self._load_model(self._deferred_bundle_indices, self._deferred_seed)
+
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
         from vllm.config import CompilationConfig
         from vllm.engine.arg_utils import AsyncEngineArgs
@@ -169,7 +328,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             self.llm_async_engine_args, stat_loggers=self.stat_loggers
         )
 
-        self.server_thread, self.base_url, self.http_server = None, None, None
         if self.cfg["vllm_cfg"].get("expose_http_server"):
             self.server_thread, self.base_url, self.http_server = (
                 self._setup_vllm_server()
@@ -275,7 +433,15 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             self.generation_tokens = []
 
     async def post_init_async(self):
+        if self.llm is not None:
+            await self.llm.collective_rpc("bind_numa", args=tuple())
         self.vllm_device_ids = await self.report_device_id_async()
+
+    async def get_reserved_url(self) -> Optional[str]:
+        """Return the URL from the reserved socket, available before model loading."""
+        if self._reserved_socket is not None:
+            return f"http://{self._reserved_node_ip}:{self._reserved_port}/v1"
+        return None
 
     async def report_dp_openai_server_base_url(self) -> Optional[str]:
         return self.base_url
@@ -289,22 +455,25 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         from fastapi import Request
         from fastapi.responses import JSONResponse, StreamingResponse
-        from vllm import __version__ as vllm_version
-        from vllm.entrypoints.openai.api_server import (
-            BaseModelPath,
-            OpenAIServingChat,
-            OpenAIServingModels,
-            OpenAIServingTokenization,
-        )
-        from vllm.entrypoints.openai.protocol import (
+        from vllm.entrypoints.openai.chat_completion.protocol import (
             ChatCompletionRequest,
             ChatCompletionResponse,
-            ErrorResponse,
+        )
+        from vllm.entrypoints.openai.chat_completion.serving import (
+            OpenAIServingChat,
+        )
+        from vllm.entrypoints.openai.engine.protocol import ErrorResponse
+        from vllm.entrypoints.openai.models.protocol import BaseModelPath
+        from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+        from vllm.entrypoints.serve.tokenize.protocol import (
             TokenizeChatRequest,
             TokenizeCompletionRequest,
             TokenizeResponse,
         )
-        from vllm.entrypoints.openai.tool_parsers import ToolParserManager
+        from vllm.entrypoints.serve.tokenize.serving import (
+            OpenAIServingTokenization,
+        )
+        from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
         from vllm.v1.engine.async_llm import logger as vllm_async_llm_logger
 
         maybe_tool_parser_plugin = self.cfg["vllm_cfg"].get("tool_parser_plugin")
@@ -325,9 +494,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             base_model_paths=base_model_paths,
             lora_modules=None,
         )
-        # Remove this fork when https://github.com/NVIDIA-NeMo/RL/pull/1563 is merged to NeMo RL main bumping to vLLM 0.11.2
-        if vllm_version < "0.11.1":
-            openai_serving_models_kwargs["model_config"] = model_config
         openai_serving_models = OpenAIServingModels(**openai_serving_models_kwargs)
 
         class NeMoRLOpenAIChatRequestMixin:
@@ -347,42 +513,68 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         class NeMoRLOpenAIServingMixin:
             async def _preprocess_chat(
                 self,
-                request: NeMoRLOpenAIChatRequestMixin,
-                tokenizer,
+                request,
                 messages,
-                chat_template,
-                chat_template_content_format,
-                add_generation_prompt=True,
-                continue_final_message=False,
+                default_template,
+                default_template_content_format,
+                default_template_kwargs,
                 tool_dicts=None,
-                documents=None,
-                chat_template_kwargs=None,
                 tool_parser=None,
-                add_special_tokens=False,
             ):
                 # Materialize the message tool calls so we can deepcopy below.
                 for message in messages:
                     if message.get("tool_calls"):
                         message["tool_calls"] = list(message["tool_calls"])
 
-                # Deepcopy messages here since _preprocess_chat may be destructive.
-                messages_for_replace_prefix_tokens = deepcopy(messages)
+                    if "content" in message:
+                        content = message["content"]
+                        if isinstance(content, (list, str)):
+                            continue
+                        # Convert ValidatorIterator to list to get actual content
+                        try:
+                            message["content"] = list(content)
+                        except Exception:
+                            message["content"] = []
 
-                # res is conversation, [request_prompt], [engine_prompt]
-                res = await super()._preprocess_chat(
-                    request,
-                    tokenizer,
-                    messages,
-                    chat_template,
-                    chat_template_content_format,
-                    add_generation_prompt,
-                    continue_final_message,
-                    tool_dicts,
-                    documents,
-                    chat_template_kwargs,
-                    tool_parser,
-                    add_special_tokens,
-                )
+                # Deepcopy messages here since _preprocess_chat may be destructive.
+                # messages_for_replace_prefix_tokens = deepcopy(messages)
+                exclude_fields = {
+                    "prompt_token_ids",
+                    "generation_token_ids",
+                    "generation_log_probs",
+                }
+                messages_for_replace_prefix_tokens = []
+                for msg in messages:
+                    if isinstance(msg, dict):
+                        new_msg = {}
+                        for k, v in msg.items():
+                            if k not in exclude_fields:
+                                new_msg[k] = deepcopy(v)
+                        messages_for_replace_prefix_tokens.append(new_msg)
+                    else:
+                        messages_for_replace_prefix_tokens.append(deepcopy(msg))
+
+                # res is (conversation, [engine_prompt])
+                try:
+                    res = await super()._preprocess_chat(
+                        request=request,
+                        messages=messages,
+                        default_template=default_template,
+                        default_template_content_format=default_template_content_format,
+                        default_template_kwargs=default_template_kwargs,
+                        tool_dicts=tool_dicts,
+                        tool_parser=tool_parser,
+                    )
+                except ValueError as e:
+                    if "maximum context length" in str(e):
+                        import logging
+
+                        # Print a clean one-liner warning that max model length has been exceeded
+                        # The exception is still raised, but later filtered out by the MaxContextLengthFilter
+                        logging.getLogger(__name__).warning(
+                            "Prompt exceeds max_model_len: %s", e
+                        )
+                    raise
 
                 if request.required_prefix_token_ids is None:
                     return res
@@ -407,31 +599,34 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                         ]
                     )
 
+                # For the prefix token calculation, we need add_generation_prompt=False
+                # to get tokens up to (and including) the last assistant message only.
+                # add_generation_prompt is a field on the request that gets embedded
+                # into ChatParams via build_chat_params().
+                modified_request = request.model_copy(
+                    update={"add_generation_prompt": False}
+                )
+
                 # Call the actual preprocess chat subroutine so we don't miss anything. Whatever they do is whatever we do since we literally do what they do.
                 corresponding_res = await super()._preprocess_chat(
-                    request,
-                    tokenizer,
-                    messages_to_last_assistant_message,
-                    chat_template,
-                    chat_template_content_format,
-                    add_generation_prompt=False,
-                    continue_final_message=False,
+                    request=modified_request,
+                    messages=messages_to_last_assistant_message,
+                    default_template=default_template,
+                    default_template_content_format=default_template_content_format,
+                    default_template_kwargs=default_template_kwargs,
                     tool_dicts=tool_dicts,
-                    documents=documents,
-                    chat_template_kwargs=chat_template_kwargs,
                     tool_parser=tool_parser,
-                    add_special_tokens=add_special_tokens,
                 )
-                actual_corresponding_token_ids = corresponding_res[2][0][
+                actual_corresponding_token_ids = corresponding_res[1][0][
                     "prompt_token_ids"
                 ]
 
-                engine_prompt = res[2][
+                engine_prompt = res[1][
                     0
                 ]  # We need to modify engine_prompt.prompt_token_ids
 
                 final_prompt_token_ids = _replace_prefix_tokens(
-                    tokenizer=tokenizer,
+                    tokenizer=self.renderer.tokenizer,
                     model_prefix_token_ids=request.required_prefix_token_ids,
                     template_prefix_token_ids=actual_corresponding_token_ids,
                     template_token_ids=engine_prompt["prompt_token_ids"],
@@ -471,6 +666,13 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 return_tokens_as_token_ids=True,
             )
         )
+
+        # Load custom reasoning parser plugin if specified
+        reasoning_parser_plugin = serving_chat_kwargs.pop("reasoning_parser_plugin", None)
+        if reasoning_parser_plugin:
+            from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
+            ReasoningParserManager.import_reasoning_parser(reasoning_parser_plugin)
+
         openai_serving_chat = NeMoRLOpenAIServingChat(**serving_chat_kwargs)
 
         generation_config = self.cfg
@@ -572,6 +774,24 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         vllm_async_llm_logger.addFilter(CleanLoggingFilter())
 
+        from logging import getLogger as _getLogger
+
+        _getLogger("vllm.entrypoints.openai.engine.protocol").addFilter(CleanLoggingFilter())
+
+        # Suppress the noisy vLLM traceback when a prompt exceeds max_model_len.
+        # This is expected during multi-turn rollouts; we log a clean one-line
+        # warning from _preprocess_chat instead.
+        class MaxContextLengthFilter(LoggingFilter):
+            def filter(self, record: LogRecord) -> bool:
+                if record.exc_info and record.exc_info[1]:
+                    if "maximum context length" in str(record.exc_info[1]):
+                        return False
+                return True
+
+        _getLogger("vllm.entrypoints.openai.serving_chat").addFilter(
+            MaxContextLengthFilter()
+        )
+
         return app
 
     def _setup_vllm_server(self) -> "tuple[threading.Thread, str, uvicorn.Server]":
@@ -592,16 +812,31 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         # Server spinup
         ########################################
 
-        node_ip = _get_node_ip_local()
-        free_port = _get_free_port_local()
+        if self._reserved_socket:
+            # Use the socket reserved during __init__ (deferred model load path).
+            # Pass it directly to uvicorn via sockets= — zero gap, the socket
+            # is never closed and re-opened.
+            node_ip = self._reserved_node_ip
+            free_port = self._reserved_port
+            reserved_sock = self._reserved_socket
+            self._reserved_socket = None  # Transfer ownership to uvicorn
+        else:
+            node_ip = _get_node_ip_local()
+            port_range_low = self.cfg.get("port_range_low", DEFAULT_PORT_RANGE_LOW)
+            port_range_high = self.cfg.get("port_range_high", DEFAULT_PORT_RANGE_HIGH)
+            free_port = _get_free_port_local(port_range_low, port_range_high)
+            reserved_sock = None
 
         base_url = f"http://{node_ip}:{free_port}/v1"
         print(f"Starting server on {base_url}")
 
+        # When sockets= is used, uvicorn ignores host/port in Config.
+        # We still set them for logging/metadata purposes.
         config = uvicorn.Config(
             app,
             host="0.0.0.0",
             port=free_port,
+            timeout_keep_alive=120,  # Keep connections alive longer (default is 5s), fix for this error: Hit an exception while making a request (try 1): <class 'aiohttp.client_exceptions.ClientOSError'>: [Errno 104] Connection reset by peer
         )
         server = uvicorn.Server(config=config)
 
@@ -617,7 +852,19 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         uvicorn_logger = getLogger("uvicorn.access")
         uvicorn_logger.addFilter(No200Filter())
 
-        thread = threading.Thread(target=server.run, daemon=True)
+        if reserved_sock is not None:
+            # Use server.serve(sockets=) to hand the pre-bound listening socket
+            # directly to uvicorn's asyncio server. No close-and-rebind needed.
+            import asyncio
+
+            def _run_with_socket():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(server.serve(sockets=[reserved_sock]))
+
+            thread = threading.Thread(target=_run_with_socket, daemon=True)
+        else:
+            thread = threading.Thread(target=server.run, daemon=True)
         thread.start()
 
         return thread, base_url, server
@@ -1024,12 +1271,13 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 worker_results = await result_or_coro
             else:
                 worker_results = result_or_coro
+            
+            all_success = all([result[0] for result in worker_results])
+            exceptions_or_none = [result[1] for result in worker_results]
 
-            worker_result = worker_results[0]
-
-            if not worker_result:
+            if not all_success:
                 print(
-                    f"Error: Worker failed to update weights. Result: {worker_result}"
+                    f"Error: Worker failed to update weights. Result: {exceptions_or_none}"
                 )
                 return False
             return True
@@ -1061,11 +1309,12 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             else:
                 worker_results = result_or_coro
 
-            worker_result = worker_results[0]
+            all_success = all([result[0] for result in worker_results])
+            exceptions_or_none = [result[1] for result in worker_results]
 
-            if not worker_result:
+            if not all_success:
                 print(
-                    f"Error: Worker failed to update weights. Result: {worker_result}"
+                    f"Error: Worker failed to update weights. Result: {exceptions_or_none}"
                 )
                 return False
             return True

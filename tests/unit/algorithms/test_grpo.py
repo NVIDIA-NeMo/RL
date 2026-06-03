@@ -44,11 +44,6 @@ from tests.unit.algorithms.utils import (
     create_mock_batch,
 )
 
-# ============================================================================
-# Stub classes for async GRPO testing (non-Ray versions for easy mocking)
-# ============================================================================
-
-
 class StubReplayBuffer:
     """Non-Ray stub of ReplayBuffer for unit testing
 

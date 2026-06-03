@@ -19,7 +19,7 @@ from unittest.mock import patch
 import ray
 import torch
 from accelerate import init_empty_weights
-from transformers import AutoConfig, AutoModel
+from transformers import AutoConfig, AutoModelForCausalLM
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.triton_utils import tl, triton
@@ -31,6 +31,13 @@ FP8_BLOCK_QUANT_KWARGS = {
     "fmt": "e4m3",
     "quant_method": "fp8",
     "weight_block_size": [128, 128],
+    "is_mx": False,
+}
+
+
+MXFP8_BLOCK_QUANT_KWARGS = {
+    "quant_method": "modelopt",
+    "quant_algo": "MXFP8",
 }
 
 
@@ -43,6 +50,7 @@ class FP8Config:
     model_parallel_size: int = None
     kv_cache_dtype: str = "auto"
     use_fp8_weights: bool = True  # Whether model weights are quantized to FP8
+    is_mx: bool = False
 
 
 @dataclass()
@@ -154,7 +162,7 @@ def apply_fp8_patches(self, fp8_config):
 
 
 def init_fp8(vllm_cfg, model_name, model_parallel_size):
-    config = AutoConfig.from_pretrained(model_name)
+    config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
     global global_fp8_config
     # Determine if we're using FP8 weights based on precision setting
     use_fp8_weights = vllm_cfg.get("precision") == "fp8"
@@ -173,21 +181,35 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
             "FP8 KV cache can only be used together with FP8 model weights."
         )
 
-    global_fp8_config = FP8Config(
-        use_weight_pow2_scale=vllm_cfg.get("pow2_weight_scaling_factors", False),
-        use_activation_pow2_scale=vllm_cfg.get(
-            "pow2_activation_scaling_factors", False
-        ),
-        num_first_layers_in_bf16=vllm_cfg.get("num_first_layers_in_bf16", 0),
-        num_last_layers_in_bf16=vllm_cfg.get("num_last_layers_in_bf16", 0),
-        model_parallel_size=model_parallel_size,
-        kv_cache_dtype=kv_cache_dtype,
-        use_fp8_weights=use_fp8_weights,
-    )
+    if use_fp8_weights:
+        is_mx = vllm_cfg["fp8_cfg"]["is_mx"]
+    else:
+        is_mx = False
+    fp8_config_kwargs = {
+        "num_first_layers_in_bf16": vllm_cfg.get("num_first_layers_in_bf16", 0),
+        "num_last_layers_in_bf16": vllm_cfg.get("num_last_layers_in_bf16", 0),
+        "model_parallel_size": model_parallel_size,
+        "kv_cache_dtype": kv_cache_dtype,
+        "use_fp8_weights": use_fp8_weights,
+    }
+    if is_mx:
+        fp8_config_kwargs["is_mx"] = True
+        if "pow2_weight_scaling_factors" in vllm_cfg:
+            print("warning: pow2_weight_scaling_factors is not used because you use is_mx=True.")
+        if "pow2_activation_scaling_factors" in vllm_cfg:
+            print("warning: pow2_activation_scaling_factors is not used because you use is_mx=True.")
+    else:
+        fp8_config_kwargs["is_mx"] = False
+        fp8_config_kwargs["use_weight_pow2_scale"] = vllm_cfg.get("pow2_weight_scaling_factors", False)
+        fp8_config_kwargs["use_activation_pow2_scale"] = vllm_cfg.get("pow2_activation_scaling_factors", False)
+    global_fp8_config = FP8Config(**fp8_config_kwargs)
 
     if vllm_cfg.get("use_deep_gemm", False):
-        os.environ["VLLM_USE_DEEP_GEMM"] = "1"
-        os.environ["VLLM_USE_DEEP_GEMM_E8M0"] = "0"
+        if is_mx:
+            print("warning: use_deep_gemm is not used because you use is_mx=True.")
+        else:
+            os.environ["VLLM_USE_DEEP_GEMM"] = "1"
+            os.environ["VLLM_USE_DEEP_GEMM_E8M0"] = "1" if vllm_cfg.get("use_deep_gemm_e8m0", False) else "0"
 
     if vllm_cfg["async_engine"]:
         # for async engine, vllm spawns a process for each DP, so we patch
@@ -201,17 +223,20 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     # create fp8 kwargs for vllm's LLM(...)
     num_first_layers_in_bf16 = vllm_cfg.get("num_first_layers_in_bf16", 0)
     num_last_layers_in_bf16 = vllm_cfg.get("num_last_layers_in_bf16", 0)
-    fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
+    if global_fp8_config.is_mx:
+        fp8_block_quant_kwargs = dict(MXFP8_BLOCK_QUANT_KWARGS)
+    else:
+        fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
 
     if num_first_layers_in_bf16 > 0 or num_last_layers_in_bf16 > 0:
         with init_empty_weights():
-            model = AutoModel.from_config(config)
+            model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
         param_names = [name for name, _ in model.named_parameters()]
 
         bf16_params = []
         if num_first_layers_in_bf16 > 0:
             layers = [l for l in range(num_first_layers_in_bf16)]
-            bf16_params.append(_get_params_in_layers(param_names, layers))
+            bf16_params.extend(_get_params_in_layers(param_names, layers))
 
         if num_last_layers_in_bf16 > 0:
             layers = [
@@ -221,27 +246,31 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
                     config.num_hidden_layers,
                 )
             ]
-            bf16_params.append(_get_params_in_layers(param_names, layers))
+            bf16_params.extend(_get_params_in_layers(param_names, layers))
 
-        fp8_block_quant_kwargs["ignored_layers"] = bf16_params
+        fp8_block_quant_kwargs["ignore"] = bf16_params
     quantization_ignored_layer_kws = vllm_cfg.get("quantization_ignored_layer_kws", [])
     if len(quantization_ignored_layer_kws):
         with init_empty_weights():
-            model = AutoModel.from_config(config)
+            model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
         param_names = [
             f"model.{name}".removesuffix(".weight")
             for name, _ in model.named_parameters()
+        ]
+        param_names = [
+            name.replace("model.backbone.", "backbone.")
+            for name in param_names
         ]
         ignored_layers = [
             n
             for n in param_names
             if any(p in n for p in quantization_ignored_layer_kws)
         ]
-        if "ignored_layers" not in fp8_block_quant_kwargs:
-            fp8_block_quant_kwargs["ignored_layers"] = ignored_layers
+        if "ignore" not in fp8_block_quant_kwargs:
+            fp8_block_quant_kwargs["ignore"] = ignored_layers
         else:
-            fp8_block_quant_kwargs["ignored_layers"].extend(ignored_layers)
-        print("ignored_layers", fp8_block_quant_kwargs["ignored_layers"])
+            fp8_block_quant_kwargs["ignore"].extend(ignored_layers)
+        print("ignored_layers", fp8_block_quant_kwargs["ignore"])
 
     # Return FP8 kwargs (precision=fp8 is required at this point)
     vllm_kwargs = {
@@ -255,13 +284,15 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
 
 def is_fp8_model(vllm_config):
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptMxFp8Config
 
     if hasattr(vllm_config, "quant_config") and isinstance(
-        vllm_config.quant_config, Fp8Config
+        vllm_config.quant_config, (Fp8Config, ModelOptMxFp8Config)
     ):
-        assert vllm_config.quant_config.weight_block_size is not None, (
-            "Only block scaling is currently supported in NeMo-RL!"
-        )
+        if isinstance(vllm_config.quant_config, Fp8Config):
+            assert vllm_config.quant_config.weight_block_size is not None, (
+                "Only block scaling is currently supported in NeMo-RL!"
+            )
         return True
 
     return False
@@ -293,7 +324,7 @@ def _get_params_in_layers(param_names, layers):
         ):
             # Convert the param name into vllm's module name
             # Vllm wraps the model with an extra 'model'
-            params.append(f"model.{name}".removesuffix(".weight"))
+            params.append(f"model.{name}".removesuffix(".weight").replace("model.backbone.", "backbone."))
     return params
 
 
@@ -311,11 +342,20 @@ def _get_module_from_param_name(model, name: str):
     }
     if module_path[-1] in reversed_mapping.keys():
         module_path[-1] = reversed_mapping[module_path[-1]]
+    if hasattr(model, "hf_to_vllm_mapper") and hasattr(model.hf_to_vllm_mapper, "orig_to_new_prefix"):
+        if module_path[0] in model.hf_to_vllm_mapper.orig_to_new_prefix:
+            module_path[0] = model.hf_to_vllm_mapper.orig_to_new_prefix[module_path[0]]
+    if hasattr(model, "hf_to_vllm_mapper") and hasattr(model.hf_to_vllm_mapper, "orig_to_new_substr"):
+        for i in range(len(module_path)):
+            if module_path[i] in model.hf_to_vllm_mapper.orig_to_new_substr:
+                module_path[i] = model.hf_to_vllm_mapper.orig_to_new_substr[module_path[i]]
 
     current_module = model
     try:
         # Traverse the model hierarchy
         for part in module_path:
+            if part == "mtp":
+                raise ValueError("Do not support getting module for mtp layers. In this case, we always assume the parameter does not need quantization.")
             if isinstance(current_module, FusedMoE):
                 return current_module
             if isinstance(current_module, torch.nn.ModuleList):
@@ -323,7 +363,8 @@ def _get_module_from_param_name(model, name: str):
             else:
                 current_module = getattr(current_module, part)
     except (AttributeError, IndexError, ValueError) as e:
-        print(f"Warning: Could not find module for parameter '{name}'. Error: {e}")
+        truncated_error_message = str(e)[:1000]
+        print(f"Warning: Could not find module for parameter '{name}'. Error: {truncated_error_message}")
     return current_module
 
 
@@ -348,6 +389,8 @@ def _is_fp8_weight(name, model):
 
 
 def load_weights(weights, model_runner):
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import mxfp8_e4m3_quantize
+    global global_fp8_config
     weights_quantized = []
     model = model_runner.model
 
@@ -356,13 +399,20 @@ def load_weights(weights, model_runner):
             weights_quantized.append((k, v))
             continue
         # Cast the weight into fp8 and its scale factor
-        param_lp, param_scale = cast_tensor_to_fp8_blockwise(
-            v.to(torch.float),
-            weight_block_size=FP8_BLOCK_QUANT_KWARGS["weight_block_size"],
-        )
+        if global_fp8_config.is_mx:
+            param_lp, param_scale = mxfp8_e4m3_quantize(v)
+        else:
+            param_lp, param_scale = cast_tensor_to_fp8_blockwise(
+                v.to(torch.float),
+                weight_block_size=FP8_BLOCK_QUANT_KWARGS["weight_block_size"],
+            )
         param_scale = torch.squeeze(param_scale, dim=-1)
-        weights_quantized.append([k, param_lp])
-        weights_quantized.append([k + "_scale_inv", param_scale])
+        if global_fp8_config.is_mx:
+            weights_quantized.append([k, param_lp])
+            weights_quantized.append([k + "_scale", param_scale])
+        else:
+            weights_quantized.append([k, param_lp])
+            weights_quantized.append([k + "_scale_inv", param_scale])
     # Finally load the weights into vllm
     model.load_weights(weights_quantized)
 
@@ -480,14 +530,14 @@ def maybe_post_process_fp8_weight_block(layer: torch.nn.Module):
     if should_use_deepgemm:
         dg_weight, dg_weight_scale = deepgemm_post_process_fp8_weight_block(
             wq=layer.weight.data,
-            ws=layer.weight_scale.data,
+            ws=layer.weight_scale_inv.data,
             quant_block_shape=tuple(layer.weight_block_size),
             use_e8m0=is_deep_gemm_e8m0_used(),
         )
         # This is the only part we change from the original function (https://github.com/vllm-project/vllm/blob/275de34170654274616082721348b7edd9741d32/vllm/model_executor/layers/quantization/utils/fp8_utils.py#L1196-L1197)
         # Instead of creating new torch.nn.Parameter, we update the data in place.
         layer.weight.data.copy_(dg_weight)
-        layer.weight_scale.data.copy_(dg_weight_scale)
+        layer.weight_scale_inv.data.copy_(dg_weight_scale)
 
 
 def process_weights_after_loading(self, layer) -> None:
@@ -506,15 +556,15 @@ def process_weights_after_loading(self, layer) -> None:
     weight_scale = layer.weight_scale_inv
     weight, weight_scale = process_fp8_weight_block_strategy(layer.weight, weight_scale)
     layer.weight.data = weight.data
-    if hasattr(layer, "weight_scale"):
-        # Not the first time to call this function, just need to update the data
-        layer.weight_scale.copy_(weight_scale.data)
-    else:
-        # The first time to call this function, create a new parameter and update the tp status
-        layer.weight_scale = torch.nn.Parameter(weight_scale.data, requires_grad=False)
-        layer.update_param_tp_status()
+    layer.weight_scale_inv.data = weight_scale.data
 
     maybe_post_process_fp8_weight_block(layer)
+
+    # Newer vLLM versions access layer.input_scale unconditionally in apply()
+    # even for dynamic activation quantization. Initialize to None so the
+    # attribute always exists; vLLM treats None as "compute dynamically".
+    if not hasattr(layer, "input_scale"):
+        layer.input_scale = None
 
 
 def process_weights_after_loading_moe(self, layer) -> None:

@@ -31,6 +31,7 @@ from megatron.bridge.training.config import (
     CheckpointConfig,
     ConfigContainer,
     DistributedDataParallelConfig,
+    DistributedInitConfig,
     LoggerConfig,
     OptimizerConfig,
     SchedulerConfig,
@@ -312,6 +313,9 @@ def setup_model_config(
     # Apply MoE settings
     _apply_moe_config(model_cfg, config)
 
+    # Apply MTP settings
+    _apply_mtp_config(model_cfg, config)
+
     # Apply precision settings
     _apply_precision_config(model_cfg, config, dtype)
 
@@ -329,7 +333,11 @@ def setup_model_config(
     _validate_chunking_config(config)
 
     # Create checkpoint configs
-    checkpoint_config = _create_checkpoint_config(pretrained_path, weights_path)
+    checkpoint_config = _create_checkpoint_config(
+        pretrained_path,
+        weights_path,
+        ckpt_cfg=config["megatron_cfg"].get("checkpoint"),
+    )
 
     # Validate training configuration
     _validate_training_config(config, model_cfg)
@@ -405,6 +413,24 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
 
     model_cfg.moe_permute_fusion = config["megatron_cfg"]["moe_permute_fusion"]
 
+    # DeepEP configuration
+    model_cfg.moe_flex_dispatcher_backend = config["megatron_cfg"]["moe_flex_dispatcher_backend"]
+    model_cfg.moe_hybridep_num_sms = config["megatron_cfg"]["moe_hybridep_num_sms"]
+    os.environ["NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"] = str(min(model_cfg.expert_model_parallel_size, 64))
+    os.environ["USE_MNNVL"] = str(int(model_cfg.expert_model_parallel_size > 4))
+
+def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
+    """Apply Multi Token Prediction configuration."""
+    model_cfg.mtp_loss_scaling_factor = config["megatron_cfg"][
+        "mtp_loss_scaling_factor"
+    ]
+    model_cfg.mtp_use_repeated_layer = config["megatron_cfg"][
+        "mtp_use_repeated_layer"
+    ]
+    # In mcore, mtp_num_layers is used for both number of MTP layers when mtp_use_repeated_layer is False and number of times to repeat the MTP layer when mtp_use_repeated_layer is True
+    model_cfg.mtp_num_layers = config["megatron_cfg"]["mtp_num_layers"]
+    model_cfg.mtp_detach_heads = config["megatron_cfg"]["mtp_detach_heads"]
+
 
 def _apply_precision_config(
     model_cfg: Any, config: PolicyConfig, dtype: torch.dtype
@@ -452,6 +478,7 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     # Fusion settings
     model_cfg.apply_rope_fusion = config["megatron_cfg"]["apply_rope_fusion"]
     model_cfg.bias_activation_fusion = config["megatron_cfg"]["bias_activation_fusion"]
+    model_cfg.use_fused_weighted_squared_relu = config["megatron_cfg"].get("use_fused_weighted_squared_relu", False)
 
     # FP8 configuration
     fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
@@ -468,6 +495,11 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
                 "Setting fp8_param=True sometimes causes NaN token_mult_prob_error, please use with caution. "
                 "Refer to https://github.com/NVIDIA-NeMo/RL/issues/1164 for latest updates with this issue."
             )
+
+    # first/last layer precision configuration
+    model_cfg.first_last_layers_bf16 = config["megatron_cfg"]["first_last_layers_bf16"]
+    model_cfg.num_layers_at_start_in_bf16 = config["megatron_cfg"]["num_layers_at_start_in_bf16"]
+    model_cfg.num_layers_at_end_in_bf16 = config["megatron_cfg"]["num_layers_at_end_in_bf16"]
 
 
 def _validate_optimizer_config(config: PolicyConfig) -> None:
@@ -498,19 +530,44 @@ def _validate_chunking_config(config: PolicyConfig) -> None:
 
 
 def _create_checkpoint_config(
-    pretrained_path: str, weights_path: Optional[str]
+    pretrained_path: str,
+    weights_path: Optional[str],
+    ckpt_cfg: Optional[dict[str, Any]] = None,
 ) -> CheckpointConfig:
-    """Create checkpoint configurations."""
-    return CheckpointConfig(
+    """Create checkpoint configurations.
+
+    Args:
+        pretrained_path: Path to the pretrained checkpoint.
+        weights_path: Path to save/load training weights.
+        ckpt_cfg: Optional MegatronCheckpointConfig dict from YAML.
+    """
+    cfg = ckpt_cfg or {}
+    async_save = cfg.get("async_save", False)
+    # Megatron-Bridge requires checkpoint.save != None when async_save is enabled.
+    # The actual path is overwritten by save_checkpoint() before each write.
+    save_path = weights_path
+    if async_save and save_path is None:
+        save_path = pretrained_path
+    kwargs: dict[str, Any] = dict(
         save_interval=100,
-        save=weights_path,
+        save=save_path,
         load=weights_path,
         pretrained_checkpoint=pretrained_path,
-        async_save=False,
+        async_save=async_save,
         fully_parallel_save=True,
         fully_parallel_load=True,
         load_rng=False,
+        ckpt_assume_constant_structure=cfg.get("ckpt_assume_constant_structure", False),
     )
+    _optional_ckpt_fields = (
+        "fully_parallel_save_process_group",
+        "fully_parallel_load_process_group",
+        "fully_parallel_load_exchange_algo",
+    )
+    for field in _optional_ckpt_fields:
+        if field in cfg:
+            kwargs[field] = cfg[field]
+    return CheckpointConfig(**kwargs)
 
 
 def _validate_training_config(config: PolicyConfig, model_cfg: Any) -> None:
@@ -579,10 +636,17 @@ def _create_megatron_config(
     dtype: torch.dtype,
 ) -> ConfigContainer:
     """Create the final Megatron configuration container."""
+    dist_cfg = DistributedInitConfig()
+    if "use_gloo_process_groups" in config["megatron_cfg"]:
+        dist_cfg.use_gloo_process_groups = config["megatron_cfg"][
+            "use_gloo_process_groups"
+        ]
+
     return ConfigContainer(
         model=model_cfg,
         checkpoint=checkpoint_config,
         logger=LoggerConfig(logging_level=0),
+        dist=dist_cfg,
         train=TrainingConfig(
             micro_batch_size=1,  # ignored
             global_batch_size=config["train_global_batch_size"],  # ignored
@@ -629,6 +693,17 @@ def setup_model_and_optimizer(
     state = GlobalState()
     state.cfg = megatron_cfg
     # TODO: Freeze state.cfg
+
+    # Must be called before initialize_megatron (before CUDA init) so the
+    # persistent worker subprocess is spawned in a clean process.
+    # Bridge hardcodes mp_mode='spawn' which is the only safe option in Ray actors.
+    # Guard: older megatron-core may lack AsyncCallsQueue.warmup_persistent_caller.
+    _init_fn = getattr(state, "initialize_async_checkpoint_worker", None)
+    if _init_fn is not None:
+        try:
+            _init_fn()
+        except AttributeError:
+            pass
 
     megatron_cfg.dist.external_gpu_device_mapping = True
     initialize_megatron(
@@ -679,6 +754,19 @@ def setup_model_and_optimizer(
     torch.distributed.barrier()
 
     pre_wrap_hook = []
+
+    # For inference-only workers (no optimizer), freeze all params so DDP
+    # skips gradient buffer allocation — saves ~50 GiB for large MoE models.
+    if not load_optimizer:
+
+        def freeze_all_params(megatron_model):
+            if not isinstance(megatron_model, list):
+                megatron_model = [megatron_model]
+            for model_module in megatron_model:
+                for param in model_module.parameters():
+                    param.requires_grad = False
+
+        pre_wrap_hook.append(freeze_all_params)
 
     use_peft = policy_cfg["megatron_cfg"].get("peft", {}).get("enabled", False)
 

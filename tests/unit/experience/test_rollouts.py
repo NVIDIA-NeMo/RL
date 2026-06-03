@@ -786,7 +786,6 @@ def test_run_sliding_puzzle_vllm(sliding_puzzle_setup_vllm):
 
     print("\nSliding Puzzle VLLM Test assertions passed.")
 
-
 @pytest.mark.skipif(
     not NEMO_GYM_INSTALLED,
     reason="Skipping NeMo-Gym test since NeMo-Gym is not installed!",

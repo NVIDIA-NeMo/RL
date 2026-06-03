@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --nodes=2
 #SBATCH --exclusive
+#SBATCH --mem=0
 #SBATCH --account=ACCOUNT
 #SBATCH --job-name=JOB_NAME
 #SBATCH --partition=PARTITION
@@ -24,6 +25,9 @@
 
 set -eoux pipefail
 
+# Record job-start epoch so Python can measure pre-Python overhead
+export NRL_JOB_START_EPOCH=$(date +%s.%N)
+
 ########################################################
 # Function to detect if SLURM cluster uses GRES
 ########################################################
@@ -32,7 +36,8 @@ maybe_gres_arg() {
   # Assumes a homogeneous allocation (not a heterogeneous job)
   if sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep -q "gpu:"; then
     # Do a quick assert here that gpus:8 == gpus:$GPUS_PER_NODE. It is probably a user error if someone isn't using GPUS_PER_NODE=8 on our clusters if it supports --gres=gpu:8 or gpu:a100:8
-    if [[ $GPUS_PER_NODE -ne $(sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep "gpu:" | awk -F: '{print $NF}') ]]; then
+    # Note: cut -d'(' -f1 removes the socket spec like "(S:0-3)" that some clusters append
+    if [[ $GPUS_PER_NODE -ne $(sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep "gpu:" | cut -d'(' -f1 | awk -F: '{print $NF}') ]]; then
       echo "Error: GPUS_PER_NODE=$GPUS_PER_NODE but GRES detected is $(sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep "gpu:") meaning GPUS_PER_NODE is not set to fully claim the GPUs on the nodes." >&2
       exit 1
     fi
@@ -47,23 +52,25 @@ maybe_gres_arg() {
 ########################################################
 # User defined variables
 ########################################################
+export OMP_NUM_THREADS=16
 CONTAINER=$CONTAINER
 MOUNTS=$MOUNTS
 COMMAND=${COMMAND:-}  # This is a script relative to the SLURM_SUBMIT_DIR. If left empty, it will leave the cluster idle after it's brought up.
+SETUP_COMMAND=${SETUP_COMMAND:-}  # Setup commands to run on all nodes before starting Ray
 ########################################################
 # Ports for all nodes (should be odd numbers since we place head/worker[0] on the same node) so all workers get the odd ports, but the head will get +1 the ports
-NODE_MANAGER_PORT=${NODE_MANAGER_PORT:-53001}
-OBJECT_MANAGER_PORT=${OBJECT_MANAGER_PORT:-53003}
-RUNTIME_ENV_AGENT_PORT=${RUNTIME_ENV_AGENT_PORT:-53005}
-DASHBOARD_AGENT_GRPC_PORT=${DASHBOARD_AGENT_GRPC_PORT:-53007}
-METRICS_EXPORT_PORT=${METRICS_EXPORT_PORT:-53009}
+NODE_MANAGER_PORT=${NODE_MANAGER_PORT:-1301}
+OBJECT_MANAGER_PORT=${OBJECT_MANAGER_PORT:-1303}
+RUNTIME_ENV_AGENT_PORT=${RUNTIME_ENV_AGENT_PORT:-1305}
+DASHBOARD_AGENT_GRPC_PORT=${DASHBOARD_AGENT_GRPC_PORT:-1307}
+METRICS_EXPORT_PORT=${METRICS_EXPORT_PORT:-1309}
 
-# Ports for the head node
-PORT=${PORT:-54514}
-RAY_CLIENT_SERVER_PORT=${RAY_CLIENT_SERVER_PORT:-10001}
+# Ports for the head node -- all below ephemeral floor (9000 on OCI-HSG).
+PORT=${PORT:-1200}
+RAY_CLIENT_SERVER_PORT=${RAY_CLIENT_SERVER_PORT:-1201}
 #REDIT_SHARD_PORTS=${REDIT_SHARD_PORTS:-"random"} ??
 DASHBOARD_PORT=${DASHBOARD_PORT:-8265}  # Also used by debugger
-DASHBOARD_AGENT_LISTEN_PORT=${DASHBOARD_AGENT_LISTEN_PORT:-52365}
+DASHBOARD_AGENT_LISTEN_PORT=${DASHBOARD_AGENT_LISTEN_PORT:-1311}
 RAY_DEBUGGER_ARGS=
 if [ "${RAY_DEBUG:-}" = "legacy" ]; then
   RAY_DEBUGGER_ARGS="--ray-debugger-external"
@@ -84,11 +91,150 @@ elif [[ $(ulimit -Hn) != "unlimited" ]] && [[ $(ulimit -Hn) -lt 65535 ]]; then
   echo "[WARNING]: Cannot increase ulimit on file descriptors to 65535 according ray recommendation: https://docs.ray.io/en/latest/cluster/vms/user-guides/large-cluster-best-practices.html. Speak to cluster admins to increase, otherwise ray may crash unexpectedly."
 fi
 
-# On our clusters, the largest port range on an idle worker appeared between 52369-64607
-# (not including the other ports set by this script). So this range is chosen to be
-# somewhere in the middle
-MIN_WORKER_PORT=${MIN_WORKER_PORT:-54001}
-MAX_WORKER_PORT=${MAX_WORKER_PORT:-54513}
+# ---------------------------------------------------------------------------
+# GCS burst-tolerance tuning for larger jobs
+#
+# During init, the burst of actor creation triggers thousands of RegisterWorker
+# RPCs to the single GCS server on the head node. The burst of traffic causes
+# overloads which create cascading failures: GCS RPC queue backs up -> workers
+# timeout during registration -> raylet kills them -> job fails.
+#
+# These settings increase GCS throughput, extend timeouts to survive the burst,
+# and reduce background RPC noise during init. Set via RAY_<config_name> env
+# vars which Ray reads at process startup.
+#
+# Config reference: https://github.com/ray-project/ray/blob/master/src/ray/common/ray_config_def.h
+# ---------------------------------------------------------------------------
+
+# --- GCS RPC thread pools ---
+# gcs_server_rpc_server_thread_num (default max(1, num_cpus/4)): threads that
+#   poll for incoming gRPC requests. 64 ensures the GCS can drain large bursts
+#   of actor creation RPCs without excessive queueing.
+# num_server_call_thread (default max(1, num_cpus/4)): threads that send gRPC
+#   replies.
+# gcs_max_active_rpcs_per_handler auto-scales to rpc_thread_num * 100.
+export RAY_gcs_server_rpc_server_thread_num="${RAY_gcs_server_rpc_server_thread_num:-64}"
+export RAY_num_server_call_thread="${RAY_num_server_call_thread:-32}"
+
+# --- Registration and RPC timeouts ---
+# With thread tuning, GCS should drain even the worst burst in ~60s. 120s gives
+# 2x margin while keeping failure detection under 2 minutes.
+#
+# worker_register_timeout_seconds (default 60s): raylet kills unregistered
+#   workers after this timeout.
+# gcs_rpc_server_connect_timeout_s (default 5s): initial GCS connection
+#   timeout. Extremely tight at scale — workers fail to get cluster ID.
+# gcs_rpc_server_reconnect_timeout_s (default 60s): max reconnection wait.
+# gcs_server_request_timeout_seconds (default 60s): synchronous GCS requests.
+export RAY_worker_register_timeout_seconds="${RAY_worker_register_timeout_seconds:-120}"
+export RAY_gcs_rpc_server_connect_timeout_s="${RAY_gcs_rpc_server_connect_timeout_s:-120}"
+export RAY_gcs_rpc_server_reconnect_timeout_s="${RAY_gcs_rpc_server_reconnect_timeout_s:-120}"
+export RAY_gcs_server_request_timeout_seconds="${RAY_gcs_server_request_timeout_seconds:-120}"
+
+# --- Reduce background RPC noise during init ---
+# raylet_report_resources_period_milliseconds (default 100ms): at many nodes
+#   the resource-report RPCs/sec hitting GCS add up quickly. 500ms reduces
+#   this 5x, freeing GCS capacity during the burst.
+# task_events_report_interval_ms (default 1000ms): task status pushed to GCS
+#   for dashboard observability. 5000ms reduces this 5x. Dashboard will show
+#   slightly stale task status during init — acceptable tradeoff.
+export RAY_raylet_report_resources_period_milliseconds="${RAY_raylet_report_resources_period_milliseconds:-500}"
+export RAY_task_events_report_interval_ms="${RAY_task_events_report_interval_ms:-5000}"
+
+# --- Resource broadcast batching ---
+# gcs_resource_broadcast_max_batch_size (default 1 = disabled): GCS broadcasts
+#   resource updates to all nodes via ray_syncer. With batch_size=1, every
+#   update is sent individually — at N nodes reporting every 500ms, the
+#   fan-out is O(N^2) messages/sec. Batching collapses these into fewer,
+#   larger messages, dramatically reducing GCS send-side overhead.
+# gcs_resource_broadcast_max_batch_delay_ms: max delay before flushing a
+#   partial batch. 100ms is imperceptible for scheduling decisions.
+export RAY_gcs_resource_broadcast_max_batch_size="${RAY_gcs_resource_broadcast_max_batch_size:-512}"
+export RAY_gcs_resource_broadcast_max_batch_delay_ms="${RAY_gcs_resource_broadcast_max_batch_delay_ms:-100}"
+
+# --- GCS reply-path threads ---
+# gcs_server_rpc_client_thread_num (default max(1, num_cpus/4)): threads for
+#   GCS to send gRPC replies back to raylets. Match to the server (inbound)
+#   thread count to avoid a reply-path bottleneck during actor creation bursts.
+export RAY_gcs_server_rpc_client_thread_num="${RAY_gcs_server_rpc_client_thread_num:-64}"
+
+# --- Increase GCS active RPC headroom ---
+# gcs_max_active_rpcs_per_handler (default rpc_server_thread_num * 100):
+#   maximum concurrent RPCs per handler in the GCS. With rpc_thread_num=64
+#   the auto-computed default is 6400. Explicitly set higher to ensure the
+#   handler queue doesn't become a bottleneck when thousands of actors
+#   register simultaneously without staggering.
+export RAY_gcs_max_active_rpcs_per_handler="${RAY_gcs_max_active_rpcs_per_handler:-12800}"
+
+# --- Subscriber cleanup ---
+# subscriber_timeout_ms (default 300,000 = 5 min): time before a dead
+#   subscriber is cleaned up from the GCS pub/sub publisher. At scale, dead
+#   subscribers accumulate stale long-poll connections. 60s is aggressive but
+#   safe — live subscribers reconnect well within this window.
+export RAY_subscriber_timeout_ms="${RAY_subscriber_timeout_ms:-60000}"
+
+# --- Cap idle task worker pool ---
+# num_workers_soft_limit (default -1 = number of CPUs): on high-core-count nodes
+#   the raylet accumulates many idle worker processes, each holding a GCS
+#   connection. Cap at 16 — our tasks are short-lived (port discovery, GPU ID
+#   queries) so 16 concurrent workers per node is sufficient.
+export RAY_num_workers_soft_limit="${RAY_num_workers_soft_limit:-16}"
+
+
+# --- Reduce gRPC keepalive overhead ---
+# grpc_keepalive_time_ms (default 10s): interval between keepalive pings to
+#   the GCS server. With 768 nodes at 10s, keepalive alone generates ~77
+#   pings/sec on GCS. 60s reduces this 6x during the init burst.
+# grpc_keepalive_timeout_ms (default 20s): timeout for keepalive ACK.
+#   Must be >= keepalive_time to avoid false dead-connection detection during
+#   GCS load spikes.
+export RAY_grpc_keepalive_time_ms="${RAY_grpc_keepalive_time_ms:-60000}"
+export RAY_grpc_keepalive_timeout_ms="${RAY_grpc_keepalive_timeout_ms:-60000}"
+
+# --- Disable observability features not in use ---
+# enable_timeline (default true): every actor/task creation emits a timeline
+#   event to GCS. Disabling eliminates thousands of GCS writes during init.
+# event_stats (default true): internal event loop statistics collection.
+#   Disabling reduces per-event overhead in the GCS event loop.
+export RAY_enable_timeline="${RAY_enable_timeline:-false}"
+export RAY_event_stats="${RAY_event_stats:-false}"
+
+# --- Reduce syncer, heartbeat, and health-check background traffic ---
+# ray_syncer_message_refresh_interval_ms (default 3s): periodic state refresh
+#   across all nodes via ray_syncer. 10s reduces traffic 3x.
+# core_worker_internal_heartbeat_ms (default 1s): worker heartbeat to raylet.
+#   During init, 3000+ workers heartbeating at 1s adds indirect GCS load via
+#   raylet resource aggregation. 5s is sufficient.
+# health_check_period_ms (default 3s): nodes health-check GCS every 3s.
+#   At 768 nodes = 256 checks/sec. 10s reduces to ~77/sec. Acceptable
+#   during init where node-failure detection latency is not critical.
+export RAY_ray_syncer_message_refresh_interval_ms="${RAY_ray_syncer_message_refresh_interval_ms:-10000}"
+export RAY_core_worker_internal_heartbeat_ms="${RAY_core_worker_internal_heartbeat_ms:-5000}"
+export RAY_health_check_period_ms="${RAY_health_check_period_ms:-10000}"
+
+# Worker port range must NOT overlap with the OS ephemeral range to prevent
+# TOCTOU collisions.  Ray's Raylet uses a probe-and-release pattern
+# (CheckPortFree) that can leave a window where the port is unguarded.
+# If the range overlaps with the ephemeral range, the kernel can assign the same
+# port as an ephemeral source port for outgoing TCP traffic during that window,
+# causing EADDRINUSE when the worker tries to bind.
+#
+# The ephemeral range is 9000-65000 on OCI-HSG DGX/GB200 nodes (32768-60999 on
+# stock Linux).  All service ports are pinned below 9000 to stay clear of even
+# the lowest observed ephemeral floor.
+#
+# Port layout (all below ephemeral floor at 9000):
+#   1200-1201    Ray GCS + client server (head only)
+#   1301-1312    Ray management (node-mgr, obj-mgr, etc.; odd=worker, even=head)
+#   2000-2999    Ray worker gRPC (min/max-worker-port)
+#   3000-4999    NeMo RL HTTP servers / TCPStore (policy.generation.port_range_low/high)
+#   5000-5999    NeMo Gym HTTP servers (Gym global config port_range_low/high)
+#   6000         Sandbox Nginx (NEMO_SKILLS_SANDBOX_PORT)
+#   6001-6999    Sandbox uWSGI workers (SANDBOX_BASE_PORT)
+#   7000-8999    vLLM engine TP/DP rendezvous (VLLM_PORT in vllm_worker.py)
+#   8265         Ray Dashboard (DASHBOARD_PORT)
+MIN_WORKER_PORT=${MIN_WORKER_PORT:-2000}
+MAX_WORKER_PORT=${MAX_WORKER_PORT:-2999}
 ########################################################
 # Number seconds to sync logs from /tmp/ray/session_*/logs to $LOG_DIR/ray/
 RAY_LOG_SYNC_FREQUENCY=${RAY_LOG_SYNC_FREQUENCY:-}
@@ -107,12 +253,38 @@ if [[ -n "${UV_CACHE_DIR_OVERRIDE:-}" ]]; then
 fi
 
 # Create logs directory
+# NOTE: LOG_DIR must be on a shared filesystem visible to both the submit host and all compute nodes.
+# File-based signaling between the submit host and containers 
+# (STARTED_RAY_HEAD, ray_worker_units, ENDED) relies on this. 
+# On systems without a shared FS, srun-based polling would be needed.
 BASE_LOG_DIR=${BASE_LOG_DIR:-$SLURM_SUBMIT_DIR}
-LOG_DIR="$BASE_LOG_DIR/$SLURM_JOB_ID-logs"
+if [[ -n "${SLURM_RESTART_COUNT:-}" ]]; then
+  LOG_DIR="$BASE_LOG_DIR/$SLURM_JOB_ID-$SLURM_RESTART_COUNT-logs"
+else
+  LOG_DIR="$BASE_LOG_DIR/$SLURM_JOB_ID-logs"
+fi
 mkdir -p $LOG_DIR
 
+# Write SETUP_COMMAND to a file to avoid heredoc escaping issues
+SETUP_COMMAND_FILE=""
+if [[ -n "$SETUP_COMMAND" ]]; then
+  SETUP_COMMAND_FILE="$LOG_DIR/setup_command.sh"
+  echo "$SETUP_COMMAND" > "$SETUP_COMMAND_FILE"
+  chmod +x "$SETUP_COMMAND_FILE"
+fi
+
+# Write COMMAND to a file to safely pass it into the container without quoting issues.
+# The head container checks for this file to decide non-interactive vs interactive mode.
+DRIVER_COMMAND_FILE=""
+if [[ -n "$COMMAND" ]]; then
+  DRIVER_COMMAND_FILE="$LOG_DIR/driver_command.sh"
+  printf '%s' "$COMMAND" > "$DRIVER_COMMAND_FILE"
+  chmod +x "$DRIVER_COMMAND_FILE"
+fi
+
 # Number of GPUs per worker node
-GPUS_PER_NODE=${GPUS_PER_NODE:-8}
+GPUS_PER_NODE=${GPUS_PER_NODE:-4}
+NUM_ACTORS=$((GPUS_PER_NODE * SLURM_JOB_NUM_NODES))
 
 # Detect GRES support and set GRES_ARG
 GRES_ARG=$(maybe_gres_arg)
@@ -123,6 +295,7 @@ else
 fi
 
 COMMON_SRUN_ARGS="$GRES_ARG"
+COMMON_SRUN_ARGS+=" --mem=0"
 COMMON_SRUN_ARGS+=" --no-container-mount-home"
 COMMON_SRUN_ARGS+=" --mpi=pmix"
 COMMON_SRUN_ARGS+=" --container-mounts=$MOUNTS"
@@ -132,7 +305,7 @@ COMMON_SRUN_ARGS+=" --container-workdir=$SLURM_SUBMIT_DIR"
 COMMON_SRUN_ARGS+=" -p $SLURM_JOB_PARTITION"
 COMMON_SRUN_ARGS+=" -A $SLURM_JOB_ACCOUNT"
 # Number of CPUs per worker node
-CPUS_PER_WORKER=${CPUS_PER_WORKER:-$((GPUS_PER_NODE * 16))}
+CPUS_PER_WORKER=${CPUS_PER_WORKER:-144}
 
 num_retries=3
 
@@ -200,18 +373,190 @@ for node in $nodes; do
     ip_addresses_array+=("$ip_address")
 done
 
+# Sort nodes alphabetically for deterministic startup order.
+_sorted_pairs=()
+for (( _si = 0; _si < ${#nodes_array[@]}; _si++ )); do
+  _sorted_pairs+=("${nodes_array[$_si]}|${ip_addresses_array[$_si]}")
+done
+IFS=$'\n' _sorted_pairs=($(printf '%s\n' "${_sorted_pairs[@]}" | sort)); unset IFS
+nodes_array=()
+ip_addresses_array=()
+for _pair in "${_sorted_pairs[@]}"; do
+  nodes_array+=("${_pair%%|*}")
+  ip_addresses_array+=("${_pair##*|}")
+done
+unset _sorted_pairs _pair _si
+echo "[INFO] Nodes after hostname sort: ${nodes_array[*]}"
+
+# Dump hostname→IP mapping to log directory for post-mortem diagnostics.
+# Format: "hostname ip" per line, easily consumed by diagnose_job.sh.
+NODE_IP_MAP="$LOG_DIR/node-ip-map.txt"
+for (( _mi = 0; _mi < ${#nodes_array[@]}; _mi++ )); do
+  echo "${nodes_array[$_mi]} ${ip_addresses_array[$_mi]}"
+done > "$NODE_IP_MAP"
+echo "[INFO] Wrote hostname→IP map to $NODE_IP_MAP (${#nodes_array[@]} entries)"
+
 head_node=${nodes_array[0]}
 head_node_ip=${ip_addresses_array[0]}
 
 ip_head=$head_node_ip:$PORT
 
-# First we start the head of the ray cluster on one of the physical nodes
-# Give the head node actual resources to make it schedulable
+# Write the topology probe script that runs inside each container.
+# Both head_cmd and worker_cmd source this to avoid duplication.
+# The script sets two variables: CLUSTER_UUID and TOPO_RANK.
+# These are then embedded into the Ray --resources JSON.
+#
+# CLUSTER_UUID: NVLink fabric ClusterUUID parsed directly from `nvidia-smi -q`.
+#   Groups GPUs by NVLink domain (all 72 GPUs in a GB200 NVL72 rack share one UUID).
+#   Empty string on DGX/HGX (no fabric) or if nvidia-smi is unavailable.
+#
+# TOPO_RANK: Topology-aware infrastructure rank.
+#   Fallback chain:
+#   1. SLURM_TOPOLOGY_ADDR (block.node format) -> block_num * 10^10 + node_num
+#   2. SLURM_PROCID (SLURM without topology plugin)
+#   3. Hostname digits (non-SLURM fallback)
+#
+# TODO(ansubramania): Harden the SLURM_TOPOLOGY_ADDR digit-extraction logic for open source.
+#   The current approach (tr -dc '0-9') assumes block/node names contain
+#   unique numeric substrings, which holds on internal clusters but
+#   may produce collisions on other providers with different naming conventions
+#   (e.g., "rack-A1" vs "rack-B1" both yield "1").
+TOPO_PROBE_SCRIPT="$LOG_DIR/topology_probe.sh"
+cat > "$TOPO_PROBE_SCRIPT" <<TOPO_PROBE_EOF
+CLUSTER_UUID=\$(nvidia-smi -q 2>/dev/null | grep 'ClusterUUID' | head -1 | awk -F: '{print \$2}' | tr -d ' ')
+if [[ -z "\$CLUSTER_UUID" ]]; then
+  CLUSTER_UUID=""
+fi
 
-head_cmd=$(cat <<EOF
-# Touch a file to indicate that the head node has started
-# Overlapping srun commands will check this file to determine if we can overlap a container command
-touch $LOG_DIR/STARTED_RAY_HEAD
+TOPO_RANK=""
+if [[ -n "\${SLURM_TOPOLOGY_ADDR:-}" && "\${SLURM_TOPOLOGY_ADDR_PATTERN:-}" == "block.node" ]]; then
+  _block_part="\${SLURM_TOPOLOGY_ADDR%%.*}"
+  _node_part="\${SLURM_TOPOLOGY_ADDR##*.}"
+  _block_digits=\$(echo "\$_block_part" | tr -dc '0-9')
+  _node_digits=\$(echo "\$_node_part" | tr -dc '0-9')
+  if [[ -n "\$_block_digits" && -n "\$_node_digits" ]]; then
+    TOPO_RANK=\$(( 10#\$_block_digits * 10000000000 + 10#\$_node_digits ))
+  fi
+elif [[ -n "\${SLURM_PROCID:-}" ]]; then
+  TOPO_RANK="\$SLURM_PROCID"
+else
+  _hostname_digits=\$(hostname | tr -dc '0-9')
+  if [[ -n "\$_hostname_digits" ]]; then
+    TOPO_RANK="\$_hostname_digits"
+  fi
+fi
+
+# Write GPU→cpulist mapping for NUMA binding.
+# IMPORTANT: The env var name NRL_GPU_CPU_AFFINITY_FILE and default path must stay
+# in sync with GPU_CPU_AFFINITY_PATH in nemo_rl/distributed/numa_utils.py.
+export NRL_GPU_CPU_AFFINITY_FILE="/tmp/nrl_gpu_cpu_affinity"
+nvidia-smi topo -m 2>/dev/null | awk '/^GPU[0-9]/ { gpu = \$1; sub(/GPU/, "", gpu); print gpu ":" \$(NF-2) }' > "\$NRL_GPU_CPU_AFFINITY_FILE" || true
+if [[ -s "\$NRL_GPU_CPU_AFFINITY_FILE" ]]; then
+  echo "NUMA affinity map written to \$NRL_GPU_CPU_AFFINITY_FILE:"
+  cat "\$NRL_GPU_CPU_AFFINITY_FILE"
+else
+  echo "WARNING: Could not generate NUMA affinity map (nvidia-smi topo unavailable)"
+fi
+
+# Use \\\" so that when --resources="\$RAY_RESOURCES" expands, we pass valid JSON to ray
+# IMPORTANT: The key names "nvlink_domain_" and "topo_rank" below must stay in sync
+# with the constants NVLINK_DOMAIN_PREFIX and TOPO_RANK_KEY defined in
+# nemo_rl/distributed/virtual_cluster.py.
+RAY_RESOURCES='{\"worker_units\": '"$GPUS_PER_NODE"', \"slurm_managed_ray_cluster\": 1'
+if [[ -n "\$CLUSTER_UUID" ]]; then
+  RAY_RESOURCES+=', \"nvlink_domain_'\${CLUSTER_UUID}'\": 1'
+fi
+if [[ -n "\$TOPO_RANK" ]]; then
+  RAY_RESOURCES+=', \"topo_rank\": '\$TOPO_RANK
+fi
+RAY_RESOURCES+='}'
+TOPO_PROBE_EOF
+
+# Set up sandbox ports directory on shared FS (if sandbox is configured).
+# Must be set before BAKED_ENV so it can be passed to containers.
+SANDBOX_PORTS_DIR=""
+if [[ -n "${SANDBOX_CONTAINER:-}" ]] && [[ -n "${SANDBOX_COMMAND:-}" ]]; then
+  SANDBOX_PORTS_DIR="$LOG_DIR/sandbox"
+  # Create shared directory between sandbox and head, used for select code execution tasks (ccc).
+  [[ -n "${SHARED_TEMP_DIR:-}" ]] && mkdir -p "$SHARED_TEMP_DIR"
+  mkdir -p "$SANDBOX_PORTS_DIR"
+fi
+
+# Submit-host variables that both head and worker scripts need.
+# Pyxis/Enroot containers do not inherit the submit host's environment, so these
+# are baked into a string and prepended to each script passed via bash -c.
+BAKED_ENV=$(cat <<ENVEOF
+export LOG_DIR="$LOG_DIR"
+export IP_HEAD="$ip_head"
+export HEAD_NODE_IP="$head_node_ip"
+export PORT=$PORT
+export RAY_CLIENT_SERVER_PORT=$RAY_CLIENT_SERVER_PORT
+export DASHBOARD_PORT=$DASHBOARD_PORT
+export DASHBOARD_AGENT_LISTEN_PORT=$DASHBOARD_AGENT_LISTEN_PORT
+export NODE_MANAGER_PORT=$NODE_MANAGER_PORT
+export OBJECT_MANAGER_PORT=$OBJECT_MANAGER_PORT
+export RUNTIME_ENV_AGENT_PORT=$RUNTIME_ENV_AGENT_PORT
+export DASHBOARD_AGENT_GRPC_PORT=$DASHBOARD_AGENT_GRPC_PORT
+export METRICS_EXPORT_PORT=$METRICS_EXPORT_PORT
+export MIN_WORKER_PORT=$MIN_WORKER_PORT
+export MAX_WORKER_PORT=$MAX_WORKER_PORT
+export RAY_DEBUGGER_ARGS="$RAY_DEBUGGER_ARGS"
+export RAY_LOG_SYNC_FREQUENCY="$RAY_LOG_SYNC_FREQUENCY"
+export SETUP_COMMAND_FILE="$SETUP_COMMAND_FILE"
+export GPUS_PER_NODE=$GPUS_PER_NODE
+export HEAD_NUM_RETRIES=$num_retries
+export WORKER_NUM_RETRIES=20
+export DRIVER_COMMAND_FILE="$DRIVER_COMMAND_FILE"
+export NUM_ACTORS=$NUM_ACTORS
+export NRL_JOB_START_EPOCH=$NRL_JOB_START_EPOCH
+export SANDBOX_PORTS_DIR="$SANDBOX_PORTS_DIR"
+export TOTAL_NUM_NODES=$SLURM_JOB_NUM_NODES
+export NRL_USE_FASTOKENS="${NRL_USE_FASTOKENS:-0}"
+export RAY_ENABLE_UV_RUN_RUNTIME_ENV=$RAY_ENABLE_UV_RUN_RUNTIME_ENV
+export RAY_core_worker_internal_heartbeat_ms=$RAY_core_worker_internal_heartbeat_ms
+export RAY_enable_timeline=$RAY_enable_timeline
+export RAY_event_stats=$RAY_event_stats
+export RAY_gcs_max_active_rpcs_per_handler=$RAY_gcs_max_active_rpcs_per_handler
+export RAY_gcs_resource_broadcast_max_batch_delay_ms=$RAY_gcs_resource_broadcast_max_batch_delay_ms
+export RAY_gcs_resource_broadcast_max_batch_size=$RAY_gcs_resource_broadcast_max_batch_size
+export RAY_gcs_rpc_server_connect_timeout_s=$RAY_gcs_rpc_server_connect_timeout_s
+export RAY_gcs_rpc_server_reconnect_timeout_s=$RAY_gcs_rpc_server_reconnect_timeout_s
+export RAY_gcs_server_request_timeout_seconds=$RAY_gcs_server_request_timeout_seconds
+export RAY_gcs_server_rpc_client_thread_num=$RAY_gcs_server_rpc_client_thread_num
+export RAY_gcs_server_rpc_server_thread_num=$RAY_gcs_server_rpc_server_thread_num
+export RAY_grpc_keepalive_time_ms=$RAY_grpc_keepalive_time_ms
+export RAY_grpc_keepalive_timeout_ms=$RAY_grpc_keepalive_timeout_ms
+export RAY_health_check_period_ms=$RAY_health_check_period_ms
+export RAY_num_server_call_thread=$RAY_num_server_call_thread
+export RAY_num_workers_soft_limit=$RAY_num_workers_soft_limit
+export RAY_ray_syncer_message_refresh_interval_ms=$RAY_ray_syncer_message_refresh_interval_ms
+export RAY_raylet_report_resources_period_milliseconds=$RAY_raylet_report_resources_period_milliseconds
+export RAY_subscriber_timeout_ms=$RAY_subscriber_timeout_ms
+export RAY_task_events_report_interval_ms=$RAY_task_events_report_interval_ms
+export RAY_worker_register_timeout_seconds=$RAY_worker_register_timeout_seconds
+# Only export cache directories when they are set on the submit host
+${LUSTRE_VLLM_CACHE:+export LUSTRE_VLLM_CACHE=$LUSTRE_VLLM_CACHE}
+${NRL_VLLM_LOCAL_CACHE_DIR:+export NRL_VLLM_LOCAL_CACHE_DIR=$NRL_VLLM_LOCAL_CACHE_DIR; export VLLM_CACHE_ROOT=$NRL_VLLM_LOCAL_CACHE_DIR}
+${NRL_VLLM_CACHE_SEED_DIR:+export NRL_VLLM_CACHE_SEED_DIR=$NRL_VLLM_CACHE_SEED_DIR}
+${LUSTRE_INDUCTOR_CACHE:+export LUSTRE_INDUCTOR_CACHE=$LUSTRE_INDUCTOR_CACHE}
+${INDUCTOR_CACHE_DIR:+export INDUCTOR_CACHE_DIR=$INDUCTOR_CACHE_DIR; export TORCHINDUCTOR_CACHE_DIR=$INDUCTOR_CACHE_DIR}
+${LUSTRE_TRITON_CACHE:+export LUSTRE_TRITON_CACHE=$LUSTRE_TRITON_CACHE}
+${TRITON_CACHE_DIR:+export TRITON_CACHE_DIR=$TRITON_CACHE_DIR}
+${CACHE_WRITE_DIR:+export CACHE_WRITE_DIR=$CACHE_WRITE_DIR}
+export CACHE_SYNC_FREQUENCY=${CACHE_SYNC_FREQUENCY:-0}
+export NRL_CACHE_SYNC_DELAY_SECONDS="${NRL_CACHE_SYNC_DELAY_SECONDS:-2700}"
+export NRL_CACHE_SYNC_JITTER_SECONDS="${NRL_CACHE_SYNC_JITTER_SECONDS:-120}"
+export NRL_CACHE_SYNC_EXIT_JITTER_SECONDS="${NRL_CACHE_SYNC_EXIT_JITTER_SECONDS:-}"
+ENVEOF
+)
+
+# First we start the head of the ray cluster on one of the physical nodes.
+# Give the head node actual resources to make it schedulable.
+# Pyxis/Enroot containers do not inherit the submit host's environment,
+# so BAKED_ENV is prepended to give the script the variables it needs.
+HEAD_BODY=$(cat <<'HEAD_BODY_EOF'
+set -oux pipefail
+
 env
 
 exit-dramatically() {
@@ -243,18 +588,18 @@ log-sync-sidecar() {
     echo "RAY_LOG_SYNC_FREQUENCY is not set, skipping log sync sidecar"
     return
   fi
-  mkdir -p $LOG_DIR/ray
+  mkdir -p "$LOG_DIR/ray"
   while true; do
-    sleep $RAY_LOG_SYNC_FREQUENCY
+    sleep "$RAY_LOG_SYNC_FREQUENCY"
     if ls /tmp/ray/session_[0-9]* > /dev/null 2>&1; then
       for session_dir in /tmp/ray/session_[0-9]*/; do
-        if [[ -d "\$session_dir/logs" ]]; then
-          session_name=\$(basename "\$session_dir")
-          mkdir -p "$LOG_DIR/ray/\$session_name"
+        if [[ -d "$session_dir/logs" ]]; then
+          session_name=$(basename "$session_dir")
+          mkdir -p "$LOG_DIR/ray/$session_name"
           if command -v rsync > /dev/null 2>&1; then
-            rsync -ahP "\$session_dir/logs/" "$LOG_DIR/ray/\$session_name/logs/" 2>/dev/null || true
+            rsync -ahP "$session_dir/logs/" "$LOG_DIR/ray/$session_name/logs/" 2>/dev/null || true
           else
-            cp -r "\$session_dir/logs" "$LOG_DIR/ray/\$session_name/"
+            cp -r "$session_dir/logs" "$LOG_DIR/ray/$session_name/"
           fi
         fi
       done
@@ -267,19 +612,194 @@ log-sync-sidecar() {
 }
 log-sync-sidecar &
 
+# Background process to periodically write the current worker_units count to a file
+# on the shared filesystem. The submit host reads this file instead of issuing srun RPCs.
+# Uses atomic write-to-tmp + mv to avoid partial reads.
+ray-status-sidecar() {
+  set +x
+  while true; do
+    sleep 10
+    units=$(ray status 2>/dev/null | grep "worker_units" | awk -F'[/. ]' '{print $4}' || echo 0)
+    echo "$units" > "$LOG_DIR/.ray_worker_units.tmp"
+    mv "$LOG_DIR/.ray_worker_units.tmp" "$LOG_DIR/ray_worker_units"
+    if [[ -f "$LOG_DIR/ENDED" ]]; then break; fi
+  done
+}
+ray-status-sidecar &
+
+# Sync locally-compiled caches back to Lustre so subsequent jobs start warm.
+# Content-addressed: --ignore-existing is safe (identical hashes = identical files).
+# Uses trap EXIT instead of ENDED polling — ENDED only fires on failure, but we also
+# need to sync on successful completion (Slurm SIGTERM → container exit).
+#
+# vLLM compile caches are delayed by NRL_CACHE_SYNC_DELAY_SECONDS (default 2700) from job start.
+# torch.compile runs during engine init at job startup
+# by the time the delay elapses, assume all vLLM instances have finished compiling. 
+# Syncing earlier risks pushing partially-compiled caches to Lustre that seed from them.
+cache-sync-sidecar() {
+  set +x
+  # note: ansubramania - cache writeback disabled unconditionally
+  # every node rsync'ing into the same cache_write/
+  # subtree under --ignore-existing causes Lustre MDS lock build-up 
+  # and invalidation storms at larger scales.
+  return
+  if [[ -z "${CACHE_SYNC_FREQUENCY:-}" ]] || [[ "${CACHE_SYNC_FREQUENCY}" == "0" ]]; then
+    return
+  fi
+
+  _sync_one() {
+    local src="$1" dst="$2" name="$3"
+    [[ -z "$src" || -z "$dst" ]] && return
+    [[ -d "$src" ]] || return
+    [[ -n "$(ls -A "$src" 2>/dev/null)" ]] || return
+    mkdir -p "$dst"
+    local _err _rc=0
+    _err=$(rsync -a --ignore-existing --exclude '.tmp_*' --exclude 'tmp*/' --prune-empty-dirs \
+      "$src/" "$dst/" 2>&1) || _rc=$?
+    if (( _rc == 0 || _rc == 23 || _rc == 24 )); then
+      echo "[CACHE SYNC] ${name}: synced to Lustre"
+    else
+      echo "[CACHE SYNC] ${name}: sync failed (rc=${_rc}: ${_err})"
+    fi
+  }
+
+  _sync_cache_rsync() {
+    local src="$1" dst="$2" name="$3" force="${4:-0}"
+    [[ -z "$src" || -z "$dst" ]] && return 1
+    [[ -d "$src" ]] || return 1
+    [[ -n "$(ls -A "$src" 2>/dev/null)" ]] || return 1
+
+    if (( ! force )); then
+      local now elapsed
+      now=$(date +%s)
+      elapsed=$(( now - ${NRL_JOB_START_EPOCH%%.*} ))
+      if (( elapsed < NRL_CACHE_SYNC_DELAY_SECONDS )); then
+        echo "[CACHE SYNC] ${name}: skipping (${elapsed}s since job start, waiting for ${NRL_CACHE_SYNC_DELAY_SECONDS}s)"
+        return 1
+      fi
+      if find "$src" -type f -mmin -5 -print -quit 2>/dev/null | grep -q .; then
+        echo "[CACHE SYNC] ${name}: skipping (files modified in last 5m)"
+        return 1
+      fi
+    fi
+
+    mkdir -p "$dst"
+    local _err _rc=0
+    _err=$(rsync -a --exclude='tmp*' --exclude='.tmp_*' "$src/" "$dst/" 2>&1) || _rc=$?
+    if (( _rc == 0 || _rc == 23 || _rc == 24 )); then
+      echo "[CACHE SYNC] ${name}: rsynced to Lustre ($(du -sh "$dst" 2>/dev/null | cut -f1))"
+      return 0
+    else
+      echo "[CACHE SYNC] ${name}: rsync failed (rc=${_rc}: ${_err})"
+      return 1
+    fi
+  }
+
+  _sync_vllm_caches() {
+    local base="${NRL_VLLM_LOCAL_CACHE_DIR:-}"
+    local lustre_base="${LUSTRE_VLLM_CACHE:-}"
+    [[ -z "$base" || -z "$lustre_base" ]] && return
+    # Bare base dir: Gym's local_vllm_model and other non-NeMo-RL vLLM
+    # processes inherit VLLM_CACHE_ROOT without a _seed suffix.
+    [[ -d "$base" ]] && _sync_one "$base" "${lustre_base}" "vLLM_base"
+    # Per-seed dirs: NeMo RL vllm_worker appends _{seed} to the base.
+    for d in "${base}"_*; do
+      [[ -d "$d" ]] || continue
+      local suffix="${d#"${base}"}"
+      _sync_one "$d" "${lustre_base}" "vLLM${suffix}"
+    done
+  }
+
+  _vllm_synced=0
+  _inductor_synced=0
+  _triton_synced=0
+
+  _sync_all() {
+    if (( ! _vllm_synced )); then
+      local _now _elapsed
+      _now=$(date +%s)
+      _elapsed=$(( _now - ${NRL_JOB_START_EPOCH%%.*} ))
+      if (( _elapsed >= ${NRL_CACHE_SYNC_DELAY_SECONDS:-2700} )); then
+        _sync_vllm_caches
+        _vllm_synced=1
+      else
+        echo "[CACHE SYNC] vLLM: skipping (${_elapsed}s since job start, waiting for ${NRL_CACHE_SYNC_DELAY_SECONDS:-2700}s)"
+      fi
+    fi
+    if (( ! _inductor_synced )); then
+      _sync_cache_rsync "${INDUCTOR_CACHE_DIR:-}" "${CACHE_WRITE_DIR:+${CACHE_WRITE_DIR}/inductor_cache}" "Inductor" \
+        && _inductor_synced=1
+    fi
+    if (( ! _triton_synced )); then
+      _sync_cache_rsync "${TRITON_CACHE_DIR:-}" "${CACHE_WRITE_DIR:+${CACHE_WRITE_DIR}/triton_cache}" "Triton" \
+        && _triton_synced=1
+    fi
+  }
+
+  _sync_final() {
+    local _nnodes=${TOTAL_NUM_NODES:-${SLURM_JOB_NUM_NODES:-1}}
+    local _auto_exit_window=$(( _nnodes / 20 ))
+    (( _auto_exit_window < 15 )) && _auto_exit_window=15
+    (( _auto_exit_window > 45 )) && _auto_exit_window=45
+    local _exit_window=${NRL_CACHE_SYNC_EXIT_JITTER_SECONDS:-$_auto_exit_window}
+    local _exit_jitter=$(( RANDOM % _exit_window ))
+    echo "[CACHE SYNC] Exit jitter: ${_exit_jitter}s (window=${_exit_window}s, nodes=${_nnodes})"
+    sleep "$_exit_jitter"
+    _sync_vllm_caches
+    _sync_cache_rsync "${INDUCTOR_CACHE_DIR:-}" "${CACHE_WRITE_DIR:+${CACHE_WRITE_DIR}/inductor_cache}" "Inductor" 1
+    _sync_cache_rsync "${TRITON_CACHE_DIR:-}" "${CACHE_WRITE_DIR:+${CACHE_WRITE_DIR}/triton_cache}" "Triton" 1
+  }
+
+  trap '_sync_final; echo "[CACHE SYNC] Final sync complete (exit trap)."' EXIT
+
+  local _jitter=$(( RANDOM % ${NRL_CACHE_SYNC_JITTER_SECONDS:-120} ))
+  echo "[CACHE SYNC] Per-node jitter: ${_jitter}s (spreading initial sync across ${NRL_CACHE_SYNC_JITTER_SECONDS:-120}s window)"
+  sleep "$_jitter"
+
+  while true; do
+    sleep "${CACHE_SYNC_FREQUENCY}"
+    _sync_all
+  done
+}
+cache-sync-sidecar &
+
 # Patch nsight.py before starting Ray head
 sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py
 
-cat <<EOFINNER | tee /launch-head.sh
+source "$LOG_DIR/topology_probe.sh"
+
+# Start Ray head without --block
+# Without --block, ray start --head starts the daemon and returns 0 once the
+# GCS is listening. This lets us touch STARTED_RAY_HEAD after the head is
+# actually ready, so workers connect on the first try instead of retrying
+# against a port that isn't listening yet.
+count=0
+while [[ $count -lt $HEAD_NUM_RETRIES ]]; do
+  # Clean up stale Ray state before every attempt.  If a previous attempt
+  # timed out, it leaves a session directory behind.  Without cleaning it,
+  # the next `ray start --head` hits:
+  #   AssertionError: Session name ... does not match persisted value ...
+  ray stop || true
+  rm -rf /tmp/ray/session_* || true
+
+  if [[ -n "$SETUP_COMMAND_FILE" ]] && [[ -f "$SETUP_COMMAND_FILE" ]]; then
+    echo "[INFO] Running setup command from $SETUP_COMMAND_FILE..."
+    bash "$SETUP_COMMAND_FILE"
+  fi
+  # Two-level evaluation: heredoc expands $RAY_RESOURCES (with \") into text,
+  # then bash re-parses it so \" inside double quotes becomes clean ".
+  if cat <<EOFINNER | bash; then
 ray start --head \
     --disable-usage-stats \
-    --resources="{\"worker_units\": $GPUS_PER_NODE, \"slurm_managed_ray_cluster\": 1}" \
-    --node-ip-address="$head_node_ip" \
+    --resources="$RAY_RESOURCES" \
+    --node-ip-address="$HEAD_NODE_IP" \
     --port=${PORT} \
     --ray-client-server-port=${RAY_CLIENT_SERVER_PORT} \
     --dashboard-port=${DASHBOARD_PORT} \
-    --dashboard-host="$head_node_ip" \
+    --dashboard-host="$HEAD_NODE_IP" \
     --include-dashboard=True \
+    --min-worker-port=${MIN_WORKER_PORT} \
+    --max-worker-port=${MAX_WORKER_PORT} \
     \
     --node-manager-port=$((${NODE_MANAGER_PORT} + 1)) \
     --object-manager-port=$((${OBJECT_MANAGER_PORT} + 1)) \
@@ -287,36 +807,88 @@ ray start --head \
     --dashboard-agent-grpc-port=$((${DASHBOARD_AGENT_GRPC_PORT} + 1)) \
     --dashboard-agent-listen-port=$((${DASHBOARD_AGENT_LISTEN_PORT} + 1)) \
     --metrics-export-port=$((${METRICS_EXPORT_PORT} + 1)) \
-    $RAY_DEBUGGER_ARGS \
-    \
-    --block 
+    $RAY_DEBUGGER_ARGS
 EOFINNER
-chmod +x /launch-head.sh
-
-count=0
-while [[ \$count -lt $num_retries ]]; do
-  bash /launch-head.sh
-  count=\$((count+1))
-  echo "Head node failed \$count/$num_retries times, restarting in 5 seconds..."
+    echo "[INFO] Ray head started successfully (attempt $((count+1))/$HEAD_NUM_RETRIES)"
+    break
+  fi
+  count=$((count+1))
+  echo "[WARN] Head node failed $count/$HEAD_NUM_RETRIES times, restarting in 5 seconds..."
   sleep 5
 done
-touch $LOG_DIR/ENDED
-exit 1
-EOF
-)
-srun $COMMON_SRUN_ARGS --container-name=ray-head --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$head_node" -o $LOG_DIR/ray-head.log bash -x -c "$head_cmd" &
-SRUN_PIDS["ray-head"]=$!
+if [[ $count -ge $HEAD_NUM_RETRIES ]]; then
+  touch "$LOG_DIR/ENDED"
+  exit 1
+fi
 
-NUM_ACTORS=$((GPUS_PER_NODE * SLURM_JOB_NUM_NODES))
+# Signal workers and submit host: Ray head GCS is now listening on $IP_HEAD.
+# Workers poll for this file before attempting ray start --address.
+touch "$LOG_DIR/STARTED_RAY_HEAD"
+
+if [[ -n "$DRIVER_COMMAND_FILE" ]]; then
+  # ── Non-interactive: poll for workers, then run the driver command ──
+  RAY_STATUS_DEADLINE=$((SECONDS + 1800))
+  while true; do
+    worker_units=$(ray status 2>/dev/null | grep "worker_units" | awk -F'[/. ]' '{print $4}' || echo 0)
+    echo "[INFO] Number of actors online: $worker_units/$NUM_ACTORS"
+    if [[ "$worker_units" -eq "$NUM_ACTORS" ]]; then
+      break
+    fi
+    if (( SECONDS > RAY_STATUS_DEADLINE )); then
+      echo "[ERROR] Timed out waiting for all workers to connect ($worker_units/$NUM_ACTORS after 30 min)"
+      touch "$LOG_DIR/ENDED"
+      exit 1
+    fi
+    sleep 5
+  done
+
+  echo "All workers connected!"
+
+  # Wait for all sandbox instances to be ready (if sandbox is configured).
+  # Each sandbox task touches SANDBOX_READY_<hostname> after its port is listening.
+  if [[ -n "$SANDBOX_PORTS_DIR" ]]; then
+    echo "[INFO] Waiting for sandbox to be ready on all $TOTAL_NUM_NODES nodes..."
+    SANDBOX_DEADLINE=$((SECONDS + 600))
+    while true; do
+      ready_count=$(ls -1 "$SANDBOX_PORTS_DIR"/SANDBOX_READY_* 2>/dev/null | wc -l)
+      if [[ "$ready_count" -ge "$TOTAL_NUM_NODES" ]]; then
+        break
+      fi
+      echo "[INFO] Sandbox ready on $ready_count/$TOTAL_NUM_NODES nodes..."
+      if (( SECONDS > SANDBOX_DEADLINE )); then
+        echo "[ERROR] Timed out waiting for sandbox ($ready_count/$TOTAL_NUM_NODES after 10 min)"
+        touch "$LOG_DIR/ENDED"
+        exit 1
+      fi
+      sleep 5
+    done
+    echo "[INFO] All $TOTAL_NUM_NODES sandbox instances ready."
+  fi
+
+  export NRL_RAY_READY_EPOCH=$(date +%s.%N)
+
+  set +e
+  bash "$DRIVER_COMMAND_FILE" > "$LOG_DIR/ray-driver.log" 2>&1
+  exit_code=$?
+  set -e
+  exit $exit_code
+else
+  # ── Interactive: keep the container alive for user attachment ──
+  # The user attaches via a separate srun --overlap (the attach script).
+  # sleep infinity is invisible to the attached session.
+  sleep infinity
+fi
+HEAD_BODY_EOF
+)
 
 # Start Ray worker nodes
 # We want 1 Ray worker node per physical node (excluding the head node)
 # Worker nodes are started with ray start but without the --head flag
-# Start from node 1 since node 0 is running the head
-for ((i = 1; i < SLURM_JOB_NUM_NODES; i++)); do
-  node_i=${nodes_array[$i]}
-    
-  worker_cmd=$(cat <<EOF
+# srun -o with %t produces 0-indexed ray-worker-{0..N-2}.log files.
+WORKER_BODY=$(cat <<'WORKER_BODY_EOF'
+set -oux pipefail
+
+echo "[INFO] Worker $SLURM_PROCID on node $SLURMD_NODENAME (SLURM_PROCID=$SLURM_PROCID)"
 env
 
 exit-dramatically() {
@@ -347,18 +919,18 @@ log-sync-sidecar() {
     echo "RAY_LOG_SYNC_FREQUENCY is not set, skipping log sync sidecar"
     return
   fi
-  mkdir -p $LOG_DIR/ray/$node_i
+  mkdir -p "$LOG_DIR/ray/$SLURMD_NODENAME"
   while true; do
-    sleep $RAY_LOG_SYNC_FREQUENCY
+    sleep "$RAY_LOG_SYNC_FREQUENCY"
     if ls /tmp/ray/session_[0-9]* > /dev/null 2>&1; then
       for session_dir in /tmp/ray/session_[0-9]*/; do
-        if [[ -d "\$session_dir/logs" ]]; then
-          session_name=\$(basename "\$session_dir")
-          mkdir -p "$LOG_DIR/ray/$node_i/\$session_name"
+        if [[ -d "$session_dir/logs" ]]; then
+          session_name=$(basename "$session_dir")
+          mkdir -p "$LOG_DIR/ray/$SLURMD_NODENAME/$session_name"
           if command -v rsync > /dev/null 2>&1; then
-            rsync -ahP "\$session_dir/logs/" $LOG_DIR/ray/$node_i/\$session_name/logs/ 2>/dev/null || true
+            rsync -ahP "$session_dir/logs/" "$LOG_DIR/ray/$SLURMD_NODENAME/$session_name/logs/" 2>/dev/null || true
           else
-            cp -r "\$session_dir/logs" $LOG_DIR/ray/$node_i/\$session_name/
+            cp -r "$session_dir/logs" "$LOG_DIR/ray/$SLURMD_NODENAME/$session_name/"
           fi
         fi
       done
@@ -371,13 +943,185 @@ log-sync-sidecar() {
 }
 log-sync-sidecar &
 
+cache-sync-sidecar() {
+  set +x
+  # note: ansubramania - cache writeback disabled unconditionally
+  # every node rsync'ing into the same cache_write/
+  # subtree under --ignore-existing causes Lustre MDS lock build-up 
+  # and invalidation storms at larger scales.
+  return
+  if [[ -z "${CACHE_SYNC_FREQUENCY:-}" ]] || [[ "${CACHE_SYNC_FREQUENCY}" == "0" ]]; then
+    return
+  fi
+
+  _sync_one() {
+    local src="$1" dst="$2" name="$3"
+    [[ -z "$src" || -z "$dst" ]] && return
+    [[ -d "$src" ]] || return
+    [[ -n "$(ls -A "$src" 2>/dev/null)" ]] || return
+    mkdir -p "$dst"
+    local _err _rc=0
+    _err=$(rsync -a --ignore-existing --exclude '.tmp_*' --exclude 'tmp*/' --prune-empty-dirs \
+      "$src/" "$dst/" 2>&1) || _rc=$?
+    if (( _rc == 0 || _rc == 23 || _rc == 24 )); then
+      echo "[CACHE SYNC] ${name}: synced to Lustre"
+    else
+      echo "[CACHE SYNC] ${name}: sync failed (rc=${_rc}: ${_err})"
+    fi
+  }
+
+  _sync_cache_rsync() {
+    local src="$1" dst="$2" name="$3" force="${4:-0}"
+    [[ -z "$src" || -z "$dst" ]] && return 1
+    [[ -d "$src" ]] || return 1
+    [[ -n "$(ls -A "$src" 2>/dev/null)" ]] || return 1
+
+    if (( ! force )); then
+      local now elapsed
+      now=$(date +%s)
+      elapsed=$(( now - ${NRL_JOB_START_EPOCH%%.*} ))
+      if (( elapsed < NRL_CACHE_SYNC_DELAY_SECONDS )); then
+        echo "[CACHE SYNC] ${name}: skipping (${elapsed}s since job start, waiting for ${NRL_CACHE_SYNC_DELAY_SECONDS}s)"
+        return 1
+      fi
+      if find "$src" -type f -mmin -5 -print -quit 2>/dev/null | grep -q .; then
+        echo "[CACHE SYNC] ${name}: skipping (files modified in last 5m)"
+        return 1
+      fi
+    fi
+
+    mkdir -p "$dst"
+    local _err _rc=0
+    _err=$(rsync -a --exclude='tmp*' --exclude='.tmp_*' "$src/" "$dst/" 2>&1) || _rc=$?
+    if (( _rc == 0 || _rc == 23 || _rc == 24 )); then
+      echo "[CACHE SYNC] ${name}: rsynced to Lustre ($(du -sh "$dst" 2>/dev/null | cut -f1))"
+      return 0
+    else
+      echo "[CACHE SYNC] ${name}: rsync failed (rc=${_rc}: ${_err})"
+      return 1
+    fi
+  }
+
+  _sync_vllm_caches() {
+    local base="${NRL_VLLM_LOCAL_CACHE_DIR:-}"
+    local lustre_base="${LUSTRE_VLLM_CACHE:-}"
+    [[ -z "$base" || -z "$lustre_base" ]] && return
+    # Bare base dir: Gym's local_vllm_model and other non-NeMo-RL vLLM
+    # processes inherit VLLM_CACHE_ROOT without a _seed suffix.
+    [[ -d "$base" ]] && _sync_one "$base" "${lustre_base}" "vLLM_base"
+    # Per-seed dirs: NeMo RL vllm_worker appends _{seed} to the base.
+    for d in "${base}"_*; do
+      [[ -d "$d" ]] || continue
+      local suffix="${d#"${base}"}"
+      _sync_one "$d" "${lustre_base}" "vLLM${suffix}"
+    done
+  }
+
+  _vllm_synced=0
+  _inductor_synced=0
+  _triton_synced=0
+
+  _sync_all() {
+    if (( ! _vllm_synced )); then
+      local _now _elapsed
+      _now=$(date +%s)
+      _elapsed=$(( _now - ${NRL_JOB_START_EPOCH%%.*} ))
+      if (( _elapsed >= ${NRL_CACHE_SYNC_DELAY_SECONDS:-2700} )); then
+        _sync_vllm_caches
+        _vllm_synced=1
+      else
+        echo "[CACHE SYNC] vLLM: skipping (${_elapsed}s since job start, waiting for ${NRL_CACHE_SYNC_DELAY_SECONDS:-2700}s)"
+      fi
+    fi
+    if (( ! _inductor_synced )); then
+      _sync_cache_rsync "${INDUCTOR_CACHE_DIR:-}" "${CACHE_WRITE_DIR:+${CACHE_WRITE_DIR}/inductor_cache}" "Inductor" \
+        && _inductor_synced=1
+    fi
+    if (( ! _triton_synced )); then
+      _sync_cache_rsync "${TRITON_CACHE_DIR:-}" "${CACHE_WRITE_DIR:+${CACHE_WRITE_DIR}/triton_cache}" "Triton" \
+        && _triton_synced=1
+    fi
+  }
+
+  _sync_final() {
+    local _nnodes=${TOTAL_NUM_NODES:-${SLURM_JOB_NUM_NODES:-1}}
+    local _auto_exit_window=$(( _nnodes / 20 ))
+    (( _auto_exit_window < 15 )) && _auto_exit_window=15
+    (( _auto_exit_window > 45 )) && _auto_exit_window=45
+    local _exit_window=${NRL_CACHE_SYNC_EXIT_JITTER_SECONDS:-$_auto_exit_window}
+    local _exit_jitter=$(( RANDOM % _exit_window ))
+    echo "[CACHE SYNC] Exit jitter: ${_exit_jitter}s (window=${_exit_window}s, nodes=${_nnodes})"
+    sleep "$_exit_jitter"
+    _sync_vllm_caches
+    _sync_cache_rsync "${INDUCTOR_CACHE_DIR:-}" "${CACHE_WRITE_DIR:+${CACHE_WRITE_DIR}/inductor_cache}" "Inductor" 1
+    _sync_cache_rsync "${TRITON_CACHE_DIR:-}" "${CACHE_WRITE_DIR:+${CACHE_WRITE_DIR}/triton_cache}" "Triton" 1
+  }
+
+  trap '_sync_final; echo "[CACHE SYNC] Final sync complete (exit trap)."' EXIT
+
+  local _jitter=$(( RANDOM % ${NRL_CACHE_SYNC_JITTER_SECONDS:-120} ))
+  echo "[CACHE SYNC] Per-node jitter: ${_jitter}s (spreading initial sync across ${NRL_CACHE_SYNC_JITTER_SECONDS:-120}s window)"
+  sleep "$_jitter"
+
+  while true; do
+    sleep "${CACHE_SYNC_FREQUENCY}"
+    _sync_all
+  done
+}
+cache-sync-sidecar &
+
 # Patch nsight.py before starting Ray worker
 sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py
 
-cat <<EOFINNER | tee /launch-worker.sh
-ray start --address "$ip_head" \
+source "$LOG_DIR/topology_probe.sh"
+
+# Run SETUP_COMMAND early so node-local work (cache seeding, env prep)
+# overlaps with head startup instead of blocking on it sequentially.
+# Current launch scripts use this exclusively for Lustre→/tmp rsync
+# which is pure I/O and has no dependency on Ray being up.
+if [[ -n "$SETUP_COMMAND_FILE" ]] && [[ -f "$SETUP_COMMAND_FILE" ]]; then
+  echo "[INFO] Worker $SLURM_PROCID: running setup command (parallel with head startup)..."
+  bash "$SETUP_COMMAND_FILE"
+  echo "[INFO] Worker $SLURM_PROCID: setup command finished."
+fi
+
+echo "[INFO] Worker $SLURM_PROCID: waiting for Ray head GCS to be ready..."
+while true; do
+  if [[ -f "$LOG_DIR/STARTED_RAY_HEAD" ]]; then
+    echo "[INFO] Worker $SLURM_PROCID: Ray head GCS is ready, connecting."
+    break
+  fi
+  if [[ -f "$LOG_DIR/ENDED" ]]; then
+    echo "[ERROR] ENDED detected before head started, exiting."
+    exit 1
+  fi
+  sleep 2
+done
+
+# Stagger worker connections to avoid thundering-herd on the GCS server.
+# All workers detect STARTED_RAY_HEAD within the same ~2s polling window;
+# without jitter they all issue `ray start --address` simultaneously.
+# Target ~100 workers/sec connection rate
+_jitter_window=$(( TOTAL_NUM_NODES / 100 ))
+(( _jitter_window < 2 )) && _jitter_window=2
+_jitter=$(( RANDOM % _jitter_window ))
+echo "[INFO] Worker $SLURM_PROCID: sleeping ${_jitter}s (jitter window ${_jitter_window}s) before connecting"
+sleep "$_jitter"
+
+count=0
+while [[ $count -lt $WORKER_NUM_RETRIES ]]; do
+  # Clean up stale Ray state before every attempt so a half-started
+  # raylet from a previous attempt doesn't block the next one.
+  ray stop || true
+  rm -rf /tmp/ray/session_* || true
+
+  # Two-level evaluation: heredoc expands $RAY_RESOURCES (with \") into text,
+  # then bash re-parses it so \" inside double quotes becomes clean ".
+  echo "[INFO] Worker $SLURM_PROCID: starting Ray worker (attempt $((count+1))/$WORKER_NUM_RETRIES)..."
+  cat <<EOFINNER | bash
+ray start --address "$IP_HEAD" \
           --disable-usage-stats \
-          --resources="{\"worker_units\": $GPUS_PER_NODE, \"slurm_managed_ray_cluster\": 1}" \
+          --resources="$RAY_RESOURCES" \
           --min-worker-port=${MIN_WORKER_PORT} \
           --max-worker-port=${MAX_WORKER_PORT} \
           \
@@ -389,67 +1133,139 @@ ray start --address "$ip_head" \
           --metrics-export-port=${METRICS_EXPORT_PORT} \
           $RAY_DEBUGGER_ARGS \
           \
-          --block 
+          --block
 EOFINNER
-
-count=0
-while [[ \$count -lt $num_retries ]]; do
-  bash /launch-worker.sh
-  count=\$((count+1))
-  echo "Worker failed \$count/$num_retries times, restarting in 5 seconds..."
-  sleep 5
+  count=$((count+1))
+  _retry_jitter=$(( 5 + RANDOM % 10 ))
+  echo "[WARN] Worker $SLURM_PROCID failed $count/$WORKER_NUM_RETRIES times, restarting in ${_retry_jitter}s..."
+  sleep "$_retry_jitter"
 done
-touch $LOG_DIR/ENDED
+touch "$LOG_DIR/ENDED"
 exit 1
-EOF
+WORKER_BODY_EOF
 )
-  srun $COMMON_SRUN_ARGS --container-name=ray-worker-$i --exact --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$node_i" -o $LOG_DIR/ray-worker-$i.log bash -x -c "$worker_cmd" &
-  SRUN_PIDS["ray-worker-$i"]=$!
-  sleep 3
-done
 
-# Then we wait here for the file to be created by the head node container
-while check_srun_processes && ! srun --overlap --nodes=1 --ntasks=1 -w $head_node test -f $LOG_DIR/STARTED_RAY_HEAD; do
-  echo "[INFO][$(date)] Waiting for head node container to start..."
-  sleep 2
-done
+# Join BAKED_ENV + body into complete scripts passed to srun via bash -c.
+# The single-quoted heredoc bodies contain unexpanded $vars that resolve at
+# container runtime; BAKED_ENV provides the submit-host values they need.
+HEAD_SCRIPT=$(printf '%s\n%s' "$BAKED_ENV" "$HEAD_BODY")
+WORKER_SCRIPT=$(printf '%s\n%s' "$BAKED_ENV" "$WORKER_BODY")
 
-# At this stage the Ray cluster bringup has started on the physical nodes in the allocation
-# Before we launch a job on this cluster we need to make sure that the bringup is complete
-# We do so by querying the number of worker_units in the ray cluster and asserting = NUM_ACTORS
-extract_worker_units() {
-  status_output=$(srun --overlap --container-name=ray-head --nodes=1 --ntasks=1 -w "$head_node" ray status)
-  if echo "$status_output" | grep -q "worker_units"; then
-    worker_units=$(echo "$status_output" | grep "worker_units" | awk -F'[/. ]' '{print $4}')
-    echo $worker_units
-  else
-    echo 0
-  fi
-}
+[[ -z "$HEAD_SCRIPT" ]] && echo "[FATAL] HEAD_SCRIPT is empty" >&2 && exit 1
+[[ -z "$WORKER_SCRIPT" ]] && echo "[FATAL] WORKER_SCRIPT is empty" >&2 && exit 1
 
-# Poll to make sure that all Ray worker nodes have connected to the head.
-# All workers have connected when number of GPUs in ray cluster
-# is equal to NUM_ACTORS. We use the utility function above
-# to check how many GPUs have come online in the ray cluster
-while true; do
-  worker_units=$(extract_worker_units)
-  echo "[INFO] Number of actors online: $worker_units/$NUM_ACTORS"
-  if [[ "$worker_units" -eq "$NUM_ACTORS" ]]; then
-    break
-  fi
-  check_srun_processes
-  sleep 2
-done
+bash -n <(printf '%s' "$HEAD_SCRIPT") || { echo "[FATAL] Head script has syntax errors" >&2; exit 1; }
+bash -n <(printf '%s' "$WORKER_SCRIPT") || { echo "[FATAL] Worker script has syntax errors" >&2; exit 1; }
 
-echo "All workers connected!"
-
-# We can now launch a job on this cluster
-# We do so by launching a driver process on the physical node that the head node is on
-# This driver process is responsible for launching a job on the Ray cluster
-CONTAINER_CWD=$(scontrol show job $SLURM_JOB_ID | grep -oP 'WorkDir=\K[^ ]+' | head -1)
-if [[ -n "$COMMAND" ]]; then
-  srun --no-container-mount-home --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" -o $LOG_DIR/ray-driver.log bash -c "$COMMAND"
+########################################################
+# Run sandbox in parallel on all nodes (overlap).
+# Each per-node task polls its own localhost port and writes a per-node
+# signal file so the head container can gate on all instances being ready.
+########################################################
+SANDBOX_PORT="${NEMO_SKILLS_SANDBOX_PORT:-6000}"
+SANDBOX_BASE_PORT="${SANDBOX_BASE_PORT:-6001}"
+if [[ -n "${SANDBOX_CONTAINER:-}" ]] && [[ -n "${SANDBOX_COMMAND:-}" ]]; then
+  echo "[INFO] Starting sandbox on all $SLURM_JOB_NUM_NODES nodes (ports_dir=$SANDBOX_PORTS_DIR, port=$SANDBOX_PORT, base_port=$SANDBOX_BASE_PORT)..."
+  srun --output "$SANDBOX_PORTS_DIR/sandbox-%t.log" \
+    --container-image="$SANDBOX_CONTAINER" \
+    --container-mounts="$SANDBOX_PORTS_DIR:$SANDBOX_PORTS_DIR${SHARED_TEMP_DIR:+,$SHARED_TEMP_DIR:$SHARED_TEMP_DIR}" \
+    --no-container-mount-home \
+    --mpi=pmix \
+    -A "$SLURM_JOB_ACCOUNT" \
+    -p "$SLURM_JOB_PARTITION" \
+    --wait=60 \
+    --kill-on-bad-exit=1 \
+    --overlap \
+    --nodes="$SLURM_JOB_NUM_NODES" \
+    --ntasks-per-node=1 \
+    --export=ALL,SANDBOX_PORTS_DIR=$SANDBOX_PORTS_DIR,SANDBOX_WORKER_BASE_PORT=$SANDBOX_BASE_PORT,NGINX_PORT=$SANDBOX_PORT \
+    bash -xc '
+      ('"$SANDBOX_COMMAND"') &
+      SANDBOX_PID=$!
+      deadline=$((SECONDS + 300))
+      while ! (echo > /dev/tcp/localhost/'"$SANDBOX_PORT"') 2>/dev/null; do
+        if ! kill -0 $SANDBOX_PID 2>/dev/null; then
+          echo "[ERROR] Sandbox process died before becoming ready on $(hostname)"
+          exit 1
+        fi
+        if (( SECONDS > deadline )); then
+          echo "[ERROR] Sandbox not ready on $(hostname) after 5 min"
+          exit 1
+        fi
+        sleep 2
+      done
+      touch '"$SANDBOX_PORTS_DIR"'/SANDBOX_READY_$(hostname)
+      echo "[INFO] Sandbox ready on $(hostname):'"$SANDBOX_PORT"'"
+      wait $SANDBOX_PID
+    ' &
+  SRUN_PIDS["sandbox"]=$!
+  echo "[INFO] Sandbox started in background (PID: ${SRUN_PIDS["sandbox"]})"
 else
+  echo "[INFO] SANDBOX_CONTAINER or SANDBOX_COMMAND not defined, skipping sandbox startup"
+fi
+
+# Start head node
+srun $COMMON_SRUN_ARGS --container-name=ray-head --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$head_node" -o $LOG_DIR/ray-head.log bash -x -c "$HEAD_SCRIPT" &
+SRUN_PIDS["ray-head"]=$!
+
+# Start worker nodes (all nodes except the head).
+# In single-node mode (_num_workers=0), the head is the only compute node
+# and already registers its GPUs as Ray resources, so no workers are needed.
+_num_workers=$((SLURM_JOB_NUM_NODES - 1))
+if [[ $_num_workers -gt 0 ]]; then
+  # srun -o with %t produces per-task log files
+  # Zero-pad to the width of the worker count so filenames sort naturally
+  _task_digits=${#_num_workers}
+  srun $COMMON_SRUN_ARGS --container-name=ray-worker --exact \
+    --nodes=$_num_workers \
+    --ntasks=$_num_workers \
+    --ntasks-per-node=1 \
+    --cpus-per-task=$CPUS_PER_WORKER \
+    --kill-on-bad-exit=0 \
+    --exclude="$head_node" \
+    -o "$LOG_DIR/ray-worker-%0${_task_digits}t.log" \
+    bash -xc "$WORKER_SCRIPT" &
+  SRUN_PIDS["ray-workers"]=$!
+else
+  echo "[INFO] Single-node mode: head node is the only compute node, no workers to launch"
+fi
+
+# Wait for the Ray head GCS to be ready
+# signal file is touched after ray start --head succeeds
+while check_srun_processes && ! test -f "$LOG_DIR/STARTED_RAY_HEAD"; do
+  echo "[INFO][$(date)] Waiting for Ray head GCS to be ready..."
+  sleep 2
+done
+
+if [[ -n "$COMMAND" ]]; then
+  # Non-interactive: head container handles polling + command execution
+  # The head srun exits when the command finishes (or on failure).
+  set +e
+  wait ${SRUN_PIDS["ray-head"]}
+  exit_code=$?
+  set -e
+  exit $exit_code
+else
+  # Interactive: poll for workers from submit host, then idle
+  RAY_STATUS_DEADLINE=$((SECONDS + 1800))
+  while true; do
+    worker_units=$(cat "$LOG_DIR/ray_worker_units" 2>/dev/null || echo -1)
+    echo "[INFO] Number of actors online: $worker_units/$NUM_ACTORS"
+    if [[ "$worker_units" -eq "$NUM_ACTORS" ]]; then
+      break
+    fi
+    check_srun_processes
+    if (( SECONDS > RAY_STATUS_DEADLINE )); then
+      echo "[ERROR] Timed out waiting for all workers to connect ($worker_units/$NUM_ACTORS after 30 min)"
+      touch "$LOG_DIR/ENDED"
+      exit 1
+    fi
+    sleep 5
+  done
+
+  echo "All workers connected!"
+
+  CONTAINER_CWD=$(scontrol show job $SLURM_JOB_ID | grep -oP 'WorkDir=\K[^ ]+' | head -1)
   echo "[INFO]: Ray Cluster is idled, run this on the slurm head node to get a shell to the head node:"
   cat <<EOF >$SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh
 # No args launches on the head node (node 0)
@@ -457,31 +1273,35 @@ else
 # Optional: set COMMAND='...' to run non-interactively instead of opening an interactive shell
 WORKER_NUM=\${1:-}
 if [[ -z "\$WORKER_NUM" ]]; then
-  # Empty means we are on the head node
   if [[ -n "\${COMMAND:-}" ]]; then
     srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID bash -c "\$COMMAND"
   else
     srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" --jobid $SLURM_JOB_ID --pty bash
   fi
+elif [[ $SLURM_JOB_NUM_NODES -eq 1 ]]; then
+  echo "Error: Single-node mode — only the head node is available. Run without arguments."
+  exit 1
 else
-  # Worker numbers 1 through N-1 correspond to ray-worker-1 through ray-worker-(N-1)
-  # and use nodes_array[1] through nodes_array[N-1]
   if [[ \$WORKER_NUM -lt 1 || \$WORKER_NUM -ge $SLURM_JOB_NUM_NODES ]]; then
     echo "Error: WORKER_NUM must be between 1 and $((SLURM_JOB_NUM_NODES-1))"
     exit 1
   fi
   nodes_array=($nodes)
+  node="\${nodes_array[\$WORKER_NUM]}"
   if [[ -n "\${COMMAND:-}" ]]; then
-    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-worker-\$WORKER_NUM --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "\${nodes_array[\$WORKER_NUM]}" --jobid $SLURM_JOB_ID bash -c "\$COMMAND"
+    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-worker --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "\$node" --jobid $SLURM_JOB_ID bash -c "\$COMMAND"
   else
-    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-worker-\$WORKER_NUM --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "\${nodes_array[\$WORKER_NUM]}" --jobid $SLURM_JOB_ID --pty bash
+    srun --no-container-mount-home $GRES_ARG -A $SLURM_JOB_ACCOUNT -p $SLURM_JOB_PARTITION --overlap --container-name=ray-worker --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "\$node" --jobid $SLURM_JOB_ID --pty bash
   fi
 fi
 EOF
   chmod +x $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh
   echo "     COMMAND='echo hello' bash $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh    # run a non-interactive command on head node"
   echo "     bash $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh    # to attach to head node (i.e., 'worker 0')"
-  echo "     bash $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh 1  # to attach to worker 1"
-  echo "     bash $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh 2  # to attach to worker 2, etc."
+  if [[ $SLURM_JOB_NUM_NODES -gt 1 ]]; then
+    echo "     bash $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh 1  # to attach to worker 1"
+    echo "     bash $SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh 2  # to attach to worker 2, etc."
+  fi
   sleep infinity
 fi
+

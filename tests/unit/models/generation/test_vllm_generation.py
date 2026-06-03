@@ -1316,6 +1316,93 @@ def test_vllm_http_server(cluster, tokenizer):
         )
 
 
+def test_vllm_deferred_model_load(cluster, tokenizer):
+    """Test deferred model loading for overlapped initialization.
+
+    Verifies:
+    1. defer_model_load=True returns URLs immediately without loading the model
+    2. Reserved URLs are valid (non-None for each DP rank)
+    3. load_and_start() loads model and starts HTTP server on the reserved port
+    4. Final reported URLs match the reserved URLs (same port)
+    5. HTTP server is functional after load_and_start()
+    """
+    generation_config = configure_http_server_config(tokenizer)
+    generation_config["temperature"] = 0.0
+
+    # Phase 1: Deferred init — only reserve ports, no model loading
+    vllm_generation = VllmGeneration(
+        cluster, generation_config, defer_model_load=True
+    )
+
+    # URLs should be available immediately from reserved ports
+    reserved_urls = vllm_generation.dp_openai_server_base_urls
+    assert len(reserved_urls) == cluster.num_gpus_per_node, (
+        f"Expected {cluster.num_gpus_per_node} URLs, got {len(reserved_urls)}"
+    )
+    for url in reserved_urls:
+        assert url is not None, "Reserved URL should not be None for async engine"
+        assert url.startswith("http://"), f"URL should start with http://, got {url}"
+        assert url.endswith("/v1"), f"URL should end with /v1, got {url}"
+
+    # Model should NOT be loaded yet — device_uuids should be None
+    assert vllm_generation.device_uuids is None, (
+        "device_uuids should be None before load_and_start()"
+    )
+
+    # HTTP server should NOT be running yet
+    try:
+        response = requests.get(reserved_urls[0], timeout=1)
+        # If we somehow get a response, something is wrong
+        assert False, "HTTP server should not be running before load_and_start()"
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+        pass  # Expected — server is not running yet
+
+    # Phase 2: Load model and start HTTP server
+    vllm_generation.load_and_start()
+
+    # Final URLs should match reserved URLs (same port was used)
+    final_urls = vllm_generation.dp_openai_server_base_urls
+    assert len(final_urls) == len(reserved_urls)
+    for reserved, final in zip(reserved_urls, final_urls):
+        # Extract port from URLs and verify they match
+        reserved_port = reserved.split(":")[-1].split("/")[0]
+        final_port = final.split(":")[-1].split("/")[0]
+        assert reserved_port == final_port, (
+            f"Port mismatch: reserved {reserved_port} != final {final_port}. "
+            f"Reserved URL: {reserved}, Final URL: {final}"
+        )
+
+    # device_uuids should be populated now
+    assert vllm_generation.device_uuids is not None, (
+        "device_uuids should be populated after load_and_start()"
+    )
+
+    # HTTP server should be functional
+    _wait_for_vllm_http_server_spinup(final_urls[0])
+
+    body = dict(
+        model=generation_config["model_name"],
+        messages=[
+            {"role": "user", "content": "count to 5"},
+        ],
+        temperature=generation_config["temperature"],
+        top_p=generation_config["top_p"],
+        logprobs=True,
+        return_tokens_as_token_ids=True,
+        max_tokens=1,
+    )
+    response = requests.post(url=f"{final_urls[0]}/chat/completions", json=body)
+    assert response.status_code == 200, (
+        f"HTTP server returned {response.status_code} after load_and_start()"
+    )
+    result = response.json()
+    assert "choices" in result, "Response should contain choices"
+    assert len(result["choices"]) > 0, "Response should have at least one choice"
+
+    # Clean up
+    vllm_generation.shutdown()
+
+
 def test_VllmAsyncGenerationWorker_replace_prefix_tokens(tokenizer):
     # This test assumes the tokenizer model is for the Qwen 3 family
     eos_token_id = tokenizer.eos_token_id

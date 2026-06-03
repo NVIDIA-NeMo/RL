@@ -84,19 +84,40 @@ policy:
     pipeline_dtype: ${policy.precision}
     # Sequence parallel is required for expert parallel
     sequence_parallel: true
-    # Apparently freezing the MoE router and using fp64 here stabilizes training
-    # This is possibly related to some refit issues.
-    freeze_moe_router: false
-    moe_router_dtype: fp32
-    moe_router_load_balancing_type: none # "seq_aux_loss" causes logprob error divergence for grpo. As of Jan 06, 2025, global_aux_loss is also not supported properly in mcore.
-    moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
-    #gives ~20% training perf speedup with sequence packing
+
+    # MoE
+    freeze_moe_router: true
+    moe_router_dtype: "fp32"
+    moe_router_load_balancing_type: "none"
+    moe_router_bias_update_rate: 1.0e-3
+    moe_router_enable_expert_bias: true
     moe_permute_fusion: true
-    apply_rope_fusion: True
-    # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
-    bias_activation_fusion: True
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "flex"
+    moe_flex_dispatcher_backend: "hybridep"
+    moe_hybridep_num_sms: 32
+    moe_aux_loss_coeff: 0.0
+    moe_shared_expert_overlap: false
+
+    # Compute
+    apply_rope_fusion: true
+    use_fused_weighted_squared_relu: true
+    bias_activation_fusion: false
     defer_fp32_logits: true
+
+    # Logging
+    track_moe_metrics: true
     moe_per_layer_logging: true
+    do_not_average_loss: true
+    cp_normalize: true
+    calculate_per_token_loss: true
+    scale_loss_by_dp_cp_size: false
+
+    # MTP — disabled
+    mtp_loss_scaling_factor: 0.0
+    mtp_use_repeated_layer: false
+    mtp_num_layers: null
+    mtp_detach_heads: false
 
     optimizer:
       optimizer: "adam"
@@ -141,6 +162,26 @@ policy:
       overlap_param_gather: true
       use_custom_fsdp: false
       data_parallel_sharding_strategy: "optim_grads_params"
+
+    # FP8 — disabled for bf16 runs.
+    fp8_cfg:
+      enabled: false
+      fp8: "e4m3"
+      fp8_recipe: "mxfp8"
+      fp8_param: false
+
+    first_last_layers_bf16: true
+    num_layers_at_start_in_bf16: 1
+    num_layers_at_end_in_bf16: 1
+
+    use_gloo_process_groups: false
+
+    checkpoint:
+      async_save: true
+      ckpt_assume_constant_structure: true
+      fully_parallel_save_process_group: "ep_dp"
+      fully_parallel_load_process_group: "ep_dp"
+      fully_parallel_load_exchange_algo: "broadcast"
 
     env_vars: null
 

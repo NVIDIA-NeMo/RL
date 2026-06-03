@@ -14,10 +14,14 @@
 
 import copy
 import gc
+import logging
 import os
 import sys
+from contextlib import contextmanager
 from importlib.util import find_spec
 from typing import Any, Optional, cast
+
+logger = logging.getLogger(__name__)
 
 import ray
 import torch
@@ -34,6 +38,7 @@ from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generation
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
+from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
@@ -94,7 +99,33 @@ class BaseVllmGenerationWorker:
             init_kwargs["seed"] = seed
             # Need to give each DP group its own vllm cache to address:
             # https://github.com/vllm-project/vllm/issues/18851
-            env_vars["VLLM_CACHE_ROOT"] = os.path.expanduser(f"~/.cache/vllm_{seed}")
+            env_vars["VLLM_CACHE_ROOT"] = os.environ.get("VLLM_CACHE_ROOT", os.path.expanduser("~/.cache/vllm")) + f"_{seed}"
+
+            # Give each vLLM engine a deterministic starting port for TP/DP
+            # rendezvous, below the OS ephemeral range floor (9000 on OCI-HSG,
+            # 32768 on stock Linux) and non-overlapping with other services.
+            # See ray.sub port layout comment for the full allocation map.
+            # vLLM's _get_open_port() reads VLLM_PORT and auto-increments on
+            # collision, so 100-port spacing per engine provides headroom.
+            #
+            # In the cross-node model-parallel path
+            # local_bundle_indices is a slice of global bundle ids spanning multiple nodes
+            # so a naive local_bundle_indices[0] // mp_size produces a global engine counter
+            # that can push VLLM_PORT into the OS ephemeral range.
+            # This can cause races and address-in-use errors with random OS-allocated sockets.
+            _VLLM_PORT_RANGE_LOW = 7000
+            _VLLM_PORTS_PER_ENGINE = 100
+            _num_gpus_per_node = int(os.environ.get("NRL_NUM_GPUS_PER_NODE", "4"))
+            mp_size = len(local_bundle_indices)
+            if mp_size > _num_gpus_per_node:
+                # Cross-node MP: each engine's driver (EngineCore_DP0) lives on a unique
+                # first-node, so slot 0 is collision-free across engines on different nodes.
+                engine_index_on_node = 0
+            elif mp_size == 1:
+                engine_index_on_node = local_bundle_indices[0] % _num_gpus_per_node
+            else:
+                engine_index_on_node = (local_bundle_indices[0] % _num_gpus_per_node) // mp_size
+            env_vars["VLLM_PORT"] = str(_VLLM_PORT_RANGE_LOW + engine_index_on_node * _VLLM_PORTS_PER_ENGINE)
 
         # Check if this worker is part of a parallel group (TP or TP+PP).
         # A worker is part of a parallel group if it's a secondary member (local_bundle_indices is None)
@@ -112,6 +143,13 @@ class BaseVllmGenerationWorker:
         env_vars["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         # Skip vllm P2P check and rely on driver to report peer to peer capability.
         env_vars["VLLM_SKIP_P2P_CHECK"] = "1"
+        # Force all TP ranks onto standard NCCL for allreduce.  When TP spans
+        # multiple nodes some ranks may fail to initialise SymmMem (e.g. due to a
+        # missing or undecodable NVML fabric clusterUuid) while others succeed,
+        # producing a split-brain where half the ring enters the SymmMem path and
+        # half enters the NCCL path -- causing a permanent hang after torch.compile.
+        # Setting this to "0" makes every rank skip SymmMem and use NCCL uniformly.
+        env_vars["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
 
         return resources, env_vars, init_kwargs
 
@@ -121,6 +159,7 @@ class BaseVllmGenerationWorker:
         bundle_indices: Optional[list[int]] = None,
         fraction_of_gpus: float = 1.0,
         seed: Optional[int] = None,
+        defer_model_load: bool = False,
     ):
         """Initialize a vLLM worker for distributed inference.
 
@@ -130,7 +169,36 @@ class BaseVllmGenerationWorker:
                           Only needed for the first worker in each tied worker group.
             fraction_of_gpus: Fraction of GPUs to use for this worker
             seed: Random seed for initialization
+            defer_model_load: If True, skip model loading during init. Call
+                _load_model() later to perform the heavy model loading.
         """
+        from nemo_rl.distributed.numa_utils import bind_to_gpu_numa
+
+        # Only bind single-GPU workers to their GPU's NUMA node.
+        # For TP>1 workers, the parent process spans multiple NUMA nodes;
+        # binding it would incorrectly constrain the EngineCore subprocess
+        # (which inherits sched_setaffinity + numa_set_membind via fork).
+        # Individual TP workers get their own NUMA binding via collective_rpc
+        # in post_init / post_init_async.
+        if bundle_indices is not None and len(bundle_indices) == 1:
+            bind_to_gpu_numa()
+
+        self._init_config(config, bundle_indices, fraction_of_gpus, seed)
+
+        if not self.is_model_owner:
+            return
+
+        if not defer_model_load:
+            self._load_model(bundle_indices, seed)
+
+    def _init_config(
+        self,
+        config: VllmConfig,
+        bundle_indices: Optional[list[int]],
+        fraction_of_gpus: float,
+        seed: Optional[int],
+    ):
+        """Lightweight config setup. No model loading, no heavy imports."""
         self.cfg = config
         self.model_name = self.cfg["model_name"]
         self.tensor_parallel_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
@@ -145,7 +213,8 @@ class BaseVllmGenerationWorker:
         # Store the Python executable being used by this worker
         self.py_executable = sys.executable
 
-        # Skip model loading if we're not the model owner
+        self._apply_vllm_patches()
+
         if not self.is_model_owner:
             self.llm = None
             self.tokenizer = None
@@ -158,10 +227,13 @@ class BaseVllmGenerationWorker:
         self.rank = 0
         self.world_size = 1
 
-        # Monkey patches for vLLM behavior. We avoid importing vllm modules
-        # here to prevent side effects during initialization and instead
-        # locate the files via importlib metadata.
+    def _apply_vllm_patches(self):
+        """Apply file-on-disk patches to vLLM and flashinfer source files.
 
+        These patches are idempotent (check before writing) and applied
+        early during ``_init_config`` so that **all** workers -- including
+        non-model-owners -- see the patched files before any vLLM import.
+        """
         from vllm.logger import init_logger
 
         logger = init_logger("vllm_patch")
@@ -194,6 +266,42 @@ class BaseVllmGenerationWorker:
 
             return file_path
 
+        @contextmanager
+        def _locked_file_patch(file_path: str):
+            """Yield (content, writer) under an exclusive file lock.
+
+            Multiple workers on the same node call _apply_vllm_patches
+            concurrently.  Without a lock, one worker's ``open(path, "w")``
+            truncates the file while another is reading it, causing spurious
+            "expected code snippet not found" warnings.
+
+            Usage::
+
+                with _locked_file_patch(path) as (content, write_back):
+                    if already_patched(content):
+                        return
+                    content = content.replace(old, new)
+                    write_back(content)
+            """
+            import fcntl
+
+            lock_path = file_path + ".patch_lock"
+            lock_fd = open(lock_path, "w")
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+
+                with open(file_path, "r") as f:
+                    content = f.read()
+
+                def write_back(new_content: str):
+                    with open(file_path, "w") as f:
+                        f.write(new_content)
+
+                yield content, write_back
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                lock_fd.close()
+
         def _patch_vllm_init_workers_ray():
             """Patch the vLLM ray_distributed_executor.py file.
 
@@ -202,128 +310,310 @@ class BaseVllmGenerationWorker:
             2. Add NCCL_CUMEM_ENABLE and NCCL_NVLS_ENABLE to vLLM ADDITIONAL_ENV_VARS.
                 - This is a workaround to fix async vllm in some scenarios.
                 - See https://github.com/NVIDIA-NeMo/RL/pull/898 for more details.
+            3. Wrap the TP rendezvous RPC chain (init_worker + init_device) in an
+               EADDRINUSE retry loop.
+                - vLLM's _get_open_port() closes the socket before TCPStore.bind(),
+                  leaving a TOCTOU window where another process can grab the port.
+                - On EADDRINUSE we regenerate distributed_init_method with a fresh
+                  port and retry. load_model stays outside the retry (non-network).
             """
             file_to_patch = _get_vllm_file("v1/executor/ray_executor.py")
 
-            with open(file_to_patch, "r") as f:
-                content = f.read()
+            old_init_rpc_block = (
+                '        self.collective_rpc("init_worker", args=(all_kwargs,))\n'
+                "\n"
+                "        is_eep_new_worker = envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH\n"
+                "        if not is_eep_new_worker:\n"
+                '            self.collective_rpc("init_device")\n'
+                '            self.collective_rpc("load_model")\n'
+            )
 
-            old_lines = [
-                "self._init_workers_ray(placement_group)",
-                'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"}',
+            new_init_rpc_block = (
+                "        is_eep_new_worker = envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH\n"
+                "        for _nrl_attempt in range(5):\n"
+                "            try:\n"
+                '                self.collective_rpc("init_worker", args=(all_kwargs,))\n'
+                "                if not is_eep_new_worker:\n"
+                '                    self.collective_rpc("init_device")\n'
+                "                break\n"
+                "            except Exception as _nrl_e:\n"
+                '                if "EADDRINUSE" not in repr(_nrl_e) or _nrl_attempt == 4:\n'
+                "                    raise\n"
+                "                logger.warning(\n"
+                '                    "nemo-rl: TP rendezvous EADDRINUSE on %s (attempt %d/5); regenerating distributed_init_method",\n'
+                "                    distributed_init_method, _nrl_attempt + 1,\n"
+                "                )\n"
+                "                distributed_init_method = get_distributed_init_method(driver_ip, get_open_port())\n"
+                "                for _kw in all_kwargs:\n"
+                '                    _kw["distributed_init_method"] = distributed_init_method\n'
+                "        if not is_eep_new_worker:\n"
+                '            self.collective_rpc("load_model")\n'
+            )
+
+            replacements = [
+                (
+                    "self._init_workers_ray(placement_group)",
+                    f'self._init_workers_ray(placement_group, runtime_env={{"py_executable": "{self.py_executable}"}})',
+                ),
+                (
+                    'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"}',
+                    'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "NCCL_CUMEM_ENABLE", "NCCL_NVLS_ENABLE", "RAY_ENABLE_UV_RUN_RUNTIME_ENV"}',
+                ),
+                (old_init_rpc_block, new_init_rpc_block),
             ]
 
-            new_lines = [
-                f'self._init_workers_ray(placement_group, runtime_env={{"py_executable": "{self.py_executable}"}})',
-                'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "NCCL_CUMEM_ENABLE", "NCCL_NVLS_ENABLE", "RAY_ENABLE_UV_RUN_RUNTIME_ENV"}',
-            ]
+            with _locked_file_patch(file_to_patch) as (content, write_back):
+                need_replace = False
+                for old, new in replacements:
+                    if new in content or old not in content:
+                        continue
+                    content = content.replace(old, new)
+                    need_replace = True
 
-            need_replace = False
-            for old_line, new_line in zip(old_lines, new_lines):
-                if new_line in content or old_line not in content:
-                    continue
-                content = content.replace(old_line, new_line)
-                need_replace = True
+                if need_replace:
+                    write_back(content)
 
-            if not need_replace:
+ 
+        def _patch_vllm_hermes_tool_parser_thread_safety():
+            """Patch Hermes2ProToolParser.__init__ to cache tokenizer calls.
+
+            The HuggingFace tokenizer's Rust backend does not support concurrent
+            access. When multiple async requests call _preprocess_chat concurrently,
+            each one constructs a new Hermes2ProToolParser which calls
+            tokenizer.encode() and tokenizer.decode() in __init__, causing
+            "RuntimeError: Already borrowed".
+
+            This patch caches the encode/decode results so only the first
+            instantiation (protected by a lock) touches the tokenizer. All
+            subsequent instantiations read from cache without any tokenizer
+            access.
+
+            Related:
+            - https://github.com/vllm-project/vllm/pull/30264
+            - https://github.com/huggingface/tokenizers/issues/537
+            - https://github.com/PrimeIntellect-ai/prime-rl/pull/1837
+            """
+            file_to_patch = _get_vllm_file("tool_parsers/hermes_tool_parser.py")
+
+            old_import = (
+                "import json\n"
+                "from collections.abc import Sequence"
+            )
+            new_import = (
+                "import json\n"
+                "import threading\n"
+                "from collections.abc import Sequence"
+            )
+
+            old_class_line = "class Hermes2ProToolParser(ToolParser):"
+            new_class_line = (
+                "class Hermes2ProToolParser(ToolParser):\n"
+                "    _tokenizer_lock = threading.Lock()\n"
+                "    _tokenizer_cache = {}"
+            )
+
+            old_init_snippet = (
+                "        self.tool_call_start_token_ids = self.model_tokenizer.encode(\n"
+                "            self.tool_call_start_token, add_special_tokens=False\n"
+                "        )\n"
+                "        self.tool_call_end_token_ids = self.model_tokenizer.encode(\n"
+                "            self.tool_call_end_token, add_special_tokens=False\n"
+                "        )\n"
+                "\n"
+                "        self.tool_call_start_token_array = [\n"
+                "            self.model_tokenizer.decode([token_id])\n"
+                "            for token_id in self.tool_call_start_token_ids\n"
+                "        ]\n"
+                "\n"
+                "        self.tool_call_end_token_array = [\n"
+                "            self.model_tokenizer.decode([token_id])\n"
+                "            for token_id in self.tool_call_end_token_ids\n"
+                "        ]"
+            )
+
+            new_init_snippet = (
+                "        _tid = id(self.model_tokenizer)\n"
+                "        if _tid in Hermes2ProToolParser._tokenizer_cache:\n"
+                "            _cached = Hermes2ProToolParser._tokenizer_cache[_tid]\n"
+                "            self.tool_call_start_token_ids = _cached['start_ids']\n"
+                "            self.tool_call_end_token_ids = _cached['end_ids']\n"
+                "            self.tool_call_start_token_array = _cached['start_array']\n"
+                "            self.tool_call_end_token_array = _cached['end_array']\n"
+                "        else:\n"
+                "            with Hermes2ProToolParser._tokenizer_lock:\n"
+                "                if _tid in Hermes2ProToolParser._tokenizer_cache:\n"
+                "                    _cached = Hermes2ProToolParser._tokenizer_cache[_tid]\n"
+                "                    self.tool_call_start_token_ids = _cached['start_ids']\n"
+                "                    self.tool_call_end_token_ids = _cached['end_ids']\n"
+                "                    self.tool_call_start_token_array = _cached['start_array']\n"
+                "                    self.tool_call_end_token_array = _cached['end_array']\n"
+                "                else:\n"
+                "                    self.tool_call_start_token_ids = "
+                "self.model_tokenizer.encode(\n"
+                "                        self.tool_call_start_token, "
+                "add_special_tokens=False\n"
+                "                    )\n"
+                "                    self.tool_call_end_token_ids = "
+                "self.model_tokenizer.encode(\n"
+                "                        self.tool_call_end_token, "
+                "add_special_tokens=False\n"
+                "                    )\n"
+                "                    self.tool_call_start_token_array = [\n"
+                "                        self.model_tokenizer.decode([token_id])\n"
+                "                        for token_id in self.tool_call_start_token_ids\n"
+                "                    ]\n"
+                "                    self.tool_call_end_token_array = [\n"
+                "                        self.model_tokenizer.decode([token_id])\n"
+                "                        for token_id in self.tool_call_end_token_ids\n"
+                "                    ]\n"
+                "                    Hermes2ProToolParser._tokenizer_cache[_tid] = {\n"
+                "                        'start_ids': self.tool_call_start_token_ids,\n"
+                "                        'end_ids': self.tool_call_end_token_ids,\n"
+                "                        'start_array': self.tool_call_start_token_array,\n"
+                "                        'end_array': self.tool_call_end_token_array,\n"
+                "                    }"
+            )
+
+            with _locked_file_patch(file_to_patch) as (content, write_back):
+                if "_tokenizer_cache" in content:
+                    logger.info("Hermes tool parser thread-safety patch already applied.")
+                    return
+
+                if old_init_snippet not in content:
+                    logger.warning(
+                        "Could not apply hermes tool parser thread-safety patch: "
+                        "expected code snippet not found in %s. "
+                        "The vLLM version may have changed.",
+                        file_to_patch,
+                    )
+                    return
+
+                content = content.replace(old_import, new_import, 1)
+                content = content.replace(old_class_line, new_class_line, 1)
+                content = content.replace(old_init_snippet, new_init_snippet, 1)
+                write_back(content)
+
+            logger.info("Successfully patched hermes tool parser for thread-safety.")
+
+        def _patch_flashinfer_mnnvl_cluster_uuid():
+            """Patch flashinfer mnnvl.py to guard against empty/undecodable clusterUuid.
+
+            On single-node NVSwitch clusters, clusterUuid is all-zero bytes
+            (no multi-node NVLink domain). ctypes truncates at the first null
+            byte, producing an empty string — then ``clusterUuid[0]`` raises
+            ``IndexError``. On some hardware the raw bytes are not valid UTF-8,
+            causing ``UnicodeDecodeError`` in pynvml's ``__getattribute__``
+            before the index is even reached.
+
+            Fix: wrap the clusterUuid access in a try/except so that either
+            failure safely returns ``False`` (falling back to
+            PosixFDHandleExchanger for single-node topologies).
+
+            Upstream fix: https://github.com/flashinfer-ai/flashinfer/pull/2626
+            Related issue: https://github.com/flashinfer-ai/flashinfer/issues/2633
+            """
+            spec = find_spec("flashinfer")
+            if spec is None or not spec.submodule_search_locations:
                 return
 
-            # Write back the patched content
-            with open(file_to_patch, "w") as f:
-                f.write(content)
+            base_dir = next(iter(spec.submodule_search_locations))
+            file_path = os.path.join(base_dir, "comm", "mnnvl.py")
 
-        def _patch_vllm_vit_flash_attn_backend():
-            """Patch vLLM vision attention backend selection logic.
-
-            Modify the CUDA branch of maybe_get_vit_flash_attn_backend in
-            vllm.attention.layer to avoid overriding the backend when it
-            is already set to XFORMERS. This avoids flash attention related
-            errors when the ViT head dimension is not a multiple of 32.
-
-            Related issues:
-            - https://github.com/vllm-project/vllm/issues/27562
-            - https://github.com/vllm-project/vllm/issues/26989
-
-            This is properly fixed in https://github.com/vllm-project/vllm/pull/28763. We can remove this patch once we upgrade to a version of vllm that contains this fix.
-            """
-            file_to_patch = _get_vllm_file("attention/layer.py")
-            with open(file_to_patch, "r") as f:
-                content = f.read()
+            if not os.path.exists(file_path):
+                return
 
             old_snippet = (
-                "    elif current_platform.is_cuda():\n"
                 "        if (\n"
-                "            attn_backend != AttentionBackendEnum.FLASH_ATTN\n"
-                "            and check_upstream_fa_availability(torch.get_default_dtype())\n"
+                "            fabric_info.state >= pynvml.NVML_GPU_FABRIC_STATE_COMPLETED\n"
+                "            and fabric_info.clusterUuid[0] != 0\n"
                 "        ):\n"
-                "            attn_backend = AttentionBackendEnum.FLASH_ATTN\n"
-                "            use_upstream_fa = True\n"
+                "            return True\n"
+                "        return False\n"
             )
 
             new_snippet = (
-                "    elif current_platform.is_cuda():\n"
-                "        if (\n"
-                "            attn_backend != AttentionBackendEnum.FLASH_ATTN\n"
-                "            and attn_backend != AttentionBackendEnum.XFORMERS\n"
-                "            and check_upstream_fa_availability(torch.get_default_dtype())\n"
-                "        ):\n"
-                "            attn_backend = AttentionBackendEnum.FLASH_ATTN\n"
-                "            use_upstream_fa = True\n"
+                "        try:\n"
+                "            return (\n"
+                "                fabric_info.state >= pynvml.NVML_GPU_FABRIC_STATE_COMPLETED\n"
+                "                and fabric_info.clusterUuid\n"
+                "                and fabric_info.clusterUuid[0] != 0\n"
+                "            )\n"
+                "        except (UnicodeDecodeError, IndexError):\n"
+                "            return False\n"
             )
 
-            # Only patch if the file still has the old snippet and
-            # hasn't been patched already.
-            if new_snippet in content or old_snippet not in content:
-                return
+            with _locked_file_patch(file_path) as (content, write_back):
+                if new_snippet in content or old_snippet not in content:
+                    return
 
-            content = content.replace(old_snippet, new_snippet)
-
-            with open(file_to_patch, "w") as f:
-                f.write(content)
-
-        def _patch_vllm_speculative_decoding_post_step():
-            """Patch vLLM speculative decoding post_step call.
-
-            Related PR:
-            - https://github.com/vllm-project/vllm/pull/30319
-
-            This patch fixes the InprocessClient.get_output method to properly
-            call post_step with the model_executed flag from step_fn.
-            """
-            file_to_patch = _get_vllm_file("v1/engine/core_client.py")
-
-            with open(file_to_patch, "r") as f:
-                content = f.read()
-
-            old_snippet = (
-                "    def get_output(self) -> EngineCoreOutputs:\n"
-                "        outputs, _ = self.engine_core.step_fn()\n"
-                "        return outputs and outputs.get(0) or EngineCoreOutputs()"
-            )
-
-            new_snippet = (
-                "    def get_output(self) -> EngineCoreOutputs:\n"
-                "        outputs, model_executed = self.engine_core.step_fn()\n"
-                "        self.engine_core.post_step(model_executed=model_executed)\n"
-                "        return outputs and outputs.get(0) or EngineCoreOutputs()"
-            )
-
-            if new_snippet in content or old_snippet not in content:
-                return
-
-            content = content.replace(old_snippet, new_snippet)
-
-            with open(file_to_patch, "w") as f:
-                f.write(content)
-            logger.info("Successfully patched vllm speculative decoding post_step.")
+                content = content.replace(old_snippet, new_snippet)
+                write_back(content)
 
         _patch_vllm_init_workers_ray()
         logger.info("Successfully patched vllm _init_workers_ray.")
 
-        _patch_vllm_vit_flash_attn_backend()
-        logger.info("Successfully patched vllm vit flash attention backend.")
+        _patch_vllm_hermes_tool_parser_thread_safety()
 
-        _patch_vllm_speculative_decoding_post_step()
+        _patch_flashinfer_mnnvl_cluster_uuid()
+        logger.info("Successfully patched flashinfer mnnvl clusterUuid guard.")
+
+        def _patch_nemotron_h_isinstance_check():
+            """Remove the no-op isinstance branch in NemotronHModel.forward.
+
+            Tomer's vLLM fork added an ``isinstance(layer, NemotronHMoEDecoderLayer)``
+            check inside the layer loop where both branches are identical.  This
+            confuses torch.compile graph tracing on Blackwell GPUs, causing Triton
+            to fail with ``KeyError: "Unknown key: 'cubin'"`` during autotuning of
+            the Mamba SSM kernels.  Reverting to the original simple loop fixes it.
+            """
+            file_path = _get_vllm_file("model_executor/models/nemotron_h.py")
+
+            old_snippet = (
+                "            if isinstance(layer, NemotronHMoEDecoderLayer):\n"
+                "                hidden_states, residual = layer(\n"
+                "                    positions=positions,\n"
+                "                    hidden_states=hidden_states,\n"
+                "                    residual=residual,\n"
+                "                )\n"
+                "            else:\n"
+                "                hidden_states, residual = layer(\n"
+                "                    positions=positions,\n"
+                "                    hidden_states=hidden_states,\n"
+                "                    residual=residual,\n"
+                "                )"
+            )
+
+            new_snippet = (
+                "            hidden_states, residual = layer(\n"
+                "                positions=positions,\n"
+                "                hidden_states=hidden_states,\n"
+                "                residual=residual,\n"
+                "            )"
+            )
+
+            with _locked_file_patch(file_path) as (content, write_back):
+                if old_snippet not in content:
+                    logger.warning(
+                        "Could not apply nemotron_h isinstance patch: "
+                        "expected code snippet not found in %s. "
+                        "The vLLM version may not contain this change.",
+                        file_path,
+                    )
+                    return
+
+                content = content.replace(old_snippet, new_snippet, 1)
+                write_back(content)
+
+            logger.info("Successfully patched nemotron_h.py: removed isinstance branch.")
+
+        _patch_nemotron_h_isinstance_check()
+
+    def _load_model(self, bundle_indices, seed):
+        """Perform model loading and engine creation."""
+        log_gpu_memory_diagnostics(label="load_model_start", worker_type="VllmGenerationWorker")
+        from vllm.logger import init_logger
+
+        logger = init_logger("vllm_load_model")
 
         try:
             import vllm
@@ -415,6 +705,11 @@ class BaseVllmGenerationWorker:
         vllm_kwargs["hf_overrides"].update(
             self.cfg["vllm_cfg"].get("hf_overrides", {}) or {}
         )
+        if "speculative_config" in vllm_kwargs and "num_speculative_tokens" in vllm_kwargs["speculative_config"] and vllm_kwargs["speculative_config"]["num_speculative_tokens"] == 0:
+            vllm_kwargs["speculative_config"] = None
+
+            if not vllm_kwargs.get("enable_prefix_caching", True):
+                print("without speculative decoding you should set prefix caching to be True")
 
         # Override HF config for gpt-oss models to ensure compatibility with megatron
         # The megatron --> hf export is done in bf16, so we disable quantization
@@ -435,6 +730,10 @@ class BaseVllmGenerationWorker:
                 )
             self.cfg["vllm_cfg"]["skip_tokenizer_init"] = False
 
+        enable_prefix_caching = self.cfg["vllm_cfg"].get("enable_prefix_caching", None)
+        if enable_prefix_caching is None:
+            enable_prefix_caching = torch.cuda.get_device_capability()[0] >= 8
+
         llm_kwargs = dict(
             model=self.model_name,
             served_model_name=self.model_name,
@@ -445,7 +744,7 @@ class BaseVllmGenerationWorker:
             pipeline_parallel_size=self.pipeline_parallel_size,
             enable_expert_parallel=self.enable_expert_parallel,
             gpu_memory_utilization=self.gpu_memory_utilization,
-            enable_prefix_caching=torch.cuda.get_device_capability()[0] >= 8,
+            enable_prefix_caching=enable_prefix_caching,
             dtype=self.precision,
             seed=seed,
             enforce_eager=self.cfg["vllm_cfg"]["enforce_eager"],
@@ -460,10 +759,12 @@ class BaseVllmGenerationWorker:
         )
 
         self._create_engine(llm_kwargs)
+        log_gpu_memory_diagnostics(label="after_engine_create", worker_type="VllmGenerationWorker", device_id=0)
 
         # will be initialized in post_init
         # used in update_weights_from_ipc_handles
         self.vllm_device_ids = None
+        log_gpu_memory_diagnostics(label="load_model_complete", worker_type="VllmGenerationWorker", device_id=0)
 
     def llm(self):
         return self.llm
@@ -564,6 +865,8 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         self.llm = vllm.LLM(**llm_kwargs)
 
     def post_init(self):
+        if self.llm is not None:
+            self.llm.collective_rpc("bind_numa", args=tuple())
         self.vllm_device_ids = self.report_device_id()
 
     def init_collective(
@@ -819,11 +1122,12 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
                 "update_weights_via_ipc_zmq",
                 args=tuple(),
             )
-            worker_result = result_or_coro[0]
+            all_success = all([result[0] for result in result_or_coro])
+            exceptions_or_none = [result[1] for result in result_or_coro]
 
-            if not worker_result:
+            if not all_success:
                 print(
-                    f"Error: Worker failed to update weights. Result: {worker_result}"
+                    f"Error: Worker failed to update weights. Result: {exceptions_or_none}"
                 )
                 return False
             return True
@@ -850,11 +1154,12 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
             result_or_coro = self.llm.collective_rpc(
                 "update_weights_from_collective", args=tuple()
             )
-            worker_result = result_or_coro[0]
+            all_success = all([result[0] for result in result_or_coro])
+            exceptions_or_none = [result[1] for result in result_or_coro]
 
-            if not worker_result:
+            if not all_success:
                 print(
-                    f"Error: Worker failed to update weights. Result: {worker_result}"
+                    f"Error: Worker failed to update weights. Result: {exceptions_or_none}"
                 )
                 return False
             return True
