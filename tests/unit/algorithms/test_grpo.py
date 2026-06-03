@@ -2251,6 +2251,36 @@ def test_gdpo_advantage_estimator_single_reward():
         estimator.compute_advantage(prompt_ids, None, mask, repeated_batch)
 
 
+def test_gdpo_advantage_estimator_reward_weights():
+    """GDPO per-reward weights: uniform weights match the default; non-uniform differ; wrong length raises."""
+    loss_config = ClippedPGLossConfig()
+    prompt_ids = torch.tensor([[0], [0], [0]])
+    mask = torch.ones(3, 2)
+    repeated_batch = {
+        "reward1": torch.tensor([1.0, 0.0, 1.0]),
+        "reward2": torch.tensor([1.0, 1.0, 0.0]),
+    }
+
+    def run(weights):
+        config = {"use_leave_one_out_baseline": False, "normalize_rewards": True}
+        if weights is not None:
+            config["reward_weights"] = weights
+        estimator = GDPOAdvantageEstimator(config, loss_config)
+        return estimator.compute_advantage(prompt_ids, None, mask, dict(repeated_batch))
+
+    default = run(None)
+
+    # Any positive uniform scaling is invariant after the final per-batch normalization.
+    assert torch.allclose(default, run([2.0, 2.0]), atol=1e-5)
+
+    # Non-uniform weights change the advantages.
+    assert not torch.allclose(default, run([1.0, 0.25]), atol=1e-3)
+
+    # Wrong number of weights -> ValueError.
+    with pytest.raises(ValueError):
+        run([1.0])
+
+
 # ============================================================================
 # Tests for ReinforcePlusPlusAdvantageEstimator class
 # ============================================================================

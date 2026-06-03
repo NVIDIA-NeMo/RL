@@ -1,0 +1,32 @@
+# GDPO over a multi-reward NeMo Gym environment.
+#
+# Inherits the workplace-assistant NeMo Gym recipe and switches only the advantage
+# estimator to GDPO. GDPO requires the Gym environment to return multiple reward
+# components: its verify endpoint must include `reward_components` (a mapping of
+# component-name -> score) in addition to the scalar `reward`. The Gym->NeMo-RL bridge
+# (nemo_rl/environments/nemo_gym.py::extract_reward_components, surfaced in
+# run_async_nemo_gym_rollout) then exposes them as reward1, reward2, ... for the GDPO
+# advantage estimator.
+#
+# NOTE: workplace_assistant is single-reward today; point `env.nemo_gym` at a
+# multi-reward environment (one whose verifier emits `reward_components`) before
+# training, or GDPO will raise "GDPO requires multiple reward components". See
+# skills/nemo-rl-gdpo-experiment/references/gym-multireward-scope.md.
+defaults: grpo_workplace_assistant_nemotron_nano_v2_9b.yaml
+
+grpo:
+  adv_estimator:
+    name: "gdpo"
+    normalize_rewards: true
+    use_leave_one_out_baseline: false
+    # Optional per-component weights, ordered to match reward1, reward2, ... .
+    # Omit for equal weighting; uncomment and size to your env's components to tune.
+    # reward_weights: [1.0, 0.5, 0.25]
+
+checkpointing:
+  checkpoint_dir: "results/gdpo_nemo_gym"
+
+logger:
+  wandb:
+    project: "gdpo-dev"
+    name: "gdpo-nemo-gym-multireward"

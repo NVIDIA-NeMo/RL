@@ -25,7 +25,12 @@ from nemo_rl.algorithms.grpo import MasterConfig
 from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
-from nemo_rl.environments.nemo_gym import NemoGym, NemoGymConfig, setup_nemo_gym_config
+from nemo_rl.environments.nemo_gym import (
+    NemoGym,
+    NemoGymConfig,
+    extract_reward_components,
+    setup_nemo_gym_config,
+)
 from nemo_rl.models.generation.vllm import VllmGeneration
 
 # cluster and tokenizer are fixture imports
@@ -36,6 +41,23 @@ from tests.unit.models.generation.test_vllm_generation import (
 from tests.unit.models.generation.test_vllm_generation import (
     tokenizer as nemo_gym_tokenizer,  # noqa: F401
 )
+
+
+def test_extract_reward_components():
+    """The GDPO multi-reward bridge helper: None for single-reward, normalized dict otherwise."""
+    # Single-reward result (no reward_components) -> None, so callers use scalar reward.
+    assert extract_reward_components({"reward": 1.0}) is None
+    assert extract_reward_components({"reward": 1.0, "reward_components": {}}) is None
+
+    # Multi-reward result -> name->float dict (values coerced to float, keys to str).
+    components = extract_reward_components(
+        {
+            "reward": 2.0,
+            "reward_components": {"correctness": 1, "format": 0.5},
+        }
+    )
+    assert components == {"correctness": 1.0, "format": 0.5}
+    assert all(isinstance(v, float) for v in components.values())
 
 
 @pytest.mark.nemo_gym
