@@ -611,7 +611,7 @@ class AsyncNemoGymRolloutManager:
         agent_extras = [c.env_extras for c in completions]
         for key in agent_extras[0].keys():
             values = [
-                float(r[key])
+                float(r[key])  # type: ignore
                 for r in agent_extras
                 if isinstance(r.get(key), (bool, int, float))
             ]

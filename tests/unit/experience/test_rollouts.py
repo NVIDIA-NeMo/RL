@@ -1111,6 +1111,8 @@ def test_async_rollout_manager_matches_original(
     then calls AsyncRolloutManager with 1 prompt and N generations.
     Asserts that both produce N results with matching message-log depth, rewards,
     and rollout_metrics numeric values.
+
+    TODO: remove this test together with run_async_multi_turn_rollout when the legacy path is deleted.
     """
     vllm_generation, rollout_tokenizer, task_to_env, _, _ = multi_step_setup_vllm_async
     input_sample = single_multi_step_calculator_input_sample
