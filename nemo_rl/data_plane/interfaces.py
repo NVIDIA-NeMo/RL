@@ -219,6 +219,31 @@ class KVBatchMeta:
             sample_ids=sample_ids, sequence_lengths=seq_lens, tags=tags
         )
 
+    def drop(self, indices: "Sequence[int]") -> "KVBatchMeta | None":
+        """Complement of :meth:`subset`. Returns ``None`` when all rows are dropped."""
+        dropped = set(indices)
+        keep = [i for i in range(self.size) if i not in dropped]
+        if not keep:
+            return None
+        return self.subset(keep)
+
+    def with_fields(self, field_names: "Sequence[str]") -> "KVBatchMeta":
+        """Return a copy with ``field_names`` merged into ``fields`` (deduped, order-preserving)."""
+        merged = list(dict.fromkeys([*(self.fields or []), *field_names]))
+        return KVBatchMeta(
+            partition_id=self.partition_id,
+            task_name=self.task_name,
+            sample_ids=list(self.sample_ids),
+            fields=merged,
+            sequence_lengths=(
+                list(self.sequence_lengths)
+                if self.sequence_lengths is not None
+                else None
+            ),
+            extra_info=dict(self.extra_info or {}),
+            tags=[dict(tag) for tag in self.tags] if self.tags is not None else None,
+        )
+
 
 class DataPlaneClient(ABC):
     """Stable, swappable data-plane boundary.

@@ -51,14 +51,11 @@ from nemo_rl.algorithms.single_controller import (
     SingleControllerActor,
     SingleControllerConfig,
 )
-from nemo_rl.algorithms.staleness_sampler import (
-    StalenessSampler,
-    StrictOnPolicyBatchSampler,
-)
+from nemo_rl.algorithms.staleness_sampler import StalenessSampler
 from nemo_rl.data_plane import KVBatchMeta
 
-
 # ── Fake in-memory DataPlane ──────────────────────────────────────────────
+
 
 @ray.remote(num_cpus=0)
 class FakeDataPlaneActor:
@@ -178,6 +175,7 @@ class FakeDataPlaneActor:
 
 
 # ── Dry-run stub actors ───────────────────────────────────────────────────
+
 
 @ray.remote(num_cpus=0)
 class DryRunGenWorker:
@@ -339,6 +337,7 @@ class DryRunWeightSynchronizer:
 
 # ── pytest fixtures ───────────────────────────────────────────────────────
 
+
 @pytest.fixture(scope="module")
 def ray_init():
     if not ray.is_initialized():
@@ -366,6 +365,7 @@ def _meta_with_versions(versions: list[int]) -> KVBatchMeta:
 
 
 # ── tests ─────────────────────────────────────────────────────────────────
+
 
 class TestSingleControllerDryRun:
     """Validate asyncio skeleton concurrency and backpressure."""
@@ -419,7 +419,10 @@ class TestSingleControllerDryRun:
         weight_sync = DryRunWeightSynchronizer(sync_latency_s=0.02, gen_handle=gen)
 
         ctrl = self._make_controller(
-            dp_client, gen, trainer, weight_sync,
+            dp_client,
+            gen,
+            trainer,
+            weight_sync,
             max_train_steps=3,
             max_rollout_prompts=12,
             min_prompt_groups_per_batch=1,
@@ -480,7 +483,9 @@ class TestSingleControllerDryRun:
         trainer = DryRunTrainer.remote(train_latency_s=0.3)
 
         ctrl = self._make_controller(
-            dp_client, gen, trainer,
+            dp_client,
+            gen,
+            trainer,
             max_train_steps=2,
             max_rollout_prompts=10,
             min_prompt_groups_per_batch=1,
@@ -500,9 +505,7 @@ class TestSingleControllerDryRun:
 
         # Some rollout calls should have started AFTER the first train step began
         first_train_start = train_start_times[0]
-        rollouts_during_train = sum(
-            1 for t in call_timestamps if t > first_train_start
-        )
+        rollouts_during_train = sum(1 for t in call_timestamps if t > first_train_start)
         assert rollouts_during_train > 0, (
             "No rollouts dispatched while trainer was running — pumps may not be concurrent"
         )
@@ -518,7 +521,9 @@ class TestSingleControllerDryRun:
         trainer = DryRunTrainer.remote(train_latency_s=0.3)  # slow trainer
 
         ctrl = self._make_controller(
-            dp_client, gen, trainer,
+            dp_client,
+            gen,
+            trainer,
             max_train_steps=2,
             max_rollout_prompts=8,
             min_prompt_groups_per_batch=1,
@@ -552,7 +557,10 @@ class TestSingleControllerDryRun:
         )  # slow sync
 
         ctrl = self._make_controller(
-            dp_client, gen, trainer, weight_sync,
+            dp_client,
+            gen,
+            trainer,
+            weight_sync,
             max_train_steps=2,
             max_rollout_prompts=8,
             min_prompt_groups_per_batch=1,
@@ -570,7 +578,9 @@ class TestSingleControllerDryRun:
         trainer = DryRunTrainer.remote(train_latency_s=0.1)
 
         ctrl = self._make_controller(
-            dp_client, gen, trainer,
+            dp_client,
+            gen,
+            trainer,
             max_train_steps=5,
             max_rollout_prompts=20,
             min_prompt_groups_per_batch=1,
@@ -587,7 +597,9 @@ class TestSingleControllerDryRun:
         ping_elapsed = time.monotonic() - ping_start
 
         assert health["alive"] is True
-        assert ping_elapsed < 1.0, f"ping() took {ping_elapsed:.2f}s — event loop may be blocked"
+        assert ping_elapsed < 1.0, (
+            f"ping() took {ping_elapsed:.2f}s — event loop may be blocked"
+        )
 
         ray.get(run_ref, timeout=30)
 
@@ -631,19 +643,16 @@ class TestSingleControllerDryRun:
             ],
         )
 
-        assert (
-            sampler.select_indices(
-                meta,
-                trainer_version=5,
-                min_prompt_groups=1,
-                generations_per_prompt=2,
-            )
-            == [1, 2]
-        )
+        assert sampler.select_indices(
+            meta,
+            trainer_version=5,
+            min_prompt_groups=1,
+            generations_per_prompt=2,
+        ) == [1, 2]
 
     def test_strict_on_policy_batch_sampler_requires_exact_version(self):
         """Strict sampler waits for a full batch at the trainer version."""
-        sampler = StrictOnPolicyBatchSampler()
+        sampler = StalenessSampler(max_staleness_versions=0)
         meta = _meta_with_versions([4, 5, 5, 6])
 
         assert (
@@ -655,30 +664,23 @@ class TestSingleControllerDryRun:
             )
             is None
         )
-        assert (
-            sampler.select_indices(
-                meta,
-                trainer_version=5,
-                min_prompt_groups=2,
-                generations_per_prompt=1,
-            )
-            == [1, 2]
-        )
+        assert sampler.select_indices(
+            meta,
+            trainer_version=5,
+            min_prompt_groups=2,
+            generations_per_prompt=1,
+        ) == [1, 2]
 
     def test_strict_on_policy_batch_sampler_evicts_old_groups(self):
         """Strict sampler marks complete old-version groups for eviction."""
-        sampler = StrictOnPolicyBatchSampler()
+        sampler = StalenessSampler(max_staleness_versions=0)
         meta = _meta_with_versions([4, 5, 4])
 
-        assert (
-            sampler.evictable_indices(
-                meta,
-                trainer_version=5,
-                generations_per_prompt=1,
-            )
-            == [0, 2]
-        )
-
+        assert sampler.evictable_indices(
+            meta,
+            trainer_version=5,
+            generations_per_prompt=1,
+        ) == [0, 2]
 
 
 class TestRisk06EventLoopBlocking:
