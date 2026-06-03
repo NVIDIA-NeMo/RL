@@ -26,14 +26,14 @@ grpo:
 loss_fn:
   reference_policy_kl_penalty: 0.0
   use_importance_sampling_correction: true
-  truncated_importance_sampling_type: "tis"
+  truncated_importance_sampling_type: tis
   truncated_importance_sampling_ratio: 2
   ratio_clip_max: 0.28
   ratio_clip_c: 10
   token_level_loss: true
 checkpointing:
-  checkpoint_dir: results/dapo-B32N16-8k-OFFPOLICY-LR2E-6-EP128-automodel-16n8g-VLLMFP8
-  keep_top_k: 3
+  checkpoint_dir: results/dapo-B32N16-8k-ONPOLICY-LR1E-6-EP128-automodel-16n8g-VLLMFP8
+  keep_top_k: 2
   save_period: 5
   checkpoint_must_save_by: "00:03:45:00"
 policy:
@@ -49,6 +49,8 @@ policy:
   optimizer:
     name: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
     kwargs:
+      lr: 1.0e-06
+      weight_decay: 0.1
       master_weights: true
       store_param_remainders: true
       exp_avg_dtype: torch.bfloat16
@@ -99,7 +101,7 @@ logger:
   tensorboard_enabled: false
   wandb:
     project: nemo-rl
-    name: dapo-B32N16-8k-OFFPOLICY-LR2E-6-EP128-automodel-16n8g-VLLMFP8
+    name: dapo-B32N16-8k-ONPOLICY-LR1E-6-EP128-automodel-16n8g-VLLMFP8
 cluster:
   gpus_per_node: 8
   num_nodes: 16
