@@ -46,6 +46,13 @@ ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
     "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector": PY_EXECUTABLES.VLLM,
     # ReplayBuffer needs vLLM environment to handle trajectory data from VllmGenerationWorker
     "nemo_rl.algorithms.async_utils.ReplayBuffer": PY_EXECUTABLES.VLLM,
+    # SyncRolloutActor doesn't import vllm directly — policy_generation is a
+    # Ray actor handle. The VLLM env is needed because (1) transfer_queue is
+    # bundled into the VLLM venv (and the policy training venvs), and the
+    # actor writes flattened tensors to TQ via dp_client.put_samples;
+    # (2) same-node colocation with VllmGenerationWorker avoids duplicate
+    # venv caches.
+    "nemo_rl.experience.sync_rollout_actor.SyncRolloutActor": PY_EXECUTABLES.VLLM,
     "nemo_rl.environments.tools.retriever.RAGEnvironment": PY_EXECUTABLES.SYSTEM,
     "nemo_rl.environments.nemo_gym.NemoGym": PY_EXECUTABLES.NEMO_GYM,
 }

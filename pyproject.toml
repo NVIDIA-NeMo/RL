@@ -51,7 +51,7 @@ dependencies = [
   "torchvision==0.26.0",
   "transformers==5.3.0",
   "num2words>=0.5.14",                                                                                                # for SmolVLM
-  "mlflow>=3.11.1",
+  "mlflow>=3.12.0",
   "nvidia-nvshmem-cu13; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
   "swanlab",
   "pyzmq",
@@ -61,6 +61,41 @@ dependencies = [
   "cuda-bindings; sys_platform != 'darwin'",                                                                          # for non-colocated refit
   "pybase64",                                                                                                         # for sglang refit
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",                                                           # for transformer-engine no build isolation
+  # tilelang — replacement Triton kernel mamba-ssm requires when
+  # Triton >= 3.4.0 on Hopper, see github.com/state-spaces/mamba#640.
+  # Without this, qwen3.5 / nano-v3 / moonlight megatron recipes
+  # crash at first gated-chunk backward with a RuntimeError pointing
+  # at this exact pip install. Linux x86_64 only — mamba-ssm itself
+  # is gated to that pair.
+  "tilelang; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  # Data-plane stack — promoted to base so worker venvs (built by
+  # nemo_rl.utils.venvs.create_local_venv via bare `uv sync`, no extras)
+  # automatically include them. Removes the need for a `[data-plane]`
+  # extra and the corresponding plumbing in the per-worker venv builder.
+  "tensordict",
+  # Pinned to b266d39 (post-0.1.6, pre-0.1.7) for PR #77's MooncakeStore
+  # refactor: `clear` switched from unanchored `remove_by_regex` to
+  # exact-key `batch_remove`, which fixes a collateral-key-deletion bug
+  # that breaks DAPO + mooncake_cpu. Bump to the 0.1.7 tag when released.
+  "TransferQueue @ git+https://github.com/Ascend/TransferQueue.git@b266d39",
+  # Backs data_plane.backend="mooncake_cpu". Default backend is "simple"
+  # (in-process), but the mooncake_cpu path needs the `mooncake_master`
+  # binary that ships in this wheel at <site-packages>/mooncake/. Bundled
+  # with TQ rather than gated behind an extra so worker venvs (built
+  # without extras) can be flipped to mooncake_cpu via config alone.
+  # PyPI's base `mooncake-transfer-engine` is cu12-only (links
+  # libcudart.so.12), which breaks on cu13 containers. Upstream now also
+  # publishes a cu13 variant as a separate distribution name
+  # `mooncake-transfer-engine-cuda13` (same `mooncake/` import namespace,
+  # store.so linked against libcudart.so.13). Resolve from PyPI rather
+  # than the GitHub release URL — the wheel is byte-identical (verified
+  # sha256), and PyPI's CDN is far more reliable than github releases
+  # from compute nodes.
+  # Upstream publishes both x86_64 and aarch64 wheels (see uv.lock).  CI's
+  # build-container runner is aarch64 (uv reports aarch64-unknown-linux-gnu),
+  # so the marker must include aarch64 — otherwise mooncake is silently
+  # excluded from the resolution during the Docker build.
+  "mooncake-transfer-engine-cuda13==0.3.10.post2 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
 ]
 
 [project.optional-dependencies]
@@ -108,8 +143,8 @@ vllm = [
   "nvidia-cutlass-dsl>=4.4.0.dev1",
 ]
 sglang = [
-  "sglang",
-  "sglang-kernel", # Must be a direct dep so [tool.uv.sources] VCS override applies (transitive deps don't use sources)
+  "sglang==0.5.11",
+  "sglang-kernel==0.4.2", # Direct dep for explicit version control
 ]
 mcore = [
   # also need cudnn (https://developer.nvidia.com/cudnn-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=deb_network)
@@ -124,6 +159,8 @@ mcore = [
   "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@v2.14.1",
   "megatron-core",
   "megatron-bridge",
+  "mamba-ssm",
+  "causal-conv1d",
   "nvidia-modelopt[torch]; sys_platform != 'darwin'",
   "onnxscript",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
@@ -185,6 +222,7 @@ test = [
   "pytest-cov",
   "pytest-asyncio",
   "pytest-testmon",
+  "pytest-shard",
 ]
 
 [tool.uv.sources]
@@ -214,9 +252,6 @@ causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", rev = "67e
 mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "d68d16ed7d5d5164eb5a57c0285f3b7eb8394ec1" }
 nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v1.1.4.post7" }
 emerging-optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.2.0" }
-# Official sglang v0.5.10 with transformers v5 support
-sglang = { git = "https://github.com/sgl-project/sglang.git", tag = "v0.5.10", subdirectory = "python" }
-sglang-kernel = { git = "https://github.com/sgl-project/sglang.git", tag = "v0.5.10", subdirectory = "sgl-kernel" }
 nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "905018803414702e414a86716484ed4115b37ba6" }
 nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", rev = "15a851565a4ce846c04431ecb0cf09903ab4837e" }
 
@@ -243,7 +278,6 @@ explicit = true
 
 [tool.uv]
 preview = true # Enable preview features like extra-build-dependencies
-extra-build-variables = { sglang-kernel = { CMAKE_BUILD_PARALLEL_LEVEL = "8", FLASHINFER_CUDA_ARCH_LIST = "9.0a 10.0a", CMAKE_ARGS = "-DCMAKE_POLICY_VERSION_MINIMUM=3.5" } }
 no-build-isolation-package = [
   "transformer-engine-torch",
   "transformer-engine",
@@ -253,7 +287,6 @@ no-build-isolation-package = [
   "deep_gemm",
   "deep_ep",
   "nv-grouped-gemm",          # from mlm (added here to make sure it's built no isolation since mlm workspace uses setup.py)
-  "sglang-kernel",
 ]
 # Always apply the build group since dependencies like TE/mcore/nemo-run require build dependencies
 # and this lets us assume they are implicitly installed with a simply `uv sync`. Ideally, we'd
@@ -283,12 +316,9 @@ override-dependencies = [
   "setuptools>=80.10.2",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480 ; platform_machine == 'x86_64'",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
-  # Note: flashinfer versions are pinned per-extra (vllm uses 0.6.8.post1, sglang uses 0.6.7.post2)
-  # since vllm and sglang extras are mutually exclusive and have different requirements.
-  # Override megatron-core's flashinfer~=0.5.0 constraint to allow both vllm (0.6.8.post1) and sglang (0.6.7.post2)
+  # Override megatron-core's flashinfer~=0.5.0 constraint to allow both vllm and sglang (both use 0.6.8.post1)
   "flashinfer-python>=0.5.0",
   "flashinfer-cubin>=0.5.0",
-  # sglang 0.5.10 requires nvidia-cutlass-dsl>=4.4.1 (via flashinfer 0.6.7.post2 which uses CUTLASS 4.4.2).
   # Override to >=4.4.1 so uv can resolve to a version satisfying both vllm and sglang.
   "nvidia-cutlass-dsl>=4.4.1",
   # Relax megatron-core workspace member's opentelemetry-api ceiling (<1.34) for protobuf 6.x compat with ray
@@ -296,21 +326,26 @@ override-dependencies = [
   # vLLM 0.20.0 excludes transformers 5.0-5.5.0 but our codebase needs 5.3.0.
   # Override so uv can resolve transformers==5.3.0 for non-vllm extras.
   "transformers==5.3.0",
-  #Override till we can upgrade sglang version to address CVE GHSA-7rgv-gqhr-fxg3
+  # Override sglang's xgrammar==0.1.32 to address CVE GHSA-7rgv-gqhr-fxg3
   "xgrammar==0.1.33",
   # Override dependencies to address CVEs
-  "mlflow>=3.11.1",
+  "mlflow>=3.12.0",
   # Override outlines for Python 3.13 support
   "outlines>=0.2.0",
   # Upgrade pytest to 9.0.3
   "pytest>=9.0.3",
+  # TransferQueue (data-plane extra) pins numpy<2.0.0; megatron-core needs
+  # numpy>=2.1.0 via onnx → ml-dtypes. Override globally so the data-plane
+  # extra composes with mcore/automodel without version-mirroring TQ's
+  # requirements.txt. Forward-compatible across TQ minor bumps.
+  "numpy>=2.1.0",
 ]
 
 # CVE fixes
 constraint-dependencies = [
   "brotli>=1.2.0",            # Address CVE GHSA-2qfp-q593-8484
   "starlette>=0.49.1",        # Address CVE GHSA-7f5h-v6xp-fcq8
-  "urllib3>=2.6.3",           # Address CVE GHSA-38jv-5279-wg99
+  "urllib3>=2.7.0",           # Address CVE GHSA-38jv-5279-wg99
   "aiohttp>=3.13.3",          # Address CVE GHSA-mqqc-3gqh-h2x8
   "pyasn1>=0.6.3",            # Address CVE GHSA-jr27-m4p2-rc6r
   "wheel>=0.46.2",            # Address CVE GHSA-8rrh-rw8j-w5fx
@@ -371,7 +406,6 @@ transformer-engine-torch = [{ requirement = "torch", match-runtime = true }]
 mamba-ssm = [{ requirement = "torch", match-runtime = true }]
 causal-conv1d = [{ requirement = "torch", match-runtime = true }]
 nv-grouped-gemm = [{ requirement = "torch", match-runtime = true }]
-sglang-kernel = [{ requirement = "torch", match-runtime = true }]
 
 # Needed when building from source
 [[tool.uv.dependency-metadata]]
@@ -417,83 +451,6 @@ name = "nv-grouped-gemm"
 # This version has to match the version in the commit/rev/tag used
 version = "v1.1.4.post7"
 requires-dist = ["setuptools", "wheel", "torch", "numpy"]
-
-[[tool.uv.dependency-metadata]]
-name = "sglang-kernel"
-# This version has to match the version in the commit/rev/tag used
-version = "0.4.1"
-requires-dist = ["torch", "scikit-build-core", "wheel"]
-
-[[tool.uv.dependency-metadata]]
-name = "sglang"
-# VCS install from official sgl-project/sglang v0.5.10
-# Version is dynamic (setuptools-scm), so uv cannot resolve deps from the VCS source automatically.
-# This requires-dist list must be kept in sync with the official python/pyproject.toml [project].dependencies.
-# Source: https://github.com/sgl-project/sglang/blob/v0.5.10/python/pyproject.toml
-version = "0.5.10"
-requires-dist = [
-  "IPython",
-  "aiohttp",
-  "apache-tvm-ffi>=0.1.5,<0.2",
-  "anthropic>=0.20.0",
-  "blobfile==3.0.0",
-  "build",
-  "compressed-tensors",
-  "cuda-python==13.0",
-  "decord2",
-  "datasets",
-  "einops",
-  "fastapi",
-  "flashinfer_python==0.6.7.post2",
-  "flashinfer_cubin==0.6.7.post2",
-  "gguf",
-  "interegular",
-  "llguidance>=0.7.11,<0.8.0",
-  "modelscope",
-  "msgspec",
-  "ninja",
-  "numpy",
-  "nvidia-cutlass-dsl>=4.4.1",
-  "nvidia-ml-py",
-  "openai-harmony==0.0.4",
-  "openai==2.6.1",
-  "orjson",
-  "outlines==0.1.11",
-  "packaging",
-  "partial_json_parser",
-  "pillow",
-  "prometheus-client>=0.20.0",
-  "psutil",
-  "py-spy",
-  "pybase64",
-  "pydantic",
-  "python-multipart",
-  "pyzmq>=25.1.2",
-  "quack-kernels>=0.3.0",
-  "requests",
-  "scipy",
-  "sentencepiece",
-  "setproctitle",
-  "flash-attn-4>=4.0.0b4",
-  "sglang-kernel==0.4.1",
-  "soundfile==0.13.1",
-  "tiktoken",
-  "timm==1.0.16",
-  "torch_memory_saver==0.0.9",
-  "torch==2.9.1",
-  "torchao==0.9.0",
-  "torchaudio==2.9.1",
-  "torchcodec==0.9.1 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')",
-  "torchvision",
-  "tqdm",
-  "mistral_common>=1.9.0",
-  "transformers==5.3.0",
-  "uvicorn",
-  "uvloop",
-  "watchfiles",
-  "xgrammar==0.1.32",
-  "smg-grpc-servicer>=0.5.0",
-]
 
 [[tool.uv.dependency-metadata]]
 name = "megatron-bridge"

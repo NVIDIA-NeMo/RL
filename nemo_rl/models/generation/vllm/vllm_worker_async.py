@@ -184,6 +184,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
         self.server_thread, self.base_url, self.http_server = None, None, None
         if self.cfg["vllm_cfg"].get("expose_http_server"):
+            # Must run after AsyncLLM.from_engine_args and before
+            # _setup_vllm_server spawns the uvicorn thread.
+            self._install_engine_input_socket_lock()
             self.server_thread, self.base_url, self.http_server = (
                 self._setup_vllm_server()
             )
@@ -193,6 +196,24 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         self._vllm_metrics_lock = threading.Lock()
         if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
             self._start_vllm_metrics_logger()
+
+    def _install_engine_input_socket_lock(self) -> None:
+        """Serialise sends on AsyncMPClient.input_socket across OS threads
+        to prevent race conditions that block the vLLM engine (e.g. during
+        in flight weight updates in async grpo).
+        """
+        shadow_sock = self.llm.engine_core.input_socket._shadow_sock
+
+        lock = threading.Lock()
+        original_send_multipart = shadow_sock.send_multipart
+
+        def locked_send_multipart(*args: Any, **kwargs: Any) -> Any:
+            with lock:
+                return original_send_multipart(*args, **kwargs)
+
+        # Replace the bound method on this socket instance only; other zmq
+        # sockets in the process are unaffected.
+        shadow_sock.send_multipart = locked_send_multipart  # type: ignore[assignment]
 
     def _start_vllm_metrics_logger(self) -> None:
         """Start a background thread that periodically collects vLLM logger metrics.
@@ -362,6 +383,32 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 return super().model_post_init(context)
 
         class NeMoRLOpenAIServingMixin:
+            @staticmethod
+            def _set_max_tokens(request, max_tokens: int) -> None:
+                """Set the request's max output tokens.
+
+                Mutates the request in place. Handles both max_completion_tokens (newer OpenAI API)
+                and max_tokens (deprecated but still supported by vLLM).
+                """
+                if request.max_completion_tokens is not None:
+                    request.max_completion_tokens = max_tokens
+                elif request.max_tokens is not None:
+                    request.max_tokens = max_tokens
+
+            def _clamp_max_tokens(
+                self, request, request_max_tokens: int, prompt_token_ids: list[int]
+            ) -> None:
+                """Clamp the request's max output tokens so that input + output <= max_model_len."""
+                remaining = self.model_config.max_model_len - len(prompt_token_ids)
+                if remaining <= 0:
+                    raise ValueError(
+                        f"Prompt length ({len(prompt_token_ids)}) fills or exceeds "
+                        f"max_model_len ({self.model_config.max_model_len}). "
+                        f"No room for output tokens."
+                    )
+                max_tokens = min(request_max_tokens, remaining)
+                self._set_max_tokens(request, max_tokens)
+
             # vLLM 0.20 moved chat preprocessing from
             # OpenAIServing._preprocess_chat to OpenAIServingRender.preprocess_chat,
             # so this override now applies via the render subclass.
@@ -383,6 +430,20 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                         message["tool_calls"] = list(message["tool_calls"])
 
                 messages_for_replace_prefix_tokens = deepcopy(messages)
+
+                # Temporarily set to 1 so vLLM's pre-tokenization length check passes;
+                # the actual value will be set through _clamp_max_tokens later.
+                actual_request_max_tokens = None
+                if isinstance(request, NeMoRLChatCompletionRequest):
+                    actual_request_max_tokens = (
+                        request.max_completion_tokens
+                        if request.max_completion_tokens is not None
+                        else request.max_tokens
+                    )
+                    # If max_completion_tokens or max_tokens is not set, we don't need to do _clamp_max_tokens.
+                    # So we don't need to set the request's max output tokens to 1 here.
+                    if actual_request_max_tokens is not None:
+                        self._set_max_tokens(request, 1)
 
                 try:
                     res = await super().preprocess_chat(
@@ -409,6 +470,13 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     not hasattr(request, "required_prefix_token_ids")
                     or request.required_prefix_token_ids is None
                 ):
+                    # Clamp the request's max output tokens so that input + output <= max_model_len.
+                    if actual_request_max_tokens is not None:
+                        self._clamp_max_tokens(
+                            request,
+                            actual_request_max_tokens,
+                            res[1][0]["prompt_token_ids"],
+                        )
                     return res
 
                 last_assistant_message_idx = None
@@ -457,6 +525,14 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 )
 
                 engine_prompt["prompt_token_ids"] = final_prompt_token_ids
+
+                # Clamp after prefix replacement since the prompt length may have changed.
+                if actual_request_max_tokens is not None:
+                    self._clamp_max_tokens(
+                        request,
+                        actual_request_max_tokens,
+                        final_prompt_token_ids,
+                    )
 
                 return res
 
@@ -1165,7 +1241,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         gc.collect()
         torch.cuda.empty_cache()
 
-    async def sleep_async(self, discard_weights: bool = False):
+    async def sleep_async(self):
         """Async version of sleep."""
         assert self.llm is not None, (
             "Attempting to sleep with either an uninitialized vLLM or non-model-owner"
@@ -1184,7 +1260,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         # the receiver and sends data=None, causing an assertion error.
         if hasattr(self.llm, "reset_mm_cache"):
             await self.llm.reset_mm_cache()
-        await self.llm.sleep(level=2 if discard_weights else 1)
+        await self.llm.sleep(level=1)
 
         gc.collect()
         torch.cuda.empty_cache()

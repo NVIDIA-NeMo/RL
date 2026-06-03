@@ -31,6 +31,22 @@ from nemo_rl.utils.config import (
 from nemo_rl.utils.logger import get_next_experiment_dir
 
 
+def _select_trainer(master_config: MasterConfig):
+    """Pick the synchronous trainer based on ``data_plane.enabled``.
+
+    Factored out so test_architecture_invariants can verify dispatch
+    without the full setup() path.
+    """
+    dp_cfg = master_config.data_plane or {}
+    if dp_cfg.get("enabled", False):
+        from nemo_rl.algorithms.grpo_sync import grpo_train_sync
+
+        print("🚀 Running synchronous GRPO training (TransferQueue)")
+        return grpo_train_sync
+    print("🚀 Running synchronous GRPO training (legacy)")
+    return grpo_train
+
+
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Run GRPO training with configuration")
@@ -100,6 +116,20 @@ def main() -> None:
         val_task_to_env,
     ) = setup_response_data(tokenizer, config.data, config.env)
 
+    # Pick the policy factory at the launcher level so the legacy trainer
+    # stays data-plane-agnostic (architectural invariant — see
+    # tests/data_plane/unit/test_architecture_invariants.py).
+    _dp_cfg = config.data_plane or {}
+    if _dp_cfg.get("enabled", False):
+        from nemo_rl.models.policy.tq_policy import TQPolicy
+
+        def _make_policy(**kwargs):
+            return TQPolicy(**kwargs, dp_cfg=_dp_cfg)
+
+        _policy_factory = _make_policy
+    else:
+        _policy_factory = None  # setup() defaults to plain Policy
+
     (
         policy,
         policy_generation,
@@ -111,7 +141,13 @@ def main() -> None:
         checkpointer,
         grpo_state,
         master_config,
-    ) = setup(config, tokenizer, dataset, val_dataset)
+    ) = setup(
+        config,
+        tokenizer,
+        dataset,
+        val_dataset,
+        policy_factory=_policy_factory,
+    )
 
     # Check if async mode is enabled
     if "async_grpo" in config.grpo and config.grpo["async_grpo"]["enabled"]:
@@ -165,10 +201,10 @@ def main() -> None:
             max_trajectory_age_steps=async_config["max_trajectory_age_steps"],
         )
     else:
-        print("🚀 Running synchronous GRPO training")
-
-        # Run standard GRPO training
-        grpo_train(
+        # Two parallel synchronous trainers (verl-style — main_ppo.py vs
+        # main_ppo_sync.py). data_plane.enabled selects which one runs.
+        trainer = _select_trainer(master_config)
+        trainer(
             policy,
             policy_generation,
             dataloader,

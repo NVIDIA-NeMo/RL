@@ -407,3 +407,19 @@ logger:
 cluster:
   gpus_per_node: 1
   num_nodes: 1
+
+# TransferQueue-mediated data plane for sync GRPO.
+# Off by default — the legacy grpo_train trainer never engages this.
+# Flip enabled=true and run grpo_train_sync to use TQ-mediated bulk
+# transfer between rollout and train. See nemo_rl/data_plane/README.md.
+data_plane:
+  enabled: false
+  impl: transfer_queue
+  backend: "simple"                  # TQ storage backend ('simple' or 'mooncake_cpu')
+  storage_capacity: 1000000          # max samples retained per partition
+  num_storage_units: 2               # storage shards
+  claim_meta_poll_interval_s: 0.5    # blocking-claim poll cadence
+  global_segment_size: 549755813888  # 512 GiB — used when backend == "mooncake_cpu"
+  local_buffer_size:   68719476736   # 64 GiB  — used when backend == "mooncake_cpu"
+  # observability:                    # NotRequired
+  #   enabled: false

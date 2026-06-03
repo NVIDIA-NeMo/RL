@@ -62,6 +62,7 @@ policy:
       lr_warmup_init: 5.0e-08
   sequence_packing:
     enabled: true
+    fuse_loss: true
   generation:
     max_new_tokens: 1536
     vllm_cfg:
