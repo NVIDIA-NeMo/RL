@@ -745,7 +745,8 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         assert self.llm is not None, (
             "Attempting to generate with either an uninitialized vLLM or non-model-owner"
         )
-        outputs = self.llm.generate(prompts, sampling_params)
+        use_tqdm = self.cfg["vllm_cfg"].get("use_tqdm", True)
+        outputs = self.llm.generate(prompts, sampling_params, use_tqdm=use_tqdm)
 
         # Process the outputs - but preserve the original input padding structure
         output_ids_list = []
@@ -881,7 +882,8 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         assert self.llm is not None, (
             "Attempting to generate with either an uninitialized vLLM or non-model-owner"
         )
-        outputs = self.llm.generate(data["prompts"], sampling_params)
+        use_tqdm = self.cfg["vllm_cfg"].get("use_tqdm", True)
+        outputs = self.llm.generate(data["prompts"], sampling_params, use_tqdm=use_tqdm)
         texts = [output.outputs[0].text for output in outputs]
 
         # Convert to BatchedDataDict
