@@ -27,7 +27,7 @@ DataPlane. Model tensors still move through DataPlane or NCCL.
 Data flow:
   _rollout_pump  → gen.generate_and_push(prompt, dp_client) ← RPC to GenWorker
                      GenWorker → dp_client.put_samples(...)
-  _train_pump    → dp_client.claim_meta(...) → BatchSelectionStrategy
+  _train_pump    → dp_client.claim_meta(...) → StalenessSampler
                  → _advantage_pump(meta) → dp_client.get_samples(...)
                                         → adv_estimator.compute_advantage(...)
                                         → dp_client.put_samples(...)
@@ -50,10 +50,9 @@ import torch
 from tensordict import TensorDict
 
 from nemo_rl.algorithms.staleness_sampler import (
-    BatchSelectionStrategy,
-    StalenessWindowSelection,
-    StrictOnPolicyBatchSampler,
+    StalenessSampler,
     count_prompt_groups,
+    min_weight_version,
 )
 from nemo_rl.data_plane import KVBatchMeta
 
@@ -152,14 +151,18 @@ class SingleControllerActor:
                 "advantage_enabled=True requires an advantage_estimator instance"
             )
 
+        # Initialize sampler
+        assert cfg.batch_selection_strategy in [
+            "strict_on_policy",
+            "staleness_window",
+        ], f"Unknown batch_selection_strategy: {cfg.batch_selection_strategy}"
+
         if cfg.batch_selection_strategy == "strict_on_policy":
-            self._sampler: BatchSelectionStrategy = StrictOnPolicyBatchSampler()
-        elif cfg.batch_selection_strategy == "staleness_window":
-            self._sampler = StalenessWindowSelection(cfg.max_weight_staleness_versions)
-        else:
-            raise ValueError(
-                f"Unknown batch_selection_strategy: {cfg.batch_selection_strategy}"
+            cfg.max_weight_staleness_versions = 0
+            print(
+                "Using strict_on_policy, auto setting max_weight_staleness_versions to 0."
             )
+        self._sampler = StalenessSampler(cfg.max_weight_staleness_versions)
 
         # ── asyncio state ──────────────────────────────────────────────────
         # Gate: cleared during _sync_weights, set when generation may proceed
@@ -235,7 +238,7 @@ class SingleControllerActor:
             return await result
         return result
 
-    # ── the three pumps ────────────────────────────────────────────────────
+    # ── the four pumps (three main pumps + advantage pump) ─────────────────
 
     async def _rollout_pump(self) -> None:
         """Dispatch prompts as concurrent coroutines, one per prompt group.
@@ -268,9 +271,7 @@ class SingleControllerActor:
                     self._inflight_rollouts -= 1
 
         tasks = [
-            asyncio.ensure_future(
-                _one_group(self._prompts[i % len(self._prompts)])
-            )
+            asyncio.ensure_future(_one_group(self._prompts[i % len(self._prompts)]))
             for i in range(n)
         ]
         await asyncio.gather(*tasks)
@@ -288,7 +289,7 @@ class SingleControllerActor:
         Flow per step:
           1. claim_meta() — temporary consuming metadata acquisition
           2. Evict sample_ids no longer eligible under the selected policy
-          3. BatchSelectionStrategy.select_indices() — choose full prompt groups
+          3. StalenessSampler.select_indices() — choose full prompt groups
           4. _advantage_pump() — fetch, compute advantages, write back
           5. trainer.train_on_meta(KVBatchMeta, dp_client) — trainer fetches tensors
           6. clear_samples(sample_ids) — SC removes consumed rows
@@ -340,7 +341,7 @@ class SingleControllerActor:
 
             selected_meta = self._claimed_meta.subset(selected_indices)
             selected_meta = await self._advantage_pump(selected_meta)
-            selected_weight = _min_weight_version(selected_meta)
+            selected_weight = min_weight_version(selected_meta)
             lag = (
                 self._trainer_version - selected_weight
                 if selected_weight is not None
@@ -371,9 +372,7 @@ class SingleControllerActor:
                     sample_ids=selected_meta.sample_ids,
                     partition_id=selected_meta.partition_id,
                 )
-                self._claimed_meta = _drop_indices(
-                    self._claimed_meta, selected_indices
-                )
+                self._claimed_meta = self._claimed_meta.drop(selected_indices)
                 self._trainer_version = result["trainer_version"]
                 selected_groups = count_prompt_groups(
                     selected_meta,
@@ -391,48 +390,39 @@ class SingleControllerActor:
                 )
                 self._train_steps += 1
 
-    async def _claim_available_meta(self) -> None:
-        """Claim currently-ready rows and append them to the local scheduler cache.
+    async def _sync_weights(self) -> None:
+        """Drain in-flight rollouts then synchronize weights.
 
-        TODO: replace this with a non-consuming metadata listing API.
-        ``claim_meta`` advances TQ's per-task cursor, so SC must keep a
-        local cache of claimed-but-not-yet-trained samples for now.
+        SC owns the drain gate (when to sync); WeightSynchronizer owns how.
+
+        Flow:
+          1. _rollout_permitted.clear()  — no new dispatches
+          2. drain _inflight_rollouts → 0  (5ms poll)
+          3. weight_synchronizer.sync_weights(trainer_version)
+          4. _rollout_permitted.set()   — resume
         """
-        batch_size = (
-            self._cfg.max_claim_prompt_groups * self._cfg.generations_per_prompt
-        )
-        meta = await self._call_dp(
-            "claim_meta",
-            partition_id=self._cfg.partition_id,
-            task_name=self._cfg.consumer_task_name,
-            required_fields=self._claim_required_fields(),
-            batch_size=batch_size,
-            blocking=False,
-            timeout_s=0.0,
-        )
-        if meta.size == 0:
-            return
-        self._claimed_meta = _concat_meta(self._claimed_meta, meta)
+        self._rollout_permitted.clear()
 
-    def _claim_required_fields(self) -> list[str]:
-        fields = list(self._cfg.claim_required_fields)
-        if self._cfg.advantage_enabled:
-            fields.extend(self._advantage_input_fields())
-        return _dedupe(fields)
+        # Drain: wait for all in-flight rollouts to complete before NCCL
+        # Critical: if GenWorker has queued calls when NCCL init is dispatched,
+        # the init sits behind them — trainer blocks in rendezvous → deadlock
+        drain_start = time.monotonic()
+        while self._inflight_rollouts > 0:
+            await asyncio.sleep(0.005)
 
-    def _advantage_input_fields(self) -> list[str]:
-        fields = [
-            self._cfg.advantage_prompt_ids_field,
-            self._cfg.advantage_reward_field,
-            self._cfg.advantage_token_mask_field,
-            self._cfg.advantage_sample_mask_field,
-            *self._cfg.advantage_repeated_batch_fields,
-        ]
-        if self._cfg.advantage_policy_logprobs_field is not None:
-            fields.append(self._cfg.advantage_policy_logprobs_field)
-        if self._cfg.advantage_reference_logprobs_field is not None:
-            fields.append(self._cfg.advantage_reference_logprobs_field)
-        return _dedupe(fields)
+        drain_elapsed = time.monotonic() - drain_start
+        log.info(
+            "  _sync_weights: drained in %.3fs, syncing weights v%d",
+            drain_elapsed,
+            self._trainer_version,
+        )
+
+        t0 = time.monotonic()
+        await self._weight_synchronizer.sync_weights(self._trainer_version)
+        elapsed = time.monotonic() - t0
+
+        log.info("  _sync_weights: sync done in %.3fs", elapsed)
+        self._rollout_permitted.set()
 
     async def _advantage_pump(self, meta: KVBatchMeta) -> KVBatchMeta:
         """Fetch advantage inputs, compute advantages, and write them back.
@@ -501,7 +491,55 @@ class SingleControllerActor:
                 {self._cfg.advantage_output_field: advantages},
             ),
         )
-        return _with_fields(meta, [self._cfg.advantage_output_field])
+        return meta.with_fields([self._cfg.advantage_output_field])
+
+    # ── utility helpers ────────────────────────────────────────────────────
+
+    async def _claim_available_meta(self) -> None:
+        """Claim currently-ready rows and append them to the local scheduler cache.
+
+        TODO: replace this with a non-consuming metadata listing API.
+        ``claim_meta`` advances TQ's per-task cursor, so SC must keep a
+        local cache of claimed-but-not-yet-trained samples for now.
+        """
+        batch_size = (
+            self._cfg.max_claim_prompt_groups * self._cfg.generations_per_prompt
+        )
+        meta = await self._call_dp(
+            "claim_meta",
+            partition_id=self._cfg.partition_id,
+            task_name=self._cfg.consumer_task_name,
+            required_fields=self._claim_required_fields(),
+            batch_size=batch_size,
+            blocking=False,
+            timeout_s=0.0,
+        )
+        if meta.size == 0:
+            return
+        if self._claimed_meta is None or self._claimed_meta.size == 0:
+            self._claimed_meta = meta
+        else:
+            self._claimed_meta = self._claimed_meta.concat(meta)
+
+    def _claim_required_fields(self) -> list[str]:
+        fields = list(self._cfg.claim_required_fields)
+        if self._cfg.advantage_enabled:
+            fields.extend(self._advantage_input_fields())
+        return list(dict.fromkeys(fields))
+
+    def _advantage_input_fields(self) -> list[str]:
+        fields = [
+            self._cfg.advantage_prompt_ids_field,
+            self._cfg.advantage_reward_field,
+            self._cfg.advantage_token_mask_field,
+            self._cfg.advantage_sample_mask_field,
+            *self._cfg.advantage_repeated_batch_fields,
+        ]
+        if self._cfg.advantage_policy_logprobs_field is not None:
+            fields.append(self._cfg.advantage_policy_logprobs_field)
+        if self._cfg.advantage_reference_logprobs_field is not None:
+            fields.append(self._cfg.advantage_reference_logprobs_field)
+        return list(dict.fromkeys(fields))
 
     async def _evict_stale_claimed(self) -> KVBatchMeta | None:
         if self._claimed_meta is None or self._claimed_meta.size == 0:
@@ -527,77 +565,8 @@ class SingleControllerActor:
             sample_ids=evicted_meta.sample_ids,
             partition_id=evicted_meta.partition_id,
         )
-        self._claimed_meta = _drop_indices(self._claimed_meta, indices)
+        self._claimed_meta = self._claimed_meta.drop(indices)
         return evicted_meta
-
-    async def _sync_weights(self) -> None:
-        """Drain in-flight rollouts then synchronize weights.
-
-        SC owns the drain gate (when to sync); WeightSynchronizer owns how.
-
-        Flow:
-          1. _rollout_permitted.clear()  — no new dispatches
-          2. drain _inflight_rollouts → 0  (5ms poll)
-          3. weight_synchronizer.sync_weights(trainer_version)
-          4. _rollout_permitted.set()   — resume
-        """
-        self._rollout_permitted.clear()
-
-        # Drain: wait for all in-flight rollouts to complete before NCCL
-        # Critical: if GenWorker has queued calls when NCCL init is dispatched,
-        # the init sits behind them — trainer blocks in rendezvous → deadlock
-        drain_start = time.monotonic()
-        while self._inflight_rollouts > 0:
-            await asyncio.sleep(0.005)
-
-        drain_elapsed = time.monotonic() - drain_start
-        log.info(
-            "  _sync_weights: drained in %.3fs, syncing weights v%d",
-            drain_elapsed,
-            self._trainer_version,
-        )
-
-        t0 = time.monotonic()
-        await self._weight_synchronizer.sync_weights(self._trainer_version)
-        elapsed = time.monotonic() - t0
-
-        log.info("  _sync_weights: sync done in %.3fs", elapsed)
-        self._rollout_permitted.set()
-
-
-def _concat_meta(left: KVBatchMeta | None, right: KVBatchMeta) -> KVBatchMeta:
-    if left is None or left.size == 0:
-        return right
-    return left.concat(right)
-
-
-def _drop_indices(meta: KVBatchMeta, indices: list[int]) -> KVBatchMeta | None:
-    dropped = set(indices)
-    keep = [i for i in range(meta.size) if i not in dropped]
-    if not keep:
-        return None
-    return meta.subset(keep)
-
-
-def _min_weight_version(meta: KVBatchMeta) -> int | None:
-    versions = []
-    for tag in meta.tags or []:
-        value = tag.get("weight_version", tag.get("version"))
-        if value is None:
-            continue
-        versions.append(int(value))
-    return min(versions) if versions else None
-
-
-def _dedupe(fields: list[str]) -> list[str]:
-    seen: set[str] = set()
-    deduped: list[str] = []
-    for field_name in fields:
-        if field_name in seen:
-            continue
-        seen.add(field_name)
-        deduped.append(field_name)
-    return deduped
 
 
 def _tensor_field(data: TensorDict, field_name: str) -> torch.Tensor:
@@ -638,18 +607,3 @@ def _fields_for_put(meta: KVBatchMeta, fields: dict[str, torch.Tensor]) -> Tenso
         else:
             packed[field_name] = value.detach().contiguous()
     return TensorDict(packed, batch_size=[meta.size])
-
-
-def _with_fields(meta: KVBatchMeta, field_names: list[str]) -> KVBatchMeta:
-    fields = _dedupe([*(meta.fields or []), *field_names])
-    return KVBatchMeta(
-        partition_id=meta.partition_id,
-        task_name=meta.task_name,
-        sample_ids=list(meta.sample_ids),
-        fields=fields,
-        sequence_lengths=(
-            list(meta.sequence_lengths) if meta.sequence_lengths is not None else None
-        ),
-        extra_info=dict(meta.extra_info or {}),
-        tags=[dict(tag) for tag in meta.tags] if meta.tags is not None else None,
-    )
