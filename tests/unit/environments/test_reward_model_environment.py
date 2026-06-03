@@ -212,4 +212,7 @@ class TestRewardModelEnvironment:
         assert output.rewards.dtype == torch.float32
         # Verify expected reward values (with tolerance for floating point precision)
         expected_rewards = torch.tensor([-5.2500, 2.6094])
-        assert torch.allclose(output.rewards, expected_rewards, atol=1e-1)
+        # transformers 5.5 shifts Skywork-Reward-V2 scores by up to ~0.16 (deterministic,
+        # e.g. reward[0] -5.25 -> -5.41); widen atol from 0.1 to 0.2 to absorb this numeric
+        # drift while still catching gross regressions.
+        assert torch.allclose(output.rewards, expected_rewards, atol=2e-1)

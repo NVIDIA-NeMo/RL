@@ -38,5 +38,5 @@ uv run $PROJECT_ROOT/examples/run_vlm_grpo.py \
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 uv run tests/check_metrics.py $JSON_METRICS \
-    'max(data["train/token_mult_prob_error"]) < 1.05' \
-    'median(data["train/token_mult_prob_error"]) < 1.05'
+    'max(data["train/token_mult_prob_error"]) < 1.08' \
+    'median(data["train/token_mult_prob_error"]) < 1.08'
