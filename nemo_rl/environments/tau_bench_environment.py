@@ -90,8 +90,8 @@ class TauBenchEnvConfig(TypedDict):
     mock_user_latency_s: NotRequired[float | None]
     mock_judge_latency_s: NotRequired[float | None]
     mock_stop_prob: NotRequired[float | None]
-    worker_stagger_delay_s: NotRequired[float]
-    max_concurrent_api_requests: NotRequired[int]
+    worker_stagger_delay_s: float
+    max_concurrent_api_requests: int
 
 
 class TauBenchEnvMetadata(TypedDict):
@@ -588,8 +588,8 @@ class TauBenchEnvironment(EnvironmentInterface[TauBenchEnvMetadata]):
                 mock_judge_latency_s=cfg.get("mock_judge_latency_s"),
                 mock_stop_prob=cfg.get("mock_stop_prob"),
                 worker_id=i,
-                worker_stagger_delay_s=cfg.get("worker_stagger_delay_s", 0.0),
-                max_concurrent_api_requests=cfg.get("max_concurrent_api_requests", 1),
+                worker_stagger_delay_s=cfg["worker_stagger_delay_s"],
+                max_concurrent_api_requests=cfg["max_concurrent_api_requests"],
             )
             for i in range(self._num_workers)
         ]

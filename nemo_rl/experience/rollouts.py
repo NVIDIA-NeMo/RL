@@ -767,6 +767,7 @@ async def run_sample_multi_turn_rollout(
     max_seq_len: int,
     max_rollout_turns: int = 999999,
     greedy: bool = False,
+    task_obs_use_chat_template: dict[str, bool] | None = None,
 ) -> tuple[dict, dict[str, Any]]:
     """Run a multi-turn rollout for a single sample.
 
@@ -782,6 +783,9 @@ async def run_sample_multi_turn_rollout(
         max_seq_len: Maximum sequence length
         max_rollout_turns: Maximum number of turns
         greedy: Whether to use greedy decoding
+        task_obs_use_chat_template: Pre-computed per-task chat-template flag. When
+            provided, avoids N×len(task_to_env) Ray RPCs across samples. If None,
+            falls back to querying each environment actor directly.
 
     Returns:
         Tuple of (final_sample_state, sample_metrics)
@@ -792,11 +796,12 @@ async def run_sample_multi_turn_rollout(
     current_stop_strings = initial_sample_state.get("stop_strings", None)
     task_name = initial_sample_state["task_name"]
 
-    # Build per-task lookup for chat-template tokenization once, before the loop.
-    task_obs_use_chat_template: dict[str, bool] = {
-        tn: ray.get(env.obs_use_chat_template.remote())  # type: ignore[attr-defined]
-        for tn, env in task_to_env.items()
-    }
+    # Use the pre-computed lookup when available; otherwise query the actors now.
+    if task_obs_use_chat_template is None:
+        task_obs_use_chat_template = {
+            tn: ray.get(env.obs_use_chat_template.remote())  # type: ignore[attr-defined]
+            for tn, env in task_to_env.items()
+        }
 
     # Sample-level metrics
     total_reward = 0.0
@@ -863,6 +868,7 @@ async def run_sample_multi_turn_rollout(
 
         except Exception as e:
             print(f"Error generating response for sample {sample_idx}: {e}")
+            truncated = True
             break
 
         # Create single-sample batch for environment interaction
@@ -996,6 +1002,13 @@ def run_async_multi_turn_rollout(
         """Internal async implementation."""
         batch_size = len(input_batch["message_log"])
 
+        # Build per-task lookup for chat-template tokenization once, before spawning
+        # per-sample coroutines. Avoids N×len(task_to_env) Ray RPCs (one per sample).
+        task_obs_use_chat_template: dict[str, bool] = {
+            tn: ray.get(env.obs_use_chat_template.remote())  # type: ignore[attr-defined]
+            for tn, env in task_to_env.items()
+        }
+
         # Prepare initial states for each sample
         sample_initial_states = []
         for i in range(batch_size):
@@ -1021,6 +1034,7 @@ def run_async_multi_turn_rollout(
                     max_seq_len=max_seq_len,
                     max_rollout_turns=max_rollout_turns,
                     greedy=greedy,
+                    task_obs_use_chat_template=task_obs_use_chat_template,
                 )
                 return result
             except Exception as e:
