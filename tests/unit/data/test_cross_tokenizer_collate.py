@@ -86,12 +86,11 @@ class FakeTokenizer:
 def _datum(text: str, idx: int = 0, loss_multiplier: float = 1.0) -> dict:
     """Build a DatumSpec-like dict matching what ``kd_data_processor`` emits."""
     return {
-        "message_log": [],
+        "message_log": [{"role": "assistant", "content": text}],
         "length": len(text),
         "extra_env_info": None,
         "loss_multiplier": loss_multiplier,
         "idx": idx,
-        "raw_text": text,
     }
 
 
@@ -264,8 +263,8 @@ class TestCollatorPadTokenFallback:
         assert student_tok.pad_token == student_tok.eos_token
 
 
-class TestCollatorTextKey:
-    def test_custom_text_key_is_honored(self):
+class TestCollatorReadsMessageLog:
+    def test_text_read_from_message_log_content(self):
         student_tok = FakeTokenizer(vocab_size=32, prefix="s")
         teacher_tok = FakeTokenizer(vocab_size=24, prefix="t")
         aligner = _fake_aligner(b=1, t_s=8, t_t=8)
@@ -275,16 +274,15 @@ class TestCollatorTextKey:
             aligner=aligner,
             ctx_length_student=8,
             ctx_length_teacher=8,
-            text_key="my_field",
         )
         out = collator(
             [
                 {
                     "loss_multiplier": 1.0,
                     "idx": 0,
-                    "my_field": "alt-text",
+                    "message_log": [{"role": "assistant", "content": "alt-text"}],
                 }
             ]
         )
-        # No raise = the key remap worked; check the output is non-trivial.
+        # The collator tokenizes message_log[0]["content"].
         assert int(out["input_lengths"][0]) == len("alt-text")

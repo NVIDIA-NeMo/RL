@@ -379,12 +379,13 @@ class TestKdDataProcessor:
             max_seq_length=512,
             idx=3,
         )
-        assert out["message_log"] == []
+        assert out["message_log"] == [
+            {"role": "assistant", "content": "the quick brown fox"}
+        ]
         assert out["length"] == len("the quick brown fox")
         assert out["extra_env_info"] is None
         assert out["loss_multiplier"] == 1.0
         assert out["idx"] == 3
-        assert out["raw_text"] == "the quick brown fox"
 
     def test_task_name_forwarded_when_present(self):
         out = kd_data_processor(
@@ -458,5 +459,5 @@ class TestKdDataProcessor:
             max_seq_length=128,
             idx=0,
         )
-        assert out["raw_text"] == long_text
+        assert out["message_log"][0]["content"] == long_text
         assert out["length"] == 10_000

@@ -54,8 +54,6 @@ class CrossTokenizerCollator:
         make_seq_div_by_student: Round student sequence length up to a
             multiple of this value (typically TP * CP * 2 for DTensor V2).
         make_seq_div_by_teacher: Same for the teacher side.
-        text_key: Field on :class:`DatumSpec` that holds the raw text. Set
-            by :func:`kd_data_processor` to ``"raw_text"``.
     """
 
     def __init__(
@@ -68,7 +66,6 @@ class CrossTokenizerCollator:
         ctx_length_teacher: int,
         make_seq_div_by_student: int = 1,
         make_seq_div_by_teacher: int = 1,
-        text_key: str = "raw_text",
     ):
         self.student_tokenizer = student_tokenizer
         self.teacher_tokenizer = teacher_tokenizer
@@ -77,7 +74,6 @@ class CrossTokenizerCollator:
         self.ctx_length_teacher = ctx_length_teacher
         self.make_seq_div_by_student = make_seq_div_by_student
         self.make_seq_div_by_teacher = make_seq_div_by_teacher
-        self.text_key = text_key
         # Defensive: HF tokenizers without a pad token can't pad batches.
         if self.student_tokenizer.pad_token_id is None:
             self.student_tokenizer.pad_token = self.student_tokenizer.eos_token
@@ -85,7 +81,9 @@ class CrossTokenizerCollator:
             self.teacher_tokenizer.pad_token = self.teacher_tokenizer.eos_token
 
     def __call__(self, batch: List[DatumSpec]) -> BatchedDataDict[Any]:
-        texts = [datum[self.text_key] for datum in batch]
+        # kd_data_processor carries the raw text as a single assistant
+        # message; the collator tokenizes that content for both sides.
+        texts = [datum["message_log"][0]["content"] for datum in batch]
         student_input_ids, student_attention_mask = self._tokenize_batch(
             texts,
             self.student_tokenizer,

@@ -716,20 +716,16 @@ def kd_data_processor(
 ) -> DatumSpec:
     """Process a raw-text datum for cross-tokenizer distillation.
 
-    The cross-tokenizer collator does the actual tokenization (twice — once
-    with the student tokenizer, once with the teacher tokenizer), so this
-    processor only carries the raw text forward. ``message_log`` is left
-    empty for compatibility with :class:`DatumSpec`; the collator reads
-    ``raw_text`` instead.
+    Tokenization is deferred to the collator, so the text is carried forward
+    as a single assistant message in ``message_log``.
     """
     text = datum_dict["text"]
     output: DatumSpec = {
-        "message_log": [],
+        "message_log": [{"role": "assistant", "content": text}],
         "length": len(text),
         "extra_env_info": None,
         "loss_multiplier": 1.0,
         "idx": idx,
-        "raw_text": text,  # consumed by CrossTokenizerCollator
     }
     if "task_name" in datum_dict:
         output["task_name"] = datum_dict["task_name"]
