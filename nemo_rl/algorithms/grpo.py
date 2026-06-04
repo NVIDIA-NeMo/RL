@@ -2985,20 +2985,9 @@ def async_grpo_train(
                     # Add loss mask to each message
                     # Only unmask assistant messages that were actually generated (have generation_logprobs),
                     # not assistant messages that were part of the prompt history
-                    for i, message_log in enumerate(repeated_batch["message_log"]):
-                        for j, message in enumerate(message_log):
-                            if message["role"] == "assistant" and "generation_logprobs" in message:
-                                message["token_loss_mask"] = torch.ones_like(
-                                    message["token_ids"]
-                                )
-                            else:
-                                message["token_loss_mask"] = torch.zeros_like(
-                                    message["token_ids"]
-                                )
-                            if "generation_logprobs" not in message:
-                                message["generation_logprobs"] = torch.zeros_like(
-                                    message["token_ids"], dtype=torch.float32
-                                )
+                    add_grpo_token_loss_masks_and_generation_logprobs(
+                        repeated_batch["message_log"]
+                    )
 
                     # Convert to flat format for training
                     flat_messages, input_lengths = batched_message_log_to_flat_message(
