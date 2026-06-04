@@ -1070,8 +1070,7 @@ class CrossTokenizerDistillationLossConfig(TypedDict):
             Loaded lazily on first call by each worker process.
         gold_loss: If True, switch to the gold-loss formulation: split the
             vocab into an exact-token-mapped *common* set (KL) and an
-            *uncommon* set (sorted L1). Matches PT
-            ``compute_KL_loss_optimized`` lines 3494–3829.
+            *uncommon* set (sorted L1).
         xtoken_loss: Modifier inside the gold-loss path. If True, relaxes
             the exact-map threshold to ``>= 0.6`` (vs ``== 1.0``) and adds
             a collision-replacement rule so multi-token projections can
@@ -1080,10 +1079,9 @@ class CrossTokenizerDistillationLossConfig(TypedDict):
             and teacher logits before KL.
         vocab_topk: Microbatch-global top-k size used by the P-KL path
             (``gold_loss=False``). Computed inside the loss fn from full
-            teacher logits, mirroring PT ``global_top_indices``. Inert when
-            ``gold_loss=True``.
+            teacher logits. Inert when ``gold_loss=True``.
         uncommon_topk: Cap on the L1 uncommon-tail sort in the gold path.
-            Matches PT's hardcoded 8192. Inert when ``gold_loss=False``.
+            Defaults to 8192. Inert when ``gold_loss=False``.
         reverse_kl: If True, compute KL(student || teacher) instead of
             KL(teacher || student).
         exact_token_match_only: If True, only aligned pairs flagged as
@@ -1249,9 +1247,8 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         ce_loss = self._compute_ce(logits, data, global_valid_toks)
 
         # Next-token accuracy on the student side, masked to valid tokens.
-        # Mirrors PT reference at train_distillation_ddp.py:1956 — gives a
-        # quick per-step signal that's directly comparable to PT's `Acc:`
-        # log column.
+        # Quick per-step signal on the student's next-token prediction
+        # quality.
         with torch.no_grad():
             student_argmax = logits[:, :-1].argmax(dim=-1)
             shift_labels = data["input_ids"][:, 1:]
@@ -1265,11 +1262,11 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             ).sum() / denom
 
         if cfg["dynamic_loss_scaling"]:
-            # Match PT reference exactly (train_distillation_ddp.py:1745-1747):
+            # Dynamic loss scaling:
             #   dls_scale = ce_loss.item() / kl_loss.item()
             #   loss = kl_loss * dls_scale + ce_loss
             # User-supplied `kl_loss_weight` / `ce_loss_scale` are
-            # intentionally ignored in this branch — PT does the same.
+            # intentionally ignored in this branch.
             kl_detached = kl_loss.detach().abs()
             ce_detached = ce_loss.detach().abs()
             kl_scale = torch.where(
@@ -1305,8 +1302,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """P-KL: chunk-averaged KL over a microbatch-global top-k teacher subset.
 
-        Mirrors the PT non-gold forward-projection path at
-        ``tokenalign.py:3901–4100``:
+        Steps:
 
         1. Project full-vocab student probs through ``M`` to teacher vocab.
         2. Use the full teacher logits materialized by ``prepare_loss_input``.
@@ -1319,7 +1315,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         5. Build per-token chunk masks from ``alignment_*_chunk_id`` and
            chunk-average via ``bmm`` (shared helper).
         6. Renormalize student chunk distributions inside the top-k subset
-           (PT convention: avg-then-renormalize, log).
+           (avg-then-renormalize, log).
         7. Forward (or reverse) KL between chunk distributions.
         """
         cfg = self.cfg
@@ -1352,7 +1348,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         # `teacher_full_logits` [B, T_t, V_t_model] is materialized by
         # `prepare_loss_input` (rebuilt from the IPC handles). Same transport
         # as the gold path consumes; here we additionally compute a
-        # microbatch-global top-k inline to match PT.
+        # microbatch-global top-k inline.
         # HF models commonly pad lm_head out_features beyond len(tokenizer)
         # for embedding/FFN alignment (e.g. Qwen3: tokenizer 151669,
         # lm_head 151936). The projection matrix is sized to the real
@@ -1363,7 +1359,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         if teacher_full_logits.shape[-1] > v_t:
             teacher_full_logits = teacher_full_logits[..., :v_t]
 
-        # PT global_top_indices: max over flat (B*T_t) → [V_t] → topk → [k].
+        # global_top_indices: max over flat (B*T_t) → [V_t] → topk → [k].
         vocab_topk = min(cfg["vocab_topk"], v_t)
         with torch.no_grad():
             teacher_flat = teacher_full_logits.view(-1, v_t)
@@ -1380,7 +1376,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         ]  # [B, T_t, k]
         target_log_probs = torch.log_softmax(
             teacher_topk_logits / T, dim=-1
-        )  # [B, T_t, k] (renormalized within the [k] subset, matching PT).
+        )  # [B, T_t, k] (renormalized within the [k] subset).
 
         # Chunk-average both sides via the shared helper.
         alignment = alignment_from_flat_batch(data)
@@ -1397,9 +1393,9 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             target_log_probs, teacher_chunk_id, max_chunks
         )  # [B, C, k] / [B, C]
 
-        # PT: renormalize the projected chunk distribution within the top-k
+        # Renormalize the projected chunk distribution within the top-k
         # subset, then take log. Teacher side is already log-probs (avg of
-        # log_softmaxes; not a true log of mean — matches PT).
+        # log_softmaxes; not a true log of mean).
         proj_chunks = proj_chunks / (proj_chunks.sum(dim=-1, keepdim=True) + eps)
         proj_log_chunks = (proj_chunks + eps).log()
 
@@ -1424,7 +1420,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
 
         # Projection top-1 accuracy: per-chunk argmax of the student-side
         # projected distribution vs the teacher's argmax over the same
-        # top-k subset. Mirrors PT reference at tokenalign.py:4097–4104.
+        # top-k subset.
         with torch.no_grad():
             proj_top1 = proj_chunks.argmax(dim=-1)  # [B, C]
             tgt_top1 = torch.exp(tgt_log_chunks).argmax(dim=-1)  # [B, C]
@@ -1458,8 +1454,6 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         teacher_full_logits: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Gold-loss path: KL on common (exact-mapped) vocab + L1 on uncommon.
-
-        Ports PT ``compute_KL_loss_optimized`` lines 3494–3829.
 
         1. Lazy-build the exact-token map (cached per device).
         2. Use the full teacher logits materialized by ``prepare_loss_input``.

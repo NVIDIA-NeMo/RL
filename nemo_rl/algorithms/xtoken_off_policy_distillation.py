@@ -585,9 +585,9 @@ def xtoken_off_policy_distillation_train(
             )  # type: ignore
             # `metrics["loss"]` and the SUM-reduced terms (kl_loss, ce_loss
             # for the P-KL path) are SUM across all DP ranks AND microbatches
-            # (= dp_size * local_mbs values summed). PT logs rank-0
-            # per-microbatch raw, so for apples-to-apples we also print
-            # per-MB-mean. n_mb = len of the flat list of per-MB metrics.
+            # (= dp_size * local_mbs values summed). We also print the
+            # per-MB-mean for a per-microbatch-comparable signal.
+            # n_mb = len of the flat list of per-MB metrics.
             n_mb = max(len(train_results["all_mb_metrics"].get("loss", [])), 1)
             print(
                 f"  • Loss: {metrics['loss']:.4f} "

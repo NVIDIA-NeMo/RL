@@ -124,8 +124,7 @@ class Fp32SparseMM(torch.autograd.Function):
     are PyTorch's official escape: they force FP32 inputs on forward and
     run the backward as if autocast were disabled.
 
-    Math matches PT reference ``project_token_likelihoods_ultra_fast``:
-    autograd's builtin sparse-mm backward computes the same
+    autograd's builtin sparse-mm backward computes
     ``M @ grad_out``. The gradient w.r.t. the sparse argument isn't
     needed (the projection matrix is frozen), so it's returned as ``None``.
     """
@@ -154,8 +153,7 @@ def chunk_average_log_probs(
 
     Builds a one-hot chunk mask from ``chunk_id`` (``-1`` means "no
     chunk", contributes to no bucket), then ``bmm``-aggregates and
-    divides by chunk sizes. Both inputs and outputs match PT's
-    chunk-averaging math at ``tokenalign.py:3617–3637``.
+    divides by chunk sizes.
 
     Args:
         log_probs: ``[B, T, V]`` log-probabilities.
@@ -329,8 +327,7 @@ def get_sparse_projection_matrix(
     # sentinel for student rows that have fewer than top_k teacher
     # mappings. A negative column index is illegal in a sparse tensor
     # and causes CUDA illegal-memory-access in sparse.mm (forward and
-    # backward). PT's tokenalign clamps to col 0 and zeros the value;
-    # we drop those entries entirely.
+    # backward). We drop those entries entirely.
     keep = indices[1] >= 0
     indices = indices[:, keep]
     values = values[keep]
@@ -425,19 +422,16 @@ def build_exact_token_map(
 ) -> Dict[str, torch.Tensor]:
     """Build the common/uncommon vocab partition for the gold path (cached).
 
-    Ports PT ``compute_KL_loss_optimized`` lines 3493–3594. Reads the
-    dense projection arrays via :func:`get_topk_projection`, sorts each
+    Reads the dense projection arrays via :func:`get_topk_projection`, sorts each
     student row's projection weights descending, then picks an exact-token
     map per the ``xtoken_loss`` flag:
 
     - ``xtoken_loss=False`` (strict): ``has_exact_map = (sorted_values[:, 0] == 1.0) & (projection_indices[:, 1] == -1)``.
       On collision (multiple students mapping to the same teacher id),
-      the earliest (lowest) student index wins — matches PT's
-      first-come-first-served loop.
+      the earliest (lowest) student index wins.
     - ``xtoken_loss=True`` (relaxed): ``has_exact_map = sorted_values[:, 0] >= 0.6``.
       On collision, the student with the highest first-projection
-      weight wins; ties are broken by lowest student index (matches
-      PT's ``prev_prob >= new_prob`` skip rule under iteration order).
+      weight wins; ties are broken by lowest student index.
 
     Both branches are vectorized via ``scatter_reduce`` so the build is
     O(V_s) and happens once per ``(path, device, xtoken_loss,
@@ -473,7 +467,7 @@ def build_exact_token_map(
         # Strict: exactly one top-k entry with weight 1.0, no second
         # mapping. `indices[:, 1] == -1` is the sentinel used by the
         # `_exact_map_remapped` projection files for "no second
-        # mapping" — matches the PT check at tokenalign.py:3517.
+        # mapping".
         has_exact_map = (sorted_values[:, 0] == 1.0) & (indices[:, 1] == -1)
 
     # Gather (s_idx, t_idx, prob) for each exact-map candidate.

@@ -24,13 +24,12 @@ loss_fn:
   #     transported via IPC; the loss derives a microbatch-global top-k
   #     (size `vocab_topk`) inside, projects student to teacher vocab via
   #     M, and chunk-averages KL on the [k] subset. CE term is added.
-  #   gold_loss=true, xtoken_loss=false  -> gold-loss (PT-faithful):
+  #   gold_loss=true, xtoken_loss=false  -> gold-loss:
   #     KL on the exact-mapped common vocab (top-1 weight == 1.0) + L1
   #     on the uncommon vocab tail (sorted, capped at `uncommon_topk`).
   #   gold_loss=true, xtoken_loss=true   -> relaxed gold: same partition
   #     math but exact-map threshold is >= 0.6 and collisions are resolved
-  #     by keeping the higher-weight student. Matches the PT canonical CT
-  #     run.
+  #     by keeping the higher-weight student.
   # `xtoken_loss=true` requires `gold_loss=true`.
   gold_loss: false
   xtoken_loss: false
@@ -38,7 +37,6 @@ loss_fn:
   vocab_topk: 8192            # P-KL only; size of the microbatch-global
                               # top-k derived inside the loss
   uncommon_topk: 8192         # gold-loss only; caps the L1 uncommon tail
-                              # (matches PT default at tokenalign.py:3727)
   reverse_kl: false
   exact_token_match_only: false
   kl_loss_weight: 1.0         # P-KL only

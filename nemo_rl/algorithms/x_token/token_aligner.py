@@ -13,10 +13,9 @@
 # limitations under the License.
 """Cross-tokenizer token alignment.
 
-Ports the alignment algorithm from the PyTorch tokenalign reference
-(``train_distillation_ddp.py`` companion ``tokenalign.py``). The DP kernel,
-canonicalization helpers, anchor optimization, and post-processing are kept
-faithful so loss-side parity with that reference is preserved. Anything
+The DP kernel, canonicalization helpers, anchor optimization, and
+post-processing implement the cross-tokenizer alignment consumed by the
+loss. Anything
 unrelated to running cross-tokenizer alignment for off-policy distillation
 (rule tracking, learnable projection, MSE loss, multiple compute_loss
 variants, accuracy, translation) is dropped.
@@ -41,8 +40,8 @@ import numpy as np
 import torch
 
 # Visual byte representations used by some BPE tokenizers (especially for
-# emojis / non-ASCII bytes). Copied from the PT reference verbatim — these
-# constants are content-coupled to the tokenizers we align across.
+# emojis / non-ASCII bytes). These constants are content-coupled to the
+# tokenizers we align across.
 VISUAL_BYTE_MAP = {
     "ð": 240,
     "Ɩ": 241,
@@ -102,7 +101,7 @@ VISUAL_BYTE_MAP = {
 
 # Multi-token encoding artifacts (mojibake patterns) where the broken byte
 # sequence spans tokens. Patterns are checked left-to-right with the first
-# match wins. From PT reference; trimmed to the high-frequency entries.
+# match wins. Trimmed to the high-frequency entries.
 _MULTI_TOKEN_ARTIFACT_FIXES = [
     (["ĠâĪ", "ĳ"], ["Ġ∑"]),
     (["âĪ", "ĳ"], ["∑"]),
@@ -857,7 +856,7 @@ class TokenAligner:
     ) -> List[AlignmentPair]:
         """Post-process: combine misaligned consecutive pairs and re-align bad spans.
 
-        Mirrors ``post_process_alignment_optimized`` from the PT reference.
+        Combines misaligned consecutive pairs and re-aligns bad spans.
         """
         if not aligned_pairs:
             return []
