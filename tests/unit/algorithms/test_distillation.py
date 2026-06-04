@@ -162,6 +162,11 @@ def mock_components():
             "data": {
                 "dataset_name": "test_dataset",
             },
+            "env": {
+                "math": {
+                    "num_workers": 1,
+                },
+            },
             "logger": {
                 "num_val_samples_to_print": 5,
             },
