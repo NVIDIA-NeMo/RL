@@ -1183,8 +1183,19 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 "threshold and adds collision resolution) and is undefined "
                 "in the P-KL path."
             )
-        self.cfg = cfg
         self.projection_matrix_path = cfg["projection_matrix_path"]
+        self.gold_loss = cfg["gold_loss"]
+        self.xtoken_loss = cfg["xtoken_loss"]
+        self.temperature = cfg["temperature"]
+        self.vocab_topk = cfg["vocab_topk"]
+        self.uncommon_topk = cfg["uncommon_topk"]
+        self.reverse_kl = cfg["reverse_kl"]
+        self.exact_token_match_only = cfg["exact_token_match_only"]
+        self.kl_loss_weight = cfg["kl_loss_weight"]
+        self.ce_loss_scale = cfg["ce_loss_scale"]
+        self.dynamic_loss_scaling = cfg["dynamic_loss_scaling"]
+        self.student_vocab_size = cfg["student_vocab_size"]
+        self.teacher_vocab_size = cfg["teacher_vocab_size"]
         # The materialized projection matrix and the derived exact-map
         # partition both live in process-local caches in
         # ``x_token.loss_utils`` (see ``get_sparse_projection_matrix``,
@@ -1225,9 +1236,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         teacher_full_logits: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute the cross-tokenizer distillation loss for one microbatch."""
-        cfg = self.cfg
-
-        if cfg["gold_loss"]:
+        if self.gold_loss:
             loss, kl_common, l1_uncommon, num_valid_chunks, top1_acc = (
                 self._compute_gold(logits, data, teacher_full_logits)
             )
@@ -1261,7 +1270,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 (student_argmax == shift_labels).float() * acc_mask
             ).sum() / denom
 
-        if cfg["dynamic_loss_scaling"]:
+        if self.dynamic_loss_scaling:
             # Dynamic loss scaling:
             #   dls_scale = ce_loss.item() / kl_loss.item()
             #   loss = kl_loss * dls_scale + ce_loss
@@ -1277,7 +1286,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             loss = kl_scale * kl_loss + ce_loss
         else:
             kl_scale = torch.tensor(1.0, device=kl_loss.device, dtype=kl_loss.dtype)
-            loss = cfg["kl_loss_weight"] * kl_loss + cfg["ce_loss_scale"] * ce_loss
+            loss = self.kl_loss_weight * kl_loss + self.ce_loss_scale * ce_loss
 
         metrics = {
             "loss": loss.item(),
@@ -1318,8 +1327,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
            (avg-then-renormalize, log).
         7. Forward (or reverse) KL between chunk distributions.
         """
-        cfg = self.cfg
-        T = cfg["temperature"]
+        T = self.temperature
         device = logits.device
         eps = 1e-10
 
@@ -1335,8 +1343,8 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         M = get_sparse_projection_matrix(
             self.projection_matrix_path,
             device,
-            student_vocab_size=self.cfg["student_vocab_size"],
-            teacher_vocab_size=self.cfg["teacher_vocab_size"],
+            student_vocab_size=self.student_vocab_size,
+            teacher_vocab_size=self.teacher_vocab_size,
         )  # [V_s, V_t] sparse COO, fp32
         flat = student_probs.reshape(b * t_s, v_s)
         # Fp32SparseMM internally computes M.t() @ dense; passing M (not
@@ -1352,7 +1360,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         # HF models commonly pad lm_head out_features beyond len(tokenizer)
         # for embedding/FFN alignment (e.g. Qwen3: tokenizer 151669,
         # lm_head 151936). The projection matrix is sized to the real
-        # tokenizer vocab (`cfg["teacher_vocab_size"]`); the padded
+        # tokenizer vocab (`self.teacher_vocab_size`); the padded
         # columns aren't real tokens and the projection has no entries
         # there. Slice to the projection's V_t to keep the projected
         # student probs and the teacher logits on the same vocab axis.
@@ -1360,7 +1368,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             teacher_full_logits = teacher_full_logits[..., :v_t]
 
         # global_top_indices: max over flat (B*T_t) → [V_t] → topk → [k].
-        vocab_topk = min(cfg["vocab_topk"], v_t)
+        vocab_topk = min(self.vocab_topk, v_t)
         with torch.no_grad():
             teacher_flat = teacher_full_logits.view(-1, v_t)
             global_importance = teacher_flat.max(dim=0).values
@@ -1383,7 +1391,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         student_chunk_id = alignment.student_chunk_id  # [B, T_s] long
         teacher_chunk_id = alignment.teacher_chunk_id  # [B, T_t] long
         pair_valid = alignment.pair_valid  # [B, max_pairs]
-        if cfg["exact_token_match_only"]:
+        if self.exact_token_match_only:
             pair_valid = pair_valid & alignment.pair_is_correct
         max_chunks = pair_valid.shape[1]
         proj_chunks, proj_sizes = chunk_average_log_probs(
@@ -1430,7 +1438,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             )
 
         # KL between chunk-averaged distributions.
-        if cfg["reverse_kl"]:
+        if self.reverse_kl:
             # KL(student || teacher)
             per_chunk_kl = torch.nn.functional.kl_div(
                 tgt_log_chunks, proj_log_chunks, reduction="none", log_target=True
@@ -1465,7 +1473,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
            geometric chunk mask AND'd with ``sample_mask`` (mirrors the
            P-KL path).
         5. Slice to ``uncommon_*`` indices, ``.exp()`` to probs, sort/topk
-           descending (capped at ``cfg['uncommon_topk']``), truncate to
+           descending (capped at ``self.uncommon_topk``), truncate to
            ``min(student_len, teacher_len)``, L1 with ``reduction="none"``
            summed over vocab and meaned across valid chunks.
         6. Combine: ``loss = (kl_common + l1_uncommon) * T**2``.
@@ -1474,21 +1482,20 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         Returns ``(loss, kl_common, l1_uncommon, num_valid_chunks, top1_acc)``.
         Components other than ``loss`` are detached.
         """
-        cfg = self.cfg
-        T = cfg["temperature"]
+        T = self.temperature
         device = logits.device
 
         exact_map = build_exact_token_map(
             self.projection_matrix_path,
             device,
-            xtoken_loss=self.cfg["xtoken_loss"],
-            teacher_vocab_size=self.cfg["teacher_vocab_size"],
+            xtoken_loss=self.xtoken_loss,
+            teacher_vocab_size=self.teacher_vocab_size,
         )
         common_s = exact_map["common_student"]
         common_t = exact_map["common_teacher"]
         uncommon_s = exact_map["uncommon_student"]
         uncommon_t = exact_map["uncommon_teacher"]
-        v_teacher = self.cfg["teacher_vocab_size"]
+        v_teacher = self.teacher_vocab_size
 
         # `teacher_full_logits` [B, T_t, V_t_model] is materialized by
         # `prepare_loss_input` (rebuilt from the IPC handles).
@@ -1545,7 +1552,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         if common_s.numel() > 0:
             student_common = student_chunks[:, :, common_s]  # [B, C, N_common]
             teacher_common = teacher_chunks[:, :, common_t]  # [B, C, N_common]
-            if cfg["reverse_kl"]:
+            if self.reverse_kl:
                 kl_per_elem = torch.nn.functional.kl_div(
                     teacher_common,
                     student_common,
@@ -1571,7 +1578,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             teacher_common = None
 
         # -------------------- L1 on uncommon ----------------------
-        uncommon_topk = cfg["uncommon_topk"]
+        uncommon_topk = self.uncommon_topk
         if uncommon_s.numel() > 0 or uncommon_t.numel() > 0:
             student_unc = student_chunks[:, :, uncommon_s][
                 valid_chunk
