@@ -2971,13 +2971,21 @@ def async_grpo_train(
                 print("▶ Training policy...")
                 with timer.time("policy_training"):
                     if SKIP_TRAINING_BENCHMARK:
-                        # No-op training: skip fwd/bwd/optimizer entirely. Return the
-                        # minimal metrics the downstream logging consumes. Weights are
-                        # left unchanged and refit as-is below.
+                        # No-op training: skip fwd/bwd/optimizer entirely. Weights are
+                        # left unchanged and refit as-is below. Still supply the metrics
+                        # the async loop indexes downstream — notably global_valid_toks,
+                        # used for token-throughput accounting (grpo.py refs metrics[
+                        # "global_valid_toks"]). Mirror real train()'s all_mb_metrics shape
+                        # (lists, mean-aggregated downstream).
+                        _valid_toks = int(train_data["token_mask"].sum().item())
+                        _valid_seqs = int(train_data["sample_mask"].sum().item())
                         train_results = {
                             "loss": torch.tensor(0.0),
                             "grad_norm": torch.tensor(0.0),
-                            "all_mb_metrics": {},
+                            "all_mb_metrics": {
+                                "global_valid_toks": [_valid_toks],
+                                "global_valid_seqs": [_valid_seqs],
+                            },
                         }
                     else:
                         train_results = policy.train(
