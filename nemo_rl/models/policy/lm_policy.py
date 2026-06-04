@@ -951,7 +951,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         return futures
 
     def prepare_nccl_reshard_refit_info(
-        self, train_parallelism, gen_parallelism, train_world_size, gen_world_size
+        self,
+        train_parallelism,
+        gen_parallelism,
+        train_world_size,
+        gen_world_size,
+        fuse_expert_param_in_metadata_fn=None,
     ):
         """Prepare per-layer param metadata for nccl_reshard refit."""
         futures = self.worker_group.run_all_workers_single_data(
@@ -960,6 +965,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             gen_parallelism=gen_parallelism,
             train_world_size=train_world_size,
             gen_world_size=gen_world_size,
+            fuse_expert_param_in_metadata_fn=fuse_expert_param_in_metadata_fn,
         )
         results = ray.get(futures)
         return results[0]

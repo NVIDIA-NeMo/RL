@@ -1412,9 +1412,19 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
 
     @torch.no_grad()
     def prepare_nccl_reshard_refit_info(
-        self, train_parallelism, gen_parallelism, train_world_size, gen_world_size
+        self,
+        train_parallelism,
+        gen_parallelism,
+        train_world_size,
+        gen_world_size,
+        fuse_expert_param_in_metadata_fn=None,
     ):
-        """Prepare per-layer parameter metadata for nccl_reshard-based refit."""
+        """Prepare per-layer parameter metadata for nccl_reshard-based refit.
+
+        ``fuse_expert_param_in_metadata_fn`` is supplied by the driver (which
+        queries the generation backend) and forwarded as-is — this train worker
+        stays agnostic to the gen backend's MoE-fusion layout.
+        """
         from nemo_rl.distributed.nccl_reshard_utils import build_nccl_reshard_refit_info
 
         # Ensure refit_param_info_mcore is computed (needed by _iter_params_with_optional_kv_scales)
@@ -1426,12 +1436,16 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         # producer/consumer agree on the packed-broadcast iteration.
         from nemo_rl.distributed.nccl_reshard_utils import is_misc_param
 
-        # If tp_size > num KV heads, Megatron splits KV weights within heads and
-        # all-gathers at runtime. In this case, we put QKV weights into misc_params
-        # to use packed_broadcast refit.
+        # Route QKV to the misc (packed_broadcast + load_weights) path whenever
+        # KV heads can't be cleanly 1/tp-sharded on EITHER side: Megatron channel-
+        # splits KV when train_tp > num_query_groups, and the gen backend
+        # replicates KV heads when gen_tp > num_query_groups.  Both layouts are
+        # the gen backend's to reproduce (via load_weights), so bulk xferdtensor
+        # only handles QKV when it shards cleanly on both sides.
         train_tp = train_parallelism.get("tp_size", 1)
-        qkv_to_misc = (
-            self.megatron_bridge.transformer_config.num_query_groups < train_tp
+        gen_tp = gen_parallelism.get("tp_size", 1)
+        qkv_to_misc = self.megatron_bridge.transformer_config.num_query_groups < max(
+            train_tp, gen_tp
         )
 
         state_dict_metadata = {}
@@ -1466,6 +1480,9 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             train_world_size,
             gen_world_size,
             layer_to_pp_stage=layer_to_pp_stage,
+            # Backend-specific MoE-expert fusion from the gen backend (via the
+            # driver); the builder applies it without knowing the gen backend.
+            fuse_expert_param_in_metadata_fn=fuse_expert_param_in_metadata_fn,
         )
 
         # _param_map is a Dict[hf_name:str] -> local_tensor:Torch.Tensor

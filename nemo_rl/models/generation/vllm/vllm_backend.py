@@ -521,36 +521,6 @@ class VllmInternalWorkerExtension:
 
         return mapping
 
-    def _compute_tp_local_slice(self, full_tensor, param_name, tp_rank, tp_size):
-        """Compute TP-local slice from a full global tensor for merged params.
-
-        Handles KV head replication: when num_kv_heads < tp_size, vLLM gives
-        each TP rank max(1, num_kv_heads // tp_size) KV heads instead of a
-        naive 1/tp_size shard of the global k/v tensor.
-        """
-        global_dim0 = full_tensor.shape[0]
-
-        if any(s in param_name for s in ("k_proj", "v_proj")):
-            hf_config = self.model_runner.model_config.hf_config
-            num_kv_heads = hf_config.num_key_value_heads
-            head_dim: int = hf_config.hidden_size // hf_config.num_attention_heads
-            if hasattr(hf_config, "head_dim"):
-                head_dim = hf_config.head_dim
-            if num_kv_heads >= tp_size:
-                num_kv_heads_per_tp: int = num_kv_heads // tp_size
-                start_head = tp_rank * num_kv_heads_per_tp
-            else:
-                num_kv_heads_per_tp = max(1, num_kv_heads // tp_size)
-                start_head = (tp_rank * num_kv_heads) // tp_size
-            start = start_head * head_dim
-            end = start + num_kv_heads_per_tp * head_dim
-            return full_tensor[start:end]
-        else:
-            # Standard column-parallel shard (q_proj, gate_proj, up_proj)
-            shard_size = global_dim0 // tp_size
-            start = tp_rank * shard_size
-            return full_tensor[start : start + shard_size]
-
     def get_dst_dtensor(self, param_name, param_info):
         """Get destination tensor info for xferdtensor.
 
@@ -560,8 +530,9 @@ class VllmInternalWorkerExtension:
         1. **Direct param**: HF name maps 1:1 to a vLLM parameter.
            Returns DTensorRef wrapping the vLLM param with global shape.
         2. **Merged param**: HF name is part of a merged vLLM tensor
-           (qkv_proj, gate_up_proj). Returns DTensorRef wrapping a full-size
-           buffer with all-Replicate placement, plus a post_refit_hook.
+           (qkv_proj, gate_up_proj, fused_qkv_a_proj). Returns DTensorRef
+           wrapping a buffer shaped like this component's slice of the merged
+           param, plus a post_refit_hook that copies it in.
         3. **Unmapped param**: No vLLM parameter (e.g., tied lm_head).
            Returns DTensorRef wrapping a dummy buffer for broadcast participation.
 
@@ -575,8 +546,6 @@ class VllmInternalWorkerExtension:
               (copies the TP-local slice from the temp buffer into the live
               vLLM merged param), or None for direct/unmapped params
         """
-        from torch.distributed.tensor.placement_types import Replicate
-
         from nemo_rl.distributed.nccl_reshard_utils import _STR_TO_DTYPE
         from nemo_rl.distributed.xferdtensor import DTensorRef
 
@@ -591,37 +560,26 @@ class VllmInternalWorkerExtension:
             return DTensorRef(buf, global_shape), dst_placements, None
 
         if merged_param_slice is not None:
-            # Merged param — receive full global tensor with all-Replicate
-            buf = torch.empty(global_shape, device=self.device, dtype=vllm_param.dtype)
-            all_replicate = [Replicate() for _ in dst_placements]
-            tp_rank = torch.distributed.get_rank()
-            tp_size = torch.distributed.get_world_size()
-            # When the merged vLLM param holds the full concat on every TP
-            # rank (e.g. MergedColumnParallelLinear with disable_tp=True), the
-            # slice into vllm_param covers the FULL global tensor — no TP
-            # local-slicing needed.
-            is_replicated_merge = (
-                merged_param_slice.stop - merged_param_slice.start == global_shape[0]
-            )
+            # Honor the dst placement decided at setup (refit_info) — identical
+            # for golden and the real op, so train and gen always agree on the
+            # redistribution (the real point-to-point op deadlocks on any
+            # disagreement).  Receive this component's slice of the merged vLLM
+            # param directly into a like-shaped buffer, then copy it in:
+            #   - Shard dst (clean column-parallel): the transfer delivers the
+            #     1/gen_tp shard, which is exactly this region.
+            #   - all-Replicate dst (disable_tp): the transfer delivers the full
+            #     tensor, which IS this region (the gen param is replicated, so
+            #     the slice spans the whole tensor).
+            # KV-head replication — where the region would be smaller than the
+            # received tensor — is routed to the misc/load_weights path instead
+            # (see qkv_to_misc), so it never reaches here.
+            region = vllm_param.data[merged_param_slice]
+            buf = torch.empty_like(region)
 
-            def post_refit_hook(
-                _buf=buf,
-                _name=param_name,
-                _vllm_param=vllm_param,
-                _slice=merged_param_slice,
-                _tp_rank=tp_rank,
-                _tp_size=tp_size,
-                _replicated=is_replicated_merge,
-            ):
-                if _replicated:
-                    local_data = _buf
-                else:
-                    local_data = self._compute_tp_local_slice(
-                        _buf, _name, _tp_rank, _tp_size
-                    )
-                _vllm_param.data[_slice].copy_(local_data)
+            def post_refit_hook(_buf=buf, _region=region):
+                _region.copy_(_buf)
 
-            return DTensorRef(buf, global_shape), all_replicate, post_refit_hook
+            return DTensorRef(buf, global_shape), dst_placements, post_refit_hook
 
         # Direct 1:1 mapping — xferdtensor handles TP sharding.
         # Use .data to avoid "leaf Variable that requires grad" error from

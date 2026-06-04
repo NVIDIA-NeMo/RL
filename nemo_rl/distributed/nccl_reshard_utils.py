@@ -28,7 +28,7 @@ live in ``nemo_rl/distributed/xferdtensor.py`` — import both from there.
 
 import re
 from collections import OrderedDict
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import torch
 from torch.distributed._tensor import Shard
@@ -363,10 +363,17 @@ _INDIVIDUAL_EXPERT_RE = re.compile(
 )
 
 
-def fuse_expert_params_in_metadata(
+def vllm_fuse_expert_params_in_metadata(
     state_dict_metadata: dict[str, dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
     """Fuse individual MoE expert params into combined w13/w2 entries.
+
+    vLLM-specific: the ``w13_weight`` / ``w2_weight`` fused names and the
+    gate+up concat layout are vLLM conventions.  This is passed into the
+    backend-agnostic ``build_nccl_reshard_refit_info`` as
+    ``fuse_expert_param_in_metadata_fn`` (a different gen backend would supply
+    its own fusion); the builder itself never hardcodes a backend's rule.
+
 
     Converts individual HF expert params (one per expert) into vLLM-style
     fused params (vLLM names them w13_weight / w2_weight; the metadata tags
@@ -626,6 +633,7 @@ def build_nccl_reshard_refit_info(
     train_world_size: int,
     gen_world_size: int,
     layer_to_pp_stage: Optional[dict[str, int]] = None,
+    fuse_expert_param_in_metadata_fn: Optional[Callable] = None,
 ) -> dict[str, Any]:
     """Build per-layer parameter info for nccl_reshard-based refit.
 
@@ -641,6 +649,11 @@ def build_nccl_reshard_refit_info(
         layer_to_pp_stage: optional mapping from layer name to PP stage index.
             When provided (PP>1), per-stage meshes are built so each PP stage's
             train ranks + all gen ranks form an independent sub-group.
+        fuse_expert_param_in_metadata_fn: optional backend-specific function that
+            fuses individual MoE expert params into the gen backend's combined
+            layout (e.g. ``vllm_fuse_expert_params_in_metadata`` → w13/w2).
+            ``None`` means no fusion.  Supplied by the caller so this builder
+            doesn't hardcode a backend's MoE naming/fusion rules.
 
     Returns:
         ``{"layer_names": [...], "per_layer_params": {layer: [param_info, ...]},
@@ -649,7 +662,11 @@ def build_nccl_reshard_refit_info(
     # state_dict_metadata is already pre-filtered to exclude misc params
     # (caller separates misc into a parallel dict for the
     # packed_broadcast-based misc refit path).
-    state_dict_metadata = fuse_expert_params_in_metadata(state_dict_metadata)
+    # Fuse MoE expert params via the caller-supplied, backend-specific function
+    # (e.g. vLLM's vllm_fuse_expert_params_in_metadata).  None → no fusion, so
+    # this builder stays agnostic to any gen backend's MoE layout.
+    if fuse_expert_param_in_metadata_fn is not None:
+        state_dict_metadata = fuse_expert_param_in_metadata_fn(state_dict_metadata)
 
     pp_size = train_parallelism.get("pp_size", 1)
     tp_size = train_parallelism.get("tp_size", 1)

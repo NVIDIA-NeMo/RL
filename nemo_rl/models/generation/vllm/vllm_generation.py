@@ -425,6 +425,21 @@ class VllmGeneration(GenerationInterface):
 
         return step_metrics
 
+    def expert_fusion_fn(self):
+        """Return the MoE-expert metadata-fusion function for this gen backend.
+
+        vLLM fuses per-expert HF params into ``w13_weight`` / ``w2_weight``; the
+        nccl_reshard refit-info builder is backend-agnostic and applies whatever
+        fusion function the gen backend supplies here.  The function itself is a
+        pure metadata transform (no vLLM import), so it is safely importable on
+        the train worker where the builder runs.
+        """
+        from nemo_rl.distributed.nccl_reshard_utils import (
+            vllm_fuse_expert_params_in_metadata,
+        )
+
+        return vllm_fuse_expert_params_in_metadata
+
     def init_collective(
         self, ip: str, port: int, world_size: int, *, train_world_size: int
     ) -> list[ray.ObjectRef]:
