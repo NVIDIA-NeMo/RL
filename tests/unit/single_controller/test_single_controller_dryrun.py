@@ -411,6 +411,24 @@ class DryRunAdvantageEstimator:
         return centered.unsqueeze(-1).expand(mask.shape)
 
 
+class DryRunRolloutManager:
+    """Dry-run mock of ``RolloutManager`` for SC dry-run tests.
+
+    Production ``RolloutManager`` is a plain (non-Ray) class living in the
+    SC actor's process; this mock matches that shape. Actual work (sleep +
+    push a fake sample to DataPlane + bump call counters) is delegated to a
+    ``DryRunGenWorker`` Ray actor so the test can inspect call counts,
+    timestamps, and weight_version from outside the SC actor.
+    """
+
+    def __init__(self, gen_actor: Any, dp_client: Any) -> None:
+        self._gen_actor = gen_actor
+        self._dp_client = dp_client
+
+    async def generate_and_push(self, prompt: str) -> None:
+        await self._gen_actor.generate_and_push.remote(prompt, self._dp_client)
+
+
 class DryRunWeightSynchronizer:
     """Stub WeightSynchronizer — just sleeps.
 
@@ -474,7 +492,6 @@ class TestSingleControllerDryRun:
         trainer,
         weight_sync=None,
         max_train_steps=3,
-        max_rollout_prompts=12,
         min_prompt_groups_per_batch=1,
         generations_per_prompt=1,
         max_buffered_rollouts=4,
@@ -486,7 +503,6 @@ class TestSingleControllerDryRun:
     ):
         cfg = SingleControllerConfig(
             max_train_steps=max_train_steps,
-            max_rollout_prompts=max_rollout_prompts,
             min_prompt_groups_per_batch=min_prompt_groups_per_batch,
             generations_per_prompt=generations_per_prompt,
             max_buffered_rollouts=max_buffered_rollouts,
@@ -495,17 +511,25 @@ class TestSingleControllerDryRun:
             advantage_enabled=advantage_enabled,
             diagnostics=diagnostics,
         )
+
+        # SC expects a StatefulDataLoader, but the pump only iterates it
+        # (`for prompt in self._dataloader`), so a list satisfies the contract.
+        dataloader = [f"prompt_{i}" for i in range(10)]
+
         if weight_sync is None:
             weight_sync = DryRunWeightSynchronizer(gen_handle=gen)
-        prompts = [f"prompt_{i}" for i in range(10)]
+        rollout_manager = DryRunRolloutManager(gen, dp_client)
+
         return SingleControllerActor.remote(
-            cfg,
-            prompts,
-            dp_client,
-            gen,
-            trainer,
-            weight_sync,
-            advantage_estimator,
+            cfg=cfg,
+            dp_client=dp_client,
+            gen_handle=gen,
+            env_handles={},
+            trainer_handle=trainer,
+            dataloader=dataloader,
+            weight_synchronizer=weight_sync,
+            advantage_estimator=advantage_estimator,
+            rollout_manager=rollout_manager,
         )
 
     def test_dry_run_completes(self, ray_init):
@@ -521,7 +545,6 @@ class TestSingleControllerDryRun:
             trainer,
             weight_sync,
             max_train_steps=3,
-            max_rollout_prompts=12,
             min_prompt_groups_per_batch=1,
             generations_per_prompt=1,
         )
@@ -545,7 +568,6 @@ class TestSingleControllerDryRun:
             gen,
             trainer,
             max_train_steps=1,
-            max_rollout_prompts=2,
             min_prompt_groups_per_batch=2,
             generations_per_prompt=1,
             advantage_enabled=True,
@@ -579,7 +601,6 @@ class TestSingleControllerDryRun:
             gen,
             trainer,
             max_train_steps=2,
-            max_rollout_prompts=10,
             min_prompt_groups_per_batch=1,
             generations_per_prompt=1,
             max_buffered_rollouts=6,
@@ -617,7 +638,6 @@ class TestSingleControllerDryRun:
             gen,
             trainer,
             max_train_steps=2,
-            max_rollout_prompts=8,
             min_prompt_groups_per_batch=1,
             generations_per_prompt=1,
             max_buffered_rollouts=2,  # small buffer — backpressure kicks in
@@ -654,7 +674,6 @@ class TestSingleControllerDryRun:
             trainer,
             weight_sync,
             max_train_steps=2,
-            max_rollout_prompts=8,
             min_prompt_groups_per_batch=1,
             generations_per_prompt=1,
         )
@@ -674,7 +693,6 @@ class TestSingleControllerDryRun:
             gen,
             trainer,
             max_train_steps=5,
-            max_rollout_prompts=20,
             min_prompt_groups_per_batch=1,
             generations_per_prompt=1,
         )
@@ -932,7 +950,6 @@ class TestStreamingTrainPump:
         prompts: list[str],
         weight_sync=None,
         max_train_steps=1,
-        max_rollout_prompts=4,
         min_prompt_groups_per_batch=1,
         target_prompt_groups_per_step=4,
         generations_per_prompt=1,
@@ -943,7 +960,6 @@ class TestStreamingTrainPump:
     ):
         cfg = SingleControllerConfig(
             max_train_steps=max_train_steps,
-            max_rollout_prompts=max_rollout_prompts,
             min_prompt_groups_per_batch=min_prompt_groups_per_batch,
             target_prompt_groups_per_step=target_prompt_groups_per_step,
             generations_per_prompt=generations_per_prompt,
@@ -952,16 +968,25 @@ class TestStreamingTrainPump:
             max_weight_staleness_versions=max_weight_staleness_versions,
             batch_selection_strategy=batch_selection_strategy,
         )
+
+        # SC expects a StatefulDataLoader, but the pump only iterates it
+        # (`for prompt in self._dataloader`), so a list satisfies the contract.
+        dataloader = prompts
+
         if weight_sync is None:
             weight_sync = DryRunWeightSynchronizer(gen_handle=gen)
+        rollout_manager = DryRunRolloutManager(gen, dp_client)
+
         return SingleControllerActor.remote(
-            cfg,
-            prompts if prompts else ["unused"],
-            dp_client,
-            gen,
-            trainer,
-            weight_sync,
-            None,
+            cfg=cfg,
+            dp_client=dp_client,
+            gen_handle=gen,
+            env_handles={},
+            trainer_handle=trainer,
+            dataloader=dataloader,
+            weight_synchronizer=weight_sync,
+            rollout_manager=rollout_manager,
+            advantage_estimator=None,
         )
 
     def test_streaming_dispatches_in_arrival_order(self, ray_init):
@@ -978,7 +1003,6 @@ class TestStreamingTrainPump:
             trainer,
             prompts=prompts,
             max_train_steps=1,
-            max_rollout_prompts=3,
             target_prompt_groups_per_step=3,
             min_prompt_groups_per_batch=1,
         )
@@ -1004,7 +1028,6 @@ class TestStreamingTrainPump:
             trainer,
             prompts=prompts,
             max_train_steps=1,
-            max_rollout_prompts=4,
             target_prompt_groups_per_step=4,
             min_prompt_groups_per_batch=1,
         )
@@ -1051,7 +1074,6 @@ class TestStreamingTrainPump:
             trainer,
             prompts=prompts,
             max_train_steps=1,
-            max_rollout_prompts=2,
             target_prompt_groups_per_step=2,
             min_prompt_groups_per_batch=1,
             batch_selection_strategy="strict_on_policy",
@@ -1080,7 +1102,6 @@ class TestStreamingTrainPump:
             trainer,
             prompts=prompts,
             max_train_steps=1,
-            max_rollout_prompts=5,
             target_prompt_groups_per_step=5,
             min_prompt_groups_per_batch=1,
         )
@@ -1131,7 +1152,6 @@ class TestStreamingTrainPump:
             trainer,
             prompts=["0:0.01"],
             max_train_steps=1,
-            max_rollout_prompts=0,
             target_prompt_groups_per_step=2,
             min_prompt_groups_per_batch=1,
         )
@@ -1152,7 +1172,6 @@ class TestStreamingTrainPump:
             trainer,
             prompts=prompts,
             max_train_steps=1,
-            max_rollout_prompts=3,
             target_prompt_groups_per_step=3,
             min_prompt_groups_per_batch=1,
         )

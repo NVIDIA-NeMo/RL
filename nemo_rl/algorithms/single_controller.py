@@ -25,8 +25,8 @@ columns, computes advantages, and writes that small derived column back to
 DataPlane. Model tensors still move through DataPlane or NCCL.
 
 Data flow:
-  _rollout_pump  → gen.generate_and_push(prompt, dp_client) ← RPC to GenWorker
-                     GenWorker → dp_client.put_samples(...)
+  _rollout_pump  → rollout_manager.generate_and_push(prompt)
+                     RolloutManager runs run_rollout locally then dp_client.put_samples(...)
   _train_pump    → dp_client.claim_meta(...) → StalenessSampler
                  → _advantage_pump(meta) → dp_client.get_samples(...)
                                         → adv_estimator.compute_advantage(...)
@@ -48,13 +48,17 @@ from typing import Any, Literal, Optional
 import ray
 import torch
 from tensordict import TensorDict
+from torchdata.stateful_dataloader import StatefulDataLoader
 
 from nemo_rl.algorithms.staleness_sampler import (
     StalenessSampler,
     count_prompt_groups,
     min_weight_version,
 )
+from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.experience.rollout_manager import RolloutManager
 
 log = logging.getLogger(__name__)
 
@@ -79,7 +83,6 @@ class SingleControllerConfig:
 
     # Training
     max_train_steps: int = 10
-    max_rollout_prompts: int = 32
 
     # DataPlane partition
     partition_id: str = "rollout_data"
@@ -106,6 +109,11 @@ class SingleControllerConfig:
     weight_nccl_addr: str = "127.0.0.1"
     weight_nccl_port: Optional[int] = None
 
+    # Rollout config. Read only when SC builds RolloutManager itself.
+    rollout_max_seq_len: int = 1024
+    rollout_max_turns: Optional[int] = None
+    use_nemo_gym: bool = False
+
     # Extra fields passed through to avoid TypedDict issues
     extra: dict = field(default_factory=dict)
 
@@ -125,12 +133,17 @@ class SingleControllerActor:
     def __init__(
         self,
         cfg: SingleControllerConfig,
-        prompts: list[str],
-        dp_client_handle: Any,
+        dp_client: Any,
         gen_handle: Any,
         trainer_handle: Any,
+        env_handles: dict[str, EnvironmentInterface],
+        # TODO: move into SC's setup phase
+        dataloader: StatefulDataLoader,
         weight_synchronizer: Any,
         advantage_estimator: Any | None = None,
+        tokenizer: Any | None = None,
+        # TODO: remove later, keep here for dry run test
+        rollout_manager: RolloutManager | None = None,
     ) -> None:
         import logging as _logging
 
@@ -140,10 +153,10 @@ class SingleControllerActor:
         )
 
         self._cfg = cfg
-        self._prompts = prompts
-        self._dp_client = dp_client_handle
+        self._dp_client = dp_client
         self._gen = gen_handle
         self._trainer = trainer_handle
+        self._dataloader = dataloader
         self._weight_synchronizer = weight_synchronizer
         self._advantage_estimator = advantage_estimator
 
@@ -151,6 +164,21 @@ class SingleControllerActor:
             raise ValueError(
                 "advantage_enabled=True requires an advantage_estimator instance"
             )
+
+        if rollout_manager is None:
+            self._rollout_manager = RolloutManager(
+                tokenizer=tokenizer,
+                env_handles=env_handles,
+                num_generations_per_prompt=cfg.generations_per_prompt,
+                max_seq_len=cfg.rollout_max_seq_len,
+                max_rollout_turns=cfg.rollout_max_turns,
+                use_nemo_gym=cfg.use_nemo_gym,
+                policy_generation=gen_handle,
+                dp_client=dp_client,
+                partition_id=cfg.partition_id,
+            )
+        else:
+            self._rollout_manager = rollout_manager
 
         # Initialize sampler
         assert cfg.batch_selection_strategy in [
@@ -273,47 +301,46 @@ class SingleControllerActor:
     # ── the four pumps (three main pumps + advantage pump) ─────────────────
 
     async def _rollout_pump(self) -> None:
-        """Dispatch prompts as concurrent coroutines, one per prompt group.
+        """Continuously dispatch rollout tasks until cancellation.
 
         Flow per prompt:
           1. Acquire _buffer_capacity slot (backpressure)
-          2. Wait for _rollout_permitted (paused during weight sync)
-          3. Call gen.generate_and_push(prompt, dp_client) — RPC to GenWorker
-             GenWorker generates and calls DataPlane put_samples directly
-          4. Decrement _inflight_rollouts
+          2. Acquire sem (cap concurrent in-flight rollouts)
+          3. Wait for _rollout_permitted (paused during weight sync)
+          4. Call rollout_manager.generate_and_push(prompt) — local async
+             RolloutManager runs rollout and calls DataPlane put_samples directly
+          5. Decrement _inflight_rollouts
         """
-        n = self._cfg.max_rollout_prompts
         sem = asyncio.Semaphore(self._cfg.max_inflight_prompts)
+        log.info("rollout_pump: starting")
 
-        start = time.monotonic()
-        log.info("rollout_pump: dispatching %d prompts", n)
+        async def _dispatch_one_prompt(prompt: DatumSpec) -> None:
+            self._inflight_rollouts += 1
+            try:
+                await self._rollout_manager.generate_and_push(prompt)
+                if self._cfg.diagnostics:
+                    content = ""
+                    for i in range(len(prompt["message_log"])):
+                        if prompt["message_log"][i]["role"] == "user":
+                            content = prompt["message_log"][i]["content"]
+                            break
+                    log.info("  rollout done for prompt='%s...'", content[:20])
+            finally:
+                self._inflight_rollouts -= 1
+                sem.release()
 
-        async def _one_group(prompt: str) -> None:
-            await self._buffer_capacity.acquire()
-            await self._rollout_permitted.wait()
-            async with sem:
-                self._inflight_rollouts += 1
-                try:
-                    await self._ray_get(
-                        self._gen.generate_and_push.remote(prompt, self._dp_client)
-                    )
-                    if self._cfg.diagnostics:
-                        log.info("  rollout done for prompt='%s...'", prompt[:20])
-                finally:
-                    self._inflight_rollouts -= 1
+        # TODO: add max_num_epochs and limit max_train_steps to max_num_epochs * len(dataloader) when setup
+        while True:
+            for prompt in self._dataloader:
+                # check if buffer is full
+                await self._buffer_capacity.acquire()
+                # check if inflight rollouts is full
+                await sem.acquire()
+                # wait for rollout to be permitted
+                await self._rollout_permitted.wait()
 
-        tasks = [
-            asyncio.ensure_future(_one_group(self._prompts[i % len(self._prompts)]))
-            for i in range(n)
-        ]
-        await asyncio.gather(*tasks)
-
-        self._rollout_done = True
-        log.info(
-            "rollout_pump: finished %d prompts in %.2fs",
-            n,
-            time.monotonic() - start,
-        )
+                # dispatch rollout
+                asyncio.create_task(_dispatch_one_prompt(prompt))
 
     async def _train_pump(self) -> None:
         """Per-prompt-group streaming train loop.
