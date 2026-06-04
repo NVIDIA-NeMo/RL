@@ -24,8 +24,25 @@ The 7-argument signature of ``xferdtensor_golden`` matches the real
 ``nccl_reshard.XferDTensor`` API so it can be swapped in trivially later.
 """
 
+import logging
+import os
+
 import torch
 from torch.distributed._tensor import Shard
+
+try:
+    from nccl.xfer.api import XdtensorRedistribute as _XdtensorRedistribute
+except ImportError:
+    # Golden-only containers (e.g. nemo_rl.v0.6.0 without the nccl4py xfer
+    # integration) don't ship the real reshard op; xferdtensor() then falls
+    # back to the broadcast-based golden implementation below.
+    _XdtensorRedistribute = None
+    logging.warning(
+        "XdtensorRedistribute not found, falling back to golden implementation"
+    )
+
+# Log the selected reshard path once per process (real op vs golden fallback).
+_XFERDTENSOR_PATH_LOGGED = False
 
 
 class DTensorRef:
@@ -67,6 +84,41 @@ class DTensorRef:
 # ===========================================================
 
 
+def _use_golden_api() -> bool:
+    """Whether ``NRL_XFERDTENSOR_GOLDEN`` forces the golden reshard path.
+
+    Set ``NRL_XFERDTENSOR_GOLDEN=1`` to force golden — e.g. to A/B against the
+    real op, or for a config the real op doesn't yet support.  When the real op
+    is simply absent (golden-only container) xferdtensor() also falls back to
+    golden automatically.
+    """
+    return os.environ.get("NRL_XFERDTENSOR_GOLDEN", "").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _to_xfer_mesh(mesh):
+    """Build an ``nccl.xfer.mesh.Mesh`` from a MeshInfo/DeviceMesh rank grid.
+
+    ``Mesh.from_ranks`` derives the 2-D mesh dims from the grid shape (a 1-D
+    grid maps to dims ``(N, 1)`` like PyTorch) and validates the row-major
+    contiguous rank interval ``ncclXferMesh_t`` requires.  Passing the grid
+    (not a flattened list) preserves the 2-D (e.g. DP x TP) structure the
+    placements index into.
+    """
+    from nccl.xfer.mesh import Mesh
+
+    rank_tensor = getattr(mesh, "mesh", None)
+    if rank_tensor is None:
+        rank_tensor = getattr(mesh, "_mesh", None)
+    if rank_tensor is None:
+        raise ValueError("mesh does not expose its rank tensor (.mesh/._mesh)")
+    return Mesh.from_ranks(rank_tensor)
+
+
 def xferdtensor(
     src_tensor,
     src_mesh,
@@ -78,20 +130,55 @@ def xferdtensor(
 ):
     """Public XferDTensor entry point used by all external callers.
 
-    For now this just forwards to the broadcast-based reference
-    implementation (``xferdtensor_golden``).  Once the real low-level
-    NCCL-XferReshard API is available, replace the body here to call into
-    it instead — external callers will pick it up automatically without
-    any further changes.
+    Calls the real ``nccl.xfer`` reshard op (``XdtensorRedistribute``) when it
+    is available and not overridden by ``NRL_XFERDTENSOR_GOLDEN``; otherwise
+    forwards to the broadcast-based golden reference.  External callers are
+    unchanged either way.
+
+    Each rank holds only ONE side (train ranks own the src shard, gen ranks the
+    dst shard), so ``src_tensor`` or ``dst_tensor`` is ``None`` on every rank;
+    the real op accepts a one-sided ``None`` and derives the absent side's local
+    shape from the present side's global shape + mesh/placements.  PyTorch
+    Shard/Replicate placements are passed through directly.
     """
-    return xferdtensor_golden(
-        src_tensor,
-        src_mesh,
-        src_placement,
-        dst_tensor,
-        dst_mesh,
-        dst_placement,
-        process_group,
+    global _XFERDTENSOR_PATH_LOGGED
+    use_golden = _use_golden_api() or _XdtensorRedistribute is None
+    if not _XFERDTENSOR_PATH_LOGGED:
+        path = (
+            "golden (broadcast)"
+            if use_golden
+            else "real nccl.xfer XdtensorRedistribute"
+        )
+        print(
+            f"[xferdtensor] reshard path: {path} "
+            f"(real_op_available={_XdtensorRedistribute is not None}, "
+            f"force_golden={_use_golden_api()})",
+            flush=True,
+        )
+        _XFERDTENSOR_PATH_LOGGED = True
+
+    if use_golden:
+        return xferdtensor_golden(
+            src_tensor,
+            src_mesh,
+            src_placement,
+            dst_tensor,
+            dst_mesh,
+            dst_placement,
+            process_group,
+        )
+
+    src_local = src_tensor._local_tensor if src_tensor is not None else None
+    dst_local = dst_tensor._local_tensor if dst_tensor is not None else None
+
+    _XdtensorRedistribute(
+        src_local,
+        dst_local,
+        process_group.nccl_communicator,
+        src_mesh=_to_xfer_mesh(src_mesh),
+        src_placements=src_placement,
+        dst_mesh=_to_xfer_mesh(dst_mesh),
+        dst_placements=dst_placement,
     )
 
 
