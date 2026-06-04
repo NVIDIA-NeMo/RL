@@ -168,6 +168,11 @@ def get_cpu_state_dict(
 class DTensorPolicyWorkerImpl(
     TQWorkerMixin, AbstractPolicyWorker, ColocatablePolicyInterface
 ):
+    # Holds split-API train-step state between begin/finish or begin/abort;
+    # None when no step is open. Declared at class level so the ``= None``
+    # writes in finish/abort type-check.
+    _train_step_state: Optional[dict[str, Any]] = None
+
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
 
@@ -972,6 +977,475 @@ class DTensorPolicyWorkerImpl(
             }
 
             return metrics
+
+    # ── split-API train-step state machine (SingleController async path) ──
+    #
+    # ``train()`` above is the sync full-step path: it computes
+    # ``global_valid_seqs/toks`` up-front, then runs the microbatch loop,
+    # then steps the optimizer. SC drives an async path where microbatches
+    # arrive one at a time, before the logical batch is complete — so we
+    # cannot all_reduce the global counts at the top.
+    #
+    # Trick: ``masked_mean(values, mask, N) = sum(values*mask) / (N+ε)`` is
+    # linear in 1/N. If every microbatch's forward passes ``N=tensor(1.0)``
+    # for both ``global_valid_seqs`` and ``global_valid_toks``, the per-mb
+    # backward deposits raw ``d(sum)/dθ`` (un-normalized) into ``.grad``.
+    # PyTorch accumulates these across microbatches naturally. At finish,
+    # we all_reduce the local mask sums to get the true N, then rescale
+    # every ``p.grad`` by ``1/N`` (a single scalar — see HANDOFF.md /
+    # discussion notes). Crucially, the rescale is loss-type-agnostic:
+    # whatever constant the loss-fn multiplies into the normalizer
+    # internally (``N``, ``N/2``, …) cancels out of the final grad
+    # because we passed ``1`` and divide by the true ``N``.
+    #
+    # State lives on ``self._train_step_state`` (None when no step open).
+
+    def _split_step_state_init(
+        self,
+        step_id: str,
+        loss_fn: LossFunction,
+        gbs: Optional[int],
+        mbs: Optional[int],
+    ) -> dict[str, Any]:
+        return {
+            "step_id": step_id,
+            "loss_fn": loss_fn,
+            "gbs": gbs or self.cfg["train_global_batch_size"],
+            "mbs": mbs or self.cfg["train_micro_batch_size"],
+            "local_valid_seqs": torch.zeros((), dtype=torch.float64, device="cuda"),
+            "local_valid_toks": torch.zeros((), dtype=torch.float64, device="cuda"),
+            "mb_losses": [],
+            "all_mb_metrics": [],
+            "num_microbatches": 0,
+        }
+
+    def _assert_step_open(self, step_id: str) -> dict[str, Any]:
+        state = getattr(self, "_train_step_state", None)
+        if state is None:
+            raise RuntimeError(
+                f"no train step open; begin_train_step({step_id!r}) must be called first"
+            )
+        if state["step_id"] != step_id:
+            raise RuntimeError(
+                f"step_id mismatch: open step is {state['step_id']!r}, got {step_id!r}"
+            )
+        return state
+
+    @wrap_with_nvtx_name("dtensor_policy_worker/begin_train_step")
+    def begin_train_step(
+        self,
+        step_id: str,
+        loss_fn: LossFunction,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+    ) -> None:
+        existing = getattr(self, "_train_step_state", None)
+        if existing is not None:
+            raise RuntimeError(
+                f"train step {existing['step_id']!r} is already open; "
+                f"call finish_train_step or abort_train_step before begin"
+            )
+        self.model.train()
+        self.optimizer.zero_grad()
+        self._train_step_state = self._split_step_state_init(
+            step_id=step_id, loss_fn=loss_fn, gbs=gbs, mbs=mbs
+        )
+
+    @wrap_with_nvtx_name("dtensor_policy_worker/train_microbatch")
+    def train_microbatch(
+        self,
+        step_id: str,
+        data: BatchedDataDict[Any],
+    ) -> dict[str, Any]:
+        """Run forward+backward over every bin in ``data`` under the open step.
+
+        ``data`` is one prompt-group's worth of post-fetch BatchedDataDict.
+        Under seq-packing or dynamic batching it may decompose into multiple
+        bins; we iterate and forward+backward each. Gradients accumulate
+        across bins and across calls until ``finish_train_step`` does the
+        single 1/N rescale.
+
+        DP rank bin-count synchronization: under seq-packing, packing
+        density varies per rank, so DP ranks can end up with different bin
+        counts. We all_reduce the per-rank count to MAX and pad with
+        dummy bins (loss zeroed before backward) on under-counted ranks —
+        mirrors the sync ``train()`` pattern. Without padding, NCCL
+        collectives inside a microbatch's forward desync across DP ranks.
+        """
+        state = self._assert_step_open(step_id)
+        loss_fn = state["loss_fn"]
+        mbs = state["mbs"]
+
+        data.to("cuda")
+
+        # Choose iterator + compute padding for DP rank bin-count sync.
+        dummy_iterator: Iterable[Any] = iter([])
+        if self.cfg["dynamic_batching"]["enabled"]:
+            mb_iterator = data.make_microbatch_iterator_with_dynamic_shapes()
+            iterator_len = data.get_microbatch_iterator_dynamic_shapes_len()
+            max_batch_ct = torch.tensor([iterator_len], device="cuda")
+            torch.distributed.all_reduce(
+                max_batch_ct, op=torch.distributed.ReduceOp.MAX
+            )
+            dummy_batch_ct = int(max_batch_ct.item()) - iterator_len
+            if dummy_batch_ct > 0:
+                dummy_iterator = itertools.islice(
+                    itertools.cycle(
+                        data.make_microbatch_iterator_with_dynamic_shapes()
+                    ),
+                    dummy_batch_ct,
+                )
+        elif self.enable_seq_packing:
+            mb_iterator = data.make_microbatch_iterator_for_packable_sequences()
+            iterator_len, _ = data.get_microbatch_iterator_for_packable_sequences_len()
+            max_batch_ct = torch.tensor([iterator_len], device="cuda")
+            torch.distributed.all_reduce(
+                max_batch_ct, op=torch.distributed.ReduceOp.MAX
+            )
+            dummy_batch_ct = int(max_batch_ct.item()) - iterator_len
+            if dummy_batch_ct > 0:
+                dummy_iterator = itertools.islice(
+                    itertools.cycle(
+                        data.make_microbatch_iterator_for_packable_sequences()
+                    ),
+                    dummy_batch_ct,
+                )
+        else:
+            mb_iterator = data.make_microbatch_iterator(mbs)
+            iterator_len = max(1, data.size // mbs)
+
+        # Placeholder N: loss returns un-normalized sums per bin. Finish
+        # does the global 1/N rescale (linear-in-1/N math).
+        placeholder_n = torch.tensor(1.0, device="cuda")
+
+        call_local_seqs = torch.zeros((), dtype=torch.float64, device="cuda")
+        call_local_toks = torch.zeros((), dtype=torch.float64, device="cuda")
+
+        for mb_idx, bin_data in enumerate(itertools.chain(mb_iterator, dummy_iterator)):
+            is_dummy = mb_idx >= iterator_len
+            seqs_mb, toks_mb, loss_item, loss_metrics = self._split_train_one_bin(
+                bin_data, loss_fn, placeholder_n, is_dummy=is_dummy
+            )
+            if not is_dummy:
+                call_local_seqs = call_local_seqs + seqs_mb
+                call_local_toks = call_local_toks + toks_mb
+                if int(seqs_mb.item()) > 0:
+                    state["mb_losses"].append(loss_item)
+                    state["all_mb_metrics"].append(loss_metrics)
+                state["num_microbatches"] += 1
+
+        state["local_valid_seqs"] = state["local_valid_seqs"] + call_local_seqs
+        state["local_valid_toks"] = state["local_valid_toks"] + call_local_toks
+
+        return {
+            "local_valid_seqs_mb": float(call_local_seqs.item()),
+            "local_valid_toks_mb": float(call_local_toks.item()),
+            "num_bins": int(iterator_len),
+        }
+
+    def _split_train_one_bin(
+        self,
+        bin_data: BatchedDataDict[Any],
+        loss_fn: LossFunction,
+        placeholder_n: torch.Tensor,
+        *,
+        is_dummy: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, float, dict[str, Any]]:
+        """One bin's forward + loss(N=1) + backward.
+
+        Returns ``(local_valid_seqs, local_valid_toks, loss_item, metrics)``.
+        For dummy bins (``is_dummy=True``) the loss is multiplied by 0
+        before backward, so neither gradients nor mask counts accumulate.
+        """
+        sequence_dim = 1
+        seq_len = bin_data.get("input_ids").shape[sequence_dim]
+        for k, v in bin_data.items():
+            if torch.is_tensor(v) and len(v.shape) > 1:
+                assert v.shape[sequence_dim] == seq_len, (
+                    f"Dim 1 must be the sequence dim, expected dim 1={seq_len} but got shape {v.shape}"
+                )
+
+        # Mask sums — only meaningful on real bins.
+        if not is_dummy:
+            sample_mask = bin_data["sample_mask"]
+            local_valid_seqs_mb = torch.sum(sample_mask).to(torch.float64)
+            if "token_mask" in bin_data:
+                token_mask = bin_data["token_mask"]
+                local_valid_toks_mb = torch.sum(
+                    token_mask[:, 1:] * sample_mask.unsqueeze(-1)
+                ).to(torch.float64)
+            else:
+                local_valid_toks_mb = (
+                    local_valid_seqs_mb * bin_data["input_ids"].shape[1]
+                )
+        else:
+            local_valid_seqs_mb = torch.zeros((), dtype=torch.float64, device="cuda")
+            local_valid_toks_mb = torch.zeros((), dtype=torch.float64, device="cuda")
+
+        with torch.autocast(device_type="cuda", dtype=self.dtype):
+            if self.enable_seq_packing:
+                input_ids = bin_data.get("input_ids").cuda()
+                input_ids, position_ids, _ = pack_sequences(
+                    input_ids=input_ids,
+                    input_lengths=bin_data["input_lengths"],
+                    packed_sequence_size=[len(bin_data["input_lengths"])],
+                    padding_value=self.tokenizer.eos_token_id,
+                    return_attention_mask=False,
+                    min_seq_len=self.cfg["sequence_packing"]["train_mb_tokens"],
+                )
+                seq_len = input_ids.shape[1]
+                attention_mask = None
+                flash_attn_kwargs = get_flash_attention_kwargs(
+                    input_lengths=bin_data["input_lengths"],
+                )
+            else:
+                input_ids = bin_data.get("input_ids").cuda()
+                batch_size, seq_len = input_ids.shape
+                if self.cfg["dtensor_cfg"]["sequence_parallel"] or self.cp_size > 1:
+                    attention_mask = None
+                else:
+                    attention_mask = torch.ones(
+                        (batch_size, seq_len),
+                        dtype=torch.bool,
+                        device=input_ids.device,
+                    )
+                position_ids = torch.arange(seq_len, device=input_ids.device).repeat(
+                    batch_size, 1
+                )
+                flash_attn_kwargs = {}
+
+            vlm_kwargs = bin_data.get_multimodal_dict(
+                as_tensors=True, device=input_ids.device
+            )
+            if len(vlm_kwargs) > 0:
+                position_ids = None
+                assert not self.cfg["dtensor_cfg"]["sequence_parallel"], (
+                    "Sequence parallel is not supported with multimodal"
+                )
+
+        context_parallel_ctx = None
+        if self.cp_size > 1:
+            assert len(vlm_kwargs) == 0, (
+                "multimodal kwargs are not supported for context parallel"
+            )
+            seq_index = torch.arange(seq_len, device=input_ids.device).repeat(1, 1)
+            cp_buffers = [input_ids, position_ids, seq_index]
+            context_parallel_ctx = self.create_context_parallel_ctx(
+                cp_mesh=self.cp_mesh,
+                cp_buffers=cp_buffers,
+                cp_seq_dims=[sequence_dim] * len(cp_buffers),
+                cp_no_restore_buffers=set(cp_buffers),
+            )
+
+        with DTensorPolicyWorker.train_context(context_parallel_ctx):
+            with torch.autocast(device_type="cuda", dtype=self.dtype):
+                model_args = dict(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    use_cache=False,
+                    flash_attn_kwargs=flash_attn_kwargs,
+                    **vlm_kwargs,
+                )
+                if self.is_gemma3 and "token_type_ids" not in model_args:
+                    model_args["token_type_ids"] = torch.zeros_like(input_ids)
+                if self._is_reward_model:
+                    assert not flash_attn_kwargs
+                    del model_args["flash_attn_kwargs"]
+                if len(vlm_kwargs) > 0:
+                    del model_args["flash_attn_kwargs"]
+
+                outputs = self.model(**model_args)
+
+            if not hasattr(outputs, "logits"):
+                logits = self.model.lm_head(outputs.last_hidden_state)
+            else:
+                logits = outputs.logits
+            del outputs
+
+            logits = self._apply_temperature_scaling(logits)
+
+            if self.cp_size > 1:
+                seq_index_dtensor = (
+                    DTensor.from_local(
+                        seq_index,
+                        device_mesh=self.cp_mesh,
+                        placements=[Shard(1)],
+                    )
+                    .full_tensor()
+                    .squeeze(0)
+                )
+                bin_data["seq_index"] = seq_index_dtensor
+                for tensor_name in bin_data:
+                    current_tensor = bin_data[tensor_name]
+                    for buffer in cp_buffers:
+                        if current_tensor is buffer:
+                            assert type(current_tensor) == torch.Tensor
+                            bin_data[tensor_name] = DTensor.from_local(
+                                current_tensor,
+                                device_mesh=self.cp_mesh,
+                                placements=[Shard(sequence_dim)],
+                            )
+                            break
+                if isinstance(logits, DTensor):
+                    assert (
+                        logits.device_mesh.ndim == 1
+                        and logits.device_mesh.mesh_dim_names[0] == "tp"
+                    ), "logits must be tp sharded"
+                    logits = DTensor.from_local(
+                        logits.to_local(),
+                        device_mesh=self.device_mesh[("cp", "tp")],
+                        placements=[Shard(sequence_dim), Shard(-1)],
+                    )
+                else:
+                    logits = DTensor.from_local(
+                        logits,
+                        device_mesh=self.device_mesh[("cp", "tp")],
+                        placements=[Shard(sequence_dim), Shard(-1)],
+                    )
+
+            prepare_loss_input_wrapped = partial(
+                prepare_loss_input, sampling_params=self.sampling_params
+            )
+            if self.enable_seq_packing:
+                loss_fn_ = SequencePackingLossWrapper(
+                    loss_fn=loss_fn,
+                    prepare_fn=prepare_loss_input_wrapped,
+                    cu_seqlens_q=flash_attn_kwargs.cu_seqlens_q,
+                    cu_seqlens_q_padded=flash_attn_kwargs.cu_seqlens_q,
+                )
+                loss, loss_metrics = loss_fn_(
+                    logits, bin_data, placeholder_n, placeholder_n
+                )
+            else:
+                loss_input, bin_data = prepare_loss_input_wrapped(
+                    logits, bin_data, loss_fn
+                )
+                loss, loss_metrics = loss_fn(
+                    data=bin_data,
+                    global_valid_seqs=placeholder_n,
+                    global_valid_toks=placeholder_n,
+                    **loss_input,
+                )
+            del logits
+
+            # Zero out dummy-bin gradients (loss is differentiable; this
+            # zeros the contribution without breaking the autograd graph).
+            if is_dummy:
+                loss = loss * 0
+
+            # FSDP averages gradients across DP+CP at backward; cancel
+            # that to a sum so per-bin contributions accumulate cleanly
+            # across bins and across calls.
+            loss *= self.dp_size * self.cp_size
+            loss.backward()
+
+        return (
+            local_valid_seqs_mb,
+            local_valid_toks_mb,
+            float(loss.item()),
+            loss_metrics,
+        )
+
+    @wrap_with_nvtx_name("dtensor_policy_worker/finish_train_step")
+    def finish_train_step(self, step_id: str) -> dict[str, Any]:
+        state = self._assert_step_open(step_id)
+        loss_fn = state["loss_fn"]
+
+        # All-reduce accumulated mask sums across DP to recover true N.
+        to_reduce = torch.stack(
+            [state["local_valid_seqs"], state["local_valid_toks"]]
+        ).to(torch.float64)
+        torch.distributed.all_reduce(to_reduce, group=self.dp_mesh.get_group())
+        global_valid_seqs = to_reduce[0]
+        global_valid_toks = to_reduce[1]
+
+        loss_type = getattr(loss_fn, "loss_type", LossType.TOKEN_LEVEL)
+        if loss_type == LossType.TOKEN_LEVEL:
+            n_true = global_valid_toks
+        else:
+            n_true = global_valid_seqs
+
+        # Avoid div-by-zero if a step ended up with no valid samples.
+        # Matches masked_mean's epsilon floor.
+        n_safe = n_true if n_true.item() > 0 else torch.tensor(1.0, device="cuda")
+        inv_n = (1.0 / n_safe).to(torch.float32)
+
+        with torch.no_grad():
+            for p in self.model.parameters():
+                if p.grad is not None:
+                    p.grad.mul_(inv_n)
+
+            grad_norm: Optional[float | torch.Tensor] = get_grad_norm(
+                self.model.parameters(),
+                dp_cp_group=self.dp_cp_mesh.get_group(),
+                tp_group=self.tp_mesh.get_group(),
+                dtype=torch.float32,
+            )
+            if self.max_grad_norm is not None:
+                clip_grad_by_total_norm_(
+                    self.model.parameters(),
+                    max_grad_norm=self.max_grad_norm,
+                    total_norm=grad_norm,
+                )
+            grad_norm = torch.tensor([grad_norm])
+
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+        self.scheduler.step()
+        torch.cuda.empty_cache()
+
+        # Per-mb metrics were computed with N=1; rescale by 1/N to recover
+        # values consistent with the sync path. The same scalar applies
+        # to every entry because masked_mean is linear in 1/N. Min/max
+        # diagnostics are left alone (existing convention in train()).
+        scale = float(inv_n.item())
+        mb_metrics: dict[str, list[Any]] = defaultdict(list)
+        for m in state["all_mb_metrics"]:
+            for k, v in m.items():
+                if "_min" in k or "_max" in k:
+                    mb_metrics[k].append(v)
+                elif isinstance(v, torch.Tensor):
+                    mb_metrics[k].append((v.detach() * scale).cpu())
+                else:
+                    mb_metrics[k].append(v * scale)
+        global_valid_seqs_f = float(global_valid_seqs.item())
+        global_valid_toks_f = float(global_valid_toks.item())
+
+        # Global step loss across DP (un-normalized sums summed, then
+        # scaled once). Matches the sync path's all_reduce of losses.
+        local_loss = torch.tensor(state["mb_losses"], device="cuda").sum() * scale
+        global_loss = local_loss.detach().clone()
+        torch.distributed.all_reduce(global_loss, group=self.dp_mesh.get_group())
+
+        # Drop state before returning so a re-call to begin_train_step
+        # doesn't see a stale handle.
+        self._train_step_state = None
+
+        return {
+            "global_loss": global_loss.cpu(),
+            "grad_norm": grad_norm,
+            "rank": torch.distributed.get_rank(),
+            "gpu_name": torch.cuda.get_device_name(),
+            "model_dtype": self.dtype,
+            "all_mb_metrics": dict(mb_metrics),
+            "global_valid_seqs": global_valid_seqs_f,
+            "global_valid_toks": global_valid_toks_f,
+        }
+
+    @wrap_with_nvtx_name("dtensor_policy_worker/abort_train_step")
+    def abort_train_step(self, step_id: str) -> None:
+        state = getattr(self, "_train_step_state", None)
+        if state is None:
+            # idempotent — no open step means nothing to abort
+            return
+        if state["step_id"] != step_id:
+            raise RuntimeError(
+                f"abort_train_step({step_id!r}) does not match open step "
+                f"{state['step_id']!r}"
+            )
+        self.optimizer.zero_grad()
+        self._train_step_state = None
 
     # TODO @Rayen Tian: Related Issue: Refactor shared logic between score() and get_logprobs() (https://github.com/NVIDIA-NeMo/RL/issues/1094)
     @wrap_with_nvtx_name("dtensor_policy_worker/get_logprobs")

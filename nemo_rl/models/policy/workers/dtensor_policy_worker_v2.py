@@ -194,6 +194,11 @@ def get_train_context(
 class DTensorPolicyWorkerV2Impl(
     TQWorkerMixin, AbstractPolicyWorker, ColocatablePolicyInterface
 ):
+    # Holds split-API train-step state between begin/finish or begin/abort;
+    # None when no step is open. Declared at class level so the ``= None``
+    # writes in finish/abort type-check.
+    _train_step_state: Optional[dict[str, Any]] = None
+
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
 
@@ -519,6 +524,303 @@ class DTensorPolicyWorkerV2Impl(
             )
 
             return metrics
+
+    # ── split-API train-step state machine (SingleController async path) ──
+    #
+    # Mirrors the v1 implementation in ``dtensor_policy_worker.py`` but built
+    # on the v2 helpers (``LossPostProcessor``, ``get_microbatch_iterator``,
+    # ``automodel_forward_backward``, ``scale_grads_and_clip_grad_norm``).
+    #
+    # Trick: ``masked_mean(values, mask, N) = sum(values*mask)/(N+ε)`` is
+    # linear in 1/N. Each call to ``train_microbatch`` passes
+    # ``global_valid_seqs=global_valid_toks=tensor(1.0)`` to the loss so
+    # backward deposits raw ``d(sum)/dθ`` into ``.grad``. PyTorch
+    # accumulates across microbatches naturally. At finish, we all-reduce
+    # accumulated mask sums to recover true ``N``, then rescale every
+    # ``p.grad`` by ``1/N``. The choice of which N (toks vs seqs) follows
+    # ``loss_fn.loss_type``. See the v1 worker for the long-form rationale.
+
+    def _split_step_state_init(
+        self,
+        step_id: str,
+        loss_fn: LossFunction,
+        gbs: Optional[int],
+        mbs: Optional[int],
+    ) -> dict[str, Any]:
+        from nemo_rl.algorithms.loss.interfaces import (
+            LossType,
+        )  # local: avoid top-level cycle risk
+
+        sequence_dim = 1
+        loss_post_processor = LossPostProcessor(
+            loss_fn=loss_fn,
+            cfg=self.cfg,
+            device_mesh=self.device_mesh,
+            cp_mesh=self.cp_mesh,
+            tp_mesh=self.tp_mesh,
+            cp_size=self.cp_size,
+            dp_size=self.dp_size,
+            enable_seq_packing=self.enable_seq_packing,
+            sampling_params=self.sampling_params,
+        )
+
+        def train_context_fn(processed_inputs: Any) -> Any:
+            return get_train_context(
+                cp_size=self.cp_size,
+                cp_mesh=self.cp_mesh,
+                cp_buffers=processed_inputs.cp_buffers,
+                sequence_dim=sequence_dim,
+                dtype=self.dtype,
+                autocast_enabled=self.autocast_enabled,
+            )
+
+        return {
+            "step_id": step_id,
+            "loss_fn": loss_fn,
+            "loss_type": getattr(loss_fn, "loss_type", LossType.TOKEN_LEVEL),
+            "gbs": gbs or self.cfg["train_global_batch_size"],
+            "mbs": mbs or self.cfg["train_micro_batch_size"],
+            "loss_post_processor": loss_post_processor,
+            "train_context_fn": train_context_fn,
+            "sequence_dim": sequence_dim,
+            "local_valid_seqs": torch.zeros((), dtype=torch.float64, device="cuda"),
+            "local_valid_toks": torch.zeros((), dtype=torch.float64, device="cuda"),
+            "mb_losses": [],
+            "all_mb_metrics": [],
+            "num_microbatches": 0,
+        }
+
+    def _assert_step_open(self, step_id: str) -> dict[str, Any]:
+        state = getattr(self, "_train_step_state", None)
+        if state is None:
+            raise RuntimeError(
+                f"no train step open; begin_train_step({step_id!r}) must be called first"
+            )
+        if state["step_id"] != step_id:
+            raise RuntimeError(
+                f"step_id mismatch: open step is {state['step_id']!r}, got {step_id!r}"
+            )
+        return state
+
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/begin_train_step")
+    def begin_train_step(
+        self,
+        step_id: str,
+        loss_fn: LossFunction,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+    ) -> None:
+        existing = getattr(self, "_train_step_state", None)
+        if existing is not None:
+            raise RuntimeError(
+                f"train step {existing['step_id']!r} is already open; "
+                f"call finish_train_step or abort_train_step before begin"
+            )
+        self.model.train()
+        self.optimizer.zero_grad()
+        self._train_step_state = self._split_step_state_init(
+            step_id=step_id, loss_fn=loss_fn, gbs=gbs, mbs=mbs
+        )
+
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/train_microbatch")
+    def train_microbatch(
+        self,
+        step_id: str,
+        data: BatchedDataDict[Any],
+    ) -> dict[str, Any]:
+        """Run forward+backward over every bin in ``data`` under the open step.
+
+        Uses ``get_microbatch_iterator`` (which already handles dummy-bin
+        padding for DP-rank bin-count sync under seq-packing) and
+        ``automodel_forward_backward`` (which already zeros dummy losses
+        and handles dp_size*cp_size FSDP-avg cancellation).
+        """
+        state = self._assert_step_open(step_id)
+
+        # Accumulate local mask sums for the finish-time all_reduce.
+        # Computed once on the call's full data (dummies cycle from these
+        # rows so we don't want to double-count). Done before forward so
+        # a backward failure can't leave counts out of sync with grads.
+        data = data.to("cuda")
+        assert "sample_mask" in data, "sample_mask required on microbatch data"
+        sample_mask = data["sample_mask"]
+        call_local_seqs = torch.sum(sample_mask).to(torch.float64)
+        if "token_mask" in data:
+            token_mask = data["token_mask"]
+            call_local_toks = torch.sum(
+                token_mask[:, 1:] * sample_mask.unsqueeze(-1)
+            ).to(torch.float64)
+        else:
+            call_local_toks = call_local_seqs * data["input_ids"].shape[1]
+
+        state["local_valid_seqs"] = state["local_valid_seqs"] + call_local_seqs
+        state["local_valid_toks"] = state["local_valid_toks"] + call_local_toks
+
+        # Get microbatch iterator (handles dummy-bin padding internally)
+        processed_iterator, iterator_len = get_microbatch_iterator(
+            data,
+            self.cfg,
+            state["mbs"],
+            self.dp_mesh,
+            tokenizer=self.tokenizer,
+            cp_size=self.cp_size,
+        )
+
+        # Optional cache-clear callback (mirrors sync train() behavior)
+        empty_cache_steps = self.cfg.get("dtensor_cfg", {}).get(
+            "clear_cache_every_n_steps"
+        )
+
+        def on_microbatch_start(mb_idx: int) -> None:
+            if empty_cache_steps and mb_idx % empty_cache_steps == 0:
+                torch.cuda.empty_cache()
+
+        # Placeholder N: loss returns un-normalized sums. Finish does the
+        # global 1/N rescale (linear-in-1/N math).
+        placeholder_n = torch.tensor(1.0, device="cuda")
+
+        mb_results = automodel_forward_backward(
+            model=self.model,
+            data_iterator=processed_iterator,
+            post_processing_fn=state["loss_post_processor"],
+            forward_only=False,
+            is_reward_model=self._is_reward_model,
+            allow_flash_attn_args=self.allow_flash_attn_args,
+            global_valid_seqs=placeholder_n,
+            global_valid_toks=placeholder_n,
+            sampling_params=self.sampling_params,
+            sequence_dim=state["sequence_dim"],
+            dp_size=self.dp_size,
+            cp_size=self.cp_size,
+            # num_global_batches=1: metric per-call division by 1 (no-op);
+            # the global 1/N rescale at finish handles the actual scaling.
+            num_global_batches=1,
+            train_context_fn=state["train_context_fn"],
+            num_valid_microbatches=iterator_len,
+            on_microbatch_start=on_microbatch_start,
+        )
+
+        # Accumulate per-real-mb losses/metrics into step state
+        for mb_idx, (loss, loss_metrics) in enumerate(mb_results):
+            if mb_idx >= iterator_len:
+                continue  # dummy bin — backward already ran with loss*0
+            num_valid_samples = loss_metrics.get("num_valid_samples", 0)
+            loss_metrics["lr"] = self.optimizer.param_groups[0]["lr"]
+            if num_valid_samples > 0:
+                state["mb_losses"].append(loss.item())
+                state["all_mb_metrics"].append(loss_metrics)
+            state["num_microbatches"] += 1
+
+        return {
+            "local_valid_seqs_mb": float(call_local_seqs.item()),
+            "local_valid_toks_mb": float(call_local_toks.item()),
+            "num_bins": int(iterator_len),
+        }
+
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/finish_train_step")
+    def finish_train_step(self, step_id: str) -> dict[str, Any]:
+        from nemo_rl.algorithms.loss.interfaces import LossType  # local
+
+        state = self._assert_step_open(step_id)
+
+        # All-reduce accumulated mask sums across DP to recover true N.
+        to_reduce = torch.stack(
+            [state["local_valid_seqs"], state["local_valid_toks"]]
+        ).to(torch.float64)
+        torch.distributed.all_reduce(to_reduce, group=self.dp_mesh.get_group())
+        global_valid_seqs = to_reduce[0]
+        global_valid_toks = to_reduce[1]
+
+        if state["loss_type"] == LossType.TOKEN_LEVEL:
+            n_true = global_valid_toks
+        else:
+            n_true = global_valid_seqs
+
+        n_safe = n_true if n_true.item() > 0 else torch.tensor(1.0, device="cuda")
+        inv_n = (1.0 / n_safe).to(torch.float32)
+
+        # Rescale accumulated unnormalized grads by 1/N (single scalar
+        # because each loss_fn commits to a single loss_type whose grad
+        # share the same normalizer — see the loss-API survey notes).
+        with torch.no_grad():
+            for p in self.model.parameters():
+                if p.grad is not None:
+                    p.grad.mul_(inv_n)
+
+        # v2's clip helper handles PP/EP grad scaling too. We've already
+        # done the 1/N rescale, so num_label_tokens=1 (no further scaling)
+        # and dp_group_size matches the FSDP-avg cancellation we did per mb.
+        grad_norm: Optional[float | torch.Tensor] = scale_grads_and_clip_grad_norm(
+            self.max_grad_norm,
+            [self.model],
+            norm_type=2.0,
+            pp_enabled=False,
+            device_mesh=self.device_mesh,
+            moe_mesh=self.moe_mesh,
+            ep_axis_name=(
+                "ep"
+                if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names
+                else None
+            ),
+            pp_axis_name=None,
+            foreach=True,
+            num_label_tokens=1,
+            dp_group_size=self.dp_size * self.cp_size,
+        )
+        grad_norm = torch.tensor(grad_norm, device="cpu", dtype=torch.float32)
+
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+        self.scheduler.step()
+        torch.cuda.empty_cache()
+
+        # Per-mb metrics were computed with N=1; rescale by 1/N (single
+        # scalar) so they match the sync-path's normalized values.
+        scale = float(inv_n.item())
+        rescaled_metrics: list[dict[str, Any]] = []
+        for m in state["all_mb_metrics"]:
+            out: dict[str, Any] = {}
+            for k, v in m.items():
+                if "_min" in k or "_max" in k or k == "lr" or k == "num_valid_samples":
+                    out[k] = v
+                elif isinstance(v, torch.Tensor):
+                    out[k] = (v.detach() * scale).cpu()
+                else:
+                    out[k] = v * scale
+            # Surface the true global counts (matches sync path's keys)
+            out["global_valid_seqs"] = float(global_valid_seqs.item())
+            out["global_valid_toks"] = float(global_valid_toks.item())
+            rescaled_metrics.append(out)
+
+        # Scale the per-mb losses (computed with N=1) by the same factor
+        # so the aggregated global loss matches what train() would emit.
+        scaled_losses = [lv * scale for lv in state["mb_losses"]]
+
+        metrics = aggregate_training_statistics(
+            losses=scaled_losses,
+            all_mb_metrics=rescaled_metrics,
+            grad_norm=grad_norm,
+            dp_group=self.dp_mesh.get_group(),
+            dtype=self.dtype,
+        )
+
+        # Drop state before returning so a re-call to begin_train_step
+        # doesn't see a stale handle.
+        self._train_step_state = None
+        return metrics
+
+    @wrap_with_nvtx_name("dtensor_policy_worker_v2/abort_train_step")
+    def abort_train_step(self, step_id: str) -> None:
+        state = getattr(self, "_train_step_state", None)
+        if state is None:
+            return
+        if state["step_id"] != step_id:
+            raise RuntimeError(
+                f"abort_train_step({step_id!r}) does not match open step "
+                f"{state['step_id']!r}"
+            )
+        self.optimizer.zero_grad()
+        self._train_step_state = None
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/get_logprobs")
     def get_logprobs(
