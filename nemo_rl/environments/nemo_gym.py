@@ -187,6 +187,7 @@ Depending on your data shape, you may want to change these values."""
 
         nemo_rl_message_log = []
         seen_token_ids: List[int] = []
+        batch_decode_items = []
         for output_item_dict in nemo_gym_result["response"]["output"]:
             # Nemo RL really only has two types of messages: assistant and not assistant since that is all that it is concerned with (i.e. to train or not to train)
             # Here we map all the trainable messages to assistant and all the non-trainable messages to user.
@@ -204,37 +205,48 @@ Seen token IDs: {seen_token_ids}
 Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
 """
 
+            prompt_token_ids = output_item_dict.pop("prompt_token_ids")
+            generation_token_ids = output_item_dict.pop("generation_token_ids")
+            generation_log_probs = output_item_dict.pop("generation_log_probs")
+            new_prompt_token_ids = prompt_token_ids[len(seen_token_ids) :]
+
             nemo_rl_message_log.append(
                 {
                     "role": "user",
                     "content": "",
-                    "token_ids": torch.tensor(
-                        output_item_dict["prompt_token_ids"][len(seen_token_ids) :]
-                    ),
+                    "token_ids": torch.tensor(new_prompt_token_ids),
                 }
             )
             nemo_rl_message_log.append(
                 {
                     "role": "assistant",
                     "content": "",
-                    "token_ids": torch.tensor(output_item_dict["generation_token_ids"]),
-                    "generation_logprobs": torch.tensor(
-                        output_item_dict["generation_log_probs"]
-                    ),
+                    "token_ids": torch.tensor(generation_token_ids),
+                    "generation_logprobs": torch.tensor(generation_log_probs),
                 }
             )
 
-            seen_token_ids.extend(nemo_rl_message_log[-2]["token_ids"])
-            seen_token_ids.extend(nemo_rl_message_log[-1]["token_ids"])
+            seen_token_ids.extend(new_prompt_token_ids)
+            seen_token_ids.extend(generation_token_ids)
 
             # We pop to remove larger tensors from logging.
-            output_item_dict["prompt_str"] = tokenizer.decode(
-                output_item_dict.pop("prompt_token_ids")
+            batch_decode_items.append(
+                (output_item_dict, prompt_token_ids, generation_token_ids)
             )
-            output_item_dict["generation_str"] = tokenizer.decode(
-                output_item_dict.pop("generation_token_ids")
+
+        if batch_decode_items:
+            prompt_strs = tokenizer.batch_decode(
+                [item[1] for item in batch_decode_items]
             )
-            output_item_dict.pop("generation_log_probs")
+            generation_strs = tokenizer.batch_decode(
+                [item[2] for item in batch_decode_items]
+            )
+
+            for (output_item_dict, _, _), prompt_str, generation_str in zip(
+                batch_decode_items, prompt_strs, generation_strs
+            ):
+                output_item_dict["prompt_str"] = prompt_str
+                output_item_dict["generation_str"] = generation_str
 
         if not nemo_rl_message_log:
             input_messages = nemo_gym_result["responses_create_params"]["input"]
