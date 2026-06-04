@@ -123,7 +123,9 @@ def _build_records(tau_bench_env_name: str, split: str) -> list[dict[str, Any]]:
     # The placeholder below just gives the model a neutral starting point for
     # the wasted generation on that pre-step turn; the real conversation begins
     # once the agent sees the customer's actual first message.
-    placeholder_user_msg = "Hi! How can I help you today?"
+    # Keep the placeholder as uninformative as possible so it doesn't prime the
+    # model with false expectations before it sees the real customer message.
+    placeholder_user_msg = "Hi"
     return [
         {
             "messages": [

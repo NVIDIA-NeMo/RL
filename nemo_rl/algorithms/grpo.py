@@ -1072,26 +1072,6 @@ def _create_advantage_estimator(master_config: MasterConfig):
     return adv_estimator
 
 
-def _extract_prompt_only_messages(message_logs: list) -> list:
-    """Extract only prompt messages (user/system) from message logs.
-
-    This is used to get prompt IDs for advantage estimation, excluding
-    any assistant responses.
-
-    Args:
-        message_logs: List of message logs, where each log is a list of messages.
-
-    Returns:
-        List of message logs containing only user and system messages.
-    """
-    prompt_only_message_logs = []
-    for message_log in message_logs:
-        prompt_only_log = []
-        for message in message_log:
-            if message["role"] == "user" or message["role"] == "system":
-                prompt_only_log.append(message)
-        prompt_only_message_logs.append(prompt_only_log)
-    return prompt_only_message_logs
 
 
 def refit_policy_generation(
@@ -1441,6 +1421,32 @@ def grpo_train(
                             master_config["grpo"]["num_generations_per_prompt"]
                         )
                     )
+
+                    # Build a composite (task_name_id, idx) grouping key used
+                    # for both dynamic sampling and advantage estimation.
+                    # Grouping by prompt token sequences is broken for multi-turn
+                    # environments (e.g. tau-bench) where all tasks share the
+                    # same initial prompt tokens. Grouping by idx alone is broken
+                    # for multi-dataset batches where idx values are independent
+                    # per dataset and can collide. task_name disambiguates both:
+                    #   - single-dataset: all task_names are equal, so grouping
+                    #     reduces to idx alone.
+                    #   - multi-dataset: different task_names get different IDs,
+                    #     preventing cross-dataset idx collisions.
+                    # task_name is None for processors that don't set it (e.g.
+                    # math); str() normalises that to "None" so sorting is safe.
+                    idx_vals = repeated_batch["idx"]
+                    task_names = repeated_batch["task_name"]
+                    unique_task_names = sorted(set(str(n) for n in task_names))
+                    task_name_to_id = {
+                        name: i for i, name in enumerate(unique_task_names)
+                    }
+                    task_ids = [task_name_to_id[str(n)] for n in task_names]
+                    prompt_ids_for_adv = torch.tensor(
+                        list(zip(task_ids, idx_vals)),
+                        dtype=torch.long,
+                    )
+
                     # Convert LLMMessageLogType to FlatMessagesType for generation
                     batched_flat, input_lengths = batched_message_log_to_flat_message(
                         repeated_batch["message_log"],
@@ -1600,7 +1606,7 @@ def grpo_train(
                         # Just fix the device id for now
                         device_id = 0
                         baseline, std = calculate_baseline_and_std_per_prompt(
-                            input_ids.cuda(device_id),
+                            prompt_ids_for_adv.cuda(device_id),
                             rewards.cuda(device_id),
                             torch.ones_like(rewards).cuda(device_id),
                             leave_one_out_baseline=master_config["grpo"][
@@ -1611,7 +1617,7 @@ def grpo_train(
                         std = std.cpu()
                     else:
                         baseline, std = calculate_baseline_and_std_per_prompt(
-                            input_ids,
+                            prompt_ids_for_adv,
                             rewards,
                             torch.ones_like(rewards),
                             leave_one_out_baseline=master_config["grpo"][
@@ -1655,22 +1661,6 @@ def grpo_train(
                     # Save baseline for logging (before deletion)
                     baseline_for_log = baseline.clone()
 
-                    # Use the dataset sample index (idx) as the prompt identifier
-                    # for advantage grouping. For multi-turn environments like
-                    # tau-bench, all tasks share the same initial system prompt and
-                    # opening user message, so prompt token sequences cannot
-                    # distinguish groups. The idx is identical for all
-                    # num_generations_per_prompt rollouts of the same task.
-                    #
-                    # NOTE: if using multi-dataset batches (task_data_processors is
-                    # a dict), idx values are independent per dataset and can collide
-                    # across datasets (e.g. task A idx=0 and task B idx=0 would be
-                    # incorrectly grouped together). In that case, use a composite
-                    # key that incorporates task_name to avoid cross-dataset merging.
-                    idx_vals = repeated_batch["idx"]
-                    prompt_ids_for_adv = torch.tensor(
-                        idx_vals, dtype=torch.long, device=rewards.device
-                    ).unsqueeze(-1)
                     del input_ids
                     del baseline
                     del std
@@ -2737,22 +2727,20 @@ def async_grpo_train(
                 with timer.time("reward_calculation"):
                     rewards = repeated_batch["total_reward"]
 
-                    # Use the dataset sample index (idx) as the prompt identifier
-                    # for advantage grouping. For multi-turn environments like
-                    # tau-bench, all tasks share the same initial system prompt and
-                    # opening user message, so prompt token sequences cannot
-                    # distinguish groups. The idx is identical for all
-                    # num_generations_per_prompt rollouts of the same task.
-                    #
-                    # NOTE: if using multi-dataset batches (task_data_processors is
-                    # a dict), idx values are independent per dataset and can collide
-                    # across datasets (e.g. task A idx=0 and task B idx=0 would be
-                    # incorrectly grouped together). In that case, use a composite
-                    # key that incorporates task_name to avoid cross-dataset merging.
+                    # Build (task_name_id, idx) composite grouping key — see
+                    # the comment in the sync path for full rationale.
                     idx_vals = repeated_batch["idx"]
+                    task_names = repeated_batch["task_name"]
+                    unique_task_names = sorted(set(str(n) for n in task_names))
+                    task_name_to_id = {
+                        name: i for i, name in enumerate(unique_task_names)
+                    }
+                    task_ids = [task_name_to_id[str(n)] for n in task_names]
                     prompt_ids_for_adv = torch.tensor(
-                        idx_vals, dtype=torch.long, device=rewards.device
-                    ).unsqueeze(-1)
+                        list(zip(task_ids, idx_vals)),
+                        dtype=torch.long,
+                        device=rewards.device,
+                    )
 
                     print(
                         f"  📊 Rewards stats: min={rewards.min():.4f}, max={rewards.max():.4f}, mean={rewards.mean():.4f}, std={rewards.std():.4f}"
