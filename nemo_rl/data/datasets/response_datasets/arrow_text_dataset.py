@@ -72,29 +72,13 @@ class ArrowTextDataset(RawDataset):
         self.task_name = "x_token"
 
         raw = load_dataset_from_path(data_files, subset, split)
-        # Drop rows whose text column is non-string or empty. Applied at the
-        # source so the packed and non-packed branches below see the same
-        # corpus; without this filter the non-packed branch passed ``None``
-        # and ``""`` straight through to ``kd_data_processor`` / the
-        # cross-tokenizer collator, while the packed branch dropped them
-        # inside ``_pack_generator`` — same corpus produced different
-        # samples depending on ``characters_per_sample``.
+        # Filter at the source so the packed and non-packed branches see the
+        # same corpus (the packed path also drops empty/non-string rows).
         raw = raw.filter(lambda d: isinstance(d[text_key], str) and bool(d[text_key]))
 
         if characters_per_sample is None or characters_per_sample <= 0:
-            # Emit both `text` (read by kd_data_processor for cross-tokenizer
-            # distillation) and a single-assistant `messages` field (read by
-            # sft_processor) so the same dataset works for both pipelines.
-            # Wrapping in role="assistant" lets the SFT pipeline's hard-coded
-            # roles_to_train_on=["assistant"] unmask every token, matching
-            # the loss-on-every-token semantic of the distillation path.
-            task_name = self.task_name
             self.dataset = raw.map(
-                lambda d: {
-                    "text": d[text_key],
-                    "messages": [{"role": "assistant", "content": d[text_key]}],
-                    "task_name": task_name,
-                },
+                self.format_data,
                 remove_columns=raw.column_names,
             )
         else:
@@ -105,17 +89,24 @@ class ArrowTextDataset(RawDataset):
                     "text_key": text_key,
                     "characters_per_sample": characters_per_sample,
                     "task_name": self.task_name,
-                    # Bump this string whenever the emitted row schema
-                    # changes; it becomes part of the HF datasets cache
-                    # fingerprint so a schema change forces a fresh
-                    # cache build rather than silently reusing a stale
-                    # cache produced by older code.
+                    # Part of the HF datasets cache fingerprint; bump it
+                    # whenever the emitted row schema changes.
                     "schema_version": "messages-v1",
                 },
             )
 
         self.val_dataset = None
         self.split_train_validation(split_validation_size, seed)
+
+    def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
+        # `text` feeds kd_data_processor; the assistant `messages` field feeds
+        # sft_processor, so the same dataset serves both pipelines.
+        text = data[self.text_key]
+        return {
+            "text": text,
+            "messages": [{"role": "assistant", "content": text}],
+            "task_name": self.task_name,
+        }
 
 
 def _pack_generator(
