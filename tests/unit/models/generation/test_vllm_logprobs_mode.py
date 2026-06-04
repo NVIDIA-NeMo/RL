@@ -55,6 +55,11 @@ def test_processed_logprobs_matches_manual_computation():
 
     Note: Run with: uv run --extra vllm --group test pytest ... --vllm-only
     """
+    import os
+
+    # Force spawn: parent already has CUDA initialized, so vLLM's default fork
+    # of EngineCore would crash. Must be set before LLM().
+    os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from vllm import LLM, SamplingParams

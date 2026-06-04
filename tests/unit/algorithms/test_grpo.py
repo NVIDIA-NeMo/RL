@@ -75,6 +75,52 @@ def _logged_train_metrics_with_key(logger, key: str):
     raise AssertionError(f"No train metrics payload contained {key}")
 
 
+def test_grpo_sync_seq_logprob_error_helper_accepts_dict_result(monkeypatch):
+    from nemo_rl.algorithms import grpo_sync as grpo_sync_mod
+
+    seq_error_result = {
+        "max_seq_mult_prob_error": 2.5,
+        "mean_seq_mult_prob_error": 1.5,
+        "min_seq_mult_prob_error": 1.0,
+        "max_seq_mult_prob_error_after_mask": 1.2,
+        "mean_seq_mult_prob_error_after_mask": 1.1,
+        "min_seq_mult_prob_error_after_mask": 1.0,
+        "num_masked_seqs": 2,
+        "masked_correct_pct": 0.5,
+    }
+
+    def fake_masking(train_data, rewards, seq_logprob_error_threshold):
+        assert seq_logprob_error_threshold == 1.2
+        assert rewards.tolist() == [1.0, 0.0]
+        train_data["sample_mask"] = torch.tensor([1.0, 0.0])
+        return seq_error_result
+
+    monkeypatch.setattr(
+        grpo_sync_mod,
+        "compute_and_apply_seq_logprob_error_masking",
+        fake_masking,
+    )
+
+    sample_mask, metrics = grpo_sync_mod._compute_seq_logprob_error_metrics(
+        token_mask=torch.ones(2, 3),
+        sample_mask=torch.ones(2),
+        prev_logprobs=torch.zeros(2, 3),
+        generation_logprobs=torch.zeros(2, 3),
+        rewards=torch.tensor([1.0, 0.0]),
+        seq_logprob_error_threshold=1.2,
+    )
+
+    assert torch.equal(sample_mask, torch.tensor([1.0, 0.0]))
+    assert metrics["max_seq_mult_prob_error"] == 2.5
+    assert metrics["mean_seq_mult_prob_error"] == 1.5
+    assert metrics["min_seq_mult_prob_error"] == 1.0
+    assert metrics["max_seq_mult_prob_error_after_mask"] == 1.2
+    assert metrics["mean_seq_mult_prob_error_after_mask"] == 1.1
+    assert metrics["min_seq_mult_prob_error_after_mask"] == 1.0
+    assert metrics["num_masked_seqs_by_logprob_error"] == 2
+    assert metrics["masked_correct_pct"] == 0.5
+
+
 # ============================================================================
 # Stub classes for async GRPO testing (non-Ray versions for easy mocking)
 # ============================================================================
@@ -1538,7 +1584,6 @@ def test_grpo_train_collects_generation_logger_and_seq_metrics(
     )
 
     assert policy_generation.clear_logger_metrics.called
-    policy_generation.finish_generation.assert_called_once_with(discard_weights=True)
     assert policy_generation.get_logger_metrics.called
     train_metrics = _logged_train_metrics_with_key(
         mock_grpo_components["logger"], "generation_logger_metrics"

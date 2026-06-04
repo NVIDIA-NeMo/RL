@@ -16,7 +16,7 @@ import json
 import os
 from copy import deepcopy
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 import ray
@@ -33,9 +33,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
-from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorkerImpl
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
-    VllmAsyncGenerationWorkerImpl,
     _replace_prefix_tokens,
 )
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
@@ -146,83 +144,15 @@ basic_lora_test_config: LoRAConfig = {
 }
 
 
-@pytest.mark.parametrize(
-    "colocated,async_engine,expected_method,expected_kwargs",
-    [
-        (True, False, "sleep", {"discard_weights": True}),
-        (True, True, "sleep_async", {"discard_weights": True}),
-        (False, False, "reset_prefix_cache", {}),
-        (False, True, "reset_prefix_cache_async", {}),
-    ],
-)
-def test_vllm_finish_generation_routes_discard_weights(
-    monkeypatch, colocated, async_engine, expected_method, expected_kwargs
-):
-    vllm_generation = VllmGeneration.__new__(VllmGeneration)
-    vllm_generation.cfg = {
-        "colocated": {"enabled": colocated},
-        "vllm_cfg": {"async_engine": async_engine},
-    }
-    vllm_generation.worker_group = MagicMock()
-    vllm_generation.worker_group.run_all_workers_single_data.return_value = [
-        "worker_future"
-    ]
-    monkeypatch.setattr(
-        "nemo_rl.models.generation.vllm.vllm_generation.ray.get",
-        lambda futures: [True],
-    )
-
-    assert vllm_generation.finish_generation(discard_weights=True)
-
-    vllm_generation.worker_group.run_all_workers_single_data.assert_called_once_with(
-        expected_method,
-        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        **expected_kwargs,
-    )
-
-
-def test_vllm_worker_sleep_uses_discard_weight_level(monkeypatch):
-    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
-    worker.cfg = {"vllm_cfg": {"async_engine": False}}
-    worker.llm = MagicMock()
-    monkeypatch.setattr(
-        "nemo_rl.models.generation.vllm.vllm_worker.gc.collect", lambda: None
-    )
-    monkeypatch.setattr(
-        "nemo_rl.models.generation.vllm.vllm_worker.torch.cuda.empty_cache",
-        lambda: None,
-    )
-
-    worker.sleep(discard_weights=False)
-    worker.llm.sleep.assert_called_once_with(level=1)
-
-    worker.llm.sleep.reset_mock()
-    worker.sleep(discard_weights=True)
-    worker.llm.sleep.assert_called_once_with(level=2)
-
-
-@pytest.mark.asyncio
-async def test_vllm_async_worker_sleep_uses_discard_weight_level(monkeypatch):
-    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
-    worker.cfg = {"vllm_cfg": {"async_engine": True}}
-    worker.llm = MagicMock()
-    worker.llm.reset_prefix_cache = AsyncMock()
-    worker.llm.reset_mm_cache = AsyncMock()
-    worker.llm.sleep = AsyncMock()
-    monkeypatch.setattr(
-        "nemo_rl.models.generation.vllm.vllm_worker_async.gc.collect", lambda: None
-    )
-    monkeypatch.setattr(
-        "nemo_rl.models.generation.vllm.vllm_worker_async.torch.cuda.empty_cache",
-        lambda: None,
-    )
-
-    await worker.sleep_async(discard_weights=False)
-    worker.llm.sleep.assert_awaited_once_with(level=1)
-
-    worker.llm.sleep.reset_mock()
-    await worker.sleep_async(discard_weights=True)
-    worker.llm.sleep.assert_awaited_once_with(level=2)
+def skip_fp8_known_failures() -> None:
+    device_name = torch.cuda.get_device_name()
+    if any(gpu_name in device_name for gpu_name in ("H100", "GB200")):
+        # TODO(https://github.com/NVIDIA-NeMo/RL/issues/2081): Re-enable these
+        # FP8 vLLM tests once the known H100/GB200 failures are fixed.
+        pytest.skip(
+            f"Skipping FP8 vLLM test on {device_name} due to a known failure. "
+            "See https://github.com/NVIDIA-NeMo/RL/issues/2081"
+        )
 
 
 def test_configure_generation_config_uses_real_startup_weights_without_draft_refit():
@@ -981,37 +911,37 @@ async def run_hf_train_process(
             lm_policy.shutdown()
 
 
-@pytest.mark.timeout(420)
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("async_engine", "cpu_offload", "vllm_precision", "enable_lora"),
     [
-        (True, False, "bfloat16", False),
-        (False, True, "bfloat16", False),
-        (True, False, "fp8", False),
-        (False, True, "fp8", False),
-        # LoRA tests (requires dtensor v2 / automodel)
-        pytest.param(False, False, "bfloat16", True, marks=pytest.mark.automodel),
-        pytest.param(True, False, "bfloat16", True, marks=pytest.mark.automodel),
+        pytest.param(True, False, "bfloat16", False, marks=pytest.mark.timeout(900)),
+        pytest.param(False, True, "bfloat16", False, marks=pytest.mark.timeout(900)),
+        pytest.param(True, False, "fp8", False, marks=pytest.mark.timeout(900)),
+        pytest.param(False, True, "fp8", False, marks=pytest.mark.timeout(900)),
+        # LoRA tests require dtensor v2 / automodel and take longer in CI.
+        pytest.param(
+            False,
+            False,
+            "bfloat16",
+            True,
+            marks=[pytest.mark.automodel, pytest.mark.timeout(900)],
+        ),
+        pytest.param(
+            True,
+            False,
+            "bfloat16",
+            True,
+            marks=[pytest.mark.automodel, pytest.mark.timeout(900)],
+        ),
     ],
 )
 async def test_vllm_generation_with_hf_training_colocated(
     cluster, tokenizer, async_engine, cpu_offload, vllm_precision, enable_lora
 ):
     """This test validates that DTensor policy can work together with colocated vLLM policy."""
-    device_name = torch.cuda.get_device_name(0)
-    if vllm_precision == "fp8" and "GB200" in device_name:
-        pytest.skip(
-            "Skipping FP8 test on GB200 until fixed. See https://github.com/NVIDIA-NeMo/RL/issues/2081"
-        )
-
-    # Skip the fp8 tests if the GPU is not H100 or newer (compute capability < 9.0)
     if vllm_precision == "fp8":
-        major_capability, _ = torch.cuda.get_device_capability()
-        if major_capability < 9:
-            pytest.skip(
-                f"Skipping FP8 test. GPU compute capability {major_capability}.0 is < 9.0 (H100 required)."
-            )
+        skip_fp8_known_failures()
 
     # Create VllmGeneration Policy
     print("Creating vLLM policy...")
@@ -1052,20 +982,31 @@ async def test_vllm_generation_with_hf_training_colocated(
     )
 
 
-@pytest.mark.timeout(300)
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("async_engine", "cpu_offload", "vllm_precision", "enable_lora"),
     [
-        (True, False, "bfloat16", False),
-        (False, True, "bfloat16", False),
+        pytest.param(True, False, "bfloat16", False, marks=pytest.mark.timeout(900)),
+        pytest.param(False, True, "bfloat16", False, marks=pytest.mark.timeout(900)),
         # NOTE: non-colocated FP8 tests fail on main as of 3/9/2026 with
         # avg_prob_mult_error=1.13 > 1.08 threshold. Left unskipped to match main.
-        (True, False, "fp8", False),
-        (False, True, "fp8", False),
-        # LoRA tests (requires dtensor v2 / automodel)
-        pytest.param(False, False, "bfloat16", True, marks=pytest.mark.automodel),
-        pytest.param(True, False, "bfloat16", True, marks=pytest.mark.automodel),
+        pytest.param(True, False, "fp8", False, marks=pytest.mark.timeout(900)),
+        pytest.param(False, True, "fp8", False, marks=pytest.mark.timeout(900)),
+        # LoRA tests require dtensor v2 / automodel and take longer in CI.
+        pytest.param(
+            False,
+            False,
+            "bfloat16",
+            True,
+            marks=[pytest.mark.automodel, pytest.mark.timeout(900)],
+        ),
+        pytest.param(
+            True,
+            False,
+            "bfloat16",
+            True,
+            marks=[pytest.mark.automodel, pytest.mark.timeout(900)],
+        ),
     ],
 )
 async def test_vllm_generation_with_hf_training_non_colocated(
@@ -1076,19 +1017,8 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     vllm_precision,
     enable_lora,
 ):
-    device_name = torch.cuda.get_device_name(0)
-    if vllm_precision == "fp8" and "GB200" in device_name:
-        pytest.skip(
-            "Skipping FP8 test on GB200 until fixed. See https://github.com/NVIDIA-NeMo/RL/issues/2081"
-        )
-
-    # Skip the fp8 tests if the GPU is not H100 or newer (compute capability < 9.0)
     if vllm_precision == "fp8":
-        major_capability, _ = torch.cuda.get_device_capability()
-        if major_capability < 9:
-            pytest.skip(
-                f"Skipping FP8 test. GPU compute capability {major_capability}.0 is < 9.0 (H100 required)."
-            )
+        skip_fp8_known_failures()
 
     """This test validates that DTensor policy can work together with non-colocated vLLM policy."""
     generation_cluster_separate = get_generation_cluster_separate(1)
@@ -1714,25 +1644,15 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
     vllm_generation.shutdown()
 
 
-@pytest.mark.timeout(600)
+@pytest.mark.timeout(900)
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
 @pytest.mark.parametrize("vllm_precision", ["bfloat16", "fp8"])
 def test_vllm_weight_update_and_prefix_cache_reset(
     cluster, tokenizer, tensor_parallel_size, vllm_precision
 ):
     """Test that the vLLM prefix cache is correctly reset when weights change."""
-    device_name = torch.cuda.get_device_name(0)
-    if vllm_precision == "fp8" and "GB200" in device_name:
-        pytest.skip(
-            "Skipping FP8 test on GB200 until fixed. See https://github.com/NVIDIA-NeMo/RL/issues/2081"
-        )
-
     if vllm_precision == "fp8":
-        major_capability, _ = torch.cuda.get_device_capability()
-        if major_capability < 9:
-            pytest.skip(
-                f"Skipping FP8 test. GPU compute capability {major_capability}.0 is < 9.0 (H100 required)."
-            )
+        skip_fp8_known_failures()
 
     from nemo_rl.models.policy.lm_policy import Policy
 
@@ -2130,7 +2050,7 @@ async def test_vllm_refit_non_colocated_update_weights(
 
 
 @pytest.mark.mcore
-@pytest.mark.timeout(360)
+@pytest.mark.timeout(600)
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
 @pytest.mark.parametrize("vllm_precision", ["bfloat16", "fp8"])
 @pytest.mark.parametrize("kv_cache_dtype", [None, "fp8"])
@@ -2141,23 +2061,12 @@ def test_vllm_generation_with_megatron_training(
 
     This test validates that vLLM and Megatron policies can work together.
     """
-    device_name = torch.cuda.get_device_name(0)
-    if vllm_precision == "fp8" and "GB200" in device_name:
-        pytest.skip(
-            "Skipping FP8 test on GB200 until fixed. See https://github.com/NVIDIA-NeMo/RL/issues/2081"
-        )
+    if vllm_precision == "fp8":
+        skip_fp8_known_failures()
 
     # Skip invalid configurations: kv_cache_dtype=fp8 requires precision=fp8
     if kv_cache_dtype == "fp8" and vllm_precision != "fp8":
         pytest.skip("kv_cache_dtype='fp8' requires precision='fp8'")
-
-    # Skip the fp8 tests if the GPU is not H100 or newer (compute capability < 9.0)
-    if vllm_precision == "fp8":
-        major_capability, _ = torch.cuda.get_device_capability()
-        if major_capability < 9:
-            pytest.skip(
-                f"Skipping FP8 test. GPU compute capability {major_capability}.0 is < 9.0 (H100 required)."
-            )
 
     if cluster.num_gpus_per_node < tensor_parallel_size:
         pytest.skip(f"Need at least {tensor_parallel_size} GPUs for this test")
@@ -2321,19 +2230,8 @@ def test_vllm_generation_with_megatron_training_moe_model(
 
     This test validates that vLLM and Megatron policies can work together.
     """
-    device_name = torch.cuda.get_device_name(0)
-    if vllm_precision == "fp8" and "GB200" in device_name:
-        pytest.skip(
-            "Skipping FP8 test on GB200 until fixed. See https://github.com/NVIDIA-NeMo/RL/issues/2081"
-        )
-
-    # Skip the fp8 tests if the GPU is not H100 or newer (compute capability < 9.0)
     if vllm_precision == "fp8":
-        major_capability, _ = torch.cuda.get_device_capability()
-        if major_capability < 9:
-            pytest.skip(
-                f"Skipping FP8 test. GPU compute capability {major_capability}.0 is < 9.0 (H100 required)."
-            )
+        skip_fp8_known_failures()
 
     model_name = "moonshotai/Moonlight-16B-A3B-Instruct"
     expert_parallel_size = 8

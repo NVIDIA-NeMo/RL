@@ -1680,11 +1680,7 @@ def grpo_train(
                             max_rollout_turns=master_config.grpo["max_rollout_turns"],
                             greedy=False,
                         )
-                    policy_generation.finish_generation(
-                        discard_weights=colocated_inference
-                    )
-                    if colocated_inference:
-                        POLICY_GENERATION_STALE = True
+                    policy_generation.finish_generation()
                     # Collect generation logger metrics for performance reporting after each generation step
                     # inflight batch sizes and num pending samples are collected from each worker
                     if policy_generation is not None:
@@ -1937,30 +1933,11 @@ def grpo_train(
                         rewards=rewards,
                         seq_logprob_error_threshold=seq_logprob_error_threshold,
                     )
-                    seq_logprob_error_metrics = {
-                        "max_seq_mult_prob_error": seq_error_result[
-                            "max_seq_mult_prob_error"
-                        ],
-                        "mean_seq_mult_prob_error": seq_error_result[
-                            "mean_seq_mult_prob_error"
-                        ],
-                        "min_seq_mult_prob_error": seq_error_result[
-                            "min_seq_mult_prob_error"
-                        ],
-                        "max_seq_mult_prob_error_after_mask": seq_error_result[
-                            "max_seq_mult_prob_error_after_mask"
-                        ],
-                        "mean_seq_mult_prob_error_after_mask": seq_error_result[
-                            "mean_seq_mult_prob_error_after_mask"
-                        ],
-                        "min_seq_mult_prob_error_after_mask": seq_error_result[
-                            "min_seq_mult_prob_error_after_mask"
-                        ],
-                        "num_masked_seqs_by_logprob_error": seq_error_result[
-                            "num_masked_seqs"
-                        ],
-                        "masked_correct_pct": seq_error_result["masked_correct_pct"],
-                    }
+                    seq_logprob_error_metrics = seq_error_result
+                    if "num_masked_seqs" in seq_logprob_error_metrics:
+                        seq_logprob_error_metrics[
+                            "num_masked_seqs_by_logprob_error"
+                        ] = seq_logprob_error_metrics.pop("num_masked_seqs")
 
                 # Compute advantages with adv_estimator using correct mask and logprobs
                 with timer.time("advantage_calculation"):
@@ -3066,30 +3043,11 @@ def async_grpo_train(
                         rewards=rewards,
                         seq_logprob_error_threshold=seq_logprob_error_threshold,
                     )
-                    seq_logprob_error_metrics = {
-                        "max_seq_mult_prob_error": seq_error_result[
-                            "max_seq_mult_prob_error"
-                        ],
-                        "mean_seq_mult_prob_error": seq_error_result[
-                            "mean_seq_mult_prob_error"
-                        ],
-                        "min_seq_mult_prob_error": seq_error_result[
-                            "min_seq_mult_prob_error"
-                        ],
-                        "max_seq_mult_prob_error_after_mask": seq_error_result[
-                            "max_seq_mult_prob_error_after_mask"
-                        ],
-                        "mean_seq_mult_prob_error_after_mask": seq_error_result[
-                            "mean_seq_mult_prob_error_after_mask"
-                        ],
-                        "min_seq_mult_prob_error_after_mask": seq_error_result[
-                            "min_seq_mult_prob_error_after_mask"
-                        ],
-                        "num_masked_seqs_by_logprob_error": seq_error_result[
-                            "num_masked_seqs"
-                        ],
-                        "masked_correct_pct": seq_error_result["masked_correct_pct"],
-                    }
+                    seq_logprob_error_metrics = seq_error_result
+                    if "num_masked_seqs" in seq_logprob_error_metrics:
+                        seq_logprob_error_metrics[
+                            "num_masked_seqs_by_logprob_error"
+                        ] = seq_logprob_error_metrics.pop("num_masked_seqs")
 
                 # Compute advantages with adv_estimator using correct mask and logprobs
                 with timer.time("advantage_calculation"):
