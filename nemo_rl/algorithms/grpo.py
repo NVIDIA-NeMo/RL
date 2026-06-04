@@ -1675,17 +1675,22 @@ def grpo_train(
                     # Save baseline for logging (before deletion)
                     baseline_for_log = baseline.clone()
 
-                    # Extract prompt-only messages for advantage estimation
-                    prompt_only_message_logs = _extract_prompt_only_messages(
-                        repeated_batch["message_log"]
-                    )
-                    prompt_batched_flat, _ = batched_message_log_to_flat_message(
-                        prompt_only_message_logs,
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                    )
-                    prompt_ids_for_adv = prompt_batched_flat["token_ids"]
-                    del prompt_only_message_logs
-                    del prompt_batched_flat
+                    # Use the dataset sample index (idx) as the prompt identifier
+                    # for advantage grouping. For multi-turn environments like
+                    # tau-bench, all tasks share the same initial system prompt and
+                    # opening user message, so prompt token sequences cannot
+                    # distinguish groups. The idx is identical for all
+                    # num_generations_per_prompt rollouts of the same task.
+                    #
+                    # NOTE: if using multi-dataset batches (task_data_processors is
+                    # a dict), idx values are independent per dataset and can collide
+                    # across datasets (e.g. task A idx=0 and task B idx=0 would be
+                    # incorrectly grouped together). In that case, use a composite
+                    # key that incorporates task_name to avoid cross-dataset merging.
+                    idx_vals = repeated_batch["idx"]
+                    prompt_ids_for_adv = torch.tensor(
+                        idx_vals, dtype=torch.long, device=rewards.device
+                    ).unsqueeze(-1)
                     del input_ids
                     del baseline
                     del std
@@ -2750,19 +2755,24 @@ def async_grpo_train(
 
                 print("▶ Processing rewards...")
                 with timer.time("reward_calculation"):
-                    # Extract prompt-only messages for advantage estimation
-                    prompt_only_message_logs = _extract_prompt_only_messages(
-                        repeated_batch["message_log"]
-                    )
-                    prompt_batched_flat, _ = batched_message_log_to_flat_message(
-                        prompt_only_message_logs,
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                    )
-                    prompt_ids_for_adv = prompt_batched_flat["token_ids"]
-                    del prompt_only_message_logs
-                    del prompt_batched_flat
-
                     rewards = repeated_batch["total_reward"]
+
+                    # Use the dataset sample index (idx) as the prompt identifier
+                    # for advantage grouping. For multi-turn environments like
+                    # tau-bench, all tasks share the same initial system prompt and
+                    # opening user message, so prompt token sequences cannot
+                    # distinguish groups. The idx is identical for all
+                    # num_generations_per_prompt rollouts of the same task.
+                    #
+                    # NOTE: if using multi-dataset batches (task_data_processors is
+                    # a dict), idx values are independent per dataset and can collide
+                    # across datasets (e.g. task A idx=0 and task B idx=0 would be
+                    # incorrectly grouped together). In that case, use a composite
+                    # key that incorporates task_name to avoid cross-dataset merging.
+                    idx_vals = repeated_batch["idx"]
+                    prompt_ids_for_adv = torch.tensor(
+                        idx_vals, dtype=torch.long, device=rewards.device
+                    ).unsqueeze(-1)
 
                     print(
                         f"  📊 Rewards stats: min={rewards.min():.4f}, max={rewards.max():.4f}, mean={rewards.mean():.4f}, std={rewards.std():.4f}"

@@ -268,6 +268,8 @@ class TauBenchWorker:
         if match:
             try:
                 payload = json.loads(match.group(1).strip())
+                if not isinstance(payload, dict):
+                    raise ValueError("tool call JSON must be an object")
                 kwargs = payload.get("arguments", payload.get("kwargs", {}))
                 if not isinstance(kwargs, dict):
                     kwargs = {}
@@ -275,7 +277,7 @@ class TauBenchWorker:
                     name=payload["name"],
                     kwargs=kwargs,
                 )
-            except (json.JSONDecodeError, KeyError):
+            except (json.JSONDecodeError, KeyError, ValueError):
                 pass
         # Guard against empty content: some model APIs (including NVIDIA NIM) reject
         # messages with empty string content.
@@ -397,6 +399,11 @@ class TauBenchWorker:
                 break
             except Exception as e:
                 last_exc = e
+                # BadRequestError (e.g. context too long) is deterministic —
+                # retrying won't help. Force-terminate immediately.
+                import litellm
+                if isinstance(e, litellm.BadRequestError):
+                    break
                 delay = 2 ** attempt + random.uniform(0, 1)
                 print(
                     f"[TauBench worker] tau_env.step attempt {attempt + 1}/5 failed "

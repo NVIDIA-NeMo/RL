@@ -99,12 +99,21 @@ def _build_records(tau_bench_env_name: str, split: str) -> list[dict[str, Any]]:
     # time. We read task.instruction directly — env.reset() is intentionally
     # NOT called here because HumanUserSimulationEnv.reset() blocks on
     # input(), which would hang the process for every task.
-    env = get_env(
-        env_name=tau_bench_env_name,
-        user_strategy="human",
-        user_model="",
-        task_split=split,
-    )
+    try:
+        env = get_env(
+            env_name=tau_bench_env_name,
+            user_strategy="human",
+            user_model="",
+            task_split=split,
+        )
+    except IndexError:
+        # The requested split has no tasks (e.g. the data file does not exist).
+        # Return an empty list so the caller can handle it gracefully.
+        print(
+            f"[WARNING] tau-bench split '{split}' has no tasks for env "
+            f"'{tau_bench_env_name}'. Returning empty dataset."
+        )
+        return []
 
     system_prompt = _build_system_prompt(env, tau_bench_env_name)
 
