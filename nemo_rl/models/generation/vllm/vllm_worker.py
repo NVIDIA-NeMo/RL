@@ -24,6 +24,10 @@ import torch
 from transformers import AutoConfig
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_VLLM_PORT_RANGE_LOW,
+    DEFAULT_VLLM_PORTS_PER_ENGINE,
+)
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
@@ -35,6 +39,13 @@ from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generati
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+
+
+def _resolve_enable_prefix_caching(vllm_cfg: dict[str, Any]) -> bool:
+    enable_prefix_caching = vllm_cfg.get("enable_prefix_caching", None)
+    if enable_prefix_caching is None:
+        enable_prefix_caching = torch.cuda.get_device_capability()[0] >= 8
+    return enable_prefix_caching
 
 
 # Use a base class to share some functions to avoid code duplication.
@@ -96,6 +107,21 @@ class BaseVllmGenerationWorker:
             # https://github.com/vllm-project/vllm/issues/18851
             env_vars["VLLM_CACHE_ROOT"] = os.path.expanduser(f"~/.cache/vllm_{seed}")
 
+            # Give each vLLM engine a deterministic starting port for TP/DP
+            # rendezvous.  vLLM's _get_open_port() reads VLLM_PORT and
+            # auto-increments on collision, so the per-engine spacing
+            # provides headroom.  See the port layout in virtual_cluster.py.
+            if len(local_bundle_indices) == 1:
+                engine_index_on_node = local_bundle_indices[0]
+            else:
+                engine_index_on_node = local_bundle_indices[0] // len(
+                    local_bundle_indices
+                )
+            env_vars["VLLM_PORT"] = str(
+                DEFAULT_VLLM_PORT_RANGE_LOW
+                + engine_index_on_node * DEFAULT_VLLM_PORTS_PER_ENGINE
+            )
+
         # Check if this worker is part of a parallel group (TP or TP+PP).
         # A worker is part of a parallel group if it's a secondary member (local_bundle_indices is None)
         # or if it's a primary member of a group with multiple workers.
@@ -121,6 +147,7 @@ class BaseVllmGenerationWorker:
         bundle_indices: Optional[list[int]] = None,
         fraction_of_gpus: float = 1.0,
         seed: Optional[int] = None,
+        extra_env_vars: Optional[list[str]] = None,
     ):
         """Initialize a vLLM worker for distributed inference.
 
@@ -130,6 +157,8 @@ class BaseVllmGenerationWorker:
                           Only needed for the first worker in each tied worker group.
             fraction_of_gpus: Fraction of GPUs to use for this worker
             seed: Random seed for initialization
+            extra_env_vars: Additional environment variable names to forward into
+                          the vLLM worker subprocess (e.g. for quantization configs).
         """
         self.cfg = config
         self.model_name = self.cfg["model_name"]
@@ -212,10 +241,13 @@ class BaseVllmGenerationWorker:
                 "self._init_workers_ray(placement_group)",
                 'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"}',
             ]
+            extra_env_str = ", ".join(
+                [f'"{env_var}"' for env_var in (extra_env_vars or [])]
+            )
 
             new_lines = [
                 f'self._init_workers_ray(placement_group, runtime_env={{"py_executable": "{self.py_executable}"}})',
-                'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "NCCL_CUMEM_ENABLE", "NCCL_NVLS_ENABLE", "RAY_ENABLE_UV_RUN_RUNTIME_ENV"}',
+                f'ADDITIONAL_ENV_VARS = {{"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "NCCL_CUMEM_ENABLE", "NCCL_NVLS_ENABLE", "RAY_ENABLE_UV_RUN_RUNTIME_ENV", {extra_env_str}}}',
             ]
 
             need_replace = False
@@ -253,6 +285,7 @@ class BaseVllmGenerationWorker:
                 "        self.lm_head = ParallelLMHead(\n"
                 "            self.config.draft_vocab_size,\n"
                 "            self.config.hidden_size,\n"
+                "            quant_config=get_draft_quant_config(vllm_config),\n"
                 '            prefix=maybe_prefix(prefix, "lm_head"),\n'
                 "        )\n"
                 "        self.logits_processor = LogitsProcessor(\n"
@@ -262,6 +295,7 @@ class BaseVllmGenerationWorker:
                 "        self.lm_head = ParallelLMHead(\n"
                 "            self.config.draft_vocab_size,\n"
                 "            self.config.hidden_size,\n"
+                "            quant_config=get_draft_quant_config(vllm_config),\n"
                 '            prefix=maybe_prefix(prefix, "lm_head"),\n'
                 "        )\n"
                 "        self.has_own_lm_head = (\n"
@@ -546,9 +580,7 @@ class BaseVllmGenerationWorker:
             pipeline_parallel_size=self.pipeline_parallel_size,
             enable_expert_parallel=self.enable_expert_parallel,
             gpu_memory_utilization=self.gpu_memory_utilization,
-            enable_prefix_caching=self.cfg["vllm_cfg"].get(
-                "enable_prefix_caching", torch.cuda.get_device_capability()[0] >= 8
-            ),
+            enable_prefix_caching=_resolve_enable_prefix_caching(self.cfg["vllm_cfg"]),
             dtype=self.precision,
             seed=seed,
             enforce_eager=self.cfg["vllm_cfg"]["enforce_eager"],
@@ -657,10 +689,7 @@ class BaseVllmGenerationWorker:
         return metrics
 
 
-@ray.remote(
-    runtime_env={**get_nsight_config_if_pattern_matches("vllm_generation_worker")}
-)  # pragma: no cover
-class VllmGenerationWorker(BaseVllmGenerationWorker):
+class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
         import vllm
 
@@ -700,10 +729,10 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
         Returns:
             BatchedDataDict conforming to GenerationOutputSpec:
-                - output_ids: input + generated token IDs with proper padding
-                - logprobs: Log probabilities for tokens
-                - generation_lengths: Lengths of each response
-                - unpadded_sequence_lengths: Lengths of each input + generated sequence
+                - ``output_ids``: input + generated token IDs with proper padding
+                - ``logprobs``: Log probabilities for tokens
+                - ``generation_lengths``: Lengths of each response
+                - ``unpadded_sequence_lengths``: Lengths of each input + generated sequence
         """
         # Handle empty input case
         if len(data["input_ids"]) == 0:
@@ -1051,3 +1080,10 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         except Exception as e:
             print(f"Error during vLLM shutdown: {e}")
             return False
+
+
+@ray.remote(
+    runtime_env={**get_nsight_config_if_pattern_matches("vllm_generation_worker")}
+)  # pragma: no cover
+class VllmGenerationWorker(VllmGenerationWorkerImpl):
+    pass

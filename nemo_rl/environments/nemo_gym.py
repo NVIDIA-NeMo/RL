@@ -12,13 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from pathlib import Path
-from typing import Any, Dict, List, TypedDict
+from typing import Any, Dict, List, NotRequired, TypedDict
 
 import ray
 import torch
 from transformers import PreTrainedTokenizerBase
 
-from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
+from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_GYM_PORT_RANGE_HIGH,
+    DEFAULT_GYM_PORT_RANGE_LOW,
+    _get_free_port_local,
+    _get_node_ip_local,
+)
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.utils.timer import Timer
 
@@ -27,6 +32,11 @@ class NemoGymConfig(TypedDict):
     model_name: str
     base_urls: List[str]
     initial_global_config_dict: Dict[str, Any]
+    # Port range for Gym HTTP servers (head server + subprocess servers).
+    # Defaults to DEFAULT_GYM_PORT_RANGE_LOW/HIGH (15001-20000) from
+    # nemo_rl.distributed.virtual_cluster.  See the port layout there.
+    port_range_low: NotRequired[int]
+    port_range_high: NotRequired[int]
 
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
@@ -37,7 +47,9 @@ class NemoGym(EnvironmentInterface):
         self.cfg = cfg
 
         self.node_ip = _get_node_ip_local()
-        self.head_server_port = _get_free_port_local()
+        _gym_port_low = self.cfg.get("port_range_low", DEFAULT_GYM_PORT_RANGE_LOW)
+        _gym_port_high = self.cfg.get("port_range_high", DEFAULT_GYM_PORT_RANGE_HIGH)
+        self.head_server_port = _get_free_port_local(_gym_port_low, _gym_port_high)
 
         from nemo_gym.cli import GlobalConfigDictParserConfig, RunHelper
         from nemo_gym.rollout_collection import RolloutCollectionHelper
@@ -56,6 +68,24 @@ class NemoGym(EnvironmentInterface):
             "dummy_key"  # No key necessary for training.
         )
         initial_global_config_dict["policy_base_url"] = self.cfg["base_urls"]
+        # In multinode runs, Gym-managed service configs must advertise a real node IP
+        # rather than falling back to localhost, or remote workers will connect to
+        # their own loopback interface instead of the actor-hosted service.
+        initial_global_config_dict.setdefault("default_host", self.node_ip)
+
+        _gym_port_low = self.cfg.get("port_range_low", DEFAULT_GYM_PORT_RANGE_LOW)
+        _gym_port_high = self.cfg.get("port_range_high", DEFAULT_GYM_PORT_RANGE_HIGH)
+        if (
+            _gym_port_low < DEFAULT_GYM_PORT_RANGE_LOW
+            or _gym_port_high > DEFAULT_GYM_PORT_RANGE_HIGH
+        ):
+            print(
+                f"WARNING: Gym port range [{_gym_port_low}, {_gym_port_high}) is outside "
+                f"the default [{DEFAULT_GYM_PORT_RANGE_LOW}, {DEFAULT_GYM_PORT_RANGE_HIGH}). "
+                f"Check the port layout in virtual_cluster.py for conflicts."
+            )
+        initial_global_config_dict["port_range_low"] = _gym_port_low
+        initial_global_config_dict["port_range_high"] = _gym_port_high
 
         initial_global_config_dict.setdefault(
             "global_aiohttp_connector_limit_per_host", 16_384
@@ -183,6 +213,7 @@ Depending on your data shape, you may want to change these values."""
 
         nemo_rl_message_log = []
         seen_token_ids: List[int] = []
+        batch_decode_items = []
         for output_item_dict in nemo_gym_result["response"]["output"]:
             # Nemo RL really only has two types of messages: assistant and not assistant since that is all that it is concerned with (i.e. to train or not to train)
             # Here we map all the trainable messages to assistant and all the non-trainable messages to user.
@@ -200,37 +231,48 @@ Seen token IDs: {seen_token_ids}
 Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
 """
 
+            prompt_token_ids = output_item_dict.pop("prompt_token_ids")
+            generation_token_ids = output_item_dict.pop("generation_token_ids")
+            generation_log_probs = output_item_dict.pop("generation_log_probs")
+            new_prompt_token_ids = prompt_token_ids[len(seen_token_ids) :]
+
             nemo_rl_message_log.append(
                 {
                     "role": "user",
                     "content": "",
-                    "token_ids": torch.tensor(
-                        output_item_dict["prompt_token_ids"][len(seen_token_ids) :]
-                    ),
+                    "token_ids": torch.tensor(new_prompt_token_ids),
                 }
             )
             nemo_rl_message_log.append(
                 {
                     "role": "assistant",
                     "content": "",
-                    "token_ids": torch.tensor(output_item_dict["generation_token_ids"]),
-                    "generation_logprobs": torch.tensor(
-                        output_item_dict["generation_log_probs"]
-                    ),
+                    "token_ids": torch.tensor(generation_token_ids),
+                    "generation_logprobs": torch.tensor(generation_log_probs),
                 }
             )
 
-            seen_token_ids.extend(nemo_rl_message_log[-2]["token_ids"])
-            seen_token_ids.extend(nemo_rl_message_log[-1]["token_ids"])
+            seen_token_ids.extend(new_prompt_token_ids)
+            seen_token_ids.extend(generation_token_ids)
 
             # We pop to remove larger tensors from logging.
-            output_item_dict["prompt_str"] = tokenizer.decode(
-                output_item_dict.pop("prompt_token_ids")
+            batch_decode_items.append(
+                (output_item_dict, prompt_token_ids, generation_token_ids)
             )
-            output_item_dict["generation_str"] = tokenizer.decode(
-                output_item_dict.pop("generation_token_ids")
+
+        if batch_decode_items:
+            prompt_strs = tokenizer.batch_decode(
+                [item[1] for item in batch_decode_items]
             )
-            output_item_dict.pop("generation_log_probs")
+            generation_strs = tokenizer.batch_decode(
+                [item[2] for item in batch_decode_items]
+            )
+
+            for (output_item_dict, _, _), prompt_str, generation_str in zip(
+                batch_decode_items, prompt_strs, generation_strs
+            ):
+                output_item_dict["prompt_str"] = prompt_str
+                output_item_dict["generation_str"] = generation_str
 
         if not nemo_rl_message_log:
             input_messages = nemo_gym_result["responses_create_params"]["input"]
@@ -270,7 +312,7 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
 
 
 def setup_nemo_gym_config(config, tokenizer) -> None:
-    generation_config = config["policy"]["generation"]
+    generation_config = config.policy["generation"]
 
     # Enable the http server. Requires both async engine and the expose_http_server flag
     generation_config["vllm_cfg"]["async_engine"] = True

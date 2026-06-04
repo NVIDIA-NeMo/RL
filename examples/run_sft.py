@@ -17,7 +17,6 @@ import os
 import pprint
 from functools import partial
 
-from datasets import concatenate_datasets
 from omegaconf import OmegaConf
 from transformers import AutoTokenizer
 
@@ -27,6 +26,7 @@ from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import (
     AllTaskProcessedDataset,
     load_response_dataset,
+    merge_datasets,
     update_single_dataset_config,
 )
 from nemo_rl.distributed.virtual_cluster import init_ray
@@ -89,7 +89,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
         if hasattr(data, "preprocessor") and data.preprocessor is not None:
             task_data_preprocessors[data.task_name] = data.preprocessor
 
-    merged_data = concatenate_datasets([data.dataset for data in data_list])
+    merged_data = merge_datasets([data.dataset for data in data_list])
     dataset = AllTaskProcessedDataset(
         merged_data,
         tokenizer,
@@ -144,7 +144,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
 
     val_dataset = None
     if len(val_data_list) > 0:
-        merged_val_data = concatenate_datasets(val_data_list)
+        merged_val_data = merge_datasets(val_data_list)
         val_dataset = AllTaskProcessedDataset(
             merged_val_data,
             tokenizer,
@@ -174,27 +174,28 @@ def main(is_vlm: bool = False):
         print(f"Overrides: {overrides}")
         config = parse_hydra_overrides(config, overrides)
 
-    config: MasterConfig = OmegaConf.to_container(config, resolve=True)
+    config = OmegaConf.to_container(config, resolve=True)
+    config = MasterConfig(**config)
     print("Applied CLI overrides")
 
     # Print config
     print("Final config:")
     pprint.pprint(config)
 
-    config["logger"]["log_dir"] = get_next_experiment_dir(config["logger"]["log_dir"])
-    print(f"📊 Using log directory: {config['logger']['log_dir']}")
-    if config["checkpointing"]["enabled"]:
+    config.logger["log_dir"] = get_next_experiment_dir(config.logger["log_dir"])
+    print(f"📊 Using log directory: {config.logger['log_dir']}")
+    if config.checkpointing["enabled"]:
         print(
-            f"📊 Using checkpoint directory: {config['checkpointing']['checkpoint_dir']}"
+            f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
         )
 
     init_ray()
 
     # setup tokenizer (or processor)
-    tokenizer = get_tokenizer(config["policy"]["tokenizer"], get_processor=is_vlm)
+    tokenizer = get_tokenizer(config.policy["tokenizer"], get_processor=is_vlm)
 
     # setup data
-    dataset, val_dataset = setup_data(tokenizer, config["data"])
+    dataset, val_dataset = setup_data(tokenizer, config.data)
 
     (
         policy,

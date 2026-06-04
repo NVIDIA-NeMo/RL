@@ -72,12 +72,12 @@ set -e
 # error: Submodule '3rdparty/Automodel-workspace/Automodel' could not be updated.
 # error: Entry '3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/examples/models/generate_from_hf.py' not uptodate. Cannot merge.
 # error: Submodule '3rdparty/Megatron-Bridge-workspace/Megatron-Bridge' could not be updated.
-# error: Entry '3rdparty/Megatron-LM-workspace/Megatron-LM/.github/copy-pr-bot.yaml' not uptodate. Cannot merge.
-# error: Submodule '3rdparty/Megatron-LM-workspace/Megatron-LM' could not be updated.
+# error: Entry '3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM/.github/copy-pr-bot.yaml' not uptodate. Cannot merge.
+# error: Submodule '3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM' could not be updated.
 # error: Cannot update submodule:
 #         3rdparty/Automodel-workspace/Automodel
 #         3rdparty/Megatron-Bridge-workspace/Megatron-Bridge
-#         3rdparty/Megatron-LM-workspace/Megatron-LM
+#         3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM
 git submodule foreach --recursive 'git reset --hard >/dev/null 2>&1 && git clean -fdx >/dev/null 2>&1'
 
 exit $ret_code

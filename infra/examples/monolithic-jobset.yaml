@@ -1,0 +1,321 @@
+# Monolithic RL JobSet for GB300 — single Ray cluster, colocated generation.
+#
+# Three ReplicatedJobs:
+#   head     — Ray head daemon (CPU-only)
+#   workers  — GPU worker pods (4 GPUs each), topology-aware via compute-domain + RoCE
+#   driver   — Submits training job via ray job submit, gates JobSet success
+#
+# Prerequisites:
+#   kubectl apply -f kai-queue.yaml
+#   kubectl apply -f endpoint-registry-rbac.yaml
+#
+# Usage:
+#   kubectl apply -f monolithic-jobset.yaml
+#   kubectl get jobset monolithic-job -w
+#
+# Cleanup:
+#   kubectl delete jobset monolithic-job
+#   kubectl delete computedomain compute-domain-monolithic
+#   kubectl delete resourceclaimtemplate roce-monolithic
+#   # Note: the compute-domain ResourceClaimTemplate is auto-created by the
+#   # controller and will be cleaned up when the ComputeDomain CR is deleted.
+#
+# ---
+# Topology-aware scheduling (DRA)
+#
+# Raw JobSets require you to create DRA resources yourself. Higher-level
+# abstractions like Kubeflow TrainJob + TrainingRuntime auto-create them per job,
+# but with raw JobSets you manage them explicitly.
+#
+# Each job needs its own set so its pods are co-located together (not mixed
+# with another job's pods). Create a unique set per job and clean them up after.
+#
+# There are two things to create:
+#
+# 1. ComputeDomain CR (resource.nvidia.com/v1beta1):
+#    Ensures all worker pods land in the same NVSwitch/MNNVL compute domain.
+#    Set spec.channel.resourceClaimTemplate.name to a name of your choice.
+#    The compute-domain controller will AUTO-CREATE a ResourceClaimTemplate with
+#    that name, populated with the correct domainID (the ComputeDomain's UID),
+#    labels, and finalizer. Do NOT pre-create the ResourceClaimTemplate yourself
+#    — if one already exists with that name, the controller will skip creation
+#    and the template will be missing the domainID, breaking topology placement.
+#    Set numNodes to 0 for elastic mode (recommended).
+#
+# 2. ResourceClaimTemplate for RoCE NICs:
+#    Allocates RoCE (RDMA) NICs per worker pod for inter-node communication.
+#    This is a separate DRA driver (dra.networking.k8s.aws) — you create it yourself.
+#    Adjust the count based on your node type:
+#      - GB300 ( NVL72 GB300 node): count: 8 (8 RoCE NICs per node)
+#
+# Only GPU worker pods need these claims (referenced via resources.claims in the
+# container spec and resourceClaims in the pod spec).
+
+# --- 1. ComputeDomain (controller auto-creates the ResourceClaimTemplate) ---
+apiVersion: resource.nvidia.com/v1beta1
+kind: ComputeDomain
+metadata:
+  name: compute-domain-monolithic
+spec:
+  channel:
+    resourceClaimTemplate:
+      name: compute-domain-monolithic   # controller creates RCT with this name
+  numNodes: 0   # elastic mode — controller doesn't wait for a fixed node count
+---
+# --- 2. RoCE ResourceClaimTemplate (manually created) ---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: roce-monolithic
+spec:
+  spec:
+    devices:
+      requests:
+      - exactly:
+          count: 8   # 8 RoCE NICs per GB300 node; adjust for other node types
+          deviceClassName: roce.networking.k8s.aws
+        name: roce
+---
+# --- JobSet ---
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: monolithic-job
+  labels:
+    kai.scheduler/queue: default-queue
+spec:
+  network:
+    enableDNSHostnames: true
+    publishNotReadyAddresses: true
+
+  coordinator:
+    replicatedJob: head
+    jobIndex: 0
+    podIndex: 0
+
+  successPolicy:
+    operator: All
+    targetReplicatedJobs: [driver]
+
+  failurePolicy:
+    maxRestarts: 0
+    rules:
+    - name: head_crash
+      action: FailJobSet
+      targetReplicatedJobs: [head]
+    - name: driver_crash
+      action: FailJobSet
+      targetReplicatedJobs: [driver]
+    - name: worker_crash
+      action: FailJobSet
+      targetReplicatedJobs: [workers]
+
+  replicatedJobs:
+  # ========================
+  # Ray head (CPU-only)
+  # ========================
+  - name: head
+    replicas: 1
+    template:
+      spec:
+        backoffLimit: 0
+        completions: 1
+        parallelism: 1
+        template:
+          spec:
+            schedulerName: kai-scheduler
+            imagePullSecrets:
+            - name: nvcr-secret
+            tolerations:
+            - operator: Exists
+            containers:
+            - name: ray-head
+              image: nvcr.io/nvidian/nemo-rl:nightly
+              command: ["/bin/bash", "-c"]
+              args:
+              - |
+                ulimit -n 65536
+                ray start --head --port=6379 \
+                  --dashboard-host=0.0.0.0 \
+                  --num-gpus=0 \
+                  --object-store-memory=200000000 \
+                  --block
+              ports:
+              - { containerPort: 6379, name: gcs-server }
+              - { containerPort: 8265, name: dashboard }
+              - { containerPort: 10001, name: client }
+              readinessProbe:
+                exec:
+                  command: ["ray", "health-check"]
+                initialDelaySeconds: 10
+                periodSeconds: 5
+                timeoutSeconds: 5
+              resources:
+                requests: { cpu: "2", memory: "8Gi" }
+                limits:   { cpu: "8", memory: "32Gi" }
+              env:
+              - { name: RAY_ADDRESS, value: "127.0.0.1:6379" }
+              - { name: RAY_memory_monitor_refresh_ms, value: "0" }
+              volumeMounts:
+              - { name: dshm, mountPath: /dev/shm }
+              - { name: rl-workspace, mountPath: /mnt/rl-workspace }
+            volumes:
+            - name: dshm
+              emptyDir: { medium: Memory, sizeLimit: 16Gi }
+            - name: rl-workspace
+              persistentVolumeClaim: { claimName: rl-workspace }
+
+  # ========================
+  # GPU workers (4 pods × 4 GPUs = 16 GPUs)
+  # ========================
+  - name: workers
+    replicas: 1
+    template:
+      spec:
+        backoffLimit: 0
+        completions: 4
+        parallelism: 4
+        template:
+          spec:
+            schedulerName: kai-scheduler
+            imagePullSecrets:
+            - name: nvcr-secret
+            tolerations:
+            - operator: Exists
+            initContainers:
+            - name: wait-for-head
+              image: nvcr.io/nvidian/nemo-rl:nightly
+              command: ["/bin/bash", "-c"]
+              args:
+              - |
+                HEAD=monolithic-job-head-0-0.monolithic-job
+                echo "Waiting for head at ${HEAD}:6379..."
+                until ray health-check --address ${HEAD}:6379 >/dev/null 2>&1; do
+                  sleep 5
+                done
+                echo "Head is ready."
+              resources:
+                requests: { cpu: "200m", memory: "256Mi" }
+            containers:
+            - name: ray-worker
+              image: nvcr.io/nvidian/nemo-rl:nightly
+              command: ["/bin/bash", "-c"]
+              args:
+              - |
+                ulimit -n 65536
+                HEAD=monolithic-job-head-0-0.monolithic-job
+                ray start --address=${HEAD}:6379 \
+                  --num-gpus=4 \
+                  --object-store-memory=200000000 \
+                  --block
+              resources:
+                claims:
+                - name: compute-domain-channel
+                - name: roce-channel
+                requests:
+                  cpu: "32"
+                  memory: "200Gi"
+                  nvidia.com/gpu: "4"
+                limits:
+                  cpu: "128"
+                  memory: "800Gi"
+                  nvidia.com/gpu: "4"
+              env:
+              - { name: RAY_ADDRESS, value: "monolithic-job-head-0-0.monolithic-job:6379" }
+              - { name: RAY_memory_monitor_refresh_ms, value: "0" }
+              - { name: HF_HOME, value: /mnt/rl-workspace/shared/hf-cache }
+              - { name: HF_DATASETS_CACHE, value: /mnt/rl-workspace/shared/hf-cache/datasets }
+              - { name: TRANSFORMERS_CACHE, value: /mnt/rl-workspace/shared/hf-cache }
+              - { name: NCCL_DEBUG, value: INFO }
+              - { name: NCCL_MNNVL_ENABLE, value: "1" }
+              volumeMounts:
+              - { name: dshm, mountPath: /dev/shm }
+              - { name: rl-workspace, mountPath: /mnt/rl-workspace }
+              securityContext:
+                capabilities:
+                  add: [IPC_LOCK]
+            resourceClaims:
+            - name: compute-domain-channel
+              resourceClaimTemplateName: compute-domain-monolithic
+            - name: roce-channel
+              resourceClaimTemplateName: roce-monolithic
+            volumes:
+            - name: dshm
+              emptyDir: { medium: Memory, sizeLimit: 64Gi }
+            - name: rl-workspace
+              persistentVolumeClaim: { claimName: rl-workspace }
+
+  # ========================
+  # Driver (submits SFT training, gates success)
+  # ========================
+  - name: driver
+    replicas: 1
+    template:
+      spec:
+        backoffLimit: 0
+        completions: 1
+        parallelism: 1
+        template:
+          spec:
+            schedulerName: kai-scheduler
+            imagePullSecrets:
+            - name: nvcr-secret
+            tolerations:
+            - operator: Exists
+            initContainers:
+            - name: wait-for-head
+              image: nvcr.io/nvidian/nemo-rl:nightly
+              command: ["/bin/bash", "-c"]
+              args:
+              - |
+                HEAD=monolithic-job-head-0-0.monolithic-job
+                echo "Waiting for head at ${HEAD}:6379..."
+                until ray health-check --address ${HEAD}:6379 >/dev/null 2>&1; do
+                  sleep 5
+                done
+                echo "Head is ready."
+              resources:
+                requests: { cpu: "200m", memory: "256Mi" }
+            containers:
+            - name: driver
+              image: nvcr.io/nvidian/nemo-rl:nightly
+              command: ["/bin/bash", "-c"]
+              args:
+              - |
+                set -eo pipefail
+                HEAD=monolithic-job-head-0-0.monolithic-job
+                SUBMISSION_ID="sft-$(date +%s)"
+
+                ray job submit --address http://${HEAD}:8265 \
+                  --submission-id ${SUBMISSION_ID} \
+                  -- bash -c "
+                    cd /opt/nemo-rl
+                    export HF_HOME=/mnt/rl-workspace/shared/hf-cache
+                    export HF_DATASETS_CACHE=/mnt/rl-workspace/shared/hf-cache/datasets
+                    export TRANSFORMERS_CACHE=/mnt/rl-workspace/shared/hf-cache
+
+                    python -u examples/run_sft.py \
+                      --config examples/configs/sft.yaml \
+                      policy.model_name=Qwen/Qwen3-0.6B \
+                      cluster.gpus_per_node=4 \
+                      cluster.num_nodes=4 \
+                      policy.train_global_batch_size=32 \
+                      policy.train_micro_batch_size=1 \
+                      policy.max_total_sequence_length=1024 \
+                      policy.dtensor_cfg.tensor_parallel_size=1 \
+                      sft.max_num_steps=10 \
+                      sft.val_period=5 \
+                      checkpointing.enabled=false \
+                      logger.wandb_enabled=false \
+                      logger.tensorboard_enabled=false
+                  " 2>&1
+              resources:
+                requests: { cpu: "500m", memory: "2Gi" }
+                limits:   { cpu: "2", memory: "8Gi" }
+              env:
+              - { name: RAY_ADDRESS, value: "monolithic-job-head-0-0.monolithic-job:6379" }
+              volumeMounts:
+              - { name: rl-workspace, mountPath: /mnt/rl-workspace }
+            volumes:
+            - name: rl-workspace
+              persistentVolumeClaim: { claimName: rl-workspace }

@@ -24,7 +24,6 @@ from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
     sharded_state_dict_default,
 )
-from modelopt.torch.speculative.plugins.megatron_eagle import EagleModule
 from torch import Tensor
 
 
@@ -47,6 +46,12 @@ class EagleModel(MegatronModule):
                 not torch.cuda.is_available(),
             ),
         )
+        # Prevent modelopt import from breaking unrelated functionality.
+        # TODO: Investigate the circular import chain inside `modelopt.torch.quantization`:
+        # backends/__init__.py -> from .nvfp4_gemm import * -> nvfp4_gemm.py ->
+        # from ...quant_linear import RealQuantLinear -> quant_linear.py -> from ... import backends
+        from modelopt.torch.speculative.plugins.megatron_eagle import EagleModule
+
         # Many specdec libraries use LlamaForCausalLMEagle3 class by default so rope is hardcoded
         self.eagle_module = EagleModule(
             config=config, rotary_pos_emb=rotary_pos_emb, bias=False

@@ -15,14 +15,14 @@ for model sizes under 70B at up to 32k sequence length.
 **LLMs**:
 
 - **Qwen**: Qwen3.5-9B/35B-A3B/397B-A17B, Qwen3-1.5B/8B/32B, Qwen3-30B-A3B, Qwen3-235B-A22B, Qwen2.5-1.5B/7B/32B
-- **GLM**: GLM-4.7-Flash
+- **GLM**: GLM-4.7-Flash, GLM-5.1
 - **Llama**: Llama 3.1/3.3-8B, Llama 3.1/3.3-70B, Llama 3.2-1B
 - **Deepseek**: Deepseek-V3/R1-671B
 - **Mistral**: Mistral-NeMo-12B
 - **Moonlight-16B-A3B**
 - **Gemma**: Gemma-3-1B/27B
 - **GPT-OSS**: GPT-OSS-20B/120B
-- **NeMotron**: Llama-Nemotron-Super-49B, Nemotron-nano-v2-12B, Nemotron-Nano-v3-30A3B
+- **Nemotron**: [NVIDIA-Nemotron-3-Super-120B-A12B](https://github.com/NVIDIA-NeMo/RL/blob/super-v3/docs/guides/nemotron-3-super.md) (available on the [`super-v3` branch](https://github.com/NVIDIA-NeMo/RL/tree/super-v3) — see the branch-specific guide), Nemotron-3-Nano-30B-A3B, Llama-3.3-Nemotron-Super-49B, Nemotron-Nano-12B-v2
 
 **VLMs**:
 

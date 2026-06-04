@@ -28,8 +28,16 @@ os.environ["RAY_TEMP_DIR"] = _temp_dir
 os.environ["RAY_TMPDIR"] = _temp_dir  # Alternative env var
 os.environ["TMPDIR"] = _temp_dir  # System temp dir
 
-from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
-from nemo_rl.algorithms.grpo import MasterConfig
+from nemo_rl.algorithms.async_utils import (
+    AsyncTrajectoryCollector,
+    ReplayBuffer,
+)
+from nemo_rl.algorithms.async_utils.replay_buffer import ReplayBufferNew
+from nemo_rl.algorithms.grpo import (
+    MasterConfig,
+    add_grpo_token_loss_masks_and_generation_logprobs,
+    extract_initial_prompt_messages,
+)
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import (
@@ -113,16 +121,12 @@ class TestReplayBuffer:
 
         # Push trajectories
         status1 = ray.get(
-            buffer.push_with_wait_signal.remote(
-                trajectory1, weight_version=0, target_weight_version=1
-            )
+            buffer.add.remote(trajectory1, weight_version=0, target_weight_version=1)
         )
         assert status1 == "success"
 
         status2 = ray.get(
-            buffer.push_with_wait_signal.remote(
-                trajectory2, weight_version=1, target_weight_version=2
-            )
+            buffer.add.remote(trajectory2, weight_version=1, target_weight_version=2)
         )
         assert status2 == "success"
 
@@ -149,23 +153,17 @@ class TestReplayBuffer:
 
         # Push first two trajectories
         status1 = ray.get(
-            buffer.push_with_wait_signal.remote(
-                trajectory1, weight_version=0, target_weight_version=1
-            )
+            buffer.add.remote(trajectory1, weight_version=0, target_weight_version=1)
         )
         status2 = ray.get(
-            buffer.push_with_wait_signal.remote(
-                trajectory2, weight_version=1, target_weight_version=2
-            )
+            buffer.add.remote(trajectory2, weight_version=1, target_weight_version=2)
         )
         assert status1 == "success"
         assert status2 == "success"
 
         # Try to push third trajectory (should return "full")
         status3 = ray.get(
-            buffer.push_with_wait_signal.remote(
-                trajectory3, weight_version=2, target_weight_version=3
-            )
+            buffer.add.remote(trajectory3, weight_version=2, target_weight_version=3)
         )
         assert status3 == "full"
 
@@ -188,7 +186,7 @@ class TestReplayBuffer:
             }
             trajectories.append(trajectory)
             ray.get(
-                buffer.push_with_wait_signal.remote(
+                buffer.add.remote(
                     trajectory, weight_version=i, target_weight_version=i + 1
                 )
             )
@@ -220,9 +218,7 @@ class TestReplayBuffer:
         # Push only one trajectory
         trajectory = {"batch": {"data": "test"}, "rollout_metrics": {"reward": 1.0}}
         ray.get(
-            buffer.push_with_wait_signal.remote(
-                trajectory, weight_version=0, target_weight_version=1
-            )
+            buffer.add.remote(trajectory, weight_version=0, target_weight_version=1)
         )
 
         # Try to sample more trajectories than available for current step
@@ -250,12 +246,10 @@ class TestReplayBuffer:
         }
 
         ray.get(
-            buffer.push_with_wait_signal.remote(
-                old_trajectory, weight_version=0, target_weight_version=1
-            )
+            buffer.add.remote(old_trajectory, weight_version=0, target_weight_version=1)
         )
         ray.get(
-            buffer.push_with_wait_signal.remote(
+            buffer.add.remote(
                 recent_trajectory, weight_version=2, target_weight_version=3
             )
         )
@@ -290,14 +284,10 @@ class TestReplayBuffer:
         }
 
         ray.get(
-            buffer.push_with_wait_signal.remote(
-                trajectory1, weight_version=0, target_weight_version=1
-            )
+            buffer.add.remote(trajectory1, weight_version=0, target_weight_version=1)
         )
         ray.get(
-            buffer.push_with_wait_signal.remote(
-                trajectory2, weight_version=1, target_weight_version=2
-            )
+            buffer.add.remote(trajectory2, weight_version=1, target_weight_version=2)
         )
 
         # Sample for current step 1 - should only get trajectory intended for step 1
@@ -328,14 +318,10 @@ class TestReplayBuffer:
         trajectory2 = {"batch": {"data": "test2"}, "rollout_metrics": {"reward": 2.0}}
 
         ray.get(
-            buffer.push_with_wait_signal.remote(
-                trajectory1, weight_version=0, target_weight_version=1
-            )
+            buffer.add.remote(trajectory1, weight_version=0, target_weight_version=1)
         )
         ray.get(
-            buffer.push_with_wait_signal.remote(
-                trajectory2, weight_version=1, target_weight_version=3
-            )
+            buffer.add.remote(trajectory2, weight_version=1, target_weight_version=3)
         )
 
         existing_weights = ray.get(buffer.get_existing_target_weights.remote())
@@ -350,9 +336,7 @@ class TestReplayBuffer:
         # Push some trajectories
         trajectory = {"batch": {"data": "test"}, "rollout_metrics": {"reward": 1.0}}
         ray.get(
-            buffer.push_with_wait_signal.remote(
-                trajectory, weight_version=0, target_weight_version=1
-            )
+            buffer.add.remote(trajectory, weight_version=0, target_weight_version=1)
         )
 
         # Verify buffer has content
@@ -374,12 +358,166 @@ class TestReplayBuffer:
         ray.kill(buffer)
 
 
+class TestReplayBufferNew:
+    """Tests for ReplayBufferNew: staleness-window sampling via _evict + sample."""
+
+    def _make_traj(self, label: str) -> dict:
+        return {"batch": {"data": label}, "rollout_metrics": {}}
+
+    def _add(self, buf, label: str, weight_version: int):
+        return ray.get(
+            buf.add.remote(
+                self._make_traj(label),
+                weight_version=weight_version,
+                target_weight_version=0,  # unused in ReplayBufferNew
+            )
+        )
+
+    def _sample(self, buf, num_groups: int, trainer_version: int):
+        return ray.get(
+            buf.sample.remote(
+                num_prompt_groups=num_groups,
+                current_weight_version=trainer_version,
+                max_age_steps=0,  # unused in ReplayBufferNew
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # Construction
+    # ------------------------------------------------------------------
+
+    def test_invalid_max_staleness_raises(self):
+        with pytest.raises(Exception):
+            buf = ReplayBufferNew.remote(max_size=10, max_staleness=-1)
+            ray.get(buf.size.remote())
+
+    # ------------------------------------------------------------------
+    # _evict (via sample)
+    # ------------------------------------------------------------------
+
+    def test_stale_rows_evicted_before_sampling(self):
+        """Rows with age > max_staleness are removed before sample() selects."""
+        buf = ReplayBufferNew.remote(max_size=10, max_staleness=2)
+        # age at trainer=4: gen_v=1 → 3 > 2 (stale), gen_v=3 → 1 ≤ 2 (valid)
+        self._add(buf, "stale", weight_version=1)
+        self._add(buf, "fresh", weight_version=3)
+
+        result = self._sample(buf, num_groups=1, trainer_version=4)
+
+        assert result is not None
+        assert result["trajectories"][0]["batch"]["data"] == "fresh"
+        assert ray.get(buf.size.remote()) == 0  # stale row also gone
+        ray.kill(buf)
+
+    def test_all_stale_returns_none(self):
+        """sample() returns None when all rows are evicted as stale."""
+        buf = ReplayBufferNew.remote(max_size=10, max_staleness=1)
+        self._add(buf, "a", weight_version=0)
+        self._add(buf, "b", weight_version=1)
+
+        # trainer=5: both ages > 1
+        result = self._sample(buf, num_groups=1, trainer_version=5)
+
+        assert result is None
+        assert ray.get(buf.size.remote()) == 0
+        ray.kill(buf)
+
+    def test_eviction_frees_capacity(self):
+        """Evicting a stale row allows a subsequent add() to succeed."""
+        buf = ReplayBufferNew.remote(max_size=1, max_staleness=1)
+        self._add(buf, "x", weight_version=1)
+        assert self._add(buf, "x", weight_version=1) == "full"
+
+        # sample() at trainer=5 evicts the stale row (age 4 > 1)
+        self._sample(buf, num_groups=1, trainer_version=5)
+
+        assert self._add(buf, "y", weight_version=4) == "success"
+        ray.kill(buf)
+
+    def test_within_window_not_evicted(self):
+        """Rows whose age is within max_staleness are not evicted."""
+        buf = ReplayBufferNew.remote(max_size=10, max_staleness=3)
+        self._add(buf, "x", weight_version=4)
+
+        # trainer=6: age = 6 - 4 = 2 ≤ 3 → should survive
+        # should return None since there is only 1 row
+        result = self._sample(buf, num_groups=2, trainer_version=6)
+        assert result is None
+
+        # this sample should still be there
+        assert ray.get(buf.size.remote()) == 1
+        ray.kill(buf)
+
+    # ------------------------------------------------------------------
+    # sample()
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize("sample_freshest_first", [True, False])
+    def test_sample_freshest_first(self, sample_freshest_first):
+        """sample() returns the freshest trajectories first."""
+        buf = ReplayBufferNew.remote(
+            max_size=10, max_staleness=5, sample_freshest_first=sample_freshest_first
+        )
+        for gen_v in [3, 4, 5]:
+            self._add(buf, f"v{gen_v}", weight_version=gen_v)
+
+        result = self._sample(buf, num_groups=2, trainer_version=6)
+
+        assert result is not None
+        data = [t["batch"]["data"] for t in result["trajectories"]]
+        if sample_freshest_first:
+            assert data == ["v5", "v4"]
+        else:
+            assert data == ["v3", "v4"]
+        ray.kill(buf)
+
+    def test_sample_returns_none_when_insufficient(self):
+        """sample() returns None when fewer rows than requested remain after eviction."""
+        buf = ReplayBufferNew.remote(max_size=10, max_staleness=5)
+        self._add(buf, "only", weight_version=1)
+
+        result = self._sample(buf, num_groups=3, trainer_version=2)
+
+        assert result is None
+        ray.kill(buf)
+
+    def test_sample_returns_none_on_empty_buffer(self):
+        buf = ReplayBufferNew.remote(max_size=10, max_staleness=5)
+        result = self._sample(buf, num_groups=1, trainer_version=1)
+        assert result is None
+        ray.kill(buf)
+
+    def test_sample_avg_trajectory_age(self):
+        """avg_trajectory_age is computed from the sampled generation versions."""
+        buf = ReplayBufferNew.remote(max_size=10, max_staleness=5)
+        # freshest first: gen 8 (age 2), gen 6 (age 4) → avg = 3.0
+        for gen_v in [6, 8]:
+            self._add(buf, f"v{gen_v}", weight_version=gen_v)
+
+        result = self._sample(buf, num_groups=2, trainer_version=10)
+
+        assert result is not None
+        assert abs(result["avg_trajectory_age"] - 3.0) < 1e-6
+        ray.kill(buf)
+
+    def test_sample_consumes_selected_rows(self):
+        """Rows returned by sample() are removed from the buffer."""
+        buf = ReplayBufferNew.remote(max_size=10, max_staleness=5)
+        for gen_v in [1, 2, 3]:
+            self._add(buf, f"v{gen_v}", weight_version=gen_v)
+
+        self._sample(buf, num_groups=2, trainer_version=4)
+
+        assert ray.get(buf.size.remote()) == 1
+        ray.kill(buf)
+
+
 class TestAsyncTrajectoryCollector:
     """Test cases for AsyncTrajectoryCollector."""
 
     def create_mock_config(self) -> MasterConfig:
         """Create a mock master config for testing."""
-        return {
+        config = {
             "grpo": {
                 "num_prompts_per_step": 2,
                 "num_generations_per_prompt": 3,
@@ -388,6 +526,7 @@ class TestAsyncTrajectoryCollector:
             },
             "policy": {"max_total_sequence_length": 512},
         }
+        return MasterConfig.model_construct(**config)
 
     def create_mock_batch(self, size: int = 2) -> BatchedDataDict[DatumSpec]:
         """Create a mock batch for testing."""
@@ -571,7 +710,7 @@ class TestAsyncUtilsIntegration:
 
     def create_mock_config(self) -> MasterConfig:
         """Create a mock master config for testing."""
-        return {
+        config = {
             "grpo": {
                 "num_prompts_per_step": 2,
                 "num_generations_per_prompt": 2,
@@ -580,6 +719,7 @@ class TestAsyncUtilsIntegration:
             },
             "policy": {"max_total_sequence_length": 512},
         }
+        return MasterConfig.model_construct(**config)
 
     def create_mock_batch(self, size: int = 2) -> BatchedDataDict[DatumSpec]:
         """Create a mock batch for testing."""
@@ -645,7 +785,7 @@ class TestAsyncUtilsIntegration:
                 "rollout_metrics": {"reward": float(trajectory_id)},
             }
             return ray.get(
-                buffer.push_with_wait_signal.remote(
+                buffer.add.remote(
                     trajectory,
                     weight_version=trajectory_id,
                     target_weight_version=trajectory_id + 1,
@@ -698,3 +838,248 @@ class TestAsyncUtilsIntegration:
         assert sample_result is None
 
         ray.kill(buffer)
+
+
+class TestPromptExtraction:
+    """Test cases for prompt extraction logic used in async GRPO advantage calculation.
+
+    These tests verify that the length-based prompt extraction correctly handles
+    multi-turn conversation prompts where the original prompt itself contains
+    assistant messages (conversation history).
+    """
+
+    def test_prompt_extraction_with_multi_turn_history(self):
+        """Test that prompt extraction correctly handles prompts containing assistant messages.
+
+        This tests the fix for multi-turn conversation prompts where the original prompt
+        from the dataset itself contains assistant messages (conversation history).
+        The extraction should use the length field to identify original prompt messages,
+        not break at the first assistant message.
+        """
+        # Create a multi-turn prompt with assistant messages in the history
+        # Original prompt: user -> assistant -> user (3 messages, 15 tokens total)
+        original_prompt_messages = [
+            {
+                "role": "user",
+                "content": "What is 2+2?",
+                "token_ids": torch.tensor([1, 2, 3, 4, 5]),
+            },
+            {
+                "role": "assistant",
+                "content": "4",
+                "token_ids": torch.tensor([6, 7, 8, 9, 10]),
+            },
+            {
+                "role": "user",
+                "content": "Now what is 3+3?",
+                "token_ids": torch.tensor([11, 12, 13, 14, 15]),
+            },
+        ]
+
+        # Generated response (added after original prompt)
+        generated_message = {
+            "role": "assistant",
+            "content": "6",
+            "token_ids": torch.tensor([16, 17, 18]),
+        }
+
+        # Full message_log after generation
+        full_message_log = original_prompt_messages + [generated_message]
+
+        # Original prompt length = sum of token_ids in original prompt
+        original_prompt_length = sum(
+            len(m["token_ids"]) for m in original_prompt_messages
+        )  # 15
+
+        message_logs = [full_message_log]
+        original_prompt_lengths = torch.tensor([original_prompt_length])
+
+        result = extract_initial_prompt_messages(message_logs, original_prompt_lengths)
+        initial_prompt_log = result[0]
+
+        # Should extract all 3 original messages, NOT break at first assistant
+        assert len(initial_prompt_log) == 3, (
+            f"Expected 3 messages (user, assistant, user), got {len(initial_prompt_log)}. "
+            "The extraction should NOT break at the first assistant message when it's part of the original prompt."
+        )
+
+        assert initial_prompt_log[0]["role"] == "user"
+        assert initial_prompt_log[1]["role"] == "assistant"
+        assert initial_prompt_log[2]["role"] == "user"
+        assert generated_message not in initial_prompt_log
+
+    def test_prompt_extraction_with_single_turn(self):
+        """Test that prompt extraction works correctly for single-turn prompts (regression test)."""
+        original_prompt_messages = [
+            {
+                "role": "user",
+                "content": "What is 2+2?",
+                "token_ids": torch.tensor([1, 2, 3, 4, 5]),
+            },
+        ]
+
+        generated_message = {
+            "role": "assistant",
+            "content": "4",
+            "token_ids": torch.tensor([6, 7, 8]),
+        }
+
+        full_message_log = original_prompt_messages + [generated_message]
+        original_prompt_length = sum(
+            len(m["token_ids"]) for m in original_prompt_messages
+        )
+
+        result = extract_initial_prompt_messages(
+            [full_message_log], torch.tensor([original_prompt_length])
+        )
+        initial_prompt_log = result[0]
+
+        assert len(initial_prompt_log) == 1
+        assert initial_prompt_log[0]["role"] == "user"
+        assert generated_message not in initial_prompt_log
+
+    def test_prompt_extraction_with_system_message(self):
+        """Test prompt extraction with system message included."""
+        original_prompt_messages = [
+            {
+                "role": "system",
+                "content": "You are a math tutor.",
+                "token_ids": torch.tensor([1, 2, 3]),
+            },
+            {
+                "role": "user",
+                "content": "What is 2+2?",
+                "token_ids": torch.tensor([4, 5, 6, 7]),
+            },
+        ]
+
+        generated_message = {
+            "role": "assistant",
+            "content": "4",
+            "token_ids": torch.tensor([8, 9]),
+        }
+
+        full_message_log = original_prompt_messages + [generated_message]
+        original_prompt_length = sum(
+            len(m["token_ids"]) for m in original_prompt_messages
+        )
+
+        result = extract_initial_prompt_messages(
+            [full_message_log], torch.tensor([original_prompt_length])
+        )
+        initial_prompt_log = result[0]
+
+        assert len(initial_prompt_log) == 2
+        assert initial_prompt_log[0]["role"] == "system"
+        assert initial_prompt_log[1]["role"] == "user"
+        assert generated_message not in initial_prompt_log
+
+    def test_prompt_extraction_complex_multi_turn(self):
+        """Test prompt extraction with complex multi-turn history (multiple assistant turns)."""
+        original_prompt_messages = [
+            {
+                "role": "system",
+                "content": "Math tutor",
+                "token_ids": torch.tensor([1, 2]),
+            },
+            {"role": "user", "content": "2+2?", "token_ids": torch.tensor([3, 4])},
+            {"role": "assistant", "content": "4", "token_ids": torch.tensor([5, 6])},
+            {"role": "user", "content": "3+3?", "token_ids": torch.tensor([7, 8])},
+            {"role": "assistant", "content": "6", "token_ids": torch.tensor([9, 10])},
+            {"role": "user", "content": "4+4?", "token_ids": torch.tensor([11, 12])},
+        ]
+
+        generated_message = {
+            "role": "assistant",
+            "content": "8",
+            "token_ids": torch.tensor([13, 14]),
+        }
+
+        full_message_log = original_prompt_messages + [generated_message]
+        original_prompt_length = sum(
+            len(m["token_ids"]) for m in original_prompt_messages
+        )
+
+        result = extract_initial_prompt_messages(
+            [full_message_log], torch.tensor([original_prompt_length])
+        )
+        initial_prompt_log = result[0]
+
+        assert len(initial_prompt_log) == 6, (
+            f"Expected 6 messages, got {len(initial_prompt_log)}. "
+            "All history messages should be included in the prompt."
+        )
+
+        expected_roles = ["system", "user", "assistant", "user", "assistant", "user"]
+        actual_roles = [m["role"] for m in initial_prompt_log]
+        assert actual_roles == expected_roles
+        assert generated_message not in initial_prompt_log
+
+    def test_grpo_loss_mask_excludes_assistant_prompt_history(self):
+        """Test that assistant messages in the original prompt are not trained on."""
+        original_prompt_messages = [
+            {
+                "role": "user",
+                "content": "What is 2+2?",
+                "token_ids": torch.tensor([1, 2]),
+            },
+            {
+                "role": "assistant",
+                "content": "4",
+                "token_ids": torch.tensor([3, 4]),
+            },
+            {
+                "role": "user",
+                "content": "Now what is 3+3?",
+                "token_ids": torch.tensor([5, 6]),
+            },
+        ]
+        generated_logprobs = torch.tensor([0.1, 0.2])
+        generated_message = {
+            "role": "assistant",
+            "content": "6",
+            "token_ids": torch.tensor([7, 8]),
+            "generation_logprobs": generated_logprobs,
+        }
+        full_message_log = original_prompt_messages + [generated_message]
+
+        add_grpo_token_loss_masks_and_generation_logprobs([full_message_log])
+
+        assert torch.equal(full_message_log[0]["token_loss_mask"], torch.tensor([0, 0]))
+        assert torch.equal(full_message_log[1]["token_loss_mask"], torch.tensor([0, 0]))
+        assert torch.equal(full_message_log[2]["token_loss_mask"], torch.tensor([0, 0]))
+        assert torch.equal(full_message_log[3]["token_loss_mask"], torch.tensor([1, 1]))
+        assert torch.equal(
+            full_message_log[3]["generation_logprobs"], generated_logprobs
+        )
+
+    def test_grpo_loss_mask_uses_generation_logprobs_marker(self):
+        """Test that only assistant messages with generation logprobs are trainable."""
+        message_log = [
+            {
+                "role": "assistant",
+                "content": "prompt history",
+                "token_ids": torch.tensor([1, 2]),
+            },
+            {
+                "role": "user",
+                "content": "next question",
+                "token_ids": torch.tensor([3, 4]),
+                "generation_logprobs": torch.tensor([0.3, 0.4]),
+            },
+            {
+                "role": "assistant",
+                "content": "generated response",
+                "token_ids": torch.tensor([5, 6]),
+                "generation_logprobs": torch.tensor([0.5, 0.6]),
+            },
+        ]
+
+        add_grpo_token_loss_masks_and_generation_logprobs([message_log])
+
+        assert torch.equal(message_log[0]["token_loss_mask"], torch.tensor([0, 0]))
+        assert torch.equal(
+            message_log[0]["generation_logprobs"], torch.tensor([0.0, 0.0])
+        )
+        assert torch.equal(message_log[1]["token_loss_mask"], torch.tensor([0, 0]))
+        assert torch.equal(message_log[2]["token_loss_mask"], torch.tensor([1, 1]))

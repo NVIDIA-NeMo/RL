@@ -171,7 +171,7 @@ policy:
 
   # makes the training sequence length divisible by the tensor parallel size
   # this is useful for sequence parallel training
-  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  make_sequence_length_divisible_by: ${mul:${mul:${policy.megatron_cfg.tensor_model_parallel_size}, ${policy.megatron_cfg.context_parallel_size}}, 2}
   max_grad_norm: 1.0
 
   optimizer: null # remove default FSDP optimizer
@@ -180,6 +180,10 @@ policy:
   offload_optimizer_for_logprob: False
 
   generation:
+    # Port range for vLLM HTTP servers, kept below the OS ephemeral range.
+    # See ray.sub for the full port layout.
+    port_range_low: 11001
+    port_range_high: 15000
     backend: "vllm"
     max_new_tokens: ${policy.max_total_sequence_length}
     temperature: 1.0
@@ -246,6 +250,11 @@ data:
 env:
   should_use_nemo_gym: true
   nemo_gym:
+    # Port range for Gym HTTP servers, kept below the OS ephemeral range
+    # (32768-60999) and non-overlapping with NeMo RL (11001-15000) or
+    # vLLM (20001+). See ray.sub for the full port layout.
+    port_range_low: 15001
+    port_range_high: 20000
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml  # Required! And it must be *for_training
     - resources_servers/math_with_judge/configs/math_with_judge.yaml
@@ -289,3 +298,5 @@ logger:
 cluster:
   gpus_per_node: 8
   num_nodes: 32
+  master_port_range_low: 25000
+  master_port_range_high: 28000
