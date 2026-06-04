@@ -457,7 +457,7 @@ def xtoken_off_policy_distillation_train(
                             train_data,
                             loss_fn,
                             timer=timer,
-                            skip_keys=XTOKEN_NON_STUDENT_SEQ_KEYS,
+                            check_dim_skip_keys=XTOKEN_NON_STUDENT_SEQ_KEYS,
                         )
                     finally:
                         # Producer-side CUDA tensors must be freed before
@@ -726,7 +726,7 @@ def validate(
                     train_data,
                     loss_fn,
                     eval_mode=True,
-                    skip_keys=XTOKEN_NON_STUDENT_SEQ_KEYS,
+                    check_dim_skip_keys=XTOKEN_NON_STUDENT_SEQ_KEYS,
                 )
             finally:
                 teacher_policy.release_ipc_buffer()

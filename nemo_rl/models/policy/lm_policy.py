@@ -669,12 +669,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
         timer: Optional[Timer] = None,
-        skip_keys: Optional[Iterable[str]] = None,
+        check_dim_skip_keys: Optional[Iterable[str]] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function.
 
         Args:
-            skip_keys: Keys whose tensors are not student-sequence-aligned at
+            check_dim_skip_keys: Keys whose tensors are not student-sequence-aligned at
                 dim 1 and must be excluded from the worker's sequence-dim
                 pre-flight check. Used by cross-tokenizer distillation to
                 pass through teacher / alignment auxiliaries that ride on
@@ -717,7 +717,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     "eval_mode": eval_mode,
                     "gbs": batch_size,
                     "mbs": micro_batch_size,
-                    "skip_keys": skip_keys,
+                    "check_dim_skip_keys": check_dim_skip_keys,
                 },
             )
         results = self.worker_group.get_all_worker_results(futures)

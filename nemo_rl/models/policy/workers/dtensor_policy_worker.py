@@ -575,7 +575,7 @@ class DTensorPolicyWorkerImpl(
         eval_mode: bool = False,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
-        skip_keys: Optional[Iterable[str]] = None,
+        check_dim_skip_keys: Optional[Iterable[str]] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
         if gbs is None:
@@ -591,16 +591,17 @@ class DTensorPolicyWorkerImpl(
         )
         num_global_batches = int(total_dataset_size.item()) // gbs
 
+        # ``check_dim_skip_keys`` is accepted for parity with the v2 worker but
+        # this worker does not run cross-tokenizer distillation (the
+        # cross-tokenizer setup asserts the v2 worker), so it must be None.
+        assert check_dim_skip_keys is None, (
+            "check_dim_skip_keys is only supported by the v2 DTensor worker; "
+            "cross-tokenizer distillation requires dtensor_cfg._v2=True."
+        )
         # dim 1 is always assumed to be the sequence dim, sanity check this here.
-        # ``skip_keys`` is accepted for parity with the v2 worker (cross-tokenizer
-        # ride-along tensors whose dim 1 is not the student sequence axis); v1
-        # doesn't run cross-tokenizer, so it's typically None.
         sequence_dim = 1
         seq_dim_size = data.get("input_ids").shape[sequence_dim]
-        _skip = set(skip_keys) if skip_keys is not None else set()
         for k, v in data.items():
-            if k in _skip:
-                continue
             if torch.is_tensor(v) and len(v.shape) > 1:
                 assert v.shape[sequence_dim] == seq_dim_size, (
                     f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"

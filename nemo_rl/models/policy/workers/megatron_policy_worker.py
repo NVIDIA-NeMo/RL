@@ -325,17 +325,19 @@ class MegatronPolicyWorkerImpl(
         eval_mode: bool = False,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
-        skip_keys: Optional[Iterable[str]] = None,
+        check_dim_skip_keys: Optional[Iterable[str]] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function.
 
-        ``skip_keys`` is accepted for parity with the v1/v2 DTensor workers
-        (cross-tokenizer ride-along tensors whose dim 1 is not the student
-        sequence axis). Megatron doesn't run cross-tokenizer, so the kwarg is
-        accepted purely so the unified ``Policy.train`` call site does not
-        break; there is no inline sequence-dim check here to filter.
+        ``check_dim_skip_keys`` is accepted for parity with the v1/v2 DTensor
+        workers (cross-tokenizer ride-along tensors whose dim 1 is not the
+        student sequence axis). Megatron doesn't run cross-tokenizer, so it
+        must be None.
         """
-        del skip_keys  # unused; see docstring
+        assert check_dim_skip_keys is None, (
+            "check_dim_skip_keys is only supported by the v2 DTensor worker; "
+            "Megatron does not run cross-tokenizer distillation."
+        )
         # Note: zero_grad_buffer is called at the start of each global batch iteration
         # in the loop below, so we don't need to call it here.
         if hasattr(self.model, "inference_params"):

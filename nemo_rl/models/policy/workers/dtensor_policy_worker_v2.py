@@ -360,7 +360,7 @@ class DTensorPolicyWorkerV2Impl(
         eval_mode: bool = False,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
-        skip_keys: Optional[Iterable[str]] = None,
+        check_dim_skip_keys: Optional[Iterable[str]] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
         if gbs is None:
@@ -377,7 +377,7 @@ class DTensorPolicyWorkerV2Impl(
         num_global_batches = int(total_dataset_size.item()) // gbs
 
         # Validate sequence dimension
-        sequence_dim, _ = check_sequence_dim(data, skip_keys=skip_keys)
+        sequence_dim, _ = check_sequence_dim(data, skip_keys=check_dim_skip_keys)
 
         if eval_mode:
             ctx: AbstractContextManager[Any] = torch.no_grad()
