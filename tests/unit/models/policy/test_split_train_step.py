@@ -39,7 +39,6 @@ import ray
 import torch
 
 from nemo_rl.models.policy.lm_policy import Policy
-from tests.unit.test_utils import SimpleLossFn
 
 # Reuse the existing v2 worker test fixtures for config + cluster setup.
 from tests.unit.models.policy.test_dtensor_worker_v2 import (
@@ -47,6 +46,7 @@ from tests.unit.models.policy.test_dtensor_worker_v2 import (
     create_test_config,
     two_gpu_virtual_cluster,  # noqa: F401 — fixture, used implicitly
 )
+from tests.unit.test_utils import SimpleLossFn
 
 
 def _all_param_state(policy: Policy) -> dict[str, torch.Tensor]:
