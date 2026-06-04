@@ -332,3 +332,45 @@ class TestRayVirtualClusterPortRange:
         )
         assert cluster.port_range_low == 20000
         assert cluster.port_range_high == 25000
+
+
+class TestVllmPortAssignment:
+    """Tests for VLLM_PORT env var calculation in BaseVllmGenerationWorker.configure_worker."""
+
+    @pytest.mark.parametrize(
+        "bundle_indices,expected_port",
+        [
+            # TP=1: single-bundle engines, engine_index = bundle index
+            ((0, [0]), 20001),
+            ((0, [1]), 20101),
+            ((0, [7]), 20701),
+            ((1, [0]), 20001),
+            ((1, [3]), 20301),
+            # TP=4: multi-bundle engine, engine_index = first_bundle // tp_size
+            ((0, [0, 1, 2, 3]), 20001),  # 0 // 4 = 0
+            ((0, [4, 5, 6, 7]), 20101),  # 4 // 4 = 1
+            # TP=2: multi-bundle engine
+            ((0, [0, 1]), 20001),  # 0 // 2 = 0
+            ((0, [2, 3]), 20101),  # 2 // 2 = 1
+            ((0, [6, 7]), 20301),  # 6 // 2 = 3
+            # TP=8: entire node is one engine
+            ((0, [0, 1, 2, 3, 4, 5, 6, 7]), 20001),  # 0 // 8 = 0
+        ],
+    )
+    def test_vllm_port_assignment(self, bundle_indices, expected_port):
+        from nemo_rl.models.generation.vllm.vllm_worker import (
+            BaseVllmGenerationWorker,
+        )
+
+        _, env_vars, _ = BaseVllmGenerationWorker.configure_worker(
+            num_gpus=1, bundle_indices=bundle_indices
+        )
+        assert env_vars["VLLM_PORT"] == str(expected_port)
+
+    def test_no_vllm_port_without_bundle_indices(self):
+        from nemo_rl.models.generation.vllm.vllm_worker import (
+            BaseVllmGenerationWorker,
+        )
+
+        _, env_vars, _ = BaseVllmGenerationWorker.configure_worker(num_gpus=1)
+        assert "VLLM_PORT" not in env_vars
