@@ -31,8 +31,8 @@ Data flow:
                  → _advantage_pump(meta) → dp_client.get_samples(...)
                                         → adv_estimator.compute_advantage(...)
                                         → dp_client.put_samples(...)
-                 → trainer.train_on_meta(meta)
-                     Trainer → dp_client.get_samples(...)
+                 → trainer.train_from_meta(meta)
+                     Trainer → dp_client.get_samples(...)   (via its own client)
                  → dp_client.clear_samples(...)             ← SC clears after train
   _sync_weights  → drain _inflight_rollouts → WeightSynchronizer.sync_weights()
 """
@@ -66,6 +66,7 @@ class SingleControllerConfig:
     # Staleness
     max_weight_staleness_versions: int = 1
     min_prompt_groups_per_batch: int = 2
+    target_prompt_groups_per_step: int = 8
     generations_per_prompt: int = 4
     batch_selection_strategy: Literal[
         "strict_on_policy",
@@ -162,6 +163,11 @@ class SingleControllerActor:
             print(
                 "Using strict_on_policy, auto setting max_weight_staleness_versions to 0."
             )
+        if cfg.target_prompt_groups_per_step < cfg.min_prompt_groups_per_batch:
+            raise ValueError(
+                f"target_prompt_groups_per_step ({cfg.target_prompt_groups_per_step}) "
+                f"must be >= min_prompt_groups_per_batch ({cfg.min_prompt_groups_per_batch})"
+            )
         self._sampler = StalenessSampler(cfg.max_weight_staleness_versions)
 
         # ── asyncio state ──────────────────────────────────────────────────
@@ -182,6 +188,7 @@ class SingleControllerActor:
         self._train_steps: int = 0
         self._rollout_done: bool = False
         self._claimed_meta: KVBatchMeta | None = None
+        self._step_consumed_sample_ids: list[str] = []
 
         log.info(
             "SingleControllerActor: staleness_cap=%d buffer=%d inflight=%d transport=%s",
@@ -226,6 +233,17 @@ class SingleControllerActor:
     async def _ray_get(self, obj_ref: Any) -> Any:
         """Await a Ray ObjectRef without blocking the asyncio event loop."""
         return await obj_ref
+
+    async def _reap_in_flight_nonblocking(
+        self, refs: list[ray.ObjectRef]
+    ) -> list[ray.ObjectRef]:
+        """Drain completed refs without blocking; return still-pending refs."""
+        if not refs:
+            return []
+        ready, pending = ray.wait(refs, num_returns=len(refs), timeout=0)
+        for r in ready:
+            await r  # surface exceptions; payload ignored
+        return pending
 
     async def _call_dp(self, method_name: str, **kwargs) -> Any:
         """Call a DataPlaneClient method or a Ray actor exposing that method."""
@@ -284,111 +302,124 @@ class SingleControllerActor:
         )
 
     async def _train_pump(self) -> None:
-        """Claim DataPlane metadata, select a batch, train, clear, sync weights.
+        """Per-prompt-group streaming train loop.
 
-        Flow per step:
-          1. claim_meta() — temporary consuming metadata acquisition
-          2. Evict sample_ids no longer eligible under the selected policy
-          3. StalenessSampler.select_indices() — choose full prompt groups
-          4. _advantage_pump() — fetch, compute advantages, write back
-          5. trainer.train_on_meta(KVBatchMeta, dp_client) — trainer fetches tensors
-          6. clear_samples(sample_ids) — SC removes consumed rows
-          7. _buffer_capacity.release() — unblock _rollout_pump
-          8. _sync_weights()
+        Per step:
+          - Lazy ``begin_train_step`` on first ready group.
+          - Per ready group: optional ``prepare_logprobs_from_meta`` →
+            ``_advantage_pump`` → ``train_microbatch_from_meta`` (queued).
+          - End-of-step: drain in-flight → ``finish_train_step`` →
+            single ``clear_samples`` → ``_sync_weights``.
         """
+        logprobs_required = (
+            self._cfg.advantage_policy_logprobs_field is not None
+            or self._cfg.advantage_reference_logprobs_field is not None
+        )
+
         while self._train_steps < self._cfg.max_train_steps:
-            await self._claim_available_meta()
+            step_id = f"sc-step-{self._train_steps:06d}"
+            target_groups = self._cfg.target_prompt_groups_per_step
+            groups_dispatched = 0
+            in_flight: list[ray.ObjectRef] = []
+            step_open = False
+            step_min_weight_version: int | None = None
 
-            if self._claimed_meta is None or self._claimed_meta.size == 0:
-                if self._rollout_done:
-                    log.info("train_pump: rollout done and buffer drained, exiting")
-                    break
-                await asyncio.sleep(0.05)
-                continue
-
-            evicted_meta = await self._evict_stale_claimed()
-            if evicted_meta is not None:
-                evicted_groups = count_prompt_groups(
-                    evicted_meta,
-                    generations_per_prompt=self._cfg.generations_per_prompt,
-                )
-                for _ in range(evicted_groups):
-                    self._buffer_capacity.release()
-
-            if self._claimed_meta is None or self._claimed_meta.size == 0:
-                continue
-
-            selected_indices = self._sampler.select_indices(
-                self._claimed_meta,
-                trainer_version=self._trainer_version,
-                min_prompt_groups=self._cfg.min_prompt_groups_per_batch,
-                generations_per_prompt=self._cfg.generations_per_prompt,
-            )
-
-            if selected_indices is None:
-                if (
-                    self._rollout_done
-                    and count_prompt_groups(
-                        self._claimed_meta,
+            while groups_dispatched < target_groups:
+                await self._claim_available_meta()
+                evicted_meta = await self._evict_stale_claimed()
+                if evicted_meta is not None:
+                    evicted_groups = count_prompt_groups(
+                        evicted_meta,
                         generations_per_prompt=self._cfg.generations_per_prompt,
                     )
-                    < self._cfg.min_prompt_groups_per_batch
-                ):
-                    log.info("train_pump: rollout done and no full batch remains")
-                    break
-                await asyncio.sleep(0.05)
-                continue
+                    for _ in range(evicted_groups):
+                        self._buffer_capacity.release()
 
-            selected_meta = self._claimed_meta.subset(selected_indices)
-            selected_meta = await self._advantage_pump(selected_meta)
-            selected_weight = min_weight_version(selected_meta)
+                group_indices = None
+                if self._claimed_meta is not None and self._claimed_meta.size > 0:
+                    group_indices = self._sampler.select_one_group(
+                        self._claimed_meta,
+                        trainer_version=self._trainer_version,
+                        generations_per_prompt=self._cfg.generations_per_prompt,
+                    )
+
+                if group_indices is None:
+                    in_flight = await self._reap_in_flight_nonblocking(in_flight)
+                    if (
+                        self._rollout_done
+                        and len(in_flight) == 0
+                        and (self._claimed_meta is None or self._claimed_meta.size == 0)
+                    ):
+                        break
+                    await asyncio.sleep(0.005)
+                    continue
+
+                group_meta = self._claimed_meta.subset(group_indices)
+                self._claimed_meta = self._claimed_meta.drop(group_indices)
+
+                if logprobs_required:
+                    await self._ray_get(
+                        self._trainer.prepare_logprobs_from_meta.remote(group_meta)
+                    )
+
+                group_meta = await self._advantage_pump(group_meta)
+
+                if not step_open:
+                    await self._ray_get(self._trainer.begin_train_step.remote(step_id))
+                    step_open = True
+
+                future = self._trainer.train_microbatch_from_meta.remote(
+                    step_id, group_meta
+                )
+                in_flight.append(future)
+                groups_dispatched += 1
+                self._buffer_capacity.release()
+                self._step_consumed_sample_ids.extend(group_meta.sample_ids)
+                group_min_v = min_weight_version(group_meta)
+                if group_min_v is not None:
+                    step_min_weight_version = (
+                        group_min_v
+                        if step_min_weight_version is None
+                        else min(step_min_weight_version, group_min_v)
+                    )
+
+                in_flight = await self._reap_in_flight_nonblocking(in_flight)
+
+            for fut in in_flight:
+                await self._ray_get(fut)
+
+            if not step_open:
+                log.info("train_pump: rollout exhausted before any group ready")
+                break
+
+            result = await self._ray_get(
+                self._trainer.finish_train_step.remote(step_id)
+            )
+            consumed_ids = list(self._step_consumed_sample_ids)
+            await self._call_dp(
+                "clear_samples",
+                sample_ids=consumed_ids,
+                partition_id=self._cfg.partition_id,
+            )
+            self._step_consumed_sample_ids = []
+            prev_trainer_version = self._trainer_version
+            self._trainer_version = result["trainer_version"]
             lag = (
-                self._trainer_version - selected_weight
-                if selected_weight is not None
+                prev_trainer_version - step_min_weight_version
+                if step_min_weight_version is not None
                 else 0
             )
-
             log.info(
                 "train step %d/%d  trainer_v=%d  lag=%d  batch_size=%d",
                 self._train_steps + 1,
                 self._cfg.max_train_steps,
                 self._trainer_version,
                 lag,
-                selected_meta.size,
+                len(consumed_ids),
             )
 
-            t0 = time.perf_counter()
-            result = await self._ray_get(
-                self._trainer.train_on_meta.remote(selected_meta, self._dp_client)
-            )
-            elapsed = time.perf_counter() - t0
-
-            if elapsed > 5.0:
-                log.info("  train_on_meta returned in %.1fs", elapsed)
-
-            if result.get("clear_samples", True):
-                await self._call_dp(
-                    "clear_samples",
-                    sample_ids=selected_meta.sample_ids,
-                    partition_id=selected_meta.partition_id,
-                )
-                self._claimed_meta = self._claimed_meta.drop(selected_indices)
-                self._trainer_version = result["trainer_version"]
-                selected_groups = count_prompt_groups(
-                    selected_meta,
-                    generations_per_prompt=self._cfg.generations_per_prompt,
-                )
-                for _ in range(selected_groups):
-                    self._buffer_capacity.release()
-
-                await self._sync_weights()
-
-                log.info(
-                    "  → done  loss=%.6g  trainer_version=%d",
-                    result["loss"],
-                    self._trainer_version,
-                )
-                self._train_steps += 1
+            await self._sync_weights()
+            self._train_steps += 1
 
     async def _sync_weights(self) -> None:
         """Drain in-flight rollouts then synchronize weights.
