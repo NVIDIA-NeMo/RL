@@ -180,6 +180,10 @@ policy:
   offload_optimizer_for_logprob: False
 
   generation:
+    # Port ranges for master address allocation, kept below the OS ephemeral
+    # range (32768-60999). See ray.sub for the full port layout.
+    port_range_low: 11001
+    port_range_high: 15000
     backend: "vllm"
     max_new_tokens: ${policy.max_total_sequence_length}
     temperature: 1.0
@@ -246,6 +250,11 @@ data:
 env:
   should_use_nemo_gym: true
   nemo_gym:
+    # Port range for Gym HTTP servers, kept below the OS ephemeral range
+    # (32768-60999) and non-overlapping with NeMo RL (11001-15000) or
+    # vLLM (20001+). See ray.sub for the full port layout.
+    port_range_low: 15001
+    port_range_high: 20000
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml  # Required! And it must be *for_training
     - resources_servers/math_with_judge/configs/math_with_judge.yaml
