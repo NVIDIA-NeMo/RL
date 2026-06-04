@@ -143,6 +143,11 @@ class MegatronPolicyWorkerImpl(
     AbstractPolicyWorker,
     ColocatablePolicyInterface,
 ):
+    # Holds the split-API train-step state between begin/finish or
+    # begin/abort; None when no step is open. Declared at class level so
+    # ``self._train_step_state = None`` after finish/abort type-checks.
+    _train_step_state: Optional[dict[str, Any]] = None
+
     def __repr__(self):
         """Customizes the actor's prefix in the Ray logs.
 
