@@ -284,6 +284,14 @@ def setup(
             "Megatron PPO value model. See "
             "https://github.com/NVIDIA-NeMo/RL/issues/2687"
         )
+        assert not (
+            value_config["megatron_cfg"]["tensor_model_parallel_size"] > 1
+            and value_config["megatron_cfg"]["sequence_parallel"]
+        ), (
+            "Sequence parallelism (TP>1 + sequence_parallel=True) is currently "
+            "not supported for the Megatron PPO value model. See "
+            "https://github.com/NVIDIA-NeMo/RL/issues/2687"
+        )
 
     # Set seed for all random number generators
     set_seed(ppo_config["seed"])

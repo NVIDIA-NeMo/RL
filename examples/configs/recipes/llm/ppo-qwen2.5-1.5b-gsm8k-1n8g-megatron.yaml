@@ -55,7 +55,6 @@ value:
   train_micro_batch_size: 4
   megatron_cfg:
     tensor_model_parallel_size: 2
-    sequence_parallel: true
     optimizer:
       lr: 1.0e-05
       weight_decay: 0.01
