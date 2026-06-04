@@ -86,6 +86,11 @@ DEFAULT_GENERATION_PORT_RANGE_LOW = 11001
 DEFAULT_GENERATION_PORT_RANGE_HIGH = 15000
 DEFAULT_GYM_PORT_RANGE_LOW = 15001
 DEFAULT_GYM_PORT_RANGE_HIGH = 20000
+# vLLM TP/DP rendezvous ports.  Each engine gets PORTS_PER_ENGINE ports
+# starting at LOW + engine_index * PORTS_PER_ENGINE.  The effective upper
+# bound is LOW + max_engines_per_node * PORTS_PER_ENGINE.  With 8 GPUs and
+# TP=1 (8 engines): 20001 + 8*100 = 20801.  There is no fixed ceiling —
+# ensure the range does not overlap with MASTER (25000+) on very large nodes.
 DEFAULT_VLLM_PORT_RANGE_LOW = 20001
 DEFAULT_VLLM_PORTS_PER_ENGINE = 100
 DEFAULT_MASTER_PORT_RANGE_LOW = 25000
