@@ -39,6 +39,10 @@ class VllmSpecificArgs(TypedDict):
     # Miscellaneous top level vLLM HTTP server arguments.
     # A filepath that can be imported to register a vLLM tool parser
     tool_parser_plugin: NotRequired[str]
+    # Extra environment variables forwarded to every vLLM worker process. Useful
+    # for per-recipe knobs (e.g. forcing a specific fused-MoE backend) without
+    # affecting other test cases.
+    env_vars: NotRequired[dict[str, str]]
 
 
 class VllmConfig(GenerationConfig):
