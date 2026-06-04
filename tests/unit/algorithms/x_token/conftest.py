@@ -21,7 +21,6 @@ fixtures here are pure-CPU.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 import pytest
 import torch
@@ -102,90 +101,3 @@ def synth_sparse_projection_path(tmp_path: Path) -> str:
     path = tmp_path / "synth_sparse_projection.pt"
     torch.save(data, path)
     return str(path)
-
-
-def make_loss_cfg(
-    projection_matrix_path: str,
-    *,
-    gold_loss: bool = False,
-    xtoken_loss: bool = False,
-    reverse_kl: bool = False,
-    exact_token_match_only: bool = False,
-    student_vocab_size: int = SYNTH_V_STUDENT,
-    teacher_vocab_size: int = SYNTH_V_TEACHER,
-    temperature: float = 1.0,
-    vocab_topk: int = 8,
-    uncommon_topk: int = 4,
-    kl_loss_weight: float = 1.0,
-    ce_loss_scale: float = 1.0,
-    dynamic_loss_scaling: bool = False,
-) -> dict[str, Any]:
-    """Minimal config dict matching ``CrossTokenizerDistillationLossConfig``."""
-    return {
-        "projection_matrix_path": projection_matrix_path,
-        "gold_loss": gold_loss,
-        "xtoken_loss": xtoken_loss,
-        "temperature": temperature,
-        "vocab_topk": vocab_topk,
-        "uncommon_topk": uncommon_topk,
-        "reverse_kl": reverse_kl,
-        "exact_token_match_only": exact_token_match_only,
-        "kl_loss_weight": kl_loss_weight,
-        "ce_loss_scale": ce_loss_scale,
-        "dynamic_loss_scaling": dynamic_loss_scaling,
-        "student_vocab_size": student_vocab_size,
-        "teacher_vocab_size": teacher_vocab_size,
-    }
-
-
-def make_ct_data_dict(
-    *,
-    batch_size: int,
-    t_student: int,
-    t_teacher: int,
-    max_pairs: int,
-    num_chunks: list[int],
-    student_chunk_id: torch.Tensor,
-    teacher_chunk_id: torch.Tensor,
-    pair_valid: torch.Tensor,
-    sample_mask: torch.Tensor,
-    pair_is_correct: torch.Tensor | None = None,
-    student_exact_partition_mask: torch.Tensor | None = None,
-    teacher_exact_partition_mask: torch.Tensor | None = None,
-) -> dict[str, Any]:
-    """Build the per-microbatch CT data dict shape expected by the loss fn.
-
-    ``teacher_full_logits_ipc`` is left as an empty list — tests that need
-    it monkeypatch ``_rebuild_teacher_full_logits`` directly so we never
-    have to construct real CUDA IPC handles.
-    """
-    if pair_is_correct is None:
-        pair_is_correct = pair_valid.clone()
-    if student_exact_partition_mask is None:
-        student_exact_partition_mask = torch.zeros(
-            (batch_size, t_student), dtype=torch.bool
-        )
-    if teacher_exact_partition_mask is None:
-        teacher_exact_partition_mask = torch.zeros(
-            (batch_size, t_teacher), dtype=torch.bool
-        )
-
-    return {
-        "input_ids": torch.zeros((batch_size, t_student), dtype=torch.long),
-        "input_lengths": torch.full((batch_size,), t_student, dtype=torch.long),
-        "token_mask": torch.ones((batch_size, t_student), dtype=torch.long),
-        "sample_mask": sample_mask,
-        "teacher_full_logits_ipc": [],
-        "alignment_pair_valid": pair_valid,
-        "alignment_pair_is_correct": pair_is_correct,
-        "alignment_student_exact_partition_mask": student_exact_partition_mask,
-        "alignment_teacher_exact_partition_mask": teacher_exact_partition_mask,
-        "alignment_student_chunk_id": student_chunk_id,
-        "alignment_teacher_chunk_id": teacher_chunk_id,
-        "alignment_num_chunks": torch.tensor(num_chunks, dtype=torch.long),
-    }
-
-
-def has_gloo() -> bool:
-    """Whether torch.distributed has a usable gloo backend."""
-    return torch.distributed.is_available() and torch.distributed.is_gloo_available()
