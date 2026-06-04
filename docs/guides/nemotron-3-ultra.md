@@ -1,6 +1,6 @@
 # Nemotron 3 Ultra
 
-**Technical Report:** _TBD — link to the Nemotron 3 Ultra technical report once published._
+**Technical Report:** [NVIDIA Nemotron 3 Ultra Technical Report](https://research.nvidia.com/labs/nemotron/files/NVIDIA-Nemotron-3-Ultra-Technical-Report.pdf)
 
 This guide explains how to post-train the Nemotron 3 Ultra model with NeMo RL on
 **GB200 NVL72** (ARM64 / aarch64) hardware.
