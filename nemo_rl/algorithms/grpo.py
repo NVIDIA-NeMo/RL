@@ -861,26 +861,6 @@ def dynamic_sampling(
                 len(non_zero_std_mask), device=std.device
             )[non_zero_std_mask].tolist()
 
-            # Log rewards of filtered-out (zero-std) samples so we can see whether
-            # they were all-correct (reward≈1) or all-wrong (reward≈0).
-            zero_std_mask = ~non_zero_std_mask
-            num_filtered = zero_std_mask.sum().item()
-            if num_filtered > 0:
-                filtered_out_rewards = total_rewards[zero_std_mask]
-                print(
-                    f"[dynamic_sampling] {num_filtered} samples filtered out (zero-std groups): "
-                    f"reward mean={filtered_out_rewards.mean():.4f}, "
-                    f"min={filtered_out_rewards.min():.4f}, "
-                    f"max={filtered_out_rewards.max():.4f}",
-                    flush=True,
-                )
-                unique_r, counts = filtered_out_rewards.unique(return_counts=True)
-                if len(unique_r) <= 10:
-                    breakdown = ", ".join(
-                        f"{r:.4f}×{c}" for r, c in zip(unique_r.tolist(), counts.tolist())
-                    )
-                    print(f"[dynamic_sampling]   reward breakdown: {breakdown}", flush=True)
-
             # Only select the inputs that have non-zero std
             # total_reward is already a part of repeated_batch so we don't need to add it again
             filtered_repeated_batch = repeated_batch.select_indices(keep_prompt_indices)
