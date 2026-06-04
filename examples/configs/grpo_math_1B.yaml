@@ -283,6 +283,10 @@ policy:
     - milestones: [50]
 
   generation:
+    # Port ranges for master address allocation, kept below the OS ephemeral
+    # range (32768-60999). See ray.sub for the full port layout.
+    port_range_low: 11001
+    port_range_high: 15000
     backend: "vllm"
     max_new_tokens: ${policy.max_total_sequence_length}
     temperature: 1.0
