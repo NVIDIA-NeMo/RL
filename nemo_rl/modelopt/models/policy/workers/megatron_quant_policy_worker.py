@@ -23,6 +23,7 @@ from megatron.bridge.training.post_training.checkpointing import (
     has_modelopt_state,
     load_modelopt_state,
 )
+from megatron.bridge.utils.instantiate_utils import register_allowed_target_prefix
 from megatron.core.utils import unwrap_model
 from modelopt.torch.quantization.nn.modules.quant_module import QuantModule
 from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
@@ -65,6 +66,10 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         # setup_reference_model_state and runs before load_checkpoint to resume
         # quantizers on the model.
         self._model_import_post_wrap_hook = self._quantize
+
+        ## need to add nemo_rl to mbridge's allowed target prefixes in order to successfully
+        ## restore from the mbridge checkpoint.
+        register_allowed_target_prefix("nemo_rl.")
         self._transformer_layer_spec = quantization_layer_spec
         self._pre_load_checkpoint_hook = self._restore_modelopt_state_pre_load
         super().__init__(config, *args, **kwargs)

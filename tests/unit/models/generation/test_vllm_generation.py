@@ -33,6 +33,9 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation.vllm.vllm_worker import (
+    _resolve_enable_prefix_caching,
+)
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     _replace_prefix_tokens,
 )
@@ -129,6 +132,28 @@ basic_dtensor_test_config: PolicyConfig = {
     "make_sequence_length_divisible_by": 1,
     "generation": deepcopy(basic_vllm_test_config),
 }
+
+
+def test_resolve_enable_prefix_caching_respects_explicit_config(monkeypatch):
+    def raise_if_called():
+        raise AssertionError("CUDA capability should not be queried")
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", raise_if_called)
+
+    assert _resolve_enable_prefix_caching({"enable_prefix_caching": False}) is False
+    assert _resolve_enable_prefix_caching({"enable_prefix_caching": True}) is True
+
+
+def test_resolve_enable_prefix_caching_uses_cuda_capability_for_auto(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (8, 0))
+
+    assert _resolve_enable_prefix_caching({}) is True
+    assert _resolve_enable_prefix_caching({"enable_prefix_caching": None}) is True
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (7, 5))
+
+    assert _resolve_enable_prefix_caching({}) is False
+
 
 basic_lora_test_config: LoRAConfig = {
     "enabled": False,
