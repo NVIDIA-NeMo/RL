@@ -1,0 +1,424 @@
+# ============================================================================
+# Async GRPO SWE RL Training: Qwen3-30B-A3B-Thinking-2507
+#
+# Model:      Qwen3-30B-A3B-Thinking-2507 (MoE, 30B total / 3B active, thinking)
+# Train data: R2E-Gym (r2e-gym subset, 4518 samples)
+# Eval data:  SWE-bench Verified
+# Mode:       Async GRPO with non-colocated generation
+# Entry:      examples/nemo_gym/run_grpo_nemo_gym.py
+# Env:        swe_agents (OpenHands agent, singularity sandbox)
+#
+# Based on:   baseline/nemo-rl-qwen-swe/grpo_qwen3_30b_thinking_swe.yaml
+# Gym:        main branch (nemo-rl-async-swe repo)
+# ============================================================================
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/grpo-qwen3-30b-thinking-swe-rl"
+  metric_name: "train:total_reward/mean"
+  higher_is_better: true
+  keep_top_k: 100
+  save_period: 5
+  checkpoint_must_save_by: "00:03:35:00"
+  model_save_format: "safetensors"
+  save_consolidated: false
+  save_optimizer: true
+
+grpo:
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 16
+  num_val_generations_per_prompt: 1
+  max_rollout_turns: 1
+  max_num_epochs: 100
+  max_num_steps: 1000000
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  advantage_clip_low: -100
+  advantage_clip_high: 100
+  val_period: 10
+  val_at_start: false
+  val_at_end: false
+  overlong_filtering: true
+  max_val_samples: null
+  val_batch_size: 256
+  seed: 42
+  invalid_tool_call_strategy: ""
+
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1
+
+  penalize_invalid_tool_call: true
+  invalid_tool_call_advantage: -5.0
+  penalize_malformed_thinking: true
+  malformed_thinking_advantage: -5.0
+
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 128
+    overlong_buffer_penalty: 1
+    max_response_length: ${policy.max_total_sequence_length}
+    stop_properly_penalty_coef: null
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
+
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: false
+
+  seq_logprob_error_threshold: 2
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  reference_policy_kl_type: "k3"
+  kl_input_clamp_value: null
+  kl_output_clamp_value: null
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: true
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_ratio: 5.0
+  truncated_importance_sampling_ratio_min: null
+  truncated_importance_sampling_type: tis
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  force_on_policy_ratio: true
+  use_kl_in_reward: false
+
+policy:
+  model_name: "/lustre/fsw/portfolios/llmservice/users/igitman/hf_models/Qwen3-30B-A3B-Thinking-2507"
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs:
+      enable_thinking: true
+  hf_config_overrides: {}
+  train_global_batch_size: 256
+  train_micro_batch_size: 1
+  generation_batch_size: 64
+  logprob_batch_size: 1
+  max_total_sequence_length: 131072
+  precision: "bfloat16"
+  logprob_chunk_size: 2048
+  offload_optimizer_for_logprob: false
+
+  dtensor_cfg:
+    _v2: true
+    enabled: false
+    cpu_offload: False
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+
+  megatron_cfg:
+    enabled: true
+    gradient_accumulation_fusion: false
+    empty_unused_memory_level: 1
+    activation_checkpointing: true
+    tensor_model_parallel_size: 2
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 8
+    pipeline_model_parallel_size: 2
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 4
+    pipeline_dtype: ${policy.precision}
+    sequence_parallel: true
+    freeze_moe_router: true
+    moe_router_dtype: "fp32"
+    moe_router_load_balancing_type: "none"
+    moe_router_bias_update_rate: 1.0e-3
+    moe_permute_fusion: true
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "alltoall"
+    moe_aux_loss_coeff: 0.0
+    moe_router_enable_expert_bias: true
+    moe_shared_expert_overlap: false
+    apply_rope_fusion: True
+    bias_activation_fusion: False
+    defer_fp32_logits: True
+    moe_per_layer_logging: True
+
+    optimizer:
+      optimizer: "adam"
+      lr: 1.0e-6
+      min_lr: 1.0e-6
+      weight_decay: 0.0
+      bf16: true
+      fp16: false
+      params_dtype: "float32"
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1e-8
+      sgd_momentum: 0.9
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      clip_grad: ${policy.max_grad_norm}
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"
+      lr_decay_iters: 1000000
+      lr_warmup_iters: 0
+      lr_warmup_init: 0
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: "optim_grads_params"
+
+    mtp_loss_scaling_factor: 0.0
+    mtp_use_repeated_layer: false
+    mtp_num_layers: 0
+    mtp_detach_heads: false
+
+    fp8_cfg:
+      enabled: false
+      fp8: "e4m3"
+      fp8_recipe: "blockwise"
+      fp8_param: false
+
+    env_vars: null
+
+  dynamic_batching:
+    enabled: False
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: True
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  make_sequence_length_divisible_by: 8
+  max_grad_norm: 1.0
+
+  optimizer: null
+  scheduler: null
+
+  generation:
+    port_range_low: 11001
+    port_range_high: 15000
+    backend: "vllm"
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      enable_prefix_caching: true
+      async_engine: true
+      precision: ${policy.precision}
+      kv_cache_dtype: "auto"
+      tensor_parallel_size: 2
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.8
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: False
+      enforce_monotonicity: false
+      use_deep_gemm: False
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 0.5
+      expose_http_server: true
+      skip_tokenizer_init: false
+      enable_thinking: true
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: hermes
+        reasoning_parser: deepseek_r1
+        chat_template: |
+          {%- if tools %}
+              {{- '<|im_start|>system\n' }}
+              {%- if messages[0].role == 'system' %}
+                  {{- messages[0].content + '\n\n' }}
+              {%- endif %}
+              {{- "# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>" }}
+              {%- for tool in tools %}
+                  {{- "\n" }}
+                  {{- tool | tojson }}
+              {%- endfor %}
+              {{- "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n" }}
+          {%- else %}
+              {%- if messages[0].role == 'system' %}
+                  {{- '<|im_start|>system\n' + messages[0].content + '<|im_end|>\n' }}
+              {%- endif %}
+          {%- endif %}
+          {%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}
+          {%- for message in messages[::-1] %}
+              {%- set index = (messages|length - 1) - loop.index0 %}
+              {%- if ns.multi_step_tool and message.role == "user" and message.content is string and not(message.content.startswith('<tool_response>') and message.content.endswith('</tool_response>')) %}
+                  {%- set ns.multi_step_tool = false %}
+                  {%- set ns.last_query_index = index %}
+              {%- endif %}
+          {%- endfor %}
+          {%- for message in messages %}
+              {%- if message.content is string %}
+                  {%- set content = message.content %}
+              {%- else %}
+                  {%- set content = '' %}
+              {%- endif %}
+              {%- if (message.role == "user") or (message.role == "system" and not loop.first) %}
+                  {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}
+              {%- elif message.role == "assistant" %}
+                  {%- set reasoning_content = '' %}
+                  {%- if message.reasoning_content is string %}
+                      {%- set reasoning_content = message.reasoning_content %}
+                  {%- else %}
+                      {%- if '</think>' in content %}
+                          {%- set reasoning_content = content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n') %}
+                          {%- set content = content.split('</think>')[-1].lstrip('\n') %}
+                      {%- endif %}
+                  {%- endif %}
+                  {%- if reasoning_content %}
+                      {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content.strip('\n') + '\n</think>\n\n' + content.lstrip('\n') }}
+                  {%- else %}
+                      {{- '<|im_start|>' + message.role + '\n' + content }}
+                  {%- endif %}
+                  {%- if message.tool_calls %}
+                      {%- for tool_call in message.tool_calls %}
+                          {%- if (loop.first and content) or (not loop.first) %}
+                              {{- '\n' }}
+                          {%- endif %}
+                          {%- if tool_call.function %}
+                              {%- set tool_call = tool_call.function %}
+                          {%- endif %}
+                          {{- '<tool_call>\n{"name": "' }}
+                          {{- tool_call.name }}
+                          {{- '", "arguments": ' }}
+                          {%- if tool_call.arguments is string %}
+                              {{- tool_call.arguments }}
+                          {%- else %}
+                              {{- tool_call.arguments | tojson }}
+                          {%- endif %}
+                          {{- '}\n</tool_call>' }}
+                      {%- endfor %}
+                  {%- endif %}
+                  {{- '<|im_end|>\n' }}
+              {%- elif message.role == "tool" %}
+                  {%- if loop.first or (messages[loop.index0 - 1].role != "tool") %}
+                      {{- '<|im_start|>user' }}
+                  {%- endif %}
+                  {{- '\n<tool_response>\n' }}
+                  {{- content }}
+                  {{- '\n</tool_response>' }}
+                  {%- if loop.last or (messages[loop.index0 + 1].role != "tool") %}
+                      {{- '<|im_end|>\n' }}
+                  {%- endif %}
+              {%- endif %}
+          {%- endfor %}
+          {%- if add_generation_prompt %}
+              {{- '<|im_start|>assistant\n<think>\n' }}
+          {%- endif %}
+        default_chat_template_kwargs:
+          enable_thinking: true
+          truncate_history_thinking: false
+
+    vllm_kwargs:
+      mamba_ssm_cache_dtype: "float32"
+      compilation_config:
+        cudagraph_capture_sizes: [1,2,4,8,16,32,64]
+
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 4
+
+data:
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 1
+  use_multiple_dataloader: false
+  train:
+    data_path: "/lustre/fsw/portfolios/llmservice/projects/llmservice_modelalignment_ppo/users/sdevare/repos/nano/dataset/rl/swe_all_datasets_train_w_agent_ref_r2e_gym_subset.jsonl"
+  validation:
+    data_path: "/lustre/fsw/portfolios/llmservice/projects/llmservice_modelalignment_ppo/users/sdevare/repos/nano/dataset/rl/swe_all_datasets_train_w_agent_ref_r2e_gym_subset.jsonl"
+  default:
+    dataset_name: NemoGymDataset
+    env_name: "nemo_gym"
+    prompt_file: null
+    system_prompt_file: null
+    processor: "nemo_gym_data_processor"
+
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: false
+  nemo_gym:
+    skip_venv_if_present: true
+    port_range_low: 15001
+    port_range_high: 20000
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - responses_api_agents/swe_agents/configs/swebench_openhands_training.yaml
+    swe_agents_train:
+      responses_api_agents:
+        swe_agents:
+          agent_max_turns: 100
+          concurrency: 768
+          swebench_agent_timeout: 3600
+          run_with_mixed_prompts: true
+          dataset_path: ${data.train.data_path}
+          container_formatter:
+          - "/lustre/fsw/portfolios/llmservice/users/igitman/images/swe-bench/swebench_sweb.eval.x86_64.{instance_id}.sif"
+          - "/lustre/fsw/portfolios/llmservice/users/sdevare/swe_sweapro/images_train/sweap.{instance_id}.sif"
+          - "/lustre/fsw/portfolios/llmservice/users/igitman/images/swe-bench/namanjain12_{instance_id}.sif"
+          - "/lustre/fsw/portfolios/llmservice/users/sdevare/swe_sweapro/images_train/sweap.{instance_id}.sif"
+          - "/lustre/fsw/portfolios/llmservice/users/igitman/images/swe-bench/swebench_sweb.eval.x86_64{instance_id}.sif"
+    swe_agents_val:
+      responses_api_agents:
+        swe_agents:
+          agent_max_turns: 200
+          concurrency: 768
+          swebench_agent_timeout: 3600
+          dataset_path: ${data.validation.data_path}
+          container_formatter:
+          - "/lustre/fsw/portfolios/llmservice/users/igitman/images/swe-bench/swebench_sweb.eval.x86_64.{instance_id}.sif"
+          - "/lustre/fsw/portfolios/llmservice/users/sdevare/swe_sweapro/images_train/sweap.{instance_id}.sif"
+          - "/lustre/fsw/portfolios/llmservice/users/igitman/images/swe-bench/namanjain12_{instance_id}.sif"
+          - "/lustre/fsw/portfolios/llmservice/users/sdevare/swe_sweapro/images_train/sweap.{instance_id}.sif"
+          - "/lustre/fsw/portfolios/llmservice/users/igitman/images/swe-bench/swebench_sweb.eval.x86_64{instance_id}.sif"
+    use_absolute_ip: true
+
+logger:
+  log_dir: "logs"
+  num_val_samples_to_print: 0
+  wandb_enabled: true
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  monitor_gpus: true
+  swanlab_enabled: false
+  wandb:
+    project: "ruit-nemo-rl"
+    name: "qwen3-30b-thinking-swe-rl"
+  tensorboard: {}
+  mlflow:
+    experiment_name: "qwen3-30b-thinking-swe-rl"
+    run_name: "qwen3-30b-thinking-swe-rl"
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 16
