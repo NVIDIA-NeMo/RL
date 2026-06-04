@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from pathlib import Path
-from typing import Any, Dict, List, TypedDict
+from typing import Any, Dict, List, NotRequired, TypedDict
 
 import ray
 import torch
@@ -32,6 +32,8 @@ class NemoGymConfig(TypedDict):
     model_name: str
     base_urls: List[str]
     initial_global_config_dict: Dict[str, Any]
+    port_range_low: NotRequired[int]
+    port_range_high: NotRequired[int]
 
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
