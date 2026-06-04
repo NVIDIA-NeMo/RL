@@ -24,6 +24,7 @@ from nemo_rl.algorithms.x_token.loss_utils import (
     alignment_from_flat_batch,
     build_exact_token_map,
     chunk_average_log_probs,
+    dp_all_reduce_sum,
     get_sparse_projection_matrix,
     valid_chunk_mask,
 )
@@ -1204,29 +1205,6 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         # any large CUDA tensors and lets multiple loss instances on
         # the same worker share one load.
 
-    @staticmethod
-    def _dp_all_reduce_sum(local: torch.Tensor) -> torch.Tensor:
-        """Sum-reduce a scalar count across the data-parallel group.
-
-        Used to compute ``global_valid_chunks`` from each rank's local
-        chunk count, so the chunk-KL denominator matches the
-        ``sum(global_valid_chunk_kl) / sum(global_valid_chunks)``
-        objective (the same convention CE follows via
-        ``global_valid_toks``). The cross-tokenizer setup asserts
-        ``cp_size=1, tp_size=1`` in
-        ``xtoken_off_policy_distillation.setup``, so the default
-        process group equals the DP group — calling all-reduce on the
-        default group therefore sums across DP only.
-
-        Returns a fresh ``float32`` scalar; the input tensor is not
-        modified. Falls back to a copy of the local value when
-        distributed is not initialized (unit tests).
-        """
-        out = local.detach().to(torch.float32).clone()
-        if torch.distributed.is_initialized():
-            torch.distributed.all_reduce(out)
-        return out
-
     def __call__(
         self,
         data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
@@ -1417,7 +1395,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         # mirrors the `global_valid_toks` convention used by CE.
         sample_mask_bool = data["sample_mask"].bool()
         valid_bool = chunk_mask & sample_mask_bool.unsqueeze(-1)
-        global_valid_chunks = self._dp_all_reduce_sum(valid_bool.sum())
+        global_valid_chunks = dp_all_reduce_sum(valid_bool.sum())
         if global_valid_chunks.item() == 0:
             zero = torch.zeros((), device=device, dtype=proj_log_chunks.dtype)
             return (
@@ -1537,7 +1515,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         # both `kl_common` and `l1_uncommon` use this as their denom so
         # the loss is normalized by `sum(global_valid_chunks)`, not a
         # per-rank mean.
-        global_valid_chunks = self._dp_all_reduce_sum(valid_chunk.sum())
+        global_valid_chunks = dp_all_reduce_sum(valid_chunk.sum())
         if global_valid_chunks.item() == 0:
             zero = torch.zeros((), device=device, dtype=zero_dtype)
             return (

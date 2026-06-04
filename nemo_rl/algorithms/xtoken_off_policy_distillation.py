@@ -182,6 +182,16 @@ def setup(
         "xtoken distillation requires teacher.dtensor_cfg.enabled=true and _v2=true."
     )
 
+    # The cross-tokenizer loss reduces ``global_valid_chunks`` with an
+    # all-reduce on the default process group (see
+    # ``loss_utils.dp_all_reduce_sum``), which only equals the DP group
+    # when there is no TP/CP sharding. Enforce that here so the chunk-KL
+    # denominator stays correct.
+    assert (
+        policy_config["dtensor_cfg"].get("tensor_parallel_size", 1) == 1
+        and policy_config["dtensor_cfg"].get("context_parallel_size", 1) == 1
+    ), "xtoken distillation requires policy tensor_parallel_size=1 and context_parallel_size=1."
+
     set_seed(distillation_config["seed"])
 
     # ==========================

@@ -21,6 +21,9 @@ and :mod:`nemo_rl.algorithms.loss.loss_functions`:
       sparse-mm kernel).
     - :func:`chunk_average_log_probs`, :func:`valid_chunk_mask` —
       chunk-aggregation helpers for the cross-tokenizer KL paths.
+    - :func:`dp_all_reduce_sum` — sum-reduce a scalar count across the
+      data-parallel group so the chunk-KL denominator is the global
+      valid-chunk count rather than a per-rank mean.
     - :func:`parse_projection_file` — single source of truth for
       reading the on-disk projection matrix file (both the dense top-k
       format and the sparse ``dict[(s, t)] -> count`` format) into COO
@@ -183,6 +186,29 @@ def valid_chunk_mask(
 ) -> torch.Tensor:
     """Per-chunk validity gate: both sides non-empty and pair is valid."""
     return (s_sizes > 0) & (t_sizes > 0) & pair_valid
+
+
+def dp_all_reduce_sum(local: torch.Tensor) -> torch.Tensor:
+    """Sum-reduce a scalar count across the data-parallel group.
+
+    Used to compute ``global_valid_chunks`` from each rank's local
+    chunk count, so the chunk-KL denominator matches the
+    ``sum(global_valid_chunk_kl) / sum(global_valid_chunks)`` objective
+    (the same convention CE follows via ``global_valid_toks``). The
+    cross-tokenizer setup asserts ``tensor_parallel_size=1`` and
+    ``context_parallel_size=1`` in
+    ``xtoken_off_policy_distillation.setup``, so the default process
+    group equals the DP group — calling all-reduce on the default group
+    therefore sums across DP only.
+
+    Returns a fresh ``float32`` scalar; the input tensor is not
+    modified. Falls back to a copy of the local value when distributed
+    is not initialized (unit tests).
+    """
+    out = local.detach().to(torch.float32).clone()
+    if torch.distributed.is_initialized():
+        torch.distributed.all_reduce(out)
+    return out
 
 
 def parse_projection_file(
