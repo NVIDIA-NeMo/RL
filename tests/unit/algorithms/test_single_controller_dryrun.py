@@ -23,7 +23,7 @@ Key questions answered:
   - Does buffer capacity correctly block rollout_pump when capacity is full?
   - Does _rollout_permitted correctly pause dispatch during _sync_weights?
   - RISK-06: does a blocking policy.train() call freeze the event loop?
-    (train_on_meta uses asyncio.sleep to simulate, so this is non-blocking
+    (train_from_meta uses asyncio.sleep to simulate, so this is non-blocking
     by construction in the dry-run — see dedicated RISK-06 test below)
 """
 
@@ -71,6 +71,7 @@ class FakeDataPlaneActor:
         self._rows: dict[str, dict] = {}
         self._consumed: dict[str, set[str]] = {}
         self._lock = threading.Lock()
+        self._clear_calls: list[list[str]] = []
 
     def put_samples(
         self,
@@ -164,10 +165,15 @@ class FakeDataPlaneActor:
         assert partition_id == self._partition_id
         with self._lock:
             ids = list(self._rows) if sample_ids is None else sample_ids
+            self._clear_calls.append(list(ids))
             for sample_id in ids:
                 self._rows.pop(sample_id, None)
                 for consumed in self._consumed.values():
                     consumed.discard(sample_id)
+
+    def get_clear_calls(self) -> list[list[str]]:
+        with self._lock:
+            return [list(c) for c in self._clear_calls]
 
     def depth(self) -> int:
         with self._lock:
@@ -245,31 +251,121 @@ class DryRunTrainer:
     """Stub PolicyTrainerActor.
 
     Implements the same interface as production trainer:
-      train_on_meta(meta, dp_client) → fetches from DataPlane, sleeps, returns result
+      train_from_meta(meta) → fetches from its own dp_client, sleeps, returns result
+
+    Production ``PolicyTrainerActor`` owns its dp_client (built from
+    ``dp_cfg`` at construction). This stub mirrors that by binding the
+    dp_client handle at ``__init__`` time, not per call.
 
     Uses asyncio.sleep so event loop stays responsive — other pumps continue.
     """
 
     def __init__(
         self,
+        dp_client: Any,
         train_latency_s: float = 0.2,
         expect_advantages: bool = False,
+        microbatch_latency_s: float = 0.0,
     ):
+        self._dp_client = dp_client
         self._train_latency_s = train_latency_s
         self._expect_advantages = expect_advantages
+        self._microbatch_latency_s = microbatch_latency_s
         self._trainer_version = 0
         self._train_count = 0
         self._train_start_times: list[float] = []
         self._last_advantages: torch.Tensor | None = None
+        # Split API state
+        self._open_step_id: str | None = None
+        self._microbatch_calls: list[tuple[str, list[str], float]] = []
+        self._finish_calls: list[str] = []
+        self._abort_calls: list[str] = []
 
-    async def train_on_meta(self, meta: KVBatchMeta, dp_client: Any) -> dict:
+    async def begin_train_step(
+        self,
+        step_id: str,
+        loss_fn: Any = None,
+        gbs: int = 0,
+        mbs: int = 0,
+    ) -> None:
+        del loss_fn, gbs, mbs
+        if self._open_step_id is not None:
+            raise RuntimeError(
+                f"begin_train_step called while step {self._open_step_id} is open"
+            )
+        self._open_step_id = step_id
+
+    async def train_microbatch_from_meta(self, step_id: str, meta: KVBatchMeta) -> None:
+        if self._open_step_id is None:
+            raise RuntimeError("train_microbatch_from_meta called with no open step")
+        if step_id != self._open_step_id:
+            raise RuntimeError(
+                f"train_microbatch_from_meta step_id={step_id!r} != open {self._open_step_id!r}"
+            )
+        self._microbatch_calls.append(
+            (step_id, list(meta.sample_ids), time.monotonic())
+        )
+        if self._expect_advantages:
+            data = await self._dp_client.get_samples.remote(
+                sample_ids=meta.sample_ids,
+                partition_id=meta.partition_id,
+                select_fields=["input_ids", "advantages"],
+            )
+            advantages = data["advantages"].detach().clone()
+            if self._last_advantages is None:
+                self._last_advantages = advantages
+            else:
+                self._last_advantages = torch.cat(
+                    [self._last_advantages, advantages], dim=0
+                )
+        if self._microbatch_latency_s > 0:
+            await asyncio.sleep(self._microbatch_latency_s)
+
+    async def finish_train_step(self, step_id: str) -> dict:
+        if self._open_step_id is None:
+            raise RuntimeError("finish_train_step called with no open step")
+        if step_id != self._open_step_id:
+            raise RuntimeError(
+                f"finish_train_step step_id={step_id!r} != open {self._open_step_id!r}"
+            )
+        self._finish_calls.append(step_id)
+        self._open_step_id = None
+        self._trainer_version += 1
+        self._train_count += 1
+        return {
+            "loss": 1.0 / (self._trainer_version + 1),
+            "trainer_version": self._trainer_version,
+        }
+
+    async def abort_train_step(self, step_id: str) -> None:
+        self._abort_calls.append(step_id)
+        self._open_step_id = None
+
+    async def prepare_logprobs_from_meta(self, meta: KVBatchMeta) -> None:
+        del meta
+        return None
+
+    def get_open_step_id(self) -> str | None:
+        return self._open_step_id
+
+    def get_microbatch_calls(self) -> list[tuple[str, list[str], float]]:
+        return list(self._microbatch_calls)
+
+    def get_finish_calls(self) -> list[str]:
+        return list(self._finish_calls)
+
+    def get_abort_calls(self) -> list[str]:
+        return list(self._abort_calls)
+
+    async def train_from_meta(self, meta: KVBatchMeta) -> dict:
         """Simulate a training step."""
         self._train_start_times.append(time.monotonic())
-        # Fetch records from DataPlane directly — same path as production
+        # Fetch records from DataPlane via the trainer's own client —
+        # same as production TQPolicy.train_from_meta.
         select_fields = ["input_ids"]
         if self._expect_advantages:
             select_fields.append("advantages")
-        data = await dp_client.get_samples.remote(
+        data = await self._dp_client.get_samples.remote(
             sample_ids=meta.sample_ids,
             partition_id=meta.partition_id,
             select_fields=select_fields,
@@ -415,7 +511,7 @@ class TestSingleControllerDryRun:
         """SC completes N train steps without deadlock on CPU."""
         dp_client = FakeDataPlaneActor.remote()
         gen = DryRunGenWorker.remote(gen_latency_s=0.05)
-        trainer = DryRunTrainer.remote(train_latency_s=0.1)
+        trainer = DryRunTrainer.remote(dp_client, train_latency_s=0.1)
         weight_sync = DryRunWeightSynchronizer(sync_latency_s=0.02, gen_handle=gen)
 
         ctrl = self._make_controller(
@@ -438,6 +534,7 @@ class TestSingleControllerDryRun:
         dp_client = FakeDataPlaneActor.remote()
         gen = DryRunGenWorker.remote(gen_latency_s=0.01)
         trainer = DryRunTrainer.remote(
+            dp_client,
             train_latency_s=0.01,
             expect_advantages=True,
         )
@@ -459,16 +556,10 @@ class TestSingleControllerDryRun:
 
         advantages = ray.get(trainer.get_last_advantages.remote())
         assert advantages is not None
+        # Per-group dispatch: each group is one sample → centered advantage is 0.
+        # The two microbatch calls are concatenated.
         assert advantages.shape == (2, 3)
-        assert torch.allclose(
-            advantages,
-            torch.tensor(
-                [
-                    [-0.5, -0.5, -0.5],
-                    [0.5, 0.5, 0.5],
-                ]
-            ),
-        )
+        assert torch.allclose(advantages, torch.zeros((2, 3)))
 
     def test_rollout_pump_runs_concurrently_with_train(self, ray_init):
         """rollout_pump dispatches while train_pump is sleeping.
@@ -480,7 +571,7 @@ class TestSingleControllerDryRun:
         dp_client = FakeDataPlaneActor.remote()
         # Gen is fast (0.02s), trainer is slow (0.3s)
         gen = DryRunGenWorker.remote(gen_latency_s=0.02)
-        trainer = DryRunTrainer.remote(train_latency_s=0.3)
+        trainer = DryRunTrainer.remote(dp_client, train_latency_s=0.3)
 
         ctrl = self._make_controller(
             dp_client,
@@ -518,7 +609,7 @@ class TestSingleControllerDryRun:
         """
         dp_client = FakeDataPlaneActor.remote()
         gen = DryRunGenWorker.remote(gen_latency_s=0.01)  # fast gen
-        trainer = DryRunTrainer.remote(train_latency_s=0.3)  # slow trainer
+        trainer = DryRunTrainer.remote(dp_client, train_latency_s=0.3)  # slow trainer
 
         ctrl = self._make_controller(
             dp_client,
@@ -550,7 +641,7 @@ class TestSingleControllerDryRun:
         """
         dp_client = FakeDataPlaneActor.remote()
         gen = DryRunGenWorker.remote(gen_latency_s=0.05)
-        trainer = DryRunTrainer.remote(train_latency_s=0.05)
+        trainer = DryRunTrainer.remote(dp_client, train_latency_s=0.05)
         weight_sync = DryRunWeightSynchronizer(
             sync_latency_s=0.15,
             gen_handle=gen,
@@ -575,7 +666,7 @@ class TestSingleControllerDryRun:
         """ping() returns immediately if event loop is running — basis for watchdog."""
         dp_client = FakeDataPlaneActor.remote()
         gen = DryRunGenWorker.remote(gen_latency_s=0.05)
-        trainer = DryRunTrainer.remote(train_latency_s=0.1)
+        trainer = DryRunTrainer.remote(dp_client, train_latency_s=0.1)
 
         ctrl = self._make_controller(
             dp_client,
@@ -683,13 +774,399 @@ class TestSingleControllerDryRun:
         ) == [0, 2]
 
 
+@ray.remote(num_cpus=0)
+class _ReapInFlightHelperActor:
+    """Tiny Ray actor exposing SingleControllerActor._reap_in_flight_nonblocking."""
+
+    async def reap(self, refs):
+        ready, pending = (
+            ray.wait(refs, num_returns=len(refs), timeout=0) if refs else ([], [])
+        )
+        for r in ready:
+            await r
+        return pending
+
+
+@ray.remote
+def _sleep_then_return(seconds: float, value: int = 0) -> int:
+    time.sleep(seconds)
+    return value
+
+
+@ray.remote
+def _raise_after(seconds: float) -> None:
+    time.sleep(seconds)
+    raise RuntimeError("boom")
+
+
+class TestReapInFlightNonblocking:
+    """Validate _reap_in_flight_nonblocking helper semantics."""
+
+    def test_reap_empty_list_returns_empty(self, ray_init):
+        helper = _ReapInFlightHelperActor.remote()
+        result = ray.get(helper.reap.remote([]))
+        assert result == []
+
+    def test_reap_drains_completed_and_returns_pending(self, ray_init):
+        helper = _ReapInFlightHelperActor.remote()
+        # One finishes immediately, two stay pending
+        done_ref = _sleep_then_return.remote(0.0, 1)
+        pending1 = _sleep_then_return.remote(10.0, 2)
+        pending2 = _sleep_then_return.remote(10.0, 3)
+        # Give Ray a moment to mark done_ref as ready
+        time.sleep(0.5)
+        result = ray.get(helper.reap.remote([done_ref, pending1, pending2]))
+        # Only the still-pending refs are returned
+        assert len(result) == 2
+        result_set = {r.hex() for r in result}
+        assert pending1.hex() in result_set
+        assert pending2.hex() in result_set
+
+    def test_reap_surfaces_exception_from_completed(self, ray_init):
+        helper = _ReapInFlightHelperActor.remote()
+        bad_ref = _raise_after.remote(0.0)
+        time.sleep(0.5)
+        with pytest.raises(Exception):
+            ray.get(helper.reap.remote([bad_ref]))
+
+
+class TestDryRunTrainerSplitAPI:
+    """Smoke test for DryRunTrainer split-API methods."""
+
+    def test_drytrainer_split_api_smoke(self, ray_init):
+        dp_client = FakeDataPlaneActor.remote()
+        trainer = DryRunTrainer.remote(dp_client, train_latency_s=0.0)
+        meta = KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=["a", "b"],
+        )
+        # Open step, microbatch, finish
+        ray.get(trainer.begin_train_step.remote("step-1"))
+        ray.get(trainer.train_microbatch_from_meta.remote("step-1", meta))
+        ray.get(trainer.train_microbatch_from_meta.remote("step-1", meta))
+        result = ray.get(trainer.finish_train_step.remote("step-1"))
+        assert result["trainer_version"] == 1
+        assert ray.get(trainer.get_open_step_id.remote()) is None
+        assert ray.get(trainer.get_finish_calls.remote()) == ["step-1"]
+        mbs = ray.get(trainer.get_microbatch_calls.remote())
+        assert len(mbs) == 2
+        assert all(call[0] == "step-1" for call in mbs)
+        assert all(call[1] == ["a", "b"] for call in mbs)
+        # Abort then begin again
+        ray.get(trainer.begin_train_step.remote("step-2"))
+        ray.get(trainer.train_microbatch_from_meta.remote("step-2", meta))
+        ray.get(trainer.abort_train_step.remote("step-2"))
+        assert ray.get(trainer.get_open_step_id.remote()) is None
+        assert ray.get(trainer.get_abort_calls.remote()) == ["step-2"]
+        # Trainer version did not advance via abort
+        ray.get(trainer.begin_train_step.remote("step-3"))
+        ray.get(trainer.finish_train_step.remote("step-3"))
+        # Now begin while a step is open should raise
+        ray.get(trainer.begin_train_step.remote("step-4"))
+        with pytest.raises(Exception):
+            ray.get(trainer.begin_train_step.remote("step-5"))
+
+
+@ray.remote(num_cpus=0)
+class StaggeredGenWorker:
+    """Gen worker that reads latency and group label from the prompt.
+
+    Prompt format: ``"{idx}:{latency}"``. Sleeps for ``latency`` then
+    pushes a row with ``group_id="group-{idx}"``.
+    """
+
+    def __init__(self, weight_version: int = 0) -> None:
+        self._weight_version = weight_version
+        self._completion_timestamps: list[float] = []
+
+    async def generate_and_push(self, prompt: str, dp_client: Any) -> None:
+        idx_str, latency_str = prompt.split(":")
+        idx = int(idx_str)
+        latency = float(latency_str)
+        await asyncio.sleep(latency)
+        group_id = f"group-{idx:04d}"
+        sample_id = f"{group_id}_g0"
+        await dp_client.put_samples.remote(
+            sample_ids=[sample_id],
+            partition_id="rollout_data",
+            fields=TensorDict(
+                {
+                    "input_ids": torch.ones((1, 3), dtype=torch.long),
+                },
+                batch_size=[1],
+            ),
+            tags=[
+                {
+                    "group_id": group_id,
+                    "weight_version": self._weight_version,
+                    "committed": True,
+                    "expected_num_samples": 1,
+                }
+            ],
+        )
+        self._completion_timestamps.append(time.monotonic())
+
+    def get_completion_timestamps(self) -> list[float]:
+        return list(self._completion_timestamps)
+
+    def set_weight_version(self, version: int) -> None:
+        self._weight_version = version
+
+
+class TestStreamingTrainPump:
+    """Streaming train_pump end-to-end behavior under DryRunTrainer."""
+
+    def _make_controller(
+        self,
+        dp_client,
+        gen,
+        trainer,
+        prompts: list[str],
+        weight_sync=None,
+        max_train_steps=1,
+        max_rollout_prompts=4,
+        min_prompt_groups_per_batch=1,
+        target_prompt_groups_per_step=4,
+        generations_per_prompt=1,
+        max_buffered_rollouts=8,
+        max_inflight_prompts=8,
+        max_weight_staleness_versions=1,
+        batch_selection_strategy="staleness_window",
+    ):
+        cfg = SingleControllerConfig(
+            max_train_steps=max_train_steps,
+            max_rollout_prompts=max_rollout_prompts,
+            min_prompt_groups_per_batch=min_prompt_groups_per_batch,
+            target_prompt_groups_per_step=target_prompt_groups_per_step,
+            generations_per_prompt=generations_per_prompt,
+            max_buffered_rollouts=max_buffered_rollouts,
+            max_inflight_prompts=max_inflight_prompts,
+            max_weight_staleness_versions=max_weight_staleness_versions,
+            batch_selection_strategy=batch_selection_strategy,
+        )
+        if weight_sync is None:
+            weight_sync = DryRunWeightSynchronizer(gen_handle=gen)
+        return SingleControllerActor.remote(
+            cfg,
+            prompts if prompts else ["unused"],
+            dp_client,
+            gen,
+            trainer,
+            weight_sync,
+            None,
+        )
+
+    def test_streaming_dispatches_in_arrival_order(self, ray_init):
+        """SC dispatches train_microbatch in order groups commit at DP."""
+        dp_client = FakeDataPlaneActor.remote()
+        # Group 0 slow, group 1 fast, group 2 medium → arrival order: 1, 2, 0
+        gen = StaggeredGenWorker.remote()
+        trainer = DryRunTrainer.remote(dp_client, train_latency_s=0.0)
+        prompts = ["0:0.30", "1:0.05", "2:0.15"]
+
+        ctrl = self._make_controller(
+            dp_client,
+            gen,
+            trainer,
+            prompts=prompts,
+            max_train_steps=1,
+            max_rollout_prompts=3,
+            target_prompt_groups_per_step=3,
+            min_prompt_groups_per_batch=1,
+        )
+        result = ray.get(ctrl.run.remote(), timeout=60)
+        assert result["train_steps"] == 1
+        mbs = ray.get(trainer.get_microbatch_calls.remote())
+        # 3 microbatches dispatched
+        assert len(mbs) == 3
+        dispatched_groups = [call[1][0].split("_")[0] for call in mbs]
+        # group-0001 (fastest) before group-0002 (medium) before group-0000 (slow)
+        assert dispatched_groups == ["group-0001", "group-0002", "group-0000"]
+
+    def test_trainer_version_advances_only_at_finish(self, ray_init):
+        """trainer_version stays put across mb calls; ticks on finish."""
+        dp_client = FakeDataPlaneActor.remote()
+        gen = StaggeredGenWorker.remote()
+        trainer = DryRunTrainer.remote(dp_client, train_latency_s=0.0)
+        prompts = [f"{i}:0.02" for i in range(4)]
+
+        ctrl = self._make_controller(
+            dp_client,
+            gen,
+            trainer,
+            prompts=prompts,
+            max_train_steps=1,
+            max_rollout_prompts=4,
+            target_prompt_groups_per_step=4,
+            min_prompt_groups_per_batch=1,
+        )
+        result = ray.get(ctrl.run.remote(), timeout=60)
+        assert result["train_steps"] == 1
+        # trainer_version should be 1 (one finish_train_step call)
+        assert ray.get(trainer.get_trainer_version.remote()) == 1
+        # finish was called exactly once
+        finishes = ray.get(trainer.get_finish_calls.remote())
+        assert finishes == ["sc-step-000000"]
+        mbs = ray.get(trainer.get_microbatch_calls.remote())
+        assert len(mbs) == 4
+
+    def test_strict_on_policy_rejects_stale_group_midstep(self, ray_init):
+        """Strict mode (staleness=0): group at version V-1 is not dispatched."""
+        dp_client = FakeDataPlaneActor.remote()
+        # Pre-stage: stale group at version -1 (trainer starts at v=0, strict)
+        stale_meta = ray.get(
+            dp_client.put_samples.remote(
+                sample_ids=["stale_g0"],
+                partition_id="rollout_data",
+                fields=TensorDict(
+                    {"input_ids": torch.ones((1, 3), dtype=torch.long)},
+                    batch_size=[1],
+                ),
+                tags=[
+                    {
+                        "group_id": "stale",
+                        "weight_version": -1,
+                        "committed": True,
+                        "expected_num_samples": 1,
+                    }
+                ],
+            )
+        )
+        del stale_meta
+        gen = StaggeredGenWorker.remote(weight_version=0)
+        trainer = DryRunTrainer.remote(dp_client, train_latency_s=0.0)
+        prompts = [f"{i}:0.02" for i in range(2)]
+
+        ctrl = self._make_controller(
+            dp_client,
+            gen,
+            trainer,
+            prompts=prompts,
+            max_train_steps=1,
+            max_rollout_prompts=2,
+            target_prompt_groups_per_step=2,
+            min_prompt_groups_per_batch=1,
+            batch_selection_strategy="strict_on_policy",
+            max_weight_staleness_versions=0,
+        )
+        result = ray.get(ctrl.run.remote(), timeout=60)
+        assert result["train_steps"] == 1
+        mbs = ray.get(trainer.get_microbatch_calls.remote())
+        # The stale group was evicted by _evict_stale_claimed; never dispatched
+        all_sample_ids = [sid for _, ids, _ in mbs for sid in ids]
+        assert "stale_g0" not in all_sample_ids
+
+    def test_long_tail_overlap(self, ray_init):
+        """First microbatch begins before the long-tail group's rollout finishes."""
+        dp_client = FakeDataPlaneActor.remote()
+        # Group 0 fast, 1-3 medium, group 4 slow
+        gen = StaggeredGenWorker.remote()
+        trainer = DryRunTrainer.remote(
+            dp_client, train_latency_s=0.0, microbatch_latency_s=0.0
+        )
+        prompts = ["0:0.01", "1:0.03", "2:0.03", "3:0.03", "4:0.30"]
+
+        ctrl = self._make_controller(
+            dp_client,
+            gen,
+            trainer,
+            prompts=prompts,
+            max_train_steps=1,
+            max_rollout_prompts=5,
+            target_prompt_groups_per_step=5,
+            min_prompt_groups_per_batch=1,
+        )
+        result = ray.get(ctrl.run.remote(), timeout=60)
+        assert result["train_steps"] == 1
+        mbs = ray.get(trainer.get_microbatch_calls.remote())
+        assert len(mbs) == 5
+        first_mb_ts = mbs[0][2]
+        completion_ts = ray.get(gen.get_completion_timestamps.remote())
+        # 5 completions; the slow group is the last one to finish
+        slow_completion = max(completion_ts)
+        assert first_mb_ts < slow_completion, (
+            f"first mb dispatched at {first_mb_ts} but slow group "
+            f"completed at {slow_completion}"
+        )
+
+    def test_abort_train_step_idempotent_and_clears_state(self, ray_init):
+        """abort_train_step clears state and a new begin succeeds."""
+        dp_client = FakeDataPlaneActor.remote()
+        trainer = DryRunTrainer.remote(dp_client, train_latency_s=0.0)
+        meta = KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=["a", "b"],
+        )
+        ray.get(trainer.begin_train_step.remote("step-x"))
+        ray.get(trainer.train_microbatch_from_meta.remote("step-x", meta))
+        ray.get(trainer.train_microbatch_from_meta.remote("step-x", meta))
+        ray.get(trainer.abort_train_step.remote("step-x"))
+        assert ray.get(trainer.get_open_step_id.remote()) is None
+        # New begin must succeed
+        ray.get(trainer.begin_train_step.remote("step-y"))
+        assert ray.get(trainer.get_open_step_id.remote()) == "step-y"
+        # Idempotent: a second abort on a closed step also clears (no raise)
+        ray.get(trainer.abort_train_step.remote("step-y"))
+        assert ray.get(trainer.get_open_step_id.remote()) is None
+        ray.get(trainer.abort_train_step.remote("step-y"))
+        assert ray.get(trainer.get_open_step_id.remote()) is None
+
+    def test_empty_step_is_no_op(self, ray_init):
+        """No rollouts → SC exits without calling finish_train_step."""
+        dp_client = FakeDataPlaneActor.remote()
+        gen = StaggeredGenWorker.remote()
+        trainer = DryRunTrainer.remote(dp_client, train_latency_s=0.0)
+        ctrl = self._make_controller(
+            dp_client,
+            gen,
+            trainer,
+            prompts=["0:0.01"],
+            max_train_steps=1,
+            max_rollout_prompts=0,
+            target_prompt_groups_per_step=2,
+            min_prompt_groups_per_batch=1,
+        )
+        result = ray.get(ctrl.run.remote(), timeout=30)
+        assert result["train_steps"] == 0
+        assert ray.get(trainer.get_finish_calls.remote()) == []
+        assert ray.get(trainer.get_microbatch_calls.remote()) == []
+
+    def test_clear_samples_called_once_per_step(self, ray_init):
+        """clear_samples is called exactly once per step covering all dispatched ids."""
+        dp_client = FakeDataPlaneActor.remote()
+        gen = StaggeredGenWorker.remote()
+        trainer = DryRunTrainer.remote(dp_client, train_latency_s=0.0)
+        prompts = ["0:0.01", "1:0.02", "2:0.03"]
+        ctrl = self._make_controller(
+            dp_client,
+            gen,
+            trainer,
+            prompts=prompts,
+            max_train_steps=1,
+            max_rollout_prompts=3,
+            target_prompt_groups_per_step=3,
+            min_prompt_groups_per_batch=1,
+        )
+        result = ray.get(ctrl.run.remote(), timeout=60)
+        assert result["train_steps"] == 1
+        clear_calls = ray.get(dp_client.get_clear_calls.remote())
+        assert len(clear_calls) == 1
+        mbs = ray.get(trainer.get_microbatch_calls.remote())
+        dispatched_ids = set()
+        for _, ids, _ in mbs:
+            dispatched_ids.update(ids)
+        assert set(clear_calls[0]) == dispatched_ids
+
+
 class TestRisk06EventLoopBlocking:
     """RISK-06: validate that asyncio event loop is not blocked during training.
 
-    The risk: if train_on_meta is a synchronous blocking call, the asyncio
+    The risk: if train_from_meta is a synchronous blocking call, the asyncio
     event loop freezes and _rollout_pump + _sync_weights can't make progress.
     Fix: use `await loop.run_in_executor(None, blocking_fn, ...)` or ensure
-    train_on_meta is an async method (as DryRunTrainer is).
+    train_from_meta is an async method (as DryRunTrainer is).
 
     These tests document the expected behavior and serve as a benchmark.
     """

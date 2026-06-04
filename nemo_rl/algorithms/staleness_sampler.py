@@ -69,6 +69,30 @@ class StalenessSampler:
         groups = [item[2] for item in eligible[:min_prompt_groups]]
         return _flatten_group_indices(groups)
 
+    def select_one_group(
+        self,
+        meta: KVBatchMeta,
+        *,
+        trainer_version: int,
+        generations_per_prompt: int,
+    ) -> Optional[list[int]]:
+        eligible: list[tuple[int, int, PromptGroup]] = []
+        for group in _prompt_groups(meta, generations_per_prompt):
+            if not group.committed or not group.is_complete:
+                continue
+            if group.weight_version is None or group.weight_version > trainer_version:
+                continue
+            lag = trainer_version - group.weight_version
+            if lag > self.max_staleness_versions:
+                continue
+            eligible.append((lag, group.indices[0], group))
+
+        if not eligible:
+            return None
+
+        eligible.sort(key=lambda item: (item[0], item[1]))
+        return _flatten_group_indices([eligible[0][2]])
+
     def evictable_indices(
         self,
         meta: KVBatchMeta,
