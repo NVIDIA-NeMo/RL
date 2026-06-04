@@ -17,6 +17,8 @@ The following workflow + quantization recipe combinations have been validated en
 | QA-Distillation | W4A4 | `NVFP4_DEFAULT_CFG` (NVFP4 weights + NVFP4 activations) | ✅ Converges | `examples/modelopt/qa_distillation_math_megatron.yaml` |
 | QA-GRPO | W4A16 | `examples/modelopt/quant_configs/nvfp4_a16.yaml` (NVFP4 weights, native-dtype activations) | ✅ Converges | `examples/modelopt/qa_grpo_llama8b_megatron.v2.yaml` |
 | QA-GRPO | W4A4 | `NVFP4_DEFAULT_CFG` | ⚠️ Known convergence issue | `examples/modelopt/qa_grpo_math_megatron.yaml` |
+| QA-Distillation | W4A4 | `examples/modelopt/quant_configs/nano3_nvfp4_default.yaml` | ✅ Smoke tested on hybrid MoE/Mamba | `examples/modelopt/qa_distillation_nano3_megatron.yaml` |
+| QA-GRPO | W4A16 | `NVFP4_MLP_WEIGHT_ONLY_CFG` | ✅ Smoke tested on MoE | `examples/modelopt/qa_grpo_qwen3_30ba3b_megatron.yaml` |
 
 The `nvfp4_a16.yaml` custom YAML enables NVFP4 e2m1 weight quantization (with dynamic e4m3 micro-block scales) and leaves activations unquantized; weights are still exercised through both Megatron training and vLLM generation.
 
@@ -165,4 +167,4 @@ uv run --extra mcore --extra modelopt \
 - **Generation**: Currently only vLLM is supported for generation.
 - **DTensor backend**: Quantization support for the DTensor policy worker is not yet implemented.
 - **Input quantization**: Only per-tensor input (activation) quantization is supported.
-- **Model support**: MoE (Mixture of Experts) and Mamba models are currently not supported.
+- **Model support**: Dense Transformer, MoE (Mixture of Experts), and hybrid MoE/Mamba models are supported on the Megatron policy + vLLM generation path when Megatron-Bridge and ModelOpt support the model architecture and quantization recipe. MoE/Mamba support is currently covered by smoke-tested example configs rather than broad convergence guarantees.
