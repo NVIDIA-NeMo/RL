@@ -27,6 +27,10 @@ policy:
     name: Qwen/Qwen2.5-1.5B-Instruct
   train_global_batch_size: 256
   max_total_sequence_length: 1024
+  # With TP=2 + CP=2 + SP, _get_pack_sequence_parameters_for_megatron requires
+  # individual sequences padded to a multiple of cp_size * 2 * tp_size = 8.
+  # Base default (= TP = 2) fails the assertion at megatron/data.py:565.
+  make_sequence_length_divisible_by: 8
   generation:
     max_new_tokens: 512
     vllm_cfg:
@@ -50,13 +54,18 @@ value:
     name: Qwen/Qwen2.5-1.5B-Instruct
   # Bump mbs so sequence_packing actually packs multiple samples per micro-batch
   train_micro_batch_size: 4
+  # Same min-pad-factor reason as policy above (TP=2, CP=2, SP → factor 8).
+  make_sequence_length_divisible_by: 8
+  # Enable sequence_packing to exercise the unpack path and (required by
+  # _apply_parallelism_config in megatron/setup.py) satisfy CP>1's
+  # packing prerequisite. Key lives at value top-level, NOT under megatron_cfg.
+  sequence_packing:
+    enabled: true
   megatron_cfg:
-    # Match policy parallelism + enable packing to exercise the unpack path
+    # Match policy parallelism: TP=2, CP=2, SP=true.
     tensor_model_parallel_size: 2
     context_parallel_size: 2
     sequence_parallel: true
-    sequence_packing:
-      enabled: true
     optimizer:
       lr: 1.0e-05
       weight_decay: 0.01

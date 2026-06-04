@@ -44,6 +44,29 @@ def _make_loss_config(
     )
 
 
+def _make_gae_config(
+    gae_lambda: float = 0.95,
+    gae_gamma: float = 1.0,
+    normalize_advantages: bool = False,
+    length_adaptive_alpha: float = 0.0,
+    **overrides,
+) -> dict:
+    """Build an estimator_config dict with all GAE-required keys populated.
+
+    ``GeneralizedAdvantageEstimator.__init__`` requires ``gae_lambda``,
+    ``gae_gamma``, ``normalize_advantages`` and ``length_adaptive_alpha`` to
+    be present (no hidden ``.get()`` defaults). Optional VAPO fields
+    (``gae_lambda_value`` / ``gae_lambda_policy``) can be passed via overrides.
+    """
+    return {
+        "gae_lambda": gae_lambda,
+        "gae_gamma": gae_gamma,
+        "normalize_advantages": normalize_advantages,
+        "length_adaptive_alpha": length_adaptive_alpha,
+        **overrides,
+    }
+
+
 # ============================================================================
 # Tests for GeneralizedAdvantageEstimator
 # ============================================================================
@@ -55,11 +78,7 @@ def test_gae_basic_computation():
     With gamma=1.0 and lambda=1.0, GAE reduces to Monte Carlo returns
     minus values, so advantages = cumulative_rewards_from_t - V(s_t).
     """
-    estimator_config = {
-        "gae_lambda": 1.0,
-        "gae_gamma": 1.0,
-        "normalize_advantages": False,
-    }
+    estimator_config = _make_gae_config(gae_lambda=1.0, gae_gamma=1.0)
     loss_config = _make_loss_config(kl_penalty=0.0)
     estimator = GeneralizedAdvantageEstimator(estimator_config, loss_config)
 
@@ -89,11 +108,7 @@ def test_gae_gamma_lambda_zero():
     With lambda=0: A_t = delta_t = r_t + gamma * V(s_{t+1}) - V(s_t).
     Only immediate TD error, no bootstrapping.
     """
-    estimator_config = {
-        "gae_lambda": 0.0,
-        "gae_gamma": 1.0,
-        "normalize_advantages": False,
-    }
+    estimator_config = _make_gae_config(gae_lambda=0.0, gae_gamma=1.0)
     loss_config = _make_loss_config(kl_penalty=0.0)
     estimator = GeneralizedAdvantageEstimator(estimator_config, loss_config)
 
@@ -120,11 +135,7 @@ def test_gae_gamma_lambda_zero():
 
 def test_gae_shape_and_masking():
     """Test that GAE correctly handles masked (padding) positions."""
-    estimator_config = {
-        "gae_lambda": 0.95,
-        "gae_gamma": 1.0,
-        "normalize_advantages": False,
-    }
+    estimator_config = _make_gae_config(gae_lambda=0.95, gae_gamma=1.0)
     loss_config = _make_loss_config(kl_penalty=0.0)
     estimator = GeneralizedAdvantageEstimator(estimator_config, loss_config)
 
@@ -155,11 +166,9 @@ def test_gae_shape_and_masking():
 
 def test_gae_normalize_advantages():
     """Test that advantage normalization produces zero mean and unit variance."""
-    estimator_config = {
-        "gae_lambda": 0.95,
-        "gae_gamma": 1.0,
-        "normalize_advantages": True,
-    }
+    estimator_config = _make_gae_config(
+        gae_lambda=0.95, gae_gamma=1.0, normalize_advantages=True
+    )
     loss_config = _make_loss_config(kl_penalty=0.0)
     estimator = GeneralizedAdvantageEstimator(estimator_config, loss_config)
 
@@ -186,11 +195,7 @@ def test_gae_normalize_advantages():
 
 def test_gae_kl_penalty_in_rewards():
     """Test KL penalty injection into token-level rewards (gated + applied)."""
-    estimator_config = {
-        "gae_lambda": 1.0,
-        "gae_gamma": 1.0,
-        "normalize_advantages": False,
-    }
+    estimator_config = _make_gae_config(gae_lambda=1.0, gae_gamma=1.0)
     loss_config = _make_loss_config(kl_penalty=0.1, kl_type="k1", use_kl_in_reward=True)
     estimator = GeneralizedAdvantageEstimator(estimator_config, loss_config)
 
@@ -259,13 +264,12 @@ def test_gae_kl_penalty_in_rewards():
 
 def test_gae_vapo_decoupled_lambda():
     """Test VAPO decoupled GAE: separate lambda for value vs policy."""
-    base_config = {
-        "gae_lambda": 0.95,
-        "gae_gamma": 1.0,
-        "normalize_advantages": False,
-        "gae_lambda_value": 1.0,
-        "gae_lambda_policy": 0.5,
-    }
+    base_config = _make_gae_config(
+        gae_lambda=0.95,
+        gae_gamma=1.0,
+        gae_lambda_value=1.0,
+        gae_lambda_policy=0.5,
+    )
     loss_config = _make_loss_config(kl_penalty=0.0)
     estimator = GeneralizedAdvantageEstimator(base_config, loss_config)
 
@@ -294,12 +298,9 @@ def test_gae_vapo_decoupled_lambda():
 
 def test_gae_length_adaptive_lambda():
     """Test VAPO length-adaptive lambda: lambda_policy = 1 - 1/(alpha * length)."""
-    config = {
-        "gae_lambda": 0.95,
-        "gae_gamma": 1.0,
-        "normalize_advantages": False,
-        "length_adaptive_alpha": 0.05,
-    }
+    config = _make_gae_config(
+        gae_lambda=0.95, gae_gamma=1.0, length_adaptive_alpha=0.05
+    )
     loss_config = _make_loss_config(kl_penalty=0.0)
     estimator = GeneralizedAdvantageEstimator(config, loss_config)
 
@@ -327,11 +328,7 @@ def test_gae_carry_forward_interior_gap():
     corrupt the GAE accumulators: the advantages at the valid tokens must
     match the case where the gap is simply removed from the sequence.
     """
-    estimator_config = {
-        "gae_lambda": 0.95,
-        "gae_gamma": 0.99,
-        "normalize_advantages": False,
-    }
+    estimator_config = _make_gae_config(gae_lambda=0.95, gae_gamma=0.99)
     loss_config = _make_loss_config(kl_penalty=0.0)
     estimator = GeneralizedAdvantageEstimator(estimator_config, loss_config)
 
@@ -626,16 +623,20 @@ def test_create_advantage_estimator_gae():
 
     from nemo_rl.algorithms.ppo import _create_advantage_estimator
 
+    # adv_estimator dict needs every GAE-required key (no hidden .get() defaults
+    # in the estimator __init__); loss_fn must be a real ClippedPGLossConfig
+    # because the estimator accesses .use_kl_in_reward / .reference_policy_kl_*
+    # as attributes, not dict keys.
     master_config = SimpleNamespace(
         ppo={
             "adv_estimator": {
                 "name": "gae",
-                "gae_lambda": 0.95,
-                "gae_gamma": 1.0,
-                "normalize_advantages": True,
+                **_make_gae_config(
+                    gae_lambda=0.95, gae_gamma=1.0, normalize_advantages=True
+                ),
             },
         },
-        loss_fn={"reference_policy_kl_penalty": 0.0},
+        loss_fn=_make_loss_config(kl_penalty=0.0),
     )
 
     estimator = _create_advantage_estimator(master_config)
