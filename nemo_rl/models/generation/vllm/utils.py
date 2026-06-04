@@ -99,7 +99,7 @@ def format_prompt_for_vllm_generation(
     return prompts if return_all else prompts[0]
 
 
-def normalize_routed_experts_for_generation_output(
+def pad_and_align_routed_expert_indices(
     request_output: Any,
     completion_output: Any,
     *,
@@ -126,12 +126,12 @@ def normalize_routed_experts_for_generation_output(
     elif prompt_routed is not None:
         routed = prompt_routed
 
-    expected_rows = min(max(valid_length - 1, 0), padded_length)
+    expected_routes = min(max(valid_length - 1, 0), padded_length)
     stats = {
-        "actual_rows": 0,
-        "expected_rows": expected_rows,
-        "missing_rows": 0,
-        "surplus_rows": 0,
+        "actual_routes": 0,
+        "expected_routes": expected_routes,
+        "missing_routes": 0,
+        "surplus_routes": 0,
     }
 
     if routed is None:
@@ -142,32 +142,32 @@ def normalize_routed_experts_for_generation_output(
             f"got {tuple(routed.shape)}"
         )
 
-    stats["actual_rows"] = int(routed.shape[0])
-    stats["missing_rows"] = max(expected_rows - int(routed.shape[0]), 0)
-    stats["surplus_rows"] = max(int(routed.shape[0]) - (expected_rows + 1), 0)
+    stats["actual_routes"] = int(routed.shape[0])
+    stats["missing_routes"] = max(expected_routes - int(routed.shape[0]), 0)
+    stats["surplus_routes"] = max(int(routed.shape[0]) - (expected_routes + 1), 0)
     if (
         require_complete_routed_experts
-        and stats["missing_rows"] > 0
+        and stats["missing_routes"] > 0
         and not allow_missing_routed_experts_fallback
     ):
         num_cached_tokens = getattr(request_output, "num_cached_tokens", None)
         raise ValueError(
             "vLLM returned incomplete routed_experts for router replay: "
-            f"rows={routed.shape[0]}, expected_at_least={expected_rows}, "
+            f"routes={routed.shape[0]}, expected_at_least={expected_routes}, "
             f"valid_length={valid_length}, padded_length={padded_length}, "
             f"num_cached_tokens={num_cached_tokens}. This usually means the "
             "generation backend did not return routed experts for every "
             "non-final token in the prompt+response sequence."
         )
-    max_allowed_rows = expected_rows + 1
-    if require_complete_routed_experts and routed.shape[0] > max_allowed_rows:
+    max_allowed_routes = expected_routes + 1
+    if require_complete_routed_experts and routed.shape[0] > max_allowed_routes:
         num_cached_tokens = getattr(request_output, "num_cached_tokens", None)
         raise ValueError(
-            "vLLM returned too many routed_experts rows for router replay: "
-            f"rows={routed.shape[0]}, expected={expected_rows}, "
-            f"max_allowed={max_allowed_rows}, valid_length={valid_length}, "
+            "vLLM returned too many routed_experts routes for router replay: "
+            f"routes={routed.shape[0]}, expected={expected_routes}, "
+            f"max_allowed={max_allowed_routes}, valid_length={valid_length}, "
             f"padded_length={padded_length}, num_cached_tokens={num_cached_tokens}. "
-            "Router replay allows at most one surplus final-token route row."
+            "Router replay allows at most one surplus final-token route."
         )
 
     default_route = torch.arange(
@@ -181,11 +181,11 @@ def normalize_routed_experts_for_generation_output(
         .clone()
     )
     full = full.to(dtype=torch.int32)
-    rows_to_copy = min(expected_rows, routed.shape[0])
-    if rows_to_copy > 0:
-        full[:rows_to_copy] = routed[:rows_to_copy].to(device=device)
-    if stats["missing_rows"] > 0:
-        full[rows_to_copy:expected_rows] = R3_MISSING_ROUTE_SENTINEL
+    routes_to_copy = min(expected_routes, routed.shape[0])
+    if routes_to_copy > 0:
+        full[:routes_to_copy] = routed[:routes_to_copy].to(device=device)
+    if stats["missing_routes"] > 0:
+        full[routes_to_copy:expected_routes] = R3_MISSING_ROUTE_SENTINEL
     return (full, stats) if return_stats else full
 
 

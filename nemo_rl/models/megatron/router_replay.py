@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import inspect
 import os
 from collections.abc import Iterable
 from typing import Any, Optional
@@ -257,6 +258,23 @@ def _install_missing_route_fallback_patch() -> None:
         return
 
     original_get_replay_topk = RouterReplay.get_replay_topk
+    expected_params = [
+        "self",
+        "scores",
+        "topk",
+        "num_groups",
+        "group_topk",
+        "default_compute_topk",
+    ]
+    actual_params = list(inspect.signature(original_get_replay_topk).parameters)
+    if actual_params != expected_params:
+        raise RuntimeError(
+            "Unsupported Megatron RouterReplay.get_replay_topk signature for "
+            "NeMo RL missing-route fallback patch: "
+            f"expected={expected_params}, actual={actual_params}. "
+            "Update nemo_rl.models.megatron.router_replay before enabling "
+            "policy.router_replay.enabled."
+        )
 
     def wrapped_get_replay_topk(
         replay_instance: Any,

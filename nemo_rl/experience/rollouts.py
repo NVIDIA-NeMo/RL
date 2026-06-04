@@ -59,26 +59,28 @@ def _add_r3_fallback_metrics(
     gen_metrics: dict[str, float | int],
     generation_outputs: BatchedDataDict,
 ) -> None:
-    missing = generation_outputs.get("r3_routed_experts_missing_rows")
+    missing = generation_outputs.get("r3_routed_experts_missing_routes")
     if missing is None:
         return
 
     missing_cpu = missing.detach().cpu()
-    expected = generation_outputs.get("r3_routed_experts_expected_rows")
-    actual = generation_outputs.get("r3_routed_experts_actual_rows")
+    expected = generation_outputs.get("r3_routed_experts_expected_routes")
+    actual = generation_outputs.get("r3_routed_experts_actual_routes")
     expected_cpu = expected.detach().cpu() if expected is not None else None
     actual_cpu = actual.detach().cpu() if actual is not None else None
 
-    missing_rows = int(missing_cpu.sum().item())
+    missing_routes = int(missing_cpu.sum().item())
     fallback_samples = int((missing_cpu > 0).sum().item())
-    expected_rows = int(expected_cpu.sum().item()) if expected_cpu is not None else 0
-    actual_rows = int(actual_cpu.sum().item()) if actual_cpu is not None else 0
+    expected_routes = (
+        int(expected_cpu.sum().item()) if expected_cpu is not None else 0
+    )
+    actual_routes = int(actual_cpu.sum().item()) if actual_cpu is not None else 0
     gen_metrics["r3/routed_experts_fallback_samples"] = fallback_samples
-    gen_metrics["r3/routed_experts_fallback_token_rows"] = missing_rows
-    gen_metrics["r3/routed_experts_expected_token_rows"] = expected_rows
-    gen_metrics["r3/routed_experts_actual_token_rows"] = actual_rows
-    gen_metrics["r3/routed_experts_fallback_token_row_fraction"] = (
-        float(missing_rows / expected_rows) if expected_rows > 0 else 0.0
+    gen_metrics["r3/routed_experts_fallback_token_routes"] = missing_routes
+    gen_metrics["r3/routed_experts_expected_token_routes"] = expected_routes
+    gen_metrics["r3/routed_experts_actual_token_routes"] = actual_routes
+    gen_metrics["r3/routed_experts_fallback_token_route_fraction"] = (
+        float(missing_routes / expected_routes) if expected_routes > 0 else 0.0
     )
 
 

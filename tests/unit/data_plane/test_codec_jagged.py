@@ -247,7 +247,7 @@ def test_pack_jagged_fields_forced_per_token_field_drops_extra_padding() -> None
             "extra_2d": extra,
         },
         lengths=lengths,
-        force_jagged_fields=frozenset({"advantages"}),
+        token_aligned_fields=frozenset({"advantages"}),
     )
 
     out = materialize(td, layout="padded")

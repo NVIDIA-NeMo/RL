@@ -128,7 +128,7 @@ def write_columns(
     td = pack_jagged_fields(
         fields,
         lengths=lengths,
-        force_jagged_fields=TOKEN_ALIGNED_FIELDS,
+        token_aligned_fields=TOKEN_ALIGNED_FIELDS,
     )
     dp_client.put_samples(
         sample_ids=meta.sample_ids,
@@ -196,7 +196,7 @@ def kv_first_write(
     td = pack_jagged_fields(
         fields,
         lengths=lengths,
-        force_jagged_fields=TOKEN_ALIGNED_FIELDS,
+        token_aligned_fields=TOKEN_ALIGNED_FIELDS,
     )
     dp_client.put_samples(
         sample_ids=list(sample_ids),

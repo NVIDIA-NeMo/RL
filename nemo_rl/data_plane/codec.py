@@ -130,62 +130,28 @@ def unwrap_wire_stripped_payload(item: Any) -> Any:
     return item
 
 
-def maybe_pack_jagged(
-    val: torch.Tensor,
-    lengths: torch.Tensor,
-) -> torch.Tensor:
-    """Convert ``val`` to jagged iff it looks like a per-token field.
-
-    Used by every write site (initial put, driver delta-write, worker
-    write-back) so all per-token fields land in TQ as jagged with the
-    same row lengths — read-time materialization then pads them all to
-    the same target shape, avoiding shape-mismatch crashes between
-    mixed wire formats.
-
-    Args:
-        val: Tensor to consider. Qualifies for jagged conversion only
-            when ``val.shape == (N, max(lengths), ...)`` where
-            ``N == lengths.shape[0]``.
-        lengths: Per-row valid lengths, shape ``(N,)``.
-
-    Returns:
-        A ``torch.jagged`` nested tensor when the shape heuristic matches;
-        otherwise ``val`` passed through as a rectangular tensor.
-    """
-    n = lengths.shape[0]
-    if n == 0:
-        return val.detach().contiguous()
-    max_len = int(lengths.max().item())
-    if val.dim() < 2 or val.shape[0] != n or val.shape[1] != max_len:
-        return val.detach().contiguous()
-    return to_nested_by_length(val.detach(), lengths)
-
-
 def pack_jagged_fields(
     fields: "dict[str, torch.Tensor | np.ndarray]",
     *,
     lengths: torch.Tensor | None,
-    force_jagged_fields: set[str] | frozenset[str] | None = None,
+    token_aligned_fields: set[str] | frozenset[str] | None = None,
 ) -> TensorDict:
     """Pack a column dict into the wire layout expected by ``put_samples``.
 
-    Zero-copy where possible: per-token tensors that match
-    ``(N, max(lengths), ...)`` become ``torch.jagged`` views via
-    :func:`maybe_pack_jagged`; non-conforming tensors pass through
-    rectangular; ``np.ndarray(dtype=object)`` is forwarded as-is. This
-    is a **layout transform**, not serialization — the on-wire bytes are
-    produced later by the TQ backend's msgpack encoder. Centralizing
-    the transform here makes it the single source of truth for both
-    :func:`kv_first_write` and :func:`write_columns`.
+    Zero-copy where possible: explicitly named per-token tensors become
+    ``torch.jagged`` views via :func:`pack_per_token_field`; all other
+    tensors pass through rectangular; ``np.ndarray(dtype=object)`` is
+    forwarded as-is. This is a **layout transform**, not serialization
+    — the on-wire bytes are produced later by the TQ backend's msgpack
+    encoder. Centralizing the transform here makes it the single source
+    of truth for both :func:`kv_first_write` and :func:`write_columns`.
 
     Args:
         fields: Column name → tensor or object array. Other value types
             raise ``TypeError``.
-        lengths: Per-row valid lengths used by :func:`maybe_pack_jagged`
-            to decide whether a tensor qualifies for jagged conversion.
-            ``None`` disables jagged conversion entirely (every tensor
-            passes through rectangular).
-        force_jagged_fields: Field names known to be per-token. These use
+        lengths: Per-row valid lengths used by :func:`pack_per_token_field`.
+            ``None`` disables jagged conversion entirely.
+        token_aligned_fields: Field names known to be per-token. These use
             :func:`pack_per_token_field`, which tolerates extra padded columns
             and slices each row to ``lengths``.
 
@@ -194,7 +160,7 @@ def pack_jagged_fields(
         given, else 0) ready for ``put_samples``.
     """
     n = int(lengths.shape[0]) if lengths is not None else 0
-    force_jagged_fields = force_jagged_fields or frozenset()
+    token_aligned_fields = token_aligned_fields or frozenset()
     packed: dict[str, Any] = {}
     for k, v in fields.items():
         if isinstance(v, np.ndarray) and v.dtype == object:
@@ -204,12 +170,10 @@ def pack_jagged_fields(
             # round-trips intact.
             packed[k] = v
         elif isinstance(v, torch.Tensor):
-            if lengths is None:
-                packed[k] = v.detach().contiguous()
-            elif k in force_jagged_fields:
+            if lengths is not None and k in token_aligned_fields:
                 packed[k] = pack_per_token_field(v, lengths)
             else:
-                packed[k] = maybe_pack_jagged(v, lengths)
+                packed[k] = v.detach().contiguous()
         else:
             raise TypeError(
                 f"pack_jagged_fields: unsupported value type for {k!r}: {type(v)}. "
@@ -221,10 +185,8 @@ def pack_jagged_fields(
 def pack_per_token_field(val: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
     """Force-jaggedize a known per-token field, tolerating SP padding.
 
-    Unlike :func:`maybe_pack_jagged` (which is shape-strict to avoid
-    false positives on 3D extras like image features), this function is
-    invoked at write-back sites where the caller already knows the
-    field is per-token (e.g. ``prev_logprobs``,
+    This function is invoked at write sites where the caller already
+    knows the field is per-token (e.g. ``prev_logprobs``,
     ``reference_policy_logprobs``). mcore SP rounds the forward
     output's seq dim up to a multiple of TP, so the value can be 1+
     tokens wider than ``max(lengths)``; :func:`to_nested_by_length`

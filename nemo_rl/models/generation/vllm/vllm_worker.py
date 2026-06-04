@@ -39,7 +39,7 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.generation.vllm.utils import (
     format_prompt_for_vllm_generation,
-    normalize_routed_experts_for_generation_output,
+    pad_and_align_routed_expert_indices,
 )
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
@@ -806,9 +806,9 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         output_ids_list = []
         logprobs_list = []
         routed_experts_list = []
-        r3_missing_rows = []
-        r3_expected_rows = []
-        r3_actual_rows = []
+        r3_missing_routes = []
+        r3_expected_routes = []
+        r3_actual_routes = []
         generation_lengths = []
         unpadded_sequence_lengths = []
         truncated_list = []  # Track if response was truncated (hit max_tokens)
@@ -859,7 +859,7 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             logprobs_list.append(full_logprobs)
 
             response_length = sequence_length + len(generated_tokens)
-            full_routed_experts, r3_stats = normalize_routed_experts_for_generation_output(
+            full_routed_experts, r3_stats = pad_and_align_routed_expert_indices(
                 output,
                 generation,
                 valid_length=response_length,
@@ -872,11 +872,11 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
                 raise RuntimeError(
                     "vLLM was asked to return routed experts but the generation output "
                     "did not include routed_experts."
-                )
+            )
             if return_routed_experts:
-                r3_missing_rows.append(r3_stats["missing_rows"])
-                r3_expected_rows.append(r3_stats["expected_rows"])
-                r3_actual_rows.append(r3_stats["actual_rows"])
+                r3_missing_routes.append(r3_stats["missing_routes"])
+                r3_expected_routes.append(r3_stats["expected_routes"])
+                r3_actual_routes.append(r3_stats["actual_routes"])
             if full_routed_experts is not None:
                 routed_experts_list.append(full_routed_experts)
 
@@ -894,21 +894,21 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         # Create return data conforming to GenerationOutputSpec
         output_ids = torch.stack(output_ids_list)
         logprobs = torch.stack(logprobs_list)
-        if r3_missing_rows and sum(r3_missing_rows) > 0:
+        if r3_missing_routes and sum(r3_missing_routes) > 0:
             bad_samples = [
                 f"{idx}:missing={missing},actual={actual},expected={expected}"
                 for idx, (missing, actual, expected) in enumerate(
-                    zip(r3_missing_rows, r3_actual_rows, r3_expected_rows)
+                    zip(r3_missing_routes, r3_actual_routes, r3_expected_routes)
                 )
                 if missing > 0
             ][:8]
             LOGGER.warning(
                 "R3 router replay fallback: vLLM returned incomplete routed_experts "
-                "for %d/%d samples, missing_token_rows=%d. Megatron will use its "
-                "own router for those missing token rows. samples=[%s]",
-                sum(1 for missing in r3_missing_rows if missing > 0),
-                len(r3_missing_rows),
-                sum(r3_missing_rows),
+                "for %d/%d samples, missing_token_routes=%d. Megatron will use its "
+                "own router for those missing token routes. samples=[%s]",
+                sum(1 for missing in r3_missing_routes if missing > 0),
+                len(r3_missing_routes),
+                sum(r3_missing_routes),
                 "; ".join(bad_samples),
             )
 
@@ -927,15 +927,15 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         )
         if routed_experts_list:
             return_data["routed_experts"] = torch.stack(routed_experts_list)
-        if r3_missing_rows:
-            return_data["r3_routed_experts_missing_rows"] = torch.tensor(
-                r3_missing_rows, dtype=torch.long
+        if r3_missing_routes:
+            return_data["r3_routed_experts_missing_routes"] = torch.tensor(
+                r3_missing_routes, dtype=torch.long
             )
-            return_data["r3_routed_experts_expected_rows"] = torch.tensor(
-                r3_expected_rows, dtype=torch.long
+            return_data["r3_routed_experts_expected_routes"] = torch.tensor(
+                r3_expected_routes, dtype=torch.long
             )
-            return_data["r3_routed_experts_actual_rows"] = torch.tensor(
-                r3_actual_rows, dtype=torch.long
+            return_data["r3_routed_experts_actual_routes"] = torch.tensor(
+                r3_actual_routes, dtype=torch.long
             )
 
         return return_data

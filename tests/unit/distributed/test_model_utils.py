@@ -217,9 +217,11 @@ def test_from_parallel_logits_to_logprobs_packed_sequences(
         pytest.skip(
             f"Not enough GPUs available. Need {world_size}, got {torch.cuda.device_count()}"
         )
+    if cp_size > 1:
+        pytest.importorskip("transformer_engine_torch")
 
     # Create appropriate virtual cluster
-    cluster = RayVirtualCluster(bundle_ct_per_node_list=[2], use_gpus=True)
+    cluster = RayVirtualCluster(bundle_ct_per_node_list=[world_size], use_gpus=True)
 
     try:
         actor_fqn = register_model_utils_test_actor

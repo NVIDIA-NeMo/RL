@@ -23,7 +23,7 @@ from nemo_rl.models.generation.vllm.utils import (
     aggregate_spec_decode_counters,
     compute_spec_decode_metrics,
     format_prompt_for_vllm_generation,
-    normalize_routed_experts_for_generation_output,
+    pad_and_align_routed_expert_indices,
 )
 
 
@@ -128,7 +128,7 @@ def test_normalize_routed_experts_full_sequence_alignment():
     completion_output = Output()
     completion_output.routed_experts = torch.arange(5 * 3 * 2).reshape(5, 3, 2)
 
-    routed_experts = normalize_routed_experts_for_generation_output(
+    routed_experts = pad_and_align_routed_expert_indices(
         request_output,
         completion_output,
         valid_length=6,
@@ -154,7 +154,7 @@ def test_normalize_routed_experts_concatenates_prompt_and_decode():
     request_output.prompt_routed_experts = torch.ones(2, 1, 2, dtype=torch.int32)
     completion_output.routed_experts = 2 * torch.ones(3, 1, 2, dtype=torch.int32)
 
-    routed_experts = normalize_routed_experts_for_generation_output(
+    routed_experts = pad_and_align_routed_expert_indices(
         request_output,
         completion_output,
         valid_length=5,
@@ -182,7 +182,7 @@ def test_normalize_routed_experts_uses_valid_dummy_route_for_missing_last_token(
         dtype=torch.int32,
     )
 
-    routed_experts = normalize_routed_experts_for_generation_output(
+    routed_experts = pad_and_align_routed_expert_indices(
         request_output,
         completion_output,
         valid_length=3,
@@ -195,7 +195,7 @@ def test_normalize_routed_experts_uses_valid_dummy_route_for_missing_last_token(
     assert torch.equal(routed_experts[2:], expected_default_route.expand(3, 2, 3))
 
 
-def test_normalize_routed_experts_keeps_final_token_dummy_even_if_vllm_returns_row():
+def test_normalize_routed_experts_keeps_final_token_dummy_even_if_vllm_returns_route():
     class Output:
         pass
 
@@ -210,7 +210,7 @@ def test_normalize_routed_experts_keeps_final_token_dummy_even_if_vllm_returns_r
         dtype=torch.int32,
     )
 
-    routed_experts = normalize_routed_experts_for_generation_output(
+    routed_experts = pad_and_align_routed_expert_indices(
         request_output,
         completion_output,
         valid_length=3,
@@ -223,7 +223,7 @@ def test_normalize_routed_experts_keeps_final_token_dummy_even_if_vllm_returns_r
     assert torch.equal(routed_experts[2:], expected_default_route.expand(1, 2, 3))
 
 
-def test_normalize_routed_experts_strict_mode_marks_missing_rows_for_fallback():
+def test_normalize_routed_experts_strict_mode_marks_missing_routes_for_fallback():
     class Output:
         pass
 
@@ -232,7 +232,7 @@ def test_normalize_routed_experts_strict_mode_marks_missing_rows_for_fallback():
     completion_output = Output()
     completion_output.routed_experts = torch.ones(2, 1, 2, dtype=torch.int32)
 
-    routed_experts, stats = normalize_routed_experts_for_generation_output(
+    routed_experts, stats = pad_and_align_routed_expert_indices(
         request_output,
         completion_output,
         valid_length=6,
@@ -243,10 +243,10 @@ def test_normalize_routed_experts_strict_mode_marks_missing_rows_for_fallback():
     )
 
     assert stats == {
-        "actual_rows": 2,
-        "expected_rows": 5,
-        "missing_rows": 3,
-        "surplus_rows": 0,
+        "actual_routes": 2,
+        "expected_routes": 5,
+        "missing_routes": 3,
+        "surplus_routes": 0,
     }
     assert torch.equal(routed_experts[:2], completion_output.routed_experts)
     assert torch.equal(
@@ -257,7 +257,7 @@ def test_normalize_routed_experts_strict_mode_marks_missing_rows_for_fallback():
     assert torch.equal(routed_experts[5:], expected_default_route)
 
 
-def test_normalize_routed_experts_can_reject_missing_rows_when_fallback_disabled():
+def test_normalize_routed_experts_can_reject_missing_routes_when_fallback_disabled():
     class Output:
         pass
 
@@ -267,7 +267,7 @@ def test_normalize_routed_experts_can_reject_missing_rows_when_fallback_disabled
     completion_output.routed_experts = torch.ones(2, 1, 2, dtype=torch.int32)
 
     with pytest.raises(ValueError, match="incomplete routed_experts"):
-        normalize_routed_experts_for_generation_output(
+        pad_and_align_routed_expert_indices(
             request_output,
             completion_output,
             valid_length=6,
@@ -278,7 +278,7 @@ def test_normalize_routed_experts_can_reject_missing_rows_when_fallback_disabled
         )
 
 
-def test_normalize_routed_experts_strict_mode_rejects_surplus_rows():
+def test_normalize_routed_experts_strict_mode_rejects_surplus_routes():
     class Output:
         pass
 
@@ -287,8 +287,8 @@ def test_normalize_routed_experts_strict_mode_rejects_surplus_rows():
     completion_output = Output()
     completion_output.routed_experts = torch.ones(4, 1, 2, dtype=torch.int32)
 
-    with pytest.raises(ValueError, match="too many routed_experts rows"):
-        normalize_routed_experts_for_generation_output(
+    with pytest.raises(ValueError, match="too many routed_experts routes"):
+        pad_and_align_routed_expert_indices(
             request_output,
             completion_output,
             valid_length=3,

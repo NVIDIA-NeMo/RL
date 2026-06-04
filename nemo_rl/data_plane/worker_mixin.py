@@ -386,7 +386,7 @@ class TQWorkerMixin:
     ) -> None:
         """Leader-only ``put_samples(meta.sample_ids, fields=...)``.
 
-        Per-token fields are jagged-packed via :func:`maybe_pack_jagged`
+        Per-token fields are jagged-packed via :func:`pack_per_token_field`
         so they land with the same row lengths as the initial put;
         without this a worker write-back (rectangular ``[N, S]``) would
         mismatch the jagged ``input_ids`` on the next read.
