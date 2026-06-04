@@ -13,7 +13,7 @@
 # limitations under the License.
 import os
 import warnings
-from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
+from typing import Any, Callable, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
 import ray
@@ -39,6 +39,11 @@ from nemo_rl.data.llm_message_utils import (
     get_keys_from_message_log,
 )
 from nemo_rl.data.utils import load_dataloader_state
+from nemo_rl.data_plane.interfaces import DataPlaneConfig
+from nemo_rl.data_plane.transport_metrics import (
+    add_byte_metric_derivatives,
+    topk_payload_nbytes,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
     ClusterConfig,
@@ -123,6 +128,7 @@ class MasterConfig(BaseModel, extra="allow"):
     logger: LoggerConfig  # Logger configuration
     cluster: ClusterConfig  # Cluster configuration
     checkpointing: CheckpointingConfig  # Checkpointing configuration
+    data_plane: Optional[DataPlaneConfig] = None
 
 
 # ===============================================================================
@@ -161,6 +167,7 @@ def setup(
     tokenizer: TokenizerType,
     train_dataset: AllTaskProcessedDataset,
     val_dataset: Optional[AllTaskProcessedDataset],
+    student_policy_factory: Optional[Callable[..., ColocatablePolicyInterface]] = None,
 ) -> tuple[
     ColocatablePolicyInterface,  # student_policy
     ColocatablePolicyInterface,  # teacher_policy
@@ -174,6 +181,14 @@ def setup(
     MasterConfig,
 ]:
     """Main entry point for distillation algorithm.
+
+    Args:
+        master_config: Fully resolved distillation configuration.
+        tokenizer: Student tokenizer or processor.
+        train_dataset: Training dataset.
+        val_dataset: Optional validation dataset.
+        student_policy_factory: Optional constructor for the student
+            policy. ``None`` keeps the legacy plain ``Policy`` path.
 
     Returns:
         tuple of student_policy, teacher_policy, student_generation,
@@ -444,7 +459,10 @@ def setup(
         )
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
-    student_policy = Policy(
+    make_student_policy = (
+        student_policy_factory if student_policy_factory is not None else Policy
+    )
+    student_policy = make_student_policy(
         name_prefix="student",
         cluster=train_cluster,
         config=policy_config,
@@ -707,6 +725,33 @@ def distillation_train(
                     )
                     train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
                     train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
+                    teacher_topk_payload_bytes = topk_payload_nbytes(
+                        teacher_topk["topk_logits"],
+                        teacher_topk["topk_indices"],
+                    )
+                    teacher_topk_valid_payload_bytes = topk_payload_nbytes(
+                        teacher_topk["topk_logits"],
+                        teacher_topk["topk_indices"],
+                        [int(length) for length in input_lengths.tolist()],
+                    )
+                    transport_metrics: dict[str, float | int] = {
+                        "teacher_topk_payload_bytes": teacher_topk_payload_bytes,
+                        "teacher_topk_valid_payload_bytes": (
+                            teacher_topk_valid_payload_bytes
+                        ),
+                        "teacher_topk_padding_overhead_bytes": max(
+                            teacher_topk_payload_bytes
+                            - teacher_topk_valid_payload_bytes,
+                            0,
+                        ),
+                        "driver_rx_teacher_topk_bytes": teacher_topk_payload_bytes,
+                        "driver_tx_teacher_topk_bytes": teacher_topk_payload_bytes,
+                        "driver_teacher_topk_bytes": 2 * teacher_topk_payload_bytes,
+                        "driver_teacher_topk_bytes_avoided": 0,
+                        "tq_teacher_topk_write_bytes": 0,
+                        "tq_teacher_topk_write_ms_sum": 0.0,
+                        "tq_teacher_topk_write_ms_max": 0.0,
+                    }
 
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
@@ -926,8 +971,13 @@ def distillation_train(
             timing_metrics["valid_tokens_per_sec_per_gpu"] = (
                 metrics["global_valid_toks"] / total_time / total_num_gpus
             )
+            add_byte_metric_derivatives(
+                transport_metrics,
+                token_count=metrics["total_num_tokens"],
+            )
             logger.log_metrics(metrics, total_steps + 1, prefix="train")
             logger.log_metrics(timing_metrics, total_steps + 1, prefix="timing/train")
+            logger.log_metrics(transport_metrics, total_steps + 1, prefix="transport")
 
             timer.reset()
             current_step += 1
