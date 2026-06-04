@@ -142,7 +142,6 @@ def _get_free_port_local(
     port_range_high: int = DEFAULT_MASTER_PORT_RANGE_HIGH,
 ) -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         port = _bind_socket_in_range(s, port_range_low, port_range_high)
         s.listen(1)
 
