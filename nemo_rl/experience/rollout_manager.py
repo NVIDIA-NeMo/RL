@@ -626,6 +626,7 @@ class RolloutManager:
         policy_generation: Optional[GenerationInterface] = None,
         generation_config: Optional[GenerationConfig] = None,
         use_nemo_gym: bool = False,
+        dp_client: Optional[Any] = None,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
@@ -653,6 +654,12 @@ class RolloutManager:
             policy_generation=policy_generation,  # type: ignore
             generation_config=generation_config,
         )
+        self._dp_client = dp_client
 
     async def run_rollout(self, input_sample: DatumSpec) -> PromptGroupRecord:
         return await self._impl.run_rollout(input_sample)
+
+    async def generate_and_push(self, input_sample: DatumSpec) -> None:
+        assert self._dp_client is not None, (
+            "generate_and_push requires dp_client to be set at __init__"
+        )

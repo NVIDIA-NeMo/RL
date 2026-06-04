@@ -314,6 +314,24 @@ class DryRunAdvantageEstimator:
         return centered.unsqueeze(-1).expand(mask.shape)
 
 
+class DryRunRolloutManager:
+    """Dry-run mock of ``RolloutManager`` for SC dry-run tests.
+
+    Production ``RolloutManager`` is a plain (non-Ray) class living in the
+    SC actor's process; this mock matches that shape. Actual work (sleep +
+    push a fake sample to DataPlane + bump call counters) is delegated to a
+    ``DryRunGenWorker`` Ray actor so the test can inspect call counts,
+    timestamps, and weight_version from outside the SC actor.
+    """
+
+    def __init__(self, gen_actor: Any, dp_client: Any) -> None:
+        self._gen_actor = gen_actor
+        self._dp_client = dp_client
+
+    async def generate_and_push(self, prompt: str) -> None:
+        await self._gen_actor.generate_and_push.remote(prompt, self._dp_client)
+
+
 class DryRunWeightSynchronizer:
     """Stub WeightSynchronizer — just sleeps.
 
@@ -398,17 +416,21 @@ class TestSingleControllerDryRun:
             advantage_enabled=advantage_enabled,
             diagnostics=diagnostics,
         )
+
+        prompts = [f"prompt_{i}" for i in range(10)]
+
         if weight_sync is None:
             weight_sync = DryRunWeightSynchronizer(gen_handle=gen)
-        prompts = [f"prompt_{i}" for i in range(10)]
+        rollout_manager = DryRunRolloutManager(gen, dp_client)
+
         return SingleControllerActor.remote(
-            cfg,
-            prompts,
-            dp_client,
-            gen,
-            trainer,
-            weight_sync,
-            advantage_estimator,
+            cfg=cfg,
+            prompts=prompts,
+            dp_client_handle=dp_client,
+            trainer_handle=trainer,
+            rollout_manager=rollout_manager,
+            weight_synchronizer=weight_sync,
+            advantage_estimator=advantage_estimator,
         )
 
     def test_dry_run_completes(self, ray_init):
