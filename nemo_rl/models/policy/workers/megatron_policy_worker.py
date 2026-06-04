@@ -1148,6 +1148,40 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         gc.collect()
         torch.cuda.empty_cache()
 
+    def start_gen_benchmark_keepalive(self) -> None:
+        """Benchmark-only: keep this training GPU non-idle while real training is
+        skipped (gen_benchmark_skip_training), so the cluster's idle-GPU reaper does
+        not kill the job. Spawns one daemon thread doing a tiny periodic matmul.
+
+        The matmul is a purely local op (no collectives), so it cannot desync the
+        weight-sync NCCL collectives that still run every step.
+        """
+        import threading
+
+        if getattr(self, "_gen_benchmark_keepalive_thread", None) is not None:
+            return
+        self._gen_benchmark_keepalive_stop = threading.Event()
+
+        def _keepalive_loop() -> None:
+            interval_s = 60.0
+            try:
+                device = torch.cuda.current_device()
+                tensor = torch.randn(256, 256, device=device)
+            except Exception:
+                return
+            while not self._gen_benchmark_keepalive_stop.wait(interval_s):
+                try:
+                    with torch.no_grad():
+                        (tensor @ tensor).sum().item()
+                except Exception:
+                    pass
+
+        self._gen_benchmark_keepalive_thread = threading.Thread(
+            target=_keepalive_loop, name="gen-benchmark-keepalive", daemon=True
+        )
+        self._gen_benchmark_keepalive_thread.start()
+        print("⚙️ gen-benchmark keep-alive thread started (tiny periodic matmul).")
+
     def prepare_for_training(self, *args, **kwargs):
         # onload models and optimizer state to cuda
         self.model = self.move_model(

@@ -792,6 +792,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data("prepare_for_training")
         ray.get(futures)
 
+    def start_gen_benchmark_keepalive(self, *args: Any, **kwargs: Any) -> None:
+        """Benchmark-only: keep training GPUs non-idle while real training is skipped."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "start_gen_benchmark_keepalive"
+        )
+        ray.get(futures)
+
     def prepare_for_lp_inference(self, *args: Any, **kwargs: Any) -> None:
         futures = self.worker_group.run_all_workers_single_data(
             "prepare_for_lp_inference"
