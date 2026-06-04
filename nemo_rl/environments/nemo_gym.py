@@ -32,6 +32,9 @@ class NemoGymConfig(TypedDict):
     model_name: str
     base_urls: List[str]
     initial_global_config_dict: Dict[str, Any]
+    # Port range for Gym HTTP servers (head server + subprocess servers).
+    # Defaults to DEFAULT_GYM_PORT_RANGE_LOW/HIGH (15001-20000) from
+    # nemo_rl.distributed.virtual_cluster.  See the port layout there.
     port_range_low: NotRequired[int]
     port_range_high: NotRequired[int]
 
