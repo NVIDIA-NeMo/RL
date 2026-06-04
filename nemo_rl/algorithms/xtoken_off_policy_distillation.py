@@ -50,6 +50,7 @@ from nemo_rl.algorithms.x_token import TokenAligner
 from nemo_rl.data import DataConfig
 from nemo_rl.data.cross_tokenizer_collate import CrossTokenizerCollator
 from nemo_rl.data.datasets import AllTaskProcessedDataset
+from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.models.policy import PolicyConfig
@@ -243,11 +244,8 @@ def setup(
         drop_last=True,
         num_workers=data_config["num_workers"],
     )
-    if last_checkpoint_path is not None:
-        dataloader_state = torch.load(
-            os.path.join(last_checkpoint_path, "train_dataloader.pt")
-        )
-        train_dataloader.load_state_dict(dataloader_state)
+    if last_checkpoint_path:
+        load_dataloader_state(train_dataloader, last_checkpoint_path, data_config)
     print(
         f"  ✓ Training dataloader loaded with {len(train_dataset)} samples",
         flush=True,
