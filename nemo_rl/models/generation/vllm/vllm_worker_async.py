@@ -350,12 +350,21 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             OpenAIServingTokenization,
         )
         from vllm.exceptions import VLLMValidationError
+        from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
         from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
         from vllm.v1.engine.async_llm import logger as vllm_async_llm_logger
 
         maybe_tool_parser_plugin = self.cfg["vllm_cfg"].get("tool_parser_plugin")
         if maybe_tool_parser_plugin:
             ToolParserManager.import_tool_parser(maybe_tool_parser_plugin)
+
+        maybe_reasoning_parser_plugin = self.cfg["vllm_cfg"].get(
+            "reasoning_parser_plugin"
+        )
+        if maybe_reasoning_parser_plugin:
+            ReasoningParserManager.import_reasoning_parser(
+                maybe_reasoning_parser_plugin
+            )
 
         engine_client = self.llm
         model_config = self.llm_async_engine_args.create_model_config()
