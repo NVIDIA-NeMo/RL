@@ -20,7 +20,6 @@ fixtures here are pure-CPU.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any
 
@@ -190,8 +189,3 @@ def make_ct_data_dict(
 def has_gloo() -> bool:
     """Whether torch.distributed has a usable gloo backend."""
     return torch.distributed.is_available() and torch.distributed.is_gloo_available()
-
-
-def cpu_only() -> bool:
-    """Whether the suite should restrict itself to CPU paths (env override)."""
-    return os.environ.get("NRL_XTOKEN_GPU_SMOKE", "0") != "1"
