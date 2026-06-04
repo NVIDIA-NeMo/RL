@@ -32,6 +32,7 @@ from nemo_rl.algorithms.single_controller import (
     SingleControllerActor,
     SingleControllerConfig,
 )
+from nemo_rl.experience.rollout_manager import RolloutManager
 
 
 @ray.remote(num_cpus=0)
@@ -43,18 +44,34 @@ class NoOpDataPlane:
 
 
 @ray.remote(num_cpus=0)
-class CountingGenWorker:
-    """Counts the number of ``generate_and_push`` calls."""
+class _CallCounter:
+    """Ray actor exposing a call counter across the SC actor boundary."""
 
     def __init__(self) -> None:
-        self._call_count = 0
+        self._n = 0
 
-    async def generate_and_push(self, prompt: str, dp_client: Any) -> None:
-        del prompt, dp_client
-        self._call_count += 1
+    def tick(self) -> None:
+        self._n += 1
 
-    def get_call_count(self) -> int:
-        return self._call_count
+    def get(self) -> int:
+        return self._n
+
+
+class _CountingRolloutManager(RolloutManager):
+    """``RolloutManager`` subclass that tallies ``generate_and_push`` calls.
+
+    Real ``RolloutManager.__init__`` runs (so the impl plumbing is exercised);
+    only ``generate_and_push`` is instrumented to bump a Ray-actor counter
+    that the test can read from the driver process.
+    """
+
+    def __init__(self, counter: Any, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._counter = counter
+
+    async def generate_and_push(self, input_sample: Any) -> None:
+        await super().generate_and_push(input_sample)
+        await self._counter.tick.remote()
 
 
 @pytest.fixture(scope="module")
@@ -65,8 +82,7 @@ def ray_init():
 
 
 def test_rollout_pump_dispatches_max_rollout_prompts(ray_init):
-    """`_rollout_pump` issues exactly `max_rollout_prompts` calls."""
-    # Set up config
+    """``_rollout_pump`` issues exactly ``max_rollout_prompts`` calls."""
     max_rollout_prompts = 4
     cfg = SingleControllerConfig(
         max_train_steps=1,
@@ -80,20 +96,26 @@ def test_rollout_pump_dispatches_max_rollout_prompts(ray_init):
         diagnostics=False,
     )
 
-    # Set up DataPlane, GenWorker and SingleController
-    dp = NoOpDataPlane.remote()
-    gen = CountingGenWorker.remote()
+    dp_client_handle = NoOpDataPlane.remote()
+    counter = _CallCounter.remote()
+    rollout_manager = _CountingRolloutManager(
+        counter=counter,
+        tokenizer=None,
+        task_to_env={},
+        num_generations_per_prompt=cfg.generations_per_prompt,
+        max_seq_len=0,
+        policy_generation=object(),
+        dp_client=dp_client_handle,
+    )
     ctrl = SingleControllerActor.remote(
-        cfg,
-        ["only_prompt"],
-        dp,
-        gen,
-        object(),
-        object(),
+        cfg=cfg,
+        prompts=["only_prompt"],
+        dp_client_handle=dp_client_handle,
+        rollout_manager=rollout_manager,
+        trainer_handle=object(),
+        weight_synchronizer=object(),
     )
 
-    # Run rollout pump
     ray.get(ctrl._rollout_pump.remote())
 
-    # Check result
-    assert ray.get(gen.get_call_count.remote()) == max_rollout_prompts
+    assert ray.get(counter.get.remote()) == max_rollout_prompts
