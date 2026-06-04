@@ -20,6 +20,36 @@ from megatron.bridge import AutoBridge
 from nemo_rl.models.policy import MegatronConfig
 
 
+def _apply_dsv4_overrides(model_provider: Any) -> None:
+    """Apply DeepSeek-V4 provider overrides before checkpoint conversion.
+
+    Two fixes that need to land before the provider is finalized and saved
+    into the mcore checkpoint's run_config.yaml:
+
+    1. dsa_indexer_loss_coeff: Megatron-Bridge's DSv4 provider_bridge does
+       not set this knob, and TransformerConfig defaults it to None. The
+       DSA forward (compute_dsa_indexer_loss) does `kl_div * loss_coeff`
+       and TypeErrors on None. Default it to 0.0 so the auxiliary loss is
+       a no-op; users can bump it via their own override if needed.
+
+    2. use_fused_mhc: The fused proj-RMS kernel in DSv4's hyper-connection
+       path uses cuTile, which requires CUDA driver >= 13.0 at runtime.
+       Hosts with older drivers crash inside `ct.launch()`. Setting
+       NRL_DSV4_DISABLE_FUSED_MHC=1 disables the fused path and falls
+       back to the native implementation.
+    """
+    if getattr(model_provider, "experimental_attention_variant", None) != "dsv4_hybrid":
+        return
+
+    if getattr(model_provider, "dsa_indexer_loss_coeff", None) is None:
+        model_provider.dsa_indexer_loss_coeff = 0.0
+
+    if os.environ.get("NRL_DSV4_DISABLE_FUSED_MHC", "0") == "1" and hasattr(
+        model_provider, "use_fused_mhc"
+    ):
+        model_provider.use_fused_mhc = False
+
+
 def import_model_from_hf_name(
     hf_model_name: str,
     output_path: str,
@@ -38,6 +68,8 @@ def import_model_from_hf_name(
     )
 
     model_provider = bridge.to_megatron_provider(load_weights=True)
+
+    _apply_dsv4_overrides(model_provider)
 
     # Keep track of defaults so can restore them to the config after loading the model
     orig_tensor_model_parallel_size = model_provider.tensor_model_parallel_size
@@ -60,6 +92,11 @@ def import_model_from_hf_name(
         model_provider.pipeline_model_parallel_size = megatron_config[
             "pipeline_model_parallel_size"
         ]
+        # Optional explicit PP layout; required by Megatron-LM when using
+        # hash-MoE with PP>1 (e.g. DSv4). None falls back to block-balanced.
+        layout = megatron_config.get("pipeline_model_parallel_layout")
+        if layout is not None:
+            model_provider.pipeline_model_parallel_layout = layout
         model_provider.context_parallel_size = megatron_config["context_parallel_size"]
         model_provider.expert_model_parallel_size = megatron_config[
             "expert_model_parallel_size"

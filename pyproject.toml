@@ -112,6 +112,9 @@ mcore = [
   "flash-attn==2.8.1",
   "emerging-optimizers==0.2.0",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
+  # Required by DeepSeek-V4 DSA (dsa.py rotate_activation); PyPI sdist is
+  # broken at 1.0.4.post1 (missing csrc), so install from source.
+  "fast-hadamard-transform @ git+https://github.com/Dao-AILab/fast-hadamard-transform.git",
 ]
 nvrx = [
   "nvidia-resiliency-ext",
@@ -346,11 +349,18 @@ mamba-ssm = [{ requirement = "torch", match-runtime = true }]
 causal-conv1d = [{ requirement = "torch", match-runtime = true }]
 nv-grouped-gemm = [{ requirement = "torch", match-runtime = true }]
 sglang-kernel = [{ requirement = "torch", match-runtime = true }]
+fast-hadamard-transform = [{ requirement = "torch", match-runtime = true }]
 
 # Needed when building from source
 [[tool.uv.dependency-metadata]]
 name = "flash-attn"
 requires-dist = ["torch", "einops", "setuptools", "psutil", "ninja"]
+
+[[tool.uv.dependency-metadata]]
+name = "fast-hadamard-transform"
+# Pinned to the main-branch HEAD at the time of writing
+version = "1.0.4.post1"
+requires-dist = ["torch", "packaging", "ninja"]
 
 [[tool.uv.dependency-metadata]]
 name = "causal-conv1d"
@@ -476,7 +486,7 @@ name = "megatron-bridge"
 # Must stay in sync with 3rdparty/Megatron-Bridge-workspace/setup.py::CACHED_DEPENDENCIES.
 version = "0.0.0"
 requires-dist = [
-  "transformers>=5.0.0,<=5.3.0",
+  "transformers>=5.8.1,<5.9.0",
   "peft>=0.18.1",
   "datasets>=2.20.0",
   "accelerate",

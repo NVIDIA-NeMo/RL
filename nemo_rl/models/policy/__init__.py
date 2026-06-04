@@ -205,6 +205,7 @@ class MegatronConfig(TypedDict):
     activation_checkpointing: bool
     tensor_model_parallel_size: int
     pipeline_model_parallel_size: int
+    pipeline_model_parallel_layout: NotRequired[str | list | None]
     num_layers_in_first_pipeline_stage: int | None
     num_layers_in_last_pipeline_stage: int | None
     context_parallel_size: int

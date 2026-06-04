@@ -301,6 +301,12 @@ class VllmInternalWorkerExtension:
             "Please call prepare_refit_info when initializing the worker."
         )
 
+        # Free reserved-but-unallocated GPU memory before receiving refit
+        # weights. vLLM runs at a high GMU and the per-chunk refit buffer
+        # competes with KV cache + private NCCL pools; reclaim what we can.
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
         def _load_model_weights(weights, model_runner):
             """Load model weights.
 

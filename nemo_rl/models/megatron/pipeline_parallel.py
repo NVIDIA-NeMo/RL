@@ -60,8 +60,10 @@ def broadcast_obj_from_pp_rank(obj: Any) -> Any:
     true_ranks = [rank for rank, flag in enumerate(obj_flags) if flag]
     if not true_ranks:
         raise ValueError("Object must exist on at least one PP rank")
-    if len(true_ranks) > 1:
-        raise ValueError(f"Object present on multiple PP ranks: {true_ranks}")
+    # Tied weights (DSv4: embedding shared with lm_head/MTP head when PP>1)
+    # legitimately appear on multiple PP ranks. Use the lowest-rank source.
+    # The downstream consumer expects a scalar (e.g. parameter size in bytes)
+    # that is consistent across ranks for the same logical parameter.
     src_rank = true_ranks[0]
 
     # ------------------------------------------------------------------

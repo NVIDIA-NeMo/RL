@@ -86,6 +86,11 @@ policy:
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 1
     pipeline_model_parallel_size: 1
+    # Optional explicit PP layer layout. Required by Megatron-LM when using
+    # hash-MoE layers with PP > 1 (e.g. DSv4). Accepts a compact string like
+    # "Et*22|t*21,L" (E=embedding, t=transformer, m=mtp, L=loss; "|" separates
+    # stages, "*N" repeats). Set to null for the default block-balanced split.
+    pipeline_model_parallel_layout: null
     num_layers_in_first_pipeline_stage: null
     num_layers_in_last_pipeline_stage: null
     context_parallel_size: 1

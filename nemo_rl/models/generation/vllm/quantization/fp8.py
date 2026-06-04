@@ -659,9 +659,44 @@ def _try_load_deepseek_v4_moe_block_scale(
     expert_data = param.data[local_expert_id]
     loaded_weight = loaded_weight.to(device=expert_data.device)
 
+    # The Megatron refit streams the *full* (un-TP-sharded) per-expert block scale,
+    # but vLLM shards each expert's intermediate dimension across its tensor-parallel
+    # ranks (so the local w13/w2 scale param is 1/tp_size of the full scale). vLLM's
+    # normal FusedMoE weight loader shards the weights for us, but this custom block
+    # scale path bypasses it, so we must apply the same contiguous TP shard here:
+    #   - w13 (w1/w3): intermediate dim is the scale's dim 0 (rows)
+    #   - w2:          intermediate dim is the scale's dim 1 (cols)
+    tp_size = getattr(layer, "tp_size", None)
+    tp_rank = getattr(layer, "tp_rank", None)
+    if tp_size is None or tp_rank is None:
+        from vllm.distributed import (
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+        )
+
+        tp_size = tp_size if tp_size is not None else get_tensor_model_parallel_world_size()
+        tp_rank = tp_rank if tp_rank is not None else get_tensor_model_parallel_rank()
+
+    def _tp_shard(scale: torch.Tensor, dim: int) -> torch.Tensor:
+        if tp_size is None or tp_size <= 1:
+            return scale
+        full = scale.shape[dim]
+        if full % tp_size != 0:
+            raise ValueError(
+                "DSV4 MoE scale refit cannot TP-shard "
+                f"dim={dim} size={full} across tp_size={tp_size} for {param_name}"
+            )
+        chunk = full // tp_size
+        return scale.narrow(dim, tp_rank * chunk, chunk)
+
     if "w13_weight_scale" in param_name:
         if shard_id not in ("w1", "w3"):
             return None
+        # Only TP-shard when the streamed scale is the full (unsharded) tensor; if it
+        # already matches the local per-shard row capacity, leave it as-is.
+        per_shard_rows = expert_data.shape[0] // 2
+        if loaded_weight.shape[0] != per_shard_rows:
+            loaded_weight = _tp_shard(loaded_weight, dim=0)
         row_offset = 0 if shard_id == "w1" else loaded_weight.shape[0]
         if expert_data.shape[1:] != loaded_weight.shape[1:]:
             raise ValueError(
@@ -680,6 +715,8 @@ def _try_load_deepseek_v4_moe_block_scale(
     if "w2_weight_scale" in param_name:
         if shard_id != "w2":
             return None
+        if expert_data.shape != loaded_weight.shape:
+            loaded_weight = _tp_shard(loaded_weight, dim=1)
         if expert_data.shape != loaded_weight.shape:
             raise ValueError(
                 "DSV4 MoE w2 scale refit shape mismatch: "

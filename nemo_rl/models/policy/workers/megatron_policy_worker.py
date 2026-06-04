@@ -88,9 +88,17 @@ from nemo_rl.models.policy.interfaces import (
 )
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
-from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
+from nemo_rl.models.policy.workers.patches import (
+    apply_torch_config_pickle_patch,
+    apply_transformer_engine_patch,
+)
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+
+# Applied at import time (before Ray serializes this worker's actor class) so that
+# torch>=2.11 config modules are picklable by reference. Required for the Megatron
+# path on the DSv4/vLLM-0.21 (torch 2.11) stack; see patches for details.
+apply_torch_config_pickle_patch()
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
@@ -946,13 +954,21 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
     @wrap_with_nvtx_name("megatron_policy_worker/prepare_refit_info")
     def prepare_refit_info(self) -> None:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
+        # The streaming iterator below does a per-expert EP all_gather inside
+        # megatron-bridge. On large MoE models (DSv4) at 80 GiB / GPU, NCCL
+        # can fail to allocate even small scratch buffers without first
+        # returning reserved pages and dropping pinned Python references.
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
         self.refit_param_info_mcore = self._calculate_refit_param_info()
 
-        # Collect tensor metadata for refit / hf side info
         refit_param_info_hf = {}
-        # Reuse shared iterator that appends FP8 KV/Q scales when enabled
         for name, tensor in self._iter_params_with_optional_kv_scales():
             refit_param_info_hf[name] = (tensor.shape, tensor.dtype)
+            del tensor
+            torch.cuda.empty_cache()
 
         return refit_param_info_hf
 
@@ -982,13 +998,18 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                 # need to broadcast for other pp ranks
                 size_in_bytes = None
             else:
-                # Calculate size for this parameter
+                # Floating-point params are cast to the policy training dtype on
+                # refit; integer buffers (e.g. DSv4 hash-MoE tid2eid) keep their
+                # own dtype, so the scale stays at 1.
                 prec_to_bytes = {
                     torch.bfloat16: 2,
                     torch.float16: 2,
                     torch.float32: 4,
                 }
-                scale = prec_to_bytes[self.dtype] / prec_to_bytes[param.dtype]
+                if param.dtype.is_floating_point:
+                    scale = prec_to_bytes[self.dtype] / prec_to_bytes[param.dtype]
+                else:
+                    scale = 1
                 size_in_bytes = (
                     param.element_size() * param.numel() * tp_size * ep_size * scale
                 )
