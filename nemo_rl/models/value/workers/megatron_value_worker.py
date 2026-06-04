@@ -39,7 +39,6 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
 from megatron.core.models.gpt import GPTModel
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.parallel_state import (
-    get_context_parallel_group,
     get_pipeline_model_parallel_group,
     get_pipeline_model_parallel_last_rank,
     get_tensor_model_parallel_group,
@@ -51,9 +50,6 @@ from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.model_utils import (
-    allgather_cp_sharded_tensor,
-)
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.megatron.common import (
     broadcast_tensor,
@@ -81,35 +77,6 @@ from nemo_rl.models.value.interfaces import ValueOutputSpec
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
-
-
-def _unpack_values(
-    values_packed: torch.Tensor,
-    cu_seqlens_padded: torch.Tensor,
-    unpacked_batch_size: int,
-    unpacked_seq_length: int,
-) -> torch.Tensor:
-    """Unpack ``[1, T_packed]`` (or ``[T_packed]``) -> ``[B, S]``.
-
-    Sequence-packed Megatron forward returns values in packed layout. PPO's
-    advantage estimator and value-loss callers expect the unpacked ``[B, S]``
-    shape, so we walk ``cu_seqlens_padded`` and copy each sample's slice back.
-    """
-    if values_packed.dim() == 2 and values_packed.shape[0] == 1:
-        values_packed = values_packed.squeeze(0)
-    out = torch.zeros(
-        unpacked_batch_size,
-        unpacked_seq_length,
-        device=values_packed.device,
-        dtype=values_packed.dtype,
-    )
-    for i in range(unpacked_batch_size):
-        start = int(cu_seqlens_padded[i].item())
-        end = int(cu_seqlens_padded[i + 1].item())
-        seq_len = min(end - start, unpacked_seq_length)
-        if seq_len > 0:
-            out[i, :seq_len] = values_packed[start : start + seq_len]
-    return out
 
 
 class ValueHead(torch.nn.Module):
@@ -856,27 +823,6 @@ class MegatronValueWorker(AbstractPolicyWorker):
                         gathered, values.contiguous(), group=tp_group
                     )
                     values = torch.cat(gathered, dim=1)
-
-                # Handle context parallelism: gather across CP.
-                # CP uses Megatron's 2*cp load-balanced interleave layout, so
-                # `allgather_cp_sharded_tensor` is the correct helper here.
-                cp_size = parallel_state.get_context_parallel_world_size()
-                if cp_size > 1:
-                    cp_group = get_context_parallel_group()
-                    values = allgather_cp_sharded_tensor(values, cp_group, seq_dim=1)
-
-                # Unpack from packed [1, T_packed] back to [B, S] when sequence
-                # packing was used in the forward. Callers (GAE / MseValueLossFn)
-                # expect [B, S]; doing this before the shift-right also keeps the
-                # shift from crossing sample boundaries.
-                if packed_seq_params is not None:
-                    unpacked_input_ids = data_dict["input_ids"]
-                    values = _unpack_values(
-                        values_packed=values,
-                        cu_seqlens_padded=packed_seq_params.cu_seqlens_q_padded,
-                        unpacked_batch_size=unpacked_input_ids.shape[0],
-                        unpacked_seq_length=unpacked_input_ids.shape[1],
-                    )
 
                 # Prepend 0 value for first token to maintain sequence length
                 values = torch.cat(

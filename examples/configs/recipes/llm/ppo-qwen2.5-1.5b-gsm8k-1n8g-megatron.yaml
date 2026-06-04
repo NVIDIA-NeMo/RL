@@ -52,19 +52,9 @@ value:
   model_name: Qwen/Qwen2.5-1.5B-Instruct
   tokenizer:
     name: Qwen/Qwen2.5-1.5B-Instruct
-  # Bump mbs so sequence_packing actually packs multiple samples per micro-batch
   train_micro_batch_size: 4
-  # Same min-pad-factor reason as policy above (TP=2, CP=2, SP → factor 8).
-  make_sequence_length_divisible_by: 8
-  # Enable sequence_packing to exercise the unpack path and (required by
-  # _apply_parallelism_config in megatron/setup.py) satisfy CP>1's
-  # packing prerequisite. Key lives at value top-level, NOT under megatron_cfg.
-  sequence_packing:
-    enabled: true
   megatron_cfg:
-    # Match policy parallelism: TP=2, CP=2, SP=true.
     tensor_model_parallel_size: 2
-    context_parallel_size: 2
     sequence_parallel: true
     optimizer:
       lr: 1.0e-05

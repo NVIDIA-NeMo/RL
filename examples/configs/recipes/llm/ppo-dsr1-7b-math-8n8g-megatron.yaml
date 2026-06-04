@@ -55,19 +55,9 @@ value:
   model_name: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
   tokenizer:
     name: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
-  # Bump mbs so sequence_packing actually packs multiple samples per micro-batch
   train_micro_batch_size: 4
-  # Value uses TP=2 + CP=2 + SP → min pad factor = cp_size * 2 * tp_size = 8.
-  make_sequence_length_divisible_by: 8
-  # Enable sequence_packing to exercise the unpack path and (required by
-  # _apply_parallelism_config in megatron/setup.py) satisfy CP>1's
-  # packing prerequisite. Key lives at value top-level, NOT under megatron_cfg.
-  sequence_packing:
-    enabled: true
   megatron_cfg:
-    # 8n8g = 64 GPUs: TP=2 × CP=2 × DP=16 = 64
     tensor_model_parallel_size: 2
-    context_parallel_size: 2
     sequence_parallel: true
     optimizer:
       lr: 2.0e-05
