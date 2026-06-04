@@ -290,6 +290,10 @@ policy:
     - milestones: [50]
 
   generation:
+    # Port range for vLLM HTTP servers, kept below the OS ephemeral range.
+    # See ray.sub for the full port layout.
+    port_range_low: 11001
+    port_range_high: 15000
     backend: "vllm"
     max_new_tokens: ${policy.max_total_sequence_length}
     temperature: 1.0
@@ -408,6 +412,11 @@ logger:
 cluster:
   gpus_per_node: 1
   num_nodes: 1
+  # Port range for the distributed master address (TCPStore / NCCL rendezvous)
+  # and per-worker available ports.  Kept below the OS ephemeral range
+  # (32768-60999 on stock Linux).  See ray.sub for the full port layout.
+  master_port_range_low: 25000
+  master_port_range_high: 28000
 
 # TransferQueue-mediated data plane for sync GRPO.
 # Off by default — the legacy grpo_train trainer never engages this.
