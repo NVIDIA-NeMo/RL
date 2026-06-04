@@ -1,95 +1,92 @@
 ---
 name: gsm8k-checkpoint-eval
-description: Evaluate NeMo-RL/Nemotron diffusion or Ministral3 RL checkpoints on GSM8K or MATH500 by converting Megatron checkpoints to Hugging Face format, running eval_3b_checkpoint.sh, or running the NemoSkills eval pipeline from the nemo-rl clone.
+description: Evaluate native Nemotron Diffusion NeMo-RL Megatron checkpoints by converting them to Hugging Face format in the required Slurm container, then running the yonggon-rl NemoSkills evaluation pipeline.
 ---
 
-# GSM8K / MATH500 Checkpoint Evaluation
+# GSM8K Checkpoint Evaluation
 
-Use this workflow when evaluating a saved NeMo-RL Megatron checkpoint on the SGLang GSM8K or MATH500 benchmark. The checkpoint must be converted to Hugging Face format before evaluation. The same scripts handle both benchmarks; choose with `BENCHMARK=gsm8k` (default) or `BENCHMARK=math`.
+Use this workflow for native Nemotron Diffusion NeMo-RL Megatron checkpoints. The evaluation has two major steps:
 
-## Workflow
+1. Convert the raw Megatron checkpoint step directory to Hugging Face format.
+2. Evaluate the converted Hugging Face checkpoint with the `yonggon-rl` NemoSkills pipeline.
 
-1. Work from the JustGRPO worktree:
+Do not run conversion directly on the login node. Run conversion inside the container specified below so CUDA, Transformer Engine, cuDNN, and C++ runtime dependencies are consistent.
+
+## Step 1: Convert Checkpoint
+
+Required inputs:
+
+- `STEP_DIR`: raw checkpoint step directory containing `config.yaml` and `policy/weights/iter_0000000`.
+- `OUT`: destination Hugging Face checkpoint directory.
+
+Use this container for conversion:
+
+```bash
+CONTAINER=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_llm/users/sfawzy/nemo-rl-nightly.sqsh
+```
+
+Use the repo wrapper for conversion. Do not inline or recreate the converter command from `tools/nemotron_diffusion/convert_nemotron_diffusion_checkpoint_to_hf.sh`; `convert_checkpoint.sh` owns the native Nemotron Diffusion conversion settings.
 
 ```bash
 cd /home/snorouzi/diffusion_RL/RL
-```
 
-2. Convert the checkpoint to HF format with `convert_checkpoint.sh`.
-
-For native Nemotron diffusion checkpoints:
-
-```bash
 STEP_DIR=/path/to/run/checkpoints/step_N \
-OUT=/lustre/fsw/portfolios/coreai/users/snorouzi/checkpoints/<name>_hf \
+OUT=/lustre/fsw/portfolios/coreai/users/snorouzi/checkpoints/<name>_step_N_hf \
 ./convert_checkpoint.sh
 ```
 
-For `Ministral3ForCausalLM` / `ministral3_ar` checkpoints, pass `--ministral3` so the Megatron-Bridge runtime patch is added:
+When running under Slurm, load the container above and run the same wrapper command inside `/home/snorouzi/diffusion_RL/RL`. Example:
 
 ```bash
-STEP_DIR=/path/to/run/checkpoints/step_N \
-OUT=/lustre/fsw/portfolios/coreai/users/snorouzi/checkpoints/<name>_hf \
-./convert_checkpoint.sh --ministral3
+srun --container-image=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_llm/users/sfawzy/nemo-rl-nightly.sqsh \
+  --container-mounts=/home/snorouzi:/home/snorouzi,/lustre:/lustre \
+  --container-workdir=/home/snorouzi/diffusion_RL/RL \
+  bash -lc 'STEP_DIR=/path/to/run/checkpoints/step_N OUT=/lustre/fsw/portfolios/coreai/users/snorouzi/checkpoints/<name>_step_N_hf ./convert_checkpoint.sh'
 ```
 
-The `--ministral3` flag is needed because the causal `Ministral3ForCausalLM` bridge is registered through the runtime patch directory.
+Agents should not generate a full custom conversion script unless the user explicitly asks for one.
 
-3. Evaluate the converted HF checkpoint with `eval_3b_checkpoint.sh`.
-
-### GSM8K (default)
+After conversion succeeds, verify the Hugging Face directory contains at least:
 
 ```bash
-MODEL=/lustre/fsw/portfolios/coreai/users/snorouzi/checkpoints/<name>_hf \
-OUTDIR=/lustre/fsw/portfolios/coreai/users/snorouzi/eval_results/<name>_gsm8k \
-./eval_3b_checkpoint.sh
+ls -l "${OUT}"/config.json \
+      "${OUT}"/model.safetensors \
+      "${OUT}"/tokenizer.json \
+      "${OUT}"/configuration_ministral_dlm.py \
+      "${OUT}"/modeling_ministral_dlm.py
 ```
 
-### MATH500
+## Step 2: Evaluate Converted Checkpoint
+
+Default evaluation uses the NemoSkills pipeline in the `yonggon-rl` clone:
 
 ```bash
-BENCHMARK=math \
-MODEL=/lustre/fsw/portfolios/coreai/users/snorouzi/checkpoints/<name>_hf \
-OUTDIR=/lustre/fsw/portfolios/coreai/users/snorouzi/eval_results/<name>_math500 \
-./eval_3b_checkpoint.sh
+cd /home/snorouzi/code/yonggon-rl
 ```
 
-To submit either as a Slurm batch job, add `--sbatch`:
+Use `xp/examples/run_llada_eval_pipeline_gpu_only.sh`. This starts the Nemotron/LLaDA API server, runs the NemoSkills client against `localhost:8000/v1`, and writes a generated `.gpu_only_cmd_*.sh` script into the output directory for exact reruns.
+
+Set `SERVER_MODEL_PATH` to the converted Hugging Face checkpoint directory from Step 1. Set `SERVER_TOKENIZER` to the known 3B base checkpoint/tokenizer path, not to the raw `step_N` Megatron checkpoint directory.
+
+Important path rule for NemoSkills: use the canonical `/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/snorouzi/...` path family for `SERVER_MODEL_PATH`, `SERVER_TOKENIZER`, and `SEQ_EVAL_OUTPUT_DIR`. The shorter `/lustre/fsw/portfolios/coreai/users/snorouzi/...` path may resolve correctly on the login node, but the NemoSkills container can fail to load an otherwise valid HF checkpoint from that path with an error like "Can't load the configuration".
+
+### GSM8K NemoSkills Diffusion Eval
 
 ```bash
-BENCHMARK=math \
-MODEL=/lustre/fsw/portfolios/coreai/users/snorouzi/checkpoints/<name>_hf \
-OUTDIR=/lustre/fsw/portfolios/coreai/users/snorouzi/eval_results/<name>_math500 \
-./eval_3b_checkpoint.sh --sbatch
-```
+HF_MODEL=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/snorouzi/checkpoints/<name>_step_N_hf
+BASE_3B_TOKENIZER=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/snorouzi/checkpoints/Nemotron-Labs-Diffusion-3B
+OUTDIR=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/snorouzi/eval_results/<name>_step_N_gsm8k_nemoskills
 
-## NemoSkills eval path from nemo-rl
-
-Use this path when you want to evaluate with the NemoSkills wrapper in the `nemo-rl` clone instead of the SGLang benchmark script. This starts the LLaDA/Nemotron API server, runs the NemoSkills GSM8K client against `localhost:8000/v1`, and writes a generated `.gpu_only_cmd_*.sh` script into the output directory for exact reproducibility.
-
-If the input is a saved NeMo-RL/Megatron checkpoint such as `/path/to/run/checkpoints/step_N`, convert it to Hugging Face format before using this NemoSkills path. Follow step 2 in this same skill file (`/home/snorouzi/diffusion_RL/RL/skills/gsm8k-checkpoint-eval/SKILL.md`) and run `./convert_checkpoint.sh`; then set `SERVER_MODEL_PATH` to the converted HF output directory. Do not point `SERVER_MODEL_PATH` directly at the raw Megatron step directory unless intentionally using the DCP conversion flow below.
-
-Work from the `nemo-rl` clone:
-
-```bash
-cd /home/snorouzi/code/yonggan-rl
-```
-
-### Diffusion / Nemotron decoding
-
-For the Nemotron-Labs-Diffusion-3B base checkpoint on GSM8K with full evaluation:
-
-```bash
 ACCOUNT=coreai_dlalgo_llm \
 SERVER_PARTITION=batch \
 SERVER_TIME=04:00:00 \
 SERVER_GPUS=8 \
-SERVER_MODEL_PATH=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/snorouzi/checkpoints/Nemotron-Labs-Diffusion-3B \
-SERVER_TOKENIZER=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/snorouzi/checkpoints/Nemotron-Labs-Diffusion-3B \
+SERVER_MODEL_PATH="${HF_MODEL}" \
+SERVER_TOKENIZER="${BASE_3B_TOKENIZER}" \
 SERVER_ENGINE=nemotron \
 SEQ_EVAL_BENCHMARK=gsm8k:1 \
-SEQ_EVAL_EXPNAME=baseline_3b_nemoskills_diffusion_steps1024_full \
-SEQ_EVAL_OUTPUT_DIR=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/snorouzi/eval_results/nemorskills_baseline_3b_diffusion_steps1024_full_$(date +%Y%m%d_%H%M%S) \
+SEQ_EVAL_EXPNAME=<name>_step_N_gsm8k_nemoskills \
+SEQ_EVAL_OUTPUT_DIR="${OUTDIR}" \
 SEQ_EVAL_GENERATION_ALGORITHM=nemotron \
 SEQ_EVAL_TOKENS_TO_GENERATE=1024 \
 SEQ_EVAL_STEPS=1024 \
@@ -99,80 +96,94 @@ SEQ_EVAL_EXTRA_ARGS="--exclude-unfinished-nfe false" \
 bash xp/examples/run_llada_eval_pipeline_gpu_only.sh
 ```
 
-For a smoke test, keep the same command but add `--max-samples 16`:
+For a smoke test, keep the same command but add a small sample cap:
 
 ```bash
 SEQ_EVAL_EXTRA_ARGS="--max-samples 16 --exclude-unfinished-nfe false"
 ```
 
-### AR-native decoding
+### GSM8K NemoSkills AR-Native Eval
 
-For AR-native evaluation, switch both the server engine and NemoSkills generation algorithm:
+When the user asks for AR mode with the same `yonggon-rl` / NemoSkills setup, use the native AR path rather than the Hugging Face `ar` path. The required flags are:
 
 ```bash
+SERVER_ENGINE=ar_native
+SEQ_EVAL_GENERATION_ALGORITHM=ar_native
+```
+
+Use a separate output directory and keep `SERVER_MODEL_PATH` pointed at the original converted Hugging Face checkpoint. Do not create an AR-specific checkpoint copy for `ar_native`; the `ar_native` engine loads the model with `AutoModel` and calls `model.ar_generate()`.
+
+```bash
+HF_MODEL=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/snorouzi/checkpoints/<name>_step_N_hf
+BASE_3B_TOKENIZER=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/snorouzi/checkpoints/Nemotron-Labs-Diffusion-3B
+OUTDIR=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/snorouzi/eval_results/<name>_step_N_gsm8k_nemoskills_ar_native
+
+ACCOUNT=coreai_dlalgo_llm \
+SERVER_PARTITION=batch \
+SERVER_TIME=04:00:00 \
+SERVER_GPUS=8 \
+SERVER_MODEL_PATH="${HF_MODEL}" \
+SERVER_TOKENIZER="${BASE_3B_TOKENIZER}" \
 SERVER_ENGINE=ar_native \
+SEQ_EVAL_BENCHMARK=gsm8k:1 \
+SEQ_EVAL_EXPNAME=<name>_step_N_gsm8k_nemoskills_ar_native \
+SEQ_EVAL_OUTPUT_DIR="${OUTDIR}" \
 SEQ_EVAL_GENERATION_ALGORITHM=ar_native \
-SEQ_EVAL_STEPS=64 \
+SEQ_EVAL_TOKENS_TO_GENERATE=1024 \
+SEQ_EVAL_STEPS=1024 \
+SEQ_EVAL_BLOCK_LENGTH=1 \
+SEQ_EVAL_TEMPERATURE=0 \
 bash xp/examples/run_llada_eval_pipeline_gpu_only.sh
 ```
 
-Keep the same `SERVER_MODEL_PATH`, `SERVER_TOKENIZER`, benchmark, output directory, and token settings as above unless intentionally changing the model or benchmark.
+Avoid `SERVER_ENGINE=hf` with `SEQ_EVAL_GENERATION_ALGORITHM=ar` unless the user explicitly asks for the Hugging Face AR path. That path patches `config.json` in place for AR loading, so it must never be run against a converted checkpoint directory that will also be reused for diffusion eval.
 
-### DCP / trained checkpoint eval
+### Alternate Block Length
 
-For a NeMo-RL DCP checkpoint, pass the DCP path and base model. The pipeline converts the DCP checkpoint to a temporary HF directory before starting the server:
+Use the same NemoSkills command as above with a separate output directory and the block-length override:
 
 ```bash
-SERVER_DCP_PATH=/path/to/run/checkpoints/step_N \
-SERVER_BASE_MODEL=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/snorouzi/checkpoints/Nemotron-Labs-Diffusion-3B \
-SERVER_MODEL_PATH=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/snorouzi/checkpoints/Nemotron-Labs-Diffusion-3B \
-SERVER_TOKENIZER=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/snorouzi/checkpoints/Nemotron-Labs-Diffusion-3B \
+SEQ_EVAL_OUTPUT_DIR=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/snorouzi/eval_results/<name>_step_N_gsm8k_nemoskills_block16 \
+SEQ_EVAL_BLOCK_LENGTH=16 \
 bash xp/examples/run_llada_eval_pipeline_gpu_only.sh
 ```
 
-If the trained checkpoint was already converted to HF, use that HF directory directly as `SERVER_MODEL_PATH` and omit `SERVER_DCP_PATH`.
+### Optional SGLang Fallback
 
-For NemoSkills evals, prefer the `/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/snorouzi/checkpoints/...` checkpoint path when it exists. We have seen the eval container fail to load an otherwise valid checkpoint from the shorter `/lustre/fsw/portfolios/coreai/users/snorouzi/checkpoints/...` path with an error like "Can't load the configuration". The `/lustre/fs1/.../projects/...` path is the path family used by the successful NemoSkills runs.
-
-Also make sure custom HF remote-code files are real files visible inside the container, not symlinks to an unmounted checkpoint directory. For Ministral/Nemotron diffusion checkpoints, verify at least these files exist in `SERVER_MODEL_PATH` before submitting:
+Use the SGLang wrapper only when the user explicitly asks for the SGLang benchmark path. For native Nemotron Diffusion, pass FastDiffuser explicitly and clear `JSON_MODEL_OVERRIDE_ARGS` so the wrapper does not inject AR mode.
 
 ```bash
-ls -l "${SERVER_MODEL_PATH}"/config.json \
-      "${SERVER_MODEL_PATH}"/configuration_ministral_dlm.py \
-      "${SERVER_MODEL_PATH}"/modeling_ministral_dlm.py
+cd /home/snorouzi/diffusion_RL/RL
+
+HF_MODEL=/lustre/fsw/portfolios/coreai/users/snorouzi/checkpoints/<name>_step_N_hf
+OUTDIR=/lustre/fsw/portfolios/coreai/users/snorouzi/eval_results/<name>_step_N_gsm8k_sglang_fastdiffuser
+SGLANG_COMMIT=$(git -C /home/snorouzi/code/sglang-nemotron-dllm-a652eb48 rev-parse HEAD)
+
+MODEL="${HF_MODEL}" \
+OUTDIR="${OUTDIR}" \
+BENCHMARK=gsm8k \
+SGLANG_COMMIT="${SGLANG_COMMIT}" \
+DLLM_ALGORITHM=FastDiffuser \
+JSON_MODEL_OVERRIDE_ARGS= \
+BLOCK_SIZE=32 \
+MAX_STEPS=32 \
+SBATCH_JOB_NAME=<name>_step_N_sglang_fd_b32 \
+./eval_3b_checkpoint.sh --sbatch
 ```
-
-If `configuration_ministral_dlm.py` or `modeling_ministral_dlm.py` is a symlink, either copy the real files into the HF checkpoint directory or use a `basefiles`/non-symlink checkpoint copy. Broken container-visible symlinks show up as missing remote-code files during model load.
-
-NemoSkills eval notes:
-
-- `SERVER_ENGINE=nemotron` corresponds to the diffusion/Nemotron server path; `SERVER_ENGINE=ar_native` corresponds to native AR decoding.
-- `SEQ_EVAL_GENERATION_ALGORITHM` must match the intended server-side mode (`nemotron` or `ar_native`) so the OpenAI-compatible request body carries the right extra fields.
-- `SEQ_EVAL_TOKENS_TO_GENERATE` is the maximum generated length. For GSM8K, `1024` is the usual setting used in these runs.
-- `SEQ_EVAL_STEPS=1024` was used for full diffusion-style Nemotron decoding; `SEQ_EVAL_STEPS=64` was used for AR-native NemoSkills evals.
-- The generated command script is saved as `${SEQ_EVAL_OUTPUT_DIR}/.gpu_only_cmd_*.sh`; use that file as the source of truth for rerunning an exact completed eval.
-- The server worker logs are saved under `${SEQ_EVAL_OUTPUT_DIR}/worker_logs`.
 
 ## Notes
 
-- `STEP_DIR` must point at a checkpoint step directory containing `config.yaml` and `policy/weights/iter_0000000`.
-- `OUT` is the converted HF model directory passed later as `MODEL`.
-- `eval_3b_checkpoint.sh` accepts `MODEL`, `OUTDIR`, and `BENCHMARK` as environment variables.
-- `BENCHMARK` values: `gsm8k` (default) or `math` (= the HuggingFaceH4/MATH-500 test set). Anything else fails fast.
-- `MAX_TOKENS` defaults: 1024 for GSM8K, 2048 for MATH500. MATH500 solutions are longer; override with `MAX_TOKENS=...` if needed.
-- The Slurm job name defaults to `eval_3b_instruct_${BENCHMARK}`; override with `SBATCH_JOB_NAME=...`.
-- The underlying evaluator is `benchmark/gsm8k/eval_sglang.py` in the SGLang fork, which dispatches on `--benchmark gsm8k|math`.
-- For diffusion-style evaluation, the converted HF checkpoint should use a diffusion-compatible HF template/base model and the eval script should run with its diffusion settings. The default decoding mode is FastDiffuser regardless of how the checkpoint was trained — see [[feedback-eval-decoding-mode]].
-
-## MATH500 dataset prefetch (one-time)
-
-The container runs with `HF_HUB_OFFLINE=1`, so `HuggingFaceH4/MATH-500` must be in the shared HF cache before the first MATH500 eval. From the login node:
-
-```bash
-HF_HOME=/lustre/fsw/portfolios/coreai/users/snorouzi/hf_home \
-HF_TOKEN=$(cat ~/hf_token.txt) \
-/lustre/fsw/portfolios/coreai/users/snorouzi/sglang_nemotron_torch291_cu129_uvpy312_venv/bin/python \
-  -c "from datasets import load_dataset; load_dataset('HuggingFaceH4/MATH-500', split='test')"
-```
-
-Cache persists across runs; only needed once per dataset. `openai/gsm8k` is already cached.
+- `STEP_DIR` is the raw NeMo-RL Megatron checkpoint step directory.
+- `OUT` is the converted Hugging Face checkpoint directory created by `convert_checkpoint.sh`.
+- `SERVER_MODEL_PATH` for NemoSkills evaluation must point to `OUT`, not to the raw `step_N` directory.
+- For NemoSkills, prefer the `/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/snorouzi/...` canonical path over the shorter `/lustre/fsw/portfolios/coreai/users/snorouzi/...` path for model, tokenizer, and output directories.
+- If a converted checkpoint exists under `/lustre/fsw/portfolios/coreai/users/snorouzi/checkpoints/...`, resolve its canonical path with `readlink -f <checkpoint_dir>` and use that `/lustre/fs1/...` result for `SERVER_MODEL_PATH`.
+- `SERVER_TOKENIZER` should point to the 3B base checkpoint/tokenizer path: `/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/snorouzi/checkpoints/Nemotron-Labs-Diffusion-3B`.
+- Keep conversion and evaluation output directories separate.
+- Keep output directories separate across block lengths, decoding modes, and benchmark variants.
+- For AR-native NemoSkills eval, use `SERVER_ENGINE=ar_native`, `SEQ_EVAL_GENERATION_ALGORITHM=ar_native`, and `SEQ_EVAL_BLOCK_LENGTH=1`.
+- Do not use `SERVER_ENGINE=hf` / `SEQ_EVAL_GENERATION_ALGORITHM=ar` by default; that Hugging Face AR path patches `config.json` in place.
+- NemoSkills writes a generated `.gpu_only_cmd_*.sh` script into `SEQ_EVAL_OUTPUT_DIR`; use it as the source of truth for rerunning an exact completed eval.
+- The NemoSkills server worker logs are saved under `${SEQ_EVAL_OUTPUT_DIR}/worker_logs`.
+- GSM8K uses `SEQ_EVAL_TOKENS_TO_GENERATE=1024` in the default command above.
+- If using the optional SGLang fallback, set `SGLANG_COMMIT` to the actual checked-out SGLang commit and use `JSON_MODEL_OVERRIDE_ARGS=` with FastDiffuser so the wrapper does not inject AR mode.
