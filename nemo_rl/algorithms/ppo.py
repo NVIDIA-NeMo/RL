@@ -118,14 +118,18 @@ class AsyncPPOConfig(TypedDict):
 
 
 class AdvEstimatorConfig(TypedDict):
-    """Configuration for advantage estimator (GRPO or Reinforce++)."""
+    """Configuration for PPO advantage estimator (GAE or raw_reward)."""
 
-    name: str  # "grpo" or "reinforce_plus_plus"
-    # GRPO specific
-    normalize_rewards: NotRequired[bool]
-    use_leave_one_out_baseline: NotRequired[bool]
-    # Reinforce++ specific
-    minus_baseline: NotRequired[bool]
+    name: str  # "gae" or "raw_reward"
+    # GAE-specific (only used when name="gae")
+    gae_lambda: NotRequired[float]
+    gae_gamma: NotRequired[float]
+    normalize_advantages: NotRequired[bool]
+    # VAPO decoupled GAE (None = standard GAE, no decoupling)
+    gae_lambda_value: NotRequired[Optional[float]]
+    gae_lambda_policy: NotRequired[Optional[float]]
+    # Length-adaptive λ_policy = 1 - 1/(α·l). 0 = disabled.
+    length_adaptive_alpha: NotRequired[float]
 
 
 class PPOConfig(TypedDict):
@@ -227,6 +231,7 @@ def setup(
     StatefulDataLoader,
     Optional[StatefulDataLoader],
     ClippedPGLossFn,
+    MseValueLossFn,
     Logger,
     CheckpointManager,
     PPOSaveState,
@@ -235,7 +240,9 @@ def setup(
     """Main entry point for running PPO algorithm.
 
     Returns:
-        tuple of policy, cluster, dataloader, tokenizer, loss_fn, math_env, logger, master_config, val_dataloader
+        tuple of (policy, policy_generation, value_model, clusters,
+        dataloader, val_dataloader, loss_fn, value_loss_fn, logger,
+        checkpointer, ppo_save_state, master_config).
     """
     # Start timing the entire setup process
     setup_start_time = time.perf_counter()
@@ -521,20 +528,32 @@ def setup(
         weights_path = None
         optimizer_path = None
 
+    # train_iters is the total scheduler-tick budget. Each Megatron worker
+    # ticks once per train() call (matching upstream main's per-rollout
+    # convention), and PPO calls each worker's train() `steps_per_epoch` times
+    # per outer step. So total ticks = (outer steps) * steps_per_epoch.
+    # Scale train_iters accordingly so the configured warmup/decay horizon
+    # matches the actual scheduler-step count.
+    steps_per_epoch = ppo_config["steps_per_epoch"]
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
-        ## NOTE: this is equal to the total number of scheduler steps
-        total_train_iters = min(
-            ppo_config.get("max_num_steps", 10**9),
-            ppo_config["max_num_epochs"] * len(dataloader),
+        total_train_iters = (
+            min(
+                ppo_config.get("max_num_steps", 10**9),
+                ppo_config["max_num_epochs"] * len(dataloader),
+            )
+            * steps_per_epoch
         )
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
     if value_config is not None and value_config.get("megatron_cfg", {}).get(
         "enabled", False
     ):
-        total_train_iters = min(
-            ppo_config.get("max_num_steps", 10**9),
-            ppo_config["max_num_epochs"] * len(dataloader),
+        total_train_iters = (
+            min(
+                ppo_config.get("max_num_steps", 10**9),
+                ppo_config["max_num_epochs"] * len(dataloader),
+            )
+            * steps_per_epoch
         )
         value_config["megatron_cfg"]["train_iters"] = total_train_iters
 
@@ -556,10 +575,27 @@ def setup(
     def init_value():
         """Initialize value model training workers."""
         t0 = time.perf_counter()
-        # Prepare checkpoint paths for value model
+        # Prepare checkpoint paths for value model. Mirror the policy's
+        # .exists() probe (see weights_path/optimizer_path resolution above):
+        # the previous run may not have had a value model, so the value sub-
+        # directory of last_checkpoint_path may be missing.
         if last_checkpoint_path:
-            value_weights_path = Path(last_checkpoint_path) / "value" / "weights"
-            value_optimizer_path = Path(last_checkpoint_path) / "value" / "optimizer"
+            _value_weights = Path(last_checkpoint_path) / "value" / "weights"
+            _value_optim = Path(last_checkpoint_path) / "value" / "optimizer"
+            value_weights_path = _value_weights if _value_weights.exists() else None
+            value_optimizer_path = _value_optim if _value_optim.exists() else None
+            if value_weights_path is None:
+                print(
+                    f"  ⚠ Value weights not found in checkpoint {last_checkpoint_path} "
+                    f"(likely the previous run didn't have a value model). "
+                    f"Initializing value model from base weights.",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"  ✓ Resuming value from checkpoint: {value_weights_path}",
+                    flush=True,
+                )
         else:
             value_weights_path = None
             value_optimizer_path = None
@@ -1448,7 +1484,6 @@ def ppo_train(
                         prompt_ids=prompt_ids_for_adv,
                         rewards=train_data["rewards"],
                         mask=train_data["token_mask"],
-                        lengths=input_lengths,
                         reference_logprobs=train_data.get("reference_policy_logprobs"),
                         logprobs=train_data["prev_logprobs"],
                     )

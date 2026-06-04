@@ -394,7 +394,7 @@ class Value(ValueInterface):
         futures = self.worker_group.run_all_workers_single_data("prepare_for_inference")
         ray.get(futures)
 
-    def finish_inference(self, *args: Any, **kwargs: Any) -> None:
+    def finish_inference(self) -> None:
         """Offload value model to CPU after inference."""
         futures = self.worker_group.run_all_workers_single_data("finish_inference")
         ray.get(futures)

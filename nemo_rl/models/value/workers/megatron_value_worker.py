@@ -242,17 +242,10 @@ def forward_step_value(
         # This must match the shift in get_values_impl so that the training targets
         # (returns, old_values) computed from inference values are aligned.
         values = torch.cat([torch.zeros_like(values[:, :1]), values[:, :-1]], dim=1)
-        # Replace output_tensor with values for loss computation.
-        # Include the original output_layer weight with a zero contribution so
-        # that it receives a gradient during backward. Megatron DDP with
-        # overlap_grad_reduce=True requires every registered parameter to
-        # produce a gradient for bucket sync; without this the output_layer
-        # weight has no grad and finish_grad_sync() raises an AssertionError.
-        if (
-            original_output_layer is not None
-            and original_output_layer.weight is not None
-        ):
-            values = values + 0.0 * original_output_layer.weight.view(-1)[0]
+        # Replace output_tensor with values for loss computation. The
+        # output_layer is frozen via the _freeze_output_layer pre-DDP-wrap
+        # hook (see init below), so it is excluded from grad buckets and
+        # no zero-grad placeholder is needed here.
         output_tensor = values
     else:
         # On non-last PP stages, output_layer doesn't exist.
@@ -706,9 +699,20 @@ class MegatronValueWorker(AbstractPolicyWorker):
                 all_mb_metrics.extend(gb_loss_metrics)
                 losses.append(torch.tensor(mb_losses).sum().item())
 
-                if not eval_mode:
-                    # step LR scheduler after every optimizer step
-                    self.scheduler.step(increment=gbs)
+            if not eval_mode:
+                # Step LR scheduler once per train() call, not per global batch.
+                # Megatron's OptimizerParamScheduler.step takes an `increment` in
+                # samples: NeMo init scales lr_warmup_steps by gbs internally, so
+                # passing increment=gbs cancels that scaling and one tick == one
+                # train() call regardless of batch size.
+                self.scheduler.step(increment=gbs)
+                # Value head has its own torch.optim.AdamW with no scheduler
+                # attached; mirror the backbone LR onto it so the head decays /
+                # warms up in lockstep instead of holding at peak LR forever.
+                if hasattr(self, "value_head_optimizer"):
+                    backbone_lr = self.optimizer.param_groups[0]["lr"]
+                    for pg in self.value_head_optimizer.param_groups:
+                        pg["lr"] = backbone_lr
 
         # Aggregate metrics
         mb_metrics = defaultdict(list)
@@ -1107,7 +1111,7 @@ class MegatronValueWorker(AbstractPolicyWorker):
             "Loading checkpoints outside of init is not yet implemented for MegatronValueWorker."
         )
 
-    def finish_inference(self, *args: Any, **kwargs: Any) -> None:
+    def finish_inference(self) -> None:
         """Offload model params to CPU after inference."""
         self.model = self.move_model(
             self.model, "cpu", move_params=True, move_grads=False

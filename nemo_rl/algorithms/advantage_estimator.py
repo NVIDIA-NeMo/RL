@@ -287,19 +287,20 @@ class GeneralizedAdvantageEstimator:
     """
 
     def __init__(self, estimator_config: dict, loss_config: dict):
-        self.gae_lambda = estimator_config.get("gae_lambda", 0.95)
-        self.gae_gamma = estimator_config.get("gae_gamma", 0.99)
-        self.normalize_advantages = estimator_config.get("normalize_advantages", True)
+        self.gae_lambda = estimator_config["gae_lambda"]
+        self.gae_gamma = estimator_config["gae_gamma"]
+        self.normalize_advantages = estimator_config["normalize_advantages"]
 
         # VAPO decoupled GAE: separate λ for value returns vs policy advantages.
-        # Defaults to gae_lambda for both (standard GAE, no decoupling).
+        # None for both = standard GAE (use gae_lambda everywhere, no decoupling).
         self.gae_lambda_value = estimator_config.get("gae_lambda_value", None)
         self.gae_lambda_policy = estimator_config.get("gae_lambda_policy", None)
-        # Length-adaptive λ_policy = 1 - 1/(α·l).  0 = disabled (use fixed λ).
-        self.length_adaptive_alpha = estimator_config.get("length_adaptive_alpha", 0.0)
+        # Length-adaptive λ_policy = 1 - 1/(α·l). 0 = disabled (use fixed λ).
+        self.length_adaptive_alpha = estimator_config["length_adaptive_alpha"]
 
-        self.kl_coef = getattr(loss_config, "reference_policy_kl_penalty", 0.1)
-        self.kl_type = getattr(loss_config, "reference_policy_kl_type", "k1")
+        self.use_kl_in_reward = loss_config.use_kl_in_reward
+        self.kl_coef = loss_config.reference_policy_kl_penalty
+        self.kl_type = loss_config.reference_policy_kl_type
 
     def _reward_whiten(
         self,
@@ -319,7 +320,6 @@ class GeneralizedAdvantageEstimator:
     def _build_token_level_rewards(
         self,
         rewards: torch.Tensor,
-        lengths: torch.Tensor,
         mask: torch.Tensor,
         logprobs: torch.Tensor | None = None,
         reference_logprobs: torch.Tensor | None = None,
@@ -331,7 +331,6 @@ class GeneralizedAdvantageEstimator:
 
         Args:
             rewards: Scalar reward per sample, shape [batch_size].
-            lengths: Total sequence lengths, shape [batch_size].
             mask: Response token mask, shape [batch_size, seq_len].
             logprobs: Current policy log probs, shape [batch_size, seq_len].
             reference_logprobs: Reference policy log probs, shape [batch_size, seq_len].
@@ -344,15 +343,21 @@ class GeneralizedAdvantageEstimator:
             rewards.shape[0], seq_len, device=rewards.device, dtype=rewards.dtype
         )
 
-        # Apply KL penalty at every response token
-        if self.kl_coef > 0 and logprobs is not None and reference_logprobs is not None:
+        # Apply KL penalty at every response token (gated by use_kl_in_reward).
+        if (
+            self.use_kl_in_reward
+            and self.kl_coef > 0
+            and logprobs is not None
+            and reference_logprobs is not None
+        ):
             kl = calculate_kl(logprobs, reference_logprobs, self.kl_type)
             token_level_rewards = token_level_rewards - self.kl_coef * kl
 
-        # Place terminal reward at last response token (last mask=1 position)
-        # for each sample. Using mask instead of lengths ensures the reward
-        # lands on an assistant token even in multi-turn scenarios where the
-        # sequence may end with a non-assistant message.
+        # Place terminal reward at the last response token (last mask=1
+        # position) for each sample. Using mask (not a separate `lengths`
+        # tensor) ensures the reward lands on an assistant token even in
+        # multi-turn scenarios where the sequence may end with a non-assistant
+        # message.
         last_response_idx = mask.shape[1] - 1 - mask.fliplr().argmax(dim=1)
         has_response = mask.any(dim=1)
         token_level_rewards[has_response, last_response_idx[has_response]] += rewards[
@@ -391,7 +396,6 @@ class GeneralizedAdvantageEstimator:
         prompt_ids,
         rewards,
         mask,
-        lengths,
         values,
         reference_logprobs=None,
         logprobs=None,
@@ -411,7 +415,6 @@ class GeneralizedAdvantageEstimator:
         """
         token_level_rewards = self._build_token_level_rewards(
             rewards,
-            lengths,
             mask,
             logprobs,
             reference_logprobs,

@@ -48,4 +48,8 @@ uv run tests/check_metrics.py $JSON_METRICS \
     'min(data["train/probs_ratio_clamped_min"]) > 0.79' \
     'max(data["train/probs_ratio_clamped_min"]) < 1.21' \
     'min(data["train/probs_ratio_clamped_max"]) > 0.79' \
-    'max(data["train/probs_ratio_clamped_max"]) < 1.29'
+    'max(data["train/probs_ratio_clamped_max"]) < 1.29' \
+    'max(data["train/critic/loss"]) < float("inf")' \
+    'min(data["train/critic/loss"]) >= 0' \
+    'max(data["train/critic/explained_var"]) <= 1.0001' \
+    'max(data["train/critic/grad_norm"]) < float("inf")'

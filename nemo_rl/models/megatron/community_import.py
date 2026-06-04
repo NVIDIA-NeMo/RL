@@ -199,22 +199,40 @@ def export_model_from_megatron(
 def extract_value_head_from_hf_checkpoint(
     hf_model_path: str,
 ) -> dict[str, torch.Tensor]:
-    """Extract value head weights (score.*) from an HF checkpoint.
+    """Extract value head weights (score.*) from a local HF checkpoint directory.
 
     Supports both safetensors and pytorch_model.bin formats.
 
+    Note:
+        Unlike most other ``config["model_name"]`` consumers in NeMo-RL (which
+        go through HF ``from_pretrained`` and transparently handle hub IDs),
+        this function reads files directly off disk via ``Path.glob`` and only
+        accepts a local checkpoint directory. If you want to initialize the
+        value head from a hub-only model, run
+        ``huggingface_hub.snapshot_download(repo_id=...)`` first and pass the
+        resulting local directory.
+
     Args:
-        hf_model_path: Path to a HuggingFace checkpoint directory.
+        hf_model_path: Path to a local HuggingFace checkpoint directory.
 
     Returns:
         Dict mapping score key names to tensors, e.g.
         {"score.weight": tensor, "score.bias": tensor}.
 
     Raises:
-        FileNotFoundError: If no checkpoint files are found.
+        ValueError: If ``hf_model_path`` is not an existing local directory.
+        FileNotFoundError: If the directory exists but contains no checkpoint files.
         ValueError: If no score.* keys are found in the checkpoint.
     """
     model_path = Path(hf_model_path)
+    if not model_path.is_dir():
+        raise ValueError(
+            f"extract_value_head_from_hf_checkpoint requires a local checkpoint "
+            f"directory; got '{hf_model_path}'. If this is an HF Hub ID, "
+            f"snapshot_download it locally first and pass the resulting path. "
+            f"(Other 'model_name' consumers in NeMo-RL accept hub IDs, but this "
+            f"helper reads files directly off disk.)"
+        )
     score_weights: dict[str, torch.Tensor] = {}
 
     # Try safetensors first

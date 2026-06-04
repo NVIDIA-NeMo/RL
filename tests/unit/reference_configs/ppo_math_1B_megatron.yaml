@@ -36,9 +36,6 @@ ppo:
     gae_lambda: 0.95
     gae_gamma: 1
     normalize_advantages: true
-    normalize_rewards: true
-    use_leave_one_out_baseline: false
-    minus_baseline: true
     # VAPO decoupled GAE (arXiv:2504.05118): separate λ for value vs policy.
     # null = use gae_lambda for both (standard GAE, no decoupling).
     gae_lambda_value: null   # VAPO: 1.0 (MC-like unbiased value returns)

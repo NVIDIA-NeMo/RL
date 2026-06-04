@@ -1138,10 +1138,14 @@ class MseValueLossFn(LossFunction):
             ).item()
         else:
             loss = torch.nn.functional.mse_loss(values, returns, reduction="none")
-            loss = self.scale * masked_mean(
-                loss,
-                mask,
-                global_normalization_factor=global_valid_toks,
+            loss = (
+                0.5
+                * self.scale
+                * masked_mean(
+                    loss,
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                )
             )
             vf_clipfrac = 0.0
 
