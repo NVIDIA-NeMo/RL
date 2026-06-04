@@ -25,8 +25,8 @@ columns, computes advantages, and writes that small derived column back to
 DataPlane. Model tensors still move through DataPlane or NCCL.
 
 Data flow:
-  _rollout_pump  → gen.generate_and_push(prompt, dp_client) ← RPC to GenWorker
-                     GenWorker → dp_client.put_samples(...)
+  _rollout_pump  → rollout_manager.generate_and_push(prompt)
+                     RolloutManager runs run_rollout locally then dp_client.put_samples(...)
   _train_pump    → dp_client.claim_meta(...) → StalenessSampler
                  → _advantage_pump(meta) → dp_client.get_samples(...)
                                         → adv_estimator.compute_advantage(...)
@@ -55,6 +55,7 @@ from nemo_rl.algorithms.staleness_sampler import (
     min_weight_version,
 )
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.experience.rollout_manager import RolloutManager
 
 log = logging.getLogger(__name__)
 
@@ -127,8 +128,8 @@ class SingleControllerActor:
         cfg: SingleControllerConfig,
         prompts: list[str],
         dp_client_handle: Any,
-        gen_handle: Any,
         trainer_handle: Any,
+        rollout_manager: RolloutManager,
         weight_synchronizer: Any,
         advantage_estimator: Any | None = None,
     ) -> None:
@@ -142,8 +143,8 @@ class SingleControllerActor:
         self._cfg = cfg
         self._prompts = prompts
         self._dp_client = dp_client_handle
-        self._gen = gen_handle
         self._trainer = trainer_handle
+        self._rollout_manager = rollout_manager
         self._weight_synchronizer = weight_synchronizer
         self._advantage_estimator = advantage_estimator
 
@@ -278,8 +279,8 @@ class SingleControllerActor:
         Flow per prompt:
           1. Acquire _buffer_capacity slot (backpressure)
           2. Wait for _rollout_permitted (paused during weight sync)
-          3. Call gen.generate_and_push(prompt, dp_client) — RPC to GenWorker
-             GenWorker generates and calls DataPlane put_samples directly
+          3. Call rollout_manager.generate_and_push(prompt) — local async
+             RolloutManager runs rollout and calls DataPlane put_samples directly
           4. Decrement _inflight_rollouts
         """
         n = self._cfg.max_rollout_prompts
@@ -294,9 +295,7 @@ class SingleControllerActor:
             async with sem:
                 self._inflight_rollouts += 1
                 try:
-                    await self._ray_get(
-                        self._gen.generate_and_push.remote(prompt, self._dp_client)
-                    )
+                    await self._rollout_manager.generate_and_push(prompt)
                     if self._cfg.diagnostics:
                         log.info("  rollout done for prompt='%s...'", prompt[:20])
                 finally:
