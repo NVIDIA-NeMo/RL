@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import re
 import traceback
 from typing import Any
 
@@ -49,6 +50,16 @@ def fix_gpt_oss_export_transpose(key: str, weight: torch.Tensor) -> torch.Tensor
     if key.endswith("mlp.experts.down_proj"):
         weight = weight.transpose(-2, -1).contiguous()
     return weight
+
+
+def fix_gemma3_vision_weight_name(key: str) -> str:
+    """Re-insert the `vision_model` segment into Gemma3 vision-tower weights.
+
+    When performing refit, the vision-tower weight paths are flattened. This unflattens them.
+    """
+    return re.sub(
+        r"vision_tower\.(?!vision_model\.)", "vision_tower.vision_model.", key
+    )
 
 
 class VllmInternalWorkerExtension:
@@ -229,6 +240,13 @@ class VllmInternalWorkerExtension:
             for idx, (key, weight) in enumerate(weights):
                 weight = fix_gpt_oss_export_transpose(key, weight)
                 weights[idx] = (key, weight)
+
+        if (
+            "Gemma3ForConditionalGeneration"
+            in self.model_runner.vllm_config.model_config.architectures
+        ):
+            for idx, (key, weight) in enumerate(weights):
+                weights[idx] = (fix_gemma3_vision_weight_name(key), weight)
 
         policy_weights, draft_weights = self._split_policy_and_draft_weights(weights)
         if fp8.is_fp8_model(self.model_runner.vllm_config):
