@@ -1985,9 +1985,13 @@ def grpo_train(
                     clip_low = master_config.grpo.get("advantage_clip_low", None)
                     clip_high = master_config.grpo.get("advantage_clip_high", None)
                     if clip_low is not None:
-                        train_data["advantages"] = train_data["advantages"].clamp(min=clip_low)
+                        train_data["advantages"] = train_data["advantages"].clamp(
+                            min=clip_low
+                        )
                     if clip_high is not None:
-                        train_data["advantages"] = train_data["advantages"].clamp(max=clip_high)
+                        train_data["advantages"] = train_data["advantages"].clamp(
+                            max=clip_high
+                        )
 
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
                 print("▶ Preparing for training...", flush=True)
@@ -2971,7 +2975,9 @@ def async_grpo_train(
                 with timer.time("data_processing"):
                     # Apply overlong filtering - mask out truncated sequences from loss computation
                     with timer.time("overlong_filter"):
-                        use_overlong_filtering = master_config.grpo.get("overlong_filtering", False)
+                        use_overlong_filtering = master_config.grpo.get(
+                            "overlong_filtering", False
+                        )
                         if use_overlong_filtering:
                             loss_multiplier = repeated_batch["loss_multiplier"].clone()
                             truncated = repeated_batch["truncated"]
@@ -3119,9 +3125,13 @@ def async_grpo_train(
                     clip_low = master_config.grpo.get("advantage_clip_low", None)
                     clip_high = master_config.grpo.get("advantage_clip_high", None)
                     if clip_low is not None:
-                        train_data["advantages"] = train_data["advantages"].clamp(min=clip_low)
+                        train_data["advantages"] = train_data["advantages"].clamp(
+                            min=clip_low
+                        )
                     if clip_high is not None:
-                        train_data["advantages"] = train_data["advantages"].clamp(max=clip_high)
+                        train_data["advantages"] = train_data["advantages"].clamp(
+                            max=clip_high
+                        )
 
                 print("▶ Preparing for training...")
                 with timer.time("training_prep"):
