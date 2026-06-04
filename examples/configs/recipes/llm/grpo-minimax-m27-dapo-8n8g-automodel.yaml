@@ -32,7 +32,7 @@ loss_fn:
   ratio_clip_c: 10
   token_level_loss: true
 checkpointing:
-  checkpoint_dir: results/dapo-B32N16-8k-ONPOLICY-LR1E-6-EP128-automodel-16n8g-VLLMFP8
+  checkpoint_dir: results/dapo-B32N16-8k-OFFPOLICY-LR2E-6-EP64-automodel-8n8g-VLLMFP8
   keep_top_k: 2
   save_period: 5
   checkpoint_must_save_by: "00:03:45:00"
@@ -40,23 +40,30 @@ policy:
   model_name: MiniMaxAI/MiniMax-M2.7
   hf_config_overrides:
     router_aux_loss_coef: 0
-  train_global_batch_size: 512
+  train_global_batch_size: 64
   train_micro_batch_size: 1
   logprob_batch_size: 1
   max_total_sequence_length: 10240
   logprob_chunk_size: 2048
   offload_optimizer_for_logprob: true
   optimizer:
-    name: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
     kwargs:
-      lr: 1.0e-06
+      lr: 2.0e-06
       weight_decay: 0.1
-      master_weights: true
-      store_param_remainders: true
-      exp_avg_dtype: torch.bfloat16
-      exp_avg_sq_dtype: torch.bfloat16
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 1.0e-08
+      end_factor: 1.0
+      total_iters: 5
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones:
+    - 5
   dtensor_cfg:
-    expert_parallel_size: 128
+    expert_parallel_size: 64
     activation_checkpointing: true
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
@@ -66,8 +73,7 @@ policy:
         attn: te
         linear: te
         rms_norm: te
-        experts: torch_mm
-        dispatcher: deepep
+        enable_deepep: true
         fake_balanced_gate: false
         rope_fusion: false
         enable_hf_state_dict_adapter: true
@@ -101,7 +107,7 @@ logger:
   tensorboard_enabled: false
   wandb:
     project: nemo-rl
-    name: dapo-B32N16-8k-ONPOLICY-LR1E-6-EP128-automodel-16n8g-VLLMFP8
+    name: dapo-B32N16-8k-OFFPOLICY-LR2E-6-EP64-automodel-8n8g-VLLMFP8
 cluster:
   gpus_per_node: 8
-  num_nodes: 16
+  num_nodes: 8
