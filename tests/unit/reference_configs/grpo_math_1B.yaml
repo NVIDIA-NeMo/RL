@@ -278,6 +278,8 @@ policy:
     - milestones: [50]
 
   generation:
+    port_range_low: 11001
+    port_range_high: 15000
     backend: "vllm"
     max_new_tokens: ${policy.max_total_sequence_length}
     temperature: 1.0
@@ -404,6 +406,8 @@ logger:
 cluster:
   gpus_per_node: 1
   num_nodes: 1
+  master_port_range_low: 25000
+  master_port_range_high: 28000
 
 # TransferQueue-mediated data plane for sync GRPO.
 # Off by default — the legacy grpo_train trainer never engages this.
