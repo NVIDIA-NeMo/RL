@@ -59,13 +59,13 @@ COPY --from=nemo-rl uv.lock /tmp/uv.lock
 
 RUN <<"EOF" bash -exu
 echo "Building vLLM from source for PyTorch base image"
-VLLM_VERSION=$(grep -A 1 '^name = "vllm"' /tmp/uv.lock | grep '^version =' | head -n1 | sed 's/version = "\(.*\)"/\1/') && \
+VLLM_VERSION=$(grep -A 1 'name = "vllm"' /tmp/uv.lock | grep 'version =' | sed 's/version = "\(.*\)"/\1/') && \
 echo "Building vLLM version: $VLLM_VERSION"
 git clone https://github.com/vllm-project/vllm.git
 cd vllm
 git checkout v$VLLM_VERSION
 python use_existing_torch.py
-pip install -r requirements/build/cuda.txt
+pip install -r requirements/build.txt
 pip wheel --no-deps --no-build-isolation -v .
 EOF
 
@@ -89,10 +89,6 @@ ENV UV_NO_INSTALL_PACKAGES=${UV_NO_INSTALL_PACKAGES}
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
 # Ensure DeepEP is built for H100 and B200
 ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
-
-# Ensure HybridEP/DeepEP JIT compilation can find nvcc at runtime
-ENV CUDA_HOME=/usr/local/cuda
-
 
 # First copy only the dependency files
 COPY --from=nemo-rl pyproject.toml uv.lock ./
@@ -138,17 +134,6 @@ LABEL com.nvidia.build.id="${NVIDIA_BUILD_ID}"
 LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
 
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
-
-# AWS EFA OFI plugin discovery (p4d / p5 / p5en multi-node NCCL via SRD).
-# The host's aws-efa-installer places libnccl-net-ofi.so under
-# /opt/amazon/ofi-nccl/lib and libfabric under /opt/amazon/efa/lib. Without
-# these on the linker search path, NCCL silently falls back to its socket
-# transport. Register both via ld.so.conf.d (so `ldconfig` populates the cache
-# once host paths are mounted at runtime) and LD_LIBRARY_PATH (so NCCL's
-# dlopen resolves the plugin even before `ldconfig` is re-run).
-RUN printf '%s\n' /opt/amazon/ofi-nccl/lib /opt/amazon/efa/lib \
-        > /etc/ld.so.conf.d/aws-efa.conf
-ENV LD_LIBRARY_PATH="/opt/amazon/ofi-nccl/lib:/opt/amazon/efa/lib:${LD_LIBRARY_PATH}"
 
 # Copy in source from build context (defaults to cloned repo, can be overridden)
 COPY --from=nemo-rl . /opt/nemo-rl

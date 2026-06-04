@@ -149,6 +149,12 @@ class VllmGeneration(GenerationInterface):
 
         # It's necessary to set env_vars here to ensure that vllm non-leader workers also have these env_vars
         env_vars = {}
+        # vLLM 0.20 auto-selects the FlashInfer CUTLASS/TRTLLM fused-MoE backend for
+        # MoE models (e.g. Qwen3-30B-A3B). Those kernels produce incorrect outputs
+        # (0% accuracy / gibberish) for several Qwen3 MoE configs, see vLLM issues
+        # #34892, #37591, #37758. Force the reference Triton MoE backend instead.
+        env_vars["VLLM_USE_FLASHINFER_MOE_FP16"] = "0"
+        env_vars["VLLM_USE_FLASHINFER_MOE_FP8"] = "0"
         # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
         # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
         if not self.cfg["colocated"]["enabled"]:
