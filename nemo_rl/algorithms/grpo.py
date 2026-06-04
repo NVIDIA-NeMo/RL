@@ -2985,6 +2985,8 @@ def async_grpo_train(
                             "all_mb_metrics": {
                                 "global_valid_toks": [_valid_toks],
                                 "global_valid_seqs": [_valid_seqs],
+                                # consumed by the per-step "Generation KL Error" print
+                                "gen_kl_error": [0.0],
                             },
                         }
                     else:
