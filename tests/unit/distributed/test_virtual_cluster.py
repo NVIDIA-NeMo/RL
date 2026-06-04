@@ -21,8 +21,8 @@ import pytest
 import ray
 
 from nemo_rl.distributed.virtual_cluster import (
-    DEFAULT_PORT_RANGE_HIGH,
-    DEFAULT_PORT_RANGE_LOW,
+    DEFAULT_MASTER_PORT_RANGE_HIGH,
+    DEFAULT_MASTER_PORT_RANGE_LOW,
     PY_EXECUTABLES,
     RayVirtualCluster,
     ResourceInsufficientError,
@@ -293,7 +293,7 @@ class TestGetFreePortLocal:
 
     def test_returns_port_in_default_range(self):
         port = _get_free_port_local()
-        assert DEFAULT_PORT_RANGE_LOW <= port < DEFAULT_PORT_RANGE_HIGH
+        assert DEFAULT_MASTER_PORT_RANGE_LOW <= port < DEFAULT_MASTER_PORT_RANGE_HIGH
 
     def test_returns_port_in_custom_range(self):
         port = _get_free_port_local(port_range_low=13000, port_range_high=13100)
@@ -321,8 +321,8 @@ class TestRayVirtualClusterPortRange:
 
     def test_default_port_range(self):
         cluster = RayVirtualCluster(bundle_ct_per_node_list=[1])
-        assert cluster.port_range_low == DEFAULT_PORT_RANGE_LOW
-        assert cluster.port_range_high == DEFAULT_PORT_RANGE_HIGH
+        assert cluster.port_range_low == DEFAULT_MASTER_PORT_RANGE_LOW
+        assert cluster.port_range_high == DEFAULT_MASTER_PORT_RANGE_HIGH
 
     def test_custom_port_range(self):
         cluster = RayVirtualCluster(

@@ -105,9 +105,10 @@ class BaseVllmGenerationWorker:
 
             # Give each vLLM engine a deterministic starting port for TP/DP
             # rendezvous, outside the OS ephemeral range (32768-60999) and
-            # non-overlapping with NeMo RL (11001-15000) and Gym (15001-20000).
-            # vLLM's _get_open_port() reads VLLM_PORT and auto-increments on
-            # collision, so 100-port spacing per engine provides headroom.
+            # non-overlapping with other services.  See the port layout in
+            # virtual_cluster.py.  vLLM's _get_open_port() reads VLLM_PORT
+            # and auto-increments on collision, so 100-port spacing provides
+            # headroom.
             _VLLM_PORT_RANGE_LOW = 20001
             _VLLM_PORTS_PER_ENGINE = 100
             if len(local_bundle_indices) == 1:

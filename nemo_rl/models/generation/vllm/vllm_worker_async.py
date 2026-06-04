@@ -28,8 +28,8 @@ from fastapi import FastAPI
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
-    DEFAULT_PORT_RANGE_HIGH,
-    DEFAULT_PORT_RANGE_LOW,
+    DEFAULT_GENERATION_PORT_RANGE_HIGH,
+    DEFAULT_GENERATION_PORT_RANGE_LOW,
     _get_free_port_local,
     _get_node_ip_local,
 )
@@ -747,8 +747,12 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         ########################################
 
         node_ip = _get_node_ip_local()
-        port_range_low = self.cfg.get("port_range_low", DEFAULT_PORT_RANGE_LOW)
-        port_range_high = self.cfg.get("port_range_high", DEFAULT_PORT_RANGE_HIGH)
+        port_range_low = self.cfg.get(
+            "port_range_low", DEFAULT_GENERATION_PORT_RANGE_LOW
+        )
+        port_range_high = self.cfg.get(
+            "port_range_high", DEFAULT_GENERATION_PORT_RANGE_HIGH
+        )
         free_port = _get_free_port_local(port_range_low, port_range_high)
 
         base_url = f"http://{node_ip}:{free_port}/v1"

@@ -19,8 +19,8 @@ import torch
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.virtual_cluster import (
-    DEFAULT_PORT_RANGE_HIGH,
-    DEFAULT_PORT_RANGE_LOW,
+    DEFAULT_GYM_PORT_RANGE_HIGH,
+    DEFAULT_GYM_PORT_RANGE_LOW,
     _get_free_port_local,
     _get_node_ip_local,
 )
@@ -42,9 +42,9 @@ class NemoGym(EnvironmentInterface):
         self.cfg = cfg
 
         self.node_ip = _get_node_ip_local()
-        port_range_low = self.cfg.get("port_range_low", DEFAULT_PORT_RANGE_LOW)
-        port_range_high = self.cfg.get("port_range_high", DEFAULT_PORT_RANGE_HIGH)
-        self.head_server_port = _get_free_port_local(port_range_low, port_range_high)
+        _gym_port_low = self.cfg.get("port_range_low", DEFAULT_GYM_PORT_RANGE_LOW)
+        _gym_port_high = self.cfg.get("port_range_high", DEFAULT_GYM_PORT_RANGE_HIGH)
+        self.head_server_port = _get_free_port_local(_gym_port_low, _gym_port_high)
 
         from nemo_gym.cli import GlobalConfigDictParserConfig, RunHelper
         from nemo_gym.rollout_collection import RolloutCollectionHelper
@@ -68,14 +68,16 @@ class NemoGym(EnvironmentInterface):
         # their own loopback interface instead of the actor-hosted service.
         initial_global_config_dict.setdefault("default_host", self.node_ip)
 
-        # Gym servers default to 15001-20000 so they don't collide with NeMo RL
-        # master-address ports (11001-15000) or vLLM engine ports (20001+).
-        _gym_port_low = self.cfg.get("port_range_low", 15001)
-        _gym_port_high = self.cfg.get("port_range_high", 20000)
-        if _gym_port_low < 15001 or _gym_port_high > 20000:
+        _gym_port_low = self.cfg.get("port_range_low", DEFAULT_GYM_PORT_RANGE_LOW)
+        _gym_port_high = self.cfg.get("port_range_high", DEFAULT_GYM_PORT_RANGE_HIGH)
+        if (
+            _gym_port_low < DEFAULT_GYM_PORT_RANGE_LOW
+            or _gym_port_high > DEFAULT_GYM_PORT_RANGE_HIGH
+        ):
             print(
-                f"WARNING: Gym port range [{_gym_port_low}, {_gym_port_high}) overlaps "
-                f"with NeMo RL (11001-15000) or vLLM (20001+). Consider adjusting."
+                f"WARNING: Gym port range [{_gym_port_low}, {_gym_port_high}) is outside "
+                f"the default [{DEFAULT_GYM_PORT_RANGE_LOW}, {DEFAULT_GYM_PORT_RANGE_HIGH}). "
+                f"Check the port layout in virtual_cluster.py for conflicts."
             )
         initial_global_config_dict["port_range_low"] = _gym_port_low
         initial_global_config_dict["port_range_high"] = _gym_port_high

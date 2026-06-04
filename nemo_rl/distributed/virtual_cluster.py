@@ -16,7 +16,7 @@ import os
 import socket
 import sys
 import time
-from typing import Optional, TypedDict
+from typing import NotRequired, Optional, TypedDict
 
 import ray
 from ray.util.placement_group import (
@@ -34,6 +34,14 @@ logger = logging.getLogger(__name__)
 class ClusterConfig(TypedDict):
     gpus_per_node: int
     num_nodes: int
+    # Port range for the distributed master address (TCPStore / NCCL rendezvous)
+    # and per-worker available ports used by RayVirtualCluster.  These ports are
+    # kept below the OS ephemeral range (32768-60999 on stock Linux) to avoid
+    # TOCTOU collisions with kernel-assigned source ports.  When absent,
+    # RayVirtualCluster falls back to DEFAULT_MASTER_PORT_RANGE_LOW/HIGH
+    # (25000-28000).  See ray.sub for the full port layout.
+    master_port_range_low: NotRequired[int]
+    master_port_range_high: NotRequired[int]
 
 
 # Get the directory path of the current module and the root of the package
@@ -66,18 +74,26 @@ class PY_EXECUTABLES:
     SGLANG = f"uv run --locked --extra sglang --directory {git_root}"
 
 
-# Default port range for master address allocation.
-# We avoid the OS ephemeral range (typically 32768-60999 on Linux) because
-# those ports can be grabbed by unrelated processes between the time we
-# probe and the time the distributed framework actually binds.
-DEFAULT_PORT_RANGE_LOW = 11001
-DEFAULT_PORT_RANGE_HIGH = 15000
+# Default port ranges — kept below the OS ephemeral range (32768-60999 on
+# stock Linux) to avoid TOCTOU collisions.  See ray.sub for the full layout
+# including Ray's own GCS / worker gRPC ports.
+#
+#   11001-15000  vLLM / SGLang HTTP servers  (policy.generation.port_range_low/high)
+#   15001-20000  NeMo Gym HTTP servers       (env.nemo_gym.port_range_low/high)
+#   20001+       vLLM TP/DP rendezvous       (VLLM_PORT env var, 100-port spacing)
+#   25000-28000  Master address / TCPStore    (cluster.master_port_range_low/high)
+DEFAULT_GENERATION_PORT_RANGE_LOW = 11001
+DEFAULT_GENERATION_PORT_RANGE_HIGH = 15000
+DEFAULT_GYM_PORT_RANGE_LOW = 15001
+DEFAULT_GYM_PORT_RANGE_HIGH = 20000
+DEFAULT_MASTER_PORT_RANGE_LOW = 25000
+DEFAULT_MASTER_PORT_RANGE_HIGH = 28000
 
 
 @ray.remote  # pragma: no cover
 def _get_node_ip_and_free_port(
-    port_range_low: int = DEFAULT_PORT_RANGE_LOW,
-    port_range_high: int = DEFAULT_PORT_RANGE_HIGH,
+    port_range_low: int = DEFAULT_MASTER_PORT_RANGE_LOW,
+    port_range_high: int = DEFAULT_MASTER_PORT_RANGE_HIGH,
 ) -> tuple[str, int]:
     return _get_node_ip_local(), _get_free_port_local(port_range_low, port_range_high)
 
@@ -115,8 +131,8 @@ def _bind_socket_in_range(
 
 
 def _get_free_port_local(
-    port_range_low: int = DEFAULT_PORT_RANGE_LOW,
-    port_range_high: int = DEFAULT_PORT_RANGE_HIGH,
+    port_range_low: int = DEFAULT_MASTER_PORT_RANGE_LOW,
+    port_range_high: int = DEFAULT_MASTER_PORT_RANGE_HIGH,
 ) -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -248,8 +264,8 @@ class RayVirtualCluster:
         num_gpus_per_node: int = 8,
         name: str = "",
         placement_group_strategy: str = "SPREAD",
-        port_range_low: int = DEFAULT_PORT_RANGE_LOW,
-        port_range_high: int = DEFAULT_PORT_RANGE_HIGH,
+        port_range_low: Optional[int] = None,
+        port_range_high: Optional[int] = None,
     ):
         """Initialize a virtual cluster using Ray placement groups.
 
@@ -261,8 +277,10 @@ class RayVirtualCluster:
             num_gpus_per_node: Number of GPUs per node
             name: Name prefix for placement groups
             placement_group_strategy: Ray placement group strategy ("STRICT_PACK", "PACK", or "SPREAD")
-            port_range_low: Lower bound (inclusive) of the port range used for master address allocation
-            port_range_high: Upper bound (exclusive) of the port range used for master address allocation
+            port_range_low: Lower bound (inclusive) of the port range for master address allocation.
+                Falls back to DEFAULT_MASTER_PORT_RANGE_LOW if None.
+            port_range_high: Upper bound (exclusive) of the port range for master address allocation.
+                Falls back to DEFAULT_MASTER_PORT_RANGE_HIGH if None.
         """
         self._bundle_ct_per_node_list = bundle_ct_per_node_list
         self._world_size = sum(self._bundle_ct_per_node_list)
@@ -278,8 +296,16 @@ class RayVirtualCluster:
         self.max_colocated_worker_groups = max_colocated_worker_groups
         self.name = name
         self.placement_group_strategy = placement_group_strategy
-        self.port_range_low = port_range_low
-        self.port_range_high = port_range_high
+        self.port_range_low = (
+            port_range_low
+            if port_range_low is not None
+            else DEFAULT_MASTER_PORT_RANGE_LOW
+        )
+        self.port_range_high = (
+            port_range_high
+            if port_range_high is not None
+            else DEFAULT_MASTER_PORT_RANGE_HIGH
+        )
 
     def _init_placement_groups(
         self, strategy: str | None = None, use_unified_pg: bool = False

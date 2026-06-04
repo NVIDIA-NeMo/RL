@@ -180,8 +180,8 @@ policy:
   offload_optimizer_for_logprob: False
 
   generation:
-    # Port ranges for master address allocation, kept below the OS ephemeral
-    # range (32768-60999). See ray.sub for the full port layout.
+    # Port range for vLLM HTTP servers, kept below the OS ephemeral range.
+    # See ray.sub for the full port layout.
     port_range_low: 11001
     port_range_high: 15000
     backend: "vllm"
@@ -298,3 +298,5 @@ logger:
 cluster:
   gpus_per_node: 8
   num_nodes: 32
+  master_port_range_low: 25000
+  master_port_range_high: 28000

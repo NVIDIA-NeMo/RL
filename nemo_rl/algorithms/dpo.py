@@ -30,8 +30,6 @@ from nemo_rl.data.collate_fn import preference_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.distributed.virtual_cluster import (
-    DEFAULT_PORT_RANGE_HIGH,
-    DEFAULT_PORT_RANGE_LOW,
     ClusterConfig,
     RayVirtualCluster,
 )
@@ -228,7 +226,6 @@ def setup(
     #          Cluster
     # ==========================
     print("\n▶ Setting up compute cluster...")
-    generation_config = policy_config.get("generation", {})
     cluster = RayVirtualCluster(
         name="dpo_cluster",
         bundle_ct_per_node_list=[cluster_config["gpus_per_node"]]
@@ -236,10 +233,8 @@ def setup(
         use_gpus=True,
         num_gpus_per_node=cluster_config["gpus_per_node"],
         max_colocated_worker_groups=1,
-        port_range_low=generation_config.get("port_range_low", DEFAULT_PORT_RANGE_LOW),
-        port_range_high=generation_config.get(
-            "port_range_high", DEFAULT_PORT_RANGE_HIGH
-        ),
+        port_range_low=cluster_config.get("master_port_range_low"),
+        port_range_high=cluster_config.get("master_port_range_high"),
     )
     print(f"  ✓ Ray cluster initialized with {cluster_config['num_nodes']} nodes")
 
