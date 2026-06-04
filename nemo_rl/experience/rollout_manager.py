@@ -15,6 +15,7 @@
 import asyncio
 import copy
 import json
+import uuid
 from typing import Any, Optional
 
 import torch
@@ -22,6 +23,7 @@ from transformers import PreTrainedTokenizerBase
 from wandb import Table
 
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data_plane.column_io import kv_first_write
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
@@ -614,7 +616,7 @@ class AsyncNemoGymRolloutImpl:
 
 
 class RolloutManager:
-    """Factory that routes to AsyncRolloutImpl (native async) or AsyncNemoGymRolloutImpl (NeMo-Gym)."""
+    """Routes to AsyncRolloutImpl (native async) or AsyncNemoGymRolloutImpl (NeMo-Gym), and pushes results to TQ."""
 
     def __init__(
         self,
@@ -627,6 +629,8 @@ class RolloutManager:
         generation_config: Optional[GenerationConfig] = None,
         use_nemo_gym: bool = False,
         dp_client: Optional[Any] = None,
+        partition_id: str = "rollout_data",
+        task_name: str = "train",
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
@@ -654,12 +658,105 @@ class RolloutManager:
             policy_generation=policy_generation,  # type: ignore
             generation_config=generation_config,
         )
+        self._tokenizer = tokenizer
+        self._num_generations_per_prompt = num_generations_per_prompt
         self._dp_client = dp_client
+        self._partition_id = partition_id
+        self._task_name = task_name
+        self._weight_version: int = 0
+
+    def set_weight_version(self, version: int) -> None:
+        """Set the weight_version used for rollout tags.
+
+        Args:
+            version: Trainer weight version to stamp on future rollout tags.
+        """
+        self._weight_version = int(version)
 
     async def run_rollout(self, input_sample: DatumSpec) -> PromptGroupRecord:
         return await self._impl.run_rollout(input_sample)
 
     async def generate_and_push(self, input_sample: DatumSpec) -> None:
+        """Run one prompt's rollout and push the N completions to TQ in one put.
+
+        Args:
+            input_sample: A single prompt (one DatumSpec entry).
+        """
         assert self._dp_client is not None, (
             "generate_and_push requires dp_client to be set at __init__"
         )
+        record = await self.run_rollout(input_sample)
+        bulk_batch, tags, sample_ids = self._build_tq_payload(record)
+        kv_first_write(
+            bulk_batch,
+            sample_ids=sample_ids,
+            dp_client=self._dp_client,
+            partition_id=self._partition_id,
+            task_name=self._task_name,
+            tags=tags,
+        )
+
+    def _build_tq_payload(
+        self, record: PromptGroupRecord
+    ) -> tuple[BatchedDataDict[Any], list[dict[str, Any]], list[str]]:
+        """Build the bulk_batch, tags, and sample_ids that kv_first_write expects."""
+        # Lazy imports: grpo and llm_message_utils both transitively pull
+        # experience.rollouts, so importing at module top risks a cycle.
+        from nemo_rl.algorithms.grpo import (
+            add_grpo_token_loss_masks_and_generation_logprobs,
+            extract_initial_prompt_messages,
+        )
+        from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
+
+        completions = record.completions
+        n = len(completions)
+        assert n > 0, "PromptGroupRecord has no completions"
+
+        message_logs = [c.message_log for c in completions]
+        prompt_token_count = sum(len(m["token_ids"]) for m in record.prompt)
+        prompt_lengths = torch.full((n,), prompt_token_count, dtype=torch.long)
+
+        pad_id = int(getattr(self._tokenizer, "pad_token_id", 0) or 0)
+        pad_kwargs = {"pad_value_dict": {"token_ids": pad_id}}
+
+        prompt_message_logs = extract_initial_prompt_messages(
+            message_logs, prompt_lengths
+        )
+        prompt_flat, _ = batched_message_log_to_flat_message(
+            prompt_message_logs, **pad_kwargs
+        )
+
+        add_grpo_token_loss_masks_and_generation_logprobs(message_logs)
+        flat, input_lengths = batched_message_log_to_flat_message(
+            message_logs, **pad_kwargs
+        )
+
+        total_reward = torch.tensor(
+            [float(c.reward) for c in completions], dtype=torch.float32
+        )
+        sample_mask = torch.ones(n, dtype=torch.float32)
+
+        bulk_batch = BatchedDataDict[Any](
+            {
+                "input_ids": flat["token_ids"],
+                "input_lengths": input_lengths,
+                "generation_logprobs": flat["generation_logprobs"],
+                "token_mask": flat["token_loss_mask"],
+                "sample_mask": sample_mask,
+                "prompt_ids_for_adv": prompt_flat["token_ids"],
+                "total_reward": total_reward,
+            }
+        )
+
+        group_uuid = str(uuid.uuid4())
+        sample_ids = [f"{group_uuid}_g{i}" for i in range(n)]
+        tags = [
+            {
+                "group_id": group_uuid,
+                "weight_version": self._weight_version,
+                "committed": True,
+                "expected_num_samples": n,
+            }
+            for _ in range(n)
+        ]
+        return bulk_batch, tags, sample_ids
