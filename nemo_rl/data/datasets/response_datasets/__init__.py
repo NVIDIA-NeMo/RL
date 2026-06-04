@@ -14,7 +14,6 @@
 
 from nemo_rl.data import ResponseDatasetConfig
 from nemo_rl.data.datasets.response_datasets.aime24 import AIME2024Dataset
-from nemo_rl.data.datasets.utils import resolve_external_dataset_class
 from nemo_rl.data.datasets.response_datasets.avqa import AVQADataset
 from nemo_rl.data.datasets.response_datasets.clevr import CLEVRCoGenTDataset
 from nemo_rl.data.datasets.response_datasets.daily_omni import DailyOmniDataset
@@ -44,6 +43,7 @@ from nemo_rl.data.datasets.response_datasets.refcoco import RefCOCODataset
 from nemo_rl.data.datasets.response_datasets.response_dataset import ResponseDataset
 from nemo_rl.data.datasets.response_datasets.squad import SquadDataset
 from nemo_rl.data.datasets.response_datasets.tulu3 import Tulu3SftMixtureDataset
+from nemo_rl.data.datasets.utils import resolve_external_dataset_class
 
 DATASET_REGISTRY = {
     # built-in datasets
