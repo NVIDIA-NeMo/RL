@@ -11,6 +11,8 @@ grpo:
   val_at_start: false
   val_at_end: false
   overlong_filtering: false
+  advantage_clip_low: null
+  advantage_clip_high: null
   max_val_samples: 256
   val_batch_size: 256
   seed: 42
