@@ -1256,6 +1256,27 @@ class MegatronPolicyWorkerImpl(
                 model_name=self.cfg["model_name"],
                 dtype=str(self.dtype).removeprefix("torch."),
             )
+            # ---- Build the receiver-side sidecar context once. ----
+            # The receiver consumes:
+            #   * MegatronTransformerConfig — head counts + dims for QKV
+            #     un-interleave (modelexpress.megatron_translator
+            #     .SIDECAR_TRANSFORMER_CONFIG_KEY)
+            #   * Megatron→HF name map — per Megatron tensor name, the
+            #     list of HF param names it expands into (1 for column/
+            #     row/replicated/vocab_parallel, 3 for qkv_column, 2 for
+            #     gated_mlp_column, N for per_expert)
+            #     (modelexpress.megatron_translator.SIDECAR_HF_NAME_MAP_KEY)
+            #
+            # Both are derived once via a Bridge introspection pass (no
+            # weights actually transferred), then attached to the
+            # publisher so every publish() embeds them in the sidecar.
+            self._mx_megatron_sidecar = self._build_megatron_sidecar()
+            try:
+                self._mx_publisher.set_megatron_sidecar(self._mx_megatron_sidecar)
+            except AttributeError:
+                # Older modelexpress without the sidecar setter — stash for
+                # the alternate path that injects via add_tensor metadata.
+                pass
 
         # ---- Resolve attention head metadata for qkv_column descriptors. ----
         # Megatron-Core's transformer_config carries this; for non-mainline
@@ -1316,6 +1337,78 @@ class MegatronPolicyWorkerImpl(
         # ---- Publish + mark ready. ----
         self._mx_publisher.publish(version=int(version))
         self._mx_publisher.mark_ready()
+
+    def _build_megatron_sidecar(self) -> dict[str, Any]:
+        """One-shot at trainer init: serialize Megatron-Bridge introspection
+        results so receivers don't need a Bridge import.
+
+        Two pieces:
+          1. ``megatron_transformer_config`` — head counts + dims read
+             from the trainer's :class:`TransformerConfig`.
+          2. ``megatron_hf_name_map`` — list of
+             ``[megatron_param_name, [hf_name_1, hf_name_2, ...]]`` derived
+             from a Bridge introspection pass over the local model
+             (no weight transfer; just iterates the conversion-task list).
+
+        See :mod:`modelexpress.megatron_translator` for the receiver-side
+        ``SIDECAR_TRANSFORMER_CONFIG_KEY`` / ``SIDECAR_HF_NAME_MAP_KEY``
+        constants the receiver consumes.
+        """
+        sidecar: dict[str, Any] = {}
+
+        # --- transformer_config ---
+        tcfg = getattr(self.megatron_bridge, "transformer_config", None)
+        if tcfg is not None:
+            num_heads = getattr(tcfg, "num_attention_heads", None)
+            kv_groups = (
+                getattr(tcfg, "num_query_groups", None) or num_heads
+            )
+            kv_channels = getattr(tcfg, "kv_channels", None)
+            if kv_channels is None and num_heads:
+                kv_channels = getattr(tcfg, "hidden_size", 0) // num_heads
+            sidecar["megatron_transformer_config"] = {
+                "num_attention_heads": num_heads,
+                "num_query_groups": kv_groups,
+                "kv_channels": kv_channels,
+                "hidden_size": getattr(tcfg, "hidden_size", None),
+            }
+
+        # --- hf_name_map ---
+        # Walk the Bridge mapping registry to derive
+        # (megatron_local_name, [hf_name_1, hf_name_2, ...]). We use the
+        # registry's resolved tasks rather than calling
+        # ``export_hf_weights`` so we don't pay the gather/broadcast cost
+        # at startup. The receiver only needs the name pairings; head
+        # counts come from transformer_config.
+        try:
+            tasks = self.megatron_bridge.build_conversion_tasks([self.model])
+            name_map_entries: list[tuple[str, list[str]]] = []
+            for task in tasks:
+                m_name = task.global_param_name or task.param_name
+                # Each task's mapping declares 1 or more HF names. Resolve
+                # via the mapping's hf_param attribute (str or dict).
+                hf_attr = getattr(task.mapping, "hf_param", None)
+                if isinstance(hf_attr, str):
+                    hf_names = [hf_attr]
+                elif isinstance(hf_attr, dict):
+                    # Order matters for QKV: q, k, v. Bridge's QKVMapping
+                    # uses keys "q", "k", "v" — preserve that ordering.
+                    if set(hf_attr.keys()) == {"q", "k", "v"}:
+                        hf_names = [hf_attr["q"], hf_attr["k"], hf_attr["v"]]
+                    else:
+                        hf_names = list(hf_attr.values())
+                else:
+                    continue
+                name_map_entries.append((m_name, list(hf_names)))
+            sidecar["megatron_hf_name_map"] = name_map_entries
+        except Exception as exc:  # noqa: BLE001
+            warnings.warn(
+                f"stream_weights_via_mx: failed to build Megatron→HF name map "
+                f"via Bridge introspection ({exc!r}); receivers may need to "
+                f"derive names independently"
+            )
+
+        return sidecar
 
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)
