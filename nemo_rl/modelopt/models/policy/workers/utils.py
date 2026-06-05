@@ -175,7 +175,7 @@ def _is_mamba_provider(config) -> bool:
     return isinstance(config, MambaModelProvider)
 
 
-def quantization_layer_spec(config):
+def get_quantization_layer_spec(config):
     """Layer specification for quantization with ModelOpt.
 
     Routes mamba/hybrid configs to the mamba stack spec; otherwise falls back
@@ -193,9 +193,9 @@ def quantization_layer_spec(config):
             return transformer_engine_mamba_stack_spec()
         return transformer_engine_layer_spec(config)
     if _is_mamba_provider(config):
-        print("Using Mamba quantization_layer_spec")
+        print("Using Mamba ModelOpt quantization layer spec")
         return modelopt_mamba_stack_spec(config)
-    print("Using quantization_layer_spec without arbitrary attention mask")
+    print("Using ModelOpt quantization layer spec without arbitrary attention mask")
     return get_gpt_modelopt_spec(
         config=config,
         local_core_attention=False,
@@ -205,6 +205,6 @@ def quantization_layer_spec(config):
     )
 
 
-def get_quantization_layer_spec():
-    """Build the ModelOpt quantization layer-spec callback as a portable target."""
-    return quantization_layer_spec
+# Backward compatibility for QARL checkpoints serialized before the callback was
+# renamed to match the worker-facing API.
+quantization_layer_spec = get_quantization_layer_spec

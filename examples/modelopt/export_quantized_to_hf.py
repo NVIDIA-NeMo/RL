@@ -15,7 +15,9 @@
 """Wrapper around Megatron-Bridge's quantization/export.py for QARL checkpoints.
 
 QARL checkpoints written by ``MegatronQuantPolicyWorker`` store the layer-spec
-callback as ``nemo_rl.modelopt.models.policy.workers.utils.quantization_layer_spec``.
+callback under ``nemo_rl.modelopt.models.policy.workers.utils``. Current
+checkpoints use ``get_quantization_layer_spec``; older checkpoints may use the
+backward-compatible ``quantization_layer_spec`` alias.
 Megatron-Bridge's instantiator rejects ``_target_`` strings outside its built-in
 allowlist (``megatron.``, ``nemo.``, ``torch.``, ``transformers.``, ``numpy.``,
 ``nvidia.``), so the upstream export script fails on these checkpoints. The
