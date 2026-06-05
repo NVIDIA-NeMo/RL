@@ -115,9 +115,7 @@ def pad_and_align_routed_expert_indices(
     prompt_routed = getattr(request_output, "prompt_routed_experts", None)
 
     if prompt_routed is not None:
-        prompt_routed = torch.as_tensor(
-            prompt_routed, dtype=torch.int32, device=device
-        )
+        prompt_routed = torch.as_tensor(prompt_routed, dtype=torch.int32, device=device)
     if routed is not None:
         routed = torch.as_tensor(routed, dtype=torch.int32, device=device)
 

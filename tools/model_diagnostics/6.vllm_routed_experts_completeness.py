@@ -26,9 +26,7 @@ from typing import Any
 def _parse_extra_kwarg(raw: str) -> tuple[str, Any]:
     key, sep, value = raw.partition("=")
     if not sep or not key:
-        raise argparse.ArgumentTypeError(
-            f"Expected --llm-kwarg KEY=VALUE, got {raw!r}"
-        )
+        raise argparse.ArgumentTypeError(f"Expected --llm-kwarg KEY=VALUE, got {raw!r}")
     try:
         return key, json.loads(value)
     except json.JSONDecodeError:

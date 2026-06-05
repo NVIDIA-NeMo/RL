@@ -71,9 +71,7 @@ def _add_r3_fallback_metrics(
 
     missing_routes = int(missing_cpu.sum().item())
     fallback_samples = int((missing_cpu > 0).sum().item())
-    expected_routes = (
-        int(expected_cpu.sum().item()) if expected_cpu is not None else 0
-    )
+    expected_routes = int(expected_cpu.sum().item()) if expected_cpu is not None else 0
     actual_routes = int(actual_cpu.sum().item()) if actual_cpu is not None else 0
     gen_metrics["r3/routed_experts_fallback_samples"] = fallback_samples
     gen_metrics["r3/routed_experts_fallback_token_routes"] = missing_routes

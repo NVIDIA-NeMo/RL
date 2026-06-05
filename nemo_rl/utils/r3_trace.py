@@ -200,7 +200,9 @@ def _tensors_equal(lhs: Any, rhs: Any) -> bool:
     return bool(torch.equal(lhs, rhs.to(device=lhs.device, dtype=lhs.dtype)))
 
 
-def _expected_with_missing_route_fallback(expected: Any, actual: Any) -> tuple[Any, int]:
+def _expected_with_missing_route_fallback(
+    expected: Any, actual: Any
+) -> tuple[Any, int]:
     if expected is None or actual is None:
         return expected, 0
     if not hasattr(expected, "shape") or list(expected.shape) != list(actual.shape):

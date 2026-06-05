@@ -1047,7 +1047,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 raise RuntimeError(
                     "vLLM was asked to return routed experts but the generation output "
                     "did not include routed_experts."
-            )
+                )
             if return_routed_experts:
                 if r3_stats["missing_routes"] > 0:
                     LOGGER.warning(

@@ -1,34 +1,18 @@
 defaults: ../../grpo_math_qwen30ba3b_megatron.yaml
-
 grpo:
   num_prompts_per_step: 16
   num_generations_per_prompt: 8
   val_period: 1000000
-  val_at_start: false
-  val_at_end: false
-  use_dynamic_sampling: false
-
-loss_fn:
-  use_importance_sampling_correction: false
-  truncated_importance_sampling_type: null
-  truncated_importance_sampling_ratio: null
-  truncated_importance_sampling_ratio_min: null
-
 checkpointing:
-  enabled: false
   checkpoint_dir: results/grpo-qwen3-30ba3b-8n8g-megatron-cp2-r3
-
 policy:
   train_global_batch_size: 128
-  train_micro_batch_size: 1
   logprob_batch_size: 1
-  max_total_sequence_length: 4096
   make_sequence_length_divisible_by: 16
   router_replay:
     enabled: true
   sequence_packing:
     enabled: true
-    algorithm: modified_first_fit_decreasing
   megatron_cfg:
     tensor_model_parallel_size: 4
     pipeline_model_parallel_size: 2
@@ -37,32 +21,18 @@ policy:
   generation:
     max_new_tokens: 2048
     vllm_cfg:
-      tensor_parallel_size: 4
-      pipeline_parallel_size: 1
       expert_parallel_size: 4
-      gpu_memory_utilization: 0.7
       precision: bfloat16
-      kv_cache_dtype: auto
       max_model_len: 4096
-      use_deep_gemm: false
       enable_prefix_caching: false
     vllm_kwargs:
       enable_chunked_prefill: false
       moe_backend: triton
-
 data:
   max_input_seq_length: 2048
-
 data_plane:
   enabled: true
-  impl: transfer_queue
-  backend: simple
-
 logger:
   log_dir: logs/grpo-qwen3-30ba3b-8n8g-megatron-cp2-r3
   wandb:
     name: grpo-qwen3-30ba3b-8n8g-megatron-cp2-r3
-
-cluster:
-  gpus_per_node: 8
-  num_nodes: 8
