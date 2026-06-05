@@ -778,6 +778,15 @@ def setup(
             worker_init_timing_metrics["collective_init_time_s"] = (
                 time.perf_counter() - t0
             )
+    else:
+        # Megatron-framework generation: the policy serves as its own
+        # generation interface, so no WeightSynchronizer is created and
+        # init_communicator() (which normally primes refit metadata) is not
+        # run. The policy still needs prepare_refit_info() here; otherwise
+        # MegatronPolicyWorker.refit_conversion_tasks stays None and the
+        # in-place weight conversion on the first rollout dereferences
+        # uninitialized state, raising "CUDA: illegal memory access".
+        policy.prepare_refit_info()
 
     # Calculate total setup time
     total_setup_time = time.perf_counter() - setup_start_time
