@@ -3,8 +3,11 @@ grpo:
   max_num_steps: 30
   num_prompts_per_step: 8
   num_generations_per_prompt: 8
+  skip_reference_policy_logprobs_calculation: true
 loss_fn:
-  use_importance_sampling_correction: true
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: false
+  force_on_policy_ratio: true
 checkpointing:
   checkpoint_dir: results/grpo-glm5.1-64n8g-megatron-2048
 policy:
@@ -17,17 +20,21 @@ policy:
   dtensor_cfg:
     enabled: false
   sequence_packing:
-    enabled: false
-  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+    enabled: true
+  make_sequence_length_divisible_by: ${mul:${policy.megatron_cfg.tensor_model_parallel_size},
+    ${mul:2, ${policy.megatron_cfg.context_parallel_size}}}
   optimizer: null
   scheduler: null
   megatron_cfg:
     enabled: true
+    converter_type: GlmMoeDsaForCausalLM
     tensor_model_parallel_size: 8
     pipeline_model_parallel_size: 8
     num_layers_in_first_pipeline_stage: 9
     num_layers_in_last_pipeline_stage: 9
     expert_model_parallel_size: 64
+    context_parallel_size: 2
+    cp_comm_type: all_gather
     sequence_parallel: true
     activation_checkpointing: true
     moe_token_dispatcher_type: allgather
@@ -46,7 +53,10 @@ policy:
       tensor_parallel_size: 32
       expert_parallel_size: 128
       gpu_memory_utilization: 0.5
+      max_model_len: ${policy.max_total_sequence_length}
       enforce_eager: true
+    vllm_kwargs:
+      max_num_batched_tokens: ${policy.max_total_sequence_length}
 logger:
   log_dir: logs/grpo-glm5.1-64n8g-megatron
   wandb_enabled: true
