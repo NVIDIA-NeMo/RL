@@ -590,13 +590,13 @@ def setup(
                 # For SGLang: gpus_per_server already includes all parallelism
                 #   dimensions (TP, DP-attention, PP are internal subdivisions),
                 #   so we use it directly without multiplying by pp_size.
-                vllm_cfg = generation_config.get("vllm_cfg", {})
-                sglang_cfg = generation_config.get("sglang_cfg", {})
-                if vllm_cfg.get("tensor_parallel_size", 0):
+                if generation_config["backend"] == "vllm":
+                    vllm_cfg = generation_config.get("vllm_cfg", {})
                     gpus_per_instance = vllm_cfg["tensor_parallel_size"] * vllm_cfg.get(
                         "pipeline_parallel_size", 1
                     )
                 else:
+                    sglang_cfg = generation_config.get("sglang_cfg", {})
                     gpus_per_instance = sglang_cfg.get("gpus_per_server", 1)
                 nodes_per_instance = (
                     gpus_per_instance + inference_gpus_per_node - 1
