@@ -1,7 +1,7 @@
 [submodule "3rdparty/Megatron-Bridge"]
 	path = 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge
 	url = https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
-	branch = main
+	branch = slikhite/glm51-mcore-pin
 	shallow = true
 [submodule "3rdparty/Automodel-workspace/Automodel"]
 	path = 3rdparty/Automodel-workspace/Automodel
@@ -13,5 +13,3 @@
 	url = https://github.com/NVIDIA-NeMo/Gym.git
 	branch = main
 	shallow = true
-[submodule "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge"]
-	url = https://github.com/slikhite-1/Megatron-Bridge.git
