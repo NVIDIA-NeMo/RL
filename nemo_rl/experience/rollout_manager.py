@@ -52,7 +52,7 @@ class AsyncRolloutImpl:
     def __init__(
         self,
         tokenizer: TokenizerType,
-        task_to_env: dict[str, EnvironmentInterface],
+        env_handles: dict[str, EnvironmentInterface],
         num_generations_per_prompt: int,
         max_seq_len: int,
         policy_generation: GenerationInterface,
@@ -60,7 +60,7 @@ class AsyncRolloutImpl:
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
-        self._task_to_env = task_to_env
+        self._env_handles = env_handles
         self._num_generations_per_prompt = num_generations_per_prompt
         self._max_seq_len = max_seq_len
         self._max_rollout_turns = max_rollout_turns
@@ -193,7 +193,7 @@ class AsyncRolloutImpl:
             # step. In this case, need to wrap with asyncio.to_thread to make
             # this function yieldable.
             env_output = await asyncio.to_thread(
-                calculate_rewards, sample_batch, self._task_to_env
+                calculate_rewards, sample_batch, self._env_handles
             )
 
             # Update reward and termination statistics
@@ -389,7 +389,7 @@ class AsyncNemoGymRolloutImpl:
     def __init__(
         self,
         tokenizer: TokenizerType,
-        task_to_env: dict[str, EnvironmentInterface],
+        env_handles: dict[str, EnvironmentInterface],
         num_generations_per_prompt: int,
         max_seq_len: int,
         generation_config: GenerationConfig,
@@ -397,7 +397,7 @@ class AsyncNemoGymRolloutImpl:
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
-        self._task_to_env = task_to_env
+        self._env_handles = env_handles
         self._num_generations_per_prompt = num_generations_per_prompt
         self._max_seq_len = max_seq_len
         self._max_rollout_turns = max_rollout_turns
@@ -480,7 +480,7 @@ class AsyncNemoGymRolloutImpl:
         self, inputs: list[dict], timer: Timer, timer_prefix: str
     ) -> tuple[list[Completion], dict[str, Any]]:
         """Dispatch rows to NeMo-Gym and return completions + metrics."""
-        nemo_gym_env = self._task_to_env["nemo_gym"]
+        nemo_gym_env = self._env_handles["nemo_gym"]
 
         # Run generation.
         with timer.time(f"{timer_prefix}/run_rollouts"):
@@ -588,7 +588,7 @@ class RolloutManager:
     def __init__(
         self,
         tokenizer: TokenizerType,
-        task_to_env: dict[str, EnvironmentInterface],
+        env_handles: dict[str, EnvironmentInterface],
         num_generations_per_prompt: int,
         max_seq_len: int,
         max_rollout_turns: Optional[int] = None,
@@ -618,7 +618,7 @@ class RolloutManager:
 
         self._impl: AsyncRolloutImpl | AsyncNemoGymRolloutImpl = rollout_cls(
             tokenizer=tokenizer,
-            task_to_env=task_to_env,
+            env_handles=env_handles,
             num_generations_per_prompt=num_generations_per_prompt,
             max_seq_len=max_seq_len,
             max_rollout_turns=max_rollout_turns,  # type: ignore
@@ -663,6 +663,8 @@ class RolloutManager:
             tags=tags,
         )
 
+    # TODO(async-rl): tmp shim. will be removed once StalenessSampler is rewritten
+    # and the canonical async-RL TQ payload is locked in.
     def _build_tq_payload(
         self, record: PromptGroupRecord
     ) -> tuple[BatchedDataDict[Any], list[dict[str, Any]], list[str]]:
@@ -690,12 +692,14 @@ class RolloutManager:
             message_logs, prompt_lengths
         )
         prompt_flat, _ = batched_message_log_to_flat_message(
-            prompt_message_logs, **pad_kwargs
+            prompt_message_logs,
+            **pad_kwargs,  # type: ignore
         )
 
         add_grpo_token_loss_masks_and_generation_logprobs(message_logs)
         flat, input_lengths = batched_message_log_to_flat_message(
-            message_logs, **pad_kwargs
+            message_logs,  # type: ignore
+            **pad_kwargs,  # type: ignore
         )
 
         total_reward = torch.tensor(
