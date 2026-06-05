@@ -63,12 +63,11 @@ from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import (
-    NVLINK_DOMAIN_UNKNOWN,
     TOPO_RANK_UNKNOWN,
     ClusterConfig,
     RayVirtualCluster,
     get_ray_cluster_topology,
-    select_segment_nodes,
+    prepare_segment_topology,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import (
@@ -451,6 +450,9 @@ def setup(
         else:
             policy_gpus_per_node = cluster_config["gpus_per_node"]
 
+        node_resource_constraints, _, _ = prepare_segment_topology(
+            segment_size, policy_nodes
+        )
         cluster = RayVirtualCluster(
             name="grpo_policy_cluster",
             bundle_ct_per_node_list=[policy_gpus_per_node] * policy_nodes,
@@ -462,6 +464,7 @@ def setup(
             port_range_low=cluster_config.get("master_port_range_low"),
             port_range_high=cluster_config.get("master_port_range_high"),
             segment_size=segment_size,
+            node_resource_constraints=node_resource_constraints,
         )
         train_cluster = cluster
         inference_cluster = cluster
@@ -558,20 +561,15 @@ def setup(
                 f"need {required_nodes} (train={train_nodes} + inference={inference_nodes}), "
                 f"but only {num_alive_nodes} alive nodes found"
             )
-            has_topology = any(
-                domain != NVLINK_DOMAIN_UNKNOWN for domain, _ in topology.values()
-            )
-            if has_topology:
-                training_node_ids, remaining_node_ids = select_segment_nodes(
-                    topology, segment_size, train_nodes
+            node_resource_constraints, remaining_node_ids, topology = (
+                prepare_segment_topology(
+                    segment_size, train_nodes, topology=topology, role="training"
                 )
-                # Each node has 1.0 of its domain resource (per-node, not shared).
-                # 0.001 per bundle * gpus_per_node bundles = negligible consumption.
-                node_resource_constraints = [
-                    {topology[nid][0]: 0.001} for nid in training_node_ids
-                ]
-                # Warn if any selected node lacks topo_rank — domain pinning
-                # still works but intra-domain rank ordering will be arbitrary.
+            )
+            # Warn if any selected training node lacks topo_rank — domain pinning
+            # still works but intra-domain rank ordering will be arbitrary.
+            if node_resource_constraints is not None:
+                training_node_ids = set(topology) - set(remaining_node_ids)
                 nodes_missing_topo_rank = [
                     nid
                     for nid in training_node_ids
@@ -583,12 +581,6 @@ def setup(
                         f"info but no topo_rank; intra-domain rank ordering may be suboptimal",
                         flush=True,
                     )
-                print(
-                    f"  ✓ Topology-aware allocation: {train_nodes} training nodes in "
-                    f"{len(set(topology[nid][0] for nid in training_node_ids))} NVLink domains "
-                    f"(segment_size={segment_size})",
-                    flush=True,
-                )
 
                 # Inference topology: each vLLM/SGLang instance spans
                 # nodes_per_instance nodes; keep those within one domain
@@ -613,19 +605,15 @@ def setup(
                     remaining_topology = {
                         nid: topology[nid] for nid in remaining_node_ids
                     }
-                    inference_node_ids, _ = select_segment_nodes(
-                        remaining_topology, nodes_per_instance, inference_nodes
+                    inference_node_resource_constraints, _, _ = (
+                        prepare_segment_topology(
+                            nodes_per_instance,
+                            inference_nodes,
+                            topology=remaining_topology,
+                            role="inference",
+                        )
                     )
-                    inference_node_resource_constraints = [
-                        {topology[nid][0]: 0.001} for nid in inference_node_ids
-                    ]
                     inference_segment_size = nodes_per_instance
-                    print(
-                        f"  ✓ Topology-aware allocation: {inference_nodes} inference nodes in "
-                        f"{len(set(topology[nid][0] for nid in inference_node_ids))} NVLink domains "
-                        f"(nodes_per_instance={nodes_per_instance}, gpus_per_instance={gpus_per_instance})",
-                        flush=True,
-                    )
                 elif nodes_per_instance > 1:
                     print(
                         f"  ⚠ inference_nodes={inference_nodes} is not divisible by "
@@ -633,12 +621,6 @@ def setup(
                         f"skipping inference topology constraints",
                         flush=True,
                     )
-            else:
-                print(
-                    f"  ⚠ segment_size={segment_size} is set but no NVLink domain info "
-                    f"available from Ray nodes; falling back to unconstrained allocation",
-                    flush=True,
-                )
 
         # initialize train cluster
         train_cluster = RayVirtualCluster(

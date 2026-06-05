@@ -401,6 +401,65 @@ def select_segment_nodes(
     return selected_node_ids, remaining_node_ids
 
 
+def prepare_segment_topology(
+    segment_size: int | None,
+    num_nodes: int,
+    *,
+    topology: dict[str, tuple[str, int]] | None = None,
+    role: str = "training",
+) -> tuple[list[dict[str, float]] | None, list[str], dict[str, tuple[str, int]]]:
+    """Compute node resource constraints for topology-aware cluster placement.
+
+    Fetches cluster topology if not provided, selects segment-aligned nodes,
+    and returns per-node domain constraints ready for ``RayVirtualCluster``.
+
+    Args:
+        segment_size: Nodes per NVLink domain segment. ``None`` disables topology logic.
+        num_nodes: Number of nodes to select.
+        topology: Pre-fetched topology dict; fetched automatically when ``None``.
+        role: Label used in progress messages (e.g. ``"training"``, ``"inference"``).
+
+    Returns:
+        ``(node_resource_constraints, remaining_node_ids, topology)``
+
+        - *node_resource_constraints*: per-node domain-pinning dicts for
+          ``RayVirtualCluster``, or ``None`` when ``segment_size`` is ``None`` or
+          no NVLink domain info is available.
+        - *remaining_node_ids*: node IDs not selected; pass the corresponding
+          sub-topology to a follow-up call to allocate an inference cluster.
+        - *topology*: the topology dict used (empty dict when ``segment_size`` is
+          ``None``, for safe sub-topology slicing by callers).
+    """
+    if segment_size is None:
+        return None, [], {}
+
+    if topology is None:
+        topology = get_ray_cluster_topology()
+
+    has_topology = any(
+        domain != NVLINK_DOMAIN_UNKNOWN for domain, _ in topology.values()
+    )
+    if not has_topology:
+        print(
+            f"  ⚠ segment_size={segment_size} is set but no NVLink domain info "
+            "found, falling back to unordered allocation",
+            flush=True,
+        )
+        return None, list(topology.keys()), topology
+
+    selected_node_ids, remaining_node_ids = select_segment_nodes(
+        topology, segment_size, num_nodes
+    )
+    node_resource_constraints = [{topology[nid][0]: 0.001} for nid in selected_node_ids]
+    print(
+        f"  ✓ Topology-aware allocation: {num_nodes} {role} nodes in "
+        f"{len(set(topology[nid][0] for nid in selected_node_ids))} NVLink domains "
+        f"(segment_size={segment_size})",
+        flush=True,
+    )
+    return node_resource_constraints, remaining_node_ids, topology
+
+
 def _sort_bundle_indices_by_topology(
     bundle_data: list[tuple[int, str, int, str]],
     segment_size: int | None = None,
