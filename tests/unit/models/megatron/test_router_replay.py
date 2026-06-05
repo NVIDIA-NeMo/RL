@@ -152,6 +152,85 @@ def test_build_router_replay_tensors_maps_full_layer_payload_to_moe_layers():
 
 
 @pytest.mark.mcore
+def test_router_replay_assignments_use_layer_numbers_for_model_chunks():
+    from megatron.core.transformer.moe.router_replay import (
+        RouterReplay,
+        RouterReplayAction,
+    )
+
+    from nemo_rl.models.megatron.router_replay import (
+        build_router_replay_assignments,
+        set_router_replay_backward,
+        set_router_replay_forward,
+    )
+
+    RouterReplay.clear_global_router_replay_instances()
+
+    class DummyRouter(torch.nn.Module):
+        def __init__(self, replay, layer_number):
+            super().__init__()
+            self.router_replay = replay
+            self.layer_number = layer_number
+
+    class DummyChunk(torch.nn.Module):
+        def __init__(self, layer_numbers, config):
+            super().__init__()
+            self.config = config
+            for layer_number in layer_numbers:
+                setattr(
+                    self,
+                    f"router_{layer_number}",
+                    DummyRouter(RouterReplay(), layer_number=layer_number),
+                )
+
+    try:
+        config = SimpleNamespace(num_layers=8, moe_layer_freq=[1] * 8)
+        chunk_1 = DummyChunk([5, 7], config)
+        chunk_0 = DummyChunk([1, 3], config)
+        model_chunks = [chunk_1, chunk_0]
+        routed_experts = torch.arange(2 * 8 * 2, dtype=torch.int32).reshape(2, 8, 2)
+
+        assignments = build_router_replay_assignments(model_chunks, routed_experts)
+
+        expected_replay_tensors = [
+            routed_experts[:, 4, :].to(torch.long),
+            routed_experts[:, 6, :].to(torch.long),
+            routed_experts[:, 0, :].to(torch.long),
+            routed_experts[:, 2, :].to(torch.long),
+        ]
+        assert len(assignments) == len(expected_replay_tensors)
+        for (_, replay_tensor), expected_tensor in zip(
+            assignments, expected_replay_tensors
+        ):
+            assert torch.equal(replay_tensor, expected_tensor)
+
+        set_router_replay_forward(model_chunks, routed_experts)
+        for chunk in model_chunks:
+            for module in chunk.modules():
+                replay = getattr(module, "router_replay", None)
+                layer_number = getattr(module, "layer_number", None)
+                if replay is None:
+                    continue
+                assert replay.router_replay_action == RouterReplayAction.REPLAY_FORWARD
+                assert torch.equal(
+                    replay.target_topk_idx,
+                    routed_experts[:, layer_number - 1, :].to(torch.long),
+                )
+
+        set_router_replay_backward(model_chunks)
+        for chunk in model_chunks:
+            for module in chunk.modules():
+                replay = getattr(module, "router_replay", None)
+                if replay is not None:
+                    assert (
+                        replay.router_replay_action
+                        == RouterReplayAction.REPLAY_BACKWARD
+                    )
+    finally:
+        RouterReplay.clear_global_router_replay_instances()
+
+
+@pytest.mark.mcore
 def test_build_router_replay_tensors_rejects_partial_padded_layer_payload():
     from megatron.core.transformer.moe.router_replay import RouterReplay
 
@@ -535,6 +614,7 @@ def test_mcore_moe_replay_backward_recompute_matches_parameter_grads(tmp_path):
         RouterReplay,
         RouterReplayAction,
     )
+    from megatron.core.transformer.spec_utils import get_submodules
     from megatron.core.transformer.transformer_config import TransformerConfig
 
     RouterReplay.clear_global_router_replay_instances()
@@ -566,7 +646,7 @@ def test_mcore_moe_replay_backward_recompute_matches_parameter_grads(tmp_path):
         submodules = get_gpt_layer_local_submodules(
             num_experts=4, moe_grouped_gemm=False
         )
-        return MoELayer(config, submodules.mlp.submodules).cuda()
+        return MoELayer(config, get_submodules(submodules.mlp)).cuda()
 
     def run_layer(layer, hidden_states, loss_weights, action, target_indices=None):
         layer.zero_grad(set_to_none=True)
