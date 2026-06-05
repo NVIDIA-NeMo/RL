@@ -346,6 +346,8 @@ def mock_grpo_components():
                 "use_leave_one_out_baseline": False,
                 "normalize_rewards": False,
                 "overlong_filtering": False,
+                "advantage_clip_low": None,
+                "advantage_clip_high": None,
                 "reward_scaling": {"enabled": False},
                 "reward_shaping": {"enabled": False},
                 "use_dynamic_sampling": False,
@@ -1481,6 +1483,45 @@ def test_refit_policy_generation_sglang_non_colocated_raises(monkeypatch):
         )
 
 
+def test_refit_policy_generation_non_colocated_offloads_and_restores(monkeypatch):
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    calls = []
+    kv_scales = {"layer_0": 1.0}
+
+    class DummyPolicy:
+        def offload_before_refit(self):
+            calls.append("offload_before_refit")
+
+        def broadcast_weights_for_collective(self, kv_scales=None):
+            calls.append(("broadcast_weights_for_collective", kv_scales))
+            return ["train-ok"]
+
+        def prepare_for_training(self):
+            calls.append("prepare_for_training")
+
+    class DummyGeneration:
+        def update_weights_from_collective(self):
+            calls.append("update_weights_from_collective")
+            return ["inference-ok"]
+
+    monkeypatch.setattr(grpo_mod.ray, "get", lambda x: x)
+
+    grpo_mod.refit_policy_generation(
+        policy=DummyPolicy(),
+        policy_generation=DummyGeneration(),
+        colocated_inference=False,
+        kv_scales=kv_scales,
+    )
+
+    assert calls == [
+        "offload_before_refit",
+        ("broadcast_weights_for_collective", kv_scales),
+        "update_weights_from_collective",
+        "prepare_for_training",
+    ]
+
+
 def test_grpo_train_collects_generation_logger_and_seq_metrics(
     monkeypatch, mock_grpo_components
 ):
@@ -1600,20 +1641,28 @@ def test_grpo_train_collects_generation_logger_and_seq_metrics(
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
-def test_grpo_train_skips_reference_policy_logprobs_when_configured(
-    mock_grpo_components, train_func
+@pytest.mark.parametrize(
+    "skip_reference_policy_logprobs_calculation",
+    [False, True],
+    ids=["implicit_kl_zero", "explicit_skip"],
+)
+def test_grpo_train_skips_reference_policy_logprobs_when_kl_disabled(
+    mock_grpo_components, train_func, skip_reference_policy_logprobs_calculation
 ):
     """Regression test for issue #1968 (Bug 1) and PRs #2174 / #2178.
 
-    When ``grpo.skip_reference_policy_logprobs_calculation=True`` and
-    ``loss_fn.reference_policy_kl_penalty=0``, both ``grpo_train`` and
-    ``async_grpo_train`` MUST NOT call ``policy.get_reference_policy_logprobs``.
-    Without the skip guards in ``grpo.py``, training would crash inside
-    ``use_reference_model()`` because the reference model state was never loaded.
+    When ``loss_fn.reference_policy_kl_penalty=0``, both ``grpo_train`` and
+    ``async_grpo_train`` MUST NOT call ``policy.get_reference_policy_logprobs``,
+    even if the caller did not pre-set
+    ``grpo.skip_reference_policy_logprobs_calculation``. Without the skip guards
+    in ``grpo.py``, training would crash inside ``use_reference_model()`` because
+    the reference model state was never loaded.
     """
     master_config = mock_grpo_components["master_config"]
     master_config.loss_fn.reference_policy_kl_penalty = 0
-    master_config.grpo["skip_reference_policy_logprobs_calculation"] = True
+    master_config.grpo["skip_reference_policy_logprobs_calculation"] = (
+        skip_reference_policy_logprobs_calculation
+    )
     master_config.grpo["max_num_steps"] = 1
     master_config.grpo["max_num_epochs"] = 1
     master_config.grpo["val_period"] = 0
@@ -1684,9 +1733,144 @@ def test_grpo_train_skips_reference_policy_logprobs_when_configured(
 
     assert not policy.get_reference_policy_logprobs.called, (
         "policy.get_reference_policy_logprobs was called even though "
-        "skip_reference_policy_logprobs_calculation=True. "
+        "loss_fn.reference_policy_kl_penalty=0. "
         "This indicates a regression of issue #1968 / PRs #2174, #2178."
     )
+
+
+def _run_single_grpo_train_step(mock_grpo_components, train_func, monkeypatch):
+    """Run one GRPO training step with rollout/logprob infrastructure mocked."""
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
+    policy = mock_grpo_components["policy"]
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo["max_num_steps"] = 1
+    master_config.grpo["max_num_epochs"] = 1
+    master_config.grpo["val_period"] = 0
+    master_config.grpo["val_at_start"] = False
+    master_config.grpo["use_dynamic_sampling"] = False
+
+    if train_func == async_grpo_train:
+        master_config.policy["generation"]["colocated"]["enabled"] = False
+        with (
+            mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics),
+            _patched_logprob_phase(policy),
+        ):
+            train_func(
+                policy,
+                None,
+                mock_grpo_components["train_dataloader"],
+                mock_grpo_components["val_dataloader"],
+                mock_grpo_components["tokenizer"],
+                mock_grpo_components["loss_fn"],
+                mock_grpo_components["task_to_env"],
+                mock_grpo_components["val_task_to_env"],
+                mock_grpo_components["logger"],
+                mock_grpo_components["checkpointer"],
+                _default_grpo_save_state(),
+                master_config,
+            )
+    else:
+        with (
+            _patched_logprob_phase(policy),
+            patch(
+                "nemo_rl.algorithms.grpo.run_multi_turn_rollout",
+                return_value=(mock_batch, mock_rollout_metrics),
+            ),
+            patch(
+                "nemo_rl.algorithms.grpo.run_async_multi_turn_rollout",
+                return_value=(mock_batch, mock_rollout_metrics),
+            ),
+            patch(
+                "nemo_rl.algorithms.grpo.compute_and_apply_seq_logprob_error_masking",
+                return_value=_mock_seq_logprob_error_result(),
+            ),
+        ):
+            train_func(
+                policy,
+                None,
+                mock_grpo_components["train_dataloader"],
+                mock_grpo_components["val_dataloader"],
+                mock_grpo_components["tokenizer"],
+                mock_grpo_components["loss_fn"],
+                mock_grpo_components["task_to_env"],
+                mock_grpo_components["val_task_to_env"],
+                mock_grpo_components["logger"],
+                mock_grpo_components["checkpointer"],
+                _default_grpo_save_state(),
+                master_config,
+            )
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
+def test_grpo_train_clips_advantages_when_configured(
+    mock_grpo_components, train_func, monkeypatch
+):
+    """Advantages passed to policy.train are clamped when clip bounds are set."""
+    extreme_advantages = torch.tensor([[-10.0, 15.0]])
+    mock_adv_estimator = MagicMock()
+    mock_adv_estimator.compute_advantage.return_value = extreme_advantages.clone()
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.grpo._create_advantage_estimator",
+        lambda _cfg: mock_adv_estimator,
+    )
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo["advantage_clip_low"] = -2.0
+    master_config.grpo["advantage_clip_high"] = 3.0
+
+    _run_single_grpo_train_step(mock_grpo_components, train_func, monkeypatch)
+
+    policy = mock_grpo_components["policy"]
+    policy.train.assert_called_once()
+    clipped = policy.train.call_args[0][0]["advantages"]
+    assert clipped.min().item() == -2.0
+    assert clipped.max().item() == 3.0
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
+def test_grpo_train_preserves_advantages_when_clipping_disabled(
+    mock_grpo_components, train_func, monkeypatch
+):
+    """Advantages are unchanged when advantage_clip_low/high are null."""
+    extreme_advantages = torch.tensor([[-10.0, 15.0]])
+    mock_adv_estimator = MagicMock()
+    mock_adv_estimator.compute_advantage.return_value = extreme_advantages.clone()
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.grpo._create_advantage_estimator",
+        lambda _cfg: mock_adv_estimator,
+    )
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo["advantage_clip_low"] = None
+    master_config.grpo["advantage_clip_high"] = None
+
+    _run_single_grpo_train_step(mock_grpo_components, train_func, monkeypatch)
+
+    policy = mock_grpo_components["policy"]
+    policy.train.assert_called_once()
+    advantages = policy.train.call_args[0][0]["advantages"]
+    assert torch.equal(advantages, extreme_advantages)
+
+
+def test_clip_grpo_advantages_respects_config_bounds():
+    """Shared clip helper clamps only when bounds are configured."""
+    from nemo_rl.algorithms.grpo import _clip_grpo_advantages
+
+    extreme_advantages = torch.tensor([[-10.0, 15.0], [0.0, 5.0]])
+
+    clipped = _clip_grpo_advantages(
+        extreme_advantages.clone(),
+        {"advantage_clip_low": -2.0, "advantage_clip_high": 3.0},
+    )
+    assert clipped.min().item() == -2.0
+    assert clipped.max().item() == 3.0
+
+    unclipped = _clip_grpo_advantages(
+        extreme_advantages.clone(),
+        {"advantage_clip_low": None, "advantage_clip_high": None},
+    )
+    assert torch.equal(unclipped, extreme_advantages)
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
