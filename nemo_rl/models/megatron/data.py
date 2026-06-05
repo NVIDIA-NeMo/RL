@@ -22,15 +22,11 @@ from megatron.core.parallel_state import (
     get_context_parallel_rank,
     get_context_parallel_world_size,
 )
-from megatron.core.utils import (
-    StragglerDetector,
-    get_batch_on_this_cp_rank,
-    get_batch_on_this_hybrid_cp_rank,
-    get_thd_batch_on_this_cp_rank,
-)
+from megatron.core.utils import StragglerDetector
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.model_utils import _get_packed_thd_tokens_on_this_cp_rank
 from nemo_rl.models.megatron.common import _round_up_to_multiple
 from nemo_rl.utils.r3_trace import (
     r3_trace_verify_forward_enabled,
@@ -660,6 +656,8 @@ def _slice_batch_for_megatron_context_parallel(
                 "Dense CP slicing uses Megatron parallel_state. Explicit "
                 "cp_rank/cp_size are only supported for packed THD slicing."
             )
+        from megatron.core.utils import get_batch_on_this_cp_rank
+
         return get_batch_on_this_cp_rank(dict(batch)), None
 
     if local_cp_size is not None:
@@ -668,6 +666,14 @@ def _slice_batch_for_megatron_context_parallel(
                 "Hybrid CP slicing uses Megatron process groups. Explicit "
                 "cp_rank/cp_size are only supported for packed THD slicing."
             )
+        try:
+            from megatron.core.utils import get_batch_on_this_hybrid_cp_rank
+        except ImportError as exc:
+            raise RuntimeError(
+                "Hybrid context-parallel slicing requires a Megatron Core version "
+                "that exports get_batch_on_this_hybrid_cp_rank."
+            ) from exc
+
         return get_batch_on_this_hybrid_cp_rank(dict(batch), local_cp_size)
 
     if cu_seqlens is None or cu_seqlens_padded is None or max_seqlen is None:
@@ -675,19 +681,44 @@ def _slice_batch_for_megatron_context_parallel(
             "Packed THD CP slicing requires cu_seqlens, cu_seqlens_padded, and max_seqlen."
         )
 
-    max_seqlen_t = torch.tensor(
-        [max_seqlen],
-        dtype=torch.int32,
-        device=cu_seqlens.device,
-    )
-    return get_thd_batch_on_this_cp_rank(
-        dict(batch),
-        cu_seqlens,
-        cu_seqlens_padded,
-        max_seqlen_t,
-        cp_size=cp_size,
-        cp_rank=cp_rank,
-    )
+    try:
+        from megatron.core.utils import get_thd_batch_on_this_cp_rank
+    except ImportError:
+        cp_batch = {
+            key: _get_packed_thd_tokens_on_this_cp_rank(
+                value,
+                cu_seqlens_padded,
+                cp_rank,
+                cp_size,
+                seq_dim=1,
+            )
+            for key, value in batch.items()
+        }
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens_padded,
+            cu_seqlens_kv=cu_seqlens_padded,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+            max_seqlen_q=int(max_seqlen),
+            max_seqlen_kv=int(max_seqlen),
+            qkv_format="thd",
+            total_tokens=cp_batch["tokens"].shape[1],
+        )
+        return cp_batch, packed_seq_params
+    else:
+        max_seqlen_t = torch.tensor(
+            [max_seqlen],
+            dtype=torch.int32,
+            device=cu_seqlens.device,
+        )
+        return get_thd_batch_on_this_cp_rank(
+            dict(batch),
+            cu_seqlens,
+            cu_seqlens_padded,
+            max_seqlen_t,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+        )
 
 
 def _pack_token_aligned_batch_for_megatron(
