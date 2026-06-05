@@ -1101,7 +1101,7 @@ class TestTopkLogitsPostProcessor:
         ):
             wrapped_fn(output_tensor)
 
-    @patch("nemo_rl.models.megatron.train.allgather_cp_sharded_tensor")
+    @patch("nemo_rl.models.megatron.train.allgather_packed_thd_cp_sharded_tensor")
     @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
     @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
     @patch(
@@ -1163,7 +1163,7 @@ class TestTopkLogitsPostProcessor:
         assert result["topk_logits"].shape == (1, 8, k)
         assert result["topk_indices"].shape == (1, 8, k)
 
-    @patch("nemo_rl.models.megatron.train.allgather_cp_sharded_tensor")
+    @patch("nemo_rl.models.megatron.train.allgather_packed_thd_cp_sharded_tensor")
     @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
     @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
     @patch(
@@ -1207,7 +1207,7 @@ class TestTopkLogitsPostProcessor:
         mock_topk.return_value = (mock_topk_vals, mock_topk_idx)
 
         # allgather is called once per sequence (2 sequences x 2 tensors = 4 calls)
-        def fake_allgather(local_tensor, group, seq_dim):
+        def fake_allgather(local_tensor, cu_seqlens_padded, group, seq_dim):
             # Simulate gathering: double the seq_dim since cp_size=2
             return local_tensor.repeat(1, cp_size, 1)
 
