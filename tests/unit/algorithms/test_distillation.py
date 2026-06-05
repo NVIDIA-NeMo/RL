@@ -55,7 +55,7 @@ def mock_components():
     }
 
     # Set student_generation to None to avoid Ray-related refit issues
-    # This makes NEED_REFIT = False, so refit_policy_generation won't be called
+    # This means weight_sync will be None, so no weight sync is performed
     student_generation = None
 
     # Create a proper message log structure with token_ids (similar to SFT)
@@ -587,6 +587,8 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch):
         def init_collective(self, *args, **kwargs):
             return [MagicMock()]
 
+    mock_weight_sync = MagicMock()
+
     with (
         patch.object(distil_mod, "RayVirtualCluster", DummyCluster),
         patch.object(distil_mod, "Logger"),
@@ -594,17 +596,20 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch):
         patch.object(distil_mod, "StatefulDataLoader"),
         patch.object(distil_mod, "Policy", DummyPolicy),
         patch.object(distil_mod, "VllmGeneration", DummyVllmGeneration),
-        patch.object(distil_mod, "ray") as mock_ray,
+        patch.object(
+            distil_mod, "create_weight_synchronizer", return_value=mock_weight_sync
+        ),
     ):
         mock_ckpt_mgr.return_value.get_latest_checkpoint_path.return_value = None
         mock_ckpt_mgr.return_value.get_resume_paths.return_value = (None, None)
-        mock_ray.get = MagicMock(return_value=None)
 
-        # Should not raise
         result = distil_mod.setup(master_config, tokenizer, dataset, None)
 
-        # Basic shape check of returned tuple
         assert isinstance(result, tuple)
+        assert len(result) == 11, f"Expected 11-tuple from setup(), got {len(result)}"
+        assert result[3] is mock_weight_sync, (
+            "weight_sync should be at position 4 in setup() return tuple"
+        )
 
 
 def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():

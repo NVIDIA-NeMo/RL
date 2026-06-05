@@ -15,6 +15,7 @@
 import argparse
 import os
 import pprint
+from typing import Optional
 
 # Increase the W&B single object size warning threshold. Initially 100_000 (100 KB) -> 10_000_000 (10 MB)
 import wandb.util
@@ -35,7 +36,6 @@ from nemo_rl.algorithms.grpo import (
     TokenizerType,
     _should_use_nemo_gym,
     grpo_train,
-    refit_policy_generation,
     setup,
 )
 from nemo_rl.algorithms.utils import get_tokenizer
@@ -54,6 +54,7 @@ from nemo_rl.utils.config import (
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.logger import get_next_experiment_dir
+from nemo_rl.weight_sync import WeightSynchronizer
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
@@ -78,11 +79,13 @@ def collect_trajectories(
     val_task_to_env: dict[str, EnvironmentInterface],
     logger: Logger,
     master_config: MasterConfig,
+    weight_sync: Optional[WeightSynchronizer] = None,
 ) -> None:
     """Run trajectory collection."""
-    # common config/state items
-    colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
-    refit_policy_generation(policy, policy_generation, colocated_inference)
+    if weight_sync is not None and weight_sync.is_stale:
+        weight_sync.sync_weights()
+    else:
+        policy_generation.prepare_for_generation()
 
     log_filename = "trajectory_collection.jsonl"
 
@@ -196,6 +199,7 @@ The validation set you pass in will directly be used for validation with no addi
         policy,
         policy_generation,
         cluster,
+        weight_sync,
         dataloader,
         val_dataloader,
         loss_fn,
@@ -231,6 +235,7 @@ The validation set you pass in will directly be used for validation with no addi
             val_task_to_env=val_task_to_env,
             logger=logger,
             master_config=master_config,
+            weight_sync=weight_sync,
         )
     # Check if async mode is enabled
     elif "async_grpo" in config.grpo and config.grpo["async_grpo"]["enabled"]:
@@ -282,6 +287,7 @@ The validation set you pass in will directly be used for validation with no addi
             grpo_save_state=grpo_state,
             master_config=master_config,
             max_trajectory_age_steps=async_config["max_trajectory_age_steps"],
+            weight_sync=weight_sync,
         )
     else:
         print("🚀 Running synchronous GRPO training")
@@ -300,6 +306,7 @@ The validation set you pass in will directly be used for validation with no addi
             checkpointer,
             grpo_state,
             master_config,
+            weight_sync=weight_sync,
         )
 
 
