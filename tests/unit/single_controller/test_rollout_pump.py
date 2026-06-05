@@ -173,7 +173,6 @@ def test_rollout_pump_writes_expected_tq_data(
 
     cfg = SingleControllerConfig(
         max_train_steps=1,
-        max_rollout_prompts=max_rollout_prompts,
         min_prompt_groups_per_batch=1,
         generations_per_prompt=num_generations,
         max_buffered_rollouts=max_rollout_prompts,
@@ -186,7 +185,9 @@ def test_rollout_pump_writes_expected_tq_data(
         rollout_max_turns=max_rollout_turns,
         use_nemo_gym=False,
     )
-    prompts = [input_sample] * max_rollout_prompts
+    # SingleControllerActor expects a StatefulDataLoader, but the pump only
+    # iterates it (`for prompt in self._dataloader`), so any iterable works.
+    dataloader = [input_sample] * max_rollout_prompts
 
     ctrl = SingleControllerActor.remote(
         cfg=cfg,
@@ -194,7 +195,7 @@ def test_rollout_pump_writes_expected_tq_data(
         gen_handle=vllm_generation,
         trainer_handle=object(),
         env_handles=env_handles,
-        prompts=prompts,
+        dataloader=dataloader,
         weight_synchronizer=object(),
         tokenizer=tokenizer,
     )
