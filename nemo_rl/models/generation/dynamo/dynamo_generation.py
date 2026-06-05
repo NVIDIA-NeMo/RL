@@ -168,10 +168,12 @@ def _dispatch_update_weights_via_mx_remote(
          → enumerate worker pods from ``instances[*]``
          → key by ``instance_id``; system_url = http://<pod_ip>:<DYN_SYSTEM_PORT>
       2. For each NEW worker (not already refitted in this cycle):
-         a. POST /engine/pause_generation       (stop accepting new generates)
-         b. POST /engine/update_weights_via_mx  (real NIXL receive, blocks)
-         c. POST /engine/flush_cache            (drop stale prefix cache)
-         d. POST /engine/resume_generation      (try/finally so we always re-enable)
+         a. POST /engine/update_weights_via_mx  (real NIXL receive, blocks)
+         b. POST /engine/flush_cache            (drop stale prefix cache)
+         No pause/resume: update_weights_via_mx is a vLLM collective_rpc that
+         runs between engine steps, pausing (not aborting) in-flight requests
+         which resume on the new weights — matching NeMo-RL's direct vLLM
+         backend. See _refit_one for the rationale.
       3. Re-discover via /health. If new instance_ids appeared (a worker
          scaled in or restarted during the cycle), go to step 2.
       4. Once a discovery shows no new instance_ids, return.
@@ -280,7 +282,20 @@ def _dispatch_update_weights_via_mx_remote(
         import concurrent.futures
 
         def _refit_one(inst: dict[str, Any]) -> tuple[Any, list[str], dict[str, Any]]:
-            """One pod's pause→refit (with retry)→flush→resume.
+            """One pod's refit (with retry) → flush.
+
+            No pause/resume around the refit: ``update_weights_via_mx`` runs as
+            a vLLM ``collective_rpc``, which executes between engine steps and
+            therefore *pauses* (not aborts) any in-flight requests — they resume
+            on the new weights once the receive returns. This matches NeMo-RL's
+            direct vLLM backend (vllm_worker.update_weights_via_mx), which calls
+            the same collective RPC with no surrounding pause/abort. The old
+            pause_generation step defaulted to mode="abort", which *killed*
+            in-flight rollouts → empty completions → downstream crashes
+            (BackendUnknown in the LocalRouter, IndexError on choices[0] in the
+            gym). flush_cache is kept — it mirrors the direct backend's
+            reset_prefix_cache, dropping prefix-cache entries computed on the
+            old weights.
 
             Returns ``(instance_id, failure_msgs, steps)``. Designed to
             run in a worker thread inside the wave-parallel executor.
@@ -290,44 +305,29 @@ def _dispatch_update_weights_via_mx_remote(
             steps: dict[str, Any] = {}
             failure_msgs: list[str] = []
 
-            r_pause = _step(sys_url, "pause_generation", {}, admin_timeout_s)
-            steps["pause"] = r_pause
-            if r_pause.get("status") != "ok":
-                _step(sys_url, "resume_generation", {}, admin_timeout_s)
-                failure_msgs.append(f"pause@{sys_url}({inst_id}): {r_pause}")
-                return inst_id, failure_msgs, steps
-
-            try:
-                attempt = 0
-                r_refit = {"status": "error", "reason": "not attempted"}
-                while True:
-                    attempt += 1
-                    r_refit = _step(
-                        sys_url, "update_weights_via_mx", payload, refit_timeout_s
-                    )
-                    steps["refit"] = r_refit
-                    if r_refit.get("status") == "ok":
-                        break
-                    if _time.monotonic() >= _cycle_deadline:
-                        failure_msgs.append(
-                            f"refit@{sys_url}({inst_id}) after {attempt} attempts "
-                            f"(deadline exceeded): {r_refit}"
-                        )
-                        break
-                    _time.sleep(min(3.0, 0.5 * attempt))
-                steps["refit_attempts"] = attempt
-
-                r_flush = _step(sys_url, "flush_cache", {}, admin_timeout_s)
-                steps["flush"] = r_flush
-                if r_flush.get("status") not in ("ok", None):
-                    failure_msgs.append(f"flush@{sys_url}({inst_id}): {r_flush}")
-            finally:
-                r_resume = _step(
-                    sys_url, "resume_generation", {}, admin_timeout_s
+            attempt = 0
+            r_refit = {"status": "error", "reason": "not attempted"}
+            while True:
+                attempt += 1
+                r_refit = _step(
+                    sys_url, "update_weights_via_mx", payload, refit_timeout_s
                 )
-                steps["resume"] = r_resume
-                if r_resume.get("status") != "ok":
-                    failure_msgs.append(f"resume@{sys_url}({inst_id}): {r_resume}")
+                steps["refit"] = r_refit
+                if r_refit.get("status") == "ok":
+                    break
+                if _time.monotonic() >= _cycle_deadline:
+                    failure_msgs.append(
+                        f"refit@{sys_url}({inst_id}) after {attempt} attempts "
+                        f"(deadline exceeded): {r_refit}"
+                    )
+                    break
+                _time.sleep(min(3.0, 0.5 * attempt))
+            steps["refit_attempts"] = attempt
+
+            r_flush = _step(sys_url, "flush_cache", {}, admin_timeout_s)
+            steps["flush"] = r_flush
+            if r_flush.get("status") not in ("ok", None):
+                failure_msgs.append(f"flush@{sys_url}({inst_id}): {r_flush}")
 
             return inst_id, failure_msgs, steps
 

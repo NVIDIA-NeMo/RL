@@ -45,8 +45,14 @@ cluster:
       mx_server_url: "modelexpress-server.default.svc.cluster.local:8001"
       timeout_seconds: 300.0
       same_rank_only: true
-      # 16 receivers — enable peer republish/pull fan-out.
-      tree_scale_out: true
+      # Tree fan-out is left off pending further debugging — see
+      # results.md "Tree fan-out followups". The wave-parallel
+      # dispatcher alone already gives ~2.5x speedup; tree fan-out
+      # adds another layer of shape/state subtleties (replica publish
+      # missing shape_registry, MX server source TTL=-1 in Redis,
+      # tensor_shapes mismatch between trainer's global publish and
+      # receiver's local-named-params fallback).
+      tree_scale_out: false
       # Qwen3-4B is dense; expert filter is a no-op but harmless.
       moe_expert_filter: false
       nic_pin: "auto"

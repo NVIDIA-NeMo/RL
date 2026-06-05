@@ -85,15 +85,47 @@ spec:
           # tokenize-endpoint + MX v2 mid-training refit + bundled-UCX nixl +
           # modelexpress @ kavink/nemo_rl_moe @ 8594fd6. See sibling DGD for
           # the full provenance note.
+          #
+          # Tree fan-out overlay: the baked modelexpress + dynamo extension
+          # predate the inference_replica heartbeat / worker_id /
+          # named_parameters fixes. Overlay the post-fix sources from Lustre
+          # into the venv before dynamo.vllm starts. Same pattern as the
+          # 1-pod MX DGD; copy modelexpress to /tmp first (Lustre egg-info
+          # mtime issue) then pip install --force-reinstall --no-deps; then
+          # cp the extension.py over the baked file.
           image: jwillthomson/dynamo-arm-tokenize-endpoint-8590c26:latest
           workingDir: /workspace
           volumeMounts:
             - mountPath: /mnt/rl-workspace
               name: rl-workspace
           command:
-            - python3
-            - -m
-            - dynamo.vllm
+            - /bin/bash
+            - -c
+            - |
+              echo "[mx-debug] start $(date -u +%FT%TZ)"
+              MX_SRC=/tmp/mx-src
+              rm -rf "$MX_SRC"
+              cp -a /mnt/rl-workspace/jothomson/modelexpress/modelexpress_client/python "$MX_SRC"
+              rm -rf "$MX_SRC"/modelexpress.egg-info "$MX_SRC"/build "$MX_SRC"/__pycache__
+              echo "[mx-debug] installing overlay from $MX_SRC"
+              /opt/dynamo/venv/bin/pip install --force-reinstall --no-deps "$MX_SRC"
+              INSTALL_RC=$?
+              echo "[mx-debug] pip install exit=$INSTALL_RC"
+              if [ "$INSTALL_RC" -ne 0 ]; then
+                echo "[mx-debug] FATAL: overlay install failed"
+                exit "$INSTALL_RC"
+              fi
+              MXRX_SRC=/mnt/rl-workspace/jothomson/dynamo/components/src/dynamo/vllm/mx_refit/extension.py
+              MXRX_DST=/opt/dynamo/venv/lib/python3.12/site-packages/dynamo/vllm/mx_refit/extension.py
+              if [ -f "$MXRX_SRC" ]; then
+                cp "$MXRX_SRC" "$MXRX_DST"
+                echo "[mx-debug] overlaid extension.py: $(md5sum $MXRX_DST | cut -d' ' -f1)"
+              else
+                echo "[mx-debug] WARN: $MXRX_SRC missing; not overlaying extension.py"
+              fi
+              echo "[mx-debug] handoff to dynamo.vllm $(date -u +%FT%TZ)"
+              exec python3 -m dynamo.vllm "$@"
+            - --   # script-name placeholder so dynamo args land as $1, $2, ...
           args:
             - --model
             - Qwen/Qwen3-4B-Thinking-2507
