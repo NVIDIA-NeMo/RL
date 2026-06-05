@@ -201,7 +201,7 @@ class MegatronPolicyWorkerImpl(
         )
         # Handle model import if needed. Subclasses (e.g. ModelOpt quant
         # worker) may set ``_model_import_post_wrap_hook`` and
-        # ``_transformer_layer_spec`` on ``self`` before calling
+        # layer-spec hooks on ``self`` before calling
         # super().__init__() to inject quantization hooks into HF->Megatron
         # import.
         handle_model_import(
@@ -211,6 +211,7 @@ class MegatronPolicyWorkerImpl(
             pt_checkpoint_exists,
             model_post_wrap_hook=getattr(self, "_model_import_post_wrap_hook", None),
             transformer_layer_spec=getattr(self, "_transformer_layer_spec", None),
+            mamba_stack_spec=getattr(self, "_mamba_stack_spec", None),
         )
 
         # Store tokenizer

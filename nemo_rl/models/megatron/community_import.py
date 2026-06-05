@@ -47,6 +47,7 @@ def import_model_from_hf_name(
     megatron_config: Optional[MegatronConfig] = None,
     model_post_wrap_hook: Optional[Callable] = None,
     transformer_layer_spec: Optional[ModuleSpec | Callable] = None,
+    mamba_stack_spec: Optional[ModuleSpec | Callable] = None,
     **config_overrides: Any,
 ):
     """Import a Hugging Face model into Megatron checkpoint format and save the Megatron checkpoint to the output path.
@@ -61,6 +62,9 @@ def import_model_from_hf_name(
         transformer_layer_spec: Optional Megatron ``ModuleSpec`` (or callable
             returning one) overriding the default layer spec selected by the
             model provider.
+        mamba_stack_spec: Optional Megatron ``ModuleSpec`` (or callable
+            returning one) overriding the default Mamba stack spec selected by
+            Mamba model providers.
         **config_overrides: Extra keyword arguments forwarded to
             ``AutoBridge.from_hf_pretrained``.
     """
@@ -113,6 +117,8 @@ def import_model_from_hf_name(
         ]
     if transformer_layer_spec is not None:
         model_provider.transformer_layer_spec = transformer_layer_spec
+    if mamba_stack_spec is not None and hasattr(model_provider, "mamba_stack_spec"):
+        model_provider.mamba_stack_spec = mamba_stack_spec
     model_provider.finalize()
 
     from megatron.core import parallel_state
