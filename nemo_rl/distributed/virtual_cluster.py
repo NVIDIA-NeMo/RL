@@ -42,9 +42,9 @@ class ClusterConfig(TypedDict):
     # (25000-28000).  See ray.sub for the full port layout.
     master_port_range_low: NotRequired[int]
     master_port_range_high: NotRequired[int]
-    segment_size: NotRequired[
-        int
-    ]  # Nodes per NVLink domain segment for topology-aware alignment
+    segment_size: (
+        int | None
+    )  # Nodes per NVLink domain segment for topology-aware alignment; None to disable
 
 
 # Get the directory path of the current module and the root of the package
