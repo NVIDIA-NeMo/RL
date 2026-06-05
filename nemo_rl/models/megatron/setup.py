@@ -505,11 +505,20 @@ def setup_model_config(
     if fmt == "megatron_lm":
         model_cfg.finalize()
 
+    # Derive fp8_param_enabled once from the config dict so that load_main_params_from_ckpt
+    # and _create_megatron_config both use the same canonical check (fp8 enabled AND fp8_param).
+    fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
+    fp8_param_enabled = bool(
+        fp8_cfg
+        and fp8_cfg.get("enabled", False)
+        and fp8_cfg.get("fp8_param", False)
+    )
+
     # When fp8_param starts from a pretrained checkpoint, model params may already
     # be quantized before optimizer main params are initialized. Load main params
     # from the checkpoint state dict to preserve the original checkpoint precision.
     load_main_params_from_ckpt = (
-        bool(getattr(model_cfg, "fp8_param", False))
+        fp8_param_enabled
         and pretrained_path is not None
         and weights_path is None
         and optimizer_path is None
@@ -528,7 +537,7 @@ def setup_model_config(
 
     # Create final megatron config
     megatron_cfg = _create_megatron_config(
-        model_cfg, checkpoint_config, config, hf_model_name, dtype
+        model_cfg, checkpoint_config, config, hf_model_name, dtype, fp8_param_enabled
     )
 
     _validate_dtype_config(dtype, megatron_cfg.model, megatron_cfg.optimizer)
@@ -855,6 +864,7 @@ def _create_megatron_config(
     config: PolicyConfig,
     hf_model_name: str,
     dtype: torch.dtype,
+    fp8_param_enabled: bool = False,
 ) -> ConfigContainer:
     """Create the final Megatron configuration container."""
     # fp8_param_gather and reuse_grad_buf_for_mxfp8_param_ag are derived: both are
@@ -862,11 +872,6 @@ def _create_megatron_config(
     # DDP __post_init__ asserts they remain in sync, so we centralize the derivation
     # rather than exposing two redundant YAML knobs that can disagree.
     fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
-    fp8_param_enabled = bool(
-        fp8_cfg
-        and fp8_cfg.get("enabled", False)
-        and fp8_cfg.get("fp8_param", False)
-    )
     reuse_grad_buf_for_mxfp8_param_ag = (
         fp8_param_enabled and fp8_cfg.get("fp8_recipe") == "mxfp8"
     )
