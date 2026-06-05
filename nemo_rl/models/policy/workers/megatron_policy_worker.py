@@ -1192,6 +1192,131 @@ class MegatronPolicyWorkerImpl(
             post_iter_func=lambda x: x[1],
         )
 
+    @torch.no_grad()
+    @wrap_with_nvtx_name("megatron_policy_worker/stream_weights_via_mx")
+    def stream_weights_via_mx(
+        self,
+        *,
+        version: int,
+        mx_config: Any,
+    ) -> None:
+        """Publish per-rank Megatron-native shards to ModelExpress (v2 path).
+
+        Megatron analogue of :meth:`DTensorPolicyWorkerImpl.stream_weights_via_mx`,
+        but instead of walking ``model.state_dict()`` and calling ``to_local()``
+        on DTensors, this iterates ``model.named_parameters()`` and uses
+        :func:`nemo_rl.distributed.mx_megatron_helpers.collect_megatron_publish_set`
+        to:
+
+        * classify each parameter into one of seven Megatron roles
+          (qkv_column, gated_mlp_column, column, row, vocab_parallel,
+          replicated, expert_column / expert_row);
+        * skip replicated tensors on TP ranks > 0 (rank 0 publishes for the
+          replicated set);
+        * publish the native shard as-is — Megatron's parameter storage
+          already holds only the local TP/PP/EP slice, so no allgather is
+          needed.
+
+        See ``temp/NemoRL_Megatron_MX_Design.md`` §4 for the contract; the
+        receiver-side slice planner that consumes this metadata lives in
+        ``modelexpress.nemo_rl_v2`` (PR #421 commit ``12c73a7``).
+        """
+        if kv_scales := getattr(self, "_kv_scales_for_mx", None):
+            raise NotImplementedError(
+                "FP8 kvcache scales are not yet supported on the Megatron MX path"
+            )
+
+        from megatron.core import parallel_state
+
+        from nemo_rl.distributed.mx_helpers import build_v2_publisher
+        from nemo_rl.distributed.mx_megatron_helpers import (
+            collect_megatron_publish_set,
+        )
+
+        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        pp_size = parallel_state.get_pipeline_model_parallel_world_size()
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        ep_size = parallel_state.get_expert_model_parallel_world_size()
+        ep_rank = parallel_state.get_expert_model_parallel_rank()
+
+        # ---- Lazy-init the publisher (once per worker lifetime). ----
+        if not hasattr(self, "_mx_publisher") or self._mx_publisher is None:
+            self._mx_publisher = build_v2_publisher(
+                rank=self.rank,
+                device_id=getattr(self, "local_device_index", self.rank),
+                fsdp_world_size=self.dp_size,
+                tp_world_size=tp_size,
+                pp_world_size=pp_size,
+                ep_world_size=ep_size,
+                mx_config=mx_config,
+                agent_name=f"nemo-rl-megatron-trainer-r{self.rank}",
+            )
+            self._mx_publisher.initialize(
+                model_name=self.cfg["model_name"],
+                dtype=str(self.dtype).removeprefix("torch."),
+            )
+
+        # ---- Resolve attention head metadata for qkv_column descriptors. ----
+        # Megatron-Core's transformer_config carries this; for non-mainline
+        # models the lookup falls back to None and the role descriptor will
+        # omit the per-rank head counts (Phase B planner aggregates across
+        # contributing sources, so this is recoverable on the receiver side
+        # for matched-TP).
+        tcfg = getattr(self.megatron_bridge, "transformer_config", None)
+        num_attention_heads = getattr(tcfg, "num_attention_heads", None) if tcfg else None
+        num_kv_heads = (
+            getattr(tcfg, "num_query_groups", None) if tcfg else None
+        ) or num_attention_heads
+        head_dim = (
+            getattr(tcfg, "kv_channels", None) if tcfg else None
+        ) or (
+            num_attention_heads and getattr(tcfg, "hidden_size", 0) // num_attention_heads
+            if tcfg else None
+        )
+
+        role_overrides = getattr(mx_config, "megatron_role_overrides", None) or {}
+
+        # ---- Add tensors. ----
+        if hasattr(self._mx_publisher, "_registry"):
+            self._mx_publisher._registry.clear()
+        if hasattr(self._mx_publisher, "_registered_tensors"):
+            self._mx_publisher._registered_tensors.clear()
+
+        # Stamp the publisher's mesh position so the source identity and
+        # sidecar will carry tp_rank / pp_rank / ep_rank for receivers.
+        self._mx_publisher.set_megatron_mesh_position(
+            tp_rank=tp_rank, pp_rank=pp_rank, ep_rank=ep_rank,
+        )
+
+        for name, local, spec, extras in collect_megatron_publish_set(
+            self.model,
+            tp_size=tp_size, pp_size=pp_size, pp_rank=pp_rank,
+            ep_size=ep_size, ep_rank=ep_rank, tp_rank=tp_rank,
+            num_attention_heads=num_attention_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            role_overrides=role_overrides,
+            target_dtype=self.dtype,
+        ):
+            # Per-tensor megatron metadata goes into the registry via
+            # the new add_tensor kwargs (megatron_role, megatron_extras).
+            # The per-source mesh position was already stamped above and
+            # rides on identity.extra_parameters / sidecar.
+            self._mx_publisher.add_tensor(
+                name=name,
+                tensor=local,
+                is_expert=spec.is_expert,
+                expert_axis=spec.expert_axis,
+                owned_expert_ids=spec.owned_expert_ids,
+                megatron_role=spec.role,
+                megatron_extras=spec.descriptor_extras,
+            )
+
+        # ---- Publish + mark ready. ----
+        self._mx_publisher.publish(version=int(version))
+        self._mx_publisher.mark_ready()
+
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)
         self.model.eval()
