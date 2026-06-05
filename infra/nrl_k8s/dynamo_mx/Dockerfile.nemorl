@@ -18,6 +18,10 @@
 # All three are pure pip installs — the base nemo-rl image already has UCX,
 # libibverbs, libcudart, etc.
 #
+# Also bakes the system packages singularity-container + squashfuse (+ squashfs-
+# tools) so swe_agents can `singularity exec` SWE-bench SIF sandboxes — runtime
+# apt for these is unreliable from the GB300 nodes (see the apt layer below).
+#
 # Build (defaults below are what we currently target; override with
 # --build-arg if you need a different base / MX commit / NIXL wheel):
 #   docker buildx build --platform linux/arm64 \
@@ -56,6 +60,32 @@ ARG PROTOBUF_VERSION=6.31.1
 # protobuf 6 and explicitly supports `protobuf<8`. Upgrade in lockstep
 # with the protobuf force-upgrade.
 ARG WANDB_VERSION=0.26.1
+
+# ---------------------------------------------------------------------------
+# System: singularity-container + squashfuse for the swe_agents SIF sandboxes.
+# Baked at BUILD time because runtime apt in the pod postStart is unreliable
+# from the GB300 nodes — ports.ubuntu.com index fetches fail there, leaving an
+# empty package list ("E: Unable to locate package singularity-container"),
+# which flaps the head and 900s-times-out the RayCluster ready gate. The build
+# runs on a normal-network builder with no readiness deadline, so apt is
+# reliable here (retried for safety). arm64 has no apptainer .deb;
+# singularity-container is the correct package (SIF + build CLI interchangeable).
+# squashfuse = FUSE SIF mount (no kernel loop needed); squashfs-tools for the
+# /dev/loop fallback. The postStart hook now only verifies presence + mknods
+# /dev/loop* (a runtime-only op); it no longer installs.
+# ---------------------------------------------------------------------------
+USER root
+RUN set -eux; \
+    ok=0; \
+    for attempt in 1 2 3 4 5; do \
+      if apt-get update -o Acquire::Retries=5 \
+         && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              singularity-container squashfuse squashfs-tools; then ok=1; break; fi; \
+      echo "[build] apt attempt ${attempt} failed; retrying in 15s"; sleep 15; \
+    done; \
+    [ "${ok}" = 1 ]; \
+    command -v singularity; singularity --version; command -v squashfuse; \
+    rm -rf /var/lib/apt/lists/*
 
 # Install into the main venv (used by the training driver entrypoint).
 # NIXL ships as two wheels: `nixl` (the Python bindings) + `nixl-cu13`

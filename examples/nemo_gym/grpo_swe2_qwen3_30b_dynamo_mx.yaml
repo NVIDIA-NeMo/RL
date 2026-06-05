@@ -1,0 +1,312 @@
+# =============================================================================
+# SWE2 Async-GRPO replication on GB300 — DTensor trainer + Dynamo generation
+# =============================================================================
+# Adapts the baseline SWE2 run (wandb nvidia/binhu-nemo-rl/dc3m70us, slurm
+# recipe examples/swe_bench/grpo_qwen3_30b_async_swe.yaml on cw-dfw-cs) to the
+# GB300 (arm64) k8s cluster via nrl-k8s.
+#
+# DELIBERATE DEPARTURES FROM THE SLURM BASELINE (all forced by the platform):
+#   * Trainer  Megatron -> **DTensor v2** (FSDP2 + expert-parallel MoE).
+#       WHY: non-colocated Dynamo refit goes only through MX
+#       (stream_weights_via_mx), which is implemented ONLY on the DTensor
+#       worker — the Megatron worker has no MX path, so Megatron+Dynamo async
+#       refit fails at step 1. See memory reference_dynamo_refit_dtensor_only.
+#   * Generation  vLLM -> **Dynamo** (DGD), with KV-cache-aware routing
+#       (--router-mode kv set on the DGD Frontend) and MX mid-training refit.
+#   * Data  R2E-Gym subset (4518, x86 sandboxes) -> **SWE-bench Verified arm64
+#       (281)**. The R2E-Gym arm64 sandboxes don't exist on this cluster; the
+#       281 Verified arm64 .sif set is the only runnable SWE substrate here.
+#       train == val (mirrors the baseline).
+#
+# UNPROVEN / SMOKE-GATED (read before launching):
+#   * max_total_sequence_length=131072 on the DTensor-automodel MoE path is
+#     UNVERIFIED. Every proven MoE-automodel recipe in this repo is 4096 seqlen
+#     (grpo-qwen3.5-35ba3b-*-automodel-ep16, dpo-nanov3-30B3AB-*-fsdp8ep8).
+#     RECOMMEND: first smoke at policy.max_total_sequence_length=32768 (Hydra
+#     override) to validate the DTensor MoE mesh + memory, then scale to 131072.
+#   * The TP x CP x EP mesh below is a STARTING POINT, not a proven layout. If
+#     it OOMs or the mesh fails to factor, the levers are: raise CP (shard the
+#     sequence), raise TP, or drop seqlen. Re-derive make_sequence_length_
+#     divisible_by when you change TP/CP.
+#   * tool/reasoning parsing: the baseline shipped a CUSTOM Qwen3 chat template
+#     under vllm_cfg.http_server (vLLM-only). On Dynamo that path is unused;
+#     parsing is done by the DGD worker's --dyn-tool-call-parser hermes /
+#     --dyn-reasoning-parser deepseek_r1. Confirm the model's built-in chat
+#     template emits <tool_call> blocks; if not, supply --chat-template on the
+#     DGD worker. This is THE thing the run exists to verify (real function_call
+#     items -> non-zero reward from step 1).
+#
+# Paired infra: infra/nrl_k8s/examples/grpo_swe2_qwen3_30b_dynamo_mx.gb300.infra.yaml
+# Paired DGD:   infra/nrl_k8s/examples_dgd/qwen3_30b_thinking_gb300_mx.yaml
+# =============================================================================
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/grpo-swe2-qwen3-30b-dynamo-mx"
+  metric_name: "train:total_reward/mean"
+  higher_is_better: true
+  keep_top_k: 2
+  save_period: 5
+  model_save_format: "safetensors"
+  save_consolidated: false
+  save_optimizer: true
+
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
+  num_val_generations_per_prompt: 1
+  max_rollout_turns: 1
+  max_num_epochs: 100
+  max_num_steps: 1000000
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  advantage_clip_low: -100
+  advantage_clip_high: 100
+  val_period: 1000          # baseline launcher effectively disabled val
+  val_at_start: false
+  val_at_end: false
+  overlong_filtering: true
+  max_val_samples: null
+  val_batch_size: 256
+  seed: 42
+  invalid_tool_call_strategy: ""
+
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1
+
+  penalize_invalid_tool_call: true
+  invalid_tool_call_advantage: -5.0
+  penalize_malformed_thinking: true
+  malformed_thinking_advantage: -5.0
+
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 128
+    overlong_buffer_penalty: 1
+    max_response_length: ${policy.max_total_sequence_length}
+    stop_properly_penalty_coef: null
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
+
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: false
+
+  seq_logprob_error_threshold: null
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  reference_policy_kl_type: "k3"
+  kl_input_clamp_value: null
+  kl_output_clamp_value: null
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: true
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_ratio: 5.0
+  truncated_importance_sampling_ratio_min: null
+  truncated_importance_sampling_type: tis
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  force_on_policy_ratio: true
+  use_kl_in_reward: false
+
+policy:
+  # SWE1 step_230_hf init checkpoint, staged on the shared PVC. Used verbatim as
+  # the trainer load path AND (via the gym) as the `model:` field sent to the
+  # Dynamo frontend, so the DGD must serve under this exact string — keep it
+  # byte-identical (no trailing slash) here and in the DGD --model/--model-name.
+  # Accepting the known discovery::watcher path-404 risk per jothomson.
+  model_name: "/mnt/rl-workspace/jothomson/swe_asyncrl_test/model/step_230_hf"
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs:
+      enable_thinking: true
+  hf_config_overrides: {}
+  train_global_batch_size: 64
+  train_micro_batch_size: 1
+  generation_batch_size: 64
+  logprob_batch_size: 1
+  max_total_sequence_length: 32768    # SMOKE (full-size target: 131072)
+  precision: "bfloat16"
+  logprob_chunk_size: 2048
+  offload_optimizer_for_logprob: true
+
+  # ----- Megatron OFF (no MX refit path) -----
+  megatron_cfg:
+    enabled: false
+
+  # ----- DTensor v2 (FSDP2 + expert-parallel MoE) ON -----
+  # SMOKE layout: mirrors the proven grpo-qwen3.5-35ba3b-2n8g-automodel-ep16
+  # shape exactly — EP == world (16), no TP/CP — the lowest-risk DTensor MoE
+  # config. At 32k seqlen on 16 GB300 GPUs this fits without TP/CP sharding.
+  # FULL-SIZE (131k) would re-introduce TP/CP — see header; re-derive
+  # make_sequence_length_divisible_by then.
+  dtensor_cfg:
+    _v2: true
+    enabled: true
+    cpu_offload: false
+    sequence_parallel: false         # no TP -> SP off
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    expert_parallel_size: 16         # EP == world (4 nodes x 4 GPU); 128 experts -> 8/rank
+    custom_parallel_plan: null
+    automodel_kwargs:
+      backend:
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
+        attn: te
+        linear: te
+        rms_norm: te
+        enable_deepep: true
+        fake_balanced_gate: false
+        rope_fusion: false
+        enable_hf_state_dict_adapter: true
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+
+  # DTensor worker reads policy.optimizer/scheduler directly (Megatron reads
+  # policy.megatron_cfg.optimizer). Baseline: constant lr=1e-6, wd=0.
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 1.0e-6
+      weight_decay: 0.0
+      betas: [0.9, 0.999]
+      eps: 1e-8
+  scheduler:
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: []
+
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  # DTensor TP=1 -> no divisibility constraint. Re-derive (TP*CP*2) for full-size.
+  make_sequence_length_divisible_by: 1
+  max_grad_norm: 1.0
+
+  generation:
+    # Generation is entirely on the DGD; nothing colocated on the trainer.
+    # dgd_name is stamped at launch via Hydra `+` override (see infra entrypoint).
+    backend: "dynamo"
+    dynamo_cfg:
+      tool_call_parser: "hermes"
+      reasoning_parser: "deepseek_r1"
+      # frontend_port (8000) + namespace fall through to operator defaults.
+    colocated:
+      enabled: false
+
+data:
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 1
+  use_multiple_dataloader: false
+  train:
+    data_path: "/mnt/rl-workspace/jothomson/swebench_containers/swebench_verified_arm64.jsonl"
+  validation:
+    data_path: "/mnt/rl-workspace/jothomson/swebench_containers/swebench_verified_arm64.jsonl"
+  default:
+    dataset_name: NemoGymDataset
+    env_name: "nemo_gym"
+    prompt_file: null
+    system_prompt_file: null
+    processor: "nemo_gym_data_processor"
+
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true   # log full trajectories to verify function_call items appear
+  nemo_gym:
+    skip_venv_if_present: true
+    port_range_low: 15001
+    port_range_high: 20000
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - responses_api_agents/swe_agents/configs/swebench_openhands_training.yaml
+    # Re-enable thinking on the model server (Qwen3-Thinking always emits
+    # <think>…</think>); mirrors the workplace dynamo recipe.
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: true
+          extra_body:
+            chat_template_kwargs:
+              enable_thinking: true
+    swe_agents_train:
+      responses_api_agents:
+        swe_agents:
+          agent_max_turns: 200
+          concurrency: 64            # TODO: tune down for the smaller GB300 gen pool
+          swebench_agent_timeout: 1800
+          run_with_mixed_prompts: true
+          dataset_path: ${data.train.data_path}
+          # Local arm64 .sif set. The gym's _find_container auto-encodes
+          # `__`->`_1776_` (and fuzzy-globs), so the raw {instance_id} resolves
+          # to the on-disk file. See memory reference_swebench_arm64_coverage.
+          container_formatter:
+          - "/mnt/rl-workspace/jothomson/swebench_containers/swebench_sweb.eval.arm64.{instance_id}.sif"
+    swe_agents_val:
+      responses_api_agents:
+        swe_agents:
+          agent_max_turns: 200
+          concurrency: 64
+          swebench_agent_timeout: 1800
+          dataset_path: ${data.validation.data_path}
+          container_formatter:
+          - "/mnt/rl-workspace/jothomson/swebench_containers/swebench_sweb.eval.arm64.{instance_id}.sif"
+    use_absolute_ip: true
+
+# ----- ModelExpress v2 weight-sync (mandatory for Dynamo refit) -----
+cluster:
+  gpus_per_node: 4          # GB300 = 4 GPU/node
+  num_nodes: 4              # SMOKE: 4 nodes x 4 = 16 training GPUs, fits one clique (full-size: 8)
+  weight_sync:
+    method: "mx"
+    mx_config:
+      enabled: true
+      mx_server_url: "modelexpress-server.default.svc.cluster.local:8001"
+      timeout_seconds: 300.0
+      same_rank_only: true
+      # Qwen3-30B-A3B IS MoE -> enable the expert filter (unlike the dense 4B
+      # smoke). Pairs with detect_moe_expert_layout in the DTensor worker.
+      moe_expert_filter: true
+      # Keep tree_scale_out OFF for a static gen pool (memory:
+      # project_tree_scale_out_hurts_refit_perf). Flip on only with autoscaling.
+      tree_scale_out: false
+      nic_pin: "auto"
+      retain_latest_k: 1
+
+logger:
+  log_dir: "logs/grpo-swe2-qwen3-30b-dynamo-mx"
+  num_val_samples_to_print: 0
+  wandb_enabled: true
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  monitor_gpus: true
+  swanlab_enabled: false
+  wandb:
+    project: "swe-benchmark"
+    name: "grpo-swe2-qwen3-30b-dynamo-mx-gb300"
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
