@@ -934,6 +934,75 @@ def test_router_replay_missing_route_sentinel_uses_megatron_topk():
 
 
 @pytest.mark.mcore
+def test_router_replay_backward_queue_is_fifo_across_replayed_microbatches():
+    from megatron.core.transformer.moe.router_replay import (
+        RouterReplay,
+        RouterReplayAction,
+    )
+
+    from nemo_rl.models.megatron.router_replay import (
+        _install_missing_route_fallback_patch,
+    )
+
+    RouterReplay.clear_global_router_replay_instances()
+
+    def default_compute_topk(scores, topk, num_groups=None, group_topk=None):
+        return torch.topk(scores, k=topk, dim=1)
+
+    try:
+        _install_missing_route_fallback_patch()
+        replay = RouterReplay()
+        scores_0 = torch.tensor(
+            [
+                [0.1, 0.9, 0.2],
+                [0.4, 0.2, 0.8],
+            ],
+            dtype=torch.float32,
+        )
+        scores_1 = torch.tensor(
+            [
+                [0.6, 0.3, 0.7],
+                [0.5, 0.1, 0.4],
+            ],
+            dtype=torch.float32,
+        )
+        target_0 = torch.tensor([[1, 2], [2, 0]], dtype=torch.long)
+        target_1 = torch.tensor([[2, 0], [0, 2]], dtype=torch.long)
+
+        replay.set_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+        replay.set_target_indices(target_0)
+        _, forward_indices_0 = replay.get_replay_topk(
+            scores_0, 2, default_compute_topk=default_compute_topk
+        )
+        replay.set_target_indices(target_1)
+        _, forward_indices_1 = replay.get_replay_topk(
+            scores_1, 2, default_compute_topk=default_compute_topk
+        )
+
+        assert torch.equal(forward_indices_0, target_0)
+        assert torch.equal(forward_indices_1, target_1)
+        assert len(replay.replay_backward_list) == 2
+        assert torch.equal(replay.replay_backward_list[0], target_0)
+        assert torch.equal(replay.replay_backward_list[1], target_1)
+
+        replay.set_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
+        _, backward_indices_0 = replay.get_replay_topk(
+            scores_0, 2, default_compute_topk=default_compute_topk
+        )
+        assert torch.equal(backward_indices_0, target_0)
+        assert len(replay.replay_backward_list) == 1
+        assert torch.equal(replay.replay_backward_list[0], target_1)
+
+        _, backward_indices_1 = replay.get_replay_topk(
+            scores_1, 2, default_compute_topk=default_compute_topk
+        )
+        assert torch.equal(backward_indices_1, target_1)
+        assert replay.replay_backward_list == []
+    finally:
+        RouterReplay.clear_global_router_replay_instances()
+
+
+@pytest.mark.mcore
 def test_router_replay_validation_allows_all_negative_fallback_rows(monkeypatch):
     from nemo_rl.models.megatron.router_replay import _validate_replay_tensor
 
