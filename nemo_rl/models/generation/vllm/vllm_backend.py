@@ -342,12 +342,30 @@ class VllmInternalWorkerExtension:
         (optionally) republish self as an inference replica for tree
         fan-out.
 
+        Megatron-MX path: if the discovered source's v2 metadata carries
+        ``publisher_kind == "megatron"`` (set by Megatron-Core trainers
+        per ``modelexpress.megatron_translator.SIDECAR_*`` keys), route
+        through :func:`_update_weights_via_mx_megatron` instead. The
+        Megatron path uses the receiver-side slice planner +
+        Bridge-shaped translator (``modelexpress.megatron_translator``)
+        to assemble per-rank shards into HF tensors via the vendored
+        QKV un-interleave + gated-MLP split helpers. The translator
+        does not depend on Megatron-Bridge being installed in the
+        worker image.
+
         Returns ``True`` on successful refit.
         """
         try:
             assert self.state_dict_info is not None, (
                 "state_dict_info not prepared; call prepare_refit_info() first"
             )
+
+            # First-cycle Megatron check: peek at any cached candidates we
+            # may have, otherwise discover for the megatron-mode flag and
+            # cache. The Megatron path has its own discover/plan loop, so
+            # we only do enough discover here to detect the publisher kind.
+            if not hasattr(self, "_mx_megatron_mode"):
+                self._mx_megatron_mode = None  # None = unknown, True/False = latched
 
             # ---- Lazy-init receiver and register receive buffers (once) ----
             if not hasattr(self, "_mx_receiver") or self._mx_receiver is None:
@@ -393,6 +411,23 @@ class VllmInternalWorkerExtension:
                     f"{self._mx_receiver.worker_rank}"
                 )
                 return False
+
+            # Latch the receiver mode on the first non-empty discovery.
+            if self._mx_megatron_mode is None:
+                self._mx_megatron_mode = any(
+                    c.megatron_meta is not None for c in candidates
+                )
+                if self._mx_megatron_mode:
+                    print(
+                        f"[mx] rank={self._mx_receiver.worker_rank} latched "
+                        f"Megatron-MX receiver mode (sources advertise "
+                        f"publisher_kind=megatron)"
+                    )
+
+            if self._mx_megatron_mode:
+                return self._update_weights_via_mx_megatron(
+                    candidates=candidates, version=int(version), mx_config=mx_config,
+                )
 
             chosen = self._mx_receiver.pick_best_source(candidates)
             if chosen is None:
@@ -457,6 +492,144 @@ class VllmInternalWorkerExtension:
                 f"{traceback.format_exc()}"
             )
             return False
+
+    @wrap_with_nvtx_name(
+        "vllm_internal_worker_extension/update_weights_via_mx_megatron"
+    )
+    def _update_weights_via_mx_megatron(
+        self,
+        *,
+        candidates: list,
+        version: int,
+        mx_config: Any,
+    ) -> bool:
+        """Megatron-MX path of :meth:`update_weights_via_mx`.
+
+        Routes through ``modelexpress.megatron_translator``'s slice
+        planner + assembly pipeline. The trainer publishes per-rank
+        Megatron-native shards (no allgather); we discover the slice
+        plan, pull each rank's contribution into a pre-allocated global
+        tensor, and apply role-aware translation (QKV un-interleave,
+        gated-MLP split, name remap) using the vendored helpers — no
+        Megatron-Bridge import required in the worker image.
+
+        See ``temp/NemoRL_Megatron_MX_Design.md`` §6 + §9b and
+        ``temp/NemoRL_Megatron_MX_Phase_C_Handoff.md``.
+        """
+        from modelexpress.megatron_translator import (
+            MegatronReceiverContext,
+            ReceiveSpec,
+            discover_megatron_context,
+            run_refit_cycle,
+        )
+        from modelexpress.nemo_rl_v2 import TargetTpLayout
+
+        # ---- One-shot: build context from the first cycle's metadata. ----
+        if not hasattr(self, "_mx_megatron_ctx") or self._mx_megatron_ctx is None:
+            cfg, name_map = discover_megatron_context(candidates)
+            if cfg is None:
+                print(
+                    "[mx-megatron] sources advertise publisher_kind=megatron but "
+                    "no transformer_config sidecar; falling back to non-Megatron "
+                    "path on next cycle"
+                )
+                self._mx_megatron_mode = False
+                return False
+
+            # Build receive specs: one per Megatron tensor name in the
+            # sidecar's name_map. The receiver's TARGET layout is its own
+            # vLLM TP × EP shape.
+            target_tp = getattr(self.parallel_config, "tensor_parallel_size", 1)
+            target_tp_rank = (
+                torch.distributed.get_rank(
+                    group=getattr(self, "_tp_process_group", None)
+                )
+                if torch.distributed.is_initialized()
+                else 0
+            )
+            target_tp_layout = TargetTpLayout(
+                tp_size=target_tp, tp_rank=target_tp_rank,
+            )
+
+            # For each Megatron source-name → list of HF target names, build
+            # one ReceiveSpec. Shape + role come from the source's
+            # TensorDescriptorV2 in the published shape_registry; the
+            # receiver-side parser is in modelexpress.nemo_rl_v2.
+            receive_specs: dict[str, ReceiveSpec] = {}
+            for cand in candidates:
+                if cand.megatron_meta is None or cand.registry is None:
+                    continue
+                for td in cand.registry.get("tensors", []):
+                    if td.name in receive_specs:
+                        continue
+                    role = td.megatron_role or ""
+                    if not role:
+                        continue
+                    hf_names = name_map.get(td.name, [td.name])
+                    receive_specs[td.name] = ReceiveSpec(
+                        megatron_name=td.name,
+                        hf_names=list(hf_names),
+                        role=role,
+                        target_shape=tuple(int(s) for s in td.global_shape),
+                        target_dtype=td.dtype,
+                        shard_axis=int(td.shard_axis),
+                        pp_rank=cand.megatron_meta.pp_rank,
+                        role_descriptor=dict(td.megatron_extras or {}),
+                    )
+
+            self._mx_megatron_ctx = MegatronReceiverContext(
+                target_tp_layout=target_tp_layout,
+                transformer_config=cfg,
+                hf_name_map=name_map,
+                receive_specs=receive_specs,
+            )
+            print(
+                f"[mx-megatron] built receive context: tp={target_tp} "
+                f"tensors={len(receive_specs)} cfg={cfg}"
+            )
+
+        # ---- One refit cycle. ----
+        # Pull callback wraps the receiver's existing per-tensor pull.
+        # For v0 we synchronously pull each source's bytes; the
+        # parallel-pull optimization hooks in the same place.
+        def _pull(src, dest):
+            self._mx_receiver._receiver._nixl.pull_to(  # type: ignore[attr-defined]
+                src.mx_source_id, src.worker_id, dest,
+                source_subslice=src.source_subslice,
+                timeout_seconds=mx_config.timeout_seconds,
+            )
+
+        weights: list[tuple[str, "torch.Tensor"]] = []
+        for hf_name, hf_tensor in run_refit_cycle(
+            self._mx_receiver,
+            candidates=candidates,
+            context=self._mx_megatron_ctx,
+            pull=_pull,
+            device=self.device,
+        ):
+            weights.append((hf_name, hf_tensor))
+
+        if not weights:
+            print(f"[mx-megatron] cycle yielded 0 tensors; refit aborted")
+            return False
+
+        self._load_weights(weights)
+        torch.cuda.current_stream().synchronize()
+        self._maybe_process_fp8_kv_cache()
+
+        if mx_config.tree_scale_out:
+            self._mx_receiver.publish_self_as_source(
+                version=int(version),
+                model_name=self.model_config.model
+                if hasattr(self.model_config, "model")
+                else getattr(
+                    self.model_runner.vllm_config.model_config, "model", "unknown",
+                ),
+            )
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        return True
 
     @wrap_with_nvtx_name(
         "vllm_internal_worker_extension/update_weights_from_collective"
