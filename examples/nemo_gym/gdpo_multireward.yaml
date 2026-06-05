@@ -10,7 +10,9 @@
 #
 # NOTE: workplace_assistant is single-reward today; point `env.nemo_gym` at a
 # multi-reward environment (one whose verifier emits `reward_components`) before
-# training, or GDPO will raise "GDPO requires multiple reward components". See
+# training, or GDPO will raise "GDPO requires multiple reward components". A ready
+# reference env is `example_tool_call_multireward` in NVIDIA-NeMo/Gym (scored on
+# correctness / schema_valid / format). See
 # skills/nemo-rl-gdpo-experiment/references/gym-multireward-scope.md.
 defaults: grpo_workplace_assistant_nemotron_nano_v2_9b.yaml
 
