@@ -4,7 +4,7 @@
 # Nano3 Megatron GRPO setup. LoRA/PEFT is intentionally out of scope here.
 #
 # Example usage:
-#   uv run examples/run_grpo.py --config examples/modelopt/qa_grpo_nano3_megatron.yaml
+#   DISABLE_MODELOPT_LAYER_SPEC=1 uv run examples/run_grpo.py --config examples/modelopt/qa_grpo_nano3_megatron.yaml
 
 defaults: "../configs/grpo_math_1B.yaml"
 

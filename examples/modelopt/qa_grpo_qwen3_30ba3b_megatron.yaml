@@ -1,5 +1,8 @@
 defaults: "../configs/recipes/llm/performance/grpo-qwen3-30ba3b-4n4g.yaml"
 
+# Example usage:
+#   DISABLE_MODELOPT_LAYER_SPEC=1 uv run examples/run_grpo.py --config examples/modelopt/qa_grpo_qwen3_30ba3b_megatron.yaml
+
 grpo:
   # Low-cost QARL health check. This is not a convergence benchmark.
   max_num_steps: 1
