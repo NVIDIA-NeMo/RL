@@ -48,10 +48,19 @@ from nemo_rl.environments.interfaces import (
     EnvironmentReturn,
 )
 from nemo_rl.experience.rollouts import calculate_rewards
+from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.utils.timer import Timer
 from tests.unit.algorithms.utils import (
     create_mock_batch,
 )
+
+
+def _mock_policy_generation() -> MagicMock:
+    """Generation-interface stand-in for grpo_train / async_grpo_train tests."""
+    policy_generation = MagicMock(spec=MegatronGeneration)
+    policy_generation.requires_kv_scale_sync = False
+    policy_generation.get_logger_metrics.return_value = {}
+    return policy_generation
 
 
 def _mock_seq_logprob_error_result() -> dict[str, object]:
@@ -1639,7 +1648,7 @@ def test_grpo_train_skips_reference_policy_logprobs_when_configured(
         ):
             train_func(
                 policy,
-                None,
+                _mock_policy_generation(),
                 mock_grpo_components["train_dataloader"],
                 mock_grpo_components["val_dataloader"],
                 mock_grpo_components["tokenizer"],
@@ -1669,7 +1678,7 @@ def test_grpo_train_skips_reference_policy_logprobs_when_configured(
         ):
             train_func(
                 policy,
-                None,
+                _mock_policy_generation(),
                 mock_grpo_components["train_dataloader"],
                 mock_grpo_components["val_dataloader"],
                 mock_grpo_components["tokenizer"],
@@ -1728,7 +1737,7 @@ def test_grpo_train_skips_prev_logprobs_when_force_on_policy_ratio(
         ):
             train_func(
                 policy,
-                None,
+                _mock_policy_generation(),
                 mock_grpo_components["train_dataloader"],
                 mock_grpo_components["val_dataloader"],
                 mock_grpo_components["tokenizer"],
@@ -1758,7 +1767,7 @@ def test_grpo_train_skips_prev_logprobs_when_force_on_policy_ratio(
         ):
             train_func(
                 policy,
-                None,
+                _mock_policy_generation(),
                 mock_grpo_components["train_dataloader"],
                 mock_grpo_components["val_dataloader"],
                 mock_grpo_components["tokenizer"],
@@ -1803,7 +1812,7 @@ def test_grpo_exit_on_max_steps(mock_grpo_components, train_func):
         with mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics):
             train_func(
                 mock_grpo_components["policy"],
-                None,  # policy_generation
+                _mock_policy_generation(),
                 mock_grpo_components["train_dataloader"],
                 mock_grpo_components["val_dataloader"],
                 mock_grpo_components["tokenizer"],
@@ -1831,7 +1840,7 @@ def test_grpo_exit_on_max_steps(mock_grpo_components, train_func):
                 ):
                     train_func(
                         mock_grpo_components["policy"],
-                        None,  # policy_generation
+                        _mock_policy_generation(),
                         mock_grpo_components["train_dataloader"],
                         mock_grpo_components["val_dataloader"],
                         mock_grpo_components["tokenizer"],
@@ -1885,7 +1894,7 @@ def test_grpo_exit_on_max_epochs(mock_grpo_components, train_func):
                 # Run training
                 train_func(
                     mock_grpo_components["policy"],
-                    None,  # policy_generation
+                    _mock_policy_generation(),
                     mock_grpo_components["train_dataloader"],
                     mock_grpo_components["val_dataloader"],
                     mock_grpo_components["tokenizer"],
@@ -1936,7 +1945,7 @@ def test_grpo_exit_on_timeout(mock_grpo_components, train_func, capsys):
             with mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics):
                 train_func(
                     mock_grpo_components["policy"],
-                    None,  # policy_generation
+                    _mock_policy_generation(),
                     mock_grpo_components["train_dataloader"],
                     mock_grpo_components["val_dataloader"],
                     mock_grpo_components["tokenizer"],
@@ -1963,7 +1972,7 @@ def test_grpo_exit_on_timeout(mock_grpo_components, train_func, capsys):
                     ):
                         train_func(
                             mock_grpo_components["policy"],
-                            None,  # policy_generation
+                            _mock_policy_generation(),
                             mock_grpo_components["train_dataloader"],
                             mock_grpo_components["val_dataloader"],
                             mock_grpo_components["tokenizer"],
