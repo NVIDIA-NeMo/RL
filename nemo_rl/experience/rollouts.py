@@ -1305,6 +1305,34 @@ def run_async_nemo_gym_rollout(
         }
     )
 
+    # Expose per-component rewards (reward1, reward2, ...) for multi-reward NeMo Gym
+    # environments so GDPO can compute per-component advantages; single-reward envs are
+    # unaffected. Mirrors the native rollout path's reward-component handling above.
+    from nemo_rl.environments.nemo_gym import extract_reward_components
+
+    component_dicts = [extract_reward_components(r["full_result"]) for r in results]
+    if any(c is not None for c in component_dicts):
+        # Stable, global component ordering so reward1/reward2/... map to the same
+        # signal across every sample (components absent on a sample default to 0.0).
+        ordered_names = sorted(
+            {name for c in component_dicts if c is not None for name in c}
+        )
+        for component_idx, name in enumerate(ordered_names, start=1):
+            final_batch[f"reward{component_idx}"] = torch.tensor(
+                [
+                    c[name] if c is not None and name in c else 0.0
+                    for c in component_dicts
+                ]
+            )
+        # Keep total_reward consistent with the native multi-reward path (sum of
+        # components) so GDPO and a GRPO control read the same aggregate.
+        final_batch["total_reward"] = torch.tensor(
+            [
+                sum(c.values()) if c is not None else float(r["full_result"]["reward"])
+                for c, r in zip(component_dicts, results)
+            ]
+        )
+
     return AsyncNemoGymRolloutResult(
         input_ids=input_ids,
         final_batch=final_batch,

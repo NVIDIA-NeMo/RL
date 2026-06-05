@@ -306,6 +306,23 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
         raise NotImplementedError
 
 
+def extract_reward_components(nemo_gym_result: dict) -> Dict[str, float] | None:
+    """Return per-component rewards from a NeMo Gym verify result, or None.
+
+    Single-reward NeMo Gym environments return only a scalar ``reward``. Multi-reward
+    environments additionally return ``reward_components``: a mapping of
+    component-name -> score. These are consumed by GDPO as reward1, reward2, ...
+    (see ``nemo_rl.algorithms.advantage_estimator.GDPOAdvantageEstimator``).
+
+    Returns ``None`` when the environment is single-reward (no ``reward_components``),
+    so callers fall back to the scalar ``reward`` path unchanged.
+    """
+    components = nemo_gym_result.get("reward_components")
+    if not components:
+        return None
+    return {str(name): float(score) for name, score in components.items()}
+
+
 ########################################
 # Global config utils
 ########################################

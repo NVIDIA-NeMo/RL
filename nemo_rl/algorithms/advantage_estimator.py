@@ -16,7 +16,7 @@
 
 This module provides different advantage estimation strategies:
 - GRPOAdvantageEstimator: Standard GRPO advantage with leave-one-out baseline
-- GDPOAdvantageEstimator: Multi-reward GDPO (per-component baselines, sum then normalize)
+- GDPOAdvantageEstimator: Multi-reward GDPO (per-component baselines, optional per-reward weights, then normalize)
 - ReinforcePlusPlusAdvantageEstimator: Reinforce++ with optional baseline subtraction (minus_baseline) and KL penalty in reward
 Reference papers:
 - ProRLv2: https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/
@@ -84,6 +84,9 @@ class GDPOAdvantageEstimator:
     def __init__(self, estimator_config: dict, loss_config: ClippedPGLossConfig):
         self.use_leave_one_out_baseline = estimator_config["use_leave_one_out_baseline"]
         self.normalize_rewards = estimator_config["normalize_rewards"]
+        # Optional per-reward weights w_n for the aggregation A = sum_n w_n * A_n
+        # (paper: https://arxiv.org/abs/2601.05242). None => equal weights (all 1.0).
+        self.reward_weights = estimator_config.get("reward_weights")
 
     def compute_advantage(
         self,
@@ -112,6 +115,16 @@ class GDPOAdvantageEstimator:
                 f"This batch has {len(reward_component_keys)} component(s). "
                 "Switch to GRPO by setting grpo.adv_estimator.name to 'grpo' in your config."
             )
+        # Resolve per-reward weights (ordered to match reward1, reward2, ...).
+        weights = self.reward_weights
+        if weights is None:
+            weights = [1.0] * len(reward_component_keys)
+        elif len(weights) != len(reward_component_keys):
+            raise ValueError(
+                f"reward_weights has {len(weights)} entries but this batch has "
+                f"{len(reward_component_keys)} reward components ({reward_component_keys}). "
+                "Provide exactly one weight per component, ordered to match reward1, reward2, ..."
+            )
         valid = torch.ones_like(repeated_batch[reward_component_keys[0]])
         leave_one_out = self.use_leave_one_out_baseline
         assert prompt_ids.shape[0] == valid.shape[0], (
@@ -137,7 +150,9 @@ class GDPOAdvantageEstimator:
 
             advantage_parts.append(adv_k)
 
-        advantages = sum(advantage_parts)
+        advantages = sum(
+            weight * adv_k for weight, adv_k in zip(weights, advantage_parts)
+        )
         # Normalize combined advantage to zero mean and unit std
         adv_std = advantages.std()
         if adv_std > 0:

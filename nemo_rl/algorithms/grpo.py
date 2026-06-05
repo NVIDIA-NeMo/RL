@@ -133,6 +133,10 @@ class AdvEstimatorConfig(TypedDict):
     # GRPO specific
     normalize_rewards: NotRequired[bool]
     use_leave_one_out_baseline: NotRequired[bool]
+    # GDPO specific: optional per-component weights w_n for the aggregation
+    # A = sum_n w_n * A_n, ordered to match reward1, reward2, ... . Defaults to
+    # equal weights (all 1.0) when omitted.
+    reward_weights: NotRequired[list[float] | None]
     # Reinforce++ specific
     minus_baseline: NotRequired[bool]
 
