@@ -401,6 +401,7 @@ cluster:
   num_nodes: 1
   master_port_range_low: 25000
   master_port_range_high: 28000
+  segment_size: null
 
 # TransferQueue-mediated data plane for sync GRPO.
 # Off by default — the legacy grpo_train trainer never engages this.
