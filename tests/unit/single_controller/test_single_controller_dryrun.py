@@ -492,7 +492,6 @@ class TestSingleControllerDryRun:
         trainer,
         weight_sync=None,
         max_train_steps=3,
-        max_rollout_prompts=12,
         min_prompt_groups_per_batch=1,
         generations_per_prompt=1,
         max_buffered_rollouts=4,
@@ -504,7 +503,6 @@ class TestSingleControllerDryRun:
     ):
         cfg = SingleControllerConfig(
             max_train_steps=max_train_steps,
-            max_rollout_prompts=max_rollout_prompts,
             min_prompt_groups_per_batch=min_prompt_groups_per_batch,
             generations_per_prompt=generations_per_prompt,
             max_buffered_rollouts=max_buffered_rollouts,
@@ -514,7 +512,9 @@ class TestSingleControllerDryRun:
             diagnostics=diagnostics,
         )
 
-        prompts = [f"prompt_{i}" for i in range(10)]
+        # SC expects a StatefulDataLoader, but the pump only iterates it
+        # (`for prompt in self._dataloader`), so a list satisfies the contract.
+        dataloader = [f"prompt_{i}" for i in range(10)]
 
         if weight_sync is None:
             weight_sync = DryRunWeightSynchronizer(gen_handle=gen)
@@ -526,7 +526,7 @@ class TestSingleControllerDryRun:
             gen_handle=gen,
             env_handles={},
             trainer_handle=trainer,
-            prompts=prompts,
+            dataloader=dataloader,
             weight_synchronizer=weight_sync,
             advantage_estimator=advantage_estimator,
             rollout_manager=rollout_manager,
@@ -545,7 +545,6 @@ class TestSingleControllerDryRun:
             trainer,
             weight_sync,
             max_train_steps=3,
-            max_rollout_prompts=12,
             min_prompt_groups_per_batch=1,
             generations_per_prompt=1,
         )
@@ -569,7 +568,6 @@ class TestSingleControllerDryRun:
             gen,
             trainer,
             max_train_steps=1,
-            max_rollout_prompts=2,
             min_prompt_groups_per_batch=2,
             generations_per_prompt=1,
             advantage_enabled=True,
@@ -603,7 +601,6 @@ class TestSingleControllerDryRun:
             gen,
             trainer,
             max_train_steps=2,
-            max_rollout_prompts=10,
             min_prompt_groups_per_batch=1,
             generations_per_prompt=1,
             max_buffered_rollouts=6,
@@ -641,7 +638,6 @@ class TestSingleControllerDryRun:
             gen,
             trainer,
             max_train_steps=2,
-            max_rollout_prompts=8,
             min_prompt_groups_per_batch=1,
             generations_per_prompt=1,
             max_buffered_rollouts=2,  # small buffer — backpressure kicks in
@@ -678,7 +674,6 @@ class TestSingleControllerDryRun:
             trainer,
             weight_sync,
             max_train_steps=2,
-            max_rollout_prompts=8,
             min_prompt_groups_per_batch=1,
             generations_per_prompt=1,
         )
@@ -698,7 +693,6 @@ class TestSingleControllerDryRun:
             gen,
             trainer,
             max_train_steps=5,
-            max_rollout_prompts=20,
             min_prompt_groups_per_batch=1,
             generations_per_prompt=1,
         )
