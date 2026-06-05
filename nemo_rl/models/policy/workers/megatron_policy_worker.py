@@ -1261,8 +1261,6 @@ class MegatronPolicyWorkerImpl(
             f"[_clear_fp8_caches] Cleared {workspace_count} workspace modules on rank {self.rank}"
         )
 
-        gc.collect()
-        torch.cuda.empty_cache()
 
     @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
     def offload_before_refit(self):
