@@ -27,7 +27,7 @@ bridge_package_name = "megatron.bridge"
 
 # Default dependencies from pyproject.toml
 CACHED_DEPENDENCIES = [
-    "transformers>=5.5.0,<=5.6.0",
+    "transformers>=5.8.1,<5.9.0",
     "mistral-common>=1.10.0",
     "peft>=0.18.1",
     "datasets>=2.20.0",
@@ -56,6 +56,8 @@ CACHED_DEPENDENCIES = [
     "mlflow>=3.9.0",
     "comet-ml>=3.50.0",
     "torch>=2.6.0",
+    "flashinfer-python==0.6.8.post1",
+    "flashinfer-cubin==0.6.8.post1",
 ]
 
 # If the bridge source exists, compare cached dependencies with the submodule's pyproject

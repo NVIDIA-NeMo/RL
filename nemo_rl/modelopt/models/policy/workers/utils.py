@@ -203,3 +203,8 @@ def quantization_layer_spec(config):
         real_quant_cfg="None",
         use_arbitrary_attention_mask=False,
     )
+
+
+def get_quantization_layer_spec():
+    """Build the ModelOpt quantization layer-spec callback as a portable target."""
+    return quantization_layer_spec

@@ -27,7 +27,12 @@ import uvicorn
 from fastapi import FastAPI
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
+from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_GENERATION_PORT_RANGE_HIGH,
+    DEFAULT_GENERATION_PORT_RANGE_LOW,
+    _get_free_port_local,
+    _get_node_ip_local,
+)
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
@@ -345,12 +350,21 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             OpenAIServingTokenization,
         )
         from vllm.exceptions import VLLMValidationError
+        from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
         from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
         from vllm.v1.engine.async_llm import logger as vllm_async_llm_logger
 
         maybe_tool_parser_plugin = self.cfg["vllm_cfg"].get("tool_parser_plugin")
         if maybe_tool_parser_plugin:
             ToolParserManager.import_tool_parser(maybe_tool_parser_plugin)
+
+        maybe_reasoning_parser_plugin = self.cfg["vllm_cfg"].get(
+            "reasoning_parser_plugin"
+        )
+        if maybe_reasoning_parser_plugin:
+            ReasoningParserManager.import_reasoning_parser(
+                maybe_reasoning_parser_plugin
+            )
 
         engine_client = self.llm
         model_config = self.llm_async_engine_args.create_model_config()
@@ -742,7 +756,13 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         ########################################
 
         node_ip = _get_node_ip_local()
-        free_port = _get_free_port_local()
+        port_range_low = self.cfg.get(
+            "port_range_low", DEFAULT_GENERATION_PORT_RANGE_LOW
+        )
+        port_range_high = self.cfg.get(
+            "port_range_high", DEFAULT_GENERATION_PORT_RANGE_HIGH
+        )
+        free_port = _get_free_port_local(port_range_low, port_range_high)
 
         base_url = f"http://{node_ip}:{free_port}/v1"
         print(f"Starting server on {base_url}")
