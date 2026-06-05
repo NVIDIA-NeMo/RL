@@ -18,28 +18,50 @@ This module:
 
 * Classifies every parameter into one of seven Megatron roles
   (see ``temp/NemoRL_Megatron_MX_Design.md`` §3) by walking the model
-  graph once at trainer init and caching the result.
+  graph and consulting **Megatron-Bridge's authoritative parallelism
+  registry** (``megatron.bridge.models.conversion.param_mapping.AutoMapping
+  ._MODULE_TYPE_REGISTRY``). Bridge's registry already classifies every
+  TE / Inference / Quant variant of column-parallel, row-parallel, and
+  replicated modules — using it directly rather than rolling our own
+  string-matching means we get correct classification of:
+    - ``TEColumnParallelLinear``, ``TELayerNormColumnParallelLinear``,
+      ``TEColumnParallelGroupedLinear``, ``InferenceLayerNormColumnParallelLinear``
+    - ``TERowParallelLinear``, ``TERowParallelGroupedLinear``,
+      ``InferenceRowParallelLinear``
+    - ``TENorm``, ``FusedLayerNorm``, ``WrappedTorchNorm``, ``L2Norm``,
+      ``InferenceTopKRouter``, ``LinearForLastLayer``
+  …without us having to maintain a parallel list. If Bridge is not
+  importable, the helper falls back to string-matching against the
+  base class names — sufficient for mainline Megatron-Core.
 * Extracts the local native shard (no allgather, no Megatron-Bridge
   ``export_hf_weights`` call — the param tensor IS the local shard).
 * Builds the ``extra_parameters`` dict the v2 publisher attaches so the
   MX-side slice planner can find the right slices for each receiver.
 
+Receiver-side context (for cross-reference): the receiver translator
+(Phase C) is intended to be a thin adapter over Bridge's
+``MegatronParamMapping.megatron_to_hf`` calls. With ``mpu`` not
+initialised, Bridge's TP-gather / PP-broadcast collectives no-op
+(``tp_group / pp_group / ep_group = None``, ``tp_size / pp_size = 1``);
+feeding a pre-assembled global tensor (assembled from N trainer ranks
+by Phase B's slice planner) into ``mapping.megatron_to_hf(buffer,
+megatron_module=None)`` gives back HF-shaped ``{q_proj, k_proj, v_proj}``
+/ ``{gate_proj, up_proj}`` / etc. directly. No hand-rolled un-interleave
+needed on the receiver. See
+``temp/NemoRL_Megatron_MX_Design.md`` §10 for the integration shape.
+
 The downstream MX-side slice planner is implemented in
 ``modelexpress.nemo_rl_v2`` (``MxV2RefitReceiver.pick_megatron_slice_plans``,
 seven Megatron role constants, ``MegatronSourceMeta``,
-``MegatronSlicePlan``). See ``ai-dynamo/modelexpress`` PR #421 commit
-``12c73a7``.
+``MegatronSlicePlan``). See ``ai-dynamo/modelexpress`` PR #421 commits
+``12c73a7`` + ``b26e80f``.
 
 Limitations of this Phase A:
 
-* Role classification is by ``module.__class__.__name__`` matching
-  against Megatron-Core's standard parallel-layer classes. Custom
-  subclasses won't be detected unless their class name contains the
-  expected substring; override via ``mx_config.megatron_role_overrides``
-  if needed (a dict of ``param_name_substring → role``).
 * Fused QKV / fused gated MLP detection is currently keyed on common
   Megatron name patterns (``linear_qkv``, ``linear_fc1``). Mainline
-  Megatron-Core uses these names; non-mainline forks may differ.
+  Megatron-Core uses these names; non-mainline forks may need a
+  ``megatron_role_overrides`` entry.
 * MoE per-expert publishing classifies as ``expert_column`` /
   ``expert_row``; the per-expert axis is assumed to be 0 (the leading
   axis), matching ``detect_moe_expert_layout``'s convention.
@@ -100,6 +122,56 @@ _DEFAULT_FUSED_QKV_NAME_PATTERNS = ("linear_qkv", "qkv_proj", "fused_qkv")
 _DEFAULT_FUSED_GATED_MLP_PATTERNS = ("linear_fc1", "gate_up_proj")
 # Vocab / embedding name pattern.
 _DEFAULT_VOCAB_NAME_PATTERNS = ("word_embeddings", "embedding", "lm_head", "output_layer")
+
+
+def _bridge_module_type_registry() -> dict[str, set[str]] | None:
+    """Return Bridge's authoritative module classifier registry, or None.
+
+    Bridge ships a curated dict of
+    ``{"column": {classes...}, "row": {...}, "replicated": {...}}`` covering
+    every TE / Inference / Quant variant. Importing it lazily avoids a hard
+    dependency: when Bridge is not in the import path (e.g. in unit tests on
+    a CPU-only env), the caller falls back to substring matching against
+    the base class names, which is correct for mainline Megatron-Core.
+    """
+    try:
+        from megatron.bridge.models.conversion.param_mapping import (
+            AutoMapping as _AM,
+        )
+        return dict(_AM._MODULE_TYPE_REGISTRY)
+    except Exception:
+        return None
+
+
+def _classify_module_class(mod_class_name: str) -> str | None:
+    """Map ``mod.__class__.__name__`` to a Megatron-Bridge parallelism kind.
+
+    Returns one of ``"column"``, ``"row"``, ``"replicated"``, or ``None``
+    if the class name doesn't match any known parallelism variant.
+    """
+    if not mod_class_name:
+        return None
+    registry = _bridge_module_type_registry()
+    if registry is not None:
+        # Direct hit on Bridge's curated set (catches every TE / Inference /
+        # Quant variant by exact class name).
+        for kind, cls_set in registry.items():
+            if mod_class_name in cls_set:
+                return kind
+        # Bridge also has a special-case for the TE-fused
+        # LayerNormColumnParallelLinear: classify as column.
+        if "LayerNormColumnParallelLinear" in mod_class_name:
+            return "column"
+    # Fallback: substring match against the base names.
+    if "ColumnParallel" in mod_class_name or "VocabParallelEmbedding" in mod_class_name:
+        return "column"
+    if "RowParallel" in mod_class_name:
+        return "row"
+    if any(needle in mod_class_name for needle in (
+        "Norm", "RMSNorm", "L2Norm", "TopKRouter", "LinearForLastLayer", "IdentityOp",
+    )):
+        return "replicated"
+    return None
 
 
 def _enclosing_module(name: str, model: "torch.nn.Module") -> "torch.nn.Module | None":
@@ -224,18 +296,20 @@ def detect_megatron_role(
                 descriptor_extras={"expert_axis": "0"},
             )
 
-    # ---- 3. Walk to the enclosing module. ----
+    # ---- 3. Walk to the enclosing module + classify against Bridge's
+    # AutoMapping._MODULE_TYPE_REGISTRY (or fall back to substring match). ----
     mod = _enclosing_module(name, model)
     mod_class = _module_class_name(mod)
+    parallelism = _classify_module_class(mod_class)
 
     # ---- 4. VocabParallelEmbedding / lm_head sharded along rows. ----
-    if "VocabParallelEmbedding" in mod_class or (
-        _is_vocab_name(name) and tp_size > 1 and param.ndim >= 2
+    if mod_class == "VocabParallelEmbedding" or (
+        _is_vocab_name(name) and tp_size > 1 and param.ndim >= 2 and parallelism == "column"
     ):
         return MegatronRoleSpec(role=ROLE_VOCAB_PARALLEL)
 
-    # ---- 5. Column / row parallel linear. ----
-    if "ColumnParallelLinear" in mod_class:
+    # ---- 5. Column-parallel linears (incl. all TE / Inference / Quant variants). ----
+    if parallelism == "column":
         if _is_fused_qkv_name(name):
             extras: dict[str, str] = {"qkv_interleave": "by_head"}
             if num_attention_heads is not None and tp_size > 0:
@@ -252,10 +326,18 @@ def detect_megatron_role(
             )
         return MegatronRoleSpec(role=ROLE_COLUMN)
 
-    if "RowParallelLinear" in mod_class:
+    # ---- 6. Row-parallel linears. ----
+    if parallelism == "row":
         return MegatronRoleSpec(role=ROLE_ROW)
 
-    # ---- 6. Anything else: replicated (LayerNorms, biases, scalars). ----
+    # ---- 7. Replicated (LayerNorms, biases, scalars, routers, etc.). ----
+    # Bridge's registry covers TENorm, FusedLayerNorm, WrappedTorchNorm,
+    # LayerNorm, RMSNorm, L2Norm, InferenceTopKRouter, IdentityOp,
+    # LinearForLastLayer, TopKRouter — anything unclassified here also
+    # falls into "replicated" as a safe default (rank 0 publishes; others
+    # skip), since misclassifying a sharded tensor as replicated would
+    # silently produce wrong logits while misclassifying a replicated
+    # tensor stays correct (just wastes one rank's publish bandwidth).
     return MegatronRoleSpec(role=ROLE_REPLICATED)
 
 
