@@ -539,6 +539,8 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
     ]
     model_cfg.sequence_parallel = config["megatron_cfg"]["sequence_parallel"]
     model_cfg.context_parallel_size = config["megatron_cfg"]["context_parallel_size"]
+    if "cp_comm_type" in config["megatron_cfg"]:
+        model_cfg.cp_comm_type = config["megatron_cfg"]["cp_comm_type"]
 
     if model_cfg.context_parallel_size > 1:
         assert config["sequence_packing"]["enabled"], (
