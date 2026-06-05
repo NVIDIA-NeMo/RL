@@ -138,7 +138,7 @@ data:
     ...
 ```
 
-##### Custom datasets defined outside NeMo RL
+### Custom datasets defined outside NeMo RL
 
 If you want to plug in a dataset class that lives outside the `nemo_rl`
 package (so you don't have to edit the built-in registry), set

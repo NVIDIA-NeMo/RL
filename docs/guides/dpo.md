@@ -179,7 +179,7 @@ Your JSONL files should contain one JSON object per line with the following stru
 }
 ```
 
-##### Custom datasets defined outside NeMo RL
+### Custom datasets defined outside NeMo RL
 
 If you want to plug in a preference dataset class that lives outside the
 `nemo_rl` package (so you don't have to edit the built-in registry), set
