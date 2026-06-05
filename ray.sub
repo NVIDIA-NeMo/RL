@@ -271,11 +271,11 @@ if [[ -n "\${SLURM_TOPOLOGY_ADDR:-}" && "\${SLURM_TOPOLOGY_ADDR_PATTERN:-}" == "
     TOPO_RANK=\$(( 10#\$_block_digits * 10000000000 + 10#\$_node_digits ))
   fi
 elif [[ -n "\${SLURM_PROCID:-}" ]]; then
-  TOPO_RANK="\$SLURM_PROCID"
+  TOPO_RANK=\$(( 10#\$SLURM_PROCID ))
 else
   _hostname_digits=\$(hostname | tr -dc '0-9')
   if [[ -n "\$_hostname_digits" ]]; then
-    TOPO_RANK="\$_hostname_digits"
+    TOPO_RANK=\$(( 10#\$_hostname_digits ))
   fi
 fi
 
