@@ -109,6 +109,15 @@ EMBEDDING_KEY_CANDIDATES = [
     "transformer.wte.weight",
 ]
 
+OUTPUT_EMBEDDING_KEY_CANDIDATES = [
+    # Most common (Llama, Mistral, Nemotron, …)
+    "lm_head.weight",
+    # GPT-NeoX style
+    "embed_out.weight",
+    # Some GPT-2 / transformer-style models
+    "transformer.lm_head.weight",
+]
+
 
 def format_index_ranges(indices: list[int]) -> str:
     """Format a list of indices into compact range strings like '0-1,3-6'."""
@@ -153,6 +162,19 @@ def find_key_in_shards(
 ) -> Optional[str]:
     """Return the shard filename that contains *key*, or None."""
     return index.get("weight_map", {}).get(key)
+
+
+def is_tied_embeddings(ckpt_dir: Path) -> Optional[bool]:
+    """Return the tie_word_embeddings setting from config.json, or None if unknown."""
+    config_path = ckpt_dir / "config.json"
+    if not config_path.exists():
+        return None
+    try:
+        with open(config_path) as f:
+            config = json.load(f)
+        return config.get("tie_word_embeddings", False)
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -238,12 +260,25 @@ def patch_safetensors_checkpoint(
     index = load_safetensors_index(input_dir)
     weight_map = index.get("weight_map", {}) if index else {}
 
+    tied = is_tied_embeddings(input_dir)
+    if tied is not None:
+        print(f"Tied word embeddings: {tied}")
+
     # Discover the input-embedding key present in this checkpoint
     keys_to_patch: dict[str, str] = {}  # key -> shard filename
     for key in EMBEDDING_KEY_CANDIDATES:
         if key in weight_map:
             keys_to_patch[key] = weight_map[key]
             break  # only one input-embedding key expected
+
+    # Also patch output embeddings when they are not tied to the input embeddings
+    if not tied:
+        for key in OUTPUT_EMBEDDING_KEY_CANDIDATES:
+            if key in weight_map:
+                keys_to_patch[key] = weight_map[key]
+                break  # only one output-embedding key expected
+    elif tied:
+        print("  Output embeddings are tied to input embeddings – no separate output patch needed.")
 
     if not keys_to_patch:
         # Single-file checkpoint (model.safetensors) – no index
@@ -435,6 +470,28 @@ def print_embedding_stats(
     }
 
 
+def _find_and_load_embedding(
+    key_candidates: list[str],
+    weight_map: dict,
+    input_dir: Path,
+    threshold: float,
+    tokenizer,
+    identical_threshold: float,
+) -> Optional[dict]:
+    """Try each candidate key in order; return stats dict for the first one found."""
+    for key in key_candidates:
+        shard_name = weight_map.get(key)
+        if shard_name is None:
+            shard_name = "model.safetensors"
+        shard_path = input_dir / shard_name
+        if not shard_path.exists():
+            continue
+        tensor = load_embedding_tensor_from_shard(shard_path, key)
+        if tensor is not None:
+            return print_embedding_stats(tensor, key, threshold, tokenizer, identical_threshold)
+    return None
+
+
 def run_stats(
     input_dir: Path,
     threshold: float,
@@ -445,28 +502,48 @@ def run_stats(
     index = load_safetensors_index(input_dir)
     weight_map = index.get("weight_map", {}) if index else {}
 
+    tied = is_tied_embeddings(input_dir)
+    if tied is not None:
+        print(f"\nTied word embeddings: {tied}")
+
     summaries = []
-    for key in EMBEDDING_KEY_CANDIDATES:
-        shard_name = weight_map.get(key)
-        if shard_name is None:
-            # Try single-file
-            shard_name = "model.safetensors"
-        shard_path = input_dir / shard_name
-        if not shard_path.exists():
-            continue
-        tensor = load_embedding_tensor_from_shard(shard_path, key)
-        if tensor is not None:
-            summary = print_embedding_stats(
-                tensor, key, threshold, tokenizer, identical_threshold
-            )
-            summaries.append(summary)
+
+    # Input embeddings
+    summary = _find_and_load_embedding(
+        EMBEDDING_KEY_CANDIDATES, weight_map, input_dir, threshold, tokenizer, identical_threshold
+    )
+    if summary is not None:
+        summary["layer_label"] = "Input Embeddings"
+        summaries.append(summary)
+    else:
+        print("\nWARNING: Could not find input embeddings layer")
+
+    # Output embeddings (separate analysis only when not tied)
+    if tied:
+        print("\nOutput embeddings are tied to input embeddings – skipping separate output analysis.")
+    else:
+        out_summary = _find_and_load_embedding(
+            OUTPUT_EMBEDDING_KEY_CANDIDATES,
+            weight_map,
+            input_dir,
+            threshold,
+            tokenizer,
+            identical_threshold,
+        )
+        if out_summary is not None:
+            tied_label = " (Tied: False)" if tied is not None else ""
+            out_summary["layer_label"] = f"Output Embeddings{tied_label}"
+            summaries.append(out_summary)
+        else:
+            print("\nWARNING: Could not find output embeddings layer")
 
     if summaries:
         print("\n" + "=" * 80)
         print("EMBEDDING SUMMARIES")
         print("=" * 80)
         for s in summaries:
-            print(f"\n--- {s['key']} ---")
+            layer_label = s.get("layer_label", s["key"])
+            print(f"\n--- {layer_label} Summary ({s['key']}) ---")
             print(f"Shape: {s['shape']}, Dtype: {s['dtype']}")
             print(
                 f"Near-zero (norm < {s['near_zero_threshold']:.2e}): "

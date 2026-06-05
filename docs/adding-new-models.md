@@ -162,6 +162,8 @@ Detects near-zero embedding rows in a HuggingFace checkpoint and optionally rein
 uv run tools/model_diagnostics/3.check_and_reinit_hf_model_embeddings_untrained.py --input nvidia/Nemotron-H-8B-Base-8K --stats-only
 
 # ...
+#Tied word embeddings: False
+#
 #=== backbone.embeddings.weight ===
 #  Shape  : (131072, 4096)
 #  Dtype  : torch.bfloat16
@@ -169,16 +171,30 @@ uv run tools/model_diagnostics/3.check_and_reinit_hf_model_embeddings_untrained.
 #  Stats  : mean_abs=0.007878  max_abs=0.196289  std_range=[0.000000, 0.015468]
 #  Near-zero rows (norm < 1.00e-06): 1041/131072 (0.8%)
 #  Indices: 0-1,3-999,1192-1193,1245-1255,55014,77579,...,114755
-#  ...
+#  Tokens :
+#    ID      0: '<unk>'  norm=0.0000e+00  values=[1.18e-37,-1.18e-37,...,-1.18e-37,-1.18e-37]
+#    ...
+#    ... and 1011 more
 #  Identical rows (std < 1.00e-08): 1041/131072 (0.8%)
 #  Indices: 0-1,3-999,1192-1193,1245-1255,55014,77579,...,114755
-#  ...
+#  Tokens :
+#    ID      0: '<unk>'  std=1.1756e-37  values=[1.18e-37,-1.18e-37,...,-1.18e-37,-1.18e-37]
+#    ...
+#    ... and 1011 more
+#
+#=== lm_head.weight ===
+#  Shape  : (131072, 4096)
+#  Dtype  : torch.bfloat16
+#  Norm   : min=2.6149e-01  mean=5.4801e-01  max=1.3579e+00
+#  Stats  : mean_abs=0.006785  max_abs=0.200195  std_range=[0.004086, 0.021219]
+#  Near-zero rows (norm < 1.00e-06): 0/131072 (0.0%)
+#  Identical rows (std < 1.00e-08): 0/131072 (0.0%)
 #
 #================================================================================
 #EMBEDDING SUMMARIES
 #================================================================================
 #
-#--- backbone.embeddings.weight ---
+#--- Input Embeddings Summary (backbone.embeddings.weight) ---
 #Shape: (131072, 4096), Dtype: torch.bfloat16
 #Near-zero (norm < 1.00e-06): 1041/131072 (0.8%)
 #  Indices: 0-1,3-999,1192-1193,1245-1255,55014,77579,81772,81819,82312,82500,82725,82737,82977,83855,84020,84121,84521,84794,85015,86409,87411,89412,90320,91368,94485,96385,101707,104097,108262,112147,112327,112497,114755
@@ -187,8 +203,15 @@ uv run tools/model_diagnostics/3.check_and_reinit_hf_model_embeddings_untrained.
 #Statistics: mean_abs=0.007878  max_abs=0.196289  std_range=[0.000000, 0.015468]
 #WARNING - POTENTIAL ISSUES: 1041 near-zero embeddings, 1041 identical embeddings
 #
+#--- Output Embeddings (Tied: False) Summary (lm_head.weight) ---
+#Shape: (131072, 4096), Dtype: torch.bfloat16
+#Near-zero (norm < 1.00e-06): 0/131072 (0.0%)
+#Identical (std < 1.00e-08): 0/131072 (0.0%)
+#Statistics: mean_abs=0.006785  max_abs=0.200195  std_range=[0.004086, 0.021219]
+#OK - No obvious untrained patterns detected
+#
 #=== Final Summary ===
-#Checkpoint: /root/.cache/huggingface/hub/models--nvidia--Nemotron-H-8B-Base-8K/snapshots/...
+#Checkpoint: /path/to/huggingface/hub/models--nvidia--Nemotron-H-8B-Base-8K/snapshots/...
 #Analysis complete.
 ```
 
