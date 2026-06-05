@@ -281,21 +281,18 @@ def _get_gpu_id_info() -> tuple[int, str, int]:  # pragma: no cover
     gpu_id = ray.get_gpu_ids()[0]
     nvlink_domain = NVLINK_DOMAIN_UNKNOWN
     topo_rank = TOPO_RANK_UNKNOWN
-    try:
-        runtime_ctx = ray.get_runtime_context()
-        node_id = runtime_ctx.get_node_id()
-        all_node_resources: dict = {}
-        for node in ray.nodes():
-            if node.get("NodeID") == node_id:
-                all_node_resources = node.get("Resources", {})
-                break
-        for key, val in all_node_resources.items():
-            if key.startswith(NVLINK_DOMAIN_PREFIX):
-                nvlink_domain = key
-            if key == TOPO_RANK_KEY:
-                topo_rank = int(val)
-    except Exception:
-        pass
+    runtime_ctx = ray.get_runtime_context()
+    node_id = runtime_ctx.get_node_id()
+    all_node_resources: dict = {}
+    for node in ray.nodes():
+        if node.get("NodeID") == node_id:
+            all_node_resources = node.get("Resources", {})
+            break
+    for key, val in all_node_resources.items():
+        if key.startswith(NVLINK_DOMAIN_PREFIX):
+            nvlink_domain = key
+        if key == TOPO_RANK_KEY:
+            topo_rank = int(val)
     return gpu_id, nvlink_domain, topo_rank
 
 
