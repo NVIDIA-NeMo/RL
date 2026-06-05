@@ -16,7 +16,7 @@
 # MX refit wiring (DYN_MX_REFIT_ENABLED, MODEL_EXPRESS_URL, RoCE DRA, UCX/NIXL
 # env, modelexpress overlay) is unchanged from the 4B MX DGD.
 #
-# Image expectations: worker image must include modelexpress (kavink @ 8594fd6)
+# Image expectations: worker image must include modelexpress (kavink @ e45a14f)
 # + bundled-UCX nixl wheel (see memory project_dyn_gp_planner_image_deps).
 
 apiVersion: nvidia.com/v1alpha1

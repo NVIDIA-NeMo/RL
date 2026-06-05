@@ -34,10 +34,8 @@
 ARG BASE_IMAGE=nvcr.io/nvidian/nemo-rl:nightly
 FROM ${BASE_IMAGE}
 
-# MX commit we currently target — kavink/nemo_rl_moe @ 8594fd6:
-# v2 sidecar fix + post-rebase fixups. Validated end-to-end on Qwen3-4B
-# (mini_swe_big parity + workplace_assistant smoke).
-ARG MX_REF=8594fd6
+# MX commit we currently target — kavink/nemo_rl_moe @ e45a14f.
+ARG MX_REF=e45a14f
 # NIXL 0.10.1 is what the dynamo worker image
 # (jwillthomson/dynamo-arm-tokenize-endpoint-8590c26) ships, so trainer
 # + worker stay wire-compatible. Tracks the base's CUDA major: the
