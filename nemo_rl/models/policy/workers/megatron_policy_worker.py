@@ -1241,9 +1241,10 @@ class MegatronPolicyWorkerImpl(
         """Clear FP8 workspace caches and release fragmented GPU memory.
 
         The main memory issue in the train→offload→refit→generate cycle is CUDA
-        allocator fragmentation, not leaked FP8 tensors. This method:
-        1. Clears TE workspace buffers (which hold references to scratch memory)
-        2. Runs gc.collect() + empty_cache() to return freed blocks to CUDA
+        allocator fragmentation, not leaked FP8 tensors. This method clears
+        per-module _fp8_workspaces buffers (scratch memory references). The
+        caller is responsible for running gc.collect() + empty_cache() once
+        all references have been dropped.
 
         For anti-fragmentation, configure PYTORCH_CUDA_ALLOC_CONF in the recipe YAML:
         - "max_split_size_mb:512" — fast, prevents large-block splitting
@@ -1255,15 +1256,6 @@ class MegatronPolicyWorkerImpl(
             if hasattr(module, "_fp8_workspaces"):
                 module._fp8_workspaces.clear()
                 workspace_count += 1
-
-        # 2. Clear global TE workspace
-        try:
-            import transformer_engine.pytorch as te
-
-            if hasattr(te, "module") and hasattr(te.module.base, "clear_workspace"):
-                te.module.base.clear_workspace()
-        except ImportError:
-            pass
 
         print(
             f"[_clear_fp8_caches] Cleared {workspace_count} workspace modules on rank {self.rank}"
@@ -1290,36 +1282,7 @@ class MegatronPolicyWorkerImpl(
         if self.fp8_cfg.get("force_clear_fp8_caches", False):
             self._clear_fp8_caches()
 
-        torch.randn(1).cuda()  # wake up torch allocator
-        if (
-            hasattr(self, "optimizer")
-            and self.optimizer is not None
-            and not self.optimizer_cpu_offload
-        ):
-            self.move_optimizer("cpu")
-
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        # Print memory stats after offloading
-        allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
-        reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
-        print(
-            f"GPU Memory after optimizer offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
-        )
-        no_grad.__exit__(None, None, None)
-
-    @wrap_with_nvtx_name("megatron_policy_worker/offload_after_refit")
-    def offload_after_refit(self):
-        """Offload as much as possible on the CPU."""
-        no_grad = torch.no_grad()
-        no_grad.__enter__()
-        self.model = self.move_model(self.model, "cpu")
-        self.model.eval()
-        torch.randn(1).cuda()  # wake up torch allocator
-        self.offload_before_refit()  # rerun the old offload function
-
-        if self.cfg["megatron_cfg"].get("clear_memory_caches_after_refit", False):
+        if self.cfg["megatron_cfg"].get("clear_memory_caches_before_refit", False):
             # Clear RotaryEmbedding's @lru_cache(maxsize=32). The cache accumulates one
             # entry per unique (max_seq_len, offset, packed_seq) seen, and each entry is
             # a GPU tensor (the concatenated sin/cos embedding). With training + logprob
@@ -1368,8 +1331,34 @@ class MegatronPolicyWorkerImpl(
             except Exception:
                 pass
 
-            gc.collect()
-            torch.cuda.empty_cache()
+        torch.randn(1).cuda()  # wake up torch allocator
+        if (
+            hasattr(self, "optimizer")
+            and self.optimizer is not None
+            and not self.optimizer_cpu_offload
+        ):
+            self.move_optimizer("cpu")
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Print memory stats after offloading
+        allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
+        reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
+        print(
+            f"GPU Memory after optimizer offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
+        )
+        no_grad.__exit__(None, None, None)
+
+    @wrap_with_nvtx_name("megatron_policy_worker/offload_after_refit")
+    def offload_after_refit(self):
+        """Offload as much as possible on the CPU."""
+        no_grad = torch.no_grad()
+        no_grad.__enter__()
+        self.model = self.move_model(self.model, "cpu")
+        self.model.eval()
+        torch.randn(1).cuda()  # wake up torch allocator
+        self.offload_before_refit()  # rerun the old offload function
 
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
         reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB

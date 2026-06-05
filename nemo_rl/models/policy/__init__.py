@@ -278,10 +278,11 @@ class MegatronConfig(TypedDict):
     # When mtp_num_layers=0, Multi-Token Prediction is disabled.
     mtp_num_layers: NotRequired[int]
     # When True, clear the RotaryEmbedding LRU cache and MoE token dispatcher
-    # routing tensors after offload_after_refit. Useful when training and logprob
-    # runs use different sequence lengths (rope cache) or for MoE models with
-    # activation recompute (dispatcher reference cycles).
-    clear_memory_caches_after_refit: NotRequired[bool]
+    # routing tensors in offload_before_refit (before weight transfer to the
+    # inference engine). Useful when training and logprob runs use different
+    # sequence lengths (rope cache) or for MoE models with activation recompute
+    # (dispatcher reference cycles).
+    clear_memory_caches_before_refit: NotRequired[bool]
 
 
 class DraftConfigDisabled(TypedDict):
