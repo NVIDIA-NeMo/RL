@@ -175,7 +175,7 @@ def _is_mamba_provider(config) -> bool:
     return isinstance(config, MambaModelProvider)
 
 
-def get_quantization_layer_spec(config):
+def quantization_layer_spec(config):
     """Layer specification for quantization with ModelOpt.
 
     Routes mamba/hybrid configs to the mamba stack spec; otherwise falls back
@@ -205,6 +205,12 @@ def get_quantization_layer_spec(config):
     )
 
 
-# Backward compatibility for QARL checkpoints serialized before the callback was
-# renamed to match the worker-facing API.
-quantization_layer_spec = get_quantization_layer_spec
+def get_quantization_layer_spec():
+    """Build the ModelOpt quantization layer-spec callback as a portable target.
+
+    Upstream returns a ``functools.partial`` for GPT-only configs so
+    Megatron-Bridge serializes a stable code reference into checkpoints. This
+    branch must dispatch on GPT vs. Mamba at provider-call time, so it returns a
+    top-level dispatch function instead of a partial.
+    """
+    return quantization_layer_spec
