@@ -48,12 +48,14 @@ from typing import Any, Literal, Optional
 import ray
 import torch
 from tensordict import TensorDict
+from torchdata.stateful_dataloader import StatefulDataLoader
 
 from nemo_rl.algorithms.staleness_sampler import (
     StalenessSampler,
     count_prompt_groups,
     min_weight_version,
 )
+from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollout_manager import RolloutManager
@@ -81,7 +83,6 @@ class SingleControllerConfig:
 
     # Training
     max_train_steps: int = 10
-    max_rollout_prompts: int = 32
 
     # DataPlane partition
     partition_id: str = "rollout_data"
@@ -137,7 +138,7 @@ class SingleControllerActor:
         trainer_handle: Any,
         env_handles: dict[str, EnvironmentInterface],
         # TODO: move into SC's setup phase
-        prompts: list[str],  # TODO: use dataloader instead
+        dataloader: StatefulDataLoader,
         weight_synchronizer: Any,
         advantage_estimator: Any | None = None,
         tokenizer: Any | None = None,
@@ -152,9 +153,10 @@ class SingleControllerActor:
         )
 
         self._cfg = cfg
-        self._prompts = prompts
         self._dp_client = dp_client
+        self._gen = gen_handle
         self._trainer = trainer_handle
+        self._dataloader = dataloader
         self._weight_synchronizer = weight_synchronizer
         self._advantage_estimator = advantage_estimator
 
@@ -303,16 +305,16 @@ class SingleControllerActor:
 
         Flow per prompt:
           1. Acquire _buffer_capacity slot (backpressure)
-          2. Wait for _rollout_permitted (paused during weight sync)
-          3. Call rollout_manager.generate_and_push(prompt) — local async
+          2. Acquire sem (cap concurrent in-flight rollouts)
+          3. Wait for _rollout_permitted (paused during weight sync)
+          4. Call rollout_manager.generate_and_push(prompt) — local async
              RolloutManager runs rollout and calls DataPlane put_samples directly
-          4. Decrement _inflight_rollouts
+          5. Decrement _inflight_rollouts
         """
         sem = asyncio.Semaphore(self._cfg.max_inflight_prompts)
-        dispatched = 0
         log.info("rollout_pump: starting")
 
-        async def _dispatch_one_prompt(prompt: str) -> None:
+        async def _dispatch_one_prompt(prompt: DatumSpec) -> None:
             self._inflight_rollouts += 1
             try:
                 await self._rollout_manager.generate_and_push(prompt)
@@ -322,18 +324,18 @@ class SingleControllerActor:
                 self._inflight_rollouts -= 1
                 sem.release()
 
+        # TODO: add max_num_epochs and limit max_train_steps to max_num_epochs * len(dataloader) when setup
         while True:
-            # check if buffer is full
-            await self._buffer_capacity.acquire()
-            # check if inflight rollouts is full
-            await sem.acquire()
-            # wait for rollout to be permitted
-            await self._rollout_permitted.wait()
+            for prompt in self._dataloader:
+                # check if buffer is full
+                await self._buffer_capacity.acquire()
+                # check if inflight rollouts is full
+                await sem.acquire()
+                # wait for rollout to be permitted
+                await self._rollout_permitted.wait()
 
-            # dispatch rollout
-            prompt = self._prompts[dispatched % len(self._prompts)]
-            asyncio.create_task(_dispatch_one_prompt(prompt))
-            dispatched += 1
+                # dispatch rollout
+                asyncio.create_task(_dispatch_one_prompt(prompt))
 
     async def _train_pump(self) -> None:
         """Per-prompt-group streaming train loop.
