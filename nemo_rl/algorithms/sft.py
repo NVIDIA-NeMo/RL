@@ -32,7 +32,10 @@ from nemo_rl.data.llm_message_utils import (
 )
 from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
+from nemo_rl.distributed.virtual_cluster import (
+    ClusterConfig,
+    RayVirtualCluster,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import PolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
@@ -176,6 +179,8 @@ def setup(
         use_gpus=True,
         num_gpus_per_node=cluster_config["gpus_per_node"],
         max_colocated_worker_groups=1,
+        port_range_low=cluster_config.get("master_port_range_low"),
+        port_range_high=cluster_config.get("master_port_range_high"),
     )
     print(f"  ✓ Ray cluster initialized with {cluster_config['num_nodes']} nodes")
 

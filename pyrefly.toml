@@ -147,6 +147,7 @@ project-includes = [
   "nemo_rl/models/generation/vllm/__init__.py",
   "nemo_rl/models/generation/vllm/config.py",
   "nemo_rl/models/generation/vllm/quantization/fp8_train_utils.py",
+  "nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py",
   "nemo_rl/models/generation/vllm/utils.py",
   "nemo_rl/models/generation/vllm/vllm_backend.py",
   "nemo_rl/models/huggingface/__init__.py",
