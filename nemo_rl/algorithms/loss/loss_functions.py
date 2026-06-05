@@ -1293,17 +1293,22 @@ class CrossTokenizerDistillationLossFn(LossFunction):
 
         1. Project full-vocab student probs through ``M`` to teacher vocab.
         2. Use the full teacher logits materialized by ``prepare_loss_input``.
-        3. Compute one ``global_top_indices [k]`` per microbatch from the
+        3. Align each predictor with the token it predicts by shifting the
+           per-position tensors and chunk ids by one (drop the last
+           predictor position and the first chunk label), symmetrically on
+           student and teacher. Matches the next-token shift already used by
+           the CE term.
+        4. Compute one ``global_top_indices [k]`` per microbatch from the
            teacher's importance: ``max`` over flat ``(B*T_t)``, ``topk``
            over ``V_t``. Same vocab subset across every sample/position —
            keeps chunk-averaged KL well-defined.
-        4. Slice both the projected student probs and the teacher logits
+        5. Slice both the projected student probs and the teacher logits
            to those ``k`` columns.
-        5. Build per-token chunk masks from ``alignment_*_chunk_id`` and
+        6. Build per-token chunk masks from ``alignment_*_chunk_id`` and
            chunk-average via ``bmm`` (shared helper).
-        6. Renormalize student chunk distributions inside the top-k subset
+        7. Renormalize student chunk distributions inside the top-k subset
            (avg-then-renormalize, log).
-        7. Forward (or reverse) KL between chunk distributions.
+        8. Forward (or reverse) KL between chunk distributions.
         """
         T = self.temperature
         device = logits.device
@@ -1345,26 +1350,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         if teacher_full_logits.shape[-1] > v_t:
             teacher_full_logits = teacher_full_logits[..., :v_t]
 
-        # global_top_indices: max over flat (B*T_t) → [V_t] → topk → [k].
-        vocab_topk = min(self.vocab_topk, v_t)
-        with torch.no_grad():
-            teacher_flat = teacher_full_logits.view(-1, v_t)
-            global_importance = teacher_flat.max(dim=0).values
-            global_top_indices = torch.topk(
-                global_importance, k=vocab_topk, dim=-1
-            ).indices
-            global_top_indices = global_top_indices.sort().values  # [k]
-
-        # Slice both sides to the shared [k] columns.
-        projected_topk = projected_full[..., global_top_indices]  # [B, T_s, k]
-        teacher_topk_logits = teacher_full_logits[
-            ..., global_top_indices
-        ]  # [B, T_t, k]
-        target_log_probs = torch.log_softmax(
-            teacher_topk_logits / T, dim=-1
-        )  # [B, T_t, k] (renormalized within the [k] subset).
-
-        # Chunk-average both sides via the shared helper.
+        # Chunk-alignment data.
         alignment = alignment_from_flat_batch(data)
         student_chunk_id = alignment.student_chunk_id  # [B, T_s] long
         teacher_chunk_id = alignment.teacher_chunk_id  # [B, T_t] long
@@ -1372,6 +1358,39 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         if self.exact_token_match_only:
             pair_valid = pair_valid & alignment.pair_is_correct
         max_chunks = pair_valid.shape[1]
+
+        # A model's distribution at position t predicts the token at t+1, so
+        # align each predictor with the token it predicts: drop the last
+        # predictor position (nothing past the sequence to predict) and the
+        # first chunk label (no predictor precedes it). Applied symmetrically
+        # to student and teacher. Same next-token convention the CE term uses.
+        projected_full = projected_full[:, :-1, :]
+        teacher_full_logits = teacher_full_logits[:, :-1, :]
+        student_chunk_id = student_chunk_id[:, 1:]
+        teacher_chunk_id = teacher_chunk_id[:, 1:]
+
+        # global_top_indices: max over flat (B*T_t) → [V_t] → topk → [k].
+        vocab_topk = min(self.vocab_topk, v_t)
+        with torch.no_grad():
+            # reshape (not view): the shift above leaves teacher_full_logits
+            # non-contiguous.
+            teacher_flat = teacher_full_logits.reshape(-1, v_t)
+            global_importance = teacher_flat.max(dim=0).values
+            global_top_indices = torch.topk(
+                global_importance, k=vocab_topk, dim=-1
+            ).indices
+            global_top_indices = global_top_indices.sort().values  # [k]
+
+        # Slice both sides to the shared [k] columns.
+        projected_topk = projected_full[..., global_top_indices]  # [B, T_s-1, k]
+        teacher_topk_logits = teacher_full_logits[
+            ..., global_top_indices
+        ]  # [B, T_t-1, k]
+        target_log_probs = torch.log_softmax(
+            teacher_topk_logits / T, dim=-1
+        )  # [B, T_t-1, k] (renormalized within the [k] subset).
+
+        # Chunk-average both sides via the shared helper.
         proj_chunks, proj_sizes = chunk_average_log_probs(
             projected_topk, student_chunk_id, max_chunks
         )  # [B, C, k] / [B, C]
@@ -1443,8 +1462,9 @@ class CrossTokenizerDistillationLossFn(LossFunction):
 
         1. Lazy-build the exact-token map (cached per device).
         2. Use the full teacher logits materialized by ``prepare_loss_input``.
-        3. ``log_softmax`` on full vocab both sides; chunk-average via the
-           shared helper.
+        3. ``log_softmax`` on full vocab both sides; shift each predictor to
+           the token it predicts (drop the last predictor position, first
+           chunk label); chunk-average via the shared helper.
         4. Slice each chunk-averaged tensor to ``common_*`` indices and
            compute (forward or reverse) KL, reduced as
            ``sum / valid_chunk.sum()`` where ``valid_chunk`` is the
@@ -1497,6 +1517,16 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         teacher_chunk_id = alignment.teacher_chunk_id
         pair_valid = alignment.pair_valid
         max_chunks = pair_valid.shape[1]
+
+        # A model's distribution at position t predicts the token at t+1, so
+        # align each predictor with the token it predicts: drop the last
+        # predictor position and the first chunk label, symmetrically on
+        # student and teacher. See the matching note in `_compute_p_kl`.
+        student_log_probs = student_log_probs[:, :-1, :]
+        teacher_log_probs = teacher_log_probs[:, :-1, :]
+        student_chunk_id = student_chunk_id[:, 1:]
+        teacher_chunk_id = teacher_chunk_id[:, 1:]
+
         student_chunks, s_sizes = chunk_average_log_probs(
             student_log_probs, student_chunk_id, max_chunks
         )  # [B, C, V_s] / [B, C]
