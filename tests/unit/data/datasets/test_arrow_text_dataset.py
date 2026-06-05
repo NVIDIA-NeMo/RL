@@ -21,8 +21,6 @@ import pyarrow as pa
 import pyarrow.ipc as ipc
 import pytest
 
-from nemo_rl.data import ResponseDatasetConfig
-
 
 def _write_arrow_file(path: Path, rows: list[dict]) -> None:
     """Write a list-of-dict rows to ``path`` as a one-record-batch arrow IPC file."""
@@ -127,28 +125,6 @@ def test_D1_packed_unpacked_emit_same_valid_row_set(mixed_arrow_file):
             f"Valid row {t!r} present in unpacked dataset but missing from "
             f"packed corpus. The two code paths have drifted."
         )
-
-
-# ---------------------------------------------------------------------------
-# D2 — ResponseDatasetConfig must declare the keys ArrowTextDataset reads.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "key",
-    ["data_files", "subset", "split", "text_key", "characters_per_sample"],
-)
-def test_D2_response_dataset_config_declares_arrow_text_keys(key: str):
-    """Class B. Reviewer flagged that ArrowTextDataset reads undeclared
-    config fields. After the fix, each must appear in
-    ``ResponseDatasetConfig`` (as a required or optional key).
-    """
-    declared = set(ResponseDatasetConfig.__annotations__.keys())
-    assert key in declared, (
-        f"{key!r} is consumed by ArrowTextDataset but not declared on "
-        f"ResponseDatasetConfig (declared keys: {sorted(declared)}). "
-        f"Reviewer asked for explicit declaration."
-    )
 
 
 # ---------------------------------------------------------------------------

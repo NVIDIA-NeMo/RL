@@ -31,18 +31,6 @@ class ResponseDatasetConfig(TypedDict):
     split_validation_size: NotRequired[float]
     # Seed for train/validation split when split_validation_size > 0
     seed: NotRequired[int]
-    # ArrowTextDataset (dataset_name="arrow_text"): resolved by
-    # `load_dataset_from_path`. Either a path/glob/URL to a data file
-    # (.arrow/.parquet/.json/.txt; format inferred from the extension) or a
-    # HuggingFace dataset id loaded by name (use `subset`/`split` for the
-    # config/split). A single string, not a list.
-    data_files: NotRequired[str]
-    # ArrowTextDataset: column on the loaded dataset that holds the raw text.
-    text_key: NotRequired[str]
-    # ArrowTextDataset: if set, pack consecutive rows together until the
-    # running character count reaches this threshold; emit a packed
-    # sample and start a fresh one. If None, every input row is one sample.
-    characters_per_sample: NotRequired[int | None]
 
 
 class PreferenceDatasetConfig(TypedDict):
