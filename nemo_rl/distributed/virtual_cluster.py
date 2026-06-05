@@ -971,6 +971,13 @@ class RayVirtualCluster:
             segment_size=self.segment_size,
             gpus_per_node=self.num_gpus_per_node if self.segment_size else None,
         )
+        assert len(pg_reordered_bundle_indices) == num_bundles, (
+            f"Topology sort returned {len(pg_reordered_bundle_indices)} bundle indices "
+            f"but the cluster has {num_bundles}. Some NVLink domains had incomplete "
+            f"segments and were trimmed. Ensure cluster.segment_size divides evenly "
+            f"into each domain's node count and that node_resource_constraints are set "
+            f"to pin nodes to complete segments before creating this cluster."
+        )
         return pg_reordered_bundle_indices
 
     def shutdown(self) -> bool:
