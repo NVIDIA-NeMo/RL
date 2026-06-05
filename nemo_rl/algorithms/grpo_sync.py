@@ -48,6 +48,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
     MasterConfig,
+    _clip_grpo_advantages,
     _create_advantage_estimator,
     _log_mixed_rewards_and_advantages_information,
     _should_log_nemo_gym_responses,
@@ -844,6 +845,7 @@ def grpo_train_sync(
                 # ── Driver delta-write: advantages + (post-masking)
                 # sample_mask under the same meta.sample_ids so workers fetch
                 # the union via train_presharded.
+                advantages = _clip_grpo_advantages(advantages, master_config.grpo)
                 policy.write_to_dataplane(
                     meta,
                     fields={
