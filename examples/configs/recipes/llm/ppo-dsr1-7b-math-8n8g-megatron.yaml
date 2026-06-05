@@ -55,7 +55,7 @@ value:
   model_name: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
   tokenizer:
     name: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
-  train_micro_batch_size: 4
+  train_micro_batch_size: 1
   megatron_cfg:
     tensor_model_parallel_size: 2
     optimizer:
