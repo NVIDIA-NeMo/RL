@@ -267,7 +267,7 @@ class SingleControllerActor:
     # ── the four pumps (three main pumps + advantage pump) ─────────────────
 
     async def _rollout_pump(self) -> None:
-        """Dispatch prompts as concurrent coroutines, one per prompt group.
+        """Continuously dispatch rollout tasks until cancellation.
 
         Flow per prompt:
           1. Acquire _buffer_capacity slot (backpressure)
@@ -276,36 +276,32 @@ class SingleControllerActor:
              RolloutManager runs rollout and calls DataPlane put_samples directly
           4. Decrement _inflight_rollouts
         """
-        n = self._cfg.max_rollout_prompts
         sem = asyncio.Semaphore(self._cfg.max_inflight_prompts)
+        dispatched = 0
+        log.info("rollout_pump: starting")
 
-        start = time.monotonic()
-        log.info("rollout_pump: dispatching %d prompts", n)
+        async def _dispatch_one_prompt(prompt: str) -> None:
+            self._inflight_rollouts += 1
+            try:
+                await self._rollout_manager.generate_and_push(prompt)
+                if self._cfg.diagnostics:
+                    log.info("  rollout done for prompt='%s...'", prompt[:20])
+            finally:
+                self._inflight_rollouts -= 1
+                sem.release()
 
-        async def _one_group(prompt: str) -> None:
+        while True:
+            # check if buffer is full
             await self._buffer_capacity.acquire()
+            # check if inflight rollouts is full
+            await sem.acquire()
+            # wait for rollout to be permitted
             await self._rollout_permitted.wait()
-            async with sem:
-                self._inflight_rollouts += 1
-                try:
-                    await self._rollout_manager.generate_and_push(prompt)
-                    if self._cfg.diagnostics:
-                        log.info("  rollout done for prompt='%s...'", prompt[:20])
-                finally:
-                    self._inflight_rollouts -= 1
 
-        tasks = [
-            asyncio.ensure_future(_one_group(self._prompts[i % len(self._prompts)]))
-            for i in range(n)
-        ]
-        await asyncio.gather(*tasks)
-
-        self._rollout_done = True
-        log.info(
-            "rollout_pump: finished %d prompts in %.2fs",
-            n,
-            time.monotonic() - start,
-        )
+            # dispatch rollout
+            prompt = self._prompts[dispatched % len(self._prompts)]
+            asyncio.create_task(_dispatch_one_prompt(prompt))
+            dispatched += 1
 
     async def _train_pump(self) -> None:
         """Claim DataPlane metadata, select a batch, train, clear, sync weights.

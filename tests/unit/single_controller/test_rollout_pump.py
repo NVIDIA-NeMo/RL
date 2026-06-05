@@ -21,6 +21,7 @@ test process can inspect TQ state after the SC actor finishes.
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import ray
@@ -35,7 +36,11 @@ from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 
 # Reuse fixtures from the experience tests; same shape as test_async_rollout_manager.
 from tests.unit.experience.test_rollouts import (
+    initial_multi_step_calculator_batch,  # noqa: F401
+    multi_step_calculator_environment,  # noqa: F401
     multi_step_setup_vllm_async,  # noqa: F401
+    rollout_cluster,  # noqa: F401
+    rollout_tokenizer,  # noqa: F401
     single_multi_step_calculator_input_sample,  # noqa: F401
 )
 
@@ -104,6 +109,9 @@ class _TQActor:
     ) -> list[dict[str, Any]]:
         rec = self._client._partitions[partition_id]
         return [dict(rec.tags.get(sid, {})) for sid in sample_ids]
+
+    def peek_count(self, partition_id: str) -> int:
+        return len(self._client._partitions[partition_id].rows)
 
 
 class _SyncDPAdapter:
@@ -180,7 +188,6 @@ def test_rollout_pump_writes_expected_tq_data(
     )
     prompts = [input_sample] * max_rollout_prompts
 
-    vllm_generation.prepare_for_generation()
     ctrl = SingleControllerActor.remote(
         cfg=cfg,
         dp_client=dp_adapter,
@@ -191,7 +198,25 @@ def test_rollout_pump_writes_expected_tq_data(
         weight_synchronizer=object(),
         tokenizer=tokenizer,
     )
-    ray.get(ctrl._rollout_pump.remote())
+
+    vllm_generation.prepare_for_generation()
+
+    # _rollout_pump runs until cancelled, so poll TQ then cancel.
+    pump_ref = ctrl._rollout_pump.remote()
+    deadline = time.monotonic() + 120.0
+    while time.monotonic() < deadline:
+        if ray.get(tq_actor.peek_count.remote(_PARTITION_ID)) >= expected_samples:
+            break
+        time.sleep(0.5)
+    assert ray.get(tq_actor.peek_count.remote(_PARTITION_ID)) >= expected_samples, (
+        "rollout_pump did not push expected_samples within timeout"
+    )
+    ray.cancel(pump_ref)
+    try:
+        ray.get(pump_ref)
+    except (ray.exceptions.RayTaskError, ray.exceptions.TaskCancelledError):
+        pass
+
     vllm_generation.finish_generation()
 
     meta = ray.get(
