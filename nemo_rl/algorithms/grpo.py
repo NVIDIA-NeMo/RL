@@ -1184,6 +1184,20 @@ def _create_advantage_estimator(master_config: MasterConfig):
     return adv_estimator
 
 
+def _clip_grpo_advantages(
+    advantages: torch.Tensor,
+    grpo_config: dict[str, Any],
+) -> torch.Tensor:
+    """Clamp normalized advantages when clip bounds are configured."""
+    clip_low = grpo_config.get("advantage_clip_low", None)
+    clip_high = grpo_config.get("advantage_clip_high", None)
+    if clip_low is not None:
+        advantages = advantages.clamp(min=clip_low)
+    if clip_high is not None:
+        advantages = advantages.clamp(max=clip_high)
+    return advantages
+
+
 def refit_policy_generation(
     policy: ColocatablePolicyInterface,
     policy_generation: GenerationInterface,
@@ -1982,16 +1996,9 @@ def grpo_train(
                     del baseline_for_log
 
                     # Clip advantages to prevent extreme values from small std normalization
-                    clip_low = master_config.grpo.get("advantage_clip_low", None)
-                    clip_high = master_config.grpo.get("advantage_clip_high", None)
-                    if clip_low is not None:
-                        train_data["advantages"] = train_data["advantages"].clamp(
-                            min=clip_low
-                        )
-                    if clip_high is not None:
-                        train_data["advantages"] = train_data["advantages"].clamp(
-                            max=clip_high
-                        )
+                    train_data["advantages"] = _clip_grpo_advantages(
+                        train_data["advantages"], master_config.grpo
+                    )
 
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
                 print("▶ Preparing for training...", flush=True)
@@ -2975,9 +2982,9 @@ def async_grpo_train(
                 with timer.time("data_processing"):
                     # Apply overlong filtering - mask out truncated sequences from loss computation
                     with timer.time("overlong_filter"):
-                        use_overlong_filtering = master_config.grpo.get(
-                            "overlong_filtering", False
-                        )
+                        use_overlong_filtering = master_config.grpo[
+                            "overlong_filtering"
+                        ]
                         if use_overlong_filtering:
                             loss_multiplier = repeated_batch["loss_multiplier"].clone()
                             truncated = repeated_batch["truncated"]
@@ -3122,16 +3129,9 @@ def async_grpo_train(
                     )
 
                     # Clip advantages to prevent extreme values from small std normalization
-                    clip_low = master_config.grpo.get("advantage_clip_low", None)
-                    clip_high = master_config.grpo.get("advantage_clip_high", None)
-                    if clip_low is not None:
-                        train_data["advantages"] = train_data["advantages"].clamp(
-                            min=clip_low
-                        )
-                    if clip_high is not None:
-                        train_data["advantages"] = train_data["advantages"].clamp(
-                            max=clip_high
-                        )
+                    train_data["advantages"] = _clip_grpo_advantages(
+                        train_data["advantages"], master_config.grpo
+                    )
 
                 print("▶ Preparing for training...")
                 with timer.time("training_prep"):
