@@ -522,12 +522,14 @@ class TestSingleControllerDryRun:
 
         return SingleControllerActor.remote(
             cfg=cfg,
-            prompts=prompts,
-            dp_client_handle=dp_client,
+            dp_client=dp_client,
+            gen_handle=gen,
+            env_handles={},
             trainer_handle=trainer,
-            rollout_manager=rollout_manager,
+            prompts=prompts,
             weight_synchronizer=weight_sync,
             advantage_estimator=advantage_estimator,
+            rollout_manager=rollout_manager,
         )
 
     def test_dry_run_completes(self, ray_init):
