@@ -23,12 +23,12 @@ maintainers = [
 ]
 dependencies = [
   "setuptools",
-  "pip",                                                                                                              # Required for frozen environments; uv venv --seed may not reliably install pip
-  "ninja",                                                                                                            # for flash-attn parallel build
+  "pip",                                                                                                 # Required for frozen environments; uv venv --seed may not reliably install pip
+  "ninja",                                                                                               # for flash-attn parallel build
   "torch==2.11.0",
   "triton; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "colored==2.2.3",
-  "ray[default]==2.54.0",
+  "ray[default]>=2.55.1",
   "wandb>=0.25.1",
   "numpy",
   "datasets>=4.0.0",
@@ -41,6 +41,7 @@ dependencies = [
   "nvidia-ml-py",
   "hydra-core",
   "tiktoken",
+  "sentencepiece",
   "blobfile",
   "debugpy",
   "nvtx",
@@ -49,18 +50,19 @@ dependencies = [
   "sympy>=1.14.0",
   "pillow>=12.1.1",
   "torchvision==0.26.0",
-  "transformers==5.3.0",
-  "num2words>=0.5.14",                                                                                                # for SmolVLM
-  "mlflow>=3.11.1",
-  "nvidia-nvshmem-cu13; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
+  # Keep the base range broad enough while allowing backend extras to tighten as needed.
+  "transformers>=5.3.0,<5.9.0",
+  "num2words>=0.5.14",                                                                                                       # for SmolVLM
+  "mlflow>=3.12.0",
+  "nvidia-nvshmem-cu13>=3.6.5; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
   "swanlab",
   "pyzmq",
   "decord2",
   "soundfile>=0.13.1",
-  "nccl4py; sys_platform != 'darwin'",                                                                                # for non-colocated refit
-  "cuda-bindings; sys_platform != 'darwin'",                                                                          # for non-colocated refit
-  "pybase64",                                                                                                         # for sglang refit
-  "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",                                                           # for transformer-engine no build isolation
+  "nccl4py; sys_platform != 'darwin'",                                                                                       # for non-colocated refit
+  "cuda-bindings; sys_platform != 'darwin'",                                                                                 # for non-colocated refit
+  "pybase64",                                                                                                                # for sglang refit
+  "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",                                                                  # for transformer-engine no build isolation
   # tilelang — replacement Triton kernel mamba-ssm requires when
   # Triton >= 3.4.0 on Hopper, see github.com/state-spaces/mamba#640.
   # Without this, qwen3.5 / nano-v3 / moonlight megatron recipes
@@ -116,7 +118,7 @@ automodel = [
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "flash-attn==2.8.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
-  "transformers>=5.3.0",
+  "transformers>=5.3.0,<5.4.0",
   "mamba-ssm",
   "causal-conv1d",
   "nv-grouped-gemm",
@@ -126,7 +128,7 @@ automodel = [
 ]
 vllm = [
   "cuda-python",
-  "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@7b6b5563b9d4c1ae07ffbce7f78ad3ac9204827c",
+  "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@67fc64863d43521080bf2005e6528d0fceee9510",
   # deep_ep also needs libibverbs-dev
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
@@ -145,6 +147,7 @@ vllm = [
 sglang = [
   "sglang==0.5.11",
   "sglang-kernel==0.4.2", # Direct dep for explicit version control
+  "kernels<0.15",
 ]
 mcore = [
   # also need cudnn (https://developer.nvidia.com/cudnn-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=deb_network)
@@ -156,9 +159,11 @@ mcore = [
   # This dependency also needs to be compatible with the spec in Megatron-Bridge/pyproject.toml.
   # It is specified here since we don't directly use Megatron-Bridge/pyproject.toml, but a proxy setup.py+pyproject.toml combo
   # outside to allow "optionally" installing the megatron path. It's simpler to deal with transformer-engine here in the NeMo RL pyproject.toml
-  "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@v2.14.1",
+  "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@release_v2.15",
   "megatron-core",
   "megatron-bridge",
+  # Must match Megatron-Bridge main's transformers requirement (still includes GLM 5.1 support).
+  "transformers>=5.8.1,<5.9.0",
   "nvidia-modelopt[torch]; sys_platform != 'darwin'",
   "onnxscript",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
@@ -167,13 +172,24 @@ mcore = [
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "flash-attn==2.8.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
+  "mamba-ssm",
+  "causal-conv1d",
+  "fast-hadamard-transform",
   "emerging-optimizers==0.2.0",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480 ; platform_machine == 'x86_64'",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
+  "quart",
+  "hypercorn",
+  "orjson",
+  "flashinfer-python==0.6.8.post1",
+  "flashinfer-cubin==0.6.8.post1",
+  "flashinfer-jit-cache==0.6.8.post1",
+  "nvshmem4py-cu13>=0.2.1",
+  "cupy-cuda13x",
 ]
 modelopt = ["nvidia-modelopt"]
 nvrx = [
-  "nvidia-resiliency-ext",
+  "nvidia-resiliency-ext==0.6.0",
 ] # for ft_launcher (fault-tolerant training launcher)
 nemo_gym = ["nemo_gym"]
 
@@ -246,12 +262,14 @@ triton = [
   { index = "pytorch-cu130", marker = "sys_platform != 'darwin'" },
   { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
-causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", rev = "67e0a9dfe1518fc0036444e9ab5fe06ab78299e0" }
-mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "d68d16ed7d5d5164eb5a57c0285f3b7eb8394ec1" }
+causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", rev = "4f6ae4e26ae5fe8af9372f8d312ab25cc4595223" }
+mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "a14b1dff0454a3bc27d9eb31355dc01e4b2490ec" }
 nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v1.1.4.post7" }
 emerging-optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.2.0" }
-nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "905018803414702e414a86716484ed4115b37ba6" }
-nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", rev = "15a851565a4ce846c04431ecb0cf09903ab4837e" }
+fast-hadamard-transform = { git = "https://github.com/Dao-AILab/fast-hadamard-transform.git" }
+nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "c897fbeaaff66d53d61033f107885b7c5432f235" }
+nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", rev = "6c5f2a13c7688d92a7ac7ee6e464721eb8b7345d" }
+flashinfer-jit-cache = { index = "flashinfer-cu130" }
 
 [tool.uv.workspace]
 members = [
@@ -274,7 +292,17 @@ name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
+[[tool.uv.index]]
+name = "flashinfer-cu130"
+url = "https://flashinfer.ai/whl/cu130"
+explicit = true
+
 [tool.uv]
+managed = true
+environments = [
+  "python_version == '3.13' and sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "python_version == '3.13' and sys_platform == 'linux' and platform_machine == 'aarch64'",
+]
 preview = true # Enable preview features like extra-build-dependencies
 no-build-isolation-package = [
   "transformer-engine-torch",
@@ -282,6 +310,7 @@ no-build-isolation-package = [
   "flash-attn",
   "mamba-ssm",
   "causal-conv1d",
+  "fast-hadamard-transform",
   "deep_gemm",
   "deep_ep",
   "nv-grouped-gemm",          # from mlm (added here to make sure it's built no isolation since mlm workspace uses setup.py)
@@ -297,15 +326,16 @@ default-groups = ["dev", "build"]
 link-mode = "copy"
 # The TE override is needed to pin the TE version across all extras
 # The opencv-python-headless override is needed because automodel pins it to 4.10.0.84, whereas vllm>=0.11.0 needs >= 4.11.0
-# The timm override is needed because current automodel pins to 1.0.16. This can be removed once we move ToT automodel
-# The nvidia-modelopt override is needed because mcore is still on 0.33
+# The timm override is needed because sglang requires timm==1.0.16.
 override-dependencies = [
-  "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@v2.14.1",
-  "nvidia-cublas==13.3.0.5; sys_platform != 'darwin'",
+  "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@release_v2.15",
+  "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",
+  "nvidia-cudnn-frontend==1.23.0",
+  "nvidia-nvshmem-cu13>=3.6.5; sys_platform != 'darwin'",
   "opencv-python-headless>=4.11.0",
   "timm<=1.0.22",
-  "nvidia-modelopt[torch]>=0.39.0",
+  "nvidia-modelopt[torch]>=0.44.0a0",
   "torch==2.11.0",
   "torchaudio==2.11.0",
   # sglang has conflicting llguidance versions than vllm, so enforcing vllm's version since it's newer
@@ -314,24 +344,20 @@ override-dependencies = [
   "setuptools>=80.10.2",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480 ; platform_machine == 'x86_64'",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
-  # Override megatron-core's flashinfer~=0.5.0 constraint to allow both vllm and sglang (both use 0.6.8.post1)
-  "flashinfer-python>=0.5.0",
-  "flashinfer-cubin>=0.5.0",
   # Override to >=4.4.1 so uv can resolve to a version satisfying both vllm and sglang.
-  "nvidia-cutlass-dsl>=4.4.1",
+  "nvidia-cutlass-dsl[cu13]>=4.4.1",
   # Relax megatron-core workspace member's opentelemetry-api ceiling (<1.34) for protobuf 6.x compat with ray
   "opentelemetry-api>=1.33.1",
-  # vLLM 0.20.0 excludes transformers 5.0-5.5.0 but our codebase needs 5.3.0.
-  # Override so uv can resolve transformers==5.3.0 for non-vllm extras.
-  "transformers==5.3.0",
   # Override sglang's xgrammar==0.1.32 to address CVE GHSA-7rgv-gqhr-fxg3
   "xgrammar==0.1.33",
   # Override dependencies to address CVEs
-  "mlflow>=3.11.1",
+  "mlflow>=3.12.0",
   # Override outlines for Python 3.13 support
   "outlines>=0.2.0",
   # Upgrade pytest to 9.0.3
   "pytest>=9.0.3",
+  "langchain>=0.3.28",      # Address CVE-2025-65106
+  "langchain-core>=0.3.80", # Address CVE-2025-65106
   # TransferQueue (data-plane extra) pins numpy<2.0.0; megatron-core needs
   # numpy>=2.1.0 via onnx → ml-dtypes. Override globally so the data-plane
   # extra composes with mcore/automodel without version-mirroring TQ's
@@ -343,7 +369,7 @@ override-dependencies = [
 constraint-dependencies = [
   "brotli>=1.2.0",            # Address CVE GHSA-2qfp-q593-8484
   "starlette>=0.49.1",        # Address CVE GHSA-7f5h-v6xp-fcq8
-  "urllib3>=2.6.3",           # Address CVE GHSA-38jv-5279-wg99
+  "urllib3>=2.7.0",           # Address CVE GHSA-38jv-5279-wg99
   "aiohttp>=3.13.3",          # Address CVE GHSA-mqqc-3gqh-h2x8
   "pyasn1>=0.6.3",            # Address CVE GHSA-jr27-m4p2-rc6r
   "wheel>=0.46.2",            # Address CVE GHSA-8rrh-rw8j-w5fx
@@ -403,6 +429,7 @@ transformer-engine = [{ requirement = "torch", match-runtime = true }]
 transformer-engine-torch = [{ requirement = "torch", match-runtime = true }]
 mamba-ssm = [{ requirement = "torch", match-runtime = true }]
 causal-conv1d = [{ requirement = "torch", match-runtime = true }]
+fast-hadamard-transform = [{ requirement = "torch", match-runtime = true }]
 nv-grouped-gemm = [{ requirement = "torch", match-runtime = true }]
 
 # Needed when building from source
@@ -414,6 +441,11 @@ requires-dist = ["torch", "einops", "setuptools", "psutil", "ninja"]
 name = "causal-conv1d"
 # This version has to match the version in the commit/rev/tag used
 version = "1.5.4"
+requires-dist = ["torch", "packaging", "ninja"]
+
+[[tool.uv.dependency-metadata]]
+name = "fast-hadamard-transform"
+version = "1.1.0"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [[tool.uv.dependency-metadata]]
@@ -431,17 +463,17 @@ requires-dist = ["torch", "packaging", "ninja"]
 [[tool.uv.dependency-metadata]]
 name = "deep_gemm"
 # This version has to match the version in the commit/rev/tag used
-version = "v2.0.0+7b6b556"
+version = "2.5.0"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [[tool.uv.dependency-metadata]]
 name = "transformer-engine"
-version = "2.14.1+366798e"
+version = "2.15.0+42b8400"
 requires-dist = ["torch", "pydantic", "importlib-metadata>=1.0", "packaging"]
 
 [[tool.uv.dependency-metadata]]
 name = "transformer-engine-torch"
-version = "2.14.1+366798e"
+version = "2.15.0+42b8400"
 requires-dist = ["torch", "transformer-engine"]
 
 [[tool.uv.dependency-metadata]]
@@ -457,7 +489,8 @@ name = "megatron-bridge"
 # Must stay in sync with 3rdparty/Megatron-Bridge-workspace/setup.py::CACHED_DEPENDENCIES.
 version = "0.0.0"
 requires-dist = [
-  "transformers>=5.0.0,<=5.3.0",
+  "transformers>=5.8.1,<5.9.0",
+  "mistral-common>=1.10.0",
   "peft>=0.18.1",
   "datasets>=2.20.0",
   "accelerate",
@@ -476,20 +509,18 @@ requires-dist = [
   "pyyaml>=6.0.2",
   "tqdm>=4.67.1",
   "hydra-core>1.3,<=1.3.2",
-  # megatron-core omitted here: it's a workspace member and already a direct dep of the mcore extra.
-  # Non-workspace path deps cannot depend on workspace members (uv name-shadowing restriction).
   "qwen-vl-utils",
-  # TODO(https://github.com/NVIDIA-NeMo/RL/issues/2111): upgrade to core_cu13 when we move to CUDA 13
-  "transformer-engine[pytorch,core_cu13]",
-  "mamba-ssm",
   "nvidia-resiliency-ext",
-  "causal-conv1d",
   "flash-linear-attention",
   "timm",
   "open-clip-torch>=3.2.0",
   "mlflow>=3.9.0",
   "comet-ml>=3.50.0",
   "torch>=2.6.0",
+  "flashinfer-python==0.6.8.post1",
+  "flashinfer-cubin==0.6.8.post1",
+  # megatron-core omitted here: it's a workspace member and already a direct dep of the mcore extra.
+  # Non-workspace path deps cannot depend on workspace members (uv name-shadowing restriction).
 ]
 
 # Override logsage metadata to remove numpy<=2.0.2 and pandas<=2.3.3 upper bounds
@@ -497,7 +528,7 @@ requires-dist = [
 # Tracking: https://github.com/NVIDIA/nvidia-resiliency-ext/issues/301
 [[tool.uv.dependency-metadata]]
 name = "logsage"
-version = "0.1.5"
+version = "0.1.7"
 requires-dist = [
   "drain3>=0.9.11,<0.10.0",
   "langchain>=0.3.27,<0.4.0",

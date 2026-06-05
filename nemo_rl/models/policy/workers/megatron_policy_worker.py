@@ -984,6 +984,7 @@ class MegatronPolicyWorkerImpl(
             GPTInferenceWrapper,
         )
         from megatron.core.inference.sampling_params import SamplingParams
+        from megatron.core.inference.utils import InferenceMode
 
         model_config = self.model.config
         model_config.cuda_graph_impl = "local"
@@ -1022,52 +1023,55 @@ class MegatronPolicyWorkerImpl(
             tokenizer=self.megatron_tokenizer,
         )
 
-        dynamic_engine = DynamicInferenceEngine(
-            text_generation_controller,
-            dynamic_context,
-        )
-
-        # Handle None values for top_k - convert to integer as required by Megatron
-        top_k_cfg = self.cfg["generation"]["top_k"]
-        top_k_val = 1 if greedy else (int(top_k_cfg) if top_k_cfg is not None else 0)
-
-        top_p_cfg = self.cfg["generation"]["top_p"]
-        top_p_val = (
-            0.0 if greedy else (float(top_p_cfg) if top_p_cfg is not None else 0.0)
-        )
-
-        # New API: SamplingParams now includes termination_id and uses num_tokens_total
-        sampling_params = SamplingParams(
-            temperature=self.cfg["generation"]["temperature"] if not greedy else 0,
-            top_k=top_k_val,
-            top_p=top_p_val,
-            skip_prompt_log_probs=False,
-            return_log_probs=True,
-            num_tokens_total=self.cfg["generation"]["max_new_tokens"],
-            num_tokens_to_generate=None,
-            termination_id=self.megatron_tokenizer.eod,
-        )
-
-        input_ids = data["input_ids"]
-        prompt_tokens_tensor = input_ids.cuda()
-        prompt_lengths_tensor = data["input_lengths"]
-        request_id = 0
-
-        # New API: add_request now takes sampling_params as a parameter
-        for p, prompt_len in zip(
-            prompt_tokens_tensor, prompt_lengths_tensor, strict=True
-        ):
-            dynamic_engine.add_request(
-                request_id,
-                p[:prompt_len],
-                sampling_params=sampling_params,
+        with InferenceMode.active():
+            dynamic_engine = DynamicInferenceEngine(
+                text_generation_controller,
+                dynamic_context,
             )
-            request_id += 1
 
-        result = []
-        while dynamic_engine.has_unfinished_requests():
-            result_step = dynamic_engine.step_modern()
-            result.extend(result_step["finished_request_records"])
+            # Handle None values for top_k - convert to integer as required by Megatron
+            top_k_cfg = self.cfg["generation"]["top_k"]
+            top_k_val = (
+                1 if greedy else (int(top_k_cfg) if top_k_cfg is not None else 0)
+            )
+
+            top_p_cfg = self.cfg["generation"]["top_p"]
+            top_p_val = (
+                0.0 if greedy else (float(top_p_cfg) if top_p_cfg is not None else 0.0)
+            )
+
+            # New API: SamplingParams now includes termination_id and uses num_tokens_total
+            sampling_params = SamplingParams(
+                temperature=self.cfg["generation"]["temperature"] if not greedy else 0,
+                top_k=top_k_val,
+                top_p=top_p_val,
+                skip_prompt_log_probs=False,
+                return_log_probs=True,
+                num_tokens_total=self.cfg["generation"]["max_new_tokens"],
+                num_tokens_to_generate=None,
+                termination_id=self.megatron_tokenizer.eod,
+            )
+
+            input_ids = data["input_ids"]
+            prompt_tokens_tensor = input_ids.cuda()
+            prompt_lengths_tensor = data["input_lengths"]
+            request_id = 0
+
+            # New API: add_request now takes sampling_params as a parameter
+            for p, prompt_len in zip(
+                prompt_tokens_tensor, prompt_lengths_tensor, strict=True
+            ):
+                dynamic_engine.add_request(
+                    request_id,
+                    p[:prompt_len],
+                    sampling_params=sampling_params,
+                )
+                request_id += 1
+
+            result = []
+            while dynamic_engine.has_unfinished_requests():
+                result_step = dynamic_engine.step_modern()
+                result.extend(result_step["finished_request_records"])
 
         # Sort results by request_id to maintain original batch order
         result.sort(key=lambda x: x.request_id)
@@ -1333,13 +1337,12 @@ class MegatronPolicyWorkerImpl(
         )
         self.model.train()
 
-        # Move optimizer state to CUDA if it exists
-        # colocated generation will always offload optimizer to cuda before refit
+        # Training expects optimizer state on CUDA. Keep this unconditional rather
+        # than trying to mirror every path that may have offloaded it to CPU.
         if (
             hasattr(self, "optimizer")
             and self.optimizer is not None
             and not self.optimizer_cpu_offload
-            and (self.offload_optimizer_for_logprob or self.is_generation_colocated)
         ):
             self.move_optimizer("cuda")
 

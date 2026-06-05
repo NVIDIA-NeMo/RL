@@ -10,6 +10,8 @@ grpo:
   val_at_start: true
   val_at_end: false
   overlong_filtering: false
+  advantage_clip_low: null
+  advantage_clip_high: null
   max_val_samples: null   # inferred from size of val dataset. for multi evals, repeat val ds via `num_repeats` in `ng_prepare_data`.
   val_batch_size: null
   seed: 42
@@ -282,6 +284,11 @@ env:
   should_use_nemo_gym: true
   should_log_nemo_gym_responses: true  # If you have low logging storage, set this to false
   nemo_gym:  # This is passed into NeMo-Gym as the initial_global_config_dict
+    # Port range for Gym HTTP servers, kept below the OS ephemeral range
+    # (32768-60999) and non-overlapping with NeMo RL (11001-15000) or
+    # vLLM (20001+). See ray.sub for the full port layout.
+    port_range_low: 15001
+    port_range_high: 20000
     rollout_max_attempts_to_avoid_lp_nan: 1
     is_trajectory_collection: false  # Set this to true to enable trajectory collection (no training). You may also want to increase `policy.generation.vllm_cfg.gpu_memory_utilization`
     config_paths:

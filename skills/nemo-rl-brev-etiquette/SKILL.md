@@ -1,7 +1,8 @@
 ---
-name: brev-etiquette
-description: Brev instance operating guidance for NeMo-RL agents working in /home/ubuntu/RL with limited workspace disk, a larger /ephemeral volume, and optional /home/ubuntu/RL/.env secrets. Use when running auto-research campaigns, experiments, training jobs, model or dataset downloads, shared cache-heavy commands, log-producing runs, checkpoint generation, W&B or Hugging Face authenticated workflows, or any workflow that may create large files on Brev.
-when_to_use: Running on a Brev instance; launching auto-research campaigns or long jobs; managing large logs, checkpoints, caches, datasets, Ray temp files, W&B files, or Hugging Face auth on Brev.
+name: nemo-rl-brev-etiquette
+license: Apache-2.0
+description: Brev instance operating guidance for NeMo-RL agents working in /home/ubuntu/RL with limited workspace disk, a larger /ephemeral volume, and optional /home/ubuntu/RL/.env secrets. Use when running nemo-rl-auto-research campaigns, experiments, training jobs, model or dataset downloads, shared cache-heavy commands, log-producing runs, checkpoint generation, W&B or Hugging Face authenticated workflows, or any workflow that may create large files on Brev.
+when_to_use: Running on a Brev instance; launching nemo-rl-auto-research campaigns or long jobs; managing large logs, checkpoints, caches, datasets, Ray temp files, W&B files, or Hugging Face auth on Brev.
 ---
 
 # Brev Etiquette
@@ -14,7 +15,7 @@ Operate as though `/home/ubuntu/RL` is the source checkout and `/ephemeral` is t
 - Put generated experiment assets under `/ephemeral`, including checkpoints, run logs, Ray temp directories, W&B offline files, profiler traces, evaluation dumps, rollout samples, and per-experiment artifacts.
 - Keep reusable caches under one shared `/ephemeral` cache root per user, not under each experiment. This includes Hugging Face models, dataset caches, PyTorch caches, Triton caches, `uv` caches, and pip caches.
 - Before a campaign or long run, check capacity with `df -h /home/ubuntu/RL /ephemeral` and avoid starting if `/ephemeral` is missing or nearly full.
-- Create a campaign root such as `/ephemeral/nemo-rl/${USER:-ubuntu}/auto-research/<campaign>` and use one subdirectory per experiment.
+- Create a campaign root such as `/ephemeral/nemo-rl/${USER:-ubuntu}/nemo-rl-auto-research/<campaign>` and use one subdirectory per experiment.
 - Do not leave large files, cache directories, or generated outputs in the git checkout. If a tool defaults to the repo, override its output/cache path before running it.
 
 ## Environment Secrets
@@ -35,7 +36,7 @@ fi
 
 ## Auto-Research Pattern
 
-When using `auto-research`, keep the git ledger in the repo and heavy evidence on `/ephemeral`.
+When using `nemo-rl-auto-research`, keep the git ledger in the repo and heavy evidence on `/ephemeral`.
 
 ```bash
 if [ -f /home/ubuntu/RL/.env ]; then
@@ -46,7 +47,7 @@ fi
 
 BREV_ROOT=/ephemeral/nemo-rl/${USER:-ubuntu}
 CACHE_ROOT=$BREV_ROOT/cache
-CAMPAIGN_ROOT=$BREV_ROOT/auto-research/<campaign>
+CAMPAIGN_ROOT=$BREV_ROOT/nemo-rl-auto-research/<campaign>
 EXP_DIR=$CAMPAIGN_ROOT/<experiment>
 mkdir -p "$EXP_DIR"/{logs,checkpoints,artifacts,ray,tmp,wandb}
 mkdir -p "$CACHE_ROOT"/{huggingface,torch,triton,uv,pip,xdg,wandb}
@@ -66,7 +67,7 @@ export TMPDIR=$EXP_DIR/tmp
 export WANDB_DIR=$EXP_DIR/wandb
 ```
 
-Record the absolute `/ephemeral` paths in the auto-research TSV fields for log path, checkpoint path, artifacts, shared cache root, and command. If the TSV itself may grow large, store the full TSV in `/ephemeral` and keep a small pointer file or summary in the repo.
+Record the absolute `/ephemeral` paths in the nemo-rl-auto-research TSV fields for log path, checkpoint path, artifacts, shared cache root, and command. If the TSV itself may grow large, store the full TSV in `/ephemeral` and keep a small pointer file or summary in the repo.
 
 ## Launch Checklist
 
