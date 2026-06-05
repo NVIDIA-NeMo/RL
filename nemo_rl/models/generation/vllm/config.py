@@ -43,6 +43,8 @@ class VllmSpecificArgs(TypedDict):
     # for per-recipe knobs (e.g. forcing a specific fused-MoE backend) without
     # affecting other test cases.
     env_vars: NotRequired[dict[str, str]]
+    # A filepath that can be imported to register a vLLM reasoning parser
+    reasoning_parser_plugin: NotRequired[str]
 
 
 class VllmConfig(GenerationConfig):
