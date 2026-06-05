@@ -1634,7 +1634,6 @@ def grpo_train(
     val_at_start = master_config.grpo["val_at_start"]
     val_at_end = master_config.grpo["val_at_end"]
     val_period = master_config.grpo["val_period"]
-    to_compute_kl = master_config.loss_fn.reference_policy_kl_penalty > 0
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
 
     # Initialize advantage estimator
@@ -2019,12 +2018,12 @@ def grpo_train(
                         "Computing prev_logprobs anyway for seq-level error masking."
                     )
 
-                if skip_prev_logprobs:
-                    print(
-                        "▶ Skipping prev_logprobs (force_on_policy_ratio=True)...",
-                        flush=True,
-                    )
-                else:
+                # Skip reference_policy_logprobs computation when skip_reference_policy_logprobs_calculation=True
+                skip_reference_logprobs = master_config.grpo.get(
+                    "skip_reference_policy_logprobs_calculation"
+                )
+
+                if not (skip_prev_logprobs and skip_reference_logprobs):
                     print("▶ Preparing for logprob inference...", flush=True)
                     with timer.time("logprob_inference_prep"):
                         policy.prepare_for_lp_inference()
@@ -2041,18 +2040,21 @@ def grpo_train(
                             **extra_multimodal_data,
                         }
                     )
+
                     if not skip_prev_logprobs:
                         train_data["prev_logprobs"] = policy.get_logprobs(
                             logprob_data, timer=timer
                         )["logprobs"]
                     else:
+                        print(
+                            "▶ Skipping prev_logprobs (force_on_policy_ratio=True)...",
+                            flush=True,
+                        )
                         train_data["prev_logprobs"] = torch.zeros_like(
                             train_data["generation_logprobs"]
                         )
 
-                    if to_compute_kl and not master_config.grpo.get(
-                        "skip_reference_policy_logprobs_calculation"
-                    ):
+                    if not skip_reference_logprobs:
                         train_data["reference_policy_logprobs"] = (
                             policy.get_reference_policy_logprobs(
                                 logprob_data,
@@ -2060,6 +2062,10 @@ def grpo_train(
                             )["reference_logprobs"]
                         )
                     else:
+                        print(
+                            "▶ Skipping reference_logprobs (skip_reference_policy_logprobs_calculation=True)...",
+                            flush=True,
+                        )
                         train_data["reference_policy_logprobs"] = torch.zeros_like(
                             train_data["prev_logprobs"]
                         )
@@ -2800,7 +2806,6 @@ def async_grpo_train(
     val_period = master_config.grpo["val_period"]
     val_at_start = master_config.grpo["val_at_start"]
     val_at_end = master_config.grpo["val_at_end"]
-    to_compute_kl = master_config.loss_fn.reference_policy_kl_penalty > 0
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
 
     # Initialize advantage estimator
@@ -3172,13 +3177,17 @@ def async_grpo_train(
                         "Computing prev_logprobs anyway for seq-level error masking."
                     )
 
-                if skip_prev_logprobs:
-                    print(
-                        "▶ Skipping prev_logprobs (force_on_policy_ratio=True)...",
-                        flush=True,
-                    )
-                    fprop_logprobs = torch.zeros_like(train_data["generation_logprobs"])
-                else:
+                # Skip reference_policy_logprobs computation when skip_reference_policy_logprobs_calculation=True
+                skip_reference_logprobs = master_config.grpo.get(
+                    "skip_reference_policy_logprobs_calculation"
+                )
+
+                if not (skip_prev_logprobs and skip_reference_logprobs):
+                    print("▶ Preparing for logprob inference...", flush=True)
+                    with timer.time("logprob_inference_prep"):
+                        policy.prepare_for_lp_inference()
+
+                if not (skip_prev_logprobs and skip_reference_logprobs):
                     print("▶ Preparing for logprob inference...")
                     with timer.time("logprob_inference_prep"):
                         policy.prepare_for_lp_inference()
@@ -3186,23 +3195,28 @@ def async_grpo_train(
                 print("▶ Computing logprobs...", flush=True)
                 with timer.time("policy_and_reference_logprobs"):
                     if not skip_prev_logprobs:
-                        fprop_logprobs = policy.get_logprobs(
-                            train_data,
-                            timer=timer,
+                        train_data["prev_logprobs"] = policy.get_logprobs(
+                            train_data, timer=timer
                         )["logprobs"]
-                    train_data["prev_logprobs"] = fprop_logprobs
-
-                    if to_compute_kl and not master_config.grpo.get(
-                        "skip_reference_policy_logprobs_calculation"
-                    ):
-                        reference_logprobs = policy.get_reference_policy_logprobs(
-                            train_data,
-                            timer=timer,
-                        )["reference_logprobs"]
-                        train_data["reference_policy_logprobs"] = reference_logprobs
                     else:
+                        train_data["prev_logprobs"] = torch.zeros_like(
+                            train_data["generation_logprobs"]
+                        )
+
+                    if not skip_reference_logprobs:
+                        train_data["reference_policy_logprobs"] = (
+                            policy.get_reference_policy_logprobs(
+                                train_data,
+                                timer=timer,
+                            )["reference_logprobs"]
+                        )
+                    else:
+                        print(
+                            "▶ Skipping reference_logprobs (skip_reference_policy_logprobs_calculation=True)...",
+                            flush=True,
+                        )
                         train_data["reference_policy_logprobs"] = torch.zeros_like(
-                            fprop_logprobs
+                            train_data["prev_logprobs"]
                         )
 
                 # Seq-level logprob error metrics/masking require real prev_logprobs
