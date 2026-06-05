@@ -208,9 +208,11 @@ def quantization_layer_spec(config):
 def get_quantization_layer_spec():
     """Build the ModelOpt quantization layer-spec callback as a portable target.
 
-    Upstream returns a ``functools.partial`` for GPT-only configs so
-    Megatron-Bridge serializes a stable code reference into checkpoints. This
-    branch must dispatch on GPT vs. Mamba at provider-call time, so it returns a
-    top-level dispatch function instead of a partial.
+    Megatron-Bridge saves ``transformer_layer_spec`` in ``run_config.yaml`` as
+    an importable ``_target_`` reference with ``_call_: false``. The allowlist
+    checks that target string when the checkpoint is reloaded; it does not care
+    about this wrapper itself. Returning a top-level function keeps the saved
+    target importable while allowing GPT-vs-Mamba dispatch after the provider
+    instance is available.
     """
     return quantization_layer_spec
