@@ -167,6 +167,7 @@ project-includes = [
   "nemo_rl/utils/nvml.py",
   "nemo_rl/utils/packed_tensor.py",
   "nemo_rl/utils/prefetch_venvs.py",
+  "nemo_rl/utils/r3_trace.py",
   "nemo_rl/utils/timer.py",
   "nemo_rl/utils/venvs.py",
   "nemo_rl/weight_sync/__init__.py",
