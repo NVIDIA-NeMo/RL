@@ -619,7 +619,7 @@ def run_multi_turn_rollout(
                 # Record truncation
                 sample_truncated[active_indices[i]] = True
 
-            tokenized_env_obs_message = {
+            tokenized_env_obs_message: dict[str, Any] = {
                 "role": env_output.observations[i]["role"],
                 "content": env_obs_content,
                 "token_ids": tokenized_obs,
@@ -918,7 +918,7 @@ async def run_sample_multi_turn_rollout(
                 tokenized_obs = torch.empty(0, dtype=tokenized_obs.dtype)
             truncated = True
 
-        env_message = {
+        env_message: dict[str, Any] = {
             "role": env_output.observations[0]["role"],
             "content": env_obs_content,
             "token_ids": tokenized_obs,

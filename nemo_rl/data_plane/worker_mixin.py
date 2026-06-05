@@ -253,7 +253,7 @@ class TQWorkerMixin:
             # the per-rank local ``input_ids`` rather than the leader's.
             attach_message_log_view(data)
             trace_tq_fetch_payload(
-                stage=meta.task_name,
+                stage=meta.task_name or "unknown",
                 keys=meta.sample_ids,
                 data=data,
             )
@@ -274,7 +274,7 @@ class TQWorkerMixin:
         )
         attach_message_log_view(data)
         trace_tq_fetch_payload(
-            stage=meta.task_name,
+            stage=meta.task_name or "unknown",
             keys=meta.sample_ids,
             data=data,
         )
