@@ -30,11 +30,9 @@ from nemo_rl.data.collate_fn import preference_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.distributed.virtual_cluster import (
-    NVLINK_DOMAIN_UNKNOWN,
     ClusterConfig,
     RayVirtualCluster,
-    get_ray_cluster_topology,
-    select_segment_nodes,
+    prepare_segment_topology,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import PolicyInterface
@@ -238,31 +236,7 @@ def setup(
     print("\n▶ Setting up compute cluster...")
     num_nodes = cluster_config["num_nodes"]
     segment_size = cluster_config.get("segment_size")
-    node_resource_constraints = None
-    if segment_size is not None:
-        topology = get_ray_cluster_topology()
-        has_topology = any(
-            domain != NVLINK_DOMAIN_UNKNOWN for domain, _ in topology.values()
-        )
-        if has_topology:
-            selected_node_ids, _ = select_segment_nodes(
-                topology, segment_size, num_nodes
-            )
-            node_resource_constraints = [
-                {topology[nid][0]: 0.001} for nid in selected_node_ids
-            ]
-            print(
-                f"  ✓ Topology-aware allocation: {num_nodes} nodes in "
-                f"{len(set(topology[nid][0] for nid in selected_node_ids))} NVLink domains "
-                f"(segment_size={segment_size})",
-                flush=True,
-            )
-        else:
-            print(
-                f"  ⚠ segment_size={segment_size} is set but no NVLink domain info "
-                "found, falling back to unordered allocation",
-                flush=True,
-            )
+    node_resource_constraints, _, _ = prepare_segment_topology(segment_size, num_nodes)
     cluster = RayVirtualCluster(
         name="dpo_cluster",
         bundle_ct_per_node_list=[cluster_config["gpus_per_node"]] * num_nodes,
