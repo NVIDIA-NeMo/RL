@@ -48,6 +48,8 @@ policy:
     vllm_cfg:
       tensor_parallel_size: 32
       async_engine: true
+    vllm_kwargs:
+      moe_backend: triton
 logger:
   log_dir: logs/grpo-deepseek-v3-32n8g
   wandb_enabled: true
