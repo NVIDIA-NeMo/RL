@@ -203,16 +203,3 @@ def quantization_layer_spec(config):
         real_quant_cfg="None",
         use_arbitrary_attention_mask=False,
     )
-
-
-def get_quantization_layer_spec():
-    """Build the ModelOpt quantization layer-spec callback as a portable target.
-
-    Megatron-Bridge saves ``transformer_layer_spec`` in ``run_config.yaml`` as
-    an importable ``_target_`` reference with ``_call_: false``. The allowlist
-    checks that target string when the checkpoint is reloaded; it does not care
-    about this wrapper itself. Returning a top-level function keeps the saved
-    target importable while allowing GPT-vs-Mamba dispatch after the provider
-    instance is available.
-    """
-    return quantization_layer_spec

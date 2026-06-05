@@ -30,8 +30,8 @@ from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuanti
 
 import nemo_rl.models.policy.workers.megatron_policy_worker as megatron_policy_worker
 from nemo_rl.modelopt.models.policy.workers.utils import (
-    get_quantization_layer_spec,
     get_tokenizer,
+    quantization_layer_spec,
     quantize_model,
     symlink_pre_quantized_model,
 )
@@ -67,7 +67,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         # setup_reference_model_state and runs before load_checkpoint to resume
         # quantizers on the model.
         self._model_import_post_wrap_hook = self._quantize
-        self._transformer_layer_spec = get_quantization_layer_spec()
+        self._transformer_layer_spec = quantization_layer_spec
         self._pre_load_checkpoint_hook = self._restore_modelopt_state_pre_load
         super().__init__(config, *args, **kwargs)
 
@@ -157,9 +157,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             if has_modelopt_state(model_path):
                 print("setting restore_modelopt_state to True")
                 megatron_cfg.model.restore_modelopt_state = True
-                megatron_cfg.model.transformer_layer_spec = (
-                    get_quantization_layer_spec()
-                )
+                megatron_cfg.model.transformer_layer_spec = quantization_layer_spec
 
             return original_setup_model_and_optimizer(
                 policy_cfg, megatron_cfg, *args, **kwargs
