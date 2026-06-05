@@ -1170,7 +1170,7 @@ class AsyncTrajectoryCollector:
                 f"❌ Error in prompt group worker (prompt_idx={prompt_idx}, target_weight={target_weight_version}, retry={retry_count}): {e}"
             )
 
-            # Retry logic for transient errors (e.g., HTTP 500 from Penguin server)
+            # Retry logic for transient errors (e.g., HTTP 500 from nemo_gym server)
             if retry_count < MAX_RETRIES and self.running:
                 retry_delay = RETRY_DELAY_BASE * (2 ** retry_count)  # Exponential backoff
                 print(
