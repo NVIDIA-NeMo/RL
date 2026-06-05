@@ -1254,12 +1254,14 @@ def refit_policy_generation(
                 raise NotImplementedError(
                     "SGLang haven't implemented non-colocated inference mode. "
                 )
+            policy.offload_before_refit()
             futures_train = policy.broadcast_weights_for_collective(kv_scales=kv_scales)
             futures_inference = policy_generation.update_weights_from_collective()
             # wait for all futures to complete
             ray.get(futures_train)
             results = ray.get(futures_inference)
             update_success = all(result for result in results if result is not None)
+            policy.prepare_for_training()
 
         # check if update is successful
         if not update_success:
@@ -1491,6 +1493,7 @@ def grpo_train(
     val_at_start = master_config.grpo["val_at_start"]
     val_at_end = master_config.grpo["val_at_end"]
     val_period = master_config.grpo["val_period"]
+    to_compute_kl = master_config.loss_fn.reference_policy_kl_penalty > 0
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
 
     # Initialize advantage estimator
@@ -1906,7 +1909,7 @@ def grpo_train(
                             train_data["generation_logprobs"]
                         )
 
-                    if not master_config.grpo.get(
+                    if to_compute_kl and not master_config.grpo.get(
                         "skip_reference_policy_logprobs_calculation"
                     ):
                         train_data["reference_policy_logprobs"] = (
@@ -2647,6 +2650,7 @@ def async_grpo_train(
     val_period = master_config.grpo["val_period"]
     val_at_start = master_config.grpo["val_at_start"]
     val_at_end = master_config.grpo["val_at_end"]
+    to_compute_kl = master_config.loss_fn.reference_policy_kl_penalty > 0
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
 
     # Initialize advantage estimator
@@ -3020,7 +3024,7 @@ def async_grpo_train(
                         )["logprobs"]
                     train_data["prev_logprobs"] = fprop_logprobs
 
-                    if not master_config.grpo.get(
+                    if to_compute_kl and not master_config.grpo.get(
                         "skip_reference_policy_logprobs_calculation"
                     ):
                         reference_logprobs = policy.get_reference_policy_logprobs(

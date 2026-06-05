@@ -1481,6 +1481,45 @@ def test_refit_policy_generation_sglang_non_colocated_raises(monkeypatch):
         )
 
 
+def test_refit_policy_generation_non_colocated_offloads_and_restores(monkeypatch):
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    calls = []
+    kv_scales = {"layer_0": 1.0}
+
+    class DummyPolicy:
+        def offload_before_refit(self):
+            calls.append("offload_before_refit")
+
+        def broadcast_weights_for_collective(self, kv_scales=None):
+            calls.append(("broadcast_weights_for_collective", kv_scales))
+            return ["train-ok"]
+
+        def prepare_for_training(self):
+            calls.append("prepare_for_training")
+
+    class DummyGeneration:
+        def update_weights_from_collective(self):
+            calls.append("update_weights_from_collective")
+            return ["inference-ok"]
+
+    monkeypatch.setattr(grpo_mod.ray, "get", lambda x: x)
+
+    grpo_mod.refit_policy_generation(
+        policy=DummyPolicy(),
+        policy_generation=DummyGeneration(),
+        colocated_inference=False,
+        kv_scales=kv_scales,
+    )
+
+    assert calls == [
+        "offload_before_refit",
+        ("broadcast_weights_for_collective", kv_scales),
+        "update_weights_from_collective",
+        "prepare_for_training",
+    ]
+
+
 def test_grpo_train_collects_generation_logger_and_seq_metrics(
     monkeypatch, mock_grpo_components
 ):
@@ -1600,20 +1639,28 @@ def test_grpo_train_collects_generation_logger_and_seq_metrics(
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
-def test_grpo_train_skips_reference_policy_logprobs_when_configured(
-    mock_grpo_components, train_func
+@pytest.mark.parametrize(
+    "skip_reference_policy_logprobs_calculation",
+    [False, True],
+    ids=["implicit_kl_zero", "explicit_skip"],
+)
+def test_grpo_train_skips_reference_policy_logprobs_when_kl_disabled(
+    mock_grpo_components, train_func, skip_reference_policy_logprobs_calculation
 ):
     """Regression test for issue #1968 (Bug 1) and PRs #2174 / #2178.
 
-    When ``grpo.skip_reference_policy_logprobs_calculation=True`` and
-    ``loss_fn.reference_policy_kl_penalty=0``, both ``grpo_train`` and
-    ``async_grpo_train`` MUST NOT call ``policy.get_reference_policy_logprobs``.
-    Without the skip guards in ``grpo.py``, training would crash inside
-    ``use_reference_model()`` because the reference model state was never loaded.
+    When ``loss_fn.reference_policy_kl_penalty=0``, both ``grpo_train`` and
+    ``async_grpo_train`` MUST NOT call ``policy.get_reference_policy_logprobs``,
+    even if the caller did not pre-set
+    ``grpo.skip_reference_policy_logprobs_calculation``. Without the skip guards
+    in ``grpo.py``, training would crash inside ``use_reference_model()`` because
+    the reference model state was never loaded.
     """
     master_config = mock_grpo_components["master_config"]
     master_config.loss_fn.reference_policy_kl_penalty = 0
-    master_config.grpo["skip_reference_policy_logprobs_calculation"] = True
+    master_config.grpo["skip_reference_policy_logprobs_calculation"] = (
+        skip_reference_policy_logprobs_calculation
+    )
     master_config.grpo["max_num_steps"] = 1
     master_config.grpo["max_num_epochs"] = 1
     master_config.grpo["val_period"] = 0
@@ -1684,7 +1731,7 @@ def test_grpo_train_skips_reference_policy_logprobs_when_configured(
 
     assert not policy.get_reference_policy_logprobs.called, (
         "policy.get_reference_policy_logprobs was called even though "
-        "skip_reference_policy_logprobs_calculation=True. "
+        "loss_fn.reference_policy_kl_penalty=0. "
         "This indicates a regression of issue #1968 / PRs #2174, #2178."
     )
 
