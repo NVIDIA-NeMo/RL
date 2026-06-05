@@ -41,8 +41,11 @@ from nemo_rl.data.llm_message_utils import (
 from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
+    NVLINK_DOMAIN_UNKNOWN,
     ClusterConfig,
     RayVirtualCluster,
+    get_ray_cluster_topology,
+    select_segment_nodes,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import (
@@ -287,12 +290,38 @@ def setup(
     # ==========================
     print("\n▶ Setting up compute cluster...", flush=True)
     colocated_inference = generation_config["colocated"]["enabled"]
+    segment_size = cluster_config.get("segment_size")
 
     if colocated_inference:
+        num_nodes = cluster_config["num_nodes"]
+        node_resource_constraints = None
+        if segment_size is not None:
+            topology = get_ray_cluster_topology()
+            has_topology = any(
+                domain != NVLINK_DOMAIN_UNKNOWN for domain, _ in topology.values()
+            )
+            if has_topology:
+                selected_node_ids, _ = select_segment_nodes(
+                    topology, segment_size, num_nodes
+                )
+                node_resource_constraints = [
+                    {topology[nid][0]: 0.001} for nid in selected_node_ids
+                ]
+                print(
+                    f"  ✓ Topology-aware allocation: {num_nodes} nodes in "
+                    f"{len(set(topology[nid][0] for nid in selected_node_ids))} NVLink domains "
+                    f"(segment_size={segment_size})",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"  ⚠ segment_size={segment_size} is set but no NVLink domain info "
+                    "found, falling back to unordered allocation",
+                    flush=True,
+                )
         cluster = RayVirtualCluster(
             name="distillation_cluster",
-            bundle_ct_per_node_list=[cluster_config["gpus_per_node"]]
-            * cluster_config["num_nodes"],
+            bundle_ct_per_node_list=[cluster_config["gpus_per_node"]] * num_nodes,
             use_gpus=True,
             num_gpus_per_node=cluster_config["gpus_per_node"],
             max_colocated_worker_groups=1
@@ -300,11 +329,13 @@ def setup(
             else 3,
             port_range_low=cluster_config.get("master_port_range_low"),
             port_range_high=cluster_config.get("master_port_range_high"),
+            segment_size=segment_size,
+            node_resource_constraints=node_resource_constraints,
         )
         train_cluster = cluster
         inference_cluster = cluster
         print(
-            f"  ✓ Ray cluster initialized with {cluster_config['num_nodes']} nodes",
+            f"  ✓ Ray cluster initialized with {num_nodes} nodes",
             flush=True,
         )
     else:
@@ -353,6 +384,53 @@ def setup(
             )
             train_nodes -= inference_nodes
 
+        # Topology-aware node selection for non-colocated distillation
+        node_resource_constraints = None
+        inference_node_resource_constraints = None
+        inference_segment_size = None
+        if segment_size is not None:
+            topology = get_ray_cluster_topology()
+            has_topology = any(
+                domain != NVLINK_DOMAIN_UNKNOWN for domain, _ in topology.values()
+            )
+            if has_topology:
+                training_node_ids, remaining_node_ids = select_segment_nodes(
+                    topology, segment_size, train_nodes
+                )
+                node_resource_constraints = [
+                    {topology[nid][0]: 0.001} for nid in training_node_ids
+                ]
+                print(
+                    f"  ✓ Topology-aware allocation: {train_nodes} training nodes in "
+                    f"{len(set(topology[nid][0] for nid in training_node_ids))} NVLink domains "
+                    f"(segment_size={segment_size})",
+                    flush=True,
+                )
+                if inference_nodes > 0:
+                    nodes_per_instance = (
+                        inference_gpus_per_node + cluster_config["gpus_per_node"] - 1
+                    ) // cluster_config["gpus_per_node"]
+                    if (
+                        nodes_per_instance > 1
+                        and inference_nodes % nodes_per_instance == 0
+                    ):
+                        remaining_topology = {
+                            nid: topology[nid] for nid in remaining_node_ids
+                        }
+                        inference_node_ids, _ = select_segment_nodes(
+                            remaining_topology, nodes_per_instance, inference_nodes
+                        )
+                        inference_node_resource_constraints = [
+                            {topology[nid][0]: 0.001} for nid in inference_node_ids
+                        ]
+                        inference_segment_size = nodes_per_instance
+            else:
+                print(
+                    f"  ⚠ segment_size={segment_size} is set but no NVLink domain info "
+                    "found, falling back to unordered allocation",
+                    flush=True,
+                )
+
         # create clusters
         train_cluster = RayVirtualCluster(
             name="distillation_train_cluster",
@@ -362,6 +440,8 @@ def setup(
             max_colocated_worker_groups=3,
             port_range_low=cluster_config.get("master_port_range_low"),
             port_range_high=cluster_config.get("master_port_range_high"),
+            segment_size=segment_size,
+            node_resource_constraints=node_resource_constraints,
         )
         inference_cluster = RayVirtualCluster(
             name="distillation_inference_cluster",
@@ -371,6 +451,8 @@ def setup(
             max_colocated_worker_groups=3,
             port_range_low=cluster_config.get("master_port_range_low"),
             port_range_high=cluster_config.get("master_port_range_high"),
+            segment_size=inference_segment_size,
+            node_resource_constraints=inference_node_resource_constraints,
         )
         print(
             f"  ✓ Separate clusters created: train={train_nodes}x{train_gpus_per_node}GPUs, inference={inference_nodes}x{inference_gpus_per_node}GPUs",
