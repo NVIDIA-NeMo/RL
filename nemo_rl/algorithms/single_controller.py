@@ -55,6 +55,7 @@ from nemo_rl.algorithms.staleness_sampler import (
     min_weight_version,
 )
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollout_manager import RolloutManager
 
 log = logging.getLogger(__name__)
@@ -106,6 +107,11 @@ class SingleControllerConfig:
     weight_nccl_addr: str = "127.0.0.1"
     weight_nccl_port: Optional[int] = None
 
+    # Rollout config. Read only when SC builds RolloutManager itself.
+    rollout_max_seq_len: int = 1024
+    rollout_max_turns: Optional[int] = None
+    use_nemo_gym: bool = False
+
     # Extra fields passed through to avoid TypedDict issues
     extra: dict = field(default_factory=dict)
 
@@ -125,12 +131,17 @@ class SingleControllerActor:
     def __init__(
         self,
         cfg: SingleControllerConfig,
-        prompts: list[str],
-        dp_client_handle: Any,
+        dp_client: Any,
+        gen_handle: Any,
         trainer_handle: Any,
-        rollout_manager: RolloutManager,
+        env_handles: dict[str, EnvironmentInterface],
+        # TODO: move into SC's setup phase
+        prompts: list[str],  # TODO: use dataloader instead
         weight_synchronizer: Any,
         advantage_estimator: Any | None = None,
+        tokenizer: Any | None = None,
+        # TODO: remove later, keep here for dry run test
+        rollout_manager: RolloutManager | None = None,
     ) -> None:
         import logging as _logging
 
@@ -141,9 +152,8 @@ class SingleControllerActor:
 
         self._cfg = cfg
         self._prompts = prompts
-        self._dp_client = dp_client_handle
+        self._dp_client = dp_client
         self._trainer = trainer_handle
-        self._rollout_manager = rollout_manager
         self._weight_synchronizer = weight_synchronizer
         self._advantage_estimator = advantage_estimator
 
@@ -151,6 +161,21 @@ class SingleControllerActor:
             raise ValueError(
                 "advantage_enabled=True requires an advantage_estimator instance"
             )
+
+        if rollout_manager is None:
+            self._rollout_manager = RolloutManager(
+                tokenizer=tokenizer,
+                env_handles=env_handles,
+                num_generations_per_prompt=cfg.generations_per_prompt,
+                max_seq_len=cfg.rollout_max_seq_len,
+                max_rollout_turns=cfg.rollout_max_turns,
+                use_nemo_gym=cfg.use_nemo_gym,
+                policy_generation=gen_handle,
+                dp_client=dp_client,
+                partition_id=cfg.partition_id,
+            )
+        else:
+            self._rollout_manager = rollout_manager
 
         # Initialize sampler
         assert cfg.batch_selection_strategy in [
