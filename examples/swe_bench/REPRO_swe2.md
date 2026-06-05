@@ -346,3 +346,53 @@ group. The **per-replica** `generation_metrics/*` timelines should stay **flat**
 > total throughput scales sub-linearly with GPUs — that is expected, not a regression.
 > Weights are frozen, so reward hovers around the init checkpoint's baseline (noisy on
 > small per-step sample counts); this mode is for **throughput/scaling**, not learning.
+
+---
+
+## 10. Generation-scaling sweep launcher (`run_grpo_swe2_scale_gen.sh`)
+
+For sweeping the number of vLLM generation replicas, use the second launcher:
+`${REPO_ROOT}/examples/swe_bench/run_grpo_swe2_scale_gen.sh`. It takes a **single
+knob — `NUM_VLLM_REPLICAS` (R)** — and auto-derives nodes / `num_prompts_per_step` /
+`train_global_batch_size` so the **per-replica generation workload stays constant**
+(`samples/replica/step = 2`) across scales. Same model / data / config / container
+as the baseline run.
+
+```bash
+# preview the derived config without submitting
+NUM_VLLM_REPLICAS=32 DRY_RUN=1 bash "${REPO_ROOT}/examples/swe_bench/run_grpo_swe2_scale_gen.sh"
+
+# a sweep, all in one wandb group for comparison
+for R in 16 32 64; do
+  NUM_VLLM_REPLICAS=$R WANDB_GROUP=swe-gen-scale-sweep \
+    bash "${REPO_ROOT}/examples/swe_bench/run_grpo_swe2_scale_gen.sh"
+done
+```
+
+Derivation (with `GPP=8`, `vLLM_TP=2` → 4 replicas/node):
+
+| mode | `R` constraint | GEN nodes | TRAIN nodes | total | PPS | GBS | train parallelism |
+|------|----------------|-----------|-------------|-------|-----|-----|-------------------|
+| **linear** (default) | multiple of **16** | `R/4` | `R/4` (1:1) | `R/2` | `R/4` | `2R` | TP=4,EP=8,CP=4,PP=2 |
+| **skip-train** (`SKIP_TRAINING=1`) | multiple of **4** | `R/4` | **1** | `R/4 + 1` | `R/4` | `2R` | TP=8,EP=8,CP=1,PP=1 |
+
+`R=32` (linear) reproduces the baseline shape exactly (16 nodes = 8 train + 8 gen,
+PPS=8, GBS=64). The `R%16` requirement in linear mode comes from training scaling
+linearly at TP×CP×PP=32 (train world `2R` must be divisible by 32); `SKIP_TRAINING=1`
+pins training to one node (model-parallel 8) so `R` need only be a multiple of 4 —
+enabling small scales like R=4 (2 nodes) / R=8 (3 nodes). See §9 for the no-op-train
+semantics, and §9's wandb table for what to verify across the sweep.
+
+### Knobs (env vars)
+
+| Var | Default | Effect |
+|-----|---------|--------|
+| `NUM_VLLM_REPLICAS` | *(required)* | number of vLLM replicas (R) |
+| `SKIP_TRAINING` | `0` | `1` = no-op training on 1 node (R%4); else linear-train (R%16) |
+| `TRAIN_NODES` | derived | override training node count |
+| `WANDB_GROUP` | `swe-gen-scale-linear` | wandb group (use one per sweep) |
+| `MAX_NUM_STEPS` | *(unset)* | cap training steps (handy for a quick smoke) |
+| `SBATCH_TIME` | `4:0:0` | SLURM walltime |
+| `DRY_RUN` | `0` | `1` = print the derived config and exit (no `sbatch`) |
+
+Job id is written to `${REPO_ROOT}/latest_scale_gen_job_id.txt`.
