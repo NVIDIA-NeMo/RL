@@ -59,6 +59,7 @@ The recipe uses `Qwen/Qwen3-30B-A3B`, Megatron policy training, async GRPO with 
 
 ## Additional Resources
 
+- [In-depth CISPO Guide](../../guides/cispo.md)
 - [MiniMax-M1 paper](https://arxiv.org/abs/2506.13585)
 - [GRPO documentation](grpo.md)
 - [DAPO documentation](dapo.md)
