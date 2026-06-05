@@ -23,7 +23,7 @@
 #   <tool_call>{"name": "tool_name", "arguments": {"key": "value"}}</tool_call>
 # Text without a <tool_call> block is treated as a respond action to the user.
 
-defaults: "grpo_math_1B.yaml"
+defaults: "../../grpo_math_1B.yaml"
 
 grpo:
   num_prompts_per_step: 128
