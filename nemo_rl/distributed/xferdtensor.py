@@ -12,16 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Reference XferDTensor implementation (broadcast-based golden).
+"""XferDTensor: cross-mesh DTensor reshard for disaggregated refit.
 
-This file contains the transfer kernel, its private helpers, and the
-``DTensorRef`` wrapper its callers pass as the src/dst tensor.  The
-``MeshInfo`` mesh wrapper still lives in ``nccl_reshard_utils.py`` alongside
-the refit metadata builders; ``xferdtensor_golden`` reads it only via duck
-typing (``.mesh``), so this module needs no import from there.
+The public entry point ``xferdtensor()`` dispatches to the real ``nccl.xfer``
+reshard op (``XdtensorRedistribute``) when it is available and not overridden
+by ``NRL_XFERDTENSOR_GOLDEN``, otherwise to the broadcast-based
+``xferdtensor_golden`` reference in this file.  Both share the canonical
+7-argument signature, so callers are identical on either path.
 
-The 7-argument signature of ``xferdtensor_golden`` matches the real
-``nccl_reshard.XferDTensor`` API so it can be swapped in trivially later.
+This file also holds the golden kernel's private helpers and the
+``DTensorRef`` wrapper callers pass as the src/dst tensor.  The ``MeshInfo``
+mesh wrapper lives in ``nccl_reshard_utils.py`` alongside the refit metadata
+builders; ``xferdtensor_golden`` reads it only via duck typing (``.mesh``), so
+this module needs no import from there.
 """
 
 import logging
@@ -218,7 +221,40 @@ def _get_mesh_coords(mesh, rank):
 
 
 def _compute_shard_slices(global_shape, mesh_shape, mesh_coords, placements):
+    """Return, per tensor dim, the slice of the GLOBAL tensor this rank owns.
+
+    Given a device mesh and DTensor ``placements`` (one per mesh dim), work out
+    which contiguous block of the full tensor the rank at ``mesh_coords`` holds.
+    Replicated tensor dims get ``slice(None)`` (the whole extent); sharded dims
+    get this rank's chunk.
+
+    Args:
+        global_shape: full (unsharded) tensor shape, e.g. ``(256, 512)``.
+        mesh_shape:   device-mesh shape, one size per mesh dim, e.g. ``[2, 4]``.
+        mesh_coords:  this rank's coordinate on each mesh dim, e.g. ``[1, 2]``.
+        placements:   one placement per mesh dim, e.g. ``[Replicate(), Shard(0)]``.
+
+    Worked example — a 2-D ``[dp=2, tp=4]`` mesh, a weight of shape
+    ``(256, 512)``, placements ``[Replicate(), Shard(0)]`` (DP replicates, TP
+    shards tensor dim 0), this rank at ``mesh_coords=[1, 2]`` (dp=1, tp=2):
+      * mesh dim 0 (dp) is Replicate -> ignored; tensor dim 1 stays slice(None).
+      * mesh dim 1 (tp, size 4) shards tensor dim 0 -> 4 chunks of 256/4 = 64.
+      * this rank's tp coord is 2 -> it owns chunk 2 -> rows [128:192].
+      * result: ``[slice(128, 192), slice(None)]``.
+
+    Generalization: two mesh dims may shard the SAME tensor dim (e.g. FSDP and
+    TP both on dim 0). Then the chunk count is the product of their sizes and
+    ``strides`` folds the per-axis coords into one chunk index, row-major (outer
+    mesh dim = larger stride), exactly like indexing a multi-dim array.
+    """
+    # Start every tensor dim fully replicated (whole extent); below we narrow
+    # only the dims that some mesh axis shards.
     slices = [slice(None) for _ in range(len(global_shape))]
+    # Group the sharding mesh axes by which TENSOR dim they shard. A tensor dim
+    # can be sharded by more than one mesh axis, hence a list per dim. Each entry
+    # is (mesh_dim, that axis's size, this rank's coord on that axis).
+    # (example: shard_map = {0: [(mesh_dim=1, size=4, coord=2)]} — tensor dim 0
+    # sharded by mesh axis 1 (tp, size 4), this rank at coord 2 on it.)
     shard_map = {}
     for mesh_dim, placement in enumerate(placements):
         if isinstance(placement, Shard):
@@ -227,16 +263,26 @@ def _compute_shard_slices(global_shape, mesh_shape, mesh_coords, placements):
             )
 
     for tensor_dim, shard_info in shard_map.items():
+        # Order the sharding axes outer->inner (ascending mesh dim) so the
+        # row-major chunk numbering below matches the mesh layout.
         shard_info.sort(key=lambda item: item[0])
+        # Total chunks this tensor dim is split into = product of the axis sizes.
+        # (example: a single tp axis of size 4 -> 4 chunks.)
         num_chunks = 1
         for _, size, _ in shard_info:
             num_chunks *= size
 
+        # Split total_size into num_chunks near-equal chunks; when it doesn't
+        # divide evenly the first `remainder` chunks each take one extra element.
+        # (example: 256 / 4 -> sizes = [64, 64, 64, 64].)
         total_size = int(global_shape[tensor_dim])
         base = total_size // num_chunks
         remainder = total_size % num_chunks
         sizes = [base + 1 if i < remainder else base for i in range(num_chunks)]
 
+        # Row-major strides that fold this rank's per-axis coords into ONE chunk
+        # index: innermost (last) axis gets stride 1, the next gets the inner
+        # axis's size, and so on. (single axis -> strides = [1].)
         strides = []
         running = 1
         for _, size, _ in reversed(shard_info):
@@ -244,12 +290,16 @@ def _compute_shard_slices(global_shape, mesh_shape, mesh_coords, placements):
             running *= size
         strides.reverse()
 
+        # linear_index = this rank's flat chunk number among num_chunks.
+        # (example: tp coord 2 * stride 1 -> linear_index = 2.)
         linear_index = 0
         for (mesh_dim, size, coord), stride in zip(shard_info, strides):
             if coord >= size:
                 raise ValueError(f"Invalid mesh coord {coord} for mesh dim {mesh_dim}.")
             linear_index += coord * stride
 
+        # This rank owns chunk `linear_index`; its slice starts past every
+        # earlier chunk. (example: start = 64+64 = 128, end = 192 -> [128:192].)
         start = sum(sizes[:linear_index])
         end = start + sizes[linear_index]
         slices[tensor_dim] = slice(start, end)
@@ -295,7 +345,12 @@ def xferdtensor_golden(
     if not has_shard:
         # Fast path: all Replicate — single broadcast from src_ranks[0]
         if src_tensor is not None:
-            full_tensor = src_tensor._local_tensor.clone()
+            # .contiguous() guards the .view(torch.uint8) below: the source is a
+            # Megatron param view that may be non-contiguous, which .view (unlike
+            # .reshape) cannot reinterpret. .clone() keeps full_tensor an
+            # independent buffer so a broadcast-in on a non-root src rank can't
+            # mutate the live param.
+            full_tensor = src_tensor._local_tensor.contiguous().clone()
         else:
             full_tensor = torch.empty(global_shape, device=device, dtype=dtype)
         process_group.broadcast(full_tensor.view(torch.uint8), src=src_ranks[0])

@@ -286,13 +286,24 @@ def build_mesh_info(
 ) -> tuple:
     """Build a ``MeshInfo`` and *dim_map* from a parallelism config.
 
-    Dimension ordering (inner->outer): ep, tp, dp, pp.  EP is innermost so
-    that ``global_rank % ep_size`` recovers the EP coord — matching
-    Megatron-Core's rank layout for MoE configs.  TP is next innermost,
-    matching the standard ``tp_rank = global_rank // ep_size % tp_size``
-    layout that Megatron uses for non-expert params when EP=1.
+    Dims are emitted in the order ``(tp, ep, dp, pp)``, size-1 dims are
+    dropped, and the survivors are reversed into the row-major rank tensor
+    (outer->inner).  So the *first* surviving dim in that order becomes the
+    **innermost** (rightmost, fastest-varying) axis — consecutive global ranks
+    differ in it.
 
-    Trivial (size-1) dimensions are dropped.
+    Callers never activate EP and TP in the same mesh:
+    ``_build_train_src_meshes`` builds a separate non-expert mesh
+    (``ep_size=1``) and expert mesh (``tp_size=1``).  So the innermost active
+    dim — and the coord a modulo recovers — is:
+
+      * **TP** in the non-expert mesh (EP dropped): ``global_rank % tp_size``
+        recovers the TP coord, the standard Megatron non-expert layout.
+      * **EP** in the expert mesh (TP dropped): ``global_rank % ep_size``
+        recovers the EP coord, Megatron-Core's MoE rank layout.
+
+    (Were EP and TP ever active together, the emit order would make TP — not
+    EP — innermost; that case does not arise today.)
 
     Returns:
         ``(MeshInfo, dim_map)`` where *dim_map* maps ``"tp"``/``"ep"``/``"dp"``/``"pp"``
@@ -586,6 +597,20 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
         fp8_recipe = fp8_cfg.get("fp8_recipe", None)
         gen_precision = vllm_cfg.get("precision", None)
 
+        # The refit byte-copies weights train -> gen, so gen dtype must match
+        # train: BF16 (unset / "auto" / "bf16" / "bfloat16") or FP8 ("fp8").  A
+        # value like "float16"/"float32" would silently mismatch the bf16 train
+        # bytes and deadlock/corrupt the bulk collective; reject anything outside
+        # the supported set up front (this also catches typos such as
+        # "fp8_e4m3" that would otherwise skip the FP8 checks below).
+        if gen_precision not in (None, "auto", "bf16", "bfloat16", "fp8"):
+            violations.append(
+                f"policy.generation.vllm_cfg.precision={gen_precision!r} is not "
+                "supported by nccl_reshard_refit (use 'bf16'/'bfloat16', 'fp8', "
+                "'auto', or leave unset); the refit byte-copies weights, so the "
+                "gen dtype must match the train dtype."
+            )
+
         if gen_precision == "fp8":
             if not fp8_param:
                 violations.append(
@@ -681,21 +706,21 @@ def build_nccl_reshard_refit_info(
     # ep=r%4 on the same rank).  We therefore build two src meshes per stage
     # and pick per-param based on whether the param is a MoE expert weight.
     def _build_train_src_meshes(num_gpus: int, rank_offset: int, stage_pp: int):
-        ne_mesh, ne_dim_map = build_mesh_info(
+        non_expert_mesh, non_expert_dim_map = build_mesh_info(
             num_gpus,
             rank_offset=rank_offset,
             tp_size=tp_size,
             ep_size=1,
             pp_size=stage_pp,
         )
-        ex_mesh, ex_dim_map = build_mesh_info(
+        expert_mesh, expert_dim_map = build_mesh_info(
             num_gpus,
             rank_offset=rank_offset,
             tp_size=1,
             ep_size=ep_size,
             pp_size=stage_pp,
         )
-        return (ne_mesh, ne_dim_map), (ex_mesh, ex_dim_map)
+        return (non_expert_mesh, non_expert_dim_map), (expert_mesh, expert_dim_map)
 
     if use_per_stage:
         # Per-PP-stage meshes: within each sub-group, train ranks are
@@ -704,11 +729,12 @@ def build_nccl_reshard_refit_info(
         per_stage_src_nonexpert = {}
         per_stage_src_expert = {}
         for s in range(pp_size):
-            ne, ex = _build_train_src_meshes(
+            (
+                per_stage_src_nonexpert[s],
+                per_stage_src_expert[s],
+            ) = _build_train_src_meshes(
                 train_ranks_per_stage, rank_offset=0, stage_pp=1
             )
-            per_stage_src_nonexpert[s] = ne
-            per_stage_src_expert[s] = ex
 
         # dst mesh: gen ranks start at train_ranks_per_stage within each sub-group
         dst_mesh, dst_dim_map = build_mesh_info(
@@ -718,7 +744,7 @@ def build_nccl_reshard_refit_info(
         )
     else:
         # Single global mesh pair (PP=1 or no per-stage mapping)
-        (src_mesh_ne, src_dim_map_ne), (src_mesh_ex, src_dim_map_ex) = (
+        (non_expert_mesh, non_expert_dim_map), (expert_mesh, expert_dim_map) = (
             _build_train_src_meshes(train_world_size, rank_offset=0, stage_pp=pp_size)
         )
         dst_mesh, dst_dim_map = build_mesh_info(
@@ -752,9 +778,9 @@ def build_nccl_reshard_refit_info(
             }
         else:
             this_src_mesh, this_src_dim_map = (
-                (src_mesh_ex, src_dim_map_ex)
+                (expert_mesh, expert_dim_map)
                 if expert
-                else (src_mesh_ne, src_dim_map_ne)
+                else (non_expert_mesh, non_expert_dim_map)
             )
             info = {
                 "name": name,

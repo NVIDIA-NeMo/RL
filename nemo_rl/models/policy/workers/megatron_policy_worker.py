@@ -1538,10 +1538,26 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
     def _build_expert_groups(self):
         """Group individual expert params from ``_param_map`` by (prefix, proj_type).
 
-        Pure regex grouping — no tensor allocations.  Returns
-        ``{(prefix, proj): [(expert_idx, param_name), ...]}`` sorted by
-        expert index.  Used by ``_fuse_one_moe_param`` to look up the
-        constituent gate/up/down tensors for a fused w13/w2 entry.
+        Megatron exposes each expert's projection as a separate param; this bins
+        them so ``_fuse_one_moe_param`` can stack a layer's experts into vLLM's
+        fused w13/w2.  Pure regex grouping — no tensor allocations.
+
+        ``_INDIVIDUAL_EXPERT_RE`` captures three fields from a name like
+        ``model.layers.3.mlp.experts.0.gate_proj.weight``:
+          * group 1 = prefix       -> ``"model.layers.3.mlp.experts"``
+          * group 2 = expert index -> ``0``
+          * group 3 = proj type    -> ``"gate_proj"``
+        so the name keys into ``("model.layers.3.mlp.experts", "gate_proj")``.
+
+        Returns ``{(prefix, proj): [(expert_idx, param_name), ...]}`` with each
+        list sorted by expert index.  Example — a layer with 2 local experts
+        (gated MoE) yields three keys:
+          ``(".../experts", "gate_proj"): [(0, "...0.gate_proj.weight"), (1, "...1.gate_proj.weight")]``
+          ``(".../experts", "up_proj")  : [(0, ...), (1, ...)]``
+          ``(".../experts", "down_proj"): [(0, ...), (1, ...)]``
+        The index sort matters: ``_fuse_one_moe_param`` zips/stacks these in
+        order, so expert 0 must precede expert 1 to match the EP ``Shard(0)``
+        layout the gen side expects.
         """
         from nemo_rl.distributed.nccl_reshard_utils import _INDIVIDUAL_EXPERT_RE
 
@@ -1549,6 +1565,8 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         for name in self._param_map:
             m = _INDIVIDUAL_EXPERT_RE.match(name)
             if m:
+                # key = (group1 prefix, group3 proj_type); value (group2 idx, name)
+                # example: ("model.layers.3.mlp.experts", "gate_proj") -> (0, name)
                 groups.setdefault((m.group(1), m.group(3)), []).append(
                     (int(m.group(2)), name)
                 )
@@ -1561,16 +1579,41 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
     ):
         """Build a single fused MoE tensor (up_proj/w13 or down_proj/w2) on demand.
 
-        ``gated`` (from the param metadata) selects the up-projection layout:
-        gated SwiGLU interleaves gate||up into w13 = [E, 2*inter, hidden];
-        non-gated ReLU^2 stacks up only into w13 = [E, inter, hidden].
+        vLLM stores all experts of a layer in two fused tensors: ``w13_weight``
+        (the up-projection input — gate+up for gated SwiGLU, or up only for
+        non-gated ReLU^2) and ``w2_weight`` (the down-projection). Megatron keeps
+        each expert's ``gate_proj``/``up_proj``/``down_proj`` as separate params;
+        this stacks the local experts back into vLLM's fused layout so the bulk
+        reshard ships them in one transfer per fused name.
 
-        Returns the local (TP/EP) shard of the fused tensor, or ``None`` if
-        no local experts contribute to this fused entry (e.g. the layer is
-        not on this PP rank).  Caller is responsible for releasing the
-        returned tensor after the per-param transfer completes — this lets
-        peak memory stay at ~one fused tensor instead of the full
-        ``_fused_expert_map``.
+        Inputs:
+          * ``expert_groups``: ``{(prefix, proj): [(expert_idx, param_name), ...]}``
+            sorted by expert index (built once in prepare).
+          * ``self._param_map[param_name]`` -> that expert param's local view.
+          * ``gated`` (from metadata) selects the w13 layout.
+          * ``gen_tp_size``: the gen-side TP the fused tensor is later sharded over.
+
+        Returns the stacked local (TP/EP) shard ``[E_local, ...]``, or ``None`` if
+        no local expert contributes (e.g. the layer is not on this PP rank).
+        Caller frees it after the transfer, so peak memory stays at ~one fused
+        tensor instead of the full ``_fused_expert_map``.
+
+        Worked example — gated w13, one expert, ``gate``/``up`` each
+        ``[inter=8, hidden=4]``, ``gen_tp_size=2`` so ``P = inter/gen_tp = 4``.
+        vLLM wants gen-rank ``r`` to receive
+        ``w13 = [gate[r*P:(r+1)*P], up[r*P:(r+1)*P]]``, i.e. a plain contiguous
+        shard along the intermediate dim must already be gate/up-interleaved. So
+        we build that dim as ``[gate[0:4], up[0:4], gate[4:8], up[4:8]]``
+        (length ``2*inter = 16``):
+          * ``gate.reshape(2, 4, 4)`` -> chunks ``[gate[0:4], gate[4:8]]``
+          * ``up.reshape(2, 4, 4)``   -> chunks ``[up[0:4], up[4:8]]``
+          * ``cat(dim=1)`` -> ``[2, 8, 4]``: chunk ``c`` = ``[gate[c*P:], up[c*P:]]``
+          * ``reshape(16, 4)`` -> ``[gate[0:4], up[0:4], gate[4:8], up[4:8]]``
+        After ``torch.stack`` over experts (``[E, 16, 4]``), a gen TP=2 Shard
+        along the intermediate dim gives rank 0 ``[gate[0:4], up[0:4]]`` and rank
+        1 ``[gate[4:8], up[4:8]]`` — exactly vLLM's per-rank layout. (With
+        ``gen_tp_size==1`` no interleave is needed: one rank holds all of
+        ``gate||up``, so a plain ``cat([gate, up], dim=0)`` suffices.)
         """
         if fused_expert_param_type == "up_proj":
             prefix = fused_name.rsplit(".w13_weight", 1)[0]
@@ -1595,14 +1638,21 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                         assert inter % gen_tp_size == 0, (
                             f"intermediate {inter} not divisible by gen_tp_size {gen_tp_size}"
                         )
-                        P = inter // gen_tp_size
+                        P = inter // gen_tp_size  # example: 8 // 2 -> P = 4
                         stacked = torch.cat(
                             [
-                                gate.view(gen_tp_size, P, hidden),
-                                up.view(gen_tp_size, P, hidden),
+                                # reshape (not view): the cached _param_map
+                                # tensors are views into Megatron's param buffers
+                                # and may be non-contiguous, which .view rejects.
+                                # Split each into gen-TP chunks; example
+                                # [gate[0:4], gate[4:8]] / [up[0:4], up[4:8]].
+                                gate.reshape(gen_tp_size, P, hidden),
+                                up.reshape(gen_tp_size, P, hidden),
                             ],
                             dim=1,
-                        )  # [gen_tp_size, 2P, hidden]
+                        )  # [gen_tp_size, 2P, hidden]; example [2, 8, 4]
+                        # Flatten to the interleaved [gate[0:P], up[0:P],
+                        # gate[P:2P], up[P:2P], ...]; example [16, 4].
                         expert_tensors.append(
                             stacked.reshape(2 * inter, hidden).contiguous()
                         )

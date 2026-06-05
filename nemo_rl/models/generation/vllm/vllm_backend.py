@@ -474,7 +474,13 @@ class VllmInternalWorkerExtension:
                             # Linear interpolation (global_size * local_dim0 / global_dim0) fails
                             # when vLLM replicates KV heads (num_kv_heads < tp_size), because
                             # q/k/v proportions change between global and local.
-                            tp_size = torch.distributed.get_world_size()
+                            #
+                            # Use the gen TP size from refit_info, NOT
+                            # torch.distributed.get_world_size(): the latter is the vLLM
+                            # worker's default-group size, which equals TP only because
+                            # gen PP/EP are pinned to 1 (check_nccl_reshard_refit_support).
+                            # Reading gen_tp_size stays correct if gen PP is ever added.
+                            tp_size = refit_info.get("gen_tp_size", 1)
                             naive_local_sizes = [gs // tp_size for gs in global_sizes]
                             if sum(naive_local_sizes) == local_dim0:
                                 local_sizes = naive_local_sizes
@@ -513,6 +519,11 @@ class VllmInternalWorkerExtension:
                     matched = True
 
             if not matched:
+                # (None, None) -> the discard branch in get_dst_dtensor: this
+                # rank still joins the collective for symmetry but throws the
+                # bytes away. Every supported model maps all of its bulk params,
+                # so this WARN firing means a real mapping gap (a new/renamed
+                # param vLLM expects under another name), not a benign case.
                 mapping[hf_name] = (None, None)
                 print(
                     f"[WARN] _build_hf_to_vllm_mapping: no vLLM param for '{hf_name}'",
@@ -533,8 +544,10 @@ class VllmInternalWorkerExtension:
            (qkv_proj, gate_up_proj, fused_qkv_a_proj). Returns DTensorRef
            wrapping a buffer shaped like this component's slice of the merged
            param, plus a post_refit_hook that copies it in.
-        3. **Unmapped param**: No vLLM parameter (e.g., tied lm_head).
-           Returns DTensorRef wrapping a dummy buffer for broadcast participation.
+        3. **Unmapped param**: no vLLM param owns this HF param. Returns a
+           DTensorRef wrapping a throwaway buffer purely so this rank still
+           joins the collective (train broadcasts every bulk param; a missing
+           participant would deadlock the broadcast). The bytes are discarded.
 
         Must be called after ``_hf_to_vllm`` is populated (inside ``nccl_reshard_refit``).
 
@@ -554,7 +567,17 @@ class VllmInternalWorkerExtension:
         dst_placements = param_info["dst_placements"]
 
         if vllm_param is None:
-            # Unmapped — participate in broadcast but discard result
+            # No vLLM owner for this HF param. This is NOT stale-weight
+            # corruption: train broadcasts EVERY bulk param, so each gen rank
+            # must call the matching collective even with nowhere to store the
+            # bytes, or the broadcast deadlocks. We receive into a throwaway
+            # buffer and run no post_refit_hook, discarding the result.
+            #
+            # The global_shape buffer is fine: golden stages the transfer in its
+            # own internal buffers, so this is only the (discarded) final-copy
+            # target. In practice every supported model maps all of its bulk
+            # params, so reaching here signals a mapping regression (see the
+            # WARN in _build_hf_to_vllm_mapping), not a normal path.
             dtype = _STR_TO_DTYPE.get(param_info.get("dtype", ""), torch.bfloat16)
             buf = torch.empty(global_shape, device=self.device, dtype=dtype)
             return DTensorRef(buf, global_shape), dst_placements, None
