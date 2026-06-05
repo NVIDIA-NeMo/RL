@@ -14,17 +14,13 @@
 
 
 import os
+from functools import partial
 from pathlib import Path
 
 import modelopt.torch.quantization as mtq
 import torch
 import torch.nn as nn
 from megatron.bridge.models.gpt_provider import transformer_engine_layer_spec
-from megatron.bridge.models.mamba.mamba_provider import (
-    MambaModelProvider,
-    modelopt_mamba_stack_spec,
-    transformer_engine_mamba_stack_spec,
-)
 from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
 from modelopt.torch.quantization.config import need_calibration
 from modelopt.torch.utils.dataset_utils import (
@@ -168,36 +164,18 @@ def get_modelopt_checkpoint_dir() -> str:
     return modelopt_checkpoint_dir
 
 
-def _is_mamba_provider(config) -> bool:
-    """Detect whether a Megatron model provider is a MBridge Mamba provider."""
-    # MBridge layer-spec callables receive the provider instance as `config`;
-    # legacy providers also carry config fields, hence the overloaded name.
-    return isinstance(config, MambaModelProvider)
+def get_quantization_layer_spec():
+    """Return a checkpoint-serializable GPT layer-spec callback.
 
-
-def quantization_layer_spec(config):
-    """Layer specification for quantization with ModelOpt.
-
-    Routes mamba/hybrid configs to the mamba stack spec; otherwise falls back
-    to the GPT modelopt spec. ``DISABLE_MODELOPT_LAYER_SPEC=1`` returns the
-    plain TE spec without modelopt wrappers (used when modelopt's layer-spec
-    interaction with the importer is undesired).
-
-    We need to disable arbitrary attention mask for sequence packing.
+    Megatron-Bridge serializes ``transformer_layer_spec`` as the callback's
+    importable target. Return Megatron functions/partials directly so saved
+    configs stay within the built-in target allowlist. The partial keeps the
+    sequence-packing requirement of disabling arbitrary attention masks.
     """
-    disable_modelopt_layer_spec = int(
-        os.environ.get("DISABLE_MODELOPT_LAYER_SPEC", "0")
-    )
-    if disable_modelopt_layer_spec:
-        if _is_mamba_provider(config):
-            return transformer_engine_mamba_stack_spec()
-        return transformer_engine_layer_spec(config)
-    if _is_mamba_provider(config):
-        print("Using Mamba ModelOpt quantization layer spec")
-        return modelopt_mamba_stack_spec(config)
-    print("Using ModelOpt quantization layer spec without arbitrary attention mask")
-    return get_gpt_modelopt_spec(
-        config=config,
+    if int(os.environ.get("DISABLE_MODELOPT_LAYER_SPEC", "0")):
+        return transformer_engine_layer_spec
+    return partial(
+        get_gpt_modelopt_spec,
         local_core_attention=False,
         remap_te_layernorm=True,
         real_quant_cfg="None",
