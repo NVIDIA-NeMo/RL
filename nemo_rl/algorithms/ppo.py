@@ -138,8 +138,6 @@ class PPOConfig(TypedDict):
     max_num_epochs: int
     max_num_steps: int
     max_rollout_turns: int
-    normalize_rewards: bool
-    use_leave_one_out_baseline: bool
     val_period: int
     val_batch_size: int
     val_at_start: bool
@@ -1109,8 +1107,8 @@ def _create_advantage_estimator(master_config: MasterConfig):
     adv_estimator_name = adv_estimator_config["name"]
     if adv_estimator_name == "gae":
         adv_estimator = GeneralizedAdvantageEstimator(adv_estimator_config, loss_config)
-        gae_lambda = adv_estimator_config.get("gae_lambda", 0.95)
-        gae_gamma = adv_estimator_config.get("gae_gamma", 0.99)
+        gae_lambda = adv_estimator_config["gae_lambda"]
+        gae_gamma = adv_estimator_config["gae_gamma"]
         print(f"  ✓ Using GAE advantage estimator (λ={gae_lambda}, γ={gae_gamma})")
     elif adv_estimator_name == "raw_reward":
         adv_estimator = RawRewardAdvantageEstimator(adv_estimator_config, loss_config)
@@ -1202,7 +1200,7 @@ def ppo_train(
     # Number of PPO steps to train only the critic before starting policy
     # training.  Despite the legacy name, this is compared against total_steps
     # (not current_epoch) to match veRL's critic_warmup semantics.
-    policy_training_start_step = master_config.ppo.get("policy_training_start_step", 0)
+    policy_training_start_step = master_config.ppo["policy_training_start_step"]
     consumed_samples = ppo_save_state["consumed_samples"]
     total_valid_tokens = ppo_save_state.get("total_valid_tokens", 0)
     val_at_start = master_config.ppo["val_at_start"]

@@ -10,8 +10,6 @@ ppo:
   max_num_steps: 100000
   steps_per_epoch: 4
   policy_training_start_step: 0  # number of PPO steps of critic-only warmup before policy training begins
-  normalize_rewards: true
-  use_leave_one_out_baseline: false  # DAPO: no leave-one-out
   val_period: 20
   val_at_start: true
   val_at_end: false
