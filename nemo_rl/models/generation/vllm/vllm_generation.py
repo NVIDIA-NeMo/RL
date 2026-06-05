@@ -64,9 +64,6 @@ class VllmGeneration(GenerationInterface):
         but that call early-returns when PGs already exist, so calling this
         method first is safe.
         """
-        if cluster._node_placement_groups is not None:
-            return
-
         tp = config["vllm_cfg"]["tensor_parallel_size"]
         pp = config["vllm_cfg"]["pipeline_parallel_size"]
         model_parallel_size = tp * pp
