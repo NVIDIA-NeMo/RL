@@ -6,7 +6,7 @@
 # precision while training the quantized student in the same loop.
 #
 # Example usage:
-#   uv run examples/nemo_gym/run_distillation_nemo_gym.py --config examples/modelopt/qa_distillation_nano3_megatron.yaml
+#   DISABLE_MODELOPT_LAYER_SPEC=1 uv run examples/nemo_gym/run_distillation_nemo_gym.py --config examples/modelopt/qa_distillation_nano3_megatron.yaml
 
 defaults: "./qa_distillation_math_megatron.yaml"
 
