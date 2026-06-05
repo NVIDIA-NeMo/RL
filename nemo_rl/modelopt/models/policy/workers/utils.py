@@ -21,6 +21,10 @@ import modelopt.torch.quantization as mtq
 import torch
 import torch.nn as nn
 from megatron.bridge.models.gpt_provider import transformer_engine_layer_spec
+from megatron.bridge.models.mamba.mamba_provider import (
+    modelopt_mamba_stack_spec,
+    transformer_engine_mamba_stack_spec,
+)
 from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
 from modelopt.torch.quantization.config import need_calibration
 from modelopt.torch.utils.dataset_utils import (
@@ -181,3 +185,10 @@ def get_quantization_layer_spec():
         real_quant_cfg="None",
         use_arbitrary_attention_mask=False,
     )
+
+
+def get_quantization_mamba_stack_spec():
+    """Return a checkpoint-serializable Mamba stack-spec callback."""
+    if int(os.environ.get("DISABLE_MODELOPT_LAYER_SPEC", "0")):
+        return transformer_engine_mamba_stack_spec
+    return modelopt_mamba_stack_spec
