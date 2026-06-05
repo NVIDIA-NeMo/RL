@@ -588,24 +588,92 @@ class VllmInternalWorkerExtension:
                 f"tensors={len(receive_specs)} cfg={cfg}"
             )
 
-        # ---- One refit cycle. ----
-        # Pull callback wraps the receiver's existing per-tensor pull.
-        # For v0 we synchronously pull each source's bytes; the
-        # parallel-pull optimization hooks in the same place.
-        def _pull(src, dest):
-            self._mx_receiver._receiver._nixl.pull_to(  # type: ignore[attr-defined]
-                src.mx_source_id, src.worker_id, dest,
-                source_subslice=src.source_subslice,
-                timeout_seconds=mx_config.timeout_seconds,
+        # ---- One refit cycle, matched-TP fast path. ----
+        # v0: pre-allocate one Megatron-shaped destination per receive_spec,
+        # register them all with NIXL under the trainer's Megatron names,
+        # and call receive_weights() once to bulk-fill them via a single
+        # RDMA pull from the matched-TP-rank source. The translator then
+        # walks the filled buffers and produces HF tensors.
+        #
+        # Mixed-TP (target_tp != source_tp) requires per-source pulls
+        # with optional sub-slicing; that's a v1 enhancement landing on
+        # top of an MxRefitReceiver.pull_to primitive. Phase B's planner
+        # already returns the right slice info; the gap is just the NIXL
+        # plumbing for partial-buffer registers.
+        ctx = self._mx_megatron_ctx
+        if not hasattr(self, "_mx_megatron_buffers"):
+            buffers: dict[str, "torch.Tensor"] = {}
+            for spec in ctx.receive_specs.values():
+                # The receiver's per-rank window along the shard axis.
+                # For matched-TP this matches a source's natural shard.
+                target_tp = ctx.target_tp_layout.tp_size
+                target_rank = ctx.target_tp_layout.tp_rank
+                full_shape = list(spec.target_shape)
+                if spec.role != "replicated" and target_tp > 1:
+                    axis_extent = full_shape[spec.shard_axis]
+                    per_rank = axis_extent // target_tp
+                    full_shape[spec.shard_axis] = (
+                        axis_extent
+                        if target_rank == target_tp - 1
+                        else per_rank
+                    )
+                # Replicated tensors stay at full shape; per_expert is
+                # one-tensor-per-expert (handled later by run_refit_cycle).
+                if spec.role.startswith("expert_"):
+                    # Per-expert: skip pre-allocation; per-cycle code path
+                    # builds per-expert buffers as part of assembly.
+                    continue
+                dt = {
+                    "bfloat16": torch.bfloat16, "float16": torch.float16,
+                    "float32": torch.float32,
+                }.get(spec.target_dtype, torch.bfloat16)
+                buffers[spec.megatron_name] = torch.empty(
+                    full_shape, dtype=dt, device=self.device,
+                )
+            # Register all at once with the receiver's NIXL plane.
+            self._mx_receiver._receiver._nixl.register_tensors(buffers)
+            self._mx_megatron_buffers = buffers
+            print(
+                f"[mx-megatron] pre-allocated + registered "
+                f"{len(buffers)} per-rank Megatron buffers "
+                f"({sum(b.numel() * b.element_size() for b in buffers.values()) / 1e9:.2f} GB)"
             )
+
+        # Bulk RDMA pull — same primitive as the DTensor path.
+        chosen = next(
+            (c for c in candidates
+             if c.megatron_meta is not None
+             and c.megatron_meta.tp_rank == ctx.target_tp_layout.tp_rank),
+            None,
+        )
+        if chosen is None:
+            print(
+                f"[mx-megatron] no matched-TP source for tp_rank="
+                f"{ctx.target_tp_layout.tp_rank}; v1 mixed-TP NIXL "
+                f"plumbing not yet wired"
+            )
+            return False
+
+        for _name, _t in self._mx_receiver.receive_from(
+            chosen, timeout_seconds=mx_config.timeout_seconds,
+        ):
+            pass  # buffers filled in-place via NIXL
+
+        # Now walk the plans and translate each filled buffer.
+        # pre_assembled_buffers tells run_refit_cycle to use the
+        # pre-filled tensors instead of allocating new dest + calling
+        # the per-source pull callback.
+        def _noop_pull(src, dest):
+            pass  # buffer already filled by receive_from above (pre-pull path)
 
         weights: list[tuple[str, "torch.Tensor"]] = []
         for hf_name, hf_tensor in run_refit_cycle(
             self._mx_receiver,
             candidates=candidates,
-            context=self._mx_megatron_ctx,
-            pull=_pull,
+            context=ctx,
+            pull=_noop_pull,
             device=self.device,
+            pre_assembled_buffers=self._mx_megatron_buffers,
         ):
             weights.append((hf_name, hf_tensor))
 
