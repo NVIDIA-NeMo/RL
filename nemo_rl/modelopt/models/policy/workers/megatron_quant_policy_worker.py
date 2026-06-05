@@ -157,7 +157,9 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             if has_modelopt_state(model_path):
                 print("setting restore_modelopt_state to True")
                 megatron_cfg.model.restore_modelopt_state = True
-                megatron_cfg.model.transformer_layer_spec = get_quantization_layer_spec()
+                megatron_cfg.model.transformer_layer_spec = (
+                    get_quantization_layer_spec()
+                )
                 if hasattr(megatron_cfg.model, "mamba_stack_spec"):
                     megatron_cfg.model.mamba_stack_spec = (
                         get_quantization_mamba_stack_spec()
