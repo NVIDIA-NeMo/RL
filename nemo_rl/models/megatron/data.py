@@ -23,7 +23,6 @@ from megatron.core.parallel_state import (
     get_context_parallel_world_size,
 )
 from megatron.core.utils import StragglerDetector
-from megatron.training.utils import get_ltor_masks_and_position_ids
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -204,6 +203,18 @@ def get_microbatch_iterator(
         seq_dim_size,
         padded_seq_length,
     )
+
+
+def get_ltor_masks_and_position_ids(*args: Any, **kwargs: Any) -> Any:
+    """Lazy proxy for `megatron.training.utils.get_ltor_masks_and_position_ids`.
+
+    The underlying import is deferred to call time so that importing this module does
+    not pull in `megatron.training` -> modelopt -> transformers -> torchvision, which
+    can crash on a duplicate torchvision ``roi_align` meta-kernel registration in the mcore venv.
+    """
+    from megatron.training.utils import get_ltor_masks_and_position_ids as _impl
+
+    return _impl(*args, **kwargs)
 
 
 def process_microbatch(

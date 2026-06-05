@@ -1,36 +1,99 @@
 ---
 name: config-conventions
-description: Configuration conventions for NeMo-RL. YAML is the single source of truth for defaults. Covers TypedDict usage, exemplar YAML updates, and forbidden default patterns.
-when_to_use: Adding or modifying config fields; reviewing config changes; 'where do I set defaults', 'TypedDict pattern', 'exemplar YAML', 'forbidden default patterns', during code review of config files.
+description: Configuration conventions for NeMo-RL. YAML is the single source of truth for defaults. Covers BaseModel/TypedDict usage, dataclass for internal classes, exemplar YAML updates, and forbidden default patterns.
+when_to_use: Adding or modifying config fields; reviewing config changes; 'where do I set defaults', 'BaseModel pattern', 'TypedDict pattern', 'dataclass', 'exemplar YAML', 'forbidden default patterns', during code review of config files.
 ---
 
 # Configuration Conventions
 
 ## Core Rule
 
-**YAML is the single source of truth for defaults.** Do not set non-`None` defaults in code for configuration values. The loaded YAML (and any user overrides) must supply required values.
+**Defaults must not be scattered at call sites.** A default for a config value must live in exactly one place; readers should never have to grep through algo code to discover what value was actually used. Where that one place is depends on the schema type — see "Where Defaults Live" below — but it is *never* a `cfg.get("k", default)`, a function-parameter default, or a magic constant inside the consumer.
+
+## Class Choice: BaseModel vs. dataclass vs. TypedDict
+
+We are **gradually migrating** the config schema from `typing.TypedDict` (v1) to `pydantic.BaseModel` (v2). Both styles coexist in the codebase today, and the migration is tracked by `tests/unit/test_config_v2.py` against the reference configs in `tests/unit/reference_configs/` (these will be removed when the migration is complete).
+
+Use the right tool for the job. **v2 (the new convention):**
+
+- **`pydantic.BaseModel` — v2, user-facing config (the new default).** Any class the user touches via YAML — currently the top-level `MasterConfig` of each algorithm (`grpo`, `dpo`, `sft`, `rm`, `distillation`, `eval`) and a few shared schemas like `ClippedPGLossConfig` — is a `BaseModel` declared with `extra="allow"` so unknown keys don't break older configs:
+
+  ```python
+  from pydantic import BaseModel
+
+  class MasterConfig(BaseModel, extra="allow"):
+      policy: PolicyConfig
+      grpo: GRPOConfig
+      ...
+  ```
+
+  Prefer `BaseModel` for **new** user-facing config classes, and when converting an existing `TypedDict` as part of the v1 → v2 migration.
+
+- **`@dataclass` — v2, internal classes (not loaded from YAML).** For purely in-process data containers — worker metadata, datum specs, internal state passed between Python components — use `@dataclass` (e.g. `nemo_rl/distributed/worker_groups.py`, `nemo_rl/data/interfaces.py`, `nemo_rl/data_plane/interfaces.py`). Do **not** use `BaseModel` or `TypedDict` for these — they're not config and shouldn't pretend to be.
+
+**v1 (legacy, being migrated away):**
+
+- **`typing.TypedDict` — v1, legacy / not-yet-migrated user-facing config.** Most nested sub-configs (e.g. `GRPOConfig`, `RewardScalingConfig`, `AsyncGRPOConfig`) are still `TypedDict`. Continue to maintain them with the same defaults rules below until they are migrated to `BaseModel`. Use `typing.NotRequired` to mark optional attributes. **Do not add new `TypedDict`-based config classes.**
+
+When in doubt: *is this class populated from a user-edited YAML?* If yes → `BaseModel` (or legacy `TypedDict`). If no → `@dataclass`.
+
+### New code follows v2 directly
+
+Any **newly added** class must follow the new convention from the start:
+
+- New user-facing config → `pydantic.BaseModel` (with `extra="allow"` when user configs may carry extra/obsolete keys). Do **not** add new `TypedDict`-based config classes.
+- New internal class → `@dataclass`.
+
+`TypedDict` edits should only happen on existing, not-yet-migrated classes — either to extend them or as part of converting them to `BaseModel`.
 
 ## Access Config Directly
 
-For required attributes, write code like `policy_cfg["precision"]` and assume it is present. Do not introduce hidden defaults deep in the code.
+For required attributes, read the value and assume it is present — don't introduce a fallback at the call site.
 
-## Express Optionality via TypedDict
+- **v2 (BaseModel):** attribute access — `master_config.policy.precision`. The BaseModel class itself supplies any default for the field; the call site reads it as-is.
+- **v1 (TypedDict, omegaconf-loaded dict):** key access — `policy_cfg["precision"]`. The exemplar YAML supplies the default; the call site reads it as-is.
 
-Use `typing.NotRequired` to mark optional attributes. Optional attributes may be absent/`None`; code may check for their presence.
+In both cases, missing required values should fail loudly at load/access time rather than being silently papered over.
+
+## Express Optionality
+
+- **TypedDict:** use `typing.NotRequired[...]` to mark optional attributes.
+- **BaseModel:** declare the field as `Optional[...] = None` (or `T | None = None`).
+
+Optional attributes may be absent/`None`; code may check for their presence. Never substitute a non-`None` default at the access site (see "Accessing NotRequired Fields" below).
 
 ## Where Defaults Live
 
-- Exemplar configs under `examples/configs/*.yaml` include documented defaults.
+The location of defaults depends on the schema type:
+
+- **v2 — `pydantic.BaseModel` (user config):** the default lives **on the BaseModel field** as a Python value. The BaseModel class is the centralized source of truth for user-facing defaults — exemplar YAML serves as documentation / override examples, not as the canonical default store. Example (from `ClippedPGLossConfig`):
+
+  ```python
+  class ClippedPGLossConfig(BaseModel, extra="allow"):
+      disable_ppo_ratio: bool = False
+      ratio_clip_min: float = 0.2
+      ratio_clip_c: Optional[float] = None  # None to disable
+      reference_policy_kl_penalty: float = 0.01
+  ```
+
+- **v1 — `typing.TypedDict` (legacy user config, pre-migration):** the default lives **only in the exemplar YAML** under `examples/configs/*.yaml`. There is no class-level default — Python code must read the value from the loaded dict without supplying a fallback.
+
+- **`@dataclass` (internal class, not loaded from YAML):** usually **no defaults at all**. Fields are populated by the producing code path; a stray `= None` / `field(default=...)` is a smell unless there's a clear reason (e.g., forward-compat for an optional field added mid-migration).
+
+In all three cases:
+
+- Exemplar configs under `examples/configs/*.yaml` include documented defaults. For v1 TypedDict configs they *are* the source of truth; for v2 BaseModel configs they serve as documentation and reasonable starting points, with the BaseModel class itself being authoritative.
 - Recipe YAMLs under `examples/configs/recipes/**/*.yaml` are runnable snapshots and may omit documentation.
+- Defaults at **call sites** (`cfg.get("k", default)`, function-parameter defaults, magic constants) are never allowed — see "Forbidden Patterns" below.
 
 ## Documenting New Config Keys
 
-When adding a new config key to a `TypedDict` subclass, document:
+When adding a new config key to a `BaseModel` or `TypedDict` subclass, document:
 - The key's purpose
 - Valid values/types
 - Recommended default (if applicable)
 
-Reflect the default in the exemplar YAMLs under `examples/configs/*.yaml`.
+Reflect the default in the exemplar YAMLs under `examples/configs/*.yaml`. If the change affects an exemplar covered by `tests/unit/test_config_v2.py`, also update the matching `tests/unit/reference_configs/*.yaml` so the v1→v2 migration check stays green.
 
 ## Recipe YAMLs Must Set `defaults`
 
@@ -78,9 +141,12 @@ If a `NotRequired` field is absent, the code should handle that explicitly — n
 
 ## Forbidden Patterns
 
-**Don't:**
+These are forbidden in **both v1 and v2** — they all hide defaults at the call site instead of on the schema.
+
+**Don't (any schema type):**
 ```python
-# Hidden default in code
+# Hidden default at the call site — should be centralized on the BaseModel
+# field (v2) or in the exemplar YAML (v1)
 precision = policy_cfg.get("precision", "bfloat16")
 
 # Function parameter defaulting a config value
@@ -88,14 +154,24 @@ def build_policy(policy_cfg, precision: str = "bfloat16"):
     ...
 ```
 
-**Do:**
+**Do — v2 (BaseModel):**
 ```python
-# Required attribute: expect it from YAML or user override
+class PolicyConfig(BaseModel, extra="allow"):
+    # The BaseModel field is the centralized source of truth for the default
+    precision: str = "bfloat16"
+
+# Call site reads the attribute directly
+precision = master_config.policy.precision
+```
+
+**Do — v1 (TypedDict, still dict-shaped after omegaconf load):**
+```python
+# Required attribute: expect it from the (exemplar or user) YAML, no fallback
 precision: str = policy_cfg["precision"]
 
-# Optional attribute: check for presence
+# Optional (NotRequired) attribute: check for presence, never invent a default
 if "milestones" in scheduler_cfg:
     configure_milestones(scheduler_cfg["milestones"])
 ```
 
-See also: @docs/design-docs/design-and-philosophy.md (TypedDict and Configuration Defaults section).
+See also: @docs/design-docs/design-and-philosophy.md (Configuration Schema: BaseModel, dataclass, and TypedDict section).
