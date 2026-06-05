@@ -58,12 +58,13 @@ export REPO_ROOT="$PWD"                     # = your clone; the launcher also au
 
 ### 2.2 Container
 
-Uses **baseline's nliang container**, NOT the default NeMo-RL image. This is the
-critical part of the repro — its vLLM is the one where the hermes tool parser
-patch applies, so the agent makes real `function_call` items:
+Uses the **SWE training container** (`ruit-swe_bench`, with mcore + apptainer baked
+in), NOT the default NeMo-RL image. Its vLLM has the working hermes tool parser, so
+the agent emits real `function_call` items (a broken parser was the original
+zero-reward failure mode):
 
 ```
-/lustre/fsw/portfolios/coreai/users/nliang/enroot-images/docker_images:nliang-qwen3-swe-training-e19dee3ba-x86_64-051626.squashfs
+/lustre/fsw/portfolios/coreai/users/ruit/enroot-images/docker_images:ruit-swe_bench-6de99f772-x86_64-060326-mcore-apptainer.squashfs
 ```
 
 It is wired in via the `CONTAINER` env var (overridable). The job mounts:
@@ -86,7 +87,7 @@ Confirm these absolute paths exist before submitting:
 | `/lustre/fsw/portfolios/coreai/users/bihu/repos/nemo-rl-async-swe/results/qwen3-30b-thinking-swe1-async-age1-pps64-gpp8-gbs512-lr1e-06/step_230_hf` | init checkpoint |
 | `/lustre/fsw/portfolios/llmservice/projects/llmservice_modelalignment_ppo/users/sdevare/repos/nano/dataset/rl/swe_all_datasets_train_w_agent_ref_r2e_gym_subset.jsonl` | train + val data |
 | `${REPO_ROOT}/ray.sub` | SLURM launcher consumed by `sbatch` |
-| `/lustre/fsw/portfolios/coreai/users/nliang/enroot-images/docker_images:nliang-qwen3-swe-training-e19dee3ba-x86_64-051626.squashfs` | training container |
+| `/lustre/fsw/portfolios/coreai/users/ruit/enroot-images/docker_images:ruit-swe_bench-6de99f772-x86_64-060326-mcore-apptainer.squashfs` | training container |
 
 Per-instance SWE-bench `.sif` sandbox images (resolved by `container_formatter`
 in the YAML, first match wins):
@@ -200,7 +201,7 @@ export WANDB_API_KEY=...     # for wandb logging
 export GITHUB_TOKEN=...      # only if your data/repo access needs it
 
 # 3. (Optional) sanity-check the shared assets exist (readable on cw-dfw-cs)
-ls "/lustre/fsw/portfolios/coreai/users/nliang/enroot-images/docker_images:nliang-qwen3-swe-training-e19dee3ba-x86_64-051626.squashfs"
+ls "/lustre/fsw/portfolios/coreai/users/ruit/enroot-images/docker_images:ruit-swe_bench-6de99f772-x86_64-060326-mcore-apptainer.squashfs"
 ls -d "/lustre/fsw/portfolios/coreai/users/bihu/repos/nemo-rl-async-swe/results/qwen3-30b-thinking-swe1-async-age1-pps64-gpp8-gbs512-lr1e-06/step_230_hf"
 ls "/lustre/fsw/portfolios/llmservice/projects/llmservice_modelalignment_ppo/users/sdevare/repos/nano/dataset/rl/swe_all_datasets_train_w_agent_ref_r2e_gym_subset.jsonl"
 
@@ -216,10 +217,11 @@ The script prints a summary, submits via `sbatch`, and writes the job id to
 | Var | Default | Effect |
 |-----|---------|--------|
 | `MODEL_PATH` (also `$1`) | `/lustre/fsw/portfolios/coreai/users/bihu/repos/nemo-rl-async-swe/results/qwen3-30b-thinking-swe1-async-age1-pps64-gpp8-gbs512-lr1e-06/step_230_hf` | init checkpoint |
-| `CONTAINER` | `/lustre/fsw/portfolios/coreai/users/nliang/enroot-images/docker_images:nliang-qwen3-swe-training-e19dee3ba-x86_64-051626.squashfs` | training image |
+| `CONTAINER` | `/lustre/fsw/portfolios/coreai/users/ruit/enroot-images/docker_images:ruit-swe_bench-6de99f772-x86_64-060326-mcore-apptainer.squashfs` | training image |
 | `NUM_NODES` | 16 | actor nodes |
 | `NUM_GEN_NODES` | 8 | generation nodes (async only) |
-| `EXP_SUFFIX` | `repro-baseline-swe2-a760f1c-nliang-async-age1-pps8-gpp8-gbs64-lr1e-06-tp4` | run + checkpoint dir name |
+| `SKIP_TRAINING` | `0` | `1` = generation-only benchmark: no-op training pinned to 1 node (see §9) |
+| `EXP_SUFFIX` | `repro-baseline-swe2-async-age1-pps8-gpp8-gbs64-lr1e-06-tp4` | run + checkpoint dir name (`notrain-` is inserted when `SKIP_TRAINING=1`) |
 | `BASE_LOG_DIR` | `${REPO_ROOT}/logs/slurm` | SLURM/Ray logs |
 
 Example — different init checkpoint, smaller cluster:
@@ -260,7 +262,7 @@ tail -f ${REPO_ROOT}/logs/slurm/slurm-${JOB_ID}.out  # driver output
 
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
-| Reward is identically 0 | wrong container — hermes tool parser broken, no tool calls | confirm `CONTAINER` is the nliang squashfs, not the default image |
+| Reward is identically 0 | wrong container — hermes tool parser broken, no tool calls | confirm `CONTAINER` is the `ruit-swe_bench` squashfs, not the default image |
 | `version mismatch` abort | strict version check | ensure `NRL_IGNORE_VERSION_MISMATCH=1` is in the command (it is, by default) |
 | Gym venv rebuild / slowness | venv rebuilt instead of reused | confirm `NEMO_GYM_SKIP_VENV_IF_PRESENT=1` and the Gym mount are present |
 | Agent can't start sandbox | apptainer/singularity missing or `.sif` images missing | check `SETUP_COMMAND` apptainer install succeeded; verify `container_formatter` paths in the YAML |
@@ -276,7 +278,7 @@ Code:        NeMo-RL @ branch ruit/SWE_bench (run in place from your clone)
 Compute:     cw-dfw-cs (SLURM)
 Repo:        github.com/NVIDIA-NeMo/RL  @  branch ruit/SWE_bench
 REPO_ROOT:   your clone (export REPO_ROOT=<clone>; launcher also auto-detects it)
-Container:   /lustre/fsw/portfolios/coreai/users/nliang/enroot-images/docker_images:nliang-qwen3-swe-training-e19dee3ba-x86_64-051626.squashfs
+Container:   /lustre/fsw/portfolios/coreai/users/ruit/enroot-images/docker_images:ruit-swe_bench-6de99f772-x86_64-060326-mcore-apptainer.squashfs
 Init model:  /lustre/fsw/portfolios/coreai/users/bihu/repos/nemo-rl-async-swe/results/qwen3-30b-thinking-swe1-async-age1-pps64-gpp8-gbs512-lr1e-06/step_230_hf
 Train data:  /lustre/fsw/portfolios/llmservice/projects/llmservice_modelalignment_ppo/users/sdevare/repos/nano/dataset/rl/swe_all_datasets_train_w_agent_ref_r2e_gym_subset.jsonl
 Config:      ${REPO_ROOT}/examples/swe_bench/grpo_qwen3_30b_async_swe.yaml
@@ -290,3 +292,57 @@ Agent:       max_turns=200, timeout=1800s
 wandb:       project=swe-benchmark
 Baseline:    nvidia/binhu-nemo-rl/dc3m70us (~8% resolved from step 1)
 ```
+
+---
+
+## 9. Generation-only benchmark (skip training)
+
+For **benchmarking generation throughput / scaling** without paying for real
+training, the launcher has a no-op-training mode, gated by the
+`grpo.gen_benchmark_skip_training` flag (added on `ruit/SWE_bench`). Set
+`SKIP_TRAINING=1`:
+
+```bash
+SKIP_TRAINING=1 bash "${REPO_ROOT}/examples/swe_bench/run_grpo_repro_baseline_swe2.sh"
+```
+
+### What it does
+- **`policy.train()` becomes a no-op** — no forward/backward, no optimizer step. The
+  weights stay frozen at the init checkpoint and are **still refit to vLLM every
+  step**, so the async generation / weight-sync cadence stays realistic.
+- **No optimizer is built** (`init_optimizer=False`) — saves memory and startup time.
+- A tiny **keep-alive matmul daemon** runs on each training worker so the cluster's
+  idle-GPU reaper doesn't kill the (otherwise idle) training node.
+- **Checkpoint saving is disabled** (`checkpointing.enabled=false`) — there is no
+  optimizer/training state to save.
+
+### What the launcher changes automatically when `SKIP_TRAINING=1`
+- Training parallelism → **`TP=8, EP=8, CP=1, PP=1`** (model-parallel = 8, fits one
+  node; `train_DP=1`), so training is pinned to a **single node**.
+- `NUM_ACTOR_NODES = NUM_GEN_NODES + 1` → total nodes = `gen + 1` (default `8 + 1 = 9`;
+  8 generation nodes = 32 vLLM replicas at `vLLM_TP=2`).
+- Appends `++grpo.gen_benchmark_skip_training=true checkpointing.enabled=false`.
+- `EXP_SUFFIX` gets a `notrain-` tag.
+
+Everything else (model, data, `PPS=8/GPP=8/GBS=64`, agent settings, container) is
+unchanged, so the per-replica generation workload (`samples/replica = GBS / replicas
+= 64 / 32 = 2`) matches the full run.
+
+### How to verify the scaling is sound (wandb)
+Compare runs at different generation sizes (vary `NUM_GEN_NODES`) within one wandb
+group. The **per-replica** `generation_metrics/*` timelines should stay **flat**
+(invariant) as you add replicas — not grow with scale:
+
+| metric | expectation across scale |
+|--------|--------------------------|
+| `generation_metrics/*inflight_batch_sizes` | flat, low (≈1–3 per replica) |
+| `generation_metrics/*num_pending_samples` | ≈ 0 (no queue backlog) |
+| `generation_metrics/*kv_cache_usage_perc` | flat (≈8–10%) |
+| `generation_metrics/*generation_tokens` | flat per replica per window |
+| worker-trace count | equals the replica count (`gen_gpus / vLLM_TP`) |
+
+> Note: SWE rollouts are **agent / tool-execution-bound** (each sample is a multi-turn
+> OpenHands rollout in an apptainer sandbox), so per-replica inflight/KV stay low and
+> total throughput scales sub-linearly with GPUs — that is expected, not a regression.
+> Weights are frozen, so reward hovers around the init checkpoint's baseline (noisy on
+> small per-step sample counts); this mode is for **throughput/scaling**, not learning.
