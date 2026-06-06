@@ -246,8 +246,9 @@ def build_compute_domain_manifest(name: str, namespace: str) -> dict[str, Any]:
     }
 
 
-def build_roce_template_manifest(name: str, namespace: str) -> dict[str, Any]:
-    # TODO: expose roce count via infra config — hardcoded to 8 for now
+def build_roce_template_manifest(
+    name: str, namespace: str, count: int = 8
+) -> dict[str, Any]:
     return {
         "apiVersion": "resource.k8s.io/v1",
         "kind": "ResourceClaimTemplate",
@@ -262,7 +263,7 @@ def build_roce_template_manifest(name: str, namespace: str) -> dict[str, Any]:
                     "requests": [
                         {
                             "exactly": {
-                                "count": 8,
+                                "count": count,
                                 "deviceClassName": "roce.networking.k8s.aws",
                             },
                             "name": "roce",
