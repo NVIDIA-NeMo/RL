@@ -494,23 +494,32 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         class NeMoRLOpenAIServingChat(NeMoRLOpenAIServingMixin, OpenAIServingChat):
             pass
 
-        try:
-            from vllm.entrypoints.openai.serving_render import OpenAIServingRender
-
-            openai_serving_render = OpenAIServingRender(
-                models=openai_serving_models
-            )
-        except ImportError:
-            openai_serving_render = None
-
         serving_chat_default_kwargs = dict(
             response_role="assistant",
             request_logger=None,
             chat_template=None,
             chat_template_content_format="auto",
         )
-        if openai_serving_render is not None:
-            serving_chat_default_kwargs["openai_serving_render"] = openai_serving_render
+        try:
+            from vllm.entrypoints.openai.serving_render import OpenAIServingRender
+
+            serving_chat_default_kwargs["openai_serving_render"] = (
+                OpenAIServingRender(models=openai_serving_models)
+            )
+        except (ImportError, TypeError):
+            pass
+        try:
+            import inspect
+
+            chat_params = inspect.signature(
+                OpenAIServingChat.__init__
+            ).parameters
+            if "openai_serving_render" in chat_params:
+                serving_chat_default_kwargs.setdefault(
+                    "openai_serving_render", None
+                )
+        except Exception:
+            pass
         serving_chat_kwargs = serving_chat_default_kwargs | self.cfg["vllm_cfg"].get(
             "http_server_serving_chat_kwargs", dict()
         )
