@@ -434,6 +434,9 @@ def test_packed_sequences_with_distributed_runner(
     with proper code coverage tracking (unlike Ray-based tests).
     """
     world_size = tp_size * cp_size
+    if cp_size > 1:
+        pytest.importorskip("transformer_engine_torch")
+
     test_fn = functools.partial(
         _run_packed_sequences_equivalence,
         tp_size=tp_size,
