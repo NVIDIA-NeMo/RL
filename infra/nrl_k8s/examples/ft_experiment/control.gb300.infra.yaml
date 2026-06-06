@@ -141,7 +141,7 @@ launch:
     echo "[FAULT-SIM] Training exited with code \${EXIT_CODE}"
     exit \${EXIT_CODE}
 
-clusters:
+kuberay:
   training:
     name: ${user:}-raycluster-ft-experiment-control
     segmentSize: 2
