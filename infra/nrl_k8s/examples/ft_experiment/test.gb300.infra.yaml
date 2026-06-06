@@ -439,7 +439,7 @@ kuberay:
       disagg.nemo-rl/run: ft-experiment-test
       kai.scheduler/queue: backfill
     daemon:
-      submissionId: ft-experiment-test-gen-server
+      submissionId: ft-experiment-test-gen-server-v2
       # Code is at /opt/nemo-rl (mounted from Lustre); no upload needed.
       entrypoint: |
         set -eu
