@@ -144,7 +144,7 @@ launch:
 kuberay:
   training:
     name: ${user:}-raycluster-ft-experiment-control
-    segmentSize: 1
+    segmentSize: 2
     labels:
       disagg.nemo-rl/cluster: ft-experiment-control
       disagg.nemo-rl/run: ft-experiment-control
