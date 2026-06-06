@@ -603,6 +603,10 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             engine_client=serving_chat_kwargs["engine_client"],
             models=serving_chat_kwargs["models"],
         )
+        if "openai_serving_render" in serving_chat_kwargs:
+            serving_tokenization_kwargs["openai_serving_render"] = (
+                serving_chat_kwargs["openai_serving_render"]
+            )
         openai_serving_tokenization = NeMoRLOpenAIServingTokenization(
             **serving_tokenization_kwargs
         )
