@@ -190,9 +190,6 @@ _shared:
       cpu: "32"
       memory: "220Gi"
       nvidia.com/gpu: "1"
-    claims:
-      - {name: compute-domain-channel}
-      - {name: roce-channel}
 
   gpuHeadPorts: &gpu_head_ports
     - {containerPort: 6379,  name: gcs-server}
@@ -513,28 +510,12 @@ kuberay:
               nodeSelector: *worker_node_selector
               tolerations:
                 - operator: Exists
-              # Standard claim names; nrl-k8s rewrites resourceClaimTemplateName
-              # to per-cluster auto-created templates
-              # (compute-domain-{cluster_name}-generation /
-              # roce-{cluster_name}-generation). Same pattern as
-              # qwen3_30b_math_4n_4gpu.gb300.infra.yaml.
-              resourceClaims:
-                - name: compute-domain-channel
-                  resourceClaimTemplateName: compute-domain-${user:}-raycluster-gen-ft-experiment-test-generation
-                - name: roce-channel
-                  resourceClaimTemplateName: roce-${user:}-raycluster-gen-ft-experiment-test-generation
-              initContainers:
-                - name: roce-preflight
-                  image: nvcr.io/nvidian/nemo-rl@sha256:3802a9dc75cc9820b040a0dcef24b597e70d8dec265e6ac9f2aa2e8712b41b19
-                  command: ["/bin/bash", "/preflight/roce_preflight.sh"]
-                  resources:
-                    claims: [{name: roce-channel}]
-                    limits:   {cpu: "1", memory: "256Mi"}
-                    requests: {cpu: "100m", memory: "128Mi"}
-                  volumeMounts:
-                    - {name: roce-preflight-script, mountPath: /preflight}
-                  securityContext:
-                    capabilities: {add: [IPC_LOCK]}
+              # DRA claims removed from gen shards: TP=1 single-GPU pods
+              # don't need EFA/RoCE for intra-shard communication.
+              # Cross-cluster weight broadcast (train→gen) falls back to
+              # TCP when RoCE is unavailable — slower but functional.
+              # This avoids FailedCreatePodSandBox on nodes with broken
+              # EFA interfaces (ens* Link not found).
               containers:
                 - name: ray-worker
                   env: *shared_worker_env
