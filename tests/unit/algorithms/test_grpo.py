@@ -27,7 +27,10 @@ from nemo_rl.algorithms.advantage_estimator import (
 )
 from nemo_rl.algorithms.grpo import (
     MasterConfig,
+    _apply_configured_message_level_advantage_penalties,
+    _apply_message_level_advantage_penalties,
     _default_grpo_save_state,
+    _resolve_message_level_advantage_penalties,
     aggregate_rollout_metrics,
     async_grpo_train,
     compute_and_apply_seq_logprob_error_masking,
@@ -73,6 +76,173 @@ def _logged_train_metrics_with_key(logger, key: str):
         if call.kwargs.get("prefix") == "train" and key in metrics:
             return metrics
     raise AssertionError(f"No train metrics payload contained {key}")
+
+
+def test_apply_message_level_advantage_penalties_targets_flagged_message_spans():
+    train_data = BatchedDataDict(
+        {
+            "advantages": torch.tensor(
+                [
+                    [0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+                    [10.0, 11.0, 12.0, 13.0, 14.0, 15.0],
+                ]
+            )
+        }
+    )
+    repeated_batch = BatchedDataDict(
+        {
+            "message_log": [
+                [
+                    {
+                        "role": "user",
+                        "token_ids": torch.tensor([1, 2]),
+                        "is_invalid_tool_call": True,
+                    },
+                    {
+                        "role": "assistant",
+                        "token_ids": torch.tensor([3, 4]),
+                        "generation_logprobs": torch.tensor([0.1, 0.2]),
+                        "is_invalid_tool_call": True,
+                    },
+                    {
+                        "role": "assistant",
+                        "token_ids": torch.tensor([5, 6]),
+                        "generation_logprobs": torch.tensor([0.3, 0.4]),
+                    },
+                ],
+                [
+                    {
+                        "role": "user",
+                        "token_ids": torch.tensor([7]),
+                    },
+                    {
+                        "role": "assistant",
+                        "token_ids": torch.tensor([8, 9, 10]),
+                        "generation_logprobs": torch.tensor([0.5, 0.6, 0.7]),
+                        "has_malformed_thinking": True,
+                    },
+                    {
+                        "role": "assistant",
+                        "token_ids": torch.tensor([11, 12]),
+                        "generation_logprobs": torch.tensor([0.8, 0.9]),
+                    },
+                ],
+            ]
+        }
+    )
+    _apply_message_level_advantage_penalties(
+        train_data=train_data,
+        message_logs=repeated_batch["message_log"],
+        invalid_tool_call_advantage=-5.0,
+        malformed_thinking_advantage=-7.0,
+    )
+
+    expected = torch.tensor(
+        [
+            [0.0, 1.0, -5.0, -5.0, 4.0, 5.0],
+            [10.0, -7.0, -7.0, -7.0, 14.0, 15.0],
+        ]
+    )
+    torch.testing.assert_close(train_data["advantages"], expected)
+
+
+def test_apply_configured_message_level_advantage_penalties_noops_when_disabled():
+    train_data = BatchedDataDict(
+        {"advantages": torch.tensor([[1.0, 2.0]], dtype=torch.float32)}
+    )
+    message_logs = [
+        [
+            {
+                "role": "assistant",
+                "token_ids": torch.tensor([1, 2]),
+                "generation_logprobs": torch.tensor([0.1, 0.2]),
+                "is_invalid_tool_call": True,
+            }
+        ]
+    ]
+    master_config = MasterConfig.model_construct(grpo={})
+
+    with patch("nemo_rl.algorithms.grpo._should_use_nemo_gym") as should_use_nemo_gym:
+        _apply_configured_message_level_advantage_penalties(
+            train_data, message_logs, master_config
+        )
+
+    should_use_nemo_gym.assert_not_called()
+    torch.testing.assert_close(
+        train_data["advantages"], torch.tensor([[1.0, 2.0]], dtype=torch.float32)
+    )
+
+
+def test_apply_configured_message_level_advantage_penalties_uses_config(capsys):
+    train_data = BatchedDataDict(
+        {"advantages": torch.tensor([[0.0, 1.0, 2.0]], dtype=torch.float32)}
+    )
+    message_logs = [
+        [
+            {
+                "role": "user",
+                "token_ids": torch.tensor([1]),
+            },
+            {
+                "role": "assistant",
+                "token_ids": torch.tensor([2, 3]),
+                "generation_logprobs": torch.tensor([0.1, 0.2]),
+                "is_invalid_tool_call": True,
+            },
+        ]
+    ]
+    master_config = MasterConfig.model_construct(
+        grpo={
+            "invalid_tool_call_advantage": -4.0,
+            "malformed_thinking_advantage": -6.0,
+        }
+    )
+
+    with patch(
+        "nemo_rl.algorithms.grpo._should_use_nemo_gym", return_value=True
+    ) as should_use_nemo_gym:
+        _apply_configured_message_level_advantage_penalties(
+            train_data, message_logs, master_config, log_config=True
+        )
+
+    should_use_nemo_gym.assert_called_once_with(master_config)
+    torch.testing.assert_close(
+        train_data["advantages"], torch.tensor([[0.0, -4.0, -4.0]])
+    )
+    captured = capsys.readouterr()
+    assert "Invalid tool call advantage: -4.0" in captured.out
+    assert "Malformed thinking advantage: -6.0" in captured.out
+
+
+def test_resolve_message_level_advantage_penalties_requires_nemo_gym():
+    master_config = MasterConfig.model_construct(
+        grpo={"invalid_tool_call_advantage": -5.0}
+    )
+
+    with patch("nemo_rl.algorithms.grpo._should_use_nemo_gym", return_value=False):
+        with pytest.raises(AssertionError, match="NeMo-Gym path"):
+            _resolve_message_level_advantage_penalties(master_config)
+
+
+def test_raise_if_message_level_advantage_penalties_enabled_noops_when_unset():
+    from nemo_rl.algorithms.grpo_sync import (
+        _raise_if_message_level_advantage_penalties_enabled,
+    )
+
+    master_config = MasterConfig.model_construct(grpo={})
+    _raise_if_message_level_advantage_penalties_enabled(master_config)
+
+
+def test_raise_if_message_level_advantage_penalties_enabled_raises_when_set():
+    from nemo_rl.algorithms.grpo_sync import (
+        _raise_if_message_level_advantage_penalties_enabled,
+    )
+
+    master_config = MasterConfig.model_construct(
+        grpo={"invalid_tool_call_advantage": -5.0}
+    )
+    with pytest.raises(NotImplementedError, match="data_plane.enabled=true"):
+        _raise_if_message_level_advantage_penalties_enabled(master_config)
 
 
 def test_grpo_sync_seq_logprob_error_helper_accepts_dict_result(monkeypatch):

@@ -462,16 +462,19 @@ class ClippedPGLossFn(LossFunction):
         #                  IS ratio ∉ [min, max]; retained sequences keep
         #                  raw (non-truncated) token-level IS weights      (ref bounds: 0.999–1.002)
         #   Blog: https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda
+        # is_oob_ratio: fraction of tokens (tis/icepop) or sequences (seq-mask-tis)
+        # whose importance weight falls outside the truncation bounds. Each microbatch
+        # contributes its out-of-bounds count divided by the *global* valid token/seq
+        # count, so the np.sum aggregation in grpo.py recovers the correct global fraction.
         if self.truncated_importance_sampling_ratio is not None:
             if self.truncated_importance_sampling_type == "tis":
-                token_in_bounds = (
+                token_oob_mask = (
                     actor_importance_weights_expanded
-                    <= self.truncated_importance_sampling_ratio
+                    > self.truncated_importance_sampling_ratio
                 )
                 _is_filter_metrics = {
-                    "is_oob_ratio": 1.0
-                    - masked_mean(
-                        token_in_bounds.float(),
+                    "is_oob_ratio": masked_mean(
+                        token_oob_mask.float(),
                         mask,
                         global_normalization_factor=global_valid_toks,
                     ).item(),
@@ -489,9 +492,8 @@ class ClippedPGLossFn(LossFunction):
                     <= self.truncated_importance_sampling_ratio
                 )
                 _is_filter_metrics = {
-                    "is_oob_ratio": 1.0
-                    - masked_mean(
-                        token_kept_mask.float(),
+                    "is_oob_ratio": masked_mean(
+                        (~token_kept_mask).float(),
                         mask,
                         global_normalization_factor=global_valid_toks,
                     ).item(),
@@ -521,9 +523,8 @@ class ClippedPGLossFn(LossFunction):
                     & (seq_geomean_is_ratio <= self.truncated_importance_sampling_ratio)
                 ).float()  # [B]
                 _is_filter_metrics = {
-                    "is_oob_ratio": 1.0
-                    - masked_mean(
-                        seq_kept_mask,
+                    "is_oob_ratio": masked_mean(
+                        1.0 - seq_kept_mask,
                         sample_mask,
                         global_normalization_factor=global_valid_seqs,
                     ).item(),
