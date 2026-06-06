@@ -506,9 +506,7 @@ kuberay:
           rayStartParams: {num-gpus: "1", object-store-memory: "200000000"}
           template:
             metadata:
-              annotations:
-                kai.scheduler/topology: gb300-topology
-                kai.scheduler/topology-required-placement: nvidia.com/gpu.clique
+              annotations: {}
             spec:
               schedulerName: kai-scheduler
               dnsPolicy: ClusterFirst
