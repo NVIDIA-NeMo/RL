@@ -589,10 +589,10 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                         )
                     model_state_dict[name] = item
 
-                self.model.load_state_dict(self.reference_state_dict, strict=True)
-                # for name, item in self.reference_state_dict.items():
-                # if isinstance(item, torch.Tensor):
-                # self.model.state_dict()[name] = item.detach().to(device="cuda", non_blocking=True, copy=True)
+                # Swap reference model state_dict to self.model
+                for k, v in self.model.state_dict().items():
+                    if isinstance(v, torch.Tensor):
+                        v.copy_(self.reference_state_dict[k])
 
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
                     gc.collect()
@@ -604,11 +604,9 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
             finally:
                 # Restore original references and device placement
-                self.model.load_state_dict(model_state_dict, strict=True)
-                # for name, item in model_state_dict.items():
-                # if isinstance(item, torch.Tensor):
-                # item = item.detach().to(device="cuda", non_blocking=True, copy=True)
-                # self.model.state_dict()[name] = item
+                for k, v in self.model.state_dict().items():
+                    if isinstance(v, torch.Tensor):
+                        v.copy_(model_state_dict[k])
 
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
                     gc.collect()
@@ -1048,12 +1046,19 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             [self.model],
             show_progress=False,
             conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
-            merge_adapter_weights=False,  # skip the extra module walk looking for adapter weights
+            # vLLM serves the plain HF model, not PEFT wrapper modules. Merge
+            # LoRA deltas into exported base weights before refit so rollout
+            # workers receive the model keyspace they already loaded.
+            merge_adapter_weights=True,
         )
 
-        # Yield the original parameters first.
+        # Yield the original parameters first. Some Megatron-Bridge PEFT export
+        # paths can still expose wrapper names or adapter-only tensors after
+        # merging; normalize them for vLLM's plain-model state dict.
         for name, tensor in base_iter:
-            yield name, tensor
+            if ".adapter" in name or ".lora_" in name:
+                continue
+            yield name.replace(".base_layer", ""), tensor
 
         # Check whether FP8 KV cache is enabled.
         use_fp8_kv_cache = False
