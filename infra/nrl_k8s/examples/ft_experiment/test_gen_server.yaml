@@ -39,9 +39,6 @@ policy:
       enable_vllm_metrics_logger: true
       vllm_metrics_logger_interval: 0.5
       expose_http_server: true
-      http_server_serving_chat_kwargs:
-        enable_auto_tools: true
-        tool_parser: hermes
       load_format: dummy
     vllm_kwargs: {}
     router:
