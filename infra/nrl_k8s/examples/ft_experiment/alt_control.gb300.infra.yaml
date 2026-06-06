@@ -78,7 +78,7 @@ _shared:
         name: roce-preflight-script
         defaultMode: 493
 
-image: nvcr.io/nvidian/nemo-rl:nightly
+image: nvcr.io/nvidian/nemo-rl@sha256:3802a9dc75cc9820b040a0dcef24b597e70d8dec265e6ac9f2aa2e8712b41b19
 imagePullSecrets: [nvcr-secret]
 serviceAccount: nemo-rl-endpoint-registry
 
@@ -197,7 +197,7 @@ kuberay:
                   resourceClaimTemplateName: PLACEHOLDER
               initContainers:
                 - name: roce-preflight
-                  image: nvcr.io/nvidian/nemo-rl:nightly
+                  image: nvcr.io/nvidian/nemo-rl@sha256:3802a9dc75cc9820b040a0dcef24b597e70d8dec265e6ac9f2aa2e8712b41b19
                   command: ["/bin/bash", "/preflight/roce_preflight.sh"]
                   resources:
                     claims: [{name: roce-channel}]

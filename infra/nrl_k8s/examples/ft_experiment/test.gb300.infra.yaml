@@ -251,7 +251,7 @@ _shared:
         defaultMode: 493  # 0755 — needs to be exec'able
 
 # namespace auto-inferred from kube context (default).
-image: nvcr.io/nvidian/nemo-rl:nightly
+image: nvcr.io/nvidian/nemo-rl@sha256:3802a9dc75cc9820b040a0dcef24b597e70d8dec265e6ac9f2aa2e8712b41b19
 imagePullSecrets: [nvcr-secret]
 serviceAccount: nemo-rl-endpoint-registry
 
@@ -397,7 +397,7 @@ kuberay:
                   resourceClaimTemplateName: roce-${user:}-raycluster-gen-ft-experiment-test-generation
               initContainers:
                 - name: roce-preflight
-                  image: nvcr.io/nvidian/nemo-rl:nightly
+                  image: nvcr.io/nvidian/nemo-rl@sha256:3802a9dc75cc9820b040a0dcef24b597e70d8dec265e6ac9f2aa2e8712b41b19
                   command: ["/bin/bash", "/preflight/roce_preflight.sh"]
                   resources:
                     claims: [{name: shared-roce}]
@@ -527,7 +527,7 @@ kuberay:
                   resourceClaimTemplateName: roce-${user:}-raycluster-gen-ft-experiment-test-generation
               initContainers:
                 - name: roce-preflight
-                  image: nvcr.io/nvidian/nemo-rl:nightly
+                  image: nvcr.io/nvidian/nemo-rl@sha256:3802a9dc75cc9820b040a0dcef24b597e70d8dec265e6ac9f2aa2e8712b41b19
                   command: ["/bin/bash", "/preflight/roce_preflight.sh"]
                   resources:
                     claims: [{name: roce-channel}]
