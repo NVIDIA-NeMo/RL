@@ -252,10 +252,9 @@ def forward_step_value(
     return output_tensor, loss_fn_wrapped
 
 
-@ray.remote(
-    runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker")
-)  # pragma: no cover
-class MegatronValueWorker(AbstractPolicyWorker):
+# Classes with @ray.remote can't be inherited from, so we split the implementation out.
+# This is useful when using worker extension classes.
+class MegatronValueWorkerImpl(AbstractPolicyWorker):
     """Megatron-Core based value function worker for PPO.
 
     This worker wraps a Megatron-Core GPT model backbone with a value head
@@ -1084,3 +1083,10 @@ class MegatronValueWorker(AbstractPolicyWorker):
 
         gc.collect()
         torch.cuda.empty_cache()
+
+
+@ray.remote(
+    runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker")
+)  # pragma: no cover
+class MegatronValueWorker(MegatronValueWorkerImpl):
+    pass

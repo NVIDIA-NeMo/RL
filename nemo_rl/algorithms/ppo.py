@@ -1366,10 +1366,7 @@ def ppo_train(
                             greedy=False,
                         )
                     policy_generation.finish_generation()
-                    if policy_generation is not None:
-                        generation_logger_metrics = (
-                            policy_generation.get_logger_metrics()
-                        )
+                    generation_logger_metrics = policy_generation.get_logger_metrics()
 
                     metrics_logging_data["mean_gen_tokens_per_sample"] = (
                         rollout_metrics["mean_gen_tokens_per_sample"]
@@ -1861,7 +1858,6 @@ def ppo_train(
                                 tokenizer_path=os.path.join(
                                     checkpoint_path, "value", "tokenizer"
                                 ),
-                                checkpointing_cfg=master_config.checkpointing,
                             )
                             value_model.finish_training()
 
