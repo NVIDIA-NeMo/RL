@@ -52,8 +52,6 @@ from nemo_rl.utils.config import (
     parse_hydra_overrides,
     register_omegaconf_resolvers,
 )
-from nemo_rl.utils.logger import log_container_init_timing
-from nemo_rl.utils.timer import Timer
 
 
 def parse_args():
@@ -76,20 +74,14 @@ def parse_args():
 
 
 def main():
-    main_start = time.perf_counter()
-    log_container_init_timing()
-
-    gen_timer = Timer(context={"worker": "gen_daemon"})
-
     register_omegaconf_resolvers()
     args, overrides = parse_args()
 
     # Load config
-    with gen_timer.time("config"):
-        config = load_config(args.config)
-        if overrides:
-            config = parse_hydra_overrides(config, overrides)
-        config = OmegaConf.to_container(config, resolve=True)
+    config = load_config(args.config)
+    if overrides:
+        config = parse_hydra_overrides(config, overrides)
+    config = OmegaConf.to_container(config, resolve=True)
 
     print("Standalone Generation Server — config:")
     pprint.pprint(config)
@@ -108,13 +100,11 @@ def main():
     generation_config["colocated"]["enabled"] = False
 
     # Initialize Ray
-    with gen_timer.time("ray_connect"):
-        init_ray()
+    init_ray()
 
     # Setup tokenizer and configure generation
-    with gen_timer.time("tokenizer"):
-        tokenizer = get_tokenizer(policy_config["tokenizer"])
-        generation_config = configure_generation_config(generation_config, tokenizer)
+    tokenizer = get_tokenizer(policy_config["tokenizer"])
+    generation_config = configure_generation_config(generation_config, tokenizer)
 
     # Detect available GPUs from the Ray cluster. Count only GPU-capable Ray nodes,
     # since KubeRay head pods are often CPU-only and would otherwise skew the division.
@@ -169,12 +159,11 @@ def main():
 
     # Create VllmGeneration (spawns Ray actor workers on GPU nodes)
     print("Initializing VllmGeneration...")
-    with gen_timer.time("vllm_init"):
-        generation = VllmGeneration(cluster=cluster, config=generation_config)
-        generation.finish_generation()  # Reset prefix cache, matches grpo.py init_vllm() pattern
-    print(f"VllmGeneration initialized in {gen_timer.get_latest_elapsed('vllm_init'):.1f}s")
+    t0 = time.perf_counter()
+    generation = VllmGeneration(cluster=cluster, config=generation_config)
+    generation.finish_generation()  # Reset prefix cache, matches grpo.py init_vllm() pattern
+    print(f"VllmGeneration initialized in {time.perf_counter() - t0:.1f}s")
 
-    gen_timer.start("router_init")
     # `policy.generation.router` lets the recipe override health-poll +
     # cordon thresholds without code changes. Defaults live in
     # GenerationRouter.__init__; only overrides take effect.
@@ -240,7 +229,6 @@ def main():
         generation=generation,
     )
     router.start()
-    gen_timer.stop("router_init")
     router_url = f"http://{_get_node_ip_local()}:{router.port}"
 
     # Register in K8s endpoint registry if disagg_job_id is set
@@ -269,16 +257,6 @@ def main():
             json.dumps(generation.dp_openai_server_base_urls),
         )
         print(f"Registered in K8sEndpointRegistry (job_id={disagg_job_id})")
-
-    gen_timer.record("total", time.perf_counter() - main_start)
-
-    gen_init_metrics = gen_timer.get_timing_metrics(reduction_op="sum")
-    print("\n" + "=" * 60)
-    print(" " * 14 + "GEN SERVER INIT TIMING BREAKDOWN")
-    for label, value in sorted(gen_init_metrics.items()):
-        if isinstance(value, (int, float)):
-            print(f"  {label}: {value:.1f}s")
-    print("=" * 60 + "\n", flush=True)
 
     print(
         f"\nGeneration server ready.\n"
