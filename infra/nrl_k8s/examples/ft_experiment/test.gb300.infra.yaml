@@ -167,12 +167,12 @@ _shared:
   # weights between train and gen ranks (MNNVL spans the shared CD).
   gpuWorkerResources: &gpu_worker_resources
     limits:
-      cpu: "132"
-      memory: "900Gi"
+      cpu: "100"
+      memory: "700Gi"
       nvidia.com/gpu: "4"
     requests:
-      cpu: "120"
-      memory: "850Gi"
+      cpu: "80"
+      memory: "650Gi"
       nvidia.com/gpu: "4"
     claims:
       - {name: shared-compute-domain}
