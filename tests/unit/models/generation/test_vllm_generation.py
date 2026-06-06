@@ -2788,12 +2788,12 @@ def test_vllm_megatron_pipeline_parallel(cluster, tokenizer):
             }
         )
 
-        print("Creating Megatron policy with PP=2...")
-        megatron_policy = Policy(cluster, megatron_config, test_tokenizer)
-
         print("Creating vLLM policy...")
         vllm_policy = VllmGeneration(cluster, vllm_config)
         vllm_policy.finish_generation()
+
+        print("Creating Megatron policy with PP=2...")
+        megatron_policy = Policy(cluster, megatron_config, test_tokenizer)
 
         print("preparing refit info...")
         state_dict_info = megatron_policy.prepare_refit_info()

@@ -383,6 +383,8 @@ def test_sequence_packing_fusion_vs_baseline(distributed_test_runner, cp_tp):
     for different CP and TP configurations.
     """
     cp_size, tp_size = cp_tp
+    if cp_size > 1:
+        pytest.importorskip("transformer_engine_torch")
     world_size = cp_size * tp_size
 
     test_fn = functools.partial(
@@ -408,6 +410,8 @@ def test_sequence_packing_fusion_vs_baseline_with_sampling_params(
 ):
     """Compare fused vs unfused wrappers with top-k/top-p sampling params."""
     cp_size, tp_size = cp_tp
+    if cp_size > 1:
+        pytest.importorskip("transformer_engine_torch")
     world_size = cp_size * tp_size
 
     test_fn = functools.partial(

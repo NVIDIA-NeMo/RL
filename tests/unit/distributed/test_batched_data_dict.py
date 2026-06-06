@@ -711,6 +711,24 @@ def test_from_batches_keeps_optional_keys_missing_only_from_empty_batches():
         BatchedDataDict.from_batches([non_empty_batch, non_empty_missing_optional_key])
 
 
+def test_from_batches_keeps_keys_missing_from_empty_mapping():
+    empty_batch = BatchedDataDict()
+    routed_experts = torch.arange(1 * 3 * 2 * 2, dtype=torch.int32).reshape(1, 3, 2, 2)
+    non_empty_batch = BatchedDataDict(
+        {
+            "output_ids": torch.tensor([[1, 2, 3]], dtype=torch.long),
+            "generation_lengths": torch.tensor([3], dtype=torch.long),
+            "routed_experts": routed_experts,
+        }
+    )
+
+    stacked = BatchedDataDict.from_batches([empty_batch, non_empty_batch])
+
+    assert torch.equal(stacked["output_ids"], non_empty_batch["output_ids"])
+    assert torch.equal(stacked["generation_lengths"], torch.tensor([3]))
+    assert torch.equal(stacked["routed_experts"], routed_experts)
+
+
 @pytest.mark.parametrize("pad_to_multiple_of", [1, 32, 64, 256])
 def test_sequence_packing_microbatch_boundaries(pad_to_multiple_of):
     """Test that microbatch boundaries are correctly maintained across chunks with random sequences."""
