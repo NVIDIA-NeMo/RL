@@ -194,13 +194,60 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
             self._start_vllm_metrics_logger()
 
+    # vLLM histogram metrics captured for per-step latency reporting.
+    _LATENCY_HIST_NAMES: frozenset[str] = frozenset(
+        {
+            "vllm:request_queue_time_seconds",
+            "vllm:request_prefill_time_seconds",
+            "vllm:request_decode_time_seconds",
+            "vllm:request_inference_time_seconds",
+            "vllm:time_to_first_token_seconds",
+            "vllm:time_per_output_token_seconds",
+            "vllm:e2e_request_latency_seconds",
+        }
+    )
+
+    @staticmethod
+    def _hist_percentiles(
+        buckets: dict[str, int], total_count: int, percentiles: tuple[int, ...]
+    ) -> list[float]:
+        """Interpolate percentile values from a cumulative histogram."""
+        import math
+
+        if total_count <= 0:
+            return [math.nan] * len(percentiles)
+        sorted_bounds = sorted((float(k), v) for k, v in buckets.items() if k != "+Inf")
+        results: list[float] = []
+        for p in percentiles:
+            target = p / 100.0 * total_count
+            cumulative = 0.0
+            prev_bound = 0.0
+            found = False
+            for bound, count in sorted_bounds:
+                cumulative += count
+                if cumulative >= target:
+                    deficit = target - (cumulative - count)
+                    frac = deficit / count if count > 0 else 0.0
+                    results.append(prev_bound + frac * (bound - prev_bound))
+                    found = True
+                    break
+                prev_bound = bound
+            if not found:
+                results.append(prev_bound)
+        return results
+
     def _start_vllm_metrics_logger(self) -> None:
         """Start a background thread that periodically collects vLLM logger metrics.
 
         Controlled by vllm_metrics_logger_interval (default: 0.5) in vllm_cfg.
         Runs only on the model-owner actor.
         """
-        from vllm.v1.metrics.reader import Gauge, Counter, get_metrics_snapshot
+        from vllm.v1.metrics.reader import (
+            Counter,
+            Gauge,
+            Histogram,
+            get_metrics_snapshot,
+        )
 
         assert self.cfg["vllm_cfg"].get("async_engine", False), (
             "vLLM metrics logger is only supported with async engine enabled"
@@ -225,6 +272,11 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         self.num_pending_samples: list[int] = []
         self.kv_cache_usage_perc: list[float] = []
         self.generation_tokens: list[int] = []
+        # Cumulative histogram snapshots: name -> {count, sum, buckets}.
+        # _hist_latest is the most-recent sample; _hist_baseline is the snapshot
+        # at the last clear_vllm_logger_metrics() call, used to compute per-step deltas.
+        self._hist_latest: dict[str, dict] = {}
+        self._hist_baseline: dict[str, dict] = {}
 
         def _logger_loop():
             # Delay a little to let engine settle
@@ -246,6 +298,13 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                             elif isinstance(m, Counter):
                                 if m.name == "vllm:generation_tokens":
                                     self.generation_tokens.append(int(m.value))
+                            elif isinstance(m, Histogram):
+                                if m.name in self._LATENCY_HIST_NAMES:
+                                    self._hist_latest[m.name] = {
+                                        "count": m.count,
+                                        "sum": m.sum,
+                                        "buckets": dict(m.buckets),
+                                    }
                 except Exception:
                     print(
                         "⚠️[vLLM Metric Logger] Exception in vLLM metrics logger",
@@ -269,12 +328,38 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             return {}
 
         with self._vllm_metrics_lock:
-            metric = {
+            metric: dict[str, Any] = {
                 "inflight_batch_sizes": copy.deepcopy(self.inflight_batch_sizes),
                 "num_pending_samples": copy.deepcopy(self.num_pending_samples),
                 "kv_cache_usage_perc": copy.deepcopy(self.kv_cache_usage_perc),
                 "generation_tokens": copy.deepcopy(self.generation_tokens),
             }
+            # Compute per-step latency stats from cumulative histogram deltas.
+            request_latencies: dict[str, dict[str, float]] = {}
+            for name, snap in self._hist_latest.items():
+                baseline = self._hist_baseline.get(
+                    name, {"count": 0, "sum": 0.0, "buckets": {}}
+                )
+                delta_count = snap["count"] - baseline["count"]
+                delta_sum = snap["sum"] - baseline["sum"]
+                if delta_count <= 0:
+                    continue
+                delta_buckets = {
+                    k: snap["buckets"].get(k, 0) - baseline["buckets"].get(k, 0)
+                    for k in snap["buckets"]
+                }
+                p50, p95, p99 = self._hist_percentiles(
+                    delta_buckets, delta_count, (50, 95, 99)
+                )
+                short_name = name.removeprefix("vllm:")
+                request_latencies[short_name] = {
+                    "mean": delta_sum / delta_count,
+                    "p50": p50,
+                    "p95": p95,
+                    "p99": p99,
+                    "count": float(delta_count),
+                }
+            metric["request_latencies"] = request_latencies
         return metric
 
     def clear_vllm_logger_metrics(self) -> None:
@@ -286,6 +371,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             self.num_pending_samples = []
             self.kv_cache_usage_perc = []
             self.generation_tokens = []
+            self._hist_baseline = copy.deepcopy(self._hist_latest)
 
     async def post_init_async(self):
         self.vllm_device_ids = await self.report_device_id_async()

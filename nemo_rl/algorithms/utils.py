@@ -828,7 +828,7 @@ def print_performance_metrics(
 
 
 def log_generation_metrics_to_wandb(
-    generation_logger_metrics: dict[str, dict[int, list[Any]]],
+    generation_logger_metrics: dict[str, Any],
     step: int,
     timeline_interval: float,
     logger: Logger,
@@ -841,11 +841,30 @@ def log_generation_metrics_to_wandb(
         timeline_interval: Interval between timeline points (in seconds)
         logger: Logger instance
     """
-    for generation_metric in generation_logger_metrics.keys():
-        logger.log_plot_per_worker_timeline_metrics(
-            generation_logger_metrics[generation_metric],
-            step=step,
-            prefix="generation_metrics",
-            name=generation_metric,
-            timeline_interval=timeline_interval,
-        )
+    _timeline_keys = {
+        "inflight_batch_sizes",
+        "num_pending_samples",
+        "kv_cache_usage_perc",
+        "generation_tokens",
+    }
+    for generation_metric, metric_data in generation_logger_metrics.items():
+        if generation_metric == "request_latencies":
+            # Log per-step latency scalars (mean/p50/p95/p99) for each histogram metric.
+            for latency_name, stats in metric_data.items():
+                for stat_name, value in stats.items():
+                    if stat_name == "count":
+                        continue
+                    logger.log(
+                        {
+                            f"generation_metrics/latency/{latency_name}/{stat_name}": value
+                        },
+                        step,
+                    )
+        elif generation_metric in _timeline_keys:
+            logger.log_plot_per_worker_timeline_metrics(
+                metric_data,
+                step=step,
+                prefix="generation_metrics",
+                name=generation_metric,
+                timeline_interval=timeline_interval,
+            )

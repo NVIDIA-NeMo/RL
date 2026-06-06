@@ -843,12 +843,17 @@ class VllmGeneration(GenerationInterface):
             dp_indices.append(dp_idx)
 
         results = ray.get(futures)
-        vllm_logger_metrics: dict[str, dict[int, list[Any]]] = {
+        vllm_logger_metrics: dict[str, Any] = {
             "inflight_batch_sizes": {},  # dp_idx -> list[int]
             "num_pending_samples": {},  # dp_idx -> list[int]
             "kv_cache_usage_perc": {},  # dp_idx -> list[float]
             "generation_tokens": {},  # dp_idx -> list[int]
+            # Averaged latency histograms: metric_name -> {mean/p50/p95/p99/count}
+            "request_latencies": {},
         }
+
+        # Accumulate per-worker request_latencies for averaging.
+        latency_accum: dict[str, dict[str, list[float]]] = {}
 
         for dp_idx, stats in zip(dp_indices, results):
             if not stats:
@@ -867,6 +872,19 @@ class VllmGeneration(GenerationInterface):
             generation_tokens = stats.get("generation_tokens")
             if generation_tokens:
                 vllm_logger_metrics["generation_tokens"][dp_idx] = generation_tokens
+            for metric_name, vals in stats.get("request_latencies", {}).items():
+                if metric_name not in latency_accum:
+                    latency_accum[metric_name] = {k: [] for k in vals}
+                for k, v in vals.items():
+                    latency_accum[metric_name][k].append(v)
+
+        # Average latency stats across DP workers that reported data.
+        for metric_name, field_lists in latency_accum.items():
+            if not field_lists.get("count"):
+                continue
+            vllm_logger_metrics["request_latencies"][metric_name] = {
+                k: sum(vs) / len(vs) for k, vs in field_lists.items() if vs
+            }
 
         return vllm_logger_metrics
 
