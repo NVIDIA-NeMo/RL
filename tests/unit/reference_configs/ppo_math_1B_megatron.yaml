@@ -69,8 +69,7 @@ loss_fn:
   # VAPO: NLL loss on correct samples. 0 = disabled.
   positive_example_nll_weight: 0.0  # VAPO: 0.1
 
-# MSE loss applied to the value model (PPO critic). Required when running PPO with GAE.
-value_loss:
+value_loss_fn:
   scale: 0.4
   cliprange: 0.2
 

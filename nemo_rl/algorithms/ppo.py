@@ -15,7 +15,6 @@ import gc
 import os
 import time
 import warnings
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
@@ -32,6 +31,7 @@ from nemo_rl.algorithms.advantage_estimator import (
     RawRewardAdvantageEstimator,
 )
 from nemo_rl.algorithms.grpo import (
+    RewardScalingConfig,
     _should_log_nemo_gym_responses,
     _should_use_async_rollouts,
     _should_use_nemo_gym,
@@ -86,37 +86,6 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
-class RewardScalingConfig(TypedDict):
-    """Configure linear reward scaling with clamping.
-
-    When `enabled` is True, each reward is clamped to the source interval
-    [source_min, source_max] and linearly mapped to the target interval
-    [target_min, target_max]. Refer to the scale_rewards function for the implementation.
-
-    Defaults:
-        source_min=0.0, source_max=1.0, target_min=0.0, target_max=1.0
-    """
-
-    enabled: bool
-    source_min: NotRequired[float]
-    source_max: NotRequired[float]
-    target_min: NotRequired[float]
-    target_max: NotRequired[float]
-
-
-class AsyncPPOConfig(TypedDict):
-    enabled: bool
-    # Maximum trajectory age in training steps for samples drawn from the
-    # async replay buffer. Trajectories older than this are excluded during
-    # sampling; buffer sizing also scales with this value.
-    max_trajectory_age_steps: int
-    # Does the weight synchronization as soon as the training is done
-    # without waiting for the pending generations to finish.
-    in_flight_weight_updates: NotRequired[bool]
-    # Recomputes the KV cache after the in-flight weight updates.
-    recompute_kv_cache_after_weight_updates: NotRequired[bool]
-
-
 class AdvEstimatorConfig(TypedDict):
     """Configuration for PPO advantage estimator (GAE or raw_reward)."""
 
@@ -147,7 +116,6 @@ class PPOConfig(TypedDict):
     max_val_samples: int
     skip_reference_policy_logprobs_calculation: NotRequired[bool]
     seed: int
-    async_ppo: NotRequired[AsyncPPOConfig]
     overlong_filtering: NotRequired[bool]
     # whether to enable dynamic sampling, i.e.
     # whether to discard prompts whose rewards have zero standard deviation
@@ -201,7 +169,7 @@ class MasterConfig(BaseModel, extra="allow"):
     policy: PolicyConfig
     value: Optional[ValueConfig] = None
     loss_fn: ClippedPGLossConfig
-    value_loss: Optional[MseValueLossConfig] = None
+    value_loss_fn: Optional[MseValueLossConfig] = None
     env: dict[str, Any]
     data: DataConfig
     ppo: PPOConfig
@@ -224,7 +192,7 @@ def setup(
 ) -> tuple[
     ColocatablePolicyInterface,
     Optional[GenerationInterface],
-    Optional[ValueInterface],
+    ValueInterface,
     tuple[RayVirtualCluster, RayVirtualCluster],
     StatefulDataLoader,
     Optional[StatefulDataLoader],
@@ -367,10 +335,10 @@ def setup(
     #        Loss Function
     # ==========================
     loss_fn = ClippedPGLossFn(loss_config)
-    assert master_config.value_loss is not None, (
-        "PPO requires the `value_loss:` config block to construct the MSE value loss."
+    assert master_config.value_loss_fn is not None, (
+        "PPO requires the `value_loss_fn:` config block to construct the MSE value loss."
     )
-    value_loss_fn = MseValueLossFn(master_config.value_loss)
+    value_loss_fn = MseValueLossFn(master_config.value_loss_fn)
 
     # Validate force_on_policy_ratio
     if loss_config.force_on_policy_ratio:
@@ -389,6 +357,17 @@ def setup(
     # ==========================
     print("\n▶ Setting up compute cluster...", flush=True)
     colocated_inference = generation_config["colocated"]["enabled"]
+    assert colocated_inference, (
+        "PPO currently requires colocated generation (vLLM / SGLang sharing GPUs "
+        "with the policy worker). Set policy.generation.colocated.enabled=true. "
+        "Non-colocated PPO is not yet supported."
+    )
+    assert value_config is not None, (
+        "PPO requires a `value:` config block (actor-critic with value model)."
+    )
+    assert master_config.value_loss_fn is not None, (
+        "PPO requires a `value_loss_fn:` config block for the MSE value loss."
+    )
     reward_model_enabled = (
         "env_name" in data_config and data_config["env_name"] == "reward_model"
     )
@@ -673,100 +652,38 @@ def setup(
         Returns:
             Tuple of (policy_generation, policy)
         """
-        # Determine if parallel initialization is possible (non-colocated mode)
-        use_parallel_init = not colocated_inference
+        # Initialize generation engine first so it claims its GPU memory
+        # before policy/value workers are constructed; then policy, then value.
+        print("  ⚙️  Initializing workers (colocated mode)", flush=True)
 
-        if use_parallel_init:
-            # Parallel initialization: Generation engine and Policy can initialize simultaneously
-            print(
-                "  ⚡ Using parallel worker initialization (non-colocated mode)",
-                flush=True,
-            )
+        policy_generation, generation_time = init_generation_fn()
+        worker_init_timing_metrics[init_time_key] = generation_time
 
-            # Execute both initializations in parallel
-            parallel_start_time = time.perf_counter()
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                generation_future = executor.submit(init_generation_fn)
-                policy_future = executor.submit(init_policy)
-                policy_generation, generation_time = generation_future.result()
-                policy, policy_time = policy_future.result()
-            parallel_wall_time = time.perf_counter() - parallel_start_time
+        policy, policy_time = init_policy()
+        # Block until the policy worker's __init__ completes and offload to
+        # CPU, freeing GPU for value model initialization. Policy will be
+        # reloaded before the vLLM refit step below.
+        policy.finish_training()
+        worker_init_timing_metrics["policy_init_time_s"] = policy_time
 
-            # Store timing metrics
-            worker_init_timing_metrics[init_time_key] = generation_time
-            worker_init_timing_metrics["policy_init_time_s"] = policy_time
-            worker_init_timing_metrics["parallel_wall_time_s"] = parallel_wall_time
-            worker_init_timing_metrics["parallel_init_enabled"] = True
-
-            # Value model is not yet supported in non-colocated mode (the
-            # parallel-init ThreadPoolExecutor only has slots for policy and
-            # generation). Fail loudly if a value_config was passed so users
-            # don't silently fall back to actor-only training.
-            assert value_config is None, (
-                "Value model is not yet supported in non-colocated mode. "
-                "Either set generation.colocated.enabled=true or remove the "
-                "'value' config block."
-            )
-            value_model = None
-
-        else:
-            # Sequential initialization: colocated mode (GPU memory requires generation engine first)
-            print(
-                "  ⚙️  Using sequential worker initialization (colocated mode)",
-                flush=True,
-            )
-
-            # Initialize generation engine first (clean GPU memory), then policy
-            policy_generation, generation_time = init_generation_fn()
-            worker_init_timing_metrics[init_time_key] = generation_time
-
-            policy, policy_time = init_policy()
-            # Block until the policy worker's __init__ completes and offload
-            # to CPU, freeing GPU for value model initialization.
-            # Policy will be reloaded before the vLLM refit step below.
-            policy.finish_training()
-            worker_init_timing_metrics["policy_init_time_s"] = policy_time
-            worker_init_timing_metrics["parallel_init_enabled"] = 0.0
-
-            # Initialize value model if configured (for GAE in colocated mode)
-            if value_config is not None:
-                print("  ⚙️  Initializing value model for GAE...", flush=True)
-                value_model, value_time = init_value()
-                # Block until the value worker's __init__ completes and offload
-                # model + optimizer to CPU. Without this, __init__ runs
-                # asynchronously in the Ray actor and may overlap with vLLM
-                # generation, causing GPU OOM.
-                value_model.finish_training()
-                worker_init_timing_metrics["value_init_time_s"] = value_time
-                print(f"  ✓ Value model initialized in {value_time:.2f}s", flush=True)
-            else:
-                value_model = None
+        print("  ⚙️  Initializing value model for GAE...", flush=True)
+        value_model, value_time = init_value()
+        # Block until the value worker's __init__ completes and offload
+        # model + optimizer to CPU. Without this, __init__ runs asynchronously
+        # in the Ray actor and may overlap with vLLM generation, causing
+        # GPU OOM.
+        value_model.finish_training()
+        worker_init_timing_metrics["value_init_time_s"] = value_time
+        print(f"  ✓ Value model initialized in {value_time:.2f}s", flush=True)
 
         return policy_generation, policy, value_model
 
-    # Handle generation-specific setup
-    if backend == "megatron":
-        # Megatron generation: policy_generation is None, only initialize policy
-        policy_generation = None
-        print(
-            f"  ✓ Using {backend} backend for generation with {policy_config['model_name']}",
-            flush=True,
-        )
+    assert backend in ("vllm", "sglang"), (
+        f"PPO requires vllm or sglang generation backend; got {backend!r}. "
+        "The megatron generation backend is not supported."
+    )
 
-        policy, policy_time = init_policy()
-        worker_init_timing_metrics["policy_init_time_s"] = policy_time
-
-        # Value model is not yet supported with the megatron generation backend.
-        # Same rationale as the non-colocated assert above: fail loudly instead
-        # of silently dropping the user's value_config.
-        assert value_config is None, (
-            "Value model is not yet supported with the megatron generation "
-            "backend. Use the vllm or sglang backend, or remove the 'value' "
-            "config block."
-        )
-        value_model = None
-
-    elif backend == "vllm":
+    if backend == "vllm":
         # vLLM generation: setup config, then initialize with policy
         generation_config = cast(VllmConfig, generation_config)
         if generation_config["vllm_cfg"]["precision"] == "fp8":
@@ -1130,7 +1047,7 @@ def _create_advantage_estimator(master_config: MasterConfig):
 def ppo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
-    value_model: Optional[ValueInterface],
+    value_model: ValueInterface,
     dataloader: StatefulDataLoader,
     val_dataloader: Optional[StatefulDataLoader],
     tokenizer: TokenizerType,
@@ -1150,19 +1067,7 @@ def ppo_train(
     - GAE advantage estimation with value bootstrap
     - Multiple training steps per rollout (steps_per_epoch)
     - Configurable policy training start epoch
-
-    Note: only synchronous PPO is implemented. The ``async_ppo`` config schema
-    exists as a scaffold for future work but is not wired up yet.
     """
-    if master_config.ppo.get("async_ppo", {}).get(  # pragma: no cover
-        "enabled", False
-    ):
-        raise NotImplementedError(
-            "Async PPO is not implemented yet. The async_ppo config schema "
-            "exists as a placeholder; remove or set async_ppo.enabled=false "
-            "to run synchronous PPO."
-        )
-
     timer = Timer()
     timeout = TimeoutChecker(
         timeout=master_config.checkpointing["checkpoint_must_save_by"],
@@ -1440,15 +1345,13 @@ def ppo_train(
 
                     metrics_logging_data["content"] = flat_messages["content"]
 
-                # PPO: Value model inference (skip when no value model)
-                if value_model is not None:
-                    memory_tracker.snapshot_start_of_stage("Value inference", dir())
-                    print("▶ Computing values...", flush=True)
-                    with timer.time("value_inference"):
-                        value_model.prepare_for_inference()
-                        values = value_model.get_values(train_data)
-                        train_data["values"] = values["values"].squeeze(-1)
-                        value_model.finish_inference()
+                memory_tracker.snapshot_start_of_stage("Value inference", dir())
+                print("▶ Computing values...", flush=True)
+                with timer.time("value_inference"):
+                    value_model.prepare_for_inference()
+                    values = value_model.get_values(train_data)
+                    train_data["values"] = values["values"].squeeze(-1)
+                    value_model.finish_inference()
 
                 print(
                     f"  • Average batch reward: {rewards.mean().numpy():.4f}\n"
@@ -1534,21 +1437,19 @@ def ppo_train(
                         flush=True,
                     )
 
-                    # Train value model first (critic before actor, matching veRL)
-                    value_results = None
-                    if value_model is not None:
-                        with timer.time("value_training_prep"):
-                            value_model.prepare_for_training()
+                    # Train value model first (critic before actor, matching veRL).
+                    with timer.time("value_training_prep"):
+                        value_model.prepare_for_training()
 
-                        with timer.time("value_training"):
-                            print("▶ Training value...", flush=True)
-                            value_results = value_model.train(
-                                train_data,
-                                value_loss_fn,
-                                timer=timer,
-                            )
+                    with timer.time("value_training"):
+                        print("▶ Training value...", flush=True)
+                        value_results = value_model.train(
+                            train_data,
+                            value_loss_fn,
+                            timer=timer,
+                        )
 
-                            value_model.finish_training()
+                        value_model.finish_training()
 
                     train_results = None
                     if total_steps >= policy_training_start_step:
@@ -1846,20 +1747,19 @@ def ppo_train(
                                 flush=True,
                             )
 
-                        if value_model is not None:
-                            value_model.prepare_for_training()
-                            value_model.save_checkpoint(
-                                weights_path=os.path.join(
-                                    checkpoint_path, "value", "weights"
-                                ),
-                                optimizer_path=os.path.join(
-                                    checkpoint_path, "value", "optimizer"
-                                ),
-                                tokenizer_path=os.path.join(
-                                    checkpoint_path, "value", "tokenizer"
-                                ),
-                            )
-                            value_model.finish_training()
+                        value_model.prepare_for_training()
+                        value_model.save_checkpoint(
+                            weights_path=os.path.join(
+                                checkpoint_path, "value", "weights"
+                            ),
+                            optimizer_path=os.path.join(
+                                checkpoint_path, "value", "optimizer"
+                            ),
+                            tokenizer_path=os.path.join(
+                                checkpoint_path, "value", "tokenizer"
+                            ),
+                        )
+                        value_model.finish_training()
 
                         torch.save(
                             dataloader.state_dict(),

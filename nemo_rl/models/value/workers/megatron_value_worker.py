@@ -310,13 +310,15 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
         # Adapt it once and cache it — the result is deterministic for `config`,
         # and downstream `train` / `get_values` calls reuse this attribute.
         self._policy_like_cfg = make_policy_like_config(config)
-        policy_like_cfg = self._policy_like_cfg
 
         hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(
-            policy_like_cfg
+            self._policy_like_cfg
         )
         handle_model_import(
-            policy_like_cfg, hf_model_name, pretrained_path, pt_checkpoint_exists
+            self._policy_like_cfg,
+            hf_model_name,
+            pretrained_path,
+            pt_checkpoint_exists,
         )
 
         # Store tokenizer
@@ -326,7 +328,7 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
 
         # Step 3: Setup model configuration
         runtime_config = validate_and_set_config(
-            policy_like_cfg,
+            self._policy_like_cfg,
             self.rank,
             hf_model_name,
             pretrained_path,
@@ -365,7 +367,7 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
                         param.requires_grad_(False)
 
         model_and_optimizer_state = setup_model_and_optimizer(
-            policy_like_cfg,
+            self._policy_like_cfg,
             self.megatron_cfg,
             init_optimizer,
             additional_pre_wrap_hooks=[_freeze_output_layer],
@@ -411,7 +413,7 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
             self.should_disable_forward_pre_hook,
             self.dp_size,
         ) = finalize_megatron_setup(
-            policy_like_cfg,
+            self._policy_like_cfg,
             self.megatron_cfg,
             hf_model_name,
             worker_sharding_annotations,
@@ -747,7 +749,6 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
         self.value_head.eval()
 
         pp_grp = get_pipeline_model_parallel_group()
-        policy_like_cfg = self._policy_like_cfg
 
         (
             mb_iterator,
@@ -757,7 +758,7 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
             padded_seq_length,
         ) = get_microbatch_iterator(
             data,
-            policy_like_cfg,
+            self._policy_like_cfg,
             value_batch_size,
             straggler_timer=self.mcore_state.straggler_timer,
         )

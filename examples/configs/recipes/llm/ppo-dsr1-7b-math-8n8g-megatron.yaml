@@ -18,7 +18,7 @@ loss_fn:
   truncated_importance_sampling_ratio: 5
   ratio_clip_max: 0.2
   ratio_clip_c: 3
-value_loss:
+value_loss_fn:
   scale: 1.0
   cliprange: 0.5
 checkpointing:

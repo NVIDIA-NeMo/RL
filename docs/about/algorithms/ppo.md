@@ -78,7 +78,7 @@ ppo:
   steps_per_epoch: 4
   policy_training_start_step: 0
 
-value_loss:
+value_loss_fn:
   scale: 0.4
   cliprange: 0.2
 
