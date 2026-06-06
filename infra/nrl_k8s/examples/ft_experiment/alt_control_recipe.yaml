@@ -1,0 +1,17 @@
+# FT Experiment — ALTERNATE CONTROL setup (checkpoint every 5 steps).
+#
+# Same as the control, but checkpoints every 5 steps instead of every step.
+# This highlights that "lost work" from a failure is even more egregious:
+# on average, a failure wastes ~2.5 steps of work + restart overhead.
+#
+# Pair with alt_control.gb300.infra.yaml.
+defaults: ./control_recipe.yaml
+
+checkpointing:
+  save_period: 5
+  checkpoint_dir: /mnt/rl-workspace/${oc.env:USER,terryk}/checkpoints/ft-experiment-alt-control
+
+logger:
+  log_dir: logs/ft-experiment-alt-control
+  wandb:
+    name: ft-experiment-alt-control-ckpt5

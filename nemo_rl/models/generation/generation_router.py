@@ -632,6 +632,11 @@ class GenerationRouter:
                     worker_indices=list(worker_indices),
                 )
                 self._cumulative_shards_added += 1
+                print(
+                    f"[RECOVERY] shard={shard_id} status=joining "
+                    f"unix_ts={time.time():.6f} reason={reason}",
+                    flush=True,
+                )
                 self._last_fault_event = {
                     "kind": "add",
                     "shard_id": shard_id,
@@ -717,6 +722,11 @@ class GenerationRouter:
             entry.consecutive_failures = 0
             entry.consecutive_successes = 0
             promoted.append(sid)
+            print(
+                f"[RECOVERY] shard={sid} status=ready "
+                f"unix_ts={time.time():.6f}",
+                flush=True,
+            )
         return promoted
 
     # =====================================================================

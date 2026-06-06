@@ -1,0 +1,227 @@
+# FT Experiment — CONTROL setup (single cluster, no fault recovery).
+#
+# Single RayCluster with 10 workers × 4 GPUs = 40 GPUs:
+#   - Training: 32 GPUs (8 PGs × 4 GPUs, Megatron TP=1 PP=1 EP=8 DP=4)
+#   - Generation: 8 GPUs (8 vLLM DP shards × 1 GPU, non-colocated)
+#
+# Fault simulation: a background timer kills the training driver after
+# 25 minutes, simulating infrastructure failure. No fault recovery →
+# restart from checkpoint. Each restart also runs for 25 min.
+#
+# Usage:
+#   nrl-k8s run infra/nrl_k8s/examples/ft_experiment/control_recipe.yaml \
+#     --infra infra/nrl_k8s/examples/ft_experiment/control.gb300.infra.yaml
+
+_shared:
+  headNodeSelector: &head_node_selector
+    karpenter.sh/nodepool: cpu
+  workerNodeSelector: &worker_node_selector
+    nvidia.com/gpu.product: NVIDIA-GB300
+
+  userSecretEnvFrom: &user_secret_env_from
+    - secretRef:
+        name: ${user:}-secrets
+        optional: true
+
+  headEnv: &shared_head_env
+    - {name: HF_HOME,                        value: "/mnt/rl-workspace/shared/hf-cache"}
+    - {name: NCCL_DEBUG,                     value: WARN}
+    - {name: RAY_memory_monitor_refresh_ms,  value: "0"}
+
+  workerEnv: &shared_worker_env
+    - {name: HF_HOME,                        value: "/mnt/rl-workspace/shared/hf-cache"}
+    - {name: NCCL_DEBUG,                     value: WARN}
+    - {name: NCCL_MNNVL_ENABLE,              value: "1"}
+    - {name: RAY_memory_monitor_refresh_ms,  value: "0"}
+    - {name: NCCL_CUMEM_HOST_ENABLE,         value: "0"}
+    - {name: HF_HUB_OFFLINE,                 value: "1"}
+    - {name: TRANSFORMERS_OFFLINE,           value: "1"}
+    - {name: RAY_OVERRIDE_JOB_RUNTIME_ENV,   value: "1"}
+    - {name: NCCL_NVLS_ENABLE,                 value: "0"}
+
+  headResources: &head_resources
+    limits:   {cpu: "8",  memory: "96Gi"}
+    requests: {cpu: "2",  memory: "16Gi"}
+
+  gpuWorkerResources: &gpu_worker_resources
+    limits:
+      cpu: "132"
+      memory: "900Gi"
+      nvidia.com/gpu: "4"
+    requests:
+      cpu: "120"
+      memory: "850Gi"
+      nvidia.com/gpu: "4"
+    claims:
+      - {name: compute-domain-channel}
+      - {name: roce-channel}
+
+  gpuHeadPorts: &gpu_head_ports
+    - {containerPort: 6379,  name: gcs-server}
+    - {containerPort: 8265,  name: dashboard}
+    - {containerPort: 10001, name: client}
+
+  codeMounts: &code_mounts
+    - {mountPath: /dev/shm, name: dshm}
+    - {mountPath: /opt/nemo-rl, name: rl-workspace, subPath: "${user:}/nemo-rl-disagg"}
+    - {mountPath: /mnt/rl-workspace, name: rl-workspace}
+
+  headVolumes: &head_volumes
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 16Gi}
+    - name: rl-workspace
+      persistentVolumeClaim: {claimName: rl-workspace}
+
+  workerVolumes: &worker_volumes
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 64Gi}
+    - name: rl-workspace
+      persistentVolumeClaim: {claimName: rl-workspace}
+    - name: roce-preflight-script
+      configMap:
+        name: roce-preflight-script
+        defaultMode: 493
+
+image: nvcr.io/nvidian/nemo-rl:nightly
+imagePullSecrets: [nvcr-secret]
+serviceAccount: nemo-rl-endpoint-registry
+
+labels:
+  nrl-k8s/owner: ${user:}
+
+submit:
+  submitter: portForward
+
+launch:
+  mode: attach
+  runMode: batch
+  codeSource: image
+  codePath: /opt/nemo-rl
+  attach:
+    training: ${user:}-raycluster-ft-experiment-control
+  peerWatcher: false
+  env: {}
+  entrypoint: |
+    set -eu
+    cd /opt/nemo-rl
+    if [ ! -d /mnt/rl-workspace ]; then
+      echo "ERROR: /mnt/rl-workspace not mounted — is the rl-workspace PVC bound?" >&2
+      exit 1
+    fi
+    export RAY_enable_infeasible_task_early_exit=true
+    export PYTHONPATH=.:3rdparty/Megatron-LM-workspace/Megatron-LM:3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src
+    TIMESTAMP=$(date -u +%Y%m%d-%H%M%S-%N)
+    LOG_DIR=/mnt/rl-workspace/${user:}/driver_logs
+    LOG=\${LOG_DIR}/ft-experiment-control-\${TIMESTAMP}.log
+    mkdir -p "\${LOG_DIR}"
+
+    # ── Fault simulation ──────────────────────────────────────────
+    # Kill the training driver after 25 minutes (1500s) to simulate
+    # an infrastructure failure. Logs the exact timestamp of the kill.
+    FAULT_DELAY=1500
+    (
+      sleep \${FAULT_DELAY}
+      FAULT_TS=\$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)
+      echo "[FAULT-SIM] \${FAULT_TS} Simulating infrastructure failure after \${FAULT_DELAY}s — killing training driver"
+      # Kill the training python process
+      pkill -TERM -f "run_grpo.py.*control_recipe" || true
+      sleep 5
+      pkill -KILL -f "run_grpo.py.*control_recipe" || true
+      echo "[FAULT-SIM] Kill signal sent"
+    ) &
+    FAULT_PID=$!
+
+    python -u examples/run_grpo.py \
+      --config infra/nrl_k8s/examples/ft_experiment/control_recipe.yaml \
+      2>&1 | tee "\${LOG}"
+    EXIT_CODE=$?
+
+    # Clean up fault timer if training exited before the timer fired
+    kill \${FAULT_PID} 2>/dev/null || true
+    echo "[FAULT-SIM] Training exited with code \${EXIT_CODE}"
+    exit \${EXIT_CODE}
+
+clusters:
+  training:
+    name: ${user:}-raycluster-ft-experiment-control
+    segmentSize: 2
+    labels:
+      disagg.nemo-rl/cluster: ft-experiment-control
+      disagg.nemo-rl/run: ft-experiment-control
+      kai.scheduler/queue: backfill
+    spec:
+      rayVersion: "2.54.0"
+      headGroupSpec:
+        rayStartParams:
+          dashboard-host: "0.0.0.0"
+          no-monitor: "true"
+          num-gpus: "0"
+          object-store-memory: "200000000"
+        template:
+          spec:
+            schedulerName: kai-scheduler
+            dnsPolicy: ClusterFirst
+            nodeSelector: *head_node_selector
+            containers:
+              - name: ray-head
+                env:
+                  - {name: HF_HOME,                        value: "/mnt/rl-workspace/shared/hf-cache"}
+                  - {name: NCCL_DEBUG,                     value: WARN}
+                  - {name: RAY_memory_monitor_refresh_ms,  value: "0"}
+                  - name: WANDB_API_KEY
+                    valueFrom:
+                      secretKeyRef:
+                        name: wandb-api-key
+                        key: WANDB_API_KEY
+                envFrom: *user_secret_env_from
+                resources: *head_resources
+                ports: *gpu_head_ports
+                volumeMounts: *code_mounts
+            volumes: *head_volumes
+      workerGroupSpecs:
+        - groupName: gpu-workers
+          replicas: 10
+          minReplicas: 10
+          maxReplicas: 10
+          numOfHosts: 1
+          rayStartParams:
+            num-gpus: "4"
+            object-store-memory: "200000000"
+          template:
+            metadata:
+              annotations:
+                kai.scheduler/topology: gb300-topology
+                kai.scheduler/topology-required-placement: nvidia.com/gpu.clique
+            spec:
+              schedulerName: kai-scheduler
+              dnsPolicy: ClusterFirst
+              nodeSelector: *worker_node_selector
+              tolerations:
+                - operator: Exists
+              resourceClaims:
+                - name: compute-domain-channel
+                  resourceClaimTemplateName: compute-domain-ft-experiment-control
+                - name: roce-channel
+                  resourceClaimTemplateName: roce-ft-experiment-control
+              initContainers:
+                - name: roce-preflight
+                  image: nvcr.io/nvidian/nemo-rl:nightly
+                  command: ["/bin/bash", "/preflight/roce_preflight.sh"]
+                  resources:
+                    claims: [{name: roce-channel}]
+                    limits:   {cpu: "1", memory: "256Mi"}
+                    requests: {cpu: "100m", memory: "128Mi"}
+                  volumeMounts:
+                    - {name: roce-preflight-script, mountPath: /preflight}
+                  securityContext:
+                    capabilities: {add: [IPC_LOCK]}
+              containers:
+                - name: ray-worker
+                  env: *shared_worker_env
+                  envFrom: *user_secret_env_from
+                  resources: *gpu_worker_resources
+                  securityContext:
+                    capabilities:
+                      add: [IPC_LOCK]
+                  volumeMounts: *code_mounts
+              volumes: *worker_volumes

@@ -1674,6 +1674,13 @@ def grpo_train(
                 maybe_gpu_profile_step(policy_generation, total_steps + 1)
             val_metrics, validation_timings = None, None
 
+            step_start_unix = time.time()
+            print(
+                f"[STEP-START] step={total_steps + 1} unix_ts={step_start_unix:.6f}",
+                flush=True,
+            )
+            timer.mark("step_start", {"step": total_steps + 1})
+
             with timer.time("total_step_time"):
                 # Prepare batch
                 print("▶ Preparing batch...", flush=True)
@@ -2906,6 +2913,13 @@ def async_grpo_train(
             maybe_gpu_profile_step(policy, step + 1)
             if policy != policy_generation:
                 maybe_gpu_profile_step(policy_generation, step + 1)
+
+            step_start_unix = time.time()
+            print(
+                f"[STEP-START] step={step + 1} unix_ts={step_start_unix:.6f}",
+                flush=True,
+            )
+            timer.mark("step_start", {"step": step + 1})
 
             with timer.time("total_step_time"):
                 # Sample trajectories from replay buffer

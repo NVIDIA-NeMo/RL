@@ -1,0 +1,72 @@
+# FT Experiment — standalone generation server for the TEST setup.
+#
+# 8 vLLM DP shards × TP=1 = 8 GPUs. Fault injection kills 1 shard every
+# 25 min and recovers immediately (no staged batching).
+
+policy:
+  model_name: Qwen/Qwen3-30B-A3B
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs: null
+  precision: bfloat16
+  max_total_sequence_length: 2048
+  generation:
+    backend: vllm
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    stop_token_ids: null
+    stop_strings: null
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 1
+        num_nodes: 8
+    vllm_cfg:
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      async_engine: true
+      precision: ${policy.precision}
+      kv_cache_dtype: auto
+      gpu_memory_utilization: 0.8
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: false
+      use_deep_gemm: false
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 0.5
+      expose_http_server: true
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: hermes
+      load_format: dummy
+    vllm_kwargs: {}
+    router:
+      health_poll_interval_s: 2.0
+      health_timeout_s: 5.0
+      failure_threshold: 10
+      join_success_threshold: 2
+      proxy_timeout_s: 600.0
+      proxy_failure_threshold: 5
+      proxy_pool_limit_total: 4096
+      proxy_pool_limit_per_host: 1024
+      uvicorn_backlog: 4096
+      uvicorn_keep_alive_s: 120
+
+# Fault injection: kill 1 shard every 25 min, immediate recovery.
+fault_inject:
+  enabled: true
+  mode: pod-kill
+  recover: true
+  trigger_after_s: 1500
+  recover_after_s: 0
+  max_cycles: null
+  rotate_target: true
+  target_shard: dp-0
+  new_shard_grace_period_s: 300
+  burst_size: 1
+  burst_every_n_cycles: 1
+  repeat_every_s: 1500

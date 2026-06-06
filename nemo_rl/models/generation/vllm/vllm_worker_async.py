@@ -226,26 +226,48 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         self.kv_cache_usage_perc: list[float] = []
         self.generation_tokens: list[int] = []
 
+        import socket as _socket
+
+        _hostname = _socket.gethostname()
+        _prev_gen_tokens = [0]
+
         def _logger_loop():
             # Delay a little to let engine settle
             time.sleep(min(2.0, interval_s))
             while True:
                 try:
+                    snap_running = None
+                    snap_waiting = None
+                    snap_gen_tokens = None
                     for m in get_metrics_snapshot():
                         with self._vllm_metrics_lock:
                             if isinstance(m, Gauge):
-                                # Log the vllm inflight batch sizes
                                 if m.name == "vllm:num_requests_running":
                                     self.inflight_batch_sizes.append(int(m.value))
-                                # Log the vllm pending number of requests in the queue
+                                    snap_running = int(m.value)
                                 elif m.name == "vllm:num_requests_waiting":
                                     self.num_pending_samples.append(int(m.value))
-                                # Log the vllm kv cache usage
+                                    snap_waiting = int(m.value)
                                 elif m.name == "vllm:kv_cache_usage_perc":
                                     self.kv_cache_usage_perc.append(float(m.value))
                             elif isinstance(m, Counter):
                                 if m.name == "vllm:generation_tokens":
                                     self.generation_tokens.append(int(m.value))
+                                    snap_gen_tokens = int(m.value)
+                    if snap_gen_tokens is not None:
+                        delta = snap_gen_tokens - _prev_gen_tokens[0]
+                        tps = delta / interval_s if interval_s > 0 else 0
+                        _prev_gen_tokens[0] = snap_gen_tokens
+                        ts = time.time()
+                        print(
+                            f"[VLLM-THROUGHPUT] unix_ts={ts:.3f} host={_hostname} "
+                            f"gen_tokens_total={snap_gen_tokens} "
+                            f"gen_tokens_delta={delta} "
+                            f"tokens_per_sec={tps:.1f} "
+                            f"running={snap_running} "
+                            f"waiting={snap_waiting}",
+                            flush=True,
+                        )
                 except Exception:
                     print(
                         "⚠️[vLLM Metric Logger] Exception in vLLM metrics logger",

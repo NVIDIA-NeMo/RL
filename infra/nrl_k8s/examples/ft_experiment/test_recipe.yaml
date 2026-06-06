@@ -1,0 +1,51 @@
+# FT Experiment — TEST setup (disaggregated generation + fault recovery).
+#
+# Async GRPO (lag 1) with Qwen3-30B-A3B. Inherits the proven async-1off
+# parallelism layout (TP=1, PP=1, EP=8, vLLM TP=1).
+#
+# Topology:
+#   - Training cluster: 8 workers × 4 GB300 GPUs = 32 GPUs (Megatron DP=4)
+#   - Generation cluster: 8 vLLM DP shards × 1 GPU each = 8 GPUs (separate)
+#
+# Fault injection: kill 1 shard every 25 min, immediate recovery.
+# The FaultInjector on the gen-daemon side handles kill + add_shard.
+#
+# Pair with test.gb300.infra.yaml + test_gen_server.yaml.
+defaults: ../../../../examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-4n4g-async-1off.yaml
+
+grpo:
+  max_num_steps: 20
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
+  val_period: 999
+  val_at_start: false
+  val_at_end: false
+
+policy:
+  max_total_sequence_length: 2048
+  generation:
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 8
+        gpus_per_node: 1
+
+checkpointing:
+  enabled: true
+  save_period: 1
+  keep_top_k: 1
+  checkpoint_dir: /mnt/rl-workspace/${oc.env:USER,terryk}/checkpoints/ft-experiment-test
+  save_optimizer: true
+
+logger:
+  log_dir: logs/ft-experiment-test
+  wandb_enabled: true
+  wandb:
+    project: nemorl-ft-experiment
+    name: ft-experiment-test-disagg
+  tensorboard_enabled: true
+  monitor_gpus: true
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 8

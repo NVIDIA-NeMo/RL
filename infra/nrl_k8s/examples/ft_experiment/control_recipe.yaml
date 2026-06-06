@@ -1,0 +1,56 @@
+# FT Experiment — CONTROL setup (non-disaggregated, no fault recovery).
+#
+# Async GRPO (lag 1) with Qwen3-30B-A3B. Same parallelism as the test
+# (TP=1, PP=1, EP=8, vLLM TP=1) but generation is in the SAME ray cluster.
+#
+# Topology:
+#   - Single cluster: 10 workers × 4 GPUs = 40 GPUs total
+#     Training: 32 GPUs (Megatron DP=4)
+#     Generation: 8 vLLM DP shards × 1 GPU (non-colocated, same cluster)
+#
+# Fault simulation: entrypoint kills training after 25 min to simulate
+# infrastructure failure. No fault recovery → restart from checkpoint.
+# Checkpoint every step so we lose at most 1 step + restart overhead.
+#
+# Pair with control.gb300.infra.yaml.
+defaults: ../../../../examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-4n4g-async-1off.yaml
+
+grpo:
+  max_num_steps: 20
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
+  val_period: 999
+  val_at_start: false
+  val_at_end: false
+
+policy:
+  max_total_sequence_length: 2048
+  generation:
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 8
+        gpus_per_node: 1
+    vllm_cfg:
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 0.5
+
+checkpointing:
+  enabled: true
+  save_period: 1
+  keep_top_k: 1
+  checkpoint_dir: /mnt/rl-workspace/${oc.env:USER,terryk}/checkpoints/ft-experiment-control
+  save_optimizer: true
+
+logger:
+  log_dir: logs/ft-experiment-control
+  wandb_enabled: true
+  wandb:
+    project: nemorl-ft-experiment
+    name: ft-experiment-control-no-ft
+  tensorboard_enabled: true
+  monitor_gpus: true
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 8

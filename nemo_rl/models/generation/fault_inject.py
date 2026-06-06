@@ -218,6 +218,14 @@ class FaultInjector:
             )
             time.sleep(delay_before_kill)
 
+            fault_ts = time.time()
+            print(
+                f"[FAULT-EVENT] unix_ts={fault_ts:.6f} cycle={cycle_n} "
+                f"mode={self.mode} target={self.target_shard} "
+                f"burst_size={this_cycle_burst}",
+                flush=True,
+            )
+
             # Track shards killed in this burst so the rotation in
             # ``_pick_first_ready_shard`` doesn't re-pick them.
             killed_in_burst: set[str] = set()
@@ -282,6 +290,11 @@ class FaultInjector:
                     )
                     time.sleep(float(self.recover_after_s))
                 sorted_killed = sorted(killed_in_burst)
+                print(
+                    f"[RECOVERY-START] unix_ts={time.time():.6f} "
+                    f"recovering {len(sorted_killed)} shards: {sorted_killed}",
+                    flush=True,
+                )
                 batch_sz = self.recover_batch_size or len(sorted_killed)
                 for batch_start in range(0, len(sorted_killed), batch_sz):
                     batch = sorted_killed[batch_start:batch_start + batch_sz]
