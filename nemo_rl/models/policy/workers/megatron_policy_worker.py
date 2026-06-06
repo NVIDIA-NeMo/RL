@@ -1276,8 +1276,10 @@ class MegatronPolicyWorkerImpl(
             self.model, "cpu", move_params=False, move_grads=True
         )  # get rid of grad buffers
 
-        # Clear FP8 caches (uint8/int16 tensors) to CPU
-        if self.fp8_cfg.get("force_clear_fp8_caches", False):
+        # When True, clear Transformer Engine's per-module _fp8_workspaces scratch
+        # buffers in offload_before_refit (before weight transfer to the inference
+        # engine).
+        if self.fp8_cfg and self.fp8_cfg.get("force_clear_fp8_caches", False):
             self._clear_fp8_caches()
 
         if self.cfg["megatron_cfg"].get("clear_memory_caches_before_refit", False):
