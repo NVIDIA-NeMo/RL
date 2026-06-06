@@ -795,6 +795,67 @@ def print_performance_metrics(
             )
 
     # =====================================================
+    # Engine Utilization Scalars (Layer 2)
+    # =====================================================
+
+    if is_vllm_metrics_logger_enabled and generation_logger_metrics:
+        inflight_by_worker = generation_logger_metrics.get("inflight_batch_sizes", {})
+        _interval = master_config.policy["generation"]["vllm_cfg"][
+            "vllm_metrics_logger_interval"
+        ]
+        if inflight_by_worker and _interval > 0:
+            per_worker_idle_fracs: list[float] = []
+            per_worker_idle_s: list[float] = []
+            per_worker_busy_s: list[float] = []
+            for _samples in inflight_by_worker.values():
+                if not _samples:
+                    continue
+                _n = len(_samples)
+                _n_idle = sum(1 for v in _samples if v == 0)
+                per_worker_idle_fracs.append(_n_idle / _n)
+                per_worker_idle_s.append(_n_idle * _interval)
+                per_worker_busy_s.append((_n - _n_idle) * _interval)
+
+            if per_worker_idle_fracs:
+                _nw = len(per_worker_idle_fracs)
+                engine_idle_ratio = sum(per_worker_idle_fracs) / _nw
+                engine_idle_ratio_max = max(per_worker_idle_fracs)
+                engine_busy_ratio = 1.0 - engine_idle_ratio
+                engine_idle_time_s = sum(per_worker_idle_s) / _nw
+                engine_busy_time_s = sum(per_worker_busy_s) / _nw
+
+                _vllm_cfg = master_config.policy["generation"].get("vllm_cfg", {})
+                _tp = _vllm_cfg.get("tensor_parallel_size", 1)
+                _pp = _vllm_cfg.get("pipeline_parallel_size", 1)
+                num_vllm_instances = generation_num_gpus / (_tp * _pp)
+                per_instance_concurrency = (
+                    number_of_samples_per_step / num_vllm_instances
+                )
+
+                print("  • Engine Utilization:")
+                print(
+                    f"    - Idle Ratio (mean/max): {100 * engine_idle_ratio:.1f}% / {100 * engine_idle_ratio_max:.1f}%"
+                )
+                print(
+                    f"    - Idle Time (mean, s): {engine_idle_time_s:.1f} | Busy: {engine_busy_time_s:.1f}"
+                )
+                print(
+                    f"    - Per-Instance Concurrency (GBS/instances): {per_instance_concurrency:.1f}"
+                    f"  [{number_of_samples_per_step} samples / {num_vllm_instances:.0f} instances]"
+                )
+
+                performance_metrics.update(
+                    {
+                        "engine_idle_ratio": engine_idle_ratio,
+                        "engine_idle_ratio_max": engine_idle_ratio_max,
+                        "engine_busy_ratio": engine_busy_ratio,
+                        "engine_idle_time_s": engine_idle_time_s,
+                        "engine_busy_time_s": engine_busy_time_s,
+                        "per_instance_concurrency": per_instance_concurrency,
+                    }
+                )
+
+    # =====================================================
     # Clean up metrics
     # =====================================================
 
