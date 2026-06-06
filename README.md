@@ -10,6 +10,7 @@
 </div>
 
 ## 📣 News
+* [06/04/2026] [Nemotron-3-Ultra](https://research.nvidia.com/labs/nemotron/Nemotron-3-Ultra/) was trained with NeMo-RL! Follow [this guide](https://github.com/NVIDIA-NeMo/RL/blob/ultra-v3/docs/guides/nemotron-3-ultra.md) to explore the post-training recipe.
 * [04/30/2026] [Release v0.6.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.6.0)
     * Sglang backend, Muon Optimizer, Speculative Decoding, Yarn long-context training, Chunked Cross Entropy Loss, top-p/top-k training
     * Newly published SWE RL release benchmark demonstrating a long-context, multi-step RL rollout. See the performance numbers [here](https://docs.nvidia.com/nemo/rl/latest/about/performance-summary.html#gb200-bf16-benchmarks) with the accompanying recipe and scripts [here](https://github.com/NVIDIA-NeMo/RL/pull/2327).
