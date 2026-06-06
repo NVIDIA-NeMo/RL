@@ -136,7 +136,7 @@ launch:
 kuberay:
   training:
     name: ${user:}-raycluster-ft-experiment-alt-ctrl
-    segmentSize: 2
+    segmentSize: 1
     labels:
       disagg.nemo-rl/cluster: ft-experiment-alt-ctrl
       disagg.nemo-rl/run: ft-experiment-alt-ctrl

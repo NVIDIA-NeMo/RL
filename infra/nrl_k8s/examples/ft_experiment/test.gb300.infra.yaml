@@ -320,7 +320,7 @@ kuberay:
     # segment requires 2 pods to land in the same gb300-topology clique
     # (kai gang-scheduling at the segment level). Smaller than full
     # all-8-in-one-clique, larger than per-pod independence.
-    segmentSize: 2
+    segmentSize: 1
     labels:
       disagg.nemo-rl/cluster: train-ft-experiment-test
       disagg.nemo-rl/run: ft-experiment-test
@@ -433,7 +433,7 @@ kuberay:
     # segmentSize=2: 8 DP shards / 2 = 4 segments of 2 pods each (TP=1,
     # one GPU per pod). Each segment requires 2 gen DP shard pods to land
     # in the same gb300-topology clique.
-    segmentSize: 2
+    segmentSize: 1
     labels:
       disagg.nemo-rl/cluster: gen-ft-experiment-test
       disagg.nemo-rl/run: ft-experiment-test
