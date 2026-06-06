@@ -8,3 +8,6 @@ tests/test_suites/llm/grpo-qwen3.5-397ba17b-32n8g-megatron.v2.sh
 
 # 64-node GLM validation is manual-only because it exceeds the nightly GPU-hour budget.
 tests/test_suites/llm/grpo-glm5.1-64n8g-megatron.sh
+
+# R3 router replay validation is manual-only because it exceeds the nightly GPU-hour budget.
+tests/test_suites/llm/grpo-qwen3-30ba3b-8n8g-megatron-cp2-r3.sh
