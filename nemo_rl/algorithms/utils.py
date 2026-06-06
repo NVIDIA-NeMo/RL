@@ -678,9 +678,12 @@ def print_performance_metrics(
     ) and not colocated_inference:
         # async grpo
         exposed_generation_time = timing_metrics["exposed_generation"]
+        # Guard: if exposed_generation_time is negligible training is the bottleneck
+        # and there is no real idle time. The original condition was inverted and
+        # reported 0 idle exactly when training workers were waiting for generation.
         training_worker_idle_time_ratio = (
             0
-            if exposed_generation_time > 0.1
+            if exposed_generation_time <= 0.1
             else exposed_generation_time
             / (
                 policy_training_time
@@ -726,9 +729,12 @@ def print_performance_metrics(
     policy_training_tokens_per_sec_per_gpu = (
         metrics["total_num_tokens"] / policy_training_time / training_num_gpus
     )
+    # Guard against near-zero logprobs time (e.g. when logprobs are skipped),
+    # which would produce an astronomically large and meaningless throughput value.
+    _logprobs_time_eps = 1e-3
     policy_and_reference_logprobs_tokens_per_sec_per_gpu = (
         metrics["total_num_tokens"]
-        / policy_and_reference_logprobs_time
+        / max(policy_and_reference_logprobs_time, _logprobs_time_eps)
         / training_num_gpus
     )
     training_worker_group_tokens_per_sec_per_gpu = (
@@ -738,6 +744,23 @@ def print_performance_metrics(
     )
     generation_tokens_per_sec_per_gpu = (
         metrics["total_num_tokens"] / generation_time / generation_num_gpus
+    )
+
+    # Output-only token rate: use vLLM generation_tokens counter (excludes prompt/tool tokens).
+    generation_logger_metrics = metrics.get("generation_logger_metrics", {})
+    vllm_generation_tokens_by_worker = generation_logger_metrics.get(
+        "generation_tokens", {}
+    )
+    output_only_tokens_total = 0
+    for _samples in vllm_generation_tokens_by_worker.values():
+        if len(_samples) >= 2:
+            output_only_tokens_total += _samples[-1] - _samples[0]
+        elif len(_samples) == 1:
+            output_only_tokens_total += _samples[0]
+    output_only_tokens_per_sec_per_gpu = (
+        output_only_tokens_total / generation_time / generation_num_gpus
+        if output_only_tokens_total > 0
+        else None
     )
 
     print("  • Throughputs (per GPU):")
@@ -755,6 +778,10 @@ def print_performance_metrics(
     print(
         f"    - Generation Worker Group (Tokens/sec/gpu): {generation_tokens_per_sec_per_gpu:.2f}"
     )
+    if output_only_tokens_per_sec_per_gpu is not None:
+        print(
+            f"    - Output-Only Tokens/sec/gpu (vLLM counter): {output_only_tokens_per_sec_per_gpu:.2f}"
+        )
 
     print("  • Throughputs (per Group):")
     print(
@@ -807,22 +834,43 @@ def print_performance_metrics(
     # Logging
     # =====================================================
 
-    performance_metrics.update(
-        {
-            "samples_per_sec": e2e_samples_per_sec_per_gpu * total_num_gpus,
-            "tokens_per_sec": e2e_tokens_per_sec_per_gpu * total_num_gpus,
-            "samples_per_sec_per_gpu": e2e_samples_per_sec_per_gpu,
-            "tokens_per_sec_per_gpu": e2e_tokens_per_sec_per_gpu,
-            "policy_training_tokens_per_sec_per_gpu": policy_training_tokens_per_sec_per_gpu,
-            "policy_and_reference_logprobs_tokens_per_sec_per_gpu": policy_and_reference_logprobs_tokens_per_sec_per_gpu,
-            "training_worker_group_tokens_per_sec_per_gpu": training_worker_group_tokens_per_sec_per_gpu,
-            "generation_tokens_per_sec_per_gpu": generation_tokens_per_sec_per_gpu,
-            "training_worker_group_tokens_per_sec": training_worker_group_tokens_per_sec_per_gpu
-            * training_num_gpus,
-            "generation_tokens_per_sec": generation_tokens_per_sec_per_gpu
-            * generation_num_gpus,
-        }
+    perf_update: dict[str, float] = {
+        "samples_per_sec": e2e_samples_per_sec_per_gpu * total_num_gpus,
+        "tokens_per_sec": e2e_tokens_per_sec_per_gpu * total_num_gpus,
+        "samples_per_sec_per_gpu": e2e_samples_per_sec_per_gpu,
+        "tokens_per_sec_per_gpu": e2e_tokens_per_sec_per_gpu,
+        "policy_training_tokens_per_sec_per_gpu": policy_training_tokens_per_sec_per_gpu,
+        "policy_and_reference_logprobs_tokens_per_sec_per_gpu": policy_and_reference_logprobs_tokens_per_sec_per_gpu,
+        "training_worker_group_tokens_per_sec_per_gpu": training_worker_group_tokens_per_sec_per_gpu,
+        "generation_tokens_per_sec_per_gpu": generation_tokens_per_sec_per_gpu,
+        "training_worker_group_tokens_per_sec": training_worker_group_tokens_per_sec_per_gpu
+        * training_num_gpus,
+        "generation_tokens_per_sec": generation_tokens_per_sec_per_gpu
+        * generation_num_gpus,
+    }
+    if output_only_tokens_per_sec_per_gpu is not None:
+        perf_update["output_only_tokens_per_sec_per_gpu"] = (
+            output_only_tokens_per_sec_per_gpu
+        )
+
+    # transport_overhead = agent-perceived model-call time − engine e2e latency (Layer 1).
+    # Only computable when both Layer 1 latencies and per-sample rollout metrics are present.
+    _request_latencies = generation_logger_metrics.get("request_latencies", {})
+    _engine_e2e_mean = _request_latencies.get("e2e_request_latency_seconds", {}).get(
+        "mean"
     )
+    _agent_model_call_mean = metrics.get(
+        "swe_agents_train/total_model_call_time/mean",
+        metrics.get("swe_agents_val/total_model_call_time/mean"),
+    )
+    if _engine_e2e_mean is not None and _agent_model_call_mean is not None:
+        transport_overhead = _agent_model_call_mean - _engine_e2e_mean
+        print(
+            f"  • Transport Overhead (agent_model_call - engine_e2e): {transport_overhead:.3f}s"
+        )
+        perf_update["transport_overhead_s"] = transport_overhead
+
+    performance_metrics.update(perf_update)
 
     return performance_metrics
 
