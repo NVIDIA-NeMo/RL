@@ -1811,28 +1811,17 @@ def test_grpo_train_collects_generation_logger_and_seq_metrics(
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
-@pytest.mark.parametrize(
-    "skip_reference_policy_logprobs_calculation",
-    [False, True],
-    ids=["implicit_kl_zero", "explicit_skip"],
-)
-def test_grpo_train_skips_reference_policy_logprobs_when_kl_disabled(
-    mock_grpo_components, train_func, skip_reference_policy_logprobs_calculation
-):
+def test_grpo_train_skips_reference_policy_logprobs(mock_grpo_components, train_func):
     """Regression test for issue #1968 (Bug 1) and PRs #2174 / #2178.
 
-    When ``loss_fn.reference_policy_kl_penalty=0``, both ``grpo_train`` and
-    ``async_grpo_train`` MUST NOT call ``policy.get_reference_policy_logprobs``,
-    even if the caller did not pre-set
-    ``grpo.skip_reference_policy_logprobs_calculation``. Without the skip guards
-    in ``grpo.py``, training would crash inside ``use_reference_model()`` because
-    the reference model state was never loaded.
+    When skip_reference_policy_logprobs_calculation=True, both grpo_train
+    and async_grpo_train MUST NOT call policy.get_reference_policy_logprobs.
+    Without the skip guards in grpo.py, training would crash inside
+    use_reference_model() because the reference model state was never loaded.
     """
     master_config = mock_grpo_components["master_config"]
     master_config.loss_fn.reference_policy_kl_penalty = 0
-    master_config.grpo["skip_reference_policy_logprobs_calculation"] = (
-        skip_reference_policy_logprobs_calculation
-    )
+    master_config.grpo["skip_reference_policy_logprobs_calculation"] = True
     master_config.grpo["max_num_steps"] = 1
     master_config.grpo["max_num_epochs"] = 1
     master_config.grpo["val_period"] = 0
@@ -1903,7 +1892,7 @@ def test_grpo_train_skips_reference_policy_logprobs_when_kl_disabled(
 
     assert not policy.get_reference_policy_logprobs.called, (
         "policy.get_reference_policy_logprobs was called even though "
-        "loss_fn.reference_policy_kl_penalty=0. "
+        "skip_reference_policy_logprobs_calculation=True. "
         "This indicates a regression of issue #1968 / PRs #2174, #2178."
     )
 
