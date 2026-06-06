@@ -200,9 +200,9 @@ kuberay:
                 - operator: Exists
               resourceClaims:
                 - name: compute-domain-channel
-                  resourceClaimTemplateName: compute-domain-ft-experiment-control
+                  resourceClaimTemplateName: PLACEHOLDER
                 - name: roce-channel
-                  resourceClaimTemplateName: roce-ft-experiment-control
+                  resourceClaimTemplateName: PLACEHOLDER
               initContainers:
                 - name: roce-preflight
                   image: nvcr.io/nvidian/nemo-rl:nightly
