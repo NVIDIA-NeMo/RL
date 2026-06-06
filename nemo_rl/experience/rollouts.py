@@ -1078,10 +1078,16 @@ class AsyncNemoGymRolloutResult:
     rollout_metrics: dict[str, Any]
 
 
+# Percentiles emitted alongside mean/median/stddev for every per-sample and
+# per-agent metric, so per-step tail latencies are queryable directly without
+# downloading the full_result table.
+_METRIC_PERCENTILES = (50, 90, 95, 99)
+
+
 def _calculate_single_metric(
     values: list[float], batch_size: int, key_name: str
 ) -> dict:
-    return {
+    metrics = {
         f"{key_name}/mean": sum(values) / batch_size,
         f"{key_name}/max": max(values),
         f"{key_name}/min": min(values),
@@ -1089,6 +1095,20 @@ def _calculate_single_metric(
         f"{key_name}/stddev": statistics.stdev(values) if len(values) > 1 else math.nan,
         f"{key_name}/histogram": Histogram(values),
     }
+    # statistics.quantiles() needs at least two data points; for a single sample
+    # every percentile collapses to that sample (mirroring how stddev degrades
+    # to nan above).
+    if len(values) > 1:
+        # quantiles(n=100, method="inclusive") returns the 99 cut points that
+        # split the data into 100 equal-sized buckets, so the p-th percentile is
+        # the cut point at index p - 1.
+        cut_points = statistics.quantiles(values, n=100, method="inclusive")
+        percentile_values = {p: cut_points[p - 1] for p in _METRIC_PERCENTILES}
+    else:
+        percentile_values = {p: values[0] for p in _METRIC_PERCENTILES}
+    for percentile, value in percentile_values.items():
+        metrics[f"{key_name}/p{percentile}"] = value
+    return metrics
 
 
 def run_async_nemo_gym_rollout(

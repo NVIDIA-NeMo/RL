@@ -99,6 +99,38 @@ class TestCalculateSingleMetric:
 
         assert result["test/stddev"] == 0.0
 
+    def test_single_value_collapses_percentiles(self):
+        """Test that every percentile collapses to the single value."""
+        result = _calculate_single_metric([42.0], batch_size=1, key_name="test")
+
+        assert result["test/p50"] == 42.0
+        assert result["test/p90"] == 42.0
+        assert result["test/p95"] == 42.0
+        assert result["test/p99"] == 42.0
+
+    def test_percentiles_for_known_distribution(self):
+        """Test p50/p90/p95/p99 against hand-computed inclusive quantiles of 1..100."""
+        values = [float(i) for i in range(1, 101)]
+        result = _calculate_single_metric(
+            values, batch_size=len(values), key_name="test"
+        )
+
+        # Hand-computed via statistics.quantiles(values, n=100, method="inclusive").
+        assert abs(result["test/p50"] - 50.5) < 1e-9
+        assert abs(result["test/p90"] - 90.1) < 1e-9
+        assert abs(result["test/p95"] - 95.05) < 1e-9
+        assert abs(result["test/p99"] - 99.01) < 1e-9
+        # p50 matches the median, and percentiles stay ordered within [min, max].
+        assert result["test/p50"] == result["test/median"]
+        assert (
+            result["test/min"]
+            <= result["test/p50"]
+            <= result["test/p90"]
+            <= result["test/p95"]
+            <= result["test/p99"]
+            <= result["test/max"]
+        )
+
 
 @pytest.fixture(scope="function")
 def rollout_tokenizer():
