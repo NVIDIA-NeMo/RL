@@ -3187,11 +3187,6 @@ def async_grpo_train(
                     with timer.time("logprob_inference_prep"):
                         policy.prepare_for_lp_inference()
 
-                if not (skip_prev_logprobs and skip_reference_logprobs):
-                    print("▶ Preparing for logprob inference...")
-                    with timer.time("logprob_inference_prep"):
-                        policy.prepare_for_lp_inference()
-
                 print("▶ Computing logprobs...", flush=True)
                 with timer.time("policy_and_reference_logprobs"):
                     if not skip_prev_logprobs:
