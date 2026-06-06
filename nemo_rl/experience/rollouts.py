@@ -1275,6 +1275,19 @@ def run_async_nemo_gym_rollout(
                         )
                     )
 
+            # Pool per-call duration lists across all trajectories and log as histograms.
+            for list_key, hist_name in [
+                ("model_call_durations", "generation_call_durations_s"),
+                ("command_exec_durations", "tool_call_exec_durations_s"),
+            ]:
+                all_durations = [
+                    d for r in agent_results for d in (r.get(list_key) or [])
+                ]
+                if all_durations:
+                    per_agent_metrics[f"{agent_name}/{hist_name}"] = Histogram(
+                        all_durations
+                    )
+
             # Log the full result
             to_log = [[json.dumps(r, separators=((",", ":")))] for r in agent_results]
             per_agent_metrics[f"{agent_name}/full_result"] = Table(
