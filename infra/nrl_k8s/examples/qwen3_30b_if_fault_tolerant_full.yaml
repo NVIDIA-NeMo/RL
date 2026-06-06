@@ -24,20 +24,16 @@
 defaults: ../../../examples/configs/recipes/llm/grpo-qwen3-30ba3b-8n4g-megatron.yaml
 
 grpo:
-  # FULL-SCALE config: 32 train GPUs + 8 gen GPUs. Pair with
-  # qwen3_30b_if_fault_tolerant_full.gb300.infra.yaml and
-  # generation_standalone_qwen3_30b_ft_full.yaml. Use the non-_full
-  # variants for the capacity-constrained 32-GPU test.
-  max_num_steps: 150
-  val_period: 30
+  max_num_steps: 50
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
+  val_period: 999
   val_at_start: false
   val_at_end: false
-  val_batch_size: 32
-  max_val_samples: 32
 
 policy:
+  max_total_sequence_length: 2048
   generation:
-    # Disagg HTTP mode — 8 shards × 1 GPU (TP=1) = 8 gen GPUs.
     colocated:
       enabled: false
       resources:
@@ -46,14 +42,13 @@ policy:
 
 checkpointing:
   enabled: false
-  save_period: 100
 
 logger:
   log_dir: logs/ft-qwen3-30b-gb300
   wandb_enabled: true
   wandb:
     project: nemorl-rl-412-fault-tolerant
-    name: ft-qwen3-30b-gb300-full-aggressive
+    name: ft-qwen3-30b-gb300-50step-extreme-ft
   tensorboard_enabled: true
   monitor_gpus: true
 

@@ -72,6 +72,8 @@ class FaultInjector:
         burst_size: int = 1,
         burst_every_n_cycles: int = 0,
         burst_size_random_max: Optional[int] = None,
+        recover_batch_size: Optional[int] = None,
+        recover_batch_delay_s: float = 600.0,
     ):
         """Initialize a fault injector.
 
@@ -144,6 +146,12 @@ class FaultInjector:
             if burst_size_random_max is not None
             else None
         )
+        self.recover_batch_size = (
+            max(1, int(recover_batch_size))
+            if recover_batch_size is not None
+            else None
+        )
+        self.recover_batch_delay_s = float(recover_batch_delay_s)
         # Use SystemRandom (os.urandom-backed) so we don't inherit a
         # deterministic seed that some upstream module (torch / numpy /
         # vLLM) may have called ``random.seed()`` with — observed three
@@ -273,26 +281,38 @@ class FaultInjector:
                         flush=True,
                     )
                     time.sleep(float(self.recover_after_s))
-                for sid in sorted(killed_in_burst):
-                    try:
-                        resp = requests.post(
-                            f"{self.router_url}/admin/add_shard",
-                            json={},
-                            timeout=600,
-                        )
-                        resp.raise_for_status()
-                        body = resp.json()
+                sorted_killed = sorted(killed_in_burst)
+                batch_sz = self.recover_batch_size or len(sorted_killed)
+                for batch_start in range(0, len(sorted_killed), batch_sz):
+                    batch = sorted_killed[batch_start:batch_start + batch_sz]
+                    if batch_start > 0:
                         print(
-                            f"[fault-inject] add_shard succeeded for "
-                            f"replacement of {sid}: {body}",
+                            f"[fault-inject] staged recovery: sleeping "
+                            f"{self.recover_batch_delay_s}s before next "
+                            f"batch of {len(batch)} add_shard(s)",
                             flush=True,
                         )
-                    except Exception as e:  # noqa: BLE001
-                        print(
-                            f"[fault-inject] add_shard failed for "
-                            f"replacement of {sid}: {e}",
-                            flush=True,
-                        )
+                        time.sleep(self.recover_batch_delay_s)
+                    for sid in batch:
+                        try:
+                            resp = requests.post(
+                                f"{self.router_url}/admin/add_shard",
+                                json={},
+                                timeout=600,
+                            )
+                            resp.raise_for_status()
+                            body = resp.json()
+                            print(
+                                f"[fault-inject] add_shard succeeded for "
+                                f"replacement of {sid}: {body}",
+                                flush=True,
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            print(
+                                f"[fault-inject] add_shard failed for "
+                                f"replacement of {sid}: {e}",
+                                flush=True,
+                            )
 
             result = (
                 burst_results[0]
@@ -731,6 +751,21 @@ def maybe_launch_fault_injector(
             if burst_size_random_max_raw is not None
             else None
         )
+        recover_batch_size_raw = entry.get(
+            "recover_batch_size",
+            fi_cfg.get("recover_batch_size"),
+        )
+        recover_batch_size = (
+            int(recover_batch_size_raw)
+            if recover_batch_size_raw is not None
+            else None
+        )
+        recover_batch_delay_s = float(
+            entry.get(
+                "recover_batch_delay_s",
+                fi_cfg.get("recover_batch_delay_s", 600.0),
+            )
+        )
         actor = FaultInjector.options(
             name=f"fault-inject-{target}",
             runtime_env={"pip": ["kubernetes"]},
@@ -757,6 +792,8 @@ def maybe_launch_fault_injector(
             burst_size=burst_size,
             burst_every_n_cycles=burst_every_n_cycles,
             burst_size_random_max=burst_size_random_max,
+            recover_batch_size=recover_batch_size,
+            recover_batch_delay_s=recover_batch_delay_s,
         )
         print(
             f"[fault-inject] launched: mode={mode}, target={target}, "

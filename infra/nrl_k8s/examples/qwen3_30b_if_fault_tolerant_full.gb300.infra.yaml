@@ -25,7 +25,7 @@
 
 _shared:
   headNodeSelector: &head_node_selector
-    nodeGroup: customer-cpu
+    karpenter.sh/nodepool: cpu
   workerNodeSelector: &worker_node_selector
     nvidia.com/gpu.product: NVIDIA-GB300
 

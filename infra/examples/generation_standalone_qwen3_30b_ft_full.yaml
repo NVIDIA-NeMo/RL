@@ -9,7 +9,7 @@ policy:
     name: ${policy.model_name}
     chat_template_kwargs: null
   precision: bfloat16
-  max_total_sequence_length: 4096
+  max_total_sequence_length: 2048
   generation:
     backend: vllm
     max_new_tokens: ${policy.max_total_sequence_length}
@@ -113,65 +113,21 @@ policy:
 # FT machinery (router pool sizing, NCCL gate, threshold-based cordon, auto-
 # recovery, broadcast retry) is the only remaining variable to validate.
 fault_inject:
-  # Re-enabled: RefitWorker IPC pipeline now produces canonical-parity
-  # rewards (step-1 mean=0.5649 vs canonical 0.5757) after the
-  # cross-stream wait_stream fix in packed_broadcast_consumer
-  # (utils/packed_tensor.py). The previous KL=1.0 / rewards=0 was
-  # caused by the consumer reading uninitialized bytes from the packed
-  # buffer because NCCL broadcast wrote on _broadcast_stream while
-  # unpack/load_weights read on streams[buffer_idx], with no cross-
-  # stream sync. Now safe to stress the FT machinery with fault inject.
-  enabled: false
-  mode: pod-kill                # http-error | actor-kill | pod-kill
-  # Continuous stress test on Megatron+vLLM-async path: cycle
-  # kill+recover indefinitely. Cycle period for 30B = trigger_after_s
-  # (first only) + recover_after_s + repeat_every_s = 1200+900+300 ≈
-  # 40min for cycle 1, then 900+300 = 20min/cycle thereafter. Slower
-  # cadence than 4B because vLLM-30B init takes ~7min on a fresh pod
-  # and the cross-cluster broadcast handles 30B weights. The schedule
-  # below only fires ONE injector (single FaultInjector with
-  # repeat_every_s set), not the legacy 2-entry schedule — rotation
-  # picks the next dp-N each cycle, so we don't need pre-set targets.
+  enabled: true
+  mode: pod-kill
+  # 50-step extreme FT demo: baseline → kill 6 → staged recovery 2→4→6→8
+  # With 8×8=64 samples at 2048 seq: ~2 min/step at 8 shards, ~8 min at 2.
+  # trigger_after_s=1200 (20 min, ~10 baseline steps)
+  # recover_after_s=2400 (40 min, ~5 steps at 2 shards)
+  # recover_batch_delay_s=1200 (20 min between batches, ~5+ steps each)
   recover: true
-  # Aggressive cadence — now safe with per-refit comm teardown
-  # (RefitWorker.broadcast_weights_until_complete + vllm_backend.update_
-  # weights_from_collective both call ``group.destroy()`` at the end of
-  # every refit). Between refits there is no NCCL state spanning
-  # train↔gen, so a peer dying outside the broadcast window cannot
-  # poison surviving shards' CUDA contexts (no peer to detect death of).
-  # That removes the cascade-to-zero failure mode that previously made
-  # a 60s repeat cadence unsafe.
-  #
-  # Cycle: trigger_after_s + recover_after_s + repeat_every_s
-  # = 240+420+60 = 12min cycle period; gives 3-4 cycles in a 45min run.
-  # Fast iteration cadence: fire a burst (2 simultaneous kills) at
-  # cycle 1, then every cycle thereafter, so the cascade-eviction
-  # scenario triggers within ~10 min of run start instead of 30+ min.
-  trigger_after_s: 60             # 1 min — first kill fires shortly after first refit
-  recover_after_s: 420            # 7 min after kill — vLLM-30B pod init bound
-  repeat_every_s: 1200            # 20 min between cycles — 30B step at full 4-shard
-                                  # capacity is ~10-15min, so this gives 1-2 clean
-                                  # full-fleet steps between kills. Earlier value
-                                  # (300s = 5min) was too tight: kill always landed
-                                  # mid-step before the joining shards from the
-                                  # previous recovery had been promoted, so steady-
-                                  # state with all 4 shards never settled. Cycle
-                                  # period now: trigger_after_s + recover_after_s +
-                                  # repeat_every_s ≈ 60 + 420 + 1200 = 28 min.
-  rotate_target: true             # each cycle picks the lowest-numbered ready shard
-  target_shard: dp-0              # first cycle's target; rotation kicks in for cycle 2+
-  # Newly-promoted (replacement) shards are excluded from kill rotation
-  # for this many seconds after first observed as ``ready`` — gives
-  # every replacement at least a few full training steps of productive
-  # contribution to the rollout pool before being killed again.
-  new_shard_grace_period_s: 600
-  # Random burst pressure: each cycle uniformly samples a burst size
-  # from ``[1, burst_size_random_max]``. At TP=1 we have 8 DP shards
-  # (8 GPUs / 1 GPU-per-shard), so cap burst at 7 so that AT LEAST one
-  # shard always survives — sampling 8 with only 8 shards would kill the
-  # entire fleet in one shot, producing the cascade-to-zero scenario
-  # the eviction filter is meant to AVOID, not deliberately reproduce.
-  # Roughly ~14% kill 1, ~14% kill 2, ..., ~14% kill 7.
-  # When this is set, the static ``burst_size`` / ``burst_every_n_cycles``
-  # schedule is bypassed entirely; we omit them from this config.
-  burst_size_random_max: 7
+  trigger_after_s: 1200
+  recover_after_s: 2400
+  max_cycles: 1
+  rotate_target: true
+  target_shard: dp-0
+  new_shard_grace_period_s: 9999
+  burst_size: 6
+  burst_every_n_cycles: 1
+  recover_batch_size: 2
+  recover_batch_delay_s: 1200
