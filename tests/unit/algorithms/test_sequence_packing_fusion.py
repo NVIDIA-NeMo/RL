@@ -66,7 +66,7 @@ def _setup_2d_process_groups(rank, world_size, cp_size, tp_size):
 
 def _build_test_case(cp_size, tp_size, my_tp_rank, cp_group):
     """Build a small packed batch with CP-aware packing."""
-    from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
+    from nemo_rl.distributed.model_utils import _get_packed_thd_tokens_on_this_cp_rank
     from nemo_rl.models.megatron.data import _pack_sequences_for_megatron
 
     device = torch.device("cuda")
@@ -149,8 +149,8 @@ def _build_test_case(cp_size, tp_size, my_tp_rank, cp_group):
         )
 
         total_padded_tokens = int(cu_seqlens_padded[-1].item())
-        packed_logits = torch.zeros(
-            1, total_padded_tokens // cp_size, vocab_size_local, device=device
+        full_packed_logits = torch.zeros(
+            1, total_padded_tokens, vocab_size_local, device=device
         )
 
         run_seq = 0
@@ -161,14 +161,16 @@ def _build_test_case(cp_size, tp_size, my_tp_rank, cp_group):
             )
             tmp = torch.zeros(1, padded_seq_len, vocab_size_local, device=device)
             tmp[:, :seq_len, :] = logits_local[i : i + 1, :seq_len, :]
-            packed_logits[
-                :,
-                run_seq // cp_size : (run_seq + padded_seq_len) // cp_size,
-                :,
-            ] = _get_tokens_on_this_cp_rank(
-                tmp, torch.distributed.get_rank(cp_group), cp_size
-            )
+            full_packed_logits[:, run_seq : run_seq + padded_seq_len, :] = tmp
             run_seq += padded_seq_len
+
+        packed_logits = _get_packed_thd_tokens_on_this_cp_rank(
+            full_packed_logits,
+            cu_seqlens_padded,
+            torch.distributed.get_rank(cp_group),
+            cp_size,
+            seq_dim=1,
+        )
 
         return logits_local, packed_logits
 
