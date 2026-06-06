@@ -142,7 +142,7 @@ kuberay:
       disagg.nemo-rl/run: ft-experiment-alt-ctrl
       kai.scheduler/queue: backfill
     spec:
-      rayVersion: "2.54.0"
+      rayVersion: "2.55.1"
       headGroupSpec:
         rayStartParams:
           dashboard-host: "0.0.0.0"
