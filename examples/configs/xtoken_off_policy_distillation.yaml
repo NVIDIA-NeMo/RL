@@ -4,6 +4,8 @@
 # P-KL loss mode (gold_loss=false, xtoken_loss=false). Override the model
 # names, tokenizers, and data_files via Hydra CLI for other pairs.
 
+defaults: distillation_math.yaml
+
 distillation:
   num_prompts_per_step: 64
   max_num_steps: 5000
