@@ -1560,3 +1560,38 @@ def get_next_experiment_dir(base_log_dir: str) -> str:
     os.makedirs(new_log_dir, exist_ok=True)
 
     return new_log_dir
+
+
+def log_container_init_timing() -> None:
+    """Log pre-Python container timing from environment variables."""
+    now = time.time()
+    slurm_start = os.environ.get("SLURM_JOB_START_TIME")
+    job_start = os.environ.get("NRL_JOB_START_EPOCH")
+    ray_ready = os.environ.get("NRL_RAY_READY_EPOCH")
+
+    if not job_start:
+        logging.warning(
+            "Cannot detect container startup time: NRL_JOB_START_EPOCH not set. "
+            "Ensure the launch script exports this variable for init timing."
+        )
+        return
+
+    job_start_f = float(job_start)
+    total = now - job_start_f
+
+    print("\n" + "=" * 60)
+    print(" " * 14 + "CONTAINER INIT TIMING")
+
+    if slurm_start:
+        prologue = job_start_f - float(slurm_start)
+        print(f"  slurm_prologue: {prologue:.1f}s")
+        total = now - float(slurm_start)
+
+    if ray_ready:
+        ray_ready_f = float(ray_ready)
+        cluster = ray_ready_f - job_start_f
+        driver_startup = now - ray_ready_f
+        print(f"  cluster_startup (orchestrator+container+ray): {cluster:.1f}s")
+        print(f"  driver_startup (launch+python+imports): {driver_startup:.1f}s")
+    print(f"  total: {total:.1f}s")
+    print("=" * 60 + "\n", flush=True)

@@ -24,6 +24,8 @@ from typing import Any, Generator, Iterable, Optional, Set, Union, cast
 
 import ray
 import torch
+
+from nemo_rl.utils.timer import Timer
 from accelerate import init_empty_weights
 from hydra.utils import get_class
 from torch import nn
@@ -219,6 +221,7 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
         # torch distributed init. Envars for rank, world_size, and master_addr and master_port are set from the ray remote call
         torch.distributed.init_process_group(backend="nccl")
         self.rank = torch.distributed.get_rank()
+        self.timer = Timer(context={"worker": "dtensor_policy", "rank": self.rank})
         world_size = torch.distributed.get_world_size()
         model_name = self.cfg["model_name"]
 
@@ -564,6 +567,7 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
+        self.timer.start("train")
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:
@@ -958,6 +962,7 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
                 "all_mb_metrics": dict(mb_metrics),
             }
 
+            self.timer.stop("train")
             return metrics
 
     # TODO @Rayen Tian: Related Issue: Refactor shared logic between score() and get_logprobs() (https://github.com/NVIDIA-NeMo/RL/issues/1094)
@@ -977,6 +982,7 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
+        self.timer.start("get_logprobs")
         logprob_batch_size = (
             micro_batch_size
             if micro_batch_size is not None
@@ -1279,6 +1285,7 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
             )
 
         return_data["logprobs"] = token_logprobs.cpu()
+        self.timer.stop("get_logprobs")
         return return_data
 
     # TODO @Rayen Tian: Related Issue: Refactor shared logic between score() and get_logprobs() (https://github.com/NVIDIA-NeMo/RL/issues/1094)

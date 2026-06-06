@@ -250,7 +250,7 @@ def validate(
         print("  ⚠️ No validation dataloader provided, skipping validation")
         return {}, {}
 
-    timer = Timer()
+    timer = Timer(context={"worker": "sft_validator"})
 
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step}...")
@@ -361,7 +361,7 @@ def sft_train(
     sft_save_state: SFTSaveState,
 ) -> None:
     # Run basic sft training
-    timer = Timer()
+    timer = Timer(context={"worker": "sft_driver"})
     timeout = TimeoutChecker(
         timeout=master_config["checkpointing"]["checkpoint_must_save_by"],
         fit_last_save_time=True,

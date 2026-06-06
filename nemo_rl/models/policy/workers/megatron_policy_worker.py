@@ -21,6 +21,8 @@ from typing import Any, Iterator, Optional, TypeVar, cast
 
 import ray
 import torch
+
+from nemo_rl.utils.timer import Timer
 from megatron.bridge.training.checkpointing import (
     maybe_finalize_async_save,
     save_checkpoint,
@@ -128,6 +130,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
 
         # Set rank for non-collocated to check which ranks to broadcast from
         self.rank = get_rank_safe()
+        self.timer = Timer(context={"worker": "megatron_policy", "rank": self.rank})
 
         # Step 1: Setup distributed
         setup_distributed()
@@ -264,6 +267,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
+        self.timer.start("train")
         # Note: zero_grad_buffer is called at the start of each global batch iteration
         # in the loop below, so we don't need to call it here.
         if hasattr(self.model, "inference_params"):
@@ -460,6 +464,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             )
             if moe_metrics:
                 metrics["moe_metrics"] = moe_metrics
+        self.timer.stop("train")
         return metrics
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs")
@@ -479,6 +484,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
+        self.timer.start("get_logprobs")
         no_grad = torch.no_grad()
         no_grad.__enter__()
         logprob_batch_size = (
@@ -543,6 +549,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         logprobs = broadcast_tensors_from_last_stage(tensors)["logprobs"]
 
         no_grad.__exit__(None, None, None)
+        self.timer.stop("get_logprobs")
         return BatchedDataDict[LogprobOutputSpec](logprobs=logprobs).to("cpu")
 
     def _apply_state_dict_to_model(

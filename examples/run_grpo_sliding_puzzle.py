@@ -17,6 +17,7 @@ import itertools
 import os
 import pprint
 import random
+import time
 from typing import Any, Iterator, Mapping
 
 from omegaconf import OmegaConf
@@ -39,7 +40,8 @@ from nemo_rl.utils.config import (
     parse_hydra_overrides,
     register_omegaconf_resolvers,
 )
-from nemo_rl.utils.logger import get_next_experiment_dir
+from nemo_rl.utils.logger import get_next_experiment_dir, log_container_init_timing
+from nemo_rl.utils.timer import Timer
 
 
 def parse_args():
@@ -193,6 +195,11 @@ def setup_puzzle_data(
 
 def main():
     """Main entry point."""
+    main_start = time.perf_counter()
+    log_container_init_timing()
+
+    rl_init_timer = Timer(context={"worker": "driver"})
+
     # Parse arguments
     register_omegaconf_resolvers()
     args, overrides = parse_args()
@@ -202,15 +209,16 @@ def main():
             os.path.dirname(__file__), "configs", "grpo_sliding_puzzle.yaml"
         )
 
-    config = load_config(args.config)
-    print(f"Loaded configuration from: {args.config}")
+    with rl_init_timer.time("config"):
+        config = load_config(args.config)
+        print(f"Loaded configuration from: {args.config}")
 
-    if overrides:
-        print(f"Overrides: {overrides}")
-        config = parse_hydra_overrides(config, overrides)
+        if overrides:
+            print(f"Overrides: {overrides}")
+            config = parse_hydra_overrides(config, overrides)
 
-    config: MasterConfig = OmegaConf.to_container(config, resolve=True)
-    print("Applied CLI overrides")
+        config: MasterConfig = OmegaConf.to_container(config, resolve=True)
+        print("Applied CLI overrides")
 
     # Print config
     print("Final config:")
@@ -224,43 +232,57 @@ def main():
             f"📊 Using checkpoint directory: {config['checkpointing']['checkpoint_dir']}"
         )
 
-    init_ray()
+    with rl_init_timer.time("ray_connect"):
+        init_ray()
 
     set_seed(config["grpo"]["seed"])
 
     # setup tokenizer
-    tokenizer = get_tokenizer(config["policy"]["tokenizer"])
-    config["policy"]["generation"] = configure_generation_config(
-        config["policy"]["generation"], tokenizer
-    )
+    with rl_init_timer.time("tokenizer"):
+        tokenizer = get_tokenizer(config["policy"]["tokenizer"])
+        config["policy"]["generation"] = configure_generation_config(
+            config["policy"]["generation"], tokenizer
+        )
 
     # setup data & env map
-    ds_length = (
-        config["grpo"]["num_prompts_per_step"]
-        * config["grpo"]["num_generations_per_prompt"]
-        * config["grpo"]["max_num_steps"]
-    )
-    dataset, val_dataset, task_to_env, val_task_to_env = setup_puzzle_data(
-        tokenizer=tokenizer,
-        env_cfg=config["env"],
-        task_name="sliding_puzzle_game",
-        length=ds_length,
-        val_length=config["grpo"]["max_val_samples"],
-        add_system_prompt=config["data"]["add_system_prompt"],
-    )
+    with rl_init_timer.time("data"):
+        ds_length = (
+            config["grpo"]["num_prompts_per_step"]
+            * config["grpo"]["num_generations_per_prompt"]
+            * config["grpo"]["max_num_steps"]
+        )
+        dataset, val_dataset, task_to_env, val_task_to_env = setup_puzzle_data(
+            tokenizer=tokenizer,
+            env_cfg=config["env"],
+            task_name="sliding_puzzle_game",
+            length=ds_length,
+            val_length=config["grpo"]["max_val_samples"],
+            add_system_prompt=config["data"]["add_system_prompt"],
+        )
 
-    (
-        policy,
-        policy_generation,
-        cluster,
-        dataloader,
-        val_dataloader,
-        loss_fn,
-        logger,
-        checkpointer,
-        grpo_state,
-        master_config,
-    ) = setup(config, tokenizer, dataset, val_dataset)
+    with rl_init_timer.time("setup"):
+        (
+            policy,
+            policy_generation,
+            cluster,
+            dataloader,
+            val_dataloader,
+            loss_fn,
+            logger,
+            checkpointer,
+            grpo_state,
+            master_config,
+        ) = setup(config, tokenizer, dataset, val_dataset)
+
+    rl_init_timer.record("total", time.perf_counter() - main_start)
+
+    rl_init_metrics = rl_init_timer.get_timing_metrics(reduction_op="sum")
+    print("\n" + "=" * 60)
+    print(" " * 14 + "RL INIT TIMING BREAKDOWN")
+    for label, value in sorted(rl_init_metrics.items()):
+        if isinstance(value, (int, float)):
+            print(f"  {label}: {value:.1f}s")
+    print("=" * 60 + "\n", flush=True)
 
     grpo_train(
         policy,

@@ -513,7 +513,7 @@ def distillation_train(
     master_config: MasterConfig,
 ) -> None:
     """Run Distillation training algorithm."""
-    timer = Timer()
+    timer = Timer(context={"worker": "distillation_driver"})
     timeout = TimeoutChecker(
         timeout=master_config["checkpointing"]["checkpoint_must_save_by"],
         fit_last_save_time=True,
@@ -965,7 +965,7 @@ def validate(
         )
         return {}, {}
 
-    timer = Timer()
+    timer = Timer(context={"worker": "distillation_validator"})
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step}...", flush=True)
 
