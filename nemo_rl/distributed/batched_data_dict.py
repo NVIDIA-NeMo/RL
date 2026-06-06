@@ -118,9 +118,33 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         """
         stacked_dict: Self = cls()
         pad_value_dict = pad_value_dict or {}
+        if not batches:
+            return stacked_dict
 
-        for k in sorted(batches[0]):
-            list_of_tensors = [item[k] for item in batches]
+        def batch_size(item: Mapping[Any, Any]) -> int:
+            if not item:
+                return 0
+            value = next(iter(item.values()))
+            if isinstance(value, PackedTensor):
+                return len(value)
+            if isinstance(value, torch.Tensor):
+                return value.shape[0]
+            return len(value)
+
+        keys = sorted({key for item in batches for key in item})
+        for k in keys:
+            missing_nonempty_batches = [
+                idx
+                for idx, item in enumerate(batches)
+                if k not in item and batch_size(item)
+            ]
+            if missing_nonempty_batches:
+                raise KeyError(
+                    f"Key {k!r} is missing from non-empty batches "
+                    f"{missing_nonempty_batches}."
+                )
+
+            list_of_tensors = [item[k] for item in batches if k in item]
 
             if isinstance(list_of_tensors[0], list):
                 tensor_or_list: list[Any] | torch.Tensor = [
