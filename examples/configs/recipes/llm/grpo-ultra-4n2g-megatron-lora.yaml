@@ -1,0 +1,425 @@
+# =============================================================================
+# GRPO/DAPO Ultra V3 LoRA - 4 Train Nodes + 2 vLLM Nodes
+# =============================================================================
+# LoRA smoke-to-starter recipe for Nemotron 3 Ultra RL on GB200 Slurm systems.
+# This recipe follows the full-weight DAPO Ultra starter path, but enables PEFT
+# and reduces the training allocation to 4 Megatron nodes plus 2 non-colocated
+# vLLM generation nodes.
+#
+# This file is self-contained and intentionally has no defaults inheritance.
+#
+#   - gpus_per_node: 4
+#   - training nodes: 4
+#   - generation nodes: 2
+#   - Megatron TP: 2
+#   - Megatron EP: 16
+#   - vLLM TP: 8
+#   - LoRA rank: 16
+# =============================================================================
+
+# =============================================================================
+# Cluster - overridden by launch script
+# =============================================================================
+cluster:
+  gpus_per_node: 4
+  num_nodes: 6
+  segment_size: null
+
+# =============================================================================
+# Checkpointing
+# =============================================================================
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/grpo-ultra-4n2g-megatron-lora"
+  metric_name: "train:reward"
+  higher_is_better: true
+  keep_top_k: 1
+  save_period: 5
+  ft_keep_latest_k: 1
+  ft_save_period: 5
+  checkpoint_must_save_by: null
+  model_save_format: null
+  save_consolidated: false
+
+# =============================================================================
+# GRPO / DAPO Algorithm
+# =============================================================================
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 2
+  num_val_generations_per_prompt: 2
+  max_rollout_turns: 1
+  max_num_epochs: 1
+  max_num_steps: 100
+
+  normalize_rewards: true
+  use_leave_one_out_baseline: false
+  advantage_clip_low: -50
+  advantage_clip_high: 50
+
+  val_period: -1
+  val_at_start: false
+  val_at_end: false
+  overlong_filtering: false
+  max_val_samples: 32
+  val_batch_size: 8
+  seed: 42
+
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 8
+  dynamic_sampling_oversample_ratio: 1.0
+  batch_multiplier: 1
+
+  penalize_invalid_tool_call: false
+  invalid_tool_call_advantage: -5.0
+  penalize_malformed_thinking: false
+  malformed_thinking_advantage: -5.0
+
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 256
+    overlong_buffer_penalty: 1
+    max_response_length: 2048
+    stop_properly_penalty_coef: null
+
+  reward_scaling:
+    enabled: true
+    source_min: 0.0
+    source_max: 1.0
+    target_min: -1.0
+    target_max: 1.0
+
+  adv_estimator:
+    name: "grpo"
+    normalize_rewards: ${grpo.normalize_rewards}
+    use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
+    minus_baseline: true
+
+  async_grpo:
+    enabled: false
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: false
+    recompute_kv_cache_after_weight_updates: false
+
+  use_best_at_k: false
+  best_at_k_k: 8
+  best_at_k_m: 1000
+
+  use_combined_training: false
+  combined_training_weight_mode: "auto"
+  combined_training_best_at_k_weight: 0.2
+  combined_training_pass_at_1_weight: 1.0
+
+  seq_logprob_error_threshold: 2
+
+# =============================================================================
+# Loss Function
+# =============================================================================
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  reference_policy_kl_type: "k3"
+  kl_input_clamp_value: null
+  kl_output_clamp_value: null
+
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10.0
+  use_on_policy_kl_approximation: true
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_ratio: 5
+  truncated_importance_sampling_ratio_min: null
+  truncated_importance_sampling_type: "tis"
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  force_on_policy_ratio: false
+  use_kl_in_reward: false
+
+# =============================================================================
+# Policy
+# =============================================================================
+policy:
+  model_name: "/path/to/nemotron-ultra-compat-checkpoint"
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs: null
+  hf_config_overrides: {}
+
+  train_global_batch_size: 16
+  train_micro_batch_size: 1
+  generation_batch_size: 16
+  logprob_batch_size: 1
+  max_total_sequence_length: 4096
+  precision: "bfloat16"
+  logprob_chunk_size: 1024
+  offload_optimizer_for_logprob: false
+
+  dtensor_cfg:
+    enabled: false
+
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 1
+    activation_checkpointing: true
+
+    tensor_model_parallel_size: 2
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 16
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 1
+    pipeline_dtype: ${policy.precision}
+    sequence_parallel: true
+
+    # MoE
+    # PEFT currently does not support freezing the MoE router in this path.
+    freeze_moe_router: false
+    moe_router_dtype: "fp32"
+    moe_router_load_balancing_type: "none"
+    moe_router_bias_update_rate: 1.0e-3
+    moe_router_enable_expert_bias: true
+    moe_permute_fusion: true
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "alltoall"
+    moe_flex_dispatcher_backend: "alltoall"
+    moe_hybridep_num_sms: 32
+    moe_aux_loss_coeff: 0.0
+    moe_shared_expert_overlap: false
+    use_gloo_process_groups: false
+
+    # Compute
+    apply_rope_fusion: true
+    use_fused_weighted_squared_relu: true
+    bias_activation_fusion: false
+    defer_fp32_logits: true
+
+    # Logging
+    track_moe_metrics: false
+    moe_per_layer_logging: false
+    do_not_average_loss: true
+    cp_normalize: true
+    calculate_per_token_loss: true
+    scale_loss_by_dp_cp_size: false
+
+    # MTP
+    mtp_loss_scaling_factor: 0.3
+    mtp_use_repeated_layer: true
+    mtp_num_layers: 5
+    mtp_detach_heads: true
+
+    # LoRA / PEFT
+    peft:
+      enabled: true
+      target_modules:
+        - "decoder.layers.*.self_attention.linear_qkv"
+        - "decoder.layers.*.self_attention.linear_proj"
+      exclude_modules: []
+      dim: 16
+      alpha: 32
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init_method: "xavier"
+      lora_B_init_method: "zero"
+      a2a_experimental: false
+      lora_dtype: null
+
+    optimizer:
+      optimizer: "adam"
+      lr: 1.0e-5
+      min_lr: 1.0e-5
+      weight_decay: 0.0
+      bf16: true
+      fp16: false
+      params_dtype: "float32"
+
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1.0e-8
+
+      sgd_momentum: 0.9
+
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+
+      clip_grad: ${policy.max_grad_norm}
+
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"
+      lr_decay_iters: null
+      lr_warmup_iters: 0
+      lr_warmup_init: 1.0e-6
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: false
+      overlap_param_gather: true
+      average_in_collective: false
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: "optim_grads_params"
+
+    # FP8
+    fp8_cfg:
+      enabled: false
+      fp8: "e4m3"
+      fp8_recipe: "mxfp8"
+      fp8_param: false
+
+    first_last_layers_bf16: true
+    num_layers_at_start_in_bf16: 1
+    num_layers_at_end_in_bf16: 1
+
+    checkpoint:
+      async_save: true
+      ckpt_assume_constant_structure: true
+      fully_parallel_save_process_group: "ep_dp"
+      fully_parallel_load_process_group: "ep_dp"
+      fully_parallel_load_exchange_algo: "broadcast"
+
+    env_vars: null
+
+  # ---------------------------------------------------------------------------
+  # Sequence Packing
+  # ---------------------------------------------------------------------------
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+    fuse_loss: true
+
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  max_grad_norm: 1.0
+  optimizer: null
+  scheduler: null
+
+  # ---------------------------------------------------------------------------
+  # Generation (vLLM) - Non-colocated
+  # ---------------------------------------------------------------------------
+  generation:
+    port_range_low: 3000
+    port_range_high: 4999
+    backend: "vllm"
+    max_new_tokens: 2048
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+
+    mcore_generation_config:
+      buffer_size_gb: 20
+      buffer_guaranteed_fraction: 0.1
+      num_cuda_graphs: 16
+      block_size_tokens: 256
+      use_cuda_graphs_for_non_decode_steps: true
+      enable_chunked_prefill: true
+      unified_memory_level: 0
+      max_tokens: 4096
+
+    vllm_cfg:
+      async_engine: true
+      precision: ${policy.precision}
+      kv_cache_dtype: "auto"
+      tensor_parallel_size: 8
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.85
+      max_model_len: 4096
+      enforce_eager: false
+      use_deep_gemm: false
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 0.5
+      expose_http_server: false
+      skip_tokenizer_init: false
+      fp8_cfg:
+        is_mx: false
+
+    vllm_kwargs:
+      attention_backend: FLASH_ATTN
+      mamba_ssm_cache_dtype: "float32"
+      compilation_config:
+        cudagraph_capture_sizes: [1,2,4,8]
+        pass_config:
+          # Disable FlashInfer TRTLLM AllReduce fusion. It requires
+          # SymmDeviceMemory (MNNVL IPC) to initialize successfully on every TP
+          # rank. When TP spans multiple nodes, mixed success/fallback can split
+          # the TP group between TRTLLM allreduce and NCCL and cause a hang.
+          fuse_allreduce_rms: false
+
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 2
+
+# =============================================================================
+# Data
+# =============================================================================
+data:
+  max_input_seq_length: 2048
+  shuffle: true
+  num_workers: 1
+  train:
+    dataset_name: "DAPOMath17K"
+    split_validation_size: 0.0
+    seed: ${grpo.seed}
+  validation:
+    dataset_name: "DAPOMathAIME2024"
+  default:
+    prompt_file: null
+    system_prompt_file: null
+    processor: "math_hf_data_processor"
+    env_name: "math"
+
+# =============================================================================
+# Environment
+# =============================================================================
+env:
+  math:
+    num_workers: 8
+    math_verify_impl: "dapo_math_verify"
+
+# =============================================================================
+# Logging
+# =============================================================================
+logger:
+  log_dir: "logs/dapo_ultra_lora_4n2g"
+  num_val_samples_to_print: 0
+  wandb_enabled: false
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  monitor_gpus: true
+  swanlab_enabled: false
+
+  wandb:
+    project: "dapo-ultra-lora"
+    name: "dapo-ultra-lora-4n2g"
+
+  swanlab:
+    project: "dapo-ultra-lora"
+    name: "dapo-ultra-lora-4n2g"
+
+  tensorboard: {}
+
+  mlflow:
+    experiment_name: "dapo-ultra-lora-4n2g"
+    run_name: "dapo-ultra-lora-4n2g"
+
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
