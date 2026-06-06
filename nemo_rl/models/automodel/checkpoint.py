@@ -38,6 +38,62 @@ from transformers import AutoTokenizer
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 
 
+def _patch_qwen_vl_vision_key_mapping() -> None:
+    """Re-add the Qwen2.5-VL ``^visual`` -> ``model.visual`` checkpoint key rename.
+
+    Workaround for a transformers 5.5.x regression. transformers #44627 (v5.5.0)
+    centralized VLM checkpoint key-conversions and dropped the Qwen2.5-VL
+    ``^visual -> model.visual`` rename; transformers #45358 restored it only in
+    v5.6.0. NeMo-RL pins ``transformers<5.6.0`` and Automodel's
+    ``get_combined_key_mapping`` only mirrors transformers ``WeightRenaming``
+    entries, so on v5.5.x the vision-tower checkpoint keys (``visual.*``) stay
+    unmapped and are dropped by FSDP2 ``set_model_state_dict(strict=False)`` in
+    ``load_base_model`` -> the vision tower is left randomly initialized, which
+    makes the training forward diverge from vLLM (token_mult_prob_error).
+
+    This wraps ``get_combined_key_mapping`` to inject the missing rule for
+    ``qwen2_5_vl``/``qwen2_vl``. It is idempotent: the rule is only added when no
+    existing rule already targets ``model.visual`` (so it auto-noops on
+    transformers >=5.6.0 or once Automodel adopts the equivalent fix, Automodel
+    PR #2431). Remove this once the Automodel pin or the transformers pin carries
+    the fix.
+    """
+    # Escape hatch (also used for A/B validation of this workaround).
+    if os.environ.get("NRL_DISABLE_QWENVL_VISION_PATCH") == "1":
+        return
+
+    import nemo_automodel.components.checkpoint.checkpointing as _am_ckpt
+
+    _vision_nested = {"qwen2_5_vl", "qwen2_vl"}
+    _orig = _am_ckpt.get_combined_key_mapping
+
+    if getattr(_orig, "_nrl_vision_patch", False):
+        return
+
+    def _patched_get_combined_key_mapping(model_type, model_key_mapping=None):
+        result = _orig(model_type, model_key_mapping)
+        if model_type in _vision_nested:
+            result = dict(result or {})
+            if not any(str(t).startswith("model.visual") for t in result.values()):
+                result[r"^visual\."] = "model.visual."
+        return result or None
+
+    _patched_get_combined_key_mapping._nrl_vision_patch = True
+    _am_ckpt.get_combined_key_mapping = _patched_get_combined_key_mapping
+
+
+try:
+    _patch_qwen_vl_vision_key_mapping()
+except Exception as e:  # pragma: no cover - defensive: never break import
+    import logging
+
+    logging.getLogger(__name__).warning(
+        "Failed to apply Qwen2.5-VL vision-tower key-mapping patch "
+        "(transformers 5.5.x / Automodel #2431 workaround): %s",
+        e,
+    )
+
+
 class AutomodelCheckpointManager:
     """Manages checkpointing for DTensor-based models using nemo_automodel's Checkpointer.
 
