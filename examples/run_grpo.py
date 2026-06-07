@@ -142,6 +142,8 @@ def main() -> None:
         checkpointer,
         grpo_state,
         master_config,
+        teacher_worker_groups,
+        alias_to_group_alias,
     ) = setup(
         config,
         tokenizer,
@@ -200,6 +202,8 @@ def main() -> None:
             grpo_save_state=grpo_state,
             master_config=master_config,
             max_trajectory_age_steps=async_config["max_trajectory_age_steps"],
+            teacher_worker_groups=teacher_worker_groups,
+            alias_to_group_alias=alias_to_group_alias,
         )
     else:
         # Two parallel synchronous trainers (verl-style — main_ppo.py vs
