@@ -32,7 +32,6 @@ from nemo_rl.algorithms.x_token.token_aligner import (
     _canonicalize_sequence,
 )
 
-
 # ---------------------------------------------------------------------------
 # Test scaffolding — barebones aligner without real tokenizers / projection.
 # ---------------------------------------------------------------------------

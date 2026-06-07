@@ -191,7 +191,9 @@ def setup(
     assert (
         policy_config["dtensor_cfg"].get("tensor_parallel_size", 1) == 1
         and policy_config["dtensor_cfg"].get("context_parallel_size", 1) == 1
-    ), "xtoken distillation requires policy tensor_parallel_size=1 and context_parallel_size=1."
+    ), (
+        "xtoken distillation requires policy tensor_parallel_size=1 and context_parallel_size=1."
+    )
 
     set_seed(distillation_config["seed"])
 
