@@ -1036,13 +1036,10 @@ class DTensorPolicyWorkerV2Impl(
             self.model = self.move_buffer_to_device(self.model, "cuda")
 
         self.model.train()
-        # Move optimizer state to CUDA if it exists
-        # colocated generation will always offload optimizer to cuda before refit
-        if (
-            self.optimizer is not None
-            and not self.cpu_offload
-            and (self.offload_optimizer_for_logprob or self.is_generation_colocated)
-        ):
+        # Training expects optimizer state on CUDA. Restore unconditionally rather
+        # than tracking which path offloaded it; move_optimizer_to_device is a no-op
+        # when the state is already resident.
+        if self.optimizer is not None and not self.cpu_offload:
             self.move_optimizer_to_device("cuda")
 
         torch.cuda.empty_cache()

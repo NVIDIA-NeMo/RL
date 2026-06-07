@@ -144,6 +144,11 @@ class GRPOConfig(TypedDict):
     max_num_steps: int
     max_rollout_turns: int
     normalize_rewards: bool
+    # Clipping bounds for normalized advantages to prevent extreme values
+    # When set, advantages are clipped to [advantage_clip_low, advantage_clip_high] after normalization
+    # Default: null (no clipping)
+    advantage_clip_low: NotRequired[float | None]
+    advantage_clip_high: NotRequired[float | None]
     use_leave_one_out_baseline: bool
     val_period: int
     val_batch_size: int | None  # None for NeMo-Gym compatibility
@@ -172,6 +177,12 @@ class GRPOConfig(TypedDict):
     # Sequence-level logprob error masking for training stability. If set, mask sequences with mult_prob_error exceeding this threshold (same scale as token_mult_prob_error metric, e.g., 1.5)
     # Note that this is slightly different than Masked Importance Sampling (MIS) because this uses the absolute value of the difference between the training and generation logprobs, whereas MIS just uses the difference between the training and generation logprobs.
     seq_logprob_error_threshold: float | None
+    # Advantage value to assign to invalid tool call tokens. When set (e.g. -5.0), overwrites the
+    # computed advantage for those tokens to penalize them; absent/None disables the penalty.
+    invalid_tool_call_advantage: NotRequired[float | None]
+    # Advantage value to assign to tokens with malformed <think>/</think> tags. When set (e.g. -5.0),
+    # overwrites the computed advantage for those tokens; absent/None disables the penalty.
+    malformed_thinking_advantage: NotRequired[float | None]
     # Advantage estimator configuration (grpo or reinforce_plus_plus)
     adv_estimator: NotRequired[AdvEstimatorConfig]
 
@@ -1083,6 +1094,122 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
                 )
 
 
+def _resolve_message_level_advantage_penalties(
+    master_config: MasterConfig,
+) -> tuple[float | None, float | None]:
+    """Return configured message-level penalties and validate feature support."""
+    invalid_tool_call_advantage = master_config.grpo.get("invalid_tool_call_advantage")
+    malformed_thinking_advantage = master_config.grpo.get(
+        "malformed_thinking_advantage"
+    )
+    if invalid_tool_call_advantage is None and malformed_thinking_advantage is None:
+        return invalid_tool_call_advantage, malformed_thinking_advantage
+
+    # The is_invalid_tool_call / has_malformed_thinking flags these penalties rely on
+    # are only populated by the NeMo-Gym environment. Without that path the penalties
+    # would silently no-op, so fail loudly instead.
+    assert _should_use_nemo_gym(master_config), (
+        "grpo.invalid_tool_call_advantage / grpo.malformed_thinking_advantage require "
+        "the NeMo-Gym path (env.should_use_nemo_gym=true); they are not supported with "
+        "the native generation path."
+    )
+    return invalid_tool_call_advantage, malformed_thinking_advantage
+
+
+def _apply_message_level_advantage_penalties(
+    train_data: BatchedDataDict[ClippedPGLossDataDict],
+    message_logs: list[LLMMessageLogType | VLMMessageLogType],
+    invalid_tool_call_advantage: float | None,
+    malformed_thinking_advantage: float | None,
+    log_config: bool = False,
+) -> None:
+    """Overwrite advantages for flagged assistant-message token spans.
+
+    For each assistant message flagged by the NeMo-Gym detector as an invalid
+    tool call or malformed thinking, overwrite that message's advantage span in
+    ``train_data["advantages"]`` with the configured negative value. No-op when
+    neither ``grpo.invalid_tool_call_advantage`` nor
+    ``grpo.malformed_thinking_advantage`` is set.
+
+    Args:
+        train_data: Training batch; ``advantages`` is modified in place.
+        message_logs: Batch of message logs with per-message flags.
+        invalid_tool_call_advantage: Advantage value assigned to invalid tool calls.
+        malformed_thinking_advantage: Advantage value assigned to malformed thinking.
+        log_config: If True, print the configured penalty values once.
+    """
+    invalid_neg_adv = invalid_tool_call_advantage
+    malformed_neg_adv = malformed_thinking_advantage
+    if invalid_neg_adv is None and malformed_neg_adv is None:
+        return
+
+    if log_config:
+        print(
+            f"Invalid tool call advantage: {invalid_neg_adv}",
+            flush=True,
+        )
+        print(
+            f"Malformed thinking advantage: {malformed_neg_adv}",
+            flush=True,
+        )
+
+    for i, message_log in enumerate(message_logs):
+        token_offset = 0
+        for j, message in enumerate(message_log):
+            token_ids = cast(torch.Tensor, message["token_ids"])
+            msg_len = len(token_ids)
+            is_assistant = (
+                message["role"] == "assistant" and "generation_logprobs" in message
+            )
+            is_invalid = (
+                is_assistant
+                and invalid_neg_adv is not None
+                and message.get("is_invalid_tool_call", False)
+            )
+            is_malformed_thinking = (
+                is_assistant
+                and malformed_neg_adv is not None
+                and message.get("has_malformed_thinking", False)
+            )
+            if is_invalid:
+                print(
+                    f"Setting negative advantage ({invalid_neg_adv}) for invalid tool call in assistant message {i} {j}",
+                    flush=True,
+                )
+                train_data["advantages"][i, token_offset : token_offset + msg_len] = (
+                    invalid_neg_adv
+                )
+            elif is_malformed_thinking:
+                print(
+                    f"Setting negative advantage ({malformed_neg_adv}) for malformed thinking in assistant message {i} {j}",
+                    flush=True,
+                )
+                train_data["advantages"][i, token_offset : token_offset + msg_len] = (
+                    malformed_neg_adv
+                )
+            token_offset += msg_len
+
+
+def _apply_configured_message_level_advantage_penalties(
+    train_data: BatchedDataDict[ClippedPGLossDataDict],
+    message_logs: list[LLMMessageLogType | VLMMessageLogType],
+    master_config: MasterConfig,
+    log_config: bool = False,
+) -> None:
+    """Resolve config and apply message-level advantage penalties."""
+    (
+        invalid_tool_call_advantage,
+        malformed_thinking_advantage,
+    ) = _resolve_message_level_advantage_penalties(master_config)
+    _apply_message_level_advantage_penalties(
+        train_data=train_data,
+        message_logs=message_logs,
+        invalid_tool_call_advantage=invalid_tool_call_advantage,
+        malformed_thinking_advantage=malformed_thinking_advantage,
+        log_config=log_config,
+    )
+
+
 def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
     """Determine if async rollouts should be used based on the configuration.
 
@@ -1179,6 +1306,20 @@ def _create_advantage_estimator(master_config: MasterConfig):
     return adv_estimator
 
 
+def _clip_grpo_advantages(
+    advantages: torch.Tensor,
+    grpo_config: dict[str, Any],
+) -> torch.Tensor:
+    """Clamp normalized advantages when clip bounds are configured."""
+    clip_low = grpo_config.get("advantage_clip_low", None)
+    clip_high = grpo_config.get("advantage_clip_high", None)
+    if clip_low is not None:
+        advantages = advantages.clamp(min=clip_low)
+    if clip_high is not None:
+        advantages = advantages.clamp(max=clip_high)
+    return advantages
+
+
 def refit_policy_generation(
     policy: ColocatablePolicyInterface,
     policy_generation: GenerationInterface,
@@ -1254,12 +1395,14 @@ def refit_policy_generation(
                 raise NotImplementedError(
                     "SGLang haven't implemented non-colocated inference mode. "
                 )
+            policy.offload_before_refit()
             futures_train = policy.broadcast_weights_for_collective(kv_scales=kv_scales)
             futures_inference = policy_generation.update_weights_from_collective()
             # wait for all futures to complete
             ray.get(futures_train)
             results = ray.get(futures_inference)
             update_success = all(result for result in results if result is not None)
+            policy.prepare_for_training()
 
         # check if update is successful
         if not update_success:
@@ -1491,6 +1634,7 @@ def grpo_train(
     val_at_start = master_config.grpo["val_at_start"]
     val_at_end = master_config.grpo["val_at_end"]
     val_period = master_config.grpo["val_period"]
+    to_compute_kl = master_config.loss_fn.reference_policy_kl_penalty > 0
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
 
     # Initialize advantage estimator
@@ -1906,7 +2050,7 @@ def grpo_train(
                             train_data["generation_logprobs"]
                         )
 
-                    if not master_config.grpo.get(
+                    if to_compute_kl and not master_config.grpo.get(
                         "skip_reference_policy_logprobs_calculation"
                     ):
                         train_data["reference_policy_logprobs"] = (
@@ -1975,6 +2119,15 @@ def grpo_train(
                         advantages=train_data["advantages"],
                     )
                     del baseline_for_log
+
+                    _apply_configured_message_level_advantage_penalties(
+                        train_data, repeated_batch["message_log"], master_config
+                    )
+
+                    # Clip advantages to prevent extreme values from small std normalization
+                    train_data["advantages"] = _clip_grpo_advantages(
+                        train_data["advantages"], master_config.grpo
+                    )
 
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
                 print("▶ Preparing for training...", flush=True)
@@ -2647,6 +2800,7 @@ def async_grpo_train(
     val_period = master_config.grpo["val_period"]
     val_at_start = master_config.grpo["val_at_start"]
     val_at_end = master_config.grpo["val_at_end"]
+    to_compute_kl = master_config.loss_fn.reference_policy_kl_penalty > 0
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
 
     # Initialize advantage estimator
@@ -2956,6 +3110,24 @@ def async_grpo_train(
 
                 # Prepare training data (same as sync version)
                 with timer.time("data_processing"):
+                    # Apply overlong filtering - mask out truncated sequences from loss computation
+                    with timer.time("overlong_filter"):
+                        use_overlong_filtering = master_config.grpo[
+                            "overlong_filtering"
+                        ]
+                        if use_overlong_filtering:
+                            loss_multiplier = repeated_batch["loss_multiplier"].clone()
+                            truncated = repeated_batch["truncated"]
+
+                            if isinstance(truncated, list):
+                                truncated = torch.tensor(truncated, dtype=torch.bool)
+
+                            loss_multiplier[truncated] = 0
+                            repeated_batch["loss_multiplier"] = loss_multiplier
+
+                    # Add loss mask to each message
+                    # Only unmask assistant messages that were actually generated (have generation_logprobs),
+                    # not assistant messages that were part of the prompt history
                     add_grpo_token_loss_masks_and_generation_logprobs(
                         repeated_batch["message_log"]
                     )
@@ -3020,7 +3192,7 @@ def async_grpo_train(
                         )["logprobs"]
                     train_data["prev_logprobs"] = fprop_logprobs
 
-                    if not master_config.grpo.get(
+                    if to_compute_kl and not master_config.grpo.get(
                         "skip_reference_policy_logprobs_calculation"
                     ):
                         reference_logprobs = policy.get_reference_policy_logprobs(
@@ -3084,6 +3256,18 @@ def async_grpo_train(
                     advantages = train_data["advantages"]
                     print(
                         f"  📊 Advantages stats: min={advantages.min():.4f}, max={advantages.max():.4f}, mean={advantages.mean():.4f}, std={advantages.std():.4f}"
+                    )
+
+                    _apply_configured_message_level_advantage_penalties(
+                        train_data,
+                        repeated_batch["message_log"],
+                        master_config,
+                        log_config=True,
+                    )
+
+                    # Clip advantages to prevent extreme values from small std normalization
+                    train_data["advantages"] = _clip_grpo_advantages(
+                        train_data["advantages"], master_config.grpo
                     )
 
                 print("▶ Preparing for training...")
