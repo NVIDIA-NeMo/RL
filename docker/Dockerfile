@@ -12,14 +12,40 @@
 #   Local NeMo RL source override:
 #     docker buildx build --build-context nemo-rl=. -f docker/Dockerfile --tag <registry>/nemo-rl:latest --push .
 #
-# Optional build args to skip vLLM or SGLang dependencies:
+# Optional build args to skip vLLM, SGLang, or TRT-LLM dependencies:
 #   --build-arg SKIP_VLLM_BUILD=1    # Skip vLLM dependencies
 #   --build-arg SKIP_SGLANG_BUILD=1  # Skip SGLang dependencies
+#   --build-arg SKIP_TRTLLM_BUILD=1  # Skip TRT-LLM (from-source) build
+#
+# TRT-LLM-only build (smallest+fastest path for the cp313/cu13/aarch64 trtllm
+# integration — skips the unrelated vLLM + SGLang from-source steps):
+#     docker buildx build \
+#       -f docker/Dockerfile \
+#       --build-arg SKIP_VLLM_BUILD=1 \
+#       --build-arg SKIP_SGLANG_BUILD=1 \
+#       --build-context nemo-rl=. \
+#       --target release \
+#       --tag <registry>/nemo-rl-trtllm:latest \
+#       --push \
+#       .
+#
+# The TRT-LLM stage clones https://github.com/NVIDIA/TensorRT-LLM @ v1.3.0rc15
+# (default — override with --build-arg BUILD_CUSTOM_TRTLLM_URL / BUILD_CUSTOM_TRTLLM_REF)
+# and builds the wheel via tools/build-custom-trtllm.sh (~30-60 min on a single
+# Blackwell node; longer on x86). Modelopt 0.37 is built alongside (override via
+# BUILD_CUSTOM_TRTLLM_MODELOPT_URL / _REF). Expect ~1.5-2h total wall time end-to-end.
+#
+# After the docker build completes, convert the image to a SLURM-friendly .sqsh
+# (Lyris / enroot users) with:
+#     enroot import -o nemo-rl-py313-trtllm.sqsh docker://<registry>/nemo-rl-trtllm:latest
 
 ARG BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:26.03-cuda13.2-devel-ubuntu24.04
 FROM scratch AS nemo-rl
 ARG NRL_GIT_REF=main
 ADD --keep-git-dir=true https://github.com/NVIDIA-NeMo/RL.git#${NRL_GIT_REF} /
+
+# Empty default; CI overrides with --build-context to inject pre-compiled wheels
+FROM scratch AS uv-cache-seed
 
 FROM ${BASE_IMAGE} AS base
 # An environment variable to indicate that we are in a container.
@@ -41,6 +67,7 @@ apt-get install -y --no-install-recommends \
     wget \
     less \
     vim \
+    ccache \
 
 # Nsight
 apt install -y --no-install-recommends gnupg
@@ -56,9 +83,9 @@ apt-get clean
 rm -rf /var/lib/apt/lists/*
 EOF
 
-# CMake (for sglang build)
+# CMake (for CUDA extension builds: transformer-engine, mamba-ssm, etc.)
 RUN GITHUB_ARTIFACTORY=github.com \
-    && CMAKE_VERSION=3.31.1 \
+    && CMAKE_VERSION=4.0.3 \
     && ARCH=$(uname -m) \
     && CMAKE_INSTALLER="cmake-${CMAKE_VERSION}-linux-${ARCH}" \
     && curl --retry 3 --retry-delay 2 -fsSL -o "${CMAKE_INSTALLER}.tar.gz" \
@@ -70,7 +97,7 @@ RUN GITHUB_ARTIFACTORY=github.com \
 
 # Install uv and python
 ARG UV_VERSION=0.11.6
-ARG PYTHON_VERSION=3.12.3
+ARG PYTHON_VERSION=3.13.13
 ENV PATH="/root/.local/bin:$PATH"
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
     uv python install ${PYTHON_VERSION}
@@ -102,15 +129,30 @@ ARG BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION
 ARG BUILD_CUSTOM_FLASHINFER
 ARG BUILD_CUSTOM_FLASHINFER_URL
 ARG BUILD_CUSTOM_FLASHINFER_REF
-# Skip building vLLM or SGLang dependencies (set to any non-empty value to skip)
+# TRT-LLM build args. Unlike vLLM/SGLang, TRT-LLM is always built from source
+# because there are no cp313/cu13/aarch64 wheels on PyPI for v1.3.0rc15. Override
+# the URL/REF if you want a different fork or tag. Modelopt 0.37 is built
+# alongside because TRT-LLM v1.3.0rc15's requirements.txt pins
+# `nvidia-modelopt[torch]~=0.37.0` and PyPI lacks a cp313 wheel for that line.
+ARG BUILD_CUSTOM_TRTLLM_URL
+ARG BUILD_CUSTOM_TRTLLM_REF
+ARG BUILD_CUSTOM_TRTLLM_MODELOPT_URL
+ARG BUILD_CUSTOM_TRTLLM_MODELOPT_REF
+# Skip building vLLM, SGLang, or TRT-LLM dependencies (set to any non-empty value to skip)
 ARG SKIP_VLLM_BUILD
 ARG SKIP_SGLANG_BUILD
+ARG SKIP_TRTLLM_BUILD
+ARG BASE_IMAGE
+ARG UV_VERSION
 
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
 
 # Ensure DeepEP is built for H100 and B200 (also mcore inference unified memory API now invokes a torch API that requires these to be set)
 ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
+
+# Ensure HybridEP/DeepEP JIT compilation can find nvcc at runtime
+ENV CUDA_HOME=/usr/local/cuda
 
 ## CUDA 13 moved standard library headers under include/cccl; expose that path so
 ## builds that include <cuda/std/...> (e.g., deep_gemm) can find them.
@@ -122,10 +164,22 @@ COPY --from=nemo-rl pyproject.toml uv.lock ./
 COPY --from=nemo-rl nemo_rl/__init__.py nemo_rl/package_info.py ./nemo_rl/
 COPY --from=nemo-rl tools/build-custom-vllm.sh ./tools/build-custom-vllm.sh
 COPY --from=nemo-rl tools/build-custom-flashinfer.sh ./tools/build-custom-flashinfer.sh
+COPY --from=nemo-rl tools/build-custom-trtllm.sh ./tools/build-custom-trtllm.sh
 COPY --from=nemo-rl --link research/ ./research/
 COPY --from=nemo-rl --link 3rdparty/ ./3rdparty/
 
-RUN --mount=type=ssh <<"EOF" bash -exu
+RUN --mount=type=ssh \
+    --mount=type=bind,from=uv-cache-seed,source=.,target=/tmp/uv-cache-seed <<"EOF" bash -exu
+CACHE_KEY=$(echo "${BASE_IMAGE}-${UV_VERSION}" | md5sum | cut -c1-12)
+SEED_KEY=$(cat /tmp/uv-cache-seed/.cache-key 2>/dev/null || echo "")
+if [ -n "$SEED_KEY" ] && [ "$SEED_KEY" != "$CACHE_KEY" ]; then
+    echo "Cache key mismatch (base image or uv version changed) — skipping stale seed"
+elif [ -n "$SEED_KEY" ]; then
+    echo "Seeding uv cache (key=${CACHE_KEY})"
+    mkdir -p /root/.cache/uv
+    rsync -a --exclude='.cache-key' /tmp/uv-cache-seed/ /root/.cache/uv/ 2>/dev/null || true
+fi
+
 uv venv --seed
 if [[ -n "${BUILD_CUSTOM_VLLM:-}" ]]; then
     bash tools/build-custom-vllm.sh ${BUILD_CUSTOM_VLLM_URL} ${BUILD_CUSTOM_VLLM_REF} ${BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION}
@@ -153,9 +207,26 @@ uv sync --link-mode symlink --locked --extra automodel --no-install-project
 uv sync --link-mode symlink --locked --extra modelopt --no-install-project
 uv sync --link-mode symlink --locked --all-groups --no-install-project
 
+# TRT-LLM is always custom-built from source (no cp313/cu13/aarch64 wheel on PyPI).
+# Sync the [trtllm] extra to bring in runtime deps (mpi4py, nvidia-cutlass-dsl-libs-base),
+# then build + install the TRT-LLM wheel via tools/build-custom-trtllm.sh.
+if [[ -z "${SKIP_TRTLLM_BUILD:-}" ]]; then
+    uv sync --link-mode symlink --locked --extra trtllm --no-install-project
+    # Activate venv so the script's `python3 -m pip ...` calls land in /opt/nemo_rl_venv.
+    source /opt/nemo_rl_venv/bin/activate
+    bash tools/build-custom-trtllm.sh \
+        "${BUILD_CUSTOM_TRTLLM_URL:-https://github.com/NVIDIA/TensorRT-LLM.git}" \
+        "${BUILD_CUSTOM_TRTLLM_REF:-v1.3.0rc15}" \
+        "${BUILD_CUSTOM_TRTLLM_MODELOPT_URL:-https://github.com/NVIDIA/TensorRT-Model-Optimizer.git}" \
+        "${BUILD_CUSTOM_TRTLLM_MODELOPT_REF:-0.37.0}"
+    deactivate
+fi
+
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8
 # The ray install will include the older aiohttp version in its cache
 find /root/.cache/uv -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +
+
+echo "${CACHE_KEY}" > /root/.cache/uv/.cache-key
 EOF
 
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
@@ -166,8 +237,8 @@ ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 # version mismatch crash (e.g. system 9.10.1 vs pip 9.19.0). CUDNN_HOME makes TE's Python
 # code find the pip version first, and LD_LIBRARY_PATH makes the dynamic linker resolve
 # cuDNN sub-libraries from pip when loading libtransformer_engine.so.
-ENV CUDNN_HOME=/opt/nemo_rl_venv/lib/python3.12/site-packages/nvidia/cudnn
-ENV LD_LIBRARY_PATH="/opt/nemo_rl_venv/lib/python3.12/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH}"
+ENV CUDNN_HOME=/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn
+ENV LD_LIBRARY_PATH="/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH}"
 # Verify with: python -c "import transformer_engine.pytorch as te; print(te.get_cudnn_version())"
 
 WORKDIR /opt/nemo-rl
@@ -189,6 +260,17 @@ LABEL com.nvidia.build.id="${NVIDIA_BUILD_ID}"
 LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
 
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
+
+# AWS EFA OFI plugin discovery (p4d / p5 / p5en multi-node NCCL via SRD).
+# The host's aws-efa-installer places libnccl-net-ofi.so under
+# /opt/amazon/ofi-nccl/lib and libfabric under /opt/amazon/efa/lib. Without
+# these on the linker search path, NCCL silently falls back to its socket
+# transport. Register both via ld.so.conf.d (so `ldconfig` populates the cache
+# once host paths are mounted at runtime) and LD_LIBRARY_PATH (so NCCL's
+# dlopen resolves the plugin even before `ldconfig` is re-run).
+RUN printf '%s\n' /opt/amazon/ofi-nccl/lib /opt/amazon/efa/lib \
+        > /etc/ld.so.conf.d/aws-efa.conf
+ENV LD_LIBRARY_PATH="/opt/amazon/ofi-nccl/lib:/opt/amazon/efa/lib:${LD_LIBRARY_PATH}"
 
 # Copy in source from build context (defaults to cloned repo, can be overridden)
 # Exclude pyproject.toml and uv.lock since those may be altered by build-custom-vllm.sh
