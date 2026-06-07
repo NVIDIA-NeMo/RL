@@ -635,12 +635,17 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             OpenAIServingCompletion,
         )
 
-        openai_serving_completion = OpenAIServingCompletion(
+        completion_kwargs = dict(
             engine_client=engine_client,
             models=openai_serving_models,
             request_logger=None,
             return_tokens_as_token_ids=True,
         )
+        if "openai_serving_render" in serving_chat_kwargs:
+            completion_kwargs["openai_serving_render"] = (
+                serving_chat_kwargs["openai_serving_render"]
+            )
+        openai_serving_completion = OpenAIServingCompletion(**completion_kwargs)
 
         @app.post("/v1/completions")
         async def create_completion(
