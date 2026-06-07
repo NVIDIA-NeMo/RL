@@ -5,7 +5,7 @@ grpo:
   num_generations_per_prompt: 8
   max_num_steps: 5000
   max_num_epochs: 1000
-  val_period: 100
+  val_period: 50
   val_at_start: false
   val_at_end: true
   max_val_samples: 2000
@@ -14,7 +14,7 @@ grpo:
 checkpointing:
   enabled: true
   checkpoint_dir: "results/grpo-nemotron-diffusion-3b-ar-megatron"
-  save_period: 100
+  save_period: 50
   model_save_format: "safetensors"
   save_consolidated: false
   save_optimizer: true

@@ -18,7 +18,7 @@ grpo:
 checkpointing:
   enabled: true
   checkpoint_dir: "results/grpo-nemotron-diffusion-3b-justgrpo-leftmost-megatron"
-  save_period: 2
+  save_period: 5
   model_save_format: "safetensors"
   save_consolidated: false
   save_optimizer: true
