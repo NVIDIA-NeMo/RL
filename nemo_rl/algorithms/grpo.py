@@ -3162,16 +3162,33 @@ def async_grpo_train(
 
                     # Only the actual refit/weight transfer should be counted as weight_sync
                     print("🔄 Performing policy generation refit...")
-                    with timer.time("weight_sync"):
-                        refit_policy_generation(
-                            policy, policy_generation, colocated_inference
-                        )
-                        POLICY_GENERATION_STALE = False
+                    refit_max_retries = 3
+                    for refit_attempt in range(1, refit_max_retries + 1):
+                        try:
+                            with timer.time("weight_sync"):
+                                refit_policy_generation(
+                                    policy, policy_generation, colocated_inference
+                                )
+                                POLICY_GENERATION_STALE = False
 
-                        # Update weight version before resuming trajectory collection so that all trajectories are updated with the new correct weight version
-                        weight_version += 1
-                        trajectory_collector.set_weight_version.remote(weight_version)
-                        trajectory_collector.resume_after_refit.remote()
+                                weight_version += 1
+                                trajectory_collector.set_weight_version.remote(weight_version)
+                                trajectory_collector.resume_after_refit.remote()
+                            break
+                        except RuntimeError as e:
+                            if refit_attempt == refit_max_retries:
+                                raise
+                            print(
+                                f"⚠️ Refit attempt {refit_attempt}/{refit_max_retries} "
+                                f"failed: {e}",
+                                flush=True,
+                            )
+                            print(
+                                "⏳ Waiting 60s for gen cluster to stabilize "
+                                "before retry...",
+                                flush=True,
+                            )
+                            time.sleep(60)
 
                     timer.stop("idle/refit_bubble")
 

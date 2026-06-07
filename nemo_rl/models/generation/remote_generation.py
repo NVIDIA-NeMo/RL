@@ -274,7 +274,7 @@ class RemoteGeneration(GenerationInterface):
         self,
         policy: Any,
         rendezvous_timeout_s: float = 150.0,
-        max_attempts: int = 6,
+        max_attempts: int = 10,
     ) -> None:
         """Re-init the train↔gen NCCL group if the gen-side world size
         changed since the last refit.
@@ -479,9 +479,19 @@ class RemoteGeneration(GenerationInterface):
                 ray.wait(pending, timeout=60.0)
             except Exception:  # noqa: BLE001
                 pass
-            # Brief settle for gen-side reset_collective + router state
-            # consistency before the next /current_gen_world_size read.
-            time.sleep(1.0)
+            # Wait for gen-side cleanup. When a shard dies mid-broadcast,
+            # the surviving shards' NCCL watchdog takes up to
+            # TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC (60s) to detect the dead
+            # peer. reset_collective is queued behind the hung NCCL op
+            # and can't execute until the watchdog fires. Use exponential
+            # backoff so early attempts (world-size-change only) settle
+            # fast while mid-fault attempts give NCCL time to recover.
+            settle_s = min(5.0 * (2 ** (attempt - 1)), 90.0)
+            print(
+                f"  ⏳ settle {settle_s:.0f}s before next attempt",
+                flush=True,
+            )
+            time.sleep(settle_s)
 
         raise RuntimeError(
             f"ensure_collective_synced failed to rendezvous after {max_attempts} "
