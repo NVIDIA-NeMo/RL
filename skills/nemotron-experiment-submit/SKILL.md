@@ -1,25 +1,27 @@
 ---
 name: nemotron-experiment-submit
-description: Submit and monitor NeMo-RL NemotronLabsDiffusion/GRPO experiments on dfw using tools/nemotron_diffusion/submit_grpo_nemotron_ar_megatron_sbatch.sh, including required CONFIG passing, run naming, env tags, rebuild flags, logs, and Slurm status checks.
+description: Submit and monitor NeMo-RL NemotronLabsDiffusion GRPO-family experiments on dfw, including AR GRPO, JustGRPO, and DiffuGRPO configs, run naming, env tags, rebuild flags, logs, and Slurm status checks.
 ---
 
-# Nemotron Experiment Submission
+# RL on NemotronLabsDiffusion Experiment Submission
 
 Use this skill when submitting or debugging NeMo-RL training experiments from the current RL repo on dfw.
 
 ## Working Directory
 
-Run from:
+Run from the active RL checkout:
 
 ```bash
-cd /home/snorouzi/diffusion_RL/RL
+cd ~/diffusion_RL/RL
 ```
 
-Submit through:
+Submit through the repo's Nemotron diffusion sbatch wrapper:
 
 ```bash
 tools/nemotron_diffusion/submit_grpo_nemotron_ar_megatron_sbatch.sh
 ```
+
+The wrapper name contains `ar`, but it is also used for JustGRPO and DiffuGRPO configs unless the repo introduces a newer algorithm-specific wrapper. The selected algorithm comes from `CONFIG=...` and any `EXTRA_CONFIG_OVERRIDES`, not from the script name.
 
 Always pass the intended config file explicitly with `CONFIG=...`; do not rely on the script default when launching a named experiment.
 
@@ -40,33 +42,29 @@ FORCE_REINSTALL_SGLANG=false \
 bash tools/nemotron_diffusion/submit_grpo_nemotron_ar_megatron_sbatch.sh --sbatch
 ```
 
+After submission, explicitly share the exact submission command with the user together with the Slurm job id.
+
 Use PARTITION=batch for all sbatch submissions. The dfw batch partition has a 4-hour limit, so keep TIME at or below 04:00:00. Adjust NODES as needed, but do not submit these experiments to backfill, batch_long, batch_large, or batch_large_long.
 
 ## Common Configs
 
-Default NemotronLabsDiffusion AR GRPO:
+AR GRPO:
 
-```bash
-CONFIG=examples/configs/gsm8k_nemotron_labs_diffusion_3b_sglang_ar_megatron.yaml
-```
+- main: `CONFIG=examples/configs/gsm8k_nemotron_labs_diffusion_3b_sglang_ar_megatron.yaml`
+- toy: `CONFIG=examples/configs/gsm8k_nemotron_labs_diffusion_3b_sglang_ar_megatron_toy_p8_g8.yaml`
 
-JustGRPO leftmost reveal toy config:
+JustGRPO leftmost reveal:
 
-```bash
-CONFIG=examples/configs/gsm8k_nemotron_labs_diffusion_3b_sglang_justgrpo_leftmost_megatron_toy_p8_g8.yaml
-```
+- main: `CONFIG=examples/configs/gsm8k_nemotron_labs_diffusion_3b_sglang_justgrpo_leftmost_megatron.yaml`
+- toy: `CONFIG=examples/configs/gsm8k_nemotron_labs_diffusion_3b_sglang_justgrpo_leftmost_megatron_toy_p8_g8.yaml`
 
-Default AR toy config:
+DiffuGRPO with FastDiffuser:
 
-```bash
-CONFIG=examples/configs/gsm8k_nemotron_labs_diffusion_3b_sglang_ar_megatron_toy_p8_g8.yaml
-```
+- main: `CONFIG=examples/configs/gsm8k_nemotron_labs_diffusion_3b_sglang_diffugrpo_megatron.yaml`
+- toy: `CONFIG=examples/configs/gsm8k_nemotron_labs_diffusion_3b_sglang_diffugrpo_megatron_toy_p8_g8.yaml`
 
-Long-context AR config:
+For a smoke test, use the toy config for the relevant mode and cap steps through `EXTRA_CONFIG_OVERRIDES`, for example `grpo.max_num_steps=3 grpo.val_at_end=false checkpointing.enabled=false logger.wandb_enabled=false`.
 
-```bash
-CONFIG=examples/configs/gsm8k_nemotron_labs_diffusion_3b_sglang_ar_megatron_seq16384_gen8192.yaml
-```
 
 ## Rebuild and Reinstall Flags
 
@@ -90,30 +88,30 @@ Use this shared env tag for the current dependency layout:
 ENV_TAG=mb_3rdparty_sglagn_local_fork
 ```
 
+Use this env tag for the DiffuGRPO local worktree layout that points at the editable DiffuGRPO NeMo-RL, SGLang, and Megatron-Bridge checkouts:
+
+```bash
+ENV_TAG=diffu_grpo
+```
+
 Do not change `ENV_TAG` for normal Python edits in the existing editable dependency trees. Reuse the tag so follow-up runs reuse the same driver and worker envs.
 
 Change `ENV_TAG` only when one of the dependency paths changes, for example a new `pyproject.toml` path for SGLang or a different Megatron-Bridge/Megatron-LM workspace path. After changing dependency paths, run once with the new tag and the needed reinstall/rebuild flags. The first run with a fresh tag may spend significant time building packages such as TransformerEngine; later runs with the same tag should be faster.
-
-## Long-Context Notes
-
-The long-context config sets `policy.max_total_sequence_length: 16384` and currently caps SGLang generation at `policy.generation.max_new_tokens: 4096`. This still increases policy/logprob memory pressure because the training tensors and masks are sized for the full `max_total_sequence_length`, not only generated tokens.
-
-For long-context experiments, start with smaller `policy.logprob_batch_size`, `policy.train_micro_batch_size`, and SGLang request concurrency if memory fails. Avoid changing model `seq_length` casually; for these runs, the intent was longer training/evaluation sequence budget, not changing the base checkpoint architecture.
 
 ## Logs and Checkpoints
 
 The default run directory is:
 
 ```text
-/lustre/fsw/portfolios/coreai/users/snorouzi/runs/diffusion_rl/<RUN_NAME>
+/lustre/fsw/portfolios/coreai/users/$USER/runs/diffusion_rl/<RUN_NAME>
 ```
 
 Key files:
 
 ```text
-run log:     /lustre/fsw/portfolios/coreai/users/snorouzi/runs/diffusion_rl/<RUN_NAME>/run.log
-slurm log:   /lustre/fsw/portfolios/coreai/users/snorouzi/runs/diffusion_rl/<RUN_NAME>/slurm-<jobid>.out
-checkpoints: /lustre/fsw/portfolios/coreai/users/snorouzi/runs/diffusion_rl/<RUN_NAME>/checkpoints
+run log:     /lustre/fsw/portfolios/coreai/users/$USER/runs/diffusion_rl/<RUN_NAME>/run.log
+slurm log:   /lustre/fsw/portfolios/coreai/users/$USER/runs/diffusion_rl/<RUN_NAME>/slurm-<jobid>.out
+checkpoints: /lustre/fsw/portfolios/coreai/users/$USER/runs/diffusion_rl/<RUN_NAME>/checkpoints
 ```
 
 ## Monitoring
@@ -128,7 +126,7 @@ sacct -j <jobid> --format=JobID,JobName%30,State,ExitCode,Elapsed,Start,End -P
 Tail logs:
 
 ```bash
-RUN_DIR=/lustre/fsw/portfolios/coreai/users/snorouzi/runs/diffusion_rl/<RUN_NAME>
+RUN_DIR=/lustre/fsw/portfolios/coreai/users/$USER/runs/diffusion_rl/<RUN_NAME>
 tail -200 "$RUN_DIR/run.log"
 tail -200 "$RUN_DIR/slurm-<jobid>.out"
 ```
@@ -140,6 +138,8 @@ grep -n "SGLANG_SOURCE\|runtime_versions\|FastDiffuser: block_size\|selection_po
 ```
 
 For JustGRPO leftmost runs, confirm SGLang logs include `selection_policy=leftmost`. If the log only prints `FastDiffuser: block_size=... max_steps=... temperature=... threshold=...`, the worker may be importing an older SGLang build.
+
+For DiffuGRPO confidence runs, confirm SGLang logs include `FastDiffuser: block_size=32`, `threshold=0.9`, and `selection_policy=confidence`, and confirm the policy worker is `DiffuGRPOMegatronPolicyWorker`.
 
 ## Local or Interactive Run
 

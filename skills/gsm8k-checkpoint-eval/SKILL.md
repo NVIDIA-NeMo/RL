@@ -1,6 +1,6 @@
 ---
 name: gsm8k-checkpoint-eval
-description: Evaluate native Nemotron Diffusion NeMo-RL Megatron checkpoints by converting them to Hugging Face format in the required Slurm container, then running the yonggon-rl NemoSkills evaluation pipeline.
+description: Evaluate native Nemotron Diffusion NeMo-RL Megatron checkpoints by converting them to Hugging Face format in the required Slurm container, then running the yonggon-rl NemoSkills pipeline or the standalone No-Ray NeMoRL-validation replication evaluator.
 ---
 
 # GSM8K Checkpoint Evaluation
@@ -27,9 +27,17 @@ CONTAINER=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_llm/users/sfawzy/
 
 Use the repo wrapper for conversion. Do not inline or recreate the converter command from `tools/nemotron_diffusion/convert_nemotron_diffusion_checkpoint_to_hf.sh`; `convert_checkpoint.sh` owns the native Nemotron Diffusion conversion settings.
 
+For diffuGRPO/native NeMo-RL checkpoints, set the same uv tag/env/cache family used by training. `convert_checkpoint.sh` does not derive these paths from `ENV_TAG` by itself, so pass both `ENV_TAG` and the `NEMOTRON_UV_*` overrides explicitly:
+
 ```bash
 cd /home/snorouzi/diffusion_RL/RL
 
+ENV_TAG=diffu_grpo \
+UV_PROJECT_ENVIRONMENT=/lustre/fsw/portfolios/coreai/users/snorouzi/nemorl_uv_driver_envs/diffusion_RL_RL_diffu_grpo \
+UV_CACHE_DIR=/lustre/fsw/portfolios/coreai/users/snorouzi/uv_cache_diffu_grpo \
+NEMOTRON_UV_PROJECT_ENVIRONMENT=/lustre/fsw/portfolios/coreai/users/snorouzi/nemorl_uv_driver_envs/diffusion_RL_RL_diffu_grpo \
+NEMOTRON_UV_CACHE_DIR=/lustre/fsw/portfolios/coreai/users/snorouzi/uv_cache_diffu_grpo \
+NEMOTRON_HF_HOME=/lustre/fsw/portfolios/coreai/users/snorouzi/hf_home \
 STEP_DIR=/path/to/run/checkpoints/step_N \
 OUT=/lustre/fsw/portfolios/coreai/users/snorouzi/checkpoints/<name>_step_N_hf \
 ./convert_checkpoint.sh
@@ -41,7 +49,13 @@ When running under Slurm, load the container above and run the same wrapper comm
 srun --container-image=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_llm/users/sfawzy/nemo-rl-nightly.sqsh \
   --container-mounts=/home/snorouzi:/home/snorouzi,/lustre:/lustre \
   --container-workdir=/home/snorouzi/diffusion_RL/RL \
-  bash -lc 'STEP_DIR=/path/to/run/checkpoints/step_N OUT=/lustre/fsw/portfolios/coreai/users/snorouzi/checkpoints/<name>_step_N_hf ./convert_checkpoint.sh'
+  bash -lc 'export ENV_TAG=diffu_grpo
+export UV_PROJECT_ENVIRONMENT=/lustre/fsw/portfolios/coreai/users/snorouzi/nemorl_uv_driver_envs/diffusion_RL_RL_diffu_grpo
+export UV_CACHE_DIR=/lustre/fsw/portfolios/coreai/users/snorouzi/uv_cache_diffu_grpo
+export NEMOTRON_UV_PROJECT_ENVIRONMENT=$UV_PROJECT_ENVIRONMENT
+export NEMOTRON_UV_CACHE_DIR=$UV_CACHE_DIR
+export NEMOTRON_HF_HOME=/lustre/fsw/portfolios/coreai/users/snorouzi/hf_home
+STEP_DIR=/path/to/run/checkpoints/step_N OUT=/lustre/fsw/portfolios/coreai/users/snorouzi/checkpoints/<name>_step_N_hf ./convert_checkpoint.sh'
 ```
 
 Agents should not generate a full custom conversion script unless the user explicitly asks for one.
@@ -148,6 +162,45 @@ SEQ_EVAL_BLOCK_LENGTH=16 \
 bash xp/examples/run_llada_eval_pipeline_gpu_only.sh
 ```
 
+### Standalone No-Ray NeMoRL Validation Replication
+
+Use this path when the user asks to reproduce the NeMoRL validation schedule, compare against training-time validation, or avoid Ray while keeping the NeMoRL prompt/generation/grading logic. Prefer the checked-in submit wrapper; do not reconstruct the full Slurm command by hand.
+
+```bash
+cd /home/snorouzi/diffusion_RL/RL
+
+CKPT=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/snorouzi/checkpoints/<name>_step_N_hf \
+TOKENIZER=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/snorouzi/checkpoints/Nemotron-Labs-Diffusion-3B \
+ALG=FastDiffuser \
+BS=32 \
+TEMP=1.0 \
+TAG=<name>_step_N_nemorl_rep_fastdiffuser_b32_t1 \
+./submit_standalone_gsm8k_eval.sh
+```
+
+Key parameters:
+
+- `ALG=FastDiffuser` for diffusion/FastDiffuser eval.
+- `ALG=LinearSpec` for linear speculation eval.
+- `BS=16` or `BS=32` for block size.
+- `TEMP=1.0` for NeMoRL validation-style sampling.
+- `TEMP=0.0` for greedy eval.
+- `NUM_SAMPLES=-1` by default for full GSM8K; set `NUM_SAMPLES=16` for a smoke test.
+
+Examples:
+
+```bash
+# FastDiffuser, block size 16, greedy
+ALG=FastDiffuser BS=16 TEMP=0.0 TAG=<name>_fd_b16_greedy ./submit_standalone_gsm8k_eval.sh
+
+# Linear speculation, block size 32, NeMoRL validation temperature
+ALG=LinearSpec BS=32 TEMP=1.0 TAG=<name>_linearspec_b32_t1 ./submit_standalone_gsm8k_eval.sh
+```
+
+The wrapper uses `/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_llm/users/sfawzy/nemo-rl-nightly.sqsh`, mounts `/home/snorouzi` and `/lustre`, and writes `metrics.json`, `records.jsonl`, `server.log`, `server_command.txt`, `dllm_config.yaml`, and `slurm-<job>.out` under the output directory.
+
+If a converted HF checkpoint is a symlink-heavy directory and fails inside the container with a missing custom-code file such as `configuration_ministral_dlm.py`, create an eval-only materialized copy with real files and the intended `config.json`, then point `CKPT` at that materialized directory. Do not patch the original converted checkpoint in place unless the user explicitly asks.
+
 ### Optional SGLang Fallback
 
 Use the SGLang wrapper only when the user explicitly asks for the SGLang benchmark path. For native Nemotron Diffusion, pass FastDiffuser explicitly and clear `JSON_MODEL_OVERRIDE_ARGS` so the wrapper does not inject AR mode.
@@ -180,9 +233,12 @@ SBATCH_JOB_NAME=<name>_step_N_sglang_fd_b32 \
 - If a converted checkpoint exists under `/lustre/fsw/portfolios/coreai/users/snorouzi/checkpoints/...`, resolve its canonical path with `readlink -f <checkpoint_dir>` and use that `/lustre/fs1/...` result for `SERVER_MODEL_PATH`.
 - `SERVER_TOKENIZER` should point to the 3B base checkpoint/tokenizer path: `/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/snorouzi/checkpoints/Nemotron-Labs-Diffusion-3B`.
 - Keep conversion and evaluation output directories separate.
+- Submit most eval jobs to the `batch_short` partition. It is usually more available, and GSM8K eval jobs usually finish under 2 hours, which matches the `batch_short` time limit.
 - Keep output directories separate across block lengths, decoding modes, and benchmark variants.
 - For AR-native NemoSkills eval, use `SERVER_ENGINE=ar_native`, `SEQ_EVAL_GENERATION_ALGORITHM=ar_native`, and `SEQ_EVAL_BLOCK_LENGTH=1`.
 - Do not use `SERVER_ENGINE=hf` / `SEQ_EVAL_GENERATION_ALGORITHM=ar` by default; that Hugging Face AR path patches `config.json` in place.
+- For standalone No-Ray NeMoRL validation replication, use `/home/snorouzi/diffusion_RL/RL/submit_standalone_gsm8k_eval.sh` and set `ALG`, `BS`, `TEMP`, `CKPT`, and `TAG`.
+- In standalone eval, `TEMP=1.0` matches the NeMoRL validation-style schedule; `TEMP=0.0` is greedy.
 - NemoSkills writes a generated `.gpu_only_cmd_*.sh` script into `SEQ_EVAL_OUTPUT_DIR`; use it as the source of truth for rerunning an exact completed eval.
 - The NemoSkills server worker logs are saved under `${SEQ_EVAL_OUTPUT_DIR}/worker_logs`.
 - GSM8K uses `SEQ_EVAL_TOKENS_TO_GENERATE=1024` in the default command above.
