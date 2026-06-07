@@ -735,6 +735,24 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
                 "Refer to https://github.com/NVIDIA-NeMo/RL/issues/1164 for latest updates with this issue."
             )
 
+    # Megatron validates module names and per-model-type compatibility.
+    # Note: Megatron-Bridge's standalone training path also sets NUMA-aware
+    # CPU affinity via set_ideal_affinity_for_current_gpu() when this is on,
+    # which improves PCIe/DRAM throughput. NeMo-RL does not call it; users
+    # who need maximum offload bandwidth may want to set affinity externally.
+    fine_grained_activation_offloading = config["megatron_cfg"].get(
+        "fine_grained_activation_offloading"
+    )
+    if fine_grained_activation_offloading:
+        offload_modules = config["megatron_cfg"].get("offload_modules")
+        if not isinstance(offload_modules, list) or not offload_modules:
+            raise ValueError(
+                "offload_modules must be a non-empty list when "
+                "fine_grained_activation_offloading is True."
+            )
+        model_cfg.fine_grained_activation_offloading = True
+        model_cfg.offload_modules = offload_modules
+
 
 def _validate_optimizer_config(config: PolicyConfig) -> None:
     """Validate optimizer configuration."""
