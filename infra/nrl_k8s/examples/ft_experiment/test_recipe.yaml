@@ -35,7 +35,7 @@ checkpointing:
   enabled: true
   save_period: 1
   keep_top_k: 1
-  checkpoint_dir: /mnt/rl-workspace/${oc.env:USER,terryk}/checkpoints/ft-experiment-test-v2
+  checkpoint_dir: /mnt/rl-workspace/${oc.env:USER,terryk}/checkpoints/ft-experiment-test
   save_optimizer: true
 
 logger:
