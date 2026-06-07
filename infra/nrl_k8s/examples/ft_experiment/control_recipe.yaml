@@ -30,8 +30,8 @@ policy:
     colocated:
       enabled: false
       resources:
-        num_nodes: 8
-        gpus_per_node: 1
+        num_nodes: 2
+        gpus_per_node: 4
     vllm_cfg:
       enable_vllm_metrics_logger: true
       vllm_metrics_logger_interval: 0.5
