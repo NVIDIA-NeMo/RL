@@ -82,7 +82,7 @@ _shared:
         name: roce-preflight-script
         defaultMode: 493
 
-image: nvcr.io/nvidian/nemo-rl@sha256:3802a9dc75cc9820b040a0dcef24b597e70d8dec265e6ac9f2aa2e8712b41b19
+image: nvcr.io/nvidian/nemo-rl:f947d78-50817369
 imagePullSecrets: [nvcr-secret]
 serviceAccount: nemo-rl-endpoint-registry
 
@@ -150,7 +150,7 @@ kuberay:
       disagg.nemo-rl/run: ft-experiment-control
       kai.scheduler/queue: backfill
     spec:
-      rayVersion: "2.55.1"
+      rayVersion: "2.54.0"
       headGroupSpec:
         rayStartParams:
           dashboard-host: "0.0.0.0"
@@ -205,7 +205,7 @@ kuberay:
                   resourceClaimTemplateName: PLACEHOLDER
               initContainers:
                 - name: roce-preflight
-                  image: nvcr.io/nvidian/nemo-rl@sha256:3802a9dc75cc9820b040a0dcef24b597e70d8dec265e6ac9f2aa2e8712b41b19
+                  image: nvcr.io/nvidian/nemo-rl:f947d78-50817369
                   command: ["/bin/bash", "/preflight/roce_preflight.sh"]
                   resources:
                     claims: [{name: roce-channel}]

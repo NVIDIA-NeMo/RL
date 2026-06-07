@@ -500,26 +500,6 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             chat_template=None,
             chat_template_content_format="auto",
         )
-        try:
-            from vllm.entrypoints.openai.serving_render import OpenAIServingRender
-
-            serving_chat_default_kwargs["openai_serving_render"] = (
-                OpenAIServingRender(models=openai_serving_models)
-            )
-        except (ImportError, TypeError):
-            pass
-        try:
-            import inspect
-
-            chat_params = inspect.signature(
-                OpenAIServingChat.__init__
-            ).parameters
-            if "openai_serving_render" in chat_params:
-                serving_chat_default_kwargs.setdefault(
-                    "openai_serving_render", None
-                )
-        except Exception:
-            pass
         serving_chat_kwargs = serving_chat_default_kwargs | self.cfg["vllm_cfg"].get(
             "http_server_serving_chat_kwargs", dict()
         )
@@ -603,10 +583,6 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             engine_client=serving_chat_kwargs["engine_client"],
             models=serving_chat_kwargs["models"],
         )
-        if "openai_serving_render" in serving_chat_kwargs:
-            serving_tokenization_kwargs["openai_serving_render"] = (
-                serving_chat_kwargs["openai_serving_render"]
-            )
         openai_serving_tokenization = NeMoRLOpenAIServingTokenization(
             **serving_tokenization_kwargs
         )
@@ -635,17 +611,12 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             OpenAIServingCompletion,
         )
 
-        completion_kwargs = dict(
+        openai_serving_completion = OpenAIServingCompletion(
             engine_client=engine_client,
             models=openai_serving_models,
             request_logger=None,
             return_tokens_as_token_ids=True,
         )
-        if "openai_serving_render" in serving_chat_kwargs:
-            completion_kwargs["openai_serving_render"] = (
-                serving_chat_kwargs["openai_serving_render"]
-            )
-        openai_serving_completion = OpenAIServingCompletion(**completion_kwargs)
 
         @app.post("/v1/completions")
         async def create_completion(
