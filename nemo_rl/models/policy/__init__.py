@@ -331,7 +331,18 @@ class JustGRPOLeftmostRevealLogprobEstimationConfig(TypedDict):
     logits_position_shift: NotRequired[int]
 
 
-LogprobEstimationConfig = JustGRPOLeftmostRevealLogprobEstimationConfig
+class DiffuGRPOLogprobEstimationConfig(TypedDict):
+    """Estimate completion logprobs from one fully-masked diffusion forward."""
+
+    type: Literal["diffu_grpo_fully_masked_completion"]
+    mask_token_id: int
+    exclude_mask_token_from_logits: NotRequired[bool]
+
+
+LogprobEstimationConfig = Union[
+    JustGRPOLeftmostRevealLogprobEstimationConfig,
+    DiffuGRPOLogprobEstimationConfig,
+]
 
 
 class PolicyConfig(TypedDict):

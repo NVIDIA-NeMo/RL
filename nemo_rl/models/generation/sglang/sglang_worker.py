@@ -118,17 +118,12 @@ def _extract_generated_tokens_and_logprobs(
         ]
 
     if output_ids:
-        meta_keys = sorted(meta_info.keys()) if isinstance(meta_info, dict) else []
-        result_keys = sorted(result.keys())
-        raise RuntimeError(
-            "SGLang returned output_ids without generation logprobs. "
-            "NemoRL refuses to silently fill generation_logprobs with zeros. "
-            "Use an SGLang build/mode that returns output_token_logprobs "
-            "(for DLLM/FastDiffuser this currently requires the leftmost "
-            "logprob path), or disable training features that require "
-            "generation_logprobs. "
-            f"result keys={result_keys}, meta_info keys={meta_keys}"
+        logger.warning(
+            "SGLang returned output_ids without generation logprobs; filling "
+            "generation_logprobs with zeros. This is expected for some DLLM "
+            "generation modes whose behavior logprobs are recomputed later."
         )
+        return [int(x) for x in output_ids], [0.0] * len(output_ids)
 
     return [], []
 

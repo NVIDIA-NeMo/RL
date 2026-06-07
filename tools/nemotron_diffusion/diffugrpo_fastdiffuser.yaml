@@ -1,0 +1,7 @@
+algorithm: FastDiffuser
+block_size: 32
+max_steps: 32
+causal_context: true
+temperature: 1.0
+threshold: 0.9
+selection_policy: confidence

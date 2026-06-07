@@ -244,6 +244,94 @@ class ClippedPGLossFn(LossFunction):
                     flush=True,
                 )
 
+    def compute_from_aligned_tensors(
+        self,
+        curr_logprobs: Tensor,
+        token_mask: Tensor,
+        sample_mask: Tensor,
+        advantages: Tensor,
+        prev_logprobs: Tensor,
+        generation_logprobs: Tensor,
+        reference_policy_logprobs: Tensor | None = None,
+        curr_logprobs_unfiltered: Tensor | None = None,
+        global_valid_seqs: torch.Tensor | None = None,
+        global_valid_toks: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict]:
+        """Compute policy-gradient loss from already aligned token tensors.
+
+        This entry point is for diffusion/reveal-style algorithms whose logprob
+        tensors are not next-token shifted. It adapts aligned [B, T] tensors to
+        the standard ClippedPGLossFn sequence contract without requiring callers
+        to add synthetic columns to model inputs.
+        """
+        if curr_logprobs.ndim == 1:
+            curr_logprobs = curr_logprobs.unsqueeze(-1)
+            token_mask = token_mask.unsqueeze(-1)
+            advantages = advantages.unsqueeze(-1)
+            prev_logprobs = prev_logprobs.unsqueeze(-1)
+            generation_logprobs = generation_logprobs.unsqueeze(-1)
+            if reference_policy_logprobs is not None:
+                reference_policy_logprobs = reference_policy_logprobs.unsqueeze(-1)
+            if curr_logprobs_unfiltered is not None:
+                curr_logprobs_unfiltered = curr_logprobs_unfiltered.unsqueeze(-1)
+        if curr_logprobs.ndim != 2:
+            raise ValueError(f"curr_logprobs must be 1D or 2D, got {curr_logprobs.shape}")
+        aligned_shape = curr_logprobs.shape
+        for name, value in (
+            ("token_mask", token_mask),
+            ("advantages", advantages),
+            ("prev_logprobs", prev_logprobs),
+            ("generation_logprobs", generation_logprobs),
+        ):
+            if value.shape != aligned_shape:
+                raise ValueError(f"{name} shape {value.shape} must match {aligned_shape}")
+        if self.reference_policy_kl_penalty != 0:
+            if reference_policy_logprobs is None:
+                raise ValueError("reference_policy_logprobs is required when KL penalty is enabled")
+            if reference_policy_logprobs.shape != aligned_shape:
+                raise ValueError(
+                    "reference_policy_logprobs shape "
+                    f"{reference_policy_logprobs.shape} must match {aligned_shape}"
+                )
+        if curr_logprobs_unfiltered is not None and curr_logprobs_unfiltered.shape != aligned_shape:
+            raise ValueError(
+                f"curr_logprobs_unfiltered shape {curr_logprobs_unfiltered.shape} must match {aligned_shape}"
+            )
+        if sample_mask.ndim != 1 or sample_mask.shape[0] != aligned_shape[0]:
+            raise ValueError(
+                "sample_mask must be a 1D tensor with one entry per aligned row, "
+                f"got {sample_mask.shape} for {aligned_shape}"
+            )
+
+        leading_zeros = torch.zeros_like(curr_logprobs[:, :1])
+        loss_data = BatchedDataDict[Any](
+            {
+                "input_ids": torch.zeros(
+                    aligned_shape[0],
+                    aligned_shape[1] + 1,
+                    device=curr_logprobs.device,
+                    dtype=torch.long,
+                ),
+                "token_mask": torch.cat([leading_zeros, token_mask], dim=1),
+                "sample_mask": sample_mask,
+                "advantages": torch.cat([leading_zeros, advantages], dim=1),
+                "prev_logprobs": torch.cat([leading_zeros, prev_logprobs], dim=1),
+                "generation_logprobs": torch.cat([leading_zeros, generation_logprobs], dim=1),
+            }
+        )
+        if self.reference_policy_kl_penalty != 0:
+            loss_data["reference_policy_logprobs"] = torch.cat(
+                [leading_zeros, reference_policy_logprobs], dim=1
+            )
+        if curr_logprobs_unfiltered is not None:
+            loss_data["curr_logprobs_unfiltered"] = curr_logprobs_unfiltered
+        return self(
+            next_token_logprobs=curr_logprobs,
+            data=loss_data,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
+        )
+
     def __call__(
         self,
         next_token_logprobs: Tensor,

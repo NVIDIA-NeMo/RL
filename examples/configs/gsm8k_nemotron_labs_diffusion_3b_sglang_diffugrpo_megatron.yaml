@@ -1,0 +1,29 @@
+defaults: "gsm8k_nemotron_labs_diffusion_3b_sglang_ar_megatron.yaml"
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nemotron-diffusion-3b-diffugrpo-megatron"
+  save_period: 50
+
+policy:
+  worker_cls_fqn: "nemo_rl.models.policy.workers.diffu_grpo_megatron_policy_worker.DiffuGRPOMegatronPolicyWorker"
+  train_micro_batch_size: 8
+  logprob_batch_size: 16
+
+  logprob_estimation:
+    type: "diffu_grpo_fully_masked_completion"
+    mask_token_id: 100
+    exclude_mask_token_from_logits: true
+
+  generation:
+    max_new_tokens: 750
+    sglang_cfg:
+      disable_cuda_graph: true
+      disable_piecewise_cuda_graph: true
+      json_model_override_args: '{}'
+      dllm_algorithm: "FastDiffuser"
+      dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL/tools/nemotron_diffusion/diffugrpo_fastdiffuser.yaml"
+
+logger:
+  log_dir: "logs/grpo-nemotron-diffusion-3b-diffugrpo-megatron-sglang"
+  wandb:
+    name: "grpo-nemotron-diffusion-3b-diffugrpo-megatron-sglang"
