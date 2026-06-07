@@ -158,9 +158,9 @@ kuberay:
             volumes: *head_volumes
       workerGroupSpecs:
         - groupName: gpu-workers
-          replicas: 10
-          minReplicas: 10
-          maxReplicas: 10
+          replicas: 6
+          minReplicas: 6
+          maxReplicas: 6
           numOfHosts: 1
           rayStartParams:
             num-gpus: "4"
