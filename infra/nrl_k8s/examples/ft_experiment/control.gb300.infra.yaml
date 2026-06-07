@@ -109,6 +109,7 @@ launch:
       exit 1
     fi
     export RAY_enable_infeasible_task_early_exit=true
+    export NRL_USE_REFIT_WORKER=0
     export PYTHONPATH=.:3rdparty/Megatron-LM-workspace/Megatron-LM:3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src
     TIMESTAMP=$(date -u +%Y%m%d-%H%M%S-%N)
     LOG_DIR=/mnt/rl-workspace/${user:}/driver_logs
