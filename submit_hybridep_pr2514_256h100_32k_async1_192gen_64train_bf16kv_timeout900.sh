@@ -219,7 +219,7 @@ export COMMAND="CUDA_HOME=/usr/local/cuda \
   env.nemo_gym.swe_agents_val.responses_api_agents.swe_agents.swebench_agent_timeout=900 \
   ++env.nemo_gym.swe_agents_val.responses_api_agents.swe_agents.swebench_tests_timeout=60"
 
-SBATCH_COMMENT='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"60","reason":"data_loading","description":"Async GRPO RL training: training GPUs idle during rollout collection (~30min) and validation each step"}}'
+SBATCH_COMMENT='{"OccupiedIdleGPUsJobReaper":{"exemptIdleTimeMins":"240","reason":"data_loading","description":"Async GRPO RL training: training GPUs idle during rollout collection (~30min) and validation each step"}}'
 
 SBATCH_CMD=(
   sbatch
