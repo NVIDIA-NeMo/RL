@@ -121,29 +121,30 @@ class VllmInternalWorkerExtension:
     def reset_collective(self) -> None:
         """Tear down the cross-cluster weight-sync collective on this worker.
 
-        Order: ``cuda.synchronize()`` BEFORE ``group.destroy()``. Pending
-        NCCL ops on side streams (the last buffered receive from
-        ``packed_broadcast_consumer``) must complete before the comm is
-        aborted — otherwise ``ncclCommAbort`` lands first and the
-        receive buffer is left zero-init from the caching allocator,
-        silently corrupting the just-broadcast weights.
+        Order: ``group.destroy()`` FIRST, then ``cuda.synchronize()``.
+        ``destroy()`` calls ``ncclCommAbort`` which immediately kills any
+        in-flight NCCL op (including a broadcast hung waiting for a dead
+        peer). After the abort, ``cuda.synchronize()`` drains remaining
+        side-stream work and returns quickly (~ms instead of 60-100s).
+
+        The previous order (synchronize → destroy) caused reset_collective
+        to block for the full NCCL heartbeat timeout (60s+) when a peer
+        died mid-broadcast, because synchronize waited for the hung op
+        to complete before the abort could fire.
 
         Idempotent — a no-op if no collective is currently held.
         """
         group = getattr(self, "model_update_group", None)
         if group is None:
             return
-        # Drain side streams BEFORE destroy.
         import torch
-        try:
-            torch.cuda.synchronize()
-        except Exception:  # noqa: BLE001
-            pass
+
+        # Abort the NCCL comm first — kills hung broadcasts immediately.
         try:
             group.destroy()
         except Exception as e:  # noqa: BLE001
             print(f"[vllm_backend.reset_collective] destroy raised {e}", flush=True)
-        # Final drain + cache clear after destroy.
+        # Now drain side streams + clear cache (fast after abort).
         for fn in (torch.cuda.synchronize, torch.cuda.empty_cache):
             try:
                 fn()
