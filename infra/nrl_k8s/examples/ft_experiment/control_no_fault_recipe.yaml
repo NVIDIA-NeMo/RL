@@ -1,0 +1,46 @@
+# FT Experiment — CONTROL baseline (no fault injection, no disaggregation).
+#
+# Async GRPO (lag 1) with Qwen3-30B-A3B. Single cluster, 20 steps.
+# This is the clean baseline with no failures.
+defaults: ../../../../examples/configs/recipes/llm/performance/grpo-qwen3-30ba3b-4n4g-async-1off.yaml
+
+grpo:
+  max_num_steps: 20
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
+  val_period: 999
+  val_at_start: false
+  val_at_end: false
+
+policy:
+  train_global_batch_size: 64
+  max_total_sequence_length: 2048
+  generation:
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 8
+        gpus_per_node: 1
+    vllm_cfg:
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 0.5
+
+checkpointing:
+  enabled: true
+  save_period: 1
+  keep_top_k: 1
+  checkpoint_dir: /mnt/rl-workspace/${oc.env:USER,terryk}/checkpoints/ft-experiment-control-nofault
+  save_optimizer: true
+
+logger:
+  log_dir: logs/ft-experiment-control-nofault
+  wandb_enabled: true
+  wandb:
+    project: nemorl-ft-experiment
+    name: ft-experiment-control-nofault
+  tensorboard_enabled: true
+  monitor_gpus: true
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 8

@@ -57,16 +57,16 @@ policy:
       uvicorn_keep_alive_s: 120
 
 # Fault injection: kill 1 shard every 25 min, immediate recovery.
-fault_inject:
-  enabled: true
-  mode: pod-kill
-  recover: true
-  trigger_after_s: 1500
-  recover_after_s: 0
-  max_cycles: null
-  rotate_target: true
-  target_shard: dp-0
-  new_shard_grace_period_s: 300
-  burst_size: 1
-  burst_every_n_cycles: 1
-  repeat_every_s: 1500
+# fault_inject:
+#   enabled: true
+#   mode: pod-kill
+#   recover: true
+#   trigger_after_s: 1500
+#   recover_after_s: 0
+#   max_cycles: null
+#   rotate_target: true
+#   target_shard: dp-0
+#   new_shard_grace_period_s: 300
+#   burst_size: 1
+#   burst_every_n_cycles: 1
+#   repeat_every_s: 1500
