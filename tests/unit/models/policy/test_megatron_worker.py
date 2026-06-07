@@ -40,6 +40,36 @@ from tests.unit.test_utils import SimpleLossFn
 pytestmark = pytest.mark.mcore
 
 
+class _FakeTrainableModel:
+    def __init__(self):
+        self.train_called = False
+
+    def train(self):
+        self.train_called = True
+
+
+def test_megatron_prepare_for_training_restores_optimizer():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    model = _FakeTrainableModel()
+    restored_devices = []
+
+    worker.model = model
+    worker.optimizer = object()
+    worker.optimizer_cpu_offload = False
+    worker.cfg = {"megatron_cfg": {"empty_unused_memory_level": 0}}
+    worker.move_model = lambda model, device, move_grads, move_params: model
+    worker.move_optimizer = lambda device: restored_devices.append(device)
+
+    MegatronPolicyWorkerImpl.prepare_for_training(worker)
+
+    assert model.train_called
+    assert restored_devices == ["cuda"]
+
+
 def create_megatron_test_config(
     model_name: str,
     tp: int = 1,
