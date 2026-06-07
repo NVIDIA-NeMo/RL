@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import threading as _threading
 import time
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import ray
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -28,6 +30,9 @@ from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
+
+if TYPE_CHECKING:
+    from nemo_rl.models.policy.teacher_worker_group import TeacherWorkerGroup
 
 TokenizerType = PreTrainedTokenizerBase
 
@@ -44,12 +49,27 @@ class AsyncTrajectoryCollector:
         master_config: MasterConfig,
         replay_buffer: Any,
         start_step: int = 0,
+        teacher_worker_groups=None,
+        alias_to_group_alias=None,
+        on_policy_distillation_cfg=None,
     ):
         self.policy_generation = policy_generation
         self.tokenizer = tokenizer
         self.task_to_env = task_to_env
         self.master_config = master_config
         self.replay_buffer = replay_buffer
+        self.teacher_worker_groups = teacher_worker_groups or {}
+        self.alias_to_group_alias = alias_to_group_alias or {}
+        self.on_policy_distillation_cfg = on_policy_distillation_cfg or {}
+        self._has_non_colocated_teachers = bool(self.teacher_worker_groups)
+        # Per-teacher locks to serialize get_logprobs calls. Concurrent calls
+        # to the same teacher cause NCCL collective desync across workers
+        # (different workers may receive requests in different order → SeqNum
+        # mismatch → 600s timeout → crash). Different teachers can still run
+        # in parallel since they use separate NCCL groups on separate nodes.
+        self._teacher_locks: dict[str, _threading.Lock] = {
+            k: _threading.Lock() for k in self.teacher_worker_groups
+        }
         self.running = False
 
         self._pg_lock: _threading.Lock = _threading.Lock()
@@ -569,6 +589,105 @@ class AsyncTrajectoryCollector:
                     f"{buffered} buffered)"
                 )
 
+    def _compute_teacher_logprobs(self, input_ids, agent_refs, input_lengths=None):
+        """Compute teacher logprobs for non-colocated teachers.
+
+        Groups samples by teacher, fans out in parallel, stitches results.
+
+        Args:
+            input_ids: [B, S] tokenized input tensor
+            agent_refs: list of B agent reference dicts
+            input_lengths: [B] per-sample lengths (required for sequence packing)
+        Returns:
+            ([B, S] teacher logprobs tensor, total_time_seconds)
+        """
+        import concurrent.futures
+        from collections import defaultdict
+
+        import torch
+
+        from nemo_rl.algorithms.opd import resolve_reference_aliases
+
+        opd_cfg = self.on_policy_distillation_cfg
+        teacher_model_by_agent_name = opd_cfg.get("teacher_model_by_agent_name", {})
+        default_teacher_alias = opd_cfg.get("default_teacher_alias")
+        strict = opd_cfg.get("strict_agent_name_match", False)
+
+        reference_aliases = resolve_reference_aliases(
+            agent_refs, teacher_model_by_agent_name,
+            default_teacher_alias=default_teacher_alias,
+            strict_agent_name_match=strict,
+        )
+
+        # Map aliases to actual group keys via deduplication mapping
+        group_keys = [self.alias_to_group_alias.get(a, a) for a in reference_aliases]
+
+        # Group sample indices by teacher group
+        group_to_indices: dict[str, list[int]] = defaultdict(list)
+        for i, gk in enumerate(group_keys):
+            group_to_indices[gk].append(i)
+
+        B, S = input_ids.shape
+        result = torch.zeros(B, S, dtype=torch.float32)
+
+        def _get_logprobs_for_group(group_key, indices):
+            twg = self.teacher_worker_groups[group_key]
+            sub_input_ids = input_ids[indices]
+            sub_lengths = input_lengths[indices] if input_lengths is not None else None
+
+            # Pad batch to multiple of dp_size (required for DP sharding)
+            dp_size = twg.sharding_annotations.get_axis_size("data_parallel")
+            actual_batch_size = sub_input_ids.shape[0]
+            remainder = actual_batch_size % dp_size
+            if remainder != 0:
+                pad_count = dp_size - remainder
+                # Repeat last row to fill — can't slice [:pad_count] when
+                # actual_batch_size < pad_count (e.g., 1 sample, dp_size=4)
+                pad_rows = sub_input_ids[-1:].expand(pad_count, -1)
+                sub_input_ids = torch.cat([sub_input_ids, pad_rows], dim=0)
+                if sub_lengths is not None:
+                    sub_lengths = torch.cat(
+                        [sub_lengths, sub_lengths[-1:].expand(pad_count)], dim=0
+                    )
+
+            sub_data = BatchedDataDict({"input_ids": sub_input_ids})
+            if sub_lengths is not None:
+                sub_data["input_lengths"] = sub_lengths
+
+            # Serialize calls per teacher to prevent NCCL collective desync
+            t_lock_start = time.time()
+            with self._teacher_locks[group_key]:
+                t_inference_start = time.time()
+                logprobs_result = twg.get_logprobs(sub_data)
+            t_done = time.time()
+            lock_wait = t_inference_start - t_lock_start
+            inference_time = t_done - t_inference_start
+            print(
+                f"[teacher_logprob] group={group_key} samples={actual_batch_size} "
+                f"lock_wait={lock_wait:.2f}s inference={inference_time:.2f}s"
+            )
+            logprobs = logprobs_result["reference_logprobs"]
+
+            # Trim DP padding
+            logprobs = logprobs[:actual_batch_size]
+
+            return indices, logprobs
+
+        # Fan out to teachers in parallel
+        t_total_start = time.time()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(group_to_indices)) as executor:
+            futures = {
+                executor.submit(_get_logprobs_for_group, gk, idxs): gk
+                for gk, idxs in group_to_indices.items()
+            }
+            for future in concurrent.futures.as_completed(futures):
+                indices, logprobs = future.result()
+                result[indices] = logprobs
+        total_time = time.time() - t_total_start
+        print(f"[teacher_logprob] total={total_time:.2f}s for {B} samples across {len(group_to_indices)} teacher(s)")
+
+        return result, total_time
+
     def _run_prompt_group_worker(
         self,
         repeated_batch: BatchedDataDict[DatumSpec],
@@ -612,6 +731,33 @@ class AsyncTrajectoryCollector:
             # Move to CPU and push to buffer (avoid blocking on GC/push)
             final_batch_cpu = final_batch.to("cpu")
             del final_batch
+
+            # Compute teacher logprobs at collection time (overlapped with async rollouts)
+            if self._has_non_colocated_teachers and "agent_ref" in final_batch_cpu:
+                agent_refs = final_batch_cpu["agent_ref"]
+                if isinstance(agent_refs, list):
+                    from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
+
+                    # Pad to the same divisor the training path uses so the
+                    # teacher's get_logprobs forward (which runs with TP+SP
+                    # enabled in mcore) satisfies reduce_scatter's first-dim%TP
+                    # divisibility assertion.
+                    flat_for_teacher, teacher_input_lengths = batched_message_log_to_flat_message(
+                        final_batch_cpu["message_log"],
+                        pad_value_dict={"token_ids": self.tokenizer.pad_token_id},
+                        make_sequence_length_divisible_by=self.master_config.policy.get(
+                            "make_sequence_length_divisible_by", 1
+                        ),
+                    )
+                    teacher_logprobs, teacher_logprob_time = self._compute_teacher_logprobs(
+                        flat_for_teacher["token_ids"], agent_refs,
+                        input_lengths=teacher_input_lengths,
+                    )
+                    # Store inside batch dict so from_batches handles
+                    # variable-length padding across prompt groups
+                    final_batch_cpu["teacher_reference_logprobs"] = teacher_logprobs
+                    rollout_metrics = dict(rollout_metrics)
+                    rollout_metrics["teacher_logprob_time"] = teacher_logprob_time
 
             trajectory_group = {
                 "batch": final_batch_cpu,
