@@ -281,7 +281,7 @@ Depending on your data shape, you may want to change these values."""
         nemo_gym_examples: list[dict],
         tokenizer: PreTrainedTokenizerBase,
         timer_prefix: str,
-    ) -> AsyncGenerator[tuple[int, dict, dict | None], None]:
+    ) -> AsyncGenerator[tuple[int, list[dict], dict | None], None]:
         """Stream postprocessed rollouts as NeMo-Gym tasks complete."""
         if not nemo_gym_examples:
             raise ValueError("NeMo-Gym rollout batch must not be empty")
@@ -298,7 +298,7 @@ Depending on your data shape, you may want to change these values."""
             examples=nemo_gym_examples, head_server_config=self.head_server_config
         )
 
-        num_results = 0
+        num_completed_rows = 0
         for task in nemo_gym_result_iterator:
             with timer.time(label=f"{timer_prefix}/await_results"):
                 try:
@@ -312,16 +312,25 @@ Depending on your data shape, you may want to change these values."""
                         )
                     raise
 
+            result_items = (
+                nemo_gym_result
+                if isinstance(nemo_gym_result, list)
+                else [nemo_gym_result]
+            )
             with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                    nemo_gym_result, tokenizer
-                )
-                if _has_nan_generation_logprobs(nemo_rl_result):
+                nemo_rl_results = [
+                    self._postprocess_nemo_gym_to_nemo_rl_result(item, tokenizer)
+                    for item in result_items
+                ]
+                if any(
+                    _has_nan_generation_logprobs(result)
+                    for result in nemo_rl_results
+                ):
                     raise RuntimeError("Generation logprobs contain NaN")
 
-            num_results += 1
+            num_completed_rows += 1
             timing_metrics = None
-            if num_results == len(nemo_gym_examples):
+            if num_completed_rows == len(nemo_gym_examples):
                 timer.stop("_run_rollouts_total")
                 timing_metrics = timer.get_timing_metrics("sum")
                 total_time = timing_metrics.pop("_run_rollouts_total")
@@ -335,7 +344,7 @@ Depending on your data shape, you may want to change these values."""
             counts_left[agent_name] -= 1
             if counts_left[agent_name] <= 0:
                 counts_left.pop(agent_name)
-            if num_results % 10 == 0 and counts_left:
+            if num_completed_rows % 10 == 0 and counts_left:
                 top_left = counts_left.most_common(5)
                 top_left_str = "\n".join(
                     f"{index + 1}. {name}: {count}"
@@ -347,7 +356,7 @@ Depending on your data shape, you may want to change these values."""
                     file=sys.stderr,
                 )
 
-            yield nemo_gym_row["_rowidx"], nemo_rl_result, timing_metrics
+            yield nemo_gym_row["_rowidx"], nemo_rl_results, timing_metrics
 
     def _postprocess_nemo_gym_to_nemo_rl_result(
         self, nemo_gym_result: dict, tokenizer: PreTrainedTokenizerBase
@@ -509,6 +518,10 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
             "message_log": nemo_rl_message_log,
             "input_message_log": nemo_rl_message_log[:1],
             "full_result": nemo_gym_result,
+            # Forward optional per-element fields used by multi-turn/group-hash flows.
+            # Defaults preserve the original single-result behavior for agents that don't set them.
+            "group_hash": nemo_gym_result.get("group_hash"),
+            "loss_multiplier": float(nemo_gym_result.get("loss_multiplier", 1.0)),
         }
 
     def shutdown(self) -> None:

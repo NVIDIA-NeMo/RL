@@ -1482,13 +1482,15 @@ class _NemoGymStreamAccumulator:
         self._num_generations = num_generations
         self._allow_mixed_agents = allow_mixed_agents
         self._received_row_indices: set[int] = set()
-        self._pending_results: dict[int, dict[int, dict]] = defaultdict(dict)
+        self._pending_results: dict[int, dict[int, list[dict]]] = defaultdict(dict)
 
     @property
     def is_complete(self) -> bool:
         return len(self._received_row_indices) == len(self._rows)
 
-    def add(self, row_index: int, result: dict) -> _CompletedNemoGymGroup | None:
+    def add(
+        self, row_index: int, results: list[dict]
+    ) -> _CompletedNemoGymGroup | None:
         """Add one streamed row and return its group when that group is complete."""
         if not isinstance(row_index, int):
             raise TypeError(
@@ -1505,7 +1507,7 @@ class _NemoGymStreamAccumulator:
         self._received_row_indices.add(row_index)
         group_index = row_index // self._num_generations
         group_results = self._pending_results[group_index]
-        group_results[row_index] = result
+        group_results[row_index] = results
         if len(group_results) < self._num_generations:
             return None
 
@@ -1529,7 +1531,12 @@ class _NemoGymStreamAccumulator:
                     f"Expected one NeMo-Gym agent per prompt group, got {agent_names}"
                 )
 
-        ordered_results = [group_results[index] for index in expected_row_indices]
+        ordered_results = []
+        for index in expected_row_indices:
+            source_rowidx = index - start
+            for result in group_results[index]:
+                result["source_rowidx"] = source_rowidx
+                ordered_results.append(result)
         del self._pending_results[group_index]
         return _CompletedNemoGymGroup(
             group_index=group_index,
@@ -2124,14 +2131,15 @@ async def run_async_nemo_gym_rollout(
                 except StopAsyncIteration:
                     stream_finished = True
                 else:
-                    rowidx, result, timing_metrics = await future
+                    rowidx, results, timing_metrics = await future
 
             if not stream_finished:
                 if timing_metrics is not None:
                     actor_timing_metrics = timing_metrics
 
-                _tensorize_nemo_gym_result(result)
-                completed_group = accumulator.add(rowidx, result)
+                for result in results:
+                    _tensorize_nemo_gym_result(result)
+                completed_group = accumulator.add(rowidx, results)
                 if completed_group is not None:
                     rollout_result = _postprocess_single_nemo_gym_group(
                         nemo_gym_rows=completed_group.rows,
@@ -2273,7 +2281,7 @@ def _postprocess_single_nemo_gym_group(
 
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
-        batch_size = len(nemo_gym_rows)
+        batch_size = len(results)
         if "vllm_cfg" in policy_generation.cfg:
             max_total_tokens_per_sample = policy_generation.cfg["vllm_cfg"][
                 "max_model_len"
@@ -2365,11 +2373,14 @@ def _postprocess_single_nemo_gym_group(
             # / batch_size,
         }
 
-    # Per-agent misc metrics
+    # Per-agent misc metrics.
+    # Results may have expanded beyond the input row count (e.g. one result per turn
+    # from a multi-turn agent), so trace each result back via source_rowidx.
     with timer.time(f"{timer_prefix}/per_agent_misc_metrics"):
         agent_to_results: dict[str, list[dict]] = defaultdict(list)
-        for nemo_gym_row, result in zip(nemo_gym_rows, results):
-            agent_ref = nemo_gym_row["agent_ref"]
+        for i, result in enumerate(results):
+            src_idx = result.get("source_rowidx", i)
+            agent_ref = nemo_gym_rows[src_idx]["agent_ref"]
             agent_name = agent_ref["name"]
             agent_to_results[agent_name].append(result["full_result"])
             result["agent_ref"] = agent_ref
@@ -2417,6 +2428,22 @@ def _postprocess_single_nemo_gym_group(
     )
     input_ids = batched_flat["token_ids"]
 
+    # Build per-result loss multiplier = parent row mask * per-element mask (for padded
+    # slots from multi-turn agents). If no expansion happened, source_rowidx is the
+    # identity and per_element_lm defaults to 1.0, so this preserves the original shape.
+    parent_lm = input_batch["loss_multiplier"]
+    source_rowidxs = torch.tensor(
+        [r.get("source_rowidx", i) for i, r in enumerate(results)],
+        dtype=torch.long,
+        device=parent_lm.device,
+    )
+    per_element_lm = torch.tensor(
+        [float(r.get("loss_multiplier", 1.0)) for r in results],
+        dtype=parent_lm.dtype,
+        device=parent_lm.device,
+    )
+    expanded_loss_multiplier = parent_lm[source_rowidxs] * per_element_lm
+
     final_batch = BatchedDataDict[DatumSpec](
         {
             "agent_ref": [r["agent_ref"] for r in results],
@@ -2425,7 +2452,7 @@ def _postprocess_single_nemo_gym_group(
             "length": torch.tensor(
                 [len(r["input_message_log"][0]["token_ids"]) for r in results]
             ),
-            "loss_multiplier": input_batch["loss_multiplier"],
+            "loss_multiplier": expanded_loss_multiplier,
             # Unnecessary parts of the DatumSpec unused by the GRPO algorithm
             # extra_env_info: dict[str, Any]
             # idx: int
@@ -2442,6 +2469,16 @@ def _postprocess_single_nemo_gym_group(
             "mask_sample": _extract_mask_sample_flags(results),
         }
     )
+
+    # group_hash is optional — only present when the agent provides it (e.g. for
+    # multi-turn grouping where all turns of one problem share a baseline).
+    group_hashes = [r.get("group_hash") for r in results]
+    if any(group_hash is not None for group_hash in group_hashes):
+        assert all(
+            isinstance(group_hash, str) and group_hash
+            for group_hash in group_hashes
+        ), "group_hash must be a non-empty string on every result when any result sets it"
+        final_batch["group_hash"] = group_hashes
 
     if length_rewards_low:
         rollout_metrics["mean_length_reward_low"] = sum(length_rewards_low) / len(
