@@ -126,6 +126,22 @@ class AsyncGRPOConfig(TypedDict):
     recompute_kv_cache_after_weight_updates: NotRequired[bool]
 
 
+def _group_hashes_to_ids(group_hashes: list[str]) -> torch.Tensor:
+    """Map an ordered list of string group hashes to a 1D LongTensor of ids.
+
+    Rows sharing the same hash share an id. The mapping is deterministic for a
+    given input list (ids are assigned in first-seen order). Used so multi-turn
+    agents can group samples that share a baseline even when their prompts differ.
+    """
+    hash_to_id: dict[str, int] = {}
+    ids: list[int] = []
+    for h in group_hashes:
+        if h not in hash_to_id:
+            hash_to_id[h] = len(hash_to_id)
+        ids.append(hash_to_id[h])
+    return torch.tensor(ids, dtype=torch.long)
+
+
 class AdvEstimatorConfig(TypedDict):
     """Configuration for advantage estimator (GRPO, GDPO, or Reinforce++)."""
 
@@ -1874,12 +1890,21 @@ def grpo_train(
                         and "unshaped_total_reward" in repeated_batch
                         else None
                     )
+                    # When the environment provides `group_hash` (e.g. nemo-gym
+                    # multi-turn agents where prompts vary across turns but samples
+                    # should share a baseline), group by those hashes instead of by
+                    # the full prompt token ids.
+                    if "group_hash" in repeated_batch:
+                        group_key = _group_hashes_to_ids(repeated_batch["group_hash"])
+                    else:
+                        group_key = input_ids
+
                     if master_config.grpo.get("calculate_advantages_on_gpu"):
                         print("Computing advantages on GPU!")
                         # Just fix the device id for now
                         device_id = 0
                         baseline, std = calculate_baseline_and_std_per_prompt(
-                            input_ids.cuda(device_id),
+                            group_key.cuda(device_id),
                             rewards.cuda(device_id),
                             torch.ones_like(rewards).cuda(device_id),
                             leave_one_out_baseline=master_config.grpo[
@@ -1895,7 +1920,7 @@ def grpo_train(
                         std = std.cpu()
                     else:
                         baseline, std = calculate_baseline_and_std_per_prompt(
-                            input_ids,
+                            group_key,
                             rewards,
                             torch.ones_like(rewards),
                             leave_one_out_baseline=master_config.grpo[
@@ -1940,19 +1965,26 @@ def grpo_train(
                     # Save baseline for logging (before deletion)
                     baseline_for_log = baseline.clone()
 
-                    # Extract original prompt messages using the length field
-                    # This correctly handles multi-turn prompts that contain assistant messages
-                    initial_prompt_message_logs = extract_initial_prompt_messages(
-                        repeated_batch["message_log"],
-                        repeated_batch["length"],
-                    )
-                    prompt_batched_flat, _ = batched_message_log_to_flat_message(
-                        initial_prompt_message_logs,
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                    )
-                    prompt_ids_for_adv = prompt_batched_flat["token_ids"]
-                    del initial_prompt_message_logs
-                    del prompt_batched_flat
+                    # Prefer env-provided group_hash (1D integer ids) when available;
+                    # otherwise fall back to the initial-prompt token tensor.
+                    if "group_hash" in repeated_batch:
+                        prompt_ids_for_adv = _group_hashes_to_ids(
+                            repeated_batch["group_hash"]
+                        )
+                    else:
+                        # Extract original prompt messages using the length field
+                        # This correctly handles multi-turn prompts that contain assistant messages
+                        initial_prompt_message_logs = extract_initial_prompt_messages(
+                            repeated_batch["message_log"],
+                            repeated_batch["length"],
+                        )
+                        prompt_batched_flat, _ = batched_message_log_to_flat_message(
+                            initial_prompt_message_logs,
+                            pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                        )
+                        prompt_ids_for_adv = prompt_batched_flat["token_ids"]
+                        del initial_prompt_message_logs
+                        del prompt_batched_flat
                     del input_ids
                     del baseline
                     del std
@@ -3064,23 +3096,35 @@ def async_grpo_train(
                             per_group_metrics.setdefault(k, []).append(v)
                     rollout_metrics = aggregate_rollout_metrics(per_group_metrics)
 
-                # Enforce fixed training batch: num_prompts_per_step * num_generations_per_prompt
-                expected_batch_size = (
-                    master_config.grpo["num_prompts_per_step"]
-                    * master_config.grpo["num_generations_per_prompt"]
+                # Every sequence produced by the environment must be consumed in exactly
+                # one gradient step: assert that the assembled training batch size equals
+                # (num prompt groups requested) * (per-group size reported by the env).
+                # This also covers multi-turn expansions (e.g. one datapoint per turn)
+                # without needing the expansion factor plumbed through the config.
+                assert len(per_prompt_batches) == num_prompt_groups_needed, (
+                    f"Async GRPO: sampled {len(per_prompt_batches)} prompt groups but "
+                    f"requested {num_prompt_groups_needed}."
                 )
-                if repeated_batch.size != expected_batch_size:
-                    print(
-                        f"❌ Unexpected training batch size: got {repeated_batch.size}, expected {expected_batch_size}. Skipping step and waiting for correct buffer content."
-                    )
-                    time.sleep(0.5)
-                    continue
+                per_group_size = per_prompt_batches[0].size
+                assert all(b.size == per_group_size for b in per_prompt_batches), (
+                    "Async GRPO: per-prompt batches have inconsistent sizes; every "
+                    "environment output must be consumed in one gradient step."
+                )
+                expected_batch_size = num_prompt_groups_needed * per_group_size
+                assert repeated_batch.size == expected_batch_size, (
+                    f"Async GRPO: training batch size mismatch: got {repeated_batch.size}, "
+                    f"expected {expected_batch_size} = {num_prompt_groups_needed} groups × "
+                    f"{per_group_size}/group. All environment outputs must be consumed "
+                    f"in one gradient step."
+                )
 
                 # Optional sanity: ensure DP divisibility to avoid sharding issues
                 dp_size = policy.sharding_annotations.get_axis_size("data_parallel")
                 if expected_batch_size % dp_size != 0:
                     raise AssertionError(
-                        f"Configuration error: (num_prompts_per_step * num_generations_per_prompt) = {expected_batch_size} must be divisible by data_parallel size {dp_size}."
+                        f"Configuration error: training batch size ({expected_batch_size} = "
+                        f"{num_prompt_groups_needed} groups × {per_group_size}/group) must be "
+                        f"divisible by data_parallel size {dp_size}."
                     )
 
                 print(f"Got trajectory batch (size: {repeated_batch.size})")

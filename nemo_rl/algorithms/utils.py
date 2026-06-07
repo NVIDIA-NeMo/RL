@@ -95,7 +95,9 @@ def calculate_baseline_and_std_per_prompt(
     The same baseline is calculated for each prompt. Samples set to 0 in 'valid_mask'
     are not included in the baseline calculation.
 
-    prompts:    tensor (b, s)     Tensor of prompts the model used. May be on any device
+    prompts:    tensor (b, s) or (b,)  Prompts the model used (2D token tensor), OR
+                                       a 1D tensor of integer group ids — rows sharing
+                                       the same id are grouped for the baseline. May be on any device
     rewards:    tensor (b,)       Float-valued rewards. May be on any device
     valid_mask: tensor (b,)       Vector of 0/1, where 0 is to ignore and 1 is to keep
     leave_one_out_baseline: bool  Compute an unbiased baseline by leaving out the sample that
@@ -123,7 +125,11 @@ def calculate_baseline_and_std_per_prompt(
         reward_device = torch.device(f"cuda:{device_ordinal}")
 
     for i in range(len(unique_prompts)):
-        is_matching_prompt = (prompts == unique_prompts[i]).all(1)
+        is_matching_prompt = prompts == unique_prompts[i]
+        # 2D prompt-token tensors need .all(1) to collapse per-token equality into
+        # a per-row boolean; 1D group-id tensors are already per-row.
+        if is_matching_prompt.dim() == 2:
+            is_matching_prompt = is_matching_prompt.all(1)
         prompt_idx = torch.arange(len(prompts), device=reward_device)[
             is_matching_prompt
         ]

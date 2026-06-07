@@ -1174,7 +1174,10 @@ def run_async_nemo_gym_rollout(
 
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
-        batch_size = len(nemo_gym_rows)
+        # Agents may return multiple results per input row (e.g. multi-turn agents
+        # return one datapoint per turn), so the post-rollout batch size is the
+        # length of the flattened results list, not the number of input rows.
+        batch_size = len(results)
         max_total_tokens_per_sample = policy_generation.cfg["vllm_cfg"]["max_model_len"]
         all_sample_metrics = [
             {
@@ -1230,11 +1233,14 @@ def run_async_nemo_gym_rollout(
             # / batch_size,
         }
 
-    # Per-agent misc metrics
+    # Per-agent misc metrics.
+    # Results may have expanded beyond the input row count (e.g. one result per turn
+    # from a multi-turn agent), so trace each result back via source_rowidx.
     with timer.time(f"{timer_prefix}/per_agent_misc_metrics"):
         agent_to_results: dict[str, list[dict]] = defaultdict(list)
-        for nemo_gym_row, result in zip(nemo_gym_rows, results):
-            agent_ref = nemo_gym_row["agent_ref"]
+        for i, result in enumerate(results):
+            src_idx = result.get("source_rowidx", i)
+            agent_ref = nemo_gym_rows[src_idx]["agent_ref"]
             agent_name = agent_ref["name"]
             agent_to_results[agent_name].append(result["full_result"])
             result["agent_ref"] = agent_ref
@@ -1282,6 +1288,22 @@ def run_async_nemo_gym_rollout(
     )
     input_ids = batched_flat["token_ids"]
 
+    # Build per-result loss multiplier = parent row mask * per-element mask (for padded
+    # slots from multi-turn agents). If no expansion happened, source_rowidx is the
+    # identity and per_element_lm defaults to 1.0, so this preserves the original shape.
+    parent_lm = input_batch["loss_multiplier"]
+    source_rowidxs = torch.tensor(
+        [r.get("source_rowidx", i) for i, r in enumerate(results)],
+        dtype=torch.long,
+        device=parent_lm.device,
+    )
+    per_element_lm = torch.tensor(
+        [float(r.get("loss_multiplier", 1.0)) for r in results],
+        dtype=parent_lm.dtype,
+        device=parent_lm.device,
+    )
+    expanded_loss_multiplier = parent_lm[source_rowidxs] * per_element_lm
+
     final_batch = BatchedDataDict[DatumSpec](
         {
             "agent_ref": [r["agent_ref"] for r in results],
@@ -1290,7 +1312,7 @@ def run_async_nemo_gym_rollout(
             "length": torch.tensor(
                 [len(r["input_message_log"][0]["token_ids"]) for r in results]
             ),
-            "loss_multiplier": input_batch["loss_multiplier"],
+            "loss_multiplier": expanded_loss_multiplier,
             # Unnecessary parts of the DatumSpec unused by the GRPO algorithm
             # extra_env_info: dict[str, Any]
             # idx: int
@@ -1304,6 +1326,15 @@ def run_async_nemo_gym_rollout(
             ),
         }
     )
+
+    # group_hash is optional — only present when the agent provides it (e.g. for
+    # multi-turn grouping where all turns of one problem share a baseline).
+    group_hashes = [r.get("group_hash") for r in results]
+    if any(h is not None for h in group_hashes):
+        assert all(isinstance(h, str) and h for h in group_hashes), (
+            "group_hash must be a non-empty string on every result when any result sets it"
+        )
+        final_batch["group_hash"] = group_hashes
 
     return AsyncNemoGymRolloutResult(
         input_ids=input_ids,

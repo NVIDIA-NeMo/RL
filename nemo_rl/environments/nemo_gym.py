@@ -230,19 +230,27 @@ Depending on your data shape, you may want to change these values."""
                 examples=nemo_gym_examples, head_server_config=self.head_server_config
             )
 
-            nemo_rl_rowidxs = []
-            nemo_rl_results = []
+            # Each input row may expand into multiple nemo_rl results if the agent
+            # returned a list (e.g. multi-turn agents return one datapoint per turn).
+            nemo_rl_rowidxs: list[int] = []
+            nemo_rl_results: list[dict] = []
             for task in nemo_gym_result_iterator:
                 with timer.time(label=f"{timer_prefix}/await_results"):
                     nemo_gym_row, nemo_gym_result = await task
 
-                with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                    nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                        nemo_gym_result, tokenizer
-                    )
+                # Normalize to a list so single-dict returns go through the same path.
+                if isinstance(nemo_gym_result, list):
+                    result_items = nemo_gym_result
+                else:
+                    result_items = [nemo_gym_result]
 
-                nemo_rl_rowidxs.append(nemo_gym_row["_rowidx"])
-                nemo_rl_results.append(nemo_rl_result)
+                with timer.time(label=f"{timer_prefix}/postprocess_results"):
+                    for item in result_items:
+                        nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
+                            item, tokenizer
+                        )
+                        nemo_rl_rowidxs.append(nemo_gym_row["_rowidx"])
+                        nemo_rl_results.append(nemo_rl_result)
 
             # determine if generation_logprobs contain NaN; if not, break;
             logprob_contains_nan = False
@@ -264,10 +272,15 @@ Depending on your data shape, you may want to change these values."""
             else:
                 break
 
-        nemo_rl_sort_results = [None] * nemo_gym_num_rows
+        # Group results by source row index, then emit them in row order. This preserves
+        # ordering across the overall batch while keeping multi-result expansions contiguous.
+        # Each result carries its source_rowidx so downstream code can expand per-row
+        # input tensors (e.g. loss_multiplier) to match.
+        grouped: list[list[dict]] = [[] for _ in range(nemo_gym_num_rows)]
         for rowidx, result in zip(nemo_rl_rowidxs, nemo_rl_results):
-            nemo_rl_sort_results[rowidx] = result
-        nemo_rl_results = nemo_rl_sort_results
+            result["source_rowidx"] = rowidx
+            grouped[rowidx].append(result)
+        nemo_rl_results = [r for group in grouped for r in group]
 
         timer.stop("_run_rollouts_total")
         timing_metrics = timer.get_timing_metrics("sum")
@@ -381,6 +394,10 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
             "message_log": nemo_rl_message_log,
             "input_message_log": nemo_rl_message_log[:1],
             "full_result": nemo_gym_result,
+            # Forward optional per-element fields used by multi-turn/group-hash flows.
+            # Defaults preserve the original single-result behavior for agents that don't set them.
+            "group_hash": nemo_gym_result.get("group_hash"),
+            "loss_multiplier": float(nemo_gym_result.get("loss_multiplier", 1.0)),
         }
 
     def shutdown(self) -> None:
