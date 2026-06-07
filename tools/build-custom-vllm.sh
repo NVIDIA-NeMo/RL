@@ -57,7 +57,7 @@ git checkout "$GIT_REF"
 # Create a new Python environment using uv
 echo "Creating Python environment..."
 # Pop the project environment set by user to not interfere with the one we create for the vllm repo
-OLD_UV_PROJECT_ENVIRONMENT=$UV_PROJECT_ENVIRONMENT
+OLD_UV_PROJECT_ENVIRONMENT=${UV_PROJECT_ENVIRONMENT:-}
 unset UV_PROJECT_ENVIRONMENT
 uv venv
 
