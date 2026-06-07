@@ -169,6 +169,14 @@ class FaultInjector:
         # First cycle uses trigger_after_s; subsequent cycles fire
         # immediately after the inter-cycle sleep (repeat_every_s).
         delay_before_kill = self.trigger_after_s
+        # Anchor the FIRST fault to "training has started refitting" rather
+        # than a wall-clock guess from daemon start. Setup time varies wildly
+        # (warm cluster reuse ~4 min vs cold Megatron-30B load ~13 min), so a
+        # fixed delay would fire during setup on a slow start (startup is NOT
+        # fault-tolerant yet) or after the run already finished on a fast one.
+        # Block until the router reports >=1 refit, THEN apply trigger_after_s
+        # as a delay measured from "training is genuinely stepping".
+        self._wait_for_training_started(timeout_s=1800.0)
         while True:
             cycle_n += 1
             if cycle_n > 1:
@@ -353,6 +361,47 @@ class FaultInjector:
             # After the first cycle, the kill should fire as soon as we
             # re-pick a target (no extra trigger delay).
             delay_before_kill = 0.0
+
+    def _wait_for_training_started(
+        self, timeout_s: float = 1800.0, poll_every_s: float = 5.0
+    ) -> None:
+        """Block until the router reports >=1 weight refit (training has
+        started refitting), so the first fault is anchored to real training
+        progress rather than a wall-clock guess from daemon start.
+
+        Best-effort: if ``/refit_count`` never reports a refit within the
+        window (or the endpoint is missing on an older router), we log and
+        fall through to the old wall-clock behavior rather than pinning the
+        actor forever.
+        """
+        deadline = time.monotonic() + timeout_s
+        last_logged = 0.0
+        while time.monotonic() < deadline:
+            try:
+                resp = requests.get(f"{self.router_url}/refit_count", timeout=5)
+                if resp.status_code == 200:
+                    n = int(resp.json().get("refit_attempts", 0))
+                    if n >= 1:
+                        print(
+                            f"[fault-inject] training started "
+                            f"(refit_attempts={n}); beginning trigger countdown",
+                            flush=True,
+                        )
+                        return
+            except Exception as e:  # noqa: BLE001
+                if time.monotonic() - last_logged > 30:
+                    print(
+                        f"[fault-inject] waiting for first refit "
+                        f"(/refit_count probe: {e})",
+                        flush=True,
+                    )
+                    last_logged = time.monotonic()
+            time.sleep(poll_every_s)
+        print(
+            "[fault-inject] WARN: no refit observed within "
+            f"{timeout_s:.0f}s; proceeding with trigger countdown anyway",
+            flush=True,
+        )
 
     def _wait_for_steady_state(
         self, timeout_s: float = 600.0, poll_every_s: float = 5.0

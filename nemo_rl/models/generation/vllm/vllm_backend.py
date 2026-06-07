@@ -543,19 +543,30 @@ class VllmInternalWorkerExtension:
                 flush=True,
             )
         finally:
-            # Tear down the cross-cluster ``model_update_group`` at the END
-            # of every refit — but ONLY in disaggregated mode where shards
-            # can die independently and stale NCCL state would poison the
-            # next refit. In single-cluster (non-disagg) mode the group is
-            # stable for the entire run, so teardown is unnecessary overhead
-            # (~2.5s re-init per step).
+            # Tear down the cross-cluster ``model_update_group`` ONLY on a
+            # FAILED refit (in disagg mode). On a SUCCESSFUL refit we KEEP the
+            # group alive across refits — symmetric with
+            # RefitWorker.broadcast_weights_until_complete.
+            #
+            # Recreating the group every refit forces a fresh cross-cluster
+            # TCPStore rendezvous each step, which is intermittently flaky on
+            # this cluster (gen workers fail to connect → the broadcast
+            # collective can never complete → spurious 60s aborts + healthy
+            # worker eviction with NO fault). Holding the group alive makes a
+            # steady-state refit a plain broadcast on the existing comm
+            # (reliable, no per-step rendezvous); ``ensure_collective_synced``
+            # re-inits only when the world size changes (a real fault). A peer
+            # dying mid-broadcast trips ``synchronize_or_abort`` (sets
+            # success=False here) → we tear down → the next refit re-inits at
+            # the new world. In single-cluster (non-disagg) mode the group is
+            # never torn down per-refit (it's stable for the whole run).
             #
             # Disagg mode is identified by DISAGG_JOB_ID env var, set by
             # run_standalone_generation_server.py's entrypoint.
             import os as _os
 
             is_disagg = bool(_os.environ.get("DISAGG_JOB_ID"))
-            if is_disagg:
+            if is_disagg and not success:
                 group = getattr(self, "model_update_group", None)
                 if group is not None:
                     try:

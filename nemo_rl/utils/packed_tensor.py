@@ -138,6 +138,24 @@ def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
     streams = [torch.cuda.Stream() for _ in range(num_buffers)]
     buffer_idx = 0
 
+    # When a peer is SIGKILL'd mid-broadcast the enqueued NCCL kernel can
+    # never complete, and a blind ``cudaStreamSynchronize`` below would
+    # wedge this thread FOREVER — the cross-cluster weight-sync comm
+    # (StatelessProcessGroup) uses the raw nccl bindings with no torch
+    # ProcessGroupNCCL watchdog to abort the spinning kernel. Prefer the
+    # group's interruptible sync, which polls the comm's async-error state
+    # and aborts+raises on peer death so the caller (vLLM
+    # ``update_weights_from_collective``) can return and free its engine
+    # RPC thread for the recovery init_collective. Fall back to a plain
+    # stream sync for groups that don't expose it (e.g. unit-test mocks).
+    _abortable_sync = getattr(group, "synchronize_or_abort", None)
+
+    def _sync_stream(s: "torch.cuda.Stream") -> None:
+        if _abortable_sync is not None:
+            _abortable_sync(s)
+        else:
+            s.synchronize()
+
     packing_tensor_meta_data = [[] for _ in range(num_buffers)]
     packing_tensor_sizes = [0 for _ in range(num_buffers)]
     offsets = [0 for _ in range(num_buffers)]
@@ -148,8 +166,9 @@ def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
     while True:
         # Move to the next buffer
         buffer_idx = (buffer_idx + 1) % num_buffers
-        # Synchronize the current stream
-        streams[buffer_idx].synchronize()
+        # Synchronize the current stream (interruptible: aborts + raises if
+        # a peer died on this buffer's previous broadcast).
+        _sync_stream(streams[buffer_idx])
         with torch.cuda.stream(streams[buffer_idx]):  # type: ignore[arg-type]
             # Initialize the packing tensor meta data
             packing_tensor_meta_data[buffer_idx] = []
@@ -198,4 +217,4 @@ def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
                 break
 
     for s in streams:
-        s.synchronize()
+        _sync_stream(s)

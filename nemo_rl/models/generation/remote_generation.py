@@ -347,14 +347,40 @@ class RemoteGeneration(GenerationInterface):
                 effective_train_ws = policy.worker_group.cluster.world_size()
             new_total_ws = effective_train_ws + new_gen_ws
             last = getattr(self, "_last_synced_world_size", None)
-            # NB: with per-refit teardown (RefitWorker.broadcast_weights_
-            # until_complete and vllm_backend.update_weights_from_collective
-            # both call ``group.destroy()`` at the end of every refit), the
-            # cross-cluster ``model_update_group`` does NOT exist between
-            # refits. So we ALWAYS need to re-rendezvous here, even when
-            # the world size hasn't changed since the last refit. The
-            # ``_last_synced_world_size`` field is kept only for log
-            # output; it no longer gates the init.
+            # Reuse the live group when the world size hasn't changed. The
+            # cross-cluster ``model_update_group`` is now KEPT ALIVE across
+            # refits (the per-refit teardown in
+            # RefitWorker.broadcast_weights_until_complete and
+            # vllm_backend.update_weights_from_collective only fires on a
+            # FAILED refit). Re-rendezvousing every refit forced a fresh
+            # cross-cluster TCPStore handshake each step, which is
+            # intermittently flaky here (gen workers fail to connect → the
+            # broadcast can never complete → spurious aborts + healthy-worker
+            # eviction with NO fault). Skipping the re-init when the world is
+            # unchanged turns a steady-state refit into a plain broadcast on
+            # the existing comm. ``_last_synced_world_size`` is reset to None
+            # on any refit FAILURE (grpo broadcast-retry loop) and a fault
+            # changes ``new_total_ws`` — either forces the re-init below.
+            #
+            # CRITICAL: only skip if the train-side producer is actually still
+            # alive. When a fault trips ``abort_collective`` it ray.kills the
+            # RefitWorker (``policy._refit_worker`` → None) but the gen-side
+            # world size can be unchanged (e.g. the dead shard's replacement
+            # rejoined at the same count) — skipping then would call
+            # ``broadcast_weights_for_collective`` with no RefitWorker and
+            # raise "called before init_collective spawned the RefitWorker",
+            # wasting a whole refit-retry. If the producer is gone we must
+            # fall through and re-init (which respawns it).
+            refit_worker_alive = (not uses_refit_worker) or (
+                getattr(policy, "_refit_worker", None) is not None
+            )
+            if last is not None and last == new_total_ws and refit_worker_alive:
+                print(
+                    f"  ✓ ensure_collective_synced: gen world unchanged "
+                    f"({last}); reusing live model_update_group (no re-rendezvous)",
+                    flush=True,
+                )
+                return
 
             ip, port = policy.worker_group.cluster.get_master_address_and_port()
             print(

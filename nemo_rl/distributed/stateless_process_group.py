@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from datetime import timedelta
 from typing import Optional
 
@@ -43,6 +44,19 @@ _RENDEZVOUS_TIMEOUT = timedelta(seconds=30)
 # fix: without this, the survivors' Ray actor processes also die when
 # one peer is SIGKILL'd during init_collective bootstrap.
 _NCCL_BOOTSTRAP_TIMEOUT = timedelta(seconds=30)
+
+# Backstop timeout for waiting on an in-flight weight-broadcast collective
+# (see ``synchronize_or_abort``). The PRIMARY failure signal is the comm's
+# async-error state — NCCL flips it within its own connection-failure
+# detection window when a peer dies — so this timeout only fires in the
+# rare case NCCL never reports the death (e.g. a peer GPU hang with the
+# socket still alive). It must sit well above the worst-case HEALTHY
+# per-buffer sync (sub-second) so a slow-but-live broadcast is never
+# aborted. Tied to the same heartbeat knob the rest of the FT timing
+# (ft_constants.py) derives from.
+_BROADCAST_SYNC_TIMEOUT = timedelta(
+    seconds=float(os.environ.get("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", "60"))
+)
 
 
 class StatelessProcessGroup:
@@ -215,6 +229,57 @@ class StatelessProcessGroup:
         except Exception:  # noqa: BLE001
             pass
 
+    def _poll_until_done(
+        self,
+        done_fn,
+        comm_ptr: int,
+        phase: str,
+        timeout: timedelta,
+        poll_interval_s: float = 0.005,
+    ) -> None:
+        """Block until ``done_fn()`` is truthy, watching the comm's
+        async-error state the whole time.
+
+        This is the steady-state analogue of ``_poll_raw_async`` (which
+        polls an in-progress *init*). Here the comm is already up and we
+        are waiting for an enqueued collective to drain: ``done_fn`` (a
+        CUDA completion query) is the success signal, while
+        ``comm_get_async_error`` is the failure signal. On peer death or
+        ``timeout`` we ``comm_abort`` — which unblocks any kernel hung
+        waiting on the dead peer — and raise a ``RuntimeError`` the
+        caller's actor can catch and recover from.
+
+        Pure-Python: ``done_fn`` is injected (not tied to CUDA) so the
+        loop is unit-testable. ``synchronize_or_abort`` wires ``done_fn``
+        to a CUDA event's ``query``.
+        """
+        import time as _time
+
+        deadline = _time.monotonic() + timeout.total_seconds()
+        success = int(_nccl_bindings.Result.Success)
+        in_progress = int(_nccl_bindings.Result.InProgress)
+        while not done_fn():
+            state = int(_nccl_bindings.comm_get_async_error(comm_ptr))
+            if state != success and state != in_progress:
+                try:
+                    err_msg = _nccl_bindings.get_last_error(comm_ptr)
+                except Exception:  # noqa: BLE001
+                    err_msg = "<get_last_error failed>"
+                self._abort_raw_quietly(comm_ptr)
+                raise RuntimeError(
+                    f"NCCL {phase} failed (rank={self.rank}/{self.world_size}, "
+                    f"async_state={state}): {err_msg} — peer likely died "
+                    f"mid-collective"
+                )
+            if _time.monotonic() > deadline:
+                self._abort_raw_quietly(comm_ptr)
+                raise RuntimeError(
+                    f"NCCL {phase} timed out after {timeout.total_seconds()}s "
+                    f"(rank={self.rank}/{self.world_size}) — peer likely died "
+                    f"mid-collective"
+                )
+            _time.sleep(poll_interval_s)
+
     def broadcast(
         self, tensor: torch.Tensor, src: int, stream: Optional[torch.cuda.Stream] = None
     ):
@@ -236,6 +301,50 @@ class StatelessProcessGroup:
             stream = torch.cuda.current_stream()
         self.nccl_communicator.broadcast(
             sendbuf=tensor, recvbuf=tensor, root=src, stream=int(stream.cuda_stream)
+        )
+
+    def synchronize_or_abort(
+        self,
+        stream: Optional[torch.cuda.Stream] = None,
+        timeout: Optional[timedelta] = None,
+    ) -> None:
+        """Interruptible replacement for ``stream.synchronize()`` on a
+        stream carrying this group's NCCL collectives.
+
+        A blind ``cudaStreamSynchronize`` on a collective whose peer was
+        SIGKILL'd mid-flight blocks UNINTERRUPTIBLY forever: this comm
+        uses the raw nccl bindings in non-blocking mode with NO torch
+        ``ProcessGroupNCCL`` watchdog, so nothing aborts the spinning
+        kernel. This method is that missing watchdog, inlined onto the
+        caller's thread — it polls a CUDA completion event together with
+        the comm's async-error state, and on peer death / timeout aborts
+        the comm (freeing the hung kernel) and raises.
+
+        The raise propagates up through ``packed_broadcast_consumer`` →
+        ``update_weights_from_collective``, which returns ``False`` and
+        frees the (otherwise wedged) engine-core RPC thread so the next
+        ``init_collective`` / ``reset_collective`` can actually be
+        dispatched and re-rendezvous at the new world size. Without this,
+        the survivors of a mid-refit fault wedge forever (no watchdog
+        exists to fire), and every downstream recovery path that waits
+        for them to free up times out.
+        """
+        if stream is None:
+            stream = torch.cuda.current_stream()
+        comm = getattr(self, "nccl_communicator", None)
+        if comm is None:
+            # No NCCL comm bound (already torn down) — nothing to guard.
+            stream.synchronize()
+            return
+        if timeout is None:
+            timeout = _BROADCAST_SYNC_TIMEOUT
+        event = torch.cuda.Event()
+        event.record(stream)
+        self._poll_until_done(
+            done_fn=event.query,
+            comm_ptr=comm._comm,
+            phase="broadcast_sync",
+            timeout=timeout,
         )
 
     def destroy(self):

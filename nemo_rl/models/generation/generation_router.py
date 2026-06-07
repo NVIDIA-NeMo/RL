@@ -211,6 +211,13 @@ class GenerationRouter:
         # it. Set inside add_shard / remove_shard, cleared once the gen-side
         # workers have completed reset_collective + init_collective.
         self._nccl_reinit_in_progress: bool = False
+        # Count of weight-refit broadcasts the router has handled. The
+        # FaultInjector gates its FIRST kill on this reaching >=1 ("training
+        # has actually started refitting") instead of a wall-clock guess —
+        # setup time varies wildly (warm reuse ~4min vs cold Megatron-30B
+        # load ~13min), so a fixed delay-from-daemon-start fires during setup
+        # on a slow start or after the run finished on a fast one.
+        self._refit_attempts: int = 0
         # Set at bring-up via register_shards; updated on add/remove.
         self._per_shard_world_size: int = 1
         # Reference to the underlying VllmGeneration. Drives both the
@@ -996,38 +1003,58 @@ class GenerationRouter:
         self,
         futures: list[Any],
         rendezvous_timeout_s: float,
-    ) -> tuple[list[int], list[Any], list[Optional[str]]]:
+        fast_fail_s: float = 8.0,
+    ) -> tuple[list[int], list[Any], list[Optional[str]], list[int]]:
         """Wait on per-worker futures, identify failures.
 
-        Returns ``(failed_indices, results, exception_types)``. A worker is
-        "failed" if its future either (a) raised an exception or (b) was
-        still pending when ``rendezvous_timeout_s`` elapsed. Pending futures
-        are ``ray.cancel`` ed so they don't pin the actor's task queue.
+        Returns ``(failed_indices, results, exception_types, failed_fast)``.
+        A worker is "failed" if its future either (a) raised an exception or
+        (b) was still pending when ``rendezvous_timeout_s`` elapsed. Pending
+        futures are ``ray.cancel`` ed so they don't pin the actor's task queue.
 
-        ``results`` has one entry per future — the unwrapped value on
-        success, or ``None`` on failure. ``exception_types`` has one entry
-        per future — the exception class name on failure (e.g.
-        ``"DistStoreError"``, ``"DistNetworkError"``, ``"RayActorError"``,
-        ``"PENDING"`` for cancelled-on-timeout), or ``None`` on success.
-        Callers use this to distinguish "rendezvous-master failure"
-        (every gen client raises ``DistStoreError`` / ``DistNetworkError``
-        because rank 0 timed out) from "individual worker died"
-        (one ``RayActorError`` / ``RuntimeError`` while peers succeeded).
-        Mass-evicting on rendezvous-master failure is wrong — see
-        ``_should_skip_mass_eviction`` for the heuristic.
+        ``results`` / ``exception_types`` are one-per-future (value/None on
+        success; class name or ``"PENDING"`` on failure). Callers use the
+        exception types to distinguish "rendezvous-master failure" (every gen
+        client raises ``DistStoreError``/``DistNetworkError`` because rank 0
+        timed out) from individual worker death.
+
+        ``failed_fast`` is the subset of ``failed_indices`` whose future RAISED
+        within ``fast_fail_s`` seconds. This is the robust discriminator for
+        "this worker's own engine/NCCL is dead/poisoned" (EngineCore died, or
+        the in-band ``comm_abort`` left NCCL state poisoned so the next
+        ``comm_init_rank_scalable`` raises immediately, in <1s) vs "healthy
+        survivor that merely TIMED OUT (~30s NCCL bootstrap) waiting on the
+        rendezvous for a dead/poisoned peer". ``_evict_failed_workers_inline``
+        force-evicts ONLY the fast-failers, so a single fault never cascades
+        into mass-eviction of the healthy-but-blocked survivors (which would
+        collapse the gen world toward zero).
         """
         import ray
 
         loop = asyncio.get_running_loop()
 
-        def _wait() -> tuple[list[Any], list[Any]]:
-            return ray.wait(
-                futures,
-                num_returns=len(futures),
-                timeout=rendezvous_timeout_s,
-            )
+        # Two-phase wait: anything that resolves in the first ``fast_fail_s``
+        # is a fast-failer (poisoned/dead engine raises immediately); the rest
+        # are slow (healthy survivors hit the ~30s bootstrap timeout) or stay
+        # pending.
+        def _wait_fast() -> tuple[list[Any], list[Any]]:
+            return ray.wait(futures, num_returns=len(futures), timeout=fast_fail_s)
 
-        ready, pending = await loop.run_in_executor(None, _wait)
+        ready_fast, pending_after_fast = await loop.run_in_executor(None, _wait_fast)
+        if pending_after_fast:
+            rem = max(0.0, rendezvous_timeout_s - fast_fail_s)
+
+            def _wait_slow() -> tuple[list[Any], list[Any]]:
+                return ray.wait(
+                    pending_after_fast,
+                    num_returns=len(pending_after_fast),
+                    timeout=rem,
+                )
+
+            _ready_slow, pending = await loop.run_in_executor(None, _wait_slow)
+        else:
+            pending = []
+        fast_set = set(ready_fast)
 
         # Cancel any straggler futures up-front. ``ray.cancel`` is best-
         # effort against a wedged actor method but it does drop the future
@@ -1041,6 +1068,7 @@ class GenerationRouter:
         failed_indices: list[int] = []
         results: list[Any] = [None] * len(futures)
         exception_types: list[Optional[str]] = [None] * len(futures)
+        failed_fast: list[int] = []
         pending_set = set(pending)
         for i, fut in enumerate(futures):
             if fut in pending_set:
@@ -1054,13 +1082,17 @@ class GenerationRouter:
             except Exception as e:  # noqa: BLE001 - per-worker fault isolation
                 failed_indices.append(i)
                 exception_types[i] = type(e).__name__
+                is_fast = fut in fast_set
+                if is_fast:
+                    failed_fast.append(i)
                 print(
                     f"[router] per-worker future idx={i} raised "
-                    f"{type(e).__name__}: {e}",
+                    f"{type(e).__name__}: {e} "
+                    f"({'fast-fail→poisoned/dead' if is_fast else 'slow→waiting/healthy'})",
                     flush=True,
                 )
 
-        return failed_indices, results, exception_types
+        return failed_indices, results, exception_types, failed_fast
 
     @staticmethod
     def _is_rendezvous_master_failure(
@@ -1206,6 +1238,7 @@ class GenerationRouter:
         failed_idxs: list[int],
         reason: str,
         exception_types: Optional[list[Optional[str]]] = None,
+        force_evict_idxs: Optional[list[int]] = None,
     ) -> tuple[int, list[str]]:
         """Cordon + remove the gen workers whose futures failed.
 
@@ -1240,16 +1273,21 @@ class GenerationRouter:
         re-rendezvouses at the same N now that the dead shards have been
         cleared.
 
-        Force-evict shortcut: when the future raises ``RayActorError`` /
-        ``ActorDiedError``, the actor IS dead — Ray confirmed it. This
-        bypasses the liveness probe (which can race against a leader
-        whose engine_core died but whose actor wrapper is still
-        responding to ``is_alive``, or against a TP follower that died
-        while the leader survived). For TP>1, the death of any actor in
-        the shard's TP group means the shard is unrecoverable and must
-        be removed wholesale — ``remove_shard`` ray.kills the whole
-        actor list, including survivors, so a half-dead TP group
-        doesn't get orphaned.
+        Force-evict shortcut: two kinds of candidate bypass the liveness
+        probe. (1) Actor death — the future raised ``RayActorError`` /
+        ``ActorDiedError``; Ray confirmed the actor is gone. (2) Fast-fail —
+        ``force_evict_idxs`` lists workers whose future RAISED within the
+        fast-fail window (<8s); their engine_core died or their NCCL state is
+        poisoned (next ``comm_init`` raises immediately), yet their actor
+        wrapper still answers ``is_alive`` — so the probe would wrongly keep
+        them. Both must be evicted: a poisoned/dead worker can never rejoin
+        the rendezvous and a collective needs all ranks. For TP>1, the death
+        of any actor in the shard's TP group means the shard is unrecoverable
+        and must be removed wholesale — ``remove_shard`` ray.kills the whole
+        actor list, including survivors, so a half-dead TP group doesn't get
+        orphaned. Slow-failers and PENDING timeouts (healthy survivors blocked
+        on a dead peer) are NOT force-evicted — they route through the probe
+        and are kept.
 
         Returns ``(num_evicted, evicted_shard_ids)``.
         """
@@ -1272,11 +1310,33 @@ class GenerationRouter:
         # if a sibling actor in the TP group is still up.
         force_dead: set[str] = set()
         seen: set[str] = set()
-        # Names that mean "the future raised because the Ray actor
-        # itself died" (as opposed to a NCCL/dist error from inside a
-        # still-live actor). Both names are surfaced by Ray; the exact
-        # one depends on Ray version.
-        actor_dead_exc_names = {"RayActorError", "ActorDiedError"}
+        # Two ways a shard force-evicts (bypassing the is_alive probe):
+        #
+        #   1. Actor death — the future raised RayActorError / ActorDiedError.
+        #      Ray itself confirmed the actor process is gone; no need to probe.
+        #
+        #   2. Fast-fail (idx in ``force_evict_idxs``) — the future RAISED
+        #      within the fast-fail window (<8s, see ``_per_worker_results``).
+        #      The worker's own engine/NCCL blew up immediately: a dead
+        #      EngineCore, or NCCL state POISONED by a prior in-band
+        #      ``comm_abort`` so the next ``comm_init_rank_scalable`` raises at
+        #      once. Such a worker is still POD-ALIVE (``is_alive`` returns
+        #      True), so the liveness probe would wrongly KEEP it — but it can
+        #      NEVER rejoin the rendezvous, and a collective needs ALL ranks,
+        #      so it blocks recovery for everyone. Force-evict + replace.
+        #
+        # Everything else routes through the is_alive probe, which RETAINS the
+        # healthy. The critical case: a survivor that merely TIMED OUT
+        # ("PENDING") or hit the ~30s NCCL bootstrap timeout (slow-fail) while
+        # blocked on the rendezvous for a dead/poisoned peer. Timing — not the
+        # exception type — is what separates it from a poisoned worker (whose
+        # comm_init raises in <1s). Evicting these survivors would cascade the
+        # gen world toward zero; instead they rejoin on the next attempt once
+        # the bad peers are gone. (DistStoreError / DistNetworkError from the
+        # rendezvous master are already short-circuited by the caller's
+        # ``_is_rendezvous_master_failure`` before we get here.)
+        _ACTOR_DEAD_TYPES = {"RayActorError", "ActorDiedError"}
+        force_idx_set = set(force_evict_idxs or [])
         for idx in failed_idxs:
             if 0 <= idx < len(shard_ids_in_order):
                 sid = shard_ids_in_order[idx]
@@ -1285,9 +1345,14 @@ class GenerationRouter:
                 if sid not in seen:
                     seen.add(sid)
                     targets.append(sid)
-                if exception_types is not None and 0 <= idx < len(exception_types):
-                    if exception_types[idx] in actor_dead_exc_names:
-                        force_dead.add(sid)
+                et = (
+                    exception_types[idx]
+                    if exception_types is not None
+                    and 0 <= idx < len(exception_types)
+                    else None
+                )
+                if idx in force_idx_set or (et in _ACTOR_DEAD_TYPES):
+                    force_dead.add(sid)
             else:
                 print(
                     f"[router] _evict_failed_workers_inline: future idx={idx} "
@@ -1507,6 +1572,14 @@ class GenerationRouter:
             ready, reason = self.refit_ready_state()
             return {"ready": ready, "reason": reason}
 
+        @app.get("/refit_count")
+        async def refit_count() -> dict[str, Any]:
+            """Number of weight-refit broadcasts handled so far. The
+            FaultInjector polls this and waits for >=1 before starting its
+            trigger countdown, anchoring fault timing to 'training has started
+            refitting' instead of a wall-clock guess (setup time varies)."""
+            return {"refit_attempts": self._refit_attempts}
+
         @app.get("/current_gen_world_size")
         async def current_gen_world_size() -> dict[str, Any]:
             """Sum of per-shard world sizes for shards in the NCCL group.
@@ -1683,7 +1756,7 @@ class GenerationRouter:
                 # stateless_process_group is 30s) but bound the total so
                 # we don't pin train indefinitely. 90s = 3x TCPStore
                 # timeout + slack for the actor's task queue to drain.
-                failed_idxs, _results, exc_types = await self._per_worker_results(
+                failed_idxs, _results, exc_types, failed_fast = await self._per_worker_results(
                     futures, rendezvous_timeout_s=90.0
                 )
 
@@ -1728,6 +1801,7 @@ class GenerationRouter:
                     failed_idxs,
                     reason="init_collective: per-worker failure",
                     exception_types=exc_types,
+                    force_evict_idxs=failed_fast,
                 )
                 new_ws = self.current_gen_world_size()
                 msg = (
@@ -1813,6 +1887,9 @@ class GenerationRouter:
                     },
                 )
             try:
+                # Mark that training has reached (at least) its first refit
+                # broadcast — the FaultInjector waits on this via /refit_count.
+                self._refit_attempts += 1
                 # Per-worker error tracking: a single worker hitting
                 # cudaErrorLaunchFailure during the broadcast would
                 # otherwise sink the whole refit (ray.get raises first
@@ -1841,7 +1918,7 @@ class GenerationRouter:
                 # Broadcast itself is fast (~3-5s for 30B); a 60s window
                 # is enough for any peer-loss DistStoreError or NCCL
                 # timeout to surface.
-                failed_idxs, results, exc_types = await self._per_worker_results(
+                failed_idxs, results, exc_types, failed_fast = await self._per_worker_results(
                     futures, rendezvous_timeout_s=60.0
                 )
 
@@ -1873,6 +1950,7 @@ class GenerationRouter:
                         failed_idxs,
                         reason="update_weights_from_collective: per-worker error",
                         exception_types=exc_types,
+                        force_evict_idxs=failed_fast,
                     )
                     new_ws = self.current_gen_world_size()
                     msg = (

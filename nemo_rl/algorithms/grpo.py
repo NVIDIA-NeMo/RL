@@ -3169,12 +3169,23 @@ def async_grpo_train(
                                 trajectory_collector.set_weight_version.remote(weight_version)
                                 trajectory_collector.resume_after_refit.remote()
                             break
-                        except RuntimeError as e:
+                        # Catch *any* refit failure, not just RuntimeError. The
+                        # gen-side ``/update_weights_from_collective`` returns a
+                        # 503 on a mid-refit fault (per-worker eviction), which
+                        # ``ray.get`` surfaces as ``RayTaskError(HTTPError)`` —
+                        # and ``requests.exceptions.HTTPError`` is NOT a
+                        # RuntimeError, so a ``except RuntimeError`` here let the
+                        # 503 escape and crash the driver on the first attempt
+                        # instead of engaging this patient (REFIT_RETRY_SETTLE_S)
+                        # retry. The gen cluster restabilizes within a couple of
+                        # settle windows (dead shard evicted, replacement joins),
+                        # so retrying the whole refit converges.
+                        except Exception as e:  # noqa: BLE001
                             if refit_attempt == REFIT_RETRY_MAX_ATTEMPTS:
                                 raise
                             print(
                                 f"⚠️ Refit attempt {refit_attempt}/{REFIT_RETRY_MAX_ATTEMPTS} "
-                                f"failed: {e}",
+                                f"failed: {type(e).__name__}: {e}",
                                 flush=True,
                             )
                             print(

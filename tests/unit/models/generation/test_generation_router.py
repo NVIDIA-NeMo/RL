@@ -1158,6 +1158,64 @@ async def test_evict_failed_workers_inline_ray_actor_error_force_evicts(
 
 
 @pytest.mark.asyncio
+async def test_evict_failed_workers_inline_fast_fail_force_evicts_poisoned(
+    monkeypatch,
+):
+    """Over-eviction fix: a POISONED worker (EngineCore dead, or NCCL state
+    poisoned by a prior in-band comm_abort so its next comm_init raises in
+    <1s) is still POD-ALIVE — is_alive returns True — so the liveness probe
+    would wrongly KEEP it. _per_worker_results flags it as a fast-failer
+    (raised inside the fast-fail window) via force_evict_idxs, and eviction
+    must force-remove it. Meanwhile a healthy survivor that merely TIMED OUT
+    (~30s NCCL bootstrap) waiting on the rendezvous for the dead peer — same
+    exception type, but SLOW — must be retained.
+
+    Timing, not exception type, is the discriminator. Pre-fix, both shards
+    (exception NCCLError ∉ the keep set) would have been force-evicted,
+    cascading the gen world toward zero on every fault."""
+    import nemo_rl.models.generation.generation_router as gr
+
+    killed_actors, _ = _stub_ray_for_eviction(monkeypatch)
+
+    fake_gen = _FakeGeneration()
+    pg_a = _FakePG("pg-a")
+    pg_b = _FakePG("pg-b")
+    r = gr.GenerationRouter(port=0, health_poll_interval_s=10.0)
+    # Both shards report is_alive=True. dp-a is POISONED (fast-fail); dp-b is
+    # a healthy survivor that timed out on the rendezvous (slow-fail).
+    r.register_shards(
+        [("dp-a", "http://a/v1"), ("dp-b", "http://b/v1")],
+        per_shard_world_size=1,
+        actor_handles_by_shard={
+            "dp-a": [_LiveActor("a-leader")],
+            "dp-b": [_LiveActor("b-leader")],
+        },
+        pg_by_shard={"dp-a": pg_a, "dp-b": pg_b},
+        generation=fake_gen,
+    )
+    assert r.current_gen_world_size() == 2
+
+    # Both futures "failed" with the same exception name, but only dp-a
+    # (idx 0) raised inside the fast-fail window. dp-b raised at the ~30s
+    # bootstrap timeout (slow → healthy survivor blocked on the dead peer).
+    num_evicted, evicted_ids = await r._evict_failed_workers_inline(
+        failed_idxs=[0, 1],
+        reason="update_weights_from_collective: per-worker error",
+        exception_types=["NCCLError", "NCCLError"],
+        force_evict_idxs=[0],
+    )
+    # Only the poisoned fast-failer is evicted; the healthy slow-failer is
+    # kept (is_alive=True). It rejoins on train's next retry.
+    assert num_evicted == 1
+    assert evicted_ids == ["dp-a"]
+    assert "dp-a" not in r._shards
+    assert "dp-b" in r._shards
+    assert "a-leader" in killed_actors
+    assert "b-leader" not in killed_actors
+    assert r.current_gen_world_size() == 1
+
+
+@pytest.mark.asyncio
 async def test_add_shard_tp2_actor_died_during_init_collective_cleans_up_full_shard(
     monkeypatch,
 ):

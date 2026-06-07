@@ -257,6 +257,9 @@ class RefitWorker:
         buffer: Optional[torch.Tensor] = None
         ipc_view: Optional[torch.Tensor] = None
         chunk_idx = 0
+        # Keep the cross-cluster group ALIVE on success; tear it down only on
+        # failure (see the ``finally`` below for the reasoning).
+        _ok = False
         try:
             while True:
                 payload = self._zmq_socket.recv_pyobj()
@@ -322,6 +325,7 @@ class RefitWorker:
                 buffer = None
                 self._zmq_socket.send(IPCProtocol.ACK.value.encode())
                 chunk_idx += 1
+            _ok = True
             return True
         except Exception as e:  # noqa: BLE001
             # Log + return False so the caller (Policy) can ray.kill us
@@ -340,26 +344,40 @@ class RefitWorker:
                 del buffer
             if ipc_view is not None:
                 del ipc_view
-            # Tear down the cross-cluster group at the END of every refit,
-            # success OR failure. Symmetric with vllm_backend.update_
-            # weights_from_collective. Critical on FAILURE: if the
-            # broadcast was interrupted (peer death, ZMQ wedge), leaving
-            # the group alive would cause the next refit's
-            # ``init_collective`` to ``destroy()`` a wedged group and
-            # hang or surface a queued NCCL error — leading to a cascade
-            # where each successive init_collective adds one more timeout
-            # to the eviction set.
-            try:
-                old = self._group
-                self._group = None
-                if old is not None:
-                    old.destroy()
-            except Exception as _e:  # noqa: BLE001
-                print(
-                    f"[refit_worker] post-broadcast destroy raised "
-                    f"{type(_e).__name__}: {_e} — group already gone",
-                    flush=True,
-                )
+            # Tear down the cross-cluster group ONLY on failure. On success we
+            # KEEP the group alive across refits.
+            #
+            # Recreating the group every refit forces a fresh cross-cluster
+            # TCPStore rendezvous on a NEW master port each step. On this
+            # cluster that rendezvous is intermittently flaky (1-2 gen workers'
+            # TCPStore clients fail to connect/validate → they never join the
+            # NCCL group → the broadcast collective can never complete → every
+            # survivor trips the 60s in-band abort and a healthy worker gets
+            # evicted, all with NO injected fault). Holding the group alive
+            # makes a steady-state refit a plain broadcast on the existing
+            # comm (~2.5s, no rendezvous, reliable) — mirroring the non-disagg
+            # path. ``ensure_collective_synced`` re-inits only when the world
+            # size changes (a real fault); ``_last_synced_world_size`` gates it.
+            #
+            # Faults are still handled without a per-refit teardown: a peer
+            # dying mid-broadcast trips the consumer's in-band abort
+            # (StatelessProcessGroup.synchronize_or_abort) → this method
+            # returns False → the grpo retry loop ray.kills + respawns this
+            # RefitWorker (poisoned context dies with the process) and re-inits
+            # at the new world. On FAILURE we MUST tear down here so a wedged
+            # group is never reused.
+            if not _ok:
+                try:
+                    old = self._group
+                    self._group = None
+                    if old is not None:
+                        old.destroy()
+                except Exception as _e:  # noqa: BLE001
+                    print(
+                        f"[refit_worker] post-broadcast destroy raised "
+                        f"{type(_e).__name__}: {_e} — group already gone",
+                        flush=True,
+                    )
             gc.collect()
             try:
                 torch.cuda.empty_cache()
