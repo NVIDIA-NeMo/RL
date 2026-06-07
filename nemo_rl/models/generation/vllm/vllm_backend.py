@@ -543,26 +543,29 @@ class VllmInternalWorkerExtension:
             )
         finally:
             # Tear down the cross-cluster ``model_update_group`` at the END
-            # of every refit, success OR failure. Symmetric with RefitWorker
-            # on the train side. Critical that this runs on FAILURE too:
-            # if the broadcast was interrupted by a peer-death and we left
-            # the group alive, the next refit's ``init_collective`` would
-            # try to ``destroy()`` the wedged group and either hang or
-            # surface a queued NCCL error — that's the cascade-eviction
-            # mechanism we hit on training-1777509648 (1 timeout in
-            # reset_collective propagating to N+1 in the next round).
-            # Always destroying here keeps the survivor recoverable.
-            group = getattr(self, "model_update_group", None)
-            if group is not None:
-                try:
-                    group.destroy()
-                except Exception as _e:  # noqa: BLE001
-                    print(
-                        f"[vllm_backend] post-refit destroy raised "
-                        f"{type(_e).__name__}: {_e} — comm already gone",
-                        flush=True,
-                    )
-                self.model_update_group = None  # pyrefly: ignore
+            # of every refit — but ONLY in disaggregated mode where shards
+            # can die independently and stale NCCL state would poison the
+            # next refit. In single-cluster (non-disagg) mode the group is
+            # stable for the entire run, so teardown is unnecessary overhead
+            # (~2.5s re-init per step).
+            #
+            # Disagg mode is identified by DISAGG_JOB_ID env var, set by
+            # run_standalone_generation_server.py's entrypoint.
+            import os as _os
+
+            is_disagg = bool(_os.environ.get("DISAGG_JOB_ID"))
+            if is_disagg:
+                group = getattr(self, "model_update_group", None)
+                if group is not None:
+                    try:
+                        group.destroy()
+                    except Exception as _e:  # noqa: BLE001
+                        print(
+                            f"[vllm_backend] post-refit destroy raised "
+                            f"{type(_e).__name__}: {_e} — comm already gone",
+                            flush=True,
+                        )
+                    self.model_update_group = None  # pyrefly: ignore
         return success
 
     def cleanup(self) -> None:

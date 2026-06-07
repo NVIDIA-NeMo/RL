@@ -273,11 +273,15 @@ class RemoteGeneration(GenerationInterface):
     def ensure_collective_synced(
         self,
         policy: Any,
-        rendezvous_timeout_s: float = 150.0,
-        max_attempts: int = 10,
+        rendezvous_timeout_s: Optional[float] = None,
+        max_attempts: Optional[int] = None,
     ) -> None:
         """Re-init the train↔gen NCCL group if the gen-side world size
         changed since the last refit.
+
+        Timing constants are derived from TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC
+        via ft_constants.py so retry logic stays correct if the heartbeat
+        changes. See that module's docstring for the reasoning.
 
         Robust to mid-rendezvous shard removal: if a peer dies between
         the world-size read and rendezvous completion (e.g. a fault
@@ -311,6 +315,18 @@ class RemoteGeneration(GenerationInterface):
             if inner is not None and hasattr(inner, "ensure_collective_synced"):
                 inner.ensure_collective_synced(policy)
             return
+
+        from nemo_rl.models.generation.ft_constants import (
+            COLLECTIVE_SYNC_BACKOFF_BASE_S,
+            COLLECTIVE_SYNC_BACKOFF_CAP_S,
+            COLLECTIVE_SYNC_MAX_ATTEMPTS,
+            COLLECTIVE_SYNC_RENDEZVOUS_TIMEOUT_S,
+        )
+
+        if rendezvous_timeout_s is None:
+            rendezvous_timeout_s = COLLECTIVE_SYNC_RENDEZVOUS_TIMEOUT_S
+        if max_attempts is None:
+            max_attempts = COLLECTIVE_SYNC_MAX_ATTEMPTS
 
         for attempt in range(1, max_attempts + 1):
             self._wait_until_refit_ready()
@@ -481,12 +497,15 @@ class RemoteGeneration(GenerationInterface):
                 pass
             # Wait for gen-side cleanup. When a shard dies mid-broadcast,
             # the surviving shards' NCCL watchdog takes up to
-            # TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC (60s) to detect the dead
-            # peer. reset_collective is queued behind the hung NCCL op
-            # and can't execute until the watchdog fires. Use exponential
-            # backoff so early attempts (world-size-change only) settle
-            # fast while mid-fault attempts give NCCL time to recover.
-            settle_s = min(5.0 * (2 ** (attempt - 1)), 90.0)
+            # NCCL_HEARTBEAT_TIMEOUT_S to detect the dead peer.
+            # reset_collective is queued behind the hung NCCL op and
+            # can't execute until the watchdog fires. Exponential backoff
+            # so early attempts settle fast while later attempts give
+            # NCCL time to recover.
+            settle_s = min(
+                COLLECTIVE_SYNC_BACKOFF_BASE_S * (2 ** (attempt - 1)),
+                COLLECTIVE_SYNC_BACKOFF_CAP_S,
+            )
             print(
                 f"  ⏳ settle {settle_s:.0f}s before next attempt",
                 flush=True,

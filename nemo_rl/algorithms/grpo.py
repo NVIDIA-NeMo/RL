@@ -1287,26 +1287,6 @@ def refit_policy_generation(
                 raise NotImplementedError(
                     "SGLang haven't implemented non-colocated inference mode. "
                 )
-            # Non-disagg non-colocated: re-init the NCCL collective before
-            # each broadcast. The collective is destroyed after every refit
-            # (per-refit teardown), so we must rendezvous again. In disagg
-            # HTTP mode this is handled by ensure_collective_synced above;
-            # here we drive it directly via VllmGeneration.init_collective.
-            if not hasattr(policy_generation, "ensure_collective_synced"):
-                gen_ws = policy_generation.worker_group.world_size
-                train_ws = policy.worker_group.cluster.world_size()
-                uses_rw = bool(getattr(policy, "_use_refit_worker", False))
-                eff_train = 1 if uses_rw else train_ws
-                total_ws = eff_train + gen_ws
-                ip, port = policy.worker_group.cluster.get_master_address_and_port()
-                ft = policy.init_collective(
-                    ip, port, total_ws, train_world_size=eff_train
-                )
-                fi = policy_generation.init_collective(
-                    ip, port, total_ws, train_world_size=eff_train
-                )
-                ray.get(list(ft) + list(fi))
-
             broadcast_attempts = 0
             while True:
                 broadcast_attempts += 1
@@ -3172,8 +3152,12 @@ def async_grpo_train(
 
                     # Only the actual refit/weight transfer should be counted as weight_sync
                     print("🔄 Performing policy generation refit...")
-                    refit_max_retries = 3
-                    for refit_attempt in range(1, refit_max_retries + 1):
+                    from nemo_rl.models.generation.ft_constants import (
+                        REFIT_RETRY_MAX_ATTEMPTS,
+                        REFIT_RETRY_SETTLE_S,
+                    )
+
+                    for refit_attempt in range(1, REFIT_RETRY_MAX_ATTEMPTS + 1):
                         try:
                             with timer.time("weight_sync"):
                                 refit_policy_generation(
@@ -3186,19 +3170,19 @@ def async_grpo_train(
                                 trajectory_collector.resume_after_refit.remote()
                             break
                         except RuntimeError as e:
-                            if refit_attempt == refit_max_retries:
+                            if refit_attempt == REFIT_RETRY_MAX_ATTEMPTS:
                                 raise
                             print(
-                                f"⚠️ Refit attempt {refit_attempt}/{refit_max_retries} "
+                                f"⚠️ Refit attempt {refit_attempt}/{REFIT_RETRY_MAX_ATTEMPTS} "
                                 f"failed: {e}",
                                 flush=True,
                             )
                             print(
-                                "⏳ Waiting 60s for gen cluster to stabilize "
-                                "before retry...",
+                                f"⏳ Waiting {REFIT_RETRY_SETTLE_S:.0f}s for gen "
+                                "cluster to stabilize before retry...",
                                 flush=True,
                             )
-                            time.sleep(60)
+                            time.sleep(REFIT_RETRY_SETTLE_S)
 
                     timer.stop("idle/refit_bubble")
 
