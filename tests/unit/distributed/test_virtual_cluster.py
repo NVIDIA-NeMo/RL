@@ -200,6 +200,7 @@ def test_ray_uses_same_cluster_for_permuted_cuda_devices():
         assert mock_ray_shutdown.call_count == 0
 
 
+@pytest.mark.mcore
 def test_mcore_py_executable():
     # The temporary directory is created within the project.
     # For some reason, creating a virtual environment outside of the project
