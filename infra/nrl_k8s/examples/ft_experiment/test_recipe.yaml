@@ -43,7 +43,7 @@ logger:
   wandb_enabled: true
   wandb:
     project: nemorl-ft-experiment
-    name: ft-experiment-test-disagg
+    name: ft-experiment-test-disagg-with-fault
   tensorboard_enabled: true
   monitor_gpus: true
 
