@@ -61,12 +61,12 @@ fault_inject:
   enabled: true
   mode: pod-kill
   recover: true
-  trigger_after_s: 1500
+  trigger_after_s: 360
   recover_after_s: 0
   max_cycles: null
   rotate_target: true
   target_shard: dp-0
-  new_shard_grace_period_s: 300
+  new_shard_grace_period_s: 120
   burst_size: 1
   burst_every_n_cycles: 1
-  repeat_every_s: 1500
+  repeat_every_s: 360
