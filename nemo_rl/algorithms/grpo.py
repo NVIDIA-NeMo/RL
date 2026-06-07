@@ -1287,16 +1287,26 @@ def refit_policy_generation(
                 raise NotImplementedError(
                     "SGLang haven't implemented non-colocated inference mode. "
                 )
-            # RL-412: wrap the cross-cluster broadcast in a retry loop. If
-            # a gen DP shard dies mid-broadcast, NCCL queues an error in
-            # the train workers' CUDA contexts that surfaces later as
-            # SIGABRT during tensor dealloc (c10::TensorImpl::~TensorImpl
-            # crashes when the underlying CUDA context is poisoned).
-            # Catching here, aborting the stale comm, and forcing
-            # ensure_collective_synced at the (now-smaller) world size
-            # before retry keeps the worker process alive and the
-            # training loop intact. One retry is enough; if the new
-            # comm hits the same peer-loss issue the failure is real.
+            # Non-disagg non-colocated: re-init the NCCL collective before
+            # each broadcast. The collective is destroyed after every refit
+            # (per-refit teardown), so we must rendezvous again. In disagg
+            # HTTP mode this is handled by ensure_collective_synced above;
+            # here we drive it directly via VllmGeneration.init_collective.
+            if not hasattr(policy_generation, "ensure_collective_synced"):
+                gen_ws = policy_generation.worker_group.dp_world_size
+                train_ws = policy.worker_group.cluster.world_size()
+                uses_rw = bool(getattr(policy, "_use_refit_worker", False))
+                eff_train = 1 if uses_rw else train_ws
+                total_ws = eff_train + gen_ws
+                ip, port = policy.worker_group.cluster.get_master_address_and_port()
+                ft = policy.init_collective(
+                    ip, port, total_ws, train_world_size=eff_train
+                )
+                fi = policy_generation.init_collective(
+                    ip, port, total_ws, train_world_size=eff_train
+                )
+                ray.get(list(ft) + list(fi))
+
             broadcast_attempts = 0
             while True:
                 broadcast_attempts += 1
