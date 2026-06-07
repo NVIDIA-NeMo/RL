@@ -22,6 +22,7 @@ grpo:
   val_at_end: false
 
 policy:
+  train_global_batch_size: 64
   max_total_sequence_length: 2048
   generation:
     colocated:
