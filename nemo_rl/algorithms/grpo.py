@@ -1293,7 +1293,7 @@ def refit_policy_generation(
             # HTTP mode this is handled by ensure_collective_synced above;
             # here we drive it directly via VllmGeneration.init_collective.
             if not hasattr(policy_generation, "ensure_collective_synced"):
-                gen_ws = policy_generation.worker_group.dp_world_size
+                gen_ws = policy_generation.worker_group.world_size
                 train_ws = policy.worker_group.cluster.world_size()
                 uses_rw = bool(getattr(policy, "_use_refit_worker", False))
                 eff_train = 1 if uses_rw else train_ws
