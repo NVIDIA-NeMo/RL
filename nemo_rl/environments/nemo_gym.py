@@ -40,6 +40,10 @@ class NemoGymConfig(TypedDict):
     model_name: str
     base_urls: List[str]
     initial_global_config_dict: Dict[str, Any]
+    # GPU nodes reserved for Gym, surfaced into the gym global config so its
+    # judge/reward servers schedule onto the reserved nodes.
+    ray_num_gpus_per_node: NotRequired[int | None]
+    ray_namespace: NotRequired[str | None]
     # Port range for Gym HTTP servers (head server + subprocess servers).
     # Defaults to DEFAULT_GYM_PORT_RANGE_LOW/HIGH (15001-20000) from
     # nemo_rl.distributed.virtual_cluster.  See the port layout there.
@@ -120,6 +124,13 @@ class NemoGym(EnvironmentInterface):
     def __init__(self, cfg: NemoGymConfig):
         self.cfg = cfg
 
+    def _spinup(self) -> None:
+        """Start the NeMo-Gym head server and rollout collection helper.
+
+        Deferred from __init__ so the actor can be created cheaply (and
+        scheduled onto reserved nodes) and spun up explicitly once the vLLM
+        server URLs are available, overlapping with vLLM model loading.
+        """
         self.node_ip = _get_node_ip_local()
         _gym_port_low = self.cfg.get("port_range_low", DEFAULT_GYM_PORT_RANGE_LOW)
         _gym_port_high = self.cfg.get("port_range_high", DEFAULT_GYM_PORT_RANGE_HIGH)
@@ -180,6 +191,16 @@ Depending on your data shape, you may want to change these values."""
         initial_global_config_dict["ray_head_node_address"] = ray_context.gcs_address
         print(f"Ray head node address: {ray_context.gcs_address}")
 
+        ray_namespace = self.cfg.get("ray_namespace", None)
+        if ray_namespace is not None:
+            initial_global_config_dict["ray_namespace"] = ray_namespace
+            print(f"Ray namespace: {ray_namespace}")
+
+        ray_num_gpus_per_node = self.cfg.get("ray_num_gpus_per_node", None)
+        if ray_num_gpus_per_node is not None:
+            initial_global_config_dict["ray_num_gpus_per_node"] = ray_num_gpus_per_node
+            print(f"Ray num GPUs per node: {ray_num_gpus_per_node}")
+
         # Head server
         initial_global_config_dict[HEAD_SERVER_KEY_NAME] = {
             "host": "0.0.0.0",
@@ -210,9 +231,6 @@ Depending on your data shape, you may want to change these values."""
             port=self.head_server_port,
         )
         self.rch = RolloutCollectionHelper()
-
-    def health_check(self) -> bool:
-        return True
 
     async def run_rollouts(
         self,
