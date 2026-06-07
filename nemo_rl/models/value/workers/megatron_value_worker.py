@@ -667,20 +667,20 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
                 all_mb_metrics.extend(gb_loss_metrics)
                 losses.append(torch.tensor(mb_losses).sum().item())
 
-            if not eval_mode:
-                # Step LR scheduler once per train() call, not per global batch.
-                # Megatron's OptimizerParamScheduler.step takes an `increment` in
-                # samples: NeMo init scales lr_warmup_steps by gbs internally, so
-                # passing increment=gbs cancels that scaling and one tick == one
-                # train() call regardless of batch size.
-                self.scheduler.step(increment=gbs)
-                # Value head has its own torch.optim.AdamW with no scheduler
-                # attached; mirror the backbone LR onto it so the head decays /
-                # warms up in lockstep instead of holding at peak LR forever.
-                if hasattr(self, "value_head_optimizer"):
-                    backbone_lr = self.optimizer.param_groups[0]["lr"]
-                    for pg in self.value_head_optimizer.param_groups:
-                        pg["lr"] = backbone_lr
+        if not eval_mode:
+            # Step LR scheduler once per train() call, not per global batch.
+            # Megatron's OptimizerParamScheduler.step takes an `increment` in
+            # samples: NeMo init scales lr_warmup_steps by gbs internally, so
+            # passing increment=gbs cancels that scaling and one tick == one
+            # train() call regardless of batch size.
+            self.scheduler.step(increment=gbs)
+            # Value head has its own torch.optim.AdamW with no scheduler
+            # attached; mirror the backbone LR onto it so the head decays /
+            # warms up in lockstep instead of holding at peak LR forever.
+            if hasattr(self, "value_head_optimizer"):
+                backbone_lr = self.optimizer.param_groups[0]["lr"]
+                for pg in self.value_head_optimizer.param_groups:
+                    pg["lr"] = backbone_lr
 
         # Aggregate metrics
         mb_metrics = defaultdict(list)
