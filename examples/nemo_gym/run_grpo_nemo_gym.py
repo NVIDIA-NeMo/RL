@@ -21,7 +21,6 @@ import wandb.util
 
 wandb.util.VALUE_BYTES_LIMIT = 10_000_000
 
-import ray
 from omegaconf import OmegaConf
 from wandb import Table
 

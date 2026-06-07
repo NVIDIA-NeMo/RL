@@ -164,7 +164,9 @@ class BaseVllmGenerationWorker:
                 _load_model() later to perform the heavy model loading. This
                 enables overlapping vLLM model loading with NeMo Gym init.
         """
-        self._init_config(config, bundle_indices, fraction_of_gpus, seed, extra_env_vars)
+        self._init_config(
+            config, bundle_indices, fraction_of_gpus, seed, extra_env_vars
+        )
 
         if not self.is_model_owner:
             return

@@ -1634,9 +1634,7 @@ def test_vllm_deferred_model_load(cluster, tokenizer):
     generation_config["temperature"] = 0.0
 
     # Phase 1: Deferred init — only reserve ports, no model loading
-    vllm_generation = VllmGeneration(
-        cluster, generation_config, defer_model_load=True
-    )
+    vllm_generation = VllmGeneration(cluster, generation_config, defer_model_load=True)
 
     # URLs should be available immediately from reserved ports
     reserved_urls = vllm_generation.dp_openai_server_base_urls
