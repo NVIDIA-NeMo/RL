@@ -12,13 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import threading as _threading
 from collections import Counter
-from typing import Any, Iterable, Optional
+from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 import ray
 
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
+from nemo_rl.data_plane import KVBatchMeta
+
+if TYPE_CHECKING:
+    from tensordict import TensorDict
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
@@ -552,43 +557,148 @@ class ReplayBuffer(ReplayBufferImpl):
 
 
 # WIP: DO NOT USE - This class is WIP and may be changed without notice, please DO NOT USE it.
-# Will be replaced by TQReplayBuffer once TQ is ready.
-@ray.remote  # pragma: no cover
-class ReplayBufferNew(ReplayBufferImpl):
-    """Staleness-window replay buffer.
+class TQReplayBuffer:
+    """Plain (non-Ray) replay buffer holding prompt-group meta + a TQ proxy.
 
     -- WIP: DO NOT USE --
-    This class is WIP and may be changed without notice, please DO NOT USE it.
 
-    Differences from ReplayBuffer:
-    - _evict(): Stale rows (trainer_version - weight_version > max_staleness) are evicted
-      at the start of every sample() call.
-    - sample(): selects trajectories in freshest-first order (default) or FIFO order,
-      controlled by the sample_freshest_first flag, from whatever remains in the buffer
-      after eviction.
+    Lives in the SingleController process. Each entry corresponds to one
+    prompt group (one ``RolloutManager.generate_and_push`` writes one
+    entry). Tensor payloads are stored in TransferQueue (TQ) via the
+    :class:`DataPlaneClient`; only per-group :class:`KVBatchMeta` and the
+    generating ``weight_version`` are cached here for selection by
+    :class:`StalenessSampler`.
 
-    TODO: remove when cleaning up
-    - max_age_steps won't be used in ReplayBufferNew;
-    - self.target_weight_versions won't be used in ReplayBufferNew and will be removed
-      when cleaning up. target_weight_versions gates generation on specific trainer steps,
-      which causes generation pauses; ReplayBufferNew intentionally avoids this.
-    - add this class to nemo_rl/algorithms/async_utils/__init__.py
+    Concurrency: single asyncio loop in the SC process; list appends and
+    pops are not protected by a lock — callers must ``await`` the TQ
+    round-trip in :meth:`add` / :meth:`remove` before the local state
+    mutation, so the TQ state is the source of truth when an ``await``
+    suspends the coroutine.
+
+    Note: :meth:`sample` / :meth:`_evict` below are legacy methods kept
+    only as Phase 2 reference for the StalenessSampler rewrite; they
+    reference the pre-TQ buffer state (``self.trajectories`` etc.) that
+    this class no longer maintains, so they are inert and will be deleted
+    once the sampler rewrite lands.
     """
 
-    def __init__(
-        self, max_size: int, max_staleness: int, sample_freshest_first: bool = True
-    ):
-        super().__init__(max_size)
-        if max_staleness < 0:
-            raise ValueError(f"max_staleness must be non-negative, got {max_staleness}")
-        self.max_staleness = max_staleness
-        # will move to StalenessSampler when we implement it
-        self.sample_freshest_first = sample_freshest_first
+    def __init__(self, dp_client: Any, partition_id: str):
+        self._dp_client = dp_client
+        self._partition_id = partition_id
+        self.meta_list: list[KVBatchMeta] = []
+        self.weight_list: list[int] = []
+
+    async def add(
+        self,
+        sample_ids: list[str],
+        fields: "TensorDict | None",
+        tags: list[dict[str, Any]] | None,
+        weight_version: int,
+    ) -> KVBatchMeta:
+        """Write one prompt group to TQ and append its meta locally.
+
+        The TQ ``put_samples`` must complete before the local lists are
+        mutated; otherwise the local view would lead the data plane and a
+        concurrent sampler could hand out meta for samples TQ has not yet
+        accepted.
+
+        Args:
+            sample_ids: Per-sample uids for this prompt group.
+            fields: Tensor / NonTensorStack leaves to write into TQ.
+            tags: Per-sample primitive metadata stamped on TQ.
+            weight_version: Trainer weight version this group was
+                generated under. Must be an ``int``; the legacy ``None``
+                path is intentionally not supported.
+
+        Returns:
+            ``KVBatchMeta`` covering ``sample_ids``.
+        """
+        if not isinstance(weight_version, int) or isinstance(weight_version, bool):
+            raise TypeError(
+                f"TQReplayBuffer.add: weight_version must be int, got "
+                f"{type(weight_version).__name__}"
+            )
+        meta = await self._call_dp(
+            "put_samples",
+            sample_ids=list(sample_ids),
+            partition_id=self._partition_id,
+            fields=fields,
+            tags=tags,
+        )
+        self.meta_list.append(meta)
+        self.weight_list.append(weight_version)
+        return meta
+
+    async def remove(self, sample_ids: list[str]) -> int:
+        """Drop entries whose sample_ids are fully covered by the input.
+
+        Removal is entry-level: an entry is dropped iff every one of its
+        ``sample_ids`` appears in the input. Callers that only know
+        partial-group ``sample_ids`` (a logic bug under the entry-as-group
+        contract) cause a ``ValueError`` so the mismatch surfaces early.
+
+        Order: TQ ``clear_samples`` runs first; local lists are mutated
+        only after the data plane has acknowledged the drop.
+
+        Args:
+            sample_ids: Uids to clear; must align with whole-entry
+                boundaries.
+
+        Returns:
+            Number of group entries dropped.
+        """
+        ids_set = set(sample_ids)
+        keep_meta: list[KVBatchMeta] = []
+        keep_weights: list[int] = []
+        hit_ids: set[str] = set()
+        n_removed = 0
+        for meta, weight in zip(self.meta_list, self.weight_list):
+            entry_ids = set(meta.sample_ids)
+            if entry_ids <= ids_set:
+                hit_ids.update(entry_ids)
+                n_removed += 1
+            else:
+                keep_meta.append(meta)
+                keep_weights.append(weight)
+        leftover = ids_set - hit_ids
+        if leftover:
+            raise ValueError(
+                f"TQReplayBuffer.remove: sample_ids did not align with whole-entry "
+                f"boundaries; unmatched ids={sorted(leftover)}"
+            )
+        await self._call_dp(
+            "clear_samples",
+            sample_ids=list(sample_ids),
+            partition_id=self._partition_id,
+        )
+        self.meta_list = keep_meta
+        self.weight_list = keep_weights
+        return n_removed
+
+    def size(self) -> int:
+        """Number of group entries currently held."""
+        return len(self.meta_list)
+
+    def __len__(self) -> int:
+        return len(self.meta_list)
+
+    async def _call_dp(self, method_name: str, **kwargs: Any) -> Any:
+        """Invoke a ``DataPlaneClient`` method on either a plain client or a Ray actor."""
+        method = getattr(self._dp_client, method_name)
+        remote = getattr(method, "remote", None)
+        if remote is not None:
+            return await remote(**kwargs)
+        result = method(**kwargs)
+        if asyncio.iscoroutine(result):
+            return await result
+        return result
+
+    # ── legacy sample/_evict (Phase 2 reference; to be deleted) ────────────
 
     def _evict(self, current_weight_version: int) -> None:
-        """Evict rows where trainer_version - weight_version > max_staleness.
+        """Legacy: evict rows where trainer_version - weight_version > max_staleness.
 
-        Must be called with self._lock held.
+        Inert under the new TQ-backed state; kept as Phase 2 reference.
         """
         min_valid = current_weight_version - self.max_staleness
         stale = [i for i, v in enumerate(self.trajectory_versions) if v < min_valid]
@@ -600,12 +710,9 @@ class ReplayBufferNew(ReplayBufferImpl):
         current_weight_version: int,
         max_age_steps: int,
     ) -> Optional[dict[str, Any]]:
-        """Sample num_prompt_groups trajectories, freshest-first.
+        """Legacy freshest-first sample. Kept as Phase 2 reference only.
 
-        Will evict stale rows before sampling, so we will get [current_weight_version - self.max_staleness, current_weight_version] valid trajectories.
-
-        Returns:
-            Dictionary with 'trajectories' and 'avg_trajectory_age' keys, or None.
+        Inert under the new TQ-backed state.
         """
         with self._lock:
             self._evict(current_weight_version)
