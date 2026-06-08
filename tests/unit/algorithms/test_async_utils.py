@@ -1342,6 +1342,72 @@ class TestAsyncTrajectoryCollector:
         assert target_weight not in collector._completed_per_target
         assert target_weight not in collector._buffered_per_target
 
+    def test_process_batch_gap_fill_spawns_only_needed(self, monkeypatch):
+        """Gap-fill generates only the trajectories still needed for a target."""
+
+        class RemoteMethod:
+            def __init__(self, value):
+                self.value = value
+
+            def remote(self, *args, **kwargs):
+                return self.value
+
+        class FakeReplayBuffer:
+            def __init__(self):
+                # Batch has 2 prompts, but only 1 more trajectory is needed.
+                self.get_trajectories_needed = RemoteMethod(1)
+
+        class FakeBatch:
+            size = 2
+
+            def slice(self, start, end):
+                return self
+
+            def repeat_interleave(self, repeats):
+                return self
+
+        started = []
+
+        class RecordingThread:
+            def __init__(self, *args, **kwargs):
+                self._args = kwargs.get("args", ())
+
+            def start(self):
+                started.append(self._args)
+                # Simulate the worker finishing and recording completion.
+                target = self._args[2]
+                with collector._counter_lock:
+                    collector._completed_per_target[target] = (
+                        collector._completed_per_target.get(target, 0) + 1
+                    )
+
+            def is_alive(self):
+                return False
+
+        target_weight = 7
+        collector = self.create_local_collector(replay_buffer=FakeReplayBuffer())
+        collector.running = True
+
+        def reserve_target(generation_weight_version):
+            collector._generating_targets.add(target_weight)
+            return target_weight
+
+        collector._get_next_target_for_generation = reserve_target
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
+        monkeypatch.setattr(
+            trajectory_collector_mod._threading, "Thread", RecordingThread
+        )
+
+        collector._process_batch(FakeBatch())
+
+        # Only one worker spawned even though the batch holds 2 prompts.
+        assert len(started) == 1
+        # Reservation released after spawning closed and the worker completed.
+        assert target_weight not in collector._generating_targets
+        assert target_weight not in collector._spawning_targets
+        assert target_weight not in collector._spawned_per_target
+        assert target_weight not in collector._completed_per_target
+
     def test_dataloader_state_retrieval(self):
         """Test getting dataloader state for checkpointing."""
         buffer = ReplayBuffer.remote(max_size=10)
