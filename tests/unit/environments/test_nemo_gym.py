@@ -21,10 +21,15 @@ import ray
 import torch
 from yaml import safe_load
 
+from nemo_rl.algorithms.grpo import MasterConfig
 from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
-from nemo_rl.environments.nemo_gym import NemoGym, NemoGymConfig, setup_nemo_gym_config
+from nemo_rl.environments.nemo_gym import (
+    NemoGym,
+    NemoGymConfig,
+    setup_nemo_gym_config,
+)
 from nemo_rl.models.generation.vllm import VllmGeneration
 
 # cluster and tokenizer are fixture imports
@@ -49,11 +54,9 @@ def test_nemo_gym_stub_module():
 @pytest.fixture(scope="function")
 def nemo_gym_vllm_generation(cluster, nemo_gym_tokenizer):  # noqa: F811
     generation_config = deepcopy(basic_vllm_test_config)
-    master_config = {
-        "policy": {
-            "generation": generation_config,
-        },
-    }
+    master_config = MasterConfig.model_construct(
+        policy={"generation": generation_config}
+    )
     setup_nemo_gym_config(master_config, nemo_gym_tokenizer)
 
     generation_config["vllm_cfg"]["max_model_len"] = 16_384
@@ -169,6 +172,57 @@ def _write_actual_test_data(original_input: list, actual_result: list):
     print(f"Wrote updated test data to {output_path}")
 
 
+def test_nemo_gym_postprocess_uses_batch_decode():
+    class _Tokenizer:
+        def __init__(self):
+            self.batch_decode_calls = []
+
+        def batch_decode(self, batch):
+            self.batch_decode_calls.append([list(token_ids) for token_ids in batch])
+            return [" ".join(map(str, token_ids)) for token_ids in batch]
+
+    tokenizer = _Tokenizer()
+    nemo_gym_result = {
+        "response": {
+            "output": [
+                {
+                    "prompt_token_ids": [1, 2],
+                    "generation_token_ids": [3],
+                    "generation_log_probs": [-0.1],
+                },
+                {
+                    "prompt_token_ids": [1, 2, 3, 4, 5],
+                    "generation_token_ids": [6, 7],
+                    "generation_log_probs": [-0.2, -0.3],
+                },
+            ]
+        },
+        "responses_create_params": {"input": []},
+    }
+
+    class _MockSelf:
+        cfg = {}
+
+    result = (
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), nemo_gym_result, tokenizer
+        )
+    )
+
+    assert tokenizer.batch_decode_calls == [
+        [[1, 2], [1, 2, 3, 4, 5]],
+        [[3], [6, 7]],
+    ]
+    assert result["message_log"][0]["token_ids"].tolist() == [1, 2]
+    assert result["message_log"][1]["token_ids"].tolist() == [3]
+    assert result["message_log"][2]["token_ids"].tolist() == [4, 5]
+    assert result["message_log"][3]["token_ids"].tolist() == [6, 7]
+    assert nemo_gym_result["response"]["output"][0]["prompt_str"] == "1 2"
+    assert nemo_gym_result["response"]["output"][0]["generation_str"] == "3"
+    assert nemo_gym_result["response"]["output"][1]["prompt_str"] == "1 2 3 4 5"
+    assert nemo_gym_result["response"]["output"][1]["generation_str"] == "6 7"
+
+
 @pytest.mark.nemo_gym
 def test_nemo_gym_sanity(
     nemo_gym,
@@ -225,6 +279,8 @@ def test_nemo_gym_sanity(
                 message["prompt_str"] = "dummy prompt_str"
             if "generation_str" in message:
                 message["generation_str"] = "dummy generation_str"
+            message.setdefault("is_invalid_tool_call", False)
+            message.setdefault("has_malformed_thinking", False)
 
         return d
 

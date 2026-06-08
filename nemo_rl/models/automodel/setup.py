@@ -428,7 +428,18 @@ def setup_distributed(
     tp_size = config["dtensor_cfg"].get("tensor_parallel_size", 1)
     cp_size = config["dtensor_cfg"].get("context_parallel_size", 1)
     ep_size = config["dtensor_cfg"].get("expert_parallel_size", 1)
+    dp_replicate_size = config["dtensor_cfg"].get("dp_replicate_size", 1)
     sequence_parallel_enabled = config["dtensor_cfg"]["sequence_parallel"]
+
+    # HSDP requires the data-parallel axis to evenly contain the replicate dim.
+    model_parallel_size = tp_size * cp_size * ep_size
+    dp_size = world_size // model_parallel_size
+    if dp_size % dp_replicate_size != 0:
+        raise ValueError(
+            f"Data parallel size ({dp_size}) must be divisible by "
+            f"dp_replicate_size ({dp_replicate_size}). "
+            "Please adjust your cluster size or parallelism parameters."
+        )
 
     # Build tp_plan from custom_parallel_plan config if set, else None (auto-select)
     tp_plan = config["dtensor_cfg"].get("custom_parallel_plan", None)
@@ -462,6 +473,7 @@ def setup_distributed(
     # Create device meshes (dp_size is derived from world_size / (tp * cp * ep))
     device_mesh, moe_mesh = create_device_mesh(
         fsdp2_config,
+        dp_replicate_size=dp_replicate_size,
         tp_size=tp_size,
         pp_size=1,
         cp_size=cp_size,
@@ -711,7 +723,20 @@ def setup_model_and_optimizer(
     optimizer = None
     if init_optimizer:
         optimizer_cls = get_class(config["optimizer"]["name"])
-        optimizer = optimizer_cls(model.parameters(), **config["optimizer"]["kwargs"])
+        optimizer_kwargs = dict(config["optimizer"]["kwargs"])
+        # Resolve string-valued torch dtypes (e.g. "torch.bfloat16" -> torch.bfloat16)
+        for key, value in optimizer_kwargs.items():
+            if isinstance(value, str) and value.startswith("torch."):
+                optimizer_kwargs[key] = getattr(torch, value.removeprefix("torch."))
+        # Only pass trainable params to the optimizer. TE FusedAdam's step()
+        # allocates per-param state (exp_avg/exp_avg_sq/master_param) before the
+        # p.grad-is-None check, so passing frozen params (e.g. the visual
+        # encoder in text-only training) causes DCP to save unused state that
+        # later fails to reshard on resume.
+        optimizer = optimizer_cls(
+            (p for p in model.parameters() if p.requires_grad),
+            **optimizer_kwargs,
+        )
 
     # Initialize scheduler
     scheduler = None

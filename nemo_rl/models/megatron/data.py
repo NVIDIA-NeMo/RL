@@ -23,7 +23,6 @@ from megatron.core.parallel_state import (
     get_context_parallel_world_size,
 )
 from megatron.core.utils import StragglerDetector
-from megatron.training.utils import get_ltor_masks_and_position_ids
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -204,6 +203,18 @@ def get_microbatch_iterator(
         seq_dim_size,
         padded_seq_length,
     )
+
+
+def get_ltor_masks_and_position_ids(*args: Any, **kwargs: Any) -> Any:
+    """Lazy proxy for `megatron.training.utils.get_ltor_masks_and_position_ids`.
+
+    The underlying import is deferred to call time so that importing this module does
+    not pull in `megatron.training` -> modelopt -> transformers -> torchvision, which
+    can crash on a duplicate torchvision ``roi_align` meta-kernel registration in the mcore venv.
+    """
+    from megatron.training.utils import get_ltor_masks_and_position_ids as _impl
+
+    return _impl(*args, **kwargs)
 
 
 def process_microbatch(
@@ -509,6 +520,8 @@ def _pack_sequences_for_megatron(
     if cu_seqlens_padded is None:
         cu_seqlens_padded = cu_seqlens.clone()
 
+    # total_tokens is required for PackedSeqParams.__post_init__ to build
+    # seq_idx, which Mamba uses to reset SSM state at sample boundaries.
     packed_seq_params = PackedSeqParams(
         cu_seqlens_q=cu_seqlens_padded,
         cu_seqlens_kv=cu_seqlens_padded,
@@ -517,6 +530,7 @@ def _pack_sequences_for_megatron(
         max_seqlen_q=int(max_seqlen),
         max_seqlen_kv=int(max_seqlen),
         qkv_format="thd",
+        total_tokens=packed_input_ids.shape[1],
     )
 
     return (
@@ -567,13 +581,28 @@ def _get_pack_sequence_parameters_for_megatron(
         f"    - If both are enabled, the minimum pad factor is `cp_size * 2 * tp_size`."
     )
 
-    # packed sequence length, after splitted to TP and CP domains, needs to be divisible by 128 if using blockwise FP8, and divisible by 16 if using other FP8 recipes.
+    # packed sequence length, after sharding to TP and CP domains, needs to be divisible
+    # by a recipe-dependent divisor:
+    #   blockwise FP8 : 128  (cublas block size)
+    #   MXFP8         :  32  (MXFP8 block size)
+    #   other FP8     :  16
+    #   HybridEP+flex : 128  (MAX_NUM_OF_TOKENS_PER_RANK must be divisible by
+    #                         NUM_OF_TOKENS_PER_CHUNK=128 in deep_ep JIT kernels)
+    # When multiple constraints apply, take the max (128 is a multiple of 32/16).
+    divisor = 1
     if use_fp8:
-        divisor = 16
         if fp8_cfg["fp8_recipe"] == "blockwise":
-            divisor = 128
+            divisor = max(divisor, 128)
         elif fp8_cfg["fp8_recipe"] == "mxfp8":
-            divisor = 32
+            divisor = max(divisor, 32)
+        else:
+            divisor = max(divisor, 16)
+    if (
+        megatron_cfg.get("moe_token_dispatcher_type") == "flex"
+        and megatron_cfg.get("moe_flex_dispatcher_backend") == "hybridep"
+    ):
+        divisor = max(divisor, 128)
+    if divisor > 1:
         pad_packed_seq_to_multiple_of = divisor
         if cp_size > 1:
             pad_packed_seq_to_multiple_of *= cp_size * 2

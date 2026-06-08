@@ -39,8 +39,13 @@ class VllmSpecificArgs(TypedDict):
     # Miscellaneous top level vLLM HTTP server arguments.
     # A filepath that can be imported to register a vLLM tool parser
     tool_parser_plugin: NotRequired[str]
+    # A filepath that can be imported to register a vLLM reasoning parser
+    reasoning_parser_plugin: NotRequired[str]
 
 
 class VllmConfig(GenerationConfig):
     vllm_cfg: VllmSpecificArgs
     vllm_kwargs: NotRequired[dict[str, Any]]
+
+    # quantization config
+    quant_cfg: NotRequired[str | None]

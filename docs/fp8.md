@@ -53,8 +53,8 @@ FP8 generations are recommended to be configured with the following settings:
                 num_first_layers_in_bf16: 0
                 # Use FP32 scaling factors. Rounding scaling factors to the nearest pow2 may improve quantization 
                 # fidelity however this feature is still under research.
-                use_weight_pow2_scale: False
-                use_activation_pow2_scale: False
+                pow2_weight_scaling_factors: False
+                pow2_activation_scaling_factors: False
 ```
 
 To train with FP8, you need to set the Megatron path and configure it using the following settings:

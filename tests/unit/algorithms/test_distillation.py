@@ -20,6 +20,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 
 import nemo_rl.algorithms.distillation as distil_mod
 from nemo_rl.algorithms.distillation import (
+    MasterConfig,
     _default_distillation_save_state,
     check_vocab_equality,
     distillation_train,
@@ -121,59 +122,61 @@ def mock_components():
     val_task_to_env = {"math": MagicMock()}
 
     # Create mock master config
-    master_config = {
-        "distillation": {
-            "max_num_steps": 5,
-            "max_num_epochs": 10,
-            "val_period": 100,
-            "val_batch_size": 1,
-            "val_at_start": False,
-            "val_at_end": False,
-            "max_val_samples": 10,
-            "topk_logits_k": 64,
-            "num_prompts_per_step": 1,
-            "num_generations_per_prompt": 1,
-            "max_rollout_turns": 0,  # No environment interaction needed for distillation
-            "seed": 42,
-        },
-        "policy": {
-            "train_global_batch_size": 1,
-            "make_sequence_length_divisible_by": 8,
-            "max_total_sequence_length": 2048,
-            "generation": {
-                "temperature": 1.0,
-                "top_p": 1.0,
-                "top_k": None,
-                "colocated": {
-                    "enabled": False,
+    master_config = MasterConfig.model_construct(
+        **{
+            "distillation": {
+                "max_num_steps": 5,
+                "max_num_epochs": 10,
+                "val_period": 100,
+                "val_batch_size": 1,
+                "val_at_start": False,
+                "val_at_end": False,
+                "max_val_samples": 10,
+                "topk_logits_k": 64,
+                "num_prompts_per_step": 1,
+                "num_generations_per_prompt": 1,
+                "max_rollout_turns": 0,  # No environment interaction needed for distillation
+                "seed": 42,
+            },
+            "policy": {
+                "train_global_batch_size": 1,
+                "make_sequence_length_divisible_by": 8,
+                "max_total_sequence_length": 2048,
+                "generation": {
+                    "temperature": 1.0,
+                    "top_p": 1.0,
+                    "top_k": None,
+                    "colocated": {
+                        "enabled": False,
+                    },
                 },
             },
-        },
-        "teacher": {
-            "model_name": "test-teacher",
-        },
-        "loss_fn": {
-            "kl_type": "forward",
-            "mixed_kl_weight": 0.5,
-            "zero_outside_topk": False,
-        },
-        "data": {
-            "dataset_name": "test_dataset",
-        },
-        "logger": {
-            "num_val_samples_to_print": 5,
-        },
-        "cluster": {
-            "num_nodes": 1,
-            "gpus_per_node": 2,
-        },
-        "checkpointing": {
-            "enabled": False,
-            "checkpoint_must_save_by": None,
-            "save_period": 10,
-            "metric_name": None,
-        },
-    }
+            "teacher": {
+                "model_name": "test-teacher",
+            },
+            "loss_fn": {
+                "kl_type": "forward",
+                "mixed_kl_weight": 0.5,
+                "zero_outside_topk": False,
+            },
+            "data": {
+                "dataset_name": "test_dataset",
+            },
+            "logger": {
+                "num_val_samples_to_print": 5,
+            },
+            "cluster": {
+                "num_nodes": 1,
+                "gpus_per_node": 2,
+            },
+            "checkpointing": {
+                "enabled": False,
+                "checkpoint_must_save_by": None,
+                "save_period": 10,
+                "metric_name": None,
+            },
+        }
+    )
 
     return {
         "student_policy": student_policy,
@@ -193,7 +196,7 @@ def mock_components():
 
 def test_distillation_train_max_steps(mock_components):
     """Test that training terminates correctly when maximum steps are reached."""
-    mock_components["master_config"]["distillation"]["max_num_steps"] = 5
+    mock_components["master_config"].distillation["max_num_steps"] = 5
 
     distillation_save_state = _default_distillation_save_state()
 
@@ -220,7 +223,7 @@ def test_distillation_train_max_steps(mock_components):
 def test_exit_on_timeout(mock_components, capsys):
     """Test that training loop exits when timeout is reached"""
     # Set max steps to large number
-    mock_components["master_config"]["distillation"]["max_num_steps"] = 100
+    mock_components["master_config"].distillation["max_num_steps"] = 100
 
     distillation_save_state = _default_distillation_save_state()
 
@@ -420,47 +423,49 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node():
     from nemo_rl.algorithms.distillation import setup
 
     # Create minimal config with non-colocated inference but gpus_per_node=None
-    master_config = {
-        "policy": {
-            "generation": {
-                "temperature": 1.0,
-                "top_p": 1.0,
-                "top_k": None,
-                "backend": "vllm",
-                "colocated": {
-                    "enabled": False,  # Non-colocated
-                    "resources": {
-                        "gpus_per_node": None,  # This should trigger error
-                        "num_nodes": None,
+    master_config = MasterConfig.model_construct(
+        **{
+            "policy": {
+                "generation": {
+                    "temperature": 1.0,
+                    "top_p": 1.0,
+                    "top_k": None,
+                    "backend": "vllm",
+                    "colocated": {
+                        "enabled": False,  # Non-colocated
+                        "resources": {
+                            "gpus_per_node": None,  # This should trigger error
+                            "num_nodes": None,
+                        },
                     },
                 },
+                "dtensor_cfg": {
+                    "enabled": False,
+                },
             },
-            "dtensor_cfg": {
-                "enabled": False,
+            "teacher": {
+                "dtensor_cfg": {
+                    "enabled": False,
+                },
             },
-        },
-        "teacher": {
-            "dtensor_cfg": {
-                "enabled": False,
+            "loss_fn": {},
+            "distillation": {
+                "seed": 42,
+                "topk_logits_k": 64,
+                "num_prompts_per_step": 1,  # Config extraction requires this key
+                "val_period": 0,  # Config extraction requires this key
+                "val_at_start": False,  # Config extraction requires this key
+                "val_at_end": False,  # Config extraction requires this key
             },
-        },
-        "loss_fn": {},
-        "distillation": {
-            "seed": 42,
-            "topk_logits_k": 64,
-            "num_prompts_per_step": 1,  # Config extraction requires this key
-            "val_period": 0,  # Config extraction requires this key
-            "val_at_start": False,  # Config extraction requires this key
-            "val_at_end": False,  # Config extraction requires this key
-        },
-        "data": {"shuffle": False},
-        "logger": {},  # Config extraction requires this key
-        "checkpointing": {},  # Config extraction requires this key
-        "cluster": {
-            "num_nodes": 1,  # Single node
-            "gpus_per_node": 8,
-        },
-    }
+            "data": {"shuffle": False},
+            "logger": {},  # Config extraction requires this key
+            "checkpointing": {},  # Config extraction requires this key
+            "cluster": {
+                "num_nodes": 1,  # Single node
+                "gpus_per_node": 8,
+            },
+        }
+    )
 
     tokenizer = MagicMock()
     dataset = MagicMock()
@@ -488,52 +493,54 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch):
     import nemo_rl.algorithms.distillation as distil_mod
 
     # Single node cluster; inference uses a subset of GPUs on same node
-    master_config = {
-        "policy": {
-            "generation": {
-                "temperature": 1.0,
-                "top_p": 1.0,
-                "top_k": None,
-                "backend": "vllm",
-                "colocated": {
-                    "enabled": False,
-                    "resources": {
-                        "gpus_per_node": 8,  # inference on 8 GPU
-                        "num_nodes": 1,
+    master_config = MasterConfig.model_construct(
+        **{
+            "policy": {
+                "generation": {
+                    "temperature": 1.0,
+                    "top_p": 1.0,
+                    "top_k": None,
+                    "backend": "vllm",
+                    "colocated": {
+                        "enabled": False,
+                        "resources": {
+                            "gpus_per_node": 8,  # inference on 8 GPU
+                            "num_nodes": 1,
+                        },
                     },
                 },
+                "dtensor_cfg": {
+                    "enabled": False,
+                },
+                "model_name": "test-policy",
             },
-            "dtensor_cfg": {
-                "enabled": False,
+            "teacher": {
+                "model_name": "test-teacher",
+                "dtensor_cfg": {
+                    "enabled": False,
+                },
             },
-            "model_name": "test-policy",
-        },
-        "teacher": {
-            "model_name": "test-teacher",
-            "dtensor_cfg": {
-                "enabled": False,
+            "loss_fn": {
+                "kl_type": "forward",
+                "mixed_kl_weight": 0.5,
+                "zero_outside_topk": False,
             },
-        },
-        "loss_fn": {
-            "kl_type": "forward",
-            "mixed_kl_weight": 0.5,
-            "zero_outside_topk": False,
-        },
-        "distillation": {
-            "seed": 42,
-            "topk_logits_k": 64,
-            "num_prompts_per_step": 1,
-            "max_num_epochs": 10,
-            "max_num_steps": 100,
-            "val_period": 0,
-            "val_at_start": False,
-            "val_at_end": False,
-        },
-        "data": {"shuffle": False},
-        "logger": {},
-        "checkpointing": {},
-        "cluster": {"num_nodes": 2, "gpus_per_node": 8},
-    }
+            "distillation": {
+                "seed": 42,
+                "topk_logits_k": 64,
+                "num_prompts_per_step": 1,
+                "max_num_epochs": 10,
+                "max_num_steps": 100,
+                "val_period": 0,
+                "val_at_start": False,
+                "val_at_end": False,
+            },
+            "data": {"shuffle": False},
+            "logger": {},
+            "checkpointing": {},
+            "cluster": {"num_nodes": 2, "gpus_per_node": 8},
+        }
+    )
 
     tokenizer = MagicMock()
     dataset = MagicMock()
@@ -607,49 +614,51 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():
     from nemo_rl.algorithms.distillation import setup
 
     # Create minimal config with non-colocated inference but gpus_per_node=None
-    master_config = {
-        "policy": {
-            "generation": {
-                "temperature": 1.0,
-                "top_p": 1.0,
-                "top_k": None,
-                "backend": "vllm",
-                "colocated": {
-                    "enabled": False,  # Non-colocated
-                    "resources": {
-                        "gpus_per_node": None,  # This should trigger error
-                        "num_nodes": 1,  # Use 1 node for inference
+    master_config = MasterConfig.model_construct(
+        **{
+            "policy": {
+                "generation": {
+                    "temperature": 1.0,
+                    "top_p": 1.0,
+                    "top_k": None,
+                    "backend": "vllm",
+                    "colocated": {
+                        "enabled": False,  # Non-colocated
+                        "resources": {
+                            "gpus_per_node": None,  # This should trigger error
+                            "num_nodes": 1,  # Use 1 node for inference
+                        },
                     },
                 },
+                "dtensor_cfg": {
+                    "enabled": False,
+                },
             },
-            "dtensor_cfg": {
-                "enabled": False,
+            "teacher": {
+                "dtensor_cfg": {
+                    "enabled": False,
+                },
             },
-        },
-        "teacher": {
-            "dtensor_cfg": {
-                "enabled": False,
+            "loss_fn": {},
+            "distillation": {
+                "seed": 42,
+                "topk_logits_k": 64,
+                "max_num_epochs": 10,
+                "max_num_steps": 100,
+                "num_prompts_per_step": 1,  # Config extraction requires this key
+                "val_period": 0,  # Config extraction requires this key
+                "val_at_start": False,  # Config extraction requires this key
+                "val_at_end": False,  # Config extraction requires this key
             },
-        },
-        "loss_fn": {},
-        "distillation": {
-            "seed": 42,
-            "topk_logits_k": 64,
-            "max_num_epochs": 10,
-            "max_num_steps": 100,
-            "num_prompts_per_step": 1,  # Config extraction requires this key
-            "val_period": 0,  # Config extraction requires this key
-            "val_at_start": False,  # Config extraction requires this key
-            "val_at_end": False,  # Config extraction requires this key
-        },
-        "data": {"shuffle": False},
-        "logger": {},  # Config extraction requires this key
-        "checkpointing": {},  # Config extraction requires this key
-        "cluster": {
-            "num_nodes": 2,  # Multi-node
-            "gpus_per_node": 8,
-        },
-    }
+            "data": {"shuffle": False},
+            "logger": {},  # Config extraction requires this key
+            "checkpointing": {},  # Config extraction requires this key
+            "cluster": {
+                "num_nodes": 2,  # Multi-node
+                "gpus_per_node": 8,
+            },
+        }
+    )
 
     tokenizer = MagicMock()
     dataset = MagicMock()
