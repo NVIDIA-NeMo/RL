@@ -14,7 +14,7 @@
 """Unit tests for ``nemo_rl/algorithms/x_token/loss_utils.py``.
 
 CPU-only. ``Fp32SparseMM`` is GPU-pinned via ``custom_fwd(device_type="cuda")``
-and lives in ``test_gpu_smoke.py``; it is intentionally not covered here.
+and is intentionally not covered here.
 """
 
 from __future__ import annotations

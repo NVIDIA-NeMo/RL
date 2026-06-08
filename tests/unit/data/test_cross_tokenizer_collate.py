@@ -13,9 +13,7 @@
 # limitations under the License.
 """Hermetic CPU tests for ``CrossTokenizerCollator``.
 
-Companion to the env-gated snapshot suite at
-``tests/unit/algorithms/x_token/test_alignment_snapshot.py`` — these
-tests pin the collator's *contract* (output keys, shapes, padding,
+These tests pin the collator's *contract* (output keys, shapes, padding,
 truncation) without needing real HF tokenizers or pre-captured artifacts.
 """
 
