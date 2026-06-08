@@ -335,3 +335,85 @@ class TestBuildExactTokenMap:
             teacher_vocab_size=24,
         )
         assert a is b  # cache returns the same dict object
+
+    @staticmethod
+    def _write_topk(tmp_path: Path, indices_rows, likelihood_rows) -> str:
+        """Save a dense top-k projection file from per-student rows."""
+        path = tmp_path / "collision_projection.pt"
+        torch.save(
+            {
+                "indices": torch.tensor(indices_rows, dtype=torch.long),
+                "likelihoods": torch.tensor(likelihood_rows, dtype=torch.float32),
+            },
+            path,
+        )
+        return str(path)
+
+    def test_relaxed_mode_collision_resolution(self, tmp_path: Path):
+        """Relaxed (xtoken_loss=True) collisions: among students whose top
+        projection lands on the same teacher, the highest first-projection
+        weight wins, ties break to the lowest student index, and the
+        exact-map threshold is ``>= 0.6``.
+
+          s0, s1 collide on teacher 2 (0.8 vs 0.7) -> s0 wins (higher weight)
+          s2, s3 collide on teacher 5 (0.9 == 0.9) -> s2 wins (lower index)
+          s4 -> teacher 1 @ 0.65 (unique, above threshold)
+          s5 -> top weight 0.5 (below threshold, no exact map)
+          s6 -> teacher 4 @ 0.6 (boundary, included)
+          s7 -> teacher 0 @ 0.95 (unique)
+        """
+        indices = [
+            [2, 3],
+            [2, 4],
+            [5, 0],
+            [5, 1],
+            [1, 0],
+            [3, 4],
+            [4, 2],
+            [0, 1],
+        ]
+        likelihoods = [
+            [0.8, 0.2],
+            [0.7, 0.3],
+            [0.9, 0.1],
+            [0.9, 0.1],
+            [0.65, 0.35],
+            [0.5, 0.5],
+            [0.6, 0.4],
+            [0.95, 0.05],
+        ]
+        out = build_exact_token_map(
+            self._write_topk(tmp_path, indices, likelihoods),
+            torch.device("cpu"),
+            xtoken_loss=True,
+            teacher_vocab_size=6,
+        )
+        # Winners, paired and sorted by student index.
+        assert out["common_student"].tolist() == [0, 2, 4, 6, 7]
+        assert out["common_teacher"].tolist() == [2, 5, 1, 4, 0]
+        # Collision losers (s1, s3) and the sub-threshold student (s5) fall to
+        # the uncommon partition; uncommon_teacher is the unmapped complement.
+        assert out["uncommon_student"].tolist() == [1, 3, 5]
+        assert out["uncommon_teacher"].tolist() == [3]
+
+    def test_strict_mode_collision_picks_lowest_student(self, tmp_path: Path):
+        """Strict (xtoken_loss=False) exact maps require weight 1.0 and a
+        ``-1`` sentinel in the second slot. On a teacher collision the lowest
+        student index wins; fuzzy rows (second slot != -1) are excluded.
+
+          s0, s1 both exact-map to teacher 1 -> s0 wins (lowest index)
+          s2 fuzzy (second slot 0) -> excluded
+          s3 exact-maps to teacher 0 (unique)
+        """
+        indices = [[1, -1], [1, -1], [2, 0], [0, -1]]
+        likelihoods = [[1.0, 0.0], [1.0, 0.0], [0.7, 0.3], [1.0, 0.0]]
+        out = build_exact_token_map(
+            self._write_topk(tmp_path, indices, likelihoods),
+            torch.device("cpu"),
+            xtoken_loss=False,
+            teacher_vocab_size=3,
+        )
+        assert out["common_student"].tolist() == [0, 3]
+        assert out["common_teacher"].tolist() == [1, 0]
+        assert out["uncommon_student"].tolist() == [1, 2]
+        assert out["uncommon_teacher"].tolist() == [2]
