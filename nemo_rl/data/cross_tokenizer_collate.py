@@ -74,6 +74,15 @@ class CrossTokenizerCollator:
         self.ctx_length_teacher = ctx_length_teacher
         self.make_seq_div_by_student = make_seq_div_by_student
         self.make_seq_div_by_teacher = make_seq_div_by_teacher
+        # Downstream consumers assume real tokens occupy the leading
+        # positions: ``input_lengths = attention_mask.sum(-1)`` plus the
+        # ``[:length]`` slices in the policy forward and the token-chunk
+        # alignment all treat ``input_ids[:, :length]`` as the content.
+        # Pin right-padding rather than trust each tokenizer's default
+        # (some tokenizer configs default to left-padding, which would
+        # silently misalign without changing the lengths).
+        self.student_tokenizer.padding_side = "right"
+        self.teacher_tokenizer.padding_side = "right"
         # Defensive: HF tokenizers without a pad token can't pad batches.
         if self.student_tokenizer.pad_token_id is None:
             self.student_tokenizer.pad_token = self.student_tokenizer.eos_token

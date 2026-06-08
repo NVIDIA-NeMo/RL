@@ -40,8 +40,8 @@ usage() {
   cat <<EOF
 Usage: $(basename "$0") --student-model <id> --teacher-model <id> [options]
 
-Chains the four projection-prep steps into a single runtime
-projection matrix.
+Chains the projection-prep steps (seed pass + Steps 1-3) into a
+single runtime projection matrix.
 
 Required:
   --student-model <id>          HuggingFace student model id
@@ -50,17 +50,17 @@ Required:
 Common:
   --data-dir <dir>              Staging dir for intermediate artifacts
                                 (default: ${DATA_DIR})
-  --prep-top-k <N>              top_k used during prep, steps 1+2
+  --prep-top-k <N>              top_k used during prep (seed + Step 1)
                                 (default: ${PREP_TOP_K})
-  --runtime-top-k <N>           Final runtime top_k, step 4
+  --runtime-top-k <N>           Final runtime top_k, Step 3
                                 (default: ${RUNTIME_TOP_K})
   --final-output <path>         Final .pt path
                                 (default: <data-dir>/projection_matrix_<S>_<T>_top<N>.pt)
-  --skip-exact-map              Skip step 3 (reapply_exact_map.py)
-  --use-canonicalization        Forward to steps 1+2
-  --no-scale-trick              Disable scale trick (step 2)
-  --no-reverse-pass             Disable reverse pass (step 2)
-  --no-special-token-mapping    Disable special-token mapping (step 2)
+  --skip-exact-map              Skip Step 2 (reapply_exact_map.py)
+  --use-canonicalization        Forward to seed + Step 1
+  --no-scale-trick              Disable scale trick (Step 1)
+  --no-reverse-pass             Disable reverse pass (Step 1)
+  --no-special-token-mapping    Disable special-token mapping (Step 1)
   -h, --help                    Show this help and exit
 
 Example:
@@ -133,7 +133,7 @@ fi
 
 mkdir -p "$DATA_DIR"
 
-echo "[1/4] minimal_projection_generator (-> ${STEP1_OUT}) ..."
+echo "[seed] minimal_projection_generator (-> ${STEP1_OUT}) ..."
 step1_args=(
   --student-model "$STUDENT"
   --teacher-model "$TEACHER"
@@ -145,7 +145,7 @@ if $USE_CANONICALIZATION; then
 fi
 uv run python -m tools.x_token.minimal_projection_generator "${step1_args[@]}"
 
-echo "[2/4] minimal_projection_via_multitoken (-> ${STEP2_OUT}) ..."
+echo "[1/3] minimal_projection_via_multitoken (-> ${STEP2_OUT}) ..."
 step2_args=(
   --student-model "$STUDENT"
   --teacher-model "$TEACHER"
@@ -174,16 +174,16 @@ fi
 uv run python -m tools.x_token.minimal_projection_via_multitoken "${step2_args[@]}"
 
 if ! $SKIP_EXACT_MAP; then
-  echo "[3/4] reapply_exact_map (-> ${STEP3_OUT}) ..."
+  echo "[2/3] reapply_exact_map (-> ${STEP3_OUT}) ..."
   uv run python -m tools.x_token.reapply_exact_map \
     --student-model "$STUDENT" \
     --teacher-model "$TEACHER" \
     --initial-projection-path "$STEP2_OUT"
 else
-  echo "[3/4] reapply_exact_map skipped (--skip-exact-map)."
+  echo "[2/3] reapply_exact_map skipped (--skip-exact-map)."
 fi
 
-echo "[4/4] sort_and_cut_projection_matrix (-> ${FINAL_OUTPUT}) ..."
+echo "[3/3] sort_and_cut_projection_matrix (-> ${FINAL_OUTPUT}) ..."
 uv run python -m tools.x_token.sort_and_cut_projection_matrix \
   --initial-projection-path "$STEP4_IN" \
   --top_k "$RUNTIME_TOP_K" \

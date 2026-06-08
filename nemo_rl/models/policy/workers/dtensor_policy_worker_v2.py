@@ -914,6 +914,11 @@ class DTensorPolicyWorkerV2Impl(
             B_r, T_t, V_t, final_vals.dtype, final_vals.device
         )
         self._teacher_ipc_buffer[:B_r, :T_t, :V_t].copy_(final_vals)
+        # The copy_ is async on the current stream; force it to complete
+        # before the IPC handle is consumed by the student process, so the
+        # consumer can't observe a partially written buffer (mirrors the
+        # sync in nemo_rl/models/policy/utils.py before exposing handles).
+        torch.cuda.synchronize()
         del (
             final_vals,
             out_vals,

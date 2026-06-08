@@ -175,11 +175,11 @@ def setup(
 
     # Backend gate: this code path is DTensor V2 only by design.
     assert policy_config["dtensor_cfg"]["enabled"] and policy_config["dtensor_cfg"].get(
-        "_v2", False
+        "_v2"
     ), "xtoken distillation requires policy.dtensor_cfg.enabled=true and _v2=true."
     assert teacher_config["dtensor_cfg"]["enabled"] and teacher_config[
         "dtensor_cfg"
-    ].get("_v2", False), (
+    ].get("_v2"), (
         "xtoken distillation requires teacher.dtensor_cfg.enabled=true and _v2=true."
     )
 
@@ -189,8 +189,8 @@ def setup(
     # when there is no TP/CP sharding. Enforce that here so the chunk-KL
     # denominator stays correct.
     assert (
-        policy_config["dtensor_cfg"].get("tensor_parallel_size", 1) == 1
-        and policy_config["dtensor_cfg"].get("context_parallel_size", 1) == 1
+        policy_config["dtensor_cfg"]["tensor_parallel_size"] == 1
+        and policy_config["dtensor_cfg"]["context_parallel_size"] == 1
     ), (
         "xtoken distillation requires policy tensor_parallel_size=1 and context_parallel_size=1."
     )
@@ -470,10 +470,11 @@ def xtoken_off_policy_distillation_train(
                             check_dim_skip_keys=XTOKEN_NON_STUDENT_SEQ_KEYS,
                         )
                     finally:
-                        # Producer-side CUDA tensors must be freed before
-                        # the next teacher forward — otherwise memory grows
-                        # unboundedly. Always release, even on student
-                        # failure.
+                        # No-op under the persistent IPC buffer design (the
+                        # teacher reuses one buffer across steps via copy_),
+                        # kept for driver-side contract compatibility. Called
+                        # in finally so the contract holds even if the
+                        # student step raised.
                         teacher_policy.release_ipc_buffer()
 
                 is_last_step = (total_steps + 1 >= max_steps) or (
