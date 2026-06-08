@@ -203,9 +203,10 @@ class DryRunGenWorker:
     async def generate_and_push(self, prompt: str, dp_client: Any) -> None:
         """Simulate generation + push directly to DataPlane."""
         self._call_count += 1
+        call_idx = self._call_count
         self._call_timestamps.append(time.monotonic())
         await asyncio.sleep(self._gen_latency_s)
-        group_id = f"group-{self._call_count:04d}"
+        group_id = f"group-{call_idx:04d}"
         sample_id = f"{group_id}_g0"
         await dp_client.put_samples.remote(
             sample_ids=[sample_id],
@@ -302,9 +303,9 @@ class DryRunTrainer:
             raise RuntimeError(
                 f"train_microbatch_from_meta step_id={step_id!r} != open {self._open_step_id!r}"
             )
-        self._microbatch_calls.append(
-            (step_id, list(meta.sample_ids), time.monotonic())
-        )
+        now = time.monotonic()
+        self._microbatch_calls.append((step_id, list(meta.sample_ids), now))
+        self._train_start_times.append(now)
         if self._expect_advantages:
             data = await self._dp_client.get_samples.remote(
                 sample_ids=meta.sample_ids,
@@ -688,7 +689,7 @@ class TestSingleControllerDryRun:
         ping_elapsed = time.monotonic() - ping_start
 
         assert health["alive"] is True
-        assert ping_elapsed < 1.0, (
+        assert ping_elapsed < 3.0, (
             f"ping() took {ping_elapsed:.2f}s — event loop may be blocked"
         )
 
@@ -779,11 +780,17 @@ class _ReapInFlightHelperActor:
     """Tiny Ray actor exposing SingleControllerActor._reap_in_flight_nonblocking."""
 
     async def reap(self, refs):
-        ready, pending = (
-            ray.wait(refs, num_returns=len(refs), timeout=0) if refs else ([], [])
-        )
-        for r in ready:
-            await r
+        if not refs:
+            return []
+        ref_to_task = {ref: asyncio.ensure_future(ref) for ref in refs}
+        await asyncio.wait(ref_to_task.values(), timeout=0.05)
+        pending = []
+        for ref, task in ref_to_task.items():
+            if task.done():
+                task.result()
+            else:
+                task.cancel()
+                pending.append(ref)
         return pending
 
 

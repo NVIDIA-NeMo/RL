@@ -66,7 +66,7 @@ class SingleControllerConfig:
     # Staleness
     max_weight_staleness_versions: int = 1
     min_prompt_groups_per_batch: int = 2
-    target_prompt_groups_per_step: int = 8
+    target_prompt_groups_per_step: Optional[int] = None
     generations_per_prompt: int = 4
     batch_selection_strategy: Literal[
         "strict_on_policy",
@@ -163,6 +163,8 @@ class SingleControllerActor:
             print(
                 "Using strict_on_policy, auto setting max_weight_staleness_versions to 0."
             )
+        if cfg.target_prompt_groups_per_step is None:
+            cfg.target_prompt_groups_per_step = cfg.min_prompt_groups_per_batch
         if cfg.target_prompt_groups_per_step < cfg.min_prompt_groups_per_batch:
             raise ValueError(
                 f"target_prompt_groups_per_step ({cfg.target_prompt_groups_per_step}) "
@@ -237,12 +239,24 @@ class SingleControllerActor:
     async def _reap_in_flight_nonblocking(
         self, refs: list[ray.ObjectRef]
     ) -> list[ray.ObjectRef]:
-        """Drain completed refs without blocking; return still-pending refs."""
+        """Drain completed refs without blocking; return still-pending refs.
+
+        Uses ``asyncio.wait`` with ``timeout=0`` so Ray ObjectRefs are checked
+        through their awaitable interface (which is accurate in async actors).
+        ``ray.wait(timeout=0)`` does not always reflect cross-process ref
+        readiness from an async actor, so we avoid it here.
+        """
         if not refs:
             return []
-        ready, pending = ray.wait(refs, num_returns=len(refs), timeout=0)
-        for r in ready:
-            await r  # surface exceptions; payload ignored
+        ref_to_task = {ref: asyncio.ensure_future(ref) for ref in refs}
+        await asyncio.wait(ref_to_task.values(), timeout=0.05)
+        pending: list[ray.ObjectRef] = []
+        for ref, task in ref_to_task.items():
+            if task.done():
+                task.result()  # surface exceptions; payload ignored
+            else:
+                task.cancel()
+                pending.append(ref)
         return pending
 
     async def _call_dp(self, method_name: str, **kwargs) -> Any:
@@ -325,6 +339,7 @@ class SingleControllerActor:
             step_min_weight_version: int | None = None
 
             while groups_dispatched < target_groups:
+                await asyncio.sleep(0)
                 await self._claim_available_meta()
                 evicted_meta = await self._evict_stale_claimed()
                 if evicted_meta is not None:
