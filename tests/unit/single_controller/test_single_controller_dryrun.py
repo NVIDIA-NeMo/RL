@@ -47,6 +47,7 @@ os.makedirs(_RAY_TEMP, exist_ok=True)
 os.environ["RAY_TEMP_DIR"] = _RAY_TEMP
 os.environ["RAY_TMPDIR"] = _RAY_TEMP
 
+import nemo_rl.algorithms.async_utils.replay_buffer as _replay_buffer_module
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms.single_controller import (
     SingleControllerActor,
@@ -54,6 +55,8 @@ from nemo_rl.algorithms.single_controller import (
 )
 from nemo_rl.algorithms.staleness_sampler import StalenessSampler
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 
 # ── Fake in-memory DataPlane ──────────────────────────────────────────────
 
@@ -182,10 +185,9 @@ class FakeDataPlaneActor:
 class DryRunGenWorker:
     """Stub GenerationWorkerActor.
 
-    Implements the new RolloutManager-driven shape: ``generate(prompt)``
-    simulates a rollout and returns the payload tuple that
-    :class:`DryRunRolloutManager` hands to :meth:`TQReplayBuffer.add`.
-    Uses ``asyncio.sleep`` so the test event loop stays responsive.
+    Returns a ``PromptGroupRecord`` whose ``prompt_idx`` and per-completion
+    ``reward`` carry the call_count so the dry-run record-converter stub
+    can reproduce the old bulk_batch fields deterministically.
     """
 
     def __init__(self, gen_latency_s: float = 0.1):
@@ -193,39 +195,58 @@ class DryRunGenWorker:
         self._call_count = 0
         self._call_timestamps: list[float] = []
 
-    async def generate(
-        self, prompt: str
-    ) -> tuple[list[str], TensorDict, list[dict[str, Any]]]:
-        """Simulate one prompt's rollout and return ``(sample_ids, fields, tags)``."""
+    async def generate(self, prompt: str) -> PromptGroupRecord:
         self._call_count += 1
         self._call_timestamps.append(time.monotonic())
         await asyncio.sleep(self._gen_latency_s)
-        group_id = f"group-{self._call_count:04d}"
-        sample_ids = [f"{group_id}_g0"]
-        fields = TensorDict(
-            {
-                "input_ids": torch.ones((1, 3), dtype=torch.long),
-                "prompt_ids_for_adv": torch.tensor(
-                    [[self._call_count]], dtype=torch.long
+        return PromptGroupRecord(
+            prompt_idx=self._call_count,
+            prompt=[],
+            extra_env_info=None,
+            metadata={},
+            completions=[
+                Completion(
+                    message_log=[],
+                    env_extras=None,
+                    truncated=False,
+                    reward=float(self._call_count),
                 ),
-                "total_reward": torch.tensor(
-                    [float(self._call_count)], dtype=torch.float32
-                ),
-                "token_mask": torch.ones((1, 3), dtype=torch.float32),
-                "sample_mask": torch.ones(1, dtype=torch.float32),
-            },
-            batch_size=[1],
+            ],
+            rollout_metrics={},
         )
-        # Producer never stamps weight_version directly — the manager does
-        # so via ``buffer.add(weight_version=…)`` when it writes.
-        tags = [{}]
-        return sample_ids, fields, tags
 
     def get_call_count(self) -> int:
         return self._call_count
 
     def get_call_timestamps(self) -> list[float]:
         return list(self._call_timestamps)
+
+
+def _dryrun_record_to_bulk_batch(
+    record: PromptGroupRecord, *, pad_value_dict: Any
+) -> BatchedDataDict[Any]:
+    """Stub for ``record_to_train_batch``.
+
+    Production reads message_logs / token_ids etc.; the dry-run records
+    have none of that. Mirror the old ``DryRunGenWorker`` bulk_batch
+    shape, using ``record.prompt_idx`` + ``completions[i].reward`` so
+    advantage tests stay deterministic.
+    """
+    del pad_value_dict
+    n = len(record.completions)
+    rewards = [float(c.reward) for c in record.completions]
+    return BatchedDataDict[Any](
+        {
+            "input_ids": torch.ones((n, 3), dtype=torch.long),
+            "input_lengths": torch.full((n,), 3, dtype=torch.long),
+            "prompt_ids_for_adv": torch.tensor(
+                [[record.prompt_idx] for _ in rewards], dtype=torch.long
+            ),
+            "total_reward": torch.tensor(rewards, dtype=torch.float32),
+            "token_mask": torch.ones((n, 3), dtype=torch.float32),
+            "sample_mask": torch.ones(n, dtype=torch.float32),
+        }
+    )
 
 
 @ray.remote(num_cpus=0)
@@ -321,13 +342,8 @@ class DryRunRolloutManager:
         self._weight_version = int(version)
 
     async def generate_and_push(self, prompt: str) -> None:
-        sample_ids, fields, tags = await self._gen_actor.generate.remote(prompt)
-        await self._tq_buffer.add(
-            sample_ids=sample_ids,
-            fields=fields,
-            tags=tags,
-            weight_version=self._weight_version,
-        )
+        bulk_batch = await self._gen_actor.generate.remote(prompt)
+        await self._tq_buffer.add(bulk_batch, weight_version=self._weight_version)
 
 
 class DryRunWeightSynchronizer:
@@ -416,6 +432,19 @@ def _buffer_with_versions(versions: list[int]) -> _FakeBuffer:
 class TestSingleControllerDryRun:
     """Validate asyncio skeleton concurrency and backpressure."""
 
+    @pytest.fixture(autouse=True)
+    def _stub_record_converter(self, monkeypatch):
+        """Replace the buffer's record→bulk_batch with a dry-run-friendly stub.
+
+        Production reads message_logs / token_ids etc.; the dry-run
+        records carry none of that.
+        """
+        monkeypatch.setattr(
+            _replay_buffer_module,
+            "record_to_train_batch",
+            _dryrun_record_to_bulk_batch,
+        )
+
     def _make_controller(
         self,
         dp_client,
@@ -447,7 +476,11 @@ class TestSingleControllerDryRun:
         # (`for prompt in self._dataloader`), so a list satisfies the contract.
         dataloader = [f"prompt_{i}" for i in range(10)]
 
-        tq_buffer = TQReplayBuffer(dp_client, partition_id=cfg.partition_id)
+        tq_buffer = TQReplayBuffer(
+            dp_client,
+            partition_id=cfg.partition_id,
+            pad_value_dict={"token_ids": 0},
+        )
         rollout_manager = DryRunRolloutManager(gen, tq_buffer)
         if weight_sync is None:
             weight_sync = DryRunWeightSynchronizer(rollout_manager=rollout_manager)

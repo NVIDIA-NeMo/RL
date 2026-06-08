@@ -15,18 +15,14 @@
 import asyncio
 import copy
 import json
-import uuid
 from typing import Any, Optional
 
-import numpy as np
 import torch
-from tensordict import TensorDict
 from transformers import PreTrainedTokenizerBase
 from wandb import Table
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.data.interfaces import DatumSpec
-from nemo_rl.data_plane.codec import pack_jagged_fields
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
@@ -685,77 +681,4 @@ class RolloutManager:
             "generate_and_push requires tq_buffer to be set at __init__"
         )
         record = await self.run_rollout(input_sample)
-        sample_ids, fields_td, tags = self._build_tq_payload(record)
-        await self._tq_buffer.add(
-            sample_ids=sample_ids,
-            fields=fields_td,
-            tags=tags,
-            weight_version=self._weight_version,
-        )
-
-    def _build_tq_payload(
-        self, record: PromptGroupRecord
-    ) -> tuple[list[str], TensorDict, list[dict[str, Any]]]:
-        """Build the payload that ``TQReplayBuffer.add`` expects."""
-        # Lazy imports: grpo and llm_message_utils both transitively pull
-        # experience.rollouts, so importing at module top risks a cycle.
-        from nemo_rl.algorithms.grpo import (
-            add_grpo_token_loss_masks_and_generation_logprobs,
-            extract_initial_prompt_messages,
-        )
-        from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
-
-        completions = record.completions
-        n = len(completions)
-        assert n > 0, "PromptGroupRecord has no completions"
-
-        message_logs = [c.message_log for c in completions]
-        prompt_token_count = sum(len(m["token_ids"]) for m in record.prompt)
-        prompt_lengths = torch.full((n,), prompt_token_count, dtype=torch.long)
-
-        pad_id = int(getattr(self._tokenizer, "pad_token_id", 0) or 0)
-        pad_kwargs = {"pad_value_dict": {"token_ids": pad_id}}
-
-        prompt_message_logs = extract_initial_prompt_messages(
-            message_logs, prompt_lengths
-        )
-        prompt_flat, _ = batched_message_log_to_flat_message(
-            prompt_message_logs,
-            **pad_kwargs,  # type: ignore
-        )
-
-        add_grpo_token_loss_masks_and_generation_logprobs(message_logs)
-        flat, input_lengths = batched_message_log_to_flat_message(
-            message_logs,  # type: ignore
-            **pad_kwargs,  # type: ignore
-        )
-
-        total_reward = torch.tensor(
-            [float(c.reward) for c in completions], dtype=torch.float32
-        )
-        sample_mask = torch.ones(n, dtype=torch.float32)
-
-        bulk_batch = BatchedDataDict[Any](
-            {
-                "input_ids": flat["token_ids"],
-                "input_lengths": input_lengths,
-                "generation_logprobs": flat["generation_logprobs"],
-                "token_mask": flat["token_loss_mask"],
-                "sample_mask": sample_mask,
-                "prompt_ids_for_adv": prompt_flat["token_ids"],
-                "total_reward": total_reward,
-            }
-        )
-
-        tensor_fields: dict[str, torch.Tensor | np.ndarray] = {
-            k: v
-            for k, v in bulk_batch.items()
-            if isinstance(v, torch.Tensor)
-            or (isinstance(v, np.ndarray) and v.dtype == object)
-        }
-        fields_td = pack_jagged_fields(tensor_fields, lengths=input_lengths)
-
-        group_uuid = str(uuid.uuid4())
-        sample_ids = [f"{group_uuid}_g{i}" for i in range(n)]
-        tags = [{"weight_version": self._weight_version} for _ in range(n)]
-        return sample_ids, fields_td, tags
+        await self._tq_buffer.add(record, weight_version=self._weight_version)
