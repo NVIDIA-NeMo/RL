@@ -554,11 +554,8 @@ class ReplayBuffer(ReplayBufferImpl):
     pass
 
 
-# WIP: DO NOT USE - This class is WIP and may be changed without notice, please DO NOT USE it.
 class TQReplayBuffer:
     """Plain (non-Ray) replay buffer holding prompt-group meta + a TQ proxy.
-
-    -- WIP: DO NOT USE --
 
     Lives in the SingleController process. Each entry corresponds to one
     prompt group (one ``RolloutManager.generate_and_push`` writes one
