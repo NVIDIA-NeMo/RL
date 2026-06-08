@@ -194,8 +194,6 @@ tests/test_suites/llm/dpo-nanov3-30B3AB-1n8g-fsdp8ep8-automodel.sh
 # Short megatron
 tests/test_suites/llm/dpo-llama3.1-8b-instruct-4n8g-megatrontp2pp2-quick.sh
 
-# PP DPO
-# tests/test_suites/llm/dpo-llama3.1-8b-tulu3-1n8g-pp2.sh
 
 # Long dtensor
 tests/test_suites/llm/dpo-mistral-nemo-instruct-2407-1n8g-fsdp2tp8-actckpt-long.sh
