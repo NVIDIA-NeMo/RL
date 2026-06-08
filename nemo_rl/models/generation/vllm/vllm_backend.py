@@ -647,43 +647,155 @@ class VllmInternalWorkerExtension:
                 f"({sum(b.numel() * b.element_size() for b in buffers.values()) / 1e9:.2f} GB)"
             )
 
-        # Bulk RDMA pull — same primitive as the DTensor path.
-        chosen = next(
+        # Choose between matched-TP fast path and mixed-TP per-source path.
+        # Matched-TP requires the source's TP-world to equal the receiver's
+        # TP-world AND there to exist a source at our tp_rank. Otherwise
+        # fall through to the multi-source path.
+        matched = next(
             (c for c in candidates
              if c.megatron_meta is not None
              and c.megatron_meta.tp_rank == ctx.target_tp_layout.tp_rank),
             None,
         )
-        if chosen is None:
-            print(
-                f"[mx-megatron] no matched-TP source for tp_rank="
-                f"{ctx.target_tp_layout.tp_rank}; v1 mixed-TP NIXL "
-                f"plumbing not yet wired"
-            )
-            return False
-
-        for _name, _t in self._mx_receiver.receive_from(
-            chosen, timeout_seconds=mx_config.timeout_seconds,
-        ):
-            pass  # buffers filled in-place via NIXL
-
-        # Now walk the plans and translate each filled buffer.
-        # pre_assembled_buffers tells run_refit_cycle to use the
-        # pre-filled tensors instead of allocating new dest + calling
-        # the per-source pull callback.
-        def _noop_pull(src, dest):
-            pass  # buffer already filled by receive_from above (pre-pull path)
+        any_megatron_tp_size = next(
+            (c.megatron_meta.tp_size for c in candidates
+             if c.megatron_meta is not None and c.megatron_meta.tp_size > 0),
+            None,
+        )
+        target_tp_size = ctx.target_tp_layout.tp_size
+        is_matched_tp = (
+            matched is not None
+            and (any_megatron_tp_size is None or any_megatron_tp_size == target_tp_size)
+        )
 
         weights: list[tuple[str, "torch.Tensor"]] = []
-        for hf_name, hf_tensor in run_refit_cycle(
-            self._mx_receiver,
-            candidates=candidates,
-            context=ctx,
-            pull=_noop_pull,
-            device=self.device,
-            pre_assembled_buffers=self._mx_megatron_buffers,
-        ):
-            weights.append((hf_name, hf_tensor))
+
+        if is_matched_tp:
+            # Bulk RDMA pull — single source, one wire transfer.
+            for _name, _t in self._mx_receiver.receive_from(
+                matched, timeout_seconds=mx_config.timeout_seconds,
+            ):
+                pass  # buffers filled in-place via NIXL
+
+            # pre_assembled_buffers tells run_refit_cycle to use the
+            # pre-filled tensors instead of calling the per-source pull
+            # callback.
+            def _noop_pull(src, dest):
+                pass
+
+            for hf_name, hf_tensor in run_refit_cycle(
+                self._mx_receiver,
+                candidates=candidates,
+                context=ctx,
+                pull=_noop_pull,
+                device=self.device,
+                pre_assembled_buffers=self._mx_megatron_buffers,
+            ):
+                weights.append((hf_name, hf_tensor))
+        else:
+            # Mixed-TP (target_tp != source_tp) or per-expert: pull each
+            # candidate's full tensor set into scratch, then satisfy
+            # per-source slice requests by copying from scratch into the
+            # planner-provided dest view.
+            #
+            # Bandwidth: O(sum(source_bytes)). For target-wider this is
+            # the minimum needed. For target-narrower we over-pull (each
+            # receiver pulls the full source then slices on the host
+            # side), but correctness-correct and ~2× the matched-TP wire
+            # cost in the worst case. A v1 sliced-pull primitive would
+            # cut over-pull by 2× for narrow-target cases.
+            megatron_cands = [c for c in candidates if c.megatron_meta is not None]
+            print(
+                f"[mx-megatron] mixed-TP path: target_tp={target_tp_size} "
+                f"source_tp={any_megatron_tp_size or '?'} "
+                f"candidates={len(megatron_cands)}"
+            )
+            # Pull each source's full manifest into a scratch dict.
+            # Bandwidth: O(sum(source_bytes)). For target-wider (vLLM TP >
+            # source TP) this is the minimum needed. For target-narrower
+            # we over-pull (each receiver pulls the full source then
+            # slices). Correctness-correct; a v1 sliced-pull primitive
+            # would reduce target-narrower bandwidth by 2×.
+            scratch: dict[str, dict[str, "torch.Tensor"]] = {}
+            for cand in megatron_cands:
+                buf_dict: dict[str, "torch.Tensor"] = {}
+                for name, t in self._mx_receiver._receiver.receive_weights_scratch(
+                    cand.ref, timeout_seconds=mx_config.timeout_seconds,
+                ):
+                    buf_dict[name] = t
+                scratch[cand.ref.mx_source_id] = buf_dict
+            total_bytes = sum(
+                t.numel() * t.element_size()
+                for d in scratch.values() for t in d.values()
+            )
+            print(
+                f"[mx-megatron] pulled {sum(len(d) for d in scratch.values())} "
+                f"tensors across {len(scratch)} sources ({total_bytes / 1e9:.2f} GB)"
+            )
+
+            # Build slice plans for every spec in one shot, then translate
+            # per plan with a name-aware pull callback. Inlines the same
+            # logic as run_refit_cycle but lets the closure capture the
+            # plan's tensor_name.
+            from modelexpress.megatron_translator import (
+                assemble_into_destination,
+                translate_megatron_to_hf,
+            )
+            from modelexpress.nemo_rl_v2 import MegatronTensorSpec
+
+            target_specs: dict[str, MegatronTensorSpec] = {
+                m_name: MegatronTensorSpec(
+                    role=rs.role,
+                    target_shape=rs.target_shape,
+                    target_dtype=rs.target_dtype,
+                    shard_axis=rs.shard_axis,
+                    pp_rank=rs.pp_rank,
+                    role_descriptor=dict(rs.role_descriptor or {}),
+                )
+                for m_name, rs in ctx.receive_specs.items()
+            }
+            plans = self._mx_receiver.pick_megatron_slice_plans(
+                megatron_cands,
+                target_tp_layout=ctx.target_tp_layout,
+                target_tensor_specs=target_specs,
+            )
+            for plan in plans:
+                if not plan.sources:
+                    continue
+                rs = ctx.receive_specs[plan.tensor_name]
+                # Capture plan.tensor_name + plan.assembly in the closure.
+                def _pull_factory(name=plan.tensor_name, assembly=plan.assembly):
+                    def _pull(src, dest):
+                        full = scratch.get(src.mx_source_id, {}).get(name)
+                        if full is None:
+                            raise RuntimeError(
+                                f"mixed-TP: scratch missing {name!r} from "
+                                f"source {src.mx_source_id}"
+                            )
+                        axis = 1 if assembly == "concat_dim1" else 0
+                        if src.source_subslice is not None:
+                            slo, shi = src.source_subslice
+                            slice_src = full.narrow(axis, slo, shi - slo)
+                        else:
+                            slice_src = full
+                        if slice_src.shape != dest.shape:
+                            raise RuntimeError(
+                                f"mixed-TP shape mismatch on {name}: "
+                                f"src={tuple(slice_src.shape)} "
+                                f"dest={tuple(dest.shape)} "
+                                f"axis={axis} subslice={src.source_subslice}"
+                            )
+                        dest.copy_(slice_src, non_blocking=True)
+                    return _pull
+                assembled = assemble_into_destination(
+                    plan, pull=_pull_factory(), device=self.device,
+                )
+                for hf_name, hf_tensor in translate_megatron_to_hf(
+                    plan, assembled,
+                    transformer_config=ctx.transformer_config,
+                    hf_names=list(rs.hf_names),
+                ):
+                    weights.append((hf_name, hf_tensor))
 
         if not weights:
             print(f"[mx-megatron] cycle yielded 0 tensors; refit aborted")
