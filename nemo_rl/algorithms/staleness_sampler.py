@@ -12,166 +12,96 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Prompt-group batch selection strategies for SingleController metadata."""
+"""Prompt-group selection over a TQReplayBuffer.
+
+The sampler is pure filter logic: it reads ``meta_list`` / ``weight_list``
+on the buffer it was constructed with and drives :meth:`TQReplayBuffer.remove`
+when groups fall outside the staleness window. It never touches the data
+plane directly.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING
 
 from nemo_rl.data_plane import KVBatchMeta
 
-
-@dataclass(frozen=True)
-class PromptGroup:
-    """Indices and scheduling metadata for one prompt group."""
-
-    group_id: str
-    indices: list[int]
-    weight_version: int | None
-    committed: bool
-    expected_num_samples: int
-
-    @property
-    def is_complete(self) -> bool:
-        return len(self.indices) == self.expected_num_samples
+if TYPE_CHECKING:
+    from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 
 
 class StalenessSampler:
-    """Select complete prompt groups inside a version staleness window."""
+    """Pick complete prompt groups inside a version staleness window."""
 
-    def __init__(self, max_staleness_versions: int):
-        self.max_staleness_versions = max_staleness_versions
-
-    def select_indices(
+    def __init__(
         self,
-        meta: KVBatchMeta,
+        buffer: "TQReplayBuffer",
+        max_staleness_versions: int,
+        sample_freshest_first: bool = True,
+    ) -> None:
+        if max_staleness_versions < 0:
+            raise ValueError(
+                f"max_staleness_versions must be non-negative, got "
+                f"{max_staleness_versions}"
+            )
+        self._buffer = buffer
+        self.max_staleness_versions = max_staleness_versions
+        self.sample_freshest_first = sample_freshest_first
+
+    def select(
+        self,
         *,
-        trainer_version: int,
+        current_train_weight: int,
         min_prompt_groups: int,
-        generations_per_prompt: int,
-    ) -> Optional[list[int]]:
-        eligible: list[tuple[int, int, PromptGroup]] = []
-        for group in _prompt_groups(meta, generations_per_prompt):
-            if not group.committed or not group.is_complete:
+    ) -> KVBatchMeta | None:
+        """Return a concat of the first ``min_prompt_groups`` eligible groups.
+
+        Eligible = lag in ``[0, max_staleness_versions]``. Order is
+        freshest-first (smallest lag, ties broken by insertion order)
+        when ``sample_freshest_first`` is set, else strict insertion-order
+        FIFO. Returns ``None`` if fewer than ``min_prompt_groups`` groups
+        are eligible.
+        """
+        if min_prompt_groups < 1:
+            raise ValueError(
+                f"min_prompt_groups must be >= 1, got {min_prompt_groups}"
+            )
+
+        eligible: list[tuple[int, int, KVBatchMeta]] = []
+        for idx, (meta, weight) in enumerate(
+            zip(self._buffer.meta_list, self._buffer.weight_list)
+        ):
+            lag = current_train_weight - weight
+            if lag < 0 or lag > self.max_staleness_versions:
                 continue
-            if group.weight_version is None or group.weight_version > trainer_version:
-                continue
-            lag = trainer_version - group.weight_version
-            if lag > self.max_staleness_versions:
-                continue
-            eligible.append((lag, group.indices[0], group))
+            eligible.append((lag, idx, meta))
 
         if len(eligible) < min_prompt_groups:
             return None
 
-        eligible.sort(key=lambda item: (item[0], item[1]))
-        groups = [item[2] for item in eligible[:min_prompt_groups]]
-        return _flatten_group_indices(groups)
+        if self.sample_freshest_first:
+            eligible.sort(key=lambda item: (item[0], item[1]))
+        else:
+            eligible.sort(key=lambda item: item[1])
 
-    def evictable_indices(
-        self,
-        meta: KVBatchMeta,
-        *,
-        trainer_version: int,
-        generations_per_prompt: int,
-    ) -> list[int]:
-        groups = []
-        for group in _prompt_groups(meta, generations_per_prompt):
-            if group.weight_version is None or not group.is_complete:
-                continue
-            lag = trainer_version - group.weight_version
+        chosen = [meta for _, _, meta in eligible[:min_prompt_groups]]
+        return chosen[0].concat(*chosen[1:])
+
+    async def evict(self, *, current_train_weight: int) -> int:
+        """Drop groups whose lag exceeds the staleness window.
+
+        Future entries (``lag < 0``) are left alone — they can't be
+        produced under normal flow and the safer behavior is to surface
+        them later rather than silently delete.
+
+        Returns:
+            Number of group entries removed from the buffer.
+        """
+        stale_sample_ids: list[str] = []
+        for meta, weight in zip(self._buffer.meta_list, self._buffer.weight_list):
+            lag = current_train_weight - weight
             if lag > self.max_staleness_versions:
-                groups.append(group)
-        return _flatten_group_indices(groups)
-
-
-def count_prompt_groups(
-    meta: KVBatchMeta,
-    *,
-    generations_per_prompt: int,
-) -> int:
-    """Count complete prompt groups represented by ``meta``."""
-    return sum(
-        1 for group in _prompt_groups(meta, generations_per_prompt) if group.is_complete
-    )
-
-
-def min_weight_version(meta: KVBatchMeta) -> int | None:
-    """Smallest ``weight_version`` across per-sample tags, or None if absent."""
-    versions = [
-        v for v in (_weight_version(tag) for tag in meta.tags or []) if v is not None
-    ]
-    return min(versions) if versions else None
-
-
-def _prompt_groups(
-    meta: KVBatchMeta,
-    generations_per_prompt: int,
-) -> list[PromptGroup]:
-    tags = meta.tags or [{} for _ in meta.sample_ids]
-    grouped: dict[str, list[int]] = {}
-    first_tag: dict[str, dict] = {}
-
-    for idx, sample_id in enumerate(meta.sample_ids):
-        tag = tags[idx] if idx < len(tags) else {}
-        group_id = str(tag.get("group_id") or _group_id_from_sample_id(sample_id))
-        grouped.setdefault(group_id, []).append(idx)
-        first_tag.setdefault(group_id, tag)
-
-    groups: list[PromptGroup] = []
-    for group_id, indices in grouped.items():
-        tag = first_tag[group_id]
-        expected = _as_int(
-            tag.get(
-                "expected_num_samples",
-                tag.get(
-                    "expected_num_keys",
-                    tag.get("generations_per_prompt", generations_per_prompt),
-                ),
-            )
-        )
-        groups.append(
-            PromptGroup(
-                group_id=group_id,
-                indices=indices,
-                weight_version=_weight_version(tag),
-                committed=_as_bool(tag.get("committed", True)),
-                expected_num_samples=expected or generations_per_prompt,
-            )
-        )
-    groups.sort(key=lambda group: group.indices[0])
-    return groups
-
-
-def _flatten_group_indices(groups: list[PromptGroup]) -> list[int]:
-    return [idx for group in groups for idx in group.indices]
-
-
-def _group_id_from_sample_id(sample_id: str) -> str:
-    prefix, sep, suffix = sample_id.rpartition("_g")
-    if sep and suffix.isdigit():
-        return prefix
-    return sample_id
-
-
-def _weight_version(tag: dict) -> int | None:
-    value = tag.get("weight_version", tag.get("version"))
-    return _as_int(value)
-
-
-def _as_int(value) -> int | None:
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _as_bool(value) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.lower() in {"1", "true", "yes"}
-    return bool(value)
+                stale_sample_ids.extend(meta.sample_ids)
+        if not stale_sample_ids:
+            return 0
+        return await self._buffer.remove(stale_sample_ids)

@@ -251,12 +251,6 @@ class TQReplayBuffer:
     round-trip in :meth:`add` / :meth:`remove` before the local state
     mutation, so the TQ state is the source of truth when an ``await``
     suspends the coroutine.
-
-    Note: :meth:`sample` / :meth:`_evict` below are legacy methods kept
-    only as Phase 2 reference for the StalenessSampler rewrite; they
-    reference the pre-TQ buffer state (``self.trajectories`` etc.) that
-    this class no longer maintains, so they are inert and will be deleted
-    once the sampler rewrite lands.
     """
 
     def __init__(self, dp_client: Any, partition_id: str):
@@ -369,59 +363,3 @@ class TQReplayBuffer:
         if asyncio.iscoroutine(result):
             return await result
         return result
-
-    # ── legacy sample/_evict (Phase 2 reference; to be deleted) ────────────
-
-    def _evict(self, current_weight_version: int) -> None:
-        """Legacy: evict rows where trainer_version - weight_version > max_staleness.
-
-        Inert under the new TQ-backed state; kept as Phase 2 reference.
-        """
-        min_valid = current_weight_version - self.max_staleness
-        stale = [i for i, v in enumerate(self.trajectory_versions) if v < min_valid]
-        self._remove_indices(stale)
-
-    def sample(
-        self,
-        num_prompt_groups: int,
-        current_weight_version: int,
-        max_age_steps: int,
-    ) -> Optional[dict[str, Any]]:
-        """Legacy freshest-first sample. Kept as Phase 2 reference only.
-
-        Inert under the new TQ-backed state.
-        """
-        with self._lock:
-            self._evict(current_weight_version)
-
-            if not self.trajectories:
-                return None
-
-            all_indices = range(len(self.trajectory_versions))
-            if self.sample_freshest_first:
-                all_indices = sorted(
-                    all_indices,
-                    key=lambda i: self.trajectory_versions[i],
-                    reverse=True,
-                )
-
-            if len(all_indices) < num_prompt_groups:
-                print(
-                    f"Insufficient trajectories: have {len(all_indices)}, "
-                    f"need {num_prompt_groups}. Waiting."
-                )
-                return None
-
-            selected = all_indices[:num_prompt_groups]
-            sampled_weights = [self.trajectory_versions[i] for i in selected]
-            avg_trajectory_age = current_weight_version - sum(sampled_weights) / len(
-                sampled_weights
-            )
-
-            sampled_items = [self.trajectories[i] for i in selected]
-            self._remove_indices(selected)
-
-            return {
-                "trajectories": sampled_items,
-                "avg_trajectory_age": avg_trajectory_age,
-            }
