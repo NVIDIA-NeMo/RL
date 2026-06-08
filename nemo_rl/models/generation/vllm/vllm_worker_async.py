@@ -1284,7 +1284,10 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
     async def prepare_refit_info_async(self, state_dict_info: dict[str, Any]) -> None:
         """Async version of prepare_refit_info."""
-        await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
+        await self.llm.collective_rpc(
+            "prepare_refit_info",
+            args=(state_dict_info, self._get_delta_load_batch_size_bytes()),
+        )
 
     async def update_weights_via_ipc_zmq_async(
         self,

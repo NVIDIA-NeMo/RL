@@ -77,7 +77,10 @@ from nemo_rl.models.policy.workers.patches import (
 )
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
-from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+from nemo_rl.utils.weight_transfer import packed_weight_transfer_producer
+from nemo_rl.utils.weight_transfer_delta_tracker import (
+    create_vllm_delta_transfer_tracker,
+)
 
 
 def dtensor_params_generator(
@@ -351,6 +354,9 @@ class DTensorPolicyWorkerV2Impl(
             self.sampling_params,
             _runtime_is_reward_model,  # Duplicate, already set as _is_reward_model
         ) = runtime_config
+        self.delta_weight_transfer_tracker = create_vllm_delta_transfer_tracker(
+            self.cfg.get("generation")
+        )
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/train")
     def train(
@@ -1070,6 +1076,11 @@ class DTensorPolicyWorkerV2Impl(
             for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
                 state_dict_info[adapted_fqn] = (adapted_tensor.shape, self.dtype)
 
+        if self.rank == 0 and self.delta_weight_transfer_tracker is not None:
+            self.delta_weight_transfer_tracker.prewarm_baseline_from_metadata(
+                state_dict_info
+            )
+
         return state_dict_info
 
     @torch.no_grad()
@@ -1180,14 +1191,11 @@ class DTensorPolicyWorkerV2Impl(
             )
             self.model = self.move_to_cuda(self.model)
 
-        # param_iterator will return (name, tensor), we only need tensor
-        dtensor_post_iter_func = lambda x: x[1]
-
-        packed_broadcast_producer(
+        packed_weight_transfer_producer(
             iterator=dtensor_params_generator(self.model, self.dtype),
             group=self.model_update_group,
             src=0,
-            post_iter_func=dtensor_post_iter_func,
+            delta_tracker=self.delta_weight_transfer_tracker,
         )
 
         # Manually move model to cpu for cpu offload case

@@ -92,7 +92,10 @@ from nemo_rl.utils.native_checkpoint import (
     save_checkpoint,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
-from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+from nemo_rl.utils.weight_transfer import packed_weight_transfer_producer
+from nemo_rl.utils.weight_transfer_delta_tracker import (
+    create_vllm_delta_transfer_tracker,
+)
 
 
 def _attach_context_parallel_hooks(model: nn.Module) -> None:
@@ -229,6 +232,9 @@ class DTensorPolicyWorkerImpl(
         configure_dynamo_cache()
 
         self.cfg = config
+        self.delta_weight_transfer_tracker = create_vllm_delta_transfer_tracker(
+            self.cfg.get("generation")
+        )
         # torch distributed init. Envars for rank, world_size, and master_addr and master_port are set from the ray remote call
         torch.distributed.init_process_group(backend="nccl")
         self.rank = torch.distributed.get_rank()
@@ -1803,6 +1809,11 @@ class DTensorPolicyWorkerImpl(
             # all tensor will be casted to self.dtype in stream_weights_via_ipc_zmq/broadcast_weights_for_collective
             state_dict_info[name] = (tensor.shape, self.dtype)
 
+        if self.rank == 0 and self.delta_weight_transfer_tracker is not None:
+            self.delta_weight_transfer_tracker.prewarm_baseline_from_metadata(
+                state_dict_info
+            )
+
         return state_dict_info
 
     @torch.no_grad()
@@ -1881,20 +1892,21 @@ class DTensorPolicyWorkerImpl(
             )
             self.model = self.move_to_cuda(self.model)
 
-        def _dtensor_post_iter_func(tensor, dtype):
+        def _prepare_refit_tensor(tensor, dtype):
             if isinstance(tensor, DTensor):
                 tensor = tensor.full_tensor()
             tensor = tensor.to(dtype, non_blocking=True)
             return tensor
 
-        # param_iterator will return (name, tensor), we only need tensor
-        dtensor_post_iter_func = lambda x: _dtensor_post_iter_func(x[1], self.dtype)
+        def _params_iterator():
+            for name, tensor in self.model.state_dict().items():
+                yield name, _prepare_refit_tensor(tensor, self.dtype)
 
-        packed_broadcast_producer(
-            iterator=iter(self.model.state_dict().items()),
+        packed_weight_transfer_producer(
+            iterator=_params_iterator(),
             group=self.model_update_group,
             src=0,
-            post_iter_func=dtensor_post_iter_func,
+            delta_tracker=self.delta_weight_transfer_tracker,
         )
 
         # Manually move model to cpu for cpu offload case
