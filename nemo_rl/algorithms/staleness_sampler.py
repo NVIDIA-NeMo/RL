@@ -31,7 +31,7 @@ class StalenessSampler:
         self,
         buffer: TQReplayBuffer,
         max_staleness_versions: int,
-        sample_freshest_first: bool = True,
+        sample_freshest_first: bool = False,
     ) -> None:
         if max_staleness_versions < 0:
             raise ValueError(
@@ -50,8 +50,7 @@ class StalenessSampler:
     ) -> KVBatchMeta | None:
         """Return a concat of the first ``min_prompt_groups`` eligible groups.
 
-        Eligible = lag in ``[0, max_staleness_versions]``. Order is
-        freshest-first (smallest lag, ties broken by insertion order)
+        Freshest-first (smallest lag, ties broken by insertion order)
         when ``sample_freshest_first`` is set, else strict insertion-order
         FIFO. Returns ``None`` if fewer than ``min_prompt_groups`` groups
         are eligible.
@@ -61,41 +60,54 @@ class StalenessSampler:
                 f"min_prompt_groups must be >= 1, got {min_prompt_groups}"
             )
 
-        eligible: list[tuple[int, int, KVBatchMeta]] = []
-        for idx, (meta, weight) in enumerate(
-            zip(self._buffer.meta_list, self._buffer.weight_list)
-        ):
-            lag = current_train_weight - weight
-            if lag < 0 or lag > self.max_staleness_versions:
-                continue
-            eligible.append((lag, idx, meta))
-
-        if len(eligible) < min_prompt_groups:
+        min_valid_version = max(
+            0, current_train_weight - self.max_staleness_versions
+        )
+        valid_indices = [
+            i
+            for i, weight in enumerate(self._buffer.weight_list)
+            if min_valid_version <= weight <= current_train_weight
+        ]
+        if not valid_indices:
+            return None
+        if len(valid_indices) < min_prompt_groups:
             return None
 
         if self.sample_freshest_first:
-            eligible.sort(key=lambda item: (item[0], item[1]))
-        else:
-            eligible.sort(key=lambda item: item[1])
+            valid_indices.sort(
+                key=lambda i: (
+                    current_train_weight - self._buffer.weight_list[i],
+                    i,
+                )
+            )
 
-        chosen = [meta for _, _, meta in eligible[:min_prompt_groups]]
-        return chosen[0].concat(*chosen[1:])
+        selected = valid_indices[:min_prompt_groups]
+        sampled_metas = [self._buffer.meta_list[i] for i in selected]
+        return sampled_metas[0].concat(*sampled_metas[1:])
 
     async def evict(self, *, current_train_weight: int) -> int:
-        """Drop groups whose lag exceeds the staleness window.
+        """Drop groups whose weight falls below the staleness window.
 
-        Future entries (``lag < 0``) are left alone — they can't be
-        produced under normal flow and the safer behavior is to surface
-        them later rather than silently delete.
+        Future entries (``weight > current_train_weight``) are left alone —
+        they can't be produced under normal flow and the safer behavior
+        is to surface them later rather than silently delete.
 
         Returns:
             Number of group entries removed from the buffer.
         """
-        stale_sample_ids: list[str] = []
-        for meta, weight in zip(self._buffer.meta_list, self._buffer.weight_list):
-            lag = current_train_weight - weight
-            if lag > self.max_staleness_versions:
-                stale_sample_ids.extend(meta.sample_ids)
-        if not stale_sample_ids:
+        min_valid_version = max(
+            0, current_train_weight - self.max_staleness_versions
+        )
+        stale_indices = [
+            i
+            for i, weight in enumerate(self._buffer.weight_list)
+            if weight < min_valid_version
+        ]
+        if not stale_indices:
             return 0
+        stale_sample_ids = [
+            sid
+            for i in stale_indices
+            for sid in self._buffer.meta_list[i].sample_ids
+        ]
         return await self._buffer.remove(stale_sample_ids)
