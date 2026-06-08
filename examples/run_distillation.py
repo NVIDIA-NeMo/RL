@@ -90,6 +90,7 @@ def main() -> None:
         student_policy,
         teacher_policy,
         student_generation,
+        weight_sync,
         dataloader,
         val_dataloader,
         loss_fn,
@@ -105,7 +106,7 @@ def main() -> None:
         student_generation,
         dataloader,
         val_dataloader,
-        tokenizer,  # pass tokenizer parameter
+        tokenizer,
         loss_fn,
         task_to_env,
         val_task_to_env,
@@ -113,6 +114,7 @@ def main() -> None:
         checkpointer,
         distillation_state,
         master_config,
+        weight_sync=weight_sync,
     )
 
 

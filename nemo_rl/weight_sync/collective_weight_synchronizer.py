@@ -102,12 +102,6 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         self._stale = True
 
     def init_communicator(self) -> None:
-        # prepare_refit_info is called before init_collective. This matches
-        # distillation.py ordering. Neither call depends on the other today,
-        # but we document this as the canonical ordering for future reference.
-        state_dict_info = self._policy.prepare_refit_info()
-        self._generation.prepare_refit_info(state_dict_info)
-
         ip, port = self._train_cluster.get_master_address_and_port()
         train_world_size = self._train_cluster.world_size()
         inference_world_size = self._inference_cluster.world_size()
@@ -120,6 +114,9 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
             ip, port, world_size, train_world_size=train_world_size
         )
         ray.get(futures_train + futures_inference)
+
+        state_dict_info = self._policy.prepare_refit_info()
+        self._generation.prepare_refit_info(state_dict_info)
 
     def shutdown(self) -> None:
         # The NCCL process group lifecycle is managed by Ray actor teardown.
