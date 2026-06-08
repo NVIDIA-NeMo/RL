@@ -45,6 +45,8 @@ from tests.unit.experience.test_rollouts import (
 )
 
 _PARTITION_ID = "rollout_data"
+# TQReplayBuffer.add tensorizes each PromptGroupRecord and writes
+# ``generations_per_prompt`` training rows directly to TQ.
 _BULK_FIELDS = [
     "input_ids",
     "input_lengths",
@@ -159,6 +161,7 @@ def test_rollout_pump_writes_expected_tq_data(
 
     num_generations = 2
     max_rollout_prompts = 2
+    # TQReplayBuffer.add writes ``num_generations`` training rows per prompt.
     expected_samples = max_rollout_prompts * num_generations
     max_seq_len = 1024
     max_rollout_turns = input_sample["extra_env_info"]["max_steps"] + 1
@@ -224,7 +227,7 @@ def test_rollout_pump_writes_expected_tq_data(
         tq_actor.claim_meta.remote(
             partition_id=_PARTITION_ID,
             task_name="train",
-            required_fields=["input_ids"],
+            required_fields=_BULK_FIELDS,
             batch_size=expected_samples * 4,
             blocking=False,
             timeout_s=0.0,
@@ -232,42 +235,44 @@ def test_rollout_pump_writes_expected_tq_data(
     )
     assert meta.size == expected_samples
 
+    # pack_payload stamps sample_ids as ``{group_uuid}_g{i}``.
     group_ids: set[str] = set()
     for sid in meta.sample_ids:
-        prefix, sep, suffix = sid.rpartition("_g")
-        assert sep == "_g" and suffix.isdigit(), f"unexpected sample_id: {sid}"
-        group_ids.add(prefix)
+        head, _, tail = sid.rpartition("_g")
+        assert head and tail.isdigit(), f"unexpected sample_id: {sid}"
+        group_ids.add(head)
     assert len(group_ids) == max_rollout_prompts
 
-    data = ray.get(
+    bulk = ray.get(
         tq_actor.get_samples.remote(
             sample_ids=meta.sample_ids,
             partition_id=_PARTITION_ID,
             select_fields=_BULK_FIELDS,
         )
     )
-    assert set(data.keys()) == set(_BULK_FIELDS), (
-        f"unexpected fields: {set(data.keys())}"
+    assert set(bulk.keys()) >= set(_BULK_FIELDS), (
+        f"missing bulk fields: {set(_BULK_FIELDS) - set(bulk.keys())}"
     )
-    assert data["input_lengths"].shape[0] == expected_samples
-    assert torch.all(data["input_lengths"] > 0)
+
+    input_lengths = bulk["input_lengths"].long()
+    assert input_lengths.shape[0] == expected_samples
+    assert torch.all(input_lengths > 0)
     assert torch.allclose(
-        data["sample_mask"].float(),
+        bulk["sample_mask"].float(),
         torch.ones(expected_samples, dtype=torch.float32),
     )
 
     # Same deterministic prompt as test_async_rollout_manager: the model
     # solves the calculator task every time -> reward == 1.0 and decoded
     # tail contains " 16".
-    rewards = data["total_reward"].float().flatten()
+    rewards = bulk["total_reward"].float().flatten()
     assert rewards.shape == (expected_samples,)
     assert torch.allclose(rewards, torch.ones(expected_samples)), (
         f"expected all rewards == 1.0, got {rewards.tolist()}"
     )
 
-    input_ids = data["input_ids"]
-    input_lengths = data["input_lengths"].tolist()
-    token_mask = data["token_mask"]
+    input_ids = bulk["input_ids"]
+    token_mask = bulk["token_mask"]
     for i in range(expected_samples):
         length = int(input_lengths[i])
         decoded = tokenizer.decode(

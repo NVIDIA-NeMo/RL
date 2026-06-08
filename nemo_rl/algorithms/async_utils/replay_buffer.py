@@ -15,13 +15,15 @@
 import asyncio
 import threading as _threading
 from collections import Counter
+from collections.abc import Mapping
 from typing import Any, Iterable, Optional
 
 import ray
-from tensordict import TensorDict
 
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.experience.interfaces import PromptGroupRecord
+from nemo_rl.experience.payload import pack_payload, record_to_train_batch
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
@@ -555,61 +557,58 @@ class ReplayBuffer(ReplayBufferImpl):
 
 
 class TQReplayBuffer:
-    """Plain (non-Ray) replay buffer holding prompt-group meta + a TQ proxy.
+    """Meta cache + TQ writer for prompt-group records.
 
-    Lives in the SingleController process. Each entry corresponds to one
-    prompt group (one ``RolloutManager.generate_and_push`` writes one
-    entry). Tensor payloads are stored in TransferQueue (TQ) via the
-    :class:`DataPlaneClient`; only per-group :class:`KVBatchMeta` and the
-    generating ``weight_version`` are cached here for selection by
-    :class:`StalenessSampler`.
+    At rollout time, :meth:`add` tensorizes a :class:`PromptGroupRecord`
+    via :func:`record_to_train_batch` and writes the resulting N rows
+    (``N = generations_per_prompt``) to TQ as one group; ``meta_list`` /
+    ``weight_list`` keep one entry per prompt group, so the sampler's
+    selected meta is directly trainable without a second TQ round-trip.
 
-    Concurrency: single asyncio loop in the SC process; list appends and
-    pops are not protected by a lock — callers must ``await`` the TQ
-    round-trip in :meth:`add` / :meth:`remove` before the local state
-    mutation, so the TQ state is the source of truth when an ``await``
-    suspends the coroutine.
+    Single asyncio loop in SC; :meth:`add` / :meth:`remove` ``await`` the
+    TQ round-trip before mutating local lists, so TQ is the source of
+    truth across suspensions (no lock needed).
     """
 
-    def __init__(self, dp_client: Any, partition_id: str):
+    def __init__(
+        self,
+        dp_client: Any,
+        partition_id: str,
+        *,
+        pad_value_dict: Mapping[str, int],
+    ):
         self._dp_client = dp_client
         self._partition_id = partition_id
+        self._pad_value_dict = dict(pad_value_dict)
         self.meta_list: list[KVBatchMeta] = []
         self.weight_list: list[int] = []
 
     async def add(
         self,
-        sample_ids: list[str],
-        fields: TensorDict | None,
-        tags: list[dict[str, Any]] | None,
+        record: PromptGroupRecord,
+        *,
         weight_version: int,
     ) -> KVBatchMeta:
-        """Write one prompt group to TQ and append its meta locally.
+        """Tensorize ``record`` and write its N rows to TQ as one group.
 
-        The TQ ``put_samples`` must complete before the local lists are
-        mutated; otherwise the local view would lead the data plane and a
-        concurrent sampler could hand out meta for samples TQ has not yet
-        accepted.
-
-        Args:
-            sample_ids: Per-sample uids for this prompt group.
-            fields: Tensor / NonTensorStack leaves to write into TQ.
-            tags: Per-sample primitive metadata stamped on TQ.
-            weight_version: Trainer weight version this group was
-                generated under. Must be an ``int``; the legacy ``None``
-                path is intentionally not supported.
-
-        Returns:
-            ``KVBatchMeta`` covering ``sample_ids``.
+        ``put_samples`` must finish before list mutation — otherwise a
+        concurrent sampler could see meta for rows TQ has not yet
+        accepted. ``weight_version`` must be ``int``.
         """
         if not isinstance(weight_version, int) or isinstance(weight_version, bool):
             raise TypeError(
                 f"TQReplayBuffer.add: weight_version must be int, got "
                 f"{type(weight_version).__name__}"
             )
+        bulk_batch = record_to_train_batch(
+            record, pad_value_dict=self._pad_value_dict
+        )
+        sample_ids, fields, tags = pack_payload(
+            bulk_batch, weight_version=weight_version
+        )
         meta = await self._call_dp(
             "put_samples",
-            sample_ids=list(sample_ids),
+            sample_ids=sample_ids,
             partition_id=self._partition_id,
             fields=fields,
             tags=tags,
@@ -619,22 +618,11 @@ class TQReplayBuffer:
         return meta
 
     async def remove(self, sample_ids: list[str]) -> int:
-        """Drop entries whose sample_ids are fully covered by the input.
+        """Drop entries whose ``sample_ids`` are fully covered by the input.
 
-        Removal is entry-level: an entry is dropped iff every one of its
-        ``sample_ids`` appears in the input. Callers that only know
-        partial-group ``sample_ids`` (a logic bug under the entry-as-group
-        contract) cause a ``ValueError`` so the mismatch surfaces early.
-
-        Order: TQ ``clear_samples`` runs first; local lists are mutated
-        only after the data plane has acknowledged the drop.
-
-        Args:
-            sample_ids: Uids to clear; must align with whole-entry
-                boundaries.
-
-        Returns:
-            Number of group entries dropped.
+        Entry-level removal: a partial-group input is a contract bug
+        (entry-as-group invariant) and raises ``ValueError``. TQ
+        ``clear_samples`` runs before local list mutation.
         """
         ids_set = set(sample_ids)
         keep_meta: list[KVBatchMeta] = []
@@ -665,7 +653,6 @@ class TQReplayBuffer:
         return n_removed
 
     def size(self) -> int:
-        """Number of group entries currently held."""
         return len(self.meta_list)
 
     def __len__(self) -> int:
