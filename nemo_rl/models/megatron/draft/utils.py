@@ -25,7 +25,7 @@ import torch.distributed as dist
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule, TransformerConfig
-from megatron.training.utils import unwrap_model
+from megatron.core.utils import unwrap_model
 from torch import Tensor
 
 StateDict = dict[str, Tensor]
