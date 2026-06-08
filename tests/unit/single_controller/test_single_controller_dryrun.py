@@ -47,6 +47,7 @@ os.makedirs(_RAY_TEMP, exist_ok=True)
 os.environ["RAY_TEMP_DIR"] = _RAY_TEMP
 os.environ["RAY_TMPDIR"] = _RAY_TEMP
 
+from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms.single_controller import (
     SingleControllerActor,
     SingleControllerConfig,
@@ -187,64 +188,50 @@ class FakeDataPlaneActor:
 class DryRunGenWorker:
     """Stub GenerationWorkerActor.
 
-    Implements the same interface as production GenWorker:
-      generate_and_push(prompt, dp_client) → pushes fake record to DataPlane
-
-    Uses asyncio.sleep to simulate generation latency without blocking
-    the event loop.
+    Implements the new RolloutManager-driven shape: ``generate(prompt)``
+    simulates a rollout and returns the payload tuple that
+    :class:`DryRunRolloutManager` hands to :meth:`TQReplayBuffer.add`.
+    Uses ``asyncio.sleep`` so the test event loop stays responsive.
     """
 
-    def __init__(self, gen_latency_s: float = 0.1, weight_version: int = 0):
+    def __init__(self, gen_latency_s: float = 0.1):
         self._gen_latency_s = gen_latency_s
-        self._weight_version = weight_version
         self._call_count = 0
         self._call_timestamps: list[float] = []
 
-    async def generate_and_push(self, prompt: str, dp_client: Any) -> None:
-        """Simulate generation + push directly to DataPlane."""
+    async def generate(
+        self, prompt: str
+    ) -> tuple[list[str], TensorDict, list[dict[str, Any]]]:
+        """Simulate one prompt's rollout and return ``(sample_ids, fields, tags)``."""
         self._call_count += 1
-        call_idx = self._call_count
         self._call_timestamps.append(time.monotonic())
         await asyncio.sleep(self._gen_latency_s)
-        group_id = f"group-{call_idx:04d}"
-        sample_id = f"{group_id}_g0"
-        await dp_client.put_samples.remote(
-            sample_ids=[sample_id],
-            partition_id="rollout_data",
-            fields=TensorDict(
-                {
-                    "input_ids": torch.ones((1, 3), dtype=torch.long),
-                    "prompt_ids_for_adv": torch.tensor(
-                        [[self._call_count]],
-                        dtype=torch.long,
-                    ),
-                    "total_reward": torch.tensor(
-                        [float(self._call_count)],
-                        dtype=torch.float32,
-                    ),
-                    "token_mask": torch.ones((1, 3), dtype=torch.float32),
-                    "sample_mask": torch.ones(1, dtype=torch.float32),
-                },
-                batch_size=[1],
-            ),
-            tags=[
-                {
-                    "group_id": group_id,
-                    "weight_version": self._weight_version,
-                    "committed": True,
-                    "expected_num_samples": 1,
-                }
-            ],
+        group_id = f"group-{self._call_count:04d}"
+        sample_ids = [f"{group_id}_g0"]
+        fields = TensorDict(
+            {
+                "input_ids": torch.ones((1, 3), dtype=torch.long),
+                "prompt_ids_for_adv": torch.tensor(
+                    [[self._call_count]], dtype=torch.long
+                ),
+                "total_reward": torch.tensor(
+                    [float(self._call_count)], dtype=torch.float32
+                ),
+                "token_mask": torch.ones((1, 3), dtype=torch.float32),
+                "sample_mask": torch.ones(1, dtype=torch.float32),
+            },
+            batch_size=[1],
         )
+        # Producer never stamps weight_version directly — the manager does
+        # so via ``buffer.add(weight_version=…)`` when it writes.
+        tags = [{}]
+        return sample_ids, fields, tags
 
     def get_call_count(self) -> int:
         return self._call_count
 
     def get_call_timestamps(self) -> list[float]:
         return list(self._call_timestamps)
-
-    def set_weight_version(self, version: int) -> None:
-        self._weight_version = version
 
 
 @ray.remote(num_cpus=0)
@@ -415,30 +402,45 @@ class DryRunRolloutManager:
     """Dry-run mock of ``RolloutManager`` for SC dry-run tests.
 
     Production ``RolloutManager`` is a plain (non-Ray) class living in the
-    SC actor's process; this mock matches that shape. Actual work (sleep +
-    push a fake sample to DataPlane + bump call counters) is delegated to a
-    ``DryRunGenWorker`` Ray actor so the test can inspect call counts,
-    timestamps, and weight_version from outside the SC actor.
+    SC actor's process and writes via ``TQReplayBuffer.add``; this mock
+    matches that shape. Generation is delegated to a ``DryRunGenWorker``
+    Ray actor so the test can inspect call counts and timestamps from
+    outside the SC actor.
     """
 
-    def __init__(self, gen_actor: Any, dp_client: Any) -> None:
+    def __init__(self, gen_actor: Any, tq_buffer: TQReplayBuffer) -> None:
         self._gen_actor = gen_actor
-        self._dp_client = dp_client
+        self._tq_buffer = tq_buffer
+        self._weight_version: int = 0
+
+    def set_weight_version(self, version: int) -> None:
+        self._weight_version = int(version)
 
     async def generate_and_push(self, prompt: str) -> None:
-        await self._gen_actor.generate_and_push.remote(prompt, self._dp_client)
+        sample_ids, fields, tags = await self._gen_actor.generate.remote(prompt)
+        await self._tq_buffer.add(
+            sample_ids=sample_ids,
+            fields=fields,
+            tags=tags,
+            weight_version=self._weight_version,
+        )
 
 
 class DryRunWeightSynchronizer:
-    """Stub WeightSynchronizer — just sleeps.
+    """Stub WeightSynchronizer — bumps the rollout manager's weight_version.
 
-    In production this would call WeightSynchronizer.sync_weights() which
-    dispatches to IPC/HTTP/NCCL based on deployment config.
+    In production this would call ``WeightSynchronizer.sync_weights()``
+    which dispatches to IPC/HTTP/NCCL based on deployment config and SC
+    then mirrors ``trainer_version`` onto the rollout manager.
     """
 
-    def __init__(self, sync_latency_s: float = 0.05, gen_handle: Any = None):
+    def __init__(
+        self,
+        sync_latency_s: float = 0.05,
+        rollout_manager: Any = None,
+    ):
         self._sync_latency_s = sync_latency_s
-        self._gen_handle = gen_handle
+        self._rollout_manager = rollout_manager
         self._sync_count = 0
         self._sync_timestamps: list[float] = []
 
@@ -446,8 +448,8 @@ class DryRunWeightSynchronizer:
         self._sync_count += 1
         self._sync_timestamps.append(time.monotonic())
         await asyncio.sleep(self._sync_latency_s)
-        if self._gen_handle is not None:
-            await self._gen_handle.set_weight_version.remote(trainer_version)
+        if self._rollout_manager is not None:
+            self._rollout_manager.set_weight_version(trainer_version)
 
 
 # ── pytest fixtures ───────────────────────────────────────────────────────
@@ -541,9 +543,10 @@ class TestSingleControllerDryRun:
         # (`for prompt in self._dataloader`), so a list satisfies the contract.
         dataloader = [f"prompt_{i}" for i in range(10)]
 
+        tq_buffer = TQReplayBuffer(dp_client, partition_id=cfg.partition_id)
+        rollout_manager = DryRunRolloutManager(gen, tq_buffer)
         if weight_sync is None:
-            weight_sync = DryRunWeightSynchronizer(gen_handle=gen)
-        rollout_manager = DryRunRolloutManager(gen, dp_client)
+            weight_sync = DryRunWeightSynchronizer(rollout_manager=rollout_manager)
 
         return SingleControllerActor.remote(
             cfg=cfg,
@@ -555,6 +558,7 @@ class TestSingleControllerDryRun:
             weight_synchronizer=weight_sync,
             advantage_estimator=advantage_estimator,
             rollout_manager=rollout_manager,
+            tq_buffer=tq_buffer,
         )
 
     def test_dry_run_completes(self, ray_init):
@@ -562,13 +566,11 @@ class TestSingleControllerDryRun:
         dp_client = FakeDataPlaneActor.remote()
         gen = DryRunGenWorker.remote(gen_latency_s=0.05)
         trainer = DryRunTrainer.remote(dp_client, train_latency_s=0.1)
-        weight_sync = DryRunWeightSynchronizer(sync_latency_s=0.02, gen_handle=gen)
 
         ctrl = self._make_controller(
             dp_client,
             gen,
             trainer,
-            weight_sync,
             max_train_steps=3,
             min_prompt_groups_per_batch=1,
             generations_per_prompt=1,
@@ -697,7 +699,7 @@ class TestSingleControllerDryRun:
             dp_client,
             gen,
             trainer,
-            weight_sync,
+            weight_sync=weight_sync,
             max_train_steps=2,
             min_prompt_groups_per_batch=1,
             generations_per_prompt=1,
