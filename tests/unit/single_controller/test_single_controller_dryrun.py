@@ -461,22 +461,47 @@ def ray_init():
     # Don't shutdown — other tests in the module may need Ray
 
 
-def _meta_with_versions(versions: list[int]) -> KVBatchMeta:
-    sample_ids = [f"g{i}_g0" for i in range(len(versions))]
-    return KVBatchMeta(
-        partition_id="rollout_data",
-        task_name="train",
-        sample_ids=sample_ids,
-        tags=[
-            {
-                "group_id": f"g{i}",
-                "weight_version": version,
-                "committed": True,
-                "expected_num_samples": 1,
-            }
-            for i, version in enumerate(versions)
-        ],
-    )
+class _FakeBuffer:
+    """Mock of TQReplayBuffer exposing only the surface StalenessSampler reads."""
+
+    def __init__(self, partition_id: str = "rollout_data") -> None:
+        self._partition_id = partition_id
+        self.meta_list: list[KVBatchMeta] = []
+        self.weight_list: list[int] = []
+
+    def add_group(self, group_id: str, weight: int, group_size: int = 1) -> None:
+        sample_ids = [f"{group_id}_s{j}" for j in range(group_size)]
+        self.meta_list.append(
+            KVBatchMeta(
+                partition_id=self._partition_id,
+                task_name=None,
+                sample_ids=sample_ids,
+                tags=[{"weight_version": weight, "group_id": group_id}] * group_size,
+            )
+        )
+        self.weight_list.append(weight)
+
+    async def remove(self, sample_ids: list[str]) -> int:
+        ids = set(sample_ids)
+        keep_meta: list[KVBatchMeta] = []
+        keep_w: list[int] = []
+        n = 0
+        for meta, w in zip(self.meta_list, self.weight_list):
+            if set(meta.sample_ids) <= ids:
+                n += 1
+            else:
+                keep_meta.append(meta)
+                keep_w.append(w)
+        self.meta_list = keep_meta
+        self.weight_list = keep_w
+        return n
+
+
+def _buffer_with_versions(versions: list[int]) -> _FakeBuffer:
+    buf = _FakeBuffer()
+    for i, w in enumerate(versions):
+        buf.add_group(f"g{i}", weight=w)
+    return buf
 
 
 # ── tests ─────────────────────────────────────────────────────────────────
@@ -716,82 +741,58 @@ class TestSingleControllerDryRun:
 
     def test_staleness_sampler_filters_correctly(self):
         """StalenessSampler returns freshest complete groups within the window."""
-        sampler = StalenessSampler(max_staleness_versions=2)
+        buf = _buffer_with_versions([3, 4, 5, 2, 6])
+        sampler = StalenessSampler(buf, max_staleness_versions=2)
 
-        meta = _meta_with_versions([3, 4, 5, 2, 6])
+        selected = sampler.select(current_train_weight=5, min_prompt_groups=2)
 
-        indices = sampler.select_indices(
-            meta,
-            trainer_version=5,
-            min_prompt_groups=2,
-            generations_per_prompt=1,
-        )
-        assert indices == [2, 1]
+        assert selected is not None
+        # freshest-first: g2(lag 0), g1(lag 1). g3 stale, g4 future.
+        assert selected.sample_ids == ["g2_s0", "g1_s0"]
 
     def test_staleness_sampler_returns_none_when_insufficient(self):
         """StalenessSampler returns None when not enough eligible rows."""
-        sampler = StalenessSampler(max_staleness_versions=1)
-        meta = _meta_with_versions([1])
-        result = sampler.select_indices(
-            meta,
-            trainer_version=5,
-            min_prompt_groups=2,
-            generations_per_prompt=1,
-        )
-        assert result is None
+        buf = _buffer_with_versions([1])
+        sampler = StalenessSampler(buf, max_staleness_versions=1)
 
-    def test_staleness_sampler_requires_complete_prompt_groups(self):
-        """Staleness sampler skips incomplete prompt groups."""
-        sampler = StalenessSampler(max_staleness_versions=2)
-        meta = KVBatchMeta(
-            partition_id="rollout_data",
-            task_name="train",
-            sample_ids=["p0_g0", "p1_g0", "p1_g1"],
-            tags=[
-                {"group_id": "p0", "weight_version": 5, "expected_num_samples": 2},
-                {"group_id": "p1", "weight_version": 5, "expected_num_samples": 2},
-                {"group_id": "p1", "weight_version": 5, "expected_num_samples": 2},
-            ],
+        assert (
+            sampler.select(current_train_weight=5, min_prompt_groups=2) is None
         )
 
-        assert sampler.select_indices(
-            meta,
-            trainer_version=5,
-            min_prompt_groups=1,
-            generations_per_prompt=2,
-        ) == [1, 2]
+    def test_staleness_sampler_concats_multiple_groups(self):
+        """Selected meta concatenates whole-group sample_ids end-to-end."""
+        buf = _FakeBuffer()
+        buf.add_group("g0", weight=5, group_size=2)
+        buf.add_group("g1", weight=5, group_size=2)
+        sampler = StalenessSampler(buf, max_staleness_versions=0)
+
+        selected = sampler.select(current_train_weight=5, min_prompt_groups=2)
+        assert selected is not None
+        assert selected.sample_ids == ["g0_s0", "g0_s1", "g1_s0", "g1_s1"]
 
     def test_strict_on_policy_batch_sampler_requires_exact_version(self):
         """Strict sampler waits for a full batch at the trainer version."""
-        sampler = StalenessSampler(max_staleness_versions=0)
-        meta = _meta_with_versions([4, 5, 5, 6])
+        buf = _buffer_with_versions([4, 5, 5, 6])
+        sampler = StalenessSampler(buf, max_staleness_versions=0)
 
+        # Eligible at weight==5 are indices 1 and 2 only.
         assert (
-            sampler.select_indices(
-                meta,
-                trainer_version=5,
-                min_prompt_groups=3,
-                generations_per_prompt=1,
-            )
-            is None
+            sampler.select(current_train_weight=5, min_prompt_groups=3) is None
         )
-        assert sampler.select_indices(
-            meta,
-            trainer_version=5,
-            min_prompt_groups=2,
-            generations_per_prompt=1,
-        ) == [1, 2]
+        selected = sampler.select(current_train_weight=5, min_prompt_groups=2)
+        assert selected is not None
+        assert selected.sample_ids == ["g1_s0", "g2_s0"]
 
     def test_strict_on_policy_batch_sampler_evicts_old_groups(self):
-        """Strict sampler marks complete old-version groups for eviction."""
-        sampler = StalenessSampler(max_staleness_versions=0)
-        meta = _meta_with_versions([4, 5, 4])
+        """Strict sampler drops complete old-version groups via buffer.remove."""
+        buf = _buffer_with_versions([4, 5, 4])
+        sampler = StalenessSampler(buf, max_staleness_versions=0)
 
-        assert sampler.evictable_indices(
-            meta,
-            trainer_version=5,
-            generations_per_prompt=1,
-        ) == [0, 2]
+        dropped = asyncio.run(sampler.evict(current_train_weight=5))
+
+        assert dropped == 2
+        assert buf.weight_list == [5]
+        assert [m.sample_ids[0] for m in buf.meta_list] == ["g1_s0"]
 
 
 @ray.remote(num_cpus=0)
