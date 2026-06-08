@@ -24,6 +24,10 @@ import torch
 from transformers import AutoConfig
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_VLLM_PORT_RANGE_LOW,
+    DEFAULT_VLLM_PORTS_PER_ENGINE,
+)
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
@@ -102,6 +106,21 @@ class BaseVllmGenerationWorker:
             # Need to give each DP group its own vllm cache to address:
             # https://github.com/vllm-project/vllm/issues/18851
             env_vars["VLLM_CACHE_ROOT"] = os.path.expanduser(f"~/.cache/vllm_{seed}")
+
+            # Give each vLLM engine a deterministic starting port for TP/DP
+            # rendezvous.  vLLM's _get_open_port() reads VLLM_PORT and
+            # auto-increments on collision, so the per-engine spacing
+            # provides headroom.  See the port layout in virtual_cluster.py.
+            if len(local_bundle_indices) == 1:
+                engine_index_on_node = local_bundle_indices[0]
+            else:
+                engine_index_on_node = local_bundle_indices[0] // len(
+                    local_bundle_indices
+                )
+            env_vars["VLLM_PORT"] = str(
+                DEFAULT_VLLM_PORT_RANGE_LOW
+                + engine_index_on_node * DEFAULT_VLLM_PORTS_PER_ENGINE
+            )
 
         # Check if this worker is part of a parallel group (TP or TP+PP).
         # A worker is part of a parallel group if it's a secondary member (local_bundle_indices is None)
