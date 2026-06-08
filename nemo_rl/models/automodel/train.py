@@ -156,12 +156,15 @@ def model_forward(
 def extract_logits(
     model: nn.Module,
     outputs: Any,
+    is_reward_model: bool = False,
 ) -> torch.Tensor:
     """Extract logits from model outputs.
 
     Args:
         model: The model (used for lm_head if needed)
         outputs: Model outputs (can be tensor, DTensor, or object with logits attribute)
+        is_reward_model: If True, outputs are reward scores (e.g. [B, 1]); skip the
+            THD 2D->3D normalization that only applies to language-model logits.
 
     Returns:
         torch.Tensor: Logits tensor with shape [batch, seq, vocab]
@@ -176,7 +179,9 @@ def extract_logits(
     else:
         logits = outputs.logits
 
-    if logits.ndim == 2:
+    # Only language-model logits ([T, V]) need batch-dim normalization for THD.
+    # Reward-model scores (e.g. [B, 1]) must not gain a spurious batch dim.
+    if logits.ndim == 2 and not is_reward_model:
         logits = logits.unsqueeze(0)
     return logits
 
@@ -359,7 +364,7 @@ def forward_with_post_processing_fn(
     )
 
     # Extract logits from model outputs
-    logits = extract_logits(model, outputs)
+    logits = extract_logits(model, outputs, is_reward_model=is_reward_model)
     del outputs
 
     # Apply temperature scaling only for sampling-oriented post-processors
