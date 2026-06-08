@@ -444,11 +444,15 @@ class SingleControllerActor:
             self._step_consumed_sample_ids = []
 
             self._trainer_version = result["trainer_version"]
+            lag = self._trainer_version - min(
+                t["weight_version"] for t in group_meta.tags
+            )
             log.info(
-                "train step %d/%d  trainer_v=%d  batch_size=%d",
+                "train step %d/%d  trainer_v=%d  lag=%d  batch_size=%d",
                 self._train_steps + 1,
                 self._cfg.max_train_steps,
                 self._trainer_version,
+                lag,
                 len(consumed_ids),
             )
 
