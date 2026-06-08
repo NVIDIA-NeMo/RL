@@ -425,8 +425,9 @@ def get_topk_projection(
         )
     indices = data["indices"].long().to(device)
     likelihoods = data["likelihoods"].float().to(device)
-    _TOPK_PROJECTION_CACHE[key] = (indices, likelihoods)
-    return indices, likelihoods
+    result = (indices, likelihoods)
+    _TOPK_PROJECTION_CACHE[key] = result
+    return result
 
 
 # Process-local cache. Keyed by every input that affects the partition:
