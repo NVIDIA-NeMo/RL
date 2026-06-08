@@ -26,21 +26,22 @@ DataPlane. Model tensors still move through DataPlane or NCCL.
 
 Data flow:
   _rollout_pump  → rollout_manager.generate_and_push(prompt)
-                     RolloutManager runs the rollout, then writes through
-                     ``TQReplayBuffer.add`` (which calls
-                     ``dp_client.put_samples`` and appends per-group meta).
+                     RolloutManager runs the rollout and hands the
+                     ``PromptGroupRecord`` to ``TQReplayBuffer.add``, which
+                     tensorizes it (``record_to_train_batch`` →
+                     ``pack_payload``) and writes N training rows to TQ
+                     as one prompt-group.
   _train_pump    → sampler.evict(trainer_version)
                      → ``buffer.remove`` drops stale groups + clears TQ rows.
                  → sampler.select(...)
-                     → ``KVBatchMeta`` of complete prompt groups (or None).
-                 → _advantage_pump(meta)
-                     → dp_client.get_samples(...)
-                     → adv_estimator.compute_advantage(...)
-                     → dp_client.put_samples(...)
-                 → trainer.train_on_meta(meta)
-                     Trainer → dp_client.get_samples(...) to load tensors.
-                 → buffer.remove(meta.sample_ids)
-                     → drops trained groups + clears TQ rows.
+                     → ``KVBatchMeta`` covering K prompt groups (or None).
+                       This meta is already trainable — no second pass.
+                 → _advantage_pump(train_meta)
+                     → dp_client.get_samples → compute → dp_client.put_samples.
+                 → trainer.train_on_meta(train_meta)
+                     Trainer → dp_client.get_samples to load tensors.
+                 → buffer.remove(train_meta.sample_ids)
+                     → drops trained groups + clears their TQ rows.
   _sync_weights  → drain _inflight_rollouts → WeightSynchronizer.sync_weights()
 """
 
@@ -177,10 +178,15 @@ class SingleControllerActor:
                 f"must be >= min_prompt_groups_per_batch ({cfg.min_prompt_groups_per_batch})"
             )
 
+        pad_id = int(getattr(tokenizer, "pad_token_id", 0) or 0)
         self._buffer = (
             tq_buffer
             if tq_buffer is not None
-            else TQReplayBuffer(dp_client, partition_id=cfg.partition_id)
+            else TQReplayBuffer(
+                dp_client,
+                partition_id=cfg.partition_id,
+                pad_value_dict={"token_ids": pad_id},
+            )
         )
 
         if rollout_manager is None:
@@ -357,19 +363,18 @@ class SingleControllerActor:
                 asyncio.create_task(_dispatch_one_prompt(prompt))
 
     async def _train_pump(self) -> None:
-        """Drain stale buffer groups, sample a batch, train, drop it.
+        """Drain stale groups, sample, train, drop.
 
-        Flow per step:
-          1. sampler.evict(trainer_version) → buffer.remove stale groups,
-             release _buffer_capacity for each dropped group.
-          2. sampler.select(...) → KVBatchMeta of complete prompt groups,
-             or None if not enough eligible groups are buffered.
-          3. _advantage_pump() — fetch advantage inputs, compute, write back.
-          4. trainer.train_on_meta(KVBatchMeta, dp_client) — trainer fetches
-             tensors via dp_client.get_samples.
-          5. buffer.remove(meta.sample_ids) — drop trained groups from TQ
-             + local meta lists, release _buffer_capacity for each.
-          6. _sync_weights()
+        Per step:
+          1. ``sampler.evict`` → ``buffer.remove`` stale prompt-group entries.
+          2. ``sampler.select`` → ``train_meta`` covering K prompt groups
+             (or None). Already trainable — buffer wrote training-shaped
+             rows at rollout time.
+          3. ``_advantage_pump(train_meta)``.
+          4. ``trainer.train_on_meta(train_meta, dp_client)``.
+          5. ``buffer.remove(train_meta.sample_ids)`` drops trained groups
+             and clears their TQ rows; release ``_buffer_capacity`` per
+             dropped group, then sync.
         """
         logprobs_required = (
             self._cfg.advantage_policy_logprobs_field is not None
@@ -398,32 +403,32 @@ class SingleControllerActor:
             while groups_dispatched < target_groups:
                 await asyncio.sleep(0)
 
-                group_meta = self._sampler.select(
+                train_meta = self._sampler.select(
                     current_train_weight=self._trainer_version,
                     min_prompt_groups=self._cfg.min_prompt_groups_per_batch,
                 )
 
-                if group_meta is None:
+                if train_meta is None:
                     await asyncio.sleep(0.05)
                     continue
 
                 if logprobs_required:
                     await self._ray_get(
-                        self._trainer.prepare_logprobs_from_meta.remote(group_meta)
+                        self._trainer.prepare_logprobs_from_meta.remote(train_meta)
                     )
 
-                group_meta = await self._advantage_pump(group_meta)
+                train_meta = await self._advantage_pump(train_meta)
 
                 if not step_open:
                     await self._ray_get(self._trainer.begin_train_step.remote(step_id))
                     step_open = True
 
                 future = self._trainer.train_microbatch_from_meta.remote(
-                    step_id, group_meta
+                    step_id, train_meta
                 )
                 in_flight.append(future)
                 groups_dispatched += 1
-                self._step_consumed_sample_ids.extend(group_meta.sample_ids)
+                self._step_consumed_sample_ids.extend(train_meta.sample_ids)
 
                 in_flight = await self._reap_in_flight_nonblocking(in_flight)
 
@@ -445,7 +450,7 @@ class SingleControllerActor:
 
             self._trainer_version = result["trainer_version"]
             lag = self._trainer_version - min(
-                t["weight_version"] for t in group_meta.tags
+                t["weight_version"] for t in train_meta.tags
             )
             log.info(
                 "train step %d/%d  trainer_v=%d  lag=%d  batch_size=%d",
