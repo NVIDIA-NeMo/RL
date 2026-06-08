@@ -41,22 +41,22 @@ from nemo_rl.utils.checkpoint import CheckpointingConfig
 def _patch_qwen_vl_vision_key_mapping() -> None:
     """Re-add the Qwen2.5-VL ``^visual`` -> ``model.visual`` checkpoint key rename.
 
-    Workaround for a transformers 5.5.x regression. transformers #44627 (v5.5.0)
-    centralized VLM checkpoint key-conversions and dropped the Qwen2.5-VL
-    ``^visual -> model.visual`` rename; transformers #45358 restored it only in
-    v5.6.0. NeMo-RL pins ``transformers<5.6.0`` and Automodel's
-    ``get_combined_key_mapping`` only mirrors transformers ``WeightRenaming``
-    entries, so on v5.5.x the vision-tower checkpoint keys (``visual.*``) stay
-    unmapped and are dropped by FSDP2 ``set_model_state_dict(strict=False)`` in
-    ``load_base_model`` -> the vision tower is left randomly initialized, which
-    makes the training forward diverge from vLLM (token_mult_prob_error).
+    Workaround for a transformers v5.5.0 regression. transformers #44627 moved
+    VLM checkpoint conversions into the main mapping, but copied the Qwen-VL
+    visual key mapping incorrectly: ``visual.*`` checkpoint keys no longer map
+    to ``model.visual.*``. transformers #45358 fixed those VLM mappings in v5.6,
+    but the Automodel commit NeMo-RL can currently pin to still depends on
+    transformers v5.5.0. Automodel's ``get_combined_key_mapping`` mirrors the
+    transformers ``WeightRenaming`` entries, so the bad v5.5.0 mapping leaves
+    vision-tower checkpoint keys unmapped and FSDP2
+    ``set_model_state_dict(strict=False)`` drops them in ``load_base_model``.
+    The vision tower is then left randomly initialized, making the training
+    forward diverge from vLLM (token_mult_prob_error).
 
     This wraps ``get_combined_key_mapping`` to inject the missing rule for
     ``qwen2_5_vl``/``qwen2_vl``. It is idempotent: the rule is only added when no
-    existing rule already targets ``model.visual`` (so it auto-noops on
-    transformers >=5.6.0 or once Automodel adopts the equivalent fix, Automodel
-    PR #2431). Remove this once the Automodel pin or the transformers pin carries
-    the fix.
+    existing rule already targets ``model.visual``. Remove this after Automodel
+    upgrades its transformers dependency to a version that includes #45358.
     """
     # Escape hatch (also used for A/B validation of this workaround).
     if os.environ.get("NRL_DISABLE_QWENVL_VISION_PATCH") == "1":
@@ -89,7 +89,7 @@ except Exception as e:  # pragma: no cover - defensive: never break import
 
     logging.getLogger(__name__).warning(
         "Failed to apply Qwen2.5-VL vision-tower key-mapping patch "
-        "(transformers 5.5.x / Automodel #2431 workaround): %s",
+        "(transformers #44627/#45358 workaround): %s",
         e,
     )
 
