@@ -439,7 +439,10 @@ kuberay:
       disagg.nemo-rl/run: ft-experiment-test
       kai.scheduler/queue: backfill
     daemon:
-      submissionId: ft-experiment-test-gen-server-v7
+      # Bumped v7→v8: new daemon code (router auto-backfill reconciler) + the
+      # gen-daemon stdout tee to Lustre. KubeRay won't resubmit an existing
+      # submissionId, so this bump is required for the new entrypoint to take effect.
+      submissionId: ft-experiment-test-gen-server-v8
       # Code is at /opt/nemo-rl (mounted from Lustre); no upload needed.
       entrypoint: |
         set -eu
@@ -450,9 +453,18 @@ kuberay:
         # the runtime_env merge between the daemon Job and the worker actor.
         export RAY_OVERRIDE_JOB_RUNTIME_ENV=1
         pip install kubernetes -q || true
+        # Persist the gen-daemon stdout (router [FAULT-EVENT]/[RECOVERY-*]/
+        # [VLLM-THROUGHPUT] + auto-backfill telemetry) to Lustre, mirroring the
+        # train driver. Without this the log lived only on the gen head pod's
+        # ephemeral storage and was lost on teardown (kill-1's was unrecoverable).
+        GEN_TS=$(date -u +%Y%m%d-%H%M%S-%N)
+        GEN_LOG_DIR=/mnt/rl-workspace/${user:}/driver_logs
+        GEN_LOG=\${GEN_LOG_DIR}/gen-daemon-ft-experiment-test-\${GEN_TS}.log
+        mkdir -p "\${GEN_LOG_DIR}"
         python -u examples/run_standalone_generation_server.py \
           --config infra/nrl_k8s/examples/ft_experiment/test_gen_server.yaml \
-          --port 8089 --num-gpus 8
+          --port 8089 --num-gpus 8 \
+          2>&1 | tee "\${GEN_LOG}"
     spec:
       rayVersion: "2.54.0"
       enableInTreeAutoscaling: true
