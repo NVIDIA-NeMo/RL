@@ -1312,6 +1312,9 @@ class TestSetupModelAndOptimizer:
         mock_sequential_lr.return_value = MagicMock()
 
         mock_model = MagicMock()
+        # One model part so ModelHandle yields a single optimizer/scheduler
+        # (setup builds optimizers/schedulers per model part).
+        mock_model.parts = [mock_model]
         mock_model.state_dict.return_value = {}
         mock_model.config = MagicMock()
         mock_model.config.pad_token_id = 0
@@ -1367,6 +1370,8 @@ class TestSetupModelAndOptimizer:
         mock_lambda_lr.return_value = MagicMock()
 
         mock_model = MagicMock()
+        # One model part so the per-part pad_token_id loop runs on mock_model.
+        mock_model.parts = [mock_model]
         mock_model.state_dict.return_value = {}
         mock_model.config = MagicMock()
         mock_model.config.pad_token_id = None  # Initially None
@@ -1406,6 +1411,8 @@ class TestSetupModelAndOptimizer:
         mock_lambda_lr.return_value = MagicMock()
 
         mock_model = MagicMock()
+        # One model part so ModelHandle.state_dict_keys() sees the keys below.
+        mock_model.parts = [mock_model]
         # Include "expert" in state dict keys to trigger MoE detection
         mock_model.state_dict.return_value = {
             "layer.expert.weight": torch.zeros(10),
@@ -1789,10 +1796,10 @@ class TestSetupModelAndOptimizer:
         )
 
         mock_buffer = MagicMock()
-        mock_buffer.data = MagicMock()
-        mock_buffer.data.to.return_value = mock_buffer.data
 
         mock_model = MagicMock()
+        # One model part so ModelHandle.move_buffers_to / to() operate on it.
+        mock_model.parts = [mock_model]
         mock_model.state_dict.return_value = {}
         mock_model.config = MagicMock()
         mock_model.config.pad_token_id = 0
@@ -1803,17 +1810,20 @@ class TestSetupModelAndOptimizer:
         mock_optimizer = MagicMock()
         mock_get_class.return_value = MagicMock(return_value=mock_optimizer)
 
-        setup_model_and_optimizer(
-            config=mock_config,
-            tokenizer=mock_tokenizer,
-            runtime_config=runtime_config,
-            distributed_context=mock_distributed_context,
-            checkpoint_manager=mock_checkpoint_manager,
-        )
+        # ModelHandle.move_buffers_to uses torch.utils.swap_tensors with real
+        # tensors; patch it so the MagicMock buffer can flow through.
+        with patch("nemo_rl.models.automodel.model_handle.torch.utils.swap_tensors"):
+            setup_model_and_optimizer(
+                config=mock_config,
+                tokenizer=mock_tokenizer,
+                runtime_config=runtime_config,
+                distributed_context=mock_distributed_context,
+                checkpoint_manager=mock_checkpoint_manager,
+            )
 
-        # Verify buffers were moved to CPU
-        mock_buffer.data.to.assert_called_with("cpu")
-        # Verify model was moved to CPU
+        # Verify buffers were moved to CPU (ModelHandle calls v.to(device))
+        mock_buffer.to.assert_called_with("cpu")
+        # Verify model part was moved to CPU
         mock_model.to.assert_called_with("cpu")
 
 
