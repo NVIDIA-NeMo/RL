@@ -16,23 +16,20 @@ import asyncio
 import copy
 import json
 import uuid
-from typing import TYPE_CHECKING, Any, Optional
+from typing import Any, Optional
 
 import numpy as np
 import torch
+from tensordict import TensorDict
 from transformers import PreTrainedTokenizerBase
 from wandb import Table
 
+from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane.codec import pack_jagged_fields
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
-
-if TYPE_CHECKING:
-    from tensordict import TensorDict
-
-    from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.experience.rollouts import (
     _calculate_single_metric,
     _tensorize_by_key,
@@ -601,7 +598,7 @@ class RolloutManager:
         policy_generation: Optional[GenerationInterface] = None,
         generation_config: Optional[GenerationConfig] = None,
         use_nemo_gym: bool = False,
-        tq_buffer: Optional["TQReplayBuffer"] = None,
+        tq_buffer: Optional[TQReplayBuffer] = None,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
@@ -665,7 +662,7 @@ class RolloutManager:
 
     def _build_tq_payload(
         self, record: PromptGroupRecord
-    ) -> tuple[list[str], "TensorDict", list[dict[str, Any]]]:
+    ) -> tuple[list[str], TensorDict, list[dict[str, Any]]]:
         """Build the payload that ``TQReplayBuffer.add`` expects."""
         # Lazy imports: grpo and llm_message_utils both transitively pull
         # experience.rollouts, so importing at module top risks a cycle.
