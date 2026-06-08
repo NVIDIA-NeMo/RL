@@ -1953,11 +1953,13 @@ class TestSetupReferenceModelState:
     @patch("nemo_rl.models.megatron.setup.GlobalState")
     @patch("nemo_rl.models.megatron.setup.get_model")
     @patch("nemo_rl.models.megatron.setup.checkpoint_exists")
+    @patch("nemo_rl.models.megatron.setup.clear_global_router_replay_instances")
     @patch("nemo_rl.models.megatron.setup.load_checkpoint")
     @patch("nemo_rl.models.megatron.setup.HAVE_FSDP2", False)
     def test_setup_reference_model(
         self,
         mock_load_checkpoint,
+        mock_clear_global_router_replay_instances,
         mock_checkpoint_exists,
         mock_get_model,
         mock_global_state,
@@ -2013,6 +2015,42 @@ class TestSetupReferenceModelState:
 
         captured = capsys.readouterr()
         assert "Reference model loaded" in captured.out
+        mock_clear_global_router_replay_instances.assert_called_once()
+
+    @patch("nemo_rl.models.megatron.setup.ProcessGroupCollection")
+    @patch("nemo_rl.models.megatron.setup.init_checkpointing_context")
+    @patch("nemo_rl.models.megatron.setup.GlobalState")
+    @patch("nemo_rl.models.megatron.setup.get_model")
+    @patch("nemo_rl.models.megatron.setup.clear_global_router_replay_instances")
+    def test_setup_reference_model_clears_router_replay_on_get_model_error(
+        self,
+        mock_clear_global_router_replay_instances,
+        mock_get_model,
+        mock_global_state,
+        mock_init_ckpt_context,
+        mock_pg_collection,
+    ):
+        """Test setup_reference_model_state cleans the temporary RouterReplay registry on setup errors."""
+        from nemo_rl.models.megatron.setup import setup_reference_model_state
+
+        mock_global_state.return_value = MagicMock()
+        mock_megatron_cfg = MagicMock()
+        mock_get_model.side_effect = RuntimeError("reference model setup failed")
+
+        config = {
+            "megatron_cfg": {
+                "freeze_moe_router": False,
+            }
+        }
+
+        with pytest.raises(RuntimeError, match="reference model setup failed"):
+            setup_reference_model_state(
+                config=config,
+                megatron_cfg=mock_megatron_cfg,
+                pretrained_path="/path/to/pretrained",
+            )
+
+        mock_clear_global_router_replay_instances.assert_called_once()
 
 
 @pytest.mark.mcore

@@ -1023,3 +1023,24 @@ def test_router_replay_validation_allows_all_negative_fallback_rows(monkeypatch)
             layer_number=1,
             payload_idx=0,
         )
+
+
+@pytest.mark.mcore
+def test_clear_global_router_replay_instances_clears_registry():
+    from megatron.core.transformer.moe.router_replay import RouterReplay
+
+    from nemo_rl.models.megatron.router_replay import (
+        clear_global_router_replay_instances,
+    )
+
+    RouterReplay.clear_global_router_replay_instances()
+    try:
+        replay = RouterReplay()
+
+        assert RouterReplay.global_router_replay_instances == [replay]
+
+        clear_global_router_replay_instances()
+
+        assert RouterReplay.global_router_replay_instances == []
+    finally:
+        RouterReplay.clear_global_router_replay_instances()

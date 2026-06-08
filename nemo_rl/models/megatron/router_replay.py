@@ -529,3 +529,9 @@ def clear_router_replay(model: Optional[Any] = None) -> None:
     for replay_instance, _ in _router_replay_instances_for_model(model):
         replay_instance.clear_router_replay_action()
         replay_instance.clear_indices()
+
+
+def clear_global_router_replay_instances() -> None:
+    from megatron.core.transformer.moe.router_replay import RouterReplay
+
+    RouterReplay.clear_global_router_replay_instances()
