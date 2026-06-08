@@ -12,166 +12,216 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for StalenessSampler (focusing on select_one_group)."""
+"""Unit tests for StalenessSampler (pure filter over TQReplayBuffer state)."""
 
 from __future__ import annotations
 
-from typing import Any
+import asyncio
+
+import pytest
 
 from nemo_rl.algorithms.staleness_sampler import StalenessSampler
 from nemo_rl.data_plane import KVBatchMeta
 
 
-def _meta_with_groups(
-    groups: list[dict[str, Any]],
-) -> KVBatchMeta:
-    """Build a KVBatchMeta from a list of group specs.
+class FakeBuffer:
+    """Minimal TQReplayBuffer surface used by StalenessSampler."""
 
-    Each group dict has keys: group_id, weight_version, committed (default True),
-    expected_num_samples, num_samples (default = expected_num_samples).
-    """
-    sample_ids: list[str] = []
-    tags: list[dict[str, Any]] = []
-    for g in groups:
-        gid = g["group_id"]
-        expected = g["expected_num_samples"]
-        n = g.get("num_samples", expected)
-        for i in range(n):
-            sample_ids.append(f"{gid}_g{i}")
-            tags.append(
-                {
-                    "group_id": gid,
-                    "weight_version": g["weight_version"],
-                    "committed": g.get("committed", True),
-                    "expected_num_samples": expected,
-                }
-            )
-    return KVBatchMeta(
-        partition_id="rollout_data",
-        task_name="train",
-        sample_ids=sample_ids,
-        tags=tags,
-    )
+    def __init__(self, partition_id: str = "rollout_data") -> None:
+        self._partition_id = partition_id
+        self.meta_list: list[KVBatchMeta] = []
+        self.weight_list: list[int] = []
+        self.remove_calls: list[list[str]] = []
 
-
-def test_select_one_group_returns_none_on_empty_meta():
-    sampler = StalenessSampler(max_staleness_versions=2)
-    meta = KVBatchMeta(
-        partition_id="rollout_data",
-        task_name="train",
-        sample_ids=[],
-        tags=[],
-    )
-    assert (
-        sampler.select_one_group(meta, trainer_version=5, generations_per_prompt=1)
-        is None
-    )
-
-
-def test_select_one_group_returns_only_complete_group():
-    sampler = StalenessSampler(max_staleness_versions=2)
-    meta = _meta_with_groups(
-        [
-            {"group_id": "g0", "weight_version": 5, "expected_num_samples": 1},
-        ]
-    )
-    assert sampler.select_one_group(
-        meta, trainer_version=5, generations_per_prompt=1
-    ) == [0]
-
-
-def test_select_one_group_picks_lowest_lag_first():
-    sampler = StalenessSampler(max_staleness_versions=3)
-    meta = _meta_with_groups(
-        [
-            {"group_id": "g0", "weight_version": 3, "expected_num_samples": 1},
-            {"group_id": "g1", "weight_version": 5, "expected_num_samples": 1},
-            {"group_id": "g2", "weight_version": 4, "expected_num_samples": 1},
-        ]
-    )
-    # trainer=5: g0 lag=2, g1 lag=0, g2 lag=1 → picks g1 (index 1)
-    assert sampler.select_one_group(
-        meta, trainer_version=5, generations_per_prompt=1
-    ) == [1]
-
-
-def test_select_one_group_tiebreak_leftmost_wins():
-    sampler = StalenessSampler(max_staleness_versions=2)
-    meta = _meta_with_groups(
-        [
-            {"group_id": "g0", "weight_version": 4, "expected_num_samples": 2},
-            {"group_id": "g1", "weight_version": 4, "expected_num_samples": 2},
-        ]
-    )
-    # Both lag=1. Tiebreak: leftmost indices[0]. g0 occupies [0,1], g1 [2,3]
-    assert sampler.select_one_group(
-        meta, trainer_version=5, generations_per_prompt=2
-    ) == [0, 1]
-
-
-def test_select_one_group_skips_incomplete_and_uncommitted():
-    sampler = StalenessSampler(max_staleness_versions=2)
-    meta = _meta_with_groups(
-        [
-            # Incomplete group: expected 2, only 1 sample
-            {
-                "group_id": "g0",
-                "weight_version": 5,
-                "expected_num_samples": 2,
-                "num_samples": 1,
-            },
-            # Uncommitted group
-            {
-                "group_id": "g1",
-                "weight_version": 5,
-                "expected_num_samples": 1,
-                "committed": False,
-            },
-            # Eligible group
-            {"group_id": "g2", "weight_version": 5, "expected_num_samples": 1},
-        ]
-    )
-    # g0 occupies idx 0; g1 idx 1; g2 idx 2 → picks g2
-    assert sampler.select_one_group(
-        meta, trainer_version=5, generations_per_prompt=1
-    ) == [2]
-
-
-def test_select_one_group_rejects_future_version():
-    sampler = StalenessSampler(max_staleness_versions=5)
-    meta = _meta_with_groups(
-        [
-            {"group_id": "g0", "weight_version": 6, "expected_num_samples": 1},
-            {"group_id": "g1", "weight_version": 4, "expected_num_samples": 1},
-        ]
-    )
-    # trainer=5: g0 has weight_version > trainer_version, rejected; g1 lag=1
-    assert sampler.select_one_group(
-        meta, trainer_version=5, generations_per_prompt=1
-    ) == [1]
-
-
-def test_select_one_group_strict_on_policy():
-    sampler = StalenessSampler(max_staleness_versions=0)
-    meta = _meta_with_groups(
-        [
-            {"group_id": "g0", "weight_version": 4, "expected_num_samples": 1},
-            {"group_id": "g1", "weight_version": 5, "expected_num_samples": 1},
-        ]
-    )
-    # strict: only weight_version==trainer_version eligible
-    assert sampler.select_one_group(
-        meta, trainer_version=5, generations_per_prompt=1
-    ) == [1]
-    # All stale → None
-    meta_stale = _meta_with_groups(
-        [
-            {"group_id": "g0", "weight_version": 4, "expected_num_samples": 1},
-        ]
-    )
-    assert (
-        sampler.select_one_group(
-            meta_stale, trainer_version=5, generations_per_prompt=1
+    def add_group(
+        self,
+        group_id: str,
+        group_size: int,
+        weight: int,
+    ) -> KVBatchMeta:
+        sample_ids = [f"{group_id}_s{j}" for j in range(group_size)]
+        meta = KVBatchMeta(
+            partition_id=self._partition_id,
+            task_name=None,
+            sample_ids=sample_ids,
+            tags=[{"weight_version": weight, "group_id": group_id}] * group_size,
         )
-        is None
-    )
+        self.meta_list.append(meta)
+        self.weight_list.append(weight)
+        return meta
+
+    async def remove(self, sample_ids: list[str]) -> int:
+        self.remove_calls.append(list(sample_ids))
+        ids = set(sample_ids)
+        keep_meta: list[KVBatchMeta] = []
+        keep_w: list[int] = []
+        n = 0
+        for meta, w in zip(self.meta_list, self.weight_list):
+            if set(meta.sample_ids) <= ids:
+                n += 1
+            else:
+                keep_meta.append(meta)
+                keep_w.append(w)
+        self.meta_list = keep_meta
+        self.weight_list = keep_w
+        return n
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+class TestStalenessSamplerSelect:
+    def test_select_returns_none_when_insufficient(self):
+        buf = FakeBuffer()
+        buf.add_group("g0", group_size=1, weight=5)
+        sampler = StalenessSampler(buf, max_staleness_versions=2)
+
+        assert (
+            sampler.select(current_train_weight=5, min_prompt_groups=2) is None
+        )
+
+    def test_select_returns_none_on_empty_buffer(self):
+        buf = FakeBuffer()
+        sampler = StalenessSampler(buf, max_staleness_versions=2)
+
+        assert (
+            sampler.select(current_train_weight=5, min_prompt_groups=1) is None
+        )
+
+    def test_select_filters_by_staleness_window(self):
+        buf = FakeBuffer()
+        # Weights 3, 4, 5, 2, 6 against trainer=5, max_staleness=2:
+        # lags = 2, 1, 0, 3 (stale), -1 (future)
+        for i, w in enumerate([3, 4, 5, 2, 6]):
+            buf.add_group(f"g{i}", group_size=1, weight=w)
+        sampler = StalenessSampler(buf, max_staleness_versions=2)
+
+        selected = sampler.select(current_train_weight=5, min_prompt_groups=2)
+
+        assert selected is not None
+        # Freshest first → g2 (lag 0), g1 (lag 1)
+        assert selected.sample_ids == ["g2_s0", "g1_s0"]
+
+    def test_select_freshest_first_orders_by_lag(self):
+        buf = FakeBuffer()
+        for i, w in enumerate([3, 4, 5]):
+            buf.add_group(f"v{w}", group_size=1, weight=w)
+        sampler = StalenessSampler(buf, max_staleness_versions=5)
+
+        selected = sampler.select(current_train_weight=6, min_prompt_groups=2)
+        assert selected is not None
+        assert selected.sample_ids == ["v5_s0", "v4_s0"]
+
+    def test_select_fifo_orders_by_insertion(self):
+        buf = FakeBuffer()
+        for i, w in enumerate([3, 4, 5]):
+            buf.add_group(f"v{w}", group_size=1, weight=w)
+        sampler = StalenessSampler(
+            buf, max_staleness_versions=5, sample_freshest_first=False
+        )
+
+        selected = sampler.select(current_train_weight=6, min_prompt_groups=2)
+        assert selected is not None
+        assert selected.sample_ids == ["v3_s0", "v4_s0"]
+
+    def test_select_skips_future_weight(self):
+        buf = FakeBuffer()
+        buf.add_group("now", group_size=1, weight=5)
+        buf.add_group("future", group_size=1, weight=7)
+        sampler = StalenessSampler(buf, max_staleness_versions=10)
+
+        selected = sampler.select(current_train_weight=5, min_prompt_groups=1)
+
+        assert selected is not None
+        assert selected.sample_ids == ["now_s0"]
+
+    def test_select_concats_groups(self):
+        buf = FakeBuffer()
+        buf.add_group("g0", group_size=2, weight=5)
+        buf.add_group("g1", group_size=2, weight=5)
+        sampler = StalenessSampler(buf, max_staleness_versions=0)
+
+        selected = sampler.select(current_train_weight=5, min_prompt_groups=2)
+
+        assert selected is not None
+        assert selected.sample_ids == [
+            "g0_s0",
+            "g0_s1",
+            "g1_s0",
+            "g1_s1",
+        ]
+
+    def test_select_strict_on_policy_requires_exact_version(self):
+        buf = FakeBuffer()
+        for i, w in enumerate([4, 5, 5, 6]):
+            buf.add_group(f"g{i}", group_size=1, weight=w)
+        sampler = StalenessSampler(buf, max_staleness_versions=0)
+
+        # 3 eligible (need weight=5), only have 2
+        assert (
+            sampler.select(current_train_weight=5, min_prompt_groups=3) is None
+        )
+
+        selected = sampler.select(current_train_weight=5, min_prompt_groups=2)
+        assert selected is not None
+        assert selected.sample_ids == ["g1_s0", "g2_s0"]
+
+    def test_select_rejects_zero_min_prompt_groups(self):
+        buf = FakeBuffer()
+        sampler = StalenessSampler(buf, max_staleness_versions=0)
+        with pytest.raises(ValueError):
+            sampler.select(current_train_weight=0, min_prompt_groups=0)
+
+
+class TestStalenessSamplerEvict:
+    def test_evict_removes_stale_groups(self):
+        buf = FakeBuffer()
+        # trainer=5, max_staleness=1 → lag >1 means stale (weights 0, 1, 2 stale; 4, 5 fresh)
+        for i, w in enumerate([0, 1, 4, 5, 2]):
+            buf.add_group(f"g{i}", group_size=1, weight=w)
+        sampler = StalenessSampler(buf, max_staleness_versions=1)
+
+        dropped = _run(sampler.evict(current_train_weight=5))
+
+        assert dropped == 3
+        assert buf.weight_list == [4, 5]
+        # Survivors' sample_ids
+        assert [m.sample_ids[0] for m in buf.meta_list] == ["g2_s0", "g3_s0"]
+
+    def test_evict_returns_zero_when_nothing_stale(self):
+        buf = FakeBuffer()
+        for w in [4, 5]:
+            buf.add_group(f"v{w}", group_size=1, weight=w)
+        sampler = StalenessSampler(buf, max_staleness_versions=1)
+
+        assert _run(sampler.evict(current_train_weight=5)) == 0
+        assert buf.remove_calls == []
+
+    def test_evict_keeps_future_groups(self):
+        buf = FakeBuffer()
+        buf.add_group("future", group_size=1, weight=7)
+        sampler = StalenessSampler(buf, max_staleness_versions=0)
+
+        assert _run(sampler.evict(current_train_weight=5)) == 0
+        assert buf.weight_list == [7]
+
+    def test_evict_drops_whole_group(self):
+        buf = FakeBuffer()
+        buf.add_group("stale", group_size=4, weight=1)
+        buf.add_group("fresh", group_size=4, weight=5)
+        sampler = StalenessSampler(buf, max_staleness_versions=1)
+
+        dropped = _run(sampler.evict(current_train_weight=5))
+
+        assert dropped == 1
+        assert len(buf.remove_calls) == 1
+        assert set(buf.remove_calls[0]) == {f"stale_s{i}" for i in range(4)}
+        assert buf.weight_list == [5]
+
+
+class TestStalenessSamplerInit:
+    def test_rejects_negative_max_staleness(self):
+        buf = FakeBuffer()
+        with pytest.raises(ValueError):
+            StalenessSampler(buf, max_staleness_versions=-1)
