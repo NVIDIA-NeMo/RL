@@ -185,9 +185,9 @@ class FakeDataPlaneActor:
 class DryRunGenWorker:
     """Stub GenerationWorkerActor.
 
-    Returns a ``PromptGroupRecord`` whose ``prompt_idx`` and per-completion
-    ``reward`` carry the call_count so the dry-run record-converter stub
-    can reproduce the old bulk_batch fields deterministically.
+    Returns a PromptGroupRecord whose prompt_idx and per-completion reward
+    carry the call_count so the dry-run record-converter stub can reproduce
+    the train_batch fields deterministically.
     """
 
     def __init__(self, gen_latency_s: float = 0.1):
@@ -222,15 +222,14 @@ class DryRunGenWorker:
         return list(self._call_timestamps)
 
 
-def _dryrun_record_to_bulk_batch(
+def _dryrun_record_to_train_batch(
     record: PromptGroupRecord, *, pad_value_dict: Any
 ) -> BatchedDataDict[Any]:
-    """Stub for ``record_to_train_batch``.
+    """Stub for record_to_train_batch.
 
-    Production reads message_logs / token_ids etc.; the dry-run records
-    have none of that. Mirror the old ``DryRunGenWorker`` bulk_batch
-    shape, using ``record.prompt_idx`` + ``completions[i].reward`` so
-    advantage tests stay deterministic.
+    Production reads message_logs / token_ids etc.; the dry-run records have
+    none of that. Mirror the DryRunGenWorker train_batch shape, using
+    record.prompt_idx + completions[i].reward so advantage tests stay deterministic.
     """
     del pad_value_dict
     n = len(record.completions)
@@ -342,8 +341,8 @@ class DryRunRolloutManager:
         self._weight_version = int(version)
 
     async def generate_and_push(self, prompt: str) -> None:
-        bulk_batch = await self._gen_actor.generate.remote(prompt)
-        await self._tq_buffer.add(bulk_batch, weight_version=self._weight_version)
+        record = await self._gen_actor.generate.remote(prompt)
+        await self._tq_buffer.add(record, weight_version=self._weight_version)
 
 
 class DryRunWeightSynchronizer:
@@ -434,15 +433,15 @@ class TestSingleControllerDryRun:
 
     @pytest.fixture(autouse=True)
     def _stub_record_converter(self, monkeypatch):
-        """Replace the buffer's record→bulk_batch with a dry-run-friendly stub.
+        """Replace the buffer's record→train_batch with a dry-run-friendly stub.
 
-        Production reads message_logs / token_ids etc.; the dry-run
-        records carry none of that.
+        Production reads message_logs / token_ids etc.; the dry-run records
+        carry none of that.
         """
         monkeypatch.setattr(
             _replay_buffer_module,
             "record_to_train_batch",
-            _dryrun_record_to_bulk_batch,
+            _dryrun_record_to_train_batch,
         )
 
     def _make_controller(

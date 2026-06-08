@@ -12,13 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Prompt-group selection over a TQReplayBuffer.
-
-The sampler is pure filter logic: it reads ``meta_list`` / ``weight_list``
-on the buffer it was constructed with and drives :meth:`TQReplayBuffer.remove`
-when groups fall outside the staleness window. It never touches the data
-plane directly.
-"""
+"""Prompt-group selection over a TQReplayBuffer."""
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.data_plane import KVBatchMeta
@@ -48,12 +42,18 @@ class StalenessSampler:
         current_train_weight: int,
         min_prompt_groups: int,
     ) -> KVBatchMeta | None:
-        """Return a concat of the first ``min_prompt_groups`` eligible groups.
+        """Return a concat of the first min_prompt_groups eligible groups, or None.
 
-        Freshest-first (smallest lag, ties broken by insertion order)
-        when ``sample_freshest_first`` is set, else strict insertion-order
-        FIFO. Returns ``None`` if fewer than ``min_prompt_groups`` groups
-        are eligible.
+        Freshest-first (smallest lag, ties by insertion order) when
+        sample_freshest_first is set, else insertion-order FIFO.
+
+        Args:
+            current_train_weight: Current trainer weight version. Eligibility window is
+                [current_train_weight - max_staleness_versions, current_train_weight].
+            min_prompt_groups: Minimum groups required; returns None below this.
+
+        Returns:
+            Concatenated KVBatchMeta covering min_prompt_groups groups, or None.
         """
         if min_prompt_groups < 1:
             raise ValueError(
@@ -88,9 +88,11 @@ class StalenessSampler:
     async def evict(self, *, current_train_weight: int) -> int:
         """Drop groups whose weight falls below the staleness window.
 
-        Future entries (``weight > current_train_weight``) are left alone —
-        they can't be produced under normal flow and the safer behavior
-        is to surface them later rather than silently delete.
+        Future entries (weight > current_train_weight) are left alone.
+
+        Args:
+            current_train_weight: Current trainer weight version; groups with
+                weight < current_train_weight - max_staleness_versions are dropped.
 
         Returns:
             Number of group entries removed from the buffer.

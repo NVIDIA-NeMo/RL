@@ -12,37 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SingleController: asyncio-based orchestrator for the RL training loop.
+"""SingleController: asyncio orchestrator for the RL training loop.
 
-SingleController is a CPU-only Ray actor that owns three concurrent asyncio
-pumps and coordinates all other actors via lightweight RPCs. Other actors
-expose methods and wait to be called.
-
-Key invariant: SC does not run model work. It sends control signals
-(``KVBatchMeta`` and actor handles) and reads metadata. When advantage
-calculation is enabled, SC fetches only the configured advantage input
-columns, computes advantages, and writes that small derived column back to
-DataPlane. Model tensors still move through DataPlane or NCCL.
+CPU-only Ray actor that runs three concurrent pumps and coordinates the
+other actors via lightweight RPCs. SC sends control signals and reads
+metadata only — model tensors still move through DataPlane or NCCL.
 
 Data flow:
   _rollout_pump  → rollout_manager.generate_and_push(prompt)
-                     RolloutManager runs the rollout and hands the
-                     ``PromptGroupRecord`` to ``TQReplayBuffer.add``, which
-                     tensorizes it (``record_to_train_batch`` →
-                     ``pack_payload``) and writes N training rows to TQ
-                     as one prompt-group.
-  _train_pump    → sampler.evict(trainer_version)
-                     → ``buffer.remove`` drops stale groups + clears TQ rows.
-                 → sampler.select(...)
-                     → ``KVBatchMeta`` covering K prompt groups (or None).
-                       This meta is already trainable — no second pass.
-                 → _advantage_pump(train_meta)
-                     → dp_client.get_samples → compute → dp_client.put_samples.
-                 → trainer.train_on_meta(train_meta)
-                     Trainer → dp_client.get_samples to load tensors.
-                 → buffer.remove(train_meta.sample_ids)
-                     → drops trained groups + clears their TQ rows.
-  _sync_weights  → drain _inflight_rollouts → WeightSynchronizer.sync_weights()
+                     → TQReplayBuffer.add tensorizes the record and writes
+                       N training rows to TQ as one prompt-group.
+  _train_pump    → sampler.evict → buffer.remove (stale groups).
+                 → sampler.select → KVBatchMeta of K groups (or None);
+                   meta is already trainable.
+                 → _advantage_pump (get → compute → put).
+                 → trainer.train_on_meta.
+                 → buffer.remove (trained groups).
+  _sync_weights  → drain _inflight_rollouts → WeightSynchronizer.sync_weights.
 """
 
 from __future__ import annotations
@@ -328,15 +314,13 @@ class SingleControllerActor:
         """Drain stale groups, sample, train, drop.
 
         Per step:
-          1. ``sampler.evict`` → ``buffer.remove`` stale prompt-group entries.
-          2. ``sampler.select`` → ``train_meta`` covering K prompt groups
-             (or None). Already trainable — buffer wrote training-shaped
-             rows at rollout time.
-          3. ``_advantage_pump(train_meta)``.
-          4. ``trainer.train_on_meta(train_meta, dp_client)``.
-          5. ``buffer.remove(train_meta.sample_ids)`` drops trained groups
-             and clears their TQ rows; release ``_buffer_capacity`` per
-             dropped group, then sync.
+          1. sampler.evict → buffer.remove stale prompt-group entries.
+          2. sampler.select → train_meta covering K prompt groups (or None).
+             Already trainable — buffer wrote training-shaped rows at rollout time.
+          3. _advantage_pump(train_meta).
+          4. trainer.train_on_meta(train_meta, dp_client).
+          5. buffer.remove(train_meta.sample_ids) drops trained groups and clears
+             their TQ rows; release _buffer_capacity per dropped group, then sync.
         """
         while self._train_steps < self._cfg.max_train_steps:
             evicted = await self._sampler.evict(
