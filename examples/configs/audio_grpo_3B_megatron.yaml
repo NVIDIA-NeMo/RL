@@ -38,7 +38,6 @@ policy:
       mm_processor_cache_gb: 0
 
   megatron_cfg:
-    converter_type: Qwen2_5OmniForConditionalGeneration
     apply_rope_fusion: false
     optimizer:
       lr: 1.0e-6
