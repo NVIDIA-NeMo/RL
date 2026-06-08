@@ -1256,13 +1256,12 @@ class MegatronPolicyWorkerImpl(
         )
         self.model.train()
 
-        # Move optimizer state to CUDA if it exists
-        # colocated generation will always offload optimizer to cuda before refit
+        # Training expects optimizer state on CUDA. Keep this unconditional rather
+        # than trying to mirror every path that may have offloaded it to CPU.
         if (
             hasattr(self, "optimizer")
             and self.optimizer is not None
             and not self.optimizer_cpu_offload
-            and (self.offload_optimizer_for_logprob or self.is_generation_colocated)
         ):
             self.move_optimizer("cuda")
 

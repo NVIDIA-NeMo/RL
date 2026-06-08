@@ -122,6 +122,24 @@ data:
     ...
 ```
 
+##### Custom datasets defined outside NeMo RL
+
+If you want to plug in a dataset class that lives outside the `nemo_rl`
+package (so you don't have to edit the built-in registry), set
+`dataset_name` to a fully qualified dotted import path. The dispatcher
+will import the module and resolve the class. The class must accept the
+same kwargs as the built-in datasets (i.e. the full data config) and
+implement `set_task_spec` and `set_processor`.
+
+```yaml
+data:
+  default:
+    dataset_name: my_pkg.my_module.MyDataset  # importable from PYTHONPATH
+```
+
+The class must be importable — install it as a package or add its
+parent directory to `PYTHONPATH` before launching training.
+
 We support using a single dataset for both train and validation by using `split_validation_size` to set the validation ratio.
 [OpenAssistant](../../nemo_rl/data/datasets/response_datasets/oasst.py), [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py), [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py), [Tulu3SftMixtureDataset](../../nemo_rl/data/datasets/response_datasets/tulu3.py) are supported for this feature.
 If you want to support this feature for your custom datasets or other built-in datasets, you can simply add the code to the dataset like [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py).
@@ -455,6 +473,25 @@ grpo:
 ```
 
 Set `overlong_filtering` to true when training on tasks where truncation at the maximum sequence length is expected, such as long-form reasoning or mathematical proofs.
+
+#### Advantage Clipping
+
+After advantage normalization, per-token advantages can become very large when the per-prompt reward standard deviation is small. The optional `advantage_clip_low` and `advantage_clip_high` parameters clamp normalized advantages to a bounded range before policy training.
+
+When both values are `null` (the default), no clipping is applied. When set, advantages are clamped after normalization:
+
+$$
+A_{\text{clipped}} = \text{clamp}(A,\ \text{advantage\_clip\_low},\ \text{advantage\_clip\_high})
+$$
+
+To configure:
+```yaml
+grpo:
+  advantage_clip_low: null   # default: no lower bound
+  advantage_clip_high: null  # default: no upper bound
+```
+
+Set explicit bounds (for example, `-5.0` and `5.0`) when small reward variance produces extreme normalized advantages that destabilize training.
 
 #### Top-p and top-k filtering
 
