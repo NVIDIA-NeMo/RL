@@ -1,0 +1,83 @@
+# Non-colocated async 1-off GRPO on Qwen3-8B with TRT-LLM inference:
+#   4 GPUs Megatron training (TP=4) + 4 GPUs TRT-LLM generation (TP=4).
+# Off-policy by 1 step (max_trajectory_age_steps=1) with in-flight weight
+# updates and KV cache recompute on refit.
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  val_period: 10
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: true
+loss_fn:
+  use_importance_sampling_correction: true
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo-qwen3-8b-2n4g-megatron-trtllm-async-1off
+policy:
+  model_name: Qwen/Qwen3-8B-Base
+  train_micro_batch_size: 4
+  logprob_batch_size: 4
+  max_total_sequence_length: 8192
+  dtensor_cfg:
+    enabled: false
+  optimizer: null
+  scheduler: null
+  megatron_cfg:
+    enabled: true
+    converter_type: Qwen3ForCausalLM
+    tensor_model_parallel_size: 4
+    attention_backend: flash
+    optimizer:
+      lr: 1.0e-06
+      min_lr: 1.0e-06
+      weight_decay: 0.1
+      use_precision_aware_optimizer: false
+    scheduler:
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 1.0e-07
+  make_sequence_length_divisible_by: ${mul:${policy.megatron_cfg.tensor_model_parallel_size}, 2}
+  generation:
+    backend: trtllm
+    trtllm_cfg:
+      tensor_parallel_size: 4
+      precision: ${policy.precision}
+      max_model_len: ${policy.max_total_sequence_length}
+      max_batch_size: 256
+      max_num_tokens: 65536
+      async_engine: true
+      gpu_memory_utilization: 0.8
+      in_flight_weight_updates: true
+      recompute_kv_cache_after_weight_updates: true
+    trtllm_kwargs:
+      batch_wait_timeout_iters: 32
+      batch_wait_max_tokens_ratio: 0.5
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 1
+        gpus_per_node: 4
+data:
+  max_input_seq_length: 2048
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+env:
+  dapo:
+    num_workers: 16
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+logger:
+  log_dir: logs/grpo-qwen3-8b-2n4g-megatron-trtllm-async-1off
+  wandb_enabled: true
+  wandb:
+    project: nemorl-trtllm-run
+    name: grpo-qwen3-8b-2n4g-megatron-trtllm-async-1off-overlap-with-seq-dump
+cluster:
+  gpus_per_node: 4
+  num_nodes: 2

@@ -248,10 +248,26 @@ class TrtllmAsyncGenerationWorkerImpl(TrtllmGenerationWorkerImpl):
         assert self.llm is not None
         await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
-    async def update_weights_from_collective_async(self) -> bool:
+    async def update_weights_from_collective_async(
+        self, *, drain: bool = True, recompute_kv: bool = False
+    ) -> bool:
+        """Async version of ``update_weights_from_collective``.
+
+        Args:
+            drain: If False, run the refit at a scheduler step boundary
+                without draining in-flight requests (in-flight weight
+                update). Default True preserves the original drain-first
+                behavior.
+            recompute_kv: If True (and ``drain=False``), preempt all
+                in-flight requests after the refit so the scheduler
+                re-prefills them under the new weights.
+        """
         assert self.llm is not None
         try:
-            results = await self.llm.collective_rpc("update_weights_from_collective")
+            results = await self.llm.collective_rpc(
+                "update_weights_from_collective",
+                kwargs={"drain": drain, "recompute_kv": recompute_kv},
+            )
             worker_result = results[0] if results else True
             if not worker_result:
                 print(
@@ -321,10 +337,9 @@ class TrtllmAsyncGenerationWorkerImpl(TrtllmGenerationWorkerImpl):
         # the next wake-up would point at stale entries.
         if self.llm is None:
             return True
-        await self.llm.collective_rpc("reset_prefix_cache")
+        await self.reset_prefix_cache_async()
         await self.llm.release(self._all_sleep_tags())
         import gc
-
         gc.collect()
         torch.cuda.empty_cache()
         return True
@@ -336,16 +351,10 @@ class TrtllmAsyncGenerationWorkerImpl(TrtllmGenerationWorkerImpl):
         await self.llm.resume(tags)
         return True
 
-    async def reset_prefix_cache_async(self) -> bool:
-        if self.llm is not None:
-            try:
-                await self.llm.collective_rpc("reset_prefix_cache")
-            except Exception:
-                pass
-        import gc
-
-        gc.collect()
-        torch.cuda.empty_cache()
+    async def reset_prefix_cache_async(self, **kwargs: Any) -> bool:
+        if self.llm is None:
+            return True
+        await self.llm.reset_prefix_cache()
         return True
 
     # ------------------------------------------------------------------ #

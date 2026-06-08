@@ -199,7 +199,9 @@ class TrtllmGenerationWorkerImpl:
     #  Collective RPC dispatch (overridden by TrtllmAsyncGenerationWorker)
     # ------------------------------------------------------------------ #
 
-    def _collective_rpc(self, method: str, *, args: tuple = ()):
+    def _collective_rpc(
+        self, method: str, *, args: tuple = (), kwargs: Optional[dict] = None
+    ):
         """Dispatch a TRT-LLM collective_rpc call.
 
         The sync ``LLM`` exposes the private ``_collective_rpc``; the async
@@ -207,7 +209,7 @@ class TrtllmGenerationWorkerImpl:
         through a background event loop.
         """
         assert self.llm is not None
-        return self.llm._collective_rpc(method, args=args)
+        return self.llm._collective_rpc(method, args=args, kwargs=kwargs)
 
     # ------------------------------------------------------------------ #
     #  Collective init / refit
@@ -229,9 +231,25 @@ class TrtllmGenerationWorkerImpl:
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         self._collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
-    def update_weights_from_collective(self) -> bool:
+    def update_weights_from_collective(
+        self, *, drain: bool = True, recompute_kv: bool = False
+    ) -> bool:
+        """Trigger NCCL-broadcast weight refit on all TRT-LLM workers.
+
+        Args:
+            drain: If False, run the refit at a scheduler step boundary
+                without draining in-flight requests (in-flight weight
+                update). Default True preserves the original drain-first
+                behavior.
+            recompute_kv: If True (and ``drain=False``), preempt all
+                in-flight requests after the refit so the scheduler
+                re-prefills them under the new weights.
+        """
         try:
-            results = self._collective_rpc("update_weights_from_collective")
+            results = self._collective_rpc(
+                "update_weights_from_collective",
+                kwargs={"drain": drain, "recompute_kv": recompute_kv},
+            )
             worker_result = results[0] if results else True
             if not worker_result:
                 print(f"Error: TRT-LLM worker failed to update weights. Result: {worker_result}")
@@ -259,6 +277,9 @@ class TrtllmGenerationWorkerImpl:
 
     def report_device_id(self) -> list[str]:
         return self._collective_rpc("report_device_id")
+
+    def reset_prefix_cache(self) -> bool:
+        return self._collective_rpc("reset_prefix_cache")
 
     # ------------------------------------------------------------------ #
     #  Generation
@@ -342,20 +363,6 @@ class TrtllmGenerationWorkerImpl:
     def _generate_impl(self, prompts, sampling_params):
         """Run a batch of prompts on the sync LLM (overridden by the async subclass)."""
         return self.llm.generate(prompts, sampling_params=sampling_params)
-
-    # ------------------------------------------------------------------ #
-    #  Prefix cache
-    # ------------------------------------------------------------------ #
-
-    def reset_prefix_cache(self) -> bool:
-        if self.llm is not None:
-            try:
-                self._collective_rpc("reset_prefix_cache")
-            except Exception:
-                pass
-        gc.collect()
-        torch.cuda.empty_cache()
-        return True
 
     # ------------------------------------------------------------------ #
     #  Helpers

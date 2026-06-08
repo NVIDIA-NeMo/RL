@@ -438,10 +438,21 @@ class TrtllmGeneration(GenerationInterface):
     def update_weights_from_collective(self) -> list[ray.ObjectRef]:
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group not initialised")
+        # Both fields are NotRequired in TrtllmSpecificArgs; bool(None) is
+        # False, so callers who omit them get the original drain-first
+        # behavior without us baking a hidden default into the .get() call
+        # (see skills/config-conventions/SKILL.md).
+        trtllm_cfg = self.cfg["trtllm_cfg"]
+        in_flight = bool(trtllm_cfg.get("in_flight_weight_updates"))
+        recompute_kv = bool(
+            trtllm_cfg.get("recompute_kv_cache_after_weight_updates")
+        )
         return self.worker_group.run_all_workers_single_data(
             "update_weights_from_collective_async" if self.async_engine
             else "update_weights_from_collective",
             run_rank_0_only_axes=["tensor_parallel"],
+            drain=not in_flight,
+            recompute_kv=recompute_kv,
         )
 
     def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
@@ -455,16 +466,21 @@ class TrtllmGeneration(GenerationInterface):
         )
 
     def invalidate_kv_cache(self) -> bool:
-        try:
-            futures = self.worker_group.run_all_workers_single_data(
-                "reset_prefix_cache_async" if self.async_engine else "reset_prefix_cache",
-                run_rank_0_only_axes=["tensor_parallel"],
-            )
-            results = ray.get(futures)
-            return all(r for r in results if r is not None)
-        except Exception as e:
-            print(f"Error invalidating TRT-LLM caches: {e}")
-            return False
+        """No-op for TRT-LLM: KV cache invalidation is performed atomically
+        inside the refit path.
+
+        For async RL correctness, KV/prefix-cache invalidation must happen in
+        the same engine step boundary as the weight update — otherwise
+        in-flight requests forward several decode steps with new weights ×
+        old KV, opening a race window.
+
+        TRT-LLM avoids this by performing the invalidation inside the refit
+        function itself, under the same ``control_action`` context:
+          * ``NcclExtension.update_weights_from_collective`` (NCCL path)
+          * ``NcclExtension.update_weights_via_ipc_zmq`` (IPC-ZMQ path)
+
+        """
+        return True
 
     def shutdown(self) -> bool:
         try:

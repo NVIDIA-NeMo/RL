@@ -37,6 +37,8 @@ class TrtllmSpecificArgs(TypedDict):
     # affect how MoE expert weights are partitioned inside each TP rank.
     moe_tensor_parallel_size: NotRequired[int]
     moe_expert_parallel_size: NotRequired[int]
+    in_flight_weight_updates: NotRequired[bool]
+    recompute_kv_cache_after_weight_updates: NotRequired[bool]
 
 
 class TrtllmConfig(GenerationConfig):

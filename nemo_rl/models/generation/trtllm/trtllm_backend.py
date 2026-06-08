@@ -90,9 +90,28 @@ class NcclExtension(WorkerExtension):
     #  NCCL weight receive + reload
     # ------------------------------------------------------------------ #
 
-    @control_action_decorator
-    def update_weights_from_collective(self) -> bool:
-        """Receive weights via NCCL broadcast and update model parameters."""
+    def update_weights_from_collective(
+        self,
+        *,
+        drain: bool = True,
+        recompute_kv: bool = False,
+    ) -> bool:
+        """Receive weights via NCCL broadcast and update model parameters.
+
+        Args:
+            drain: If True (default), wait for all in-flight requests to
+                drain before applying weights — exclusive engine access.
+                If False, the swap happens at a scheduler step boundary
+                with in-flight requests still in the engine (in-flight
+                weight update).
+            recompute_kv: Only meaningful with ``drain=False``. If True,
+                preempt every in-flight request after the swap so the
+                scheduler re-prefills them under the new weights, and
+                clear the prefix-reuse pool. If False, in-flight requests
+                keep decoding with their existing KV cache (new-Q × old-K
+                mixing on the first decode under new weights — callers
+                tolerate this via importance-sampling correction).
+        """
         assert hasattr(self, "state_dict_info") and self.state_dict_info is not None, (
             "state_dict_info not set — call prepare_refit_info first"
         )
@@ -104,31 +123,38 @@ class NcclExtension(WorkerExtension):
                 model, dict(weight_list), allow_partial_loading=True,
             )
 
-        try:
-            for module in model.modules():
-                if hasattr(module, "pre_reload_weights") and not getattr(module, "_weights_removed", False):
-                    module.pre_reload_weights()
-            packed_broadcast_consumer(
-                iterator=iter(self.state_dict_info.items()),
-                group=self.model_update_group,
-                src=0,
-                post_unpack_func=load_model_weight_func,
-            )
-            for module in model.modules():
-                if hasattr(module, "process_weights_after_loading") and not getattr(
-                    module, "_weights_removed", False
-                ):
-                    module.process_weights_after_loading()
-                if hasattr(module, "post_load_weights") and not getattr(module, "_weights_removed", False):
-                    module.post_load_weights()
-            torch.cuda.current_stream().synchronize()
-        except Exception as e:
-            print(
-                f"Error in NcclExtension.update_weights_from_collective: {e}"
-            )
-            import traceback
-            traceback.print_exc()
-            return False
+        with self.engine.control_action(drain=drain):
+            try:
+                # TRT-LLM uses the overlap scheduler by default: control_action
+                # fires at a step boundary as soon as scheduling for the previous
+                # iter is enqueued, but its GPU forward may still be in flight.
+                # Block here so we don't overwrite weights mid-forward
+                torch.cuda.synchronize()
+                for module in model.modules():
+                    if hasattr(module, "pre_reload_weights") and not getattr(module, "_weights_removed", False):
+                        module.pre_reload_weights()
+                packed_broadcast_consumer(
+                    iterator=iter(self.state_dict_info.items()),
+                    group=self.model_update_group,
+                    src=0,
+                    post_unpack_func=load_model_weight_func,
+                )
+                for module in model.modules():
+                    if hasattr(module, "process_weights_after_loading") and not getattr(
+                        module, "_weights_removed", False
+                    ):
+                        module.process_weights_after_loading()
+                    if hasattr(module, "post_load_weights") and not getattr(module, "_weights_removed", False):
+                        module.post_load_weights()
+                torch.cuda.current_stream().synchronize()
+
+                if not drain and recompute_kv:
+                    self.engine.reset_prefix_cache()
+            except Exception as e:
+                print(
+                    f"Error in NcclExtension.update_weights_from_collective: {e}"
+                )
+                return False
 
         return True
 
