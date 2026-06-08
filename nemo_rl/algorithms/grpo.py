@@ -255,7 +255,10 @@ def setup(
     """Main entry point for running GRPO algorithm.
 
     Returns:
-        tuple of policy, cluster, dataloader, tokenizer, loss_fn, math_env, logger, master_config, val_dataloader
+        An 11-tuple, in order:
+            policy, policy_generation, nemo_gym (the NeMo-Gym env actor, or None
+            when not enabled), cluster, dataloader, val_dataloader, loss_fn,
+            logger, checkpointer, grpo_save_state, master_config.
     """
     # Start timing the entire setup process
     setup_start_time = time.perf_counter()
@@ -437,15 +440,11 @@ def setup(
     nemo_gym_actor = None
     if enable_nemo_gym:
         nemo_gym_num_nodes = env_configs.get("nemo_gym", {}).get("num_gpu_nodes", 0)
-        nemo_gym_num_gpus_per_node = cluster_config["gpus_per_node"]
         ray_runtime_ctx = ray.get_runtime_context()
         ray_cur_node_id = ray_runtime_ctx.get_node_id()
-        ray_namespace = ray_runtime_ctx.namespace
     else:
         nemo_gym_num_nodes = 0
-        nemo_gym_num_gpus_per_node = 0
         ray_cur_node_id = None
-        ray_namespace = None
 
     total_nodes = cluster_config["num_nodes"]
     if rm_env_enabled:
@@ -803,8 +802,6 @@ def setup(
                 nemo_gym_cfg = NemoGymConfig(
                     model_name=generation_config["model_name"],
                     base_urls=deferred_vllm.dp_openai_server_base_urls,
-                    ray_num_gpus_per_node=nemo_gym_num_gpus_per_node,
-                    ray_namespace=ray_namespace,
                     invalid_tool_call_patterns=invalid_tool_call_patterns,
                     thinking_tags=thinking_tags,
                     initial_global_config_dict=nemo_gym_dict,
