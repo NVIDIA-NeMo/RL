@@ -186,6 +186,10 @@ class GenerationRouter:
         uvicorn_backlog: int = _DEFAULT_UVICORN_BACKLOG,
         uvicorn_keep_alive_s: int = _DEFAULT_UVICORN_KEEP_ALIVE_S,
         reset_collective_timeout_s: float = _DEFAULT_RESET_COLLECTIVE_TIMEOUT_S,
+        auto_backfill: bool = False,
+        backfill_target: Optional[int] = None,
+        backfill_max_concurrent: int = 4,
+        pg_ready_timeout_s: float = 600.0,
     ):
         self.port = port
         self.health_poll_interval_s = health_poll_interval_s
@@ -199,6 +203,19 @@ class GenerationRouter:
         self.uvicorn_keep_alive_s = uvicorn_keep_alive_s
         self.proxy_timeout_s = proxy_timeout_s
         self._reset_collective_timeout_s = reset_collective_timeout_s
+
+        # RL-412 auto-backfill (state-driven recovery). When enabled, the
+        # health-poll loop restores the gen world to ``_backfill_target_count``
+        # by calling add_shard for the deficit — covering collateral
+        # poison-evicted shards the fault injector never replaces.
+        self.auto_backfill = auto_backfill
+        self._backfill_target = backfill_target
+        self.backfill_max_concurrent = max(1, int(backfill_max_concurrent))
+        self.pg_ready_timeout_s = float(pg_ready_timeout_s)
+        # add_shard calls launched by the reconciler that have not yet
+        # registered a ``joining`` shard (PG still booting). Counted in the
+        # deficit so repeated ticks don't over-provision.
+        self._inflight_adds: int = 0
 
         self._shards: dict[str, ShardEntry] = {}
         self._rr_index: int = 0
@@ -997,6 +1014,13 @@ class GenerationRouter:
                 raise
             except Exception as e:  # noqa: BLE001 - keep loop alive across transient errors
                 print(f"[router] health poll iteration failed: {e}", flush=True)
+            # RL-412 auto-backfill: restore the gen world to target after any
+            # shard loss (killed or poison-evicted). Guarded so a reconcile
+            # failure never kills the health loop.
+            try:
+                self._reconcile_backfill()
+            except Exception as e:  # noqa: BLE001
+                print(f"[router] reconcile tick failed: {e}", flush=True)
             await asyncio.sleep(self.health_poll_interval_s)
 
     async def _per_worker_results(
@@ -2160,6 +2184,57 @@ class GenerationRouter:
             if s.status in ("ready", "joining")
         )
 
+    def _backfill_target_count(self) -> int:
+        """Target number of gen shards to maintain. Explicit override, else the
+        bootstrap cohort size (recorded by ``register_shards``)."""
+        if self._backfill_target is not None:
+            return int(self._backfill_target)
+        return int(self._total_shards_at_bootstrap)
+
+    def _backfill_deficit(self) -> int:
+        """How many shards short of target, counting shards already booting.
+
+        ``shard_count_alive_for_collective`` counts ``ready`` + ``joining``
+        shards; ``_inflight_adds`` counts add_shard calls whose PG is still
+        booting (not yet ``joining``). Both are shard counts, matching the
+        shard-count target."""
+        in_world = self.shard_count_alive_for_collective() + self._inflight_adds
+        return max(0, self._backfill_target_count() - in_world)
+
+    def _reconcile_backfill(self) -> int:
+        """If under target, launch up to ``backfill_max_concurrent`` (minus
+        already in-flight) ``add_shard`` tasks to restore the gen world —
+        regardless of whether the missing shards were killed or poison-evicted.
+
+        Non-blocking: each add_shard is fired as a background task (its PG boot
+        happens off the request path). ``_inflight_adds`` is reserved here and
+        released in ``_backfill_one`` so repeated ticks don't over-provision.
+        Returns the number of tasks launched this tick."""
+        if not self.auto_backfill or self._generation is None:
+            return 0
+        deficit = self._backfill_deficit()
+        slots = max(0, self.backfill_max_concurrent - self._inflight_adds)
+        launch = min(deficit, slots)
+        for _ in range(launch):
+            self._inflight_adds += 1
+            asyncio.create_task(self._backfill_one())
+        if launch:
+            print(
+                f"[router] auto-backfill: launching {launch} add_shard(s) "
+                f"(deficit={deficit}, in_flight={self._inflight_adds}, "
+                f"target={self._backfill_target_count()})",
+                flush=True,
+            )
+        return launch
+
+    async def _backfill_one(self) -> None:
+        try:
+            await self.add_shard(reason="auto-backfill")
+        except Exception as e:  # noqa: BLE001 - keep the reconciler alive
+            print(f"[router] auto-backfill add_shard failed: {e}", flush=True)
+        finally:
+            self._inflight_adds -= 1
+
     def current_gen_world_size(self) -> int:
         """World size to advertise to the train side for init_collective.
 
@@ -2219,6 +2294,9 @@ class GenerationRouter:
             "num_draining_shards": draining,
             "num_total_shards": len(self._shards),
             "total_shards_at_bootstrap": self._total_shards_at_bootstrap,
+            "backfill_target": self._backfill_target_count(),
+            "backfill_in_flight": self._inflight_adds,
+            "backfill_deficit": self._backfill_deficit(),
             "cumulative_shards_removed": self._cumulative_shards_removed,
             "cumulative_shards_added": self._cumulative_shards_added,
             "per_shard_world_size": self._per_shard_world_size,

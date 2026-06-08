@@ -134,6 +134,13 @@ class RouterConfig(TypedDict, total=False):
     proxy_pool_limit_per_host: int
     uvicorn_backlog: int
     uvicorn_keep_alive_s: int
+    # RL-412 auto-backfill: maintain the gen world at a target size by
+    # re-provisioning ANY lost shard (killed OR collateral poison-evicted),
+    # not just the ones a fault injector deliberately killed.
+    auto_backfill: bool
+    backfill_target: int
+    backfill_max_concurrent: int
+    pg_ready_timeout_s: float
 
 
 class GenerationConfig(TypedDict):

@@ -181,6 +181,10 @@ def main():
             "proxy_pool_limit_per_host",
             "uvicorn_backlog",
             "uvicorn_keep_alive_s",
+            "auto_backfill",
+            "backfill_target",
+            "backfill_max_concurrent",
+            "pg_ready_timeout_s",
         )
         if k in router_cfg
     }

@@ -1768,3 +1768,109 @@ async def test_fire_cordon_hook_auto_removes_when_other_shards_alive(monkeypatch
     # dp-a's actor got ray.kill'd; dp-b untouched.
     assert "dp-a-leader" in killed
     assert "dp-b-leader" not in killed
+
+
+# =====================================================================
+# RL-412 auto-backfill reconciler
+# =====================================================================
+import time as _time
+
+
+def _seed_shards(r: GenerationRouter, statuses: dict) -> None:
+    """Seed router._shards with minimal ShardEntry rows. statuses maps
+    shard_id -> status string."""
+    r._shards = {
+        sid: ShardEntry(
+            shard_id=sid, url="", status=st, last_health_ok_at=_time.monotonic()
+        )
+        for sid, st in statuses.items()
+    }
+
+
+def test_backfill_deficit_counts_ready_joining_and_inflight():
+    r = GenerationRouter(port=0, backfill_target=8)
+    _seed_shards(r, {"dp-0": "ready", "dp-1": "ready", "dp-2": "joining",
+                     "dp-3": "cordoned"})
+    # alive (ready+joining) = 3; cordoned excluded; target 8 -> deficit 5
+    assert r._backfill_deficit() == 5
+    r._inflight_adds = 2
+    # 3 alive + 2 in-flight => deficit 3
+    assert r._backfill_deficit() == 3
+
+
+def test_backfill_target_defaults_to_bootstrap():
+    r = GenerationRouter(port=0)  # no explicit target
+    r._total_shards_at_bootstrap = 8
+    _seed_shards(r, {"dp-0": "ready"})
+    assert r._backfill_target_count() == 8
+    assert r._backfill_deficit() == 7
+
+
+@pytest.mark.asyncio
+async def test_reconcile_launches_capped_by_max_concurrent_and_inflight():
+    r = GenerationRouter(port=0, auto_backfill=True, backfill_target=8,
+                         backfill_max_concurrent=3)
+    r._generation = object()  # non-None so reconciler is active
+    _seed_shards(r, {"dp-0": "ready", "dp-1": "ready"})  # alive=2, deficit=6
+
+    calls = {"n": 0}
+
+    async def _fake_add_shard(reason="manual"):
+        calls["n"] += 1
+        await asyncio.sleep(0.01)  # simulate PG boot
+        return {"added": True, "shard_id": f"dp-x{calls['n']}"}
+
+    r.add_shard = _fake_add_shard  # type: ignore[assignment]
+
+    launched = r._reconcile_backfill()
+    assert launched == 3            # capped by max_concurrent
+    assert r._inflight_adds == 3    # reserved immediately
+    # second tick while 3 in-flight => no new launches (slots full)
+    assert r._reconcile_backfill() == 0
+    await asyncio.sleep(0.05)       # let the 3 tasks finish
+    assert calls["n"] == 3
+    assert r._inflight_adds == 0    # released after completion
+
+
+@pytest.mark.asyncio
+async def test_reconcile_noop_when_disabled_or_no_generation():
+    r = GenerationRouter(port=0, auto_backfill=False, backfill_target=8)
+    r._generation = object()
+    _seed_shards(r, {"dp-0": "ready"})
+    assert r._reconcile_backfill() == 0   # disabled
+    r.auto_backfill = True
+    r._generation = None
+    assert r._reconcile_backfill() == 0   # no backing generation
+
+
+@pytest.mark.asyncio
+async def test_health_loop_calls_reconcile_each_tick(monkeypatch):
+    r = GenerationRouter(port=0, auto_backfill=True, health_poll_interval_s=0.05,
+                         backfill_target=8)
+    r._generation = object()
+    _seed_shards(r, {"dp-0": "ready"})
+    r._http_session = aiohttp.ClientSession()
+    ticks = {"n": 0}
+    monkeypatch.setattr(
+        r, "_reconcile_backfill",
+        lambda: ticks.__setitem__("n", ticks["n"] + 1) or 0,
+    )
+    task = asyncio.create_task(r._health_poll_loop())
+    await asyncio.sleep(0.2)   # ~3-4 ticks
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):
+        pass
+    await r._http_session.close()
+    assert ticks["n"] >= 2
+
+
+def test_metrics_snapshot_includes_backfill_fields():
+    r = GenerationRouter(port=0, auto_backfill=True, backfill_target=8)
+    _seed_shards(r, {"dp-0": "ready", "dp-1": "joining"})
+    r._inflight_adds = 1
+    snap = r.metrics_snapshot()
+    assert snap["backfill_target"] == 8
+    assert snap["backfill_in_flight"] == 1
+    assert snap["backfill_deficit"] == 8 - 2 - 1  # target - (ready+joining) - inflight
