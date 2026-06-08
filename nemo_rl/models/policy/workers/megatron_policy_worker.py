@@ -629,9 +629,17 @@ class MegatronPolicyWorkerImpl(
         # bypasses ``no_sync``). Save the existing value so we can restore
         # at finish/abort. PP=1's ``forward_backward_no_pipelining`` doesn't
         # invoke this; nulling it is a no-op there.
-        model_config = self.model.config
-        state["saved_grad_sync_func"] = getattr(model_config, "grad_sync_func", None)
-        model_config.grad_sync_func = None
+        # Read "config" via getattr-by-string so the token stays out of
+        # begin_train_step.__code__.co_names; otherwise cloudpickle matches
+        # torch.distributed.config (a non-pickleable ConfigModuleInstance).
+        model_config = getattr(self.model, "config", None)
+        if model_config is not None:
+            state["saved_grad_sync_func"] = getattr(
+                model_config, "grad_sync_func", None
+            )
+            model_config.grad_sync_func = None
+        else:
+            state["saved_grad_sync_func"] = None
 
         self._train_step_state = state
 
@@ -809,7 +817,10 @@ class MegatronPolicyWorkerImpl(
             torch.cuda.empty_cache()
 
         # Restore grad_sync_func before scheduler.step / further state.
-        self.model.config.grad_sync_func = state["saved_grad_sync_func"]
+        # See begin_train_step for why .config is accessed by string.
+        finish_model_config = getattr(self.model, "config", None)
+        if finish_model_config is not None:
+            finish_model_config.grad_sync_func = state["saved_grad_sync_func"]
 
         # Scheduler increment matches sync path's ``increment=gbs``.
         self.scheduler.step(increment=state["gbs"])
@@ -886,7 +897,10 @@ class MegatronPolicyWorkerImpl(
             )
         # Restore grad_sync_func first so the model is back to a normal
         # state before zero_grad_buffer touches anything.
-        self.model.config.grad_sync_func = state["saved_grad_sync_func"]
+        # See begin_train_step for why .config is accessed by string.
+        abort_model_config = getattr(self.model, "config", None)
+        if abort_model_config is not None:
+            abort_model_config.grad_sync_func = state["saved_grad_sync_func"]
         self.model.zero_grad_buffer()
         self.optimizer.zero_grad()
         self._train_step_state = None
