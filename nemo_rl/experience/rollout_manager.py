@@ -16,17 +16,23 @@ import asyncio
 import copy
 import json
 import uuid
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
+import numpy as np
 import torch
 from transformers import PreTrainedTokenizerBase
 from wandb import Table
 
 from nemo_rl.data.interfaces import DatumSpec
-from nemo_rl.data_plane.column_io import kv_first_write
+from nemo_rl.data_plane.codec import pack_jagged_fields
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
+
+if TYPE_CHECKING:
+    from tensordict import TensorDict
+
+    from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.experience.rollouts import (
     _calculate_single_metric,
     _tensorize_by_key,
@@ -583,7 +589,7 @@ class AsyncNemoGymRolloutImpl:
 
 
 class RolloutManager:
-    """Routes to AsyncRolloutImpl (native async) or AsyncNemoGymRolloutImpl (NeMo-Gym), and pushes results to TQ."""
+    """Routes to AsyncRolloutImpl (native async) or AsyncNemoGymRolloutImpl (NeMo-Gym), and pushes results to a TQReplayBuffer."""
 
     def __init__(
         self,
@@ -595,9 +601,7 @@ class RolloutManager:
         policy_generation: Optional[GenerationInterface] = None,
         generation_config: Optional[GenerationConfig] = None,
         use_nemo_gym: bool = False,
-        dp_client: Optional[Any] = None,
-        partition_id: str = "rollout_data",
-        task_name: str = "train",
+        tq_buffer: Optional["TQReplayBuffer"] = None,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
@@ -627,9 +631,7 @@ class RolloutManager:
         )
         self._tokenizer = tokenizer
         self._num_generations_per_prompt = num_generations_per_prompt
-        self._dp_client = dp_client
-        self._partition_id = partition_id
-        self._task_name = task_name
+        self._tq_buffer = tq_buffer
         self._weight_version: int = 0
 
     def set_weight_version(self, version: int) -> None:
@@ -644,31 +646,27 @@ class RolloutManager:
         return await self._impl.run_rollout(input_sample)
 
     async def generate_and_push(self, input_sample: DatumSpec) -> None:
-        """Run one prompt's rollout and push the N completions to TQ in one put.
+        """Run one prompt's rollout and write the N completions through the buffer.
 
         Args:
             input_sample: A single prompt (one DatumSpec entry).
         """
-        assert self._dp_client is not None, (
-            "generate_and_push requires dp_client to be set at __init__"
+        assert self._tq_buffer is not None, (
+            "generate_and_push requires tq_buffer to be set at __init__"
         )
         record = await self.run_rollout(input_sample)
-        bulk_batch, tags, sample_ids = self._build_tq_payload(record)
-        kv_first_write(
-            bulk_batch,
+        sample_ids, fields_td, tags = self._build_tq_payload(record)
+        await self._tq_buffer.add(
             sample_ids=sample_ids,
-            dp_client=self._dp_client,
-            partition_id=self._partition_id,
-            task_name=self._task_name,
+            fields=fields_td,
             tags=tags,
+            weight_version=self._weight_version,
         )
 
-    # TODO(async-rl): tmp shim. will be removed once StalenessSampler is rewritten
-    # and the canonical async-RL TQ payload is locked in.
     def _build_tq_payload(
         self, record: PromptGroupRecord
-    ) -> tuple[BatchedDataDict[Any], list[dict[str, Any]], list[str]]:
-        """Build the bulk_batch, tags, and sample_ids that kv_first_write expects."""
+    ) -> tuple[list[str], "TensorDict", list[dict[str, Any]]]:
+        """Build the payload that ``TQReplayBuffer.add`` expects."""
         # Lazy imports: grpo and llm_message_utils both transitively pull
         # experience.rollouts, so importing at module top risks a cycle.
         from nemo_rl.algorithms.grpo import (
@@ -719,15 +717,15 @@ class RolloutManager:
             }
         )
 
+        tensor_fields: dict[str, torch.Tensor | np.ndarray] = {
+            k: v
+            for k, v in bulk_batch.items()
+            if isinstance(v, torch.Tensor)
+            or (isinstance(v, np.ndarray) and v.dtype == object)
+        }
+        fields_td = pack_jagged_fields(tensor_fields, lengths=input_lengths)
+
         group_uuid = str(uuid.uuid4())
         sample_ids = [f"{group_uuid}_g{i}" for i in range(n)]
-        tags = [
-            {
-                "group_id": group_uuid,
-                "weight_version": self._weight_version,
-                "committed": True,
-                "expected_num_samples": n,
-            }
-            for _ in range(n)
-        ]
-        return bulk_batch, tags, sample_ids
+        tags = [{"weight_version": self._weight_version} for _ in range(n)]
+        return sample_ids, fields_td, tags

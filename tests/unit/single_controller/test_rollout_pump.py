@@ -285,6 +285,5 @@ def test_rollout_pump_writes_expected_tq_data(
     )
     for tag in tags:
         assert tag["weight_version"] == 0
-        assert tag["expected_num_samples"] == num_generations
-        assert tag["committed"] is True
-        assert tag["group_id"] in group_ids
+        # Slim tag schema: weight_version is the only field producers stamp.
+        assert set(tag) == {"weight_version"}
