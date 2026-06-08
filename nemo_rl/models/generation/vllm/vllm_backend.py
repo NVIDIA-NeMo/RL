@@ -14,6 +14,7 @@
 import gc
 import re
 import traceback
+from collections.abc import Iterator
 from typing import Any
 
 import torch
@@ -25,7 +26,8 @@ from nemo_rl.models.policy.utils import (
     rebuild_cuda_tensor_from_ipc,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
-from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
+from nemo_rl.utils.weight_transfer import packed_weight_transfer_consumer
+from nemo_rl.utils.weight_transfer_protocol import additive_weight_load_context
 
 try:
     import vllm  # noqa: F401
@@ -36,6 +38,20 @@ except ImportError:
         "This error can also happen if the venv creation was aborted or errored out in the middle. In that case, "
         "please run at least once with the environment variable NRL_FORCE_REBUILD_VENVS=true set to force the rebuild of the environment."
     )
+
+
+def fix_gpt_oss_export_transpose(key: str, weight: torch.Tensor) -> torch.Tensor:
+    """Apply GPT-OSS down_proj transpose fix to the weight.
+
+    This is a workaround for the issue that the down_proj layout is not the same across different frameworks.
+        - HF needs [in, out] layout.
+        - Megatron needs [in, out] layout.
+        - vLLM needs [out, in] layout.
+    See https://github.com/NVIDIA-NeMo/Megatron-Bridge/pull/3271 for more details.
+    """
+    if key.endswith("mlp.experts.down_proj"):
+        weight = weight.transpose(-2, -1).contiguous()
+    return weight
 
 
 def fix_gemma3_vision_weight_name(key: str) -> str:
@@ -49,6 +65,12 @@ def fix_gemma3_vision_weight_name(key: str) -> str:
 
 
 class VllmInternalWorkerExtension:
+    state_dict_info: dict[str, Any] | None = None
+    delta_load_batch_size_bytes: int | None = None
+    model_update_group: Any
+    zmq_context: Any
+    zmq_socket: Any
+
     def init_collective(
         self,
         rank_prefix: int,
@@ -64,7 +86,7 @@ class VllmInternalWorkerExtension:
         # Place vLLM ranks after all training ranks so all training workers can join
         rank = train_world_size + rank_prefix + local_rank
 
-        self.model_update_group = StatelessProcessGroup(  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
+        self.model_update_group = StatelessProcessGroup(
             master_address=ip, port=port, rank=rank, world_size=world_size
         )
         self.model_update_group.init_nccl_communicator(device=self.device)
@@ -82,56 +104,46 @@ class VllmInternalWorkerExtension:
     def maybe_init_zmq(self):
         """Initialize the ZMQ socket if it doesn't exist."""
         if not hasattr(self, "zmq_socket"):
-            self.zmq_context = zmq.Context()  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
-            self.zmq_socket = self.zmq_context.socket(  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
-                zmq.REP
-            )
-            self.zmq_socket.setsockopt(
-                zmq.SNDTIMEO, 120000
-            )  # set timeout to 120 seconds
-            self.zmq_socket.setsockopt(
-                zmq.RCVTIMEO, 120000
-            )  # set timeout to 120 seconds
+            self.zmq_context = zmq.Context()
+            self.zmq_socket = self.zmq_context.socket(zmq.REP)
+            self.zmq_socket.setsockopt(zmq.SNDTIMEO, 120000)
+            self.zmq_socket.setsockopt(zmq.RCVTIMEO, 120000)
             self.zmq_socket.setsockopt(zmq.LINGER, 0)
             self.zmq_socket.connect(self.get_zmq_address())
 
-    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
-        """Prepare state dict metadata for weight refitting and IPC streaming.
+    def prepare_refit_info(
+        self,
+        state_dict_info: dict[str, Any],
+        delta_load_batch_size_bytes: int | None = None,
+    ) -> None:
+        """Prepare state dict metadata for IPC/ZMQ weight refitting.
+
+        Collective refit receives tensor metadata from the transfer headers.
 
         Args:
             state_dict_info (dict): A dictionary containing the info for refit.
                 e.g. {tensor_name: (shape, dtype)}
+            delta_load_batch_size_bytes (int | None): Maximum decoded delta bytes
+                to batch before calling vLLM load_weights. None means delta
+                transfer is disabled.
         """
-        self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
+        self.state_dict_info = state_dict_info
+        self.delta_load_batch_size_bytes = delta_load_batch_size_bytes
 
-    def _maybe_process_fp8_kv_cache(self) -> None:
-        """Process weights after loading for FP8 KV cache (static scales)."""
-        use_fp8_kv_cache = False
-        if hasattr(self.model_runner.vllm_config, "cache_config"):
-            kv_cache_dtype = getattr(
-                self.model_runner.vllm_config.cache_config, "cache_dtype", None
-            )
-            use_fp8_kv_cache = (
-                kv_cache_dtype is not None and "fp8" in str(kv_cache_dtype).lower()
-            )
-
-        if not use_fp8_kv_cache:
-            return
-
-        # FP8 KV cache: process KV scales after weight loading
+    def _process_weights_after_loading(
+        self,
+        model_config: Any,
+        target_device: torch.device,
+    ) -> None:
         from vllm.config import set_current_vllm_config
         from vllm.model_executor.model_loader.utils import (
             process_weights_after_loading,
         )
 
-        # Get target device for processing
-        target_device = next(self.model_runner.model.parameters()).device
-
-        # Call process_weights_after_loading to handle KV scales
         with set_current_vllm_config(self.model_runner.vllm_config):
             process_weights_after_loading(
                 self.model_runner.model,
-                self.model_runner.model_config,
+                model_config,
                 target_device,
             )
 
@@ -199,25 +211,39 @@ class VllmInternalWorkerExtension:
         if not draft_weights:
             return
 
-        draft_owner = getattr(self.model_runner, "drafter", None)
-        draft_model = getattr(draft_owner, "model", None) if draft_owner else None
-
+        draft_model = self._get_draft_model()
         if draft_model is None:
             print(
                 "[draft] Received draft weights but vLLM drafter is unavailable; skipping draft update."
             )
             return
         draft_weights = self._trim_vocab_padding(draft_model, draft_weights)
-        draft_model.load_weights(weights=draft_weights)
+        draft_model.load_weights(  # pyrefly: ignore[not-callable]  vLLM model API.
+            weights=draft_weights
+        )
 
-    def _load_weights(self, weights):
-        """Load weights with Gemma3 vision-tower weight name fix, FP8, and draft-weight support.
+    def _get_draft_model(self) -> torch.nn.Module | None:
+        draft_owner = getattr(self.model_runner, "drafter", None)
+        if draft_owner is None:
+            return None
+        return getattr(draft_owner, "model", None)
 
-        Applies Gemma3 vision-tower weight name fix if needed, splits policy/draft
-        weights, applies FP8 conversion if needed, and loads draft weights
-        into the drafter model.
+    def _load_weights(self, weights: list[tuple[str, torch.Tensor]]) -> None:
+        """Load weights with GPT-OSS, Gemma3, FP8, and draft-weight support.
+
+        Applies GPT-OSS down_proj transpose and Gemma3 vision-tower weight name
+        fixes if needed, splits policy/draft weights, applies FP8 conversion if
+        needed, and loads draft weights into the drafter model.
         """
         from nemo_rl.models.generation.vllm.quantization import fp8
+
+        if (
+            "GptOssForCausalLM"
+            in self.model_runner.vllm_config.model_config.architectures
+        ):
+            for idx, (key, weight) in enumerate(weights):
+                weight = fix_gpt_oss_export_transpose(key, weight)
+                weights[idx] = (key, weight)
 
         if (
             "Gemma3ForConditionalGeneration"
@@ -234,6 +260,21 @@ class VllmInternalWorkerExtension:
 
         self._load_draft_weights(draft_weights)
 
+    def _load_weight_deltas(self, weights: list[tuple[str, torch.Tensor]]) -> None:
+        """Apply additive weight deltas through vLLM's regular loaders."""
+        with additive_weight_load_context(self._iter_delta_load_target_tensors()):
+            self._load_weights(weights)
+
+    def _iter_delta_load_target_tensors(self) -> Iterator[torch.Tensor]:
+        """Yield model-owned tensors that should receive additive delta loads."""
+        yield from self.model_runner.model.parameters()
+        yield from self.model_runner.model.buffers()
+
+        draft_model = self._get_draft_model()
+        if draft_model is not None:
+            yield from draft_model.parameters()
+            yield from draft_model.buffers()
+
     @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(self) -> bool:
         """Receive and update model weights via ZMQ IPC socket.
@@ -241,50 +282,42 @@ class VllmInternalWorkerExtension:
         Returns:
             bool: True if weights were successfully updated.
         """
-        buffer = None
-        weights = None
+        state_dict_info = self.state_dict_info
+        assert state_dict_info is not None, (
+            "state_dict_info is not prepared. "
+            "Please call prepare_refit_info when initializing the worker."
+        )
 
         try:
             self.maybe_init_zmq()
             while True:
-                # Blocking receive with timeout (this is the main operation)
                 payload = self.zmq_socket.recv_pyobj()
 
                 if payload == IPCProtocol.COMPLETE:
-                    # means the update is done
-                    from vllm.config import set_current_vllm_config
-                    from vllm.model_executor.model_loader.utils import (
-                        process_weights_after_loading,
-                    )
-
-                    with set_current_vllm_config(self.model_runner.vllm_config):
-                        process_weights_after_loading(
-                            self.model_runner.model, self.model_config, self.device
-                        )
+                    self._process_weights_after_loading(self.model_config, self.device)
                     self.zmq_socket.send(IPCProtocol.ACK.value.encode())
                     break
 
                 ipc_handle, list_keys, used_bytes = payload
                 buffer = rebuild_cuda_tensor_from_ipc(ipc_handle, self.device.index)
 
-                weight = None
                 weights = []
                 offset = 0
                 for key in list_keys:
-                    shape, dtype = self.state_dict_info[key]  # pyrefly
+                    shape, dtype = state_dict_info[key]
                     if isinstance(shape, list):
                         shape = torch.Size(shape)
 
-                    # Get the weight from the buffer
                     size_in_bytes = dtype.itemsize * shape.numel()
-                    weight = (
-                        buffer[offset : offset + size_in_bytes]
-                        .view(dtype=dtype)
-                        .view(shape)
+                    weights.append(
+                        (
+                            key,
+                            buffer[offset : offset + size_in_bytes]
+                            .view(dtype=dtype)
+                            .view(shape),
+                        )
                     )
-                    weights.append((key, weight))
 
-                    # Move offset to the next weight
                     aligned_size = calculate_aligned_size(size_in_bytes)
                     offset += aligned_size
 
@@ -292,7 +325,6 @@ class VllmInternalWorkerExtension:
                     "Offset is not equal to used bytes, usually indicate inaccurate info like keys or cached dtype in state_dict_info"
                 )
 
-                # Load weights into the model
                 self._load_weights(weights)
 
                 torch.cuda.current_stream().synchronize()
@@ -302,14 +334,8 @@ class VllmInternalWorkerExtension:
                 # copied the data, Python may not garbage collect these view objects immediately.
                 # If sender reuses the buffer before GC runs, old views would read corrupted data.
                 # Explicit del ensures immediate cleanup before sending ACK.
-                del weight, weights, buffer
-                weight = None
-                weights = None
-                buffer = None
+                del weights, buffer
                 self.zmq_socket.send(IPCProtocol.ACK.value.encode())
-
-            # Process weights after loading for FP8 KV cache
-            self._maybe_process_fp8_kv_cache()
 
             gc.collect()
             torch.cuda.empty_cache()
@@ -326,23 +352,21 @@ class VllmInternalWorkerExtension:
     )
     def update_weights_from_collective(self) -> bool:
         """Update the model weights from collective communication."""
-        assert self.state_dict_info is not None, (
-            "state_dict_info is not prepared. "
-            "Please call prepare_refit_info when initializing the worker."
-        )
-
-        load_model_weight_func = self._load_weights
-
         try:
-            packed_broadcast_consumer(
-                iterator=iter(self.state_dict_info.items()),
+            transfer_result = packed_weight_transfer_consumer(
                 group=self.model_update_group,
                 src=0,
-                post_unpack_func=load_model_weight_func,
+                load_full_weights_func=self._load_weights,
+                load_delta_weights_func=self._load_weight_deltas,
+                device=self.device,
+                delta_load_batch_size_bytes=self.delta_load_batch_size_bytes,
             )
 
-            # Process weights after loading for FP8 KV cache
-            self._maybe_process_fp8_kv_cache()
+            if transfer_result.loaded_any and not transfer_result.is_delta_sync:
+                self._process_weights_after_loading(
+                    self.model_runner.model_config,
+                    next(self.model_runner.model.parameters()).device,
+                )
 
         except Exception as e:
             print(
@@ -354,7 +378,6 @@ class VllmInternalWorkerExtension:
 
     def cleanup(self) -> None:
         """Shutdown and cleanup resources."""
-        # Close ZMQ socket and context if they exist
         if hasattr(self, "zmq_socket"):
             self.zmq_socket.close()
             self.zmq_context.term()

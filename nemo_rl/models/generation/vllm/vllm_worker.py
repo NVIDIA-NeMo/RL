@@ -757,6 +757,12 @@ class BaseVllmGenerationWorker:
                     metrics[metric.name] = metric.value
         return metrics
 
+    def _get_delta_load_batch_size_bytes(self) -> int | None:
+        delta_config = self.cfg.get("delta_compression")
+        if delta_config is None or not delta_config["enabled"]:
+            return None
+        return int(delta_config["delta_load_batch_size_bytes"])
+
 
 class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
@@ -1003,7 +1009,10 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
 
     def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
         """Prepare the info for refit."""
-        self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
+        self.llm.collective_rpc(
+            "prepare_refit_info",
+            args=(state_dict_info, self._get_delta_load_batch_size_bytes()),
+        )
 
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(self) -> bool:

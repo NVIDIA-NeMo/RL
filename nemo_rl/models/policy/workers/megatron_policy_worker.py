@@ -91,7 +91,10 @@ from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
-from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+from nemo_rl.utils.weight_transfer import packed_weight_transfer_producer
+from nemo_rl.utils.weight_transfer_delta_tracker import (
+    create_vllm_delta_transfer_tracker,
+)
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
@@ -236,6 +239,9 @@ class MegatronPolicyWorkerImpl(
         )
         self.is_generation_colocated = runtime_config.is_generation_colocated
         self.sampling_params = runtime_config.sampling_params
+        self.delta_weight_transfer_tracker = create_vllm_delta_transfer_tracker(
+            self.cfg.get("generation")
+        )
         self.final_padded_vocab_size = runtime_config.final_padded_vocab_size
 
         self.defer_fp32_logits = self.cfg["megatron_cfg"].get(
@@ -1048,11 +1054,14 @@ class MegatronPolicyWorkerImpl(
         """Prepare state dict metadata for weight refitting and IPC streaming."""
         self.refit_param_info_mcore = self._calculate_refit_param_info()
 
-        # Collect tensor metadata for refit / hf side info
         refit_param_info_hf = {}
-        # Reuse shared iterator that appends FP8 KV/Q scales when enabled
         for name, tensor in self._iter_params_with_optional_kv_scales():
             refit_param_info_hf[name] = (tensor.shape, tensor.dtype)
+
+        if self.rank == 0 and self.delta_weight_transfer_tracker is not None:
+            self.delta_weight_transfer_tracker.prewarm_baseline_from_metadata(
+                refit_param_info_hf
+            )
 
         return refit_param_info_hf
 
@@ -1141,21 +1150,12 @@ class MegatronPolicyWorkerImpl(
             for name, tensor in draft_weights:
                 yield f"draft.{name}", tensor
 
-        # Check whether FP8 KV cache is enabled.
-        use_fp8_kv_cache = False
-        if (
-            "generation" in self.cfg
-            and self.cfg["generation"] is not None
-            and self.cfg["generation"]["backend"] == "vllm"
-        ):
-            generation_cfg = cast(VllmConfig, self.cfg["generation"])
-            use_fp8_kv_cache = (
-                "vllm_cfg" in generation_cfg
-                and "kv_cache_dtype" in generation_cfg["vllm_cfg"]
-                and generation_cfg["vllm_cfg"]["kv_cache_dtype"].startswith("fp8")
-            )
-
-        if not use_fp8_kv_cache:
+        generation_cfg = self.cfg.get("generation")
+        if generation_cfg is None or generation_cfg.get("backend") != "vllm":
+            return
+        generation_cfg = cast(VllmConfig, generation_cfg)
+        kv_cache_dtype = generation_cfg.get("vllm_cfg", {}).get("kv_cache_dtype")
+        if kv_cache_dtype is None or not kv_cache_dtype.startswith("fp8"):
             return
 
         # Append KV (and potentially Q) scale entries to match metadata.
@@ -1201,12 +1201,11 @@ class MegatronPolicyWorkerImpl(
         self, kv_scales: Optional[dict[str, float]] = None
     ) -> None:
         """Broadcast the weights for collective communication."""
-        # param_iterator will return (name, tensor), we only need tensor.
-        packed_broadcast_producer(
+        packed_weight_transfer_producer(
             iterator=self._iter_params_with_optional_kv_scales(kv_scales=kv_scales),
             group=self.model_update_group,
             src=0,
-            post_iter_func=lambda x: x[1],
+            delta_tracker=self.delta_weight_transfer_tracker,
         )
 
     def prepare_for_lp_inference(self):

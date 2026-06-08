@@ -16,6 +16,10 @@ from typing import Any, Literal, NotRequired, TypedDict
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
+DeltaCompressionDType = Literal[
+    "fp16", "float16", "bf16", "bfloat16", "fp32", "float32"
+]
+
 
 class VllmSpecificArgs(TypedDict):
     tensor_parallel_size: int
@@ -49,9 +53,20 @@ class VllmSpecificArgs(TypedDict):
     reasoning_parser_plugin: NotRequired[str]
 
 
+class VllmDeltaCompressionConfig(TypedDict):
+    """Delta-compressed collective refit config for non-colocated vLLM."""
+
+    enabled: bool
+    dtype: DeltaCompressionDType
+    full_sync_interval: int
+    sparse_bucket_size_bytes: int
+    delta_load_batch_size_bytes: int
+
+
 class VllmConfig(GenerationConfig):
     vllm_cfg: VllmSpecificArgs
     vllm_kwargs: NotRequired[dict[str, Any]]
+    delta_compression: NotRequired[VllmDeltaCompressionConfig | None]
 
     # quantization config
     quant_cfg: NotRequired[str | None]

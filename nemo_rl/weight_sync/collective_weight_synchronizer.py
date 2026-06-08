@@ -102,9 +102,6 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
         self._stale = True
 
     def init_communicator(self) -> None:
-        # prepare_refit_info is called before init_collective. This matches
-        # distillation.py ordering. Neither call depends on the other today,
-        # but we document this as the canonical ordering for future reference.
         state_dict_info = self._policy.prepare_refit_info()
         self._generation.prepare_refit_info(state_dict_info)
 
