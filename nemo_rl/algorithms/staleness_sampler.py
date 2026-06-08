@@ -20,14 +20,8 @@ when groups fall outside the staleness window. It never touches the data
 plane directly.
 """
 
-from __future__ import annotations
-
-from typing import TYPE_CHECKING
-
+from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.data_plane import KVBatchMeta
-
-if TYPE_CHECKING:
-    from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 
 
 class StalenessSampler:
@@ -35,7 +29,7 @@ class StalenessSampler:
 
     def __init__(
         self,
-        buffer: "TQReplayBuffer",
+        buffer: TQReplayBuffer,
         max_staleness_versions: int,
         sample_freshest_first: bool = True,
     ) -> None:

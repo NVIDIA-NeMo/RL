@@ -15,15 +15,13 @@
 import asyncio
 import threading as _threading
 from collections import Counter
-from typing import TYPE_CHECKING, Any, Iterable, Optional
+from typing import Any, Iterable, Optional
 
 import ray
+from tensordict import TensorDict
 
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
 from nemo_rl.data_plane import KVBatchMeta
-
-if TYPE_CHECKING:
-    from tensordict import TensorDict
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
@@ -585,7 +583,7 @@ class TQReplayBuffer:
     async def add(
         self,
         sample_ids: list[str],
-        fields: "TensorDict | None",
+        fields: TensorDict | None,
         tags: list[dict[str, Any]] | None,
         weight_version: int,
     ) -> KVBatchMeta:
