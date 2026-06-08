@@ -584,6 +584,11 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.moe_shared_expert_overlap = config["megatron_cfg"][
         "moe_shared_expert_overlap"
     ]
+    # Optional: select the flex dispatcher backend directly (e.g. "hybridep" — the GB200/NVL72-native
+    # expert dispatch; "deepep"). Only applied when set, so default behavior is unchanged.
+    _flex_backend = config["megatron_cfg"].get("moe_flex_dispatcher_backend")
+    if _flex_backend is not None:
+        model_cfg.moe_flex_dispatcher_backend = _flex_backend
 
     model_cfg.moe_permute_fusion = config["megatron_cfg"]["moe_permute_fusion"]
 
@@ -621,11 +626,49 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     """Apply performance optimization configuration."""
     model_cfg.parallel_output = True
 
-    # Activation checkpointing
+    # Activation checkpointing. Defaults to full/uniform (unchanged) but allow overriding the
+    # recompute granularity (e.g. "selective" — recompute only attention, store the rest -> uses
+    # spare HBM headroom to cut recompute FLOPS / raise MFU).
     if config["megatron_cfg"]["activation_checkpointing"]:
-        model_cfg.recompute_granularity = "full"
-        model_cfg.recompute_method = "uniform"
-        model_cfg.recompute_num_layers = 1
+        _gran = config["megatron_cfg"].get("recompute_granularity", "full")
+        model_cfg.recompute_granularity = _gran
+        if _gran == "selective":
+            # Megatron requires method/num_layers to be None for selective recompute
+            # (it recomputes only the attention core, stores the rest).
+            model_cfg.recompute_method = None
+            model_cfg.recompute_num_layers = None
+        else:
+            model_cfg.recompute_method = config["megatron_cfg"].get(
+                "recompute_method", "uniform"
+            )
+            model_cfg.recompute_num_layers = config["megatron_cfg"].get(
+                "recompute_num_layers", 1
+            )
+
+    # Optional MFU-tuning knobs: forwarded ONLY when the user set them in megatron_cfg AND this
+    # Megatron TransformerConfig actually supports them (hasattr guard), so default behavior is
+    # unchanged when they are absent. Lets experiments toggle fusions / CUDA graphs / hierarchical
+    # CP / selective-recompute module set without further code changes.
+    _opt_knobs = [
+        "moe_grouped_gemm",
+        "moe_router_fusion",
+        "cp_comm_type",
+        "hierarchical_context_parallel_sizes",
+        "recompute_modules",
+        "moe_hybridep_num_sms",
+        "enable_cuda_graph",
+        "cuda_graph_scope",
+        # MoE MFU levers: balance expert load (no straggler), static drop+pad dispatch, drop policy
+        "moe_router_force_load_balancing",
+        "moe_expert_capacity_factor",
+        "moe_pad_expert_input_to_capacity",
+        "moe_token_drop_policy",
+        "moe_token_dropping",
+    ]
+    for _k in _opt_knobs:
+        if _k in config["megatron_cfg"] and hasattr(model_cfg, _k):
+            setattr(model_cfg, _k, config["megatron_cfg"][_k])
+            print(f"[nemo_rl megatron setup] applied optional knob {_k}={config['megatron_cfg'][_k]}")
 
     # Activation function validation
     if not model_cfg.gated_linear_unit:
