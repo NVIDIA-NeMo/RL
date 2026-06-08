@@ -332,7 +332,10 @@ class SingleControllerActor:
 
         while self._train_steps < self._cfg.max_train_steps:
             step_id = f"sc-step-{self._train_steps:06d}"
-            target_groups = self._cfg.target_prompt_groups_per_step
+            # __init__ coerces None → min_prompt_groups_per_batch (int);
+            # the assert narrows the Optional[int] type for pyrefly.
+            assert self._cfg.target_prompt_groups_per_step is not None
+            target_groups: int = self._cfg.target_prompt_groups_per_step
             groups_dispatched = 0
             in_flight: list[ray.ObjectRef] = []
             step_open = False
