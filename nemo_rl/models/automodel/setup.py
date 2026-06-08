@@ -131,6 +131,67 @@ def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
     automodel_kwargs["force_hf"] = True
 
 
+def _is_nemotron_h_config(model_config) -> bool:
+    model_type = getattr(model_config, "model_type", None)
+    architectures = getattr(model_config, "architectures", None) or []
+    return model_type == "nemotron_h" or any(
+        str(arch).startswith("NemotronH") for arch in architectures
+    )
+
+
+def _patch_nemotron_h_mamba_out_proj_dtype(model, model_config) -> int:
+    """Cast Nemotron-H Mamba out_proj inputs to the projection weight dtype.
+
+    Automodel PR #1631 ("fix: tied embedding v4 to v5") added
+    ``_restore_loaded_model_dtype``, which restores each loaded tensor to the
+    dtype stored in the checkpoint:
+    https://github.com/NVIDIA-NeMo/Automodel/pull/1631
+
+    That correctly keeps Nemotron-H ``out_proj`` weights in BF16, but exposes a
+    Transformers bug where the remote ``modeling_nemotron_h.py``
+    ``cuda_kernels_forward`` path feeds an FP32 ``scan_output`` into that BF16
+    projection and fails with a mat1/mat2 dtype mismatch. Transformers PR #46487
+    adds the upstream cast at the model source; keep this NeMo-RL hook only
+    until our dependency includes it:
+    https://github.com/huggingface/transformers/pull/46487
+    """
+    if os.environ.get("NRL_DISABLE_NEMOTRON_H_DTYPE_PATCH") == "1":
+        return 0
+    if not _is_nemotron_h_config(model_config):
+        return 0
+
+    def _cast_input_to_weight_dtype(linear, inputs):
+        if not inputs:
+            return inputs
+
+        x, *rest = inputs
+        weight = getattr(linear, "weight", None)
+        if (
+            torch.is_tensor(x)
+            and torch.is_tensor(weight)
+            and x.is_floating_point()
+            and weight.is_floating_point()
+            and x.dtype != weight.dtype
+        ):
+            x = x.to(dtype=weight.dtype)
+        return (x, *rest)
+
+    patched = 0
+    for module in model.modules():
+        if module.__class__.__name__ != "NemotronHMamba2Mixer":
+            continue
+
+        out_proj = getattr(module, "out_proj", None)
+        if out_proj is None or getattr(out_proj, "_nrl_nemotron_h_dtype_patch", False):
+            continue
+
+        out_proj.register_forward_pre_hook(_cast_input_to_weight_dtype)
+        out_proj._nrl_nemotron_h_dtype_patch = True
+        patched += 1
+
+    return patched
+
+
 def get_tokenizer(
     tokenizer_config: TokenizerConfig, get_processor: bool = False
 ) -> Union[PreTrainedTokenizerBase, AutoProcessor]:
@@ -674,6 +735,14 @@ def setup_model_and_optimizer(
         **from_pretrained_kwargs,
         **automodel_kwargs,
     )
+    patched_nemotron_h_modules = _patch_nemotron_h_mamba_out_proj_dtype(
+        model, model_config
+    )
+    if patched_nemotron_h_modules:
+        print(
+            f"[Rank {rank}] Patched {patched_nemotron_h_modules} Nemotron-H "
+            "Mamba out_proj modules to cast inputs to weight dtype"
+        )
 
     print(model)
 
