@@ -51,8 +51,10 @@ dependencies = [
   "pillow>=12.1.1",
   "torchvision==0.26.0",
   # Keep the base range broad enough while allowing backend extras to tighten as needed.
-  "transformers>=5.3.0,<5.9.0",
+  "transformers==5.5.0",
   "num2words>=0.5.14",                                                                                                       # for SmolVLM
+  "timm",
+  "open-clip-torch>=3.2.0",
   "mlflow>=3.12.0",
   "nvidia-nvshmem-cu13>=3.6.5; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
   "swanlab",
@@ -348,6 +350,9 @@ override-dependencies = [
   "nvidia-cutlass-dsl[cu13]>=4.4.1",
   # Relax megatron-core workspace member's opentelemetry-api ceiling (<1.34) for protobuf 6.x compat with ray
   "opentelemetry-api>=1.33.1",
+  # vLLM 0.20.0 declares transformers !=5.5.0, but our codebase needs 5.5.0.
+  # Force-override so uv resolves transformers==5.5.0 across all extras.
+  "transformers==5.5.0",
   # Override sglang's xgrammar==0.1.32 to address CVE GHSA-7rgv-gqhr-fxg3
   "xgrammar==0.1.33",
   # Override dependencies to address CVEs
