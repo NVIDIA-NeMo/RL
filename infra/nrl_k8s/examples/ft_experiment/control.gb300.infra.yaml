@@ -109,38 +109,26 @@ launch:
       exit 1
     fi
     export RAY_enable_infeasible_task_early_exit=true
-    export NRL_USE_REFIT_WORKER=0
+    # Use the RefitWorker weight-sync path (rank 0 → sibling actor → gen, a
+    # 1+gen=9-way group) instead of the legacy all-train-ranks broadcast
+    # (40-way), which DEADLOCKS at this scale/topology in the colocated
+    # cluster (first refit's NCCL collective times out). See #1 infra.
+    export NRL_USE_REFIT_WORKER=1
     export PYTHONPATH=.:3rdparty/Megatron-LM-workspace/Megatron-LM:3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src
-    TIMESTAMP=$(date -u +%Y%m%d-%H%M%S-%N)
-    LOG_DIR=/mnt/rl-workspace/${user:}/driver_logs
-    LOG=\${LOG_DIR}/ft-experiment-control-\${TIMESTAMP}.log
-    mkdir -p "\${LOG_DIR}"
-
-    # ── Fault simulation ──────────────────────────────────────────
-    # Kill the training driver after 25 minutes (1500s) to simulate
-    # an infrastructure failure. Logs the exact timestamp of the kill.
-    FAULT_DELAY=1500
-    (
-      sleep \${FAULT_DELAY}
-      FAULT_TS=\$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)
-      echo "[FAULT-SIM] \${FAULT_TS} Simulating infrastructure failure after \${FAULT_DELAY}s — killing training driver"
-      # Kill the training python process
-      pkill -TERM -f "run_grpo.py.*control_recipe" || true
-      sleep 5
-      pkill -KILL -f "run_grpo.py.*control_recipe" || true
-      echo "[FAULT-SIM] Kill signal sent"
-    ) &
-    FAULT_PID=$!
-
-    python -u examples/run_grpo.py \
-      --config infra/nrl_k8s/examples/ft_experiment/control_recipe.yaml \
-      2>&1 | tee "\${LOG}"
-    EXIT_CODE=$?
-
-    # Clean up fault timer if training exited before the timer fired
-    kill \${FAULT_PID} 2>/dev/null || true
-    echo "[FAULT-SIM] Training exited with code \${EXIT_CODE}"
-    exit \${EXIT_CODE}
+    # ── Requeue-on-failure with mid-training fault injection ──────────
+    # CONTROL has NO fault recovery. The shared ft_requeue.sh driver loops
+    # run_grpo.py (auto-resuming from the last checkpoint) until step 20 is
+    # reached, killing the driver mid-training a few times to simulate infra
+    # failures. save_period=1 here, so FT_STEPS_PER_ATTEMPT=6 yields faults
+    # at steps 6/11/16 (3 faults, ~1 step lost each). The fault watcher keys
+    # off "[STEP-START] step=N", so it never fires during the cold start.
+    export FT_CKPT_DIR=/mnt/rl-workspace/${user:}/checkpoints/ft-experiment-control
+    export FT_CONFIG=infra/nrl_k8s/examples/ft_experiment/control_recipe.yaml
+    export FT_LOG_DIR=/mnt/rl-workspace/${user:}/driver_logs
+    export FT_TARGET_STEP=20
+    export FT_STEPS_PER_ATTEMPT=6
+    export FT_RUN_TAG=control
+    bash infra/nrl_k8s/examples/ft_experiment/ft_requeue.sh
 
 kuberay:
   training:

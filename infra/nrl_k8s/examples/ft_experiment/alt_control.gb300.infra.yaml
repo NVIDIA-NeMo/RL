@@ -105,34 +105,24 @@ launch:
       exit 1
     fi
     export RAY_enable_infeasible_task_early_exit=true
-    export NRL_USE_REFIT_WORKER=0
+    # Use the RefitWorker weight-sync path (1+gen=9-way) instead of the legacy
+    # all-train-ranks broadcast (40-way), which DEADLOCKS at this scale in the
+    # colocated cluster (first refit's NCCL collective times out). See #1 infra.
+    export NRL_USE_REFIT_WORKER=1
     export PYTHONPATH=.:3rdparty/Megatron-LM-workspace/Megatron-LM:3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src
-    TIMESTAMP=$(date -u +%Y%m%d-%H%M%S-%N)
-    LOG_DIR=/mnt/rl-workspace/${user:}/driver_logs
-    LOG=\${LOG_DIR}/ft-experiment-alt-control-\${TIMESTAMP}.log
-    mkdir -p "\${LOG_DIR}"
-
-    # ── Fault simulation (same as control) ────────────────────────
-    FAULT_DELAY=1500
-    (
-      sleep \${FAULT_DELAY}
-      FAULT_TS=\$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)
-      echo "[FAULT-SIM] \${FAULT_TS} Simulating infrastructure failure after \${FAULT_DELAY}s — killing training driver"
-      pkill -TERM -f "run_grpo.py.*alt_control_recipe" || true
-      sleep 5
-      pkill -KILL -f "run_grpo.py.*alt_control_recipe" || true
-      echo "[FAULT-SIM] Kill signal sent"
-    ) &
-    FAULT_PID=$!
-
-    python -u examples/run_grpo.py \
-      --config infra/nrl_k8s/examples/ft_experiment/alt_control_recipe.yaml \
-      2>&1 | tee "\${LOG}"
-    EXIT_CODE=$?
-
-    kill \${FAULT_PID} 2>/dev/null || true
-    echo "[FAULT-SIM] Training exited with code \${EXIT_CODE}"
-    exit \${EXIT_CODE}
+    # ── Requeue-on-failure with mid-training fault injection ──────────
+    # ALTERNATE CONTROL: identical to control.gb300.infra.yaml but
+    # save_period=5, so a fault loses MORE work. FT_STEPS_PER_ATTEMPT=8
+    # yields faults at steps 8/13/18 (3 faults), each resuming from the
+    # prior step_5/10/15 checkpoint → ~3 steps of lost work per fault. Uses
+    # the same shared ft_requeue.sh requeue driver as the control.
+    export FT_CKPT_DIR=/mnt/rl-workspace/${user:}/checkpoints/ft-experiment-alt-control
+    export FT_CONFIG=infra/nrl_k8s/examples/ft_experiment/alt_control_recipe.yaml
+    export FT_LOG_DIR=/mnt/rl-workspace/${user:}/driver_logs
+    export FT_TARGET_STEP=20
+    export FT_STEPS_PER_ATTEMPT=8
+    export FT_RUN_TAG=alt-control
+    bash infra/nrl_k8s/examples/ft_experiment/ft_requeue.sh
 
 kuberay:
   training:

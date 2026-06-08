@@ -43,4 +43,9 @@ logger:
 
 cluster:
   gpus_per_node: 4
-  num_nodes: 4
+  # Non-disagg non-colocated: generation carves its 2 nodes OUT of this
+  # pool, so train uses (num_nodes - gen.num_nodes) = 10 - 2 = 8 nodes =
+  # 32 GPU → DP=32 (matches the disagg TEST), and global_batch_size 64 / 32
+  # = 2 microbatches. (num_nodes=8 would leave only 6 train nodes → DP=24,
+  # which 64 is NOT divisible by — Megatron asserts at init.)
+  num_nodes: 10

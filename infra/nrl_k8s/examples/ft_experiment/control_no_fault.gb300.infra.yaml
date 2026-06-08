@@ -109,7 +109,13 @@ launch:
       exit 1
     fi
     export RAY_enable_infeasible_task_early_exit=true
-    export NRL_USE_REFIT_WORKER=0
+    # Use the RefitWorker weight-sync path (rank 0 → sibling actor → gen, a
+    # 1+gen=9-way group) instead of the legacy all-train-ranks broadcast
+    # (32 train + 8 gen = 40-way), which DEADLOCKS at this scale/topology in
+    # the colocated cluster: the first refit's 40-way NCCL collective times
+    # out ("Get timed out: some object(s) not ready"). The disagg TEST uses
+    # the same RefitWorker path and refits cleanly.
+    export NRL_USE_REFIT_WORKER=1
     export PYTHONPATH=.:3rdparty/Megatron-LM-workspace/Megatron-LM:3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src
     TIMESTAMP=$(date -u +%Y%m%d-%H%M%S-%N)
     LOG_DIR=/mnt/rl-workspace/${user:}/driver_logs
@@ -159,9 +165,9 @@ kuberay:
             volumes: *head_volumes
       workerGroupSpecs:
         - groupName: gpu-workers
-          replicas: 6
-          minReplicas: 6
-          maxReplicas: 6
+          replicas: 10
+          minReplicas: 10
+          maxReplicas: 10
           numOfHosts: 1
           rayStartParams:
             num-gpus: "4"

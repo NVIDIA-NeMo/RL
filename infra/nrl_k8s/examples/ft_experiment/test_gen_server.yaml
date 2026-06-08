@@ -56,17 +56,31 @@ policy:
       uvicorn_backlog: 4096
       uvicorn_keep_alive_s: 120
 
-# Fault injection: kill 1 shard every 25 min, immediate recovery.
+# Fault injection. trigger_after_s is now measured FROM the first weight
+# refit (the FaultInjector blocks on the router's /refit_count until training
+# has actually started refitting — see FaultInjector._wait_for_training_started).
+# This makes timing robust to wildly variable setup time (warm reuse ~4 min vs
+# cold Megatron-30B load ~13 min): the first fault always lands a few steps
+# into steady-state training, never during the (not-yet-fault-tolerant)
+# startup. trigger_after_s=180 → first fault ~step 3-4; repeat_every_s=240 +
+# the inter-cycle steady-state gate yields ~3 faults over a 20-step run
+# (~steps 3, 7, 11). Faults recover via the in-band self-abort
+# (StatelessProcessGroup.synchronize_or_abort) + re-init at the new world; the
+# cross-cluster group is held alive between refits so steady-state refits
+# never re-rendezvous.
 fault_inject:
   enabled: true
   mode: pod-kill
   recover: true
-  trigger_after_s: 360
+  trigger_after_s: 180
   recover_after_s: 0
+  # Canonical TEST = kill-1: every cycle kills 1 shard and recovers it.
+  # For the kill-half sub-experiment (#3b) set burst_size: 4 + max_cycles: 2
+  # (kills 4 of 8 at once, twice) — see INSTRUCTIONS.md.
   max_cycles: null
   rotate_target: true
   target_shard: dp-0
   new_shard_grace_period_s: 120
   burst_size: 1
   burst_every_n_cycles: 1
-  repeat_every_s: 360
+  repeat_every_s: 240
