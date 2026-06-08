@@ -78,7 +78,6 @@ def create_megatron_test_config(
     activation_checkpointing: bool = False,
     generation_backend: str = "megatron",
     sequence_parallel: bool = False,
-    converter_type: str = "LlamaForCausalLM",
     logprob_chunk_size: Optional[int] = None,
     defer_fp32_logits: Optional[bool] = None,
     attention_backend: Optional[str] = None,
@@ -133,7 +132,6 @@ def create_megatron_test_config(
             "enabled": True,
             "empty_unused_memory_level": 0,
             "activation_checkpointing": activation_checkpointing,
-            "converter_type": converter_type,
             "tensor_model_parallel_size": tp,
             "expert_tensor_parallel_size": 1,
             "expert_model_parallel_size": 1,
@@ -310,17 +308,10 @@ def training_setup(request):
         )
 
         # Determine converter type based on model
-        converter_type = "LlamaForCausalLM"
-        if "qwen" in model_name.lower():
-            converter_type = "Qwen2ForCausalLM"
-        elif "gemma" in model_name.lower():
-            converter_type = "GemmaForCausalLM"
-
         config = create_megatron_test_config(
             model_name=model_name,
             tp=tp,
             pp=pp,
-            converter_type=converter_type,
         )
 
         # Apply config updates
@@ -682,17 +673,10 @@ def logprob_setup(request):
         )
 
         # Determine converter type based on model
-        converter_type = "LlamaForCausalLM"
-        if "qwen" in model_name.lower():
-            converter_type = "Qwen2ForCausalLM"
-        elif "gemma" in model_name.lower():
-            converter_type = "GemmaForCausalLM"
-
         config = create_megatron_test_config(
             model_name=model_name,
             tp=tp,
             pp=pp,
-            converter_type=converter_type,
             logprob_chunk_size=logprob_chunk_size,
             defer_fp32_logits=defer_fp32_logits,
         )
@@ -1536,17 +1520,10 @@ def topk_setup(request):
         )
 
         # Determine converter type based on model
-        converter_type = "LlamaForCausalLM"
-        if "qwen" in model_name.lower():
-            converter_type = "Qwen2ForCausalLM"
-        elif "gemma" in model_name.lower():
-            converter_type = "GemmaForCausalLM"
-
         config = create_megatron_test_config(
             model_name=model_name,
             tp=tp,
             pp=pp,
-            converter_type=converter_type,
             logprob_chunk_size=logprob_chunk_size,
             defer_fp32_logits=defer_fp32_logits,
         )

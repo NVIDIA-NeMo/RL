@@ -25,7 +25,6 @@ policy:
   megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1
-    converter_type: "LlamaForCausalLM"
     tensor_model_parallel_size: 4
     pipeline_model_parallel_size: 4
     context_parallel_size: 1
