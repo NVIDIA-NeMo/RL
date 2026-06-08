@@ -26,6 +26,11 @@ loss_fn:
   # examples/configs/recipes/vlm/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-megatron-ep16.yaml.
   use_importance_sampling_correction: true
   truncated_importance_sampling_ratio: 2
+  # "tis" clamps per-token IS weights to [0, ratio]. Required whenever
+  # truncated_importance_sampling_ratio is set: with type unset (None) the loss
+  # raises "Invalid truncated importance sampling type: None" at the first step.
+  # Matches recipes/vlm/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-megatron-ep16.yaml.
+  truncated_importance_sampling_type: tis
 
 checkpointing:
   enabled: true

@@ -1,0 +1,13 @@
+# Nightly: Qwen3-Omni-30B-A3B-Instruct GRPO on AudioMCQ-StrongAC-GeminiCoT.
+# 20-step convergence signal on 4x8 -- the minimum hardware for this MoE recipe
+# (expert_model_parallel_size=8 collapses DP to 1 on a single node and OOMs at
+# the optimizer; see examples/configs/audio_grpo_qwen3_omni_megatron.yaml).
+# Mirrors the qwen2.5-omni avqa nightly, scaled up to 30B-A3B on the AudioMCQ task.
+defaults: ../../audio_grpo_qwen3_omni_megatron.yaml
+grpo:
+  max_num_steps: 20
+checkpointing:
+  checkpoint_dir: results/vlm_grpo-qwen3-omni-30ba3b-audiomcq-4n8g-megatron
+logger:
+  wandb:
+    name: vlm_grpo-qwen3-omni-30ba3b-audiomcq-4n8g-megatron
