@@ -681,4 +681,5 @@ class RolloutManager:
             "generate_and_push requires tq_buffer to be set at __init__"
         )
         record = await self.run_rollout(input_sample)
+        # TODO @yukih: record start and end weight version of the rollout instead of just end
         await self._tq_buffer.add(record, weight_version=self._weight_version)
