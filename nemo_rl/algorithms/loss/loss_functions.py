@@ -1147,16 +1147,25 @@ class CrossTokenizerDistillationLossDataDict(TypedDict):
 
 
 class CrossTokenizerDistillationLossFn(LossFunction):
-    """Cross-tokenizer distillation loss with three configurable modes.
+    """Cross-tokenizer distillation loss.
 
-    Mode is selected by ``(gold_loss, xtoken_loss)`` flags:
+    Mode is selected by the ``(gold_loss, xtoken_loss)`` flags:
 
-    - ``(False, False)`` -> P-KL: full-vocab projection KL using projection
-      matrix M. Implemented in v0.
-    - ``(True, False)``  -> gold-loss: exact-match partition uses CE on
-      paired tokens; non-partition uses ULD. **NotImplementedError in v0.**
-    - ``(False, True)``  -> xtoken-loss: chunk-aggregated KL using
-      multi-token spans. **NotImplementedError in v0.**
+    - ``(False, False)`` -> P-KL: full-vocab projection KL (student logits
+      mapped through the projection matrix M) plus a standard next-token
+      student CE term, combined as ``kl_loss_weight * kl + ce_loss_scale * ce``
+      — or, when ``dynamic_loss_scaling`` is set, with the KL term rescaled
+      each step to match the detached CE magnitude.
+    - ``(True, False)`` -> gold-loss: ``(kl_common + l1_uncommon) * T**2``,
+      i.e. KL on the exact-mapped *common* partition plus a sorted-L1 term on
+      the *uncommon* tail. No CE term.
+    - ``(True, True)`` -> gold-loss with the xtoken modifier: same objective,
+      but the exact-map threshold is relaxed (``>= 0.6`` instead of ``== 1.0``)
+      and a collision-replacement rule lets multi-token projections still
+      contribute exact maps.
+
+    ``(False, True)`` is rejected in ``__init__``: xtoken_loss is a modifier
+    inside the gold path and is undefined for P-KL.
 
     Inputs (via ``LossInputType.DISTILLATION_CROSS_TOKENIZER``):
         logits: ``[B, T_s, V_s]`` raw student logits from the worker forward.
@@ -1168,9 +1177,11 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         See :class:`CrossTokenizerDistillationLossDataDict`.
 
     Returns:
-        ``(loss, metrics)`` where ``metrics`` contains ``loss``, ``kl_loss``,
-        ``ce_loss``, ``kl_loss_scale``, ``num_valid_samples``,
-        ``num_valid_pairs``.
+        ``(loss, metrics)``. The P-KL path reports ``loss``, ``kl_loss``,
+        ``ce_loss``, ``kl_loss_scale``, ``accuracy``, ``proj_accuracy``,
+        ``num_valid_samples``, ``num_valid_pairs``. The gold path reports
+        ``loss``, ``kl_common``, ``l1_uncommon``, ``accuracy``,
+        ``num_valid_samples``, ``num_valid_chunks``.
     """
 
     loss_type = LossType.TOKEN_LEVEL
