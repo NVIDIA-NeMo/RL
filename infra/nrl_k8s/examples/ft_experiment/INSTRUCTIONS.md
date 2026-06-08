@@ -5,12 +5,14 @@ dies, the router evicts it and training recovers *in place*) versus traditional
 single-cluster training that **crashes and restarts from checkpoint** on any
 failure.
 
-> **Status (2026-06-08):** The disaggregated fault-recovery path is fixed,
-> committed (`cd54a7303`), and validated end-to-end (TEST / kill-1 completed 20
-> steps through 3 faults). The non-disaggregated CONTROL runs are currently
-> **blocked by a deterministic NCCL collective hang** in the colocated-cluster
-> training path — see [Known Blockers](#known-blockers). Read that section
-> before re-running the controls.
+> **Status (2026-06-08):** All four setups completed 20 steps. The
+> disaggregated fault-recovery path is fixed, committed (`cd54a7303`), and
+> validated end-to-end (TEST / kill-1 + kill-half both recovered in place). The
+> non-disaggregated CONTROLs (#2, #4) — which have **no** fault recovery — were
+> driven to 20 steps by `ft_requeue.sh`, which restarts `run_grpo.py` from the
+> last checkpoint after each simulated fault. **Each restart is a fresh
+> `wandb.init`, so #2 and #4 each have FOUR separate W&B runs (one per attempt),
+> not one** — see [W&B runs](#wb-runs-project-nvidianemorl-ft-experiment).
 
 ## Experiment Matrix
 
@@ -148,17 +150,17 @@ refit and all 20 steps ran with no hang.
 
 ### #2 CONTROL (faults + crash/restart) ✅ CONFIRMED
 
-Run `exp2-control-20260608-050754`. WandB `eljrkqwl`. **4 attempts, 3 faults,
-20 steps, 35.5 min** (step 1 → step 20). `ft_requeue.sh` killed the driver at
-steps 6/11/16; each crash forced a cold restart + resume from the last
-checkpoint:
+Driver run `exp2-control-20260608-050754`. **4 attempts → 4 separate W&B runs,
+3 faults, 20 steps, 35.5 min** (step 1 → step 20). `ft_requeue.sh` killed the
+driver at steps 6/11/16; each crash forced a cold restart + resume from the last
+checkpoint (a fresh `wandb.init` each time — no resume):
 
-| attempt | resumed from | ran steps | killed at | restart gap |
-|---|---|---|---|---|
-| 1 | fresh | 1–6 | step 6 | — |
-| 2 | step_5 | 6–11 | step 11 | 313 s |
-| 3 | step_10 | 11–16 | step 16 | 305 s |
-| 4 | step_15 | 16–20 | (finished) | 296 s |
+| attempt | W&B run | resumed from | ran steps | killed at | restart gap |
+|---|---|---|---|---|---|
+| 1 | `s4wysfa2` | fresh | 1–6 | step 6 | — |
+| 2 | `hjjm8997` | step_5 | 6–11 | step 11 | 313 s |
+| 3 | `eljrkqwl` | step_10 | 11–16 | step 16 | 305 s |
+| 4 | `3ihvflkx` | step_15 | 16–20 | (finished) | 296 s |
 
 Each fault cost **~5 min** of restart overhead (kill + Megatron/vLLM cold
 reload + resume) plus ~1 redone step — vs the disagg TEST's ~1.7 min in-place
@@ -166,16 +168,17 @@ recovery with zero redone steps.
 
 ### #4 ALT-CONTROL (save_period=5) ✅ CONFIRMED
 
-Run `exp4-altcontrol-20260608-055423`. WandB `rcjyoc5t`. **4 attempts, 3 faults,
-20 steps.** Faults at steps 8/13/18; with `save_period=5` each crash resumes
-from the prior step_5-multiple checkpoint, so it **redoes ~3 steps per fault**:
+Driver run `exp4-altcontrol-20260608-055423`. **4 attempts → 4 separate W&B
+runs, 3 faults, 20 steps.** Faults at steps 8/13/18; with `save_period=5` each
+crash resumes from the prior step_5-multiple checkpoint, so it **redoes ~3 steps
+per fault**:
 
-| attempt | resumed from | ran steps | killed at | steps redone |
-|---|---|---|---|---|
-| 1 | fresh | 1–8 | step 8 | — |
-| 2 | step_5 | 6–13 | step 13 | 6,7,8 |
-| 3 | step_10 | 11–18 | step 18 | 11,12,13 |
-| 4 | step_15 | 16–20 | (finished) | 16,17,18 |
+| attempt | W&B run | resumed from | ran steps | killed at | steps redone |
+|---|---|---|---|---|---|
+| 1 | `rcjyoc5t` | fresh | 1–8 | step 8 | — |
+| 2 | `0r4zq4yd` | step_5 | 6–13 | step 13 | 6,7,8 |
+| 3 | `lo18wgw6` | step_10 | 11–18 | step 18 | 11,12,13 |
+| 4 | `1d5ry4o0` | step_15 | 16–20 | (finished) | 16,17,18 |
 
 **9 steps redone total vs #2's 3** — the egregious lost-work penalty of
 infrequent checkpointing without FT. (Wall clock 25.8 min came in below #2's
@@ -212,7 +215,7 @@ nrl-k8s run infra/nrl_k8s/examples/ft_experiment/test_recipe.yaml \
 
 # CONTROL (#2) / ALT-CONTROL (#4) — single cluster; ft_requeue.sh loops
 # run_grpo (auto-resume from checkpoint) until step 20, injecting 3 mid-
-# training faults via the requeue driver.  (BLOCKED — see below.)
+# training faults via the requeue driver. Each attempt = a separate W&B run.
 nrl-k8s run infra/nrl_k8s/examples/ft_experiment/control_recipe.yaml \
   --infra infra/nrl_k8s/examples/ft_experiment/control.gb300.infra.yaml \
   --raycluster --mode batch --run-id control-$(date -u +%Y%m%d-%H%M%S)
@@ -248,8 +251,8 @@ only on `megatron_enable` (not on disagg), so it applies to the non-colocated
 control too (`init_collective` runs for any non-colocated Megatron gen).
 
 Fix: set **`NRL_USE_REFIT_WORKER=1`** in all three control entrypoints
-(`control_no_fault`, `control`, `alt_control` `.gb300.infra.yaml`). Validation
-pending — retest #1 once GPUs free from the kill-half run.
+(`control_no_fault`, `control`, `alt_control` `.gb300.infra.yaml`). Validated:
+#1, #2, and #4 all subsequently refit cleanly and ran 20 steps.
 
 ## Config files
 
@@ -264,16 +267,33 @@ pending — retest #1 once GPUs free from the kill-half run.
 
 ## W&B runs (project `nvidia/nemorl-ft-experiment`)
 
-| # | Setup | Run | Link |
-|---|-------|-----|------|
-| 1 | baseline | `ft-experiment-control-nofault` | https://wandb.ai/nvidia/nemorl-ft-experiment/runs/9fee5n8x |
-| 2 | control | `ft-experiment-control-no-ft` | https://wandb.ai/nvidia/nemorl-ft-experiment/runs/eljrkqwl |
-| 3 | test (kill-1) | `ft-experiment-test-disagg-with-fault` | https://wandb.ai/nvidia/nemorl-ft-experiment/runs/wtki1r59 |
-| 3 | test (kill-half) | `ft-experiment-test-disagg-with-fault` | https://wandb.ai/nvidia/nemorl-ft-experiment/runs/fxbb17bm |
-| 4 | alt-control | `ft-experiment-alt-control-ckpt5` | https://wandb.ai/nvidia/nemorl-ft-experiment/runs/rcjyoc5t |
+**#1 and #3 are single runs** (no restart). **#2 and #4 are 4 runs each** — one
+per `ft_requeue.sh` attempt, all sharing the recipe's fixed `wandb.name` but with
+distinct run IDs (fresh `wandb.init`, no resume). To see a control end-to-end,
+view all 4 of its runs in step order; the *display name* alone is ambiguous.
 
-Driver logs (per-run, with `[STEP-START]`/`[FAULT-*]`/`[REQUEUE]` telemetry) and
-the saved kill-half gen-daemon log are under `/mnt/rl-workspace/terryk/driver_logs/`.
+| # | Setup | Display name | Attempt | Steps | Run ID |
+|---|-------|--------------|:---:|:---:|--------|
+| 1 | baseline | `ft-experiment-control-nofault` | — | 1–20 | [`9fee5n8x`](https://wandb.ai/nvidia/nemorl-ft-experiment/runs/9fee5n8x) |
+| 3 | test (kill-1) | `ft-experiment-test-disagg-with-fault` | — | 1–20 | [`wtki1r59`](https://wandb.ai/nvidia/nemorl-ft-experiment/runs/wtki1r59) |
+| 3 | test (kill-half) | `ft-experiment-test-disagg-with-fault` | — | 1–20 | [`fxbb17bm`](https://wandb.ai/nvidia/nemorl-ft-experiment/runs/fxbb17bm) |
+| 2 | control | `ft-experiment-control-no-ft` | 1 | 1–6 | [`s4wysfa2`](https://wandb.ai/nvidia/nemorl-ft-experiment/runs/s4wysfa2) |
+| 2 | control | `ft-experiment-control-no-ft` | 2 | 6–11 | [`hjjm8997`](https://wandb.ai/nvidia/nemorl-ft-experiment/runs/hjjm8997) |
+| 2 | control | `ft-experiment-control-no-ft` | 3 | 11–16 | [`eljrkqwl`](https://wandb.ai/nvidia/nemorl-ft-experiment/runs/eljrkqwl) |
+| 2 | control | `ft-experiment-control-no-ft` | 4 | 16–20 | [`3ihvflkx`](https://wandb.ai/nvidia/nemorl-ft-experiment/runs/3ihvflkx) |
+| 4 | alt-control | `ft-experiment-alt-control-ckpt5` | 1 | 1–8 | [`rcjyoc5t`](https://wandb.ai/nvidia/nemorl-ft-experiment/runs/rcjyoc5t) |
+| 4 | alt-control | `ft-experiment-alt-control-ckpt5` | 2 | 6–13 | [`0r4zq4yd`](https://wandb.ai/nvidia/nemorl-ft-experiment/runs/0r4zq4yd) |
+| 4 | alt-control | `ft-experiment-alt-control-ckpt5` | 3 | 11–18 | [`lo18wgw6`](https://wandb.ai/nvidia/nemorl-ft-experiment/runs/lo18wgw6) |
+| 4 | alt-control | `ft-experiment-alt-control-ckpt5` | 4 | 16–20 | [`1d5ry4o0`](https://wandb.ai/nvidia/nemorl-ft-experiment/runs/1d5ry4o0) |
+
+Note the step *overlap* between consecutive control runs (e.g. #2 attempt 1 ends
+at step 6 but attempt 2 starts at step 6): the killed step was in-flight and never
+checkpointed, so it is redone on resume — that overlap *is* the lost-work cost of
+no fault tolerance. The disagg TEST has no such overlap (zero redone steps).
+
+Driver logs (per-attempt, with `[STEP-START]`/`[FAULT-*]`/`[REQUEUE]` telemetry,
+named `ft-experiment-{control,alt-control}-attempt{N}-<ts>.log`) and the saved
+kill-half gen-daemon log are under `/mnt/rl-workspace/terryk/driver_logs/`.
 
 ## Branch
 
