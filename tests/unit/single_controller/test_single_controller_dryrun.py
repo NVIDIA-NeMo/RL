@@ -53,7 +53,7 @@ from nemo_rl.algorithms.single_controller import (
     SingleControllerActor,
     SingleControllerConfig,
 )
-from nemo_rl.algorithms.staleness_sampler import StalenessSampler
+from nemo_rl.algorithms.async_utils.staleness_sampler import StalenessSampler
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord

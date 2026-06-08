@@ -45,7 +45,7 @@ from tensordict import TensorDict
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
-from nemo_rl.algorithms.staleness_sampler import StalenessSampler
+from nemo_rl.algorithms.async_utils.staleness_sampler import StalenessSampler
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.environments.interfaces import EnvironmentInterface

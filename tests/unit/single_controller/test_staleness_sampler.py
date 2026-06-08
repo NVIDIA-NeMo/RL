@@ -20,7 +20,7 @@ import asyncio
 
 import pytest
 
-from nemo_rl.algorithms.staleness_sampler import StalenessSampler
+from nemo_rl.algorithms.async_utils.staleness_sampler import StalenessSampler
 from nemo_rl.data_plane import KVBatchMeta
 
 
