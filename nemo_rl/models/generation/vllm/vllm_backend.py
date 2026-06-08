@@ -565,7 +565,15 @@ class VllmInternalWorkerExtension:
                     role = td.megatron_role or ""
                     if not role:
                         continue
-                    hf_names = name_map.get(td.name, [td.name])
+                    # Bridge's name_map uses unprefixed Megatron names; the
+                    # publisher (post-2026-06-08) normalizes to that form, but
+                    # be defensive in case a publisher emits the `module.`
+                    # prefix and the name_map doesn't.
+                    lookup_name = (
+                        td.name[len("module."):] if td.name.startswith("module.")
+                        else td.name
+                    )
+                    hf_names = name_map.get(lookup_name, name_map.get(td.name, [td.name]))
                     receive_specs[td.name] = ReceiveSpec(
                         megatron_name=td.name,
                         hf_names=list(hf_names),

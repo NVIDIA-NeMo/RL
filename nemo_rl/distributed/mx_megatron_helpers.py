@@ -376,11 +376,19 @@ def collect_megatron_publish_set(
     """
     import torch
 
-    for name, param in model.named_parameters():
+    for raw_name, param in model.named_parameters():
         if not param.is_floating_point():
             # Skip non-float buffers (rotary inv_freq, etc.); they aren't
             # weight-refit material.
             continue
+
+        # `model.named_parameters()` returns names with a `module.` prefix when
+        # the model is wrapped (DDP-style). Bridge's `get_conversion_tasks`
+        # returns names without the prefix, so strip it here so the per-tensor
+        # name in the catalog matches the name used as the sidecar `name_map`
+        # key. (Validated on Qwen3-4B-Thinking on the GB200 trainer pod,
+        # 2026-06-08.)
+        name = raw_name[len("module."):] if raw_name.startswith("module.") else raw_name
 
         spec = detect_megatron_role(
             name, param, model=model,

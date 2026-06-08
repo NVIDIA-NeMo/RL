@@ -1381,7 +1381,7 @@ class MegatronPolicyWorkerImpl(
         # at startup. The receiver only needs the name pairings; head
         # counts come from transformer_config.
         try:
-            tasks = self.megatron_bridge.build_conversion_tasks([self.model])
+            tasks = self.megatron_bridge.get_conversion_tasks([self.model])
             name_map_entries: list[tuple[str, list[str]]] = []
             for task in tasks:
                 m_name = task.global_param_name or task.param_name
