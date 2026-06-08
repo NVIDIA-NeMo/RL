@@ -559,15 +559,8 @@ class ReplayBuffer(ReplayBufferImpl):
 class TQReplayBuffer:
     """Meta cache + TQ writer for prompt-group records.
 
-    At rollout time, :meth:`add` tensorizes a :class:`PromptGroupRecord`
-    via :func:`record_to_train_batch` and writes the resulting N rows
-    (``N = generations_per_prompt``) to TQ as one group; ``meta_list`` /
-    ``weight_list`` keep one entry per prompt group, so the sampler's
-    selected meta is directly trainable without a second TQ round-trip.
-
-    Single asyncio loop in SC; :meth:`add` / :meth:`remove` ``await`` the
-    TQ round-trip before mutating local lists, so TQ is the source of
-    truth across suspensions (no lock needed).
+    add tensorizes one record and writes its N rows to TQ as a single group;
+    meta_list / weight_list keep one entry per group for sampler reads.
     """
 
     def __init__(
@@ -589,22 +582,25 @@ class TQReplayBuffer:
         *,
         weight_version: int,
     ) -> KVBatchMeta:
-        """Tensorize ``record`` and write its N rows to TQ as one group.
+        """Tensorize record and write its N rows to TQ as one group.
 
-        ``put_samples`` must finish before list mutation — otherwise a
-        concurrent sampler could see meta for rows TQ has not yet
-        accepted. ``weight_version`` must be ``int``.
+        Args:
+            record: PromptGroupRecord with N completions to tensorize.
+            weight_version: Trainer weight version stamped on every row's tag; must be int.
+
+        Returns:
+            KVBatchMeta for the newly written group.
         """
         if not isinstance(weight_version, int) or isinstance(weight_version, bool):
             raise TypeError(
                 f"TQReplayBuffer.add: weight_version must be int, got "
                 f"{type(weight_version).__name__}"
             )
-        bulk_batch = record_to_train_batch(
+        train_batch = record_to_train_batch(
             record, pad_value_dict=self._pad_value_dict
         )
         sample_ids, fields, tags = pack_payload(
-            bulk_batch, weight_version=weight_version
+            train_batch, weight_version=weight_version
         )
         meta = await self._call_dp(
             "put_samples",
@@ -618,11 +614,13 @@ class TQReplayBuffer:
         return meta
 
     async def remove(self, sample_ids: list[str]) -> int:
-        """Drop entries whose ``sample_ids`` are fully covered by the input.
+        """Drop entries fully covered by sample_ids; partial groups raise ValueError.
 
-        Entry-level removal: a partial-group input is a contract bug
-        (entry-as-group invariant) and raises ``ValueError``. TQ
-        ``clear_samples`` runs before local list mutation.
+        Args:
+            sample_ids: Sample ids covering whole prompt-group entries to drop.
+
+        Returns:
+            Number of group entries removed from the buffer.
         """
         ids_set = set(sample_ids)
         keep_meta: list[KVBatchMeta] = []
@@ -653,13 +651,14 @@ class TQReplayBuffer:
         return n_removed
 
     def size(self) -> int:
+        """Return the number of prompt-group entries currently held."""
         return len(self.meta_list)
 
     def __len__(self) -> int:
         return len(self.meta_list)
 
     async def _call_dp(self, method_name: str, **kwargs: Any) -> Any:
-        """Invoke a ``DataPlaneClient`` method on either a plain client or a Ray actor."""
+        """Call a DataPlaneClient method, awaiting Ray remotes if needed."""
         method = getattr(self._dp_client, method_name)
         remote = getattr(method, "remote", None)
         if remote is not None:

@@ -12,15 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Producer-side payload conversions for the async-RL TQ path.
-
-``record_to_train_batch`` lifts a rollout's :class:`PromptGroupRecord`
-into a packed ``BatchedDataDict``; ``pack_payload`` then turns that into
-the ``(sample_ids, fields, tags)`` triple TQ's ``put_samples`` expects.
-Both are invoked from :class:`TQReplayBuffer.add` so the buffer's TQ
-rows are already training-shaped and the sampler's meta is directly
-trainable.
-"""
+"""Producer-side payload helpers for the async-RL TQ path."""
 
 import uuid
 from collections.abc import Mapping
@@ -40,7 +32,16 @@ def record_to_train_batch(
     *,
     pad_value_dict: Mapping[str, int],
 ) -> BatchedDataDict[Any]:
-    """Lift one prompt group's record into a packed ``BatchedDataDict`` (N rows)."""
+    """Convert one prompt group's record into a packed BatchedDataDict of N rows.
+
+    Args:
+        record: Rollout's PromptGroupRecord with N completions to flatten into rows.
+        pad_value_dict: Field-name → pad value used by batched_message_log_to_flat_message.
+
+    Returns:
+        BatchedDataDict with input_ids, input_lengths, generation_logprobs, token_mask,
+        sample_mask, prompt_ids_for_adv, and total_reward.
+    """
     # Lazy imports: grpo and llm_message_utils transitively pull
     # experience.rollouts, so importing at module top risks a cycle.
     from nemo_rl.algorithms.grpo import (
@@ -90,21 +91,24 @@ def record_to_train_batch(
 
 
 def pack_payload(
-    bulk_batch: Mapping[str, Any],
+    train_batch: Mapping[str, Any],
     *,
     weight_version: int,
 ) -> tuple[list[str], TensorDict, list[dict[str, Any]]]:
-    """Pack producer batch → ``(sample_ids, fields, tags)`` for TQ.
+    """Pack a producer batch into (sample_ids, fields, tags) for put_samples.
 
-    Sample ids: ``{uuid}_g{i}``. Tensor / object-array fields are
-    jagged-packed via ``bulk_batch["input_lengths"]``. Tags stamp
-    ``weight_version`` on every row.
+    Args:
+        train_batch: Mapping with at least input_lengths plus the tensor/object fields to send.
+        weight_version: Trainer weight version stamped on every row's tag.
+
+    Returns:
+        sample_ids of the form {uuid}_g{i}, a jagged-packed TensorDict, and per-row tags.
     """
-    lengths = bulk_batch["input_lengths"]
+    lengths = train_batch["input_lengths"]
     n = int(lengths.shape[0])
     tensor_fields: dict[str, torch.Tensor | np.ndarray] = {
         k: v
-        for k, v in bulk_batch.items()
+        for k, v in train_batch.items()
         if isinstance(v, torch.Tensor)
         or (isinstance(v, np.ndarray) and v.dtype == object)
     }
