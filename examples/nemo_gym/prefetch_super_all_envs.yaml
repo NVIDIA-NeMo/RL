@@ -11,22 +11,35 @@
 # NemoGym._spinup (no policy model), so policy / megatron_cfg / data / cluster / grpo /
 # loss_fn / logger are intentionally omitted — they are not read during prefetch.
 #
-# The judge model-server blocks (safety_judge_model / nl2bash_judge_model / genrm_model)
-# are kept because resource servers below reference them by name; the dry run resolves
-# the config graph (it never loads the referenced model weights). All three use the
-# `vllm_model` server type, so they add no venv beyond the policy `vllm_model` one.
+# NOTE on the dummy_* keys below: the bundled Gym configs pulled in via config_paths use
+# OmegaConf interpolations (e.g. ${genrm_model_name}, ${judge_model_name}, ${policy_*})
+# that super_launch.sh injects at run time. The gym resolves them against the root of its
+# global config (== this env.nemo_gym block), so they MUST live directly under nemo_gym.
+# Their values are irrelevant to prefetch (no model is loaded in the dry run) — dummies
+# just let resolution succeed so the venvs build.
 #
 # Deviations from super-v3 stage1_rlvr.yaml:
-#   - `resources_servers/terminal_pivot/...` DROPPED: it does not exist at our Gym pin
-#     (9b52dc8a). The newer Gym has terminus_judge / terminal_multi_harness / swe_pivot
-#     instead, with no 1:1 successor. Re-add (remapped) if you need that env.
-#   - `num_gpu_nodes` DROPPED: irrelevant to the prefetch dry run (reserves no nodes).
+#   - terminal_pivot DROPPED: absent at our Gym pin (9b52dc8a); no 1:1 successor.
+#   - num_gpu_nodes DROPPED: irrelevant to the prefetch dry run (reserves no nodes).
 env:
   should_use_nemo_gym: true
   nemo_gym:
     skip_venv_if_present: true
     port_range_low: 15001
     port_range_high: 20000
+
+    # Dummy interpolation values consumed by the bundled configs (see NOTE above).
+    policy_model_name: dummy-model
+    policy_base_url: http://localhost:8000/v1
+    policy_api_key: dummy
+    judge_model_name: dummy-judge
+    judge_base_url: http://localhost:8000/v1
+    judge_api_key: dummy
+    genrm_model_name: dummy-genrm
+    anthropic_model_name: dummy-anthropic
+    anthropic_base_url: http://localhost:8000/v1
+    anthropic_api_key: dummy
+
     invalid_tool_call_patterns:
       - "<tool_call>"
       - "</tool_call>"
@@ -65,153 +78,53 @@ env:
     - resources_servers/single_step_tool_use_with_argument_comparison/configs/swe_pivot_single_step_tool_use_with_argument_comparison.yaml
     - responses_api_agents/swe_agents/configs/swebench_openhands_training.yaml
 
-    # ---- judge model servers (referenced by the resource servers above) ----
+    # Named judge servers the bundled configs reference but don't define in this set:
+    #   safety_judge_model -> jailbreak_detection, over_refusal_detection
+    #   judge_model        -> inverse_if
+    # Defined as thin vllm_model clients (spinup_server: false) so the references resolve
+    # and the vllm_model venv builds; no model is loaded in the prefetch dry run.
+    # genrm_model is NOT defined here — the bundled genrm_compare.yaml already defines it
+    # (type genrm_model, model ${genrm_model_name}); redefining would collide.
     safety_judge_model:
       responses_api_models:
         vllm_model:
           entrypoint: app.py
-          base_url: http://127.0.0.1:8001/v1
-          api_key: dummy_key
-          model: "nvidia/Nemotron-Content-Safety-Reasoning-4B"
-          return_token_id_information: false
-          uses_reasoning_parser: false
-          spinup_server: true
-          router_dp_size: 8
-          server_args:
-            tensor_parallel_size: 1
-            gpu_memory_utilization: 0.85
-            max_model_len: 96000
-            model_loader_extra_config:
-              enable_multithread_load: true
-              num_threads: 2
-            compilation_config:
-              cudagraph_capture_sizes: [1, 2, 4, 8, 16]
-          server_env:
-            VLLM_ATTENTION_BACKEND: TRITON_ATTN
-
-    nl2bash_judge_model:
+          base_url: http://localhost:8000/v1
+          api_key: dummy
+          model: dummy-judge
+          spinup_server: false
+    judge_model:
       responses_api_models:
         vllm_model:
           entrypoint: app.py
-          base_url: http://127.0.0.1:10000/v1
-          api_key: dummy_key
-          model: "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
-          return_token_id_information: False
-          uses_reasoning_parser: False
-          spinup_server: True
-          router_dp_size: 2
-          server_args:
-            tensor_parallel_size: 8
-            data_parallel_size: 1
-            enable_expert_parallel: True
-            enable_auto_tool_choice: true
-            tool_call_parser: hermes
-            gpu_memory_utilization: 0.85
-            max_model_len: 131072
-            model_loader_extra_config:
-              enable_multithread_load: true
-              num_threads: 112
-            compilation_config:
-              cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32]
-
-    genrm_model:
+          base_url: http://localhost:8000/v1
+          api_key: dummy
+          model: dummy-judge
+          spinup_server: false
+    # Referenced by the *_reasoning_off agents (e.g. genrm_simple_agent_reasoning_off).
+    # ultra-v3 defines this via `_copy: policy_model` + ${grpo...}/${add:...}, but those
+    # interpolations need a grpo section + the `add` resolver that a prefetch-only config
+    # lacks — so define it as a self-contained thin client (same venv: vllm_model).
+    policy_model_reasoning_off:
       responses_api_models:
         vllm_model:
           entrypoint: app.py
-          base_url: http://127.0.0.1:8000/v1
-          api_key: dummy_key
-          model: "nvidia/Qwen3-Nemotron-235B-A22B-GenRM-2603"
-          uses_reasoning_parser: True
-          return_token_id_information: False
-          spinup_server: True
-          router_dp_size: 2
-          server_args:
-            tensor_parallel_size: 8
-            reasoning_parser: deepseek_r1
-            gpu_memory_utilization: 0.85
-            max_model_len: 60000
-            model_loader_extra_config:
-              enable_multithread_load: true
-              num_threads: 112
-            compilation_config:
-              cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32]
+          base_url: http://localhost:8000/v1
+          api_key: dummy
+          model: dummy-model
+          spinup_server: false
 
-    # ---- per-resource judge wiring (point resource servers at the judges above) ----
-    jailbreak_detection:
-      resources_servers:
-        jailbreak_detection:
-          judge_model_server:
-            type: responses_api_models
-            name: safety_judge_model
-
-    over_refusal_detection:
-      resources_servers:
-        over_refusal_detection:
-          judge_model_server:
-            type: responses_api_models
-            name: nl2bash_judge_model
-
-    inverse_if:
-      resources_servers:
-        inverse_if:
-          judge_model_server:
-            type: responses_api_models
-            name: nl2bash_judge_model
-
-    multichallenge:
-      resources_servers:
-        multichallenge:
-          judge_model_server:
-            type: responses_api_models
-            name: nl2bash_judge_model
-          judge_responses_create_params:
-            max_output_tokens: 8192
-
-    equivalence_llm_judge:
-      resources_servers:
-        equivalence_llm_judge:
-          judge_model_server:
-            name: nl2bash_judge_model
-          judge_responses_create_params:
-            max_output_tokens: 8192
-
-    lc_judge:
-      resources_servers:
-        equivalence_llm_judge:
-          judge_model_server:
-            name: nl2bash_judge_model
-          judge_responses_create_params:
-            max_output_tokens: 8192
-
-    math_with_judge:
-      resources_servers:
-        math_with_judge:
-          judge_model_server:
-            name: nl2bash_judge_model
-          judge_responses_create_params:
-            max_output_tokens: 8192
-          should_use_judge: true
-
-    genrm_compare:
-      resources_servers:
-        genrm_compare:
-          genrm_model_server:
-            type: responses_api_models
-            name: genrm_model
-          genrm_responses_create_params:
-            max_output_tokens: 16384
-            temperature: 0.6
-            top_p: 0.95
-          comparison_strategy: "circular"
-          num_judges_per_comparison: 1
-          use_principle: true
-          aggregator_method: "simple_tiebreaker"
-          default_score: 3.0
-          default_ranking: 3.5
-
-    code_gen:
-      resources_servers:
-        code_gen:
-          num_processes: 1024
-          unit_test_timeout_secs: 10
-          debug: false
+    # The bundled swe_agents config (stage2.2 / swebench_openhands_training.yaml) marks
+    # container_formatter and dataset_path as mandatory (???) — super_launch.sh fills them
+    # at run time. Provide dummies so the prefetch dry run resolves (no SWE runs here; the
+    # values are unused for venv building). Real SWE runs still need the sandbox container.
+    swe_agents_train:
+      responses_api_agents:
+        swe_agents:
+          container_formatter: dummy
+          dataset_path: /dev/null
+    swe_agents_val:
+      responses_api_agents:
+        swe_agents:
+          container_formatter: dummy
+          dataset_path: /dev/null
