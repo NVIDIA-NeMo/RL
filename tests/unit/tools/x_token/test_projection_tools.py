@@ -416,7 +416,7 @@ class TestShared:
         )
         assert (
             utils.clean_model_name_for_filename("microsoft/phi-4-Base")
-            == "microsoft/phi"
+            == "microsoft/phi-4"
         )
         # "mini" preserved as suffix.
         cleaned = utils.clean_model_name_for_filename("Qwen2.5-0.5B-mini-Instruct")
