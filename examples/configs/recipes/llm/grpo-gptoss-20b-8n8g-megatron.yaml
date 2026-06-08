@@ -21,6 +21,8 @@ policy:
   generation:
     vllm_cfg:
       tensor_parallel_size: 2
+    vllm_kwargs:
+      moe_backend: triton
 cluster:
   num_nodes: 8
   gpus_per_node: 8
