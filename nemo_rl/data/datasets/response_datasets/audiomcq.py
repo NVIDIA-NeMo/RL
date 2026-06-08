@@ -72,35 +72,31 @@ class AudioMCQDataset(RawDataset):
         split_validation_size: float = 0,
         seed: int = 42,
         max_samples: int | None = None,
-        populate_val_dataset: bool = True,
         **kwargs,
     ):
         """Construct the wrapper.
 
+        The upstream manifest only ships a native ``train`` split, so the
+        validation slice is synthesized from it through
+        ``split_train_validation`` — the same train-and-validate-from-train
+        convention used by ``AVQADataset``. Set ``split_validation_size > 0``
+        on the ``data.train`` entry and the held-out slice is exposed via
+        ``self.val_dataset`` for ``setup_response_data`` to pick up; no
+        separate ``data.validation`` entry is needed.
+
         Args:
-            split: ``"train"`` or ``"validation"``. The upstream manifest only
-                ships a native train split; both values share the same
-                shuffled+filtered base dataset and partition deterministically
-                from ``split_validation_size`` and ``seed``.
-            split_validation_size: Fraction (or absolute count) of held-out
-                rows. Required when ``split == "validation"``.
-            seed: Shuffle and partition seed. Use the same value across the
-                train and validation entries to share the same partition.
+            split: ``"train"`` or ``"validation"``. Kept for config
+                compatibility; both read the same train manifest.
+            split_validation_size: Fraction (``float``) or absolute count
+                (``int``) of rows held out for validation.
+            seed: Shuffle and split seed.
             max_samples: Optional cap, applied after the defensive
                 ``audio-contribution`` filter and the deterministic shuffle.
-            populate_val_dataset: For ``split == "train"``: when ``True``
-                (the default), populate ``self.val_dataset`` with the
-                held-out slice (the convention used by AVQA and the
-                ``setup_response_data`` train-only path). Set to ``False``
-                when the YAML configures an explicit ``data.validation``
-                entry — the train slice still excludes the held-out rows
-                (no leakage), but ``self.val_dataset`` stays ``None`` so
-                ``setup_response_data`` does not double-count the same rows.
         """
-        valid_splits = ("train", "validation")
-        if split not in valid_splits:
+        VALID_SPLITS = ("train", "validation")
+        if split not in VALID_SPLITS:
             raise ValueError(
-                f"Invalid split: {split}. Please use one of {valid_splits}."
+                f"Invalid split: {split}. Please use one of {VALID_SPLITS}."
             )
 
         self.snapshot_root = _resolve_snapshot_root()
@@ -112,9 +108,7 @@ class AudioMCQDataset(RawDataset):
                 f"{AUDIOMCQ_MANIFEST} at its root."
             )
 
-        # The upstream dataset has only a native 'train' split; we always
-        # load the full manifest and synthesize a validation slice from it
-        # when the caller requests one.
+        # The upstream dataset only has a native 'train' split.
         ds = load_dataset("json", data_files=manifest_path, split="train")
 
         # Defensive filter: the dataset is already pre-filtered to the StrongAC
@@ -129,41 +123,21 @@ class AudioMCQDataset(RawDataset):
 
         self._eager_audio_probe(ds)
 
-        ds = ds.add_column("task_name", [self.task_name] * len(ds))
+        self.dataset = ds.add_column("task_name", [self.task_name] * len(ds))
 
-        if split == "validation":
-            if split_validation_size <= 0:
-                raise ValueError(
-                    "AudioMCQDataset(split='validation') requires "
-                    "split_validation_size > 0; the upstream dataset has no "
-                    "native validation split."
-                )
-            split_ds = ds.train_test_split(test_size=split_validation_size, seed=seed)
-            self.dataset = split_ds["test"]
-            self.preprocessor = self.format_data
-            self.val_dataset = None
-        else:
-            self.preprocessor = self.format_data
-            self.val_dataset = None
-            if populate_val_dataset:
-                # Train-and-validate-from-train convention: keep the train
-                # slice on self.dataset and expose the held-out slice via
-                # self.val_dataset. setup_response_data will pick it up.
-                self.dataset = ds
-                self.split_train_validation(split_validation_size, seed)
-            else:
-                # Caller is loading validation through a separate
-                # data.validation entry; drop the held-out rows from train
-                # so the two splits remain disjoint, but leave val_dataset
-                # unset so setup_response_data does not duplicate the rows
-                # the validation entry already contributes.
-                if split_validation_size > 0:
-                    split_ds = ds.train_test_split(
-                        test_size=split_validation_size, seed=seed
-                    )
-                    self.dataset = split_ds["train"]
-                else:
-                    self.dataset = ds
+        self.preprocessor = self.format_data
+
+        # `self.val_dataset` is used (not None) only when this dataset provides
+        # both training and the held-out validation slice.
+        self.val_dataset = None
+        # split_validation_size is either a fraction in (0, 1) or an absolute
+        # row count. The typed config delivers an absolute count as a float
+        # (e.g. 256.0); datasets.train_test_split only accepts an int for
+        # absolute counts, so coerce whole numbers >= 1 back to int.
+        val_size = split_validation_size
+        if val_size >= 1:
+            val_size = int(val_size)
+        self.split_train_validation(val_size, seed)
 
     def _eager_audio_probe(self, ds: Dataset) -> None:
         """Verify the first row's audio file exists under the snapshot root.

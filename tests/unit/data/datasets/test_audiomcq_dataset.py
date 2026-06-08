@@ -255,78 +255,43 @@ class TestAudioMCQConstruction:
         # Different seed should produce a materially different split.
         assert train_ids_a != train_ids_c
 
-    def test_split_validation_returns_held_out_slice_not_train(
-        self, monkeypatch, tmp_path
-    ):
-        # Regression for round-1 review #2: split="validation" used to load
-        # the train manifest split and then drop the held-out slice on the
-        # floor, returning training rows. The wrapper must now route correctly.
+    def test_split_validation_keeps_train_and_val_disjoint(self, monkeypatch, tmp_path):
+        # The held-out validation slice (exposed via val_dataset) must not
+        # overlap the train slice — the AVQA train-and-validate-from-train
+        # convention partitions a single shuffled base dataset.
         rows = [_row(i) for i in range(10)]
         snapshot_root = _build_fixture_snapshot(tmp_path, rows)
         _patch_snapshot(monkeypatch, snapshot_root)
 
-        train_ds = AudioMCQDataset(split="train", split_validation_size=0.2, seed=42)
-        val_ds = AudioMCQDataset(split="validation", split_validation_size=0.2, seed=42)
+        dataset = AudioMCQDataset(split="train", split_validation_size=0.2, seed=42)
 
-        train_ids = set(r["id"] for r in train_ds.dataset)
-        held_out_ids = set(r["id"] for r in train_ds.val_dataset)
-        val_loader_ids = set(r["id"] for r in val_ds.dataset)
+        train_ids = set(r["id"] for r in dataset.dataset)
+        val_ids = set(r["id"] for r in dataset.val_dataset)
 
-        assert val_loader_ids == held_out_ids, (
-            "split='validation' must return the held-out slice, not the training slice"
-        )
-        assert train_ids.isdisjoint(val_loader_ids), (
+        assert train_ids.isdisjoint(val_ids), (
             "validation IDs must not overlap with training IDs"
         )
+        assert len(train_ids) + len(val_ids) == len(rows)
 
-    def test_validation_split_requires_size(self, monkeypatch, tmp_path):
-        rows = [_row(i) for i in range(5)]
+    def test_absolute_count_validation_size_as_float(self, monkeypatch, tmp_path):
+        # The typed config delivers an absolute split_validation_size as a
+        # float (e.g. 256.0); datasets.train_test_split rejects a float >= 1,
+        # so the wrapper must coerce whole numbers back to an int count.
+        rows = [_row(i) for i in range(10)]
         snapshot_root = _build_fixture_snapshot(tmp_path, rows)
         _patch_snapshot(monkeypatch, snapshot_root)
 
-        with pytest.raises(ValueError, match="split_validation_size > 0"):
-            AudioMCQDataset(split="validation", split_validation_size=0.0)
+        dataset = AudioMCQDataset(split="train", split_validation_size=3.0, seed=42)
 
-    def test_populate_val_dataset_false_keeps_train_disjoint_no_dup(
-        self, monkeypatch, tmp_path
-    ):
-        # When the YAML configures both `data.train` (with
-        # populate_val_dataset=false) and an explicit `data.validation`
-        # entry, the train wrapper must (a) drop the held-out rows from
-        # its `dataset` so train/val stay disjoint and (b) leave
-        # `val_dataset` unset so setup_response_data does not double-count
-        # those rows alongside the validation entry.
-        rows = [_row(i) for i in range(20)]
-        snapshot_root = _build_fixture_snapshot(tmp_path, rows)
-        _patch_snapshot(monkeypatch, snapshot_root)
+        assert len(dataset.val_dataset) == 3
+        assert len(dataset.dataset) == len(rows) - 3
 
-        train_ds = AudioMCQDataset(
-            split="train",
-            split_validation_size=0.25,
-            seed=7,
-            populate_val_dataset=False,
-        )
-        val_ds = AudioMCQDataset(split="validation", split_validation_size=0.25, seed=7)
-
-        train_ids = set(r["id"] for r in train_ds.dataset)
-        val_ids = set(r["id"] for r in val_ds.dataset)
-
-        # Train slice excludes the held-out rows.
-        assert len(train_ids) == len(rows) - len(val_ids)
-        assert train_ids.isdisjoint(val_ids)
-        # No auto-population on the train wrapper.
-        assert train_ds.val_dataset is None
-
-    def test_populate_val_dataset_false_with_size_zero_keeps_full_train(
-        self, monkeypatch, tmp_path
-    ):
+    def test_no_validation_size_keeps_full_train(self, monkeypatch, tmp_path):
         rows = [_row(i) for i in range(8)]
         snapshot_root = _build_fixture_snapshot(tmp_path, rows)
         _patch_snapshot(monkeypatch, snapshot_root)
 
-        train_ds = AudioMCQDataset(
-            split="train", split_validation_size=0, populate_val_dataset=False
-        )
+        train_ds = AudioMCQDataset(split="train", split_validation_size=0)
         assert len(train_ds.dataset) == len(rows)
         assert train_ds.val_dataset is None
 

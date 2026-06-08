@@ -7,10 +7,10 @@ NeMo-RL ships three recipes out of the box, but the pieces are independent and c
 | Recipe | Model | Default dataset | Config |
 | --- | --- | --- | --- |
 | 3B (R1-AQA reproduction) | Qwen2.5-Omni-3B | [AVQA](https://mn.cs.tsinghua.edu.cn/avqa) | `examples/configs/audio_grpo_3B_megatron.yaml` |
-| 7B (StrongAC + Gemini CoT) | Qwen2.5-Omni-7B | [Harland/AudioMCQ-StrongAC-GeminiCoT](https://huggingface.co/datasets/Harland/AudioMCQ-StrongAC-GeminiCoT) | `examples/configs/audio_grpo_7B_megatron.yaml` |
-| 30B MoE (Qwen3-Omni) | Qwen3-Omni-30B-A3B-Instruct | Harland/AudioMCQ-StrongAC-GeminiCoT | `examples/configs/audio_grpo_qwen3_omni_megatron.yaml` |
+| 7B (StrongAC + Gemini CoT) | Qwen2.5-Omni-7B | [Harland/AudioMCQ-StrongAC-GeminiCoT](https://huggingface.co/datasets/Harland/AudioMCQ-StrongAC-GeminiCoT) | `examples/configs/recipes/vlm/vlm_grpo-qwen2.5-omni-7b-audiomcq-1n8g-megatron.v1.yaml` |
+| 30B MoE (Qwen3-Omni) | Qwen3-Omni-30B-A3B-Instruct | Harland/AudioMCQ-StrongAC-GeminiCoT | `examples/configs/recipes/vlm/vlm_grpo-qwen3-omni-30ba3b-audiomcq-4n8g-megatron.v1.yaml` |
 
-The 3B recipe accepts the AudioMCQ dataset via a CLI override (no new YAML needed); the 7B recipe is standalone (it inherits non-audio defaults from `grpo_math_1B_megatron.yaml` rather than chaining through the 3B audio recipe); and the 30B recipe targets the Qwen3-Omni MoE thinker on 4 × 8 H100/H200, sharing the AudioMCQ dataset block with the 7B recipe. You can swap models and datasets independently.
+The 3B recipe accepts the AudioMCQ dataset via a CLI override (no new YAML needed); the 7B and 30B recipes live under `examples/configs/recipes/vlm/` and inherit non-audio defaults from `grpo_math_1B_megatron.yaml`, redeclaring the audio-specific blocks inline. The 30B recipe targets the Qwen3-Omni MoE thinker on 4 × 8 H100/H200. You can swap models and datasets independently.
 
 ## 1. Datasets
 
@@ -33,7 +33,7 @@ NeMo-RL exposes the dataset under `dataset_name: audiomcq`. The wrapper performs
 huggingface-cli download Harland/AudioMCQ-StrongAC-GeminiCoT --repo-type=dataset
 ```
 
-Because the upstream manifest only ships a native `train` split, the wrapper synthesizes a deterministic validation slice from `split_validation_size` + `seed`. The 7B yaml uses an explicit `data.validation` block plus `populate_val_dataset: false` on `data.train` so the train slice excludes the held-out rows (no leakage) and the validation pool is not double-counted (no duplication).
+Because the upstream manifest only ships a native `train` split, the wrapper synthesizes a deterministic held-out validation slice from `split_validation_size` + `seed` — the same train-and-validate-from-train convention used by AVQA. The 7B and 30B yamls set `data.train.split_validation_size` to an absolute count (256, matching `grpo.max_val_samples`); the held-out rows are exposed as the validation set and excluded from training (no leakage), and no separate `data.validation` entry is needed.
 
 ## 2. Train
 
@@ -62,15 +62,16 @@ To retarget the 3B recipe to AudioMCQ purely via CLI overrides:
 uv run examples/run_vlm_grpo.py \
     --config examples/configs/audio_grpo_3B_megatron.yaml \
     data.train.dataset_name=audiomcq \
+    data.train.split_validation_size=256 \
     data.validation=null
 ```
 
-(`data.validation=null` is required because AVQA's native `split=validation` doesn't exist on the AudioMCQ manifest. The train wrapper's auto-populated `val_dataset` provides the held-out rows instead.)
+(`data.validation=null` drops AVQA's native `split=validation` entry, which doesn't exist on the AudioMCQ manifest; `data.train.split_validation_size=256` makes the train wrapper auto-populate `val_dataset` with a held-out slice instead.)
 
-### 7B (Qwen2.5-Omni-7B) — `audio_grpo_7B_megatron.yaml`
+### 7B (Qwen2.5-Omni-7B) — `vlm_grpo-qwen2.5-omni-7b-audiomcq-1n8g-megatron.v1.yaml`
 
 ```
-uv run examples/run_vlm_grpo.py --config examples/configs/audio_grpo_7B_megatron.yaml
+uv run examples/run_vlm_grpo.py --config examples/configs/recipes/vlm/vlm_grpo-qwen2.5-omni-7b-audiomcq-1n8g-megatron.v1.yaml
 ```
 
 Key hyperparameters (sized for 1 × 8 × H100/H200 80 GB):
@@ -92,16 +93,16 @@ For a quick smoke run that exercises the dataset and processor plumbing without 
 
 ```
 uv run --no-sync examples/run_vlm_grpo.py \
-    --config examples/configs/audio_grpo_7B_megatron.yaml \
+    --config examples/configs/recipes/vlm/vlm_grpo-qwen2.5-omni-7b-audiomcq-1n8g-megatron.v1.yaml \
     grpo.max_num_steps=2 \
     checkpointing.enabled=false \
     logger.wandb_enabled=false
 ```
 
-### 30B MoE (Qwen3-Omni-30B-A3B-Instruct) — `audio_grpo_qwen3_omni_megatron.yaml`
+### 30B MoE (Qwen3-Omni-30B-A3B-Instruct) — `vlm_grpo-qwen3-omni-30ba3b-audiomcq-4n8g-megatron.v1.yaml`
 
 ```
-uv run examples/run_vlm_grpo.py --config examples/configs/audio_grpo_qwen3_omni_megatron.yaml
+uv run examples/run_vlm_grpo.py --config examples/configs/recipes/vlm/vlm_grpo-qwen3-omni-30ba3b-audiomcq-4n8g-megatron.v1.yaml
 ```
 
 Key hyperparameters (sized for 4 × 8 × H100/H200 80 GB):
@@ -119,7 +120,7 @@ Key hyperparameters (sized for 4 × 8 × H100/H200 80 GB):
 | Learning rate | 1e-6 |
 | Reward | format (0.2) + exact_alnum (0.8) |
 
-The Qwen3-Omni recipe has three model-specific gotchas baked into the yaml:
+The Qwen3-Omni recipe has two model-specific gotchas baked into the yaml:
 
 - **Thinker-only training.** The Megatron `Qwen3OmniBridge` only converts the thinker (LLM + audio + vision encoders); talker / code2wav modules emit a one-line `talker/code2wav audio-output is not supported yet` warning at convert time and stay frozen at the original HF weights, so checkpoint conversion in §3 needs `--no-strict`.
 - **vLLM `tensor_parallel_size: 4`, not 1.** With TP=1 + EP > 1, NeMo-RL's `VllmGenerationWorker` enters the `else` branch in `vllm_worker.py:431` (no `RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES`, no `VLLM_RAY_PER_WORKER_GPUS`); vLLM then auto-picks `RayDistributedExecutor` (because the worker actor itself runs inside a Ray actor) and `_init_workers_ray` blocks forever in `ray.get` waiting for a Ray sub-worker that has no GPU bundle to land on. TP=4 enters the `if model_parallel_size > 1` branch, which sets the per-worker GPU fraction so the sub-workers can co-tenant the parent actor's GPU bundle. TP must also divide the audio tower's 20 attention heads, which rules out TP=8.
