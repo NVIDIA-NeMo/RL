@@ -640,6 +640,7 @@ def _fields_for_put(meta: KVBatchMeta, fields: dict[str, torch.Tensor]) -> Tenso
     if meta.sequence_lengths is None:
         for field_name, value in fields.items():
             packed[field_name] = value.detach().contiguous()
+        # pyrefly: ignore[bad-argument-type]
         return TensorDict(packed, batch_size=[meta.size])
 
     lengths = torch.tensor(meta.sequence_lengths, dtype=torch.long)
@@ -655,4 +656,5 @@ def _fields_for_put(meta: KVBatchMeta, fields: dict[str, torch.Tensor]) -> Tenso
             )
         else:
             packed[field_name] = value.detach().contiguous()
+    # pyrefly: ignore[bad-argument-type]
     return TensorDict(packed, batch_size=[meta.size])
