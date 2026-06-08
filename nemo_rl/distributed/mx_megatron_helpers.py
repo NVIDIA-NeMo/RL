@@ -174,16 +174,48 @@ def _classify_module_class(mod_class_name: str) -> str | None:
     return None
 
 
+_PARAM_LEAF_NAMES = {"weight", "bias", "scale", "_extra_state"}
+
+
+def _is_param_leaf(name_part: str) -> bool:
+    """Return True for any trailing name that's a parameter rather than a child module.
+
+    Includes the standard ``weight``/``bias``/``scale``/``_extra_state``
+    and the grouped-MoE per-expert convention ``weight0``, ``weight1``,
+    ``weight127``, ``bias0``, etc. Megatron-Core's TE-grouped linears
+    expose one ``weight<idx>`` ``nn.Parameter`` per local expert.
+    """
+    if name_part in _PARAM_LEAF_NAMES:
+        return True
+    for base in ("weight", "bias", "scale"):
+        if name_part.startswith(base):
+            suffix = name_part[len(base):]
+            if suffix and suffix.isdigit():
+                return True
+    return False
+
+
+def _expert_index_from_param(name_part: str) -> int | None:
+    """If ``name_part`` is ``weight<N>``/``bias<N>``/etc, return ``N``."""
+    for base in ("weight", "bias", "scale"):
+        if name_part.startswith(base):
+            suffix = name_part[len(base):]
+            if suffix and suffix.isdigit():
+                return int(suffix)
+    return None
+
+
 def _enclosing_module(name: str, model: "torch.nn.Module") -> "torch.nn.Module | None":
     """Walk down model attributes to find the module that owns ``name``.
 
     ``name`` is a parameter name like
-    ``decoder.layers.0.self_attention.linear_qkv.weight``. Return the
-    module at ``decoder.layers.0.self_attention.linear_qkv`` (i.e. the
-    parent of ``.weight``).
+    ``decoder.layers.0.self_attention.linear_qkv.weight`` or
+    ``decoder.layers.0.mlp.experts.linear_fc1.weight0`` for grouped-MoE
+    per-expert parameters. Return the parent module of the final
+    parameter token.
     """
     parts = name.split(".")
-    if not parts or parts[-1] not in {"weight", "bias", "scale", "_extra_state"}:
+    if not parts or not _is_param_leaf(parts[-1]):
         # Fall back to the deepest module — caller will get a leaf.
         cur = model
         for p in parts:
@@ -274,7 +306,34 @@ def detect_megatron_role(
             if needle in name:
                 return MegatronRoleSpec(role=role)
 
-    # ---- 2. MoE expert tensors. ----
+    # ---- 2a. Grouped-MoE per-expert tensors (one ``weight<N>``
+    # nn.Parameter per local expert, used by TE-grouped linears even
+    # when EP=1). The trailing param name carries the expert index.
+    if _is_expert_name(name, expert_pattern=expert_pattern):
+        leaf = name.rsplit(".", 1)[-1] if "." in name else name
+        expert_idx = _expert_index_from_param(leaf)
+        if expert_idx is not None:
+            # Per-expert grouped tensor. Each `weight<N>` is one expert's
+            # full local shard; the receiver runs per_expert assembly.
+            mod_class = _module_class_name(_enclosing_module(name, model))
+            sub_role = (
+                ROLE_EXPERT_ROW if "RowParallel" in mod_class
+                else ROLE_EXPERT_COLUMN
+            )
+            return MegatronRoleSpec(
+                role=sub_role,
+                is_expert=True,
+                expert_axis=0,
+                owned_expert_ids={expert_idx},
+                descriptor_extras={
+                    "expert_axis": "0",
+                    "expert_id": str(expert_idx),
+                    "expert_layout": "grouped",
+                },
+            )
+
+    # ---- 2b. EP>1 leading-axis grouped (legacy path: single .weight
+    # holds ep_size experts as the leading axis chunk). ----
     if _is_expert_name(name, expert_pattern=expert_pattern) and ep_size > 1 and param.ndim >= 2:
         leading = param.shape[0]
         if leading % ep_size == 0:
@@ -284,7 +343,7 @@ def detect_megatron_role(
             if _is_fused_gated_mlp_name(name):
                 # Per-expert fused gate+up: assembler treats it as
                 # gated_mlp_split inside the per-expert routing.
-                sub_role = ROLE_EXPERT_COLUMN  # v0: classify as column-shaped expert
+                sub_role = ROLE_EXPERT_COLUMN
             mod_class = _module_class_name(_enclosing_module(name, model))
             if "RowParallel" in mod_class:
                 sub_role = ROLE_EXPERT_ROW
@@ -293,7 +352,10 @@ def detect_megatron_role(
                 is_expert=True,
                 expert_axis=0,
                 owned_expert_ids=owned,
-                descriptor_extras={"expert_axis": "0"},
+                descriptor_extras={
+                    "expert_axis": "0",
+                    "expert_layout": "leading_axis",
+                },
             )
 
     # ---- 3. Walk to the enclosing module + classify against Bridge's
