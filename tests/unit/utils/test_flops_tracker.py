@@ -37,9 +37,7 @@ def _qwen3_flops_config(head_dim):
 
 def test_qwen3_flops_head_dim_backward_compat():
     """head_dim=None falls back to hidden_size // num_heads, matching the old formula."""
-    assert qwen3(_qwen3_flops_config(None)) == qwen3(
-        _qwen3_flops_config(4096 // 64)
-    )
+    assert qwen3(_qwen3_flops_config(None)) == qwen3(_qwen3_flops_config(4096 // 64))
 
 
 def test_qwen3_flops_wide_attention():
