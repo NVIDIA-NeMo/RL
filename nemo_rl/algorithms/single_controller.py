@@ -359,11 +359,15 @@ class SingleControllerActor:
 
             selected_meta = await self._advantage_pump(selected_meta)
 
+            lag = self._trainer_version - min(
+                t["weight_version"] for t in selected_meta.tags
+            )
             log.info(
-                "train step %d/%d  trainer_v=%d  batch_size=%d",
+                "train step %d/%d  trainer_v=%d  lag=%d  batch_size=%d",
                 self._train_steps + 1,
                 self._cfg.max_train_steps,
                 self._trainer_version,
+                lag,
                 selected_meta.size,
             )
 
