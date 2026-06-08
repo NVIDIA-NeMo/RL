@@ -12,29 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SingleController: asyncio-based orchestrator for the RL training loop.
+"""SingleController: asyncio orchestrator for the RL training loop.
 
-SingleController is a CPU-only Ray actor that owns three concurrent asyncio
-pumps and coordinates all other actors via lightweight RPCs. Other actors
-expose methods and wait to be called.
-
-Key invariant: SC does not run model work. It sends control signals
-(``KVBatchMeta`` and actor handles) and reads metadata. When advantage
-calculation is enabled, SC fetches only the configured advantage input
-columns, computes advantages, and writes that small derived column back to
-DataPlane. Model tensors still move through DataPlane or NCCL.
+CPU-only Ray actor that runs three concurrent pumps and coordinates the
+other actors via lightweight RPCs. SC sends control signals and reads
+metadata only — model tensors still move through DataPlane or NCCL.
 
 Data flow:
   _rollout_pump  → rollout_manager.generate_and_push(prompt)
-                     RolloutManager runs run_rollout locally then dp_client.put_samples(...)
-  _train_pump    → dp_client.claim_meta(...) → StalenessSampler
-                 → _advantage_pump(meta) → dp_client.get_samples(...)
-                                        → adv_estimator.compute_advantage(...)
-                                        → dp_client.put_samples(...)
-                 → trainer.train_from_meta(meta)
-                     Trainer → dp_client.get_samples(...)   (via its own client)
-                 → dp_client.clear_samples(...)             ← SC clears after train
-  _sync_weights  → drain _inflight_rollouts → WeightSynchronizer.sync_weights()
+                     → TQReplayBuffer.add tensorizes the record and writes
+                       N training rows to TQ as one prompt-group.
+  _train_pump    → sampler.evict → buffer.remove (stale groups, with DP clear).
+                 → sampler.select → drops chosen groups from buffer, returns
+                   KVBatchMeta of K groups (or None); meta is already trainable.
+                 → _advantage_pump (get → compute → put).
+                 → trainer.train_on_meta.
+                 → dp_client.clear_samples (trained groups; buffer already dropped).
+  _sync_weights  → drain _inflight_rollouts → WeightSynchronizer.sync_weights.
 """
 
 from __future__ import annotations
@@ -50,11 +44,8 @@ import torch
 from tensordict import TensorDict
 from torchdata.stateful_dataloader import StatefulDataLoader
 
-from nemo_rl.algorithms.staleness_sampler import (
-    StalenessSampler,
-    count_prompt_groups,
-    min_weight_version,
-)
+from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
+from nemo_rl.algorithms.async_utils.staleness_sampler import StalenessSampler
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -83,12 +74,11 @@ class SingleControllerConfig:
 
     # Training
     max_train_steps: int = 10
+    # Cap on dataloader passes; None means unbounded (cycle until cancelled).
+    max_num_epochs: Optional[int] = None
 
     # DataPlane partition
     partition_id: str = "rollout_data"
-    consumer_task_name: str = "train"
-    claim_required_fields: list[str] = field(default_factory=lambda: ["input_ids"])
-    max_claim_prompt_groups: int = 8
 
     # Advantage calculation
     advantage_enabled: bool = False
@@ -123,8 +113,8 @@ class SingleControllerActor:
     """CPU-only Ray actor that orchestrates the RL training loop.
 
     Owns three concurrent asyncio tasks:
-      - _rollout_pump: dispatches prompts to GenerationWorkerActor
-      - _train_pump:   claims DataPlane meta, trains, clears consumed rows
+      - _rollout_pump: dispatches prompts via RolloutManager → TQReplayBuffer.add
+      - _train_pump:   evicts stale groups, samples a batch, trains, drops it
       - _sync_weights: drain gate + weight synchronization
 
     All other actors are passive — they expose methods and wait to be called.
@@ -142,8 +132,11 @@ class SingleControllerActor:
         weight_synchronizer: Any,
         advantage_estimator: Any | None = None,
         tokenizer: Any | None = None,
-        # TODO: remove later, keep here for dry run test
+        # TODO: remove the rollout_manager / tq_buffer overrides once SC's
+        # setup phase owns construction; today they let the dry-run test
+        # share one buffer + manager instance with SC.
         rollout_manager: RolloutManager | None = None,
+        tq_buffer: TQReplayBuffer | None = None,
     ) -> None:
         import logging as _logging
 
@@ -165,6 +158,24 @@ class SingleControllerActor:
                 "advantage_enabled=True requires an advantage_estimator instance"
             )
 
+        if cfg.target_prompt_groups_per_step is None:
+            cfg.target_prompt_groups_per_step = cfg.min_prompt_groups_per_batch
+        if cfg.target_prompt_groups_per_step < cfg.min_prompt_groups_per_batch:
+            raise ValueError(
+                f"target_prompt_groups_per_step ({cfg.target_prompt_groups_per_step}) "
+                f"must be >= min_prompt_groups_per_batch ({cfg.min_prompt_groups_per_batch})"
+            )
+
+        pad_id = int(getattr(tokenizer, "pad_token_id", 0) or 0)
+        if tq_buffer is None:
+            self._buffer = TQReplayBuffer(
+                dp_client,
+                partition_id=cfg.partition_id,
+                pad_value_dict={"token_ids": pad_id},
+            )
+        else:
+            self._buffer = tq_buffer
+
         if rollout_manager is None:
             self._rollout_manager = RolloutManager(
                 tokenizer=tokenizer,
@@ -174,11 +185,15 @@ class SingleControllerActor:
                 max_rollout_turns=cfg.rollout_max_turns,
                 use_nemo_gym=cfg.use_nemo_gym,
                 policy_generation=gen_handle,
-                dp_client=dp_client,
-                partition_id=cfg.partition_id,
+                tq_buffer=self._buffer,
             )
         else:
             self._rollout_manager = rollout_manager
+            # Ray serializes kwargs as separate cloudpickle blobs, so a
+            # rollout_manager and tq_buffer passed together as `.remote()`
+            # args deserialize as distinct buffer instances inside the actor.
+            # Rebind so the rollout writer and sampler share one buffer.
+            self._rollout_manager._tq_buffer = self._buffer
 
         # Initialize sampler
         assert cfg.batch_selection_strategy in [
@@ -191,14 +206,11 @@ class SingleControllerActor:
             print(
                 "Using strict_on_policy, auto setting max_weight_staleness_versions to 0."
             )
-        if cfg.target_prompt_groups_per_step is None:
-            cfg.target_prompt_groups_per_step = cfg.min_prompt_groups_per_batch
-        if cfg.target_prompt_groups_per_step < cfg.min_prompt_groups_per_batch:
-            raise ValueError(
-                f"target_prompt_groups_per_step ({cfg.target_prompt_groups_per_step}) "
-                f"must be >= min_prompt_groups_per_batch ({cfg.min_prompt_groups_per_batch})"
-            )
-        self._sampler = StalenessSampler(cfg.max_weight_staleness_versions)
+
+        self._sampler = StalenessSampler(
+            self._buffer,
+            max_staleness_versions=cfg.max_weight_staleness_versions,
+        )
 
         # ── asyncio state ──────────────────────────────────────────────────
         # Gate: cleared during _sync_weights, set when generation may proceed
@@ -209,15 +221,14 @@ class SingleControllerActor:
         self._inflight_rollouts: int = 0
 
         # Backpressure valve: max unconsumed rollout groups allowed in DataPlane.
-        # Acquired before each rollout dispatch; released after clear_samples.
+        # Acquired before each rollout dispatch; released when the buffer
+        # drops a group (sampler.evict or post-train buffer.remove).
         self._buffer_capacity: asyncio.Semaphore = asyncio.Semaphore(
             cfg.max_buffered_rollouts
         )
 
         self._trainer_version: int = 0
         self._train_steps: int = 0
-        self._rollout_done: bool = False
-        self._claimed_meta: KVBatchMeta | None = None
         self._step_consumed_sample_ids: list[str] = []
 
         log.info(
@@ -298,7 +309,7 @@ class SingleControllerActor:
             return await result
         return result
 
-    # ── the four pumps (three main pumps + advantage pump) ─────────────────
+    # ── the three pumps + advantage helper ────────────────────────────────
 
     async def _rollout_pump(self) -> None:
         """Continuously dispatch rollout tasks until cancellation.
@@ -308,7 +319,8 @@ class SingleControllerActor:
           2. Acquire sem (cap concurrent in-flight rollouts)
           3. Wait for _rollout_permitted (paused during weight sync)
           4. Call rollout_manager.generate_and_push(prompt) — local async
-             RolloutManager runs rollout and calls DataPlane put_samples directly
+             RolloutManager runs the rollout and writes the group via
+             TQReplayBuffer.add (→ dp_client.put_samples + meta append)
           5. Decrement _inflight_rollouts
         """
         sem = asyncio.Semaphore(self._cfg.max_inflight_prompts)
@@ -329,8 +341,10 @@ class SingleControllerActor:
                 self._inflight_rollouts -= 1
                 sem.release()
 
-        # TODO: add max_num_epochs and limit max_train_steps to max_num_epochs * len(dataloader) when setup
-        while True:
+        # TODO: limit max_train_steps to max_num_epochs * len(dataloader) when setup
+        max_epochs = self._cfg.max_num_epochs
+        epoch = 0
+        while max_epochs is None or epoch < max_epochs:
             for prompt in self._dataloader:
                 # check if buffer is full
                 await self._buffer_capacity.acquire()
@@ -341,16 +355,22 @@ class SingleControllerActor:
 
                 # dispatch rollout
                 asyncio.create_task(_dispatch_one_prompt(prompt))
+            epoch += 1
+
+        log.info("rollout_pump: completed %d epoch(s)", epoch)
 
     async def _train_pump(self) -> None:
-        """Per-prompt-group streaming train loop.
+        """Drain stale groups, sample, train, drop.
 
         Per step:
-          - Lazy ``begin_train_step`` on first ready group.
-          - Per ready group: optional ``prepare_logprobs_from_meta`` →
-            ``_advantage_pump`` → ``train_microbatch_from_meta`` (queued).
-          - End-of-step: drain in-flight → ``finish_train_step`` →
-            single ``clear_samples`` → ``_sync_weights``.
+          1. sampler.evict drops stale groups from the buffer and clears their TQ rows.
+          2. sampler.select returns K prompt groups (or None) and drops them from the
+             buffer; DP rows survive so the trainer can read them. Already trainable —
+             buffer wrote training-shaped rows at rollout time.
+          3. _advantage_pump(train_meta).
+          4. trainer.train_on_meta(train_meta, dp_client).
+          5. dp_client.clear_samples on consumed sample_ids; release _buffer_capacity
+             per dropped group, then sync.
         """
         logprobs_required = (
             self._cfg.advantage_policy_logprobs_field is not None
@@ -366,67 +386,49 @@ class SingleControllerActor:
             groups_dispatched = 0
             in_flight: list[ray.ObjectRef] = []
             step_open = False
-            step_min_weight_version: int | None = None
+
+            evicted = await self._sampler.evict(
+                current_train_weight=self._trainer_version,
+            )
+            if evicted:
+                log.info("  evicted %d stale prompt group(s)", evicted)
+                for _ in range(evicted):
+                    self._buffer_capacity.release()
 
             while groups_dispatched < target_groups:
                 await asyncio.sleep(0)
-                await self._claim_available_meta()
-                evicted_meta = await self._evict_stale_claimed()
-                if evicted_meta is not None:
-                    evicted_groups = count_prompt_groups(
-                        evicted_meta,
-                        generations_per_prompt=self._cfg.generations_per_prompt,
-                    )
-                    for _ in range(evicted_groups):
-                        self._buffer_capacity.release()
 
-                group_indices = None
-                if self._claimed_meta is not None and self._claimed_meta.size > 0:
-                    group_indices = self._sampler.select_one_group(
-                        self._claimed_meta,
-                        trainer_version=self._trainer_version,
-                        generations_per_prompt=self._cfg.generations_per_prompt,
-                    )
+                # TODO @yukih: wait train pump merged, now always return min_prompt_groups_per_batch
+                # need to add a max_prompt_groups_per_batch
+                train_meta, num_groups = await self._sampler.select(
+                    current_train_weight=self._trainer_version,
+                    min_prompt_groups=self._cfg.min_prompt_groups_per_batch,
+                )
 
-                if group_indices is None:
-                    in_flight = await self._reap_in_flight_nonblocking(in_flight)
-                    if (
-                        self._rollout_done
-                        and len(in_flight) == 0
-                        and (self._claimed_meta is None or self._claimed_meta.size == 0)
-                    ):
-                        break
-                    await asyncio.sleep(0.005)
+                if train_meta is None:
+                    await asyncio.sleep(0.05)
                     continue
 
-                group_meta = self._claimed_meta.subset(group_indices)
-                self._claimed_meta = self._claimed_meta.drop(group_indices)
+                for _ in range(num_groups):
+                    self._buffer_capacity.release()
 
                 if logprobs_required:
                     await self._ray_get(
-                        self._trainer.prepare_logprobs_from_meta.remote(group_meta)
+                        self._trainer.prepare_logprobs_from_meta.remote(train_meta)
                     )
 
-                group_meta = await self._advantage_pump(group_meta)
+                train_meta = await self._advantage_pump(train_meta)
 
                 if not step_open:
                     await self._ray_get(self._trainer.begin_train_step.remote(step_id))
                     step_open = True
 
                 future = self._trainer.train_microbatch_from_meta.remote(
-                    step_id, group_meta
+                    step_id, train_meta
                 )
                 in_flight.append(future)
-                groups_dispatched += 1
-                self._buffer_capacity.release()
-                self._step_consumed_sample_ids.extend(group_meta.sample_ids)
-                group_min_v = min_weight_version(group_meta)
-                if group_min_v is not None:
-                    step_min_weight_version = (
-                        group_min_v
-                        if step_min_weight_version is None
-                        else min(step_min_weight_version, group_min_v)
-                    )
+                groups_dispatched += num_groups
+                self._step_consumed_sample_ids.extend(train_meta.sample_ids)
 
                 in_flight = await self._reap_in_flight_nonblocking(in_flight)
 
@@ -441,19 +443,16 @@ class SingleControllerActor:
                 self._trainer.finish_train_step.remote(step_id)
             )
             consumed_ids = list(self._step_consumed_sample_ids)
+            self._step_consumed_sample_ids = []
             await self._call_dp(
                 "clear_samples",
-                sample_ids=consumed_ids,
+                sample_ids=list(consumed_ids),
                 partition_id=self._cfg.partition_id,
             )
-            self._step_consumed_sample_ids = []
-            prev_trainer_version = self._trainer_version
+
             self._trainer_version = result["trainer_version"]
-            lag = (
-                prev_trainer_version - step_min_weight_version
-                if step_min_weight_version is not None
-                else 0
-            )
+            min_sample_version = min(t["weight_version"] for t in train_meta.tags)  # type: ignore
+            lag = self._trainer_version - min_sample_version
             log.info(
                 "train step %d/%d  trainer_v=%d  lag=%d  batch_size=%d",
                 self._train_steps + 1,
@@ -498,6 +497,7 @@ class SingleControllerActor:
         elapsed = time.monotonic() - t0
 
         log.info("  _sync_weights: sync done in %.3fs", elapsed)
+        self._rollout_manager.set_weight_version(self._trainer_version)
         self._rollout_permitted.set()
 
     async def _advantage_pump(self, meta: KVBatchMeta) -> KVBatchMeta:
@@ -571,38 +571,6 @@ class SingleControllerActor:
 
     # ── utility helpers ────────────────────────────────────────────────────
 
-    async def _claim_available_meta(self) -> None:
-        """Claim currently-ready rows and append them to the local scheduler cache.
-
-        TODO: replace this with a non-consuming metadata listing API.
-        ``claim_meta`` advances TQ's per-task cursor, so SC must keep a
-        local cache of claimed-but-not-yet-trained samples for now.
-        """
-        batch_size = (
-            self._cfg.max_claim_prompt_groups * self._cfg.generations_per_prompt
-        )
-        meta = await self._call_dp(
-            "claim_meta",
-            partition_id=self._cfg.partition_id,
-            task_name=self._cfg.consumer_task_name,
-            required_fields=self._claim_required_fields(),
-            batch_size=batch_size,
-            blocking=False,
-            timeout_s=0.0,
-        )
-        if meta.size == 0:
-            return
-        if self._claimed_meta is None or self._claimed_meta.size == 0:
-            self._claimed_meta = meta
-        else:
-            self._claimed_meta = self._claimed_meta.concat(meta)
-
-    def _claim_required_fields(self) -> list[str]:
-        fields = list(self._cfg.claim_required_fields)
-        if self._cfg.advantage_enabled:
-            fields.extend(self._advantage_input_fields())
-        return list(dict.fromkeys(fields))
-
     def _advantage_input_fields(self) -> list[str]:
         fields = [
             self._cfg.advantage_prompt_ids_field,
@@ -616,33 +584,6 @@ class SingleControllerActor:
         if self._cfg.advantage_reference_logprobs_field is not None:
             fields.append(self._cfg.advantage_reference_logprobs_field)
         return list(dict.fromkeys(fields))
-
-    async def _evict_stale_claimed(self) -> KVBatchMeta | None:
-        if self._claimed_meta is None or self._claimed_meta.size == 0:
-            return None
-        indices = self._sampler.evictable_indices(
-            self._claimed_meta,
-            trainer_version=self._trainer_version,
-            generations_per_prompt=self._cfg.generations_per_prompt,
-        )
-        if not indices:
-            return None
-        evicted_meta = self._claimed_meta.subset(indices)
-        log.info(
-            "  evicting %d stale samples from %d prompt group(s)",
-            evicted_meta.size,
-            count_prompt_groups(
-                evicted_meta,
-                generations_per_prompt=self._cfg.generations_per_prompt,
-            ),
-        )
-        await self._call_dp(
-            "clear_samples",
-            sample_ids=evicted_meta.sample_ids,
-            partition_id=evicted_meta.partition_id,
-        )
-        self._claimed_meta = self._claimed_meta.drop(indices)
-        return evicted_meta
 
 
 def _tensor_field(data: TensorDict, field_name: str) -> torch.Tensor:

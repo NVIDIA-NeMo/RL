@@ -12,13 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import threading as _threading
+import uuid
 from collections import Counter
+from collections.abc import Mapping
 from typing import Any, Iterable, Optional
 
 import ray
 
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
+from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.experience.interfaces import PromptGroupRecord
+from nemo_rl.experience.payload import pack_payload, record_to_train_batch
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
@@ -551,93 +557,111 @@ class ReplayBuffer(ReplayBufferImpl):
     pass
 
 
-# WIP: DO NOT USE - This class is WIP and may be changed without notice, please DO NOT USE it.
-# Will be replaced by TQReplayBuffer once TQ is ready.
-@ray.remote  # pragma: no cover
-class ReplayBufferNew(ReplayBufferImpl):
-    """Staleness-window replay buffer.
+class TQReplayBuffer:
+    """Meta cache + TQ writer for prompt-group records.
 
-    -- WIP: DO NOT USE --
-    This class is WIP and may be changed without notice, please DO NOT USE it.
-
-    Differences from ReplayBuffer:
-    - _evict(): Stale rows (trainer_version - weight_version > max_staleness) are evicted
-      at the start of every sample() call.
-    - sample(): selects trajectories in freshest-first order (default) or FIFO order,
-      controlled by the sample_freshest_first flag, from whatever remains in the buffer
-      after eviction.
-
-    TODO: remove when cleaning up
-    - max_age_steps won't be used in ReplayBufferNew;
-    - self.target_weight_versions won't be used in ReplayBufferNew and will be removed
-      when cleaning up. target_weight_versions gates generation on specific trainer steps,
-      which causes generation pauses; ReplayBufferNew intentionally avoids this.
-    - add this class to nemo_rl/algorithms/async_utils/__init__.py
+    add tensorizes one record and writes its N rows to TQ as a single group;
+    meta_list / weight_list keep one entry per group for sampler reads.
     """
 
     def __init__(
-        self, max_size: int, max_staleness: int, sample_freshest_first: bool = True
-    ):
-        super().__init__(max_size)
-        if max_staleness < 0:
-            raise ValueError(f"max_staleness must be non-negative, got {max_staleness}")
-        self.max_staleness = max_staleness
-        # will move to StalenessSampler when we implement it
-        self.sample_freshest_first = sample_freshest_first
-
-    def _evict(self, current_weight_version: int) -> None:
-        """Evict rows where trainer_version - weight_version > max_staleness.
-
-        Must be called with self._lock held.
-        """
-        min_valid = current_weight_version - self.max_staleness
-        stale = [i for i, v in enumerate(self.trajectory_versions) if v < min_valid]
-        self._remove_indices(stale)
-
-    def sample(
         self,
-        num_prompt_groups: int,
-        current_weight_version: int,
-        max_age_steps: int,
-    ) -> Optional[dict[str, Any]]:
-        """Sample num_prompt_groups trajectories, freshest-first.
+        dp_client: Any,
+        partition_id: str,
+        *,
+        pad_value_dict: Mapping[str, int],
+    ):
+        self._dp_client = dp_client
+        self._partition_id = partition_id
+        self._pad_value_dict = dict(pad_value_dict)
+        self.meta_list: list[KVBatchMeta] = []
+        self.weight_list: list[int] = []
 
-        Will evict stale rows before sampling, so we will get [current_weight_version - self.max_staleness, current_weight_version] valid trajectories.
+    async def add(
+        self,
+        record: PromptGroupRecord,
+        *,
+        weight_version: int,
+        group_id: Optional[str] = None,
+    ) -> KVBatchMeta:
+        """Tensorize record and write its N rows to TQ as one group.
+
+        Args:
+            record: PromptGroupRecord with N completions to tensorize.
+            weight_version: Trainer weight version stamped on every row's tag; must be int.
+            group_id: Per-group sample_id prefix; defaults to a fresh uuid4.
 
         Returns:
-            Dictionary with 'trajectories' and 'avg_trajectory_age' keys, or None.
+            KVBatchMeta for the newly written group.
         """
-        with self._lock:
-            self._evict(current_weight_version)
+        if group_id is None:
+            group_id = str(uuid.uuid4())
 
-            if not self.trajectories:
-                return None
+        train_batch = record_to_train_batch(record, pad_value_dict=self._pad_value_dict)
+        sample_ids, fields, tags = pack_payload(
+            train_batch, weight_version=weight_version, group_id=group_id
+        )
+        meta = await self._call_dp(
+            "put_samples",
+            sample_ids=sample_ids,
+            partition_id=self._partition_id,
+            fields=fields,
+            tags=tags,
+        )
 
-            all_indices = range(len(self.trajectory_versions))
-            if self.sample_freshest_first:
-                all_indices = sorted(
-                    all_indices,
-                    key=lambda i: self.trajectory_versions[i],
-                    reverse=True,
-                )
+        self.meta_list.append(meta)
+        self.weight_list.append(weight_version)
+        return meta
 
-            if len(all_indices) < num_prompt_groups:
-                print(
-                    f"Insufficient trajectories: have {len(all_indices)}, "
-                    f"need {num_prompt_groups}. Waiting."
-                )
-                return None
+    async def remove(self, idxs: list[int], remove_in_dp: bool) -> int:
+        """Drop entries at the given indices and optionally clear them from DataPlane.
 
-            selected = all_indices[:num_prompt_groups]
-            sampled_weights = [self.trajectory_versions[i] for i in selected]
-            avg_trajectory_age = current_weight_version - sum(sampled_weights) / len(
-                sampled_weights
+        Args:
+            idxs: Entry indices to drop. Must be within [0, size).
+            remove_in_dp: If True, also clear the dropped rows from DataPlane.
+
+        Returns:
+            Number of group entries removed from the buffer.
+        """
+        if len(idxs) == 0:
+            return 0
+
+        drop_idxs = sorted(idxs, reverse=True)
+        if drop_idxs[0] >= len(self.meta_list):
+            raise IndexError(
+                f"TQReplayBuffer.remove: indices out of range: {drop_idxs[0]}; "
+                f"size={len(self.meta_list)}"
             )
 
-            sampled_items = [self.trajectories[i] for i in selected]
-            self._remove_indices(selected)
+        dropped_sample_ids: list[str] = []
+        for i in drop_idxs:
+            dropped_sample_ids.extend(self.meta_list[i].sample_ids)
+            del self.meta_list[i]
+            del self.weight_list[i]
 
-            return {
-                "trajectories": sampled_items,
-                "avg_trajectory_age": avg_trajectory_age,
-            }
+        if remove_in_dp:
+            await self._call_dp(
+                "clear_samples",
+                sample_ids=dropped_sample_ids,
+                partition_id=self._partition_id,
+            )
+
+        return len(drop_idxs)
+
+    def size(self) -> int:
+        """Return the number of prompt-group entries currently held."""
+        return len(self.meta_list)
+
+    def __len__(self) -> int:
+        return len(self.meta_list)
+
+    async def _call_dp(self, method_name: str, **kwargs: Any) -> Any:
+        """Call a DataPlaneClient method, awaiting Ray remotes if needed."""
+        method = getattr(self._dp_client, method_name)
+        remote = getattr(method, "remote", None)
+        if remote is not None:
+            return await remote(**kwargs)
+        result = method(**kwargs)
+        if asyncio.iscoroutine(result):
+            return await result
+        return result
