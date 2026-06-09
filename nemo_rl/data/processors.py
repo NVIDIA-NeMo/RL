@@ -707,6 +707,31 @@ def nemo_gym_data_processor(
     return output
 
 
+def kd_data_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer: TokenizerType,
+    max_seq_length: int | None,
+    idx: int,
+) -> DatumSpec:
+    """Process a raw-text datum for cross-tokenizer distillation.
+
+    Tokenization is deferred to the collator, so the text is carried forward
+    as a single assistant message in ``message_log``.
+    """
+    text = datum_dict["text"]
+    output: DatumSpec = {
+        "message_log": [{"role": "assistant", "content": text}],
+        "length": len(text),
+        "extra_env_info": None,
+        "loss_multiplier": 1.0,
+        "idx": idx,
+    }
+    if "task_name" in datum_dict:
+        output["task_name"] = datum_dict["task_name"]
+    return output
+
+
 # Processor registry. Key is the processor name, value is the processor function.
 # Note: We cast the literal dict to Dict[str, TaskDataProcessFnCallable] because
 # type checkers see each concrete function's signature as a distinct callable type.
@@ -718,6 +743,7 @@ PROCESSOR_REGISTRY: Dict[str, TaskDataProcessFnCallable] = cast(
     {
         "default": math_hf_data_processor,
         "helpsteer3_data_processor": helpsteer3_data_processor,
+        "kd_data_processor": kd_data_processor,
         "math_data_processor": math_data_processor,
         "math_hf_data_processor": math_hf_data_processor,
         "multichoice_qa_processor": multichoice_qa_processor,
