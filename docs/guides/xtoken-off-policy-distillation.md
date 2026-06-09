@@ -200,7 +200,7 @@ to train on your own `.arrow`/`.parquet`/`.json`/`.txt` corpus.
 |---|---|---|
 | `false` | (inert) | **P-KL** — full-vocab teacher logits via CUDA IPC; the loss derives a microbatch-global top-k inside, projects the student into teacher vocab via the projection matrix, and chunk-averages KL on the top-k subset. CE term is added. |
 | `true` | `false` | **Gold loss** — split the vocab into an *exact-token-mapped* common set (KL) and an *uncommon* tail (sorted L1). |
-| `true` | `true`  | **Gold + x-token loss** — same as gold, but relax the exact-map threshold to `>= 0.6` and allow multi-token projections to count as exact maps via a collision-replacement rule. |
+| `true` | `true`  | **H-KL (gold + xtoken)** — same as gold, but relax the exact-map threshold to `>= 0.6` and allow multi-token projections to count as exact maps via a collision-replacement rule. |
 
 Other relevant fields:
 
@@ -208,6 +208,40 @@ Other relevant fields:
 - `loss_fn.vocab_topk` — microbatch-global top-k size for the P-KL path (inert when `gold_loss=true`).
 - `loss_fn.uncommon_topk` — cap on the L1 uncommon-tail sort in the gold path (defaults to 8192).
 - `loss_fn.reverse_kl` — compute `KL(student || teacher)` instead of `KL(teacher || student)`.
+
+## Results — 100-step P-KL smoke run
+
+A short P-KL run (Llama-3.2-1B student ← Qwen3-4B teacher, default config:
+global batch 96, micro-batch 1, sequence length 2048, 100 steps, 2 nodes)
+shows the distillation objective converging and the student tracking the
+teacher more closely over training:
+
+<img src="../assets/xtoken_pkl_smoke_curves.png" alt="train/kl_loss, train/ce_loss, and train/accuracy over 100 P-KL distillation steps" width="900">
+
+- **KL loss** falls from ≈3.64 to ≈2.48 — the projected student distribution
+  moves toward the teacher's.
+- **CE loss** drifts down from ≈1.68 to ≈1.55.
+- **Top-1 accuracy** rises from ≈0.62 to ≈0.64.
+
+### Throughput and memory
+
+Measured on the same run (per training step, P-KL, micro-batch 1, sequence
+length 2048):
+
+| Metric | Value |
+|---|---|
+| Mean step time | 4.18 s (min 3.78 s) |
+| Training throughput | ≈47k valid tokens/s (global batch ÷ mean step time) |
+| Peak GPU memory | 29.5 GB per GPU |
+| Teacher-logit IPC tray | ≈0.6 GB per sample-step — `[T_t≈2048, V_t≈151,936]` bf16 |
+
+The full-vocab teacher logits never cross the network: the producer publishes
+a single rank-level `[B_r, T_t, V_t]` bf16 tray and hands the student a CUDA
+IPC handle to it (same node), so the per-step transport cost is the ≈0.6 GB
+tray allocation rather than a host round-trip.
+
+A downstream task evaluation (distilled student vs. base student) needs a
+longer run than this smoke test and is tracked separately.
 
 ## Where files live
 
