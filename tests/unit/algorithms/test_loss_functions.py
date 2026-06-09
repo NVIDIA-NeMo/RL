@@ -1239,6 +1239,33 @@ def test_clipped_pg_loss_icepop_importance_sampling():
     torch.testing.assert_close(actual_loss, expected_loss, atol=1e-4, rtol=1e-3)
 
 
+def test_clipped_pg_loss_reports_is_oob_ratio_tis():
+    device = "cpu"
+    data, _, seq_len, _ = _setup_clipped_pg_test_data(device=device)
+
+    cfg = ClippedPGLossConfig(
+        reference_policy_kl_penalty=0.0,
+        use_importance_sampling_correction=True,
+        truncated_importance_sampling_type="tis",
+        truncated_importance_sampling_ratio=2.0,
+    )
+    loss_fn = ClippedPGLossFn(cfg)
+
+    data["advantages"][0, 1:] = torch.tensor([1.0, 1.0, 1.0])
+    data["prev_logprobs"][0, 1:] = torch.log(torch.tensor([1.0, 3.0, 0.5]))
+    data["generation_logprobs"][0, 1:] = torch.zeros(3)
+    next_token_logprobs = torch.zeros((1, seq_len - 1))
+
+    _, metrics = loss_fn(
+        next_token_logprobs=next_token_logprobs,
+        data=data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(data["sample_mask"] * data["token_mask"]),
+    )
+
+    assert metrics["is_oob_ratio"] == pytest.approx(1.0 / 3.0)
+
+
 def test_clipped_pg_loss_seq_mask_tis():
     """Tests ClippedPGLossFn with seq-mask-tis, including nan_to_num on -inf.
 
