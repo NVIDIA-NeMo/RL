@@ -85,6 +85,7 @@ def create_test_config(
         "precision": "float32",
         "offload_optimizer_for_logprob": False,
         "use_pinned_optimizer_offload": False,
+        "use_coalesced_optimizer_offload": False,
         "generation": {
             "backend": "hf",
             "temperature": 1.0,
