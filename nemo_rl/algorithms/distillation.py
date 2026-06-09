@@ -629,7 +629,7 @@ def distillation_train(
                         student_generation.prepare_for_generation()
 
                 with timer.time("generation"):
-                    # Use async rollouts if vLLM async engine is enabled
+                    # Use async rollouts when enabled by config/backend defaults.
                     if _should_use_async_rollouts(master_config):
                         (
                             repeated_batch,
@@ -991,7 +991,7 @@ def validate(
                 break
 
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
-            # Use async rollouts if vLLM async engine is enabled
+            # Use async rollouts when enabled by config/backend defaults.
             if _should_use_async_rollouts(master_config):
                 val_batch, gen_metrics = run_async_multi_turn_rollout(
                     policy_generation,

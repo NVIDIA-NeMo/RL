@@ -44,6 +44,7 @@ from nemo_rl.experience.rollout_manager import (
 )
 from nemo_rl.experience.rollouts import (
     _calculate_single_metric,
+    generate_responses_async,
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
@@ -104,6 +105,80 @@ class TestCalculateSingleMetric:
         result = _calculate_single_metric([5.0, 5.0], batch_size=2, key_name="test")
 
         assert result["test/stddev"] == 0.0
+
+
+class _DummyTokenizer:
+    pad_token_id = 0
+
+    def batch_decode(self, generated_ids, skip_special_tokens=True):
+        return ["ok" for _ in generated_ids]
+
+
+class _DummySGLangGeneration:
+    def __init__(self, use_async_rollouts=False):
+        self.sglang_cfg = {
+            "backend": "sglang",
+            "use_async_rollouts": use_async_rollouts,
+        }
+
+    async def generate_async(self, data, greedy=False):
+        yield (
+            0,
+            BatchedDataDict(
+                {
+                    "output_ids": torch.tensor([[1, 2]]),
+                    "logprobs": torch.zeros((1, 2), dtype=torch.float32),
+                    "generation_lengths": torch.tensor([1], dtype=torch.long),
+                    "unpadded_sequence_lengths": torch.tensor([2], dtype=torch.long),
+                    "truncated": torch.tensor([False], dtype=torch.bool),
+                }
+            ),
+        )
+
+
+def test_generate_responses_async_requires_sglang_opt_in():
+    generation_input_data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[1]]),
+            "input_lengths": torch.tensor([1], dtype=torch.long),
+        }
+    )
+    batch = BatchedDataDict({"message_log": [[]]})
+
+    with pytest.raises(AssertionError, match="use_async_rollouts"):
+        asyncio.run(
+            generate_responses_async(
+                _DummySGLangGeneration(use_async_rollouts=False),
+                generation_input_data,
+                batch,
+                _DummyTokenizer(),
+                input_lengths=generation_input_data["input_lengths"],
+            )
+        )
+
+
+def test_generate_responses_async_allows_sglang_opt_in():
+    generation_input_data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[1]]),
+            "input_lengths": torch.tensor([1], dtype=torch.long),
+        }
+    )
+    batch = BatchedDataDict({"message_log": [[]]})
+
+    updated_batch, generated_ids, gen_metrics = asyncio.run(
+        generate_responses_async(
+            _DummySGLangGeneration(use_async_rollouts=True),
+            generation_input_data,
+            batch,
+            _DummyTokenizer(),
+            input_lengths=generation_input_data["input_lengths"],
+        )
+    )
+
+    assert updated_batch["message_log"][0][-1]["content"] == "ok"
+    assert generated_ids[0].tolist() == [2]
+    assert gen_metrics["total_generated_tokens"] == 1
 
 
 @pytest.fixture(scope="function")
