@@ -415,12 +415,16 @@ def setup(
 
     # Validate force_on_policy_ratio
     if loss_config.force_on_policy_ratio:
-        assert (
-            grpo_config["num_prompts_per_step"]
-            * grpo_config["num_generations_per_prompt"]
-            == policy_config["train_global_batch_size"]
-        ), (
-            "force_on_policy_ratio requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt"
+        _pps_gpp = (
+            grpo_config["num_prompts_per_step"] * grpo_config["num_generations_per_prompt"]
+        )
+        _gbs = policy_config["train_global_batch_size"]
+        # Multi-sample agents (e.g. the refine agent) expand each generation into
+        # `samples_per_run` training samples, so GBS = PPS*GPP*samples_per_run. Allow any
+        # positive integer multiple of PPS*GPP (single-turn is the samples_per_run==1 case).
+        assert _gbs % _pps_gpp == 0 and _gbs >= _pps_gpp, (
+            "force_on_policy_ratio requires train_global_batch_size to be a positive multiple "
+            f"of num_prompts_per_step * num_generations_per_prompt (got GBS={_gbs}, PPS*GPP={_pps_gpp})"
         )
         os.environ["NRL_IGNORE_TP_ACCURACY_CHECK"] = "1"
         print("  ✓ force_on_policy_ratio enabled")
