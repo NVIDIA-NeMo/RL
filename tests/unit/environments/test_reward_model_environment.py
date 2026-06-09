@@ -37,6 +37,7 @@ basic_env_config: RewardModelEnvironmentConfig = {
     "precision": "bfloat16",
     "offload_optimizer_for_logprob": False,
     "use_pinned_optimizer_offload": False,
+    "use_coalesced_optimizer_offload": False,
     "batch_size": 32,
     "checkpoint_path": None,
     "max_model_len": MAX_MODEL_LEN,

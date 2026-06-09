@@ -1441,6 +1441,7 @@ class TestValidateAndSetConfig:
             },
             "offload_optimizer_for_logprob": False,
             "use_pinned_optimizer_offload": False,
+            "use_coalesced_optimizer_offload": False,
         }
 
         with pytest.raises(NotImplementedError) as exc_info:
@@ -1477,6 +1478,7 @@ class TestValidateAndSetConfig:
             },
             "offload_optimizer_for_logprob": False,
             "use_pinned_optimizer_offload": False,
+            "use_coalesced_optimizer_offload": False,
         }
 
         # The function would fail on setup_model_config, but we test the initial parsing

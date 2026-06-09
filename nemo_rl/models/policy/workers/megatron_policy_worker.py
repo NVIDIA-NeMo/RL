@@ -1600,15 +1600,24 @@ class MegatronPolicyWorkerImpl(
             optimizer_state = self.optimizer._get_state()
 
         use_pinned = self.cfg["use_pinned_optimizer_offload"]
+        use_coalesced = self.cfg["use_coalesced_optimizer_offload"]
+        if use_coalesced and not use_pinned:
+            raise ValueError(
+                "use_coalesced_optimizer_offload requires use_pinned_optimizer_offload=True."
+            )
 
         if device == "cpu":
-            if use_pinned:
+            if use_coalesced:
                 self._coalesced_optimizer_to_cpu(optimizer_state)
+            elif use_pinned:
+                self._pinned_optimizer_to_cpu(optimizer_state)
             else:
                 self._optimizer_to_cpu(optimizer_state)
         elif device == "cuda":
-            if use_pinned:
+            if use_coalesced:
                 self._coalesced_optimizer_to_cuda(optimizer_state)
+            elif use_pinned:
+                self._pinned_optimizer_to_cuda(optimizer_state)
             else:
                 self._optimizer_to_cuda(optimizer_state)
         else:
@@ -1630,6 +1639,33 @@ class MegatronPolicyWorkerImpl(
                 if torch.is_tensor(v) and not v.is_cuda:
                     state[k] = v.to("cuda")
 
+    def _pinned_optimizer_to_cpu(self, optimizer_state):
+        """Offload optimizer state tensors to CPU using per-tensor pinned memory.
+
+        Each tensor gets its own pinned CPU allocation. Avoids the single large
+        contiguous pinned buffer used by the coalesced path, at the cost of more
+        host allocations.
+        """
+        for _, state in optimizer_state.items():
+            for k, v in state.items():
+                if not torch.is_tensor(v) or not v.is_cuda:
+                    continue
+                if v.dim() == 0:
+                    state[k] = v.cpu()
+                    continue
+                dst = torch.empty(v.shape, dtype=v.dtype, device="cpu", pin_memory=True)
+                dst.copy_(v, non_blocking=True)
+                state[k] = dst
+        torch.cuda.synchronize()
+
+    def _pinned_optimizer_to_cuda(self, optimizer_state):
+        """Reload optimizer state tensors from per-tensor pinned CPU memory to CUDA."""
+        for _, state in optimizer_state.items():
+            for k, v in state.items():
+                if torch.is_tensor(v) and not v.is_cuda:
+                    state[k] = v.to("cuda", non_blocking=True)
+        torch.cuda.synchronize()
+
     def _get_or_alloc_pinned_buf(
         self, attr_name: str, total_bytes: int
     ) -> torch.Tensor:
@@ -1641,11 +1677,6 @@ class MegatronPolicyWorkerImpl(
             )
             setattr(self, attr_name, buf)
         return buf
-
-    def _delete_pinned_buf(self, attr_name: str) -> None:
-        """Free a cached pinned CPU buffer allocated by _get_or_alloc_pinned_buf."""
-        if hasattr(self, attr_name):
-            delattr(self, attr_name)
 
     def _coalesced_optimizer_to_cpu(self, optimizer_state):
         """Offload all optimizer state tensors to CPU via a cached pinned buffer.
