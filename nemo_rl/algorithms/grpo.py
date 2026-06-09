@@ -2872,6 +2872,8 @@ def async_grpo_train(
         replay_buffer_path = os.path.join(last_checkpoint_path, "replay_buffer.pt")
         if os.path.exists(replay_buffer_path):
             print(f"📦 Restoring replay buffer from checkpoint: {replay_buffer_path}")
+            # weights_only=False: trajectories are pickled BatchedDataDict/dicts,
+            # not plain tensors. The checkpoint is a trusted same-job artifact.
             replay_buffer_state = torch.load(replay_buffer_path, weights_only=False)
             ray.get(
                 replay_buffer.load_state_dict.remote(
