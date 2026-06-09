@@ -1,8 +1,5 @@
 defaults: ../../../../examples/modelopt/qa_distillation_nano3_megatron.yaml
 distillation:
-  # The NeMo Gym smoke fixture has 5 prompts and the distillation dataloader
-  # uses drop_last=True. Use 4 prompts so 4 prompts * 4 generations produces a
-  # 16-sample batch that shards evenly across the 16 logprob workers.
   num_prompts_per_step: 4
   max_num_steps: 1
   val_period: 0
@@ -28,4 +25,3 @@ logger:
     log_dir: tb_logs-distillation-nano3-30ba3b-4n4g-megatron-qa-nvfp4-modelopt-spec
 cluster:
   gpus_per_node: 4
-  num_nodes: 4
