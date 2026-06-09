@@ -44,6 +44,8 @@ policy: &POLICY_BASE
     logprob_chunk_size: null
 
     offload_optimizer_for_logprob: false
+    use_pinned_optimizer_offload: false
+    use_coalesced_optimizer_offload: false
 
     dtensor_cfg: &DTENSOR_BASE
         enabled: true
