@@ -1,0 +1,48 @@
+defaults: "../configs/recipes/llm/performance/grpo-qwen3-30ba3b-4n4g.yaml"
+
+# Example usage:
+#   DISABLE_MODELOPT_LAYER_SPEC=1 uv run examples/run_grpo.py --config examples/modelopt/qa_grpo_qwen3_30ba3b_megatron.yaml
+
+grpo:
+  # Low-cost QARL health check. This is not a convergence benchmark.
+  max_num_steps: 1
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 2
+  val_period: 30
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/qa_grpo_qwen3_30ba3b_megatron
+
+policy:
+  train_global_batch_size: 16
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+
+  # Built-in NVFP4 weight-only recipe keeps activations in native dtype while
+  # still exercising ModelOpt quantization on Qwen3 MoE/MLP weights.
+  quant_cfg: NVFP4_MLP_WEIGHT_ONLY_CFG
+  quant_calib_data: cnn_dailymail
+  quant_calib_size: 16
+  quant_batch_size: 1
+  quant_sequence_length: 512
+
+  megatron_cfg:
+    # ModelOpt quantization is incompatible with gradient accumulation fusion.
+    gradient_accumulation_fusion: false
+
+  generation:
+    quant_cfg: NVFP4_MLP_WEIGHT_ONLY_CFG
+    vllm_cfg:
+      enforce_eager: false
+    vllm_kwargs:
+      compilation_config:
+        backend: "eager"
+
+logger:
+  log_dir: logs/qa_grpo_qwen3_30ba3b_megatron
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: qa-grpo-qwen3-30ba3b-megatron

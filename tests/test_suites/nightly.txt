@@ -69,6 +69,9 @@ tests/test_suites/llm/grpo-llama3.1-8b-instruct-2n8g-megatron-fp8-e2e.sh
 tests/test_suites/llm/grpo-moonlight-16ba3b-4n8g-megatron-fp8-e2e.sh
 tests/test_suites/llm/grpo-qwen3-8b-base-1n8g-fp8-kvcache-megatron.sh
 
+# Quantization-Aware RL (NVFP4) on Qwen3 MoE
+tests/test_suites/llm/grpo-qwen3-30ba3b-4n4g-megatron-qa-nvfp4.sh
+
 # Non-colocated
 tests/test_suites/llm/grpo-llama3.1-8b-instruct-2n8g-fsdp2tp1-noncolocated.sh
 
