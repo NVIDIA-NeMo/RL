@@ -8,7 +8,7 @@ source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=4
-GPUS_PER_NODE=8
+GPUS_PER_NODE=4
 STEPS_PER_RUN=1
 MAX_STEPS=1
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
@@ -36,11 +36,14 @@ uv run examples/nemo_gym/run_distillation_nemo_gym.py \
 # Convert tensorboard logs to json
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
-# Only run metrics if the target step is reached
-if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
-    uv run tests/check_metrics.py $JSON_METRICS \
-        'data["train/loss"]["1"] > 0.0' \
-        'data["train/loss"]["1"] < 0.2' \
-        'data["train/mean_gen_tokens_per_sample"]["1"] > 100' \
-        'data["train/mean_gen_tokens_per_sample"]["1"] < 2048'
+MAX_RECORDED_STEP=$(jq -r 'if has("train/loss") then (."train/loss" | keys | map(tonumber) | max // 0) else 0 end' $JSON_METRICS)
+if [[ $MAX_RECORDED_STEP -lt $MAX_STEPS ]]; then
+    echo "[ERROR] Expected train/loss through step $MAX_STEPS, found step $MAX_RECORDED_STEP"
+    exit 1
 fi
+
+uv run tests/check_metrics.py $JSON_METRICS \
+    'data["train/loss"]["1"] > 0.0' \
+    'data["train/loss"]["1"] < 0.12' \
+    'data["train/mean_gen_tokens_per_sample"]["1"] > 100' \
+    'data["train/mean_gen_tokens_per_sample"]["1"] < 2048'
