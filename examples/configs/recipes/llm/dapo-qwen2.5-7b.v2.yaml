@@ -35,6 +35,7 @@ policy:
     _v2: false
     context_parallel_size: 4
   megatron_cfg:
+    use_gloo_process_groups: false
     tensor_model_parallel_size: 4
     pipeline_model_parallel_size: 2
     context_parallel_size: 2

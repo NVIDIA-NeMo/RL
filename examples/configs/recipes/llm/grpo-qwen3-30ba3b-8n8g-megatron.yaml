@@ -20,6 +20,7 @@ policy:
   make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
   megatron_cfg:
     enabled: true
+    use_gloo_process_groups: false
     tensor_model_parallel_size: 4
     pipeline_model_parallel_size: 4
     expert_model_parallel_size: 4

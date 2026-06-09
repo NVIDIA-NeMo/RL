@@ -23,6 +23,7 @@ policy:
   scheduler: null
   megatron_cfg:
     enabled: true
+    use_gloo_process_groups: false
     tensor_model_parallel_size: 8
     pipeline_model_parallel_size: 8
     num_layers_in_first_pipeline_stage: 9

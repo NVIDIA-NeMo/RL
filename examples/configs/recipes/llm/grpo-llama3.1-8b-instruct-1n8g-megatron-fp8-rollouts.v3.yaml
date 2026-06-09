@@ -18,6 +18,7 @@ policy:
     enabled: false
   megatron_cfg:
     enabled: true
+    use_gloo_process_groups: false
     pipeline_model_parallel_size: 2
     activation_checkpointing: true
     defer_fp32_logits: true

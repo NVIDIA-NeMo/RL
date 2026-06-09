@@ -16,6 +16,7 @@ policy:
     enabled: false
   megatron_cfg:
     enabled: true
+    use_gloo_process_groups: false
     tensor_model_parallel_size: 2
     scheduler:
       lr_warmup_iters: 50

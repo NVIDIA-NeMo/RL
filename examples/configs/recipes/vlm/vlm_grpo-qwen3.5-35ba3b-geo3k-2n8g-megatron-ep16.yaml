@@ -19,6 +19,7 @@ policy:
     enabled: false
   megatron_cfg:
     enabled: true
+    use_gloo_process_groups: false
     expert_model_parallel_size: 16
     moe_token_dispatcher_type: allgather
     apply_rope_fusion: false

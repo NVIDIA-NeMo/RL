@@ -249,6 +249,10 @@ class MegatronConfig(TypedDict):
     moe_token_dispatcher_type: str
     # Can be used only with 'alltoall' token dispatcher
     moe_shared_expert_overlap: bool
+    # Whether to create gloo process groups during Megatron distributed init.
+    # When omitted, the Megatron Bridge default is used. Disabling skips gloo
+    # process group creation.
+    use_gloo_process_groups: NotRequired[bool]
     # Enable grouped GEMM for MoE experts via CUTLASS. Significant throughput
     # gain when multiple experts are assigned per rank (num_local_experts > 1).
     # Requires TE >= 1.11.0 for FP8 and Ampere (sm_80) or newer.

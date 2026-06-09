@@ -6,6 +6,7 @@ policy:
   quant_calib_size: 64
   quant_sequence_length: 1024
   megatron_cfg:
+    use_gloo_process_groups: false
     tensor_model_parallel_size: 1
     pipeline_model_parallel_size: 1
     context_parallel_size: 1
@@ -18,6 +19,7 @@ policy:
 teacher:
   model_name: Qwen/Qwen3-1.7B-Base
   megatron_cfg:
+    use_gloo_process_groups: false
     tensor_model_parallel_size: 1
     pipeline_model_parallel_size: 1
     context_parallel_size: 1
