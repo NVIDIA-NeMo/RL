@@ -1261,7 +1261,6 @@ class MegatronPolicyWorkerImpl(
             f"[_clear_fp8_caches] Cleared {workspace_count} workspace modules on rank {self.rank}"
         )
 
-
     @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
     def offload_before_refit(self):
         """Offload the optimizer and buffers to the CPU."""
@@ -1289,7 +1288,10 @@ class MegatronPolicyWorkerImpl(
             # runs at different sequence lengths, the cache fills quickly and the tensors
             # anchor large CUDA segments.
             try:
-                from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+                from megatron.core.models.common.embeddings.rotary_pos_embedding import (
+                    RotaryEmbedding,
+                )
+
                 RotaryEmbedding.forward.cache_clear()
             except Exception:
                 pass
@@ -1320,11 +1322,11 @@ class MegatronPolicyWorkerImpl(
                     if dispatcher is None:
                         continue
                     for attr in (
-                        "probs",                                    # AllToAll + AllGather
-                        "routing_map",                              # AllToAll
-                        "reversed_local_input_permutation_mapping", # AllToAll
-                        "local_probs",                              # AllGather
-                        "local_map",                                # AllGather
+                        "probs",  # AllToAll + AllGather
+                        "routing_map",  # AllToAll
+                        "reversed_local_input_permutation_mapping",  # AllToAll
+                        "local_probs",  # AllGather
+                        "local_map",  # AllGather
                     ):
                         if isinstance(getattr(dispatcher, attr, None), torch.Tensor):
                             setattr(dispatcher, attr, None)
