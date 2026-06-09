@@ -106,7 +106,6 @@ ppo:
     gae_lambda: 0.95         # GAE lambda (bias-variance tradeoff)
     gae_gamma: 1             # Discount factor
     normalize_advantages: true
-    normalize_rewards: true
 ```
 
 ### VAPO Decoupled GAE
@@ -134,13 +133,9 @@ ppo:
 
 ### Other Advantage Estimators
 
-While GAE is the default for PPO, the implementation also supports other advantage estimators via `ppo.adv_estimator.name`:
+While GAE is the default for PPO, the implementation also supports running without a value model via `ppo.adv_estimator.name`:
 
-- **`"grpo"`**: Standard GRPO advantage with leave-one-out baseline (no value model needed)
-- **`"reinforce_plus_plus"`**: Reinforce++ with optional baseline subtraction
 - **`"raw_reward"`**: Raw reward as advantage (no value model, no baselines)
-
-These can be used if you want to run the PPO training loop without a value model.
 
 ## PPO Training Loop
 
@@ -154,7 +149,7 @@ The PPO training loop, [ppo_train](../../nemo_rl/algorithms/ppo.py), follows thi
 6. **Value training**: the critic is updated first (critic-before-actor, following [veRL](https://arxiv.org/abs/2412.09613))
 7. **Policy training**: the actor is updated with the clipped surrogate objective
 
-Steps 6–7 repeat `steps_per_epoch` times per rollout before generating new responses.
+Steps 6–7 repeat `ppo_epochs` times per rollout before generating new responses.
 
 ### Multiple Training Steps per Rollout
 
@@ -162,7 +157,7 @@ Unlike GRPO, which performs one training update per rollout, PPO can perform mul
 
 ```yaml
 ppo:
-  steps_per_epoch: 4   # Train 4 times on each rollout batch
+  ppo_epochs: 4   # Train 4 times on each rollout batch
 ```
 
 Each step trains both the critic and the actor on the same advantage estimates computed from the initial rollout.
@@ -199,8 +194,8 @@ $$L_V = \frac{1}{2} \max\left((V_\theta - R)^2,\; (V_{\text{clipped}} - R)^2\rig
 where $V_{\text{clipped}} = \text{clamp}(V_\theta,\; V_{\text{old}} - \epsilon_v,\; V_{\text{old}} + \epsilon_v)$ and $R$ are the GAE returns. This prevents the value function from changing too drastically in a single update, analogous to the policy ratio clipping in the actor loss.
 
 Key parameters:
-- **`value_loss_fn.scale`**: Scaling factor for the value loss (default: 0.4)
-- **`value_loss_fn.cliprange`**: Clip range $\epsilon_v$ for value predictions (default: 0.2). Set to `null` to disable clipping.
+- **`value_loss_fn.scale`**: Scaling factor for the value loss (default: 1.0; reference recipe overrides to 0.4)
+- **`value_loss_fn.cliprange`**: Clip range $\epsilon_v$ for value predictions (default: `null` / disabled; reference recipe overrides to 0.2). Set to `null` to disable clipping.
 - **`loss_fn.positive_example_nll_weight`**: VAPO NLL auxiliary loss weight on correct samples (0 = disabled)
 
 ## Configuration
@@ -212,10 +207,8 @@ ppo:
   max_rollout_turns: 1
   max_num_epochs: 100000
   max_num_steps: 100000
-  steps_per_epoch: 4
+  ppo_epochs: 4
   policy_training_start_step: 0
-  normalize_rewards: true
-  use_leave_one_out_baseline: false
   val_period: 20
   val_at_start: true
   val_at_end: false
@@ -228,9 +221,6 @@ ppo:
     gae_lambda: 0.95
     gae_gamma: 1
     normalize_advantages: true
-    normalize_rewards: true
-    use_leave_one_out_baseline: false
-    minus_baseline: true
     gae_lambda_value: null
     gae_lambda_policy: null
     length_adaptive_alpha: 0.0
@@ -263,7 +253,7 @@ value_loss_fn:
 ```
 
 **PPO-specific parameters:**
-- **`ppo.steps_per_epoch`**: Number of training updates per rollout batch
+- **`ppo.ppo_epochs`**: Number of training updates per rollout batch
 - **`ppo.policy_training_start_step`**: Number of critic-only warmup steps before policy training begins
 - **`ppo.adv_estimator.name`**: Set to `"gae"` for GAE advantage estimation (PPO default)
 - **`ppo.adv_estimator.gae_lambda`**: GAE $\lambda$ parameter (bias-variance tradeoff, typically 0.95)

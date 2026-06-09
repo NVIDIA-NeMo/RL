@@ -1249,7 +1249,7 @@ class MegatronPolicyWorkerImpl(
         gc.collect()
         torch.cuda.empty_cache()
 
-    def finish_training(self, *args, **kwargs):
+    def finish_training(self) -> None:
         """Offload model, gradients, and optimizer to CPU after training."""
         self.model = self.move_model(
             self.model, "cpu", move_params=True, move_grads=True

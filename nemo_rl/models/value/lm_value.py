@@ -383,12 +383,12 @@ class Value(ValueInterface):
 
         return aggregated_results
 
-    def prepare_for_training(self, *args: Any, **kwargs: Any) -> None:
+    def prepare_for_training(self) -> None:
         """Prepare the value model for training (load to GPU)."""
         futures = self.worker_group.run_all_workers_single_data("prepare_for_training")
         ray.get(futures)
 
-    def prepare_for_inference(self, *args: Any, **kwargs: Any) -> None:
+    def prepare_for_inference(self) -> None:
         """Prepare the value model for inference (offload gradients, set eval mode)."""
         futures = self.worker_group.run_all_workers_single_data("prepare_for_inference")
         ray.get(futures)
@@ -398,7 +398,7 @@ class Value(ValueInterface):
         futures = self.worker_group.run_all_workers_single_data("finish_inference")
         ray.get(futures)
 
-    def finish_training(self, *args: Any, **kwargs: Any) -> None:
+    def finish_training(self) -> None:
         """Offload value model to CPU after training."""
         futures = self.worker_group.run_all_workers_single_data("finish_training")
         ray.get(futures)

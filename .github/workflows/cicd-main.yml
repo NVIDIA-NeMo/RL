@@ -844,6 +844,8 @@ jobs:
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_SFT
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+          - script: L1_Functional_Tests_PPO
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_Eval
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_Other_1

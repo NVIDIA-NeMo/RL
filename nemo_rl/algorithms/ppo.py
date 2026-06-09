@@ -36,6 +36,7 @@ from nemo_rl.algorithms.grpo import (
     _should_use_nemo_gym,
     extract_initial_prompt_messages,
     refit_policy_generation,
+    scale_rewards,
 )
 from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
@@ -57,6 +58,7 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
+from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -115,7 +117,7 @@ class PPOConfig(TypedDict):
     max_val_samples: int
     skip_reference_policy_logprobs_calculation: NotRequired[bool]
     seed: int
-    overlong_filtering: NotRequired[bool]
+    overlong_filtering: bool
     # whether to enable dynamic sampling, i.e.
     # whether to discard prompts whose rewards have zero standard deviation
     use_dynamic_sampling: bool
@@ -125,13 +127,13 @@ class PPOConfig(TypedDict):
     # When using dynamic sampling, generation prompt batch size will equal
     # num_prompts_per_step * batch_multiplier
     batch_multiplier: NotRequired[float]
-    steps_per_epoch: int
+    ppo_epochs: int
     reward_shaping: RewardShapingConfig
     reward_scaling: RewardScalingConfig
     # By default advantages are calculated on CPU. Setting this flag to true leverages GPU for their computation.
     calculate_advantages_on_gpu: NotRequired[bool]
-    # Advantage estimator configuration (grpo or reinforce_plus_plus)
-    adv_estimator: NotRequired[AdvEstimatorConfig]
+    # Advantage estimator configuration (gae or raw_reward)
+    adv_estimator: AdvEstimatorConfig
     # Number of PPO steps of critic-only warmup before policy training begins.
     # Value model trains from step 0; policy training is skipped for
     # total_steps < this value. Default 0 (train from start).
@@ -298,10 +300,7 @@ def setup(
         num_workers=data_config["num_workers"],
     )
     if last_checkpoint_path is not None:
-        dataloader_state_dict = torch.load(
-            os.path.join(last_checkpoint_path, "train_dataloader.pt")
-        )
-        dataloader.load_state_dict(dataloader_state_dict)
+        load_dataloader_state(dataloader, last_checkpoint_path, data_config)
 
     print(f"  ✓ Training dataloader loaded with {len(dataset)} samples", flush=True)
 
@@ -437,28 +436,28 @@ def setup(
 
     # train_iters is the total scheduler-tick budget. Each Megatron worker
     # ticks once per train() call (matching upstream main's per-rollout
-    # convention), and PPO calls each worker's train() `steps_per_epoch` times
-    # per outer step. So total ticks = (outer steps) * steps_per_epoch.
+    # convention), and PPO calls each worker's train() `ppo_epochs` times
+    # per outer step. So total ticks = (outer steps) * ppo_epochs.
     # Scale train_iters accordingly so the configured warmup/decay horizon
     # matches the actual scheduler-step count.
-    steps_per_epoch = ppo_config["steps_per_epoch"]
+    ppo_epochs = ppo_config["ppo_epochs"]
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
         total_train_iters = (
             min(
-                ppo_config.get("max_num_steps", 10**9),
+                ppo_config["max_num_steps"],
                 ppo_config["max_num_epochs"] * len(dataloader),
             )
-            * steps_per_epoch
+            * ppo_epochs
         )
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
     if value_config.get("megatron_cfg", {}).get("enabled", False):
         total_train_iters = (
             min(
-                ppo_config.get("max_num_steps", 10**9),
+                ppo_config["max_num_steps"],
                 ppo_config["max_num_epochs"] * len(dataloader),
             )
-            * steps_per_epoch
+            * ppo_epochs
         )
         value_config["megatron_cfg"]["train_iters"] = total_train_iters
 
@@ -831,47 +830,6 @@ def dynamic_sampling(
     return batch_to_return, is_batch_complete, batch_cache, dynamic_sampling_metrics
 
 
-def scale_rewards(
-    repeated_batch: BatchedDataDict[DatumSpec], reward_scaling_cfg: RewardScalingConfig
-) -> BatchedDataDict[DatumSpec]:
-    """Linearly scales rewards from a source range to a target range.
-
-    If `reward_scaling.enabled` is True, each reward in `repeated_batch["total_reward"]`
-    is clamped to the configured source interval [source_min, source_max] and then
-    rescaled to the target interval [target_min, target_max].
-
-    Default configuration:
-        source_min = 0.0
-        source_max = 1.0
-        target_min = 0.0
-        target_max = 1.0
-    """
-    if reward_scaling_cfg["enabled"]:
-        rewards = repeated_batch["total_reward"]
-        source_min = float(reward_scaling_cfg["source_min"])
-        source_max = float(reward_scaling_cfg["source_max"])
-        target_min = float(reward_scaling_cfg["target_min"])
-        target_max = float(reward_scaling_cfg["target_max"])
-
-        # Detect out-of-range values
-        out_of_range_mask = (rewards < source_min) | (rewards > source_max)
-        if torch.any(out_of_range_mask):
-            print(
-                f"[reward_scaling] WARNING: {int(out_of_range_mask.sum())} rewards "
-                f"are outside the configured source range [{source_min}, {source_max}]. "
-                f"Values will be clipped before scaling."
-            )
-
-        # Clamp and scale
-        rewards = torch.clamp(rewards, min=source_min, max=source_max)
-        scaled_rewards = target_min + (rewards - source_min) / (
-            source_max - source_min
-        ) * (target_max - target_min)
-        repeated_batch["total_reward"] = scaled_rewards
-
-    return repeated_batch
-
-
 def _create_advantage_estimator(master_config: MasterConfig):
     """Create and return an advantage estimator based on configuration.
 
@@ -938,7 +896,7 @@ def ppo_train(
     Based on the grpo_train loop with PPO-specific modifications:
     - Value model inference and training (actor-critic)
     - GAE advantage estimation with value bootstrap
-    - Multiple training steps per rollout (steps_per_epoch)
+    - Multiple training steps per rollout (ppo_epochs)
     - Configurable policy training start epoch
     """
     timer = Timer()
@@ -974,7 +932,7 @@ def ppo_train(
     max_num_steps = master_config.ppo["max_num_steps"]
     current_epoch = ppo_save_state["current_epoch"]
     max_num_epochs = master_config.ppo["max_num_epochs"]
-    steps_per_epoch = master_config.ppo["steps_per_epoch"]
+    ppo_epochs = master_config.ppo["ppo_epochs"]
     # Number of PPO steps to train only the critic before starting policy
     # training.  Despite the legacy name, this is compared against total_steps
     # (not current_epoch) to match veRL's critic_warmup semantics.
@@ -1166,9 +1124,7 @@ def ppo_train(
                     rewards = repeated_batch["total_reward"]
 
                 with timer.time("data_processing"):
-                    use_overlong_filtering = master_config.ppo.get(
-                        "overlong_filtering", False
-                    )
+                    use_overlong_filtering = master_config.ppo["overlong_filtering"]
                     if use_overlong_filtering:
                         loss_multiplier = repeated_batch["loss_multiplier"].clone()
                         truncated = repeated_batch["truncated"]
@@ -1304,9 +1260,9 @@ def ppo_train(
 
                 # PPO: Multiple training steps per rollout
                 memory_tracker.snapshot_start_of_stage("Policy train", dir())
-                for step in range(steps_per_epoch):
+                for step in range(ppo_epochs):
                     print(
-                        f"▶ Step {step + 1}/{steps_per_epoch}...",
+                        f"▶ Step {step + 1}/{ppo_epochs}...",
                         flush=True,
                     )
 

@@ -75,7 +75,7 @@ ppo:
     name: "gae"
     gae_lambda: 0.95
     gae_gamma: 1.0
-  steps_per_epoch: 4
+  ppo_epochs: 4
   policy_training_start_step: 0
 
 value_loss_fn:

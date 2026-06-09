@@ -2,7 +2,7 @@ defaults: ../../ppo_math_1B_megatron.yaml
 ppo:
   num_prompts_per_step: 2048
   num_generations_per_prompt: 1
-  steps_per_epoch: 1
+  ppo_epochs: 1
   max_num_steps: 20
   val_period: 5
   val_at_start: false

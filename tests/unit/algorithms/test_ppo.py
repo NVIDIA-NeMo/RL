@@ -49,20 +49,23 @@ def _make_gae_config(
     gae_gamma: float = 1.0,
     normalize_advantages: bool = False,
     length_adaptive_alpha: float = 0.0,
+    gae_lambda_value: float | None = None,
+    gae_lambda_policy: float | None = None,
     **overrides,
 ) -> dict:
     """Build an estimator_config dict with all GAE-required keys populated.
 
-    ``GeneralizedAdvantageEstimator.__init__`` requires ``gae_lambda``,
-    ``gae_gamma``, ``normalize_advantages`` and ``length_adaptive_alpha`` to
-    be present (no hidden ``.get()`` defaults). Optional VAPO fields
-    (``gae_lambda_value`` / ``gae_lambda_policy``) can be passed via overrides.
+    ``GeneralizedAdvantageEstimator.__init__`` requires every field to be
+    present (no hidden ``.get()`` defaults). VAPO fields default to ``None``
+    (standard GAE, no decoupling) and can be overridden via kwargs.
     """
     return {
         "gae_lambda": gae_lambda,
         "gae_gamma": gae_gamma,
         "normalize_advantages": normalize_advantages,
         "length_adaptive_alpha": length_adaptive_alpha,
+        "gae_lambda_value": gae_lambda_value,
+        "gae_lambda_policy": gae_lambda_policy,
         **overrides,
     }
 
@@ -467,13 +470,14 @@ def test_mse_value_loss_with_clipping():
     assert loss.ndim == 0
     assert loss.item() >= 0
 
-    # Verify per-token max guarantee: clipped path uses 0.5 * mean(max(unclipped, clipped))
-    # while unclipped path uses mean(mse) without the 0.5 factor, so account for that.
+    # Per-token max guarantee: both branches apply the same 0.5*scale prefactor,
+    # so clipped loss must be >= unclipped loss because of torch.max. This
+    # would fail if someone refactored the clipped branch to drop torch.max.
     loss_fn_unclipped = MseValueLossFn(MseValueLossConfig(scale=1.0, cliprange=None))
     loss_unclipped, _ = loss_fn_unclipped(
         values.detach().requires_grad_(True), data, global_valid_seqs, global_valid_toks
     )
-    assert loss.item() >= 0.5 * loss_unclipped.item() - 1e-6
+    assert loss.item() >= loss_unclipped.item() - 1e-6
 
 
 def test_mse_value_loss_scale():
@@ -651,7 +655,9 @@ def test_create_advantage_estimator_raw_reward():
     from nemo_rl.algorithms.ppo import _create_advantage_estimator
 
     master_config = SimpleNamespace(
-        ppo={"adv_estimator": {"name": "raw_reward"}},
+        ppo={
+            "adv_estimator": {"name": "raw_reward", "normalize_advantages": True},
+        },
         loss_fn={"reference_policy_kl_penalty": 0.0},
     )
 

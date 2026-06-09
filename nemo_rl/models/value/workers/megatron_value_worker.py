@@ -499,6 +499,18 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
             ctx = nullcontext()
             self.model.train()
             self.value_head.train()
+            # Mirror the backbone LR + WD onto the value head BEFORE stepping so
+            # the first iteration respects warmup (otherwise the head trains at
+            # peak LR for step 0 while the backbone is still at warmup-init).
+            # Use scheduler.get_*() instead of param_groups directly — it is
+            # canonical (matches the logging pattern below) and also valid at
+            # step 0 before any scheduler.step() has written param_groups.
+            if hasattr(self, "value_head_optimizer"):
+                backbone_lr = self.scheduler.get_lr(self.optimizer.param_groups[0])
+                backbone_wd = self.scheduler.get_wd()
+                for pg in self.value_head_optimizer.param_groups:
+                    pg["lr"] = backbone_lr
+                    pg["weight_decay"] = backbone_wd
 
         with ctx:
             forward_step = partial(
@@ -674,13 +686,6 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
             # passing increment=gbs cancels that scaling and one tick == one
             # train() call regardless of batch size.
             self.scheduler.step(increment=gbs)
-            # Value head has its own torch.optim.AdamW with no scheduler
-            # attached; mirror the backbone LR onto it so the head decays /
-            # warms up in lockstep instead of holding at peak LR forever.
-            if hasattr(self, "value_head_optimizer"):
-                backbone_lr = self.optimizer.param_groups[0]["lr"]
-                for pg in self.value_head_optimizer.param_groups:
-                    pg["lr"] = backbone_lr
 
         # Aggregate metrics
         mb_metrics = defaultdict(list)
@@ -868,7 +873,7 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
 
         return BatchedDataDict[ValueOutputSpec](values=values_tensor.cpu())
 
-    def prepare_for_training(self, *args, **kwargs):
+    def prepare_for_training(self) -> None:
         """Move model and optimizer to CUDA for training."""
         self.model = self.move_model(
             self.model, "cuda", move_grads=True, move_params=True
@@ -1067,7 +1072,7 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
         gc.collect()
         torch.cuda.empty_cache()
 
-    def finish_training(self, *args: Any, **kwargs: Any) -> None:
+    def finish_training(self) -> None:
         """Offload model, gradients, and optimizer to CPU after training."""
         self.model = self.move_model(
             self.model, "cpu", move_params=True, move_grads=True

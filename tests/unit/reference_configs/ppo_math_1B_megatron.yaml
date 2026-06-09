@@ -8,7 +8,7 @@ ppo:
   max_rollout_turns: 1
   max_num_epochs: 100000
   max_num_steps: 100000
-  steps_per_epoch: 4
+  ppo_epochs: 4
   policy_training_start_step: 0  # number of PPO steps of critic-only warmup before policy training begins
   val_period: 20
   val_at_start: true
