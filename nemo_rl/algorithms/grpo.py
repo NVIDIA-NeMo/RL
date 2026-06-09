@@ -119,6 +119,12 @@ class AsyncGRPOConfig(TypedDict):
     # async replay buffer. Trajectories older than this are excluded during
     # sampling; buffer sizing also scales with this value.
     max_trajectory_age_steps: int
+    # Maximum cumulative number of generation-worker failures the
+    # AsyncTrajectoryCollector tolerates before aborting the run. 0
+    # makes the very first worker exception fatal. The counter is
+    # process-lifetime and never resets. Increase only when transient
+    # generation errors are expected and acceptable to drop.
+    max_generation_failures: int
     # Does the weight synchronization as soon as the training is done
     # without waiting for the pending generations to finish.
     in_flight_weight_updates: NotRequired[bool]
@@ -2982,6 +2988,7 @@ def async_grpo_train(
     wait_iterations = 0
     while True:
         buffer_size_current = ray.get(replay_buffer.size.remote())
+        ray.get(trajectory_collector.check_health.remote())
 
         print(
             f"  Wait iteration {wait_iterations}: buffer_filled_ratio={buffer_size_current}/{min_trajectories_needed}"
@@ -3048,6 +3055,7 @@ def async_grpo_train(
                                 f"   Trajectory versions in buffer: {buffer_debug['trajectory_versions']}"
                             )
 
+                        ray.get(trajectory_collector.check_health.remote())
                         time.sleep(0.5)
                         continue
 

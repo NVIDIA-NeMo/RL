@@ -329,6 +329,29 @@ class TestReplayBuffer:
 
         ray.kill(buffer)
 
+    def test_replay_buffer_get_target_weight_counts(self):
+        """Test counting buffered trajectory groups by target weight."""
+        buffer = ReplayBuffer.remote(max_size=10)
+
+        trajectories = [
+            ({"batch": {"data": "test1"}, "rollout_metrics": {"reward": 1.0}}, 0, 2),
+            ({"batch": {"data": "test2"}, "rollout_metrics": {"reward": 2.0}}, 1, 2),
+            ({"batch": {"data": "test3"}, "rollout_metrics": {"reward": 3.0}}, 1, 3),
+        ]
+        for trajectory, weight_version, target_weight_version in trajectories:
+            ray.get(
+                buffer.add.remote(
+                    trajectory,
+                    weight_version=weight_version,
+                    target_weight_version=target_weight_version,
+                )
+            )
+
+        target_counts = ray.get(buffer.get_target_weight_counts.remote())
+        assert target_counts == {2: 2, 3: 1}
+
+        ray.kill(buffer)
+
     def test_replay_buffer_clear(self):
         """Test clearing the buffer."""
         buffer = ReplayBuffer.remote(max_size=10)
@@ -522,7 +545,10 @@ class TestAsyncTrajectoryCollector:
                 "num_prompts_per_step": 2,
                 "num_generations_per_prompt": 3,
                 "max_rollout_turns": 1,
-                "async_grpo": {"max_trajectory_age_steps": 2},
+                "async_grpo": {
+                    "max_trajectory_age_steps": 2,
+                    "max_generation_failures": 0,
+                },
             },
             "policy": {"max_total_sequence_length": 512},
         }
@@ -704,6 +730,85 @@ class TestAsyncTrajectoryCollector:
         ray.kill(buffer)
         ray.kill(mock_env)
 
+    def _make_failing_collector(self, max_generation_failures: int):
+        """Build a collector that fails any worker invocation.
+
+        Passing ``repeated_batch=None`` to ``_run_prompt_group_worker`` makes
+        ``run_async_multi_turn_rollout`` raise inside the worker's try block,
+        which is the path we want to exercise.
+        """
+        buffer = ReplayBuffer.remote(max_size=10)
+        mock_generation = MockGenerationInterface()
+        mock_tokenizer = mock.MagicMock()
+        mock_env = MockEnvironment.remote(rewards=[1.0])
+        task_to_env = {"test": mock_env}
+        master_config = self.create_mock_config()
+        master_config.grpo["async_grpo"]["max_generation_failures"] = (
+            max_generation_failures
+        )
+
+        collector = AsyncTrajectoryCollector.remote(
+            policy_generation=mock_generation,
+            tokenizer=mock_tokenizer,
+            task_to_env=task_to_env,
+            master_config=master_config,
+            replay_buffer=buffer,
+            start_step=0,
+        )
+        return collector, buffer, mock_env
+
+    def test_worker_failure_default_threshold_fails_immediately(self):
+        """A single worker failure with max_generation_failures=0 makes check_health raise."""
+        collector, buffer, mock_env = self._make_failing_collector(0)
+        try:
+            ray.get(collector.check_health.remote())
+
+            ray.get(collector._run_prompt_group_worker.remote(None, 0, 1, 0))
+
+            with pytest.raises(RuntimeError, match="max_generation_failures=0"):
+                ray.get(collector.check_health.remote())
+
+            with pytest.raises(RuntimeError, match="prompt_idx=0"):
+                ray.get(collector.check_health.remote())
+        finally:
+            ray.kill(collector)
+            ray.kill(buffer)
+            ray.kill(mock_env)
+
+    def test_worker_failures_below_threshold_do_not_raise(self):
+        """Failures up to and including the threshold leave check_health silent."""
+        collector, buffer, mock_env = self._make_failing_collector(3)
+        try:
+            for prompt_idx in range(3):
+                ray.get(
+                    collector._run_prompt_group_worker.remote(None, 0, 1, prompt_idx)
+                )
+
+            ray.get(collector.check_health.remote())
+        finally:
+            ray.kill(collector)
+            ray.kill(buffer)
+            ray.kill(mock_env)
+
+    def test_worker_failures_above_threshold_raise(self):
+        """Exceeding the threshold makes check_health raise with count + threshold."""
+        collector, buffer, mock_env = self._make_failing_collector(2)
+        try:
+            for prompt_idx in range(3):
+                ray.get(
+                    collector._run_prompt_group_worker.remote(None, 0, 1, prompt_idx)
+                )
+
+            with pytest.raises(RuntimeError, match="3 generation-worker failure"):
+                ray.get(collector.check_health.remote())
+
+            with pytest.raises(RuntimeError, match="max_generation_failures=2"):
+                ray.get(collector.check_health.remote())
+        finally:
+            ray.kill(collector)
+            ray.kill(buffer)
+            ray.kill(mock_env)
+
 
 class TestAsyncUtilsIntegration:
     """Integration tests for async utilities working together."""
@@ -715,7 +820,10 @@ class TestAsyncUtilsIntegration:
                 "num_prompts_per_step": 2,
                 "num_generations_per_prompt": 2,
                 "max_rollout_turns": 1,
-                "async_grpo": {"max_trajectory_age_steps": 1},
+                "async_grpo": {
+                    "max_trajectory_age_steps": 1,
+                    "max_generation_failures": 0,
+                },
             },
             "policy": {"max_total_sequence_length": 512},
         }

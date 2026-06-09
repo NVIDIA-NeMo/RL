@@ -586,6 +586,13 @@ class StubAsyncTrajectoryCollector:
         mock.remote = MagicMock(return_value=MagicMock())
         return mock
 
+    @property
+    def check_health(self):
+        """Check collector health - returns a remote-callable mock"""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value=None)
+        return mock
+
 
 def mock_async_grpo_infrastructure(
     mock_batch, mock_rollout_metrics, seq_logprob_error_result=None

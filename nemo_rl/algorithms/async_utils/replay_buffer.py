@@ -95,6 +95,12 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             self.target_weight_versions.pop(idx)
             self.trajectories.pop(idx)
 
+    def get_target_weight_counts(self) -> dict[int, int]:
+        """Get counts of buffered trajectory groups per target weight."""
+        with self._lock:
+            counts: Counter[int] = Counter(self.target_weight_versions)
+            return dict(counts)
+
     def sample(
         self,
         num_prompt_groups: int,
