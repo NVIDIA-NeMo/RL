@@ -16,6 +16,7 @@ import copy
 import gc
 import os
 import sys
+from contextlib import contextmanager
 from importlib.util import find_spec
 from typing import Any, Optional, cast
 
@@ -254,6 +255,42 @@ class BaseVllmGenerationWorker:
 
             return file_path
 
+        @contextmanager
+        def _locked_file_patch(file_path: str):
+            """Yield (content, writer) under an exclusive file lock.
+
+            Multiple workers on the same node call _apply_vllm_patches
+            concurrently. Without a lock, one worker's ``open(path, "w")``
+            truncates the file while another is reading it, causing spurious
+            "expected code snippet not found" warnings.
+
+            Usage::
+
+                with _locked_file_patch(path) as (content, write_back):
+                    if already_patched(content):
+                        return
+                    content = content.replace(old, new)
+                    write_back(content)
+            """
+            import fcntl
+
+            lock_path = file_path + ".patch_lock"
+            lock_fd = open(lock_path, "w")
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+
+                with open(file_path, "r") as f:
+                    content = f.read()
+
+                def write_back(new_content: str):
+                    with open(file_path, "w") as f:
+                        f.write(new_content)
+
+                yield content, write_back
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                lock_fd.close()
+
         def _patch_vllm_init_workers_ray():
             """Patch the vLLM ray_distributed_executor.py file.
 
@@ -264,9 +301,6 @@ class BaseVllmGenerationWorker:
                 - See https://github.com/NVIDIA-NeMo/RL/pull/898 for more details.
             """
             file_to_patch = _get_vllm_file("v1/executor/ray_executor.py")
-
-            with open(file_to_patch, "r") as f:
-                content = f.read()
 
             old_lines = [
                 "self._init_workers_ray(placement_group)",
@@ -281,19 +315,16 @@ class BaseVllmGenerationWorker:
                 f'ADDITIONAL_ENV_VARS = {{"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "NCCL_CUMEM_ENABLE", "NCCL_NVLS_ENABLE", "RAY_ENABLE_UV_RUN_RUNTIME_ENV", {extra_env_str}}}',
             ]
 
-            need_replace = False
-            for old_line, new_line in zip(old_lines, new_lines):
-                if new_line in content or old_line not in content:
-                    continue
-                content = content.replace(old_line, new_line)
-                need_replace = True
+            with _locked_file_patch(file_to_patch) as (content, write_back):
+                need_replace = False
+                for old_line, new_line in zip(old_lines, new_lines):
+                    if new_line in content or old_line not in content:
+                        continue
+                    content = content.replace(old_line, new_line)
+                    need_replace = True
 
-            if not need_replace:
-                return
-
-            # Write back the patched content
-            with open(file_to_patch, "w") as f:
-                f.write(content)
+                if need_replace:
+                    write_back(content)
 
         def _patch_vllm_llama_eagle3_own_lm_head():
             """Patch LlamaEagle3 to keep truncated draft lm_head ownership."""
@@ -303,13 +334,6 @@ class BaseVllmGenerationWorker:
                 logger.warning(
                     "Could not locate llama_eagle3.py for lm_head ownership patch."
                 )
-                return
-
-            with open(file_to_patch, "r") as f:
-                content = f.read()
-
-            if "self.has_own_lm_head = (" in content:
-                logger.info("llama_eagle3 lm_head ownership patch already applied.")
                 return
 
             old_snippet = (
@@ -335,19 +359,22 @@ class BaseVllmGenerationWorker:
                 "        self.logits_processor = LogitsProcessor(\n"
             )
 
-            if old_snippet not in content:
-                logger.warning(
-                    "Could not apply llama_eagle3 lm_head ownership patch: "
-                    "expected code snippet not found in %s. "
-                    "The vLLM version may have changed.",
-                    file_to_patch,
-                )
-                return
+            with _locked_file_patch(file_to_patch) as (content, write_back):
+                if "self.has_own_lm_head = (" in content:
+                    logger.info("llama_eagle3 lm_head ownership patch already applied.")
+                    return
 
-            content = content.replace(old_snippet, new_snippet, 1)
+                if old_snippet not in content:
+                    logger.warning(
+                        "Could not apply llama_eagle3 lm_head ownership patch: "
+                        "expected code snippet not found in %s. "
+                        "The vLLM version may have changed.",
+                        file_to_patch,
+                    )
+                    return
 
-            with open(file_to_patch, "w") as f:
-                f.write(content)
+                content = content.replace(old_snippet, new_snippet, 1)
+                write_back(content)
 
             logger.info("Successfully patched llama_eagle3 lm_head ownership.")
 
@@ -375,13 +402,6 @@ class BaseVllmGenerationWorker:
             - https://github.com/PrimeIntellect-ai/prime-rl/pull/1837
             """
             file_to_patch = _get_vllm_file("tool_parsers/hermes_tool_parser.py")
-
-            with open(file_to_patch, "r") as f:
-                content = f.read()
-
-            if "_tokenizer_cache" in content:
-                logger.info("Hermes tool parser thread-safety patch already applied.")
-                return
 
             old_import = "import json\nfrom collections.abc import Sequence"
             new_import = (
@@ -453,21 +473,26 @@ class BaseVllmGenerationWorker:
                 "                    }"
             )
 
-            if old_init_snippet not in content:
-                logger.warning(
-                    "Could not apply hermes tool parser thread-safety patch: "
-                    "expected code snippet not found in %s. "
-                    "The vLLM version may have changed.",
-                    file_to_patch,
-                )
-                return
+            with _locked_file_patch(file_to_patch) as (content, write_back):
+                if "_tokenizer_cache" in content:
+                    logger.info(
+                        "Hermes tool parser thread-safety patch already applied."
+                    )
+                    return
 
-            content = content.replace(old_import, new_import, 1)
-            content = content.replace(old_class_line, new_class_line, 1)
-            content = content.replace(old_init_snippet, new_init_snippet, 1)
+                if old_init_snippet not in content:
+                    logger.warning(
+                        "Could not apply hermes tool parser thread-safety patch: "
+                        "expected code snippet not found in %s. "
+                        "The vLLM version may have changed.",
+                        file_to_patch,
+                    )
+                    return
 
-            with open(file_to_patch, "w") as f:
-                f.write(content)
+                content = content.replace(old_import, new_import, 1)
+                content = content.replace(old_class_line, new_class_line, 1)
+                content = content.replace(old_init_snippet, new_init_snippet, 1)
+                write_back(content)
 
             logger.info("Successfully patched hermes tool parser for thread-safety.")
 
