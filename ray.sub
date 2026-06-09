@@ -5,7 +5,7 @@
 #SBATCH --job-name=JOB_NAME
 #SBATCH --partition=PARTITION
 #SBATCH --time=1:0:0
-#SBATCH --dependency=singleton
+##SBATCH --dependency=singleton
 
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
@@ -212,10 +212,112 @@ for node in $nodes; do
     ip_addresses_array+=("$ip_address")
 done
 
+# Sort nodes alphabetically for deterministic startup order.
+_sorted_pairs=()
+for (( _si = 0; _si < ${#nodes_array[@]}; _si++ )); do
+  _sorted_pairs+=("${nodes_array[$_si]}|${ip_addresses_array[$_si]}")
+done
+IFS=$'\n' _sorted_pairs=($(printf '%s\n' "${_sorted_pairs[@]}" | sort)); unset IFS
+nodes_array=()
+ip_addresses_array=()
+for _pair in "${_sorted_pairs[@]}"; do
+  nodes_array+=("${_pair%%|*}")
+  ip_addresses_array+=("${_pair##*|}")
+done
+unset _sorted_pairs _pair _si
+echo "[INFO] Nodes after hostname sort: ${nodes_array[*]}"
+
 head_node=${nodes_array[0]}
 head_node_ip=${ip_addresses_array[0]}
 
 ip_head=$head_node_ip:$PORT
+
+# Write the topology probe script that runs inside each container.
+# Both head_cmd and worker_cmd source this to avoid duplication.
+# The script sets two variables: CLUSTER_UUID and TOPO_RANK.
+# These are then embedded into the Ray --resources JSON.
+#
+# CLUSTER_UUID: NVLink fabric ClusterUUID parsed directly from `nvidia-smi -q`.
+#   Groups GPUs by NVLink domain (all 72 GPUs in a GB200 NVL72 rack share one UUID).
+#   Empty string on DGX/HGX (no fabric) or if nvidia-smi is unavailable.
+#
+# TOPO_RANK: Topology-aware infrastructure rank.
+#   Fallback chain:
+#   1. SLURM_TOPOLOGY_ADDR (block.node format) -> block_num * 10^10 + node_num
+#   2. SLURM_PROCID (SLURM without topology plugin)
+#   3. Hostname digits (non-SLURM fallback)
+#
+# TODO(ansubramania): Harden the SLURM_TOPOLOGY_ADDR digit-extraction logic for open source.
+#   The current approach (tr -dc '0-9') assumes block/node names contain
+#   unique numeric substrings, which holds on internal clusters but
+#   may produce collisions on other providers with different naming conventions
+#   (e.g., "rack-A1" vs "rack-B1" both yield "1").
+TOPO_PROBE_SCRIPT="$LOG_DIR/topology_probe.sh"
+cat > "$TOPO_PROBE_SCRIPT" <<TOPO_PROBE_EOF
+CLUSTER_UUID=\$(nvidia-smi -q 2>/dev/null | grep 'ClusterUUID' | head -1 | awk -F: '{print \$2}' | tr -d ' ')
+if [[ -z "\$CLUSTER_UUID" ]]; then
+  CLUSTER_UUID=""
+fi
+
+TOPO_RANK=""
+if [[ -n "\${SLURM_TOPOLOGY_ADDR:-}" && "\${SLURM_TOPOLOGY_ADDR_PATTERN:-}" == "block.node" ]]; then
+  _block_part="\${SLURM_TOPOLOGY_ADDR%%.*}"
+  _node_part="\${SLURM_TOPOLOGY_ADDR##*.}"
+  _block_digits=\$(echo "\$_block_part" | tr -dc '0-9')
+  _node_digits=\$(echo "\$_node_part" | tr -dc '0-9')
+  if [[ -n "\$_block_digits" && -n "\$_node_digits" ]]; then
+    # Force base-10 interpretation; leading-zero digits like "08" would otherwise
+    # be parsed as invalid octal by bash arithmetic, silently leaving TOPO_RANK empty.
+    TOPO_RANK=\$(( 10#\$_block_digits * 10000000000 + 10#\$_node_digits ))
+  fi
+elif [[ -n "\${SLURM_PROCID:-}" ]]; then
+  TOPO_RANK="\$SLURM_PROCID"
+else
+  _hostname_digits=\$(hostname | tr -dc '0-9')
+  if [[ -n "\$_hostname_digits" ]]; then
+    TOPO_RANK="\$_hostname_digits"
+  fi
+fi
+
+# Write GPU→cpulist mapping for NUMA binding.
+# IMPORTANT: The env var name NRL_GPU_CPU_AFFINITY_FILE and default path must stay
+# in sync with GPU_CPU_AFFINITY_PATH in nemo_rl/distributed/numa_utils.py.
+export NRL_GPU_CPU_AFFINITY_FILE="/tmp/nrl_gpu_cpu_affinity"
+# nvidia-smi topo -m's CPU Affinity column is unreliable on GB200 (empty for
+# GPUs not directly attached to the socket). Use NUMA Affinity (always
+# populated, at field NF-1 since GPU NUMA ID is last) and look up the
+# node-local CPU list from sysfs.
+nvidia-smi topo -m 2>/dev/null | awk '/^GPU[0-9]/ {
+  gpu = \$1; sub(/GPU/, "", gpu)
+  numa = \$(NF-1)
+  if (numa ~ /^[0-9]+\$/) print gpu, numa
+}' | while read -r _gpu _numa; do
+  _cpulist=\$(cat "/sys/devices/system/node/node\${_numa}/cpulist" 2>/dev/null)
+  if [[ -n "\$_cpulist" ]]; then
+    echo "\${_gpu}:\${_cpulist}"
+  fi
+done > "\$NRL_GPU_CPU_AFFINITY_FILE" || true
+if [[ -s "\$NRL_GPU_CPU_AFFINITY_FILE" ]]; then
+  echo "NUMA affinity map written to \$NRL_GPU_CPU_AFFINITY_FILE:"
+  cat "\$NRL_GPU_CPU_AFFINITY_FILE"
+else
+  echo "WARNING: Could not generate NUMA affinity map (nvidia-smi topo unavailable)"
+fi
+
+# Use \\\" so that when --resources="\$RAY_RESOURCES" expands, we pass valid JSON to ray
+# IMPORTANT: The key names "nvlink_domain_" and "topo_rank" below must stay in sync
+# with the constants NVLINK_DOMAIN_PREFIX and TOPO_RANK_KEY defined in
+# nemo_rl/distributed/virtual_cluster.py.
+RAY_RESOURCES='{\"worker_units\": '"$GPUS_PER_NODE"', \"slurm_managed_ray_cluster\": 1'
+if [[ -n "\$CLUSTER_UUID" ]]; then
+  RAY_RESOURCES+=', \"nvlink_domain_'\${CLUSTER_UUID}'\": 1'
+fi
+if [[ -n "\$TOPO_RANK" ]]; then
+  RAY_RESOURCES+=', \"topo_rank\": '\$TOPO_RANK
+fi
+RAY_RESOURCES+='}'
+export RAY_RESOURCES
+TOPO_PROBE_EOF
 
 # First we start the head of the ray cluster on one of the physical nodes
 # Give the head node actual resources to make it schedulable
@@ -282,10 +384,12 @@ log-sync-sidecar &
 # Patch nsight.py before starting Ray head
 sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py
 
+source $LOG_DIR/topology_probe.sh
+
 cat <<EOFINNER | tee /launch-head.sh
 ray start --head \
     --disable-usage-stats \
-    --resources="{\"worker_units\": $GPUS_PER_NODE, \"slurm_managed_ray_cluster\": 1}" \
+    --resources="\$RAY_RESOURCES" \
     --node-ip-address="$head_node_ip" \
     --port=${PORT} \
     --ray-client-server-port=${RAY_CLIENT_SERVER_PORT} \
@@ -386,10 +490,12 @@ log-sync-sidecar &
 # Patch nsight.py before starting Ray worker
 sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py
 
+source $LOG_DIR/topology_probe.sh
+
 cat <<EOFINNER | tee /launch-worker.sh
 ray start --address "$ip_head" \
           --disable-usage-stats \
-          --resources="{\"worker_units\": $GPUS_PER_NODE, \"slurm_managed_ray_cluster\": 1}" \
+          --resources="\$RAY_RESOURCES" \
           --min-worker-port=${MIN_WORKER_PORT} \
           --max-worker-port=${MAX_WORKER_PORT} \
           \
