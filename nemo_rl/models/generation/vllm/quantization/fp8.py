@@ -274,7 +274,12 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
 
     if vllm_cfg.get("use_deep_gemm", False):
         os.environ["VLLM_USE_DEEP_GEMM"] = "1"
-        os.environ["VLLM_USE_DEEP_GEMM_E8M0"] = "0"
+        # Don't force E8M0 off: on Blackwell (sm_100) DeepGEMM's fp8 path requires
+        # UE8M0 scale factors (forcing "0" triggers gemm.hpp "Unsupported architecture
+        # or scaling factor types"). Leaving this unset lets vLLM auto-select per arch
+        # (E8M0 on Blackwell, off on Hopper); pair with pow2_weight_scaling_factors=true
+        # so refit emits power-of-2 (UE8M0-compatible) weight scales.
+        # os.environ["VLLM_USE_DEEP_GEMM_E8M0"] = "0"
 
     if vllm_cfg["async_engine"]:
         # for async engine, vllm spawns a process for each DP, so we patch
@@ -814,6 +819,18 @@ def load_weights(weights, model_runner):
         weights_quantized.append([k + "_scale_inv", param_scale])
     # Finally load the weights into vllm
     _restore_model_linear_vllm_parameter_types(model)
+    # On Blackwell, the previous refit/startup leaves fp8 scales in the E8M0
+    # DeepGEMM layout (packed int32), which the refit's raw fp32 block scales
+    # cannot load into. Reset the scale params back to their raw fp32 block shape
+    # so vLLM's stock loaders can fill them; the E8M0 transform is re-applied by
+    # the caller's `process_weights_after_loading` pass after the stream
+    # completes (see vllm_backend.update_weights_via_ipc_zmq). On Hopper (E8M0
+    # unused) the scales already stay in the refit-compatible layout, so skip.
+    from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used
+
+    if is_deep_gemm_e8m0_used():
+        _reset_e8m0_fp8_linear_scales_for_refit(model)
+        _reset_e8m0_fp8_moe_scales_for_refit(model)
     original_weight_loaders = _wrap_weight_loaders_for_refit(model)
     try:
         model.load_weights(weights_quantized)
@@ -913,6 +930,20 @@ def cast_tensor_to_fp8_blockwise(
     return fp_data, descale_fp
 
 
+def _assign_param_data(param, value) -> None:
+    """Update a Parameter's data in place, preserving the Parameter object (and
+    its weight_loader). copy_ when the shape/dtype match, else rebind .data.
+
+    The rebind branch matters on a Blackwell refit: scale params are reset to
+    raw fp32 then re-transformed to the packed-int32 E8M0 layout, so the new
+    value has a different shape/dtype and copy_ (which requires a match) fails.
+    """
+    if param.data.shape == value.shape and param.data.dtype == value.dtype:
+        param.data.copy_(value)
+    else:
+        param.data = value
+
+
 # Ref: https://github.com/vllm-project/vllm/blob/275de34170654274616082721348b7edd9741d32/vllm/model_executor/layers/quantization/utils/fp8_utils.py#L1175
 # Patches this method to not create new torch.nn.Parameter for layer weights
 # to maintain weight loaders.
@@ -972,7 +1003,10 @@ def maybe_post_process_fp8_weight_block(layer: torch.nn.Module):
             layer.weight_scale.data = dg_weight_scale
         else:
             layer.weight.data.copy_(dg_weight)
-            layer.weight_scale.data.copy_(dg_weight_scale)
+            # On a Blackwell refit the scale param was reset to its raw fp32 block
+            # shape, so the E8M0 (packed int32) result has a different shape/dtype;
+            # rebind .data instead of copy_ in that case (copy_ requires a match).
+            _assign_param_data(layer.weight_scale, dg_weight_scale)
 
         # vllm-stock writes the DG-transformed scale back to `weight_scale_inv`
         # (see model_executor/kernels/linear/scaled_mm/deep_gemm.py:replace_parameter
@@ -985,6 +1019,90 @@ def maybe_post_process_fp8_weight_block(layer: torch.nn.Module):
         # shape change.
         if hasattr(layer, "weight_scale_inv"):
             layer.weight_scale_inv.data = dg_weight_scale
+
+
+def _iter_refit_e8m0_fp8_linears(model):
+    """Yield regular fp8 block-quant Linear layers needing the Blackwell E8M0
+    scale re-transform on refit.
+
+    Excludes BMM layers (the refit writes their DeepGEMM 3D layout directly via
+    `_copy_deepseek_v4_bmm_scale`) and FusedMoE (not a LinearBase; its grouped
+    experts go through `_try_load_deepseek_v4_moe_block_scale`).
+    """
+    from vllm.utils.deep_gemm import should_use_deepgemm_for_fp8_linear
+
+    for layer in model.modules():
+        if not isinstance(layer, LinearBase) or getattr(layer, "is_bmm", False):
+            continue
+        weight = getattr(layer, "weight", None)
+        orig_dtype = getattr(layer, "orig_dtype", None)
+        if (
+            getattr(layer, "weight_block_size", None) is None
+            or weight is None
+            or weight.data.ndim != 2
+            or orig_dtype is None
+        ):
+            continue
+        if should_use_deepgemm_for_fp8_linear(orig_dtype, tuple(weight.shape)):
+            yield layer
+
+
+def _reset_e8m0_fp8_linear_scales_for_refit(model) -> None:
+    """Rebind each fp8 Linear's weight_scale[_inv] back to its raw (un-transformed)
+    fp32 block-scale shape so vLLM's stock block-scale loader can fill it.
+
+    On Blackwell, startup leaves these scales in the E8M0 DeepGEMM layout
+    ((blocks, packed) int32), which the refit's fp32 (out/blk, in/blk) block
+    scales cannot load into. The E8M0 layout is restored after the stream by the
+    caller's `process_weights_after_loading` pass.
+    """
+    for layer in _iter_refit_e8m0_fp8_linears(model):
+        blk_m, blk_n = tuple(layer.weight_block_size)
+        rows = (layer.weight.shape[0] + blk_m - 1) // blk_m
+        cols = (layer.weight.shape[1] + blk_n - 1) // blk_n
+        for scale_name in ("weight_scale_inv", "weight_scale"):
+            scale = getattr(layer, scale_name, None)
+            if scale is None:
+                continue
+            if scale.data.shape == (rows, cols) and scale.data.dtype == torch.float32:
+                continue
+            scale.data = torch.empty(
+                (rows, cols), dtype=torch.float32, device=scale.data.device
+            )
+
+
+def _moe_scale_attr_name(layer) -> str:
+    qm = getattr(layer, "quant_method", None)
+    return getattr(qm, "weight_scale_name", "weight_scale_inv")
+
+
+def _reset_e8m0_fp8_moe_scales_for_refit(model) -> None:
+    """Rebind each FusedMoE's w13/w2 block-scale params back to their raw
+    (un-transformed) fp32 (num_experts, out/blk, in/blk) shape so the DSv4 MoE
+    refit loader can fill them. The E8M0 layout is restored after the stream by
+    the caller's `process_weights_after_loading` pass (mirrors the Linear path)."""
+    for layer in model.modules():
+        if not isinstance(layer, FusedMoE):
+            continue
+        scale_name = _moe_scale_attr_name(layer)
+        block = getattr(layer, "weight_block_size", None) or [128, 128]
+        blk_m, blk_n = int(block[0]), int(block[1])
+        for prefix, weight in (
+            ("w13", getattr(layer, "w13_weight", None)),
+            ("w2", getattr(layer, "w2_weight", None)),
+        ):
+            scale = getattr(layer, f"{prefix}_{scale_name}", None)
+            if weight is None or scale is None or weight.data.ndim != 3:
+                continue
+            num_experts, out_dim, in_dim = weight.data.shape
+            rows = (out_dim + blk_m - 1) // blk_m
+            cols = (in_dim + blk_n - 1) // blk_n
+            raw_shape = (num_experts, rows, cols)
+            if scale.data.shape == raw_shape and scale.data.dtype == torch.float32:
+                continue
+            scale.data = torch.empty(
+                raw_shape, dtype=torch.float32, device=scale.data.device
+            )
 
 
 def _get_weight_loader(param):
@@ -1087,7 +1205,8 @@ def process_weights_after_loading(self, layer) -> None:
     layer.weight.data = weight.data
     if hasattr(layer, "weight_scale"):
         # Not the first time to call this function, just need to update the data
-        layer.weight_scale.copy_(weight_scale.data)
+        # (rebind if a Blackwell refit reset this to a different raw shape).
+        _assign_param_data(layer.weight_scale, weight_scale.data)
     else:
         # The first time to call this function, create a new parameter and update the tp status
         layer.weight_scale = torch.nn.Parameter(weight_scale.data, requires_grad=False)
@@ -1146,11 +1265,13 @@ def process_weights_after_loading_moe(self, layer) -> None:
         w2_input_scale=w2_input_scale,
     )
 
-    # Use .copy_() to preserve weight_loader attribute on Parameters.
-    layer.w13_weight.copy_(w13)
-    layer.w2_weight.copy_(w2)
-    getattr(layer, f"w13_{self.weight_scale_name}").copy_(w13_scale)
-    getattr(layer, f"w2_{self.weight_scale_name}").copy_(w2_scale)
+    # Preserve weight_loader attribute on Parameters: copy_ in place when the
+    # processed tensor matches, otherwise rebind .data (needed on a Blackwell
+    # refit, where the E8M0 scale layout differs from the raw fp32 block scales).
+    _assign_param_data(layer.w13_weight, w13)
+    _assign_param_data(layer.w2_weight, w2)
+    _assign_param_data(getattr(layer, f"w13_{self.weight_scale_name}"), w13_scale)
+    _assign_param_data(getattr(layer, f"w2_{self.weight_scale_name}"), w2_scale)
 
     # Set up the MoE kernel (same as upstream _setup_kernel but without replace_parameter).
     self.moe_quant_config = self.get_fused_moe_quant_config(layer)

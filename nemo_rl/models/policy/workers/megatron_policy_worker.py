@@ -103,6 +103,15 @@ apply_torch_config_pickle_patch()
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
+def _debug_sync_train(label: str) -> None:
+    if os.environ.get("NRL_DEBUG_SYNC_TRAIN", "0") != "1":
+        return
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+    print(f"[NRL_DEBUG_SYNC_TRAIN][rank={rank}] before {label}", flush=True)
+    torch.cuda.synchronize()
+    print(f"[NRL_DEBUG_SYNC_TRAIN][rank={rank}] after {label}", flush=True)
+
+
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
 class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
@@ -354,16 +363,19 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                             "use_linear_ce_fusion_loss", False
                         ),
                     )
+                    _debug_sync_train("megatron_forward_backward")
 
                 # Empty unused memory.
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
                     torch.cuda.empty_cache()
+                _debug_sync_train("empty_cache_level_1")
 
                 # Update parameters.
                 if not eval_mode:
                     update_successful, grad_norm, num_zeros_in_grad = (
                         self.optimizer.step()
                     )
+                    _debug_sync_train("optimizer_step")
                 else:
                     update_successful, grad_norm, num_zeros_in_grad = (True, 0.0, 0.0)
 
@@ -374,18 +386,22 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                 update_successful = logical_and_across_model_parallel_group(
                     update_successful, mp_group=pg_collection.mp
                 )
+                _debug_sync_train("logical_and_across_model_parallel_group")
                 # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
                 # so we must gather across mp ranks
                 grad_norm: float = reduce_max_stat_across_model_parallel_group(
                     grad_norm, mp_group=pg_collection.mp
                 )
+                _debug_sync_train("reduce_max_grad_norm")
                 num_zeros_in_grad: float = reduce_max_stat_across_model_parallel_group(
                     num_zeros_in_grad, mp_group=pg_collection.mp
                 )
+                _debug_sync_train("reduce_max_num_zeros_in_grad")
 
                 # Empty unused memory.
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 2:
                     torch.cuda.empty_cache()
+                _debug_sync_train("empty_cache_level_2")
 
                 if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
                     # keep all microbatch metrics to be normalized later
@@ -414,6 +430,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                 gb_loss_metrics = broadcast_loss_metrics_from_last_stage(
                     gb_loss_metrics
                 )
+                _debug_sync_train("broadcast_loss_metrics_from_last_stage")
                 if not parallel_state.is_pipeline_last_stage(ignore_virtual=True):
                     mb_losses = [x["loss"] for x in gb_loss_metrics]
 

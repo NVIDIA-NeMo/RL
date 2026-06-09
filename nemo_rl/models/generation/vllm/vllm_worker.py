@@ -1020,7 +1020,24 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
             self.llm.renderer, "clear_mm_cache"
         ):
             self.llm.renderer.clear_mm_cache()
-        self.llm.sleep(level=1)
+        # In the colocated refit flow the policy weights are overwritten by the
+        # refit right after wake_up, so level-1's CPU weight backup is wasted.
+        # level=2 discards instead of backing up, saving large host RAM (critical
+        # on Grace nodes with less host memory). Defaults to 1 to preserve behavior.
+        sleep_level = self.cfg["vllm_cfg"].get("sleep_level", 1)
+        if sleep_level == 2 and self.cfg.get("vllm_kwargs", {}).get(
+            "speculative_config"
+        ):
+            # A (frozen) draft model's weights don't flow through the refit IPC
+            # stream, so level=2 would discard them and never restore them
+            # (NVIDIA-NeMo/RL#2646). Fall back to level=1 to preserve them.
+            logger.warning(
+                "vLLM sleep_level=2 requested but a speculative/draft model is "
+                "configured; falling back to level=1 to avoid discarding draft "
+                "weights (see NVIDIA-NeMo/RL#2646)."
+            )
+            sleep_level = 1
+        self.llm.sleep(level=sleep_level)
 
         gc.collect()
         torch.cuda.empty_cache()

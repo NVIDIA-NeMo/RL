@@ -47,6 +47,23 @@ except ImportError:
 
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 
+
+def safe_empty_cache(context: str = "") -> None:
+    """Best-effort ``torch.cuda.empty_cache()`` that tolerates IPC-segment errors.
+
+    With ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True``, ``empty_cache()``
+    can hit ``"std::get: wrong index for variant"`` in the caching allocator on
+    Blackwell when CUDA-IPC-mapped segments (from weight streaming / refit) are
+    still present. The reclaim is an optimization, not a correctness
+    requirement, so treat it as best-effort and continue on RuntimeError.
+    """
+    try:
+        torch.cuda.empty_cache()
+    except RuntimeError as e:
+        suffix = f" [{context}]" if context else ""
+        print(f"non-fatal empty_cache() failed ({e}){suffix}; continuing.", flush=True)
+
+
 # an automodel factory for loading the huggingface models from correct class
 
 AUTOMODEL_FACTORY: Dict[str, Any] = {
@@ -378,9 +395,11 @@ def stream_weights_via_ipc_zmq_impl(
         if buffer_b is not None:
             del buffer_b
 
-        # Force garbage collection and clear CUDA cache
+        # Force garbage collection and clear CUDA cache. The streamed weights are
+        # shared via CUDA IPC handles, so empty_cache() may raise on Blackwell —
+        # see safe_empty_cache(). The stream has already completed here.
         gc.collect()
-        torch.cuda.empty_cache()
+        safe_empty_cache(f"{worker_name} (rank {rank}): after IPC weight stream")
 
 
 def rebuild_cuda_tensor_from_ipc(

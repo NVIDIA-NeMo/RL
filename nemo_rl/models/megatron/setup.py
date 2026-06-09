@@ -441,6 +441,16 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     if "moe_grouped_gemm" in config["megatron_cfg"]:
         model_cfg.moe_grouped_gemm = config["megatron_cfg"]["moe_grouped_gemm"]
 
+    # Optional override for the flex token dispatcher backend. The DSv4 bridge
+    # defaults this to "deepep", whose arch check only admits Hopper/Ampere and
+    # discrete "NVIDIA B200"/"B300" — it rejects GB200 (reported as "NVIDIA
+    # GB200"). On GB200/GB300 NVL72 use "hybridep" instead (the validator admits
+    # compute capability major in {8,9,10}).
+    if "moe_flex_dispatcher_backend" in config["megatron_cfg"]:
+        model_cfg.moe_flex_dispatcher_backend = config["megatron_cfg"][
+            "moe_flex_dispatcher_backend"
+        ]
+
 
 def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
     if "mtp_num_layers" in config["megatron_cfg"]:

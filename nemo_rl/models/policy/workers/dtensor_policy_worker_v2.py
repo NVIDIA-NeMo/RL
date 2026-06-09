@@ -65,7 +65,10 @@ from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
     ScoreOutputSpec,
 )
-from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
+from nemo_rl.models.policy.utils import (
+    get_runtime_env_for_policy_worker,
+    safe_empty_cache,
+)
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.patches import (
     apply_transformer_engine_patch,
@@ -406,7 +409,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
 
         def on_microbatch_start(mb_idx):
             if empty_cache_steps and mb_idx % empty_cache_steps == 0:
-                torch.cuda.empty_cache()
+                safe_empty_cache(f"{self} on_microbatch_start")
 
         with ctx:
             # Get data from batch and move to device
@@ -507,7 +510,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 self.scheduler.step()
             # dynamic batch and sequence dims causes alot of fragmentation, so clear
             # the memory allocator before moving on
-            torch.cuda.empty_cache()
+            safe_empty_cache(f"{self} train end")
 
             # Aggregate training statistics across microbatches and ranks
             metrics = aggregate_training_statistics(
@@ -1018,7 +1021,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             self.move_optimizer_to_device("cpu")
 
         gc.collect()
-        torch.cuda.empty_cache()
+        safe_empty_cache(f"{self} prepare_for_lp_inference")
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/prepare_for_training")
     def prepare_for_training(self, *args, **kwargs) -> None:
@@ -1044,7 +1047,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         ):
             self.move_optimizer_to_device("cuda")
 
-        torch.cuda.empty_cache()
+        safe_empty_cache(f"{self} prepare_for_training")
 
     @torch.no_grad()
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/offload_before_refit")
@@ -1055,7 +1058,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             self.move_optimizer_to_device("cpu")
 
         gc.collect()
-        torch.cuda.empty_cache()
+        safe_empty_cache(f"{self} offload_before_refit")
 
     @torch.no_grad()
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/offload_after_refit")
@@ -1109,14 +1112,14 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         if should_offload:
             self.move_optimizer_to_device("cpu")
             gc.collect()
-            torch.cuda.empty_cache()
+            safe_empty_cache(f"{self} checkpoint optimizer offload")
 
         try:
             yield
         finally:
             if should_offload and not self.cpu_offload:
                 self.move_optimizer_to_device("cuda")
-                torch.cuda.empty_cache()
+                safe_empty_cache(f"{self} checkpoint optimizer onload")
 
     def move_to_device(self, model: nn.Module, device: str | torch.device) -> nn.Module:
         model = self.move_buffer_to_device(model, device)
@@ -1134,13 +1137,13 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
     def move_to_cuda(self, model: torch.nn.Module) -> torch.nn.Module:
         model = self.move_to_device(model, "cuda")
         gc.collect()
-        torch.cuda.empty_cache()
+        safe_empty_cache(f"{self} move_to_cuda")
         return model
 
     def move_to_cpu(self, model: torch.nn.Module) -> torch.nn.Module:
         model = self.move_to_device(model, "cpu")
         gc.collect()
-        torch.cuda.empty_cache()
+        safe_empty_cache(f"{self} move_to_cpu")
         return model
 
     def save_checkpoint(
