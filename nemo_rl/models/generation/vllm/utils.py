@@ -148,6 +148,11 @@ def pad_and_align_routed_expert_indices(
         and stats["missing_routes"] > 0
         and not allow_missing_routed_experts_fallback
     ):
+        # This has only been observed rarely with vLLM prefix caching plus
+        # chunked prefill: a small number of samples can omit routed-expert
+        # rows even though most requests are complete. Keep
+        # tools/model_diagnostics/6.vllm_routed_experts_completeness.py as a
+        # standalone reproducer for upstream vLLM bug reports.
         num_cached_tokens = getattr(request_output, "num_cached_tokens", None)
         raise ValueError(
             "vLLM returned incomplete routed_experts for router replay: "
