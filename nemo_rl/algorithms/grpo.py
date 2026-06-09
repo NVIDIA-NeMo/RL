@@ -22,8 +22,8 @@ from typing import Any, Callable, NotRequired, Optional, TypedDict, TypeVar, cas
 import numpy as np
 import ray
 import torch
-from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from pydantic import BaseModel
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
