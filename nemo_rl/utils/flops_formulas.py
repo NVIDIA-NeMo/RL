@@ -27,6 +27,7 @@ class FLOPSConfig:
     layers: Optional[int] = None
     ffn_hs: Optional[int] = None
     attention_heads: Optional[int] = None
+    head_dim: Optional[int] = None
     moe_router_topk: Optional[int] = None
     query_groups: Optional[int] = None
     img_seq_len: Optional[int] = None
@@ -173,6 +174,19 @@ def qwen3(config: FLOPSConfig):
     hidden_size = config.hs
     gated_linear_multiplier = 2
 
+    # head_dim defaults to hidden_size / num_heads, but Qwen3 sets it explicitly and for some
+    # models (e.g. Qwen3-235B-A22B: head_dim=128, num_heads=64, hidden=4096) num_heads * head_dim
+    # != hidden_size ("wide" attention). The QKV/output projections and the O(seq^2) attention
+    # scores scale with num_heads * head_dim, NOT hidden_size, so use the real projection sizes.
+    # This reduces exactly to the previous formula when num_heads * head_dim == hidden_size.
+    head_dim = (
+        config.head_dim
+        if config.head_dim is not None
+        else hidden_size // config.attention_heads
+    )
+    q_proj_size = config.attention_heads * head_dim
+    kv_proj_size = config.query_groups * head_dim
+
     # attention flops for GQA
     attention_flops = (
         3
@@ -180,14 +194,13 @@ def qwen3(config: FLOPSConfig):
         * config.gbs
         * config.layers
         * seq_len
-        * hidden_size
-        * hidden_size
         * (
-            (config.query_groups / config.attention_heads * 2 + 1)  # QKV gemm
-            + (
-                seq_len / hidden_size * 2 * (0.5 if causal_self_attn else 1)
-            )  # attention
-            + 1  # attention proj gemm
+            q_proj_size * hidden_size  # Q projection
+            + 2 * kv_proj_size * hidden_size  # K, V projections (GQA)
+            + q_proj_size * hidden_size  # output projection
+            + seq_len
+            * q_proj_size
+            * (2 * (0.5 if causal_self_attn else 1))  # QK^T + A.V scores
         )
     )
 
