@@ -1226,13 +1226,33 @@ class CrossTokenizerDistillationLossFn(LossFunction):
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute the cross-tokenizer distillation loss for one microbatch."""
         if self.gold_loss:
-            loss, kl_common, l1_uncommon, num_valid_chunks, top1_acc = (
+            kd_loss, kl_common, l1_uncommon, num_valid_chunks, top1_acc = (
                 self._compute_gold(logits, data, teacher_full_logits)
             )
+            ce_loss = self._compute_ce(logits, data, global_valid_toks)
+            # Combine the H-KL distillation loss with next-token CE, mirroring
+            # the P-KL path below (paper Eq. 7 under dynamic scaling:
+            # loss = sg(ce/kd) * kd + ce).
+            if self.dynamic_loss_scaling:
+                kd_detached = kd_loss.detach().abs()
+                ce_detached = ce_loss.detach().abs()
+                kl_scale = torch.where(
+                    kd_detached > 0,
+                    ce_detached / kd_detached,
+                    torch.ones_like(kd_detached),
+                )
+                loss = kl_scale * kd_loss + ce_loss
+            else:
+                kl_scale = torch.tensor(
+                    1.0, device=kd_loss.device, dtype=kd_loss.dtype
+                )
+                loss = self.kl_loss_weight * kd_loss + self.ce_loss_scale * ce_loss
             metrics = {
                 "loss": loss.item(),
                 "kl_common": kl_common.item(),
                 "l1_uncommon": l1_uncommon.item(),
+                "ce_loss": ce_loss.item(),
+                "kl_loss_scale": kl_scale.item(),
                 "accuracy": top1_acc.item(),
                 "num_valid_samples": data["input_ids"].shape[0],
                 "num_valid_chunks": int(num_valid_chunks.item()),
