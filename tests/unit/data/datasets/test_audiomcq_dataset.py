@@ -276,7 +276,7 @@ class TestAudioMCQConstruction:
     def test_absolute_count_validation_size_as_float(self, monkeypatch, tmp_path):
         # The typed config delivers an absolute split_validation_size as a
         # float (e.g. 256.0); datasets.train_test_split rejects a float >= 1,
-        # so the wrapper must coerce whole numbers back to an int count.
+        # so split_train_validation coerces whole numbers back to an int count.
         rows = [_row(i) for i in range(10)]
         snapshot_root = _build_fixture_snapshot(tmp_path, rows)
         _patch_snapshot(monkeypatch, snapshot_root)

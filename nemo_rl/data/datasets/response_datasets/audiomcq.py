@@ -69,7 +69,7 @@ class AudioMCQDataset(RawDataset):
     def __init__(
         self,
         split: str = "train",
-        split_validation_size: float = 0,
+        split_validation_size: float | int = 0,
         seed: int = 42,
         max_samples: int | None = None,
         **kwargs,
@@ -128,16 +128,11 @@ class AudioMCQDataset(RawDataset):
         self.preprocessor = self.format_data
 
         # `self.val_dataset` is used (not None) only when this dataset provides
-        # both training and the held-out validation slice.
+        # both training and the held-out validation slice. split_validation_size
+        # is a fraction in (0, 1) or an absolute row count; split_train_validation
+        # accepts either form.
         self.val_dataset = None
-        # split_validation_size is either a fraction in (0, 1) or an absolute
-        # row count. The typed config delivers an absolute count as a float
-        # (e.g. 256.0); datasets.train_test_split only accepts an int for
-        # absolute counts, so coerce whole numbers >= 1 back to int.
-        val_size = split_validation_size
-        if val_size >= 1:
-            val_size = int(val_size)
-        self.split_train_validation(val_size, seed)
+        self.split_train_validation(split_validation_size, seed)
 
     def _eager_audio_probe(self, ds: Dataset) -> None:
         """Verify the first row's audio file exists under the snapshot root.
