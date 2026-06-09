@@ -119,7 +119,7 @@ constraints = [
 ]
 overrides = [
     { name = "deep-ep", marker = "platform_machine == 'aarch64'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=a48493600c4886c1b297aaa78db0e1ebc2d8dd6c" },
-    { name = "deep-ep", marker = "platform_machine == 'x86_64'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=bfded34800dfec415b71503f8205181de90b2480" },
+    { name = "deep-ep", marker = "platform_machine == 'x86_64'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=7febc6e25660af0f54d95dd781ecdcd62265ecca" },
     { name = "flashinfer-cubin", specifier = ">=0.5.0" },
     { name = "flashinfer-python", specifier = ">=0.5.0" },
     { name = "llguidance", specifier = ">=1.3.0,<1.4.0" },
@@ -151,7 +151,7 @@ requires-dist = ["torch", "packaging", "ninja"]
 
 [[manifest.dependency-metadata]]
 name = "deep-ep"
-version = "1.2.1+bfded34"
+version = "1.2.1+7febc6e"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [[manifest.dependency-metadata]]
@@ -1120,7 +1120,23 @@ wheels = [
 
 [[package]]
 name = "deep-ep"
-version = "1.2.1+bfded34"
+version = "1.2.1+7febc6e"
+source = { git = "https://github.com/deepseek-ai/DeepEP.git?rev=7febc6e25660af0f54d95dd781ecdcd62265ecca#7febc6e25660af0f54d95dd781ecdcd62265ecca" }
+resolution-markers = [
+    "platform_machine == 'x86_64' and sys_platform != 'darwin' and sys_platform != 'linux'",
+    "platform_machine == 'x86_64' and sys_platform == 'linux'",
+    "platform_machine == 'x86_64' and sys_platform == 'darwin'",
+]
+dependencies = [
+    { name = "ninja", marker = "platform_machine == 'x86_64'" },
+    { name = "packaging", marker = "platform_machine == 'x86_64'" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'x86_64' and sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel') or (platform_machine == 'x86_64' and sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine == 'x86_64' and sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine == 'x86_64' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-sglang') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "torch", version = "2.11.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "(platform_machine == 'x86_64' and sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-automodel') or (platform_machine == 'x86_64' and sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine == 'x86_64' and sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine == 'x86_64' and sys_platform != 'darwin' and extra != 'extra-7-nemo-rl-sglang') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+]
+
+[[package]]
+name = "deep-ep"
+version = "1.2.1+7febc6e"
 source = { git = "https://github.com/deepseek-ai/DeepEP.git?rev=a48493600c4886c1b297aaa78db0e1ebc2d8dd6c#a48493600c4886c1b297aaa78db0e1ebc2d8dd6c" }
 resolution-markers = [
     "platform_machine == 'aarch64' and sys_platform != 'darwin' and sys_platform != 'linux'",
@@ -1132,22 +1148,6 @@ dependencies = [
     { name = "packaging", marker = "platform_machine == 'aarch64'" },
     { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'aarch64' and sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel') or (platform_machine == 'aarch64' and sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine == 'aarch64' and sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine == 'aarch64' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine != 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine != 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'aarch64' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'aarch64' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "torch", version = "2.11.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "(platform_machine == 'aarch64' and sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-automodel') or (platform_machine == 'aarch64' and sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine == 'aarch64' and sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine == 'aarch64' and sys_platform != 'darwin' and extra != 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine != 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine != 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'aarch64' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'aarch64' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-]
-
-[[package]]
-name = "deep-ep"
-version = "1.2.1+bfded34"
-source = { git = "https://github.com/deepseek-ai/DeepEP.git?rev=bfded34800dfec415b71503f8205181de90b2480#bfded34800dfec415b71503f8205181de90b2480" }
-resolution-markers = [
-    "platform_machine == 'x86_64' and sys_platform != 'darwin' and sys_platform != 'linux'",
-    "platform_machine == 'x86_64' and sys_platform == 'linux'",
-    "platform_machine == 'x86_64' and sys_platform == 'darwin'",
-]
-dependencies = [
-    { name = "ninja", marker = "platform_machine == 'x86_64'" },
-    { name = "packaging", marker = "platform_machine == 'x86_64'" },
-    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'x86_64' and sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel') or (platform_machine == 'x86_64' and sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine == 'x86_64' and sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine == 'x86_64' and sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-sglang') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "torch", version = "2.11.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "(platform_machine == 'x86_64' and sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-automodel') or (platform_machine == 'x86_64' and sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine == 'x86_64' and sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine == 'x86_64' and sys_platform != 'darwin' and extra != 'extra-7-nemo-rl-sglang') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
 ]
 
 [[package]]
@@ -1530,8 +1530,8 @@ version = "0.4.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "einops" },
-    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "torch", version = "2.11.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "(sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "torch", version = "2.11.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "(sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-automodel') or (sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/53/f9/9e05c48f92b1388a8a357141eb557ed0dd6d4bb936e1d05d35f01976657f/fla_core-0.4.2.tar.gz", hash = "sha256:e9fef6fcdf122029f9feb7dccfeb85eb9650e6aabc72d2a65b36558e9c590edd", size = 377722, upload-time = "2026-03-12T14:45:46.101Z" }
 wheels = [
@@ -2176,6 +2176,37 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/39/40/43109e943fd718b0ccd0cd61eb4f1c347df22bf81f5874c6f22adf44bcff/huggingface_hub-1.14.0.tar.gz", hash = "sha256:d6d2c9cd6be1d02ae9ec6672d5587d10a427f377db688e82528f426a041622c2", size = 782365, upload-time = "2026-05-06T14:14:34.278Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/89/a5/33b49ba7bea7c41bb37f74ec0f8beea0831e052330196633fe2c77516ea6/huggingface_hub-1.14.0-py3-none-any.whl", hash = "sha256:efe075535c62e130b30e836b138e13785f6f043d1f0539e0a39aa411a99e90b8", size = 661479, upload-time = "2026-05-06T14:14:32.029Z" },
+]
+
+[[package]]
+name = "humming-kernels"
+version = "0.1.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cuda-bindings" },
+    { name = "jinja2" },
+    { name = "numpy" },
+    { name = "nvidia-ml-py" },
+    { name = "pyelftools" },
+    { name = "safetensors" },
+    { name = "tabulate" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "torch", version = "2.11.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "(sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (sys_platform != 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "tqdm" },
+    { name = "triton", version = "3.6.0", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'aarch64' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'x86_64' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "triton", version = "3.6.0", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/06/f4/e141f45697b7d0d38bfaf8766a7362d8f0136e3cff2620624f24f68e2700/humming_kernels-0.1.2.tar.gz", hash = "sha256:7894c80061c7866591bef12617da720ac4e925636ffc99464af433a5dcb035eb", size = 117251, upload-time = "2026-05-23T16:18:08.084Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/6d/41/288bf756d921dbe98982eeb3ec4c20e7cb5224ea6dcb164f2df3d2f68a7f/humming_kernels-0.1.2-py3-none-any.whl", hash = "sha256:f7434b0424946445ef5ad5682bcabf309d97721818ed5bdc4c6f61de3c6b9d2f", size = 160951, upload-time = "2026-05-23T16:18:06.405Z" },
+]
+
+[package.optional-dependencies]
+cu13 = [
+    { name = "nvidia-cuda-cccl" },
+    { name = "nvidia-cuda-nvcc" },
+    { name = "nvidia-cuda-nvrtc" },
+    { name = "nvidia-cuda-runtime" },
 ]
 
 [[package]]
@@ -3557,6 +3588,7 @@ dependencies = [
     { name = "opencv-python-headless" },
     { name = "pybind11" },
     { name = "pyyaml" },
+    { name = "tiktoken" },
     { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "torch", version = "2.11.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "(sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-automodel') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "torchao" },
@@ -3568,8 +3600,9 @@ dependencies = [
 [package.optional-dependencies]
 moe = [
     { name = "causal-conv1d" },
-    { name = "deep-ep", version = "1.2.1+bfded34", source = { git = "https://github.com/deepseek-ai/DeepEP.git?rev=a48493600c4886c1b297aaa78db0e1ebc2d8dd6c#a48493600c4886c1b297aaa78db0e1ebc2d8dd6c" }, marker = "(platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "deep-ep", version = "1.2.1+bfded34", source = { git = "https://github.com/deepseek-ai/DeepEP.git?rev=bfded34800dfec415b71503f8205181de90b2480#bfded34800dfec415b71503f8205181de90b2480" }, marker = "(platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "deep-ep", version = "1.2.1+7febc6e", source = { git = "https://github.com/deepseek-ai/DeepEP.git?rev=7febc6e25660af0f54d95dd781ecdcd62265ecca#7febc6e25660af0f54d95dd781ecdcd62265ecca" }, marker = "(platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "deep-ep", version = "1.2.1+7febc6e", source = { git = "https://github.com/deepseek-ai/DeepEP.git?rev=a48493600c4886c1b297aaa78db0e1ebc2d8dd6c#a48493600c4886c1b297aaa78db0e1ebc2d8dd6c" }, marker = "(platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "flash-linear-attention" },
     { name = "mamba-ssm" },
     { name = "nv-grouped-gemm" },
     { name = "onnxscript" },
@@ -3581,28 +3614,35 @@ requires-dist = [
     { name = "albumentations", marker = "extra == 'vlm'" },
     { name = "backoff", marker = "extra == 'vlm'" },
     { name = "bitsandbytes", marker = "extra == 'cuda-source'" },
+    { name = "boto3", marker = "extra == 's3'", specifier = ">=1.34" },
     { name = "causal-conv1d", marker = "extra == 'cuda'" },
     { name = "databricks-sql-connector", marker = "extra == 'delta-databricks'", specifier = ">=3.0.0" },
     { name = "datasets", specifier = ">=4.0.0" },
-    { name = "deep-ep", marker = "extra == 'moe'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=e3908bf5bd0cc6265bcb225d15cd8c996d4759ef" },
+    { name = "deep-ep", marker = "extra == 'moe'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=7febc6e25660af0f54d95dd781ecdcd62265ecca" },
     { name = "deltalake", marker = "extra == 'delta-databricks'", specifier = ">=1.0.0" },
-    { name = "diffusers", marker = "extra == 'diffusion'", specifier = ">=0.36.0" },
+    { name = "diffusers", marker = "extra == 'diffusion'", specifier = ">=0.37.0" },
     { name = "flash-attn", marker = "extra == 'fa'", specifier = "<=2.8.3" },
+    { name = "flash-linear-attention", marker = "extra == 'fla'", specifier = ">=0.4.2" },
     { name = "flashoptim", specifier = ">=0.1.3" },
     { name = "ftfy", marker = "extra == 'diffusion'" },
     { name = "imageio", marker = "extra == 'diffusion'" },
     { name = "imageio-ffmpeg", marker = "extra == 'diffusion'" },
-    { name = "kernels", marker = "extra == 'diffusion'" },
+    { name = "kernels", marker = "extra == 'diffusion-kernels'" },
     { name = "mamba-ssm", marker = "extra == 'cuda'" },
     { name = "megatron-fsdp", specifier = ">=0.2.3" },
     { name = "mistral-common", extras = ["audio", "hf-hub", "image", "sentencepiece"] },
-    { name = "mistral-common", extras = ["opencv"], marker = "extra == 'vlm'", specifier = ">=1.9.0" },
+    { name = "mistral-common", extras = ["opencv"], marker = "extra == 'vlm'", specifier = ">=1.11.0" },
     { name = "mlflow" },
+    { name = "multi-storage-client", marker = "extra == 'msc'", specifier = ">=0.13" },
     { name = "nemo-automodel", extras = ["cuda"], marker = "extra == 'all'" },
     { name = "nemo-automodel", extras = ["cuda"], marker = "extra == 'moe'" },
     { name = "nemo-automodel", extras = ["delta-databricks"], marker = "extra == 'all'" },
     { name = "nemo-automodel", extras = ["diffusion"], marker = "extra == 'all'" },
+    { name = "nemo-automodel", extras = ["diffusion"], marker = "extra == 'diffusion-kernels'" },
     { name = "nemo-automodel", extras = ["extra"], marker = "extra == 'all'" },
+    { name = "nemo-automodel", extras = ["fla"], marker = "extra == 'all'" },
+    { name = "nemo-automodel", extras = ["fla"], marker = "extra == 'moe'" },
+    { name = "nemo-automodel", extras = ["s3"], marker = "extra == 'all'" },
     { name = "nemo-automodel", extras = ["vlm"], marker = "extra == 'all'" },
     { name = "numba", marker = "extra == 'vlm'" },
     { name = "numpy", marker = "extra == 'vlm'" },
@@ -3615,13 +3655,16 @@ requires-dist = [
     { name = "pillow", marker = "extra == 'vlm'" },
     { name = "pybind11" },
     { name = "pyyaml" },
+    { name = "pyyaml", marker = "extra == 'cli'" },
     { name = "qwen-omni-utils", marker = "extra == 'vlm'" },
     { name = "qwen-vl-utils", extras = ["decord"], marker = "platform_machine == 'x86_64' and sys_platform != 'darwin' and extra == 'vlm'" },
     { name = "sentencepiece", marker = "extra == 'extra'" },
+    { name = "soundfile", marker = "extra == 'vlm'" },
+    { name = "tiktoken" },
     { name = "timm", marker = "extra == 'vlm'", specifier = "<=1.0.22" },
-    { name = "torch", marker = "sys_platform != 'darwin' and sys_platform != 'linux'", specifier = ">=2.6.0,<=2.10.0", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "torch", marker = "sys_platform == 'darwin'", specifier = ">=2.6.0,<=2.10.0", index = "https://pypi.org/simple" },
-    { name = "torch", marker = "sys_platform == 'linux'", specifier = ">=2.6.0,<=2.10.0", index = "https://download.pytorch.org/whl/cu129" },
+    { name = "torch", marker = "sys_platform != 'darwin' and sys_platform != 'linux'", specifier = ">=2.6.0", index = "https://download.pytorch.org/whl/cpu" },
+    { name = "torch", marker = "sys_platform == 'darwin'", specifier = ">=2.6.0", index = "https://pypi.org/simple" },
+    { name = "torch", marker = "sys_platform == 'linux'", specifier = ">=2.6.0", index = "https://download.pytorch.org/whl/cu129" },
     { name = "torchao" },
     { name = "torchcodec", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin' and extra == 'vlm'" },
     { name = "torchdata" },
@@ -3629,10 +3672,10 @@ requires-dist = [
     { name = "torchvision", marker = "sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'diffusion'", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchvision", marker = "sys_platform == 'linux' and extra == 'diffusion'", index = "https://download.pytorch.org/whl/cu129" },
     { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'cuda'", specifier = "<=2.11.0" },
-    { name = "transformers", specifier = ">=5.3.0,<5.4.0" },
-    { name = "wandb" },
+    { name = "transformers", specifier = "==5.8.1" },
+    { name = "wandb", specifier = ">=0.26.1" },
 ]
-provides-extras = ["diffusion", "cuda", "cuda-source", "extra", "fa", "delta-databricks", "moe", "vlm", "all"]
+provides-extras = ["diffusion", "diffusion-kernels", "cuda", "cuda-source", "extra", "fa", "fla", "delta-databricks", "moe", "vlm", "cli", "s3", "msc", "all"]
 
 [package.metadata.requires-dev]
 build = [
@@ -3646,7 +3689,6 @@ build = [
 dev = [
     { name = "cut-cross-entropy", git = "https://github.com/apple/ml-cross-entropy.git?rev=87a86aba72cfd2f0d8abecaf81c13c4528ea07d8" },
     { name = "dion", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", git = "https://github.com/microsoft/dion.git" },
-    { name = "flash-linear-attention", git = "https://github.com/fla-org/flash-linear-attention.git?rev=7cbe461b10bde60180c32c5f9381a04d41887514" },
     { name = "liger-kernel", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", git = "https://github.com/linkedin/Liger-Kernel.git?rev=1f1a4b8d6a6c3c1ddb3573a46480c41cef25bde6" },
 ]
 docs = [
@@ -3669,6 +3711,7 @@ test = [
     { name = "onnxruntime-gpu", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'", index = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-13/pypi/simple/" },
     { name = "peft", specifier = ">=0.18.1" },
     { name = "pytest" },
+    { name = "ruamel-yaml" },
 ]
 
 [[package]]
@@ -3838,8 +3881,8 @@ dependencies = [
 [package.optional-dependencies]
 automodel = [
     { name = "causal-conv1d" },
-    { name = "deep-ep", version = "1.2.1+bfded34", source = { git = "https://github.com/deepseek-ai/DeepEP.git?rev=a48493600c4886c1b297aaa78db0e1ebc2d8dd6c#a48493600c4886c1b297aaa78db0e1ebc2d8dd6c" }, marker = "(platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "deep-ep", version = "1.2.1+bfded34", source = { git = "https://github.com/deepseek-ai/DeepEP.git?rev=bfded34800dfec415b71503f8205181de90b2480#bfded34800dfec415b71503f8205181de90b2480" }, marker = "(platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "deep-ep", version = "1.2.1+7febc6e", source = { git = "https://github.com/deepseek-ai/DeepEP.git?rev=7febc6e25660af0f54d95dd781ecdcd62265ecca#7febc6e25660af0f54d95dd781ecdcd62265ecca" }, marker = "(platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "deep-ep", version = "1.2.1+7febc6e", source = { git = "https://github.com/deepseek-ai/DeepEP.git?rev=a48493600c4886c1b297aaa78db0e1ebc2d8dd6c#a48493600c4886c1b297aaa78db0e1ebc2d8dd6c" }, marker = "(platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "flash-attn", version = "2.8.1", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "flash-attn", version = "2.8.1+cu13torch2.10cxx11abitrue", source = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_aarch64.whl" }, marker = "(platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel') or (platform_machine != 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine != 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine != 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'aarch64' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'aarch64' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "flash-attn", version = "2.8.1+cu13torch2.10cxx11abitrue", source = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl" }, marker = "(platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-automodel') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
@@ -3858,8 +3901,8 @@ fsdp = [
 ]
 mcore = [
     { name = "causal-conv1d" },
-    { name = "deep-ep", version = "1.2.1+bfded34", source = { git = "https://github.com/deepseek-ai/DeepEP.git?rev=a48493600c4886c1b297aaa78db0e1ebc2d8dd6c#a48493600c4886c1b297aaa78db0e1ebc2d8dd6c" }, marker = "(platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "deep-ep", version = "1.2.1+bfded34", source = { git = "https://github.com/deepseek-ai/DeepEP.git?rev=bfded34800dfec415b71503f8205181de90b2480#bfded34800dfec415b71503f8205181de90b2480" }, marker = "(platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "deep-ep", version = "1.2.1+7febc6e", source = { git = "https://github.com/deepseek-ai/DeepEP.git?rev=7febc6e25660af0f54d95dd781ecdcd62265ecca#7febc6e25660af0f54d95dd781ecdcd62265ecca" }, marker = "(platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "deep-ep", version = "1.2.1+7febc6e", source = { git = "https://github.com/deepseek-ai/DeepEP.git?rev=a48493600c4886c1b297aaa78db0e1ebc2d8dd6c#a48493600c4886c1b297aaa78db0e1ebc2d8dd6c" }, marker = "(platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "emerging-optimizers" },
     { name = "flash-attn", version = "2.8.1", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-mcore') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "flash-attn", version = "2.8.1+cu13torch2.10cxx11abitrue", source = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_aarch64.whl" }, marker = "(platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine != 'aarch64' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'aarch64' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
@@ -3886,16 +3929,14 @@ sglang = [
 ]
 vllm = [
     { name = "cuda-python" },
-    { name = "deep-ep", version = "1.2.1+bfded34", source = { git = "https://github.com/deepseek-ai/DeepEP.git?rev=a48493600c4886c1b297aaa78db0e1ebc2d8dd6c#a48493600c4886c1b297aaa78db0e1ebc2d8dd6c" }, marker = "(platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (platform_machine == 'aarch64' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "deep-ep", version = "1.2.1+bfded34", source = { git = "https://github.com/deepseek-ai/DeepEP.git?rev=bfded34800dfec415b71503f8205181de90b2480#bfded34800dfec415b71503f8205181de90b2480" }, marker = "(platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (platform_machine == 'x86_64' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "deep-ep", version = "1.2.1+7febc6e", source = { git = "https://github.com/deepseek-ai/DeepEP.git?rev=7febc6e25660af0f54d95dd781ecdcd62265ecca#7febc6e25660af0f54d95dd781ecdcd62265ecca" }, marker = "(platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (platform_machine == 'x86_64' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "deep-ep", version = "1.2.1+7febc6e", source = { git = "https://github.com/deepseek-ai/DeepEP.git?rev=a48493600c4886c1b297aaa78db0e1ebc2d8dd6c#a48493600c4886c1b297aaa78db0e1ebc2d8dd6c" }, marker = "(platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (platform_machine == 'aarch64' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "deep-gemm" },
     { name = "flashinfer-cubin" },
     { name = "flashinfer-python" },
     { name = "num2words" },
     { name = "nvidia-cutlass-dsl" },
-    { name = "vllm", version = "0.20.0", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "vllm", version = "0.20.0", source = { url = "https://github.com/vllm-project/vllm/releases/download/v0.20.0/vllm-0.20.0-cp38-abi3-manylinux_2_35_aarch64.whl" }, marker = "(platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "vllm", version = "0.20.0", source = { url = "https://github.com/vllm-project/vllm/releases/download/v0.20.0/vllm-0.20.0-cp38-abi3-manylinux_2_35_x86_64.whl" }, marker = "(platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "vllm" },
 ]
 
 [package.dev-dependencies]
@@ -3954,9 +3995,9 @@ requires-dist = [
     { name = "deep-ep", marker = "platform_machine == 'aarch64' and extra == 'automodel'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=a48493600c4886c1b297aaa78db0e1ebc2d8dd6c" },
     { name = "deep-ep", marker = "platform_machine == 'aarch64' and extra == 'mcore'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=a48493600c4886c1b297aaa78db0e1ebc2d8dd6c" },
     { name = "deep-ep", marker = "platform_machine == 'aarch64' and extra == 'vllm'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=a48493600c4886c1b297aaa78db0e1ebc2d8dd6c" },
-    { name = "deep-ep", marker = "platform_machine == 'x86_64' and extra == 'automodel'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=bfded34800dfec415b71503f8205181de90b2480" },
-    { name = "deep-ep", marker = "platform_machine == 'x86_64' and extra == 'mcore'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=bfded34800dfec415b71503f8205181de90b2480" },
-    { name = "deep-ep", marker = "platform_machine == 'x86_64' and extra == 'vllm'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=bfded34800dfec415b71503f8205181de90b2480" },
+    { name = "deep-ep", marker = "platform_machine == 'x86_64' and extra == 'automodel'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=7febc6e25660af0f54d95dd781ecdcd62265ecca" },
+    { name = "deep-ep", marker = "platform_machine == 'x86_64' and extra == 'mcore'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=7febc6e25660af0f54d95dd781ecdcd62265ecca" },
+    { name = "deep-ep", marker = "platform_machine == 'x86_64' and extra == 'vllm'", git = "https://github.com/deepseek-ai/DeepEP.git?rev=7febc6e25660af0f54d95dd781ecdcd62265ecca" },
     { name = "deep-gemm", marker = "extra == 'vllm'", git = "https://github.com/deepseek-ai/DeepGEMM.git?rev=7b6b5563b9d4c1ae07ffbce7f78ad3ac9204827c" },
     { name = "emerging-optimizers", marker = "extra == 'mcore'", git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=v0.2.0" },
     { name = "flash-attn", marker = "platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'automodel'", url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_aarch64.whl" },
@@ -4026,9 +4067,7 @@ requires-dist = [
     { name = "transformers", specifier = "==5.3.0" },
     { name = "transformers", marker = "extra == 'automodel'", specifier = ">=5.3.0" },
     { name = "triton", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "vllm", marker = "platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'vllm'", url = "https://github.com/vllm-project/vllm/releases/download/v0.20.0/vllm-0.20.0-cp38-abi3-manylinux_2_35_aarch64.whl" },
-    { name = "vllm", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'vllm'", url = "https://github.com/vllm-project/vllm/releases/download/v0.20.0/vllm-0.20.0-cp38-abi3-manylinux_2_35_x86_64.whl" },
-    { name = "vllm", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'vllm') or (sys_platform != 'linux' and extra == 'vllm')", specifier = "==0.20.0" },
+    { name = "vllm", marker = "extra == 'vllm'", editable = "3rdparty/vLLM-workspace/vllm" },
     { name = "wandb", specifier = ">=0.25.1" },
 ]
 provides-extras = ["fsdp", "automodel", "vllm", "sglang", "mcore", "modelopt", "nvrx", "nemo-gym"]
@@ -4221,6 +4260,26 @@ wheels = [
 ]
 
 [[package]]
+name = "nvidia-cuda-cccl"
+version = "13.3.3.3.1"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5f/7a/9cb8a7fb87a85b11e8753548ae1422be847c5dddf3ca9ff5b080b309e271/nvidia_cuda_cccl-13.3.3.3.1-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:4dbc9dd84fbaeae267cbd80a9ed76d35171dba78639695dbdff0bae50e4503fa", size = 3453010, upload-time = "2026-05-26T16:27:45.179Z" },
+    { url = "https://files.pythonhosted.org/packages/fe/fb/195d50d25ab68a76b817ffc68c45b1fb828598ce35a8e5c1736060628dab/nvidia_cuda_cccl-13.3.3.3.1-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:40ba1fa0b2c694ddc06cc791ed5c8bdad4638e2735b784960d68ac3086399c97", size = 3453013, upload-time = "2026-05-26T16:28:08.209Z" },
+    { url = "https://files.pythonhosted.org/packages/57/44/37cf1596880e7712f357b3f4991cd34d0f322c26e2bc814d1bdeffb2f420/nvidia_cuda_cccl-13.3.3.3.1-py3-none-win_amd64.whl", hash = "sha256:d1ac746f57ab83403f01e64e2b292101caf5b3445babca9f1c1c34f344766adf", size = 3452993, upload-time = "2026-05-26T16:58:59.166Z" },
+]
+
+[[package]]
+name = "nvidia-cuda-crt"
+version = "13.3.33"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d1/32/5ea57f8cd6ad5df2173d175ac5db4e06edde40028b1b1f6c539ea4c10290/nvidia_cuda_crt-13.3.33-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:c8c257393f9c9146a85d3644f352be8154843d760031f756e673222c768a4930", size = 157348, upload-time = "2026-05-26T16:28:40.446Z" },
+    { url = "https://files.pythonhosted.org/packages/8d/a7/998af901511d5efdc6e42fc597d32a69f34eecf86f1591a9d230ab3ab951/nvidia_cuda_crt-13.3.33-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:01ff37600c7b880a14cab4ade763b4c10c0ff92f25cc9dca30f0881ce52693c4", size = 157350, upload-time = "2026-05-26T16:29:22.315Z" },
+    { url = "https://files.pythonhosted.org/packages/a4/5f/fc8ce6b7719c825e0e519d2922e3b7630238e860222ad3f972dd9b8b7fa9/nvidia_cuda_crt-13.3.33-py3-none-win_amd64.whl", hash = "sha256:7e89c6dbb807a47ee0628907488b158e57c36fa31af3756a8f826a9ec482715f", size = 158284, upload-time = "2026-05-26T16:59:37.309Z" },
+]
+
+[[package]]
 name = "nvidia-cuda-cupti"
 version = "13.0.85"
 source = { registry = "https://pypi.org/simple" }
@@ -4228,6 +4287,21 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/2a/2a/80353b103fc20ce05ef51e928daed4b6015db4aaa9162ed0997090fe2250/nvidia_cuda_cupti-13.0.85-py3-none-manylinux_2_25_aarch64.whl", hash = "sha256:796bd679890ee55fb14a94629b698b6db54bcfd833d391d5e94017dd9d7d3151", size = 10310827, upload-time = "2025-09-04T08:26:42.012Z" },
     { url = "https://files.pythonhosted.org/packages/33/6d/737d164b4837a9bbd202f5ae3078975f0525a55730fe871d8ed4e3b952b0/nvidia_cuda_cupti-13.0.85-py3-none-manylinux_2_25_x86_64.whl", hash = "sha256:4eb01c08e859bf924d222250d2e8f8b8ff6d3db4721288cf35d14252a4d933c8", size = 10715597, upload-time = "2025-09-04T08:26:51.312Z" },
     { url = "https://files.pythonhosted.org/packages/ad/df/b74b10025c1205695c5676373f2edd3e87a7202cc62ead0dfbc373b0f6ea/nvidia_cuda_cupti-13.0.85-py3-none-win_amd64.whl", hash = "sha256:683f58d301548deeefcb8f6fac1b8d907691b9d8b18eccab417f51e362102f00", size = 7736776, upload-time = "2025-09-04T08:38:08.38Z" },
+]
+
+[[package]]
+name = "nvidia-cuda-nvcc"
+version = "13.3.33"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "nvidia-cuda-crt" },
+    { name = "nvidia-cuda-runtime" },
+    { name = "nvidia-nvvm" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/be/b6/bb07a3a63b5b7b55516366747892abbf3ee62d616684c40bb51e6cbfe956/nvidia_cuda_nvcc-13.3.33-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:8c348623b1434aebd234da9ec1f81022587ae4995d65c3dc8a7743245cc441f7", size = 39515074, upload-time = "2026-05-26T16:34:28.489Z" },
+    { url = "https://files.pythonhosted.org/packages/3f/af/e1b107f034f7c133255c162b922bbad3da5be20ebf76df17662ae4bd31f6/nvidia_cuda_nvcc-13.3.33-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:53b5f1be1731574368b8be931b77b6313492266c464aef3dd3f431569ce90deb", size = 44943276, upload-time = "2026-05-26T16:35:05.912Z" },
+    { url = "https://files.pythonhosted.org/packages/47/c2/831fa54020621a64d44cff47f1ed5eb0611794495fce01c857f6999d76b1/nvidia_cuda_nvcc-13.3.33-py3-none-win_amd64.whl", hash = "sha256:21c93aeef695a81b688137119f9120fe08a67292bf0ad730d94dc2b18bec23f0", size = 32723421, upload-time = "2026-05-26T17:01:47.511Z" },
 ]
 
 [[package]]
@@ -4468,6 +4542,16 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/c2/f3/d86c845465a2723ad7e1e5c36dcd75ddb82898b3f53be47ebd429fb2fa5d/nvidia_nvtx-13.0.85-py3-none-manylinux1_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:4936d1d6780fbe68db454f5e72a42ff64d1fd6397df9f363ae786930fd5c1cd4", size = 148047, upload-time = "2025-09-04T08:29:01.761Z" },
     { url = "https://files.pythonhosted.org/packages/a8/64/3708a90d1ebe202ffdeb7185f878a3c84d15c2b2c31858da2ce0583e2def/nvidia_nvtx-13.0.85-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:cb7780edb6b14107373c835bf8b72e7a178bac7367e23da7acb108f973f157a6", size = 148878, upload-time = "2025-09-04T08:28:53.627Z" },
     { url = "https://files.pythonhosted.org/packages/d2/50/0e2220f8620a177de994211186ffc5bfa9f2ce1e1282797f8f90096f9f88/nvidia_nvtx-13.0.85-py3-none-win_amd64.whl", hash = "sha256:d66ea44254dd3c6eacc300047af6e1288d2269dd072b417e0adffbf479e18519", size = 137066, upload-time = "2025-09-04T08:39:25.649Z" },
+]
+
+[[package]]
+name = "nvidia-nvvm"
+version = "13.3.33"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/01/8a/f767031dcd0d24c2bbab4b696dbcf004da4f3284e5e4649fc47bc0e2bb78/nvidia_nvvm-13.3.33-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl", hash = "sha256:aafaf73246b6126bc88f521e5dab1d196395ee87739d9f5b7c39c9fee0ead9c7", size = 69250604, upload-time = "2026-05-26T16:57:56.875Z" },
+    { url = "https://files.pythonhosted.org/packages/83/36/ce0d42d3a4465c858c379932f0080d29d22f04383ab79119c7c4f4cdd5ef/nvidia_nvvm-13.3.33-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:fd74a1c5ef284ba04c1ba75f886404dff953c54731a3a9c7b45e9aedaf1a226b", size = 66984524, upload-time = "2026-05-26T16:57:30.778Z" },
+    { url = "https://files.pythonhosted.org/packages/8f/96/4de7a37803d168337ab36f81ecbc496c7c21c9b06ec68ce0ecc381af88d4/nvidia_nvvm-13.3.33-py3-none-win_amd64.whl", hash = "sha256:b1c63cf8972d8a1ff153c5ac4cc7038fe6ef705aa38415f12007b0e5e4c31b79", size = 60175824, upload-time = "2026-05-26T17:13:27.588Z" },
 ]
 
 [[package]]
@@ -5539,6 +5623,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/19/f4/f408dffd3ca3eeaaf385cfcf49b913883f5db83e1e56e25ecb16e2b27468/pyecharts-2.1.0.tar.gz", hash = "sha256:077f8205390aea705b8cc0be9d0c09916a2c060e9e5c8d9c9d11b7d8f4bdc1da", size = 172645, upload-time = "2026-02-10T11:53:38.377Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/8b/4d/518d1c17575dc3a51f3c17490e75b1811873168a165c4eb585af9da093e3/pyecharts-2.1.0-py3-none-any.whl", hash = "sha256:5cba0aa06af3d9390a1fed18aa4e76acd7bdfb323cdf131874f46eaf7e78c6c7", size = 161148, upload-time = "2026-02-10T11:53:36.943Z" },
+]
+
+[[package]]
+name = "pyelftools"
+version = "0.33"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/a3/11/767522582afab1b884d277de0e6e011640cb9d7292a38694b4b1a1df1ae8/pyelftools-0.33.tar.gz", hash = "sha256:660d82dcbeb8e83d1702bd97f223f761625da06111c0cc988eac6b8ab0c1b61f", size = 15068655, upload-time = "2026-05-29T12:56:22.553Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/46/2a/f9697576603dae937727827505a6126a066affb227034e77e6f9068910da/pyelftools-0.33-py3-none-any.whl", hash = "sha256:f215ad5f47d3f1373a21496a6c9e0707c622840d0622f23ff7ce08678b020036", size = 201178, upload-time = "2026-05-29T12:56:20.587Z" },
 ]
 
 [[package]]
@@ -7027,6 +7120,31 @@ wheels = [
 ]
 
 [[package]]
+name = "tokenspeed-mla"
+version = "0.1.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "apache-tvm-ffi", version = "0.1.9", source = { registry = "https://pypi.org/simple" } },
+    { name = "nvidia-cutlass-dsl" },
+    { name = "tokenspeed-triton" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "torch", version = "2.11.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "(sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (sys_platform != 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/42/20/4110d624d81d63f0bee2f19dba7ea0e1d8a31ea50147e6c1db82223c88a4/tokenspeed_mla-0.1.2-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:592590f36d85e624ecdc5e357ff35e29e761e6d879900dce8b67a6785c8ce75c", size = 743769, upload-time = "2026-05-13T03:30:54.486Z" },
+    { url = "https://files.pythonhosted.org/packages/84/01/4bf8b74ead3e8e7c1c809435396254c067a33fde48acc20f602aae622d97/tokenspeed_mla-0.1.2-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:c9466a351fe039792e56cf49f3e79744c1dc28c7af10306a02e62b8e92fa5985", size = 748681, upload-time = "2026-05-13T03:30:56.718Z" },
+]
+
+[[package]]
+name = "tokenspeed-triton"
+version = "3.7.10.post20260531"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/84/58/fdb5fb70d99c1f18f01c2198420fa2a0f7e5301bd7dd5b5f34b22a3cb87b/tokenspeed_triton-3.7.10.post20260531-cp312-abi3-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:16cd0a3fc1cffeb458a7e03e8688714f49fdf0b5a108bfca999f46597c3faabb", size = 81636010, upload-time = "2026-05-31T01:29:17.699Z" },
+    { url = "https://files.pythonhosted.org/packages/d7/49/7bae94729bfd7a3f331795251302f0b0c8e54a7ec25b3af5d5bfe133367c/tokenspeed_triton-3.7.10.post20260531-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:b90ac41e7f15933797545ff1a9e803a9d8beb4ca9ba70f6d41a9e0fc26484f5c", size = 85888791, upload-time = "2026-05-31T01:29:25.584Z" },
+]
+
+[[package]]
 name = "tomlkit"
 version = "0.15.0"
 source = { registry = "https://pypi.org/simple" }
@@ -7488,6 +7606,14 @@ source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "platform_machine == 's390x' and sys_platform == 'linux'",
     "platform_machine != 'aarch64' and platform_machine != 's390x' and platform_machine != 'x86_64' and sys_platform == 'linux'",
+    "platform_machine == 'x86_64' and sys_platform != 'darwin' and sys_platform != 'linux'",
+    "platform_machine == 'aarch64' and sys_platform != 'darwin' and sys_platform != 'linux'",
+    "platform_machine != 'aarch64' and platform_machine != 's390x' and platform_machine != 'x86_64' and sys_platform != 'darwin' and sys_platform != 'linux'",
+    "platform_machine == 's390x' and sys_platform != 'darwin' and sys_platform != 'linux'",
+    "platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "platform_machine == 'aarch64' and sys_platform == 'darwin'",
+    "platform_machine != 'aarch64' and platform_machine != 's390x' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
+    "platform_machine == 's390x' and sys_platform == 'darwin'",
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/3c/12/34d71b350e89a204c2c7777a9bba0dcf2f19a5bfdd70b57c4dbc5ffd7154/triton-3.6.0-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:448e02fe6dc898e9e5aa89cf0ee5c371e99df5aa5e8ad976a80b93334f3494fd", size = 176133521, upload-time = "2026-01-20T16:16:13.321Z" },
@@ -7671,178 +7797,83 @@ wheels = [
 
 [[package]]
 name = "vllm"
-version = "0.20.0"
-source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "platform_machine == 'x86_64' and sys_platform != 'darwin' and sys_platform != 'linux'",
-    "platform_machine == 'aarch64' and sys_platform != 'darwin' and sys_platform != 'linux'",
-    "platform_machine != 'aarch64' and platform_machine != 's390x' and platform_machine != 'x86_64' and sys_platform == 'linux'",
-    "platform_machine == 's390x' and sys_platform == 'linux'",
-    "platform_machine != 'aarch64' and platform_machine != 's390x' and platform_machine != 'x86_64' and sys_platform != 'darwin' and sys_platform != 'linux'",
-    "platform_machine == 's390x' and sys_platform != 'darwin' and sys_platform != 'linux'",
-    "platform_machine == 'x86_64' and sys_platform == 'darwin'",
-    "platform_machine == 'aarch64' and sys_platform == 'darwin'",
-    "platform_machine != 'aarch64' and platform_machine != 's390x' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
-    "platform_machine == 's390x' and sys_platform == 'darwin'",
-]
+source = { editable = "3rdparty/vLLM-workspace/vllm" }
 dependencies = [
-    { name = "aiohttp", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "anthropic", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "apache-tvm-ffi", version = "0.1.9", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "blake3", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "cachetools", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "cbor2", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "cloudpickle", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "compressed-tensors", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "depyf", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "diskcache", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "einops", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "fastapi", extra = ["standard"], marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "fastsafetensors", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "filelock", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "flashinfer-cubin", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "flashinfer-python", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "gguf", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "ijson", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "lark", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "llguidance", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "lm-format-enforcer", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "mcp", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "mistral-common", extra = ["image"], marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "model-hosting-container-standards", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "msgspec", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "ninja", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "numba", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "numpy", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "nvidia-cudnn-frontend", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "nvidia-cutlass-dsl", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "openai", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "openai-harmony", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "opencv-python-headless", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "opentelemetry-api", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "opentelemetry-exporter-otlp", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "opentelemetry-sdk", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "opentelemetry-semantic-conventions-ai", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "outlines-core", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "partial-json-parser", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "pillow", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "prometheus-client", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "prometheus-fastapi-instrumentator", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "protobuf", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "psutil", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "py-cpuinfo", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "pybase64", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "pydantic", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "python-json-logger", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "pyyaml", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "pyzmq", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "quack-kernels", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "regex", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "requests", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "sentencepiece", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "setproctitle", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "setuptools", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "six", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "tiktoken", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "tilelang", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "tokenizers", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
+    { name = "aiohttp" },
+    { name = "anthropic" },
+    { name = "apache-tvm-ffi", version = "0.1.9", source = { registry = "https://pypi.org/simple" } },
+    { name = "blake3" },
+    { name = "cachetools" },
+    { name = "cbor2" },
+    { name = "cloudpickle" },
+    { name = "compressed-tensors" },
+    { name = "depyf" },
+    { name = "diskcache" },
+    { name = "einops" },
+    { name = "fastapi", extra = ["standard"], marker = "(extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "fastsafetensors" },
+    { name = "filelock" },
+    { name = "flashinfer-cubin" },
+    { name = "flashinfer-python" },
+    { name = "gguf" },
+    { name = "humming-kernels", extra = ["cu13"], marker = "(extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "ijson" },
+    { name = "jsonschema" },
+    { name = "lark" },
+    { name = "llguidance" },
+    { name = "lm-format-enforcer" },
+    { name = "mcp" },
+    { name = "mistral-common", extra = ["image"], marker = "(extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "model-hosting-container-standards" },
+    { name = "msgspec" },
+    { name = "ninja" },
+    { name = "numba" },
+    { name = "numpy" },
+    { name = "nvidia-cudnn-frontend", version = "1.18.0", source = { registry = "https://pypi.org/simple" } },
+    { name = "nvidia-cutlass-dsl" },
+    { name = "openai" },
+    { name = "openai-harmony" },
+    { name = "opencv-python-headless" },
+    { name = "opentelemetry-api" },
+    { name = "opentelemetry-exporter-otlp" },
+    { name = "opentelemetry-sdk" },
+    { name = "opentelemetry-semantic-conventions-ai" },
+    { name = "outlines-core" },
+    { name = "partial-json-parser" },
+    { name = "pillow" },
+    { name = "prometheus-client" },
+    { name = "prometheus-fastapi-instrumentator" },
+    { name = "protobuf" },
+    { name = "psutil" },
+    { name = "py-cpuinfo" },
+    { name = "pybase64" },
+    { name = "pydantic" },
+    { name = "python-json-logger" },
+    { name = "pyyaml" },
+    { name = "pyzmq" },
+    { name = "quack-kernels" },
+    { name = "regex" },
+    { name = "requests" },
+    { name = "safetensors" },
+    { name = "sentencepiece" },
+    { name = "setproctitle" },
+    { name = "setuptools" },
+    { name = "six" },
+    { name = "tiktoken" },
+    { name = "tilelang" },
+    { name = "tokenizers" },
+    { name = "tokenspeed-mla" },
     { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "torch", version = "2.11.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'aarch64' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'x86_64' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "torch", version = "2.11.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "(sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (sys_platform != 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "torchaudio", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "torchaudio", version = "2.11.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'aarch64' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'x86_64' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "torchaudio", version = "2.11.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "(sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (sys_platform != 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "torchvision", version = "0.26.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (sys_platform == 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "torchvision", version = "0.26.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine != 'aarch64' and platform_machine != 'x86_64' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'aarch64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'aarch64' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (platform_machine == 'x86_64' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (sys_platform != 'darwin' and sys_platform != 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform == 'darwin' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "tqdm", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "transformers", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "typing-extensions", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "watchfiles", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-    { name = "xgrammar", marker = "(platform_machine != 'aarch64' and platform_machine != 'x86_64') or sys_platform != 'linux'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/e7/80/9798ce5e16af5754183ef33a63dc27017e2b51c87f51cc741832ce47a2d5/vllm-0.20.0.tar.gz", hash = "sha256:a6d50152936ee292455af3ffbe359f7a284ac43bf3b68caccf29f368e196cc72", size = 33508260, upload-time = "2026-04-27T11:08:04.666Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/63/5b/26379d3c522379373e50b9f77adf55eb94f4a0f62a6c8e3e7fe3f0bf0d39/vllm-0.20.0-cp38-abi3-manylinux_2_35_aarch64.whl", hash = "sha256:29a135ca0d70650f057f15c7c0b560d24659524c771f70fbddc24597c861c118", size = 235776358, upload-time = "2026-04-27T11:07:22.058Z" },
-    { url = "https://files.pythonhosted.org/packages/47/bb/cb02d1e9679fce892a674f86caee25acc9ddd64d7dafa4cfe29e899993a8/vllm-0.20.0-cp38-abi3-manylinux_2_35_x86_64.whl", hash = "sha256:24d28892e210200f6e1bd13f699c42a74cd2bb7364c11248e2348f677c7f6dfb", size = 244415937, upload-time = "2026-04-27T11:07:48.135Z" },
-]
-
-[[package]]
-name = "vllm"
-version = "0.20.0"
-source = { url = "https://github.com/vllm-project/vllm/releases/download/v0.20.0/vllm-0.20.0-cp38-abi3-manylinux_2_35_aarch64.whl" }
-resolution-markers = [
-    "platform_machine == 'aarch64' and sys_platform == 'linux'",
-]
-dependencies = [
-    { name = "aiohttp", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "anthropic", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "apache-tvm-ffi", version = "0.1.9", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "blake3", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "cachetools", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "cbor2", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "cloudpickle", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "compressed-tensors", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "depyf", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "diskcache", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "einops", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "fastapi", extra = ["standard"], marker = "(platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "fastsafetensors", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "filelock", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "flashinfer-cubin", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "flashinfer-python", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "gguf", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "ijson", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "lark", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "llguidance", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "lm-format-enforcer", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "mcp", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "mistral-common", extra = ["image"], marker = "(platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (platform_machine == 'aarch64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'aarch64' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "model-hosting-container-standards", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "msgspec", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "ninja", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "numba", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "numpy", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "nvidia-cudnn-frontend", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "nvidia-cutlass-dsl", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "openai", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "openai-harmony", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "opencv-python-headless", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "opentelemetry-api", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "opentelemetry-exporter-otlp", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "opentelemetry-sdk", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "opentelemetry-semantic-conventions-ai", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "outlines-core", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "partial-json-parser", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "pillow", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "prometheus-client", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "prometheus-fastapi-instrumentator", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "protobuf", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "psutil", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "py-cpuinfo", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "pybase64", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "pydantic", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "python-json-logger", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "pyyaml", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "pyzmq", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "quack-kernels", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "regex", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "requests", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "sentencepiece", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "setproctitle", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "setuptools", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "six", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "tiktoken", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "tilelang", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "tokenizers", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "torch", version = "2.11.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "torchaudio", version = "2.11.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "torchvision", version = "0.26.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "tqdm", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "transformers", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "typing-extensions", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "watchfiles", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-    { name = "xgrammar", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
-]
-wheels = [
-    { url = "https://github.com/vllm-project/vllm/releases/download/v0.20.0/vllm-0.20.0-cp38-abi3-manylinux_2_35_aarch64.whl", hash = "sha256:29a135ca0d70650f057f15c7c0b560d24659524c771f70fbddc24597c861c118" },
+    { name = "torchvision", version = "0.26.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "(sys_platform != 'darwin' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (sys_platform != 'darwin' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "tqdm" },
+    { name = "transformers" },
+    { name = "typing-extensions" },
+    { name = "watchfiles" },
+    { name = "xgrammar" },
 ]
 
 [package.metadata]
@@ -7864,26 +7895,28 @@ requires-dist = [
     { name = "fastsafetensors", specifier = ">=0.2.2" },
     { name = "fastsafetensors", marker = "extra == 'fastsafetensors'", specifier = ">=0.2.2" },
     { name = "filelock", specifier = ">=3.16.1" },
-    { name = "flashinfer-cubin", specifier = "==0.6.8.post1" },
-    { name = "flashinfer-python", specifier = "==0.6.8.post1" },
+    { name = "flashinfer-cubin", specifier = "==0.6.12" },
+    { name = "flashinfer-python", specifier = "==0.6.12" },
     { name = "gguf", specifier = ">=0.17.0" },
     { name = "helion", marker = "extra == 'helion'", specifier = "==1.0.0" },
+    { name = "humming-kernels", extras = ["cu13"], specifier = "==0.1.2" },
     { name = "ijson" },
     { name = "instanttensor", marker = "extra == 'instanttensor'", specifier = ">=0.1.5" },
+    { name = "jsonschema", specifier = ">=4.23.0" },
     { name = "lark", specifier = "==1.2.2" },
-    { name = "llguidance", marker = "platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'ppc64le' or platform_machine == 'x86_64'", specifier = ">=1.3.0,<1.4.0" },
+    { name = "llguidance", marker = "platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'ppc64le' or platform_machine == 'x86_64'", specifier = ">=1.7.0,<1.8.0" },
     { name = "lm-format-enforcer", specifier = "==0.11.3" },
     { name = "matplotlib", marker = "extra == 'bench'" },
     { name = "mcp" },
     { name = "mistral-common", extras = ["audio"], marker = "extra == 'audio'" },
-    { name = "mistral-common", extras = ["image"], specifier = ">=1.11.0" },
-    { name = "model-hosting-container-standards", specifier = ">=0.1.13,<1.0.0" },
+    { name = "mistral-common", extras = ["image"], specifier = ">=1.11.2" },
+    { name = "model-hosting-container-standards", specifier = ">=0.1.14,<1.0.0" },
     { name = "msgspec" },
     { name = "ninja" },
     { name = "numba", specifier = "==0.65.0" },
     { name = "numpy" },
     { name = "nvidia-cudnn-frontend", specifier = ">=1.13.0,<1.19.0" },
-    { name = "nvidia-cutlass-dsl", specifier = ">=4.4.2" },
+    { name = "nvidia-cutlass-dsl", extras = ["cu13"], specifier = "==4.5.2" },
     { name = "openai", specifier = ">=2.0.0" },
     { name = "openai-harmony", specifier = ">=0.0.3" },
     { name = "opencv-python-headless", specifier = ">=4.13.0" },
@@ -7914,6 +7947,7 @@ requires-dist = [
     { name = "regex" },
     { name = "requests", specifier = ">=2.26.0" },
     { name = "runai-model-streamer", extras = ["azure", "gcs", "s3"], marker = "extra == 'runai'", specifier = ">=0.15.7" },
+    { name = "safetensors", specifier = ">=0.6.2" },
     { name = "scipy", marker = "extra == 'audio'" },
     { name = "scipy", marker = "extra == 'bench'" },
     { name = "seaborn", marker = "extra == 'bench'" },
@@ -7927,6 +7961,7 @@ requires-dist = [
     { name = "tiktoken", specifier = ">=0.6.0" },
     { name = "tilelang", specifier = "==0.1.9" },
     { name = "tokenizers", specifier = ">=0.21.1" },
+    { name = "tokenspeed-mla", specifier = "==0.1.2" },
     { name = "torch", specifier = "==2.11.0" },
     { name = "torchaudio", specifier = "==2.11.0" },
     { name = "torchvision", specifier = "==0.26.0" },
@@ -7934,183 +7969,8 @@ requires-dist = [
     { name = "transformers", specifier = ">=4.56.0,!=5.0.*,!=5.1.*,!=5.2.*,!=5.3.*,!=5.4.*,!=5.5.0" },
     { name = "typing-extensions", specifier = ">=4.10" },
     { name = "watchfiles" },
-    { name = "xgrammar", marker = "platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'ppc64le' or platform_machine == 's390x' or platform_machine == 'x86_64'", specifier = ">=0.1.32,<1.0.0" },
-    { name = "zentorch-weekly", marker = "extra == 'zen'", specifier = "==5.2.1.dev20260408" },
-]
-provides-extras = ["zen", "bench", "tensorizer", "fastsafetensors", "instanttensor", "runai", "audio", "video", "flashinfer", "helion", "grpc", "otel"]
-
-[[package]]
-name = "vllm"
-version = "0.20.0"
-source = { url = "https://github.com/vllm-project/vllm/releases/download/v0.20.0/vllm-0.20.0-cp38-abi3-manylinux_2_35_x86_64.whl" }
-resolution-markers = [
-    "platform_machine == 'x86_64' and sys_platform == 'linux'",
-]
-dependencies = [
-    { name = "aiohttp", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "anthropic", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "apache-tvm-ffi", version = "0.1.9", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "blake3", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "cachetools", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "cbor2", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "cloudpickle", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "compressed-tensors", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "depyf", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "diskcache", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "einops", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "fastapi", extra = ["standard"], marker = "(platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "fastsafetensors", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "filelock", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "flashinfer-cubin", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "flashinfer-python", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "gguf", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "ijson", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "lark", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "llguidance", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "lm-format-enforcer", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "mcp", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "mistral-common", extra = ["image"], marker = "(platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (sys_platform != 'linux' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "model-hosting-container-standards", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "msgspec", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "ninja", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "numba", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "numpy", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "nvidia-cudnn-frontend", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "nvidia-cutlass-dsl", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "openai", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "openai-harmony", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "opencv-python-headless", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "opentelemetry-api", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "opentelemetry-exporter-otlp", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "opentelemetry-sdk", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "opentelemetry-semantic-conventions-ai", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "outlines-core", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "partial-json-parser", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "pillow", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "prometheus-client", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "prometheus-fastapi-instrumentator", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "protobuf", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "psutil", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "py-cpuinfo", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "pybase64", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "pydantic", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "python-json-logger", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "pyyaml", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "pyzmq", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "quack-kernels", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "regex", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "requests", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "sentencepiece", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "setproctitle", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "setuptools", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "six", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "tiktoken", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "tilelang", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "tokenizers", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "torch", version = "2.11.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "torchaudio", version = "2.11.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "torchvision", version = "0.26.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "tqdm", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "transformers", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "typing-extensions", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "watchfiles", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "xgrammar", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-]
-wheels = [
-    { url = "https://github.com/vllm-project/vllm/releases/download/v0.20.0/vllm-0.20.0-cp38-abi3-manylinux_2_35_x86_64.whl", hash = "sha256:24d28892e210200f6e1bd13f699c42a74cd2bb7364c11248e2348f677c7f6dfb" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "aiohttp", specifier = ">=3.13.3" },
-    { name = "anthropic", specifier = ">=0.71.0" },
-    { name = "apache-tvm-ffi", specifier = "==0.1.9" },
-    { name = "av", marker = "extra == 'audio'" },
-    { name = "blake3" },
-    { name = "cachetools" },
-    { name = "cbor2" },
-    { name = "cloudpickle" },
-    { name = "compressed-tensors", specifier = "==0.15.0.1" },
-    { name = "datasets", marker = "extra == 'bench'" },
-    { name = "depyf", specifier = "==0.20.0" },
-    { name = "diskcache", specifier = "==5.6.3" },
-    { name = "einops" },
-    { name = "fastapi", extras = ["standard"], specifier = ">=0.115.0" },
-    { name = "fastsafetensors", specifier = ">=0.2.2" },
-    { name = "fastsafetensors", marker = "extra == 'fastsafetensors'", specifier = ">=0.2.2" },
-    { name = "filelock", specifier = ">=3.16.1" },
-    { name = "flashinfer-cubin", specifier = "==0.6.8.post1" },
-    { name = "flashinfer-python", specifier = "==0.6.8.post1" },
-    { name = "gguf", specifier = ">=0.17.0" },
-    { name = "helion", marker = "extra == 'helion'", specifier = "==1.0.0" },
-    { name = "ijson" },
-    { name = "instanttensor", marker = "extra == 'instanttensor'", specifier = ">=0.1.5" },
-    { name = "lark", specifier = "==1.2.2" },
-    { name = "llguidance", marker = "platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'ppc64le' or platform_machine == 'x86_64'", specifier = ">=1.3.0,<1.4.0" },
-    { name = "lm-format-enforcer", specifier = "==0.11.3" },
-    { name = "matplotlib", marker = "extra == 'bench'" },
-    { name = "mcp" },
-    { name = "mistral-common", extras = ["audio"], marker = "extra == 'audio'" },
-    { name = "mistral-common", extras = ["image"], specifier = ">=1.11.0" },
-    { name = "model-hosting-container-standards", specifier = ">=0.1.13,<1.0.0" },
-    { name = "msgspec" },
-    { name = "ninja" },
-    { name = "numba", specifier = "==0.65.0" },
-    { name = "numpy" },
-    { name = "nvidia-cudnn-frontend", specifier = ">=1.13.0,<1.19.0" },
-    { name = "nvidia-cutlass-dsl", specifier = ">=4.4.2" },
-    { name = "openai", specifier = ">=2.0.0" },
-    { name = "openai-harmony", specifier = ">=0.0.3" },
-    { name = "opencv-python-headless", specifier = ">=4.13.0" },
-    { name = "opentelemetry-api", specifier = ">=1.27.0" },
-    { name = "opentelemetry-api", marker = "extra == 'otel'", specifier = ">=1.26.0" },
-    { name = "opentelemetry-exporter-otlp", specifier = ">=1.27.0" },
-    { name = "opentelemetry-exporter-otlp", marker = "extra == 'otel'", specifier = ">=1.26.0" },
-    { name = "opentelemetry-sdk", specifier = ">=1.27.0" },
-    { name = "opentelemetry-sdk", marker = "extra == 'otel'", specifier = ">=1.26.0" },
-    { name = "opentelemetry-semantic-conventions-ai", specifier = ">=0.4.1" },
-    { name = "opentelemetry-semantic-conventions-ai", marker = "extra == 'otel'", specifier = ">=0.4.1" },
-    { name = "outlines-core", specifier = "==0.2.14" },
-    { name = "pandas", marker = "extra == 'bench'" },
-    { name = "partial-json-parser" },
-    { name = "pillow" },
-    { name = "plotly", marker = "extra == 'bench'" },
-    { name = "prometheus-client", specifier = ">=0.18.0" },
-    { name = "prometheus-fastapi-instrumentator", specifier = ">=7.0.0" },
-    { name = "protobuf", specifier = ">=5.29.6,!=6.30.*,!=6.31.*,!=6.32.*,!=6.33.0.*,!=6.33.1.*,!=6.33.2.*,!=6.33.3.*,!=6.33.4.*" },
-    { name = "psutil" },
-    { name = "py-cpuinfo" },
-    { name = "pybase64" },
-    { name = "pydantic", specifier = ">=2.12.0" },
-    { name = "python-json-logger" },
-    { name = "pyyaml" },
-    { name = "pyzmq", specifier = ">=25.0.0" },
-    { name = "quack-kernels", specifier = ">=0.3.3" },
-    { name = "regex" },
-    { name = "requests", specifier = ">=2.26.0" },
-    { name = "runai-model-streamer", extras = ["azure", "gcs", "s3"], marker = "extra == 'runai'", specifier = ">=0.15.7" },
-    { name = "scipy", marker = "extra == 'audio'" },
-    { name = "scipy", marker = "extra == 'bench'" },
-    { name = "seaborn", marker = "extra == 'bench'" },
-    { name = "sentencepiece" },
-    { name = "setproctitle" },
-    { name = "setuptools", marker = "python_full_version >= '3.12'", specifier = ">=77.0.3,<81.0.0" },
-    { name = "six", marker = "python_full_version >= '3.12'", specifier = ">=1.16.0" },
-    { name = "smg-grpc-servicer", extras = ["vllm"], marker = "extra == 'grpc'", specifier = ">=0.5.2" },
-    { name = "soundfile", marker = "extra == 'audio'" },
-    { name = "tensorizer", marker = "extra == 'tensorizer'", specifier = "==2.10.1" },
-    { name = "tiktoken", specifier = ">=0.6.0" },
-    { name = "tilelang", specifier = "==0.1.9" },
-    { name = "tokenizers", specifier = ">=0.21.1" },
-    { name = "torch", specifier = "==2.11.0" },
-    { name = "torchaudio", specifier = "==2.11.0" },
-    { name = "torchvision", specifier = "==0.26.0" },
-    { name = "tqdm" },
-    { name = "transformers", specifier = ">=4.56.0,!=5.0.*,!=5.1.*,!=5.2.*,!=5.3.*,!=5.4.*,!=5.5.0" },
-    { name = "typing-extensions", specifier = ">=4.10" },
-    { name = "watchfiles" },
-    { name = "xgrammar", marker = "platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'ppc64le' or platform_machine == 's390x' or platform_machine == 'x86_64'", specifier = ">=0.1.32,<1.0.0" },
-    { name = "zentorch-weekly", marker = "extra == 'zen'", specifier = "==5.2.1.dev20260408" },
+    { name = "xgrammar", marker = "platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'ppc64le' or platform_machine == 's390x' or platform_machine == 'x86_64'", specifier = ">=0.2.0,<1.0.0" },
+    { name = "zentorch", marker = "extra == 'zen'", specifier = "==2.11.0.0" },
 ]
 provides-extras = ["zen", "bench", "tensorizer", "fastsafetensors", "instanttensor", "runai", "audio", "video", "flashinfer", "helion", "grpc", "otel"]
 
