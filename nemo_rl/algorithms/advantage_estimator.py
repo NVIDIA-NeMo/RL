@@ -18,7 +18,8 @@ This module provides different advantage estimation strategies:
 - GRPOAdvantageEstimator: Standard GRPO advantage with leave-one-out baseline
 - GDPOAdvantageEstimator: Multi-reward GDPO (per-component baselines, sum then normalize)
 - ReinforcePlusPlusAdvantageEstimator: Reinforce++ with optional baseline subtraction (minus_baseline) and KL penalty in reward
-- GAEAdvantageEstimator: Generalized Advantage Estimation (GAE) with temporal bootstrapping
+- RawRewardAdvantageEstimator: Raw reward as advantage with optional batch normalization (no baseline, no value model)
+- GeneralizedAdvantageEstimator: Generalized Advantage Estimation (GAE) with temporal bootstrapping
 Reference papers:
 - ProRLv2: https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/
 - Reinforce++: https://arxiv.org/abs/2501.03262
@@ -233,8 +234,8 @@ class RawRewardAdvantageEstimator:
     No value model, no baselines. Optionally normalizes across the batch.
     """
 
-    def __init__(self, estimator_config: dict, loss_config: dict):
-        self.normalize_advantages = estimator_config.get("normalize_advantages", True)
+    def __init__(self, estimator_config: dict, loss_config: ClippedPGLossConfig):
+        self.normalize_advantages = estimator_config["normalize_advantages"]
 
     def compute_advantage(self, prompt_ids, rewards, mask, **kwargs):
         """Compute advantages as raw rewards expanded to token-level shape.
@@ -286,15 +287,15 @@ class GeneralizedAdvantageEstimator:
         normalize_advantages: If True, normalize advantages globally across batch
     """
 
-    def __init__(self, estimator_config: dict, loss_config: dict):
+    def __init__(self, estimator_config: dict, loss_config: ClippedPGLossConfig):
         self.gae_lambda = estimator_config["gae_lambda"]
         self.gae_gamma = estimator_config["gae_gamma"]
         self.normalize_advantages = estimator_config["normalize_advantages"]
 
         # VAPO decoupled GAE: separate λ for value returns vs policy advantages.
         # None for both = standard GAE (use gae_lambda everywhere, no decoupling).
-        self.gae_lambda_value = estimator_config.get("gae_lambda_value", None)
-        self.gae_lambda_policy = estimator_config.get("gae_lambda_policy", None)
+        self.gae_lambda_value = estimator_config["gae_lambda_value"]
+        self.gae_lambda_policy = estimator_config["gae_lambda_policy"]
         # Length-adaptive λ_policy = 1 - 1/(α·l). 0 = disabled (use fixed λ).
         self.length_adaptive_alpha = estimator_config["length_adaptive_alpha"]
 
