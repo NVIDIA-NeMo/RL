@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
-import ray
 import torch
 from pydantic import BaseModel
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -167,9 +166,9 @@ class PPOLoggerConfig(LoggerConfig):
 
 class MasterConfig(BaseModel, extra="allow"):
     policy: PolicyConfig
-    value: Optional[ValueConfig] = None
+    value: ValueConfig
     loss_fn: ClippedPGLossConfig
-    value_loss_fn: Optional[MseValueLossConfig] = None
+    value_loss_fn: MseValueLossConfig
     env: dict[str, Any]
     data: DataConfig
     ppo: PPOConfig
@@ -234,9 +233,7 @@ def setup(
     # logic that the inference-path get_values already has). Reject up front
     # rather than crashing inside a Megatron forward.
     # Tracked at https://github.com/NVIDIA-NeMo/RL/issues/2687.
-    if value_config is not None and value_config.get("megatron_cfg", {}).get(
-        "enabled", False
-    ):
+    if value_config.get("megatron_cfg", {}).get("enabled", False):
         assert not value_config["sequence_packing"]["enabled"], (
             "Sequence packing is currently not supported for the Megatron PPO "
             "value model. See https://github.com/NVIDIA-NeMo/RL/issues/2687"
@@ -335,9 +332,6 @@ def setup(
     #        Loss Function
     # ==========================
     loss_fn = ClippedPGLossFn(loss_config)
-    assert master_config.value_loss_fn is not None, (
-        "PPO requires the `value_loss_fn:` config block to construct the MSE value loss."
-    )
     value_loss_fn = MseValueLossFn(master_config.value_loss_fn)
 
     # Validate force_on_policy_ratio
@@ -362,12 +356,6 @@ def setup(
         "with the policy worker). Set policy.generation.colocated.enabled=true. "
         "Non-colocated PPO is not yet supported."
     )
-    assert value_config is not None, (
-        "PPO requires a `value:` config block (actor-critic with value model)."
-    )
-    assert master_config.value_loss_fn is not None, (
-        "PPO requires a `value_loss_fn:` config block for the MSE value loss."
-    )
     reward_model_enabled = (
         "env_name" in data_config and data_config["env_name"] == "reward_model"
     )
@@ -390,120 +378,31 @@ def setup(
             f"policy_nodes:{policy_nodes} + rm_nodes:{rm_nodes} = total_nodes:{total_nodes}"
         )
 
-    if colocated_inference:
-        if total_nodes == 1:
-            policy_gpus_per_node = cluster_config["gpus_per_node"] - rm_gpus_per_node
-            assert policy_gpus_per_node > 0, (
-                "policy.generation.colocated.resources.gpus_per_node must be > 0 "
-                "when cluster.num_nodes = 1, "
-                f"but got {policy_gpus_per_node}."
-            )
-        else:
-            policy_gpus_per_node = cluster_config["gpus_per_node"]
-
-        cluster = RayVirtualCluster(
-            name="grpo_policy_cluster",
-            bundle_ct_per_node_list=[policy_gpus_per_node] * policy_nodes,
-            use_gpus=True,
-            num_gpus_per_node=policy_gpus_per_node,
-            max_colocated_worker_groups=1
-            if generation_config["backend"] == "megatron"
-            else 3,
+    if total_nodes == 1:
+        policy_gpus_per_node = cluster_config["gpus_per_node"] - rm_gpus_per_node
+        assert policy_gpus_per_node > 0, (
+            "policy.generation.colocated.resources.gpus_per_node must be > 0 "
+            "when cluster.num_nodes = 1, "
+            f"but got {policy_gpus_per_node}."
         )
-        train_cluster = cluster
-        inference_cluster = cluster
-        print(
-            f"  ✓ Ray cluster for policy initialized with {policy_nodes} nodes",
-            flush=True,
-        )
-
     else:
-        assert generation_config["backend"] != "megatron", (
-            "Non-colocated inference is not supported for Megatron generation backends. "
-            "Please use vLLM backend for generation."
-        )
+        policy_gpus_per_node = cluster_config["gpus_per_node"]
 
-        # train resources will be updated through overall and inference resources below
-        train_gpus_per_node = cluster_config["gpus_per_node"]
-        train_nodes = policy_nodes
-
-        inference_resources = generation_config["colocated"]["resources"]
-        inference_gpus_per_node = inference_resources["gpus_per_node"]
-        inference_nodes = inference_resources["num_nodes"]
-
-        # validate and configure resources
-        if policy_nodes == 1:
-            # When policy_nodes == 1, train and inference are on the same node
-            assert (
-                inference_gpus_per_node is not None and inference_gpus_per_node > 0
-            ), (
-                "policy.generation.colocated.resources.gpus_per_node must be explicitly set to a value > 0 "
-                "when policy_nodes = 1 and inference is non-colocated, "
-                f"but got {inference_gpus_per_node}."
-            )
-            assert inference_nodes is None or inference_nodes == 1, (
-                "policy.generation.colocated.resources.num_nodes must be 1 or set to null "
-                "when policy_nodes = 1 and inference is non-colocated, "
-                f"but got {inference_nodes}."
-            )
-
-            inference_nodes = 1
-            # If total_nodes == 1, reward model is also on the same node; otherwise it's on a different node
-            reward_gpus_to_subtract = (
-                rm_gpus_per_node if total_nodes == 1 and reward_model_enabled else 0
-            )
-            train_gpus_per_node -= inference_gpus_per_node + reward_gpus_to_subtract
-            assert train_gpus_per_node > 0, (
-                "No enough GPUs for training, "
-                f"train_gpus_per_node:{train_gpus_per_node} = cluster_config['gpus_per_node']:{cluster_config['gpus_per_node']} - inference_gpus_per_node:{inference_gpus_per_node}"
-                + (
-                    f" - rm_gpus_per_node:{rm_gpus_per_node}"
-                    if total_nodes == 1 and reward_model_enabled
-                    else ""
-                )
-            )
-        else:
-            # train, inference, and reward model are all on different nodes
-            assert inference_nodes > 0, (
-                "policy.generation.colocated.resources.num_nodes must be > 0 "
-                "when cluster.num_nodes > 1 and inference is non-colocated, "
-                f"but got {inference_nodes}."
-            )
-            assert (
-                inference_gpus_per_node is not None
-                and inference_gpus_per_node == cluster_config["gpus_per_node"]
-            ), (
-                "policy.generation.colocated.resources.gpus_per_node must be explicitly set and equal to cluster.gpus_per_node "
-                "when cluster.num_nodes > 1 and inference is non-colocated, "
-                f"but got inference_gpus_per_node={inference_gpus_per_node}, cluster.gpus_per_node={cluster_config['gpus_per_node']}."
-            )
-            train_nodes -= inference_nodes
-
-        # initialize train cluster
-        train_cluster = RayVirtualCluster(
-            name="grpo_train_cluster",
-            bundle_ct_per_node_list=[train_gpus_per_node] * train_nodes,
-            use_gpus=True,
-            num_gpus_per_node=train_gpus_per_node,
-            max_colocated_worker_groups=1,
-        )
-        print(
-            f"  ✓ Ray train cluster initialized with {train_nodes} nodes with {train_gpus_per_node} GPUs per node",
-            flush=True,
-        )
-
-        # initialize inference cluster
-        inference_cluster = RayVirtualCluster(
-            name="grpo_inference_cluster",
-            bundle_ct_per_node_list=[inference_gpus_per_node] * inference_nodes,
-            use_gpus=True,
-            num_gpus_per_node=inference_gpus_per_node,
-            max_colocated_worker_groups=1,
-        )
-        print(
-            f"  ✓ Ray inference cluster initialized with {inference_nodes} nodes with {inference_gpus_per_node} GPUs per node",
-            flush=True,
-        )
+    cluster = RayVirtualCluster(
+        name="grpo_policy_cluster",
+        bundle_ct_per_node_list=[policy_gpus_per_node] * policy_nodes,
+        use_gpus=True,
+        num_gpus_per_node=policy_gpus_per_node,
+        max_colocated_worker_groups=1
+        if generation_config["backend"] == "megatron"
+        else 3,
+    )
+    train_cluster = cluster
+    inference_cluster = cluster
+    print(
+        f"  ✓ Ray cluster for policy initialized with {policy_nodes} nodes",
+        flush=True,
+    )
 
     # ==========================
     #   Training and Inference
@@ -553,9 +452,7 @@ def setup(
         )
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
-    if value_config is not None and value_config.get("megatron_cfg", {}).get(
-        "enabled", False
-    ):
+    if value_config.get("megatron_cfg", {}).get("enabled", False):
         total_train_iters = (
             min(
                 ppo_config.get("max_num_steps", 10**9),
@@ -637,7 +534,6 @@ def setup(
         init_generation_fn,
         generation_name: str,
         init_time_key: str,
-        colocated_inference: bool,
         worker_init_timing_metrics: dict,
     ):
         """Generic function to initialize a generation engine (vLLM or SGLang) along with policy.
@@ -646,7 +542,6 @@ def setup(
             init_generation_fn: Function that initializes the generation engine (init_vllm or init_sglang)
             generation_name: Name of the generation engine ("vLLM" or "SGLang")
             init_time_key: Key name for storing initialization time in metrics ("vllm_init_time_s" or "sglang_init_time_s")
-            colocated_inference: Whether inference is colocated with training
             worker_init_timing_metrics: Dictionary to store timing metrics
 
         Returns:
@@ -716,7 +611,6 @@ def setup(
             init_generation_fn=init_vllm,
             generation_name="vLLM",
             init_time_key="vllm_init_time_s",
-            colocated_inference=colocated_inference,
             worker_init_timing_metrics=worker_init_timing_metrics,
         )
 
@@ -736,7 +630,6 @@ def setup(
             init_generation_fn=init_sglang,
             generation_name="SGLang",
             init_time_key="sglang_init_time_s",
-            colocated_inference=colocated_inference,
             worker_init_timing_metrics=worker_init_timing_metrics,
         )
 
@@ -750,26 +643,6 @@ def setup(
 
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
-
-    # if it is not colocated inference, initialize collective communication for update weights
-    if not colocated_inference:
-        t0 = time.perf_counter()
-        ip, port = train_cluster.get_master_address_and_port()
-        print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
-        # world includes all training workers and all inference workers
-        train_world_size = train_cluster.world_size()
-        inference_world_size = inference_nodes * inference_gpus_per_node
-        world_size = train_world_size + inference_world_size
-        # init collective
-        futures_train = policy.init_collective(
-            ip, port, world_size, train_world_size=train_world_size
-        )
-        futures_inference = policy_generation.init_collective(
-            ip, port, world_size, train_world_size=train_world_size
-        )  # type: ignore
-        # wait for all futures to complete
-        ray.get(futures_train + futures_inference)
-        worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
 
     # Reload policy weights to GPU before refit (they may have been offloaded
     # during setup to free GPU for value model initialization).

@@ -27,9 +27,6 @@ policy:
     name: Qwen/Qwen2.5-1.5B-Instruct
   train_global_batch_size: 256
   max_total_sequence_length: 1024
-  # With TP=2 + CP=2 + SP, _get_pack_sequence_parameters_for_megatron requires
-  # individual sequences padded to a multiple of cp_size * 2 * tp_size = 8.
-  # Base default (= TP = 2) fails the assertion at megatron/data.py:565.
   make_sequence_length_divisible_by: 8
   generation:
     max_new_tokens: 512
@@ -37,7 +34,6 @@ policy:
       max_model_len: 1024
       gpu_memory_utilization: 0.4
   megatron_cfg:
-    # Exercise TP + SP + CP code paths (1n8g: TP=2 × CP=2 × DP=2 = 8)
     tensor_model_parallel_size: 2
     context_parallel_size: 2
     sequence_parallel: true

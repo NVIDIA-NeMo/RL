@@ -31,9 +31,6 @@ policy:
   train_micro_batch_size: 1
   logprob_batch_size: 1
   max_total_sequence_length: 10240
-  # With TP=4 + CP=2 + SP, _get_pack_sequence_parameters_for_megatron requires
-  # individual sequences padded to a multiple of cp_size * 2 * tp_size = 16.
-  # Base default (= TP = 4) fails the assertion at megatron/data.py:565.
   make_sequence_length_divisible_by: 16
   generation:
     max_new_tokens: 8192
@@ -41,7 +38,6 @@ policy:
       max_model_len: 10240
       gpu_memory_utilization: 0.65
   megatron_cfg:
-    # Exercise TP + SP + CP code paths (8n8g = 64 GPUs: TP=4 × CP=2 × DP=8 = 64)
     tensor_model_parallel_size: 4
     context_parallel_size: 2
     sequence_parallel: true
