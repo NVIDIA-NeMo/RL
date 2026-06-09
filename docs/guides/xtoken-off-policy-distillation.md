@@ -209,9 +209,9 @@ Other relevant fields:
 - `loss_fn.uncommon_topk` — cap on the L1 uncommon-tail sort in the gold path (defaults to 8192).
 - `loss_fn.reverse_kl` — compute `KL(student || teacher)` instead of `KL(teacher || student)`.
 
-## Results — 100-step P-KL smoke run
+## Results — 100-step P-KL run
 
-A short P-KL run (Llama-3.2-1B student ← Qwen3-4B teacher, default config:
+A P-KL run (Llama-3.2-1B student ← Qwen3-4B teacher, default config:
 global batch 96, micro-batch 1, sequence length 2048, 100 steps, 2 nodes)
 shows the distillation objective converging and the student tracking the
 teacher more closely over training:
@@ -239,9 +239,6 @@ The full-vocab teacher logits never cross the network: the producer publishes
 a single rank-level `[B_r, T_t, V_t]` bf16 tray and hands the student a CUDA
 IPC handle to it (same node), so the per-step transport cost is the ≈0.6 GB
 tray allocation rather than a host round-trip.
-
-A downstream task evaluation (distilled student vs. base student) needs a
-longer run than this smoke test and is tracked separately.
 
 ## Where files live
 
