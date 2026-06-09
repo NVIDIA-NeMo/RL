@@ -1180,13 +1180,13 @@ def run_async_nemo_gym_rollout(
     lengths3 = [[],[],[]]
     if master_config and 'effort_levels' in master_config:
         low_weight = 0.
-        low_penlty = 1.
+        low_penalty = 1.
         low_ub     = 64000
         low_string = ""
         if 'low_weight' in master_config['effort_levels']:
             low_weight = master_config['effort_levels']['low_weight']
-        if 'low_penlty' in master_config['effort_levels']:
-            low_penlty = master_config['effort_levels']['low_penalty']
+        if 'low_penalty' in master_config['effort_levels']:
+            low_penalty = master_config['effort_levels']['low_penalty']
         if 'low_ub' in master_config['effort_levels']:
             low_ub = master_config['effort_levels']['low_ub']
         if 'low_string' in master_config['effort_levels']:
@@ -1202,7 +1202,7 @@ def run_async_nemo_gym_rollout(
                         break
                 if low_string in prompt:
                     len_reward = min(1.,low_weight * (1. - lengths[i]/low_ub))
-                    new_r = orig_rewards[i] + orig_rewards[i] * max(len_reward,0.) + low_penlty * min(len_reward,0.)
+                    new_r = orig_rewards[i] + orig_rewards[i] * max(len_reward,0.) + low_penalty * min(len_reward,0.)
                     results[i]["full_result"]["reward"] = new_r
                     len_reward_low.append(len_reward)
                     reward_low.append(new_r)
