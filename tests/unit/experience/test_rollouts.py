@@ -358,10 +358,7 @@ def multi_step_setup_vllm_async(
         print("VllmGeneration cleanup finished (async engine, Multi-Step Calc Test).")
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.device_count() < 1,
-    reason="VLLM test requires at least 1 GPU",
-)
+@pytest.mark.vllm
 def test_run_multi_step_calculator_vllm_sync(multi_step_setup_vllm_sync):
     """Tests multi-step calculator rollout with VllmGeneration using sync generation and sync rollout."""
     vllm_generation, rollout_tokenizer, task_to_env, initial_batch, rollout_cluster = (
@@ -442,10 +439,7 @@ def test_run_multi_step_calculator_vllm_sync(multi_step_setup_vllm_sync):
     print("\nSync Multi-Step Calculator VLLM Test assertions passed for all samples.")
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.device_count() < 1,
-    reason="VLLM test requires at least 1 GPU",
-)
+@pytest.mark.vllm
 def test_run_multi_step_calculator_vllm_async(multi_step_setup_vllm_async):
     """Tests multi-step calculator rollout with VllmGeneration using async generation and async rollout."""
     vllm_generation, rollout_tokenizer, task_to_env, initial_batch, rollout_cluster = (
@@ -528,10 +522,7 @@ def test_run_multi_step_calculator_vllm_async(multi_step_setup_vllm_async):
     print("\nAsync Multi-Step Calculator VLLM Test assertions passed for all samples.")
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.device_count() < 1,
-    reason="VLLM test requires at least 1 GPU",
-)
+@pytest.mark.vllm
 def test_max_seqlen_respected_sync(multi_step_setup_vllm_sync):
     """Tests multi-step calculator rollout with VllmGeneration (sync)."""
     vllm_generation, rollout_tokenizer, task_to_env, initial_batch, rollout_cluster = (
@@ -567,10 +558,7 @@ def test_max_seqlen_respected_sync(multi_step_setup_vllm_sync):
     )
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.device_count() < 1,
-    reason="VLLM test requires at least 1 GPU",
-)
+@pytest.mark.vllm
 def test_max_seqlen_respected_async(multi_step_setup_vllm_async):
     """Tests multi-step calculator rollout with VllmGeneration (async)."""
     vllm_generation, rollout_tokenizer, task_to_env, initial_batch, rollout_cluster = (
@@ -735,10 +723,7 @@ def sliding_puzzle_setup_vllm(
         print("VllmGeneration cleanup finished (Sliding Puzzle Test).")
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.device_count() < 1,
-    reason="VLLM test requires at least 1 GPU",
-)
+@pytest.mark.vllm
 def test_run_sliding_puzzle_vllm(sliding_puzzle_setup_vllm):
     """Tests sliding puzzle rollout with VllmGeneration."""
     vllm_generation, rollout_tokenizer, task_to_env, initial_batch, rollout_cluster = (
@@ -1037,6 +1022,7 @@ def single_multi_step_calculator_input_sample(rollout_tokenizer):
     }
 
 
+@pytest.mark.vllm
 def test_async_rollout_manager(
     multi_step_setup_vllm_async,
     single_multi_step_calculator_input_sample,
@@ -1101,6 +1087,7 @@ def test_async_rollout_manager(
     assert record.completions[0].message_log is not record.completions[1].message_log
 
 
+@pytest.mark.vllm
 def test_async_rollout_manager_truncation(
     multi_step_setup_vllm_async,
     single_multi_step_calculator_input_sample,
@@ -1130,6 +1117,7 @@ def test_async_rollout_manager_truncation(
     assert record.rollout_metrics["natural_termination_rate"] == 0.0
 
 
+@pytest.mark.vllm
 def test_async_rollout_manager_matches_original(
     multi_step_setup_vllm_async,
     single_multi_step_calculator_input_sample,
