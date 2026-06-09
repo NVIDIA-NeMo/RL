@@ -14,6 +14,7 @@
 import gc
 import os
 import re
+import time
 import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -360,6 +361,9 @@ class MegatronPolicyWorkerImpl(
             # Ensure model is in training mode
             self.model.train()
 
+        torch.cuda.synchronize()
+        _train_t0 = time.perf_counter()
+
         with ctx:
             all_mb_metrics = []
             losses = []
@@ -492,6 +496,9 @@ class MegatronPolicyWorkerImpl(
                 all_mb_metrics.extend(gb_loss_metrics)
                 losses.append(torch.tensor(mb_losses).sum().item())
 
+        torch.cuda.synchronize()
+        metrics_train_elapsed = time.perf_counter() - _train_t0
+
         if not eval_mode:
             # take one LR step every rollout batch
             # we need to scale the step by gbs to counteract the fact that NeMo automatically
@@ -512,6 +519,7 @@ class MegatronPolicyWorkerImpl(
             "model_dtype": self.dtype,
             "all_mb_metrics": mb_metrics,
             "grad_norm": torch.tensor([grad_norm]),
+            "train_elapsed_seconds": metrics_train_elapsed,
         }
         # Read "config" via getattr-by-string so the token stays out of
         # train.__code__.co_names; with torch 2.11 cloudpickle otherwise
@@ -526,6 +534,29 @@ class MegatronPolicyWorkerImpl(
             )
             if moe_metrics:
                 metrics["moe_metrics"] = moe_metrics
+
+        try:
+            from megatron.bridge.training.utils import flop_utils as _mb_flop_utils
+
+            # cfg.model.seq_length is set from max_position_embeddings (model max context)
+            # via CONFIG_MAPPING, not from max_total_sequence_length. Override it with the
+            # actual training sequence length so FLOPs are not inflated.
+            _orig_seq = self.mcore_state.cfg.model.seq_length
+            self.mcore_state.cfg.model.seq_length = self.cfg[
+                "max_total_sequence_length"
+            ]
+            try:
+                flops_per_sample = _mb_flop_utils.num_floating_point_operations(
+                    self.mcore_state.cfg, batch_size=1
+                )
+            finally:
+                self.mcore_state.cfg.model.seq_length = _orig_seq
+
+            metrics["total_flops"] = flops_per_sample * gbs * num_global_batches
+            metrics["num_ranks"] = torch.distributed.get_world_size()
+        except Exception as e:
+            warnings.warn(f"Failed to compute FLOPs for MFU reporting: {e}")
+
         return metrics
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs")

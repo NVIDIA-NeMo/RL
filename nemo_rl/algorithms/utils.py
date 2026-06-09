@@ -792,9 +792,13 @@ def print_performance_metrics(
     # =====================================================
 
     if "total_flops" in train_results:
-        total_tflops = (
-            train_results["total_flops"] / timing_metrics["policy_training"] / 1e12
+        # Prefer the CUDA-synchronized elapsed time recorded inside the Megatron worker
+        # over the driver-side policy_training timer, which returns as soon as the Ray
+        # future is submitted and can be much shorter than actual GPU compute time.
+        flops_elapsed = train_results.get(
+            "train_elapsed_seconds", timing_metrics["policy_training"]
         )
+        total_tflops = train_results["total_flops"] / flops_elapsed / 1e12
         num_ranks = train_results["num_ranks"]
         print(
             f"  • Training FLOPS: {total_tflops:.2f} TFLOPS ({total_tflops / num_ranks:.2f} TFLOPS per rank)",

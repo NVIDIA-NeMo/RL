@@ -672,6 +672,23 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 )
             except Exception as e:
                 warnings.warn(f"Error getting theoretical flops: {e}")
+        elif results and "total_flops" in results[0]:
+            aggregated_results["total_flops"] = results[0]["total_flops"]
+            aggregated_results["num_ranks"] = results[0].get(
+                "num_ranks", self.worker_group.cluster.world_size()
+            )
+            if "train_elapsed_seconds" in results[0]:
+                aggregated_results["train_elapsed_seconds"] = results[0][
+                    "train_elapsed_seconds"
+                ]
+            try:
+                aggregated_results["theoretical_tflops"] = aggregated_results[
+                    "num_ranks"
+                ] * get_theoretical_tflops(
+                    results[0]["gpu_name"], results[0]["model_dtype"]
+                )
+            except Exception as e:
+                warnings.warn(f"Error getting theoretical flops: {e}")
 
         # Aggregate metrics across all workers
         all_mb_metrics = defaultdict(list)
