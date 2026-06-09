@@ -269,8 +269,9 @@ class TestProcessMicrobatch:
 
         assert "input_lengths not found in data_dict" in str(exc_info.value)
 
+    @patch("nemo_rl.models.megatron.data._pack_sequences_for_megatron")
     @patch("nemo_rl.models.megatron.data._prepare_vlm_batch_for_megatron")
-    def test_process_microbatch_delegate_pack_to_model(self, mock_prepare):
+    def test_process_microbatch_delegate_pack_to_model(self, mock_prepare, mock_pack):
         """Test that delegate_pack_to_model routes packing to the VLM helper.
 
         When the model self-packs (mbridge VLM wrappers), process_microbatch must
@@ -312,8 +313,10 @@ class TestProcessMicrobatch:
             straggler_timer=MagicMock(),
         )
 
-        # VLM helper was used, not _pack_sequences_for_megatron
+        # VLM helper was used, and the classic packer was NOT invoked (guards
+        # against a regression silently routing to _pack_sequences_for_megatron).
         mock_prepare.assert_called_once()
+        mock_pack.assert_not_called()
         # pad_full_seq_to must be forwarded to the helper
         assert mock_prepare.call_args[1]["pad_full_seq_to"] == 8
 

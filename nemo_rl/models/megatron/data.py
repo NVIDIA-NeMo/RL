@@ -390,7 +390,7 @@ def _prepare_vlm_batch_for_megatron(
     torch.Tensor,
     torch.Tensor,
     PackedSeqParams,
-    torch.Tensor,
+    Optional[torch.Tensor],
     torch.Tensor,
 ]:
     """Prepare a [B, max_seq] batch for a model that does its own packing + CP sharding.
