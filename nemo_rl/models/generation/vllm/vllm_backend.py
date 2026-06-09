@@ -472,6 +472,22 @@ class VllmInternalWorkerExtension:
     )
     def update_weights_from_collective(self) -> bool:
         """Update the model weights from collective communication."""
+        # RL-412 elastic re-init: this worker may not be in the current
+        # cross-cluster comm. A freshly added shard is appended to the gen
+        # worker group (so the broadcast dispatch targets it) BEFORE the
+        # trainer has grown the comm to include it — during that "debounce"
+        # window the trainer broadcasts on the existing comm, which this
+        # worker never joined (``model_update_group is None``). Skip the
+        # receive: there is nothing to recv, and erroring/blocking here would
+        # break the whole refit. The shard stays ``joining`` (router does NOT
+        # promote a not-in-comm shard) until a later grow re-init pulls it in.
+        if getattr(self, "model_update_group", None) is None:
+            print(
+                "[vllm_backend.update_weights_from_collective] no comm "
+                "(not in current model_update_group); skipping broadcast recv",
+                flush=True,
+            )
+            return True
         assert self.state_dict_info is not None, (
             "state_dict_info is not prepared. "
             "Please call prepare_refit_info when initializing the worker."

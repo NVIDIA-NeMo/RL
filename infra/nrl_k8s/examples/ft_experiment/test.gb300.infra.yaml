@@ -295,15 +295,24 @@ launch:
     # — gates the diagnostic prints in megatron_policy_worker /
     # refit_worker / packed_broadcast_consumer.
     export NRL_REFIT_PACKED_DEBUG=1
+    # RL-412 elastic re-init: fresh backfill shards land on new nodes with
+    # COLD cross-cluster RoCE routes; their first TCPStore rendezvous to the
+    # train master takes 60-90s (see stateless_process_group.py). The default
+    # 30s window killed the RefitWorker before they could join (DistStoreError
+    # "5/9 clients joined"). Give the rendezvous 90s so the gen-side 90s
+    # per-worker classifier can either land them or cleanly evict + retry.
+    export NRL_RENDEZVOUS_TIMEOUT_S=90
     TIMESTAMP=$(date -u +%Y%m%d-%H%M%S-%N)
     LOG_DIR=/mnt/rl-workspace/${user:}/driver_logs
     LOG=\${LOG_DIR}/${user:}-raycluster-train-ft-experiment-test-\${TIMESTAMP}.log
     mkdir -p "\${LOG_DIR}"
 
-    python -u examples/run_grpo.py \
+    # stdbuf -oL: line-buffer the pipe to tee so the Lustre log flushes in
+    # real time (block buffering otherwise delayed the file by minutes).
+    stdbuf -oL -eL python -u examples/run_grpo.py \
       --config infra/nrl_k8s/examples/ft_experiment/test_recipe.yaml \
       +policy.generation.remote_generation_url=http://${user:}-raycluster-gen-ft-experiment-test-head-svc.default.svc.cluster.local:8089 \
-      2>&1 | tee "\${LOG}"
+      2>&1 | stdbuf -oL -eL tee "\${LOG}"
 
 kuberay:
   # ---------------------------------------------------------------------
@@ -439,9 +448,12 @@ kuberay:
       disagg.nemo-rl/run: ft-experiment-test
       kai.scheduler/queue: backfill
     daemon:
-      # Bumped v7→v8: new daemon code (router auto-backfill reconciler) + the
-      # gen-daemon stdout tee to Lustre. KubeRay won't resubmit an existing
-      # submissionId, so this bump is required for the new entrypoint to take effect.
+      # Keep this submissionId STABLE: ``nrl-k8s run --replace`` stops the
+      # currently-running daemon by matching this base id, then resubmits with
+      # a fresh timestamp suffix (which already forces the new entrypoint/code
+      # to take effect). Bumping the base (e.g. v8→v9) breaks --replace's stop
+      # step — it can't find the old base to stop, so the old daemon lingers
+      # holding all the GPU placement groups and the new daemon PG-times-out.
       submissionId: ft-experiment-test-gen-server-v8
       # Code is at /opt/nemo-rl (mounted from Lustre); no upload needed.
       entrypoint: |
@@ -452,6 +464,10 @@ kuberay:
         # the VllmAsyncGenerationWorker actor; without this flag Ray errors on
         # the runtime_env merge between the daemon Job and the worker actor.
         export RAY_OVERRIDE_JOB_RUNTIME_ENV=1
+        # Match the train side: 90s rendezvous window so a freshly added
+        # backfill shard (cold cross-cluster RoCE route, 60-90s first connect)
+        # can complete init_collective instead of timing out at 30s.
+        export NRL_RENDEZVOUS_TIMEOUT_S=90
         pip install kubernetes -q || true
         # Persist the gen-daemon stdout (router [FAULT-EVENT]/[RECOVERY-*]/
         # [VLLM-THROUGHPUT] + auto-backfill telemetry) to Lustre, mirroring the
@@ -461,10 +477,12 @@ kuberay:
         GEN_LOG_DIR=/mnt/rl-workspace/${user:}/driver_logs
         GEN_LOG=\${GEN_LOG_DIR}/gen-daemon-ft-experiment-test-\${GEN_TS}.log
         mkdir -p "\${GEN_LOG_DIR}"
-        python -u examples/run_standalone_generation_server.py \
+        # stdbuf -oL: line-buffer the pipe to tee so the Lustre log flushes in
+        # real time instead of in multi-minute blocks.
+        stdbuf -oL -eL python -u examples/run_standalone_generation_server.py \
           --config infra/nrl_k8s/examples/ft_experiment/test_gen_server.yaml \
           --port 8089 --num-gpus 8 \
-          2>&1 | tee "\${GEN_LOG}"
+          2>&1 | stdbuf -oL -eL tee "\${GEN_LOG}"
     spec:
       rayVersion: "2.54.0"
       enableInTreeAutoscaling: true

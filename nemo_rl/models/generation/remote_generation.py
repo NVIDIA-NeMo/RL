@@ -82,6 +82,136 @@ def _http_call_blocking(url: str, json_body: dict | None = None, raw_body: bytes
     return body
 
 
+def _should_respawn_refit_worker(exc: BaseException) -> bool:
+    """Decide whether a failed rendezvous requires KILLING + respawning the
+    RefitWorker (its context is dead or NCCL-poisoned) vs REUSING it.
+
+    Reuse is safe ONLY for a clean *pre-NCCL* rendezvous failure: a TCPStore
+    timeout (``DistStoreError`` / ``DistNetworkError``) means a gen peer never
+    checked in, so no NCCL communicator was ever created and the RefitWorker's
+    CUDA/NCCL context is untouched → reuse (avoids the kill/respawn storm that
+    destabilized Megatron rank-0).
+
+    Everything else — an ``NCCLError`` (the NCCL bootstrap partially ran and
+    left the comm/context poisoned, so reusing it fails forever with NCCLError),
+    a dead/unavailable actor (``RayActorError``), or any unknown error — means
+    we must respawn to get a clean context. Conservative by design: when in
+    doubt, respawn (a respawn always clears poison; the gen side evicts the
+    broken peer in parallel, so respawns stay rare — only on genuine poison,
+    not on every timeout)."""
+    # A dead/unavailable actor → respawn. Check first (also avoids calling
+    # ``str()`` on a malformed RayActorError in the fallback below).
+    try:
+        from ray.exceptions import RayActorError
+
+        if isinstance(exc, RayActorError):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from torch.distributed import DistNetworkError, DistStoreError
+
+        # Ray surfaces an actor-method exception as ``RayTaskError(<Original>)``
+        # whose class dual-inherits the original type, so isinstance sees through
+        # the wrap for a clean TCPStore timeout.
+        if isinstance(exc, (DistStoreError, DistNetworkError)):
+            return False
+    except Exception:  # noqa: BLE001 — torch symbol moved/renamed: fall through
+        pass
+    # Robustness fallback: the original class name is carried in the type name /
+    # message even when isinstance-through-wrap doesn't hold on some versions.
+    try:
+        blob = f"{type(exc).__name__}: {exc}"
+    except Exception:  # noqa: BLE001 — can't introspect → respawn (conservative)
+        return True
+    if "DistStoreError" in blob or "DistNetworkError" in blob:
+        return False
+    return True
+
+
+def _parse_gen_world(
+    payload: dict,
+) -> Optional[tuple[int, int, float, int, bool]]:
+    """Parse a /current_gen_world_size body into
+    (alive, joinable, stable_s, epoch, reinit_in_progress).
+
+    Back-compat: an older gen server returns only ``world_size``. We then set
+    joinable == alive, stable == +inf, epoch == 0, reinit == False, which makes
+    the trainer treat the world as always-settled with no comm invalidation —
+    exactly today's "world-size changed → re-init" behavior. Returns None when
+    ``world_size`` is absent (caller skips dynamic re-sync entirely)."""
+    try:
+        alive = int(payload["world_size"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    joinable = int(payload.get("joinable_world_size", alive))
+    stable = float(payload.get("joinable_stable_for_s", float("inf")))
+    epoch = int(payload.get("comm_epoch", 0))
+    reinit = bool(payload.get("nccl_reinit_in_progress", False))
+    return alive, joinable, stable, epoch, reinit
+
+
+def decide_collective_sync(
+    *,
+    alive_gen_ws: int,
+    joinable_gen_ws: int,
+    stable_for_s: float,
+    effective_train_ws: int,
+    last_synced_ws: Optional[int],
+    refit_worker_alive: bool,
+    rejoin_debounce_s: float,
+    comm_epoch: int = 0,
+    last_synced_epoch: int = 0,
+) -> tuple[str, int]:
+    """Decide how this refit should treat the cross-cluster comm.
+
+    Returns ``(action, target_ws)`` where action is:
+      - ``"reuse"``    : world unchanged + comm alive → broadcast on the live
+                          comm (steady state).
+      - ``"debounce"`` : the world GREW but the joinable set has not settled →
+                          broadcast on the existing comm this refit; the new
+                          shard stays ``joining`` and is re-checked next refit.
+      - ``"reinit"``   : rendezvous a fresh comm at ``target_ws`` now.
+
+    ``target_ws`` is ``effective_train_ws + joinable_gen_ws`` — the FROZEN
+    cohort the router rendezvouses (the gen side dispatches ``init_collective``
+    to exactly the joinable workers). Cold/booting backfills are excluded from
+    the cohort entirely, so a too-early rendezvous can't include a peer that
+    can't yet complete the handshake (the "7/9 clients joined" failure).
+
+    Policy: shrink (target < last) re-inits immediately (the old comm is
+    broken — don't wait ~3 min for replacements). Grow (target > last) re-inits
+    only once the joinable set == the dispatch set AND has been stable for
+    ``rejoin_debounce_s``. First sync (last is None) or a dead producer forces
+    a re-init. This function is the single decision point, which (with the
+    caller updating ``_last_synced_world_size`` only on a successful re-init)
+    gives the single-initiator / no-double-reinit guarantee.
+
+    ``comm_epoch`` (from the router) bumps whenever an in-comm shard was
+    removed/evicted, so the last-synced group is wedged. If it changed since
+    our last sync we re-init PROACTIVELY — even when the shard count is
+    unchanged (backfill restored it) — instead of reusing a dead group and
+    eating a failed broadcast first."""
+    # Rendezvous the frozen JOINABLE cohort (not the raw alive set): cold
+    # backfills are excluded until warm, so they never sabotage the handshake.
+    target_ws = effective_train_ws + joinable_gen_ws
+    if last_synced_ws is None or not refit_worker_alive:
+        return "reinit", target_ws
+    if comm_epoch != last_synced_epoch:
+        # A comm member was removed/evicted since our last sync → the live
+        # group is missing a peer (wedged). Rebuild now, don't reuse.
+        return "reinit", target_ws
+    if target_ws == last_synced_ws:
+        return "reuse", target_ws
+    if target_ws < last_synced_ws:
+        return "reinit", target_ws  # SHRINK — eager
+    # GROW: a replacement became joinable. Debounce so a batch that warms up
+    # close together coalesces into one re-init; a replica that warms after
+    # this boundary simply joins the next one.
+    settled = stable_for_s >= rejoin_debounce_s
+    return ("reinit" if settled else "debounce"), target_ws
+
+
 class RemoteGeneration(GenerationInterface):
     """GenerationInterface wrapper that supports direct delegation or HTTP-only mode."""
 
@@ -204,6 +334,76 @@ class RemoteGeneration(GenerationInterface):
         except (requests.RequestException, KeyError, ValueError):
             return None
 
+    def _fetch_gen_world(
+        self,
+    ) -> Optional[tuple[int, int, float, int, bool]]:
+        """Read /current_gen_world_size → (alive, joinable, stable_s, epoch, reinit).
+
+        ``alive`` is the live dispatch set the trainer rendezvouses at;
+        ``joinable`` is the health-responsive+warm subset; ``stable_s`` is how
+        long that subset has held; ``epoch`` bumps when an in-comm shard was
+        removed/evicted (the live group is wedged); ``reinit`` is the router's
+        ``nccl_reinit_in_progress`` (a lifecycle op is mid-flight). Returns None
+        when the endpoint is unavailable (older gen server) — caller skips."""
+        try:
+            resp = requests.get(
+                f"{self.server_url}/current_gen_world_size", timeout=10
+            )
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            return _parse_gen_world(resp.json())
+        except (requests.RequestException, ValueError):
+            return None
+
+    def _quiesce_wait(self) -> None:
+        """Block until the gen world has SETTLED, bounded by a max wait.
+
+        Replaces the blind exponential backoff between rendezvous retries: each
+        retry should fire only when the gen world is stable + warm, so it lands
+        cleanly instead of re-failing on a still-churning world (which would
+        drive another RefitWorker kill/respawn). Settled := the joinable count
+        (the cohort we rendezvous) has held for >= COLLECTIVE_SYNC_QUIESCE_S, no
+        lifecycle op is in flight (``nccl_reinit_in_progress`` false), and the
+        joinable count is stable across two reads. Bounded by COLLECTIVE_SYNC_QUIESCE_MAX_WAIT_S
+        — on timeout we proceed anyway (the rendezvous itself is still bounded by
+        NRL_RENDEZVOUS_TIMEOUT_S). Returns immediately against an older gen
+        server (no dynamic world)."""
+        from nemo_rl.models.generation.ft_constants import (
+            COLLECTIVE_SYNC_QUIESCE_MAX_WAIT_S,
+            COLLECTIVE_SYNC_QUIESCE_POLL_S,
+            COLLECTIVE_SYNC_QUIESCE_S,
+        )
+
+        deadline = time.monotonic() + COLLECTIVE_SYNC_QUIESCE_MAX_WAIT_S
+        prev_joinable: Optional[int] = None
+        while time.monotonic() < deadline:
+            gw = self._fetch_gen_world()
+            if gw is None:
+                return  # older server / transport error: nothing to quiesce on
+            _alive, joinable, stable_s, _epoch, reinit = gw
+            # Settled := the JOINABLE cohort (what we rendezvous) has held for
+            # >= QUIESCE_S, no lifecycle op is in flight, and the joinable count
+            # is stable across two consecutive reads.
+            settled = (
+                stable_s >= COLLECTIVE_SYNC_QUIESCE_S
+                and not reinit
+                and prev_joinable == joinable
+            )
+            if settled:
+                print(
+                    f"    ✓ gen world quiesced (joinable={joinable} "
+                    f"stable={stable_s:.0f}s); retrying rendezvous",
+                    flush=True,
+                )
+                return
+            prev_joinable = joinable
+            time.sleep(COLLECTIVE_SYNC_QUIESCE_POLL_S)
+        print(
+            "    ⏱ quiesce-wait hit max; proceeding with rendezvous anyway",
+            flush=True,
+        )
+
     def _evict_gen_stragglers(self, gen_idxs: list[int]) -> None:
         """Tell the router to remove gen-side shards whose init_collective
         future didn't complete in the rendezvous timeout window.
@@ -317,10 +517,9 @@ class RemoteGeneration(GenerationInterface):
             return
 
         from nemo_rl.models.generation.ft_constants import (
-            COLLECTIVE_SYNC_BACKOFF_BASE_S,
-            COLLECTIVE_SYNC_BACKOFF_CAP_S,
             COLLECTIVE_SYNC_MAX_ATTEMPTS,
             COLLECTIVE_SYNC_RENDEZVOUS_TIMEOUT_S,
+            REJOIN_DEBOUNCE_S,
         )
 
         if rendezvous_timeout_s is None:
@@ -328,11 +527,20 @@ class RemoteGeneration(GenerationInterface):
         if max_attempts is None:
             max_attempts = COLLECTIVE_SYNC_MAX_ATTEMPTS
 
+        # A RefitWorker that can't complete the handshake across this many
+        # consecutive PACED retries is almost certainly poisoned (e.g. a
+        # near-total gen collapse left its CUDA/NCCL context in an error state,
+        # which surfaces as a rendezvous timeout rather than a clean
+        # DistStoreError). Escalate from reuse → respawn to clear it. Paced by
+        # the quiesce-wait, so this is not a kill-storm.
+        consecutive_timeouts = 0
+
         for attempt in range(1, max_attempts + 1):
             self._wait_until_refit_ready()
-            new_gen_ws = self._fetch_current_gen_world_size()
-            if new_gen_ws is None:
+            gen_world = self._fetch_gen_world()
+            if gen_world is None:
                 return  # Older gen server: no dynamic world size, nothing to do.
+            alive_gen_ws, joinable_gen_ws, stable_for_s, comm_epoch, _reinit = gen_world
 
             # RL-412 follow-up: under the RefitWorker architecture only ONE
             # train-side actor (the RefitWorker) participates in the
@@ -345,49 +553,62 @@ class RemoteGeneration(GenerationInterface):
                 effective_train_ws = 1
             else:
                 effective_train_ws = policy.worker_group.cluster.world_size()
-            new_total_ws = effective_train_ws + new_gen_ws
+
             last = getattr(self, "_last_synced_world_size", None)
-            # Reuse the live group when the world size hasn't changed. The
-            # cross-cluster ``model_update_group`` is now KEPT ALIVE across
-            # refits (the per-refit teardown in
-            # RefitWorker.broadcast_weights_until_complete and
-            # vllm_backend.update_weights_from_collective only fires on a
-            # FAILED refit). Re-rendezvousing every refit forced a fresh
-            # cross-cluster TCPStore handshake each step, which is
-            # intermittently flaky here (gen workers fail to connect → the
-            # broadcast can never complete → spurious aborts + healthy-worker
-            # eviction with NO fault). Skipping the re-init when the world is
-            # unchanged turns a steady-state refit into a plain broadcast on
-            # the existing comm. ``_last_synced_world_size`` is reset to None
-            # on any refit FAILURE (grpo broadcast-retry loop) and a fault
-            # changes ``new_total_ws`` — either forces the re-init below.
+            # The cross-cluster ``model_update_group`` is kept alive across
+            # refits (the per-refit teardown only fires on a FAILED refit), so
+            # we only re-rendezvous when membership genuinely settled into a
+            # new shape — see ``decide_collective_sync``. Elastic re-init
+            # (RL-412): shrink eager (lost member → old comm broken → rebuild
+            # now at survivors), grow debounced (replacement joinable →
+            # rebuild only once the joinable set == the dispatch set and has
+            # held for REJOIN_DEBOUNCE_S), same → reuse.
             #
-            # CRITICAL: only skip if the train-side producer is actually still
-            # alive. When a fault trips ``abort_collective`` it ray.kills the
-            # RefitWorker (``policy._refit_worker`` → None) but the gen-side
-            # world size can be unchanged (e.g. the dead shard's replacement
-            # rejoined at the same count) — skipping then would call
-            # ``broadcast_weights_for_collective`` with no RefitWorker and
-            # raise "called before init_collective spawned the RefitWorker",
-            # wasting a whole refit-retry. If the producer is gone we must
-            # fall through and re-init (which respawns it).
+            # CRITICAL: when a fault trips ``abort_collective`` it ray.kills
+            # the RefitWorker (``policy._refit_worker`` → None) but the gen
+            # world can be unchanged (the dead shard's replacement rejoined at
+            # the same count) — reusing then would call broadcast with no
+            # RefitWorker and raise. ``refit_worker_alive=False`` forces a
+            # re-init (which respawns it).
             refit_worker_alive = (not uses_refit_worker) or (
                 getattr(policy, "_refit_worker", None) is not None
             )
-            if last is not None and last == new_total_ws and refit_worker_alive:
+            last_epoch = getattr(self, "_last_synced_comm_epoch", 0)
+            action, new_total_ws = decide_collective_sync(
+                alive_gen_ws=alive_gen_ws,
+                joinable_gen_ws=joinable_gen_ws,
+                stable_for_s=stable_for_s,
+                effective_train_ws=effective_train_ws,
+                last_synced_ws=last,
+                refit_worker_alive=refit_worker_alive,
+                rejoin_debounce_s=REJOIN_DEBOUNCE_S,
+                comm_epoch=comm_epoch,
+                last_synced_epoch=last_epoch,
+            )
+            if action == "reuse":
                 print(
                     f"  ✓ ensure_collective_synced: gen world unchanged "
                     f"({last}); reusing live model_update_group (no re-rendezvous)",
                     flush=True,
                 )
                 return
+            if action == "debounce":
+                print(
+                    f"  ⏸ ensure_collective_synced: gen grew "
+                    f"(alive={alive_gen_ws} joinable={joinable_gen_ws} "
+                    f"stable={stable_for_s:.0f}s < {REJOIN_DEBOUNCE_S:.0f}s); "
+                    f"refit on existing comm (L={last}), re-check next refit",
+                    flush=True,
+                )
+                return
+            # action == "reinit": fall through to the rendezvous below.
 
             ip, port = policy.worker_group.cluster.get_master_address_and_port()
             print(
                 f"  ↻ ensure_collective_synced [attempt {attempt}/{max_attempts}]: "
                 f"world_size {last} → {new_total_ws} "
                 f"(effective_train={effective_train_ws} "
-                f"refit_worker={uses_refit_worker}, gen={new_gen_ws}); "
+                f"refit_worker={uses_refit_worker}, gen={alive_gen_ws}); "
                 f"rendezvous on {ip}:{port}",
                 flush=True,
             )
@@ -403,6 +624,12 @@ class RemoteGeneration(GenerationInterface):
                 num_returns=len(all_futures),
                 timeout=rendezvous_timeout_s,
             )
+            # Whether THIS attempt requires kill+respawn of the RefitWorker
+            # (dead or NCCL-poisoned) vs reuse (clean pre-NCCL rendezvous
+            # timeout). Default False: a ray.wait timeout means the RefitWorker
+            # is still blocked in the TCPStore rendezvous (no NCCL formed →
+            # reuse), and a gen-side 503 eviction is a clean structured body.
+            respawn = False
             if not pending:
                 # Router-owned classification: in HTTP mode, the gen-side
                 # ``init_collective`` future resolves to the router's
@@ -433,6 +660,10 @@ class RemoteGeneration(GenerationInterface):
                         )
                     else:
                         self._last_synced_world_size = new_total_ws
+                        # Record the comm epoch this group was built at, so a
+                        # later eviction (epoch bump) forces a proactive
+                        # re-init rather than a reuse of the wedged group.
+                        self._last_synced_comm_epoch = comm_epoch
                         if attempt > 1:
                             print(
                                 f"  ✓ ensure_collective_synced recovered on attempt {attempt}",
@@ -440,9 +671,10 @@ class RemoteGeneration(GenerationInterface):
                             )
                         return
                 except Exception as e:  # noqa: BLE001 — covers RayActorError, transport errors, etc.
+                    respawn = _should_respawn_refit_worker(e)
                     print(
                         f"  ⚠ ensure_collective_synced attempt {attempt} raised "
-                        f"{type(e).__name__}: {e}",
+                        f"{type(e).__name__}: {e} (respawn_refit_worker={respawn})",
                         flush=True,
                     )
             else:
@@ -458,85 +690,80 @@ class RemoteGeneration(GenerationInterface):
                 pending_set = set(pending)
                 pending_gen = sum(1 for f in futures_inf if f in pending_set)
                 pending_train = sum(1 for f in futures_train if f in pending_set)
+                consecutive_timeouts += 1
+                # If the RefitWorker future itself is what's stuck (pending),
+                # or we've timed out repeatedly, the RefitWorker is likely
+                # poisoned (CUDA/NCCL error from a near-total collapse) — escalate
+                # to respawn below so the next attempt gets a clean actor.
+                if consecutive_timeouts >= 2 or pending_train > 0:
+                    respawn = True
                 print(
                     f"  ⚠ ensure_collective_synced attempt {attempt} timed out "
                     f"after {rendezvous_timeout_s}s; pending: gen={pending_gen} "
-                    f"train={pending_train} — retrying (router does its own "
-                    f"per-worker classification on the gen side)",
+                    f"train={pending_train} (consecutive_timeouts="
+                    f"{consecutive_timeouts}, respawn={respawn}) — retrying",
                     flush=True,
                 )
 
-            # Tear down the train-side comm so the next attempt starts
-            # from a clean state. The gen side recovers on its own
-            # whenever the next fault completes (remove_shard/add_shard
-            # both call reset_collective on surviving workers), so we
-            # don't need to drive a gen-side abort here — re-reading
-            # /current_gen_world_size on the next attempt picks up
-            # whatever world the gen side has converged to.
+            # Per-attempt teardown. Distinguish two failure modes:
+            #  - respawn: the RefitWorker is dead OR its NCCL context is
+            #    poisoned (an NCCLError partially ran the bootstrap; reusing it
+            #    would fail forever with NCCLError) → kill + respawn
+            #    (``abort_collective``) so the next attempt gets a clean actor.
+            #  - clean pre-NCCL rendezvous timeout / 503 eviction (the COMMON
+            #    case): the RefitWorker is ALIVE and never formed an NCCL comm,
+            #    so its context is clean. Do NOT ray.kill it — reuse it. Killing
+            #    on every timeout is the kill/respawn storm on train rank-0's
+            #    shared GPU that destabilized Megatron rank-0. ``reset_collective``
+            #    keeps the live actor; its next ``init_collective`` destroys the
+            #    stale (TCPStore-only) group and rebinds a fresh one on a new
+            #    free port. Re-reading /current_gen_world_size next attempt picks
+            #    up whatever (smaller) world the gen side evicted to.
             try:
-                abort_train = policy.abort_collective()
-                if abort_train:
-                    ray.wait(list(abort_train), timeout=15.0)
+                if respawn:
+                    abort_train = policy.abort_collective()
+                    if abort_train:
+                        ray.wait(list(abort_train), timeout=15.0)
+                    consecutive_timeouts = 0  # fresh actor next attempt
+                else:
+                    policy.reset_collective()
             except Exception as e:  # noqa: BLE001
                 print(
-                    f"  ⚠ abort_collective dispatch (train) raised {type(e).__name__}: {e}",
+                    f"  ⚠ teardown (respawn={respawn}) raised "
+                    f"{type(e).__name__}: {e}",
                     flush=True,
                 )
+
+            # Drain pending futures before the next attempt so we don't dispatch
+            # a fresh init_collective behind in-flight work. The gen-side HTTP
+            # task is a stateless Ray task — safe to force-cancel. The
+            # RefitWorker (train) future is an ACTOR task: when we're REUSING
+            # the actor, force-cancelling it can mark the actor dead (defeating
+            # reuse), so instead we let it drain via its own ~30s TCPStore /
+            # bootstrap timeout under the bounded ray.wait below. (When
+            # respawning, the actor is being killed anyway, so cancelling is moot.)
+            train_set = set(futures_train)
             for f in pending:
+                if f in train_set and not respawn:
+                    continue  # reuse path: let the RefitWorker future drain
                 try:
                     ray.cancel(f, force=True)
                 except Exception:  # noqa: BLE001
                     pass
-
-            # CRITICAL: wait for the cancelled futures to actually settle
-            # before starting the next attempt. Without this, we just call
-            # ``ray.cancel`` and loop back to dispatch a NEW init_collective
-            # — but the in-flight ones haven't finished yet. On the gen
-            # side, ``ray.cancel(force=True)`` raises ``CancelledError`` at
-            # the next ``await`` point, but vLLM's ``collective_rpc``
-            # internals dispatch to TP subprocesses via ``MessageQueue``
-            # which serializes — the dispatched work CONTINUES even if the
-            # leader's coroutine is cancelled (the TP subprocesses don't
-            # see the cancel). So the leader has a queue: the cancelled
-            # coroutine, then the new one we're about to dispatch. The
-            # new one waits behind the old one's TP work, and meanwhile
-            # train has moved its master port — so the new dispatch
-            # rendezvous against a stale master, fails, train retries
-            # again, repeat until eviction kicks in and (incorrectly)
-            # kills the healthy-but-slow leaders.
-            #
-            # Concrete failure mode (30B TP=2 mid-broadcast pod-kill):
-            # train retries 3x at 45s each. Eviction at attempt 3 of 6
-            # tears down survivor shards that were just queued behind a
-            # stale 30s rendezvous; world cascades to 0.
-            #
-            # Fix: after cancel, ``ray.wait`` on the cancelled futures
-            # with a timeout that exceeds gen-side rendezvous timeout
-            # (StatelessProcessGroup uses 30s). 60s gives slack for
-            # cancel propagation + any internal vLLM cleanup. Train's
-            # next attempt is GUARANTEED to start on a clean gen side
-            # — the leaders' actor task queue is empty when train
-            # dispatches. No queue buildup, no spurious eviction.
             try:
-                ray.wait(pending, timeout=60.0)
+                # Bound comfortably above NRL_RENDEZVOUS_TIMEOUT (default 30s,
+                # FT recipe 90s) so a reused RefitWorker's rendezvous wait fully
+                # drains and its actor task queue is empty before we redispatch.
+                ray.wait(pending, timeout=120.0)
             except Exception:  # noqa: BLE001
                 pass
-            # Wait for gen-side cleanup. When a shard dies mid-broadcast,
-            # the surviving shards' NCCL watchdog takes up to
-            # NCCL_HEARTBEAT_TIMEOUT_S to detect the dead peer.
-            # reset_collective is queued behind the hung NCCL op and
-            # can't execute until the watchdog fires. Exponential backoff
-            # so early attempts settle fast while later attempts give
-            # NCCL time to recover.
-            settle_s = min(
-                COLLECTIVE_SYNC_BACKOFF_BASE_S * (2 ** (attempt - 1)),
-                COLLECTIVE_SYNC_BACKOFF_CAP_S,
-            )
-            print(
-                f"  ⏳ settle {settle_s:.0f}s before next attempt",
-                flush=True,
-            )
-            time.sleep(settle_s)
+
+            # Quiesce-gated retry: instead of a blind exponential backoff, wait
+            # until the gen world has SETTLED (joinable count stable, no
+            # lifecycle op in flight) before the next rendezvous. Each retry
+            # then fires on a stable, warm world — far more likely to succeed,
+            # which is what converges recovery without a kill/respawn storm.
+            self._quiesce_wait()
 
         raise RuntimeError(
             f"ensure_collective_synced failed to rendezvous after {max_attempts} "

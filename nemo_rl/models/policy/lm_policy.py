@@ -576,6 +576,27 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # mode — return [] so the caller's ``ray.wait`` is a no-op.
         return []
 
+    def reset_collective(self) -> bool:
+        """Soft reset of the cross-cluster group WITHOUT killing the RefitWorker.
+
+        Used when a rendezvous *timed out* (a gen peer didn't check in) rather
+        than the actor dying. On a failed rendezvous no NCCL communicator is
+        ever created, so the RefitWorker's CUDA/NCCL context is NOT poisoned —
+        killing + respawning it (``abort_collective``) is unnecessary, and doing
+        it on every timeout produces a kill/respawn storm on train rank-0's
+        shared GPU that destabilizes Megatron rank-0. Instead we keep the live
+        actor: its next ``init_collective`` destroys the stale (TCPStore-only)
+        ``StatelessProcessGroup`` and rebinds a fresh one on a new free port.
+
+        Returns True if a live RefitWorker remains to be reused, False if there
+        is none (caller must fall back to a full respawn). Legacy/DTensor path
+        mirrors ``abort_collective`` (dispatch abort on all train workers).
+        """
+        if not self._use_refit_worker:
+            self.worker_group.run_all_workers_single_data("abort_collective")
+            return True
+        return self._refit_worker is not None
+
     def get_logprobs(
         self,
         data: BatchedDataDict[GenerationDatumSpec],

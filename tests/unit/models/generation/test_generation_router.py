@@ -51,6 +51,15 @@ class FakeShard:
             return web.json_response({"status": "ok"})
         return web.Response(status=503, text="unhealthy")
 
+    async def _openapi(self, request: web.Request) -> web.Response:
+        # The router's health probe hits /openapi.json (the only stable
+        # always-present endpoint on a real vLLM OpenAI server), NOT /health.
+        # Mirror vLLM: serve it, gated on the same `healthy` toggle so tests
+        # can simulate an unresponsive engine.
+        if self.healthy:
+            return web.json_response({"openapi": "3.0.0"})
+        return web.Response(status=503, text="unhealthy")
+
     async def _completions(self, request: web.Request) -> web.Response:
         body = await request.read()
         try:
@@ -66,6 +75,7 @@ class FakeShard:
     async def start(self) -> None:
         app = web.Application()
         app.router.add_get("/health", self._health)
+        app.router.add_get("/openapi.json", self._openapi)
         app.router.add_post("/v1/completions", self._completions)
         app.router.add_post("/v1/chat/completions", self._completions)
         self._runner = web.AppRunner(app)
@@ -1874,3 +1884,210 @@ def test_metrics_snapshot_includes_backfill_fields():
     assert snap["backfill_target"] == 8
     assert snap["backfill_in_flight"] == 1
     assert snap["backfill_deficit"] == 8 - 2 - 1  # target - (ready+joining) - inflight
+
+
+# =====================================================================
+# RL-412 elastic re-init: joinable set + stability signal
+# =====================================================================
+
+
+def _seed_shards_with_successes(r, rows):
+    """rows maps shard_id -> (status, consecutive_successes)."""
+    r._shards = {
+        sid: ShardEntry(
+            shard_id=sid, url="", status=st,
+            last_health_ok_at=_time.monotonic(), consecutive_successes=succ,
+        )
+        for sid, (st, succ) in rows.items()
+    }
+
+
+def test_joinable_world_size_excludes_unhealthy_joining():
+    # joinable_min_age_s=0.0 isolates the threshold gate from the warm-up age
+    # gate (tested separately below).
+    r = GenerationRouter(port=0, join_success_threshold=2, joinable_min_age_s=0.0)
+    r._per_shard_world_size = 1
+    _seed_shards_with_successes(r, {
+        "dp-0": ("ready", 5),      # joinable
+        "dp-1": ("ready", 0),      # joinable (ready is always joinable)
+        "dp-2": ("joining", 2),    # joinable (>= threshold)
+        "dp-3": ("joining", 1),    # NOT joinable (still booting/unproven)
+        "dp-4": ("cordoned", 9),   # NOT joinable
+    })
+    assert r.shard_count_alive_for_collective() == 4   # ready+joining
+    assert r.joinable_world_size() == 3                # ready,ready,joining(2)
+
+
+def test_joinable_stable_resets_when_count_changes():
+    r = GenerationRouter(port=0, join_success_threshold=1, joinable_min_age_s=0.0)
+    r._per_shard_world_size = 1
+    _seed_shards_with_successes(r, {"dp-0": ("ready", 1)})
+    r._joinable_changed_at = _time.monotonic() - 100.0
+    r._last_joinable_count = 1
+    # No change → timer NOT reset → still ~100s stable.
+    r._refresh_joinable_stability()
+    assert r.joinable_stable_for_s() >= 100.0
+    # A new joinable shard appears → timer resets to ~0.
+    r._shards["dp-1"] = ShardEntry(
+        shard_id="dp-1", url="", status="ready",
+        last_health_ok_at=_time.monotonic(), consecutive_successes=1,
+    )
+    r._refresh_joinable_stability()
+    assert r.joinable_stable_for_s() < 1.0
+    assert r._last_joinable_count == 2
+
+
+def test_metrics_snapshot_includes_joinable_fields():
+    r = GenerationRouter(port=0, join_success_threshold=2, joinable_min_age_s=0.0)
+    r._per_shard_world_size = 1
+    _seed_shards_with_successes(r, {"dp-0": ("ready", 3), "dp-1": ("joining", 1)})
+    snap = r.metrics_snapshot()
+    assert snap["joinable_world_size"] == 1            # dp-1 not yet joinable
+    assert "joinable_stable_for_s" in snap
+    assert snap["joinable_stable_for_s"] >= 0.0
+
+
+def test_joinable_warmup_age_gate_excludes_fresh_unproven():
+    # A fresh (just-added), health-responsive, UNPROVEN joining shard must NOT
+    # count as joinable until it ages past the warm-up window (cold RoCE route).
+    r = GenerationRouter(port=0, join_success_threshold=2, joinable_min_age_s=90.0)
+    r._per_shard_world_size = 1
+    now = _time.monotonic()
+    r._shards = {
+        "dp-0": ShardEntry(shard_id="dp-0", url="", status="ready",
+                           last_health_ok_at=now, consecutive_successes=5),
+        # fresh + healthy + unproven → excluded by the age gate
+        "dp-1": ShardEntry(shard_id="dp-1", url="", status="joining",
+                           last_health_ok_at=now, consecutive_successes=3,
+                           joined_at=now, proven=False),
+    }
+    assert r.joinable_world_size() == 1                # only dp-0 (ready)
+    # Age it past the warm-up window → now joinable.
+    r._shards["dp-1"].joined_at = now - 100.0
+    assert r.joinable_world_size() == 2
+
+
+def test_joinable_proven_bypasses_age_gate():
+    # A PROVEN shard (rendezvoused before → route warm) rejoins immediately,
+    # even if freshly re-added.
+    r = GenerationRouter(port=0, join_success_threshold=2, joinable_min_age_s=90.0)
+    r._per_shard_world_size = 1
+    now = _time.monotonic()
+    r._shards = {
+        "dp-0": ShardEntry(shard_id="dp-0", url="", status="joining",
+                           last_health_ok_at=now, consecutive_successes=3,
+                           joined_at=now, proven=True),
+    }
+    assert r.joinable_world_size() == 1                # proven bypasses age
+
+
+def test_joinable_cohort_snapshot_excludes_cold_and_cordoned():
+    # The frozen cohort the rendezvous dispatches: ready + warm-joining only,
+    # with their flat worker_indices. Cold/booting joining + cordoned excluded.
+    r = GenerationRouter(port=0, join_success_threshold=2, joinable_min_age_s=90.0)
+    r._per_shard_world_size = 1
+    now = _time.monotonic()
+    r._shards = {
+        "dp-0": ShardEntry(shard_id="dp-0", url="", status="ready",
+                           last_health_ok_at=now, consecutive_successes=5),
+        "dp-1": ShardEntry(shard_id="dp-1", url="", status="joining",
+                           last_health_ok_at=now, consecutive_successes=3,
+                           joined_at=now - 200.0, proven=False),   # warm by age
+        "dp-2": ShardEntry(shard_id="dp-2", url="", status="joining",
+                           last_health_ok_at=now, consecutive_successes=3,
+                           joined_at=now, proven=False),            # cold → excluded
+        "dp-3": ShardEntry(shard_id="dp-3", url="", status="cordoned",
+                           last_health_ok_at=now, consecutive_successes=9),
+    }
+    r._shards["dp-0"].worker_indices = [0]
+    r._shards["dp-1"].worker_indices = [1]
+    r._shards["dp-2"].worker_indices = [2]
+    r._shards["dp-3"].worker_indices = [3]
+    sids, indices = r._joinable_cohort()
+    assert set(sids) == {"dp-0", "dp-1"}      # cold dp-2 + cordoned dp-3 excluded
+    assert indices == [0, 1]                  # flat, sorted worker indices
+
+
+def test_joinable_ready_shard_ignores_age_gate():
+    # ``ready`` shards are joinable unconditionally (already promoted by a prior
+    # successful refit → warm), regardless of joined_at / proven.
+    r = GenerationRouter(port=0, join_success_threshold=2, joinable_min_age_s=90.0)
+    r._per_shard_world_size = 1
+    now = _time.monotonic()
+    r._shards = {
+        "dp-0": ShardEntry(shard_id="dp-0", url="", status="ready",
+                           last_health_ok_at=now, consecutive_successes=0,
+                           joined_at=now, proven=False),
+    }
+    assert r.joinable_world_size() == 1
+
+
+@pytest.mark.asyncio
+async def test_current_gen_world_size_endpoint_exposes_joinable(router, aclient):
+    # The router fixture registers dp-a, dp-b as ready with per_shard_ws=2.
+    resp = await aclient.get("/current_gen_world_size")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["world_size"] == 4
+    assert body["joinable_world_size"] == 4          # both ready → joinable
+    assert "joinable_stable_for_s" in body
+    assert body["joinable_stable_for_s"] >= 0.0
+    # The trainer's quiesce-wait reads this; steady fixture → not re-initing.
+    assert body["nccl_reinit_in_progress"] is False
+
+
+def test_eligible_promote_excludes_not_in_comm_joining():
+    """A `joining` shard that never joined the comm (in_comm=False, the
+    debounce window) must NOT be eligible for promotion — promoting it would
+    route the data plane to stale dummy weights. Once a grow re-init pulls it
+    into the comm (in_comm=True), it becomes eligible."""
+    r = GenerationRouter(port=0)
+    r._per_shard_world_size = 1
+    _seed_shards_with_successes(r, {
+        "dp-0": ("ready", 5),      # ready, not joining → not in promote set
+        "dp-1": ("joining", 3),    # joining + in_comm below → eligible
+        "dp-2": ("joining", 3),    # joining, NOT in_comm → debounced → excluded
+    })
+    r._shards["dp-0"].in_comm = True
+    r._shards["dp-1"].in_comm = True
+    r._shards["dp-2"].in_comm = False
+    assert r._eligible_promote_sids() == {"dp-1"}
+    # After a grow re-init pulls dp-2 in:
+    r._shards["dp-2"].in_comm = True
+    assert r._eligible_promote_sids() == {"dp-1", "dp-2"}
+    # promote_all_joining honors the eligible set (dp-2 excluded first time).
+    r._shards["dp-2"].in_comm = False
+    promoted = r.promote_all_joining(eligible_sids=r._eligible_promote_sids())
+    assert promoted == ["dp-1"]
+    assert r._shards["dp-2"].status == "joining"   # debounced shard untouched
+
+
+@pytest.mark.asyncio
+async def test_health_poll_cordons_unhealthy_joining_shard():
+    """A `joining` shard whose engine goes unhealthy is cordoned after the
+    failure threshold (so `alive` converges back to `joinable`). Before this
+    change the health poll only ever cordoned `ready` shards, so a `joining`
+    shard that lost its engine would pin `alive > joinable` forever and wedge
+    the trainer's quiescence check."""
+    import nemo_rl.models.generation.generation_router as gr
+    r = gr.GenerationRouter(
+        port=0, health_poll_interval_s=0.05, health_timeout_s=0.2,
+        failure_threshold=2, join_success_threshold=1,
+    )
+    # A `joining` shard that never answers health (unroutable url). No actor
+    # handles, so the proxy-side _probe short-circuits and only the HTTP
+    # /openapi.json probe runs — which fails on this address.
+    r._shards["dp-bad"] = ShardEntry(
+        shard_id="dp-bad", url="http://127.0.0.1:1/v1", status="joining",
+        last_health_ok_at=_time.monotonic(),
+    )
+    r._http_session = aiohttp.ClientSession()
+    task = asyncio.create_task(r._health_poll_loop())
+    await asyncio.sleep(0.6)   # > failure_threshold poll intervals
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):
+        pass
+    await r._http_session.close()
+    assert r._shards["dp-bad"].status == "cordoned"

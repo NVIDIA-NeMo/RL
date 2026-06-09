@@ -68,6 +68,11 @@ _DEFAULT_HEALTH_TIMEOUT_S = 5.0
 # bounded window; transient probe lag during burst load doesn't.
 _DEFAULT_FAILURE_THRESHOLD = 10
 _DEFAULT_JOIN_SUCCESS_THRESHOLD = 2
+# RL-412 §3 warm-up gate default (env NRL_JOINABLE_MIN_AGE_S). Imported from
+# ft_constants so the default lives in one place alongside the other FT knobs.
+from nemo_rl.models.generation.ft_constants import (  # noqa: E402
+    JOINABLE_MIN_AGE_S as _DEFAULT_JOINABLE_MIN_AGE_S,
+)
 # Data-plane (proxy) error threshold. The proxy used to cordon on a
 # single 5xx or transport error from a shard, which under burst load
 # turned an overloaded vLLM into a permanently-removed shard. Now we
@@ -139,6 +144,27 @@ class ShardEntry:
     # and only then do we let the data plane route requests to this
     # shard — eliminates the post-join KL spike.
     successful_refits_since_join: int = 0
+    # RL-412 elastic re-init: True once this shard has been included in a
+    # successful cross-cluster ``init_collective`` (i.e. it is in the live
+    # weight-sync comm). A freshly added shard is ``in_comm=False`` until the
+    # trainer grows the comm to include it; until then the gen-side broadcast
+    # skips it (no comm) and the router must NOT promote it to ``ready`` —
+    # otherwise the data plane would route to stale ``load_format=dummy``
+    # weights. Set in the ``/init_collective`` success path; reset on add.
+    in_comm: bool = False
+    # RL-412 §3 warm-up gate: monotonic timestamp this entry was created. A
+    # freshly backfilled shard answers /openapi.json long before its COLD
+    # cross-cluster RoCE route can complete a TCPStore rendezvous (~60-90s), so
+    # it must not count as joinable until it has aged past JOINABLE_MIN_AGE_S
+    # — UNLESS ``proven``. Stamped in __post_init__ (guarded so tests may pass
+    # an explicit aged value).
+    joined_at: float = 0.0
+    # Sticky (never reset): True once this shard completed >=1 successful
+    # init_collective, i.e. its cross-cluster route has rendezvoused at least
+    # once and is warm. A proven shard rejoins immediately (no age gate). Kept
+    # distinct from ``in_comm`` (which is reset on add/uncordon and tracks
+    # *current* membership): ``proven`` tracks route warmth across re-adds.
+    proven: bool = False
     actor_handles: list[Any] = field(default_factory=list, repr=False)
     placement_group: Any = field(default=None, repr=False)
     # Indices of these actors in the underlying VllmGeneration's worker_group.
@@ -152,6 +178,10 @@ class ShardEntry:
         if base.endswith("/v1"):
             base = base[: -len("/v1")]
         self._health_url = f"{base}{_HEALTH_PATH}"
+        # Stamp creation time for the warm-up age gate, unless the caller
+        # supplied one (tests pass an explicit aged value to simulate warm-up).
+        if self.joined_at == 0.0:
+            self.joined_at = time.monotonic()
 
 
 class GenerationRouter:
@@ -190,12 +220,16 @@ class GenerationRouter:
         backfill_target: Optional[int] = None,
         backfill_max_concurrent: int = 4,
         pg_ready_timeout_s: float = 600.0,
+        joinable_min_age_s: float = _DEFAULT_JOINABLE_MIN_AGE_S,
     ):
         self.port = port
         self.health_poll_interval_s = health_poll_interval_s
         self.health_timeout_s = health_timeout_s
         self.failure_threshold = failure_threshold
         self.join_success_threshold = join_success_threshold
+        # RL-412 §3: a fresh (unproven) joining shard isn't counted joinable
+        # until it has aged past this (cold cross-cluster RoCE route warm-up).
+        self._joinable_min_age_s = float(joinable_min_age_s)
         self.proxy_failure_threshold = proxy_failure_threshold
         self.proxy_pool_limit_total = proxy_pool_limit_total
         self.proxy_pool_limit_per_host = proxy_pool_limit_per_host
@@ -216,6 +250,25 @@ class GenerationRouter:
         # registered a ``joining`` shard (PG still booting). Counted in the
         # deficit so repeated ticks don't over-provision.
         self._inflight_adds: int = 0
+
+        # RL-412 elastic re-init: a shard counts toward the cross-cluster
+        # rendezvous only once it is *joinable* — actor __init__ complete AND
+        # health-responsive — not merely spawned/`joining`. The trainer reads
+        # joinable_world_size + joinable_stable_for_s to decide WHEN to grow
+        # the comm (debounced) vs reuse it. Tracked here; refreshed once per
+        # health-poll tick by ``_refresh_joinable_stability``.
+        self._joinable_changed_at: float = time.monotonic()
+        self._last_joinable_count: int = 0
+
+        # RL-412 elastic re-init: bumped whenever a shard that was IN the live
+        # comm (``in_comm``) is removed/evicted — i.e. the cross-cluster group
+        # the trainer last synced is now missing a member and is wedged. The
+        # trainer compares this epoch and re-inits PROACTIVELY instead of
+        # reusing the dead group and only discovering it when the weight
+        # broadcast fails (~1 heartbeat wasted). Critical for the "member
+        # evicted but backfill restored the count" case, where the shard count
+        # is unchanged so the trainer would otherwise reuse.
+        self._comm_reset_epoch: int = 0
 
         self._shards: dict[str, ShardEntry] = {}
         self._rr_index: int = 0
@@ -462,8 +515,15 @@ class GenerationRouter:
             # it; routing skips it. The autoscaler v2 + minReplicas:0
             # combination is what reclaims the pod from here.
             async with self._table_lock:
-                self._shards.pop(shard_id, None)
+                removed_entry = self._shards.pop(shard_id, None)
                 self._cumulative_shards_removed += 1
+                # If the removed shard was IN the live comm, the surviving
+                # members' cross-cluster group is now wedged (a peer is gone).
+                # Bump the epoch so the trainer re-inits proactively rather
+                # than reusing the dead group (esp. when backfill restores the
+                # count and the world-size check alone would say "reuse").
+                if removed_entry is not None and removed_entry.in_comm:
+                    self._comm_reset_epoch += 1
                 self._last_fault_event = {
                     "kind": "remove",
                     "shard_id": shard_id,
@@ -712,6 +772,23 @@ class GenerationRouter:
         while f"dp-{n}" in self._shards:
             n += 1
         return f"dp-{n}"
+
+    def _eligible_promote_sids(self) -> set[str]:
+        """Joining shards safe to promote to ``ready`` after a broadcast.
+
+        Only joining shards that are IN the current comm (``in_comm``)
+        received this broadcast and have fresh weights. A joining shard that
+        is NOT in_comm was added/registered while the trainer was debouncing
+        the grow — the gen-side broadcast skipped it (no ``model_update_group``)
+        so its weights are still stale ``load_format=dummy``. Promoting it
+        would route the data plane to garbage; it promotes on the refit AFTER
+        a grow re-init pulls it into the comm. (Also subsumes the old
+        "added after dispatch" guard: such a shard is never in_comm.)"""
+        return {
+            sid
+            for sid, e in self._shards.items()
+            if e.status == "joining" and e.in_comm
+        }
 
     def promote_all_joining(
         self, eligible_sids: Optional[set[str]] = None
@@ -1001,7 +1078,7 @@ class GenerationRouter:
                             if nccl_paused:
                                 continue
                             if (
-                                entry.status == "ready"
+                                entry.status in ("ready", "joining")
                                 and entry.consecutive_failures >= self.failure_threshold
                             ):
                                 entry.status = "cordoned"
@@ -1014,6 +1091,12 @@ class GenerationRouter:
                 raise
             except Exception as e:  # noqa: BLE001 - keep loop alive across transient errors
                 print(f"[router] health poll iteration failed: {e}", flush=True)
+            # Recompute the joinable set's stability AFTER this tick's status
+            # updates so the trainer's debounce sees a current timer.
+            try:
+                self._refresh_joinable_stability()
+            except Exception as e:  # noqa: BLE001
+                print(f"[router] joinable refresh failed: {e}", flush=True)
             # RL-412 auto-backfill: restore the gen world to target after any
             # shard loss (killed or poison-evicted). Guarded so a reconcile
             # failure never kills the health loop.
@@ -1263,6 +1346,7 @@ class GenerationRouter:
         reason: str,
         exception_types: Optional[list[Optional[str]]] = None,
         force_evict_idxs: Optional[list[int]] = None,
+        shard_ids_in_order: Optional[list[str]] = None,
     ) -> tuple[int, list[str]]:
         """Cordon + remove the gen workers whose futures failed.
 
@@ -1324,8 +1408,14 @@ class GenerationRouter:
         # to shard insertion order. With TP>1, one failed leader future
         # implies the whole TP group is evicted via remove_shard (which
         # ray.kills every actor in the worker_group).
-        async with self._table_lock:
-            shard_ids_in_order = list(self._shards.keys())
+        # ``shard_ids_in_order`` maps a failed future index → shard id. The
+        # caller MUST pass the exact dispatch order. For the frozen-cohort
+        # rendezvous (RL-412) the futures cover only the cohort, so the handler
+        # passes the cohort's shard ids; otherwise we fall back to full shard
+        # insertion order (broadcast path, which dispatches to all live).
+        if shard_ids_in_order is None:
+            async with self._table_lock:
+                shard_ids_in_order = list(self._shards.keys())
         targets: list[str] = []
         # ``force_dead`` shards are confirmed dead by Ray (the future
         # raised RayActorError/ActorDiedError). These bypass the
@@ -1608,12 +1698,22 @@ class GenerationRouter:
         async def current_gen_world_size() -> dict[str, Any]:
             """Sum of per-shard world sizes for shards in the NCCL group.
 
-            The training driver reads this immediately before init_collective
-            so it picks up shrink/grow without redeploying. Includes
-            ``ready`` + ``joining`` shards (both participate in NCCL) and
-            excludes ``cordoned``/``draining``.
+            ``world_size`` is the live dispatch set (``ready`` + ``joining``);
+            the training driver rendezvouses at this. ``joinable_world_size``
+            is the subset whose engines are health-responsive, and
+            ``joinable_stable_for_s`` is how long that subset has held — the
+            trainer uses both to debounce comm growth (only grow once the
+            joinable set == the dispatch set and has settled).
             """
-            return {"world_size": self.current_gen_world_size()}
+            return {
+                "world_size": self.current_gen_world_size(),
+                "joinable_world_size": self.joinable_world_size(),
+                "joinable_stable_for_s": self.joinable_stable_for_s(),
+                "comm_epoch": self._comm_reset_epoch,
+                # The trainer's quiesce-wait reads this to avoid retrying a
+                # rendezvous while a lifecycle op (add/remove/reset) is mid-flight.
+                "nccl_reinit_in_progress": self._nccl_reinit_in_progress,
+            }
 
         @app.get("/dp_openai_server_base_urls")
         async def get_dp_urls() -> list[str]:
@@ -1765,12 +1865,40 @@ class GenerationRouter:
                 # need per-future error tracking so a single bad worker
                 # (cudaErrorLaunchFailure / poisoned NCCL state /
                 # DistStoreError) doesn't sink the whole rendezvous.
+                # Frozen cohort (RL-412): snapshot exactly the JOINABLE shards
+                # and rendezvous only them. A booting/cold backfill shard is in
+                # the worker group but not yet joinable, so it's omitted from
+                # the cohort and cannot sabotage the handshake; it joins a later
+                # re-init once warm. The explicit worker-index list IS the
+                # freeze — a concurrent append can't change it. On success these
+                # are the comm members → mark ``in_comm``/``proven``.
+                async with self._table_lock:
+                    cohort_sids, cohort_indices = self._joinable_cohort()
+                dispatched_sids = set(cohort_sids)
+                if not cohort_indices:
+                    # No shard is joinable yet (e.g. survivors all cold mid-
+                    # recovery). Don't rendezvous an empty cohort — 503 so the
+                    # train retries after the quiesce-wait, by which point a
+                    # shard has warmed.
+                    self._nccl_reinit_in_progress = prev_flag
+                    return JSONResponse(
+                        status_code=503,
+                        content={
+                            "success": False,
+                            "error": "no joinable shards yet; retry after warm-up",
+                            "current_gen_world_size": self.current_gen_world_size(),
+                            "failed_indices": [],
+                            "evicted_shard_ids": [],
+                        },
+                    )
+
                 def _dispatch() -> list[Any]:
                     return generation.init_collective(
                         ip=body["ip"],
                         port=body["port"],
                         world_size=body["world_size"],
                         train_world_size=body["train_world_size"],
+                        include_worker_indices=cohort_indices,
                     )
 
                 futures = await _run_blocking(_dispatch)
@@ -1785,6 +1913,18 @@ class GenerationRouter:
                 )
 
                 if not failed_idxs:
+                    # Rendezvous succeeded: these shards are now in the live
+                    # weight-sync comm. Promotion of a joining shard is gated
+                    # on this (see /update_weights_from_collective).
+                    async with self._table_lock:
+                        for sid in dispatched_sids:
+                            entry = self._shards.get(sid)
+                            if entry is not None:
+                                entry.in_comm = True
+                                # Sticky: this shard's cross-cluster route has
+                                # now rendezvoused → warm. Bypasses the warm-up
+                                # age gate on any future re-add/rejoin.
+                                entry.proven = True
                     return {"success": True}
 
                 # Rendezvous-master failure short-circuit: when EVERY gen
@@ -1826,6 +1966,9 @@ class GenerationRouter:
                     reason="init_collective: per-worker failure",
                     exception_types=exc_types,
                     force_evict_idxs=failed_fast,
+                    # Futures cover only the frozen cohort, in cohort order —
+                    # map failed indices back through the SAME order.
+                    shard_ids_in_order=cohort_sids,
                 )
                 new_ws = self.current_gen_world_size()
                 msg = (
@@ -1930,10 +2073,7 @@ class GenerationRouter:
                 # collapse to 0 — observed in production once when an
                 # add_shard landed during a long ~410s refit window).
                 async with self._table_lock:
-                    eligible_promote = {
-                        sid for sid, e in self._shards.items()
-                        if e.status == "joining"
-                    }
+                    eligible_promote = self._eligible_promote_sids()
 
                 def _dispatch() -> list[Any]:
                     return generation.update_weights_from_collective()
@@ -2245,6 +2385,75 @@ class GenerationRouter:
         """
         return self.shard_count_alive_for_collective() * self._per_shard_world_size
 
+    def _is_joinable(self, s: "ShardEntry", now: float) -> bool:
+        """Whether a shard can complete a cross-cluster rendezvous *right now*.
+
+        ``ready`` always qualifies (promoted by a prior successful refit → its
+        route is warm by construction). A ``joining`` shard qualifies only once
+        it has passed ``join_success_threshold`` health probes AND is either
+        ``proven`` (rendezvoused before → warm) or has aged past the warm-up
+        window — a freshly-backfilled shard answers /openapi.json long before
+        its COLD cross-cluster route can finish a TCPStore rendezvous, and
+        counting it too early is what sabotaged the grow ("7/9 clients joined").
+        """
+        if s.status == "ready":
+            return True
+        if (
+            s.status == "joining"
+            and s.consecutive_successes >= self.join_success_threshold
+        ):
+            return s.proven or (now - s.joined_at) >= self._joinable_min_age_s
+        return False
+
+    def joinable_shard_count(self) -> int:
+        """Number of shards that can complete a rendezvous right now."""
+        now = time.monotonic()
+        return sum(1 for s in self._shards.values() if self._is_joinable(s, now))
+
+    def _joinable_cohort(self) -> tuple[list[str], list[int]]:
+        """Snapshot the joinable cohort: (shard_ids, worker_indices).
+
+        The frozen set the cross-cluster ``init_collective`` rendezvouses — a
+        booting/cold backfill shard (in the worker group but not yet joinable)
+        is excluded so it can't sabotage the handshake.
+
+        Both lists are ordered by the shard's LEADER worker index so they line
+        up with the dispatch order of ``run_all_workers_multiple_data`` (which
+        iterates workers in ascending index): ``shard_ids[i]`` is the shard
+        whose leader future is the i-th in the returned futures list, which is
+        what ``_evict_failed_workers_inline`` relies on to map a failed index
+        back to its shard. ``worker_indices`` is the flat, sorted dispatch set."""
+        now = time.monotonic()
+        joinable = [
+            (min(s.worker_indices) if s.worker_indices else 0, sid, s)
+            for sid, s in self._shards.items()
+            if self._is_joinable(s, now)
+        ]
+        joinable.sort(key=lambda t: t[0])
+        sids = [sid for _, sid, _ in joinable]
+        indices = sorted(i for _, _, s in joinable for i in s.worker_indices)
+        return sids, indices
+
+    def joinable_world_size(self) -> int:
+        """Joinable shard count × per-shard world size (subset of
+        ``current_gen_world_size``; equal to it at a settled point)."""
+        return self.joinable_shard_count() * self._per_shard_world_size
+
+    def _refresh_joinable_stability(self) -> None:
+        """Bump ``_joinable_changed_at`` whenever the joinable count changes.
+
+        Called once per health-poll tick (2 s granularity is plenty for a
+        ~45 s debounce). Idempotent: a tick with no change leaves the timer
+        alone so ``joinable_stable_for_s`` keeps growing."""
+        count = self.joinable_shard_count()
+        if count != self._last_joinable_count:
+            self._last_joinable_count = count
+            self._joinable_changed_at = time.monotonic()
+
+    def joinable_stable_for_s(self) -> float:
+        """Seconds since the joinable count last changed."""
+        return max(0.0, time.monotonic() - self._joinable_changed_at)
+
     def metrics_snapshot(self) -> dict[str, Any]:
         """Cheap point-in-time snapshot of router state for wandb.
 
@@ -2301,6 +2510,9 @@ class GenerationRouter:
             "cumulative_shards_added": self._cumulative_shards_added,
             "per_shard_world_size": self._per_shard_world_size,
             "current_gen_world_size": self.current_gen_world_size(),
+            "joinable_world_size": self.joinable_world_size(),
+            "joinable_stable_for_s": self.joinable_stable_for_s(),
+            "comm_epoch": self._comm_reset_epoch,
             "nccl_reinit_in_progress": self._nccl_reinit_in_progress,
             "last_fault_event": (
                 dict(self._last_fault_event)

@@ -427,9 +427,24 @@ class VllmGeneration(GenerationInterface):
         return step_metrics
 
     def init_collective(
-        self, ip: str, port: int, world_size: int, *, train_world_size: int
+        self,
+        ip: str,
+        port: int,
+        world_size: int,
+        *,
+        train_world_size: int,
+        include_worker_indices: Optional[list[int]] = None,
     ) -> list[ray.ObjectRef]:
-        """Initialize the collective communication."""
+        """Initialize the collective communication.
+
+        ``include_worker_indices`` (RL-412 frozen cohort): when provided, the
+        rendezvous is dispatched to EXACTLY these worker indices instead of all
+        live workers. The router passes the snapshot of *joinable* shard workers
+        so a booting/cold backfill shard (in the worker group but not yet able
+        to complete a cross-cluster rendezvous) is excluded from the cohort and
+        cannot sabotage the handshake. ``world_size`` must equal
+        ``train_world_size + (#leaders in the cohort) * model_parallel_size``.
+        """
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
 
@@ -440,26 +455,38 @@ class VllmGeneration(GenerationInterface):
             else "init_collective"
         )
 
-        # Prepare rank — over surviving workers only (RL-412: shard may have
-        # been killed by the router after a fault). Dead worker indices
-        # were dropped from worker_group via mark_workers_dead.
-        live_indices = [
-            i for i in range(len(self.worker_group.workers))
-            if i not in self.worker_group.dead_indices
-        ]
-        total_workers = len(live_indices)
-        if self.dp_size == 0:
-            raise RuntimeError(
-                "Data parallel size is zero, cannot initialize collective."
+        # Prepare rank — over the dispatch set. Default: all surviving workers
+        # (dead indices were dropped via mark_workers_dead). Frozen-cohort mode:
+        # exactly the requested indices (still excluding any dead one).
+        dead = self.worker_group.dead_indices
+        if include_worker_indices is not None:
+            live_indices = sorted(
+                i for i in include_worker_indices if i not in dead
             )
-        workers_per_group = total_workers // self.dp_size
-        rank_prefix_list = list(range(0, total_workers, workers_per_group))
+        else:
+            live_indices = [
+                i for i in range(len(self.worker_group.workers)) if i not in dead
+            ]
+        total_workers = len(live_indices)
+        if total_workers == 0:
+            raise RuntimeError(
+                "Cohort is empty, cannot initialize collective."
+            )
+        # Each DP shard owns ``model_parallel_size`` (= TP * PP) consecutive
+        # workers; the cohort's leader count is total_workers // that. Compute
+        # from the cohort (NOT self.dp_size, which counts all shards) so the
+        # rank layout matches the restricted dispatch.
+        per_shard = max(1, self.model_parallel_size)
+        rank_prefix_list = list(range(0, total_workers, per_shard))
 
         # Send world_size and rank for init collective to all workers
         futures = self.worker_group.run_all_workers_multiple_data(
             method_name,
             rank_prefix=rank_prefix_list,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            restrict_to_indices=(
+                set(live_indices) if include_worker_indices is not None else None
+            ),
             common_kwargs={
                 "ip": ip,
                 "port": port,

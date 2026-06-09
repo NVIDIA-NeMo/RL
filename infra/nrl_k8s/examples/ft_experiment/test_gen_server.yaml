@@ -55,6 +55,12 @@ policy:
       proxy_pool_limit_per_host: 1024
       uvicorn_backlog: 4096
       uvicorn_keep_alive_s: 120
+      # RL-412 elastic re-init verification: the router is the SOLE recoverer
+      # (fault_inject.recover=false below). On any shard loss the reconciler
+      # provisions replacements back toward target; the trainer grows the comm
+      # opportunistically (debounced) once each becomes joinable.
+      auto_backfill: true
+      backfill_target: 8
 
 # Fault injection. trigger_after_s is now measured FROM the first weight
 # refit (the FaultInjector blocks on the router's /refit_count until training
@@ -71,10 +77,15 @@ policy:
 fault_inject:
   enabled: true
   mode: pod-kill
-  recover: true
+  # RL-412 elastic re-init: the router's auto_backfill reconciler is now the
+  # sole recoverer (mirrors production, which has no fault injector). The
+  # injector only KILLS; recovery + comm re-init are driven by the router +
+  # the trainer's shrink-eager/grow-debounced decision.
+  recover: false
   trigger_after_s: 180
   recover_after_s: 0
-  # Canonical TEST = kill-1: every cycle kills 1 shard and recovers it.
+  # Canonical TEST = kill-1: every cycle kills 1 shard; the router's
+  # auto_backfill reconciler (above) is the sole recoverer (recover: false).
   # For the kill-half sub-experiment (#3b) set burst_size: 4 + max_cycles: 2
   # (kills 4 of 8 at once, twice) — see INSTRUCTIONS.md.
   max_cycles: null

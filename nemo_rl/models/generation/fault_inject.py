@@ -271,14 +271,36 @@ class FaultInjector:
                 # purpose. We accumulate kills first, then fire ONE
                 # _maybe_recover-equivalent at the end of the burst
                 # that brings back replacements for ALL killed shards.
-                if self.mode == "http-error":
-                    kill_result = self._fire_http_error()
-                elif self.mode == "actor-kill":
-                    kill_result = self._fire_actor_kill()
-                elif self.mode == "pod-kill":
-                    kill_result = self._fire_pod_kill()
-                else:
-                    raise ValueError(f"unknown fault mode {self.mode!r}")
+                try:
+                    if self.mode == "http-error":
+                        kill_result = self._fire_http_error()
+                    elif self.mode == "actor-kill":
+                        kill_result = self._fire_actor_kill()
+                    elif self.mode == "pod-kill":
+                        kill_result = self._fire_pod_kill()
+                    else:
+                        raise ValueError(f"unknown fault mode {self.mode!r}")
+                except ValueError:
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    # A single kill stalling (e.g. the router's remove_shard
+                    # blocked on its lifecycle lock mid-cascade → HTTP read
+                    # timeout) must NOT abort the rest of the burst or the run
+                    # loop (which would skip later cycles). The pod delete in
+                    # pod-kill already fired before any router call, so the
+                    # fault landed; record + continue to the next burst kill.
+                    print(
+                        f"[fault-inject] cycle={cycle_n} burst kill "
+                        f"{burst_idx + 1}/{this_cycle_burst} on "
+                        f"{self.target_shard} raised {type(e).__name__}: {e} "
+                        f"— continuing burst",
+                        flush=True,
+                    )
+                    kill_result = {
+                        "mode": self.mode,
+                        "error": str(e),
+                        "target": self.target_shard,
+                    }
                 killed_in_burst.add(self.target_shard)
                 burst_results.append(kill_result)
 
@@ -606,13 +628,18 @@ class FaultInjector:
             )
         return {"mode": "http-error", "target_shard": self.target_shard}
 
-    def _fire_actor_kill(self) -> dict[str, Any]:
+    def _fire_actor_kill(self, timeout: float = 60.0) -> dict[str, Any]:
         # Pass drain_timeout_s=5 so in-flight rollouts on the dying
         # shard fail fast (~5s) instead of blocking up to 30s for
         # graceful drain. The proxy replays the failed requests on
         # surviving shards, which is faster end-to-end than waiting
         # for the dying shard's vLLM to finish them. Cuts the
         # step-time bump on kill+recover from ~97s to ~30-40s.
+        #
+        # ``timeout`` is bounded by the caller: pod-kill passes a short
+        # value because the remove is best-effort bookkeeping (the pod is
+        # already deleted; the health poll reaps router-side state), and a
+        # long block here under cascade load would serialize a burst.
         resp = requests.post(
             f"{self.router_url}/admin/remove_shard",
             json={
@@ -620,7 +647,7 @@ class FaultInjector:
                 "reason": "fault-inject actor-kill",
                 "drain_timeout_s": 5.0,
             },
-            timeout=60,
+            timeout=timeout,
         )
         resp.raise_for_status()
         body = resp.json()
@@ -674,11 +701,15 @@ class FaultInjector:
                 flush=True,
             )
 
-        # Tear down router-side state first so subsequent rollouts replay
-        # off the dead shard. With minReplicas=0 the autoscaler will reap
-        # the freed GPU once the PG releases.
-        actor_kill_result = self._fire_actor_kill()
-
+        # Delete the pod FIRST — that is the actual fault. Doing it before
+        # the router-side remove_shard means a burst of kills lands the real
+        # pod deaths immediately even when the router is busy (its lifecycle
+        # lock is held mid-cascade and remove_shard would block for the full
+        # HTTP timeout). The router's health poll detects the dead pod within
+        # ``failure_threshold`` ticks and reaps its table entry; the
+        # best-effort remove below just makes that immediate when the router
+        # is free. With minReplicas=0 the autoscaler reclaims the freed GPU
+        # once the PG releases.
         try:
             v1.delete_namespaced_pod(
                 name=pod_name,
@@ -691,6 +722,21 @@ class FaultInjector:
             )
         except client.exceptions.ApiException as e:
             print(f"[fault-inject] pod delete raised {e}", flush=True)
+
+        # Best-effort router bookkeeping with a SHORT timeout: under cascade
+        # load the lifecycle lock may be held, so don't block the burst on it
+        # — the health poll already covers detection. A timeout/error here is
+        # non-fatal (caught) so the burst proceeds to the next kill.
+        try:
+            actor_kill_result = self._fire_actor_kill(timeout=10.0)
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"[fault-inject] pod-kill: best-effort remove_shard for "
+                f"{self.target_shard} failed ({type(e).__name__}: {e}); "
+                f"health poll will reap the dead pod",
+                flush=True,
+            )
+            actor_kill_result = {"mode": "actor-kill", "error": str(e)}
         return {
             "mode": "pod-kill",
             "actor_kill": actor_kill_result,

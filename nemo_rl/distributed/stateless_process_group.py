@@ -33,7 +33,14 @@ from nccl.core.utils import UniqueId, get_unique_id
 # Tradeoff: a single bad pod blocks the rendezvous for 30s instead
 # of 5 min. Across 4 retry attempts that's 2 min worst-case, vs the
 # 20 min wedge we hit on the 300s default.
-_RENDEZVOUS_TIMEOUT = timedelta(seconds=30)
+# Env-overridable (RL-412 elastic re-init §C): the quiescence gating on the
+# train side means we only START a rendezvous at a settled point, so a shorter
+# window mainly makes the rare mid-rendezvous fault fail fast → the retry loop
+# re-snapshots the world. Default kept at 30s (no behavior change); the FT
+# verification dials it down via NRL_RENDEZVOUS_TIMEOUT_S.
+_RENDEZVOUS_TIMEOUT = timedelta(
+    seconds=float(os.environ.get("NRL_RENDEZVOUS_TIMEOUT_S", "30"))
+)
 
 # Bound NCCL bootstrap (the ncclCommInitRank handshake) at the same 30s.
 # In blocking mode (NCCL default) this call BLOCKS in C land and ignores
