@@ -354,7 +354,10 @@ class TrtllmAsyncGenerationWorkerImpl(TrtllmGenerationWorkerImpl):
     async def reset_prefix_cache_async(self, **kwargs: Any) -> bool:
         if self.llm is None:
             return True
-        await self.llm.reset_prefix_cache()
+        # AsyncLLM doesn't expose reset_prefix_cache directly; dispatch via
+        # collective_rpc to invoke WorkerExtension.reset_prefix_cache on each
+        # Ray worker (which calls PyExecutor.reset_prefix_cache locally).
+        await self.llm.collective_rpc("reset_prefix_cache")
         return True
 
     # ------------------------------------------------------------------ #
