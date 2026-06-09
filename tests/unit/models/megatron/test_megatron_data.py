@@ -366,7 +366,9 @@ class TestPrepareVlmBatchForMegatron:
 
         # cu_seqlens_padded is the cumulative sum of padded lengths, int32.
         assert cu_seqlens_padded.dtype == torch.int32
-        assert torch.equal(cu_seqlens_padded, torch.tensor([0, 3, 5], dtype=torch.int32))
+        assert torch.equal(
+            cu_seqlens_padded, torch.tensor([0, 3, 5], dtype=torch.int32)
+        )
 
         # cu_seqlens (unpadded) is unused on this path.
         assert cu_seqlens is None
@@ -405,7 +407,9 @@ class TestPrepareVlmBatchForMegatron:
 
         # padded_lens are [4, 4] so every column is "valid".
         assert attention_mask.all()
-        assert torch.equal(cu_seqlens_padded, torch.tensor([0, 4, 8], dtype=torch.int32))
+        assert torch.equal(
+            cu_seqlens_padded, torch.tensor([0, 4, 8], dtype=torch.int32)
+        )
         assert packed_seq_params.max_seqlen_q == 4
         assert packed_input_ids.shape == (1, 8)
 
@@ -430,7 +434,9 @@ class TestPrepareVlmBatchForMegatron:
 
         assert input_ids_2d.shape == (2, 4)
         assert torch.equal(input_ids_2d, torch.tensor([[1, 2, 3, 0], [4, 5, 6, 0]]))
-        assert torch.equal(cu_seqlens_padded, torch.tensor([0, 4, 8], dtype=torch.int32))
+        assert torch.equal(
+            cu_seqlens_padded, torch.tensor([0, 4, 8], dtype=torch.int32)
+        )
         assert torch.equal(packed_input_ids, torch.tensor([[1, 2, 3, 0, 4, 5, 6, 0]]))
 
     def test_pad_full_seq_to_extends_last_sequence(self):
@@ -457,7 +463,9 @@ class TestPrepareVlmBatchForMegatron:
 
         # Total packed length now equals pad_full_seq_to.
         assert int(cu_seqlens_padded[-1]) == 8
-        assert torch.equal(cu_seqlens_padded, torch.tensor([0, 3, 8], dtype=torch.int32))
+        assert torch.equal(
+            cu_seqlens_padded, torch.tensor([0, 3, 8], dtype=torch.int32)
+        )
 
         # The extended last sequence's tail positions are marked "valid" (they are
         # masked out at the loss layer, not here); the first sequence keeps its mask.
