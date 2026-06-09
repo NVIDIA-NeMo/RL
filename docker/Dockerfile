@@ -275,11 +275,23 @@ EOF
 # Prefetch NeMo Gym internal venvs (gym servers like code_gen, math_with_judge, etc.)
 # into the image. Gated on NEMO_GYM_PREFETCH_CONFIGS (no-op by default). Runs after the
 # source COPY above so examples/nemo_gym/prefetch_venvs.py is present.
+# Gym's vllm default PyPI wheel is CUDA-12 (vllm._C needs libcudart.so.12) and fails under RL's
+# cu130 torch. Set Gym's torch/nvidia stack to NEMO_GYM_CUDA and override vllm to vLLM's matching
+# prebuilt cu-wheel so they agree. Keep NEMO_GYM_CUDA == RL's CUDA (one shared torch stack) and a CUDA
+# vLLM ships a wheel for (0.17.0 -> cu126/128/129/130).
+ARG NEMO_GYM_CUDA=cu130
+ARG NEMO_GYM_VLLM_VERSION=0.17.0
 RUN <<"EOF" bash -exu
 if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
-    # Infer the torch index from RL's pyproject.toml so gym venvs use RL's pinned CUDA/torch.
-    UV_TORCH_BACKEND=$(uv run python -c "import tomllib,pathlib; indexes=tomllib.loads(pathlib.Path('pyproject.toml').read_text())['tool']['uv']['index']; print(next(i['name'].removeprefix('pytorch-') for i in indexes if i['name'].startswith('pytorch-')))") \
+    case "${TARGETARCH:-amd64}" in arm64) WHEEL_ARCH=aarch64 ;; *) WHEEL_ARCH=x86_64 ;; esac
+    # Force the gym's vllm==0.17.0 to vLLM's prebuilt cu-wheel matching NEMO_GYM_CUDA (no Gym edit).
+    GYM_VLLM_OVERRIDE=/opt/nemo-rl/.gym-vllm-override.txt
+    printf 'vllm @ https://github.com/vllm-project/vllm/releases/download/v%s/vllm-%s+%s-cp38-abi3-manylinux_2_35_%s.whl\n' \
+        "${NEMO_GYM_VLLM_VERSION}" "${NEMO_GYM_VLLM_VERSION}" "${NEMO_GYM_CUDA}" "${WHEEL_ARCH}" > "${GYM_VLLM_OVERRIDE}"
+    UV_TORCH_BACKEND="${NEMO_GYM_CUDA}" \
+    UV_OVERRIDE="${GYM_VLLM_OVERRIDE}" \
     UV_LINK_MODE=symlink uv run python examples/nemo_gym/prefetch_venvs.py $NEMO_GYM_PREFETCH_CONFIGS
+    rm -f "${GYM_VLLM_OVERRIDE}"
 fi
 EOF
 # Generate container fingerprint for frozen environment support
