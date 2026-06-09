@@ -190,6 +190,7 @@ policy:
           enable_thinking: true
           truncate_history_thinking: false
     vllm_kwargs:
+      moe_backend: triton
       compilation_config:
         cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 64]
     colocated:
