@@ -459,7 +459,7 @@ requires-dist = ["torch", "packaging", "ninja", "causal-conv1d"]
 [[tool.uv.dependency-metadata]]
 name = "deep_ep"
 # This version has to match the version in the commit/rev/tag used
-version = "v1.2.1+bfded34"
+version = "v1.2.1+29d31c0"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [[tool.uv.dependency-metadata]]
