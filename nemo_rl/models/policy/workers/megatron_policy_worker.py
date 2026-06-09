@@ -15,6 +15,7 @@ import copy
 import gc
 import os
 import re
+import time
 import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -577,6 +578,9 @@ class MegatronPolicyWorkerImpl(
             saved_extra_state = None
             reenable_forward_pre_hook_after_eval = False
 
+        torch.cuda.synchronize()
+        _train_t0 = time.perf_counter()
+
         with ctx:
             all_mb_metrics = []
             losses = []
@@ -777,6 +781,9 @@ class MegatronPolicyWorkerImpl(
             # accumulation starts from a clean shared param/grad buffer.
             self._disable_forward_pre_hook_until_next_train_step()
 
+        torch.cuda.synchronize()
+        metrics_train_elapsed = time.perf_counter() - _train_t0
+
         if not eval_mode:
             # Step LR scheduler once per train() call, not per global batch.
             # Megatron's OptimizerParamScheduler.step takes an `increment` in
@@ -799,6 +806,7 @@ class MegatronPolicyWorkerImpl(
             "model_dtype": self.dtype,
             "all_mb_metrics": mb_metrics,
             "grad_norm": torch.tensor([grad_norm]),
+            "train_elapsed_seconds": metrics_train_elapsed,
         }
         # Read "config" via getattr-by-string so the token stays out of
         # train.__code__.co_names; with torch 2.11 cloudpickle otherwise
@@ -816,6 +824,28 @@ class MegatronPolicyWorkerImpl(
         # Collect MTP metrics (kept out of train()'s body so cloudpickle does not
         # pull an unpicklable torch ConfigModuleInstance into the worker actor).
         self._collect_mtp_metrics(metrics)
+
+        try:  # pragma: no cover
+            from megatron.bridge.training.utils import flop_utils as _mb_flop_utils
+
+            # cfg.model.seq_length is set from max_position_embeddings (model max context)
+            # via CONFIG_MAPPING, not from max_total_sequence_length. Override it with the
+            # actual training sequence length so FLOPs are not inflated.
+            _orig_seq = self.mcore_state.cfg.model.seq_length
+            self.mcore_state.cfg.model.seq_length = self.cfg[
+                "max_total_sequence_length"
+            ]
+            try:
+                flops_per_sample = _mb_flop_utils.num_floating_point_operations(
+                    self.mcore_state.cfg, batch_size=1
+                )
+            finally:
+                self.mcore_state.cfg.model.seq_length = _orig_seq
+
+            metrics["total_flops"] = flops_per_sample * gbs * num_global_batches
+            metrics["num_ranks"] = torch.distributed.get_world_size()
+        except Exception as e:
+            warnings.warn(f"Failed to compute FLOPs for MFU reporting: {e}")
         return metrics
 
     def _compute_moe_grad_scale(self, global_valid_toks):
