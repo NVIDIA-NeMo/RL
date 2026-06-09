@@ -2867,6 +2867,29 @@ def async_grpo_train(
         max_size=optimal_buffer_size
     )
 
+    last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
+    if last_checkpoint_path is not None:
+        replay_buffer_path = os.path.join(last_checkpoint_path, "replay_buffer.pt")
+        if os.path.exists(replay_buffer_path):
+            print(f"📦 Restoring replay buffer from checkpoint: {replay_buffer_path}")
+            # weights_only=False: trajectories are pickled BatchedDataDict/dicts,
+            # not plain tensors. The checkpoint is a trusted same-job artifact.
+            replay_buffer_state = torch.load(replay_buffer_path, weights_only=False)
+            ray.get(
+                replay_buffer.load_state_dict.remote(
+                    replay_buffer_state,
+                    num_prompts_per_step=num_prompts_per_step,
+                    current_training_step=step,
+                    max_age_steps=max_trajectory_age_steps,
+                )
+            )
+            print("✅ Replay buffer restored from checkpoint")
+        else:
+            print(
+                f"⚠️ No replay buffer checkpoint found at {replay_buffer_path}. "
+                "Starting with an empty replay buffer."
+            )
+
     _tc_py_exec = get_actor_python_env(
         "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector"
     )
@@ -2975,24 +2998,42 @@ def async_grpo_train(
     if policy_generation is not None:
         policy_generation.clear_logger_metrics()
 
-    # Wait for initial buffer fill
+    # Wait for initial buffer fill for the current training step.
     print(
-        f"⏳ Waiting for replay buffer to have sufficient trajectories ({min_trajectories_needed} trajectories)..."
+        f"⏳ Waiting for replay buffer to have sufficient trajectories for step {step}..."
     )
     wait_iterations = 0
     while True:
         buffer_size_current = ray.get(replay_buffer.size.remote())
-
-        print(
-            f"  Wait iteration {wait_iterations}: buffer_filled_ratio={buffer_size_current}/{min_trajectories_needed}"
+        current_step_ready = ray.get(
+            replay_buffer.has_complete_batch.remote(
+                step, num_prompts_per_step, max_trajectory_age_steps
+            )
         )
 
-        if buffer_size_current >= min_trajectories_needed:
+        print(
+            f"  Wait iteration {wait_iterations}: buffer_size={buffer_size_current}, "
+            f"step {step} ready={current_step_ready}"
+        )
+
+        if current_step_ready:
             break
 
+        trajectories_needed = ray.get(
+            replay_buffer.get_trajectories_needed.remote(
+                step, num_prompts_per_step, max_trajectory_age_steps
+            )
+        )
+        if buffer_size_current >= min_trajectories_needed and trajectories_needed > 0:
+            print(
+                f"  ⏳ Gap-filling in progress: need {trajectories_needed} more "
+                f"trajectories for step {step}"
+            )
+
+        wait_iterations += 1
         time.sleep(1.0)
 
-    print("✅ Buffer ready! Starting training loop...")
+    print(f"✅ Buffer ready for step {step}! Starting training loop...")
 
     # Main training loop
     try:
@@ -3507,6 +3548,16 @@ def async_grpo_train(
                         torch.save(
                             actual_dataloader_state,
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
+                        )
+                        print("📦 Saving replay buffer state...")
+                        replay_buffer_state = ray.get(replay_buffer.state_dict.remote())
+                        torch.save(
+                            replay_buffer_state,
+                            os.path.join(checkpoint_path, "replay_buffer.pt"),
+                        )
+                        print(
+                            "✅ Saved replay buffer with "
+                            f"{len(replay_buffer_state['trajectories'])} trajectories"
                         )
                         checkpointer.finalize_checkpoint(checkpoint_path)
 
