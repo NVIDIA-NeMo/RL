@@ -1,21 +1,13 @@
 defaults: ../../grpo_math_1B.yaml
 grpo:
-  num_prompts_per_step: 32
-  num_generations_per_prompt: 16
-  max_rollout_turns: 1
   max_num_epochs: 10
   max_num_steps: 10000
-  normalize_rewards: true
   use_leave_one_out_baseline: false
   val_period: 5
-  val_at_start: false
-  overlong_filtering: false
   max_val_samples: 960
   val_batch_size: 960
   batch_multiplier: 2
   use_dynamic_sampling: true
-  dynamic_sampling_max_gen_batches: 10
-  seed: 42
   reward_scaling:
     enabled: true
     target_min: -1.0
@@ -30,12 +22,11 @@ loss_fn:
   truncated_importance_sampling_ratio: 2
   ratio_clip_max: 0.28
   ratio_clip_c: 10
-  token_level_loss: true
 checkpointing:
   checkpoint_dir: results/dapo-minimax-m27-8n8g-vllm-fp8
   keep_top_k: 2
   save_period: 5
-  checkpoint_must_save_by: "00:03:45:00"
+  checkpoint_must_save_by: 00:03:45:00
 policy:
   model_name: MiniMaxAI/MiniMax-M2.7
   hf_config_overrides:
@@ -104,7 +95,6 @@ env:
     math_verify_impl: dapo_math_verify
 logger:
   wandb_enabled: true
-  tensorboard_enabled: false
   wandb:
     project: nemo-rl
     name: dapo-minimax-m27-8n8g-vllm-fp8
