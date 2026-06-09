@@ -12,6 +12,8 @@ grpo:
   val_at_start: False
   val_at_end: False
   overlong_filtering: true
+  advantage_clip_low: null
+  advantage_clip_high: null
   max_val_samples: null
   val_batch_size: 256
   seed: 42
@@ -28,6 +30,10 @@ grpo:
     enabled: False
 
   seq_logprob_error_threshold: 2
+  # Advantage value assigned to invalid tool call tokens (e.g. -5.0 to penalize). null disables.
+  invalid_tool_call_advantage: null
+  # Advantage value assigned to tokens with malformed <think>/</think> tags (e.g. -5.0). null disables.
+  malformed_thinking_advantage: null
 
 loss_fn:
   reference_policy_kl_penalty: 0
@@ -81,7 +87,6 @@ policy:
     empty_unused_memory_level: 1
     activation_checkpointing: true
     bias_activation_fusion: False
-      # converter_type: "Qwen2ForCausalLM"
     tensor_model_parallel_size: 2
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 8
@@ -246,10 +251,11 @@ policy:
       num_last_layers_in_bf16: 0
       num_first_layers_in_bf16: 0
       expose_http_server: true
+      reasoning_parser_plugin: nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py
       http_server_serving_chat_kwargs:
         enable_auto_tools: true
         tool_parser: qwen3_coder
-        reasoning_parser: deepseek_r1
+        reasoning_parser: nano_v3
 
     vllm_kwargs:
       mamba_ssm_cache_dtype: "float32"
@@ -291,6 +297,11 @@ env:
     # vLLM (20001+). See ray.sub for the full port layout.
     port_range_low: 15001
     port_range_high: 20000
+    # Optional substrings/tags used to flag malformed assistant turns for advantage
+    # penalties (see grpo.invalid_tool_call_advantage / malformed_thinking_advantage).
+    # Omit to use the built-in defaults (DEFAULT_INVALID_TOOL_CALL_PATTERNS / DEFAULT_THINKING_TAGS).
+    # invalid_tool_call_patterns: ["<tool_call>", "</tool_call>", "<function_call>", "</function_call>"]
+    # thinking_tags: ["<think>", "</think>"]
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml  # Required! And it must be *for_training
     - resources_servers/math_with_judge/configs/math_with_judge.yaml

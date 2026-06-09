@@ -10,6 +10,8 @@ grpo:
   val_at_start: true
   val_at_end: false
   overlong_filtering: false
+  advantage_clip_low: null
+  advantage_clip_high: null
   max_val_samples: null   # inferred from size of val dataset. for multi evals, repeat val ds via `num_repeats` in `ng_prepare_data`.
   val_batch_size: null
   seed: 42
@@ -36,6 +38,10 @@ grpo:
     target_max: 1.0
   skip_reference_policy_logprobs_calculation: true
   seq_logprob_error_threshold: null
+  # Advantage value assigned to invalid tool call tokens (e.g. -5.0 to penalize). null disables.
+  invalid_tool_call_advantage: null
+  # Advantage value assigned to tokens with malformed <think>/</think> tags (e.g. -5.0). null disables.
+  malformed_thinking_advantage: null
 
   async_grpo:
     enabled: false # Set to true to enable async training mode
