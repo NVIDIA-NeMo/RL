@@ -27,6 +27,7 @@ TP=CP=PP=1) and inherit ``train`` / ``get_logprobs`` /
 
 from __future__ import annotations
 
+from time import monotonic
 from typing import TYPE_CHECKING, Any, Literal, Optional
 
 import torch
@@ -39,8 +40,11 @@ from nemo_rl.data_plane.schema import (
     GLOBAL_FORWARD_PAD_SEQLEN,
     MICRO_BATCH_INDICES,
     MICRO_BATCH_LENGTHS,
+    TEACHER_TOPK_INDICES,
+    TEACHER_TOPK_LOGITS,
     Layout,
 )
+from nemo_rl.data_plane.transport_metrics import topk_payload_nbytes
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
@@ -505,3 +509,86 @@ class TQWorkerMixin:
             tq_field="reference_policy_logprobs",
         )
         del result
+
+    @wrap_with_nvtx_name("policy_worker/get_topk_logits_presharded")
+    def get_topk_logits_presharded(
+        self,
+        meta: "KVBatchMeta",
+        k: int,
+        micro_batch_size: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Per-rank teacher top-k entrypoint.
+
+        Fetches only the seed/model-input fields named by ``meta.fields``,
+        computes top-k logits with the worker's existing implementation,
+        writes both teacher columns back to TQ, and returns only an ack.
+        """
+        from collections.abc import Mapping
+
+        data = self._fetch(meta)
+        data = self._attach_or_repack_pack_metadata(data, meta)
+        result = self.get_topk_logits(  # type: ignore[attr-defined]
+            data=data,
+            k=k,
+            micro_batch_size=micro_batch_size,
+        )
+        if not isinstance(result, Mapping):
+            raise RuntimeError(
+                "get_topk_logits_presharded expected get_topk_logits to return "
+                f"a mapping, got {type(result).__name__}."
+            )
+        topk_logits = result.get("topk_logits")
+        topk_indices = result.get("topk_indices")
+        if not isinstance(topk_logits, torch.Tensor):
+            raise TypeError(
+                "get_topk_logits_presharded expected result['topk_logits'] "
+                f"to be a torch.Tensor, got {type(topk_logits).__name__}."
+            )
+        if not isinstance(topk_indices, torch.Tensor):
+            raise TypeError(
+                "get_topk_logits_presharded expected result['topk_indices'] "
+                f"to be a torch.Tensor, got {type(topk_indices).__name__}."
+            )
+        if topk_logits.shape[0] != len(meta.sample_ids):
+            raise ValueError(
+                "get_topk_logits_presharded topk_logits batch dim "
+                f"{topk_logits.shape[0]} does not match {len(meta.sample_ids)} "
+                "sample ids."
+            )
+        if topk_indices.shape[0] != len(meta.sample_ids):
+            raise ValueError(
+                "get_topk_logits_presharded topk_indices batch dim "
+                f"{topk_indices.shape[0]} does not match {len(meta.sample_ids)} "
+                "sample ids."
+            )
+        is_writeback_leader = self._is_replica_leader()
+        teacher_topk_payload_bytes = (
+            topk_payload_nbytes(topk_logits, topk_indices) if is_writeback_leader else 0
+        )
+        teacher_topk_valid_payload_bytes = (
+            topk_payload_nbytes(topk_logits, topk_indices, meta.sequence_lengths)
+            if is_writeback_leader
+            else 0
+        )
+        write_start = monotonic()
+        self._write_back(
+            meta,
+            {
+                TEACHER_TOPK_LOGITS: topk_logits.detach().to("cpu"),
+                TEACHER_TOPK_INDICES: topk_indices.detach().to("cpu"),
+            },
+        )
+        write_ms = (monotonic() - write_start) * 1000.0 if is_writeback_leader else 0.0
+        return {
+            "teacher_topk_payload_bytes": teacher_topk_payload_bytes,
+            "teacher_topk_valid_payload_bytes": teacher_topk_valid_payload_bytes,
+            "teacher_topk_padding_overhead_bytes": max(
+                teacher_topk_payload_bytes - teacher_topk_valid_payload_bytes,
+                0,
+            ),
+            "tq_teacher_topk_write_bytes": teacher_topk_valid_payload_bytes,
+            "tq_teacher_topk_write_num_samples": len(meta.sample_ids)
+            if is_writeback_leader
+            else 0,
+            "tq_teacher_topk_write_ms": write_ms,
+        }
