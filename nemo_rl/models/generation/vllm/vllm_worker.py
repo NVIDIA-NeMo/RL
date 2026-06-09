@@ -621,6 +621,7 @@ class BaseVllmGenerationWorker:
             stop_token_ids=self.cfg["stop_token_ids"],
             stop=stop_strings,
             include_stop_str_in_output=True,
+            ignore_eos=self.cfg["ignore_eos"],
         )
 
     def start_gpu_profiling(self) -> None:
