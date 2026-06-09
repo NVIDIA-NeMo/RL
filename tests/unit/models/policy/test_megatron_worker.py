@@ -158,6 +158,7 @@ def create_megatron_test_config(
         "precision": precision,
         "offload_optimizer_for_logprob": False,
         "use_pinned_optimizer_offload": False,
+        "use_coalesced_optimizer_offload": False,
         "generation": {
             "backend": generation_backend,
             "temperature": 1.0,
@@ -2945,14 +2946,24 @@ class _FakeOptimizer:
         return self._state
 
 
-def _make_pinned_test_worker(use_pinned, optimizer_state):
+_MODES = [
+    pytest.param(False, False, id="pageable"),
+    pytest.param(True, False, id="pinned"),
+    pytest.param(True, True, id="coalesced"),
+]
+
+
+def _make_pinned_test_worker(use_pinned, optimizer_state, use_coalesced=False):
     """Build a stub worker with only the attributes needed for optimizer offload."""
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
     )
 
     worker = object.__new__(MegatronPolicyWorkerImpl)
-    worker.cfg = {"use_pinned_optimizer_offload": use_pinned}
+    worker.cfg = {
+        "use_pinned_optimizer_offload": use_pinned,
+        "use_coalesced_optimizer_offload": use_coalesced,
+    }
     worker.optimizer = _FakeOptimizer(optimizer_state)
     return worker
 
@@ -2961,11 +2972,11 @@ def _make_pinned_test_worker(use_pinned, optimizer_state):
 class TestOptimizerOffloadRoundtrip:
     """Verify optimizer state survives a GPU -> CPU -> GPU round-trip."""
 
-    @pytest.mark.parametrize("use_pinned", [False, True], ids=["pageable", "pinned"])
-    def test_values_preserved(self, use_pinned):
+    @pytest.mark.parametrize("use_pinned,use_coalesced", _MODES)
+    def test_values_preserved(self, use_pinned, use_coalesced):
         shapes = [(64, 128), (32,), (256, 256)]
         state = _make_optimizer_state(shapes, include_scalar=True)
-        worker = _make_pinned_test_worker(use_pinned, state)
+        worker = _make_pinned_test_worker(use_pinned, state, use_coalesced)
 
         originals = {}
         for pid, param_state in state.items():
@@ -2984,11 +2995,11 @@ class TestOptimizerOffloadRoundtrip:
                     v, originals[pid][k], msg=lambda m: f"param {pid}/{k}: {m}"
                 )
 
-    @pytest.mark.parametrize("use_pinned", [False, True], ids=["pageable", "pinned"])
-    def test_multiple_dtypes(self, use_pinned):
+    @pytest.mark.parametrize("use_pinned,use_coalesced", _MODES)
+    def test_multiple_dtypes(self, use_pinned, use_coalesced):
         for dtype in [torch.float32, torch.float16, torch.bfloat16]:
             state = _make_optimizer_state([(128,)], dtype=dtype)
-            worker = _make_pinned_test_worker(use_pinned, state)
+            worker = _make_pinned_test_worker(use_pinned, state, use_coalesced)
             original = state[0]["exp_avg"].clone()
 
             worker.move_optimizer("cpu")
@@ -2998,12 +3009,12 @@ class TestOptimizerOffloadRoundtrip:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-class TestPinnedBufferCaching:
-    """Verify the pinned path allocates the buffer once and reuses it."""
+class TestCoalescedBufferCaching:
+    """Verify the coalesced path allocates the buffer once and reuses it."""
 
     def test_buffer_reused_across_calls(self):
         state = _make_optimizer_state([(64, 128)])
-        worker = _make_pinned_test_worker(True, state)
+        worker = _make_pinned_test_worker(True, state, use_coalesced=True)
 
         worker.move_optimizer("cpu")
         buf1 = worker._optimizer_pinned_buf
@@ -3014,21 +3025,33 @@ class TestPinnedBufferCaching:
 
         assert buf1.data_ptr() == buf2.data_ptr(), "pinned buffer should be reused"
 
-    def test_no_pinned_buf_when_disabled(self):
+    def test_no_pinned_buf_when_pageable(self):
         state = _make_optimizer_state([(64, 128)])
         worker = _make_pinned_test_worker(False, state)
 
         worker.move_optimizer("cpu")
         assert not hasattr(worker, "_optimizer_pinned_buf")
 
+    def test_no_pinned_buf_when_pinned_per_tensor(self):
+        state = _make_optimizer_state([(64, 128)])
+        worker = _make_pinned_test_worker(True, state, use_coalesced=False)
+
+        worker.move_optimizer("cpu")
+        assert not hasattr(worker, "_optimizer_pinned_buf"), (
+            "per-tensor pinned path must not allocate the coalesced buffer"
+        )
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 class TestPinnedMemoryProperties:
-    """Verify CPU tensors from the pinned path are actually pinned."""
+    """Verify CPU tensors from the pinned paths are actually pinned."""
 
-    def test_cpu_tensors_are_pinned(self):
+    @pytest.mark.parametrize(
+        "use_coalesced", [False, True], ids=["per-tensor", "coalesced"]
+    )
+    def test_cpu_tensors_are_pinned(self, use_coalesced):
         state = _make_optimizer_state([(64, 128), (256,)])
-        worker = _make_pinned_test_worker(True, state)
+        worker = _make_pinned_test_worker(True, state, use_coalesced)
 
         worker.move_optimizer("cpu")
         for param_state in state.values():
@@ -3052,17 +3075,17 @@ class TestPinnedMemoryProperties:
 class TestPinnedOptimizerEdgeCases:
     """Edge cases: empty state, scalars only, invalid device."""
 
-    @pytest.mark.parametrize("use_pinned", [False, True], ids=["pageable", "pinned"])
-    def test_empty_optimizer_state(self, use_pinned):
+    @pytest.mark.parametrize("use_pinned,use_coalesced", _MODES)
+    def test_empty_optimizer_state(self, use_pinned, use_coalesced):
         state = {}
-        worker = _make_pinned_test_worker(use_pinned, state)
+        worker = _make_pinned_test_worker(use_pinned, state, use_coalesced)
         worker.move_optimizer("cpu")
         worker.move_optimizer("cuda")
 
-    @pytest.mark.parametrize("use_pinned", [False, True], ids=["pageable", "pinned"])
-    def test_scalars_only(self, use_pinned):
+    @pytest.mark.parametrize("use_pinned,use_coalesced", _MODES)
+    def test_scalars_only(self, use_pinned, use_coalesced):
         state = {0: {"step": torch.tensor(5.0, device="cuda")}}
-        worker = _make_pinned_test_worker(use_pinned, state)
+        worker = _make_pinned_test_worker(use_pinned, state, use_coalesced)
 
         worker.move_optimizer("cpu")
         assert not state[0]["step"].is_cuda
@@ -3070,16 +3093,24 @@ class TestPinnedOptimizerEdgeCases:
         worker.move_optimizer("cuda")
         assert state[0]["step"].is_cuda
 
-    @pytest.mark.parametrize("use_pinned", [False, True], ids=["pageable", "pinned"])
-    def test_invalid_device_raises(self, use_pinned):
+    @pytest.mark.parametrize("use_pinned,use_coalesced", _MODES)
+    def test_invalid_device_raises(self, use_pinned, use_coalesced):
         state = _make_optimizer_state([(8,)])
-        worker = _make_pinned_test_worker(use_pinned, state)
+        worker = _make_pinned_test_worker(use_pinned, state, use_coalesced)
         with pytest.raises(ValueError, match="Invalid device"):
             worker.move_optimizer("tpu")
 
+    def test_coalesced_without_pinned_raises(self):
+        state = _make_optimizer_state([(8,)])
+        worker = _make_pinned_test_worker(False, state, use_coalesced=True)
+        with pytest.raises(
+            ValueError, match="use_coalesced_optimizer_offload requires"
+        ):
+            worker.move_optimizer("cpu")
+
     def test_pinned_buffer_grows_if_needed(self):
         state_small = _make_optimizer_state([(16,)])
-        worker = _make_pinned_test_worker(True, state_small)
+        worker = _make_pinned_test_worker(True, state_small, use_coalesced=True)
         worker.move_optimizer("cpu")
         small_size = worker._optimizer_pinned_buf.numel()
 
