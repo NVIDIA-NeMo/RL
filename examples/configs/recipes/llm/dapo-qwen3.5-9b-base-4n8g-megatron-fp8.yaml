@@ -1,0 +1,27 @@
+# GRPO Algorithm Configuration
+defaults: "./dapo-qwen3.5-9b-base-4n8g-megatron.yaml"
+
+loss_fn:
+  use_importance_sampling_correction: true
+
+policy:
+  make_sequence_length_divisible_by: 16
+  generation:
+    vllm_cfg:
+      precision: "fp8"
+      use_deep_gemm: true
+      gpu_memory_utilization: 0.5
+  megatron_cfg:
+    moe_router_dtype: fp32
+    mtp_num_layers: 0
+    freeze_vision_tower: true
+    fp8_cfg:
+      enabled: true
+      fp8: "e4m3"
+      fp8_recipe: "blockwise"
+      fp8_param: false
+    optimizer:
+      use_precision_aware_optimizer: false
+    env_vars:
+      NVTE_FP8_BLOCK_SCALING_FP32_SCALES: "1"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
