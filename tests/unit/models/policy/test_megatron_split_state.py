@@ -36,11 +36,17 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+# megatron.bridge is only available with the mcore extras. Without it the
+# eager import of megatron_policy_worker (transitively imports megatron.bridge)
+# fails at COLLECTION time on non-mcore shards, which then breaks every other
+# test in that shard. importorskip stops collection cleanly here.
+pytest.importorskip("megatron.bridge")
+
 # Eagerly import the worker module so ``unittest.mock.patch`` can resolve
 # attributes on it via ``getattr``. Without this the patch path
 # ``nemo_rl.models.policy.workers.megatron_policy_worker.<symbol>`` fails
 # at ``getattr(workers, "megatron_policy_worker")``.
-import nemo_rl.models.policy.workers.megatron_policy_worker  # noqa: F401
+import nemo_rl.models.policy.workers.megatron_policy_worker  # noqa: E402,F401
 
 pytestmark = pytest.mark.mcore
 
