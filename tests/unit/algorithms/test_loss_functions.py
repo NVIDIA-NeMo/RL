@@ -24,7 +24,13 @@ from nemo_rl.algorithms.loss import (
     NLLLossFn,
     prepare_loss_input,
 )
+from nemo_rl.algorithms.loss.loss_functions import CrossTokenizerDistillationLossFn
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
+from nemo_rl.algorithms.x_token.loss_utils import (
+    build_exact_token_map,
+    chunk_average_log_probs,
+    valid_chunk_mask,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
@@ -1239,6 +1245,33 @@ def test_clipped_pg_loss_icepop_importance_sampling():
     torch.testing.assert_close(actual_loss, expected_loss, atol=1e-4, rtol=1e-3)
 
 
+def test_clipped_pg_loss_reports_is_oob_ratio_tis():
+    device = "cpu"
+    data, _, seq_len, _ = _setup_clipped_pg_test_data(device=device)
+
+    cfg = ClippedPGLossConfig(
+        reference_policy_kl_penalty=0.0,
+        use_importance_sampling_correction=True,
+        truncated_importance_sampling_type="tis",
+        truncated_importance_sampling_ratio=2.0,
+    )
+    loss_fn = ClippedPGLossFn(cfg)
+
+    data["advantages"][0, 1:] = torch.tensor([1.0, 1.0, 1.0])
+    data["prev_logprobs"][0, 1:] = torch.log(torch.tensor([1.0, 3.0, 0.5]))
+    data["generation_logprobs"][0, 1:] = torch.zeros(3)
+    next_token_logprobs = torch.zeros((1, seq_len - 1))
+
+    _, metrics = loss_fn(
+        next_token_logprobs=next_token_logprobs,
+        data=data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(data["sample_mask"] * data["token_mask"]),
+    )
+
+    assert metrics["is_oob_ratio"] == pytest.approx(1.0 / 3.0)
+
+
 def test_clipped_pg_loss_seq_mask_tis():
     """Tests ClippedPGLossFn with seq-mask-tis, including nan_to_num on -inf.
 
@@ -2047,3 +2080,224 @@ def test_distillation_loss_fn_call():
     expected_fields = ["loss"]
     for field in expected_fields:
         assert field in metrics
+
+
+# ---------------------------------------------------------------------------
+# CrossTokenizerDistillationLossFn — CPU synthetic-tensor coverage for the
+# gold path (KL on the exact-mapped common partition + L1 on the uncommon
+# tail) and the next-token CE term. Unlike the DistillationLossFn tests
+# above, these run on CPU: the gold and CE paths use no GPU-pinned ops, and
+# ``dp_all_reduce_sum`` falls back to the local sum when torch.distributed
+# is not initialized.
+# ---------------------------------------------------------------------------
+
+_CT_V_STUDENT = 6
+_CT_V_TEACHER = 5
+_CT_TOPK = 2
+_CT_TEMPERATURE = 2.0
+
+
+def _write_ct_projection(tmp_path):
+    """Dense top-k projection with two strict exact maps (s0->t0, s5->t4).
+
+    Strict exact-map rule: slot-0 weight 1.0 and a ``-1`` sentinel in slot 1.
+    The four middle rows are fuzzy (0.7/0.3, both slots real) so they fall in
+    the uncommon partition. Result: common student {0, 5} / teacher {0, 4};
+    uncommon teacher {1, 2, 3}.
+    """
+    v_s, v_t, k = _CT_V_STUDENT, _CT_V_TEACHER, _CT_TOPK
+    indices = torch.full((v_s, k), -1, dtype=torch.long)
+    likelihoods = torch.zeros((v_s, k), dtype=torch.float32)
+    indices[0, 0], likelihoods[0, 0] = 0, 1.0
+    indices[v_s - 1, 0], likelihoods[v_s - 1, 0] = v_t - 1, 1.0
+    for s, (t1, t2) in {1: (1, 2), 2: (2, 3), 3: (3, 1), 4: (1, 3)}.items():
+        indices[s, 0], indices[s, 1] = t1, t2
+        likelihoods[s, 0], likelihoods[s, 1] = 0.7, 0.3
+    path = tmp_path / "ct_projection.pt"
+    torch.save({"indices": indices, "likelihoods": likelihoods}, path)
+    return str(path)
+
+
+def _ct_loss_cfg(projection_path, *, gold_loss):
+    return {
+        "projection_matrix_path": projection_path,
+        "gold_loss": gold_loss,
+        "xtoken_loss": False,
+        "temperature": _CT_TEMPERATURE,
+        "vocab_topk": 4,
+        "uncommon_topk": 8192,
+        "reverse_kl": False,
+        "exact_token_match_only": False,
+        "kl_loss_weight": 1.0,
+        "ce_loss_scale": 1.0,
+        "dynamic_loss_scaling": False,
+        "student_vocab_size": _CT_V_STUDENT,
+        "teacher_vocab_size": _CT_V_TEACHER,
+    }
+
+
+def _ct_gold_data(student_chunk_id, teacher_chunk_id, pair_valid, sample_mask):
+    """Flat CT loss data dict the gold path consumes.
+
+    ``_compute_gold`` reads the ``alignment_*`` keys via
+    ``alignment_from_flat_batch`` plus ``sample_mask``. The partition masks
+    and ``pair_is_correct`` are required by the schema but unused by the gold
+    path, so they are filled with correctly shaped zeros/ones.
+    """
+    b, t_s = student_chunk_id.shape
+    t_t = teacher_chunk_id.shape[1]
+    max_pairs = pair_valid.shape[1]
+    return BatchedDataDict(
+        {
+            "input_ids": torch.zeros((b, t_s), dtype=torch.long),
+            "input_lengths": torch.full((b,), t_s, dtype=torch.long),
+            "token_mask": torch.ones((b, t_s)),
+            "sample_mask": sample_mask,
+            "alignment_pair_valid": pair_valid,
+            "alignment_pair_is_correct": torch.ones((b, max_pairs), dtype=torch.bool),
+            "alignment_student_exact_partition_mask": torch.zeros(
+                (b, t_s), dtype=torch.bool
+            ),
+            "alignment_teacher_exact_partition_mask": torch.zeros(
+                (b, t_t), dtype=torch.bool
+            ),
+            "alignment_student_chunk_id": student_chunk_id,
+            "alignment_teacher_chunk_id": teacher_chunk_id,
+            "alignment_num_chunks": pair_valid.sum(dim=1).long(),
+        }
+    )
+
+
+def test_cross_tokenizer_gold_loss_matches_reference(tmp_path):
+    """Gold path == (KL on common + L1 on uncommon) * T**2, with no CE term.
+
+    Independently recomputes ``kl_common`` from the public helpers, pinning
+    the next-token shift, chunk averaging, common-index slice, forward-KL
+    direction, sample_mask gating, valid-chunk normalization, and the T**2
+    combination.
+    """
+    torch.manual_seed(0)
+    path = _write_ct_projection(tmp_path)
+    loss_fn = CrossTokenizerDistillationLossFn(_ct_loss_cfg(path, gold_loss=True))
+
+    student_chunk_id = torch.tensor([[0, 0, 1]], dtype=torch.long)
+    teacher_chunk_id = torch.tensor([[0, 0, 1]], dtype=torch.long)
+    pair_valid = torch.ones((1, 2), dtype=torch.bool)
+    sample_mask = torch.tensor([1.0])
+    data = _ct_gold_data(student_chunk_id, teacher_chunk_id, pair_valid, sample_mask)
+
+    logits = torch.randn(1, 3, _CT_V_STUDENT)
+    teacher_logits = torch.randn(1, 3, _CT_V_TEACHER)
+
+    loss, kl_common, l1_uncommon, n_valid, _ = loss_fn._compute_gold(
+        logits, data, teacher_logits
+    )
+
+    assert torch.isfinite(loss)
+    assert kl_common.item() >= 0.0
+    assert l1_uncommon.item() >= 0.0
+    assert n_valid.item() == 2
+
+    # Combination + temperature**2 scaling (gold step 6); no CE term.
+    T = _CT_TEMPERATURE
+    assert torch.allclose(loss, (kl_common + l1_uncommon) * (T * T), atol=1e-6)
+
+    # Reference recompute of kl_common from the public helpers.
+    exact = build_exact_token_map(
+        path, logits.device, xtoken_loss=False, teacher_vocab_size=_CT_V_TEACHER
+    )
+    assert exact["common_student"].tolist() == [0, 5]
+    assert exact["common_teacher"].tolist() == [0, 4]
+
+    s_lp = torch.log_softmax(logits.float() / T, dim=-1)[:, :-1]
+    t_lp = torch.log_softmax(teacher_logits / T, dim=-1)[:, :-1]
+    s_chunks, s_sizes = chunk_average_log_probs(s_lp, student_chunk_id[:, 1:], 2)
+    t_chunks, t_sizes = chunk_average_log_probs(t_lp, teacher_chunk_id[:, 1:], 2)
+    vc = valid_chunk_mask(s_sizes, t_sizes, pair_valid) & sample_mask.bool().unsqueeze(
+        -1
+    )
+    sc = s_chunks[:, :, exact["common_student"]]
+    tc = t_chunks[:, :, exact["common_teacher"]]
+    per_chunk = (
+        torch.nn.functional.kl_div(sc, tc, reduction="none", log_target=True).sum(
+            dim=-1
+        )
+        * vc
+    )
+    expected_kl_common = per_chunk.sum() / vc.float().sum().clamp(min=1.0)
+    assert torch.allclose(kl_common, expected_kl_common, atol=1e-5)
+
+
+def test_cross_tokenizer_gold_loss_all_samples_masked_is_zero(tmp_path):
+    """sample_mask all-zero -> zero loss and zero valid chunks (the gold path
+    consults sample_mask, not just the geometric chunk mask)."""
+    path = _write_ct_projection(tmp_path)
+    loss_fn = CrossTokenizerDistillationLossFn(_ct_loss_cfg(path, gold_loss=True))
+
+    student_chunk_id = torch.tensor([[0, 0, 1]], dtype=torch.long)
+    data = _ct_gold_data(
+        student_chunk_id,
+        student_chunk_id.clone(),
+        torch.ones((1, 2), dtype=torch.bool),
+        torch.zeros(1),  # every sample masked out
+    )
+    logits = torch.randn(1, 3, _CT_V_STUDENT)
+    teacher_logits = torch.randn(1, 3, _CT_V_TEACHER)
+
+    loss, _, _, n_valid, _ = loss_fn._compute_gold(logits, data, teacher_logits)
+    assert n_valid.item() == 0
+    assert torch.equal(loss.detach(), torch.zeros(()))
+
+
+def test_cross_tokenizer_ce_uniform_logits_equals_log_vocab(tmp_path):
+    """_compute_ce on uniform logits equals log(V_student) per valid token."""
+    loss_fn = CrossTokenizerDistillationLossFn(
+        _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
+    )
+    b, t_s = 1, 5
+    logits = torch.zeros(b, t_s, _CT_V_STUDENT)  # uniform -> CE == log(V)
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.randint(0, _CT_V_STUDENT, (b, t_s)),
+            "token_mask": torch.ones(b, t_s),
+            "sample_mask": torch.ones(b),
+        }
+    )
+    gvt = (data["token_mask"][:, 1:] * data["sample_mask"].unsqueeze(-1)).sum()
+    ce = loss_fn._compute_ce(logits, data, gvt)
+    assert torch.allclose(ce, torch.log(torch.tensor(float(_CT_V_STUDENT))), atol=1e-5)
+
+
+def test_cross_tokenizer_ce_respects_sample_mask(tmp_path):
+    """A masked sample must not contribute to _compute_ce: the B=2 result with
+    sample 1 masked equals the CE over sample 0 alone."""
+    loss_fn = CrossTokenizerDistillationLossFn(
+        _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
+    )
+    b, t_s = 2, 5
+    torch.manual_seed(0)
+    logits = torch.randn(b, t_s, _CT_V_STUDENT)
+    input_ids = torch.randint(0, _CT_V_STUDENT, (b, t_s))
+    token_mask = torch.ones(b, t_s)
+
+    data_masked = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "token_mask": token_mask,
+            "sample_mask": torch.tensor([1.0, 0.0]),
+        }
+    )
+    gvt_masked = (token_mask[:, 1:] * data_masked["sample_mask"].unsqueeze(-1)).sum()
+    ce_masked = loss_fn._compute_ce(logits, data_masked, gvt_masked)
+
+    data_single = BatchedDataDict(
+        {
+            "input_ids": input_ids[:1],
+            "token_mask": token_mask[:1],
+            "sample_mask": torch.tensor([1.0]),
+        }
+    )
+    gvt_single = (token_mask[:1, 1:] * data_single["sample_mask"].unsqueeze(-1)).sum()
+    ce_single = loss_fn._compute_ce(logits[:1], data_single, gvt_single)
+
+    assert torch.allclose(ce_masked, ce_single, atol=1e-6)

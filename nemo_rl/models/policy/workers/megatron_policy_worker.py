@@ -17,7 +17,7 @@ import re
 import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Any, Iterator, Optional, TypeVar, cast
+from typing import Any, Iterable, Iterator, Optional, TypeVar, cast
 
 import ray
 import torch
@@ -325,8 +325,19 @@ class MegatronPolicyWorkerImpl(
         eval_mode: bool = False,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        check_dim_skip_keys: Optional[Iterable[str]] = None,
     ) -> dict[str, Any]:
-        """Train the policy on a batch of data with a given loss function."""
+        """Train the policy on a batch of data with a given loss function.
+
+        ``check_dim_skip_keys`` is accepted for parity with the v1/v2 DTensor
+        workers (cross-tokenizer ride-along tensors whose dim 1 is not the
+        student sequence axis). Megatron doesn't run cross-tokenizer, so it
+        must be None.
+        """
+        assert check_dim_skip_keys is None, (
+            "check_dim_skip_keys is only supported by the v2 DTensor worker; "
+            "Megatron does not run cross-tokenizer distillation."
+        )
         # Note: zero_grad_buffer is called at the start of each global batch iteration
         # in the loop below, so we don't need to call it here.
         if hasattr(self.model, "inference_params"):
