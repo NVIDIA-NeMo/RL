@@ -11,6 +11,8 @@ grpo:
   val_at_start: false
   val_at_end: false
   overlong_filtering: false
+  advantage_clip_low: null
+  advantage_clip_high: null
   max_val_samples: 256
   val_batch_size: 256
   seed: 42
@@ -38,6 +40,10 @@ grpo:
     target_min: 0.0
     target_max: 1.0
   seq_logprob_error_threshold: null
+  # Advantage value assigned to invalid tool call tokens (e.g. -5.0 to penalize). null disables.
+  invalid_tool_call_advantage: null
+  # Advantage value assigned to tokens with malformed <think>/</think> tags (e.g. -5.0). null disables.
+  malformed_thinking_advantage: null
 
   async_grpo:
     enabled: false # Set to true to enable async training mode
@@ -145,7 +151,6 @@ policy:
     # https://github.com/NVIDIA/Megatron-LM/blob/d30c3ae5469fe3f6a64d4fd2e63b6e7f7844ea81/megatron/core/transformer/transformer_config.py#L483
     # Use ["moe"] for MoE models to recompute expert activations only.
     recompute_modules: null
-    converter_type: "Qwen2ForCausalLM"
     tensor_model_parallel_size: 1
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 1
@@ -283,6 +288,10 @@ policy:
     - milestones: [50]
 
   generation:
+    # Port range for vLLM HTTP servers, kept below the OS ephemeral range.
+    # See ray.sub for the full port layout.
+    port_range_low: 11001
+    port_range_high: 15000
     backend: "vllm"
     max_new_tokens: ${policy.max_total_sequence_length}
     temperature: 1.0
@@ -401,6 +410,11 @@ logger:
 cluster:
   gpus_per_node: 1
   num_nodes: 1
+  # Port range for the distributed master address (TCPStore / NCCL rendezvous)
+  # and per-worker available ports.  Kept below the OS ephemeral range
+  # (32768-60999 on stock Linux).  See ray.sub for the full port layout.
+  master_port_range_low: 25000
+  master_port_range_high: 28000
 
 # TransferQueue-mediated data plane for sync GRPO.
 # Off by default — the legacy grpo_train trainer never engages this.
