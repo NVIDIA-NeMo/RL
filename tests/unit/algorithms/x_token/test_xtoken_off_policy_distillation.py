@@ -107,13 +107,23 @@ def _make_master_config(
                 "val_at_end": val_at_end,
             },
             "policy": {
-                "dtensor_cfg": {"enabled": True, "_v2": True},
+                "dtensor_cfg": {
+                    "enabled": True,
+                    "_v2": True,
+                    "tensor_parallel_size": 1,
+                    "context_parallel_size": 1,
+                },
                 "max_total_sequence_length": 64,
                 "make_sequence_length_divisible_by": 8,
                 "tokenizer": {"name": "student-tok"},
             },
             "teacher": {
-                "dtensor_cfg": {"enabled": True, "_v2": True},
+                "dtensor_cfg": {
+                    "enabled": True,
+                    "_v2": True,
+                    "tensor_parallel_size": 1,
+                    "context_parallel_size": 1,
+                },
                 "max_total_sequence_length": 64,
                 "make_sequence_length_divisible_by": 8,
                 "tokenizer": {"name": "teacher-tok"},
