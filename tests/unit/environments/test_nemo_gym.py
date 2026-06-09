@@ -231,3 +231,78 @@ def test_nemo_gym_sanity(
         return list(map(_standardize_single_result, l))
 
     assert _standardize(expected_result) == _standardize(actual_result)
+
+
+# `_postprocess_nemo_gym_to_nemo_rl_result` uses no instance state, so we reach the
+# undecorated method on the @ray.remote class and exercise it directly with a mock
+# tokenizer — no cluster / vLLM / gym server needed.
+_postprocess = NemoGym.__ray_actor_class__._postprocess_nemo_gym_to_nemo_rl_result
+
+
+class _StubTokenizer:
+    eos_token_id = 99
+    pad_token_id = 0
+
+    def apply_chat_template(self, messages, tokenize=True):
+        return [1, 2, 3]
+
+    def decode(self, ids):
+        return "x"
+
+
+def test_postprocess_no_generation_degrades_to_zero_reward_trajectory():
+    """A timed-out / no-completion rollout must NOT crash the step.
+
+    Regression for the graceful-timeout fix: previously this `raise`d (and even
+    IndexError-ed on an empty input via apply_chat_template), which let one
+    timed-out rollout permanently starve an async-GRPO step. It must instead
+    return a valid ZERO-REWARD trajectory so the prompt group still completes.
+    """
+    tok = _StubTokenizer()
+
+    # (1) Timed-out rollout: empty output, valid prompt -> zero-reward trajectory.
+    r1 = {
+        "response": {"output": []},
+        "responses_create_params": {"input": [{"role": "user", "content": "hi"}]},
+        "reward": 0.0,
+    }
+    with pytest.warns(UserWarning, match="no generation data"):
+        o1 = _postprocess(None, r1, tok)
+    assert [m["role"] for m in o1["message_log"]] == ["user", "assistant"]
+    assert o1["message_log"][0]["token_ids"].tolist() == [1, 2, 3]  # prompt
+    assert o1["message_log"][1]["token_ids"].tolist() == [99]  # EOS placeholder gen
+    assert o1["message_log"][1]["generation_logprobs"].tolist() == [0.0]
+    assert o1["full_result"]["reward"] == 0.0
+    assert len(o1["input_message_log"]) == 1
+
+    # (2) The former IndexError case: empty input too, reward missing -> EOS fallback.
+    r2 = {
+        "response": {"output": []},
+        "responses_create_params": {"input": []},
+        "reward": None,
+    }
+    with pytest.warns(UserWarning, match="no generation data"):
+        o2 = _postprocess(None, r2, tok)
+    assert o2["message_log"][0]["token_ids"].tolist() == [99]  # no IndexError
+    assert o2["full_result"]["reward"] == 0.0  # None -> 0.0
+
+
+def test_postprocess_normal_rollout_unaffected():
+    """A rollout with real generation data is untouched by the graceful path."""
+    tok = _StubTokenizer()
+    r = {
+        "response": {
+            "output": [
+                {
+                    "prompt_token_ids": [1, 2],
+                    "generation_token_ids": [3, 4],
+                    "generation_log_probs": [-0.1, -0.2],
+                }
+            ]
+        },
+        "responses_create_params": {"input": [{"role": "user", "content": "hi"}]},
+        "reward": 1.0,
+    }
+    o = _postprocess(None, r, tok)
+    assert o["message_log"][1]["token_ids"].tolist() == [3, 4]
+    assert o["full_result"]["reward"] == 1.0

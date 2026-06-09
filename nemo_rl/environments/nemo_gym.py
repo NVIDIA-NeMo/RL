@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, TypedDict
 
@@ -245,18 +246,62 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
             output_item_dict.pop("generation_log_probs")
 
         if not nemo_rl_message_log:
-            input_messages = nemo_gym_result["responses_create_params"]["input"]
-            prompt_token_ids = tokenizer.apply_chat_template(
-                input_messages, tokenize=True
+            # No trainable generation came back. Known causes: the agent timed out /
+            # was killed mid-episode before emitting any completion (common at high
+            # agent_max_turns under the swebench_agent_timeout wall-clock cap), or the
+            # first-turn prompt already exceeds vLLM max_model_len so vLLM rejected it.
+            #
+            # Degrade gracefully instead of raising: a single no-generation rollout must
+            # not crash the (async-GRPO) training step — and the prior code also
+            # IndexError-ed here when the input was empty (apply_chat_template([])),
+            # which let one timed-out rollout permanently starve a step. Emit a valid
+            # ZERO-REWARD trajectory so the prompt group still completes; a timed-out
+            # attempt legitimately earns reward 0. Warn loudly so the prompt-too-long
+            # config error stays visible.
+            eos_id = tokenizer.eos_token_id
+            if eos_id is None:
+                eos_id = getattr(tokenizer, "pad_token_id", None)
+            if eos_id is None:
+                eos_id = 0
+            input_messages = (
+                nemo_gym_result.get("responses_create_params") or {}
+            ).get("input") or []
+            prompt_token_ids: List[int] = []
+            if input_messages:
+                try:
+                    prompt_token_ids = list(
+                        tokenizer.apply_chat_template(input_messages, tokenize=True)
+                    )
+                except Exception:
+                    prompt_token_ids = []
+            if not prompt_token_ids:
+                prompt_token_ids = [eos_id]
+            warnings.warn(
+                "NeMo-Gym rollout returned no generation data (timed-out/killed agent, or "
+                f"prompt exceeds max_model_len: prompt={len(prompt_token_ids)} tokens). "
+                "Emitting a zero-reward trajectory so the GRPO step is not starved. If this "
+                "is frequent, raise policy.max_total_sequence_length / "
+                "policy.generation.vllm_cfg.max_model_len, or lower agent_max_turns / raise "
+                "swebench_agent_timeout.",
+                stacklevel=2,
             )
-            raise ValueError(
-                f"NeMo Gym returned a result with no generation data. "
-                f"This typically means the prompt for the first turn already exceeds the vLLM max_model_len, "
-                f"so vLLM rejected the request before any tokens could be generated.\n"
-                f"  Prompt length: {len(prompt_token_ids)} tokens.\n"
-                f"  → Fix: increase `policy.max_total_sequence_length` and `policy.generation.vllm_cfg.max_model_len` "
-                f"to a value larger than {len(prompt_token_ids)}."
-            )
+            nemo_rl_message_log = [
+                {
+                    "role": "user",
+                    "content": "",
+                    "token_ids": torch.tensor(prompt_token_ids, dtype=torch.long),
+                },
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "token_ids": torch.tensor([eos_id], dtype=torch.long),
+                    "generation_logprobs": torch.tensor([0.0], dtype=torch.float32),
+                },
+            ]
+            # full_result already carries reward (0 for an unresolved/failed task);
+            # ensure the key exists so downstream r["full_result"]["reward"] is safe.
+            if nemo_gym_result.get("reward") is None:
+                nemo_gym_result["reward"] = 0.0
 
         return {
             "message_log": nemo_rl_message_log,

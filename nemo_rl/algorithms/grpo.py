@@ -629,7 +629,9 @@ def setup(
             processor=processor,
             weights_path=weights_path,
             optimizer_path=optimizer_path,
-            init_optimizer=True,
+            # gen_benchmark_skip_training: pure generation benchmark, no real training
+            # -> skip optimizer init (saves memory; refit needs only weights).
+            init_optimizer=not grpo_config.get("gen_benchmark_skip_training", False),
             init_reference_model=init_reference_model,
         )
         return p, time.perf_counter() - t0
@@ -1177,26 +1179,42 @@ def _create_advantage_estimator(master_config: MasterConfig):
     return adv_estimator
 
 
-def _extract_prompt_only_messages(message_logs: list) -> list:
-    """Extract only prompt messages (user/system) from message logs.
+def extract_initial_prompt_messages(
+    message_logs: list,
+    original_prompt_lengths: "torch.Tensor",
+) -> list:
+    """Extract the original prompt messages from message logs using token length.
 
-    This is used to get prompt IDs for advantage estimation, excluding
-    any assistant responses.
+    This is used to get prompt IDs for advantage estimation. Slicing by the
+    original prompt token length (rather than by role) is required for
+    multi-turn rollouts (e.g. the swe_agents OpenHands harness): a role-based
+    filter would keep every interleaved user/tool-observation message of the
+    agent loop, which differs across the N generations of a prompt. That makes
+    each generation a distinct prompt row under
+    ``calculate_baseline_and_std_per_prompt``'s ``torch.unique`` grouping, so
+    the leave-one-out baseline degenerates (singleton groups, std=0) and
+    advantages collapse. Slicing by length yields the shared initial prompt, so
+    all N generations group together. (Ported from ruit/SWE_bench.)
 
     Args:
         message_logs: List of message logs, where each log is a list of messages.
+        original_prompt_lengths: Tensor of original prompt token lengths per sample.
 
     Returns:
-        List of message logs containing only user and system messages.
+        List of message logs containing only the original prompt messages.
     """
-    prompt_only_message_logs = []
-    for message_log in message_logs:
-        prompt_only_log = []
+    initial_prompt_message_logs = []
+    for i, message_log in enumerate(message_logs):
+        initial_prompt_log = []
+        cumulative_length = 0
+        target_length = original_prompt_lengths[i].item()
         for message in message_log:
-            if message["role"] == "user" or message["role"] == "system":
-                prompt_only_log.append(message)
-        prompt_only_message_logs.append(prompt_only_log)
-    return prompt_only_message_logs
+            if cumulative_length >= target_length:
+                break
+            initial_prompt_log.append(message)
+            cumulative_length += len(message["token_ids"])
+        initial_prompt_message_logs.append(initial_prompt_log)
+    return initial_prompt_message_logs
 
 
 def refit_policy_generation(
@@ -1850,9 +1868,13 @@ def grpo_train(
                     # Save baseline for logging (before deletion)
                     baseline_for_log = baseline.clone()
 
-                    # Extract prompt-only messages for advantage estimation
-                    prompt_only_message_logs = _extract_prompt_only_messages(
-                        repeated_batch["message_log"]
+                    # Extract the ORIGINAL prompt messages (by token length, not
+                    # role) for advantage estimation — required so all N
+                    # generations of a multi-turn rollout share one prompt row.
+                    # See extract_initial_prompt_messages.
+                    prompt_only_message_logs = extract_initial_prompt_messages(
+                        repeated_batch["message_log"],
+                        repeated_batch["length"],
                     )
                     prompt_batched_flat, _ = batched_message_log_to_flat_message(
                         prompt_only_message_logs,
@@ -2683,6 +2705,23 @@ def async_grpo_train(
     )
     timeout.start_iterations()
 
+    # gen_benchmark_skip_training: no-op-train mode for pure generation benchmarking.
+    # Skips fwd/bwd/optimizer (policy.train() below becomes a no-op) while still
+    # refitting the (frozen) weights every step, so the gen/weight-sync cadence stays
+    # realistic and the loss-stage log_softmax OOM at long seqlen is avoided entirely.
+    SKIP_TRAINING_BENCHMARK = master_config.grpo.get(
+        "gen_benchmark_skip_training", False
+    )
+    if SKIP_TRAINING_BENCHMARK:
+        print(
+            "⚠️ gen_benchmark_skip_training=True: policy.train() is a no-op; weights "
+            "are frozen and refit every step (generation benchmark mode).",
+            flush=True,
+        )
+        # Keep training GPUs non-idle so the idle-GPU reaper doesn't kill the job.
+        if hasattr(policy, "start_gen_benchmark_keepalive"):
+            policy.start_gen_benchmark_keepalive()
+
     # ---- ModelExpress v2 weight-sync wiring (cfg.cluster.weight_sync) ----
     # Read once so the per-refit call sites don't re-parse the config.
     _weight_sync_cfg = (master_config.cluster or {}).get("weight_sync", {}) or {}
@@ -3012,9 +3051,13 @@ def async_grpo_train(
 
                 print("▶ Processing rewards...")
                 with timer.time("reward_calculation"):
-                    # Extract prompt-only messages for advantage estimation
-                    prompt_only_message_logs = _extract_prompt_only_messages(
-                        repeated_batch["message_log"]
+                    # Extract the ORIGINAL prompt messages (by token length, not
+                    # role) for advantage estimation — required so all N
+                    # generations of a multi-turn rollout share one prompt row.
+                    # See extract_initial_prompt_messages.
+                    prompt_only_message_logs = extract_initial_prompt_messages(
+                        repeated_batch["message_log"],
+                        repeated_batch["length"],
                     )
                     prompt_batched_flat, _ = batched_message_log_to_flat_message(
                         prompt_only_message_logs,
@@ -3164,11 +3207,32 @@ def async_grpo_train(
 
                 print("▶ Training policy...")
                 with timer.time("policy_training"):
-                    train_results = policy.train(
-                        train_data,
-                        loss_fn,
-                        timer=timer,
-                    )
+                    if SKIP_TRAINING_BENCHMARK:
+                        # No-op training: skip fwd/bwd/optimizer entirely (avoids the
+                        # loss-stage log_softmax OOM). Weights stay frozen and are refit
+                        # as-is below. Still supply the metrics the async loop indexes
+                        # downstream — global_valid_toks/global_valid_seqs (token-throughput
+                        # accounting at metrics["global_valid_toks"]) and gen_kl_error (the
+                        # per-step "Generation KL Error" print) — mirroring real train()'s
+                        # all_mb_metrics shape (lists, aggregated downstream). Matches
+                        # upstream/ruit/SWE_bench's gen_benchmark_skip_training.
+                        _valid_toks = int(train_data["token_mask"].sum().item())
+                        _valid_seqs = int(train_data["sample_mask"].sum().item())
+                        train_results = {
+                            "loss": torch.tensor(0.0),
+                            "grad_norm": torch.tensor(0.0),
+                            "all_mb_metrics": {
+                                "global_valid_toks": [_valid_toks],
+                                "global_valid_seqs": [_valid_seqs],
+                                "gen_kl_error": [0.0],
+                            },
+                        }
+                    else:
+                        train_results = policy.train(
+                            train_data,
+                            loss_fn,
+                            timer=timer,
+                        )
 
                 print("🔄 Synchronizing policy weights to trajectory collector…")
                 generation_logger_metrics = None

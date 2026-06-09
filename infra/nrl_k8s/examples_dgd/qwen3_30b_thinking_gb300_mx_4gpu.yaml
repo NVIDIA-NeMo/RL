@@ -1,0 +1,204 @@
+# DynamoGraphDeployment for Qwen3-30B-A3B-Thinking on GB300 (arm64), MX-enabled,
+# with KV-cache-aware routing — for the SWE2 async-GRPO replication.
+#
+# Derived from qwen3_4b_thinking_gb300_mx.yaml. Differences:
+#   * Model -> Qwen3-30B-A3B-Thinking-2507 (MoE); reasoning parser -> deepseek_r1
+#     (matches the SWE2 baseline, not qwen3).
+#   * **KV routing**: Frontend gets `--router-mode kv` (the one Dynamo feature
+#     we're enabling). KV-overlap-aware routing sends each request to the worker
+#     whose prefix cache already holds it.
+#   * 16 decode workers x TP=2 = 32 generation GPUs (8 GB300 nodes). 30B fits on
+#     one 288GB GPU at TP=1, but TP=2 buys KV headroom for 131k-token contexts
+#     under the swe_agents concurrency.
+#   * HF offline (HF_HOME on Lustre + HF_HUB_OFFLINE) — 16 simultaneous workers
+#     would otherwise trip Hugging Face 429s (parity-run gotcha).
+#
+# MX refit wiring (DYN_MX_REFIT_ENABLED, MODEL_EXPRESS_URL, RoCE DRA, UCX/NIXL
+# env, modelexpress overlay) is unchanged from the 4B MX DGD.
+#
+# Image expectations: worker image must include modelexpress (kavink @ e45a14f)
+# + bundled-UCX nixl wheel (see memory project_dyn_gp_planner_image_deps).
+
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: qwen3-30b-thinking-gb300-mx
+  annotations:
+    nvidia.com/kai-scheduler-queue: backfill
+spec:
+  services:
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      resources:
+        requests:
+          cpu: "2"
+          memory: "4Gi"
+        limits:
+          cpu: "4"
+          memory: "8Gi"
+      extraPodSpec:
+        nodeSelector:
+          nodeGroup: customer-cpu
+          kubernetes.io/arch: arm64
+        tolerations:
+          - operator: Exists
+        # Frontend reads the local checkpoint for its /tokenize endpoint, so it
+        # needs the PVC mounted (and offline env to avoid a network round-trip).
+        volumes:
+          - name: rl-workspace
+            persistentVolumeClaim:
+              claimName: rl-workspace
+        mainContainer:
+          # Same image as the worker: be735142 carries the /tokenize reasoning-contiguity
+          # fix, and the Frontend is what serves /tokenize — so the fix MUST be here.
+          image: jwillthomson/dynamo-arm-tokenize-endpoint-be735142:latest
+          workingDir: /workspace
+          volumeMounts:
+            - mountPath: /mnt/rl-workspace
+              name: rl-workspace
+          command:
+            - python3
+            - -m
+            - dynamo.frontend
+          args:
+            - --router-reset-states
+            # KV-cache-aware routing (the key Dynamo feature for this run).
+            - --router-mode
+            - kv
+            # Serve under the local checkpoint path (byte-identical to the
+            # worker --served-model-name and recipe policy.model_name).
+            - --model-path
+            - /mnt/rl-workspace/jothomson/swe_asyncrl_test/model/step_230_hf
+            - --model-name
+            - /mnt/rl-workspace/jothomson/swe_asyncrl_test/model/step_230_hf
+          env:
+            - name: HF_HOME
+              value: /mnt/rl-workspace/jothomson/hf-cache
+            - name: HF_HUB_OFFLINE
+              value: "1"
+            - name: TRANSFORMERS_OFFLINE
+              value: "1"
+    VllmDecodeWorker:
+      componentType: worker
+      replicas: 24                     # 24x TP2 workers = 48 gen GPU = 12 GB300 nodes (32 didn't fit current
+                                       # cluster GPU/RoCE-DRA capacity). 48 gen ranks vs trainer dp16 (mocked) -> MX same_rank_only + peer-pull.
+      envFromSecret: jothomson-secrets
+      resources:
+        requests:
+          gpu: "2"                     # 2 GPUs, TP=2 (TP4 breaks MoE intermediate_size%128)
+          memory: "128Gi"
+        limits:
+          gpu: "2"
+          memory: "256Gi"
+      extraPodSpec:
+        # Fix A (temporary): run the worker as root so FlashInfer can create its
+        # cubin symlink under the root-owned /usr/local/.../flashinfer_cubin/cubins.
+        # The AOT fused_moe_trtllm_sm100 kernel is baked in flashinfer-jit-cache;
+        # only the symlink write was blocked for the default uid=1000(dynamo) user.
+        # Permanent fix: chmod -R g+rwX that dir in vllm_runtime.Dockerfile, then drop this.
+        securityContext:
+          runAsUser: 0
+        nodeSelector:
+          nvidia.com/gpu.product: NVIDIA-GB300
+        tolerations:
+          - operator: Exists
+        resourceClaims:
+          - name: roce-channel
+            resourceClaimTemplateName: roce-mx-qwen3-30b
+        volumes:
+          - name: rl-workspace
+            persistentVolumeClaim:
+              claimName: rl-workspace
+        mainContainer:
+          # be735142: upstream-vLLM base with BOTH the /tokenize reasoning-contiguity
+          # fix (dynamo._core) AND modelexpress (kavink nemo_rl_moe @3fbf7d0) baked into
+          # system dist-packages — no runtime overlay needed. NIXL/UCX plugins are
+          # bundled in the nixl wheel (auto-discovered). See
+          # project_dynamo_container_upstream_vllm_base + project_swe2_historical_reasoning_strip_rootcause.
+          image: jwillthomson/dynamo-arm-tokenize-endpoint-be735142:latest
+          workingDir: /workspace
+          volumeMounts:
+            - mountPath: /mnt/rl-workspace
+              name: rl-workspace
+          command:
+            - /bin/bash
+            - -c
+            - |
+              # No overlay: modelexpress + dynamo mx_refit are baked into be735142
+              # (system dist-packages). Just sanity-check the import, then hand off.
+              echo "[startup] dynamo.vllm on be735142 (modelexpress baked) $(date -u +%FT%TZ)"
+              python3 -c "import modelexpress; print('modelexpress at', modelexpress.__file__)" \
+                || { echo "FATAL: modelexpress import failed (image missing the baked client)"; exit 1; }
+              exec python3 -m dynamo.vllm "$@"
+            - --
+          args:
+            # Local step_230 checkpoint (same string as recipe policy.model_name).
+            # --served-model-name pins the registered id so the gym's `model:`
+            # field matches; keep byte-identical with the recipe (no trailing /).
+            - --model
+            - /mnt/rl-workspace/jothomson/swe_asyncrl_test/model/step_230_hf
+            - --served-model-name
+            - /mnt/rl-workspace/jothomson/swe_asyncrl_test/model/step_230_hf
+            # MxModelLoader: discover v2 sources at boot, pull via NIXL RDMA;
+            # cold start falls through to the disk loader.
+            - --load-format
+            - mx-target
+            - --tensor-parallel-size
+            - "2"
+            # Lowered from 0.85: the MX receive (receive_weights_scratch) needs
+            # GPU headroom to stage incoming weights; at 0.85 vLLM ate ~all 276GiB
+            # (207MiB free) -> refit OOM -> workers_ok=0. 0.6 leaves ~110GiB.
+            - --gpu-memory-utilization
+            - "0.6"
+            - --max-model-len
+            - "131072"          # match recipe seqlen (128k)
+            - --enforce-eager        # safer for bring-up; drop for gen throughput later
+            - --dyn-tool-call-parser
+            - hermes
+            - --dyn-reasoning-parser
+            - deepseek_r1            # matches the SWE2 baseline (NOT qwen3)
+          resources:
+            claims:
+              - name: roce-channel
+          env:
+            - name: DYN_HEALTH_CHECK_ENABLED
+              value: "false"
+            # Dynamo system_status_server (Prometheus /metrics + /engine/* admin
+            # routes) on 0.0.0.0:9090. MX refit already POSTs /engine/* here, so
+            # the server is effectively already on — this pins it explicitly so
+            # DynamoGeneration's metrics sampler can scrape http://<pod>:9090/metrics
+            # for the generation_metrics/* wandb panels (vllm:* + dynamo_component_*).
+            - name: DYN_SYSTEM_PORT
+              value: "9090"
+            # HF offline — 16 workers downloading simultaneously trips 429.
+            - name: HF_HOME
+              value: /mnt/rl-workspace/jothomson/hf-cache
+            - name: HF_HUB_OFFLINE
+              value: "1"
+            - name: TRANSFORMERS_OFFLINE
+              value: "1"
+            # 8590c26 image has the venv-bundled UCX nixl; point NIXL at it
+            # (operator default /opt/nvidia/nvda_nixl/lib64/plugins lacks UCX).
+            # NIXL_PLUGIN_DIR removed: be735142's nixl wheel bundles the UCX/NIXL
+            # plugins and nixl auto-discovers them (probe confirmed the UCX backend
+            # instantiates with this unset). The old /opt/dynamo/venv path is gone on
+            # the upstream-vLLM base. Re-add (system path) only if refit can't find UCX.
+            - name: DYN_MX_REFIT_ENABLED
+              value: "1"
+            - name: MODEL_EXPRESS_URL
+              value: "modelexpress-server.default.svc.cluster.local:8001"
+            # Restricted TLS forces the RDMA path (broader set fails
+            # prep_xfer_dlist for cross-pod descriptors).
+            - name: UCX_TLS
+              value: "^tcp"
+            - name: NIXL_UCX_TLS
+              value: "^tcp"
+            - name: UCX_IB_GPU_DIRECT_RDMA
+              value: "yes"
+            - name: UCX_CUDA_COPY_DMABUF
+              value: "yes"
+            - name: UCX_LOG_LEVEL
+              value: "info"
+            - name: MX_RDMA_NIC_PIN
+              value: "auto"

@@ -20,6 +20,8 @@ URL of the DGD's frontend Service so nemo-gym can dispatch rollout requests to
 it over HTTP.
 """
 
+import threading
+import time
 import warnings
 from typing import Any, Optional, Union
 
@@ -69,6 +71,106 @@ def _http_post_json(url: str, payload: dict[str, Any], timeout_s: float) -> dict
         return json.loads(body)
     except json.JSONDecodeError:
         return {"status": "error", "raw": body.decode("utf-8", "replace")}
+
+
+# Interpreter/process noise (prometheus_client internals) — not engine
+# telemetry. Override via policy.generation.dynamo_cfg.metrics_exclude_prefixes.
+_DEFAULT_METRICS_EXCLUDE_PREFIXES = ("python_", "process_")
+
+# nemo-rl's print_performance_metrics (algorithms/utils.py) hard-asserts the
+# vLLM backend's canonical generation-metric names are present in
+# get_logger_metrics() output (inflight_batch_sizes / num_pending_samples), and
+# log_generation_metrics_to_wandb plots them. We ALWAYS surface these four
+# canonical keys — mapped from the generically-scraped vllm_* values (post ':'
+# -> '_' sanitization), or an empty dict if absent — so (a) that assert never
+# trips, (b) panels match the vLLM backend's names for direct comparison, and
+# (c) a missing/renamed source metric degrades to a valid empty dict rather than
+# crashing the training loop. Additive: the generic bulk collection is unchanged.
+_CANONICAL_LOGGER_ALIASES: "dict[str, list[str]]" = {
+    "inflight_batch_sizes": ["vllm_num_requests_running"],
+    "num_pending_samples": ["vllm_num_requests_waiting"],
+    "kv_cache_usage_perc": [
+        "vllm_kv_cache_usage_perc",
+        "vllm_gpu_cache_usage_perc",
+        "dynamo_component_gpu_cache_usage_percent",
+    ],
+    "generation_tokens": ["vllm_generation_tokens_total", "vllm_generation_tokens"],
+}
+
+
+def _http_get_text(url: str, timeout_s: float) -> "Optional[str]":
+    """GET a URL, returning the decoded body or None on any transport/HTTP error.
+
+    Sibling of :func:`_http_post_json` for the Prometheus ``/metrics`` scrape.
+    Never raises — a best-effort telemetry scrape must not perturb training.
+    """
+    import urllib.error
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(url, timeout=timeout_s) as resp:
+            return resp.read().decode("utf-8", "replace")
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
+        return None
+
+
+def _parse_prometheus_metrics(
+    text: str,
+    include_prefixes: "Optional[tuple[str, ...]]" = None,
+    exclude_prefixes: "tuple[str, ...]" = _DEFAULT_METRICS_EXCLUDE_PREFIXES,
+) -> "dict[str, float]":
+    """Parse Prometheus text exposition into ``{metric_name: summed_value}``.
+
+    Deliberately schema-agnostic: it collects *every* scalar sample line rather
+    than a fixed allow-list, so whatever the Dynamo workers emit today
+    (``vllm:*``, ``dynamo_component_*``, runtime gauges) — and whatever they
+    emit after an upgrade — flows through with no code change. Rules:
+
+      * ``# HELP`` / ``# TYPE`` comment lines are skipped;
+      * histogram ``*_bucket`` lines are skipped (cumulative-by-``le``; summing
+        across buckets is meaningless — the scalar ``_sum`` / ``_count`` are
+        kept);
+      * ``*_created`` lines are skipped (prometheus_client per-series creation
+        timestamps — a constant epoch value, not telemetry);
+      * label sets are dropped and values for the same metric name are summed
+        (each worker pod serves one engine, so this is a no-op in the common
+        single-line case and a sane aggregate otherwise);
+      * ``include_prefixes`` (if given) restricts to those families;
+        ``exclude_prefixes`` drops matches (interpreter noise by default);
+      * ``:`` in names is mapped to ``_`` so keys are wandb-safe (Prometheus
+        names are ``[a-zA-Z0-9_:]``, so ``:`` is the only unsafe character).
+
+    Never raises; unparseable lines are skipped.
+    """
+    out: dict[str, float] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line[0] == "#":
+            continue
+        if "{" in line:
+            name = line[: line.index("{")]
+            tail = line[line.rindex("}") + 1 :]
+        else:
+            sp = line.split(None, 1)
+            if len(sp) != 2:
+                continue
+            name, tail = sp[0], sp[1]
+        if name.endswith(("_bucket", "_created")):
+            continue
+        if include_prefixes and not name.startswith(include_prefixes):
+            continue
+        if exclude_prefixes and name.startswith(exclude_prefixes):
+            continue
+        tok = tail.split()
+        if not tok:
+            continue
+        try:
+            val = float(tok[0])
+        except ValueError:
+            continue
+        key = name.replace(":", "_")
+        out[key] = out.get(key, 0.0) + val
+    return out
 
 
 def _discover_worker_instances(
@@ -458,6 +560,40 @@ class DynamoGeneration(GenerationInterface):
         self.dp_openai_server_base_urls: list[Optional[str]] = [url]
         print(f"  [Dynamo] Forwarding rollouts to {url}", flush=True)
 
+        # --- Engine-telemetry sampler (Dynamo → nemo-rl generation_metrics/*) ---
+        # Gated by vllm_cfg.enable_vllm_metrics_logger — the same flag grpo.py
+        # reads to decide whether to call log_generation_metrics_to_wandb — so a
+        # single recipe switch turns both the gate and this sampler on together.
+        # Worker discovery needs the in-cluster /health path, so a frontend_url /
+        # non-k8s construction (local tests) skips the sampler.
+        vllm_cfg = config.get("vllm_cfg") or {}
+        self._metrics_enabled = bool(vllm_cfg.get("enable_vllm_metrics_logger", False))
+        self._metrics_interval_s = float(
+            vllm_cfg.get("vllm_metrics_logger_interval", 0.5) or 0.5
+        )
+        # Schema-agnostic collection: by default include everything and drop only
+        # interpreter noise. Both lists are config-overridable (no metric names
+        # are baked in, so changes to what Dynamo emits are picked up for free).
+        _inc = dynamo_cfg.get("metrics_include_prefixes")
+        self._metrics_include_prefixes: Optional[tuple[str, ...]] = (
+            tuple(_inc) if _inc else None
+        )
+        _exc = dynamo_cfg.get("metrics_exclude_prefixes")
+        self._metrics_exclude_prefixes: tuple[str, ...] = (
+            tuple(_exc) if _exc is not None else _DEFAULT_METRICS_EXCLUDE_PREFIXES
+        )
+        self._dyn_logger_metrics: dict[str, dict[int, list[float]]] = {}
+        self._dyn_metrics_lock = threading.Lock()
+        self._dyn_metrics_stop: Optional[threading.Event] = None
+        self._dyn_metrics_thread: Optional[threading.Thread] = None
+        self._dyn_worker_ordinals: dict[Any, int] = {}
+        self._metrics_discovery_kwargs: Optional[dict[str, Any]] = None
+        if self._metrics_enabled and requires_k8s and "dgd_name" in dynamo_cfg:
+            self._metrics_discovery_kwargs = self._build_metrics_discovery_kwargs(
+                dynamo_cfg
+            )
+            self._start_metrics_sampler()
+
     # ------------------------------------------------------------------
     # GenerationInterface — lifecycle
     # ------------------------------------------------------------------
@@ -468,9 +604,142 @@ class DynamoGeneration(GenerationInterface):
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
         return True
 
+    # ------------------------------------------------------------------
+    # Engine telemetry — scrape each DGD worker's Prometheus /metrics and
+    # surface it into nemo-rl's generation_metrics/* wandb panels. The workers
+    # already run Dynamo's system_status_server on DYN_SYSTEM_PORT (9090) — the
+    # same server MX refit POSTs /engine/* to — which serves a combined
+    # /metrics (vLLM engine stats + Dynamo-native gauges). One driver-side
+    # sampler polls all workers; the pickled actor-side rollout copies never
+    # sample (__getstate__ omits the thread/lock; the guards below no-op there).
+    # ------------------------------------------------------------------
+
+    def _build_metrics_discovery_kwargs(
+        self, dynamo_cfg: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Freeze the worker-discovery args (mirrors update_weights_via_mx)."""
+        dgd_name = dynamo_cfg["dgd_name"]
+        namespace = dynamo_cfg.get("namespace") or read_pod_namespace() or "default"
+        worker_namespaces = dynamo_cfg.get("refit_worker_namespaces") or None
+        if worker_namespaces:
+            dyn_namespaces = set(worker_namespaces)
+        else:
+            dyn_namespaces = {f"{namespace}-{dgd_name}"}
+        return {
+            "frontend_host": f"{dgd_name}-frontend.{namespace}.svc.cluster.local",
+            "frontend_port": int(
+                dynamo_cfg.get("frontend_port", DEFAULT_FRONTEND_PORT)
+            ),
+            "dyn_namespaces": dyn_namespaces,
+            "dyn_system_port": int(
+                dynamo_cfg.get("dyn_system_port", DEFAULT_DYN_SYSTEM_PORT)
+            ),
+        }
+
+    def _start_metrics_sampler(self) -> None:
+        stop = threading.Event()
+        self._dyn_metrics_stop = stop
+        t = threading.Thread(
+            target=self._metrics_loop, name="dynamo-metrics-sampler", daemon=True
+        )
+        self._dyn_metrics_thread = t
+        t.start()
+        print(
+            "📋[Dynamo Metrics] sampler thread started "
+            f"(interval={self._metrics_interval_s}s, "
+            f"frontend={self._metrics_discovery_kwargs['frontend_host']})",
+            flush=True,
+        )
+
+    def _metrics_ordinal(self, instance_id: Any) -> int:
+        """Stable 0-based worker index for a discovery instance_id."""
+        idx = self._dyn_worker_ordinals.get(instance_id)
+        if idx is None:
+            idx = len(self._dyn_worker_ordinals)
+            self._dyn_worker_ordinals[instance_id] = idx
+        return idx
+
+    def _metrics_loop(self) -> None:
+        interval = self._metrics_interval_s
+        include = self._metrics_include_prefixes
+        exclude = self._metrics_exclude_prefixes
+        stop = self._dyn_metrics_stop
+        kwargs = self._metrics_discovery_kwargs
+        assert stop is not None and kwargs is not None
+
+        stop.wait(min(2.0, interval))  # let the DGD settle before first scrape
+        instances: list[dict[str, Any]] = []
+        last_discover = 0.0
+        while not stop.is_set():
+            try:
+                now = time.monotonic()
+                # Re-discover at most every 5s — cheap, and picks up worker
+                # restarts / autoscale without re-hitting /health every tick.
+                if not instances or (now - last_discover) > 5.0:
+                    instances = _discover_worker_instances(**kwargs)
+                    last_discover = now
+                for inst in instances:
+                    text = _http_get_text(
+                        f"{inst['system_url']}/metrics", timeout_s=interval + 2.0
+                    )
+                    if not text:
+                        continue
+                    found = _parse_prometheus_metrics(text, include, exclude)
+                    if not found:
+                        continue
+                    ordinal = self._metrics_ordinal(inst["instance_id"])
+                    with self._dyn_metrics_lock:
+                        for name, value in found.items():
+                            self._dyn_logger_metrics.setdefault(name, {}).setdefault(
+                                ordinal, []
+                            ).append(value)
+            except Exception as exc:  # daemon telemetry: never perturb training
+                print(
+                    f"⚠️[Dynamo Metrics] sampler tick failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+            stop.wait(interval)
+
+    def get_logger_metrics(self) -> dict[str, Any]:
+        """Per-worker engine-metric timelines for generation_metrics/* panels.
+
+        Shape matches the vLLM backend's get_logger_metrics():
+        ``{metric_name: {worker_idx: [samples]}}`` — consumed by
+        log_generation_metrics_to_wandb / log_plot_per_worker_timeline_metrics.
+        Empty until the sampler accumulates at least one scrape.
+        """
+        if not getattr(self, "_metrics_enabled", False):
+            return {}
+        with self._dyn_metrics_lock:
+            out = {
+                name: {idx: list(samples) for idx, samples in per_worker.items()}
+                for name, per_worker in self._dyn_logger_metrics.items()
+            }
+        # Always expose the vLLM-backend canonical keys (print_performance_metrics
+        # asserts inflight_batch_sizes/num_pending_samples; all four also give
+        # panel parity). Map from the generic scrape; default to {} so a
+        # missing/renamed source can never trip the assert or crash the loop.
+        for canon, sources in _CANONICAL_LOGGER_ALIASES.items():
+            if canon in out:
+                continue
+            out[canon] = next((dict(out[s]) for s in sources if s in out), {})
+        return out
+
+    def clear_logger_metrics(self) -> None:
+        """Reset the timelines after each refit (start a fresh logging cycle)."""
+        if not getattr(self, "_metrics_enabled", False):
+            return
+        with self._dyn_metrics_lock:
+            self._dyn_logger_metrics = {}
+
     def shutdown(self) -> bool:
         # The DGD lifecycle is owned by Kubernetes (the dynamo operator); we
-        # have nothing to tear down on the nemo-rl side.
+        # have nothing to tear down on the nemo-rl side — just stop the
+        # telemetry sampler thread if one is running.
+        stop = getattr(self, "_dyn_metrics_stop", None)
+        if stop is not None:
+            stop.set()
         return True
 
     # ------------------------------------------------------------------

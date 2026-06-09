@@ -1,0 +1,376 @@
+# =============================================================================
+# SWE2 Async-GRPO replication on GB300 — DTensor trainer + Dynamo generation
+# =============================================================================
+# Adapts the baseline SWE2 run (wandb nvidia/binhu-nemo-rl/dc3m70us, slurm
+# recipe examples/swe_bench/grpo_qwen3_30b_async_swe.yaml on cw-dfw-cs) to the
+# GB300 (arm64) k8s cluster via nrl-k8s.
+#
+# DELIBERATE DEPARTURES FROM THE SLURM BASELINE (all forced by the platform):
+#   * Trainer  Megatron -> **DTensor v2** (FSDP2 + expert-parallel MoE).
+#       WHY: non-colocated Dynamo refit goes only through MX
+#       (stream_weights_via_mx), which is implemented ONLY on the DTensor
+#       worker — the Megatron worker has no MX path, so Megatron+Dynamo async
+#       refit fails at step 1. See memory reference_dynamo_refit_dtensor_only.
+#   * Generation  vLLM -> **Dynamo** (DGD), with KV-cache-aware routing
+#       (--router-mode kv set on the DGD Frontend) and MX mid-training refit.
+#   * Data  R2E-Gym subset (4518, x86 sandboxes) -> **SWE-bench Verified arm64
+#       (281)**. The R2E-Gym arm64 sandboxes don't exist on this cluster; the
+#       281 Verified arm64 .sif set is the only runnable SWE substrate here.
+#       train == val (mirrors the baseline).
+#
+# UNPROVEN / SMOKE-GATED (read before launching):
+#   * max_total_sequence_length=131072 on the DTensor-automodel MoE path is
+#     UNVERIFIED. Every proven MoE-automodel recipe in this repo is 4096 seqlen
+#     (grpo-qwen3.5-35ba3b-*-automodel-ep16, dpo-nanov3-30B3AB-*-fsdp8ep8).
+#     RECOMMEND: first smoke at policy.max_total_sequence_length=32768 (Hydra
+#     override) to validate the DTensor MoE mesh + memory, then scale to 131072.
+#   * The TP x CP x EP mesh below is a STARTING POINT, not a proven layout. If
+#     it OOMs or the mesh fails to factor, the levers are: raise CP (shard the
+#     sequence), raise TP, or drop seqlen. Re-derive make_sequence_length_
+#     divisible_by when you change TP/CP.
+#   * tool/reasoning parsing: the baseline shipped a CUSTOM Qwen3 chat template
+#     under vllm_cfg.http_server (vLLM-only). On Dynamo that path is unused;
+#     parsing is done by the DGD worker's --dyn-tool-call-parser hermes /
+#     --dyn-reasoning-parser deepseek_r1. Confirm the model's built-in chat
+#     template emits <tool_call> blocks; if not, supply --chat-template on the
+#     DGD worker. This is THE thing the run exists to verify (real function_call
+#     items -> non-zero reward from step 1).
+#
+# Paired infra: infra/nrl_k8s/examples/grpo_swe2_qwen3_30b_dynamo_mx.gb300.infra.yaml
+# Paired DGD:   infra/nrl_k8s/examples_dgd/qwen3_30b_thinking_gb300_mx.yaml
+# =============================================================================
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/grpo-swe2-qwen3-30b-dynamo-mx"
+  metric_name: "train:total_reward/mean"
+  higher_is_better: true
+  keep_top_k: 2
+  save_period: 5
+  # Required by async_grpo_train (grpo.py reads checkpointing["checkpoint_must_save_by"]).
+  checkpoint_must_save_by: "00:03:35:00"
+  model_save_format: "safetensors"
+  save_consolidated: false
+  save_optimizer: true
+
+grpo:
+  # GEN-ONLY: no-op training (skip fwd/bwd/optimizer) -> avoids the Step-1 loss
+  # log_softmax OOM at 131072. Weights stay frozen and are refit every step, so the
+  # Dynamo gen + MX-refit + contiguity pipeline runs realistically. Flip to false for
+  # real training (needs the OOM fix: TP/CP/chunked-loss/lower-seqlen).
+  gen_benchmark_skip_training: true
+  num_prompts_per_step: 8          # doc SKIP_TRAINING: 8 prompts/step (8*8=64=GBS)
+                                   # collected (and postprocessed through the contiguity
+                                   # assert) BEFORE training/step-1 flash-attn crash kicks in.
+  num_generations_per_prompt: 8    # doc SKIP_TRAINING: GRPO group size 8 (8*8=64=GBS)
+  num_val_generations_per_prompt: 1
+  max_rollout_turns: 1
+  max_num_epochs: 100
+  max_num_steps: 1000000
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  advantage_clip_low: -100
+  advantage_clip_high: 100
+  val_period: 0             # 0 fully disables val (dataloader + async val collector);
+                            # val_period>0 was spinning up the swe_agents_val collector
+                            # at startup -> 500 flood. No val for the smoke.
+  val_at_start: false
+  val_at_end: false
+  overlong_filtering: true
+  max_val_samples: null
+  val_batch_size: 256
+  seed: 42
+  invalid_tool_call_strategy: ""
+
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1
+
+  penalize_invalid_tool_call: true
+  invalid_tool_call_advantage: -5.0
+  penalize_malformed_thinking: true
+  malformed_thinking_advantage: -5.0
+
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 128
+    overlong_buffer_penalty: 1
+    max_response_length: ${policy.max_total_sequence_length}
+    stop_properly_penalty_coef: null
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
+
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: false
+
+  seq_logprob_error_threshold: null
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  reference_policy_kl_type: "k3"
+  kl_input_clamp_value: null
+  kl_output_clamp_value: null
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: true
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_ratio: 5.0
+  truncated_importance_sampling_ratio_min: null
+  truncated_importance_sampling_type: tis
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  force_on_policy_ratio: true
+  use_kl_in_reward: false
+
+policy:
+  # SWE1 step_230_hf init checkpoint, staged on the shared PVC. Used verbatim as
+  # the trainer load path AND (via the gym) as the `model:` field sent to the
+  # Dynamo frontend, so the DGD must serve under this exact string — keep it
+  # byte-identical (no trailing slash) here and in the DGD --model/--model-name.
+  # Accepting the known discovery::watcher path-404 risk per jothomson.
+  model_name: "/mnt/rl-workspace/jothomson/swe_asyncrl_test/model/step_230_hf"
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs:
+      enable_thinking: true
+  hf_config_overrides: {}
+  train_global_batch_size: 64      # doc SKIP_TRAINING: 8*8=64 rollouts/step (divisible by dp=4)
+  train_micro_batch_size: 1
+  generation_batch_size: 64
+  logprob_batch_size: 1
+  max_total_sequence_length: 131072   # 128k: long SWE histories truncated at 32k -> non-contiguous -> collector assert
+  precision: "bfloat16"
+  logprob_chunk_size: 2048
+  offload_optimizer_for_logprob: true
+
+  # ----- Megatron OFF (no MX refit path) -----
+  megatron_cfg:
+    enabled: false
+
+  # ----- DTensor v2 (FSDP2 + expert-parallel MoE) ON -----
+  # v1 DTensor (NOT v2): v2 has expert-parallel MoE but NO stream_weights_via_mx;
+  # v1 has MoE-aware MX refit but NO EP. MoE+MX only coexist on v1, so we run the
+  # 30B-A3B MoE via PURE FSDP (experts FSDP-sharded, no EP) — fits easily at 32k
+  # on 16 GB300 GPUs. Slower MoE forward (no deepep/EP) but correct; fine for the
+  # smoke. (automodel_kwargs is a v2-only path — dropped.) See memory
+  # reference_dynamo_refit_dtensor_only.
+  dtensor_cfg:
+    _v2: false
+    enabled: true
+    cpu_offload: true                # 131072 activations heavy on 4 GPU; offload params+optim to host RAM
+    sequence_parallel: false         # no TP -> SP off
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+    # expandable_segments REMOVED: its CUDA-VMM (cuMemMap, multi-handle)
+    # allocations make the MX publisher's NIXL-registered full_tensor() buffers
+    # unreadable over RDMA — the rkey doesn't cover the physical backing, so the
+    # worker's first-refit read fails with RoCE synd 0x13 (remote access error)
+    # -> NIXL_ERR_REMOTE_DISCONNECT. Proven by a single-variable NIXL-agent A/B
+    # (expandable_segments alone reproduces it; default allocator reads cleanly).
+    # Keep the DTensor trainer on the default allocator while weight_sync=mx.
+    env_vars: {}
+
+  # DTensor worker reads policy.optimizer/scheduler directly (Megatron reads
+  # policy.megatron_cfg.optimizer). Baseline: constant lr=1e-6, wd=0.
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 1.0e-6
+      weight_decay: 0.0
+      betas: [0.9, 0.999]
+      eps: 1e-8
+  scheduler:
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: []
+
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  # DTensor TP=1 -> no divisibility constraint. Re-derive (TP*CP*2) for full-size.
+  make_sequence_length_divisible_by: 1
+  max_grad_norm: 1.0
+
+  generation:
+    # Generation is entirely on the DGD; nothing colocated on the trainer.
+    # dgd_name is stamped at launch via Hydra `+` override (see infra entrypoint).
+    backend: "dynamo"
+    # Sampling params are required by MasterConfig even on the Dynamo path
+    # (matches the SWE2 baseline: temp 1.0, top_p 1.0).
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    # Required by setup_nemo_gym_config (nemo_gym.py forces async_engine +
+    # expose_http_server on vllm_cfg). On the Dynamo path the DGD owns the real
+    # vLLM config — these are gym-model-server placeholders, not the gen engine.
+    vllm_cfg:
+      async_engine: true
+      precision: ${policy.precision}
+      kv_cache_dtype: "auto"
+      tensor_parallel_size: 2        # TP2: TP4 breaks this MoE (intermediate_size%128); gen ranks subset of trainer dp4
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.6
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: False
+      use_deep_gemm: False
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 0.5
+      expose_http_server: true
+    vllm_kwargs: {}
+    dynamo_cfg:
+      tool_call_parser: "hermes"
+      reasoning_parser: "deepseek_r1"
+      # frontend_port (8000) + namespace fall through to operator defaults.
+    colocated:
+      enabled: false
+      # Unused on the Dynamo path (gen runs on the DGD), but required by schema.
+      resources:
+        gpus_per_node: 4
+        num_nodes: 1
+
+data:
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 1
+  use_multiple_dataloader: false
+  train:
+    data_path: "/mnt/rl-workspace/jothomson/swebench_containers/swebench_verified_arm64_model.jsonl"
+  validation:
+    data_path: "/mnt/rl-workspace/jothomson/swebench_containers/swebench_verified_arm64_model.jsonl"
+  default:
+    dataset_name: NemoGymDataset
+    env_name: "nemo_gym"
+    prompt_file: null
+    system_prompt_file: null
+    processor: "nemo_gym_data_processor"
+
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true   # log full trajectories to verify function_call items appear
+  nemo_gym:
+    skip_venv_if_present: true
+    port_range_low: 15001
+    port_range_high: 20000
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - responses_api_agents/swe_agents/configs/swebench_openhands_training.yaml
+    # Re-enable thinking on the model server (Qwen3-Thinking always emits
+    # <think>…</think>); mirrors the workplace dynamo recipe.
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: true
+          extra_body:
+            chat_template_kwargs:
+              enable_thinking: true
+    swe_agents_train:
+      responses_api_agents:
+        swe_agents:
+          agent_max_turns: 200    # doc SKIP_TRAINING value
+          # 16 (not the baseline's 64): the baseline ran 64 rollouts across 8 actor
+          # nodes (~8 concurrent SWE sandboxes/node); we have 4 nodes, so 64 here =
+          # ~16 simultaneous singularity .sif mounts + instance_swe_entry.sh conda
+          # setups per node over Lustre — an IO storm that blew past OpenHands' 600s
+          # setup-command timeout (rc=124, no completions). 16 ≈ baseline per-node
+          # density. Same 64-rollout/step RL shape (pps8*gpp8).
+          # Reduced 16->4 (with runner_ray_remote num_cpus 0.1->4) to test the
+          # CPU-starvation hypothesis: dense co-scheduling of rollouts next to
+          # the trainer starved the OpenHands tmux poll loop -> 600s source hang.
+          concurrency: 512         # 512 rollouts across 4 training nodes (~128/node). 512*num_cpus=0.1
+                                   # (app.py) = ~51 CPU vs ~576 Ray CPU; memory ~128 sandboxes/node *
+                                   # ~5 GiB ~= 660 GiB < 946 GiB. 768-on-1-node would OOM -> went 4 nodes.
+          swebench_agent_timeout: 1800
+          run_with_mixed_prompts: true
+          # DEBUG diagnostic: emit OpenHands DEBUG logs (incl bash.py tmux
+          # lifecycle) to each rollout's agent.log, to capture WHY the tmux
+          # server dies in the live trainer-co-located context.
+          dataset_path: ${data.train.data_path}
+          # Local arm64 .sif set. The gym's _find_container auto-encodes
+          # `__`->`_1776_` (and fuzzy-globs), so the raw {instance_id} resolves
+          # to the on-disk file. See memory reference_swebench_arm64_coverage.
+          container_formatter:
+          - "/mnt/rl-workspace/jothomson/swebench_containers/swebench_sweb.eval.arm64.{instance_id}.sif"
+          # The arm64 SWE-bench .sif images ship no `tmux`, but OpenHands' bash
+          # runtime (libtmux) needs it to run/complete every command. Without it
+          # the first action (`source /swe_util/instance_swe_entry.sh`) never
+          # completes -> 600s hard timeout -> retry loop -> zero completions (the
+          # real root cause; concurrency/IO was a red herring). Bind a static
+          # arm64 tmux in. See memory project_swe2_openhands_source_hang_environmental.
+          extra_container_binds:
+          - "/mnt/rl-workspace/jothomson/tmux_static_build/tmux:/usr/bin/tmux"
+    swe_agents_val:
+      responses_api_agents:
+        swe_agents:
+          agent_max_turns: 200    # doc SKIP_TRAINING value
+          concurrency: 512
+          swebench_agent_timeout: 1800
+          dataset_path: ${data.validation.data_path}
+          container_formatter:
+          - "/mnt/rl-workspace/jothomson/swebench_containers/swebench_sweb.eval.arm64.{instance_id}.sif"
+          # arm64 .sif lacks tmux; OpenHands' bash runtime needs it (see train block).
+          extra_container_binds:
+          - "/mnt/rl-workspace/jothomson/tmux_static_build/tmux:/usr/bin/tmux"
+    use_absolute_ip: true
+
+# ----- ModelExpress v2 weight-sync (mandatory for Dynamo refit) -----
+cluster:
+  gpus_per_node: 4          # 16 training GPUs across 4 nodes (FSDP dp=16). Mocked trainer;
+  num_nodes: 4              # the extra nodes give the 512 SWE-agent sandboxes RAM headroom (~660 GiB/node).
+  weight_sync:
+    method: "mx"
+    mx_config:
+      enabled: true
+      mx_server_url: "modelexpress-server.default.svc.cluster.local:8001"
+      timeout_seconds: 300.0
+      same_rank_only: true
+      # Qwen3-30B-A3B IS MoE -> enable the expert filter (unlike the dense 4B
+      # smoke). Pairs with detect_moe_expert_layout in the DTensor worker.
+      moe_expert_filter: true
+      # Keep tree_scale_out OFF for a static gen pool (memory:
+      # project_tree_scale_out_hurts_refit_perf). Flip on only with autoscaling.
+      tree_scale_out: false
+      nic_pin: "auto"
+      retain_latest_k: 1
+
+logger:
+  log_dir: "logs/grpo-swe2-qwen3-30b-dynamo-mx"
+  num_val_samples_to_print: 0
+  wandb_enabled: true       # gen-scale benchmark run — capture the trace
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  monitor_gpus: true
+  swanlab_enabled: false
+  wandb:
+    project: "swe-benchmark"
+    name: "grpo-swe2-q30b-dynamo-mx-genscale-4w-c36"
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
