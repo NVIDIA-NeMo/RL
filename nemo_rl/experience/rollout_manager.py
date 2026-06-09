@@ -57,6 +57,9 @@ class AsyncRolloutManager:
         num_generations_per_prompt: int,
         max_rollout_turns: int = 999999,
     ) -> None:
+        assert num_generations_per_prompt >= 1, (
+            "num_generations_per_prompt must be >= 1"
+        )
         self._policy_generation = policy_generation
         self._tokenizer = tokenizer
         self._task_to_env = task_to_env
