@@ -13,21 +13,105 @@
 # limitations under the License.
 import json
 from pathlib import Path
-from typing import Any, Dict, List, TypedDict
+from typing import Any, Dict, List, NotRequired, TypedDict
 
 import ray
 import torch
 from transformers import PreTrainedTokenizerBase
 
-from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
+from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_GYM_PORT_RANGE_HIGH,
+    DEFAULT_GYM_PORT_RANGE_LOW,
+    _get_free_port_local,
+    _get_node_ip_local,
+)
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.utils.timer import Timer
+
+DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
+    "<tool_call>",
+    "</tool_call>",
+    "<function_call>",
+    "</function_call>",
+]
+DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
 
 
 class NemoGymConfig(TypedDict):
     model_name: str
     base_urls: List[str]
     initial_global_config_dict: Dict[str, Any]
+    # Port range for Gym HTTP servers (head server + subprocess servers).
+    # Defaults to DEFAULT_GYM_PORT_RANGE_LOW/HIGH (15001-20000) from
+    # nemo_rl.distributed.virtual_cluster.  See the port layout there.
+    port_range_low: NotRequired[int]
+    port_range_high: NotRequired[int]
+    invalid_tool_call_patterns: NotRequired[
+        List[str] | None
+    ]  # Substrings in assistant text content that indicate an invalid tool call
+    thinking_tags: NotRequired[
+        List[str] | None
+    ]  # Thinking tags to check for malformed usage
+
+
+def _detect_invalid_tool_call_and_malformed_thinking(
+    output_item_dict: dict[str, Any],
+    invalid_tool_call_patterns: list[str] | None = None,
+    thinking_tags: list[str] | None = None,
+) -> tuple[bool, bool]:
+    """Flag a NeMo-Gym output item as an invalid tool call / malformed thinking.
+
+    Inspects the final output item of a model turn. For a final *content*
+    message, any thinking tag is malformed (thinking should never leak into the
+    answer); for a *reasoning* summary, only a repeated tag (count > 1) is
+    malformed (a single pair is expected). A textual tool-call pattern in either
+    indicates an invalid (unexecuted) tool call.
+
+    Returns:
+        (is_invalid_tool_call, has_malformed_thinking).
+    """
+    invalid_tool_call_patterns = (
+        invalid_tool_call_patterns or DEFAULT_INVALID_TOOL_CALL_PATTERNS
+    )
+    thinking_tags = thinking_tags or DEFAULT_THINKING_TAGS
+
+    is_output_message = (
+        "content" in output_item_dict
+        and len(output_item_dict["content"]) > 0
+        and "text" in output_item_dict["content"][0]
+    )
+    # NeMo-Gym only attaches generation_token_ids to the last output item of a
+    # model call (see vllm_model/app.py postprocess_chat_response). So this item
+    # is guaranteed to be the final thing the model produced for this turn.
+    # If it's a reasoning item, the model output only reasoning (no content/tool calls).
+    is_reasoning_message = (
+        output_item_dict.get("type") == "reasoning"
+        and len(output_item_dict.get("summary", [])) > 0
+        and "text" in output_item_dict["summary"][0]
+    )
+
+    is_invalid_tool_call = False
+    has_malformed_thinking = False
+    if is_output_message:
+        assistant_message_content = output_item_dict["content"][0]["text"]
+        if any(
+            pattern in assistant_message_content
+            for pattern in invalid_tool_call_patterns
+        ):
+            is_invalid_tool_call = True
+        if any(tag in assistant_message_content for tag in thinking_tags):
+            has_malformed_thinking = True
+    elif is_reasoning_message:
+        assistant_message_content = output_item_dict["summary"][0]["text"]
+        if any(
+            pattern in assistant_message_content
+            for pattern in invalid_tool_call_patterns
+        ):
+            is_invalid_tool_call = True
+        if any(assistant_message_content.count(tag) > 1 for tag in thinking_tags):
+            has_malformed_thinking = True
+
+    return is_invalid_tool_call, has_malformed_thinking
 
 
 def _truncate_error_value(value: Any, max_len: int = 256) -> str:
@@ -218,7 +302,9 @@ class NemoGym(EnvironmentInterface):
         self.cfg = cfg
 
         self.node_ip = _get_node_ip_local()
-        self.head_server_port = _get_free_port_local()
+        _gym_port_low = self.cfg.get("port_range_low", DEFAULT_GYM_PORT_RANGE_LOW)
+        _gym_port_high = self.cfg.get("port_range_high", DEFAULT_GYM_PORT_RANGE_HIGH)
+        self.head_server_port = _get_free_port_local(_gym_port_low, _gym_port_high)
 
         from nemo_gym.cli import GlobalConfigDictParserConfig, RunHelper
         from nemo_gym.rollout_collection import RolloutCollectionHelper
@@ -241,6 +327,20 @@ class NemoGym(EnvironmentInterface):
         # rather than falling back to localhost, or remote workers will connect to
         # their own loopback interface instead of the actor-hosted service.
         initial_global_config_dict.setdefault("default_host", self.node_ip)
+
+        _gym_port_low = self.cfg.get("port_range_low", DEFAULT_GYM_PORT_RANGE_LOW)
+        _gym_port_high = self.cfg.get("port_range_high", DEFAULT_GYM_PORT_RANGE_HIGH)
+        if (
+            _gym_port_low < DEFAULT_GYM_PORT_RANGE_LOW
+            or _gym_port_high > DEFAULT_GYM_PORT_RANGE_HIGH
+        ):
+            print(
+                f"WARNING: Gym port range [{_gym_port_low}, {_gym_port_high}) is outside "
+                f"the default [{DEFAULT_GYM_PORT_RANGE_LOW}, {DEFAULT_GYM_PORT_RANGE_HIGH}). "
+                f"Check the port layout in virtual_cluster.py for conflicts."
+            )
+        initial_global_config_dict["port_range_low"] = _gym_port_low
+        initial_global_config_dict["port_range_high"] = _gym_port_high
 
         initial_global_config_dict.setdefault(
             "global_aiohttp_connector_limit_per_host", 16_384
@@ -368,6 +468,7 @@ Depending on your data shape, you may want to change these values."""
 
         nemo_rl_message_log = []
         seen_token_ids: List[int] = []
+        batch_decode_items = []
         for output_item_dict in nemo_gym_result["response"]["output"]:
             # Nemo RL really only has two types of messages: assistant and not assistant since that is all that it is concerned with (i.e. to train or not to train)
             # Here we map all the trainable messages to assistant and all the non-trainable messages to user.
@@ -385,37 +486,63 @@ Seen token IDs: {seen_token_ids}
 Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
 """
 
+            prompt_token_ids = output_item_dict.pop("prompt_token_ids")
+            generation_token_ids = output_item_dict.pop("generation_token_ids")
+            generation_log_probs = output_item_dict.pop("generation_log_probs")
+            new_prompt_token_ids = prompt_token_ids[len(seen_token_ids) :]
+
             nemo_rl_message_log.append(
                 {
                     "role": "user",
                     "content": "",
-                    "token_ids": torch.tensor(
-                        output_item_dict["prompt_token_ids"][len(seen_token_ids) :]
-                    ),
+                    "token_ids": torch.tensor(new_prompt_token_ids),
                 }
             )
+            # Valid tool calls go through the structured API (tool_calls field) and get
+            # executed by NeMo-Gym. If tool call patterns appear in the text content instead,
+            # the call was invalid and never executed — flag it so training can penalize it.
+            is_invalid_tool_call, has_malformed_thinking = (
+                _detect_invalid_tool_call_and_malformed_thinking(
+                    output_item_dict,
+                    invalid_tool_call_patterns=self.cfg.get(
+                        "invalid_tool_call_patterns"
+                    ),
+                    thinking_tags=self.cfg.get("thinking_tags"),
+                )
+            )
+
             nemo_rl_message_log.append(
                 {
                     "role": "assistant",
                     "content": "",
-                    "token_ids": torch.tensor(output_item_dict["generation_token_ids"]),
-                    "generation_logprobs": torch.tensor(
-                        output_item_dict["generation_log_probs"]
-                    ),
+                    "token_ids": torch.tensor(generation_token_ids),
+                    "generation_logprobs": torch.tensor(generation_log_probs),
+                    "is_invalid_tool_call": is_invalid_tool_call,
+                    "has_malformed_thinking": has_malformed_thinking,
                 }
             )
 
-            seen_token_ids.extend(nemo_rl_message_log[-2]["token_ids"])
-            seen_token_ids.extend(nemo_rl_message_log[-1]["token_ids"])
+            seen_token_ids.extend(new_prompt_token_ids)
+            seen_token_ids.extend(generation_token_ids)
 
             # We pop to remove larger tensors from logging.
-            output_item_dict["prompt_str"] = tokenizer.decode(
-                output_item_dict.pop("prompt_token_ids")
+            batch_decode_items.append(
+                (output_item_dict, prompt_token_ids, generation_token_ids)
             )
-            output_item_dict["generation_str"] = tokenizer.decode(
-                output_item_dict.pop("generation_token_ids")
+
+        if batch_decode_items:
+            prompt_strs = tokenizer.batch_decode(
+                [item[1] for item in batch_decode_items]
             )
-            output_item_dict.pop("generation_log_probs")
+            generation_strs = tokenizer.batch_decode(
+                [item[2] for item in batch_decode_items]
+            )
+
+            for (output_item_dict, _, _), prompt_str, generation_str in zip(
+                batch_decode_items, prompt_strs, generation_strs
+            ):
+                output_item_dict["prompt_str"] = prompt_str
+                output_item_dict["generation_str"] = generation_str
 
         if not nemo_rl_message_log:
             response_summary = _summarize_nemo_gym_empty_generation_result(
@@ -451,7 +578,7 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
 
 
 def setup_nemo_gym_config(config, tokenizer) -> None:
-    generation_config = config["policy"]["generation"]
+    generation_config = config.policy["generation"]
 
     # Enable the http server. Requires both async engine and the expose_http_server flag
     generation_config["vllm_cfg"]["async_engine"] = True

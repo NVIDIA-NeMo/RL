@@ -15,9 +15,19 @@
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar
 
 import torch
+from pydantic import BaseModel
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType, LossType
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
+from nemo_rl.algorithms.x_token.loss_utils import (
+    Fp32SparseMM,
+    alignment_from_flat_batch,
+    build_exact_token_map,
+    chunk_average_log_probs,
+    dp_all_reduce_sum,
+    get_sparse_projection_matrix,
+    valid_chunk_mask,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import DistributedCrossEntropy
 
@@ -79,39 +89,54 @@ class DraftCrossEntropyLossFn(LossFunction):
         )
 
 
-class ClippedPGLossConfig(TypedDict):
-    reference_policy_kl_penalty: float
-    reference_policy_kl_type: str
-    kl_input_clamp_value: float | None
-    kl_output_clamp_value: float | None
-    ratio_clip_min: float
-    ratio_clip_max: float
-    # Dual-clipping value (should be >1 if enabled; usually set to 3 empirically). None to disable.
-    ratio_clip_c: float | None
-    use_on_policy_kl_approximation: bool
-    use_importance_sampling_correction: bool
-    truncated_importance_sampling_ratio: float | None
-    # Type of truncated importance sampling:
-    #   "tis"          – clamp IS weights to max
-    #   "icepop"       – zero out tokens with IS weight outside [min, max]
-    #   "seq-mask-tis" – zero out sequences by geometric-mean IS ratio, non-truncated token IS correction
-    truncated_importance_sampling_type: NotRequired[str | None]
-    # Lower bound for ICE-POP / seq-mask-tis filtering
-    truncated_importance_sampling_ratio_min: NotRequired[float | None]
-    token_level_loss: bool
+class ClippedPGLossConfig(BaseModel, extra="allow"):
+    # --- Loss type ---
+    disable_ppo_ratio: bool = False
+    token_level_loss: bool = True
     # If True, apply the off-policy importance-sampling correction at the
     # sequence level (one weight per generated sample), as in GSPO.
     # If False (default), correction is applied at the token level as in the
     # original GRPO paper.
-    sequence_level_importance_ratios: NotRequired[bool]
-    disable_ppo_ratio: NotRequired[bool]
+    sequence_level_importance_ratios: bool = False
+
+    # --- Clipping ---
+    ratio_clip_min: float = 0.2
+    ratio_clip_max: float = 0.2
+    # Dual-clipping value (should be >1 if enabled; usually set to 3 empirically). None to disable.
+    ratio_clip_c: Optional[float] = None
+
+    # --- KL regularization ---
+    reference_policy_kl_penalty: float = 0.01
+    # Can be set to k1, k2, k3
+    # For more details, see http://joschu.net/blog/kl-approx.html
+    reference_policy_kl_type: str = "k3"
+    kl_input_clamp_value: Optional[float] = 20.0
+    kl_output_clamp_value: Optional[float] = 10.0
+    # If True, add KL penalty to reward instead of loss (used by Reinforce++)
+    use_kl_in_reward: bool = False
+
+    # --- Importance sampling correction ---
+    # Async GRPO requires importance sampling correction enabled
+    # Set to true when async_grpo.enabled is true
+    use_importance_sampling_correction: bool = False
+    # --- Truncated importance sampling ---
+    # Type of truncated importance sampling:
+    #   "tis"          – clamp IS weights to max
+    #   "icepop"       – zero out tokens with IS weight outside [min, max]
+    #   "seq-mask-tis" – zero out sequences by geometric-mean IS ratio, non-truncated token IS correction
+    truncated_importance_sampling_type: Optional[str] = None
+    truncated_importance_sampling_ratio: Optional[float] = None
+    # Lower bound for ICE-POP / seq-mask-tis filtering
+    truncated_importance_sampling_ratio_min: Optional[float] = None
+
+    # --- On-policy ---
+    # (default off) loss formulation improvements (docs/guides/grpo.md#loss)
+    use_on_policy_kl_approximation: bool = False
     # If True, force the ratio to 1.0 for truly on-policy behavior,
     # eliminating any importance sampling effects.
     # NOTE: This should only be used when doing exactly one update per rollout
     # (i.e., num_prompts_per_step * num_generations_per_prompt == train_global_batch_size)
-    force_on_policy_ratio: NotRequired[bool]
-    # If True, add KL penalty to reward instead of loss (used by Reinforce++)
-    use_kl_in_reward: NotRequired[bool]
+    force_on_policy_ratio: bool = False
 
 
 class ClippedPGLossDataDict(TypedDict):
@@ -171,50 +196,40 @@ class ClippedPGLossFn(LossFunction):
     input_type = LossInputType.LOGPROB
 
     def __init__(self, cfg: ClippedPGLossConfig):
-        self.ratio_clip_min = cfg["ratio_clip_min"]
-        self.ratio_clip_max = cfg["ratio_clip_max"]
-        self.ratio_clip_c = cfg["ratio_clip_c"]  # set to None to disable dual-clipping
-        self.reference_policy_kl_penalty = cfg["reference_policy_kl_penalty"]
-        self.reference_policy_kl_type = cfg["reference_policy_kl_type"]
-        self.kl_input_clamp_value = cfg["kl_input_clamp_value"]
-        self.kl_output_clamp_value = cfg["kl_output_clamp_value"]
-        self.disable_ppo_ratio = cfg.get("disable_ppo_ratio", False)
-        self.force_on_policy_ratio = cfg.get(
-            "force_on_policy_ratio", False
-        )  # Force ratio to 1.0
-        self.use_on_policy_kl_approximation = cfg["use_on_policy_kl_approximation"]
-        self.use_importance_sampling_correction = cfg[
-            "use_importance_sampling_correction"
-        ]
-        self.truncated_importance_sampling_ratio = cfg[
-            "truncated_importance_sampling_ratio"
-        ]
+        self.disable_ppo_ratio = cfg.disable_ppo_ratio
+        self.ratio_clip_min = cfg.ratio_clip_min
+        self.ratio_clip_max = cfg.ratio_clip_max
+        self.ratio_clip_c = cfg.ratio_clip_c  # set to None to disable dual-clipping
+        self.reference_policy_kl_penalty = cfg.reference_policy_kl_penalty
+        self.reference_policy_kl_type = cfg.reference_policy_kl_type
+        self.kl_input_clamp_value = cfg.kl_input_clamp_value
+        self.kl_output_clamp_value = cfg.kl_output_clamp_value
+        self.use_importance_sampling_correction = cfg.use_importance_sampling_correction
         # Type of truncated importance sampling: "tis" | "icepop" | "seq-mask-tis"
-        self.truncated_importance_sampling_type = cfg.get(
-            "truncated_importance_sampling_type"
+        self.truncated_importance_sampling_type = cfg.truncated_importance_sampling_type
+        self.truncated_importance_sampling_ratio = (
+            cfg.truncated_importance_sampling_ratio
         )
         # Lower bound for ICE-POP / seq-mask-tis filtering
-        self.truncated_importance_sampling_ratio_min = cfg.get(
-            "truncated_importance_sampling_ratio_min"
+        self.truncated_importance_sampling_ratio_min = (
+            cfg.truncated_importance_sampling_ratio_min
         )
+        self.use_on_policy_kl_approximation = cfg.use_on_policy_kl_approximation
+        self.force_on_policy_ratio = cfg.force_on_policy_ratio  # Force ratio to 1.0
+
         # Whether to compute importance weights per-sequence instead of per-token.
-        self.sequence_level_importance_ratios = cfg.get(
-            "sequence_level_importance_ratios",
-            False,
-        )
+        self.sequence_level_importance_ratios = cfg.sequence_level_importance_ratios
         self.loss_type = (
-            LossType.TOKEN_LEVEL if cfg["token_level_loss"] else LossType.SEQUENCE_LEVEL
+            LossType.TOKEN_LEVEL if cfg.token_level_loss else LossType.SEQUENCE_LEVEL
         )
         if self.sequence_level_importance_ratios:
             assert self.loss_type == LossType.SEQUENCE_LEVEL, (
                 "sequence-level importance sampling (e.g. GSPO) is mutually exclusive with token-level loss"
             )
-        if self.truncated_importance_sampling_ratio is not None:
+
+        if self.truncated_importance_sampling_type is not None:
             assert self.use_importance_sampling_correction, (
-                "truncated_importance_sampling_ratio is only supported when use_importance_sampling_correction is True"
-            )
-            assert self.truncated_importance_sampling_ratio > 0, (
-                "truncated_importance_sampling_ratio should be positive"
+                "truncated importance sampling is only supported when use_importance_sampling_correction is True"
             )
             assert self.truncated_importance_sampling_type in (
                 "tis",
@@ -224,24 +239,18 @@ class ClippedPGLossFn(LossFunction):
                 f"truncated_importance_sampling_type must be 'tis', 'icepop', or 'seq-mask-tis', "
                 f"got {self.truncated_importance_sampling_type}"
             )
+            assert (
+                self.truncated_importance_sampling_ratio is not None
+                and self.truncated_importance_sampling_ratio > 0
+            ), "truncated_importance_sampling_ratio should be positive"
+            if self.truncated_importance_sampling_type in ("icepop", "seq-mask-tis"):
+                assert self.truncated_importance_sampling_ratio_min is not None, (
+                    "truncated_importance_sampling_ratio_min should be set when truncated_importance_sampling_type is 'icepop' or 'seq-mask-tis'"
+                )
             if self.truncated_importance_sampling_type == "seq-mask-tis":
                 assert not self.sequence_level_importance_ratios, (
                     "seq-mask-tis uses token-level IS correction with sequence-level masking, "
                     "and is incompatible with sequence_level_importance_ratios=True"
-                )
-        else:
-            # Warn user that TIS-related parameters are ignored when truncated_importance_sampling_ratio is not set
-            ignored_params = []
-            if cfg.get("truncated_importance_sampling_type") is not None:
-                ignored_params.append("truncated_importance_sampling_type")
-            if cfg.get("truncated_importance_sampling_ratio_min") is not None:
-                ignored_params.append("truncated_importance_sampling_ratio_min")
-            if ignored_params:
-                print(
-                    f"[WARN] truncated_importance_sampling_ratio is not set, so the following "
-                    f"parameters are ignored: {', '.join(ignored_params)}. "
-                    f"Set truncated_importance_sampling_ratio to enable truncated importance sampling.",
-                    flush=True,
                 )
 
     def __call__(
@@ -256,7 +265,10 @@ class ClippedPGLossFn(LossFunction):
         token_mask = data["token_mask"][:, 1:]
         sample_mask = data["sample_mask"]
         advantages = data["advantages"][:, 1:]
-        prev_logprobs = data["prev_logprobs"][:, 1:]
+        # Skip loading prev_logprobs when force_on_policy_ratio=True (will use curr_logprobs instead)
+        prev_logprobs = (
+            None if self.force_on_policy_ratio else data["prev_logprobs"][:, 1:]
+        )
         generation_logprobs = data["generation_logprobs"][:, 1:]
         if self.reference_policy_kl_penalty != 0:
             reference_policy_logprobs = data["reference_policy_logprobs"][:, 1:]
@@ -265,6 +277,11 @@ class ClippedPGLossFn(LossFunction):
             )
 
         mask = token_mask * sample_mask.unsqueeze(-1)
+
+        # For truly on-policy training, use curr_logprobs as prev_logprobs
+        # This avoids computing prev_logprobs upstream
+        if self.force_on_policy_ratio:
+            prev_logprobs = curr_logprobs.detach()
 
         # token_mult_prob_error
         # See more details and other metrics in docs/guides/grpo.md#metrics
@@ -449,16 +466,19 @@ class ClippedPGLossFn(LossFunction):
         #                  IS ratio ∉ [min, max]; retained sequences keep
         #                  raw (non-truncated) token-level IS weights      (ref bounds: 0.999–1.002)
         #   Blog: https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda
+        # is_oob_ratio: fraction of tokens (tis/icepop) or sequences (seq-mask-tis)
+        # whose importance weight falls outside the truncation bounds. Each microbatch
+        # contributes its out-of-bounds count divided by the *global* valid token/seq
+        # count, so the np.sum aggregation in grpo.py recovers the correct global fraction.
         if self.truncated_importance_sampling_ratio is not None:
             if self.truncated_importance_sampling_type == "tis":
-                token_in_bounds = (
+                token_oob_mask = (
                     actor_importance_weights_expanded
-                    <= self.truncated_importance_sampling_ratio
+                    > self.truncated_importance_sampling_ratio
                 )
                 _is_filter_metrics = {
-                    "is_oob_ratio": 1.0
-                    - masked_mean(
-                        token_in_bounds.float(),
+                    "is_oob_ratio": masked_mean(
+                        token_oob_mask.float(),
                         mask,
                         global_normalization_factor=global_valid_toks,
                     ).item(),
@@ -476,9 +496,8 @@ class ClippedPGLossFn(LossFunction):
                     <= self.truncated_importance_sampling_ratio
                 )
                 _is_filter_metrics = {
-                    "is_oob_ratio": 1.0
-                    - masked_mean(
-                        token_kept_mask.float(),
+                    "is_oob_ratio": masked_mean(
+                        (~token_kept_mask).float(),
                         mask,
                         global_normalization_factor=global_valid_toks,
                     ).item(),
@@ -508,9 +527,8 @@ class ClippedPGLossFn(LossFunction):
                     & (seq_geomean_is_ratio <= self.truncated_importance_sampling_ratio)
                 ).float()  # [B]
                 _is_filter_metrics = {
-                    "is_oob_ratio": 1.0
-                    - masked_mean(
-                        seq_kept_mask,
+                    "is_oob_ratio": masked_mean(
+                        1.0 - seq_kept_mask,
                         sample_mask,
                         global_normalization_factor=global_valid_seqs,
                     ).item(),
@@ -1035,3 +1053,648 @@ class DistillationLossFn(LossFunction):
         }
 
         return kl_loss, metrics
+
+
+# =====================================================================
+# Cross-tokenizer distillation
+# =====================================================================
+
+
+class CrossTokenizerDistillationLossConfig(TypedDict):
+    """Config for cross-tokenizer distillation loss.
+
+    Attributes:
+        projection_matrix_path: Filesystem path to the .pt file containing
+            either the dense top-k projection (dict with 'indices' and
+            'likelihoods' tensors of shape [V_student, top_k]) or the sparse
+            multi-token format (dict[(student_id, teacher_id)] -> count).
+            Loaded lazily on first call by each worker process.
+        gold_loss: If True, switch to the gold-loss formulation: split the
+            vocab into an exact-token-mapped *common* set (KL) and an
+            *uncommon* set (sorted L1).
+        xtoken_loss: Modifier inside the gold-loss path. If True, relaxes
+            the exact-map threshold to ``>= 0.6`` (vs ``== 1.0``) and adds
+            a collision-replacement rule so multi-token projections can
+            still contribute exact maps. Requires ``gold_loss=True``.
+        temperature: Softmax temperature applied symmetrically to student
+            and teacher logits before KL.
+        vocab_topk: Microbatch-global top-k size used by the P-KL path
+            (``gold_loss=False``). Computed inside the loss fn from full
+            teacher logits. Inert when ``gold_loss=True``.
+        uncommon_topk: Cap on the L1 uncommon-tail sort in the gold path.
+            Defaults to 8192. Inert when ``gold_loss=False``.
+        reverse_kl: If True, compute KL(student || teacher) instead of
+            KL(teacher || student).
+        exact_token_match_only: If True, only aligned pairs flagged as
+            'is_correct' contribute to KL; mismatched pairs are masked out.
+            Used by the P-KL path only.
+        kl_loss_weight: Scalar multiplier on the KL term (P-KL path).
+        ce_loss_scale: Scalar multiplier on the CE term (P-KL path).
+        dynamic_loss_scaling: If True, rescale KL each step so its detached
+            magnitude matches CE (P-KL path).
+        student_vocab_size: Full student tokenizer vocab size, used to size
+            the projection matrix's student-side (V_s) axis. Runtime-injected
+            by ``xtoken_off_policy_distillation.setup`` from ``len(student_tokenizer)``;
+            not a user knob in YAML. Sizing V_s from the configured tokenizer
+            vocab (rather than ``max(observed student_id) + 1`` from the
+            sparse projection file) keeps V_s in lockstep with
+            ``logits.shape[-1]`` when the file's highest student ids happen
+            to be absent.
+        teacher_vocab_size: Full teacher tokenizer vocab size, used to size
+            the projection matrix's teacher-side (V_t) axis. Runtime-injected
+            symmetrically to ``student_vocab_size`` from
+            ``len(teacher_tokenizer)``; not a user knob in YAML.
+    """
+
+    projection_matrix_path: Optional[
+        str
+    ]  # null in the exemplar YAML; set per-run via Hydra CLI, required at runtime
+    gold_loss: bool
+    xtoken_loss: bool
+    temperature: float
+    vocab_topk: int
+    uncommon_topk: int
+    reverse_kl: bool
+    exact_token_match_only: bool
+    kl_loss_weight: float
+    ce_loss_scale: float
+    dynamic_loss_scaling: bool
+    student_vocab_size: NotRequired[int]
+    teacher_vocab_size: NotRequired[int]
+
+
+class CrossTokenizerDistillationLossDataDict(TypedDict):
+    input_ids: torch.Tensor
+    input_lengths: torch.Tensor
+    token_mask: torch.Tensor
+    sample_mask: torch.Tensor
+    # Full-vocab teacher logits shipped via CUDA IPC. List[B] of dicts; every
+    # entry within one DP rank carries the same ``rank_logits_ipc`` handle
+    # (taken on the producer's ``[B_r, T_t, V_t]`` tray) plus its own
+    # ``sample_idx_within_rank``. The consumer rebuilds the single rank-level
+    # handle and slices ``[mb_start:mb_end]`` for a contiguous view — no
+    # ``torch.stack``. Produced by ``Policy.get_full_logits_ipc``. The loss
+    # fn either derives a microbatch-global top-k subset internally (P-KL
+    # path) or uses full vocab end-to-end (gold-loss path).
+    teacher_full_logits_ipc: list[dict[str, Any]]
+    alignment_pair_valid: torch.Tensor  # [B, max_pairs]
+    alignment_pair_is_correct: torch.Tensor  # [B, max_pairs]
+    alignment_student_exact_partition_mask: torch.Tensor
+    alignment_teacher_exact_partition_mask: torch.Tensor
+    alignment_student_chunk_id: torch.Tensor  # [B, T_s], -1 = no chunk
+    alignment_teacher_chunk_id: torch.Tensor  # [B, T_t]
+    alignment_num_chunks: torch.Tensor
+
+
+class CrossTokenizerDistillationLossFn(LossFunction):
+    """Cross-tokenizer distillation loss.
+
+    Mode is selected by the ``(gold_loss, xtoken_loss)`` flags:
+
+    - ``(False, False)`` -> P-KL: full-vocab projection KL (student logits
+      mapped through the projection matrix M) plus a standard next-token
+      student CE term, combined as ``kl_loss_weight * kl + ce_loss_scale * ce``
+      — or, when ``dynamic_loss_scaling`` is set, with the KL term rescaled
+      each step to match the detached CE magnitude.
+    - ``(True, False)`` -> gold-loss: ``(kl_common + l1_uncommon) * T**2``,
+      i.e. KL on the exact-mapped *common* partition plus a sorted-L1 term on
+      the *uncommon* tail. No CE term.
+    - ``(True, True)`` -> gold-loss with the xtoken modifier: same objective,
+      but the exact-map threshold is relaxed (``>= 0.6`` instead of ``== 1.0``)
+      and a collision-replacement rule lets multi-token projections still
+      contribute exact maps.
+
+    ``(False, True)`` is rejected in ``__init__``: xtoken_loss is a modifier
+    inside the gold path and is undefined for P-KL.
+
+    Inputs (via ``LossInputType.DISTILLATION_CROSS_TOKENIZER``):
+        logits: ``[B, T_s, V_s]`` raw student logits from the worker forward.
+        teacher_full_logits: ``[B, T_t, V_t]`` full-vocab teacher logits,
+            rebuilt from the CUDA IPC handles by ``prepare_loss_input`` (see
+            :func:`nemo_rl.algorithms.x_token.loss_utils.rebuild_teacher_full_logits_from_ipc`).
+
+    Inputs (via ``data: BatchedDataDict``):
+        See :class:`CrossTokenizerDistillationLossDataDict`.
+
+    Returns:
+        ``(loss, metrics)``. The P-KL path reports ``loss``, ``kl_loss``,
+        ``ce_loss``, ``kl_loss_scale``, ``accuracy``, ``proj_accuracy``,
+        ``num_valid_samples``, ``num_valid_pairs``. The gold path reports
+        ``loss``, ``kl_common``, ``l1_uncommon``, ``accuracy``,
+        ``num_valid_samples``, ``num_valid_chunks``.
+    """
+
+    loss_type = LossType.TOKEN_LEVEL
+    input_type = LossInputType.DISTILLATION_CROSS_TOKENIZER
+
+    def __init__(self, cfg: CrossTokenizerDistillationLossConfig):
+        if cfg["xtoken_loss"] and not cfg["gold_loss"]:
+            raise ValueError(
+                "xtoken_loss=True requires gold_loss=True; xtoken_loss is "
+                "a modifier inside the gold path (relaxes the exact-map "
+                "threshold and adds collision resolution) and is undefined "
+                "in the P-KL path."
+            )
+        self.projection_matrix_path = cfg["projection_matrix_path"]
+        self.gold_loss = cfg["gold_loss"]
+        self.xtoken_loss = cfg["xtoken_loss"]
+        self.temperature = cfg["temperature"]
+        self.vocab_topk = cfg["vocab_topk"]
+        self.uncommon_topk = cfg["uncommon_topk"]
+        self.reverse_kl = cfg["reverse_kl"]
+        self.exact_token_match_only = cfg["exact_token_match_only"]
+        self.kl_loss_weight = cfg["kl_loss_weight"]
+        self.ce_loss_scale = cfg["ce_loss_scale"]
+        self.dynamic_loss_scaling = cfg["dynamic_loss_scaling"]
+        self.student_vocab_size = cfg["student_vocab_size"]
+        self.teacher_vocab_size = cfg["teacher_vocab_size"]
+        # The materialized projection matrix and the derived exact-map
+        # partition both live in process-local caches in
+        # ``x_token.loss_utils`` (see ``get_sparse_projection_matrix``,
+        # ``get_topk_projection``, ``build_exact_token_map``), not on
+        # this instance. That keeps the driver-side ``loss_fn`` free of
+        # any large CUDA tensors and lets multiple loss instances on
+        # the same worker share one load.
+
+    def __call__(
+        self,
+        data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+        logits: torch.Tensor,
+        teacher_full_logits: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Compute the cross-tokenizer distillation loss for one microbatch."""
+        if self.gold_loss:
+            loss, kl_common, l1_uncommon, num_valid_chunks, top1_acc = (
+                self._compute_gold(logits, data, teacher_full_logits)
+            )
+            metrics = {
+                "loss": loss.item(),
+                "kl_common": kl_common.item(),
+                "l1_uncommon": l1_uncommon.item(),
+                "accuracy": top1_acc.item(),
+                "num_valid_samples": data["input_ids"].shape[0],
+                "num_valid_chunks": int(num_valid_chunks.item()),
+            }
+            return loss, metrics
+
+        kl_loss, num_valid_pairs, proj_acc = self._compute_p_kl(
+            logits, data, teacher_full_logits
+        )
+        ce_loss = self._compute_ce(logits, data, global_valid_toks)
+
+        # Next-token accuracy on the student side, masked to valid tokens.
+        # Quick per-step signal on the student's next-token prediction
+        # quality.
+        with torch.no_grad():
+            student_argmax = logits[:, :-1].argmax(dim=-1)
+            shift_labels = data["input_ids"][:, 1:]
+            acc_mask = (
+                data["token_mask"][:, 1:].float()
+                * data["sample_mask"].unsqueeze(-1).float()
+            )
+            denom = acc_mask.sum().clamp(min=1.0)
+            accuracy = (
+                (student_argmax == shift_labels).float() * acc_mask
+            ).sum() / denom
+
+        if self.dynamic_loss_scaling:
+            # Dynamic loss scaling:
+            #   dls_scale = ce_loss.item() / kl_loss.item()
+            #   loss = kl_loss * dls_scale + ce_loss
+            # User-supplied `kl_loss_weight` / `ce_loss_scale` are
+            # intentionally ignored in this branch.
+            kl_detached = kl_loss.detach().abs()
+            ce_detached = ce_loss.detach().abs()
+            kl_scale = torch.where(
+                kl_detached > 0,
+                ce_detached / kl_detached,
+                torch.ones_like(kl_detached),
+            )
+            loss = kl_scale * kl_loss + ce_loss
+        else:
+            kl_scale = torch.tensor(1.0, device=kl_loss.device, dtype=kl_loss.dtype)
+            loss = self.kl_loss_weight * kl_loss + self.ce_loss_scale * ce_loss
+
+        metrics = {
+            "loss": loss.item(),
+            "kl_loss": kl_loss.item(),
+            "ce_loss": ce_loss.item(),
+            "kl_loss_scale": kl_scale.item(),
+            "accuracy": accuracy.item(),
+            "proj_accuracy": proj_acc.item(),
+            "num_valid_samples": data["input_ids"].shape[0],
+            "num_valid_pairs": int(num_valid_pairs.item()),
+        }
+        return loss, metrics
+
+    # ------------------------------------------------------------------ #
+    # Loss-mode implementations
+    # ------------------------------------------------------------------ #
+    def _compute_p_kl(
+        self,
+        logits: torch.Tensor,
+        data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
+        teacher_full_logits: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """P-KL: chunk-averaged KL over a microbatch-global top-k teacher subset.
+
+        Steps:
+
+        1. Project full-vocab student probs through ``M`` to teacher vocab.
+        2. Use the full teacher logits materialized by ``prepare_loss_input``.
+        3. Align each predictor with the token it predicts by shifting the
+           per-position tensors and chunk ids by one (drop the last
+           predictor position and the first chunk label), symmetrically on
+           student and teacher. Matches the next-token shift already used by
+           the CE term.
+        4. Compute one ``global_top_indices [k]`` per microbatch from the
+           teacher's importance: ``max`` over flat ``(B*T_t)``, ``topk``
+           over ``V_t``. Same vocab subset across every sample/position —
+           keeps chunk-averaged KL well-defined.
+        5. Slice both the projected student probs and the teacher logits
+           to those ``k`` columns.
+        6. Build per-token chunk masks from ``alignment_*_chunk_id`` and
+           chunk-average via ``bmm`` (shared helper).
+        7. Renormalize student chunk distributions inside the top-k subset
+           (avg-then-renormalize, log).
+        8. Forward (or reverse) KL between chunk distributions.
+        """
+        T = self.temperature
+        device = logits.device
+        eps = 1e-10
+
+        b, t_s, v_s = logits.shape
+        student_log_probs = torch.log_softmax(logits.float() / T, dim=-1)
+        student_probs = student_log_probs.exp()  # [B, T_s, V_s]
+
+        # Project to full teacher vocab. Sparse matmul via M.T trick.
+        # `Fp32SparseMM` keeps the op in FP32 on both forward and backward;
+        # `torch.sparse.mm` has no BF16 kernel and the worker's autocast(BF16)
+        # context wraps loss.backward(), so a plain `.float()` cast isn't
+        # enough — the backward kernel is still dispatched as BF16.
+        M = get_sparse_projection_matrix(
+            self.projection_matrix_path,
+            device,
+            student_vocab_size=self.student_vocab_size,
+            teacher_vocab_size=self.teacher_vocab_size,
+        )  # [V_s, V_t] sparse COO, fp32
+        flat = student_probs.reshape(b * t_s, v_s)
+        # Fp32SparseMM internally computes M.t() @ dense; passing M (not
+        # M.t()) avoids a sparse `.t()` on a saved tensor in backward.
+        projected_full = Fp32SparseMM.apply(M, flat.t()).t()  # [B*T_s, V_t]
+        v_t = projected_full.shape[-1]
+        projected_full = projected_full.reshape(b, t_s, v_t)  # [B, T_s, V_t]
+
+        # `teacher_full_logits` [B, T_t, V_t_model] is materialized by
+        # `prepare_loss_input` (rebuilt from the IPC handles). Same transport
+        # as the gold path consumes; here we additionally compute a
+        # microbatch-global top-k inline.
+        # HF models commonly pad lm_head out_features beyond len(tokenizer)
+        # for embedding/FFN alignment (e.g. Qwen3: tokenizer 151669,
+        # lm_head 151936). The projection matrix is sized to the real
+        # tokenizer vocab (`self.teacher_vocab_size`); the padded
+        # columns aren't real tokens and the projection has no entries
+        # there. Slice to the projection's V_t to keep the projected
+        # student probs and the teacher logits on the same vocab axis.
+        if teacher_full_logits.shape[-1] > v_t:
+            teacher_full_logits = teacher_full_logits[..., :v_t]
+
+        # Chunk-alignment data.
+        alignment = alignment_from_flat_batch(data)
+        student_chunk_id = alignment.student_chunk_id  # [B, T_s] long
+        teacher_chunk_id = alignment.teacher_chunk_id  # [B, T_t] long
+        pair_valid = alignment.pair_valid  # [B, max_pairs]
+        if self.exact_token_match_only:
+            pair_valid = pair_valid & alignment.pair_is_correct
+        max_chunks = pair_valid.shape[1]
+
+        # A model's distribution at position t predicts the token at t+1, so
+        # align each predictor with the token it predicts: drop the last
+        # predictor position (nothing past the sequence to predict) and the
+        # first chunk label (no predictor precedes it). Applied symmetrically
+        # to student and teacher. Same next-token convention the CE term uses.
+        projected_full = projected_full[:, :-1, :]
+        teacher_full_logits = teacher_full_logits[:, :-1, :]
+        student_chunk_id = student_chunk_id[:, 1:]
+        teacher_chunk_id = teacher_chunk_id[:, 1:]
+
+        # global_top_indices: max over flat (B*T_t) → [V_t] → topk → [k].
+        vocab_topk = min(self.vocab_topk, v_t)
+        with torch.no_grad():
+            # reshape (not view): the shift above leaves teacher_full_logits
+            # non-contiguous.
+            teacher_flat = teacher_full_logits.reshape(-1, v_t)
+            global_importance = teacher_flat.max(dim=0).values
+            global_top_indices = torch.topk(
+                global_importance, k=vocab_topk, dim=-1
+            ).indices
+            global_top_indices = global_top_indices.sort().values  # [k]
+
+        # Slice both sides to the shared [k] columns.
+        projected_topk = projected_full[..., global_top_indices]  # [B, T_s-1, k]
+        teacher_topk_logits = teacher_full_logits[
+            ..., global_top_indices
+        ]  # [B, T_t-1, k]
+        target_log_probs = torch.log_softmax(
+            teacher_topk_logits / T, dim=-1
+        )  # [B, T_t-1, k] (renormalized within the [k] subset).
+
+        # Chunk-average both sides via the shared helper.
+        proj_chunks, proj_sizes = chunk_average_log_probs(
+            projected_topk, student_chunk_id, max_chunks
+        )  # [B, C, k] / [B, C]
+        tgt_log_chunks, tgt_sizes = chunk_average_log_probs(
+            target_log_probs, teacher_chunk_id, max_chunks
+        )  # [B, C, k] / [B, C]
+
+        # Renormalize the projected chunk distribution within the top-k
+        # subset, then take log. Teacher side is already log-probs (avg of
+        # log_softmaxes; not a true log of mean).
+        proj_chunks = proj_chunks / (proj_chunks.sum(dim=-1, keepdim=True) + eps)
+        proj_log_chunks = (proj_chunks + eps).log()
+
+        chunk_mask = valid_chunk_mask(proj_sizes, tgt_sizes, pair_valid)
+        # Compute the DP-global valid-chunk count BEFORE the early
+        # return so the collective fires on every rank (a local-only
+        # `chunk_mask.any()` check would deadlock when one rank skips
+        # and others do not). The reduction at the bottom uses this
+        # global count so the KL is normalized by
+        # `sum(global_valid_chunks)` rather than a per-rank mean —
+        # mirrors the `global_valid_toks` convention used by CE.
+        sample_mask_bool = data["sample_mask"].bool()
+        valid_bool = chunk_mask & sample_mask_bool.unsqueeze(-1)
+        global_valid_chunks = dp_all_reduce_sum(valid_bool.sum())
+        if global_valid_chunks.item() == 0:
+            zero = torch.zeros((), device=device, dtype=proj_log_chunks.dtype)
+            return (
+                zero,
+                torch.zeros((), device=device, dtype=torch.long),
+                zero.detach(),
+            )
+
+        # Projection top-1 accuracy: per-chunk argmax of the student-side
+        # projected distribution vs the teacher's argmax over the same
+        # top-k subset.
+        with torch.no_grad():
+            proj_top1 = proj_chunks.argmax(dim=-1)  # [B, C]
+            tgt_top1 = torch.exp(tgt_log_chunks).argmax(dim=-1)  # [B, C]
+            proj_matches = (proj_top1 == tgt_top1) & chunk_mask
+            proj_acc = proj_matches.sum().float() / chunk_mask.sum().float().clamp(
+                min=1.0
+            )
+
+        # KL between chunk-averaged distributions.
+        if self.reverse_kl:
+            # KL(student || teacher)
+            per_chunk_kl = torch.nn.functional.kl_div(
+                tgt_log_chunks, proj_log_chunks, reduction="none", log_target=True
+            ).sum(dim=-1)
+        else:
+            # Forward KL(teacher || student)
+            per_chunk_kl = torch.nn.functional.kl_div(
+                proj_log_chunks, tgt_log_chunks, reduction="none", log_target=True
+            ).sum(dim=-1)
+
+        sample_mask = data["sample_mask"].to(per_chunk_kl.dtype)  # [B]
+        valid = chunk_mask.to(per_chunk_kl.dtype) * sample_mask.unsqueeze(-1)
+        denom = global_valid_chunks.to(per_chunk_kl.dtype).clamp(min=1.0)
+        kl_loss = (per_chunk_kl * valid).sum() / denom * (T * T)
+        return kl_loss, valid.sum().detach(), proj_acc.detach()
+
+    def _compute_gold(
+        self,
+        logits: torch.Tensor,
+        data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
+        teacher_full_logits: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Gold-loss path: KL on common (exact-mapped) vocab + L1 on uncommon.
+
+        1. Lazy-build the exact-token map (cached per device).
+        2. Use the full teacher logits materialized by ``prepare_loss_input``.
+        3. ``log_softmax`` on full vocab both sides; shift each predictor to
+           the token it predicts (drop the last predictor position, first
+           chunk label); chunk-average via the shared helper.
+        4. Slice each chunk-averaged tensor to ``common_*`` indices and
+           compute (forward or reverse) KL, reduced as
+           ``sum / valid_chunk.sum()`` where ``valid_chunk`` is the
+           geometric chunk mask AND'd with ``sample_mask`` (mirrors the
+           P-KL path).
+        5. Slice to ``uncommon_*`` indices, ``.exp()`` to probs, sort/topk
+           descending (capped at ``self.uncommon_topk``), truncate to
+           ``min(student_len, teacher_len)``, L1 with ``reduction="none"``
+           summed over vocab and meaned across valid chunks.
+        6. Combine: ``loss = (kl_common + l1_uncommon) * T**2``.
+        7. Top-1 accuracy on the common slice over valid chunks.
+
+        Returns ``(loss, kl_common, l1_uncommon, num_valid_chunks, top1_acc)``.
+        Components other than ``loss`` are detached.
+        """
+        T = self.temperature
+        device = logits.device
+
+        exact_map = build_exact_token_map(
+            self.projection_matrix_path,
+            device,
+            xtoken_loss=self.xtoken_loss,
+            teacher_vocab_size=self.teacher_vocab_size,
+        )
+        common_s = exact_map["common_student"]
+        common_t = exact_map["common_teacher"]
+        uncommon_s = exact_map["uncommon_student"]
+        uncommon_t = exact_map["uncommon_teacher"]
+        v_teacher = self.teacher_vocab_size
+
+        # `teacher_full_logits` [B, T_t, V_t_model] is materialized by
+        # `prepare_loss_input` (rebuilt from the IPC handles).
+        # Drop any padded lm_head vocab beyond the real tokenizer vocab —
+        # the exact-token map's t-axis is bounded by `teacher_vocab_size`,
+        # so chunked teacher log-probs must use the same axis. See the
+        # matching note in `_compute_p_kl` for why the model vocab can
+        # exceed `len(tokenizer)`.
+        if teacher_full_logits.shape[-1] > v_teacher:
+            teacher_full_logits = teacher_full_logits[..., :v_teacher]
+
+        student_log_probs = torch.log_softmax(
+            logits.float() / T, dim=-1
+        )  # [B, T_s, V_s]
+        teacher_log_probs = torch.log_softmax(
+            teacher_full_logits / T, dim=-1
+        )  # [B, T_t, V_t]
+
+        alignment = alignment_from_flat_batch(data)
+        student_chunk_id = alignment.student_chunk_id
+        teacher_chunk_id = alignment.teacher_chunk_id
+        pair_valid = alignment.pair_valid
+        max_chunks = pair_valid.shape[1]
+
+        # A model's distribution at position t predicts the token at t+1, so
+        # align each predictor with the token it predicts: drop the last
+        # predictor position and the first chunk label, symmetrically on
+        # student and teacher. See the matching note in `_compute_p_kl`.
+        student_log_probs = student_log_probs[:, :-1, :]
+        teacher_log_probs = teacher_log_probs[:, :-1, :]
+        student_chunk_id = student_chunk_id[:, 1:]
+        teacher_chunk_id = teacher_chunk_id[:, 1:]
+
+        student_chunks, s_sizes = chunk_average_log_probs(
+            student_log_probs, student_chunk_id, max_chunks
+        )  # [B, C, V_s] / [B, C]
+        teacher_chunks, t_sizes = chunk_average_log_probs(
+            teacher_log_probs, teacher_chunk_id, max_chunks
+        )  # [B, C, V_t] / [B, C]
+
+        chunk_mask = valid_chunk_mask(s_sizes, t_sizes, pair_valid)
+        # Match the P-KL path: a chunk only contributes if its alignment is
+        # geometrically valid AND its sample isn't masked out by sample_mask.
+        sample_mask = data["sample_mask"]  # [B]
+        valid_chunk = chunk_mask & sample_mask.bool().unsqueeze(-1)
+        zero_dtype = student_log_probs.dtype
+        # Compute the DP-global valid-chunk count BEFORE any potentially
+        # divergent early return so the collective fires on every rank;
+        # both `kl_common` and `l1_uncommon` use this as their denom so
+        # the loss is normalized by `sum(global_valid_chunks)`, not a
+        # per-rank mean.
+        global_valid_chunks = dp_all_reduce_sum(valid_chunk.sum())
+        if global_valid_chunks.item() == 0:
+            zero = torch.zeros((), device=device, dtype=zero_dtype)
+            return (
+                zero,
+                zero.detach(),
+                zero.detach(),
+                torch.zeros((), device=device, dtype=torch.long),
+                zero.detach(),
+            )
+
+        # ---------------------- KL on common ----------------------
+        if common_s.numel() > 0:
+            student_common = student_chunks[:, :, common_s]  # [B, C, N_common]
+            teacher_common = teacher_chunks[:, :, common_t]  # [B, C, N_common]
+            if self.reverse_kl:
+                kl_per_elem = torch.nn.functional.kl_div(
+                    teacher_common,
+                    student_common,
+                    reduction="none",
+                    log_target=True,
+                )
+            else:
+                kl_per_elem = torch.nn.functional.kl_div(
+                    student_common,
+                    teacher_common,
+                    reduction="none",
+                    log_target=True,
+                )
+            kl_per_chunk = kl_per_elem.sum(dim=-1) * valid_chunk  # [B, C]
+            kl_common = kl_per_chunk.sum() / global_valid_chunks.to(
+                kl_per_chunk.dtype
+            ).clamp(min=1.0)
+        else:
+            kl_common = torch.zeros(
+                (), device=device, dtype=zero_dtype, requires_grad=True
+            )
+            student_common = None
+            teacher_common = None
+
+        # -------------------- L1 on uncommon ----------------------
+        uncommon_topk = self.uncommon_topk
+        if uncommon_s.numel() > 0 or uncommon_t.numel() > 0:
+            student_unc = student_chunks[:, :, uncommon_s][
+                valid_chunk
+            ]  # [N_valid, N_u_s]
+            teacher_unc = teacher_chunks[:, :, uncommon_t][
+                valid_chunk
+            ]  # [N_valid, N_u_t]
+            n_valid = student_unc.shape[0]
+            max_uncommon = min(
+                student_unc.shape[-1],
+                teacher_unc.shape[-1],
+                uncommon_topk,
+            )
+            if n_valid > 0 and max_uncommon > 0:
+                student_unc_probs = student_unc.exp()
+                teacher_unc_probs = teacher_unc.exp()
+                if student_unc_probs.shape[-1] > max_uncommon:
+                    student_sorted = torch.topk(
+                        student_unc_probs, k=max_uncommon, dim=-1, largest=True
+                    ).values
+                else:
+                    student_sorted = student_unc_probs.sort(
+                        dim=-1, descending=True
+                    ).values
+                if teacher_unc_probs.shape[-1] > max_uncommon:
+                    teacher_sorted = torch.topk(
+                        teacher_unc_probs, k=max_uncommon, dim=-1, largest=True
+                    ).values
+                else:
+                    teacher_sorted = teacher_unc_probs.sort(
+                        dim=-1, descending=True
+                    ).values
+                min_len = min(student_sorted.shape[-1], teacher_sorted.shape[-1])
+                student_sorted = student_sorted[:, :min_len]
+                teacher_sorted = teacher_sorted[:, :min_len]
+                l1_per_chunk = torch.nn.functional.l1_loss(
+                    student_sorted, teacher_sorted, reduction="none"
+                ).sum(dim=-1)
+                l1_uncommon = l1_per_chunk.sum() / global_valid_chunks.to(
+                    l1_per_chunk.dtype
+                ).clamp(min=1.0)
+            else:
+                l1_uncommon = torch.zeros(
+                    (), device=device, dtype=zero_dtype, requires_grad=True
+                )
+        else:
+            l1_uncommon = torch.zeros(
+                (), device=device, dtype=zero_dtype, requires_grad=True
+            )
+
+        # -------------------- Top-1 accuracy ----------------------
+        with torch.no_grad():
+            if student_common is not None:
+                s_common_valid = student_common[valid_chunk]
+                t_common_valid = teacher_common[valid_chunk]
+                matches = (
+                    (s_common_valid.argmax(dim=-1) == t_common_valid.argmax(dim=-1))
+                    .sum()
+                    .float()
+                )
+                top1_acc = matches / valid_chunk.sum().float().clamp(min=1.0)
+            else:
+                top1_acc = torch.zeros((), device=device, dtype=zero_dtype)
+
+        loss = (kl_common + l1_uncommon) * (T * T)
+        return (
+            loss,
+            kl_common.detach(),
+            l1_uncommon.detach(),
+            valid_chunk.sum().detach(),
+            top1_acc.detach(),
+        )
+
+    def _compute_ce(
+        self,
+        logits: torch.Tensor,
+        data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
+        global_valid_toks: torch.Tensor,
+    ) -> torch.Tensor:
+        """Standard next-token CE on the student side.
+
+        Uses ``token_mask[:, 1:]`` so padded tokens don't contribute.
+        """
+        input_ids = data["input_ids"]
+        token_mask = data["token_mask"][:, 1:]
+        sample_mask = data["sample_mask"]
+
+        shift_logits = logits[:, :-1].contiguous()
+        shift_labels = input_ids[:, 1:].contiguous()
+
+        per_token_ce = torch.nn.functional.cross_entropy(
+            shift_logits.reshape(-1, shift_logits.shape[-1]).float(),
+            shift_labels.reshape(-1),
+            reduction="none",
+        ).reshape(shift_labels.shape)
+
+        mask = token_mask.float() * sample_mask.unsqueeze(-1).float()
+        return masked_mean(
+            per_token_ce, mask, global_normalization_factor=global_valid_toks
+        )
