@@ -84,7 +84,7 @@ def create_quant_megatron_test_config(model_name, tp=1, pp=1, precision="float32
 
 
 @requires_weight_folding
-def test_modelopt_layer_spec_config_overrides_env(monkeypatch):
+def test_modelopt_layer_spec_config_selects_layer_specs():
     from functools import partial
 
     from megatron.bridge.models.gpt_provider import transformer_engine_layer_spec
@@ -100,8 +100,6 @@ def test_modelopt_layer_spec_config_overrides_env(monkeypatch):
         get_quantization_layer_spec,
         get_quantization_mamba_stack_spec,
     )
-
-    monkeypatch.setenv("DISABLE_MODELOPT_LAYER_SPEC", "1")
 
     assert get_quantization_layer_spec(True) is transformer_engine_layer_spec
     assert (
