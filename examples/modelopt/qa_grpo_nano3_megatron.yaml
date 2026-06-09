@@ -4,7 +4,7 @@
 # Nano3 Megatron GRPO setup. LoRA/PEFT is intentionally out of scope here.
 #
 # Example usage:
-#   DISABLE_MODELOPT_LAYER_SPEC=1 uv run examples/run_grpo.py --config examples/modelopt/qa_grpo_nano3_megatron.yaml
+#   uv run examples/run_grpo.py --config examples/modelopt/qa_grpo_nano3_megatron.yaml
 
 defaults: "../configs/grpo_math_1B.yaml"
 
@@ -20,6 +20,7 @@ policy:
   train_micro_batch_size: 1
   logprob_batch_size: 1
   max_total_sequence_length: 2048
+  disable_modelopt_layer_spec: true
 
   # Nano3 is a hybrid MoE/Mamba model. This recipe keeps attention and the
   # known Nano3-sensitive layers in BF16, while applying NVFP4 to weights.

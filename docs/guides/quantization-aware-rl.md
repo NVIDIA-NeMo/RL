@@ -24,11 +24,11 @@ The `nvfp4_a16.yaml` custom YAML enables NVFP4 e2m1 weight quantization (with dy
 
 ## ModelOpt Layer Spec Toggle
 
-For most models, set `DISABLE_MODELOPT_LAYER_SPEC=1` when launching QARL runs.
+For most models, set `policy.disable_modelopt_layer_spec=true` in QARL configs.
 This keeps ModelOpt quantization enabled while using the standard Megatron layer
-specs instead of ModelOpt's custom layer specs, which is usually faster. Leave
-it unset or set it to `0` only when you specifically need to exercise ModelOpt's
-Megatron layer-spec path.
+specs instead of ModelOpt's custom layer specs, which is usually faster and is
+recorded with the rest of the run config. Leave it unset or set it to `false`
+only when you specifically need to exercise ModelOpt's Megatron layer-spec path.
 
 ## Quantization-Aware GRPO (QA-GRPO)
 

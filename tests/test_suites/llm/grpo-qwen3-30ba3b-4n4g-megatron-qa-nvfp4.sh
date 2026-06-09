@@ -19,7 +19,6 @@ exit_if_max_steps_reached
 
 # Run the experiment
 cd $PROJECT_ROOT
-export DISABLE_MODELOPT_LAYER_SPEC=1
 uv run examples/run_grpo.py \
     --config $CONFIG_PATH \
     grpo.max_num_steps=$MAX_STEPS \

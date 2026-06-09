@@ -1,7 +1,7 @@
 defaults: "../configs/recipes/llm/performance/grpo-qwen3-30ba3b-4n4g.yaml"
 
 # Example usage:
-#   DISABLE_MODELOPT_LAYER_SPEC=1 uv run examples/run_grpo.py --config examples/modelopt/qa_grpo_qwen3_30ba3b_megatron.yaml
+#   uv run examples/run_grpo.py --config examples/modelopt/qa_grpo_qwen3_30ba3b_megatron.yaml
 
 grpo:
   # Low-cost QARL health check. This is not a convergence benchmark.
@@ -18,6 +18,7 @@ policy:
   train_global_batch_size: 16
   train_micro_batch_size: 1
   logprob_batch_size: 1
+  disable_modelopt_layer_spec: true
 
   # Built-in NVFP4 weight-only recipe keeps activations in native dtype while
   # still exercising ModelOpt quantization on Qwen3 MoE/MLP weights.

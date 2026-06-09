@@ -59,7 +59,7 @@ def _tolerate_dummy_weight_nan_amax():
 
     @torch.no_grad()
     def _safe_collect(self, x):
-        if x.numel() > 0 and not torch.isfinite(x).all():
+        if x.device.type != "meta" and x.numel() > 0 and not torch.isfinite(x).all():
             x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
         _original_collect(self, x)
 

@@ -6,7 +6,7 @@
 # precision while training the quantized student in the same loop.
 #
 # Example usage:
-#   DISABLE_MODELOPT_LAYER_SPEC=1 uv run examples/nemo_gym/run_distillation_nemo_gym.py --config examples/modelopt/qa_distillation_nano3_megatron.yaml
+#   uv run examples/nemo_gym/run_distillation_nemo_gym.py --config examples/modelopt/qa_distillation_nano3_megatron.yaml
 
 defaults: "./qa_distillation_math_megatron.yaml"
 
@@ -36,6 +36,7 @@ policy:
   max_total_sequence_length: 8192
   logprob_chunk_size: 1024
   offload_optimizer_for_logprob: true
+  disable_modelopt_layer_spec: true
   # Keep this example on the non-packed CP=1 path covered by the Nano3
   # QAD smoke. Re-enable CP>1 only with a targeted Nano3 Mamba+distillation
   # smoke test.
