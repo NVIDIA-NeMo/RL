@@ -211,17 +211,19 @@ Other relevant fields:
 
 ## Results — 100-step P-KL run
 
-A P-KL run (Llama-3.2-1B student ← Qwen3-4B teacher, default config:
-global batch 96, micro-batch 1, sequence length 2048, 100 steps, 2 nodes)
-shows the distillation objective converging and the student tracking the
-teacher more closely over training:
+A P-KL run (Llama-3.2-1B student ← Qwen3-4B teacher; default config — global
+batch 96, micro-batch 1, sequence length 2048, 100 steps, 2 nodes — on the
+default Nemotron-Pretraining-Specialized-v1.1 / Formal-Logic corpus) shows the
+distillation objective converging and the student tracking the teacher more
+closely over training:
 
-<img src="../assets/xtoken_pkl_smoke_curves.png" alt="train/kl_loss, train/ce_loss, and train/accuracy over 100 P-KL distillation steps" width="900">
+<img src="../assets/xtoken_pkl_smoke_curves.png" alt="train/loss, train/kl_loss, train/ce_loss, and train/accuracy over 100 P-KL distillation steps" width="900">
 
-- **KL loss** falls from ≈3.64 to ≈2.48 — the projected student distribution
+- **Loss** falls from ≈1.51 to ≈0.78.
+- **KL loss** falls from ≈2.67 to ≈0.78 — the projected student distribution
   moves toward the teacher's.
-- **CE loss** drifts down from ≈1.68 to ≈1.55.
-- **Top-1 accuracy** rises from ≈0.62 to ≈0.64.
+- **CE loss** falls from ≈0.75 to ≈0.39.
+- **Top-1 accuracy** rises from ≈0.82 to ≈0.88.
 
 ### Throughput and memory
 
@@ -230,8 +232,8 @@ length 2048):
 
 | Metric | Value |
 |---|---|
-| Mean step time | 4.18 s (min 3.78 s) |
-| Training throughput | ≈47k valid tokens/s (global batch ÷ mean step time) |
+| Mean step time | 4.07 s (min 3.66 s) |
+| Training throughput | ≈48k valid tokens/s (global batch ÷ mean step time) |
 | Peak GPU memory | 29.5 GB per GPU |
 | Teacher-logit IPC tray | ≈0.6 GB per sample-step — `[T_t≈2048, V_t≈151,936]` bf16 |
 
