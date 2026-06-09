@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import base64
+import importlib
 import io
 import os
 from pathlib import Path
@@ -125,6 +126,43 @@ def load_dataset_from_path(
         raw_dataset = raw_dataset["train"]
 
     return raw_dataset
+
+
+def resolve_external_dataset_class(dataset_name: str) -> type:
+    """Resolve a fully-qualified dotted dataset path to a class.
+
+    Used by both ``load_response_dataset`` and ``load_preference_dataset``
+    to support user-defined datasets that live outside ``nemo_rl`` so users
+    do not have to edit the built-in ``DATASET_REGISTRY`` to plug in their
+    own dataset class. The class must be importable from ``PYTHONPATH`` (or
+    the active virtual environment).
+
+    The caller is expected to have already verified that ``dataset_name``
+    looks like a dotted import path (i.e. contains a ``.``); this helper
+    focuses on the import / attribute-lookup / type-validation steps and
+    raises ``ValueError`` with an actionable message on any failure.
+    """
+    module_path, _, class_name = dataset_name.rpartition(".")
+    try:
+        module = importlib.import_module(module_path)
+    except ImportError as e:
+        raise ValueError(
+            f"Could not import module {module_path!r} for "
+            f"dataset_name={dataset_name!r}. Ensure the module is "
+            "installed and importable from PYTHONPATH."
+        ) from e
+    if not hasattr(module, class_name):
+        raise ValueError(
+            f"Module {module_path!r} has no attribute {class_name!r} "
+            f"(referenced by dataset_name={dataset_name!r})."
+        )
+    dataset_class = getattr(module, class_name)
+    if not isinstance(dataset_class, type):
+        raise ValueError(
+            f"dataset_name={dataset_name!r} resolved to {dataset_class!r}, "
+            "which is not a class. Expected a dataset class."
+        )
+    return dataset_class
 
 
 def update_single_dataset_config(data_config: dict, default_data_config: dict) -> None:
