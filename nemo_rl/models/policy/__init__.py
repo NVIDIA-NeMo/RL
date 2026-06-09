@@ -277,6 +277,9 @@ class MegatronConfig(TypedDict):
     linear_ce_fusion_chunk_size: NotRequired[int]
     # When mtp_num_layers=0, Multi-Token Prediction is disabled.
     mtp_num_layers: NotRequired[int]
+    # When True, freeze the vision tower (`vision_model`/`visual`) of a vision-language model.
+    # Use for text-only RL on a VL model.
+    freeze_vision_tower: NotRequired[bool]
 
 
 class DraftConfigDisabled(TypedDict):

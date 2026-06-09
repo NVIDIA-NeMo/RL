@@ -1048,6 +1048,22 @@ def setup_model_and_optimizer(
         mixed_precision_wrapper = MoEFloat16Module
         pre_wrap_hook.extend([freeze_moe_router])
 
+    if policy_cfg["megatron_cfg"].get("freeze_vision_tower"):
+        def freeze_vision_tower(megatron_model):
+            # Text-only RL on a vision-language model never runs the vision tower (no image inputs), so its parameters receive no gradient.
+            if not isinstance(megatron_model, list):
+                megatron_model = [megatron_model]
+            for model_module in megatron_model:
+                # Handle both wrapped (Float16Module) and unwrapped models.
+                if isinstance(model_module, Float16Module):
+                    model_module = model_module.module                # Vision tower: `vision_model` on Qwen3-VL, `visual` on Qwen2.5-VL.
+                vision_module = getattr(model_module, "vision_model", None) or getattr(model_module, "visual", None)
+                if vision_module is not None:
+                    for param in vision_module.parameters():
+                        param.requires_grad = False
+
+        pre_wrap_hook.extend([freeze_vision_tower])
+
     if use_peft:
         peft_cfg = policy_cfg["megatron_cfg"].get("peft", {})
         if "dim" not in peft_cfg or peft_cfg["dim"] is None:
