@@ -27,6 +27,7 @@ from typing import Any, Optional
 
 import ray
 import torch
+from pydantic import BaseModel
 from transformers import PreTrainedTokenizerBase
 from wandb import Histogram, Table
 
@@ -51,9 +52,34 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
 )
 from nemo_rl.utils.timer import Timer
-import numpy as np
 
 TokenizerType = PreTrainedTokenizerBase
+
+
+class EffortLevelsConfig(BaseModel, extra="allow"):
+    """Controls length-based reward shaping for low-effort prompts.
+
+    When a prompt contains ``low_string``, the final reward is adjusted by a
+    length-reward term that penalises overly long responses.  The reward formula
+    is::
+
+        length_reward = min(1, low_weight * (1 - response_len / low_ub))
+        new_reward    = orig_reward
+                      + orig_reward * max(length_reward, 0)
+                      + low_penalty * min(length_reward, 0)
+
+    Setting ``low_weight = 0`` or leaving ``low_string`` empty disables the
+    shaping entirely.
+    """
+
+    low_weight: float = 0.0
+    """Weight applied to the length-reward term.  Set to 0 to disable."""
+    low_penalty: float = 1.0
+    """Coefficient for the negative length-reward penalty."""
+    low_ub: int = 64000
+    """Response-length upper bound (in tokens) used to normalise the term."""
+    low_string: str = ""
+    """Substring that must appear in the user prompt to trigger shaping."""
 
 
 def generate_responses(
@@ -1101,7 +1127,7 @@ def run_async_nemo_gym_rollout(
     max_seq_len: Optional[int] = None,
     max_rollout_turns: Optional[int] = None,
     greedy: bool = False,
-    master_config = None,
+    effort_config: Optional[EffortLevelsConfig] = None,
 ) -> AsyncNemoGymRolloutResult:
     """Run multi-turn rollouts with NeMo-Gym. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters."""
     # We accept max_seq_len for API parity with the other rollout paths, but NeMo-Gym
@@ -1174,41 +1200,44 @@ def run_async_nemo_gym_rollout(
                 "generation_logprobs",
             )
 
-    # for effort level
-    len_reward_low = []
-    reward_low = []
-    lengths3 = [[],[],[]]
-    if master_config and 'effort_levels' in master_config:
-        low_weight = 0.
-        low_penalty = 1.
-        low_ub     = 64000
-        low_string = ""
-        if 'low_weight' in master_config['effort_levels']:
-            low_weight = master_config['effort_levels']['low_weight']
-        if 'low_penalty' in master_config['effort_levels']:
-            low_penalty = master_config['effort_levels']['low_penalty']
-        if 'low_ub' in master_config['effort_levels']:
-            low_ub = master_config['effort_levels']['low_ub']
-        if 'low_string' in master_config['effort_levels']:
-            low_string = master_config['effort_levels']['low_string']
-        if low_weight>0 and low_string:
-            lengths = [len(r["message_log"][-1]["token_ids"]) if r["message_log"][-1]["role"]=="assistant" else 0 for r in results]
-            orig_rewards = [r["full_result"]["reward"] for r in results]
-            for i in range(len(results)):
-                prompt = ''
-                for ii in reversed(nemo_gym_rows[i]['responses_create_params']['input']):
-                    if 'role' in ii and ii['role'] == 'user' and 'content' in ii:
-                        prompt = ii['content']
-                        break
-                if low_string in prompt:
-                    len_reward = min(1.,low_weight * (1. - lengths[i]/low_ub))
-                    new_r = orig_rewards[i] + orig_rewards[i] * max(len_reward,0.) + low_penalty * min(len_reward,0.)
-                    results[i]["full_result"]["reward"] = new_r
-                    len_reward_low.append(len_reward)
-                    reward_low.append(new_r)
-                    lengths3[0].append(lengths[i])
-                else:
-                    lengths3[2].append(lengths[i])
+    # Length-based reward shaping for low-effort prompts
+    length_rewards_low: list[float] = []
+    rewards_low: list[float] = []
+    low_lengths: list[int] = []
+    high_lengths: list[int] = []
+    if effort_config is not None and effort_config.low_weight > 0 and effort_config.low_string:
+        lengths = [
+            len(r["message_log"][-1]["token_ids"])
+            if r["message_log"][-1]["role"] == "assistant"
+            else 0
+            for r in results
+        ]
+        orig_rewards = [r["full_result"]["reward"] for r in results]
+        for i, result in enumerate(results):
+            prompt = next(
+                (
+                    msg["content"]
+                    for msg in reversed(nemo_gym_rows[i]["responses_create_params"]["input"])
+                    if msg.get("role") == "user" and "content" in msg
+                ),
+                "",
+            )
+            if effort_config.low_string in prompt:
+                length_reward = min(
+                    1.0,
+                    effort_config.low_weight * (1.0 - lengths[i] / effort_config.low_ub),
+                )
+                new_reward = (
+                    orig_rewards[i]
+                    + orig_rewards[i] * max(length_reward, 0.0)
+                    + effort_config.low_penalty * min(length_reward, 0.0)
+                )
+                result["full_result"]["reward"] = new_reward
+                length_rewards_low.append(length_reward)
+                rewards_low.append(new_reward)
+                low_lengths.append(lengths[i])
+            else:
+                high_lengths.append(lengths[i])
 
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
@@ -1343,17 +1372,16 @@ def run_async_nemo_gym_rollout(
         }
     )
 
-    # for effort level
-    if len_reward_low:
-        rollout_metrics['mean_length_reward_low'] = sum(len_reward_low)/len(len_reward_low)
-    if reward_low:
-        rollout_metrics['mean_reward_low'] = sum(reward_low)/len(reward_low)
-    if lengths3[0]:
-        rollout_metrics['mean_length_low'] = sum(lengths3[0])/len(lengths3[0])
-        rollout_metrics['median_length_low'] = float(np.median(lengths3[0]))
-    if lengths3[2]:
-        rollout_metrics['mean_length_high'] = sum(lengths3[2])/len(lengths3[2])
-        rollout_metrics['median_length_high'] = float(np.median(lengths3[2]))
+    if length_rewards_low:
+        rollout_metrics["mean_length_reward_low"] = sum(length_rewards_low) / len(length_rewards_low)
+    if rewards_low:
+        rollout_metrics["mean_reward_low"] = sum(rewards_low) / len(rewards_low)
+    if low_lengths:
+        rollout_metrics["mean_length_low"] = sum(low_lengths) / len(low_lengths)
+        rollout_metrics["median_length_low"] = float(statistics.median(low_lengths))
+    if high_lengths:
+        rollout_metrics["mean_length_high"] = sum(high_lengths) / len(high_lengths)
+        rollout_metrics["median_length_high"] = float(statistics.median(high_lengths))
 
     return AsyncNemoGymRolloutResult(
         input_ids=input_ids,

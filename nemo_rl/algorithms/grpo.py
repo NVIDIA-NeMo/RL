@@ -68,6 +68,7 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import (
+    EffortLevelsConfig,
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
@@ -223,6 +224,7 @@ class MasterConfig(BaseModel, extra="allow"):
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
     data_plane: Optional[DataPlaneConfig] = None
+    effort_levels: Optional[EffortLevelsConfig] = None
 
 
 # ===============================================================================
@@ -1793,7 +1795,7 @@ def grpo_train(
                             generation_config=generation_config,
                             max_rollout_turns=None,
                             greedy=False,
-                            master_config=master_config,
+                            effort_config=master_config.effort_levels,
                         )
                         input_ids = nemo_gym_rollout_result.input_ids
                         repeated_batch = nemo_gym_rollout_result.final_batch
@@ -2588,7 +2590,7 @@ def validate(
                     generation_config=generation_config,
                     max_rollout_turns=None,
                     greedy=False,
-                    master_config=master_config,
+                    effort_config=master_config.effort_levels,
                 )
                 val_batch = nemo_gym_rollout_result.final_batch
                 gen_metrics = nemo_gym_rollout_result.rollout_metrics
