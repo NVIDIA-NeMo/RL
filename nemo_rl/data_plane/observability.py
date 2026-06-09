@@ -47,7 +47,12 @@ class DataPlaneEvent(TypedDict):
 import torch
 from tensordict import TensorDict
 
-from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
+from nemo_rl.data_plane.interfaces import (
+    DataPlaneCapabilities,
+    DataPlaneClient,
+    DataPlaneGroupMeta,
+    KVBatchMeta,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +200,8 @@ class MetricsDataPlaneClient(DataPlaneClient):
             n_bytes = _td_bytes(out)
         elif isinstance(out, KVBatchMeta) and not n_keys:
             n_keys = len(out.sample_ids)
+        elif isinstance(out, list) and not n_keys:
+            n_keys = len(out)
         self._emit(op, partition_id, n_keys, n_bytes, t0, "ok")
         return out
 
@@ -336,6 +343,51 @@ class MetricsDataPlaneClient(DataPlaneClient):
             n_keys=n_keys,
         )
         self._record_clear(partition_id, sample_ids_list)
+
+    def ping(self, timeout_s=None) -> None:
+        self._run(
+            "ping",
+            "",
+            lambda: self._inner.ping(timeout_s=timeout_s),
+        )
+
+    def list_metadata(self, partition_id) -> list[DataPlaneGroupMeta]:
+        out = self._run(
+            "list_metadata",
+            partition_id,
+            lambda: self._inner.list_metadata(partition_id),
+        )
+        return out
+
+    def depth(self, partition_id) -> int:
+        return self._run(
+            "depth",
+            partition_id,
+            lambda: self._inner.depth(partition_id),
+        )
+
+    def pop(self, keys, partition_id) -> None:
+        keys_list = keys if isinstance(keys, list) else list(keys)
+        self._run(
+            "pop",
+            partition_id,
+            lambda: self._inner.pop(keys_list, partition_id),
+            n_keys=len(keys_list),
+        )
+        self._record_clear(partition_id, keys_list)
+
+    def evict(self, keys, partition_id) -> None:
+        keys_list = keys if isinstance(keys, list) else list(keys)
+        self._run(
+            "evict",
+            partition_id,
+            lambda: self._inner.evict(keys_list, partition_id),
+            n_keys=len(keys_list),
+        )
+        self._record_clear(partition_id, keys_list)
+
+    def get_capabilities(self) -> DataPlaneCapabilities:
+        return self._inner.get_capabilities()
 
     def close(self) -> None:
         self._run(

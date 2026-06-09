@@ -32,7 +32,13 @@ import torch
 from tensordict import TensorDict
 
 from nemo_rl.data_plane.codec import stack_or_nest as _stack_or_nest
-from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
+from nemo_rl.data_plane.interfaces import (
+    DataPlaneCapabilities,
+    DataPlaneClient,
+    DataPlaneGroupMeta,
+    DataPlaneUnavailable,
+    KVBatchMeta,
+)
 
 
 def _reject_non_tensor_leaves(td: TensorDict) -> None:
@@ -55,6 +61,32 @@ def _reject_non_tensor_leaves(td: TensorDict) -> None:
             "Tensorize via codec helpers, use `tags=` for primitives, "
             "or use the Ray object store for arbitrary Python objects."
         )
+
+
+def _as_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() in {"1", "true", "yes"}
+    return bool(value)
 
 
 @dataclass
@@ -236,6 +268,53 @@ class NoOpDataPlaneClient(DataPlaneClient):
             rec.tags.pop(sid, None)
             for s in rec.consumed.values():
                 s.discard(sid)
+
+    def ping(self, timeout_s: float | None = None) -> None:
+        del timeout_s
+        if self._closed:
+            raise DataPlaneUnavailable("NoOp data plane is closed")
+
+    def list_metadata(self, partition_id: str) -> list[DataPlaneGroupMeta]:
+        rec = self._partitions.get(partition_id)
+        if rec is None:
+            return []
+
+        grouped: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+        for key in sorted(set(rec.rows) | set(rec.tags)):
+            tag = rec.tags.get(key, {})
+            group_id = str(tag.get("group_id") or key)
+            grouped.setdefault(group_id, []).append((key, tag))
+
+        groups: list[DataPlaneGroupMeta] = []
+        for group_id, rows in grouped.items():
+            keys = [key for key, _ in rows]
+            tags = [tag for _, tag in rows]
+            first_tag = dict(tags[0]) if tags else {}
+            expected_num_keys = _as_int(
+                first_tag.get("expected_num_keys", first_tag.get("num_keys"))
+            )
+            groups.append(
+                DataPlaneGroupMeta(
+                    partition_id=partition_id,
+                    group_id=group_id,
+                    keys=keys,
+                    weight_version=_as_int(first_tag.get("weight_version")),
+                    created_at=_as_float(first_tag.get("created_at")),
+                    committed=all(_as_bool(t.get("committed", False)) for t in tags),
+                    expected_num_keys=expected_num_keys,
+                    size_bytes=_as_int(first_tag.get("size_bytes")),
+                    tags=first_tag,
+                )
+            )
+        return groups
+
+    def get_capabilities(self) -> DataPlaneCapabilities:
+        return DataPlaneCapabilities(
+            supports_persistent_recovery=False,
+            supports_server_side_filtering=False,
+            supports_atomic_batch_put=True,
+            supports_verified_clear=True,
+        )
 
     def close(self) -> None:
         if self._closed:

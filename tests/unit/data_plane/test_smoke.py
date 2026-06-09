@@ -90,6 +90,10 @@ def test_dataplane_client_abc_surface() -> None:
         "put_samples",
         "get_samples",
         "clear_samples",
+        # recovery/control-plane
+        "ping",
+        "list_metadata",
+        "get_capabilities",
         # lifecycle
         "close",
     }

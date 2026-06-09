@@ -187,6 +187,34 @@ Worker write-backs append new columns under the same keys.
 
 ---
 
+## Recovery/control-plane
+
+`DataPlaneClient` exposes a small controller-facing recovery surface:
+
+- `ping(timeout_s)` — health-check the real data-plane request path.
+- `list_metadata(partition_id) → list[DataPlaneGroupMeta]` — non-consuming
+  rollout-group metadata for controller recovery.
+- `depth(partition_id) → int` — count committed, complete groups visible to
+  recovery.
+- `pop(keys, partition_id)` — remove successfully trained keys.
+- `evict(keys, partition_id)` — remove stale or abandoned keys.
+- `get_capabilities() → DataPlaneCapabilities` — backend recovery guarantees.
+
+`list_metadata` is deliberately separate from `get_meta`: it must not advance
+TransferQueue's per-task consumption counters. SingleController should use
+`list_metadata` to reconstruct capacity and `pop`/`evict` to release capacity
+only after the data plane reports a successful clear.
+
+Recovery-aware producers should tag every rollout key with:
+
+- `group_id` — rollout group identity; all keys in a group share it.
+- `weight_version` — policy version used to produce the row.
+- `created_at` — producer timestamp for stale uncommitted cleanup.
+- `committed` — `True` only after the row is safe to train on.
+- `expected_num_keys` or `num_keys` — complete group size.
+
+---
+
 ## Concrete examples
 
 ### Call shapes

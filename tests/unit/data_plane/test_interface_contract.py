@@ -26,6 +26,7 @@ from tensordict import TensorDict
 
 from nemo_rl.data_plane import (
     DataPlaneClient,
+    DataPlaneUnavailable,
     KVBatchMeta,
     build_data_plane_client,
 )
@@ -87,6 +88,97 @@ def test_claim_meta_advances_consumption(client: DataPlaneClient):
     assert isinstance(meta, KVBatchMeta)
     assert meta.size == 2
     assert client.check_consumption_status("p", ["read"])
+
+
+def test_recovery_metadata_is_non_consuming(client: DataPlaneClient):
+    client.register_partition(
+        partition_id="p",
+        fields=["x"],
+        num_samples=3,
+        consumer_tasks=["read"],
+    )
+    fields = TensorDict({"x": torch.tensor([10, 20, 30])}, batch_size=[3])
+    client.put_samples(
+        sample_ids=["a", "b"],
+        partition_id="p",
+        fields=fields[:2],
+        tags=[
+            {
+                "group_id": "g1",
+                "weight_version": 2,
+                "created_at": 100.0,
+                "committed": True,
+                "expected_num_keys": 2,
+            },
+            {
+                "group_id": "g1",
+                "weight_version": 2,
+                "created_at": 100.0,
+                "committed": True,
+                "expected_num_keys": 2,
+            },
+        ],
+    )
+    client.put_samples(
+        sample_ids=["c"],
+        partition_id="p",
+        fields=fields[2:],
+        tags=[
+            {
+                "group_id": "g2",
+                "weight_version": 3,
+                "committed": False,
+                "expected_num_keys": 1,
+            }
+        ],
+    )
+
+    first = {group.group_id: group for group in client.list_metadata("p")}
+    second = {group.group_id: group for group in client.list_metadata("p")}
+
+    assert first == second
+    assert first["g1"].keys == ["a", "b"]
+    assert first["g1"].weight_version == 2
+    assert first["g1"].committed
+    assert first["g1"].is_complete
+    assert not first["g2"].committed
+    assert client.depth("p") == 1
+
+    meta = client.claim_meta(
+        partition_id="p", task_name="read", required_fields=["x"], batch_size=3
+    )
+    assert meta.sample_ids == ["a", "b", "c"]
+
+
+def test_recovery_pop_and_evict_remove_keys(client: DataPlaneClient):
+    client.register_partition(
+        partition_id="p",
+        fields=["x"],
+        num_samples=3,
+        consumer_tasks=["read"],
+    )
+    client.put_samples(
+        sample_ids=["a", "b", "c"],
+        partition_id="p",
+        fields=TensorDict({"x": torch.tensor([1, 2, 3])}, batch_size=[3]),
+        tags=[
+            {"group_id": "trained", "committed": True},
+            {"group_id": "trained", "committed": True},
+            {"group_id": "stale", "committed": False},
+        ],
+    )
+
+    client.pop(keys=["a", "b"], partition_id="p")
+    assert [group.group_id for group in client.list_metadata("p")] == ["stale"]
+
+    client.evict(keys=["c"], partition_id="p")
+    assert client.list_metadata("p") == []
+
+
+def test_ping_reports_closed_client(client: DataPlaneClient):
+    client.close()
+    with pytest.raises(DataPlaneUnavailable):
+        client.ping()
 
 
 def test_get_data_requires_field_selection(client: DataPlaneClient):

@@ -80,6 +80,12 @@ def test_sync_trainer_rejects_message_level_advantage_penalties():
         "get_samples",
         "clear_samples",
         "check_consumption_status",
+        "ping",
+        "list_metadata",
+        "depth",
+        "pop",
+        "evict",
+        "get_capabilities",
         "close",
     ],
 )
