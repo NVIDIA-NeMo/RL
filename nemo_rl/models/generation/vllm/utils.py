@@ -87,25 +87,6 @@ def format_prompt_for_vllm_generation(
                 prompts.append(_get_regular_prompt(i))
                 continue
             prompt_dict["multi_modal_data"] = multi_modal_data
-            # For Qwen2.5-Omni IntentTrain/IntentBench rollouts the rendered
-            # text in vllm_content does NOT contain audio placeholder tokens
-            # (apply_chat_template with tokenize=False does not expand them),
-            # so vLLM's prompt-replacement step would fail with "Failed to
-            # apply prompt replacement for mm_items['audio'][...]". Switch to
-            # the pre-tokenized prompt path: input_ids was built from the same
-            # processor invocation that produced the audio+video payload, so
-            # it already carries the audio AND video placeholder tokens at the
-            # correct positions for vLLM to fill in with the multimodal data.
-            task_names = data.get("task_name", None)
-            if (
-                task_names is not None
-                and task_names[i] in ("intent-train", "intent-bench")
-                and "audio" in multi_modal_data
-                and "video" in multi_modal_data
-            ):
-                regular = _get_regular_prompt(i)
-                prompt_dict.pop("prompt", None)
-                prompt_dict["prompt_token_ids"] = regular["prompt_token_ids"]
             prompts.append(prompt_dict)
     else:
         # Regular LLM generation using token_ids (pre-tokenized).

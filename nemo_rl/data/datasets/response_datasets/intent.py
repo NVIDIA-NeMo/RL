@@ -282,18 +282,27 @@ class IntentDataset(RawDataset):
     def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
         """Format a manifest record into NeMo-RL OpenAI-style messages.
 
-        The user content carries only the video reference and the text prompt.
-        For Qwen2.5-Omni's ``use_audio_in_video=True`` mode the audio track is
-        decoded from the same video file by ``vlm_hf_data_processor`` and
-        attached as a processor-level kwarg, NOT as a separate ``type=audio``
-        content item. Adding an explicit audio item here would cause the chat
-        template to emit duplicate audio placeholder tokens and trip the
-        processor's audio_lengths iterator.
+        Each yielded sample carries the video file path AND the audio track
+        decoded from that same file at 16 kHz mono. Both arrive as
+        independent ``{type: video}`` / ``{type: audio}`` content items so
+        the Qwen2.5-Omni chat template renders both ``<|VIDEO|>`` and
+        ``<|AUDIO|>`` placeholders in the prompt; vLLM's multimodal prompt
+        replacement on the rollout side requires those placeholders to exist
+        in the prompt before it will accept matching ``mm_items``.
+
+        We deliberately do NOT pass ``use_audio_in_video=True`` to the
+        processor in v1: that flag would entangle the audio and video
+        placeholder accounting in ways the current installed transformers
+        + vLLM stack does not handle (see Round 1 BitLesson). The model
+        still receives both modalities; the only thing missing is the
+        explicit time alignment hint.
         """
         instruction = _TYPE_TEMPLATE.get(data["problem_type"], "")
         prompt_text = f"{data['problem']}{instruction}"
+        audio_array = _load_audio_from_video(data["video_path"])
         user_content = [
             {"type": "video", "video": data["video_path"]},
+            {"type": "audio", "audio": audio_array},
             {"type": "text", "text": prompt_text},
         ]
         return {

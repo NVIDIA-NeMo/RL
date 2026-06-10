@@ -350,16 +350,6 @@ async def _run_env_eval_impl(
                     )
                 if multi_modal_data:
                     prompt_dict["multi_modal_data"] = multi_modal_data
-                # IntentTrain/IntentBench rollouts pair audio with its parent
-                # video stream; tell vLLM's Qwen2.5-Omni processor to align them.
-                task_names = batch.get("task_name", None)
-                if (
-                    task_names is not None
-                    and task_names[i] in ("intent-train", "intent-bench")
-                    and "audio" in multi_modal_data
-                    and "video" in multi_modal_data
-                ):
-                    prompt_dict["mm_processor_kwargs"] = {"use_audio_in_video": True}
                 prompts.append(prompt_dict)
                 prompts_for_display.append(vllm_content)
             else:
