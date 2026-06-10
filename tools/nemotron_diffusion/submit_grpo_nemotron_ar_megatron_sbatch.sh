@@ -74,6 +74,9 @@ export UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-300}"
 export NEMO_RL_SGLANG_KERNEL_SOURCE="${NEMO_RL_SGLANG_KERNEL_SOURCE:-/lustre/fsw/portfolios/coreai/users/snorouzi/wheels/sglang_kernel_torch210_cu129_py313/sglang_kernel-0.4.1-cp310-abi3-linux_x86_64.whl}"
 export NEMO_RL_SGLANG_FLASHINFER_SPECS="${NEMO_RL_SGLANG_FLASHINFER_SPECS:-flashinfer_python==0.6.7.post3 flashinfer_cubin==0.6.7.post3}"
 export EXTRA_CONFIG_OVERRIDES="${EXTRA_CONFIG_OVERRIDES:-}"
+# Opt-in: set EXPANDABLE_SEGMENTS=true to add PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# to the megatron policy workers (mitigates fragmentation OOMs, e.g. in logprob at long seqlen).
+export EXPANDABLE_SEGMENTS="${EXPANDABLE_SEGMENTS:-false}"
 
 run_training() {
   mkdir -p "${RUNDIR}"
@@ -163,6 +166,13 @@ run_training() {
     read -r -a extra_config_overrides <<< "${EXTRA_CONFIG_OVERRIDES}"
   fi
 
+  # Megatron policy worker env vars. PYTHONPATH (megatron bridge patch) is always set;
+  # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is added only when EXPANDABLE_SEGMENTS=true.
+  megatron_env_vars="PYTHONPATH:${MEGATRON_PATCH_DIR}"
+  if [[ "${EXPANDABLE_SEGMENTS}" == "true" || "${EXPANDABLE_SEGMENTS}" == "1" ]]; then
+    megatron_env_vars="${megatron_env_vars},PYTORCH_CUDA_ALLOC_CONF:\"expandable_segments:True\""
+  fi
+
   uv run \
     "${reinstall_args[@]}" \
     --extra mcore \
@@ -176,7 +186,7 @@ run_training() {
     "logger.log_dir=${LOG_DIR}" \
     "logger.wandb.name=${WANDB_RUN_NAME}" \
     policy.generation.vllm_cfg.enforce_eager=true \
-    "policy.megatron_cfg.env_vars={PYTHONPATH:${MEGATRON_PATCH_DIR}}" \
+    "policy.megatron_cfg.env_vars={${megatron_env_vars}}" \
     "${extra_config_overrides[@]}" \
     2>&1 | tee -a "${RUNDIR}/run.log"
 }
@@ -258,6 +268,7 @@ export UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT}"
 export NEMO_RL_SGLANG_KERNEL_SOURCE="${NEMO_RL_SGLANG_KERNEL_SOURCE}"
 export NEMO_RL_SGLANG_FLASHINFER_SPECS="${NEMO_RL_SGLANG_FLASHINFER_SPECS}"
 export EXTRA_CONFIG_OVERRIDES="${EXTRA_CONFIG_OVERRIDES}"
+export EXPANDABLE_SEGMENTS="${EXPANDABLE_SEGMENTS}"
 export NEMO_RL_GIT_PATH="${NEMO_RL_GIT_PATH:-}"
 export NEMO_RL_GIT_BRANCH="${NEMO_RL_GIT_BRANCH:-}"
 export NEMO_RL_GIT_COMMIT="${NEMO_RL_GIT_COMMIT:-}"
