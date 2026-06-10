@@ -1,0 +1,3 @@
+Solve the following math problem. Output your answer inside of \\boxed{{}} tags.
+
+{}

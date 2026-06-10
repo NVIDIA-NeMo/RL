@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""No-Ray GSM8K evaluator matching the diffuGRPO validation settings.
+"""No-Ray math evaluator matching the diffuGRPO validation settings.
 
 This script avoids NeMo-RL's Ray training stack. It reproduces the important
 validation ingredients directly:
 
-* openai/gsm8k test split
-* NeMo-RL math_hf_data_processor prompt formatting with examples/prompts/cot.txt
+* openai/gsm8k test split or Nemo Skills AIME 2024/2025 test jsonl
+* NeMo-RL math_hf_data_processor-style prompt formatting with examples/prompts/cot.txt
 * tokenizer.apply_chat_template(..., add_generation_prompt=True)
 * SGLang /generate with input_ids
 * FastDiffuser block_size=32, max_steps=32, threshold=0.9,
   selection_policy=confidence, temperature=1.0
-* NeMo-RL HFVerifyWorker-equivalent math_verify grading against the GSM8K answer after "####"
+* NeMo-RL HFVerifyWorker-equivalent math_verify grading
 
 The raw Megatron checkpoint must first be converted to Hugging Face format for
 SGLang. The defaults point at the already-converted step_275 checkpoint.
@@ -29,6 +29,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from eval_datasets import load_benchmark_samples, normalize_benchmark
+
 
 DEFAULT_MODEL = Path(
     "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/snorouzi/"
@@ -41,13 +43,12 @@ DEFAULT_VENV = Path(
     "sglang_nemotron_torch291_cu129_uvpy312_venv"
 )
 DEFAULT_PROMPT = Path(
-    "/home/snorouzi/diffusion_RL/RL-diffugrpo-shared/examples/prompts/cot.txt"
-)
+    __file__
+).resolve().parent / "prompts" / "cot.txt"
 DEFAULT_OUTDIR = Path(
     "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/snorouzi/"
     "eval_results/diffugrpo_step275_gsm8k_training_style_no_ray"
 )
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -67,6 +68,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tokenizer-path", type=Path, default=None)
     parser.add_argument("--outdir", type=Path, default=DEFAULT_OUTDIR)
     parser.add_argument("--prompt-file", type=Path, default=DEFAULT_PROMPT)
+    parser.add_argument(
+        "--benchmark",
+        default="gsm8k",
+        choices=("gsm8k", "aime24", "aime2024", "aime25", "aime2025"),
+        help="Evaluation benchmark to load.",
+    )
     parser.add_argument("--num-samples", type=int, default=-1)
     parser.add_argument("--seed", type=int, default=42)
 
@@ -87,13 +94,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=-1)
     parser.add_argument("--concurrent", type=int, default=8)
-
     parser.add_argument(
-        "--backend",
-        default="sglang_dllm",
-        choices=("sglang_dllm", "ar_native"),
-        help="Generation backend. ar_native loads the HF model directly and calls model.ar_generate().",
+        "--generation-api",
+        default="generate",
+        choices=("generate", "chat_completions"),
+        help="SGLang request API to use.",
     )
+
     parser.add_argument("--dllm-algorithm", default="FastDiffuser", choices=("FastDiffuser", "LinearSpec"))
     parser.add_argument("--block-size", type=int, default=32)
     parser.add_argument("--max-steps", type=int, default=32)
@@ -115,36 +122,9 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def extract_hash_answer(text: str) -> str | None:
-    if "####" not in text:
-        return None
-    return text.split("####", 1)[1].strip()
-
-
 def load_prompt_template(path: Path) -> str:
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
-
-
-def load_gsm8k(num_samples: int, seed: int) -> list[dict[str, str]]:
-    from datasets import load_dataset
-
-    rows = load_dataset("openai/gsm8k", "main", split="test")
-    samples = [
-        {
-            "question": row["question"],
-            "gold": extract_hash_answer(row["answer"]) or row["answer"].strip(),
-            "raw_answer": row["answer"],
-        }
-        for row in rows
-    ]
-    if 0 < num_samples < len(samples):
-        import random
-
-        rng = random.Random(seed)
-        indices = sorted(rng.sample(range(len(samples)), num_samples))
-        samples = [samples[i] for i in indices]
-    return samples
 
 
 def select_validation_shard(
@@ -416,54 +396,54 @@ def generate_one(
     return result
 
 
-def load_ar_native_model(args: argparse.Namespace) -> Any:
-    import torch
-    from transformers import AutoModel
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.bfloat16 if args.dtype == "bfloat16" and device == "cuda" else None
-    kwargs: dict[str, Any] = {"trust_remote_code": True}
-    if dtype is not None:
-        kwargs["torch_dtype"] = dtype
-    model = AutoModel.from_pretrained(str(args.model_path), **kwargs)
-    if not hasattr(model, "ar_generate"):
-        raise RuntimeError(f"Model does not expose ar_generate(): {args.model_path}")
-    model.to(device)
-    model.eval()
-    return model
-
-
-def generate_one_ar_native(
-    model: Any,
-    input_ids: list[int],
+def generate_one_chat_completions(
+    base_url: str,
+    prompt_template: str,
+    question: str,
     max_new_tokens: int,
     temperature: float,
-    context_length: int,
+    top_p: float,
+    args: argparse.Namespace,
+    benchmark_name: str,
 ) -> dict[str, Any]:
-    import torch
+    import requests
 
-    final_max_tokens = min(max_new_tokens, max(0, context_length - len(input_ids) - 1))
-    prompt_ids = torch.tensor(
-        [input_ids[: max(0, context_length - 1)]],
-        dtype=torch.long,
-        device=next(model.parameters()).device,
+    content = prompt_template.format(question)
+    payload: dict[str, Any] = {
+        "model": args.served_model_name,
+        "messages": [{"role": "user", "content": content}],
+        "temperature": temperature,
+        "top_p": top_p,
+        "max_tokens": max_new_tokens,
+        "steps": args.max_steps,
+        "block_length": args.block_size,
+        "threshold": args.threshold,
+        "benchmark_name": benchmark_name,
+    }
+    resp = requests.post(
+        base_url + "/v1/chat/completions",
+        json=payload,
+        timeout=14400,
     )
-    with torch.no_grad():
-        output_tensor, nfe = model.ar_generate(
-            prompt_ids=prompt_ids,
-            max_new_tokens=final_max_tokens,
-            temperature=temperature,
-        )
-    generated = output_tensor[0, prompt_ids.shape[1] :].detach().cpu().tolist()
+    resp.raise_for_status()
+    result = resp.json()
+    choice = result["choices"][0]
+    message = choice.get("message") or {}
+    response = message.get("content")
+    if response is None:
+        response = choice.get("text", "")
     return {
-        "output_ids": [int(x) for x in generated],
-        "nfe": int(nfe),
-        "_requested_max_new_tokens": final_max_tokens,
+        "response": response,
+        "raw_response": result,
+        "_requested_max_new_tokens": max_new_tokens,
+        "prompt": content,
+        "finish_reason": choice.get("finish_reason"),
     }
 
 
 def main() -> None:
     args = parse_args()
+    args.benchmark = normalize_benchmark(args.benchmark)
     args.outdir.mkdir(parents=True, exist_ok=True)
     args.base_url = args.base_url.rstrip("/")
 
@@ -475,17 +455,12 @@ def main() -> None:
     if not args.dry_run:
         check_client_dependencies()
 
-    dllm_config = None
-    if args.backend == "sglang_dllm":
-        dllm_config = write_dllm_config(args)
-        print(f"DLLM config: {dllm_config}")
-    else:
-        print("Backend: ar_native (direct AutoModel + model.ar_generate)")
+    dllm_config = write_dllm_config(args)
+    print(f"DLLM config: {dllm_config}")
 
     server_proc = None
     try:
-        if args.backend == "sglang_dllm" and args.launch_server:
-            assert dllm_config is not None
+        if args.launch_server:
             cmd = server_command(args, dllm_config)
             print("Server command:")
             print(" ".join(json.dumps(x) for x in cmd))
@@ -494,9 +469,8 @@ def main() -> None:
             server_proc = launch_server(args, dllm_config)
         elif args.dry_run:
             return
-        if args.backend == "sglang_dllm":
-            wait_for_server(args.base_url, server_proc)
-        if args.backend == "sglang_dllm" and args.refit_model_path is not None:
+        wait_for_server(args.base_url, server_proc)
+        if args.refit_model_path is not None:
             if not args.refit_model_path.is_dir():
                 raise FileNotFoundError(
                     f"refit-model-path must be a converted Hugging Face checkpoint: {args.refit_model_path}"
@@ -510,7 +484,7 @@ def main() -> None:
             trust_remote_code=True,
         )
         prompt_template = load_prompt_template(args.prompt_file)
-        samples = load_gsm8k(args.num_samples, args.seed)
+        samples = load_benchmark_samples(args.benchmark, args.num_samples, args.seed)
         indexed_samples = select_validation_shard(
             samples,
             val_batch_size=args.val_batch_size,
@@ -518,9 +492,8 @@ def main() -> None:
             rank=args.shard_rank,
         )
         verify_func = build_verifier()
-        ar_native_model = load_ar_native_model(args) if args.backend == "ar_native" else None
 
-        print(f"Loaded {len(samples)} GSM8K samples")
+        print(f"Loaded {len(samples)} {args.benchmark} samples")
         if args.shard_dp_size != 1:
             print(
                 f"Validation shard: rank={args.shard_rank}/{args.shard_dp_size}, "
@@ -529,52 +502,61 @@ def main() -> None:
         print(
             "Generation settings: "
             f"max_new_tokens={args.max_new_tokens}, temperature={args.temperature}, "
-            f"top_p={args.top_p}, top_k={args.top_k}, context_length={args.context_length}"
+            f"top_p={args.top_p}, top_k={args.top_k}, context_length={args.context_length}, "
+            f"generation_api={args.generation_api}"
         )
 
         records: list[dict[str, Any]] = [None] * len(indexed_samples)  # type: ignore
         started = time.time()
 
         def work(i: int, original_idx: int, sample: dict[str, str]) -> tuple[int, dict[str, Any]]:
-            prompt, input_ids = make_prompt_ids(
-                tokenizer, prompt_template, sample["question"]
-            )
-            result = generate_one(
-                args.base_url,
-                input_ids,
-                args.max_new_tokens,
-                args.temperature,
-                args.top_p,
-                args.top_k,
-                args.context_length,
-            ) if args.backend == "sglang_dllm" else generate_one_ar_native(
-                ar_native_model,
-                input_ids,
-                args.max_new_tokens,
-                args.temperature,
-                args.context_length,
-            )
-            output_ids = extract_generated_token_ids(result)
-            response = tokenizer.decode(output_ids, skip_special_tokens=True)
+            prompt, input_ids = make_prompt_ids(tokenizer, prompt_template, sample["question"])
+            output_ids: list[int] = []
+            if args.generation_api == "chat_completions":
+                result = generate_one_chat_completions(
+                    args.base_url,
+                    prompt_template,
+                    sample["question"],
+                    args.max_new_tokens,
+                    args.temperature,
+                    args.top_p,
+                    args,
+                    args.benchmark,
+                )
+                prompt = result["prompt"]
+                response = result["response"]
+            else:
+                result = generate_one(
+                    args.base_url,
+                    input_ids,
+                    args.max_new_tokens,
+                    args.temperature,
+                    args.top_p,
+                    args.top_k,
+                    args.context_length,
+                )
+                output_ids = extract_generated_token_ids(result)
+                response = tokenizer.decode(output_ids, skip_special_tokens=True)
             return i, {
                 "idx": i,
                 "original_idx": original_idx,
+                "source_id": sample.get("source_id"),
                 "question": sample["question"],
                 "gold": sample["gold"],
                 "prompt": prompt,
                 "prompt_len": len(input_ids),
                 "requested_max_new_tokens": result.get("_requested_max_new_tokens"),
-                    "output_ids": output_ids,
-                    "nfe": result.get("nfe"),
-                    "response": response,
-                }
+                "output_ids": output_ids,
+                "nfe": result.get("nfe"),
+                "finish_reason": result.get("finish_reason"),
+                "response": response,
+            }
 
         done = 0
         generation_batch_size = args.generation_batch_size or len(indexed_samples)
         if generation_batch_size < 1:
             raise ValueError("--generation-batch-size must be >= 1 when set")
-        max_workers = 1 if args.backend == "ar_native" else args.concurrent
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrent) as pool:
             for batch_start in range(0, len(indexed_samples), generation_batch_size):
                 batch = indexed_samples[batch_start : batch_start + generation_batch_size]
                 futures = [
@@ -596,6 +578,7 @@ def main() -> None:
         avg_len = sum(len(r["output_ids"]) for r in records) / max(total, 1)
         elapsed = time.time() - started
         metrics = {
+            "benchmark": args.benchmark,
             "accuracy": correct / total if total else 0.0,
             "correct": correct,
             "total": total,
@@ -612,7 +595,7 @@ def main() -> None:
             json.dump(metrics, f, indent=2, default=str)
 
         print(
-            f"GSM8K Accuracy: {correct}/{total} = {100 * metrics['accuracy']:.4f}%"
+            f"{args.benchmark} Accuracy: {correct}/{total} = {100 * metrics['accuracy']:.4f}%"
         )
         print(f"Average generation length: {avg_len:.1f} tokens")
         print(f"Metrics: {args.outdir / 'metrics.json'}")

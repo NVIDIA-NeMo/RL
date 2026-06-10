@@ -102,8 +102,8 @@ SEQ_EVAL_BENCHMARK=gsm8k:1 \
 SEQ_EVAL_EXPNAME=<name>_step_N_gsm8k_nemoskills \
 SEQ_EVAL_OUTPUT_DIR="${OUTDIR}" \
 SEQ_EVAL_GENERATION_ALGORITHM=nemotron \
-SEQ_EVAL_TOKENS_TO_GENERATE=1024 \
-SEQ_EVAL_STEPS=1024 \
+SEQ_EVAL_TOKENS_TO_GENERATE=750 \
+SEQ_EVAL_STEPS=750 \
 SEQ_EVAL_BLOCK_LENGTH=32 \
 SEQ_EVAL_TEMPERATURE=0 \
 SEQ_EVAL_EXTRA_ARGS="--exclude-unfinished-nfe false" \
@@ -143,8 +143,8 @@ SEQ_EVAL_BENCHMARK=gsm8k:1 \
 SEQ_EVAL_EXPNAME=<name>_step_N_gsm8k_nemoskills_ar_native \
 SEQ_EVAL_OUTPUT_DIR="${OUTDIR}" \
 SEQ_EVAL_GENERATION_ALGORITHM=ar_native \
-SEQ_EVAL_TOKENS_TO_GENERATE=1024 \
-SEQ_EVAL_STEPS=1024 \
+SEQ_EVAL_TOKENS_TO_GENERATE=750 \
+SEQ_EVAL_STEPS=750 \
 SEQ_EVAL_BLOCK_LENGTH=1 \
 SEQ_EVAL_TEMPERATURE=0 \
 bash xp/examples/run_llada_eval_pipeline_gpu_only.sh
@@ -166,35 +166,56 @@ bash xp/examples/run_llada_eval_pipeline_gpu_only.sh
 
 Use this path when the user asks to reproduce the NeMoRL validation schedule, compare against training-time validation, or avoid Ray while keeping the NeMoRL prompt/generation/grading logic. Prefer the checked-in submit wrapper; do not reconstruct the full Slurm command by hand.
 
+Set benchmark-specific budgets explicitly. The wrapper defaults may be tuned for recent AIME runs, so do not rely on defaults for GSM8K.
+
+Recommended standalone budgets:
+
+- `BENCHMARK=gsm8k`: `MAX_NEW_TOKENS=750`, `MAX_STEPS=32`, `CONTEXT_LENGTH=1024`.
+- `BENCHMARK=aime2024`/`aime24` or `BENCHMARK=aime2025`/`aime25`: `MAX_NEW_TOKENS=8192`, `MAX_STEPS=8192`, `CONTEXT_LENGTH=20480`.
+
 ```bash
-cd /home/snorouzi/diffusion_RL/RL
+cd /home/snorouzi/diffusion_RL/RL-aime-eval-worktree
 
 CKPT=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/snorouzi/checkpoints/<name>_step_N_hf \
 TOKENIZER=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/snorouzi/checkpoints/Nemotron-Labs-Diffusion-3B \
+BENCHMARK=gsm8k \
 ALG=FastDiffuser \
 BS=32 \
 TEMP=1.0 \
+MAX_NEW_TOKENS=750 \
+MAX_STEPS=32 \
+CONTEXT_LENGTH=1024 \
 TAG=<name>_step_N_nemorl_rep_fastdiffuser_b32_t1 \
 ./submit_standalone_gsm8k_eval.sh
 ```
 
 Key parameters:
 
+- `BENCHMARK=gsm8k` by default. Use `BENCHMARK=aime2024`/`aime24` or `BENCHMARK=aime2025`/`aime25` to run the same standalone NeMoRL-style evaluator on AIME.
 - `ALG=FastDiffuser` for diffusion/FastDiffuser eval.
 - `ALG=LinearSpec` for linear speculation eval.
 - `BS=16` or `BS=32` for block size.
 - `TEMP=1.0` for NeMoRL validation-style sampling.
 - `TEMP=0.0` for greedy eval.
-- `NUM_SAMPLES=-1` by default for full GSM8K; set `NUM_SAMPLES=16` for a smoke test.
+- `MAX_NEW_TOKENS`, `MAX_STEPS`, and `CONTEXT_LENGTH` must be set per benchmark: use `750/32/1024` for GSM8K and `8192/8192/20480` for AIME.
+- For AIME chat-completions parity with Yonggon/NemoSkills, use `GENERATION_API=chat_completions`, `TOP_P=0.95`, and `PROMPT_FILE=/home/snorouzi/diffusion_RL/RL-aime-eval-worktree/examples/prompts/generic_math.txt`.
+- Observed baseline prompt sensitivity for the 3B checkpoint with SGLang/FastDiffuser block size 16, temp 0, high AIME budget: `generic_math.txt` gives AIME24 `4/30 = 13.33%` and AIME25 `3/30 = 10.00%`; `aime_no_cot.txt` gives AIME24 `5/30 = 16.67%` and AIME25 `2/30 = 6.67%`. Use `aime_no_cot.txt` when trying to match the higher observed AIME24 number.
+- `NUM_SAMPLES=-1` by default for the full benchmark; set `NUM_SAMPLES=16` for a smoke test.
 
 Examples:
 
 ```bash
-# FastDiffuser, block size 16, greedy
-ALG=FastDiffuser BS=16 TEMP=0.0 TAG=<name>_fd_b16_greedy ./submit_standalone_gsm8k_eval.sh
+# GSM8K, FastDiffuser, NeMoRL validation-style budget
+BENCHMARK=gsm8k ALG=FastDiffuser BS=32 TEMP=1.0 MAX_NEW_TOKENS=750 MAX_STEPS=32 CONTEXT_LENGTH=1024 TAG=<name>_gsm8k_fd_b32_t1 ./submit_standalone_gsm8k_eval.sh
+
+# AIME 2024, FastDiffuser, Yonggon/NemoSkills-style high budget
+BENCHMARK=aime2024 ALG=FastDiffuser BS=16 TEMP=0 MAX_NEW_TOKENS=8192 MAX_STEPS=8192 CONTEXT_LENGTH=20480 GENERATION_API=chat_completions TOP_P=0.95 PROMPT_FILE=/home/snorouzi/diffusion_RL/RL-aime-eval-worktree/examples/prompts/generic_math.txt TAG=<name>_aime24_fd_b16_chat ./submit_standalone_gsm8k_eval.sh
+
+# AIME 2025, FastDiffuser, Yonggon/NemoSkills-style high budget
+BENCHMARK=aime2025 ALG=FastDiffuser BS=16 TEMP=0 MAX_NEW_TOKENS=8192 MAX_STEPS=8192 CONTEXT_LENGTH=20480 GENERATION_API=chat_completions TOP_P=0.95 PROMPT_FILE=/home/snorouzi/diffusion_RL/RL-aime-eval-worktree/examples/prompts/generic_math.txt TAG=<name>_aime25_fd_b16_chat ./submit_standalone_gsm8k_eval.sh
 
 # Linear speculation, block size 32, NeMoRL validation temperature
-ALG=LinearSpec BS=32 TEMP=1.0 TAG=<name>_linearspec_b32_t1 ./submit_standalone_gsm8k_eval.sh
+BENCHMARK=gsm8k ALG=LinearSpec BS=32 TEMP=1.0 MAX_NEW_TOKENS=750 MAX_STEPS=32 CONTEXT_LENGTH=1024 TAG=<name>_gsm8k_linearspec_b32_t1 ./submit_standalone_gsm8k_eval.sh
 ```
 
 The wrapper uses `/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_llm/users/sfawzy/nemo-rl-nightly.sqsh`, mounts `/home/snorouzi` and `/lustre`, and writes `metrics.json`, `records.jsonl`, `server.log`, `server_command.txt`, `dllm_config.yaml`, and `slurm-<job>.out` under the output directory.
@@ -237,9 +258,10 @@ SBATCH_JOB_NAME=<name>_step_N_sglang_fd_b32 \
 - Keep output directories separate across block lengths, decoding modes, and benchmark variants.
 - For AR-native NemoSkills eval, use `SERVER_ENGINE=ar_native`, `SEQ_EVAL_GENERATION_ALGORITHM=ar_native`, and `SEQ_EVAL_BLOCK_LENGTH=1`.
 - Do not use `SERVER_ENGINE=hf` / `SEQ_EVAL_GENERATION_ALGORITHM=ar` by default; that Hugging Face AR path patches `config.json` in place.
-- For standalone No-Ray NeMoRL validation replication, use `/home/snorouzi/diffusion_RL/RL/submit_standalone_gsm8k_eval.sh` and set `ALG`, `BS`, `TEMP`, `CKPT`, and `TAG`.
+- For standalone No-Ray NeMoRL validation replication, use `/home/snorouzi/diffusion_RL/RL-aime-eval-worktree/submit_standalone_gsm8k_eval.sh` and set `BENCHMARK`, `ALG`, `BS`, `TEMP`, `CKPT`, `TAG`, `MAX_NEW_TOKENS`, `MAX_STEPS`, and `CONTEXT_LENGTH`.
 - In standalone eval, `TEMP=1.0` matches the NeMoRL validation-style schedule; `TEMP=0.0` is greedy.
 - NemoSkills writes a generated `.gpu_only_cmd_*.sh` script into `SEQ_EVAL_OUTPUT_DIR`; use it as the source of truth for rerunning an exact completed eval.
 - The NemoSkills server worker logs are saved under `${SEQ_EVAL_OUTPUT_DIR}/worker_logs`.
-- GSM8K uses `SEQ_EVAL_TOKENS_TO_GENERATE=1024` in the default command above.
+- GSM8K uses `SEQ_EVAL_TOKENS_TO_GENERATE=750` in the NemoSkills command above and `MAX_NEW_TOKENS=750` in the standalone command.
+- AIME uses the high-budget standalone settings `MAX_NEW_TOKENS=8192`, `MAX_STEPS=8192`, and `CONTEXT_LENGTH=20480`.
 - If using the optional SGLang fallback, set `SGLANG_COMMIT` to the actual checked-out SGLang commit and use `JSON_MODEL_OVERRIDE_ARGS=` with FastDiffuser so the wrapper does not inject AR mode.
