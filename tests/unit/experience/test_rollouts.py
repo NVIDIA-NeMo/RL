@@ -1123,13 +1123,14 @@ def test_async_rollout_manager_truncation(
     max_seq_len = 290
     max_rollout_turns = input_sample["extra_env_info"]["max_steps"] + 1
 
-    manager = AsyncRolloutManager(
-        policy_generation=vllm_generation,
+    manager = RolloutManager(
+        use_nemo_gym=False,
         tokenizer=rollout_tokenizer,
         task_to_env=task_to_env,
-        max_seq_len=max_seq_len,
         num_generations_per_prompt=num_generations,
+        max_seq_len=max_seq_len,
         max_rollout_turns=max_rollout_turns,
+        policy_generation=vllm_generation,
     )
     vllm_generation.prepare_for_generation()
     record = asyncio.run(manager.run_rollout(input_sample))
