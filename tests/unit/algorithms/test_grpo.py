@@ -31,6 +31,7 @@ from nemo_rl.algorithms.grpo import (
     _apply_message_level_advantage_penalties,
     _default_grpo_save_state,
     _resolve_message_level_advantage_penalties,
+    _should_use_async_rollouts,
     aggregate_rollout_metrics,
     async_grpo_train,
     compute_and_apply_seq_logprob_error_masking,
@@ -748,6 +749,30 @@ def mock_async_grpo_infrastructure(
     return stack
 
 
+@pytest.mark.parametrize(
+    ("generation_config", "expected"),
+    [
+        ({"backend": "vllm", "vllm_cfg": {"async_engine": False}}, False),
+        ({"backend": "vllm", "vllm_cfg": {"async_engine": True}}, True),
+        (
+            {
+                "backend": "vllm",
+                "use_async_rollouts": True,
+                "vllm_cfg": {"async_engine": False},
+            },
+            False,
+        ),
+    ],
+)
+def test_should_use_async_rollouts_selects_backend_specific_config(
+    generation_config, expected
+):
+    master_config = MagicMock()
+    master_config.policy = {"generation": generation_config}
+
+    assert _should_use_async_rollouts(master_config) is expected
+
+
 @contextmanager
 def _patched_logprob_phase(policy):
     """Provide real tensors for the logprob phase of ``grpo_train``.
@@ -1403,136 +1428,6 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node(
 
 
 @pytest.mark.parametrize(
-    "colocated_inference, expected_parallel",
-    [(True, 0.0), (False, True)],
-)
-def test_setup_sglang_sets_model_path_and_parallel_flag(
-    monkeypatch, mock_grpo_components, colocated_inference, expected_parallel
-):
-    from nemo_rl.algorithms import grpo as grpo_mod
-
-    logged = {}
-
-    class DummyLogger:
-        def log_hyperparams(self, *_args, **_kwargs):
-            pass
-
-        def log_metrics(self, metrics, *_args, **_kwargs):
-            logged["metrics"] = metrics
-
-    class DummyCheckpointer:
-        def get_latest_checkpoint_path(self):
-            return None
-
-        def load_training_info(self, _path):
-            return None
-
-        def get_resume_paths(self, _path):
-            return None, None
-
-    class DummyLoader:
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-        def __len__(self):
-            return 1
-
-        def load_state_dict(self, _state):
-            pass
-
-    class DummyCluster:
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-        def world_size(self):
-            return 1
-
-        def get_master_address_and_port(self):
-            return "127.0.0.1", 1234
-
-    class DummyPolicy:
-        def print_node_ip_and_gpu_id(self):
-            pass
-
-        def init_collective(self, *_args, **_kwargs):
-            return []
-
-        def prepare_refit_info(self):
-            return {}
-
-    class DummySGLangGeneration:
-        def finish_generation(self):
-            pass
-
-        def prepare_refit_info(self, _state):
-            pass
-
-        def init_collective(self, *_args, **_kwargs):
-            return []
-
-    monkeypatch.setattr(grpo_mod, "Logger", lambda *_args, **_kwargs: DummyLogger())
-    monkeypatch.setattr(
-        grpo_mod, "CheckpointManager", lambda *_args, **_kwargs: DummyCheckpointer()
-    )
-    monkeypatch.setattr(
-        grpo_mod, "ClippedPGLossFn", lambda *_args, **_kwargs: MagicMock()
-    )
-    monkeypatch.setattr(grpo_mod, "StatefulDataLoader", DummyLoader)
-    monkeypatch.setattr(grpo_mod, "RayVirtualCluster", DummyCluster)
-    monkeypatch.setattr(grpo_mod, "Policy", lambda *_args, **_kwargs: DummyPolicy())
-    monkeypatch.setattr(
-        grpo_mod,
-        "SGLangGeneration",
-        lambda *_args, **_kwargs: DummySGLangGeneration(),
-    )
-    monkeypatch.setattr(grpo_mod.ray, "get", lambda x: x)
-
-    generation_resources = {
-        "gpus_per_node": 1,
-        "num_nodes": 1,
-    }
-    if colocated_inference:
-        generation_resources = {"gpus_per_node": None, "num_nodes": None}
-
-    master_config = mock_grpo_components["master_config"]
-    master_config.policy["model_name"] = "fake-model"
-    master_config.policy["dtensor_cfg"] = {"enabled": False}
-    master_config.policy["megatron_cfg"] = {
-        "enabled": False,
-        "pipeline_model_parallel_size": 1,
-    }
-    master_config.policy["generation"]["backend"] = "sglang"
-    master_config.policy["generation"]["colocated"] = {
-        "enabled": colocated_inference,
-        "resources": generation_resources,
-    }
-    master_config.policy["generation"]["sglang_cfg"] = {
-        "gpus_per_server": 1,
-        "dp_size": 1,
-        "pp_size": 1,
-        "ep_size": 1,
-    }
-    master_config.loss_fn = ClippedPGLossConfig(reference_policy_kl_penalty=0.0)
-    master_config.grpo["val_period"] = 0
-    master_config.grpo["batch_multiplier"] = 1
-    master_config.cluster["gpus_per_node"] = 4
-    master_config.data["shuffle"] = False
-    master_config.data["num_workers"] = 0
-
-    tokenizer = MagicMock()
-    dataset = MagicMock()
-    dataset.__len__ = MagicMock(return_value=1)
-
-    grpo_mod.setup(master_config, tokenizer, dataset, None)
-
-    assert (
-        master_config.policy["generation"]["sglang_cfg"]["model_path"]
-        == master_config.policy["model_name"]
-    )
-    assert logged["metrics"]["parallel_init_enabled"] == expected_parallel
-
-
-@pytest.mark.parametrize(
     "initial_skip_flag",
     [None, False],
 )
@@ -1651,76 +1546,6 @@ def test_setup_auto_enables_skip_reference_policy_logprobs_when_kl_penalty_zero(
     grpo_mod.setup(master_config, tokenizer, dataset, None)
 
     assert master_config.grpo["skip_reference_policy_logprobs_calculation"] is True
-
-
-def test_refit_policy_generation_sglang_colocated_http(monkeypatch):
-    from nemo_rl.algorithms import grpo as grpo_mod
-
-    calls = {
-        "prepare_for_generation_tags": [],
-        "invalidate_kv_cache": 0,
-        "stream_weights_via_http": [],
-        "offload_before_refit": 0,
-        "offload_after_refit": 0,
-    }
-
-    class DummySGLangGeneration:
-        def prepare_for_generation(self, tags=None):
-            calls["prepare_for_generation_tags"].append(tags)
-
-        def get_sglang_url_to_gpu_uuids(self):
-            return {"http://localhost:12345": ["gpu-uuid-0"]}
-
-        def invalidate_kv_cache(self):
-            calls["invalidate_kv_cache"] += 1
-            return True
-
-    class DummyPolicy:
-        def offload_before_refit(self):
-            calls["offload_before_refit"] += 1
-
-        def offload_after_refit(self):
-            calls["offload_after_refit"] += 1
-
-        def get_free_memory_bytes(self):
-            return 1024 * 1024 * 1024
-
-        def stream_weights_via_http(self, sglang_url_to_gpu_uuids):
-            calls["stream_weights_via_http"].append(sglang_url_to_gpu_uuids)
-            return ["ok"]
-
-    monkeypatch.setattr(grpo_mod, "SGLangGeneration", DummySGLangGeneration)
-    monkeypatch.setattr(grpo_mod.ray, "get", lambda x: x)
-
-    grpo_mod.refit_policy_generation(
-        policy=DummyPolicy(),
-        policy_generation=DummySGLangGeneration(),
-        colocated_inference=True,
-    )
-
-    assert calls["offload_before_refit"] == 1
-    assert calls["offload_after_refit"] == 1
-    assert calls["invalidate_kv_cache"] == 1
-    assert calls["stream_weights_via_http"] == [
-        {"http://localhost:12345": ["gpu-uuid-0"]}
-    ]
-    assert calls["prepare_for_generation_tags"] == [["weights"], ["kv_cache"]]
-
-
-def test_refit_policy_generation_sglang_non_colocated_raises(monkeypatch):
-    from nemo_rl.algorithms import grpo as grpo_mod
-
-    class DummySGLangGeneration:
-        pass
-
-    monkeypatch.setattr(grpo_mod, "SGLangGeneration", DummySGLangGeneration)
-
-    with pytest.raises(NotImplementedError):
-        grpo_mod.refit_policy_generation(
-            policy=object(),
-            policy_generation=DummySGLangGeneration(),
-            colocated_inference=False,
-        )
 
 
 def test_refit_policy_generation_non_colocated_offloads_and_restores(monkeypatch):

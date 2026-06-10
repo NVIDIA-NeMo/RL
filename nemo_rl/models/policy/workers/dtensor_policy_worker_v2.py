@@ -352,6 +352,26 @@ class DTensorPolicyWorkerV2Impl(
             _runtime_is_reward_model,  # Duplicate, already set as _is_reward_model
         ) = runtime_config
 
+        # Rollout topology constant for SGLang colocated refit: set once via
+        # ``set_rollout_num_gpus_per_engine`` after the SGLang generation
+        # handle exists and consumed by ``stream_weights_via_http`` on each
+        # refit. Only initialized on the SGLang colocated path since no other
+        # generation backend uses this attribute.
+        generation_backend = config.get("generation", {}).get("backend")
+        if generation_backend == "sglang":
+            from nemo_rl.models.generation.sglang.utils.train_utils import (
+                monkey_patch_torch_reductions,
+            )
+
+            monkey_patch_torch_reductions()
+            if self.is_generation_colocated:
+                self._rollout_num_gpus_per_engine: Optional[int] = None
+                self._ipc_worker_state: dict = {}
+
+    def set_rollout_num_gpus_per_engine(self, num_gpus_per_engine: int) -> None:
+        """Record the rollout engine's TP size for later use in ``stream_weights_via_http``."""
+        self._rollout_num_gpus_per_engine = num_gpus_per_engine
+
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/train")
     def train(
         self,
@@ -1119,47 +1139,42 @@ class DTensorPolicyWorkerV2Impl(
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/stream_weights_via_http")
     def stream_weights_via_http(
         self,
-        sglang_url_to_gpu_uuids: dict[str, list[str]],
+        rollout_engine_urls: list[str],
+        buffer_size_bytes: int,
     ) -> None:
-        """Stream model weights to SGLang servers via HTTP API.
+        """Stream FSDP weights to colocated SGLang engines via CUDA IPC over HTTP.
 
         Args:
-            sglang_url_to_gpu_uuids: Dict mapping SGLang server URL to list of GPU UUIDs it uses
+            rollout_engine_urls: ``http://host:port`` base URLs of each
+                engine's ``node_rank=0`` SGLang HTTP server. The driver
+                resolves these once via ``engine.get_base_url`` and passes
+                them down so every FSDP rank doesn't redo the Ray RPC.
+            buffer_size_bytes: Max bucket size in bytes before flushing.
+
+        ``num_gpus_per_engine`` is recorded once via
+        ``set_rollout_num_gpus_per_engine`` after the SGLang generation handle
+        is created, so the caller doesn't have to pass it on every refit.
         """
+        assert self._rollout_num_gpus_per_engine is not None, (
+            "stream_weights_via_http called before set_rollout_num_gpus_per_engine; "
+            "wire the rollout TP size on the policy after SGLangGeneration is built."
+        )
+
         # Manually move model to cuda for cpu offload case
         if self.cpu_offload:
             self.model = self.move_to_cuda(self.model)
 
         from nemo_rl.models.policy.utils import stream_weights_via_http_impl
 
-        # Get current GPU UUID
-        current_device_uuid = self.report_device_id()
-
-        def dtensor_params_generator():
-            """Generator that yields (name, tensor) pairs, converting DTensors to local tensors."""
-            state_dict_items = sorted(
-                self.model.state_dict().items(), key=lambda x: x[0]
-            )
-            for name, tensor in state_dict_items:
-                if isinstance(tensor, DTensor):
-                    # Convert DTensor to full tensor for streaming
-                    full_tensor = tensor.full_tensor()
-                    # Convert to target dtype
-                    yield (
-                        name,
-                        full_tensor.to(self.dtype, non_blocking=True).contiguous(),
-                    )
-                else:
-                    # Convert to target dtype
-                    yield name, tensor.to(self.dtype, non_blocking=True).contiguous()
-
-        # Use the HTTP implementation
         stream_weights_via_http_impl(
-            params_generator=dtensor_params_generator(),
-            sglang_url_to_gpu_uuids=sglang_url_to_gpu_uuids,
+            params_generator=dtensor_params_generator(self.model, self.dtype),
+            rollout_engine_urls=rollout_engine_urls,
+            num_gpus_per_engine=self._rollout_num_gpus_per_engine,
             rank=self.rank,
+            world_size=torch.distributed.get_world_size(),
             worker_name=str(self),
-            current_device_uuid=current_device_uuid,
+            buffer_size_bytes=buffer_size_bytes,
+            worker_state=self._ipc_worker_state,
         )
 
     @torch.no_grad()
