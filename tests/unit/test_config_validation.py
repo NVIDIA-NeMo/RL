@@ -27,6 +27,9 @@ from nemo_rl.algorithms.grpo import MasterConfig as GRPOMasterConfig
 from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
 from nemo_rl.algorithms.rm import MasterConfig as RMMasterConfig
 from nemo_rl.algorithms.sft import MasterConfig as SFTMasterConfig
+from nemo_rl.algorithms.xtoken_off_policy_distillation import (
+    MasterConfig as XTokenOffPolicyDistillationMasterConfig,
+)
 from nemo_rl.evals.eval import MasterConfig as EvalMasterConfig
 from nemo_rl.utils.config import (
     load_config_with_inheritance,
@@ -113,6 +116,15 @@ def test_all_config_files_have_required_keys(config_file):
     if "/evals/" in config_file:
         master_config_class = EvalMasterConfig
         config_type = "eval"
+    elif (
+        "loss_fn" in config_dict and "projection_matrix_path" in config_dict["loss_fn"]
+    ):
+        # Cross-tokenizer off-policy distillation also has a top-level
+        # ``distillation`` block, so it must be matched before the generic
+        # ``distillation`` branch below. ``projection_matrix_path`` is unique to
+        # the cross-tokenizer loss and disambiguates it from online distillation.
+        master_config_class = XTokenOffPolicyDistillationMasterConfig
+        config_type = "xtoken_off_policy_distillation"
     elif "distillation" in config_dict:
         master_config_class = DistillationMasterConfig
         config_type = "distillation"
