@@ -227,9 +227,18 @@ policy: &POLICY_BASE
 teacher:
     <<: *POLICY_BASE
     model_name: "Qwen/Qwen3-4B"
+    # YAML merge above is a load-time copy, so values from `policy:` get
+    # frozen at parse time. Re-bind the fields whose semantics require the
+    # teacher to track the policy via absolute interpolation; OmegaConf
+    # resolves these at use time so user overrides on `policy.<field>`
+    # propagate. An explicit `teacher.<field>` override still wins.
+    max_total_sequence_length: ${policy.max_total_sequence_length}
+    train_micro_batch_size: ${policy.train_micro_batch_size}
+    logprob_batch_size: ${policy.logprob_batch_size}
+    precision: ${policy.precision}
     dtensor_cfg:
         <<: *DTENSOR_BASE
-        context_parallel_size: 2 
+        context_parallel_size: 2
         tensor_parallel_size: 4
 
 data:
