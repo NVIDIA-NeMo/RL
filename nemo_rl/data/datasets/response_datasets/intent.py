@@ -43,25 +43,40 @@ from nemo_rl.data.datasets.utils import get_huggingface_cache_path
 
 logger = logging.getLogger(__name__)
 
-# Per-problem-type instruction string appended to the question, mirroring
-# HumanOmniV2's TYPE_TEMPLATE so the model knows the answer format.
+# Per-problem-type instruction appended to the question. The wording asks
+# the model to first think between <think>...</think> tags and then commit
+# the final answer between <answer>...</answer> tags so both NeMo-RL reward
+# functions (format_reward checks for <think> + <answer>; exact_alnum
+# extracts content from <answer>) can score the response. Without the
+# explicit "<think>" instruction the base Qwen2.5-Omni-3B emits a bare
+# letter (e.g. "B") and both rewards collapse to 0.
 _TYPE_TEMPLATE = {
     "multiple choice": (
-        " Please provide only the single option letter (e.g., A, B, C, D, etc.) "
-        "within the <answer> </answer> tags."
+        " First reason briefly between <think> </think> tags, then output "
+        "only the single option letter (e.g., A, B, C, D, ...) between "
+        "<answer> </answer> tags. Format example: "
+        "<think>your reasoning</think><answer>A</answer>"
     ),
     "emer_ov_mc": (
-        " Please provide only the single or multiple option letter "
-        "(e.g., A for single option or A,E for multi option, etc.) "
-        "within the <answer> </answer> tags."
+        " First reason briefly between <think> </think> tags, then output "
+        "the single or multi-letter answer (e.g., A for single, A,E for "
+        "multiple) between <answer> </answer> tags. Format example: "
+        "<think>your reasoning</think><answer>A,E</answer>"
     ),
     "numerical": (
-        " Please provide the numerical value (e.g., 42 or 3.14) "
-        "within the <answer> </answer> tags."
+        " First reason briefly between <think> </think> tags, then output "
+        "the numerical value (e.g., 42 or 3.14) between <answer> </answer> "
+        "tags. Format example: <think>your reasoning</think><answer>42</answer>"
     ),
-    "judge": (" Please answer Yes or No within the <answer> </answer> tags."),
+    "judge": (
+        " First reason briefly between <think> </think> tags, then answer "
+        "Yes or No between <answer> </answer> tags. Format example: "
+        "<think>your reasoning</think><answer>Yes</answer>"
+    ),
     "free-form": (
-        " Please provide your text answer within the <answer> </answer> tags."
+        " First reason briefly between <think> </think> tags, then provide "
+        "your final text answer between <answer> </answer> tags. Format "
+        "example: <think>your reasoning</think><answer>your answer</answer>"
     ),
 }
 

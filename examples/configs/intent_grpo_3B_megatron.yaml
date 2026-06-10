@@ -94,10 +94,17 @@ env:
   vlm:
     num_workers: 8
     reward_functions:
+    # The Qwen2.5-Omni base model often emits a bare letter (e.g. "B") instead
+    # of "<answer>B</answer>" -- with the strict exact_alnum reward both
+    # rewards stay 0 and GRPO has no learning signal. The "with_fallback"
+    # variant accepts the whole response when no <answer> tag is present so
+    # the model gets credit for bare-letter answers; once it's reliably right
+    # we keep the format_reward in the mix to nudge it toward the wrapped
+    # form and unlock <think>/<answer> structure.
     - name: format
-      weight: 0.2
-    - name: exact_alnum
-      weight: 0.8
+      weight: 0.1
+    - name: exact_alnum_with_fallback
+      weight: 0.9
 
 logger:
   wandb_enabled: true

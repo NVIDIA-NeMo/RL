@@ -1,0 +1,68 @@
+# Intent (audio+video) GRPO 7B Megatron configuration.
+#
+# Same recipe as intent_grpo_3B_megatron.yaml (PhilipC/IntentTrain →
+# PhilipC/IntentBench, audio+video as independent <|VIDEO|> + <|AUDIO|>
+# multimodal items, format(0.1)+exact_alnum_with_fallback(0.9) reward,
+# multiple-choice problem_type only) but for Qwen/Qwen2.5-Omni-7B.
+#
+# 7B requires more aggressive sharding than 3B to fit on 80 GB H100s
+# alongside vLLM rollout memory:
+#   * tensor_model_parallel_size: 2 → model state sharded across 2 ranks,
+#     data parallel size = gpus_per_node / TP = 4 with 8 GPUs.
+#   * train_global_batch_size: 4 → 1 sample per DP rank per gradient
+#     update (the same constraint that avoids the Qwen2.5-Omni rope
+#     IndexError seen with multi-sample-per-rank batches in the 3B run).
+#   * generation_batch_size: 4, logprob_batch_size: 1 → match.
+#   * num_prompts_per_step × num_generations_per_prompt = 16 → 4 gradient
+#     updates per step (matches train_global_batch_size).
+#   * activation_checkpointing on, vllm gpu_memory_utilization: 0.4 to
+#     leave more headroom for the Megatron forward.
+#
+# Inherits from intent_grpo_3B_megatron.yaml so the IntentTrain dataset
+# wiring, IntentBench validation, prompt instruction, and reward set
+# stay identical to the 3B recipe.
+defaults: "intent_grpo_3B_megatron.yaml"
+
+grpo:
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 4
+
+policy:
+  model_name: Qwen/Qwen2.5-Omni-7B
+  train_global_batch_size: 4
+  train_micro_batch_size: 1
+  generation_batch_size: 4
+  logprob_batch_size: 1
+  # Multimodal token budget for video (4 frames) + audio + text. Bump if
+  # loss_multiplier truncates many samples in early validation.
+  max_total_sequence_length: 4096
+
+  generation:
+    vllm_cfg:
+      # 7B model state crowds the GPU; lower vLLM cache budget so Megatron
+      # has room for activations during the training-time forward pass.
+      gpu_memory_utilization: 0.4
+
+  megatron_cfg:
+    activation_checkpointing: true
+    # Shard the model across two ranks. With cluster.gpus_per_node=8 this
+    # gives DP=4. train_global_batch_size=4 + micro=1 satisfies Megatron's
+    # divisibility check (4 % (1 * 4) == 0) AND keeps the per-rank batch
+    # at exactly 1 sample per forward, which is what the Qwen2.5-Omni rope
+    # path requires.
+    tensor_model_parallel_size: 2
+
+  tokenizer:
+    video:
+      num_frames: 4
+
+logger:
+  wandb:
+    project: grpo-dev
+    name: intent-grpo-7b-megatron
+  swanlab:
+    project: grpo-dev
+    name: intent-grpo-7b-megatron
+
+cluster:
+  gpus_per_node: 8
