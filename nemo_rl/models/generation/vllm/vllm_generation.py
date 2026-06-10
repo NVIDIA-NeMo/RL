@@ -54,10 +54,25 @@ class VllmGeneration(GenerationInterface):
         config: VllmConfig,
         name_prefix: str = "vllm_policy",
         workers_per_node: Optional[Union[int, list[int]]] = None,
+        defer_model_load: bool = False,
     ):
-        """Initialize a vLLM policy with distributed workers."""
+        """Initialize a vLLM policy with distributed workers.
+
+        When defer_model_load=True, workers only reserve ports (seconds) and
+        dp_openai_server_base_urls is populated immediately from reserved ports.
+        Call load_and_start() later to perform heavy model loading. This enables
+        overlapping vLLM model loading with NeMo Gym init.
+
+        Args:
+            cluster: Virtual cluster for worker placement
+            config: VllmConfig dictionary
+            name_prefix: Prefix for Ray actor names
+            workers_per_node: Workers per node override
+            defer_model_load: If True, defer model loading for overlapped init
+        """
         # Store config
         self.cfg = config
+        self._defer_model_load = defer_model_load
         self.tp_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
         self.pp_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
         self.ep_size = self.cfg["vllm_cfg"]["expert_parallel_size"]
@@ -148,7 +163,12 @@ class VllmGeneration(GenerationInterface):
                 "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker"
             )
         worker_cls = resolve_generation_worker_cls(worker_cls, self.cfg)
-        worker_builder = RayWorkerBuilder(worker_cls, config)
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            worker_builder = RayWorkerBuilder(
+                worker_cls, config, defer_model_load=defer_model_load
+            )
+        else:
+            worker_builder = RayWorkerBuilder(worker_cls, config)
 
         # It's necessary to set env_vars here to ensure that vllm non-leader workers also have these env_vars
         env_vars = {}
@@ -195,13 +215,6 @@ class VllmGeneration(GenerationInterface):
                 env_vars=env_vars,
             )
 
-        # Call some collective rpc functions in VllmGenerationWorker when initializing the vLLM engine
-        # This is necessary for async engine to work
-        self._post_init()
-
-        # dp_openai_server_base_urls is only returned by Async vLLM flow when http server is active
-        self.dp_openai_server_base_urls = self._report_dp_openai_server_base_urls()
-
         # Number of data parallel groups is the number of tied worker groups
         assert self.dp_size == self.worker_group.dp_size, (
             f"Data parallel size mismatch. Expected {self.dp_size}, got {self.worker_group.dp_size}"
@@ -210,8 +223,20 @@ class VllmGeneration(GenerationInterface):
         # Used to track the round-robin selection of worker groups for generate_async
         self.current_generate_dp_shard_idx = 0
 
-        # Save the device uuids for the workers
-        self.device_uuids = self._report_device_id()
+        if defer_model_load:
+            # Workers only reserved ports — collect URLs immediately and defer
+            # the heavy model loading (and HTTP server start) to load_and_start().
+            self.dp_openai_server_base_urls = self._collect_reserved_urls()
+            self.device_uuids = None
+        else:
+            # Full init: call some collective rpc functions in the worker when
+            # initializing the vLLM engine (necessary for async engine to work),
+            # then report server URLs and device ids.
+            self._post_init()
+            # dp_openai_server_base_urls is only returned by the async vLLM flow
+            # when the http server is active.
+            self.dp_openai_server_base_urls = self._report_dp_openai_server_base_urls()
+            self.device_uuids = self._report_device_id()
 
         self._step_metrics_snapshot: dict[str | tuple[str, int], float] | None = None
 
@@ -359,6 +384,45 @@ class VllmGeneration(GenerationInterface):
         # Wait for all futures to complete
         results = ray.get(futures)
         return results
+
+    def _collect_reserved_urls(self) -> list[Optional[str]]:
+        """Collect reserved URLs from DP leaders before model loading.
+
+        Only called when defer_model_load=True. Workers have bound ports
+        during __init__ and can report their reserved URLs immediately.
+        """
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            return [None]
+
+        futures = self.worker_group.run_all_workers_single_data(
+            "get_reserved_url",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        results = ray.get(futures)
+        return results
+
+    def load_and_start(self) -> None:
+        """Load models on all workers and start HTTP servers.
+
+        Called after a deferred init (defer_model_load=True) to perform the
+        heavy model loading. Updates dp_openai_server_base_urls with the actual
+        running server URLs and populates device_uuids.
+        """
+        # Call load_model() on all model-owner workers
+        futures = self.worker_group.run_all_workers_single_data(
+            "load_model",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        ray.get(futures)
+
+        # Post-init (collective rpc functions needed for async engine)
+        self._post_init()
+
+        # Refresh URLs from the actual running servers
+        self.dp_openai_server_base_urls = self._report_dp_openai_server_base_urls()
+
+        # Save device UUIDs
+        self.device_uuids = self._report_device_id()
 
     def _post_init(self):
         # Choose the appropriate method based on async_engine setting
