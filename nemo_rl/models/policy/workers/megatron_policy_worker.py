@@ -102,6 +102,47 @@ from nemo_rl.utils.timer import Timer
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
+def _should_merge_adapter_weights_for_refit(config: PolicyConfig) -> bool:
+    """Return whether vLLM refit export should fold PEFT weights into base weights."""
+    return config["megatron_cfg"].get("peft", {}).get("enabled", False)
+
+
+def _validate_merged_refit_weight_name(name: str) -> None:
+    """Ensure merged LoRA export uses the plain base-model keyspace vLLM loaded."""
+    peft_markers = (".base_layer", ".adapter", ".lora_")
+    if any(marker in name for marker in peft_markers):
+        raise RuntimeError(
+            "Megatron-Bridge returned an unmerged PEFT wrapper key during "
+            f"vLLM refit export: {name}. When PEFT is enabled, "
+            "merge_adapter_weights=True should produce plain base-model keys."
+        )
+
+
+def _iter_refit_base_weights(
+    *,
+    megatron_bridge: Any,
+    model: Any,
+    conversion_tasks: Any,
+    config: PolicyConfig,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Export base-model refit weights with LoRA merging only when PEFT is enabled."""
+    merge_adapter_weights = _should_merge_adapter_weights_for_refit(config)
+    base_iter = megatron_bridge.export_hf_weights(
+        [model],
+        show_progress=False,
+        conversion_tasks=conversion_tasks,  # used for metadata caching
+        # Full-weight Ultra refit skips adapter discovery for speed. LoRA
+        # refit must merge adapter deltas so vLLM receives the same plain
+        # base-model keyspace it loaded initially.
+        merge_adapter_weights=merge_adapter_weights,
+    )
+
+    for name, tensor in base_iter:
+        if merge_adapter_weights:
+            _validate_merged_refit_weight_name(name)
+        yield name, tensor
+
+
 @ray.remote(
     runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker")
 )  # pragma: no cover
@@ -1042,23 +1083,13 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             get_vllm_qkv_scale_names,
         )
 
-        base_iter = self.megatron_bridge.export_hf_weights(
-            [self.model],
-            show_progress=False,
-            conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
-            # vLLM serves the plain HF model, not PEFT wrapper modules. Merge
-            # LoRA deltas into exported base weights before refit so rollout
-            # workers receive the model keyspace they already loaded.
-            merge_adapter_weights=True,
+        # Yield the original parameters first.
+        yield from _iter_refit_base_weights(
+            megatron_bridge=self.megatron_bridge,
+            model=self.model,
+            conversion_tasks=self.refit_conversion_tasks,
+            config=self.cfg,
         )
-
-        # Yield the original parameters first. Some Megatron-Bridge PEFT export
-        # paths can still expose wrapper names or adapter-only tensors after
-        # merging; normalize them for vLLM's plain-model state dict.
-        for name, tensor in base_iter:
-            if ".adapter" in name or ".lora_" in name:
-                continue
-            yield name.replace(".base_layer", ""), tensor
 
         # Check whether FP8 KV cache is enabled.
         use_fp8_kv_cache = False
