@@ -15,6 +15,7 @@
 import contextlib
 import os
 import tempfile
+from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -528,6 +529,21 @@ def test_dtensor_v2_mixed_precision_training_and_logprobs(
 class TestMaybeAdaptTensorToHF:
     """Tests for the _maybe_adapt_tensor_to_hf helper function."""
 
+    def _combined_projection_adapter(self):
+        """Create a small combined-projection adapter for regression tests."""
+        from nemo_automodel.components.models.common.combined_projection.state_dict_adapter import (
+            CombinedProjectionStateDictAdapter,
+        )
+
+        return CombinedProjectionStateDictAdapter(
+            SimpleNamespace(
+                num_hidden_layers=1,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                hidden_size=8,
+            )
+        )
+
     def test_no_adapter_returns_single_tuple(self):
         """Test that when model has no adapter, returns single FQN-tensor tuple."""
         # Arrange
@@ -617,11 +633,54 @@ class TestMaybeAdaptTensorToHF:
             "Should exclude extra_state tensors"
         )
 
+    def test_combined_projection_adapter_splits_qkv_weight(self):
+        """Regression test for Automodel combined projections in tensor sync."""
+        adapter = self._combined_projection_adapter()
+        q_weight = torch.randn(8, 3)
+        k_weight = torch.randn(4, 3)
+        v_weight = torch.randn(4, 3)
+        qkv_weight = adapter._interleave_qkv(q_weight, k_weight, v_weight)
+        model = nn.Module()
+        model.state_dict_adapter = adapter
+
+        result = dict(
+            _maybe_adapt_tensor_to_hf(
+                model,
+                "model.layers.0.self_attn.qkv_proj.weight",
+                qkv_weight,
+            )
+        )
+
+        torch.testing.assert_close(
+            result["model.layers.0.self_attn.q_proj.weight"], q_weight
+        )
+        torch.testing.assert_close(
+            result["model.layers.0.self_attn.k_proj.weight"], k_weight
+        )
+        torch.testing.assert_close(
+            result["model.layers.0.self_attn.v_proj.weight"], v_weight
+        )
+
 
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
 class TestDTensorParamsGenerator:
     """Tests for the dtensor_params_generator helper function."""
+
+    def _combined_projection_adapter(self):
+        """Create a small combined-projection adapter for regression tests."""
+        from nemo_automodel.components.models.common.combined_projection.state_dict_adapter import (
+            CombinedProjectionStateDictAdapter,
+        )
+
+        return CombinedProjectionStateDictAdapter(
+            SimpleNamespace(
+                num_hidden_layers=1,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                hidden_size=8,
+            )
+        )
 
     def test_simple_model_yields_adapted_tensors(self):
         """Test that generator yields correct (name, tensor) pairs for a simple model."""
@@ -752,6 +811,42 @@ class TestDTensorParamsGenerator:
         for name, tensor in results:
             assert tensor.dtype == target_dtype
             assert tensor.is_contiguous()
+
+    def test_combined_projection_adapter_emits_hf_split_keys(self):
+        """Generator should emit HF split keys for custom Automodel state dicts."""
+        adapter = self._combined_projection_adapter()
+        q_weight = torch.randn(8, 3)
+        k_weight = torch.randn(4, 3)
+        v_weight = torch.randn(4, 3)
+        qkv_weight = adapter._interleave_qkv(q_weight, k_weight, v_weight)
+
+        class CombinedProjectionModel(nn.Module):
+            def __init__(self, weight, state_dict_adapter):
+                super().__init__()
+                layer = nn.Module()
+                layer.self_attn = nn.Module()
+                layer.self_attn.qkv_proj = nn.Linear(3, 16, bias=False)
+                with torch.no_grad():
+                    layer.self_attn.qkv_proj.weight.copy_(weight)
+
+                self.model = nn.Module()
+                self.model.layers = nn.ModuleList([layer])
+                self.state_dict_adapter = state_dict_adapter
+
+        model = CombinedProjectionModel(qkv_weight, adapter)
+
+        results = dict(dtensor_params_generator(model, torch.float32))
+
+        assert "model.layers.0.self_attn.qkv_proj.weight" not in results
+        torch.testing.assert_close(
+            results["model.layers.0.self_attn.q_proj.weight"], q_weight
+        )
+        torch.testing.assert_close(
+            results["model.layers.0.self_attn.k_proj.weight"], k_weight
+        )
+        torch.testing.assert_close(
+            results["model.layers.0.self_attn.v_proj.weight"], v_weight
+        )
 
 
 @pytest.mark.automodel
