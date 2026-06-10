@@ -36,6 +36,20 @@ def get_num_buffers():
     return int(os.getenv("NRL_REFIT_NUM_BUFFERS", "2"))
 
 
+# Pack each tensor's byte payload to this byte boundary so subsequent
+# chunks in the packed buffer have storage_offset divisible by the largest
+# common dtype alignment (8 bytes covers fp64/int64; covers fp32/int32 by
+# transitivity). Without padding, e.g. a BF16 tensor with odd numel
+# leaves the next chunk at a 2-byte (but not 4-byte) boundary, and
+# `chunk.view(torch.float32)` fails with
+#   "self.storage_offset() must be divisible by 4 to view Byte as Float"
+_PACK_ALIGN = 8
+
+
+def _aligned_size(n: int, alignment: int = _PACK_ALIGN) -> int:
+    return ((n + alignment - 1) // alignment) * alignment
+
+
 def packed_broadcast_producer(iterator, group, src, post_iter_func):
     """Broadcast a list of tensors in a packed manner.
 
@@ -83,8 +97,15 @@ def packed_broadcast_producer(iterator, group, src, post_iter_func):
                         .view(torch.uint8)
                         .view(-1)
                     )
+                    raw = tensor.numel()
+                    aligned = _aligned_size(raw)
+                    if aligned != raw:
+                        pad = torch.zeros(
+                            aligned - raw, dtype=torch.uint8, device=tensor.device
+                        )
+                        tensor = torch.cat([tensor, pad])
                     packing_tensor_list[buffer_idx].append(tensor)
-                    packing_tensor_sizes[buffer_idx] += tensor.view(torch.uint8).numel()
+                    packing_tensor_sizes[buffer_idx] += aligned
                     if packing_tensor_sizes[buffer_idx] > target_packed_tensor_size:
                         break
                 # Pack the tensors and call broadcast collective
@@ -129,15 +150,20 @@ def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
             unpacked List[(name, tensor)]
         """
         unpacked_list = []
-        # Perform batched split with torch.split_with_sizes
-        packed_tensor_sizes = list(map(lambda x: x[4], meta_data_list))
+        # Split using padded sizes (entry [5] = aligned_size, set in the
+        # iterator loop below). The split chunks land on 8-byte-aligned
+        # boundaries within the packed buffer, so view(dtype) is safe for
+        # any common dtype. Then trim back to the original (unpadded)
+        # tensor_size before view.
+        packed_tensor_sizes = list(map(lambda x: x[5], meta_data_list))
         unpacked_tensor = packed_tensor.split_with_sizes(packed_tensor_sizes)
 
-        # unpacked_list = List[(name, torch.Tensor.view(dtype).view(*shape))]
         unpacked_list = [
             (
                 meta_data_list[i][0],
-                tensor.view(meta_data_list[i][2]).view(*meta_data_list[i][1]),
+                tensor[: meta_data_list[i][4]]
+                .view(meta_data_list[i][2])
+                .view(*meta_data_list[i][1]),
             )
             for i, tensor in enumerate(unpacked_tensor)
         ]
@@ -172,11 +198,16 @@ def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
                 while True:
                     name, (shape, dtype) = next(iterator)
                     tensor_size = math.prod(shape) * dtype.itemsize
+                    aligned_size = _aligned_size(tensor_size)
+                    # Layout in meta_data: (name, shape, dtype, offset,
+                    # tensor_size, aligned_size). The split uses aligned_size
+                    # so chunks land on _PACK_ALIGN-aligned offsets; the
+                    # view then trims back to tensor_size.
                     packing_tensor_meta_data[buffer_idx].append(
-                        (name, shape, dtype, offsets[buffer_idx], tensor_size)
+                        (name, shape, dtype, offsets[buffer_idx], tensor_size, aligned_size)
                     )
-                    packing_tensor_sizes[buffer_idx] += tensor_size
-                    offsets[buffer_idx] += tensor_size
+                    packing_tensor_sizes[buffer_idx] += aligned_size
+                    offsets[buffer_idx] += aligned_size
                     if packing_tensor_sizes[buffer_idx] > target_packed_tensor_size:
                         break
                 # Create a packed tensor and broadcast it

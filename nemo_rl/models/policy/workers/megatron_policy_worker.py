@@ -89,11 +89,28 @@ from nemo_rl.models.policy.interfaces import (
 )
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
-from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
+from nemo_rl.models.policy.workers.patches import (
+    apply_torch_config_pickle_patch,
+    apply_transformer_engine_patch,
+)
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
+# Applied at import time (before Ray serializes this worker's actor class) so that
+# torch>=2.11 config modules are picklable by reference. Required for the Megatron
+# path on the DSv4/vLLM-0.21 (torch 2.11) stack; see patches for details.
+apply_torch_config_pickle_patch()
+
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+
+
+def _debug_sync_train(label: str) -> None:
+    if os.environ.get("NRL_DEBUG_SYNC_TRAIN", "0") != "1":
+        return
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+    print(f"[NRL_DEBUG_SYNC_TRAIN][rank={rank}] before {label}", flush=True)
+    torch.cuda.synchronize()
+    print(f"[NRL_DEBUG_SYNC_TRAIN][rank={rank}] after {label}", flush=True)
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
@@ -437,16 +454,19 @@ class MegatronPolicyWorkerImpl(
                             "use_linear_ce_fusion_loss", False
                         ),
                     )
+                    _debug_sync_train("megatron_forward_backward")
 
                 # Empty unused memory.
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
                     torch.cuda.empty_cache()
+                _debug_sync_train("empty_cache_level_1")
 
                 # Update parameters.
                 if not eval_mode:
                     update_successful, grad_norm, num_zeros_in_grad = (
                         self.optimizer.step()
                     )
+                    _debug_sync_train("optimizer_step")
                 else:
                     update_successful, grad_norm, num_zeros_in_grad = (True, 0.0, 0.0)
 
@@ -457,18 +477,22 @@ class MegatronPolicyWorkerImpl(
                 update_successful = logical_and_across_model_parallel_group(
                     update_successful, mp_group=pg_collection.mp
                 )
+                _debug_sync_train("logical_and_across_model_parallel_group")
                 # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
                 # so we must gather across mp ranks
                 grad_norm: float = reduce_max_stat_across_model_parallel_group(
                     grad_norm, mp_group=pg_collection.mp
                 )
+                _debug_sync_train("reduce_max_grad_norm")
                 num_zeros_in_grad: float = reduce_max_stat_across_model_parallel_group(
                     num_zeros_in_grad, mp_group=pg_collection.mp
                 )
+                _debug_sync_train("reduce_max_num_zeros_in_grad")
 
                 # Empty unused memory.
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 2:
                     torch.cuda.empty_cache()
+                _debug_sync_train("empty_cache_level_2")
 
                 if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
                     # keep all microbatch metrics to be normalized later
@@ -497,6 +521,7 @@ class MegatronPolicyWorkerImpl(
                 gb_loss_metrics = broadcast_loss_metrics_from_last_stage(
                     gb_loss_metrics
                 )
+                _debug_sync_train("broadcast_loss_metrics_from_last_stage")
                 if not parallel_state.is_pipeline_last_stage(ignore_virtual=True):
                     mb_losses = [x["loss"] for x in gb_loss_metrics]
 
@@ -1044,13 +1069,21 @@ class MegatronPolicyWorkerImpl(
     @wrap_with_nvtx_name("megatron_policy_worker/prepare_refit_info")
     def prepare_refit_info(self) -> None:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
+        # The streaming iterator below does a per-expert EP all_gather inside
+        # megatron-bridge. On large MoE models (DSv4) at 80 GiB / GPU, NCCL
+        # can fail to allocate even small scratch buffers without first
+        # returning reserved pages and dropping pinned Python references.
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
         self.refit_param_info_mcore = self._calculate_refit_param_info()
 
-        # Collect tensor metadata for refit / hf side info
         refit_param_info_hf = {}
-        # Reuse shared iterator that appends FP8 KV/Q scales when enabled
         for name, tensor in self._iter_params_with_optional_kv_scales():
             refit_param_info_hf[name] = (tensor.shape, tensor.dtype)
+            del tensor
+            torch.cuda.empty_cache()
 
         return refit_param_info_hf
 
@@ -1080,13 +1113,18 @@ class MegatronPolicyWorkerImpl(
                 # need to broadcast for other pp ranks
                 size_in_bytes = None
             else:
-                # Calculate size for this parameter
+                # Floating-point params are cast to the policy training dtype on
+                # refit; integer buffers (e.g. DSv4 hash-MoE tid2eid) keep their
+                # own dtype, so the scale stays at 1.
                 prec_to_bytes = {
                     torch.bfloat16: 2,
                     torch.float16: 2,
                     torch.float32: 4,
                 }
-                scale = prec_to_bytes[self.dtype] / prec_to_bytes[param.dtype]
+                if param.dtype.is_floating_point:
+                    scale = prec_to_bytes[self.dtype] / prec_to_bytes[param.dtype]
+                else:
+                    scale = 1
                 size_in_bytes = (
                     param.element_size() * param.numel() * tp_size * ep_size * scale
                 )
@@ -1147,10 +1185,18 @@ class MegatronPolicyWorkerImpl(
             and self.cfg["generation"]["backend"] == "vllm"
         ):
             generation_cfg = cast(VllmConfig, self.cfg["generation"])
+            # fp8_ds_mla (DSV4 MLA) packs KV scales inline in the cache tensor;
+            # there are no Parameter-style q/k/v_scale buffers on the vLLM side
+            # for refit to write into, so we skip appending those metadata keys.
+            kv_cache_dtype_val = (
+                generation_cfg["vllm_cfg"].get("kv_cache_dtype")
+                if "vllm_cfg" in generation_cfg
+                else None
+            )
             use_fp8_kv_cache = (
-                "vllm_cfg" in generation_cfg
-                and "kv_cache_dtype" in generation_cfg["vllm_cfg"]
-                and generation_cfg["vllm_cfg"]["kv_cache_dtype"].startswith("fp8")
+                kv_cache_dtype_val is not None
+                and kv_cache_dtype_val.startswith("fp8")
+                and kv_cache_dtype_val != "fp8_ds_mla"
             )
 
         if not use_fp8_kv_cache:

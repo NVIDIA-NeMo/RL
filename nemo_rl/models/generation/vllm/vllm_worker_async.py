@@ -1280,7 +1280,22 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         # the receiver and sends data=None, causing an assertion error.
         if hasattr(self.llm, "reset_mm_cache"):
             await self.llm.reset_mm_cache()
-        await self.llm.sleep(level=1)
+        # See vllm_worker.sleep: level=2 avoids wasted CPU weight backup in the
+        # colocated refit flow. Defaults to 1 to preserve behavior. Fall back to
+        # level=1 when a draft model is present, since its weights don't flow
+        # through the refit IPC stream and level=2 would discard them
+        # (NVIDIA-NeMo/RL#2646).
+        sleep_level = self.cfg["vllm_cfg"].get("sleep_level", 1)
+        if sleep_level == 2 and self.cfg.get("vllm_kwargs", {}).get(
+            "speculative_config"
+        ):
+            warnings.warn(
+                "vLLM sleep_level=2 requested but a speculative/draft model is "
+                "configured; falling back to level=1 (see NVIDIA-NeMo/RL#2646).",
+                stacklevel=1,
+            )
+            sleep_level = 1
+        await self.llm.sleep(level=sleep_level)
 
         gc.collect()
         torch.cuda.empty_cache()

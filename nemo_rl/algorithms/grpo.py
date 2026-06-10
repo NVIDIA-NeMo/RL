@@ -717,22 +717,28 @@ def setup(
             assert loss_config.use_importance_sampling_correction, (
                 "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
             )
-        if generation_config["vllm_cfg"]["kv_cache_dtype"].startswith("fp8"):
+        kv_cache_dtype = generation_config["vllm_cfg"]["kv_cache_dtype"]
+        if kv_cache_dtype.startswith("fp8"):
             # FP8 KV cache requires FP8 model precision
             assert generation_config["vllm_cfg"]["precision"] == "fp8", (
-                f"kv_cache_dtype='{generation_config['vllm_cfg']['kv_cache_dtype']}' requires precision='fp8'. "
+                f"kv_cache_dtype='{kv_cache_dtype}' requires precision='fp8'. "
                 "FP8 KV cache can only be used together with FP8 model weights."
             )
-            # FP8 KV cache compatibility checks
-            assert policy_config["dtensor_cfg"]["enabled"] == False, (
-                "DTensor backend is not supported with kv cache fp8 enabled."
-            )
-            assert not _should_use_async_rollouts(master_config), (
-                "Async rollouts is not supported with kv cache fp8 enabled."
-            )
-            assert policy_config["megatron_cfg"]["pipeline_model_parallel_size"] == 1, (
-                "Currently when using FP8 KV cache in generation, then in megatron we only support pipeline_model_parallel_size=1. We will add more support in future."
-            )
+            # The remaining FP8 KV cache compatibility checks below are about
+            # KV-scale refit (DTensor backend, async rollouts, megatron PP).
+            # fp8_ds_mla (DeepSeek V4 MLA) packs scales inline in the cache
+            # tensor; there are no Parameter-style KV scales to refit, so
+            # these incompatibilities don't apply.
+            if kv_cache_dtype != "fp8_ds_mla":
+                assert policy_config["dtensor_cfg"]["enabled"] == False, (
+                    "DTensor backend is not supported with kv cache fp8 enabled."
+                )
+                assert not _should_use_async_rollouts(master_config), (
+                    "Async rollouts is not supported with kv cache fp8 enabled."
+                )
+                assert policy_config["megatron_cfg"]["pipeline_model_parallel_size"] == 1, (
+                    "Currently when using FP8 KV cache in generation, then in megatron we only support pipeline_model_parallel_size=1. We will add more support in future."
+                )
 
         ## make vllm hf overrides match the training policy
         generation_config["vllm_kwargs"]["hf_overrides"] = policy_config.get(
@@ -1848,6 +1854,9 @@ def grpo_train(
                 repeated_batch = scale_rewards(
                     repeated_batch, master_config.grpo["reward_scaling"]
                 )
+                # Dynamic sampling should not treat DAPO overlong penalties as task reward variance.
+                dynamic_sampling_rewards = repeated_batch["total_reward"].clone()
+
                 # Process rewards with custom reward function
                 if master_config.grpo["reward_shaping"]["enabled"]:
                     repeated_batch = apply_reward_shaping(
@@ -1860,6 +1869,11 @@ def grpo_train(
                 with timer.time("reward_calculation"):
                     # Extract rewards from final_batch
                     rewards = repeated_batch["total_reward"]
+                    filtering_rewards = (
+                        dynamic_sampling_rewards
+                        if master_config.grpo["use_dynamic_sampling"]
+                        else rewards
+                    )
 
                     print("▶ Computing advantages...", flush=True)
                     # For DAPO with reward shaping, compute std on the raw
@@ -1879,8 +1893,8 @@ def grpo_train(
                         device_id = 0
                         baseline, std = calculate_baseline_and_std_per_prompt(
                             input_ids.cuda(device_id),
-                            rewards.cuda(device_id),
-                            torch.ones_like(rewards).cuda(device_id),
+                            filtering_rewards.cuda(device_id),
+                            torch.ones_like(filtering_rewards).cuda(device_id),
                             leave_one_out_baseline=master_config.grpo[
                                 "use_leave_one_out_baseline"
                             ],
@@ -1895,8 +1909,8 @@ def grpo_train(
                     else:
                         baseline, std = calculate_baseline_and_std_per_prompt(
                             input_ids,
-                            rewards,
-                            torch.ones_like(rewards),
+                            filtering_rewards,
+                            torch.ones_like(filtering_rewards),
                             leave_one_out_baseline=master_config.grpo[
                                 "use_leave_one_out_baseline"
                             ],

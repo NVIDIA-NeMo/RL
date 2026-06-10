@@ -531,6 +531,9 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.pipeline_model_parallel_size = config["megatron_cfg"][
         "pipeline_model_parallel_size"
     ]
+    layout = config["megatron_cfg"].get("pipeline_model_parallel_layout")
+    if layout is not None:
+        model_cfg.pipeline_model_parallel_layout = layout
     model_cfg.num_layers_in_first_pipeline_stage = config["megatron_cfg"][
         "num_layers_in_first_pipeline_stage"
     ]
@@ -630,8 +633,21 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
 
     model_cfg.moe_permute_fusion = config["megatron_cfg"]["moe_permute_fusion"]
 
+    # Optional override for moe_grouped_gemm. The DSv4 bridge defaults this
+    # to True; at large EP/node counts the grouped-gemm path can deadlock
+    # in some kernel configurations, so the YAML may override to False.
     if "moe_grouped_gemm" in config["megatron_cfg"]:
         model_cfg.moe_grouped_gemm = config["megatron_cfg"]["moe_grouped_gemm"]
+
+    # Optional override for the flex token dispatcher backend. The DSv4 bridge
+    # defaults this to "deepep", whose arch check only admits Hopper/Ampere and
+    # discrete "NVIDIA B200"/"B300" — it rejects GB200 (reported as "NVIDIA
+    # GB200"). On GB200/GB300 NVL72 use "hybridep" instead (the validator admits
+    # compute capability major in {8,9,10}).
+    if "moe_flex_dispatcher_backend" in config["megatron_cfg"]:
+        model_cfg.moe_flex_dispatcher_backend = config["megatron_cfg"][
+            "moe_flex_dispatcher_backend"
+        ]
 
 
 def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:

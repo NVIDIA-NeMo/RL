@@ -44,6 +44,32 @@ def _get_transformer_engine_file(relative_path: str) -> str:
     return file_path
 
 
+def apply_torch_config_pickle_patch():
+    """Make torch config modules (e.g. ``torch._dynamo.config``) picklable by reference.
+
+    torch>=2.11 installs its config modules as ``ConfigModuleInstance`` objects that
+    cloudpickle cannot serialize. NeMo-RL wraps every policy worker in a locally
+    defined class (``RayWorkerBuilder._modify_class``), which forces Ray to serialize
+    the actor class *by value*; under torch 2.11 that recurses into a captured
+    ``ConfigModuleInstance`` and fails with
+    ``TypeError: cannot pickle 'ConfigModuleInstance' object``. The config module is
+    present identically in every worker process, so pickling it by reference
+    (re-importing it by name) is both correct and sufficient. torch 2.10 was
+    unaffected, which is why the AutoModel/DTensor path never tripped this.
+    """
+    try:
+        import importlib
+
+        from torch.utils._config_module import ConfigModule
+
+        def _reduce_config_module(self):
+            return (importlib.import_module, (self.__name__,))
+
+        ConfigModule.__reduce__ = _reduce_config_module
+    except Exception as e:
+        print(f"Could not apply torch config-module pickle patch: {e}")
+
+
 def apply_transformer_engine_patch():
     """Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files.
 

@@ -118,31 +118,44 @@ automodel = [
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "flash-attn==2.8.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
-  "transformers>=5.3.0,<5.4.0",
+  # DSV4-Flash debug Automodel (rl/dsv4-rebased-bug-20260528) pins transformers==5.5.0.
+  # automodel is its own resolution group (see [conflicts]) so this need not match mcore's 5.8.x.
+  "transformers==5.5.0",
   "mamba-ssm",
   "causal-conv1d",
   "nv-grouped-gemm",
   "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@v2.14.1",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480 ; platform_machine == 'x86_64'",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
+  # DeepSeek-V4 sparse-attention "tilelang" backend (opt-in via policy.model_cfg backend.attn=tilelang).
+  # The vendored Miles kernels need tilelang; the mHC Sinkhorn path additionally imports DeepSeek
+  # TileKernels (tile_kernels), pinned to the revision Automodel validated against. TileKernels
+  # requires CUDA Toolkit >= 13.1 at runtime — satisfied by the cu13.2 base image (this is why the
+  # branch had to move off cu12.9). tilelang ships a cp38-abi3 aarch64 wheel for GB200.
+  "tilelang>=0.1.9 ; sys_platform == 'linux'",
+  "tile_kernels @ git+https://github.com/deepseek-ai/TileKernels.git@36d9e45d38e204ebb87e6f6e833821eee0482fe5 ; sys_platform == 'linux'",
 ]
 vllm = [
   "cuda-python",
-  "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@67fc64863d43521080bf2005e6528d0fceee9510",
+  # Commit matches vllm 0.21's vendored deep_gemm (cmake/external_projects/deepgemm.cmake @ post-#40860);
+  # required so the top-level package exposes DSV4 kernels (tf32_hc_prenorm_gemm, fp8_fp4_*, etc.)
+  # and vllm's _import_deep_gemm picks it up instead of the cpython-312 vendored _C.so.
+  "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@891d57b4db1071624b5c8fa0d1e51cb317fa709f",
   # deep_ep also needs libibverbs-dev
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480 ; platform_machine == 'x86_64'",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
-  # Default wheels on GitHub are cu130. See v0.20.0 release assets:
-  # https://github.com/vllm-project/vllm/releases/tag/v0.20.0
-  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.20.0/vllm-0.20.0-cp38-abi3-manylinux_2_35_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
-  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.20.0/vllm-0.20.0-cp38-abi3-manylinux_2_35_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-  "vllm==0.20.0 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
+  # vLLM 0.21.0 default (no +cu suffix) wheels link against CUDA 13 (manylinux_2_24).
+  # The +cu129 variant is the CUDA 12.9 build; we use the cu13 default to match torch cu130.
+  # See v0.21.0 release assets: https://github.com/vllm-project/vllm/releases/tag/v0.21.0
+  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.21.0/vllm-0.21.0-cp38-abi3-manylinux_2_24_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
+  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.21.0/vllm-0.21.0-cp38-abi3-manylinux_2_24_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "vllm==0.21.0 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
   "num2words>=0.5.14",
   "flashinfer-python==0.6.8.post1",
   "flashinfer-cubin==0.6.8.post1",
-  "nvidia-cutlass-dsl>=4.4.0.dev1",
+  "nvidia-cutlass-dsl>=4.4.2",
 ]
 sglang = ["sglang==0.5.12.post1", "sglang-kernel==0.4.2.post2", "kernels<0.15"]
 mcore = [
@@ -300,6 +313,9 @@ environments = [
   "python_version == '3.13' and sys_platform == 'linux' and platform_machine == 'aarch64'",
 ]
 preview = true # Enable preview features like extra-build-dependencies
+# sglang's flash-attn-4>=4.0.0b9 is a pre-release; allow pre-releases so `uv lock`
+# resolves it and `uv sync --locked` accepts the resulting lock without a CLI flag.
+prerelease = "allow"
 no-build-isolation-package = [
   "transformer-engine-torch",
   "transformer-engine",
@@ -321,15 +337,16 @@ default-groups = ["dev", "build"]
 #  --link-mode=symlink (fastest option when uv cache and venv on different file-system; caveat: venv is brittle since it depends on the environment/container)
 link-mode = "copy"
 # The TE override is needed to pin the TE version across all extras
-# The opencv-python-headless override is needed because automodel pins it to 4.10.0.84, whereas vllm>=0.11.0 needs >= 4.11.0
-# The timm override is needed because sglang requires timm==1.0.16.
+# The opencv-python-headless override is needed because automodel pins it to 4.10.0.84, whereas vllm 0.21 needs >= 4.13.0
+# The timm override is needed because current automodel pins to 1.0.16. This can be removed once we move ToT automodel
 override-dependencies = [
   "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@release_v2.15",
   "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",
   "nvidia-cudnn-frontend==1.23.0",
   "nvidia-nvshmem-cu13>=3.6.5; sys_platform != 'darwin'",
-  "opencv-python-headless>=4.11.0",
+  # vLLM 0.21 needs opencv-python-headless >= 4.13.0 (automodel pins 4.10.0.84).
+  "opencv-python-headless>=4.13.0",
   "timm<=1.0.22",
   "nvidia-modelopt[torch]>=0.44.0a0",
   "torch==2.11.0",
@@ -340,8 +357,13 @@ override-dependencies = [
   "setuptools>=80.10.2",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480 ; platform_machine == 'x86_64'",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
-  # Override to >=4.4.1 so uv can resolve to a version satisfying both vllm and sglang.
-  "nvidia-cutlass-dsl[cu13]>=4.4.1",
+  # The DSV4 vllm 0.21 wheel pins flashinfer-python/cubin == 0.6.8.post1 directly. uv
+  # overrides REPLACE constraints (not merge), so without an exact pin here the override
+  # loosens the wheel's == constraint and uv may resolve to a different version.
+  "flashinfer-python==0.6.8.post1",
+  "flashinfer-cubin==0.6.8.post1",
+  # Match vLLM 0.21's exact CUTLASS DSL requirement (cu13) while satisfying sglang's lower bound.
+  "nvidia-cutlass-dsl[cu13]==4.4.2",
   # Relax megatron-core workspace member's opentelemetry-api ceiling (<1.34) for protobuf 6.x compat with ray
   "opentelemetry-api>=1.33.1",
   # Override sglang's xgrammar==0.1.32 to address CVE GHSA-7rgv-gqhr-fxg3
@@ -446,6 +468,13 @@ requires-dist = ["torch", "packaging", "ninja"]
 name = "fast-hadamard-transform"
 version = "1.1.0"
 requires-dist = ["torch", "packaging", "ninja"]
+
+[[tool.uv.dependency-metadata]]
+name = "tile_kernels"
+# DeepSeek TileKernels (git source, pure-python TileLang kernels — no CUDA build step).
+# Static metadata so the resolver doesn't build the package (setuptools-scm) to read deps.
+version = "0.0.0"
+requires-dist = ["torch>=2.10", "tilelang>=0.1.9"]
 
 [[tool.uv.dependency-metadata]]
 name = "mamba-ssm"

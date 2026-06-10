@@ -105,14 +105,22 @@ class VllmInternalWorkerExtension:
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
 
     def _maybe_process_fp8_kv_cache(self) -> None:
-        """Process weights after loading for FP8 KV cache (static scales)."""
+        """Process weights after loading for FP8 KV cache (static scales).
+
+        Skipped for fp8_ds_mla (DSV4 MLA): scales are packed inline in the
+        cache tensor and there are no Parameter-style k_scale/v_scale to
+        re-apply via process_weights_after_loading.
+        """
         use_fp8_kv_cache = False
         if hasattr(self.model_runner.vllm_config, "cache_config"):
             kv_cache_dtype = getattr(
                 self.model_runner.vllm_config.cache_config, "cache_dtype", None
             )
+            kv_cache_dtype_str = (
+                str(kv_cache_dtype).lower() if kv_cache_dtype is not None else ""
+            )
             use_fp8_kv_cache = (
-                kv_cache_dtype is not None and "fp8" in str(kv_cache_dtype).lower()
+                "fp8" in kv_cache_dtype_str and kv_cache_dtype_str != "fp8_ds_mla"
             )
 
         if not use_fp8_kv_cache:
@@ -257,6 +265,13 @@ class VllmInternalWorkerExtension:
                         process_weights_after_loading,
                     )
 
+                    from nemo_rl.models.generation.vllm.quantization import fp8
+
+                    # DSV4/Blackwell: install the shape-aware FP8 post-process
+                    # monkeypatches before process_weights_after_loading re-applies
+                    # the E8M0 transform on the freshly streamed block scales.
+                    if fp8.is_fp8_model(self.model_runner.vllm_config):
+                        fp8.ensure_fp8_patches_applied(self.model_runner)
                     with set_current_vllm_config(self.model_runner.vllm_config):
                         process_weights_after_loading(
                             self.model_runner.model, self.model_config, self.device

@@ -70,6 +70,7 @@ from nemo_rl.models.policy.interfaces import (
 from nemo_rl.models.policy.utils import (
     get_handle_from_tensor,
     get_runtime_env_for_policy_worker,
+    safe_empty_cache,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.patches import (
@@ -78,6 +79,17 @@ from nemo_rl.models.policy.workers.patches import (
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+
+
+def _resolve_refit_transfer_dtype(
+    src_dtype: torch.dtype, base_dtype: torch.dtype
+) -> torch.dtype:
+    """Pick the dtype used to transfer a tensor during refit."""
+    if not src_dtype.is_floating_point:
+        return src_dtype
+    if src_dtype == torch.float32:
+        return torch.float32
+    return base_dtype
 
 
 def dtensor_params_generator(
@@ -102,10 +114,12 @@ def dtensor_params_generator(
 
         adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(model, name, merged_tensor)
         for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
-            # Convert to target dtype
+            transfer_dtype = _resolve_refit_transfer_dtype(
+                adapted_tensor.dtype, target_dtype
+            )
             yield (
                 adapted_fqn,
-                adapted_tensor.to(target_dtype, non_blocking=True).contiguous(),
+                adapted_tensor.to(transfer_dtype, non_blocking=True).contiguous(),
             )
             del adapted_tensor
         del adapted_fqn_tensors
@@ -422,7 +436,7 @@ class DTensorPolicyWorkerV2Impl(
 
         def on_microbatch_start(mb_idx):
             if empty_cache_steps and mb_idx % empty_cache_steps == 0:
-                torch.cuda.empty_cache()
+                safe_empty_cache(f"{self} on_microbatch_start")
 
         with ctx:
             # Get data from batch and move to device
@@ -523,7 +537,7 @@ class DTensorPolicyWorkerV2Impl(
                 self.scheduler.step()
             # dynamic batch and sequence dims causes alot of fragmentation, so clear
             # the memory allocator before moving on
-            torch.cuda.empty_cache()
+            safe_empty_cache(f"{self} train end")
 
             # Aggregate training statistics across microbatches and ranks
             metrics = aggregate_training_statistics(
@@ -1068,7 +1082,10 @@ class DTensorPolicyWorkerV2Impl(
                 self.model, name, full_tensor
             )
             for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
-                state_dict_info[adapted_fqn] = (adapted_tensor.shape, self.dtype)
+                transfer_dtype = _resolve_refit_transfer_dtype(
+                    adapted_tensor.dtype, self.dtype
+                )
+                state_dict_info[adapted_fqn] = (adapted_tensor.shape, transfer_dtype)
 
         return state_dict_info
 
@@ -1141,17 +1158,16 @@ class DTensorPolicyWorkerV2Impl(
                 self.model.state_dict().items(), key=lambda x: x[0]
             )
             for name, tensor in state_dict_items:
-                if isinstance(tensor, DTensor):
-                    # Convert DTensor to full tensor for streaming
-                    full_tensor = tensor.full_tensor()
-                    # Convert to target dtype
-                    yield (
-                        name,
-                        full_tensor.to(self.dtype, non_blocking=True).contiguous(),
-                    )
-                else:
-                    # Convert to target dtype
-                    yield name, tensor.to(self.dtype, non_blocking=True).contiguous()
+                full_tensor = (
+                    tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
+                )
+                transfer_dtype = _resolve_refit_transfer_dtype(
+                    full_tensor.dtype, self.dtype
+                )
+                yield (
+                    name,
+                    full_tensor.to(transfer_dtype, non_blocking=True).contiguous(),
+                )
 
         # Use the HTTP implementation
         stream_weights_via_http_impl(
@@ -1211,7 +1227,7 @@ class DTensorPolicyWorkerV2Impl(
             self.move_optimizer_to_device("cpu")
 
         gc.collect()
-        torch.cuda.empty_cache()
+        safe_empty_cache(f"{self} prepare_for_lp_inference")
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/prepare_for_training")
     def prepare_for_training(self, *args, **kwargs) -> None:
@@ -1230,7 +1246,7 @@ class DTensorPolicyWorkerV2Impl(
         if self.optimizer is not None and not self.cpu_offload:
             self.move_optimizer_to_device("cuda")
 
-        torch.cuda.empty_cache()
+        safe_empty_cache(f"{self} prepare_for_training")
 
     @torch.no_grad()
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/offload_before_refit")
@@ -1241,7 +1257,7 @@ class DTensorPolicyWorkerV2Impl(
             self.move_optimizer_to_device("cpu")
 
         gc.collect()
-        torch.cuda.empty_cache()
+        safe_empty_cache(f"{self} offload_before_refit")
 
     @torch.no_grad()
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/offload_after_refit")
@@ -1265,6 +1281,45 @@ class DTensorPolicyWorkerV2Impl(
                 if isinstance(v, (DTensor, torch.Tensor)):
                     state[k] = v.to(device)
 
+    def _optimizer_state_has_cuda_tensors(self) -> bool:
+        if self.optimizer is None:
+            return False
+        return any(
+            v.device.type == "cuda"
+            for state in self.optimizer.state.values()
+            for v in state.values()
+            if isinstance(v, (DTensor, torch.Tensor))
+        )
+
+    def _optimizer_state_has_cpu_tensors(self) -> bool:
+        if self.optimizer is None:
+            return False
+        return any(
+            v.device.type == "cpu"
+            for state in self.optimizer.state.values()
+            for v in state.values()
+            if isinstance(v, (DTensor, torch.Tensor))
+        )
+
+    @contextmanager
+    def _offload_optimizer_state_for_checkpoint(
+        self, optimizer_path: Optional[str]
+    ) -> Generator[None, None, None]:
+        should_offload = (
+            optimizer_path is not None and self._optimizer_state_has_cuda_tensors()
+        )
+        if should_offload:
+            self.move_optimizer_to_device("cpu")
+            gc.collect()
+            safe_empty_cache(f"{self} checkpoint optimizer offload")
+
+        try:
+            yield
+        finally:
+            if should_offload and not self.cpu_offload:
+                self.move_optimizer_to_device("cuda")
+                safe_empty_cache(f"{self} checkpoint optimizer onload")
+
     def move_to_device(self, model: nn.Module, device: str | torch.device) -> nn.Module:
         model = self.move_buffer_to_device(model, device)
         return model.to(device)
@@ -1281,13 +1336,13 @@ class DTensorPolicyWorkerV2Impl(
     def move_to_cuda(self, model: torch.nn.Module) -> torch.nn.Module:
         model = self.move_to_device(model, "cuda")
         gc.collect()
-        torch.cuda.empty_cache()
+        safe_empty_cache(f"{self} move_to_cuda")
         return model
 
     def move_to_cpu(self, model: torch.nn.Module) -> torch.nn.Module:
         model = self.move_to_device(model, "cpu")
         gc.collect()
-        torch.cuda.empty_cache()
+        safe_empty_cache(f"{self} move_to_cpu")
         return model
 
     def save_checkpoint(
@@ -1301,18 +1356,19 @@ class DTensorPolicyWorkerV2Impl(
 
         the optimizer states are saved only if `optimizer` and `optimizer_path` are provided.
         """
-        self.checkpoint_manager.save_checkpoint(
-            model=self.model,
-            weights_path=weights_path,
-            optimizer=self.optimizer,
-            optimizer_path=optimizer_path,
-            scheduler=self.scheduler,
-            tokenizer=self.tokenizer if tokenizer_path else None,
-            tokenizer_path=tokenizer_path,
-            checkpointing_cfg=checkpointing_cfg,
-            lora_enabled=self.lora_enabled,
-            peft_config=self.peft_config,
-        )
+        with self._offload_optimizer_state_for_checkpoint(optimizer_path):
+            self.checkpoint_manager.save_checkpoint(
+                model=self.model,
+                weights_path=weights_path,
+                optimizer=self.optimizer,
+                optimizer_path=optimizer_path,
+                scheduler=self.scheduler,
+                tokenizer=self.tokenizer if tokenizer_path else None,
+                tokenizer_path=tokenizer_path,
+                checkpointing_cfg=checkpointing_cfg,
+                lora_enabled=self.lora_enabled,
+                peft_config=self.peft_config,
+            )
 
     def load_checkpoint(
         self,

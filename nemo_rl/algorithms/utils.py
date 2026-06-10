@@ -17,6 +17,7 @@ import random
 import re
 import warnings
 from functools import partial, wraps
+from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
@@ -24,10 +25,15 @@ import torch
 from transformers import (
     AutoProcessor,
     AutoTokenizer,
+    PreTrainedTokenizerFast,
     PreTrainedTokenizerBase,
 )
 
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
+from nemo_rl.data.deepseek_v4_tokenizer import (
+    get_deepseek_v4_tokenizer,
+    should_use_deepseek_v4_chat_template,
+)
 from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.utils.logger import Logger
 
@@ -329,14 +335,30 @@ def get_tokenizer(
         )
         tokenizer = processor.tokenizer
     else:
-        tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_config["name"], trust_remote_code=True
-        )
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_config["name"], trust_remote_code=True
+            )
+        except (AttributeError, KeyError, ValueError):
+            tokenizer_path = Path(tokenizer_config["name"])
+            if not (tokenizer_path / "tokenizer.json").is_file():
+                raise
+            tokenizer = PreTrainedTokenizerFast.from_pretrained(
+                tokenizer_config["name"], trust_remote_code=True
+            )
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    if "chat_template" in tokenizer_config:
+    use_deepseek_v4_chat_template = should_use_deepseek_v4_chat_template(
+        tokenizer_config
+    )
+    if use_deepseek_v4_chat_template:
+        print("Using DeepSeek V4 chat template")
+        tokenizer = get_deepseek_v4_tokenizer(tokenizer)
+        if processor is not None:
+            processor.tokenizer = tokenizer
+    elif "chat_template" in tokenizer_config:
         if tokenizer_config["chat_template"] is None:
             print("Using passthrough chat template")
             tokenizer.chat_template = COMMON_CHAT_TEMPLATES.passthrough_prompt_response

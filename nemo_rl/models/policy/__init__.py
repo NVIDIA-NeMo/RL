@@ -237,6 +237,7 @@ class MegatronConfig(TypedDict):
     recompute_modules: NotRequired[list[str] | None]
     tensor_model_parallel_size: int
     pipeline_model_parallel_size: int
+    pipeline_model_parallel_layout: NotRequired[str | list | None]
     num_layers_in_first_pipeline_stage: int | None
     num_layers_in_last_pipeline_stage: int | None
     context_parallel_size: int
@@ -324,6 +325,7 @@ class DraftConfig(TypedDict):
 
 class TokenizerConfig(TypedDict):
     name: str
+    # Use "deepseek_v4" to apply the built-in DeepSeek V4 Python chat encoder.
     chat_template: NotRequired[str]
     # Arguments to pass to tokenizer.apply_chat_template(...). This can be used to pass kwargs like enable_thinking=true
     chat_template_kwargs: NotRequired[dict[str, Any] | None]

@@ -6,7 +6,7 @@
 [submodule "3rdparty/Automodel-workspace/Automodel"]
 	path = 3rdparty/Automodel-workspace/Automodel
 	url = https://github.com/NVIDIA-NeMo/Automodel.git
-	branch = main
+	branch = rl/dsv4-rebased-bug-20260528
 	shallow = true
 [submodule "3rdparty/Gym-workspace/Gym"]
 	path = 3rdparty/Gym-workspace/Gym
