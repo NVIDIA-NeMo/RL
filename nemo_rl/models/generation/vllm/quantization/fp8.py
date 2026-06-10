@@ -274,7 +274,12 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
 
     if vllm_cfg.get("use_deep_gemm", False):
         os.environ["VLLM_USE_DEEP_GEMM"] = "1"
-        os.environ["VLLM_USE_DEEP_GEMM_E8M0"] = "0"
+        # Do NOT force VLLM_USE_DEEP_GEMM_E8M0=0 here. DSV4 checkpoints declare
+        # scale_fmt="ue8m0" and the training-side FP8 fake-quant rounds scales to
+        # the UE8M0 (power-of-2) format. Disabling E8M0 makes the generation
+        # DeepGEMM path use ordinary block scales, so the sampling policy diverges
+        # from the training policy and gen_kl_error inflates (~0.02 vs ~0.005).
+        # Leave E8M0 at vLLM's default so it honors the checkpoint's scale_fmt.
 
     if vllm_cfg["async_engine"]:
         # for async engine, vllm spawns a process for each DP, so we patch
@@ -659,32 +664,54 @@ def _try_load_deepseek_v4_moe_block_scale(
     expert_data = param.data[local_expert_id]
     loaded_weight = loaded_weight.to(device=expert_data.device)
 
+    # DSV4 fp8 MoE scale params are not tagged with a standard quant_method, so
+    # vLLM's native FusedMoE.weight_loader rejects them; we must place the slice
+    # ourselves. Under expert parallelism each rank owns whole experts and the
+    # loaded per-expert scale maps 1:1 onto the slot. Under pure tensor
+    # parallelism the expert intermediate dim is sharded across TP ranks, so the
+    # loaded (unsharded) scale is wider than the slot and we take this rank's
+    # slice, mirroring vLLM's FusedMoE._load_w13/_load_w2.
+    tp_rank = getattr(layer, "tp_rank", 0)
+
     if "w13_weight_scale" in param_name:
         if shard_id not in ("w1", "w3"):
             return None
-        row_offset = 0 if shard_id == "w1" else loaded_weight.shape[0]
         if expert_data.shape[1:] != loaded_weight.shape[1:]:
             raise ValueError(
-                "DSV4 MoE w13 scale refit shape mismatch: "
+                "DSV4 MoE w13 scale refit column mismatch: "
                 f"param={tuple(expert_data.shape)}, loaded={tuple(loaded_weight.shape)}"
             )
-        if expert_data.shape[0] < row_offset + loaded_weight.shape[0]:
-            raise ValueError(
-                "DSV4 MoE w13 scale refit row range mismatch: "
-                f"param={tuple(expert_data.shape)}, loaded={tuple(loaded_weight.shape)}, "
-                f"shard_id={shard_id}"
-            )
-        expert_data.narrow(0, row_offset, loaded_weight.shape[0]).copy_(loaded_weight)
+        # w13 stacks gate (w1) then up (w3) along dim 0; each occupies half.
+        shard_size = expert_data.shape[0] // 2
+        if loaded_weight.shape[0] != shard_size:
+            if shard_size * (tp_rank + 1) > loaded_weight.shape[0]:
+                raise ValueError(
+                    "DSV4 MoE w13 scale refit row range mismatch: "
+                    f"param={tuple(expert_data.shape)} (shard_size={shard_size}), "
+                    f"loaded={tuple(loaded_weight.shape)}, tp_rank={tp_rank}, "
+                    f"shard_id={shard_id}"
+                )
+            loaded_weight = loaded_weight.narrow(0, shard_size * tp_rank, shard_size)
+        dst_offset = 0 if shard_id == "w1" else shard_size
+        expert_data.narrow(0, dst_offset, shard_size).copy_(loaded_weight)
         return True
 
     if "w2_weight_scale" in param_name:
         if shard_id != "w2":
             return None
-        if expert_data.shape != loaded_weight.shape:
-            raise ValueError(
-                "DSV4 MoE w2 scale refit shape mismatch: "
-                f"param={tuple(expert_data.shape)}, loaded={tuple(loaded_weight.shape)}"
-            )
+        # w2 (down_proj) is sharded along the intermediate (input) dim = dim 1.
+        shard_size = expert_data.shape[1]
+        if loaded_weight.shape != expert_data.shape:
+            if (
+                expert_data.shape[0] != loaded_weight.shape[0]
+                or shard_size * (tp_rank + 1) > loaded_weight.shape[1]
+            ):
+                raise ValueError(
+                    "DSV4 MoE w2 scale refit shape mismatch: "
+                    f"param={tuple(expert_data.shape)}, loaded={tuple(loaded_weight.shape)}, "
+                    f"tp_rank={tp_rank}"
+                )
+            loaded_weight = loaded_weight.narrow(1, shard_size * tp_rank, shard_size)
         expert_data.copy_(loaded_weight)
         return True
 

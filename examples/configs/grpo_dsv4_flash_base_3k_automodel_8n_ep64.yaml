@@ -49,8 +49,13 @@ policy:
   hf_config_overrides:
     num_nextn_predict_layers: 0
     freeze_indexer_query_projection: false
-    fp8_ds_mla_fake_quant_kv: false
-    fp8_ds_mla_fake_quant_o_proj: false
+    # Enable training-side FP8 fake-quant on all DSV4 submodules so the training
+    # policy matches the FP8 generation policy (keeps gen_kl_error low).
+    fp8_ds_mla_fake_quant_kv: true
+    fp8_ds_mla_fake_quant_o_proj: true
+    fp8_ds_mla_fake_quant_moe: true
+    fp8_ds_mla_fake_quant_attn_proj: true
+    fp8_ds_mla_fake_quant_indexer: true
     expert_dtype: fp8
   train_global_batch_size: 512
   train_micro_batch_size: 1
@@ -127,13 +132,17 @@ policy:
       precision: fp8
       kv_cache_dtype: fp8_ds_mla
       # vLLM internal data-parallel = expert_parallel_size / tensor_parallel_size.
-      # EP=32/TP=8 -> internal DP=4, which may deadlock generation
-      # under DP load imbalance (vLLM V1 DP dummy-batch lockstep hangs on a gloo
-      # collective; see vllm-project/vllm#41530). EP=8/TP=8 -> DP=1 removes the
-      # lockstep and avoids the hang (tradeoff: 32 experts/rank, more memory).
+      # EP=1/TP=8 -> internal DP=1, which removes the vLLM V1 DP dummy-batch
+      # lockstep that can deadlock generation under DP load imbalance (hangs on a
+      # gloo collective; see vllm-project/vllm#41530). All experts live on the
+      # full TP group (no expert sharding across ranks).
       tensor_parallel_size: 8
-      expert_parallel_size: 8
+      expert_parallel_size: 1
       enable_expert_parallel: true
+      # Round FP8 weight scales to powers of 2 (UE8M0) so the generation policy
+      # matches the DSV4 checkpoint's scale_fmt="ue8m0" and the training-side
+      # fake-quant; keeps gen_kl_error low.
+      pow2_weight_scaling_factors: true
       gpu_memory_utilization: 0.6
       enforce_eager: true
       max_model_len: ${policy.max_total_sequence_length}
