@@ -16,6 +16,8 @@ MEGATRON_FP8_KV_HOOK=${MEGATRON_FP8_KV_HOOK:-true}
 KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-fp8_per_token_head}
 DRIVER_SRUN_ARGS=${DRIVER_SRUN_ARGS:---mem=64G}
 INTERACTIVE=${INTERACTIVE:-0}
+CHECKPOINTING_ENABLED=${CHECKPOINTING_ENABLED:-true}
+CHECKPOINTING_SAVE_PERIOD=${CHECKPOINTING_SAVE_PERIOD:-50}
 
 case "${MEGATRON_FP8_KV_HOOK}" in
     1|true|TRUE|True|yes|YES|Yes|on|ON|On)
@@ -52,6 +54,7 @@ fi
 
 JOB_NAME=${JOB_NAME:-grpo-llama3-1-8b-${EXPERIMENT_VARIANT}}
 WANDB_NAME=${WANDB_NAME:-${JOB_NAME}-importance-sampling}
+CHECKPOINT_DIR=${CHECKPOINT_DIR:-results/${JOB_NAME}}
 
 TRAIN_CMD="\
 uv run examples/run_grpo.py \
@@ -80,7 +83,9 @@ policy.generation.vllm_cfg.async_engine=false \
 policy.generation.vllm_cfg.kv_cache_dtype=${KV_CACHE_DTYPE} \
 data.max_input_seq_length=${MAX_TOTAL_SEQUENCE_LENGTH} \
 loss_fn.use_importance_sampling_correction=true \
-checkpointing.enabled=false \
+checkpointing.enabled=${CHECKPOINTING_ENABLED} \
+checkpointing.save_period=${CHECKPOINTING_SAVE_PERIOD} \
+checkpointing.checkpoint_dir=${CHECKPOINT_DIR} \
 logger.wandb_enabled=true \
 logger.wandb.project=${WANDB_PROJECT} \
 logger.wandb.name=${WANDB_NAME} \
@@ -98,6 +103,9 @@ echo "KV_CACHE_DTYPE: ${KV_CACHE_DTYPE}"
 echo "DRIVER_SRUN_ARGS: ${DRIVER_SRUN_ARGS}"
 echo "JOB_NAME: ${JOB_NAME}"
 echo "WANDB_NAME: ${WANDB_NAME}"
+echo "CHECKPOINTING_ENABLED: ${CHECKPOINTING_ENABLED}"
+echo "CHECKPOINTING_SAVE_PERIOD: ${CHECKPOINTING_SAVE_PERIOD}"
+echo "CHECKPOINT_DIR: ${CHECKPOINT_DIR}"
 
 if [ "${INTERACTIVE}" -eq 1 ]; then
     eval "${TRAIN_CMD}"
