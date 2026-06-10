@@ -69,6 +69,51 @@ def test_vllm_utils_vlm_with_images_and_text():
     assert prompts[1]["multi_modal_data"]["image"] == ["img2a", "img2b"]
 
 
+def test_vllm_utils_vlm_with_audio_and_video_intent_path():
+    """IntentTrain/IntentBench rollouts must surface both modalities to vLLM.
+
+    Asserts ``multi_modal_data`` contains a ``video`` key built from
+    ``vllm_videos`` AND an ``audio`` key built from ``vllm_audios`` for the
+    same prompt. This is the regression bar for AC-3 of the audio+video
+    intent recipe; if either key is dropped at this site, vLLM rolls out a
+    text-only / single-modality prompt and the smoke run silently degrades.
+    """
+    input_ids, input_lengths = _mk_inputs()
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "vllm_content": ["<s>user: q1</s>", "<s>user: q2</s>"],
+            "vllm_videos": [["frames-1"], ["frames-2"]],
+            "vllm_audios": [[("audio-1", 16000)], [("audio-2", 16000)]],
+            "task_name": ["intent-train", "intent-bench"],
+        }
+    )
+
+    prompts = format_prompt_for_vllm_generation(data)
+    assert len(prompts) == 2
+    for i, prompt in enumerate(prompts):
+        assert "multi_modal_data" in prompt, (
+            f"prompt {i} missing multi_modal_data: keys={list(prompt)}"
+        )
+        mm = prompt["multi_modal_data"]
+        assert "video" in mm, (
+            f"prompt {i} dropped vllm_videos -> multi_modal_data['video']: "
+            f"keys={list(mm)}"
+        )
+        assert "audio" in mm, (
+            f"prompt {i} dropped vllm_audios -> multi_modal_data['audio']: "
+            f"keys={list(mm)}"
+        )
+    # The independent-streams path explicitly does not set
+    # mm_processor_kwargs={"use_audio_in_video": True} (Round 1 BitLesson
+    # BL-20260428-omni-use-audio-in-video). If a future change re-introduces
+    # that flag this assertion will need to be updated together with vLLM
+    # acceptance evidence.
+    for prompt in prompts:
+        assert "mm_processor_kwargs" not in prompt
+
+
 def test_vllm_utils_vlm_with_missing_images_fallback_to_tokens():
     input_ids, input_lengths = _mk_inputs()
     # images None triggers fallback

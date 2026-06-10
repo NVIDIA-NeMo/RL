@@ -2,10 +2,13 @@
 #
 # Trains Qwen/Qwen2.5-Omni-3B with GRPO on PhilipC/IntentTrain (intent
 # recognition over short MER24 / social_iq video clips with audio) and runs
-# in-training validation on PhilipC/IntentBench. Per the IntentTrain plan:
-#   * Audio+video coexist on every prompt; the HF processor is invoked with
-#     use_audio_in_video=True and vLLM rollouts pass the same flag through
-#     mm_processor_kwargs.
+# in-training validation on PhilipC/IntentBench.
+#   * Audio and video reach the model as two independent multimodal items
+#     per prompt: the dataset emits {type: video} + {type: audio}, the chat
+#     template renders <|VIDEO|> and <|AUDIO|> placeholders, and vLLM
+#     rollouts pass them as multi_modal_data["video"] / multi_modal_data["audio"].
+#     use_audio_in_video=True / mm_processor_kwargs are NOT used because the
+#     installed transformers + vLLM Qwen2.5-Omni stack rejected that path.
 #   * Only problem_type == "multiple choice" samples are used; rewards reuse
 #     the audio recipe's format + exact_alnum.
 #

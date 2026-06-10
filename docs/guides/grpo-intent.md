@@ -1,8 +1,8 @@
 # Audio+Video Intent GRPO on IntentTrain / IntentBench
 
-This guide explains how to use NeMo RL to train [Qwen2.5-Omni-3B](https://huggingface.co/Qwen/Qwen2.5-Omni-3B) with GRPO on the [PhilipC/IntentTrain](https://huggingface.co/datasets/PhilipC/IntentTrain) audio-visual intent-recognition dataset and validate on [PhilipC/IntentBench](https://huggingface.co/datasets/PhilipC/IntentBench), following the joint audio+video setup used in the [HumanOmniV2 reference](https://github.com/HumanMLLM/HumanOmniV2).
+This guide explains how to use NeMo RL to train [Qwen2.5-Omni-3B](https://huggingface.co/Qwen/Qwen2.5-Omni-3B) with GRPO on the [PhilipC/IntentTrain](https://huggingface.co/datasets/PhilipC/IntentTrain) audio-visual intent-recognition dataset and validate on [PhilipC/IntentBench](https://huggingface.co/datasets/PhilipC/IntentBench), following the dataset structure used in the [HumanOmniV2 reference](https://github.com/HumanMLLM/HumanOmniV2).
 
-Each training sample feeds the Qwen2.5-Omni processor both the video stream (16 frames) and the audio track decoded from the same file at 16 kHz mono. The recipe sets `use_audio_in_video=True` on the HuggingFace processor and on every vLLM rollout request so audio and video tokens are aligned.
+Each training sample feeds the Qwen2.5-Omni processor both the video stream (16 frames) and the audio track decoded from the same file at 16 kHz mono. Audio and video flow as two **independent multimodal items** per prompt: the dataset emits `{type: video}` + `{type: audio}` content items, the Qwen2.5-Omni chat template renders both `<|VIDEO|>` and `<|AUDIO|>` placeholders, and vLLM rollouts populate `multi_modal_data["video"]` and `multi_modal_data["audio"]` from the same sample. The explicit time-alignment hint `use_audio_in_video=True` is **not** used in v1 because the installed transformers + vLLM Qwen2.5-Omni stack rejected that path during smoke testing (see Round 1 BitLesson `BL-20260428-omni-use-audio-in-video`); both modalities still reach the model, just without that alignment hint.
 
 ## 1. Train the Model
 
@@ -54,6 +54,22 @@ In-training validation uses IntentBench as the validation set, so `val_period`, 
 
 ## 4. Results
 
-This guide ships as a starting point for audio+video GRPO on IntentTrain/IntentBench. The recipe is exercised end to end (load → rollout → reward → checkpoint → validation) but does not commit to a particular IntentBench accuracy target — IntentBench's evaluation methodology and any published numerical comparison are out of scope for this recipe. Use the validation reward and answer-correctness reward signal in the wandb / tensorboard logs to track training progress.
+This guide ships as a starting point for audio+video GRPO on IntentTrain/IntentBench. The recipe does not commit to a particular IntentBench accuracy target — IntentBench's evaluation methodology and any published numerical comparison are out of scope for this recipe. Use the validation reward and answer-correctness reward signal in the wandb / tensorboard logs to track training progress.
+
+The smoke configuration that v1 was developed against:
+
+```
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+uv run examples/run_vlm_grpo.py \
+  --config examples/configs/intent_grpo_3B_megatron.yaml \
+  grpo.max_num_steps=2 grpo.max_val_samples=4 grpo.val_batch_size=4 \
+  grpo.val_at_start=true \
+  grpo.num_prompts_per_step=4 grpo.num_generations_per_prompt=1 \
+  policy.train_global_batch_size=4 policy.train_micro_batch_size=1 \
+  policy.generation_batch_size=4 policy.logprob_batch_size=2 \
+  checkpointing.save_period=1 cluster.gpus_per_node=4
+```
+
+Note: `HF_HUB_OFFLINE=1` is recommended once `Qwen/Qwen2.5-Omni-3B`, `PhilipC/IntentTrain`, and `PhilipC/IntentBench` have been pre-fetched — Megatron's tokenizer worker otherwise hits `AutoTokenizer.from_pretrained(...)` over the network and can fail with read timeouts on flaky links.
 
 If `loss_multiplier` is logged at 0 for many samples, the multimodal prompt is exceeding `policy.max_total_sequence_length` (default 8192 in this recipe) and the truncation branch in `vlm_hf_data_processor` is masking those samples out. Bump `max_total_sequence_length` until validation samples consistently produce non-zero loss.

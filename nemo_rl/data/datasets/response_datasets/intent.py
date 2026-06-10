@@ -18,9 +18,15 @@ Loads the PhilipC/IntentTrain (training) or PhilipC/IntentBench (validation)
 datasets that ship as a JSON manifest plus a ``videos.zip`` archive on
 HuggingFace, filters samples to the configured ``problem_type`` allow-list, and
 emits OpenAI-style messages whose user content carries both a video reference
-and the audio track extracted from that same video. The ``vlm_hf_data_processor``
-consumes both modalities jointly with ``use_audio_in_video=True`` so
-Qwen2.5-Omni aligns audio and video tokens during inference.
+and the audio track extracted from that same video. Audio and video flow as
+two independent ``{type:audio}`` / ``{type:video}`` content items so the
+Qwen2.5-Omni chat template renders both ``<|VIDEO|>`` and ``<|AUDIO|>``
+placeholders into the prompt -- vLLM's multimodal prompt replacement on the
+rollout side requires those placeholders to exist before it accepts matching
+``mm_items``. The ``use_audio_in_video=True`` time-alignment hint is NOT
+threaded through here because the installed transformers + vLLM stack
+rejected that path during Round 1 testing (see BitLesson
+BL-20260428-omni-use-audio-in-video).
 """
 
 import json
@@ -157,9 +163,13 @@ def _read_manifest(snapshot_dir: str, manifest_filename: str) -> list[dict[str, 
 class IntentDataset(RawDataset):
     """HumanOmniV2 IntentTrain / IntentBench loader for VLM GRPO.
 
-    Each sample emits a video file path plus a text prompt; the audio track is
-    folded in at processor time via ``use_audio_in_video=True`` so the
-    Qwen2.5-Omni processor decodes both modalities jointly. Samples whose
+    Each sample emits both a video file path and a 16 kHz mono audio array
+    decoded from that same file as two independent content items
+    (``{type:video}`` and ``{type:audio}``) plus a text prompt. The
+    Qwen2.5-Omni processor and vLLM rollout both treat the two streams as
+    independent multimodal sources; the explicit time-alignment via
+    ``use_audio_in_video=True`` is intentionally not used in v1 because the
+    installed transformers + vLLM stack rejected that path. Samples whose
     ``problem_type`` is not in ``allowed_problem_types`` are dropped before
     iteration.
 
