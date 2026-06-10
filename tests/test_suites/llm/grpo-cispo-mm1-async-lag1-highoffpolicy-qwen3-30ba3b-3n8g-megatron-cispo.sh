@@ -4,7 +4,7 @@ source $SCRIPT_DIR/common.env
 
 # MiniMax-M1 async lag-1 high-off-policy study, CISPO arm.
 # Uses 2 nodes for Megatron policy training plus 1 non-colocated vLLM node.
-# See examples/configs/recipes/llm/cispo-mm1-async-lag1-highoffpolicy-qwen3-30ba3b-3n8g-megatron-cispo.yaml.
+# See examples/configs/recipes/llm/grpo-cispo-mm1-async-lag1-highoffpolicy-qwen3-30ba3b-3n8g-megatron-cispo.yaml.
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=3
