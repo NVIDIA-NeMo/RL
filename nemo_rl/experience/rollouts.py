@@ -28,7 +28,7 @@ from typing import Any, Optional
 import ray
 import torch
 from transformers import PreTrainedTokenizerBase
-from wandb import Histogram, Table
+from wandb import Histogram
 
 from nemo_rl.data.interfaces import (
     DatumSpec,
@@ -1255,11 +1255,15 @@ def run_async_nemo_gym_rollout(
                         )
                     )
 
-            # Log the full result
-            to_log = [[json.dumps(r, separators=((",", ":")))] for r in agent_results]
-            per_agent_metrics[f"{agent_name}/full_result"] = Table(
-                data=to_log, columns=["Full result"]
-            )
+            # NOTE: previously logged the full per-rollout trajectory JSON as a
+            # wandb Table ({agent}/full_result). For SWE2 that is ~700MB/step
+            # (131k-token multi-turn trajectories x 64) — it 500-errors on upload
+            # and STARVES the metric-history commit (the dashboard shows "no data
+            # for the selected runs"; only the summary lands). should_log_nemo_gym_
+            # responses does NOT gate this async path (grpo.py only pops full_result
+            # in the non-async branch), so it logged unconditionally. Dropped to keep
+            # the history committing. Re-add gated on should_log_nemo_gym_responses
+            # AND sampled (a handful of rows) if you need trajectory inspection.
 
         rollout_metrics.update(per_agent_metrics)
 

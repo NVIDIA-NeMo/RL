@@ -2338,6 +2338,11 @@ def grpo_train(
                     name="train/token_mult_prob_error_plot_sample",
                 )
             del train_data
+            # Per-worker generation-metric timelines -> generation_metrics/* wandb tab.
+            # Logged as figures (media), which do NOT block the history commit: the
+            # dc3m70us baseline logs these and still commits its scalar history. The
+            # earlier "no data" was the missing step_finished commit gate on the async
+            # path (restored there), not these figures.
             if (
                 master_config.policy["generation"]
                 .get("vllm_cfg", {})
@@ -3497,6 +3502,14 @@ def async_grpo_train(
             metrics["buffer_size"] = buffer_size_current
             metrics["avg_trajectory_age"] = avg_trajectory_age
 
+            # Per-worker generation-metric timelines -> generation_metrics/* wandb tab.
+            # Logged as figures (media), which do NOT block the history commit: the
+            # dc3m70us baseline logs these on this SAME async path and still commits 15
+            # history rows (the figures show as None in scan_history because they're media,
+            # but the scalar history commits fine). The earlier "no data" / scan_history=0
+            # was the missing step_finished commit gate on the final per-step log below
+            # (this async path had regressed to omit it, unlike the sync path) -- NOT these
+            # figures. Keep both: figures for the tab, step_finished for the commit.
             if (
                 master_config.policy["generation"]
                 .get("vllm_cfg", {})
@@ -3558,7 +3571,14 @@ def async_grpo_train(
 
             logger.log_metrics(performance_metrics, step + 1, prefix="performance")
             logger.log_metrics(metrics, step + 1, prefix="train")
-            logger.log_metrics(timing_metrics, step + 1, prefix="timing/train")
+            # step_finished=True: final per-step log -> commit=True so the metric
+            # HISTORY (not just the summary) commits to wandb. This async/benchmark
+            # path previously omitted it (unlike the sync path at ~2427), so the wandb
+            # step never committed -> scan_history stayed empty and the dashboard
+            # showed "no data for the selected runs" despite the summary populating.
+            logger.log_metrics(
+                timing_metrics, step + 1, prefix="timing/train", step_finished=True
+            )
 
             timer.reset()
             step += 1

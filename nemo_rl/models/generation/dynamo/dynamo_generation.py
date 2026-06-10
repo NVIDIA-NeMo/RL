@@ -77,6 +77,34 @@ def _http_post_json(url: str, payload: dict[str, Any], timeout_s: float) -> dict
 # telemetry. Override via policy.generation.dynamo_cfg.metrics_exclude_prefixes.
 _DEFAULT_METRICS_EXCLUDE_PREFIXES = ("python_", "process_")
 
+# Default collection allow-list, in two tiers. Bounding volume matters: a worker
+# exposes ~120 metric families, and each becomes a per-worker timeline figure that
+# wandb renders to a multi-MB Plotly string — logging all of them chokes ALL metric
+# sync (train/reward/gpu never reach the cloud). Override / widen via
+# policy.generation.dynamo_cfg.metrics_include_prefixes (pass [] to scrape all).
+#
+# Tier 1 — Dynamo *runtime* metrics (dynamo_component_* / dynamo_work_handler_*),
+# emitted identically by ANY Dynamo engine, so backend-agnostic.
+_DYNAMO_RUNTIME_METRIC_PREFIXES = (
+    "dynamo_component_gpu_cache_usage",            # kv-cache utilization
+    "dynamo_component_inflight_requests",          # inflight (running) requests
+    "dynamo_work_handler_queue_depth",             # pending queue depth
+    "dynamo_component_requests_total",             # request throughput (requests)
+    "dynamo_work_handler_time_to_first_response",  # time-to-first-response latency
+)
+# Tier 2 — engine-specific passthroughs for high-value signals the Dynamo runtime
+# does NOT expose: it has no token-level metrics and only coarse latency. vLLM is
+# the only engine wired today; as others are onboarded add their equivalents here
+# (e.g. "sglang:..."), and a non-matching engine just falls back to Tier 1.
+_ENGINE_PASSTHROUGH_METRIC_PREFIXES = (
+    "vllm:generation_tokens",                      # generation throughput (tokens)
+    "vllm:prompt_tokens_total",                    # prompt throughput (tokens)
+    "vllm:inter_token_latency",                    # inter-token (decode) latency
+)
+_CURATED_METRICS_INCLUDE_PREFIXES = (
+    _DYNAMO_RUNTIME_METRIC_PREFIXES + _ENGINE_PASSTHROUGH_METRIC_PREFIXES
+)
+
 # nemo-rl's print_performance_metrics (algorithms/utils.py) hard-asserts the
 # vLLM backend's canonical generation-metric names are present in
 # get_logger_metrics() output (inflight_batch_sizes / num_pending_samples), and
@@ -86,13 +114,23 @@ _DEFAULT_METRICS_EXCLUDE_PREFIXES = ("python_", "process_")
 # trips, (b) panels match the vLLM backend's names for direct comparison, and
 # (c) a missing/renamed source metric degrades to a valid empty dict rather than
 # crashing the training loop. Additive: the generic bulk collection is unchanged.
+# Sources are tried in order. The dynamo_component_* / dynamo_work_handler_* names
+# are backend-agnostic (Dynamo's runtime emits them identically for any engine);
+# the engine-specific vllm_* names are kept as a fallback for the colocated-vLLM
+# backend (only collected if metrics_include_prefixes is widened to include them).
 _CANONICAL_LOGGER_ALIASES: "dict[str, list[str]]" = {
-    "inflight_batch_sizes": ["vllm_num_requests_running"],
-    "num_pending_samples": ["vllm_num_requests_waiting"],
+    "inflight_batch_sizes": [
+        "dynamo_component_inflight_requests",
+        "vllm_num_requests_running",
+    ],
+    "num_pending_samples": [
+        "dynamo_work_handler_queue_depth",
+        "vllm_num_requests_waiting",
+    ],
     "kv_cache_usage_perc": [
+        "dynamo_component_gpu_cache_usage_percent",
         "vllm_kv_cache_usage_perc",
         "vllm_gpu_cache_usage_perc",
-        "dynamo_component_gpu_cache_usage_percent",
     ],
     "generation_tokens": ["vllm_generation_tokens_total", "vllm_generation_tokens"],
 }
@@ -574,7 +612,12 @@ class DynamoGeneration(GenerationInterface):
         # Schema-agnostic collection: by default include everything and drop only
         # interpreter noise. Both lists are config-overridable (no metric names
         # are baked in, so changes to what Dynamo emits are picked up for free).
-        _inc = dynamo_cfg.get("metrics_include_prefixes")
+        # Default to the backend-agnostic curated allow-list (Dynamo runtime
+        # metrics, see _CURATED_METRICS_INCLUDE_PREFIXES). A non-empty config list
+        # overrides it; an explicit empty list ([]) opts back into scraping all.
+        _inc = dynamo_cfg.get(
+            "metrics_include_prefixes", _CURATED_METRICS_INCLUDE_PREFIXES
+        )
         self._metrics_include_prefixes: Optional[tuple[str, ...]] = (
             tuple(_inc) if _inc else None
         )
@@ -716,14 +759,19 @@ class DynamoGeneration(GenerationInterface):
                 name: {idx: list(samples) for idx, samples in per_worker.items()}
                 for name, per_worker in self._dyn_logger_metrics.items()
             }
-        # Always expose the vLLM-backend canonical keys (print_performance_metrics
+        # Surface the vLLM-backend canonical keys (print_performance_metrics
         # asserts inflight_batch_sizes/num_pending_samples; all four also give
-        # panel parity). Map from the generic scrape; default to {} so a
+        # panel parity), mapping from the generic scrape. Drop the raw source once
+        # aliased so the same per-worker timeline isn't logged twice (canonical +
+        # raw) — that duplication doubled the figure volume. Default to {} so a
         # missing/renamed source can never trip the assert or crash the loop.
         for canon, sources in _CANONICAL_LOGGER_ALIASES.items():
             if canon in out:
                 continue
-            out[canon] = next((dict(out[s]) for s in sources if s in out), {})
+            src = next((s for s in sources if s in out), None)
+            out[canon] = dict(out[src]) if src is not None else {}
+            if src is not None:
+                del out[src]
         return out
 
     def clear_logger_metrics(self) -> None:

@@ -181,9 +181,14 @@ launch:
     TEE_PID=$!
 
     RC=0
+    # Full SWE2 config (recipe defaults: pps8/gpp8, max_turns=200, concurrency=512,
+    # swebench_agent_timeout=1800, seqlen 131072). The MX heartbeat fix lets the
+    # per-step refit survive past v2 (the old crash point) for a multi-step run.
     python -u examples/nemo_gym/run_grpo_nemo_gym.py \
       --config examples/nemo_gym/grpo_swe2_qwen3_30b_dynamo_mx_debug.yaml \
       +policy.generation.dynamo_cfg.dgd_name=${user:}-swe2-q30b-mx \
+      grpo.max_num_steps=5 \
+      logger.wandb.name=grpo-swe2-q30b-mx-24w-genmetrics \
       > "\${PIPE}" 2>&1 || RC=$?
 
     wait "\${TEE_PID}" || true

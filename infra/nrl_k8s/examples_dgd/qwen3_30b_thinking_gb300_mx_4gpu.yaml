@@ -26,6 +26,14 @@ metadata:
   annotations:
     nvidia.com/kai-scheduler-queue: backfill
 spec:
+  # Disable Grove's MNNVL (multi-node NVLink clique) DRA auto-injection. Each
+  # VllmDecodeWorker is TP=2, so its 2 GPUs are always intra-node (a pod runs on
+  # one node) — a cross-node NVLink clique is unnecessary and only constrains
+  # placement. Dropping it lets 2 TP=2 workers pack onto each 4-GPU node, packing
+  # the 24-worker pool tighter. The explicit roce-channel claim (NIXL RDMA refit)
+  # is separate and unaffected.
+  annotations:
+    grove.io/auto-mnnvl: "disabled"
   services:
     Frontend:
       componentType: frontend
@@ -81,16 +89,18 @@ spec:
               value: "1"
     VllmDecodeWorker:
       componentType: worker
-      replicas: 24                     # 24x TP2 workers = 48 gen GPU = 12 GB300 nodes (32 didn't fit current
-                                       # cluster GPU/RoCE-DRA capacity). 48 gen ranks vs trainer dp16 (mocked) -> MX same_rank_only + peer-pull.
+      replicas: 24                     # 24x TP2 workers = 48 gen GPU. count=8 RoCE = 1-per-node = 24 GB300 nodes.
+                                       # 48 gen ranks vs trainer dp16 -> MX same_rank_only + peer-pull.
       envFromSecret: jothomson-secrets
       resources:
         requests:
           gpu: "2"                     # 2 GPUs, TP=2 (TP4 breaks MoE intermediate_size%128)
           memory: "128Gi"
+          ephemeral-storage: "100Gi"   # match the working reference pod; lets the scheduler account for per-worker local disk
         limits:
           gpu: "2"
           memory: "256Gi"
+          ephemeral-storage: "100Gi"
       extraPodSpec:
         # Fix A (temporary): run the worker as root so FlashInfer can create its
         # cubin symlink under the root-owned /usr/local/.../flashinfer_cubin/cubins.
@@ -101,10 +111,31 @@ spec:
           runAsUser: 0
         nodeSelector:
           nvidia.com/gpu.product: NVIDIA-GB300
+        # Exclude the known-bad node (broken aws-cni, ens177 "Link not found" ->
+        # FailedCreatePodSandBox / stuck ContainerCreating). Matches the trainer's
+        # exclusion; prevents a decode worker getting wedged on it across 24 nodes.
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - key: kubernetes.io/hostname
+                      operator: NotIn
+                      values:
+                        - ip-7-248-83-146.us-east-2.compute.internal
         tolerations:
           - operator: Exists
         resourceClaims:
           - name: roce-channel
+            # REVERTED to the known-good count=8 claim. The new roce-mx-qwen3-30b-tp2
+            # (count=4, to fit 2 TP2 workers/node) packs correctly but BREAKS the MX
+            # refit: with only 4 of the node's ~8 RoCE devices, the DRA (not
+            # GPU-affinity-aware) hands a worker NICs that aren't on its node ->
+            # NIXL UCX: "network device rocep161s0:1 is not available" -> NIXL_ERR_BACKEND
+            # -> refit workers_ok=0 -> driver crash at refit version=0. count=8 gives each
+            # worker the full set incl. its GPU-affinity NIC that MX_RDMA_NIC_PIN=auto needs
+            # (so it forces 1-per-node). TODO(packing): make roce-mx-qwen3-30b-tp2 select
+            # the 2 GPU-affinity RoCE NICs for each worker's GPUs, then re-enable.
             resourceClaimTemplateName: roce-mx-qwen3-30b
         volumes:
           - name: rl-workspace

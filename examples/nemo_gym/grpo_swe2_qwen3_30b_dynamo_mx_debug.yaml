@@ -274,7 +274,7 @@ data:
 
 env:
   should_use_nemo_gym: true
-  should_log_nemo_gym_responses: true   # log full trajectories to verify function_call items appear
+  should_log_nemo_gym_responses: false  # DISABLED: full 131k-token SWE trajectories x 64/step = ~1GB/step of wandb Tables, which starve the metric-history commit (dashboard shows "no data for the selected runs"). Re-enable + sample if you need trajectory inspection.
   nemo_gym:
     skip_venv_if_present: true
     port_range_low: 15001
