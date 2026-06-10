@@ -143,6 +143,7 @@ vllm = [
   "flashinfer-python==0.6.8.post1",
   "flashinfer-cubin==0.6.8.post1",
   "nvidia-cutlass-dsl>=4.4.0.dev1",
+  "kernels==0.14.1",
 ]
 sglang = [
   "sglang==0.5.12.post1",
@@ -190,6 +191,7 @@ mcore = [
   "flashinfer-jit-cache==0.6.8.post1",
   "nvshmem4py-cu13>=0.2.1",
   "cupy-cuda13x",
+  "transformer-engine-torch",
 ]
 modelopt = ["nvidia-modelopt"]
 nvrx = [
