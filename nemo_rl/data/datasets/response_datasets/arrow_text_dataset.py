@@ -103,7 +103,6 @@ class ArrowTextDataset(RawDataset):
         # sft_processor, so the same dataset serves both pipelines.
         text = data[self.text_key]
         return {
-            "text": text,
             "messages": [{"role": "assistant", "content": text}],
             "task_name": self.task_name,
         }
@@ -132,7 +131,6 @@ def _pack_generator(
         if n >= characters_per_sample:
             packed = "\n".join(buf)
             yield {
-                "text": packed,
                 "messages": [{"role": "assistant", "content": packed}],
                 "task_name": task_name,
             }
@@ -141,7 +139,6 @@ def _pack_generator(
     if buf:
         packed = "\n".join(buf)
         yield {
-            "text": packed,
             "messages": [{"role": "assistant", "content": packed}],
             "task_name": task_name,
         }

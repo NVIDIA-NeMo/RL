@@ -373,7 +373,9 @@ class TestKdDataProcessor:
 
     def test_output_keys_and_values(self):
         out = kd_data_processor(
-            datum_dict={"text": "the quick brown fox"},
+            datum_dict={
+                "messages": [{"role": "assistant", "content": "the quick brown fox"}]
+            },
             task_data_spec=self._spec(),
             tokenizer=DummyTokenizer(),  # must not be called
             max_seq_length=512,
@@ -382,14 +384,18 @@ class TestKdDataProcessor:
         assert out["message_log"] == [
             {"role": "assistant", "content": "the quick brown fox"}
         ]
-        assert out["length"] == len("the quick brown fox")
+        # length is a fake placeholder for the kd pipeline.
+        assert out["length"] == 0
         assert out["extra_env_info"] is None
         assert out["loss_multiplier"] == 1.0
         assert out["idx"] == 3
 
     def test_task_name_forwarded_when_present(self):
         out = kd_data_processor(
-            datum_dict={"text": "hello", "task_name": "code"},
+            datum_dict={
+                "messages": [{"role": "assistant", "content": "hello"}],
+                "task_name": "code",
+            },
             task_data_spec=self._spec(),
             tokenizer=DummyTokenizer(),
             max_seq_length=128,
@@ -399,7 +405,7 @@ class TestKdDataProcessor:
 
     def test_task_name_absent_when_not_in_datum(self):
         out = kd_data_processor(
-            datum_dict={"text": "hello"},
+            datum_dict={"messages": [{"role": "assistant", "content": "hello"}]},
             task_data_spec=self._spec(),
             tokenizer=DummyTokenizer(),
             max_seq_length=128,
@@ -412,7 +418,7 @@ class TestKdDataProcessor:
         # processor's. If a future change emits any of these keys, the
         # CrossTokenizerCollator's contract is broken.
         out = kd_data_processor(
-            datum_dict={"text": "hello"},
+            datum_dict={"messages": [{"role": "assistant", "content": "hello"}]},
             task_data_spec=self._spec(),
             tokenizer=DummyTokenizer(),
             max_seq_length=128,
@@ -439,7 +445,7 @@ class TestKdDataProcessor:
 
         # Should not raise — the processor must not touch the tokenizer.
         _ = kd_data_processor(
-            datum_dict={"text": "hello"},
+            datum_dict={"messages": [{"role": "assistant", "content": "hello"}]},
             task_data_spec=self._spec(),
             tokenizer=StrictTokenizer(),
             max_seq_length=128,
@@ -453,11 +459,12 @@ class TestKdDataProcessor:
         # max_seq_length.
         long_text = "a" * 10_000
         out = kd_data_processor(
-            datum_dict={"text": long_text},
+            datum_dict={"messages": [{"role": "assistant", "content": long_text}]},
             task_data_spec=self._spec(),
             tokenizer=DummyTokenizer(),
             max_seq_length=128,
             idx=0,
         )
         assert out["message_log"][0]["content"] == long_text
-        assert out["length"] == 10_000
+        # length is a fake placeholder for the kd pipeline.
+        assert out["length"] == 0
