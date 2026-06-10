@@ -721,13 +721,15 @@ def kd_data_processor(
     Tokenization is deferred to the collator, so the text is carried forward
     as a single assistant message in ``message_log``.
     """
-    text = datum_dict["text"]
     output: DatumSpec = {
-        "message_log": [{"role": "assistant", "content": text}],
-        "length": len(text),
-        "extra_env_info": None,
+        # Defensive shallow-per-message copy so downstream mutation (e.g.
+        # adding token_ids) doesn't leak back into the dataset row.
+        "message_log": [dict(m) for m in datum_dict["messages"]],
         "loss_multiplier": 1.0,
         "idx": idx,
+        # fake keys (not used for cross-tokenizer distillation)
+        "length": 0,
+        "extra_env_info": None,
     }
     if "task_name" in datum_dict:
         output["task_name"] = datum_dict["task_name"]
