@@ -1253,9 +1253,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 )
                 loss = kl_scale * kd_loss + ce_loss
             else:
-                kl_scale = torch.tensor(
-                    1.0, device=kd_loss.device, dtype=kd_loss.dtype
-                )
+                kl_scale = torch.tensor(1.0, device=kd_loss.device, dtype=kd_loss.dtype)
                 loss = self.kl_loss_weight * kd_loss + self.ce_loss_scale * ce_loss
             metrics = {
                 "loss": loss.item(),
