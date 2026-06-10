@@ -185,6 +185,8 @@ def test_fp8_per_token_head_hook_quantizes_only_kv_inputs():
         pytest.skip("torch.float8_e4m3fn is unavailable")
 
     class CoreAttention(nn.Module):
+        hidden_size_per_attention_head = 4
+
         def forward(self, query, key, value, attention_mask=None):
             return query, key, value, attention_mask
 
@@ -219,6 +221,38 @@ def test_fp8_per_token_head_hook_quantizes_only_kv_inputs():
         torch.testing.assert_close(out_k, _fp8_per_token_head_quant_dequant(k))
         torch.testing.assert_close(out_v, _fp8_per_token_head_quant_dequant(v))
         assert out_attention_mask is attention_mask
+    finally:
+        handle.remove()
+
+
+def test_fp8_per_token_head_hook_rejects_wrong_head_dim():
+    import torch.nn as nn
+
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _quant_dequant_kv_cache_forward_pre_hook,
+    )
+
+    if not hasattr(torch, "float8_e4m3fn"):
+        pytest.skip("torch.float8_e4m3fn is unavailable")
+
+    class CoreAttention(nn.Module):
+        hidden_size_per_attention_head = 4
+
+        def forward(self, query, key, value):
+            return query, key, value
+
+    core_attention = CoreAttention()
+    handle = core_attention.register_forward_pre_hook(
+        _quant_dequant_kv_cache_forward_pre_hook,
+        with_kwargs=True,
+    )
+    try:
+        q = torch.randn(2, 1, 2, 4, dtype=torch.bfloat16)
+        k = torch.randn(2, 1, 2, 8, dtype=torch.bfloat16)
+        v = torch.randn(2, 1, 2, 4, dtype=torch.bfloat16)
+
+        with pytest.raises(AssertionError, match="model head_dim=4"):
+            core_attention(q, k, v)
     finally:
         handle.remove()
 

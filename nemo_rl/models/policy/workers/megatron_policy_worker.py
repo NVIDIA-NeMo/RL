@@ -152,17 +152,33 @@ def _fp8_per_token_head_scale(tensor: torch.Tensor) -> torch.Tensor:
     return scale.clamp(min=torch.finfo(torch.float32).eps)
 
 
+def _assert_core_attention_kv_head_dim(
+    module: torch.nn.Module, tensor: torch.Tensor
+) -> None:
+    expected_head_dim = getattr(module, "hidden_size_per_attention_head", None)
+    assert expected_head_dim is not None, (
+        "fp8_per_token_head KV cache simulation expected CoreAttention module "
+        "to expose hidden_size_per_attention_head."
+    )
+    assert tensor.shape[-1] == expected_head_dim, (
+        "fp8_per_token_head KV cache simulation expected K/V last dimension "
+        f"to match model head_dim={expected_head_dim}, but got shape "
+        f"{tuple(tensor.shape)}."
+    )
+
+
 def _quant_dequant_kv_cache_forward_pre_hook(
     module: torch.nn.Module,
     inputs: tuple[Any, ...],
     kwargs: dict[str, Any] | None = None,
 ) -> tuple[Any, ...] | tuple[tuple[Any, ...], dict[str, Any]]:
-    del module
     args: tuple[Any, ...] | list[Any] = inputs
     nested_container_type: str | None = None
     updated_kwargs = dict(kwargs or {})
 
     if "key" in updated_kwargs and "value" in updated_kwargs:
+        _assert_core_attention_kv_head_dim(module, updated_kwargs["key"])
+        _assert_core_attention_kv_head_dim(module, updated_kwargs["value"])
         updated_kwargs["key"] = _fp8_per_token_head_quant_dequant(updated_kwargs["key"])
         updated_kwargs["value"] = _fp8_per_token_head_quant_dequant(
             updated_kwargs["value"]
@@ -180,6 +196,8 @@ def _quant_dequant_kv_cache_forward_pre_hook(
         )
 
     updated_args = list(args)
+    _assert_core_attention_kv_head_dim(module, updated_args[1])
+    _assert_core_attention_kv_head_dim(module, updated_args[2])
     updated_args[1] = _fp8_per_token_head_quant_dequant(updated_args[1])
     updated_args[2] = _fp8_per_token_head_quant_dequant(updated_args[2])
 

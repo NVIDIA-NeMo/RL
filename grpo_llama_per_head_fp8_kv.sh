@@ -32,7 +32,7 @@ case "${MEGATRON_FP8_KV_HOOK}" in
 esac
 
 JOB_NAME=${JOB_NAME:-grpo-llama3-1-8b-per-head-fp8-kv-${HOOK_VARIANT}}
-WANDB_NAME=${WANDB_NAME:-${JOB_NAME}}
+WANDB_NAME=${WANDB_NAME:-${JOB_NAME}-importance-sampling}
 
 TRAIN_CMD="\
 uv run examples/run_grpo.py \
