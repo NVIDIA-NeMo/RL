@@ -74,6 +74,7 @@ def test_fp8_per_token_head_quant_dequant_uses_ste_backward():
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         FP8_E4M3_MAX,
         _fp8_per_token_head_quant_dequant,
+        _fp8_per_token_head_scale,
     )
 
     if not hasattr(torch, "float8_e4m3fn"):
@@ -89,8 +90,7 @@ def test_fp8_per_token_head_quant_dequant_uses_ste_backward():
     )
 
     y = _fp8_per_token_head_quant_dequant(x)
-    scale = x.float().abs().amax(dim=-1, keepdim=True) / FP8_E4M3_MAX
-    scale = scale.clamp(min=torch.finfo(torch.float32).eps)
+    scale = _fp8_per_token_head_scale(x.float())
     expected = (
         (x.float() / scale)
         .clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX)
@@ -105,6 +105,72 @@ def test_fp8_per_token_head_quant_dequant_uses_ste_backward():
 
     y.float().sum().backward()
     torch.testing.assert_close(x.grad, torch.ones_like(x))
+
+
+def test_fp8_per_token_head_scale_reduces_head_dim_only():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        FP8_E4M3_MAX,
+        _fp8_per_token_head_scale,
+    )
+
+    x = torch.tensor(
+        [
+            [
+                [[1.0, -2.0, 3.0], [4.0, -5.0, 6.0]],
+                [[7.0, -8.0, 9.0], [10.0, -11.0, 12.0]],
+            ],
+            [
+                [[13.0, -14.0, 15.0], [16.0, -17.0, 18.0]],
+                [[19.0, -20.0, 21.0], [22.0, -23.0, 24.0]],
+            ],
+        ],
+        dtype=torch.float32,
+    )
+
+    scale = _fp8_per_token_head_scale(x)
+    expected_amax = torch.tensor(
+        [
+            [[[3.0], [6.0]], [[9.0], [12.0]]],
+            [[[15.0], [18.0]], [[21.0], [24.0]]],
+        ],
+        dtype=torch.float32,
+    )
+
+    assert scale.shape == (2, 2, 2, 1)
+    torch.testing.assert_close(scale, expected_amax / FP8_E4M3_MAX)
+
+
+def test_fp8_per_token_head_scale_supports_packed_core_attention_layout():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        FP8_E4M3_MAX,
+        _fp8_per_token_head_scale,
+    )
+
+    x = torch.tensor(
+        [
+            [[1.0, -2.0, 3.0], [4.0, -5.0, 6.0]],
+            [[7.0, -8.0, 9.0], [10.0, -11.0, 12.0]],
+        ],
+        dtype=torch.float32,
+    )
+
+    scale = _fp8_per_token_head_scale(x)
+    expected_amax = torch.tensor(
+        [[[3.0], [6.0]], [[9.0], [12.0]]],
+        dtype=torch.float32,
+    )
+
+    assert scale.shape == (2, 2, 1)
+    torch.testing.assert_close(scale, expected_amax / FP8_E4M3_MAX)
+
+
+def test_fp8_per_token_head_scale_rejects_missing_token_head_axes():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _fp8_per_token_head_scale,
+    )
+
+    with pytest.raises(RuntimeError, match="at least 3 dimensions"):
+        _fp8_per_token_head_scale(torch.randn(2, 3))
 
 
 def test_fp8_per_token_head_hook_quantizes_only_kv_inputs():
@@ -155,6 +221,36 @@ def test_fp8_per_token_head_hook_quantizes_only_kv_inputs():
         assert out_attention_mask is attention_mask
     finally:
         handle.remove()
+
+
+def test_fp8_per_token_head_hook_uses_megatron_switch():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.cfg = {
+        "megatron_cfg": {
+            "enabled": True,
+            "fp8_per_token_head_kv_cache_hook": True,
+        },
+        "generation": {
+            "backend": "vllm",
+            "vllm_cfg": {"kv_cache_dtype": "auto"},
+        },
+    }
+
+    assert worker._uses_fp8_per_token_head_kv_cache_hook()
+
+    worker.cfg = {
+        "megatron_cfg": {"enabled": True},
+        "generation": {
+            "backend": "vllm",
+            "vllm_cfg": {"kv_cache_dtype": "fp8_per_token_head"},
+        },
+    }
+
+    assert not worker._uses_fp8_per_token_head_kv_cache_hook()
 
 
 def create_megatron_test_config(

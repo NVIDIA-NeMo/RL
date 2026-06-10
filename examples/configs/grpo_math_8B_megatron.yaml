@@ -41,6 +41,7 @@ policy:
     pipeline_model_parallel_size: 2
     context_parallel_size: 1
     pipeline_dtype: ${policy.precision}
+    fp8_per_token_head_kv_cache_hook: false
 
     optimizer:
       optimizer: "adam"

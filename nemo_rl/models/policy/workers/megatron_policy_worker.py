@@ -55,7 +55,6 @@ from nemo_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from nemo_rl.models.generation.vllm.config import (
-    VLLM_FP8_PER_TOKEN_HEAD_KV_CACHE_DTYPE,
     VllmConfig,
     is_static_fp8_kv_cache_dtype,
 )
@@ -115,8 +114,7 @@ class _FP8PerTokenHeadQuantDequant(torch.autograd.Function):
 
         ctx.input_dtype = tensor.dtype
         tensor_fp32 = tensor.to(torch.float32)
-        scale = tensor_fp32.abs().amax(dim=-1, keepdim=True) / FP8_E4M3_MAX
-        scale = scale.clamp(min=torch.finfo(torch.float32).eps)
+        scale = _fp8_per_token_head_scale(tensor_fp32)
         quantized = (
             (tensor_fp32 / scale)
             .clamp(
@@ -134,6 +132,24 @@ class _FP8PerTokenHeadQuantDequant(torch.autograd.Function):
 
 def _fp8_per_token_head_quant_dequant(tensor: torch.Tensor) -> torch.Tensor:
     return _FP8PerTokenHeadQuantDequant.apply(tensor)
+
+
+def _fp8_per_token_head_scale(tensor: torch.Tensor) -> torch.Tensor:
+    """Compute one FP8 scale per Megatron CoreAttention token and KV head.
+
+    Megatron CoreAttention may receive K/V tensors either as explicit
+    [seq, batch, heads, head_dim] tensors or as packed
+    [tokens, batch_heads, head_dim] tensors. The scale is reduced over only
+    head_dim, leaving every token/head subtensor with its own scale.
+    """
+    if tensor.ndim < 3:
+        raise RuntimeError(
+            "fp8_per_token_head KV cache simulation expected CoreAttention "
+            "K/V tensors with at least 3 dimensions and head_dim last, but "
+            f"got shape {tuple(tensor.shape)}."
+        )
+    scale = tensor.abs().amax(dim=-1, keepdim=True) / FP8_E4M3_MAX
+    return scale.clamp(min=torch.finfo(torch.float32).eps)
 
 
 def _quant_dequant_kv_cache_forward_pre_hook(
@@ -1260,23 +1276,12 @@ class MegatronPolicyWorkerImpl(
             ).reshape(1)
             yield param_name, scale_tensor
 
-    def _uses_fp8_per_token_head_kv_cache(self) -> bool:
-        if "generation" not in self.cfg or self.cfg["generation"] is None:
-            return False
-        if self.cfg["generation"]["backend"] != "vllm":
-            return False
-
-        generation_cfg = cast(VllmConfig, self.cfg["generation"])
-        return (
-            "vllm_cfg" in generation_cfg
-            and "kv_cache_dtype" in generation_cfg["vllm_cfg"]
-            and generation_cfg["vllm_cfg"]["kv_cache_dtype"]
-            == VLLM_FP8_PER_TOKEN_HEAD_KV_CACHE_DTYPE
-        )
+    def _uses_fp8_per_token_head_kv_cache_hook(self) -> bool:
+        return bool(self.cfg["megatron_cfg"].get("fp8_per_token_head_kv_cache_hook"))
 
     def _maybe_register_fp8_per_token_head_kv_cache_hook(self) -> None:
         """Install dynamic FP8 KV cache simulation before CoreAttention."""
-        if not self._uses_fp8_per_token_head_kv_cache():
+        if not self._uses_fp8_per_token_head_kv_cache_hook():
             return
 
         matched_module_names = []

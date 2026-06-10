@@ -302,6 +302,10 @@ class MegatronConfig(TypedDict):
     # sequence lengths (rope cache) or for MoE models with activation recompute
     # (dispatcher reference cycles).
     clear_memory_caches_before_refit: NotRequired[bool]
+    # When True, quant-dequant K/V tensors before Megatron CoreAttention using
+    # FP8 E4M3 and one scale per [sequence, batch, KV head] subtensor. This is
+    # independent of vLLM kv_cache_dtype so runs can ablate the training hook.
+    fp8_per_token_head_kv_cache_hook: NotRequired[bool]
     # FP8 quantization settings for the Megatron training backend.
     fp8_cfg: NotRequired[Fp8Config]
 

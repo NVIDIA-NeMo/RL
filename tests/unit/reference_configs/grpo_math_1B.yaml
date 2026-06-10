@@ -167,6 +167,7 @@ policy:
     moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
     gradient_accumulation_fusion: false
+    fp8_per_token_head_kv_cache_hook: false
 
     peft:
       enabled: false

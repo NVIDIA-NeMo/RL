@@ -175,6 +175,10 @@ policy:
     moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
     gradient_accumulation_fusion: false
+    # When true, Megatron training/logprob CoreAttention K/V tensors are
+    # quant-dequant simulated with FP8 per-token per-head scales. This is
+    # independent from policy.generation.vllm_cfg.kv_cache_dtype for ablations.
+    fp8_per_token_head_kv_cache_hook: false
 
     peft:
       enabled: false
@@ -311,8 +315,9 @@ policy:
       async_engine: false
       precision: ${policy.precision}
       # Valid values: "auto", "fp8", "fp8_e4m3", "fp8_per_token_head".
-      # "fp8_per_token_head" uses dynamic per-token per-head KV scales in
-      # vLLM and simulates the same quant-dequant on Megatron K/V tensors.
+      # "fp8_per_token_head" uses dynamic per-token per-head KV scales in vLLM.
+      # Set policy.megatron_cfg.fp8_per_token_head_kv_cache_hook=true to
+      # independently simulate the same quant-dequant on Megatron K/V tensors.
       kv_cache_dtype: "auto"
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
