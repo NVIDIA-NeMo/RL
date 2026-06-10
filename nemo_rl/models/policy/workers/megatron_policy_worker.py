@@ -361,6 +361,7 @@ class MegatronPolicyWorkerImpl(
             # Ensure model is in training mode
             self.model.train()
 
+        torch.distributed.barrier()
         torch.cuda.synchronize()
         _train_t0 = time.perf_counter()
 
@@ -496,6 +497,7 @@ class MegatronPolicyWorkerImpl(
                 all_mb_metrics.extend(gb_loss_metrics)
                 losses.append(torch.tensor(mb_losses).sum().item())
 
+        torch.distributed.barrier()
         torch.cuda.synchronize()
         metrics_train_elapsed = time.perf_counter() - _train_t0
 
