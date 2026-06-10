@@ -1344,6 +1344,7 @@ def refit_policy_generation(
     _refit_buffer_size_gb: Optional[int] = None,
     timer: Optional[Timer] = None,
     kv_scales: Optional[dict[str, float]] = None,
+    task_to_env: Optional[dict[str, Any]] = None,
 ) -> None:
     """Refit the policy generation interface with the latest policy weights.
 
@@ -1355,6 +1356,9 @@ def refit_policy_generation(
             This parameter is primarily used for testing.
         timer: Optional Timer used to time the prepare/transfer/update phase
         kv_scales: Optional dictionary of KV cache scales for FP8 quantization.
+        task_to_env: Optional environment map. If a "nemo_gym" key is present,
+            its notify_kv_cache_invalidated() method is called after the weight
+            sync so that custom routing policies can reset their KV-cache state.
     """
     if colocated_inference:
         policy.offload_before_refit()
@@ -1430,6 +1434,13 @@ def refit_policy_generation(
                 "a problem within the generation backend (e.g., vLLM worker).\n"
             )
             raise RuntimeError(error_message)
+
+        if isinstance(policy_generation, VllmGeneration):
+            policy_generation.notify_weights_updated()
+
+        nemo_gym_actor = (task_to_env or {}).get("nemo_gym")
+        if nemo_gym_actor is not None:
+            ray.get(nemo_gym_actor.notify_kv_cache_invalidated.remote())
 
     if colocated_inference:
         policy.offload_after_refit()
@@ -1674,7 +1685,9 @@ def grpo_train(
         memory_tracker.snapshot_start_of_stage("Initial validation", dir())
 
         if NEED_REFIT and POLICY_GENERATION_STALE:
-            refit_policy_generation(policy, policy_generation, colocated_inference)
+            refit_policy_generation(
+                policy, policy_generation, colocated_inference, task_to_env=task_to_env
+            )
             POLICY_GENERATION_STALE = False
         else:
             policy_generation.prepare_for_generation()
@@ -1778,6 +1791,7 @@ def grpo_train(
                             colocated_inference,
                             timer=timer,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
+                            task_to_env=task_to_env,
                         )
                         POLICY_GENERATION_STALE = False
                     else:
@@ -2213,6 +2227,7 @@ def grpo_train(
                             policy_generation,
                             colocated_inference,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
+                            task_to_env=task_to_env,
                         )
                         POLICY_GENERATION_STALE = False
                     else:
@@ -2960,7 +2975,9 @@ def async_grpo_train(
     if NEED_REFIT and POLICY_GENERATION_STALE:
         print("🔄 Refitting policy generation with actual model weights...")
         try:
-            refit_policy_generation(policy, policy_generation, colocated_inference)
+            refit_policy_generation(
+                policy, policy_generation, colocated_inference, task_to_env=task_to_env
+            )
             print("✅ Policy generation refit completed successfully")
             POLICY_GENERATION_STALE = False
         except Exception as e:
@@ -3412,8 +3429,13 @@ def async_grpo_train(
                     # Only the actual refit/weight transfer should be counted as weight_sync
                     print("🔄 Performing policy generation refit...")
                     with timer.time("weight_sync"):
+                        # Don't pass task_to_env here; in the async path the
+                        # nemo_gym KV-cache-invalidated notification is sent by
+                        # resume_after_refit() when it actually clears the cache.
                         refit_policy_generation(
-                            policy, policy_generation, colocated_inference
+                            policy,
+                            policy_generation,
+                            colocated_inference,
                         )
                         POLICY_GENERATION_STALE = False
 
@@ -3439,7 +3461,10 @@ def async_grpo_train(
 
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
-                            policy, policy_generation, colocated_inference
+                            policy,
+                            policy_generation,
+                            colocated_inference,
+                            task_to_env=task_to_env,
                         )
                         POLICY_GENERATION_STALE = False
                     else:
