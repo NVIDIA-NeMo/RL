@@ -1,0 +1,99 @@
+defaults: ../../grpo_math_1B.yaml
+
+grpo:
+  max_num_steps: 100
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
+  skip_reference_policy_logprobs_calculation: true
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: false
+  force_on_policy_ratio: true
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/grpo-glm5.1-64n8g-megatron-dsa-loss0-nosparse-nogradred-cp2-seq8192-full-onpolicy
+  save_period: 5
+
+policy:
+  model_name: /lustre/fsw/portfolios/llmservice/users/slikhite/hf_home/hub/models--zai-org--GLM-5.1/snapshots/442b5279043b5f43f382003e7272731f680e1393
+  tokenizer:
+    name: /lustre/fsw/portfolios/llmservice/users/slikhite/hf_home/hub/models--zai-org--GLM-5.1/snapshots/442b5279043b5f43f382003e7272731f680e1393
+  train_global_batch_size: 64
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 8192
+  logprob_chunk_size: 2048
+  dtensor_cfg:
+    enabled: false
+  sequence_packing:
+    enabled: true
+  make_sequence_length_divisible_by: ${mul:${policy.megatron_cfg.tensor_model_parallel_size},
+    ${mul:2, ${policy.megatron_cfg.context_parallel_size}}}
+  optimizer: null
+  scheduler: null
+  megatron_cfg:
+    enabled: true
+    converter_type: GlmMoeDsaForCausalLM
+    tensor_model_parallel_size: 8
+    pipeline_model_parallel_size: 8
+    num_layers_in_first_pipeline_stage: 9
+    num_layers_in_last_pipeline_stage: 9
+    expert_model_parallel_size: 64
+    context_parallel_size: 2
+    cp_comm_type: all_gather
+    sequence_parallel: true
+    activation_checkpointing: true
+    moe_token_dispatcher_type: allgather
+    apply_rope_fusion: false
+    defer_fp32_logits: true
+    dsa_indexer_rope_interleaved: true
+    dsa_indexer_rotate_activation: false
+    dsa_indexer_k_norm_epsilon: 1.0e-6
+    dsa_kernel_backend: tilelang
+    dsa_indexer_loss_coeff: 0.0
+    dsa_indexer_use_sparse_loss: false
+    moe_router_dtype: fp32
+    moe_shared_expert_overlap: false
+    gradient_accumulation_fusion: false
+    moe_permute_fusion: true
+    moe_grouped_gemm: true
+    bias_activation_fusion: true
+    deallocate_pipeline_outputs: true
+    persist_layer_norm: true
+    bias_dropout_fusion: true
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+    peft:
+      enabled: false
+    optimizer:
+      lr: 5.0e-07
+      min_lr: 5.0e-08
+      weight_decay: 0.0
+      use_precision_aware_optimizer: false
+    scheduler:
+      lr_warmup_iters: 2
+      lr_warmup_init: 5.0e-08
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 32
+      expert_parallel_size: 128
+      gpu_memory_utilization: 0.5
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: true
+    vllm_kwargs:
+      max_num_batched_tokens: ${policy.max_total_sequence_length}
+
+logger:
+  log_dir: logs/grpo-glm5.1-64n8g-megatron-dsa-loss0-nosparse-nogradred-cp2-seq8192-full-onpolicy
+  wandb_enabled: true
+  tensorboard_enabled: true
+  monitor_gpus: true
+  wandb:
+    project: nemo-rl-glm
+    name: grpo-glm5.1-64n8g-megatron-dsa-loss0-nosparse-nogradred-cp2-seq8192-full-onpolicy
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 64

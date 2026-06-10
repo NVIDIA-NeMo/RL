@@ -75,6 +75,7 @@ def import_model_from_hf_name(
     orig_context_parallel_size = model_provider.context_parallel_size
     orig_expert_model_parallel_size = model_provider.expert_model_parallel_size
     orig_expert_tensor_parallel_size = model_provider.expert_tensor_parallel_size
+    orig_cp_comm_type = getattr(model_provider, "cp_comm_type", None)
     orig_num_layers_in_first_pipeline_stage = (
         model_provider.num_layers_in_first_pipeline_stage
     )
@@ -110,6 +111,8 @@ def import_model_from_hf_name(
         model_provider.gradient_accumulation_fusion = megatron_config[
             "gradient_accumulation_fusion"
         ]
+        if "cp_comm_type" in megatron_config:
+            model_provider.cp_comm_type = megatron_config["cp_comm_type"]
     if transformer_layer_spec is not None:
         model_provider.transformer_layer_spec = transformer_layer_spec
     model_provider.finalize()
@@ -137,6 +140,7 @@ def import_model_from_hf_name(
     config.context_parallel_size = orig_context_parallel_size
     config.expert_model_parallel_size = orig_expert_model_parallel_size
     config.expert_tensor_parallel_size = orig_expert_tensor_parallel_size
+    config.cp_comm_type = orig_cp_comm_type
     config.num_layers_in_first_pipeline_stage = orig_num_layers_in_first_pipeline_stage
     config.num_layers_in_last_pipeline_stage = orig_num_layers_in_last_pipeline_stage
     config.pipeline_dtype = orig_pipeline_dtype

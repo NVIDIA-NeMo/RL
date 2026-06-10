@@ -236,6 +236,17 @@ class MegatronConfig(TypedDict):
     apply_rope_fusion: bool
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: bool
+    # DSA indexer and sparse DSA kernel overrides. These mirror MCore
+    # TransformerConfig fields and are copied through when explicitly set.
+    dsa_indexer_rope_interleaved: NotRequired[bool]
+    dsa_indexer_rotate_activation: NotRequired[bool]
+    dsa_indexer_k_norm_epsilon: NotRequired[float | None]
+    dsa_kernel_backend: NotRequired[Literal["none", "tilelang", "cudnn"]]
+    dsa_indexer_loss_coeff: NotRequired[float | None]
+    dsa_indexer_use_sparse_loss: NotRequired[bool]
+    deallocate_pipeline_outputs: NotRequired[bool]
+    persist_layer_norm: NotRequired[bool]
+    bias_dropout_fusion: NotRequired[bool]
     # Force reconvert from HF even if the checkpoint already exists (default: False)
     force_reconvert_from_hf: NotRequired[bool]
     # Attention backend available values:
