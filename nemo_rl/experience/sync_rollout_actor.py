@@ -242,6 +242,7 @@ class SyncRolloutActor:
                 max_seq_len=None,
                 max_rollout_turns=None,
                 generation_config=cfg.policy["generation"],
+                effort_config=cfg.nemo_gym.effort_levels if cfg.nemo_gym else None,
             )
             final_batch, rollout_metrics = r.final_batch, r.rollout_metrics
         else:

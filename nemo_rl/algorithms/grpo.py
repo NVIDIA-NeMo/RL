@@ -214,6 +214,16 @@ class GRPOLoggerConfig(LoggerConfig):
     num_val_samples_to_print: int  # number of val samples to print to stdout
 
 
+class NemoGymConfig(BaseModel, extra="allow"):
+    """Configuration for the NeMo-Gym rollout path.
+
+    Only used when ``env.should_use_nemo_gym: true``.
+    """
+
+    effort_levels: Optional[EffortLevelsConfig] = None
+    """Length-based reward shaping for effort-level prompts. Omit to disable."""
+
+
 class MasterConfig(BaseModel, extra="allow"):
     policy: PolicyConfig
     loss_fn: ClippedPGLossConfig
@@ -224,7 +234,7 @@ class MasterConfig(BaseModel, extra="allow"):
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
     data_plane: Optional[DataPlaneConfig] = None
-    effort_levels: Optional[EffortLevelsConfig] = None
+    nemo_gym: Optional[NemoGymConfig] = None
 
 
 # ===============================================================================
@@ -1795,7 +1805,9 @@ def grpo_train(
                             generation_config=generation_config,
                             max_rollout_turns=None,
                             greedy=False,
-                            effort_config=master_config.effort_levels,
+                            effort_config=master_config.nemo_gym.effort_levels
+                            if master_config.nemo_gym
+                            else None,
                         )
                         input_ids = nemo_gym_rollout_result.input_ids
                         repeated_batch = nemo_gym_rollout_result.final_batch
