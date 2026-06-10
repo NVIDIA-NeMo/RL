@@ -78,6 +78,12 @@ loss_fn:
   force_on_policy_ratio: false  # Set to true to force ratio=1.0 (requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt)
   use_kl_in_reward: false  # Reinforce++: add KL penalty to reward instead of loss
   use_cispo: false  # CISPO (https://arxiv.org/abs/2506.13585): clipped IS-weight policy optimization
+  # Disable PPO ratio (curr_logprobs - prev_logprobs).exp(); falls back to REINFORCE-style
+  # surrogate loss. Used by REINFORCE/RLOO. See https://arxiv.org/abs/2402.14740
+  disable_ppo_ratio: false
+  # VAPO positive-example NLL loss weight: L = L_PPO + mu * L_NLL(correct samples).
+  # 0.0 disables it. VAPO paper recommends 0.1.
+  positive_example_nll_weight: 0.0
 
 checkpointing:
   enabled: true

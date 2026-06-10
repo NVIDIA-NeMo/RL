@@ -12,22 +12,397 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import copy
 import json
 import warnings
 from typing import Any, Optional
 
+import torch
 from transformers import PreTrainedTokenizerBase
 from wandb import Table
 
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
-from nemo_rl.experience.rollouts import _calculate_single_metric, _tensorize_by_key
-from nemo_rl.models.generation.interfaces import GenerationConfig
+from nemo_rl.experience.rollouts import (
+    _calculate_single_metric,
+    _tensorize_by_key,
+    calculate_rewards,
+)
+from nemo_rl.models.generation.interfaces import (
+    GenerationConfig,
+    GenerationDatumSpec,
+    GenerationInterface,
+)
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
+
+
+class AsyncRolloutManager:
+    """Manages per-prompt multi-turn rollouts, producing a PromptGroupRecord per call.
+
+    Each run_rollout takes one prompt and returns num_generations_per_prompt completions
+    generated concurrently via asyncio.gather.
+    """
+
+    def __init__(
+        self,
+        policy_generation: GenerationInterface,
+        tokenizer: TokenizerType,
+        task_to_env: dict[str, EnvironmentInterface],
+        max_seq_len: int,
+        num_generations_per_prompt: int,
+        max_rollout_turns: int = 999999,
+    ) -> None:
+        assert num_generations_per_prompt >= 1, (
+            "num_generations_per_prompt must be >= 1"
+        )
+        self._policy_generation = policy_generation
+        self._tokenizer = tokenizer
+        self._task_to_env = task_to_env
+        self._max_seq_len = max_seq_len
+        self._num_generations_per_prompt = num_generations_per_prompt
+        self._max_rollout_turns = max_rollout_turns
+
+    async def run_rollout(self, input_sample: DatumSpec) -> PromptGroupRecord:
+        """Run num_generations_per_prompt rollouts for one prompt.
+
+        Args:
+            input_sample: A single prompt (one DatumSpec entry).
+
+        Returns:
+            PromptGroupRecord with num_generations_per_prompt completions.
+        """
+        timer = Timer()
+        timer_prefix = "timing/rollout"
+        timer.start(f"{timer_prefix}/total")
+
+        with timer.time(f"{timer_prefix}/run_rollouts"):
+            results = list(
+                await asyncio.gather(
+                    *[
+                        self._run_single_rollout(input_sample, traj_idx)
+                        for traj_idx in range(self._num_generations_per_prompt)
+                    ]
+                )
+            )
+            completions = [c for c, _ in results]
+            all_sample_metrics = [m for _, m in results]
+
+        with timer.time(f"{timer_prefix}/aggregate_metrics"):
+            rollout_metrics = self._aggregate_rollout_metrics(
+                completions, all_sample_metrics
+            )
+
+        timer.stop(f"{timer_prefix}/total")
+        rollout_metrics.update(timer.get_timing_metrics("sum"))
+
+        return PromptGroupRecord(
+            prompt_idx=input_sample["idx"],
+            prompt=input_sample["message_log"],
+            extra_env_info=input_sample["extra_env_info"],
+            metadata={"task_name": input_sample["task_name"]},
+            completions=completions,
+            rollout_metrics=rollout_metrics,
+        )
+
+    async def _run_single_rollout(
+        self, input_sample: DatumSpec, traj_idx: int
+    ) -> tuple[Completion, dict]:
+        """Run one multi-turn rollout for a single generation index."""
+        current_message_log = copy.deepcopy(input_sample["message_log"])
+        current_extra_env_info = copy.deepcopy(input_sample["extra_env_info"])
+        current_stop_strings = input_sample.get("stop_strings", None)
+        task_name = input_sample["task_name"]
+
+        total_reward = 0.0
+        turn_count = 0
+        # token statistics
+        total_token_count = 0
+        assistant_token_count = 0
+        env_token_count = 0
+        # truncated statistics
+        terminated = False
+        truncated = False
+        max_turns_reached = False
+
+        # Track per-turn metrics
+        turn_gen_tokens = []
+        turn_input_tokens = []
+        turn_total_tokens = []
+        # Track per-turn per-worker token accounting if available
+        per_worker_token_counts = {}  # worker_idx -> token_count
+
+        for _ in range(self._max_rollout_turns):
+            if terminated or truncated:
+                break
+
+            turn_count += 1
+
+            # Generate response for this sample using async generation
+            try:
+                (
+                    assistant_message,
+                    input_lengths,
+                    gen_metrics,
+                ) = await self._generate_response(
+                    current_message_log,
+                    current_stop_strings,
+                )
+                current_message_log.append(assistant_message)
+
+                # Check if response was truncated (hit max_tokens without stop token)
+                response_truncated = gen_metrics.pop("_response_truncated", None)
+                if response_truncated is not None and response_truncated[0]:
+                    truncated = True
+
+                # Update token counts
+                gen_token_count = len(assistant_message["token_ids"])
+                assistant_token_count += gen_token_count
+                total_token_count += gen_token_count
+                turn_gen_tokens.append(gen_token_count)
+                turn_input_tokens.append(int(input_lengths))
+                turn_total_tokens.append(int(input_lengths) + gen_token_count)
+                # Per-worker load accounting
+                if "gen_leader_worker_idx" in gen_metrics:
+                    worker_idx = int(gen_metrics["gen_leader_worker_idx"])
+                    per_worker_token_counts[worker_idx] = (
+                        per_worker_token_counts.get(worker_idx, 0) + gen_token_count
+                    )
+
+            except Exception as e:
+                print(
+                    f"Error generating response for prompt_idx {input_sample['idx']}, traj_idx {traj_idx}: {e}"
+                )
+                break
+
+            # Create single-sample batch for environment interaction
+            sample_batch = BatchedDataDict[DatumSpec](
+                {
+                    "message_log": [current_message_log],
+                    "extra_env_info": [current_extra_env_info],
+                    "task_name": [task_name],
+                }
+            )
+            # Get environment feedback.
+            # calculate_rewards uses blocking ray.get internally. Running it
+            # directly on the asyncio event loop (which this coroutine runs on)
+            # blocks every other in-flight rollout coroutine for the entire env
+            # step. In this case, need to wrap with asyncio.to_thread to make
+            # this function yieldable.
+            env_output = await asyncio.to_thread(
+                calculate_rewards, sample_batch, self._task_to_env
+            )
+
+            # Update reward and termination statistics
+            total_reward += float(env_output.rewards[0].item())
+            terminated = env_output.terminateds[0].item()
+            env_obs_content = env_output.observations[0]["content"]
+            tokenized_obs = self._tokenizer(
+                env_obs_content, return_tensors="pt", add_special_tokens=False
+            ).input_ids[0]
+
+            # Check for sequence length overflow
+            if (
+                input_lengths + gen_token_count + len(tokenized_obs)
+                >= self._max_seq_len
+            ):
+                # Truncate environment observation
+                max_env_tokens = self._max_seq_len - input_lengths - gen_token_count
+                if max_env_tokens > 0:
+                    tokenized_obs = tokenized_obs[:max_env_tokens]
+                else:
+                    tokenized_obs = torch.empty(0, dtype=tokenized_obs.dtype)
+                truncated = True
+
+            current_message_log.append(
+                {
+                    "role": env_output.observations[0]["role"],
+                    "content": env_obs_content,
+                    "token_ids": tokenized_obs,
+                }
+            )
+
+            # Update token counts
+            env_token_count += len(tokenized_obs)
+            total_token_count += len(tokenized_obs)
+
+            # Update sample state for next turn
+            if not terminated and not truncated:
+                if env_output.next_stop_strings[0] is not None:
+                    current_stop_strings = env_output.next_stop_strings[0]
+                if env_output.metadata[0] is not None:
+                    current_extra_env_info = env_output.metadata[0]
+
+        else:
+            # Reached max turns without termination or truncation.
+            max_turns_reached = True
+
+        completion = Completion(
+            message_log=current_message_log,
+            env_extras=current_extra_env_info,
+            truncated=truncated,
+            reward=total_reward,
+        )
+        sample_metrics = {
+            "turn_count": turn_count,
+            "total_tokens": total_token_count,
+            "assistant_tokens": assistant_token_count,
+            "env_tokens": env_token_count,
+            "terminated": terminated,
+            "max_turns_reached": max_turns_reached,
+            "turn_gen_tokens": turn_gen_tokens,
+            "turn_input_tokens": turn_input_tokens,
+            "turn_total_tokens": turn_total_tokens,
+            "per_worker_token_counts": per_worker_token_counts,
+        }
+        return completion, sample_metrics
+
+    async def _generate_response(
+        self,
+        message_log: list[dict],
+        stop_strings: list[str] | None,
+    ) -> tuple[dict, torch.Tensor, dict[str, Any]]:
+        """Generate a single-turn response for one sample.
+
+        Returns:
+            Tuple of (assistant_message, input_lengths, gen_metrics)
+        """
+        # Prepare generation input
+        input_ids = torch.cat([m["token_ids"] for m in message_log]).unsqueeze(0)
+        input_lengths = torch.tensor([input_ids.shape[1]], dtype=torch.int32)
+        generation_input_data = BatchedDataDict[GenerationDatumSpec](
+            {
+                "input_ids": input_ids,
+                "input_lengths": input_lengths,
+                "stop_strings": [stop_strings],
+            }
+        )
+
+        # Generate response
+        # TODO: update generate_async to return a single item directly
+        output = None
+        async for _idx, output in self._policy_generation.generate_async(
+            generation_input_data
+        ):
+            pass
+
+        # Build assistant message
+        input_len = int(input_lengths[0].item())
+        total_len = int(output["unpadded_sequence_lengths"][0].item())
+        output_ids = output["output_ids"]
+        generated_ids = output_ids[0, input_len:total_len]
+
+        assistant_message: dict = {
+            "role": "assistant",
+            "content": self._tokenizer.decode(generated_ids, skip_special_tokens=True),
+            "token_ids": generated_ids,
+        }
+        if "logprobs" in output:
+            assistant_message["generation_logprobs"] = output["logprobs"][
+                0, input_len:total_len
+            ]
+
+        # Calculate generation metrics
+        gen_metrics: dict[str, Any] = {}
+        if "gen_leader_worker_idx" in output:
+            v = output["gen_leader_worker_idx"][0]
+            try:
+                gen_metrics["gen_leader_worker_idx"] = (
+                    int(v[0]) if isinstance(v, list) else int(v)
+                )
+            except Exception as e:
+                print(f"Error extracting gen_leader_worker_idx: {e}")
+        if "truncated" in output:
+            gen_metrics["_response_truncated"] = output["truncated"]
+
+        return assistant_message, input_lengths, gen_metrics
+
+    def _aggregate_rollout_metrics(
+        self, completions: list[Completion], all_sample_metrics: list[dict]
+    ) -> dict[str, Any]:
+        """Aggregate per-sample metrics across all completions."""
+        # Prepare lists of values for each metric.
+        total_reward = [c.reward for c in completions]
+        turn_count = [m["turn_count"] for m in all_sample_metrics]
+        # token metrics
+        total_tokens = [m["total_tokens"] for m in all_sample_metrics]
+        assistant_tokens = [m["assistant_tokens"] for m in all_sample_metrics]
+        env_tokens = [m["env_tokens"] for m in all_sample_metrics]
+        # truncated metrics
+        truncated = [c.truncated for c in completions]
+        terminated = [m["terminated"] for m in all_sample_metrics]
+        max_turns_reached = [m["max_turns_reached"] for m in all_sample_metrics]
+
+        # Aggregate metrics across all samples.
+        n = len(all_sample_metrics)
+        rollout_metrics: dict[str, Any] = {
+            **self._aggregate_single_metric(
+                "total_reward", total_reward, ["mean", "max", "min"], n
+            ),
+            # turn metrics
+            "total_turns": sum(turn_count),
+            **self._aggregate_single_metric(
+                "turns_per_sample", turn_count, ["mean", "max"], n
+            ),
+            # token metrics
+            **self._aggregate_single_metric(
+                "total_tokens_per_sample", total_tokens, ["mean"], n
+            ),
+            **self._aggregate_single_metric(
+                "gen_tokens_per_sample", assistant_tokens, ["mean", "max"], n
+            ),
+            **self._aggregate_single_metric(
+                "env_tokens_per_sample", env_tokens, ["mean"], n
+            ),
+            # truncated metrics
+            "truncation_rate": sum(truncated) / n,
+            "natural_termination_rate": sum(terminated) / n,
+            "max_turns_reached_rate": sum(max_turns_reached) / n,
+        }
+
+        if "per_worker_token_counts" in all_sample_metrics[0]:
+            per_worker_token_counts: dict[int, int] = {}
+            for m in all_sample_metrics:
+                for k, v in m["per_worker_token_counts"].items():
+                    per_worker_token_counts[k] = per_worker_token_counts.get(k, 0) + v
+            rollout_metrics["per_worker_token_counts"] = per_worker_token_counts
+
+        # Histogram metrics.
+        rollout_metrics["histogram/gen_tokens_length"] = [
+            t for m in all_sample_metrics for t in m["turn_gen_tokens"]
+        ]
+        rollout_metrics["histogram/input_tokens_length"] = [
+            t for m in all_sample_metrics for t in m["turn_input_tokens"]
+        ]
+        rollout_metrics["histogram/total_tokens_length"] = [
+            t for m in all_sample_metrics for t in m["turn_total_tokens"]
+        ]
+
+        return rollout_metrics
+
+    @staticmethod
+    def _aggregate_single_metric(
+        name: str,
+        values: list[float],
+        agg_method: list[str],
+        n: Optional[int] = None,
+    ) -> dict:
+        """Calculate a single metric across a list of values."""
+        metrics = {}
+
+        if "mean" in agg_method:
+            assert n is not None, "n must be provided for mean aggregation"
+            metrics[f"mean_{name}"] = sum(values) / n
+        if "max" in agg_method:
+            metrics[f"max_{name}"] = max(values)
+        if "min" in agg_method:
+            metrics[f"min_{name}"] = min(values)
+
+        return metrics
 
 
 class AsyncNemoGymRolloutManager:
@@ -239,7 +614,7 @@ class AsyncNemoGymRolloutManager:
         agent_extras = [c.env_extras for c in completions]
         for key in agent_extras[0].keys():
             values = [
-                float(r[key])
+                float(r[key])  # type: ignore
                 for r in agent_extras
                 if isinstance(r.get(key), (bool, int, float))
             ]

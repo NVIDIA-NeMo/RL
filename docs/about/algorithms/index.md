@@ -12,6 +12,7 @@ NeMo RL supports multiple training algorithms for post-training large language m
 | [On-policy Distillation](on-policy-distillation.md) | [Distillation Single Node](on-policy-distillation.md#on-policy-distillation-single-node) | [Distillation Multi-node](on-policy-distillation.md#on-policy-distillation-multi-node) |
 | [Supervised Fine-Tuning (SFT)](sft.md) | [SFT Single Node](sft.md#sft-single-node) | [SFT Multi-node](sft.md#sft-multi-node) |
 | [DPO](dpo.md) | [DPO Single Node](dpo.md#dpo-single-node) | [DPO Multi-node](dpo.md#dpo-multi-node) |
+| [PPO](ppo.md) | [PPO Single Node](ppo.md#ppo-single-node) | [PPO Multi-node](ppo.md#ppo-multi-node) |
 | [RM](rm.md) | [RM Single Node](rm.md#rm-single-node) | [RM Multi-node](rm.md#rm-multi-node) |
 
 On-policy distillation is also supported in the PyTorch DTensor path.
@@ -22,6 +23,7 @@ On-policy distillation is also supported in the PyTorch DTensor path.
 grpo
 dapo
 cispo
+ppo
 on-policy-distillation
 sft
 dpo
