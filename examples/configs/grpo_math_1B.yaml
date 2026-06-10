@@ -77,6 +77,14 @@ loss_fn:
   token_level_loss: true
   force_on_policy_ratio: false  # Set to true to force ratio=1.0 (requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt)
   use_kl_in_reward: false  # Reinforce++: add KL penalty to reward instead of loss
+  # SAPO (Soft Adaptive Policy Optimization, https://arxiv.org/abs/2511.20347).
+  # Replaces the hard PPO clip with a smooth temperature-controlled sigmoid
+  # gate. Mutually exclusive with sequence_level_importance_ratios (GSPO),
+  # ratio_clip_c (dual clip), force_on_policy_ratio. Paper recommends
+  # tau_neg > tau_pos so negative-token gradients decay faster.
+  sapo_enabled: false
+  sapo_tau_pos: 1.0
+  sapo_tau_neg: 1.05
 
 checkpointing:
   enabled: true

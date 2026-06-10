@@ -137,6 +137,29 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # NOTE: This should only be used when doing exactly one update per rollout
     # (i.e., num_prompts_per_step * num_generations_per_prompt == train_global_batch_size)
     force_on_policy_ratio: bool = False
+    # If True, add KL penalty to reward instead of loss (used by Reinforce++)
+    use_kl_in_reward: NotRequired[bool]
+    # SAPO: Soft Adaptive Policy Optimization (https://arxiv.org/abs/2511.20347).
+    # When enabled, the standard hard PPO-style clipping is replaced by a
+    # token-level temperature-controlled sigmoid soft gate:
+    #
+    #     f_SAPO(r; A) = sigmoid(tau * (r - 1)) * 4 / tau
+    #     L_SAPO       = -f_SAPO(r; A) * A
+    #
+    # where the temperature is selected per-sequence by the sign of the
+    # group-normalized advantage:
+    #
+    #     tau = sapo_tau_pos if A > 0 else sapo_tau_neg
+    #
+    # The paper recommends sapo_tau_neg > sapo_tau_pos (e.g. 1.05 vs 1.0) so
+    # high-variance negative-token gradients decay faster than positive ones.
+    # SAPO is mutually exclusive with hard clipping, dual clipping
+    # (ratio_clip_c), sequence-level importance ratios (GSPO), disable_ppo_ratio
+    # (REINFORCE/RLOO) and force_on_policy_ratio.
+    sapo_enabled: NotRequired[bool]
+    sapo_tau_pos: NotRequired[float]
+    sapo_tau_neg: NotRequired[float]
+    force_on_policy_ratio: bool = False
 
 
 class ClippedPGLossDataDict(TypedDict):
@@ -161,6 +184,7 @@ class ClippedPGLossFn(LossFunction):
     - GRPO - https://arxiv.org/abs/2402.03300
     - REINFORCE/RLOO (set disable_ppo_ratio = True and ignores ratio_clip_min/ratio_clip_max) - https://arxiv.org/abs/2402.14740
     - GSPO (set sequence_level_importance_ratios = True and token_level_loss = False) - https://arxiv.org/abs/2507.18071
+    - SAPO (set sapo_enabled = True; replaces hard clipping with a smooth temperature-controlled sigmoid gate) - https://arxiv.org/abs/2511.20347
     - Truly on-policy (set force_on_policy_ratio = True to force ratio = 1.0, requires one update per rollout)
 
     Formula:
@@ -219,12 +243,39 @@ class ClippedPGLossFn(LossFunction):
 
         # Whether to compute importance weights per-sequence instead of per-token.
         self.sequence_level_importance_ratios = cfg.sequence_level_importance_ratios
+        # SAPO (Soft Adaptive Policy Optimization), https://arxiv.org/abs/2511.20347
+        self.sapo_enabled = cfg.get("sapo_enabled", False)
+        self.sapo_tau_pos = float(cfg.get("sapo_tau_pos", 1.0))
+        self.sapo_tau_neg = float(cfg.get("sapo_tau_neg", 1.05))
+        self.sequence_level_importance_ratios = cfg.sequence_level_importance_ratios
         self.loss_type = (
             LossType.TOKEN_LEVEL if cfg.token_level_loss else LossType.SEQUENCE_LEVEL
         )
         if self.sequence_level_importance_ratios:
             assert self.loss_type == LossType.SEQUENCE_LEVEL, (
                 "sequence-level importance sampling (e.g. GSPO) is mutually exclusive with token-level loss"
+            )
+        if self.sapo_enabled:
+            # SAPO is defined as a smooth token-level gate on the importance
+            # ratio r_t = pi_theta / pi_theta_old. The flags below are
+            # alternative formulations that conflict with that definition.
+            assert self.sapo_tau_pos > 0, (
+                f"sapo_tau_pos must be > 0, got {self.sapo_tau_pos}"
+            )
+            assert self.sapo_tau_neg > 0, (
+                f"sapo_tau_neg must be > 0, got {self.sapo_tau_neg}"
+            )
+            assert not self.sequence_level_importance_ratios, (
+                "sapo_enabled is mutually exclusive with sequence_level_importance_ratios (GSPO)"
+            )
+            assert not self.disable_ppo_ratio, (
+                "sapo_enabled requires the standard ratio r_t = pi/pi_old; disable_ppo_ratio must be False"
+            )
+            assert not self.force_on_policy_ratio, (
+                "sapo_enabled is mutually exclusive with force_on_policy_ratio (the gate would degenerate to a constant)"
+            )
+            assert self.ratio_clip_c is None, (
+                "sapo_enabled is mutually exclusive with dual clipping (ratio_clip_c); set ratio_clip_c=null"
             )
 
         if self.truncated_importance_sampling_type is not None:
@@ -421,21 +472,55 @@ class ClippedPGLossFn(LossFunction):
             ratios = curr_logprobs
             ratios_clamped = curr_logprobs
 
-        loss1 = -advantages * ratios
-        loss2 = -advantages * ratios_clamped
-
-        # Determine which value to use for clipping (max for pessimistic estimate)
-        clip_loss = torch.max(loss1, loss2)
-
-        # Dual-clipping see https://arxiv.org/pdf/1912.09729
-        if self.ratio_clip_c is not None:
-            assert self.ratio_clip_c > 1, (
-                f"ratio_clip_c must exceed 1 representing a lower bound of the ratios, got {self.ratio_clip_c}."
+        if self.sapo_enabled:
+            # SAPO (https://arxiv.org/abs/2511.20347) - replace the hard
+            # PPO clip with a smooth temperature-controlled sigmoid gate.
+            #
+            #   tau   = tau_pos if A > 0 else tau_neg            (per-element,
+            #                                                     A is shared
+            #                                                     within a seq
+            #                                                     in GRPO so
+            #                                                     this matches
+            #                                                     the paper's
+            #                                                     per-sequence
+            #                                                     selection)
+            #   f(r)  = sigmoid(tau * (r - 1)) * 4 / tau
+            #   loss  = -f(r) * A
+            #
+            # At r=1: f(1) = 2/tau and df/dr|_{r=1} = 1, so near on-policy
+            # the SAPO gradient on theta matches that of vanilla REINFORCE
+            # (since d r / d theta = r * d log pi / d theta and r=1 there).
+            # As r drifts off 1 the gate smoothly attenuates the gradient
+            # instead of zeroing it discontinuously like PPO clipping.
+            tau_pos_t = torch.tensor(
+                self.sapo_tau_pos, device=ratios.device, dtype=ratios.dtype
             )
-            loss3 = -advantages * self.ratio_clip_c
-            clip_loss = torch.where(
-                advantages < 0, torch.min(clip_loss, loss3), clip_loss
+            tau_neg_t = torch.tensor(
+                self.sapo_tau_neg, device=ratios.device, dtype=ratios.dtype
             )
+            sapo_tau = torch.where(advantages > 0, tau_pos_t, tau_neg_t)
+            sapo_gate = torch.sigmoid(sapo_tau * (ratios - 1.0)) * (4.0 / sapo_tau)
+            clip_loss = -advantages * sapo_gate
+            # NB: ratios_clamped is unused on the SAPO path; we keep the
+            # variable around so the unchanged downstream metric code
+            # (probs_ratio_clamped*) still has a valid tensor to reduce
+            # over. Its value reflects the "would-have-been" PPO clip.
+        else:
+            loss1 = -advantages * ratios
+            loss2 = -advantages * ratios_clamped
+
+            # Determine which value to use for clipping (max for pessimistic estimate)
+            clip_loss = torch.max(loss1, loss2)
+
+            # Dual-clipping see https://arxiv.org/pdf/1912.09729
+            if self.ratio_clip_c is not None:
+                assert self.ratio_clip_c > 1, (
+                    f"ratio_clip_c must exceed 1 representing a lower bound of the ratios, got {self.ratio_clip_c}."
+                )
+                loss3 = -advantages * self.ratio_clip_c
+                clip_loss = torch.where(
+                    advantages < 0, torch.min(clip_loss, loss3), clip_loss
+                )
 
         # -------------------------------------------------------------
         # Off-policy (actor) importance-sampling correction
@@ -618,6 +703,36 @@ class ClippedPGLossFn(LossFunction):
                 probs_ratio_clamped_min = float("inf")
                 probs_ratio_clamped_max = float("-inf")
 
+            # SAPO-specific diagnostics: mean gate value, normalized gate
+            # (gate * tau / 4 in [0, 1] - shows how saturated the sigmoid is),
+            # and the fraction of tokens with the gate below 0.5 (analog of
+            # PPO's "clipped fraction" - those tokens are getting <= half the
+            # at-r=1 weight).
+            sapo_metrics: dict = {}
+            if self.sapo_enabled:
+                sapo_gate_detached = sapo_gate.detach()
+                sapo_tau_detached = sapo_tau.detach()
+                sapo_gate_norm = sapo_gate_detached * sapo_tau_detached / 4.0
+                sapo_metrics = {
+                    "sapo_gate_mean": masked_mean(
+                        sapo_gate_detached,
+                        mask,
+                        global_normalization_factor=global_valid_toks,
+                    ).item(),
+                    "sapo_gate_norm_mean": masked_mean(
+                        sapo_gate_norm,
+                        mask,
+                        global_normalization_factor=global_valid_toks,
+                    ).item(),
+                    "sapo_attenuated_token_frac": masked_mean(
+                        (sapo_gate_norm < 0.25).to(sapo_gate_detached.dtype),
+                        mask,
+                        global_normalization_factor=global_valid_toks,
+                    ).item(),
+                    "sapo_tau_pos": self.sapo_tau_pos,
+                    "sapo_tau_neg": self.sapo_tau_neg,
+                }
+
         # If you provided a global_valid_{seqs/toks}, all metrics here are globally normalized
         # by either sequence or token count, depending on particular metric.
         # To get the true metric, you'll need to sum over the microbatch.
@@ -640,6 +755,7 @@ class ClippedPGLossFn(LossFunction):
                 "num_valid_samples": sample_mask.sum().item(),
                 "approx_entropy": seq_entropy_approx.item(),
                 **_is_filter_metrics,
+                **sapo_metrics,
             },
         )
 

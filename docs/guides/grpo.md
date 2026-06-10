@@ -437,6 +437,32 @@ By multiplying the first term of the loss function by the importance weights $\f
 To enable the importance sampling correction, set the config `use_importance_sampling_correction=True` in the `ClippedPGLossConfig`. By default, we set this config to False to align with standard GRPO.
 
 
+#### Soft Adaptive Policy Optimization (SAPO)
+
+This feature is controlled by the parameter `sapo_enabled`. It replaces GRPO's hard PPO-style clipping on the importance ratio with a smooth, temperature-controlled sigmoid gate, as introduced in [Gao et al. (2025)](https://arxiv.org/abs/2511.20347). The motivation is that hard clipping zeros the gradient on tokens whose ratio leaves the trust region $[1-\varepsilon, 1+\varepsilon]$, which discards informative learning signal — a problem amplified in MoE models and when training is genuinely off-policy (multiple gradient updates per rollout).
+
+SAPO replaces the per-token clipped term $\min\!\big(r_t A_t, \text{clip}(r_t, 1-\varepsilon, 1+\varepsilon) A_t\big)$ with $-f_{\text{SAPO}}(r_t; A_i) \cdot A_t$, where
+
+$$
+f_{\text{SAPO}}(r_t; A_i) = \sigma\!\big(\tau_i \cdot (r_t - 1)\big) \cdot \frac{4}{\tau_i}, \qquad \tau_i = \begin{cases} \tau_{\text{pos}} & A_i > 0 \\ \tau_{\text{neg}} & A_i \le 0 \end{cases}
+$$
+
+Here $r_t = \pi_{\theta}(y_t) / \pi_{\theta_{\text{old}}}(y_t)$ is the standard token-level importance ratio, $\sigma$ is the sigmoid, and $\tau_{\text{pos}}, \tau_{\text{neg}} > 0$ are temperature hyperparameters. At $r_t = 1$ the gate evaluates to $2/\tau$ and its slope $\partial f / \partial r$ equals $1$, so near on-policy the per-parameter gradient matches plain REINFORCE on the advantage. As $r_t$ drifts off $1$ the gate saturates at $4/\tau$ instead of vanishing discontinuously like the PPO clip — moderately off-policy tokens contribute attenuated but non-zero gradients.
+
+The temperatures are chosen *per-sequence* based on the sign of the group-normalized advantage $A_i$. The paper recommends $\tau_{\text{neg}} > \tau_{\text{pos}}$ (default $\tau_{\text{pos}} = 1.0$, $\tau_{\text{neg}} = 1.05$): negative-advantage updates tend to increase the logits of many unsampled tokens (more dispersive), so damping their gradients more aggressively than positive-advantage updates improves training stability. The symmetric choice $\tau_{\text{neg}} = \tau_{\text{pos}}$ is supported but less stable empirically, and $\tau_{\text{neg}} < \tau_{\text{pos}}$ is not recommended.
+
+To enable SAPO, set `sapo_enabled=True` in the `ClippedPGLossConfig`:
+
+```yaml
+loss_fn:
+  sapo_enabled: true
+  sapo_tau_pos: 1.0   # default
+  sapo_tau_neg: 1.05  # default; tau_neg > tau_pos is recommended
+```
+
+By default `sapo_enabled=False` and the standard hard-clip path is used. When SAPO is on, the existing `ratio_clip_min` / `ratio_clip_max` parameters are ignored on the loss path (the soft gate replaces hard clipping entirely), though they continue to populate the `probs_ratio_clamped*` diagnostic metrics. SAPO is mutually exclusive with [GSPO-style sequence-level importance ratios](#importance-sampling-correction), dual clipping (`ratio_clip_c`), `force_on_policy_ratio`, and `disable_ppo_ratio` — the loss-function constructor raises if any of these are set together with `sapo_enabled=True`. When SAPO is active, three additional metrics are emitted to wandb/TensorBoard: `train/sapo_gate_mean` (mean gate value), `train/sapo_gate_norm_mean` (gate normalized to $[0, 1]$ so $0.5$ corresponds to on-policy), and `train/sapo_attenuated_token_frac` (fraction of tokens with normalized gate $< 0.25$ — SAPO's analog of PPO's "clipped fraction").
+
+
 #### Overlong Filtering
 
 This feature is controlled by the parameter `overlong_filtering`. It filters out sequences that exceed a predefined maximum length, helping maintain computational efficiency and model stability. When `overlong_filtering=True`, samples that reach `max_total_sequence_length` without producing an end-of-text token are excluded from loss computation. This reduces noise from penalizing generations that may be high-quality but exceed the sequence length limit.
