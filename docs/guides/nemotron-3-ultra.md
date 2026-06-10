@@ -183,7 +183,7 @@ override.
 Ultra can also be trained with Megatron LoRA/PEFT. The starter recipe is:
 
 ```bash
-examples/configs/recipes/llm/grpo-ultra-4n2g-megatron-lora.yaml
+examples/configs/recipes/llm/grpo-ultra-6n4g-megatron-lora.yaml
 ```
 
 The recipe uses 4 GB200 training nodes plus 2 non-colocated vLLM generation
