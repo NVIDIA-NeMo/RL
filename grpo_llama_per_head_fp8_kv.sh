@@ -13,6 +13,7 @@ MAX_TOTAL_SEQUENCE_LENGTH=${MAX_TOTAL_SEQUENCE_LENGTH:-4096}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.6}
 WANDB_PROJECT=${WANDB_PROJECT:-guyueh-nemo-rl-fp8-kv}
 MEGATRON_FP8_KV_HOOK=${MEGATRON_FP8_KV_HOOK:-true}
+KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-fp8_per_token_head}
 DRIVER_SRUN_ARGS=${DRIVER_SRUN_ARGS:---mem=64G}
 INTERACTIVE=${INTERACTIVE:-0}
 
@@ -31,7 +32,25 @@ case "${MEGATRON_FP8_KV_HOOK}" in
         ;;
 esac
 
-JOB_NAME=${JOB_NAME:-grpo-llama3-1-8b-per-head-fp8-kv-${HOOK_VARIANT}}
+case "${KV_CACHE_DTYPE}" in
+    fp8_per_token_head)
+        KV_CACHE_VARIANT=per-head-fp8-kv
+        ;;
+    auto)
+        KV_CACHE_VARIANT=bf16-kv-cache
+        ;;
+    *)
+        echo "KV_CACHE_DTYPE must be fp8_per_token_head or auto; got ${KV_CACHE_DTYPE}" >&2
+        exit 1
+        ;;
+esac
+
+EXPERIMENT_VARIANT=${KV_CACHE_VARIANT}-${HOOK_VARIANT}
+if [ "${KV_CACHE_DTYPE}" = "auto" ] && [ "${MEGATRON_FP8_KV_HOOK}" = "false" ]; then
+    EXPERIMENT_VARIANT=bf16-baseline
+fi
+
+JOB_NAME=${JOB_NAME:-grpo-llama3-1-8b-${EXPERIMENT_VARIANT}}
 WANDB_NAME=${WANDB_NAME:-${JOB_NAME}-importance-sampling}
 
 TRAIN_CMD="\
@@ -58,7 +77,7 @@ policy.generation.vllm_cfg.pipeline_parallel_size=1 \
 policy.generation.vllm_cfg.max_model_len=${MAX_TOTAL_SEQUENCE_LENGTH} \
 policy.generation.vllm_cfg.gpu_memory_utilization=${GPU_MEMORY_UTILIZATION} \
 policy.generation.vllm_cfg.async_engine=false \
-policy.generation.vllm_cfg.kv_cache_dtype=fp8_per_token_head \
+policy.generation.vllm_cfg.kv_cache_dtype=${KV_CACHE_DTYPE} \
 data.max_input_seq_length=${MAX_TOTAL_SEQUENCE_LENGTH} \
 loss_fn.use_importance_sampling_correction=true \
 checkpointing.enabled=false \
@@ -75,6 +94,7 @@ echo "PP_SIZE: ${PP_SIZE}"
 echo "MAX_STEPS: ${MAX_STEPS}"
 echo "MAX_TOTAL_SEQUENCE_LENGTH: ${MAX_TOTAL_SEQUENCE_LENGTH}"
 echo "MEGATRON_FP8_KV_HOOK: ${MEGATRON_FP8_KV_HOOK}"
+echo "KV_CACHE_DTYPE: ${KV_CACHE_DTYPE}"
 echo "DRIVER_SRUN_ARGS: ${DRIVER_SRUN_ARGS}"
 echo "JOB_NAME: ${JOB_NAME}"
 echo "WANDB_NAME: ${WANDB_NAME}"

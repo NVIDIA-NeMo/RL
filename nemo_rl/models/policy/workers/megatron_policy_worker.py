@@ -156,9 +156,13 @@ def _assert_core_attention_kv_head_dim(
     module: torch.nn.Module, tensor: torch.Tensor
 ) -> None:
     expected_head_dim = getattr(module, "hidden_size_per_attention_head", None)
+    if expected_head_dim is None:
+        expected_head_dim = getattr(
+            getattr(module, "config", None), "kv_channels", None
+        )
     assert expected_head_dim is not None, (
         "fp8_per_token_head KV cache simulation expected CoreAttention module "
-        "to expose hidden_size_per_attention_head."
+        "to expose hidden_size_per_attention_head or config.kv_channels."
     )
     assert tensor.shape[-1] == expected_head_dim, (
         "fp8_per_token_head KV cache simulation expected K/V last dimension "
@@ -211,6 +215,10 @@ def _quant_dequant_kv_cache_forward_pre_hook(
     if kwargs is not None:
         return updated_inputs, updated_kwargs
     return updated_inputs
+
+
+def _is_self_attention_core_attention_module_name(name: str) -> bool:
+    return name.endswith("self_attention.core_attention")
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
@@ -1304,7 +1312,7 @@ class MegatronPolicyWorkerImpl(
 
         matched_module_names = []
         for name, module in self.model.named_modules():
-            if "self_attention.core_attention" not in name:
+            if not _is_self_attention_core_attention_module_name(name):
                 continue
             handle = module.register_forward_pre_hook(
                 _quant_dequant_kv_cache_forward_pre_hook,
@@ -1828,7 +1836,7 @@ class MegatronPolicyWorkerImpl(
         matched_modules = []
         # Try to register forward_pre_hook on core_attention first
         for name, module in self.model.named_modules():
-            if "self_attention.core_attention" in name:
+            if _is_self_attention_core_attention_module_name(name):
                 try:
                     handle = module.register_forward_pre_hook(
                         _pre_hook_builder_core_attention(name)

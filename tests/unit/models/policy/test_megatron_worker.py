@@ -257,6 +257,44 @@ def test_fp8_per_token_head_hook_rejects_wrong_head_dim():
         handle.remove()
 
 
+def test_fp8_per_token_head_hook_accepts_config_kv_channels_head_dim():
+    import types
+
+    import torch.nn as nn
+
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _fp8_per_token_head_quant_dequant,
+        _quant_dequant_kv_cache_forward_pre_hook,
+    )
+
+    if not hasattr(torch, "float8_e4m3fn"):
+        pytest.skip("torch.float8_e4m3fn is unavailable")
+
+    class CoreAttention(nn.Module):
+        config = types.SimpleNamespace(kv_channels=4)
+
+        def forward(self, query, key, value):
+            return query, key, value
+
+    core_attention = CoreAttention()
+    handle = core_attention.register_forward_pre_hook(
+        _quant_dequant_kv_cache_forward_pre_hook,
+        with_kwargs=True,
+    )
+    try:
+        q = torch.randn(2, 1, 2, 4, dtype=torch.bfloat16)
+        k = torch.randn(2, 1, 2, 4, dtype=torch.bfloat16)
+        v = torch.randn(2, 1, 2, 4, dtype=torch.bfloat16)
+
+        out_q, out_k, out_v = core_attention(q, k, v)
+
+        assert out_q is q
+        torch.testing.assert_close(out_k, _fp8_per_token_head_quant_dequant(k))
+        torch.testing.assert_close(out_v, _fp8_per_token_head_quant_dequant(v))
+    finally:
+        handle.remove()
+
+
 def test_fp8_per_token_head_hook_uses_megatron_switch():
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
         MegatronPolicyWorkerImpl,
@@ -285,6 +323,61 @@ def test_fp8_per_token_head_hook_uses_megatron_switch():
     }
 
     assert not worker._uses_fp8_per_token_head_kv_cache_hook()
+
+
+def test_fp8_per_token_head_hook_registers_only_core_attention_module():
+    import torch.nn as nn
+
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    class CoreAttention(nn.Module):
+        hidden_size_per_attention_head = 4
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.fused_attention = nn.Linear(4, 4)
+
+        def forward(self, query, key, value):
+            return query, key, value
+
+    class SelfAttention(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.core_attention = CoreAttention()
+
+    class Layer(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.self_attention = SelfAttention()
+
+    class Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.layers = nn.ModuleList([Layer()])
+
+    model = Model()
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.cfg = {
+        "megatron_cfg": {
+            "enabled": True,
+            "fp8_per_token_head_kv_cache_hook": True,
+        }
+    }
+    worker.model = model
+    worker._fp8_per_token_head_kv_cache_hook_handles = []
+
+    worker._maybe_register_fp8_per_token_head_kv_cache_hook()
+
+    core_attention = model.layers[0].self_attention.core_attention
+    fused_attention = core_attention.fused_attention
+    assert len(worker._fp8_per_token_head_kv_cache_hook_handles) == 1
+    assert len(core_attention._forward_pre_hooks) == 1
+    assert len(fused_attention._forward_pre_hooks) == 0
+
+    for handle in worker._fp8_per_token_head_kv_cache_hook_handles:
+        handle.remove()
 
 
 def create_megatron_test_config(
