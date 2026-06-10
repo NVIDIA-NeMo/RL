@@ -28,6 +28,26 @@ format is colon separated integers representing `start:stop`, where `start` is i
 export NRL_NSYS_PROFILE_STEP_RANGE=3:5
 ```
 
+### Extra Nsys Options (Optional)
+
+Set `NRL_NSYS_EXTRA_OPTIONS` to a JSON object to add or override nsys CLI flags on top of
+the built-in defaults. Keys are the nsys flag names (without leading `--`); values are the
+flag values (string, or anything Ray's nsight runtime_env accepts). User-supplied keys win
+on conflict with the built-in defaults (`t`, `o`, `stop-on-exit`, `capture-range`,
+`capture-range-end`, `cuda-graph-trace`).
+
+```bash
+export NRL_NSYS_EXTRA_OPTIONS='{"gpu-metrics-device": "all", "cuda-memory-usage": "true", "cpuctxsw": "none"}'
+```
+
+Common additions:
+- `gpu-metrics-device`: sample SM/memory utilization counters (e.g. `"all"` or a specific device id).
+- `cuda-memory-usage`: track host/device memory allocations (`"true"`).
+- `cpuctxsw`: control CPU context-switch sampling (`"none"`, `"process-tree"`).
+
+Empty or unset means no extras — defaults apply unchanged. Invalid JSON or a non-object
+payload raises at startup so misconfiguration surfaces immediately.
+
 ### Pattern Format
 
 - Use shell-style wildcards (`*`, `?`, `[seq]`, `[!seq]`)
