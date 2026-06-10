@@ -54,7 +54,15 @@ In-training validation uses IntentBench as the validation set, so `val_period`, 
 
 ## 4. Results
 
-This guide ships as a starting point for audio+video GRPO on IntentTrain/IntentBench. The recipe does not commit to a particular IntentBench accuracy target — IntentBench's evaluation methodology and any published numerical comparison are out of scope for this recipe. Use the validation reward and answer-correctness reward signal in the wandb / tensorboard logs to track training progress.
+This guide ships as a starting point for audio+video GRPO on IntentTrain/IntentBench. The recipe does not commit to a particular IntentBench accuracy target — IntentBench's evaluation methodology and any published numerical comparison are out of scope for this recipe.
+
+What the validation loop actually logs each `val_period`:
+
+- Stdout summary block: `Accuracy: <float>`, `Average response length: <float> tokens`, `Samples processed: <N>`, and a `Per-component reward (weighted):` sub-block listing one line per configured reward function — for the shipped recipe that is `format: <float>` and `exact_alnum: <float>` (each value is the per-component score multiplied by its weight, so summing the listed components reproduces the combined reward).
+- `val_metrics` (handed off to wandb / tensorboard if enabled): `accuracy`, `avg_length`, and `reward/<name>` keys for each component (e.g. `reward/format`, `reward/exact_alnum`).
+- `logs/exp_NNN/val_data_step{step}.jsonl`: each row gets the existing `content`, `idx`, and combined `rewards` columns, plus one new column per reward component (`reward/format`, `reward/exact_alnum`) with the per-sample weighted score so eyeballing or plotting can split format vs answer-correctness signal directly.
+
+The per-component plumbing is implemented by having the VLM environment emit an `(N, K)` rewards tensor — one column per configured reward function — and the rollout's existing multi-reward path (`nemo_rl/experience/rollouts.py`) promotes those columns to `reward1`, `reward2`, ... batch keys. The validation loop in `nemo_rl/algorithms/grpo.py::validate` queries `VLMEnvironment.reward_component_names()` to label them and aggregates means across val batches.
 
 The smoke configuration that v1 was actually exercised against (4 H100 80GB GPUs, single node):
 
