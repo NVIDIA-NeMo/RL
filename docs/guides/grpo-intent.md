@@ -21,7 +21,7 @@ Key hyperparameters:
 | Model | Qwen2.5-Omni-3B |
 | Train dataset | PhilipC/IntentTrain (problem_type = "multiple choice") |
 | Validation dataset | PhilipC/IntentBench (problem_type = "multiple choice") |
-| Modalities per prompt | video (16 frames) + audio (16 kHz mono, joint via `use_audio_in_video=True`) |
+| Modalities per prompt | video (16 frames, `<\|VIDEO\|>` placeholder) + audio (16 kHz mono, `<\|AUDIO\|>` placeholder) — independent multimodal items, no `use_audio_in_video` alignment |
 | GPUs | 8 x 1 node, Megatron backend |
 | Learning rate | 1e-6 |
 | KL penalty | 0.01 |
@@ -56,20 +56,34 @@ In-training validation uses IntentBench as the validation set, so `val_period`, 
 
 This guide ships as a starting point for audio+video GRPO on IntentTrain/IntentBench. The recipe does not commit to a particular IntentBench accuracy target — IntentBench's evaluation methodology and any published numerical comparison are out of scope for this recipe. Use the validation reward and answer-correctness reward signal in the wandb / tensorboard logs to track training progress.
 
-The smoke configuration that v1 was developed against:
+The smoke configuration that v1 was actually exercised against (4 H100 80GB GPUs, single node):
 
 ```
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+PYTORCH_ALLOC_CONF=expandable_segments:True \
 uv run examples/run_vlm_grpo.py \
   --config examples/configs/intent_grpo_3B_megatron.yaml \
   grpo.max_num_steps=2 grpo.max_val_samples=4 grpo.val_batch_size=4 \
   grpo.val_at_start=true \
   grpo.num_prompts_per_step=4 grpo.num_generations_per_prompt=1 \
   policy.train_global_batch_size=4 policy.train_micro_batch_size=1 \
-  policy.generation_batch_size=4 policy.logprob_batch_size=2 \
+  policy.generation_batch_size=4 policy.logprob_batch_size=1 \
+  policy.tokenizer.video.num_frames=4 \
+  policy.max_total_sequence_length=4096 \
+  policy.megatron_cfg.activation_checkpointing=true \
+  policy.generation.vllm_cfg.gpu_memory_utilization=0.5 \
   checkpointing.save_period=1 cluster.gpus_per_node=4
 ```
 
-Note: `HF_HUB_OFFLINE=1` is recommended once `Qwen/Qwen2.5-Omni-3B`, `PhilipC/IntentTrain`, and `PhilipC/IntentBench` have been pre-fetched — Megatron's tokenizer worker otherwise hits `AutoTokenizer.from_pretrained(...)` over the network and can fail with read timeouts on flaky links.
+This run reached `val_at_start` validation (4 samples through the IntentBench dataset, accuracy logged), produced a step-1 and step-2 GRPO training step + checkpoint at `results/intent_grpo_3B_megatron/step_2/policy/weights/iter_0000000`, and Megatron-to-HF conversion at `results/intent_grpo_3B_megatron/step_2/hf/` succeeded with "All tensors from the original checkpoint were written." Both modalities reached the model on the rollout path: a runtime probe of `format_prompt_for_vllm_generation` confirms `multi_modal_data` keys = `['audio', 'video']`, video tensor shape `(num_frames, H, W, 3)`, audio tuple `(np.ndarray, 16000)`, with `mm_processor_kwargs` absent and the rendered prompt containing both `<|VIDEO|>` and `<|AUDIO|>` placeholders.
 
-If `loss_multiplier` is logged at 0 for many samples, the multimodal prompt is exceeding `policy.max_total_sequence_length` (default 8192 in this recipe) and the truncation branch in `vlm_hf_data_processor` is masking those samples out. Bump `max_total_sequence_length` until validation samples consistently produce non-zero loss.
+Notes on the smoke overrides:
+
+- `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1`: required once `Qwen/Qwen2.5-Omni-3B`, `PhilipC/IntentTrain`, and `PhilipC/IntentBench` are pre-fetched. Without this, Megatron's tokenizer worker calls `AutoTokenizer.from_pretrained(...)` over the network and can fail with `ValueError: Unable to instantiate HuggingFace AutoTokenizer for Qwen/Qwen2.5-Omni-3B. Exception: The read operation timed out` on flaky links.
+- `policy.tokenizer.video.num_frames=4` + `policy.max_total_sequence_length=4096`: the YAML default of 16 frames + 8192-token budget OOMs at training-time forward on a 79 GB H100 because vLLM keeps a few GB resident even after sleep mode and the multimodal forward needs another ~70+ GB of activations. 4 frames + activation checkpointing fits comfortably; bump them back up only after profiling.
+- `policy.megatron_cfg.activation_checkpointing=true`: required to keep the Megatron forward pass under the resident-memory budget that vLLM leaves available.
+- `policy.generation.vllm_cfg.gpu_memory_utilization=0.5`: caps vLLM's KV cache so more GPU memory stays free for Megatron training. Smoke runs only roll out a few samples so the cache budget is not the bottleneck.
+- `policy.train_global_batch_size` must be divisible by `policy.train_micro_batch_size * data_parallel_size`; with `cluster.gpus_per_node=4` and `train_micro_batch_size=1`, the smallest viable global batch is 4. With 8 GPUs use `train_global_batch_size=8` and `num_prompts_per_step * num_generations_per_prompt = 8`.
+- `policy.logprob_batch_size=1` matches the per-DP-rank slice when the global batch is 4 over 4 ranks; using the YAML default of `logprob_batch_size=4` (as set by the audio recipe) trips Megatron's "Data dict size (1) is not a multiple of the provided microbatch size" assertion at logprob time.
+
+If `loss_multiplier` is logged at 0 for many samples, the multimodal prompt is exceeding `policy.max_total_sequence_length` and the truncation branch in `vlm_hf_data_processor` is masking those samples out. Bump `max_total_sequence_length` until validation samples consistently produce non-zero loss.
