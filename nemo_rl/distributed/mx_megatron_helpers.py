@@ -444,16 +444,32 @@ def collect_megatron_publish_set(
             # weight-refit material.
             continue
 
-        # `model.named_parameters()` returns names with a `module.` prefix when
-        # the model is wrapped (DDP-style). Bridge's `get_conversion_tasks`
-        # returns names without the prefix, so strip it here so the per-tensor
-        # name in the catalog matches the name used as the sidecar `name_map`
-        # key. (Validated on Qwen3-4B-Thinking on the GB200 trainer pod,
-        # 2026-06-08.)
-        name = raw_name[len("module."):] if raw_name.startswith("module.") else raw_name
+        # `model.named_parameters()` returns names with a `module.` prefix
+        # when the model is wrapped (DDP-style). Two distinct uses of the
+        # name:
+        #
+        # 1. The model-walking classifier needs the ORIGINAL prefixed
+        #    name to descend through `model.module.decoder.layers...` —
+        #    stripping the prefix breaks `_enclosing_module` and every
+        #    non-expert tensor falls to ROLE_REPLICATED.
+        # 2. The PUBLISHED name on the catalog has to match Bridge's
+        #    name_map (which uses unprefixed names from
+        #    `get_conversion_tasks`) so the receiver's name-map lookup
+        #    finds the HF target names.
+        #
+        # Classify with `raw_name`; publish with the stripped form.
+        # (Bug surfaced on Qwen3-MoE-30B-A3B on 2026-06-10: the
+        # previous version stripped before classification and the
+        # receiver saw only `expert_column` / `replicated` because
+        # every TP-sharded role fell through to the default.)
+        name = (
+            raw_name[len("module."):]
+            if raw_name.startswith("module.")
+            else raw_name
+        )
 
         spec = detect_megatron_role(
-            name, param, model=model,
+            raw_name, param, model=model,
             tp_size=tp_size, ep_size=ep_size, ep_rank=ep_rank,
             num_attention_heads=num_attention_heads,
             num_kv_heads=num_kv_heads, head_dim=head_dim,
