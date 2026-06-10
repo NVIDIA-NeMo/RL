@@ -343,6 +343,11 @@ async def _run_env_eval_impl(
                     multi_modal_data["image"] = (
                         images[i][0] if len(images[i]) == 1 else images[i]
                     )
+                videos = batch.get("vllm_videos", None)
+                if videos is not None and len(videos[i]) > 0:
+                    multi_modal_data["video"] = (
+                        videos[i][0] if len(videos[i]) == 1 else videos[i]
+                    )
                 if multi_modal_data:
                     prompt_dict["multi_modal_data"] = multi_modal_data
                 prompts.append(prompt_dict)

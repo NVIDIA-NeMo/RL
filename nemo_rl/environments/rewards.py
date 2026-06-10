@@ -85,6 +85,25 @@ def exact_answer_alphanumeric_reward(
     return 0.0, False
 
 
+def exact_answer_alphanumeric_with_fallback_reward(
+    ground_truth: str, response: str, answer_tag: str = "answer"
+) -> tuple[float, bool]:
+    """Like ``exact_answer_alphanumeric_reward``, but with a no-tag fallback.
+
+    If the response has no <{answer_tag}> tags, fall back to comparing the
+    entire response. Mirrors HumanOmniV2 eval semantics: if the model emits
+    a bare answer without wrapping it in tags, treat the whole output as the
+    answer instead of judging it as missing.
+    """
+    match = re.search(rf"<{answer_tag}>([\s\S]*)</{answer_tag}>", response)
+    answer = match.group(1) if match else response
+    answer_clean = "".join(c for c in answer if c.isalnum()).lower()
+    ground_truth_clean = "".join(c for c in ground_truth if c.isalnum()).lower()
+    if answer_clean == ground_truth_clean:
+        return 1.0, True
+    return 0.0, False
+
+
 def bbox_giou_reward(
     ground_truth: str,
     response: str,

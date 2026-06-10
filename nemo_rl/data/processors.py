@@ -461,6 +461,7 @@ def vlm_hf_data_processor(
     from nemo_rl.data.multimodal_utils import (
         PackedTensor,
         get_dim_to_pack_along,
+        get_multimodal_default_settings_from_processor,
         get_multimodal_keys_from_processor,
         resolve_to_image,
     )
@@ -478,6 +479,8 @@ def vlm_hf_data_processor(
         pass  # AudioMCQ data is already formatted by AudioMCQDataset.format_data
     elif datum_dict["task_name"] == "mmau":
         pass  # MMAU data is already formatted by MMAUDataset.format_data
+    elif datum_dict["task_name"] == "daily-omni":
+        pass  # Daily-Omni data is already formatted by DailyOmniDataset.format_data
     else:
         raise ValueError(f"No data processor for task {datum_dict['task_name']}")
 
@@ -493,6 +496,8 @@ def vlm_hf_data_processor(
     #
     images = []
     audios = []
+    videos = []
+    load_video_kwargs: dict[str, Any] = {}
     if isinstance(problem, list):
         for content in problem:
             # for image, video, audio, just append it
@@ -515,6 +520,21 @@ def vlm_hf_data_processor(
                 audios.append(
                     (content["audio"], processor.feature_extractor.sampling_rate)
                 )
+            elif content["type"] == "video":
+                from transformers.video_utils import load_video
+
+                if not load_video_kwargs:
+                    load_video_kwargs = get_multimodal_default_settings_from_processor(
+                        processor
+                    ).get("video", {})
+                video_value = content["video"]
+                if isinstance(video_value, str):
+                    video_value = load_video(
+                        video_value, backend="decord", **load_video_kwargs
+                    )[0]
+                # Replace path with loaded frames so apply_chat_template can consume it
+                user_message["content"].append({"type": "video", "video": video_value})
+                videos.append(video_value)
             else:
                 raise ValueError(f"Unsupported content type: {content['type']}")
     else:
@@ -576,6 +596,7 @@ def vlm_hf_data_processor(
             "vllm_content": None,
             "vllm_images": [],
             "vllm_audios": [],
+            "vllm_videos": [],
         }
 
         # make smaller and mask out
@@ -593,6 +614,7 @@ def vlm_hf_data_processor(
             "vllm_content": string_formatted_dialog,
             "vllm_images": images,
             "vllm_audios": audios,
+            "vllm_videos": videos,
         }
 
     output: DatumSpec = {

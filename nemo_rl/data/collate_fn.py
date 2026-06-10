@@ -132,6 +132,9 @@ def eval_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
         extra_args["vllm_audios"] = [
             datum_spec.get("vllm_audios", []) for datum_spec in data_batch
         ]
+        extra_args["vllm_videos"] = [
+            datum_spec.get("vllm_videos", []) for datum_spec in data_batch
+        ]
 
     output: BatchedDataDict[Any] = BatchedDataDict(
         message_log=message_log,

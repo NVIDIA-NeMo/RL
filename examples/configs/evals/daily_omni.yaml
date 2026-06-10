@@ -1,0 +1,63 @@
+eval:
+  metric: "pass@k"
+  num_tests_per_prompt: 1
+  seed: 42
+  k_value: 1
+  save_path: results/daily_omni_decode.json
+
+generation:
+  backend: "vllm"
+  max_new_tokens: 2048
+  temperature: 0.0
+  top_p: 1.0
+  top_k: -1
+  num_prompts_per_step: -1
+  model_name: "Qwen/Qwen2.5-Omni-3B"
+  stop_token_ids: null
+  stop_strings: null
+  vllm_cfg:
+    async_engine: false
+    precision: "bfloat16"
+    tensor_parallel_size: 1
+    pipeline_parallel_size: 1
+    expert_parallel_size: 1
+    gpu_memory_utilization: 0.9
+    max_model_len: 16000
+    enforce_eager: False
+    skip_tokenizer_init: False
+    limit_mm_per_prompt:
+      video: 1
+  vllm_kwargs:
+    # Disable mm processor cache to avoid vLLM cache eviction during eval.
+    mm_processor_cache_gb: 0
+  colocated:
+    enabled: true
+    resources:
+      gpus_per_node: null
+      num_nodes: null
+
+tokenizer:
+  name: ${generation.model_name}
+  chat_template: "default"
+  chat_template_kwargs: null
+  video:
+    num_frames: 16
+
+data:
+  max_input_seq_length: ${generation.vllm_cfg.max_model_len}
+  prompt_file: examples/prompts/daily_omni.txt
+  system_prompt_file: null
+  dataset_name: "daily-omni"
+  split: "train"
+  env_name: vlm
+
+env:
+  vlm:
+    num_workers: 8
+    reward_functions:
+    - name: exact_alnum_with_fallback
+      weight: 1.0
+
+cluster:
+  gpus_per_node: 1
+  num_nodes: 1
