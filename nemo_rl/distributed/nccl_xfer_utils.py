@@ -668,7 +668,7 @@ def build_nccl_xfer_refit_info(
     does the EP all-gather) and DTensor doesn't use EP at all.
 
     Args:
-        state_dict_metadata: ``{param_name: {"shape": list, "dtype": str}}``
+        state_dict_metadata: ``{hf_param_name: {"shape": list, "dtype": str}}``
         train_parallelism / gen_parallelism: ``{"tp_size", "ep_size", "pp_size"}``
         train_world_size / gen_world_size: number of GPUs per side
         layer_to_pp_stage: optional mapping from layer name to PP stage index.
@@ -696,7 +696,11 @@ def build_nccl_xfer_refit_info(
     pp_size = train_parallelism.get("pp_size", 1)
     tp_size = train_parallelism.get("tp_size", 1)
     ep_size = train_parallelism.get("ep_size", 1)
-    use_per_stage = layer_to_pp_stage is not None and pp_size > 1
+    use_per_stage = pp_size > 1
+    if use_per_stage:
+        assert layer_to_pp_stage is not None, (
+            "layer_to_pp_stage must be provided when pp_size > 1"
+        )
 
     # Megatron-Core with ETP=1 gives non-expert and expert params *different*
     # rank-to-coord layouts on the same physical ranks: for non-expert params,

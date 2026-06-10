@@ -1174,15 +1174,18 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             ).reshape(1)
             yield param_name, scale_tensor
 
-    def _iter_local_hf_params(self) -> Iterator[tuple[str, torch.Tensor]]:
+    def _iter_local_hf_param_shards(self) -> Iterator[tuple[str, torch.Tensor]]:
         """Yield (hf_name, local_tp_shard) for locally owned params.
 
         Unlike ``_iter_params_with_optional_kv_scales`` which does PP broadcast
         + TP gather via ``export_hf_weights``, this method yields TP-local
         shards directly from Megatron parameters — no collectives needed.
 
+        Regarding the EP case, the self.refit_conversion_tasks already contains
+        the local expert weights only.
+
         Compound mappings (QKV, GatedMLP) are split into individual HF params
-        on the TP-local shard.  The returned tensors are views of the model
+        on the TP-local shard. The returned tensors are views of the model
         parameters and must not be modified in-place.
         """
         from types import SimpleNamespace
@@ -1195,51 +1198,23 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
 
         config = self.megatron_bridge.transformer_config
 
+        # non-local expert weights are not included in the refit_conversion_tasks
         for task in self.refit_conversion_tasks:
-            if task.param_weight is None:
-                continue  # Non-local PP rank
-
+            # task.param_weight is the local tensor of the megatron model
             local_tensor = task.param_weight
 
-            # FP8 blockwise scale_inv tasks ship as siblings of their weight
-            # tasks. Bridge wraps the base mapping in `_HFNameSuffixMapping`
-            # which delegates `.hf_param` to the base — for compound mappings
-            # the scale tensor must be split the same way the weight is, then
-            # each piece gets the `_scale_inv` suffix on the HF name.
+            if local_tensor is None:
+                continue  # Non-local PP rank
+
+            # refit_conversion_tasks is the FULL Bridge task list (for FP8,
+            # build_export_fp8_tasks emits a weight + _scale_inv pair per param);
+            # it is NOT pre-filtered by is_misc_param.  The misc routing happens
+            # downstream — is_misc_param sends _scale_inv into misc_meta and
+            # _misc_conversion_tasks (a derived subset), not by pruning this list.
+            # So we DO see _scale_inv tasks here on FP8 runs; skip them because
+            # their bulk _param_map entry would never be read (the bulk transfer
+            # iterates state_dict_metadata, which excludes them).
             if task.global_param_name.endswith("_scale_inv"):
-                hf_param = task.mapping.hf_param
-                if isinstance(hf_param, dict):
-                    base = task.mapping._base_mapping
-                    if isinstance(base, QKVMapping):
-                        # QKV scale: split along dim 0 by head structure.
-                        # split_qkv_weights auto-detects FP8 scale tensors via
-                        # the trailing-dim block divisor (see Bridge code).
-                        tp_size = base.tp_size
-                        local_config = SimpleNamespace(
-                            num_attention_heads=config.num_attention_heads // tp_size,
-                            num_query_groups=config.num_query_groups // tp_size,
-                            kv_channels=config.kv_channels,
-                            hidden_size=config.hidden_size,
-                            attention_output_gate=getattr(
-                                config, "attention_output_gate", False
-                            ),
-                        )
-                        q_s, k_s, v_s = split_qkv_weights(local_config, local_tensor)
-                        yield hf_param["q"] + "_scale_inv", q_s
-                        yield hf_param["k"] + "_scale_inv", k_s
-                        yield hf_param["v"] + "_scale_inv", v_s
-                    elif isinstance(base, GatedMLPMapping):
-                        # linear_fc1 scale: rows are [gate_scale; up_scale]
-                        gate_s, up_s = torch.chunk(local_tensor, 2, dim=0)
-                        yield hf_param["gate"] + "_scale_inv", gate_s
-                        yield hf_param["up"] + "_scale_inv", up_s
-                    else:
-                        raise NotImplementedError(
-                            f"FP8 scale_inv not yet supported for compound "
-                            f"mapping: {type(base).__name__}"
-                        )
-                else:
-                    yield str(hf_param) + "_scale_inv", local_tensor
                 continue
 
             hf_param = task.mapping.hf_param
@@ -1247,15 +1222,8 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             if isinstance(hf_param, dict):
                 if isinstance(task.mapping, QKVMapping):
                     # Split interleaved QKV into separate Q, K, V on TP-local shard.
-                    # split_qkv_weights works on local shards with adjusted head counts
-                    # since heads_per_group = num_heads/num_query_groups stays constant.
-                    # This requires train TP <= num_query_groups (KV heads).  When
-                    # tp_size > num_query_groups, Megatron channel-splits the KV heads
-                    # (each rank holds a fraction of a KV head, not a whole one), which
-                    # this whole-head reshape cannot represent — so QKV is routed to the
-                    # misc/load_weights path in prepare_nccl_xfer_refit_info (which
-                    # gathers full heads via export_hf_weights).  Skip it here so the
-                    # bulk path doesn't attempt the impossible per-rank split.
+                    # When tp_size > num_query_groups, we route the QKV to the misc path
+                    # in prepare_nccl_xfer_refit_info since there is too much complication there
                     tp_size = task.mapping.tp_size
                     if config.num_query_groups < tp_size:
                         continue
@@ -1427,9 +1395,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         """
         from nemo_rl.distributed.nccl_xfer_utils import build_nccl_xfer_refit_info
 
-        # Ensure refit_param_info_mcore is computed (needed by _iter_params_with_optional_kv_scales)
-        if self.refit_conversion_tasks is None:
-            self.refit_param_info_mcore = self._calculate_refit_param_info()
+        self.refit_param_info_mcore = self._calculate_refit_param_info()
 
         # Single pass over Bridge's stream: classify each param as bulk
         # (xferdtensor) or misc (load_weights), preserve yield order so
@@ -1450,13 +1416,14 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
 
         state_dict_metadata = {}
         misc_meta = OrderedDict()
+
+        # iterates all the params to construct the state_dict_metadata
+        # state_dict_metadata[hf_name] -> [shape, dtype]
+        # At the same time, filter the params to the misc subset (see is_misc_param).
+        # misc_meta[hf_name] -> [shape, dtype]
         with _meta_tensor_alloc_context():
             for name, tensor in self._iter_params_with_optional_kv_scales():
                 meta = {
-                    # tensor.dtype is honest about per-entry dtype: model
-                    # weights use self.dtype (bf16/fp16), FP8 blockwise
-                    # weight_scale_inv siblings yielded by the iterator are
-                    # float32.
                     "shape": list(tensor.shape),
                     "dtype": str(tensor.dtype),
                 }
@@ -1482,29 +1449,23 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             layer_to_pp_stage=layer_to_pp_stage,
             # Backend-specific MoE-expert fusion from the gen backend (via the
             # driver); the builder applies it without knowing the gen backend.
+            # e.g., for vllm, it is vllm_fuse_expert_params_in_metadata
             fuse_expert_param_in_metadata_fn=fuse_expert_param_in_metadata_fn,
         )
-
-        # _param_map is a Dict[hf_name:str] -> local_tensor:Torch.Tensor
+        # _param_map is a dictionary that holds the pointer to the real local tensor
+        # _param_map[hf_name:str] -> [local_tensor:Torch.Tensor]
         self._param_map = {
-            name: tensor for name, tensor in self._iter_local_hf_params()
+            name: tensor for name, tensor in self._iter_local_hf_param_shards()
         }
         # _expert_groups is a
         # Dict[(hf_layer_name.layer_id.expert:str, expert_param_susfix:str)]
         # -> List[(expert_id:int, hf_param_name:str)]
         self._expert_groups = self._build_expert_groups()
 
-        # Misc params are using packed_broadcast path as the same as the
-        # nccl_xfer_refit=False path, which is using per-backend weight
-        # loading functions (e.g., vllm.load_weights) to handle the complexity
+        # Misc params are using packed_broadcast path to handle the complexity
+        # misc_meta[hf_name] -> [shape, dtype]
         self.nccl_xfer_refit_info["misc_meta"] = misc_meta
-        # Filter conversion_tasks to the misc subset (see is_misc_param).
-        # is_misc_param runs on the Megatron global_param_name here; Bridge
-        # preserves the classifying suffixes through megatron_to_hf, so it
-        # agrees with the metadata (HF-name) split above.  qkv_to_misc adds the
-        # fused QKV tasks (self_attention.linear_qkv) to the misc subset so the
-        # broadcast path exports them via export_hf_weights (full TP gather ->
-        # whole-head split) instead of the impossible per-rank split.
+        # Filter conversion_tasks to the misc subset.
         self._misc_conversion_tasks = [
             task
             for task in self.refit_conversion_tasks
