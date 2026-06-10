@@ -15,7 +15,7 @@ checkpointing:
   enabled: false
   checkpoint_dir: results/grpo-qwen3-8b-2n4g-megatron-trtllm-async-1off
 policy:
-  model_name: Qwen/Qwen3-8B-Base
+  model_name: /lustre/fsw/coreai_comparch_trtllm/erinh/llm-models/Qwen3/Qwen3-8B-Base
   train_micro_batch_size: 4
   logprob_batch_size: 4
   max_total_sequence_length: 8192
@@ -76,7 +76,7 @@ logger:
   log_dir: logs/grpo-qwen3-8b-2n4g-megatron-trtllm-async-1off
   wandb_enabled: true
   wandb:
-    project: nemorl-trtllm-run
+    project: nemorl-grpo-dev-erinh
     name: grpo-qwen3-8b-2n4g-megatron-trtllm-async-1off-overlap-with-seq-dump
 cluster:
   gpus_per_node: 4
