@@ -1,0 +1,56 @@
+defaults: ../../grpo_math_1B.yaml
+
+grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 8
+
+checkpointing:
+  checkpoint_dir: results/grpo-nemotron3-super-120BA12B-8n8g-megatron
+
+policy:
+  model_name: "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
+  tokenizer:
+    name: "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
+  train_global_batch_size: 16
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  logprob_chunk_size: 2048
+  max_total_sequence_length: 8192
+  # Divisible by TP=4; use 8 for SP-alignment safety
+  make_sequence_length_divisible_by: 8
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    # Production uses TP=4/CP=8/EP=8; nightly drops CP to 1 (seqlen=8192 vs 65536)
+    # World size = TP(4) x PP(1) x CP(1) x DP(16) = 128 GPUs = 8 nodes; EP(8) <= DP(16) ✓
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    expert_model_parallel_size: 8
+    sequence_parallel: true
+    activation_checkpointing: true
+    bias_activation_fusion: false       # Required for this model family
+    moe_router_dtype: "fp32"            # Production value; base default is "fp64"
+    moe_router_load_balancing_type: "none"
+    moe_router_bias_update_rate: 1.0e-3 # Production value; base default is 0.0
+    moe_router_enable_expert_bias: true
+    moe_permute_fusion: true
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "alltoall"
+  generation:
+    vllm_cfg:
+      # TP=8 required: 120B BF16 / 8 = 30 GB/GPU; gpu_memory_utilization=0.5 → 40 GB/GPU for vLLM
+      tensor_parallel_size: 8
+      gpu_memory_utilization: 0.5
+
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-nemotron3-super-120BA12B-8n8g-megatron
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 8
