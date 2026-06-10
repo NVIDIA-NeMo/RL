@@ -971,7 +971,7 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             traceback.print_exc()
             return False
 
-    def init_pp_comm_groups(
+    def init_per_pp_refit_comm_group(
         self,
         rank_prefix: int,
         pp_ips: list[str],
@@ -982,7 +982,7 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
     ) -> None:
         """Forward per-PP-stage comm group init to vLLM backend workers."""
         self.llm.collective_rpc(
-            "init_pp_comm_groups",
+            "init_per_pp_refit_comm_group",
             args=(
                 rank_prefix,
                 pp_ips,
@@ -993,28 +993,26 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             ),
         )
 
-    def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
+    def prepare_nccl_xfer_refit_info(self, refit_info: dict) -> None:
         """Forward refit info to vLLM backend workers."""
-        self.llm.collective_rpc("prepare_nccl_reshard_refit_info", args=(refit_info,))
+        self.llm.collective_rpc("prepare_nccl_xfer_refit_info", args=(refit_info,))
 
-    def nccl_reshard_refit(self) -> bool:
-        """Receive weights from training workers via nccl_reshard (xferdtensor)."""
+    def nccl_xfer_refit(self) -> bool:
+        """Receive weights from training workers via nccl_xfer (xferdtensor)."""
         try:
             assert self.llm is not None, (
                 "Attempting to update weights with either an uninitialized vLLM or non-model-owner"
             )
 
-            result_or_coro = self.llm.collective_rpc("nccl_reshard_refit", args=tuple())
+            result_or_coro = self.llm.collective_rpc("nccl_xfer_refit", args=tuple())
             worker_result = result_or_coro[0]
 
             if not worker_result:
-                print(
-                    f"Error: Worker failed nccl_reshard_refit. Result: {worker_result}"
-                )
+                print(f"Error: Worker failed nccl_xfer_refit. Result: {worker_result}")
                 return False
             return True
         except Exception as e:
-            print(f"Exception during nccl_reshard_refit: {e}")
+            print(f"Exception during nccl_xfer_refit: {e}")
             import traceback
 
             traceback.print_exc()

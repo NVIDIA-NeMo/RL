@@ -72,7 +72,7 @@ class VllmInternalWorkerExtension:
         )
         self.model_update_group.init_nccl_communicator(device=self.device)
 
-    def init_pp_comm_groups(
+    def init_per_pp_refit_comm_group(
         self,
         rank_prefix: int,
         pp_ips: list[str],
@@ -81,7 +81,7 @@ class VllmInternalWorkerExtension:
         train_ranks_per_stage: int,
         sub_world_size: int,
     ) -> None:
-        """Initialize per-PP-stage communication groups for nccl_reshard refit.
+        """Initialize per-PP-stage communication groups for nccl_xfer refit.
 
         Gen workers join ALL ``pp_size`` groups sequentially (they need all
         layers).  Groups are created in order stage 0, 1, … so that train
@@ -352,21 +352,21 @@ class VllmInternalWorkerExtension:
 
         return True
 
-    def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
+    def prepare_nccl_xfer_refit_info(self, refit_info: dict) -> None:
         """Restore per-layer param metadata and build the HF→vLLM mapping.
 
         Done once ahead of refit; the cached mapping is reused by every
-        ``nccl_reshard_refit`` call.
+        ``nccl_xfer_refit`` call.
         """
-        from nemo_rl.distributed.nccl_reshard_utils import (
+        from nemo_rl.distributed.nccl_xfer_utils import (
             restore_refit_info_placements,
         )
 
-        self.nccl_reshard_refit_info = (  # pyrefly: ignore[implicitly-defined-attribute]
+        self.nccl_xfer_refit_info = (  # pyrefly: ignore[implicitly-defined-attribute]
             restore_refit_info_placements(refit_info)
         )
         self._hf_to_vllm = self._build_hf_to_vllm_mapping(  # pyrefly: ignore[implicitly-defined-attribute]
-            self.nccl_reshard_refit_info
+            self.nccl_xfer_refit_info
         )
 
     def _build_hf_to_vllm_mapping(self, refit_info):
@@ -423,22 +423,9 @@ class VllmInternalWorkerExtension:
                 ["q_a_proj.weight", "kv_a_proj_with_mqa.weight"],
                 "fused_qkv_a_proj.weight",
             ),
-            # FP8 blockwise scale siblings (paired with the weights above).
-            # vLLM-FP8 stores `<vllm_name>.weight_scale_inv` next to the FP8
-            # weight, with shape `[output//block, input//block]`. The same
-            # column-parallel TP slicing applies to dim 0.
-            (
-                [
-                    "q_proj.weight_scale_inv",
-                    "k_proj.weight_scale_inv",
-                    "v_proj.weight_scale_inv",
-                ],
-                "qkv_proj.weight_scale_inv",
-            ),
-            (
-                ["gate_proj.weight_scale_inv", "up_proj.weight_scale_inv"],
-                "gate_up_proj.weight_scale_inv",
-            ),
+            # NB: FP8 ``*.weight_scale_inv`` siblings are NOT merged here — every
+            # ``_scale_inv`` takes the misc/load_weights path (is_misc_param), so
+            # they never reach this bulk mapping and need no merge rule.
         ]
 
         for hf_name in hf_shapes:
@@ -478,7 +465,7 @@ class VllmInternalWorkerExtension:
                             # Use the gen TP size from refit_info, NOT
                             # torch.distributed.get_world_size(): the latter is the vLLM
                             # worker's default-group size, which equals TP only because
-                            # gen PP/EP are pinned to 1 (check_nccl_reshard_refit_support).
+                            # gen PP/EP are pinned to 1 (check_nccl_xfer_refit_support).
                             # Reading gen_tp_size stays correct if gen PP is ever added.
                             tp_size = refit_info.get("gen_tp_size", 1)
                             naive_local_sizes = [gs // tp_size for gs in global_sizes]
@@ -549,7 +536,7 @@ class VllmInternalWorkerExtension:
            joins the collective (train broadcasts every bulk param; a missing
            participant would deadlock the broadcast). The bytes are discarded.
 
-        Must be called after ``_hf_to_vllm`` is populated (inside ``nccl_reshard_refit``).
+        Must be called after ``_hf_to_vllm`` is populated (inside ``nccl_xfer_refit``).
 
         Returns:
             ``(dst_tensor, dst_placements, post_refit_hook)`` where:
@@ -559,7 +546,7 @@ class VllmInternalWorkerExtension:
               (copies the TP-local slice from the temp buffer into the live
               vLLM merged param), or None for direct/unmapped params
         """
-        from nemo_rl.distributed.nccl_reshard_utils import _STR_TO_DTYPE
+        from nemo_rl.distributed.nccl_xfer_utils import _STR_TO_DTYPE
         from nemo_rl.distributed.xferdtensor import DTensorRef
 
         vllm_param, merged_param_slice = self._hf_to_vllm.get(param_name, (None, None))
@@ -609,22 +596,20 @@ class VllmInternalWorkerExtension:
         # in-place copy_ inside xferdtensor.
         return DTensorRef(vllm_param.data, global_shape), dst_placements, None
 
-    def nccl_reshard_refit(self) -> bool:
+    def nccl_xfer_refit(self) -> bool:
         """Receive weights from training workers via xferdtensor.
 
         Uses ``get_dst_dtensor`` to prepare each parameter, then calls the
         canonical 7-arg ``xferdtensor``. For merged params (qkv_proj,
         gate_up_proj), a post_refit_hook copies the TP-local slice. The
-        HF→vLLM mapping is built once in ``prepare_nccl_reshard_refit_info``.
+        HF→vLLM mapping is built once in ``prepare_nccl_xfer_refit_info``.
         """
         from nemo_rl.distributed.xferdtensor import xferdtensor
 
         use_per_stage = hasattr(self, "pp_comm_groups") and self.pp_comm_groups
 
-        for layer_name in self.nccl_reshard_refit_info["layer_names"]:
-            for param_info in self.nccl_reshard_refit_info["per_layer_params"][
-                layer_name
-            ]:
+        for layer_name in self.nccl_xfer_refit_info["layer_names"]:
+            for param_info in self.nccl_xfer_refit_info["per_layer_params"][layer_name]:
                 if use_per_stage:
                     group = self.pp_comm_groups[param_info["pp_stage"]]
                 else:
@@ -667,9 +652,9 @@ class VllmInternalWorkerExtension:
 
     def _receive_and_load_misc_params(self) -> None:
         """Receive misc params via packed_broadcast and load via vLLM."""
-        from nemo_rl.distributed.nccl_reshard_utils import _STR_TO_DTYPE
+        from nemo_rl.distributed.nccl_xfer_utils import _STR_TO_DTYPE
 
-        misc_meta = self.nccl_reshard_refit_info.get("misc_meta", {})
+        misc_meta = self.nccl_xfer_refit_info.get("misc_meta", {})
         if not misc_meta:
             return
 

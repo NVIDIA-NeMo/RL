@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Refit metadata builders and lightweight wrapper types for nccl_reshard.
+"""Refit metadata builders and lightweight wrapper types for nccl_xfer.
 
 This module provides:
 - MeshInfo: lightweight DeviceMesh-compatible wrapper that doesn't require a
   shared torch.distributed process group (needed for cross-world transfers)
 - Placement rules: mapping param names to TP/EP sharding strategies
-- build_nccl_reshard_refit_info: compute per-layer param metadata for refit
+- build_nccl_xfer_refit_info: compute per-layer param metadata for refit
 - restore_refit_info_placements: undo msgspec dict-flattening of placements
   and meshes on the receiving side
 
@@ -121,7 +121,7 @@ def get_tp_shard_dim(param_name: str) -> Optional[int]:
         if param_name.endswith(suffix):
             return 1
     for name in VOCAB_PARALLEL_NAMES:
-        if name in param_name:
+        if param_name.endswith(name):
             return 0
     return None
 
@@ -381,7 +381,7 @@ def vllm_fuse_expert_params_in_metadata(
 
     vLLM-specific: the ``w13_weight`` / ``w2_weight`` fused names and the
     gate+up concat layout are vLLM conventions.  This is passed into the
-    backend-agnostic ``build_nccl_reshard_refit_info`` as
+    backend-agnostic ``build_nccl_xfer_refit_info`` as
     ``fuse_expert_param_in_metadata_fn`` (a different gen backend would supply
     its own fusion); the builder itself never hardcodes a backend's rule.
 
@@ -498,8 +498,8 @@ def _extract_layer_name(param_name: str) -> str:
     return param_name.split(".")[0]
 
 
-def check_nccl_reshard_refit_support(master_config: dict) -> None:
-    """Validate ``master_config`` against every precondition of nccl_reshard_refit.
+def check_nccl_xfer_refit_support(master_config: dict) -> None:
+    """Validate ``master_config`` against every precondition of nccl_xfer_refit.
 
     Collects all violations and raises a single ``ValueError`` listing them, so
     a user fixing their config can address everything in one pass rather than
@@ -531,10 +531,10 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
     if generation.get("colocated", {}).get("enabled", False):
         violations.append(
             "policy.generation.colocated.enabled must be False "
-            "(nccl_reshard_refit is only for disaggregated train/gen)."
+            "(nccl_xfer_refit is only for disaggregated train/gen)."
         )
 
-    # Gen backend = vLLM — only backend with prepare_nccl_reshard_refit_info.
+    # Gen backend = vLLM — only backend with prepare_nccl_xfer_refit_info.
     backend = generation.get("backend")
     if backend != "vllm":
         violations.append(
@@ -606,7 +606,7 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
         if gen_precision not in (None, "auto", "bf16", "bfloat16", "fp8"):
             violations.append(
                 f"policy.generation.vllm_cfg.precision={gen_precision!r} is not "
-                "supported by nccl_reshard_refit (use 'bf16'/'bfloat16', 'fp8', "
+                "supported by nccl_xfer_refit (use 'bf16'/'bfloat16', 'fp8', "
                 "'auto', or leave unset); the refit byte-copies weights, so the "
                 "gen dtype must match the train dtype."
             )
@@ -646,12 +646,12 @@ def check_nccl_reshard_refit_support(master_config: dict) -> None:
 
     if violations:
         raise ValueError(
-            "nccl_reshard_refit cannot be enabled with the current config:\n"
+            "nccl_xfer_refit cannot be enabled with the current config:\n"
             + "\n".join(f"  - {v}" for v in violations)
         )
 
 
-def build_nccl_reshard_refit_info(
+def build_nccl_xfer_refit_info(
     state_dict_metadata: dict[str, dict[str, Any]],
     train_parallelism: dict[str, int],
     gen_parallelism: dict[str, int],
@@ -660,7 +660,7 @@ def build_nccl_reshard_refit_info(
     layer_to_pp_stage: Optional[dict[str, int]] = None,
     fuse_expert_param_in_metadata_fn: Optional[Callable] = None,
 ) -> dict[str, Any]:
-    """Build per-layer parameter info for nccl_reshard-based refit.
+    """Build per-layer parameter info for nccl_xfer-based refit.
 
     The input ``state_dict_metadata`` must be EP-gathered (enumerate every
     expert globally, not per-rank).  Both backends meet this naturally:

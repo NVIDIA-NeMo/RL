@@ -927,7 +927,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # this function should co-work with vllm, so we should wait for all futures to complete outside
         return futures
 
-    def init_pp_comm_groups(
+    def init_per_pp_refit_comm_group(
         self,
         pp_ips: list[str],
         pp_ports: list[int],
@@ -938,7 +938,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     ) -> list[ray.ObjectRef]:
         """Initialize per-PP-stage comm groups on all train workers."""
         futures = self.worker_group.run_all_workers_multiple_data(
-            "init_pp_comm_groups",
+            "init_per_pp_refit_comm_group",
             my_pp_stage=pp_stages,
             my_rank_in_group=ranks_in_group,
             common_kwargs={
@@ -950,7 +950,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         )
         return futures
 
-    def prepare_nccl_reshard_refit_info(
+    def prepare_nccl_xfer_refit_info(
         self,
         train_parallelism,
         gen_parallelism,
@@ -958,9 +958,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         gen_world_size,
         fuse_expert_param_in_metadata_fn=None,
     ):
-        """Prepare per-layer param metadata for nccl_reshard refit."""
+        """Prepare per-layer param metadata for nccl_xfer refit."""
         futures = self.worker_group.run_all_workers_single_data(
-            "prepare_nccl_reshard_refit_info",
+            "prepare_nccl_xfer_refit_info",
             train_parallelism=train_parallelism,
             gen_parallelism=gen_parallelism,
             train_world_size=train_world_size,
@@ -970,10 +970,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         results = ray.get(futures)
         return results[0]
 
-    def nccl_reshard_refit(self, kv_scales=None) -> list[ray.ObjectRef]:
-        """Transfer weights to gen workers via nccl_reshard (xferdtensor)."""
+    def nccl_xfer_refit(self, kv_scales=None) -> list[ray.ObjectRef]:
+        """Transfer weights to gen workers via nccl_xfer (xferdtensor)."""
         futures = self.worker_group.run_all_workers_single_data(
-            "nccl_reshard_refit",
+            "nccl_xfer_refit",
             kv_scales=kv_scales,
         )
         return futures

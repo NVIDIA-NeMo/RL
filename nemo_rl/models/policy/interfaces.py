@@ -206,10 +206,10 @@ class ColocatablePolicyInterface(PolicyInterface):
     ) -> list[ray.ObjectRef]:
         pass
 
-    def prepare_nccl_reshard_refit_info(self, *args, **kwargs):
+    def prepare_nccl_xfer_refit_info(self, *args, **kwargs):
         raise NotImplementedError
 
-    def nccl_reshard_refit(self, kv_scales=None) -> list[ray.ObjectRef]:
+    def nccl_xfer_refit(self, kv_scales=None) -> list[ray.ObjectRef]:
         raise NotImplementedError
 
     @abstractmethod

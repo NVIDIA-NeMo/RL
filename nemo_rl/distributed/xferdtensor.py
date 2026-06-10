@@ -22,7 +22,7 @@ by ``NRL_XFERDTENSOR_GOLDEN``, otherwise to the broadcast-based
 
 This file also holds the golden kernel's private helpers and the
 ``DTensorRef`` wrapper callers pass as the src/dst tensor.  The ``MeshInfo``
-mesh wrapper lives in ``nccl_reshard_utils.py`` alongside the refit metadata
+mesh wrapper lives in ``nccl_xfer_utils.py`` alongside the refit metadata
 builders; ``xferdtensor_golden`` reads it only via duck typing (``.mesh``), so
 this module needs no import from there.
 """
@@ -76,10 +76,6 @@ class DTensorRef:
         )
         self.dtype = dtype if dtype is not None else local_tensor.dtype
         self.device = device if device is not None else local_tensor.device
-
-    def local_tensor(self):
-        """Return the local shard / dst buffer this ref wraps."""
-        return self._local_tensor
 
 
 # ===========================================================
@@ -327,7 +323,7 @@ def xferdtensor_golden(
     region reconstructs the full tensor.
 
     This is the canonical 7-argument signature matching the real
-    ``nccl_reshard.XferDTensor`` API.  Callers must wrap raw tensors in
+    ``nccl.xfer.api.XdtensorRedistribute`` op.  Callers must wrap raw tensors in
     ``DTensorRef`` so that ``.shape`` reports the global shape and
     ``._local_tensor`` holds the local shard.
     """
@@ -398,9 +394,5 @@ def xferdtensor_golden(
         )
         resharded_local = full_tensor[tuple(shard_slices)]
         if dst_tensor is not None:
-            if hasattr(dst_tensor, "_local_tensor"):
-                dst_tensor._local_tensor.copy_(resharded_local)
-            else:
-                dst_tensor_local = dst_tensor.to_local()
-                dst_tensor_local.copy_(resharded_local)
+            dst_tensor._local_tensor.copy_(resharded_local)
     return

@@ -260,12 +260,12 @@ class GenerationInterface(ABC):
         """Update the model weights from collective communication."""
         raise NotImplementedError
 
-    def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
-        """Prepare per-layer param metadata for nccl_reshard-based refit."""
+    def prepare_nccl_xfer_refit_info(self, refit_info: dict) -> None:
+        """Prepare per-layer param metadata for nccl_xfer-based refit."""
         raise NotImplementedError
 
-    def nccl_reshard_refit(self) -> list[ray.ObjectRef]:
-        """Receive weights from training workers via nccl_reshard."""
+    def nccl_xfer_refit(self) -> list[ray.ObjectRef]:
+        """Receive weights from training workers via nccl_xfer."""
         raise NotImplementedError
 
     # Optional hook; backends may override to invalidate any reusable caches

@@ -356,4 +356,4 @@ class PolicyConfig(TypedDict):
     quant_sequence_length: NotRequired[int | None]
 
     # shard-to-shard refit for large models (experimental)
-    nccl_reshard_refit: NotRequired[bool]
+    nccl_xfer_refit: NotRequired[bool]

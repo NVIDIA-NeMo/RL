@@ -744,16 +744,16 @@ def setup(
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
 
     # prepare refit info
-    nccl_reshard_refit_enabled = policy_config.get("nccl_reshard_refit", False)
-    if nccl_reshard_refit_enabled:
-        from nemo_rl.distributed.nccl_reshard_utils import (
-            check_nccl_reshard_refit_support,
+    nccl_xfer_refit_enabled = policy_config.get("nccl_xfer_refit", False)
+    if nccl_xfer_refit_enabled:
+        from nemo_rl.distributed.nccl_xfer_utils import (
+            check_nccl_xfer_refit_support,
         )
 
-        check_nccl_reshard_refit_support(master_config)
-    if nccl_reshard_refit_enabled and not colocated_inference:
+        check_nccl_xfer_refit_support(master_config)
+    if nccl_xfer_refit_enabled and not colocated_inference:
         # Megatron train backend only — enforced by
-        # check_nccl_reshard_refit_support above (the DTensor train backend
+        # check_nccl_xfer_refit_support above (the DTensor train backend
         # refit path is not supported in this initial version).
         train_parallelism = {
             "tp_size": policy_config["megatron_cfg"].get(
@@ -804,7 +804,7 @@ def setup(
                 f"Per-PP-stage comm group IPs/ports: {list(zip(pp_ips, pp_ports))}",
                 flush=True,
             )
-            futures_train_pp = policy.init_pp_comm_groups(
+            futures_train_pp = policy.init_per_pp_refit_comm_group(
                 pp_ips=pp_ips,
                 pp_ports=pp_ports,
                 pp_size=pp_size,
@@ -812,7 +812,7 @@ def setup(
                 sub_world_size=sub_world_size,
                 ranks_in_group=ranks_in_group,
             )
-            futures_gen_pp = policy_generation.init_pp_comm_groups(
+            futures_gen_pp = policy_generation.init_per_pp_refit_comm_group(
                 pp_ips=pp_ips,
                 pp_ports=pp_ports,
                 pp_size=pp_size,
@@ -826,14 +826,14 @@ def setup(
         # staying backend-agnostic.  (KV-head replication is handled by routing
         # QKV to the misc path when num_query_groups < max(train_tp, gen_tp).)
         fuse_expert_param_in_metadata_fn = policy_generation.expert_fusion_fn()
-        nccl_reshard_refit_info = policy.prepare_nccl_reshard_refit_info(
+        nccl_xfer_refit_info = policy.prepare_nccl_xfer_refit_info(
             train_parallelism,
             gen_parallelism,
             train_world_size,
             inference_world_size,
             fuse_expert_param_in_metadata_fn=fuse_expert_param_in_metadata_fn,
         )
-        policy_generation.prepare_nccl_reshard_refit_info(nccl_reshard_refit_info)
+        policy_generation.prepare_nccl_xfer_refit_info(nccl_xfer_refit_info)
     else:
         state_dict_info = policy.prepare_refit_info()
         if policy_generation is not None:
@@ -1192,7 +1192,7 @@ def refit_policy_generation(
     _refit_buffer_size_gb: Optional[int] = None,
     timer: Optional[Timer] = None,
     kv_scales: Optional[dict[str, float]] = None,
-    nccl_reshard_refit: bool = False,
+    nccl_xfer_refit: bool = False,
 ) -> None:
     """Refit the policy generation interface with the latest policy weights.
 
@@ -1261,10 +1261,10 @@ def refit_policy_generation(
                 raise NotImplementedError(
                     "SGLang haven't implemented non-colocated inference mode. "
                 )
-            if nccl_reshard_refit:
-                # nccl_reshard path: per-parameter xferdtensor transfer
-                futures_train = policy.nccl_reshard_refit(kv_scales=kv_scales)
-                futures_inference = policy_generation.nccl_reshard_refit()
+            if nccl_xfer_refit:
+                # nccl_xfer path: per-parameter xferdtensor transfer
+                futures_train = policy.nccl_xfer_refit(kv_scales=kv_scales)
+                futures_inference = policy_generation.nccl_xfer_refit()
                 ray.get(futures_train)
                 results = ray.get(futures_inference)
                 update_success = all(result for result in results if result is not None)
@@ -1468,8 +1468,8 @@ def grpo_train(
     val_at_end = master_config["grpo"]["val_at_end"]
     val_period = master_config["grpo"]["val_period"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
-    nccl_reshard_refit_enabled = (
-        master_config["policy"].get("nccl_reshard_refit", False)
+    nccl_xfer_refit_enabled = (
+        master_config["policy"].get("nccl_xfer_refit", False)
         and not colocated_inference
     )
 
@@ -1487,7 +1487,7 @@ def grpo_train(
                 policy,
                 policy_generation,
                 colocated_inference,
-                nccl_reshard_refit=nccl_reshard_refit_enabled,
+                nccl_xfer_refit=nccl_xfer_refit_enabled,
             )
             POLICY_GENERATION_STALE = False
         else:
@@ -1604,7 +1604,7 @@ def grpo_train(
                             colocated_inference,
                             timer=timer,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
-                            nccl_reshard_refit=nccl_reshard_refit_enabled,
+                            nccl_xfer_refit=nccl_xfer_refit_enabled,
                         )
                         POLICY_GENERATION_STALE = False
                     else:
@@ -1958,7 +1958,7 @@ def grpo_train(
                             policy_generation,
                             colocated_inference,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
-                            nccl_reshard_refit=nccl_reshard_refit_enabled,
+                            nccl_xfer_refit=nccl_xfer_refit_enabled,
                         )
                         POLICY_GENERATION_STALE = False
                     else:
@@ -2554,8 +2554,8 @@ def async_grpo_train(
     val_at_start = master_config["grpo"]["val_at_start"]
     val_at_end = master_config["grpo"]["val_at_end"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
-    nccl_reshard_refit_enabled = (
-        master_config["policy"].get("nccl_reshard_refit", False)
+    nccl_xfer_refit_enabled = (
+        master_config["policy"].get("nccl_xfer_refit", False)
         and not colocated_inference
     )
 
@@ -2672,7 +2672,7 @@ def async_grpo_train(
                 policy,
                 policy_generation,
                 colocated_inference,
-                nccl_reshard_refit=nccl_reshard_refit_enabled,
+                nccl_xfer_refit=nccl_xfer_refit_enabled,
             )
             print("✅ Policy generation refit completed successfully", flush=True)
             POLICY_GENERATION_STALE = False
@@ -3003,7 +3003,7 @@ def async_grpo_train(
                             policy,
                             policy_generation,
                             colocated_inference,
-                            nccl_reshard_refit=nccl_reshard_refit_enabled,
+                            nccl_xfer_refit=nccl_xfer_refit_enabled,
                         )
                         POLICY_GENERATION_STALE = False
 
@@ -3032,7 +3032,7 @@ def async_grpo_train(
                             policy,
                             policy_generation,
                             colocated_inference,
-                            nccl_reshard_refit=nccl_reshard_refit_enabled,
+                            nccl_xfer_refit=nccl_xfer_refit_enabled,
                         )
                         POLICY_GENERATION_STALE = False
                     else:

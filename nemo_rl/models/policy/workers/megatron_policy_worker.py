@@ -1253,7 +1253,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                     # tp_size > num_query_groups, Megatron channel-splits the KV heads
                     # (each rank holds a fraction of a KV head, not a whole one), which
                     # this whole-head reshape cannot represent — so QKV is routed to the
-                    # misc/load_weights path in prepare_nccl_reshard_refit_info (which
+                    # misc/load_weights path in prepare_nccl_xfer_refit_info (which
                     # gathers full heads via export_hf_weights).  Skip it here so the
                     # bulk path doesn't attempt the impossible per-rank split.
                     tp_size = task.mapping.tp_size
@@ -1341,19 +1341,19 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         config = self.model.config
 
         assert getattr(config, "pipeline_model_parallel_layout", None) is None, (
-            "nccl_reshard_refit does not support custom pipeline_model_parallel_layout yet"
+            "nccl_xfer_refit does not support custom pipeline_model_parallel_layout yet"
         )
         assert getattr(config, "virtual_pipeline_model_parallel_size", None) in (
             None,
             1,
         ), (
-            "nccl_reshard_refit does not support virtual_pipeline_model_parallel_size > 1 yet"
+            "nccl_xfer_refit does not support virtual_pipeline_model_parallel_size > 1 yet"
         )
         assert not getattr(config, "account_for_embedding_in_pipeline_split", False), (
-            "nccl_reshard_refit does not support account_for_embedding_in_pipeline_split yet"
+            "nccl_xfer_refit does not support account_for_embedding_in_pipeline_split yet"
         )
         assert not getattr(config, "account_for_loss_in_pipeline_split", False), (
-            "nccl_reshard_refit does not support account_for_loss_in_pipeline_split yet"
+            "nccl_xfer_refit does not support account_for_loss_in_pipeline_split yet"
         )
 
         num_layers = config.num_layers
@@ -1389,7 +1389,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                 count = middle_per_stage
             for _ in range(count):
                 # Emit both HF naming conventions so the lookup in
-                # build_nccl_reshard_refit_info hits regardless of model family:
+                # build_nccl_xfer_refit_info hits regardless of model family:
                 # Llama/Qwen use ``model.layers.N``; NemotronH uses
                 # ``backbone.layers.N``.  Keys are looked up (not iterated), so
                 # the unused convention's extra keys are harmless.
@@ -1411,7 +1411,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         return layer_to_pp_stage
 
     @torch.no_grad()
-    def prepare_nccl_reshard_refit_info(
+    def prepare_nccl_xfer_refit_info(
         self,
         train_parallelism,
         gen_parallelism,
@@ -1419,13 +1419,13 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         gen_world_size,
         fuse_expert_param_in_metadata_fn=None,
     ):
-        """Prepare per-layer parameter metadata for nccl_reshard-based refit.
+        """Prepare per-layer parameter metadata for nccl_xfer-based refit.
 
         ``fuse_expert_param_in_metadata_fn`` is supplied by the driver (which
         queries the generation backend) and forwarded as-is — this train worker
         stays agnostic to the gen backend's MoE-fusion layout.
         """
-        from nemo_rl.distributed.nccl_reshard_utils import build_nccl_reshard_refit_info
+        from nemo_rl.distributed.nccl_xfer_utils import build_nccl_xfer_refit_info
 
         # Ensure refit_param_info_mcore is computed (needed by _iter_params_with_optional_kv_scales)
         if self.refit_conversion_tasks is None:
@@ -1434,7 +1434,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         # Single pass over Bridge's stream: classify each param as bulk
         # (xferdtensor) or misc (load_weights), preserve yield order so
         # producer/consumer agree on the packed-broadcast iteration.
-        from nemo_rl.distributed.nccl_reshard_utils import is_misc_param
+        from nemo_rl.distributed.nccl_xfer_utils import is_misc_param
 
         # Route QKV to the misc (packed_broadcast + load_weights) path whenever
         # KV heads can't be cleanly 1/tp-sharded on EITHER side: Megatron channel-
@@ -1473,7 +1473,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         )
 
         # The key metadata, which should shared with generation workers
-        self.nccl_reshard_refit_info = build_nccl_reshard_refit_info(
+        self.nccl_xfer_refit_info = build_nccl_xfer_refit_info(
             state_dict_metadata,
             train_parallelism,
             gen_parallelism,
@@ -1495,9 +1495,9 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         self._expert_groups = self._build_expert_groups()
 
         # Misc params are using packed_broadcast path as the same as the
-        # nccl_reshard_refit=False path, which is using per-backend weight
+        # nccl_xfer_refit=False path, which is using per-backend weight
         # loading functions (e.g., vllm.load_weights) to handle the complexity
-        self.nccl_reshard_refit_info["misc_meta"] = misc_meta
+        self.nccl_xfer_refit_info["misc_meta"] = misc_meta
         # Filter conversion_tasks to the misc subset (see is_misc_param).
         # is_misc_param runs on the Megatron global_param_name here; Bridge
         # preserves the classifying suffixes through megatron_to_hf, so it
@@ -1512,7 +1512,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             and is_misc_param(task.global_param_name, qkv_to_misc=qkv_to_misc)
         ]
 
-        return self.nccl_reshard_refit_info
+        return self.nccl_xfer_refit_info
 
     def _get_src_local_tensor(self, param_info, expert_groups, gen_tp_size):
         """Get the TP/EP-local source tensor for one param.
@@ -1559,7 +1559,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         order, so expert 0 must precede expert 1 to match the EP ``Shard(0)``
         layout the gen side expects.
         """
-        from nemo_rl.distributed.nccl_reshard_utils import _INDIVIDUAL_EXPERT_RE
+        from nemo_rl.distributed.nccl_xfer_utils import _INDIVIDUAL_EXPERT_RE
 
         groups: dict[tuple[str, str], list[tuple[int, str]]] = {}
         for name in self._param_map:
@@ -1679,7 +1679,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         )
 
     @torch.no_grad()
-    def nccl_reshard_refit(self, kv_scales=None):
+    def nccl_xfer_refit(self, kv_scales=None):
         """Transfer weights to generation workers via xferdtensor.
 
         Uses TP-local shards directly from Megatron parameters, bypassing
@@ -1690,21 +1690,19 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
 
         if kv_scales is not None:
             raise NotImplementedError(
-                "FP8 kvcache is not currently supported for nccl_reshard refit path."
+                "FP8 kvcache is not currently supported for nccl_xfer refit path."
             )
 
         from nemo_rl.distributed.xferdtensor import DTensorRef
 
         # _param_map and _expert_groups are built once in
-        # prepare_nccl_reshard_refit_info; weight values change but the
+        # prepare_nccl_xfer_refit_info; weight values change but the
         # name → view mapping is stable across refits.
-        gen_tp_size = self.nccl_reshard_refit_info.get("gen_tp_size", 1)
+        gen_tp_size = self.nccl_xfer_refit_info.get("gen_tp_size", 1)
         use_per_stage = hasattr(self, "pp_comm_group")
 
-        for layer_name in self.nccl_reshard_refit_info["layer_names"]:
-            for param_info in self.nccl_reshard_refit_info["per_layer_params"][
-                layer_name
-            ]:
+        for layer_name in self.nccl_xfer_refit_info["layer_names"]:
+            for param_info in self.nccl_xfer_refit_info["per_layer_params"][layer_name]:
                 if use_per_stage:
                     if param_info.get("pp_stage", 0) != self.my_pp_stage:
                         continue
@@ -1745,7 +1743,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         so Bridge skips TP/EP all-gather for bulk weights — only the
         relatively small misc subset is gathered + broadcast.
         """
-        misc_meta = self.nccl_reshard_refit_info.get("misc_meta", {})
+        misc_meta = self.nccl_xfer_refit_info.get("misc_meta", {})
         if not misc_meta:
             return
 

@@ -44,7 +44,7 @@ class AbstractPolicyWorker:
         device = torch.cuda.current_device()
         self.model_update_group.init_nccl_communicator(device=device)
 
-    def init_pp_comm_groups(
+    def init_per_pp_refit_comm_group(
         self,
         pp_ips: list[str],
         pp_ports: list[int],
@@ -53,7 +53,7 @@ class AbstractPolicyWorker:
         sub_world_size: int,
         my_rank_in_group: int,
     ) -> None:
-        """Initialize a per-PP-stage communication group for nccl_reshard refit.
+        """Initialize a per-PP-stage communication group for nccl_xfer refit.
 
         Each train worker creates exactly one group — for its own PP stage.
         ``pp_ips[my_pp_stage]`` and ``pp_ports[my_pp_stage]`` identify the
