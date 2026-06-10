@@ -578,6 +578,7 @@ class MegatronPolicyWorkerImpl(
             saved_extra_state = None
             reenable_forward_pre_hook_after_eval = False
 
+        torch.distributed.barrier()
         torch.cuda.synchronize()
         _train_t0 = time.perf_counter()
 
@@ -781,6 +782,7 @@ class MegatronPolicyWorkerImpl(
             # accumulation starts from a clean shared param/grad buffer.
             self._disable_forward_pre_hook_until_next_train_step()
 
+        torch.distributed.barrier()
         torch.cuda.synchronize()
         metrics_train_elapsed = time.perf_counter() - _train_t0
 
