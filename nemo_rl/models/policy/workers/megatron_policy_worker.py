@@ -325,9 +325,7 @@ class MegatronPolicyWorkerImpl(
         if not self._forward_pre_hook_enabled():
             return
         if param_sync:
-            self._copy_main_params_to_param_buffer(
-                zero_grad_buffer=True
-            )
+            self._copy_main_params_to_param_buffer(zero_grad_buffer=True)
         self.model.disable_forward_pre_hook(param_sync=param_sync)
 
     def _forward_pre_hook_enabled(self) -> bool:
@@ -344,9 +342,7 @@ class MegatronPolicyWorkerImpl(
         model_config.param_sync_func = None
         self._first_train_step_forward_pre_hook_disabled = True
 
-    def _copy_main_params_to_param_buffer(
-        self, zero_grad_buffer: bool = False
-    ) -> None:
+    def _copy_main_params_to_param_buffer(self, zero_grad_buffer: bool = False) -> None:
         if not isinstance(self.model, DistributedDataParallel):
             return
 
@@ -369,12 +365,9 @@ class MegatronPolicyWorkerImpl(
                 optim_instance._copy_main_params_to_param_buffer()
 
     def _uses_mxfp8_overlap_shared_param_buffer(self) -> bool:
-        return (
-            getattr(
-                self.megatron_cfg.optimizer, "reuse_grad_buf_for_mxfp8_param_ag", False
-            )
-            and getattr(self.megatron_cfg.ddp, "overlap_param_gather", False)
-        )
+        return getattr(
+            self.megatron_cfg.optimizer, "reuse_grad_buf_for_mxfp8_param_ag", False
+        ) and getattr(self.megatron_cfg.ddp, "overlap_param_gather", False)
 
     def _get_model_extra_state_dict(self) -> dict[str, Any]:
         fp8_enabled = self.fp8_cfg and self.fp8_cfg.get("enabled", False)
@@ -553,9 +546,9 @@ class MegatronPolicyWorkerImpl(
                     and update_successful
                 ):
                     self.enable_forward_pre_hook()
-                    get_model_config(self.model).param_sync_func = (
-                        self._first_train_step_param_sync_func
-                    )
+                    get_model_config(
+                        self.model
+                    ).param_sync_func = self._first_train_step_param_sync_func
                     self._first_train_step_param_sync_func = None
                     self._first_train_step_forward_pre_hook_disabled = False
 

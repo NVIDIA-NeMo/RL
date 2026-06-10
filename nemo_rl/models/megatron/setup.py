@@ -509,9 +509,7 @@ def setup_model_config(
     # and _create_megatron_config both use the same canonical check (fp8 enabled AND fp8_param).
     fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
     fp8_param_enabled = bool(
-        fp8_cfg
-        and fp8_cfg.get("enabled", False)
-        and fp8_cfg.get("fp8_param", False)
+        fp8_cfg and fp8_cfg.get("enabled", False) and fp8_cfg.get("fp8_param", False)
     )
 
     # When fp8_param starts from a pretrained checkpoint, model params may already
@@ -875,9 +873,9 @@ def _create_megatron_config(
     reuse_grad_buf_for_mxfp8_param_ag = (
         fp8_param_enabled and fp8_cfg.get("fp8_recipe") == "mxfp8"
     )
-    overlap_param_gather = config["megatron_cfg"][
-        "distributed_data_parallel_config"
-    ]["overlap_param_gather"]
+    overlap_param_gather = config["megatron_cfg"]["distributed_data_parallel_config"][
+        "overlap_param_gather"
+    ]
     optimizer_kwargs = {
         **config["megatron_cfg"]["optimizer"],
         "overlap_param_gather": overlap_param_gather,
