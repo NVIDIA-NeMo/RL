@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import base64
+import importlib
 import inspect
 import logging
 import re
@@ -20,7 +21,6 @@ from collections import defaultdict
 from io import BytesIO
 from typing import Any, Optional, Union
 
-import decord
 import requests
 import torch
 from PIL import Image
@@ -65,6 +65,16 @@ MEDIA_TAG_PATTERN = re.compile(
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _load_decord():
+    try:
+        return importlib.import_module("decord")
+    except ImportError as exc:
+        raise ImportError(
+            "decord2 is required for the audio loading fallback. Install decord2 or "
+            "ensure transformers can load the audio file directly."
+        ) from exc
 
 
 class PackedTensor:
@@ -356,9 +366,10 @@ def load_media_from_message(
                     loaded_media["audio"].append(
                         load_audio(aud, **multimodal_load_kwargs["audio"])
                     )
-                except (RuntimeError, FileNotFoundError, OSError) as e:
-                    logger.warning("Audio loading failed. Fall back to decord.")
+                except (RuntimeError, FileNotFoundError, OSError):
                     # use decord
+                    decord = _load_decord()
+                    logger.warning("Audio loading failed. Falling back to decord.")
                     loaded_audio = decord.AudioReader(
                         aud,
                         sample_rate=multimodal_load_kwargs["audio"]["sampling_rate"],
