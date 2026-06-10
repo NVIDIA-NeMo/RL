@@ -23,6 +23,7 @@ import numpy as np
 import ray
 import torch
 from pydantic import BaseModel
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -71,6 +72,7 @@ from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemo_gym import NemoGym, NemoGymConfig
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
@@ -244,6 +246,7 @@ def setup(
 ) -> tuple[
     ColocatablePolicyInterface,
     Optional[GenerationInterface],
+    Optional[EnvironmentInterface],
     tuple[RayVirtualCluster, RayVirtualCluster],
     StatefulDataLoader | MultipleDataloaderWrapper,
     Optional[StatefulDataLoader],
@@ -256,7 +259,10 @@ def setup(
     """Main entry point for running GRPO algorithm.
 
     Returns:
-        tuple of policy, cluster, dataloader, tokenizer, loss_fn, math_env, logger, master_config, val_dataloader
+        An 11-tuple, in order:
+            policy, policy_generation, nemo_gym (the NeMo-Gym env actor, or None
+            when not enabled), cluster, dataloader, val_dataloader, loss_fn,
+            logger, checkpointer, grpo_save_state, master_config.
     """
     # Start timing the entire setup process
     setup_start_time = time.perf_counter()
@@ -465,6 +471,18 @@ def setup(
 
     env_name_list = extract_necessary_env_names(data_config)
     rm_env_enabled = "reward_model" in env_name_list
+
+    # NeMo Gym is initialized inside setup() (rather than by the caller) so its
+    # spinup can overlap with vLLM model loading via deferred model load.
+    enable_nemo_gym = _should_use_nemo_gym(master_config)
+    nemo_gym_actor = None
+    if enable_nemo_gym:
+        nemo_gym_num_nodes = env_configs.get("nemo_gym", {}).get("num_gpu_nodes", 0)
+        ray_runtime_ctx = ray.get_runtime_context()
+        ray_cur_node_id = ray_runtime_ctx.get_node_id()
+    else:
+        nemo_gym_num_nodes = 0
+        ray_cur_node_id = None
 
     total_nodes = cluster_config["num_nodes"]
     if rm_env_enabled:
@@ -777,13 +795,117 @@ def setup(
             "hf_config_overrides", {}
         )
 
-        policy_generation, policy = initialize_generation_with_policy(
-            init_generation_fn=init_vllm,
-            generation_name="vLLM",
-            init_time_key="vllm_init_time_s",
-            colocated_inference=colocated_inference,
-            worker_init_timing_metrics=worker_init_timing_metrics,
-        )
+        if enable_nemo_gym:
+            # ---- NeMo Gym: reserve vLLM ports up-front so we can hand the
+            # server URLs to NeMo Gym and spin it up while vLLM loads weights.
+            print(
+                "  ⚡ Deferred model load: reserving vLLM ports for overlapped NeMo Gym init",
+                flush=True,
+            )
+            deferred_vllm = VllmGeneration(
+                cluster=inference_cluster,
+                config=generation_config,
+                defer_model_load=True,
+            )
+            print(
+                f"  ✓ Reserved {len(deferred_vllm.dp_openai_server_base_urls)} vLLM server URLs: "
+                f"{deferred_vllm.dp_openai_server_base_urls}",
+                flush=True,
+            )
+
+            def init_vllm_deferred():
+                """Complete the deferred vLLM model load started above."""
+                t0 = time.perf_counter()
+                deferred_vllm.load_and_start()
+                deferred_vllm.finish_generation()
+                return deferred_vllm, time.perf_counter() - t0
+
+            def init_nemo_gym():
+                """Spin up NeMo Gym servers with the pre-assigned vLLM URLs."""
+                t0 = time.perf_counter()
+                nemo_gym_py_exec = get_actor_python_env(
+                    "nemo_rl.environments.nemo_gym.NemoGym"
+                )
+                if nemo_gym_py_exec.startswith("uv"):
+                    nemo_gym_py_exec = create_local_venv_on_each_node(
+                        nemo_gym_py_exec, "nemo_rl.environments.nemo_gym.NemoGym"
+                    )
+                nemo_gym_dict = env_configs["nemo_gym"]
+                # NeMo-RL-side detection knobs are top-level NemoGymConfig fields
+                # (where the detector reads them), not part of Gym's global config.
+                invalid_tool_call_patterns = nemo_gym_dict.pop(
+                    "invalid_tool_call_patterns", None
+                )
+                thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
+                nemo_gym_cfg = NemoGymConfig(
+                    model_name=generation_config["model_name"],
+                    base_urls=deferred_vllm.dp_openai_server_base_urls,
+                    invalid_tool_call_patterns=invalid_tool_call_patterns,
+                    thinking_tags=thinking_tags,
+                    initial_global_config_dict=nemo_gym_dict,
+                )
+                nemo_gym_opts = {}
+                if nemo_gym_num_nodes:
+                    nemo_gym_opts["scheduling_strategy"] = (
+                        NodeAffinitySchedulingStrategy(
+                            node_id=ray_cur_node_id,
+                            soft=True,
+                        )
+                    )
+                nemo_gym_opts["runtime_env"] = {
+                    "py_executable": nemo_gym_py_exec,
+                    "env_vars": {
+                        **os.environ,
+                        "VIRTUAL_ENV": nemo_gym_py_exec,
+                        "UV_PROJECT_ENVIRONMENT": nemo_gym_py_exec,
+                    },
+                }
+                actor = NemoGym.options(**nemo_gym_opts).remote(nemo_gym_cfg)
+                ray.get(actor._spinup.remote())
+                return actor, time.perf_counter() - t0
+
+            # Colocated: vLLM + policy share GPUs -> sequential; otherwise parallel.
+            init_tasks = {}
+            if colocated_inference:
+
+                def init_vllm_then_policy():
+                    pg, vllm_t = init_vllm_deferred()
+                    p, policy_t = init_policy()
+                    return pg, vllm_t, p, policy_t
+
+                init_tasks["vllm_policy"] = init_vllm_then_policy
+            else:
+                init_tasks["vllm"] = init_vllm_deferred
+                init_tasks["policy"] = init_policy
+            init_tasks["nemo_gym"] = init_nemo_gym
+
+            print(
+                f"  ⚡ Init tasks: {', '.join(init_tasks.keys())}",
+                flush=True,
+            )
+            with ThreadPoolExecutor(max_workers=len(init_tasks)) as executor:
+                submitted = {k: executor.submit(fn) for k, fn in init_tasks.items()}
+                results = {k: f.result() for k, f in submitted.items()}
+
+            if colocated_inference:
+                policy_generation, vllm_time, policy, policy_time = results[
+                    "vllm_policy"
+                ]
+            else:
+                policy_generation, vllm_time = results["vllm"]
+                policy, policy_time = results["policy"]
+            nemo_gym_actor, nemo_gym_time = results["nemo_gym"]
+            worker_init_timing_metrics["vllm_init_time_s"] = vllm_time
+            worker_init_timing_metrics["policy_init_time_s"] = policy_time
+            worker_init_timing_metrics["nemo_gym_init_time_s"] = nemo_gym_time
+        else:
+            policy_generation, policy = initialize_generation_with_policy(
+                init_generation_fn=init_vllm,
+                generation_name="vLLM",
+                init_time_key="vllm_init_time_s",
+                colocated_inference=colocated_inference,
+                worker_init_timing_metrics=worker_init_timing_metrics,
+            )
 
         print(
             f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}",
@@ -877,6 +999,7 @@ def setup(
     return (
         policy,
         policy_generation,
+        nemo_gym_actor,
         (train_cluster, inference_cluster),
         dataloader,
         val_dataloader,
