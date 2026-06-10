@@ -337,24 +337,14 @@ class AsyncRolloutImpl:
         # Aggregate metrics across all samples.
         n = len(all_sample_metrics)
         rollout_metrics: dict[str, Any] = {
-            **self._aggregate_single_metric(
-                "total_reward", total_reward, ["mean", "max", "min"], n
-            ),
+            **_calculate_single_metric(total_reward, n, "total_reward"),
             # turn metrics
             "total_turns": sum(turn_count),
-            **self._aggregate_single_metric(
-                "turns_per_sample", turn_count, ["mean", "max"], n
-            ),
+            **_calculate_single_metric(turn_count, n, "turns_per_sample"),
             # token metrics
-            **self._aggregate_single_metric(
-                "total_tokens_per_sample", total_tokens, ["mean"], n
-            ),
-            **self._aggregate_single_metric(
-                "gen_tokens_per_sample", assistant_tokens, ["mean", "max"], n
-            ),
-            **self._aggregate_single_metric(
-                "env_tokens_per_sample", env_tokens, ["mean"], n
-            ),
+            **_calculate_single_metric(total_tokens, n, "total_tokens_per_sample"),
+            **_calculate_single_metric(assistant_tokens, n, "gen_tokens_per_sample"),
+            **_calculate_single_metric(env_tokens, n, "env_tokens_per_sample"),
             # truncated metrics
             "truncation_rate": sum(truncated) / n,
             "natural_termination_rate": sum(terminated) / n,
@@ -368,7 +358,8 @@ class AsyncRolloutImpl:
                     per_worker_token_counts[k] = per_worker_token_counts.get(k, 0) + v
             rollout_metrics["per_worker_token_counts"] = per_worker_token_counts
 
-        # Histogram metrics.
+        # Per-turn token histograms (flat across all turns, distinct from the
+        # per-sample histograms emitted via _calculate_single_metric above).
         rollout_metrics["histogram/gen_tokens_length"] = [
             t for m in all_sample_metrics for t in m["turn_gen_tokens"]
         ]
@@ -379,27 +370,11 @@ class AsyncRolloutImpl:
             t for m in all_sample_metrics for t in m["turn_total_tokens"]
         ]
 
+        # Necessary for downstream nemo rl logging/printing.
+        rollout_metrics["mean_gen_tokens_per_sample"] = rollout_metrics[
+            "gen_tokens_per_sample/mean"
+        ]
         return rollout_metrics
-
-    @staticmethod
-    def _aggregate_single_metric(
-        name: str,
-        values: list[float],
-        agg_method: list[str],
-        n: Optional[int] = None,
-    ) -> dict:
-        """Calculate a single metric across a list of values."""
-        metrics = {}
-
-        if "mean" in agg_method:
-            assert n is not None, "n must be provided for mean aggregation"
-            metrics[f"mean_{name}"] = sum(values) / n
-        if "max" in agg_method:
-            metrics[f"max_{name}"] = max(values)
-        if "min" in agg_method:
-            metrics[f"min_{name}"] = min(values)
-
-        return metrics
 
 
 class AsyncNemoGymRolloutImpl:
@@ -551,42 +526,34 @@ class AsyncNemoGymRolloutImpl:
         agent_name: str,
     ) -> dict[str, Any]:
         """Aggregate per-sample and per-agent metrics."""
-        n = len(completions)
+        # Prepare lists of values for each metric.
+        total_reward = [c.reward for c in completions]
+        turn_count = [
+            sum(1 for m in c.message_log if m["role"] == "user") for c in completions
+        ]
+        # token metrics
+        total_tokens = [
+            sum(len(m["token_ids"]) for m in c.message_log) for c in completions
+        ]
+        assistant_tokens = [
+            sum(len(m["token_ids"]) for m in c.message_log if m["role"] == "assistant")
+            for c in completions
+        ]
+        # truncated metrics
+        truncated = [c.truncated for c in completions]
 
-        # Aggregate metrics across all samples
+        # Aggregate metrics across all samples.
+        n = len(completions)
         rollout_metrics: dict[str, Any] = {
-            **_calculate_single_metric(
-                [
-                    sum(1 for m in c.message_log if m["role"] == "user")
-                    for c in completions
-                ],
-                n,
-                "turns_per_sample",
-            ),
-            **_calculate_single_metric(
-                [sum(len(m["token_ids"]) for m in c.message_log) for c in completions],
-                n,
-                "total_tokens_per_sample",
-            ),
-            **_calculate_single_metric(
-                [
-                    sum(
-                        len(m["token_ids"])
-                        for m in c.message_log
-                        if m["role"] == "assistant"
-                    )
-                    for c in completions
-                ],
-                n,
-                "gen_tokens_per_sample",
-            ),
-            **_calculate_single_metric(
-                [c.reward for c in completions],
-                n,
-                "total_reward",
-            ),
-            "natural_termination_rate": sum(not c.truncated for c in completions) / n,
-            "truncation_rate": sum(c.truncated for c in completions) / n,
+            **_calculate_single_metric(total_reward, n, "total_reward"),
+            # turn metrics
+            **_calculate_single_metric(turn_count, n, "turns_per_sample"),
+            # token metrics
+            **_calculate_single_metric(total_tokens, n, "total_tokens_per_sample"),
+            **_calculate_single_metric(assistant_tokens, n, "gen_tokens_per_sample"),
+            # truncated metrics
+            "natural_termination_rate": sum(not t for t in truncated) / n,
+            "truncation_rate": sum(truncated) / n,
         }
 
         # Agent-level metrics.

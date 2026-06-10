@@ -1234,14 +1234,23 @@ def test_async_rollout_manager_matches_original(
             f"Completion {i}: reward mismatch — original {orig_reward}, manager {new_reward}"
         )
 
-    # 4. rollout_metrics numeric values match (timing and histogram fields are excluded)
+    # 4. rollout_metrics numeric values match (timing and histogram fields are excluded).
+    # The new impl emits slash-style keys (X/mean, X/max, X/min) via _calculate_single_metric;
+    # translate the legacy prefix-style keys before comparing.
+    def _translate_legacy_key(key: str) -> str:
+        if key == "avg_turns_per_sample":
+            return "turns_per_sample/mean"
+        for prefix, suffix in (("mean_", "/mean"), ("max_", "/max"), ("min_", "/min")):
+            if key.startswith(prefix):
+                return f"{key[len(prefix) :]}{suffix}"
+        return key
+
     new_metrics = record.rollout_metrics
     for key in original_metrics.keys():
         if key.startswith("timing/") or key.startswith("histogram/"):
             continue
 
-        # renamed in new impl
-        new_key = "mean_turns_per_sample" if key == "avg_turns_per_sample" else key
+        new_key = _translate_legacy_key(key)
         assert new_key in new_metrics, (
             f"rollout_metrics[{new_key!r}] missing from manager"
         )
