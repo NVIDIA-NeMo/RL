@@ -183,6 +183,8 @@ policy:
   scheduler: null
 
   offload_optimizer_for_logprob: False
+  use_pinned_optimizer_offload: false # Use pinned memory for optimizer D2H/H2D transfers (per-tensor pinning)
+  use_coalesced_optimizer_offload: false # Coalesce all optimizer state into a single pinned buffer; requires use_pinned_optimizer_offload=true. Faster but may OOM on very large models.
 
   generation:
     # Port range for vLLM HTTP servers, kept below the OS ephemeral range.

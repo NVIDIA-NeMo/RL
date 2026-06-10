@@ -202,6 +202,8 @@ policy:
   make_sequence_length_divisible_by: 1
   max_grad_norm: 1.0
   offload_optimizer_for_logprob: false # Only useful for non-colocated generation since colocated generation will always offload optimizer to cuda before refit
+  use_pinned_optimizer_offload: false # Use pinned memory for optimizer D2H/H2D transfers (per-tensor pinning)
+  use_coalesced_optimizer_offload: false # Coalesce all optimizer state into a single pinned buffer; requires use_pinned_optimizer_offload=true. Faster but may OOM on very large models.
 
   optimizer: null
 
