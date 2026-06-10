@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import time
 import traceback
 from typing import Any
 
@@ -693,52 +694,33 @@ class VllmInternalWorkerExtension:
             ):
                 weights.append((hf_name, hf_tensor))
         else:
-            # Mixed-TP (target_tp != source_tp) or per-expert: pull each
-            # candidate's full tensor set into scratch, then satisfy
-            # per-source slice requests by copying from scratch into the
-            # planner-provided dest view.
+            # Mixed-TP (target_tp != source_tp) or per-expert.
             #
-            # Bandwidth: O(sum(source_bytes)). For target-wider this is
-            # the minimum needed. For target-narrower we over-pull (each
-            # receiver pulls the full source then slices on the host
-            # side), but correctness-correct and ~2× the matched-TP wire
-            # cost in the worst case. A v1 sliced-pull primitive would
-            # cut over-pull by 2× for narrow-target cases.
+            # v1 sliced-pull path:
+            #   * Pre-allocate a per-plan dest tensor (target_shape).
+            #   * For each plan source whose dest narrow is CONTIGUOUS
+            #     (axis 0 — column, qkv, gated_mlp, vocab, per_expert,
+            #     passthrough), build a SlicedTransferRequest pointing
+            #     directly at the dest view. Each source's requests
+            #     batch into one combined NIXL transfer per source.
+            #   * For non-contiguous narrows (axis 1 — row-parallel),
+            #     fall back to the v0 scratch+host-copy path.
+            #
+            # Bandwidth profile:
+            #   target-narrower: same as v0 (already optimal — each
+            #     receiver pulls a different source's full data).
+            #   target-wider: v1 cuts wire bytes by target_tp/source_tp×
+            #     for axis-0 roles by pulling only the sub-slice each
+            #     receiver needs from each source rank. Row-parallel
+            #     stays at v0 cost.
             megatron_cands = [c for c in candidates if c.megatron_meta is not None]
             print(
                 f"[mx-megatron] mixed-TP path: target_tp={target_tp_size} "
                 f"source_tp={any_megatron_tp_size or '?'} "
                 f"candidates={len(megatron_cands)}"
             )
-            # Pull each source's full manifest into a scratch dict.
-            # Bandwidth: O(sum(source_bytes)). For target-wider (vLLM TP >
-            # source TP) this is the minimum needed. For target-narrower
-            # we over-pull (each receiver pulls the full source then
-            # slices). Correctness-correct; a v1 sliced-pull primitive
-            # would reduce target-narrower bandwidth by 2×.
-            scratch: dict[str, dict[str, "torch.Tensor"]] = {}
-            for cand in megatron_cands:
-                buf_dict: dict[str, "torch.Tensor"] = {}
-                for name, t in self._mx_receiver._receiver.receive_weights_scratch(
-                    cand.ref, timeout_seconds=mx_config.timeout_seconds,
-                ):
-                    buf_dict[name] = t
-                scratch[cand.ref.mx_source_id] = buf_dict
-            total_bytes = sum(
-                t.numel() * t.element_size()
-                for d in scratch.values() for t in d.values()
-            )
-            print(
-                f"[mx-megatron] pulled {sum(len(d) for d in scratch.values())} "
-                f"tensors across {len(scratch)} sources ({total_bytes / 1e9:.2f} GB)"
-            )
 
-            # Build slice plans for every spec in one shot, then translate
-            # per plan with a name-aware pull callback. Inlines the same
-            # logic as run_refit_cycle but lets the closure capture the
-            # plan's tensor_name.
             from modelexpress.megatron_translator import (
-                assemble_into_destination,
                 translate_megatron_to_hf,
             )
             from modelexpress.nemo_rl_v2 import MegatronTensorSpec
@@ -759,37 +741,155 @@ class VllmInternalWorkerExtension:
                 target_tp_layout=ctx.target_tp_layout,
                 target_tensor_specs=target_specs,
             )
+
+            # ------ Phase 1: pre-allocate + classify per-plan dests ------
+            dt_map = {
+                "bfloat16": torch.bfloat16, "float16": torch.float16,
+                "float32": torch.float32,
+            }
+            plan_dests: dict[str, "torch.Tensor"] = {}
+            # Per-source pull batches: cand_sid -> list[(name, subslice, dest_view)]
+            v1_batches: dict[str, list] = {c.ref.mx_source_id: [] for c in megatron_cands}
+            # Plans that need the v0 scratch path (non-contiguous narrows
+            # OR per_expert dict assembly).
+            v0_plans: list = []
+
             for plan in plans:
                 if not plan.sources:
                     continue
                 rs = ctx.receive_specs[plan.tensor_name]
-                # Capture plan.tensor_name + plan.assembly in the closure.
-                def _pull_factory(name=plan.tensor_name, assembly=plan.assembly):
-                    def _pull(src, dest):
-                        full = scratch.get(src.mx_source_id, {}).get(name)
-                        if full is None:
-                            raise RuntimeError(
-                                f"mixed-TP: scratch missing {name!r} from "
-                                f"source {src.mx_source_id}"
-                            )
-                        axis = 1 if assembly == "concat_dim1" else 0
-                        if src.source_subslice is not None:
-                            slo, shi = src.source_subslice
-                            slice_src = full.narrow(axis, slo, shi - slo)
-                        else:
-                            slice_src = full
-                        if slice_src.shape != dest.shape:
-                            raise RuntimeError(
-                                f"mixed-TP shape mismatch on {name}: "
-                                f"src={tuple(slice_src.shape)} "
-                                f"dest={tuple(dest.shape)} "
-                                f"axis={axis} subslice={src.source_subslice}"
-                            )
-                        dest.copy_(slice_src, non_blocking=True)
-                    return _pull
-                assembled = assemble_into_destination(
-                    plan, pull=_pull_factory(), device=self.device,
+                dt = dt_map.get(rs.target_dtype, torch.bfloat16)
+                # per_expert returns a dict; fall back to v0 (host scratch
+                # + per-expert assembly).
+                if plan.assembly == "per_expert":
+                    v0_plans.append(plan)
+                    continue
+                dest = torch.empty(plan.target_shape, dtype=dt, device=self.device)
+                plan_dests[plan.tensor_name] = dest
+                axis = 1 if plan.assembly == "concat_dim1" else 0
+                routed_to_v1 = True
+                for src in plan.sources:
+                    target_lo, target_hi = src.target_local_range
+                    dest_view = dest.narrow(axis, target_lo, target_hi - target_lo)
+                    if not dest_view.is_contiguous():
+                        # Row-parallel axis-1 narrow → strided → can't RDMA
+                        # directly; whole plan falls back to v0.
+                        routed_to_v1 = False
+                        break
+                    v1_batches[src.mx_source_id].append(
+                        (plan.tensor_name, src.source_subslice, dest_view)
+                    )
+                if not routed_to_v1:
+                    # Drop any v1 entries for this plan that we already
+                    # queued and route the entire plan to v0.
+                    plan_dests.pop(plan.tensor_name, None)
+                    for sid in v1_batches:
+                        v1_batches[sid] = [
+                            r for r in v1_batches[sid] if r[0] != plan.tensor_name
+                        ]
+                    v0_plans.append(plan)
+
+            n_v1_slices = sum(len(b) for b in v1_batches.values())
+            print(
+                f"[mx-megatron] v1 sliced-pull: {n_v1_slices} slices across "
+                f"{sum(1 for b in v1_batches.values() if b)} sources "
+                f"(plans: {len(plan_dests)} via v1, {len(v0_plans)} via v0)"
+            )
+
+            # ------ Phase 2: NIXL register the dest buffers ------
+            # pull_to writes into the dest_views directly; the underlying
+            # buffer must be NIXL-registered so the agent can DMA to it.
+            if plan_dests:
+                t0 = time.perf_counter()
+                self._mx_receiver._receiver._nixl.register_tensors(plan_dests)
+                print(
+                    f"[mx-megatron] registered {len(plan_dests)} v1 dest buffers "
+                    f"with NIXL in {time.perf_counter() - t0:.2f}s"
                 )
+
+            # ------ Phase 3: per-source sliced pulls (v1) ------
+            t0 = time.perf_counter()
+            v1_total_bytes = 0
+            for cand in megatron_cands:
+                batch = v1_batches[cand.ref.mx_source_id]
+                if not batch:
+                    continue
+                xferred, n_slices, elapsed = self._mx_receiver._receiver.pull_to(
+                    cand.ref, batch, timeout_seconds=mx_config.timeout_seconds,
+                )
+                v1_total_bytes += xferred
+            v1_elapsed = time.perf_counter() - t0
+            if n_v1_slices:
+                v1_bw = (v1_total_bytes * 8) / (v1_elapsed * 1e9) if v1_elapsed > 0 else 0
+                print(
+                    f"[mx-megatron] v1 pull complete: {n_v1_slices} slices, "
+                    f"{v1_total_bytes / 1e9:.2f} GB, {v1_elapsed:.2f}s, "
+                    f"{v1_bw:.1f} Gbps aggregate"
+                )
+
+            # ------ Phase 4: v0 fallback for plans that needed scratch ------
+            scratch: dict[str, dict[str, "torch.Tensor"]] = {}
+            if v0_plans:
+                # Identify which sources contribute to the v0 plans.
+                v0_source_ids = set()
+                for plan in v0_plans:
+                    for src in plan.sources:
+                        v0_source_ids.add(src.mx_source_id)
+                v0_cands = [c for c in megatron_cands if c.ref.mx_source_id in v0_source_ids]
+                t0 = time.perf_counter()
+                for cand in v0_cands:
+                    buf_dict: dict[str, "torch.Tensor"] = {}
+                    for name, t in self._mx_receiver._receiver.receive_weights_scratch(
+                        cand.ref, timeout_seconds=mx_config.timeout_seconds,
+                    ):
+                        buf_dict[name] = t
+                    scratch[cand.ref.mx_source_id] = buf_dict
+                print(
+                    f"[mx-megatron] v0 fallback: scratch-pulled {len(v0_plans)} "
+                    f"plans from {len(v0_cands)} sources in "
+                    f"{time.perf_counter() - t0:.2f}s"
+                )
+            # ------ Phase 5: assemble + translate per plan ------
+            from modelexpress.megatron_translator import (
+                assemble_into_destination,
+            )
+            for plan in plans:
+                if not plan.sources:
+                    continue
+                rs = ctx.receive_specs[plan.tensor_name]
+                if plan.tensor_name in plan_dests:
+                    # v1 path: dest was filled directly by the sliced
+                    # NIXL transfer. No host-side assembly needed.
+                    assembled = plan_dests[plan.tensor_name]
+                else:
+                    # v0 path: scratch+slice-copy via assemble_into_destination
+                    # with a name+source-aware pull callback.
+                    def _pull_factory(name=plan.tensor_name, assembly=plan.assembly):
+                        def _pull(src, dest):
+                            full = scratch.get(src.mx_source_id, {}).get(name)
+                            if full is None:
+                                raise RuntimeError(
+                                    f"mixed-TP v0: scratch missing {name!r} from "
+                                    f"source {src.mx_source_id}"
+                                )
+                            axis = 1 if assembly == "concat_dim1" else 0
+                            if src.source_subslice is not None:
+                                slo, shi = src.source_subslice
+                                slice_src = full.narrow(axis, slo, shi - slo)
+                            else:
+                                slice_src = full
+                            if slice_src.shape != dest.shape:
+                                raise RuntimeError(
+                                    f"mixed-TP v0 shape mismatch on {name}: "
+                                    f"src={tuple(slice_src.shape)} "
+                                    f"dest={tuple(dest.shape)} "
+                                    f"axis={axis} subslice={src.source_subslice}"
+                                )
+                            dest.copy_(slice_src, non_blocking=True)
+                        return _pull
+                    assembled = assemble_into_destination(
+                        plan, pull=_pull_factory(), device=self.device,
+                    )
                 for hf_name, hf_tensor in translate_megatron_to_hf(
                     plan, assembled,
                     transformer_config=ctx.transformer_config,
