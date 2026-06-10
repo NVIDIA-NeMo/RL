@@ -358,6 +358,83 @@ def test_validate_function(mock_components):
     # Note: validate() function itself doesn't call logger.log_metrics - that's done by the caller
 
 
+def test_validate_uses_nemo_gym_rollout_when_enabled(mock_components):
+    master_config = mock_components["master_config"]
+    master_config.distillation["max_val_samples"] = 1
+    master_config.distillation["val_batch_size"] = 1
+    master_config.env["should_use_nemo_gym"] = True
+    master_config.env["should_log_nemo_gym_responses"] = False
+    master_config.policy["generation"]["backend"] = "vllm"
+    master_config.policy["generation"]["vllm_cfg"] = {
+        "async_engine": True,
+        "expose_http_server": True,
+    }
+
+    final_batch = BatchedDataDict[DatumSpec](
+        {
+            "message_log": [
+                [
+                    {
+                        "token_ids": torch.tensor([1, 2]),
+                        "role": "user",
+                        "content": "What is 1+1?",
+                    },
+                    {
+                        "token_ids": torch.tensor([3, 4]),
+                        "role": "assistant",
+                        "content": "2",
+                    },
+                ]
+            ],
+            "total_reward": torch.tensor([1.0]),
+        }
+    )
+    mock_rollout_result = SimpleNamespace(
+        final_batch=final_batch,
+        rollout_metrics={
+            "mean_gen_tokens_per_sample": 2.0,
+            "score": 0.5,
+            "full_result_debug": {"large_response": True},
+        },
+    )
+
+    with (
+        patch(
+            "nemo_rl.algorithms.distillation.run_async_nemo_gym_rollout",
+            return_value=mock_rollout_result,
+        ) as mock_nemo_gym_rollout,
+        patch(
+            "nemo_rl.algorithms.distillation.run_async_multi_turn_rollout"
+        ) as mock_async_rollout,
+        patch("nemo_rl.algorithms.distillation.run_multi_turn_rollout") as mock_rollout,
+    ):
+        val_metrics, validation_timings = validate(
+            mock_components["student_generation"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["val_task_to_env"],
+            step=0,
+            master_config=master_config,
+        )
+
+    mock_nemo_gym_rollout.assert_called_once()
+    rollout_kwargs = mock_nemo_gym_rollout.call_args.kwargs
+    assert rollout_kwargs["policy_generation"] is mock_components["student_generation"]
+    assert rollout_kwargs["task_to_env"] is mock_components["val_task_to_env"]
+    assert rollout_kwargs["generation_config"] is master_config.policy["generation"]
+    assert rollout_kwargs["max_seq_len"] is None
+    assert rollout_kwargs["max_rollout_turns"] is None
+    assert rollout_kwargs["greedy"] is False
+    mock_async_rollout.assert_not_called()
+    mock_rollout.assert_not_called()
+    assert val_metrics["accuracy"] == 1.0
+    assert val_metrics["avg_length"] == 2.0
+    assert val_metrics["mean_gen_tokens_per_sample"] == 2.0
+    assert val_metrics["score"] == 0.5
+    assert "full_result_debug" not in val_metrics
+    assert isinstance(validation_timings, dict)
+
+
 def test_check_vocab_equality_pass(monkeypatch):
     student_tokenizer = MagicMock()
     student_tokenizer.get_vocab.return_value = {"a": 0, "b": 1}

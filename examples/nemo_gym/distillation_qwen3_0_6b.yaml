@@ -25,7 +25,7 @@ policy:
   make_sequence_length_divisible_by: 1
   dtensor_cfg:
     enabled: true
-    _v2: false
+    _v2: true
     tensor_parallel_size: 1
     context_parallel_size: 1
   megatron_cfg:
@@ -54,14 +54,14 @@ policy:
         num_nodes: null
 
 teacher:
-  model_name: Qwen/Qwen3-0.6B
+  model_name: Qwen/Qwen3-1.7B
   train_global_batch_size: 2
   logprob_batch_size: 1
   max_total_sequence_length: 4096
   make_sequence_length_divisible_by: 1
   dtensor_cfg:
     enabled: true
-    _v2: false
+    _v2: true
     tensor_parallel_size: 1
     context_parallel_size: 1
   megatron_cfg:

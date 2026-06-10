@@ -27,7 +27,9 @@ cd $PROJECT_ROOT
 # Reuse the checked-in NeMo-Gym sanity fixture so this functional test does not
 # depend on external dataset download. The fixture rows use
 # `example_multi_step_simple_agent`, which is provided by Gym's
-# resources_servers/example_multi_step config.
+# resources_servers/example_multi_step config. The model overrides use the same
+# small non-identical Qwen3 pair as other distillation functional tests so this
+# stays cheap while still catching a degenerate zero-KL path.
 TRAIN_PATH=$DATA_DIR/example_multi_step_train.jsonl
 VALIDATION_PATH=$DATA_DIR/example_multi_step_validation.jsonl
 python - <<'PY' "$PROJECT_ROOT/tests/unit/environments/nemo_gym_test_data/test_nemo_gym_sanity.json" "$TRAIN_PATH" "$VALIDATION_PATH"
@@ -47,10 +49,19 @@ PY
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $PROJECT_ROOT/examples/nemo_gym/run_distillation_nemo_gym.py \
     --config $PROJECT_ROOT/examples/nemo_gym/distillation_qwen3_0_6b.yaml \
+    policy.model_name=Qwen/Qwen3-0.6B-Base \
+    policy.tokenizer.name=Qwen/Qwen3-0.6B-Base \
+    teacher.model_name=Qwen/Qwen3-0.6B \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=false \
     checkpointing.enabled=false \
     checkpointing.checkpoint_dir=$CHECKPOINT_DIR \
+    cluster.gpus_per_node=2 \
+    policy.dtensor_cfg.tensor_parallel_size=1 \
+    policy.dtensor_cfg.context_parallel_size=2 \
+    policy.make_sequence_length_divisible_by=2 \
+    teacher.dtensor_cfg.tensor_parallel_size=2 \
+    teacher.dtensor_cfg.context_parallel_size=1 \
     data.train.data_path=$TRAIN_PATH \
     data.validation.data_path=$VALIDATION_PATH \
     $@ \
@@ -59,6 +70,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 uv run tests/check_metrics.py $JSON_METRICS \
-    'data["train/loss"]["1"] < 0.5' \
+    'data["train/loss"]["1"] > 0' \
+    'data["train/loss"]["1"] < 2.0' \
     'data["timing/train/generation"]["1"] > 0' \
     'data["train/mean_gen_tokens_per_sample"]["1"] > 0'
