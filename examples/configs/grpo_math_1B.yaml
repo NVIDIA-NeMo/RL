@@ -310,6 +310,9 @@ policy:
     vllm_cfg:
       async_engine: false
       precision: ${policy.precision}
+      # Valid values: "auto", "fp8", "fp8_e4m3", "fp8_per_token_head".
+      # "fp8_per_token_head" uses dynamic per-token per-head KV scales in
+      # vLLM and simulates the same quant-dequant on Megatron K/V tensors.
       kv_cache_dtype: "auto"
       tensor_parallel_size: 1
       pipeline_parallel_size: 1

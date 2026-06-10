@@ -54,7 +54,11 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     verify_right_padding,
 )
-from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.config import (
+    VLLM_FP8_PER_TOKEN_HEAD_KV_CACHE_DTYPE,
+    VllmConfig,
+    is_static_fp8_kv_cache_dtype,
+)
 from nemo_rl.models.megatron.common import get_moe_metrics
 from nemo_rl.models.megatron.config import MegatronGenerationConfig
 from nemo_rl.models.megatron.data import (
@@ -94,6 +98,85 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+FP8_E4M3_MAX = 448.0
+
+
+class _FP8PerTokenHeadQuantDequant(torch.autograd.Function):
+    """Quantize/dequantize with per-token per-head scales and STE backward."""
+
+    @staticmethod
+    def forward(ctx: Any, tensor: torch.Tensor) -> torch.Tensor:
+        if not tensor.is_floating_point():
+            return tensor
+        if not hasattr(torch, "float8_e4m3fn"):
+            raise RuntimeError(
+                "fp8_per_token_head KV cache simulation requires torch.float8_e4m3fn"
+            )
+
+        ctx.input_dtype = tensor.dtype
+        tensor_fp32 = tensor.to(torch.float32)
+        scale = tensor_fp32.abs().amax(dim=-1, keepdim=True) / FP8_E4M3_MAX
+        scale = scale.clamp(min=torch.finfo(torch.float32).eps)
+        quantized = (
+            (tensor_fp32 / scale)
+            .clamp(
+                min=-FP8_E4M3_MAX,
+                max=FP8_E4M3_MAX,
+            )
+            .to(torch.float8_e4m3fn)
+        )
+        return (quantized.to(torch.float32) * scale).to(torch.bfloat16)
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> torch.Tensor:
+        return grad_output.to(ctx.input_dtype)
+
+
+def _fp8_per_token_head_quant_dequant(tensor: torch.Tensor) -> torch.Tensor:
+    return _FP8PerTokenHeadQuantDequant.apply(tensor)
+
+
+def _quant_dequant_kv_cache_forward_pre_hook(
+    module: torch.nn.Module,
+    inputs: tuple[Any, ...],
+    kwargs: dict[str, Any] | None = None,
+) -> tuple[Any, ...] | tuple[tuple[Any, ...], dict[str, Any]]:
+    del module
+    args: tuple[Any, ...] | list[Any] = inputs
+    nested_container_type: str | None = None
+    updated_kwargs = dict(kwargs or {})
+
+    if "key" in updated_kwargs and "value" in updated_kwargs:
+        updated_kwargs["key"] = _fp8_per_token_head_quant_dequant(updated_kwargs["key"])
+        updated_kwargs["value"] = _fp8_per_token_head_quant_dequant(
+            updated_kwargs["value"]
+        )
+        return inputs, updated_kwargs
+
+    if len(args) == 1 and isinstance(args[0], (tuple, list)):
+        nested_container_type = "tuple" if isinstance(args[0], tuple) else "list"
+        args = args[0]
+
+    if len(args) < 3:
+        raise RuntimeError(
+            "fp8_per_token_head KV cache simulation expected CoreAttention "
+            "inputs to start with query, key, and value tensors."
+        )
+
+    updated_args = list(args)
+    updated_args[1] = _fp8_per_token_head_quant_dequant(updated_args[1])
+    updated_args[2] = _fp8_per_token_head_quant_dequant(updated_args[2])
+
+    if nested_container_type == "tuple":
+        updated_inputs = (tuple(updated_args),)
+    elif nested_container_type == "list":
+        updated_inputs = (updated_args,)
+    else:
+        updated_inputs = tuple(updated_args)
+
+    if kwargs is not None:
+        return updated_inputs, updated_kwargs
+    return updated_inputs
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
@@ -308,6 +391,8 @@ class MegatronPolicyWorkerImpl(
 
         ## used for streaming update inference engine weights
         self._held_gather_buffer = None
+        self._fp8_per_token_head_kv_cache_hook_handles = []
+        self._maybe_register_fp8_per_token_head_kv_cache_hook()
 
     def enable_forward_pre_hook(self):
         assert isinstance(self.model, DistributedDataParallel)
@@ -1150,7 +1235,9 @@ class MegatronPolicyWorkerImpl(
             use_fp8_kv_cache = (
                 "vllm_cfg" in generation_cfg
                 and "kv_cache_dtype" in generation_cfg["vllm_cfg"]
-                and generation_cfg["vllm_cfg"]["kv_cache_dtype"].startswith("fp8")
+                and is_static_fp8_kv_cache_dtype(
+                    generation_cfg["vllm_cfg"]["kv_cache_dtype"]
+                )
             )
 
         if not use_fp8_kv_cache:
@@ -1172,6 +1259,48 @@ class MegatronPolicyWorkerImpl(
                 scale_value, dtype=torch.float32, device="cuda"
             ).reshape(1)
             yield param_name, scale_tensor
+
+    def _uses_fp8_per_token_head_kv_cache(self) -> bool:
+        if "generation" not in self.cfg or self.cfg["generation"] is None:
+            return False
+        if self.cfg["generation"]["backend"] != "vllm":
+            return False
+
+        generation_cfg = cast(VllmConfig, self.cfg["generation"])
+        return (
+            "vllm_cfg" in generation_cfg
+            and "kv_cache_dtype" in generation_cfg["vllm_cfg"]
+            and generation_cfg["vllm_cfg"]["kv_cache_dtype"]
+            == VLLM_FP8_PER_TOKEN_HEAD_KV_CACHE_DTYPE
+        )
+
+    def _maybe_register_fp8_per_token_head_kv_cache_hook(self) -> None:
+        """Install dynamic FP8 KV cache simulation before CoreAttention."""
+        if not self._uses_fp8_per_token_head_kv_cache():
+            return
+
+        matched_module_names = []
+        for name, module in self.model.named_modules():
+            if "self_attention.core_attention" not in name:
+                continue
+            handle = module.register_forward_pre_hook(
+                _quant_dequant_kv_cache_forward_pre_hook,
+                with_kwargs=True,
+            )
+            self._fp8_per_token_head_kv_cache_hook_handles.append(handle)
+            matched_module_names.append(name)
+
+        if not matched_module_names:
+            raise RuntimeError(
+                "fp8_per_token_head KV cache simulation requested, but no "
+                "'self_attention.core_attention' modules were found."
+            )
+
+        print(
+            "Enabled fp8_per_token_head KV cache simulation on "
+            f"{len(matched_module_names)} CoreAttention modules.",
+            flush=True,
+        )
 
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/stream_weights_via_ipc_zmq")

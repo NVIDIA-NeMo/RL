@@ -26,6 +26,11 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
 
+from nemo_rl.models.generation.vllm.config import (
+    VLLM_KV_CACHE_DTYPES,
+    is_static_fp8_kv_cache_dtype,
+)
+
 FP8_BLOCK_QUANT_KWARGS = {
     "activation_scheme": "dynamic",
     "fmt": "e4m3",
@@ -142,10 +147,15 @@ def apply_fp8_patches(self, fp8_config):
             patcher4 = patch(func4_path, _per_token_group_quant_fp8_colmajor)
             fp8_state.vllm_patches.append(patcher2, patcher3, patcher4)
 
-        # Static scales mode: patch process_weights_after_loading to preserve k_scale/v_scale for manual updates
-        func5_path = "vllm.model_executor.layers.quantization.kv_cache.BaseKVCacheMethod.process_weights_after_loading"
-        patcher5 = patch(func5_path, process_weights_after_loading_kv)
-        fp8_state.vllm_patches.append(patcher5)
+        # Static scales mode: patch process_weights_after_loading to preserve
+        # k_scale/v_scale for manual updates.
+        if is_static_fp8_kv_cache_dtype(global_fp8_config.kv_cache_dtype):
+            func5_path = (
+                "vllm.model_executor.layers.quantization.kv_cache."
+                "BaseKVCacheMethod.process_weights_after_loading"
+            )
+            patcher5 = patch(func5_path, process_weights_after_loading_kv)
+            fp8_state.vllm_patches.append(patcher5)
 
     for p in fp8_state.vllm_patches:
         p.start()
@@ -161,13 +171,15 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     kv_cache_dtype = vllm_cfg["kv_cache_dtype"]
 
     # Validate configuration: kv_cache_dtype
-    if kv_cache_dtype not in ["auto", "fp8", "fp8_e4m3"]:
+    if kv_cache_dtype not in VLLM_KV_CACHE_DTYPES:
         raise ValueError(
-            f"kv_cache_dtype must be one of ['auto', 'fp8', 'fp8_e4m3'], but got {kv_cache_dtype}"
+            f"kv_cache_dtype must be one of {list(VLLM_KV_CACHE_DTYPES)}, but got {kv_cache_dtype}"
         )
 
-    # Validate configuration: kv_cache_dtype=fp8 requires precision=fp8
-    if kv_cache_dtype.startswith("fp8") and not use_fp8_weights:
+    # Static-scale FP8 KV cache requires FP8 weights because NeMo-RL exports
+    # static Q/K/V scale tensors alongside FP8 model weights. Dynamic
+    # fp8_per_token_head KV cache does not need those static scale tensors.
+    if is_static_fp8_kv_cache_dtype(kv_cache_dtype) and not use_fp8_weights:
         raise ValueError(
             f"kv_cache_dtype='{kv_cache_dtype}' requires precision='fp8'. "
             "FP8 KV cache can only be used together with FP8 model weights."

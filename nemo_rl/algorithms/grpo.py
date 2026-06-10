@@ -75,6 +75,7 @@ from nemo_rl.experience.rollouts import (
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.sglang import SGLangConfig, SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation.vllm.config import is_static_fp8_kv_cache_dtype
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
@@ -717,12 +718,15 @@ def setup(
             assert loss_config.use_importance_sampling_correction, (
                 "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
             )
-        if generation_config["vllm_cfg"]["kv_cache_dtype"].startswith("fp8"):
-            # FP8 KV cache requires FP8 model precision
-            assert generation_config["vllm_cfg"]["precision"] == "fp8", (
-                f"kv_cache_dtype='{generation_config['vllm_cfg']['kv_cache_dtype']}' requires precision='fp8'. "
-                "FP8 KV cache can only be used together with FP8 model weights."
-            )
+        kv_cache_dtype = generation_config["vllm_cfg"]["kv_cache_dtype"]
+        if kv_cache_dtype.startswith("fp8"):
+            if is_static_fp8_kv_cache_dtype(kv_cache_dtype):
+                # Static-scale FP8 KV cache requires FP8 model precision because
+                # scale tensors are exported with FP8 model weights.
+                assert generation_config["vllm_cfg"]["precision"] == "fp8", (
+                    f"kv_cache_dtype='{kv_cache_dtype}' requires precision='fp8'. "
+                    "Static FP8 KV cache can only be used together with FP8 model weights."
+                )
             # FP8 KV cache compatibility checks
             assert policy_config["dtensor_cfg"]["enabled"] == False, (
                 "DTensor backend is not supported with kv cache fp8 enabled."
@@ -730,9 +734,14 @@ def setup(
             assert not _should_use_async_rollouts(master_config), (
                 "Async rollouts is not supported with kv cache fp8 enabled."
             )
-            assert policy_config["megatron_cfg"]["pipeline_model_parallel_size"] == 1, (
-                "Currently when using FP8 KV cache in generation, then in megatron we only support pipeline_model_parallel_size=1. We will add more support in future."
-            )
+            if is_static_fp8_kv_cache_dtype(kv_cache_dtype):
+                assert (
+                    policy_config["megatron_cfg"]["pipeline_model_parallel_size"] == 1
+                ), (
+                    "Currently when using static-scale FP8 KV cache in generation, "
+                    "then in megatron we only support pipeline_model_parallel_size=1. "
+                    "We will add more support in future."
+                )
 
         ## make vllm hf overrides match the training policy
         generation_config["vllm_kwargs"]["hf_overrides"] = policy_config.get(

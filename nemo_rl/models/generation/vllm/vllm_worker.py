@@ -35,7 +35,10 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     verify_right_padding,
 )
-from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.config import (
+    VLLM_FP8_PER_TOKEN_HEAD_KV_CACHE_DTYPE,
+    VllmConfig,
+)
 from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generation
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
@@ -47,6 +50,14 @@ def _resolve_enable_prefix_caching(vllm_cfg: dict[str, Any]) -> bool:
     if enable_prefix_caching is None:
         enable_prefix_caching = torch.cuda.get_device_capability()[0] >= 8
     return enable_prefix_caching
+
+
+def _set_per_token_head_kv_cache_dtype(
+    vllm_cfg: dict[str, Any], vllm_kwargs: dict[str, Any]
+) -> None:
+    """Pass vLLM dynamic per-token per-head KV cache dtype through EngineArgs."""
+    if vllm_cfg["kv_cache_dtype"] == VLLM_FP8_PER_TOKEN_HEAD_KV_CACHE_DTYPE:
+        vllm_kwargs["kv_cache_dtype"] = VLLM_FP8_PER_TOKEN_HEAD_KV_CACHE_DTYPE
 
 
 # Use a base class to share some functions to avoid code duplication.
@@ -584,8 +595,10 @@ class BaseVllmGenerationWorker:
             )
             vllm_kwargs["ray_workers_use_nsight"] = True
 
-        # Call init_fp8 when precision is fp8
-        # (kv_cache_dtype can be fp8/fp8_e4m3 or auto, validated in init_fp8)
+        _set_per_token_head_kv_cache_dtype(self.cfg["vllm_cfg"], vllm_kwargs)
+
+        # Call init_fp8 when precision is fp8.
+        # kv_cache_dtype validation lives in init_fp8 for FP8-weight runs.
         if self.cfg["vllm_cfg"]["precision"] == "fp8":
             from nemo_rl.models.generation.vllm.quantization.fp8 import init_fp8
 

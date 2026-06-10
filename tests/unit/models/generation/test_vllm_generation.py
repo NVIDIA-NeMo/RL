@@ -38,6 +38,7 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.vllm_worker import (
     _resolve_enable_prefix_caching,
+    _set_per_token_head_kv_cache_dtype,
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
@@ -136,6 +137,30 @@ basic_dtensor_test_config: PolicyConfig = {
     "make_sequence_length_divisible_by": 1,
     "generation": deepcopy(basic_vllm_test_config),
 }
+
+
+def test_per_token_head_kv_cache_dtype_is_forwarded_to_vllm_kwargs():
+    vllm_cfg = deepcopy(basic_vllm_test_config["vllm_cfg"])
+    vllm_cfg["kv_cache_dtype"] = "fp8_per_token_head"
+    llm_kwargs = {}
+
+    _set_per_token_head_kv_cache_dtype(vllm_cfg, llm_kwargs)
+
+    assert llm_kwargs["kv_cache_dtype"] == "fp8_per_token_head"
+
+
+def test_vllm_requires_kv_scale_sync_only_for_static_fp8_kv_cache():
+    generation = object.__new__(VllmGeneration)
+    generation.cfg = deepcopy(basic_vllm_test_config)
+
+    generation.cfg["vllm_cfg"]["kv_cache_dtype"] = "fp8"
+    assert generation.requires_kv_scale_sync
+
+    generation.cfg["vllm_cfg"]["kv_cache_dtype"] = "fp8_e4m3"
+    assert generation.requires_kv_scale_sync
+
+    generation.cfg["vllm_cfg"]["kv_cache_dtype"] = "fp8_per_token_head"
+    assert not generation.requires_kv_scale_sync
 
 
 def test_resolve_enable_prefix_caching_respects_explicit_config(monkeypatch):
