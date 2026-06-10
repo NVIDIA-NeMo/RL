@@ -1,0 +1,111 @@
+# Intent (audio+video) GRPO 3B Megatron configuration.
+#
+# Trains Qwen/Qwen2.5-Omni-3B with GRPO on PhilipC/IntentTrain (intent
+# recognition over short MER24 / social_iq video clips with audio) and runs
+# in-training validation on PhilipC/IntentBench. Per the IntentTrain plan:
+#   * Audio+video coexist on every prompt; the HF processor is invoked with
+#     use_audio_in_video=True and vLLM rollouts pass the same flag through
+#     mm_processor_kwargs.
+#   * Only problem_type == "multiple choice" samples are used; rewards reuse
+#     the audio recipe's format + exact_alnum.
+#
+# Inherits from grpo_math_1B_megatron.yaml and overrides intent-specific
+# settings.
+defaults: "grpo_math_1B_megatron.yaml"
+
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
+  max_num_steps: 1000
+  max_val_samples: 32
+  val_batch_size: 32
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/intent_grpo_3B_megatron
+  keep_top_k: 10
+  save_period: 400
+
+policy:
+  model_name: Qwen/Qwen2.5-Omni-3B
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  generation_batch_size: 32
+  logprob_batch_size: 4
+  # Audio + video at 16 frames per prompt produces materially more tokens than
+  # the audio-only recipe; raise the budget to keep loss_multiplier > 0.
+  # If the smoke run shows truncation, bump this further.
+  max_total_sequence_length: 8192
+
+  tokenizer:
+    video:
+      # Frame count for Qwen2.5-Omni's video processor. Matches sft_avlm.yaml.
+      num_frames: 16
+
+  sequence_packing:
+    enabled: false
+
+  generation:
+    max_new_tokens: 1024
+    vllm_cfg:
+      # Audio/multimodal models require tokenizer to be initialized before generation
+      skip_tokenizer_init: False
+      limit_mm_per_prompt:
+        video: 1
+        audio: 1
+    vllm_kwargs:
+      # Disable mm processor cache to avoid vLLM cache eviction assertion error during validation.
+      mm_processor_cache_gb: 0
+
+  megatron_cfg:
+    converter_type: Qwen2_5OmniForConditionalGeneration
+    apply_rope_fusion: false
+    optimizer:
+      lr: 1.0e-6
+      min_lr: 1.0e-7
+    scheduler:
+      lr_warmup_iters: 10
+      lr_warmup_init: 1.0e-7
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+
+data:
+  num_workers: 0
+  train:
+    dataset_name: intent-train
+    split: train
+    allowed_problem_types:
+      - "multiple choice"
+  validation:
+    dataset_name: intent-bench
+    split: validation
+    allowed_problem_types:
+      - "multiple choice"
+  default:
+    prompt_file: null
+    system_prompt_file: null
+    processor: "vlm_hf_data_processor"
+    env_name: "vlm"
+
+env:
+  vlm:
+    num_workers: 8
+    reward_functions:
+    - name: format
+      weight: 0.2
+    - name: exact_alnum
+      weight: 0.8
+
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  monitor_gpus: false
+  wandb:
+    project: grpo-dev
+    name: intent-grpo-3b-megatron
+  swanlab:
+    project: grpo-dev
+    name: intent-grpo-3b-megatron
+
+cluster:
+  gpus_per_node: 8

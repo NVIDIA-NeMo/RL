@@ -117,6 +117,7 @@ def eval_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
     message_log = [datum_spec["message_log"] for datum_spec in data_batch]
     extra_env_info = [datum_spec["extra_env_info"] for datum_spec in data_batch]
     idx = [datum_spec["idx"] for datum_spec in data_batch]
+    task_names = [datum_spec.get("task_name", None) for datum_spec in data_batch]
 
     # Check if any of the data batch has vllm content (multimodal data)
     extra_args = {}
@@ -140,6 +141,7 @@ def eval_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
         message_log=message_log,
         extra_env_info=extra_env_info,
         idx=idx,
+        task_name=task_names,
         **extra_args,
     )
     return output

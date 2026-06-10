@@ -66,7 +66,7 @@ def format_prompt_for_vllm_generation(
                 continue
             # init prompt dict
             prompt_dict = {"prompt": msg}
-            # collect multi_modal_data from images and audios
+            # collect multi_modal_data from images, audios, and videos
             multi_modal_data = {}
             images = data.get("vllm_images", None)
             if images is not None and len(images[i]) > 0:
@@ -78,10 +78,27 @@ def format_prompt_for_vllm_generation(
                 multi_modal_data["audio"] = (
                     audios[i][0] if len(audios[i]) == 1 else audios[i]
                 )
+            videos = data.get("vllm_videos", None)
+            if videos is not None and len(videos[i]) > 0:
+                multi_modal_data["video"] = (
+                    videos[i][0] if len(videos[i]) == 1 else videos[i]
+                )
             if not multi_modal_data:
                 prompts.append(_get_regular_prompt(i))
                 continue
             prompt_dict["multi_modal_data"] = multi_modal_data
+            # For Qwen2.5-Omni IntentTrain/IntentBench rollouts, tell vLLM to
+            # align audio with its parent video stream. The presence of both
+            # audio and video on the same prompt is the trigger; consumers
+            # without the omni model simply ignore the kwarg.
+            task_names = data.get("task_name", None)
+            if (
+                task_names is not None
+                and task_names[i] in ("intent-train", "intent-bench")
+                and "audio" in multi_modal_data
+                and "video" in multi_modal_data
+            ):
+                prompt_dict["mm_processor_kwargs"] = {"use_audio_in_video": True}
             prompts.append(prompt_dict)
     else:
         # Regular LLM generation using token_ids (pre-tokenized).

@@ -481,6 +481,8 @@ def vlm_hf_data_processor(
         pass  # MMAU data is already formatted by MMAUDataset.format_data
     elif datum_dict["task_name"] == "daily-omni":
         pass  # Daily-Omni data is already formatted by DailyOmniDataset.format_data
+    elif datum_dict["task_name"] in ("intent-train", "intent-bench"):
+        pass  # IntentDataset.format_data already produces the message structure
     else:
         raise ValueError(f"No data processor for task {datum_dict['task_name']}")
 
@@ -551,6 +553,13 @@ def vlm_hf_data_processor(
     else:
         user_message_for_chat_template = user_message
 
+    # For Qwen2.5-Omni IntentTrain/IntentBench samples we want the processor
+    # to align the audio stream with its parent video stream, so propagate
+    # use_audio_in_video=True through apply_chat_template's processor kwargs.
+    extra_processor_kwargs: dict[str, Any] = {}
+    if datum_dict["task_name"] in ("intent-train", "intent-bench"):
+        extra_processor_kwargs["use_audio_in_video"] = True
+
     # this is the string-tokenized conversation template for the generation policy (for vllm)
     string_formatted_dialog = processor.apply_chat_template(
         [user_message_for_chat_template],
@@ -565,6 +574,7 @@ def vlm_hf_data_processor(
         add_generation_prompt=True,
         return_tensors="pt",
         return_dict=True,
+        **extra_processor_kwargs,
     )
 
     # add this for backward compatibility
