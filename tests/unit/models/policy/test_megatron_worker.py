@@ -35,6 +35,7 @@ from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.checkpoint import CheckpointManager
+from tests.unit.models.policy.training_assertions import assert_training_loss_changed
 from tests.unit.test_utils import SimpleLossFn
 
 pytestmark = pytest.mark.mcore
@@ -455,8 +456,8 @@ def test_megatron_policy_training(training_setup):
 
     policy.finish_training()
 
-    # Verify loss changed between iterations (model parameters were updated)
-    assert losses[0] > losses[-1], "Loss should decrease over training iterations"
+    # Verify loss changed between iterations (model parameters were updated).
+    assert_training_loss_changed(losses)
 
     if policy.flops_tracker is not None:
         assert "total_flops" in results and isinstance(

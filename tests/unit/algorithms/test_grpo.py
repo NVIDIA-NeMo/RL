@@ -1029,18 +1029,6 @@ def test_dapo_dynamic_sampling_filters_nonzero_std(mock_grpo_components):
     repeated_batch = create_mock_batch(batch_size, task_names, message_logs)
     repeated_batch["total_reward"] = torch.tensor([1.0, 0.0, 1.0, 0.5, 0.5, 0.0])
 
-    # Mock prompts tensor (2 unique prompts, each repeated 3 times)
-    prompts = torch.tensor(
-        [
-            [1, 2, 3],  # prompt 0
-            [1, 2, 3],  # prompt 0
-            [1, 2, 3],  # prompt 0
-            [4, 5, 6],  # prompt 1
-            [4, 5, 6],  # prompt 1
-            [4, 5, 6],  # prompt 1
-        ]
-    )
-
     # First prompt group has std=0.5 (rewards: 1.0, 0.0, 1.0 -> std ≠ 0)
     # Second prompt group has std=0.25 (rewards: 0.5, 0.5, 0.0 -> std ≠ 0)
     std = torch.tensor(
@@ -1172,14 +1160,6 @@ def test_dapo_dynamic_sampling_batch_caching(mock_grpo_components):
     repeated_batch = create_mock_batch(batch_size, task_names, message_logs)
     repeated_batch["total_reward"] = torch.tensor([1.0, 0.0, 0.5])  # Non-zero std
 
-    prompts = torch.tensor(
-        [
-            [1, 2, 3],  # prompt 0
-            [1, 2, 3],  # prompt 0
-            [1, 2, 3],  # prompt 0
-        ]
-    )
-
     std = torch.tensor([0.4, 0.4, 0.4])  # Only one prompt with non-zero std
     baseline = torch.tensor([0.5, 0.5, 0.5])
 
@@ -1243,17 +1223,6 @@ def test_dapo_dynamic_sampling_disabled(mock_grpo_components):
 
     repeated_batch = create_mock_batch(batch_size, task_names, message_logs)
     repeated_batch["total_reward"] = torch.tensor([1.0, 1.0, 1.0, 0.5, 0.5, 0.0])
-
-    prompts = torch.tensor(
-        [
-            [1, 2, 3],
-            [1, 2, 3],
-            [1, 2, 3],
-            [4, 5, 6],
-            [4, 5, 6],
-            [4, 5, 6],
-        ]
-    )
 
     # Mix of zero and non-zero std
     std = torch.tensor([0.0, 0.0, 0.0, 0.25, 0.25, 0.25])
@@ -1404,7 +1373,7 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node(
 
     # Mock everything we don't need to test
     with (
-        patch("nemo_rl.algorithms.grpo.Logger") as mock_logger,
+        patch("nemo_rl.algorithms.grpo.Logger"),
         patch("nemo_rl.algorithms.grpo.CheckpointManager") as mock_checkpointer,
         patch("nemo_rl.algorithms.grpo.StatefulDataLoader"),
         pytest.raises(
@@ -1447,7 +1416,7 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node(
 
     # Mock everything we don't need to test
     with (
-        patch("nemo_rl.algorithms.grpo.Logger") as mock_logger,
+        patch("nemo_rl.algorithms.grpo.Logger"),
         patch("nemo_rl.algorithms.grpo.CheckpointManager") as mock_checkpointer,
         patch("nemo_rl.algorithms.grpo.StatefulDataLoader"),
         pytest.raises(
@@ -1723,6 +1692,9 @@ def test_refit_policy_generation_sglang_colocated_http(monkeypatch):
     }
 
     class DummySGLangGeneration:
+        def get_checkpoint_engine_config(self):
+            return None
+
         def prepare_for_generation(self, tags=None):
             calls["prepare_for_generation_tags"].append(tags)
 
@@ -1748,7 +1720,10 @@ def test_refit_policy_generation_sglang_colocated_http(monkeypatch):
             return ["ok"]
 
     monkeypatch.setattr(grpo_mod, "SGLangGeneration", DummySGLangGeneration)
-    monkeypatch.setattr(grpo_mod.ray, "get", lambda x: x)
+
+    import nemo_rl.weight_sync.http_weight_synchronizer as sync_mod
+
+    monkeypatch.setattr(sync_mod.ray, "get", lambda x: x)
 
     grpo_mod.refit_policy_generation(
         policy=DummyPolicy(),
@@ -1769,7 +1744,8 @@ def test_refit_policy_generation_sglang_non_colocated_raises(monkeypatch):
     from nemo_rl.algorithms import grpo as grpo_mod
 
     class DummySGLangGeneration:
-        pass
+        def get_checkpoint_engine_config(self):
+            return None
 
     monkeypatch.setattr(grpo_mod, "SGLangGeneration", DummySGLangGeneration)
 
@@ -1799,6 +1775,9 @@ def test_refit_policy_generation_non_colocated_offloads_and_restores(monkeypatch
             calls.append("prepare_for_training")
 
     class DummyGeneration:
+        def get_checkpoint_engine_config(self):
+            return None
+
         def update_weights_from_collective(self):
             calls.append("update_weights_from_collective")
             return ["inference-ok"]
@@ -1818,6 +1797,131 @@ def test_refit_policy_generation_non_colocated_offloads_and_restores(monkeypatch
         "update_weights_from_collective",
         "prepare_for_training",
     ]
+
+
+def test_refit_policy_generation_checkpoint_engine_non_colocated(monkeypatch):
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    calls = []
+    checkpoint_engine_config = {
+        "enabled": True,
+        "backend": "nixl",
+        "update_weights_bucket_megabytes": 1,
+        "engine_kwargs": {
+            "nixl": {
+                "device": "cuda",
+                "cleanup_after_load": False,
+                "backend_name": "UCX",
+            }
+        },
+    }
+
+    class DummyPolicy:
+        def init_checkpoint_engine(self, **kwargs):
+            calls.append(("policy_init", kwargs))
+            return ["policy_init"]
+
+        def prepare_checkpoint_engine(self):
+            calls.append(("policy_prepare", None))
+            return ["policy_meta_0", "policy_meta_1"]
+
+        def init_checkpoint_engine_process_group(self, **kwargs):
+            calls.append(("policy_pg", kwargs))
+            return ["policy_pg"]
+
+        def send_weights_via_checkpoint_engine(self, kv_scales=None):
+            calls.append(("policy_send", kv_scales))
+            return ["policy_send"]
+
+        def finalize_checkpoint_engine(self):
+            calls.append(("policy_finalize", None))
+            return ["policy_finalize"]
+
+        def broadcast_weights_for_collective(self, **_kwargs):
+            raise AssertionError("NCCL path should not be used")
+
+    class DummyGeneration:
+        def get_checkpoint_engine_config(self):
+            return checkpoint_engine_config
+
+        def init_checkpoint_engine(self, **kwargs):
+            calls.append(("generation_init", kwargs))
+            return ["generation_init"]
+
+        def prepare_checkpoint_engine(self):
+            calls.append(("generation_prepare", None))
+            return [["generation_meta_0", "generation_meta_1"]]
+
+        def init_checkpoint_engine_process_group(self, **kwargs):
+            calls.append(("generation_pg", kwargs))
+            return ["generation_pg"]
+
+        def update_weights_from_checkpoint_engine(self):
+            calls.append(("generation_update", None))
+            return [True]
+
+        def finalize_checkpoint_engine(self):
+            calls.append(("generation_finalize", None))
+            return ["generation_finalize"]
+
+        def update_weights_from_collective(self):
+            raise AssertionError("NCCL path should not be used")
+
+    import nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer as sync_mod
+
+    monkeypatch.setattr(sync_mod.ray, "get", lambda x: x)
+
+    grpo_mod.refit_policy_generation(
+        policy=DummyPolicy(),
+        policy_generation=DummyGeneration(),
+        colocated_inference=False,
+        kv_scales={"scale": 1.0},
+    )
+
+    assert calls[0][0] == "policy_init"
+    assert calls[1][0] == "generation_init"
+    assert ("policy_send", {"scale": 1.0}) in calls
+    assert ("generation_update", None) in calls
+    assert calls[-2:] == [
+        ("policy_finalize", None),
+        ("generation_finalize", None),
+    ]
+
+    policy_pg = next(kwargs for name, kwargs in calls if name == "policy_pg")
+    assert policy_pg["metadata"] == [
+        "policy_meta_0",
+        "policy_meta_1",
+        "generation_meta_0",
+        "generation_meta_1",
+    ]
+    assert policy_pg["train_world_size"] == 2
+    assert policy_pg["rollout_world_size"] == 2
+
+
+def test_refit_policy_generation_checkpoint_engine_requires_non_colocated():
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    class DummyGeneration:
+        def get_checkpoint_engine_config(self):
+            return {
+                "enabled": True,
+                "backend": "nixl",
+                "update_weights_bucket_megabytes": 1,
+                "engine_kwargs": {
+                    "nixl": {
+                        "device": "cuda",
+                        "cleanup_after_load": False,
+                        "backend_name": "UCX",
+                    }
+                },
+            }
+
+    with pytest.raises(ValueError, match="non-colocated"):
+        grpo_mod.refit_policy_generation(
+            policy=object(),
+            policy_generation=DummyGeneration(),
+            colocated_inference=True,
+        )
 
 
 def test_grpo_train_collects_generation_logger_and_seq_metrics(

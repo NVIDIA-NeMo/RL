@@ -84,6 +84,7 @@ from nemo_rl.models.policy.interfaces import (
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
     get_runtime_env_for_policy_worker,
+    maybe_preinit_nixl_for_checkpoint_engine,
     resolve_model_class,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
@@ -229,6 +230,8 @@ class DTensorPolicyWorkerImpl(
         configure_dynamo_cache()
 
         self.cfg = config
+        self._nixl_preinit_agent = maybe_preinit_nixl_for_checkpoint_engine(config)
+
         # torch distributed init. Envars for rank, world_size, and master_addr and master_port are set from the ray remote call
         torch.distributed.init_process_group(backend="nccl")
         self.rank = torch.distributed.get_rank()
@@ -901,7 +904,7 @@ class DTensorPolicyWorkerImpl(
                         if mb_idx < iterator_len:
                             ## scale by the number of global batches so we get the correct
                             ## value when summing metrics across all microbatches
-                            for k in loss_metrics.keys():
+                            for k in loss_metrics:
                                 if "_min" in k or "_max" in k:
                                     continue
                                 loss_metrics[k] /= num_global_batches
@@ -1361,9 +1364,6 @@ class DTensorPolicyWorkerImpl(
                     )
                     seq_len = input_ids.shape[1]
                     attention_mask = None
-                    flash_attn_kwargs = get_flash_attention_kwargs(
-                        input_lengths=input_lengths,
-                    )
                 else:
                     # Create attention mask for right-padded data
                     post_attention_mask = torch.zeros(
@@ -1819,6 +1819,14 @@ class DTensorPolicyWorkerImpl(
             "calibrate_qkv_fp8_scales is not implemented for DTensorPolicyWorker"
         )
 
+    def _iter_params_for_refit(self) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """Yield full contiguous tensors from DTensor state for refit transfer."""
+        for name, tensor in self.model.state_dict().items():
+            full_tensor = (
+                tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
+            )
+            yield name, full_tensor.to(self.dtype, non_blocking=True).contiguous()
+
     @torch.no_grad()
     @wrap_with_nvtx_name("dtensor_policy_worker/stream_weights_via_ipc_zmq")
     def stream_weights_via_ipc_zmq(
@@ -1839,24 +1847,9 @@ class DTensorPolicyWorkerImpl(
 
         from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
 
-        def dtensor_params_generator():
-            """Generator that yields (name, tensor) pairs, converting DTensors to local tensors."""
-            for name, tensor in self.model.state_dict().items():
-                if isinstance(tensor, DTensor):
-                    # Convert DTensor to full tensor for streaming
-                    full_tensor = tensor.full_tensor()
-                    # Convert to target dtype
-                    yield (
-                        name,
-                        full_tensor.to(self.dtype, non_blocking=True).contiguous(),
-                    )
-                else:
-                    # Convert to target dtype
-                    yield name, tensor.to(self.dtype, non_blocking=True).contiguous()
-
         # Use the shared implementation
         stream_weights_via_ipc_zmq_impl(
-            params_generator=dtensor_params_generator(),
+            params_generator=self._iter_params_for_refit(),
             buffer_size_bytes=buffer_size_bytes,
             zmq_socket=self.zmq_socket,
             rank=self.rank,
@@ -1901,6 +1894,29 @@ class DTensorPolicyWorkerImpl(
         # cpu offload needs model on CPU before model forward
         if self.cpu_offload:
             self.model = self.move_to_cpu(self.model)
+
+    @torch.no_grad()
+    def send_weights_via_checkpoint_engine(
+        self, kv_scales: Optional[dict[str, float]] = None
+    ) -> None:
+        """Send model weights through the configured checkpoint engine."""
+        if kv_scales is not None:
+            raise NotImplementedError(
+                "FP8 kvcache is not currently supported for DTensor path, we will support it in the future."
+            )
+
+        if self.cpu_offload:
+            print(
+                "[WARNING]: Unless you are lacking of memory, it is not recommended to enable cpu_offload when "
+                "using non-colocated generation since it will have an extra onload and offload at refit stage."
+            )
+            self.model = self.move_to_cuda(self.model)
+
+        try:
+            self._send_weights_with_checkpoint_engine(self._iter_params_for_refit())
+        finally:
+            if self.cpu_offload:
+                self.model = self.move_to_cpu(self.model)
 
     @wrap_with_nvtx_name("dtensor_policy_worker/prepare_for_lp_inference")
     def prepare_for_lp_inference(self) -> None:

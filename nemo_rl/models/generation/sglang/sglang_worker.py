@@ -43,6 +43,10 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_SERVER_STARTUP_TIMEOUT_SECONDS = 300.0
+_DEFAULT_STARTUP_HEALTH_ENDPOINT = "health"
+_SUPPORTED_STARTUP_HEALTH_ENDPOINTS = {"health", "health_generate"}
+
 
 def _require_sglang():
     """Import `sglang` lazily so test collection works without the optional extra."""
@@ -58,6 +62,27 @@ def _require_sglang():
         ) from e
 
     return launch_server, ServerArgs, kill_process_tree
+
+
+def _normalize_startup_health_endpoint(endpoint: str | None) -> str:
+    if endpoint is None:
+        return _DEFAULT_STARTUP_HEALTH_ENDPOINT
+    endpoint = endpoint.removeprefix("/")
+    if endpoint not in _SUPPORTED_STARTUP_HEALTH_ENDPOINTS:
+        raise ValueError(
+            "SGLang startup_health_endpoint must be one of "
+            f"{sorted(_SUPPORTED_STARTUP_HEALTH_ENDPOINTS)}, got {endpoint!r}."
+        )
+    return endpoint
+
+
+def _normalize_server_startup_timeout(timeout: int | float | None) -> float:
+    if timeout is None:
+        return _DEFAULT_SERVER_STARTUP_TIMEOUT_SECONDS
+    timeout = float(timeout)
+    if timeout <= 0:
+        raise ValueError("SGLang server_startup_timeout must be > 0 seconds.")
+    return timeout
 
 
 @ray.remote(
@@ -523,6 +548,16 @@ class SGLangGenerationWorker:
         """Launch the SGLang server process and wait for it to be ready."""
         # Ensure `sglang` is importable when we actually start a server.
         launch_server, _, kill_process_tree = _require_sglang()
+        max_wait_time = _normalize_server_startup_timeout(
+            self.sglang_cfg.get("server_startup_timeout")
+        )
+        startup_health_endpoint = _normalize_startup_health_endpoint(
+            self.sglang_cfg.get("startup_health_endpoint")
+        )
+        health_endpoints = [startup_health_endpoint]
+        if startup_health_endpoint == "health":
+            health_endpoints.append("health_generate")
+        polled_endpoints = " or ".join(f"/{endpoint}" for endpoint in health_endpoints)
         p = multiprocessing.Process(target=launch_server, args=(server_args,))
         p.start()
 
@@ -532,20 +567,30 @@ class SGLangGenerationWorker:
             "Content-Type": "application/json; charset=utf-8",
         }
 
-        max_wait_time = 300  # 5 minutes timeout
         start_time = time.time()
         with requests.Session() as session:
             while True:
                 if time.time() - start_time > max_wait_time:
                     kill_process_tree(p.pid)
                     raise TimeoutError(
-                        f"[SGLang Server] Rank {self.global_rank} Server failed to start within {max_wait_time}s"
+                        f"[SGLang Server] Rank {self.global_rank} Server failed "
+                        f"to start within {max_wait_time:g}s while polling "
+                        f"{polled_endpoints}"
                     )
                 try:
-                    response = session.get(
-                        f"{self.base_url}/health_generate", headers=headers, timeout=10
-                    )
-                    if response.status_code == 200:
+                    is_ready = False
+                    for endpoint in health_endpoints:
+                        response = session.get(
+                            f"{self.base_url}/{endpoint}",
+                            headers=headers,
+                            timeout=10,
+                        )
+                        if response.status_code == 200:
+                            is_ready = True
+                            break
+                        if response.status_code not in (404, 405):
+                            break
+                    if is_ready:
                         logger.info(
                             f"[SGLang Server] Rank {self.global_rank} Server is ready at {self.base_url}"
                         )

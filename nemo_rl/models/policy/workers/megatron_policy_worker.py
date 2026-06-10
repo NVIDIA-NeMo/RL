@@ -87,7 +87,10 @@ from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
 )
-from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
+from nemo_rl.models.policy.utils import (
+    get_runtime_env_for_policy_worker,
+    maybe_preinit_nixl_for_checkpoint_engine,
+)
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
@@ -188,6 +191,7 @@ class MegatronPolicyWorkerImpl(
         apply_transformer_engine_patch()
 
         self.cfg = config
+        self._nixl_preinit_agent = maybe_preinit_nixl_for_checkpoint_engine(config)
 
         # Set rank for non-collocated to check which ranks to broadcast from
         self.rank = get_rank_safe()
@@ -476,7 +480,7 @@ class MegatronPolicyWorkerImpl(
                     mb_losses = []
                     for x in losses_reduced:
                         loss_metrics = {}
-                        for k in x.keys():
+                        for k in x:
                             if "_min" in k or "_max" in k:
                                 loss_metrics[k] = x[k]
                             else:
@@ -1209,6 +1213,15 @@ class MegatronPolicyWorkerImpl(
             post_iter_func=lambda x: x[1],
         )
 
+    @torch.no_grad()
+    def send_weights_via_checkpoint_engine(
+        self, kv_scales: Optional[dict[str, float]] = None
+    ) -> None:
+        """Send model weights through the configured checkpoint engine."""
+        self._send_weights_with_checkpoint_engine(
+            self._iter_params_with_optional_kv_scales(kv_scales=kv_scales)
+        )
+
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)
         self.model.eval()
@@ -1487,8 +1500,6 @@ class MegatronPolicyWorkerImpl(
             )
 
         original_save_path = self.mcore_state.cfg.checkpoint.save
-        # save_dir = os.path.dirname(weights_path)
-        release_name = os.path.basename(weights_path)
 
         try:
             maybe_finalize_async_save(

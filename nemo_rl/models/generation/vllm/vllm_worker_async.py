@@ -13,8 +13,10 @@
 # limitations under the License.
 
 import asyncio
+import concurrent.futures
 import copy
 import gc
+import inspect
 import threading
 import time
 import uuid
@@ -39,8 +41,30 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     verify_right_padding,
 )
+from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generation
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
+
+
+async def _resolve_collective_rpc_result(result: Any) -> Any:
+    while inspect.isawaitable(result):
+        result = await result
+
+    if isinstance(result, concurrent.futures.Future):
+        return await _resolve_collective_rpc_result(await asyncio.wrap_future(result))
+
+    if isinstance(result, ray.ObjectRef):
+        return await asyncio.to_thread(ray.get, result)
+
+    if isinstance(result, list):
+        if all(isinstance(item, ray.ObjectRef) for item in result):
+            return await asyncio.to_thread(ray.get, result)
+        return [await _resolve_collective_rpc_result(item) for item in result]
+
+    if isinstance(result, tuple):
+        return tuple([await _resolve_collective_rpc_result(item) for item in result])
+
+    return result
 
 
 def _replace_prefix_tokens(
@@ -152,10 +176,10 @@ Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"""
 class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
     def __init__(
         self,
-        config,
-        bundle_indices=None,
+        config: VllmConfig,
+        bundle_indices: Optional[list[int]] = None,
         fraction_of_gpus: float = 1.0,
-        seed=None,
+        seed: Optional[int] = None,
         extra_env_vars: Optional[list[str]] = None,
         defer_model_load: bool = False,
     ):
@@ -175,6 +199,10 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                           the vLLM worker subprocess.
             defer_model_load: If True, skip model loading and only reserve port
         """
+        self.server_thread: Optional[threading.Thread] = None
+        self.base_url: Optional[str] = None
+        self.http_server: Optional[uvicorn.Server] = None
+
         # Deferred-loading state. Always initialized so every instance has a
         # consistent set of attributes regardless of init path.
         self._reserved_socket = None
@@ -184,12 +212,12 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         self._deferred_seed = None
 
         super().__init__(
-            config,
-            bundle_indices,
-            fraction_of_gpus,
-            seed,
-            extra_env_vars,
-            defer_model_load,
+            config=config,
+            bundle_indices=bundle_indices,
+            fraction_of_gpus=fraction_of_gpus,
+            seed=seed,
+            extra_env_vars=extra_env_vars,
+            defer_model_load=defer_model_load,
         )
 
         if not self.is_model_owner or not defer_model_load:
@@ -274,7 +302,6 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             self.llm_async_engine_args, stat_loggers=self.stat_loggers
         )
 
-        self.server_thread, self.base_url, self.http_server = None, None, None
         if self.cfg["vllm_cfg"].get("expose_http_server"):
             # Must run after AsyncLLM.from_engine_args and before
             # _setup_vllm_server spawns the uvicorn thread.
@@ -926,6 +953,53 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             ),
         )
 
+    async def _checkpoint_engine_rpc_async(self, method_name: str, *args: Any) -> Any:
+        result = await self.llm.collective_rpc(method_name, args=args)
+        return await _resolve_collective_rpc_result(result)
+
+    async def init_checkpoint_engine_async(
+        self,
+        backend: str,
+        bucket_size_bytes: int,
+        engine_kwargs: dict[str, Any],
+    ) -> None:
+        await self._checkpoint_engine_rpc_async(
+            "init_checkpoint_engine",
+            backend,
+            bucket_size_bytes,
+            engine_kwargs,
+        )
+
+    async def prepare_checkpoint_engine_async(self) -> list[Any]:
+        return cast(
+            list[Any],
+            await self._checkpoint_engine_rpc_async("prepare_checkpoint_engine"),
+        )
+
+    async def init_checkpoint_engine_process_group_async(
+        self,
+        rank_prefix: int,
+        train_world_size: int,
+        rollout_world_size: int,
+        metadata: list[Any],
+    ) -> None:
+        await self._checkpoint_engine_rpc_async(
+            "init_checkpoint_engine_process_group",
+            rank_prefix,
+            train_world_size,
+            rollout_world_size,
+            metadata,
+        )
+
+    async def finalize_checkpoint_engine_async(self) -> None:
+        await self._checkpoint_engine_rpc_async("finalize_checkpoint_engine")
+
+    async def update_weights_from_checkpoint_engine_async(self) -> bool:
+        worker_results = await self._checkpoint_engine_rpc_async(
+            "update_weights_from_checkpoint_engine"
+        )
+        return all(result for result in worker_results if result is not None)
+
     async def generate_async(
         self,
         data: BatchedDataDict[GenerationDatumSpec],
@@ -1441,13 +1515,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             torch.cuda.empty_cache()
 
             if self.server_thread is not None:
-                from threading import Thread
-
-                from uvicorn import Server
-
-                self.http_server: Server
-                self.server_thread: Thread
-
+                assert self.http_server is not None
                 self.http_server.should_exit = True
                 self.server_thread.join()
 

@@ -72,12 +72,12 @@ import ray
 import torch
 from transformers import AutoTokenizer
 
-from nemo_rl.algorithms.grpo import refit_policy_generation
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.weight_sync import create_weight_synchronizer
 
 
 def parse_args():
@@ -149,12 +149,13 @@ def setup_configs(args, tokenizer):
     megatron_config = {
         "model_name": args.model_name,
         "training_backend": "megatron",
-        "train_global_batch_size": 1,
+        "train_global_batch_size": 8,
         "train_micro_batch_size": 1,
         "generation_batch_size": 2,
         "learning_rate": 0.0001,
         "logprob_batch_size": 1,
         "generation": {
+            "backend": "vllm",
             "temperature": 1.0,
             "top_p": 1.0,
             "top_k": None,
@@ -214,9 +215,14 @@ def setup_configs(args, tokenizer):
             "moe_router_dtype": "fp64",
             "moe_router_load_balancing_type": "none",
             "moe_router_bias_update_rate": 0.0,
+            "moe_enable_deepep": False,
+            "moe_token_dispatcher_type": "alltoall",
+            "moe_shared_expert_overlap": False,
+            "moe_grouped_gemm": True,
             "moe_permute_fusion": False,
             "pipeline_dtype": "bfloat16",
             "train_iters": 1,
+            "defer_fp32_logits": False,
             "bias_activation_fusion": False,
             "moe_per_layer_logging": False,
             "freeze_moe_router": False,
@@ -227,7 +233,7 @@ def setup_configs(args, tokenizer):
                 "lr": 5.0e-6,
                 "min_lr": 5.0e-7,
                 "weight_decay": 0.01,
-                "bf16": False,
+                "bf16": True,
                 "fp16": False,
                 "params_dtype": "float32",
                 # Adam optimizer settings
@@ -397,14 +403,15 @@ def run_model_refitting(policy, vllm_inference_policy, refit_buffer_size_gb):
     """
     print("\n--- Performing Model Refitting ---")
 
-    # Perform the refitting between policies using GRPO's refit function
-    # Note: colocated_inference=True since we're using the same cluster
-    refit_policy_generation(
-        policy,
-        vllm_inference_policy,
-        colocated_inference=True,
-        _refit_buffer_size_gb=refit_buffer_size_gb,
+    weight_sync = create_weight_synchronizer(
+        policy=policy,
+        generation=vllm_inference_policy,
+        generation_backend="vllm",
+        colocated=True,
+        refit_buffer_size_gb=refit_buffer_size_gb,
     )
+    weight_sync.init_communicator()
+    weight_sync.sync_weights()
     print("Model refitting completed")
 
 
@@ -597,10 +604,6 @@ def main():
 
     # Prepare input data
     generation_data = prepare_input_data(args.prompt, tokenizer)
-
-    # prepare refit info
-    state_dict_info = policy.prepare_refit_info()
-    vllm_inference_policy.prepare_refit_info(state_dict_info)
 
     # Perform model refitting
     run_model_refitting(policy, vllm_inference_policy, args.refit_buffer_size_gb)

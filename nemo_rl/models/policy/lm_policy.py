@@ -989,6 +989,58 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # this function should co-work with vllm, so we should wait for all futures to complete outside
         return futures
 
+    def _run_checkpoint_engine_workers(
+        self, method_name: str, **kwargs: Any
+    ) -> list[ray.ObjectRef]:
+        return self.worker_group.run_all_workers_single_data(method_name, **kwargs)
+
+    def init_checkpoint_engine(
+        self,
+        *,
+        backend: str,
+        bucket_size_bytes: int,
+        engine_kwargs: dict[str, Any],
+    ) -> list[ray.ObjectRef]:
+        """Initialize checkpoint-engine refit transfer on all policy workers."""
+        return self._run_checkpoint_engine_workers(
+            "init_checkpoint_engine",
+            backend=backend,
+            bucket_size_bytes=bucket_size_bytes,
+            engine_kwargs=engine_kwargs,
+        )
+
+    def prepare_checkpoint_engine(self) -> list[ray.ObjectRef]:
+        """Prepare checkpoint-engine buffers on all policy workers."""
+        return self._run_checkpoint_engine_workers("prepare_checkpoint_engine")
+
+    def init_checkpoint_engine_process_group(
+        self,
+        *,
+        metadata: list[Any],
+        train_world_size: int,
+        rollout_world_size: int,
+    ) -> list[ray.ObjectRef]:
+        """Initialize policy-side checkpoint-engine topology."""
+        return self._run_checkpoint_engine_workers(
+            "init_checkpoint_engine_process_group",
+            metadata=metadata,
+            train_world_size=train_world_size,
+            rollout_world_size=rollout_world_size,
+        )
+
+    def send_weights_via_checkpoint_engine(
+        self, kv_scales: Optional[dict[str, float]] = None
+    ) -> list[ray.ObjectRef]:
+        """Send policy weights through the configured checkpoint engine."""
+        return self._run_checkpoint_engine_workers(
+            "send_weights_via_checkpoint_engine",
+            kv_scales=kv_scales,
+        )
+
+    def finalize_checkpoint_engine(self) -> list[ray.ObjectRef]:
+        """Finalize checkpoint-engine state on all policy workers."""
+        return self._run_checkpoint_engine_workers("finalize_checkpoint_engine")
+
     def offload_before_refit(self) -> None:
         """Offload the optimizer and buffers to the CPU."""
         futures = self.worker_group.run_all_workers_single_data("offload_before_refit")

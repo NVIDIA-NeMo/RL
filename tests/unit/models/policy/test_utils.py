@@ -27,6 +27,7 @@ from nemo_rl.models.policy.utils import (
     IPCProtocol,
     calculate_aligned_size,
     get_megatron_checkpoint_dir,
+    maybe_preinit_nixl_for_checkpoint_engine,
     rebuild_cuda_tensor_from_ipc,
     stream_weights_via_ipc_zmq_impl,
 )
@@ -118,6 +119,60 @@ class TestGetMegatronCheckpointDir:
                 f"Using default megatron checkpoint dir: {expected_dir}" in captured.out
             )
             assert result == expected_dir
+
+
+class TestMaybePreinitNixlForCheckpointEngine:
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {},
+            {"generation": {}},
+            {"generation": {"checkpoint_engine": {"enabled": False}}},
+            {
+                "generation": {
+                    "checkpoint_engine": {
+                        "enabled": True,
+                        "backend": "other",
+                        "engine_kwargs": {},
+                    }
+                }
+            },
+        ],
+    )
+    def test_returns_none_when_checkpoint_engine_is_not_nixl(self, config):
+        assert maybe_preinit_nixl_for_checkpoint_engine(config) is None
+
+    def test_preinitializes_nixl_backend(self, monkeypatch):
+        calls = []
+
+        def fake_preinit_nixl_agent(*, backend_name, backend_init_params):
+            calls.append((backend_name, backend_init_params))
+            return "agent"
+
+        monkeypatch.setattr(
+            "nemo_rl.utils.checkpoint_engines.nixl.preinit_nixl_agent",
+            fake_preinit_nixl_agent,
+        )
+
+        agent = maybe_preinit_nixl_for_checkpoint_engine(
+            {
+                "generation": {
+                    "checkpoint_engine": {
+                        "enabled": True,
+                        "backend": "nixl",
+                        "engine_kwargs": {
+                            "nixl": {
+                                "backend_name": "UCX",
+                                "backend_init_params": {"device": "cuda"},
+                            }
+                        },
+                    }
+                }
+            }
+        )
+
+        assert agent == "agent"
+        assert calls == [("UCX", {"device": "cuda"})]
 
 
 def server_process(

@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 from typing import Any, Optional
 
 import ray
@@ -43,6 +44,54 @@ class AbstractPolicyWorker:
         )
         device = torch.cuda.current_device()
         self.model_update_group.init_nccl_communicator(device=device)
+
+    def init_checkpoint_engine(
+        self,
+        *,
+        backend: str,
+        bucket_size_bytes: int,
+        engine_kwargs: dict[str, Any],
+    ) -> None:
+        """Initialize a checkpoint-engine refit backend for this policy worker."""
+        if getattr(self, "checkpoint_engine", None) is not None:
+            return
+
+        from nemo_rl.utils.checkpoint_engine import create_checkpoint_engine
+
+        self.checkpoint_engine = create_checkpoint_engine(
+            backend,
+            bucket_size_bytes=bucket_size_bytes,
+            engine_kwargs=engine_kwargs,
+        )
+
+    def prepare_checkpoint_engine(self) -> Any:
+        """Prepare transfer buffers and return checkpoint-engine metadata."""
+        return self.checkpoint_engine.prepare()
+
+    def init_checkpoint_engine_process_group(
+        self,
+        *,
+        metadata: list[Any],
+        train_world_size: int,
+        rollout_world_size: int,
+    ) -> None:
+        """Connect this policy worker into the checkpoint-engine topology."""
+        self.checkpoint_engine.init_policy_process_group(
+            worker_rank=self.rank,
+            train_world_size=train_world_size,
+            rollout_world_size=rollout_world_size,
+            metadata=metadata,
+        )
+
+    def finalize_checkpoint_engine(self) -> None:
+        """Release checkpoint-engine transfer state."""
+        checkpoint_engine = getattr(self, "checkpoint_engine", None)
+        if checkpoint_engine is None:
+            return
+        checkpoint_engine.finalize()
+
+    def _send_weights_with_checkpoint_engine(self, weights: Any) -> None:
+        asyncio.run(self.checkpoint_engine.send_weights(weights))
 
     def is_alive(self) -> bool:
         """Check if the worker is alive."""
