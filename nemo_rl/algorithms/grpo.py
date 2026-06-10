@@ -804,8 +804,8 @@ def setup(
                     "invalid_tool_call_patterns", None
                 )
                 thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
-                # Gym venv/uv caching (05eb9167): pass prebuilt cache + venv dirs through
-                # the global config so the gym reuses image-baked venvs vs. rebuilding.
+                # Pass prebuilt cache + venv dirs through the global config so the gym reuses
+                # image-baked venvs instead of rebuilding them.
                 uv_cache_dir = get_nemo_gym_uv_cache_dir()
                 if uv_cache_dir is not None:
                     nemo_gym_dict.setdefault("uv_cache_dir", uv_cache_dir)

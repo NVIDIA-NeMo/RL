@@ -1,26 +1,9 @@
-# Prefetch-only config: union of all NeMo Gym environments used across the
-# nemotron-3-super training stages (stage1_rlvr + stage2_swe{1,2} + stage3_rlhf,
-# from docs/guides/nemotron-3-super.md).
-#
-# Purpose: pass to the docker build so every gym server venv is baked into the image:
+# Prefetch config: union of NeMo Gym environments across the nemotron-3-super stages
+# (RLVR + SWE + RLHF). Pass to the docker build to bake every gym server venv into the image:
 #   docker buildx build -f docker/Dockerfile \
-#     --build-arg NEMO_GYM_PREFETCH_CONFIGS="examples/nemo_gym/prefetch_super_all_envs.yaml" \
-#     --tag <registry>/nemo-rl:latest .
-#
-# examples/nemo_gym/prefetch_venvs.py reads ONLY config["env"]["nemo_gym"] and dry-runs
-# NemoGym._spinup (no policy model), so policy / megatron_cfg / data / cluster / grpo /
-# loss_fn / logger are intentionally omitted — they are not read during prefetch.
-#
-# NOTE on the dummy_* keys below: the bundled Gym configs pulled in via config_paths use
-# OmegaConf interpolations (e.g. ${genrm_model_name}, ${judge_model_name}, ${policy_*})
-# that super_launch.sh injects at run time. The gym resolves them against the root of its
-# global config (== this env.nemo_gym block), so they MUST live directly under nemo_gym.
-# Their values are irrelevant to prefetch (no model is loaded in the dry run) — dummies
-# just let resolution succeed so the venvs build.
-#
-# Deviations from super-v3 stage1_rlvr.yaml:
-#   - terminal_pivot DROPPED: absent at our Gym pin (9b52dc8a); no 1:1 successor.
-#   - num_gpu_nodes DROPPED: irrelevant to the prefetch dry run (reserves no nodes).
+#     --build-arg NEMO_GYM_PREFETCH_CONFIGS="examples/nemo_gym/prefetch_super_all_envs.yaml" .
+# Only env.nemo_gym is read (dry-run NemoGym._spinup); the dummy values below satisfy the bundled
+# configs' interpolations during the dry run. terminal_pivot is omitted (absent at our Gym pin).
 env:
   should_use_nemo_gym: true
   nemo_gym:
@@ -28,7 +11,7 @@ env:
     port_range_low: 15001
     port_range_high: 20000
 
-    # Dummy interpolation values consumed by the bundled configs (see NOTE above).
+    # Dummy interpolation values for the bundled configs (unused in the dry run).
     policy_model_name: dummy-model
     policy_base_url: http://localhost:8000/v1
     policy_api_key: dummy
@@ -49,7 +32,6 @@ env:
       - "<think>"
       - "</think>"
     config_paths:
-    # --- stage1_rlvr (RLVR blend) ---
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
     - resources_servers/math_with_judge/configs/math_with_judge.yaml
     - resources_servers/code_gen/configs/code_gen.yaml
@@ -64,7 +46,6 @@ env:
     - resources_servers/equivalence_llm_judge/configs/equivalence_llm_judge.yaml
     - resources_servers/single_step_tool_use_with_argument_comparison/configs/single_step_tool_use_with_argument_comparison.yaml
     - resources_servers/reasoning_gym/configs/reasoning_gym.yaml
-    # NOTE: terminal_pivot dropped (absent at Gym pin 9b52dc8a) — see header.
     - resources_servers/ns_tools/configs/ns_tools.yaml
     - resources_servers/math_formal_lean/configs/math_formal_lean_multi_turn.yaml
     - resources_servers/swerl_gen/configs/swerl_gen.yaml
@@ -74,17 +55,11 @@ env:
     - resources_servers/inverse_if/configs/inverse_if.yaml
     - resources_servers/single_step_tool_use_with_argument_comparison/configs/search_pivot_single_step_tool_use_with_argument_comparison.yaml
     - resources_servers/single_step_tool_use_with_argument_comparison/configs/toolcall_schema_single_step_tool_use_with_argument_comparison.yaml
-    # --- stage2_swe1 / stage2_swe2 (SWE) ---
     - resources_servers/single_step_tool_use_with_argument_comparison/configs/swe_pivot_single_step_tool_use_with_argument_comparison.yaml
     - responses_api_agents/swe_agents/configs/swebench_openhands_training.yaml
 
-    # Named judge servers the bundled configs reference but don't define in this set:
-    #   safety_judge_model -> jailbreak_detection, over_refusal_detection
-    #   judge_model        -> inverse_if
-    # Defined as thin vllm_model clients (spinup_server: false) so the references resolve
-    # and the vllm_model venv builds; no model is loaded in the prefetch dry run.
-    # genrm_model is NOT defined here — the bundled genrm_compare.yaml already defines it
-    # (type genrm_model, model ${genrm_model_name}); redefining would collide.
+    # Thin vllm_model clients for the judge refs the bundled configs expect (so refs resolve and
+    # the vllm_model venv builds). genrm_model is already defined by the bundled genrm_compare.yaml.
     safety_judge_model:
       responses_api_models:
         vllm_model:
@@ -101,10 +76,7 @@ env:
           api_key: dummy
           model: dummy-judge
           spinup_server: false
-    # Referenced by the *_reasoning_off agents (e.g. genrm_simple_agent_reasoning_off).
-    # ultra-v3 defines this via `_copy: policy_model` + ${grpo...}/${add:...}, but those
-    # interpolations need a grpo section + the `add` resolver that a prefetch-only config
-    # lacks — so define it as a self-contained thin client (same venv: vllm_model).
+    # Thin client for the *_reasoning_off agent refs.
     policy_model_reasoning_off:
       responses_api_models:
         vllm_model:
@@ -113,11 +85,19 @@ env:
           api_key: dummy
           model: dummy-model
           spinup_server: false
+    # Standalone server defined only to bake the local_vllm_model venv (the runtime GPU judges
+    # use this type). dry_run builds the venv without loading a model.
+    prefetch_local_vllm_model:
+      responses_api_models:
+        local_vllm_model:
+          entrypoint: app.py
+          model: dummy-model
+          vllm_serve_kwargs:
+            tensor_parallel_size: 1
+            data_parallel_size: 1
+            pipeline_parallel_size: 1
 
-    # The bundled swe_agents config (stage2.2 / swebench_openhands_training.yaml) marks
-    # container_formatter and dataset_path as mandatory (???) — super_launch.sh fills them
-    # at run time. Provide dummies so the prefetch dry run resolves (no SWE runs here; the
-    # values are unused for venv building). Real SWE runs still need the sandbox container.
+    # swe_agents marks container_formatter/dataset_path mandatory; dummies satisfy the dry run.
     swe_agents_train:
       responses_api_agents:
         swe_agents:
