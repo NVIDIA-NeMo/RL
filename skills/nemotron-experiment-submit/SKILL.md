@@ -66,6 +66,41 @@ DiffuGRPO with FastDiffuser:
 For a smoke test, use the toy config for the relevant mode and cap steps through `EXTRA_CONFIG_OVERRIDES`, for example `grpo.max_num_steps=3 grpo.val_at_end=false checkpointing.enabled=false logger.wandb_enabled=false`.
 
 
+## DeepScaleR dataset
+
+DeepScaleR variants train on `agentica-org/DeepScaleR-Preview-Dataset` (`dataset_name: DeepScaler`, ~40K math problems) and validate on AIME 2024 (`HuggingFaceH4/aime_2024`, `dataset_name: AIME2024`, `repeat: 16`). Both route through the `math` env / `hf_math_verify` reward. The datasets are prefetched into the offline HF cache at `/lustre/fsw/portfolios/coreai/users/$USER/hf_home/datasets` (the training container is HF-offline; prefetch new datasets from a login node into that path before submitting).
+
+Configs (DeepScaleR train + AIME2024 validation; 4096 sequence budget = 350 prompt + 3744 generation; KL off; `val_period`/`save_period` = 10):
+
+- AR GRPO:   `CONFIG=examples/configs/deepscaler_nemotron_labs_diffusion_3b_sglang_ar_megatron.yaml`
+- DiffuGRPO: `CONFIG=examples/configs/deepscaler_nemotron_labs_diffusion_3b_sglang_diffugrpo_megatron.yaml`
+
+The diffugrpo config inherits the data block + 4096 sequence budget from the AR DeepScaleR config; KL-off (`loss_fn.reference_policy_kl_penalty: 0.0` + `grpo.skip_reference_policy_logprobs_calculation: true`) and the val/save intervals live in the AR parent.
+
+### max_new_tokens must be divisible by FastDiffuser block_size (32)
+
+For DiffuGRPO, `policy.generation.max_new_tokens` MUST be a multiple of the FastDiffuser `block_size` (32). A non-multiple (e.g. 3746) crashes generation with a RoPE view error (`view size is not compatible with input tensor's size and stride ...` in `rotary_embedding`). Use 3744 (= 117*32). AR mode has no such constraint but is kept at 3744 for consistency. For ar grpo use EXPANDABLE_SEGMENTS flag to avoid OOM(fragmentation OOM). DiffuGRPO did not need it (it does not OOM).
+
+### Multi-node: set cluster.num_nodes to match NODES
+
+`NODES` only sizes the Slurm allocation; the wrapper does NOT inject `cluster.num_nodes`, and the config defaults to `cluster.num_nodes: 1`. For multi-node runs you MUST override it via `EXTRA_CONFIG_OVERRIDES`, or NeMo-RL runs on a single node:
+
+```bash
+NODES=8 ... EXTRA_CONFIG_OVERRIDES='cluster.num_nodes=8' ...
+```
+
+### Example 8-node AR DeepScaleR submit
+
+```bash
+RUN_NAME=deepscaler_ar_3b_8n WANDB_RUN_NAME=deepscaler_ar_3b_8n JOB_NAME=ds_ar_8n \
+ACCOUNT=coreai_dlalgo_genai PARTITION=batch TIME=04:00:00 NODES=8 \
+ENV_TAG=mb_3rdparty_sglagn_local_fork EXPANDABLE_SEGMENTS=true \
+CONFIG=examples/configs/deepscaler_nemotron_labs_diffusion_3b_sglang_ar_megatron.yaml \
+NRL_FORCE_REBUILD_VENVS=false FORCE_REINSTALL_PACKAGES=false FORCE_REINSTALL_SGLANG=false \
+EXTRA_CONFIG_OVERRIDES='cluster.num_nodes=8 policy.logprob_batch_size=4' \
+bash tools/nemotron_diffusion/submit_grpo_nemotron_ar_megatron_sbatch.sh --sbatch
+```
+
 ## Rebuild and Reinstall Flags
 
 Use these deliberately:

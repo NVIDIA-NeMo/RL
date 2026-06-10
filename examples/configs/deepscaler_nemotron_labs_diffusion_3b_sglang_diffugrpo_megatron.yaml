@@ -1,0 +1,38 @@
+# DiffuGRPO on Nemotron-Labs-Diffusion-3B, training on DeepScaleR with AIME 2024 as validation.
+# Inherits from the AR DeepScaleR config: data block, 4096 sequence budget, KL off + reference
+# logprob skip, and val/save interval=10. Only DiffuGRPO-specific settings remain here -- the
+# DiffuGRPO policy worker + FastDiffuser generation, and the smaller validated batch
+# (mb=2 / logprob=4 vs AR's 4/8, since block-diffusion + fully-masked-completion logprob is
+# heavier than AR's generation + single-forward logprob; mb=4 OOMs for DiffuGRPO at 4096).
+defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_ar_megatron.yaml"
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nemotron-diffusion-3b-diffugrpo-deepscaler-megatron"
+
+policy:
+  worker_cls_fqn: "nemo_rl.models.policy.workers.diffu_grpo_megatron_policy_worker.DiffuGRPOMegatronPolicyWorker"
+  train_micro_batch_size: 2
+  logprob_batch_size: 2
+
+  logprob_estimation:
+    type: "diffu_grpo_fully_masked_completion"
+    mask_token_id: 100
+    exclude_mask_token_from_logits: true
+
+  generation:
+    # MUST stay divisible by FastDiffuser block_size=32 (3746 crashes generation with a RoPE
+    # view error). Kept explicit (not inherited) because the divisibility constraint is
+    # DiffuGRPO-specific -- AR has no such requirement.
+    max_new_tokens: 3744
+    sglang_cfg:
+      max_running_requests: 4
+      disable_cuda_graph: true
+      disable_piecewise_cuda_graph: true
+      json_model_override_args: '{}'
+      dllm_algorithm: "FastDiffuser"
+      dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL/tools/nemotron_diffusion/diffugrpo_fastdiffuser.yaml"
+
+logger:
+  log_dir: "logs/grpo-nemotron-diffusion-3b-diffugrpo-deepscaler-megatron-sglang"
+  wandb:
+    name: "grpo-nemotron-diffusion-3b-diffugrpo-deepscaler-megatron-sglang"

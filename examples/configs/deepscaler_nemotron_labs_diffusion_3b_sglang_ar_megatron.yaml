@@ -1,0 +1,50 @@
+# AR GRPO on Nemotron-Labs-Diffusion-3B, training on DeepScaleR with AIME 2024 as validation.
+# Inherits policy / megatron / generation settings from the gsm8k AR config; overrides the
+# data block plus the DeepScaleR sequence budget (350 prompt + 3744 generation <= 4096 total;
+# max_new_tokens kept at 3744 to match the DiffuGRPO config, though AR doesn't use FastDiffuser).
+# KL penalty disabled + reference logprob calc skipped (memory). val/save interval = 10.
+# Batch sizes validated by a memory smoke at 4096 (single node, 8xH100-80GB, SGLang co-located,
+# KL off): train_micro_batch_size=4 / logprob_batch_size=4 (logprob=8 fits one step but OOMs over a long run) -- 2x the DiffuGRPO ceiling (mb=2),
+# since AR generation + single-forward logprob is lighter than block-diffusion + fully-masked logprob.
+defaults: "gsm8k_nemotron_labs_diffusion_3b_sglang_ar_megatron.yaml"
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+
+grpo:
+  skip_reference_policy_logprobs_calculation: true
+  val_period: 10
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nemotron-diffusion-3b-ar-deepscaler-megatron"
+  save_period: 10
+
+policy:
+  max_total_sequence_length: 4096
+  train_micro_batch_size: 4
+  logprob_batch_size: 4
+  generation:
+    max_new_tokens: 3744
+
+logger:
+  log_dir: "logs/grpo-nemotron-diffusion-3b-ar-deepscaler-megatron-sglang"
+  wandb:
+    name: "grpo-nemotron-diffusion-3b-ar-deepscaler-megatron-sglang"
+
+data:
+  # Fully replace the inherited data block so no gsm8k split / split_validation_size leaks in.
+  _override_: true
+  shuffle: true
+  num_workers: 1
+  use_multiple_dataloader: false
+  max_input_seq_length: 350
+  train:
+    dataset_name: DeepScaler
+  validation:
+    dataset_name: AIME2024
+    repeat: 16
+  default:
+    prompt_file: "examples/prompts/cot.txt"
+    system_prompt_file: null
+    processor: "math_hf_data_processor"
+    env_name: "math"
