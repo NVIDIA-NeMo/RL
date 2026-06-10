@@ -102,6 +102,47 @@ from nemo_rl.utils.timer import Timer
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
+def _should_merge_adapter_weights_for_refit(config: PolicyConfig) -> bool:
+    """Return whether vLLM refit export should fold PEFT weights into base weights."""
+    return config["megatron_cfg"].get("peft", {}).get("enabled", False)
+
+
+def _validate_merged_refit_weight_name(name: str) -> None:
+    """Ensure merged LoRA export uses the plain base-model keyspace vLLM loaded."""
+    peft_markers = (".base_layer", ".adapter", ".lora_")
+    if any(marker in name for marker in peft_markers):
+        raise RuntimeError(
+            "Megatron-Bridge returned an unmerged PEFT wrapper key during "
+            f"vLLM refit export: {name}. When PEFT is enabled, "
+            "merge_adapter_weights=True should produce plain base-model keys."
+        )
+
+
+def _iter_refit_base_weights(
+    *,
+    megatron_bridge: Any,
+    model: Any,
+    conversion_tasks: Any,
+    config: PolicyConfig,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Export base-model refit weights with LoRA merging only when PEFT is enabled."""
+    merge_adapter_weights = _should_merge_adapter_weights_for_refit(config)
+    base_iter = megatron_bridge.export_hf_weights(
+        [model],
+        show_progress=False,
+        conversion_tasks=conversion_tasks,  # used for metadata caching
+        # Full-weight Ultra refit skips adapter discovery for speed. LoRA
+        # refit must merge adapter deltas so vLLM receives the same plain
+        # base-model keyspace it loaded initially.
+        merge_adapter_weights=merge_adapter_weights,
+    )
+
+    for name, tensor in base_iter:
+        if merge_adapter_weights:
+            _validate_merged_refit_weight_name(name)
+        yield name, tensor
+
+
 @ray.remote(
     runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker")
 )  # pragma: no cover
@@ -589,10 +630,10 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                         )
                     model_state_dict[name] = item
 
-                self.model.load_state_dict(self.reference_state_dict, strict=True)
-                # for name, item in self.reference_state_dict.items():
-                # if isinstance(item, torch.Tensor):
-                # self.model.state_dict()[name] = item.detach().to(device="cuda", non_blocking=True, copy=True)
+                # Swap reference model state_dict to self.model
+                for k, v in self.model.state_dict().items():
+                    if isinstance(v, torch.Tensor):
+                        v.copy_(self.reference_state_dict[k])
 
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
                     gc.collect()
@@ -604,11 +645,9 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
             finally:
                 # Restore original references and device placement
-                self.model.load_state_dict(model_state_dict, strict=True)
-                # for name, item in model_state_dict.items():
-                # if isinstance(item, torch.Tensor):
-                # item = item.detach().to(device="cuda", non_blocking=True, copy=True)
-                # self.model.state_dict()[name] = item
+                for k, v in self.model.state_dict().items():
+                    if isinstance(v, torch.Tensor):
+                        v.copy_(model_state_dict[k])
 
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
                     gc.collect()
@@ -1044,16 +1083,13 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             get_vllm_qkv_scale_names,
         )
 
-        base_iter = self.megatron_bridge.export_hf_weights(
-            [self.model],
-            show_progress=False,
-            conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
-            merge_adapter_weights=False,  # skip the extra module walk looking for adapter weights
-        )
-
         # Yield the original parameters first.
-        for name, tensor in base_iter:
-            yield name, tensor
+        yield from _iter_refit_base_weights(
+            megatron_bridge=self.megatron_bridge,
+            model=self.model,
+            conversion_tasks=self.refit_conversion_tasks,
+            config=self.cfg,
+        )
 
         # Check whether FP8 KV cache is enabled.
         use_fp8_kv_cache = False
