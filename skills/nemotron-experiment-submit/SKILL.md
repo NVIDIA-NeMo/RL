@@ -88,10 +88,10 @@ Use this shared env tag for the current dependency layout:
 ENV_TAG=mb_3rdparty_sglagn_local_fork
 ```
 
-Use this env tag for the DiffuGRPO local worktree layout that points at the editable DiffuGRPO NeMo-RL, SGLang, and Megatron-Bridge checkouts:
+Use this same env tag for DiffuGRPO megatron runs as well:
 
 ```bash
-ENV_TAG=diffu_grpo
+ENV_TAG=mb_3rdparty_sglagn_local_fork
 ```
 
 Do not change `ENV_TAG` for normal Python edits in the existing editable dependency trees. Reuse the tag so follow-up runs reuse the same driver and worker envs.

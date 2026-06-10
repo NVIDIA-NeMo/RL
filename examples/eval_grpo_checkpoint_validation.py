@@ -94,7 +94,17 @@ def parse_args() -> argparse.Namespace:
         choices=("sglang_dllm", "ar_native"),
         help="Generation backend. ar_native loads the HF model directly and calls model.ar_generate().",
     )
-    parser.add_argument("--dllm-algorithm", default="FastDiffuser", choices=("FastDiffuser", "LinearSpec"))
+    parser.add_argument(
+        "--dllm-algorithm",
+        default="FastDiffuser",
+        choices=("FastDiffuser", "LinearSpec", "AR"),
+        help="SGLang generation mode. AR uses model-level ar_mode=true, not a DLLM algorithm.",
+    )
+    parser.add_argument(
+        "--json-model-override-args",
+        default=None,
+        help="JSON override passed to SGLang. Defaults to {'ar_mode': true} for ALG=AR and {} otherwise.",
+    )
     parser.add_argument("--block-size", type=int, default=32)
     parser.add_argument("--max-steps", type=int, default=32)
     parser.add_argument("--threshold", type=float, default=0.9)
@@ -232,17 +242,24 @@ def score_response(verify_func: Any, response: str, gold: str) -> tuple[float, A
 def write_dllm_config(args: argparse.Namespace) -> Path:
     args.outdir.mkdir(parents=True, exist_ok=True)
     config_path = args.outdir / "dllm_config.yaml"
-    config = {
-        "algorithm": args.dllm_algorithm,
-        "causal_context": args.causal_context,
-        "block_size": args.block_size,
-        "max_steps": args.max_steps,
-        "threshold": args.threshold,
-        "stats_file": str(args.outdir / "stats.jsonl"),
-    }
-    if args.dllm_algorithm == "FastDiffuser":
-        config["selection_policy"] = args.selection_policy
-        config["temperature"] = args.temperature
+    if args.dllm_algorithm == "AR":
+        config = {
+            "algorithm": "AR",
+            "causal_context": args.causal_context,
+            "stats_file": str(args.outdir / "stats.jsonl"),
+        }
+    else:
+        config = {
+            "algorithm": args.dllm_algorithm,
+            "causal_context": args.causal_context,
+            "block_size": args.block_size,
+            "max_steps": args.max_steps,
+            "threshold": args.threshold,
+            "stats_file": str(args.outdir / "stats.jsonl"),
+        }
+        if args.dllm_algorithm == "FastDiffuser":
+            config["selection_policy"] = args.selection_policy
+            config["temperature"] = args.temperature
     with open(config_path, "w", encoding="utf-8") as f:
         for key, value in config.items():
             f.write(f"{key}: {value}\n")
@@ -262,8 +279,11 @@ def check_sglang_commit(repo: Path, expected: str) -> None:
         )
 
 
-def server_command(args: argparse.Namespace, dllm_config: Path) -> list[str]:
+def server_command(args: argparse.Namespace, dllm_config: Path | None) -> list[str]:
     py = args.venv / "bin" / "python"
+    json_model_override_args = args.json_model_override_args
+    if not json_model_override_args:
+        json_model_override_args = '{"ar_mode": true}' if args.dllm_algorithm == "AR" else "{}"
     cmd = [
         str(py),
         "-m",
@@ -296,20 +316,26 @@ def server_command(args: argparse.Namespace, dllm_config: Path) -> list[str]:
         "--attention-backend",
         args.attention_backend,
         "--json-model-override-args",
-        "{}",
+        json_model_override_args,
         "--disable-cuda-graph",
         "--disable-piecewise-cuda-graph",
-        "--dllm-algorithm",
-        args.dllm_algorithm,
-        "--dllm-algorithm-config",
-        str(dllm_config),
     ]
+    if args.dllm_algorithm != "AR":
+        assert dllm_config is not None
+        cmd.extend(
+            [
+                "--dllm-algorithm",
+                args.dllm_algorithm,
+                "--dllm-algorithm-config",
+                str(dllm_config),
+            ]
+        )
     if args.server_random_seed is not None:
         cmd.extend(["--random-seed", str(args.server_random_seed)])
     return cmd
 
 
-def launch_server(args: argparse.Namespace, dllm_config: Path) -> subprocess.Popen:
+def launch_server(args: argparse.Namespace, dllm_config: Path | None) -> subprocess.Popen:
     check_sglang_commit(args.sglang_repo, args.sglang_commit)
     log_path = args.outdir / "server.log"
     env = os.environ.copy()
@@ -476,7 +502,9 @@ def main() -> None:
         check_client_dependencies()
 
     dllm_config = None
-    if args.backend == "sglang_dllm":
+    if args.backend == "sglang_dllm" and args.dllm_algorithm == "AR":
+        print("Backend: SGLang AR mode via json_model_override_args {'ar_mode': true}")
+    elif args.backend == "sglang_dllm":
         dllm_config = write_dllm_config(args)
         print(f"DLLM config: {dllm_config}")
     else:
@@ -485,7 +513,6 @@ def main() -> None:
     server_proc = None
     try:
         if args.backend == "sglang_dllm" and args.launch_server:
-            assert dllm_config is not None
             cmd = server_command(args, dllm_config)
             print("Server command:")
             print(" ".join(json.dumps(x) for x in cmd))
