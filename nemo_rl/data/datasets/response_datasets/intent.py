@@ -282,17 +282,18 @@ class IntentDataset(RawDataset):
     def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
         """Format a manifest record into NeMo-RL OpenAI-style messages.
 
-        Each yielded sample carries the video file path AND a numpy audio
-        array decoded from the same file at 16 kHz mono. Downstream the VLM
-        processor invokes Qwen2.5-Omni with ``use_audio_in_video=True`` so the
-        two streams are aligned.
+        The user content carries only the video reference and the text prompt.
+        For Qwen2.5-Omni's ``use_audio_in_video=True`` mode the audio track is
+        decoded from the same video file by ``vlm_hf_data_processor`` and
+        attached as a processor-level kwarg, NOT as a separate ``type=audio``
+        content item. Adding an explicit audio item here would cause the chat
+        template to emit duplicate audio placeholder tokens and trip the
+        processor's audio_lengths iterator.
         """
         instruction = _TYPE_TEMPLATE.get(data["problem_type"], "")
         prompt_text = f"{data['problem']}{instruction}"
-        audio_array = _load_audio_from_video(data["video_path"])
         user_content = [
             {"type": "video", "video": data["video_path"]},
-            {"type": "audio", "audio": audio_array},
             {"type": "text", "text": prompt_text},
         ]
         return {

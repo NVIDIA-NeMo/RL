@@ -530,6 +530,32 @@ def vlm_hf_data_processor(
                         processor
                     ).get("video", {})
                 video_value = content["video"]
+                # IntentTrain/IntentBench rollouts pass video as a path AND
+                # need the audio track that lives in the same file. Pull the
+                # audio out before video_value gets replaced with frames; the
+                # audio is attached as a processor-level kwarg below, NOT as a
+                # separate type=audio content item, otherwise the chat
+                # template would emit duplicate audio placeholder tokens.
+                if datum_dict["task_name"] in (
+                    "intent-train",
+                    "intent-bench",
+                ) and isinstance(video_value, str):
+                    import decord
+
+                    sampling_rate = processor.feature_extractor.sampling_rate
+                    try:
+                        audio_reader = decord.AudioReader(
+                            video_value, sample_rate=sampling_rate, mono=True
+                        )
+                        audio_array = audio_reader[:].asnumpy()
+                        if audio_array.ndim > 1:
+                            audio_array = audio_array[0]
+                        audios.append((audio_array, sampling_rate))
+                    except Exception as e:
+                        raise RuntimeError(
+                            f"Failed to decode audio from intent video {video_value}: {e}"
+                        ) from e
+
                 if isinstance(video_value, str):
                     video_value = load_video(
                         video_value, backend="decord", **load_video_kwargs
@@ -553,13 +579,6 @@ def vlm_hf_data_processor(
     else:
         user_message_for_chat_template = user_message
 
-    # For Qwen2.5-Omni IntentTrain/IntentBench samples we want the processor
-    # to align the audio stream with its parent video stream, so propagate
-    # use_audio_in_video=True through apply_chat_template's processor kwargs.
-    extra_processor_kwargs: dict[str, Any] = {}
-    if datum_dict["task_name"] in ("intent-train", "intent-bench"):
-        extra_processor_kwargs["use_audio_in_video"] = True
-
     # this is the string-tokenized conversation template for the generation policy (for vllm)
     string_formatted_dialog = processor.apply_chat_template(
         [user_message_for_chat_template],
@@ -567,15 +586,35 @@ def vlm_hf_data_processor(
         add_generation_prompt=True,
     )
 
-    # this is the id-tokenized and image processed conversation template for the policy
-    message: dict = processor.apply_chat_template(
-        [user_message],
-        tokenize=True,
-        add_generation_prompt=True,
-        return_tensors="pt",
-        return_dict=True,
-        **extra_processor_kwargs,
-    )
+    if datum_dict["task_name"] in ("intent-train", "intent-bench"):
+        # Qwen2.5-Omni's apply_chat_template path swallows
+        # use_audio_in_video and trips on duplicate audio placeholders, so do
+        # the two-step manual call: render the chat template to text without
+        # tokenizing, then invoke the processor directly with both videos and
+        # the audio extracted above. The processor inserts audio placeholders
+        # into the rendered text aligned to the video stream.
+        text_for_intent = processor.apply_chat_template(
+            [user_message],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        intent_audio_arrays = [aud for aud, _sr in audios]
+        message = processor(
+            text=[text_for_intent],
+            videos=videos,
+            audio=intent_audio_arrays,
+            use_audio_in_video=True,
+            return_tensors="pt",
+        )
+    else:
+        # this is the id-tokenized and image processed conversation template for the policy
+        message = processor.apply_chat_template(
+            [user_message],
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
+            return_dict=True,
+        )
 
     # add this for backward compatibility
     user_message["token_ids"] = message["input_ids"][0]
