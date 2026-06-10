@@ -1,0 +1,52 @@
+defaults: ./grpo-glm5.1-64n8g-megatron-8K-full-onpolicy-new.yaml
+
+grpo:
+  num_prompts_per_step: 6
+  num_generations_per_prompt: 8
+
+policy:
+  model_name: /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/songlinj/glm5.1-dummy-model-lite
+  tokenizer:
+    name: /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/songlinj/glm5.1-dummy-model-lite
+  train_global_batch_size: 48
+
+  megatron_cfg:
+    force_reconvert_from_hf: false
+    env_vars:
+      CUDA_DEVICE_MAX_CONNECTIONS: "1"
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 2
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 8
+
+  generation:
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 1
+        gpus_per_node: 8
+    vllm_cfg:
+      tensor_parallel_size: 1
+      expert_parallel_size: 1
+    vllm_kwargs:
+      max_num_batched_tokens: ${policy.max_total_sequence_length}
+      enable_chunked_prefill: true
+      attention_config:
+        backend: FLASHMLA_SPARSE
+      kernel_config:
+        moe_backend: flashinfer_cutlass
+
+checkpointing:
+  checkpoint_dir: results/grpo-glm5.1-dummy-4l-megatron-8192-full-onpolicy-4n-noncoloc-tp4cp2-dsa-loss0-nosparse-overlapgrad-off-2
+
+logger:
+  log_dir: logs/grpo-glm5.1-dummy-4l-megatron-8192-full-onpolicy-4n-noncoloc-tp4cp2-dsa-loss0-nosparse-overlapgrad-off-2
+  wandb:
+    name: grpo-glm5.1-dummy-4l-megatron-8192-full-onpolicy-4n-noncoloc-tp4cp2-dsa-loss0-nosparse-overlapgrad-off-2
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 4

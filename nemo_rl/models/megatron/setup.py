@@ -239,6 +239,37 @@ from nemo_rl.models.value.config import ValueConfig
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
+_MCORE_CONFIG_OVERRIDE_FIELDS: tuple[str, ...] = (
+    "dsa_indexer_rope_interleaved",
+    "dsa_indexer_rotate_activation",
+    "dsa_indexer_k_norm_epsilon",
+    "dsa_kernel_backend",
+    "dsa_indexer_loss_coeff",
+    "dsa_indexer_use_sparse_loss",
+    "deallocate_pipeline_outputs",
+    "persist_layer_norm",
+    "bias_dropout_fusion",
+)
+
+_MCORE_EFFECTIVE_LOG_FIELDS: tuple[str, ...] = (
+    "dsa_indexer_rope_interleaved",
+    "dsa_indexer_rotate_activation",
+    "dsa_indexer_k_norm_epsilon",
+    "dsa_kernel_backend",
+    "dsa_indexer_loss_coeff",
+    "dsa_indexer_use_sparse_loss",
+    "moe_router_dtype",
+    "moe_shared_expert_overlap",
+    "gradient_accumulation_fusion",
+    "moe_permute_fusion",
+    "moe_grouped_gemm",
+    "bias_activation_fusion",
+    "cp_comm_type",
+    "deallocate_pipeline_outputs",
+    "persist_layer_norm",
+    "bias_dropout_fusion",
+)
+
 
 def destroy_parallel_state():
     """Safely destroy parallel state and reset async call tracking.
@@ -638,6 +669,15 @@ def setup_model_config(
     # Apply performance settings
     _apply_performance_config(model_cfg, config)
 
+    # Apply explicit MCore TransformerConfig overrides.
+    mcore_overrides_applied = _apply_mcore_config_overrides(
+        model_cfg, config, rank=rank
+    )
+    if mcore_overrides_applied:
+        finalize = getattr(model_cfg, "finalize", None)
+        if callable(finalize):
+            finalize()
+
     # Validate optimizer configuration
     _validate_optimizer_config(config)
 
@@ -967,6 +1007,43 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
             model_cfg.fp8_param = fp8_cfg["fp8_param"]
         except KeyError as e:
             raise KeyError(f"Missing key in fp8_cfg: {e}")
+
+
+def _apply_mcore_config_overrides(
+    model_cfg: Any, config: PolicyConfig, rank: int | None = None
+) -> bool:
+    """Apply explicit MCore TransformerConfig overrides from policy.megatron_cfg."""
+    megatron_cfg = config["megatron_cfg"]
+    applied: dict[str, Any] = {}
+    missing_fields: list[str] = []
+
+    for field in _MCORE_CONFIG_OVERRIDE_FIELDS:
+        if field not in megatron_cfg:
+            continue
+        if not hasattr(model_cfg, field):
+            missing_fields.append(field)
+            continue
+        value = megatron_cfg[field]
+        setattr(model_cfg, field, value)
+        applied[field] = value
+
+    if missing_fields:
+        raise ValueError(
+            "policy.megatron_cfg includes MCore override(s) that are not present "
+            f"on this model config: {missing_fields}"
+        )
+
+    if applied and (rank is None or rank == 0):
+        effective_values = {
+            field: getattr(model_cfg, field, "<missing>")
+            for field in _MCORE_EFFECTIVE_LOG_FIELDS
+        }
+        formatted_values = ", ".join(
+            f"{field}={value!r}" for field, value in effective_values.items()
+        )
+        print(f"Effective MCore config overrides at rank 0: {formatted_values}")
+
+    return bool(applied)
 
 
 def _validate_optimizer_config(config: PolicyConfig) -> None:
