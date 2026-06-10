@@ -824,9 +824,10 @@ class ChunkedDistributedGatherLogprob(torch.autograd.Function):
         return grad_input, None, None, None, None, None, None
 
 
-def dtensor_from_parallel_logits_to_logprobs(
+def _compute_next_token_logprobs_from_vocab_parallel_logits(
     vocab_parallel_logits: torch.Tensor,
     target: DTensor | torch.Tensor,
+    *,
     vocab_start_index: int,
     vocab_end_index: int,
     tp_group: torch.distributed.ProcessGroup,
@@ -835,24 +836,29 @@ def dtensor_from_parallel_logits_to_logprobs(
     chunk_size: Optional[int] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
 ) -> torch.Tensor:
-    """Get log probabilities from TP+CP sharded vocab logits.
+    """Compute next-token logprobs from local vocab-parallel logits.
+
+    This is the DTensor implementation helper for
+    `get_next_token_logprobs_from_vocab_parallel_logits`. It shifts targets
+    internally and gathers the next-token logprob from TP-sharded vocab logits.
 
     Args:
-        vocab_parallel_logits (orch.Tensor): Logits distributed across tensor parallel workers,
+        vocab_parallel_logits (torch.Tensor): Logits local to this tensor-parallel worker,
             with shape [batch_size, seq_len, vocab_size/tp_size].
-        target (DTensor): Target token indices with shape [batch_size, seq_len].
-            NOTE: Must be the unmodified targets as this function will shift them internally.
+        target (DTensor | torch.Tensor): Unshifted token IDs with shape [batch_size, seq_len].
         vocab_start_index (int): Starting vocabulary index for this worker's partition.
         vocab_end_index (int): Ending vocabulary index for this worker's partition.
         tp_group (torch.distributed.ProcessGroup): Process group for distributed communication.
         inference_only (bool, optional): If True, tensors won't be saved for backward pass. Defaults to False.
         seq_index (Optional[torch.Tensor]): Sequence index tensor with shape [seq_len].
-            It is only provided for cp sharded logits. It represents how tensor is sharded across the sequence dimension.
+            It is only provided for cp sharded logits. It represents how tensor
+            is sharded across the sequence dimension.
         chunk_size (Optional[int]): Sequence dimension chunk size for computing the log probabilities.
-        sampling_params (TrainingSamplingParams, optional): Sampling parameters for Top-k/Top-p filtering and temperature scaling.
+        sampling_params (TrainingSamplingParams, optional): Sampling parameters
+            for Top-k/Top-p filtering and temperature scaling.
 
     Returns:
-        torch.Tensor: Log probabilities tensor with shape [batch_size, seq_len-1].
+        torch.Tensor: Next-token log probabilities with shape [batch_size, seq_len-1].
             The sequence dimension is reduced by 1 due to the target shifting.
     """
     cp_size = 1
@@ -956,7 +962,8 @@ def from_parallel_logits_to_logprobs(
         inference_only (bool, optional): If True, tensors won't be saved for backward pass. Defaults to False.
         cp_group (torch.distributed.ProcessGroup, optional): Context parallelism process group. Defaults to None.
         chunk_size (int, optional): Sequence dimension chunk size for computing the log probabilities.
-        sampling_params (TrainingSamplingParams, optional): Sampling parameters for Top-k/Top-p filtering and temperature scaling.
+        sampling_params (TrainingSamplingParams, optional): Sampling parameters
+            for Top-k/Top-p filtering and temperature scaling.
 
     Returns:
         torch.Tensor: Log probabilities tensor with shape [batch_size, seq_len-1].
@@ -1293,30 +1300,33 @@ class AllGatherCPTensor(torch.autograd.Function):
         return grad_input, None, None  # , None
 
 
-def get_logprobs_from_vocab_parallel_logits(
+def get_next_token_logprobs_from_vocab_parallel_logits(
     vocab_parallel_logits: DTensor,
     input_ids: torch.Tensor | DTensor,
     seq_index: Optional[torch.Tensor] = None,
     chunk_size: Optional[int] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
-):
-    """Computes log probabilities from vocabulary-parallel logits.
+) -> torch.Tensor:
+    """Compute next-token logprobs from DTensor vocab-parallel logits.
 
-    This function takes logits that are sharded across the vocabulary dimension (tensor parallel)
-    and computes the log probabilities for the given input IDs.
+    This is the public DTensor adapter for logits sharded across the vocabulary
+    dimension. It shifts `input_ids` internally and returns gathered
+    next-token logprobs rather than the full log-softmax tensor.
 
     Args:
         vocab_parallel_logits (DTensor): Logits distributed across tensor parallel workers,
             with shape [batch_size, seq_len, vocab_size/tp_size].
-        input_ids (torch.Tensor | DTensor): Input token IDs for which to compute log probabilities,
+        input_ids (torch.Tensor | DTensor): Unshifted input token IDs,
             with shape [batch_size, seq_len].
         seq_index (Optional[torch.Tensor]): Sequence index for the input IDs,
-            with shape [sequence_length].
+            with shape [seq_len]. Required when context parallelism shards the
+            sequence dimension.
         chunk_size (Optional[int]): Sequence dimension chunk size for computing log probabilities.
-        sampling_params (TrainingSamplingParams, optional): Sampling parameters for Top-k/Top-p filtering and temperature scaling.
+        sampling_params (TrainingSamplingParams, optional): Sampling parameters
+            for Top-k/Top-p filtering and temperature scaling.
 
     Returns:
-        torch.Tensor: Log probabilities for the given input IDs.
+        torch.Tensor: Next-token log probabilities with shape [batch_size, seq_len - 1].
     """
     device_mesh = vocab_parallel_logits.device_mesh
     if seq_index is not None:
@@ -1333,12 +1343,12 @@ def get_logprobs_from_vocab_parallel_logits(
 
     vocab_interval_per_rank = vocab_parallel_logits.shape[-1] // tp_size
 
-    return dtensor_from_parallel_logits_to_logprobs(
+    return _compute_next_token_logprobs_from_vocab_parallel_logits(
         vocab_parallel_logits.to_local(),
         input_ids,
-        vocab_interval_per_rank * tp_rank,
-        (tp_rank + 1) * vocab_interval_per_rank,
-        tp_group,
+        vocab_start_index=vocab_interval_per_rank * tp_rank,
+        vocab_end_index=(tp_rank + 1) * vocab_interval_per_rank,
+        tp_group=tp_group,
         inference_only=not torch.is_grad_enabled(),
         seq_index=seq_index,
         chunk_size=chunk_size,
@@ -1348,31 +1358,33 @@ def get_logprobs_from_vocab_parallel_logits(
 
 def get_next_token_logprobs_from_logits(
     input_ids: torch.Tensor,
-    next_token_logits: torch.Tensor,
+    next_token_logits: torch.Tensor | DTensor,
     seq_index: Optional[torch.Tensor] = None,
     vocab_parallel_rank: Optional[int] = None,
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
 ) -> torch.Tensor:
-    """Compute token log-probabilities from logits, handling parallel and non-parallel cases.
+    """Compute next-token logprobs from logits across supported layouts.
 
     This function handles three cases:
-    1. Vocab parallel (Megatron-style): uses from_parallel_logits_to_logprobs
-    2. DTensor: uses get_logprobs_from_vocab_parallel_logits
-    3. Non-parallel: applies top-k/top-p filtering, log_softmax, and gather
+    1. Vocab parallel (Megatron-style): uses from_parallel_logits_to_logprobs.
+    2. DTensor: uses get_next_token_logprobs_from_vocab_parallel_logits.
+    3. Non-parallel: applies top-k/top-p filtering, log_softmax, and gather.
 
     Args:
-        input_ids: Input token IDs of shape [batch_size, seq_len]
-        next_token_logits: Logits tensor of shape [batch_size, seq_len, vocab_size]
-        seq_index: Sequence index tensor for DTensor path
-        vocab_parallel_rank: Rank in the vocab parallel group (required if vocab_parallel_group is provided)
-        vocab_parallel_group: Process group for vocab parallelism
-        context_parallel_group: Process group for context parallelism
-        sampling_params: Sampling parameters for top-k/top-p filtering
+        input_ids: Unshifted input token IDs of shape [batch_size, seq_len].
+        next_token_logits: Logits tensor of shape [batch_size, seq_len, vocab_size],
+            or a DTensor with the vocabulary dimension sharded.
+        seq_index: Sequence index tensor for the DTensor context-parallel path.
+        vocab_parallel_rank: Rank in the vocab parallel group. Required if
+            `vocab_parallel_group` is provided.
+        vocab_parallel_group: Process group for Megatron-style vocab parallelism.
+        context_parallel_group: Process group for context parallelism.
+        sampling_params: Sampling parameters for top-k/top-p filtering.
 
     Returns:
-        Token log-probabilities of shape [batch_size, seq_len - 1]
+        torch.Tensor: Next-token log probabilities with shape [batch_size, seq_len - 1].
     """
     next_token_logits = next_token_logits.to(torch.float32)
 
@@ -1393,8 +1405,8 @@ def get_next_token_logprobs_from_logits(
         # slice off to the correct length to remove potential CP padding
         logprobs = logprobs[:, : input_ids.shape[1] - 1]
 
-    elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
-        logprobs = get_logprobs_from_vocab_parallel_logits(
+    elif isinstance(next_token_logits, DTensor):
+        logprobs = get_next_token_logprobs_from_vocab_parallel_logits(
             next_token_logits,
             input_ids,
             seq_index=seq_index,
@@ -1414,7 +1426,7 @@ def get_next_token_logprobs_from_logits(
         next_token_logprobs = torch.nn.functional.log_softmax(
             next_token_logits_wo_last, dim=-1
         )
-        next_tokens = input_ids[:, 1:].cuda()  # Skip first token
+        next_tokens = input_ids[:, 1:].to(next_token_logprobs.device)
         logprobs = next_token_logprobs.gather(
             dim=-1, index=next_tokens.unsqueeze(-1)
         ).squeeze(-1)
