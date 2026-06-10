@@ -1188,7 +1188,11 @@ def build_draft_model(
     )
 
     model_name = draft_config.get("model_name")
-    hf_config = AutoConfig.from_pretrained(model_name).to_dict() if model_name else {}
+    hf_config = (
+        AutoConfig.from_pretrained(model_name, trust_remote_code=True).to_dict()
+        if model_name
+        else {}
+    )
     draft_num_layers = draft_config.get("num_layers")
     config = TransformerConfig(
         normalization="RMSNorm",
