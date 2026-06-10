@@ -1,5 +1,5 @@
 # =============================================================================
-# GRPO/DAPO Ultra V3 LoRA - 4 Train Nodes + 2 vLLM Nodes
+# GRPO/DAPO Ultra V3 LoRA - 6 Nodes x 4 GPUs
 # =============================================================================
 # LoRA smoke-to-starter recipe for Nemotron 3 Ultra RL on GB200 Slurm systems.
 # This recipe follows the full-weight DAPO Ultra starter path, but enables PEFT
@@ -30,7 +30,7 @@ cluster:
 # =============================================================================
 checkpointing:
   enabled: true
-  checkpoint_dir: "results/grpo-ultra-4n2g-megatron-lora"
+  checkpoint_dir: "results/grpo-ultra-6n4g-megatron-lora"
   metric_name: "train:reward"
   higher_is_better: true
   keep_top_k: 1
@@ -398,7 +398,7 @@ env:
 # Logging
 # =============================================================================
 logger:
-  log_dir: "logs/dapo_ultra_lora_4n2g"
+  log_dir: "logs/dapo_ultra_lora_6n4g"
   num_val_samples_to_print: 0
   wandb_enabled: false
   tensorboard_enabled: false
@@ -408,17 +408,17 @@ logger:
 
   wandb:
     project: "dapo-ultra-lora"
-    name: "dapo-ultra-lora-4n2g"
+    name: "dapo-ultra-lora-6n4g"
 
   swanlab:
     project: "dapo-ultra-lora"
-    name: "dapo-ultra-lora-4n2g"
+    name: "dapo-ultra-lora-6n4g"
 
   tensorboard: {}
 
   mlflow:
-    experiment_name: "dapo-ultra-lora-4n2g"
-    run_name: "dapo-ultra-lora-4n2g"
+    experiment_name: "dapo-ultra-lora-6n4g"
+    run_name: "dapo-ultra-lora-6n4g"
 
   gpu_monitoring:
     collection_interval: 10
