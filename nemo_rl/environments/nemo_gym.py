@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 from pathlib import Path
 from typing import Any, Dict, List, NotRequired, TypedDict
 
@@ -111,6 +112,186 @@ def _detect_invalid_tool_call_and_malformed_thinking(
             has_malformed_thinking = True
 
     return is_invalid_tool_call, has_malformed_thinking
+
+
+def _truncate_error_value(value: Any, max_len: int = 256) -> str:
+    text = str(value)
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3] + "..."
+
+
+def _summarize_nemo_gym_output_item(output_item: Any) -> dict[str, Any]:
+    if not isinstance(output_item, dict):
+        return {
+            "python_type": type(output_item).__name__,
+            "repr": _truncate_error_value(output_item),
+        }
+
+    summary: dict[str, Any] = {
+        "keys": sorted(output_item.keys()),
+    }
+
+    for key in (
+        "type",
+        "role",
+        "status",
+        "finish_reason",
+        "stop_reason",
+        "id",
+    ):
+        if key in output_item:
+            summary[key] = output_item[key]
+
+    for key, summary_key in (
+        ("prompt_token_ids", "prompt_token_count"),
+        ("generation_token_ids", "generation_token_count"),
+        ("generation_log_probs", "generation_logprob_count"),
+    ):
+        value = output_item.get(key)
+        if isinstance(value, list):
+            summary[summary_key] = len(value)
+
+    content = output_item.get("content")
+    if isinstance(content, list):
+        summary["content_len"] = len(content)
+        summary["content_types"] = [
+            item.get("type", type(item).__name__)
+            if isinstance(item, dict)
+            else type(item).__name__
+            for item in content[:8]
+        ]
+    elif content is not None:
+        summary["content_type"] = type(content).__name__
+        summary["content_preview"] = _truncate_error_value(content)
+
+    if "refusal" in output_item and output_item["refusal"] is not None:
+        summary["refusal"] = _truncate_error_value(output_item["refusal"])
+
+    return summary
+
+
+def _safe_prompt_token_count(
+    responses_create_params: Any,
+    tokenizer: Any,
+) -> tuple[int | None, str | None]:
+    """Best-effort prompt token count for the empty-generation diagnostic.
+
+    Tokenizing via ``apply_chat_template`` can itself raise — most commonly
+    ``jinja2.exceptions.UndefinedError`` when the request input is malformed
+    (e.g. a dict missing ``role``). That must not mask the underlying empty-
+    generation failure while we're building the diagnostic summary.
+
+    Returns ``(token_count, error)``: exactly one is non-None on a real attempt,
+    and both are None when no attempt was made (no tokenizer / no input).
+    """
+    if tokenizer is None or not isinstance(responses_create_params, dict):
+        return None, None
+    input_messages = responses_create_params.get("input")
+    if input_messages is None:
+        return None, None
+    try:
+        token_ids = tokenizer.apply_chat_template(input_messages, tokenize=True)
+        return len(token_ids), None
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {_truncate_error_value(exc)}"
+
+
+def _summarize_nemo_gym_request_params(
+    responses_create_params: Any,
+) -> dict[str, Any]:
+    """Extract call-site identifiers from the request that produced the empty result.
+
+    With many concurrent rollouts in flight, the request-side fields (model,
+    max_output_tokens, metadata/user) are what let an operator pinpoint which
+    call failed.
+    """
+    if not isinstance(responses_create_params, dict):
+        return {
+            "python_type": type(responses_create_params).__name__,
+            "repr": _truncate_error_value(responses_create_params),
+        }
+
+    request_summary: dict[str, Any] = {}
+    for key in (
+        "model",
+        "max_output_tokens",
+        "temperature",
+        "top_p",
+        "user",
+        "metadata",
+        "previous_response_id",
+    ):
+        if key in responses_create_params:
+            request_summary[key] = responses_create_params[key]
+
+    input_value = responses_create_params.get("input")
+    if isinstance(input_value, list):
+        request_summary["input_message_count"] = len(input_value)
+    elif isinstance(input_value, str):
+        request_summary["input_str_len"] = len(input_value)
+
+    return request_summary
+
+
+def _summarize_nemo_gym_empty_generation_result(
+    nemo_gym_result: dict[str, Any],
+    tokenizer: Any = None,
+) -> dict[str, Any]:
+    responses_create_params = nemo_gym_result.get("responses_create_params")
+    response = nemo_gym_result.get("response")
+
+    summary: dict[str, Any] = {
+        "request": _summarize_nemo_gym_request_params(responses_create_params),
+    }
+
+    prompt_token_count, prompt_token_count_error = _safe_prompt_token_count(
+        responses_create_params, tokenizer
+    )
+    if prompt_token_count is not None:
+        summary["prompt_token_count"] = prompt_token_count
+    if prompt_token_count_error is not None:
+        summary["prompt_token_count_error"] = prompt_token_count_error
+
+    if not isinstance(response, dict):
+        summary["response_python_type"] = type(response).__name__
+        summary["response_repr"] = _truncate_error_value(response)
+        return summary
+
+    output_items = response.get("output")
+    if isinstance(output_items, list):
+        output_summary = [
+            _summarize_nemo_gym_output_item(item) for item in output_items[:8]
+        ]
+        output_count = len(output_items)
+    else:
+        output_summary = [
+            {
+                "python_type": type(output_items).__name__,
+                "repr": _truncate_error_value(output_items),
+            }
+        ]
+        output_count = None
+
+    summary.update(
+        {
+            "response_keys": sorted(response.keys()),
+            "response_status": response.get("status"),
+            "response_finish_reason": response.get("finish_reason"),
+            "response_incomplete_details": response.get("incomplete_details"),
+            "response_error": response.get("error"),
+            "usage": response.get("usage"),
+            "output_count": output_count,
+            "output_summary": output_summary,
+        }
+    )
+
+    if "id" in response:
+        summary["response_id"] = response["id"]
+    if "model" in response:
+        summary["response_model"] = response["model"]
+
+    return summary
 
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
@@ -364,17 +545,13 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                 output_item_dict["generation_str"] = generation_str
 
         if not nemo_rl_message_log:
-            input_messages = nemo_gym_result["responses_create_params"]["input"]
-            prompt_token_ids = tokenizer.apply_chat_template(
-                input_messages, tokenize=True
+            response_summary = _summarize_nemo_gym_empty_generation_result(
+                nemo_gym_result, tokenizer=tokenizer
             )
             raise ValueError(
-                f"NeMo Gym returned a result with no generation data. "
-                f"This typically means the prompt for the first turn already exceeds the vLLM max_model_len, "
-                f"so vLLM rejected the request before any tokens could be generated.\n"
-                f"  Prompt length: {len(prompt_token_ids)} tokens.\n"
-                f"  → Fix: increase `policy.max_total_sequence_length` and `policy.generation.vllm_cfg.max_model_len` "
-                f"to a value larger than {len(prompt_token_ids)}."
+                "NeMo Gym returned a result with no generation data.\n"
+                "  Response summary:\n"
+                f"  {json.dumps(response_summary, indent=2, sort_keys=True, default=str)}"
             )
 
         return {

@@ -28,6 +28,7 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 from nemo_rl.environments.nemo_gym import (
     NemoGym,
     NemoGymConfig,
+    _summarize_nemo_gym_empty_generation_result,
     setup_nemo_gym_config,
 )
 from nemo_rl.models.generation.vllm import VllmGeneration
@@ -49,6 +50,134 @@ def test_nemo_gym_stub_module():
     print(
         f"NeMo-Gym test successfully run! NeMo-Gym config_types module: {config_types}"
     )
+
+
+def test_summarize_nemo_gym_empty_generation_result_is_diagnosable():
+    """The empty-generation summary should expose the response status, finish reason,
+    incomplete details, per-output structure, and request-side identifiers (model,
+    max_output_tokens, metadata) so the resulting ValueError points at the actual
+    failed call instead of guessing."""
+    nemo_gym_result = {
+        "responses_create_params": {
+            "model": "dummy-model",
+            "max_output_tokens": 64,
+            "temperature": 0.7,
+            "metadata": {"task_id": "abc123"},
+            "input": [{"role": "user", "content": "hello"}],
+        },
+        "response": {
+            "id": "resp_123",
+            "model": "dummy-model",
+            "status": "incomplete",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "incomplete",
+                    "finish_reason": "length",
+                    "content": [{"type": "output_text", "text": ""}],
+                }
+            ],
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "usage": {"input_tokens": 2, "output_tokens": 0},
+        },
+    }
+
+    summary = _summarize_nemo_gym_empty_generation_result(nemo_gym_result)
+
+    assert summary["response_status"] == "incomplete"
+    assert summary["response_incomplete_details"] == {"reason": "max_output_tokens"}
+    assert summary["output_count"] == 1
+    assert summary["response_id"] == "resp_123"
+    assert summary["response_model"] == "dummy-model"
+    assert summary["usage"] == {"input_tokens": 2, "output_tokens": 0}
+
+    request = summary["request"]
+    assert request["model"] == "dummy-model"
+    assert request["max_output_tokens"] == 64
+    assert request["temperature"] == 0.7
+    assert request["metadata"] == {"task_id": "abc123"}
+    assert request["input_message_count"] == 1
+
+    [output_item] = summary["output_summary"]
+    assert output_item["status"] == "incomplete"
+    assert output_item["finish_reason"] == "length"
+    assert output_item["content_len"] == 1
+    assert output_item["content_types"] == ["output_text"]
+
+
+def test_summarize_nemo_gym_empty_generation_result_handles_non_dict_response():
+    """If the response field is missing / malformed, the summarizer should still
+    produce a useful representation (including request-side identifiers) rather
+    than raising."""
+    summary = _summarize_nemo_gym_empty_generation_result(
+        {
+            "responses_create_params": {"model": "dummy-model"},
+            "response": None,
+        }
+    )
+    assert summary["response_python_type"] == "NoneType"
+    assert summary["request"]["model"] == "dummy-model"
+
+
+def test_summarize_nemo_gym_empty_generation_result_survives_tokenizer_failure():
+    """If tokenizing the request input itself raises (e.g. jinja UndefinedError
+    on a malformed message dict), the summary helper must capture that error in
+    ``prompt_token_count_error`` and still return the rest of the diagnostic —
+    otherwise we fail during exception handling and lose the real cause."""
+
+    class _RaisingTokenizer:
+        def apply_chat_template(self, *args, **kwargs):
+            raise RuntimeError("template render failed")
+
+    summary = _summarize_nemo_gym_empty_generation_result(
+        {
+            "responses_create_params": {
+                "model": "dummy-model",
+                "input": [{"not_a_role": "user"}],
+            },
+            "response": {
+                "status": "incomplete",
+                "output": [],
+                "incomplete_details": {"reason": "max_output_tokens"},
+            },
+        },
+        tokenizer=_RaisingTokenizer(),
+    )
+
+    assert "prompt_token_count" not in summary
+    assert summary["prompt_token_count_error"].startswith("RuntimeError: ")
+    assert summary["response_status"] == "incomplete"
+    assert summary["response_incomplete_details"] == {"reason": "max_output_tokens"}
+    assert summary["request"]["model"] == "dummy-model"
+
+
+def test_summarize_nemo_gym_empty_generation_result_includes_prompt_token_count():
+    """When a working tokenizer is provided, the summary should include
+    ``prompt_token_count`` so operators still get the prompt length they had
+    before — just sourced through the safe path."""
+
+    class _CountingTokenizer:
+        def apply_chat_template(self, input_messages, tokenize=True):
+            assert tokenize is True
+            return list(range(len(input_messages) * 3))
+
+    summary = _summarize_nemo_gym_empty_generation_result(
+        {
+            "responses_create_params": {
+                "model": "dummy-model",
+                "input": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "hello"},
+                ],
+            },
+            "response": {"status": "incomplete", "output": []},
+        },
+        tokenizer=_CountingTokenizer(),
+    )
+
+    assert summary["prompt_token_count"] == 6
+    assert "prompt_token_count_error" not in summary
 
 
 @pytest.fixture(scope="function")
