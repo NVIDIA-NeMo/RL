@@ -1,0 +1,458 @@
+# ============================================================================
+# Async GRPO SWE smoke recipe: Qwen3.5-4B  (GB200 / aarch64)
+#
+# Model:      Qwen3.5-4B (dense)
+# Train data: SWE blend (balanced_language.jsonl)
+# Eval data:  SWE-bench Verified (swe_public_datasets_val_swebench.jsonl)
+# Mode:       Async GRPO with non-colocated generation
+# Entry:      examples/nemo_gym/run_grpo_nemo_gym.py
+# Env:        swe_agents (OpenHands agent, apptainer sandbox), arm64 SWE sif set
+# Cluster:    oci-hsg-cs-001 / nemotron_sw_post (GB200, aarch64, 4 GPU/node)
+#
+# Ported from the cw-dfw/coreai (x86_64) smoke recipe for GB200:
+#   - gpus_per_node 8 -> 4 (ray.sub asserts GPUS_PER_NODE == gres gpu:4)
+#   - arm64 container_formatter + accessible model/data paths
+#
+# This file owns the recipe; runtime choices (nodes, container, caches, names,
+# per-run overrides) live in run_grpo_qwen35_4b_swe_smoke.sh.
+# ============================================================================
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/qwen3.5-4b-swe-rl
+  metric_name: train:total_reward/mean
+  higher_is_better: true
+  keep_top_k: 2
+  save_period: 5
+  checkpoint_must_save_by: 00:03:35:00
+  model_save_format: safetensors
+  save_consolidated: false
+  save_optimizer: true
+
+grpo:
+  num_prompts_per_step: 1
+  num_generations_per_prompt: 4
+  num_val_generations_per_prompt: 1
+  max_rollout_turns: 1
+  max_num_epochs: 100
+  max_num_steps: 50
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  advantage_clip_low: -100
+  advantage_clip_high: 100
+  val_period: 50
+  val_at_start: false
+  val_at_end: false
+  overlong_filtering: true
+  max_val_samples: null
+  val_batch_size: 4518
+  seed: 42
+  invalid_tool_call_strategy: ''
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1.0
+  penalize_invalid_tool_call: true
+  invalid_tool_call_advantage: -5.0
+  penalize_malformed_thinking: true
+  malformed_thinking_advantage: -5.0
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 128
+    overlong_buffer_penalty: 1.0
+    max_response_length: 65536
+    stop_properly_penalty_coef: null
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: false
+    recompute_kv_cache_after_weight_updates: false
+  seq_logprob_error_threshold: null
+  skip_reference_policy_logprobs_calculation: true
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  reference_policy_kl_type: k3
+  kl_input_clamp_value: null
+  kl_output_clamp_value: null
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: true
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_ratio: 5.0
+  truncated_importance_sampling_ratio_min: null
+  truncated_importance_sampling_type: tis
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  force_on_policy_ratio: true
+  use_kl_in_reward: false
+  disable_ppo_ratio: false
+
+policy:
+  model_name: /lustre/fsw/coreai_comparch_trtllm/erinh/llm-models/Qwen/Qwen3.5-4B   # lyris (oci-hsg was ruit/hf_models)
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs:
+      enable_thinking: true
+  hf_config_overrides: {}
+  train_global_batch_size: 4
+  train_micro_batch_size: 1
+  generation_batch_size: 8
+  logprob_batch_size: 1
+  max_total_sequence_length: 65536
+  precision: bfloat16
+  logprob_chunk_size: 2048
+  offload_optimizer_for_logprob: false
+  dtensor_cfg:
+    _v2: true
+    enabled: false
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+  megatron_cfg:
+    enabled: true
+    gradient_accumulation_fusion: false
+    empty_unused_memory_level: 2
+    activation_checkpointing: true
+    tensor_model_parallel_size: 2
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 1
+    pipeline_dtype: bfloat16
+    sequence_parallel: true
+    freeze_moe_router: false
+    moe_router_dtype: fp32
+    moe_router_load_balancing_type: none
+    moe_router_bias_update_rate: 0.001
+    moe_permute_fusion: true
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: alltoall
+    moe_aux_loss_coeff: 0.0
+    moe_router_enable_expert_bias: true
+    moe_shared_expert_overlap: false
+    apply_rope_fusion: false
+    bias_activation_fusion: false
+    defer_fp32_logits: true
+    moe_per_layer_logging: true
+    optimizer:
+      optimizer: adam
+      lr: 1.0e-06
+      min_lr: 1.0e-06
+      weight_decay: 0.0
+      bf16: true
+      fp16: false
+      params_dtype: float32
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1.0e-08
+      sgd_momentum: 0.9
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      clip_grad: 1.0
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+    scheduler:
+      start_weight_decay: 0.0
+      end_weight_decay: 0.0
+      weight_decay_incr_style: constant
+      lr_decay_style: constant
+      lr_decay_iters: 1000000
+      lr_warmup_iters: 0
+      lr_warmup_init: 0.0
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: optim_grads_params
+    mtp_loss_scaling_factor: 0.0
+    mtp_use_repeated_layer: false
+    mtp_num_layers: 0
+    mtp_detach_heads: false
+    fp8_cfg:
+      enabled: false
+      fp8: e4m3
+      fp8_recipe: blockwise
+      fp8_param: false
+    env_vars: null
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: 65536
+    logprob_mb_tokens: 65536
+    sequence_length_round: 64
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: 65536
+    logprob_mb_tokens: 65536
+    algorithm: modified_first_fit_decreasing
+    sequence_length_round: 64
+  make_sequence_length_divisible_by: 8
+  max_grad_norm: 1.0
+  optimizer: null
+  scheduler: null
+  generation:
+    port_range_low: 11001
+    port_range_high: 15000
+    backend: trtllm
+    max_new_tokens: 65536
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    model_name: ${policy.model_name}
+    _pad_token_id: 248044
+    # ===== TRT-LLM backend config (mirrors grpo-qwen3-8b-2n4g-megatron-trtllm-async-1off.yaml) =====
+    # The launch script overrides tensor_parallel_size / gpu_memory_utilization / max_model_len /
+    # async_engine / expose_http_server / in_flight_weight_updates at submit time.
+    trtllm_cfg:
+      tensor_parallel_size: 1
+      precision: bfloat16
+      max_model_len: ${policy.max_total_sequence_length}
+      max_batch_size: 256
+      max_num_tokens: 65536
+      async_engine: true
+      gpu_memory_utilization: 0.8
+      expose_http_server: true          # REQUIRED for agentic nemo_gym (gym calls /v1/chat/completions)
+      in_flight_weight_updates: false
+      recompute_kv_cache_after_weight_updates: false
+    trtllm_kwargs:
+      batch_wait_timeout_iters: 32
+      batch_wait_max_tokens_ratio: 0.5
+    # ===== GAP for agentic-on-TRT-LLM =====
+    # The vLLM block below has http_server_serving_chat_kwargs (tool_parser=qwen3_coder,
+    # reasoning_parser=qwen3, custom tool chat_template). trtllm_cfg has NO equivalent key —
+    # the TRT-LLM HTTP server only does basic regex <tool_call> parsing. If the SWE agent's
+    # tool-calling relies on the qwen3 tool/reasoning parsers, that's a missing trtllm backend
+    # piece to add. The vllm_cfg below is kept for reference (ignored when backend=trtllm).
+    vllm_cfg:
+      enable_prefix_caching: true
+      async_engine: true
+      precision: bfloat16
+      kv_cache_dtype: auto
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.8
+      max_model_len: 65536
+      enforce_eager: false
+      enforce_monotonicity: false
+      use_deep_gemm: false
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 0.5
+      expose_http_server: true
+      skip_tokenizer_init: false
+      enable_thinking: true
+      load_format: dummy
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: qwen3_coder
+        reasoning_parser: qwen3
+        chat_template: |
+          {%- if tools %}
+              {{- '<|im_start|>system\n' }}
+              {%- if messages[0].role == 'system' %}
+                  {%- if messages[0].content is string %}
+                      {{- messages[0].content + '\n\n' }}
+                  {%- endif %}
+              {%- endif %}
+              {{- "# Tools\n\nYou have access to the following functions:\n\n<tools>" }}
+              {%- for tool in tools %}
+                  {{- "\n" }}
+                  {{- tool | tojson }}
+              {%- endfor %}
+              {{- "\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n" }}
+          {%- else %}
+              {%- if messages[0].role == 'system' %}
+                  {%- if messages[0].content is string %}
+                      {{- '<|im_start|>system\n' + messages[0].content + '<|im_end|>\n' }}
+                  {%- endif %}
+              {%- endif %}
+          {%- endif %}
+          {%- for message in messages %}
+              {%- if message.content is string %}
+                  {%- set content = message.content %}
+              {%- else %}
+                  {%- set content = '' %}
+              {%- endif %}
+              {%- if (message.role == "user") or (message.role == "system" and not loop.first) %}
+                  {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}
+              {%- elif message.role == "assistant" %}
+                  {%- set reasoning_content = '' %}
+                  {%- if message.reasoning_content is string %}
+                      {%- set reasoning_content = message.reasoning_content %}
+                  {%- else %}
+                      {%- if '</think>' in content %}
+                          {%- set reasoning_content = content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n') %}
+                          {%- set content = content.split('</think>')[-1].lstrip('\n') %}
+                      {%- endif %}
+                  {%- endif %}
+                  {%- set reasoning_content = reasoning_content | trim %}
+                  {%- if reasoning_content %}
+                      {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content + '\n</think>\n\n' + content.lstrip('\n') }}
+                  {%- else %}
+                      {{- '<|im_start|>' + message.role + '\n' + content }}
+                  {%- endif %}
+                  {%- if message.tool_calls %}
+                      {%- for tool_call in message.tool_calls %}
+                          {%- if tool_call.function is defined %}
+                              {%- set tool_call = tool_call.function %}
+                          {%- endif %}
+                          {%- if loop.first %}
+                              {%- if content | trim %}
+                                  {{- '\n\n<tool_call>\n<function=' + tool_call.name + '>\n' }}
+                              {%- else %}
+                                  {{- '<tool_call>\n<function=' + tool_call.name + '>\n' }}
+                              {%- endif %}
+                          {%- else %}
+                              {{- '\n<tool_call>\n<function=' + tool_call.name + '>\n' }}
+                          {%- endif %}
+                          {%- if tool_call.arguments is defined %}
+                              {%- for args_name, args_value in tool_call.arguments | items %}
+                                  {{- '<parameter=' + args_name + '>\n' }}
+                                  {%- set args_value = args_value | tojson | safe if args_value is mapping or (args_value is sequence and args_value is not string) else args_value | string %}
+                                  {{- args_value }}
+                                  {{- '\n</parameter>\n' }}
+                              {%- endfor %}
+                          {%- endif %}
+                          {{- '</function>\n</tool_call>' }}
+                      {%- endfor %}
+                  {%- endif %}
+                  {{- '<|im_end|>\n' }}
+              {%- elif message.role == "tool" %}
+                  {%- if loop.first or (messages[loop.index0 - 1].role != "tool") %}
+                      {{- '<|im_start|>user' }}
+                  {%- endif %}
+                  {{- '\n<tool_response>\n' }}
+                  {{- content }}
+                  {{- '\n</tool_response>' }}
+                  {%- if loop.last or (messages[loop.index0 + 1].role != "tool") %}
+                      {{- '<|im_end|>\n' }}
+                  {%- endif %}
+              {%- endif %}
+          {%- endfor %}
+          {%- if add_generation_prompt %}
+              {%- if enable_thinking is defined and enable_thinking is false %}
+                  {{- '<|im_start|>assistant\n<think>\n\n</think>\n\n' }}
+              {%- else %}
+                  {{- '<|im_start|>assistant\n<think>\n' }}
+              {%- endif %}
+          {%- endif %}
+        default_chat_template_kwargs:
+          enable_thinking: true
+          truncate_history_thinking: false
+    vllm_kwargs:
+      mamba_ssm_cache_dtype: float32
+      compilation_config:
+        cudagraph_capture_sizes:
+        - 1
+        - 2
+        - 4
+        - 8
+        - 16
+        - 32
+        - 64
+      hf_overrides: {}
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 1
+
+data:
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 1
+  use_multiple_dataloader: false
+  train:
+    data_path: /lustre/fsw/coreai_comparch_trtllm/erinh/RL/balanced_language_lyris_subset.jsonl
+  validation:
+    data_path: /lustre/fsw/coreai_comparch_trtllm/erinh/RL/swe_public_datasets_val_swebench_lyris_subset.jsonl
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    system_prompt_file: null
+    processor: nemo_gym_data_processor
+
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: false
+  nemo_gym:
+    skip_venv_if_present: true
+    port_range_low: 15001
+    port_range_high: 20000
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - responses_api_agents/swe_agents/configs/swebench_openhands_training.yaml
+    swe_agents_train:
+      responses_api_agents:
+        swe_agents:
+          agent_max_turns: 50
+          concurrency: 768
+          swebench_agent_timeout: 1800
+          run_with_mixed_prompts: true
+          dataset_path: ${data.train.data_path}
+          # lyris: SIFs under /lustre/share/coreai_comparch_trtllm/verl-resource/gym_sifs (4/6 categories present).
+          # nv_internal + swebench_498 dirs are NOT on lyris -> commented out (kept for reference).
+          container_formatter:
+          # - /lustre/share/coreai_comparch_trtllm/verl-resource/gym_sifs/nv_internal/{instance_id}.sif      # MISSING on lyris
+          - /lustre/share/coreai_comparch_trtllm/verl-resource/gym_sifs/r2e_gym/{instance_id}.sif
+          - /lustre/share/coreai_comparch_trtllm/verl-resource/gym_sifs/swegym/sweb.eval.arm64.{instance_id}.sif
+          - /lustre/share/coreai_comparch_trtllm/verl-resource/gym_sifs/swebench/swe-bench.eval.arm64.{instance_id}.sif
+          # - /lustre/share/coreai_comparch_trtllm/verl-resource/gym_sifs/swebench_498/swe-bench.eval.arm64.{instance_id}.sif   # MISSING on lyris
+          - /lustre/share/coreai_comparch_trtllm/verl-resource/gym_sifs/swerebench/{instance_id}.sif
+    swe_agents_val:
+      responses_api_agents:
+        swe_agents:
+          agent_max_turns: 50
+          concurrency: 768
+          swebench_agent_timeout: 1800
+          dataset_path: ${data.validation.data_path}
+          # lyris: SIFs under /lustre/share/coreai_comparch_trtllm/verl-resource/gym_sifs (4/6 categories present).
+          # nv_internal + swebench_498 dirs are NOT on lyris -> commented out (kept for reference).
+          container_formatter:
+          # - /lustre/share/coreai_comparch_trtllm/verl-resource/gym_sifs/nv_internal/{instance_id}.sif      # MISSING on lyris
+          - /lustre/share/coreai_comparch_trtllm/verl-resource/gym_sifs/r2e_gym/{instance_id}.sif
+          - /lustre/share/coreai_comparch_trtllm/verl-resource/gym_sifs/swegym/sweb.eval.arm64.{instance_id}.sif
+          - /lustre/share/coreai_comparch_trtllm/verl-resource/gym_sifs/swebench/swe-bench.eval.arm64.{instance_id}.sif
+          # - /lustre/share/coreai_comparch_trtllm/verl-resource/gym_sifs/swebench_498/swe-bench.eval.arm64.{instance_id}.sif   # MISSING on lyris
+          - /lustre/share/coreai_comparch_trtllm/verl-resource/gym_sifs/swerebench/{instance_id}.sif
+    use_absolute_ip: true
+
+logger:
+  log_dir: logs
+  num_val_samples_to_print: 0
+  wandb_enabled: true
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  monitor_gpus: true
+  swanlab_enabled: false
+  wandb:
+    project: swe-benchmark
+    name: qwen3.5-4b-swe-rl-smoke
+  tensorboard: {}
+  mlflow:
+    experiment_name: qwen3.5-4b-swe-rl
+    run_name: qwen3.5-4b-swe-rl-64k-50turns-smoke
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 2
