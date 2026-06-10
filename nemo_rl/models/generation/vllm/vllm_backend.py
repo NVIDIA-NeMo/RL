@@ -106,13 +106,16 @@ class VllmInternalWorkerExtension:
 
     def _maybe_process_fp8_kv_cache(self) -> None:
         """Process weights after loading for FP8 KV cache (static scales)."""
+        from nemo_rl.models.generation.vllm.config import is_static_fp8_kv_cache_dtype
+
         use_fp8_kv_cache = False
         if hasattr(self.model_runner.vllm_config, "cache_config"):
             kv_cache_dtype = getattr(
                 self.model_runner.vllm_config.cache_config, "cache_dtype", None
             )
             use_fp8_kv_cache = (
-                kv_cache_dtype is not None and "fp8" in str(kv_cache_dtype).lower()
+                kv_cache_dtype is not None
+                and is_static_fp8_kv_cache_dtype(str(kv_cache_dtype).lower())
             )
 
         if not use_fp8_kv_cache:

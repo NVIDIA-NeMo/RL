@@ -36,7 +36,10 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     GenerationOutputSpec,
 )
-from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.config import (
+    VllmConfig,
+    is_static_fp8_kv_cache_dtype,
+)
 from nemo_rl.models.generation.vllm.utils import (
     aggregate_spec_decode_counters,
     compute_spec_decode_metrics,
@@ -924,8 +927,9 @@ class VllmGeneration(GenerationInterface):
     def requires_kv_scale_sync(self) -> bool:
         """Check if KV cache scales should be synchronized during refit.
 
-        Returns True if kv_cache_dtype is fp8/fp8_e4m3.
+        Returns True if kv_cache_dtype is a static-scale FP8 cache dtype.
         """
-        return "kv_cache_dtype" in self.cfg["vllm_cfg"] and self.cfg["vllm_cfg"][
-            "kv_cache_dtype"
-        ].startswith("fp8")
+        vllm_cfg = self.cfg["vllm_cfg"]
+        return "kv_cache_dtype" in vllm_cfg and is_static_fp8_kv_cache_dtype(
+            vllm_cfg["kv_cache_dtype"]
+        )

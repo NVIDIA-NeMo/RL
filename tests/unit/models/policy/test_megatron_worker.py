@@ -70,6 +70,93 @@ def test_megatron_prepare_for_training_restores_optimizer():
     assert restored_devices == ["cuda"]
 
 
+def test_fp8_per_token_head_quant_dequant_uses_ste_backward():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        FP8_E4M3_MAX,
+        _fp8_per_token_head_quant_dequant,
+    )
+
+    if not hasattr(torch, "float8_e4m3fn"):
+        pytest.skip("torch.float8_e4m3fn is unavailable")
+
+    x = torch.tensor(
+        [
+            [[[1.0, -2.0, 3.0, -4.0], [0.125, -0.25, 0.5, -1.0]]],
+            [[[5.0, -6.0, 7.0, -8.0], [1.5, -2.5, 3.5, -4.5]]],
+        ],
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+
+    y = _fp8_per_token_head_quant_dequant(x)
+    scale = x.float().abs().amax(dim=-1, keepdim=True) / FP8_E4M3_MAX
+    scale = scale.clamp(min=torch.finfo(torch.float32).eps)
+    expected = (
+        (x.float() / scale)
+        .clamp(min=-FP8_E4M3_MAX, max=FP8_E4M3_MAX)
+        .to(torch.float8_e4m3fn)
+        .to(torch.float32)
+        .mul(scale)
+        .to(torch.bfloat16)
+    )
+
+    assert y.dtype == torch.bfloat16
+    torch.testing.assert_close(y, expected)
+
+    y.float().sum().backward()
+    torch.testing.assert_close(x.grad, torch.ones_like(x))
+
+
+def test_fp8_per_token_head_hook_quantizes_only_kv_inputs():
+    import torch.nn as nn
+
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _fp8_per_token_head_quant_dequant,
+        _quant_dequant_kv_cache_forward_pre_hook,
+    )
+
+    if not hasattr(torch, "float8_e4m3fn"):
+        pytest.skip("torch.float8_e4m3fn is unavailable")
+
+    class CoreAttention(nn.Module):
+        def forward(self, query, key, value, attention_mask=None):
+            return query, key, value, attention_mask
+
+    core_attention = CoreAttention()
+    handle = core_attention.register_forward_pre_hook(
+        _quant_dequant_kv_cache_forward_pre_hook,
+        with_kwargs=True,
+    )
+    try:
+        q = torch.randn(2, 1, 2, 4, dtype=torch.bfloat16)
+        k = torch.randn(2, 1, 2, 4, dtype=torch.bfloat16)
+        v = torch.randn(2, 1, 2, 4, dtype=torch.bfloat16)
+        attention_mask = object()
+
+        out_q, out_k, out_v, out_attention_mask = core_attention(
+            q, k, v, attention_mask
+        )
+
+        assert out_q is q
+        torch.testing.assert_close(out_k, _fp8_per_token_head_quant_dequant(k))
+        torch.testing.assert_close(out_v, _fp8_per_token_head_quant_dequant(v))
+        assert out_attention_mask is attention_mask
+
+        out_q, out_k, out_v, out_attention_mask = core_attention(
+            query=q,
+            key=k,
+            value=v,
+            attention_mask=attention_mask,
+        )
+
+        assert out_q is q
+        torch.testing.assert_close(out_k, _fp8_per_token_head_quant_dequant(k))
+        torch.testing.assert_close(out_v, _fp8_per_token_head_quant_dequant(v))
+        assert out_attention_mask is attention_mask
+    finally:
+        handle.remove()
+
+
 def create_megatron_test_config(
     model_name: str,
     tp: int = 1,

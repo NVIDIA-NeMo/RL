@@ -16,6 +16,19 @@ from typing import Any, Literal, NotRequired, TypedDict
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
+VLLM_FP8_STATIC_KV_CACHE_DTYPES = ("fp8", "fp8_e4m3")
+VLLM_FP8_PER_TOKEN_HEAD_KV_CACHE_DTYPE = "fp8_per_token_head"
+VLLM_KV_CACHE_DTYPES = (
+    "auto",
+    *VLLM_FP8_STATIC_KV_CACHE_DTYPES,
+    VLLM_FP8_PER_TOKEN_HEAD_KV_CACHE_DTYPE,
+)
+
+
+def is_static_fp8_kv_cache_dtype(kv_cache_dtype: str) -> bool:
+    """Return whether vLLM expects externally synchronized FP8 KV scales."""
+    return kv_cache_dtype in VLLM_FP8_STATIC_KV_CACHE_DTYPES
+
 
 class VllmSpecificArgs(TypedDict):
     tensor_parallel_size: int
@@ -28,7 +41,9 @@ class VllmSpecificArgs(TypedDict):
     async_engine: bool
     load_format: NotRequired[str]
     precision: NotRequired[str]
-    kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3"]
+    # "fp8"/"fp8_e4m3" use static KV scales synchronized from training.
+    # "fp8_per_token_head" uses vLLM dynamic per-token per-head KV scales.
+    kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3", "fp8_per_token_head"]
     enforce_eager: NotRequired[bool]
     # By default, NeMo RL only has a Python handle to the vllm.LLM generation engine. The expose_http_server flag here will expose that generation engine as an HTTP server.
     # Exposing vLLM as a server is useful in instances where the multi-turn rollout is performed with utilities outside of NeMo RL, but the user still wants to take advantage of the refit logic in NeMo RL that keeps the policy and generation up to date.
