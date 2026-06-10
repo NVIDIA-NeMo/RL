@@ -50,9 +50,7 @@ def prefetch_nemo_gym_venvs(config_paths: list[str]) -> None:
     """
     init_ray()
 
-    nemo_gym_py_exec = get_actor_python_env(
-        "nemo_rl.environments.nemo_gym.NemoGym"
-    )
+    nemo_gym_py_exec = get_actor_python_env("nemo_rl.environments.nemo_gym.NemoGym")
     if nemo_gym_py_exec.startswith("uv"):
         nemo_gym_py_exec = create_local_venv_on_each_node(
             nemo_gym_py_exec, "nemo_rl.environments.nemo_gym.NemoGym"
