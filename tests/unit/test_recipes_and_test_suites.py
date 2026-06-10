@@ -45,6 +45,7 @@ ALGO_MAPPING_TO_BASE_YAML = {
     "distillation": "examples/configs/distillation_math.yaml",
     "rm": "examples/configs/rm.yaml",
     "dapo": "examples/configs/grpo_math_1B.yaml",
+    "cispo": "examples/configs/grpo_math_1B.yaml",
     "prorlv2": "examples/configs/prorlv2.v2.yaml",
 }
 
