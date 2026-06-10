@@ -137,6 +137,10 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # NOTE: This should only be used when doing exactly one update per rollout
     # (i.e., num_prompts_per_step * num_generations_per_prompt == train_global_batch_size)
     force_on_policy_ratio: bool = False
+    # VAPO: weight μ for positive-example NLL loss on correct samples.
+    # L = L_PPO + μ·L_NLL(correct)   (arXiv:2504.05118, Eq. 10)
+    # Set to 0 to disable.
+    positive_example_nll_weight: float = 0.0
 
 
 class ClippedPGLossDataDict(TypedDict):
@@ -205,7 +209,9 @@ class ClippedPGLossFn(LossFunction):
         self.ratio_clip_min = cfg.ratio_clip_min
         self.ratio_clip_max = cfg.ratio_clip_max
         self.ratio_clip_c = cfg.ratio_clip_c  # set to None to disable dual-clipping
-        self.reference_policy_kl_penalty = cfg.reference_policy_kl_penalty
+        self.reference_policy_kl_penalty = (
+            cfg.reference_policy_kl_penalty if not cfg.use_kl_in_reward else 0
+        )
         self.reference_policy_kl_type = cfg.reference_policy_kl_type
         self.kl_input_clamp_value = cfg.kl_input_clamp_value
         self.kl_output_clamp_value = cfg.kl_output_clamp_value
@@ -224,6 +230,7 @@ class ClippedPGLossFn(LossFunction):
 
         # Whether to compute importance weights per-sequence instead of per-token.
         self.sequence_level_importance_ratios = cfg.sequence_level_importance_ratios
+        self.positive_example_nll_weight = cfg.positive_example_nll_weight
         self.loss_type = (
             LossType.TOKEN_LEVEL if cfg.token_level_loss else LossType.SEQUENCE_LEVEL
         )
@@ -594,7 +601,23 @@ class ClippedPGLossFn(LossFunction):
                 global_normalization_factor=global_valid_toks,
             )
 
-        loss = actor_loss + kl
+        # -----------------------------------------------------------------
+        # VAPO: positive-example NLL loss on correct samples (reward > 0)
+        # L = L_PPO + μ · L_NLL(correct)
+        # -----------------------------------------------------------------
+        nll_loss = torch.tensor(0.0, device=mask.device)
+        if self.positive_example_nll_weight > 0 and "rewards" in data:
+            correct_sample_mask = (data["rewards"] > 0).float()  # [batch]
+            correct_mask = mask * correct_sample_mask.unsqueeze(-1)
+            correct_valid_toks = correct_mask.sum()
+            if correct_valid_toks > 0:
+                nll_loss = masked_mean(
+                    -curr_logprobs,
+                    correct_mask,
+                    global_normalization_factor=correct_valid_toks,
+                )
+
+        loss = actor_loss + kl + self.positive_example_nll_weight * nll_loss
         with torch.no_grad():
             probs_ratio = masked_mean(
                 ratios.detach(),
@@ -645,6 +668,7 @@ class ClippedPGLossFn(LossFunction):
                 "num_valid_samples": sample_mask.sum().item(),
                 "approx_entropy": seq_entropy_approx.item(),
                 **_is_filter_metrics,
+                "positive_nll_loss": nll_loss.item(),
             },
         )
 
@@ -1058,6 +1082,140 @@ class DistillationLossFn(LossFunction):
         }
 
         return kl_loss, metrics
+
+
+class MseValueLossConfig(BaseModel, extra="forbid"):
+    """Config for the MSE value loss used by PPO's value model."""
+
+    # Scaling factor applied to the value loss before it is added to the policy loss.
+    scale: float = 1.0
+    # Clipping range for value predictions (PPO-style). Set to None to disable clipping.
+    cliprange: Optional[float] = None
+
+
+class MseValueLossFn(LossFunction):
+    """Mean Squared Error value loss function with optional clipping (PPO-style).
+
+    When ``cliprange`` is set, value predictions are clipped to
+    ``[old_values - cliprange, old_values + cliprange]`` and the loss is
+    ``0.5 * max(mse(vpred, returns), mse(vpred_clipped, returns))``.
+    This prevents the value function from changing too drastically in a
+    single update, mirroring the policy ratio clipping in PPO.
+    """
+
+    input_type = LossInputType.LOGIT
+
+    def __init__(self, cfg: MseValueLossConfig):
+        self.scale = cfg.scale
+        self.cliprange = cfg.cliprange
+        self.loss_type = LossType.TOKEN_LEVEL
+
+    def __call__(
+        self,
+        values: torch.Tensor,
+        data: BatchedDataDict,
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Compute Mean Squared Error value loss, optionally with clipping."""
+        # Squeeze trailing singleton from value head output: [B, S, 1] -> [B, S]
+        if values.ndim > 2 and values.shape[-1] == 1:
+            values = values.squeeze(-1)
+
+        token_mask = data["token_mask"]
+        sample_mask = data["sample_mask"]
+        returns = data["returns"]
+        mask = token_mask * sample_mask.unsqueeze(-1)
+
+        if self.cliprange and self.cliprange > 0:
+            old_values = data["values"]
+            vpred_clipped = torch.clamp(
+                values,
+                old_values - self.cliprange,
+                old_values + self.cliprange,
+            )
+            vf_losses_unclipped = (values - returns) ** 2
+            vf_losses_clipped = (vpred_clipped - returns) ** 2
+            vf_losses = torch.max(vf_losses_unclipped, vf_losses_clipped)
+            loss = (
+                0.5
+                * self.scale
+                * masked_mean(
+                    vf_losses,
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                )
+            )
+            vf_clipfrac = masked_mean(
+                (vf_losses_clipped > vf_losses_unclipped).float(),
+                mask,
+                global_normalization_factor=global_valid_toks,
+            ).item()
+        else:
+            loss = torch.nn.functional.mse_loss(values, returns, reduction="none")
+            loss = (
+                0.5
+                * self.scale
+                * masked_mean(
+                    loss,
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                )
+            )
+            vf_clipfrac = 0.0
+
+        with torch.no_grad():
+            # Use global_valid_toks so each MB contributes local_sum/global_total.
+            # Summing across MBs in ppo.py then gives the correct global mean.
+            returns_mean = masked_mean(
+                returns,
+                mask,
+                global_normalization_factor=global_valid_toks,
+            ).item()
+            values_mean = masked_mean(
+                values,
+                mask,
+                global_normalization_factor=global_valid_toks,
+            ).item()
+
+            # Min/max are per-MB; ppo.py takes min/max across MBs.
+            masked_values = values[mask.bool()]
+            values_min = (
+                masked_values.min().item() if masked_values.numel() > 0 else 0.0
+            )
+            values_max = (
+                masked_values.max().item() if masked_values.numel() > 0 else 0.0
+            )
+
+            # Explained variance sufficient statistics.
+            # EV = 1 - Var(residual) / Var(returns)
+            # We export E[r²] and E[(r-v)²] (both / global_valid_toks so they
+            # sum correctly across MBs).  ppo.py combines them with returns_mean
+            # and values_mean to compute exact global EV.
+            returns_sq_mean = masked_mean(
+                returns**2,
+                mask,
+                global_normalization_factor=global_valid_toks,
+            ).item()
+            residual_sq_mean = masked_mean(
+                (returns - values) ** 2,
+                mask,
+                global_normalization_factor=global_valid_toks,
+            ).item()
+
+        metrics = {
+            "loss": float(loss.item()),
+            "vf_clipfrac": vf_clipfrac,
+            "returns_mean": returns_mean,
+            "values_mean": values_mean,
+            "values_min": values_min,
+            "values_max": values_max,
+            "returns_sq_mean": returns_sq_mean,
+            "residual_sq_mean": residual_sq_mean,
+            "num_valid_samples": int(values.shape[0]),
+        }
+
+        return loss, metrics
 
 
 # =====================================================================

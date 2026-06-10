@@ -874,9 +874,15 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # Only get the first worker's info since all workers will have the same result
         return results[0]
 
-    def finish_training(self, *args: Any, **kwargs: Any) -> None:
-        # Placeholder implementation
-        pass
+    def finish_inference(self) -> None:
+        """Offload policy model to CPU after inference."""
+        futures = self.worker_group.run_all_workers_single_data("finish_inference")
+        ray.get(futures)
+
+    def finish_training(self) -> None:
+        """Offload policy model to CPU after training."""
+        futures = self.worker_group.run_all_workers_single_data("finish_training")
+        ray.get(futures)
 
     def calibrate_qkv_fp8_scales(
         self,

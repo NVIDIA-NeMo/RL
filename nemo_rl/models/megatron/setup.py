@@ -87,6 +87,7 @@ from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
     get_megatron_checkpoint_dir,
 )
+from nemo_rl.models.value.config import ValueConfig
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
@@ -972,6 +973,7 @@ def setup_model_and_optimizer(
     get_embedding_ranks=None,  # TODO @sahilj: What is this?
     get_position_embedding_ranks=None,
     pre_load_checkpoint_hook: Optional[Callable] = None,
+    additional_pre_wrap_hooks: Optional[list[Callable]] = None,
 ):
     state = GlobalState()
     state.cfg = megatron_cfg
@@ -1111,6 +1113,9 @@ def setup_model_and_optimizer(
             preload_policy_from_pretrained=preload_policy_from_pretrained_for_draft,
         )
         pre_wrap_hook.extend([draft_pre_wrap_hook])
+
+    if additional_pre_wrap_hooks:
+        pre_wrap_hook.extend(additional_pre_wrap_hooks)
 
     # Model, optimizer, and learning rate.
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -1489,3 +1494,111 @@ class MoEFloat16Module(Float16Module):
                     router, "_maintain_float32_expert_bias"
                 ):
                     router._maintain_float32_expert_bias()
+
+
+def make_policy_like_config(config: ValueConfig) -> dict:
+    """Adapt a ValueConfig to look like a PolicyConfig for reusing setup functions.
+
+    The Megatron setup functions expect PolicyConfig fields. This builds a
+    compatible dict from the ValueConfig with the same shape as a PolicyConfig.
+
+    The output is deterministic for a given input — callers should cache the
+    result rather than rebuilding on every call.
+    """
+    megatron_cfg = dict(config["megatron_cfg"])
+
+    # Ensure required fields have defaults
+    megatron_cfg.setdefault("empty_unused_memory_level", 1)
+    megatron_cfg.setdefault("freeze_moe_router", False)
+    megatron_cfg.setdefault("moe_per_layer_logging", False)
+    megatron_cfg.setdefault("moe_enable_deepep", False)
+    megatron_cfg.setdefault("moe_token_dispatcher_type", "allgather")
+    megatron_cfg.setdefault("moe_shared_expert_overlap", False)
+    megatron_cfg.setdefault("moe_permute_fusion", False)
+    megatron_cfg.setdefault("moe_router_load_balancing_type", "none")
+    megatron_cfg.setdefault("moe_router_bias_update_rate", 0.0)
+    megatron_cfg.setdefault("moe_router_dtype", None)
+    megatron_cfg.setdefault("num_layers_in_first_pipeline_stage", None)
+    megatron_cfg.setdefault("num_layers_in_last_pipeline_stage", None)
+    megatron_cfg.setdefault("apply_rope_fusion", True)
+    megatron_cfg.setdefault("bias_activation_fusion", True)
+    megatron_cfg.setdefault("gradient_accumulation_fusion", False)
+    megatron_cfg.setdefault("defer_fp32_logits", False)
+    megatron_cfg.setdefault("force_overwrite_initial_ckpt", False)
+
+    return {
+        "model_name": config["model_name"],
+        "tokenizer": config["tokenizer"],
+        "train_global_batch_size": config["train_global_batch_size"],
+        "train_micro_batch_size": config["train_micro_batch_size"],
+        "logprob_batch_size": config.get(
+            "logprob_batch_size", config["train_micro_batch_size"]
+        ),
+        "precision": config["precision"],
+        "megatron_cfg": megatron_cfg,
+        "dynamic_batching": config["dynamic_batching"],
+        "sequence_packing": config.get("sequence_packing", {"enabled": False}),
+        "make_sequence_length_divisible_by": config[
+            "make_sequence_length_divisible_by"
+        ],
+        "max_total_sequence_length": config["max_total_sequence_length"],
+        "max_grad_norm": config.get("max_grad_norm", 1.0),
+        "hf_config_overrides": config.get("hf_config_overrides", {}),
+        "offload_optimizer_for_logprob": False,
+        # Value models don't use generation or reference models
+        "generation": None,
+    }
+
+
+def setup_value_head(
+    hidden_size: int,
+    dtype: torch.dtype,
+    config: ValueConfig,
+    weights_path: Optional[str],
+) -> torch.nn.Module:
+    """Create the value head module and load its weights.
+
+    Prefers a training checkpoint at ``<weights_path>/value_head.pt``; falls
+    back to the HF model's ``score`` weights when ``config.load_value_head_from_model``
+    is true. Returns the constructed ``ValueHead`` on CUDA.
+    """
+    # Lazy import to avoid a circular dependency between this module and the
+    # value worker that defines ValueHead.
+    from nemo_rl.models.value.workers.megatron_value_worker import ValueHead
+
+    value_head = ValueHead(hidden_size, dtype).cuda()
+
+    # 1) Try a training checkpoint first.
+    value_head_loaded = False
+    if weights_path is not None:
+        ckpt_path = os.path.join(weights_path, "value_head.pt")
+        if os.path.exists(ckpt_path):
+            value_head.load_state_dict(
+                torch.load(ckpt_path, map_location="cuda", weights_only=True)
+            )
+            print(f"Loaded value head weights from {ckpt_path}")
+            value_head_loaded = True
+
+    # 2) Fall back to HF model's score weights when requested.
+    if not value_head_loaded and config.get("load_value_head_from_model", False):
+        from nemo_rl.models.megatron.community_import import (
+            extract_value_head_from_hf_checkpoint,
+        )
+
+        score_weights = extract_value_head_from_hf_checkpoint(config["model_name"])
+        if "score.weight" in score_weights:
+            value_head.linear.weight.data.copy_(score_weights["score.weight"])
+            print(f"Loaded value head score.weight from {config['model_name']}")
+        if "score.bias" in score_weights:
+            if value_head.linear.bias is None:
+                value_head.linear.bias = torch.nn.Parameter(
+                    torch.zeros(
+                        value_head.linear.out_features,
+                        dtype=value_head.dtype,
+                        device=value_head.linear.weight.device,
+                    )
+                )
+            value_head.linear.bias.data.copy_(score_weights["score.bias"])
+            print(f"Loaded value head score.bias from {config['model_name']}")
+
+    return value_head
