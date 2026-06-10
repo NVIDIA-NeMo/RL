@@ -59,6 +59,7 @@ DATASET_REGISTRY = {
     "DAPOMath17K": DAPOMath17KDataset,
     "DAPOMathAIME2024": DAPOMathAIME2024Dataset,
     "DeepScaler": DeepScalerDataset,
+    "GSM8K": GSM8KDataset,
     "geometry3k": Geometry3KDataset,
     "HelpSteer3": HelpSteer3Dataset,
     "open_assistant": OasstDataset,
