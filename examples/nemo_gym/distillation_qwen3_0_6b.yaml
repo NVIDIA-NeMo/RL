@@ -1,0 +1,123 @@
+defaults: "../configs/distillation_math.yaml"
+
+distillation:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 1
+  max_num_steps: 1
+  max_num_epochs: 1
+  val_batch_size: 2
+  val_period: 1
+  max_val_samples: null
+  topk_logits_k: 16
+
+loss_fn:
+  kl_type: reverse
+
+policy:
+  model_name: Qwen/Qwen3-0.6B
+  tokenizer:
+    name: ${..model_name}
+  train_global_batch_size: 2
+  train_micro_batch_size: 1
+  generation_batch_size: 2
+  logprob_batch_size: 1
+  max_total_sequence_length: 4096
+  make_sequence_length_divisible_by: 1
+  dtensor_cfg:
+    enabled: true
+    _v2: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+  megatron_cfg:
+    enabled: false
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+  dynamic_batching:
+    enabled: false
+  generation:
+    max_new_tokens: 128
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    vllm_cfg:
+      async_engine: true
+      expose_http_server: true
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      gpu_memory_utilization: 0.6
+      max_model_len: ${...max_total_sequence_length}
+    colocated:
+      enabled: true
+      resources:
+        gpus_per_node: null
+        num_nodes: null
+
+teacher:
+  model_name: Qwen/Qwen3-0.6B
+  train_global_batch_size: 2
+  logprob_batch_size: 1
+  max_total_sequence_length: 4096
+  make_sequence_length_divisible_by: 1
+  dtensor_cfg:
+    enabled: true
+    _v2: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+  megatron_cfg:
+    enabled: false
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+  dynamic_batching:
+    enabled: false
+
+data:
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 1
+  train:
+    dataset_name: NemoGymDataset
+    data_path: /path/to/train.jsonl
+  validation:
+    dataset_name: NemoGymDataset
+    data_path: /path/to/validation.jsonl
+    repeat: 1
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    system_prompt_file: null
+    processor: nemo_gym_data_processor
+
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: false
+  nemo_gym:
+    port_range_low: 15001
+    port_range_high: 20000
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - resources_servers/example_multi_step/configs/example_multi_step.yaml
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: false
+          extra_body:
+            chat_template_kwargs:
+              enable_thinking: false
+
+logger:
+  log_dir: logs/distillation-qwen3-0.6b-nemo-gym
+  wandb_enabled: false
+  tensorboard_enabled: true
+  monitor_gpus: true
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: checkpoints/distillation-qwen3-0.6b-nemo-gym
+  save_period: 1
+
+cluster:
+  gpus_per_node: 1
+  num_nodes: 1

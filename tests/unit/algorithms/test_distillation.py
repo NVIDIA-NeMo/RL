@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -162,6 +163,11 @@ def mock_components():
             "data": {
                 "dataset_name": "test_dataset",
             },
+            "env": {
+                "math": {
+                    "num_workers": 1,
+                },
+            },
             "logger": {
                 "num_val_samples_to_print": 5,
             },
@@ -218,6 +224,61 @@ def test_distillation_train_max_steps(mock_components):
     )
 
     assert mock_components["student_policy"].train.call_count == 5
+
+
+def test_distillation_train_uses_nemo_gym_rollout_when_enabled(mock_components):
+    master_config = mock_components["master_config"]
+    master_config.distillation["max_num_steps"] = 1
+    master_config.distillation["max_num_epochs"] = 1
+    master_config.distillation["val_period"] = 0
+    master_config.env["should_use_nemo_gym"] = True
+    master_config.policy["generation"]["backend"] = "vllm"
+    master_config.policy["generation"]["vllm_cfg"] = {
+        "async_engine": True,
+        "expose_http_server": True,
+    }
+
+    mock_rollout_result = SimpleNamespace(
+        final_batch=next(iter(mock_components["train_dataloader"])),
+        rollout_metrics={"mean_gen_tokens_per_sample": 3.0},
+    )
+
+    with (
+        patch(
+            "nemo_rl.algorithms.distillation.run_async_nemo_gym_rollout",
+            return_value=mock_rollout_result,
+        ) as mock_nemo_gym_rollout,
+        patch(
+            "nemo_rl.algorithms.distillation.run_async_multi_turn_rollout"
+        ) as mock_async_rollout,
+        patch("nemo_rl.algorithms.distillation.run_multi_turn_rollout") as mock_rollout,
+    ):
+        distillation_train(
+            mock_components["student_policy"],
+            mock_components["teacher_policy"],
+            mock_components["student_generation"],
+            mock_components["train_dataloader"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            mock_components["task_to_env"],
+            mock_components["val_task_to_env"],
+            mock_components["logger"],
+            mock_components["checkpointer"],
+            _default_distillation_save_state(),
+            master_config,
+        )
+
+    mock_nemo_gym_rollout.assert_called_once()
+    mock_async_rollout.assert_not_called()
+    mock_rollout.assert_not_called()
+    train_metric_calls = [
+        call
+        for call in mock_components["logger"].log_metrics.call_args_list
+        if call.kwargs.get("prefix") == "train"
+    ]
+    assert train_metric_calls
+    assert train_metric_calls[-1].args[0]["mean_gen_tokens_per_sample"] == 3.0
 
 
 def test_exit_on_timeout(mock_components, capsys):
