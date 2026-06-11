@@ -1251,10 +1251,15 @@ class CrossTokenizerDistillationLossConfig(TypedDict):
         exact_token_match_only: If True, only aligned pairs flagged as
             'is_correct' contribute to KL; mismatched pairs are masked out.
             Used by the P-KL path only.
-        kl_loss_weight: Scalar multiplier on the KL term (P-KL path).
-        ce_loss_scale: Scalar multiplier on the CE term (P-KL path).
-        dynamic_loss_scaling: If True, rescale KL each step so its detached
-            magnitude matches CE (P-KL path).
+        kl_loss_weight: Scalar multiplier on the distillation (KD) term in
+            fixed-weight mode (``dynamic_loss_scaling=False``). Applies to
+            both the P-KL and gold-loss paths.
+        ce_loss_scale: Scalar multiplier on the next-token CE term in
+            fixed-weight mode. Applies to both the P-KL and gold-loss paths.
+        dynamic_loss_scaling: If True, rescale the KD term each step so its
+            detached magnitude matches CE, then add CE; ``kl_loss_weight`` /
+            ``ce_loss_scale`` are ignored in this mode. Applies to both the
+            P-KL and gold-loss paths.
         student_vocab_size: Full student tokenizer vocab size, used to size
             the projection matrix's student-side (V_s) axis. Runtime-injected
             by ``xtoken_off_policy_distillation.setup`` from ``len(student_tokenizer)``;
@@ -1319,9 +1324,13 @@ class CrossTokenizerDistillationLossFn(LossFunction):
       student CE term, combined as ``kl_loss_weight * kl + ce_loss_scale * ce``
       — or, when ``dynamic_loss_scaling`` is set, with the KL term rescaled
       each step to match the detached CE magnitude.
-    - ``(True, False)`` -> gold-loss: ``(kl_common + l1_uncommon) * T**2``,
-      i.e. KL on the exact-mapped *common* partition plus a sorted-L1 term on
-      the *uncommon* tail. No CE term.
+    - ``(True, False)`` -> gold-loss: KL on the exact-mapped *common* partition
+      plus a sorted-L1 term on the *uncommon* tail
+      (``kd = (kl_common + l1_uncommon) * T**2``), combined with a next-token
+      student CE term the same way as the P-KL path —
+      ``kl_loss_weight * kd + ce_loss_scale * ce``, or, when
+      ``dynamic_loss_scaling`` is set, with the KD term rescaled each step to
+      match the detached CE magnitude.
     - ``(True, True)`` -> gold-loss with the xtoken modifier: same objective,
       but the exact-map threshold is relaxed (``>= 0.6`` instead of ``== 1.0``)
       and a collision-replacement rule lets multi-token projections still
@@ -1343,8 +1352,9 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         ``(loss, metrics)``. The P-KL path reports ``loss``, ``kl_loss``,
         ``ce_loss``, ``kl_loss_scale``, ``accuracy``, ``proj_accuracy``,
         ``num_valid_samples``, ``num_valid_pairs``. The gold path reports
-        ``loss``, ``kl_common``, ``l1_uncommon``, ``accuracy``,
-        ``num_valid_samples``, ``num_valid_chunks``.
+        ``loss``, ``kl_common``, ``l1_uncommon``, ``ce_loss``,
+        ``kl_loss_scale``, ``accuracy``, ``num_valid_samples``,
+        ``num_valid_chunks``.
     """
 
     loss_type = LossType.TOKEN_LEVEL
@@ -1389,13 +1399,31 @@ class CrossTokenizerDistillationLossFn(LossFunction):
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute the cross-tokenizer distillation loss for one microbatch."""
         if self.gold_loss:
-            loss, kl_common, l1_uncommon, num_valid_chunks, top1_acc = (
+            kd_loss, kl_common, l1_uncommon, num_valid_chunks, top1_acc = (
                 self._compute_gold(logits, data, teacher_full_logits)
             )
+            ce_loss = self._compute_ce(logits, data, global_valid_toks)
+            # Combine the H-KL distillation loss with next-token CE, mirroring
+            # the P-KL path below (paper Eq. 7 under dynamic scaling:
+            # loss = sg(ce/kd) * kd + ce).
+            if self.dynamic_loss_scaling:
+                kd_detached = kd_loss.detach().abs()
+                ce_detached = ce_loss.detach().abs()
+                kl_scale = torch.where(
+                    kd_detached > 0,
+                    ce_detached / kd_detached,
+                    torch.ones_like(kd_detached),
+                )
+                loss = kl_scale * kd_loss + ce_loss
+            else:
+                kl_scale = torch.tensor(1.0, device=kd_loss.device, dtype=kd_loss.dtype)
+                loss = self.kl_loss_weight * kd_loss + self.ce_loss_scale * ce_loss
             metrics = {
                 "loss": loss.item(),
                 "kl_common": kl_common.item(),
                 "l1_uncommon": l1_uncommon.item(),
+                "ce_loss": ce_loss.item(),
+                "kl_loss_scale": kl_scale.item(),
                 "accuracy": top1_acc.item(),
                 "num_valid_samples": data["input_ids"].shape[0],
                 "num_valid_chunks": int(num_valid_chunks.item()),
