@@ -1022,9 +1022,8 @@ def scale_rewards(
 def get_idx_grouping(
     repeated_batch,
 ) -> list:
-    """Build a composite (task_name_id, idx) grouping key used
-    for both dynamic sampling and advantage estimation.
-    
+    """Build a composite (task_name_id, idx) grouping key used for both dynamic sampling and advantage estimation.
+
     Grouping by prompt token sequences is broken for multi-turn
     environments (e.g. tau-bench) where all tasks share the
     same initial prompt tokens. Grouping by idx alone is broken
