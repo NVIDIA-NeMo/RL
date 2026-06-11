@@ -38,10 +38,7 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleMetadata,
 )
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
-from nemo_rl.experience.rollout_manager import (
-    AsyncNemoGymRolloutManager,
-    AsyncRolloutManager,
-)
+from nemo_rl.experience.rollout_manager import RolloutManager
 from nemo_rl.experience.rollouts import (
     _calculate_single_metric,
     run_async_multi_turn_rollout,
@@ -964,6 +961,32 @@ def test_run_async_nemo_gym_rollout(
 
 
 # ---------------------------------------------------------------------------
+# Tests for RolloutManager
+# ---------------------------------------------------------------------------
+
+
+def test_rollout_manager_raises_without_impl_params():
+    """RolloutManager raises AssertionError when required params are missing."""
+    common = {
+        "tokenizer": None,
+        "task_to_env": {},
+        "num_generations_per_prompt": 1,
+        "max_seq_len": 1,
+    }
+
+    with pytest.raises(AssertionError, match="num_generations_per_prompt must be >= 1"):
+        updated_common = common.copy()
+        updated_common["num_generations_per_prompt"] = 0
+        RolloutManager(**updated_common, use_nemo_gym=False)
+
+    with pytest.raises(AssertionError, match="policy_generation is required"):
+        RolloutManager(**common, use_nemo_gym=False)
+
+    with pytest.raises(AssertionError, match="generation_config is required"):
+        RolloutManager(**common, use_nemo_gym=True)
+
+
+# ---------------------------------------------------------------------------
 # Tests for AsyncRolloutManager (native async path)
 # ---------------------------------------------------------------------------
 
@@ -1041,13 +1064,14 @@ def test_async_rollout_manager(
     max_seq_len = 1024
     max_rollout_turns = input_sample["extra_env_info"]["max_steps"] + 1
 
-    manager = AsyncRolloutManager(
-        policy_generation=vllm_generation,
+    manager = RolloutManager(
+        use_nemo_gym=False,
         tokenizer=rollout_tokenizer,
         task_to_env=task_to_env,
-        max_seq_len=max_seq_len,
         num_generations_per_prompt=num_generations,
+        max_seq_len=max_seq_len,
         max_rollout_turns=max_rollout_turns,
+        policy_generation=vllm_generation,
     )
 
     vllm_generation.prepare_for_generation()
@@ -1099,13 +1123,14 @@ def test_async_rollout_manager_truncation(
     max_seq_len = 290
     max_rollout_turns = input_sample["extra_env_info"]["max_steps"] + 1
 
-    manager = AsyncRolloutManager(
-        policy_generation=vllm_generation,
+    manager = RolloutManager(
+        use_nemo_gym=False,
         tokenizer=rollout_tokenizer,
         task_to_env=task_to_env,
-        max_seq_len=max_seq_len,
         num_generations_per_prompt=num_generations,
+        max_seq_len=max_seq_len,
         max_rollout_turns=max_rollout_turns,
+        policy_generation=vllm_generation,
     )
     vllm_generation.prepare_for_generation()
     record = asyncio.run(manager.run_rollout(input_sample))
@@ -1163,13 +1188,14 @@ def test_async_rollout_manager_matches_original(
         max_rollout_turns=max_rollout_turns,
     )
 
-    manager = AsyncRolloutManager(
-        policy_generation=vllm_generation,
+    manager = RolloutManager(
+        use_nemo_gym=False,
         tokenizer=rollout_tokenizer,
         task_to_env=task_to_env,
-        max_seq_len=max_seq_len,
         num_generations_per_prompt=num_generations,
+        max_seq_len=max_seq_len,
         max_rollout_turns=max_rollout_turns,
+        policy_generation=vllm_generation,
     )
     record = asyncio.run(manager.run_rollout(input_sample))
     vllm_generation.finish_generation()
@@ -1209,14 +1235,23 @@ def test_async_rollout_manager_matches_original(
             f"Completion {i}: reward mismatch — original {orig_reward}, manager {new_reward}"
         )
 
-    # 4. rollout_metrics numeric values match (timing and histogram fields are excluded)
+    # 4. rollout_metrics numeric values match (timing and histogram fields are excluded).
+    # The new impl emits slash-style keys (X/mean, X/max, X/min) via _calculate_single_metric;
+    # translate the legacy prefix-style keys before comparing.
+    def _translate_legacy_key(key: str) -> str:
+        if key == "avg_turns_per_sample":
+            return "turns_per_sample/mean"
+        for prefix, suffix in (("mean_", "/mean"), ("max_", "/max"), ("min_", "/min")):
+            if key.startswith(prefix):
+                return f"{key[len(prefix) :]}{suffix}"
+        return key
+
     new_metrics = record.rollout_metrics
     for key in original_metrics.keys():
         if key.startswith("timing/") or key.startswith("histogram/"):
             continue
 
-        # renamed in new impl
-        new_key = "mean_turns_per_sample" if key == "avg_turns_per_sample" else key
+        new_key = _translate_legacy_key(key)
         assert new_key in new_metrics, (
             f"rollout_metrics[{new_key!r}] missing from manager"
         )
@@ -1281,12 +1316,13 @@ def test_async_nemo_gym_rollout_manager(
     }
     num_generations = 2
 
-    manager = AsyncNemoGymRolloutManager(
+    manager = RolloutManager(
+        use_nemo_gym=True,
         tokenizer=nemo_gym_tokenizer,
         task_to_env={"nemo_gym": nemo_gym},
-        generation_config=nemo_gym_vllm_generation.cfg,
         num_generations_per_prompt=num_generations,
         max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
+        generation_config=nemo_gym_vllm_generation.cfg,
     )
     record = asyncio.run(manager.run_rollout(single_prompt))
 
@@ -1391,12 +1427,13 @@ def test_async_nemo_gym_rollout_manager_matches_original(
         max_rollout_turns=None,
     )
 
-    manager = AsyncNemoGymRolloutManager(
+    manager = RolloutManager(
+        use_nemo_gym=True,
         tokenizer=nemo_gym_tokenizer,
         task_to_env={"nemo_gym": nemo_gym},
-        generation_config=nemo_gym_vllm_generation.cfg,
         num_generations_per_prompt=num_generations,
         max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
+        generation_config=nemo_gym_vllm_generation.cfg,
     )
     record = asyncio.run(manager.run_rollout(single_prompt))
 
