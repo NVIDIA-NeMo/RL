@@ -77,17 +77,13 @@ class TestStalenessSamplerSelect:
         buf.add_group("g0", group_size=1, weight=5)
         sampler = StalenessSampler(buf, max_staleness_versions=2)
 
-        assert (
-            sampler.select(current_train_weight=5, min_prompt_groups=2) is None
-        )
+        assert sampler.select(current_train_weight=5, min_prompt_groups=2) is None
 
     def test_select_returns_none_on_empty_buffer(self):
         buf = FakeBuffer()
         sampler = StalenessSampler(buf, max_staleness_versions=2)
 
-        assert (
-            sampler.select(current_train_weight=5, min_prompt_groups=1) is None
-        )
+        assert sampler.select(current_train_weight=5, min_prompt_groups=1) is None
 
     def test_select_filters_by_staleness_window(self):
         buf = FakeBuffer()
@@ -159,9 +155,7 @@ class TestStalenessSamplerSelect:
         sampler = StalenessSampler(buf, max_staleness_versions=0)
 
         # 3 eligible (need weight=5), only have 2
-        assert (
-            sampler.select(current_train_weight=5, min_prompt_groups=3) is None
-        )
+        assert sampler.select(current_train_weight=5, min_prompt_groups=3) is None
 
         selected = sampler.select(current_train_weight=5, min_prompt_groups=2)
         assert selected is not None

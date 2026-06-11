@@ -56,13 +56,9 @@ class StalenessSampler:
             Concatenated KVBatchMeta covering min_prompt_groups groups, or None.
         """
         if min_prompt_groups < 1:
-            raise ValueError(
-                f"min_prompt_groups must be >= 1, got {min_prompt_groups}"
-            )
+            raise ValueError(f"min_prompt_groups must be >= 1, got {min_prompt_groups}")
 
-        min_valid_version = max(
-            0, current_train_weight - self.max_staleness_versions
-        )
+        min_valid_version = max(0, current_train_weight - self.max_staleness_versions)
         valid_indices = [
             i
             for i, weight in enumerate(self._buffer.weight_list)
@@ -97,9 +93,7 @@ class StalenessSampler:
         Returns:
             Number of group entries removed from the buffer.
         """
-        min_valid_version = max(
-            0, current_train_weight - self.max_staleness_versions
-        )
+        min_valid_version = max(0, current_train_weight - self.max_staleness_versions)
         stale_indices = [
             i
             for i, weight in enumerate(self._buffer.weight_list)
@@ -108,8 +102,6 @@ class StalenessSampler:
         if not stale_indices:
             return 0
         stale_sample_ids = [
-            sid
-            for i in stale_indices
-            for sid in self._buffer.meta_list[i].sample_ids
+            sid for i in stale_indices for sid in self._buffer.meta_list[i].sample_ids
         ]
         return await self._buffer.remove(stale_sample_ids)

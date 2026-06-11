@@ -596,9 +596,7 @@ class TQReplayBuffer:
                 f"TQReplayBuffer.add: weight_version must be int, got "
                 f"{type(weight_version).__name__}"
             )
-        train_batch = record_to_train_batch(
-            record, pad_value_dict=self._pad_value_dict
-        )
+        train_batch = record_to_train_batch(record, pad_value_dict=self._pad_value_dict)
         sample_ids, fields, tags = pack_payload(
             train_batch, weight_version=weight_version
         )

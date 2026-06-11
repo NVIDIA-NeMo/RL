@@ -91,9 +91,7 @@ class FakeDataPlaneClient:
             tags=[dict(t) for t in tags] if tags is not None else None,
         )
 
-    def clear_samples(
-        self, sample_ids: list[str] | None, partition_id: str
-    ) -> None:
+    def clear_samples(self, sample_ids: list[str] | None, partition_id: str) -> None:
         assert partition_id == self._partition_id
         ids = list(sample_ids) if sample_ids is not None else list(self._rows)
         self.clear_calls.append(list(ids))
