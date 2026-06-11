@@ -157,10 +157,16 @@ class TauBenchWorker:
         self._active_envs: Dict[str, Any] = {}
 
         if self._mock_user:
-            assert mock_user_latency_s is not None, "mock_user_latency_s must be set when user_strategy='mock'"
-            assert mock_stop_prob is not None, "mock_stop_prob must be set when user_strategy='mock'"
+            assert mock_user_latency_s is not None, (
+                "mock_user_latency_s must be set when user_strategy='mock'"
+            )
+            assert mock_stop_prob is not None, (
+                "mock_stop_prob must be set when user_strategy='mock'"
+            )
         if self._mock_judge:
-            assert mock_judge_latency_s is not None, "mock_judge_latency_s must be set when judge_model='mock'"
+            assert mock_judge_latency_s is not None, (
+                "mock_judge_latency_s must be set when judge_model='mock'"
+            )
         self._mock_judge_latency_s = mock_judge_latency_s
 
         if self._mock_user:
@@ -196,7 +202,11 @@ class TauBenchWorker:
 
             def _mock_completion(*args: Any, **kwargs: Any) -> "_Resp":
                 time.sleep(_latency)
-                content = "###STOP###" if random.random() < _stop_prob else random.choice(_responses)
+                content = (
+                    "###STOP###"
+                    if random.random() < _stop_prob
+                    else random.choice(_responses)
+                )
                 return _Resp(content)
 
             self._mock_completion = _mock_completion
@@ -243,6 +253,7 @@ class TauBenchWorker:
         )
         if self._mock_user:
             from unittest.mock import patch
+
             with patch("litellm.completion", self._mock_completion):
                 reset_response = env.reset(task_index=task_index)
         else:
@@ -346,7 +357,7 @@ class TauBenchWorker:
                     break
                 except Exception as e:
                     last_exc = e
-                    delay = 2 ** attempt + random.uniform(0, 1)
+                    delay = 2**attempt + random.uniform(0, 1)
                     print(
                         f"[TauBench worker] _make_env attempt {attempt + 1}/5 failed "
                         f"({type(e).__name__}: {e}); retrying in {delay:.1f}s",
@@ -392,6 +403,7 @@ class TauBenchWorker:
             try:
                 if self._mock_user:
                     from unittest.mock import patch
+
                     with patch("litellm.completion", self._mock_completion):
                         env_response = tau_env.step(action)
                 else:
@@ -402,9 +414,10 @@ class TauBenchWorker:
                 # BadRequestError (e.g. context too long) is deterministic —
                 # retrying won't help. Force-terminate immediately.
                 import litellm
+
                 if isinstance(e, litellm.BadRequestError):
                     break
-                delay = 2 ** attempt + random.uniform(0, 1)
+                delay = 2**attempt + random.uniform(0, 1)
                 print(
                     f"[TauBench worker] tau_env.step attempt {attempt + 1}/5 failed "
                     f"({type(e).__name__}: {e}); retrying in {delay:.1f}s",
@@ -457,7 +470,10 @@ class TauBenchWorker:
                 # From the user sim's POV, role="user" is the agent speaking and
                 # role="assistant" is the customer speaking — flip for judge.
                 convo = [
-                    {"role": "assistant" if m["role"] == "user" else "user", "content": m["content"]}
+                    {
+                        "role": "assistant" if m["role"] == "user" else "user",
+                        "content": m["content"],
+                    }
                     for m in user_msgs
                     if m.get("role") in ("user", "assistant")
                 ]
@@ -684,8 +700,8 @@ class TauBenchEnvironment(EnvironmentInterface[TauBenchEnvMetadata]):
         if tau_rewards:
             metrics["tau_bench/mean_tau_reward"] = sum(tau_rewards) / len(tau_rewards)
         if judge_scores:
-            metrics["tau_bench/mean_judge_score"] = (
-                sum(judge_scores) / len(judge_scores)
+            metrics["tau_bench/mean_judge_score"] = sum(judge_scores) / len(
+                judge_scores
             )
 
         return batch, metrics

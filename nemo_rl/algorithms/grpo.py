@@ -1174,15 +1174,14 @@ def get_idx_grouping(
     idx_vals = repeated_batch["idx"]
     task_names = repeated_batch["task_name"]
     unique_task_names = sorted(set(str(n) for n in task_names))
-    task_name_to_id = {
-        name: i for i, name in enumerate(unique_task_names)
-    }
+    task_name_to_id = {name: i for i, name in enumerate(unique_task_names)}
     task_ids = [task_name_to_id[str(n)] for n in task_names]
     prompt_ids_for_adv = torch.tensor(
         list(zip(task_ids, idx_vals)),
         dtype=torch.long,
     )
     return prompt_ids_for_adv
+
 
 def add_grpo_token_loss_masks_and_generation_logprobs(
     message_logs: list[LLMMessageLogType | VLMMessageLogType],

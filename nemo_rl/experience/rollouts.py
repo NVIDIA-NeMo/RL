@@ -80,7 +80,6 @@ def _tokenize_env_observation(
             obs_content, return_tensors="pt", add_special_tokens=False
         ).input_ids[0]
 
-
     assert getattr(tokenizer, "chat_template", None) is not None
 
     # Use a minimal two-message sequence to extract the incremental tokens for
@@ -133,7 +132,7 @@ def _tokenize_env_observation(
     # on a stop string (which it would include via include_stop_str_in_output).
     _sep_start = _without_obs.rfind(_dummy_content) + len(_dummy_content)
     _turn_separator = _without_obs[_sep_start:]
-    obs_chunk = _turn_separator + _with_obs[len(_without_obs):]
+    obs_chunk = _turn_separator + _with_obs[len(_without_obs) :]
     return tokenizer(
         obs_chunk, return_tensors="pt", add_special_tokens=False
     ).input_ids[0]
