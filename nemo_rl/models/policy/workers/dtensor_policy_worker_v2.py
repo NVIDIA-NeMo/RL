@@ -82,18 +82,39 @@ from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 from nemo_rl.utils.timer import Timer
 
 
+def _resolve_refit_transfer_dtype(
+    name: str,
+    src_dtype: torch.dtype,
+    base_dtype: torch.dtype,
+) -> torch.dtype:
+    """Pick the dtype used to transfer a tensor during refit."""
+    if not src_dtype.is_floating_point:
+        return src_dtype
+    if name.endswith(".gate.weight") or name.endswith(".e_score_correction_bias"):
+        return torch.float32
+    return base_dtype
+
+
+def _prepare_refit_tensor(
+    tensor: torch.Tensor, target_dtype: torch.dtype
+) -> torch.Tensor:
+    """Return a contiguous tensor with the dtype expected by generation refit."""
+    return tensor.to(dtype=target_dtype, non_blocking=True).contiguous()
+
+
 def dtensor_params_generator(
-    model: nn.Module, target_dtype: torch.dtype
+    model: nn.Module,
+    target_dtype: torch.dtype,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
-    """Generator that yields (name, tensor) pairs, converting DTensors to local tensors and adapting to HF format.
+    """Yield HF-adapted tensors, converting DTensors to local tensors first.
 
     Args:
         model: The model whose parameters to generate.
-        target_dtype: The dtype to convert tensors to.
-        peft_config: Optional LoRA config for filtering which layers to merge.
+        target_dtype: Base dtype for floating tensors that are not fp32.
 
     Yields:
-        Tuples of (fully_qualified_name, tensor) where tensors are converted to target dtype and made contiguous.
+        Tuples of (fully_qualified_name, tensor) where tensors are converted to
+        the dtype expected by generation refit and made contiguous.
     """
     module_map = dict(model.named_modules())
     for name, tensor in model.state_dict().items():
@@ -104,10 +125,16 @@ def dtensor_params_generator(
 
         adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(model, name, merged_tensor)
         for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
-            # Convert to target dtype
             yield (
                 adapted_fqn,
-                adapted_tensor.to(target_dtype, non_blocking=True).contiguous(),
+                _prepare_refit_tensor(
+                    adapted_tensor,
+                    _resolve_refit_transfer_dtype(
+                        adapted_fqn,
+                        adapted_tensor.dtype,
+                        target_dtype,
+                    ),
+                ),
             )
             del adapted_tensor
         del adapted_fqn_tensors
@@ -387,6 +414,9 @@ class DTensorPolicyWorkerV2Impl(
     def set_rollout_num_gpus_per_engine(self, num_gpus_per_engine: int) -> None:
         """Record the rollout engine's TP size for later use in ``stream_weights_via_http``."""
         self._rollout_num_gpus_per_engine = num_gpus_per_engine
+
+    def _get_refit_target_dtype(self, name: str, src_dtype: torch.dtype) -> torch.dtype:
+        return _resolve_refit_transfer_dtype(name, src_dtype, self.dtype)
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/train")
     def train(
@@ -1075,7 +1105,10 @@ class DTensorPolicyWorkerV2Impl(
                 self.model, name, full_tensor
             )
             for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
-                state_dict_info[adapted_fqn] = (adapted_tensor.shape, self.dtype)
+                state_dict_info[adapted_fqn] = (
+                    adapted_tensor.shape,
+                    self._get_refit_target_dtype(adapted_fqn, adapted_tensor.dtype),
+                )
 
         return state_dict_info
 
