@@ -83,18 +83,38 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
 
+def _resolve_refit_transfer_dtype(
+    src_dtype: torch.dtype,
+    base_dtype: torch.dtype,
+) -> torch.dtype:
+    """Pick the dtype used to transfer a tensor during refit."""
+    if not src_dtype.is_floating_point:
+        return src_dtype
+    if src_dtype == torch.float32:
+        return torch.float32
+    return base_dtype
+
+
+def _prepare_refit_tensor(
+    tensor: torch.Tensor, target_dtype: torch.dtype
+) -> torch.Tensor:
+    """Return a contiguous tensor with the dtype expected by generation refit."""
+    return tensor.to(dtype=target_dtype, non_blocking=True).contiguous()
+
+
 def dtensor_params_generator(
-    model: nn.Module, target_dtype: torch.dtype
+    model: nn.Module,
+    target_dtype: torch.dtype,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
-    """Generator that yields (name, tensor) pairs, converting DTensors to local tensors and adapting to HF format.
+    """Yield HF-adapted tensors, converting DTensors to local tensors first.
 
     Args:
         model: The model whose parameters to generate.
-        target_dtype: The dtype to convert tensors to.
-        peft_config: Optional LoRA config for filtering which layers to merge.
+        target_dtype: Base dtype for floating tensors that are not fp32.
 
     Yields:
-        Tuples of (fully_qualified_name, tensor) where tensors are converted to target dtype and made contiguous.
+        Tuples of (fully_qualified_name, tensor) where tensors are converted to
+        the dtype expected by generation refit and made contiguous.
     """
     module_map = dict(model.named_modules())
     for name, tensor in model.state_dict().items():
@@ -105,10 +125,15 @@ def dtensor_params_generator(
 
         adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(model, name, merged_tensor)
         for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
-            # Convert to target dtype
             yield (
                 adapted_fqn,
-                adapted_tensor.to(target_dtype, non_blocking=True).contiguous(),
+                _prepare_refit_tensor(
+                    adapted_tensor,
+                    _resolve_refit_transfer_dtype(
+                        adapted_tensor.dtype,
+                        target_dtype,
+                    ),
+                ),
             )
             del adapted_tensor
         del adapted_fqn_tensors
@@ -353,6 +378,9 @@ class DTensorPolicyWorkerV2Impl(
             self.sampling_params,
             _runtime_is_reward_model,  # Duplicate, already set as _is_reward_model
         ) = runtime_config
+
+    def _get_refit_target_dtype(self, src_dtype: torch.dtype) -> torch.dtype:
+        return _resolve_refit_transfer_dtype(src_dtype, self.dtype)
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/train")
     def train(
@@ -1123,36 +1151,35 @@ class DTensorPolicyWorkerV2Impl(
                 adapted_pairs = list(
                     _maybe_adapt_tensor_to_hf(owning_part, name, tensor)
                 )
-                meta = [(an, list(at.shape), str(at.dtype)) for an, at in adapted_pairs]
+                target_pairs = [
+                    (an, at, self._get_refit_target_dtype(at.dtype))
+                    for an, at in adapted_pairs
+                ]
+                meta = [
+                    (adapted_name, list(adapted_tensor.shape), target_dtype)
+                    for adapted_name, adapted_tensor, target_dtype in target_pairs
+                ]
                 torch.distributed.broadcast_object_list(
                     [meta], src=owner_global_rank, group=pp_group
                 )
-                for _, adapted_tensor in adapted_pairs:
-                    contig = adapted_tensor.contiguous()
+                for adapted_name, adapted_tensor, target_dtype in target_pairs:
+                    contig = _prepare_refit_tensor(adapted_tensor, target_dtype)
                     torch.distributed.broadcast(
                         contig, src=owner_global_rank, group=pp_group
                     )
-                for adapted_name, adapted_tensor in adapted_pairs:
-                    yield (
-                        adapted_name,
-                        adapted_tensor.to(self.dtype, non_blocking=True).contiguous(),
-                    )
+                    yield adapted_name, contig
             else:
                 meta_list = [None]
                 torch.distributed.broadcast_object_list(
                     meta_list, src=owner_global_rank, group=pp_group
                 )
                 meta = meta_list[0]
-                for adapted_name, shape, dtype_str in meta:
-                    dtype = getattr(torch, dtype_str.replace("torch.", ""))
+                for adapted_name, shape, dtype in meta:
                     buf = torch.empty(shape, dtype=dtype, device="cuda")
                     torch.distributed.broadcast(
                         buf, src=owner_global_rank, group=pp_group
                     )
-                    yield (
-                        adapted_name,
-                        buf.to(self.dtype, non_blocking=True).contiguous(),
-                    )
+                    yield adapted_name, _prepare_refit_tensor(buf, dtype)
 
     def _get_local_param_tensor(self, name: str) -> tuple[torch.Tensor, nn.Module]:
         """Get a single param tensor by name from local model parts, gathering DTensor.
@@ -1249,7 +1276,10 @@ class DTensorPolicyWorkerV2Impl(
                 )
                 adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(part, name, full_tensor)
                 for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
-                    local_info[adapted_fqn] = (adapted_tensor.shape, self.dtype)
+                    local_info[adapted_fqn] = (
+                        adapted_tensor.shape,
+                        self._get_refit_target_dtype(adapted_tensor.dtype),
+                    )
 
         if self.pp_enabled:
             # All-gather param info across PP ranks so all workers return full metadata
@@ -1334,14 +1364,11 @@ class DTensorPolicyWorkerV2Impl(
                 if isinstance(tensor, DTensor):
                     # Convert DTensor to full tensor for streaming
                     full_tensor = tensor.full_tensor()
-                    # Convert to target dtype
-                    yield (
-                        name,
-                        full_tensor.to(self.dtype, non_blocking=True).contiguous(),
-                    )
+                    target_dtype = self._get_refit_target_dtype(full_tensor.dtype)
+                    yield name, _prepare_refit_tensor(full_tensor, target_dtype)
                 else:
-                    # Convert to target dtype
-                    yield name, tensor.to(self.dtype, non_blocking=True).contiguous()
+                    target_dtype = self._get_refit_target_dtype(tensor.dtype)
+                    yield name, _prepare_refit_tensor(tensor, target_dtype)
 
         # Use the HTTP implementation
         stream_weights_via_http_impl(
