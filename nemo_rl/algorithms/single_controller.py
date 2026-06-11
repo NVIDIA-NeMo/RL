@@ -387,6 +387,7 @@ class SingleControllerActor:
             while groups_dispatched < target_groups:
                 await asyncio.sleep(0)
 
+                # TODO @yukih: wait train pump merged
                 train_meta = self._sampler.select(
                     current_train_weight=self._trainer_version,
                     min_prompt_groups=self._cfg.min_prompt_groups_per_batch,
