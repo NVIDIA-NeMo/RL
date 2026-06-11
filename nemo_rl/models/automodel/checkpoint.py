@@ -79,6 +79,10 @@ def _patch_qwen_vl_vision_key_mapping() -> None:
         return result or None
 
     _patched_get_combined_key_mapping._nrl_vision_patch = True
+    # Expose the wrapped original so the removal tripwire test
+    # (test_qwen_vl_vision_key_mapping_workaround_still_needed) can query the real
+    # (unpatched) mapping and detect when transformers #45358 (>=5.6) makes this obsolete.
+    _patched_get_combined_key_mapping._nrl_orig = _orig
     _am_ckpt.get_combined_key_mapping = _patched_get_combined_key_mapping
 
 

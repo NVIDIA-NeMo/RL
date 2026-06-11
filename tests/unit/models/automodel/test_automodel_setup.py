@@ -2136,3 +2136,50 @@ class TestMaybeSetForceHf:
         config = self._make_config(arch)
         _maybe_set_force_hf(kwargs, config)
         assert "force_hf" not in kwargs
+
+
+@pytest.mark.automodel
+def test_automodel_dtype_restore_workaround_still_needed(monkeypatch):
+    """Tripwire for the temporary fp32 master-weight workaround in setup.py.
+
+    ``_disable_automodel_checkpoint_dtype_restore`` no-ops Automodel's
+    ``_restore_loaded_model_dtype`` because (pre PR #2419) it downgrades an explicitly-fp32
+    load back to the bf16 checkpoint dtype, breaking optimizer master weights. This test
+    reproduces that downgrade against the *live* pinned function (no model/checkpoint load).
+
+    It PASSES while the bug is present. It FAILS — telling us to delete the workaround in
+    ``nemo_rl/models/automodel/setup.py`` (and this test) — once Automodel either removes the
+    function or ships PR #2419 (honors the explicit fp32 via ``promote_types`` so the weight
+    stays fp32).
+    """
+    import types
+
+    from nemo_automodel._transformers import model_init
+    import nemo_automodel.components.checkpoint.utils as ckpt_utils
+
+    restore = getattr(model_init, "_restore_loaded_model_dtype", None)
+    if restore is None:
+        pytest.fail(
+            "Automodel removed _restore_loaded_model_dtype - remove the fp32 master-weight "
+            "workaround _disable_automodel_checkpoint_dtype_restore() in "
+            "nemo_rl/models/automodel/setup.py."
+        )
+
+    model = torch.nn.Linear(4, 4).float()
+    assert model.weight.dtype == torch.float32
+
+    # Pretend the checkpoint stored the weight in bf16.
+    monkeypatch.setattr(
+        ckpt_utils,
+        "_get_checkpoint_tensor_dtypes",
+        lambda *args, **kwargs: {"weight": torch.bfloat16},
+    )
+    # Supply the explicit fp32 request both ways the rewritten (#2419) fn might read it.
+    hf_config = types.SimpleNamespace(torch_dtype=torch.float32)
+    restore(model, "dummy", hf_config, None, {"torch_dtype": "torch.float32"})
+
+    assert model.weight.dtype == torch.bfloat16, (
+        "Automodel no longer downgrades an explicit-fp32 load (likely PR #2419 landed); the "
+        "_disable_automodel_checkpoint_dtype_restore() workaround in setup.py is obsolete - "
+        "remove it and this test."
+    )

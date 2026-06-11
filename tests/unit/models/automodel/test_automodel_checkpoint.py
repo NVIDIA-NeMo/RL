@@ -987,3 +987,39 @@ class TestSaveLoadIntegration:
             }
             # Verify the weights match the original
             check_dict_equality(lora_params_loaded, lora_params_original)
+
+
+@pytest.mark.automodel
+def test_qwen_vl_vision_key_mapping_workaround_still_needed():
+    """Tripwire for the temporary Qwen-VL vision-tower key-mapping workaround.
+
+    ``_patch_qwen_vl_vision_key_mapping`` (checkpoint.py) re-injects the
+    ``^visual.`` -> ``model.visual.`` rename that transformers v5.5.0 (#44627) dropped, so
+    the vision tower loads instead of being left randomly initialized. transformers #45358
+    (v5.6) fixed the upstream mapping; the workaround is needed only while the automodel pin
+    uses the broken transformers 5.5.x.
+
+    This calls the *unwrapped* real ``get_combined_key_mapping`` and asserts it still lacks the
+    ``model.visual`` target (bug present). It runs under ``@pytest.mark.automodel`` (the
+    automodel-extra venv, transformers 5.5.x, where the patch matters). It FAILS — telling us
+    to remove ``_patch_qwen_vl_vision_key_mapping`` (and this test) — once that transformers
+    pin includes #45358 (>=5.6) and the real mapping targets ``model.visual``.
+    """
+    import nemo_rl.models.automodel.checkpoint  # noqa: F401  (import applies the patch)
+    import nemo_automodel.components.checkpoint.checkpointing as ckpt
+
+    fn = ckpt.get_combined_key_mapping
+    # Unwrap to the real automodel mapping fn (Change 3 exposes it as _nrl_orig); if the patch
+    # was never applied, fn is already the original.
+    orig = getattr(fn, "_nrl_orig", fn)
+
+    for model_type in ("qwen2_5_vl", "qwen2_vl"):
+        mapping = orig(model_type) or {}
+        assert not any(
+            str(target).startswith("model.visual") for target in mapping.values()
+        ), (
+            f"Automodel/transformers now maps visual->model.visual for {model_type} "
+            "(likely transformers #45358 / >=5.6); the _patch_qwen_vl_vision_key_mapping "
+            "workaround in nemo_rl/models/automodel/checkpoint.py is obsolete - remove it "
+            "and this test."
+        )
