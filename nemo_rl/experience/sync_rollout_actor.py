@@ -48,6 +48,7 @@ from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import (
+    EffortLevelsConfig,
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
@@ -242,7 +243,11 @@ class SyncRolloutActor:
                 max_seq_len=None,
                 max_rollout_turns=None,
                 generation_config=cfg.policy["generation"],
-                effort_config=cfg.nemo_gym.effort_levels if cfg.nemo_gym else None,
+                effort_config=EffortLevelsConfig.model_validate(
+                    cfg.env["nemo_gym"]["effort_levels"]
+                )
+                if cfg.env.get("nemo_gym", {}).get("effort_levels")
+                else None,
             )
             final_batch, rollout_metrics = r.final_batch, r.rollout_metrics
         else:

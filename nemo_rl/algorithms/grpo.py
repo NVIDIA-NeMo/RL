@@ -214,16 +214,6 @@ class GRPOLoggerConfig(LoggerConfig):
     num_val_samples_to_print: int  # number of val samples to print to stdout
 
 
-class NemoGymConfig(BaseModel, extra="allow"):
-    """Configuration for the NeMo-Gym rollout path.
-
-    Only used when ``env.should_use_nemo_gym: true``.
-    """
-
-    effort_levels: Optional[EffortLevelsConfig] = None
-    """Length-based reward shaping for effort-level prompts. Omit to disable."""
-
-
 class MasterConfig(BaseModel, extra="allow"):
     policy: PolicyConfig
     loss_fn: ClippedPGLossConfig
@@ -234,7 +224,6 @@ class MasterConfig(BaseModel, extra="allow"):
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
     data_plane: Optional[DataPlaneConfig] = None
-    nemo_gym: Optional[NemoGymConfig] = None
 
 
 # ===============================================================================
@@ -1270,6 +1259,14 @@ def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
     return should_log_nemo_gym_responses
 
 
+def _get_effort_config(master_config: MasterConfig) -> Optional[EffortLevelsConfig]:
+    """Return the effort-levels reward-shaping config from env.nemo_gym, if set."""
+    effort_dict = master_config.env.get("nemo_gym", {}).get("effort_levels")
+    if effort_dict is None:
+        return None
+    return EffortLevelsConfig.model_validate(effort_dict)
+
+
 def _create_advantage_estimator(master_config: MasterConfig):
     """Create and return an advantage estimator based on configuration.
 
@@ -1805,9 +1802,7 @@ def grpo_train(
                             generation_config=generation_config,
                             max_rollout_turns=None,
                             greedy=False,
-                            effort_config=master_config.nemo_gym.effort_levels
-                            if master_config.nemo_gym
-                            else None,
+                            effort_config=_get_effort_config(master_config),
                         )
                         input_ids = nemo_gym_rollout_result.input_ids
                         repeated_batch = nemo_gym_rollout_result.final_batch
@@ -2602,9 +2597,7 @@ def validate(
                     generation_config=generation_config,
                     max_rollout_turns=None,
                     greedy=False,
-                    effort_config=master_config.nemo_gym.effort_levels
-                    if master_config.nemo_gym
-                    else None,
+                    effort_config=_get_effort_config(master_config),
                 )
                 val_batch = nemo_gym_rollout_result.final_batch
                 gen_metrics = nemo_gym_rollout_result.rollout_metrics

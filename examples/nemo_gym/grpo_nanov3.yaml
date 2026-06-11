@@ -287,6 +287,13 @@ env:
           num_processes: 1024
           unit_test_timeout_secs: 10
           debug: false
+  # Length-based reward shaping for effort-level prompts (NeMo-RL-side knob,
+  # not forwarded to the NeMo-Gym server). Omit to disable shaping entirely.
+  # effort_levels:
+  #   low_weight: 0.0   # Weight on the length-reward bonus term (0 disables upside)
+  #   low_penalty: 1.0  # Coefficient for the length-reward penalty term
+  #   low_ub: 64000     # Response-length upper bound in tokens
+  #   low_string: ""    # Prompt substring that triggers shaping; "" applies to all
 
 logger:
   log_dir: "logs"  # Base directory for all logs
