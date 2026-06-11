@@ -133,12 +133,6 @@ class SDPOConfig(TypedDict):
     # 0 disables (no ref-policy forward pass; ref model is not initialized).
     reference_policy_kl_penalty: NotRequired[float]  # beta; default 0.0
     reference_policy_kl_type: NotRequired[str]  # "k1" | "k2" | "k3" (Schulman); default "k3"
-    # EMA-regularized self-teacher (paper Table 12 for LCBv6: alpha=0.01).
-    # When enabled, the teacher's top-k forward routes through a slow-moving
-    # EMA copy of the student weights instead of the live policy, breaking the
-    # student-teacher lockstep that otherwise destabilizes training.
-    use_ema_teacher: NotRequired[bool]
-    ema_alpha: NotRequired[float]
     # Per-step env-feedback sample logging (paper F.3 verification).
     # 0 = never log samples; 1 = every step; N = every N steps.
     log_sample_every_n_steps: NotRequired[int]
@@ -787,12 +781,6 @@ def setup(
     grpo_master_config["grpo"] = grpo_config_stub
     grpo_master_config["loss_fn"] = grpo_loss_fn_stub
 
-    # Propagate the EMA-teacher flag into the policy config so the policy
-    # workers allocate the EMA state dict at init time (paper Table 12).
-    if sdpo_config.get("use_ema_teacher", False):
-        grpo_master_config["policy"] = dict(grpo_master_config["policy"])
-        grpo_master_config["policy"]["init_ema_teacher"] = True
-
     (
         policy,
         policy_generation,
@@ -896,8 +884,6 @@ def sdpo_train(
     env_feedback_template = sdpo_cfg.get("env_feedback_template", _DEFAULT_ENV_FEEDBACK_TEMPLATE)
     combined_template = sdpo_cfg.get("combined_template", _DEFAULT_COMBINED_TEMPLATE)
     combined_success_template = sdpo_cfg.get("combined_success_template", _DEFAULT_COMBINED_SUCCESS_TEMPLATE)
-    use_ema_teacher = sdpo_cfg.get("use_ema_teacher", False)
-    ema_alpha = sdpo_cfg.get("ema_alpha", 0.01)
     make_div_by = policy_cfg.get("make_sequence_length_divisible_by", 1)
 
     # SDPO+GRPO hybrid (paper §4.5): build the GRPO advantage estimator used by
@@ -1100,7 +1086,6 @@ def sdpo_train(
                         teacher_data,
                         k=topk_logits_k,
                         timer=timer,
-                        use_ema=use_ema_teacher,
                     )
                     teacher_topk_logits_raw = teacher_topk["topk_logits"]
                     teacher_topk_indices_raw = teacher_topk["topk_indices"]
@@ -1201,11 +1186,6 @@ def sdpo_train(
                         loss_fn,
                         timer=timer,
                     )
-
-                # ── EMA teacher update (paper Table 12, alpha=0.01) ──────────
-                if use_ema_teacher:
-                    policy.update_ema_teacher_state(ema_alpha, timer=timer)
-                    metrics["sdpo/ema_alpha"] = float(ema_alpha)
 
                 # ── Metrics & logging ────────────────────────────────────────
                 metrics["train/loss"] = train_results.get("loss", float("nan"))

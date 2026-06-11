@@ -69,7 +69,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         weights_path: Optional[PathLike] = None,
         optimizer_path: Optional[PathLike] = None,
         init_reference_model: bool = True,
-        init_ema_teacher: bool = False,
         processor: Optional[AutoProcessor] = None,
         worker_extension_cls_fqn: Optional[str] = None,
     ):
@@ -216,7 +215,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             weights_path=weights_path,
             optimizer_path=optimizer_path,
             init_reference_model=init_reference_model,
-            init_ema_teacher=init_ema_teacher,
             worker_sharding_annotations=self.sharding_annotations,
             pre_init_communication_queue=pre_init_queue,
         )
@@ -517,13 +515,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         k: int,
         micro_batch_size: Optional[int] = None,
         timer: Optional[Timer] = None,
-        use_ema: bool = False,
     ) -> BatchedDataDict[TopkLogitsOutputSpec]:
-        """Dispatch get_topk_logits to workers (no CP/packed support initially).
-
-        When ``use_ema=True``, workers swap their EMA-teacher state dict into
-        the live model for the duration of the forward pass (paper Table 12).
-        """
+        """Dispatch get_topk_logits to workers (no CP/packed support initially)."""
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
         sharded_data: list[SlicedDataDict]
         unsorted_data_indices: list[int]
@@ -575,7 +568,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 common_kwargs={
                     "k": k,
                     "micro_batch_size": micro_batch_size,
-                    "use_ema": use_ema,
                 },
             )
 
@@ -592,24 +584,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             stacked.reorder_data(unsorted_data_indices)
 
         return stacked
-
-    def update_ema_teacher_state(
-        self,
-        alpha: float,
-        timer: Optional[Timer] = None,
-    ) -> None:
-        """Blend live student weights into each worker's EMA-teacher state dict.
-
-        Implements ``theta_T <- (1 - alpha) * theta_T + alpha * theta_S`` (paper
-        Table 12 uses alpha=0.01 for LCBv6). Requires the policy to have been
-        constructed with ``init_ema_teacher=True``.
-        """
-        with timer.time("update_ema_teacher_state") if timer else nullcontext():
-            futures = self.worker_group.run_all_workers_single_data(
-                "update_ema_teacher_state",
-                alpha=alpha,
-            )
-            ray.get(futures)
 
     def train(
         self,

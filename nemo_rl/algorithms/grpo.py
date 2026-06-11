@@ -570,7 +570,6 @@ def setup(
             weights_path=weights_path,
             optimizer_path=optimizer_path,
             init_optimizer=True,
-            init_ema_teacher=policy_config.get("init_ema_teacher", False),
         )
         return p, time.perf_counter() - t0
 

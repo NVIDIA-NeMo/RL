@@ -34,8 +34,6 @@ sdpo:
   topk_logits_k: 20                  # paper Table 12 (Section 4 / LCBv6): K=20
   remove_thinking_from_demo: true    # strip <think>...</think> from peer demos so {solution} slot stays content-only
   feedback_source: "combined"        # paper Table 2: peer-rollout demo + env feedback
-  use_ema_teacher: true              # paper Table 12: EMA-regularized self-teacher
-  ema_alpha: 0.01                    # paper Table 12 (Section 4 / LCBv6)
   log_sample_every_n_steps: 1        # dump one fail + one pass per step (stdout + W&B Table)
   log_sample_max_chars: 8000         # raise for inspection so it doesn't trail behind env's 12K max_feedback_chars
   # GRPO advantage estimator for the hybrid's policy-gradient term.
@@ -53,7 +51,7 @@ loss_fn:
     kl_type: "reverse"               # paper Table 12 (Section 4 / LCBv6): Reverse-KL
     mixed_kl_weight: 0.5             # unused when kl_type="reverse"
     zero_outside_topk: true
-    reference_policy_kl_penalty: 0.0 # SDPO trust-region anchor (paper uses EMA teacher instead)
+    reference_policy_kl_penalty: 0.0 # SDPO trust-region anchor disabled
     reference_policy_kl_type: "k3"
   grpo:
     reference_policy_kl_penalty: 0.01 # GRPO KL penalty to frozen-init reference. Non-zero anchors

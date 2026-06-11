@@ -208,7 +208,6 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         optimizer_path: Optional[str] = None,
         init_optimizer: bool = True,
         init_reference_model: bool = True,
-        init_ema_teacher: bool = False,
         **kwargs: Any,
     ):
         """Initialize the DTensorPolicyWorkerV2."""
@@ -307,13 +306,6 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         self.reference_model_state_dict = None
         if init_reference_model:
             self.reference_model_state_dict = setup_reference_model_state(self.model)
-
-        # Initialize EMA-teacher state (paper Table 12, alpha=0.01). Same CPU
-        # state-dict pattern as the reference model — swapped into self.model
-        # via use_ema_teacher() during the SDPO teacher forward pass.
-        self.ema_teacher_state_dict = None
-        if init_ema_teacher:
-            self.ema_teacher_state_dict = setup_reference_model_state(self.model)
 
         # Set instance attributes from runtime config (tuple unpacking)
         (
@@ -678,7 +670,6 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         data: BatchedDataDict[Any],
         k: int,
         micro_batch_size: Optional[int] = None,
-        use_ema: bool = False,
     ) -> BatchedDataDict[Any]:
         """Return per-position top-k logits and corresponding global indices.
 
@@ -689,13 +680,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         - If logits are TP-sharded DTensor, performs distributed global top-k across TP.
         - Supports context parallelism with proper CP gather.
         - Otherwise, computes local top-k on full-vocab tensor.
-        - When ``use_ema=True``, swaps the EMA-teacher state dict into self.model
-          for the duration of the forward pass (paper Table 12).
         """
-        if use_ema:
-            with self.use_ema_teacher():
-                return self.get_topk_logits(data, k, micro_batch_size, use_ema=False)
-
         topk_batch_size = (
             micro_batch_size
             if micro_batch_size is not None
@@ -839,48 +824,6 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             for k, v in self.model.state_dict().items():
                 val = to_local_if_dtensor(v)
                 val.copy_(curr_state_dict[k])
-
-    @contextmanager
-    def use_ema_teacher(self) -> Generator[None, None, None]:
-        """Context manager that temporarily swaps the EMA-teacher state dict into self.model.
-
-        Same swap-in/swap-out semantics as use_reference_model(): saves the live
-        weights to CPU, copies the EMA state dict into the live model, yields,
-        then restores. Used by SDPO during the teacher forward pass when
-        feedback_source uses an EMA-regularized self-teacher (paper Table 12).
-        """
-        if self.ema_teacher_state_dict is None:
-            raise RuntimeError(
-                "use_ema_teacher() called but ema_teacher_state_dict is None; "
-                "construct the worker with init_ema_teacher=True."
-            )
-        with torch.no_grad():
-            curr_state_dict = get_cpu_state_dict(
-                self.model.state_dict().items(), pin_memory=True
-            )
-            for k, v in self.model.state_dict().items():
-                val = to_local_if_dtensor(v)
-                val.copy_(self.ema_teacher_state_dict[k])
-
-            yield
-
-            for k, v in self.model.state_dict().items():
-                val = to_local_if_dtensor(v)
-                val.copy_(curr_state_dict[k])
-
-    @torch.no_grad()
-    def update_ema_teacher_state(self, alpha: float) -> None:
-        """Blend live student weights into the EMA-teacher state dict.
-
-        theta_T <- (1 - alpha) * theta_T + alpha * theta_S
-        """
-        if self.ema_teacher_state_dict is None:
-            return
-        live = get_cpu_state_dict(
-            self.model.state_dict().items(), pin_memory=True
-        )
-        for k, ema_t in self.ema_teacher_state_dict.items():
-            ema_t.mul_(1.0 - alpha).add_(live[k], alpha=alpha)
 
     def _add_noise_to_weights(self) -> None:
         """Add small Gaussian noise to the weights of the model. Note that this is used for testing purposes only."""
