@@ -2602,7 +2602,9 @@ def validate(
                     generation_config=generation_config,
                     max_rollout_turns=None,
                     greedy=False,
-                    effort_config=master_config.effort_levels,
+                    effort_config=master_config.nemo_gym.effort_levels
+                    if master_config.nemo_gym
+                    else None,
                 )
                 val_batch = nemo_gym_rollout_result.final_batch
                 gen_metrics = nemo_gym_rollout_result.rollout_metrics
