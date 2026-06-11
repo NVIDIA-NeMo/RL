@@ -369,14 +369,9 @@ def setup(
         )
     else:
         dataloader = init_train_dataloader(dataset)
-        train_sample_count = len(dataset)
-        num_batches = len(dataloader)
-        dropped = train_sample_count - num_batches * dataloader_batch_size
+        train_sample_count = len(dataloader)
         print(
-            f"  ✓ Training dataloader loaded with {train_sample_count} samples "
-            f"({num_batches} batches of {dataloader_batch_size}"
-            + (f"; {dropped} dropped by drop_last" if dropped > 0 else "")
-            + ")",
+            f"  ✓ Training dataloader loaded with {train_sample_count} samples",
             flush=True,
         )
 
