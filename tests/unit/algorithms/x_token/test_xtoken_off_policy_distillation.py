@@ -452,8 +452,10 @@ def test_validate_emits_pkl_metrics_only(mock_xtoken_components):
 
 def test_validate_emits_gold_metrics_only(mock_xtoken_components):
     c = mock_xtoken_components
+    # The gold path combines KD with next-token CE, so it emits ce_loss
+    # alongside kl_common/l1_uncommon. kl_loss stays P-KL-only.
     c.student_policy.train.return_value = _make_train_results_with(
-        {"kl_common": [0.2], "l1_uncommon": [0.1]}
+        {"kl_common": [0.2], "l1_uncommon": [0.1], "ce_loss": [0.4]}
     )
 
     metrics, _timings = validate(
@@ -467,8 +469,8 @@ def test_validate_emits_gold_metrics_only(mock_xtoken_components):
     assert "loss" in metrics
     assert "kl_common" in metrics
     assert "l1_uncommon" in metrics
+    assert "ce_loss" in metrics
     assert "kl_loss" not in metrics
-    assert "ce_loss" not in metrics
 
 
 # ---------------------------------------------------------------------------
