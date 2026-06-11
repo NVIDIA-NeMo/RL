@@ -1302,15 +1302,21 @@ class MegatronPolicyWorkerImpl(
         )
 
     @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
-    def offload_before_refit(self):
-        """Offload the optimizer and buffers to the CPU, keeping params on GPU for refit."""
+    def offload_before_refit(self, onload_params: bool = True):
+        """Offload the optimizer and buffers to the CPU, keeping params on GPU for refit.
+
+        When ``onload_params`` is True, params are moved onto the GPU first (they may
+        have been offloaded by finish_training) so the refit can stream them. offload_after_refit
+        passes False: it has already moved params to the CPU and must not re-onload them.
+        """
         no_grad = torch.no_grad()
         no_grad.__enter__()
 
         # Ensure model params are on GPU (they may have been offloaded by finish_training)
-        self.model = self.move_model(
-            self.model, "cuda", move_params=True, move_grads=False
-        )
+        if onload_params:
+            self.model = self.move_model(
+                self.model, "cuda", move_params=True, move_grads=False
+            )
 
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
         reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
@@ -1406,7 +1412,9 @@ class MegatronPolicyWorkerImpl(
         self.model = self.move_model(self.model, "cpu")
         self.model.eval()
         torch.randn(1).cuda()  # wake up torch allocator
-        self.offload_before_refit()  # rerun the old offload function
+        # Drop optimizer/grad buffers and caches, but keep params on the CPU
+        # (we just moved them there) — do not re-onload them.
+        self.offload_before_refit(onload_params=False)
 
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
         reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
