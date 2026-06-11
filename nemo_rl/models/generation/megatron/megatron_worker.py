@@ -116,14 +116,22 @@ class MegatronGenerationMixin:
         max_requests = mcore_generation_config.get("max_requests")
 
         mamba_inference_state_config = MambaInferenceStateConfig.from_model(self.model)
-        if mcore_generation_config.get("mamba_inference_ssm_states_dtype") is not None:
-            mamba_inference_state_config.ssm_states_dtype = resolve_torch_dtype(
-                mcore_generation_config["mamba_inference_ssm_states_dtype"]
-            )
-        if mcore_generation_config.get("mamba_inference_conv_states_dtype") is not None:
-            mamba_inference_state_config.conv_states_dtype = resolve_torch_dtype(
-                mcore_generation_config["mamba_inference_conv_states_dtype"]
-            )
+        is_hybrid_model = mamba_inference_state_config is not None
+        if is_hybrid_model:
+            if (
+                mcore_generation_config.get("mamba_inference_ssm_states_dtype")
+                is not None
+            ):
+                mamba_inference_state_config.ssm_states_dtype = resolve_torch_dtype(
+                    mcore_generation_config["mamba_inference_ssm_states_dtype"]
+                )
+            if (
+                mcore_generation_config.get("mamba_inference_conv_states_dtype")
+                is not None
+            ):
+                mamba_inference_state_config.conv_states_dtype = resolve_torch_dtype(
+                    mcore_generation_config["mamba_inference_conv_states_dtype"]
+                )
 
         # logging_step_interval is a power-user argument that should be NotRequired.
         logging_step_interval = mcore_generation_config.get("logging_step_interval")
@@ -152,7 +160,9 @@ class MegatronGenerationMixin:
             pg_collection=pg_collection,
             mamba_inference_state_config=mamba_inference_state_config,
             # Reserve more KV-cache space when speculative decoding is enabled.
-            mamba_memory_ratio=0.1 + 0.1 * num_speculative_tokens,
+            mamba_memory_ratio=(
+                0.1 + 0.1 * num_speculative_tokens if is_hybrid_model else None
+            ),
             logging_step_interval=logging_step_interval,
             num_speculative_tokens=num_speculative_tokens,
             max_requests=max_requests,

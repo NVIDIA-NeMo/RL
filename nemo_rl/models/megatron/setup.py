@@ -757,6 +757,16 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
                 config["megatron_cfg"]["inference_cuda_graph_scope"]
             ]
 
+    # Use the graph-safe TE RNG tracker for either training graphs or inference graphs.
+    if "generation" in config and config["generation"] is not None:
+        generation_cfg = config["generation"]
+        if (
+            generation_cfg["backend"] == "megatron"
+            and generation_cfg["colocated"]["enabled"]
+            and generation_cfg["mcore_generation_config"]["cuda_graph_impl"] != "none"
+        ):
+            model_cfg.use_te_rng_tracker = True
+
     # FP8 configuration
     fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
     if fp8_cfg is not None and fp8_cfg.get("enabled", False):
