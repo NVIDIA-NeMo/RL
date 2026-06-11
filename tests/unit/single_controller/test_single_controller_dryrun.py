@@ -47,7 +47,6 @@ os.makedirs(_RAY_TEMP, exist_ok=True)
 os.environ["RAY_TEMP_DIR"] = _RAY_TEMP
 os.environ["RAY_TMPDIR"] = _RAY_TEMP
 
-import nemo_rl.algorithms.async_utils.replay_buffer as _replay_buffer_module
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms.single_controller import (
     SingleControllerActor,
@@ -55,7 +54,6 @@ from nemo_rl.algorithms.single_controller import (
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import StalenessSampler
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 
 # ── Fake in-memory DataPlane ──────────────────────────────────────────────
@@ -205,14 +203,23 @@ class DryRunGenWorker:
         self._call_count += 1
         self._call_timestamps.append(time.monotonic())
         await asyncio.sleep(self._gen_latency_s)
+        prompt_msg = {
+            "role": "user",
+            "token_ids": torch.tensor([self._call_count] * 3, dtype=torch.long),
+        }
+        assistant_msg = {
+            "role": "assistant",
+            "token_ids": torch.tensor([self._call_count] * 3, dtype=torch.long),
+            "generation_logprobs": torch.zeros(3, dtype=torch.float32),
+        }
         return PromptGroupRecord(
             prompt_idx=self._call_count,
-            prompt=[],
+            prompt=[prompt_msg],
             extra_env_info=None,
             metadata={},
             completions=[
                 Completion(
-                    message_log=[],
+                    message_log=[prompt_msg, assistant_msg],
                     env_extras=None,
                     truncated=False,
                     reward=float(self._call_count),
@@ -226,32 +233,6 @@ class DryRunGenWorker:
 
     def get_call_timestamps(self) -> list[float]:
         return list(self._call_timestamps)
-
-
-def _dryrun_record_to_train_batch(
-    record: PromptGroupRecord, *, pad_value_dict: Any
-) -> BatchedDataDict[Any]:
-    """Stub for record_to_train_batch.
-
-    Production reads message_logs / token_ids etc.; the dry-run records have
-    none of that. Mirror the DryRunGenWorker train_batch shape, using
-    record.prompt_idx + completions[i].reward so advantage tests stay deterministic.
-    """
-    del pad_value_dict
-    n = len(record.completions)
-    rewards = [float(c.reward) for c in record.completions]
-    return BatchedDataDict[Any](
-        {
-            "input_ids": torch.ones((n, 3), dtype=torch.long),
-            "input_lengths": torch.full((n,), 3, dtype=torch.long),
-            "prompt_ids_for_adv": torch.tensor(
-                [[record.prompt_idx] for _ in rewards], dtype=torch.long
-            ),
-            "total_reward": torch.tensor(rewards, dtype=torch.float32),
-            "token_mask": torch.ones((n, 3), dtype=torch.float32),
-            "sample_mask": torch.ones(n, dtype=torch.float32),
-        }
-    )
 
 
 @ray.remote(num_cpus=0)
@@ -526,19 +507,6 @@ def _buffer_with_versions(versions: list[int]) -> _FakeBuffer:
 
 class TestSingleControllerDryRun:
     """Validate asyncio skeleton concurrency and backpressure."""
-
-    @pytest.fixture(autouse=True)
-    def _stub_record_converter(self, monkeypatch):
-        """Replace the buffer's record→train_batch with a dry-run-friendly stub.
-
-        Production reads message_logs / token_ids etc.; the dry-run records
-        carry none of that.
-        """
-        monkeypatch.setattr(
-            _replay_buffer_module,
-            "record_to_train_batch",
-            _dryrun_record_to_train_batch,
-        )
 
     def _make_controller(
         self,
