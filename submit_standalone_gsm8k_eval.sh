@@ -7,6 +7,7 @@ set -euo pipefail
 # Common usage:
 #   ALG=FastDiffuser BS=16 TEMP=0 TAG=my_eval ./submit_standalone_gsm8k_eval.sh
 #   ALG=LinearSpec   BS=16 TEMP=0.0 TAG=my_greedy_ls_b16 ./submit_standalone_gsm8k_eval.sh
+#   ALG=AR           BS=16 TEMP=0.0 TAG=my_ar_mode ./submit_standalone_gsm8k_eval.sh
 #   BENCHMARK=aime2024 ALG=FastDiffuser BS=16 TEMP=0 TAG=my_aime24 ./submit_standalone_gsm8k_eval.sh
 #   BENCHMARK=aime2025 ALG=FastDiffuser BS=16 TEMP=0 TAG=my_aime25 ./submit_standalone_gsm8k_eval.sh
 
@@ -17,7 +18,7 @@ GPUS_PER_NODE=${GPUS_PER_NODE:-1}
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 BENCHMARK=${BENCHMARK:-gsm8k}        # gsm8k, aime2024/aime24, or aime2025/aime25
-ALG=${ALG:-FastDiffuser}        # FastDiffuser or LinearSpec
+ALG=${ALG:-FastDiffuser}        # FastDiffuser, LinearSpec, or AR
 BS=${BS:-16}                    # diffusion block size
 TEMP=${TEMP:-0}                 # paper-style AIME greedy decoding uses temperature 0
 MAX_STEPS=${MAX_STEPS:-8192}
@@ -88,8 +89,8 @@ done
 
 MAX_RUNNING_REQUESTS=${MAX_RUNNING_REQUESTS:-$CONCURRENT}
 
-if [[ "$ALG" != "FastDiffuser" && "$ALG" != "LinearSpec" ]]; then
-  echo "ALG must be FastDiffuser or LinearSpec, got: $ALG" >&2
+if [[ "$ALG" != "FastDiffuser" && "$ALG" != "LinearSpec" && "$ALG" != "AR" ]]; then
+  echo "ALG must be FastDiffuser, LinearSpec, or AR, got: $ALG" >&2
   exit 2
 fi
 if [[ "$GENERATION_API" != "generate" && "$GENERATION_API" != "chat_completions" ]]; then

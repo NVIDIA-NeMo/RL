@@ -101,7 +101,7 @@ def parse_args() -> argparse.Namespace:
         help="SGLang request API to use.",
     )
 
-    parser.add_argument("--dllm-algorithm", default="FastDiffuser", choices=("FastDiffuser", "LinearSpec"))
+    parser.add_argument("--dllm-algorithm", default="FastDiffuser", choices=("FastDiffuser", "LinearSpec", "AR"))
     parser.add_argument("--block-size", type=int, default=32)
     parser.add_argument("--max-steps", type=int, default=32)
     parser.add_argument("--threshold", type=float, default=0.9)
@@ -209,8 +209,11 @@ def score_response(verify_func: Any, response: str, gold: str) -> tuple[float, A
         return 0.0, {"error": f"{type(e).__name__}: {e!r}"}
 
 
-def write_dllm_config(args: argparse.Namespace) -> Path:
+def write_dllm_config(args: argparse.Namespace) -> Path | None:
     args.outdir.mkdir(parents=True, exist_ok=True)
+    if args.dllm_algorithm == "AR":
+        return None
+
     config_path = args.outdir / "dllm_config.yaml"
     config = {
         "algorithm": args.dllm_algorithm,
@@ -242,7 +245,7 @@ def check_sglang_commit(repo: Path, expected: str) -> None:
         )
 
 
-def server_command(args: argparse.Namespace, dllm_config: Path) -> list[str]:
+def server_command(args: argparse.Namespace, dllm_config: Path | None) -> list[str]:
     py = args.venv / "bin" / "python"
     cmd = [
         str(py),
@@ -276,20 +279,25 @@ def server_command(args: argparse.Namespace, dllm_config: Path) -> list[str]:
         "--attention-backend",
         args.attention_backend,
         "--json-model-override-args",
-        "{}",
+        '{"ar_mode": true}' if args.dllm_algorithm == "AR" else "{}",
         "--disable-cuda-graph",
         "--disable-piecewise-cuda-graph",
-        "--dllm-algorithm",
-        args.dllm_algorithm,
-        "--dllm-algorithm-config",
-        str(dllm_config),
     ]
+    if args.dllm_algorithm != "AR":
+        if dllm_config is None:
+            raise ValueError("dllm_config is required unless --dllm-algorithm AR")
+        cmd.extend([
+            "--dllm-algorithm",
+            args.dllm_algorithm,
+            "--dllm-algorithm-config",
+            str(dllm_config),
+        ])
     if args.server_random_seed is not None:
         cmd.extend(["--random-seed", str(args.server_random_seed)])
     return cmd
 
 
-def launch_server(args: argparse.Namespace, dllm_config: Path) -> subprocess.Popen:
+def launch_server(args: argparse.Namespace, dllm_config: Path | None) -> subprocess.Popen:
     check_sglang_commit(args.sglang_repo, args.sglang_commit)
     log_path = args.outdir / "server.log"
     env = os.environ.copy()
@@ -456,7 +464,10 @@ def main() -> None:
         check_client_dependencies()
 
     dllm_config = write_dllm_config(args)
-    print(f"DLLM config: {dllm_config}")
+    if dllm_config is None:
+        print("SGLang AR mode: json_model_override_args={\"ar_mode\": true}")
+    else:
+        print(f"DLLM config: {dllm_config}")
 
     server_proc = None
     try:
