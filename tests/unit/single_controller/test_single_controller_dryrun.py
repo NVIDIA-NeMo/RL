@@ -48,11 +48,11 @@ os.environ["RAY_TEMP_DIR"] = _RAY_TEMP
 os.environ["RAY_TMPDIR"] = _RAY_TEMP
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
+from nemo_rl.algorithms.async_utils.staleness_sampler import StalenessSampler
 from nemo_rl.algorithms.single_controller import (
     SingleControllerActor,
     SingleControllerConfig,
 )
-from nemo_rl.algorithms.async_utils.staleness_sampler import StalenessSampler
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 
@@ -757,9 +757,7 @@ class TestSingleControllerDryRun:
         buf = _buffer_with_versions([1])
         sampler = StalenessSampler(buf, max_staleness_versions=1)
 
-        assert (
-            sampler.select(current_train_weight=5, min_prompt_groups=2) is None
-        )
+        assert sampler.select(current_train_weight=5, min_prompt_groups=2) is None
 
     def test_staleness_sampler_concats_multiple_groups(self):
         """Selected meta concatenates whole-group sample_ids end-to-end."""
@@ -778,9 +776,7 @@ class TestSingleControllerDryRun:
         sampler = StalenessSampler(buf, max_staleness_versions=0)
 
         # Eligible at weight==5 are indices 1 and 2 only.
-        assert (
-            sampler.select(current_train_weight=5, min_prompt_groups=3) is None
-        )
+        assert sampler.select(current_train_weight=5, min_prompt_groups=3) is None
         selected = sampler.select(current_train_weight=5, min_prompt_groups=2)
         assert selected is not None
         assert selected.sample_ids == ["g1_s0", "g2_s0"]

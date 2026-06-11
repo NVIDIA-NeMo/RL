@@ -58,9 +58,7 @@ def record_to_train_batch(
     prompt_token_count = sum(len(m["token_ids"]) for m in record.prompt)
     prompt_lengths = torch.full((n,), prompt_token_count, dtype=torch.long)
 
-    prompt_message_logs = extract_initial_prompt_messages(
-        message_logs, prompt_lengths
-    )
+    prompt_message_logs = extract_initial_prompt_messages(message_logs, prompt_lengths)
     prompt_flat, _ = batched_message_log_to_flat_message(
         prompt_message_logs,
         pad_value_dict=dict(pad_value_dict),  # type: ignore
