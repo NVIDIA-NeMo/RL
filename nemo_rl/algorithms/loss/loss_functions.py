@@ -179,31 +179,43 @@ class ClippedPGLossFn(LossFunction):
         self.kl_input_clamp_value = cfg["kl_input_clamp_value"]
         self.kl_output_clamp_value = cfg["kl_output_clamp_value"]
         self.disable_ppo_ratio = cfg.get("disable_ppo_ratio", False)
-        self.force_on_policy_ratio = cfg.get("force_on_policy_ratio", False)  # Force ratio to 1.0
+        self.force_on_policy_ratio = cfg.get(
+            "force_on_policy_ratio", False
+        )  # Force ratio to 1.0
         self.use_on_policy_kl_approximation = cfg["use_on_policy_kl_approximation"]
-        self.use_importance_sampling_correction = cfg["use_importance_sampling_correction"]
-        self.truncated_importance_sampling_ratio = cfg["truncated_importance_sampling_ratio"]
+        self.use_importance_sampling_correction = cfg[
+            "use_importance_sampling_correction"
+        ]
+        self.truncated_importance_sampling_ratio = cfg[
+            "truncated_importance_sampling_ratio"
+        ]
         # Type of truncated importance sampling: "tis" | "icepop" | "seq-mask-tis"
-        self.truncated_importance_sampling_type = cfg.get("truncated_importance_sampling_type")
+        self.truncated_importance_sampling_type = cfg.get(
+            "truncated_importance_sampling_type"
+        )
         # Lower bound for ICE-POP / seq-mask-tis filtering
-        self.truncated_importance_sampling_ratio_min = cfg.get("truncated_importance_sampling_ratio_min")
+        self.truncated_importance_sampling_ratio_min = cfg.get(
+            "truncated_importance_sampling_ratio_min"
+        )
         # Whether to compute importance weights per-sequence instead of per-token.
         self.sequence_level_importance_ratios = cfg.get(
             "sequence_level_importance_ratios",
             False,
         )
-        self.loss_type = LossType.TOKEN_LEVEL if cfg["token_level_loss"] else LossType.SEQUENCE_LEVEL
+        self.loss_type = (
+            LossType.TOKEN_LEVEL if cfg["token_level_loss"] else LossType.SEQUENCE_LEVEL
+        )
         if self.sequence_level_importance_ratios:
-            assert (
-                self.loss_type == LossType.SEQUENCE_LEVEL
-            ), "sequence-level importance sampling (e.g. GSPO) is mutually exclusive with token-level loss"
+            assert self.loss_type == LossType.SEQUENCE_LEVEL, (
+                "sequence-level importance sampling (e.g. GSPO) is mutually exclusive with token-level loss"
+            )
         if self.truncated_importance_sampling_ratio is not None:
-            assert (
-                self.use_importance_sampling_correction
-            ), "truncated_importance_sampling_ratio is only supported when use_importance_sampling_correction is True"
-            assert (
-                self.truncated_importance_sampling_ratio > 0
-            ), "truncated_importance_sampling_ratio should be positive"
+            assert self.use_importance_sampling_correction, (
+                "truncated_importance_sampling_ratio is only supported when use_importance_sampling_correction is True"
+            )
+            assert self.truncated_importance_sampling_ratio > 0, (
+                "truncated_importance_sampling_ratio should be positive"
+            )
             assert self.truncated_importance_sampling_type in (
                 "tis",
                 "icepop",
@@ -248,7 +260,9 @@ class ClippedPGLossFn(LossFunction):
         generation_logprobs = data["generation_logprobs"][:, 1:]
         if self.reference_policy_kl_penalty != 0:
             reference_policy_logprobs = data["reference_policy_logprobs"][:, 1:]
-            curr_logprobs_unfiltered = data.get("curr_logprobs_unfiltered", curr_logprobs)
+            curr_logprobs_unfiltered = data.get(
+                "curr_logprobs_unfiltered", curr_logprobs
+            )
 
         mask = token_mask * sample_mask.unsqueeze(-1)
 
@@ -295,12 +309,20 @@ class ClippedPGLossFn(LossFunction):
         # Jensen-Shannon divergence
         # M = 0.5 * (P_train + P_gen)
         # JSD = 0.5 * KL(P_train || M) + 0.5 * KL(P_gen || M)
-        log_mixture = torch.log(0.5 * torch.exp(prev_logprobs) + 0.5 * torch.exp(generation_logprobs))
+        log_mixture = torch.log(
+            0.5 * torch.exp(prev_logprobs) + 0.5 * torch.exp(generation_logprobs)
+        )
         # KL(P_train || M)
-        kl_prev_to_mixture = torch.exp(prev_logprobs - log_mixture) - (prev_logprobs - log_mixture) - 1
+        kl_prev_to_mixture = (
+            torch.exp(prev_logprobs - log_mixture) - (prev_logprobs - log_mixture) - 1
+        )
 
         # KL(P_gen || M)
-        kl_gen_to_mixture = torch.exp(generation_logprobs - log_mixture) - (generation_logprobs - log_mixture) - 1
+        kl_gen_to_mixture = (
+            torch.exp(generation_logprobs - log_mixture)
+            - (generation_logprobs - log_mixture)
+            - 1
+        )
 
         js_divergence_error = masked_mean(
             0.5 * kl_prev_to_mixture + 0.5 * kl_gen_to_mixture,
@@ -320,8 +342,12 @@ class ClippedPGLossFn(LossFunction):
             # On-policy KL approximation
             if self.use_on_policy_kl_approximation:
                 # See: docs/guides/grpo.md#on-policy-kl-approximation
-                kl_importance_weights = torch.exp(curr_logprobs_unfiltered - generation_logprobs).detach()
-                kl_importance_weights = torch.nan_to_num(kl_importance_weights, nan=0.0, posinf=0.0, neginf=0.0)
+                kl_importance_weights = torch.exp(
+                    curr_logprobs_unfiltered - generation_logprobs
+                ).detach()
+                kl_importance_weights = torch.nan_to_num(
+                    kl_importance_weights, nan=0.0, posinf=0.0, neginf=0.0
+                )
             else:
                 kl_importance_weights = torch.ones_like(curr_logprobs_unfiltered)
 
@@ -340,7 +366,9 @@ class ClippedPGLossFn(LossFunction):
 
             # Reduce KL loss
             if self.loss_type == LossType.TOKEN_LEVEL:
-                kl = masked_mean(kl, mask, global_normalization_factor=global_valid_toks)
+                kl = masked_mean(
+                    kl, mask, global_normalization_factor=global_valid_toks
+                )
             else:
                 kl = masked_mean(
                     masked_mean(kl, token_mask, dim=-1),
@@ -369,7 +397,9 @@ class ClippedPGLossFn(LossFunction):
                 ratios = seq_ratio.repeat(1, advantages.shape[1])
             else:
                 ratios = log_ratios.exp()
-            ratios_clamped = ratios.clamp(1.0 - self.ratio_clip_min, 1.0 + self.ratio_clip_max)
+            ratios_clamped = ratios.clamp(
+                1.0 - self.ratio_clip_min, 1.0 + self.ratio_clip_max
+            )
         else:
             ratios = curr_logprobs
             ratios_clamped = curr_logprobs
@@ -382,11 +412,13 @@ class ClippedPGLossFn(LossFunction):
 
         # Dual-clipping see https://arxiv.org/pdf/1912.09729
         if self.ratio_clip_c is not None:
-            assert (
-                self.ratio_clip_c > 1
-            ), f"ratio_clip_c must exceed 1 representing a lower bound of the ratios, got {self.ratio_clip_c}."
+            assert self.ratio_clip_c > 1, (
+                f"ratio_clip_c must exceed 1 representing a lower bound of the ratios, got {self.ratio_clip_c}."
+            )
             loss3 = -advantages * self.ratio_clip_c
-            clip_loss = torch.where(advantages < 0, torch.min(clip_loss, loss3), clip_loss)
+            clip_loss = torch.where(
+                advantages < 0, torch.min(clip_loss, loss3), clip_loss
+            )
 
         # -------------------------------------------------------------
         # Off-policy (actor) importance-sampling correction
@@ -397,12 +429,16 @@ class ClippedPGLossFn(LossFunction):
             # importance weight w_i = exp(Σ_t (log π_actor − log π_behaviour))
             seq_lp_diff = ((prev_logprobs - generation_logprobs) * mask).sum(dim=-1)
             actor_importance_weights = torch.exp(seq_lp_diff).detach()
-            actor_importance_weights = torch.nan_to_num(actor_importance_weights, nan=0.0, posinf=0.0, neginf=0.0)
+            actor_importance_weights = torch.nan_to_num(
+                actor_importance_weights, nan=0.0, posinf=0.0, neginf=0.0
+            )
             # Broadcast to token dimension so we can reuse existing reduction
             actor_importance_weights_expanded = actor_importance_weights.unsqueeze(-1)
         else:
             # Token-level correction
-            actor_importance_weights_expanded = torch.exp(prev_logprobs - generation_logprobs)
+            actor_importance_weights_expanded = torch.exp(
+                prev_logprobs - generation_logprobs
+            )
             actor_importance_weights_expanded = torch.nan_to_num(
                 actor_importance_weights_expanded, nan=0.0, posinf=0.0, neginf=0.0
             )
@@ -415,7 +451,10 @@ class ClippedPGLossFn(LossFunction):
         #   Blog: https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Training-Inference-Mismatch-271211a558b7808d8b12d403fd15edda
         if self.truncated_importance_sampling_ratio is not None:
             if self.truncated_importance_sampling_type == "tis":
-                token_in_bounds = actor_importance_weights_expanded <= self.truncated_importance_sampling_ratio
+                token_in_bounds = (
+                    actor_importance_weights_expanded
+                    <= self.truncated_importance_sampling_ratio
+                )
                 _is_filter_metrics = {
                     "is_oob_ratio": 1.0
                     - masked_mean(
