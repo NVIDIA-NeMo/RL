@@ -11,16 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import logging
 import os
 from unittest.mock import MagicMock, patch
 
 from nemo_rl.utils.nvml import (
     _resolve_device_id,
-    device_id_to_physical_device_id,
-    get_device_uuid,
     log_gpu_memory_diagnostics,
-    nvml_context,
 )
 
 
@@ -67,11 +63,17 @@ def test_log_gpu_memory_diagnostics_emits_prefix(mock_pynvml, capfd):
     mock_pynvml.nvmlDeviceGetHandleByIndex.return_value = MagicMock()
     mock_pynvml.nvmlDeviceGetUUID.return_value = b"GPU-FAKE-UUID"
     mem_info = MagicMock()
-    mem_info.total, mem_info.used, mem_info.free = 24 * 1024**3, 4 * 1024**3, 20 * 1024**3
+    mem_info.total, mem_info.used, mem_info.free = (
+        24 * 1024**3,
+        4 * 1024**3,
+        20 * 1024**3,
+    )
     mock_pynvml.nvmlDeviceGetMemoryInfo.return_value = mem_info
     mock_pynvml.nvmlDeviceGetComputeRunningProcesses.return_value = []
 
-    log_gpu_memory_diagnostics(label="test-label", worker_type="TestWorker", device_id=0)
+    log_gpu_memory_diagnostics(
+        label="test-label", worker_type="TestWorker", device_id=0
+    )
 
     out = capfd.readouterr().out
     assert "[GPU_DIAG]" in out and "TestWorker" in out and "test-label" in out
