@@ -689,20 +689,13 @@ class VllmInternalWorkerExtension:
 
         torch.cuda.synchronize()
 
-        # process_weights_after_loading is intentionally disabled for the
-        # FP8-weight refit path: bulk FP8 weights arrive kernel-ready via
-        # xferdtensor and misc params go through vLLM's own load_weights, so no
-        # extra post-load finalization is needed (verified on 30B FP8 MoE:
-        # byte-identical generation/rewards with and without this call).  It is
-        # kept (commented) rather than deleted because enabling FP8 *KV cache*
-        # will need it to finalize the per-layer k/v scales after refit;
-        # uncomment it (guarded on kv_cache_dtype) as part of that work.
-        # from vllm.model_executor.model_loader.utils import (
-        #     process_weights_after_loading,
-        # )
-        # process_weights_after_loading(
-        #     self.model_runner.model, self.model_config, self.device
-        # )
+        # Finalize FP8 KV-cache per-layer k/v scales after the misc broadcast
+        # delivers them as scale tensors.  No-op unless kv_cache_dtype=fp8 (the
+        # guard lives in _maybe_process_fp8_kv_cache).  Bulk FP8 *weights* arrive
+        # kernel-ready via xferdtensor and misc params go through vLLM's own
+        # load_weights, so for the non-KV-cache path this stays a no-op (verified
+        # on 30B FP8 MoE: byte-identical generation/rewards either way).
+        self._maybe_process_fp8_kv_cache()
         return True
 
     def _receive_and_load_misc_params(self) -> None:

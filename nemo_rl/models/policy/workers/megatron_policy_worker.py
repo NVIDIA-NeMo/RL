@@ -1561,15 +1561,13 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         Uses TP-local shards directly from Megatron parameters, bypassing
         the Bridge's PP broadcast + TP gather.  The modified xferdtensor
         reconstructs the full tensor from per-rank shards internally.
+
+        ``kv_scales`` (FP8 KV cache): the per-layer k/v(/q) scales ride the misc
+        packed-broadcast as plain scale tensors (is_misc_param routes
+        ``.k_scale``/``.v_scale``/``.q_scale`` to misc); the gen side finalizes
+        them via ``_maybe_process_fp8_kv_cache``.  No out-of-band channel needed.
         """
-        from nemo_rl.distributed.xferdtensor import xferdtensor
-
-        if kv_scales is not None:
-            raise NotImplementedError(
-                "FP8 kvcache is not currently supported for nccl_xfer refit path."
-            )
-
-        from nemo_rl.distributed.xferdtensor import DTensorRef
+        from nemo_rl.distributed.xferdtensor import DTensorRef, xferdtensor
 
         # _param_map and _expert_groups are built once in
         # prepare_nccl_xfer_refit_info; weight values change but the
@@ -1607,20 +1605,24 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                 # iteration's grouping allocates.
                 del local, src_tensor
 
-        self._broadcast_misc_params_packed()
+        self._broadcast_misc_params_packed(kv_scales=kv_scales)
 
-    def _broadcast_misc_params_packed(self) -> None:
+    def _broadcast_misc_params_packed(self, kv_scales=None) -> None:
         """Broadcast misc params via the existing packed_broadcast machinery.
 
         Uses the misc-only conversion task list pre-computed at prepare time,
         so Bridge skips TP/EP all-gather for bulk weights — only the
-        relatively small misc subset is gathered + broadcast.
+        relatively small misc subset is gathered + broadcast.  FP8 KV-cache
+        ``kv_scales`` (if provided) are appended as scale tensors here so they
+        broadcast alongside the misc params (their names are already in
+        misc_meta via is_misc_param's ``.k_scale``/``.v_scale`` routing).
         """
         misc_meta = self.nccl_xfer_refit_info.get("misc_meta", {})
         if not misc_meta:
             return
 
         misc_iter = self._iter_params_with_optional_kv_scales(
+            kv_scales=kv_scales,
             conversion_tasks=self._misc_conversion_tasks,
         )
 
