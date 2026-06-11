@@ -319,7 +319,12 @@ class SingleControllerActor:
             try:
                 await self._rollout_manager.generate_and_push(prompt)
                 if self._cfg.diagnostics:
-                    log.info("  rollout done for prompt='%s...'", prompt[:20])
+                    content = ""
+                    for i in range(len(prompt["message_log"])):
+                        if prompt["message_log"][i]["role"] == "user":
+                            content = prompt["message_log"][i]["content"]
+                            break
+                    log.info("  rollout done for prompt='%s...'", content[:20])
             finally:
                 self._inflight_rollouts -= 1
                 sem.release()

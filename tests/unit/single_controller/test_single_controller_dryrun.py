@@ -950,7 +950,6 @@ class TestStreamingTrainPump:
         prompts: list[str],
         weight_sync=None,
         max_train_steps=1,
-        max_rollout_prompts=4,
         min_prompt_groups_per_batch=1,
         target_prompt_groups_per_step=4,
         generations_per_prompt=1,
@@ -961,7 +960,6 @@ class TestStreamingTrainPump:
     ):
         cfg = SingleControllerConfig(
             max_train_steps=max_train_steps,
-            max_rollout_prompts=max_rollout_prompts,
             min_prompt_groups_per_batch=min_prompt_groups_per_batch,
             target_prompt_groups_per_step=target_prompt_groups_per_step,
             generations_per_prompt=generations_per_prompt,
@@ -970,16 +968,25 @@ class TestStreamingTrainPump:
             max_weight_staleness_versions=max_weight_staleness_versions,
             batch_selection_strategy=batch_selection_strategy,
         )
+
+        # SC expects a StatefulDataLoader, but the pump only iterates it
+        # (`for prompt in self._dataloader`), so a list satisfies the contract.
+        dataloader = prompts
+
         if weight_sync is None:
             weight_sync = DryRunWeightSynchronizer(gen_handle=gen)
+        rollout_manager = DryRunRolloutManager(gen, dp_client)
+
         return SingleControllerActor.remote(
-            cfg,
-            prompts if prompts else ["unused"],
-            dp_client,
-            gen,
-            trainer,
-            weight_sync,
-            None,
+            cfg=cfg,
+            dp_client=dp_client,
+            gen_handle=gen,
+            env_handles={},
+            trainer_handle=trainer,
+            dataloader=dataloader,
+            weight_synchronizer=weight_sync,
+            rollout_manager=rollout_manager,
+            advantage_estimator=None,
         )
 
     def test_streaming_dispatches_in_arrival_order(self, ray_init):
@@ -996,7 +1003,6 @@ class TestStreamingTrainPump:
             trainer,
             prompts=prompts,
             max_train_steps=1,
-            max_rollout_prompts=3,
             target_prompt_groups_per_step=3,
             min_prompt_groups_per_batch=1,
         )
@@ -1022,7 +1028,6 @@ class TestStreamingTrainPump:
             trainer,
             prompts=prompts,
             max_train_steps=1,
-            max_rollout_prompts=4,
             target_prompt_groups_per_step=4,
             min_prompt_groups_per_batch=1,
         )
@@ -1069,7 +1074,6 @@ class TestStreamingTrainPump:
             trainer,
             prompts=prompts,
             max_train_steps=1,
-            max_rollout_prompts=2,
             target_prompt_groups_per_step=2,
             min_prompt_groups_per_batch=1,
             batch_selection_strategy="strict_on_policy",
@@ -1098,7 +1102,6 @@ class TestStreamingTrainPump:
             trainer,
             prompts=prompts,
             max_train_steps=1,
-            max_rollout_prompts=5,
             target_prompt_groups_per_step=5,
             min_prompt_groups_per_batch=1,
         )
@@ -1149,7 +1152,6 @@ class TestStreamingTrainPump:
             trainer,
             prompts=["0:0.01"],
             max_train_steps=1,
-            max_rollout_prompts=0,
             target_prompt_groups_per_step=2,
             min_prompt_groups_per_batch=1,
         )
@@ -1170,7 +1172,6 @@ class TestStreamingTrainPump:
             trainer,
             prompts=prompts,
             max_train_steps=1,
-            max_rollout_prompts=3,
             target_prompt_groups_per_step=3,
             min_prompt_groups_per_batch=1,
         )
