@@ -343,9 +343,9 @@ def forward_with_post_processing_fn(
     # use_cache=True so that DynamicCache is created and shared layers can
     # retrieve K/V from anchor layers. Without it, shared layers fall back to
     # untrained K/V projections and produce garbage.
-    # Note: use_cache=True is incompatible with gradient/activation checkpointing
-    # (DynamicCache is stateful and recomputation doubles the cache). Callers
-    # must disable activation_checkpointing when training KV-sharing models.
+    # This is compatible with activation checkpointing: Automodel's parallelizer
+    # keeps use_cache=True for KV-sharing models under activation checkpointing
+    # (NVIDIA-NeMo/Automodel#1705).
     use_cache = _needs_kv_cache_for_shared_layers(model)
 
     # Model forward pass

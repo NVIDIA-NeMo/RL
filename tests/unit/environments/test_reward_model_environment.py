@@ -213,3 +213,5 @@ class TestRewardModelEnvironment:
         # Verify expected reward values (with tolerance for floating point precision)
         expected_rewards = torch.tensor([-5.4062, 2.6719])
         assert torch.allclose(output.rewards, expected_rewards, atol=1e-1)
+        # Version-robust invariant: correct answer must out-score the incorrect one.
+        assert output.rewards[1] > output.rewards[0]
