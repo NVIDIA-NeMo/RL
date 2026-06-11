@@ -565,10 +565,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     "tensor_parallel",
                     "pipeline_parallel",
                 ],
-                common_kwargs={
-                    "k": k,
-                    "micro_batch_size": micro_batch_size,
-                },
+                common_kwargs={"k": k, "micro_batch_size": micro_batch_size},
             )
 
         # Avoid BatchedDataDict.from_batches here because it flattens rows for tensors with ndim>2 ([B,S,k] -> [B,S*k]).
