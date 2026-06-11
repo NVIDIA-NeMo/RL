@@ -29,10 +29,8 @@ class LossInputType(enum.Enum):
     LOGIT = "logit"
     LOGPROB = "logprob"
     DISTILLATION = "distillation"
-    # Both the distillation top-k outputs and the next-token logprobs from a
-    # single forward, for losses that blend a distillation term with a policy
-    # gradient term (e.g. the SDPO+GRPO hybrid, paper §4.5).
     DISTILLATION_AND_LOGPROB = "distillation_and_logprob"
+    DISTILLATION_CROSS_TOKENIZER = "distillation_cross_tokenizer"
     DRAFT = "draft"
 
 
@@ -72,6 +70,7 @@ class LossFunction(Protocol):
                 - For LossInputType.LOGIT: logits (torch.Tensor)
                 - For LossInputType.DISTILLATION: student_topk_logprobs, teacher_topk_logprobs, H_all (torch.Tensor)
                 - For LossInputType.DISTILLATION_AND_LOGPROB: student_topk_logprobs, teacher_topk_logprobs, H_all, next_token_logprobs (torch.Tensor)
+                - For LossInputType.DISTILLATION_CROSS_TOKENIZER: logits, teacher_full_logits (torch.Tensor)
                 - For LossInputType.DRAFT: teacher_logits, student_logits, mask (torch.Tensor)
 
         Returns:

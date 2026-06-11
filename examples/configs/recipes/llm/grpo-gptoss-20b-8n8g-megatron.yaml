@@ -13,7 +13,6 @@ policy:
     expert_model_parallel_size: 8
     tensor_model_parallel_size: 4
     sequence_parallel: true
-    moe_permute_fusion: true
   make_sequence_length_divisible_by: 4
   dtensor_cfg:
     enabled: false
@@ -22,6 +21,8 @@ policy:
   generation:
     vllm_cfg:
       tensor_parallel_size: 2
+    vllm_kwargs:
+      moe_backend: triton
 cluster:
   num_nodes: 8
   gpus_per_node: 8

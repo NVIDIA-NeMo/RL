@@ -17,6 +17,7 @@ from typing import NotRequired, Optional, TypedDict, cast
 
 import numpy as np
 import torch
+from pydantic import BaseModel
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
@@ -29,8 +30,12 @@ from nemo_rl.data.llm_message_utils import (
     add_loss_mask_to_message_log,
     batched_message_log_to_flat_message,
 )
+from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
+from nemo_rl.distributed.virtual_cluster import (
+    ClusterConfig,
+    RayVirtualCluster,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import PolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
@@ -71,9 +76,10 @@ class SFTConfig(TypedDict):
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
     val_at_end: bool
     seed: int
+    only_unmask_final: bool
 
 
-class MasterConfig(TypedDict):
+class MasterConfig(BaseModel, extra="allow"):
     policy: PolicyConfig
     data: DataConfig
     sft: SFTConfig
@@ -106,25 +112,30 @@ def setup(
     Returns:
         Tuple of policy, cluster, dataloader, tokenizer, loss_fn, math_env, master_config, logger
     """
-    set_seed(master_config["sft"]["seed"])
+    set_seed(master_config.sft["seed"])
 
     # Extract individual configs for easier access
-    policy_config = master_config["policy"]
-    data_config = master_config["data"]
-    logger_config = master_config["logger"]
-    cluster_config = master_config["cluster"]
-    sft_config = master_config["sft"]
+    policy_config = master_config.policy
+    data_config = master_config.data
+    sft_config = master_config.sft
+    logger_config = master_config.logger
+    cluster_config = master_config.cluster
+    checkpointing_config = master_config.checkpointing
+
+    checkpointing_pretrained = checkpointing_config.get("pretrained_checkpoint")
+    if checkpointing_pretrained is not None:
+        policy_config["pretrained_checkpoint"] = checkpointing_pretrained
 
     # ==========================
     #         Logger
     # ==========================
     logger = Logger(logger_config)
-    logger.log_hyperparams(master_config)
+    logger.log_hyperparams(master_config.model_dump())
 
     # ==========================
     #      Checkpointing
     # ==========================
-    checkpointer = CheckpointManager(master_config["checkpointing"])
+    checkpointer = CheckpointManager(checkpointing_config)
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
     sft_save_state: Optional[SFTSaveState] = cast(
         Optional[SFTSaveState], checkpointer.load_training_info(last_checkpoint_path)
@@ -143,10 +154,7 @@ def setup(
     )
 
     if last_checkpoint_path is not None:
-        dataloader_state_dict = torch.load(
-            os.path.join(last_checkpoint_path, "train_dataloader.pt")
-        )
-        train_dataloader.load_state_dict(dataloader_state_dict)
+        load_dataloader_state(train_dataloader, last_checkpoint_path, data_config)
 
     if val_dataset is not None:
         val_dataloader = StatefulDataLoader(
@@ -171,6 +179,8 @@ def setup(
         use_gpus=True,
         num_gpus_per_node=cluster_config["gpus_per_node"],
         max_colocated_worker_groups=1,
+        port_range_low=cluster_config.get("master_port_range_low"),
+        port_range_high=cluster_config.get("master_port_range_high"),
     )
     print(f"  ✓ Ray cluster initialized with {cluster_config['num_nodes']} nodes")
 
@@ -244,7 +254,7 @@ def validate(
 ):
     """Run validation on the validation dataset."""
     if val_dataloader is None:
-        assert master_config["sft"]["val_period"] <= 0, (
+        assert master_config.sft["val_period"] <= 0, (
             "val_dataloader is None, so sft.val_period must be <= 0"
         )
         print("  ⚠️ No validation dataloader provided, skipping validation")
@@ -267,12 +277,13 @@ def validate(
             add_loss_mask_to_message_log(
                 val_batch["message_log"],
                 roles_to_train_on=["assistant"],
+                only_unmask_final=master_config.sft["only_unmask_final"],
             )
 
             cat_and_padded, input_lengths = batched_message_log_to_flat_message(
                 val_batch["message_log"],
                 pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                make_sequence_length_divisible_by=master_config["policy"][
+                make_sequence_length_divisible_by=master_config.policy[
                     "make_sequence_length_divisible_by"
                 ],
             )
@@ -363,7 +374,7 @@ def sft_train(
     # Run basic sft training
     timer = Timer()
     timeout = TimeoutChecker(
-        timeout=master_config["checkpointing"]["checkpoint_must_save_by"],
+        timeout=master_config.checkpointing["checkpoint_must_save_by"],
         fit_last_save_time=True,
     )
     timeout.start_iterations()
@@ -382,7 +393,7 @@ def sft_train(
             "total_valid_tokens", 0
         )  # Default to 0 for backward compatibility with older checkpoints
 
-    sft_config = master_config["sft"]
+    sft_config = master_config.sft
     # Validation configuration
     val_period = sft_config["val_period"]
     val_at_start = sft_config["val_at_start"]
@@ -411,13 +422,13 @@ def sft_train(
 
     while (
         current_epoch < max_num_epochs
-        and total_steps < master_config["sft"]["max_num_steps"]
+        and total_steps < master_config.sft["max_num_steps"]
     ):
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
 
         for batch in train_dataloader:
             print(
-                f"\n{'=' * 25} Step {current_step + 1}/{min(len(train_dataloader), master_config['sft']['max_num_steps'])} {'=' * 25}"
+                f"\n{'=' * 25} Step {current_step + 1}/{min(len(train_dataloader), master_config.sft['max_num_steps'])} {'=' * 25}"
             )
             maybe_gpu_profile_step(policy, total_steps + 1)
             val_metrics, validation_timings = None, None
@@ -430,12 +441,13 @@ def sft_train(
                     add_loss_mask_to_message_log(
                         batch["message_log"],
                         roles_to_train_on=["assistant"],
+                        only_unmask_final=master_config.sft["only_unmask_final"],
                     )
 
                     cat_and_padded, input_lengths = batched_message_log_to_flat_message(
                         batch["message_log"],
                         pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                        make_sequence_length_divisible_by=master_config["policy"][
+                        make_sequence_length_divisible_by=master_config.policy[
                             "make_sequence_length_divisible_by"
                         ],
                     )
@@ -460,7 +472,7 @@ def sft_train(
                         timer=timer,
                     )
 
-                is_last_step = total_steps + 1 >= master_config["sft"][
+                is_last_step = total_steps + 1 >= master_config.sft[
                     "max_num_steps"
                 ] or (
                     current_epoch + 1 == max_num_epochs
@@ -505,20 +517,20 @@ def sft_train(
                 total_valid_tokens += metrics.get("global_valid_toks", 0)
 
                 ## Checkpointing
-                sft_save_state["consumed_samples"] += master_config["policy"][
+                sft_save_state["consumed_samples"] += master_config.policy[
                     "train_global_batch_size"
                 ]
                 timeout.mark_iteration()
                 should_save_by_step = (
                     is_last_step
-                    or (total_steps + 1) % master_config["checkpointing"]["save_period"]
+                    or (total_steps + 1) % master_config.checkpointing["save_period"]
                     == 0
                 )
                 # +1 because step is 0-indexed
                 # Check if timeout-based checkpointing is enabled in config.
                 should_save_by_timeout = timeout.check_save()
 
-                if master_config["checkpointing"]["enabled"] and (
+                if master_config.checkpointing["enabled"] and (
                     should_save_by_step or should_save_by_timeout
                 ):
                     sft_save_state["step"] = (current_step + 1) % len(train_dataloader)
@@ -526,7 +538,7 @@ def sft_train(
                     sft_save_state["epoch"] = current_epoch
                     sft_save_state["total_valid_tokens"] = total_valid_tokens
 
-                    full_metric_name = master_config["checkpointing"]["metric_name"]
+                    full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
                         assert full_metric_name.startswith(
                             "train:"
@@ -572,7 +584,7 @@ def sft_train(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
-                            checkpointing_cfg=master_config["checkpointing"],
+                            checkpointing_cfg=master_config.checkpointing,
                         )
                         torch.save(
                             train_dataloader.state_dict(),
@@ -614,8 +626,8 @@ def sft_train(
                     print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
             total_num_gpus = (
-                master_config["cluster"]["num_nodes"]
-                * master_config["cluster"]["gpus_per_node"]
+                master_config.cluster["num_nodes"]
+                * master_config.cluster["gpus_per_node"]
             )
             if total_time > 0:
                 timing_metrics["valid_tokens_per_sec_per_gpu"] = (
@@ -633,7 +645,7 @@ def sft_train(
             if should_save_by_timeout:
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
-            if total_steps >= master_config["sft"]["max_num_steps"]:
+            if total_steps >= master_config.sft["max_num_steps"]:
                 print(
                     "Max number of steps has been reached, stopping training early",
                     flush=True,

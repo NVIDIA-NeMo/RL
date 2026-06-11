@@ -38,7 +38,9 @@ from nemo_rl.data.datasets.response_datasets import (
 )
 from nemo_rl.data.interfaces import TaskDataProcessFnCallable, TaskDataSpec
 from nemo_rl.data.processors import (
+    PROCESSOR_REGISTRY,
     helpsteer3_data_processor,
+    kd_data_processor,
     math_data_processor,
     math_hf_data_processor,
 )
@@ -191,6 +193,46 @@ def test_math_hf_data_processor_without_prompt():
     assert "Solve 1+1." in result["message_log"][0]["content"]
 
 
+def test_math_hf_data_processor_with_system_prompt():
+    datum_dict = {
+        "messages": [
+            {"role": "user", "content": "Solve 1+1."},
+            {"role": "assistant", "content": "2"},
+        ],
+        "task_name": "math",
+    }
+    tokenizer = DummyTokenizer()
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        f.write("You are a math expert.")
+        system_prompt_file = f.name
+
+    try:
+        math_task_spec = TaskDataSpec(
+            task_name="math",
+            prompt_file=None,
+            system_prompt_file=system_prompt_file,
+        )
+
+        result = math_hf_data_processor(
+            datum_dict=datum_dict,
+            task_data_spec=math_task_spec,
+            tokenizer=tokenizer,
+            max_seq_length=512,
+            idx=0,
+        )
+
+        assert result["extra_env_info"]["ground_truth"] == "2"
+        assert result["loss_multiplier"] == 1.0
+        assert len(result["message_log"]) == 1
+        assert result["message_log"][0]["role"] == "user"
+        # System prompt should be included in the rendered content
+        assert "You are a math expert." in result["message_log"][0]["content"]
+        assert "Solve 1+1." in result["message_log"][0]["content"]
+    finally:
+        os.unlink(system_prompt_file)
+
+
 @pytest.fixture
 def system_prompt_file(request):
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as file:
@@ -308,3 +350,121 @@ def test_helpsteer3_data_processor():
 
     # Length equals sum of token lengths
     assert out["length"] == sum(int(m["token_ids"].numel()) for m in msg_log)
+
+
+# ---------------------------------------------------------------------------
+# kd_data_processor — raw-text forwarder for cross-tokenizer distillation.
+# The cross-tokenizer collator tokenizes (twice), so this processor must NOT
+# emit input_ids / token_mask / loss_mask; it only carries raw text.
+# ---------------------------------------------------------------------------
+
+
+class TestKdDataProcessor:
+    def _spec(self) -> TaskDataSpec:
+        return TaskDataSpec(
+            task_name="kd",
+            prompt_file=None,
+            system_prompt_file=None,
+        )
+
+    def test_registry_resolves_kd_data_processor(self):
+        assert "kd_data_processor" in PROCESSOR_REGISTRY
+        assert PROCESSOR_REGISTRY["kd_data_processor"] is kd_data_processor
+
+    def test_output_keys_and_values(self):
+        out = kd_data_processor(
+            datum_dict={
+                "messages": [{"role": "assistant", "content": "the quick brown fox"}]
+            },
+            task_data_spec=self._spec(),
+            tokenizer=DummyTokenizer(),  # must not be called
+            max_seq_length=512,
+            idx=3,
+        )
+        assert out["message_log"] == [
+            {"role": "assistant", "content": "the quick brown fox"}
+        ]
+        # length is a fake placeholder for the kd pipeline.
+        assert out["length"] == 0
+        assert out["extra_env_info"] is None
+        assert out["loss_multiplier"] == 1.0
+        assert out["idx"] == 3
+
+    def test_task_name_forwarded_when_present(self):
+        out = kd_data_processor(
+            datum_dict={
+                "messages": [{"role": "assistant", "content": "hello"}],
+                "task_name": "code",
+            },
+            task_data_spec=self._spec(),
+            tokenizer=DummyTokenizer(),
+            max_seq_length=128,
+            idx=0,
+        )
+        assert out.get("task_name") == "code"
+
+    def test_task_name_absent_when_not_in_datum(self):
+        out = kd_data_processor(
+            datum_dict={"messages": [{"role": "assistant", "content": "hello"}]},
+            task_data_spec=self._spec(),
+            tokenizer=DummyTokenizer(),
+            max_seq_length=128,
+            idx=0,
+        )
+        assert "task_name" not in out
+
+    def test_does_not_emit_collator_keys(self):
+        # Drift-detector: tokenization is the collator's job, not the
+        # processor's. If a future change emits any of these keys, the
+        # CrossTokenizerCollator's contract is broken.
+        out = kd_data_processor(
+            datum_dict={"messages": [{"role": "assistant", "content": "hello"}]},
+            task_data_spec=self._spec(),
+            tokenizer=DummyTokenizer(),
+            max_seq_length=128,
+            idx=0,
+        )
+        for forbidden in ("input_ids", "token_mask", "loss_mask"):
+            assert forbidden not in out, (
+                f"kd_data_processor must not emit {forbidden!r}; the "
+                "cross-tokenizer collator handles tokenization."
+            )
+
+    def test_does_not_call_tokenizer(self):
+        # A passing MagicMock tokenizer would let any call slip by — use
+        # a real DummyTokenizer subclass whose methods raise if invoked.
+        class StrictTokenizer(DummyTokenizer):
+            def apply_chat_template(self, *a, **kw):  # noqa: ARG002
+                raise AssertionError("tokenizer must not be called")
+
+            def __call__(self, *a, **kw):  # noqa: ARG002
+                raise AssertionError("tokenizer must not be called")
+
+            def encode(self, *a, **kw):  # noqa: ARG002
+                raise AssertionError("tokenizer must not be called")
+
+        # Should not raise — the processor must not touch the tokenizer.
+        _ = kd_data_processor(
+            datum_dict={"messages": [{"role": "assistant", "content": "hello"}]},
+            task_data_spec=self._spec(),
+            tokenizer=StrictTokenizer(),
+            max_seq_length=128,
+            idx=0,
+        )
+
+    def test_long_text_not_truncated_in_processor(self):
+        # Per PR contract, truncation lives in CrossTokenizerCollator
+        # (via tokenizer max_length), NOT in the processor. The
+        # processor forwards the full raw text regardless of
+        # max_seq_length.
+        long_text = "a" * 10_000
+        out = kd_data_processor(
+            datum_dict={"messages": [{"role": "assistant", "content": long_text}]},
+            task_data_spec=self._spec(),
+            tokenizer=DummyTokenizer(),
+            max_seq_length=128,
+            idx=0,
+        )
+        assert out["message_log"][0]["content"] == long_text
+        # length is a fake placeholder for the kd pipeline.
+        assert out["length"] == 0

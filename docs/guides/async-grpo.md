@@ -88,14 +88,14 @@ The async GRPO implementation consists of three main components:
 - Handles validation and checkpointing
 - Manages weight synchronization between training and generation
 
-#### 2. Async Trajectory Collector (`AsyncTrajectoryCollector` in `async_utils.py`)
+#### 2. Async Trajectory Collector (`AsyncTrajectoryCollector` in `async_utils/trajectory_collector.py`)
 - Runs in background Ray actor
 - Continuously generates trajectories using current policy weights
 - Manages generation scheduling and weight version tracking
 - Handles pause/resume for weight updates and validation
 - Coordinates with replay buffer for trajectory storage
 
-#### 3. Replay Buffer (`ReplayBuffer` in `async_utils.py`)
+#### 3. Replay Buffer (`ReplayBuffer` in `async_utils/replay_buffer.py`)
 - Stores generated trajectories with metadata
 - Tracks weight versions for both generation and intended training use
 - Implements age-based filtering to prevent stale trajectories
@@ -150,6 +150,31 @@ sequenceDiagram
         end
     end
 ```
+
+## Checkpointing
+
+Async GRPO checkpoints the replay buffer alongside the rest of training state so that in-progress trajectory generation is not lost across restarts.
+
+### What is saved
+
+On each checkpoint, a `replay_buffer.pt` file is written next to the other checkpoint artifacts. It contains all trajectories currently in the buffer together with their weight and target versions, and the `last_target_weight_already_generated` watermark.
+
+### Restore behaviour
+
+On resume, the buffer is restored before the trajectory collector starts, then cleaned up as follows:
+
+1. **Past targets dropped** — trajectories whose target step is earlier than the resume step are removed.
+2. **Stale trajectories evicted** — if `max_trajectory_age_steps` is set, trajectories too old for their target step are removed.
+3. **Incomplete targets kept** — target steps that still lack a full batch are kept in the buffer. The collector will *gap-fill* only the missing trajectories for those targets before moving on.
+4. **Buffer truncated** — if the restored count exceeds `max_size`, the buffer is truncated, prioritising entries closest to the resume step.
+
+### Gap-filling after restore
+
+After a restore, `last_target_weight_already_generated` is reset to `current_training_step - 1` so the collector re-evaluates every target from the resume step onward. For each target it queries `get_trajectories_needed` and spawns only the workers required to complete the batch — previously buffered trajectories are reused and the collector does not regenerate them.
+
+### Disabling replay-buffer restore
+
+If no `replay_buffer.pt` file is found in the latest checkpoint directory, training starts with an empty buffer and waits for the collector to fill it before the first training step.
 
 ## Usage Tips
 

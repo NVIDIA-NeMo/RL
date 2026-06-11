@@ -6,7 +6,7 @@ NeMo RL supports Nsight profiling for Ray workers through environment variable p
 
 ## Prerequisites
 
-* Install NVIDIA Nsight Systems (`nsys`) on the compute nodes where workers will run. For Ubuntu installation instructions, see the [NVIDIA Nsight Systems Installation Guide](https://docs.nvidia.com/nsight-systems/InstallationGuide/index.html#package-manager-installation)).
+* Install NVIDIA Nsight Systems (`nsys`) on the compute nodes where workers will run. For Ubuntu installation instructions, see the [NVIDIA Nsight Systems Installation Guide](https://docs.nvidia.com/nsight-systems/InstallationGuide/index.html#package-manager-installation).
 
 **Note: If you're using NeMo RL containers, `nsys` is already installed.**
 
@@ -22,7 +22,7 @@ export NRL_NSYS_WORKER_PATTERNS="*policy*,*vllm*"
 
 Set the `NRL_NSYS_PROFILE_STEP_RANGE` environment variable to control which training steps the profiler captures. Its
 format is colon separated integers representing `start:stop`, where `start` is inclusive and `stop` is exclusive
-(same as slice syntax `arr[start:stop]`). Note that the `start` is 1-index, so `NRL_NSYS_PROFILE_STEP_RANGE=0:10` would error.
+(same as slice syntax `arr[start:stop]`). Note that the `start` is 1-indexed, so `NRL_NSYS_PROFILE_STEP_RANGE=0:10` would error.
 
 ```bash
 export NRL_NSYS_PROFILE_STEP_RANGE=3:5

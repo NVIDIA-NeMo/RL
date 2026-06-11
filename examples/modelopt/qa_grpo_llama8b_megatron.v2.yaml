@@ -1,0 +1,114 @@
+# Quantization-Aware GRPO (QA-GRPO) with Megatron Backend, Model-Optimizer,
+# and NVFP4 weight-only (W4A16) quantization.
+#
+# Uses NVFP4 weights with native-dtype activations to avoid the convergence
+# issues seen with W4A4 (NVFP4 on both weights and activations) on GRPO.
+#
+# Algorithmic settings track ProRLv2 (dynamic sampling, decoupled clipping,
+# token-level loss, REINFORCE++, ICE-POP TIS, etc.) since the on-policy
+# variants are what makes long-horizon QA training stable. See
+# ``examples/configs/prorlv2.yaml`` for the canonical (DTensor) ProRLv2
+# config; this file inlines the same settings on top of the Megatron 8B
+# base because NeMo-RL configs use single-defaults inheritance.
+#
+# Example usage (1 node, 8 GPUs):
+#   uv run examples/run_grpo.py --config examples/modelopt/qa_grpo_llama8b_megatron.yaml \
+#     policy.model_name=meta-llama/Llama-3.1-8B-Instruct
+#
+# Reference papers and blogs:
+# ProRLv2: https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/
+# REINFORCE++: https://arxiv.org/abs/2501.03262
+# Online IcePop: https://hijkzzz.notion.site/online-ice-pop
+# DLER (Stop properly penalty): https://arxiv.org/pdf/2510.15110
+
+defaults: "../configs/grpo_math_8B_megatron.yaml"
+
+# ============================================================================
+# ProRLv2 algorithmic settings (mirrored from examples/configs/prorlv2.yaml)
+# ============================================================================
+grpo:
+  # Smaller rollout volume than the 8B base (64×32) to keep this example
+  # runnable as a smoke / convergence test on a single 1n8g node.
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+
+  # DAPO: Dynamic Sampling — filter prompts with std=0 reward to focus on
+  # learnable examples with mixed outcomes.
+  use_dynamic_sampling: true
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1.5
+
+  # Advantage estimator: REINFORCE++ with global reward normalization.
+  adv_estimator:
+    name: "reinforce_plus_plus"
+    normalize_rewards: true
+    use_leave_one_out_baseline: false
+    minus_baseline: true
+
+  # Reward shaping (DAPO overlong + stop-properly penalty).
+  reward_shaping:
+    enabled: true
+    stop_properly_penalty_coef: 0.0
+
+loss_fn:
+  # KL regularization
+  reference_policy_kl_penalty: 0.0001
+  reference_policy_kl_type: "k2"
+  kl_input_clamp_value: 20.0
+  kl_output_clamp_value: 10.0
+
+  # DAPO: Decoupled (asymmetric) clipping.
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.27
+  ratio_clip_c: null
+
+  # DAPO: Token-level loss.
+  token_level_loss: true
+
+  # Truncated Importance Sampling (ICE-POP).
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_ratio: 5.0
+  truncated_importance_sampling_ratio_min: 0.5
+  truncated_importance_sampling_type: "icepop"
+
+  # Reinforce++: KL via external loss (more stable than reward-side KL).
+  use_kl_in_reward: false
+
+# ============================================================================
+# Quantization-Aware overrides
+# ============================================================================
+policy:
+  max_total_sequence_length: 8192
+
+  # Required by the TP>=4 batch-variant accuracy guard in lm_policy.py:
+  # train_micro_batch_size and logprob_batch_size must match. The 8B base
+  # sets train_micro_batch_size=1 (kept) and logprob_batch_size=4 (overridden).
+  logprob_batch_size: 1
+
+  # NVFP4 weight-only (W4A16) custom recipe applied to the Megatron training worker.
+  quant_cfg: "examples/modelopt/quant_configs/nvfp4_a16.yaml"
+  quant_calib_data: "cnn_dailymail"
+  quant_calib_size: 512
+  quant_batch_size: 1
+  quant_sequence_length: 2048
+
+  megatron_cfg:
+    # 8B model: shard with TP=4 and turn on sequence parallel to reduce
+    # activation memory. With PP=1 and CP=1, a 1n8g node leaves DP=2.
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 1
+    sequence_parallel: true
+    # ModelOpt quantization is incompatible with gradient accumulation fusion.
+    gradient_accumulation_fusion: false
+
+  generation:
+    # Same NVFP4 weight-only recipe applied to the vLLM generation worker.
+    quant_cfg: "examples/modelopt/quant_configs/nvfp4_a16.yaml"
+
+checkpointing:
+  checkpoint_dir: "results/qa_grpo_llama8b_megatron"
+
+logger:
+  log_dir: "logs/qa_grpo_llama8b_megatron"
+  wandb:
+    name: "qa-grpo-llama8b-megatron"

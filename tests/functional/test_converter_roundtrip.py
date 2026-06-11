@@ -25,12 +25,15 @@ This test:
 """
 
 import copy
+import gc
+import importlib.util
 import os
 import tempfile
 import time
 from typing import Any, Dict
 
 import torch
+import yaml
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from nemo_rl.algorithms.utils import get_tokenizer
@@ -41,6 +44,17 @@ from nemo_rl.models.megatron.community_import import (
 )
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.native_checkpoint import convert_dcp_to_hf
+
+_CONVERTER_PATH = os.path.normpath(
+    os.path.join(
+        os.path.dirname(__file__), "../../examples/converters/convert_lora_to_hf.py"
+    )
+)
+_spec = importlib.util.spec_from_file_location("convert_lora_to_hf", _CONVERTER_PATH)
+_convert_lora_mod = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_convert_lora_mod)
+merge_lora_to_hf = _convert_lora_mod.merge_lora_to_hf
+export_lora_adapter_to_hf = _convert_lora_mod.export_lora_adapter_to_hf
 
 
 def create_test_config() -> Dict[str, Any]:
@@ -252,7 +266,22 @@ def create_megatron_checkpoint(model_name: str, temp_dir: str) -> str:
 
     with temporary_distributed_context(backend="gloo"):
         megatron_checkpoint_path = os.path.join(temp_dir, "megatron_checkpoint")
-        import_model_from_hf_name(model_name, megatron_checkpoint_path)
+        megatron_config = {
+            "tensor_model_parallel_size": 1,
+            "pipeline_model_parallel_size": 1,
+            "context_parallel_size": 1,
+            "expert_tensor_parallel_size": 1,
+            "expert_model_parallel_size": 1,
+            "num_layers_in_first_pipeline_stage": None,
+            "num_layers_in_last_pipeline_stage": None,
+            "pipeline_dtype": "float32",
+            "sequence_parallel": False,
+            "gradient_accumulation_fusion": False,
+        }
+        # need to set `gradient_accumulation_fusion=False` to avoid RuntimeError
+        import_model_from_hf_name(
+            model_name, megatron_checkpoint_path, megatron_config=megatron_config
+        )
 
     if not check_file_exists(megatron_checkpoint_path):
         raise FileNotFoundError(
@@ -304,6 +333,122 @@ def convert_megatron_to_hf_checkpoint(
 
     print(f"✓ Megatron to HF conversion saved to: {hf_path}")
     return hf_path
+
+
+def create_megatron_lora_checkpoint(
+    model_name: str, base_ckpt_path: str, temp_dir: str
+) -> str:
+    """Build a Megatron model with LoRA, apply a known perturbation, and save only the adapter weights.
+
+    Returns the path to the LoRA adapter checkpoint directory (iter_XXXXXXX format).
+    """
+    print("Creating Megatron LoRA adapter checkpoint...")
+
+    from megatron.bridge import AutoBridge
+    from megatron.bridge.peft.lora import LoRA
+    from megatron.bridge.training.model_load_save import (
+        load_model_config,
+        megatron_cpu_init_context,
+        save_megatron_model,
+        temporary_distributed_context,
+    )
+    from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
+
+    lora_dim = 8
+    lora_alpha = 16
+    peft_cfg = {
+        "target_modules": [],
+        "exclude_modules": [],
+        "dim": lora_dim,
+        "alpha": lora_alpha,
+        "dropout": 0.0,
+        "dropout_position": "pre",
+        "lora_A_init_method": "xavier",
+        "lora_B_init_method": "zero",
+        "a2a_experimental": False,
+    }
+
+    bridge = AutoBridge.from_hf_pretrained(model_name, trust_remote_code=True)
+
+    with temporary_distributed_context(backend="gloo"):
+        model_parallel_cuda_manual_seed(0)
+
+        model_cfg, _ = load_model_config(base_ckpt_path)
+        model_cfg.tensor_model_parallel_size = 1
+        model_cfg.pipeline_model_parallel_size = 1
+        model_cfg.num_layers_in_first_pipeline_stage = None
+        model_cfg.num_layers_in_last_pipeline_stage = None
+        model_cfg.context_parallel_size = 1
+        model_cfg.expert_model_parallel_size = 1
+        model_cfg.expert_tensor_parallel_size = 1
+        model_cfg.moe_extended_tp = False
+        model_cfg.sequence_parallel = False
+        model_cfg.perform_initialization = False
+        model_cfg.virtual_pipeline_model_parallel_size = None
+        model_cfg.hierarchical_context_parallel_sizes = None
+        model_cfg.fp8 = None
+        model_cfg.fp8_param = False
+
+        peft = LoRA(**peft_cfg)
+        if hasattr(model_cfg, "finalize"):
+            model_cfg.finalize()
+        with megatron_cpu_init_context(model_cfg):
+            megatron_model = model_cfg.provide_distributed_model(
+                wrap_with_ddp=False,
+                use_cpu_initialization=True,
+            )
+        gc.collect()
+
+        for m in megatron_model:
+            m.requires_grad_(False)
+
+        # Save the base model first to create the checkpoint directory structure
+        # and write run_config.yaml (which contains the "model" key needed by
+        # load_model_config). Adapter weights are saved separately below.
+        adapter_dir = os.path.join(temp_dir, "lora_adapter_checkpoint")
+        save_megatron_model(megatron_model, adapter_dir)
+        iter_dir = os.path.join(adapter_dir, "iter_0000000")
+
+        # Apply LoRA wrappers (same pattern as merge_lora_to_hf) and perturb
+        # adapter weights so that the merge produces something different from base.
+        megatron_model = peft(megatron_model, training=False)
+        gc.collect()
+
+        torch.manual_seed(42)
+        for m in megatron_model:
+            for name, param in m.named_parameters():
+                if "lora_" in name or "adapter" in name:
+                    param.data.normal_(0, 0.01)
+
+        # Save only the adapter weights using dist_checkpointing, which is the
+        # format that merge_lora_to_hf expects to load from adapter_ckpt.
+        from megatron.bridge.training.checkpointing import (
+            _generate_model_state_dict,
+            apply_peft_adapter_filter_to_state_dict,
+        )
+        from megatron.core import dist_checkpointing
+
+        adapter_sharded_sd = _generate_model_state_dict(megatron_model, {})
+        adapter_sharded_sd = apply_peft_adapter_filter_to_state_dict(
+            adapter_sharded_sd, peft
+        )
+        dist_checkpointing.save(adapter_sharded_sd, iter_dir)
+
+        # Merge the peft section into run_config.yaml so that both
+        # load_model_config (needs "model") and the LoRA converter
+        # (needs "peft") can find what they expect.
+        run_config_path = os.path.join(iter_dir, "run_config.yaml")
+        with open(run_config_path) as f:
+            run_config = yaml.safe_load(f)
+        run_config["peft"] = peft_cfg
+        with open(run_config_path, "w") as f:
+            yaml.dump(run_config, f)
+
+        del megatron_model
+        gc.collect()
+
+    print(f"✓ LoRA adapter checkpoint saved to: {iter_dir}")
+    return iter_dir
 
 
 def main():
@@ -371,6 +516,39 @@ def main():
             megatron_checkpoint_path, model_name, temp_dir
         )
 
+        # Step 7b: Create LoRA adapter checkpoint on top of the Megatron base
+        print("\n" + "=" * 60)
+        print("STEP 7b: Creating Megatron LoRA adapter checkpoint")
+        print("=" * 60)
+        lora_adapter_path = create_megatron_lora_checkpoint(
+            model_name, megatron_checkpoint_path, temp_dir
+        )
+
+        # Step 7c: Merge LoRA adapter + base and export to HF
+        # Calls the actual merge_lora_to_hf function from the converter script.
+        print("\n" + "=" * 60)
+        print("STEP 7c: Merging LoRA adapter with base and exporting to HF")
+        print("=" * 60)
+        lora_merged_hf_path = os.path.join(temp_dir, "lora_merged_hf")
+        merge_lora_to_hf(
+            base_ckpt=megatron_checkpoint_path,
+            adapter_ckpt=lora_adapter_path,
+            hf_model_name=model_name,
+            hf_ckpt_path=lora_merged_hf_path,
+        )
+
+        # Step 7d: Export LoRA adapter only in HuggingFace PEFT format
+        print("\n" + "=" * 60)
+        print("STEP 7d: Exporting LoRA adapter only (PEFT format)")
+        print("=" * 60)
+        lora_adapter_hf_path = os.path.join(temp_dir, "lora_adapter_hf")
+        export_lora_adapter_to_hf(
+            base_ckpt=megatron_checkpoint_path,
+            adapter_ckpt=lora_adapter_path,
+            hf_model_name=model_name,
+            hf_ckpt_path=lora_adapter_hf_path,
+        )
+
         # Step 8: Load converted models and compare
         print("\n" + "=" * 60)
         print("STEP 8: Loading converted models and comparing")
@@ -430,6 +608,93 @@ def main():
             "✓ Dtensor V1 and Dtensor V2 DCP and Megatron roundtrip checkpoints are identical!"
         )
 
+        # LoRA merged model: should have same keys as original but different values
+        # (because the LoRA adapter perturbs the weights).
+        print("Comparing LoRA-merged HF model with Original HF model...")
+        lora_merged_model = AutoModelForCausalLM.from_pretrained(
+            lora_merged_hf_path, torch_dtype=torch.bfloat16, trust_remote_code=True
+        )
+        lora_merged_state_dict = get_model_state_dict(lora_merged_model)
+
+        lora_merged_keys = set(lora_merged_state_dict.keys())
+        assert lora_merged_keys == set(original_state_dict.keys()), (
+            f"LoRA merged model key mismatch.\n"
+            f"  Extra: {lora_merged_keys - set(original_state_dict.keys())}\n"
+            f"  Missing: {set(original_state_dict.keys()) - lora_merged_keys}"
+        )
+        print("✓ LoRA merged model has the expected key structure")
+
+        # The merged model should differ from the original because LoRA
+        # perturbations have been folded in.
+        any_different = False
+        for key in original_state_dict:
+            v_orig = original_state_dict[key]
+            v_lora_merged = lora_merged_state_dict[key]
+            if isinstance(v_orig, torch.Tensor) and not torch.allclose(
+                v_orig, v_lora_merged, rtol=1e-5, atol=1e-5
+            ):
+                any_different = True
+                break
+        assert any_different, (
+            "LoRA-merged model weights are identical to the original — "
+            "the adapter perturbation was not applied."
+        )
+        print("✓ LoRA merged model weights differ from original (adapter was applied)")
+
+        # Forward pass sanity check
+        test_input_lora = torch.randint(0, 1000, (1, 10))
+        with torch.no_grad():
+            lora_output = lora_merged_model(test_input_lora)
+        print("✓ LoRA merged model can perform forward pass")
+        del lora_merged_model
+        gc.collect()
+
+        # Adapter-only (PEFT) export assertions
+        print("Verifying adapter-only PEFT export...")
+        adapter_config_path = os.path.join(lora_adapter_hf_path, "adapter_config.json")
+        assert os.path.exists(adapter_config_path), (
+            f"adapter_config.json not found in {lora_adapter_hf_path}"
+        )
+        weight_candidates = ["adapter_model.safetensors", "adapter_model.bin"]
+        weight_file_found = any(
+            os.path.exists(os.path.join(lora_adapter_hf_path, f))
+            for f in weight_candidates
+        )
+        assert weight_file_found, (
+            f"No adapter weight file found in {lora_adapter_hf_path}. "
+            f"Expected one of: {weight_candidates}"
+        )
+        print(
+            "✓ PEFT adapter directory has expected files (adapter_config.json + weights)"
+        )
+
+        # Verify the adapter-only export produces the same merged weights as Step 7c
+        # by calling merge_lora_to_hf again with the same Megatron adapter. This
+        # avoids tied-weight complications from PeftModel.merge_and_unload().
+        adapter_only_merged_hf_path = os.path.join(temp_dir, "adapter_only_merged_hf")
+        merge_lora_to_hf(
+            base_ckpt=megatron_checkpoint_path,
+            adapter_ckpt=lora_adapter_path,
+            hf_model_name=model_name,
+            hf_ckpt_path=adapter_only_merged_hf_path,
+        )
+        adapter_only_merged_model = AutoModelForCausalLM.from_pretrained(
+            adapter_only_merged_hf_path,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+        )
+        adapter_only_merged_state_dict = get_model_state_dict(adapter_only_merged_model)
+        assert_state_dicts_equal(
+            adapter_only_merged_state_dict,
+            lora_merged_state_dict,
+            "adapter-only export + merge_lora_to_hf (Step 7d)",
+            "lora merged (Step 7c)",
+        )
+        print("✓ adapter-only merge via merge_lora_to_hf matches Step 7c")
+
+        del adapter_only_merged_model
+        gc.collect()
+
         # Verify that both converted models have the expected structure
         expected_keys = set(original_state_dict.keys())
         dcp_keys_v1 = set(dcp_converted_state_dict_v1.keys())
@@ -458,11 +723,13 @@ def main():
             megatron_output = megatron_converted_model(test_input)
 
         print(
-            "✓ Dtensor V1 and Dtensor V2 DCP and Megatron converted models can perform forward passes"
+            "✓ Dtensor V1 and Dtensor V2 DCP, Megatron, and LoRA merged models can perform forward passes"
         )
 
         print("\n" + "=" * 80)
-        print("✓ ALL TESTS PASSED!")
+        print(
+            "✓ ALL TESTS PASSED (DCP v1, DCP v2, Megatron, LoRA merge, LoRA adapter-only PEFT)!"
+        )
         print("=" * 80)
 
 

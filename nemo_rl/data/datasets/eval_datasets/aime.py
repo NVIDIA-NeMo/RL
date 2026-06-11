@@ -21,11 +21,13 @@ from datasets import concatenate_datasets, load_dataset
 from nemo_rl.data import processors
 from nemo_rl.data.interfaces import TaskDataSpec
 
+AIMEVariant = Literal["2024", "2025", "2026"]
+
 
 class AIMEDataset:
     def __init__(
         self,
-        variant: Literal["2024", "2025"] = "2025",
+        variant: AIMEVariant = "2025",
         prompt_file: Optional[str] = None,
         system_prompt_file: Optional[str] = None,
     ):
@@ -37,6 +39,9 @@ class AIMEDataset:
             ds1 = load_dataset("opencompass/AIME2025", "AIME2025-II", split="test")
             ds = concatenate_datasets([ds0, ds1])
             self.input_key = "question"
+        elif variant == "2026":
+            ds = load_dataset("MathArena/aime_2026", split="train")
+            self.input_key = "problem"
         else:
             raise ValueError(f"Invalid variant for aime dataset: aime{variant}")
 

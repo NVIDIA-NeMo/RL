@@ -50,9 +50,19 @@ from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_
 # an automodel factory for loading the huggingface models from correct class
 
 AUTOMODEL_FACTORY: Dict[str, Any] = {
+    # Add an entry here when a model (1) uses HF's standard loading path
+    # (no custom NeMo automodel impl) AND (2) its architecture isn't
+    # loadable via AutoModelForCausalLM (e.g. VLMs using
+    # ForConditionalGeneration / ForImageTextToText). Models with a
+    # custom NeMo automodel impl (e.g. qwen3_5_moe) don't need an entry
+    # — the custom impl intercepts from_pretrained regardless of the
+    # parent AutoModel class. Check MODEL_ARCH_MAPPING in the NeMo
+    # automodel registry to see which architectures have custom impls:
+    # https://github.com/NVIDIA-NeMo/Automodel/blob/main/nemo_automodel/_transformers/registry.py#L32-L146
     "qwen2_5_vl": AutoModelForImageTextToText,
     "qwen2_vl": AutoModelForImageTextToText,
     "qwen2_5_omni": AutoModelForTextToWaveform,
+    "qwen3_5": AutoModelForImageTextToText,
     "llava": AutoModelForImageTextToText,
     "internvl": AutoModelForImageTextToText,
     "gemma3": AutoModelForImageTextToText,
@@ -63,9 +73,12 @@ AUTOMODEL_FACTORY: Dict[str, Any] = {
 
 if NEMO_AUTOMODEL_AVAILABLE:
     AUTOMODEL_FACTORY = {
+        # NeMo wrappers — keep in sync with the vanilla HF dict above.
+        # See comment above for when to add entries.
         "qwen2_5_vl": NeMoAutoModelForImageTextToText,
         "qwen2_vl": NeMoAutoModelForImageTextToText,
         "qwen2_5_omni": NeMoAutoModelForTextToWaveform,
+        "qwen3_5": NeMoAutoModelForImageTextToText,
         "llava": NeMoAutoModelForImageTextToText,
         "internvl": NeMoAutoModelForImageTextToText,
         "gemma3": NeMoAutoModelForImageTextToText,
@@ -80,6 +93,29 @@ class IPCProtocol(Enum):
 
     COMPLETE = "complete"
     ACK = "ack"
+
+
+# TODO: Replace this hard-coded map with a generic plugin-registration
+# hook on ``Policy`` (e.g. a ``worker_cls_overrides`` registry populated by
+# ``nemo_rl.modelopt`` on import) so core has no knowledge of ModelOpt-specific
+# worker classes.
+POLICY_WORKER_OVERRIDES = {
+    "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker": "nemo_rl.modelopt.models.policy.workers.megatron_quant_policy_worker.MegatronQuantPolicyWorker",
+    "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker": "nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker.DTensorQuantPolicyWorker",
+    "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2": "nemo_rl.modelopt.models.policy.workers.dtensor_quant_policy_worker_v2.DTensorQuantPolicyWorkerV2",
+}
+
+
+def resolve_policy_worker_cls(default_cls: str, config: dict) -> str:
+    """Return the quantized policy worker FQN if ``quant_cfg`` is set, else ``default_cls``.
+
+    Safe to call even when ModelOpt is not installed — returns ``default_cls``
+    unchanged whenever ``quant_cfg`` is ``None``, so the core policy path stays
+    import-free of ModelOpt.
+    """
+    if config.get("quant_cfg") is None:
+        return default_cls
+    return POLICY_WORKER_OVERRIDES.get(default_cls, default_cls)
 
 
 def resolve_model_class(model_name: str) -> Any:
@@ -279,8 +315,10 @@ def stream_weights_via_ipc_zmq_impl(
     def pack_tensor(buffer, tensor, used_bytes) -> int:
         """Pack tensor into buffer and return new used_bytes."""
         tensor_bytes = tensor.nbytes
+        # reshape(-1) (not view(-1)): the params iterator may yield
+        # non-contiguous tensors and view would raise on incompatible stride.
         buffer[used_bytes : used_bytes + tensor_bytes].data.copy_(
-            tensor.data.view(-1).view(dtype=torch.uint8), non_blocking=True
+            tensor.data.reshape(-1).view(dtype=torch.uint8), non_blocking=True
         )
         return used_bytes + calculate_aligned_size(tensor_bytes)
 

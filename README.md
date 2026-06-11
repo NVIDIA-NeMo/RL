@@ -10,6 +10,15 @@
 </div>
 
 ## 📣 News
+* [06/04/2026] [Nemotron-3-Ultra](https://research.nvidia.com/labs/nemotron/Nemotron-3-Ultra/) was trained with NeMo-RL! Follow [this guide](https://github.com/NVIDIA-NeMo/RL/blob/ultra-v3/docs/guides/nemotron-3-ultra.md) to explore the post-training recipe.
+* [04/30/2026] [Release v0.6.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.6.0)
+    * Sglang backend, Muon Optimizer, Speculative Decoding, Yarn long-context training, Chunked Cross Entropy Loss, top-p/top-k training
+    * Newly published SWE RL release benchmark demonstrating a long-context, multi-step RL rollout. See the performance numbers [here](https://docs.nvidia.com/nemo/rl/latest/about/performance-summary.html#gb200-bf16-benchmarks) with the accompanying recipe and scripts [here](https://github.com/NVIDIA-NeMo/RL/pull/2327).
+    * Release runs coming soon!
+* [04/06/2026] New Model Support
+    * Added support for [Qwen3.5](https://huggingface.co/collections/Qwen/qwen35) dense and MoE models (LLM and VLM) for GRPO training.
+    * Added support for [GLM-4.7-Flash](https://huggingface.co/zai-org/GLM-4.7-Flash) for GRPO training.
+    * Recipes: [grpo-qwen3.5-9b-1n8g-megatron.yaml](/examples/configs/recipes/llm/grpo-qwen3.5-9b-1n8g-megatron.yaml), [grpo-qwen3.5-35ba3b-2n8g-megatron-ep16.yaml](/examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-2n8g-megatron-ep16.yaml), [grpo-glm47-flash-4n8g-automodel.yaml](/examples/configs/recipes/llm/grpo-glm47-flash-4n8g-automodel.yaml)
 * [03/12/2026] GDPO Support
     * Enabling [Group reward-Decoupled Normalization Policy Optimization](https://arxiv.org/abs/2601.05242) (GDPO) for multi-reward RL training is now supported.
     * Example: [gdpo_math_1B.yaml](/examples/configs/gdpo_math_1B.yaml)
@@ -24,14 +33,14 @@
         * [sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml](examples/configs/recipes/llm/sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml)
         * [grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml](examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml)
         * [grpo-nanov3-30BA3B-2n8g-megatron-lora.yaml](examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-megatron-lora.yaml)
+
+<details>
+<summary>Previous News</summary>
+   
 * [01/30/2026] [Release v0.5.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.5.0)
     * Both linux/amd64 and linux/arm64 Docker containers are available on NGC [nvcr.io/nvidia/nemo-rl:v0.5.0](https://registry.ngc.nvidia.com/orgs/nvidia/containers/nemo-rl/tags).
     * NeMo-Gym + NeMo-RL support
     * 📊 View the release run metrics on [Google Colab](https://colab.research.google.com/drive/1Xgg8D7mNkWnz6t2uL8BbPfPb7UTkN1H0?usp=sharing) to get a head start on your experimentation.
-
-<details>
-<summary>Previous News</summary>
-
 * [12/15/2025] NeMo-RL is the framework that trained [NVIDIA-NeMotron-3-Nano-30B-A3B-FP8](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8)! [This guide](docs/guides/nemotron-3-nano.md) provides reproducible instructions for the post-training process.
 * [10/10/2025] **DAPO Algorithm Support**  
   NeMo RL now supports [Decoupled Clip and Dynamic Sampling Policy Optimization (DAPO)](https://arxiv.org/pdf/2503.14476) algorithm that extends GRPO with **Clip-Higher**, **Dynamic Sampling**, **Token-Level Policy Gradient Loss**, and **Overlong Reward Shaping** for more stable and efficient RL training. See the [DAPO guide](docs/guides/dapo.md) for more details.
@@ -88,18 +97,21 @@ For detailed information on backend selection, configuration, and examples, see 
 
 ## Features
 
-✅ _Available now_ | 🔜 _Coming in v0.6_
-- 🔜 **Muon Optimizer** - Emerging Optimizer support for SFT/RL
-- 🔜 **Megatron Inference** - Improved performance for Megatron Inference (avoid weight conversion).
-- 🔜 **SGLang Inference** - SGLang rollout support for optimized inference.
+✅ _Available now_ | 🔜 _Coming in v0.7_
+
 - 🔜 **Improved Native Performance** - Improve training time for native PyTorch models.
 - 🔜 **Improved Large MoE Performance** - Improve Megatron Core training performance and generation performance.
-- 🔜 **New Models** -  Qwen3-Next, Nemotron-Super.
-- 🔜 **Expand Algorithms** - GDPO, LoRA support for RL(GRPO) and DPO
 - 🔜 **Resiliency** - Fault tolerance and auto-scaling support
 - 🔜 **On-Policy Distillation** - Multi-teacher and cross tokenizer distillation support
-- 🔜 **Speculative Decoding** - Speculative Decoding support for rollout acceleration
+- 🔜 **New Models** - Qwen3-Next, Minimax 
 
+- ✅ **X-Token Off-Policy Distillation** - Off-policy distillation across mismatched (student, teacher) tokenizers via a precomputed projection matrix.
+- ✅ **Muon Optimizer** - Emerging Optimizer support for SFT/RL
+- ✅ **Megatron Inference** - Improved performance for Megatron Inference (avoid weight conversion).
+- ✅ **SGLang Inference** - SGLang rollout support for optimized inference.
+- ✅ **Speculative Decoding** - Speculative Decoding support for rollout acceleration and training
+- ✅ **New Models** - Nemotron-Super, Qwen3.5, GLM Flash-4.7
+- ✅ **Expand Algorithms** - GDPO, LoRA support for RL(GRPO) and DPO
 - ✅ **Distributed Training** - Ray-based infrastructure.
 - ✅ **Environment Support and Isolation** - Support for multi-environment training and dependency isolation between components.
 - ✅ **Worker Isolation** - Process isolation between RL Actors (no worries about global state).
@@ -128,6 +140,7 @@ For detailed information on backend selection, configuration, and examples, see 
     |-|-|-|
     |[GRPO](#grpo)|[GRPO Single Node](#grpo-single-node)|[GRPO Multi-node](#grpo-multi-node): [GRPO Qwen2.5-32B](#grpo-qwen25-32b), [GRPO Multi-Turn](#grpo-multi-turn)|
     |[On-policy Distillation](#on-policy-distillation)|[Distillation Single Node](#on-policy-distillation-single-node)|[Distillation Multi-node](#on-policy-distillation-multi-node)|
+    |[X-Token Off-Policy Distillation](#x-token-off-policy-distillation)|[X-Token Distillation Single Node](#x-token-off-policy-distillation-single-node)|[X-Token Distillation Multi-node](#x-token-off-policy-distillation-multi-node)|
     |[SFT](#supervised-fine-tuning-sft)|[SFT Single Node](#sft-single-node)|[SFT Multi-node](#sft-multi-node)|
     |[DPO](#dpo)|[DPO Single Node](#dpo-single-node)|[DPO Multi-node](#dpo-multi-node)|
     |[RM](#rm)|[RM Single Node](#rm-single-node)|[RM Multi-node](#rm-multi-node)|
@@ -239,8 +252,8 @@ Use `uv run` to launch all commands. It handles pip installing implicitly and en
 > [!IMPORTANT]
 > **Bare metal only (skip if using the NeMo RL container):** If you use the Megatron backend (`--extra mcore`), set these environment variables so Transformer Engine uses the pip-installed cuDNN instead of a potentially mismatched system version:
 > ```sh
-> export CUDNN_HOME=.venv/lib/python3.12/site-packages/nvidia/cudnn
-> export LD_LIBRARY_PATH=".venv/lib/python3.12/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH:-}"
+> export CUDNN_HOME=.venv/lib/python3.13/site-packages/nvidia/cudnn
+> export LD_LIBRARY_PATH=".venv/lib/python3.13/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH:-}"
 > # Verify (should match nvidia-cudnn-cu12 version in pyproject.toml, currently 9.19.0):
 > # uv run --extra mcore python -c "import transformer_engine.pytorch as te; print(te.get_cudnn_version())"
 > ```
@@ -389,6 +402,66 @@ uv run python examples/run_distillation.py \
 NUM_ACTOR_NODES=2
 
 COMMAND="uv run ./examples/run_distillation.py --config examples/configs/distillation_math.yaml cluster.num_nodes=2 cluster.gpus_per_node=8 checkpointing.checkpoint_dir='results/distill_2nodes' logger.wandb_enabled=True logger.wandb.name='distill-2nodes'" \
+CONTAINER=YOUR_CONTAINER \
+MOUNTS="$PWD:$PWD" \
+sbatch \
+    --nodes=${NUM_ACTOR_NODES} \
+    --account=YOUR_ACCOUNT \
+    --job-name=YOUR_JOBNAME \
+    --partition=YOUR_PARTITION \
+    --time=4:0:0 \
+    --gres=gpu:8 \
+    ray.sub
+```
+
+> [!NOTE]
+> For GB200 systems with 4 GPUs per node, use `--gres=gpu:4` instead.
+
+## X-Token Off-Policy Distillation
+
+We support off-policy distillation between a student and a teacher that **do not share a tokenizer** (cross-tokenizer, or "x-token", distillation) — for example, distilling a `Qwen/Qwen3-4B` teacher into a `meta-llama/Llama-3.2-1B` student. The reference recipe trains on the ungated, CC-BY-4.0 [Nemotron-Pretraining-Specialized-v1.1](https://huggingface.co/datasets/nvidia/Nemotron-Pretraining-Specialized-v1.1) corpus (`Nemotron-Pretraining-Formal-Logic` subset).
+
+You can read about the details of the x-token distillation implementation [here](docs/guides/xtoken-off-policy-distillation.md), including how the (student, teacher) projection matrix is built and how the loss modes work.
+
+Before launching a run, build the projection matrix for your (student, teacher) tokenizer pair:
+
+```sh
+./tools/x_token/build_projection_matrix.sh \
+  --student-model meta-llama/Llama-3.2-1B \
+  --teacher-model Qwen/Qwen3-4B \
+  --runtime-top-k 4 \
+  --final-output cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt
+```
+
+> [!NOTE]
+> X-token distillation runs on the DTensor V2 backend only, and the student and teacher must be colocated on the same node (teacher logits travel via CUDA IPC).
+
+### X-Token Off-Policy Distillation Single Node
+
+To run x-token off-policy distillation on a single node using `meta-llama/Llama-3.2-1B` as the student and `Qwen/Qwen3-4B` as the teacher:
+
+```sh
+uv run python examples/run_xtoken_off_policy_distillation.py \
+  loss_fn.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt
+```
+
+By default, this uses the configuration in `examples/configs/xtoken_off_policy_distillation.yaml`. The projection matrix path is the only required override. You can customize other parameters with command-line overrides. For example:
+
+```sh
+uv run python examples/run_xtoken_off_policy_distillation.py \
+  loss_fn.projection_matrix_path=cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt \
+  policy.model_name="meta-llama/Llama-3.2-1B" \
+  teacher.model_name="Qwen/Qwen3-4B" \
+  cluster.gpus_per_node=8
+```
+
+### X-Token Off-Policy Distillation Multi-node
+
+```sh
+# Run from the root of NeMo RL repo
+NUM_ACTOR_NODES=2
+
+COMMAND="uv run ./examples/run_xtoken_off_policy_distillation.py --config examples/configs/xtoken_off_policy_distillation.yaml loss_fn.projection_matrix_path='cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt' cluster.num_nodes=2 cluster.gpus_per_node=8 checkpointing.checkpoint_dir='results/xtoken_distill_2nodes' logger.wandb_enabled=True logger.wandb.name='xtoken-distill-2nodes'" \
 CONTAINER=YOUR_CONTAINER \
 MOUNTS="$PWD:$PWD" \
 sbatch \
@@ -584,6 +657,16 @@ uv run --extra mcore python examples/converters/convert_megatron_to_hf.py \
     --config results/grpo/step_170/config.yaml \
     --megatron-ckpt-path results/grpo/step_170/policy/weights/iter_0000000 \
     --hf-ckpt-path results/grpo/hf
+```
+
+If you trained with **LoRA on the Megatron backend**, use the LoRA merger to fold the adapter weights into the base model and export a standalone Hugging Face checkpoint:
+
+```sh
+uv run --extra mcore python examples/converters/convert_lora_to_hf.py \
+    --base-ckpt <path_to_base_megatron_checkpoint>/iter_0000000 \
+    --adapter-ckpt <path_to_lora_adapter_checkpoint>/iter_0000000 \
+    --hf-model-name <huggingface_model_name> \
+    --hf-ckpt-path results/lora_merged_hf
 ```
 
 > **Note:** Adjust the paths according to your training output directory structure.

@@ -67,7 +67,7 @@ NeMo RL SFT uses Hugging Face chat templates to format the individual examples. 
     tokenizer:
       chat_template: NULL
     ```
-3. Use a custom template: If you would like to use a custom template, create a string template in [Jinja format](https://huggingface.co/docs/transformers/v4.34.0/en/chat_templating#how-do-i-create-a-chat-template), and add that string to the config. For example,
+3. Use a custom template: If you would like to use a custom template, create a string template in [Jinja format](https://huggingface.co/docs/transformers/en/chat_templating_writing), and add that string to the config. For example,
 
     ```yaml
     tokenizer:
@@ -137,6 +137,24 @@ data:
   default:
     ...
 ```
+
+### Custom datasets defined outside NeMo RL
+
+If you want to plug in a dataset class that lives outside the `nemo_rl`
+package (so you don't have to edit the built-in registry), set
+`dataset_name` to a fully qualified dotted import path. The dispatcher
+will import the module and resolve the class. The class must accept the
+same kwargs as the built-in datasets (i.e. the full data config) and
+implement `set_task_spec` and `set_processor`.
+
+```yaml
+data:
+  default:
+    dataset_name: my_pkg.my_module.MyDataset  # importable from PYTHONPATH
+```
+
+The class must be importable — install it as a package or add its
+parent directory to `PYTHONPATH` before launching training.
 
 We support using a single dataset for both train and validation by using `split_validation_size` to set the ratio of validation.
 [OpenAssistant](../../nemo_rl/data/datasets/response_datasets/oasst.py), [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py), [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py), [Tulu3SftMixtureDataset](../../nemo_rl/data/datasets/response_datasets/tulu3.py) are supported for this feature.
@@ -336,6 +354,15 @@ uv run examples/run_sft.py \
 ```
 
 For more details on LoRA, see [LoRA: Low-Rank Adaptation of Large Language Models](https://arxiv.org/abs/2106.09685).
+
+### Exporting a LoRA Checkpoint to Hugging Face Format
+
+After training with LoRA on the Megatron backend, the `convert_lora_to_hf.py` script supports two export modes:
+
+- **Merged**: fold the adapter into the base model and export a single standalone HuggingFace checkpoint for inference or evaluation.
+- **Adapter-only**: export only the adapter weights in HuggingFace PEFT format, keeping the base model separate (e.g. for use with vLLM's LoRA support).
+
+See the [Checkpointing documentation](../design-docs/checkpointing.md#converting-megatron-lora-adapter-checkpoints-to-hugging-face-format) for full usage details and examples.
 
 ## Optimizations
 

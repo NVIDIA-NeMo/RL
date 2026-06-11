@@ -4,6 +4,7 @@ policy:
     tensor_model_parallel_size: 2
     pipeline_model_parallel_size: 2
     expert_model_parallel_size: 2
+    moe_token_dispatcher_type: allgather
   make_sequence_length_divisible_by: 2
   generation:
     vllm_cfg:

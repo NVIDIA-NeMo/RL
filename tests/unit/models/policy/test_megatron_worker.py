@@ -39,22 +39,35 @@ from tests.unit.test_utils import SimpleLossFn
 
 pytestmark = pytest.mark.mcore
 
-basic_pg_loss_test_config: ClippedPGLossConfig = {
-    "ratio_clip_min": 0.2,
-    "ratio_clip_max": 0.2,
-    "ratio_clip_c": None,
-    "reference_policy_kl_penalty": 0.1,
-    "reference_policy_kl_type": "k3",
-    "kl_input_clamp_value": 20.0,
-    "kl_output_clamp_value": 10.0,
-    "disable_ppo_ratio": False,
-    "use_on_policy_kl_approximation": False,
-    "use_importance_sampling_correction": False,
-    "truncated_importance_sampling_ratio": None,
-    "sequence_level_importance_ratios": False,
-    "token_level_loss": True,
-    "force_on_policy_ratio": False,
-}
+
+class _FakeTrainableModel:
+    def __init__(self):
+        self.train_called = False
+
+    def train(self):
+        self.train_called = True
+
+
+def test_megatron_prepare_for_training_restores_optimizer():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    model = _FakeTrainableModel()
+    restored_devices = []
+
+    worker.model = model
+    worker.optimizer = object()
+    worker.optimizer_cpu_offload = False
+    worker.cfg = {"megatron_cfg": {"empty_unused_memory_level": 0}}
+    worker.move_model = lambda model, device, move_grads, move_params: model
+    worker.move_optimizer = lambda device: restored_devices.append(device)
+
+    MegatronPolicyWorkerImpl.prepare_for_training(worker)
+
+    assert model.train_called
+    assert restored_devices == ["cuda"]
 
 
 def create_megatron_test_config(
@@ -65,7 +78,6 @@ def create_megatron_test_config(
     activation_checkpointing: bool = False,
     generation_backend: str = "megatron",
     sequence_parallel: bool = False,
-    converter_type: str = "LlamaForCausalLM",
     logprob_chunk_size: Optional[int] = None,
     defer_fp32_logits: Optional[bool] = None,
     attention_backend: Optional[str] = None,
@@ -120,7 +132,6 @@ def create_megatron_test_config(
             "enabled": True,
             "empty_unused_memory_level": 0,
             "activation_checkpointing": activation_checkpointing,
-            "converter_type": converter_type,
             "tensor_model_parallel_size": tp,
             "expert_tensor_parallel_size": 1,
             "expert_model_parallel_size": 1,
@@ -144,6 +155,7 @@ def create_megatron_test_config(
             "defer_fp32_logits": defer_fp32_logits,
             "use_linear_ce_fusion_loss": False,
             "linear_ce_fusion_chunk_size": 256,
+            "gradient_accumulation_fusion": False,
             "train_iters": 100,  # Required for Megatron training
             "optimizer": {
                 "optimizer": "adam",
@@ -296,17 +308,10 @@ def training_setup(request):
         )
 
         # Determine converter type based on model
-        converter_type = "LlamaForCausalLM"
-        if "qwen" in model_name.lower():
-            converter_type = "Qwen2ForCausalLM"
-        elif "gemma" in model_name.lower():
-            converter_type = "GemmaForCausalLM"
-
         config = create_megatron_test_config(
             model_name=model_name,
             tp=tp,
             pp=pp,
-            converter_type=converter_type,
         )
 
         # Apply config updates
@@ -668,17 +673,10 @@ def logprob_setup(request):
         )
 
         # Determine converter type based on model
-        converter_type = "LlamaForCausalLM"
-        if "qwen" in model_name.lower():
-            converter_type = "Qwen2ForCausalLM"
-        elif "gemma" in model_name.lower():
-            converter_type = "GemmaForCausalLM"
-
         config = create_megatron_test_config(
             model_name=model_name,
             tp=tp,
             pp=pp,
-            converter_type=converter_type,
             logprob_chunk_size=logprob_chunk_size,
             defer_fp32_logits=defer_fp32_logits,
         )
@@ -846,7 +844,7 @@ def test_megatron_loss_independent_of_microbatch_size(tiny_llama_model_path):
 
     # Test loss functions
     nll_loss_fn = NLLLossFn()
-    pg_loss_fn = ClippedPGLossFn(basic_pg_loss_test_config)
+    pg_loss_fn = ClippedPGLossFn(ClippedPGLossConfig())
 
     policy1.prepare_for_training()
     mbs1_nll_results = policy1.train(data, nll_loss_fn)
@@ -1276,7 +1274,7 @@ def test_megatron_checkpoint_save_kill_and_restore(
             restore_config = deepcopy(initial_config)
 
             # Check if the optimizer exists in the checkpoint
-            # checkpointer = CheckpointManager(restore_config["checkpointing"])
+            # checkpointer = CheckpointManager(restore_config.checkpointing)
             weights_path, optimizer_path = CheckpointManager.get_resume_paths(
                 checkpoint_dir
             )
@@ -1522,17 +1520,10 @@ def topk_setup(request):
         )
 
         # Determine converter type based on model
-        converter_type = "LlamaForCausalLM"
-        if "qwen" in model_name.lower():
-            converter_type = "Qwen2ForCausalLM"
-        elif "gemma" in model_name.lower():
-            converter_type = "GemmaForCausalLM"
-
         config = create_megatron_test_config(
             model_name=model_name,
             tp=tp,
             pp=pp,
-            converter_type=converter_type,
             logprob_chunk_size=logprob_chunk_size,
             defer_fp32_logits=defer_fp32_logits,
         )
@@ -2422,7 +2413,7 @@ def test_megatron_context_parallel_training_agreement(tiny_llama_model_path):
     )
 
     # Create ClippedPG loss function
-    loss_fn = ClippedPGLossFn(basic_pg_loss_test_config)
+    loss_fn = ClippedPGLossFn(ClippedPGLossConfig())
 
     # Train non-CP model
     policy_no_cp.prepare_for_training()
