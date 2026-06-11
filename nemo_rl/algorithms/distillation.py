@@ -702,6 +702,11 @@ def distillation_train(
 
                 print("▶ Preparing for teacher logprob inference...", flush=True)
                 with timer.time("teacher_logprob_inference_prep"):
+                    if not colocated_inference:
+                        # The non-colocated refit ends with prepare_for_training(),
+                        # which leaves the student optimizer state on the train GPUs.
+                        # Offload it so the teacher fits for top-k inference.
+                        student_policy.offload_before_refit()
                     teacher_policy.prepare_for_lp_inference()
 
                 print("▶ Computing teacher logprobs...", flush=True)
