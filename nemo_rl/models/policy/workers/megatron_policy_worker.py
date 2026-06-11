@@ -504,9 +504,11 @@ class MegatronPolicyWorkerImpl(
                 losses.append(torch.tensor(mb_losses).sum().item())
 
         if not eval_mode:
-            # take one LR step every rollout batch
-            # we need to scale the step by gbs to counteract the fact that NeMo automatically
-            # scales lr_warmup_steps by gbs during init
+            # Step LR scheduler once per train() call, not per global batch.
+            # Megatron's OptimizerParamScheduler.step takes an `increment` in
+            # samples: NeMo init scales lr_warmup_steps by gbs internally, so
+            # passing increment=gbs cancels that scaling and one tick == one
+            # train() call regardless of batch size.
             self.scheduler.step(increment=gbs)
 
         # Aggregate metrics across all microbatches
@@ -1247,6 +1249,16 @@ class MegatronPolicyWorkerImpl(
 
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
             torch.cuda.empty_cache()
+
+    def finish_inference(self) -> None:
+        """Offload model params to CPU after inference."""
+        self.model = self.move_model(
+            self.model, "cpu", move_params=True, move_grads=False
+        )
+        self.model.eval()
+
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def _clear_fp8_caches(self):
         """Clear FP8 workspace caches and release fragmented GPU memory.

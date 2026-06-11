@@ -120,6 +120,13 @@ class NemoGym(EnvironmentInterface):
     def __init__(self, cfg: NemoGymConfig):
         self.cfg = cfg
 
+    def _spinup(self) -> None:
+        """Start the NeMo-Gym head server and rollout collection helper.
+
+        Deferred from __init__ so the actor can be created cheaply (and
+        scheduled onto reserved nodes) and spun up explicitly once the vLLM
+        server URLs are available, overlapping with vLLM model loading.
+        """
         self.node_ip = _get_node_ip_local()
         _gym_port_low = self.cfg.get("port_range_low", DEFAULT_GYM_PORT_RANGE_LOW)
         _gym_port_high = self.cfg.get("port_range_high", DEFAULT_GYM_PORT_RANGE_HIGH)
@@ -210,9 +217,6 @@ Depending on your data shape, you may want to change these values."""
             port=self.head_server_port,
         )
         self.rch = RolloutCollectionHelper()
-
-    def health_check(self) -> bool:
-        return True
 
     async def run_rollouts(
         self,

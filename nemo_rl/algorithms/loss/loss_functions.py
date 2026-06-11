@@ -137,6 +137,10 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # NOTE: This should only be used when doing exactly one update per rollout
     # (i.e., num_prompts_per_step * num_generations_per_prompt == train_global_batch_size)
     force_on_policy_ratio: bool = False
+    # VAPO: weight μ for positive-example NLL loss on correct samples.
+    # L = L_PPO + μ·L_NLL(correct)   (arXiv:2504.05118, Eq. 10)
+    # Set to 0 to disable.
+    positive_example_nll_weight: float = 0.0
 
 
 class ClippedPGLossDataDict(TypedDict):
@@ -200,7 +204,9 @@ class ClippedPGLossFn(LossFunction):
         self.ratio_clip_min = cfg.ratio_clip_min
         self.ratio_clip_max = cfg.ratio_clip_max
         self.ratio_clip_c = cfg.ratio_clip_c  # set to None to disable dual-clipping
-        self.reference_policy_kl_penalty = cfg.reference_policy_kl_penalty
+        self.reference_policy_kl_penalty = (
+            cfg.reference_policy_kl_penalty if not cfg.use_kl_in_reward else 0
+        )
         self.reference_policy_kl_type = cfg.reference_policy_kl_type
         self.kl_input_clamp_value = cfg.kl_input_clamp_value
         self.kl_output_clamp_value = cfg.kl_output_clamp_value
@@ -219,6 +225,7 @@ class ClippedPGLossFn(LossFunction):
 
         # Whether to compute importance weights per-sequence instead of per-token.
         self.sequence_level_importance_ratios = cfg.sequence_level_importance_ratios
+        self.positive_example_nll_weight = cfg.positive_example_nll_weight
         self.loss_type = (
             LossType.TOKEN_LEVEL if cfg.token_level_loss else LossType.SEQUENCE_LEVEL
         )
@@ -589,7 +596,23 @@ class ClippedPGLossFn(LossFunction):
                 global_normalization_factor=global_valid_toks,
             )
 
-        loss = actor_loss + kl
+        # -----------------------------------------------------------------
+        # VAPO: positive-example NLL loss on correct samples (reward > 0)
+        # L = L_PPO + μ · L_NLL(correct)
+        # -----------------------------------------------------------------
+        nll_loss = torch.tensor(0.0, device=mask.device)
+        if self.positive_example_nll_weight > 0 and "rewards" in data:
+            correct_sample_mask = (data["rewards"] > 0).float()  # [batch]
+            correct_mask = mask * correct_sample_mask.unsqueeze(-1)
+            correct_valid_toks = correct_mask.sum()
+            if correct_valid_toks > 0:
+                nll_loss = masked_mean(
+                    -curr_logprobs,
+                    correct_mask,
+                    global_normalization_factor=correct_valid_toks,
+                )
+
+        loss = actor_loss + kl + self.positive_example_nll_weight * nll_loss
         with torch.no_grad():
             probs_ratio = masked_mean(
                 ratios.detach(),
@@ -640,6 +663,7 @@ class ClippedPGLossFn(LossFunction):
                 "num_valid_samples": sample_mask.sum().item(),
                 "approx_entropy": seq_entropy_approx.item(),
                 **_is_filter_metrics,
+                "positive_nll_loss": nll_loss.item(),
             },
         )
 
@@ -1055,6 +1079,140 @@ class DistillationLossFn(LossFunction):
         return kl_loss, metrics
 
 
+class MseValueLossConfig(BaseModel, extra="forbid"):
+    """Config for the MSE value loss used by PPO's value model."""
+
+    # Scaling factor applied to the value loss before it is added to the policy loss.
+    scale: float = 1.0
+    # Clipping range for value predictions (PPO-style). Set to None to disable clipping.
+    cliprange: Optional[float] = None
+
+
+class MseValueLossFn(LossFunction):
+    """Mean Squared Error value loss function with optional clipping (PPO-style).
+
+    When ``cliprange`` is set, value predictions are clipped to
+    ``[old_values - cliprange, old_values + cliprange]`` and the loss is
+    ``0.5 * max(mse(vpred, returns), mse(vpred_clipped, returns))``.
+    This prevents the value function from changing too drastically in a
+    single update, mirroring the policy ratio clipping in PPO.
+    """
+
+    input_type = LossInputType.LOGIT
+
+    def __init__(self, cfg: MseValueLossConfig):
+        self.scale = cfg.scale
+        self.cliprange = cfg.cliprange
+        self.loss_type = LossType.TOKEN_LEVEL
+
+    def __call__(
+        self,
+        values: torch.Tensor,
+        data: BatchedDataDict,
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Compute Mean Squared Error value loss, optionally with clipping."""
+        # Squeeze trailing singleton from value head output: [B, S, 1] -> [B, S]
+        if values.ndim > 2 and values.shape[-1] == 1:
+            values = values.squeeze(-1)
+
+        token_mask = data["token_mask"]
+        sample_mask = data["sample_mask"]
+        returns = data["returns"]
+        mask = token_mask * sample_mask.unsqueeze(-1)
+
+        if self.cliprange and self.cliprange > 0:
+            old_values = data["values"]
+            vpred_clipped = torch.clamp(
+                values,
+                old_values - self.cliprange,
+                old_values + self.cliprange,
+            )
+            vf_losses_unclipped = (values - returns) ** 2
+            vf_losses_clipped = (vpred_clipped - returns) ** 2
+            vf_losses = torch.max(vf_losses_unclipped, vf_losses_clipped)
+            loss = (
+                0.5
+                * self.scale
+                * masked_mean(
+                    vf_losses,
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                )
+            )
+            vf_clipfrac = masked_mean(
+                (vf_losses_clipped > vf_losses_unclipped).float(),
+                mask,
+                global_normalization_factor=global_valid_toks,
+            ).item()
+        else:
+            loss = torch.nn.functional.mse_loss(values, returns, reduction="none")
+            loss = (
+                0.5
+                * self.scale
+                * masked_mean(
+                    loss,
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                )
+            )
+            vf_clipfrac = 0.0
+
+        with torch.no_grad():
+            # Use global_valid_toks so each MB contributes local_sum/global_total.
+            # Summing across MBs in ppo.py then gives the correct global mean.
+            returns_mean = masked_mean(
+                returns,
+                mask,
+                global_normalization_factor=global_valid_toks,
+            ).item()
+            values_mean = masked_mean(
+                values,
+                mask,
+                global_normalization_factor=global_valid_toks,
+            ).item()
+
+            # Min/max are per-MB; ppo.py takes min/max across MBs.
+            masked_values = values[mask.bool()]
+            values_min = (
+                masked_values.min().item() if masked_values.numel() > 0 else 0.0
+            )
+            values_max = (
+                masked_values.max().item() if masked_values.numel() > 0 else 0.0
+            )
+
+            # Explained variance sufficient statistics.
+            # EV = 1 - Var(residual) / Var(returns)
+            # We export E[r²] and E[(r-v)²] (both / global_valid_toks so they
+            # sum correctly across MBs).  ppo.py combines them with returns_mean
+            # and values_mean to compute exact global EV.
+            returns_sq_mean = masked_mean(
+                returns**2,
+                mask,
+                global_normalization_factor=global_valid_toks,
+            ).item()
+            residual_sq_mean = masked_mean(
+                (returns - values) ** 2,
+                mask,
+                global_normalization_factor=global_valid_toks,
+            ).item()
+
+        metrics = {
+            "loss": float(loss.item()),
+            "vf_clipfrac": vf_clipfrac,
+            "returns_mean": returns_mean,
+            "values_mean": values_mean,
+            "values_min": values_min,
+            "values_max": values_max,
+            "returns_sq_mean": returns_sq_mean,
+            "residual_sq_mean": residual_sq_mean,
+            "num_valid_samples": int(values.shape[0]),
+        }
+
+        return loss, metrics
+
+
 # =====================================================================
 # Cross-tokenizer distillation
 # =====================================================================
@@ -1088,10 +1246,15 @@ class CrossTokenizerDistillationLossConfig(TypedDict):
         exact_token_match_only: If True, only aligned pairs flagged as
             'is_correct' contribute to KL; mismatched pairs are masked out.
             Used by the P-KL path only.
-        kl_loss_weight: Scalar multiplier on the KL term (P-KL path).
-        ce_loss_scale: Scalar multiplier on the CE term (P-KL path).
-        dynamic_loss_scaling: If True, rescale KL each step so its detached
-            magnitude matches CE (P-KL path).
+        kl_loss_weight: Scalar multiplier on the distillation (KD) term in
+            fixed-weight mode (``dynamic_loss_scaling=False``). Applies to
+            both the P-KL and gold-loss paths.
+        ce_loss_scale: Scalar multiplier on the next-token CE term in
+            fixed-weight mode. Applies to both the P-KL and gold-loss paths.
+        dynamic_loss_scaling: If True, rescale the KD term each step so its
+            detached magnitude matches CE, then add CE; ``kl_loss_weight`` /
+            ``ce_loss_scale`` are ignored in this mode. Applies to both the
+            P-KL and gold-loss paths.
         student_vocab_size: Full student tokenizer vocab size, used to size
             the projection matrix's student-side (V_s) axis. Runtime-injected
             by ``xtoken_off_policy_distillation.setup`` from ``len(student_tokenizer)``;
@@ -1156,9 +1319,13 @@ class CrossTokenizerDistillationLossFn(LossFunction):
       student CE term, combined as ``kl_loss_weight * kl + ce_loss_scale * ce``
       — or, when ``dynamic_loss_scaling`` is set, with the KL term rescaled
       each step to match the detached CE magnitude.
-    - ``(True, False)`` -> gold-loss: ``(kl_common + l1_uncommon) * T**2``,
-      i.e. KL on the exact-mapped *common* partition plus a sorted-L1 term on
-      the *uncommon* tail. No CE term.
+    - ``(True, False)`` -> gold-loss: KL on the exact-mapped *common* partition
+      plus a sorted-L1 term on the *uncommon* tail
+      (``kd = (kl_common + l1_uncommon) * T**2``), combined with a next-token
+      student CE term the same way as the P-KL path —
+      ``kl_loss_weight * kd + ce_loss_scale * ce``, or, when
+      ``dynamic_loss_scaling`` is set, with the KD term rescaled each step to
+      match the detached CE magnitude.
     - ``(True, True)`` -> gold-loss with the xtoken modifier: same objective,
       but the exact-map threshold is relaxed (``>= 0.6`` instead of ``== 1.0``)
       and a collision-replacement rule lets multi-token projections still
@@ -1180,8 +1347,9 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         ``(loss, metrics)``. The P-KL path reports ``loss``, ``kl_loss``,
         ``ce_loss``, ``kl_loss_scale``, ``accuracy``, ``proj_accuracy``,
         ``num_valid_samples``, ``num_valid_pairs``. The gold path reports
-        ``loss``, ``kl_common``, ``l1_uncommon``, ``accuracy``,
-        ``num_valid_samples``, ``num_valid_chunks``.
+        ``loss``, ``kl_common``, ``l1_uncommon``, ``ce_loss``,
+        ``kl_loss_scale``, ``accuracy``, ``num_valid_samples``,
+        ``num_valid_chunks``.
     """
 
     loss_type = LossType.TOKEN_LEVEL
@@ -1226,13 +1394,31 @@ class CrossTokenizerDistillationLossFn(LossFunction):
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute the cross-tokenizer distillation loss for one microbatch."""
         if self.gold_loss:
-            loss, kl_common, l1_uncommon, num_valid_chunks, top1_acc = (
+            kd_loss, kl_common, l1_uncommon, num_valid_chunks, top1_acc = (
                 self._compute_gold(logits, data, teacher_full_logits)
             )
+            ce_loss = self._compute_ce(logits, data, global_valid_toks)
+            # Combine the H-KL distillation loss with next-token CE, mirroring
+            # the P-KL path below (paper Eq. 7 under dynamic scaling:
+            # loss = sg(ce/kd) * kd + ce).
+            if self.dynamic_loss_scaling:
+                kd_detached = kd_loss.detach().abs()
+                ce_detached = ce_loss.detach().abs()
+                kl_scale = torch.where(
+                    kd_detached > 0,
+                    ce_detached / kd_detached,
+                    torch.ones_like(kd_detached),
+                )
+                loss = kl_scale * kd_loss + ce_loss
+            else:
+                kl_scale = torch.tensor(1.0, device=kd_loss.device, dtype=kd_loss.dtype)
+                loss = self.kl_loss_weight * kd_loss + self.ce_loss_scale * ce_loss
             metrics = {
                 "loss": loss.item(),
                 "kl_common": kl_common.item(),
                 "l1_uncommon": l1_uncommon.item(),
+                "ce_loss": ce_loss.item(),
+                "kl_loss_scale": kl_scale.item(),
                 "accuracy": top1_acc.item(),
                 "num_valid_samples": data["input_ids"].shape[0],
                 "num_valid_chunks": int(num_valid_chunks.item()),
