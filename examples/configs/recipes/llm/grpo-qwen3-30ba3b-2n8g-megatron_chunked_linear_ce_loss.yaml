@@ -48,6 +48,8 @@ policy:
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 8
     sequence_parallel: true
+    # cu13 image: cuDNN fused attention is broken; use the flash backend.
+    attention_backend: flash
     freeze_moe_router: true
     moe_router_dtype: fp64
     moe_router_load_balancing_type: none
