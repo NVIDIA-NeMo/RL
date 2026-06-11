@@ -18,7 +18,7 @@ import re
 import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Any, Iterator, Optional, TypeVar, cast
+from typing import Any, Iterable, Iterator, Optional, TypeVar, cast
 
 import ray
 import torch
@@ -396,8 +396,19 @@ class MegatronPolicyWorkerImpl(
         eval_mode: bool = False,
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
+        check_dim_skip_keys: Optional[Iterable[str]] = None,
     ) -> dict[str, Any]:
-        """Train the policy on a batch of data with a given loss function."""
+        """Train the policy on a batch of data with a given loss function.
+
+        ``check_dim_skip_keys`` is accepted for parity with the v1/v2 DTensor
+        workers (cross-tokenizer ride-along tensors whose dim 1 is not the
+        student sequence axis). Megatron doesn't run cross-tokenizer, so it
+        must be None.
+        """
+        assert check_dim_skip_keys is None, (
+            "check_dim_skip_keys is only supported by the v2 DTensor worker; "
+            "Megatron does not run cross-tokenizer distillation."
+        )
         # Note: zero_grad_buffer is called at the start of each global batch iteration
         # in the loop below, so we don't need to call it here.
         if hasattr(self.model, "inference_params"):
@@ -598,9 +609,11 @@ class MegatronPolicyWorkerImpl(
             self._disable_forward_pre_hook_until_next_train_step()
 
         if not eval_mode:
-            # take one LR step every rollout batch
-            # we need to scale the step by gbs to counteract the fact that NeMo automatically
-            # scales lr_warmup_steps by gbs during init
+            # Step LR scheduler once per train() call, not per global batch.
+            # Megatron's OptimizerParamScheduler.step takes an `increment` in
+            # samples: NeMo init scales lr_warmup_steps by gbs internally, so
+            # passing increment=gbs cancels that scaling and one tick == one
+            # train() call regardless of batch size.
             self.scheduler.step(increment=gbs)
 
         # Aggregate metrics across all microbatches
@@ -1342,11 +1355,68 @@ class MegatronPolicyWorkerImpl(
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
             torch.cuda.empty_cache()
 
+    def finish_inference(self) -> None:
+        """Offload model params to CPU after inference."""
+        self.model = self.move_model(
+            self.model, "cpu", move_params=True, move_grads=False
+        )
+        self.model.eval()
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def finish_training(self) -> None:
+        """Offload model, gradients, and optimizer to CPU after training."""
+        self.model = self.move_model(
+            self.model, "cpu", move_params=True, move_grads=True
+        )
+        self.model.eval()
+
+        if (
+            hasattr(self, "optimizer")
+            and self.optimizer is not None
+            and not self.optimizer_cpu_offload
+        ):
+            self.move_optimizer("cpu")
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def _clear_fp8_caches(self):
+        """Clear FP8 workspace caches and release fragmented GPU memory.
+
+        The main memory issue in the train→offload→refit→generate cycle is CUDA
+        allocator fragmentation, not leaked FP8 tensors. This method clears
+        per-module _fp8_workspaces buffers (scratch memory references). The
+        caller is responsible for running gc.collect() + empty_cache() once
+        all references have been dropped.
+
+        For anti-fragmentation, configure PYTORCH_CUDA_ALLOC_CONF in the recipe YAML:
+        - "max_split_size_mb:512" — fast, prevents large-block splitting
+        - "expandable_segments:True" — most effective but ~5x slower weight transfer
+        """
+        # 1. Clear Transformer Engine workspaces
+        workspace_count = 0
+        for module in self.model.modules():
+            if hasattr(module, "_fp8_workspaces"):
+                module._fp8_workspaces.clear()
+                workspace_count += 1
+
+        print(
+            f"[_clear_fp8_caches] Cleared {workspace_count} workspace modules on rank {self.rank}"
+        )
+
     @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
     def offload_before_refit(self):
-        """Offload the optimizer and buffers to the CPU."""
+        """Offload the optimizer and buffers to the CPU, keeping params on GPU for refit."""
         no_grad = torch.no_grad()
         no_grad.__enter__()
+
+        # Ensure model params are on GPU (they may have been offloaded by finish_training)
+        self.model = self.move_model(
+            self.model, "cuda", move_params=True, move_grads=False
+        )
+
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
         reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
         print(
@@ -1355,6 +1425,65 @@ class MegatronPolicyWorkerImpl(
         self.model = self.move_model(
             self.model, "cpu", move_params=False, move_grads=True
         )  # get rid of grad buffers
+
+        # When True, clear Transformer Engine's per-module _fp8_workspaces scratch
+        # buffers in offload_before_refit (before weight transfer to the inference
+        # engine).
+        if self.fp8_cfg and self.fp8_cfg.get("force_clear_fp8_caches", False):
+            self._clear_fp8_caches()
+
+        if self.cfg["megatron_cfg"].get("clear_memory_caches_before_refit", False):
+            # Clear RotaryEmbedding's @lru_cache(maxsize=32). The cache accumulates one
+            # entry per unique (max_seq_len, offset, packed_seq) seen, and each entry is
+            # a GPU tensor (the concatenated sin/cos embedding). With training + logprob
+            # runs at different sequence lengths, the cache fills quickly and the tensors
+            # anchor large CUDA segments.
+            try:
+                from megatron.core.models.common.embeddings.rotary_pos_embedding import (
+                    RotaryEmbedding,
+                )
+
+                RotaryEmbedding.forward.cache_clear()
+            except Exception:
+                pass
+
+            # Clear MoE token dispatcher persistent routing tensors.
+            #
+            # MoETokenDispatcher is a plain Python class (NOT an nn.Module), so iterating
+            # self.model.modules() never yields it. We must access it via the token_dispatcher
+            # attribute on MoELayer nn.Module objects.
+            #
+            # When recompute_mlp=True and fp8=True,
+            # transformer_layer._forward_mlp wraps self.mlp (the MoE layer) with te_checkpoint.
+            # te_checkpoint._CheckpointFunction.backward recomputes the forward with
+            # torch.enable_grad(), which causes dispatch_preprocess to store
+            #   dispatcher.probs = routing_probs   (with grad_fn, under enable_grad)
+            # This creates a reference cycle:
+            #   _CheckpointFunctionBackward → ctx → ctx.run_function=mlp
+            #   → mlp.token_dispatcher.probs → probs.grad_fn → ... → _CheckpointFunctionBackward
+            #
+            # Breaking this cycle by nulling dispatcher.probs frees BOTH:
+            #   - the routing tensors
+            #   - the te_checkpoint ctx saved tensors
+            try:
+                for module in self.model.modules():
+                    if not hasattr(module, "token_dispatcher"):
+                        continue
+                    dispatcher = module.token_dispatcher
+                    if dispatcher is None:
+                        continue
+                    for attr in (
+                        "probs",  # AllToAll + AllGather
+                        "routing_map",  # AllToAll
+                        "reversed_local_input_permutation_mapping",  # AllToAll
+                        "local_probs",  # AllGather
+                        "local_map",  # AllGather
+                    ):
+                        if isinstance(getattr(dispatcher, attr, None), torch.Tensor):
+                            setattr(dispatcher, attr, None)
+            except Exception:
+                pass
+
         torch.randn(1).cuda()  # wake up torch allocator
         if (
             hasattr(self, "optimizer")

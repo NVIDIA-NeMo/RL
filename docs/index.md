@@ -62,7 +62,7 @@ Learn about DTensor and Megatron Core training backends, their capabilities, and
 :link: about/algorithms/index
 :link-type: doc
 
-Discover supported algorithms including GRPO, SFT, DPO, RM, and on-policy distillation with detailed guides and examples.
+Discover supported algorithms including GRPO, PPO, SFT, DPO, RM, and on-policy distillation with detailed guides and examples.
 :::
 
 :::{grid-item-card} {octicon}`graph` Evaluation
@@ -133,6 +133,13 @@ Learn how to add support for new model architectures in NeMo RL.
 :link-type: doc
 
 Extend a model's context window with YaRN RoPE scaling on the Megatron backend for SFT, GRPO, and other workflows.
+:::
+
+:::{grid-item-card} {octicon}`git-compare` Cross-Tokenizer Distillation
+:link: guides/xtoken-off-policy-distillation
+:link-type: doc
+
+Off-policy distillation across mismatched tokenizers — build a (student, teacher) projection matrix and run x-token KD via CUDA-IPC teacher logits.
 :::
 
 ::::
@@ -239,6 +246,7 @@ guides/dpo.md
 guides/dapo.md
 guides/prorlv2.md
 guides/grpo.md
+guides/ppo.md
 guides/grpo-deepscaler.md
 guides/grpo-sliding-puzzle.md
 guides/grpo-audio.md
@@ -251,6 +259,7 @@ guides/async-grpo.md
 guides/quantization-aware-rl.md
 guides/eagle3-speculative-decoding.md
 guides/yarn-long-context.md
+guides/xtoken-off-policy-distillation.md
 guides/muon-optimizer.md
 guides/dtensor-tp-accuracy.md
 guides/ft-launcher-guide.md

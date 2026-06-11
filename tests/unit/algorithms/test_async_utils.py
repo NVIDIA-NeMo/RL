@@ -28,11 +28,15 @@ os.environ["RAY_TEMP_DIR"] = _temp_dir
 os.environ["RAY_TMPDIR"] = _temp_dir  # Alternative env var
 os.environ["TMPDIR"] = _temp_dir  # System temp dir
 
+import nemo_rl.algorithms.async_utils.trajectory_collector as trajectory_collector_mod
 from nemo_rl.algorithms.async_utils import (
     AsyncTrajectoryCollector,
     ReplayBuffer,
 )
-from nemo_rl.algorithms.async_utils.replay_buffer import ReplayBufferNew
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    ReplayBufferImpl,
+    ReplayBufferNew,
+)
 from nemo_rl.algorithms.grpo import (
     MasterConfig,
     add_grpo_token_loss_masks_and_generation_logprobs,
@@ -92,6 +96,179 @@ class MockGenerationInterface:
 
     def finish_generation(self):
         self.finish_calls += 1
+
+
+class TestReplayBufferImplCheckpointing:
+    """Direct implementation tests for checkpoint coverage.
+
+    Ray actor execution is not reliably attributed to source coverage, so these
+    tests cover the checkpoint/restore helpers on the local implementation class.
+    """
+
+    def _state(
+        self,
+        trajectory_versions: list[int],
+        target_weight_versions: list[int],
+        last_target_weight_already_generated: int,
+        max_size: int = 10,
+    ) -> dict:
+        return {
+            "trajectories": [
+                {"batch": {"data": f"traj_{idx}"}, "rollout_metrics": {}}
+                for idx in range(len(trajectory_versions))
+            ],
+            "trajectory_versions": trajectory_versions,
+            "target_weight_versions": target_weight_versions,
+            "last_target_weight_already_generated": (
+                last_target_weight_already_generated
+            ),
+            "max_size": max_size,
+        }
+
+    def test_local_restore_prepares_current_step_for_gap_fill(self):
+        buffer = ReplayBufferImpl(max_size=10)
+        state = self._state(
+            trajectory_versions=[0, 1, 1, 2],
+            target_weight_versions=[1, 2, 2, 3],
+            last_target_weight_already_generated=3,
+        )
+
+        buffer.load_state_dict(
+            state,
+            num_prompts_per_step=2,
+            current_training_step=2,
+        )
+
+        assert buffer.get_debug_info()["trajectory_versions"] == [1, 1, 2]
+        assert buffer.get_debug_info()["target_weight_versions"] == [2, 2, 3]
+        assert buffer.get_last_target_weight_already_generated() == 1
+        assert buffer.has_complete_batch(2, 2)
+        assert not buffer.has_complete_batch(3, 2)
+        assert buffer.get_trajectories_needed(2, 2) == 0
+        assert buffer.get_trajectories_needed(3, 2) == 1
+
+    def test_local_restore_empty_state_resets_generation_watermark(self):
+        buffer = ReplayBufferImpl(max_size=10)
+        state = self._state(
+            trajectory_versions=[],
+            target_weight_versions=[],
+            last_target_weight_already_generated=7,
+        )
+
+        buffer.load_state_dict(
+            state,
+            num_prompts_per_step=2,
+            current_training_step=5,
+        )
+
+        assert buffer.size() == 0
+        assert buffer.get_last_target_weight_already_generated() == 4
+        assert buffer.get_trajectories_needed(5, 2) == 2
+
+    def test_local_restore_removes_stale_trajectories(self):
+        buffer = ReplayBufferImpl(max_size=10)
+        state = self._state(
+            trajectory_versions=[0, 1, 4],
+            target_weight_versions=[5, 5, 5],
+            last_target_weight_already_generated=5,
+        )
+
+        buffer.load_state_dict(
+            state,
+            num_prompts_per_step=2,
+            current_training_step=5,
+            max_age_steps=1,
+        )
+
+        assert buffer.get_debug_info()["trajectory_versions"] == [4]
+        assert buffer.get_debug_info()["target_weight_versions"] == [5]
+        assert not buffer.has_complete_batch(5, 2)
+        assert buffer.get_trajectories_needed(5, 2) == 1
+
+    def test_local_restore_truncates_after_resume_cleanup(self):
+        buffer = ReplayBufferImpl(max_size=2)
+        state = self._state(
+            trajectory_versions=[0, 1, 2, 3],
+            target_weight_versions=[1, 2, 3, 4],
+            last_target_weight_already_generated=4,
+            max_size=4,
+        )
+
+        buffer.load_state_dict(
+            state,
+            num_prompts_per_step=1,
+            current_training_step=2,
+        )
+
+        assert buffer.get_debug_info()["trajectory_versions"] == [1, 2]
+        assert buffer.get_debug_info()["target_weight_versions"] == [2, 3]
+
+    def test_local_restore_without_current_step_rechecks_after_stale_removal(self):
+        buffer = ReplayBufferImpl(max_size=10)
+        state = self._state(
+            trajectory_versions=[0, 4, 4],
+            target_weight_versions=[5, 5, 6],
+            last_target_weight_already_generated=6,
+        )
+
+        buffer.load_state_dict(
+            state,
+            num_prompts_per_step=2,
+            max_age_steps=1,
+        )
+
+        assert buffer.size() == 0
+        assert buffer.get_last_target_weight_already_generated() == -1
+
+    def test_local_sample_evicts_stale_restored_trajectories(self):
+        buffer = ReplayBufferImpl(max_size=10)
+        assert (
+            buffer.add(
+                {"batch": {"data": "stale"}, "rollout_metrics": {}},
+                weight_version=0,
+                target_weight_version=5,
+            )
+            == "success"
+        )
+        assert (
+            buffer.add(
+                {"batch": {"data": "valid"}, "rollout_metrics": {}},
+                weight_version=4,
+                target_weight_version=5,
+            )
+            == "success"
+        )
+
+        sample_result = buffer.sample(
+            num_prompt_groups=1,
+            current_weight_version=5,
+            max_age_steps=1,
+        )
+
+        assert sample_result is not None
+        assert sample_result["trajectories"][0]["batch"]["data"] == "valid"
+        assert buffer.size() == 0
+
+    def test_local_load_state_dict_validates_checkpoint_shape(self):
+        buffer = ReplayBufferImpl(max_size=10)
+
+        with pytest.raises(ValueError, match="Checkpoint missing required keys"):
+            buffer.load_state_dict(
+                {
+                    "trajectories": [],
+                    "trajectory_versions": [],
+                }
+            )
+
+        with pytest.raises(ValueError, match="inconsistent replay buffer lengths"):
+            buffer.load_state_dict(
+                {
+                    "trajectories": [{"batch": {"data": "test"}}],
+                    "trajectory_versions": [0, 1],
+                    "target_weight_versions": [1],
+                    "last_target_weight_already_generated": 1,
+                }
+            )
 
 
 class TestReplayBuffer:
@@ -208,6 +385,7 @@ class TestReplayBuffer:
         # But we pushed with target_weight_version=i+1, so trajectory at i=1 has target=2
         sampled_trajectory = sample_result["trajectories"][0]
         assert sampled_trajectory["batch"]["data"] == "test1"
+        assert ray.get(buffer.get_last_target_weight_already_generated.remote()) == 2
 
         ray.kill(buffer)
 
@@ -231,11 +409,50 @@ class TestReplayBuffer:
         )
 
         assert sample_result is None  # Should return None when insufficient
+        assert ray.get(buffer.get_last_target_weight_already_generated.remote()) == -1
+
+        ray.kill(buffer)
+
+    def test_replay_buffer_watermark_advances_only_after_consumption(self):
+        """Test buffering alone does not mark a target as consumed."""
+        buffer = ReplayBuffer.remote(max_size=10)
+
+        trajectory1 = {"batch": {"data": "test1"}, "rollout_metrics": {}}
+        trajectory2 = {"batch": {"data": "test2"}, "rollout_metrics": {}}
+
+        ray.get(
+            buffer.add.remote(trajectory1, weight_version=4, target_weight_version=5)
+        )
+        assert ray.get(buffer.get_last_target_weight_already_generated.remote()) == -1
+
+        sample_result = ray.get(
+            buffer.sample.remote(
+                num_prompt_groups=2,
+                current_weight_version=5,
+                max_age_steps=1,
+            )
+        )
+        assert sample_result is None
+        assert ray.get(buffer.get_last_target_weight_already_generated.remote()) == -1
+
+        ray.get(
+            buffer.add.remote(trajectory2, weight_version=4, target_weight_version=5)
+        )
+        sample_result = ray.get(
+            buffer.sample.remote(
+                num_prompt_groups=2,
+                current_weight_version=5,
+                max_age_steps=1,
+            )
+        )
+
+        assert sample_result is not None
+        assert ray.get(buffer.get_last_target_weight_already_generated.remote()) == 5
 
         ray.kill(buffer)
 
     def test_replay_buffer_age_filtering(self):
-        """Test that old trajectories are filtered out."""
+        """Test that old trajectories are evicted."""
         buffer = ReplayBuffer.remote(max_size=10)
 
         # Push trajectories with different ages
@@ -254,18 +471,20 @@ class TestReplayBuffer:
             )
         )
 
-        # Sample with current_weight_version=3 and max_age_steps=1
-        # This should filter out the trajectory with weight_version=0 (too old)
-        with pytest.raises(
-            ValueError, match="Found .* trajectories older than min_valid_version"
-        ):
-            ray.get(
-                buffer.sample.remote(
-                    num_prompt_groups=1,
-                    current_weight_version=3,
-                    max_age_steps=1,
-                )
+        assert ray.get(buffer.size.remote()) == 2
+
+        sample_result = ray.get(
+            buffer.sample.remote(
+                num_prompt_groups=1,
+                current_weight_version=3,
+                max_age_steps=1,
             )
+        )
+
+        assert sample_result is not None
+        assert len(sample_result["trajectories"]) == 1
+        assert sample_result["trajectories"][0]["batch"]["data"] == "recent"
+        assert ray.get(buffer.size.remote()) == 0
 
         ray.kill(buffer)
 
@@ -356,6 +575,349 @@ class TestReplayBuffer:
         assert debug_info["target_weight_versions"] == []
 
         ray.kill(buffer)
+
+    def test_replay_buffer_state_dict(self):
+        """Test state_dict serialization for checkpointing."""
+        buffer = ReplayBuffer.remote(max_size=10)
+
+        trajectory1 = {"batch": {"data": "test1"}, "rollout_metrics": {"reward": 1.0}}
+        trajectory2 = {"batch": {"data": "test2"}, "rollout_metrics": {"reward": 2.0}}
+
+        ray.get(
+            buffer.add.remote(trajectory1, weight_version=5, target_weight_version=6)
+        )
+        ray.get(
+            buffer.add.remote(trajectory2, weight_version=6, target_weight_version=7)
+        )
+
+        state = ray.get(buffer.state_dict.remote())
+
+        assert state["trajectories"][0]["batch"]["data"] == "test1"
+        assert state["trajectories"][1]["batch"]["data"] == "test2"
+        assert state["trajectory_versions"] == [5, 6]
+        assert state["target_weight_versions"] == [6, 7]
+        assert state["last_target_weight_already_generated"] == -1
+        assert state["max_size"] == 10
+
+        ray.kill(buffer)
+
+    def test_replay_buffer_load_state_dict(self):
+        """Test load_state_dict restoration from checkpoint."""
+        buffer1 = ReplayBuffer.remote(max_size=10)
+
+        trajectory1 = {"batch": {"data": "test1"}, "rollout_metrics": {"reward": 1.0}}
+        trajectory2 = {"batch": {"data": "test2"}, "rollout_metrics": {"reward": 2.0}}
+
+        ray.get(
+            buffer1.add.remote(trajectory1, weight_version=5, target_weight_version=6)
+        )
+        ray.get(
+            buffer1.add.remote(trajectory2, weight_version=6, target_weight_version=7)
+        )
+
+        state = ray.get(buffer1.state_dict.remote())
+        ray.kill(buffer1)
+
+        buffer2 = ReplayBuffer.remote(max_size=10)
+        assert ray.get(buffer2.size.remote()) == 0
+
+        ray.get(buffer2.load_state_dict.remote(state))
+
+        assert ray.get(buffer2.size.remote()) == 2
+        debug_info = ray.get(buffer2.get_debug_info.remote())
+        assert debug_info["trajectory_versions"] == [5, 6]
+        assert debug_info["target_weight_versions"] == [6, 7]
+        assert ray.get(buffer2.get_last_target_weight_already_generated.remote()) == -1
+
+        ray.kill(buffer2)
+
+    def test_replay_buffer_state_dict_round_trip_sampling(self):
+        """Test save/restore preserves sampling behavior."""
+        buffer1 = ReplayBuffer.remote(max_size=10)
+
+        for i in range(3):
+            trajectory = {
+                "batch": {"data": f"test{i}"},
+                "rollout_metrics": {"reward": float(i)},
+            }
+            ray.get(
+                buffer1.add.remote(
+                    trajectory, weight_version=i, target_weight_version=i + 1
+                )
+            )
+
+        state = ray.get(buffer1.state_dict.remote())
+        ray.kill(buffer1)
+
+        buffer2 = ReplayBuffer.remote(max_size=10)
+        ray.get(buffer2.load_state_dict.remote(state))
+
+        sample_result = ray.get(
+            buffer2.sample.remote(
+                num_prompt_groups=1,
+                current_weight_version=2,
+                max_age_steps=2,
+            )
+        )
+
+        assert sample_result is not None
+        assert sample_result["trajectories"][0]["batch"]["data"] == "test1"
+
+        ray.kill(buffer2)
+
+    def test_replay_buffer_load_state_dict_max_size_change(self):
+        """Test load_state_dict truncates after resume cleanup."""
+        buffer1 = ReplayBuffer.remote(max_size=5)
+
+        for i in range(4):
+            trajectory = {
+                "batch": {"data": f"test{i}"},
+                "rollout_metrics": {"reward": float(i)},
+            }
+            ray.get(
+                buffer1.add.remote(
+                    trajectory, weight_version=i, target_weight_version=i + 1
+                )
+            )
+
+        state = ray.get(buffer1.state_dict.remote())
+        ray.kill(buffer1)
+
+        buffer2 = ReplayBuffer.remote(max_size=2)
+        ray.get(
+            buffer2.load_state_dict.remote(
+                state,
+                num_prompts_per_step=1,
+                current_training_step=2,
+            )
+        )
+
+        assert ray.get(buffer2.size.remote()) == 2
+        debug_info = ray.get(buffer2.get_debug_info.remote())
+        assert debug_info["trajectory_versions"] == [1, 2]
+        assert debug_info["target_weight_versions"] == [2, 3]
+
+        ray.kill(buffer2)
+
+    def test_replay_buffer_load_empty_state_resets_generation_watermark(self):
+        """Test empty restore can generate from the current step."""
+        buffer = ReplayBuffer.remote(max_size=10)
+
+        state = {
+            "trajectories": [],
+            "trajectory_versions": [],
+            "target_weight_versions": [],
+            "last_target_weight_already_generated": 7,
+            "max_size": 10,
+        }
+
+        ray.get(
+            buffer.load_state_dict.remote(
+                state,
+                num_prompts_per_step=2,
+                current_training_step=5,
+            )
+        )
+
+        assert ray.get(buffer.size.remote()) == 0
+        assert ray.get(buffer.get_last_target_weight_already_generated.remote()) == 4
+        assert ray.get(buffer.get_trajectories_needed.remote(5, 2)) == 2
+
+        ray.kill(buffer)
+
+    def test_replay_buffer_restore_removes_stale_trajectories(self):
+        """Test stale restored trajectories do not make a step look complete."""
+        buffer = ReplayBuffer.remote(max_size=10)
+
+        state = {
+            "trajectories": [
+                {"batch": {"data": "stale_a"}},
+                {"batch": {"data": "stale_b"}},
+                {"batch": {"data": "valid_a"}},
+            ],
+            "trajectory_versions": [0, 1, 4],
+            "target_weight_versions": [5, 5, 5],
+            "last_target_weight_already_generated": 5,
+            "max_size": 10,
+        }
+
+        ray.get(
+            buffer.load_state_dict.remote(
+                state,
+                num_prompts_per_step=2,
+                current_training_step=5,
+                max_age_steps=1,
+            )
+        )
+
+        debug_info = ray.get(buffer.get_debug_info.remote())
+        assert debug_info["trajectory_versions"] == [4]
+        assert debug_info["target_weight_versions"] == [5]
+        assert not ray.get(buffer.has_complete_batch.remote(5, 2))
+        assert ray.get(buffer.get_trajectories_needed.remote(5, 2)) == 1
+
+        ray.kill(buffer)
+
+    def test_replay_buffer_readiness_ignores_stale_trajectories(self):
+        """Test readiness helpers match sample's age-window filtering."""
+        buffer = ReplayBuffer.remote(max_size=10)
+
+        for version in [0, 1, 4]:
+            ray.get(
+                buffer.add.remote(
+                    {"batch": {"data": f"version_{version}"}},
+                    weight_version=version,
+                    target_weight_version=5,
+                )
+            )
+
+        assert ray.get(buffer.has_complete_batch.remote(5, 3))
+        assert ray.get(buffer.get_trajectories_needed.remote(5, 3)) == 0
+
+        assert not ray.get(buffer.has_complete_batch.remote(5, 3, 1))
+        assert ray.get(buffer.get_trajectories_needed.remote(5, 3, 1)) == 2
+
+        assert (
+            ray.get(
+                buffer.sample.remote(
+                    num_prompt_groups=3,
+                    current_weight_version=5,
+                    max_age_steps=1,
+                )
+            )
+            is None
+        )
+
+        ray.kill(buffer)
+
+    def test_replay_buffer_load_state_dict_missing_keys(self):
+        """Test load_state_dict raises for missing required keys."""
+        buffer = ReplayBuffer.remote(max_size=10)
+
+        incomplete_state = {
+            "trajectories": [],
+            "trajectory_versions": [],
+        }
+
+        with pytest.raises(ValueError, match="Checkpoint missing required keys"):
+            ray.get(buffer.load_state_dict.remote(incomplete_state))
+
+        ray.kill(buffer)
+
+    def test_replay_buffer_load_state_dict_inconsistent_lengths(self):
+        """Test load_state_dict raises for inconsistent parallel lists."""
+        buffer = ReplayBuffer.remote(max_size=10)
+
+        bad_state = {
+            "trajectories": [{"batch": {"data": "test"}}],
+            "trajectory_versions": [0, 1],
+            "target_weight_versions": [1],
+            "last_target_weight_already_generated": 1,
+        }
+
+        with pytest.raises(ValueError, match="inconsistent replay buffer lengths"):
+            ray.get(buffer.load_state_dict.remote(bad_state))
+
+        ray.kill(buffer)
+
+    def test_replay_buffer_restore_for_training_step_gap_fill_accounting(self):
+        """Test resume cleanup keeps incomplete future targets for gap filling."""
+        buffer = ReplayBuffer.remote(max_size=10)
+
+        state = {
+            "trajectories": [
+                {"batch": {"data": "past"}},
+                {"batch": {"data": "step2_a"}},
+                {"batch": {"data": "step2_b"}},
+                {"batch": {"data": "step3_a"}},
+            ],
+            "trajectory_versions": [0, 1, 1, 2],
+            "target_weight_versions": [1, 2, 2, 3],
+            "last_target_weight_already_generated": 3,
+            "max_size": 10,
+        }
+
+        ray.get(
+            buffer.load_state_dict.remote(
+                state,
+                num_prompts_per_step=2,
+                current_training_step=2,
+            )
+        )
+
+        debug_info = ray.get(buffer.get_debug_info.remote())
+        assert debug_info["trajectory_versions"] == [1, 1, 2]
+        assert debug_info["target_weight_versions"] == [2, 2, 3]
+        assert ray.get(buffer.has_complete_batch.remote(2, 2))
+        assert not ray.get(buffer.has_complete_batch.remote(3, 2))
+        assert ray.get(buffer.get_trajectories_needed.remote(2, 2)) == 0
+        assert ray.get(buffer.get_trajectories_needed.remote(3, 2)) == 1
+        assert ray.get(buffer.get_last_target_weight_already_generated.remote()) == 1
+
+        ray.kill(buffer)
+
+    def test_replay_buffer_remove_incomplete_resets_watermark_before_first_remaining_target(
+        self,
+    ):
+        """Test fallback cleanup does not skip gaps after removing partial targets."""
+        buffer = ReplayBuffer.remote(max_size=10)
+
+        state = {
+            "trajectories": [
+                {"batch": {"data": "step5_a"}},
+                {"batch": {"data": "step5_b"}},
+                {"batch": {"data": "step6_a"}},
+                {"batch": {"data": "step8_a"}},
+                {"batch": {"data": "step8_b"}},
+            ],
+            "trajectory_versions": [4, 4, 5, 7, 7],
+            "target_weight_versions": [5, 5, 6, 8, 8],
+            "last_target_weight_already_generated": 8,
+            "max_size": 10,
+        }
+
+        ray.get(buffer.load_state_dict.remote(state, num_prompts_per_step=2))
+
+        debug_info = ray.get(buffer.get_debug_info.remote())
+        assert debug_info["target_weight_versions"] == [5, 5, 8, 8]
+        assert ray.get(buffer.get_last_target_weight_already_generated.remote()) == 4
+
+        ray.kill(buffer)
+
+    def test_replay_buffer_checkpoint_with_torch_save(self):
+        """Test that state_dict can be saved and loaded with torch.save/load."""
+        buffer1 = ReplayBuffer.remote(max_size=10)
+
+        trajectory = {
+            "batch": {
+                "token_ids": torch.tensor([1, 2, 3]),
+                "rewards": torch.tensor([0.5]),
+            },
+            "rollout_metrics": {"reward": 1.0, "length": 10},
+            "timestamp": 12345.0,
+        }
+        ray.get(
+            buffer1.add.remote(trajectory, weight_version=5, target_weight_version=6)
+        )
+
+        state = ray.get(buffer1.state_dict.remote())
+        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
+            torch.save(state, f.name)
+            checkpoint_path = f.name
+
+        ray.kill(buffer1)
+
+        loaded_state = torch.load(checkpoint_path, weights_only=False)
+        buffer2 = ReplayBuffer.remote(max_size=10)
+        ray.get(buffer2.load_state_dict.remote(loaded_state))
+
+        assert ray.get(buffer2.size.remote()) == 1
+        debug_info = ray.get(buffer2.get_debug_info.remote())
+        assert debug_info["trajectory_versions"] == [5]
+        assert debug_info["target_weight_versions"] == [6]
+
+        os.unlink(checkpoint_path)
+        ray.kill(buffer2)
 
 
 class TestReplayBufferNew:
@@ -514,6 +1076,25 @@ class TestReplayBufferNew:
 
 class TestAsyncTrajectoryCollector:
     """Test cases for AsyncTrajectoryCollector."""
+
+    def create_local_collector(self, replay_buffer=None):
+        """Create a non-Ray collector instance for unit-testing local state."""
+        collector_cls = AsyncTrajectoryCollector.__ray_metadata__.modified_class
+        mock_generation = MockGenerationInterface()
+        mock_tokenizer = mock.MagicMock()
+        task_to_env = {}
+        master_config = self.create_mock_config()
+        if replay_buffer is None:
+            replay_buffer = mock.MagicMock()
+
+        return collector_cls(
+            policy_generation=mock_generation,
+            tokenizer=mock_tokenizer,
+            task_to_env=task_to_env,
+            master_config=master_config,
+            replay_buffer=replay_buffer,
+            start_step=0,
+        )
 
     def create_mock_config(self) -> MasterConfig:
         """Create a mock master config for testing."""
@@ -677,6 +1258,155 @@ class TestAsyncTrajectoryCollector:
         ray.kill(collector)
         ray.kill(buffer)
         ray.kill(mock_env)
+
+    def test_maybe_release_target_waits_for_spawning_to_close(self):
+        """Test fast workers do not release a target while spawning is open."""
+        collector = self.create_local_collector()
+        target_weight = 5
+
+        collector._generating_targets.add(target_weight)
+        collector._spawning_targets.add(target_weight)
+        collector._spawned_per_target[target_weight] = 1
+        collector._completed_per_target[target_weight] = 1
+        collector._buffered_per_target[target_weight] = 1
+
+        collector._maybe_release_target(target_weight)
+
+        assert target_weight in collector._generating_targets
+        assert collector._spawned_per_target[target_weight] == 1
+        assert collector._completed_per_target[target_weight] == 1
+        assert collector._buffered_per_target[target_weight] == 1
+
+        collector._spawning_targets.remove(target_weight)
+        collector._maybe_release_target(target_weight)
+
+        assert target_weight not in collector._generating_targets
+        assert target_weight not in collector._spawned_per_target
+        assert target_weight not in collector._completed_per_target
+        assert target_weight not in collector._buffered_per_target
+
+    def test_process_batch_releases_target_when_worker_start_fails(self, monkeypatch):
+        """Test start failures do not leave a target reserved forever."""
+
+        class RemoteMethod:
+            def __init__(self, value):
+                self.value = value
+
+            def remote(self, *args, **kwargs):
+                return self.value
+
+        class FakeReplayBuffer:
+            def __init__(self):
+                self.get_trajectories_needed = RemoteMethod(1)
+
+        class FakeBatch:
+            size = 1
+
+            def slice(self, start, end):
+                return self
+
+            def repeat_interleave(self, repeats):
+                return self
+
+        class FailingThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                raise RuntimeError("thread start failed")
+
+            def is_alive(self):
+                return False
+
+        target_weight = 5
+        collector = self.create_local_collector(replay_buffer=FakeReplayBuffer())
+        collector.running = True
+
+        def reserve_target(generation_weight_version):
+            collector._generating_targets.add(target_weight)
+            return target_weight
+
+        collector._get_next_target_for_generation = reserve_target
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
+        monkeypatch.setattr(
+            trajectory_collector_mod._threading,
+            "Thread",
+            FailingThread,
+        )
+
+        collector._process_batch(FakeBatch())
+
+        assert target_weight not in collector._generating_targets
+        assert target_weight not in collector._spawning_targets
+        assert target_weight not in collector._spawned_per_target
+        assert target_weight not in collector._completed_per_target
+        assert target_weight not in collector._buffered_per_target
+
+    def test_process_batch_gap_fill_spawns_only_needed(self, monkeypatch):
+        """Gap-fill generates only the trajectories still needed for a target."""
+
+        class RemoteMethod:
+            def __init__(self, value):
+                self.value = value
+
+            def remote(self, *args, **kwargs):
+                return self.value
+
+        class FakeReplayBuffer:
+            def __init__(self):
+                # Batch has 2 prompts, but only 1 more trajectory is needed.
+                self.get_trajectories_needed = RemoteMethod(1)
+
+        class FakeBatch:
+            size = 2
+
+            def slice(self, start, end):
+                return self
+
+            def repeat_interleave(self, repeats):
+                return self
+
+        started = []
+
+        class RecordingThread:
+            def __init__(self, *args, **kwargs):
+                self._args = kwargs.get("args", ())
+
+            def start(self):
+                started.append(self._args)
+                # Simulate the worker finishing and recording completion.
+                target = self._args[2]
+                with collector._counter_lock:
+                    collector._completed_per_target[target] = (
+                        collector._completed_per_target.get(target, 0) + 1
+                    )
+
+            def is_alive(self):
+                return False
+
+        target_weight = 7
+        collector = self.create_local_collector(replay_buffer=FakeReplayBuffer())
+        collector.running = True
+
+        def reserve_target(generation_weight_version):
+            collector._generating_targets.add(target_weight)
+            return target_weight
+
+        collector._get_next_target_for_generation = reserve_target
+        monkeypatch.setattr(trajectory_collector_mod.ray, "get", lambda value: value)
+        monkeypatch.setattr(
+            trajectory_collector_mod._threading, "Thread", RecordingThread
+        )
+
+        collector._process_batch(FakeBatch())
+
+        # Only one worker spawned even though the batch holds 2 prompts.
+        assert len(started) == 1
+        # Reservation released after spawning closed and the worker completed.
+        assert target_weight not in collector._generating_targets
+        assert target_weight not in collector._spawning_targets
+        assert target_weight not in collector._spawned_per_target
+        assert target_weight not in collector._completed_per_target
 
     def test_dataloader_state_retrieval(self):
         """Test getting dataloader state for checkpointing."""
