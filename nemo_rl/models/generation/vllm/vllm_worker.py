@@ -106,7 +106,10 @@ class BaseVllmGenerationWorker:
             init_kwargs["seed"] = seed
             # Need to give each DP group its own vllm cache to address:
             # https://github.com/vllm-project/vllm/issues/18851
-            env_vars["VLLM_CACHE_ROOT"] = os.path.expanduser(f"~/.cache/vllm_{seed}")
+            env_vars["VLLM_CACHE_ROOT"] = (
+                os.environ.get("VLLM_CACHE_ROOT", os.path.expanduser("~/.cache/vllm"))
+                + f"_{seed}"
+            )
 
             # Give each vLLM engine a deterministic starting port for TP/DP
             # rendezvous.  vLLM's _get_open_port() reads VLLM_PORT and
@@ -835,7 +838,8 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         assert self.llm is not None, (
             "Attempting to generate with either an uninitialized vLLM or non-model-owner"
         )
-        outputs = self.llm.generate(prompts, sampling_params)
+        use_tqdm = self.cfg["vllm_cfg"].get("use_tqdm", True)
+        outputs = self.llm.generate(prompts, sampling_params, use_tqdm=use_tqdm)
 
         # Process the outputs - but preserve the original input padding structure
         output_ids_list = []
@@ -971,7 +975,8 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         assert self.llm is not None, (
             "Attempting to generate with either an uninitialized vLLM or non-model-owner"
         )
-        outputs = self.llm.generate(data["prompts"], sampling_params)
+        use_tqdm = self.cfg["vllm_cfg"].get("use_tqdm", True)
+        outputs = self.llm.generate(data["prompts"], sampling_params, use_tqdm=use_tqdm)
         texts = [output.outputs[0].text for output in outputs]
 
         # Convert to BatchedDataDict
