@@ -557,7 +557,7 @@ def setup(
         # Block until the policy worker's __init__ completes and offload to
         # CPU, freeing GPU for value model initialization. Policy will be
         # reloaded before the vLLM refit step below.
-        policy.finish_training()
+        policy.offload_after_refit()
         worker_init_timing_metrics["policy_init_time_s"] = policy_time
 
         print("  ⚙️  Initializing value model for GAE...", flush=True)
@@ -1010,9 +1010,12 @@ def ppo_train(
                 )
                 with timer.time("prepare_for_generation/total"):
                     if NEED_REFIT and POLICY_GENERATION_STALE:
+                        # Ensure value is offloaded and policy params are on GPU before refit.
+                        value_model.finish_training()
+                        policy.prepare_for_lp_inference()
+
                         if sync_kv_scales and kv_scales_cache is None:
                             print("▶ Computing KV cache scales...", flush=True)
-                            policy.prepare_for_lp_inference()
                             calib_flat, calib_input_lengths = (
                                 batched_message_log_to_flat_message(
                                     repeated_batch["message_log"],
@@ -1303,7 +1306,8 @@ def ppo_train(
                                 loss_fn,
                                 timer=timer,
                             )
-                            policy.finish_training()
+                            if step < ppo_epochs - 1:
+                                policy.offload_after_refit()
 
                     if train_results is not None:
                         print(
@@ -1568,7 +1572,7 @@ def ppo_train(
                                 ),
                                 checkpointing_cfg=master_config.checkpointing,
                             )
-                            policy.finish_training()
+                            policy.offload_after_refit()
                         else:
                             print(
                                 f"Skipping policy checkpoint (critic warmup: "
