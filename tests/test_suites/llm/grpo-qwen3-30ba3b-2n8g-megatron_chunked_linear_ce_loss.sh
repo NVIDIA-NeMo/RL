@@ -14,7 +14,10 @@ exit_if_max_steps_reached
 
 # Run the experiment
 cd $PROJECT_ROOT
-uv run examples/run_grpo.py \
+# Use NRL_PYTHON (the image's /opt/nemo_rl_venv/bin/python, set by the slurm)
+# instead of `uv run`, which can mis-resolve to a stale workspace/.venv env and
+# cause a Ray version mismatch with the cluster. Mirrors the cispo launch SH.
+${NRL_PYTHON:-python} examples/run_grpo.py \
     --config $CONFIG_PATH \
     grpo.max_num_steps=$MAX_STEPS \
     logger.log_dir=$LOG_DIR \
@@ -29,11 +32,11 @@ uv run examples/run_grpo.py \
     2>&1 | tee $RUN_LOG
 
 # Convert tensorboard logs to json
-uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
+${NRL_PYTHON:-python} tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
-    uv run tests/check_metrics.py $JSON_METRICS \
+    ${NRL_PYTHON:-python} tests/check_metrics.py $JSON_METRICS \
         'median(data["train/token_mult_prob_error"]) < 1.1' \
         "data[\"train/token_mult_prob_error\"][\"$MAX_STEPS\"] < 1.1" \
         "data[\"train/reward\"][\"$MAX_STEPS\"] > 0.1"
