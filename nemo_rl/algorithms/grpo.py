@@ -821,17 +821,16 @@ def setup(
             )
             ray.get(futures_train_pp + futures_gen_pp)
 
-        # The gen backend owns its MoE-expert fusion layout (e.g. vLLM's w13/w2);
-        # the train-side builder applies whatever fusion function it's handed,
-        # staying backend-agnostic.  (KV-head replication is handled by routing
-        # QKV to the misc path when num_query_groups < max(train_tp, gen_tp).)
-        fuse_expert_param_in_metadata_fn = policy_generation.expert_fusion_fn()
+        # The train-side builder groups per-expert MoE params into
+        # backend-agnostic grouped HF entries (gate_proj/up_proj/down_proj); the
+        # gen backend maps those into its own fused layout (e.g. vLLM's w13/w2)
+        # gen-side.  (KV-head replication is handled by routing QKV to the misc
+        # path when num_query_groups < max(train_tp, gen_tp).)
         nccl_xfer_refit_info = policy.prepare_nccl_xfer_refit_info(
             train_parallelism,
             gen_parallelism,
             train_world_size,
             inference_world_size,
-            fuse_expert_param_in_metadata_fn=fuse_expert_param_in_metadata_fn,
         )
         policy_generation.prepare_nccl_xfer_refit_info(nccl_xfer_refit_info)
     else:

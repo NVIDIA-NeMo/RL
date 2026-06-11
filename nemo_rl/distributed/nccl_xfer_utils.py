@@ -28,7 +28,7 @@ live in ``nemo_rl/distributed/xferdtensor.py`` — import both from there.
 
 import re
 from collections import OrderedDict
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 import torch
 from torch.distributed._tensor import Shard
@@ -73,8 +73,10 @@ COLUMN_PARALLEL_SUFFIXES = [
     # DeepSeek MLA up-projections (column-parallel on output: num_heads * head_dim)
     "q_b_proj.weight",
     "kv_b_proj.weight",
-    # Fused MoE expert params (vLLM naming: gate+up fused)
-    "w13_weight",
+    # NOTE: grouped MoE expert gate_proj/up_proj are column-parallel too; they
+    # match the gate_proj.weight/up_proj.weight suffixes above via
+    # _get_expert_tp_shard_dim (which, unlike get_tp_shard_dim, does not skip
+    # .experts. names).  The vLLM-specific w13_weight fusion happens gen-side.
 ]
 
 # DeepSeek MLA down-projections.  vLLM creates these as ReplicatedLinear (or
@@ -86,9 +88,7 @@ COLUMN_PARALLEL_SUFFIXES = [
 # Row-parallel suffixes: TP shards along dim 1 (input dimension).
 ROW_PARALLEL_SUFFIXES = [
     "o_proj.weight",
-    "down_proj.weight",
-    # Fused MoE expert param (vLLM naming: down proj)
-    "w2_weight",
+    "down_proj.weight",  # also grouped MoE expert down_proj (row-parallel, gen-side -> w2_weight)
     # NemotronH Mamba2 output projection
     "out_proj.weight",
 ]
@@ -374,97 +374,64 @@ _INDIVIDUAL_EXPERT_RE = re.compile(
 )
 
 
-def vllm_fuse_expert_params_in_metadata(
+def group_expert_params_in_metadata(
     state_dict_metadata: dict[str, dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
-    """Fuse individual MoE expert params into combined w13/w2 entries.
+    """Group per-expert MoE params into backend-agnostic grouped HF entries.
 
-    vLLM-specific: the ``w13_weight`` / ``w2_weight`` fused names and the
-    gate+up concat layout are vLLM conventions.  This is passed into the
-    backend-agnostic ``build_nccl_xfer_refit_info`` as
-    ``fuse_expert_param_in_metadata_fn`` (a different gen backend would supply
-    its own fusion); the builder itself never hardcodes a backend's rule.
+    For each MoE projection, stack every expert's HF param into ONE entry along
+    a new leading expert dim, keeping the *HF* projection name (no backend
+    fusion, no w13/w2, no gen-TP / interleave):
+      - gate_proj : [E, intermediate, hidden]
+      - up_proj   : [E, intermediate, hidden]
+      - down_proj : [E, hidden, intermediate]
+    Each grouped entry is tagged ``grouped_expert_proj`` ("gate_proj" /
+    "up_proj" / "down_proj").  The train side stacks the matching per-expert
+    tensors (``_group_experts``); the gen backend maps these grouped HF params
+    into ITS fused layout entirely on the gen side (for vLLM: gate/up ->
+    w13_weight halves, down -> w2_weight; see
+    ``vllm_backend._build_hf_to_vllm_mapping``).
 
+    Grouping is universal — every gen backend needs experts grouped for an
+    efficient reshard (per-expert would be hundreds of tiny collectives) — so
+    the builder applies this unconditionally; only the gen-side fusion (the
+    actual ``w13``/``w2`` names + gate/up interleave) is backend-specific and
+    lives in the gen backend.
 
-    Converts individual HF expert params (one per expert) into vLLM-style
-    fused params (vLLM names them w13_weight / w2_weight; the metadata tags
-    them with the semantic role up_proj / down_proj + a ``gated`` flag):
-    - gated SwiGLU (gate_proj + up_proj) → w13_weight: [E, 2*intermediate, hidden]
-    - non-gated ReLU^2 (up_proj only)    → w13_weight: [E, intermediate, hidden]
-    - down_proj                          → w2_weight:  [E, hidden, intermediate]
-
-    The input ``state_dict_metadata`` is required to be EP-gathered, i.e. it
-    must already enumerate every expert globally (not just this rank's local
-    subset).  Both backends meet this invariant: Megatron's metadata pipeline
-    routes through ``export_hf_weights`` which does the EP all-gather, and
-    DTensor doesn't use EP at all.
-
-    Non-expert params are passed through unchanged.
+    The input ``state_dict_metadata`` must be EP-gathered (enumerate every
+    expert globally).  Non-expert params are passed through unchanged.
     """
     # Group individual expert params by (prefix, proj_type)
     expert_groups: dict[tuple[str, str], list[tuple[str, dict]]] = {}
-    fused_metadata: dict[str, dict[str, Any]] = OrderedDict()
+    grouped_metadata: dict[str, dict[str, Any]] = OrderedDict()
 
     for name, meta in state_dict_metadata.items():
         m = _INDIVIDUAL_EXPERT_RE.match(name)
         if m:
             prefix = m.group(1)  # e.g., "model.layers.0.mlp.experts"
             proj = m.group(3)  # "gate_proj", "up_proj", "down_proj"
-            key = (prefix, proj)
-            expert_groups.setdefault(key, []).append((name, meta))
+            expert_groups.setdefault((prefix, proj), []).append((name, meta))
         else:
-            fused_metadata[name] = meta
+            grouped_metadata[name] = meta
 
     if not expert_groups:
         return state_dict_metadata
 
-    # Build fused entries from expert groups
-    # Group gate_proj + up_proj → w13_weight, down_proj → w2_weight
-    w13_groups: dict[str, dict] = {}  # prefix → {gate: entries, up: entries}
-    w2_groups: dict[str, list] = {}  # prefix → entries
-
+    # Stack each (prefix, proj) group into one [E, *per_expert_shape] grouped
+    # HF entry.  Prepending the expert dim is layout-agnostic — it works for
+    # gate/up ([inter, hidden] -> [E, inter, hidden]) and down ([hidden, inter]
+    # -> [E, hidden, inter]) uniformly.  The reshard ships it Shard(0) on EP
+    # (src) -> Shard(intermediate-axis) on gen TP (dst); see get_placements.
     for (prefix, proj), entries in expert_groups.items():
-        if proj in ("gate_proj", "up_proj"):
-            w13_groups.setdefault(prefix, {})
-            w13_groups[prefix][proj] = entries
-        else:  # down_proj
-            w2_groups[prefix] = entries
-
-    # Input projection -> vLLM's w13_weight slot.  The fused *name* is always
-    # w13_weight (vLLM's FusedMoE convention), but the tag carries the semantic
-    # role ("up_proj") plus an explicit ``gated`` flag for the layout:
-    #  * gated SwiGLU (gate_proj + up_proj): w13 = [E, 2*intermediate, hidden].
-    #  * non-gated ReLU^2 (NemotronH, SharedFusedMoE(is_act_and_mul=False)):
-    #    up_proj only, w13 = [E, intermediate, hidden] (no gate half).
-    for prefix, projs in w13_groups.items():
-        gate_entries = projs.get("gate_proj", [])
-        up_entries = projs.get("up_proj", [])
-        gated = bool(gate_entries)
-        ref_entries = gate_entries if gated else up_entries
-        if not ref_entries:
-            continue
-        num_experts_global = len(ref_entries)
-        intermediate_size, hidden_size = ref_entries[0][1]["shape"]
-        dim0 = (2 if gated else 1) * intermediate_size
-        fused_metadata[f"{prefix}.w13_weight"] = {
-            "shape": [num_experts_global, dim0, hidden_size],
-            "dtype": ref_entries[0][1]["dtype"],
-            "fused_expert_param_type": "up_proj",
-            "gated": gated,
-        }
-
-    # Output projection -> vLLM's w2_weight slot: [E, hidden, intermediate].
-    for prefix, entries in w2_groups.items():
         num_experts_global = len(entries)
-        hidden_size, intermediate_size = entries[0][1]["shape"]
-        fused_metadata[f"{prefix}.w2_weight"] = {
-            "shape": [num_experts_global, hidden_size, intermediate_size],
+        per_expert_shape = list(entries[0][1]["shape"])
+        grouped_metadata[f"{prefix}.{proj}.weight"] = {
+            "shape": [num_experts_global, *per_expert_shape],
             "dtype": entries[0][1]["dtype"],
-            "fused_expert_param_type": "down_proj",
-            "gated": False,
+            "grouped_expert_proj": proj,
         }
 
-    return fused_metadata
+    return grouped_metadata
 
 
 # =========================================================================
@@ -658,7 +625,6 @@ def build_nccl_xfer_refit_info(
     train_world_size: int,
     gen_world_size: int,
     layer_to_pp_stage: Optional[dict[str, int]] = None,
-    fuse_expert_param_in_metadata_fn: Optional[Callable] = None,
 ) -> dict[str, Any]:
     """Build per-layer parameter info for nccl_xfer-based refit.
 
@@ -674,11 +640,6 @@ def build_nccl_xfer_refit_info(
         layer_to_pp_stage: optional mapping from layer name to PP stage index.
             When provided (PP>1), per-stage meshes are built so each PP stage's
             train ranks + all gen ranks form an independent sub-group.
-        fuse_expert_param_in_metadata_fn: optional backend-specific function that
-            fuses individual MoE expert params into the gen backend's combined
-            layout (e.g. ``vllm_fuse_expert_params_in_metadata`` → w13/w2).
-            ``None`` means no fusion.  Supplied by the caller so this builder
-            doesn't hardcode a backend's MoE naming/fusion rules.
 
     Returns:
         ``{"layer_names": [...], "per_layer_params": {layer: [param_info, ...]},
@@ -687,11 +648,11 @@ def build_nccl_xfer_refit_info(
     # state_dict_metadata is already pre-filtered to exclude misc params
     # (caller separates misc into a parallel dict for the
     # packed_broadcast-based misc refit path).
-    # Fuse MoE expert params via the caller-supplied, backend-specific function
-    # (e.g. vLLM's vllm_fuse_expert_params_in_metadata).  None → no fusion, so
-    # this builder stays agnostic to any gen backend's MoE layout.
-    if fuse_expert_param_in_metadata_fn is not None:
-        state_dict_metadata = fuse_expert_param_in_metadata_fn(state_dict_metadata)
+    # Group per-expert MoE params into backend-agnostic grouped HF entries
+    # (gate_proj/up_proj/down_proj, each [E, ...]).  Grouping is universal; the
+    # gen backend maps these into its own fused layout (w13/w2) gen-side.  No-op
+    # for dense (non-MoE) models (early return when there are no expert params).
+    state_dict_metadata = group_expert_params_in_metadata(state_dict_metadata)
 
     pp_size = train_parallelism.get("pp_size", 1)
     tp_size = train_parallelism.get("tp_size", 1)
@@ -796,11 +757,12 @@ def build_nccl_xfer_refit_info(
                 "dst_placements": get_placements(name, dst_dim_map, ndim),
             }
 
-        # Propagate fused-expert role (up_proj/down_proj) + gating for the
-        # train-side expert stacking in _fuse_one_moe_param.
-        if "fused_expert_param_type" in meta:
-            info["fused_expert_param_type"] = meta["fused_expert_param_type"]
-            info["gated"] = meta.get("gated", False)
+        # Propagate the grouped-expert projection tag (gate_proj/up_proj/
+        # down_proj) so the train side stacks the matching per-expert tensors
+        # (_group_experts) and the gen backend maps the grouped HF param into
+        # its own fused layout (w13/w2).
+        if "grouped_expert_proj" in meta:
+            info["grouped_expert_proj"] = meta["grouped_expert_proj"]
 
         per_layer_params.setdefault(layer, []).append(info)
 

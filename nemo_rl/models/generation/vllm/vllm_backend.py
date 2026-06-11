@@ -390,11 +390,24 @@ class VllmInternalWorkerExtension:
         vllm_params = dict(self.model_runner.model.named_parameters())
         mapping = {}
 
-        # Collect all HF param names and their global shapes from refit_info
+        # Collect all HF param names + global shapes from refit_info, plus the
+        # grouped-expert tag (gate_proj/up_proj/down_proj) for MoE params.
         hf_shapes = {}
+        hf_grouped = {}  # hf_name -> "gate_proj"|"up_proj"|"down_proj" (MoE only)
         for layer_name in refit_info["layer_names"]:
             for p in refit_info["per_layer_params"][layer_name]:
                 hf_shapes[p["name"]] = tuple(p["global_shape"])
+                if p.get("grouped_expert_proj"):
+                    hf_grouped[p["name"]] = p["grouped_expert_proj"]
+
+        # Per-prefix gate presence: a grouped-MoE layer is gated SwiGLU iff it
+        # has a gate_proj group (else non-gated ReLU^2 = up_proj only).  Decides
+        # whether up_proj maps to the whole w13 (non-gated) or its second half.
+        has_gate = {
+            name.rsplit(".gate_proj.weight", 1)[0]
+            for name, proj in hf_grouped.items()
+            if proj == "gate_proj"
+        }
 
         # NemotronH (nemotron_h): HF param names use the ``backbone.*`` prefix
         # while vLLM uses ``model.*`` (e.g. ``backbone.layers.N.mixer.experts.
@@ -429,7 +442,44 @@ class VllmInternalWorkerExtension:
         ]
 
         for hf_name in hf_shapes:
-            # 1) Direct match (includes fused MoE expert params: w13_weight, w2_weight)
+            # 0) Grouped MoE expert params (gate_proj/up_proj/down_proj, each
+            #    [E, ...]).  vLLM fuses them as w13_weight (gate||up on the
+            #    intermediate axis) and w2_weight (down).  Dispatch on the
+            #    grouped_expert_proj TAG, NOT the suffix, so dense gate_proj/
+            #    up_proj (-> gate_up_proj, rule below) don't collide.  The
+            #    received Shard(1)/Shard(2) shard is placed into the right
+            #    w13/w2 region by get_dst_dtensor (+ its post_refit_hook for the
+            #    gated w13 halves).
+            grouped_proj = hf_grouped.get(hf_name)
+            if grouped_proj is not None:
+                expert_prefix = hf_name.rsplit(f".{grouped_proj}.weight", 1)[0]
+                vllm_suffix = (
+                    "w2_weight" if grouped_proj == "down_proj" else "w13_weight"
+                )
+                vllm_name = _to_vllm_name(f"{expert_prefix}.{vllm_suffix}")
+                if vllm_name not in vllm_params:
+                    mapping[hf_name] = (None, None)
+                    print(
+                        f"[WARN] _build_hf_to_vllm_mapping: no vLLM expert param "
+                        f"for grouped '{hf_name}'",
+                        flush=True,
+                    )
+                    continue
+                vllm_param = vllm_params[vllm_name]
+                if grouped_proj == "down_proj" or expert_prefix not in has_gate:
+                    # down -> whole w2; non-gated ReLU^2 up -> whole w13.  The
+                    # received shard IS the local vLLM param (gen TP shards the
+                    # intermediate axis), so this is a direct copy, no sub-slice.
+                    mapping[hf_name] = (vllm_param, None)
+                else:
+                    # gated SwiGLU: w13 = [E, 2P, hidden]; gate -> [:, :P, :],
+                    # up -> [:, P:2P, :] along the intermediate axis (dim 1).
+                    P = vllm_param.shape[1] // 2
+                    sl = slice(0, P) if grouped_proj == "gate_proj" else slice(P, 2 * P)
+                    mapping[hf_name] = (vllm_param, (slice(None), sl, slice(None)))
+                continue
+
+            # 1) Direct match (1:1 HF -> vLLM name)
             vllm_direct = _to_vllm_name(hf_name)
             if vllm_direct in vllm_params:
                 mapping[hf_name] = (vllm_params[vllm_direct], None)
@@ -487,9 +537,14 @@ class VllmInternalWorkerExtension:
                             local_offset = sum(local_sizes[:i])
                             local_size = local_sizes[i]
 
+                            # merged_param_slice is a multi-dim index TUPLE (not a
+                            # bare slice): get_dst_dtensor indexes the vLLM param as
+                            # ``vllm_param.data[merged_param_slice]``.  Dim-0 concat
+                            # merges (qkv_proj, gate_up_proj, fused_qkv_a_proj) use a
+                            # 1-tuple; grouped-expert w13 sub-slices use a dim-1 tuple.
                             mapping[hf_name] = (
                                 vllm_param,
-                                slice(local_offset, local_offset + local_size),
+                                (slice(local_offset, local_offset + local_size),),
                             )
                             matched = True
                         break
