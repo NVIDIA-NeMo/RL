@@ -244,9 +244,10 @@ class SyncRolloutActor:
                 max_rollout_turns=None,
                 generation_config=cfg.policy["generation"],
                 effort_config=EffortLevelsConfig.model_validate(
-                    cfg.env["nemo_gym"]["effort_levels"]
+                    cfg.env["nemo_gym"].get("effort_levels")
                 )
-                if cfg.env.get("nemo_gym", {}).get("effort_levels")
+                if "nemo_gym" in cfg.env
+                and cfg.env["nemo_gym"].get("effort_levels") is not None
                 else None,
             )
             final_batch, rollout_metrics = r.final_batch, r.rollout_metrics

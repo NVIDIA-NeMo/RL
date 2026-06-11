@@ -1261,7 +1261,9 @@ def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
 
 def _get_effort_config(master_config: MasterConfig) -> Optional[EffortLevelsConfig]:
     """Return the effort-levels reward-shaping config from env.nemo_gym, if set."""
-    effort_dict = master_config.env.get("nemo_gym", {}).get("effort_levels")
+    if "nemo_gym" not in master_config.env:
+        return None
+    effort_dict = master_config.env["nemo_gym"].get("effort_levels")
     if effort_dict is None:
         return None
     return EffortLevelsConfig.model_validate(effort_dict)
