@@ -1241,6 +1241,8 @@ def test_async_rollout_manager_matches_original(
     def _translate_legacy_key(key: str) -> str:
         if key == "avg_turns_per_sample":
             return "turns_per_sample/mean"
+        if key == "max_turns_reached_rate":
+            return key
         for prefix, suffix in (("mean_", "/mean"), ("max_", "/max"), ("min_", "/min")):
             if key.startswith(prefix):
                 return f"{key[len(prefix) :]}{suffix}"
