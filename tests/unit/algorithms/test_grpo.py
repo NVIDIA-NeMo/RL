@@ -582,6 +582,20 @@ class StubAsyncTrajectoryCollector:
         return mock
 
     @property
+    def prepare_for_refit(self):
+        """Prepare for refit - returns a remote-callable mock"""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value=MagicMock())
+        return mock
+
+    @property
+    def resume_after_refit(self):
+        """Resume after refit - returns a remote-callable mock"""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value=MagicMock())
+        return mock
+
+    @property
     def stop(self):
         """Stop collection - returns a remote-callable mock"""
         mock = MagicMock()

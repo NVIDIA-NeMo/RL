@@ -104,6 +104,8 @@ def create_megatron_test_config(
             "stop_token_ids": None,
             "stop_strings": None,
             "mcore_generation_config": {
+                "async_engine": False,
+                "max_model_len": 1024,
                 "buffer_size_gb": 2,
                 "num_cuda_graphs": 16,
                 "block_size_tokens": 1024,

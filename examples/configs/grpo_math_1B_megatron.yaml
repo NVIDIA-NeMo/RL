@@ -116,8 +116,6 @@ policy:
     moe_shared_expert_overlap: false
     #gives ~20% training perf speedup with sequence packing
     apply_rope_fusion: True
-    use_te_rng_tracker: true
-    inference_rng_tracker: true
 
     peft:
       enabled: false
