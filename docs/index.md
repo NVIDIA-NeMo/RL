@@ -252,6 +252,7 @@ guides/sft.md
 guides/dpo.md
 guides/dapo.md
 guides/lora.md
+guides/cispo.md
 guides/prorlv2.md
 guides/grpo.md
 guides/ppo.md

@@ -1276,6 +1276,8 @@ def _apply_message_level_advantage_penalties(
             flush=True,
         )
 
+    advantages = train_data["advantages"]
+    materialized_advantages = False
     for i, message_log in enumerate(message_logs):
         token_offset = 0
         for j, message in enumerate(message_log):
@@ -1294,22 +1296,25 @@ def _apply_message_level_advantage_penalties(
                 and malformed_neg_adv is not None
                 and message.get("has_malformed_thinking", False)
             )
+            if (is_invalid or is_malformed_thinking) and not materialized_advantages:
+                # GRPO/GDPO may expand per-sample advantages into zero-stride views;
+                # clone before span writes so penalties only affect targeted tokens.
+                advantages = advantages.clone()
+                train_data["advantages"] = advantages
+                materialized_advantages = True
+
             if is_invalid:
                 print(
                     f"Setting negative advantage ({invalid_neg_adv}) for invalid tool call in assistant message {i} {j}",
                     flush=True,
                 )
-                train_data["advantages"][i, token_offset : token_offset + msg_len] = (
-                    invalid_neg_adv
-                )
+                advantages[i, token_offset : token_offset + msg_len] = invalid_neg_adv
             elif is_malformed_thinking:
                 print(
                     f"Setting negative advantage ({malformed_neg_adv}) for malformed thinking in assistant message {i} {j}",
                     flush=True,
                 )
-                train_data["advantages"][i, token_offset : token_offset + msg_len] = (
-                    malformed_neg_adv
-                )
+                advantages[i, token_offset : token_offset + msg_len] = malformed_neg_adv
             token_offset += msg_len
 
 
