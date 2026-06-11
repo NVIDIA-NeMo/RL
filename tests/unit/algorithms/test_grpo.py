@@ -325,6 +325,64 @@ def test_apply_message_level_advantage_penalties_targets_flagged_message_spans()
     torch.testing.assert_close(train_data["advantages"], expected)
 
 
+def test_apply_message_level_advantage_penalties_materializes_broadcasted_advantages():
+    per_sample_advantages = torch.tensor([[1.0], [10.0]])
+    train_data = BatchedDataDict({"advantages": per_sample_advantages.expand(2, 6)})
+    message_logs = [
+        [
+            {
+                "role": "user",
+                "token_ids": torch.tensor([1]),
+            },
+            {
+                "role": "assistant",
+                "token_ids": torch.tensor([2, 3, 4]),
+                "generation_logprobs": torch.tensor([0.1, 0.2, 0.3]),
+                "is_invalid_tool_call": True,
+            },
+            {
+                "role": "assistant",
+                "token_ids": torch.tensor([5, 6]),
+                "generation_logprobs": torch.tensor([0.4, 0.5]),
+            },
+        ],
+        [
+            {
+                "role": "user",
+                "token_ids": torch.tensor([7, 8]),
+            },
+            {
+                "role": "assistant",
+                "token_ids": torch.tensor([9, 10]),
+                "generation_logprobs": torch.tensor([0.6, 0.7]),
+                "has_malformed_thinking": True,
+            },
+            {
+                "role": "assistant",
+                "token_ids": torch.tensor([11, 12]),
+                "generation_logprobs": torch.tensor([0.8, 0.9]),
+            },
+        ],
+    ]
+
+    _apply_message_level_advantage_penalties(
+        train_data=train_data,
+        message_logs=message_logs,
+        invalid_tool_call_advantage=-5.0,
+        malformed_thinking_advantage=-7.0,
+    )
+
+    expected = torch.tensor(
+        [
+            [1.0, -5.0, -5.0, -5.0, 1.0, 1.0],
+            [10.0, 10.0, -7.0, -7.0, 10.0, 10.0],
+        ]
+    )
+    torch.testing.assert_close(train_data["advantages"], expected)
+    torch.testing.assert_close(per_sample_advantages, torch.tensor([[1.0], [10.0]]))
+    assert train_data["advantages"].stride(-1) != 0
+
+
 def test_apply_configured_message_level_advantage_penalties_noops_when_disabled(
     mock_grpo_components,
 ):
