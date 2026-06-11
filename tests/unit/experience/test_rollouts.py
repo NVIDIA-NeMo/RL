@@ -38,7 +38,7 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleMetadata,
 )
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
-from nemo_rl.experience.rollout_manager import AsyncNemoGymRolloutManager
+from nemo_rl.experience.rollout_manager import RolloutManager
 from nemo_rl.experience.rollouts import (
     _calculate_single_metric,
     run_async_multi_turn_rollout,
@@ -355,10 +355,7 @@ def multi_step_setup_vllm_async(
         print("VllmGeneration cleanup finished (async engine, Multi-Step Calc Test).")
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.device_count() < 1,
-    reason="VLLM test requires at least 1 GPU",
-)
+@pytest.mark.vllm
 def test_run_multi_step_calculator_vllm_sync(multi_step_setup_vllm_sync):
     """Tests multi-step calculator rollout with VllmGeneration using sync generation and sync rollout."""
     vllm_generation, rollout_tokenizer, task_to_env, initial_batch, rollout_cluster = (
@@ -439,10 +436,7 @@ def test_run_multi_step_calculator_vllm_sync(multi_step_setup_vllm_sync):
     print("\nSync Multi-Step Calculator VLLM Test assertions passed for all samples.")
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.device_count() < 1,
-    reason="VLLM test requires at least 1 GPU",
-)
+@pytest.mark.vllm
 def test_run_multi_step_calculator_vllm_async(multi_step_setup_vllm_async):
     """Tests multi-step calculator rollout with VllmGeneration using async generation and async rollout."""
     vllm_generation, rollout_tokenizer, task_to_env, initial_batch, rollout_cluster = (
@@ -525,10 +519,7 @@ def test_run_multi_step_calculator_vllm_async(multi_step_setup_vllm_async):
     print("\nAsync Multi-Step Calculator VLLM Test assertions passed for all samples.")
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.device_count() < 1,
-    reason="VLLM test requires at least 1 GPU",
-)
+@pytest.mark.vllm
 def test_max_seqlen_respected_sync(multi_step_setup_vllm_sync):
     """Tests multi-step calculator rollout with VllmGeneration (sync)."""
     vllm_generation, rollout_tokenizer, task_to_env, initial_batch, rollout_cluster = (
@@ -564,10 +555,7 @@ def test_max_seqlen_respected_sync(multi_step_setup_vllm_sync):
     )
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.device_count() < 1,
-    reason="VLLM test requires at least 1 GPU",
-)
+@pytest.mark.vllm
 def test_max_seqlen_respected_async(multi_step_setup_vllm_async):
     """Tests multi-step calculator rollout with VllmGeneration (async)."""
     vllm_generation, rollout_tokenizer, task_to_env, initial_batch, rollout_cluster = (
@@ -732,10 +720,7 @@ def sliding_puzzle_setup_vllm(
         print("VllmGeneration cleanup finished (Sliding Puzzle Test).")
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.device_count() < 1,
-    reason="VLLM test requires at least 1 GPU",
-)
+@pytest.mark.vllm
 def test_run_sliding_puzzle_vllm(sliding_puzzle_setup_vllm):
     """Tests sliding puzzle rollout with VllmGeneration."""
     vllm_generation, rollout_tokenizer, task_to_env, initial_batch, rollout_cluster = (
@@ -976,6 +961,318 @@ def test_run_async_nemo_gym_rollout(
 
 
 # ---------------------------------------------------------------------------
+# Tests for RolloutManager
+# ---------------------------------------------------------------------------
+
+
+def test_rollout_manager_raises_without_impl_params():
+    """RolloutManager raises AssertionError when required params are missing."""
+    common = {
+        "tokenizer": None,
+        "task_to_env": {},
+        "num_generations_per_prompt": 1,
+        "max_seq_len": 1,
+    }
+
+    with pytest.raises(AssertionError, match="num_generations_per_prompt must be >= 1"):
+        updated_common = common.copy()
+        updated_common["num_generations_per_prompt"] = 0
+        RolloutManager(**updated_common, use_nemo_gym=False)
+
+    with pytest.raises(AssertionError, match="policy_generation is required"):
+        RolloutManager(**common, use_nemo_gym=False)
+
+    with pytest.raises(AssertionError, match="generation_config is required"):
+        RolloutManager(**common, use_nemo_gym=True)
+
+
+# ---------------------------------------------------------------------------
+# Tests for AsyncRolloutManager (native async path)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="function")
+def single_multi_step_calculator_input_sample(rollout_tokenizer):
+    """Returns a single DatumSpec prompt dict (problem 0) for AsyncRolloutManager tests."""
+    problem_text = "(5 + 3) * 2"
+    expected_answer = 16.0
+    max_steps = 5
+
+    tool_instructions = (
+        "You have a calculator tool. To use it, respond with:\n"
+        "'[operand1, operand2, operation_name]<call: calculator>'\n"
+        "The valid 'operation_name' values are exactly: 'sum', 'diff', 'prod', 'div'.\n"
+        "Example: [5, 3, sum]<call: calculator>\n"
+        "You will receive the result of your calculation as <result>...</result>\n"
+        "Use this result to make the next calculation if needed.\n"
+        "IMPORTANT: Only perform one calculation step (one tool call) before waiting for a result and making a new tool call.\n"
+        "IMPORTANT: Do not perform any other calculations or operations aside from the tool call and result. Doing so will result in failure.\n"
+        "To give the final answer, just output the number. numbers inside of <result> don't count, so output just the final number yourself outside of this.\n"
+        "Example full output: [2, 4, sum]<call: calculator>\n<result>6.0</result>\n[6, 6, diff]<call: calculator>\n<result>0.0</result> 0\n(note how you have to output the final 0 outside of the tags)"
+        "------\n"
+        f"Solve: {problem_text}"
+    )
+
+    initial_prompt_content = rollout_tokenizer.apply_chat_template(
+        [{"role": "user", "content": tool_instructions}],
+        tokenize=False,
+        add_system_prompt=False,
+        add_generation_prompt=True,
+        add_special_tokens=False,
+    )
+    tokenized_prompt = rollout_tokenizer(
+        initial_prompt_content, return_tensors="pt", add_special_tokens=False
+    )["input_ids"][0]
+    message_log = [
+        {
+            "role": "user",
+            "content": initial_prompt_content,
+            "token_ids": tokenized_prompt,
+        }
+    ]
+    metadata = MultiStepCalcMetadata(
+        problem=problem_text,
+        expected_final_answer=expected_answer,
+        max_steps=max_steps,
+        current_step=0,
+    )
+    return {
+        "message_log": message_log,
+        "extra_env_info": metadata,
+        "task_name": "multi_step_calculator_game",
+        "stop_strings": ["<call: calculator>"],
+        "idx": 0,
+    }
+
+
+@pytest.mark.vllm
+def test_async_rollout_manager(
+    multi_step_setup_vllm_async,
+    single_multi_step_calculator_input_sample,
+):
+    """Standalone test for AsyncRolloutManager.
+
+    Given 1 prompt with num_generations_per_prompt=N, asserts:
+    - output is a PromptGroupRecord with N Completion objects
+    - each Completion has a reward (float) and a non-empty message_log
+    - rollout_metrics has the expected keys with correct types
+    - completions hold independent (not aliased) message_log objects
+    """
+    vllm_generation, rollout_tokenizer, task_to_env, _, _ = multi_step_setup_vllm_async
+    input_sample = single_multi_step_calculator_input_sample
+    num_generations = 2
+    max_seq_len = 1024
+    max_rollout_turns = input_sample["extra_env_info"]["max_steps"] + 1
+
+    manager = RolloutManager(
+        use_nemo_gym=False,
+        tokenizer=rollout_tokenizer,
+        task_to_env=task_to_env,
+        num_generations_per_prompt=num_generations,
+        max_seq_len=max_seq_len,
+        max_rollout_turns=max_rollout_turns,
+        policy_generation=vllm_generation,
+    )
+
+    vllm_generation.prepare_for_generation()
+    record = asyncio.run(manager.run_rollout(input_sample))
+    vllm_generation.finish_generation()
+
+    assert isinstance(record, PromptGroupRecord)
+    assert len(record.completions) == num_generations, (
+        f"Expected {num_generations} completions, got {len(record.completions)}"
+    )
+    assert record.prompt_idx == input_sample["idx"]
+
+    for i, completion in enumerate(record.completions):
+        assert isinstance(completion, Completion)
+
+        # 1. message_log length
+        assert len(completion.message_log) >= 4, (
+            f"Completion {i}: expected >= 4 messages, got {len(completion.message_log)}"
+        )
+
+        # 2. last assistant content
+        last_assistant = next(
+            (m for m in reversed(completion.message_log) if m["role"] == "assistant"),
+            None,
+        )
+        assert last_assistant is not None, f"Completion {i}: no assistant message found"
+        assert last_assistant["content"].strip() == "16", (
+            f"Completion {i}: last assistant content {last_assistant['content']!r} != '16'"
+        )
+
+        # 3. reward
+        assert completion.reward == 1.0, (
+            f"Completion {i}: reward {completion.reward} != 1.0"
+        )
+
+    # completions must be independent objects
+    assert record.completions[0].message_log is not record.completions[1].message_log
+
+
+@pytest.mark.vllm
+def test_async_rollout_manager_truncation(
+    multi_step_setup_vllm_async,
+    single_multi_step_calculator_input_sample,
+):
+    """Small max_seq_len forces truncation and truncation_rate=1.0."""
+    vllm_generation, rollout_tokenizer, task_to_env, _, _ = multi_step_setup_vllm_async
+    input_sample = single_multi_step_calculator_input_sample
+    num_generations = 2
+    max_seq_len = 290
+    max_rollout_turns = input_sample["extra_env_info"]["max_steps"] + 1
+
+    manager = RolloutManager(
+        use_nemo_gym=False,
+        tokenizer=rollout_tokenizer,
+        task_to_env=task_to_env,
+        num_generations_per_prompt=num_generations,
+        max_seq_len=max_seq_len,
+        max_rollout_turns=max_rollout_turns,
+        policy_generation=vllm_generation,
+    )
+    vllm_generation.prepare_for_generation()
+    record = asyncio.run(manager.run_rollout(input_sample))
+    vllm_generation.finish_generation()
+
+    assert len(record.completions) == num_generations
+    assert all(c.truncated for c in record.completions)
+    assert record.rollout_metrics["truncation_rate"] == 1.0
+    assert record.rollout_metrics["natural_termination_rate"] == 0.0
+
+
+@pytest.mark.vllm
+def test_async_rollout_manager_matches_original(
+    multi_step_setup_vllm_async,
+    single_multi_step_calculator_input_sample,
+):
+    """Comparison test: AsyncRolloutManager output is structurally equivalent to the original.
+
+    Calls run_async_multi_turn_rollout with a batch of N identical prompts,
+    then calls AsyncRolloutManager with 1 prompt and N generations.
+    Asserts that both produce N results with matching message-log depth, rewards,
+    and rollout_metrics numeric values.
+
+    TODO: remove this test together with run_async_multi_turn_rollout when the legacy path is deleted.
+    """
+    vllm_generation, rollout_tokenizer, task_to_env, _, _ = multi_step_setup_vllm_async
+    input_sample = single_multi_step_calculator_input_sample
+    num_generations = 2
+    max_seq_len = 1024
+    max_rollout_turns = input_sample["extra_env_info"]["max_steps"] + 1
+
+    # Build a batch of N identical prompts for the original function
+    batch = BatchedDataDict(
+        {
+            "message_log": [
+                deepcopy(input_sample["message_log"]) for _ in range(num_generations)
+            ],
+            "extra_env_info": [
+                deepcopy(input_sample["extra_env_info"]) for _ in range(num_generations)
+            ],
+            "task_name": [input_sample["task_name"]] * num_generations,
+            "stop_strings": [input_sample["stop_strings"]] * num_generations,
+            "idx": list(range(num_generations)),
+            "loss_multiplier": [1.0] * num_generations,
+        }
+    )
+
+    vllm_generation.prepare_for_generation()
+    original_batch, original_metrics = run_async_multi_turn_rollout(
+        policy_generation=vllm_generation,
+        input_batch=batch,
+        tokenizer=rollout_tokenizer,
+        task_to_env=task_to_env,
+        max_seq_len=max_seq_len,
+        max_rollout_turns=max_rollout_turns,
+    )
+
+    manager = RolloutManager(
+        use_nemo_gym=False,
+        tokenizer=rollout_tokenizer,
+        task_to_env=task_to_env,
+        num_generations_per_prompt=num_generations,
+        max_seq_len=max_seq_len,
+        max_rollout_turns=max_rollout_turns,
+        policy_generation=vllm_generation,
+    )
+    record = asyncio.run(manager.run_rollout(input_sample))
+    vllm_generation.finish_generation()
+
+    # Both should produce N results
+    assert len(original_batch["message_log"]) == num_generations
+    assert len(record.completions) == num_generations
+
+    for i in range(num_generations):
+        orig_msg_log = original_batch["message_log"][i]
+        new_msg_log = record.completions[i].message_log
+
+        # 1. message_log length matches
+        assert len(orig_msg_log) == len(new_msg_log), (
+            f"Completion {i}: message_log length {len(new_msg_log)} != original {len(orig_msg_log)}"
+        )
+
+        # 2. last assistant content matches
+        def _last_assistant_content(msg_log):
+            for m in reversed(msg_log):
+                if m["role"] == "assistant":
+                    return m.get("content", "")
+            return ""
+
+        orig_last = _last_assistant_content(orig_msg_log)
+        new_last = _last_assistant_content(new_msg_log)
+        assert orig_last == new_last, (
+            f"Completion {i}: last assistant content mismatch\n"
+            f"  original:  {orig_last!r}\n"
+            f"  manager:   {new_last!r}"
+        )
+
+        # 3. reward matches
+        orig_reward = original_batch["total_reward"][i].item()
+        new_reward = record.completions[i].reward
+        assert orig_reward == new_reward, (
+            f"Completion {i}: reward mismatch — original {orig_reward}, manager {new_reward}"
+        )
+
+    # 4. rollout_metrics numeric values match (timing and histogram fields are excluded).
+    # The new impl emits slash-style keys (X/mean, X/max, X/min) via _calculate_single_metric;
+    # translate the legacy prefix-style keys before comparing.
+    def _translate_legacy_key(key: str) -> str:
+        if key == "avg_turns_per_sample":
+            return "turns_per_sample/mean"
+        if key == "max_turns_reached_rate":
+            return key
+        for prefix, suffix in (("mean_", "/mean"), ("max_", "/max"), ("min_", "/min")):
+            if key.startswith(prefix):
+                return f"{key[len(prefix) :]}{suffix}"
+        return key
+
+    new_metrics = record.rollout_metrics
+    for key in original_metrics.keys():
+        if key.startswith("timing/") or key.startswith("histogram/"):
+            continue
+
+        new_key = _translate_legacy_key(key)
+        assert new_key in new_metrics, (
+            f"rollout_metrics[{new_key!r}] missing from manager"
+        )
+
+        orig_val = original_metrics[key]
+        new_val = new_metrics[new_key]
+
+        assert type(orig_val) == type(new_val), (
+            f"rollout_metrics[{key!r}] type mismatch: {type(orig_val)} != {type(new_val)}"
+        )
+        if not isinstance(orig_val, (bool, int, float)):
+            continue
+
+        assert orig_val == pytest.approx(new_val), (
+            f"rollout_metrics[{key!r}] mismatch — original {orig_val}, manager {new_val}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Tests for AsyncNemoGymRolloutManager
 # ---------------------------------------------------------------------------
 
@@ -1021,12 +1318,13 @@ def test_async_nemo_gym_rollout_manager(
     }
     num_generations = 2
 
-    manager = AsyncNemoGymRolloutManager(
+    manager = RolloutManager(
+        use_nemo_gym=True,
         tokenizer=nemo_gym_tokenizer,
         task_to_env={"nemo_gym": nemo_gym},
-        generation_config=nemo_gym_vllm_generation.cfg,
         num_generations_per_prompt=num_generations,
         max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
+        generation_config=nemo_gym_vllm_generation.cfg,
     )
     record = asyncio.run(manager.run_rollout(single_prompt))
 
@@ -1131,12 +1429,13 @@ def test_async_nemo_gym_rollout_manager_matches_original(
         max_rollout_turns=None,
     )
 
-    manager = AsyncNemoGymRolloutManager(
+    manager = RolloutManager(
+        use_nemo_gym=True,
         tokenizer=nemo_gym_tokenizer,
         task_to_env={"nemo_gym": nemo_gym},
-        generation_config=nemo_gym_vllm_generation.cfg,
         num_generations_per_prompt=num_generations,
         max_seq_len=nemo_gym_vllm_generation.cfg["vllm_cfg"]["max_model_len"],
+        generation_config=nemo_gym_vllm_generation.cfg,
     )
     record = asyncio.run(manager.run_rollout(single_prompt))
 

@@ -327,6 +327,7 @@ def test_dtensor_hsdp_dispatches_distinct_batches(
             "eval_mode": False,
             "gbs": 32,
             "mbs": 4,
+            "check_dim_skip_keys": None,
         },
     )
 

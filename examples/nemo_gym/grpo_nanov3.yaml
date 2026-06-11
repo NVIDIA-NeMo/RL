@@ -87,7 +87,6 @@ policy:
     empty_unused_memory_level: 1
     activation_checkpointing: true
     bias_activation_fusion: False
-      # converter_type: "Qwen2ForCausalLM"
     tensor_model_parallel_size: 2
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 8
