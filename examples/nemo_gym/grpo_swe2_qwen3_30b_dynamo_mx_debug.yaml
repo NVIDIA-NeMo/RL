@@ -304,9 +304,9 @@ env:
           # Reduced 16->4 (with runner_ray_remote num_cpus 0.1->4) to test the
           # CPU-starvation hypothesis: dense co-scheduling of rollouts next to
           # the trainer starved the OpenHands tmux poll loop -> 600s source hang.
-          concurrency: 512         # 512 rollouts across 4 training nodes (~128/node). 512*num_cpus=0.1
-                                   # (app.py) = ~51 CPU vs ~576 Ray CPU; memory ~128 sandboxes/node *
-                                   # ~5 GiB ~= 660 GiB < 946 GiB. 768-on-1-node would OOM -> went 4 nodes.
+          concurrency: 64          # 512->64 (8 gen nodes, was 24): cap concurrent SWE .sif mounts
+                                   # within the 256 loop devices/trainer-node, while keeping the
+                                   # 8-worker DGD load proportional.
           swebench_agent_timeout: 1800
           run_with_mixed_prompts: true
           # DEBUG diagnostic: emit OpenHands DEBUG logs (incl bash.py tmux
@@ -330,7 +330,7 @@ env:
       responses_api_agents:
         swe_agents:
           agent_max_turns: 200    # doc SKIP_TRAINING value
-          concurrency: 512
+          concurrency: 64
           swebench_agent_timeout: 1800
           dataset_path: ${data.validation.data_path}
           container_formatter:

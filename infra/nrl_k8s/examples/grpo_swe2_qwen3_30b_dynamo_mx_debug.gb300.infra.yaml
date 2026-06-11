@@ -119,7 +119,10 @@ _shared:
             # `singularity` binary, so symlink apptainer -> singularity.
             command -v apptainer >/dev/null 2>&1 || ln -sf "$(command -v singularity)" /usr/bin/apptainer
             echo "[postStart] apptainer: $(apptainer --version 2>&1 | head -1)"
-            for i in 0 1 2 3 4 5 6 7; do
+            # 256 loop devices: full-batch SWE rollouts mount many concurrent .sif
+            # sandboxes/node; 32 saturated on a fresh trainer host and produced
+            # "no loop devices available" -> zero-reward trajectories.
+            for i in $(seq 0 255); do
               [ -e /dev/loop$i ] || mknod -m 0660 /dev/loop$i b 7 $i || true
             done
             ls -l /dev/loop* 2>&1 | head -10
@@ -181,7 +184,7 @@ launch:
     TEE_PID=$!
 
     RC=0
-    # Full SWE2 config (recipe defaults: pps8/gpp8, max_turns=200, concurrency=512,
+    # Full SWE2 config (recipe defaults: pps8/gpp8, max_turns=200, concurrency=64,
     # swebench_agent_timeout=1800, seqlen 131072). The MX heartbeat fix lets the
     # per-step refit survive past v2 (the old crash point) for a multi-step run.
     python -u examples/nemo_gym/run_grpo_nemo_gym.py \

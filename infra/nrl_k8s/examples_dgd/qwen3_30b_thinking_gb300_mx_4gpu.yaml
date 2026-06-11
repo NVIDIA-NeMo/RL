@@ -89,8 +89,8 @@ spec:
               value: "1"
     VllmDecodeWorker:
       componentType: worker
-      replicas: 24                     # 24x TP2 workers = 48 gen GPU. count=8 RoCE = 1-per-node = 24 GB300 nodes.
-                                       # 48 gen ranks vs trainer dp16 -> MX same_rank_only + peer-pull.
+      replicas: 8                      # 8x TP2 workers = 16 gen GPU = 8 GB300 nodes (count=8 RoCE = 1-per-node).
+                                       # 16 gen ranks <= trainer dp16 -> MX same_rank_only. (reduced from 24)
       envFromSecret: jothomson-secrets
       resources:
         requests:
@@ -111,18 +111,11 @@ spec:
           runAsUser: 0
         nodeSelector:
           nvidia.com/gpu.product: NVIDIA-GB300
-        # Exclude the known-bad node (broken aws-cni, ens177 "Link not found" ->
-        # FailedCreatePodSandBox / stuck ContainerCreating). Matches the trainer's
-        # exclusion; prevents a decode worker getting wedged on it across 24 nodes.
-        affinity:
-          nodeAffinity:
-            requiredDuringSchedulingIgnoredDuringExecution:
-              nodeSelectorTerms:
-                - matchExpressions:
-                    - key: kubernetes.io/hostname
-                      operator: NotIn
-                      values:
-                        - ip-7-248-83-146.us-east-2.compute.internal
+        # NO kubernetes.io/hostname nodeAffinity here: Karpenter rejects it ("interferes
+        # with provisioning logic") and wedges worker scheduling (7/8 Pending). The DGD
+        # workers go through Karpenter, not KAI (unlike the trainer RC, where the same
+        # exclusion is fine). Handle broken-CNI nodes (ens17x "Link not found") reactively:
+        # delete the stuck pod so it reschedules onto a healthy node.
         tolerations:
           - operator: Exists
         resourceClaims:

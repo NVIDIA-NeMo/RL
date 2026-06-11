@@ -34,11 +34,12 @@
 ARG BASE_IMAGE=nvcr.io/nvidian/nemo-rl:nightly
 FROM ${BASE_IMAGE}
 
-# MX commit we currently target — kavink/nemo_rl_moe @ 3fbf7d0.
+# MX commit we currently target — kavink/nemo_rl_moe @ 5420b57.
 # Bumps in: PR #421 (Kavin) publish_self_as_source 3-transport +
 # _worker_id init; this branch's tree-fanout picker (replicas-prefer +
-# 60s stale filter) + replica heartbeat continuation.
-ARG MX_REF=3fbf7d0
+# 60s stale filter) + replica heartbeat continuation + heartbeat rearm
+# after mark_ready/publish.
+ARG MX_REF=5420b579cc24ecc2abf34122e56dbd17dc37781e
 # NIXL 0.10.1 is what the dynamo worker image
 # (jwillthomson/dynamo-arm-tokenize-endpoint-8590c26) ships, so trainer
 # + worker stay wire-compatible. Tracks the base's CUDA major: the
@@ -86,6 +87,7 @@ RUN set -eux; \
     done; \
     [ "${ok}" = 1 ]; \
     command -v singularity; singularity --version; command -v squashfuse; \
+    ln -sf "$(command -v singularity)" /usr/bin/apptainer; apptainer --version; \
     rm -rf /var/lib/apt/lists/*
 
 # Install into the main venv (used by the training driver entrypoint).
