@@ -1,0 +1,9 @@
+cache/
+data/
+data_filled/
+data_with_placeholders/*.jsonl
+logs/
+results/
+*.env
+!super.env.example
+__pycache__/

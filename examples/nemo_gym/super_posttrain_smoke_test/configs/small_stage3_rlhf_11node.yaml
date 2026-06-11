@@ -1,0 +1,63 @@
+# Stage 3 (RLHF) smoke — full Super model + actual 235B pairwise GenRM judge.
+#
+# rlhf is the only stage with a GPU judge: genrm_compare uses the 235B GenRM-2603 (the only
+# model compatible with the pairwise {score_1, score_2, ranking} protocol). The single_step
+# tool-use env is rule-based (CPU). Shrunk from prod for a smoke:
+#
+#   - Policy train: 8 nodes -> TP4 x PP4 x EP8 x CP2
+#   - Policy gen:   1 node  -> vLLM TP8
+#   - GenRM judge:  2 nodes -> DP2 x TP8  (num_gpu_nodes=2)
+#   - cluster.num_nodes = 9 (8 train + 1 vLLM); SBATCH_NUM_NODES=11 (9 + 2 GenRM nodes).
+#
+# Set MODEL_PATH to the actual Super checkpoint (continues from SWE 2 output).
+defaults: "stage3_rlhf.yaml"
+
+checkpointing:
+  checkpoint_dir: "results/super_v3_smoke_stage3_rlhf_11node"
+
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 8
+
+data:
+  # Cap prompt length below max_model_len so over-long prompts are capped at the
+  # dataloader instead of being rejected by vLLM (prompt>=max_model_len -> 400/422).
+  max_input_seq_length: 24576
+
+policy:
+  train_global_batch_size: 256
+  max_total_sequence_length: 32768   # smoke: down from prod 49152
+  generation:
+    max_new_tokens: 8192   # cap output so prompt+gen <= max_total_sequence_length
+    colocated:
+      resources:
+        num_nodes: 1
+    vllm_cfg:
+      tensor_parallel_size: 8
+    vllm_kwargs:
+      max_num_seqs: 16
+  megatron_cfg:
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 4
+    expert_model_parallel_size: 8
+    context_parallel_size: 2
+    optimizer:
+      params_dtype: "bfloat16"
+      use_precision_aware_optimizer: false
+
+env:
+  nemo_gym:
+    num_gpu_nodes: 2   # GenRM DP2 x TP8 = 16 GPUs = 2 nodes
+    genrm_compare_resources_server:
+      resources_servers:
+        genrm_compare:
+          num_rollouts_per_prompt: 8   # must equal grpo.num_generations_per_prompt
+    genrm_model:
+      responses_api_models:
+        genrm_model:
+          vllm_serve_kwargs:
+            data_parallel_size: 2
+            max_num_seqs: 16
+
+cluster:
+  num_nodes: 9
