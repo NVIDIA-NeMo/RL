@@ -23,6 +23,7 @@ import numpy as np
 import ray
 import torch
 from pydantic import BaseModel
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -67,6 +68,7 @@ from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemo_gym import NemoGym, NemoGymConfig
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
@@ -241,6 +243,7 @@ def setup(
 ) -> tuple[
     ColocatablePolicyInterface,
     Optional[GenerationInterface],
+    Optional[EnvironmentInterface],
     tuple[RayVirtualCluster, RayVirtualCluster],
     StatefulDataLoader | MultipleDataloaderWrapper,
     Optional[StatefulDataLoader],
@@ -253,7 +256,10 @@ def setup(
     """Main entry point for running GRPO algorithm.
 
     Returns:
-        tuple of policy, cluster, dataloader, tokenizer, loss_fn, math_env, logger, master_config, val_dataloader
+        An 11-tuple, in order:
+            policy, policy_generation, nemo_gym (the NeMo-Gym env actor, or None
+            when not enabled), cluster, dataloader, val_dataloader, loss_fn,
+            logger, checkpointer, grpo_save_state, master_config.
     """
     # Start timing the entire setup process
     setup_start_time = time.perf_counter()
@@ -428,6 +434,18 @@ def setup(
 
     env_name_list = extract_necessary_env_names(data_config)
     rm_env_enabled = "reward_model" in env_name_list
+
+    # NeMo Gym is initialized inside setup() (rather than by the caller) so its
+    # spinup can overlap with vLLM model loading via deferred model load.
+    enable_nemo_gym = _should_use_nemo_gym(master_config)
+    nemo_gym_actor = None
+    if enable_nemo_gym:
+        nemo_gym_num_nodes = env_configs.get("nemo_gym", {}).get("num_gpu_nodes", 0)
+        ray_runtime_ctx = ray.get_runtime_context()
+        ray_cur_node_id = ray_runtime_ctx.get_node_id()
+    else:
+        nemo_gym_num_nodes = 0
+        ray_cur_node_id = None
 
     total_nodes = cluster_config["num_nodes"]
     if rm_env_enabled:
@@ -773,13 +791,117 @@ def setup(
             "hf_config_overrides", {}
         )
 
-        policy_generation, policy = initialize_generation_with_policy(
-            init_generation_fn=init_vllm,
-            generation_name="vLLM",
-            init_time_key="vllm_init_time_s",
-            colocated_inference=colocated_inference,
-            worker_init_timing_metrics=worker_init_timing_metrics,
-        )
+        if enable_nemo_gym:
+            # ---- NeMo Gym: reserve vLLM ports up-front so we can hand the
+            # server URLs to NeMo Gym and spin it up while vLLM loads weights.
+            print(
+                "  ⚡ Deferred model load: reserving vLLM ports for overlapped NeMo Gym init",
+                flush=True,
+            )
+            deferred_vllm = VllmGeneration(
+                cluster=inference_cluster,
+                config=generation_config,
+                defer_model_load=True,
+            )
+            print(
+                f"  ✓ Reserved {len(deferred_vllm.dp_openai_server_base_urls)} vLLM server URLs: "
+                f"{deferred_vllm.dp_openai_server_base_urls}",
+                flush=True,
+            )
+
+            def init_vllm_deferred():
+                """Complete the deferred vLLM model load started above."""
+                t0 = time.perf_counter()
+                deferred_vllm.load_and_start()
+                deferred_vllm.finish_generation()
+                return deferred_vllm, time.perf_counter() - t0
+
+            def init_nemo_gym():
+                """Spin up NeMo Gym servers with the pre-assigned vLLM URLs."""
+                t0 = time.perf_counter()
+                nemo_gym_py_exec = get_actor_python_env(
+                    "nemo_rl.environments.nemo_gym.NemoGym"
+                )
+                if nemo_gym_py_exec.startswith("uv"):
+                    nemo_gym_py_exec = create_local_venv_on_each_node(
+                        nemo_gym_py_exec, "nemo_rl.environments.nemo_gym.NemoGym"
+                    )
+                nemo_gym_dict = env_configs["nemo_gym"]
+                # NeMo-RL-side detection knobs are top-level NemoGymConfig fields
+                # (where the detector reads them), not part of Gym's global config.
+                invalid_tool_call_patterns = nemo_gym_dict.pop(
+                    "invalid_tool_call_patterns", None
+                )
+                thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
+                nemo_gym_cfg = NemoGymConfig(
+                    model_name=generation_config["model_name"],
+                    base_urls=deferred_vllm.dp_openai_server_base_urls,
+                    invalid_tool_call_patterns=invalid_tool_call_patterns,
+                    thinking_tags=thinking_tags,
+                    initial_global_config_dict=nemo_gym_dict,
+                )
+                nemo_gym_opts = {}
+                if nemo_gym_num_nodes:
+                    nemo_gym_opts["scheduling_strategy"] = (
+                        NodeAffinitySchedulingStrategy(
+                            node_id=ray_cur_node_id,
+                            soft=True,
+                        )
+                    )
+                nemo_gym_opts["runtime_env"] = {
+                    "py_executable": nemo_gym_py_exec,
+                    "env_vars": {
+                        **os.environ,
+                        "VIRTUAL_ENV": nemo_gym_py_exec,
+                        "UV_PROJECT_ENVIRONMENT": nemo_gym_py_exec,
+                    },
+                }
+                actor = NemoGym.options(**nemo_gym_opts).remote(nemo_gym_cfg)
+                ray.get(actor._spinup.remote())
+                return actor, time.perf_counter() - t0
+
+            # Colocated: vLLM + policy share GPUs -> sequential; otherwise parallel.
+            init_tasks = {}
+            if colocated_inference:
+
+                def init_vllm_then_policy():
+                    pg, vllm_t = init_vllm_deferred()
+                    p, policy_t = init_policy()
+                    return pg, vllm_t, p, policy_t
+
+                init_tasks["vllm_policy"] = init_vllm_then_policy
+            else:
+                init_tasks["vllm"] = init_vllm_deferred
+                init_tasks["policy"] = init_policy
+            init_tasks["nemo_gym"] = init_nemo_gym
+
+            print(
+                f"  ⚡ Init tasks: {', '.join(init_tasks.keys())}",
+                flush=True,
+            )
+            with ThreadPoolExecutor(max_workers=len(init_tasks)) as executor:
+                submitted = {k: executor.submit(fn) for k, fn in init_tasks.items()}
+                results = {k: f.result() for k, f in submitted.items()}
+
+            if colocated_inference:
+                policy_generation, vllm_time, policy, policy_time = results[
+                    "vllm_policy"
+                ]
+            else:
+                policy_generation, vllm_time = results["vllm"]
+                policy, policy_time = results["policy"]
+            nemo_gym_actor, nemo_gym_time = results["nemo_gym"]
+            worker_init_timing_metrics["vllm_init_time_s"] = vllm_time
+            worker_init_timing_metrics["policy_init_time_s"] = policy_time
+            worker_init_timing_metrics["nemo_gym_init_time_s"] = nemo_gym_time
+        else:
+            policy_generation, policy = initialize_generation_with_policy(
+                init_generation_fn=init_vllm,
+                generation_name="vLLM",
+                init_time_key="vllm_init_time_s",
+                colocated_inference=colocated_inference,
+                worker_init_timing_metrics=worker_init_timing_metrics,
+            )
 
         print(
             f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}",
@@ -892,6 +1014,7 @@ def setup(
     return (
         policy,
         policy_generation,
+        nemo_gym_actor,
         (train_cluster, inference_cluster),
         dataloader,
         val_dataloader,
@@ -2958,6 +3081,29 @@ def async_grpo_train(
         max_size=optimal_buffer_size
     )
 
+    last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
+    if last_checkpoint_path is not None:
+        replay_buffer_path = os.path.join(last_checkpoint_path, "replay_buffer.pt")
+        if os.path.exists(replay_buffer_path):
+            print(f"📦 Restoring replay buffer from checkpoint: {replay_buffer_path}")
+            # weights_only=False: trajectories are pickled BatchedDataDict/dicts,
+            # not plain tensors. The checkpoint is a trusted same-job artifact.
+            replay_buffer_state = torch.load(replay_buffer_path, weights_only=False)
+            ray.get(
+                replay_buffer.load_state_dict.remote(
+                    replay_buffer_state,
+                    num_prompts_per_step=num_prompts_per_step,
+                    current_training_step=step,
+                    max_age_steps=max_trajectory_age_steps,
+                )
+            )
+            print("✅ Replay buffer restored from checkpoint")
+        else:
+            print(
+                f"⚠️ No replay buffer checkpoint found at {replay_buffer_path}. "
+                "Starting with an empty replay buffer."
+            )
+
     _tc_py_exec = get_actor_python_env(
         "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector"
     )
@@ -3066,24 +3212,42 @@ def async_grpo_train(
     if policy_generation is not None:
         policy_generation.clear_logger_metrics()
 
-    # Wait for initial buffer fill
+    # Wait for initial buffer fill for the current training step.
     print(
-        f"⏳ Waiting for replay buffer to have sufficient trajectories ({min_trajectories_needed} trajectories)..."
+        f"⏳ Waiting for replay buffer to have sufficient trajectories for step {step}..."
     )
     wait_iterations = 0
     while True:
         buffer_size_current = ray.get(replay_buffer.size.remote())
-
-        print(
-            f"  Wait iteration {wait_iterations}: buffer_filled_ratio={buffer_size_current}/{min_trajectories_needed}"
+        current_step_ready = ray.get(
+            replay_buffer.has_complete_batch.remote(
+                step, num_prompts_per_step, max_trajectory_age_steps
+            )
         )
 
-        if buffer_size_current >= min_trajectories_needed:
+        print(
+            f"  Wait iteration {wait_iterations}: buffer_size={buffer_size_current}, "
+            f"step {step} ready={current_step_ready}"
+        )
+
+        if current_step_ready:
             break
 
+        trajectories_needed = ray.get(
+            replay_buffer.get_trajectories_needed.remote(
+                step, num_prompts_per_step, max_trajectory_age_steps
+            )
+        )
+        if buffer_size_current >= min_trajectories_needed and trajectories_needed > 0:
+            print(
+                f"  ⏳ Gap-filling in progress: need {trajectories_needed} more "
+                f"trajectories for step {step}"
+            )
+
+        wait_iterations += 1
         time.sleep(1.0)
 
-    print("✅ Buffer ready! Starting training loop...")
+    print(f"✅ Buffer ready for step {step}! Starting training loop...")
 
     # Main training loop
     try:
@@ -3600,6 +3764,16 @@ def async_grpo_train(
                         torch.save(
                             actual_dataloader_state,
                             os.path.join(checkpoint_path, "train_dataloader.pt"),
+                        )
+                        print("📦 Saving replay buffer state...")
+                        replay_buffer_state = ray.get(replay_buffer.state_dict.remote())
+                        torch.save(
+                            replay_buffer_state,
+                            os.path.join(checkpoint_path, "replay_buffer.pt"),
+                        )
+                        print(
+                            "✅ Saved replay buffer with "
+                            f"{len(replay_buffer_state['trajectories'])} trajectories"
                         )
                         checkpointer.finalize_checkpoint(checkpoint_path)
 

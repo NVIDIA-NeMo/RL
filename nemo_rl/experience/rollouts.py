@@ -22,6 +22,7 @@ import math
 import statistics
 import warnings
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -1087,7 +1088,7 @@ class AsyncNemoGymRolloutResult:
 
 
 def _calculate_single_metric(
-    values: list[float], batch_size: int, key_name: str
+    values: Sequence[float | int], batch_size: int, key_name: str
 ) -> dict:
     return {
         f"{key_name}/mean": sum(values) / batch_size,

@@ -87,6 +87,12 @@ class AsyncTrajectoryCollector:
         self._generation_check_lock: _threading.Lock = _threading.Lock()
         # Track which target weights are currently being generated (globally)
         self._generating_targets: set[int] = set()
+        # Track spawned, buffered, and completed prompt-group workers per target.
+        self._spawned_per_target: dict[int, int] = {}
+        self._buffered_per_target: dict[int, int] = {}
+        self._completed_per_target: dict[int, int] = {}
+        self._spawning_targets: set[int] = set()
+        self._counter_lock: _threading.Lock = _threading.Lock()
 
     def _calculate_target_weights(self, generation_weight_version: int) -> list[int]:
         """Calculate target weight versions for given generation weight version.
@@ -122,19 +128,38 @@ class AsyncTrajectoryCollector:
     ) -> Optional[int]:
         """Get the next target weight that needs generation (if any)."""
         target_weights = self._calculate_target_weights(generation_weight_version)
-        last_target_weight_already_generated = ray.get(
+        num_prompts = int(self.master_config.grpo["num_prompts_per_step"])
+        max_age_steps = int(
+            self.master_config.grpo["async_grpo"]["max_trajectory_age_steps"]
+        )
+        last_consumed_target = ray.get(
             self.replay_buffer.get_last_target_weight_already_generated.remote()
         )
 
         with self._generation_check_lock:
             for target_weight in target_weights:
-                if (
-                    target_weight > last_target_weight_already_generated
-                    and target_weight not in self._generating_targets
-                ):
-                    self._generating_targets.add(target_weight)
+                if target_weight <= last_consumed_target:
+                    continue
+                if target_weight in self._generating_targets:
+                    continue
+
+                trajectories_needed = ray.get(
+                    self.replay_buffer.get_trajectories_needed.remote(
+                        target_weight, num_prompts, max_age_steps
+                    )
+                )
+                if trajectories_needed <= 0:
+                    continue
+
+                self._generating_targets.add(target_weight)
+                if trajectories_needed < num_prompts:
+                    print(
+                        f"🎯 Reserved target weight {target_weight} for gap-filling "
+                        f"(need {trajectories_needed}/{num_prompts} more trajectories)"
+                    )
+                else:
                     print(f"🎯 Reserved target weight {target_weight} for generation")
-                    return target_weight
+                return target_weight
 
         return None
 
@@ -153,17 +178,27 @@ class AsyncTrajectoryCollector:
         """Check if collection should be paused due to generation limits."""
         try:
             target_weights = self._calculate_target_weights(self.current_weight_version)
-            last_target_weight_already_generated = ray.get(
+            num_prompts = int(self.master_config.grpo["num_prompts_per_step"])
+            max_age_steps = int(
+                self.master_config.grpo["async_grpo"]["max_trajectory_age_steps"]
+            )
+            last_consumed_target = ray.get(
                 self.replay_buffer.get_last_target_weight_already_generated.remote()
             )
 
             # Check if any target weight in our range needs generation
             with self._generation_check_lock:
                 for target_weight in target_weights:
-                    if (
-                        target_weight > last_target_weight_already_generated
-                        and target_weight not in self._generating_targets
-                    ):
+                    if target_weight <= last_consumed_target:
+                        continue
+                    if target_weight in self._generating_targets:
+                        continue
+                    trajectories_needed = ray.get(
+                        self.replay_buffer.get_trajectories_needed.remote(
+                            target_weight, num_prompts, max_age_steps
+                        )
+                    )
+                    if trajectories_needed > 0:
                         return False  # Found a target that needs generation
 
             print(
@@ -245,10 +280,15 @@ class AsyncTrajectoryCollector:
 
     def _process_batch(self, batch: BatchedDataDict[DatumSpec]) -> None:
         """Process a single batch and generate for one target weight."""
+        target_weight: Optional[int] = None
         try:
             generation_weight_version = self.current_weight_version
             num_generations = self.master_config.grpo["num_generations_per_prompt"]
-            num_prompts = batch.size
+            num_prompts_in_batch = batch.size
+            num_prompts_per_step = int(self.master_config.grpo["num_prompts_per_step"])
+            max_age_steps = int(
+                self.master_config.grpo["async_grpo"]["max_trajectory_age_steps"]
+            )
 
             # Get the next target weight that needs generation
             target_weight = self._get_next_target_for_generation(
@@ -265,44 +305,117 @@ class AsyncTrajectoryCollector:
                 f"🎯 Generating for target weight {target_weight} from generation_weight_version {generation_weight_version}"
             )
 
-            # Generate for all prompts in this batch for the target weight
-            for prompt_idx in range(num_prompts):
-                # Wait for refit to complete if in progress
-                if not self._refit_pause_cleared.is_set() and self.running:
-                    with self._threads_lock:
-                        active_threads = len(self._inflight_threads)
-                    print(
-                        f"⏸️ Waiting for refit to complete before starting new generation ({active_threads} threads still active)"
-                    )
-                    print(
-                        "   Note: With vLLM V1 async engine, active threads can complete during weight update"
-                    )
-                    self._refit_pause_cleared.wait()
-
-                    # After refit finishes if weight version has updated, reflect that in the new trajectories
-                    generation_weight_version = self.current_weight_version
-
-                single_prompt_batch = batch.slice(prompt_idx, prompt_idx + 1)
-                repeated_batch = single_prompt_batch.repeat_interleave(num_generations)
-
-                self._inflight_sema.acquire()
-                worker = _threading.Thread(
-                    target=self._run_prompt_group_worker,
-                    args=(
-                        repeated_batch,
-                        generation_weight_version,
-                        target_weight,
-                        prompt_idx,
-                    ),
-                    daemon=True,
+            trajectories_needed = ray.get(
+                self.replay_buffer.get_trajectories_needed.remote(
+                    target_weight, num_prompts_per_step, max_age_steps
                 )
-                with self._threads_lock:
-                    self._inflight_threads.add(worker)
-                worker.start()
+            )
+            num_prompts_to_generate = min(num_prompts_in_batch, trajectories_needed)
+            if num_prompts_to_generate == 0:
+                print(
+                    f"🔄 Target {target_weight} already has enough trajectories, skipping"
+                )
+                with self._generation_check_lock:
+                    self._generating_targets.discard(target_weight)
+                return
+
+            if num_prompts_to_generate < num_prompts_in_batch:
+                print(
+                    f"🎯 Gap-filling for target weight {target_weight}: "
+                    f"generating {num_prompts_to_generate}/{num_prompts_in_batch} "
+                    f"prompts (need {trajectories_needed} more trajectories)"
+                )
+
+            # Generate only the prompt groups needed for this target. While the
+            # spawn loop is open, workers may finish before later workers start,
+            # so reservation release is deferred until spawning closes.
+            started = 0
+            with self._counter_lock:
+                self._spawning_targets.add(target_weight)
+            try:
+                for prompt_idx in range(num_prompts_to_generate):
+                    # Wait for refit to complete if in progress
+                    if not self._refit_pause_cleared.is_set() and self.running:
+                        with self._threads_lock:
+                            active_threads = len(self._inflight_threads)
+                        print(
+                            f"⏸️ Waiting for refit to complete before starting new generation ({active_threads} threads still active)"
+                        )
+                        print(
+                            "   Note: With vLLM V1 async engine, active threads can complete during weight update"
+                        )
+                        self._refit_pause_cleared.wait()
+
+                        # After refit finishes if weight version has updated, reflect that in the new trajectories
+                        generation_weight_version = self.current_weight_version
+
+                    single_prompt_batch = batch.slice(prompt_idx, prompt_idx + 1)
+                    repeated_batch = single_prompt_batch.repeat_interleave(
+                        num_generations
+                    )
+
+                    worker = _threading.Thread(
+                        target=self._run_prompt_group_worker,
+                        args=(
+                            repeated_batch,
+                            generation_weight_version,
+                            target_weight,
+                            prompt_idx,
+                        ),
+                        daemon=True,
+                    )
+                    self._inflight_sema.acquire()
+                    registered = False
+                    try:
+                        with self._threads_lock:
+                            self._inflight_threads.add(worker)
+                        with self._counter_lock:
+                            self._spawned_per_target[target_weight] = (
+                                self._spawned_per_target.get(target_weight, 0) + 1
+                            )
+                            spawned_count = self._spawned_per_target[target_weight]
+                        registered = True
+                        worker.start()
+                    except Exception:
+                        # The worker never ran, so it won't release its slot or
+                        # run its finally block; undo the bookkeeping here.
+                        with self._threads_lock:
+                            self._inflight_threads.discard(worker)
+                        if registered:
+                            with self._counter_lock:
+                                updated_count = (
+                                    self._spawned_per_target.get(target_weight, 0) - 1
+                                )
+                                if updated_count > 0:
+                                    self._spawned_per_target[target_weight] = (
+                                        updated_count
+                                    )
+                                else:
+                                    self._spawned_per_target.pop(target_weight, None)
+                        self._inflight_sema.release()
+                        raise
+                    started += 1
+                    print(
+                        f"📊 Started worker {started}/{num_prompts_to_generate} for "
+                        f"target_weight={target_weight} ({spawned_count} total)"
+                    )
+            finally:
+                if started < num_prompts_to_generate:
+                    print(
+                        f"⚠️ Only {started}/{num_prompts_to_generate} workers "
+                        f"started for target_weight={target_weight}"
+                    )
+                with self._counter_lock:
+                    self._spawning_targets.discard(target_weight)
+                self._maybe_release_target(target_weight)
 
             self._cleanup_finished_threads()
 
         except Exception as e:
+            if target_weight is not None:
+                with self._counter_lock:
+                    self._spawning_targets.discard(target_weight)
+                self._maybe_release_target(target_weight)
             print(f"❌ Error processing batch: {e}")
             import traceback
 
@@ -433,6 +546,39 @@ class AsyncTrajectoryCollector:
             for t in finished:
                 self._inflight_threads.remove(t)
 
+    def _maybe_release_target(self, target_weight_version: int) -> None:
+        """Release a target's reservation once all its workers have completed.
+
+        A worker counts as "completed" whether or not it managed to buffer a
+        trajectory. The reservation is released exactly when the number of
+        completed workers reaches the number spawned for the target and no more
+        workers are being spawned for the same target. Safe to call repeatedly:
+        the reservation is discarded at most once and the per-target counters
+        are dropped on release (so a later re-reservation starts from a clean
+        slate and the dicts don't grow unbounded).
+        """
+        with self._counter_lock:
+            if target_weight_version in self._spawning_targets:
+                return
+            completed = self._completed_per_target.get(target_weight_version, 0)
+            spawned = self._spawned_per_target.get(target_weight_version, 0)
+            if completed < spawned:
+                return
+            buffered = self._buffered_per_target.get(target_weight_version, 0)
+            self._spawned_per_target.pop(target_weight_version, None)
+            self._buffered_per_target.pop(target_weight_version, None)
+            self._completed_per_target.pop(target_weight_version, None)
+            self._spawning_targets.discard(target_weight_version)
+
+        with self._generation_check_lock:
+            if target_weight_version in self._generating_targets:
+                self._generating_targets.discard(target_weight_version)
+                print(
+                    "🧹 Released reservation for target weight "
+                    f"{target_weight_version} ({spawned} workers completed, "
+                    f"{buffered} buffered)"
+                )
+
     def _run_prompt_group_worker(
         self,
         repeated_batch: BatchedDataDict[DatumSpec],
@@ -495,20 +641,22 @@ class AsyncTrajectoryCollector:
                         )
                     )
                     if status == "success":
+                        with self._counter_lock:
+                            self._buffered_per_target[target_weight_version] = (
+                                self._buffered_per_target.get(target_weight_version, 0)
+                                + 1
+                            )
+                            buffered_count = self._buffered_per_target[
+                                target_weight_version
+                            ]
+                            spawned_count = self._spawned_per_target.get(
+                                target_weight_version, 0
+                            )
                         print(
-                            f"📦 Buffered per-prompt group (prompt_idx {prompt_idx}, target_weight {target_weight_version})"
+                            f"📦 Buffered per-prompt group (prompt_idx {prompt_idx}, "
+                            f"target_weight {target_weight_version}) "
+                            f"[{buffered_count}/{spawned_count} buffered]"
                         )
-
-                        # Release reservation when FIRST prompt group for this target is successfully buffered
-                        if prompt_idx == 0:
-                            with self._generation_check_lock:
-                                if target_weight_version in self._generating_targets:
-                                    self._generating_targets.discard(
-                                        target_weight_version
-                                    )
-                                    print(
-                                        f"🧹 Released reservation for target weight {target_weight_version} (first prompt buffered)"
-                                    )
                         break
                     elif status == "full":
                         # Exponential backoff up to 0.5 second
@@ -528,13 +676,11 @@ class AsyncTrajectoryCollector:
 
             traceback.print_exc()
         finally:
-            # Clean up reservation in case of error (if not already cleaned up)
-            with self._generation_check_lock:
-                if target_weight_version in self._generating_targets:
-                    self._generating_targets.discard(target_weight_version)
-                    print(
-                        f"🧹 Emergency cleanup: Released reservation for target weight {target_weight_version}"
-                    )
+            with self._counter_lock:
+                self._completed_per_target[target_weight_version] = (
+                    self._completed_per_target.get(target_weight_version, 0) + 1
+                )
+            self._maybe_release_target(target_weight_version)
 
             # Detach thread record when finished
             with self._threads_lock:

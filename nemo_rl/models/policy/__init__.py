@@ -194,6 +194,25 @@ class MegatronDDPConfig(TypedDict):
     data_parallel_sharding_strategy: str
 
 
+class Fp8Config(TypedDict):
+    # Master switch for FP8 training. When False, all other fields are ignored.
+    enabled: bool
+    # FP8 format used for the GEMMs (e.g. "e4m3").
+    fp8: NotRequired[str]
+    # FP8 scaling recipe (e.g. "blockwise").
+    fp8_recipe: NotRequired[str]
+    # When True, keep parameters in FP8. Can cause NaN token_mult_prob_error;
+    # use with caution (see https://github.com/NVIDIA-NeMo/RL/issues/1164).
+    fp8_param: NotRequired[bool]
+    # When True, clear Transformer Engine's per-module _fp8_workspaces scratch
+    # buffers in offload_before_refit (before weight transfer to the inference
+    # engine). These FP8 workspace tensors anchor large CUDA segments and
+    # aggravate allocator fragmentation across the train->offload->refit->generate
+    # cycle. Useful for FP8 training runs that observe growing reserved GPU memory
+    # after offload.
+    force_clear_fp8_caches: NotRequired[bool]
+
+
 # Type exists to be lax if not specified
 class MegatronConfigDisabled(TypedDict):
     enabled: Literal[False]
@@ -296,6 +315,14 @@ class MegatronConfig(TypedDict):
     linear_ce_fusion_chunk_size: NotRequired[int]
     # When mtp_num_layers=0, Multi-Token Prediction is disabled.
     mtp_num_layers: NotRequired[int]
+    # When True, clear the RotaryEmbedding LRU cache and MoE token dispatcher
+    # routing tensors in offload_before_refit (before weight transfer to the
+    # inference engine). Useful when training and logprob runs use different
+    # sequence lengths (rope cache) or for MoE models with activation recompute
+    # (dispatcher reference cycles).
+    clear_memory_caches_before_refit: NotRequired[bool]
+    # FP8 quantization settings for the Megatron training backend.
+    fp8_cfg: NotRequired[Fp8Config]
 
 
 class DraftConfigDisabled(TypedDict):
