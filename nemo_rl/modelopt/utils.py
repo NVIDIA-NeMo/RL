@@ -14,10 +14,91 @@
 
 """Lightweight quantization config resolver usable by both Megatron and vLLM workers."""
 
-from typing import Any
+from __future__ import annotations
 
-import modelopt.torch.quantization as mtq
-from modelopt.recipe import load_config
+from fnmatch import fnmatchcase
+from pathlib import Path
+from typing import Any, Iterator
+
+_QUANT_IGNORE_NAME_SUFFIXES = (
+    ".weight",
+    ".weight_scale",
+    ".weight_scale_2",
+)
+
+# Layers kept in native dtype by the real-quant vLLM rollout. Shared between the
+# vLLM quantization_config and the Megatron export-side ignore patterns.
+DEFAULT_NVFP4_IGNORE = [
+    "lm_head",
+    "*output_layer*",
+    "*mlp.gate",
+    "*router*",
+    "*block_sparse_moe.gate*",
+    "*self_attention*",
+    "*self_attn*",
+]
+
+
+def _iter_quant_ignore_suffix_variants(name: str) -> Iterator[str]:
+    """Yield ``name`` and, if it ends in a known quant suffix, the stripped form."""
+    yield name
+    for suffix in _QUANT_IGNORE_NAME_SUFFIXES:
+        if name.endswith(suffix):
+            yield name[: -len(suffix)]
+            break
+
+
+def iter_quant_ignore_name_candidates(name: str) -> Iterator[str]:
+    """Yield name variants matched by ModelOpt real-quant ignore patterns."""
+    yield from _iter_quant_ignore_suffix_variants(name)
+
+    alternate = (
+        name.removeprefix("model.") if name.startswith("model.") else f"model.{name}"
+    )
+    if alternate == name:
+        return
+
+    yield from _iter_quant_ignore_suffix_variants(alternate)
+
+
+def matches_quant_ignore_pattern(name: str, patterns: list[str]) -> bool:
+    """Return whether ``name`` matches any ModelOpt real-quant ignore pattern."""
+    return any(
+        fnmatchcase(candidate, pattern)
+        for candidate in iter_quant_ignore_name_candidates(name)
+        for pattern in patterns
+    )
+
+
+def build_vllm_modelopt_nvfp4_config(
+    *,
+    ignore: list[str] | None = None,
+) -> dict[str, Any]:
+    """Build the HuggingFace quantization_config consumed by vLLM ModelOpt NVFP4.
+
+    NeMo-RL's ``quant_cfg`` recipes are ModelOpt PTQ/QAT configs consumed by
+    ``mtq.quantize``. vLLM expects the deployment/export-side
+    ``quantization_config`` shape instead.
+    """
+    return {
+        "quant_method": "modelopt",
+        "config_groups": {
+            "group_0": {
+                "input_activations": None,
+                "weights": {
+                    "dynamic": False,
+                    "num_bits": 4,
+                    "type": "float",
+                    "group_size": 16,
+                },
+                "targets": ["Linear"],
+            }
+        },
+        "ignore": ignore if ignore is not None else list(DEFAULT_NVFP4_IGNORE),
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "producer": {"name": "modelopt"},
+    }
 
 
 def resolve_quant_cfg(quant_cfg: str) -> dict[str, Any]:
@@ -46,9 +127,18 @@ def resolve_quant_cfg(quant_cfg: str) -> dict[str, Any]:
     for the canonical format and ``examples/modelopt/quant_configs/`` for a
     user-authored example.
     """
+    import modelopt.torch.quantization as mtq
+    from modelopt.recipe import load_config
+
     builtin = getattr(mtq, quant_cfg, None)
     if builtin is not None:
         return builtin
+
+    config_path = Path(quant_cfg)
+    if not config_path.is_absolute():
+        repo_config_path = Path(__file__).resolve().parents[2] / config_path
+        if repo_config_path.is_file():
+            quant_cfg = str(repo_config_path)
 
     try:
         loaded = load_config(quant_cfg)

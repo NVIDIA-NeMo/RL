@@ -17,8 +17,8 @@ import os
 from contextlib import contextmanager
 from typing import Generator
 
-import modelopt.torch.quantization as mtq
 import ray
+import torch
 from megatron.bridge.training.post_training.checkpointing import (
     has_modelopt_state,
     load_modelopt_state,
@@ -82,29 +82,21 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                     self.reference_state_dict[name] = item.detach().to(
                         device="cpu", non_blocking=True, copy=True
                     )
-        if self.rank == 0:
-            print(f"Quantized model: {self.model}")
-            mtq.print_quant_summary(self.model)
 
     def _quantize(self, model):
         """Quantize the model if the model is not quantized yet."""
-        quant_cfg = self.cfg["quant_cfg"]
-        quant_calib_data = self.cfg["quant_calib_data"]
-        quant_calib_size = self.cfg["quant_calib_size"]
-        quant_batch_size = self.cfg["quant_batch_size"]
-        quant_sequence_length = self.cfg["quant_sequence_length"]
         unwrapped_model = unwrap_model(model)[0]
 
         tokenizer = get_tokenizer(self.cfg["model_name"])
         quantize_model(
             model=unwrapped_model,
-            quant_cfg=quant_cfg,
+            quant_cfg=self.cfg["quant_cfg"],
             tokenizer=tokenizer,
-            calib_size=quant_calib_size,
+            calib_size=self.cfg.get("quant_calib_size"),
             is_megatron=True,
-            batch_size=quant_batch_size,
-            data=quant_calib_data,
-            max_sample_length=quant_sequence_length,
+            batch_size=self.cfg.get("quant_batch_size"),
+            data=self.cfg.get("quant_calib_data"),
+            max_sample_length=self.cfg.get("quant_sequence_length"),
         )
         return model
 
@@ -143,7 +135,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         megatron_policy_worker.validate_model_paths = _validate_model_paths
 
     def _patch_setup_model_and_optimizer(self):
-        """Patch setup_model_and_optimizer to restore modelopt state when loading quantized checkpoints."""
+        """Patch setup_model_and_optimizer to restore modelopt state."""
         if getattr(
             megatron_policy_worker.setup_model_and_optimizer, "_is_patched", False
         ):
@@ -160,7 +152,6 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             if os.path.exists(os.path.join(model_path, "iter_0000000")):
                 model_path = os.path.join(model_path, "iter_0000000")
             if has_modelopt_state(model_path):
-                print("setting restore_modelopt_state to True")
                 disable_modelopt_layer_spec = policy_cfg.get(
                     "disable_modelopt_layer_spec", False
                 )
@@ -279,7 +270,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
 
     @contextmanager
     def without_model_config(self):
-        """Context manager that temporarily removes the ``config`` attribute from TensorQuantizer modules.
+        """Temporarily remove TensorQuantizer ``config`` attributes.
 
         Used by :meth:`use_reference_model` and :meth:`save_checkpoint`. Both
         of these flows traverse the module tree (e.g. for state-dict swapping
@@ -341,6 +332,62 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         with self.without_model_config():
             return super().save_checkpoint(*args, **kwargs)
 
+    def _use_real_quant_refit(self) -> bool:
+        generation_cfg = self.cfg.get("generation") or {}
+        return (
+            generation_cfg.get("backend") == "vllm"
+            and generation_cfg.get("quant_cfg") is not None
+            and bool(generation_cfg.get("real_quant"))
+        )
+
+    def _iter_real_quant_refit_params(self, kv_scales=None):
+        """Export packed NVFP4 weights and scales for real-quant vLLM rollout."""
+        from nemo_rl.modelopt.utils import DEFAULT_NVFP4_IGNORE
+
+        generation_cfg = self.cfg.get("generation") or {}
+        vllm_cfg = generation_cfg.get("vllm_cfg", {})
+        ignore = generation_cfg.get("real_quant_ignore")
+        if ignore is None:
+            ignore = DEFAULT_NVFP4_IGNORE
+        yield from self.megatron_bridge.export_hf_weights_modelopt(
+            [self.model],
+            quant_mode="nvfp4",
+            cpu=True,
+            show_progress=False,
+            conversion_tasks=self.refit_conversion_tasks,
+            ignore_patterns=ignore,
+        )
+
+        if self.draft_model is not None:
+            from nemo_rl.models.megatron.draft import export_eagle_weights_to_hf
+
+            for name, tensor in export_eagle_weights_to_hf(self.draft_model):
+                yield f"draft.{name}", tensor
+
+        if not vllm_cfg.get("kv_cache_dtype", "").startswith("fp8"):
+            return
+
+        from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
+            get_vllm_qkv_scale_names,
+        )
+
+        keys: list[str] = []
+        for layer_idx in range(self.megatron_bridge.transformer_config.num_layers):
+            keys.extend(get_vllm_qkv_scale_names(layer_idx).values())
+
+        for param_name in keys:
+            scale_value = (
+                kv_scales[param_name] if kv_scales and param_name in kv_scales else 1.0
+            )
+            yield (
+                param_name,
+                torch.tensor(
+                    scale_value,
+                    dtype=torch.float32,
+                    device="cuda",
+                ).reshape(1),
+            )
+
     @staticmethod
     def _find_weight_quantizer(module, param_weight):
         """Find the enabled weight quantizer that corresponds to ``param_weight``.
@@ -377,6 +424,9 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             RuntimeError: If weight folding fails for a specific parameter,
                 with context about which parameter caused the failure.
         """
+        if self._use_real_quant_refit():
+            yield from self._iter_real_quant_refit_params(kv_scales)
+            return
 
         class _FoldedTask:
             """Proxy that applies weight_quantizer(param_weight) on access."""
@@ -402,7 +452,6 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 return getattr(self._task, name)
 
         folded_tasks = []
-        skipped_fold = []
         for task in self.refit_conversion_tasks:
             matched_wq = self._find_weight_quantizer(
                 task.megatron_module, task.param_weight
@@ -410,20 +459,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             if matched_wq is not None:
                 folded_tasks.append(_FoldedTask(task, matched_wq))
             else:
-                if (
-                    task.param_weight is not None
-                    and isinstance(task.megatron_module, QuantModule)
-                    and next(task.megatron_module.iter_weights_for_calibration(), None)
-                    is not None
-                ):
-                    skipped_fold.append(task.param_name)
                 folded_tasks.append(task)
-
-        if skipped_fold and self.rank == 0:
-            print(
-                f"[QuantFold] Skipped folding {len(skipped_fold)} non-GEMM params "
-                f"that share a module with weight_quantizer: {skipped_fold[:5]}"
-            )
 
         original_tasks = self.refit_conversion_tasks
         self.refit_conversion_tasks = folded_tasks
@@ -432,14 +468,5 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 if "weight_quantizer" in name:
                     continue
                 yield name, tensor
-        except RuntimeError:
-            raise
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed during quantized weight refit iteration. "
-                f"Folded {len(folded_tasks)} tasks, skipped folding for: "
-                f"{skipped_fold[:5] if skipped_fold else 'none'}. "
-                f"Cause: {e}"
-            ) from e
         finally:
             self.refit_conversion_tasks = original_tasks

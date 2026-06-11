@@ -16,6 +16,7 @@
 import os
 from functools import partial
 from pathlib import Path
+from typing import Any
 
 import modelopt.torch.quantization as mtq
 import torch
@@ -26,7 +27,7 @@ from megatron.bridge.models.mamba.mamba_provider import (
     transformer_engine_mamba_stack_spec,
 )
 from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
-from modelopt.torch.quantization.config import need_calibration
+from modelopt.torch.quantization.config import normalize_quant_cfg_list
 from modelopt.torch.utils.dataset_utils import (
     create_forward_loop,
     get_dataset_dataloader,
@@ -39,6 +40,10 @@ from nemo_rl.modelopt.utils import resolve_quant_cfg
 
 MAX_SEQ_LEN = 2048
 MAX_OUTPUT_LEN = 512
+# Calibration dataloader defaults used when the optional
+# policy.quant_batch_size / policy.quant_sequence_length config keys are unset.
+DEFAULT_CALIB_BATCH_SIZE = 32
+DEFAULT_CALIB_SAMPLE_LENGTH = 1024
 
 
 def symlink_pre_quantized_model(src: str, pretrained_path: str) -> None:
@@ -76,6 +81,34 @@ class _DictDataset(Dataset):
         return len(next(iter(self.data.values())))
 
 
+def _pad_or_truncate_input_ids(
+    input_ids: torch.Tensor,
+    *,
+    max_length: int | None = None,
+    multiple: int = 1,
+    pad_token_id: int = 0,
+) -> torch.Tensor:
+    if max_length is not None and input_ids.shape[-1] > max_length:
+        input_ids = input_ids[..., :max_length]
+
+    if multiple <= 1:
+        return input_ids.contiguous()
+
+    seq_len = input_ids.shape[-1]
+    padded_len = ((seq_len + multiple - 1) // multiple) * multiple
+    pad_len = padded_len - seq_len
+    if pad_len == 0:
+        return input_ids.contiguous()
+
+    padding = torch.full(
+        (*input_ids.shape[:-1], pad_len),
+        pad_token_id,
+        dtype=input_ids.dtype,
+        device=input_ids.device,
+    )
+    return torch.cat((input_ids, padding), dim=-1).contiguous()
+
+
 def get_forward_loop_func(
     is_megatron: bool,
     calib_dataloader: DataLoader,
@@ -84,11 +117,53 @@ def get_forward_loop_func(
     if not is_megatron:
         return create_forward_loop(dataloader=calib_dataloader)
 
+    from megatron.core import parallel_state
+
+    cp_size = parallel_state.get_context_parallel_world_size()
+    pad_multiple = max(1, 2 * cp_size)
+
     def _forward_loop(model):
         for batch in calib_dataloader:
-            megatron_prefill(model, batch["input_ids"], skip_return_logits=True)
+            input_ids = _pad_or_truncate_input_ids(
+                batch["input_ids"],
+                multiple=pad_multiple,
+            )
+            megatron_prefill(model, input_ids, skip_return_logits=True)
 
     return _forward_loop
+
+
+def _requires_forward_calibration(config: dict[str, Any]) -> bool:
+    """Return whether this config needs data-driven activation calibration."""
+    algorithm = config.get("algorithm")
+    if algorithm is not None and algorithm != "max":
+        return True
+
+    def _needs_stats(cfg: dict[str, Any]) -> bool:
+        if not cfg.get("enable", True):
+            return False
+        if cfg.get("type") == "dynamic":
+            return False
+        return not cfg.get("use_constant_amax", False)
+
+    for entry in normalize_quant_cfg_list(config.get("quant_cfg") or []):
+        name = entry["quantizer_name"]
+        if "weight_quantizer" in name:
+            continue
+
+        raw_cfg = entry.get("cfg")
+        if isinstance(raw_cfg, list):
+            if any(_needs_stats(dict(cfg)) for cfg in raw_cfg):
+                return True
+            continue
+
+        cfg = dict(raw_cfg or {})
+        if "enable" in entry:
+            cfg["enable"] = entry["enable"]
+        if _needs_stats(cfg):
+            return True
+
+    return False
 
 
 def quantize_model(
@@ -97,9 +172,9 @@ def quantize_model(
     tokenizer,
     calib_size,
     is_megatron: bool = False,
-    batch_size=32,
-    data="cnn_dailymail",
-    max_sample_length=1024,
+    batch_size=None,
+    data=None,
+    max_sample_length=None,
 ):
     """Quantizes the model with the provided calibration dataset.
 
@@ -113,37 +188,47 @@ def quantize_model(
         auto_quantize_bits: The effective bits constraint for auto_quantize.
         data: the name of the calibration dataset.
     """
-    device = (
-        model.device if hasattr(model, "device") else next(model.parameters()).device
-    )
-    if data == "random":
-        calib_size = 1
-        calib_dataloader = DataLoader(
-            _DictDataset({"input_ids": torch.randint(0, 100, (1, 5), device=device)}),
-            batch_size=1,
-        )
-    else:
-        calib_dataloader = get_dataset_dataloader(
-            dataset_name=data,
-            tokenizer=tokenizer,
-            batch_size=batch_size,
-            num_samples=calib_size,
-            device=device,
-            include_labels=False,
-            max_sample_length=max_sample_length,
-        )
-
     mtq_cfg = resolve_quant_cfg(quant_cfg)
-
-    forward_loop = None
-    use_calibration = need_calibration(mtq_cfg)
+    use_calibration = _requires_forward_calibration(mtq_cfg)
     if not use_calibration:
-        print("Dynamic quantization. Calibration skipped.")
+        forward_loop = None
     else:
+        if data is None:
+            raise ValueError(
+                "policy.quant_calib_data is required by this quantization config."
+            )
+        device = (
+            model.device
+            if hasattr(model, "device")
+            else next(model.parameters()).device
+        )
+        if data == "random":
+            calib_size = 1
+            calib_dataloader = DataLoader(
+                _DictDataset(
+                    {"input_ids": torch.randint(0, 100, (1, 5), device=device)}
+                ),
+                batch_size=1,
+            )
+        else:
+            calib_dataloader = get_dataset_dataloader(
+                dataset_name=data,
+                tokenizer=tokenizer,
+                batch_size=batch_size
+                if batch_size is not None
+                else DEFAULT_CALIB_BATCH_SIZE,
+                num_samples=calib_size,
+                device=device,
+                include_labels=False,
+                max_sample_length=(
+                    max_sample_length
+                    if max_sample_length is not None
+                    else DEFAULT_CALIB_SAMPLE_LENGTH
+                ),
+            )
         forward_loop = get_forward_loop_func(is_megatron, calib_dataloader)
 
-    model = mtq.quantize(model, mtq_cfg, forward_loop)
-    mtq.print_quant_summary(model)
+    mtq.quantize(model, mtq_cfg, forward_loop)
 
 
 def get_modelopt_checkpoint_dir() -> str:
