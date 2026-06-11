@@ -39,6 +39,13 @@ sudo apt install cudnn  # Will install cuDNN meta packages which points to the l
 # sudo apt install cudnn9-cuda-12-8  # Will install cuDNN version 9.x.x compiled for cuda 12.8
 ```
 
+> [!NOTE]
+> **cuDNN in Ray worker virtual environments**: Even when cuDNN is installed on the host system, Ray worker processes run in isolated virtual environments (`/opt/ray_venvs/`) that may not have access to system CUDA libraries. If you see errors like `libcudnn.so.9: cannot open shared object file`, ensure that the CUDA library paths are included in `LD_LIBRARY_PATH`:
+> ```sh
+> export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
+> ```
+> Alternatively, you can fall back to Flash Attention by setting `export VLLM_ATTENTION_BACKEND=FLASH_ATTENTION`.
+
 ### libibverbs (For vLLM Dependencies)
 
 If you encounter problems when installing vllm's dependency `deepspeed` on bare-metal (outside of a container), you may need to install `libibverbs-dev`:
