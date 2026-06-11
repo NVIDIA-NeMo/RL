@@ -21,9 +21,78 @@ from nemo_rl.data.llm_message_utils import (
     add_loss_mask_to_message_log,
     batched_message_log_to_flat_message,
 )
+from nemo_rl.data.soft_tokens import (
+    SOFT_TOKEN_EMBEDDINGS_KEY,
+    SOFT_TOKEN_POSITIONS_KEY,
+    VLLM_PROMPT_EMBEDS_KEY,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 TokenizerType = Union[PreTrainedTokenizerBase, AutoProcessor]
+
+
+def _collate_optional_tensor_field(
+    data_batch: list[DatumSpec],
+    key: str,
+    padding_value: int | float,
+) -> torch.Tensor | None:
+    if not any(key in datum_spec for datum_spec in data_batch):
+        return None
+
+    missing_indices = [
+        idx for idx, datum_spec in enumerate(data_batch) if key not in datum_spec
+    ]
+    if missing_indices:
+        raise ValueError(
+            f"{key} must be present on every sample in a batch. "
+            f"Missing sample indices: {missing_indices}"
+        )
+
+    tensors = [datum_spec[key] for datum_spec in data_batch]
+    if not all(torch.is_tensor(tensor) for tensor in tensors):
+        raise TypeError(f"{key} must contain torch.Tensor values")
+
+    tensor_ndim = tensors[0].ndim
+    if tensor_ndim == 0:
+        raise ValueError(f"{key} must have at least one dimension")
+    if any(tensor.ndim != tensor_ndim for tensor in tensors):
+        raise ValueError(f"{key} tensors must have the same rank")
+
+    trailing_shape = tensors[0].shape[1:]
+    if any(tensor.shape[1:] != trailing_shape for tensor in tensors):
+        raise ValueError(f"{key} tensors must have matching trailing dimensions")
+
+    max_length = max(tensor.shape[0] for tensor in tensors)
+    padded_tensors = []
+    for tensor in tensors:
+        pad_length = max_length - tensor.shape[0]
+        if pad_length > 0:
+            pad_shape = (pad_length, *tensor.shape[1:])
+            padding = torch.full(
+                pad_shape,
+                padding_value,
+                dtype=tensor.dtype,
+                device=tensor.device,
+            )
+            tensor = torch.cat([tensor, padding], dim=0)
+        padded_tensors.append(tensor)
+
+    return torch.stack(padded_tensors, dim=0)
+
+
+def _collate_soft_token_fields(
+    data_batch: list[DatumSpec],
+) -> dict[str, torch.Tensor]:
+    extra_args = {}
+    for key, padding_value in (
+        (SOFT_TOKEN_EMBEDDINGS_KEY, 0.0),
+        (SOFT_TOKEN_POSITIONS_KEY, -1),
+        (VLLM_PROMPT_EMBEDS_KEY, 0.0),
+    ):
+        collated = _collate_optional_tensor_field(data_batch, key, padding_value)
+        if collated is not None:
+            extra_args[key] = collated
+    return extra_args
 
 
 def rl_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
@@ -60,6 +129,8 @@ def rl_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
         extra_args["vllm_images"] = vllm_images
         extra_args["vllm_videos"] = vllm_videos
         extra_args["vllm_audios"] = vllm_audios
+
+    extra_args.update(_collate_soft_token_fields(data_batch))
 
     output: BatchedDataDict[Any] = BatchedDataDict(
         message_log=message_log,
@@ -132,6 +203,8 @@ def eval_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
         extra_args["vllm_audios"] = [
             datum_spec.get("vllm_audios", []) for datum_spec in data_batch
         ]
+
+    extra_args.update(_collate_soft_token_fields(data_batch))
 
     output: BatchedDataDict[Any] = BatchedDataDict(
         message_log=message_log,

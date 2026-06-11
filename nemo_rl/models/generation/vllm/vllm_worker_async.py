@@ -703,6 +703,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             return
 
         verify_right_padding(data, pad_value=self.cfg["_pad_token_id"])
+        self._validate_prompt_embeds_config(data)
 
         input_ids_batch = data["input_ids"]
         input_lengths_batch = data["input_lengths"]

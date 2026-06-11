@@ -45,6 +45,15 @@ class PreferenceDatasetConfig(TypedDict):
     system_prompt_file: NotRequired[str | None]
 
 
+class SoftTokenDataConfig(TypedDict):
+    mode: Literal["smoke", "datum"]
+    vllm_prompt_mode: Literal["prompt_embeds", "token_ids"]
+    hidden_size: int
+    num_soft_tokens: int
+    scale: float
+    seed: int
+
+
 class DataConfig(TypedDict):
     max_input_seq_length: int | None
     add_bos: NotRequired[bool]
@@ -72,6 +81,7 @@ class DataConfig(TypedDict):
     ]
     # default settings for all datasets, will be overridden by dataset-specific settings
     default: NotRequired[ResponseDatasetConfig | PreferenceDatasetConfig | None]
+    soft_token: NotRequired[SoftTokenDataConfig]
 
 
 # ===============================================================================

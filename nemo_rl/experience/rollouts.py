@@ -38,6 +38,12 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
+from nemo_rl.data.soft_tokens import (
+    copy_soft_token_inputs,
+    copy_vllm_prompt_embeds,
+    get_sample_soft_token_inputs,
+    get_sample_vllm_prompt_embeds,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
@@ -429,6 +435,8 @@ def run_multi_turn_rollout(
                 "stop_strings": active_stop_strings,
             }
         )
+        copy_soft_token_inputs(active_batch, generation_input_data)
+        copy_vllm_prompt_embeds(active_batch, generation_input_data)
         # add the multimodal data to the generation input data
         multimodal_data = active_flat_messages.get_multimodal_dict(as_tensors=False)
         generation_input_data.update(multimodal_data)
@@ -604,6 +612,8 @@ async def async_generate_response_for_sample_turn(
     sample_stop_strings: list[str] | None,
     tokenizer: TokenizerType,
     max_seq_len: int,
+    soft_token_inputs: Optional[dict[str, torch.Tensor]] = None,
+    vllm_prompt_embeds: Optional[dict[str, torch.Tensor]] = None,
     greedy: bool = False,
 ) -> tuple[list[dict], torch.Tensor, torch.Tensor, dict[str, float]]:
     """Generate a response for a single sample's turn using async generation.
@@ -638,6 +648,10 @@ async def async_generate_response_for_sample_turn(
             "stop_strings": [sample_stop_strings],
         }
     )
+    if soft_token_inputs:
+        copy_soft_token_inputs(soft_token_inputs, generation_input_data)
+    if vllm_prompt_embeds:
+        copy_vllm_prompt_embeds(vllm_prompt_embeds, generation_input_data)
 
     # Create a dummy batch for generate_responses_async
     dummy_batch = BatchedDataDict[DatumSpec](
@@ -697,6 +711,8 @@ async def run_sample_multi_turn_rollout(
     current_message_log = copy.deepcopy(initial_sample_state["message_log"])
     current_extra_env_info = copy.deepcopy(initial_sample_state["extra_env_info"])
     current_stop_strings = initial_sample_state.get("stop_strings", None)
+    soft_token_inputs = initial_sample_state.get("soft_token_inputs", None)
+    vllm_prompt_embeds = initial_sample_state.get("vllm_prompt_embeds", None)
     task_name = initial_sample_state["task_name"]
 
     # Sample-level metrics
@@ -739,6 +755,8 @@ async def run_sample_multi_turn_rollout(
                 current_stop_strings,
                 tokenizer,
                 max_seq_len,
+                soft_token_inputs=soft_token_inputs,
+                vllm_prompt_embeds=vllm_prompt_embeds,
                 greedy=greedy,
             )
             current_message_log = updated_message_log
@@ -911,6 +929,12 @@ def run_async_multi_turn_rollout(
                 "stop_strings": input_batch.get("stop_strings", [None] * batch_size)[i],
                 "idx": input_batch.get("idx", list(range(batch_size)))[i],
             }
+            soft_token_inputs = get_sample_soft_token_inputs(input_batch, i)
+            if soft_token_inputs:
+                sample_state["soft_token_inputs"] = soft_token_inputs
+            sample_vllm_prompt_embeds = get_sample_vllm_prompt_embeds(input_batch, i)
+            if sample_vllm_prompt_embeds:
+                sample_state["vllm_prompt_embeds"] = sample_vllm_prompt_embeds
             sample_initial_states.append(sample_state)
 
         # Run all samples concurrently

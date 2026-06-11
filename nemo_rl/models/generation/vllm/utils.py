@@ -15,6 +15,10 @@
 from collections import defaultdict
 from typing import Any, Optional
 
+from nemo_rl.data.soft_tokens import (
+    get_vllm_prompt_embeds_for_sample,
+    has_vllm_prompt_embeds,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 
@@ -24,7 +28,8 @@ def format_prompt_for_vllm_generation(
 ) -> list[dict[str, Any]]:
     """Format a list of prompts for vllm generation (which requires a specific format for its own `generate` method).
 
-    See https://docs.vllm.ai/en/v0.9.1/features/multimodal_inputs.html for prompt format for multimodal inputs.
+    Supports tokenized prompts, vLLM multimodal prompts, and precomputed
+    prompt embeddings.
     """
     # Prepare prompts for vLLM (removing padding)
     prompts = []
@@ -52,6 +57,19 @@ def format_prompt_for_vllm_generation(
         )
         token_ids = valid_ids.tolist()
         return {"prompt_token_ids": token_ids}
+
+    def _get_prompt_embeds_prompt(index: int):
+        valid_length = input_lengths[index].item()
+        return {
+            "prompt_embeds": get_vllm_prompt_embeds_for_sample(
+                data, index, valid_length
+            )
+        }
+
+    if has_vllm_prompt_embeds(data):
+        for i in range(start_idx, end_idx):
+            prompts.append(_get_prompt_embeds_prompt(i))
+        return prompts if return_all else prompts[0]
 
     # Check if this is VLM generation by looking for message_log with images
     # Support for videos/audio/etc. can be added here

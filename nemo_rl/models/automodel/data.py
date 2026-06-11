@@ -22,6 +22,11 @@ import torch
 from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
+from nemo_rl.data.soft_tokens import (
+    SOFT_TOKEN_KEYS,
+    copy_soft_token_inputs,
+    has_soft_token_inputs,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.huggingface.common import (
     get_flash_attention_kwargs,
@@ -50,6 +55,8 @@ class ProcessedInputs:
 
     # Multimodal (VLM) inputs
     vlm_kwargs: dict[str, Any] = field(default_factory=dict)
+
+    soft_token_kwargs: dict[str, Any] = field(default_factory=dict)
 
     # Context parallel support (cp_size > 1)
     cp_buffers: list[torch.Tensor] = field(default_factory=list)
@@ -164,6 +171,15 @@ def get_microbatch_iterator(
     """
     # Infer enable_seq_packing from config to mirror mcore pattern
     enable_seq_packing = cfg.get("sequence_packing", {}).get("enabled", False)
+    has_soft_tokens = has_soft_token_inputs(data)
+    if has_soft_tokens and enable_seq_packing:
+        raise NotImplementedError(
+            "soft-token embeddings are not supported with sequence packing"
+        )
+    if has_soft_tokens and cfg["dynamic_batching"]["enabled"]:
+        raise NotImplementedError(
+            "soft-token embeddings are not supported with dynamic batching"
+        )
 
     dummy_iterator: Iterator[BatchedDataDict[Any]] = iter([])
 
@@ -217,6 +233,12 @@ def process_microbatch(
         ProcessedInputs containing all tensors and metadata for forward pass
     """
     input_ids = mb.get("input_ids").cuda()
+    soft_token_kwargs: dict[str, Any] = {}
+    copy_soft_token_inputs(mb, soft_token_kwargs)
+    if soft_token_kwargs and cp_size > 1:
+        raise NotImplementedError(
+            "soft-token embeddings are not supported with context parallelism"
+        )
 
     if enable_seq_packing:
         input_ids, position_ids, _ = pack_sequences(
@@ -289,6 +311,7 @@ def process_microbatch(
         position_ids=position_ids,
         flash_attn_kwargs=flash_attn_kwargs,
         vlm_kwargs=vlm_kwargs,
+        soft_token_kwargs=soft_token_kwargs,
         cp_buffers=cp_buffers,
         seq_index=seq_index,
         seq_len=seq_len,
@@ -365,7 +388,9 @@ def check_sequence_dim(data: BatchedDataDict[Any]) -> Tuple[int, int]:
     """
     sequence_dim = 1
     seq_dim_size = data.get("input_ids").shape[sequence_dim]
-    for _, v in data.items():
+    for key, v in data.items():
+        if key in SOFT_TOKEN_KEYS:
+            continue
         if torch.is_tensor(v) and len(v.shape) > 1:
             assert v.shape[sequence_dim] == seq_dim_size, (
                 f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"

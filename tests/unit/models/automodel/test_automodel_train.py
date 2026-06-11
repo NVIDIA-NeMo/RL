@@ -683,6 +683,21 @@ class TestCheckSequenceDim:
         assert seq_dim == 1
         assert seq_dim_size == 64
 
+    def test_ignores_soft_token_prefix_tensors(self):
+        data = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 1000, (4, 64)),
+                "attention_mask": torch.ones(4, 64, dtype=torch.bool),
+                "soft_token_embeddings": torch.randn(4, 8, 32),
+                "soft_token_positions": torch.arange(8).repeat(4, 1),
+            }
+        )
+
+        seq_dim, seq_dim_size = check_sequence_dim(data)
+
+        assert seq_dim == 1
+        assert seq_dim_size == 64
+
 
 # =====================
 # Test ProcessedInputs properties

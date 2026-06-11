@@ -17,6 +17,7 @@ import math
 import pytest
 import torch
 
+from nemo_rl.data.soft_tokens import VLLM_PROMPT_EMBEDS_KEY
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.vllm.utils import (
     aggregate_spec_decode_counters,
@@ -116,6 +117,47 @@ def test_vllm_utils_vlm_with_none_content_fallback_to_tokens_and_sample_idx():
     p1 = format_prompt_for_vllm_generation(data, sample_idx=1)
     assert isinstance(p0, dict) and isinstance(p1, dict)
     assert "prompt_token_ids" in p0 and "prompt_token_ids" in p1
+
+
+def test_vllm_utils_prompt_embeds_override_other_prompt_forms():
+    input_ids, input_lengths = _mk_inputs()
+    prompt_embeds = torch.randn(2, 5, 4)
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "vllm_content": ["ignored", "also ignored"],
+            "vllm_images": [["img1"], ["img2"]],
+            VLLM_PROMPT_EMBEDS_KEY: prompt_embeds,
+        }
+    )
+
+    prompts = format_prompt_for_vllm_generation(data)
+
+    assert len(prompts) == 2
+    assert set(prompts[0]) == {"prompt_embeds"}
+    torch.testing.assert_close(prompts[0]["prompt_embeds"], prompt_embeds[0, :5])
+    torch.testing.assert_close(prompts[1]["prompt_embeds"], prompt_embeds[1, :3])
+
+
+def test_vllm_worker_prompt_embeds_require_vllm_flag():
+    from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
+
+    worker = object.__new__(BaseVllmGenerationWorker)
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[1, 2]]),
+            "input_lengths": torch.tensor([2], dtype=torch.int32),
+            VLLM_PROMPT_EMBEDS_KEY: torch.zeros(1, 2, 4),
+        }
+    )
+
+    worker.cfg = {"vllm_kwargs": {}}
+    with pytest.raises(ValueError, match="enable_prompt_embeds=true"):
+        worker._validate_prompt_embeds_config(data)
+
+    worker.cfg = {"vllm_kwargs": {"enable_prompt_embeds": True}}
+    worker._validate_prompt_embeds_config(data)
 
 
 @pytest.mark.vllm

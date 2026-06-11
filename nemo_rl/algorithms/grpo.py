@@ -57,6 +57,7 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
+from nemo_rl.data.soft_tokens import copy_soft_token_inputs
 from nemo_rl.data.utils import extract_necessary_env_names
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
@@ -1482,6 +1483,7 @@ def grpo_train(
                             calibration_data.update(
                                 calib_flat.get_multimodal_dict(as_tensors=False)
                             )
+                            copy_soft_token_inputs(repeated_batch, calibration_data)
                             calibration_data.to("cpu")
                             kv_scales_cache = policy.calibrate_qkv_fp8_scales(
                                 calibration_data, include_q=True
@@ -1723,6 +1725,7 @@ def grpo_train(
                         as_tensors=False
                     )
                     train_data.update(extra_multimodal_data)
+                    copy_soft_token_inputs(repeated_batch, train_data)
                     train_data.to("cpu")
 
                     metrics_logging_data["content"] = flat_messages["content"]
@@ -1744,6 +1747,7 @@ def grpo_train(
                             **extra_multimodal_data,
                         }
                     )
+                    copy_soft_token_inputs(repeated_batch, logprob_data)
                     train_data["prev_logprobs"] = policy.get_logprobs(
                         logprob_data, timer=timer
                     )["logprobs"]
@@ -2786,6 +2790,7 @@ def async_grpo_train(
                             "sample_mask": repeated_batch["loss_multiplier"],
                         }
                     )
+                    copy_soft_token_inputs(repeated_batch, train_data)
                     train_data.to("cpu")
 
                 # Training phase (same as sync version)

@@ -44,6 +44,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
 from nemo_rl.algorithms.loss import SequencePackingLossWrapper, prepare_loss_input
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
+from nemo_rl.data.soft_tokens import soft_token_embedding_override
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
@@ -97,6 +98,8 @@ def model_forward(
         if "flash_attn_kwargs" in model_args:
             del model_args["flash_attn_kwargs"]
 
+    model_args.update(processed_inputs.soft_token_kwargs)
+
     is_gemma3 = isinstance(model, Gemma3ForCausalLM) or isinstance(
         model, Gemma3ForConditionalGeneration
     )
@@ -112,7 +115,8 @@ def model_forward(
     if not allow_flash_attn_args and "flash_attn_kwargs" in model_args:
         del model_args["flash_attn_kwargs"]
 
-    outputs = model(**model_args)
+    with soft_token_embedding_override(model, model_args) as model_args:
+        outputs = model(**model_args)
     return outputs
 
 

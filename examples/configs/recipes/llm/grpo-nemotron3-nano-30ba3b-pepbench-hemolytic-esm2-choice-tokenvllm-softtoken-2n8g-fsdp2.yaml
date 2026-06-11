@@ -1,0 +1,77 @@
+defaults: ./grpo-nanov3-30BA3B-2n8g-fsdp2.yaml
+
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 4
+  max_num_steps: 5
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  async_grpo:
+    enabled: false
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo-nemotron3-nano-30ba3b-pepbench-hemolytic-esm2-choice-tokenvllm-softtoken-2n8g-fsdp2
+
+policy:
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  generation_batch_size: 32
+  logprob_batch_size: 1
+  max_total_sequence_length: 512
+  dynamic_batching:
+    enabled: false
+  sequence_packing:
+    enabled: false
+  make_sequence_length_divisible_by: 1
+  dtensor_cfg:
+    context_parallel_size: 1
+  generation:
+    max_new_tokens: 16
+    temperature: 1.0
+    top_p: 1.0
+    vllm_cfg:
+      max_model_len: 512
+    vllm_kwargs: {}
+
+data:
+  max_input_seq_length: 512
+  num_workers: 1
+  train:
+    dataset_name: ResponseDataset
+    data_path: datasets/pepbenchmark/hemolytic-esm2-choice-softtokens/train.jsonl
+    split: train
+    split_validation_size: 0
+  validation:
+    dataset_name: ResponseDataset
+    data_path: datasets/pepbenchmark/hemolytic-esm2-choice-softtokens/validation.jsonl
+    split: train
+    split_validation_size: 0
+  default:
+    prompt_file: null
+    system_prompt_file: null
+    processor: soft_token_math_hf_data_processor
+    env_name: math
+  soft_token:
+    mode: datum
+    vllm_prompt_mode: token_ids
+    hidden_size: 2688
+    num_soft_tokens: 8
+    scale: 0.01
+    seed: 1234
+
+env:
+  math:
+    num_workers: 8
+    verifier_type: english_multichoice
+    math_verify_impl: hf_math_verify
+
+logger:
+  log_dir: logs/grpo-nemotron3-nano-30ba3b-pepbench-hemolytic-esm2-choice-tokenvllm-softtoken-2n8g-fsdp2
+  monitor_gpus: false
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-nemotron3-nano-30ba3b-pepbench-hemolytic-esm2-choice-tokenvllm-softtoken-2n8g-fsdp2

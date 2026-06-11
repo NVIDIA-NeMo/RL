@@ -23,6 +23,7 @@ import ray
 import torch
 from transformers import AutoConfig
 
+from nemo_rl.data.soft_tokens import has_vllm_prompt_embeds
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.interfaces import (
@@ -45,6 +46,19 @@ class BaseVllmGenerationWorker:
         This makes it easier to identify which worker is producing specific log messages.
         """
         return f"{self.__class__.__name__}"
+
+    def _validate_prompt_embeds_config(
+        self, data: BatchedDataDict[GenerationDatumSpec]
+    ) -> None:
+        if not has_vllm_prompt_embeds(data):
+            return
+
+        vllm_kwargs = self.cfg.get("vllm_kwargs", None)
+        if vllm_kwargs is None or vllm_kwargs.get("enable_prompt_embeds") is not True:
+            raise ValueError(
+                "vllm_prompt_embeds requires "
+                "policy.generation.vllm_kwargs.enable_prompt_embeds=true"
+            )
 
     @staticmethod
     def configure_worker(
@@ -732,6 +746,7 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
 
         # verify inputs have correct padding
         verify_right_padding(data, pad_value=self.cfg["_pad_token_id"])
+        self._validate_prompt_embeds_config(data)
 
         # Original input length with padding
         padded_input_length = input_ids.size(1)
