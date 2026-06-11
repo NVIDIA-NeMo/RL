@@ -82,7 +82,15 @@ def monkey_patch_vllm_ray_executor(fp8_config):
     if fp8_config.model_parallel_size > 1:
         # we patch vllm's collective_rpc so that before vllm initalizes the model on each rank, we execute
         # a ray remote that patches each worker with the required fp8 vllm patches
-        from vllm.v1.executor.ray_executor import RayDistributedExecutor
+        # vLLM 0.20.0 renamed this module ray_distributed_executor -> ray_executor
+        # (the class RayDistributedExecutor is unchanged). Support both so the FP8
+        # refit path works on vLLM 0.17.x (v0.6.0 container) and >=0.20.0 (main).
+        try:
+            from vllm.v1.executor.ray_executor import RayDistributedExecutor
+        except ImportError:
+            from vllm.v1.executor.ray_distributed_executor import (
+                RayDistributedExecutor,
+            )
 
         original_run_workers = RayDistributedExecutor.collective_rpc
 
