@@ -167,8 +167,8 @@ logger:
   swanlab_enabled: false
   monitor_gpus: false
   wandb:
-    project: "ashors-grpo-dev"
+    project: "grpo-dev"
     name: "grpo-tau-bench-local-qwen7b"
   mlflow:
-    experiment_name: "dapo-dev"
+    experiment_name: "grpo-dev"
     run_name: "grpo-tau-bench-local"

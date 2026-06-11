@@ -176,7 +176,7 @@ class TestParseAction:
     def test_empty_string_returns_respond(self, worker):
         action = worker._parse_action("")
         assert action.name == "respond"
-        assert action.kwargs["content"] == ""
+        assert action.kwargs["content"] == "[no response]"
 
     def test_tool_call_with_leading_trailing_text(self, worker):
         text = "Okay, I will cancel it now. <tool_call>{'name': 'cancel_order', 'arguments': {}}</tool_call> Done."

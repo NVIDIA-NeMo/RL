@@ -721,10 +721,8 @@ def tau_bench_data_processor(
       - extra_env_info: {task_index, episode_id, step_count}
       - task_name: "tau_bench"
 
-    The full system + user prompt is collapsed into a single message_log entry
-    (role "user") whose content is the chat-template-formatted string.  This is
-    the same layout used by math_hf_data_processor and is required because the
-    multi-turn rollout loop appends subsequent turns on top of this entry.
+    Returns a message_log with one entry per input message (system + user).
+    The multi-turn rollout loop appends subsequent turns on top of these entries.
     """
     messages = datum_dict["messages"]
     extra_env_info = datum_dict["extra_env_info"]

@@ -46,7 +46,17 @@ from nemo_rl.data.processors import (
 from nemo_rl.models.policy import TokenizerConfig
 
 
+class _FakeInnerTokenizer:
+    model_input_names: list[str] = ["input_ids"]
+
+
 class DummyTokenizer:
+    model_input_names: list[str] = ["input_ids"]
+    # Required so get_multimodal_keys_from_processor can compute the diff
+    # "all multimodal keys minus base tokenizer keys" without crashing.
+    tokenizer = _FakeInnerTokenizer()
+    bos_token = None
+
     def apply_chat_template(
         self,
         messages,
@@ -380,8 +390,10 @@ def test_tau_bench_data_processor_returns_valid_datum_spec():
     assert result["task_name"] == "tau_bench"
     assert result["loss_multiplier"] == 1.0
     assert isinstance(result["length"], int) and result["length"] > 0
-    assert len(result["message_log"]) == 1
-    msg = result["message_log"][0]
+    # get_formatted_message_log produces one entry per input message (system + user).
+    assert len(result["message_log"]) == 2
+    assert result["message_log"][0]["role"] == "system"
+    msg = result["message_log"][-1]
     assert msg["role"] == "user"
     assert "Cancel my order O123." in msg["content"]
     assert isinstance(msg["token_ids"], torch.Tensor)
