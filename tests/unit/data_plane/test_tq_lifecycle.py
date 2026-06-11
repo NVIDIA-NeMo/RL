@@ -66,6 +66,7 @@ def tq_client():
 
 
 @pytest.fixture(
+    scope="module",
     params=["simple", "mooncake_cpu"],
     ids=["simple", "mooncake_cpu"],
 )
@@ -74,6 +75,9 @@ def tq_client_backends(request):
 
     mooncake_cpu is skipped when the mooncake wheel is not installed.
     Set NEMO_RL_REQUIRE_MOONCAKE=1 to promote the skip to a loud failure.
+
+    Module-scoped to dodge mooncake's close→re-init race (stale C++ mount
+    registry); safe because each test uses a distinct ``partition_id``.
     """
     backend = request.param
     if backend == "mooncake_cpu" and not mooncake_available():
