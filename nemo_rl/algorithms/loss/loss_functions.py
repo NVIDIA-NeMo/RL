@@ -1136,9 +1136,9 @@ class SDPOLossFn(LossFunction):
         student_topk_logprobs: torch.Tensor,
         teacher_topk_logprobs: torch.Tensor,
         H_all: Optional[torch.Tensor],
-        data: BatchedDataDict,
-        global_valid_seqs: torch.Tensor,
-        global_valid_toks: torch.Tensor,
+        data: BatchedDataDict, # dummy comment
+        global_valid_seqs: torch.Tensor, # dummy comment
+        global_valid_toks: torch.Tensor, # dummy comment
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute the SDPO logit-level KL loss.
 
