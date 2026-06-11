@@ -25,7 +25,11 @@ from nemo_rl.algorithms.grpo import MasterConfig
 from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
-from nemo_rl.environments.nemo_gym import NemoGym, NemoGymConfig, setup_nemo_gym_config
+from nemo_rl.environments.nemo_gym import (
+    NemoGym,
+    NemoGymConfig,
+    setup_nemo_gym_config,
+)
 from nemo_rl.models.generation.vllm import VllmGeneration
 
 # cluster and tokenizer are fixture imports
@@ -114,7 +118,7 @@ rollout_max_attempts_to_avoid_lp_nan: 1
     ).remote(config)
 
     # Blocking wait for NeMo-Gym to spin up
-    ray.get(env.health_check.remote())
+    ray.get(env._spinup.remote())
 
     yield env
     # Clean up the actor and wait for it to be killed
@@ -196,9 +200,12 @@ def test_nemo_gym_postprocess_uses_batch_decode():
         "responses_create_params": {"input": []},
     }
 
+    class _MockSelf:
+        cfg = {}
+
     result = (
         NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
-            None, nemo_gym_result, tokenizer
+            _MockSelf(), nemo_gym_result, tokenizer
         )
     )
 
@@ -272,6 +279,8 @@ def test_nemo_gym_sanity(
                 message["prompt_str"] = "dummy prompt_str"
             if "generation_str" in message:
                 message["generation_str"] = "dummy generation_str"
+            message.setdefault("is_invalid_tool_call", False)
+            message.setdefault("has_malformed_thinking", False)
 
         return d
 

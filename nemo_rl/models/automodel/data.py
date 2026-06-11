@@ -16,7 +16,7 @@
 
 import itertools
 from dataclasses import dataclass, field
-from typing import Any, Iterator, Optional, Tuple
+from typing import Any, Iterable, Iterator, Optional, Tuple
 
 import torch
 from transformers import AutoTokenizer
@@ -348,7 +348,11 @@ def process_global_batch(
     }
 
 
-def check_sequence_dim(data: BatchedDataDict[Any]) -> Tuple[int, int]:
+def check_sequence_dim(
+    data: BatchedDataDict[Any],
+    *,
+    skip_keys: Optional[Iterable[str]] = None,
+) -> Tuple[int, int]:
     """Check and validate sequence dimension across all tensors.
 
     Verifies that dimension 1 is the sequence dimension for all tensors
@@ -356,6 +360,10 @@ def check_sequence_dim(data: BatchedDataDict[Any]) -> Tuple[int, int]:
 
     Args:
         data: BatchedDataDict to validate
+        skip_keys: Keys whose tensors are not student-sequence-aligned at
+            dim 1 and should be excluded from the check (e.g. cross-tokenizer
+            teacher and alignment auxiliaries that ride along on the same
+            BatchedDataDict).
 
     Returns:
         Tuple of (sequence_dim, seq_dim_size)
@@ -363,9 +371,12 @@ def check_sequence_dim(data: BatchedDataDict[Any]) -> Tuple[int, int]:
     Raises:
         AssertionError: If any tensor has inconsistent sequence dimension
     """
+    skip_set = set(skip_keys) if skip_keys is not None else set()
     sequence_dim = 1
     seq_dim_size = data.get("input_ids").shape[sequence_dim]
-    for _, v in data.items():
+    for k, v in data.items():
+        if k in skip_set:
+            continue
         if torch.is_tensor(v) and len(v.shape) > 1:
             assert v.shape[sequence_dim] == seq_dim_size, (
                 f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape}"

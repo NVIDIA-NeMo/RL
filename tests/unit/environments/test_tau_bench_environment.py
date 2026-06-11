@@ -26,6 +26,7 @@ import torch
 # Module-level mocks: tau_bench is an optional dependency not available in CI
 # ---------------------------------------------------------------------------
 
+
 def _make_module(name):
     mod = types.ModuleType(name)
     mod.__spec__ = importlib.util.spec_from_loader(name, loader=None)
@@ -70,6 +71,7 @@ from nemo_rl.environments.tau_bench_environment import (
 # ---------------------------------------------------------------------------
 # Helpers: instantiate the underlying (non-Ray) classes for unit testing
 # ---------------------------------------------------------------------------
+
 
 def _make_worker(
     judge_model=None,
@@ -119,7 +121,7 @@ class TestToolCallRegex:
         assert m.group(1).strip() == '{"name": "foo"}'
 
     def test_matches_multiline_tool_call(self):
-        text = "<tool_call>\n  {\"name\": \"bar\"}\n</tool_call>"
+        text = '<tool_call>\n  {"name": "bar"}\n</tool_call>'
         m = _TOOL_CALL_RE.search(text)
         assert m is not None
 
@@ -185,7 +187,7 @@ class TestParseAction:
         assert action.name == "respond"
 
     def test_tool_call_whitespace_stripped(self, worker):
-        text = "<tool_call>  \n  {\"name\": \"find_user\", \"arguments\": {\"id\": 1}}  \n  </tool_call>"
+        text = '<tool_call>  \n  {"name": "find_user", "arguments": {"id": 1}}  \n  </tool_call>'
         action = worker._parse_action(text)
         assert action.name == "find_user"
         assert action.kwargs == {"id": 1}
@@ -214,7 +216,9 @@ class TestCallJudge:
         return resp
 
     def test_successful_judge_call_returns_score(self, worker):
-        with mock.patch("litellm.completion", return_value=self._make_response(0.9)) as mock_completion:
+        with mock.patch(
+            "litellm.completion", return_value=self._make_response(0.9)
+        ) as mock_completion:
             score = worker._call_judge(
                 [{"role": "user", "content": "hello"}],
                 domain_rules="Be helpful.",
@@ -224,13 +228,17 @@ class TestCallJudge:
         mock_completion.assert_called_once()
 
     def test_judge_passes_correct_api_base(self, worker):
-        with mock.patch("litellm.completion", return_value=self._make_response(0.5)) as mock_completion:
+        with mock.patch(
+            "litellm.completion", return_value=self._make_response(0.5)
+        ) as mock_completion:
             worker._call_judge([], domain_rules="", task_instruction="")
         assert mock_completion.call_args.kwargs["api_base"] == "https://api.example.com"
 
     def test_judge_passes_none_api_base_when_not_configured(self):
         worker = _make_worker(judge_model="gpt-4o", judge_base_url=None)
-        with mock.patch("litellm.completion", return_value=self._make_response(0.7)) as mock_completion:
+        with mock.patch(
+            "litellm.completion", return_value=self._make_response(0.7)
+        ) as mock_completion:
             score = worker._call_judge([], domain_rules="", task_instruction="")
         assert mock_completion.call_args.kwargs["api_base"] is None
         assert score == pytest.approx(0.7)
@@ -256,7 +264,9 @@ class TestCallJudge:
 
     def test_score_boundary_values(self, worker):
         for expected in (0.0, 1.0):
-            with mock.patch("litellm.completion", return_value=self._make_response(expected)):
+            with mock.patch(
+                "litellm.completion", return_value=self._make_response(expected)
+            ):
                 score = worker._call_judge([], domain_rules="", task_instruction="")
             assert score == pytest.approx(expected)
 
@@ -265,7 +275,9 @@ class TestCallJudge:
             {"role": "user", "content": "Hello"},
             {"role": "assistant", "content": "Hi there"},
         ]
-        with mock.patch("litellm.completion", return_value=self._make_response(0.8)) as mock_completion:
+        with mock.patch(
+            "litellm.completion", return_value=self._make_response(0.8)
+        ) as mock_completion:
             worker._call_judge(convo, domain_rules="Rules.", task_instruction="Task.")
         messages = mock_completion.call_args.kwargs["messages"]
         user_prompt = messages[1]["content"]
@@ -314,7 +326,11 @@ class TestGlobalPostProcessAndMetrics:
         batch = self._batch(
             rewards=[1.0, 0.0, 1.0],
             is_end=[1, 1, 1],
-            extra_env_info=[{"tau_reward": 1.0}, {"tau_reward": 0.0}, {"tau_reward": 1.0}],
+            extra_env_info=[
+                {"tau_reward": 1.0},
+                {"tau_reward": 0.0},
+                {"tau_reward": 1.0},
+            ],
         )
         _, metrics = env.global_post_process_and_metrics(batch)
         assert metrics["tau_bench/task_completion_rate"] == pytest.approx(2 / 3)
@@ -324,7 +340,11 @@ class TestGlobalPostProcessAndMetrics:
         batch = self._batch(
             rewards=[1.0, 1.0, 1.0],
             is_end=[1, 0, 1],
-            extra_env_info=[{"tau_reward": 1.0}, {"tau_reward": 1.0}, {"tau_reward": 1.0}],
+            extra_env_info=[
+                {"tau_reward": 1.0},
+                {"tau_reward": 1.0},
+                {"tau_reward": 1.0},
+            ],
         )
         _, metrics = env.global_post_process_and_metrics(batch)
         assert metrics["tau_bench/fraction_properly_ended"] == pytest.approx(2 / 3)

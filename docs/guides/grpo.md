@@ -474,6 +474,25 @@ grpo:
 
 Set `overlong_filtering` to true when training on tasks where truncation at the maximum sequence length is expected, such as long-form reasoning or mathematical proofs.
 
+#### Advantage Clipping
+
+After advantage normalization, per-token advantages can become very large when the per-prompt reward standard deviation is small. The optional `advantage_clip_low` and `advantage_clip_high` parameters clamp normalized advantages to a bounded range before policy training.
+
+When both values are `null` (the default), no clipping is applied. When set, advantages are clamped after normalization:
+
+$$
+A_{\text{clipped}} = \text{clamp}(A,\ \text{advantage\_clip\_low},\ \text{advantage\_clip\_high})
+$$
+
+To configure:
+```yaml
+grpo:
+  advantage_clip_low: null   # default: no lower bound
+  advantage_clip_high: null  # default: no upper bound
+```
+
+Set explicit bounds (for example, `-5.0` and `5.0`) when small reward variance produces extreme normalized advantages that destabilize training.
+
 #### Top-p and top-k filtering
 
 The implementation aligns with vLLM’s top-p and top-k filtering by applying an equivalent process to the logits.

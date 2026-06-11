@@ -133,6 +133,7 @@ def main() -> None:
     (
         policy,
         policy_generation,
+        _nemo_gym,
         cluster,
         dataloader,
         val_dataloader,

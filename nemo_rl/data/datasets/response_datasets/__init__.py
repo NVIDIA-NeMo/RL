@@ -14,6 +14,8 @@
 
 from nemo_rl.data import ResponseDatasetConfig
 from nemo_rl.data.datasets.response_datasets.aime24 import AIME2024Dataset
+from nemo_rl.data.datasets.response_datasets.arrow_text_dataset import ArrowTextDataset
+from nemo_rl.data.datasets.response_datasets.audiomcq import AudioMCQDataset
 from nemo_rl.data.datasets.response_datasets.avqa import AVQADataset
 from nemo_rl.data.datasets.response_datasets.clevr import CLEVRCoGenTDataset
 from nemo_rl.data.datasets.response_datasets.daily_omni import DailyOmniDataset
@@ -48,6 +50,8 @@ from nemo_rl.data.datasets.utils import resolve_external_dataset_class
 
 DATASET_REGISTRY = {
     # built-in datasets
+    "audiomcq": AudioMCQDataset,
+    "arrow_text": ArrowTextDataset,
     "avqa": AVQADataset,
     "AIME2024": AIME2024Dataset,
     "clevr-cogent": CLEVRCoGenTDataset,
@@ -56,6 +60,7 @@ DATASET_REGISTRY = {
     "DAPOMath17K": DAPOMath17KDataset,
     "DAPOMathAIME2024": DAPOMathAIME2024Dataset,
     "DeepScaler": DeepScalerDataset,
+    "GSM8K": GSM8KDataset,
     "geometry3k": Geometry3KDataset,
     "HelpSteer3": HelpSteer3Dataset,
     "open_assistant": OasstDataset,
@@ -115,6 +120,8 @@ def load_response_dataset(data_config: ResponseDatasetConfig):
 
 
 __all__ = [
+    "AudioMCQDataset",
+    "ArrowTextDataset",
     "AVQADataset",
     "AIME2024Dataset",
     "CLEVRCoGenTDataset",

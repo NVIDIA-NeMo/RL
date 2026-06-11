@@ -1,0 +1,83 @@
+defaults: ../../grpo_math_1B_megatron.yaml
+grpo:
+  num_generations_per_prompt: 8
+  max_num_steps: 1000
+  val_at_start: true
+loss_fn:
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_ratio: 2
+  truncated_importance_sampling_type: tis
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/audio_grpo_qwen3_omni_megatron
+  keep_top_k: 5
+policy:
+  model_name: Qwen/Qwen3-Omni-30B-A3B-Instruct
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  generation_batch_size: 32
+  logprob_batch_size: 1
+  max_total_sequence_length: 2048
+  sequence_packing:
+    enabled: false
+  generation:
+    max_new_tokens: 1024
+    vllm_cfg:
+      skip_tokenizer_init: false
+      tensor_parallel_size: 4
+      expert_parallel_size: 8
+      gpu_memory_utilization: 0.55
+    vllm_kwargs:
+      mm_processor_cache_gb: 0
+      limit_mm_per_prompt:
+        audio: 1
+  megatron_cfg:
+    converter_type: Qwen3OmniMoeForConditionalGeneration
+    expert_model_parallel_size: 8
+    activation_checkpointing: true
+    defer_fp32_logits: true
+    apply_rope_fusion: false
+    moe_grouped_gemm: true
+    moe_token_dispatcher_type: allgather
+    optimizer:
+      lr: 1.0e-06
+      min_lr: 1.0e-07
+      weight_decay: 0.1
+      use_precision_aware_optimizer: false
+    scheduler:
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 1.0e-07
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+data:
+  num_workers: 0
+  train:
+    dataset_name: audiomcq
+    split: train
+    split_validation_size: 256
+    seed: 42
+  default:
+    prompt_file: null
+    processor: vlm_hf_data_processor
+    env_name: vlm
+env:
+  vlm:
+    num_workers: 8
+    reward_functions:
+    - name: format
+      weight: 0.2
+    - name: exact_alnum
+      weight: 0.8
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    name: audio-grpo-qwen3-omni-megatron
+  swanlab:
+    name: audio-grpo-qwen3-omni-megatron
+cluster:
+  gpus_per_node: 8
+  num_nodes: 4

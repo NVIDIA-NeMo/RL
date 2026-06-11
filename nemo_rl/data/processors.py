@@ -474,6 +474,8 @@ def vlm_hf_data_processor(
         datum_dict = format_geometry3k_dataset(datum_dict)
     elif datum_dict["task_name"] == "avqa":
         pass  # AVQA data is already formatted by AVQADataset.format_data
+    elif datum_dict["task_name"] == "audiomcq":
+        pass  # AudioMCQ data is already formatted by AudioMCQDataset.format_data
     elif datum_dict["task_name"] == "mmau":
         pass  # MMAU data is already formatted by MMAUDataset.format_data
     else:
@@ -740,7 +742,9 @@ def tau_bench_data_processor(
     loss_multiplier = 1.0
     if length >= max_seq_length:
         for msg in message_log:
-            msg["token_ids"] = msg["token_ids"][: min(4, max_seq_length // len(message_log))]
+            msg["token_ids"] = msg["token_ids"][
+                : min(4, max_seq_length // len(message_log))
+            ]
         loss_multiplier = 0.0
 
     output: DatumSpec = {
@@ -751,6 +755,32 @@ def tau_bench_data_processor(
         "idx": idx,
         "task_name": datum_dict.get("task_name", "tau_bench"),
     }
+
+
+def kd_data_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer: TokenizerType,
+    max_seq_length: int | None,
+    idx: int,
+) -> DatumSpec:
+    """Process a raw-text datum for cross-tokenizer distillation.
+
+    Tokenization is deferred to the collator, so the text is carried forward
+    as a single assistant message in ``message_log``.
+    """
+    output: DatumSpec = {
+        # Defensive shallow-per-message copy so downstream mutation (e.g.
+        # adding token_ids) doesn't leak back into the dataset row.
+        "message_log": [dict(m) for m in datum_dict["messages"]],
+        "loss_multiplier": 1.0,
+        "idx": idx,
+        # fake keys (not used for cross-tokenizer distillation)
+        "length": 0,
+        "extra_env_info": None,
+    }
+    if "task_name" in datum_dict:
+        output["task_name"] = datum_dict["task_name"]
     return output
 
 
@@ -765,6 +795,7 @@ PROCESSOR_REGISTRY: Dict[str, TaskDataProcessFnCallable] = cast(
     {
         "default": math_hf_data_processor,
         "helpsteer3_data_processor": helpsteer3_data_processor,
+        "kd_data_processor": kd_data_processor,
         "math_data_processor": math_data_processor,
         "math_hf_data_processor": math_hf_data_processor,
         "multichoice_qa_processor": multichoice_qa_processor,
