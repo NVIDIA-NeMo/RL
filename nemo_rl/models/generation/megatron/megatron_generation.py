@@ -211,17 +211,22 @@ class MegatronGeneration(GenerationInterface):
             self._policy.worker_group.run_all_workers_single_data("resume_after_refit")
         )
 
-    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
-        """Prepare state dict metadata for weight refitting.
+    def prepare_refit_info(self, state_dict_info: Optional[dict[str, Any]]) -> None:
+        """Accept the cross-backend refit-prep contract; Megatron needs none of it."""
+        pass
 
-        Args:
-            state_dict_info: Dictionary mapping tensor names to (shape, dtype) tuples.
+    def start_gpu_profiling(self) -> None:
+        """Start GPU profiling on the dedicated inference workers.
+
+        No-op when colocated: the shared workers are already profiled through the training policy.
         """
-        futures = self._policy.worker_group.run_all_workers_single_data(
-            "prepare_refit_info",
-            state_dict_info=state_dict_info,
-        )
-        ray.get(futures)
+        if self._owns_policy:
+            self._policy.start_gpu_profiling()
+
+    def stop_gpu_profiling(self) -> None:
+        """Stop GPU profiling on the dedicated inference workers."""
+        if self._owns_policy:
+            self._policy.stop_gpu_profiling()
 
     def shutdown(self) -> bool:
         """Shut down all inference workers and clean up resources."""
