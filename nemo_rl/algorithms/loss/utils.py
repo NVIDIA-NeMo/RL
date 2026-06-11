@@ -90,7 +90,10 @@ def prepare_loss_input(
             logprobs = mask_out_neg_inf_logprobs(logprobs, mask[:, 1:], "curr_logprobs")
 
             # compute unfiltered logprobs for reference policy KL penalty
-            if hasattr(loss_fn, "reference_policy_kl_penalty") and loss_fn.reference_policy_kl_penalty != 0:
+            if (
+                hasattr(loss_fn, "reference_policy_kl_penalty")
+                and loss_fn.reference_policy_kl_penalty != 0
+            ):
                 data["curr_logprobs_unfiltered"] = get_next_token_logprobs_from_logits(
                     input_ids=data["input_ids"],
                     next_token_logits=logits,
@@ -180,15 +183,22 @@ def prepare_loss_input(
             dims=1,
             cp_group=context_parallel_group,
         )[0]
-        token_mask = roll_tensor(data["token_mask"], shifts=-1, dims=1, cp_group=context_parallel_group)[0]
+        token_mask = roll_tensor(
+            data["token_mask"], shifts=-1, dims=1, cp_group=context_parallel_group
+        )[0]
         if d2t is not None:
-            reverse_mapping = torch.arange(len(d2t), device=teacher_logits.device, dtype=d2t.dtype) + d2t
+            reverse_mapping = (
+                torch.arange(len(d2t), device=teacher_logits.device, dtype=d2t.dtype)
+                + d2t
+            )
             if vocab_parallel_group is not None:
                 from megatron.core.tensor_parallel import (
                     gather_from_tensor_model_parallel_region,
                 )
 
-                teacher_logits = gather_from_tensor_model_parallel_region(teacher_logits, vocab_parallel_group)
+                teacher_logits = gather_from_tensor_model_parallel_region(
+                    teacher_logits, vocab_parallel_group
+                )
                 tp_size = torch.distributed.get_world_size(vocab_parallel_group)
                 local_draft_size = len(d2t) // tp_size
                 assert vocab_parallel_rank is not None
@@ -235,7 +245,9 @@ def _pack_input_ids(
     """
     batch_size = input_ids.shape[0]
     total_packed_len = int(cu_seqlens_q_padded[-1].item()) // cp_size
-    packed = torch.zeros(total_packed_len, dtype=input_ids.dtype, device=input_ids.device)
+    packed = torch.zeros(
+        total_packed_len, dtype=input_ids.dtype, device=input_ids.device
+    )
     for i in range(batch_size):
         actual_len = int((cu_seqlens_q[i + 1] - cu_seqlens_q[i]).item())
         padded_len = int((cu_seqlens_q_padded[i + 1] - cu_seqlens_q_padded[i]).item())
@@ -245,7 +257,9 @@ def _pack_input_ids(
         if roll_shift != 0:
             seq = seq.roll(shifts=roll_shift, dims=0)
         sharded = _get_tokens_on_this_cp_rank(seq, cp_rank, cp_size, seq_dim=0)
-        packed[packed_start // cp_size : (packed_start + padded_len) // cp_size] = sharded
+        packed[packed_start // cp_size : (packed_start + padded_len) // cp_size] = (
+            sharded
+        )
     return packed.unsqueeze(0)
 
 
@@ -293,13 +307,25 @@ def prepare_packed_loss_input(
             f"got {loss_fn.input_type}. Use SequencePackingLossWrapper with "
             f"prepare_loss_input for other types.{hint}"
         )
-    assert vocab_parallel_group is not None, "prepare_packed_loss_input requires vocab_parallel_group (Megatron TP)."
-    assert vocab_parallel_rank is not None, "vocab_parallel_rank must be provided with vocab_parallel_group."
+    assert vocab_parallel_group is not None, (
+        "prepare_packed_loss_input requires vocab_parallel_group (Megatron TP)."
+    )
+    assert vocab_parallel_rank is not None, (
+        "vocab_parallel_rank must be provided with vocab_parallel_group."
+    )
 
     input_ids = data["input_ids"]
     unpacked_seqlen = input_ids.shape[1]
-    cp_size = 1 if context_parallel_group is None else torch.distributed.get_world_size(context_parallel_group)
-    cp_rank = 0 if context_parallel_group is None else torch.distributed.get_rank(context_parallel_group)
+    cp_size = (
+        1
+        if context_parallel_group is None
+        else torch.distributed.get_world_size(context_parallel_group)
+    )
+    cp_rank = (
+        0
+        if context_parallel_group is None
+        else torch.distributed.get_rank(context_parallel_group)
+    )
 
     packed_rolled_targets = _pack_input_ids(
         input_ids,
