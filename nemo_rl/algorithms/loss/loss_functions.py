@@ -469,8 +469,12 @@ class ClippedPGLossFn(LossFunction):
                 )
             elif self.truncated_importance_sampling_type == "icepop":
                 token_kept_mask = (
-                    actor_importance_weights_expanded >= self.truncated_importance_sampling_ratio_min
-                ) & (actor_importance_weights_expanded <= self.truncated_importance_sampling_ratio)
+                    actor_importance_weights_expanded
+                    >= self.truncated_importance_sampling_ratio_min
+                ) & (
+                    actor_importance_weights_expanded
+                    <= self.truncated_importance_sampling_ratio
+                )
                 _is_filter_metrics = {
                     "is_oob_ratio": 1.0
                     - masked_mean(
@@ -492,10 +496,15 @@ class ClippedPGLossFn(LossFunction):
                     posinf=0.0,
                     neginf=0.0,
                 )
-                seq_log_is_ratio_mean = masked_mean(log_is_ratio, token_mask, dim=-1)  # [B]
+                seq_log_is_ratio_mean = masked_mean(
+                    log_is_ratio, token_mask, dim=-1
+                )  # [B]
                 seq_geomean_is_ratio = torch.exp(seq_log_is_ratio_mean).detach()  # [B]
                 seq_kept_mask = (
-                    (seq_geomean_is_ratio >= self.truncated_importance_sampling_ratio_min)
+                    (
+                        seq_geomean_is_ratio
+                        >= self.truncated_importance_sampling_ratio_min
+                    )
                     & (seq_geomean_is_ratio <= self.truncated_importance_sampling_ratio)
                 ).float()  # [B]
                 _is_filter_metrics = {
@@ -506,7 +515,9 @@ class ClippedPGLossFn(LossFunction):
                         global_normalization_factor=global_valid_seqs,
                     ).item(),
                 }
-                actor_importance_weights_expanded = actor_importance_weights_expanded * seq_kept_mask.unsqueeze(-1)
+                actor_importance_weights_expanded = (
+                    actor_importance_weights_expanded * seq_kept_mask.unsqueeze(-1)
+                )
             else:
                 raise ValueError(
                     f"Invalid truncated importance sampling type: {self.truncated_importance_sampling_type}"
@@ -868,7 +879,9 @@ class DPOLossFn(PreferenceLossFn):
         if self.preference_average_log_probs:
             rewards = rewards / token_mask.sum(-1).clamp(min=1)
 
-        return self._preference_loss(rewards, sample_mask, global_valid_seqs, self.reference_policy_kl_penalty)
+        return self._preference_loss(
+            rewards, sample_mask, global_valid_seqs, self.reference_policy_kl_penalty
+        )
 
     # TODO a cleaner typing fix would be required (probably that DPOLossFn should not inherit from PreferenceLossFn)
     def __call__(  # type: ignore
@@ -880,7 +893,9 @@ class DPOLossFn(PreferenceLossFn):
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         sft_loss_chosen = torch.tensor(0.0)
         if self.sft_loss_weight > 0:
-            assert global_valid_toks is not None, "global_valid_toks must be provided for SFT loss"
+            assert global_valid_toks is not None, (
+                "global_valid_toks must be provided for SFT loss"
+            )
             sft_loss, _ = self.sft_loss(
                 next_token_logprobs,
                 data,
@@ -903,7 +918,10 @@ class DPOLossFn(PreferenceLossFn):
             rewards_rejected_mean,
         ) = self._dpo_loss(next_token_logprobs, data, global_valid_seqs)
 
-        dpo_loss = self.sft_loss_weight * sft_loss_chosen + self.preference_loss_weight * preference_loss
+        dpo_loss = (
+            self.sft_loss_weight * sft_loss_chosen
+            + self.preference_loss_weight * preference_loss
+        )
 
         ## divide by 2 because we're summing over (chosen, rejected) pairs
         num_valid_samples = data["sample_mask"].sum() / 2
@@ -947,7 +965,9 @@ class DistillationLossFn(LossFunction):
         self.log_infinitesimal = -100
 
         assert self.kl_type in ["forward", "reverse", "mixed"], "Invalid KL type"
-        assert self.mixed_kl_weight >= 0 and self.mixed_kl_weight <= 1, "Invalid mixed KL weight"
+        assert self.mixed_kl_weight >= 0 and self.mixed_kl_weight <= 1, (
+            "Invalid mixed KL weight"
+        )
 
     def __call__(
         self,
@@ -969,17 +989,26 @@ class DistillationLossFn(LossFunction):
             # The entropy and prob of the rest of the tokens [B, S-1]
             loss_correction_term = H_rest - self.log_infinitesimal * P_rest  # [B, S-1]
             if self.kl_type == "mixed":
-                loss_correction_term = loss_correction_term * (1.0 - self.mixed_kl_weight)
+                loss_correction_term = loss_correction_term * (
+                    1.0 - self.mixed_kl_weight
+                )
 
         if self.kl_type == "forward":
-            per_token_kl = teacher_probs * (teacher_topk_logprobs - student_topk_logprobs)
+            per_token_kl = teacher_probs * (
+                teacher_topk_logprobs - student_topk_logprobs
+            )
         elif self.kl_type == "reverse":
-            per_token_kl = student_probs * (student_topk_logprobs - teacher_topk_logprobs)
+            per_token_kl = student_probs * (
+                student_topk_logprobs - teacher_topk_logprobs
+            )
         else:
             # mixed KL
             kl_forward = teacher_probs * (teacher_topk_logprobs - student_topk_logprobs)
             kl_reverse = student_probs * (student_topk_logprobs - teacher_topk_logprobs)
-            per_token_kl = self.mixed_kl_weight * kl_forward + (1.0 - self.mixed_kl_weight) * kl_reverse
+            per_token_kl = (
+                self.mixed_kl_weight * kl_forward
+                + (1.0 - self.mixed_kl_weight) * kl_reverse
+            )
 
         per_token_kl = per_token_kl.sum(dim=-1) + loss_correction_term  # [B, S-1]
 
