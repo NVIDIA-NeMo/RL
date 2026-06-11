@@ -127,12 +127,6 @@ def prepare_loss_input(
             "H_all": H_all,
         }
     elif loss_fn.input_type == LossInputType.DISTILLATION_AND_LOGPROB:
-        # Hybrid SDPO+GRPO (paper §4.5): emit both the distillation top-k
-        # outputs (consumed by the SDPO KL term) and the next-token logprobs
-        # (consumed by the clipped-PG term) from the same forward. The hybrid
-        # loss fn exposes its inner SDPOLossFn / ClippedPGLossFn as
-        # `sdpo_loss` / `grpo_loss`; we read the distillation/filtering knobs
-        # from those, mirroring the DISTILLATION and LOGPROB branches above.
         sdpo_loss = loss_fn.sdpo_loss
         calculate_entropy = sdpo_loss.zero_outside_topk and sdpo_loss.kl_type != "forward"
         student_topk_logprobs, teacher_topk_logprobs, H_all = get_distillation_topk_logprobs_from_logits(
@@ -312,15 +306,10 @@ def prepare_packed_loss_input(
         tuple(loss_input, maybe_updated_data)
     """
     if loss_fn.input_type != LossInputType.LOGPROB:
-        hint = (
-            " Set sequence_packing.fuse_loss=false to route through the " "non-fused SequencePackingLossWrapper path."
-            if loss_fn.input_type == LossInputType.DISTILLATION_AND_LOGPROB
-            else ""
-        )
         raise ValueError(
             f"prepare_packed_loss_input only supports LossInputType.LOGPROB, "
             f"got {loss_fn.input_type}. Use SequencePackingLossWrapper with "
-            f"prepare_loss_input for other types.{hint}"
+            f"prepare_loss_input for other types."
         )
     assert vocab_parallel_group is not None, (
         "prepare_packed_loss_input requires vocab_parallel_group (Megatron TP)."

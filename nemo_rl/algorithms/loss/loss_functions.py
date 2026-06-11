@@ -1121,16 +1121,16 @@ class SDPOLossConfig(TypedDict):
     SDPO computes a logit-level KL between a student (current policy on the
     original prompt) and a self-teacher (same policy conditioned on a successful
     demonstration), summed over the full vocabulary at every response position
-    (top-k approximation, paper Eq. 1).
+    (top-k approximation).
 
     Defaults:
-        kl_type: "reverse"            - paper Eq. 1 form; "forward", "mixed", or "js" (symmetric
+        kl_type: "reverse"            - "forward", "mixed", or "js" (symmetric
                                         Jensen-Shannon, bounded in [0, log 2] per token) also supported
         mixed_kl_weight: 0.5          - weight on forward-KL when kl_type="mixed"
         zero_outside_topk: True       - model the teacher as having ~0 mass outside top-k
-                                        and add the corresponding tail-correction term to the loss
-                                        (paper §A.2). Setting False omits the tail and keeps only
-                                        the top-k sum (cheaper, less accurate).
+                                        and add the corresponding tail-correction term to the loss.
+                                        Setting False omits the tail and keeps only the top-k sum
+                                        (cheaper, less accurate).
         success_reward_threshold: 1.0 - minimum reward to count as "successful" (used by orchestration)
     """
 
@@ -1138,7 +1138,6 @@ class SDPOLossConfig(TypedDict):
     mixed_kl_weight: NotRequired[float]
     zero_outside_topk: NotRequired[bool]
     success_reward_threshold: float
-    # Trust-region anchor to a frozen-init reference policy (paper Table 4).
     # When penalty > 0, the loss adds beta * KL(student || ref) summed over
     # response positions, where the KL is estimated by one of Schulman's
     # k1/k2/k3 estimators at the sampled tokens.
@@ -1158,7 +1157,7 @@ class SDPOLossDataDict(TypedDict):
 
 
 class SDPOLossFn(LossFunction):
-    """Self-Distilled Policy Optimization loss (logit-level KL, paper Eq. 1).
+    """Self-Distilled Policy Optimization loss (logit-level KL).
 
     Trains the student (current policy on the original prompt) to match the
     self-teacher (current policy conditioned on a successful demonstration) via
@@ -1168,7 +1167,7 @@ class SDPOLossFn(LossFunction):
              ≈ Σ_t  Σ_{ŷ ∈ topK}  π_θ(ŷ|x,y_<t) · [log π_θ(ŷ|x,y_<t) − log π_T(ŷ|x,f,y_<t)]
                + tail_correction_t       (when zero_outside_topk=True)
 
-    Top-k indices are chosen by the teacher (paper §A.2). Tail correction uses the
+    Top-k indices are chosen by the teacher. Tail correction uses the
     full-vocab student entropy H_all returned by the training forward, so the gather
     over top-k preserves an unbiased estimate of the full-vocabulary KL even with
     K << |V|.
@@ -1235,8 +1234,7 @@ class SDPOLossFn(LossFunction):
             per_token_kl = student_probs * (student_topk_logprobs - teacher_topk_logprobs)
         elif self.kl_type == "js":
             # Symmetric Jensen-Shannon divergence at top-k positions, bounded in
-            # [0, log 2] per (sample, position). Per the paper (Appendix E, §A),
-            # this is the recommended SDPO loss for stability.
+            # [0, log 2] per (sample, position).
             m_probs = 0.5 * (student_probs + teacher_probs)
             log_m = m_probs.clamp_min(1e-12).log()
             per_token_kl = 0.5 * student_probs * (student_topk_logprobs - log_m) + 0.5 * teacher_probs * (
@@ -1269,7 +1267,7 @@ class SDPOLossFn(LossFunction):
                 tail = tail * (1.0 - self.mixed_kl_weight)
             per_token_kl = per_token_kl + tail
 
-        # Trust-region anchor to a frozen-init reference policy (paper Table 4).
+        # Trust-region anchor to a frozen-init reference policy.
         # We use prev_logprobs (snapshot at step start) as the student side; at
         # LR=3e-7 the within-step drift is small. ref_kl is added regardless of
         # sdpo_mask so that even samples without a teacher demonstration are
@@ -1457,12 +1455,12 @@ class MseValueLossFn(LossFunction):
 
 
 # ============================================================================
-# SDPO + GRPO hybrid loss (paper §4.5)
+# SDPO + GRPO hybrid loss
 # ============================================================================
 
 
 class SDPOHybridLossConfig(TypedDict):
-    """Configuration for the SDPO+GRPO hybrid loss (paper §4.5).
+    """Configuration for the SDPO+GRPO hybrid loss.
 
     The hybrid blends a clipped policy-gradient (GRPO) term with the SDPO
     logit-level KL distillation term:
@@ -1493,7 +1491,7 @@ class SDPOHybridLossConfig(TypedDict):
 
 
 class SDPOHybridLossFn(LossFunction):
-    """SDPO+GRPO hybrid loss (paper §4.5), blended at the loss level.
+    """SDPO+GRPO hybrid loss, blended at the loss level.
 
     Composes an inner SDPOLossFn and ClippedPGLossFn and returns
 
@@ -1761,8 +1759,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             )
             ce_loss = self._compute_ce(logits, data, global_valid_toks)
             # Combine the H-KL distillation loss with next-token CE, mirroring
-            # the P-KL path below (paper Eq. 7 under dynamic scaling:
-            # loss = sg(ce/kd) * kd + ce).
+            # the P-KL path below
             if self.dynamic_loss_scaling:
                 kd_detached = kd_loss.detach().abs()
                 ce_detached = ce_loss.detach().abs()

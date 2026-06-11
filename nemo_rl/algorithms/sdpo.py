@@ -1,3 +1,16 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Self-Distilled Policy Optimization (SDPO).
 
 Reference: Hübotter et al. (2026) "Reinforcement Learning via Self-Distillation"
@@ -11,7 +24,7 @@ This module implements SDPO in NeMo-RL.  The key idea is:
    excluded from the distillation loss.
  - Compute teacher top-k logits (current model, enriched context) and align
    them to the student sequence positions.
- - Train with logit-level KL distillation (SDPOLossFn, paper Eq. 1) summed
+ - Train with logit-level KL distillation (SDPOLossFn) summed
    over the response tokens, with an optional tail-correction term for vocab
    outside the top-k.
 """
@@ -71,8 +84,8 @@ _DEFAULT_REPROMPT_TEMPLATE = (
     "{prompt}\n\n" "Here is a correct solution for reference:\n\n" "{solution}\n\n" "Now solve the original problem."
 )
 
-# Env-feedback teacher template (paper Table 2, code/LCBv6 mechanism). The
-# teacher conditions on the model's *failed* attempt plus the environment's
+# Env-feedback teacher template. The teacher conditions on the model's
+# *failed* attempt plus the environment's
 # textual feedback (test failures, runtime errors), and is asked to solve the
 # problem again. Placeholders: {prompt}, {environment_output}.
 _DEFAULT_ENV_FEEDBACK_TEMPLATE = (
@@ -82,7 +95,7 @@ _DEFAULT_ENV_FEEDBACK_TEMPLATE = (
     "Correctly solve the original question."
 )
 
-# Combined teacher template — full paper Table 2 form for failed code rollouts:
+# Combined teacher template for failed code rollouts:
 # peer-rollout demo AND env feedback. Placeholders: {prompt}, {solution},
 # {environment_output}.
 _DEFAULT_COMBINED_TEMPLATE = (
@@ -117,27 +130,27 @@ class SDPOConfig(TypedDict):
     # SDPO-specific
     success_reward_threshold: float  # reward >= this counts as "successful"
     max_reprompt_len: int  # max tokens in teacher prompt
-    topk_logits_k: int  # K in top-k logit distillation (paper: 100)
+    topk_logits_k: int  # K in top-k logit distillation
     reprompt_template: NotRequired[str]  # uses {prompt} and {solution} placeholders
     remove_thinking_from_demo: NotRequired[bool]  # strip <think>…</think> from demos
     # "peer_rollout" (default): teacher conditions on a successful peer rollout.
     # "env_feedback": teacher conditions on the failed attempt's env feedback.
-    # "combined": full paper Table 2 form — peer rollout + env feedback together
+    # "combined": peer rollout + env feedback together
     #   (failed rollouts) and peer rollout alone (successful rollouts).
     feedback_source: NotRequired[str]
     env_feedback_template: NotRequired[str]  # placeholders: {prompt}, {environment_output}
     combined_template: NotRequired[str]  # placeholders: {prompt}, {solution}, {environment_output}
     combined_success_template: NotRequired[str]  # placeholders: {prompt}, {solution}
-    # Trust-region anchor to the frozen-init policy (paper Table 4): adds
+    # Trust-region anchor to the frozen-init policy: adds
     # beta * KL(student || ref) to the loss summed over response positions.
     # 0 disables (no ref-policy forward pass; ref model is not initialized).
     reference_policy_kl_penalty: NotRequired[float]  # beta; default 0.0
     reference_policy_kl_type: NotRequired[str]  # "k1" | "k2" | "k3" (Schulman); default "k3"
-    # Per-step env-feedback sample logging (paper F.3 verification).
+    # Per-step env-feedback sample logging.
     # 0 = never log samples; 1 = every step; N = every N steps.
     log_sample_every_n_steps: NotRequired[int]
     log_sample_max_chars: NotRequired[int]
-    # Advantage estimator config for the SDPO+GRPO hybrid (paper §4.5). Only
+    # Advantage estimator config for the SDPO+GRPO hybrid. Only
     # used when loss_fn carries grpo_weight. Keys: name ("grpo"),
     # use_leave_one_out_baseline (bool), normalize_rewards (bool). Defaults to a
     # leave-one-out, reward-normalized GRPO estimator.
@@ -167,7 +180,7 @@ def _default_sdpo_save_state() -> SDPOSaveState:
 class MasterConfig(TypedDict):
     policy: PolicyConfig
     # SDPOLossConfig for pure SDPO; SDPOHybridLossConfig (carrying grpo_weight,
-    # nested sdpo/grpo blocks) for the SDPO+GRPO hybrid (paper §4.5).
+    # nested sdpo/grpo blocks) for the SDPO+GRPO hybrid.
     loss_fn: Union[SDPOLossConfig, SDPOHybridLossConfig]
     env: dict[str, Any]
     data: DataConfig
@@ -297,7 +310,7 @@ def _log_env_feedback_sample(
         env_feedback = _extract_environment_output(msg_log)
 
         # Find a peer demo (successful peer in the same prompt group; a
-        # successful sample may use its own attempt, per paper Table 2).
+        # successful sample may use its own attempt).
         group_start = (idx // num_generations) * num_generations
         peer_demo: Optional[str] = None
         for j in range(group_start, group_start + num_generations):
@@ -393,7 +406,7 @@ def build_sdpo_teacher_data(
       ``{environment_output}``). Successful rollouts get no signal in this
       mode.
 
-    - ``"combined"``: full paper Table 2 form. Failed rollouts get a teacher
+    - ``"combined"``: Failed rollouts get a teacher
       conditioned on BOTH a successful peer rollout AND this attempt's env
       feedback (``combined_template``). Successful rollouts get a teacher
       conditioned on a successful peer rollout alone
@@ -795,7 +808,7 @@ def setup(
     ) = grpo_setup(grpo_master_config, tokenizer, dataset, val_dataset)
 
     # Replace GRPO loss with SDPO loss (or the SDPO+GRPO hybrid when the
-    # loss_fn config carries grpo_weight, paper §4.5).
+    # loss_fn config carries grpo_weight).
     if "grpo_weight" in loss_config:
         loss_fn: LossFunction = SDPOHybridLossFn(loss_config)
     else:
@@ -886,7 +899,7 @@ def sdpo_train(
     combined_success_template = sdpo_cfg.get("combined_success_template", _DEFAULT_COMBINED_SUCCESS_TEMPLATE)
     make_div_by = policy_cfg.get("make_sequence_length_divisible_by", 1)
 
-    # SDPO+GRPO hybrid (paper §4.5): build the GRPO advantage estimator used by
+    # SDPO+GRPO hybrid: build the GRPO advantage estimator used by
     # the policy-gradient term. Only active when loss_fn is the hybrid.
     is_hybrid = isinstance(loss_fn, SDPOHybridLossFn)
     adv_estimator: Optional[GRPOAdvantageEstimator] = None
@@ -1057,7 +1070,7 @@ def sdpo_train(
                     flush=True,
                 )
 
-                # ── Sample logging for paper-F.3 format verification ─────────
+                # ── Sample logging for format verification ─────────
                 log_every = sdpo_cfg.get("log_sample_every_n_steps", 1)
                 if log_every > 0 and ((total_steps + 1) % log_every == 0):
                     _log_env_feedback_sample(
@@ -1115,10 +1128,10 @@ def sdpo_train(
 
                 # ── prev / reference logprobs ─────────────────────────────────
                 # Two consumers need these:
-                #  • SDPO trust-region anchor to the frozen-init policy (paper
-                #    Table 4): the SDPO term adds beta*KL(student||ref) when its
+                #  • SDPO trust-region anchor to the frozen-init policy:
+                #    the SDPO term adds beta*KL(student||ref) when its
                 #    reference_policy_kl_penalty > 0.
-                #  • GRPO policy-gradient term (hybrid, paper §4.5): always needs
+                #  • GRPO policy-gradient term (hybrid): always needs
                 #    prev_logprobs; needs reference logprobs when GRPO's KL
                 #    penalty is on.
                 if is_hybrid:
@@ -1151,7 +1164,7 @@ def sdpo_train(
                             )["reference_logprobs"]
                     del logprob_data
 
-                # ── GRPO advantages (hybrid, paper §4.5) ──────────────────────
+                # ── GRPO advantages (hybrid) ──────────────────────
                 # Samples are prompt-major (repeat_interleave(num_generations)),
                 # so a synthetic per-group index groups the G rollouts of each
                 # prompt together. calculate_baseline_and_std_per_prompt expects
