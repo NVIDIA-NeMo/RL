@@ -32,6 +32,7 @@ from nemo_rl.models.automodel.setup import (
     ModelAndOptimizerState,
     RuntimeConfig,
     _maybe_set_force_hf,
+    _precision_to_dtype,
     get_tokenizer,
     setup_distributed,
     setup_model_and_optimizer,
@@ -551,6 +552,115 @@ class TestValidateAndPrepareConfig:
         )
 
         assert result.hf_config_overrides == {}
+
+    def test_precision_to_dtype_supported(self):
+        """_precision_to_dtype maps each supported name to the right torch.dtype."""
+        assert _precision_to_dtype("float32", "precision") == torch.float32
+        assert _precision_to_dtype("bfloat16", "precision") == torch.bfloat16
+        assert _precision_to_dtype("float16", "precision") == torch.float16
+
+    def test_precision_to_dtype_invalid(self):
+        """_precision_to_dtype raises ValueError on unknown name."""
+        with pytest.raises(ValueError, match="Unknown dtensor_cfg.load_precision"):
+            _precision_to_dtype("fp4", "dtensor_cfg.load_precision")
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_load_precision_default_is_float32(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+    ):
+        """Unset load_precision defaults to float32 and does not trip the guard."""
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
+        assert "load_precision" not in mock_config["dtensor_cfg"]
+
+        result = validate_and_prepare_config(
+            config=mock_config,
+            processor=None,
+            rank=0,
+            init_optimizer=True,
+        )
+        assert result.model_load_dtype == torch.float32
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_load_precision_bfloat16_reference_passes(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+    ):
+        """Reference/teacher workers (init_optimizer=False) can load in bfloat16."""
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
+        mock_config["dtensor_cfg"]["load_precision"] = "bfloat16"
+
+        result = validate_and_prepare_config(
+            config=mock_config,
+            processor=None,
+            rank=0,
+            init_optimizer=False,
+        )
+        assert result.model_load_dtype == torch.bfloat16
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_load_precision_bfloat16_trainable_raises(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+    ):
+        """Trainable workers (init_optimizer=True) must use float32; bfloat16 raises."""
+        mock_config["dtensor_cfg"]["load_precision"] = "bfloat16"
+
+        with pytest.raises(
+            ValueError,
+            match="load_precision must be float32 for trainable workers",
+        ):
+            validate_and_prepare_config(
+                config=mock_config,
+                processor=None,
+                rank=0,
+                init_optimizer=True,
+            )
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_load_precision_passed_to_autoconfig_from_pretrained(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+    ):
+        """model_load_dtype is forwarded to AutoConfig.from_pretrained as torch_dtype."""
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
+        mock_config["dtensor_cfg"]["load_precision"] = "bfloat16"
+
+        validate_and_prepare_config(
+            config=mock_config,
+            processor=None,
+            rank=0,
+            init_optimizer=False,
+        )
+        assert mock_autoconfig_class.from_pretrained.called
+        kwargs = mock_autoconfig_class.from_pretrained.call_args.kwargs
+        assert kwargs["torch_dtype"] == torch.bfloat16
 
 
 @pytest.mark.automodel

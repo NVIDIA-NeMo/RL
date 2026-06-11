@@ -112,6 +112,13 @@ class DTensorConfig(TypedDict):
     # Model config
     lora_cfg: NotRequired[LoRAConfig | LoRAConfigDisabled]
     automodel_kwargs: NotRequired[AutomodelKwargs]
+    # Dtype used when loading weights via from_pretrained. Valid values:
+    # "float32" (default), "bfloat16", "float16". Reference/teacher workers
+    # (init_optimizer=False) can set this to "bfloat16" / "float16" to halve
+    # init-time and resident parameter memory. Trainable workers MUST keep
+    # the default "float32" to preserve master-weight precision; non-float32
+    # is rejected by validate_and_prepare_config when init_optimizer=True.
+    load_precision: NotRequired[str]
     # Runtime
     clear_cache_every_n_steps: NotRequired[int | None]
 
