@@ -35,7 +35,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
+from nemo_rl.data_plane.interfaces import DataPlaneClient
 from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
 
 
@@ -208,7 +208,7 @@ def keys_from_uids(uids: list[str], n_gen: int = 1) -> list[str]:
 
 
 def register_train_partition(
-    client: NoOpDataPlaneClient,
+    client: DataPlaneClient,
     *,
     num_samples: int,
     fields: list[str] | None = None,
@@ -226,6 +226,39 @@ def register_train_partition(
         num_samples=num_samples,
         consumer_tasks=consumer_tasks if consumer_tasks is not None else ["train"],
     )
+
+
+def simple_backend_dp_config() -> dict[str, Any]:
+    """Load the SimpleStorage ``DataPlaneConfig`` from the test reference YAML.
+
+    Reuses the ``data_plane:`` section of
+    ``tests/unit/reference_configs/grpo_math_1B.yaml`` (canonical test
+    config, mirrored from ``examples/configs/grpo_math_1B.yaml``) so test
+    config flows through the same OmegaConf path production uses.
+
+    Overrides applied for the unit-test scenario:
+    - ``enabled: true`` (production default is False; tests need the
+      ``build_data_plane_client`` factory to actually build a client).
+    - ``storage_capacity: 1024`` / ``num_storage_units: 1`` — trimmed
+      from production's 1_000_000 / 2 for fast in-process setup.
+    """
+    from pathlib import Path
+
+    from omegaconf import OmegaConf
+
+    cfg_path = (
+        Path(__file__).resolve().parents[1] / "reference_configs" / "grpo_math_1B.yaml"
+    )
+    full_cfg = OmegaConf.load(cfg_path)
+    dp_cfg = OmegaConf.to_container(full_cfg.data_plane, resolve=True)
+    dp_cfg["enabled"] = True
+    # Pin impl/backend — the helper's name promises simple-backend TQ;
+    # the reference YAML's defaults could drift to mooncake_cpu otherwise.
+    dp_cfg["impl"] = "transfer_queue"
+    dp_cfg["backend"] = "simple"
+    dp_cfg["storage_capacity"] = 1024
+    dp_cfg["num_storage_units"] = 1
+    return dp_cfg  # type: ignore[return-value]
 
 
 def mooncake_available() -> bool:
