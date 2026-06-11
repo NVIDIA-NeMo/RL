@@ -165,15 +165,14 @@ class SingleControllerActor:
             )
 
         pad_id = int(getattr(tokenizer, "pad_token_id", 0) or 0)
-        self._buffer = (
-            tq_buffer
-            if tq_buffer is not None
-            else TQReplayBuffer(
+        if tq_buffer is None:
+            self._buffer = TQReplayBuffer(
                 dp_client,
                 partition_id=cfg.partition_id,
                 pad_value_dict={"token_ids": pad_id},
             )
-        )
+        else:
+            self._buffer = tq_buffer
 
         if rollout_manager is None:
             self._rollout_manager = RolloutManager(
@@ -188,6 +187,11 @@ class SingleControllerActor:
             )
         else:
             self._rollout_manager = rollout_manager
+            # Ray serializes kwargs as separate cloudpickle blobs, so a
+            # rollout_manager and tq_buffer passed together as `.remote()`
+            # args deserialize as distinct buffer instances inside the actor.
+            # Rebind so the rollout writer and sampler share one buffer.
+            self._rollout_manager._tq_buffer = self._buffer
 
         # Initialize sampler
         assert cfg.batch_selection_strategy in [
@@ -481,6 +485,7 @@ class SingleControllerActor:
         elapsed = time.monotonic() - t0
 
         log.info("  _sync_weights: sync done in %.3fs", elapsed)
+        self._rollout_manager.set_weight_version(self._trainer_version)
         self._rollout_permitted.set()
 
     async def _advantage_pump(self, meta: KVBatchMeta) -> KVBatchMeta:
