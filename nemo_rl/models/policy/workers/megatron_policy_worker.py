@@ -1260,23 +1260,6 @@ class MegatronPolicyWorkerImpl(
         gc.collect()
         torch.cuda.empty_cache()
 
-    def finish_training(self) -> None:
-        """Offload model, gradients, and optimizer to CPU after training."""
-        self.model = self.move_model(
-            self.model, "cpu", move_params=True, move_grads=True
-        )
-        self.model.eval()
-
-        if (
-            hasattr(self, "optimizer")
-            and self.optimizer is not None
-            and not self.optimizer_cpu_offload
-        ):
-            self.move_optimizer("cpu")
-
-        gc.collect()
-        torch.cuda.empty_cache()
-
     def _clear_fp8_caches(self):
         """Clear FP8 workspace caches and release fragmented GPU memory.
 
@@ -1303,15 +1286,9 @@ class MegatronPolicyWorkerImpl(
 
     @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
     def offload_before_refit(self):
-        """Offload the optimizer and buffers to the CPU, keeping params on GPU for refit."""
+        """Offload the optimizer and buffers to the CPU."""
         no_grad = torch.no_grad()
         no_grad.__enter__()
-
-        # Ensure model params are on GPU (they may have been offloaded by finish_training)
-        self.model = self.move_model(
-            self.model, "cuda", move_params=True, move_grads=False
-        )
-
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
         reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
         print(
