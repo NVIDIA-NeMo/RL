@@ -447,6 +447,46 @@ def setup(
         nemo_gym_num_nodes = 0
         ray_cur_node_id = None
 
+    def _spinup_nemo_gym(base_urls, model_name):
+        """Spin up the NeMo Gym actor against the given generation server URLs."""
+        t0 = time.perf_counter()
+        nemo_gym_py_exec = get_actor_python_env("nemo_rl.environments.nemo_gym.NemoGym")
+        if nemo_gym_py_exec.startswith("uv"):
+            nemo_gym_py_exec = create_local_venv_on_each_node(
+                nemo_gym_py_exec, "nemo_rl.environments.nemo_gym.NemoGym"
+            )
+        nemo_gym_dict = env_configs["nemo_gym"]
+        # NeMo-RL-side detection knobs are top-level NemoGymConfig fields
+        # (where the detector reads them), not part of Gym's global config.
+        invalid_tool_call_patterns = nemo_gym_dict.pop(
+            "invalid_tool_call_patterns", None
+        )
+        thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
+        nemo_gym_cfg = NemoGymConfig(
+            model_name=model_name,
+            base_urls=base_urls,
+            invalid_tool_call_patterns=invalid_tool_call_patterns,
+            thinking_tags=thinking_tags,
+            initial_global_config_dict=nemo_gym_dict,
+        )
+        nemo_gym_opts = {}
+        if nemo_gym_num_nodes:
+            nemo_gym_opts["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
+                node_id=ray_cur_node_id,
+                soft=True,
+            )
+        nemo_gym_opts["runtime_env"] = {
+            "py_executable": nemo_gym_py_exec,
+            "env_vars": {
+                **os.environ,
+                "VIRTUAL_ENV": nemo_gym_py_exec,
+                "UV_PROJECT_ENVIRONMENT": nemo_gym_py_exec,
+            },
+        }
+        actor = NemoGym.options(**nemo_gym_opts).remote(nemo_gym_cfg)
+        ray.get(actor._spinup.remote())
+        return actor, time.perf_counter() - t0
+
     total_nodes = cluster_config["num_nodes"]
     if rm_env_enabled:
         rm_resource = env_configs["reward_model"]["resources"]
@@ -757,6 +797,15 @@ def setup(
         worker_init_timing_metrics["megatron_generation_init_time_s"] = (
             megatron_gen_time
         )
+
+        if enable_nemo_gym:
+            # The Megatron inference engine must be up before its server URLs exist.
+            nemo_gym_actor, nemo_gym_time = _spinup_nemo_gym(
+                policy_generation.dp_openai_server_base_urls,
+                generation_config["model_name"],
+            )
+            worker_init_timing_metrics["nemo_gym_init_time_s"] = nemo_gym_time
+
         print(
             f"  ✓ Using {backend} backend for generation with {policy_config['model_name']}",
             flush=True,
@@ -818,47 +867,10 @@ def setup(
 
             def init_nemo_gym():
                 """Spin up NeMo Gym servers with the pre-assigned vLLM URLs."""
-                t0 = time.perf_counter()
-                nemo_gym_py_exec = get_actor_python_env(
-                    "nemo_rl.environments.nemo_gym.NemoGym"
+                return _spinup_nemo_gym(
+                    deferred_vllm.dp_openai_server_base_urls,
+                    generation_config["model_name"],
                 )
-                if nemo_gym_py_exec.startswith("uv"):
-                    nemo_gym_py_exec = create_local_venv_on_each_node(
-                        nemo_gym_py_exec, "nemo_rl.environments.nemo_gym.NemoGym"
-                    )
-                nemo_gym_dict = env_configs["nemo_gym"]
-                # NeMo-RL-side detection knobs are top-level NemoGymConfig fields
-                # (where the detector reads them), not part of Gym's global config.
-                invalid_tool_call_patterns = nemo_gym_dict.pop(
-                    "invalid_tool_call_patterns", None
-                )
-                thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
-                nemo_gym_cfg = NemoGymConfig(
-                    model_name=generation_config["model_name"],
-                    base_urls=deferred_vllm.dp_openai_server_base_urls,
-                    invalid_tool_call_patterns=invalid_tool_call_patterns,
-                    thinking_tags=thinking_tags,
-                    initial_global_config_dict=nemo_gym_dict,
-                )
-                nemo_gym_opts = {}
-                if nemo_gym_num_nodes:
-                    nemo_gym_opts["scheduling_strategy"] = (
-                        NodeAffinitySchedulingStrategy(
-                            node_id=ray_cur_node_id,
-                            soft=True,
-                        )
-                    )
-                nemo_gym_opts["runtime_env"] = {
-                    "py_executable": nemo_gym_py_exec,
-                    "env_vars": {
-                        **os.environ,
-                        "VIRTUAL_ENV": nemo_gym_py_exec,
-                        "UV_PROJECT_ENVIRONMENT": nemo_gym_py_exec,
-                    },
-                }
-                actor = NemoGym.options(**nemo_gym_opts).remote(nemo_gym_cfg)
-                ray.get(actor._spinup.remote())
-                return actor, time.perf_counter() - t0
 
             # Colocated: vLLM + policy share GPUs -> sequential; otherwise parallel.
             init_tasks = {}
