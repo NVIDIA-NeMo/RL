@@ -140,9 +140,14 @@ class NemoGym(EnvironmentInterface):
         RELATIVE_PATH = "nemo_rl/environments/nemo_gym.py"
         assert __file__.endswith(RELATIVE_PATH)
 
-        initial_global_config_dict = (
-            self.cfg.get("initial_global_config_dict") or dict()
+        # Make a shallow copy so that NeMo-RL-side keys we pop or add below
+        # do not mutate the caller's config dict (config.env["nemo_gym"]).
+        initial_global_config_dict = dict(
+            self.cfg.get("initial_global_config_dict") or {}
         )
+        # Strip NeMo-RL-only training knobs that must not be forwarded to the
+        # NeMo-Gym server (same pattern as the pops in run_grpo_nemo_gym.py).
+        initial_global_config_dict.pop("effort_levels", None)
         # Policy information
         initial_global_config_dict["policy_model_name"] = self.cfg["model_name"]
         initial_global_config_dict["policy_api_key"] = (

@@ -70,6 +70,7 @@ from nemo_rl.distributed.virtual_cluster import (
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import NemoGym, NemoGymConfig
 from nemo_rl.experience.rollouts import (
+    EffortLevelsConfig,
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
@@ -1386,6 +1387,16 @@ def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
     return should_log_nemo_gym_responses
 
 
+def _get_effort_config(master_config: MasterConfig) -> Optional[EffortLevelsConfig]:
+    """Return the effort-levels reward-shaping config from env.nemo_gym, if set."""
+    if "nemo_gym" not in master_config.env:
+        return None
+    effort_dict = master_config.env["nemo_gym"].get("effort_levels")
+    if effort_dict is None:
+        return None
+    return EffortLevelsConfig.model_validate(effort_dict)
+
+
 def _create_advantage_estimator(master_config: MasterConfig):
     """Create and return an advantage estimator based on configuration.
 
@@ -1920,6 +1931,7 @@ def grpo_train(
                             generation_config=generation_config,
                             max_rollout_turns=None,
                             greedy=False,
+                            effort_config=_get_effort_config(master_config),
                         )
                         input_ids = nemo_gym_rollout_result.input_ids
                         repeated_batch = nemo_gym_rollout_result.final_batch
@@ -2721,6 +2733,7 @@ def validate(
                     generation_config=generation_config,
                     max_rollout_turns=None,
                     greedy=False,
+                    effort_config=_get_effort_config(master_config),
                 )
                 val_batch = nemo_gym_rollout_result.final_batch
                 gen_metrics = nemo_gym_rollout_result.rollout_metrics
