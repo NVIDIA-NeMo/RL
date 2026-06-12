@@ -5,8 +5,9 @@ is integrated into NeMo-RL as a generation backend, and the overall structure of
 that integration as it currently stands.
 
 > **Status:** Active development on the `dynamo-k8s-integration` branch.
-> Kubernetes-only. The rollout path (nemo-gym HTTP) and ModelExpress v2
-> mid-training weight refit are both wired end-to-end; see
+> Kubernetes-only. The nemo-gym HTTP rollout path, token-ID
+> `generate()` / `generate_async()` path, and ModelExpress v2 mid-training
+> weight refit are wired end-to-end; see
 > [Current State and Limitations](#current-state-and-limitations) for what is
 > and isn't supported.
 
@@ -14,10 +15,11 @@ that integration as it currently stands.
 
 A `DynamoGraphDeployment` (DGD) becomes the generation backend for RL training.
 This decouples generation from the trainer: inference is an independent,
-Kubernetes-managed deployment, and the trainer dispatches rollouts to its
+Kubernetes-managed deployment, and the trainer dispatches generation work to its
 frontend over HTTP. It is the natural fit for **non-colocated** RL and for
 [nemo-gym](nemo-gym-integration.md)-style agentic rollouts, which already speak
-OpenAI-compatible HTTP.
+OpenAI-compatible HTTP. The same backend can also service direct token-ID
+generation through Dynamo's OpenAI-compatible `/v1/completions` route.
 
 The key thing to understand is the **division of ownership**, which is
 deliberately lopsided:
@@ -42,7 +44,7 @@ NIXL). Everything else is standard Dynamo.
 │   ┌─────────────── Training RayCluster ───────────────┐                       │
 │   │  run_grpo_nemo_gym.py (driver)                     │                       │
 │   │    └─ GRPO loop                                    │                       │
-│   │         ├─ DTensorPolicyWorker (trainer GPUs)      │                       │
+│   │         ├─ DTensor/Megatron policy workers         │                       │
 │   │         └─ DynamoGeneration  ── HTTP rollouts ─────┼──┐                    │
 │   └────────────────────────────────────────────────────┘  │                  │
 │            │ stream_weights_via_mx (NIXL RDMA publish)      │ /v1 (OpenAI API) │
@@ -63,10 +65,11 @@ NIXL). Everything else is standard Dynamo.
 
 Two data planes connect the trainer and the DGD:
 
-1. **Rollout path (HTTP).** nemo-gym dispatches generation requests to the DGD
-   frontend's OpenAI-compatible `/v1` endpoint. The frontend load-balances across
-   workers. This is the only generation path — `DynamoGeneration.generate()` is
-   intentionally not implemented.
+1. **Rollout / generation path (HTTP).** nemo-gym dispatches agentic rollout
+   requests to the DGD frontend's OpenAI-compatible `/v1` endpoint. Direct
+   NeMo-RL `generate()` and `generate_async()` calls use the DGD frontend's
+   `/v1/completions` route with token-ID prompts. The frontend load-balances
+   across workers.
 2. **Weight-refit path (NIXL RDMA, optional).** When `cluster.weight_sync.method
    = "mx"`, the trainer publishes new weights to the ModelExpress (MX) server each
    step and each DGD worker RDMA-pulls them. See
@@ -98,8 +101,26 @@ It is essentially a URL forwarder plus a refit dispatcher:
 
 - **Lifecycle methods** (`prepare_for_generation`, `finish_generation`,
   `shutdown`) are no-ops — the DGD lifecycle is owned by Kubernetes.
-- **`generate()`** raises `NotImplementedError`; rollouts flow through the
-  nemo-gym HTTP path.
+- **`generate()`** performs synchronous token-ID generation by POSTing one
+  `/v1/completions` request per prompt. It sends `prompt` as token IDs,
+  `return_tokens_as_token_ids: true`, `include_stop_str_in_output: true`, and
+  `nvext.extra_fields: ["completion_token_ids"]`, then reconstructs the standard
+  `GenerationOutputSpec` tensor shape from the returned completion token IDs.
+- **`generate_async()`** performs the same completion request in an async wrapper.
+  It intentionally accepts one sample at a time, matching the vLLM async worker
+  contract used by the rollout code. It also budgets `max_tokens` against
+  `vllm_cfg.max_model_len` so direct Dynamo generation has the same context
+  truncation behavior expected by NeMo-RL.
+- **Sampling behavior** mirrors the existing vLLM backend knobs: non-greedy
+  requests forward `temperature`, `top_p`, and `top_k` from
+  `policy.generation`; `top_k: null` becomes `-1` for the Dynamo/vLLM HTTP API.
+  Greedy requests send `temperature: 0.0` and `top_k: 1`. Config-level
+  `stop_strings`, per-sample `stop_strings`, and `stop_token_ids` are forwarded
+  to the DGD.
+- **Direct-generation limits:** only token-ID LLM prompts are supported. The
+  direct path rejects multimodal `vllm_content`, requires
+  `dynamo_cfg.request_timeout_s`, and requires a Dynamo image that returns
+  `nvext.completion_token_ids` from `/v1/completions`.
 - **Collective / IPC weight-sync methods** (`init_collective`,
   `update_weights_from_collective`, `update_weights_via_ipc_zmq`) raise
   `NotImplementedError` — non-colocated refit goes through MX.
@@ -118,6 +139,8 @@ It is essentially a URL forwarder plus a refit dispatcher:
   | `namespace` | K8s namespace (auto-resolved from the pod if omitted). |
   | `frontend_port` | Frontend HTTP port (default `8000`). |
   | `tool_call_parser`, `reasoning_parser` | Compatibility hints; the actual parsers are configured on the DGD worker via `--dyn-*` flags. |
+  | `request_timeout_s` | HTTP timeout for direct `generate()` / `generate_async()` completion requests. |
+  | `dynamo_namespace`, `worker_component` | Legacy endpoint-resolution hints for refit paths; the current DGD dispatcher discovers workers through frontend `/health`. |
 
 - `DynamoConfig(GenerationConfig)` adds `dynamo_cfg` plus `vllm_cfg` /
   `vllm_kwargs` *compatibility shims* — the DGD owns the real inference-engine
@@ -147,17 +170,20 @@ recipe to it before the training entrypoint runs.
 
 ### Config files
 
-A run is described by three files that reference each other:
+A runnable k8s exemplar is described by a recipe/infra pair under
+`infra/nrl_k8s/examples/k8s_exemplars/*/*.yaml`. Start from those files; the
+infra YAML references the matching DGD manifest internally.
 
 | File | Role |
 |---|---|
-| `examples/nemo_gym/grpo_workplace_assistant_dynamo_*.yaml` | **Recipe** — sets `policy.generation.backend: dynamo`, GRPO hyperparameters, and (for MX) `cluster.weight_sync`. |
-| `infra/nrl_k8s/examples/*.gb300.infra.yaml` | **Infra** — training RayCluster spec, image, the `dynamo:` block pointing at a DGD manifest, and the launch entrypoint. |
-| `infra/nrl_k8s/examples_dgd/*.yaml` | **DGD manifest** — the `DynamoGraphDeployment` itself (Frontend + worker services, model, parsers, env). |
+| `infra/nrl_k8s/examples/k8s_exemplars/*/*.yaml` | **Recipe + infra exemplars** — recipe YAMLs set `policy.generation.backend: dynamo`, GRPO hyperparameters, and `cluster.weight_sync`; companion `*.infra.yaml` files set the training RayCluster, image, `dynamo:` block, and launch entrypoint. |
 
-Current examples: a non-MX `..._smoke` variant, an MX variant
-(`..._dynamo_mx`), a 16×TP2 MX scale variant (`..._dynamo_mx_16tp2`), and a
-small `qwen3_0.6b_kind` variant for local Kind clusters.
+Current runnable exemplars:
+
+- `infra/nrl_k8s/examples/k8s_exemplars/V1/*.yaml`: Qwen2.5 math + Dynamo + MX.
+- `infra/nrl_k8s/examples/k8s_exemplars/V2/*.yaml`: Llama 3.1 8B instruct Megatron + Dynamo + MX.
+- `infra/nrl_k8s/examples/k8s_exemplars/V3/*.yaml`: sliding puzzle + Dynamo + MX.
+- `infra/nrl_k8s/examples/k8s_exemplars/V5/*.yaml`: Nemotron Nano v2 workplace-assistant Megatron + Dynamo + MX.
 
 ## Rollout Path
 
@@ -166,6 +192,13 @@ the URL(s) in `DynamoGeneration.dp_openai_server_base_urls`. Those requests hit
 the DGD frontend, which routes them across `VllmDecodeWorker` replicas. NeMo-RL
 is not in this loop beyond having resolved the URL — there is no per-token or
 per-request involvement on the trainer side.
+
+For non-nemo-gym code paths, `DynamoGeneration.generate()` and
+`generate_async()` issue `/v1/completions` requests directly. This path is useful
+for ordinary token-ID LLM rollouts and tests, but it is intentionally narrower
+than vLLM's in-process backend: it does not support multimodal payloads, and it
+depends on the Dynamo `/v1/completions` response carrying
+`nvext.completion_token_ids`.
 
 ## Weight Refit via ModelExpress v2
 
@@ -182,13 +215,21 @@ process group. The integration solves this with **ModelExpress v2 (MX)** over
   service (`:8001`) that holds source discovery state and a per-version tensor
   **shape registry**. Both the trainer and the workers must point at the same
   `mx_server_url`.
-- **Trainer publisher** — `DTensorPolicyWorker.stream_weights_via_mx`
-  (`nemo_rl/models/policy/workers/dtensor_policy_worker.py`), built via
-  `nemo_rl/distributed/mx_helpers.py::build_v2_publisher` (an
-  `MxV2TrainingPublisher`).
+- **Trainer publishers**:
+  - `DTensorPolicyWorker.stream_weights_via_mx`
+    (`nemo_rl/models/policy/workers/dtensor_policy_worker.py`), built via
+    `nemo_rl/distributed/mx_helpers.py::build_v2_publisher`.
+  - `MegatronPolicyWorker.stream_weights_via_mx`
+    (`nemo_rl/models/policy/workers/megatron_policy_worker.py`), which uses
+    `nemo_rl/distributed/mx_megatron_helpers.py` to publish Megatron-native
+    per-rank shards plus role metadata and a Megatron-Bridge sidecar.
 - **Worker receiver** — each `VllmDecodeWorker` runs `MxRefitWorkerExtension`
   (registered on the dynamo side as `parallel_config.worker_extension_cls`,
-  gated by `DYN_MX_REFIT_ENABLED=1`), which builds an `MxV2RefitReceiver`.
+  gated by `DYN_MX_REFIT_ENABLED=1`), which builds an `MxV2RefitReceiver`. The
+  current k8s exemplars overlay
+  `infra/nrl_k8s/dynamo_mx/mx_refit_extension_megatron.py` into the Dynamo
+  worker image so the DGD can receive both DTensor/HF-shaped and Megatron-shaped
+  publishes.
 - **Refit dispatcher** — `_dispatch_update_weights_via_mx_remote` (a Ray remote
   in `dynamo_generation.py`) drives the per-worker refit over the workers'
   `/engine/<route>` admin HTTP server.
@@ -216,30 +257,33 @@ The orchestration lives in `refit_policy_generation`
 (`nemo_rl/algorithms/grpo.py`). The MX path is **serialized publish-then-pull**
 (unlike the NCCL collective path, which must run concurrently or it deadlocks):
 
-1. **Publish (trainer).** `policy.stream_weights_via_mx(version, mx_config)` →
-   each `DTensorPolicyWorker`:
-   - Lazily builds an `MxV2TrainingPublisher` once per worker (NIXL registration
-     happens on the first publish; local addresses are stable across steps).
-   - For each tensor in the state dict: DTensors are materialized with
-     `full_tensor()` (allgather across the FSDP/TP mesh) so the published bytes
-     match the global shape recorded in the registry, then registered with NIXL.
-     The receiver reshapes to the global shape and vLLM applies its own TP
-     sharding. *(This trades away the v2 "no-allgather" optimization; per-rank
-     expert publishing for MoE/EP is a follow-up.)*
-   - Calls `publish(version)` then `mark_ready()`.
-   - The driver `ray.get`s the publish futures so the publish fully completes
-     before any receiver is triggered.
+1. **Publish (trainer).** `policy.stream_weights_via_mx(version, mx_config)` runs
+   on whichever policy backend is active:
+   - **DTensor:** lazily builds an `MxV2TrainingPublisher`. The current
+     implementation materializes DTensors with `full_tensor()` before publishing
+     so the bytes match the global shape recorded in the registry; vLLM then
+     applies its own TP sharding on load. This is functional but trades away the
+     v2 no-allgather optimization.
+   - **Megatron:** publishes Megatron-native local shards without allgather. Each
+     tensor is classified into Megatron roles (`qkv_column`,
+     `gated_mlp_column`, `column`, `row`, `vocab_parallel`, `replicated`,
+     `expert_column`, `expert_row`) and carries enough sidecar metadata for the
+     Dynamo receiver to translate the shard set into vLLM/HF-shaped weights.
+   - Both paths call `publish(version)` then `mark_ready()`. The driver
+     `ray.get`s the publish futures so publish fully completes before any
+     receiver is triggered.
 2. **Pull (workers).** `policy_generation.update_weights_via_mx(version,
    mx_config)` dispatches `_dispatch_update_weights_via_mx_remote`, which:
    - `GET <dgd-frontend>:8000/health` to enumerate live worker instances (keyed
      by stable `instance_id`), pairing each pod IP with `DYN_SYSTEM_PORT` (9090)
      to form the per-pod `system_url`. Retries with backoff on the first pass
      (workers may be container-Ready but not yet registered in discovery).
-   - For each *new* worker: `POST /engine/pause_generation` → `POST
-     /engine/update_weights_via_mx` (the real NIXL receive, blocks) → `POST
-     /engine/flush_cache` (drop stale prefix cache) → `POST
-     /engine/resume_generation` (in a `finally`, so generation is always
-     re-enabled).
+   - For each *new* worker: `POST /engine/update_weights_via_mx` (the real NIXL
+     receive, blocks) → `POST /engine/flush_cache` (drop stale prefix cache).
+     There is intentionally no pause/resume wrapper: vLLM `collective_rpc`
+     executes between engine steps, pausing rather than aborting in-flight
+     requests. The earlier `pause_generation` wrapper could abort rollouts and
+     produce empty completions.
    - **Re-discovers** after each pass: if new `instance_id`s appeared (a worker
      scaled in or restarted mid-cycle), it refits those too, converging over up
      to 5 passes. Workers that disappeared mid-cycle are dropped (they can't be
@@ -255,6 +299,24 @@ The orchestration lives in `refit_policy_generation`
    - Raises (failing the run loudly) on per-worker step errors or non-convergence
      — replacing the silent stale-weight failure mode of an earlier poll-only
      design.
+
+### Megatron receive path
+
+The Megatron path is separate from the DTensor/HF-shaped receive path. The
+trainer publishes Megatron parameter names and role descriptors, and the DGD
+overlay builds a receiver context from:
+
+- the target vLLM worker TP rank and TP size;
+- the Megatron-Bridge sidecar (`megatron_transformer_config` and
+  `megatron_hf_name_map`);
+- the v2 shape registry and Megatron role metadata in each tensor descriptor.
+
+The current overlay supports **matched TP only** for Megatron refit: the trainer
+TP size must match the DGD vLLM TP size. That keeps the receiver path simple:
+each target TP rank pulls the matching trainer TP rank's buffers, handles
+full-vocab tensors specially, runs the Modelexpress Megatron translator, loads
+the translated weights into vLLM, and flushes stale caches. Cross-TP
+repartitioning is a follow-up.
 
 ### RDMA fabric setup
 
@@ -282,21 +344,20 @@ infra/DGD YAMLs (GB300):
 
 - **Kubernetes-only.** The `dgd_name` path requires running inside a pod;
   `frontend_url` is the only way to point at a DGD from outside.
-- **No `generate()`.** Direct generation is not supported; rollouts go through
-  the nemo-gym HTTP path.
-- **MX refit is DTensor-only.** `stream_weights_via_mx` is implemented on
-  `DTensorPolicyWorker`. Megatron-backend MX support is a follow-up — MX recipes
-  flip `megatron_cfg.enabled: false` / `dtensor_cfg.enabled: true`.
-- **DTensors are allgathered** (`full_tensor()`) on publish rather than published
-  as local shards. The per-rank/no-allgather optimization (and MoE expert
-  filtering) is a known follow-up.
+- **Direct generation is token-ID only.** `generate()` and `generate_async()` are
+  implemented through `/v1/completions`, but multimodal `vllm_content` is not
+  supported. `generate_async()` accepts one sample per call.
+- **Dynamo image requirement.** Direct generation and nemo-gym training require a
+  Dynamo build that supports `/tokenize`, `required_prefix_token_ids`, and
+  `nvext.completion_token_ids` on `/v1/completions` (the V5 exemplars use the
+  `jthomson04/tokenize-endpoint-merge-main-06-09` lineage).
+- **MX refit supports DTensor and Megatron.** DTensor refit is functional but
+  still allgathers each DTensor with `full_tensor()` before publish. Megatron
+  refit publishes native local shards and currently requires matched trainer TP
+  and DGD TP.
 - **FP8 KV-cache scales** are not yet supported on the MX path.
 - **No collective / IPC weight sync** for the Dynamo backend — MX is the only
   non-colocated refit mechanism.
-- **Autoscaling / planner** integration (VirtualConnector-driven scaling) is not
-  part of the current DGD-centric architecture; the refit dispatcher tolerates
-  worker pool churn (re-discovery + convergence passes) but does not itself drive
-  scaling.
 
 ## File Map
 
@@ -306,13 +367,13 @@ infra/DGD YAMLs (GB300):
 | Backend config | `nemo_rl/models/generation/dynamo/config.py` |
 | Backend selection | `nemo_rl/models/generation/__init__.py` |
 | MX helpers (config, publisher/receiver, NIC pin) | `nemo_rl/distributed/mx_helpers.py` |
-| Trainer-side publish | `nemo_rl/models/policy/workers/dtensor_policy_worker.py` (`stream_weights_via_mx`) |
+| Megatron MX helpers | `nemo_rl/distributed/mx_megatron_helpers.py` |
+| Trainer-side publish | `nemo_rl/models/policy/workers/dtensor_policy_worker.py` and `nemo_rl/models/policy/workers/megatron_policy_worker.py` (`stream_weights_via_mx`) |
 | Refit orchestration | `nemo_rl/algorithms/grpo.py` (`refit_policy_generation`) |
+| DGD Megatron receive overlay | `infra/nrl_k8s/dynamo_mx/mx_refit_extension_megatron.py` |
 | DGD ingestion / CRUD | `infra/nrl_k8s/src/nrl_k8s/dgd.py` |
 | DGD schema | `infra/nrl_k8s/src/nrl_k8s/schema.py` (`DynamoGraphSpec`, `InfraConfig.dynamo`) |
 | DGD orchestration | `infra/nrl_k8s/src/nrl_k8s/orchestrate.py` (`ensure_dgd`) |
 | MX infra (server, images, README) | `infra/nrl_k8s/dynamo_mx/` |
-| Example recipes | `examples/nemo_gym/grpo_workplace_assistant_dynamo_*.yaml` |
-| Example infra | `infra/nrl_k8s/examples/*dynamo*.infra.yaml` |
-| Example DGD manifests | `infra/nrl_k8s/examples_dgd/*.yaml` |
+| Runnable k8s exemplars | `infra/nrl_k8s/examples/k8s_exemplars/*/*.yaml` |
 | Unit tests | `tests/unit/models/generation/test_dynamo_generation.py` |
