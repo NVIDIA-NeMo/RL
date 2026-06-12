@@ -2152,12 +2152,18 @@ def test_automodel_dtype_restore_workaround_still_needed(monkeypatch):
     function or ships PR #2419 (honors the explicit fp32 via ``promote_types`` so the weight
     stays fp32).
     """
+    import inspect
     import types
 
     import nemo_automodel.components.checkpoint.utils as ckpt_utils
     from nemo_automodel._transformers import model_init
 
     restore = getattr(model_init, "_restore_loaded_model_dtype", None)
+    # An earlier test in this process may have triggered the setup.py workaround
+    # (_disable_automodel_checkpoint_dtype_restore), which globally and irreversibly
+    # replaces this symbol with a no-op. Recover the genuine upstream function it
+    # stashed so this tripwire exercises Automodel's real behavior, not our no-op.
+    restore = getattr(restore, "_nrl_original", restore)
     if restore is None:
         pytest.fail(
             "Automodel removed _restore_loaded_model_dtype - remove the fp32 master-weight "
@@ -2174,9 +2180,25 @@ def test_automodel_dtype_restore_workaround_still_needed(monkeypatch):
         "_get_checkpoint_tensor_dtypes",
         lambda *args, **kwargs: {"weight": torch.bfloat16},
     )
-    # Supply the explicit fp32 request both ways the rewritten (#2419) fn might read it.
+    # Reproduce NeMo-RL's explicit-fp32 load. PR #2419 honors the request ONLY via the
+    # new `requested_dtype` parameter (it ignores hf_config.torch_dtype / load_kwargs in
+    # this function): with requested_dtype=fp32 it promotes the bf16 checkpoint tensor up
+    # to fp32 and leaves the weight unchanged. The current pin predates #2419 and its
+    # signature has no such parameter, so pass it only when the signature accepts it:
+    #   pre-#2419  -> requested_dtype absent -> weight downgraded to bf16 (assert holds, workaround needed)
+    #   post-#2419 -> requested_dtype=fp32   -> weight stays fp32      (assert fails, fires the removal tripwire)
     hf_config = types.SimpleNamespace(torch_dtype=torch.float32)
-    restore(model, "dummy", hf_config, None, {"torch_dtype": "torch.float32"})
+    restore_kwargs = {}
+    if "requested_dtype" in inspect.signature(restore).parameters:
+        restore_kwargs["requested_dtype"] = torch.float32
+    restore(
+        model,
+        "dummy",
+        hf_config,
+        None,
+        {"torch_dtype": "torch.float32"},
+        **restore_kwargs,
+    )
 
     assert model.weight.dtype == torch.bfloat16, (
         "Automodel no longer downgrades an explicit-fp32 load (likely PR #2419 landed); the "

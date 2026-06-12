@@ -533,6 +533,10 @@ def _disable_automodel_checkpoint_dtype_restore() -> None:
         return None
 
     _noop._nrl_disabled = True
+    # Stash the genuine function so the removal tripwire test
+    # (test_automodel_dtype_restore_workaround_still_needed) can exercise Automodel's
+    # real behavior even after this no-op has globally replaced the symbol process-wide.
+    _noop._nrl_original = restore
     _model_init._restore_loaded_model_dtype = _noop
 
 
