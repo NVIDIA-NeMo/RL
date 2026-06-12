@@ -3,19 +3,18 @@
 This guide summarizes the current MiniMax-M3 support in NeMo-RL, including the
 validated scope, a reference GRPO recipe, and known limitations.
 
-:::{warning}
-**Status: Functional Ready.** MiniMax-M3 is runnable in NeMo-RL, and short GRPO
-training runs have been validated with a BF16 MiniMax-M3 checkpoint. Long-run
-convergence has not been validated yet, so treat this as an early-access
-integration.
-:::
+> [!IMPORTANT]
+> **Status: Functional Ready.** MiniMax-M3 is runnable in NeMo-RL, and short GRPO
+> training runs have been validated with a BF16 MiniMax-M3 checkpoint. Long-run
+> convergence has not been validated yet, so treat this as an early-access
+> integration.
 
 ## Support Status
 
 
-| Model                      | Training backend    | Training parallelism      | Inference backend | Precision                                       | Status           |
-| -------------------------- | ------------------- | ------------------------- | ----------------- | ----------------------------------------------- | ---------------- |
-| MiniMax-M3 BF16 checkpoint | AutoModel (DTensor) | Expert Parallel (EP) only | vLLM              | BF16 training weights with BF16 vLLM generation | Functional Ready |
+| Model                | Training backend    | Training parallelism      | Inference backend | Precision                                       | Status           |
+| -------------------- | ------------------- | ------------------------- | ----------------- | ----------------------------------------------- | ---------------- |
+| MiniMaxAI/MiniMax-M3 | AutoModel (DTensor) | Expert Parallel (EP) only | vLLM              | BF16 training weights with BF16 vLLM generation | Functional Ready |
 
 
 Validated scope:
@@ -29,26 +28,31 @@ Validated scope:
 
 ### 1. Build the Environment
 
-MiniMax-M3 requires matching development branches of AutoModel and vLLM.
-NeMo-RL resolves both packages from local editable sources, so place the
-checkouts at the expected `3rdparty` paths:
+MiniMax-M3 currently depends on a specific AutoModel branch and vLLM pull
+request. Clone those sources into the `3rdparty` paths used by NeMo-RL's
+editable installs.
+
+Sources:
+
+- AutoModel: [https://github.com/NVIDIA-NeMo/Automodel/tree/larkz/minimax_m3](https://github.com/NVIDIA-NeMo/Automodel/tree/larkz/minimax_m3)
+- vLLM: [https://github.com/vllm-project/vllm/pull/45381](https://github.com/vllm-project/vllm/pull/45381)
+
+From the NeMo-RL repository root, run:
 
 ```bash
 mkdir -p 3rdparty/Automodel-workspace 3rdparty/vLLM-workspace
 
-git clone --branch athitten/minimax_m3 --single-branch \
-  https://github.com/athitten/Automodel-private.git \
+git clone --branch larkz/minimax_m3 --single-branch \
+  https://github.com/NVIDIA-NeMo/Automodel.git \
   3rdparty/Automodel-workspace/Automodel
 
-git clone --branch m3_release --single-branch \
-  https://github.com/vllm-project/vllm.git \
+git clone https://github.com/vllm-project/vllm.git \
   3rdparty/vLLM-workspace/vllm
+
+git -C 3rdparty/vLLM-workspace/vllm fetch origin \
+  pull/45381/head:minimax-m3-pr-45381
+git -C 3rdparty/vLLM-workspace/vllm checkout minimax-m3-pr-45381
 ```
-
-Branches:
-
-- AutoModel: [https://github.com/athitten/Automodel-private/tree/athitten/minimax_m3](https://github.com/athitten/Automodel-private/tree/athitten/minimax_m3)
-- vLLM: [https://github.com/vllm-project/vllm/tree/m3_release](https://github.com/vllm-project/vllm/tree/m3_release)
 
 Published NeMo-RL containers do not yet include the full MiniMax-M3 runtime
 environment. Force a rebuild of the per-worker `uv` virtual environments at
@@ -63,17 +67,14 @@ export NRL_FORCE_REBUILD_VENVS=true
 The reference recipe is:
 
 ```text
-exp/grpo-m3-32n8g-non-colocated-adamw.yaml
+exp/grpo-minimax-m3-32n8g-non-colocated.yaml
 ```
-
-Before launching, update `policy.model_name` to the path of your BF16
-MiniMax-M3 checkpoint.
 
 Key settings:
 
 - AutoModel (DTensor) training with `expert_parallel_size: 128`.
 - Non-colocated vLLM generation
-  (`generation.colocated.enabled: false`).
+(`generation.colocated.enabled: false`).
 - DAPO Math datasets (`DAPOMath17K` train / `DAPOMathAIME2024` validation).
 
 ### 3. Launch
@@ -84,7 +85,7 @@ MiniMax-M3 uses the standard GRPO entrypoint:
 export NRL_FORCE_REBUILD_VENVS=true
 
 uv run examples/run_grpo.py \
-  --config exp/grpo-m3-32n8g-non-colocated-adamw.yaml
+  --config exp/grpo-minimax-m3-32n8g-non-colocated.yaml
 ```
 
 ### Reference Training Curve
