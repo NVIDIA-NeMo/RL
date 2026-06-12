@@ -1242,9 +1242,10 @@ class MegatronPolicyWorkerImpl(
 
         # ---- Lazy-init the publisher (once per worker lifetime). ----
         if not hasattr(self, "_mx_publisher") or self._mx_publisher is None:
+            mx_device_id = torch.cuda.current_device()
             self._mx_publisher = build_v2_publisher(
                 rank=self.rank,
-                device_id=getattr(self, "local_device_index", self.rank),
+                device_id=mx_device_id,
                 fsdp_world_size=self.dp_size,
                 tp_world_size=tp_size,
                 pp_world_size=pp_size,

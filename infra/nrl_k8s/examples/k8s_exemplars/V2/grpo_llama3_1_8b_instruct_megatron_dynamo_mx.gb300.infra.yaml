@@ -76,7 +76,7 @@ _shared:
     - name: rl-workspace
       persistentVolumeClaim: {claimName: rl-workspace}
 
-image: jwillthomson/nemo-rl-mx:06-11
+image: jwillthomson/nemo-rl-mx:megatron-dynamo-mx-v2
 imagePullSecrets: [nvcr-secret]
 serviceAccount: nemo-rl-endpoint-registry
 
