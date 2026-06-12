@@ -13,31 +13,48 @@
 # limitations under the License.
 """Unit tests for ``nemo_rl/algorithms/x_token/loss_utils.py``.
 
-CPU-only. ``Fp32SparseMM`` is GPU-pinned via ``custom_fwd(device_type="cuda")``
-and is intentionally not covered here.
+Most tests here are CPU-only. ``Fp32SparseMM`` is GPU-pinned via
+``custom_fwd(device_type="cuda")`` and is intentionally not covered. The TP/CP
+> 1 code paths require real collectives, so they live in the multi-GPU NCCL
+tests at the bottom of this file (skipped when < 2 GPUs are available).
 """
 
 from __future__ import annotations
 
+import os
+import traceback
 from dataclasses import fields
 from pathlib import Path
 
+import numpy as np
 import pytest
+import ray
 import torch
 
 from nemo_rl.algorithms.x_token.loss_utils import (
     _EXACT_TOKEN_MAP_CACHE,
     _SPARSE_PROJECTION_CACHE,
     _TOPK_PROJECTION_CACHE,
+    _try_zero_copy_teacher_logits,
     alignment_from_flat_batch,
     build_exact_token_map,
     chunk_average_log_probs,
+    collect_overlapping_teacher_shards,
     get_sparse_projection_matrix,
     get_topk_projection,
+    localize_alignment,
     parse_projection_file,
     valid_chunk_mask,
 )
 from nemo_rl.algorithms.x_token.token_aligner import AlignmentBatch
+from nemo_rl.distributed.model_utils import AllReduceSum
+from nemo_rl.distributed.named_sharding import NamedSharding
+from nemo_rl.distributed.ray_actor_environment_registry import (
+    ACTOR_ENVIRONMENT_REGISTRY,
+    PY_EXECUTABLES,
+)
+from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 
 # ---------------------------------------------------------------------------
 # alignment_from_flat_batch
@@ -417,3 +434,299 @@ class TestBuildExactTokenMap:
         assert out["common_teacher"].tolist() == [1, 0]
         assert out["uncommon_student"].tolist() == [1, 2]
         assert out["uncommon_teacher"].tolist() == [2]
+
+
+# NOTE: the TP/CP > 1 paths of vocab_parallel_log_softmax / vocab_parallel_full_log_softmax /
+# project_student_to_teacher_vocab / vocab_parallel_argmax /
+# select_teacher_topk_indices are covered by the real multi-GPU NCCL tests at
+# the bottom of this file (single-rank fallbacks would not exercise any of the
+# collectives).
+class TestLocalizeAlignment:
+    def _data(self, B: int = 2, T_s: int = 5, T_t: int = 6, P: int = 3) -> dict:
+        return {
+            "alignment_student_chunk_id": torch.zeros((B, T_s), dtype=torch.long),
+            "alignment_teacher_chunk_id": torch.arange(B * T_t).reshape(B, T_t),
+            "alignment_pair_valid": torch.ones((B, P), dtype=torch.bool),
+            "alignment_pair_is_correct": torch.zeros((B, P), dtype=torch.bool),
+            "sample_mask": torch.ones(B, dtype=torch.bool),
+        }
+
+    def test_no_cp_keeps_full_teacher_chunk_id(self):
+        data = self._data()
+        align = localize_alignment(data, teacher_seq_len=6, cp_group=None)
+        # cp_group=None → start offset 0, full teacher_chunk_id passed through.
+        assert torch.equal(align.teacher_chunk_id, data["alignment_teacher_chunk_id"])
+        assert torch.equal(align.student_chunk_id, data["alignment_student_chunk_id"])
+        assert torch.equal(align.pair_valid, data["alignment_pair_valid"])
+        assert torch.equal(align.pair_is_correct, data["alignment_pair_is_correct"])
+        assert torch.equal(align.sample_mask, data["sample_mask"])
+
+
+class TestCollectOverlappingTeacherShards:
+    @staticmethod
+    def _shard(vstart, vend, gss, seq):
+        return {
+            "vocab_start_index": vstart,
+            "vocab_end_index": vend,
+            "global_seq_start": gss,
+            "actual_shape": (seq, vend - vstart),
+        }
+
+    def test_single_full_shard_no_cp(self):
+        m = collect_overlapping_teacher_shards(
+            [self._shard(0, 5, 0, 4)],
+            student_cp_rank=0,
+            student_cp_size=1,
+            full_seq_len=4,
+        )
+        assert len(m) == 1
+        _, src_seq, src_vocab, dest_seq, dest_vocab = m[0]
+        assert (src_seq, dest_seq) == (slice(0, 4), slice(0, 4))
+        assert (src_vocab, dest_vocab) == (slice(0, 5), slice(0, 5))
+
+    def test_cp_selects_matching_rank_only(self):
+        s0, s1 = self._shard(0, 5, 0, 4), self._shard(0, 5, 4, 4)
+        m = collect_overlapping_teacher_shards(
+            [s0, s1], student_cp_rank=1, student_cp_size=2, full_seq_len=8
+        )
+        assert len(m) == 1 and m[0][0] is s1
+        assert m[0][3] == slice(0, 4)
+
+    def test_tp_shards_map_to_vocab_ranges(self):
+        m = collect_overlapping_teacher_shards(
+            [self._shard(0, 4, 0, 2), self._shard(4, 8, 0, 2)],
+            student_cp_rank=0,
+            student_cp_size=1,
+            full_seq_len=2,
+        )
+        assert [x[4] for x in m] == [slice(0, 4), slice(4, 8)]
+
+
+class TestZeroCopyTeacherLogits:
+    @staticmethod
+    def _entry(sample_idx, vend=5, buf=0, payload=("p",)):
+        return {
+            "teacher_shards": [
+                {
+                    "payload_ipc": payload,
+                    "buf_idx": buf,
+                    "sample_index_in_buf": sample_idx,
+                    "vocab_start_index": 0,
+                    "vocab_end_index": vend,
+                    "global_seq_start": 0,
+                    "actual_shape": (4, vend),
+                    "full_seq_len": 4,
+                    "full_vocab_size": vend,
+                }
+            ]
+        }
+
+    def test_fastpath_returns_zero_copy_view(self, monkeypatch):
+        storage = torch.arange(2 * 4 * 5, dtype=torch.float32).reshape(1, 2, 4, 5)
+        monkeypatch.setattr(
+            "nemo_rl.models.policy.utils.rebuild_cuda_tensor_from_ipc",
+            lambda h, d: storage,
+        )
+        out = _try_zero_copy_teacher_logits(
+            [self._entry(0), self._entry(1)],
+            student_cp_rank=0,
+            student_cp_size=1,
+            device=0,
+        )
+        assert out is not None and out.data_ptr() == storage.data_ptr()
+        assert torch.equal(out, storage[0, :2])
+
+    def test_none_when_vocab_sharded(self):
+        e = self._entry(0)
+        e["teacher_shards"][0]["vocab_end_index"] = 3
+        assert (
+            _try_zero_copy_teacher_logits(
+                [e], student_cp_rank=0, student_cp_size=1, device=0
+            )
+            is None
+        )
+
+    def test_none_when_samples_not_contiguous(self):
+        assert (
+            _try_zero_copy_teacher_logits(
+                [self._entry(0), self._entry(2)],
+                student_cp_rank=0,
+                student_cp_size=1,
+                device=0,
+            )
+            is None
+        )
+
+
+# ---------------------------------------------------------------------------
+# Real multi-GPU (NCCL) tests for the TP/CP loss helpers.
+#
+# tp2cp1 vocab-shards the student logits across 2 ranks; tp1cp2 seq-shards the
+# teacher logits across 2 ranks. Each rank compares its sharded helper output
+# against the single-rank full-tensor reference. Skipped when < 2 GPUs.
+# ---------------------------------------------------------------------------
+
+
+@ray.remote(num_gpus=1)
+class XtokenShardTestActor:
+    def __init__(self, tp_size, cp_size, sharding):
+        self.tp_size = tp_size
+        self.cp_size = cp_size
+
+    def run_tp(self):
+        from nemo_rl.algorithms.x_token.loss_utils import (
+            project_student_to_teacher_vocab,
+        )
+        from nemo_rl.distributed.model_utils import (
+            vocab_parallel_argmax,
+            vocab_parallel_full_log_softmax,
+            vocab_parallel_log_softmax,
+        )
+
+        try:
+            torch.distributed.init_process_group(backend="nccl")
+            rank = int(os.environ["RANK"])
+            ws = int(os.environ["WORLD_SIZE"])
+            tp = torch.distributed.new_group(ranks=list(range(ws)))
+
+            torch.manual_seed(0)
+            B, T, Vs, Vt, temp = 2, 4, 8, 6, 1.5
+            shard = Vs // ws
+            sl = slice(rank * shard, (rank + 1) * shard)
+            full = torch.randn(B, T, Vs, device="cuda")
+            full_log = torch.log_softmax(full.float() / temp, dim=-1)
+            local = full[:, :, sl].contiguous()
+
+            torch.testing.assert_close(
+                vocab_parallel_log_softmax(local, temp, tp_group=tp),
+                full_log[:, :, sl],
+                rtol=1e-4,
+                atol=1e-4,
+            )
+            torch.testing.assert_close(
+                vocab_parallel_full_log_softmax(local, temp, tp_group=tp),
+                full_log,
+                rtol=1e-4,
+                atol=1e-4,
+            )
+            torch.testing.assert_close(
+                vocab_parallel_argmax(local, tp_group=tp), full.argmax(dim=-1)
+            )
+
+            idx = torch.tensor(
+                [[0, 1, 2, 3, 4, 5, 6, 7], [0, 1, 2, 3, 4, 5, 0, 1]], device="cuda"
+            )
+            m = torch.sparse_coo_tensor(
+                idx, torch.ones(8, device="cuda"), (Vs, Vt)
+            ).coalesce()
+            full_probs = full_log.exp()
+            proj = project_student_to_teacher_vocab(
+                full_probs[:, :, sl].contiguous(), m, tp_group=tp
+            )
+            ref = (full_probs.reshape(-1, Vs) @ m.to_dense()).reshape(B, T, Vt)
+            torch.testing.assert_close(proj, ref, rtol=1e-4, atol=1e-4)
+            return {"success": True, "error": None}
+        except Exception:
+            return {"success": False, "error": traceback.format_exc()}
+        finally:
+            if torch.distributed.is_initialized():
+                torch.distributed.destroy_process_group()
+
+    def run_cp(self):
+        from nemo_rl.algorithms.x_token.loss_utils import (
+            chunk_average_log_probs,
+            select_teacher_topk_indices,
+        )
+
+        try:
+            torch.distributed.init_process_group(backend="nccl")
+            rank = int(os.environ["RANK"])
+            ws = int(os.environ["WORLD_SIZE"])
+            cp = torch.distributed.new_group(ranks=list(range(ws)))
+
+            torch.manual_seed(0)
+            B, T, V, k = 2, 8, 6, 3
+            shard = T // ws
+            sl = slice(rank * shard, (rank + 1) * shard)
+            full = torch.randn(B, T, V, device="cuda")
+
+            torch.testing.assert_close(
+                select_teacher_topk_indices(
+                    full[:, sl, :].contiguous(), k, cp_group=cp
+                ),
+                torch.topk(full.reshape(-1, V).max(dim=0).values, k)
+                .indices.sort()
+                .values,
+            )
+
+            full_lp = torch.log_softmax(full, dim=-1)
+            cid = torch.tensor(
+                [[0, 0, 0, 0, 1, 1, 1, 1], [0, 0, 1, 1, 1, 1, 0, 0]], device="cuda"
+            )
+            avg, sizes = chunk_average_log_probs(
+                full_lp[:, sl, :].contiguous(), cid[:, sl].contiguous(), 2, cp_group=cp
+            )
+            ref_avg, ref_sizes = chunk_average_log_probs(full_lp, cid, 2, cp_group=None)
+            torch.testing.assert_close(avg, ref_avg, rtol=1e-4, atol=1e-4)
+            torch.testing.assert_close(sizes, ref_sizes)
+
+            x = torch.full((3,), float(rank + 1), device="cuda", requires_grad=True)
+            y = AllReduceSum.apply(x, cp)
+            torch.testing.assert_close(
+                y, torch.full((3,), float(ws * (ws + 1) // 2), device="cuda")
+            )
+            y.sum().backward()
+            torch.testing.assert_close(x.grad, torch.ones(3, device="cuda"))
+            return {"success": True, "error": None}
+        except Exception:
+            return {"success": False, "error": traceback.format_exc()}
+        finally:
+            if torch.distributed.is_initialized():
+                torch.distributed.destroy_process_group()
+
+
+_ACTOR_FQN = f"{XtokenShardTestActor.__module__}.XtokenShardTestActor"
+
+
+@pytest.fixture
+def register_actor():
+    original = ACTOR_ENVIRONMENT_REGISTRY.get(_ACTOR_FQN)
+    ACTOR_ENVIRONMENT_REGISTRY[_ACTOR_FQN] = PY_EXECUTABLES.SYSTEM
+    yield _ACTOR_FQN
+    if original is None:
+        ACTOR_ENVIRONMENT_REGISTRY.pop(_ACTOR_FQN, None)
+    else:
+        ACTOR_ENVIRONMENT_REGISTRY[_ACTOR_FQN] = original
+
+
+def _run(register_actor, tp_size, cp_size, method):
+    world_size = tp_size * cp_size
+    if not torch.cuda.is_available() or torch.cuda.device_count() < world_size:
+        pytest.skip(f"need {world_size} GPUs, got {torch.cuda.device_count()}")
+    cluster = RayVirtualCluster(bundle_ct_per_node_list=[world_size], use_gpus=True)
+    try:
+        sharding = NamedSharding(
+            layout=np.arange(world_size).reshape(tp_size, cp_size), names=["tp", "cp"]
+        )
+        worker_group = RayWorkerGroup(
+            cluster=cluster,
+            remote_worker_builder=RayWorkerBuilder(
+                register_actor, tp_size, cp_size, sharding
+            ),
+            workers_per_node=None,
+            sharding_annotations=sharding,
+        )
+        results = ray.get(worker_group.run_all_workers_single_data(method))
+        for i, r in enumerate(results):
+            assert r["success"], f"rank {i} failed:\n{r['error']}"
+        worker_group.shutdown(force=True)
+    finally:
+        cluster.shutdown()
+
+
+def test_tp2cp1_sharded_helpers(register_actor):
+    _run(register_actor, tp_size=2, cp_size=1, method="run_tp")
+
+
+def test_tp1cp2_sharded_helpers(register_actor):
+    _run(register_actor, tp_size=1, cp_size=2, method="run_cp")

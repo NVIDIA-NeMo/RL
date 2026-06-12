@@ -205,6 +205,9 @@ tests/test_suites/llm/distillation-qwen3-32b-to-1.7b-base-1n8g-megatron-tp2pp2cp
 # healthy. Self-distill Qwen3-1.7B-Base, ~20 min on 1n8g.
 tests/test_suites/llm/distillation-qwen3-1.7b-1n8g-megatron-qa-nvfp4.sh
 
+# Cross-tokenizer off-policy distillation (xtoken): Qwen3-4B -> Llama-3.2-1B P-KL, student TP4xCP2 <- teacher TP2xCP2, guards sharded-loss parallelism-invariance.
+tests/test_suites/llm/distillation-xtoken-off-policy-qwen3-4b-to-llama3.2-1b-1n8g-dtensor-tp4cp2.sh
+
 #######
 # PPO #
 #######
