@@ -408,14 +408,43 @@ class Value(ValueInterface):
         weights_path: str,
         optimizer_path: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
+        checkpointing_cfg: Optional[CheckpointingConfig] = None,
     ) -> None:
         """Save a checkpoint of the value model."""
-        futures = self.worker_group.run_all_workers_single_data(
-            "save_checkpoint",
-            weights_path=weights_path,
-            optimizer_path=optimizer_path,
-            tokenizer_path=tokenizer_path,
-        )
+        megatron_enable = bool(self.cfg.get("megatron_cfg", {}).get("enabled", False))
+
+        if megatron_enable:
+            futures = self.worker_group.run_all_workers_single_data(
+                "save_checkpoint",
+                weights_path=weights_path,
+                optimizer_path=optimizer_path,
+                tokenizer_path=tokenizer_path,
+            )
+        else:
+            use_v2 = self.cfg.get("dtensor_cfg", {}).get("_v2", False)
+
+            if use_v2:
+                futures = self.worker_group.run_all_workers_single_data(
+                    "save_checkpoint",
+                    weights_path=weights_path,
+                    optimizer_path=optimizer_path,
+                    tokenizer_path=tokenizer_path,
+                    checkpointing_cfg=checkpointing_cfg,
+                )
+            else:
+                if (
+                    checkpointing_cfg is not None
+                    and checkpointing_cfg.get("model_save_format", None) is not None
+                ):
+                    raise ValueError(
+                        "model_save_format must be None or omitted if using DTensorValueWorker (_v2=False)."
+                    )
+                futures = self.worker_group.run_all_workers_single_data(
+                    "save_checkpoint",
+                    weights_path=weights_path,
+                    optimizer_path=optimizer_path,
+                    tokenizer_path=tokenizer_path,
+                )
         ray.get(futures)
 
     def shutdown(self) -> bool:

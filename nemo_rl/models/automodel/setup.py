@@ -22,7 +22,10 @@ from typing import Any, Optional, Union
 
 import torch
 from hydra.utils import get_class
-from nemo_automodel import NeMoAutoModelForSequenceClassification
+from nemo_automodel import (
+    NeMoAutoModelForSequenceClassification,
+    NeMoAutoModelForTokenClassification,
+)
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components._peft.lora import PeftConfig
@@ -337,6 +340,14 @@ def validate_and_prepare_config(
                     "for the linear head of Bradley-Terry reward models."
                 )
                 model_config.num_labels = 1
+        elif rm_type == "regression":
+            model_class = NeMoAutoModelForTokenClassification
+            if model_config.num_labels != 1:
+                print(
+                    "model_config.num_labels is not 1. Setting it to 1 since this value is used as the out_features "
+                    "for the linear head of regression reward models."
+                )
+                model_config.num_labels = 1
         else:
             raise ValueError(f"Unknown reward model type: {rm_type}")
     else:
@@ -550,6 +561,7 @@ def setup_model_and_optimizer(
     init_optimizer: bool = True,
     weights_path: Optional[str] = None,
     optimizer_path: Optional[str] = None,
+    optimizer_module_filter: Optional[list[str]] = None,
 ) -> ModelAndOptimizerState:
     """Set up model, parallelization, and optimizer.
 
@@ -566,6 +578,7 @@ def setup_model_and_optimizer(
         init_optimizer: Whether to initialize optimizer
         weights_path: Optional path to checkpoint weights to load
         optimizer_path: Optional path to optimizer state to load
+        optimizer_module_filter: Optional list of module names to filter optimizer parameters
 
     Returns:
         ModelAndOptimizerState containing model, optimizer, scheduler, and metadata
@@ -761,15 +774,16 @@ def setup_model_and_optimizer(
         for key, value in optimizer_kwargs.items():
             if isinstance(value, str) and value.startswith("torch."):
                 optimizer_kwargs[key] = getattr(torch, value.removeprefix("torch."))
-        # Only pass trainable params to the optimizer. TE FusedAdam's step()
-        # allocates per-param state (exp_avg/exp_avg_sq/master_param) before the
-        # p.grad-is-None check, so passing frozen params (e.g. the visual
-        # encoder in text-only training) causes DCP to save unused state that
-        # later fails to reshard on resume.
-        optimizer = optimizer_cls(
-            (p for p in model.parameters() if p.requires_grad),
-            **optimizer_kwargs,
-        )
+
+        if optimizer_module_filter is not None:
+            parameters = [
+                p
+                for n, p in model.named_parameters()
+                if p.requires_grad and any(x in n for x in optimizer_module_filter)
+            ]
+        else:
+            parameters = [p for p in model.parameters() if p.requires_grad]
+        optimizer = optimizer_cls(parameters, **optimizer_kwargs)
 
     # Initialize scheduler
     scheduler = None
