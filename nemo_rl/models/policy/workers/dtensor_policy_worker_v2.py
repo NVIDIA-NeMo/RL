@@ -84,13 +84,14 @@ from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
 
 def _resolve_refit_transfer_dtype(
+    name: str,
     src_dtype: torch.dtype,
     base_dtype: torch.dtype,
 ) -> torch.dtype:
     """Pick the dtype used to transfer a tensor during refit."""
     if not src_dtype.is_floating_point:
         return src_dtype
-    if src_dtype == torch.float32:
+    if name.endswith(".gate.weight") or name.endswith(".e_score_correction_bias"):
         return torch.float32
     return base_dtype
 
@@ -130,6 +131,7 @@ def dtensor_params_generator(
                 _prepare_refit_tensor(
                     adapted_tensor,
                     _resolve_refit_transfer_dtype(
+                        adapted_fqn,
                         adapted_tensor.dtype,
                         target_dtype,
                     ),
@@ -379,8 +381,8 @@ class DTensorPolicyWorkerV2Impl(
             _runtime_is_reward_model,  # Duplicate, already set as _is_reward_model
         ) = runtime_config
 
-    def _get_refit_target_dtype(self, src_dtype: torch.dtype) -> torch.dtype:
-        return _resolve_refit_transfer_dtype(src_dtype, self.dtype)
+    def _get_refit_target_dtype(self, name: str, src_dtype: torch.dtype) -> torch.dtype:
+        return _resolve_refit_transfer_dtype(name, src_dtype, self.dtype)
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/train")
     def train(
@@ -1152,7 +1154,7 @@ class DTensorPolicyWorkerV2Impl(
                     _maybe_adapt_tensor_to_hf(owning_part, name, tensor)
                 )
                 target_pairs = [
-                    (an, at, self._get_refit_target_dtype(at.dtype))
+                    (an, at, self._get_refit_target_dtype(an, at.dtype))
                     for an, at in adapted_pairs
                 ]
                 meta = [
@@ -1278,7 +1280,7 @@ class DTensorPolicyWorkerV2Impl(
                 for adapted_fqn, adapted_tensor in adapted_fqn_tensors:
                     local_info[adapted_fqn] = (
                         adapted_tensor.shape,
-                        self._get_refit_target_dtype(adapted_tensor.dtype),
+                        self._get_refit_target_dtype(adapted_fqn, adapted_tensor.dtype),
                     )
 
         if self.pp_enabled:
@@ -1364,10 +1366,10 @@ class DTensorPolicyWorkerV2Impl(
                 if isinstance(tensor, DTensor):
                     # Convert DTensor to full tensor for streaming
                     full_tensor = tensor.full_tensor()
-                    target_dtype = self._get_refit_target_dtype(full_tensor.dtype)
+                    target_dtype = self._get_refit_target_dtype(name, full_tensor.dtype)
                     yield name, _prepare_refit_tensor(full_tensor, target_dtype)
                 else:
-                    target_dtype = self._get_refit_target_dtype(tensor.dtype)
+                    target_dtype = self._get_refit_target_dtype(name, tensor.dtype)
                     yield name, _prepare_refit_tensor(tensor, target_dtype)
 
         # Use the HTTP implementation
