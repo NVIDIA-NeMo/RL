@@ -73,6 +73,7 @@ def model_forward(
     attention_mask: torch.Tensor,
     packed_seq_params: Optional[PackedSeqParams] = None,
     defer_fp32_logits: Optional[bool] = False,
+    mtp_loss_mask: Optional[torch.Tensor] = None,
     straggler_timer: Optional[StragglerDetector] = None,
     use_linear_ce_fusion_loss: bool = False,
 ) -> torch.Tensor:
@@ -86,6 +87,7 @@ def model_forward(
         attention_mask: Attention mask for the sequence
         packed_seq_params: Parameters for packed sequences (optional)
         defer_fp32_logits: Whether to skip the conversion of logits to fp32
+        mtp_loss_mask: MTP loss mask to exclude prompt tokens from MTP loss (optional)
         straggler_timer: Straggler detector for profiling the forward pass
         use_linear_ce_fusion_loss: Whether to use linear CE fusion loss
 
@@ -102,6 +104,11 @@ def model_forward(
     # Mamba models currently do not support packed_seq_params
     if packed_seq_params is not None:
         additional_kwargs["packed_seq_params"] = packed_seq_params
+
+    # Pass MTP loss mask to exclude prompt tokens from MTP loss
+    if mtp_loss_mask is not None:
+        additional_kwargs["loss_mask"] = mtp_loss_mask
+
     if defer_fp32_logits:
         additional_kwargs["fp32_output"] = False
     if use_linear_ce_fusion_loss:
@@ -186,6 +193,7 @@ def forward_with_post_processing_fn(
     position_ids = processed_mb.position_ids
     packed_seq_params = processed_mb.packed_seq_params
     cu_seqlens_padded = processed_mb.cu_seqlens_padded
+    mtp_loss_mask = processed_mb.mtp_loss_mask
 
     # Insert hook to capture hidden states and embeddings for draft model training if draft_model is provided
     capture_context, capture = get_capture_context(model, enable_hidden_capture)
@@ -198,6 +206,7 @@ def forward_with_post_processing_fn(
             attention_mask=attention_mask,
             packed_seq_params=packed_seq_params,
             defer_fp32_logits=defer_fp32_logits,
+            mtp_loss_mask=mtp_loss_mask,
             straggler_timer=straggler_timer,
             use_linear_ce_fusion_loss=use_linear_ce_fusion_loss,
         )
