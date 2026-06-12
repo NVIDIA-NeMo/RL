@@ -1,0 +1,48 @@
+# Stage 2.1 (SWE 1) smoke — full Super model, NO GPU judges.
+#
+# swe1 uses the single_step_tool_use_with_argument_comparison (swe_pivot) env, which
+# scores by rule-based tool-call argument comparison — there are NO LLM-judge GPU servers,
+# so no Gym judge nodes are needed.
+#
+#   - Policy train: 8 nodes -> TP4 x PP4 x EP8 x CP2 (mirrors small_stage1_rlvr_14node)
+#   - Policy gen:   1 node  -> vLLM TP8 (non-colocated / async)
+#   - cluster.num_nodes = 9 (8 train + 1 vLLM); SBATCH_NUM_NODES=9 (no judge nodes).
+#
+# Set MODEL_PATH to the actual Super checkpoint (continues from RLVR 3 output).
+defaults: "stage2_swe1.yaml"
+
+checkpointing:
+  checkpoint_dir: "results/super_v3_smoke_stage2_swe1_9node"
+
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 8
+
+data:
+  # Cap prompt length below max_model_len so over-long prompts are capped at the
+  # dataloader instead of being rejected by vLLM (prompt>=max_model_len -> 400/422).
+  max_input_seq_length: 24576
+
+policy:
+  train_global_batch_size: 256
+  max_total_sequence_length: 32768   # smoke: down from prod 131072
+  generation:
+    max_new_tokens: 8192   # cap output so prompt+gen <= max_total_sequence_length
+    colocated:
+      resources:
+        num_nodes: 1
+    vllm_cfg:
+      tensor_parallel_size: 8
+    vllm_kwargs:
+      max_num_seqs: 16
+  megatron_cfg:
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 4
+    expert_model_parallel_size: 8
+    context_parallel_size: 2
+    optimizer:
+      params_dtype: "bfloat16"               # avoid FP32 master weights
+      use_precision_aware_optimizer: false
+
+cluster:
+  num_nodes: 9

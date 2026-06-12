@@ -1,0 +1,122 @@
+# Nano-30B-A3B recipe smoke test with downsized judge models.
+#
+# Inherits the full Gym / judge stack from small_stage1_rlvr_14node.yaml (which
+# itself inherits stage1_rlvr.yaml) and shrinks BOTH the policy footprint and the
+# Gym judge footprint for a cheap, fast-to-schedule smoke test:
+#
+#   - Policy train:  1 node -> TP=2 x PP=1 x EP=8 x CP=1  (DP=4, EP=8 = DP*TP)
+#   - Policy gen:    1 node -> vLLM TP=2 (matched to train TP=2; non-colocated / async)
+#   - cluster.num_nodes = 2 (1 train + 1 policy-vLLM)
+#   - Gym judges:    235B models swapped for 32B-class siblings, num_gpu_nodes 5 -> 2
+#
+# So SBATCH_NUM_NODES=4  (cluster.num_nodes=2 + 2 Gym judge nodes).
+#
+# Set MODEL_PATH=/lustre/fs1/portfolios/coreai/users/yifuw/checkpoints/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+# Run cache_judge_models.sh first to prefetch the new judge weights.
+defaults: "small_stage1_rlvr_14node.yaml"
+
+checkpointing:
+  checkpoint_dir: "results/super_v3_smoke_nano30b_4node"
+  # Smoke: avoid writing a resumable checkpoint mid-run. Megatron's CPU-offload optimizer
+  # (optimizer_cpu_offload below) KeyErrors on optimizer load_state_dict during resume, so any
+  # restart that auto-resumes a saved ckpt crashes. Push save_period past the smoke length.
+  save_period: 1000
+
+grpo:
+  # Small, fast step for smoke iteration. num_generations_per_prompt must equal
+  # genrm_compare.num_rollouts_per_prompt (overridden to 4 below).
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 4
+
+data:
+  # Cap prompt length below max_model_len so over-long prompts are filtered/capped at the
+  # dataloader instead of being rejected by vLLM (prompt>=max_model_len -> 400/422 -> the
+  # collector stalls and trajectories go stale). 16384 in + ~4096 gen <= 20480.
+  max_input_seq_length: 16384
+
+policy:
+  # 8 prompts * 4 generations = 32 trajectories per step
+  train_global_batch_size: 32
+  # Loss-time fp32 logits are (packed tokens = max_total_sequence_length) x vocab(131072).
+  # 65536 OOM'd; 16384 fixed the OOM but rejected prompts >=16384. 20480 (with optimizer
+  # offload below) balances both: logits still fit, and prompts are capped at 16384.
+  max_total_sequence_length: 20480
+  generation:
+    max_new_tokens: 4096
+    colocated:
+      resources:
+        num_nodes: 1        # 1 dedicated node for policy vLLM generation
+    vllm_cfg:
+      tensor_parallel_size: 2   # match train TP2 (was 8) to remove the gen/train TP-mismatch source of seq-logprob error
+    vllm_kwargs:
+      max_num_seqs: 16
+  megatron_cfg:
+    # Single training node. Clean divisibility for this model:
+    #   32 attn heads / TP2, 2 KV heads / TP2, 64 mamba heads / TP2,
+    #   8 n_groups / TP2, 128 experts / EP8 = 16.
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 8
+    context_parallel_size: 1
+    optimizer:
+      params_dtype: "float32"                # fp32 master (prod-faithful); tests if it cuts seq-logprob masking
+      use_precision_aware_optimizer: true    # fp32 master + Adam states
+      # Adam states (fp32) are offloaded to host RAM, so GPU memory is ~unchanged vs bf16 (only
+      # host RAM grows ~2x) -> no extra GPU nodes. Also validates that precision-aware + cpu_offload
+      # co-exist on this build. (If optimizer init errors, revert to bf16 + precision_aware:false.)
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 1.0
+    # Reclaim fragmented reserve; the OOM message itself recommends this.
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+
+env:
+  nemo_gym:
+    # 2 (genrm) + 2 (nl2bash) + 2 (safety) = 6 judge GPUs -> fits in 2 nodes with
+    # headroom. Dropping to 1 may work but packs 3 vLLM servers on one node; try
+    # only after the 2-node version boots clean.
+    num_gpu_nodes: 2
+
+    # Must equal grpo.num_generations_per_prompt (=4) or genrm_compare never forms
+    # a full rollout cohort and always returns default_score.
+    genrm_compare_resources_server:
+      resources_servers:
+        genrm_compare:
+          num_rollouts_per_prompt: 4
+          # 32B GenRM ctx is 40960; with the inherited max_output_tokens=16384 the max input
+          # is only 24576, which rejected 24577-token judge inputs. 8192 -> max input 32768.
+          genrm_responses_create_params:
+            max_output_tokens: 8192
+
+    # --- GenRM: 235B -> 32B principle-based sibling (same role, supports principle role) ---
+    genrm_model:
+      responses_api_models:
+        genrm_model:
+          model: "nvidia/Qwen3-Nemotron-32B-GenRM-Principle"
+          # VERIFY: does this 32B variant emit <think> reasoning? Inherited
+          # uses_reasoning_parser=true + reasoning_parser=deepseek_r1 from base.
+          # If genrm_compare returns only default_score (3.0), flip
+          # uses_reasoning_parser -> false and drop reasoning_parser below.
+          vllm_serve_kwargs:
+            data_parallel_size: 1
+            tensor_parallel_size: 2
+            max_model_len: 40960   # Qwen3-32B native ctx; 60000 would need YARN
+
+    # --- General LLM judge: 235B-FP8 -> 30B-A3B (MoE, same family, hermes tools) ---
+    nl2bash_judge_model:
+      responses_api_models:
+        local_vllm_model:
+          model: "Qwen/Qwen3-30B-A3B-Instruct-2507"
+          vllm_serve_kwargs:
+            data_parallel_size: 1
+            tensor_parallel_size: 2
+
+    # --- Safety judge: keep 4B model, just shrink the DP replica count ---
+    safety_judge_model:
+      responses_api_models:
+        local_vllm_model:
+          vllm_serve_kwargs:
+            data_parallel_size: 2
+
+cluster:
+  num_nodes: 2  # 1 training node + 1 policy-vLLM node; SBATCH_NUM_NODES=4 leaves 2 Gym nodes.

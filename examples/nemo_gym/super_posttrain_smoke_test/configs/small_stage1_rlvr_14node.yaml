@@ -1,0 +1,62 @@
+defaults: "stage1_rlvr.yaml"
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/super_v3_prod_stage1_rlvr_14node"
+
+grpo:
+  num_prompts_per_step: 128
+  num_generations_per_prompt: 8
+
+policy:
+  train_global_batch_size: 1024
+  generation:
+    colocated:
+      resources:
+        num_nodes: 1
+    vllm_cfg:
+      tensor_parallel_size: 8
+    vllm_kwargs:
+      max_num_seqs: 16
+  megatron_cfg:
+    pipeline_model_parallel_size: 4
+    expert_model_parallel_size: 8
+    context_parallel_size: 2
+    optimizer:
+      params_dtype: "bfloat16"          # eliminates ~30GB FP32 master weights per GPU
+      use_precision_aware_optimizer: false  # required when params_dtype is bfloat16
+
+env:
+  nemo_gym:
+    policy_model_reasoning_off:
+      _copy: policy_model
+      responses_api_models:
+        vllm_model:
+          chat_template_kwargs:
+            enable_thinking: false
+            truncate_history_thinking: false
+          sequential_reasoning_allowed: false
+    genrm_compare_resources_server:
+      resources_servers:
+        genrm_compare:
+          num_rollouts_per_prompt: 8
+    genrm_model:
+      responses_api_models:
+        genrm_model:
+          hf_home: "${oc.env:PERSISTENT_CACHE}/hf_judge_models"
+          vllm_serve_kwargs:
+            max_num_seqs: 16
+    nl2bash_judge_model:
+      responses_api_models:
+        local_vllm_model:
+          hf_home: "${oc.env:PERSISTENT_CACHE}/hf_judge_models"
+          vllm_serve_kwargs:
+            max_num_seqs: 16
+    safety_judge_model:
+      responses_api_models:
+        local_vllm_model:
+          vllm_serve_kwargs:
+            max_num_seqs: 16
+
+cluster:
+  num_nodes: 9  # 8 training nodes + 1 policy-vLLM node; SBATCH_NUM_NODES=14 leaves 5 Gym nodes.

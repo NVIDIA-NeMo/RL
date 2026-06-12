@@ -1,0 +1,71 @@
+# Stage 3 (RLHF) smoke — Nano-30B-A3B policy + 235B GenRM judge (1 replica).
+#
+# Inherits small_stage3_rlhf_11node.yaml; shrinks the policy to one training node with the
+# validated nano fixes. NOTE: the GenRM stays the 235B Qwen3-Nemotron-235B-A22B-GenRM-2603 —
+# there is NO smaller *pairwise* GenRM (the 32B-GenRM-Principle is a single-response scorer and
+# fails genrm_compare's parser). The "nano" saving for rlhf is fewer GenRM replicas, not a
+# smaller judge model.
+#
+#   - Policy train: 1 node -> TP2 x PP1 x EP8 x CP1
+#   - Policy gen:   1 node -> vLLM TP8
+#   - GenRM judge:  1 node -> DP1 x TP8  (num_gpu_nodes=1)
+#   - cluster.num_nodes = 2 (1 train + 1 vLLM); SBATCH_NUM_NODES=3 (2 + 1 GenRM node).
+#
+# Set MODEL_PATH=/lustre/fs1/portfolios/coreai/users/yifuw/checkpoints/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+defaults: "small_stage3_rlhf_11node.yaml"
+
+checkpointing:
+  checkpoint_dir: "results/super_v3_smoke_stage3_rlhf_nano30b_3node"
+  # Resume-safe: CPU-offload optimizer KeyErrors on load_state_dict during resume; push
+  # save_period past the smoke length so no resumable checkpoint is written mid-run.
+  save_period: 1000
+
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 4
+  async_grpo:
+    max_trajectory_age_steps: 4
+
+data:
+  # Cap prompt length below max_model_len so over-long prompts are capped at the
+  # dataloader instead of being rejected by vLLM (prompt>=max_model_len -> 400/422).
+  max_input_seq_length: 12288
+
+policy:
+  train_global_batch_size: 32
+  max_total_sequence_length: 16384
+  generation:
+    max_new_tokens: 4096   # cap output so prompt+gen <= max_total_sequence_length
+    colocated:
+      resources:
+        num_nodes: 1
+    vllm_cfg:
+      tensor_parallel_size: 8
+  megatron_cfg:
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 8
+    context_parallel_size: 1
+    optimizer:
+      params_dtype: "bfloat16"
+      use_precision_aware_optimizer: false
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 1.0
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+
+env:
+  nemo_gym:
+    num_gpu_nodes: 1   # GenRM DP1 x TP8 = 8 GPUs = 1 node
+    genrm_compare_resources_server:
+      resources_servers:
+        genrm_compare:
+          num_rollouts_per_prompt: 4   # must equal grpo.num_generations_per_prompt
+    genrm_model:
+      responses_api_models:
+        genrm_model:
+          vllm_serve_kwargs:
+            data_parallel_size: 1
+
+cluster:
+  num_nodes: 2
