@@ -1504,8 +1504,20 @@ class MegatronPolicyWorkerImpl(
         no_grad.__enter__()
         self.model = self.move_model(self.model, "cpu")
         self.model.eval()
+        # Offload grad buffers (params already on CPU from the move above).
+        self.model = self.move_model(
+            self.model, "cpu", move_params=False, move_grads=True
+        )
         torch.randn(1).cuda()  # wake up torch allocator
-        self.offload_before_refit()  # rerun the old offload function
+        if (
+            hasattr(self, "optimizer")
+            and self.optimizer is not None
+            and not self.optimizer_cpu_offload
+        ):
+            self.move_optimizer("cpu")
+
+        gc.collect()
+        torch.cuda.empty_cache()
 
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
         reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
