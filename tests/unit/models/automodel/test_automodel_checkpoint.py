@@ -1005,8 +1005,9 @@ def test_qwen_vl_vision_key_mapping_workaround_still_needed():
     to remove ``_patch_qwen_vl_vision_key_mapping`` (and this test) — once that transformers
     pin includes #45358 (>=5.6) and the real mapping targets ``model.visual``.
     """
-    import nemo_rl.models.automodel.checkpoint  # noqa: F401  (import applies the patch)
     import nemo_automodel.components.checkpoint.checkpointing as ckpt
+
+    import nemo_rl.models.automodel.checkpoint  # noqa: F401  (import applies the patch)
 
     fn = ckpt.get_combined_key_mapping
     # Unwrap to the real automodel mapping fn (Change 3 exposes it as _nrl_orig); if the patch

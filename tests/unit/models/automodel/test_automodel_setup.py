@@ -2154,8 +2154,8 @@ def test_automodel_dtype_restore_workaround_still_needed(monkeypatch):
     """
     import types
 
-    from nemo_automodel._transformers import model_init
     import nemo_automodel.components.checkpoint.utils as ckpt_utils
+    from nemo_automodel._transformers import model_init
 
     restore = getattr(model_init, "_restore_loaded_model_dtype", None)
     if restore is None:
