@@ -607,6 +607,78 @@ def vlm_hf_data_processor(
     return output
 
 
+def livecodebench_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer: TokenizerType,
+    max_seq_length: int,
+    idx: int,
+) -> DatumSpec:
+    """Process a LiveCodeBench example into a DatumSpec for the LCB env.
+
+    The dataset stashes test cases + starter code as JSON in datum_dict["metadata"];
+    we forward them as extra_env_info so LiveCodeBenchEnvironment can grade.
+    """
+    user_message_dict = datum_dict["messages"][0]
+    problem = user_message_dict["content"]
+    extra_env_info = json.loads(datum_dict["metadata"])
+
+    formatted_content = (
+        task_data_spec.prompt.format(problem) if task_data_spec.prompt else problem
+    )
+    user_message = {"role": "user", "content": formatted_content}
+
+    if task_data_spec.system_prompt:
+        message_list = [
+            {"role": "system", "content": task_data_spec.system_prompt},
+            user_message,
+        ]
+    else:
+        message_list = [user_message]
+
+    rendered = tokenizer.apply_chat_template(
+        message_list,
+        tokenize=False,
+        add_generation_prompt=True,
+        add_special_tokens=False,
+    )
+    token_ids = tokenizer(
+        rendered,
+        return_tensors="pt",
+        add_special_tokens=False,
+    )["input_ids"][0]
+
+    # Store the RAW problem text in `content`, not the chat-templated `rendered`
+    # string. SDPO's build_sdpo_teacher_data reads `content` and re-applies the
+    # chat template; storing `rendered` here would cause a double-wrap, with
+    # `<|im_start|>assistant\n` markers landing in the middle of the user turn
+    # and env feedback ending up inside the assistant turn. `token_ids` keeps
+    # the rendered chat template for rollouts that consume tokens directly.
+    user_message["content"] = formatted_content
+    user_message["token_ids"] = token_ids
+    message_log: LLMMessageLogType = [user_message]
+
+    length = sum(len(m["token_ids"]) for m in message_log)
+
+    loss_multiplier = 1.0
+    if length >= max_seq_length:
+        for chat_message in message_log:
+            chat_message["token_ids"] = chat_message["token_ids"][
+                : min(4, max_seq_length // len(message_log))
+            ]
+        loss_multiplier = 0.0
+
+    output: DatumSpec = {
+        "message_log": message_log,
+        "length": length,
+        "extra_env_info": extra_env_info,
+        "loss_multiplier": loss_multiplier,
+        "idx": idx,
+        "task_name": datum_dict.get("task_name", "livecodebench_v6"),
+    }
+    return output
+
+
 def _construct_multichoice_prompt(
     prompt: str, question: str, options: dict[str, str]
 ) -> str:
@@ -750,6 +822,7 @@ PROCESSOR_REGISTRY: Dict[str, TaskDataProcessFnCallable] = cast(
         "kd_data_processor": kd_data_processor,
         "math_data_processor": math_data_processor,
         "math_hf_data_processor": math_hf_data_processor,
+        "livecodebench_processor": livecodebench_processor,
         "multichoice_qa_processor": multichoice_qa_processor,
         "sft_processor": sft_processor,
         "vlm_hf_data_processor": vlm_hf_data_processor,

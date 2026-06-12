@@ -126,6 +126,50 @@ def prepare_loss_input(
             "teacher_topk_logprobs": teacher_topk_logprobs,
             "H_all": H_all,
         }
+    elif loss_fn.input_type == LossInputType.DISTILLATION_AND_LOGPROB:
+        sdpo_loss = loss_fn.sdpo_loss
+        calculate_entropy = sdpo_loss.zero_outside_topk and sdpo_loss.kl_type != "forward"
+        student_topk_logprobs, teacher_topk_logprobs, H_all = get_distillation_topk_logprobs_from_logits(
+            student_logits=logits,
+            teacher_topk_logits=data["teacher_topk_logits"],
+            teacher_topk_indices=data["teacher_topk_indices"],
+            zero_outside_topk=sdpo_loss.zero_outside_topk,
+            calculate_entropy=calculate_entropy,
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+        )
+
+        logprobs = get_next_token_logprobs_from_logits(
+            input_ids=data["input_ids"],
+            next_token_logits=logits,
+            seq_index=data.get("seq_index", None),
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+            sampling_params=sampling_params,
+        )
+        if need_top_k_or_top_p_filtering(sampling_params):
+            mask = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
+            logprobs = mask_out_neg_inf_logprobs(logprobs, mask[:, 1:], "curr_logprobs")
+            # GRPO reference-policy KL needs unfiltered current logprobs.
+            if loss_fn.grpo_loss.reference_policy_kl_penalty != 0:
+                data["curr_logprobs_unfiltered"] = get_next_token_logprobs_from_logits(
+                    input_ids=data["input_ids"],
+                    next_token_logits=logits,
+                    seq_index=data.get("seq_index", None),
+                    vocab_parallel_rank=vocab_parallel_rank,
+                    vocab_parallel_group=vocab_parallel_group,
+                    context_parallel_group=context_parallel_group,
+                    sampling_params=None,  # no filtering
+                )
+
+        loss_input = {
+            "student_topk_logprobs": student_topk_logprobs,
+            "teacher_topk_logprobs": teacher_topk_logprobs,
+            "H_all": H_all,
+            "next_token_logprobs": logprobs,
+        }
     elif loss_fn.input_type == LossInputType.DISTILLATION_CROSS_TOKENIZER:
         # Materialize the teacher-side loss input: rebuild the microbatch's
         # full-vocab teacher logits from the CUDA IPC handles shipped on the
