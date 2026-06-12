@@ -118,9 +118,11 @@ automodel = [
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "flash-attn==2.8.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
-  # DSV4-Flash debug Automodel (rl/dsv4-rebased-bug-20260528) pins transformers==5.5.0.
-  # automodel is its own resolution group (see [conflicts]) so this need not match mcore's 5.8.x.
-  "transformers==5.5.0",
+  # transformers must be >=5.8.1 for native deepseek_v4 support: 5.5.0 lacks it, so AutoConfig
+  # falls back to Automodel's custom DeepseekV4Config and the train (Automodel) vs vLLM sides resolve
+  # the config (rope/yarn) inconsistently -> per-layer mismatch -> gen_kl explosion (5.0 on 43L).
+  # Verified: cu13 + tilelang/eager attn + transformers 5.8.1 gives gen_kl ~0.012; 5.5.0 gives 5.0.
+  "transformers>=5.8.1,<5.9.0",
   "mamba-ssm",
   "causal-conv1d",
   "nv-grouped-gemm",
