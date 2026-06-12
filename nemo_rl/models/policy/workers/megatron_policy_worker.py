@@ -516,7 +516,7 @@ class MegatronPolicyWorkerImpl(
                     mtp_loss_mask = batch["token_mask"] * batch[
                         "sample_mask"
                     ].unsqueeze(-1)
-                    if self.cfg["megatron_cfg"].get("mtp_positive_only", False):
+                    if self.cfg["megatron_cfg"].get("mtp_positive_only"):
                         mtp_loss_mask = (batch["advantages"] > 0) * mtp_loss_mask
                     batch["mtp_loss_mask"] = mtp_loss_mask
 
