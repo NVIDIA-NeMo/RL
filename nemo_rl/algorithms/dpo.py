@@ -491,24 +491,17 @@ def validate_one_dataset(
     timing_metrics = timer.get_timing_metrics(reduction_op="sum")
     validation_time = timing_metrics.get("total_validation_time", 0)
 
-    if len(val_metrics) == 0:
-        warnings.warn(
-            "No validation metrics were collected."
-            " This is likely because there were no valid samples in the validation set."
+    # Print summary of validation results
+    print(f"\n📊 Validation Results for `{dataset_name}` set:")
+    for metric_name in DPOValMetrics.__annotations__.keys():
+        print(
+            f"    • Validation {metric_name}: {getattr(val_metrics, metric_name):.4f}"
         )
 
-    else:
-        # Print summary of validation results
-        print(f"\n📊 Validation Results for `{dataset_name}` set:")
-        for metric_name in DPOValMetrics.__annotations__.keys():
-            print(
-                f"    • Validation {metric_name}: {getattr(val_metrics, metric_name):.4f}"
-            )
-
-        # Print timing information
-        print(f"\n  ⏱️  Validation Timing for `{dataset_name}` set:")
-        validation_time = timing_metrics.get("total_validation_time", 0)
-        print(f"    • Total validation time: {validation_time:.2f}s")
+    # Print timing information
+    print(f"\n  ⏱️  Validation Timing for `{dataset_name}` set:")
+    validation_time = timing_metrics.get("total_validation_time", 0)
+    print(f"    • Total validation time: {validation_time:.2f}s")
 
     # Make sure to reset the timer after validation
     timer.reset()
