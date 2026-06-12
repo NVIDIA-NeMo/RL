@@ -46,10 +46,12 @@ def configure_generation_config(
         # set load_format
         config["vllm_cfg"]["load_format"] = "auto" if is_eval else "dummy"
         speculative_config = config.get("vllm_kwargs", {}).get("speculative_config")
-        if speculative_config:
-            # Speculative decoding needs real startup weights unless the draft
-            # weights will be pushed into vLLM during the initial refit.
-            if not is_eval and not has_refit_draft_weights:
+        if speculative_config and not is_eval and not has_refit_draft_weights:
+            # Speculative decoding needs real draft weights at startup, since the
+            # draft is not covered by the initial refit.
+            if speculative_config.get("method") not in ("deepseek_mtp", "mtp"):
+                # Non-MTP methods (e.g. Eagle) must read the drafter's real
+                # weights from the checkpoint, so load everything.
                 warnings.warn(
                     "Speculative decoding is enabled without draft refit sync. "
                     "Setting vllm_cfg['load_format'] to 'auto' so the drafter does "
