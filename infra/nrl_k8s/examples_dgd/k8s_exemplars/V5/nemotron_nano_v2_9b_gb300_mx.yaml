@@ -34,7 +34,7 @@ spec:
             persistentVolumeClaim:
               claimName: rl-workspace
         mainContainer:
-          image: jwillthomson/dynamo-arm-tokenize-endpoint-3c63dd69-mx
+          image: jwillthomson/dynamo-arm-tokenize-endpoint-2cf73128
           workingDir: /workspace
           volumeMounts:
             - mountPath: /mnt/rl-workspace
@@ -74,7 +74,7 @@ spec:
             persistentVolumeClaim:
               claimName: rl-workspace
         mainContainer:
-          image: jwillthomson/dynamo-arm-tokenize-endpoint-3c63dd69-mx
+          image: jwillthomson/dynamo-arm-tokenize-endpoint-2cf73128
           workingDir: /workspace
           volumeMounts:
             - mountPath: /mnt/rl-workspace
@@ -144,7 +144,7 @@ spec:
             - --mamba-ssm-cache-dtype
             - float32
             - --dyn-tool-call-parser
-            - nemotron_nano
+            - nemotron_deci
             - --dyn-reasoning-parser
             - nemotron_nano
           resources:

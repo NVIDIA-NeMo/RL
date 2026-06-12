@@ -49,7 +49,7 @@ policy:
 
   generation:
     backend: "dynamo"
-    max_new_tokens: 512
+    max_new_tokens: 8192
     temperature: 1.0
     top_p: 1.0
     top_k: null
@@ -57,7 +57,7 @@ policy:
     stop_strings: null
     dynamo_cfg:
       request_timeout_s: 900.0
-      tool_call_parser: "nemotron_nano"
+      tool_call_parser: "nemotron_deci"
       reasoning_parser: "nemotron_nano"
     vllm_cfg:
       async_engine: true
