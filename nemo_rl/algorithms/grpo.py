@@ -70,6 +70,7 @@ from nemo_rl.distributed.virtual_cluster import (
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import NemoGym, NemoGymConfig
 from nemo_rl.experience.rollouts import (
+    EffortLevelsConfig,
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
@@ -1276,6 +1277,8 @@ def _apply_message_level_advantage_penalties(
             flush=True,
         )
 
+    advantages = train_data["advantages"]
+    materialized_advantages = False
     for i, message_log in enumerate(message_logs):
         token_offset = 0
         for j, message in enumerate(message_log):
@@ -1294,22 +1297,25 @@ def _apply_message_level_advantage_penalties(
                 and malformed_neg_adv is not None
                 and message.get("has_malformed_thinking", False)
             )
+            if (is_invalid or is_malformed_thinking) and not materialized_advantages:
+                # GRPO/GDPO may expand per-sample advantages into zero-stride views;
+                # clone before span writes so penalties only affect targeted tokens.
+                advantages = advantages.clone()
+                train_data["advantages"] = advantages
+                materialized_advantages = True
+
             if is_invalid:
                 print(
                     f"Setting negative advantage ({invalid_neg_adv}) for invalid tool call in assistant message {i} {j}",
                     flush=True,
                 )
-                train_data["advantages"][i, token_offset : token_offset + msg_len] = (
-                    invalid_neg_adv
-                )
+                advantages[i, token_offset : token_offset + msg_len] = invalid_neg_adv
             elif is_malformed_thinking:
                 print(
                     f"Setting negative advantage ({malformed_neg_adv}) for malformed thinking in assistant message {i} {j}",
                     flush=True,
                 )
-                train_data["advantages"][i, token_offset : token_offset + msg_len] = (
-                    malformed_neg_adv
-                )
+                advantages[i, token_offset : token_offset + msg_len] = malformed_neg_adv
             token_offset += msg_len
 
 
@@ -1379,6 +1385,16 @@ def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
     )
 
     return should_log_nemo_gym_responses
+
+
+def _get_effort_config(master_config: MasterConfig) -> Optional[EffortLevelsConfig]:
+    """Return the effort-levels reward-shaping config from env.nemo_gym, if set."""
+    if "nemo_gym" not in master_config.env:
+        return None
+    effort_dict = master_config.env["nemo_gym"].get("effort_levels")
+    if effort_dict is None:
+        return None
+    return EffortLevelsConfig.model_validate(effort_dict)
 
 
 def _create_advantage_estimator(master_config: MasterConfig):
@@ -1915,6 +1931,7 @@ def grpo_train(
                             generation_config=generation_config,
                             max_rollout_turns=None,
                             greedy=False,
+                            effort_config=_get_effort_config(master_config),
                         )
                         input_ids = nemo_gym_rollout_result.input_ids
                         repeated_batch = nemo_gym_rollout_result.final_batch
@@ -2716,6 +2733,7 @@ def validate(
                     generation_config=generation_config,
                     max_rollout_turns=None,
                     greedy=False,
+                    effort_config=_get_effort_config(master_config),
                 )
                 val_batch = nemo_gym_rollout_result.final_batch
                 gen_metrics = nemo_gym_rollout_result.rollout_metrics

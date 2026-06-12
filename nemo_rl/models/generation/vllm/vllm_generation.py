@@ -169,6 +169,10 @@ class VllmGeneration(GenerationInterface):
 
         # It's necessary to set env_vars here to ensure that vllm non-leader workers also have these env_vars
         env_vars = {}
+        # User-supplied per-recipe env vars (e.g. vllm_cfg.env_vars in the yaml).
+        # Scoped to this generation config so it does not impact other test cases.
+        for k, v in self.cfg["vllm_cfg"].get("env_vars", {}).items():
+            env_vars[str(k)] = str(v)
         # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
         # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
         if not self.cfg["colocated"]["enabled"]:
