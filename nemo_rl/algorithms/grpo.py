@@ -28,9 +28,11 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
+from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.advantage_estimator import (
     GDPOAdvantageEstimator,
     GRPOAdvantageEstimator,
+    OPDAdvantageEstimator,
     ReinforcePlusPlusAdvantageEstimator,
 )
 from nemo_rl.algorithms.loss import (
@@ -468,6 +470,31 @@ def setup(
         assert policy_nodes > 0, (
             "policy_nodes must be > 0, but got "
             f"policy_nodes:{policy_nodes} + rm_nodes:{rm_nodes} = total_nodes:{total_nodes}"
+        )
+
+    # Reserve nodes for non-colocated OPD teachers so training doesn't claim them.
+    opd_teacher_nodes = 0
+    enable_opd_teachers = opd_module.is_non_colocated_teachers_enabled(master_config)
+    if enable_opd_teachers:
+        assert _should_use_async_rollouts(master_config), (
+            "Non-colocated OPD teachers require async GRPO (vLLM backend with async_engine enabled)."
+        )
+        from nemo_rl.models.policy.teacher_worker_group import (
+            create_teacher_configs_from_opd_config,
+        )
+
+        opd_cfg = getattr(master_config, "on_policy_distillation", None) or {}
+        teacher_configs = create_teacher_configs_from_opd_config(opd_cfg)
+        for tcfg in teacher_configs:
+            opd_teacher_nodes += tcfg.get("num_nodes", 1)
+        policy_nodes -= opd_teacher_nodes
+        assert policy_nodes > 0, (
+            "policy_nodes must be > 0 after reserving OPD teacher nodes, but got "
+            f"policy_nodes:{policy_nodes} + rm_nodes:{rm_nodes} + opd_teacher_nodes:{opd_teacher_nodes} = total_nodes:{total_nodes}"
+        )
+        print(
+            f"policy_nodes:{policy_nodes} + rm_nodes:{rm_nodes} + opd_teacher_nodes:{opd_teacher_nodes} = total_nodes:{total_nodes}",
+            flush=True,
         )
 
     if colocated_inference:
@@ -939,6 +966,21 @@ def setup(
     if policy_generation is not None:
         policy_generation.prepare_refit_info(state_dict_info)
 
+    # Spin up non-colocated OPD teacher worker groups AFTER policy / vLLM are
+    # ready. Parallelizing with policy init races on Megatron-Bridge's HF->mcore
+    # cache (shared key when student == teacher) — both workers write to the
+    # same iter_0000000/ path and the second reader gets a truncated file.
+    teacher_worker_groups: dict[str, Any] = {}
+    alias_to_group_alias: dict[str, str] = {}
+    if enable_opd_teachers:
+        t0 = time.perf_counter()
+        teacher_worker_groups, alias_to_group_alias = (
+            opd_module.create_teacher_worker_groups(
+                master_config, policy_config, tokenizer
+            )
+        )
+        worker_init_timing_metrics["teacher_init_time_s"] = time.perf_counter() - t0
+
     # Calculate total setup time
     total_setup_time = time.perf_counter() - setup_start_time
     worker_init_timing_metrics["total_setup_time_s"] = total_setup_time
@@ -956,6 +998,10 @@ def setup(
 
         if policy_time:
             print(f"  Policy init: {policy_time:.1f}s")
+
+        teacher_time = worker_init_timing_metrics.get("teacher_init_time_s", 0)
+        if teacher_time:
+            print(f"  Teacher init: {teacher_time:.1f}s")
 
         # Calculate "other" time (time after worker init completes)
         other_time = total_setup - worker_init_complete_time
@@ -984,6 +1030,8 @@ def setup(
         checkpointer,
         grpo_save_state,
         master_config,
+        teacher_worker_groups,
+        alias_to_group_alias,
     )
 
 
@@ -1447,6 +1495,29 @@ def _create_advantage_estimator(master_config: MasterConfig):
     elif adv_estimator_name == "grpo":
         adv_estimator = GRPOAdvantageEstimator(adv_estimator_config, loss_config)
         print("  ✓ Using GRPO advantage estimator")
+    elif adv_estimator_name == "opd":
+        opd_cfg = getattr(master_config, "on_policy_distillation", None) or {}
+        opd_estimator_config = {
+            "name": "opd",
+            "use_orm_advantage": opd_cfg.get("use_orm_advantage", False),
+            "orm_advantage_weight": opd_cfg.get("orm_advantage_weight", 0.0),
+        }
+        adv_estimator = OPDAdvantageEstimator(opd_estimator_config, loss_config)
+        print("  ✓ Using OPD advantage estimator")
+        # Warn if loss_fn is not configured per MOPD paper recommendations.
+        if not loss_config.disable_ppo_ratio:
+            warnings.warn(
+                "OPD recommends loss_fn.disable_ppo_ratio: true (REINFORCE-style, MOPD Eq. 7)"
+            )
+        if not loss_config.use_importance_sampling_correction:
+            warnings.warn(
+                "OPD recommends loss_fn.use_importance_sampling_correction: true (MOPD Eq. 8 w_t)"
+            )
+        if loss_config.truncated_importance_sampling_type != "icepop":
+            warnings.warn(
+                "OPD recommends loss_fn.truncated_importance_sampling_type: 'icepop' "
+                "(hard gate, MOPD Eq. 8)"
+            )
     elif adv_estimator_name == "reinforce_plus_plus":
         adv_estimator = ReinforcePlusPlusAdvantageEstimator(
             adv_estimator_config, loss_config
@@ -2898,6 +2969,8 @@ def async_grpo_train(
     grpo_save_state: GRPOSaveState,
     master_config: MasterConfig,
     max_trajectory_age_steps: int = 1,
+    teacher_worker_groups: Optional[dict[str, Any]] = None,
+    alias_to_group_alias: Optional[dict[str, str]] = None,
 ) -> None:
     """Run asynchronous GRPO training with replay buffer.
 
@@ -3076,6 +3149,11 @@ def async_grpo_train(
         master_config=master_config,
         replay_buffer=replay_buffer,
         start_step=step,
+        teacher_worker_groups=teacher_worker_groups,
+        alias_to_group_alias=alias_to_group_alias,
+        on_policy_distillation_cfg=dict(
+            getattr(master_config, "on_policy_distillation", None) or {}
+        ),
     )
 
     # Start trajectory collection in background
@@ -3257,6 +3335,16 @@ def async_grpo_train(
                     # Concatenate per-prompt groups into a single training batch
                     per_prompt_batches = [t["batch"] for t in trajectories]
                     repeated_batch = BatchedDataDict.from_batches(per_prompt_batches)
+
+                    # Teacher logprobs are stored in batch dict by collection-time
+                    # computation and padded by from_batches. Extract here.
+                    trajectory_teacher_logprobs = None
+                    if opd_module.is_opd_enabled(master_config):
+                        if "teacher_reference_logprobs" in repeated_batch:
+                            trajectory_teacher_logprobs = repeated_batch[
+                                "teacher_reference_logprobs"
+                            ]
+
                     # Aggregate rollout metrics across groups with proper aggregation per metric type
                     per_group_metrics = {}
                     for t in trajectories:
@@ -3434,6 +3522,26 @@ def async_grpo_train(
                             "num_masked_seqs_by_logprob_error"
                         ] = seq_logprob_error_metrics.pop("num_masked_seqs")
 
+                # Pad teacher logprobs to match train_data sequence length.
+                # from_batches pads to max(S_i); train_data may be longer due to
+                # make_sequence_length_divisible_by. Zero-pad is safe because
+                # the mask zeros out padding in advantage computation.
+                if trajectory_teacher_logprobs is not None:
+                    train_S = train_data["input_ids"].shape[1]
+                    teacher_S = trajectory_teacher_logprobs.shape[1]
+                    if teacher_S > train_S:
+                        raise ValueError(
+                            f"Teacher logprobs seq length ({teacher_S}) > train_data seq length ({train_S}). "
+                            "Teacher logprobs are padded to max(S_i) by from_batches, "
+                            "and train_data is padded to roundup(max(S_i), make_sequence_length_divisible_by)."
+                        )
+                    if teacher_S < train_S:
+                        trajectory_teacher_logprobs = torch.nn.functional.pad(
+                            trajectory_teacher_logprobs,
+                            (0, train_S - teacher_S),
+                            value=0.0,
+                        )
+
                 # Compute advantages with adv_estimator using correct mask and logprobs
                 with timer.time("advantage_calculation"):
                     print("▶ Computing advantages...", flush=True)
@@ -3449,7 +3557,21 @@ def async_grpo_train(
                         repeated_batch=repeated_batch,
                         logprobs_policy=train_data["prev_logprobs"],
                         logprobs_reference=train_data.get("reference_policy_logprobs"),
+                        # OPD kwargs (ignored by non-OPD estimators via **kwargs)
+                        teacher_logprobs=trajectory_teacher_logprobs.to(
+                            train_data["prev_logprobs"].device
+                        )
+                        if trajectory_teacher_logprobs is not None
+                        else None,
+                        prev_logprobs=train_data["prev_logprobs"],
+                        generation_logprobs=train_data["generation_logprobs"],
+                        sample_mask=train_data["sample_mask"],
                     )
+                    if (
+                        hasattr(adv_estimator, "last_metrics")
+                        and adv_estimator.last_metrics
+                    ):
+                        rollout_metrics.update(adv_estimator.last_metrics)
                     del prompt_ids_for_adv
 
                     # Log advantages stats
