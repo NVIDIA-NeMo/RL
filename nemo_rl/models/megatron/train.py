@@ -58,7 +58,6 @@ from nemo_rl.models.megatron.draft.hidden_capture import (
 )
 from nemo_rl.models.megatron.router_replay import (
     clear_router_replay,
-    router_replay_enabled,
     set_router_replay_backward,
     set_router_replay_forward,
 )
@@ -196,6 +195,12 @@ def forward_with_post_processing_fn(
     packed_seq_params = processed_mb.packed_seq_params
     cu_seqlens_padded = processed_mb.cu_seqlens_padded
     routed_experts_cp_sharded = processed_mb.routed_experts_cp_sharded
+    # The packed-CP path uses TE THD sharding iff data.py packed this microbatch
+    # with THD (i.e. routed_experts was present). Gate the logprob/loss/topk CP
+    # reconstruction on this SAME per-batch signal so it always matches the forward
+    # shard -- NOT on the config-global router_replay flag, because reference-logprob
+    # intentionally drops routed_experts (zigzag-packs) yet runs under an R3 config.
+    use_thd_cp = routed_experts_cp_sharded is not None
 
     if use_router_replay:
         if routed_experts_cp_sharded is None:
@@ -264,17 +269,20 @@ def forward_with_post_processing_fn(
             packed_seq_params=packed_seq_params,
             global_valid_seqs=global_valid_seqs,
             global_valid_toks=global_valid_toks,
+            use_thd_cp=use_thd_cp,
         )
     elif isinstance(post_processing_fn, LogprobsPostProcessor):
         post_processing_fn_wrapped = post_processing_fn(
             data_dict=data_dict,
             input_ids=input_ids,
             cu_seqlens_padded=cu_seqlens_padded,
+            use_thd_cp=use_thd_cp,
         )
     elif isinstance(post_processing_fn, TopkLogitsPostProcessor):
         post_processing_fn_wrapped = post_processing_fn(
             data_dict=data_dict,
             cu_seqlens_padded=cu_seqlens_padded,
+            use_thd_cp=use_thd_cp,
         )
     else:
         raise TypeError(
@@ -387,6 +395,7 @@ class LossPostProcessor:
         packed_seq_params: Optional[PackedSeqParams] = None,
         global_valid_seqs: Optional[torch.Tensor] = None,
         global_valid_toks: Optional[torch.Tensor] = None,
+        use_thd_cp: bool = False,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, Any]]]:
         """Create a loss post-processing function for training.
 
@@ -409,7 +418,8 @@ class LossPostProcessor:
         )
 
         # wrap loss function with loss input preparation
-        use_thd_cp = router_replay_enabled(self.cfg)
+        # use_thd_cp is supplied per-microbatch by forward_with_post_processing_fn
+        # (== routed_experts_cp_sharded is not None), matching the forward CP shard.
         pack_sequences = self.cfg["sequence_packing"]["enabled"]
         if pack_sequences and packed_seq_params is not None:
             fuse_loss = self.cfg.get("sequence_packing", {}).get("fuse_loss", False)
@@ -502,6 +512,7 @@ class LogprobsPostProcessor:
         data_dict: BatchedDataDict[Any],
         input_ids: torch.Tensor,
         cu_seqlens_padded: torch.Tensor,
+        use_thd_cp: bool = False,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         """Create a post-processing function that computes token log probabilities.
 
@@ -518,7 +529,6 @@ class LogprobsPostProcessor:
         """
         unpacked_input_ids = data_dict["input_ids"]
         original_seq_length = unpacked_input_ids.shape[1]
-        use_thd_cp = router_replay_enabled(self.cfg)
 
         def processor_fn_inner(output_tensor):
             if self.use_linear_ce_fusion:
@@ -585,6 +595,7 @@ class TopkLogitsPostProcessor:
         self,
         data_dict: BatchedDataDict[Any],
         cu_seqlens_padded: torch.Tensor,
+        use_thd_cp: bool = False,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         """Create a post-processing function that computes top-k logits and indices.
 
@@ -604,7 +615,6 @@ class TopkLogitsPostProcessor:
         cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
         unpacked_seqlen = data_dict["input_ids"].shape[1]
         seq_lengths = data_dict["input_lengths"]
-        use_thd_cp = router_replay_enabled(self.cfg)
 
         def processor_fn_inner(output_tensor):
             tp_grp = get_tensor_model_parallel_group()
