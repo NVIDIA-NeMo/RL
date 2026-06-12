@@ -13,44 +13,45 @@
 # limitations under the License.
 """Shared utilities for cross-tokenizer distillation.
 
-Hosts pieces that are used by both :mod:`token_aligner` (in this package)
-and :mod:`nemo_rl.algorithms.loss.loss_functions`:
+Used by both :mod:`token_aligner` and
+:mod:`nemo_rl.algorithms.loss.loss_functions`:
 
-    - :class:`Fp32SparseMM` — FP32 sparse-dense matmul autograd Function
-      that ignores the surrounding BF16 autocast (PyTorch has no BF16
-      sparse-mm kernel).
-    - :func:`chunk_average_log_probs`, :func:`valid_chunk_mask` —
-      chunk-aggregation helpers for the cross-tokenizer KL paths.
-    - :func:`dp_all_reduce_sum` — sum-reduce a scalar count across the
-      data-parallel group so the chunk-KL denominator is the global
-      valid-chunk count rather than a per-rank mean.
-    - :func:`parse_projection_file` — single source of truth for
-      reading the on-disk projection matrix file (both the dense top-k
-      format and the sparse ``dict[(s, t)] -> count`` format) into COO
-      components. Callers retain their own validation / sizing rules.
-    - :func:`get_sparse_projection_matrix`, :func:`get_topk_projection`
-      — process-local lazy caches for the materialized projection
-      matrix on a given device. Driver processes never trigger a fill;
-      each Ray worker populates its own cache on the first loss call.
-    - :func:`build_exact_token_map` — derived common/uncommon vocab
-      partition for the gold-loss path. Cached per
-      ``(path, device, xtoken_loss, teacher_vocab_size)`` because the
-      partition depends on those four inputs.
-    - :func:`alignment_from_flat_batch` — rehydrate the flat
-      ``alignment_*`` transport keys on the loss data dict into a single
-      :class:`AlignmentBatch` so the loss bodies access alignment via
-      attributes instead of repeating flat field names.
+- :class:`Fp32SparseMM` — FP32 sparse-dense matmul that ignores BF16
+  autocast (no BF16 sparse-mm kernel exists).
+- Chunk aggregation: :func:`chunk_log_prob_sums` / :func:`chunk_average_finalize`
+  / :func:`chunk_average_log_probs` / :func:`valid_chunk_mask` (the
+  partial/finalize split lets callers insert a CP all-reduce between), plus
+  :func:`dp_all_reduce_sum` for the global valid-chunk denominator.
+- Teacher-logit IPC: :func:`rebuild_teacher_full_logits_from_ipc`,
+  :func:`assemble_teacher_logits_from_shards`,
+  :func:`collect_overlapping_teacher_shards` reassemble full-vocab teacher
+  logits from per-rank shards across heterogeneous TP/CP.
+- Projection: :func:`parse_projection_file`, the
+  :func:`get_sparse_projection_matrix` / :func:`get_topk_projection`
+  process-local caches, :func:`slice_sparse_projection_rows`, and
+  :func:`build_exact_token_map` (cached common/uncommon partition).
+- :func:`alignment_from_flat_batch` rehydrates the flat ``alignment_*``
+  data-dict keys into an :class:`AlignmentBatch`.
 """
 
 from __future__ import annotations
 
 import os
-from dataclasses import fields
-from typing import Any, Dict, Mapping, Tuple, Union
+from dataclasses import dataclass, fields
+from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
 import torch
+from torch.distributed.tensor import DTensor
 
 from nemo_rl.algorithms.x_token.token_aligner import AlignmentBatch
+from nemo_rl.distributed.model_utils import (
+    AllReduceSum,
+    cp_load_balanced_to_contiguous,
+    cp_shift_next,
+    get_logprobs_from_vocab_parallel_logits,
+    vocab_parallel_argmax,
+)
+from nemo_rl.models.dtensor.parallelize import to_local_if_dtensor
 
 
 def alignment_from_flat_batch(data: Mapping[str, Any]) -> AlignmentBatch:
@@ -62,57 +63,6 @@ def alignment_from_flat_batch(data: Mapping[str, Any]) -> AlignmentBatch:
     return AlignmentBatch(
         **{f.name: data[f"alignment_{f.name}"] for f in fields(AlignmentBatch)}
     )
-
-
-def rebuild_teacher_full_logits_from_ipc(data: Mapping[str, Any]) -> torch.Tensor:
-    """View-only rebuild of the microbatch's teacher-logits slice from IPC.
-
-    The producer maintains a **persistent** IPC buffer on its GPU sized
-    ``[B_r, T_t, V_t]``; the buffer (and the IPC handle it was captured
-    with) survives across training steps, with fresh logits ``.copy_()``-ed
-    in each step. Because the producer never frees the buffer between steps,
-    holding a view into the IPC-imported storage is safe: the producer-side
-    allocation isn't fighting the consumer's refcount, it's simply alive for
-    the worker's lifetime.
-
-    Every per-sample entry in ``teacher_full_logits_ipc`` carries the same
-    stable rank-level handle plus its rank-local ``sample_idx_within_rank``.
-    We rebuild that single handle once and slice ``[mb_start:mb_end]`` for
-    the current microbatch -- zero allocation on the consumer, dtype
-    preserved (the loss fn casts if/where it needs fp32).
-
-    Args:
-        data: The loss data dict, carrying ``teacher_full_logits_ipc`` -- a
-            list of per-sample IPC handle dicts produced by
-            ``Policy.get_full_logits_ipc``.
-
-    Returns:
-        A ``[mb_B, T_t, V_t]`` view into the producer's GPU memory (no copy).
-    """
-    from nemo_rl.models.policy.utils import rebuild_cuda_tensor_from_ipc
-
-    entries = data["teacher_full_logits_ipc"]
-    consumer_device = torch.cuda.current_device()
-
-    first = entries[0]
-    last = entries[-1]
-    rank_view = rebuild_cuda_tensor_from_ipc(
-        first["rank_logits_ipc"], consumer_device
-    )  # [B_r, T_t, V_t] view into producer's GPU memory
-
-    mb_start = first["sample_idx_within_rank"]
-    mb_end = last["sample_idx_within_rank"] + 1
-    # Contract: BatchedDataDict.slice and shard_by_batch_size preserve
-    # contiguous sample order, so sample_idx_within_rank is monotone in
-    # the microbatch. If a future change ever reorders samples, fall back
-    # to advanced indexing (which DOES copy -- defeats the no-copy win);
-    # assert loudly instead of silently regressing.
-    assert mb_end - mb_start == len(entries), (
-        "expected contiguous monotonic sample_idx_within_rank within a "
-        f"microbatch; got entries with indices "
-        f"{[e['sample_idx_within_rank'] for e in entries]}"
-    )
-    return rank_view[mb_start:mb_end]  # [mb_B, T_t, V_t] view, no copy
 
 
 class Fp32SparseMM(torch.autograd.Function):
@@ -147,36 +97,476 @@ class Fp32SparseMM(torch.autograd.Function):
         return None, grad_dense
 
 
-def chunk_average_log_probs(
+def chunk_log_prob_sums(
     log_probs: torch.Tensor,
     chunk_id: torch.Tensor,
     max_chunks: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Average ``log_probs`` over the chunks defined by ``chunk_id``.
+    """Local bmm + bucket count, no division.
 
-    Builds a one-hot chunk mask from ``chunk_id`` (``-1`` means "no
-    chunk", contributes to no bucket), then ``bmm``-aggregates and
-    divides by chunk sizes.
+    Output is summable across CP; callers that need cross-rank chunks to
+    aggregate correctly should ``AllReduceSum`` both tensors before
+    :func:`chunk_average_finalize`. ``chunk_id == -1`` contributes to no
+    bucket.
+    """
+    device = log_probs.device
+    chunk_arange = torch.arange(max_chunks, device=device).view(1, 1, -1)
+    chunk_mask = chunk_id.unsqueeze(-1) == chunk_arange
+    chunk_mask_f = chunk_mask.transpose(1, 2).to(log_probs.dtype)
+    chunk_sums = torch.bmm(chunk_mask_f, log_probs)  # [B, C, V]
+    chunk_sizes = chunk_mask.sum(dim=1).float()  # [B, C]
+    return chunk_sums, chunk_sizes
+
+
+def chunk_average_finalize(
+    chunk_sums: torch.Tensor,
+    chunk_sizes: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Divide sums by sizes; ``eps`` guards empty buckets."""
+    eps = 1e-10
+    chunk_log_probs = chunk_sums / (chunk_sizes.unsqueeze(-1) + eps)
+    return chunk_log_probs, chunk_sizes
+
+
+def chunk_average_log_probs(
+    log_probs: torch.Tensor,
+    chunk_id: torch.Tensor,
+    max_chunks: int,
+    *,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Average ``log_probs`` over chunks defined by ``chunk_id``.
+
+    Builds a one-hot chunk mask from ``chunk_id`` (``-1`` = no chunk), then
+    ``bmm``-aggregates and divides by chunk sizes. When ``cp_group`` has world
+    > 1, the per-chunk sums are ``AllReduceSum``'d across CP ranks before the
+    divide (mean is non-linear, so the reduce must precede it).
 
     Args:
         log_probs: ``[B, T, V]`` log-probabilities.
         chunk_id: ``[B, T]`` long tensor, values in ``[-1, max_chunks)``.
         max_chunks: number of chunk buckets.
+        cp_group: context-parallel group for cross-rank chunk aggregation.
 
     Returns:
         chunk_log_probs: ``[B, max_chunks, V]`` averaged log-probs.
-        chunk_sizes:    ``[B, max_chunks]`` float tensor of bucket sizes.
+        chunk_sizes: ``[B, max_chunks]`` float tensor of bucket sizes.
     """
-    eps = 1e-10
-    device = log_probs.device
-    chunk_arange = torch.arange(max_chunks, device=device).view(1, 1, -1)
-    # [B, T, max_chunks] — -1 entries compare false everywhere.
-    chunk_mask = chunk_id.unsqueeze(-1) == chunk_arange
-    chunk_mask_f = chunk_mask.transpose(1, 2).to(log_probs.dtype)
-    chunk_sums = torch.bmm(chunk_mask_f, log_probs)  # [B, C, V]
-    chunk_sizes = chunk_mask.sum(dim=1).float()  # [B, C]
-    chunk_log_probs = chunk_sums / (chunk_sizes.unsqueeze(-1) + eps)
-    return chunk_log_probs, chunk_sizes
+    chunk_sums, chunk_sizes = chunk_log_prob_sums(log_probs, chunk_id, max_chunks)
+    if cp_group is not None and torch.distributed.get_world_size(cp_group) > 1:
+        chunk_sums = AllReduceSum.apply(chunk_sums, cp_group)
+        chunk_sizes = AllReduceSum.apply(chunk_sizes, cp_group)
+    return chunk_average_finalize(chunk_sums, chunk_sizes)
+
+
+def slice_sparse_projection_rows(
+    sparse_matrix: torch.Tensor,
+    row_start: int,
+    row_end: int,
+) -> torch.Tensor:
+    """Row-slice a sparse-COO projection ``[V_s, V_t]`` to ``[row_end-row_start, V_t]``.
+
+    Filters COO indices in-place: keeps entries with row in ``[row_start, row_end)``
+    and shifts the row index by ``-row_start``. Used by the TP-aware P-KL path
+    where each rank owns a contiguous slab of the student vocab axis.
+    """
+    indices = sparse_matrix.indices()
+    values = sparse_matrix.values()
+    mask = (indices[0] >= row_start) & (indices[0] < row_end)
+    local_indices = indices[:, mask].clone()
+    local_indices[0] -= row_start
+    local_values = values[mask]
+    return torch.sparse_coo_tensor(
+        local_indices,
+        local_values,
+        (row_end - row_start, sparse_matrix.size(1)),
+        device=sparse_matrix.device,
+        dtype=sparse_matrix.dtype,
+    ).coalesce()
+
+
+# ---------------------------------------------------------------------------
+# TP/CP-aware loss primitives
+#
+# Each of these collapses to the plain single-rank torch op when the relevant
+# process group has world size 1, so the cross-tokenizer loss body stays free
+# of any ``tp_world > 1`` / rank / offset branching.
+# ---------------------------------------------------------------------------
+def project_student_to_teacher_vocab(
+    student_probs: torch.Tensor,
+    sparse_projection: torch.Tensor,
+    *,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """Project student vocab probs ``[B, T, V_s(/TP)]`` to teacher vocab ``[B, T, V_t]``.
+
+    ``sparse_projection`` is the full ``[V_s, V_t]`` sparse-COO matrix. With
+    ``tp_group`` world > 1 the student probs cover only this rank's ``V_s/TP``
+    rows, so the matrix is row-sliced to that range, the sparse matmul produces a
+    partial teacher-vocab sum, and an ``AllReduceSum`` over the TP group combines
+    the partials into the full ``V_s`` contraction. Otherwise a single sparse
+    matmul over the full matrix is used.
+    """
+    batch_size, seq_len, local_vocab_size = student_probs.shape
+    flat = student_probs.reshape(batch_size * seq_len, local_vocab_size)
+    tp_world = torch.distributed.get_world_size(tp_group) if tp_group is not None else 1
+    if tp_world > 1:
+        tp_rank = torch.distributed.get_rank(tp_group)
+        full_student_vocab_size = sparse_projection.size(0)
+        rows_per_rank = full_student_vocab_size // tp_world
+        local_projection = slice_sparse_projection_rows(
+            sparse_projection,
+            row_start=tp_rank * rows_per_rank,
+            row_end=(tp_rank + 1) * rows_per_rank,
+        )
+        projected_partial = Fp32SparseMM.apply(local_projection, flat.t()).t()
+        projected = AllReduceSum.apply(projected_partial.contiguous(), tp_group)
+    else:
+        # Fp32SparseMM internally computes M.t() @ dense; passing M (not M.t())
+        # avoids a sparse ``.t()`` on a saved tensor in backward.
+        projected = Fp32SparseMM.apply(sparse_projection, flat.t()).t()
+    teacher_vocab_size = projected.shape[-1]
+    return projected.reshape(batch_size, seq_len, teacher_vocab_size)
+
+
+def select_teacher_topk_indices(
+    teacher_logits: torch.Tensor,
+    k: int,
+    *,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """Sorted global top-``k`` teacher-vocab ids by max importance over the microbatch.
+
+    Importance is the per-vocab max over flattened ``(B*T)`` teacher logits. With
+    ``cp_group`` world > 1 the sequence is CP-sharded, so the local max only sees
+    this rank's slice; an ``all_reduce(MAX)`` makes every rank pick the same
+    subset. No gradient.
+    """
+    vocab_size = teacher_logits.shape[-1]
+    with torch.no_grad():
+        # reshape (not view): a preceding next-token shift can leave the teacher
+        # logits non-contiguous.
+        teacher_flat = teacher_logits.reshape(-1, vocab_size)
+        importance = teacher_flat.max(dim=0).values
+        if cp_group is not None and torch.distributed.get_world_size(cp_group) > 1:
+            torch.distributed.all_reduce(
+                importance, op=torch.distributed.ReduceOp.MAX, group=cp_group
+            )
+        top_indices = torch.topk(importance, k=k, dim=-1).indices
+        return top_indices.sort().values
+
+
+@dataclass
+class LocalizedAlignment:
+    """CP-localized chunk-alignment tensors consumed by the loss reductions."""
+
+    student_chunk_id: torch.Tensor
+    teacher_chunk_id: torch.Tensor
+    pair_valid: torch.Tensor
+    pair_is_correct: torch.Tensor
+    sample_mask: torch.Tensor
+
+
+def localize_alignment(
+    data: Mapping[str, Any],
+    *,
+    teacher_seq_len: int,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> LocalizedAlignment:
+    """Localize the chunk-alignment data-dict fields for the local CP shard.
+
+    Unwraps the ``alignment_*`` / ``sample_mask`` entries from DTensor to their
+    local tensors. Student-seq fields (``student_chunk_id``) are contiguously
+    CP-sharded via ``cp_buffers`` (rank r holds the r-th contiguous seq slice);
+    the teacher-seq ``teacher_chunk_id`` is full, so it is sliced contiguously to
+    this CP rank's ``teacher_seq_len`` window to match the IPC consumer's
+    contiguous teacher-logit slice.
+    """
+    teacher_chunk_id_full = to_local_if_dtensor(data["alignment_teacher_chunk_id"])
+    cp_rank = (
+        torch.distributed.get_rank(cp_group)
+        if cp_group is not None and torch.distributed.get_world_size(cp_group) > 1
+        else 0
+    )
+    teacher_seq_start = cp_rank * teacher_seq_len
+    teacher_chunk_id = teacher_chunk_id_full[
+        :, teacher_seq_start : teacher_seq_start + teacher_seq_len
+    ]
+    return LocalizedAlignment(
+        student_chunk_id=to_local_if_dtensor(data["alignment_student_chunk_id"]),
+        teacher_chunk_id=teacher_chunk_id,
+        pair_valid=to_local_if_dtensor(data["alignment_pair_valid"]),
+        pair_is_correct=to_local_if_dtensor(data["alignment_pair_is_correct"]),
+        sample_mask=to_local_if_dtensor(data["sample_mask"]),
+    )
+
+
+def student_next_token_ce(
+    logits: torch.Tensor,
+    *,
+    input_ids: torch.Tensor,
+    seq_index: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Per-token next-token cross-entropy ``[B, T-1]`` on the student.
+
+    DTensor (TP/CP) logits route through the vocab-parallel log-prob helper
+    (which also handles the CP roll); plain logits use a local shifted
+    ``cross_entropy``. The next-token shift (drop the last predictor) matches the
+    convention the KL terms use.
+    """
+    if isinstance(logits, DTensor):
+        next_token_logprobs = get_logprobs_from_vocab_parallel_logits(
+            logits, input_ids, seq_index=seq_index
+        )
+        return -next_token_logprobs[:, :-1]  # drop CP-roll wrap-around
+    shift_logits = logits[:, :-1].contiguous()
+    shift_labels = input_ids[:, 1:].contiguous()
+    return torch.nn.functional.cross_entropy(
+        shift_logits.reshape(-1, shift_logits.shape[-1]).float(),
+        shift_labels.reshape(-1),
+        reduction="none",
+    ).reshape(shift_labels.shape)
+
+
+def ce_label_mask(
+    *,
+    token_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+    ce_seq_len: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Next-token label mask ``[B, ce_seq_len]`` = shifted token_mask * sample_mask.
+
+    ``token_mask`` is gathered to the full sequence (CP) before the shift; both
+    inputs are DTensor-unwrapped.
+    """
+    token_mask = (
+        token_mask.full_tensor() if isinstance(token_mask, DTensor) else token_mask
+    )
+    sample_mask = to_local_if_dtensor(sample_mask)
+    return (token_mask[:, 1 : ce_seq_len + 1] * sample_mask.unsqueeze(-1)).to(dtype)
+
+
+def next_token_accuracy(
+    logits: torch.Tensor,
+    *,
+    input_ids: torch.Tensor,
+    token_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """Masked next-token top-1 accuracy of the student (scalar, no gradient).
+
+    Uses :func:`vocab_parallel_argmax` for the (possibly TP-sharded) argmax. The
+    next-token shift on labels/mask is CP-aware (:func:`cp_shift_next`) so the
+    boundary token crosses CP ranks, and the correct/total counts are CP-reduced
+    so every rank reports the same global accuracy.
+    """
+    with torch.no_grad():
+        argmax = vocab_parallel_argmax(logits, tp_group=tp_group)
+        next_labels = cp_shift_next(to_local_if_dtensor(input_ids), cp_group, fill=0)
+        next_mask = cp_shift_next(to_local_if_dtensor(token_mask), cp_group, fill=0)
+        acc_mask = (
+            next_mask.float() * to_local_if_dtensor(sample_mask).unsqueeze(-1).float()
+        )
+        correct = ((argmax == next_labels).float() * acc_mask).sum()
+        denom = acc_mask.sum()
+        if cp_group is not None and torch.distributed.get_world_size(cp_group) > 1:
+            stats = torch.stack([correct, denom])
+            torch.distributed.all_reduce(stats, group=cp_group)
+            correct, denom = stats[0], stats[1]
+        return correct / denom.clamp(min=1.0)
+
+
+def collect_overlapping_teacher_shards(
+    teacher_shards: list[dict[str, Any]],
+    student_cp_rank: int,
+    student_cp_size: int,
+    full_seq_len: int,
+) -> list[tuple[dict[str, Any], slice, slice, slice, slice]]:
+    """Plan ``(src_seq, src_vocab, dest_seq, dest_vocab)`` slices per teacher shard.
+
+    Dest is ``[T_t/CP_s, V_t]`` (vocab fully reassembled, seq is this
+    student CP rank's range). Shards with no seq overlap are skipped.
+    """
+    student_seq_start = student_cp_rank * full_seq_len // student_cp_size
+    student_seq_end = (student_cp_rank + 1) * full_seq_len // student_cp_size
+
+    matches: list[tuple[dict[str, Any], slice, slice, slice, slice]] = []
+    for handle in teacher_shards:
+        teacher_vocab_start = int(handle["vocab_start_index"])
+        teacher_vocab_end = int(handle["vocab_end_index"])
+        teacher_seq_start = int(handle["global_seq_start"])
+        teacher_seq_end = teacher_seq_start + int(handle["actual_shape"][0])
+
+        overlap_seq_start = max(student_seq_start, teacher_seq_start)
+        overlap_seq_end = min(student_seq_end, teacher_seq_end)
+        if overlap_seq_end <= overlap_seq_start:
+            continue
+
+        src_seq = slice(
+            overlap_seq_start - teacher_seq_start,
+            overlap_seq_end - teacher_seq_start,
+        )
+        src_vocab = slice(0, teacher_vocab_end - teacher_vocab_start)
+        dest_seq = slice(
+            overlap_seq_start - student_seq_start,
+            overlap_seq_end - student_seq_start,
+        )
+        dest_vocab = slice(teacher_vocab_start, teacher_vocab_end)
+        matches.append((handle, src_seq, src_vocab, dest_seq, dest_vocab))
+    return matches
+
+
+def assemble_teacher_logits_from_shards(
+    teacher_shards: list[dict[str, Any]],
+    student_cp_rank: int,
+    student_cp_size: int,
+    device: int,
+) -> torch.Tensor:
+    """P2P-IPC-read overlapping teacher shards into a ``[T_t/CP_s, V_t]`` dest.
+
+    ``device`` is a CUDA device index (matches
+    :func:`rebuild_cuda_tensor_from_ipc`'s ``device_id`` signature).
+    """
+    from nemo_rl.models.policy.utils import rebuild_cuda_tensor_from_ipc
+
+    if not teacher_shards:
+        raise ValueError("teacher_shards must be non-empty")
+    full_seq_len = int(teacher_shards[0]["full_seq_len"])
+    full_vocab_size = int(teacher_shards[0]["full_vocab_size"])
+    local_seq_len = full_seq_len // student_cp_size
+
+    dest = torch.zeros(
+        (local_seq_len, full_vocab_size),
+        dtype=torch.float32,
+        device=device,
+    )
+    matches = collect_overlapping_teacher_shards(
+        teacher_shards,
+        student_cp_rank=student_cp_rank,
+        student_cp_size=student_cp_size,
+        full_seq_len=full_seq_len,
+    )
+    for handle, src_seq, src_vocab, dest_seq, dest_vocab in matches:
+        # Producer's IPC payload is the full contiguous storage
+        # [N_microbatches, B_mb, T_t_local, V_t_local]; index the slot
+        # then the sample row, then apply the seq/vocab overlap slices.
+        src_full = rebuild_cuda_tensor_from_ipc(handle["payload_ipc"], device).detach()
+        buf_idx = int(handle["buf_idx"])
+        sample_idx = int(handle["sample_index_in_buf"])
+        local_seq_t, local_vocab_t = handle["actual_shape"]
+        src = src_full[buf_idx, sample_idx, :local_seq_t, :local_vocab_t]
+        dest[dest_seq, dest_vocab] = src[src_seq, src_vocab].to(torch.float32)
+    return dest
+
+
+def _try_zero_copy_teacher_logits(
+    per_sample_entries: list[dict[str, Any]],
+    *,
+    student_cp_rank: int,
+    student_cp_size: int,
+    device: int,
+) -> Optional[torch.Tensor]:
+    """Zero-copy ``[B, T_t/CP_s, V_t]`` view of the teacher logits, or None.
+
+    Returns a view into the producer's IPC storage only when reassembly is
+    unnecessary: every sample's seq range is covered by a single full-vocab
+    teacher shard (i.e. teacher ``tp_size == 1`` and ``teacher_cp == student_cp``
+    or ``teacher_cp == 1``), and the microbatch's samples are a contiguous slab
+    (same payload + ``buf_idx``, sample rows ``0..B-1``) in one storage slot.
+    Otherwise returns None and the caller falls back to assemble + stack.
+    """
+    if not per_sample_entries:
+        return None
+    from nemo_rl.models.policy.utils import rebuild_cuda_tensor_from_ipc
+
+    first_shards = per_sample_entries[0]["teacher_shards"]
+    if not first_shards:
+        return None
+    full_seq_len = int(first_shards[0]["full_seq_len"])
+    full_vocab_size = int(first_shards[0]["full_vocab_size"])
+    student_seq_start = student_cp_rank * full_seq_len // student_cp_size
+    student_seq_end = (student_cp_rank + 1) * full_seq_len // student_cp_size
+
+    # Exactly one full-vocab shard must cover this student rank's seq range.
+    chosen: list[dict[str, Any]] = []
+    for entry in per_sample_entries:
+        covering = [
+            h
+            for h in entry["teacher_shards"]
+            if int(h["vocab_start_index"]) == 0
+            and int(h["vocab_end_index"]) == full_vocab_size
+            and int(h["global_seq_start"]) <= student_seq_start
+            and int(h["global_seq_start"]) + int(h["actual_shape"][0])
+            >= student_seq_end
+        ]
+        if len(covering) != 1:
+            return None
+        chosen.append(covering[0])
+
+    # All samples must form a contiguous slab in one storage slot.
+    h0 = chosen[0]
+    payload = h0["payload_ipc"]
+    buf_idx = int(h0["buf_idx"])
+    teacher_seq_start = int(h0["global_seq_start"])
+    for i, h in enumerate(chosen):
+        if (
+            h["payload_ipc"] != payload
+            or int(h["buf_idx"]) != buf_idx
+            or int(h["sample_index_in_buf"]) != i
+            or int(h["global_seq_start"]) != teacher_seq_start
+        ):
+            return None
+
+    src_full = rebuild_cuda_tensor_from_ipc(payload, device).detach()
+    seq_lo = student_seq_start - teacher_seq_start
+    seq_hi = student_seq_end - teacher_seq_start
+    return src_full[buf_idx, : len(chosen), seq_lo:seq_hi, :full_vocab_size]
+
+
+def rebuild_teacher_full_logits_from_ipc(
+    per_sample_entries: list[dict[str, Any]],
+    cp_group: Optional[torch.distributed.ProcessGroup],
+    device: int,
+) -> torch.Tensor:
+    """Rebuild ``[B, T_t/CP_s, V_t]`` teacher logits for this student rank.
+
+    Fast path (zero-copy view via :func:`_try_zero_copy_teacher_logits`): when the
+    teacher is not vocab-sharded and each sample's seq range is covered by a
+    single shard, return a view into the IPC storage. Otherwise reassemble each
+    sample from its overlapping shards and stack.
+    """
+    student_cp_rank = (
+        torch.distributed.get_rank(cp_group) if cp_group is not None else 0
+    )
+    student_cp_size = (
+        torch.distributed.get_world_size(cp_group) if cp_group is not None else 1
+    )
+
+    # Bypass: when the teacher layout lines up with this student rank (no
+    # vocab sharding, seq covered by one shard), skip reassembly and return a
+    # zero-copy view of the IPC storage. Returns None when reassembly is needed.
+    view = _try_zero_copy_teacher_logits(
+        per_sample_entries,
+        student_cp_rank=student_cp_rank,
+        student_cp_size=student_cp_size,
+        device=device,
+    )
+    if view is not None:
+        return view
+
+    rebuilt = [
+        assemble_teacher_logits_from_shards(
+            entry["teacher_shards"],
+            student_cp_rank=student_cp_rank,
+            student_cp_size=student_cp_size,
+            device=device,
+        )
+        for entry in per_sample_entries
+    ]
+    return torch.stack(rebuilt, dim=0)
 
 
 def valid_chunk_mask(
@@ -186,29 +576,6 @@ def valid_chunk_mask(
 ) -> torch.Tensor:
     """Per-chunk validity gate: both sides non-empty and pair is valid."""
     return (s_sizes > 0) & (t_sizes > 0) & pair_valid
-
-
-def dp_all_reduce_sum(local: torch.Tensor) -> torch.Tensor:
-    """Sum-reduce a scalar count across the data-parallel group.
-
-    Used to compute ``global_valid_chunks`` from each rank's local
-    chunk count, so the chunk-KL denominator matches the
-    ``sum(global_valid_chunk_kl) / sum(global_valid_chunks)`` objective
-    (the same convention CE follows via ``global_valid_toks``). The
-    cross-tokenizer setup asserts ``tensor_parallel_size=1`` and
-    ``context_parallel_size=1`` in
-    ``xtoken_off_policy_distillation.setup``, so the default process
-    group equals the DP group — calling all-reduce on the default group
-    therefore sums across DP only.
-
-    Returns a fresh ``float32`` scalar; the input tensor is not
-    modified. Falls back to a copy of the local value when distributed
-    is not initialized (unit tests).
-    """
-    out = local.detach().to(torch.float32).clone()
-    if torch.distributed.is_initialized():
-        torch.distributed.all_reduce(out)
-    return out
 
 
 def parse_projection_file(
@@ -565,3 +932,54 @@ def build_exact_token_map(
     }
     _EXACT_TOKEN_MAP_CACHE[key] = result
     return result
+
+
+def prepare_xtoken_cross_tokenizer_loss_input(
+    logits: torch.Tensor,
+    data: Mapping[str, Any],
+    *,
+    vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    LocalizedAlignment,
+    Optional[torch.distributed.ProcessGroup],
+    Optional[torch.distributed.ProcessGroup],
+]:
+    """Compute the cross-tokenizer distillation loss pieces from student logits + IPC teacher data.
+
+    Rebuilds the teacher full-vocab logits from the per-rank CUDA IPC handles and
+    does the shared CP-resolution the P-KL and gold paths need (contiguous student
+    logits + localized, next-token-shifted alignment). TP/CP groups come from the
+    student ``logits``' device mesh, falling back to the passed groups for
+    non-DTensor logits.
+
+    Returns:
+        ``(teacher_full_logits, student_logits_contig, align, tp_group, cp_group)``.
+    """
+    if isinstance(logits, DTensor):
+        mesh = logits.device_mesh
+        mesh_names = mesh.mesh_dim_names or ()
+        cp_group = mesh.get_group("cp") if "cp" in mesh_names else None
+        tp_group = mesh.get_group("tp") if "tp" in mesh_names else None
+    else:
+        cp_group = context_parallel_group
+        tp_group = vocab_parallel_group
+
+    teacher_full_logits = rebuild_teacher_full_logits_from_ipc(
+        data["teacher_full_logits_ipc"],
+        cp_group=cp_group,
+        device=torch.cuda.current_device(),
+    )
+    student_logits = cp_load_balanced_to_contiguous(logits, cp_group=cp_group)
+    align = localize_alignment(
+        data, teacher_seq_len=teacher_full_logits.shape[1], cp_group=cp_group
+    )
+    align.student_chunk_id = cp_shift_next(
+        cp_load_balanced_to_contiguous(align.student_chunk_id, cp_group=cp_group),
+        cp_group,
+        fill=-1,
+    )
+    align.teacher_chunk_id = cp_shift_next(align.teacher_chunk_id, cp_group, fill=-1)
+    return teacher_full_logits, student_logits, align, tp_group, cp_group
