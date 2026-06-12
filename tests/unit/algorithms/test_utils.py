@@ -17,6 +17,7 @@ from datetime import datetime
 
 import pytest
 import torch
+from pydantic import TypeAdapter
 
 from nemo_rl.algorithms.grpo import MasterConfig
 from nemo_rl.algorithms.utils import (
@@ -27,6 +28,7 @@ from nemo_rl.algorithms.utils import (
 )
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.policy import TokenizerConfig
 
 
 @pytest.fixture
@@ -123,6 +125,14 @@ def test_get_tokenizer_null_chat_template(conversation_messages):
     expected = "".join(msg["content"] for msg in conversation_messages)
 
     assert formatted == expected
+
+
+def test_tokenizer_config_schema_accepts_null_chat_template():
+    config = TypeAdapter(TokenizerConfig).validate_python(
+        {"name": "model", "chat_template": None}
+    )
+
+    assert config["chat_template"] is None
 
 
 @pytest.mark.hf_gated
@@ -397,6 +407,28 @@ def test_minimal_inputs_no_counts_no_flops(capsys):
         assert k in perf
 
     out = capsys.readouterr().out
+    assert "Throughputs (per GPU)" in out
+
+
+def test_empty_per_worker_token_counts_are_skipped(capsys):
+    master_config = _base_master_config(colocated=False)
+    timing_metrics = {
+        "policy_and_reference_logprobs": 1.0,
+        "policy_training": 3.0,
+        "total_step_time": 8.0,
+        "exposed_generation": 0.2,
+        "prepare_for_generation/total": 0.5,
+    }
+    metrics = {
+        "total_num_tokens": 1600.0,
+        "per_worker_token_counts": {},
+    }
+
+    perf = print_performance_metrics({}, metrics, timing_metrics, master_config)
+
+    assert "average_token_imbalance" not in perf
+    out = capsys.readouterr().out
+    assert "Average Token Imbalance" not in out
     assert "Throughputs (per GPU)" in out
 
 

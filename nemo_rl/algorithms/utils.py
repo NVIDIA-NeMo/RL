@@ -490,12 +490,21 @@ def print_performance_metrics(
     # =====================================================
     # Generate Token Imbalance Visualization
     # =====================================================
-    def visualize_per_worker_load(per_worker_token_counts: dict[int, int]) -> float:
+    def visualize_per_worker_load(
+        per_worker_token_counts: dict[int, int],
+    ) -> Optional[float]:
         per_worker_token_counts_list = [
             v for k, v in sorted(per_worker_token_counts.items())
         ]
+        if not per_worker_token_counts_list:
+            return None
+
+        max_token_count = max(per_worker_token_counts_list)
+        if max_token_count <= 0:
+            return None
+
         per_worker_load_ratio = [
-            v / max(per_worker_token_counts_list) for v in per_worker_token_counts_list
+            v / max_token_count for v in per_worker_token_counts_list
         ]
         max_rows_to_print = 1000
         bar_length = 20
@@ -532,7 +541,8 @@ def print_performance_metrics(
 
         if per_worker_token_counts is not None:
             average_token_imbalance = visualize_per_worker_load(per_worker_token_counts)
-            performance_metrics["average_token_imbalance"] = average_token_imbalance
+            if average_token_imbalance is not None:
+                performance_metrics["average_token_imbalance"] = average_token_imbalance
 
     if "mean_total_tokens_per_sample" in metrics:
         print(

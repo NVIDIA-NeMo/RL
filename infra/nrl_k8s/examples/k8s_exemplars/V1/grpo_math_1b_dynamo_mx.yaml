@@ -1,0 +1,94 @@
+# GRPO math 1B k8s smoke with Dynamo direct generation + ModelExpress.
+#
+# This is a small functional bring-up variant of
+# examples/configs/grpo_math_1B.yaml. It preserves the source base model, but
+# uses NeMo-RL's passthrough prompt template plus bounded smoke-test sampling to
+# avoid unreadable base-model generations while still running two steps so the
+# Dynamo DGD receives an MX refit after training.
+
+defaults: ../../../../../examples/configs/grpo_math_1B.yaml
+
+grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 2
+  max_rollout_turns: 1
+  max_num_steps: 2
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  max_val_samples: 4
+  val_batch_size: 4
+
+checkpointing:
+  enabled: false
+
+policy:
+  model_name: "Qwen/Qwen2.5-1.5B"
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template: null
+    chat_template_kwargs: null
+  train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 512
+
+  dtensor_cfg:
+    enabled: true
+    _v2: false
+    cpu_offload: false
+    activation_checkpointing: false
+    sequence_parallel: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+
+  megatron_cfg:
+    enabled: false
+
+  generation:
+    backend: "dynamo"
+    max_new_tokens: 128
+    temperature: 0.7
+    top_p: 0.95
+    top_k: 50
+    stop_token_ids: null
+    stop_strings: null
+    dynamo_cfg:
+      request_timeout_s: 900.0
+    vllm_cfg:
+      async_engine: false
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.6
+      max_model_len: ${policy.max_total_sequence_length}
+      enable_vllm_metrics_logger: false
+    colocated:
+      enabled: false
+
+logger:
+  log_dir: "logs/grpo-math-1b-dynamo-mx"
+  num_val_samples_to_print: 0
+  wandb_enabled: false
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: false
+
+cluster:
+  gpus_per_node: 1
+  num_nodes: 1
+  weight_sync:
+    method: "mx"
+    mx_config:
+      enabled: true
+      mx_server_url: "modelexpress-server.default.svc.cluster.local:8001"
+      timeout_seconds: 300.0
+      same_rank_only: true
+      # Keep the smoke deterministic with a long-lived DGD: tree fan-out can
+      # leave self-published inference_replica sources in MX across runs.
+      tree_scale_out: false
+      moe_expert_filter: false
+      nic_pin: "auto"
+      retain_latest_k: 1

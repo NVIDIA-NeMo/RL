@@ -1,0 +1,136 @@
+# DynamoGraphDeployment for Qwen/Qwen2.5-1.5B-Instruct on GB300, MX-enabled.
+#
+# Used by the sliding-puzzle k8s V3 exemplar. The NeMo-RL Dynamo backend sends
+# token-id OpenAI completions requests and requires nvext.completion_token_ids,
+# so this must run a Dynamo image built from
+# jthomson04/tokenize-endpoint-merge-main-06-09 or newer.
+
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: qwen2-5-1-5b-instruct-gb300-mx
+  annotations:
+    nvidia.com/kai-scheduler-queue: backfill
+spec:
+  services:
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      resources:
+        requests:
+          cpu: "2"
+          memory: "4Gi"
+        limits:
+          cpu: "4"
+          memory: "8Gi"
+      extraPodSpec:
+        nodeSelector:
+          nodeGroup: customer-cpu
+          kubernetes.io/arch: arm64
+        tolerations:
+          - operator: Exists
+        volumes:
+          - name: rl-workspace
+            persistentVolumeClaim:
+              claimName: rl-workspace
+        mainContainer:
+          image: jwillthomson/dynamo-arm-tokenize-endpoint-3c63dd69-mx
+          workingDir: /workspace
+          volumeMounts:
+            - mountPath: /mnt/rl-workspace
+              name: rl-workspace
+          command:
+            - python3
+            - -m
+            - dynamo.frontend
+          args:
+            - --router-reset-states
+          env:
+            - name: HF_HOME
+              value: /mnt/rl-workspace/jothomson/hf-cache
+    VllmDecodeWorker:
+      componentType: worker
+      replicas: 1
+      envFromSecret: jothomson-secrets
+      resources:
+        requests:
+          gpu: "1"
+          memory: "64Gi"
+        limits:
+          gpu: "1"
+          memory: "128Gi"
+      extraPodSpec:
+        nodeSelector:
+          nvidia.com/gpu.product: NVIDIA-GB300
+        tolerations:
+          - operator: Exists
+        resourceClaims:
+          - name: roce-channel
+            resourceClaimTemplateName: roce-mx-qwen3-4b
+        volumes:
+          - name: rl-workspace
+            persistentVolumeClaim:
+              claimName: rl-workspace
+        mainContainer:
+          image: jwillthomson/dynamo-arm-tokenize-endpoint-3c63dd69-mx
+          workingDir: /workspace
+          volumeMounts:
+            - mountPath: /mnt/rl-workspace
+              name: rl-workspace
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              echo "[startup] dynamo.vllm qwen2.5-1.5b mx $(date -u +%FT%TZ)"
+              python3 -c "import modelexpress; print('modelexpress at', modelexpress.__file__)"
+              exec python3 -m dynamo.vllm "$@"
+            - --
+          args:
+            - --model
+            - Qwen/Qwen2.5-1.5B-Instruct
+            - --served-model-name
+            - Qwen/Qwen2.5-1.5B-Instruct
+            - --load-format
+            - mx-target
+            - --model-express-url
+            - modelexpress-server.default.svc.cluster.local:8001
+            - --tensor-parallel-size
+            - "1"
+            - --dtype
+            - bfloat16
+            - --gpu-memory-utilization
+            - "0.6"
+            - --max-model-len
+            - "1024"
+            - --max-num-seqs
+            - "32"
+            - --max-num-batched-tokens
+            - "4096"
+            - --enforce-eager
+          resources:
+            claims:
+              - name: roce-channel
+          env:
+            - name: DYN_HEALTH_CHECK_ENABLED
+              value: "false"
+            - name: DYN_SYSTEM_PORT
+              value: "9090"
+            - name: HF_HOME
+              value: /mnt/rl-workspace/jothomson/hf-cache
+            - name: DYN_MX_REFIT_ENABLED
+              value: "1"
+            - name: MODEL_EXPRESS_URL
+              value: "modelexpress-server.default.svc.cluster.local:8001"
+            - name: UCX_TLS
+              value: "^tcp"
+            - name: NIXL_UCX_TLS
+              value: "^tcp"
+            - name: UCX_IB_GPU_DIRECT_RDMA
+              value: "yes"
+            - name: UCX_CUDA_COPY_DMABUF
+              value: "yes"
+            - name: UCX_LOG_LEVEL
+              value: "info"
+            - name: MX_RDMA_NIC_PIN
+              value: "auto"

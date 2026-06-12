@@ -2686,8 +2686,9 @@ def async_grpo_train(
     """
     # Ensure we are running with a compatible async generation backend
     assert _should_use_async_rollouts(master_config), (
-        "Async GRPO requires vLLM backend with vllm_cfg.async_engine=True. "
-        "Set policy.generation.vllm_cfg.async_engine to true in your config."
+        "Async GRPO requires the Dynamo backend or vLLM backend with "
+        "vllm_cfg.async_engine=True. Set policy.generation.backend=dynamo, "
+        "or set policy.generation.vllm_cfg.async_engine=true."
     )
     assert master_config.loss_fn.use_importance_sampling_correction, (
         "Importance sampling correction must be enabled for async GRPO for good convergence due to off-policy samples!"

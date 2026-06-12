@@ -20,12 +20,14 @@ URL of the DGD's frontend Service so nemo-gym can dispatch rollout requests to
 it over HTTP.
 """
 
+import asyncio
 import threading
 import time
 import warnings
-from typing import Any, Optional, Union
+from typing import Any, AsyncGenerator, Optional, Union
 
 import ray
+import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
@@ -34,6 +36,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
+    verify_right_padding,
 )
 from nemo_rl.utils.k8s import is_in_kubernetes, read_pod_namespace
 
@@ -41,7 +44,9 @@ DEFAULT_FRONTEND_PORT = 8000
 DEFAULT_DYN_SYSTEM_PORT = 9090
 
 
-def _http_post_json(url: str, payload: dict[str, Any], timeout_s: float) -> dict[str, Any]:
+def _http_post_json(
+    url: str, payload: dict[str, Any], timeout_s: float
+) -> dict[str, Any]:
     """POST a JSON body to a URL and parse the JSON response.
 
     Returns the parsed dict (or a ``{"status": "error", ...}`` shape on
@@ -71,6 +76,72 @@ def _http_post_json(url: str, payload: dict[str, Any], timeout_s: float) -> dict
         return json.loads(body)
     except json.JSONDecodeError:
         return {"status": "error", "raw": body.decode("utf-8", "replace")}
+
+
+def _format_dynamo_error(response: dict[str, Any]) -> str:
+    """Format the internal error shape returned by ``_http_post_json``."""
+    if "http_status" in response:
+        return f"HTTP {response['http_status']}: {response.get('raw', '')}"
+    if "transport_error" in response:
+        return str(response["transport_error"])
+    if "raw" in response:
+        return str(response["raw"])
+    return str(response)
+
+
+def _parse_dynamo_completion_response(
+    response: dict[str, Any], *, request_url: str
+) -> tuple[list[int], list[float], bool]:
+    """Parse the Dynamo OpenAI completion response for direct generation."""
+    if not isinstance(response, dict):
+        raise RuntimeError(
+            f"Dynamo completion response from {request_url} was not a JSON object."
+        )
+    if response.get("status") == "error":
+        raise RuntimeError(
+            f"Dynamo completion request to {request_url} failed: "
+            f"{_format_dynamo_error(response)}"
+        )
+
+    choices = response.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise RuntimeError(
+            f"Dynamo completion response from {request_url} did not include choices."
+        )
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        raise RuntimeError(
+            f"Dynamo completion response from {request_url} has invalid choice shape."
+        )
+
+    nvext = response.get("nvext")
+    if not isinstance(nvext, dict):
+        raise RuntimeError(
+            f"Dynamo completion response from {request_url} did not include nvext."
+        )
+    completion_token_ids = nvext.get("completion_token_ids")
+    if not isinstance(completion_token_ids, list):
+        raise RuntimeError(
+            "Dynamo completion response did not include "
+            "nvext.completion_token_ids. Ensure the DGD is based on "
+            "jthomson04/tokenize-endpoint-merge-main-06-09 or newer."
+        )
+    generated_token_ids = [int(token_id) for token_id in completion_token_ids]
+
+    generated_logprobs = [0.0] * len(generated_token_ids)
+    logprobs = choice.get("logprobs")
+    if isinstance(logprobs, dict):
+        token_logprobs = logprobs.get("token_logprobs")
+        if isinstance(token_logprobs, list):
+            for idx, logprob in enumerate(token_logprobs[: len(generated_logprobs)]):
+                if logprob is not None:
+                    generated_logprobs[idx] = float(logprob)
+
+    return (
+        generated_token_ids,
+        generated_logprobs,
+        choice.get("finish_reason") == "length",
+    )
 
 
 # Interpreter/process noise (prometheus_client internals) — not engine
@@ -804,14 +875,380 @@ class DynamoGeneration(GenerationInterface):
         self.cfg = state["cfg"]
         self.dp_openai_server_base_urls = state["dp_openai_server_base_urls"]
 
+    def _completion_url(self) -> str:
+        base_url = self.dp_openai_server_base_urls[0]
+        if not base_url:
+            raise RuntimeError("DynamoGeneration does not have a frontend URL.")
+        return f"{base_url.rstrip('/')}/completions"
+
+    def _request_timeout_s(self) -> float:
+        dynamo_cfg = self.cfg["dynamo_cfg"]
+        if (
+            "request_timeout_s" not in dynamo_cfg
+            or dynamo_cfg["request_timeout_s"] is None
+        ):
+            raise RuntimeError(
+                "DynamoGeneration direct generate() requires "
+                "policy.generation.dynamo_cfg.request_timeout_s."
+            )
+        return float(dynamo_cfg["request_timeout_s"])
+
+    def _merge_stop_strings(self, batch_stop_strings: Any) -> Optional[list[str]]:
+        stop_set: set[str] = set()
+
+        if self.cfg.get("stop_strings"):
+            stop_set.update(self.cfg["stop_strings"])
+
+        if batch_stop_strings is not None:
+            for sample_stop_strings in batch_stop_strings:
+                if not sample_stop_strings:
+                    continue
+                if isinstance(sample_stop_strings, str):
+                    stop_set.add(sample_stop_strings)
+                else:
+                    stop_set.update(sample_stop_strings)
+
+        return list(stop_set) if stop_set else None
+
+    def _prompt_token_ids(
+        self,
+        data: BatchedDataDict["GenerationDatumSpec"],
+        sample_idx: int,
+    ) -> list[int]:
+        if "vllm_content" in data:
+            raise NotImplementedError(
+                "DynamoGeneration direct generate() supports token-ID LLM "
+                "prompts only; multimodal vllm_content is not supported."
+            )
+
+        input_length = int(data["input_lengths"][sample_idx].item())
+        return data["input_ids"][sample_idx, :input_length].tolist()
+
+    def _build_completion_request(
+        self,
+        *,
+        prompt_token_ids: list[int],
+        greedy: bool,
+        stop_strings: Optional[list[str]],
+        max_new_tokens: int,
+    ) -> dict[str, Any]:
+        top_k_cfg = self.cfg["top_k"]
+        top_k_val = 1 if greedy else (top_k_cfg if top_k_cfg is not None else -1)
+
+        payload: dict[str, Any] = {
+            "model": self.cfg["model_name"],
+            "prompt": prompt_token_ids,
+            "max_tokens": int(max_new_tokens),
+            "temperature": 0.0 if greedy else self.cfg["temperature"],
+            "top_p": self.cfg["top_p"],
+            "top_k": top_k_val,
+            "logprobs": 0,
+            "n": 1,
+            "return_tokens_as_token_ids": True,
+            "include_stop_str_in_output": True,
+            "nvext": {"extra_fields": ["completion_token_ids"]},
+        }
+
+        if self.cfg["stop_token_ids"] is not None:
+            payload["stop_token_ids"] = self.cfg["stop_token_ids"]
+        if stop_strings is not None:
+            payload["stop"] = stop_strings
+
+        return payload
+
+    def _post_completion_request(
+        self,
+        *,
+        prompt_token_ids: list[int],
+        greedy: bool,
+        stop_strings: Optional[list[str]],
+        max_new_tokens: int,
+    ) -> tuple[list[int], list[float], bool]:
+        request_url = self._completion_url()
+        payload = self._build_completion_request(
+            prompt_token_ids=prompt_token_ids,
+            greedy=greedy,
+            stop_strings=stop_strings,
+            max_new_tokens=max_new_tokens,
+        )
+        response = _http_post_json(request_url, payload, self._request_timeout_s())
+        return _parse_dynamo_completion_response(response, request_url=request_url)
+
+    def _single_sample_output(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        input_length: int,
+        generated_token_ids: list[int],
+        generated_logprobs: list[float],
+        truncated: bool,
+    ) -> BatchedDataDict["GenerationOutputSpec"]:
+        output_length = input_length + len(generated_token_ids)
+        output_ids = torch.full(
+            (output_length,),
+            self.cfg["_pad_token_id"],
+            dtype=input_ids.dtype,
+            device=input_ids.device,
+        )
+        output_ids[:input_length] = input_ids[:input_length]
+        if generated_token_ids:
+            output_ids[input_length:output_length] = torch.tensor(
+                generated_token_ids,
+                dtype=input_ids.dtype,
+                device=input_ids.device,
+            )
+
+        logprobs = torch.zeros(
+            (1, output_length),
+            dtype=torch.float32,
+            device=input_ids.device,
+        )
+        for idx, logprob in enumerate(generated_logprobs[: len(generated_token_ids)]):
+            logprobs[0, input_length + idx] = logprob
+
+        return BatchedDataDict[GenerationOutputSpec](
+            {
+                "output_ids": output_ids.unsqueeze(0),
+                "logprobs": logprobs,
+                "generation_lengths": torch.tensor(
+                    [len(generated_token_ids)],
+                    dtype=torch.long,
+                    device=input_ids.device,
+                ),
+                "unpadded_sequence_lengths": torch.tensor(
+                    [output_length],
+                    dtype=torch.long,
+                    device=input_ids.device,
+                ),
+                "truncated": torch.tensor(
+                    [truncated],
+                    dtype=torch.bool,
+                    device=input_ids.device,
+                ),
+            }
+        )
+
     def generate(
         self,
         data: BatchedDataDict["GenerationDatumSpec"],
         greedy: bool = False,
     ) -> BatchedDataDict["GenerationOutputSpec"]:
-        raise NotImplementedError(
-            "DynamoGeneration does not support direct generate(). "
-            "Use the nemo-gym HTTP rollout path instead."
+        """Generate a batch of token-ID prompts using the DGD completions route."""
+        assert isinstance(data, BatchedDataDict), (
+            f"data must be a BatchedDataDict, got type: {type(data)}"
+        )
+        assert "input_ids" in data and "input_lengths" in data, (
+            "input_ids and input_lengths are required in data for Dynamo generation"
+        )
+
+        input_ids = data["input_ids"]
+        input_lengths = data["input_lengths"]
+        if len(input_ids) == 0:
+            return BatchedDataDict[GenerationOutputSpec](
+                {
+                    "output_ids": torch.zeros(
+                        (0, 0), dtype=torch.long, device=input_ids.device
+                    ),
+                    "logprobs": torch.zeros(
+                        (0, 0), dtype=torch.float, device=input_ids.device
+                    ),
+                    "generation_lengths": torch.zeros(
+                        0, dtype=torch.long, device=input_ids.device
+                    ),
+                    "unpadded_sequence_lengths": torch.zeros(
+                        0, dtype=torch.long, device=input_ids.device
+                    ),
+                    "truncated": torch.zeros(
+                        0, dtype=torch.bool, device=input_ids.device
+                    ),
+                }
+            )
+
+        verify_right_padding(data, pad_value=self.cfg["_pad_token_id"])
+
+        batch_stop_strings = data.get("stop_strings", [])
+        stop_strings = self._merge_stop_strings(batch_stop_strings)
+        padded_input_length = input_ids.size(1)
+
+        per_sample_results = []
+        max_generated_length = 0
+        for sample_idx in range(input_ids.shape[0]):
+            generated_token_ids, generated_logprobs, truncated = (
+                self._post_completion_request(
+                    prompt_token_ids=self._prompt_token_ids(data, sample_idx),
+                    greedy=greedy,
+                    stop_strings=stop_strings,
+                    max_new_tokens=self.cfg["max_new_tokens"],
+                )
+            )
+            per_sample_results.append(
+                (generated_token_ids, generated_logprobs, truncated)
+            )
+            max_generated_length = max(max_generated_length, len(generated_token_ids))
+
+        total_length = padded_input_length + max_generated_length
+        output_ids_list = []
+        logprobs_list = []
+        generation_lengths = []
+        unpadded_sequence_lengths = []
+        truncated_list = []
+
+        for sample_idx, (
+            generated_token_ids,
+            generated_logprobs,
+            truncated,
+        ) in enumerate(per_sample_results):
+            input_length = int(input_lengths[sample_idx].item())
+            full_output = torch.full(
+                (total_length,),
+                self.cfg["_pad_token_id"],
+                dtype=input_ids.dtype,
+                device=input_ids.device,
+            )
+            full_output[:input_length] = input_ids[sample_idx, :input_length]
+            if generated_token_ids:
+                full_output[input_length : input_length + len(generated_token_ids)] = (
+                    torch.tensor(
+                        generated_token_ids,
+                        dtype=input_ids.dtype,
+                        device=input_ids.device,
+                    )
+                )
+
+            full_logprobs = torch.zeros(
+                total_length,
+                dtype=torch.float32,
+                device=input_ids.device,
+            )
+            for idx, logprob in enumerate(
+                generated_logprobs[: len(generated_token_ids)]
+            ):
+                full_logprobs[input_length + idx] = logprob
+
+            response_length = input_length + len(generated_token_ids)
+            if (
+                "vllm_cfg" in self.cfg
+                and "max_model_len" in self.cfg["vllm_cfg"]
+                and response_length > self.cfg["vllm_cfg"]["max_model_len"]
+            ):
+                raise AssertionError(
+                    "Dynamo response length exceeded "
+                    f"vllm_cfg.max_model_len: {response_length} > "
+                    f"{self.cfg['vllm_cfg']['max_model_len']}"
+                )
+
+            output_ids_list.append(full_output)
+            logprobs_list.append(full_logprobs)
+            generation_lengths.append(len(generated_token_ids))
+            unpadded_sequence_lengths.append(response_length)
+            truncated_list.append(truncated)
+
+        return BatchedDataDict[GenerationOutputSpec](
+            {
+                "output_ids": torch.stack(output_ids_list),
+                "logprobs": torch.stack(logprobs_list),
+                "generation_lengths": torch.tensor(
+                    generation_lengths,
+                    dtype=torch.long,
+                    device=input_ids.device,
+                ),
+                "unpadded_sequence_lengths": torch.tensor(
+                    unpadded_sequence_lengths,
+                    dtype=torch.long,
+                    device=input_ids.device,
+                ),
+                "truncated": torch.tensor(
+                    truncated_list,
+                    dtype=torch.bool,
+                    device=input_ids.device,
+                ),
+            }
+        )
+
+    async def generate_async(
+        self,
+        data: BatchedDataDict["GenerationDatumSpec"],
+        greedy: bool = False,
+    ) -> AsyncGenerator[tuple[int, BatchedDataDict["GenerationOutputSpec"]], None]:
+        """Generate one token-ID prompt asynchronously using the DGD route."""
+        assert isinstance(data, BatchedDataDict), (
+            f"data must be a BatchedDataDict, got type: {type(data)}"
+        )
+        assert "input_ids" in data and "input_lengths" in data, (
+            "input_ids and input_lengths are required in data for Dynamo generation"
+        )
+        if len(data["input_ids"]) == 0:
+            return
+
+        verify_right_padding(data, pad_value=self.cfg["_pad_token_id"])
+
+        input_ids_batch = data["input_ids"]
+        input_lengths_batch = data["input_lengths"]
+        batch_size = input_ids_batch.shape[0]
+        assert batch_size == 1, (
+            "generate_async is restricted to handle only single samples, "
+            f"but received batch_size={batch_size}. Please handle batching "
+            "outside this method."
+        )
+        if "vllm_cfg" not in self.cfg or "max_model_len" not in self.cfg["vllm_cfg"]:
+            raise RuntimeError(
+                "DynamoGeneration.generate_async requires "
+                "policy.generation.vllm_cfg.max_model_len for vLLM-parity "
+                "context budgeting."
+            )
+
+        sample_idx = 0
+        input_length = int(input_lengths_batch[sample_idx].item())
+        batch_stop_strings = data.get("stop_strings", [[] for _ in range(batch_size)])
+        per_sample_stop_strings = None
+        if batch_stop_strings and sample_idx < len(batch_stop_strings):
+            per_sample_stop_strings = batch_stop_strings[sample_idx]
+        final_stop_strings = self._merge_stop_strings(
+            [per_sample_stop_strings] if per_sample_stop_strings else None
+        )
+
+        remaining_ctx = self.cfg["vllm_cfg"]["max_model_len"] - input_length
+        allowed_new_tokens = max(0, min(self.cfg["max_new_tokens"], remaining_ctx))
+        input_ids = input_ids_batch[sample_idx]
+        if allowed_new_tokens == 0:
+            yield (
+                sample_idx,
+                self._single_sample_output(
+                    input_ids=input_ids,
+                    input_length=input_length,
+                    generated_token_ids=[],
+                    generated_logprobs=[],
+                    truncated=False,
+                ),
+            )
+            return
+
+        request_url = self._completion_url()
+        payload = self._build_completion_request(
+            prompt_token_ids=self._prompt_token_ids(data, sample_idx),
+            greedy=greedy,
+            stop_strings=final_stop_strings,
+            max_new_tokens=allowed_new_tokens,
+        )
+        response = await asyncio.to_thread(
+            _http_post_json,
+            request_url,
+            payload,
+            self._request_timeout_s(),
+        )
+        generated_token_ids, generated_logprobs, truncated = (
+            _parse_dynamo_completion_response(response, request_url=request_url)
+        )
+
+        yield (
+            sample_idx,
+            self._single_sample_output(
+                input_ids=input_ids,
+                input_length=input_length,
+                generated_token_ids=generated_token_ids,
+                generated_logprobs=generated_logprobs,
+                truncated=truncated,
+            ),
         )
 
     def init_collective(

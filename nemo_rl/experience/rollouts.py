@@ -17,7 +17,6 @@
 
 import asyncio
 import copy
-import json
 import math
 import statistics
 import warnings
@@ -143,16 +142,25 @@ async def generate_responses_async(
         # Ensure the key exists even if it's None, matching GenerationDatumSpec
         generation_input_data["stop_strings"] = [None] * len(input_lengths)
 
-    # Check if this is vLLM with async_engine enabled
-    use_async_generation = (
+    # Check if this is a backend with per-sample async generation enabled.
+    has_generate_async = hasattr(policy_generation, "generate_async")
+    is_vllm_async_generation = (
         hasattr(policy_generation, "cfg")
         and "vllm_cfg" in policy_generation.cfg
         and policy_generation.cfg["vllm_cfg"]["async_engine"]
-        and hasattr(policy_generation, "generate_async")
+    )
+    is_dynamo_generation = (
+        hasattr(policy_generation, "cfg")
+        and policy_generation.cfg.get("backend") == "dynamo"
+    )
+    use_async_generation = has_generate_async and (
+        is_vllm_async_generation or is_dynamo_generation
     )
 
     assert use_async_generation, (
-        "Async generation is not enabled. Please enable async generation by setting async_engine=True in the vllm_cfg section of the policy config."
+        "Async generation is not enabled. Use the Dynamo generation backend, "
+        "or enable async generation by setting async_engine=True in the "
+        "vllm_cfg section of the policy config."
     )
 
     # Use async generation with per-sample streaming
@@ -862,9 +870,10 @@ async def run_sample_multi_turn_rollout(
         "turn_gen_tokens": turn_gen_tokens,
         "turn_input_tokens": turn_input_tokens,
         "turn_total_tokens": turn_total_tokens,
-        # Pass-through per-worker per-turn accounting for aggregation at batch level
-        "per_worker_token_counts": per_worker_token_counts,
     }
+    if per_worker_token_counts:
+        # Pass-through per-worker per-turn accounting for aggregation at batch level.
+        sample_metrics["per_worker_token_counts"] = per_worker_token_counts
 
     return final_sample_state, sample_metrics
 
@@ -1040,11 +1049,11 @@ def run_async_multi_turn_rollout(
         }
 
         # Calculate per-worker token counts
-        if "per_worker_token_counts" in all_sample_metrics[0]:
-            per_worker_token_counts = {}
-            for m in all_sample_metrics:
-                for k, v in m["per_worker_token_counts"].items():
-                    per_worker_token_counts[k] = per_worker_token_counts.get(k, 0) + v
+        per_worker_token_counts = {}
+        for m in all_sample_metrics:
+            for k, v in m.get("per_worker_token_counts", {}).items():
+                per_worker_token_counts[k] = per_worker_token_counts.get(k, 0) + v
+        if per_worker_token_counts:
             rollout_metrics["per_worker_token_counts"] = per_worker_token_counts
 
         # Collect ISL, OSL, and ISL+OSL metrics for all samples

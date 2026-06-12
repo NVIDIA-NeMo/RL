@@ -14,16 +14,21 @@
 """Pure-mock unit tests for the Dynamo URL-forwarder backend.
 
 These do not exercise a real DynamoGraphDeployment — they only verify the
-class's contract: K8s detection, URL derivation, lifecycle no-ops, and that
-unsupported methods fail loudly. End-to-end coverage is provided separately
-in the Phase 2 integration tests once nrl-k8s can stand up a DGD.
+class's contract: K8s detection, URL derivation, lifecycle no-ops, direct
+generation HTTP payloads, and that unsupported methods fail loudly. End-to-end
+coverage is provided separately in the Phase 2 integration tests once nrl-k8s
+can stand up a DGD.
 """
 
+import asyncio
 import pickle
 
 import pytest
+import torch
 
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.dynamo import DynamoConfig, DynamoGeneration
+from nemo_rl.models.generation.dynamo import dynamo_generation as _dynmod
 from nemo_rl.utils import k8s as k8s_utils
 
 
@@ -37,9 +42,30 @@ def _base_config(**dynamo_cfg_overrides) -> DynamoConfig:
         "top_k": None,
         "stop_token_ids": None,
         "stop_strings": None,
-        "dynamo_cfg": {"dgd_name": "my-dgd", **dynamo_cfg_overrides},
+        "_pad_token_id": 0,
+        "dynamo_cfg": {
+            "dgd_name": "my-dgd",
+            "request_timeout_s": 30.0,
+            **dynamo_cfg_overrides,
+        },
     }
     return cfg
+
+
+def _generation_data(
+    input_ids: list[list[int]],
+    input_lengths: list[int],
+    stop_strings: list[list[str] | None] | None = None,
+) -> BatchedDataDict:
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "input_lengths": torch.tensor(input_lengths, dtype=torch.long),
+        }
+    )
+    if stop_strings is not None:
+        data["stop_strings"] = stop_strings
+    return data
 
 
 @pytest.fixture
@@ -135,8 +161,6 @@ def test_lifecycle_noops(in_k8s, stub_namespace):
 def test_unsupported_methods_raise(in_k8s, stub_namespace):
     g = DynamoGeneration(cluster=None, config=_base_config())
     with pytest.raises(NotImplementedError):
-        g.generate(data=None, greedy=False)  # type: ignore[arg-type]
-    with pytest.raises(NotImplementedError):
         g.init_collective(ip="127.0.0.1", port=1, world_size=1)
     with pytest.raises(NotImplementedError):
         g.update_weights_via_ipc_zmq()
@@ -160,10 +184,254 @@ def test_pickle_roundtrip(in_k8s, stub_namespace):
 
 
 # ---------------------------------------------------------------------------
-# Engine-telemetry sampler — Prometheus parsing + get/clear contract.
+# Direct generation — OpenAI completions payload + vLLM-parity tensors.
 # ---------------------------------------------------------------------------
 
-from nemo_rl.models.generation.dynamo import dynamo_generation as _dynmod
+
+def test_generate_requires_request_timeout_s(monkeypatch):
+    monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+    cfg = _base_config()
+    cfg["dynamo_cfg"] = {"frontend_url": "http://my-dgd.example.com:8000/v1"}  # type: ignore[typeddict-item]
+    g = DynamoGeneration(cluster=None, config=cfg)
+
+    with pytest.raises(RuntimeError, match="request_timeout_s"):
+        g.generate(_generation_data([[1, 2, 0]], [2]))
+
+
+def test_generate_builds_non_greedy_payload_and_vllm_sync_tensors(
+    monkeypatch,
+):
+    monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+    cfg = _base_config(
+        frontend_url="http://my-dgd.example.com:8000/v1",
+        request_timeout_s=42.0,
+    )
+    cfg["temperature"] = 0.7
+    cfg["top_p"] = 0.9
+    cfg["top_k"] = 50
+    cfg["stop_token_ids"] = [128001]
+    cfg["stop_strings"] = ["global-stop"]
+    calls = []
+
+    def fake_post_json(url, payload, timeout_s):
+        calls.append((url, payload, timeout_s))
+        if payload["prompt"] == [1, 2, 3]:
+            return {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "logprobs": {"token_logprobs": [-0.1, -0.2]},
+                    }
+                ],
+                "nvext": {"completion_token_ids": [10, 11]},
+            }
+        return {
+            "choices": [
+                {
+                    "finish_reason": "length",
+                    "logprobs": {"token_logprobs": [-0.3]},
+                }
+            ],
+            "nvext": {"completion_token_ids": [12]},
+        }
+
+    monkeypatch.setattr(_dynmod, "_http_post_json", fake_post_json)
+    g = DynamoGeneration(cluster=None, config=cfg)
+    out = g.generate(
+        _generation_data(
+            [[1, 2, 3, 0], [4, 5, 0, 0]],
+            [3, 2],
+            stop_strings=[["sample-a"], ["sample-b"]],
+        )
+    )
+
+    assert [call[0] for call in calls] == [
+        "http://my-dgd.example.com:8000/v1/completions",
+        "http://my-dgd.example.com:8000/v1/completions",
+    ]
+    assert [call[2] for call in calls] == [42.0, 42.0]
+    for _, payload, _ in calls:
+        assert payload["model"] == "Qwen/Qwen3-0.6B"
+        assert payload["max_tokens"] == 16
+        assert payload["temperature"] == 0.7
+        assert payload["top_p"] == 0.9
+        assert payload["top_k"] == 50
+        assert payload["logprobs"] == 0
+        assert payload["n"] == 1
+        assert payload["return_tokens_as_token_ids"] is True
+        assert payload["include_stop_str_in_output"] is True
+        assert payload["stop_token_ids"] == [128001]
+        assert set(payload["stop"]) == {"global-stop", "sample-a", "sample-b"}
+        assert payload["nvext"] == {"extra_fields": ["completion_token_ids"]}
+        assert "greed_sampling" not in payload["nvext"]
+
+    assert out["output_ids"].tolist() == [
+        [1, 2, 3, 10, 11, 0],
+        [4, 5, 12, 0, 0, 0],
+    ]
+    assert out["generation_lengths"].tolist() == [2, 1]
+    assert out["unpadded_sequence_lengths"].tolist() == [5, 3]
+    assert out["truncated"].tolist() == [False, True]
+    assert torch.allclose(
+        out["logprobs"],
+        torch.tensor(
+            [
+                [0.0, 0.0, 0.0, -0.1, -0.2, 0.0],
+                [0.0, 0.0, -0.3, 0.0, 0.0, 0.0],
+            ]
+        ),
+    )
+
+
+def test_generate_builds_greedy_payload_without_dynamo_greed_sampling(monkeypatch):
+    monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+    cfg = _base_config(frontend_url="http://my-dgd.example.com:8000/v1")
+    cfg["temperature"] = 1.2
+    cfg["top_p"] = 0.75
+    cfg["top_k"] = None
+    calls = []
+
+    def fake_post_json(url, payload, timeout_s):
+        calls.append((url, payload, timeout_s))
+        return {
+            "choices": [{"finish_reason": "stop", "logprobs": None}],
+            "nvext": {"completion_token_ids": [9]},
+        }
+
+    monkeypatch.setattr(_dynmod, "_http_post_json", fake_post_json)
+    g = DynamoGeneration(cluster=None, config=cfg)
+    out = g.generate(_generation_data([[7, 8]], [2]), greedy=True)
+
+    payload = calls[0][1]
+    assert payload["temperature"] == 0.0
+    assert payload["top_k"] == 1
+    assert payload["top_p"] == 0.75
+    assert payload["nvext"] == {"extra_fields": ["completion_token_ids"]}
+    assert "greed_sampling" not in payload["nvext"]
+    assert out["output_ids"].tolist() == [[7, 8, 9]]
+    assert out["logprobs"].tolist() == [[0.0, 0.0, 0.0]]
+
+
+def test_generate_raises_on_http_error(monkeypatch):
+    monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+    cfg = _base_config(frontend_url="http://my-dgd.example.com:8000/v1")
+
+    def fake_post_json(url, payload, timeout_s):
+        return {"status": "error", "http_status": 500, "raw": "boom"}
+
+    monkeypatch.setattr(_dynmod, "_http_post_json", fake_post_json)
+    g = DynamoGeneration(cluster=None, config=cfg)
+
+    with pytest.raises(RuntimeError, match="HTTP 500: boom"):
+        g.generate(_generation_data([[1]], [1]))
+
+
+def test_generate_raises_on_missing_completion_token_ids(monkeypatch):
+    monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+    cfg = _base_config(frontend_url="http://my-dgd.example.com:8000/v1")
+
+    def fake_post_json(url, payload, timeout_s):
+        return {"choices": [{"finish_reason": "stop"}]}
+
+    monkeypatch.setattr(_dynmod, "_http_post_json", fake_post_json)
+    g = DynamoGeneration(cluster=None, config=cfg)
+
+    with pytest.raises(RuntimeError, match="did not include nvext"):
+        g.generate(_generation_data([[1]], [1]))
+
+
+def test_generate_async_caps_context_and_yields_compact_result(monkeypatch):
+    monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+    cfg = _base_config(frontend_url="http://my-dgd.example.com:8000/v1")
+    cfg["max_new_tokens"] = 10
+    cfg["vllm_cfg"] = {"max_model_len": 5}  # type: ignore[typeddict-item]
+    calls = []
+
+    def fake_post_json(url, payload, timeout_s):
+        calls.append((url, payload, timeout_s))
+        return {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "logprobs": {"token_logprobs": [-0.4]},
+                }
+            ],
+            "nvext": {"completion_token_ids": [8]},
+        }
+
+    monkeypatch.setattr(_dynmod, "_http_post_json", fake_post_json)
+    g = DynamoGeneration(cluster=None, config=cfg)
+
+    async def collect():
+        return [
+            item
+            async for item in g.generate_async(
+                _generation_data([[1, 2, 3, 0]], [3], stop_strings=[["sample-stop"]])
+            )
+        ]
+
+    results = asyncio.run(collect())
+
+    assert len(results) == 1
+    original_idx, out = results[0]
+    assert original_idx == 0
+    assert calls[0][1]["max_tokens"] == 2
+    assert calls[0][1]["prompt"] == [1, 2, 3]
+    assert calls[0][1]["stop"] == ["sample-stop"]
+    assert out["output_ids"].tolist() == [[1, 2, 3, 8]]
+    assert out["generation_lengths"].tolist() == [1]
+    assert out["unpadded_sequence_lengths"].tolist() == [4]
+    assert out["truncated"].tolist() == [False]
+    assert torch.allclose(out["logprobs"], torch.tensor([[0.0, 0.0, 0.0, -0.4]]))
+
+
+def test_generate_async_zero_budget_skips_http(monkeypatch):
+    monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+    cfg = _base_config(frontend_url="http://my-dgd.example.com:8000/v1")
+    cfg["vllm_cfg"] = {"max_model_len": 3}  # type: ignore[typeddict-item]
+
+    def fake_post_json(url, payload, timeout_s):
+        raise AssertionError("HTTP should not be called when no context remains")
+
+    monkeypatch.setattr(_dynmod, "_http_post_json", fake_post_json)
+    g = DynamoGeneration(cluster=None, config=cfg)
+
+    async def collect():
+        return [
+            item
+            async for item in g.generate_async(_generation_data([[1, 2, 3, 0]], [3]))
+        ]
+
+    results = asyncio.run(collect())
+    original_idx, out = results[0]
+
+    assert original_idx == 0
+    assert out["output_ids"].tolist() == [[1, 2, 3]]
+    assert out["generation_lengths"].tolist() == [0]
+    assert out["unpadded_sequence_lengths"].tolist() == [3]
+    assert out["truncated"].tolist() == [False]
+    assert out["logprobs"].tolist() == [[0.0, 0.0, 0.0]]
+
+
+def test_generate_async_rejects_multi_sample_batch(monkeypatch):
+    monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+    cfg = _base_config(frontend_url="http://my-dgd.example.com:8000/v1")
+    cfg["vllm_cfg"] = {"max_model_len": 10}  # type: ignore[typeddict-item]
+    g = DynamoGeneration(cluster=None, config=cfg)
+
+    async def collect():
+        return [
+            item
+            async for item in g.generate_async(_generation_data([[1], [2]], [1, 1]))
+        ]
+
+    with pytest.raises(AssertionError, match="single samples"):
+        asyncio.run(collect())
+
+
+# ---------------------------------------------------------------------------
+# Engine-telemetry sampler — Prometheus parsing + get/clear contract.
+# ---------------------------------------------------------------------------
 
 
 def test_parse_prometheus_basic_and_colon_sanitization():
@@ -259,15 +527,15 @@ def test_logger_metrics_enabled_shape_deepcopy_and_clear(
     assert "vllm_num_requests_running" not in g.get_logger_metrics()
 
     with g._dyn_metrics_lock:
-        g._dyn_logger_metrics = {"vllm_num_requests_running": {0: [1.0, 2.0], 1: [3.0]}}
+        g._dyn_logger_metrics = {"custom_metric": {0: [1.0, 2.0], 1: [3.0]}}
     out = g.get_logger_metrics()
-    assert out["vllm_num_requests_running"] == {0: [1.0, 2.0], 1: [3.0]}
+    assert out["custom_metric"] == {0: [1.0, 2.0], 1: [3.0]}
     # Returned timelines are copies — mutating them must not corrupt the sampler.
-    out["vllm_num_requests_running"][0].append(999.0)
-    assert g.get_logger_metrics()["vllm_num_requests_running"][0] == [1.0, 2.0]
+    out["custom_metric"][0].append(999.0)
+    assert g.get_logger_metrics()["custom_metric"][0] == [1.0, 2.0]
 
     g.clear_logger_metrics()
-    assert "vllm_num_requests_running" not in g.get_logger_metrics()  # cleared
+    assert "custom_metric" not in g.get_logger_metrics()  # cleared
 
 
 def test_pickle_roundtrip_with_metrics_enabled(in_k8s, stub_namespace, monkeypatch):
@@ -314,7 +582,7 @@ def test_logger_metrics_always_has_canonical_vllm_keys(
         assert k in out and isinstance(out[k], dict), k
 
     # (b) populated scrape -> canonical keys mapped from the raw vllm_* names,
-    #     and the raw generic names remain present (additive, not renamed).
+    #     and raw alias sources are dropped to avoid duplicate timelines.
     with g._dyn_metrics_lock:
         g._dyn_logger_metrics = {
             "vllm_num_requests_running": {0: [3.0, 4.0]},
@@ -327,4 +595,4 @@ def test_logger_metrics_always_has_canonical_vllm_keys(
     assert out["num_pending_samples"] == {0: [1.0]}
     assert out["kv_cache_usage_perc"] == {0: [0.5]}
     assert out["generation_tokens"] == {0: [100.0]}
-    assert "vllm_num_requests_running" in out  # raw name still surfaced too
+    assert "vllm_num_requests_running" not in out
