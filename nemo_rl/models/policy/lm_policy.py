@@ -918,9 +918,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         ray.get(futures)
 
     def finish_training(self, *args: Any, **kwargs: Any) -> None:
-        """Offload policy model to CPU after training."""
-        futures = self.worker_group.run_all_workers_single_data("finish_training")
-        ray.get(futures)
+        # Placeholder implementation
+        pass
 
     def calibrate_qkv_fp8_scales(
         self,
