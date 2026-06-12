@@ -30,9 +30,14 @@ from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.algorithms.x_token.loss_utils import (
     build_exact_token_map,
     chunk_average_log_probs,
+    localize_alignment,
     valid_chunk_mask,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.model_utils import (
+    cp_load_balanced_to_contiguous,
+    cp_shift_next,
+)
 
 
 def setup_dpo_loss_test_data(vocab_size=16, batch_size=1):
@@ -2370,6 +2375,22 @@ def _ct_gold_data(student_chunk_id, teacher_chunk_id, pair_valid, sample_mask):
     )
 
 
+def _ct_gold_prep(logits, teacher_logits, data):
+    """Mirror ``prepare_loss_input``'s shared prep for the single-rank (no-CP)
+    gold path: CP-relaid student logits + localized, next-token-shifted align."""
+    student_logits = cp_load_balanced_to_contiguous(logits, cp_group=None)
+    align = localize_alignment(
+        data, teacher_seq_len=teacher_logits.shape[1], cp_group=None
+    )
+    align.student_chunk_id = cp_shift_next(
+        cp_load_balanced_to_contiguous(align.student_chunk_id, cp_group=None),
+        None,
+        fill=-1,
+    )
+    align.teacher_chunk_id = cp_shift_next(align.teacher_chunk_id, None, fill=-1)
+    return student_logits, align
+
+
 def test_cross_tokenizer_gold_loss_matches_reference(tmp_path):
     """Gold path == (KL on common + L1 on uncommon) * T**2, with no CE term.
 
@@ -2391,8 +2412,9 @@ def test_cross_tokenizer_gold_loss_matches_reference(tmp_path):
     logits = torch.randn(1, 3, _CT_V_STUDENT)
     teacher_logits = torch.randn(1, 3, _CT_V_TEACHER)
 
+    student_logits, align = _ct_gold_prep(logits, teacher_logits, data)
     loss, kl_common, l1_uncommon, n_valid, _ = loss_fn._compute_gold(
-        logits, data, teacher_logits
+        student_logits, teacher_logits, align
     )
 
     assert torch.isfinite(loss)
@@ -2446,7 +2468,10 @@ def test_cross_tokenizer_gold_loss_all_samples_masked_is_zero(tmp_path):
     logits = torch.randn(1, 3, _CT_V_STUDENT)
     teacher_logits = torch.randn(1, 3, _CT_V_TEACHER)
 
-    loss, _, _, n_valid, _ = loss_fn._compute_gold(logits, data, teacher_logits)
+    student_logits, align = _ct_gold_prep(logits, teacher_logits, data)
+    loss, _, _, n_valid, _ = loss_fn._compute_gold(
+        student_logits, teacher_logits, align
+    )
     assert n_valid.item() == 0
     assert torch.equal(loss.detach(), torch.zeros(()))
 
