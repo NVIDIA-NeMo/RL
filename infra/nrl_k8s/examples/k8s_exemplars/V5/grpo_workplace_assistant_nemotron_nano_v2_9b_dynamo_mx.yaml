@@ -1,0 +1,119 @@
+# Nemotron Nano v2 9B workplace-assistant Megatron GRPO smoke with Dynamo + MX.
+#
+# Based on:
+# examples/nemo_gym/grpo_workplace_assistant_nemotron_nano_v2_9b.yaml
+#
+# The source recipe is Megatron TP=2 with colocated vLLM generation. This smoke
+# keeps the source model and Megatron layout, moves generation to a Dynamo DGD,
+# and runs exactly two training steps so the second step exercises an MX refit.
+
+defaults: ../../../../../examples/nemo_gym/grpo_workplace_assistant_nemotron_nano_v2_9b.yaml
+
+grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 2
+  max_rollout_turns: 1
+  max_num_steps: 2
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  max_val_samples: null
+  val_batch_size: null
+
+checkpointing:
+  enabled: false
+
+policy:
+  model_name: "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs: null
+  train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 8192
+
+  dtensor_cfg:
+    enabled: false
+
+  megatron_cfg:
+    enabled: true
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 1
+    context_parallel_size: 1
+    sequence_parallel: false
+    activation_checkpointing: true
+    moe_per_layer_logging: false
+
+  generation:
+    backend: "dynamo"
+    max_new_tokens: 512
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    dynamo_cfg:
+      request_timeout_s: 900.0
+      tool_call_parser: "nemotron_nano"
+      reasoning_parser: "nemotron_nano"
+    vllm_cfg:
+      async_engine: true
+      precision: ${policy.precision}
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.8
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: true
+      enable_vllm_metrics_logger: false
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: nemotron_json
+    vllm_kwargs:
+      compilation_config:
+        backend: eager
+      mamba_ssm_cache_dtype: "float32"
+    colocated:
+      enabled: false
+
+env:
+  should_log_nemo_gym_responses: false
+  nemo_gym:
+    port_range_low: 15001
+    port_range_high: 20000
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: false
+          extra_body:
+            chat_template_kwargs:
+              enable_thinking: false
+
+logger:
+  log_dir: "logs/grpo-workplace-assistant-nemotron-nano-v2-9b-dynamo-mx"
+  num_val_samples_to_print: 0
+  wandb_enabled: false
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: false
+
+cluster:
+  # GB300 nodes expose 4 GPUs. The source model uses Megatron TP=2, so this
+  # smoke allocates two training GPUs in one worker pod.
+  gpus_per_node: 2
+  num_nodes: 1
+  weight_sync:
+    method: "mx"
+    mx_config:
+      enabled: true
+      mx_server_url: "modelexpress-server.default.svc.cluster.local:8001"
+      timeout_seconds: 300.0
+      same_rank_only: true
+      tree_scale_out: false
+      moe_expert_filter: false
+      nic_pin: "auto"
+      retain_latest_k: 1

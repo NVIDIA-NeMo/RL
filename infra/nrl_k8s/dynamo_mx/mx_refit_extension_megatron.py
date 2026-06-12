@@ -109,6 +109,8 @@ def _parallel_config(worker: Any) -> Any:
 def _target_tp(worker: Any) -> tuple[int, int]:
     parallel_config = _parallel_config(worker)
     tp_size = int(getattr(parallel_config, "tensor_parallel_size", 1) or 1)
+    if tp_size <= 1 and torch.distributed.is_initialized():
+        tp_size = int(torch.distributed.get_world_size())
     if torch.distributed.is_initialized():
         # Dynamo vLLM workers are single-DP in this smoke. For TP>1, global
         # rank modulo TP gives the worker's TP rank.
@@ -116,6 +118,112 @@ def _target_tp(worker: Any) -> tuple[int, int]:
     else:
         tp_rank = 0
     return tp_size, tp_rank
+
+
+def _param_for_loaded_weight(
+    name: str,
+    params: dict[str, torch.Tensor],
+) -> torch.Tensor | None:
+    candidates = [name]
+    if name.startswith("backbone."):
+        candidates.append(f"model.{name[len('backbone.'):]}")
+    for candidate in candidates:
+        param = params.get(candidate)
+        if param is not None:
+            return param
+
+    # vLLM maps separate q/k/v checkpoint names onto qkv_proj internally.
+    # The shape adapter below still needs to inspect the fused parameter.
+    for candidate in candidates:
+        for shard_name in ("q_proj", "k_proj", "v_proj"):
+            if shard_name not in candidate:
+                continue
+            mapped_name = candidate.replace(shard_name, "qkv_proj")
+            param = params.get(mapped_name)
+            if param is not None:
+                return param
+    return None
+
+
+def _maybe_copy_tp_local_weight(
+    *,
+    name: str,
+    weight: torch.Tensor,
+    params: dict[str, torch.Tensor],
+) -> bool:
+    """Copy exact TP-local linear shards directly.
+
+    The Megatron matched-TP path receives local shards. vLLM's standard
+    loaders usually expect checkpoint-global tensors and slice again, which
+    is wrong for exact-shaped row-parallel and fused local layouts such as
+    Nemotron-H Mamba ``conv1d``/``in_proj``.
+    """
+    param = _param_for_loaded_weight(name, params)
+    if param is None or tuple(param.shape) != tuple(weight.shape):
+        return False
+    if ".experts." in name:
+        return False
+
+    is_linear_shard = (
+        getattr(param, "input_dim", None) is not None
+        or getattr(param, "output_dim", None) is not None
+    )
+    if not is_linear_shard:
+        return False
+
+    with torch.no_grad():
+        param.copy_(weight, non_blocking=True)
+    return True
+
+
+def _maybe_expand_tp_local_weight(
+    *,
+    name: str,
+    weight: torch.Tensor,
+    params: dict[str, torch.Tensor],
+    tp_size: int,
+    tp_rank: int,
+) -> torch.Tensor:
+    """Wrap a local TP shard in a checkpoint-global tensor for vLLM loaders."""
+    if tp_size <= 1 or weight.ndim == 0:
+        return weight
+
+    param = _param_for_loaded_weight(name, params)
+    if param is None:
+        return weight
+
+    is_sharded_weight = bool(getattr(param, "is_sharded_weight", False))
+    use_bitsandbytes_4bit = bool(getattr(param, "use_bitsandbytes_4bit", False))
+    if is_sharded_weight or use_bitsandbytes_4bit:
+        return weight
+
+    dim = getattr(param, "output_dim", None)
+    if dim is None:
+        dim = getattr(param, "input_dim", None)
+    if dim is None:
+        return weight
+    dim = int(dim)
+    if dim < 0:
+        dim += weight.ndim
+    if dim < 0 or dim >= weight.ndim:
+        return weight
+
+    local_extent = int(weight.shape[dim])
+    if dim < param.ndim and local_extent > int(param.shape[dim]):
+        return weight
+
+    expanded_shape = list(weight.shape)
+    expanded_shape[dim] = local_extent * tp_size
+    expanded = torch.empty(
+        expanded_shape,
+        dtype=weight.dtype,
+        device=weight.device,
+    )
+    expanded.narrow(dim, tp_rank * local_extent, local_extent).copy_(
+        weight,
+        non_blocking=True,
+    )
+    return expanded
 
 
 def _torch_dtype(dtype_name: str) -> torch.dtype:
@@ -138,6 +246,30 @@ class MxRefitWorkerExtension:
             self.state_dict_info = state_dict_info
 
     def _mx_load_weights(self, weights: list[tuple[str, torch.Tensor]]) -> None:
+        tp_size, tp_rank = _target_tp(self)
+        if tp_size > 1:
+            params = dict(self.model_runner.model.named_parameters())
+            adapted_weights = []
+            for name, weight in weights:
+                if _maybe_copy_tp_local_weight(
+                    name=name,
+                    weight=weight,
+                    params=params,
+                ):
+                    continue
+                adapted_weights.append(
+                    (
+                        name,
+                        _maybe_expand_tp_local_weight(
+                            name=name,
+                            weight=weight,
+                            params=params,
+                            tp_size=tp_size,
+                            tp_rank=tp_rank,
+                        ),
+                    )
+                )
+            weights = adapted_weights
         self.model_runner.model.load_weights(weights=weights)
 
     def _mx_maybe_process_fp8_kv_cache(self) -> None:
@@ -297,7 +429,10 @@ class MxRefitWorkerExtension:
             ReceiveSpec,
             discover_megatron_context,
         )
-        from modelexpress.nemo_rl_v2 import TargetTpLayout
+        from modelexpress.nemo_rl_v2 import (
+            ROLE_MEGATRON_VOCAB_PARALLEL,
+            TargetTpLayout,
+        )
 
         cfg, name_map = discover_megatron_context(candidates)
         if cfg is None:
@@ -341,6 +476,46 @@ class MxRefitWorkerExtension:
             receive_specs=receive_specs,
         )
 
+    def _mx_pull_megatron_vocab_buffers(
+        self,
+        *,
+        candidates: list[Any],
+        ctx: Any,
+        mx_config: MxConfig,
+    ) -> None:
+        vocab_buffers = getattr(self, "_mx_megatron_vocab_buffers", {})
+        if not vocab_buffers:
+            return
+
+        megatron_cands = sorted(
+            [c for c in candidates if c.megatron_meta is not None],
+            key=lambda c: c.megatron_meta.tp_rank,
+        )
+        for cand in megatron_cands:
+            batch = []
+            for name, dest in vocab_buffers.items():
+                spec = ctx.receive_specs[name]
+                axis = int(spec.shard_axis)
+                if axis != 0:
+                    raise RuntimeError(
+                        f"vocab_parallel tensor {name!r} uses unsupported "
+                        f"shard_axis={axis}; expected 0"
+                    )
+                rows = int(spec.target_shape[axis])
+                lo = int(cand.megatron_meta.tp_rank) * rows
+                view = dest.narrow(axis, lo, rows)
+                if not view.is_contiguous():
+                    raise RuntimeError(
+                        f"vocab_parallel destination for {name!r} is not contiguous"
+                    )
+                batch.append((name, None, view))
+            if batch:
+                self._mx_receiver._receiver.pull_to(
+                    cand.ref,
+                    batch,
+                    timeout_seconds=mx_config.timeout_seconds,
+                )
+
     def _mx_update_weights_via_mx_megatron(
         self,
         *,
@@ -349,6 +524,7 @@ class MxRefitWorkerExtension:
         mx_config: MxConfig,
     ) -> bool:
         from modelexpress.megatron_translator import run_refit_cycle
+        from modelexpress.nemo_rl_v2 import ROLE_MEGATRON_VOCAB_PARALLEL
 
         if not getattr(self, "_mx_megatron_ctx", None):
             self._mx_megatron_ctx = self._build_megatron_context(candidates)
@@ -356,24 +532,42 @@ class MxRefitWorkerExtension:
         ctx = self._mx_megatron_ctx
         if not hasattr(self, "_mx_megatron_buffers"):
             buffers: dict[str, torch.Tensor] = {}
+            vocab_buffers: dict[str, torch.Tensor] = {}
+            source_tp_size = next(
+                (
+                    c.megatron_meta.tp_size
+                    for c in candidates
+                    if c.megatron_meta is not None and c.megatron_meta.tp_size > 0
+                ),
+                ctx.target_tp_layout.tp_size,
+            )
             for spec in ctx.receive_specs.values():
                 if spec.role.startswith("expert_"):
                     continue
                 shape = list(spec.target_shape)
-                if spec.role != "replicated" and ctx.target_tp_layout.tp_size > 1:
-                    axis_extent = shape[spec.shard_axis]
-                    per_rank = axis_extent // ctx.target_tp_layout.tp_size
-                    if ctx.target_tp_layout.tp_rank != ctx.target_tp_layout.tp_size - 1:
-                        shape[spec.shard_axis] = per_rank
-                buffers[spec.megatron_name] = torch.empty(
+                target = buffers
+                if spec.role == ROLE_MEGATRON_VOCAB_PARALLEL:
+                    shape[int(spec.shard_axis)] *= int(source_tp_size)
+                    target = vocab_buffers
+                # The Megatron registry shape reflects the published buffer
+                # shape. Vocab tensors are the exception: vLLM's loader wants
+                # the full vocab tensor and slices it internally for TP.
+                target[spec.megatron_name] = torch.empty(
                     shape,
                     dtype=_torch_dtype(spec.target_dtype),
                     device=self.device,
                 )
-            if buffers:
-                self._mx_receiver._receiver._nixl.register_tensors(buffers)
+            all_buffers = dict(buffers)
+            all_buffers.update(vocab_buffers)
+            if all_buffers:
+                self._mx_receiver._receiver._nixl.register_tensors(all_buffers)
             self._mx_megatron_buffers = buffers
-            logger.info("[mx-megatron] registered %d buffers", len(buffers))
+            self._mx_megatron_vocab_buffers = vocab_buffers
+            logger.info(
+                "[mx-megatron] registered %d per-rank buffers and %d full-vocab buffers",
+                len(buffers),
+                len(vocab_buffers),
+            )
 
         matched = next(
             (
@@ -401,15 +595,24 @@ class MxRefitWorkerExtension:
                 f"(target_tp={ctx.target_tp_layout.tp_size}, source_tp={source_tp_size})."
             )
 
+        self._mx_receiver._receiver._nixl.rebind_tensors(self._mx_megatron_buffers)
         for _name, _tensor in self._mx_receiver.receive_from(
             matched,
             timeout_seconds=mx_config.timeout_seconds,
         ):
             pass
 
+        self._mx_pull_megatron_vocab_buffers(
+            candidates=candidates,
+            ctx=ctx,
+            mx_config=mx_config,
+        )
+
         def _noop_pull(_src: Any, _dest: torch.Tensor) -> None:
             return
 
+        pre_assembled_buffers = dict(self._mx_megatron_buffers)
+        pre_assembled_buffers.update(self._mx_megatron_vocab_buffers)
         weights = list(
             run_refit_cycle(
                 self._mx_receiver,
@@ -417,7 +620,7 @@ class MxRefitWorkerExtension:
                 context=ctx,
                 pull=_noop_pull,
                 device=self.device,
-                pre_assembled_buffers=self._mx_megatron_buffers,
+                pre_assembled_buffers=pre_assembled_buffers,
             )
         )
         if not weights:

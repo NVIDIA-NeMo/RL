@@ -1230,6 +1230,7 @@ class MegatronPolicyWorkerImpl(
 
         from nemo_rl.distributed.mx_helpers import build_v2_publisher
         from nemo_rl.distributed.mx_megatron_helpers import (
+            ROLE_COLUMN,
             collect_megatron_publish_set,
         )
 
@@ -1297,7 +1298,10 @@ class MegatronPolicyWorkerImpl(
             if tcfg else None
         )
 
-        role_overrides = getattr(mx_config, "megatron_role_overrides", None) or {}
+        role_overrides = self._mx_megatron_role_overrides_from_sidecar(
+            role=ROLE_COLUMN,
+        )
+        role_overrides.update(getattr(mx_config, "megatron_role_overrides", None) or {})
 
         # ---- Add tensors. ----
         if hasattr(self._mx_publisher, "_registry"):
@@ -1338,6 +1342,29 @@ class MegatronPolicyWorkerImpl(
         # ---- Publish + mark ready. ----
         self._mx_publisher.publish(version=int(version))
         self._mx_publisher.mark_ready()
+
+    def _mx_megatron_role_overrides_from_sidecar(self, *, role: str) -> dict[str, str]:
+        """Derive publish role overrides from Bridge's Megatron-to-HF name map."""
+        sidecar = getattr(self, "_mx_megatron_sidecar", {})
+        name_map = sidecar.get("megatron_hf_name_map", [])
+        role_overrides: dict[str, str] = {}
+        for entry in name_map:
+            if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+                continue
+            megatron_name = str(entry[0])
+            if ".experts." in megatron_name:
+                continue
+            if not any(
+                marker in megatron_name for marker in ("linear_fc1", "gate_up_proj")
+            ):
+                continue
+            hf_names = [str(hf_name) for hf_name in entry[1]]
+            if len(hf_names) != 1:
+                continue
+            hf_name = hf_names[0]
+            if "up_proj" in hf_name and "gate_proj" not in hf_name:
+                role_overrides[megatron_name] = role
+        return role_overrides
 
     def _build_megatron_sidecar(self) -> dict[str, Any]:
         """Serialize Megatron-Bridge introspection results at trainer init.
@@ -1382,7 +1409,42 @@ class MegatronPolicyWorkerImpl(
         # counts come from transformer_config.
         try:
             tasks = self.megatron_bridge.get_conversion_tasks([self.model])
-            name_map_entries: list[tuple[str, list[str]]] = []
+            name_map: defaultdict[str, list[str]] = defaultdict(list)
+
+            def _ordered_hf_names(hf_names: list[str]) -> list[str]:
+                unique: list[str] = []
+                for hf_name in hf_names:
+                    if hf_name not in unique:
+                        unique.append(hf_name)
+
+                def _priority(name: str, markers: tuple[str, ...]) -> int:
+                    for index, marker in enumerate(markers):
+                        if marker in name:
+                            return index
+                    return len(markers)
+
+                if any(
+                    marker in name
+                    for name in unique
+                    for marker in ("q_proj", "k_proj", "v_proj")
+                ):
+                    return sorted(
+                        unique,
+                        key=lambda name: _priority(
+                            name, ("q_proj", "k_proj", "v_proj")
+                        ),
+                    )
+                if any(
+                    marker in name
+                    for name in unique
+                    for marker in ("gate_proj", "up_proj")
+                ):
+                    return sorted(
+                        unique,
+                        key=lambda name: _priority(name, ("gate_proj", "up_proj")),
+                    )
+                return unique
+
             for task in tasks:
                 m_name = task.global_param_name or task.param_name
                 # Each task's mapping declares 1 or more HF names. Resolve
@@ -1399,7 +1461,11 @@ class MegatronPolicyWorkerImpl(
                         hf_names = list(hf_attr.values())
                 else:
                     continue
-                name_map_entries.append((m_name, list(hf_names)))
+                name_map[m_name].extend(str(hf_name) for hf_name in hf_names)
+            name_map_entries = [
+                (m_name, _ordered_hf_names(hf_names))
+                for m_name, hf_names in name_map.items()
+            ]
             sidecar["megatron_hf_name_map"] = name_map_entries
         except Exception as exc:  # noqa: BLE001
             warnings.warn(

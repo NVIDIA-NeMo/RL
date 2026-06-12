@@ -1,0 +1,265 @@
+# Nemotron Nano v2 9B workplace-assistant Megatron GRPO + Dynamo + MX on GB300.
+#
+# Run from the NeMo-RL repo root:
+#   RECIPE=infra/nrl_k8s/examples/k8s_exemplars/V5/grpo_workplace_assistant_nemotron_nano_v2_9b_dynamo_mx.yaml
+#   INFRA=infra/nrl_k8s/examples/k8s_exemplars/V5/grpo_workplace_assistant_nemotron_nano_v2_9b_dynamo_mx.gb300.infra.yaml
+#   nrl-k8s check $RECIPE --infra $INFRA
+#   nrl-k8s run   $RECIPE --infra $INFRA --raycluster --no-wait --replace
+
+_shared:
+  headNodeSelector: &head_node_selector
+    nodeGroup: customer-cpu
+    kubernetes.io/arch: arm64
+  workerNodeSelector: &worker_node_selector
+    nvidia.com/gpu.product: NVIDIA-GB300
+  modelOptOverlay: &modelopt_overlay "/mnt/rl-workspace/${user:}/runtime-overlays/modelopt-min"
+  modelexpressOverlay: &modelexpress_overlay "/mnt/rl-workspace/${user:}/modelexpress/modelexpress_client/python"
+  sharedPythonPath: &shared_python_path "/mnt/rl-workspace/${user:}/runtime-overlays/modelopt-min:/mnt/rl-workspace/${user:}/modelexpress/modelexpress_client/python:/opt/nemo-rl:/mnt/rl-workspace/${user:}/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src:/mnt/rl-workspace/${user:}/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM"
+  userSecretEnvFrom: &user_secret_env_from
+    - secretRef:
+        name: ${user:}-secrets
+        optional: true
+  headEnv: &shared_head_env
+    - {name: HF_HOME,                       value: "/mnt/rl-workspace/${user:}/hf-cache"}
+    - {name: PYTHONPATH,                    value: *shared_python_path}
+    - {name: NEMO_RL_MODELOPT_OVERLAY,      value: *modelopt_overlay}
+    - {name: NEMO_RL_MODELEXPRESS_OVERLAY,  value: *modelexpress_overlay}
+    - {name: NCCL_DEBUG,                    value: WARN}
+    - {name: RAY_memory_monitor_refresh_ms, value: "0"}
+    - {name: TOKENIZERS_PARALLELISM,        value: "false"}
+  workerEnv: &shared_worker_env
+    - {name: HF_HOME,                       value: "/mnt/rl-workspace/${user:}/hf-cache"}
+    - {name: PYTHONPATH,                    value: *shared_python_path}
+    - {name: NEMO_RL_MODELOPT_OVERLAY,      value: *modelopt_overlay}
+    - {name: NEMO_RL_MODELEXPRESS_OVERLAY,  value: *modelexpress_overlay}
+    - {name: NCCL_DEBUG,                    value: WARN}
+    - {name: RAY_memory_monitor_refresh_ms, value: "0"}
+    - {name: TOKENIZERS_PARALLELISM,        value: "false"}
+    - {name: UCX_TLS,                       value: "rc,cuda_copy"}
+    - {name: NIXL_UCX_TLS,                  value: "rc,cuda_copy"}
+    - {name: UCX_IB_GPU_DIRECT_RDMA,        value: "yes"}
+    - {name: UCX_CUDA_COPY_DMABUF,          value: "yes"}
+    - {name: MX_RDMA_NIC_PIN,               value: "auto"}
+  headResources: &head_resources
+    limits:   {cpu: "48", memory: "128Gi"}
+    requests: {cpu: "16", memory: "64Gi"}
+  gpuWorkerResources: &gpu_worker_resources
+    limits:
+      cpu: "96"
+      memory: "700Gi"
+      nvidia.com/gpu: "2"
+    requests:
+      cpu: "64"
+      memory: "500Gi"
+      nvidia.com/gpu: "2"
+    claims:
+      - {name: roce-channel}
+  gpuHeadPorts: &gpu_head_ports
+    - {containerPort: 6379,  name: gcs-server}
+    - {containerPort: 8265,  name: dashboard}
+    - {containerPort: 10001, name: client}
+  codeMounts: &code_mounts
+    - {mountPath: /dev/shm,          name: dshm}
+    - {mountPath: /opt/nemo-rl,      name: rl-workspace, subPath: "${user:}/nemo-rl"}
+    - {mountPath: /mnt/rl-workspace, name: rl-workspace}
+  headVolumes: &head_volumes
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 8Gi}
+    - name: rl-workspace
+      persistentVolumeClaim: {claimName: rl-workspace}
+  workerVolumes: &worker_volumes
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 64Gi}
+    - name: rl-workspace
+      persistentVolumeClaim: {claimName: rl-workspace}
+
+image: jwillthomson/nemo-rl-mx:megatron-dynamo-mx-v2
+imagePullSecrets: [nvcr-secret]
+serviceAccount: nemo-rl-endpoint-registry
+
+labels:
+  nrl-k8s/owner: ${user:}
+
+submit:
+  submitter: portForward
+
+launch:
+  mode: attach
+  runMode: batch
+  codeSource: image
+  codePath: /opt/nemo-rl
+  attach:
+    training: ${user:}-rc-nemotron-nano-v2-9b-dyn-mx
+  peerWatcher: false
+  env: {}
+  entrypoint: |
+    set -eu
+    cd /opt/nemo-rl
+    if [ ! -d /mnt/rl-workspace ]; then
+      echo "ERROR: /mnt/rl-workspace not mounted; is the rl-workspace PVC bound?" >&2
+      exit 1
+    fi
+
+    export MODELOPT_OVERLAY=/mnt/rl-workspace/${user:}/runtime-overlays/modelopt-min
+    export PYTHONPATH=\${MODELOPT_OVERLAY}:/mnt/rl-workspace/${user:}/modelexpress/modelexpress_client/python:/opt/nemo-rl:/mnt/rl-workspace/${user:}/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src:/mnt/rl-workspace/${user:}/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM
+    export MX_RDMA_NIC_PIN=auto
+    export TOKENIZERS_PARALLELISM=false
+
+    if ! python - <<'PY'
+    from modelopt.torch.quantization.utils import is_quantized
+
+    print("modelopt:", is_quantized)
+    PY
+    then
+      echo "[overlay] installing minimal ModelOpt overlay at \${MODELOPT_OVERLAY}"
+      TMP_MODELOPT_OVERLAY=\${MODELOPT_OVERLAY}.\$\$
+      rm -rf "\${TMP_MODELOPT_OVERLAY}"
+      mkdir -p "$(dirname "\${MODELOPT_OVERLAY}")"
+      python -m pip install --target "\${TMP_MODELOPT_OVERLAY}" --no-deps \
+        nvidia-modelopt==0.44.0 \
+        "pulp<4.0"
+      rm -rf "\${MODELOPT_OVERLAY}"
+      mv "\${TMP_MODELOPT_OVERLAY}" "\${MODELOPT_OVERLAY}"
+    fi
+
+    python - <<'PY'
+    import importlib.util
+    import modelexpress
+    import modelexpress.megatron_translator as mt
+    from modelopt.torch.quantization.utils import is_quantized
+    import megatron.core
+    import megatron.bridge
+    import mamba_ssm
+
+    try:
+        transformer_engine_spec = importlib.util.find_spec("transformer_engine.pytorch")
+    except ModuleNotFoundError:
+        transformer_engine_spec = None
+    if transformer_engine_spec is None:
+        raise RuntimeError("transformer_engine.pytorch is required for the Megatron Bridge path")
+    import transformer_engine.pytorch as te
+
+    print("modelexpress overlay:", modelexpress.__file__)
+    print("megatron translator:", mt.__file__)
+    print("modelopt is_quantized:", is_quantized)
+    print("megatron.core:", megatron.core.__file__)
+    print("megatron.bridge:", megatron.bridge.__file__)
+    print("transformer_engine.pytorch:", te.__file__)
+    print("mamba_ssm:", mamba_ssm.__file__)
+    PY
+
+    echo "[probe] Dynamo completion probe with recipe sampling: temperature=1.0 top_p=1.0 top_k=-1"
+    python - <<'PY'
+    import json
+    import urllib.request
+
+    url = "http://${user:}-dyn-nano-v2-mx-frontend.default.svc.cluster.local:8000/v1/completions"
+    payload = {
+        "model": "nvidia/NVIDIA-Nemotron-Nano-9B-v2",
+        "prompt": [0],
+        "max_tokens": 8,
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": -1,
+        "logprobs": 0,
+        "n": 1,
+        "return_tokens_as_token_ids": True,
+        "include_stop_str_in_output": True,
+        "nvext": {"extra_fields": ["completion_token_ids"]},
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=900) as resp:
+        body = json.loads(resp.read().decode("utf-8"))
+    print("[probe] status=ok completion_token_ids=", body.get("nvext", {}).get("completion_token_ids"))
+    PY
+
+    TIMESTAMP=$(date -u +%Y%m%d-%H%M%S-%N)
+    LOG_DIR=/mnt/rl-workspace/${user:}/driver_logs
+    LOG=\${LOG_DIR}/${user:}-nemotron-nano-v2-9b-dyn-mx-\${TIMESTAMP}.log
+    mkdir -p "\${LOG_DIR}"
+
+    PIPE=$(mktemp -u)
+    mkfifo "\${PIPE}"
+    tee "\${LOG}" < "\${PIPE}" &
+    TEE_PID=$!
+
+    RC=0
+    python -u examples/nemo_gym/run_grpo_nemo_gym.py \
+      --config infra/nrl_k8s/examples/k8s_exemplars/V5/grpo_workplace_assistant_nemotron_nano_v2_9b_dynamo_mx.yaml \
+      +policy.generation.dynamo_cfg.dgd_name=${user:}-dyn-nano-v2-mx \
+      > "\${PIPE}" 2>&1 || RC=$?
+
+    wait "\${TEE_PID}" || true
+    rm -f "\${PIPE}"
+    exit "\${RC}"
+
+kuberay:
+  training:
+    name: ${user:}-rc-nemotron-nano-v2-9b-dyn-mx
+    labels:
+      disagg.nemo-rl/cluster: nemotron-nano-v2-9b-dyn-mx
+      disagg.nemo-rl/run: nemotron-nano-v2-9b-dyn-mx
+      kai.scheduler/queue: backfill
+    spec:
+      rayVersion: "2.52.0"
+      headGroupSpec:
+        rayStartParams:
+          dashboard-host: "0.0.0.0"
+          no-monitor: "true"
+          num-gpus: "0"
+          object-store-memory: "200000000"
+        template:
+          spec:
+            schedulerName: kai-scheduler
+            dnsPolicy: ClusterFirst
+            nodeSelector: *head_node_selector
+            tolerations:
+              - operator: Exists
+            containers:
+              - name: ray-head
+                env: *shared_head_env
+                envFrom: *user_secret_env_from
+                resources: *head_resources
+                ports: *gpu_head_ports
+                volumeMounts: *code_mounts
+            volumes: *head_volumes
+      workerGroupSpecs:
+        - groupName: gpu-workers
+          replicas: 1
+          minReplicas: 1
+          maxReplicas: 1
+          numOfHosts: 1
+          rayStartParams:
+            num-gpus: "2"
+            object-store-memory: "200000000"
+          template:
+            spec:
+              schedulerName: kai-scheduler
+              dnsPolicy: ClusterFirst
+              nodeSelector: *worker_node_selector
+              tolerations:
+                - operator: Exists
+              resourceClaims:
+                - name: roce-channel
+                  resourceClaimTemplateName: roce-mx-trainer-nemotron-nano-v2-9b
+              containers:
+                - name: ray-worker
+                  env: *shared_worker_env
+                  envFrom: *user_secret_env_from
+                  resources: *gpu_worker_resources
+                  securityContext:
+                    capabilities:
+                      add: [IPC_LOCK]
+                  volumeMounts: *code_mounts
+              volumes: *worker_volumes
+
+dynamo:
+  serving:
+    manifest: ../../../examples_dgd/k8s_exemplars/V5/nemotron_nano_v2_9b_gb300_mx.yaml
+    name: ${user:}-dyn-nano-v2-mx
+    readyTimeoutS: 1800
