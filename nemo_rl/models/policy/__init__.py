@@ -302,8 +302,6 @@ class MegatronConfig(TypedDict):
     mtp_use_repeated_layer: NotRequired[bool]
     # When True, detach MTP heads from the main model so MTP loss does not affect main-model gradients.
     mtp_detach_heads: NotRequired[bool]
-    # When True, restrict the MTP loss mask to positive-advantage tokens (NeMo-RL training knob).
-    mtp_positive_only: NotRequired[bool]
     # When True, clear the RotaryEmbedding LRU cache and MoE token dispatcher
     # routing tensors in offload_before_refit (before weight transfer to the
     # inference engine). Useful when training and logprob runs use different
