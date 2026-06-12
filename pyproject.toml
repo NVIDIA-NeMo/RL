@@ -49,7 +49,7 @@ dependencies = [
   "sympy>=1.14.0",
   "pillow>=12.1.1",
   "torchvision==0.26.0",
-  "transformers==5.3.0",
+  "transformers>=5.5.0,<5.9.0",
   "num2words>=0.5.14",                                                                                                # for SmolVLM
   "mlflow>=3.12.0",
   "nvidia-nvshmem-cu13; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
@@ -116,7 +116,7 @@ automodel = [
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "flash-attn==2.8.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
-  "transformers>=5.3.0",
+  "transformers>=5.8.1,<5.9.0",
   "mamba-ssm",
   "causal-conv1d",
   "nv-grouped-gemm",
@@ -313,16 +313,15 @@ override-dependencies = [
   "setuptools>=80.10.2",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@7febc6e25660af0f54d95dd781ecdcd62265ecca ; platform_machine == 'x86_64'",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
-  # Override megatron-core's flashinfer~=0.5.0 constraint to allow both vllm and sglang (both use 0.6.8.post1)
-  "flashinfer-python>=0.5.0",
-  "flashinfer-cubin>=0.5.0",
+  # Override megatron-core's flashinfer~=0.5.0 constraint; pin to 0.6.12 because the
+  # workspace vLLM's MiniMax-M3 fused all-reduce path needs allreduce_fusion(weight_bias=...),
+  # added in flashinfer 0.6.12 (matches 3rdparty/vLLM-workspace/vllm/requirements/cuda.txt).
+  "flashinfer-python==0.6.12",
+  "flashinfer-cubin==0.6.12",
   # Override to >=4.4.1 so uv can resolve to a version satisfying both vllm and sglang.
   "nvidia-cutlass-dsl>=4.4.1",
   # Relax megatron-core workspace member's opentelemetry-api ceiling (<1.34) for protobuf 6.x compat with ray
   "opentelemetry-api>=1.33.1",
-  # vLLM 0.20.0 excludes transformers 5.0-5.5.0 but our codebase needs 5.3.0.
-  # Override so uv can resolve transformers==5.3.0 for non-vllm extras.
-  "transformers==5.3.0",
   # Override sglang's xgrammar==0.1.32 to address CVE GHSA-7rgv-gqhr-fxg3
   "xgrammar==0.1.33",
   # Override dependencies to address CVEs
@@ -456,7 +455,7 @@ name = "megatron-bridge"
 # Must stay in sync with 3rdparty/Megatron-Bridge-workspace/setup.py::CACHED_DEPENDENCIES.
 version = "0.0.0"
 requires-dist = [
-  "transformers>=5.0.0,<=5.3.0",
+  "transformers>=5.8.1,<5.9.0",
   "peft>=0.18.1",
   "datasets>=2.20.0",
   "accelerate",
