@@ -44,6 +44,7 @@ from nemo_rl.models.generation.vllm.utils import (
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 
 LOGGER = logging.getLogger(__name__)
 
@@ -112,7 +113,10 @@ class BaseVllmGenerationWorker:
             init_kwargs["seed"] = seed
             # Need to give each DP group its own vllm cache to address:
             # https://github.com/vllm-project/vllm/issues/18851
-            env_vars["VLLM_CACHE_ROOT"] = os.path.expanduser(f"~/.cache/vllm_{seed}")
+            env_vars["VLLM_CACHE_ROOT"] = (
+                os.environ.get("VLLM_CACHE_ROOT", os.path.expanduser("~/.cache/vllm"))
+                + f"_{seed}"
+            )
 
             # Give each vLLM engine a deterministic starting port for TP/DP
             # rendezvous.  vLLM's _get_open_port() reads VLLM_PORT and
@@ -155,6 +159,7 @@ class BaseVllmGenerationWorker:
         fraction_of_gpus: float = 1.0,
         seed: Optional[int] = None,
         extra_env_vars: Optional[list[str]] = None,
+        defer_model_load: bool = False,
     ):
         """Initialize a vLLM worker for distributed inference.
 
@@ -166,7 +171,29 @@ class BaseVllmGenerationWorker:
             seed: Random seed for initialization
             extra_env_vars: Additional environment variable names to forward into
                           the vLLM worker subprocess (e.g. for quantization configs).
+            defer_model_load: If True, skip model loading during init. Call
+                _load_model() later to perform the heavy model loading. This
+                enables overlapping vLLM model loading with NeMo Gym init.
         """
+        self._init_config(
+            config, bundle_indices, fraction_of_gpus, seed, extra_env_vars
+        )
+
+        if not self.is_model_owner:
+            return
+
+        if not defer_model_load:
+            self._load_model(bundle_indices, seed)
+
+    def _init_config(
+        self,
+        config: VllmConfig,
+        bundle_indices: Optional[list[int]],
+        fraction_of_gpus: float,
+        seed: Optional[int],
+        extra_env_vars: Optional[list[str]],
+    ):
+        """Lightweight config setup. No model loading, no heavy imports."""
         self.cfg = config
         self.model_name = self.cfg["model_name"]
         self.tensor_parallel_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
@@ -177,9 +204,12 @@ class BaseVllmGenerationWorker:
         self.precision = self.cfg["vllm_cfg"]["precision"]
         self.fraction_of_gpus = fraction_of_gpus
         self.is_model_owner = bundle_indices is not None
+        self._extra_env_vars = extra_env_vars
 
         # Store the Python executable being used by this worker
         self.py_executable = sys.executable
+
+        self._apply_vllm_patches()
 
         # Skip model loading if we're not the model owner
         if not self.is_model_owner:
@@ -194,10 +224,15 @@ class BaseVllmGenerationWorker:
         self.rank = 0
         self.world_size = 1
 
-        # Monkey patches for vLLM behavior. We avoid importing vllm modules
-        # here to prevent side effects during initialization and instead
-        # locate the files via importlib metadata.
+    def _apply_vllm_patches(self):
+        """Apply file-on-disk patches to vLLM source files.
 
+        These patches are idempotent (check before writing) and applied early
+        during ``_init_config`` so that **all** workers -- including non-model
+        owners -- see the patched files before any vLLM import. We avoid
+        importing vllm modules here to prevent side effects during
+        initialization and instead locate the files via importlib metadata.
+        """
         from vllm.logger import init_logger
 
         logger = init_logger("vllm_patch")
@@ -282,7 +317,7 @@ class BaseVllmGenerationWorker:
                 'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"}',
             ]
             extra_env_str = ", ".join(
-                [f'"{env_var}"' for env_var in (extra_env_vars or [])]
+                [f'"{env_var}"' for env_var in (self._extra_env_vars or [])]
             )
 
             new_lines = [
@@ -476,6 +511,19 @@ class BaseVllmGenerationWorker:
 
         _patch_vllm_llama_eagle3_own_lm_head()
         _patch_vllm_hermes_tool_parser_thread_safety()
+        log_gpu_memory_diagnostics(
+            label="load_model_start", worker_type="VllmGenerationWorker"
+        )
+
+    def _load_model(self, bundle_indices, seed):
+        """Perform the heavy model loading and engine creation.
+
+        Split out from __init__ so it can be deferred (defer_model_load=True)
+        and run after ports are reserved, overlapping with NeMo Gym init.
+        """
+        from vllm.logger import init_logger
+
+        logger = init_logger("vllm_load_model")
 
         try:
             import vllm
@@ -626,10 +674,16 @@ class BaseVllmGenerationWorker:
         )
 
         self._create_engine(llm_kwargs)
+        log_gpu_memory_diagnostics(
+            label="after_engine_create", worker_type="VllmGenerationWorker", device_id=0
+        )
 
         # will be initialized in post_init
         # used in update_weights_from_ipc_handles
         self.vllm_device_ids = None
+        log_gpu_memory_diagnostics(
+            label="load_model_complete", worker_type="VllmGenerationWorker", device_id=0
+        )
 
     def llm(self):
         return self.llm
@@ -800,7 +854,8 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         assert self.llm is not None, (
             "Attempting to generate with either an uninitialized vLLM or non-model-owner"
         )
-        outputs = self.llm.generate(prompts, sampling_params)
+        use_tqdm = self.cfg["vllm_cfg"].get("use_tqdm", True)
+        outputs = self.llm.generate(prompts, sampling_params, use_tqdm=use_tqdm)
 
         # Process the outputs - but preserve the original input padding structure
         output_ids_list = []
@@ -993,7 +1048,8 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         assert self.llm is not None, (
             "Attempting to generate with either an uninitialized vLLM or non-model-owner"
         )
-        outputs = self.llm.generate(data["prompts"], sampling_params)
+        use_tqdm = self.cfg["vllm_cfg"].get("use_tqdm", True)
+        outputs = self.llm.generate(data["prompts"], sampling_params, use_tqdm=use_tqdm)
         texts = [output.outputs[0].text for output in outputs]
 
         # Convert to BatchedDataDict

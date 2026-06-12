@@ -65,7 +65,7 @@ def test_D1_unpacked_path_filters_invalid_rows(mixed_arrow_file):
         text_key="text",
         characters_per_sample=None,
     )
-    texts = [row["text"] for row in ds.dataset]
+    texts = [row["messages"][0]["content"] for row in ds.dataset]
     # 3 valid rows total; empty string and None must be dropped.
     assert "" not in texts
     assert None not in texts
@@ -90,7 +90,7 @@ def test_D1_packed_path_filters_invalid_rows(mixed_arrow_file):
         text_key="text",
         characters_per_sample=10,
     )
-    texts = [row["text"] for row in ds.dataset]
+    texts = [row["messages"][0]["content"] for row in ds.dataset]
     # Each packed sample is a join of valid rows, but no packed sample
     # should be empty or None.
     assert all(isinstance(t, str) and t for t in texts), (
@@ -117,8 +117,8 @@ def test_D1_packed_unpacked_emit_same_valid_row_set(mixed_arrow_file):
         text_key="text",
         characters_per_sample=10,
     )
-    unpacked_texts = {row["text"] for row in ds_unpacked.dataset}
-    packed_blob = "\n".join(row["text"] for row in ds_packed.dataset)
+    unpacked_texts = {row["messages"][0]["content"] for row in ds_unpacked.dataset}
+    packed_blob = "\n".join(row["messages"][0]["content"] for row in ds_packed.dataset)
 
     for t in unpacked_texts:
         assert t in packed_blob, (
@@ -167,11 +167,9 @@ class TestPackGenerator:
         rows = [{"text": "aaaa"}, {"text": "bbbb"}, {"text": "cccc"}]
         packs = _packs_from(rows, chars=10)
         assert len(packs) == 1
-        # Pack contains all three texts joined by newline.
-        assert packs[0]["text"] == "aaaa\nbbbb\ncccc"
         # task_name forwarded into the emitted dict.
         assert packs[0]["task_name"] == "kd"
-        # `messages` schema mirrors the source contract.
+        # `messages` carries the packed text as a single assistant message.
         assert packs[0]["messages"] == [
             {"role": "assistant", "content": "aaaa\nbbbb\ncccc"}
         ]
@@ -184,8 +182,8 @@ class TestPackGenerator:
         rows = [{"text": "x" * 100}, {"text": "y" * 100}]
         packs = _packs_from(rows, chars=10)
         assert len(packs) == 2
-        assert len(packs[0]["text"]) == 100
-        assert len(packs[1]["text"]) == 100
+        assert len(packs[0]["messages"][0]["content"]) == 100
+        assert len(packs[1]["messages"][0]["content"]) == 100
 
     def test_long_row_not_truncated(self):
         # A single row of 10k chars, threshold 10 → one pack containing
@@ -193,7 +191,7 @@ class TestPackGenerator:
         rows = [{"text": "z" * 10_000}]
         packs = _packs_from(rows, chars=10)
         assert len(packs) == 1
-        assert len(packs[0]["text"]) == 10_000
+        assert len(packs[0]["messages"][0]["content"]) == 10_000
 
     def test_trailing_partial_pack_emitted(self):
         # Three rows of 2 chars each (n=6 total) with threshold 10 — no
@@ -203,7 +201,7 @@ class TestPackGenerator:
         rows = [{"text": "ab"}, {"text": "cd"}, {"text": "ef"}]
         packs = _packs_from(rows, chars=10)
         assert len(packs) == 1
-        assert packs[0]["text"] == "ab\ncd\nef"
+        assert packs[0]["messages"][0]["content"] == "ab\ncd\nef"
 
     def test_zero_rows_emits_zero_packs(self):
         # Truly empty input (no rows at all) → no packs, no raise.
@@ -220,7 +218,7 @@ class TestPackGenerator:
         # Exactly one trailing partial pack, containing only the join
         # separator(s).
         assert len(packs) == 1
-        assert packs[0]["text"] == "\n"
+        assert packs[0]["messages"][0]["content"] == "\n"
 
     def test_schema_version_does_not_change_output(self):
         # `schema_version` is `del`'d inside the function and only

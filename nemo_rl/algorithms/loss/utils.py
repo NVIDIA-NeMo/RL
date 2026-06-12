@@ -24,7 +24,7 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
-    _get_packed_thd_tokens_on_this_cp_rank,
+    _get_tokens_on_this_cp_rank,
     from_parallel_logits_to_logprobs_packed_sequences,
     get_distillation_topk_logprobs_from_logits,
     get_next_token_logprobs_from_logits,
@@ -80,7 +80,6 @@ def prepare_loss_input(
                 vocab_parallel_group=vocab_parallel_group,
                 context_parallel_group=context_parallel_group,
                 sampling_params=sampling_params,
-                cu_seqlens_padded=data.get("_packed_cp_cu_seqlens_padded", None),
             )
 
         # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
@@ -103,7 +102,6 @@ def prepare_loss_input(
                     vocab_parallel_group=vocab_parallel_group,
                     context_parallel_group=context_parallel_group,
                     sampling_params=None,  # no filtering
-                    cu_seqlens_padded=data.get("_packed_cp_cu_seqlens_padded", None),
                 )
 
         loss_input = {"next_token_logprobs": logprobs}
@@ -211,7 +209,7 @@ def _pack_input_ids(
             next-token prediction.
     """
     batch_size = input_ids.shape[0]
-    total_packed_len = int(cu_seqlens_q_padded[-1].item())
+    total_packed_len = int(cu_seqlens_q_padded[-1].item()) // cp_size
     packed = torch.zeros(
         total_packed_len, dtype=input_ids.dtype, device=input_ids.device
     )
@@ -223,15 +221,11 @@ def _pack_input_ids(
         seq[:actual_len] = input_ids[i, :actual_len]
         if roll_shift != 0:
             seq = seq.roll(shifts=roll_shift, dims=0)
-        packed[packed_start : packed_start + padded_len] = seq
-
-    return _get_packed_thd_tokens_on_this_cp_rank(
-        packed.unsqueeze(0),
-        cu_seqlens_q_padded,
-        cp_rank,
-        cp_size,
-        seq_dim=1,
-    )
+        sharded = _get_tokens_on_this_cp_rank(seq, cp_rank, cp_size, seq_dim=0)
+        packed[packed_start // cp_size : (packed_start + padded_len) // cp_size] = (
+            sharded
+        )
+    return packed.unsqueeze(0)
 
 
 def prepare_packed_loss_input(

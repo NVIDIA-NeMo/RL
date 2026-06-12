@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import copy
 import gc
 import os
 import re
@@ -42,6 +43,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.utils import get_model_config
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
@@ -93,6 +95,7 @@ from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 from nemo_rl.utils.r3_trace import maybe_r3_trace_stage
 
@@ -117,6 +120,23 @@ def _should_use_router_replay(
         "stopped carrying routed_experts. Reference-logprob intentionally skips "
         "routed_experts; prev-logprob and train must not."
     )
+
+
+def _model_self_packs_for_cp(model: Any) -> bool:
+    """Whether the model packs sequences + CP-shards inside its own forward.
+
+    Such models (mbridge VLM wrappers) call ``preprocess_packed_seqs`` in their
+    forward, so NeMo-RL must hand them an unpacked ``[B, S]`` batch instead of
+    pre-packing + CP-sharding itself. The only such model today is mbridge's
+    Qwen3VL, which is also the only mbridge VLM that supports context
+    parallelism; classic mcore GPTModel and other VLMs do not self-pack.
+    """
+    from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
+    from megatron.core.utils import unwrap_model
+
+    unwrapped = unwrap_model(model)
+    chunks = unwrapped if isinstance(unwrapped, (list, tuple)) else [unwrapped]
+    return any(isinstance(chunk, Qwen3VLModel) for chunk in chunks)
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
@@ -207,6 +227,10 @@ class MegatronPolicyWorkerImpl(
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
+        log_gpu_memory_diagnostics(
+            label="init_start", worker_type="MegatronPolicyWorker"
+        )
+
         # Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files
         apply_transformer_engine_patch()
 
@@ -218,6 +242,9 @@ class MegatronPolicyWorkerImpl(
 
         # Step 1: Setup distributed
         setup_distributed()
+        log_gpu_memory_diagnostics(
+            label="after_nccl_init", worker_type="MegatronPolicyWorker"
+        )
 
         # Step 2: Validate and setup model paths
         hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(
@@ -235,6 +262,9 @@ class MegatronPolicyWorkerImpl(
             pt_checkpoint_exists,
             model_post_wrap_hook=getattr(self, "_model_import_post_wrap_hook", None),
             transformer_layer_spec=getattr(self, "_transformer_layer_spec", None),
+        )
+        log_gpu_memory_diagnostics(
+            label="after_hf_import", worker_type="MegatronPolicyWorker"
         )
 
         # Store tokenizer
@@ -287,10 +317,13 @@ class MegatronPolicyWorkerImpl(
         self.checkpointing_context = model_and_optimizer_state.checkpointing_context
         param_sync_func = model_and_optimizer_state.param_sync_func
         self.draft_model = model_and_optimizer_state.draft_model
+        log_gpu_memory_diagnostics(
+            label="after_model_setup", worker_type="MegatronPolicyWorker"
+        )
 
         # Set the param sync function for the model if needed
         if param_sync_func is not None:
-            self.megatron_cfg.param_sync_func = param_sync_func
+            get_model_config(self.model).param_sync_func = param_sync_func
 
         # Step 5: Setup reference model if needed
         if init_reference_model:
@@ -304,6 +337,9 @@ class MegatronPolicyWorkerImpl(
                 ),
             )
             self.model = self.move_model(self.model, "cuda")
+            log_gpu_memory_diagnostics(
+                label="after_ref_model", worker_type="MegatronPolicyWorker"
+            )
 
         # Step 6: Finalize setup
         (
@@ -319,6 +355,15 @@ class MegatronPolicyWorkerImpl(
             self.model,
             self.optimizer,
         )
+        self._first_train_step_forward_pre_hook_disabled = False
+        self._first_train_step_param_sync_func = None
+        if self.should_disable_forward_pre_hook and self._forward_pre_hook_enabled():
+            self._disable_forward_pre_hook_until_next_train_step()
+
+        # Whether the model packs sequences + CP-shards inside its own forward
+        # (mbridge VLM wrappers like Qwen3VL). If so, NeMo-RL must hand it an
+        # unpacked [B, S] batch rather than pre-packing + CP-sharding itself.
+        self.delegate_pack_to_model = _model_self_packs_for_cp(self.model)
 
         # vars used for refit
         ## will be initialized in prepare_refit_info
@@ -333,13 +378,82 @@ class MegatronPolicyWorkerImpl(
         ## used for streaming update inference engine weights
         self._held_gather_buffer = None
 
+        log_gpu_memory_diagnostics(
+            label="init_complete", worker_type="MegatronPolicyWorker"
+        )
+
     def enable_forward_pre_hook(self):
         assert isinstance(self.model, DistributedDataParallel)
-        self.model.enable_forward_pre_hook()
+        if not self._forward_pre_hook_enabled():
+            self.model.enable_forward_pre_hook()
 
     def disable_forward_pre_hook(self, param_sync=True):
         assert isinstance(self.model, DistributedDataParallel)
+        if not self._forward_pre_hook_enabled():
+            return
+        if param_sync:
+            self._copy_main_params_to_param_buffer(zero_grad_buffer=True)
         self.model.disable_forward_pre_hook(param_sync=param_sync)
+
+    def _forward_pre_hook_enabled(self) -> bool:
+        if not isinstance(self.model, DistributedDataParallel):
+            return False
+        return len(getattr(self.model, "remove_forward_pre_hook_handles", {})) > 0
+
+    def _disable_forward_pre_hook_until_next_train_step(self) -> None:
+        assert isinstance(self.model, DistributedDataParallel)
+        if self._forward_pre_hook_enabled():
+            self.model.disable_forward_pre_hook(param_sync=False)
+        model_config = get_model_config(self.model)
+        self._first_train_step_param_sync_func = model_config.param_sync_func
+        model_config.param_sync_func = None
+        self._first_train_step_forward_pre_hook_disabled = True
+
+    def _copy_main_params_to_param_buffer(self, zero_grad_buffer: bool = False) -> None:
+        if not isinstance(self.model, DistributedDataParallel):
+            return
+
+        if not self._uses_mxfp8_overlap_shared_param_buffer():
+            return
+
+        if not self._forward_pre_hook_enabled():
+            return
+
+        if zero_grad_buffer:
+            self.model.zero_grad_buffer()
+
+        optimizers = (
+            self.optimizer.chained_optimizers
+            if isinstance(self.optimizer, ChainedOptimizer)
+            else [self.optimizer]
+        )
+        for optim_instance in optimizers:
+            if hasattr(optim_instance, "_copy_main_params_to_param_buffer"):
+                optim_instance._copy_main_params_to_param_buffer()
+
+    def _uses_mxfp8_overlap_shared_param_buffer(self) -> bool:
+        return getattr(
+            self.megatron_cfg.optimizer, "reuse_grad_buf_for_mxfp8_param_ag", False
+        ) and getattr(self.megatron_cfg.ddp, "overlap_param_gather", False)
+
+    def _get_model_extra_state_dict(self) -> dict[str, Any]:
+        fp8_enabled = self.fp8_cfg and self.fp8_cfg.get("enabled", False)
+        if not fp8_enabled:
+            return {}
+        extra_state = {}
+        for key, value in self.model.state_dict().items():
+            if "._extra_state" not in key:
+                continue
+            if isinstance(value, torch.Tensor):
+                extra_state[key] = value.detach().clone()
+            else:
+                extra_state[key] = copy.deepcopy(value)
+        return extra_state
+
+    def _restore_model_extra_state_dict(self, extra_state: dict[str, Any]) -> None:
+        if not extra_state:
+            return
+        self.model.load_state_dict(extra_state, strict=False)
 
     @wrap_with_nvtx_name("megatron_policy_worker/train")
     def train(
@@ -390,10 +504,19 @@ class MegatronPolicyWorkerImpl(
         if eval_mode:
             ctx: AbstractContextManager[Any] = torch.no_grad()
             self.model.eval()
+            saved_extra_state = self._get_model_extra_state_dict()
+            reenable_forward_pre_hook_after_eval = (
+                self.should_disable_forward_pre_hook
+                and self._forward_pre_hook_enabled()
+            )
+            if reenable_forward_pre_hook_after_eval:
+                self.disable_forward_pre_hook()
         else:
             ctx = nullcontext()
             # Ensure model is in training mode
             self.model.train()
+            saved_extra_state = None
+            reenable_forward_pre_hook_after_eval = False
 
         with ctx:
             all_mb_metrics = []
@@ -422,6 +545,7 @@ class MegatronPolicyWorkerImpl(
                     self.cfg,
                     mbs,
                     straggler_timer=self.mcore_state.straggler_timer,
+                    delegate_pack_to_model=self.delegate_pack_to_model,
                 )
                 # Track total microbatches for MoE aux-loss averaging
                 total_num_microbatches += int(num_microbatches)
@@ -436,9 +560,15 @@ class MegatronPolicyWorkerImpl(
 
                 rerun_state_machine = get_rerun_state_machine()
                 while rerun_state_machine.should_run_forward_backward(data_iterator):
-                    # Set grad to zero.
-                    self.model.zero_grad_buffer()
-                    self.optimizer.zero_grad()
+                    # Set grad to zero. For MXFP8 overlap eval, the param and
+                    # grad buffers are shared and pre-hooks are disabled above.
+                    # Avoid zeroing the shared param buffer before forward-only eval.
+                    if not (
+                        eval_mode and self._uses_mxfp8_overlap_shared_param_buffer()
+                    ):
+                        self.model.zero_grad_buffer()
+                        self.optimizer.zero_grad()
+                        self._copy_main_params_to_param_buffer()
 
                     # Forward pass.
                     draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
@@ -498,6 +628,17 @@ class MegatronPolicyWorkerImpl(
                 num_zeros_in_grad: float = reduce_max_stat_across_model_parallel_group(
                     num_zeros_in_grad, mp_group=pg_collection.mp
                 )
+                if (
+                    not eval_mode
+                    and self._first_train_step_forward_pre_hook_disabled
+                    and update_successful
+                ):
+                    self.enable_forward_pre_hook()
+                    get_model_config(
+                        self.model
+                    ).param_sync_func = self._first_train_step_param_sync_func
+                    self._first_train_step_param_sync_func = None
+                    self._first_train_step_forward_pre_hook_disabled = False
 
                 # Empty unused memory.
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 2:
@@ -536,10 +677,20 @@ class MegatronPolicyWorkerImpl(
                 all_mb_metrics.extend(gb_loss_metrics)
                 losses.append(torch.tensor(mb_losses).sum().item())
 
+        if saved_extra_state is not None:
+            self._restore_model_extra_state_dict(saved_extra_state)
+        if reenable_forward_pre_hook_after_eval:
+            # A forced param sync leaves the next training step with no pending
+            # param AG to finish. Keep hooks disabled for that one step so grad
+            # accumulation starts from a clean shared param/grad buffer.
+            self._disable_forward_pre_hook_until_next_train_step()
+
         if not eval_mode:
-            # take one LR step every rollout batch
-            # we need to scale the step by gbs to counteract the fact that NeMo automatically
-            # scales lr_warmup_steps by gbs during init
+            # Step LR scheduler once per train() call, not per global batch.
+            # Megatron's OptimizerParamScheduler.step takes an `increment` in
+            # samples: NeMo init scales lr_warmup_steps by gbs internally, so
+            # passing increment=gbs cancels that scaling and one tick == one
+            # train() call regardless of batch size.
             self.scheduler.step(increment=gbs)
 
         # Aggregate metrics across all microbatches
@@ -632,6 +783,7 @@ class MegatronPolicyWorkerImpl(
             self.cfg,
             logprob_batch_size,
             straggler_timer=self.mcore_state.straggler_timer,
+            delegate_pack_to_model=self.delegate_pack_to_model,
         )
 
         use_linear_ce_fusion = self.cfg["megatron_cfg"].get(
@@ -845,6 +997,7 @@ class MegatronPolicyWorkerImpl(
             self.cfg,
             logprob_batch_size,
             straggler_timer=self.mcore_state.straggler_timer,
+            delegate_pack_to_model=self.delegate_pack_to_model,
         )
 
         list_of_outputs = megatron_forward_backward(
@@ -1312,6 +1465,40 @@ class MegatronPolicyWorkerImpl(
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
             torch.cuda.empty_cache()
 
+    def finish_inference(self) -> None:
+        """Offload model params to CPU after inference."""
+        self.model = self.move_model(
+            self.model, "cpu", move_params=True, move_grads=False
+        )
+        self.model.eval()
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def _clear_fp8_caches(self):
+        """Clear FP8 workspace caches and release fragmented GPU memory.
+
+        The main memory issue in the train→offload→refit→generate cycle is CUDA
+        allocator fragmentation, not leaked FP8 tensors. This method clears
+        per-module _fp8_workspaces buffers (scratch memory references). The
+        caller is responsible for running gc.collect() + empty_cache() once
+        all references have been dropped.
+
+        For anti-fragmentation, configure PYTORCH_CUDA_ALLOC_CONF in the recipe YAML:
+        - "max_split_size_mb:512" — fast, prevents large-block splitting
+        - "expandable_segments:True" — most effective but ~5x slower weight transfer
+        """
+        # 1. Clear Transformer Engine workspaces
+        workspace_count = 0
+        for module in self.model.modules():
+            if hasattr(module, "_fp8_workspaces"):
+                module._fp8_workspaces.clear()
+                workspace_count += 1
+
+        print(
+            f"[_clear_fp8_caches] Cleared {workspace_count} workspace modules on rank {self.rank}"
+        )
+
     @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
     def offload_before_refit(self):
         """Offload the optimizer and buffers to the CPU."""
@@ -1325,6 +1512,65 @@ class MegatronPolicyWorkerImpl(
         self.model = self.move_model(
             self.model, "cpu", move_params=False, move_grads=True
         )  # get rid of grad buffers
+
+        # When True, clear Transformer Engine's per-module _fp8_workspaces scratch
+        # buffers in offload_before_refit (before weight transfer to the inference
+        # engine).
+        if self.fp8_cfg and self.fp8_cfg.get("force_clear_fp8_caches", False):
+            self._clear_fp8_caches()
+
+        if self.cfg["megatron_cfg"].get("clear_memory_caches_before_refit", False):
+            # Clear RotaryEmbedding's @lru_cache(maxsize=32). The cache accumulates one
+            # entry per unique (max_seq_len, offset, packed_seq) seen, and each entry is
+            # a GPU tensor (the concatenated sin/cos embedding). With training + logprob
+            # runs at different sequence lengths, the cache fills quickly and the tensors
+            # anchor large CUDA segments.
+            try:
+                from megatron.core.models.common.embeddings.rotary_pos_embedding import (
+                    RotaryEmbedding,
+                )
+
+                RotaryEmbedding.forward.cache_clear()
+            except Exception:
+                pass
+
+            # Clear MoE token dispatcher persistent routing tensors.
+            #
+            # MoETokenDispatcher is a plain Python class (NOT an nn.Module), so iterating
+            # self.model.modules() never yields it. We must access it via the token_dispatcher
+            # attribute on MoELayer nn.Module objects.
+            #
+            # When recompute_mlp=True and fp8=True,
+            # transformer_layer._forward_mlp wraps self.mlp (the MoE layer) with te_checkpoint.
+            # te_checkpoint._CheckpointFunction.backward recomputes the forward with
+            # torch.enable_grad(), which causes dispatch_preprocess to store
+            #   dispatcher.probs = routing_probs   (with grad_fn, under enable_grad)
+            # This creates a reference cycle:
+            #   _CheckpointFunctionBackward → ctx → ctx.run_function=mlp
+            #   → mlp.token_dispatcher.probs → probs.grad_fn → ... → _CheckpointFunctionBackward
+            #
+            # Breaking this cycle by nulling dispatcher.probs frees BOTH:
+            #   - the routing tensors
+            #   - the te_checkpoint ctx saved tensors
+            try:
+                for module in self.model.modules():
+                    if not hasattr(module, "token_dispatcher"):
+                        continue
+                    dispatcher = module.token_dispatcher
+                    if dispatcher is None:
+                        continue
+                    for attr in (
+                        "probs",  # AllToAll + AllGather
+                        "routing_map",  # AllToAll
+                        "reversed_local_input_permutation_mapping",  # AllToAll
+                        "local_probs",  # AllGather
+                        "local_map",  # AllGather
+                    ):
+                        if isinstance(getattr(dispatcher, attr, None), torch.Tensor):
+                            setattr(dispatcher, attr, None)
+            except Exception:
+                pass
+
         torch.randn(1).cuda()  # wake up torch allocator
         if (
             hasattr(self, "optimizer")
