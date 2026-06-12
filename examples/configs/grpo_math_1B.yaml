@@ -181,6 +181,16 @@ policy:
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
+    # Multi-Token Prediction (MTP). mtp_num_layers=0 disables MTP.
+    mtp_num_layers: 0
+    # MTP loss weight added to the main next-token loss (0.0 disables the MTP loss contribution).
+    mtp_loss_scaling_factor: 0.0
+    # When true, repeat one MTP layer mtp_num_layers times instead of using distinct layers.
+    mtp_use_repeated_layer: false
+    # When true, detach MTP heads so MTP loss does not affect main-model gradients.
+    mtp_detach_heads: false
+    # When true, restrict the MTP loss mask to positive-advantage tokens.
+    mtp_positive_only: false
     gradient_accumulation_fusion: false
 
     peft:
