@@ -139,6 +139,12 @@ class MegatronGenerationMixin:
         if logging_step_interval is None:
             logging_step_interval = 0
 
+        # flashinfer's fused-RoPE kernel only dispatches fp16/bf16 q/k.
+        use_flashinfer_fused_rope = self.model.config.params_dtype in (
+            torch.float16,
+            torch.bfloat16,
+        )
+
         inference_config = InferenceConfig(
             block_size_tokens=block_size_tokens,
             buffer_size_gb=buffer_size_gb,
@@ -148,7 +154,7 @@ class MegatronGenerationMixin:
             kv_cache_management_mode=KVCacheManagementMode(kv_cache_management_mode),
             static_kv_memory_pointers=needs_static_kv_pointers,
             use_cuda_graphs_for_non_decode_steps=use_cuda_graphs_for_non_decode_steps,
-            use_flashinfer_fused_rope=True,
+            use_flashinfer_fused_rope=use_flashinfer_fused_rope,
             sampling_backend="flashinfer",
             use_synchronous_zmq_collectives=True,
             materialize_only_last_token_logits=materialize_only_last_token_logits,
@@ -427,7 +433,7 @@ class MegatronGenerationMixin:
             temperature=self.cfg["generation"]["temperature"] if not greedy else 0,
             top_k=top_k_val,
             top_p=top_p_val,
-            skip_prompt_log_probs=False,
+            skip_prompt_log_probs=True,
             return_log_probs=True,
             num_tokens_to_generate=self.cfg["generation"]["max_new_tokens"],
             termination_id=self.megatron_tokenizer.eod,
@@ -513,18 +519,20 @@ class MegatronGenerationMixin:
         )
         for i in range(batch_size):
             tokens = result[i].prompt_tokens.tolist() + result[i].generated_tokens
-            logprobs = result[i].prompt_log_probs + result[i].generated_log_probs
             seq_len = len(tokens)
             output_ids_padded[i, :seq_len] = torch.tensor(
                 tokens, dtype=torch.long, device=input_ids.device
             )
-            generation_lengths[i] = seq_len - input_lengths[i].item()
+            prompt_len = input_lengths[i].item()
+            generation_lengths[i] = seq_len - prompt_len
             unpadded_sequence_lengths[i] = seq_len
-            logprob_len = len(logprobs)
-            logprobs_padded[i, 1 : logprob_len + 1] = torch.tensor(
-                logprobs,
-                dtype=torch.float,
-                device=input_ids.device,
+            gen_logprobs = result[i].generated_log_probs
+            logprobs_padded[i, prompt_len : prompt_len + len(gen_logprobs)] = (
+                torch.tensor(
+                    gen_logprobs,
+                    dtype=torch.float,
+                    device=input_ids.device,
+                )
             )
 
         out_dict = {
