@@ -36,13 +36,13 @@ loss_fn:
   token_level_loss: true
 checkpointing:
   enabled: true
-  checkpoint_dir: results/grpo-m3-32n8g-non-colocated-adamW
+  checkpoint_dir: results/grpo-minimax-m3-32n8g-non-colocated
   keep_top_k: 2
   save_period: 5
   checkpoint_must_save_by: "00:03:45:00"
   save_optimizer: true
 policy:
-  model_name: /apps/models/minimax-m3-bf16_vv1
+  model_name: MiniMaxAI/MiniMax-M3
   hf_config_overrides:
     text_config:
       num_mtp_modules: 0
@@ -127,7 +127,7 @@ logger:
   tensorboard_enabled: false
   wandb:
     project: nemorl-m3
-    name: grpo-m3-32n8g-non-colocated-adamW
+    name: grpo-minimax-m3-32n8g-non-colocated
 cluster:
   gpus_per_node: 8
   num_nodes: 32
