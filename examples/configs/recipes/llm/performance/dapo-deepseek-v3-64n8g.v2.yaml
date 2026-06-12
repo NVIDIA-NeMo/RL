@@ -43,6 +43,7 @@ policy:
   megatron_cfg:
     empty_unused_memory_level: 2
     enabled: true
+    use_gloo_process_groups: false
     activation_checkpointing: true
     moe_grouped_gemm: true
     tensor_model_parallel_size: 8

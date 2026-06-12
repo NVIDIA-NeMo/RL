@@ -21,6 +21,7 @@ policy:
   optimizer: null
   megatron_cfg:
     enabled: true
+    use_gloo_process_groups: false
     tensor_model_parallel_size: 2
     pipeline_model_parallel_size: 2
     optimizer:

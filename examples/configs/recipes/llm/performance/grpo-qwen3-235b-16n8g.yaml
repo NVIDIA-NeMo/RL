@@ -24,6 +24,7 @@ policy:
     enabled: false
   megatron_cfg:
     enabled: true
+    use_gloo_process_groups: false
     empty_unused_memory_level: 1
     tensor_model_parallel_size: 2
     sequence_parallel: true

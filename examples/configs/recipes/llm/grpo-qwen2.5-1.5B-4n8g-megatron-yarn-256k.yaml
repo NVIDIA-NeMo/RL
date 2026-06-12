@@ -11,6 +11,7 @@ policy:
   max_total_sequence_length: 262144
   make_sequence_length_divisible_by: 64
   megatron_cfg:
+    use_gloo_process_groups: false
     context_parallel_size: 32
   hf_config_overrides:
     rope_scaling:
