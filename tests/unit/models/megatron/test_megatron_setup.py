@@ -903,6 +903,7 @@ class TestApplyPerformanceConfig:
                 "apply_rope_fusion": True,
                 "bias_activation_fusion": True,
                 "gradient_accumulation_fusion": False,
+                "use_fused_weighted_squared_relu": False,
             }
         }
 
@@ -924,6 +925,7 @@ class TestApplyPerformanceConfig:
                 "apply_rope_fusion": False,
                 "bias_activation_fusion": False,
                 "gradient_accumulation_fusion": False,
+                "use_fused_weighted_squared_relu": False,
             }
         }
 
@@ -946,6 +948,7 @@ class TestApplyPerformanceConfig:
                 "apply_rope_fusion": False,
                 "bias_activation_fusion": False,
                 "gradient_accumulation_fusion": False,
+                "use_fused_weighted_squared_relu": False,
             }
         }
 
@@ -966,6 +969,7 @@ class TestApplyPerformanceConfig:
                 "apply_rope_fusion": False,
                 "bias_activation_fusion": False,
                 "gradient_accumulation_fusion": False,
+                "use_fused_weighted_squared_relu": False,
                 "fp8_cfg": {
                     "enabled": True,
                     "fp8": "e4m3",
@@ -993,6 +997,7 @@ class TestApplyPerformanceConfig:
                 "apply_rope_fusion": False,
                 "bias_activation_fusion": False,
                 "gradient_accumulation_fusion": False,
+                "use_fused_weighted_squared_relu": False,
                 "fp8_cfg": {
                     "enabled": True,
                     "fp8": "e4m3",
@@ -1018,6 +1023,7 @@ class TestApplyPerformanceConfig:
                 "apply_rope_fusion": False,
                 "bias_activation_fusion": False,
                 "gradient_accumulation_fusion": False,
+                "use_fused_weighted_squared_relu": False,
             }
         }
 
@@ -1042,6 +1048,7 @@ class TestApplyPerformanceConfig:
                 "apply_rope_fusion": False,
                 "bias_activation_fusion": False,
                 "gradient_accumulation_fusion": False,
+                "use_fused_weighted_squared_relu": False,
             }
         }
 
@@ -1063,6 +1070,7 @@ class TestApplyPerformanceConfig:
                 "apply_rope_fusion": False,
                 "bias_activation_fusion": False,
                 "gradient_accumulation_fusion": False,
+                "use_fused_weighted_squared_relu": False,
             }
         }
 
@@ -1086,6 +1094,7 @@ class TestApplyPerformanceConfig:
                 "apply_rope_fusion": False,
                 "bias_activation_fusion": False,
                 "gradient_accumulation_fusion": False,
+                "use_fused_weighted_squared_relu": False,
             }
         }
 

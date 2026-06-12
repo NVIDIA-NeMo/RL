@@ -222,6 +222,7 @@ def setup_configs(args, tokenizer):
             "freeze_moe_router": False,
             "apply_rope_fusion": False,
             "gradient_accumulation_fusion": False,
+            "use_fused_weighted_squared_relu": False,
             "optimizer": {
                 "optimizer": "adam",
                 "lr": 5.0e-6,
