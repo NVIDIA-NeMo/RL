@@ -35,6 +35,9 @@ policy:
     _v2: false
     context_parallel_size: 4
   megatron_cfg:
+    checkpoint:
+      async_save: true
+      ckpt_assume_constant_structure: true
     tensor_model_parallel_size: 4
     pipeline_model_parallel_size: 2
     context_parallel_size: 2

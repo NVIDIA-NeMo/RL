@@ -30,6 +30,9 @@ policy:
   sequence_packing:
     enabled: true
   megatron_cfg:
+    checkpoint:
+      async_save: true
+      ckpt_assume_constant_structure: true
     # CUDA13/vLLM0.20 image: TE cuDNN fused-attn sublibrary fails to load at
     # runtime; force flash-attn backend (pre-baked) so MCore skips the cuDNN
     # fused path. setup.py clears NVTE_* env vars when this is set.

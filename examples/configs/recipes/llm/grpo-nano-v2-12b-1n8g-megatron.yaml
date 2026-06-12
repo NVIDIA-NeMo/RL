@@ -10,6 +10,9 @@ policy:
   optimizer: null
   megatron_cfg:
     enabled: true
+    checkpoint:
+      async_save: true
+      ckpt_assume_constant_structure: true
     bias_activation_fusion: false
     tensor_model_parallel_size: 8
   dtensor_cfg:

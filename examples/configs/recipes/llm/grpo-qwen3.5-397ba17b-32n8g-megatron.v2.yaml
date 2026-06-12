@@ -34,6 +34,9 @@ policy:
   scheduler: null
   megatron_cfg:
     enabled: true
+    checkpoint:
+      async_save: true
+      ckpt_assume_constant_structure: true
     tensor_model_parallel_size: 8
     pipeline_model_parallel_size: 8
     num_layers_in_first_pipeline_stage: 6

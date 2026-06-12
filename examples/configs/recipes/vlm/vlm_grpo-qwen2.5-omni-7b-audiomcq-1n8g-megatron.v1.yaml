@@ -28,6 +28,9 @@ policy:
       limit_mm_per_prompt:
         audio: 1
   megatron_cfg:
+    checkpoint:
+      async_save: true
+      ckpt_assume_constant_structure: true
     converter_type: Qwen2_5OmniForConditionalGeneration
     apply_rope_fusion: false
     tensor_model_parallel_size: 4

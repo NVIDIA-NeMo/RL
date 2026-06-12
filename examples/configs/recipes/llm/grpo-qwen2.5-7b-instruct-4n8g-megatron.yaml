@@ -16,6 +16,9 @@ policy:
     enabled: false
   megatron_cfg:
     enabled: true
+    checkpoint:
+      async_save: true
+      ckpt_assume_constant_structure: true
     tensor_model_parallel_size: 2
     scheduler:
       lr_warmup_iters: 50

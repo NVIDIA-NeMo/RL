@@ -24,6 +24,9 @@ policy:
     enabled: false
   megatron_cfg:
     enabled: true
+    checkpoint:
+      async_save: true
+      ckpt_assume_constant_structure: true
     empty_unused_memory_level: 1
     tensor_model_parallel_size: 2
     sequence_parallel: true
