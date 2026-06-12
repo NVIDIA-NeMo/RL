@@ -45,6 +45,7 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
+    allgather_cp_sharded_tensor,
     allgather_packed_thd_cp_sharded_tensor,
     distributed_vocab_topk,
     from_parallel_logits_to_logprobs,
@@ -57,6 +58,7 @@ from nemo_rl.models.megatron.draft.hidden_capture import (
 )
 from nemo_rl.models.megatron.router_replay import (
     clear_router_replay,
+    router_replay_enabled,
     set_router_replay_backward,
     set_router_replay_forward,
 )
@@ -407,13 +409,16 @@ class LossPostProcessor:
         )
 
         # wrap loss function with loss input preparation
+        use_thd_cp = router_replay_enabled(self.cfg)
         pack_sequences = self.cfg["sequence_packing"]["enabled"]
         if pack_sequences and packed_seq_params is not None:
             fuse_loss = self.cfg.get("sequence_packing", {}).get("fuse_loss", False)
             if fuse_loss:
                 wrapper_cls = SequencePackingFusionLossWrapper
                 prepare_fn = partial(
-                    prepare_packed_loss_input, sampling_params=self.sampling_params
+                    prepare_packed_loss_input,
+                    sampling_params=self.sampling_params,
+                    use_thd_cp=use_thd_cp,
                 )
             else:
                 wrapper_cls = SequencePackingLossWrapper
@@ -427,6 +432,7 @@ class LossPostProcessor:
                 vocab_parallel_rank=get_tensor_model_parallel_rank(),
                 vocab_parallel_group=get_tensor_model_parallel_group(),
                 context_parallel_group=get_context_parallel_group(),
+                use_thd_cp=use_thd_cp,
             )
         else:
             loss_fn_wrapped = partial(
@@ -512,6 +518,7 @@ class LogprobsPostProcessor:
         """
         unpacked_input_ids = data_dict["input_ids"]
         original_seq_length = unpacked_input_ids.shape[1]
+        use_thd_cp = router_replay_enabled(self.cfg)
 
         def processor_fn_inner(output_tensor):
             if self.use_linear_ce_fusion:
@@ -533,6 +540,7 @@ class LogprobsPostProcessor:
                     cp_group=get_context_parallel_group(),
                     chunk_size=logprob_chunk_size,
                     sampling_params=self.sampling_params,
+                    use_thd_cp=use_thd_cp,
                 )
             else:
                 tp_grp = get_tensor_model_parallel_group()
@@ -593,8 +601,10 @@ class TopkLogitsPostProcessor:
                       (dummy_loss, {"topk_logits": values, "topk_indices": indices})
         """
         pack = self.cfg["sequence_packing"]["enabled"]
+        cp_size = self.cfg["megatron_cfg"]["context_parallel_size"]
         unpacked_seqlen = data_dict["input_ids"].shape[1]
         seq_lengths = data_dict["input_lengths"]
+        use_thd_cp = router_replay_enabled(self.cfg)
 
         def processor_fn_inner(output_tensor):
             tp_grp = get_tensor_model_parallel_group()
@@ -618,12 +628,64 @@ class TopkLogitsPostProcessor:
             if self.cfg["megatron_cfg"]["context_parallel_size"] > 1:
                 cp_grp = get_context_parallel_group()
                 if pack:
-                    topk_vals_full = allgather_packed_thd_cp_sharded_tensor(
-                        topk_vals_local, cu_seqlens_padded, cp_grp, seq_dim=1
-                    )
-                    topk_idx_full = allgather_packed_thd_cp_sharded_tensor(
-                        topk_idx_local, cu_seqlens_padded, cp_grp, seq_dim=1
-                    )
+                    if not use_thd_cp:
+                        # Per-sequence CP allgather following packed-sequence logic
+                        batch_size = data_dict["input_ids"].shape[0]
+                        total_packed_len = int(cu_seqlens_padded[-1].item())
+
+                        topk_vals_full = torch.zeros(
+                            (1, total_packed_len, self.k),
+                            dtype=topk_vals_local.dtype,
+                            device=topk_vals_local.device,
+                        )
+                        topk_idx_full = torch.zeros(
+                            (1, total_packed_len, self.k),
+                            dtype=topk_idx_local.dtype,
+                            device=topk_idx_local.device,
+                        )
+
+                        for i in range(batch_size):
+                            start_idx = int(cu_seqlens_padded[i].item())
+                            end_idx = int(cu_seqlens_padded[i + 1].item())
+                            if end_idx > start_idx:
+                                local_vals_slice = topk_vals_local[
+                                    :, start_idx // cp_size : end_idx // cp_size, :
+                                ]
+                                local_idx_slice = topk_idx_local[
+                                    :, start_idx // cp_size : end_idx // cp_size, :
+                                ]
+                                gathered_vals = allgather_cp_sharded_tensor(
+                                    local_vals_slice, cp_grp, seq_dim=1
+                                )
+                                gathered_idx = allgather_cp_sharded_tensor(
+                                    local_idx_slice, cp_grp, seq_dim=1
+                                )
+                                # Some kernels may return [X, Y, k] where X*Y = (end_idx - start_idx).
+                                # Flatten leading dims and reshape to [1, expected_len, k] to match target.
+                                expected_len = end_idx - start_idx
+                                if (
+                                    gathered_vals.dim() == 3
+                                    and gathered_vals.shape[1] != expected_len
+                                ):
+                                    gathered_vals = gathered_vals.reshape(
+                                        1, expected_len, gathered_vals.shape[-1]
+                                    )
+                                if (
+                                    gathered_idx.dim() == 3
+                                    and gathered_idx.shape[1] != expected_len
+                                ):
+                                    gathered_idx = gathered_idx.reshape(
+                                        1, expected_len, gathered_idx.shape[-1]
+                                    )
+                                topk_vals_full[:, start_idx:end_idx, :] = gathered_vals
+                                topk_idx_full[:, start_idx:end_idx, :] = gathered_idx
+                    else:
+                        topk_vals_full = allgather_packed_thd_cp_sharded_tensor(
+                            topk_vals_local, cu_seqlens_padded, cp_grp, seq_dim=1
+                        )
+                        topk_idx_full = allgather_packed_thd_cp_sharded_tensor(
+                            topk_idx_local, cu_seqlens_padded, cp_grp, seq_dim=1
+                        )
                 else:
                     # Sequence packing must be enabled when CP > 1
                     raise RuntimeError(

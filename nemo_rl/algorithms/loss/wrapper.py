@@ -35,6 +35,7 @@ class SequencePackingLossWrapper:
         vocab_parallel_rank: Optional[int] = None,
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        use_thd_cp: bool = False,
     ):
         """Wrap a loss function to handle sequence packing.
 
@@ -46,6 +47,10 @@ class SequencePackingLossWrapper:
             vocab_parallel_rank: Vocab parallel rank.
             vocab_parallel_group: Vocab parallel group.
             context_parallel_group: Context parallel group.
+            use_thd_cp: If True, expose per-sequence padded THD boundaries so the
+                downstream logprob path CP-reconstructs with TransformerEngine THD
+                partitioning (router replay path). If False (default), the boundaries
+                are not injected and the per-sequence zigzag CP path is used.
 
             vocab_parallel_rank, vocab_parallel_group, context_parallel_group are only used for megatron policy worker.
 
@@ -59,6 +64,7 @@ class SequencePackingLossWrapper:
         self.vocab_parallel_rank = vocab_parallel_rank
         self.vocab_parallel_group = vocab_parallel_group
         self.context_parallel_group = context_parallel_group
+        self.use_thd_cp = use_thd_cp
 
     def __call__(
         self,
@@ -101,7 +107,11 @@ class SequencePackingLossWrapper:
                 if self.context_parallel_group is None
                 else torch.distributed.get_world_size(self.context_parallel_group)
             )
-            if cp_size > 1 and self.cu_seqlens_q_padded is not None:
+            if (
+                self.use_thd_cp
+                and cp_size > 1
+                and self.cu_seqlens_q_padded is not None
+            ):
                 unpadded_seq_data["_packed_cp_cu_seqlens_padded"] = torch.tensor(
                     [0, int(padded_seq_lengths[seq_idx].item())],
                     dtype=torch.int32,

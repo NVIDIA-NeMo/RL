@@ -25,6 +25,7 @@ from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     _get_packed_thd_tokens_on_this_cp_rank,
+    _get_tokens_on_this_cp_rank,
     from_parallel_logits_to_logprobs_packed_sequences,
     get_distillation_topk_logprobs_from_logits,
     get_next_token_logprobs_from_logits,
@@ -192,6 +193,7 @@ def _pack_input_ids(
     cp_rank: int = 0,
     cp_size: int = 1,
     roll_shift: int = 0,
+    use_thd_cp: bool = False,
 ) -> torch.Tensor:
     """Pack input_ids from [B, S] to [1, T_packed // CP] using sequence boundaries.
 
@@ -209,8 +211,34 @@ def _pack_input_ids(
         roll_shift: If non-zero, roll each padded sequence by this amount
             before CP-sharding.  Use -1 to build shifted targets for
             next-token prediction.
+        use_thd_cp: If True, CP-shard the packed buffer with TransformerEngine
+            THD partitioning (router replay path). If False (default), use the
+            per-sequence zigzag sharding.
     """
     batch_size = input_ids.shape[0]
+    if not use_thd_cp:
+        total_packed_len = int(cu_seqlens_q_padded[-1].item()) // cp_size
+        packed = torch.zeros(
+            total_packed_len, dtype=input_ids.dtype, device=input_ids.device
+        )
+        for i in range(batch_size):
+            actual_len = int((cu_seqlens_q[i + 1] - cu_seqlens_q[i]).item())
+            padded_len = int(
+                (cu_seqlens_q_padded[i + 1] - cu_seqlens_q_padded[i]).item()
+            )
+            packed_start = int(cu_seqlens_q_padded[i].item())
+            seq = torch.zeros(
+                padded_len, dtype=input_ids.dtype, device=input_ids.device
+            )
+            seq[:actual_len] = input_ids[i, :actual_len]
+            if roll_shift != 0:
+                seq = seq.roll(shifts=roll_shift, dims=0)
+            sharded = _get_tokens_on_this_cp_rank(seq, cp_rank, cp_size, seq_dim=0)
+            packed[packed_start // cp_size : (packed_start + padded_len) // cp_size] = (
+                sharded
+            )
+        return packed.unsqueeze(0)
+
     total_packed_len = int(cu_seqlens_q_padded[-1].item())
     packed = torch.zeros(
         total_packed_len, dtype=input_ids.dtype, device=input_ids.device
@@ -244,6 +272,7 @@ def prepare_packed_loss_input(
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
+    use_thd_cp: bool = False,
 ) -> tuple[dict[str, Any], BatchedDataDict[Any]]:
     """Prepare loss input from packed logits in a single fused pass.
 
@@ -263,6 +292,10 @@ def prepare_packed_loss_input(
         vocab_parallel_group: Vocab parallel group.
         context_parallel_group: Context parallel group.
         sampling_params: Sampling parameters.
+        use_thd_cp: If True, target packing and the CP logprob reconstruction use
+            TransformerEngine THD partitioning (router replay path). If False
+            (default), use the per-sequence zigzag sharding. Must match the CP
+            sharding used by the packed forward path.
 
     Returns:
         tuple(loss_input, maybe_updated_data)
@@ -300,6 +333,7 @@ def prepare_packed_loss_input(
         cp_rank=cp_rank,
         cp_size=cp_size,
         roll_shift=-1,
+        use_thd_cp=use_thd_cp,
     )
 
     logprobs = from_parallel_logits_to_logprobs_packed_sequences(
@@ -314,6 +348,7 @@ def prepare_packed_loss_input(
         cp_group=context_parallel_group,
         sampling_params=sampling_params,
         target_is_pre_rolled=True,
+        use_thd_cp=use_thd_cp,
     )
 
     # Match prepare_loss_input behavior for top-k/top-p filtered training:
@@ -339,6 +374,7 @@ def prepare_packed_loss_input(
                     cp_group=context_parallel_group,
                     sampling_params=None,
                     target_is_pre_rolled=True,
+                    use_thd_cp=use_thd_cp,
                 )
             )
 

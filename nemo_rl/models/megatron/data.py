@@ -26,7 +26,10 @@ from megatron.core.utils import StragglerDetector
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.model_utils import _get_packed_thd_tokens_on_this_cp_rank
+from nemo_rl.distributed.model_utils import (
+    _get_packed_thd_tokens_on_this_cp_rank,
+    _get_tokens_on_this_cp_rank,
+)
 from nemo_rl.models.megatron.common import _round_up_to_multiple
 from nemo_rl.utils.r3_trace import (
     r3_trace_verify_forward_enabled,
@@ -274,58 +277,79 @@ def process_microbatch(
             # Get sequence lengths and context parallel size
             seq_lengths = data_dict[seq_length_key]
 
-            token_aligned_tensors = {"tokens": input_ids}
             if routed_experts is not None:
+                token_aligned_tensors = {"tokens": input_ids}
                 token_aligned_tensors["routed_experts"] = routed_experts
                 if r3_trace_verify_forward_enabled():
                     token_aligned_tensors["_r3_trace_token_identity"] = (
                         _make_r3_trace_token_identity(input_ids, seq_lengths)
                     )
 
-            (
-                packed_batch,
-                cp_packed_batch,
-                packed_seq_params,
-                cu_seqlens,
-                cu_seqlens_padded,
-            ) = _pack_token_aligned_batch_for_megatron(
-                token_aligned_tensors,
-                seq_lengths,
-                pad_individual_seqs_to_multiple_of,
-                pad_packed_seq_to_multiple_of,
-                pad_full_seq_to,
-                cp_rank=get_context_parallel_rank(),
-                cp_size=get_context_parallel_world_size(),
-            )
-            input_ids = packed_batch["tokens"]
-            input_ids_cp_sharded = cp_packed_batch["tokens"]
-            routed_experts = packed_batch.get("routed_experts")
-            routed_experts_cp_sharded = cp_packed_batch.get("routed_experts")
-            token_identity_cp_sharded = cp_packed_batch.get("_r3_trace_token_identity")
-            if (
-                routed_experts_cp_sharded is not None
-                and routed_experts_cp_sharded.dim() != 4
-            ):
-                raise ValueError(
-                    "CP-sharded routed_experts must have shape [1, tokens, "
-                    "num_moe_layers, topk] after Megatron packing; got "
-                    f"{tuple(routed_experts_cp_sharded.shape)}"
+                (
+                    packed_batch,
+                    cp_packed_batch,
+                    packed_seq_params,
+                    cu_seqlens,
+                    cu_seqlens_padded,
+                ) = _pack_token_aligned_batch_for_megatron(
+                    token_aligned_tensors,
+                    seq_lengths,
+                    pad_individual_seqs_to_multiple_of,
+                    pad_packed_seq_to_multiple_of,
+                    pad_full_seq_to,
+                    cp_rank=get_context_parallel_rank(),
+                    cp_size=get_context_parallel_world_size(),
                 )
-            verified_token_count = _verify_r3_trace_cp_token_alignment(
-                source_input_ids=data_dict["input_ids"],
-                source_routed_experts=data_dict.get("routed_experts"),
-                input_ids_cp_sharded=input_ids_cp_sharded,
-                routed_experts_cp_sharded=routed_experts_cp_sharded,
-                token_identity_cp_sharded=token_identity_cp_sharded,
-            )
-            trace_cp_routed_experts(
-                routed_experts_cp_sharded=routed_experts_cp_sharded,
-                token_identity_cp_sharded=token_identity_cp_sharded,
-                input_ids_cp_sharded=input_ids_cp_sharded,
-                cp_token_identity_verified_count=verified_token_count,
-                cp_rank=get_context_parallel_rank(),
-                cp_size=get_context_parallel_world_size(),
-            )
+                input_ids = packed_batch["tokens"]
+                input_ids_cp_sharded = cp_packed_batch["tokens"]
+                routed_experts = packed_batch.get("routed_experts")
+                routed_experts_cp_sharded = cp_packed_batch.get("routed_experts")
+                token_identity_cp_sharded = cp_packed_batch.get(
+                    "_r3_trace_token_identity"
+                )
+                if (
+                    routed_experts_cp_sharded is not None
+                    and routed_experts_cp_sharded.dim() != 4
+                ):
+                    raise ValueError(
+                        "CP-sharded routed_experts must have shape [1, tokens, "
+                        "num_moe_layers, topk] after Megatron packing; got "
+                        f"{tuple(routed_experts_cp_sharded.shape)}"
+                    )
+                verified_token_count = _verify_r3_trace_cp_token_alignment(
+                    source_input_ids=data_dict["input_ids"],
+                    source_routed_experts=data_dict.get("routed_experts"),
+                    input_ids_cp_sharded=input_ids_cp_sharded,
+                    routed_experts_cp_sharded=routed_experts_cp_sharded,
+                    token_identity_cp_sharded=token_identity_cp_sharded,
+                )
+                trace_cp_routed_experts(
+                    routed_experts_cp_sharded=routed_experts_cp_sharded,
+                    token_identity_cp_sharded=token_identity_cp_sharded,
+                    input_ids_cp_sharded=input_ids_cp_sharded,
+                    cp_token_identity_verified_count=verified_token_count,
+                    cp_rank=get_context_parallel_rank(),
+                    cp_size=get_context_parallel_world_size(),
+                )
+            else:
+                (
+                    input_ids,
+                    input_ids_cp_sharded,
+                    packed_seq_params,
+                    cu_seqlens,
+                    cu_seqlens_padded,
+                ) = _pack_sequences_for_megatron(
+                    input_ids,
+                    seq_lengths,
+                    pad_individual_seqs_to_multiple_of,
+                    pad_packed_seq_to_multiple_of,
+                    pad_full_seq_to,
+                    cp_rank=get_context_parallel_rank(),
+                    cp_size=get_context_parallel_world_size(),
+                )
+                routed_experts = None
+                routed_experts_cp_sharded = None
+                token_identity_cp_sharded = None
 
             # For packed sequences, position_ids and attention_mask are typically None
             # The PackedSeqParams handles all necessary sequence information
@@ -851,21 +875,160 @@ def _pack_sequences_for_megatron(
         - cu_seqlens: Cumulative sequence lengths
         - cu_seqlens_padded: Padded cumulative sequence lengths
     """
-    packed_batch, cp_packed_batch, packed_seq_params, cu_seqlens, cu_seqlens_padded = (
-        _pack_token_aligned_batch_for_megatron(
-            {"tokens": input_ids},
-            seq_lengths,
-            pad_individual_seqs_to_multiple_of,
-            pad_packed_seq_to_multiple_of,
-            pad_packed_seq_to,
-            cp_rank=cp_rank,
-            cp_size=cp_size,
+    batch_size = input_ids.shape[0]
+
+    # Build cumulative sequence lengths (cu_seqlens) and extract valid tokens
+    needs_padding = (
+        pad_individual_seqs_to_multiple_of > 1
+        or pad_packed_seq_to_multiple_of > 1
+        or pad_packed_seq_to is not None
+    )
+
+    cu_seqlens = [0]
+    cu_seqlens_padded = [0] if needs_padding else None
+    valid_tokens = []
+
+    if pad_packed_seq_to is not None:
+        assert pad_packed_seq_to % pad_packed_seq_to_multiple_of == 0, (
+            f"pad_packed_seq_to ({pad_packed_seq_to}) is not a multiple of pad_packed_seq_to_multiple_of ({pad_packed_seq_to_multiple_of})."
         )
+
+    pad_factor = pad_individual_seqs_to_multiple_of
+
+    for b in range(batch_size):
+        seq_len = (
+            seq_lengths[b].item() if torch.is_tensor(seq_lengths[b]) else seq_lengths[b]
+        )
+
+        # Extract valid tokens for this sequence
+        valid_tokens.append(input_ids[b, :seq_len])
+
+        # Update cumulative sequence lengths
+        cu_seqlens.append(cu_seqlens[-1] + seq_len)
+
+        # For context parallelism, track padded sequence lengths
+        if needs_padding:
+            # Pad sequence length to multiple of (cp_size * 2)
+            padded_seq_len = _round_up_to_multiple(seq_len, pad_factor)
+            cu_seqlens_padded.append(cu_seqlens_padded[-1] + padded_seq_len)
+
+    # Convert to tensors
+    cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32, device=input_ids.device)
+    if needs_padding:
+        cu_seqlens_padded = torch.tensor(
+            cu_seqlens_padded, dtype=torch.int32, device=input_ids.device
+        )
+        if pad_packed_seq_to is not None:
+            cu_seqlens_padded[-1] = pad_packed_seq_to
+        elif pad_packed_seq_to_multiple_of > 1:
+            cu_seqlens_padded[-1] = _round_up_to_multiple(
+                cu_seqlens_padded[-1], pad_packed_seq_to_multiple_of
+            )
+
+    # Calculate max sequence length (padded if using CP)
+    if needs_padding:
+        seq_lens_padded = cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]
+        max_seqlen = seq_lens_padded.max().item()
+    else:
+        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        max_seqlen = seq_lens.max().item()
+
+    # Concatenate all valid tokens
+    # If using individual padding, we need to pad individual sequences
+    # CP will always need padding (of at least cp_size * 2)
+    running_seq_len = 0
+    if pad_factor > 1:
+        all_input_ids = []
+        padded_tokens = []
+        for b in range(batch_size):
+            seq_len = (
+                seq_lengths[b].item()
+                if torch.is_tensor(seq_lengths[b])
+                else seq_lengths[b]
+            )
+            # if last element, pad to the max sequence length
+            if b == batch_size - 1 and needs_padding:
+                if pad_packed_seq_to is not None:
+                    padded_seq_len = pad_packed_seq_to - running_seq_len
+                elif pad_packed_seq_to_multiple_of > 1:
+                    padded_seq_len = _round_up_to_multiple(seq_len, pad_factor)
+                    padded_seq_len = (
+                        _round_up_to_multiple(
+                            running_seq_len + padded_seq_len,
+                            pad_packed_seq_to_multiple_of,
+                        )
+                        - running_seq_len
+                    )
+                else:
+                    padded_seq_len = _round_up_to_multiple(seq_len, pad_factor)
+            else:
+                padded_seq_len = _round_up_to_multiple(seq_len, pad_factor)
+
+            running_seq_len += padded_seq_len
+
+            # Pad this sequence to the required length
+            seq_tokens = input_ids[b, :seq_len]
+            if padded_seq_len > seq_len:
+                # Pad with zeros (or use a padding token if available)
+                seq_tokens = torch.nn.functional.pad(
+                    seq_tokens, (0, padded_seq_len - seq_len), value=0
+                )
+            all_input_ids.append(seq_tokens)
+
+            if cp_size > 1:
+                seq_tokens = _get_tokens_on_this_cp_rank(
+                    seq_tokens, cp_rank, cp_size, seq_dim=0
+                )
+
+            padded_tokens.append(seq_tokens)
+
+        # Concatenate all padded tokens
+        # For 'thd' format, the shape should be [1, T] where T is total tokens
+        packed_input_ids = torch.cat(padded_tokens, dim=0).unsqueeze(0)
+        all_input_ids = torch.cat(all_input_ids, dim=0).unsqueeze(0)
+    else:
+        # No individual padding, just concatenate valid tokens
+        # For 'thd' format, the shape should be [1, T] where T is total tokens
+        packed_input_ids = torch.cat(valid_tokens, dim=0).unsqueeze(0)
+        all_input_ids = packed_input_ids
+        if needs_padding:
+            if pad_packed_seq_to is not None:
+                pad_len = pad_packed_seq_to - packed_input_ids.shape[1]
+            elif pad_packed_seq_to_multiple_of > 1:
+                current_seq_len = packed_input_ids.shape[1]
+                pad_this_seq_to = _round_up_to_multiple(
+                    current_seq_len, pad_packed_seq_to_multiple_of
+                )
+                pad_len = pad_this_seq_to - current_seq_len
+            else:
+                pad_len = 0
+            if pad_len > 0:
+                packed_input_ids = torch.nn.functional.pad(
+                    packed_input_ids, (0, pad_len), value=0
+                )
+                all_input_ids = torch.nn.functional.pad(
+                    all_input_ids, (0, pad_len), value=0
+                )
+
+    if cu_seqlens_padded is None:
+        cu_seqlens_padded = cu_seqlens.clone()
+
+    # total_tokens is required for PackedSeqParams.__post_init__ to build
+    # seq_idx, which Mamba uses to reset SSM state at sample boundaries.
+    packed_seq_params = PackedSeqParams(
+        cu_seqlens_q=cu_seqlens_padded,
+        cu_seqlens_kv=cu_seqlens_padded,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
+        max_seqlen_q=int(max_seqlen),
+        max_seqlen_kv=int(max_seqlen),
+        qkv_format="thd",
+        total_tokens=packed_input_ids.shape[1],
     )
 
     return (
-        packed_batch["tokens"].contiguous(),
-        cp_packed_batch["tokens"].contiguous(),
+        all_input_ids.contiguous(),
+        packed_input_ids.contiguous(),
         packed_seq_params,
         cu_seqlens,
         cu_seqlens_padded,

@@ -1062,6 +1062,7 @@ def from_parallel_logits_to_logprobs_packed_sequences(
     chunk_size: Optional[int] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
     target_is_pre_rolled: bool = False,
+    use_thd_cp: bool = False,
 ) -> torch.Tensor:
     """Get log probabilities from TP sharded vocab logits for packed sequences.
 
@@ -1084,6 +1085,9 @@ def from_parallel_logits_to_logprobs_packed_sequences(
         sampling_params (TrainingSamplingParams, optional): Sampling parameters for Top-k/Top-p filtering.
         target_is_pre_rolled (bool): If True, target is already shifted and CP-sharded to match
             vocab_parallel_logits shape, skipping the internal per-sequence roll+CP-shard loop.
+        use_thd_cp (bool): If True, CP target sharding and the probs all-gather use TransformerEngine
+            THD packed partitioning (router replay path). If False (default), use the per-sequence
+            zigzag sharding/all-gather.
 
     Returns:
         torch.Tensor: Unpacked log probabilities tensor with shape [batch_size, unpacked_seqlen-1].
@@ -1099,27 +1103,46 @@ def from_parallel_logits_to_logprobs_packed_sequences(
         target = target.squeeze(0)
         cp_rank = 0 if cp_group is None else torch.distributed.get_rank(cp_group)
 
-        rolled_targets = torch.zeros_like(target)
-        for i in range(batch_size):
-            start_idx = cu_seqlens_padded[i].item()
-            end_idx = cu_seqlens_padded[i + 1].item()
-
-            seq_targets = target[start_idx:end_idx]
-            rolled_seq_targets = seq_targets.roll(shifts=-1, dims=0)
-            rolled_targets[start_idx:end_idx] = rolled_seq_targets
-
-        if cp_size > 1:
-            rolled_targets = _get_packed_thd_tokens_on_this_cp_rank(
-                rolled_targets.unsqueeze(0),
-                cu_seqlens_padded,
-                cp_rank,
-                cp_size,
-                seq_dim=1,
+        if not use_thd_cp:
+            rolled_targets = torch.zeros(
+                target.shape[0] // cp_size, dtype=target.dtype, device=target.device
             )
-        else:
-            rolled_targets = rolled_targets.unsqueeze(0)
+            for i in range(batch_size):
+                start_idx = cu_seqlens_padded[i].item()
+                end_idx = cu_seqlens_padded[i + 1].item()
 
-        target = rolled_targets
+                seq_targets = target[start_idx:end_idx]
+                rolled_seq_targets = seq_targets.roll(shifts=-1, dims=0)
+                rolled_targets[start_idx // cp_size : end_idx // cp_size] = (
+                    _get_tokens_on_this_cp_rank(
+                        rolled_seq_targets, cp_rank, cp_size, seq_dim=0
+                    )
+                )
+
+            target = rolled_targets.unsqueeze(0)
+        else:
+            rolled_targets = torch.zeros_like(target)
+            for i in range(batch_size):
+                start_idx = cu_seqlens_padded[i].item()
+                end_idx = cu_seqlens_padded[i + 1].item()
+
+                seq_targets = target[start_idx:end_idx]
+                rolled_seq_targets = seq_targets.roll(shifts=-1, dims=0)
+                rolled_targets[start_idx:end_idx] = rolled_seq_targets
+
+            if cp_size > 1:
+                rolled_targets = _get_packed_thd_tokens_on_this_cp_rank(
+                    rolled_targets.unsqueeze(0),
+                    cu_seqlens_padded,
+                    cp_rank,
+                    cp_size,
+                    seq_dim=1,
+                )
+            else:
+                rolled_targets = rolled_targets.unsqueeze(0)
+
+            target = rolled_targets
+
         vocab_parallel_logits = vocab_parallel_logits.unsqueeze(0)
 
     # Apply distributed log probability computation
@@ -1175,9 +1198,22 @@ def from_parallel_logits_to_logprobs_packed_sequences(
         )
 
     if cp_size > 1:
-        probs = allgather_packed_thd_cp_sharded_tensor(
-            probs, cu_seqlens_padded, cp_group, seq_dim=0
-        )
+        if not use_thd_cp:
+            # per-sequence cp_allgather
+            final_probs = torch.zeros(probs.shape[0] * cp_size, device=probs.device)
+            for i in range(batch_size):
+                start_idx = cu_seqlens_padded[i].item()
+                end_idx = cu_seqlens_padded[i + 1].item()
+                final_probs[start_idx:end_idx] = allgather_cp_sharded_tensor(
+                    probs[start_idx // cp_size : end_idx // cp_size],
+                    cp_group,
+                    seq_dim=0,
+                )
+            probs = final_probs
+        else:
+            probs = allgather_packed_thd_cp_sharded_tensor(
+                probs, cu_seqlens_padded, cp_group, seq_dim=0
+            )
 
     out_logprobs = torch.zeros(
         (batch_size, unpacked_seqlen - 1), dtype=probs.dtype, device=probs.device
