@@ -93,6 +93,7 @@ from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
@@ -186,6 +187,10 @@ class MegatronPolicyWorkerImpl(
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
+        log_gpu_memory_diagnostics(
+            label="init_start", worker_type="MegatronPolicyWorker"
+        )
+
         # Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files
         apply_transformer_engine_patch()
 
@@ -196,6 +201,9 @@ class MegatronPolicyWorkerImpl(
 
         # Step 1: Setup distributed
         setup_distributed()
+        log_gpu_memory_diagnostics(
+            label="after_nccl_init", worker_type="MegatronPolicyWorker"
+        )
 
         # Step 2: Validate and setup model paths
         hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(
@@ -213,6 +221,9 @@ class MegatronPolicyWorkerImpl(
             pt_checkpoint_exists,
             model_post_wrap_hook=getattr(self, "_model_import_post_wrap_hook", None),
             transformer_layer_spec=getattr(self, "_transformer_layer_spec", None),
+        )
+        log_gpu_memory_diagnostics(
+            label="after_hf_import", worker_type="MegatronPolicyWorker"
         )
 
         # Store tokenizer
@@ -265,6 +276,9 @@ class MegatronPolicyWorkerImpl(
         self.checkpointing_context = model_and_optimizer_state.checkpointing_context
         param_sync_func = model_and_optimizer_state.param_sync_func
         self.draft_model = model_and_optimizer_state.draft_model
+        log_gpu_memory_diagnostics(
+            label="after_model_setup", worker_type="MegatronPolicyWorker"
+        )
 
         # Set the param sync function for the model if needed
         if param_sync_func is not None:
@@ -282,6 +296,9 @@ class MegatronPolicyWorkerImpl(
                 ),
             )
             self.model = self.move_model(self.model, "cuda")
+            log_gpu_memory_diagnostics(
+                label="after_ref_model", worker_type="MegatronPolicyWorker"
+            )
 
         # Step 6: Finalize setup
         (
@@ -314,6 +331,10 @@ class MegatronPolicyWorkerImpl(
 
         ## used for streaming update inference engine weights
         self._held_gather_buffer = None
+
+        log_gpu_memory_diagnostics(
+            label="init_complete", worker_type="MegatronPolicyWorker"
+        )
 
     def enable_forward_pre_hook(self):
         assert isinstance(self.model, DistributedDataParallel)
@@ -1365,23 +1386,6 @@ class MegatronPolicyWorkerImpl(
         gc.collect()
         torch.cuda.empty_cache()
 
-    def finish_training(self) -> None:
-        """Offload model, gradients, and optimizer to CPU after training."""
-        self.model = self.move_model(
-            self.model, "cpu", move_params=True, move_grads=True
-        )
-        self.model.eval()
-
-        if (
-            hasattr(self, "optimizer")
-            and self.optimizer is not None
-            and not self.optimizer_cpu_offload
-        ):
-            self.move_optimizer("cpu")
-
-        gc.collect()
-        torch.cuda.empty_cache()
-
     def _clear_fp8_caches(self):
         """Clear FP8 workspace caches and release fragmented GPU memory.
 
@@ -1408,15 +1412,9 @@ class MegatronPolicyWorkerImpl(
 
     @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
     def offload_before_refit(self):
-        """Offload the optimizer and buffers to the CPU, keeping params on GPU for refit."""
+        """Offload the optimizer and buffers to the CPU."""
         no_grad = torch.no_grad()
         no_grad.__enter__()
-
-        # Ensure model params are on GPU (they may have been offloaded by finish_training)
-        self.model = self.move_model(
-            self.model, "cuda", move_params=True, move_grads=False
-        )
-
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
         reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
         print(
