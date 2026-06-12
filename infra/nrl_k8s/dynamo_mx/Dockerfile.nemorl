@@ -15,6 +15,12 @@
 #   * modelexpress       Kavin's v2 publisher/receiver, at the SHA we tested
 #                        the dynamo side against.
 #
+# The Megatron + MX path also needs NeMo-RL's mcore extra because Megatron-
+# Bridge eagerly imports transformer_engine.pytorch. The upstream nightly base
+# currently has megatron-core/bridge in the actor venvs but not the compiled
+# TransformerEngine PyTorch extension, so this overlay installs mcore into the
+# main venv and the Megatron actor venvs at build time.
+#
 # All three are pure pip installs — the base nemo-rl image already has UCX,
 # libibverbs, libcudart, etc.
 #
@@ -62,6 +68,28 @@ ARG PROTOBUF_VERSION=6.31.1
 # protobuf 6 and explicitly supports `protobuf<8`. Upgrade in lockstep
 # with the protobuf force-upgrade.
 ARG WANDB_VERSION=0.26.1
+
+ENV NVTE_FRAMEWORK=pytorch
+ENV MAX_JOBS=4
+ENV NVTE_BUILD_THREADS_PER_JOB=1
+ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
+
+# Install Megatron dependencies, including the compiled TransformerEngine
+# PyTorch extension, into the main driver venv and the Megatron Ray actor venvs.
+# Use --inexact because this image overlays the nightly base; an exact sync would
+# remove packages that are already baked into those environments.
+RUN UV_LINK_MODE=symlink \
+    UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv \
+    uv sync --directory /opt/nemo-rl --locked --inexact --extra mcore --no-install-project
+
+RUN set -eux; \
+    for venv in /opt/ray_venvs/*megatron*/; do \
+      [ -d "$venv" ] || continue; \
+      echo "Installing mcore deps into ${venv}"; \
+      UV_LINK_MODE=symlink \
+      UV_PROJECT_ENVIRONMENT="${venv%/}" \
+      uv sync --directory /opt/nemo-rl --locked --inexact --extra mcore --no-install-project; \
+    done
 
 # ---------------------------------------------------------------------------
 # System: singularity-container + squashfuse for the swe_agents SIF sandboxes.
@@ -152,12 +180,18 @@ RUN set -e; \
 
 # Smoke imports — fail the build if anything didn't land.
 RUN /opt/nemo_rl_venv/bin/python -c "\
+import transformer_engine.pytorch as te; \
 import nixl, nixl._api; \
 import dynamo._core, dynamo.runtime; \
 from modelexpress import MxV2TrainingPublisher, MxV2RefitReceiver; \
 import wandb; \
 from wandb.proto.wandb_telemetry_pb2 import Imports; \
-print('main venv: imports OK')"
+print('main venv: imports OK', te.__file__)"
+
+RUN /opt/ray_venvs/nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker/bin/python -c "\
+import transformer_engine.pytorch as te; \
+import megatron.bridge; \
+print('MegatronPolicyWorker venv: imports OK', te.__file__)"
 
 RUN /opt/ray_venvs/nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker/bin/python -c "\
 import nixl._api; \

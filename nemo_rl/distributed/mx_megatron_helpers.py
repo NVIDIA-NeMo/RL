@@ -436,8 +436,6 @@ def collect_megatron_publish_set(
     Caller is responsible for invoking ``add_tensor`` and
     ``publish(version=...)`` on the publisher.
     """
-    import torch
-
     for raw_name, param in model.named_parameters():
         if not param.is_floating_point():
             # Skip non-float buffers (rotary inv_freq, etc.); they aren't

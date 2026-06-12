@@ -1339,8 +1339,7 @@ class MegatronPolicyWorkerImpl(
         self._mx_publisher.mark_ready()
 
     def _build_megatron_sidecar(self) -> dict[str, Any]:
-        """One-shot at trainer init: serialize Megatron-Bridge introspection
-        results so receivers don't need a Bridge import.
+        """Serialize Megatron-Bridge introspection results at trainer init.
 
         Two pieces:
           1. ``megatron_transformer_config`` — head counts + dims read

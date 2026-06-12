@@ -898,7 +898,7 @@ class VllmInternalWorkerExtension:
                     weights.append((hf_name, hf_tensor))
 
         if not weights:
-            print(f"[mx-megatron] cycle yielded 0 tensors; refit aborted")
+            print("[mx-megatron] cycle yielded 0 tensors; refit aborted")
             return False
 
         self._load_weights(weights)
