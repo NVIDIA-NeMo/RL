@@ -1192,6 +1192,224 @@ class MegatronPolicyWorkerImpl(
             post_iter_func=lambda x: x[1],
         )
 
+    @torch.no_grad()
+    @wrap_with_nvtx_name("megatron_policy_worker/stream_weights_via_mx")
+    def stream_weights_via_mx(
+        self,
+        *,
+        version: int,
+        mx_config: Any,
+    ) -> None:
+        """Publish per-rank Megatron-native shards to ModelExpress (v2 path).
+
+        Megatron analogue of :meth:`DTensorPolicyWorkerImpl.stream_weights_via_mx`,
+        but instead of walking ``model.state_dict()`` and calling ``to_local()``
+        on DTensors, this iterates ``model.named_parameters()`` and uses
+        :func:`nemo_rl.distributed.mx_megatron_helpers.collect_megatron_publish_set`
+        to:
+
+        * classify each parameter into one of seven Megatron roles
+          (qkv_column, gated_mlp_column, column, row, vocab_parallel,
+          replicated, expert_column / expert_row);
+        * skip replicated tensors on TP ranks > 0 (rank 0 publishes for the
+          replicated set);
+        * publish the native shard as-is — Megatron's parameter storage
+          already holds only the local TP/PP/EP slice, so no allgather is
+          needed.
+
+        See ``temp/NemoRL_Megatron_MX_Design.md`` §4 for the contract; the
+        receiver-side slice planner that consumes this metadata lives in
+        ``modelexpress.nemo_rl_v2`` (PR #421 commit ``12c73a7``).
+        """
+        if kv_scales := getattr(self, "_kv_scales_for_mx", None):
+            raise NotImplementedError(
+                "FP8 kvcache scales are not yet supported on the Megatron MX path"
+            )
+
+        from megatron.core import parallel_state
+
+        from nemo_rl.distributed.mx_helpers import build_v2_publisher
+        from nemo_rl.distributed.mx_megatron_helpers import (
+            collect_megatron_publish_set,
+        )
+
+        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        pp_size = parallel_state.get_pipeline_model_parallel_world_size()
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        ep_size = parallel_state.get_expert_model_parallel_world_size()
+        ep_rank = parallel_state.get_expert_model_parallel_rank()
+
+        # ---- Lazy-init the publisher (once per worker lifetime). ----
+        if not hasattr(self, "_mx_publisher") or self._mx_publisher is None:
+            self._mx_publisher = build_v2_publisher(
+                rank=self.rank,
+                device_id=getattr(self, "local_device_index", self.rank),
+                fsdp_world_size=self.dp_size,
+                tp_world_size=tp_size,
+                pp_world_size=pp_size,
+                ep_world_size=ep_size,
+                mx_config=mx_config,
+                agent_name=f"nemo-rl-megatron-trainer-r{self.rank}",
+            )
+            self._mx_publisher.initialize(
+                model_name=self.cfg["model_name"],
+                dtype=str(self.dtype).removeprefix("torch."),
+            )
+            # ---- Build the receiver-side sidecar context once. ----
+            # The receiver consumes:
+            #   * MegatronTransformerConfig — head counts + dims for QKV
+            #     un-interleave (modelexpress.megatron_translator
+            #     .SIDECAR_TRANSFORMER_CONFIG_KEY)
+            #   * Megatron→HF name map — per Megatron tensor name, the
+            #     list of HF param names it expands into (1 for column/
+            #     row/replicated/vocab_parallel, 3 for qkv_column, 2 for
+            #     gated_mlp_column, N for per_expert)
+            #     (modelexpress.megatron_translator.SIDECAR_HF_NAME_MAP_KEY)
+            #
+            # Both are derived once via a Bridge introspection pass (no
+            # weights actually transferred), then attached to the
+            # publisher so every publish() embeds them in the sidecar.
+            self._mx_megatron_sidecar = self._build_megatron_sidecar()
+            try:
+                self._mx_publisher.set_megatron_sidecar(self._mx_megatron_sidecar)
+            except AttributeError:
+                # Older modelexpress without the sidecar setter — stash for
+                # the alternate path that injects via add_tensor metadata.
+                pass
+
+        # ---- Resolve attention head metadata for qkv_column descriptors. ----
+        # Megatron-Core's transformer_config carries this; for non-mainline
+        # models the lookup falls back to None and the role descriptor will
+        # omit the per-rank head counts (Phase B planner aggregates across
+        # contributing sources, so this is recoverable on the receiver side
+        # for matched-TP).
+        tcfg = getattr(self.megatron_bridge, "transformer_config", None)
+        num_attention_heads = getattr(tcfg, "num_attention_heads", None) if tcfg else None
+        num_kv_heads = (
+            getattr(tcfg, "num_query_groups", None) if tcfg else None
+        ) or num_attention_heads
+        head_dim = (
+            getattr(tcfg, "kv_channels", None) if tcfg else None
+        ) or (
+            num_attention_heads and getattr(tcfg, "hidden_size", 0) // num_attention_heads
+            if tcfg else None
+        )
+
+        role_overrides = getattr(mx_config, "megatron_role_overrides", None) or {}
+
+        # ---- Add tensors. ----
+        if hasattr(self._mx_publisher, "_registry"):
+            self._mx_publisher._registry.clear()
+        if hasattr(self._mx_publisher, "_registered_tensors"):
+            self._mx_publisher._registered_tensors.clear()
+
+        # Stamp the publisher's mesh position so the source identity and
+        # sidecar will carry tp_rank / pp_rank / ep_rank for receivers.
+        self._mx_publisher.set_megatron_mesh_position(
+            tp_rank=tp_rank, pp_rank=pp_rank, ep_rank=ep_rank,
+        )
+
+        for name, local, spec, extras in collect_megatron_publish_set(
+            self.model,
+            tp_size=tp_size, pp_size=pp_size, pp_rank=pp_rank,
+            ep_size=ep_size, ep_rank=ep_rank, tp_rank=tp_rank,
+            num_attention_heads=num_attention_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            role_overrides=role_overrides,
+            target_dtype=self.dtype,
+        ):
+            # Per-tensor megatron metadata goes into the registry via
+            # the new add_tensor kwargs (megatron_role, megatron_extras).
+            # The per-source mesh position was already stamped above and
+            # rides on identity.extra_parameters / sidecar.
+            self._mx_publisher.add_tensor(
+                name=name,
+                tensor=local,
+                is_expert=spec.is_expert,
+                expert_axis=spec.expert_axis,
+                owned_expert_ids=spec.owned_expert_ids,
+                megatron_role=spec.role,
+                megatron_extras=spec.descriptor_extras,
+            )
+
+        # ---- Publish + mark ready. ----
+        self._mx_publisher.publish(version=int(version))
+        self._mx_publisher.mark_ready()
+
+    def _build_megatron_sidecar(self) -> dict[str, Any]:
+        """One-shot at trainer init: serialize Megatron-Bridge introspection
+        results so receivers don't need a Bridge import.
+
+        Two pieces:
+          1. ``megatron_transformer_config`` — head counts + dims read
+             from the trainer's :class:`TransformerConfig`.
+          2. ``megatron_hf_name_map`` — list of
+             ``[megatron_param_name, [hf_name_1, hf_name_2, ...]]`` derived
+             from a Bridge introspection pass over the local model
+             (no weight transfer; just iterates the conversion-task list).
+
+        See :mod:`modelexpress.megatron_translator` for the receiver-side
+        ``SIDECAR_TRANSFORMER_CONFIG_KEY`` / ``SIDECAR_HF_NAME_MAP_KEY``
+        constants the receiver consumes.
+        """
+        sidecar: dict[str, Any] = {}
+
+        # --- transformer_config ---
+        tcfg = getattr(self.megatron_bridge, "transformer_config", None)
+        if tcfg is not None:
+            num_heads = getattr(tcfg, "num_attention_heads", None)
+            kv_groups = (
+                getattr(tcfg, "num_query_groups", None) or num_heads
+            )
+            kv_channels = getattr(tcfg, "kv_channels", None)
+            if kv_channels is None and num_heads:
+                kv_channels = getattr(tcfg, "hidden_size", 0) // num_heads
+            sidecar["megatron_transformer_config"] = {
+                "num_attention_heads": num_heads,
+                "num_query_groups": kv_groups,
+                "kv_channels": kv_channels,
+                "hidden_size": getattr(tcfg, "hidden_size", None),
+            }
+
+        # --- hf_name_map ---
+        # Walk the Bridge mapping registry to derive
+        # (megatron_local_name, [hf_name_1, hf_name_2, ...]). We use the
+        # registry's resolved tasks rather than calling
+        # ``export_hf_weights`` so we don't pay the gather/broadcast cost
+        # at startup. The receiver only needs the name pairings; head
+        # counts come from transformer_config.
+        try:
+            tasks = self.megatron_bridge.get_conversion_tasks([self.model])
+            name_map_entries: list[tuple[str, list[str]]] = []
+            for task in tasks:
+                m_name = task.global_param_name or task.param_name
+                # Each task's mapping declares 1 or more HF names. Resolve
+                # via the mapping's hf_param attribute (str or dict).
+                hf_attr = getattr(task.mapping, "hf_param", None)
+                if isinstance(hf_attr, str):
+                    hf_names = [hf_attr]
+                elif isinstance(hf_attr, dict):
+                    # Order matters for QKV: q, k, v. Bridge's QKVMapping
+                    # uses keys "q", "k", "v" — preserve that ordering.
+                    if set(hf_attr.keys()) == {"q", "k", "v"}:
+                        hf_names = [hf_attr["q"], hf_attr["k"], hf_attr["v"]]
+                    else:
+                        hf_names = list(hf_attr.values())
+                else:
+                    continue
+                name_map_entries.append((m_name, list(hf_names)))
+            sidecar["megatron_hf_name_map"] = name_map_entries
+        except Exception as exc:  # noqa: BLE001
+            warnings.warn(
+                f"stream_weights_via_mx: failed to build Megatron→HF name map "
+                f"via Bridge introspection ({exc!r}); receivers may need to "
+                f"derive names independently"
+            )
+
+        return sidecar
+
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)
         self.model.eval()

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import time
 import traceback
 from typing import Any
 
@@ -342,12 +343,30 @@ class VllmInternalWorkerExtension:
         (optionally) republish self as an inference replica for tree
         fan-out.
 
+        Megatron-MX path: if the discovered source's v2 metadata carries
+        ``publisher_kind == "megatron"`` (set by Megatron-Core trainers
+        per ``modelexpress.megatron_translator.SIDECAR_*`` keys), route
+        through :func:`_update_weights_via_mx_megatron` instead. The
+        Megatron path uses the receiver-side slice planner +
+        Bridge-shaped translator (``modelexpress.megatron_translator``)
+        to assemble per-rank shards into HF tensors via the vendored
+        QKV un-interleave + gated-MLP split helpers. The translator
+        does not depend on Megatron-Bridge being installed in the
+        worker image.
+
         Returns ``True`` on successful refit.
         """
         try:
             assert self.state_dict_info is not None, (
                 "state_dict_info not prepared; call prepare_refit_info() first"
             )
+
+            # First-cycle Megatron check: peek at any cached candidates we
+            # may have, otherwise discover for the megatron-mode flag and
+            # cache. The Megatron path has its own discover/plan loop, so
+            # we only do enough discover here to detect the publisher kind.
+            if not hasattr(self, "_mx_megatron_mode"):
+                self._mx_megatron_mode = None  # None = unknown, True/False = latched
 
             # ---- Lazy-init receiver and register receive buffers (once) ----
             if not hasattr(self, "_mx_receiver") or self._mx_receiver is None:
@@ -393,6 +412,23 @@ class VllmInternalWorkerExtension:
                     f"{self._mx_receiver.worker_rank}"
                 )
                 return False
+
+            # Latch the receiver mode on the first non-empty discovery.
+            if self._mx_megatron_mode is None:
+                self._mx_megatron_mode = any(
+                    c.megatron_meta is not None for c in candidates
+                )
+                if self._mx_megatron_mode:
+                    print(
+                        f"[mx] rank={self._mx_receiver.worker_rank} latched "
+                        f"Megatron-MX receiver mode (sources advertise "
+                        f"publisher_kind=megatron)"
+                    )
+
+            if self._mx_megatron_mode:
+                return self._update_weights_via_mx_megatron(
+                    candidates=candidates, version=int(version), mx_config=mx_config,
+                )
 
             chosen = self._mx_receiver.pick_best_source(candidates)
             if chosen is None:
@@ -457,6 +493,431 @@ class VllmInternalWorkerExtension:
                 f"{traceback.format_exc()}"
             )
             return False
+
+    @wrap_with_nvtx_name(
+        "vllm_internal_worker_extension/update_weights_via_mx_megatron"
+    )
+    def _update_weights_via_mx_megatron(
+        self,
+        *,
+        candidates: list,
+        version: int,
+        mx_config: Any,
+    ) -> bool:
+        """Megatron-MX path of :meth:`update_weights_via_mx`.
+
+        Routes through ``modelexpress.megatron_translator``'s slice
+        planner + assembly pipeline. The trainer publishes per-rank
+        Megatron-native shards (no allgather); we discover the slice
+        plan, pull each rank's contribution into a pre-allocated global
+        tensor, and apply role-aware translation (QKV un-interleave,
+        gated-MLP split, name remap) using the vendored helpers — no
+        Megatron-Bridge import required in the worker image.
+
+        See ``temp/NemoRL_Megatron_MX_Design.md`` §6 + §9b and
+        ``temp/NemoRL_Megatron_MX_Phase_C_Handoff.md``.
+        """
+        from modelexpress.megatron_translator import (
+            MegatronReceiverContext,
+            ReceiveSpec,
+            discover_megatron_context,
+            run_refit_cycle,
+        )
+        from modelexpress.nemo_rl_v2 import TargetTpLayout
+
+        # ---- One-shot: build context from the first cycle's metadata. ----
+        if not hasattr(self, "_mx_megatron_ctx") or self._mx_megatron_ctx is None:
+            cfg, name_map = discover_megatron_context(candidates)
+            if cfg is None:
+                print(
+                    "[mx-megatron] sources advertise publisher_kind=megatron but "
+                    "no transformer_config sidecar; falling back to non-Megatron "
+                    "path on next cycle"
+                )
+                self._mx_megatron_mode = False
+                return False
+
+            # Build receive specs: one per Megatron tensor name in the
+            # sidecar's name_map. The receiver's TARGET layout is its own
+            # vLLM TP × EP shape.
+            target_tp = getattr(self.parallel_config, "tensor_parallel_size", 1)
+            target_tp_rank = (
+                torch.distributed.get_rank(
+                    group=getattr(self, "_tp_process_group", None)
+                )
+                if torch.distributed.is_initialized()
+                else 0
+            )
+            target_tp_layout = TargetTpLayout(
+                tp_size=target_tp, tp_rank=target_tp_rank,
+            )
+
+            # For each Megatron source-name → list of HF target names, build
+            # one ReceiveSpec. Shape + role come from the source's
+            # TensorDescriptorV2 in the published shape_registry; the
+            # receiver-side parser is in modelexpress.nemo_rl_v2.
+            receive_specs: dict[str, ReceiveSpec] = {}
+            for cand in candidates:
+                if cand.megatron_meta is None or cand.registry is None:
+                    continue
+                for td in cand.registry.get("tensors", []):
+                    if td.name in receive_specs:
+                        continue
+                    role = td.megatron_role or ""
+                    if not role:
+                        continue
+                    # Bridge's name_map uses unprefixed Megatron names; the
+                    # publisher (post-2026-06-08) normalizes to that form, but
+                    # be defensive in case a publisher emits the `module.`
+                    # prefix and the name_map doesn't.
+                    lookup_name = (
+                        td.name[len("module."):] if td.name.startswith("module.")
+                        else td.name
+                    )
+                    hf_names = name_map.get(lookup_name, name_map.get(td.name, [td.name]))
+                    receive_specs[td.name] = ReceiveSpec(
+                        megatron_name=td.name,
+                        hf_names=list(hf_names),
+                        role=role,
+                        target_shape=tuple(int(s) for s in td.global_shape),
+                        target_dtype=td.dtype,
+                        shard_axis=int(td.shard_axis),
+                        pp_rank=cand.megatron_meta.pp_rank,
+                        role_descriptor=dict(td.megatron_extras or {}),
+                    )
+
+            self._mx_megatron_ctx = MegatronReceiverContext(
+                target_tp_layout=target_tp_layout,
+                transformer_config=cfg,
+                hf_name_map=name_map,
+                receive_specs=receive_specs,
+            )
+            print(
+                f"[mx-megatron] built receive context: tp={target_tp} "
+                f"tensors={len(receive_specs)} cfg={cfg}"
+            )
+
+        # ---- One refit cycle, matched-TP fast path. ----
+        # v0: pre-allocate one Megatron-shaped destination per receive_spec,
+        # register them all with NIXL under the trainer's Megatron names,
+        # and call receive_weights() once to bulk-fill them via a single
+        # RDMA pull from the matched-TP-rank source. The translator then
+        # walks the filled buffers and produces HF tensors.
+        #
+        # Mixed-TP (target_tp != source_tp) requires per-source pulls
+        # with optional sub-slicing; that's a v1 enhancement landing on
+        # top of an MxRefitReceiver.pull_to primitive. Phase B's planner
+        # already returns the right slice info; the gap is just the NIXL
+        # plumbing for partial-buffer registers.
+        ctx = self._mx_megatron_ctx
+        if not hasattr(self, "_mx_megatron_buffers"):
+            buffers: dict[str, "torch.Tensor"] = {}
+            for spec in ctx.receive_specs.values():
+                # The receiver's per-rank window along the shard axis.
+                # For matched-TP this matches a source's natural shard.
+                target_tp = ctx.target_tp_layout.tp_size
+                target_rank = ctx.target_tp_layout.tp_rank
+                full_shape = list(spec.target_shape)
+                if spec.role != "replicated" and target_tp > 1:
+                    axis_extent = full_shape[spec.shard_axis]
+                    per_rank = axis_extent // target_tp
+                    full_shape[spec.shard_axis] = (
+                        axis_extent
+                        if target_rank == target_tp - 1
+                        else per_rank
+                    )
+                # Replicated tensors stay at full shape; per_expert is
+                # one-tensor-per-expert (handled later by run_refit_cycle).
+                if spec.role.startswith("expert_"):
+                    # Per-expert: skip pre-allocation; per-cycle code path
+                    # builds per-expert buffers as part of assembly.
+                    continue
+                dt = {
+                    "bfloat16": torch.bfloat16, "float16": torch.float16,
+                    "float32": torch.float32,
+                }.get(spec.target_dtype, torch.bfloat16)
+                buffers[spec.megatron_name] = torch.empty(
+                    full_shape, dtype=dt, device=self.device,
+                )
+            # Register all at once with the receiver's NIXL plane.
+            self._mx_receiver._receiver._nixl.register_tensors(buffers)
+            self._mx_megatron_buffers = buffers
+            print(
+                f"[mx-megatron] pre-allocated + registered "
+                f"{len(buffers)} per-rank Megatron buffers "
+                f"({sum(b.numel() * b.element_size() for b in buffers.values()) / 1e9:.2f} GB)"
+            )
+
+        # Choose between matched-TP fast path and mixed-TP per-source path.
+        # Matched-TP requires the source's TP-world to equal the receiver's
+        # TP-world AND there to exist a source at our tp_rank. Otherwise
+        # fall through to the multi-source path.
+        matched = next(
+            (c for c in candidates
+             if c.megatron_meta is not None
+             and c.megatron_meta.tp_rank == ctx.target_tp_layout.tp_rank),
+            None,
+        )
+        any_megatron_tp_size = next(
+            (c.megatron_meta.tp_size for c in candidates
+             if c.megatron_meta is not None and c.megatron_meta.tp_size > 0),
+            None,
+        )
+        target_tp_size = ctx.target_tp_layout.tp_size
+        is_matched_tp = (
+            matched is not None
+            and (any_megatron_tp_size is None or any_megatron_tp_size == target_tp_size)
+        )
+
+        weights: list[tuple[str, "torch.Tensor"]] = []
+
+        if is_matched_tp:
+            # Bulk RDMA pull — single source, one wire transfer.
+            for _name, _t in self._mx_receiver.receive_from(
+                matched, timeout_seconds=mx_config.timeout_seconds,
+            ):
+                pass  # buffers filled in-place via NIXL
+
+            # pre_assembled_buffers tells run_refit_cycle to use the
+            # pre-filled tensors instead of calling the per-source pull
+            # callback.
+            def _noop_pull(src, dest):
+                pass
+
+            for hf_name, hf_tensor in run_refit_cycle(
+                self._mx_receiver,
+                candidates=candidates,
+                context=ctx,
+                pull=_noop_pull,
+                device=self.device,
+                pre_assembled_buffers=self._mx_megatron_buffers,
+            ):
+                weights.append((hf_name, hf_tensor))
+        else:
+            # Mixed-TP (target_tp != source_tp) or per-expert.
+            #
+            # v1 sliced-pull path:
+            #   * Pre-allocate a per-plan dest tensor (target_shape).
+            #   * For each plan source whose dest narrow is CONTIGUOUS
+            #     (axis 0 — column, qkv, gated_mlp, vocab, per_expert,
+            #     passthrough), build a SlicedTransferRequest pointing
+            #     directly at the dest view. Each source's requests
+            #     batch into one combined NIXL transfer per source.
+            #   * For non-contiguous narrows (axis 1 — row-parallel),
+            #     fall back to the v0 scratch+host-copy path.
+            #
+            # Bandwidth profile:
+            #   target-narrower: same as v0 (already optimal — each
+            #     receiver pulls a different source's full data).
+            #   target-wider: v1 cuts wire bytes by target_tp/source_tp×
+            #     for axis-0 roles by pulling only the sub-slice each
+            #     receiver needs from each source rank. Row-parallel
+            #     stays at v0 cost.
+            megatron_cands = [c for c in candidates if c.megatron_meta is not None]
+            print(
+                f"[mx-megatron] mixed-TP path: target_tp={target_tp_size} "
+                f"source_tp={any_megatron_tp_size or '?'} "
+                f"candidates={len(megatron_cands)}"
+            )
+
+            from modelexpress.megatron_translator import (
+                translate_megatron_to_hf,
+            )
+            from modelexpress.nemo_rl_v2 import MegatronTensorSpec
+
+            target_specs: dict[str, MegatronTensorSpec] = {
+                m_name: MegatronTensorSpec(
+                    role=rs.role,
+                    target_shape=rs.target_shape,
+                    target_dtype=rs.target_dtype,
+                    shard_axis=rs.shard_axis,
+                    pp_rank=rs.pp_rank,
+                    role_descriptor=dict(rs.role_descriptor or {}),
+                )
+                for m_name, rs in ctx.receive_specs.items()
+            }
+            plans = self._mx_receiver.pick_megatron_slice_plans(
+                megatron_cands,
+                target_tp_layout=ctx.target_tp_layout,
+                target_tensor_specs=target_specs,
+            )
+
+            # ------ Phase 1: pre-allocate + classify per-plan dests ------
+            dt_map = {
+                "bfloat16": torch.bfloat16, "float16": torch.float16,
+                "float32": torch.float32,
+            }
+            plan_dests: dict[str, "torch.Tensor"] = {}
+            # Per-source pull batches: cand_sid -> list[(name, subslice, dest_view)]
+            v1_batches: dict[str, list] = {c.ref.mx_source_id: [] for c in megatron_cands}
+            # Plans that need the v0 scratch path (non-contiguous narrows
+            # OR per_expert dict assembly).
+            v0_plans: list = []
+
+            for plan in plans:
+                if not plan.sources:
+                    continue
+                rs = ctx.receive_specs[plan.tensor_name]
+                dt = dt_map.get(rs.target_dtype, torch.bfloat16)
+                # per_expert returns a dict; fall back to v0 (host scratch
+                # + per-expert assembly).
+                if plan.assembly == "per_expert":
+                    v0_plans.append(plan)
+                    continue
+                dest = torch.empty(plan.target_shape, dtype=dt, device=self.device)
+                plan_dests[plan.tensor_name] = dest
+                axis = 1 if plan.assembly == "concat_dim1" else 0
+                routed_to_v1 = True
+                for src in plan.sources:
+                    target_lo, target_hi = src.target_local_range
+                    dest_view = dest.narrow(axis, target_lo, target_hi - target_lo)
+                    if not dest_view.is_contiguous():
+                        # Row-parallel axis-1 narrow → strided → can't RDMA
+                        # directly; whole plan falls back to v0.
+                        routed_to_v1 = False
+                        break
+                    v1_batches[src.mx_source_id].append(
+                        (plan.tensor_name, src.source_subslice, dest_view)
+                    )
+                if not routed_to_v1:
+                    # Drop any v1 entries for this plan that we already
+                    # queued and route the entire plan to v0.
+                    plan_dests.pop(plan.tensor_name, None)
+                    for sid in v1_batches:
+                        v1_batches[sid] = [
+                            r for r in v1_batches[sid] if r[0] != plan.tensor_name
+                        ]
+                    v0_plans.append(plan)
+
+            n_v1_slices = sum(len(b) for b in v1_batches.values())
+            print(
+                f"[mx-megatron] v1 sliced-pull: {n_v1_slices} slices across "
+                f"{sum(1 for b in v1_batches.values() if b)} sources "
+                f"(plans: {len(plan_dests)} via v1, {len(v0_plans)} via v0)"
+            )
+
+            # ------ Phase 2: NIXL register the dest buffers ------
+            # pull_to writes into the dest_views directly; the underlying
+            # buffer must be NIXL-registered so the agent can DMA to it.
+            if plan_dests:
+                t0 = time.perf_counter()
+                self._mx_receiver._receiver._nixl.register_tensors(plan_dests)
+                print(
+                    f"[mx-megatron] registered {len(plan_dests)} v1 dest buffers "
+                    f"with NIXL in {time.perf_counter() - t0:.2f}s"
+                )
+
+            # ------ Phase 3: per-source sliced pulls (v1) ------
+            t0 = time.perf_counter()
+            v1_total_bytes = 0
+            for cand in megatron_cands:
+                batch = v1_batches[cand.ref.mx_source_id]
+                if not batch:
+                    continue
+                xferred, n_slices, elapsed = self._mx_receiver._receiver.pull_to(
+                    cand.ref, batch, timeout_seconds=mx_config.timeout_seconds,
+                )
+                v1_total_bytes += xferred
+            v1_elapsed = time.perf_counter() - t0
+            if n_v1_slices:
+                v1_bw = (v1_total_bytes * 8) / (v1_elapsed * 1e9) if v1_elapsed > 0 else 0
+                print(
+                    f"[mx-megatron] v1 pull complete: {n_v1_slices} slices, "
+                    f"{v1_total_bytes / 1e9:.2f} GB, {v1_elapsed:.2f}s, "
+                    f"{v1_bw:.1f} Gbps aggregate"
+                )
+
+            # ------ Phase 4: v0 fallback for plans that needed scratch ------
+            scratch: dict[str, dict[str, "torch.Tensor"]] = {}
+            if v0_plans:
+                # Identify which sources contribute to the v0 plans.
+                v0_source_ids = set()
+                for plan in v0_plans:
+                    for src in plan.sources:
+                        v0_source_ids.add(src.mx_source_id)
+                v0_cands = [c for c in megatron_cands if c.ref.mx_source_id in v0_source_ids]
+                t0 = time.perf_counter()
+                for cand in v0_cands:
+                    buf_dict: dict[str, "torch.Tensor"] = {}
+                    for name, t in self._mx_receiver._receiver.receive_weights_scratch(
+                        cand.ref, timeout_seconds=mx_config.timeout_seconds,
+                    ):
+                        buf_dict[name] = t
+                    scratch[cand.ref.mx_source_id] = buf_dict
+                print(
+                    f"[mx-megatron] v0 fallback: scratch-pulled {len(v0_plans)} "
+                    f"plans from {len(v0_cands)} sources in "
+                    f"{time.perf_counter() - t0:.2f}s"
+                )
+            # ------ Phase 5: assemble + translate per plan ------
+            from modelexpress.megatron_translator import (
+                assemble_into_destination,
+            )
+            for plan in plans:
+                if not plan.sources:
+                    continue
+                rs = ctx.receive_specs[plan.tensor_name]
+                if plan.tensor_name in plan_dests:
+                    # v1 path: dest was filled directly by the sliced
+                    # NIXL transfer. No host-side assembly needed.
+                    assembled = plan_dests[plan.tensor_name]
+                else:
+                    # v0 path: scratch+slice-copy via assemble_into_destination
+                    # with a name+source-aware pull callback.
+                    def _pull_factory(name=plan.tensor_name, assembly=plan.assembly):
+                        def _pull(src, dest):
+                            full = scratch.get(src.mx_source_id, {}).get(name)
+                            if full is None:
+                                raise RuntimeError(
+                                    f"mixed-TP v0: scratch missing {name!r} from "
+                                    f"source {src.mx_source_id}"
+                                )
+                            axis = 1 if assembly == "concat_dim1" else 0
+                            if src.source_subslice is not None:
+                                slo, shi = src.source_subslice
+                                slice_src = full.narrow(axis, slo, shi - slo)
+                            else:
+                                slice_src = full
+                            if slice_src.shape != dest.shape:
+                                raise RuntimeError(
+                                    f"mixed-TP v0 shape mismatch on {name}: "
+                                    f"src={tuple(slice_src.shape)} "
+                                    f"dest={tuple(dest.shape)} "
+                                    f"axis={axis} subslice={src.source_subslice}"
+                                )
+                            dest.copy_(slice_src, non_blocking=True)
+                        return _pull
+                    assembled = assemble_into_destination(
+                        plan, pull=_pull_factory(), device=self.device,
+                    )
+                for hf_name, hf_tensor in translate_megatron_to_hf(
+                    plan, assembled,
+                    transformer_config=ctx.transformer_config,
+                    hf_names=list(rs.hf_names),
+                ):
+                    weights.append((hf_name, hf_tensor))
+
+        if not weights:
+            print(f"[mx-megatron] cycle yielded 0 tensors; refit aborted")
+            return False
+
+        self._load_weights(weights)
+        torch.cuda.current_stream().synchronize()
+        self._maybe_process_fp8_kv_cache()
+
+        if mx_config.tree_scale_out:
+            self._mx_receiver.publish_self_as_source(
+                version=int(version),
+                model_name=self.model_config.model
+                if hasattr(self.model_config, "model")
+                else getattr(
+                    self.model_runner.vllm_config.model_config, "model", "unknown",
+                ),
+            )
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        return True
 
     @wrap_with_nvtx_name(
         "vllm_internal_worker_extension/update_weights_from_collective"

@@ -1,0 +1,53 @@
+# Workplace-assistant + Dynamo + ModelExpress v2 mid-training refit
+# **with Megatron-Core training** (not DTensor).
+#
+# Inherits from grpo_workplace_assistant_dynamo_mx.yaml (which flips weight
+# sync to MX but uses DTensor) and overrides:
+#   * policy.megatron_cfg.enabled = true   (re-enable the parent's Megatron)
+#   * policy.dtensor_cfg.enabled = false   (turn off the v0 DTensor override)
+#   * remove policy.optimizer (was re-added for DTensor)
+#
+# Requires:
+#   * The DGD's Dynamo mx_refit/extension.py patched with the Megatron
+#     dispatch (calls modelexpress.megatron_translator.run_refit_cycle).
+#     The patch is committed at infra/nrl_k8s/dynamo_mx/extension_megatron_patch.py
+#     and overlayed onto the worker pod's
+#     /opt/dynamo/venv/lib/python3.12/site-packages/dynamo/vllm/mx_refit/extension.py
+#     before running.
+#   * The MX overlays (modelexpress nemo_rl_v2 / megatron_helpers /
+#     megatron_translator / refit_receiver / shape_descriptors /
+#     nixl_transfer) on both trainer + DGD worker venvs.
+#
+# Cluster validation (kavin / GB200, 2026-06-10/11):
+#   * Qwen3-4B-Thinking matched-TP shape 1: 398/398 byte-identical
+#   * Qwen3-MoE-30B-A3B shape 2: 18 867/18 867 byte-identical
+#   * Mixed-TP target-narrower (synthetic): 8/8 byte-identical
+#   * Mixed-TP target-wider v1 sliced-pull (synthetic): 16/16 byte-identical
+
+defaults: grpo_workplace_assistant_dynamo_mx.yaml
+
+grpo:
+  max_num_steps: 2          # one refit cycle to validate end-to-end
+
+policy:
+  megatron_cfg:
+    enabled: true
+  dtensor_cfg:
+    enabled: false
+
+  # The dtensor MX recipe re-populated optimizer for DTensor; Megatron
+  # reads from megatron_cfg.optimizer instead, so blank this back out.
+  optimizer: null
+  scheduler: null
+
+cluster:
+  weight_sync:
+    method: "mx"
+    mx_config:
+      enabled: true
+      mx_server_url: "modelexpress-server.kavin.svc.cluster.local:8001"
+      timeout_seconds: 300.0
+      same_rank_only: true
+      tree_scale_out: true
+      moe_expert_filter: false   # Qwen3-4B is dense
+      nixl_retry_budget: 3
