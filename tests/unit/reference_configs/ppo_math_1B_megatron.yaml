@@ -66,6 +66,7 @@ loss_fn:
   token_level_loss: true
   force_on_policy_ratio: false
   use_kl_in_reward: false  # No KL in reward (KL penalty is 0 anyway)
+  use_cispo: false  # CISPO (https://arxiv.org/abs/2506.13585): clipped IS-weight policy optimization
   # VAPO: NLL loss on correct samples. 0 = disabled.
   positive_example_nll_weight: 0.0  # VAPO: 0.1
 
