@@ -413,8 +413,9 @@ class VllmInternalWorkerExtension:
         # while vLLM uses ``model.*`` (e.g. ``backbone.layers.N.mixer.experts.
         # w13_weight`` -> ``model.layers.N.mixer.experts.w13_weight``).  Translate
         # at the point of vLLM-param lookup so the direct-match / merge rules below
-        # resolve.  Mamba SSM params + embeddings take the misc path instead (see
-        # is_misc_param), so vLLM's load_weights handles their special sharding and
+        # resolve.  Mamba SSM params take the misc path instead (the
+        # is_nccl_xfer_param whitelist excludes them), so vLLM's load_weights
+        # handles their special sharding and
         # the A_log -> A transform; they never reach this bulk mapping.  For
         # non-NemotronH models the name is unchanged, so this is a no-op.
         def _to_vllm_name(n):
@@ -437,8 +438,8 @@ class VllmInternalWorkerExtension:
                 "fused_qkv_a_proj.weight",
             ),
             # NB: FP8 ``*.weight_scale_inv`` siblings are NOT merged here — every
-            # ``_scale_inv`` takes the misc/load_weights path (is_misc_param), so
-            # they never reach this bulk mapping and need no merge rule.
+            # ``_scale_inv`` takes the misc/load_weights path (excluded by
+            # is_nccl_xfer_param), so they never reach this bulk mapping.
         ]
 
         for hf_name in hf_shapes:

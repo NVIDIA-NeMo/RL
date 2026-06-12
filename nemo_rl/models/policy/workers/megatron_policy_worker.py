@@ -1206,8 +1206,8 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             if local_tensor is None:
                 continue  # Non-local PP rank
 
-            # scale tensors are routed to misc_param path, so this function should
-            # skip the scale tensors. See is_misc_param in nccl_xfer_utils.py
+            # scale tensors are routed to the misc path, so this function should
+            # skip the scale tensors. See is_nccl_xfer_param in nccl_xfer_utils.py
             if task.global_param_name.endswith("_scale_inv"):
                 continue
 
@@ -1392,7 +1392,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         """
         from nemo_rl.distributed.nccl_xfer_utils import (
             build_nccl_xfer_refit_info,
-            is_misc_param,
+            is_nccl_xfer_param,
         )
 
         self.refit_param_info_mcore = self._calculate_refit_param_info()
@@ -1425,22 +1425,23 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                     "dtype": str(tensor.dtype),
                 }
                 _nbytes = tensor.numel() * tensor.element_size()
-                # filtering hard to handle params as a misc_param
-                if is_misc_param(name, qkv_to_misc=qkv_to_misc):
-                    misc_meta[name] = meta
-                    _bcast_bytes += _nbytes
-                else:
+                # Whitelist: only known-shardable params take the nccl-xfer path;
+                # everything else (incl. unknown/new params) -> misc (packed_broadcast).
+                if is_nccl_xfer_param(name, qkv_to_misc=qkv_to_misc):
                     state_dict_metadata[name] = meta
                     _xfer_bytes += _nbytes
+                else:
+                    misc_meta[name] = meta
+                    _bcast_bytes += _nbytes
 
         _gib = 1024**3
         _tot = _xfer_bytes + _bcast_bytes
         print(
             f"[xferd-payload] qkv_to_misc={qkv_to_misc} "
-            f"xfer_major={_xfer_bytes / _gib:.2f}GiB "
+            f"nccl_xfer={_xfer_bytes / _gib:.2f}GiB "
             f"bcast_misc={_bcast_bytes / _gib:.2f}GiB "
             f"total={_tot / _gib:.2f}GiB "
-            f"bcast_frac={_bcast_bytes / max(_tot, 1):.1%}",
+            f"xfer_frac={_xfer_bytes / max(_tot, 1):.1%}",
             flush=True,
         )
 
@@ -1476,11 +1477,23 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         # misc_meta[hf_name] -> [shape, dtype]
         self.nccl_xfer_refit_info["misc_meta"] = misc_meta
         # Filter conversion_tasks to the misc subset.
+        _misc_names = set(misc_meta.keys())
+
+        def _task_is_misc(task) -> bool:
+            # FP8 scale siblings carry the suffix on global_param_name and are
+            # always misc (packed_broadcast).
+            if task.global_param_name.endswith("_scale_inv"):
+                return True
+            # Compound mappings (QKV/GatedMLP) export homogeneous sub-params
+            # (all nccl-xfer or all misc), so the first HF name is representative.
+            hf = task.mapping.hf_param
+            name = next(iter(hf.values())) if isinstance(hf, dict) else str(hf)
+            return name in _misc_names
+
         self._misc_conversion_tasks = [
             task
             for task in self.refit_conversion_tasks
-            if task is not None
-            and is_misc_param(task.global_param_name, qkv_to_misc=qkv_to_misc)
+            if task is not None and _task_is_misc(task)
         ]
 
         return self.nccl_xfer_refit_info
@@ -1568,8 +1581,8 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         reconstructs the full tensor from per-rank shards internally.
 
         ``kv_scales`` (FP8 KV cache): the per-layer k/v(/q) scales ride the misc
-        packed-broadcast as plain scale tensors (is_misc_param routes
-        ``.k_scale``/``.v_scale``/``.q_scale`` to misc); the gen side finalizes
+        packed-broadcast as plain scale tensors (the is_nccl_xfer_param whitelist
+        excludes ``.k_scale``/``.v_scale``/``.q_scale`` -> misc); the gen side finalizes
         them via ``_maybe_process_fp8_kv_cache``.  No out-of-band channel needed.
         """
         from nemo_rl.distributed.xferdtensor import DTensorRef, xferdtensor

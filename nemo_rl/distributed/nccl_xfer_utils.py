@@ -62,8 +62,8 @@ class MeshInfo:
 
 # Column-parallel suffixes: TP shards along dim 0 (output dimension).
 # FP8 ``_scale_inv`` siblings are NOT listed here — they take the misc
-# refit path (see ``is_misc_param``), so vLLM's load_weights handles the
-# Parameter-specific FP8 blockwise quant layout.
+# refit path (the ``is_nccl_xfer_param`` whitelist excludes them), so vLLM's
+# load_weights handles the Parameter-specific FP8 blockwise quant layout.
 COLUMN_PARALLEL_SUFFIXES = [
     "q_proj.weight",
     "k_proj.weight",
@@ -134,65 +134,57 @@ def is_expert_param(param_name: str) -> bool:
     return ".experts." in param_name
 
 
-def is_misc_param(param_name: str, qkv_to_misc: bool = False) -> bool:
-    """Return True if the parameter should be routed to the misc refit path.
+def is_nccl_xfer_param(param_name: str, qkv_to_misc: bool = False) -> bool:
+    """Return True iff the param takes the xferdtensor reshard path.
 
-    Misc params are all-gathered to their full HF shape on the train side and
-    loaded via vLLM's ``model.load_weights`` on the gen side, letting vLLM
-    handle param-specific quirks (FP8 blockwise layout, Mamba/MoE sharding,
-    ``A_log -> A``) that xferdtensor's uniform column/row sharding can't
-    reproduce.  Everything else takes the xferdtensor bulk fast path.
+    The nccl-xfer refit path chooses parameters for the nccl-xfer path
+    in a whitelist manner, to remain robust to new model and layer types.
+    Parameters that are not in the whitelist are treated as misc params
+    that falls back to the conventional packed_broadcast path.
 
-    The same classifier runs on both the gen-side HF names and the train-side
-    Megatron names (Bridge preserves these suffixes through ``megatron_to_hf``).
-    It MUST classify each param identically on both sides, or the bulk/misc
-    split desyncs and packed_broadcast deadlocks.
+    The whitelist is:
+    - Embedding and output projection params.
+    - Most of the QKV weight params unless qkv_to_misc is True.
+    - MoE experts gate/up/down_proj weights.
 
-    ``qkv_to_misc`` routes attention QKV to the misc path too.  The bulk path
-    splits the fused QKV on each TP-local shard (split_qkv_weights), which needs
-    every rank to own whole K/V heads; when ``tp_size > num_query_groups`` (GQA
-    with few KV heads) Megatron channel-splits the KV heads and that local split
-    is impossible.
+    Notable params that correctly fall through to misc:
+      * FP8 ``_scale_inv`` siblings and ``.k/v/q_scale`` / ``.weight_scale`` /
+        ``.input_scale`` scales — vLLM load_weights owns the blockwise-FP8 layout.
+      * MoE router/gate (``mlp.gate.weight`` / ``mlp.router.weight`` /
+        ``mixer.gate.weight``) — bf16 in Megatron but fp8 in vLLM; the dtype
+        mismatch would deadlock the bulk collective, so load_weights quantizes it.
+      * NemotronH Mamba2 mixer params (in_proj / conv1d / A_log / A / D / dt_bias
+        / norm) and all replicated params (layernorms, biases, MLA q_a/kv_a
+        down-projections) — no clean uniform TP shard; load_weights handles them.
+
+    ``qkv_to_misc``: by default q/k/v_proj are subjected to the whitelist, but when
+    GQA KV heads can't be cleanly 1/tp-split (num_query_groups < max(train_tp, gen_tp))
+    the local split is impossible, so route fused/split QKV to misc instead.
     """
-    if qkv_to_misc and (
-        # Megatron fused QKV *weight* only — not the fused-in input layernorm
-        # (``linear_qkv.layer_norm_weight``), which maps to an HF norm and must
-        # stay on whichever path its HF name selects.
-        param_name.endswith("linear_qkv.weight")
-        or param_name.endswith(("q_proj.weight", "k_proj.weight", "v_proj.weight"))
+    if qkv_to_misc and param_name.endswith(
+        ("q_proj.weight", "k_proj.weight", "v_proj.weight", "linear_qkv.weight")
     ):
+        return False
+    # MoE experts: the bulk EP-grouping handles ONLY the exact grouped
+    # projections (gate/up/down_proj weight with a numeric expert index).
+    if _INDIVIDUAL_EXPERT_RE.match(param_name):
         return True
-    # FP8 blockwise scale siblings + KV-cache/activation scales.
-    if param_name.endswith("_scale_inv"):
-        return True
-    if param_name.endswith(
-        (".k_scale", ".v_scale", ".q_scale", ".weight_scale", ".input_scale")
+    # Any OTHER ``.experts.*`` param (bias, scale, router-under-experts, a novel
+    # projection) is not bulk-handled -> misc.  Mirrors get_tp_shard_dim's
+    # ``.experts.`` short-circuit so a suffix match below can't sneak an expert
+    # onto the TP-sharded path.
+    if ".experts." in param_name:
+        return False
+    # Explicitly TP-sharded params: column (q/k/v/o/gate/up/down, MLA up-projs),
+    # row, vocab.
+    for suffix in (
+        COLUMN_PARALLEL_SUFFIXES + ROW_PARALLEL_SUFFIXES + VOCAB_PARALLEL_NAMES
     ):
-        return True
-    # MoE router/gate Linear: vLLM blockwise-FP8 quantizes it to fp8 (+scale)
-    # while Megatron keeps it bf16 — that dtype mismatch would deadlock the
-    # xferdtensor collective, so let vLLM's load_weights quantize it.  Tiny and
-    # not an expert weight, so misc costs negligible bandwidth.  Match the HF
-    # forms (``mlp.gate.weight``, NemotronH ``mixer.gate.weight``) and the
-    # Megatron form (``mlp.router.weight``) so both sides classify it the same.
-    if param_name.endswith(
-        ("mlp.gate.weight", "mlp.router.weight", "mixer.gate.weight")
-    ):
-        return True
-    # NemotronH Mamba2 mixer params:
-    if param_name.endswith(
-        (
-            "mixer.in_proj.weight",
-            "mixer.conv1d.weight",
-            "mixer.conv1d.bias",
-            "mixer.A_log",
-            "mixer.A",
-            "mixer.D",
-            "mixer.dt_bias",
-            "mixer.norm.weight",
-        )
-    ):
-        return True
+        if param_name.endswith(suffix):
+            return True
+    # Unknown params match nothing in the whitelist -> misc.
+    # Mamba2 mixer params are not in the whitelist. (e.g. in_proj, conv1d,
+    # A_log, A, D, dt_bias, norm)
     return False
 
 
@@ -370,7 +362,7 @@ def get_placements(param_name: str, dim_map: dict, ndim: int) -> list:
 
 # Matches individual expert params: model.layers.X.mlp.experts.Y.proj.weight
 # Anchored with ``$`` so it doesn't prefix-match FP8 ``_scale_inv`` siblings
-# (scale_inv siblings take the misc refit path via ``is_misc_param`` and
+# (scale_inv siblings take the misc refit path via ``is_nccl_xfer_param`` and
 # must not appear in the per-expert weight fusion groups).
 _INDIVIDUAL_EXPERT_RE = re.compile(
     r"(.+\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$"
