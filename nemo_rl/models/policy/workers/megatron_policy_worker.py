@@ -90,6 +90,7 @@ from nemo_rl.models.policy.interfaces import (
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
+from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
@@ -510,6 +511,8 @@ class MegatronPolicyWorkerImpl(
                     num_zeros_in_grad, mp_group=pg_collection.mp
                 )
 
+                warn_if_inf_grad_norm(grad_norm)
+                
                 # Empty unused memory.
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 2:
                     torch.cuda.empty_cache()
