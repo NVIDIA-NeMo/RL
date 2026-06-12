@@ -40,6 +40,7 @@ from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generati
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 
 
 def _resolve_enable_prefix_caching(vllm_cfg: dict[str, Any]) -> bool:
@@ -504,6 +505,9 @@ class BaseVllmGenerationWorker:
 
         _patch_vllm_llama_eagle3_own_lm_head()
         _patch_vllm_hermes_tool_parser_thread_safety()
+        log_gpu_memory_diagnostics(
+            label="load_model_start", worker_type="VllmGenerationWorker"
+        )
 
     def _load_model(self, bundle_indices, seed):
         """Perform the heavy model loading and engine creation.
@@ -664,10 +668,16 @@ class BaseVllmGenerationWorker:
         )
 
         self._create_engine(llm_kwargs)
+        log_gpu_memory_diagnostics(
+            label="after_engine_create", worker_type="VllmGenerationWorker", device_id=0
+        )
 
         # will be initialized in post_init
         # used in update_weights_from_ipc_handles
         self.vllm_device_ids = None
+        log_gpu_memory_diagnostics(
+            label="load_model_complete", worker_type="VllmGenerationWorker", device_id=0
+        )
 
     def llm(self):
         return self.llm
