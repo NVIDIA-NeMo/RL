@@ -53,18 +53,29 @@ import torch
 from nemo_rl.algorithms.x_token.token_aligner import AlignmentBatch
 
 
-def alignment_from_flat_batch(data: Mapping[str, Any]) -> AlignmentBatch:
-    """Rebuild :class:`AlignmentBatch` from the flat ``alignment_*`` keys.
+def alignment_from_flat_batch(
+    data: Mapping[str, Any], prefix: str = "alignment_"
+) -> AlignmentBatch:
+    """Rebuild :class:`AlignmentBatch` from the flat ``<prefix>*`` keys.
 
     The field set is driven off :class:`AlignmentBatch` so the helper
     can't drift from the schema.
+
+    Args:
+        data: The loss data dict carrying the flat alignment keys.
+        prefix: Key prefix to read. Defaults to ``"alignment_"`` (the
+            single-teacher layout). Multi-teacher callers pass
+            ``f"alignment_{i}_"`` so teacher ``i`` reads its own alignment
+            payload rather than teacher 0's.
     """
     return AlignmentBatch(
-        **{f.name: data[f"alignment_{f.name}"] for f in fields(AlignmentBatch)}
+        **{f.name: data[f"{prefix}{f.name}"] for f in fields(AlignmentBatch)}
     )
 
 
-def rebuild_teacher_full_logits_from_ipc(data: Mapping[str, Any]) -> torch.Tensor:
+def rebuild_teacher_full_logits_from_ipc(
+    data: Mapping[str, Any], key: str = "teacher_full_logits_ipc"
+) -> torch.Tensor:
     """View-only rebuild of the microbatch's teacher-logits slice from IPC.
 
     The producer maintains a **persistent** IPC buffer on its GPU sized
@@ -82,16 +93,19 @@ def rebuild_teacher_full_logits_from_ipc(data: Mapping[str, Any]) -> torch.Tenso
     preserved (the loss fn casts if/where it needs fp32).
 
     Args:
-        data: The loss data dict, carrying ``teacher_full_logits_ipc`` -- a
-            list of per-sample IPC handle dicts produced by
+        data: The loss data dict, carrying the IPC handle list under ``key``
+            -- a list of per-sample IPC handle dicts produced by
             ``Policy.get_full_logits_ipc``.
+        key: Data-dict key holding the IPC handle list. Defaults to
+            ``"teacher_full_logits_ipc"`` (single-teacher layout);
+            multi-teacher callers pass ``f"teacher_{i}_full_logits_ipc"``.
 
     Returns:
         A ``[mb_B, T_t, V_t]`` view into the producer's GPU memory (no copy).
     """
     from nemo_rl.models.policy.utils import rebuild_cuda_tensor_from_ipc
 
-    entries = data["teacher_full_logits_ipc"]
+    entries = data[key]
     consumer_device = torch.cuda.current_device()
 
     first = entries[0]
