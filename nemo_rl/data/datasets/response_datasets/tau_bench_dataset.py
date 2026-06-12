@@ -31,7 +31,6 @@ from datasets import Dataset
 from nemo_rl.data.datasets.raw_dataset import RawDataset
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
 
-
 _TOOL_CALL_INSTRUCTIONS = """\
 To call a tool, wrap a JSON object in <tool_call> tags:
 

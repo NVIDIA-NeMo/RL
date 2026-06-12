@@ -755,6 +755,7 @@ def tau_bench_data_processor(
         "idx": idx,
         "task_name": datum_dict.get("task_name", "tau_bench"),
     }
+    return output
 
 
 def kd_data_processor(

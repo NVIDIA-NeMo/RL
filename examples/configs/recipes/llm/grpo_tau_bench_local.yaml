@@ -1,41 +1,11 @@
-# GRPO training on tau-bench with local vLLM inference endpoints.
-# Identical to grpo_tau_bench_internal.yaml except the user simulator and judge
-# are served by local vLLM instances instead of the NVIDIA inference API.
-#
-# How to start the servers (see also: docs/local_vllm_endpoints.md):
-#
-#   # User simulator (small/fast model is sufficient):
-#   vllm serve meta-llama/Llama-3.1-8B-Instruct \
-#       --port 8100 \
-#       --tensor-parallel-size <N_GPUS> \
-#       --gpu-memory-utilization 0.9
-#
-#   # Judge (can reuse the user simulator server if same model and port):
-#   vllm serve meta-llama/Llama-3.1-8B-Instruct \
-#       --port 8101 \          # use 8100 to share with user simulator
-#       --tensor-parallel-size <N_GPUS> \
-#       --gpu-memory-utilization 0.9
-#
-# Set USER_SERVER_HOST / JUDGE_SERVER_HOST to the hostname or IP of the machine
-# running each server (or "localhost" if on the same node).
-#
-# Tool call format expected from the policy:
-#   <tool_call>{"name": "tool_name", "arguments": {"key": "value"}}</tool_call>
-# Text without a <tool_call> block is treated as a respond action to the user.
-
-defaults: "../../grpo_math_1B.yaml"
-
+defaults: ../../grpo_math_1B.yaml
 grpo:
   num_prompts_per_step: 128
-  num_generations_per_prompt: 16
-  batch_multiplier: 1 #3
   max_num_steps: 10000
   use_leave_one_out_baseline: false
   val_period: 20
   max_val_samples: 960
   val_batch_size: 960
-  use_dynamic_sampling: false #true
-  # tau-bench episodes can be up to ~50 tool calls; set headroom above max_steps.
   max_rollout_turns: 56
   max_num_epochs: 5000
   reward_scaling:
@@ -45,21 +15,15 @@ grpo:
     enabled: true
     overlong_buffer_length: 2048
     max_response_length: 14336
-
 loss_fn:
   reference_policy_kl_penalty: 0.0
   ratio_clip_max: 0.28
   ratio_clip_c: 10
-
 checkpointing:
-  enabled: true
   checkpoint_dir: results/grpo-tau-bench-local
-  metric_name: "val:accuracy"
-  higher_is_better: true
   keep_top_k: 5
   save_period: 5
   model_save_format: null
-
 policy:
   model_name: Qwen/Qwen2.5-7B-Instruct
   hf_config_overrides:
@@ -74,7 +38,6 @@ policy:
   megatron_cfg:
     enabled: true
     tensor_model_parallel_size: 2
-    pipeline_model_parallel_size: 1
     context_parallel_size: 4
     sequence_parallel: true
     optimizer:
@@ -85,8 +48,6 @@ policy:
       lr_decay_iters: null
       lr_warmup_iters: 10
       lr_warmup_init: 1.0e-07
-  sequence_packing:
-    enabled: true
   optimizer:
     kwargs:
       lr: 1.0e-06
@@ -104,71 +65,47 @@ policy:
   - milestones:
     - 10
   generation:
-    backend: "vllm"
-    max_new_tokens: 1024 #512   # per turn; tool calls are short
-    stop_strings: null    # turn separator prepended to each observation by _tokenize_env_observation
+    max_new_tokens: 1024
     vllm_cfg:
-      tensor_parallel_size: 2 #1
+      tensor_parallel_size: 2
       gpu_memory_utilization: 0.7
-      enforce_eager: false #true
-
 cluster:
   gpus_per_node: 8
   num_nodes: 16
-
 env:
   tau_bench:
     num_workers: 16
-    env_name: "retail"       # "retail" or "airline"
-    task_split: "train"
-    user_strategy: "llm"
-    # User simulator: local vLLM server.
-    # The model name after "openai/" must match the name reported by vLLM's
-    # /v1/models endpoint (typically the HuggingFace repo path you passed to
-    # "vllm serve").
-    user_model: "openai/meta-llama/Llama-3.1-8B-Instruct"
-    user_base_url: "http://${oc.env:USER_SERVER_HOST,localhost}:8100/v1"
-    user_api_key: "local"    # vLLM does not validate the key; any non-empty string works
+    env_name: retail
+    task_split: train
+    user_strategy: llm
+    user_model: openai/meta-llama/Llama-3.1-8B-Instruct
+    user_base_url: http://${oc.env:USER_SERVER_HOST,localhost}:8100/v1
+    user_api_key: local
     max_steps: 15
-    # LLM-as-judge: local vLLM server.
-    # Set judge_model to null to disable and use pure tau-bench rewards.
-    # Pointing at the same host:port as user_base_url reuses the user simulator
-    # server (no extra node needed when both use the same model).
-    judge_model: "openai/meta-llama/Llama-3.1-8B-Instruct"
-    judge_base_url: "http://${oc.env:USER_SERVER_HOST,localhost}:8100/v1"
-    judge_api_key: "local"
-    judge_weight: 0.3   # 70% task-completion + 30% judge score
+    judge_model: openai/meta-llama/Llama-3.1-8B-Instruct
+    judge_base_url: http://${oc.env:USER_SERVER_HOST,localhost}:8100/v1
+    judge_api_key: local
+    judge_weight: 0.3
     worker_stagger_delay_s: 1.0
-    # With a local server the round-trip is much faster; you can raise this
-    # without hitting remote rate limits.
     max_concurrent_api_requests: 8
-
 data:
-  max_input_seq_length: 16384 #8192
+  max_input_seq_length: 16384
   train:
-    dataset_name: "tau_bench"
+    dataset_name: tau_bench
     tau_bench_env_name: ${env.tau_bench.env_name}
-    split: "train"
+    split: train
   validation:
-    dataset_name: "tau_bench"
+    dataset_name: tau_bench
     tau_bench_env_name: ${env.tau_bench.env_name}
-    split: "test"
+    split: test
   default:
     prompt_file: null
-    system_prompt_file: null
-    processor: "tau_bench_data_processor"
-    env_name: "tau_bench"
-
+    processor: tau_bench_data_processor
+    env_name: tau_bench
 logger:
-  log_dir: "logs"
   wandb_enabled: true
-  tensorboard_enabled: false
-  mlflow_enabled: false
-  swanlab_enabled: false
   monitor_gpus: false
   wandb:
-    project: "grpo-dev"
-    name: "grpo-tau-bench-local-qwen7b"
+    name: grpo-tau-bench-local-qwen7b
   mlflow:
-    experiment_name: "grpo-dev"
-    run_name: "grpo-tau-bench-local"
+    run_name: grpo-tau-bench-local

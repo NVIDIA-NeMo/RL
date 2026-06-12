@@ -21,7 +21,6 @@ import unittest.mock as mock
 import pytest
 import torch
 
-
 # ---------------------------------------------------------------------------
 # Module-level mocks: tau_bench is an optional dependency not available in CI
 # ---------------------------------------------------------------------------
@@ -55,6 +54,14 @@ for _name, _mod in [
 ]:
     sys.modules.setdefault(_name, _mod)
 
+# litellm is an optional dependency not installed in the unit-test environment;
+# stub it out so tests can mock.patch("litellm.completion") without ImportError.
+if "litellm" not in sys.modules:
+    _litellm = _make_module("litellm")
+    _litellm.completion = None
+    _litellm.BadRequestError = Exception
+    sys.modules["litellm"] = _litellm
+
 # decord is an optional multimedia dependency; stub it out so transformers
 # can discover it via importlib.util.find_spec without crashing.
 if "decord" not in sys.modules:
@@ -63,9 +70,9 @@ if "decord" not in sys.modules:
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.tau_bench_environment import (
+    _TOOL_CALL_RE,
     TauBenchEnvironment,
     TauBenchWorker,
-    _TOOL_CALL_RE,
 )
 
 # ---------------------------------------------------------------------------

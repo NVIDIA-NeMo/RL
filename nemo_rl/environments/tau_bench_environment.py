@@ -31,7 +31,6 @@ from nemo_rl.environments.interfaces import EnvironmentInterface, EnvironmentRet
 from nemo_rl.environments.metrics import calculate_pass_rate_per_prompt
 from nemo_rl.environments.utils import chunk_list_to_workers
 
-
 _TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
 
 _JUDGE_SYSTEM_PROMPT = """\
