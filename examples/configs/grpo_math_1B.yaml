@@ -189,8 +189,6 @@ policy:
     mtp_use_repeated_layer: false
     # When true, detach MTP heads so MTP loss does not affect main-model gradients.
     mtp_detach_heads: false
-    # When true, restrict the MTP loss mask to positive-advantage tokens.
-    mtp_positive_only: false
     gradient_accumulation_fusion: false
 
     peft:
