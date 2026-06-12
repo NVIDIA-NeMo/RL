@@ -156,6 +156,93 @@ Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"""
 
 
 class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
+    def __init__(
+        self,
+        config,
+        bundle_indices=None,
+        fraction_of_gpus: float = 1.0,
+        seed=None,
+        extra_env_vars: Optional[list[str]] = None,
+        defer_model_load: bool = False,
+    ):
+        """Initialize an async vLLM worker.
+
+        When defer_model_load=True, only stores config and reserves a port for
+        the HTTP server (if expose_http_server is enabled). Call load_model()
+        later to perform the heavy model loading. This enables overlapping vLLM
+        model loading with NeMo Gym init.
+
+        Args:
+            config: Configuration dictionary for the policy
+            bundle_indices: List of local bundle indices within a node for parallelism.
+            fraction_of_gpus: Fraction of GPUs to use for this worker
+            seed: Random seed for initialization
+            extra_env_vars: Additional environment variable names to forward into
+                          the vLLM worker subprocess.
+            defer_model_load: If True, skip model loading and only reserve port
+        """
+        # Deferred-loading state. Always initialized so every instance has a
+        # consistent set of attributes regardless of init path.
+        self._reserved_socket = None
+        self._reserved_port = None
+        self._reserved_node_ip = None
+        self._deferred_bundle_indices = None
+        self._deferred_seed = None
+
+        super().__init__(
+            config,
+            bundle_indices,
+            fraction_of_gpus,
+            seed,
+            extra_env_vars,
+            defer_model_load,
+        )
+
+        if not self.is_model_owner or not defer_model_load:
+            return
+
+        self._deferred_bundle_indices = bundle_indices
+        self._deferred_seed = seed
+
+        if self.cfg["vllm_cfg"].get("expose_http_server"):
+            self._reserve_port()
+
+        self.llm = None
+        self.vllm_device_ids = None
+
+    def _reserve_port(self) -> None:
+        """Bind and listen on a TCP socket to reserve a free port from the OS.
+
+        The socket is held open in LISTENING state and later passed directly to
+        uvicorn via the ``sockets=`` parameter in ``server.serve()``. The socket
+        is never closed and re-opened, so there is zero gap where another process
+        could steal the port.
+        """
+        import socket
+
+        from nemo_rl.distributed.virtual_cluster import _get_node_ip_local
+
+        self._reserved_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._reserved_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._reserved_socket.bind(("", 0))
+        self._reserved_socket.listen(128)
+        self._reserved_socket.setblocking(False)
+        self._reserved_port = self._reserved_socket.getsockname()[1]
+        self._reserved_node_ip = _get_node_ip_local()
+        print(
+            f"Reserved port {self._reserved_port} on {self._reserved_node_ip} "
+            f"for vLLM HTTP server"
+        )
+
+    def load_model(self) -> None:
+        """Load the vLLM model and create the engine.
+
+        Called after a deferred init to perform the heavy model loading.
+        """
+        if not self.is_model_owner:
+            return
+        self._load_model(self._deferred_bundle_indices, self._deferred_seed)
+
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
         from vllm.config import CompilationConfig
         from vllm.engine.arg_utils import AsyncEngineArgs
@@ -321,6 +408,12 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
     async def post_init_async(self):
         self.vllm_device_ids = await self.report_device_id_async()
+
+    async def get_reserved_url(self) -> Optional[str]:
+        """Return the URL from the reserved socket, available before model loading."""
+        if self._reserved_socket is not None:
+            return f"http://{self._reserved_node_ip}:{self._reserved_port}/v1"
+        return None
 
     async def report_dp_openai_server_base_url(self) -> Optional[str]:
         return self.base_url
@@ -761,14 +854,24 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         # Server spinup
         ########################################
 
-        node_ip = _get_node_ip_local()
-        port_range_low = self.cfg.get(
-            "port_range_low", DEFAULT_GENERATION_PORT_RANGE_LOW
-        )
-        port_range_high = self.cfg.get(
-            "port_range_high", DEFAULT_GENERATION_PORT_RANGE_HIGH
-        )
-        free_port = _get_free_port_local(port_range_low, port_range_high)
+        if self._reserved_socket is not None:
+            # Use the socket reserved during __init__ (deferred model load path).
+            # Pass it directly to uvicorn via sockets= — zero gap, the socket is
+            # never closed and re-opened, so no other process can steal the port.
+            node_ip = self._reserved_node_ip
+            free_port = self._reserved_port
+            reserved_sock = self._reserved_socket
+            self._reserved_socket = None  # Transfer ownership to uvicorn
+        else:
+            node_ip = _get_node_ip_local()
+            port_range_low = self.cfg.get(
+                "port_range_low", DEFAULT_GENERATION_PORT_RANGE_LOW
+            )
+            port_range_high = self.cfg.get(
+                "port_range_high", DEFAULT_GENERATION_PORT_RANGE_HIGH
+            )
+            free_port = _get_free_port_local(port_range_low, port_range_high)
+            reserved_sock = None
 
         base_url = f"http://{node_ip}:{free_port}/v1"
         print(f"Starting server on {base_url}")
@@ -793,7 +896,19 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         uvicorn_logger = getLogger("uvicorn.access")
         uvicorn_logger.addFilter(No200Filter())
 
-        thread = threading.Thread(target=server.run, daemon=True)
+        if reserved_sock is not None:
+            # Hand the pre-bound listening socket directly to uvicorn's asyncio
+            # server via server.serve(sockets=). No close-and-rebind needed.
+            import asyncio
+
+            def _run_with_socket():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(server.serve(sockets=[reserved_sock]))
+
+            thread = threading.Thread(target=_run_with_socket, daemon=True)
+        else:
+            thread = threading.Thread(target=server.run, daemon=True)
         thread.start()
 
         return thread, base_url, server

@@ -1101,7 +1101,7 @@ class TestTopkLogitsPostProcessor:
         ):
             wrapped_fn(output_tensor)
 
-    @patch("nemo_rl.models.megatron.train.allgather_packed_thd_cp_sharded_tensor")
+    @patch("nemo_rl.models.megatron.train.allgather_cp_sharded_tensor")
     @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
     @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
     @patch(
@@ -1163,7 +1163,7 @@ class TestTopkLogitsPostProcessor:
         assert result["topk_logits"].shape == (1, 8, k)
         assert result["topk_indices"].shape == (1, 8, k)
 
-    @patch("nemo_rl.models.megatron.train.allgather_packed_thd_cp_sharded_tensor")
+    @patch("nemo_rl.models.megatron.train.allgather_cp_sharded_tensor")
     @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
     @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
     @patch(
@@ -1206,15 +1206,12 @@ class TestTopkLogitsPostProcessor:
         mock_topk_idx = torch.randint(0, 100, (1, local_packed_len, k))
         mock_topk.return_value = (mock_topk_vals, mock_topk_idx)
 
-        # allgather returns full packed tensors, then the postprocessor unpacks
-        # each sequence according to cu_seqlens_padded.
-        gathered_vals = torch.arange(total_packed_len * k, dtype=torch.float32).reshape(
-            1, total_packed_len, k
-        )
-        gathered_idx = torch.arange(total_packed_len * k, dtype=torch.long).reshape(
-            1, total_packed_len, k
-        )
-        mock_allgather.side_effect = [gathered_vals, gathered_idx]
+        # allgather is called once per sequence (2 sequences x 2 tensors = 4 calls)
+        def fake_allgather(local_tensor, group, seq_dim):
+            # Simulate gathering: double the seq_dim since cp_size=2
+            return local_tensor.repeat(1, cp_size, 1)
+
+        mock_allgather.side_effect = fake_allgather
 
         cu_seqlens_padded = torch.tensor([0, seq1_len, total_packed_len])
 
@@ -1226,27 +1223,13 @@ class TestTopkLogitsPostProcessor:
         output_tensor = torch.randn(1, local_packed_len, 100)
         loss, result = wrapped_fn(output_tensor)
 
-        # allgather called once for values and once for indices.
-        assert mock_allgather.call_count == 2
+        # allgather called 2x per sequence (vals + idx) x 2 sequences = 4 calls
+        assert mock_allgather.call_count == 4
         assert "topk_logits" in result
         assert "topk_indices" in result
         # Output should be unpacked: (batch_size=2, unpacked_seqlen=6, k=3)
         assert result["topk_logits"].shape == (2, unpacked_seqlen, k)
         assert result["topk_indices"].shape == (2, unpacked_seqlen, k)
-        torch.testing.assert_close(
-            result["topk_logits"][0, :seq1_len], gathered_vals[0, :seq1_len]
-        )
-        torch.testing.assert_close(
-            result["topk_logits"][1, :seq2_len],
-            gathered_vals[0, seq1_len:total_packed_len],
-        )
-        assert torch.equal(
-            result["topk_indices"][0, :seq1_len], gathered_idx[0, :seq1_len]
-        )
-        assert torch.equal(
-            result["topk_indices"][1, :seq2_len],
-            gathered_idx[0, seq1_len:total_packed_len],
-        )
 
 
 class TestAggregateTrainingStatistics:

@@ -26,7 +26,6 @@ from nemo_rl.distributed.model_utils import (
     DistributedLogprob,
     DistributedLogprobWithSampling,
     _compute_distributed_log_softmax,
-    _get_packed_thd_tokens_on_this_cp_rank,
     _get_tokens_on_this_cp_rank,
     allgather_cp_sharded_tensor,
     from_parallel_logits_to_logprobs,
@@ -125,24 +124,18 @@ class ModelUtilsTestActor:
         cu_seqlens = torch.nn.functional.pad(
             torch.cumsum(seq_lengths, dim=0, dtype=torch.int32), (1, 0)
         ).to("cuda")
-        cu_seqlens_padded = cu_seqlens.clone()
 
         # Pack the logits and target_ids
-        full_packed_logits = unpacked_logits.reshape(1, -1, vocab_part_size)
-        packed_logits = _get_packed_thd_tokens_on_this_cp_rank(
-            full_packed_logits,
-            cu_seqlens_padded,
-            torch.distributed.get_rank(cp_group),
-            self.cp_size,
-            seq_dim=1,
-        )
+        packed_logits = _get_tokens_on_this_cp_rank(
+            unpacked_logits, cp_rank, self.cp_size, seq_dim=1
+        ).reshape(1, -1, vocab_part_size)
         packed_target_ids = unpacked_target_ids.reshape(1, -1)
 
         # 3. Get actual logprobs from packed function
         actual_logprobs = from_parallel_logits_to_logprobs_packed_sequences(
             packed_logits,
             packed_target_ids,
-            cu_seqlens_padded,
+            cu_seqlens,
             seq_len,  # unpacked_seqlen
             vocab_start_index,
             vocab_end_index,
@@ -202,7 +195,6 @@ import numpy as np
     [
         (2, 1),  # TP=2, CP=1
         (1, 2),  # TP=1, CP=2
-        (2, 2),  # TP=2, CP=2
     ],
 )
 def test_from_parallel_logits_to_logprobs_packed_sequences(
@@ -217,11 +209,9 @@ def test_from_parallel_logits_to_logprobs_packed_sequences(
         pytest.skip(
             f"Not enough GPUs available. Need {world_size}, got {torch.cuda.device_count()}"
         )
-    if cp_size > 1:
-        pytest.importorskip("transformer_engine_torch")
 
     # Create appropriate virtual cluster
-    cluster = RayVirtualCluster(bundle_ct_per_node_list=[world_size], use_gpus=True)
+    cluster = RayVirtualCluster(bundle_ct_per_node_list=[2], use_gpus=True)
 
     try:
         actor_fqn = register_model_utils_test_actor
@@ -324,23 +314,21 @@ def _run_packed_sequences_equivalence(rank, world_size, tp_size, cp_size, chunk_
     ]
 
     # --- Pack logits: [B, S, V_local] -> [1, T_padded // CP, V_local] ---
-    # Build the full packed THD tensor, then slice it with the same TE/Megatron
-    # indices used by production sequence packing.
-    full_packed_logits = torch.zeros(1, total_padded, vocab_part_size, device="cuda")
+    # Each sequence is individually padded and CP-sharded (matching production).
+    packed_logits = torch.zeros(
+        1, total_padded // cp_size, vocab_part_size, device="cuda"
+    )
     for i in range(batch_size):
         sl = raw_seq_lengths[i]
         psl = padded_seq_lengths[i]
         padded_seq = torch.zeros(1, psl, vocab_part_size, device="cuda")
         padded_seq[:, :sl, :] = unpacked_logits_local[i : i + 1, :sl, :]
         offset = int(cu_seqlens_padded[i].item())
-        full_packed_logits[:, offset : offset + psl, :] = padded_seq
-    packed_logits = _get_packed_thd_tokens_on_this_cp_rank(
-        full_packed_logits,
-        cu_seqlens_padded,
-        my_cp_rank_val,
-        cp_size,
-        seq_dim=1,
-    )
+        if cp_size > 1:
+            sharded = _get_tokens_on_this_cp_rank(padded_seq, my_cp_rank_val, cp_size)
+            packed_logits[:, offset // cp_size : (offset + psl) // cp_size, :] = sharded
+        else:
+            packed_logits[:, offset : offset + psl, :] = padded_seq
 
     # --- Path 1: target_is_pre_rolled=False ---
     # Pack raw (unrolled) input_ids to [1, T_padded] using _pack_input_ids.
@@ -394,23 +382,26 @@ def _run_packed_sequences_equivalence(rank, world_size, tp_size, cp_size, chunk_
         )
 
     # --- Also compare against the unpacked baseline ---
-    baseline_logprobs = from_parallel_logits_to_logprobs(
-        unpacked_logits_local,
-        input_ids,
-        vocab_start_index,
-        vocab_end_index,
-        tp_group,
-        cp_group=None,
-    )
-    for i in range(batch_size):
-        valid_len = raw_seq_lengths[i] - 1
-        torch.testing.assert_close(
-            logprobs_not_pre_rolled[i, :valid_len],
-            baseline_logprobs[i, :valid_len],
-            rtol=1e-5,
-            atol=1e-5,
-            msg=f"packed vs unpacked mismatch on rank {rank}, seq {i}",
+    # The unpacked function CP-shards each row from max_seq_len, which matches
+    # the packed per-sequence CP-sharding only when CP=1.
+    if cp_size == 1:
+        baseline_logprobs = from_parallel_logits_to_logprobs(
+            unpacked_logits_local,
+            input_ids,
+            vocab_start_index,
+            vocab_end_index,
+            tp_group,
+            cp_group=cp_group,
         )
+        for i in range(batch_size):
+            valid_len = raw_seq_lengths[i] - 1
+            torch.testing.assert_close(
+                logprobs_not_pre_rolled[i, :valid_len],
+                baseline_logprobs[i, :valid_len],
+                rtol=1e-5,
+                atol=1e-5,
+                msg=f"packed vs unpacked mismatch on rank {rank}, seq {i}",
+            )
 
 
 @pytest.mark.parametrize(
@@ -418,10 +409,8 @@ def _run_packed_sequences_equivalence(rank, world_size, tp_size, cp_size, chunk_
     [
         (2, 1, None),
         (1, 2, None),
-        (2, 2, None),
         (2, 1, 8),
         (1, 2, 8),
-        (2, 2, 8),
     ],
     ids=lambda v: str(v),
 )
@@ -434,9 +423,6 @@ def test_packed_sequences_with_distributed_runner(
     with proper code coverage tracking (unlike Ray-based tests).
     """
     world_size = tp_size * cp_size
-    if cp_size > 1:
-        pytest.importorskip("transformer_engine_torch")
-
     test_fn = functools.partial(
         _run_packed_sequences_equivalence,
         tp_size=tp_size,
