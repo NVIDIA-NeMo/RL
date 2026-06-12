@@ -1623,6 +1623,13 @@ class MegatronPolicyWorkerImpl(
     ):
         """Save a training checkpoint.
 
+        With async_save=True, this method returns after D2H staging. The actual
+        disk write continues in a background persistent worker process. Callers
+        must call finalize_async_save() before renaming the directory or starting
+        another save.
+
+        With async_save=False (default), this blocks until the write is complete.
+
         Args:
             weights_path: The specific directory path where the checkpoint will be saved.
             optimizer_path: If not None, optimizer and scheduler states are saved if they exist.
@@ -1638,14 +1645,15 @@ class MegatronPolicyWorkerImpl(
             )
 
         original_save_path = self.mcore_state.cfg.checkpoint.save
-        # save_dir = os.path.dirname(weights_path)
-        release_name = os.path.basename(weights_path)
+        is_async = self.mcore_state.cfg.checkpoint.async_save
 
         try:
+            # Block until any previous async save is fully written to disk.
+            # With sync save this is a no-op.
             maybe_finalize_async_save(
                 self.mcore_state,
                 ckpt_cfg=self.mcore_state.cfg.checkpoint,
-                blocking=False,
+                blocking=True,
             )
             self.mcore_state.cfg.checkpoint.save = weights_path
 
@@ -1676,12 +1684,14 @@ class MegatronPolicyWorkerImpl(
                 checkpointing_context=self.checkpointing_context,
             )
             print(f"Saved checkpoint to {weights_path}")
-            maybe_finalize_async_save(
-                self.mcore_state,
-                ckpt_cfg=self.mcore_state.cfg.checkpoint,
-                blocking=True,
-                terminate=True,
-            )
+
+            if not is_async:
+                # Sync path: finalize immediately (runs finalize_fns + barrier).
+                maybe_finalize_async_save(
+                    self.mcore_state,
+                    ckpt_cfg=self.mcore_state.cfg.checkpoint,
+                    blocking=True,
+                )
             if self.should_disable_forward_pre_hook:
                 self.enable_forward_pre_hook()
 
@@ -1693,6 +1703,29 @@ class MegatronPolicyWorkerImpl(
             raise
         finally:
             self.mcore_state.cfg.checkpoint.save = original_save_path
+
+    def finalize_async_save(self):
+        """Block until the in-flight async write completes and run finalize_fns.
+
+        Safe to call when async_save is disabled (no-op).
+        Does NOT terminate the persistent worker — it stays alive for the next save.
+        """
+        maybe_finalize_async_save(
+            self.mcore_state,
+            ckpt_cfg=self.mcore_state.cfg.checkpoint,
+            blocking=True,
+        )
+
+    def terminate_async_checkpoint_worker(self):
+        """Block until any in-flight write completes, then shut down the persistent worker.
+
+        Directly closes the async queue on GlobalState, bypassing
+        maybe_finalize_async_save's early-return guard on ckpt_cfg.async_save.
+        Safe to call regardless of whether async_save is enabled.
+        """
+        async_queue = getattr(self.mcore_state, "async_calls_queue", None)
+        if async_queue is not None:
+            async_queue.close()
 
     def load_checkpoint(self, weights_path: str, optimizer_path: Optional[str] = None):
         """Load a training checkpoint.

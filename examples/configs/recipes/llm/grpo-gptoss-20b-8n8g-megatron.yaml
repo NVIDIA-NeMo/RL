@@ -10,6 +10,9 @@ policy:
   max_total_sequence_length: 4096
   megatron_cfg:
     enabled: true
+    checkpoint:
+      async_save: true
+      ckpt_assume_constant_structure: true
     expert_model_parallel_size: 8
     tensor_model_parallel_size: 4
     sequence_parallel: true

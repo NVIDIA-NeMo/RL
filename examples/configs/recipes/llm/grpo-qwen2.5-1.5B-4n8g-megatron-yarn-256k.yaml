@@ -11,6 +11,9 @@ policy:
   max_total_sequence_length: 262144
   make_sequence_length_divisible_by: 64
   megatron_cfg:
+    checkpoint:
+      async_save: true
+      ckpt_assume_constant_structure: true
     context_parallel_size: 32
   hf_config_overrides:
     rope_scaling:
