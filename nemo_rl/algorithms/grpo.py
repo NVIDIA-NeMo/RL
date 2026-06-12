@@ -68,7 +68,12 @@ from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.nemo_gym import NemoGym, NemoGymConfig
+from nemo_rl.environments.nemo_gym import (
+    NemoGym,
+    NemoGymConfig,
+    get_nemo_gym_uv_cache_dir,
+    get_nemo_gym_venv_dir,
+)
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
     run_async_multi_turn_rollout,
@@ -800,6 +805,14 @@ def setup(
                     "invalid_tool_call_patterns", None
                 )
                 thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
+                # Pass prebuilt cache + venv dirs through the global config so the gym reuses
+                # image-baked venvs instead of rebuilding them.
+                uv_cache_dir = get_nemo_gym_uv_cache_dir()
+                if uv_cache_dir is not None:
+                    nemo_gym_dict.setdefault("uv_cache_dir", uv_cache_dir)
+                uv_venv_dir = get_nemo_gym_venv_dir()
+                if uv_venv_dir is not None:
+                    nemo_gym_dict.setdefault("uv_venv_dir", uv_venv_dir)
                 nemo_gym_cfg = NemoGymConfig(
                     model_name=generation_config["model_name"],
                     base_urls=deferred_vllm.dp_openai_server_base_urls,
