@@ -105,13 +105,7 @@ def _model_self_packs_for_cp(model: Any) -> bool:
     Qwen3VL, which is also the only mbridge VLM that supports context
     parallelism; classic mcore GPTModel and other VLMs do not self-pack.
     """
-    try:
-        from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import (
-            Qwen3VLModel,
-        )
-    except ImportError:
-        return False
-
+    from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
     from megatron.core.utils import unwrap_model
 
     unwrapped = unwrap_model(model)
