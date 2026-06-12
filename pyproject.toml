@@ -53,7 +53,7 @@ dependencies = [
   # Keep the base range broad enough while allowing backend extras to tighten as needed.
   "transformers>=5.3.0,<5.9.0",
   "num2words>=0.5.14",                                                                                                       # for SmolVLM
-  "mlflow>=3.12.0",
+  "mlflow>=3.13.0",
   "nvidia-nvshmem-cu13>=3.6.5; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
   "swanlab",
   "pyzmq",
@@ -348,7 +348,7 @@ override-dependencies = [
   # Override sglang's xgrammar==0.1.32 to address CVE GHSA-7rgv-gqhr-fxg3
   "xgrammar==0.1.33",
   # Override dependencies to address CVEs
-  "mlflow>=3.12.0",
+  "mlflow>=3.13.0",
   # Override langchain-core to address CVE GHSA-qh6h-p6c9-ff54 (path traversal in load_prompt)
   "langchain-core>=1.2.22",
   # Override outlines for Python 3.13 support
@@ -379,7 +379,7 @@ constraint-dependencies = [
   "onnx>=1.21.0rc4",          # Address CVE GHSA-hqmj-h5c6-369m
   "cryptography>=46.0.6",     # Address CVE GHSA-6w46-j5rx-g56g
   "orjson>=3.11.6",           # Address CVE GHSA-hx9q-6w63-j58v
-  "pyjwt>=2.12.0",            # Address CVE GHSA-752w-5fwx-jx9f
+  "pyjwt>=2.13.0",
   "dulwich>=1.2.5",           # Address CVEs GHSA-897w-fcg9-f6xj, GHSA-9277-mp7x-85jf
 ]
 

@@ -118,7 +118,7 @@ rollout_max_attempts_to_avoid_lp_nan: 1
     ).remote(config)
 
     # Blocking wait for NeMo-Gym to spin up
-    ray.get(env.health_check.remote())
+    ray.get(env._spinup.remote())
 
     yield env
     # Clean up the actor and wait for it to be killed
