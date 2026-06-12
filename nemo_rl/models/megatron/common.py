@@ -21,6 +21,7 @@ from megatron.core.transformer.moe.moe_utils import (
     get_moe_layer_wise_logging_tracker,
     reduce_aux_losses_tracker_across_ranks,
 )
+from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 
 
 def _round_up_to_multiple(value: int, multiple: int) -> int:
@@ -163,4 +164,35 @@ def get_moe_metrics(
                     metrics[f"moe/{name}_layer_{i}"] = float(loss)
 
     clear_aux_losses_tracker()
+    return metrics
+
+
+def get_mtp_metrics() -> dict[str, Any]:
+    """Returns Multi-Token Prediction (MTP) loss and acceptance rate metrics.
+
+    This function reduces MTP metrics across ranks and returns a dictionary of metrics.
+
+    Returns:
+        dict[str, Any]: A flat dict of metrics. Each MTP layer's loss is returned
+        under the key "mtp_{i}_loss" and acceptance rate under "mtp_{i}_acceptance_rate"
+        where i is 1-indexed (matching Megatron-LM).
+    """
+    MTPLossLoggingHelper.reduce_metrics_in_tracker()
+    tracker = MTPLossLoggingHelper.tracker
+
+    metrics: dict[str, Any] = {}
+    if "loss_values" in tracker:
+        mtp_losses = tracker["loss_values"].float()
+        mtp_corrects = tracker.get("correct_values", torch.zeros_like(mtp_losses))
+        mtp_totals = tracker.get("total_values", torch.ones_like(mtp_losses))
+        mtp_num_layers = mtp_losses.shape[0]
+
+        # Log per-layer losses and acceptance rates
+        for i in range(mtp_num_layers):
+            metrics[f"mtp_{i + 1}_loss"] = float(mtp_losses[i].item())
+            # Compute acceptance rate as percentage
+            acceptance_rate = (mtp_corrects[i] / max(mtp_totals[i], 1)) * 100.0
+            metrics[f"mtp_{i + 1}_acceptance_rate"] = float(acceptance_rate.item())
+
+        MTPLossLoggingHelper.clean_metrics_in_tracker()
     return metrics
