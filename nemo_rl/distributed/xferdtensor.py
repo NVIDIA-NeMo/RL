@@ -34,7 +34,9 @@ import torch
 from torch.distributed._tensor import Shard
 
 try:
-    from nccl.xfer.api import XdtensorRedistribute as _XdtensorRedistribute
+    from nccl.xfer.api import (
+        XdtensorRedistribute as _XdtensorRedistribute,
+    )  # pyrefly: ignore[import-error]
 except ImportError:
     # Golden-only containers (e.g. nemo_rl.v0.6.0 without the nccl4py xfer
     # integration) don't ship the real reshard op; xferdtensor() then falls
@@ -108,7 +110,7 @@ def _to_xfer_mesh(mesh):
     (not a flattened list) preserves the 2-D (e.g. DP x TP) structure the
     placements index into.
     """
-    from nccl.xfer.mesh import Mesh
+    from nccl.xfer.mesh import Mesh  # pyrefly: ignore[import-error]
 
     rank_tensor = getattr(mesh, "mesh", None)
     if rank_tensor is None:
@@ -170,13 +172,13 @@ def xferdtensor(
     src_local = src_tensor._local_tensor if src_tensor is not None else None
     dst_local = dst_tensor._local_tensor if dst_tensor is not None else None
 
-    _XdtensorRedistribute(
+    _XdtensorRedistribute(  # pyrefly: ignore[not-callable]
         src_local,
         dst_local,
         process_group.nccl_communicator,
-        src_mesh=_to_xfer_mesh(src_mesh),
+        src_mesh=_to_xfer_mesh(src_mesh),  # pyrefly: ignore[bad-argument-type]
         src_placements=src_placement,
-        dst_mesh=_to_xfer_mesh(dst_mesh),
+        dst_mesh=_to_xfer_mesh(dst_mesh),  # pyrefly: ignore[bad-argument-type]
         dst_placements=dst_placement,
     )
 

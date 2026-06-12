@@ -752,9 +752,7 @@ def setup(
 
         check_nccl_xfer_refit_support(master_config)
     if nccl_xfer_refit_enabled and not colocated_inference:
-        # Megatron train backend only — enforced by
-        # check_nccl_xfer_refit_support above (the DTensor train backend
-        # refit path is not supported in this initial version).
+        # Currently megatron train backend is only supported for nccl_xfer_refit
         train_parallelism = {
             "tp_size": policy_config["megatron_cfg"].get(
                 "tensor_model_parallel_size", 1
@@ -787,10 +785,6 @@ def setup(
                 r % train_ranks_per_stage for r in range(train_world_size)
             ]
             # Find an IP and free port for each PP stage.
-            # Each stage's TCPStore server (rank 0) must run on the node
-            # whose IP is used as master_address.  Stage s's rank 0 is
-            # global train rank s*train_ranks_per_stage, which lives on
-            # node s*train_ranks_per_stage // gpus_per_node.
             pp_ips = []
             pp_ports = []
             for stage in range(pp_size):
@@ -821,11 +815,11 @@ def setup(
             )
             ray.get(futures_train_pp + futures_gen_pp)
 
-        # The train-side builder groups per-expert MoE params into
-        # backend-agnostic grouped HF entries (gate_proj/up_proj/down_proj); the
-        # gen backend maps those into its own fused layout (e.g. vLLM's w13/w2)
-        # gen-side.  (KV-head replication is handled by routing QKV to the misc
-        # path when num_query_groups < max(train_tp, gen_tp).)
+        # Train-side preparation for nccl_xfer_refit creates required per-layer parameter metadata,
+        # required for the nccl-xfer refit execution.
+        # Train-side builder should generate the backend-agnostic metadata, strictly aligned with
+        # the huggingface naming convention.
+        # The gen-side builder maps those into its own fused layout (e.g. vLLM's w13/w2)
         nccl_xfer_refit_info = policy.prepare_nccl_xfer_refit_info(
             train_parallelism,
             gen_parallelism,
@@ -1261,7 +1255,7 @@ def refit_policy_generation(
                     "SGLang haven't implemented non-colocated inference mode. "
                 )
             if nccl_xfer_refit:
-                # nccl_xfer path: per-parameter xferdtensor transfer
+                # nccl_xfer path: shard-to-shard xferdtensor transfer
                 futures_train = policy.nccl_xfer_refit(kv_scales=kv_scales)
                 futures_inference = policy_generation.nccl_xfer_refit()
                 ray.get(futures_train)

@@ -1007,7 +1007,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
 
         # Collect tensor metadata for refit / hf side info
         refit_param_info_hf = {}
-        # Reuse shared iterator that appends FP8 KV/Q scales when enabled
+        # Use meta allocation context, since this loop is collecting metadata only
         with _meta_tensor_alloc_context():
             for name, tensor in self._iter_params_with_optional_kv_scales():
                 refit_param_info_hf[name] = (tensor.shape, tensor.dtype)
@@ -1015,14 +1015,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         return refit_param_info_hf
 
     def _is_fp8_export(self) -> bool:
-        """Return True iff the train side stores weights as TE blockwise FP8.
-
-        Only ``fp8_param=True`` together with ``fp8_recipe="blockwise"`` produces
-        ``Float8BlockwiseQTensor`` weights that Megatron-Bridge can export via
-        ``build_export_fp8_tasks``.  The common ``fp8_param=False`` recipe runs
-        FP8 GEMMs internally but stores BF16 weights, so the standard task list
-        is correct for that case.
-        """
+        """Return True if the train side stores weights as TE blockwise FP8."""
         if self.fp8_cfg is None:
             return False
         return bool(
@@ -1111,14 +1104,15 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         so that the logic for adding KV scales stays consistent in one place.
 
         ``conversion_tasks`` (optional) overrides ``self.refit_conversion_tasks``
-        — used by the misc-refit path to pass a filtered subset so Bridge only
-        does TP/EP all-gather for those tasks instead of the full model.
+        — used by the nccl_xfer_refit misc-refit path to pass a filtered subset so
+        Bridge only does TP/EP all-gather for those tasks instead of the full model.
         """
         from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
             get_vllm_qkv_scale_names,
         )
 
         if conversion_tasks is None:
+            # Default to the full conversion tasks
             conversion_tasks = self.refit_conversion_tasks
 
         base_iter = self.megatron_bridge.export_hf_weights(
@@ -1177,16 +1171,22 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
     def _iter_local_hf_param_shards(self) -> Iterator[tuple[str, torch.Tensor]]:
         """Yield (hf_name, local_tp_shard) for locally owned params.
 
+        This function is used by the nccl_xfer_refit path, when building the
+        _param_map in build_nccl_xfer_refit_info.
+
         Unlike ``_iter_params_with_optional_kv_scales`` which does PP broadcast
         + TP gather via ``export_hf_weights``, this method yields TP-local
         shards directly from Megatron parameters — no collectives needed.
 
-        Regarding the EP case, the self.refit_conversion_tasks already contains
-        the local expert weights only.
-
         Compound mappings (QKV, GatedMLP) are split into individual HF params
         on the TP-local shard. The returned tensors are views of the model
         parameters and must not be modified in-place.
+
+        Regarding the EP case, the self.refit_conversion_tasks already contains
+        the local expert weights only.
+
+        For the PP, non-local params, task.param_weight is None from
+        the refit_conversion_tasks.
         """
         from types import SimpleNamespace
 
@@ -1206,14 +1206,8 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             if local_tensor is None:
                 continue  # Non-local PP rank
 
-            # refit_conversion_tasks is the FULL Bridge task list (for FP8,
-            # build_export_fp8_tasks emits a weight + _scale_inv pair per param);
-            # it is NOT pre-filtered by is_misc_param.  The misc routing happens
-            # downstream — is_misc_param sends _scale_inv into misc_meta and
-            # _misc_conversion_tasks (a derived subset), not by pruning this list.
-            # So we DO see _scale_inv tasks here on FP8 runs; skip them because
-            # their bulk _param_map entry would never be read (the bulk transfer
-            # iterates state_dict_metadata, which excludes them).
+            # scale tensors are routed to misc_param path, so this function should
+            # skip the scale tensors. See is_misc_param in nccl_xfer_utils.py
             if task.global_param_name.endswith("_scale_inv"):
                 continue
 
@@ -1250,7 +1244,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                         f"Unsupported compound mapping: {type(task.mapping).__name__}"
                     )
             else:
-                # Simple 1→1 mapping (Direct, ColumnParallel, RowParallel, Replicated)
+                # Simple 1→1 mapping
                 yield str(hf_param), local_tensor
 
     @torch.no_grad()
@@ -1290,6 +1284,8 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
     def _build_layer_to_pp_stage(self, pp_size: int) -> dict[str, int]:
         """Build mapping from layer group name to PP stage index.
 
+        Returns a dictionary that maps the layer group name to the PP stage index.
+
         Mirrors Megatron-LM's ``get_num_layers_to_build``
         (``transformer_block.py``) for the standard (non-VP, non-custom-layout)
         path: middle stages share ``num_layers - first - last`` evenly, while
@@ -1301,6 +1297,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
           - ``virtual_pipeline_model_parallel_size`` (interleaved PP)
           - ``account_for_embedding_in_pipeline_split``
           - ``account_for_loss_in_pipeline_split``
+        These cases are checked in check_nccl_xfer_refit_support function.
         """
         # Read from the runtime model's config rather than the bridge's
         # default — the user's per-stage layout overrides
@@ -1390,24 +1387,23 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
 
         The builder groups per-expert MoE params into backend-agnostic grouped
         HF entries (gate_proj/up_proj/down_proj); the gen backend maps those into
-        its own fused layout (vLLM w13/w2) gen-side, so this train worker stays
-        agnostic to any gen backend's MoE-fusion layout.
+        its own fused layout (e.g., vLLM w13/w2) gen-side, so this train worker
+        stays agnostic to any gen backend's MoE-fusion layout.
         """
-        from nemo_rl.distributed.nccl_xfer_utils import build_nccl_xfer_refit_info
+        from nemo_rl.distributed.nccl_xfer_utils import (
+            build_nccl_xfer_refit_info,
+            is_misc_param,
+        )
 
         self.refit_param_info_mcore = self._calculate_refit_param_info()
 
-        # Single pass over Bridge's stream: classify each param as bulk
-        # (xferdtensor) or misc (load_weights), preserve yield order so
+        # Single pass over Bridge's stream: classify each param as major
+        # (xferdtensor) or misc (packed_broadcast), preserve yield order so
         # producer/consumer agree on the packed-broadcast iteration.
-        from nemo_rl.distributed.nccl_xfer_utils import is_misc_param
 
-        # Route QKV to the misc (packed_broadcast + load_weights) path whenever
-        # KV heads can't be cleanly 1/tp-sharded on EITHER side: Megatron channel-
-        # splits KV when train_tp > num_query_groups, and the gen backend
-        # replicates KV heads when gen_tp > num_query_groups.  Both layouts are
-        # the gen backend's to reproduce (via load_weights), so bulk xferdtensor
-        # only handles QKV when it shards cleanly on both sides.
+        # Route QKV to the misc (packed_broadcast) path whenever
+        # KV heads can't be cleanly 1/tp-sharded on EITHER side,
+        # for the code simplicity.
         train_tp = train_parallelism.get("tp_size", 1)
         gen_tp = gen_parallelism.get("tp_size", 1)
         qkv_to_misc = self.megatron_bridge.transformer_config.num_query_groups < max(
@@ -1416,10 +1412,11 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
 
         state_dict_metadata = {}
         misc_meta = OrderedDict()
+        _xfer_bytes = _bcast_bytes = 0  # full-tensor payload routed to each path
 
-        # iterates all the params to construct the state_dict_metadata
+        # Iterates all the params to construct the state_dict_metadata (xferdtensor path)
         # state_dict_metadata[hf_name] -> [shape, dtype]
-        # At the same time, filter the params to the misc subset (see is_misc_param).
+        # At the same time, filter the params to the misc subset (packed_broadcast path).
         # misc_meta[hf_name] -> [shape, dtype]
         with _meta_tensor_alloc_context():
             for name, tensor in self._iter_params_with_optional_kv_scales():
@@ -1427,11 +1424,25 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                     "shape": list(tensor.shape),
                     "dtype": str(tensor.dtype),
                 }
+                _nbytes = tensor.numel() * tensor.element_size()
                 # filtering hard to handle params as a misc_param
                 if is_misc_param(name, qkv_to_misc=qkv_to_misc):
                     misc_meta[name] = meta
+                    _bcast_bytes += _nbytes
                 else:
                     state_dict_metadata[name] = meta
+                    _xfer_bytes += _nbytes
+
+        _gib = 1024**3
+        _tot = _xfer_bytes + _bcast_bytes
+        print(
+            f"[xferd-payload] qkv_to_misc={qkv_to_misc} "
+            f"xfer_major={_xfer_bytes / _gib:.2f}GiB "
+            f"bcast_misc={_bcast_bytes / _gib:.2f}GiB "
+            f"total={_tot / _gib:.2f}GiB "
+            f"bcast_frac={_bcast_bytes / max(_tot, 1):.1%}",
+            flush=True,
+        )
 
         pp_size = train_parallelism.get("pp_size", 1)
         # Construct a dict[layer_name:str] -> pp_stage:int
@@ -1449,16 +1460,19 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             layer_to_pp_stage=layer_to_pp_stage,
         )
         # _param_map is a dictionary that holds the pointer to the real local tensor
+        # All of the non-misc params should be in the _param_map.
         # _param_map[hf_name:str] -> [local_tensor:Torch.Tensor]
         self._param_map = {
             name: tensor for name, tensor in self._iter_local_hf_param_shards()
         }
         # _expert_groups is a
-        # Dict[(hf_layer_name.layer_id.expert:str, expert_param_susfix:str)]
-        # -> List[(expert_id:int, hf_param_name:str)]
+        # Dict[(hf_layer_name.layer_id.expert:str, expert_param_suffix:str)]
+        # -> List[local_tensor:Torch.Tensor]   (index-sorted _param_map views)
+        # Later at the refit time, you just need to call torch.stack to
+        # consolidate the expert tensors into one tensor.
         self._expert_groups = self._build_expert_groups()
 
-        # Misc params are using packed_broadcast path to handle the complexity
+        # Keep the misc_meta in the nccl_xfer_refit_info
         # misc_meta[hf_name] -> [shape, dtype]
         self.nccl_xfer_refit_info["misc_meta"] = misc_meta
         # Filter conversion_tasks to the misc subset.
@@ -1471,88 +1485,79 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
 
         return self.nccl_xfer_refit_info
 
-    def _get_src_local_tensor(self, param_info, expert_groups):
-        """Get the TP/EP-local source tensor for one param.
-
-        For grouped MoE entries (``grouped_expert_proj`` set), stack this rank's
-        local experts for that projection into one ``[E_local, ...]`` tensor on
-        demand from ``_param_map``.  For everything else, return the existing
-        ``_param_map`` view directly.  Returns ``None`` if not on this rank
-        (e.g. layer owned by a different PP stage and PP filtering didn't already
-        skip the param).
-        """
-        name = param_info["name"]
-        grouped_expert_proj = param_info.get("grouped_expert_proj")
-        if grouped_expert_proj:
-            return self._group_experts(grouped_expert_proj, name, expert_groups)
-        return self._param_map.get(name)
-
     def _build_expert_groups(self):
-        """Group individual expert params from ``_param_map`` by (prefix, proj_type).
+        """Group this rank's local expert params into stack-ready views.
+
+        Keyed by (prefix, proj_type) and resolved to ordered ``_param_map``
+        views ready for ``torch.stack``.
 
         Megatron exposes each expert's projection as a separate param; this bins
         them so ``_group_experts`` can stack a layer's experts into one grouped
-        HF tensor per projection.  Pure regex grouping — no tensor allocations.
+        HF tensor per projection.  Built once in ``prepare_nccl_xfer_refit_info``.
 
         ``_INDIVIDUAL_EXPERT_RE`` captures three fields from a name like
-        ``model.layers.3.mlp.experts.0.gate_proj.weight``:
+        ``model.layers.3.mlp.experts.17.gate_proj.weight``:
           * group 1 = prefix       -> ``"model.layers.3.mlp.experts"``
-          * group 2 = expert index -> ``0``
+          * group 2 = expert index -> ``17``
           * group 3 = proj type    -> ``"gate_proj"``
         so the name keys into ``("model.layers.3.mlp.experts", "gate_proj")``.
 
-        Returns ``{(prefix, proj): [(expert_idx, param_name), ...]}`` with each
-        list sorted by expert index.  Example — a layer with 2 local experts
-        (gated MoE) yields three keys:
-          ``(".../experts", "gate_proj"): [(0, "...0.gate_proj.weight"), (1, "...1.gate_proj.weight")]``
-          ``(".../experts", "up_proj")  : [(0, ...), (1, ...)]``
-          ``(".../experts", "down_proj"): [(0, ...), (1, ...)]``
-        The index sort matters: ``_group_experts`` stacks these in order, so
-        expert 0 must precede expert 1 to match the EP ``Shard(0)`` layout the
-        gen side expects.
+        Returns ``{(prefix, proj): [tensor_0, tensor_1, ...]}`` — the per-expert
+        ``_param_map`` views sorted by expert index.  Example — a layer with 2
+        local experts (gated MoE) yields three keys:
+          ``(".../experts", "gate_proj"): [view(expert 0), view(expert 1)]``
+          ``(".../experts", "up_proj")  : [view(expert 0), view(expert 1)]``
+          ``(".../experts", "down_proj"): [view(expert 0), view(expert 1)]``
+
+        Resolving names → views here (rather than per refit in ``_group_experts``)
+        costs nothing extra — ``_param_map`` already owns these views and they
+        stay valid across refits (weights are updated in place; the name→view
+        mapping is stable), so ``_group_experts`` only has to ``torch.stack``.
+        The index sort matters: the views are stacked in this order, so expert 0
+        must precede expert 1 to match the EP ``Shard(0)`` layout the gen side
+        expects.
         """
         from nemo_rl.distributed.nccl_xfer_utils import _INDIVIDUAL_EXPERT_RE
 
-        groups: dict[tuple[str, str], list[tuple[int, str]]] = {}
+        index_groups: dict[tuple[str, str], list[tuple[int, str]]] = {}
         for name in self._param_map:
+            # find all the expert params
             m = _INDIVIDUAL_EXPERT_RE.match(name)
             if m:
                 # key = (group1 prefix, group3 proj_type); value (group2 idx, name)
                 # example: ("model.layers.3.mlp.experts", "gate_proj") -> (0, name)
-                groups.setdefault((m.group(1), m.group(3)), []).append(
+                index_groups.setdefault((m.group(1), m.group(3)), []).append(
                     (int(m.group(2)), name)
                 )
-        for key in groups:
-            groups[key].sort()
-        return groups
+        # Sort by expert index, then resolve each name to its _param_map view once.
+        return {
+            key: [self._param_map[n] for _, n in sorted(idx_names)]
+            for key, idx_names in index_groups.items()
+        }
 
     def _group_experts(self, proj, grouped_name, expert_groups):
         """Stack this rank's local experts for one projection into ``[E_local, ...]``.
 
-        Backend-agnostic: just ``torch.stack`` the per-expert ``gate_proj`` /
-        ``up_proj`` / ``down_proj`` weights (each a per-expert TP/EP-local view
-        from ``_param_map``) along a new leading expert dim — NO gate/up fusion,
-        NO interleave, NO gen-TP awareness.  The gen backend assembles its own
-        fused layout (for vLLM: gate/up -> the two w13 halves, down -> w2) from
-        these grouped HF params entirely on the gen side
-        (``vllm_backend._build_hf_to_vllm_mapping``).
-
-        Args:
-          * ``proj``: HF projection name ("gate_proj"/"up_proj"/"down_proj").
-          * ``grouped_name``: ``{prefix}.{proj}.weight`` (prefix = ``...experts``).
-          * ``expert_groups``: ``{(prefix, proj): [(expert_idx, param_name), ...]}``
-            sorted by expert index (built once in prepare).
-
-        Returns the stacked local (EP) shard ``[E_local, *per_expert_shape]``, or
-        ``None`` if no local expert contributes (e.g. the layer is not on this PP
-        rank).  Caller frees it after the transfer, so peak memory stays at ~one
-        grouped tensor.  The index-sorted stack order matches the EP ``Shard(0)``
-        layout the gen side expects.
+        Using the pre-calculated expert_groups (=self._expert_groups) it is
+        just calling torch.stack of all the local expert params.
         """
         prefix = grouped_name.rsplit(f".{proj}.weight", 1)[0]
-        group = expert_groups.get((prefix, proj), [])
-        expert_tensors = [self._param_map[n] for _, n in group]
-        return torch.stack(expert_tensors) if expert_tensors else None
+        expert_tensors = expert_groups.get((prefix, proj))
+        assert expert_tensors, (
+            f"no local experts for {grouped_name!r} (proj={proj!r}); "
+            "PP-filter / expert-group-metadata inconsistency"
+        )
+        return torch.stack(expert_tensors)
+
+    def _get_src_local_tensor(self, param_info, expert_groups):
+        """Get the TP/EP-local source tensor for one param."""
+        name = param_info["name"]
+        grouped_expert_proj = param_info.get("grouped_expert_proj")
+        if grouped_expert_proj:
+            # expert_groups has pre-calculated pointer to the local expert tensors
+            # which was extracted from the _param_map in _build_expert_groups.
+            return self._group_experts(grouped_expert_proj, name, expert_groups)
+        return self._param_map.get(name)
 
     @torch.no_grad()
     def nccl_xfer_refit(self, kv_scales=None):
@@ -1583,13 +1588,11 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                 else:
                     group = self.model_update_group
 
+                # expert stacking is done in _get_src_local_tensor
                 local = self._get_src_local_tensor(param_info, self._expert_groups)
-                src_tensor = (
-                    DTensorRef(
-                        local_tensor=local, global_shape=param_info["global_shape"]
-                    )
-                    if local is not None
-                    else None
+                assert local is not None, f"no local tensor for {param_info['name']!r}"
+                src_tensor = DTensorRef(
+                    local_tensor=local, global_shape=param_info["global_shape"]
                 )
                 xferdtensor(
                     src_tensor,
@@ -1601,22 +1604,13 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                     group,
                 )
                 # Drop refs to the per-iteration grouped MoE tensor so its CUDA
-                # memory returns to the caching allocator before the next
-                # iteration's grouping allocates.
+                # memory returns to the caching allocator
                 del local, src_tensor
 
         self._broadcast_misc_params_packed(kv_scales=kv_scales)
 
     def _broadcast_misc_params_packed(self, kv_scales=None) -> None:
-        """Broadcast misc params via the existing packed_broadcast machinery.
-
-        Uses the misc-only conversion task list pre-computed at prepare time,
-        so Bridge skips TP/EP all-gather for bulk weights — only the
-        relatively small misc subset is gathered + broadcast.  FP8 KV-cache
-        ``kv_scales`` (if provided) are appended as scale tensors here so they
-        broadcast alongside the misc params (their names are already in
-        misc_meta via is_misc_param's ``.k_scale``/``.v_scale`` routing).
-        """
+        """Broadcast misc params via the existing packed_broadcast machinery."""
         misc_meta = self.nccl_xfer_refit_info.get("misc_meta", {})
         if not misc_meta:
             return

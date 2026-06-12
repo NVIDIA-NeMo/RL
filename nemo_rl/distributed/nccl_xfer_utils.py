@@ -73,17 +73,20 @@ COLUMN_PARALLEL_SUFFIXES = [
     # DeepSeek MLA up-projections (column-parallel on output: num_heads * head_dim)
     "q_b_proj.weight",
     "kv_b_proj.weight",
-    # NOTE: grouped MoE expert gate_proj/up_proj are column-parallel too; they
-    # match the gate_proj.weight/up_proj.weight suffixes above via
-    # _get_expert_tp_shard_dim (which, unlike get_tp_shard_dim, does not skip
-    # .experts. names).  The vLLM-specific w13_weight fusion happens gen-side.
 ]
 
-# DeepSeek MLA down-projections.  vLLM creates these as ReplicatedLinear (or
-# merges them into ``fused_qkv_a_proj`` with ``disable_tp=True``), so the full
-# tensor lives on every TP rank.  Megatron with TP=1 also keeps them
-# unsharded, so leaving them out of COLUMN_PARALLEL_SUFFIXES gives the right
-# "all Replicate" placement on both sides.
+# DeepSeek MLA down-projections (q_a_proj / kv_a_proj_with_mqa).  In Megatron's
+# TE spec (what nemo-rl uses) these are TELinear with parallel_mode='duplicated'
+# — NOT tensor-parallel, the full weight is replicated on every TP rank at ANY
+# tp_size.  vLLM mirrors this (ReplicatedLinear, or fused into fused_qkv_a_proj
+# with disable_tp=True), so omitting them from COLUMN_PARALLEL_SUFFIXES gives the
+# right "all Replicate" placement on both sides for any TP.
+#
+# WARNING — holds ONLY for the unfused TE spec.  Both of these SHARD the down-
+# projs (ColumnParallelLinear, gather_output=False) and would break this:
+#   * the LOCAL spec (get_gpt_layer_local_spec)
+#   * mla_down_proj_fusion=True (also renames to fused linear_qkv_down_proj)
+# nemo-rl uses neither today (TE backend; fusion defaults False).
 
 # Row-parallel suffixes: TP shards along dim 1 (input dimension).
 ROW_PARALLEL_SUFFIXES = [
@@ -379,27 +382,19 @@ def group_expert_params_in_metadata(
 ) -> dict[str, dict[str, Any]]:
     """Group per-expert MoE params into backend-agnostic grouped HF entries.
 
+    This function replaces expert entries in the state_dict_metadata with
+    grouped-expert entries.
+
     For each MoE projection, stack every expert's HF param into ONE entry along
-    a new leading expert dim, keeping the *HF* projection name (no backend
-    fusion, no w13/w2, no gen-TP / interleave):
+    a new leading expert dim, keeping the *HF* projection name:
       - gate_proj : [E, intermediate, hidden]
       - up_proj   : [E, intermediate, hidden]
       - down_proj : [E, hidden, intermediate]
     Each grouped entry is tagged ``grouped_expert_proj`` ("gate_proj" /
-    "up_proj" / "down_proj").  The train side stacks the matching per-expert
-    tensors (``_group_experts``); the gen backend maps these grouped HF params
-    into ITS fused layout entirely on the gen side (for vLLM: gate/up ->
-    w13_weight halves, down -> w2_weight; see
-    ``vllm_backend._build_hf_to_vllm_mapping``).
+    "up_proj" / "down_proj").
 
-    Grouping is universal — every gen backend needs experts grouped for an
-    efficient reshard (per-expert would be hundreds of tiny collectives) — so
-    the builder applies this unconditionally; only the gen-side fusion (the
-    actual ``w13``/``w2`` names + gate/up interleave) is backend-specific and
-    lives in the gen backend.
-
-    The input ``state_dict_metadata`` must be EP-gathered (enumerate every
-    expert globally).  Non-expert params are passed through unchanged.
+    The input ``state_dict_metadata`` has a global view of the parameters.
+    Non-expert params are passed through unchanged.
     """
     # Group individual expert params by (prefix, proj_type)
     expert_groups: dict[tuple[str, str], list[tuple[str, dict]]] = {}
@@ -418,10 +413,7 @@ def group_expert_params_in_metadata(
         return state_dict_metadata
 
     # Stack each (prefix, proj) group into one [E, *per_expert_shape] grouped
-    # HF entry.  Prepending the expert dim is layout-agnostic — it works for
-    # gate/up ([inter, hidden] -> [E, inter, hidden]) and down ([hidden, inter]
-    # -> [E, hidden, inter]) uniformly.  The reshard ships it Shard(0) on EP
-    # (src) -> Shard(intermediate-axis) on gen TP (dst); see get_placements.
+    # HF entry.
     for (prefix, proj), entries in expert_groups.items():
         num_experts_global = len(entries)
         per_expert_shape = list(entries[0][1]["shape"])
@@ -628,13 +620,9 @@ def build_nccl_xfer_refit_info(
 ) -> dict[str, Any]:
     """Build per-layer parameter info for nccl_xfer-based refit.
 
-    The input ``state_dict_metadata`` must be EP-gathered (enumerate every
-    expert globally, not per-rank).  Both backends meet this naturally:
-    Megatron's metadata pipeline routes through ``export_hf_weights`` (which
-    does the EP all-gather) and DTensor doesn't use EP at all.
-
     Args:
         state_dict_metadata: ``{hf_param_name: {"shape": list, "dtype": str}}``
+            The input ``state_dict_metadata`` has a global view of the parameters
         train_parallelism / gen_parallelism: ``{"tp_size", "ep_size", "pp_size"}``
         train_world_size / gen_world_size: number of GPUs per side
         layer_to_pp_stage: optional mapping from layer name to PP stage index.
@@ -648,10 +636,11 @@ def build_nccl_xfer_refit_info(
     # state_dict_metadata is already pre-filtered to exclude misc params
     # (caller separates misc into a parallel dict for the
     # packed_broadcast-based misc refit path).
+
     # Group per-expert MoE params into backend-agnostic grouped HF entries
     # (gate_proj/up_proj/down_proj, each [E, ...]).  Grouping is universal; the
-    # gen backend maps these into its own fused layout (w13/w2) gen-side.  No-op
-    # for dense (non-MoE) models (early return when there are no expert params).
+    # gen backend maps these into its own fused layout (e.g., vLLM w13/w2) gen-side.
+    # No-op for dense (non-MoE) models (early return when there are no expert params)
     state_dict_metadata = group_expert_params_in_metadata(state_dict_metadata)
 
     pp_size = train_parallelism.get("pp_size", 1)
@@ -663,13 +652,9 @@ def build_nccl_xfer_refit_info(
             "layer_to_pp_stage must be provided when pp_size > 1"
         )
 
-    # Megatron-Core with ETP=1 gives non-expert and expert params *different*
-    # rank-to-coord layouts on the same physical ranks: for non-expert params,
-    # ranks are partitioned (tp, dp); for expert params, ranks are partitioned
-    # (ep, edp).  TP and EP are not jointly indexable on a single rectangular
-    # mesh (the coords aren't independent — e.g. EP4×TP2 has tp=r%2 AND
-    # ep=r%4 on the same rank).  We therefore build two src meshes per stage
-    # and pick per-param based on whether the param is a MoE expert weight.
+    # Currently we don't support ETP>1 for the nccl_xfer_refit.
+    # Non-expert params, ranks are partitioned (tp, dp);
+    # Expert params, ranks are partitioned (ep, edp).
     def _build_train_src_meshes(num_gpus: int, rank_offset: int, stage_pp: int):
         non_expert_mesh, non_expert_dim_map = build_mesh_info(
             num_gpus,
