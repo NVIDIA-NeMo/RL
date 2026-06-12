@@ -57,7 +57,7 @@ from nemo_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
-from nemo_rl.models.megatron.common import get_moe_metrics, get_mtp_metrics
+from nemo_rl.models.megatron.common import get_moe_metrics
 from nemo_rl.models.megatron.config import MegatronGenerationConfig
 from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
@@ -704,12 +704,9 @@ class MegatronPolicyWorkerImpl(
             )
             if moe_metrics:
                 metrics["moe_metrics"] = moe_metrics
-        # Collect MTP metrics
-        mtp_num_layers = getattr(self.model.config, "mtp_num_layers", None)
-        if mtp_num_layers is not None and mtp_num_layers > 0:
-            mtp_metrics = get_mtp_metrics()
-            if mtp_metrics:
-                metrics["mtp_metrics"] = mtp_metrics
+        # Collect MTP metrics (kept out of train()'s body so cloudpickle does not
+        # pull an unpicklable torch ConfigModuleInstance into the worker actor).
+        self._collect_mtp_metrics(metrics)
         return metrics
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs")
@@ -1228,6 +1225,21 @@ class MegatronPolicyWorkerImpl(
             refit_param_info_hf[name] = (tensor.shape, tensor.dtype)
 
         return refit_param_info_hf
+
+    def _collect_mtp_metrics(self, metrics: dict[str, Any]) -> None:
+        """Add Multi-Token Prediction metrics to ``metrics`` when MTP is enabled.
+
+        get_mtp_metrics is imported lazily (not a module global) so cloudpickle
+        does not pull an unpicklable torch ConfigModuleInstance into the worker
+        actor's serialization.
+        """
+        mtp_num_layers = getattr(self.model.config, "mtp_num_layers", None)
+        if mtp_num_layers is not None and mtp_num_layers > 0:
+            from nemo_rl.models.megatron.common import get_mtp_metrics
+
+            mtp_metrics = get_mtp_metrics()
+            if mtp_metrics:
+                metrics["mtp_metrics"] = mtp_metrics
 
     def _set_mtp_grad_scale_func(self, func):
         """Set mtp_grad_scale_func on the model config for MTP loss scaling."""
