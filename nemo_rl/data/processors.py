@@ -709,6 +709,55 @@ def nemo_gym_data_processor(
     return output
 
 
+def tau_bench_data_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer: TokenizerType,
+    max_seq_length: int,
+    idx: int,
+) -> DatumSpec:
+    """Process a tau-bench datum into a DatumSpec for multi-turn GRPO training.
+
+    Expects datum_dict produced by ``TauBenchDataset`` at runtime:
+      - messages: [system_message, initial_user_message]
+      - extra_env_info: {task_index, episode_id, step_count}
+      - task_name: "tau_bench"
+
+    Returns a message_log with one entry per input message (system + user).
+    The multi-turn rollout loop appends subsequent turns on top of these entries.
+    """
+    messages = datum_dict["messages"]
+    extra_env_info = datum_dict["extra_env_info"]
+
+    message_log: LLMMessageLogType = get_formatted_message_log(
+        messages,
+        tokenizer,
+        task_data_spec,
+        add_bos_token=True,
+        add_eos_token=False,
+        add_generation_prompt=True,
+    )
+
+    length = sum(len(msg["token_ids"]) for msg in message_log)
+    loss_multiplier = 1.0
+    if length >= max_seq_length:
+        for msg in message_log:
+            msg["token_ids"] = msg["token_ids"][
+                : min(4, max_seq_length // len(message_log))
+            ]
+        loss_multiplier = 0.0
+
+    output: DatumSpec = {
+        "message_log": message_log,
+        "length": length,
+        "extra_env_info": extra_env_info,
+        "loss_multiplier": loss_multiplier,
+        "idx": idx,
+        "task_name": datum_dict.get("task_name", "tau_bench"),
+    }
+    return output
+
+
 def kd_data_processor(
     datum_dict: dict[str, Any],
     task_data_spec: TaskDataSpec,
@@ -754,6 +803,7 @@ PROCESSOR_REGISTRY: Dict[str, TaskDataProcessFnCallable] = cast(
         "sft_processor": sft_processor,
         "vlm_hf_data_processor": vlm_hf_data_processor,
         "nemo_gym_data_processor": nemo_gym_data_processor,
+        "tau_bench_data_processor": tau_bench_data_processor,
     },
 )
 

@@ -210,6 +210,51 @@ See [examples/run_grpo.py](../../examples/run_grpo.py) with [examples/configs/gr
 uv run examples/run_grpo.py --config examples/configs/grpo_rm_1B.yaml
 ```
 
+## Tau-Bench Environment
+
+The Tau-Bench Environment wraps the [tau-bench](https://github.com/sierra-research/tau-bench) benchmark for multi-turn customer service agent training. The agent must complete customer requests using tool calls while following domain policies, interacting with a simulated user (LLM or mock) and optionally scored by an LLM judge.
+
+### Key Features
+
+- **Multi-turn interaction**: the agent and simulated customer exchange messages until the task is complete or the step limit is reached.
+- **Tool calling**: the agent issues structured `<tool_call>` JSON actions; the environment executes them against tau-bench's domain backend (retail or airline).
+- **LLM user simulator**: a separate LLM plays the customer (via an OpenAI-compatible API, e.g. a local vLLM server).
+- **LLM judge scoring** (optional): blends tau-bench's programmatic reward with an LLM judge score for richer signal.
+- **Mock mode** (`user_strategy: "mock"`): runs without any real LLM calls for fast smoke-testing.
+
+### Configuration
+
+```yaml
+env:
+  tau_bench:
+    num_workers: 16           # parallel episode workers
+    env_name: retail          # "retail" or "airline"
+    task_split: train         # "train" or "test"
+    user_strategy: llm        # "llm" or "mock"
+    user_model: "openai/meta-llama/Llama-3.1-8B-Instruct"
+    user_base_url: "http://<host>:<port>/v1"
+    max_steps: 30
+    judge_model: "openai/meta-llama/Llama-3.1-8B-Instruct"
+    judge_base_url: "http://<host>:<port>/v1"
+    judge_weight: 0.0         # 0 = pure tau-bench reward, 1 = pure judge score
+    worker_stagger_delay_s: 1.0   # stagger worker startup to avoid thundering-herd on vLLM
+    max_concurrent_api_requests: 8  # per-worker LLM concurrency limit
+```
+
+Optional fields (`user_base_url`, `user_api_key`, `judge_model`, `judge_base_url`, `judge_api_key`, `mock_*`) can be omitted when not needed.
+
+### Running with Local vLLM Endpoints
+
+For large-scale training on a SLURM cluster, `examples/tau_bench/run_tau_local.sh` submits three coordinated jobs: the NeMo-RL training job, a vLLM user simulator server, and optionally a separate vLLM judge server.
+
+```bash
+ACCOUNT=my_account \
+NEMO_CONTAINER=/path/to/nemo-rl.squashfs \
+./examples/tau_bench/run_tau_local.sh
+```
+
+See `examples/tau_bench/run_tau_local.sh` for the full list of environment-variable overrides (model names, ports, node counts, partitions, etc.) and `examples/configs/recipes/llm/grpo_tau_bench_local.yaml` for the corresponding training config.
+
 ## Registering Custom Environments
 
 NeMo RL provides a flexible environment registration mechanism that allows you to add custom environments without modifying the source code.

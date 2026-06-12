@@ -1,0 +1,140 @@
+#!/bin/bash
+#SBATCH --nodes=1
+#SBATCH --exclusive
+#SBATCH --account=ACCOUNT
+#SBATCH --job-name=JOB_NAME
+#SBATCH --partition=PARTITION
+#SBATCH --time=4:0:0
+
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Starts a vLLM OpenAI-compatible server inside an Enroot/Pyxis container.
+#
+# Required env vars (set by the launcher script):
+#   CONTAINER         - path to .squashfs image
+#   MOUNTS            - comma-separated host:container mount pairs
+#   MODEL             - HuggingFace model path (e.g. meta-llama/Llama-3.1-8B-Instruct)
+#   PORT              - port to serve on (e.g. 8100)
+#   TENSOR_PARALLEL   - number of GPUs per replica (tensor parallelism)
+#   COORD_FILE        - path on shared FS where this script writes its hostname
+#                       (the training job reads this to discover the server)
+#
+# Optional:
+#   DATA_PARALLEL     - number of replicas (data parallelism, default: 1)
+#                       e.g. TP=1 DP=8 → 8 independent replicas, one per GPU
+#                            TP=4 DP=2 → 2 replicas each spanning 4 GPUs
+#   GPU_MEMORY_UTIL   - fraction of GPU memory to use (default: 0.90)
+#   MAX_MODEL_LEN     - max sequence length (default: 4096)
+#   EXTRA_VLLM_ARGS   - any additional vllm serve flags
+
+set -eoux pipefail
+
+CONTAINER=$CONTAINER
+MOUNTS=$MOUNTS
+MODEL=$MODEL
+PORT=${PORT:-8100}
+TENSOR_PARALLEL=${TENSOR_PARALLEL:-1}
+DATA_PARALLEL=${DATA_PARALLEL:-1}
+COORD_FILE=$COORD_FILE
+GPU_MEMORY_UTIL=${GPU_MEMORY_UTIL:-0.90}
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-4096}
+EXTRA_VLLM_ARGS=${EXTRA_VLLM_ARGS:-}
+GPUS_PER_NODE=${GPUS_PER_NODE:-8}
+
+########################################################
+# Function to detect if SLURM cluster uses GRES
+########################################################
+maybe_gres_arg() {
+  if sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep -q "gpu:"; then
+    echo "--gres=gpu:${GPUS_PER_NODE}"
+    return
+  fi
+  echo ""
+}
+
+GRES_ARG=$(maybe_gres_arg)
+
+# Create log directory
+BASE_LOG_DIR=${BASE_LOG_DIR:-$SLURM_SUBMIT_DIR}
+LOG_DIR="$BASE_LOG_DIR/$SLURM_JOB_ID-logs"
+mkdir -p $LOG_DIR
+
+# Resolve head node hostname/IP
+head_node=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -1)
+head_node_ip=$(host $head_node 2>/dev/null | awk '/has address/ { print $4 }' | head -1 \
+    || getent hosts $head_node 2>/dev/null | awk '{ print $1 }' | head -1 \
+    || echo "$head_node")
+
+echo "[INFO] vLLM node: $head_node ($head_node_ip)"
+
+COMMON_SRUN_ARGS="$GRES_ARG"
+COMMON_SRUN_ARGS+=" --no-container-mount-home"
+COMMON_SRUN_ARGS+=" --mpi=pmix"
+COMMON_SRUN_ARGS+=" --container-mounts=$MOUNTS"
+COMMON_SRUN_ARGS+=" --container-image=$CONTAINER"
+COMMON_SRUN_ARGS+=" --container-workdir=$SLURM_SUBMIT_DIR"
+COMMON_SRUN_ARGS+=" -p $SLURM_JOB_PARTITION"
+COMMON_SRUN_ARGS+=" -A $SLURM_JOB_ACCOUNT"
+
+# Build data-parallel flag before the heredoc so it expands correctly inside it.
+# (Variables set inside a heredoc body are not visible at heredoc capture time.)
+DP_ARG=""
+if [[ ${DATA_PARALLEL} -gt 1 ]]; then
+    DP_ARG="--data-parallel-size ${DATA_PARALLEL}"
+fi
+
+server_cmd=$(cat <<EOF
+set -eoux pipefail
+
+exit-dramatically() {
+    pkill -P \$\$ || true
+    kill -TERM 0 || true
+    exit 1
+}
+export -f exit-dramatically
+
+# Verify vllm is importable before writing the coordination file, so the
+# launcher doesn't proceed to the curl health check against a dead server.
+uv run --extra vllm python -c "import vllm; print('vllm', vllm.__version__)"
+
+# Write our hostname to the coordination file so the training job can find us.
+# Write to a temp file first then rename to make the write atomic.
+echo "$head_node_ip" > ${COORD_FILE}.tmp
+mv ${COORD_FILE}.tmp ${COORD_FILE}
+echo "[INFO] Wrote hostname $head_node_ip to $COORD_FILE"
+
+# Start vLLM server (invoked as a module since the CLI entry point is not
+# registered in the uv environment; equivalent to "vllm serve").
+uv run --extra vllm python -m vllm.entrypoints.openai.api_server \
+    --model ${MODEL} \
+    --host 0.0.0.0 \
+    --port ${PORT} \
+    --tensor-parallel-size ${TENSOR_PARALLEL} \
+    ${DP_ARG} \
+    --gpu-memory-utilization ${GPU_MEMORY_UTIL} \
+    --max-model-len ${MAX_MODEL_LEN} \
+    --no-enable-log-requests \
+    ${EXTRA_VLLM_ARGS}
+EOF
+)
+
+srun $COMMON_SRUN_ARGS \
+    --container-name=vllm-server \
+    --nodes=1 \
+    --ntasks=1 \
+    --cpus-per-task=$((GPUS_PER_NODE * 16)) \
+    -w "$head_node" \
+    -o "$LOG_DIR/vllm-server.log" \
+    bash -x -c "$server_cmd"
