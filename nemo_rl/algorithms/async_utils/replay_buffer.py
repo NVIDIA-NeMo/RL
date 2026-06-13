@@ -14,6 +14,7 @@
 
 import asyncio
 import threading as _threading
+import uuid
 from collections import Counter
 from collections.abc import Mapping
 from typing import Any, Iterable, Optional
@@ -581,12 +582,14 @@ class TQReplayBuffer:
         record: PromptGroupRecord,
         *,
         weight_version: int,
+        group_id: Optional[str] = None,
     ) -> KVBatchMeta:
         """Tensorize record and write its N rows to TQ as one group.
 
         Args:
             record: PromptGroupRecord with N completions to tensorize.
             weight_version: Trainer weight version stamped on every row's tag; must be int.
+            group_id: Per-group sample_id prefix; defaults to a fresh uuid4.
 
         Returns:
             KVBatchMeta for the newly written group.
@@ -596,9 +599,11 @@ class TQReplayBuffer:
                 f"TQReplayBuffer.add: weight_version must be int, got "
                 f"{type(weight_version).__name__}"
             )
+        if group_id is None:
+            group_id = str(uuid.uuid4())
         train_batch = record_to_train_batch(record, pad_value_dict=self._pad_value_dict)
         sample_ids, fields, tags = pack_payload(
-            train_batch, weight_version=weight_version
+            train_batch, weight_version=weight_version, group_id=group_id
         )
         meta = await self._call_dp(
             "put_samples",
@@ -611,42 +616,40 @@ class TQReplayBuffer:
         self.weight_list.append(weight_version)
         return meta
 
-    async def remove(self, sample_ids: list[str]) -> int:
-        """Drop entries fully covered by sample_ids; partial groups raise ValueError.
+    async def remove(self, idxs: list[int], remove_in_dp: bool) -> int:
+        """Drop entries at the given indices and optionally clear them from DataPlane.
 
         Args:
-            sample_ids: Sample ids covering whole prompt-group entries to drop.
+            idxs: Entry indices to drop. Must be within [0, size).
+            remove_in_dp: If True, also clear the dropped rows from DataPlane.
 
         Returns:
             Number of group entries removed from the buffer.
         """
-        ids_set = set(sample_ids)
-        keep_meta: list[KVBatchMeta] = []
-        keep_weights: list[int] = []
-        hit_ids: set[str] = set()
-        n_removed = 0
-        for meta, weight in zip(self.meta_list, self.weight_list):
-            entry_ids = set(meta.sample_ids)
-            if entry_ids <= ids_set:
-                hit_ids.update(entry_ids)
-                n_removed += 1
-            else:
-                keep_meta.append(meta)
-                keep_weights.append(weight)
-        leftover = ids_set - hit_ids
-        if leftover:
-            raise ValueError(
-                f"TQReplayBuffer.remove: sample_ids did not align with whole-entry "
-                f"boundaries; unmatched ids={sorted(leftover)}"
+        if len(idxs) == 0:
+            return 0
+
+        drop_idxs = sorted(idxs, reverse=True)
+        if drop_idxs[0] >= len(self.meta_list):
+            raise IndexError(
+                f"TQReplayBuffer.remove: indices out of range: {drop_idxs[0]}; "
+                f"size={len(self.meta_list)}"
             )
-        await self._call_dp(
-            "clear_samples",
-            sample_ids=list(sample_ids),
-            partition_id=self._partition_id,
-        )
-        self.meta_list = keep_meta
-        self.weight_list = keep_weights
-        return n_removed
+
+        dropped_sample_ids: list[str] = []
+        for i in drop_idxs:
+            dropped_sample_ids.extend(self.meta_list[i].sample_ids)
+            del self.meta_list[i]
+            del self.weight_list[i]
+
+        if remove_in_dp:
+            await self._call_dp(
+                "clear_samples",
+                sample_ids=dropped_sample_ids,
+                partition_id=self._partition_id,
+            )
+
+        return len(drop_idxs)
 
     def size(self) -> int:
         """Return the number of prompt-group entries currently held."""
