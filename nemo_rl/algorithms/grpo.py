@@ -1259,7 +1259,7 @@ def _apply_message_level_advantage_penalties(
     invalid_tool_call_advantage: float | None,
     malformed_thinking_advantage: float | None,
     log_config: bool = False,
-) -> dict[str, float]:
+) -> Optional[dict[str, float]]:
     """Overwrite advantages for flagged assistant-message token spans.
 
     For each assistant message flagged by the NeMo-Gym detector as an invalid
@@ -1274,6 +1274,8 @@ def _apply_message_level_advantage_penalties(
         invalid_tool_call_advantage: Advantage value assigned to invalid tool calls.
         malformed_thinking_advantage: Advantage value assigned to malformed thinking.
         log_config: If True, print the configured penalty values once.
+    Returns:
+        Dictionary of penalty metrics if penalties are applied, otherwise None.
     """
     penalty_metrics = {}
     invalid_neg_adv = invalid_tool_call_advantage
@@ -1363,7 +1365,7 @@ def _apply_configured_message_level_advantage_penalties(
     message_logs: list[LLMMessageLogType | VLMMessageLogType],
     master_config: MasterConfig,
     log_config: bool = False,
-) -> None:
+) -> Optional[dict[str, float]]:
     """Resolve config and apply message-level advantage penalties."""
     (
         invalid_tool_call_advantage,
