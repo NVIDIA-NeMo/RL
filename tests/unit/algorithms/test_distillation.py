@@ -874,6 +874,16 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch):
             "make_actor_runtime_env",
             return_value=runtime_env,
         ) as mock_runtime_env,
+        patch.object(
+            distil_mod,
+            "get_nemo_gym_uv_cache_dir",
+            return_value="/opt/nemo-gym/.uv-cache",
+        ),
+        patch.object(
+            distil_mod,
+            "get_nemo_gym_venv_dir",
+            return_value="/opt/nemo-gym/venvs",
+        ),
         patch.object(distil_mod, "ray") as mock_ray,
     ):
         mock_ckpt_mgr.return_value.get_latest_checkpoint_path.return_value = None
@@ -906,6 +916,8 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch):
     assert nemo_gym_cfg["initial_global_config_dict"] == {
         "num_gpu_nodes": 1,
         "config_paths": ["gym.yaml"],
+        "uv_cache_dir": "/opt/nemo-gym/.uv-cache",
+        "uv_venv_dir": "/opt/nemo-gym/venvs",
     }
     assert master_config.env["nemo_gym"] == nemo_gym_env_before
     nemo_gym_actor._spinup.remote.assert_called_once_with()
