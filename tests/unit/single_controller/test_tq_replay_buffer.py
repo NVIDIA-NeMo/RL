@@ -187,32 +187,49 @@ class TestTQReplayBufferAdd:
 
 
 class TestTQReplayBufferRemove:
-    def test_remove_drops_fully_covered_entries(self):
+    def test_remove_drops_indices_and_clears_dp_when_requested(self):
         dp = FakeDataPlaneClient()
         buf = _make_buffer(dp)
         metas = [_add_group(buf, weight=g) for g in range(3)]
 
-        remove_ids = list(metas[0].sample_ids) + list(metas[2].sample_ids)
-        n = _run(buf.remove(remove_ids))
+        n = _run(buf.remove([0, 2], remove_in_dp=True))
 
         assert n == 2
         assert buf.size() == 1
         assert buf.weight_list == [1]
         assert buf.meta_list[0].sample_ids == list(metas[1].sample_ids)
-        # TQ cleared too
         assert dp.depth() == _N_GENS
         assert set(dp._rows) == set(metas[1].sample_ids)
 
-    def test_remove_rejects_unknown_sample_id(self):
+    def test_remove_without_dp_keeps_rows(self):
         dp = FakeDataPlaneClient()
         buf = _make_buffer(dp)
-        meta = _add_group(buf, weight=0)
+        metas = [_add_group(buf, weight=g) for g in range(2)]
 
-        with pytest.raises(ValueError, match="whole-entry boundaries"):
-            _run(buf.remove([*meta.sample_ids, "ghost-id"]))
+        n = _run(buf.remove([0], remove_in_dp=False))
 
+        assert n == 1
         assert buf.size() == 1
-        assert dp.depth() == _N_GENS
+        assert buf.weight_list == [1]
+        assert buf.meta_list[0].sample_ids == list(metas[1].sample_ids)
+        assert dp.clear_calls == []
+        assert dp.depth() == 2 * _N_GENS
+
+    def test_remove_rejects_out_of_range_before_mutating(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        metas = [_add_group(buf, weight=g) for g in range(2)]
+
+        with pytest.raises(IndexError, match=r"out of range: 5; size=2"):
+            _run(buf.remove([0, 5], remove_in_dp=True))
+
+        assert buf.size() == 2
+        assert [m.sample_ids for m in buf.meta_list] == [
+            list(metas[0].sample_ids),
+            list(metas[1].sample_ids),
+        ]
+        assert dp.depth() == 2 * _N_GENS
+        assert dp.clear_calls == []
 
     def test_remove_empty_is_noop(self):
         dp = FakeDataPlaneClient()
@@ -220,11 +237,12 @@ class TestTQReplayBufferRemove:
         _add_group(buf, weight=0)
         _add_group(buf, weight=0)
 
-        n = _run(buf.remove([]))
+        n = _run(buf.remove([], remove_in_dp=True))
 
         assert n == 0
         assert buf.size() == 2
         assert dp.depth() == 2 * _N_GENS
+        assert dp.clear_calls == []
 
 
 class TestTQReplayBufferSize:
@@ -234,7 +252,7 @@ class TestTQReplayBufferSize:
         assert buf.size() == 0
         assert len(buf) == 0
 
-        meta_g0 = _add_group(buf, weight=0)
+        _add_group(buf, weight=0)
         assert buf.size() == 1
         assert len(buf) == 1
 
@@ -242,6 +260,6 @@ class TestTQReplayBufferSize:
         assert buf.size() == 2
         assert len(buf) == 2
 
-        _run(buf.remove(list(meta_g0.sample_ids)))
+        _run(buf.remove([0], remove_in_dp=True))
         assert buf.size() == 1
         assert len(buf) == 1

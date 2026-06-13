@@ -14,7 +14,6 @@
 
 """Producer-side payload helpers for the async-RL TQ path."""
 
-import uuid
 from collections.abc import Mapping
 from typing import Any
 
@@ -92,15 +91,17 @@ def pack_payload(
     train_batch: Mapping[str, Any],
     *,
     weight_version: int,
+    group_id: str,
 ) -> tuple[list[str], TensorDict, list[dict[str, Any]]]:
     """Pack a producer batch into (sample_ids, fields, tags) for put_samples.
 
     Args:
         train_batch: Mapping with at least input_lengths plus the tensor/object fields to send.
         weight_version: Trainer weight version stamped on every row's tag.
+        group_id: Per-group identifier used as the sample_id prefix; the caller owns uniqueness.
 
     Returns:
-        sample_ids of the form {uuid}_g{i}, a jagged-packed TensorDict, and per-row tags.
+        sample_ids of the form {group_id}_g{i}, a jagged-packed TensorDict, and per-row tags.
     """
     lengths = train_batch["input_lengths"]
     n = int(lengths.shape[0])
@@ -111,7 +112,6 @@ def pack_payload(
         or (isinstance(v, np.ndarray) and v.dtype == object)
     }
     fields_td = pack_jagged_fields(tensor_fields, lengths=lengths)
-    group_uuid = str(uuid.uuid4())
-    sample_ids = [f"{group_uuid}_g{i}" for i in range(n)]
+    sample_ids = [f"{group_id}_g{i}" for i in range(n)]
     tags = [{"weight_version": weight_version} for _ in range(n)]
     return sample_ids, fields_td, tags

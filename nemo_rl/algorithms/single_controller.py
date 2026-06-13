@@ -22,12 +22,12 @@ Data flow:
   _rollout_pump  → rollout_manager.generate_and_push(prompt)
                      → TQReplayBuffer.add tensorizes the record and writes
                        N training rows to TQ as one prompt-group.
-  _train_pump    → sampler.evict → buffer.remove (stale groups).
-                 → sampler.select → KVBatchMeta of K groups (or None);
-                   meta is already trainable.
+  _train_pump    → sampler.evict → buffer.remove (stale groups, with DP clear).
+                 → sampler.select → drops chosen groups from buffer, returns
+                   KVBatchMeta of K groups (or None); meta is already trainable.
                  → _advantage_pump (get → compute → put).
                  → trainer.train_on_meta.
-                 → buffer.remove (trained groups).
+                 → dp_client.clear_samples (trained groups; buffer already dropped).
   _sync_weights  → drain _inflight_rollouts → WeightSynchronizer.sync_weights.
 """
 
@@ -356,13 +356,14 @@ class SingleControllerActor:
         """Drain stale groups, sample, train, drop.
 
         Per step:
-          1. sampler.evict → buffer.remove stale prompt-group entries.
-          2. sampler.select → train_meta covering K prompt groups (or None).
-             Already trainable — buffer wrote training-shaped rows at rollout time.
+          1. sampler.evict drops stale groups from the buffer and clears their TQ rows.
+          2. sampler.select returns K prompt groups (or None) and drops them from the
+             buffer; DP rows survive so the trainer can read them. Already trainable —
+             buffer wrote training-shaped rows at rollout time.
           3. _advantage_pump(train_meta).
           4. trainer.train_on_meta(train_meta, dp_client).
-          5. buffer.remove(train_meta.sample_ids) drops trained groups and clears
-             their TQ rows; release _buffer_capacity per dropped group, then sync.
+          5. dp_client.clear_samples on consumed sample_ids; release _buffer_capacity
+             per dropped group, then sync.
         """
         logprobs_required = (
             self._cfg.advantage_policy_logprobs_field is not None
@@ -378,7 +379,6 @@ class SingleControllerActor:
             groups_dispatched = 0
             in_flight: list[ray.ObjectRef] = []
             step_open = False
-            step_min_weight_version: int | None = None
 
             evicted = await self._sampler.evict(
                 current_train_weight=self._trainer_version,
@@ -391,8 +391,9 @@ class SingleControllerActor:
             while groups_dispatched < target_groups:
                 await asyncio.sleep(0)
 
-                # TODO @yukih: wait train pump merged
-                train_meta = self._sampler.select(
+                # TODO @yukih: wait train pump merged, now always return min_prompt_groups_per_batch
+                # need to add a max_prompt_groups_per_batch
+                train_meta = await self._sampler.select(
                     current_train_weight=self._trainer_version,
                     min_prompt_groups=self._cfg.min_prompt_groups_per_batch,
                 )
@@ -400,6 +401,9 @@ class SingleControllerActor:
                 if train_meta is None:
                     await asyncio.sleep(0.05)
                     continue
+
+                for _ in range(len(train_meta.tags)):
+                    self._buffer_capacity.release()
 
                 if logprobs_required:
                     await self._ray_get(
@@ -416,7 +420,7 @@ class SingleControllerActor:
                     step_id, train_meta
                 )
                 in_flight.append(future)
-                groups_dispatched += 1
+                groups_dispatched += len(train_meta.tags)
                 self._step_consumed_sample_ids.extend(train_meta.sample_ids)
 
                 in_flight = await self._reap_in_flight_nonblocking(in_flight)
@@ -432,10 +436,12 @@ class SingleControllerActor:
                 self._trainer.finish_train_step.remote(step_id)
             )
             consumed_ids = list(self._step_consumed_sample_ids)
-            dropped = await self._buffer.remove(list(consumed_ids))
-            for _ in range(dropped):
-                self._buffer_capacity.release()
             self._step_consumed_sample_ids = []
+            await self._call_dp(
+                "clear_samples",
+                sample_ids=list(consumed_ids),
+                partition_id=self._cfg.partition_id,
+            )
 
             self._trainer_version = result["trainer_version"]
             lag = self._trainer_version - min(

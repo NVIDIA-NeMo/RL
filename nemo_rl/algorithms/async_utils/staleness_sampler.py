@@ -19,7 +19,10 @@ from nemo_rl.data_plane import KVBatchMeta
 
 
 class StalenessSampler:
-    """Pick complete prompt groups inside a version staleness window."""
+    """Pick complete prompt groups inside a version staleness window.
+
+    Defaults to FIFO (sample_freshest_first=False); pass True to prefer smallest lag.
+    """
 
     def __init__(
         self,
@@ -36,7 +39,7 @@ class StalenessSampler:
         self.max_staleness_versions = max_staleness_versions
         self.sample_freshest_first = sample_freshest_first
 
-    def select(
+    async def select(
         self,
         *,
         current_train_weight: int,
@@ -46,6 +49,8 @@ class StalenessSampler:
 
         Freshest-first (smallest lag, ties by insertion order) when
         sample_freshest_first is set, else insertion-order FIFO.
+        Selected entries are dropped from the buffer locally; DataPlane rows survive
+        for the trainer and are cleared by the caller at step boundary.
 
         Args:
             current_train_weight: Current trainer weight version. Eligibility window is
@@ -59,27 +64,30 @@ class StalenessSampler:
             raise ValueError(f"min_prompt_groups must be >= 1, got {min_prompt_groups}")
 
         min_valid_version = max(0, current_train_weight - self.max_staleness_versions)
-        valid_indices = [
+        valid_idxs = [
             i
             for i, weight in enumerate(self._buffer.weight_list)
             if min_valid_version <= weight <= current_train_weight
         ]
-        if not valid_indices:
+        if not valid_idxs:
             return None
-        if len(valid_indices) < min_prompt_groups:
+        if len(valid_idxs) < min_prompt_groups:
             return None
 
         if self.sample_freshest_first:
-            valid_indices.sort(
+            valid_idxs.sort(
                 key=lambda i: (
                     current_train_weight - self._buffer.weight_list[i],
                     i,
                 )
             )
 
-        selected = valid_indices[:min_prompt_groups]
-        sampled_metas = [self._buffer.meta_list[i] for i in selected]
-        return sampled_metas[0].concat(*sampled_metas[1:])
+        selected_idxs = valid_idxs[:min_prompt_groups]
+        selected_metas = [self._buffer.meta_list[i] for i in selected_idxs]
+
+        await self._buffer.remove(selected_idxs, remove_in_dp=False)
+
+        return selected_metas[0].concat(*selected_metas[1:])
 
     async def evict(self, *, current_train_weight: int) -> int:
         """Drop groups whose weight falls below the staleness window.
@@ -94,14 +102,11 @@ class StalenessSampler:
             Number of group entries removed from the buffer.
         """
         min_valid_version = max(0, current_train_weight - self.max_staleness_versions)
-        stale_indices = [
+        stale_idxs = [
             i
             for i, weight in enumerate(self._buffer.weight_list)
             if weight < min_valid_version
         ]
-        if not stale_indices:
+        if not stale_idxs:
             return 0
-        stale_sample_ids = [
-            sid for i in stale_indices for sid in self._buffer.meta_list[i].sample_ids
-        ]
-        return await self._buffer.remove(stale_sample_ids)
+        return await self._buffer.remove(stale_idxs, remove_in_dp=True)

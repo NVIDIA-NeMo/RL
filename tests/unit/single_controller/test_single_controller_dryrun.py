@@ -64,7 +64,7 @@ class FakeDataPlaneActor:
     """Minimal in-memory DataPlane actor for dry-run testing.
 
     Stores rows by sample_id and exposes the current DataPlane methods
-    SingleController uses: claim_meta, get_samples, and clear_samples.
+    SingleController uses: get_samples, and clear_samples.
     Not production code — used only for C-03 dry-run validation.
     """
 
@@ -108,40 +108,6 @@ class FakeDataPlaneActor:
             sample_ids=list(sample_ids),
             fields=list(fields.keys()) if fields is not None else None,
             tags=[dict(t) for t in tags] if tags is not None else None,
-        )
-
-    def claim_meta(
-        self,
-        partition_id: str,
-        task_name: str,
-        required_fields: list[str],
-        batch_size: int,
-        dp_rank: int | None = None,
-        blocking: bool = True,
-        timeout_s: float = 60.0,
-    ) -> KVBatchMeta:
-        del dp_rank, blocking, timeout_s
-        assert partition_id == self._partition_id
-        with self._lock:
-            consumed = self._consumed.setdefault(task_name, set())
-            sample_ids: list[str] = []
-            tags: list[dict[str, Any]] = []
-            for sample_id, row in self._rows.items():
-                if sample_id in consumed:
-                    continue
-                if not all(field in row["fields"] for field in required_fields):
-                    continue
-                sample_ids.append(sample_id)
-                tags.append(dict(row["tag"]))
-                if len(sample_ids) >= batch_size:
-                    break
-            consumed.update(sample_ids)
-        return KVBatchMeta(
-            partition_id=partition_id,
-            task_name=task_name,
-            sample_ids=sample_ids,
-            fields=list(required_fields),
-            tags=tags if tags else None,
         )
 
     def get_samples(
@@ -230,6 +196,54 @@ class DryRunGenWorker:
 
     def get_call_count(self) -> int:
         return self._call_count
+
+    def get_call_timestamps(self) -> list[float]:
+        return list(self._call_timestamps)
+
+
+@ray.remote(num_cpus=0)
+class DryRunStaggeredGenWorker:
+    """Gen worker that reads latency and group label from the prompt.
+
+    Prompt format: ``"{idx}:{latency}"``. Sleeps for ``latency`` then
+    returns a PromptGroupRecord tagged with ``group_id="group-{idx:04d}"``;
+    DryRunRolloutManager is responsible for pushing it to TQ.
+    """
+
+    def __init__(self) -> None:
+        self._call_timestamps: list[float] = []
+
+    async def generate(self, prompt: str) -> PromptGroupRecord:
+        idx_str, latency_str = prompt.split(":")
+        idx = int(idx_str)
+        latency = float(latency_str)
+        self._call_timestamps.append(time.monotonic())
+        await asyncio.sleep(latency)
+        group_id = f"group-{idx:04d}"
+        prompt_msg = {
+            "role": "user",
+            "token_ids": torch.tensor([idx] * 3, dtype=torch.long),
+        }
+        assistant_msg = {
+            "role": "assistant",
+            "token_ids": torch.tensor([idx] * 3, dtype=torch.long),
+            "generation_logprobs": torch.zeros(3, dtype=torch.float32),
+        }
+        return PromptGroupRecord(
+            prompt_idx=idx,
+            prompt=[prompt_msg],
+            extra_env_info=None,
+            metadata={"group_id": group_id},
+            completions=[
+                Completion(
+                    message_log=[prompt_msg, assistant_msg],
+                    env_extras=None,
+                    truncated=False,
+                    reward=float(idx),
+                ),
+            ],
+            rollout_metrics={},
+        )
 
     def get_call_timestamps(self) -> list[float]:
         return list(self._call_timestamps)
@@ -419,7 +433,12 @@ class DryRunRolloutManager:
 
     async def generate_and_push(self, prompt: str) -> None:
         record = await self._gen_actor.generate.remote(prompt)
-        await self._tq_buffer.add(record, weight_version=self._weight_version)
+        group_id = (record.metadata or {}).get("group_id")
+        await self._tq_buffer.add(
+            record,
+            weight_version=self._weight_version,
+            group_id=group_id,
+        )
 
 
 class DryRunWeightSynchronizer:
@@ -430,13 +449,8 @@ class DryRunWeightSynchronizer:
     then mirrors ``trainer_version`` onto the rollout manager.
     """
 
-    def __init__(
-        self,
-        sync_latency_s: float = 0.05,
-        rollout_manager: Any = None,
-    ):
+    def __init__(self, sync_latency_s: float = 0.05):
         self._sync_latency_s = sync_latency_s
-        self._rollout_manager = rollout_manager
         self._sync_count = 0
         self._sync_timestamps: list[float] = []
 
@@ -444,8 +458,6 @@ class DryRunWeightSynchronizer:
         self._sync_count += 1
         self._sync_timestamps.append(time.monotonic())
         await asyncio.sleep(self._sync_latency_s)
-        if self._rollout_manager is not None:
-            self._rollout_manager.set_weight_version(trainer_version)
 
 
 # ── pytest fixtures ───────────────────────────────────────────────────────
@@ -467,8 +479,8 @@ class _FakeBuffer:
         self.meta_list: list[KVBatchMeta] = []
         self.weight_list: list[int] = []
 
-    def add_group(self, group_id: str, weight: int, group_size: int = 1) -> None:
-        sample_ids = [f"{group_id}_s{j}" for j in range(group_size)]
+    def add(self, group_id: str, weight: int, group_size: int = 1) -> None:
+        sample_ids = [f"{group_id}_g{i}" for i in range(group_size)]
         self.meta_list.append(
             KVBatchMeta(
                 partition_id=self._partition_id,
@@ -479,26 +491,18 @@ class _FakeBuffer:
         )
         self.weight_list.append(weight)
 
-    async def remove(self, sample_ids: list[str]) -> int:
-        ids = set(sample_ids)
-        keep_meta: list[KVBatchMeta] = []
-        keep_w: list[int] = []
-        n = 0
-        for meta, w in zip(self.meta_list, self.weight_list):
-            if set(meta.sample_ids) <= ids:
-                n += 1
-            else:
-                keep_meta.append(meta)
-                keep_w.append(w)
-        self.meta_list = keep_meta
-        self.weight_list = keep_w
-        return n
+    async def remove(self, idxs: list[int], remove_in_dp: bool) -> int:
+        del remove_in_dp
+        for i in sorted(idxs, reverse=True):
+            del self.meta_list[i]
+            del self.weight_list[i]
+        return len(idxs)
 
 
 def _buffer_with_versions(versions: list[int]) -> _FakeBuffer:
     buf = _FakeBuffer()
     for i, w in enumerate(versions):
-        buf.add_group(f"g{i}", weight=w)
+        buf.add(f"g{i}", weight=w)
     return buf
 
 
@@ -546,7 +550,7 @@ class TestSingleControllerDryRun:
         )
         rollout_manager = DryRunRolloutManager(gen, tq_buffer)
         if weight_sync is None:
-            weight_sync = DryRunWeightSynchronizer(rollout_manager=rollout_manager)
+            weight_sync = DryRunWeightSynchronizer()
 
         return SingleControllerActor.remote(
             cfg=cfg,
@@ -608,8 +612,8 @@ class TestSingleControllerDryRun:
         assert advantages is not None
         # Per-group dispatch: each group is one sample → centered advantage is 0.
         # The two microbatch calls are concatenated.
-        assert advantages.shape == (2, 3)
-        assert torch.allclose(advantages, torch.zeros((2, 3)))
+        assert advantages.shape == (2, 6)
+        assert torch.allclose(advantages, torch.zeros((2, 6)))
 
     def test_rollout_pump_runs_concurrently_with_train(self, ray_init):
         """rollout_pump dispatches while train_pump is sleeping.
@@ -690,10 +694,7 @@ class TestSingleControllerDryRun:
         dp_client = FakeDataPlaneActor.remote()
         gen = DryRunGenWorker.remote(gen_latency_s=0.05)
         trainer = DryRunTrainer.remote(dp_client, train_latency_s=0.05)
-        weight_sync = DryRunWeightSynchronizer(
-            sync_latency_s=0.15,
-            gen_handle=gen,
-        )  # slow sync
+        weight_sync = DryRunWeightSynchronizer(sync_latency_s=0.15)  # slow sync
 
         ctrl = self._make_controller(
             dp_client,
@@ -744,31 +745,40 @@ class TestSingleControllerDryRun:
     def test_staleness_sampler_filters_correctly(self):
         """StalenessSampler returns freshest complete groups within the window."""
         buf = _buffer_with_versions([3, 4, 5, 2, 6])
-        sampler = StalenessSampler(buf, max_staleness_versions=2)
+        sampler = StalenessSampler(
+            buf, max_staleness_versions=2, sample_freshest_first=True
+        )
 
-        selected = sampler.select(current_train_weight=5, min_prompt_groups=2)
+        selected = asyncio.run(
+            sampler.select(current_train_weight=5, min_prompt_groups=2)
+        )
 
         assert selected is not None
         # freshest-first: g2(lag 0), g1(lag 1). g3 stale, g4 future.
-        assert selected.sample_ids == ["g2_s0", "g1_s0"]
+        assert selected.sample_ids == ["g2_g0", "g1_g0"]
 
     def test_staleness_sampler_returns_none_when_insufficient(self):
         """StalenessSampler returns None when not enough eligible rows."""
         buf = _buffer_with_versions([1])
         sampler = StalenessSampler(buf, max_staleness_versions=1)
 
-        assert sampler.select(current_train_weight=5, min_prompt_groups=2) is None
+        assert (
+            asyncio.run(sampler.select(current_train_weight=5, min_prompt_groups=2))
+            is None
+        )
 
     def test_staleness_sampler_concats_multiple_groups(self):
         """Selected meta concatenates whole-group sample_ids end-to-end."""
         buf = _FakeBuffer()
-        buf.add_group("g0", weight=5, group_size=2)
-        buf.add_group("g1", weight=5, group_size=2)
+        buf.add("g0", weight=5, group_size=2)
+        buf.add("g1", weight=5, group_size=2)
         sampler = StalenessSampler(buf, max_staleness_versions=0)
 
-        selected = sampler.select(current_train_weight=5, min_prompt_groups=2)
+        selected = asyncio.run(
+            sampler.select(current_train_weight=5, min_prompt_groups=2)
+        )
         assert selected is not None
-        assert selected.sample_ids == ["g0_s0", "g0_s1", "g1_s0", "g1_s1"]
+        assert selected.sample_ids == ["g0_g0", "g0_g1", "g1_g0", "g1_g1"]
 
     def test_strict_on_policy_batch_sampler_requires_exact_version(self):
         """Strict sampler waits for a full batch at the trainer version."""
@@ -776,10 +786,15 @@ class TestSingleControllerDryRun:
         sampler = StalenessSampler(buf, max_staleness_versions=0)
 
         # Eligible at weight==5 are indices 1 and 2 only.
-        assert sampler.select(current_train_weight=5, min_prompt_groups=3) is None
-        selected = sampler.select(current_train_weight=5, min_prompt_groups=2)
+        assert (
+            asyncio.run(sampler.select(current_train_weight=5, min_prompt_groups=3))
+            is None
+        )
+        selected = asyncio.run(
+            sampler.select(current_train_weight=5, min_prompt_groups=2)
+        )
         assert selected is not None
-        assert selected.sample_ids == ["g1_s0", "g2_s0"]
+        assert selected.sample_ids == ["g1_g0", "g2_g0"]
 
     def test_strict_on_policy_batch_sampler_evicts_old_groups(self):
         """Strict sampler drops complete old-version groups via buffer.remove."""
@@ -790,7 +805,7 @@ class TestSingleControllerDryRun:
 
         assert dropped == 2
         assert buf.weight_list == [5]
-        assert [m.sample_ids[0] for m in buf.meta_list] == ["g1_s0"]
+        assert [m.sample_ids[0] for m in buf.meta_list] == ["g1_g0"]
 
 
 @ray.remote(num_cpus=0)
@@ -894,52 +909,6 @@ class TestDryRunTrainerSplitAPI:
             ray.get(trainer.begin_train_step.remote("step-5"))
 
 
-@ray.remote(num_cpus=0)
-class StaggeredGenWorker:
-    """Gen worker that reads latency and group label from the prompt.
-
-    Prompt format: ``"{idx}:{latency}"``. Sleeps for ``latency`` then
-    pushes a row with ``group_id="group-{idx}"``.
-    """
-
-    def __init__(self, weight_version: int = 0) -> None:
-        self._weight_version = weight_version
-        self._completion_timestamps: list[float] = []
-
-    async def generate_and_push(self, prompt: str, dp_client: Any) -> None:
-        idx_str, latency_str = prompt.split(":")
-        idx = int(idx_str)
-        latency = float(latency_str)
-        await asyncio.sleep(latency)
-        group_id = f"group-{idx:04d}"
-        sample_id = f"{group_id}_g0"
-        await dp_client.put_samples.remote(
-            sample_ids=[sample_id],
-            partition_id="rollout_data",
-            fields=TensorDict(
-                {
-                    "input_ids": torch.ones((1, 3), dtype=torch.long),
-                },
-                batch_size=[1],
-            ),
-            tags=[
-                {
-                    "group_id": group_id,
-                    "weight_version": self._weight_version,
-                    "committed": True,
-                    "expected_num_samples": 1,
-                }
-            ],
-        )
-        self._completion_timestamps.append(time.monotonic())
-
-    def get_completion_timestamps(self) -> list[float]:
-        return list(self._completion_timestamps)
-
-    def set_weight_version(self, version: int) -> None:
-        self._weight_version = version
-
-
 class TestStreamingTrainPump:
     """Streaming train_pump end-to-end behavior under DryRunTrainer."""
 
@@ -975,8 +944,14 @@ class TestStreamingTrainPump:
         dataloader = prompts
 
         if weight_sync is None:
-            weight_sync = DryRunWeightSynchronizer(gen_handle=gen)
-        rollout_manager = DryRunRolloutManager(gen, dp_client)
+            weight_sync = DryRunWeightSynchronizer()
+
+        tq_buffer = TQReplayBuffer(
+            dp_client,
+            partition_id=cfg.partition_id,
+            pad_value_dict={"token_ids": 0},
+        )
+        rollout_manager = DryRunRolloutManager(gen, tq_buffer)
 
         return SingleControllerActor.remote(
             cfg=cfg,
@@ -987,6 +962,7 @@ class TestStreamingTrainPump:
             dataloader=dataloader,
             weight_synchronizer=weight_sync,
             rollout_manager=rollout_manager,
+            tq_buffer=tq_buffer,
             advantage_estimator=None,
         )
 
@@ -994,7 +970,7 @@ class TestStreamingTrainPump:
         """SC dispatches train_microbatch in order groups commit at DP."""
         dp_client = FakeDataPlaneActor.remote()
         # Group 0 slow, group 1 fast, group 2 medium → arrival order: 1, 2, 0
-        gen = StaggeredGenWorker.remote()
+        gen = DryRunStaggeredGenWorker.remote()
         trainer = DryRunTrainer.remote(dp_client, train_latency_s=0.0)
         prompts = ["0:0.30", "1:0.05", "2:0.15"]
 
@@ -1019,7 +995,7 @@ class TestStreamingTrainPump:
     def test_trainer_version_advances_only_at_finish(self, ray_init):
         """trainer_version stays put across mb calls; ticks on finish."""
         dp_client = FakeDataPlaneActor.remote()
-        gen = StaggeredGenWorker.remote()
+        gen = DryRunStaggeredGenWorker.remote()
         trainer = DryRunTrainer.remote(dp_client, train_latency_s=0.0)
         prompts = [f"{i}:0.02" for i in range(4)]
 
@@ -1065,7 +1041,7 @@ class TestStreamingTrainPump:
             )
         )
         del stale_meta
-        gen = StaggeredGenWorker.remote(weight_version=0)
+        gen = DryRunStaggeredGenWorker.remote()
         trainer = DryRunTrainer.remote(dp_client, train_latency_s=0.0)
         prompts = [f"{i}:0.02" for i in range(2)]
 
@@ -1091,7 +1067,7 @@ class TestStreamingTrainPump:
         """First microbatch begins before the long-tail group's rollout finishes."""
         dp_client = FakeDataPlaneActor.remote()
         # Group 0 fast, 1-3 medium, group 4 slow
-        gen = StaggeredGenWorker.remote()
+        gen = DryRunStaggeredGenWorker.remote()
         trainer = DryRunTrainer.remote(
             dp_client, train_latency_s=0.0, microbatch_latency_s=0.0
         )
@@ -1111,8 +1087,10 @@ class TestStreamingTrainPump:
         mbs = ray.get(trainer.get_microbatch_calls.remote())
         assert len(mbs) == 5
         first_mb_ts = mbs[0][2]
-        completion_ts = ray.get(gen.get_completion_timestamps.remote())
-        # 5 completions; the slow group is the last one to finish
+        # generate() records call-time before sleep; derive completion via prompt latency.
+        call_ts = ray.get(gen.get_call_timestamps.remote())
+        latencies = [float(p.split(":")[1]) for p in prompts]
+        completion_ts = [call_ts[i] + latencies[i] for i in range(len(prompts))]
         slow_completion = max(completion_ts)
         assert first_mb_ts < slow_completion, (
             f"first mb dispatched at {first_mb_ts} but slow group "
@@ -1146,7 +1124,7 @@ class TestStreamingTrainPump:
     def test_empty_step_is_no_op(self, ray_init):
         """No rollouts → SC exits without calling finish_train_step."""
         dp_client = FakeDataPlaneActor.remote()
-        gen = StaggeredGenWorker.remote()
+        gen = DryRunStaggeredGenWorker.remote()
         trainer = DryRunTrainer.remote(dp_client, train_latency_s=0.0)
         ctrl = self._make_controller(
             dp_client,
@@ -1165,7 +1143,7 @@ class TestStreamingTrainPump:
     def test_clear_samples_called_once_per_step(self, ray_init):
         """clear_samples is called exactly once per step covering all dispatched ids."""
         dp_client = FakeDataPlaneActor.remote()
-        gen = StaggeredGenWorker.remote()
+        gen = DryRunStaggeredGenWorker.remote()
         trainer = DryRunTrainer.remote(dp_client, train_latency_s=0.0)
         prompts = ["0:0.01", "1:0.02", "2:0.03"]
         ctrl = self._make_controller(
