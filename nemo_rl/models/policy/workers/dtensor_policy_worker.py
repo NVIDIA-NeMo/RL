@@ -584,6 +584,9 @@ class DTensorPolicyWorkerImpl(
         check_dim_skip_keys: Optional[Iterable[str]] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
+        if self.delta_weight_transfer_tracker is not None:
+            self.delta_weight_transfer_tracker.flush_baseline()
+
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:

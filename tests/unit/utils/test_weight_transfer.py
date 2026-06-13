@@ -14,6 +14,7 @@
 
 import json
 import threading
+from concurrent.futures import Future
 from contextlib import contextmanager
 from unittest.mock import Mock, patch
 
@@ -35,6 +36,8 @@ from nemo_rl.utils.weight_transfer import (
 )
 from nemo_rl.utils.weight_transfer_delta_tracker import (
     DeltaCompressionTracker,
+    _baseline_mmap_pending_bytes,
+    _baseline_mmap_write_workers,
     create_vllm_delta_transfer_tracker,
 )
 from nemo_rl.utils.weight_transfer_protocol import additive_weight_load_context
@@ -839,6 +842,75 @@ def test_delta_baseline_prewarm_can_be_disabled(monkeypatch):
     assert tracker._baseline_entries == {}
 
 
+def test_delta_baseline_prewarm_honors_max_bytes(monkeypatch):
+    monkeypatch.setenv("NRL_REFIT_BASELINE_PREWARM_CHUNK_BYTES", "1024")
+    monkeypatch.setenv("NRL_REFIT_BASELINE_PREWARM_MAX_BYTES", "16")
+    tracker = DeltaCompressionTracker(_tracker_config())
+    metadata = {
+        "linear.weight": (torch.Size([4]), torch.float32),
+        "linear.bias": (torch.Size([4]), torch.float32),
+    }
+
+    with _cpu_transfer_env():
+        tracker.prewarm_baseline_from_metadata(metadata)
+
+    assert set(tracker.baseline) == {"linear.weight"}
+    assert set(tracker._baseline_entries) == {"linear.weight"}
+
+
+def test_delta_baseline_can_use_mmap_storage(monkeypatch, tmp_path):
+    monkeypatch.setenv("NRL_REFIT_BASELINE_MMAP_MIN_BYTES", "1")
+    monkeypatch.setenv("NRL_REFIT_BASELINE_MMAP_DIR", str(tmp_path))
+    tracker = DeltaCompressionTracker(_tracker_config())
+    metadata = {
+        "linear.weight": (torch.Size([2]), torch.float32),
+    }
+
+    with _cpu_transfer_env():
+        tracker.prewarm_baseline_from_metadata(metadata)
+        first_is_delta, _ = tracker.prepare_chunk(
+            [("linear.weight", torch.tensor([1.0, 2.0]))]
+        )
+        tracker.on_sync_succeeded()
+        is_delta, deltas = tracker.prepare_chunk(
+            [("linear.weight", torch.tensor([1.5, 1.0]))]
+        )
+
+    assert tracker._mmap_arenas
+    assert not first_is_delta
+    assert is_delta
+    torch.testing.assert_close(deltas[0][1], torch.tensor([0.5, -1.0]))
+
+
+def test_delta_baseline_flush_waits_for_mmap_write_future():
+    tracker = DeltaCompressionTracker(_tracker_config())
+    future: Future[None] = Future()
+    future.set_result(None)
+    tracker._baseline_write_futures["linear.weight"] = future
+    tracker._mmap_pending_writes.append((future, 16))
+    tracker._mmap_pending_stage_bytes = 16
+
+    tracker.flush_baseline(["linear.weight"])
+
+    assert tracker._baseline_write_futures == {}
+    assert tracker._mmap_pending_writes == []
+    assert tracker._mmap_pending_stage_bytes == 0
+
+
+def test_delta_baseline_mmap_stage_settings(monkeypatch):
+    monkeypatch.delenv("NRL_REFIT_BASELINE_MMAP_PENDING_BYTES", raising=False)
+    monkeypatch.delenv("NRL_REFIT_BASELINE_MMAP_WRITE_WORKERS", raising=False)
+
+    assert _baseline_mmap_pending_bytes(32) == 256
+    assert _baseline_mmap_write_workers() == 4
+
+    monkeypatch.setenv("NRL_REFIT_BASELINE_MMAP_PENDING_BYTES", "64")
+    monkeypatch.setenv("NRL_REFIT_BASELINE_MMAP_WRITE_WORKERS", "2")
+
+    assert _baseline_mmap_pending_bytes(32) == 64
+    assert _baseline_mmap_write_workers() == 2
+
+
 def test_delta_baseline_keeps_source_dtype_but_emits_delta_dtype():
     tracker = DeltaCompressionTracker(_tracker_config())
     initial = [
@@ -932,7 +1004,7 @@ def test_memory_limited_stage_bytes_uses_fraction_of_free_cuda_memory(monkeypatc
     assert stage_bytes == 128
 
 
-def test_successful_sync_flushes_async_baseline():
+def test_successful_sync_defers_async_baseline_flush_until_needed():
     tracker = DeltaCompressionTracker(_tracker_config())
     flush_count = 0
 
@@ -943,8 +1015,23 @@ def test_successful_sync_flushes_async_baseline():
     tracker.flush_baseline = flush_baseline
     tracker.on_sync_succeeded()
 
-    assert flush_count == 1
+    assert flush_count == 0
     assert tracker.committed_syncs == 1
+
+
+def test_failed_sync_flushes_async_baseline():
+    tracker = DeltaCompressionTracker(_tracker_config())
+    flush_count = 0
+
+    def flush_baseline(_names=None):
+        nonlocal flush_count
+        flush_count += 1
+
+    tracker.flush_baseline = flush_baseline
+    tracker.on_sync_failed()
+
+    assert flush_count == 1
+    assert tracker.committed_syncs == 0
 
 
 def test_transfer_done_sync_does_not_synchronize_whole_device():

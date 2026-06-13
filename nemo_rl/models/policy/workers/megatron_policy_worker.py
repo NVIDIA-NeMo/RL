@@ -458,6 +458,9 @@ class MegatronPolicyWorkerImpl(
             "check_dim_skip_keys is only supported by the v2 DTensor worker; "
             "Megatron does not run cross-tokenizer distillation."
         )
+        if self.delta_weight_transfer_tracker is not None:
+            self.delta_weight_transfer_tracker.flush_baseline()
+
         # Note: zero_grad_buffer is called at the start of each global batch iteration
         # in the loop below, so we don't need to call it here.
         if hasattr(self.model, "inference_params"):

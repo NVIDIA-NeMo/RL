@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import mmap
+import os
+import tempfile
+import weakref
 from collections.abc import Iterable, Iterator, Mapping
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -20,10 +25,18 @@ import torch
 
 from nemo_rl.utils.packed_tensor import get_target_packed_tensor_size
 from nemo_rl.utils.weight_transfer_protocol import (
+    G_DEFAULT_BASELINE_MMAP_MIN_BYTES,
+    G_DEFAULT_BASELINE_MMAP_WRITE_WORKERS,
     G_DEFAULT_BASELINE_PREWARM_CHUNK_BYTES,
+    G_DEFAULT_BASELINE_PREWARM_MAX_BYTES,
     G_DEFAULT_BASELINE_STAGE_COALESCE_BYTES,
     G_FLOAT_DTYPE_MAP,
+    G_REFIT_BASELINE_MMAP_DIR_ENV,
+    G_REFIT_BASELINE_MMAP_MIN_BYTES_ENV,
+    G_REFIT_BASELINE_MMAP_PENDING_BYTES_ENV,
+    G_REFIT_BASELINE_MMAP_WRITE_WORKERS_ENV,
     G_REFIT_BASELINE_PREWARM_CHUNK_BYTES_ENV,
+    G_REFIT_BASELINE_PREWARM_MAX_BYTES_ENV,
     G_REFIT_BASELINE_STAGE_COALESCE_BYTES_ENV,
     G_REFIT_PREWARM_DELTA_BASELINE_ENV,
     TensorBatch,
@@ -41,6 +54,14 @@ class _BaselineEntry:
     arena: torch.Tensor
     offset: int
     numel: int
+
+
+@dataclass
+class _MmapArena:
+    mapping: mmap.mmap
+
+
+_MmapWrite = tuple[Future[None], int]
 
 
 def _baseline_prewarm_enabled() -> bool:
@@ -62,11 +83,70 @@ def _baseline_prewarm_chunk_bytes() -> int:
     )
 
 
+def _baseline_prewarm_max_bytes() -> int:
+    return env_int(
+        G_REFIT_BASELINE_PREWARM_MAX_BYTES_ENV,
+        default=G_DEFAULT_BASELINE_PREWARM_MAX_BYTES,
+    )
+
+
 def _baseline_stage_coalesce_bytes() -> int:
     return env_int(
         G_REFIT_BASELINE_STAGE_COALESCE_BYTES_ENV,
         default=G_DEFAULT_BASELINE_STAGE_COALESCE_BYTES,
     )
+
+
+def _baseline_mmap_min_bytes() -> int:
+    return env_int(
+        G_REFIT_BASELINE_MMAP_MIN_BYTES_ENV,
+        default=G_DEFAULT_BASELINE_MMAP_MIN_BYTES,
+    )
+
+
+def _baseline_mmap_dir() -> str:
+    return os.getenv(G_REFIT_BASELINE_MMAP_DIR_ENV) or tempfile.gettempdir()
+
+
+def _baseline_mmap_pending_bytes(max_stage_bytes: int) -> int:
+    pending_bytes = env_int(
+        G_REFIT_BASELINE_MMAP_PENDING_BYTES_ENV,
+        default=max_stage_bytes * 8,
+    )
+    if pending_bytes < 1:
+        raise ValueError("baseline mmap pending bytes must be >= 1")
+    return pending_bytes
+
+
+def _baseline_mmap_write_workers() -> int:
+    workers = env_int(
+        G_REFIT_BASELINE_MMAP_WRITE_WORKERS_ENV,
+        default=G_DEFAULT_BASELINE_MMAP_WRITE_WORKERS,
+    )
+    if workers < 1:
+        raise ValueError("baseline mmap write workers must be >= 1")
+    return workers
+
+
+def _cleanup_mmap_arenas(arenas: dict[int, _MmapArena]) -> None:
+    for arena in arenas.values():
+        try:
+            arena.mapping.close()
+        except BufferError:
+            pass
+
+
+def _shutdown_mmap_executor(executor: ThreadPoolExecutor) -> None:
+    executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _copy_staged_mmap_baseline(
+    ready_event: torch.cuda.Event,
+    staging: torch.Tensor,
+    target: torch.Tensor,
+) -> None:
+    ready_event.synchronize()
+    target.copy_(staging)
 
 
 class DeltaCompressionTracker:
@@ -92,6 +172,17 @@ class DeltaCompressionTracker:
         self.committed_syncs = 0
         self._d2h_stream: torch.cuda.Stream | None = None
         self._baseline_ready_events: dict[str, torch.cuda.Event] = {}
+        self._baseline_allocated_bytes = 0
+        self._mmap_arenas: dict[int, _MmapArena] = {}
+        self._mmap_executor: ThreadPoolExecutor | None = None
+        self._mmap_pending_writes: list[_MmapWrite] = []
+        self._mmap_pending_stage_bytes = 0
+        self._baseline_write_futures: dict[str, Future[None]] = {}
+        weakref.finalize(
+            self,
+            _cleanup_mmap_arenas,
+            self._mmap_arenas,
+        )
 
     def _baseline_dtype(self, dtype: torch.dtype) -> torch.dtype:
         return dtype
@@ -123,6 +214,17 @@ class DeltaCompressionTracker:
 
         pending: list[tuple[str, tuple[int, ...], torch.dtype]] = []
         pending_bytes = 0
+        pending_metadata: list[tuple[str, tuple[int, ...], torch.dtype, int]] = []
+        prewarm_cap = _baseline_prewarm_max_bytes()
+        prewarmed_bytes = 0
+
+        for name, (shape, dtype) in metadata.items():
+            shape_tuple = tuple(int(dim) for dim in shape)
+            if self._has_matching_baseline(name, shape_tuple, dtype):
+                continue
+            baseline_dtype = self._baseline_dtype(dtype)
+            tensor_bytes = metadata_numel(shape_tuple) * dtype_itemsize(baseline_dtype)
+            pending_metadata.append((name, shape_tuple, baseline_dtype, tensor_bytes))
 
         def flush_pending() -> None:
             nonlocal pending, pending_bytes
@@ -132,15 +234,13 @@ class DeltaCompressionTracker:
             pending = []
             pending_bytes = 0
 
-        for name, (shape, dtype) in metadata.items():
-            shape_tuple = tuple(int(dim) for dim in shape)
-            if self._has_matching_baseline(name, shape_tuple, dtype):
-                continue
+        for name, shape_tuple, baseline_dtype, tensor_bytes in pending_metadata:
+            if prewarm_cap > 0 and prewarmed_bytes + tensor_bytes > prewarm_cap:
+                flush_pending()
+                break
             if name in self._baseline_ready_events:
                 self.flush_baseline([name])
 
-            baseline_dtype = self._baseline_dtype(dtype)
-            tensor_bytes = metadata_numel(shape_tuple) * dtype_itemsize(baseline_dtype)
             if pending and (
                 pending[0][2] != baseline_dtype
                 or pending_bytes + tensor_bytes > chunk_cap
@@ -148,6 +248,7 @@ class DeltaCompressionTracker:
                 flush_pending()
             pending.append((name, shape_tuple, baseline_dtype))
             pending_bytes += tensor_bytes
+            prewarmed_bytes += tensor_bytes
             if pending_bytes >= chunk_cap:
                 flush_pending()
 
@@ -179,9 +280,6 @@ class DeltaCompressionTracker:
         return True, deltas
 
     def on_sync_succeeded(self) -> None:
-        # The baseline snapshot reads from caller-owned model tensors. Finish
-        # those reads before the caller can offload or update the weights.
-        self.flush_baseline()
         self.committed_syncs += 1
 
     def on_sync_failed(self) -> None:
@@ -189,24 +287,35 @@ class DeltaCompressionTracker:
         self.committed_syncs = 0
 
     def flush_baseline(self, names: Iterable[str] | None = None) -> None:
-        if not self._baseline_ready_events:
+        if not self._baseline_ready_events and not self._baseline_write_futures:
             return
         d2h_stream = self._d2h_stream
-        assert d2h_stream is not None
         if names is None:
-            d2h_stream.synchronize()
+            if d2h_stream is not None:
+                d2h_stream.synchronize()
+            futures_by_id = {
+                id(future): future for future in self._baseline_write_futures.values()
+            }
+            self._wait_for_mmap_writes(list(futures_by_id.values()))
             self._baseline_ready_events.clear()
+            self._baseline_write_futures.clear()
             return
 
-        names_to_wait = self._baseline_ready_events.keys() & set(names)
+        names_set = set(names)
+        event_names = self._baseline_ready_events.keys() & names_set
+        future_names = self._baseline_write_futures.keys() & names_set
         current_stream = torch.cuda.current_stream()
         seen_events = set()
-        for name in names_to_wait:
+        for name in event_names:
             event = self._baseline_ready_events.pop(name)
             if id(event) in seen_events:
                 continue
             current_stream.wait_event(event)
             seen_events.add(id(event))
+        futures = [self._baseline_write_futures.pop(name) for name in future_names]
+        self._wait_for_mmap_writes(
+            list({id(future): future for future in futures}.values())
+        )
 
     def _snapshot_baseline(
         self,
@@ -216,23 +325,15 @@ class DeltaCompressionTracker:
             self._snapshot_cuda_baseline(tensors)
             return
         for name, tensor in tensors:
-            baseline = self.baseline.get(name)
-            if (
-                baseline is None
-                or baseline.shape != tensor.shape
-                or baseline.dtype != self._baseline_dtype(tensor.dtype)
+            if not self._has_matching_baseline(
+                name,
+                tuple(tensor.shape),
+                tensor.dtype,
             ):
-                baseline = torch.empty_like(
-                    tensor,
-                    dtype=self._baseline_dtype(tensor.dtype),
-                    device=torch.device("cpu"),
+                self._allocate_baseline_views(
+                    [(name, tuple(tensor.shape), self._baseline_dtype(tensor.dtype))]
                 )
-                self.baseline[name] = baseline
-                self._baseline_entries[name] = _BaselineEntry(
-                    arena=baseline.view(-1),
-                    offset=0,
-                    numel=baseline.numel(),
-                )
+            baseline = self.baseline[name]
             baseline.copy_(tensor.detach())
 
     def _snapshot_cuda_baseline(
@@ -372,6 +473,11 @@ class DeltaCompressionTracker:
             start: int,
             length: int,
         ) -> None:
+            first_entry = span[0][2]
+            if self._is_mmap_arena(first_entry.arena):
+                self._copy_span_to_mmap_baseline(span, start, length, max_stage_bytes)
+                return
+
             if len(span) == 1:
                 name, tensor, _ = span[0]
                 copy_tensor_to_host(name, tensor)
@@ -390,7 +496,6 @@ class DeltaCompressionTracker:
                 )
                 staging_offset += entry.numel
 
-            first_entry = span[0][2]
             staging.record_stream(torch.cuda.current_stream())
             first_entry.arena.narrow(0, start, length).copy_(
                 staging,
@@ -403,6 +508,93 @@ class DeltaCompressionTracker:
             max_bytes=max_stage_bytes,
         ):
             copy_span_to_host(span, start, length)
+
+    def _copy_span_to_mmap_baseline(
+        self,
+        span: list[tuple[str, torch.Tensor, _BaselineEntry]],
+        start: int,
+        length: int,
+        max_stage_bytes: int,
+    ) -> None:
+        first_tensor = span[0][1]
+        dtype = self._baseline_dtype(first_tensor.dtype)
+        stage_bytes = length * dtype_itemsize(dtype)
+        self._wait_for_mmap_stage_capacity(stage_bytes, max_stage_bytes)
+        staging = torch.empty(
+            length,
+            dtype=dtype,
+            device=torch.device("cpu"),
+            pin_memory=True,
+        )
+
+        staging_offset = 0
+        for _, tensor, entry in span:
+            staging.narrow(0, staging_offset, entry.numel).view(tensor.shape).copy_(
+                tensor.detach(),
+                non_blocking=True,
+            )
+            staging_offset += entry.numel
+
+        ready_event = torch.cuda.current_stream().record_event()
+        target = span[0][2].arena.narrow(0, start, length)
+        future = self._get_mmap_executor().submit(
+            _copy_staged_mmap_baseline,
+            ready_event,
+            staging,
+            target,
+        )
+        self._mmap_pending_writes.append((future, stage_bytes))
+        self._mmap_pending_stage_bytes += stage_bytes
+        for name, _, _ in span:
+            self._baseline_write_futures[name] = future
+
+    def _get_mmap_executor(self) -> ThreadPoolExecutor:
+        if self._mmap_executor is None:
+            executor = ThreadPoolExecutor(
+                max_workers=_baseline_mmap_write_workers(),
+                thread_name_prefix="nrl-refit-mmap-baseline",
+            )
+            self._mmap_executor = executor
+            weakref.finalize(
+                self,
+                _shutdown_mmap_executor,
+                executor,
+            )
+        return self._mmap_executor
+
+    def _wait_for_mmap_stage_capacity(
+        self,
+        stage_bytes: int,
+        max_stage_bytes: int,
+    ) -> None:
+        max_pending_bytes = max(
+            stage_bytes,
+            _baseline_mmap_pending_bytes(max_stage_bytes),
+        )
+        self._prune_completed_mmap_writes()
+        while (
+            self._mmap_pending_writes
+            and self._mmap_pending_stage_bytes + stage_bytes > max_pending_bytes
+        ):
+            future, pending_bytes = self._mmap_pending_writes.pop(0)
+            future.result()
+            self._mmap_pending_stage_bytes -= pending_bytes
+            self._prune_completed_mmap_writes()
+
+    def _wait_for_mmap_writes(self, futures: list[Future[None]]) -> None:
+        for future in futures:
+            future.result()
+        self._prune_completed_mmap_writes()
+
+    def _prune_completed_mmap_writes(self) -> None:
+        pending_writes = []
+        for future, stage_bytes in self._mmap_pending_writes:
+            if future.done():
+                future.result()
+                self._mmap_pending_stage_bytes -= stage_bytes
+            else:
+                pending_writes.append((future, stage_bytes))
+        self._mmap_pending_writes = pending_writes
 
     @staticmethod
     def _baseline_span_bounds(
@@ -510,13 +702,51 @@ class DeltaCompressionTracker:
         dtype = items[0][2]
         if any(item_dtype != dtype for _, _, item_dtype in items):
             raise ValueError("baseline allocation items must have the same dtype")
-        total_numel = sum(metadata_numel(shape) for _, shape, _ in items)
-        baseline_arena = torch.empty(
-            total_numel,
-            dtype=dtype,
-            device=torch.device("cpu"),
-            pin_memory=torch.cuda.is_available(),
+
+        mmap_min_bytes = _baseline_mmap_min_bytes()
+        if mmap_min_bytes > 0 and self._baseline_allocated_bytes < mmap_min_bytes:
+            cpu_items: list[tuple[str, tuple[int, ...], torch.dtype]] = []
+            mmap_items: list[tuple[str, tuple[int, ...], torch.dtype]] = []
+            remaining_cpu_bytes = mmap_min_bytes - self._baseline_allocated_bytes
+            for item in items:
+                item_bytes = metadata_numel(item[1]) * dtype_itemsize(dtype)
+                if item_bytes <= remaining_cpu_bytes:
+                    cpu_items.append(item)
+                    remaining_cpu_bytes -= item_bytes
+                else:
+                    mmap_items.append(item)
+
+            if mmap_items:
+                if cpu_items:
+                    self._allocate_baseline_views_in_arena(cpu_items, use_mmap=False)
+                self._allocate_baseline_views_in_arena(mmap_items, use_mmap=True)
+                return
+
+        use_mmap = (
+            mmap_min_bytes > 0 and self._baseline_allocated_bytes >= mmap_min_bytes
         )
+        self._allocate_baseline_views_in_arena(items, use_mmap=use_mmap)
+
+    def _allocate_baseline_views_in_arena(
+        self,
+        items: list[tuple[str, tuple[int, ...], torch.dtype]],
+        *,
+        use_mmap: bool,
+    ) -> None:
+        dtype = items[0][2]
+        total_numel = sum(metadata_numel(shape) for _, shape, _ in items)
+        total_bytes = total_numel * dtype_itemsize(dtype)
+        baseline_arena = (
+            self._allocate_mmap_arena(total_numel, dtype)
+            if use_mmap
+            else torch.empty(
+                total_numel,
+                dtype=dtype,
+                device=torch.device("cpu"),
+                pin_memory=torch.cuda.is_available(),
+            )
+        )
+        self._baseline_allocated_bytes += total_bytes
         offset = 0
         for name, shape, _ in items:
             numel = metadata_numel(shape)
@@ -527,6 +757,46 @@ class DeltaCompressionTracker:
                 numel=numel,
             )
             offset += numel
+
+    def _allocate_mmap_arena(
+        self,
+        total_numel: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        total_bytes = total_numel * dtype_itemsize(dtype)
+        os.makedirs(_baseline_mmap_dir(), exist_ok=True)
+        fd, path = tempfile.mkstemp(
+            prefix="nrl-refit-baseline-",
+            suffix=".bin",
+            dir=_baseline_mmap_dir(),
+        )
+        try:
+            with os.fdopen(fd, "w+b") as file:
+                file.truncate(total_bytes)
+                mapping = mmap.mmap(
+                    file.fileno(), total_bytes, access=mmap.ACCESS_WRITE
+                )
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            arena = torch.frombuffer(mapping, dtype=dtype, count=total_numel)
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            raise
+
+        self._mmap_arenas[id(arena)] = _MmapArena(mapping=mapping)
+        return arena
+
+    def _is_mmap_arena(self, arena: torch.Tensor) -> bool:
+        return id(arena) in self._mmap_arenas
 
 
 def create_vllm_delta_transfer_tracker(
