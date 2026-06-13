@@ -14,6 +14,7 @@
 
 import contextlib
 import gc
+import os
 import warnings
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Generator, Iterable, Optional
@@ -190,7 +191,11 @@ def get_train_context(
     """Create combined context manager for training with context parallel and autocast."""
     with contextlib.ExitStack() as stack:
         context_parallel_ctx = None
-        if cp_size > 1:
+        # DSV4 manual CP handles context parallel inside the model (its own KV
+        # all-gather via _dsv4_cp_group), so skip torch's standard CP context —
+        # it would shard buffers / patch SDPA, which conflicts with sparse-MLA.
+        manual_cp = os.environ.get("NRL_DSV4_MANUAL_CP", "0") == "1"
+        if cp_size > 1 and not manual_cp:
             # Create context parallel context
             context_parallel_ctx = create_context_parallel_ctx(
                 cp_mesh=cp_mesh,
@@ -205,6 +210,31 @@ def get_train_context(
         if autocast_enabled:
             stack.enter_context(torch.autocast(device_type="cuda", dtype=dtype))
         yield
+
+
+# DSV4 manual context-parallel: token-normalized loss metrics that the loss fn
+# returns as (local token-sum / global_valid_toks). Under manual CP each rank
+# only forwards its contiguous seq-shard, so its token-sum is partial; grpo sums
+# these over the data-parallel ranks for the global value but the CP dimension is
+# deduplicated (lm_policy output_is_replicated=["context_parallel"]), so only
+# cp-rank-0's partial survives -> the logged metric is ~1/cp_size of the true
+# value. We all-reduce-SUM these keys over the CP group so every CP rank (incl.
+# the kept cp-rank-0) already carries the full-sequence value. Intentionally
+# EXCLUDED: num_valid_samples (per-sequence count, split over DP not CP, so the
+# existing DP sum is already correct) and probs_ratio_{min,max} (grpo reduces
+# them with min/max, not sum). See [[dsv4-cp-port]].
+_DSV4_CP_SUM_METRIC_KEYS = (
+    "loss",
+    "kl_penalty",
+    "token_mult_prob_error",
+    "gen_kl_error",
+    "policy_kl_error",
+    "js_divergence_error",
+    "sampling_importance_ratio",
+    "approx_entropy",
+    "probs_ratio",
+    "probs_ratio_clamped",
+)
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
@@ -444,6 +474,13 @@ class DTensorPolicyWorkerV2Impl(
 
             losses = []
             all_mb_metrics = []
+            # DSV4 manual context-parallel: when active, the loss/metrics need a
+            # CP-dimension SUM that the standard dp reduction misses (see below).
+            # Hoisted out of the gb loop so it is always bound for the post-loop
+            # aggregate call even if num_global_batches were 0. No-op for cp=1.
+            dsv4_manual_cp = self.cp_size > 1 and (
+                os.environ.get("NRL_DSV4_MANUAL_CP", "0") == "1"
+            )
             for gb_idx in range(num_global_batches):
                 # Process global batch and compute normalization factors
                 gb_result = process_global_batch(
@@ -487,6 +524,14 @@ class DTensorPolicyWorkerV2Impl(
                     train_context_fn=train_context_fn,
                     num_valid_microbatches=iterator_len,
                     on_microbatch_start=on_microbatch_start,
+                    # DSV4 manual CP: hand the model the CP group + this rank's CP
+                    # index so it all-gathers KV and forwards only its seq shard.
+                    dsv4_cp_group=(
+                        self.cp_mesh.get_group()
+                        if (self.cp_size > 1 and os.environ.get("NRL_DSV4_MANUAL_CP", "0") == "1")
+                        else None
+                    ),
+                    cp_rank=(self.cp_mesh.get_local_rank() if self.cp_size > 1 else 0),
                 )
 
                 # Extract losses and metrics from results
@@ -498,6 +543,30 @@ class DTensorPolicyWorkerV2Impl(
                         loss_metrics["lr"] = self.optimizer.param_groups[0]["lr"]
                         loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
                         loss_metrics["global_valid_toks"] = global_valid_toks.item()
+
+                        if dsv4_manual_cp:
+                            # num_valid_samples is per-sequence (replicated across
+                            # CP), so it gates the collective identically on every
+                            # CP rank -> no desync. Batch all keys into one
+                            # all_reduce to minimize the per-microbatch collective.
+                            cp_keys = [
+                                k
+                                for k in _DSV4_CP_SUM_METRIC_KEYS
+                                if k in loss_metrics
+                            ]
+                            if cp_keys:
+                                cp_vals = torch.tensor(
+                                    [float(loss_metrics[k]) for k in cp_keys],
+                                    device="cuda",
+                                    dtype=torch.float32,
+                                )
+                                torch.distributed.all_reduce(
+                                    cp_vals,
+                                    op=torch.distributed.ReduceOp.SUM,
+                                    group=self.cp_mesh.get_group(),
+                                )
+                                for i, k in enumerate(cp_keys):
+                                    loss_metrics[k] = cp_vals[i].item()
 
                         if num_valid_samples > 0:
                             mb_losses.append(loss.item())
@@ -539,12 +608,21 @@ class DTensorPolicyWorkerV2Impl(
             # the memory allocator before moving on
             safe_empty_cache(f"{self} train end")
 
-            # Aggregate training statistics across microbatches and ranks
+            # Aggregate training statistics across microbatches and ranks.
+            # global_loss is SUM-reduced over this group; under DSV4 manual-CP the
+            # per-microbatch losses are seq-shard partials, so reduce over dp_cp
+            # (incl. the CP dim) to recover the full-sequence loss. (The logged
+            # "loss" actually comes from all_mb_metrics["loss"], CP-summed above;
+            # this keeps the separate global_loss path consistent too.)
             metrics = aggregate_training_statistics(
                 losses=losses,
                 all_mb_metrics=all_mb_metrics,
                 grad_norm=grad_norm,
-                dp_group=self.dp_mesh.get_group(),
+                dp_group=(
+                    self.dp_cp_mesh.get_group()
+                    if dsv4_manual_cp
+                    else self.dp_mesh.get_group()
+                ),
                 dtype=self.dtype,
             )
 

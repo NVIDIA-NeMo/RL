@@ -23,6 +23,7 @@ Key differences from megatron approach:
 - automodel_forward_backward uses PyTorch autograd instead of Megatron's pipeline
 """
 
+import os
 from collections import defaultdict
 from functools import partial
 from typing import Any, Callable, Iterator, Optional, Tuple, Union
@@ -68,6 +69,7 @@ def model_forward(
     processed_inputs: ProcessedInputs,
     is_reward_model: bool = False,
     allow_flash_attn_args: bool = True,
+    dsv4_cp_group: Any = None,
 ) -> torch.Tensor:
     """Perform a single forward pass through the model.
 
@@ -113,8 +115,54 @@ def model_forward(
     if not allow_flash_attn_args and "flash_attn_kwargs" in model_args:
         del model_args["flash_attn_kwargs"]
 
+    # DeepSeek-V4 manual context parallel: the model reads `_dsv4_cp_group` from
+    # kwargs and all-gathers KV across CP ranks internally (its own differentiable
+    # all-gather), so each rank forwards only its contiguous sequence shard. This is
+    # a separate CP path from NeMo-RL's DTensor/ring CP (which can't wrap the custom
+    # sparse-MLA/tilelang attention). Only set when DSV4 manual CP is active.
+    if dsv4_cp_group is not None:
+        model_args["_dsv4_cp_group"] = dsv4_cp_group
+
     outputs = model(**model_args)
     return outputs
+
+
+def dsv4_manual_cp_enabled(cp_size: int) -> bool:
+    """DSV4 manual context-parallel mode (separate from NeMo-RL's DTensor/ring CP).
+
+    Active only when cp_size>1 AND env NRL_DSV4_MANUAL_CP=1. When off, every CP code
+    path below is bypassed so cp_size==1 (and the standard CP path) is byte-identical.
+    """
+    return cp_size > 1 and os.environ.get("NRL_DSV4_MANUAL_CP", "0") == "1"
+
+
+def _dsv4_cp_shard_tensor(t: Any, full_seq_len: int, cp_rank: int, cp_size: int, seq_dim: int = 1) -> Any:
+    """Contiguously shard a per-token tensor along seq_dim into cp_size pieces, keep rank's."""
+    if not isinstance(t, torch.Tensor) or t.dim() <= seq_dim or t.shape[seq_dim] != full_seq_len:
+        return t
+    local = full_seq_len // cp_size
+    return t.narrow(seq_dim, cp_rank * local, local).contiguous()
+
+
+def dsv4_cp_shard_microbatch(processed_mb, cp_rank: int, cp_size: int):
+    """Seq-shard a ProcessedMicrobatch contiguously per CP rank for DSV4 manual CP.
+
+    Shards processed_inputs.{input_ids,attention_mask,position_ids} and the per-token
+    tensors in data_dict (those whose dim-1 == full seq len), and updates seq_len.
+    The model all-gathers KV across CP ranks internally, so each rank forwards only its
+    contiguous slice. Returns the (mutated) processed_mb.
+    """
+    pi = processed_mb.processed_inputs
+    S = pi.input_ids.shape[1]
+    assert S % cp_size == 0, f"seq_len {S} not divisible by cp_size {cp_size}"
+    pi.input_ids = _dsv4_cp_shard_tensor(pi.input_ids, S, cp_rank, cp_size)
+    pi.attention_mask = _dsv4_cp_shard_tensor(pi.attention_mask, S, cp_rank, cp_size)
+    pi.position_ids = _dsv4_cp_shard_tensor(pi.position_ids, S, cp_rank, cp_size)
+    pi.seq_len = S // cp_size
+    dd = processed_mb.data_dict
+    for k in list(dd.keys()):
+        dd[k] = _dsv4_cp_shard_tensor(dd[k], S, cp_rank, cp_size)
+    return processed_mb
 
 
 def extract_logits(
@@ -277,6 +325,9 @@ def forward_with_post_processing_fn(
     global_valid_toks: Optional[torch.Tensor] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
     sequence_dim: int = 1,
+    dsv4_cp_group: Any = None,
+    cp_rank: int = 0,
+    cp_size: int = 1,
 ) -> Tuple[Any, dict[str, Any], ProcessedMicrobatch]:
     """Perform forward pass with pre-processed microbatch and apply post-processing.
 
@@ -304,6 +355,12 @@ def forward_with_post_processing_fn(
             - metrics: Dictionary of metrics from post-processing
             - processed_microbatch: The ProcessedMicrobatch that was processed
     """
+    # DSV4 manual CP: contiguously seq-shard this microbatch per CP rank before the
+    # forward. The model all-gathers KV across ranks internally; logits + the loss
+    # then operate on the local shard. cp_size==1 / standard CP path is untouched.
+    if dsv4_cp_group is not None and dsv4_manual_cp_enabled(cp_size):
+        processed_mb = dsv4_cp_shard_microbatch(processed_mb, cp_rank, cp_size)
+
     # Extract the processed components
     data_dict = processed_mb.data_dict
     processed_inputs = processed_mb.processed_inputs
@@ -314,6 +371,7 @@ def forward_with_post_processing_fn(
         processed_inputs,
         is_reward_model=is_reward_model,
         allow_flash_attn_args=allow_flash_attn_args,
+        dsv4_cp_group=dsv4_cp_group,
     )
 
     # Extract logits from model outputs
@@ -402,6 +460,8 @@ def automodel_forward_backward(
     train_context_fn: Optional[Callable[[ProcessedInputs], Any]] = None,
     num_valid_microbatches: Optional[int] = None,
     on_microbatch_start: Optional[Callable[[int], None]] = None,
+    dsv4_cp_group: Any = None,
+    cp_rank: int = 0,
 ) -> list[Tuple[Any, dict[str, Any]]]:
     """Execute forward and backward passes for automodel.
 
@@ -466,6 +526,9 @@ def automodel_forward_backward(
                 global_valid_toks=global_valid_toks,
                 sampling_params=sampling_params,
                 sequence_dim=sequence_dim,
+                dsv4_cp_group=dsv4_cp_group,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
             )
 
             # Check if this is a dummy batch
@@ -564,8 +627,9 @@ class LossPostProcessor:
         Returns:
             Tuple of (loss, metrics)
         """
-        # Handle CP redistribution
-        if self.cp_size > 1:
+        # Handle CP redistribution (standard DTensor CP only; DSV4 manual CP
+        # pre-shards the microbatch + logits, so skip the DTensor path).
+        if self.cp_size > 1 and not dsv4_manual_cp_enabled(self.cp_size):
             _, data_dict = prepare_data_for_cp(
                 data_dict, processed_inputs, self.cp_mesh, sequence_dim
             )
@@ -663,7 +727,7 @@ class LogprobsPostProcessor:
         seq_len = processed_inputs.seq_len
         input_lengths = data_dict["input_lengths"]
 
-        if self.cp_size > 1:
+        if self.cp_size > 1 and not dsv4_manual_cp_enabled(self.cp_size):
             seq_index_tensor = (
                 DTensor.from_local(
                     processed_inputs.seq_index,
@@ -863,7 +927,7 @@ class TopkLogitsPostProcessor:
         """
         input_lengths = data_dict["input_lengths"]
 
-        if self.cp_size > 1:
+        if self.cp_size > 1 and not dsv4_manual_cp_enabled(self.cp_size):
             logits = redistribute_logits_for_cp(
                 logits, self.device_mesh, self.cp_mesh, sequence_dim
             )
