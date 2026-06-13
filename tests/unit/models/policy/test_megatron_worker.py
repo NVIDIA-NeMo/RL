@@ -117,7 +117,7 @@ def create_megatron_test_config(
                 "kv_cache_management_mode": "persist",
                 "materialize_only_last_token_logits": True,
                 "num_speculative_tokens": 0,
-                "refit_backend": "nvshmem",
+                "refit_backend": "gloo",  # not nvshmem: its NVLS multicast init is unavailable in CI
                 "parsers": [],
                 "expose_http_server": False,
             },
