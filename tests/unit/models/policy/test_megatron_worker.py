@@ -11,9 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import ast
 import os
 import tempfile
 import time
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -68,6 +70,47 @@ def test_megatron_prepare_for_training_restores_optimizer():
 
     assert model.train_called
     assert restored_devices == ["cuda"]
+
+
+def test_disable_forward_pre_hook_until_next_step_uses_worker_override():
+    source_path = (
+        Path(__file__).parents[4]
+        / "nemo_rl/models/policy/workers/megatron_policy_worker.py"
+    )
+    tree = ast.parse(source_path.read_text())
+    method = next(
+        node
+        for class_node in tree.body
+        if isinstance(class_node, ast.ClassDef)
+        and class_node.name == "MegatronPolicyWorkerImpl"
+        for node in class_node.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_disable_forward_pre_hook_until_next_train_step"
+    )
+
+    worker_disable_calls = [
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "disable_forward_pre_hook"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "self"
+    ]
+    raw_ddp_disable_calls = [
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "disable_forward_pre_hook"
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr == "model"
+        and isinstance(node.func.value.value, ast.Name)
+        and node.func.value.value.id == "self"
+    ]
+
+    assert len(worker_disable_calls) == 1
+    assert raw_ddp_disable_calls == []
 
 
 def create_megatron_test_config(
