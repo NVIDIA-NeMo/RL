@@ -74,6 +74,8 @@ class SingleControllerConfig:
 
     # Training
     max_train_steps: int = 10
+    # Cap on dataloader passes; None means unbounded (cycle until cancelled).
+    max_num_epochs: Optional[int] = None
 
     # DataPlane partition
     partition_id: str = "rollout_data"
@@ -339,8 +341,10 @@ class SingleControllerActor:
                 self._inflight_rollouts -= 1
                 sem.release()
 
-        # TODO: add max_num_epochs and limit max_train_steps to max_num_epochs * len(dataloader) when setup
-        while True:
+        # TODO: limit max_train_steps to max_num_epochs * len(dataloader) when setup
+        max_epochs = self._cfg.max_num_epochs
+        epoch = 0
+        while max_epochs is None or epoch < max_epochs:
             for prompt in self._dataloader:
                 # check if buffer is full
                 await self._buffer_capacity.acquire()
@@ -351,6 +355,9 @@ class SingleControllerActor:
 
                 # dispatch rollout
                 asyncio.create_task(_dispatch_one_prompt(prompt))
+            epoch += 1
+
+        log.info("rollout_pump: completed %d epoch(s)", epoch)
 
     async def _train_pump(self) -> None:
         """Drain stale groups, sample, train, drop.
