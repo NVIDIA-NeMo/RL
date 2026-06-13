@@ -594,13 +594,9 @@ class TQReplayBuffer:
         Returns:
             KVBatchMeta for the newly written group.
         """
-        if not isinstance(weight_version, int) or isinstance(weight_version, bool):
-            raise TypeError(
-                f"TQReplayBuffer.add: weight_version must be int, got "
-                f"{type(weight_version).__name__}"
-            )
         if group_id is None:
             group_id = str(uuid.uuid4())
+
         train_batch = record_to_train_batch(record, pad_value_dict=self._pad_value_dict)
         sample_ids, fields, tags = pack_payload(
             train_batch, weight_version=weight_version, group_id=group_id
@@ -612,6 +608,7 @@ class TQReplayBuffer:
             fields=fields,
             tags=tags,
         )
+
         self.meta_list.append(meta)
         self.weight_list.append(weight_version)
         return meta
