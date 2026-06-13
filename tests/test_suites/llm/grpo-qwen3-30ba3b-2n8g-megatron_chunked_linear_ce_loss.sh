@@ -14,14 +14,10 @@ exit_if_max_steps_reached
 
 # Run the experiment
 cd $PROJECT_ROOT
-<<<<<<< HEAD
 # Use NRL_PYTHON (the image's /opt/nemo_rl_venv/bin/python, set by the slurm)
 # instead of `uv run`, which can mis-resolve to a stale workspace/.venv env and
 # cause a Ray version mismatch with the cluster. Mirrors the cispo launch SH.
 ${NRL_PYTHON:-python} examples/run_grpo.py \
-=======
-uv run examples/run_grpo.py \
->>>>>>> 06a24c239 (initial commit of linear ce fusion for grpo)
     --config $CONFIG_PATH \
     grpo.max_num_steps=$MAX_STEPS \
     logger.log_dir=$LOG_DIR \
