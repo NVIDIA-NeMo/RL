@@ -749,23 +749,24 @@ class TestSingleControllerDryRun:
             buf, max_staleness_versions=2, sample_freshest_first=True
         )
 
-        selected = asyncio.run(
+        selected, num_groups = asyncio.run(
             sampler.select(current_train_weight=5, min_prompt_groups=2)
         )
 
         assert selected is not None
         # freshest-first: g2(lag 0), g1(lag 1). g3 stale, g4 future.
         assert selected.sample_ids == ["g2_g0", "g1_g0"]
+        assert num_groups == 2
 
     def test_staleness_sampler_returns_none_when_insufficient(self):
-        """StalenessSampler returns None when not enough eligible rows."""
+        """StalenessSampler returns (None, 0) when not enough eligible rows."""
         buf = _buffer_with_versions([1])
         sampler = StalenessSampler(buf, max_staleness_versions=1)
 
-        assert (
-            asyncio.run(sampler.select(current_train_weight=5, min_prompt_groups=2))
-            is None
+        result = asyncio.run(
+            sampler.select(current_train_weight=5, min_prompt_groups=2)
         )
+        assert result == (None, 0)
 
     def test_staleness_sampler_concats_multiple_groups(self):
         """Selected meta concatenates whole-group sample_ids end-to-end."""
@@ -774,11 +775,12 @@ class TestSingleControllerDryRun:
         buf.add("g1", weight=5, group_size=2)
         sampler = StalenessSampler(buf, max_staleness_versions=0)
 
-        selected = asyncio.run(
+        selected, num_groups = asyncio.run(
             sampler.select(current_train_weight=5, min_prompt_groups=2)
         )
         assert selected is not None
         assert selected.sample_ids == ["g0_g0", "g0_g1", "g1_g0", "g1_g1"]
+        assert num_groups == 2
 
     def test_strict_on_policy_batch_sampler_requires_exact_version(self):
         """Strict sampler waits for a full batch at the trainer version."""
@@ -786,15 +788,17 @@ class TestSingleControllerDryRun:
         sampler = StalenessSampler(buf, max_staleness_versions=0)
 
         # Eligible at weight==5 are indices 1 and 2 only.
-        assert (
-            asyncio.run(sampler.select(current_train_weight=5, min_prompt_groups=3))
-            is None
+        result = asyncio.run(
+            sampler.select(current_train_weight=5, min_prompt_groups=3)
         )
-        selected = asyncio.run(
+        assert result == (None, 0)
+
+        selected, num_groups = asyncio.run(
             sampler.select(current_train_weight=5, min_prompt_groups=2)
         )
         assert selected is not None
         assert selected.sample_ids == ["g1_g0", "g2_g0"]
+        assert num_groups == 2
 
     def test_strict_on_policy_batch_sampler_evicts_old_groups(self):
         """Strict sampler drops complete old-version groups via buffer.remove."""
