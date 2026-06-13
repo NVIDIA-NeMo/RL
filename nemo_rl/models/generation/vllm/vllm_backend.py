@@ -51,6 +51,51 @@ def fix_gpt_oss_export_transpose(key: str, weight: torch.Tensor) -> torch.Tensor
     return weight
 
 
+def _fused_param_merge_slice(
+    hf_shapes: dict,
+    prefix: str,
+    hf_suffixes: list,
+    shard_index: int,
+    local_dim0: int,
+    tp_size: int,
+) -> tuple:
+    """Dim-0 sub-slice into a TP-sharded *fused* vLLM param for one component.
+
+    vLLM fuses several HF projections into one param along dim 0 (q/k/v ->
+    qkv_proj, gate/up -> gate_up_proj, q_a/kv_a -> fused_qkv_a_proj).  Given the
+    component list (``hf_suffixes`` at the same layer ``prefix``), the local
+    param's dim-0 (``local_dim0``), and the gen TP size, return where component
+    ``shard_index``'s received local shard lands.
+
+    Returns a 1-tuple ``(slice(off, off + size),)`` — an index tuple so the
+    caller can do ``vllm_param.data[merged_slice]`` uniformly (grouped-expert
+    w13 sub-slices use a dim-1 tuple elsewhere).
+    """
+    # Global (unsharded) dim-0 size of each fused component.
+    global_sizes = [
+        hf_shapes[prefix + s][0] if (prefix + s) in hf_shapes else 0
+        for s in hf_suffixes
+    ]
+    # LOCAL sizes = global // gen TP.  The KV-head-replication case
+    # (tp > num_kv_heads), where that even split breaks, is routed to misc via
+    # qkv_to_misc, so the `else` fallback below rarely fires.
+    naive = [gs // tp_size for gs in global_sizes]
+    if sum(naive) == local_dim0:
+        local_sizes = naive
+    elif local_dim0 == sum(global_sizes):
+        # Fully replicated merge (e.g. DeepSeek MLA fused_qkv_a_proj with
+        # disable_tp=True): the param holds the full concat on every TP rank.
+        local_sizes = list(global_sizes)
+    else:
+        # KV-head replication: q divides evenly, k/v are replicated.
+        local_sizes = [global_sizes[0] // tp_size]
+        num_rest = len(global_sizes) - 1
+        rest = local_dim0 - local_sizes[0]
+        local_sizes += [rest // num_rest] * num_rest
+    offset = sum(local_sizes[:shard_index])
+    return (slice(offset, offset + local_sizes[shard_index]),)
+
+
 class VllmInternalWorkerExtension:
     def init_collective(
         self,
@@ -365,26 +410,31 @@ class VllmInternalWorkerExtension:
         self.nccl_xfer_refit_info = (  # pyrefly: ignore[implicitly-defined-attribute]
             restore_refit_info_placements(refit_info)
         )
-        self._hf_to_vllm = self._build_hf_to_vllm_mapping(  # pyrefly: ignore[implicitly-defined-attribute]
+        self._hf_to_gen_param = self._build_hf_to_gen_backend_mapping(  # pyrefly: ignore[implicitly-defined-attribute]
             self.nccl_xfer_refit_info
         )
 
-    def _build_hf_to_vllm_mapping(self, refit_info):
-        """Build mapping from HF param names to vLLM (param, merged_param_slice).
+    def _build_hf_to_gen_backend_mapping(self, refit_info):
+        """Map each HF param name to the generation backend's param and slice.
+
+        Returns a dict ``hf_name -> (param: torch.Tensor, merged_param_slice or
+        None)``. merged_param_slice is used in the post_refit_hook to copy the
+        received data from the temp buffer into the live merged param. (This
+        function could be upstreamed to the generation backend repo later.)
 
         vLLM merges certain HF params into combined tensors:
-          - q_proj + k_proj + v_proj  → qkv_proj  (concat along dim 0)
-          - gate_proj + up_proj       → gate_up_proj (concat along dim 0)
+          - q_proj + k_proj + v_proj  → qkv_proj      (concat along dim 0)
+          - gate_proj + up_proj       → gate_up_proj  (concat along dim 0)
           - lm_head may be tied to embed_tokens
 
-        For TP>1, vLLM shards merged params along dim 0. Each TP rank stores
-        [q_shard, k_shard, v_shard] locally. We compute LOCAL slices by scaling
-        global offsets proportionally: local_offset = global_offset * local_dim0 / global_dim0.
+        For TP>1, vLLM shards merged params along dim 0, so each TP rank stores
+        [q_shard, k_shard, v_shard] locally; _fused_param_merge_slice computes
+        the LOCAL sub-slice each HF component occupies.
 
         Returns:
-            dict: hf_name → (vllm_param_tensor, merged_param_slice or None)
-                  If merged_param_slice is None, the HF param maps 1:1 to the
-                  vLLM param.  Otherwise it is the LOCAL slice into the merged
+            dict: hf_name → (vllm_param_tensor, merged_param_slice or None).
+                  If merged_param_slice is None the HF param maps 1:1 to the
+                  vLLM param; otherwise it is the LOCAL slice into the merged
                   vLLM param that this HF piece occupies.
         """
         vllm_params = dict(self.model_runner.model.named_parameters())
@@ -392,17 +442,16 @@ class VllmInternalWorkerExtension:
 
         # Collect all HF param names + global shapes from refit_info, plus the
         # grouped-expert tag (gate_proj/up_proj/down_proj) for MoE params.
-        hf_shapes = {}
+        hf_shapes = {}  # hf_name -> global_shape
         hf_grouped = {}  # hf_name -> "gate_proj"|"up_proj"|"down_proj" (MoE only)
         for layer_name in refit_info["layer_names"]:
+            # p is a dict of param info
             for p in refit_info["per_layer_params"][layer_name]:
                 hf_shapes[p["name"]] = tuple(p["global_shape"])
                 if p.get("grouped_expert_proj"):
                     hf_grouped[p["name"]] = p["grouped_expert_proj"]
 
-        # Per-prefix gate presence: a grouped-MoE layer is gated SwiGLU iff it
-        # has a gate_proj group (else non-gated ReLU^2 = up_proj only).  Decides
-        # whether up_proj maps to the whole w13 (non-gated) or its second half.
+        # Check if this model uses gated MLP layer (e.g., SwiGLU, Gated ReLU^2)
         has_gate = {
             name.rsplit(".gate_proj.weight", 1)[0]
             for name, proj in hf_grouped.items()
@@ -411,12 +460,7 @@ class VllmInternalWorkerExtension:
 
         # NemotronH (nemotron_h): HF param names use the ``backbone.*`` prefix
         # while vLLM uses ``model.*`` (e.g. ``backbone.layers.N.mixer.experts.
-        # w13_weight`` -> ``model.layers.N.mixer.experts.w13_weight``).  Translate
-        # at the point of vLLM-param lookup so the direct-match / merge rules below
-        # resolve.  Mamba SSM params take the misc path instead (the
-        # is_nccl_xfer_param whitelist excludes them), so vLLM's load_weights
-        # handles their special sharding and
-        # the A_log -> A transform; they never reach this bulk mapping.  For
+        # w13_weight`` -> ``model.layers.N.mixer.experts.w13_weight``). For
         # non-NemotronH models the name is unchanged, so this is a no-op.
         def _to_vllm_name(n):
             if n == "backbone.embeddings.weight":
@@ -437,122 +481,82 @@ class VllmInternalWorkerExtension:
                 ["q_a_proj.weight", "kv_a_proj_with_mqa.weight"],
                 "fused_qkv_a_proj.weight",
             ),
-            # NB: FP8 ``*.weight_scale_inv`` siblings are NOT merged here — every
-            # ``_scale_inv`` takes the misc/load_weights path (excluded by
-            # is_nccl_xfer_param), so they never reach this bulk mapping.
         ]
 
         for hf_name in hf_shapes:
-            # 0) Grouped MoE expert params (gate_proj/up_proj/down_proj, each
-            #    [E, ...]).  vLLM fuses them as w13_weight (gate||up on the
-            #    intermediate axis) and w2_weight (down).  Dispatch on the
-            #    grouped_expert_proj TAG, NOT the suffix, so dense gate_proj/
-            #    up_proj (-> gate_up_proj, rule below) don't collide.  The
-            #    received Shard(1)/Shard(2) shard is placed into the right
-            #    w13/w2 region by get_dst_dtensor (+ its post_refit_hook for the
-            #    gated w13 halves).
+            # 1) Grouped MoE expert params (gate_proj/up_proj/down_proj, each
+            #    [E, ...]). vLLM fuses them as w13_weight (gate||up on the
+            #    intermediate axis) and w2_weight (down). The received
+            #    Shard(1)/Shard(2) shard is placed into the right w13/w2 region by
+            #    get_dst_dtensor (+ its post_refit_hook for the gated w13 halves).
+            # Caveat: Dispatch on the grouped_expert_proj TAG, NOT the suffix,
+            #   so dense gate_proj/up_proj (-> gate_up_proj, rule below) don't collide.
             grouped_proj = hf_grouped.get(hf_name)
             if grouped_proj is not None:
+                # e.g.) expert_prefix = model.layers.3.mlp.experts
                 expert_prefix = hf_name.rsplit(f".{grouped_proj}.weight", 1)[0]
                 vllm_suffix = (
                     "w2_weight" if grouped_proj == "down_proj" else "w13_weight"
                 )
+                # e.g.) vllm_name = model.layers.3.mlp.experts.w13_weight
                 vllm_name = _to_vllm_name(f"{expert_prefix}.{vllm_suffix}")
                 if vllm_name not in vllm_params:
-                    mapping[hf_name] = (None, None)
-                    print(
-                        f"[WARN] _build_hf_to_vllm_mapping: no vLLM expert param "
-                        f"for grouped '{hf_name}'",
-                        flush=True,
+                    raise ValueError(
+                        f"_build_hf_to_gen_backend_mapping: grouped expert {hf_name!r} has "
+                        f"no vLLM target {vllm_name!r}; refit would silently drop "
+                        f"the expert weights."
                     )
-                    continue
+                # vllm_param is a torch.Tensor corresponding to the vllm_name
                 vllm_param = vllm_params[vllm_name]
                 if grouped_proj == "down_proj" or expert_prefix not in has_gate:
-                    # down -> whole w2; non-gated ReLU^2 up -> whole w13.  The
-                    # received shard IS the local vLLM param (gen TP shards the
-                    # intermediate axis), so this is a direct copy, no sub-slice.
+                    # Case for non-gated MLP layer or down_proj (w2)
+                    # Weights are not merged, so the mapping is 1:1
                     mapping[hf_name] = (vllm_param, None)
                 else:
-                    # gated SwiGLU: w13 = [E, 2P, hidden]; gate -> [:, :P, :],
-                    # up -> [:, P:2P, :] along the intermediate axis (dim 1).
+                    # Case for gated MLP layer (w13) which is merged
+                    # w13 = [E, 2P, hidden]; gate -> [:, :P, :], up -> [:, P:2P, :]
+                    # along the intermediate axis (dim 1).
                     P = vllm_param.shape[1] // 2
                     sl = slice(0, P) if grouped_proj == "gate_proj" else slice(P, 2 * P)
                     mapping[hf_name] = (vllm_param, (slice(None), sl, slice(None)))
                 continue
 
-            # 1) Direct match (1:1 HF -> vLLM name)
+            # 2) Direct match (1:1 HF -> vLLM name)
             vllm_direct = _to_vllm_name(hf_name)
             if vllm_direct in vllm_params:
                 mapping[hf_name] = (vllm_params[vllm_direct], None)
                 continue
 
-            # 2) Check merge rules
+            # 3) Check merge rules
             matched = False
             for hf_suffixes, vllm_suffix in MERGE_RULES:
                 for i, suffix in enumerate(hf_suffixes):
                     if hf_name.endswith(suffix):
                         prefix = hf_name[: -len(suffix)]
+                        # e.g.) vllm_name = model.layers.3.mlp.qkv_proj.weight
                         vllm_name = _to_vllm_name(prefix + vllm_suffix)
                         if vllm_name in vllm_params:
                             vllm_param = vllm_params[vllm_name]
-                            local_dim0 = vllm_param.shape[0]
-
-                            # Collect global dim0 sizes for all components
-                            global_sizes = []
-                            for s in hf_suffixes:
-                                full_name = prefix + s
-                                global_sizes.append(
-                                    hf_shapes[full_name][0]
-                                    if full_name in hf_shapes
-                                    else 0
-                                )
-                            global_dim0 = sum(global_sizes)
-
-                            # Compute LOCAL sizes per component.
-                            # Linear interpolation (global_size * local_dim0 / global_dim0) fails
-                            # when vLLM replicates KV heads (num_kv_heads < tp_size), because
-                            # q/k/v proportions change between global and local.
-                            #
-                            # Use the gen TP size from refit_info, NOT
-                            # torch.distributed.get_world_size(): the latter is the vLLM
-                            # worker's default-group size, which equals TP only because
-                            # gen PP/EP are pinned to 1 (check_nccl_xfer_refit_support).
-                            # Reading gen_tp_size stays correct if gen PP is ever added.
-                            tp_size = refit_info.get("gen_tp_size", 1)
-                            naive_local_sizes = [gs // tp_size for gs in global_sizes]
-                            if sum(naive_local_sizes) == local_dim0:
-                                local_sizes = naive_local_sizes
-                            elif local_dim0 == global_dim0:
-                                # Fully replicated merge (e.g. DeepSeek MLA's
-                                # fused_qkv_a_proj with disable_tp=True): the
-                                # vLLM param holds the full concat on every TP
-                                # rank, so local == global per component.
-                                local_sizes = list(global_sizes)
-                            else:
-                                # KV head replication: q divides evenly, k/v are replicated
-                                local_sizes = [global_sizes[0] // tp_size]
-                                num_rest = len(global_sizes) - 1
-                                rest = local_dim0 - local_sizes[0]
-                                for _ in range(num_rest):
-                                    local_sizes.append(rest // num_rest)
-                            local_offset = sum(local_sizes[:i])
-                            local_size = local_sizes[i]
-
-                            # merged_param_slice is a multi-dim index TUPLE (not a
-                            # bare slice): get_dst_dtensor indexes the vLLM param as
-                            # ``vllm_param.data[merged_param_slice]``.  Dim-0 concat
-                            # merges (qkv_proj, gate_up_proj, fused_qkv_a_proj) use a
-                            # 1-tuple; grouped-expert w13 sub-slices use a dim-1 tuple.
+                            # Place this component's received shard into its dim-0
+                            # region of the fused vLLM param (qkv_proj/gate_up_proj/
+                            # fused_qkv_a_proj).  See _fused_param_merge_slice.
                             mapping[hf_name] = (
                                 vllm_param,
-                                (slice(local_offset, local_offset + local_size),),
+                                _fused_param_merge_slice(
+                                    hf_shapes,
+                                    prefix,
+                                    hf_suffixes,
+                                    i,
+                                    vllm_param.shape[0],
+                                    refit_info.get("gen_tp_size", 1),
+                                ),
                             )
                             matched = True
                         break
                 if matched:
                     break
 
-            # 3) lm_head tied to embed_tokens
+            # 4) lm_head tied to embed_tokens
             if not matched and hf_name == "lm_head.weight":
                 if "model.embed_tokens.weight" in vllm_params:
                     mapping[hf_name] = (
@@ -562,15 +566,9 @@ class VllmInternalWorkerExtension:
                     matched = True
 
             if not matched:
-                # (None, None) -> the discard branch in get_dst_dtensor: this
-                # rank still joins the collective for symmetry but throws the
-                # bytes away. Every supported model maps all of its bulk params,
-                # so this WARN firing means a real mapping gap (a new/renamed
-                # param vLLM expects under another name), not a benign case.
-                mapping[hf_name] = (None, None)
-                print(
-                    f"[WARN] _build_hf_to_vllm_mapping: no vLLM param for '{hf_name}'",
-                    flush=True,
+                raise ValueError(
+                    f"_build_hf_to_gen_backend_mapping: no vLLM param for {hf_name!r} "
+                    f"(no direct / merge-rule / tied-lm_head match)."
                 )
 
         return mapping
@@ -579,7 +577,7 @@ class VllmInternalWorkerExtension:
         """Get destination tensor info for xferdtensor.
 
         Takes an HF parameter name and returns a tuple suitable for calling
-        the canonical 7-arg xferdtensor. Handles three cases:
+        the canonical 7-arg xferdtensor. Handles two cases:
 
         1. **Direct param**: HF name maps 1:1 to a vLLM parameter.
            Returns DTensorRef wrapping the vLLM param with global shape.
@@ -587,12 +585,13 @@ class VllmInternalWorkerExtension:
            (qkv_proj, gate_up_proj, fused_qkv_a_proj). Returns DTensorRef
            wrapping a buffer shaped like this component's slice of the merged
            param, plus a post_refit_hook that copies it in.
-        3. **Unmapped param**: no vLLM param owns this HF param. Returns a
-           DTensorRef wrapping a throwaway buffer purely so this rank still
-           joins the collective (train broadcasts every bulk param; a missing
-           participant would deadlock the broadcast). The bytes are discarded.
 
-        Must be called after ``_hf_to_vllm`` is populated (inside ``nccl_xfer_refit``).
+        ``_build_hf_to_gen_backend_mapping`` guarantees every bulk param falls
+        into one of these (it raises if a param has no vLLM target), so a param
+        with no mapping entry here is a coverage regression and raises
+        ValueError rather than silently discarding its weights.
+
+        Must be called after ``_hf_to_gen_param`` is populated (inside ``nccl_xfer_refit``).
 
         Returns:
             ``(dst_tensor, dst_placements, post_refit_hook)`` where:
@@ -600,45 +599,26 @@ class VllmInternalWorkerExtension:
             - ``dst_placements``: placement list to use (may differ from param_info)
             - ``post_refit_hook``: callable to run after xferdtensor
               (copies the TP-local slice from the temp buffer into the live
-              vLLM merged param), or None for direct/unmapped params
+              vLLM merged param), or None for direct params
         """
-        from nemo_rl.distributed.nccl_xfer_utils import _STR_TO_DTYPE
         from nemo_rl.distributed.xferdtensor import DTensorRef
 
-        vllm_param, merged_param_slice = self._hf_to_vllm.get(param_name, (None, None))
+        vllm_param, merged_param_slice = self._hf_to_gen_param.get(
+            param_name, (None, None)
+        )
         global_shape = param_info["global_shape"]
         dst_placements = param_info["dst_placements"]
 
         if vllm_param is None:
-            # No vLLM owner for this HF param. This is NOT stale-weight
-            # corruption: train broadcasts EVERY bulk param, so each gen rank
-            # must call the matching collective even with nowhere to store the
-            # bytes, or the broadcast deadlocks. We receive into a throwaway
-            # buffer and run no post_refit_hook, discarding the result.
-            #
-            # The global_shape buffer is fine: golden stages the transfer in its
-            # own internal buffers, so this is only the (discarded) final-copy
-            # target. In practice every supported model maps all of its bulk
-            # params, so reaching here signals a mapping regression (see the
-            # WARN in _build_hf_to_vllm_mapping), not a normal path.
-            dtype = _STR_TO_DTYPE.get(param_info.get("dtype", ""), torch.bfloat16)
-            buf = torch.empty(global_shape, device=self.device, dtype=dtype)
-            return DTensorRef(buf, global_shape), dst_placements, None
+            raise ValueError(
+                f"get_dst_dtensor: {param_name!r} has no entry in the HF->gen "
+                f"mapping; _build_hf_to_gen_backend_mapping did not enumerate it. "
+                f"This would silently discard the param's weights."
+            )
 
         if merged_param_slice is not None:
-            # Honor the dst placement decided at setup (refit_info) — identical
-            # for golden and the real op, so train and gen always agree on the
-            # redistribution (the real point-to-point op deadlocks on any
-            # disagreement).  Receive this component's slice of the merged vLLM
-            # param directly into a like-shaped buffer, then copy it in:
-            #   - Shard dst (clean column-parallel): the transfer delivers the
-            #     1/gen_tp shard, which is exactly this region.
-            #   - all-Replicate dst (disable_tp): the transfer delivers the full
-            #     tensor, which IS this region (the gen param is replicated, so
-            #     the slice spans the whole tensor).
-            # KV-head replication — where the region would be smaller than the
-            # received tensor — is routed to the misc/load_weights path instead
-            # (see qkv_to_misc), so it never reaches here.
+            # If the param is a merged param, we need to copy the received data
+            # from the temp buffer into the live generation backend merged param.
             region = vllm_param.data[merged_param_slice]
             buf = torch.empty_like(region)
 
@@ -647,9 +627,6 @@ class VllmInternalWorkerExtension:
 
             return DTensorRef(buf, global_shape), dst_placements, post_refit_hook
 
-        # Direct 1:1 mapping — xferdtensor handles TP sharding.
-        # Use .data to avoid "leaf Variable that requires grad" error from
-        # in-place copy_ inside xferdtensor.
         return DTensorRef(vllm_param.data, global_shape), dst_placements, None
 
     def nccl_xfer_refit(self) -> bool:
@@ -660,42 +637,64 @@ class VllmInternalWorkerExtension:
         gate_up_proj), a post_refit_hook copies the TP-local slice. The
         HF→vLLM mapping is built once in ``prepare_nccl_xfer_refit_info``.
         """
+        import os
+        from collections import OrderedDict
+
         from nemo_rl.distributed.xferdtensor import xferdtensor
 
+        def _recv_one_param(param_info, group):
+            dst_tensor, dst_placements, post_refit_hook = self.get_dst_dtensor(
+                param_info["name"], param_info
+            )
+            xferdtensor(
+                None,
+                param_info["src_mesh_info"],
+                param_info["src_placements"],
+                dst_tensor,
+                param_info["dst_mesh_info"],
+                dst_placements,
+                group,
+            )
+            if post_refit_hook:
+                post_refit_hook()
+
         use_per_stage = hasattr(self, "pp_comm_groups") and self.pp_comm_groups
+        num_streams = (
+            int(os.environ.get("NRL_REFIT_NUM_STREAMS", "2")) if use_per_stage else 1
+        )
 
+        # Group params into ordered batches to concurrently recieve params from
+        # different pp-stages
+        stage_params = OrderedDict()
         for layer_name in self.nccl_xfer_refit_info["layer_names"]:
-            for param_info in self.nccl_xfer_refit_info["per_layer_params"][layer_name]:
-                if use_per_stage:
-                    group = self.pp_comm_groups[param_info["pp_stage"]]
-                else:
-                    group = self.model_update_group
+            for p in self.nccl_xfer_refit_info["per_layer_params"][layer_name]:
+                key = p["pp_stage"] if use_per_stage else 0
+                stage_params.setdefault(key, []).append(p)
 
-                dst_tensor, dst_placements, post_refit_hook = self.get_dst_dtensor(
-                    param_info["name"], param_info
+        streams = [torch.cuda.Stream() for _ in range(num_streams)]
+        events = {}
+        for idx, (stage, params) in enumerate(stage_params.items()):
+            # synchronize the last run in the same stream
+            if (idx - num_streams) in events:
+                events[idx - num_streams].synchronize()
+            with torch.cuda.stream(streams[idx % num_streams]):
+                group = (
+                    self.pp_comm_groups[stage]
+                    if use_per_stage
+                    else self.model_update_group
                 )
-                xferdtensor(
-                    None,
-                    param_info["src_mesh_info"],
-                    param_info["src_placements"],
-                    dst_tensor,
-                    param_info["dst_mesh_info"],
-                    dst_placements,
-                    group,
-                )
-                if post_refit_hook:
-                    post_refit_hook()
+                for p in params:
+                    _recv_one_param(p, group)
+                ev = torch.cuda.Event()
+                ev.record()
+                events[idx] = ev
 
         self._receive_and_load_misc_params()
 
         torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
-        # Finalize FP8 KV-cache per-layer k/v scales after the misc broadcast
-        # delivers them as scale tensors.  No-op unless kv_cache_dtype=fp8 (the
-        # guard lives in _maybe_process_fp8_kv_cache).  Bulk FP8 *weights* arrive
-        # kernel-ready via xferdtensor and misc params go through vLLM's own
-        # load_weights, so for the non-KV-cache path this stays a no-op (verified
-        # on 30B FP8 MoE: byte-identical generation/rewards either way).
+        # Finalize FP8 KV-cache per-layer k/v scales after the misc broadcast.
         self._maybe_process_fp8_kv_cache()
         return True
 
