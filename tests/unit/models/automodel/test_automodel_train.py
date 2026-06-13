@@ -258,6 +258,28 @@ class TestNeedsKvCacheForSharedLayers:
 
         assert _needs_kv_cache_for_shared_layers(types.SimpleNamespace()) is False
 
+    def test_workaround_obsolete_tripwire(self):
+        """Tripwire: fires once transformers>=5.5.2 (PR #45312) lands.
+
+        PR #45312 fixes KV sharing without requiring use_cache=True, which makes
+        the _needs_kv_cache_for_shared_layers workaround (and the use_cache
+        plumbing it drives in model_forward / automodel_forward_backward) obsolete.
+        There is no importable symbol/signature to key on, so we key on the
+        transformers version the TODO names. When this assertion fails, remove the
+        workaround in nemo_rl/models/automodel/train.py and this test.
+        """
+        import transformers
+        from packaging.version import Version
+
+        assert Version(transformers.__version__) < Version("5.5.2"), (
+            f"transformers {transformers.__version__} >= 5.5.2 detected "
+            "(PR #45312 fixes KV sharing without use_cache=True). The "
+            "_needs_kv_cache_for_shared_layers workaround in "
+            "nemo_rl/models/automodel/train.py (and the use_cache plumbing in "
+            "model_forward / automodel_forward_backward) is now obsolete - "
+            "remove it and this test."
+        )
+
 
 # =====================
 # Test extract_logits
