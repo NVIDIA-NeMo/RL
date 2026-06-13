@@ -176,38 +176,37 @@ def test_smoke_round_trip_backends(tq_client_backends) -> None:
     client.clear_samples(sample_ids=None, partition_id="smoke-backend")
 
 
-def test_smoke_round_trip_1d_fields(tq_client) -> None:
+def test_smoke_round_trip_1d_fields(tq_client_backends) -> None:
     """A 1D (N,) tensor put into TQ must come back as (N,), not (N,1).
 
     Regression guard for R-C2: TQ's KVStorageManager path silently unsqueezes
-    1D fields. The adapter's `_promote_1d_leaves` + `_from_wire` pair fix
-    this for the mooncake_cpu backend; this test verifies simple backend does
-    not introduce the regression.
+    1D fields. The adapter's `_promote_1d_leaves` + `_from_wire` pair fixes
+    this for mooncake_cpu; simple passes the tensor through unchanged.
     """
     n = 6
     reward = torch.arange(n, dtype=torch.float32)
 
-    tq_client.register_partition(
+    tq_client_backends.register_partition(
         partition_id="smoke-1d",
         fields=["reward"],
         num_samples=n,
         consumer_tasks=["read"],
     )
     keys = [f"k{i}" for i in range(n)]
-    tq_client.put_samples(
+    tq_client_backends.put_samples(
         sample_ids=keys,
         partition_id="smoke-1d",
         fields=TensorDict({"reward": reward}, batch_size=[n]),
     )
 
-    meta = tq_client.claim_meta(
+    meta = tq_client_backends.claim_meta(
         partition_id="smoke-1d",
         task_name="read",
         required_fields=["reward"],
         batch_size=n,
         timeout_s=30.0,
     )
-    data = tq_client.get_data(meta)
+    data = tq_client_backends.get_data(meta)
 
     assert data["reward"].shape == reward.shape, (
         f"Expected shape {tuple(reward.shape)} for 1D field, "
@@ -215,7 +214,7 @@ def test_smoke_round_trip_1d_fields(tq_client) -> None:
         "TQ must not unsqueeze 1D tensors silently (R-C2)."
     )
 
-    tq_client.clear_samples(sample_ids=None, partition_id="smoke-1d")
+    tq_client_backends.clear_samples(sample_ids=None, partition_id="smoke-1d")
 
 
 # ── Object-field round-trip across backends ───────────────────────────────────
