@@ -19,6 +19,9 @@ policy:
   dtensor_cfg:
     _v2: true
     expert_parallel_size: 8
+    # Recompute activations to fit 30B-A3B on 1n8g: avoids the full-vocab
+    # log_softmax OOM in DPO loss-input prep (~step 8) on 80 GiB GPUs.
+    activation_checkpointing: true
     automodel_kwargs:
       backend:
         _target_: nemo_automodel.components.models.common.utils.BackendConfig
