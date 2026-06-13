@@ -1,9 +1,8 @@
 # DynamoGraphDeployment for Qwen/Qwen2.5-1.5B-Instruct on GB300, MX-enabled.
 #
-# Used by the sliding-puzzle k8s V3 exemplar. The NeMo-RL Dynamo backend sends
-# token-id OpenAI completions requests and requires nvext.completion_token_ids,
-# so this must run a Dynamo image built from
-# jthomson04/tokenize-endpoint-merge-main-06-09 or newer.
+# Used by the sliding-puzzle k8s V3 exemplar. The Dynamo image includes
+# token-id completions support plus the Modelexpress client and MX refit
+# receiver.
 
 apiVersion: nvidia.com/v1alpha1
 kind: DynamoGraphDeployment
@@ -34,7 +33,7 @@ spec:
             persistentVolumeClaim:
               claimName: rl-workspace
         mainContainer:
-          image: jwillthomson/dynamo-arm-tokenize-endpoint-3c63dd69-mx
+          image: jwillthomson/dynamo-arm-tokenize-endpoint-7da82a91
           workingDir: /workspace
           volumeMounts:
             - mountPath: /mnt/rl-workspace
@@ -72,20 +71,15 @@ spec:
             persistentVolumeClaim:
               claimName: rl-workspace
         mainContainer:
-          image: jwillthomson/dynamo-arm-tokenize-endpoint-3c63dd69-mx
+          image: jwillthomson/dynamo-arm-tokenize-endpoint-7da82a91
           workingDir: /workspace
           volumeMounts:
             - mountPath: /mnt/rl-workspace
               name: rl-workspace
           command:
-            - /bin/bash
-            - -c
-            - |
-              set -euo pipefail
-              echo "[startup] dynamo.vllm qwen2.5-1.5b mx $(date -u +%FT%TZ)"
-              python3 -c "import modelexpress; print('modelexpress at', modelexpress.__file__)"
-              exec python3 -m dynamo.vllm "$@"
-            - --
+            - python3
+            - -m
+            - dynamo.vllm
           args:
             - --model
             - Qwen/Qwen2.5-1.5B-Instruct

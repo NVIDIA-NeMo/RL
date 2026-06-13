@@ -1,8 +1,8 @@
 # DynamoGraphDeployment for meta-llama/Llama-3.1-8B-Instruct on GB300.
 #
-# Used by the V2 Megatron + Dynamo + ModelExpress smoke. The container image is
-# intentionally not rebuilt; startup overlays Modelexpress PR 429 and the
-# Megatron-capable Dynamo mx_refit extension from the NeMo-RL worktree.
+# Used by the V2 Megatron + Dynamo + ModelExpress smoke. The Dynamo image
+# includes the Modelexpress client and Megatron MX refit receiver, so the
+# worker starts directly without copying source from the shared workspace.
 
 apiVersion: nvidia.com/v1alpha1
 kind: DynamoGraphDeployment
@@ -33,7 +33,7 @@ spec:
             persistentVolumeClaim:
               claimName: rl-workspace
         mainContainer:
-          image: jwillthomson/dynamo-arm-tokenize-endpoint-3c63dd69-mx
+          image: jwillthomson/dynamo-arm-tokenize-endpoint-7da82a91
           workingDir: /workspace
           volumeMounts:
             - mountPath: /mnt/rl-workspace
@@ -59,8 +59,6 @@ spec:
           gpu: "1"
           memory: "192Gi"
       extraPodSpec:
-        # Runtime overlay writes the Megatron-capable mx_refit extension into
-        # the image's system site-packages. Drop this after rebuilding Dynamo.
         securityContext:
           runAsUser: 0
         nodeSelector:
@@ -78,51 +76,15 @@ spec:
             persistentVolumeClaim:
               claimName: rl-workspace
         mainContainer:
-          image: jwillthomson/dynamo-arm-tokenize-endpoint-3c63dd69-mx
+          image: jwillthomson/dynamo-arm-tokenize-endpoint-7da82a91
           workingDir: /workspace
           volumeMounts:
             - mountPath: /mnt/rl-workspace
               name: rl-workspace
           command:
-            - /bin/bash
-            - -c
-            - |
-              set -euo pipefail
-              echo "[startup] dynamo.vllm llama3.1-8b mx $(date -u +%FT%TZ)"
-
-              MX_SRC=/tmp/mx-src
-              rm -rf "$MX_SRC"
-              cp -a /mnt/rl-workspace/jothomson/modelexpress-pr429/modelexpress_client/python "$MX_SRC"
-              rm -rf "$MX_SRC"/modelexpress.egg-info "$MX_SRC"/build "$MX_SRC"/__pycache__
-              export PYTHONPATH="$MX_SRC:${PYTHONPATH:-}"
-
-              MXRX_SRC=/mnt/rl-workspace/jothomson/nemo-rl-megatron-dynamo-mx-v2/infra/nrl_k8s/dynamo_mx/mx_refit_extension_megatron.py
-              DYN_SITE=$(python3 - <<'PY'
-              import importlib.util
-
-              spec = importlib.util.find_spec("dynamo")
-              if spec is None or spec.submodule_search_locations is None:
-                  raise RuntimeError("Could not locate installed dynamo package")
-              print(next(iter(spec.submodule_search_locations)))
-              PY
-              )
-              MXRX_DST="$DYN_SITE/vllm/mx_refit/extension.py"
-              mkdir -p "$(dirname "$MXRX_DST")"
-              cp "$MXRX_SRC" "$MXRX_DST"
-
-              python3 - <<'PY'
-              import modelexpress
-              from modelexpress.engines.vllm.registration import _PLUGIN_LOAD_FORMATS
-              import modelexpress.megatron_translator as mt
-              import dynamo.vllm.mx_refit.extension as mx_ext
-              print("modelexpress at", modelexpress.__file__)
-              print("_PLUGIN_LOAD_FORMATS =", _PLUGIN_LOAD_FORMATS)
-              print("megatron translator at", mt.__file__)
-              print("mx refit extension at", mx_ext.__file__)
-              PY
-
-              exec python3 -m dynamo.vllm "$@"
-            - --
+            - python3
+            - -m
+            - dynamo.vllm
           args:
             - --model
             - meta-llama/Llama-3.1-8B-Instruct
