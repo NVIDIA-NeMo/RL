@@ -32,6 +32,7 @@ loss function does only loss math; this module is just plumbing.
 
 from __future__ import annotations
 
+import math
 import os
 from typing import Any, NotRequired, Optional, TypedDict, cast
 
@@ -47,6 +48,10 @@ from nemo_rl.algorithms.loss.loss_functions import (
 )
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.algorithms.x_token import TokenAligner
+from nemo_rl.algorithms.x_token.utils import (
+    assert_teacher_student_batch_grid,
+    pad_distillation_val_batch,
+)
 from nemo_rl.data import DataConfig
 from nemo_rl.data.cross_tokenizer_collate import CrossTokenizerCollator
 from nemo_rl.data.datasets import AllTaskProcessedDataset
@@ -101,6 +106,10 @@ class OffPolicyDistillationConfig(TypedDict):
         val_period: Validation cadence in steps. ``0`` disables validation.
         val_at_start: Run validation before training begins.
         val_at_end: Run validation on the final step.
+        val_teacher_micro_batch_size: Teacher microbatch size used for the
+            validation logits export. Defaults to the teacher's
+            ``train_micro_batch_size``; tune independently for val
+            memory/throughput.
     """
 
     num_prompts_per_step: int
@@ -110,6 +119,7 @@ class OffPolicyDistillationConfig(TypedDict):
     val_period: int
     val_at_start: bool
     val_at_end: bool
+    val_teacher_micro_batch_size: NotRequired[int]
 
 
 class OffPolicyDistillationSaveState(TypedDict):
@@ -181,18 +191,6 @@ def setup(
         "dtensor_cfg"
     ].get("_v2"), (
         "xtoken distillation requires teacher.dtensor_cfg.enabled=true and _v2=true."
-    )
-
-    # The cross-tokenizer loss reduces ``global_valid_chunks`` with an
-    # all-reduce on the default process group (see
-    # ``loss_utils.dp_all_reduce_sum``), which only equals the DP group
-    # when there is no TP/CP sharding. Enforce that here so the chunk-KL
-    # denominator stays correct.
-    assert (
-        policy_config["dtensor_cfg"]["tensor_parallel_size"] == 1
-        and policy_config["dtensor_cfg"]["context_parallel_size"] == 1
-    ), (
-        "xtoken distillation requires policy tensor_parallel_size=1 and context_parallel_size=1."
     )
 
     set_seed(distillation_config["seed"])
@@ -318,6 +316,40 @@ def setup(
     )
 
     # ==========================
+    #   Teacher/student grid
+    # ==========================
+    # Teacher and student may differ in DP and MBS, but they must agree on the
+    # global batch size (one dataloader batch feeds both, in the same global
+    # order) and tile it cleanly into per-DP-rank chunks and whole microbatches.
+    # assert_teacher_student_batch_grid checks both (GBS agreement + tiling).
+    student_dp = student_policy.data_parallel_size
+    teacher_dp = teacher_policy.data_parallel_size
+    val_teacher_mbs = distillation_config.get(
+        "val_teacher_micro_batch_size", teacher_config["train_micro_batch_size"]
+    )
+    # Training grid.
+    assert_teacher_student_batch_grid(
+        global_batch_size=distillation_config["num_prompts_per_step"],
+        student_gbs=policy_config["train_global_batch_size"],
+        teacher_gbs=teacher_config["train_global_batch_size"],
+        student_dp=student_dp,
+        teacher_dp=teacher_dp,
+        student_mbs=policy_config["train_micro_batch_size"],
+        teacher_mbs=teacher_config["train_micro_batch_size"],
+    )
+    # Validation grid: the student reuses its train MBS in eval mode; the
+    # teacher uses val_teacher_micro_batch_size for the val export.
+    assert_teacher_student_batch_grid(
+        global_batch_size=distillation_config["num_prompts_per_step"],
+        student_gbs=policy_config["train_global_batch_size"],
+        teacher_gbs=teacher_config["train_global_batch_size"],
+        student_dp=student_dp,
+        teacher_dp=teacher_dp,
+        student_mbs=policy_config["train_micro_batch_size"],
+        teacher_mbs=val_teacher_mbs,
+    )
+
+    # ==========================
     #         Loss
     # ==========================
     # Inject both tokenizer vocab sizes so the projection matrix's V_s
@@ -427,7 +459,11 @@ def xtoken_off_policy_distillation_train(
                     # full vocab (gold path) or derives a microbatch-global
                     # top-k from this inline (P-KL path).
                     teacher_handles = teacher_policy.get_full_logits_ipc(
-                        teacher_data, timer=timer
+                        teacher_data,
+                        micro_batch_size=master_config.teacher[
+                            "train_micro_batch_size"
+                        ],
+                        timer=timer,
                     )
                     # Model offload frees the teacher's PARAMS to CPU; the
                     # IPC-stashed logit tensors live in worker Python state
@@ -469,13 +505,15 @@ def xtoken_off_policy_distillation_train(
                             timer=timer,
                             check_dim_skip_keys=XTOKEN_NON_STUDENT_SEQ_KEYS,
                         )
-                    finally:
-                        # No-op under the persistent IPC buffer design (the
-                        # teacher reuses one buffer across steps via copy_),
-                        # kept for driver-side contract compatibility. Called
-                        # in finally so the contract holds even if the
-                        # student step raised.
+                    except Exception:
+                        # Free the producer's IPC buffer before propagating so a
+                        # failed step doesn't leak the teacher logits. The happy
+                        # path keeps the buffer persistent across steps (reused
+                        # via copy_) and releases once at loop exit — releasing
+                        # every step here frees + reallocs the large teacher
+                        # logits buffer and fragments the GPU into an OOM.
                         teacher_policy.release_ipc_buffer()
+                        raise
 
                 is_last_step = (total_steps + 1 >= max_steps) or (
                     (current_epoch + 1 == max_epochs)
@@ -662,13 +700,16 @@ def xtoken_off_policy_distillation_train(
 
             if should_save_by_timeout:
                 print("Timeout reached, stopping training early.", flush=True)
+                teacher_policy.release_ipc_buffer()
                 return
             if total_steps >= max_steps:
                 print("Max steps reached, stopping training.", flush=True)
+                teacher_policy.release_ipc_buffer()
                 return
 
         current_epoch += 1
         current_step = 0
+    teacher_policy.release_ipc_buffer()
 
 
 # ===============================================================================
@@ -701,16 +742,33 @@ def validate(
     kl_common_losses: list[float] = []
     l1_uncommon_losses: list[float] = []
 
+    # Teacher and student may differ in DP/MBS; the final val batch (with
+    # drop_last=False) can be ragged. Pad each batch up to the smallest size
+    # that tiles cleanly on both grids so the existing even-split path applies.
+    student_dp = student_policy.data_parallel_size
+    teacher_dp = teacher_policy.data_parallel_size
+    student_mbs = master_config.policy["train_micro_batch_size"]
+    val_teacher_mbs = distill_cfg.get(
+        "val_teacher_micro_batch_size",
+        master_config.teacher["train_micro_batch_size"],
+    )
+    pad_quantum = math.lcm(student_dp * student_mbs, teacher_dp * val_teacher_mbs)
+
     with timer.time("validation_total"):
         teacher_policy.prepare_for_lp_inference()
         for batch in val_dataloader:
+            target_size = math.ceil(batch.size / pad_quantum) * pad_quantum
+            batch = pad_distillation_val_batch(batch, target_size)
+
             teacher_data = BatchedDataDict(
                 input_ids=batch["teacher_input_ids"],
                 input_lengths=batch["teacher_input_lengths"],
                 token_mask=batch["teacher_token_mask"],
                 sample_mask=batch["sample_mask"],
             )
-            teacher_handles = teacher_policy.get_full_logits_ipc(teacher_data)
+            teacher_handles = teacher_policy.get_full_logits_ipc(
+                teacher_data, micro_batch_size=val_teacher_mbs
+            )
 
             train_data: BatchedDataDict[Any] = BatchedDataDict(
                 input_ids=batch["input_ids"],
@@ -739,9 +797,10 @@ def validate(
                     eval_mode=True,
                     check_dim_skip_keys=XTOKEN_NON_STUDENT_SEQ_KEYS,
                 )
-            finally:
+            except Exception:
                 teacher_policy.release_ipc_buffer()
-            losses.append(float(results["loss"].numpy()))
+                raise
+            losses.append(float(np.mean(results["loss"].numpy())))
             mb_metrics = results.get("all_mb_metrics", {})
             if "kl_loss" in mb_metrics:
                 kl_losses.append(float(np.mean(mb_metrics["kl_loss"])))
@@ -751,6 +810,7 @@ def validate(
                 kl_common_losses.append(float(np.mean(mb_metrics["kl_common"])))
             if "l1_uncommon" in mb_metrics:
                 l1_uncommon_losses.append(float(np.mean(mb_metrics["l1_uncommon"])))
+        teacher_policy.release_ipc_buffer()
         teacher_policy.offload_after_refit()
 
     metrics: dict[str, Any] = {

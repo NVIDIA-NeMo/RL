@@ -15,6 +15,7 @@
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
+import torch.distributed.nn.functional
 from torch.distributed.tensor import DTensor, distribute_tensor
 
 from nemo_rl.algorithms.logits_sampling_utils import (
@@ -29,24 +30,23 @@ if TYPE_CHECKING:
     from megatron.core.models.gpt import GPTModel
 
 
-@torch.no_grad()
-def _compute_distributed_log_softmax(
+def _compute_distributed_log_softmax_with_grad(
     vocab_parallel_logits: torch.Tensor, group: torch.distributed.ProcessGroup
 ) -> torch.Tensor:
-    """Compute a stable distributed log softmax across tensor parallel workers.
-
-    Taken from: https://github.com/NVIDIA/NeMo-Aligner/blob/9faab404f21994a7eb1d6ed5890b76152b941636/nemo_aligner/utils/distributed.py#L265
+    """Differentiable stable distributed log_softmax across tensor parallel workers.
 
     Args:
-        vocab_parallel_logits (torch.Tensor): Logits tensor with shape [batch_size, seq_length, vocab_size//TP]
-            where TP is the tensor parallel size.
-        group (torch.distributed.ProcessGroup): Process group for the all-reduce operations.
+        vocab_parallel_logits (torch.Tensor): Logits with shape
+            [batch_size, seq_length, vocab_size // TP], where TP is the tensor
+            parallel size.
+        group (torch.distributed.ProcessGroup): Process group for the all-reduces.
 
     Returns:
-        torch.Tensor: Log softmax output with the same shape as input, but values represent
-            log probabilities normalized across the full vocabulary dimension.
+        torch.Tensor: Log probabilities, same shape as the input, normalized across
+            the full vocabulary dimension. Differentiable (gradients flow through
+            the all-reduces).
     """
-    logits_max = torch.amax(vocab_parallel_logits, dim=-1, keepdim=True)
+    logits_max = torch.amax(vocab_parallel_logits, dim=-1, keepdim=True).detach()
     torch.distributed.all_reduce(
         logits_max,
         op=torch.distributed.ReduceOp.MAX,
@@ -58,13 +58,25 @@ def _compute_distributed_log_softmax(
 
     sum_exp_logits = vocab_parallel_logits.exp().sum(-1, keepdim=True).float()
 
-    torch.distributed.all_reduce(
+    sum_exp_logits = torch.distributed.nn.functional.all_reduce(
         sum_exp_logits,
         op=torch.distributed.ReduceOp.SUM,
         group=group,
     )
 
-    return vocab_parallel_logits - sum_exp_logits.log_().to(vocab_parallel_logits.dtype)
+    return vocab_parallel_logits - sum_exp_logits.log().to(vocab_parallel_logits.dtype)
+
+
+@torch.no_grad()
+def _compute_distributed_log_softmax(
+    vocab_parallel_logits: torch.Tensor, group: torch.distributed.ProcessGroup
+) -> torch.Tensor:
+    """Non-differentiable variant of :func:`_compute_distributed_log_softmax_with_grad`.
+
+    Same math and shape contract, wrapped in ``torch.no_grad()`` for the
+    inference / logprob paths that don't need gradients.
+    """
+    return _compute_distributed_log_softmax_with_grad(vocab_parallel_logits, group)
 
 
 @torch.no_grad()
@@ -1227,6 +1239,38 @@ def allgather_cp_sharded_tensor(
     return AllGatherCPTensor.apply(tensor, cp_group, seq_dim)  # , unpadded_seqlen)
 
 
+class AllReduceSum(torch.autograd.Function):
+    """Autograd-aware SUM all-reduce; forward clones + reduces, backward is identity.
+
+    Math: ``y = Σ_r x_r`` ⇒ ``dy/dx_r = 1``. Every rank holds the same
+    ``y`` after forward, so the upstream grad is identical across ranks
+    — passing it back as ``grad_x_r`` lets the rank-local chain rule
+    route gradients to each rank's own input shard with no cross-rank
+    coupling.
+    """
+
+    @staticmethod
+    def forward(  # pyrefly: ignore[bad-override]
+        ctx: Any,
+        x: torch.Tensor,
+        group: Optional[torch.distributed.ProcessGroup],
+    ) -> torch.Tensor:
+        ctx.group = group
+        if group is None or torch.distributed.get_world_size(group) <= 1:
+            return x
+        out = x.clone()
+        torch.distributed.all_reduce(
+            out, op=torch.distributed.ReduceOp.SUM, group=group
+        )
+        return out
+
+    @staticmethod
+    def backward(  # pyrefly: ignore[bad-override]
+        ctx: Any, grad_out: torch.Tensor
+    ) -> tuple[torch.Tensor, None]:
+        return grad_out, None
+
+
 class AllGatherCPTensor(torch.autograd.Function):
     def forward(
         ctx, tensor, cp_group: torch.distributed.ProcessGroup, seq_dim=1
@@ -1291,6 +1335,149 @@ class AllGatherCPTensor(torch.autograd.Function):
         )
 
         return grad_input, None, None  # , None
+
+
+def cp_load_balanced_to_contiguous(
+    x: torch.Tensor,
+    *,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    seq_dim: int = 1,
+) -> torch.Tensor:
+    """Re-layout a tensor from load-balanced CP order to this rank's contiguous window.
+
+    PyTorch ``context_parallel`` shards the sequence in a load-balanced
+    (``2*cp`` interleaved) order. :func:`allgather_cp_sharded_tensor` undoes the
+    chunking to the full contiguous sequence; this re-slices to this CP rank's
+    contiguous ``[cp_rank*L, (cp_rank+1)*L)`` window. No-op when CP world <= 1.
+    Uses the grad-preserving ``DTensor.to_local()`` so the gradient is kept.
+    """
+    if cp_group is None or torch.distributed.get_world_size(cp_group) <= 1:
+        return x
+    local = x.to_local() if isinstance(x, DTensor) else x
+    full = allgather_cp_sharded_tensor(local, cp_group, seq_dim=seq_dim)
+    cp_size = torch.distributed.get_world_size(cp_group)
+    cp_rank = torch.distributed.get_rank(cp_group)
+    local_len = full.shape[seq_dim] // cp_size
+    return full.narrow(seq_dim, cp_rank * local_len, local_len).contiguous()
+
+
+def cp_shift_next(
+    x: torch.Tensor,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    *,
+    fill: float,
+) -> torch.Tensor:
+    """Next-token (left-by-1) shift along seq dim 1, CP-aware for contiguous sharding.
+
+    Returns ``out[:, t] = x[:, t + 1]`` over the *global* sequence: interior
+    positions roll locally, each rank's last position takes the next CP rank's
+    first row (contiguous CP sharding), and the global-last position is set to
+    ``fill`` (no next token). With no / size-1 ``cp_group`` this is a plain local
+    left-roll with the last position set to ``fill``.
+    """
+    out = torch.roll(x, shifts=-1, dims=1)
+    cp_size = torch.distributed.get_world_size(cp_group) if cp_group is not None else 1
+    if cp_size <= 1:
+        out[:, -1] = fill
+        return out
+    cp_rank = torch.distributed.get_rank(cp_group)
+    first = x[:, 0].contiguous()
+    gathered = [torch.empty_like(first) for _ in range(cp_size)]
+    torch.distributed.all_gather(gathered, first, group=cp_group)
+    out[:, -1] = gathered[cp_rank + 1] if cp_rank < cp_size - 1 else fill
+    return out
+
+
+def dp_all_reduce_sum(local: torch.Tensor) -> torch.Tensor:
+    """Sum a scalar over the worker's default (full-mesh DP×CP×TP) group, no grad.
+
+    The TP-replication inflation is intentional: normalizers whose numerator sums
+    over the same mesh cancel it, so the result stays parallelism-invariant. Returns
+    a fresh float32 scalar (falls back to a local copy when dist is uninitialized).
+    """
+    out = local.detach().to(torch.float32).clone()
+    if torch.distributed.is_initialized():
+        torch.distributed.all_reduce(out)
+    return out
+
+
+def vocab_parallel_log_softmax(
+    logits: torch.Tensor,
+    temperature: float,
+    *,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """TP-aware ``log_softmax(logits / temperature)`` keeping the vocab shard.
+
+    With ``tp_group`` world > 1 the logits are vocab-sharded, so the softmax
+    normalization is reduced across the TP group (kept differentiable) while the
+    result stays sharded on the same vocab axis. Otherwise this is a plain local
+    ``log_softmax``. DTensor inputs are unwrapped to their local shard.
+    """
+    if isinstance(logits, DTensor):
+        logits = logits.to_local()
+    scaled = logits.float() / temperature
+    if tp_group is not None and torch.distributed.get_world_size(tp_group) > 1:
+        return _compute_distributed_log_softmax_with_grad(scaled, group=tp_group)
+    return torch.log_softmax(scaled, dim=-1)
+
+
+def vocab_parallel_full_log_softmax(
+    logits: torch.Tensor,
+    temperature: float,
+    *,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """TP-aware ``log_softmax`` gathered to the full vocab ``[B, T, V]``.
+
+    Unlike :func:`vocab_parallel_log_softmax` (which keeps the result
+    vocab-sharded), callers that slice arbitrary vocab indices need the full
+    vocab axis. With ``tp_group`` world > 1 the sharded log-probs are all-gathered
+    via Megatron's autograd-aware gather; otherwise a plain local ``log_softmax``.
+    """
+    if isinstance(logits, DTensor):
+        logits = logits.to_local()
+    scaled = logits.float() / temperature
+    if tp_group is not None and torch.distributed.get_world_size(tp_group) > 1:
+        # Local import keeps the optional Megatron dependency boundary intact.
+        from megatron.core.tensor_parallel import (
+            gather_from_tensor_model_parallel_region,
+        )
+
+        sharded_log_probs = _compute_distributed_log_softmax_with_grad(
+            scaled, group=tp_group
+        )
+        return gather_from_tensor_model_parallel_region(
+            sharded_log_probs, group=tp_group
+        )
+    return torch.log_softmax(scaled, dim=-1)
+
+
+def vocab_parallel_argmax(
+    logits: torch.Tensor,
+    *,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """Per-position global argmax token id over the (possibly TP-sharded) vocab.
+
+    Returns ``[B, T]`` global token ids. With ``tp_group`` world > 1 the vocab is
+    sharded, so a distributed top-1 recovers the global argmax; otherwise a plain
+    local ``argmax``. No gradient.
+    """
+    local_logits = logits.to_local() if isinstance(logits, DTensor) else logits
+    tp_world = torch.distributed.get_world_size(tp_group) if tp_group is not None else 1
+    if tp_world > 1:
+        tp_rank = torch.distributed.get_rank(tp_group)
+        local_vocab_size = int(local_logits.shape[-1])
+        _, topk_global_idx = distributed_vocab_topk(
+            local_logits,
+            k=1,
+            tp_group=tp_group,
+            vocab_start_index=tp_rank * local_vocab_size,
+            vocab_end_index=(tp_rank + 1) * local_vocab_size,
+        )
+        return topk_global_idx.squeeze(-1)
+    return local_logits.argmax(dim=-1)
 
 
 def get_logprobs_from_vocab_parallel_logits(
