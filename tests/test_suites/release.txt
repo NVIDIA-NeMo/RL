@@ -32,6 +32,9 @@ tests/test_suites/llm/grpo-glm5.1-64n8g-megatron.sh
 # Deepseek-V3 on DAPO dataset
 tests/test_suites/llm/grpo-dapomath17k-dsv3-megatron.sh
 
+# Functional MiniMax M2.7 run (text-only task)
+tests/test_suites/llm/grpo-minimax-m27-dapo-8n8g-automodel.sh
+
 # GPT-OSS
 tests/test_suites/llm/grpo-gptoss-20b-8n8g-megatron.sh
 

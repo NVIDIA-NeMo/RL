@@ -511,8 +511,15 @@ class DTensorPolicyWorkerV2Impl(
                         grad_norm, device="cpu", dtype=torch.float32
                     )
 
-                    # Update parameters
+                    # Update parameters and the non-gradient MoE routing bias.
                     self.optimizer.step()
+                    update_moe_gate_bias = getattr(
+                        self.model,
+                        "update_moe_gate_bias",
+                        None,
+                    )
+                    if update_moe_gate_bias is not None:
+                        update_moe_gate_bias()
 
                 losses.append(torch.tensor(mb_losses).sum().item())
 
