@@ -44,7 +44,7 @@ class StalenessSampler:
         *,
         current_train_weight: int,
         min_prompt_groups: int,
-    ) -> KVBatchMeta | None:
+    ) -> tuple[KVBatchMeta | None, int]:
         """Return a concat of the first min_prompt_groups eligible groups, or None.
 
         Freshest-first (smallest lag, ties by insertion order) when
@@ -55,10 +55,11 @@ class StalenessSampler:
         Args:
             current_train_weight: Current trainer weight version. Eligibility window is
                 [current_train_weight - max_staleness_versions, current_train_weight].
-            min_prompt_groups: Minimum groups required; returns None below this.
+            min_prompt_groups: Minimum groups required; returns (None, 0) below this.
 
         Returns:
-            Concatenated KVBatchMeta covering min_prompt_groups groups, or None.
+            meta: Concatenated KVBatchMeta covering num_groups groups, or None.
+            num_groups: Number of prompt groups in meta; 0 when meta is None.
         """
         if min_prompt_groups < 1:
             raise ValueError(f"min_prompt_groups must be >= 1, got {min_prompt_groups}")
@@ -69,10 +70,8 @@ class StalenessSampler:
             for i, weight in enumerate(self._buffer.weight_list)
             if min_valid_version <= weight <= current_train_weight
         ]
-        if not valid_idxs:
-            return None
         if len(valid_idxs) < min_prompt_groups:
-            return None
+            return None, 0
 
         if self.sample_freshest_first:
             valid_idxs.sort(
@@ -87,7 +86,10 @@ class StalenessSampler:
 
         await self._buffer.remove(selected_idxs, remove_in_dp=False)
 
-        return selected_metas[0].concat(*selected_metas[1:])
+        return (
+            selected_metas[0].concat(*selected_metas[1:]),
+            len(selected_idxs),
+        )
 
     async def evict(self, *, current_train_weight: int) -> int:
         """Drop groups whose weight falls below the staleness window.

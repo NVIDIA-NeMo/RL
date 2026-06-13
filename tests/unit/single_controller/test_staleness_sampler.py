@@ -63,13 +63,15 @@ class TestStalenessSamplerSelect:
         buf.add("g0", weight=5)
         sampler = StalenessSampler(buf, max_staleness_versions=2)
 
-        assert _run(sampler.select(current_train_weight=5, min_prompt_groups=2)) is None
+        result = _run(sampler.select(current_train_weight=5, min_prompt_groups=2))
+        assert result == (None, 0)
 
     def test_select_returns_none_on_empty_buffer(self):
         buf = FakeBuffer()
         sampler = StalenessSampler(buf, max_staleness_versions=2)
 
-        assert _run(sampler.select(current_train_weight=5, min_prompt_groups=1)) is None
+        result = _run(sampler.select(current_train_weight=5, min_prompt_groups=1))
+        assert result == (None, 0)
 
     def test_select_filters_by_staleness_window(self):
         buf = FakeBuffer()
@@ -81,11 +83,14 @@ class TestStalenessSamplerSelect:
             buf, max_staleness_versions=2, sample_freshest_first=True
         )
 
-        selected = _run(sampler.select(current_train_weight=5, min_prompt_groups=2))
+        selected, num_groups = _run(
+            sampler.select(current_train_weight=5, min_prompt_groups=2)
+        )
 
         assert selected is not None
         # Freshest first → g2 (lag 0), g1 (lag 1)
         assert selected.sample_ids == ["g2_g0", "g1_g0"]
+        assert num_groups == 2
 
     def test_select_freshest_first_orders_by_lag(self):
         buf = FakeBuffer()
@@ -95,9 +100,12 @@ class TestStalenessSamplerSelect:
             buf, max_staleness_versions=5, sample_freshest_first=True
         )
 
-        selected = _run(sampler.select(current_train_weight=6, min_prompt_groups=2))
+        selected, num_groups = _run(
+            sampler.select(current_train_weight=6, min_prompt_groups=2)
+        )
         assert selected is not None
         assert selected.sample_ids == ["v5_g0", "v4_g0"]
+        assert num_groups == 2
 
     def test_select_fifo_orders_by_insertion(self):
         buf = FakeBuffer()
@@ -107,9 +115,12 @@ class TestStalenessSamplerSelect:
             buf, max_staleness_versions=5, sample_freshest_first=False
         )
 
-        selected = _run(sampler.select(current_train_weight=6, min_prompt_groups=2))
+        selected, num_groups = _run(
+            sampler.select(current_train_weight=6, min_prompt_groups=2)
+        )
         assert selected is not None
         assert selected.sample_ids == ["v3_g0", "v4_g0"]
+        assert num_groups == 2
 
     def test_select_skips_future_weight(self):
         buf = FakeBuffer()
@@ -117,10 +128,13 @@ class TestStalenessSamplerSelect:
         buf.add("future", weight=7)
         sampler = StalenessSampler(buf, max_staleness_versions=10)
 
-        selected = _run(sampler.select(current_train_weight=5, min_prompt_groups=1))
+        selected, num_groups = _run(
+            sampler.select(current_train_weight=5, min_prompt_groups=1)
+        )
 
         assert selected is not None
         assert selected.sample_ids == ["now_g0"]
+        assert num_groups == 1
 
     def test_select_concats_groups(self):
         buf = FakeBuffer()
@@ -128,7 +142,9 @@ class TestStalenessSamplerSelect:
         buf.add("g1", weight=5, group_size=2)
         sampler = StalenessSampler(buf, max_staleness_versions=0)
 
-        selected = _run(sampler.select(current_train_weight=5, min_prompt_groups=2))
+        selected, num_groups = _run(
+            sampler.select(current_train_weight=5, min_prompt_groups=2)
+        )
 
         assert selected is not None
         assert selected.sample_ids == [
@@ -137,6 +153,8 @@ class TestStalenessSamplerSelect:
             "g1_g0",
             "g1_g1",
         ]
+        # Two groups concatenated, each of size 2 → 4 sample_ids total.
+        assert num_groups == 2
 
     def test_select_strict_on_policy_requires_exact_version(self):
         buf = FakeBuffer()
@@ -145,12 +163,16 @@ class TestStalenessSamplerSelect:
         sampler = StalenessSampler(buf, max_staleness_versions=0)
 
         # 3 eligible (need weight=5), only have 2
-        assert _run(sampler.select(current_train_weight=5, min_prompt_groups=3)) is None
+        result = _run(sampler.select(current_train_weight=5, min_prompt_groups=3))
+        assert result == (None, 0)
 
         # Buffer still intact: select with min=3 returned None without dropping anything.
-        selected = _run(sampler.select(current_train_weight=5, min_prompt_groups=2))
+        selected, num_groups = _run(
+            sampler.select(current_train_weight=5, min_prompt_groups=2)
+        )
         assert selected is not None
         assert selected.sample_ids == ["g1_g0", "g2_g0"]
+        assert num_groups == 2
 
     def test_select_drops_returned_entries_from_buffer(self):
         buf = FakeBuffer()
@@ -158,16 +180,22 @@ class TestStalenessSamplerSelect:
             buf.add(f"g{i}", weight=w)
         sampler = StalenessSampler(buf, max_staleness_versions=0)
 
-        first = _run(sampler.select(current_train_weight=5, min_prompt_groups=1))
-        assert first is not None
-        assert first.sample_ids == ["g0_g0"]
+        first_meta, first_num_groups = _run(
+            sampler.select(current_train_weight=5, min_prompt_groups=1)
+        )
+        assert first_meta is not None
+        assert first_meta.sample_ids == ["g0_g0"]
+        assert first_num_groups == 1
         assert buf.weight_list == [5, 5]
         # remove_in_dp=False; DP rows kept for trainer.
         assert buf.remove_calls[-1][1] is False
 
-        second = _run(sampler.select(current_train_weight=5, min_prompt_groups=1))
-        assert second is not None
-        assert second.sample_ids == ["g1_g0"]
+        second_meta, second_num_groups = _run(
+            sampler.select(current_train_weight=5, min_prompt_groups=1)
+        )
+        assert second_meta is not None
+        assert second_meta.sample_ids == ["g1_g0"]
+        assert second_num_groups == 1
 
     def test_select_rejects_zero_min_prompt_groups(self):
         buf = FakeBuffer()

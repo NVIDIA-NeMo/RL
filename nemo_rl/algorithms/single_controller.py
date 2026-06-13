@@ -400,7 +400,7 @@ class SingleControllerActor:
 
                 # TODO @yukih: wait train pump merged, now always return min_prompt_groups_per_batch
                 # need to add a max_prompt_groups_per_batch
-                train_meta = await self._sampler.select(
+                train_meta, num_groups = await self._sampler.select(
                     current_train_weight=self._trainer_version,
                     min_prompt_groups=self._cfg.min_prompt_groups_per_batch,
                 )
@@ -409,7 +409,7 @@ class SingleControllerActor:
                     await asyncio.sleep(0.05)
                     continue
 
-                for _ in range(len(train_meta.tags)):
+                for _ in range(num_groups):
                     self._buffer_capacity.release()
 
                 if logprobs_required:
@@ -427,7 +427,7 @@ class SingleControllerActor:
                     step_id, train_meta
                 )
                 in_flight.append(future)
-                groups_dispatched += len(train_meta.tags)
+                groups_dispatched += num_groups
                 self._step_consumed_sample_ids.extend(train_meta.sample_ids)
 
                 in_flight = await self._reap_in_flight_nonblocking(in_flight)
@@ -451,9 +451,8 @@ class SingleControllerActor:
             )
 
             self._trainer_version = result["trainer_version"]
-            lag = self._trainer_version - min(
-                t["weight_version"] for t in train_meta.tags
-            )
+            min_sample_version = min(t["weight_version"] for t in train_meta.tags)  # type: ignore
+            lag = self._trainer_version - min_sample_version
             log.info(
                 "train step %d/%d  trainer_v=%d  lag=%d  batch_size=%d",
                 self._train_steps + 1,
