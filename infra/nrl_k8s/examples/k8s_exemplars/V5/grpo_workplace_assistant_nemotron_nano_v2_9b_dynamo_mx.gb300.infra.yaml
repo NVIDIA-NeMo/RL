@@ -12,9 +12,7 @@ _shared:
     kubernetes.io/arch: arm64
   workerNodeSelector: &worker_node_selector
     nvidia.com/gpu.product: NVIDIA-GB300
-  modelOptOverlay: &modelopt_overlay "/mnt/rl-workspace/${user:}/runtime-overlays/modelopt-min"
-  modelexpressOverlay: &modelexpress_overlay "/mnt/rl-workspace/${user:}/modelexpress/modelexpress_client/python"
-  sharedPythonPath: &shared_python_path "/mnt/rl-workspace/${user:}/runtime-overlays/modelopt-min:/mnt/rl-workspace/${user:}/modelexpress/modelexpress_client/python:/opt/nemo-rl:/mnt/rl-workspace/${user:}/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src:/mnt/rl-workspace/${user:}/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM"
+  sharedPythonPath: &shared_python_path "/opt/nemo-rl:/mnt/rl-workspace/${user:}/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src:/mnt/rl-workspace/${user:}/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM"
   userSecretEnvFrom: &user_secret_env_from
     - secretRef:
         name: ${user:}-secrets
@@ -22,16 +20,12 @@ _shared:
   headEnv: &shared_head_env
     - {name: HF_HOME,                       value: "/mnt/rl-workspace/${user:}/hf-cache"}
     - {name: PYTHONPATH,                    value: *shared_python_path}
-    - {name: NEMO_RL_MODELOPT_OVERLAY,      value: *modelopt_overlay}
-    - {name: NEMO_RL_MODELEXPRESS_OVERLAY,  value: *modelexpress_overlay}
     - {name: NCCL_DEBUG,                    value: WARN}
     - {name: RAY_memory_monitor_refresh_ms, value: "0"}
     - {name: TOKENIZERS_PARALLELISM,        value: "false"}
   workerEnv: &shared_worker_env
     - {name: HF_HOME,                       value: "/mnt/rl-workspace/${user:}/hf-cache"}
     - {name: PYTHONPATH,                    value: *shared_python_path}
-    - {name: NEMO_RL_MODELOPT_OVERLAY,      value: *modelopt_overlay}
-    - {name: NEMO_RL_MODELEXPRESS_OVERLAY,  value: *modelexpress_overlay}
     - {name: NCCL_DEBUG,                    value: WARN}
     - {name: RAY_memory_monitor_refresh_ms, value: "0"}
     - {name: TOKENIZERS_PARALLELISM,        value: "false"}
@@ -100,27 +94,9 @@ launch:
       exit 1
     fi
 
-    export MODELOPT_OVERLAY=/mnt/rl-workspace/${user:}/runtime-overlays/modelopt-min
-    export PYTHONPATH=\${MODELOPT_OVERLAY}:/mnt/rl-workspace/${user:}/modelexpress/modelexpress_client/python:/opt/nemo-rl:/mnt/rl-workspace/${user:}/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src:/mnt/rl-workspace/${user:}/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM
+    export PYTHONPATH=/opt/nemo-rl:/mnt/rl-workspace/${user:}/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src:/mnt/rl-workspace/${user:}/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM
     export MX_RDMA_NIC_PIN=auto
     export TOKENIZERS_PARALLELISM=false
-
-    if ! python - <<'PY'
-    from modelopt.torch.quantization.utils import is_quantized
-
-    print("modelopt:", is_quantized)
-    PY
-    then
-      echo "[overlay] installing minimal ModelOpt overlay at \${MODELOPT_OVERLAY}"
-      TMP_MODELOPT_OVERLAY=\${MODELOPT_OVERLAY}.\$\$
-      rm -rf "\${TMP_MODELOPT_OVERLAY}"
-      mkdir -p "$(dirname "\${MODELOPT_OVERLAY}")"
-      python -m pip install --target "\${TMP_MODELOPT_OVERLAY}" --no-deps \
-        nvidia-modelopt==0.44.0 \
-        "pulp<4.0"
-      rm -rf "\${MODELOPT_OVERLAY}"
-      mv "\${TMP_MODELOPT_OVERLAY}" "\${MODELOPT_OVERLAY}"
-    fi
 
     python - <<'PY'
     import importlib.util
@@ -139,7 +115,7 @@ launch:
         raise RuntimeError("transformer_engine.pytorch is required for the Megatron Bridge path")
     import transformer_engine.pytorch as te
 
-    print("modelexpress overlay:", modelexpress.__file__)
+    print("modelexpress:", modelexpress.__file__)
     print("megatron translator:", mt.__file__)
     print("modelopt is_quantized:", is_quantized)
     print("megatron.core:", megatron.core.__file__)

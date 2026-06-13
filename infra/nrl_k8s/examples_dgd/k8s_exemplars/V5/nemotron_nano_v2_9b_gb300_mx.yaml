@@ -1,8 +1,8 @@
 # DynamoGraphDeployment for nvidia/NVIDIA-Nemotron-Nano-9B-v2 on GB300, MX-enabled.
 #
-# Used by the V5 workplace-assistant k8s smoke. The Dynamo image is kept fixed
-# for now; startup overlays the merged Modelexpress branch and the Megatron MX
-# refit extension from the mounted NeMo-RL worktree.
+# Used by the V5 workplace-assistant k8s smoke. The Dynamo image includes the
+# Modelexpress client and Megatron MX refit receiver, so the worker starts
+# directly without copying source from the shared workspace.
 
 apiVersion: nvidia.com/v1alpha1
 kind: DynamoGraphDeployment
@@ -34,7 +34,7 @@ spec:
             persistentVolumeClaim:
               claimName: rl-workspace
         mainContainer:
-          image: jwillthomson/dynamo-arm-tokenize-endpoint-2cf73128
+          image: jwillthomson/dynamo-arm-tokenize-endpoint-7da82a91
           workingDir: /workspace
           volumeMounts:
             - mountPath: /mnt/rl-workspace
@@ -74,51 +74,15 @@ spec:
             persistentVolumeClaim:
               claimName: rl-workspace
         mainContainer:
-          image: jwillthomson/dynamo-arm-tokenize-endpoint-2cf73128
+          image: jwillthomson/dynamo-arm-tokenize-endpoint-7da82a91
           workingDir: /workspace
           volumeMounts:
             - mountPath: /mnt/rl-workspace
               name: rl-workspace
           command:
-            - /bin/bash
-            - -c
-            - |
-              set -euo pipefail
-              echo "[startup] dynamo.vllm nemotron-nano-v2-9b mx $(date -u +%FT%TZ)"
-
-              MX_SRC=/tmp/mx-src
-              rm -rf "$MX_SRC"
-              cp -a /mnt/rl-workspace/jothomson/modelexpress/modelexpress_client/python "$MX_SRC"
-              rm -rf "$MX_SRC"/modelexpress.egg-info "$MX_SRC"/build "$MX_SRC"/__pycache__
-              export PYTHONPATH="$MX_SRC:${PYTHONPATH:-}"
-
-              MXRX_SRC=/mnt/rl-workspace/jothomson/nemo-rl/infra/nrl_k8s/dynamo_mx/mx_refit_extension_megatron.py
-              DYN_SITE=$(python3 - <<'PY'
-              import importlib.util
-
-              spec = importlib.util.find_spec("dynamo")
-              if spec is None or spec.submodule_search_locations is None:
-                  raise RuntimeError("Could not locate installed dynamo package")
-              print(next(iter(spec.submodule_search_locations)))
-              PY
-              )
-              MXRX_DST="$DYN_SITE/vllm/mx_refit/extension.py"
-              mkdir -p "$(dirname "$MXRX_DST")"
-              cp "$MXRX_SRC" "$MXRX_DST"
-
-              python3 - <<'PY'
-              import modelexpress
-              from modelexpress.engines.vllm.registration import _PLUGIN_LOAD_FORMATS
-              import modelexpress.megatron_translator as mt
-              import dynamo.vllm.mx_refit.extension as mx_ext
-              print("modelexpress at", modelexpress.__file__)
-              print("_PLUGIN_LOAD_FORMATS =", _PLUGIN_LOAD_FORMATS)
-              print("megatron translator at", mt.__file__)
-              print("mx refit extension at", mx_ext.__file__)
-              PY
-
-              exec python3 -m dynamo.vllm "$@"
-            - --
+            - python3
+            - -m
+            - dynamo.vllm
           args:
             - --model
             - nvidia/NVIDIA-Nemotron-Nano-9B-v2
