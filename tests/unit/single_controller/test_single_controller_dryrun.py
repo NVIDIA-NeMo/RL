@@ -927,6 +927,7 @@ class TestStreamingTrainPump:
         max_inflight_prompts=8,
         max_weight_staleness_versions=1,
         batch_selection_strategy="staleness_window",
+        max_num_epochs=1,
     ):
         cfg = SingleControllerConfig(
             max_train_steps=max_train_steps,
@@ -937,6 +938,7 @@ class TestStreamingTrainPump:
             max_inflight_prompts=max_inflight_prompts,
             max_weight_staleness_versions=max_weight_staleness_versions,
             batch_selection_strategy=batch_selection_strategy,
+            max_num_epochs=max_num_epochs,
         )
 
         # SC expects a StatefulDataLoader, but the pump only iterates it
