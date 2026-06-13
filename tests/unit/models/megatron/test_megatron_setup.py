@@ -2279,3 +2279,167 @@ class TestDraftSetup:
             restored_chunk.draft_model.weight,
             owner_chunk.draft_model.weight,
         )
+
+
+@pytest.mark.mcore
+class TestForceSyncOptimizerFp32FromModel:
+    """Tests for _force_sync_optimizer_fp32_from_model.
+
+    Regression coverage for the optimizer_cpu_offload=True bug where the FP32
+    master copies kept by HybridDeviceOptimizer were left at random init after a
+    fine-tune checkpoint load, so the first optimizer step reverted the BF16
+    model to ~random. The helper must propagate the loaded BF16 model params to
+    all three FP32 levels (GPU shards, CPU clones, and the extra FP32 copy).
+    """
+
+    @staticmethod
+    def _patch_hdo_class(monkeypatch, hdo_cls):
+        """Make the in-function ``import HybridDeviceOptimizer`` resolve to hdo_cls.
+
+        The helper imports it lazily from
+        ``megatron.core.optimizer.cpu_offloading.hybrid_optimizer``; that module
+        may be absent (or fail to import) in a CPU-only unit-test env, so we
+        inject a stub module exposing the class we want isinstance() to match.
+        """
+        import sys
+        import types
+
+        pkg_path = "megatron.core.optimizer.cpu_offloading.hybrid_optimizer"
+        # Ensure every intermediate package exists so the dotted import resolves.
+        accum = ""
+        for part in pkg_path.split("."):
+            accum = f"{accum}.{part}" if accum else part
+            if accum not in sys.modules:
+                monkeypatch.setitem(sys.modules, accum, types.ModuleType(accum))
+        stub_mod = sys.modules[pkg_path]
+        monkeypatch.setattr(stub_mod, "HybridDeviceOptimizer", hdo_cls, raising=False)
+
+    def _make_distrib_opt(self, hdo_cls):
+        """Build a fake distributed optimizer wrapping a HybridDeviceOptimizer.
+
+        - Level 1: one BF16 model param (value 7.0) and a stale FP32 GPU shard
+          (value 0.0) covering the full param range.
+        - Level 2: a CPU clone (stale 0.0) mapped from a GPU param (value 9.0).
+        - Level 3: tracked via update_fp32_param_by_new_param() being called.
+        """
+        model_param = torch.full((4,), 7.0)
+        shard_main_param = torch.zeros(4)  # stale "random init"
+
+        gpu_param = torch.full((4,), 9.0)
+        cpu_clone = torch.zeros(4)  # stale "random init"
+
+        level3_called = {"count": 0}
+
+        class _HDO(hdo_cls):
+            def __init__(self):
+                self.gpu_params_map_cpu_copy = {gpu_param: cpu_clone}
+
+            def update_fp32_param_by_new_param(self):
+                level3_called["count"] += 1
+
+        hdo = _HDO()
+
+        class _DistribOpt:
+            def __init__(self):
+                self.optimizer = hdo
+                self.model_float16_groups = [[model_param]]
+                self.shard_fp32_from_float16_groups = [[shard_main_param]]
+
+            def _get_model_param_range_map(self, param):
+                return {"param": SimpleNamespace(start=0, end=4)}
+
+        return SimpleNamespace(
+            distrib_opt=_DistribOpt(),
+            model_param=model_param,
+            shard_main_param=shard_main_param,
+            gpu_param=gpu_param,
+            cpu_clone=cpu_clone,
+            level3_called=level3_called,
+        )
+
+    def test_syncs_all_three_fp32_levels(self, monkeypatch):
+        """All three FP32 copies must be refreshed from the BF16 model params."""
+        from nemo_rl.models.megatron import setup as setup_mod
+
+        class _HybridDeviceOptimizer:
+            pass
+
+        self._patch_hdo_class(monkeypatch, _HybridDeviceOptimizer)
+        fake = self._make_distrib_opt(_HybridDeviceOptimizer)
+
+        setup_mod._force_sync_optimizer_fp32_from_model(
+            fake.distrib_opt, model=MagicMock()
+        )
+
+        # Level 1: GPU FP32 shard now matches the BF16 model param (7.0, not 0.0).
+        torch.testing.assert_close(fake.shard_main_param, fake.model_param)
+        # Level 2: CPU clone now matches its GPU param (9.0, not 0.0).
+        torch.testing.assert_close(fake.cpu_clone, fake.gpu_param)
+        # Level 3: the extra FP32 working-copy refresh hook fired exactly once.
+        assert fake.level3_called["count"] == 1
+
+    def test_handles_chained_optimizers(self, monkeypatch):
+        """A ChainedOptimizer is walked sub-optimizer by sub-optimizer."""
+        from nemo_rl.models.megatron import setup as setup_mod
+
+        class _HybridDeviceOptimizer:
+            pass
+
+        self._patch_hdo_class(monkeypatch, _HybridDeviceOptimizer)
+        a = self._make_distrib_opt(_HybridDeviceOptimizer)
+        b = self._make_distrib_opt(_HybridDeviceOptimizer)
+
+        chained = SimpleNamespace(
+            chained_optimizers=[a.distrib_opt, b.distrib_opt]
+        )
+
+        setup_mod._force_sync_optimizer_fp32_from_model(chained, model=MagicMock())
+
+        for fake in (a, b):
+            torch.testing.assert_close(fake.shard_main_param, fake.model_param)
+            torch.testing.assert_close(fake.cpu_clone, fake.gpu_param)
+            assert fake.level3_called["count"] == 1
+
+    def test_noop_when_not_hybrid_device_optimizer(self, monkeypatch):
+        """A non-HybridDeviceOptimizer inner optimizer must be left untouched."""
+        from nemo_rl.models.megatron import setup as setup_mod
+
+        class _HybridDeviceOptimizer:
+            pass
+
+        # The real HDO class is patched in, but our optimizer is NOT an instance.
+        self._patch_hdo_class(monkeypatch, _HybridDeviceOptimizer)
+
+        shard_main_param = torch.zeros(4)
+        plain_opt = SimpleNamespace(
+            optimizer=object(),  # not a HybridDeviceOptimizer
+            model_float16_groups=[[torch.full((4,), 7.0)]],
+            shard_fp32_from_float16_groups=[[shard_main_param]],
+        )
+
+        setup_mod._force_sync_optimizer_fp32_from_model(plain_opt, model=MagicMock())
+
+        # Untouched: the helper short-circuits before touching the FP32 shard.
+        torch.testing.assert_close(shard_main_param, torch.zeros(4))
+
+    def test_noop_when_hybrid_optimizer_import_unavailable(self, monkeypatch):
+        """If HybridDeviceOptimizer can't be imported, the helper is a safe no-op."""
+        import sys
+
+        from nemo_rl.models.megatron import setup as setup_mod
+
+        # Force the lazy import to fail by removing the module and blocking reimport.
+        pkg_path = "megatron.core.optimizer.cpu_offloading.hybrid_optimizer"
+        monkeypatch.setitem(sys.modules, pkg_path, None)
+
+        shard_main_param = torch.zeros(4)
+        fake_opt = SimpleNamespace(
+            optimizer=object(),
+            model_float16_groups=[[torch.full((4,), 7.0)]],
+            shard_fp32_from_float16_groups=[[shard_main_param]],
+        )
+
+        # Must not raise even though the import fails.
+        setup_mod._force_sync_optimizer_fp32_from_model(fake_opt, model=MagicMock())
+
+        torch.testing.assert_close(shard_main_param, torch.zeros(4))
