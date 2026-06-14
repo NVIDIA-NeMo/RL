@@ -611,7 +611,6 @@ class TestSingleControllerDryRun:
             env_handles={},
             train_cluster=None,
             inference_cluster=None,
-            dataset=None,
             components=(
                 dataloader,
                 weight_sync,
@@ -1023,7 +1022,6 @@ class TestStreamingTrainPump:
             env_handles={},
             train_cluster=None,
             inference_cluster=None,
-            dataset=None,
             components=(dataloader, weight_sync, None, rollout_manager, tq_buffer),
         )
 

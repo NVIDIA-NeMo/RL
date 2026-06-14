@@ -34,7 +34,6 @@ from omegaconf import OmegaConf
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils import MasterConfig, setup_handle
 from nemo_rl.algorithms.utils import get_tokenizer
-from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import (
@@ -108,10 +107,6 @@ def main() -> None:
         has_refit_draft_weights=has_refit_draft_weights,
     )
 
-    dataset, val_dataset, task_to_env, _val_task_to_env = setup_response_data(
-        tokenizer, config.data, config.env
-    )
-
     (
         dp_client,
         gen_handle,
@@ -119,13 +114,7 @@ def main() -> None:
         env_handles,
         train_cluster,
         inference_cluster,
-    ) = setup_handle(
-        config,
-        tokenizer,
-        dataset,
-        val_dataset,
-        env_handles=task_to_env,
-    )
+    ) = setup_handle(config, tokenizer)
 
     print("🚀 Launching SingleControllerActor")
     sc = SingleControllerActor.remote(
@@ -136,7 +125,6 @@ def main() -> None:
         env_handles=env_handles,
         train_cluster=train_cluster,
         inference_cluster=inference_cluster,
-        dataset=dataset,
     )
     result = ray.get(sc.run.remote())
     print(f"SC run complete: {result}")

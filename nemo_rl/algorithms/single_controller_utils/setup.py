@@ -43,19 +43,27 @@ from nemo_rl.algorithms.grpo import (
 )
 from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
-from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.utils import create_env
 from nemo_rl.experience.rollout_manager import RolloutManager
 from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
+
+
+def _build_env_handles(
+    master_config: MasterConfig,
+) -> dict[str, EnvironmentInterface]:
+    """Build env_name -> EnvironmentInterface from master_config.env."""
+    return {
+        env_name: create_env(env_name=env_name, env_config=env_config)
+        for env_name, env_config in master_config.env.items()
+    }
 
 
 def setup_handle(
     master_config: MasterConfig,
     tokenizer: PreTrainedTokenizerBase,
-    dataset: AllTaskProcessedDataset | dict[str, AllTaskProcessedDataset],
-    val_dataset: Optional[AllTaskProcessedDataset],
     *,
     processor: Optional[AutoProcessor] = None,
     env_handles: Optional[dict[str, EnvironmentInterface]] = None,
@@ -79,14 +87,12 @@ def setup_handle(
 
     Args:
         master_config: Resolved SC MasterConfig.
-        tokenizer: Tokenizer used by the policy + by setup_response_data
-            for env_handles.
-        dataset: Train dataset.
-        val_dataset: Optional validation dataset.
+        tokenizer: Tokenizer used by the policy.
         processor: Optional ``AutoProcessor`` for VLM paths.
-        env_handles: Pre-built ``task_to_env`` mapping. If ``None``,
-            this function calls :func:`setup_response_data` to build it
-            from the data + env configs.
+        env_handles: Pre-built ``env_name -> EnvironmentInterface``
+            mapping. If ``None``, this function builds one by iterating
+            ``master_config.env`` and calling
+            :func:`nemo_rl.environments.utils.create_env`.
 
     Returns:
         Tuple ``(dp_client, gen_handle, trainer_handle, env_handles,
@@ -109,6 +115,13 @@ def setup_handle(
     def _make_tq_policy(**kwargs):
         return TQPolicy(**kwargs, dp_cfg=dp_cfg)
 
+    # grpo.setup loads the train dataset itself; setup_single_controller_component
+    # rebuilds the dataset from scratch when SC needs it, so we hand grpo.setup a
+    # throw-away dataset here just to satisfy its signature.
+    placeholder_dataset, placeholder_val_dataset = setup_response_data(
+        tokenizer, master_config.data
+    )
+
     # ``grpo.setup`` is typed against its own MasterConfig. We're not
     # subclassing it, so re-emit our config under that schema (the SC
     # specific fields ride along via ``extra="allow"`` and are ignored).
@@ -129,19 +142,15 @@ def setup_handle(
     ) = grpo_setup(
         grpo_mc,
         tokenizer,
-        dataset,
-        val_dataset,
+        placeholder_dataset,
+        placeholder_val_dataset,
         processor=processor,
         policy_factory=_make_tq_policy,
     )
     train_cluster, inference_cluster = clusters
 
     if env_handles is None:
-        _ds, _vds, env_handles, _val_env_handles = setup_response_data(
-            tokenizer,
-            master_config.data,
-            master_config.env,
-        )  # type: ignore[misc]
+        env_handles = _build_env_handles(master_config)
 
     # NOTE: trainer_handle should be a Ray actor wrapping TQPolicy (the
     # PolicyTrainerActor from PR #2692). Until that lands, callers that
@@ -168,7 +177,6 @@ def setup_single_controller_component(
     env_handles: dict[str, EnvironmentInterface],
     train_cluster: RayVirtualCluster,
     inference_cluster: RayVirtualCluster,
-    dataset: Any,
     partition_id: str = "rollout_data",
 ) -> tuple[
     StatefulDataLoader,
@@ -180,7 +188,9 @@ def setup_single_controller_component(
     """Build the five local components SC owns inside its actor process.
 
     All five are plain Python objects — they live in SC's process and are
-    not Ray actors. SC drives them directly via method calls.
+    not Ray actors. SC drives them directly via method calls. The train
+    dataset is loaded here (no-env path through
+    :func:`setup_response_data`) so it never crosses the Ray boundary.
 
     Args:
         master_config: SC MasterConfig.
@@ -191,11 +201,10 @@ def setup_single_controller_component(
         gen_handle: Generation backend (VllmGeneration / SGLangGeneration).
         trainer_handle: Trainer Ray actor handle (or the bare TQPolicy
             until PolicyTrainerActor lands).
-        env_handles: ``task_name -> EnvironmentInterface`` mapping.
+        env_handles: ``env_name -> EnvironmentInterface`` mapping.
         train_cluster: Training cluster — used by the weight synchronizer
             for non-colocated NCCL bring-up.
         inference_cluster: Inference cluster — same.
-        dataset: Train dataset, wrapped here in a ``StatefulDataLoader``.
         partition_id: TQ partition the rollout writer + sampler share.
 
     Returns:
@@ -215,6 +224,12 @@ def setup_single_controller_component(
             "single_controller_utils does not support "
             "data.use_multiple_dataloader=True yet."
         )
+
+    # Build the train dataset inside the actor; env_handles were already
+    # constructed driver-side and passed in, so we use the no-env form of
+    # setup_response_data.
+    dataset, _val_dataset = setup_response_data(tokenizer, data_config)
+
     dataloader = StatefulDataLoader(
         dataset,
         batch_size=grpo_config["num_prompts_per_step"],
