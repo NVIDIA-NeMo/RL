@@ -32,7 +32,6 @@ from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     calculate_kl,
-    get_gdpo_reward_component_keys,
     masked_mean,
     masked_var,
 )
