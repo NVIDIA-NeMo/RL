@@ -307,16 +307,21 @@ class SingleControllerActor:
         max_epochs = self._master_config.grpo["max_num_epochs"]
         epoch = 0
         while max_epochs is None or epoch < max_epochs:
-            for prompt in self._dataloader:
-                # check if buffer is full
-                await self._buffer_capacity.acquire()
-                # check if inflight rollouts is full
-                await sem.acquire()
-                # wait for rollout to be permitted
-                await self._rollout_permitted.wait()
+            for prompt_batch in self._dataloader:
+                for prompt_idx in range(prompt_batch.size):
+                    prompt: DatumSpec = {
+                        k: v[prompt_idx] for k, v in prompt_batch.items()
+                    }
 
-                # dispatch rollout
-                asyncio.create_task(_dispatch_one_prompt(prompt))
+                    # check if buffer is full
+                    await self._buffer_capacity.acquire()
+                    # check if inflight rollouts is full
+                    await sem.acquire()
+                    # wait for rollout to be permitted
+                    await self._rollout_permitted.wait()
+
+                    # dispatch rollout
+                    asyncio.create_task(_dispatch_one_prompt(prompt))
             epoch += 1
 
         log.info("rollout_pump: completed %d epoch(s)", epoch)
