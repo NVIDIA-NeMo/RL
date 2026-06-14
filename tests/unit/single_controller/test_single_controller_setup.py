@@ -31,6 +31,7 @@ def _make_master_config(
     use_multiple_dataloader: bool = False,
     colocated: bool = True,
     backend: str = "vllm",
+    env: dict | None = None,
 ) -> MasterConfig:
     """Build a partially-populated MasterConfig for unit tests.
 
@@ -45,6 +46,7 @@ def _make_master_config(
             "use_multiple_dataloader": use_multiple_dataloader,
             "shuffle": False,
             "num_workers": 0,
+            "train": [{"env_name": "math"}],
         },
         grpo={
             "num_prompts_per_step": 4,
@@ -58,7 +60,7 @@ def _make_master_config(
                 "colocated": {"enabled": colocated, "resources": {}},
             },
         },
-        env={},
+        env=env if env is not None else {},
     )
 
 
@@ -68,7 +70,7 @@ class TestSetupHandle:
     def test_raises_when_data_plane_disabled(self):
         mc = _make_master_config(dp_enabled=False)
         with pytest.raises(ValueError, match="data_plane.enabled=True"):
-            setup_handle(mc, MagicMock(), object(), None)
+            setup_handle(mc, MagicMock())
 
     def test_passes_dp_cfg_to_tq_policy_and_returns_six_tuple(self):
         """setup_handle wires grpo.setup with a TQPolicy factory and returns the 6-tuple."""
@@ -77,33 +79,33 @@ class TestSetupHandle:
         policy.dp_client = MagicMock(name="dp_client_handle")
         policy_generation = MagicMock(name="policy_generation")
         train_cluster, inference_cluster = MagicMock(), MagicMock()
-        loss_fn = MagicMock(name="loss_fn")
 
         fake_grpo_setup_return = (
-            policy,                # policy
-            policy_generation,     # policy_generation
-            None,                  # nemo_gym
+            policy,
+            policy_generation,
+            None,
             (train_cluster, inference_cluster),
-            MagicMock(),           # dataloader (ignored — SC rebuilds it)
-            None,                  # val_dataloader
-            loss_fn,
-            MagicMock(),           # logger
-            MagicMock(),           # checkpointer
-            {},                    # grpo_save_state
-            mc,                    # master_config
+            MagicMock(),
+            None,
+            MagicMock(),
+            MagicMock(),
+            MagicMock(),
+            {},
+            mc,
         )
         env_handles = {"math": MagicMock(name="math_env")}
 
-        with patch.object(
-            setup_module, "grpo_setup", return_value=fake_grpo_setup_return
-        ) as mock_grpo_setup:
-            result = setup_handle(
-                mc,
-                tokenizer=MagicMock(),
-                dataset=object(),
-                val_dataset=None,
-                env_handles=env_handles,
-            )
+        with (
+            patch.object(
+                setup_module, "grpo_setup", return_value=fake_grpo_setup_return
+            ) as mock_grpo_setup,
+            patch.object(
+                setup_module,
+                "setup_response_data",
+                return_value=(object(), None),
+            ),
+        ):
+            result = setup_handle(mc, MagicMock(), env_handles=env_handles)
 
         assert mock_grpo_setup.call_count == 1
         _, call_kwargs = mock_grpo_setup.call_args
@@ -117,12 +119,13 @@ class TestSetupHandle:
         assert tc is train_cluster
         assert ic is inference_cluster
 
-    def test_builds_env_handles_when_not_passed(self):
-        """When env_handles is None, setup_response_data is invoked."""
-        mc = _make_master_config(dp_enabled=True)
+    def test_env_handles_built_from_config_when_not_passed(self):
+        """When env_handles is None, setup_handle iterates config.env + create_env."""
+        math_env_cfg = {"some": "value"}
+        mc = _make_master_config(env={"math": math_env_cfg})
         policy = MagicMock()
         policy.dp_client = MagicMock()
-        derived_env_handles = {"derived": MagicMock()}
+        fake_math_env = MagicMock(name="math_env")
 
         fake_grpo_setup_return = (
             policy,
@@ -140,22 +143,25 @@ class TestSetupHandle:
 
         with (
             patch.object(
-                setup_module,
-                "grpo_setup",
-                return_value=fake_grpo_setup_return,
+                setup_module, "grpo_setup", return_value=fake_grpo_setup_return
             ),
             patch.object(
                 setup_module,
                 "setup_response_data",
-                return_value=(object(), None, derived_env_handles, {}),
-            ) as mock_setup_data,
+                return_value=(object(), None),
+            ),
+            patch.object(
+                setup_module, "create_env", return_value=fake_math_env
+            ) as mock_create_env,
         ):
             _, _, _, returned_env_handles, _, _ = setup_handle(
-                mc, MagicMock(), object(), None, env_handles=None
+                mc, MagicMock(), env_handles=None
             )
 
-        mock_setup_data.assert_called_once()
-        assert returned_env_handles is derived_env_handles
+        mock_create_env.assert_called_once_with(
+            env_name="math", env_config=math_env_cfg
+        )
+        assert returned_env_handles == {"math": fake_math_env}
 
 
 def _component_kwargs(*, dp_client=None, master_config=None, **overrides):
@@ -167,7 +173,6 @@ def _component_kwargs(*, dp_client=None, master_config=None, **overrides):
         env_handles={},
         train_cluster=MagicMock(),
         inference_cluster=MagicMock(),
-        dataset=[1, 2, 3, 4, 5, 6, 7, 8],
     )
     kwargs.update(overrides)
     return master_config or _make_master_config(), kwargs
@@ -180,10 +185,17 @@ class TestSetupSingleControllerComponent:
         mc, kwargs = _component_kwargs()
         tokenizer = MagicMock(pad_token_id=0)
 
-        with patch.object(
-            setup_module,
-            "create_weight_synchronizer",
-            return_value=MagicMock(name="weight_sync"),
+        with (
+            patch.object(
+                setup_module,
+                "create_weight_synchronizer",
+                return_value=MagicMock(name="weight_sync"),
+            ),
+            patch.object(
+                setup_module,
+                "setup_response_data",
+                return_value=([1, 2, 3, 4, 5, 6, 7, 8], None),
+            ),
         ):
             result = setup_single_controller_component(mc, tokenizer, **kwargs)
 
@@ -223,11 +235,18 @@ class TestSetupSingleControllerComponent:
         _, kwargs = _component_kwargs(master_config=mc)
         tokenizer = MagicMock(pad_token_id=0)
 
-        with patch.object(
-            setup_module,
-            "create_weight_synchronizer",
-            return_value=MagicMock(),
-        ) as mock_factory:
+        with (
+            patch.object(
+                setup_module,
+                "create_weight_synchronizer",
+                return_value=MagicMock(),
+            ) as mock_factory,
+            patch.object(
+                setup_module,
+                "setup_response_data",
+                return_value=([1, 2, 3, 4], None),
+            ),
+        ):
             setup_single_controller_component(mc, tokenizer, **kwargs)
 
         _, factory_kwargs = mock_factory.call_args
@@ -242,10 +261,17 @@ class TestSetupSingleControllerComponent:
         mc, kwargs = _component_kwargs()
         tokenizer = MagicMock(pad_token_id=7)
 
-        with patch.object(
-            setup_module,
-            "create_weight_synchronizer",
-            return_value=MagicMock(),
+        with (
+            patch.object(
+                setup_module,
+                "create_weight_synchronizer",
+                return_value=MagicMock(),
+            ),
+            patch.object(
+                setup_module,
+                "setup_response_data",
+                return_value=([1, 2, 3, 4], None),
+            ),
         ):
             _, _, _, _, tq_buffer = setup_single_controller_component(
                 mc, tokenizer, partition_id="custom_partition", **kwargs

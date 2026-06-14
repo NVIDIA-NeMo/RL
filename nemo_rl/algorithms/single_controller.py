@@ -73,7 +73,6 @@ class SingleControllerActor:
         env_handles: dict[str, EnvironmentInterface],
         train_cluster: Any,
         inference_cluster: Any,
-        dataset: Any,
         components: Optional[tuple] = None,
     ) -> None:
         """Initialize the SingleController actor.
@@ -83,10 +82,9 @@ class SingleControllerActor:
             dp_client: DataPlane client handle.
             gen_handle: Generation backend.
             trainer_handle: Trainer Ray actor handle.
-            env_handles: ``task_name -> EnvironmentInterface`` mapping.
+            env_handles: ``env_name -> EnvironmentInterface`` mapping.
             train_cluster: Training Ray cluster (weight-sync rendezvous).
             inference_cluster: Inference Ray cluster.
-            dataset: Train dataset wrapped into a StatefulDataLoader here.
             components: Test-only escape hatch — a tuple
                 ``(dataloader, weight_synchronizer, advantage_estimator,
                 rollout_manager, tq_buffer)`` that bypasses the in-actor
@@ -119,7 +117,6 @@ class SingleControllerActor:
                 env_handles=env_handles,
                 train_cluster=train_cluster,
                 inference_cluster=inference_cluster,
-                dataset=dataset,
                 partition_id=master_config.partition_id,
             )
 

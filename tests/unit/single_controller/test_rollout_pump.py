@@ -223,7 +223,6 @@ def test_rollout_pump_writes_expected_tq_data(
         env_handles=env_handles,
         train_cluster=None,
         inference_cluster=None,
-        dataset=None,
         components=(dataloader, object(), None, rollout_manager, tq_buffer),
     )
 
