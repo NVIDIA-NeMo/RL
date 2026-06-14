@@ -215,7 +215,15 @@ def test_rollout_pump_writes_expected_tq_data(
         env_handles=env_handles,
         train_cluster=None,
         inference_cluster=None,
-        components=(dp_adapter, dataloader, object(), None, rollout_manager, tq_buffer),
+        components=(
+            dp_adapter,
+            dataloader,
+            object(),
+            None,
+            None,
+            rollout_manager,
+            tq_buffer,
+        ),
     )
 
     vllm_generation.prepare_for_generation()

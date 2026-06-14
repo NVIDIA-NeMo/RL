@@ -44,7 +44,7 @@ grpo:
   malformed_thinking_advantage: null
 
   async_grpo:
-    enabled: false
+    enabled: true
     max_trajectory_age_steps: 1
     in_flight_weight_updates: false
     recompute_kv_cache_after_weight_updates: false
@@ -259,7 +259,7 @@ policy:
       unified_memory_level: 0
       max_tokens: 16384
     vllm_cfg:
-      async_engine: false
+      async_engine: true
       precision: ${policy.precision}
       kv_cache_dtype: "auto"
       tensor_parallel_size: 1

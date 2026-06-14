@@ -18,8 +18,8 @@ Two factories split along the SC actor boundary:
   - setup_handle: driver-side. Builds gen_handle, trainer_handle,
     env_handles plus the two Ray clusters.
   - setup_single_controller_component: in-actor. Builds dp_client,
-    dataloader, weight_synchronizer, advantage_estimator, rollout_manager,
-    tq_buffer.
+    dataloader, weight_synchronizer, advantage_estimator, loss_fn,
+    rollout_manager, tq_buffer.
 """
 
 from __future__ import annotations
@@ -33,6 +33,8 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms.grpo import _create_advantage_estimator
+from nemo_rl.algorithms.loss import ClippedPGLossFn
+from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.utils import setup_response_data
@@ -43,7 +45,7 @@ from nemo_rl.environments.utils import create_env
 from nemo_rl.experience.rollout_manager import RolloutManager
 from nemo_rl.models.generation.sglang import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
-from nemo_rl.models.policy.tq_policy import TQPolicy
+from nemo_rl.models.policy.tq_policy import TQPolicyActor
 from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
 
 
@@ -159,7 +161,7 @@ def _build_trainer(
     """Build the TQ-mediated trainer (driver-side TQPolicy)."""
     loss_config = master_config.loss_fn
     init_reference_model = loss_config.reference_policy_kl_penalty > 0
-    return TQPolicy(
+    return TQPolicyActor.remote(
         cluster=train_cluster,
         config=master_config.policy,
         tokenizer=tokenizer,
@@ -234,15 +236,10 @@ def setup_handle(
 
     if env_handles is None:
         env_handles = _build_env_handles(master_config)
-
-    # NOTE: trainer_handle should be a Ray actor wrapping TQPolicy (the
-    # PolicyTrainerActor from PR #2692). Until that lands, callers that
-    # invoke SC.run() will hit AttributeError on `.remote(...)`; surface
-    # the policy here so the rest of the wiring can be inspected.
-    trainer_handle: Any = policy
+    
     return (
         generation,
-        trainer_handle,
+        policy,
         env_handles,
         train_cluster,
         inference_cluster,
@@ -281,10 +278,11 @@ def setup_single_controller_component(
     StatefulDataLoader,
     WeightSynchronizer,
     Any,  # advantage_estimator
+    LossFunction,
     RolloutManager,
     TQReplayBuffer,
 ]:
-    """Build the six local components SC owns inside its actor process.
+    """Build the seven local components SC owns inside its actor process.
 
     One connect-only DataPlane client is built here and shared by every
     in-process consumer (the TQReplayBuffer, and SC's _call_dp helper) —
@@ -306,7 +304,7 @@ def setup_single_controller_component(
 
     Returns:
         (dp_client, dataloader, weight_synchronizer, advantage_estimator,
-        rollout_manager, tq_buffer).
+        loss_fn, rollout_manager, tq_buffer).
     """
     data_config = master_config.data
     grpo_config = master_config.grpo
@@ -362,6 +360,9 @@ def setup_single_controller_component(
     # ── advantage estimator ────────────────────────────────────────────
     advantage_estimator = _create_advantage_estimator(master_config)
 
+    # ── loss fn ────────────────────────────────────────────────────────
+    loss_fn: LossFunction = ClippedPGLossFn(master_config.loss_fn)
+
     # ── TQ buffer + rollout manager ────────────────────────────────────
     pad_id = int(getattr(tokenizer, "pad_token_id", 0) or 0)
     tq_buffer = TQReplayBuffer(
@@ -386,6 +387,7 @@ def setup_single_controller_component(
         dataloader,
         weight_synchronizer,
         advantage_estimator,
+        loss_fn,
         rollout_manager,
         tq_buffer,
     )

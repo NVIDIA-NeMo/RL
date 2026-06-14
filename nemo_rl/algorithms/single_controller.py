@@ -87,10 +87,10 @@ class SingleControllerActor:
             env_handles: env_name -> EnvironmentInterface mapping.
             train_cluster: Training Ray cluster (weight-sync rendezvous).
             inference_cluster: Inference Ray cluster.
-            components: Test-only escape hatch — a 6-tuple (dp_client,
+            components: Test-only escape hatch — a 7-tuple (dp_client,
                 dataloader, weight_synchronizer, advantage_estimator,
-                rollout_manager, tq_buffer) that bypasses the in-actor
-                setup.
+                loss_fn, rollout_manager, tq_buffer) that bypasses the
+                in-actor setup.
         """
         import logging as _logging
 
@@ -131,6 +131,7 @@ class SingleControllerActor:
             dataloader,
             weight_synchronizer,
             advantage_estimator,
+            loss_fn,
             rollout_manager,
             tq_buffer,
         ) = components
@@ -143,6 +144,7 @@ class SingleControllerActor:
         self._dataloader = dataloader
         self._weight_synchronizer = weight_synchronizer
         self._advantage_estimator = advantage_estimator
+        self._loss_fn = loss_fn
         self._buffer = tq_buffer
         self._rollout_manager = rollout_manager
         # When tests pass rollout_manager + tq_buffer as separate
@@ -390,7 +392,11 @@ class SingleControllerActor:
                 train_meta = await self._advantage_pump(train_meta)
 
                 if not step_open:
-                    await self._ray_get(self._trainer.begin_train_step.remote(step_id))
+                    await self._ray_get(
+                        self._trainer.begin_train_step.remote(
+                            step_id, loss_fn=self._loss_fn
+                        )
+                    )
                     step_open = True
 
                 future = self._trainer.train_microbatch_from_meta.remote(
