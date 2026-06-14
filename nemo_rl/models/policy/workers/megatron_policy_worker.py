@@ -37,10 +37,6 @@ from megatron.core.distributed import DistributedDataParallel
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallel as custom_FSDP,
 )
-from megatron.core.inference.config import InferenceConfig
-from megatron.core.inference.text_generation_controllers.text_generation_controller import (
-    TextGenerationController,
-)
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_model_config
@@ -51,14 +47,13 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
-from nemo_rl.models.generation.interfaces import (
-    GenerationDatumSpec,
-    GenerationOutputSpec,
-    verify_right_padding,
+from nemo_rl.models.generation.interfaces import GenerationDatumSpec
+from nemo_rl.models.generation.megatron.megatron_worker import (
+    MegatronGenerationMixin,
+    MegatronGenerationRefitMixin,
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.megatron.common import get_moe_metrics
-from nemo_rl.models.megatron.config import MegatronGenerationConfig
 from nemo_rl.models.megatron.data import (
     get_microbatch_iterator,
     process_global_batch,
@@ -119,7 +114,11 @@ def _model_self_packs_for_cp(model: Any) -> bool:
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
 class MegatronPolicyWorkerImpl(
-    TQWorkerMixin, AbstractPolicyWorker, ColocatablePolicyInterface
+    MegatronGenerationMixin,
+    MegatronGenerationRefitMixin,
+    TQWorkerMixin,
+    AbstractPolicyWorker,
+    ColocatablePolicyInterface,
 ):
     def __repr__(self):
         """Customizes the actor's prefix in the Ray logs.
@@ -191,6 +190,31 @@ class MegatronPolicyWorkerImpl(
         self._replica_group_cache = groups[my_dp_rank]
         return self._replica_group_cache
 
+    @staticmethod
+    def configure_worker(
+        num_gpus: int | float,
+        bundle_indices: Optional[tuple[int, list[int]]] = None,
+    ) -> tuple[dict[str, Any], dict[str, str], dict[str, Any]]:
+        """Worker-controlled Ray actor configuration.
+
+        Ensures that communication via NVLS functions correctly.
+
+        Args:
+            num_gpus: Original GPU allocation for this worker based on the placement group
+            bundle_indices: Tuple of (node_idx, local_bundle_indices) for this server
+
+        Returns:
+            tuple with complete worker configuration:
+              - 'resources': Resource allocation (e.g., num_gpus)
+              - 'env_vars': Environment variables for this worker
+              - 'init_kwargs': Parameters to pass to __init__ of the worker
+        """
+        del num_gpus, bundle_indices  # Megatron policy workers are always parallel.
+        resources: dict[str, Any] = {"num_gpus": 0}
+        env_vars: dict[str, str] = {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}
+        init_kwargs: dict[str, Any] = {}
+        return resources, env_vars, init_kwargs
+
     def __init__(
         self,
         config: PolicyConfig,
@@ -204,9 +228,17 @@ class MegatronPolicyWorkerImpl(
         **kwargs: Any,
     ):
         """Initialize the MegatronPolicyWorker."""
+        # NVML-based and guarded on torch.cuda.is_initialized(), so this does
+        # not initialize a CUDA context ahead of the set_device below.
         log_gpu_memory_diagnostics(
             label="init_start", worker_type="MegatronPolicyWorker"
         )
+
+        # Must be the first CUDA-touching call in this process.
+        # With `RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1` (set by `configure_worker()`),
+        # all node GPUs are visible to this actor; LOCAL_RANK selects ours.
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
 
         # Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files
         apply_transformer_engine_patch()
@@ -220,6 +252,12 @@ class MegatronPolicyWorkerImpl(
         setup_distributed()
         log_gpu_memory_diagnostics(
             label="after_nccl_init", worker_type="MegatronPolicyWorker"
+        )
+
+        # Defensive assert to ensure to ensure `local_rank` setter worked correctly.
+        assert torch.cuda.current_device() == local_rank, (
+            f"device drift after setup_distributed: current_device="
+            f"{torch.cuda.current_device()}, LOCAL_RANK={local_rank}."
         )
 
         # Step 2: Validate and setup model paths
@@ -249,6 +287,14 @@ class MegatronPolicyWorkerImpl(
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         # Step 3: Setup model configuration
+        # Training workers cannot use inference_optimized transformer spec.
+        if init_optimizer:
+            assert (
+                config["megatron_cfg"].get("transformer_impl") != "inference_optimized"
+            ), (
+                "transformer_impl=inference_optimized must not be set on training workers. "
+                "Use policy.generation.mcore_generation_config.transformer_impl=inference_optimized instead."
+            )
         runtime_config = validate_and_set_config(
             config,
             self.rank,
@@ -265,8 +311,8 @@ class MegatronPolicyWorkerImpl(
             runtime_config.offload_optimizer_for_logprob
         )
         self.is_generation_colocated = runtime_config.is_generation_colocated
-        self.sampling_params = runtime_config.sampling_params
         self.final_padded_vocab_size = runtime_config.final_padded_vocab_size
+        self.sampling_params = runtime_config.sampling_params
 
         self.defer_fp32_logits = self.cfg["megatron_cfg"].get(
             "defer_fp32_logits", None
@@ -274,6 +320,14 @@ class MegatronPolicyWorkerImpl(
 
         # Store FP8 config for later use
         self.fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
+
+        # Full-iteration CUDA graphs cannot be interrupted, so disable the
+        # NaN-in-loss check that would otherwise require breaking out of the graph.
+        if self.megatron_cfg.model.cuda_graph_impl == "full_iteration":
+            warnings.warn(
+                "Disabling check_for_nan_in_loss: full-iteration CUDA graph cannot be interrupted."
+            )
+            self.megatron_cfg.rerun_state_machine.check_for_nan_in_loss = False
 
         # Validate configuration
         self.megatron_cfg.validate()
@@ -353,6 +407,8 @@ class MegatronPolicyWorkerImpl(
 
         ## used for streaming update inference engine weights
         self._held_gather_buffer = None
+
+        self._init_inference_engine_state()
 
         log_gpu_memory_diagnostics(
             label="init_complete", worker_type="MegatronPolicyWorker"
@@ -848,7 +904,9 @@ class MegatronPolicyWorkerImpl(
                     item = item.detach().to(device="cpu", non_blocking=True, copy=True)
                 model_state_dict[name] = item
 
-            # Swap reference model state_dict into self.model (reference weights + optional FP8 extra_state)
+            # Swap reference state into self.model. Use _apply_state_dict_to_model
+            # (rather than load_state_dict) so FP8 _extra_state with mismatched shape
+            # is routed through set_extra_state() correctly.
             self._apply_state_dict_to_model(
                 self.reference_state_dict,
                 raise_if_key_missing=True,
@@ -985,214 +1043,6 @@ class MegatronPolicyWorkerImpl(
             [{"topk_logits": topk_logits.cpu(), "topk_indices": topk_indices.cpu()}]
         )
 
-    @wrap_with_nvtx_name("megatron_policy_worker/generate")
-    def generate(
-        self, *, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
-    ) -> BatchedDataDict[GenerationOutputSpec]:
-        """Generate a batch of data using huggingface framework generation.
-
-        Args:
-            data: BatchedDataDict containing input_ids and input_lengths tensors
-        Returns:
-            BatchedDataDict conforming to GenerationOutputSpec:
-                - ``output_ids``: input + generated token IDs
-                - ``logprobs``: Log probabilities for each token
-                - ``generation_lengths``: Lengths of each response
-        """
-        # 512 bATCH SIZE (200 tokens)
-        no_grad = torch.no_grad()
-        no_grad.__enter__()
-        self.model.config.flash_decode = False
-        if self.should_disable_forward_pre_hook:
-            self.model = self.move_model(
-                self.model, "cuda", move_params=True, move_grads=False
-            )
-        # Verify input is right padded
-        assert isinstance(data, BatchedDataDict), (
-            f"data must be a BatchedDataDict, got type: {type(data)}"
-        )
-        assert "input_ids" in data and "input_lengths" in data, (
-            f"input_ids and input_lengths must be present in the BatchedDataDict, got keys: {data.keys()}"
-        )
-        is_right_padded, error_msg = verify_right_padding(
-            data, pad_value=self.tokenizer.pad_token_id
-        )
-        if not is_right_padded:
-            warnings.warn(
-                f"Input to Megatron Generation worker is not properly right-padded: {error_msg}"
-            )
-
-        mcore_generation_config = cast(
-            MegatronGenerationConfig, self.cfg["generation"]["mcore_generation_config"]
-        )
-
-        from megatron.core.inference.contexts.dynamic_context import (
-            DynamicInferenceContext,
-        )
-        from megatron.core.inference.engines.dynamic_engine import (
-            DynamicInferenceEngine,
-        )
-        from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
-            GPTInferenceWrapper,
-        )
-        from megatron.core.inference.sampling_params import SamplingParams
-        from megatron.core.inference.utils import InferenceMode
-
-        model_config = self.model.config
-        model_config.cuda_graph_impl = "local"
-
-        local_rank = torch.cuda.current_device()
-        num_gpus_per_node = torch.cuda.device_count()
-        node_idx = self.rank // num_gpus_per_node if num_gpus_per_node > 0 else 0
-        model_config.inference_sampling_seed = (node_idx * 1024) + local_rank
-
-        inference_config = InferenceConfig(
-            max_sequence_length=self.cfg["generation"]["max_new_tokens"],
-            buffer_size_gb=mcore_generation_config["buffer_size_gb"],
-            num_cuda_graphs=mcore_generation_config["num_cuda_graphs"],
-            block_size_tokens=mcore_generation_config["block_size_tokens"],
-            use_cuda_graphs_for_non_decode_steps=mcore_generation_config[
-                "use_cuda_graphs_for_non_decode_steps"
-            ],
-            enable_chunked_prefill=mcore_generation_config["enable_chunked_prefill"],
-            unified_memory_level=mcore_generation_config["unified_memory_level"],
-            max_tokens=mcore_generation_config["max_tokens"],
-            materialize_only_last_token_logits=False,
-            use_flashinfer_fused_rope=False,
-        )
-
-        dynamic_context = DynamicInferenceContext(model_config, inference_config)
-        inference_wrapped_model = GPTInferenceWrapper(self.model, dynamic_context)
-
-        inference_wrapped_model.prep_model_for_inference()
-        # Set pipeline parallel flag
-        inference_wrapped_model.model_is_pipeline_parallel = (
-            self.cfg["megatron_cfg"]["pipeline_model_parallel_size"] > 1
-        )
-
-        text_generation_controller = TextGenerationController(
-            inference_wrapped_model=inference_wrapped_model,
-            tokenizer=self.megatron_tokenizer,
-        )
-
-        with InferenceMode.active():
-            dynamic_engine = DynamicInferenceEngine(
-                text_generation_controller,
-                dynamic_context,
-            )
-
-            # Handle None values for top_k - convert to integer as required by Megatron
-            top_k_cfg = self.cfg["generation"]["top_k"]
-            top_k_val = (
-                1 if greedy else (int(top_k_cfg) if top_k_cfg is not None else 0)
-            )
-
-            top_p_cfg = self.cfg["generation"]["top_p"]
-            top_p_val = (
-                0.0 if greedy else (float(top_p_cfg) if top_p_cfg is not None else 0.0)
-            )
-
-            # New API: SamplingParams now includes termination_id and uses num_tokens_total
-            sampling_params = SamplingParams(
-                temperature=self.cfg["generation"]["temperature"] if not greedy else 0,
-                top_k=top_k_val,
-                top_p=top_p_val,
-                skip_prompt_log_probs=False,
-                return_log_probs=True,
-                num_tokens_total=self.cfg["generation"]["max_new_tokens"],
-                num_tokens_to_generate=None,
-                termination_id=self.megatron_tokenizer.eod,
-            )
-
-            input_ids = data["input_ids"]
-            prompt_tokens_tensor = input_ids.cuda()
-            prompt_lengths_tensor = data["input_lengths"]
-            request_id = 0
-
-            # New API: add_request now takes sampling_params as a parameter
-            for p, prompt_len in zip(
-                prompt_tokens_tensor, prompt_lengths_tensor, strict=True
-            ):
-                dynamic_engine.add_request(
-                    request_id,
-                    p[:prompt_len],
-                    sampling_params=sampling_params,
-                )
-                request_id += 1
-
-            result = []
-            while dynamic_engine.has_unfinished_requests():
-                result_step = dynamic_engine.step_modern()
-                result.extend(result_step["finished_request_records"])
-
-        # Sort results by request_id to maintain original batch order
-        result.sort(key=lambda x: x.request_id)
-
-        out = {
-            "tokens": [
-                x.requests[0].prompt_tokens.tolist() + x.requests[0].generated_tokens
-                for x in result
-            ],
-            "logprobs": [
-                x.requests[0].prompt_log_probs + x.requests[0].generated_log_probs
-                for x in result
-            ],
-        }
-
-        input_lengths = data["input_lengths"]
-        # pad the out "tokens" and "logprobs" and make them into tensors from lists
-        batch_size = data["input_ids"].size(0)
-        max_gen_seq_len = max([len(x.requests[0].generated_tokens) for x in result])
-        padded_input_length = input_ids.size(1)
-
-        max_seq_len = padded_input_length + max_gen_seq_len
-        # Create padded tensors for tokens and logprobs
-        output_ids_padded = torch.full(
-            (batch_size, max_seq_len),
-            self.tokenizer.pad_token_id,
-            dtype=torch.long,
-            device=data["input_ids"].device,
-        )
-
-        logprobs_padded = torch.zeros(
-            (batch_size, max_seq_len),
-            dtype=torch.float,
-            device=data["input_ids"].device,
-        )
-
-        # Fill in the padded tensors with actual values
-        generation_lengths = torch.zeros(
-            batch_size, dtype=torch.long, device=data["input_ids"].device
-        )
-        unpadded_sequence_lengths = torch.zeros(
-            batch_size, dtype=torch.long, device=data["input_ids"].device
-        )
-        for i in range(batch_size):
-            seq_len = len(out["tokens"][i])
-            output_ids_padded[i, :seq_len] = torch.tensor(
-                out["tokens"][i], dtype=torch.long, device=data["input_ids"].device
-            )
-            generation_lengths[i] = seq_len - input_lengths[i].item()
-            unpadded_sequence_lengths[i] = seq_len
-            logprob_len = len(out["logprobs"][i])
-            logprobs_padded[i, 1 : logprob_len + 1] = torch.tensor(
-                out["logprobs"][i],
-                dtype=torch.float,
-                device=data["input_ids"].device,
-            )
-
-        out_dict = {
-            "output_ids": output_ids_padded,
-            "logprobs": logprobs_padded,
-            "generation_lengths": generation_lengths,
-            "unpadded_sequence_lengths": unpadded_sequence_lengths,
-        }
-
-        self.model.config.flash_decode = False
-        no_grad.__exit__(None, None, None)
-
-        return BatchedDataDict.from_batches([out_dict]).to("cpu")
-
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/prepare_refit_info")
     def prepare_refit_info(self) -> None:
@@ -1238,6 +1088,8 @@ class MegatronPolicyWorkerImpl(
                     torch.bfloat16: 2,
                     torch.float16: 2,
                     torch.float32: 4,
+                    torch.float8_e4m3fn: 1,
+                    torch.float8_e5m2: 1,
                 }
                 scale = prec_to_bytes[self.dtype] / prec_to_bytes[param.dtype]
                 size_in_bytes = (
@@ -1638,14 +1490,15 @@ class MegatronPolicyWorkerImpl(
             )
 
         original_save_path = self.mcore_state.cfg.checkpoint.save
-        # save_dir = os.path.dirname(weights_path)
-        release_name = os.path.basename(weights_path)
+        is_async = self.mcore_state.cfg.checkpoint.async_save
 
         try:
+            # Block until any previous async save is fully written to disk.
+            # With sync save this is a no-op.
             maybe_finalize_async_save(
                 self.mcore_state,
                 ckpt_cfg=self.mcore_state.cfg.checkpoint,
-                blocking=False,
+                blocking=True,
             )
             self.mcore_state.cfg.checkpoint.save = weights_path
 
@@ -1675,17 +1528,18 @@ class MegatronPolicyWorkerImpl(
                 num_floating_point_operations_so_far=self.mcore_state.train_state.floating_point_operations_so_far,
                 checkpointing_context=self.checkpointing_context,
             )
-            print(f"Saved checkpoint to {weights_path}")
-            maybe_finalize_async_save(
-                self.mcore_state,
-                ckpt_cfg=self.mcore_state.cfg.checkpoint,
-                blocking=True,
-                terminate=True,
-            )
+
+            if not is_async:
+                # Sync path: finalize immediately (runs finalize_fns + barrier).
+                maybe_finalize_async_save(
+                    self.mcore_state,
+                    ckpt_cfg=self.mcore_state.cfg.checkpoint,
+                    blocking=True,
+                )
             if self.should_disable_forward_pre_hook:
                 self.enable_forward_pre_hook()
 
-            if not is_training:  # Restore training state if it was changed
+            if not is_training:
                 self.model.train()
 
         except Exception as e:

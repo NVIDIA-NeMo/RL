@@ -113,7 +113,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             pp_size = config["megatron_cfg"]["pipeline_model_parallel_size"]
             cp_size = config["megatron_cfg"]["context_parallel_size"]
 
-            env_vars = config["megatron_cfg"].get("env_vars", {})
+            env_vars = dict(config["megatron_cfg"].get("env_vars") or {})
 
             if "TORCH_CUDA_ARCH_LIST" not in os.environ:
                 raise RuntimeError(
@@ -372,6 +372,38 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         )
         # this function should co-work with vllm, so we should wait for all futures to complete outside
         return futures
+
+    def init_collective_mcore_generation(
+        self,
+        ip: str,
+        port: int,
+        world_size: int,
+        *,
+        rank_offset: int,
+        refit_backend: str = "gloo",
+    ) -> list[ray.ObjectRef]:
+        """Initialize the megatron refit collective on this policy's workers."""
+        return self.worker_group.run_all_workers_single_data(
+            "init_collective_mcore_generation",
+            ip=ip,
+            port=port,
+            world_size=world_size,
+            rank_offset=rank_offset,
+            refit_backend=refit_backend,
+        )
+
+    def preinit_nvshmem(self) -> list[ray.ObjectRef]:
+        """Pre-initialize NVSHMEM on this policy's workers (no-op when not using nvshmem)."""
+        return self.worker_group.run_all_workers_single_data(
+            "preinit_nvshmem_collective"
+        )
+
+    def swap_weights_via_reshard(self, *, is_source: bool) -> list[ray.ObjectRef]:
+        """Send (`is_source=True`) or receive (`is_source=False`) weights via megatron reshard."""
+        return self.worker_group.run_all_workers_single_data(
+            "swap_weights_via_reshard",
+            is_source=is_source,
+        )
 
     # ── DP-shard helpers ────────────────────────────────────────────────
     # DRY for Policy's logprob/train methods only. The data-plane sibling
@@ -756,13 +788,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
         """Generate a batch of data using the policy."""
-        # Verify input data is right-padded
         assert isinstance(data, BatchedDataDict), (
             f"data must be a BatchedDataDict, got type: {type(data)}"
         )
         assert "input_ids" in data and "input_lengths" in data, (
             "Missing required input fields"
         )
+        assert self.cfg["generation"] is not None, "Generation config is not set"
 
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
         sharded_data = data.shard_by_batch_size(dp_size, batch_size=None)
@@ -774,13 +806,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             output_is_replicated=["tensor_parallel", "pipeline_parallel"],
             common_kwargs={"greedy": greedy},
         )
-        assert self.cfg["generation"] is not None, "Generation config is not set"
-        result: BatchedDataDict[GenerationOutputSpec] = BatchedDataDict.from_batches(
+        result = BatchedDataDict.from_batches(
             self.worker_group.get_all_worker_results(futures),
             pad_value_dict={"output_ids": self.cfg["generation"]["_pad_token_id"]},
         )
 
-        # Verify the output has all required fields
         required_keys = [
             "output_ids",
             "generation_lengths",
@@ -844,6 +874,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # We don't need to do anything here
         return True
 
+    def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
+        # We don't need to do anything here
+        return True
+
     def prepare_for_training(self, *args: Any, **kwargs: Any) -> None:
         # onload everything to the GPU
         futures = self.worker_group.run_all_workers_single_data("prepare_for_training")
@@ -854,10 +888,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             "prepare_for_lp_inference"
         )
         ray.get(futures)
-
-    def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
-        # We don't need to do anything here
-        return True
 
     def invalidate_kv_cache(self, *args: Any, **kwargs: Any) -> bool:
         # We don't need to do anything here

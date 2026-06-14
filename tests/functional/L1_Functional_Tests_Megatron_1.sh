@@ -38,8 +38,13 @@ run_test fast uv run --no-sync bash ./tests/functional/audio_grpo_megatron.sh
 run_test      uv run --no-sync bash ./tests/functional/grpo_megatron.sh
 run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_mbridge_restore.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_megatron_eagle3_online.sh
-# TODO: enable after resolving megatron inference test cases
-# run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation.sh
+run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation.sh
+run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_non_colocated.sh
+run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_async.sh
+run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_colocated_async.sh
+run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_async_gym.sh
+run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_topp_topk.sh
+run_test      uv run --no-sync bash ./tests/functional/grpo_megatron_generation_multiturn.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then
