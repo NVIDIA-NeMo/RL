@@ -28,11 +28,17 @@ import ray
 import torch
 from tensordict import TensorDict
 
+from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms.single_controller import (
     SingleControllerActor,
     SingleControllerConfig,
 )
+from nemo_rl.algorithms.single_controller_setup import (
+    SingleControllerComponents,
+    SingleControllerHandles,
+)
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
+from nemo_rl.experience.rollout_manager import RolloutManager
 
 # Reuse fixtures from the experience tests; same shape as test_async_rollout_manager.
 from tests.unit.experience.test_rollouts import (
@@ -184,23 +190,51 @@ def test_rollout_pump_writes_expected_tq_data(
         advantage_enabled=False,
         diagnostics=False,
         partition_id=_PARTITION_ID,
-        rollout_max_seq_len=max_seq_len,
-        rollout_max_turns=max_rollout_turns,
-        use_nemo_gym=False,
     )
     # SingleControllerActor expects a StatefulDataLoader, but the pump only
     # iterates it (`for prompt in self._dataloader`), so any iterable works.
     dataloader = [input_sample] * max_rollout_prompts
 
-    ctrl = SingleControllerActor.remote(
-        cfg=cfg,
+    tq_buffer = TQReplayBuffer(
+        dp_adapter,
+        partition_id=cfg.partition_id,
+        pad_value_dict={"token_ids": int(tokenizer.pad_token_id or 0)},
+    )
+    rollout_manager = RolloutManager(
+        tokenizer=tokenizer,
+        env_handles=env_handles,
+        num_generations_per_prompt=num_generations,
+        max_seq_len=max_seq_len,
+        max_rollout_turns=max_rollout_turns,
+        policy_generation=vllm_generation,
+        use_nemo_gym=False,
+        tq_buffer=tq_buffer,
+    )
+    handles = SingleControllerHandles(
         dp_client=dp_adapter,
         gen_handle=vllm_generation,
         trainer_handle=object(),
         env_handles=env_handles,
+        train_cluster=None,  # type: ignore[arg-type]
+        inference_cluster=None,  # type: ignore[arg-type]
+        loss_fn=None,
+        dataset=None,
+        val_dataset=None,
+        master_config=None,  # type: ignore[arg-type]
+    )
+    components = SingleControllerComponents(
         dataloader=dataloader,
         weight_synchronizer=object(),
+        advantage_estimator=None,
         tokenizer=tokenizer,
+        rollout_manager=rollout_manager,
+        tq_buffer=tq_buffer,
+    )
+    ctrl = SingleControllerActor.remote(
+        cfg=cfg,
+        handles=handles,
+        tokenizer=tokenizer,
+        components=components,
     )
 
     vllm_generation.prepare_for_generation()

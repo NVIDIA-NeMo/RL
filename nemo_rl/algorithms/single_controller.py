@@ -37,19 +37,21 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Literal, Optional
+from typing import TYPE_CHECKING, Any, Literal, Optional
 
 import ray
 import torch
 from tensordict import TensorDict
-from torchdata.stateful_dataloader import StatefulDataLoader
 
-from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms.async_utils.staleness_sampler import StalenessSampler
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.experience.rollout_manager import RolloutManager
+
+if TYPE_CHECKING:
+    from nemo_rl.algorithms.single_controller_setup import (
+        SingleControllerComponents,
+        SingleControllerHandles,
+    )
 
 log = logging.getLogger(__name__)
 
@@ -99,11 +101,6 @@ class SingleControllerConfig:
     weight_nccl_addr: str = "127.0.0.1"
     weight_nccl_port: Optional[int] = None
 
-    # Rollout config. Read only when SC builds RolloutManager itself.
-    rollout_max_seq_len: int = 1024
-    rollout_max_turns: Optional[int] = None
-    use_nemo_gym: bool = False
-
     # Extra fields passed through to avoid TypedDict issues
     extra: dict = field(default_factory=dict)
 
@@ -123,20 +120,9 @@ class SingleControllerActor:
     def __init__(
         self,
         cfg: SingleControllerConfig,
-        dp_client: Any,
-        gen_handle: Any,
-        trainer_handle: Any,
-        env_handles: dict[str, EnvironmentInterface],
-        # TODO: move into SC's setup phase
-        dataloader: StatefulDataLoader,
-        weight_synchronizer: Any,
-        advantage_estimator: Any | None = None,
+        handles: "SingleControllerHandles",
         tokenizer: Any | None = None,
-        # TODO: remove the rollout_manager / tq_buffer overrides once SC's
-        # setup phase owns construction; today they let the dry-run test
-        # share one buffer + manager instance with SC.
-        rollout_manager: RolloutManager | None = None,
-        tq_buffer: TQReplayBuffer | None = None,
+        components: "SingleControllerComponents | None" = None,
     ) -> None:
         import logging as _logging
 
@@ -145,13 +131,31 @@ class SingleControllerActor:
             format="[%(asctime)s] %(levelname)s %(filename)s:%(lineno)d: %(message)s",
         )
 
+        # Build the six local components if the caller did not supply them.
+        # Tests inject fakes via ``components=``; production goes through
+        # :func:`setup_single_controller_component`.
+        if components is None:
+            from nemo_rl.algorithms.single_controller_setup import (
+                setup_single_controller_component,
+            )
+
+            components = setup_single_controller_component(
+                handles, tokenizer, partition_id=cfg.partition_id
+            )
+
         self._cfg = cfg
-        self._dp_client = dp_client
-        self._gen = gen_handle
-        self._trainer = trainer_handle
-        self._dataloader = dataloader
-        self._weight_synchronizer = weight_synchronizer
-        self._advantage_estimator = advantage_estimator
+        self._dp_client = handles.dp_client
+        self._gen = handles.gen_handle
+        self._trainer = handles.trainer_handle
+        self._dataloader = components.dataloader
+        self._weight_synchronizer = components.weight_synchronizer
+        self._advantage_estimator = components.advantage_estimator
+        self._buffer = components.tq_buffer
+        self._rollout_manager = components.rollout_manager
+        # Tests pass a separately constructed rollout_manager and tq_buffer
+        # as distinct cloudpickle blobs; rebind so the writer and the
+        # sampler always share one buffer.
+        self._rollout_manager._tq_buffer = self._buffer
 
         if cfg.advantage_enabled and self._advantage_estimator is None:
             raise ValueError(
@@ -165,35 +169,6 @@ class SingleControllerActor:
                 f"target_prompt_groups_per_step ({cfg.target_prompt_groups_per_step}) "
                 f"must be >= min_prompt_groups_per_batch ({cfg.min_prompt_groups_per_batch})"
             )
-
-        pad_id = int(getattr(tokenizer, "pad_token_id", 0) or 0)
-        if tq_buffer is None:
-            self._buffer = TQReplayBuffer(
-                dp_client,
-                partition_id=cfg.partition_id,
-                pad_value_dict={"token_ids": pad_id},
-            )
-        else:
-            self._buffer = tq_buffer
-
-        if rollout_manager is None:
-            self._rollout_manager = RolloutManager(
-                tokenizer=tokenizer,
-                env_handles=env_handles,
-                num_generations_per_prompt=cfg.generations_per_prompt,
-                max_seq_len=cfg.rollout_max_seq_len,
-                max_rollout_turns=cfg.rollout_max_turns,
-                use_nemo_gym=cfg.use_nemo_gym,
-                policy_generation=gen_handle,
-                tq_buffer=self._buffer,
-            )
-        else:
-            self._rollout_manager = rollout_manager
-            # Ray serializes kwargs as separate cloudpickle blobs, so a
-            # rollout_manager and tq_buffer passed together as `.remote()`
-            # args deserialize as distinct buffer instances inside the actor.
-            # Rebind so the rollout writer and sampler share one buffer.
-            self._rollout_manager._tq_buffer = self._buffer
 
         # Initialize sampler
         assert cfg.batch_selection_strategy in [
