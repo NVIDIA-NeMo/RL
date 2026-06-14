@@ -605,13 +605,13 @@ class TestSingleControllerDryRun:
 
         return SingleControllerActor.remote(
             master_config=mc,
-            dp_client=dp_client,
             gen_handle=gen,
             trainer_handle=trainer,
             env_handles={},
             train_cluster=None,
             inference_cluster=None,
             components=(
+                dp_client,
                 dataloader,
                 weight_sync,
                 advantage_estimator,
@@ -1016,13 +1016,19 @@ class TestStreamingTrainPump:
 
         return SingleControllerActor.remote(
             master_config=mc,
-            dp_client=dp_client,
             gen_handle=gen,
             trainer_handle=trainer,
             env_handles={},
             train_cluster=None,
             inference_cluster=None,
-            components=(dataloader, weight_sync, None, rollout_manager, tq_buffer),
+            components=(
+                dp_client,
+                dataloader,
+                weight_sync,
+                None,
+                rollout_manager,
+                tq_buffer,
+            ),
         )
 
     def test_streaming_dispatches_in_arrival_order(self, ray_init):
