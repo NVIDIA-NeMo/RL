@@ -13,9 +13,8 @@
 # limitations under the License.
 
 import gc
-import os
 from collections import defaultdict
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
 from typing import Any, Iterator, Optional, TypeVar
 
@@ -27,6 +26,8 @@ from megatron.bridge.training.checkpointing import (
 )
 from megatron.bridge.training.utils.pg_utils import get_pg_collection
 from megatron.bridge.training.utils.train_utils import (
+    LinearForLastLayer,
+    create_value_head_hook,
     logical_and_across_model_parallel_group,
     reduce_max_stat_across_model_parallel_group,
 )
@@ -41,7 +42,6 @@ from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.parallel_state import (
     get_pipeline_model_parallel_group,
     get_pipeline_model_parallel_last_rank,
-    get_tensor_model_parallel_group,
     is_pipeline_last_stage,
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
@@ -65,7 +65,6 @@ from nemo_rl.models.megatron.setup import (
     make_policy_like_config,
     setup_distributed,
     setup_model_and_optimizer,
-    setup_value_head,
     validate_and_set_config,
     validate_model_paths,
 )
@@ -79,63 +78,6 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
-class ValueHead(torch.nn.Module):
-    """Simple linear value head that maps hidden states to scalar values.
-
-    Works correctly with tensor parallelism by operating on the full hidden
-    dimension (which is not split across TP ranks at the output_layer input).
-    With sequence parallelism, each TP rank processes its shard of the sequence
-    independently; results are gathered later.
-    """
-
-    def __init__(self, hidden_size: int, dtype: torch.dtype):
-        super().__init__()
-        self.dtype = dtype
-        self.linear = torch.nn.Linear(hidden_size, 1, bias=True)
-        self.linear.to(dtype=dtype)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Map hidden states to scalar values.
-
-        Args:
-            hidden_states: [batch, seq, hidden_size] (may be seq-parallel sharded)
-
-        Returns:
-            values: [batch, seq, 1]
-        """
-        with torch.autocast(device_type=hidden_states.device.type, dtype=torch.float32):
-            return self.linear(hidden_states.float())
-
-
-def _unwrap_model(model):
-    """Unwrap a model from DDP/Float16Module wrappers to get the base GPTModel."""
-    m = model
-    while hasattr(m, "module"):
-        m = m.module
-    return m
-
-
-class _ValueOutputLayerBypass(torch.nn.Module):
-    """Replaces the output_layer during value model forward.
-
-    Skips the expensive logits computation (hidden_size -> vocab_size).
-    Instead of computing [S, B, vocab_size] logits, captures the hidden states
-    and returns a minimal [S, B, 1] tensor, saving both memory and FLOPS.
-    """
-
-    def __init__(self, captured_hidden: dict):
-        super().__init__()
-        self.captured_hidden = captured_hidden
-
-    def forward(self, hidden_states, *args, **kwargs):
-        self.captured_hidden["hidden_states"] = hidden_states
-        # Return (tensor, bias) tuple matching ColumnParallelLinear's signature,
-        # since GPTModel._postprocess does `logits, _ = self.output_layer(...)`.
-        # Uses a slice view to avoid allocating new memory.
-        dummy = hidden_states[..., :1]
-        return dummy, None
-
-
 def forward_step_value(
     state,
     global_valid_seqs,
@@ -143,17 +85,18 @@ def forward_step_value(
     data_iterator,
     model,
     *,
-    value_head,
     loss_fn,
     pack_sequences=False,
     defer_fp32_logits=None,
     cp_normalize=True,
     policy_cfg=None,
 ):
-    """Forward step for value model that captures hidden states and computes values.
+    """Forward step for the value model.
 
-    This is similar to forward_step_arbitrary_loss but intercepts hidden states
-    before the language model head and applies a value head instead.
+    The LM head is replaced at build time by a ``LinearForLastLayer``
+    (hidden_size -> 1) value head (see ``create_value_head_hook``), so
+    ``model(...)`` returns per-token values directly — the head already gathers
+    sequence-parallel shards.
     """
     from nemo_rl.algorithms.loss import SequencePackingLossWrapper
 
@@ -163,12 +106,10 @@ def forward_step_value(
     processed_mb = next(data_iterator)
 
     data_dict = processed_mb.data_dict
-    input_ids = processed_mb.input_ids
     input_ids_cp_sharded = processed_mb.input_ids_cp_sharded
     attention_mask = processed_mb.attention_mask
     position_ids = processed_mb.position_ids
     packed_seq_params = processed_mb.packed_seq_params
-    cu_seqlens_padded = processed_mb.cu_seqlens_padded
 
     additional_kwargs = {}
     if packed_seq_params is not None:
@@ -176,48 +117,21 @@ def forward_step_value(
     if defer_fp32_logits:
         additional_kwargs["fp32_output"] = False
 
-    # Bypass the output_layer to avoid computing expensive logits [S, B, vocab_size].
-    # Instead, capture hidden_states and route them through the value head.
-    captured_hidden = {}
-    base_model = _unwrap_model(model)
-    original_output_layer = None
+    with straggler_timer:
+        output_tensor = model(
+            input_ids=input_ids_cp_sharded,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            **additional_kwargs,
+        )
 
-    if hasattr(base_model, "output_layer"):
-        original_output_layer = base_model.output_layer
-        base_model.output_layer = _ValueOutputLayerBypass(captured_hidden)
-
-    try:
-        with straggler_timer:
-            output_tensor = model(
-                input_ids=input_ids_cp_sharded,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                **additional_kwargs,
-            )
-    finally:
-        # Always restore the original output_layer
-        if original_output_layer is not None:
-            base_model.output_layer = original_output_layer
-
-    # Compute values from captured hidden states
-    if "hidden_states" in captured_hidden:
-        hidden_states = captured_hidden["hidden_states"]
-        # Megatron-Core always uses [S, B, H] layout internally; transpose to [B, S, H]
-        hidden_states = hidden_states.transpose(0, 1).contiguous()
-        values = value_head(hidden_states).squeeze(-1)  # [batch, seq]
-        # Shift right by 1 to align with inference: values[t] = V(state before token t).
-        # This must match the shift in get_values_impl so that the training targets
-        # (returns, old_values) computed from inference values are aligned.
+    # Head-owning stage returns [B, S, 1] values; others pass hidden states through.
+    # ignore_virtual=False so only the head-owning vp chunk is gated under VPP.
+    if is_pipeline_last_stage(ignore_virtual=False):
+        values = output_tensor.squeeze(-1)  # [B, S]
+        # Shift right by 1 (values[t] = V(state before token t)); must match get_values.
         values = torch.cat([torch.zeros_like(values[:, :1]), values[:, :-1]], dim=1)
-        # Replace output_tensor with values for loss computation. The
-        # output_layer is frozen via the _freeze_output_layer pre-DDP-wrap
-        # hook (see init below), so it is excluded from grad buckets and
-        # no zero-grad placeholder is needed here.
         output_tensor = values
-    else:
-        # On non-last PP stages, output_layer doesn't exist.
-        # output_tensor is the intermediate hidden states, pass through.
-        pass
 
     # Handle packed sequences
     if pack_sequences and packed_seq_params is not None:
@@ -250,6 +164,58 @@ def forward_step_value(
         loss_fn_wrapped = _div_by_cp_size
 
     return output_tensor, loss_fn_wrapped
+
+
+def _install_value_head_load_skip(chunk: GPTModel) -> None:
+    """Give the chunk a ``hide_loss_modules`` context manager that drops ``output_layer.*``.
+
+    The freshly-initialized value head is never in a base checkpoint, so Megatron-Bridge
+    enters this context during finetune loads (and HF->Megatron conversion) to skip it.
+    Resume loads run with ``finetune=False``, so the trained head is restored normally.
+    """
+    chunk._skip_value_head_in_sharded_sd = False
+    original_sharded_state_dict = chunk.sharded_state_dict
+
+    def sharded_state_dict(
+        prefix: str = "", sharded_offsets: tuple = (), metadata: Optional[dict] = None
+    ):
+        sharded_sd = original_sharded_state_dict(
+            prefix=prefix, sharded_offsets=sharded_offsets, metadata=metadata
+        )
+        if chunk._skip_value_head_in_sharded_sd:
+            for key in list(sharded_sd.keys()):
+                if key.startswith(f"{prefix}output_layer."):
+                    del sharded_sd[key]
+        return sharded_sd
+
+    chunk.sharded_state_dict = sharded_state_dict
+
+    @contextmanager
+    def hide_loss_modules():
+        previous = chunk._skip_value_head_in_sharded_sd
+        chunk._skip_value_head_in_sharded_sd = True
+        try:
+            yield
+        finally:
+            chunk._skip_value_head_in_sharded_sd = previous
+
+    chunk.hide_loss_modules = hide_loss_modules
+
+
+def make_value_head_hook(hidden_size: int, sequence_parallel: bool):
+    """Build the pre-wrap hook that installs the value head and lets it skip base loads."""
+    base_hook = create_value_head_hook(
+        hidden_size=hidden_size, sequence_parallel=sequence_parallel
+    )
+
+    def hook(model):
+        model = base_hook(model)
+        for chunk in model if isinstance(model, list) else [model]:
+            if isinstance(getattr(chunk, "output_layer", None), LinearForLastLayer):
+                _install_value_head_load_skip(chunk)
+        return model
+
+    return hook
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
@@ -352,25 +318,18 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
         self.megatron_cfg.validate()
 
         # Step 4: Setup Megatron model and components
-        # Freeze the output_layer (LM head) before DDP wrapping so it is not
-        # registered in any DDP gradient bucket.  The value model never uses the
-        # LM head — it bypasses it and routes hidden states through a value head
-        # instead — so its weights should not participate in gradient sync.
-        def _freeze_output_layer(megatron_model):
-            if not isinstance(megatron_model, list):
-                megatron_model = [megatron_model]
-            for model_module in megatron_model:
-                if hasattr(model_module, "module"):
-                    model_module = model_module.module
-                if hasattr(model_module, "output_layer"):
-                    for param in model_module.output_layer.parameters():
-                        param.requires_grad_(False)
+        # Replace output_layer with a hidden->1 value head before DDP wrapping, so grad
+        # sync, the optimizer, dist-checkpoint save/load, PP, and SP are all inherited.
+        value_head_hook = make_value_head_hook(
+            hidden_size=self.megatron_cfg.model.hidden_size,
+            sequence_parallel=self.megatron_cfg.model.sequence_parallel,
+        )
 
         model_and_optimizer_state = setup_model_and_optimizer(
             self._policy_like_cfg,
             self.megatron_cfg,
             init_optimizer,
-            additional_pre_wrap_hooks=[_freeze_output_layer],
+            additional_pre_wrap_hooks=[value_head_hook],
         )
 
         self.mcore_state = model_and_optimizer_state.state
@@ -383,28 +342,9 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
         if param_sync_func is not None:
             self.megatron_cfg.param_sync_func = param_sync_func
 
-        # Step 5: Create value head
-        self.value_head = setup_value_head(
-            hidden_size=self.megatron_cfg.model.hidden_size,
-            dtype=self.dtype,
-            config=config,
-            weights_path=weights_path,
-        )
-
-        # Add value head parameters to the optimizer
-        if init_optimizer and self.optimizer is not None:
-            # For Megatron optimizers, we need to handle this carefully.
-            # The value head is a small module, so we add it as a separate param group.
-            self._add_value_head_to_optimizer()
-
-            if optimizer_path is not None:
-                vh_opt_path = os.path.join(optimizer_path, "value_head_optimizer.pt")
-                if os.path.exists(vh_opt_path):
-                    vh_opt_state = torch.load(
-                        vh_opt_path, map_location="cuda", weights_only=True
-                    )
-                    self.value_head_optimizer.load_state_dict(vh_opt_state)
-                    print(f"Loaded value head optimizer state from {vh_opt_path}")
+        # The value head (output_layer) is now a model parameter, so it is
+        # trained by the main optimizer and saved/loaded via the normal
+        # dist-checkpoint — no separate value-head optimizer or sidecar needed.
 
         # Step 6: Finalize setup
         (
@@ -422,27 +362,6 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
         )
 
         print(f"MegatronValueWorker initialized on rank {self.rank}")
-
-    def _add_value_head_to_optimizer(self):
-        """Add value head parameters to the Megatron optimizer.
-
-        Since the Megatron optimizer manages parameters through DDP buffers,
-        we create a separate PyTorch optimizer for the value head and step
-        both during training.
-        """
-        lr = self.megatron_cfg.optimizer.lr
-        weight_decay = self.megatron_cfg.optimizer.weight_decay
-
-        self.value_head_optimizer = torch.optim.AdamW(
-            self.value_head.parameters(),
-            lr=lr,
-            weight_decay=weight_decay,
-            betas=(
-                self.megatron_cfg.optimizer.adam_beta1,
-                self.megatron_cfg.optimizer.adam_beta2,
-            ),
-            eps=self.megatron_cfg.optimizer.adam_eps,
-        )
 
     def enable_forward_pre_hook(self):
         if isinstance(self.model, DistributedDataParallel):
@@ -494,29 +413,14 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
         if eval_mode:
             ctx: AbstractContextManager[Any] = torch.no_grad()
             self.model.eval()
-            self.value_head.eval()
         else:
             ctx = nullcontext()
             self.model.train()
-            self.value_head.train()
-            # Mirror the backbone LR + WD onto the value head BEFORE stepping so
-            # the first iteration respects warmup (otherwise the head trains at
-            # peak LR for step 0 while the backbone is still at warmup-init).
-            # Use scheduler.get_*() instead of param_groups directly — it is
-            # canonical (matches the logging pattern below) and also valid at
-            # step 0 before any scheduler.step() has written param_groups.
-            if hasattr(self, "value_head_optimizer"):
-                backbone_lr = self.scheduler.get_lr(self.optimizer.param_groups[0])
-                backbone_wd = self.scheduler.get_wd()
-                for pg in self.value_head_optimizer.param_groups:
-                    pg["lr"] = backbone_lr
-                    pg["weight_decay"] = backbone_wd
 
         with ctx:
             forward_step = partial(
                 forward_step_value,
                 loss_fn=loss_fn,
-                value_head=self.value_head,
                 policy_cfg=None,
             )
             all_mb_metrics = []
@@ -554,8 +458,6 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
                     # Zero gradients
                     self.model.zero_grad_buffer()
                     self.optimizer.zero_grad()
-                    if hasattr(self, "value_head_optimizer"):
-                        self.value_head_optimizer.zero_grad()
 
                     # Forward-backward pass
                     forward_backward_func = get_forward_backward_func()
@@ -588,42 +490,6 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
                     update_successful, grad_norm, num_zeros_in_grad = (
                         self.optimizer.step()
                     )
-
-                    # Step value head optimizer separately.
-                    # The value head is NOT wrapped in DDP, so we must manually
-                    # allreduce its gradients to keep weights in sync.
-                    if hasattr(self, "value_head_optimizer"):
-                        # When sequence parallelism is on, each TP rank processes
-                        # a different shard of the sequence, so the value head
-                        # receives different gradients on each TP rank. We must
-                        # allreduce across TP first to get the correct full-sequence
-                        # gradient before syncing across DP.
-                        tp_size = parallel_state.get_tensor_model_parallel_world_size()
-                        if tp_size > 1 and self.megatron_cfg.model.sequence_parallel:
-                            tp_group = parallel_state.get_tensor_model_parallel_group()
-                            for param in self.value_head.parameters():
-                                if param.grad is not None:
-                                    torch.distributed.all_reduce(
-                                        param.grad,
-                                        op=torch.distributed.ReduceOp.AVG,
-                                        group=tp_group,
-                                    )
-
-                        dp_group = parallel_state.get_data_parallel_group()
-                        for param in self.value_head.parameters():
-                            if param.grad is not None:
-                                torch.distributed.all_reduce(
-                                    param.grad,
-                                    op=torch.distributed.ReduceOp.AVG,
-                                    group=dp_group,
-                                )
-                        # Clip value head gradients
-                        max_grad_norm = self.cfg.get("max_grad_norm", 1.0)
-                        if max_grad_norm is not None and max_grad_norm > 0:
-                            torch.nn.utils.clip_grad_norm_(
-                                self.value_head.parameters(), max_grad_norm
-                            )
-                        self.value_head_optimizer.step()
 
                     pg_collection = get_pg_collection(self.model)
                     update_successful = logical_and_across_model_parallel_group(
@@ -751,7 +617,6 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
         )
 
         self.model.eval()
-        self.value_head.eval()
 
         pp_grp = get_pipeline_model_parallel_group()
 
@@ -782,57 +647,28 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
             if packed_seq_params is not None:
                 additional_kwargs["packed_seq_params"] = packed_seq_params
 
-            # Bypass output_layer to avoid computing expensive logits
-            captured_hidden = {}
-            base_model = _unwrap_model(model)
-            original_output_layer = None
-
-            if hasattr(base_model, "output_layer"):
-                original_output_layer = base_model.output_layer
-                base_model.output_layer = _ValueOutputLayerBypass(captured_hidden)
-
-            try:
-                output_tensor = model(
-                    input_ids=input_ids_cp_sharded,
-                    position_ids=position_ids,
-                    attention_mask=attention_mask,
-                    **additional_kwargs,
-                )
-            finally:
-                if original_output_layer is not None:
-                    base_model.output_layer = original_output_layer
+            output_tensor = model(
+                input_ids=input_ids_cp_sharded,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                **additional_kwargs,
+            )
 
             def collection_fn(output_tensor):
-                # Compute values from hidden states
-                if "hidden_states" in captured_hidden:
-                    hidden_states = captured_hidden["hidden_states"]
-                    # Megatron-Core always uses [S, B, H] layout; transpose to [B, S, H]
-                    hidden_states = hidden_states.transpose(0, 1).contiguous()
-                    values = self.value_head(hidden_states).squeeze(-1)  # [B, S]
-                else:
-                    # Non-last PP stage: return dummy
-                    values = torch.zeros(1, device=output_tensor.device)
-
-                # Handle sequence parallelism: gather across TP.
-                # SP shards the seq dim *contiguously* per TP rank, so we just
-                # all-gather and concat — do NOT use `allgather_cp_sharded_tensor`
-                # here, which is hardcoded for CP's 2*cp load-balanced interleave
-                # and would scramble the sequence.
-                tp_size = parallel_state.get_tensor_model_parallel_world_size()
-                if tp_size > 1 and self.megatron_cfg.model.sequence_parallel:
-                    tp_group = get_tensor_model_parallel_group()
-                    if values.dim() == 1:
-                        values = values.unsqueeze(0)
-                    gathered = [torch.empty_like(values) for _ in range(tp_size)]
-                    torch.distributed.all_gather(
-                        gathered, values.contiguous(), group=tp_group
+                # On the last PP stage the value head returns [B, S, 1] per-token
+                # values (sequence-parallel shards already gathered inside the
+                # head). Earlier PP stages return intermediate hidden states; their
+                # collection output is discarded (values are broadcast from the
+                # last stage below).
+                if is_pipeline_last_stage(ignore_virtual=True):
+                    values = output_tensor.squeeze(-1)  # [B, S]
+                    # Prepend a 0 value for the first token (shift right by 1) so
+                    # values[t] = V(state before token t).
+                    values = torch.cat(
+                        [torch.zeros_like(values[:, :1]), values[:, :-1]], dim=1
                     )
-                    values = torch.cat(gathered, dim=1)
-
-                # Prepend 0 value for first token to maintain sequence length
-                values = torch.cat(
-                    [torch.zeros_like(values[:, :1]), values[:, :-1]], dim=1
-                )
+                else:
+                    values = torch.zeros(1, device=output_tensor.device)
 
                 return torch.tensor(0.0, device=values.device), {"values": values}
 
@@ -879,7 +715,6 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
             self.model, "cuda", move_grads=True, move_params=True
         )
         self.model.train()
-        self.value_head.cuda().train()
 
         if (
             hasattr(self, "optimizer")
@@ -895,7 +730,6 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
         """Prepare model for value inference."""
         self.model = self.move_model(self.model, "cuda", move_grads=False)
         self.model.eval()
-        self.value_head.cuda().eval()
 
         # Offload gradients
         self.model = self.move_model(
@@ -966,16 +800,6 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
                     elif device == "cuda" and not v.is_cuda:
                         state[k] = v.to("cuda")
 
-        # Also move value head optimizer
-        if hasattr(self, "value_head_optimizer"):
-            for state in self.value_head_optimizer.state.values():
-                for k, v in state.items():
-                    if torch.is_tensor(v):
-                        if device == "cpu" and v.is_cuda:
-                            state[k] = v.to("cpu")
-                        elif device == "cuda" and not v.is_cuda:
-                            state[k] = v.to("cuda")
-
     def save_checkpoint(
         self,
         weights_path: str,
@@ -985,7 +809,8 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
     ):
         """Save a checkpoint of the value model.
 
-        Saves both the Megatron backbone checkpoint and the value head weights.
+        The value head is the model's ``output_layer`` and is saved as part of
+        the normal Megatron dist-checkpoint — no separate value-head sidecar.
         """
         if not torch.distributed.is_initialized():
             raise RuntimeError(
@@ -1033,20 +858,6 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
             if self.should_disable_forward_pre_hook:
                 self.enable_forward_pre_hook()
 
-            # Save value head weights separately (only on rank 0 to avoid conflicts)
-            if torch.distributed.get_rank() == 0:
-                value_head_path = os.path.join(weights_path, "value_head.pt")
-                os.makedirs(os.path.dirname(value_head_path), exist_ok=True)
-                torch.save(self.value_head.state_dict(), value_head_path)
-
-                # Save value head optimizer if requested
-                if optimizer_path is not None and hasattr(self, "value_head_optimizer"):
-                    vh_opt_path = os.path.join(
-                        optimizer_path, "value_head_optimizer.pt"
-                    )
-                    os.makedirs(os.path.dirname(vh_opt_path), exist_ok=True)
-                    torch.save(self.value_head_optimizer.state_dict(), vh_opt_path)
-
             torch.distributed.barrier()
             print(f"Saved value model checkpoint to {weights_path}")
 
@@ -1067,7 +878,6 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
         self.model = self.move_model(
             self.model, "cpu", move_params=True, move_grads=False
         )
-        self.value_head.cpu()
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -1078,7 +888,6 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
             self.model, "cpu", move_params=True, move_grads=True
         )
         self.model.eval()
-        self.value_head.cpu().eval()
 
         if (
             hasattr(self, "optimizer")

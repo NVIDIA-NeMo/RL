@@ -15,13 +15,15 @@
 
 These tests exercise the public `Value` API (init / get_values / train /
 checkpoint save+load) using a tiny Qwen2 model on a small Ray cluster.
-They cover the PPO-specific value-worker behavior we ship in this PR:
+They cover the PPO-specific value-worker behavior:
 
-  * `ValueHead` construction + integration with the Megatron backbone
-  * `get_values` forward pass (output shape + finite values)
+  * value head (the model's ``output_layer``, a hidden->1 ``LinearForLastLayer``)
+    integration with the Megatron backbone
+  * `get_values` forward pass (output shape + finite values), incl. TP / SP /
+    dynamic batching
   * `train` step with `MseValueLossFn` (loss is finite + non-negative)
-  * Backbone-LR-to-value-head-LR mirror (T3) after one scheduler step
-  * Checkpoint save+load round-trip preserves value-head weights
+  * Sequence-parallel equivalence (SP must not change values)
+  * Checkpoint save+load round-trip preserves the trained value head
 
 Modeled after `tests/unit/models/policy/test_megatron_worker.py`.
 """
@@ -139,10 +141,32 @@ def _create_value_test_config(
         "make_sequence_length_divisible_by": tp,
         "max_total_sequence_length": 128,
         "max_grad_norm": 1.0,
-        "load_value_head_from_model": False,
         "optimizer": None,
         "scheduler": None,
     }
+
+
+def _apply_config_updates(config: ValueConfig, config_updates: dict) -> None:
+    """Apply test config overrides in place (precision / SP / dynamic batching)."""
+    for k, v in config_updates.items():
+        if k == "precision":
+            config["precision"] = v
+            config["megatron_cfg"]["pipeline_dtype"] = v
+            config["megatron_cfg"]["optimizer"]["bf16"] = v == "bfloat16"
+            config["megatron_cfg"]["optimizer"]["fp16"] = v == "float16"
+        elif k == "sequence_parallel":
+            config["megatron_cfg"]["sequence_parallel"] = v
+        elif k == "dynamic_batching":
+            mbt = config["max_total_sequence_length"] * config["train_micro_batch_size"]
+            lbt = config["max_total_sequence_length"] * config["logprob_batch_size"]
+            config["dynamic_batching"] = {
+                "enabled": v,
+                "train_mb_tokens": mbt,
+                "logprob_mb_tokens": lbt,
+                "sequence_length_round": 64,
+            }
+        else:
+            raise ValueError(f"Unknown config_updates key: {k!r}")
 
 
 @pytest.fixture
@@ -181,12 +205,7 @@ def value_setup(request, tiny_qwen2_model_path):
             pp=pp,
             cp=cp,
         )
-        for k, v in config_updates.items():
-            if k == "precision":
-                config["precision"] = v
-                config["megatron_cfg"]["pipeline_dtype"] = v
-                config["megatron_cfg"]["optimizer"]["bf16"] = v == "bfloat16"
-                config["megatron_cfg"]["optimizer"]["fp16"] = v == "float16"
+        _apply_config_updates(config, config_updates)
         tokenizer = get_tokenizer(config["tokenizer"])
 
         value = Value(cluster=cluster, config=config, tokenizer=tokenizer)
@@ -238,9 +257,17 @@ def value_setup(request, tiny_qwen2_model_path):
         (2, 1, 1, 1, {}),
         (2, 2, 1, 1, {}),
         (2, 1, 1, 1, {"precision": "bfloat16"}),
+        (2, 2, 1, 1, {"sequence_parallel": True}),
+        (2, 1, 1, 1, {"dynamic_batching": True}),
     ],
     indirect=True,
-    ids=["2gpu_dp2", "2gpu_tp2", "2gpu_dp2_bf16"],
+    ids=[
+        "2gpu_dp2",
+        "2gpu_tp2",
+        "2gpu_dp2_bf16",
+        "2gpu_tp2sp",
+        "2gpu_dp2_dynbatch",
+    ],
 )
 def test_value_worker_init_and_get_values(value_setup):
     """`Value` should initialize and `get_values` should return finite tensors of the expected shape."""
@@ -252,6 +279,11 @@ def test_value_worker_init_and_get_values(value_setup):
     out = value.get_values(data)
     assert "values" in out, "Output should contain 'values' key"
     values = out["values"]
+    # [B, S] scalar-per-token; a 3-D [B, S, vocab] result would mean the value
+    # head did not replace output_layer at init.
+    assert values.ndim == 2, (
+        f"Expected per-token scalar values [B, S], got {values.shape}"
+    )
     assert values.shape[0] == data["input_ids"].shape[0], (
         f"Batch dim mismatch: values={values.shape}, "
         f"input_ids={data['input_ids'].shape}"
@@ -271,9 +303,11 @@ def test_value_worker_init_and_get_values(value_setup):
     [
         (2, 1, 1, 1, {}),
         (2, 2, 1, 1, {}),
+        (2, 2, 1, 1, {"sequence_parallel": True}),
+        (2, 1, 1, 1, {"dynamic_batching": True}),
     ],
     indirect=True,
-    ids=["2gpu_dp2", "2gpu_tp2"],
+    ids=["2gpu_dp2", "2gpu_tp2", "2gpu_tp2sp", "2gpu_dp2_dynbatch"],
 )
 def test_value_worker_train_step(value_setup):
     """One `train()` call should produce a finite, non-negative MSE value loss."""
@@ -295,6 +329,89 @@ def test_value_worker_train_step(value_setup):
     )
 
     value.finish_training()
+
+
+@pytest.mark.hf_gated
+@pytest.mark.timeout(420)
+@pytest.mark.parametrize(
+    ("tp", "feature_updates"),
+    [
+        (2, {"sequence_parallel": True}),
+        (1, {"dynamic_batching": True}),
+    ],
+    ids=["sequence_parallel", "dynamic_batching"],
+)
+def test_value_worker_parallelism_equivalence(
+    tiny_qwen2_model_path, tmp_path, tp, feature_updates
+):
+    """A perf/sharding feature must not change values.
+
+    The value head (``output_layer``) is randomly initialized per worker, so we
+    pin the weights by saving a feature-OFF worker and reloading them into a
+    feature-ON worker, then assert ``get_values`` matches on the same batch:
+
+      * sequence parallelism — guards the head's sequence-parallel all-gather
+        reassembles the sequence correctly (a wrong gather still yields finite
+        values, so finiteness alone would not catch it);
+      * dynamic batching — guards the microbatch reorder + ``reorder_data``
+        restore round-trips back to the original sample order.
+    """
+    cluster = None
+    ref = None
+    feat = None
+    try:
+        feature_id = next(iter(feature_updates))
+        cluster = RayVirtualCluster(
+            name=f"test-megatron-value-equiv-{feature_id}",
+            bundle_ct_per_node_list=[2],
+            use_gpus=True,
+            num_gpus_per_node=2,
+            max_colocated_worker_groups=1,
+        )
+
+        # Deterministic batch (get_values only needs input_ids + input_lengths).
+        torch.manual_seed(42)
+        batch, seq_len = 8, 64
+        data = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 151000, (batch, seq_len)),
+                "input_lengths": torch.full((batch,), seq_len, dtype=torch.int32),
+                "attention_mask": torch.ones(batch, seq_len),
+            }
+        )
+
+        # Reference worker: feature OFF.
+        ref_config = _create_value_test_config(model_name=tiny_qwen2_model_path, tp=tp)
+        tokenizer = get_tokenizer(ref_config["tokenizer"])
+        ref = Value(cluster=cluster, config=ref_config, tokenizer=tokenizer)
+        values_ref = ref.get_values(data)["values"].detach().cpu()
+
+        # Save weights, then reload into a feature-ON worker (same weights).
+        weights_path = os.path.join(str(tmp_path), "value", "weights")
+        ref.prepare_for_inference()
+        ref.save_checkpoint(weights_path=weights_path)
+        ref.shutdown()
+        ref = None
+
+        feat_config = _create_value_test_config(model_name=tiny_qwen2_model_path, tp=tp)
+        _apply_config_updates(feat_config, feature_updates)
+        feat = Value(
+            cluster=cluster,
+            config=feat_config,
+            tokenizer=tokenizer,
+            weights_path=Path(weights_path),
+            name_prefix="lm_value_feat",
+        )
+        values_feat = feat.get_values(data)["values"].detach().cpu()
+
+        torch.testing.assert_close(values_feat, values_ref, rtol=1e-3, atol=1e-3)
+    finally:
+        if ref is not None:
+            ref.shutdown()
+        if feat is not None:
+            feat.shutdown()
+        if cluster is not None:
+            cluster.shutdown()
 
 
 @pytest.mark.hf_gated

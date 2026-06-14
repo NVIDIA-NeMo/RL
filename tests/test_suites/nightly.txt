@@ -211,3 +211,6 @@ tests/test_suites/llm/distillation-qwen3-1.7b-1n8g-megatron-qa-nvfp4.sh
 
 # Megatron PPO with GAE and value model (Qwen2.5-1.5B, GSM8K)
 tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron.sh
+
+# Megatron PPO with value sequence parallelism (TP2+SP) and dynamic batching
+tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron-valuetp2sp-dynbatch.sh
