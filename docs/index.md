@@ -239,31 +239,12 @@ guides/sft-openmathinstruct2.md
 :caption: Guides
 :hidden:
 
-guides/nemotron-3-nano.md
-adding-new-models.md
-guides/sft.md
-guides/dpo.md
-guides/dapo.md
-guides/cispo.md
-guides/prorlv2.md
-guides/grpo.md
-guides/ppo.md
-guides/grpo-deepscaler.md
-guides/grpo-sliding-puzzle.md
-guides/grpo-audio.md
-guides/rm.md
-guides/environments.md
-guides/eval.md
-guides/deepseek.md
-model-quirks.md
-guides/async-grpo.md
-guides/quantization-aware-rl.md
-guides/eagle3-speculative-decoding.md
-guides/yarn-long-context.md
-guides/xtoken-off-policy-distillation.md
-guides/muon-optimizer.md
-guides/dtensor-tp-accuracy.md
-guides/ft-launcher-guide.md
+guides/grpo-ppo-guides.md
+guides/sft-dpo-rm-guides.md
+guides/evaluation-environments-guides.md
+guides/model-guides.md
+guides/advanced-training-guides.md
+guides/troubleshooting-reliability-guides.md
 ```
 
 ```{toctree}
