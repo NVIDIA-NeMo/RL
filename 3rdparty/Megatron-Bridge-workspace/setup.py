@@ -35,8 +35,6 @@ CACHED_DEPENDENCIES = [
     "diffusers>=0.36.0",
     "peft>=0.18.0",
     "einops",
-    "imageio",
-    "imageio-ffmpeg",
     "omegaconf>=2.3.0",
     "tensorboard>=2.19.0",
     "typing-extensions",
