@@ -72,48 +72,37 @@ class TestSetupHandle:
         with pytest.raises(ValueError, match="data_plane.enabled=True"):
             setup_handle(mc, MagicMock())
 
-    def test_passes_dp_cfg_to_tq_policy_and_returns_six_tuple(self):
-        """setup_handle wires grpo.setup with a TQPolicy factory and returns the 6-tuple."""
-        mc = _make_master_config(dp_enabled=True)
+    def test_assembles_handles_from_inline_helpers(self):
+        """setup_handle returns dp_client/gen/policy via the inline _build_* helpers."""
+        mc = _make_master_config(dp_enabled=True, colocated=True)
         policy = MagicMock()
         policy.dp_client = MagicMock(name="dp_client_handle")
-        policy_generation = MagicMock(name="policy_generation")
+        generation = MagicMock(name="generation")
         train_cluster, inference_cluster = MagicMock(), MagicMock()
-
-        fake_grpo_setup_return = (
-            policy,
-            policy_generation,
-            None,
-            (train_cluster, inference_cluster),
-            MagicMock(),
-            None,
-            MagicMock(),
-            MagicMock(),
-            MagicMock(),
-            {},
-            mc,
-        )
         env_handles = {"math": MagicMock(name="math_env")}
 
         with (
             patch.object(
-                setup_module, "grpo_setup", return_value=fake_grpo_setup_return
-            ) as mock_grpo_setup,
-            patch.object(
                 setup_module,
-                "setup_response_data",
-                return_value=(object(), None),
-            ),
+                "_build_clusters",
+                return_value=(train_cluster, inference_cluster),
+            ) as mock_build_clusters,
+            patch.object(
+                setup_module, "_build_generation", return_value=generation
+            ) as mock_build_generation,
+            patch.object(
+                setup_module, "_build_trainer", return_value=policy
+            ) as mock_build_trainer,
         ):
             result = setup_handle(mc, MagicMock(), env_handles=env_handles)
 
-        assert mock_grpo_setup.call_count == 1
-        _, call_kwargs = mock_grpo_setup.call_args
-        assert callable(call_kwargs["policy_factory"])
+        mock_build_clusters.assert_called_once_with(mc)
+        mock_build_generation.assert_called_once()
+        mock_build_trainer.assert_called_once()
 
         dp_client, gen_handle, trainer_handle, returned_env_handles, tc, ic = result
         assert dp_client is policy.dp_client
-        assert gen_handle is policy_generation
+        assert gen_handle is generation
         assert trainer_handle is policy
         assert returned_env_handles is env_handles
         assert tc is train_cluster
@@ -122,34 +111,19 @@ class TestSetupHandle:
     def test_env_handles_built_from_config_when_not_passed(self):
         """When env_handles is None, setup_handle iterates config.env + create_env."""
         math_env_cfg = {"some": "value"}
-        mc = _make_master_config(env={"math": math_env_cfg})
+        mc = _make_master_config(env={"math": math_env_cfg}, colocated=True)
         policy = MagicMock()
         policy.dp_client = MagicMock()
         fake_math_env = MagicMock(name="math_env")
 
-        fake_grpo_setup_return = (
-            policy,
-            MagicMock(),
-            None,
-            (MagicMock(), MagicMock()),
-            MagicMock(),
-            None,
-            MagicMock(),
-            MagicMock(),
-            MagicMock(),
-            {},
-            mc,
-        )
-
         with (
             patch.object(
-                setup_module, "grpo_setup", return_value=fake_grpo_setup_return
-            ),
-            patch.object(
                 setup_module,
-                "setup_response_data",
-                return_value=(object(), None),
+                "_build_clusters",
+                return_value=(MagicMock(), MagicMock()),
             ),
+            patch.object(setup_module, "_build_generation", return_value=MagicMock()),
+            patch.object(setup_module, "_build_trainer", return_value=policy),
             patch.object(
                 setup_module, "create_env", return_value=fake_math_env
             ) as mock_create_env,
