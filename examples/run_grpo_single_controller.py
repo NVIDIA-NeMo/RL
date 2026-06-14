@@ -14,10 +14,9 @@
 
 """Async GRPO launcher driven by the SingleController actor.
 
-Wires together setup_handle (the four remote handles) and
-SingleControllerActor (which builds the local components inside its
-actor process). Mirrors run_grpo.py up to setup_handle so the same YAML
-configs apply. data_plane.enabled=true is mandatory.
+Builds the full SC bundle driver-side via single_controller_utils.setup and hands it
+to SingleControllerActor. Mirrors run_grpo.py for config loading so the same YAML
+files apply. data_plane.enabled=true is mandatory.
 """
 
 import argparse
@@ -28,7 +27,7 @@ import ray
 from omegaconf import OmegaConf
 
 from nemo_rl.algorithms.single_controller import SingleControllerActor
-from nemo_rl.algorithms.single_controller_utils import MasterConfig, setup_handle
+from nemo_rl.algorithms.single_controller_utils import MasterConfig, setup
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.models.generation import configure_generation_config
@@ -105,23 +104,10 @@ def main() -> None:
         has_refit_draft_weights=has_refit_draft_weights,
     )
 
-    (
-        gen_handle,
-        trainer_handle,
-        env_handles,
-        train_cluster,
-        inference_cluster,
-    ) = setup_handle(config, tokenizer)
+    bundle = setup(config, tokenizer)
 
     print("🚀 Launching SingleControllerActor")
-    sc = SingleControllerActor.remote(
-        master_config=config,
-        gen_handle=gen_handle,
-        trainer_handle=trainer_handle,
-        env_handles=env_handles,
-        train_cluster=train_cluster,
-        inference_cluster=inference_cluster,
-    )
+    sc = SingleControllerActor.remote(master_config=config, bundle=bundle)
     result = ray.get(sc.run.remote())
     print(f"SC run complete: {result}")
 

@@ -21,15 +21,15 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     WeightSyncConfig,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import (
-    setup_handle,
-    setup_single_controller_component,
+    SingleControllerBundle,
+    setup,
 )
 
 __all__ = [
     "AdvantageConfig",
     "AsyncRLConfig",
     "MasterConfig",
+    "SingleControllerBundle",
     "WeightSyncConfig",
-    "setup_handle",
-    "setup_single_controller_component",
+    "setup",
 ]

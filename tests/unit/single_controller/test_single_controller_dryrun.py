@@ -50,7 +50,11 @@ os.environ["RAY_TMPDIR"] = _RAY_TEMP
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms.async_utils.staleness_sampler import StalenessSampler
 from nemo_rl.algorithms.single_controller import SingleControllerActor
-from nemo_rl.algorithms.single_controller_utils import AsyncRLConfig, MasterConfig
+from nemo_rl.algorithms.single_controller_utils import (
+    AsyncRLConfig,
+    MasterConfig,
+    SingleControllerBundle,
+)
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 
@@ -69,10 +73,10 @@ def _make_test_master_config(
 ) -> MasterConfig:
     """Build a MasterConfig for tests with only grpo + async_rl filled.
 
-    Cross-cutting components (policy/data/cluster/...) are required by
-    pydantic but unused when ``components=`` is injected, so we use
-    ``model_construct`` to skip validation. SC-specific knobs live on
-    the top-level ``async_rl`` section (an AsyncRLConfig BaseModel).
+    Cross-cutting components (policy/data/cluster/...) are required by pydantic but
+    unused when a hand-built SingleControllerBundle is injected, so we use
+    model_construct to skip validation. SC-specific knobs live on the top-level
+    async_rl section (an AsyncRLConfig BaseModel).
     """
     grpo_subset = {
         "max_num_steps": max_num_steps,
@@ -582,23 +586,22 @@ class TestSingleControllerDryRun:
         if weight_sync is None:
             weight_sync = DryRunWeightSynchronizer()
 
-        return SingleControllerActor.remote(
-            master_config=mc,
+        bundle = SingleControllerBundle(
             gen_handle=gen,
             trainer_handle=trainer,
             env_handles={},
             train_cluster=None,
             inference_cluster=None,
-            components=(
-                dp_client,
-                dataloader,
-                weight_sync,
-                advantage_estimator,
-                None,
-                rollout_manager,
-                tq_buffer,
-            ),
+            dp_client=dp_client,
+            dataloader=dataloader,
+            weight_synchronizer=weight_sync,
+            advantage_estimator=advantage_estimator,
+            loss_fn=None,
+            rollout_manager=rollout_manager,
+            tq_buffer=tq_buffer,
+            partition_id="rollout_data",
         )
+        return SingleControllerActor.remote(master_config=mc, bundle=bundle)
 
     def test_dry_run_completes(self, ray_init):
         """SC completes N train steps without deadlock on CPU."""
@@ -930,23 +933,22 @@ class TestStreamingTrainPump:
         )
         rollout_manager = DryRunRolloutManager(gen, tq_buffer)
 
-        return SingleControllerActor.remote(
-            master_config=mc,
+        bundle = SingleControllerBundle(
             gen_handle=gen,
             trainer_handle=trainer,
             env_handles={},
             train_cluster=None,
             inference_cluster=None,
-            components=(
-                dp_client,
-                dataloader,
-                weight_sync,
-                None,
-                None,
-                rollout_manager,
-                tq_buffer,
-            ),
+            dp_client=dp_client,
+            dataloader=dataloader,
+            weight_synchronizer=weight_sync,
+            advantage_estimator=None,
+            loss_fn=None,
+            rollout_manager=rollout_manager,
+            tq_buffer=tq_buffer,
+            partition_id="rollout_data",
         )
+        return SingleControllerActor.remote(master_config=mc, bundle=bundle)
 
     def test_streaming_dispatches_in_arrival_order(self, ray_init):
         """SC dispatches train_microbatch in order groups commit at DP."""

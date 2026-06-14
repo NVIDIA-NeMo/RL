@@ -36,7 +36,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Optional
+from typing import Any
 
 import ray
 import torch
@@ -48,9 +48,9 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     WeightSyncConfig,
 )
+from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerBundle
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.environments.interfaces import EnvironmentInterface
 
 log = logging.getLogger(__name__)
 
@@ -70,27 +70,14 @@ class SingleControllerActor:
     def __init__(
         self,
         master_config: MasterConfig,
-        *,
-        gen_handle: Any,
-        trainer_handle: Any,
-        env_handles: dict[str, EnvironmentInterface],
-        train_cluster: Any,
-        inference_cluster: Any,
-        components: Optional[tuple] = None,
+        bundle: SingleControllerBundle,
     ) -> None:
         """Initialize the SingleController actor.
 
         Args:
             master_config: SC MasterConfig.
-            gen_handle: Generation backend.
-            trainer_handle: Trainer Ray actor handle.
-            env_handles: env_name -> EnvironmentInterface mapping.
-            train_cluster: Training Ray cluster (weight-sync rendezvous).
-            inference_cluster: Inference Ray cluster.
-            components: Test-only escape hatch — a 7-tuple (dp_client,
-                dataloader, weight_synchronizer, advantage_estimator,
-                loss_fn, rollout_manager, tq_buffer) that bypasses the
-                in-actor setup.
+            bundle: Pre-built bundle from single_controller_utils.setup. Tests can
+                construct a bundle by hand (or with fakes) to bypass the real factories.
         """
         import logging as _logging
 
@@ -101,60 +88,27 @@ class SingleControllerActor:
 
         self._advantage_cfg = AdvantageConfig()
         self._weight_sync_cfg = WeightSyncConfig()
-        self._partition_id: str = "rollout_data"
+        self._partition_id: str = bundle.partition_id
         self._diagnostics: bool = False
-
-        # Build tokenizer + components inside the actor so the heavy
-        # Python objects never ride through Ray cloudpickle. The
-        # components arg is a test-only escape hatch that injects fakes
-        # built CPU-side.
-        if components is None:
-            from nemo_rl.algorithms.single_controller_utils.setup import (
-                setup_single_controller_component,
-            )
-            from nemo_rl.algorithms.utils import get_tokenizer
-
-            tokenizer = get_tokenizer(master_config.policy["tokenizer"])
-            components = setup_single_controller_component(
-                master_config,
-                tokenizer,
-                gen_handle=gen_handle,
-                trainer_handle=trainer_handle,
-                env_handles=env_handles,
-                train_cluster=train_cluster,
-                inference_cluster=inference_cluster,
-                partition_id=self._partition_id,
-            )
-
-        (
-            dp_client,
-            dataloader,
-            weight_synchronizer,
-            advantage_estimator,
-            loss_fn,
-            rollout_manager,
-            tq_buffer,
-        ) = components
 
         self._master_config = master_config
         self._async_cfg = master_config.async_rl
-        self._dp_client = dp_client
-        self._gen = gen_handle
-        self._trainer = trainer_handle
-        self._dataloader = dataloader
-        self._weight_synchronizer = weight_synchronizer
-        self._advantage_estimator = advantage_estimator
-        self._loss_fn = loss_fn
-        self._buffer = tq_buffer
-        self._rollout_manager = rollout_manager
-        # When tests pass rollout_manager + tq_buffer as separate
-        # cloudpickle blobs, Ray deserializes them into distinct buffer
-        # instances. Rebind so the writer and the sampler share one.
+        self._dp_client = bundle.dp_client
+        self._gen = bundle.gen_handle
+        self._trainer = bundle.trainer_handle
+        self._dataloader = bundle.dataloader
+        self._weight_synchronizer = bundle.weight_synchronizer
+        self._advantage_estimator = bundle.advantage_estimator
+        self._loss_fn = bundle.loss_fn
+        self._buffer = bundle.tq_buffer
+        self._rollout_manager = bundle.rollout_manager
+        # Rebind so writer and sampler share one buffer instance even
+        # when Ray deserializes rollout_manager and tq_buffer separately.
         self._rollout_manager._tq_buffer = self._buffer
 
         # Pin clusters so RayVirtualCluster.__del__ doesn't remove the PGs.
-        self._train_cluster = train_cluster
-        self._inference_cluster = inference_cluster
+        self._train_cluster = bundle.train_cluster
+        self._inference_cluster = bundle.inference_cluster
 
         if self._async_cfg.target_prompt_groups_per_step is None:
             self._async_cfg.target_prompt_groups_per_step = (
@@ -321,11 +275,6 @@ class SingleControllerActor:
           4. trainer.train_microbatch_from_meta + finish_train_step.
           5. dp_client.clear_samples on consumed sample_ids; release _buffer_capacity
              per dropped group, then sync.
-
-        Train microbatches run synchronously inside the asyncio event loop:
-        driver-side TQPolicy blocks on worker results. Restore in-flight
-        reaping for rollout/train overlap once PR #2692 lands an async
-        variant of train_microbatch_from_meta.
         """
         adv_cfg = self._advantage_cfg
         grpo_cfg = self._master_config.grpo

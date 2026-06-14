@@ -30,7 +30,11 @@ from tensordict import TensorDict
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms.single_controller import SingleControllerActor
-from nemo_rl.algorithms.single_controller_utils import AsyncRLConfig, MasterConfig
+from nemo_rl.algorithms.single_controller_utils import (
+    AsyncRLConfig,
+    MasterConfig,
+    SingleControllerBundle,
+)
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.experience.rollout_manager import RolloutManager
 
@@ -208,23 +212,22 @@ def test_rollout_pump_writes_expected_tq_data(
         use_nemo_gym=False,
         tq_buffer=tq_buffer,
     )
-    ctrl = SingleControllerActor.remote(
-        master_config=mc,
+    bundle = SingleControllerBundle(
         gen_handle=vllm_generation,
         trainer_handle=object(),
         env_handles=env_handles,
         train_cluster=None,
         inference_cluster=None,
-        components=(
-            dp_adapter,
-            dataloader,
-            object(),
-            None,
-            None,
-            rollout_manager,
-            tq_buffer,
-        ),
+        dp_client=dp_adapter,
+        dataloader=dataloader,
+        weight_synchronizer=object(),
+        advantage_estimator=None,
+        loss_fn=None,
+        rollout_manager=rollout_manager,
+        tq_buffer=tq_buffer,
+        partition_id=_PARTITION_ID,
     )
+    ctrl = SingleControllerActor.remote(master_config=mc, bundle=bundle)
 
     vllm_generation.prepare_for_generation()
 
