@@ -67,7 +67,6 @@ class SingleControllerActor:
         self,
         master_config: MasterConfig,
         *,
-        dp_client: Any,
         gen_handle: Any,
         trainer_handle: Any,
         env_handles: dict[str, EnvironmentInterface],
@@ -79,15 +78,15 @@ class SingleControllerActor:
 
         Args:
             master_config: SC MasterConfig.
-            dp_client: DataPlane client handle.
             gen_handle: Generation backend.
             trainer_handle: Trainer Ray actor handle.
             env_handles: env_name -> EnvironmentInterface mapping.
             train_cluster: Training Ray cluster (weight-sync rendezvous).
             inference_cluster: Inference Ray cluster.
-            components: Test-only escape hatch — a 5-tuple (dataloader,
-                weight_synchronizer, advantage_estimator, rollout_manager,
-                tq_buffer) that bypasses the in-actor setup.
+            components: Test-only escape hatch — a 6-tuple (dp_client,
+                dataloader, weight_synchronizer, advantage_estimator,
+                rollout_manager, tq_buffer) that bypasses the in-actor
+                setup.
         """
         import logging as _logging
 
@@ -110,7 +109,6 @@ class SingleControllerActor:
             components = setup_single_controller_component(
                 master_config,
                 tokenizer,
-                dp_client=dp_client,
                 gen_handle=gen_handle,
                 trainer_handle=trainer_handle,
                 env_handles=env_handles,
@@ -120,6 +118,7 @@ class SingleControllerActor:
             )
 
         (
+            dp_client,
             dataloader,
             weight_synchronizer,
             advantage_estimator,

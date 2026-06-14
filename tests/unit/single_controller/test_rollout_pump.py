@@ -217,13 +217,12 @@ def test_rollout_pump_writes_expected_tq_data(
     )
     ctrl = SingleControllerActor.remote(
         master_config=mc,
-        dp_client=dp_adapter,
         gen_handle=vllm_generation,
         trainer_handle=object(),
         env_handles=env_handles,
         train_cluster=None,
         inference_cluster=None,
-        components=(dataloader, object(), None, rollout_manager, tq_buffer),
+        components=(dp_adapter, dataloader, object(), None, rollout_manager, tq_buffer),
     )
 
     vllm_generation.prepare_for_generation()

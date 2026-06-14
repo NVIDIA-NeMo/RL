@@ -104,7 +104,6 @@ def main() -> None:
     )
 
     (
-        dp_client,
         gen_handle,
         trainer_handle,
         env_handles,
@@ -115,7 +114,6 @@ def main() -> None:
     print("🚀 Launching SingleControllerActor")
     sc = SingleControllerActor.remote(
         master_config=config,
-        dp_client=dp_client,
         gen_handle=gen_handle,
         trainer_handle=trainer_handle,
         env_handles=env_handles,
