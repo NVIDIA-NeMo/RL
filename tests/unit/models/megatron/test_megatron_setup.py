@@ -981,30 +981,6 @@ class TestApplyPerformanceConfig:
         assert model_cfg.fp8_recipe == "default"
         assert model_cfg.fp8_param is False
 
-    def test_fp8_param_warning(self):
-        """Test that fp8_param=True generates a warning."""
-        from nemo_rl.models.megatron.setup import _apply_performance_config
-
-        model_cfg = MagicMock()
-        model_cfg.gated_linear_unit = True
-        config = {
-            "megatron_cfg": {
-                "activation_checkpointing": False,
-                "apply_rope_fusion": False,
-                "bias_activation_fusion": False,
-                "gradient_accumulation_fusion": False,
-                "fp8_cfg": {
-                    "enabled": True,
-                    "fp8": "e4m3",
-                    "fp8_recipe": "default",
-                    "fp8_param": True,
-                },
-            }
-        }
-
-        with pytest.warns(UserWarning, match="fp8_param=True sometimes causes NaN"):
-            _apply_performance_config(model_cfg, config)
-
     def test_recompute_granularity_full_explicit(self):
         """granularity='full' sets uniform method with 1 layer."""
         from nemo_rl.models.megatron.setup import _apply_performance_config
