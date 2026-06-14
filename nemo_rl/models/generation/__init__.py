@@ -16,7 +16,13 @@ from typing import cast
 
 from transformers import PreTrainedTokenizerBase
 
+from nemo_rl.models.generation.constants import VLLM_BACKEND
 from nemo_rl.models.generation.interfaces import GenerationConfig
+from nemo_rl.models.generation.registry import (
+    create_generation,
+    get_registered_backends,
+    register_generation_backend,
+)
 from nemo_rl.models.generation.vllm import VllmConfig
 
 TokenizerType = PreTrainedTokenizerBase
@@ -41,7 +47,7 @@ def configure_generation_config(
         config["stop_token_ids"] = [tokenizer.eos_token_id]
 
     # vllm setting
-    if config["backend"] == "vllm":
+    if config["backend"] == VLLM_BACKEND:
         config = cast(VllmConfig, config)
         # set load_format
         config["vllm_cfg"]["load_format"] = "auto" if is_eval else "dummy"

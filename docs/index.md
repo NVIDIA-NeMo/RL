@@ -177,6 +177,13 @@ Optimize large language models with FP8 quantization for faster training and inf
 Run quantization aware GRPO and distillation using NVIDIA ModelOpt (NVFP4, FP8).
 :::
 
+:::{grid-item-card} {octicon}`arrow-both` Delta-Compressed Refit
+:link: guides/delta-compressed-refit
+:link-type: doc
+
+Configure and validate delta-compressed collective refit for non-colocated vLLM generation.
+:::
+
 :::{grid-item-card} {octicon}`container` Docker Containers
 :link: docker
 :link-type: doc
@@ -258,6 +265,7 @@ guides/deepseek.md
 model-quirks.md
 guides/async-grpo.md
 guides/quantization-aware-rl.md
+guides/delta-compressed-refit.md
 guides/eagle3-speculative-decoding.md
 guides/yarn-long-context.md
 guides/xtoken-off-policy-distillation.md
