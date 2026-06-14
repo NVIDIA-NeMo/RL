@@ -82,13 +82,12 @@ class SingleControllerActor:
             dp_client: DataPlane client handle.
             gen_handle: Generation backend.
             trainer_handle: Trainer Ray actor handle.
-            env_handles: ``env_name -> EnvironmentInterface`` mapping.
+            env_handles: env_name -> EnvironmentInterface mapping.
             train_cluster: Training Ray cluster (weight-sync rendezvous).
             inference_cluster: Inference Ray cluster.
-            components: Test-only escape hatch — a tuple
-                ``(dataloader, weight_synchronizer, advantage_estimator,
-                rollout_manager, tq_buffer)`` that bypasses the in-actor
-                setup. Production callers leave this ``None``.
+            components: Test-only escape hatch — a 5-tuple (dataloader,
+                weight_synchronizer, advantage_estimator, rollout_manager,
+                tq_buffer) that bypasses the in-actor setup.
         """
         import logging as _logging
 
@@ -99,8 +98,8 @@ class SingleControllerActor:
 
         # Build tokenizer + components inside the actor so the heavy
         # Python objects never ride through Ray cloudpickle. The
-        # ``components`` arg is a test-only escape hatch that injects
-        # fakes built CPU-side.
+        # components arg is a test-only escape hatch that injects fakes
+        # built CPU-side.
         if components is None:
             from nemo_rl.algorithms.utils import get_tokenizer
             from nemo_rl.algorithms.single_controller_utils.setup import (
@@ -128,7 +127,7 @@ class SingleControllerActor:
             tq_buffer,
         ) = components
 
-        self._mc = master_config
+        self._master_config = master_config
         self._dp_client = dp_client
         self._gen = gen_handle
         self._trainer = trainer_handle
@@ -282,14 +281,14 @@ class SingleControllerActor:
              TQReplayBuffer.add (→ dp_client.put_samples + meta append)
           5. Decrement _inflight_rollouts
         """
-        sem = asyncio.Semaphore(self._mc.concurrency.max_inflight_prompts)
+        sem = asyncio.Semaphore(self._master_config.concurrency.max_inflight_prompts)
         log.info("rollout_pump: starting")
 
         async def _dispatch_one_prompt(prompt: DatumSpec) -> None:
             self._inflight_rollouts += 1
             try:
                 await self._rollout_manager.generate_and_push(prompt)
-                if self._mc.diagnostics:
+                if self._master_config.diagnostics:
                     content = ""
                     for i in range(len(prompt["message_log"])):
                         if prompt["message_log"][i]["role"] == "user":
@@ -301,7 +300,7 @@ class SingleControllerActor:
                 sem.release()
 
         # TODO: limit max_train_steps to max_num_epochs * len(dataloader) when setup
-        max_epochs = self._mc.training.max_num_epochs
+        max_epochs = self._master_config.training.max_num_epochs
         epoch = 0
         while max_epochs is None or epoch < max_epochs:
             for prompt in self._dataloader:
@@ -331,9 +330,9 @@ class SingleControllerActor:
           5. dp_client.clear_samples on consumed sample_ids; release _buffer_capacity
              per dropped group, then sync.
         """
-        adv_cfg = self._mc.advantage
-        stale_cfg = self._mc.staleness
-        train_cfg = self._mc.training
+        adv_cfg = self._master_config.advantage
+        stale_cfg = self._master_config.staleness
+        train_cfg = self._master_config.training
 
         logprobs_required = (
             adv_cfg.policy_logprobs_field is not None
@@ -410,7 +409,7 @@ class SingleControllerActor:
             await self._call_dp(
                 "clear_samples",
                 sample_ids=list(consumed_ids),
-                partition_id=self._mc.partition_id,
+                partition_id=self._master_config.partition_id,
             )
 
             self._trainer_version = result["trainer_version"]
@@ -472,7 +471,7 @@ class SingleControllerActor:
         only the configured advantage input columns and writes the computed
         ``advantages`` column back under the same ``sample_ids``.
         """
-        adv_cfg = self._mc.advantage
+        adv_cfg = self._master_config.advantage
         if not adv_cfg.enabled:
             return meta
         assert self._advantage_estimator is not None
@@ -536,7 +535,7 @@ class SingleControllerActor:
     # ── utility helpers ────────────────────────────────────────────────────
 
     def _advantage_input_fields(self) -> list[str]:
-        adv_cfg = self._mc.advantage
+        adv_cfg = self._master_config.advantage
         fields = [
             adv_cfg.prompt_ids_field,
             adv_cfg.reward_field,
