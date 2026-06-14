@@ -1259,7 +1259,7 @@ def _apply_message_level_advantage_penalties(
     invalid_tool_call_advantage: float | None,
     malformed_thinking_advantage: float | None,
     log_config: bool = False,
-) -> None:
+) -> Optional[dict[str, float]]:
     """Overwrite advantages for flagged assistant-message token spans.
 
     For each assistant message flagged by the NeMo-Gym detector as an invalid
@@ -1274,11 +1274,14 @@ def _apply_message_level_advantage_penalties(
         invalid_tool_call_advantage: Advantage value assigned to invalid tool calls.
         malformed_thinking_advantage: Advantage value assigned to malformed thinking.
         log_config: If True, print the configured penalty values once.
+    Returns:
+        Dictionary of penalty metrics if penalties are applied, otherwise None.
     """
+    penalty_metrics = {}
     invalid_neg_adv = invalid_tool_call_advantage
     malformed_neg_adv = malformed_thinking_advantage
     if invalid_neg_adv is None and malformed_neg_adv is None:
-        return
+        return penalty_metrics
 
     if log_config:
         print(
@@ -1292,6 +1295,10 @@ def _apply_message_level_advantage_penalties(
 
     advantages = train_data["advantages"]
     materialized_advantages = False
+    num_invalid_tool_calls = 0
+    num_malformed_thinking = 0
+    num_assistant_messages = 0
+
     for i, message_log in enumerate(message_logs):
         token_offset = 0
         for j, message in enumerate(message_log):
@@ -1300,6 +1307,8 @@ def _apply_message_level_advantage_penalties(
             is_assistant = (
                 message["role"] == "assistant" and "generation_logprobs" in message
             )
+            if is_assistant:
+                num_assistant_messages += 1
             is_invalid = (
                 is_assistant
                 and invalid_neg_adv is not None
@@ -1318,12 +1327,14 @@ def _apply_message_level_advantage_penalties(
                 materialized_advantages = True
 
             if is_invalid:
+                num_invalid_tool_calls += 1
                 print(
                     f"Setting negative advantage ({invalid_neg_adv}) for invalid tool call in assistant message {i} {j}",
                     flush=True,
                 )
                 advantages[i, token_offset : token_offset + msg_len] = invalid_neg_adv
             elif is_malformed_thinking:
+                num_malformed_thinking += 1
                 print(
                     f"Setting negative advantage ({malformed_neg_adv}) for malformed thinking in assistant message {i} {j}",
                     flush=True,
@@ -1331,19 +1342,36 @@ def _apply_message_level_advantage_penalties(
                 advantages[i, token_offset : token_offset + msg_len] = malformed_neg_adv
             token_offset += msg_len
 
+    invalid_tool_call_rate = num_invalid_tool_calls / max(num_assistant_messages, 1)
+    malformed_thinking_rate = num_malformed_thinking / max(num_assistant_messages, 1)
+    print(
+        f"Invalid tool call rate: {invalid_tool_call_rate:.4f} ({num_invalid_tool_calls}/{num_assistant_messages})",
+        flush=True,
+    )
+    print(
+        f"Malformed thinking rate: {malformed_thinking_rate:.4f} ({num_malformed_thinking}/{num_assistant_messages})",
+        flush=True,
+    )
+    penalty_metrics["invalid_tool_call_rate"] = invalid_tool_call_rate
+    penalty_metrics["malformed_thinking_rate"] = malformed_thinking_rate
+    penalty_metrics["num_invalid_tool_calls"] = num_invalid_tool_calls
+    penalty_metrics["num_malformed_thinking"] = num_malformed_thinking
+    penalty_metrics["num_assistant_messages"] = num_assistant_messages
+    return penalty_metrics
+
 
 def _apply_configured_message_level_advantage_penalties(
     train_data: BatchedDataDict[ClippedPGLossDataDict],
     message_logs: list[LLMMessageLogType | VLMMessageLogType],
     master_config: MasterConfig,
     log_config: bool = False,
-) -> None:
+) -> Optional[dict[str, float]]:
     """Resolve config and apply message-level advantage penalties."""
     (
         invalid_tool_call_advantage,
         malformed_thinking_advantage,
     ) = _resolve_message_level_advantage_penalties(master_config)
-    _apply_message_level_advantage_penalties(
+    return _apply_message_level_advantage_penalties(
         train_data=train_data,
         message_logs=message_logs,
         invalid_tool_call_advantage=invalid_tool_call_advantage,
@@ -2279,8 +2307,10 @@ def grpo_train(
                     )
                     del baseline_for_log
 
-                    _apply_configured_message_level_advantage_penalties(
-                        train_data, repeated_batch["message_log"], master_config
+                    penalty_metrics = (
+                        _apply_configured_message_level_advantage_penalties(
+                            train_data, repeated_batch["message_log"], master_config
+                        )
                     )
 
                     # Clip advantages to prevent extreme values from small std normalization
@@ -2395,6 +2425,7 @@ def grpo_train(
 
                 metrics.update(train_results["all_mb_metrics"])
                 metrics.update(gen_step_metrics)
+                metrics.update(penalty_metrics)
                 for k, v in metrics.items():
                     if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
                         valid_values = [x for x in v if not np.isinf(x)]
@@ -3462,11 +3493,13 @@ def async_grpo_train(
                         f"  📊 Advantages stats: min={advantages.min():.4f}, max={advantages.max():.4f}, mean={advantages.mean():.4f}, std={advantages.std():.4f}"
                     )
 
-                    _apply_configured_message_level_advantage_penalties(
-                        train_data,
-                        repeated_batch["message_log"],
-                        master_config,
-                        log_config=True,
+                    penalty_metrics = (
+                        _apply_configured_message_level_advantage_penalties(
+                            train_data,
+                            repeated_batch["message_log"],
+                            master_config,
+                            log_config=True,
+                        )
                     )
 
                     # Clip advantages to prevent extreme values from small std normalization
@@ -3594,6 +3627,7 @@ def async_grpo_train(
                         {f"moe/{k}": v for k, v in train_results["moe_metrics"].items()}
                     )
                 metrics.update(train_results["all_mb_metrics"])
+                metrics.update(penalty_metrics)
                 for k, v in metrics.items():
                     if k in {"probs_ratio_min", "probs_ratio_clamped_min"}:
                         valid_values = [x for x in v if not np.isinf(x)]
