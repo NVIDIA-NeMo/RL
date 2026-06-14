@@ -14,10 +14,10 @@
 
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Optional, Tuple, TypeVar
+from typing import Any, Optional, Tuple, TypeVar
 
 import torch
-from transformers import AutoConfig
+from transformers.configuration_utils import PretrainedConfig
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
@@ -55,9 +55,63 @@ class ModelFlag(Enum):
                 raise ValueError(f"Unknown ModelFlag: {self}")
 
 
+def get_hf_config_dict(model_name: str) -> dict[str, Any]:
+    """Read raw Hugging Face config metadata without instantiating a config class."""
+    config_dict, _ = PretrainedConfig.get_config_dict(
+        model_name, trust_remote_code=True
+    )
+    return config_dict
+
+
+def apply_hf_config_overrides(
+    vllm_kwargs: dict[str, Any],
+    vllm_cfg: dict[str, Any],
+    hf_config: dict[str, Any],
+    load_format: str,
+) -> None:
+    if not isinstance(vllm_kwargs.get("hf_overrides"), dict):
+        vllm_kwargs["hf_overrides"] = {}
+
+    architectures = hf_config.get("architectures") or []
+
+    # Override HF config for gpt-oss models to ensure compatibility with megatron.
+    # The megatron --> hf export is done in bf16, so we disable quantization.
+    if "GptOssForCausalLM" in architectures:
+        if "quantization_config" in hf_config:
+            assert load_format == "dummy", (
+                "Loading quantized GPT-OSS models is currently only supported with load_format='dummy'."
+            )
+            vllm_kwargs["hf_overrides"]["quantization_config"] = {}
+    elif any(
+        arch in architectures
+        for arch in (
+            "Gemma3ForConditionalGeneration",
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
+        )
+    ):
+        detected_arch = [
+            arch
+            for arch in architectures
+            if arch
+            in (
+                "Gemma3ForConditionalGeneration",
+                "Qwen3_5ForConditionalGeneration",
+                "Qwen3_5MoeForConditionalGeneration",
+            )
+        ]
+        if vllm_cfg["skip_tokenizer_init"]:
+            print(
+                f"Detected {detected_arch} which may crash when skip_tokenizer_init is True. "
+                "NeMo-RL is forcing it to False for this architecture. "
+                "See https://github.com/NVIDIA-NeMo/RL/issues/1681 for more details."
+            )
+        vllm_cfg["skip_tokenizer_init"] = False
+
+
 def is_gemma_model(model_name: str) -> bool:
-    hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-    return hasattr(hf_config, "model_type") and hf_config.model_type in [
+    hf_config = get_hf_config_dict(model_name)
+    return hf_config.get("model_type") in [
         "gemma2",
         "gemma3",
         "gemma3_text",

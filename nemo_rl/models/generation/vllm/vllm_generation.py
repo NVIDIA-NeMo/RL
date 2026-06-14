@@ -35,6 +35,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
+    RefitCheckpointEngineConfig,
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.generation.vllm.utils import (
@@ -881,6 +882,77 @@ class VllmGeneration(GenerationInterface):
 
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
+
+    def get_checkpoint_engine_config(self) -> RefitCheckpointEngineConfig | None:
+        """Return optional checkpoint-engine refit config."""
+        return self.cfg.get("checkpoint_engine")
+
+    def _checkpoint_engine_worker_method(self, method_name: str) -> str:
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            return f"{method_name}_async"
+        return method_name
+
+    def _run_checkpoint_engine_workers(
+        self, method_name: str, **kwargs: Any
+    ) -> list[ray.ObjectRef]:
+        return self.worker_group.run_all_workers_single_data(
+            self._checkpoint_engine_worker_method(method_name),
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            **kwargs,
+        )
+
+    def init_checkpoint_engine(
+        self,
+        *,
+        backend: str,
+        bucket_size_bytes: int,
+        engine_kwargs: dict[str, Any],
+    ) -> list[ray.ObjectRef]:
+        """Initialize checkpoint-engine refit transfer on vLLM workers."""
+        return self._run_checkpoint_engine_workers(
+            "init_checkpoint_engine",
+            backend=backend,
+            bucket_size_bytes=bucket_size_bytes,
+            engine_kwargs=engine_kwargs,
+        )
+
+    def prepare_checkpoint_engine(self) -> list[ray.ObjectRef]:
+        """Prepare checkpoint-engine buffers on vLLM workers."""
+        return self._run_checkpoint_engine_workers("prepare_checkpoint_engine")
+
+    def init_checkpoint_engine_process_group(
+        self,
+        *,
+        metadata: list[Any],
+        train_world_size: int,
+        rollout_world_size: int,
+    ) -> list[ray.ObjectRef]:
+        """Initialize vLLM-side checkpoint-engine topology."""
+        total_workers = len(self.worker_group.workers)
+        workers_per_group = total_workers // self.dp_size
+        rank_prefix_list = list(range(0, total_workers, workers_per_group))
+        return self.worker_group.run_all_workers_multiple_data(
+            self._checkpoint_engine_worker_method(
+                "init_checkpoint_engine_process_group"
+            ),
+            rank_prefix=rank_prefix_list,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            common_kwargs={
+                "metadata": metadata,
+                "train_world_size": train_world_size,
+                "rollout_world_size": rollout_world_size,
+            },
+        )
+
+    def update_weights_from_checkpoint_engine(self) -> list[ray.ObjectRef]:
+        """Update vLLM weights through the configured checkpoint engine."""
+        return self._run_checkpoint_engine_workers(
+            "update_weights_from_checkpoint_engine"
+        )
+
+    def finalize_checkpoint_engine(self) -> list[ray.ObjectRef]:
+        """Finalize checkpoint-engine state on vLLM workers."""
+        return self._run_checkpoint_engine_workers("finalize_checkpoint_engine")
 
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""

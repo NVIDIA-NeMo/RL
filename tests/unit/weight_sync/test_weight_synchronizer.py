@@ -23,6 +23,10 @@ from nemo_rl.models.generation.constants import (
     SGLANG_BACKEND,
     VLLM_BACKEND,
 )
+from nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer import (
+    CheckpointEngineWeightSynchronizer,
+    _flatten_checkpoint_engine_metadata,
+)
 from nemo_rl.weight_sync.collective_weight_synchronizer import (
     CollectiveWeightSynchronizer,
 )
@@ -49,6 +53,11 @@ def _mock_policy(**overrides):
     policy.stream_weights_via_http.return_value = [MagicMock()]
     policy.broadcast_weights_for_collective.return_value = [MagicMock()]
     policy.init_collective.return_value = [MagicMock()]
+    policy.init_checkpoint_engine.return_value = [MagicMock()]
+    policy.prepare_checkpoint_engine.return_value = ["policy_meta_0", "policy_meta_1"]
+    policy.init_checkpoint_engine_process_group.return_value = [MagicMock()]
+    policy.send_weights_via_checkpoint_engine.return_value = [MagicMock()]
+    policy.finalize_checkpoint_engine.return_value = [MagicMock()]
     policy.get_free_memory_bytes.return_value = 1024**3  # 1 GB
     for k, v in overrides.items():
         setattr(policy, k, v)
@@ -63,10 +72,16 @@ def _mock_generation(**overrides):
     gen.update_weights_via_ipc_zmq.return_value = [MagicMock()]
     gen.update_weights_from_collective.return_value = [MagicMock()]
     gen.invalidate_kv_cache.return_value = True
+    gen.get_checkpoint_engine_config.return_value = None
     gen.get_sglang_url_to_gpu_uuids.return_value = {
         "http://localhost:30000": ["GPU-abc"]
     }
     gen.init_collective.return_value = [MagicMock()]
+    gen.init_checkpoint_engine.return_value = [MagicMock()]
+    gen.prepare_checkpoint_engine.return_value = [["generation_meta_0"]]
+    gen.init_checkpoint_engine_process_group.return_value = [MagicMock()]
+    gen.update_weights_from_checkpoint_engine.return_value = [True]
+    gen.finalize_checkpoint_engine.return_value = [MagicMock()]
     for k, v in overrides.items():
         setattr(gen, k, v)
     return gen
@@ -77,6 +92,21 @@ def _mock_cluster(world_size=4, ip="127.0.0.1", port=29500):
     cluster.world_size.return_value = world_size
     cluster.get_master_address_and_port.return_value = (ip, port)
     return cluster
+
+
+def _checkpoint_engine_config(engine_kwargs=None):
+    if engine_kwargs is None:
+        engine_kwargs = {
+            "device": "cuda",
+            "cleanup_after_load": False,
+            "backend_name": "UCX",
+        }
+    return {
+        "enabled": True,
+        "backend": "nixl",
+        "update_weights_bucket_megabytes": 16,
+        "engine_kwargs": {"nixl": engine_kwargs},
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +399,159 @@ class TestCollectiveWeightSynchronizer:
 
 
 # ---------------------------------------------------------------------------
+# CheckpointEngineWeightSynchronizer
+# ---------------------------------------------------------------------------
+
+
+class TestCheckpointEngineWeightSynchronizer:
+    def test_flatten_checkpoint_engine_metadata_accepts_mixed_entries(self):
+        assert _flatten_checkpoint_engine_metadata(
+            [["policy0", "policy1"], "generation0", ["generation1"]]
+        ) == ["policy0", "policy1", "generation0", "generation1"]
+
+    @patch("nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer.ray")
+    def test_sync_weights_calls_checkpoint_engine_lifecycle(self, mock_ray):
+        mock_ray.get.side_effect = lambda value: value
+        policy = _mock_policy()
+        gen = _mock_generation()
+        sync = CheckpointEngineWeightSynchronizer(
+            policy,
+            gen,
+            _checkpoint_engine_config(),
+        )
+
+        sync.sync_weights(kv_scales={"layer.0": 1.0})
+
+        policy.init_checkpoint_engine.assert_called_once_with(
+            backend="nixl",
+            bucket_size_bytes=16 * 1024 * 1024,
+            engine_kwargs={
+                "device": "cuda",
+                "cleanup_after_load": False,
+                "backend_name": "UCX",
+            },
+        )
+        gen.init_checkpoint_engine.assert_called_once_with(
+            backend="nixl",
+            bucket_size_bytes=16 * 1024 * 1024,
+            engine_kwargs={
+                "device": "cuda",
+                "cleanup_after_load": False,
+                "backend_name": "UCX",
+            },
+        )
+        policy.init_checkpoint_engine_process_group.assert_called_once_with(
+            metadata=["policy_meta_0", "policy_meta_1", "generation_meta_0"],
+            train_world_size=2,
+            rollout_world_size=1,
+        )
+        gen.init_checkpoint_engine_process_group.assert_called_once_with(
+            metadata=["policy_meta_0", "policy_meta_1", "generation_meta_0"],
+            train_world_size=2,
+            rollout_world_size=1,
+        )
+        policy.send_weights_via_checkpoint_engine.assert_called_once_with(
+            kv_scales={"layer.0": 1.0}
+        )
+        gen.update_weights_from_checkpoint_engine.assert_called_once()
+        policy.finalize_checkpoint_engine.assert_called_once()
+        gen.finalize_checkpoint_engine.assert_called_once()
+        assert not sync.is_stale
+
+    @patch("nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer.ray")
+    def test_sync_weights_raises_on_failure(self, mock_ray):
+        mock_ray.get.side_effect = lambda value: value
+        policy = _mock_policy()
+        gen = _mock_generation()
+        gen.update_weights_from_checkpoint_engine.return_value = [False]
+        sync = CheckpointEngineWeightSynchronizer(
+            policy,
+            gen,
+            _checkpoint_engine_config(),
+        )
+
+        with pytest.raises(RuntimeError, match="checkpoint-engine sync"):
+            sync.sync_weights()
+
+        policy.finalize_checkpoint_engine.assert_called_once()
+        gen.finalize_checkpoint_engine.assert_called_once()
+        assert sync.is_stale
+
+    @patch("nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer.ray")
+    def test_sync_weights_uses_timer_context(self, mock_ray):
+        mock_ray.get.side_effect = lambda value: value
+        events = []
+
+        class TimerContext:
+            def __enter__(self):
+                events.append("enter")
+
+            def __exit__(self, exc_type, exc, tb):
+                events.append(("exit", exc_type))
+
+        class Timer:
+            def time(self, label):
+                events.append(label)
+                return TimerContext()
+
+        sync = CheckpointEngineWeightSynchronizer(
+            _mock_policy(),
+            _mock_generation(),
+            _checkpoint_engine_config(),
+        )
+
+        sync.sync_weights(timer=Timer())
+
+        assert events == [
+            "prepare_for_generation/transfer_and_update_weights",
+            "enter",
+            ("exit", None),
+        ]
+
+    @patch("nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer.ray")
+    def test_transfer_weights_treats_none_results_as_success(self, mock_ray):
+        mock_ray.get.side_effect = lambda value: value
+        gen = _mock_generation()
+        gen.update_weights_from_checkpoint_engine.return_value = [None, True]
+        sync = CheckpointEngineWeightSynchronizer(
+            _mock_policy(),
+            gen,
+            _checkpoint_engine_config(),
+        )
+
+        assert sync._transfer_weights(kv_scales=None)
+
+    def test_mark_stale_and_shutdown(self):
+        sync = CheckpointEngineWeightSynchronizer(
+            _mock_policy(),
+            _mock_generation(),
+            _checkpoint_engine_config(),
+        )
+
+        sync._stale = False
+        sync.mark_stale()
+        sync.shutdown()
+
+        assert sync.is_stale
+
+    def test_init_communicator(self):
+        policy = _mock_policy()
+        gen = _mock_generation()
+        sync = CheckpointEngineWeightSynchronizer(
+            policy,
+            gen,
+            _checkpoint_engine_config(),
+        )
+
+        sync.init_communicator()
+
+        policy.prepare_refit_info.assert_called_once()
+        gen.prepare_refit_info.assert_called_once_with(
+            {"layer_0": {"shape": [4096, 4096]}}
+        )
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -407,6 +590,16 @@ class TestFactory:
         )
         assert isinstance(sync, IPCWeightSynchronizer)
 
+    def test_colocated_megatron_without_checkpoint_config_method_returns_ipc(self):
+        policy = _mock_policy()
+        sync = create_weight_synchronizer(
+            policy=policy,
+            generation=object(),
+            generation_backend=MEGATRON_BACKEND,
+            colocated=True,
+        )
+        assert isinstance(sync, IPCWeightSynchronizer)
+
     def test_non_colocated_vllm_returns_collective(self):
         policy = _mock_policy()
         gen = _mock_generation()
@@ -419,6 +612,64 @@ class TestFactory:
             inference_cluster=_mock_cluster(),
         )
         assert isinstance(sync, CollectiveWeightSynchronizer)
+
+    def test_non_colocated_checkpoint_engine_returns_checkpoint_sync(self):
+        policy = _mock_policy()
+        gen = _mock_generation()
+        gen.get_checkpoint_engine_config.return_value = _checkpoint_engine_config()
+
+        sync = create_weight_synchronizer(
+            policy=policy,
+            generation=gen,
+            generation_backend=VLLM_BACKEND,
+            colocated=False,
+        )
+
+        assert isinstance(sync, CheckpointEngineWeightSynchronizer)
+
+    def test_disabled_checkpoint_engine_config_falls_back_to_collective(self):
+        policy = _mock_policy()
+        gen = _mock_generation()
+        checkpoint_config = _checkpoint_engine_config()
+        checkpoint_config["enabled"] = False
+        gen.get_checkpoint_engine_config.return_value = checkpoint_config
+
+        sync = create_weight_synchronizer(
+            policy=policy,
+            generation=gen,
+            generation_backend=VLLM_BACKEND,
+            colocated=False,
+            train_cluster=_mock_cluster(),
+            inference_cluster=_mock_cluster(),
+        )
+
+        assert isinstance(sync, CollectiveWeightSynchronizer)
+
+    def test_colocated_checkpoint_engine_raises(self):
+        policy = _mock_policy()
+        gen = _mock_generation()
+        gen.get_checkpoint_engine_config.return_value = _checkpoint_engine_config()
+
+        with pytest.raises(ValueError, match="non-colocated generation"):
+            create_weight_synchronizer(
+                policy=policy,
+                generation=gen,
+                generation_backend=VLLM_BACKEND,
+                colocated=True,
+            )
+
+    def test_sglang_checkpoint_engine_raises(self):
+        policy = _mock_policy()
+        gen = _mock_generation()
+        gen.get_checkpoint_engine_config.return_value = _checkpoint_engine_config()
+
+        with pytest.raises(NotImplementedError, match="checkpoint-engine"):
+            create_weight_synchronizer(
+                policy=policy,
+                generation=gen,
+                generation_backend=SGLANG_BACKEND,
+                colocated=False,
+            )
 
     def test_non_colocated_sglang_raises(self):
         policy = _mock_policy()

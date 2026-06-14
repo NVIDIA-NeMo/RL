@@ -223,6 +223,27 @@ def get_runtime_env_for_policy_worker(policy_worker_name: str) -> dict[str, Any]
     return runtime_env
 
 
+def maybe_preinit_nixl_for_checkpoint_engine(config: Any) -> Any | None:
+    """Initialize NIXL's backend before distributed comm stacks are created."""
+    generation_cfg = config.get("generation")
+    if generation_cfg is None:
+        return None
+
+    checkpoint_cfg = generation_cfg.get("checkpoint_engine")
+    if checkpoint_cfg is None:
+        return None
+    if not checkpoint_cfg["enabled"] or checkpoint_cfg["backend"] != "nixl":
+        return None
+
+    nixl_kwargs = checkpoint_cfg["engine_kwargs"]["nixl"]
+    from nemo_rl.utils.checkpoint_engines.nixl import preinit_nixl_agent
+
+    return preinit_nixl_agent(
+        backend_name=nixl_kwargs["backend_name"],
+        backend_init_params=nixl_kwargs.get("backend_init_params"),
+    )
+
+
 def get_megatron_checkpoint_dir() -> str:
     """Gets the default megatron checkpoint directory for initial HF -> Mcore conversion.
 
@@ -569,7 +590,6 @@ def _setup_ipc_gather_group(
         return None, None, None
 
     world_size = dist.get_world_size()
-    my_rank = dist.get_rank()
 
     all_ranks_uuids = [None] * world_size
     dist.all_gather_object(all_ranks_uuids, current_device_uuid)

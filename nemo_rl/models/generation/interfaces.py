@@ -115,6 +115,26 @@ class ColocationConfig(TypedDict):
     resources: OptionalResourcesConfig
 
 
+class RefitCheckpointEngineConfig(TypedDict):
+    """Configuration for checkpoint-engine based generation refit.
+
+    Keys:
+        enabled: Whether to use checkpoint-engine transfer for non-colocated
+            policy-to-generation refit.
+        backend: Transfer backend registered name or backend class path. Built-in
+            backend: ``"nixl"``.
+        update_weights_bucket_megabytes: Maximum transfer bucket size in MiB.
+            Tune this per backend and model size.
+        engine_kwargs: Backend-specific keyword arguments, keyed by backend value.
+            For plugin backends, use the same class path string as ``backend``.
+    """
+
+    enabled: bool
+    backend: str
+    update_weights_bucket_megabytes: int
+    engine_kwargs: dict[str, dict[str, Any]]
+
+
 class GenerationConfig(TypedDict):
     """Configuration for generation."""
 
@@ -129,6 +149,7 @@ class GenerationConfig(TypedDict):
     colocated: NotRequired[ColocationConfig]
     port_range_low: NotRequired[int]
     port_range_high: NotRequired[int]
+    checkpoint_engine: NotRequired[RefitCheckpointEngineConfig]
     # This isn't meant to be passed by the user, but is populated by nemo_rl.models.generation.__init__.configure_generation_config
     _pad_token_id: NotRequired[int]
 
@@ -260,6 +281,42 @@ class GenerationInterface(ABC):
 
     def update_weights_from_collective(self) -> list[ray.ObjectRef]:
         """Update the model weights from collective communication."""
+        raise NotImplementedError
+
+    def get_checkpoint_engine_config(self) -> RefitCheckpointEngineConfig | None:
+        """Return checkpoint-engine refit config if the backend supports it."""
+        return None
+
+    def init_checkpoint_engine(
+        self,
+        *,
+        backend: str,
+        bucket_size_bytes: int,
+        engine_kwargs: dict[str, Any],
+    ) -> list[ray.ObjectRef]:
+        """Initialize checkpoint-engine based refit transfer."""
+        raise NotImplementedError
+
+    def prepare_checkpoint_engine(self) -> list[ray.ObjectRef]:
+        """Prepare checkpoint-engine buffers and return metadata futures."""
+        raise NotImplementedError
+
+    def init_checkpoint_engine_process_group(
+        self,
+        *,
+        metadata: list[Any],
+        train_world_size: int,
+        rollout_world_size: int,
+    ) -> list[ray.ObjectRef]:
+        """Initialize checkpoint-engine process groups."""
+        raise NotImplementedError
+
+    def update_weights_from_checkpoint_engine(self) -> list[ray.ObjectRef]:
+        """Receive and load weights through the configured checkpoint engine."""
+        raise NotImplementedError
+
+    def finalize_checkpoint_engine(self) -> list[ray.ObjectRef]:
+        """Finalize checkpoint-engine state."""
         raise NotImplementedError
 
     # Optional hook; backends may override to invalidate any reusable caches

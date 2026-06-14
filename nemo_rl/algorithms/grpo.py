@@ -80,6 +80,7 @@ from nemo_rl.experience.rollouts import (
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
 )
+from nemo_rl.models.generation.constants import SGLANG_BACKEND, VLLM_BACKEND
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.sglang import SGLangConfig, SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
@@ -96,6 +97,7 @@ from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
+from nemo_rl.weight_sync import create_weight_synchronizer
 
 # ===============================================================================
 # Configuration
@@ -914,8 +916,12 @@ def setup(
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
+    checkpoint_engine_config = _get_enabled_checkpoint_engine_config(
+        generation_config.get("checkpoint_engine")
+    )
+
     # if it is not colocated inference, initialize collective communication for update weights
-    if not colocated_inference:
+    if not colocated_inference and checkpoint_engine_config is None:
         t0 = time.perf_counter()
         ip, port = train_cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
@@ -933,6 +939,11 @@ def setup(
         # wait for all futures to complete
         ray.get(futures_train + futures_inference)
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
+    elif not colocated_inference:
+        print(
+            f"Using checkpoint-engine refit backend: {checkpoint_engine_config['backend']}",
+            flush=True,
+        )
 
     # prepare refit info
     state_dict_info = policy.prepare_refit_info()
@@ -1472,6 +1483,14 @@ def _clip_grpo_advantages(
     return advantages
 
 
+def _get_enabled_checkpoint_engine_config(
+    checkpoint_engine_config: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if checkpoint_engine_config is None or not checkpoint_engine_config["enabled"]:
+        return None
+    return checkpoint_engine_config
+
+
 def refit_policy_generation(
     policy: ColocatablePolicyInterface,
     policy_generation: GenerationInterface,
@@ -1491,84 +1510,56 @@ def refit_policy_generation(
         timer: Optional Timer used to time the prepare/transfer/update phase
         kv_scales: Optional dictionary of KV cache scales for FP8 quantization.
     """
-    if colocated_inference:
-        policy.offload_before_refit()
-        policy_generation.prepare_for_generation(tags=["weights"])
+    checkpoint_engine_config = _get_enabled_checkpoint_engine_config(
+        policy_generation.get_checkpoint_engine_config()
+    )
+    if colocated_inference and checkpoint_engine_config is not None:
+        raise ValueError(
+            "checkpoint-engine refit is only supported for non-colocated generation. "
+            "Set policy.generation.colocated.enabled=false or disable "
+            "policy.generation.checkpoint_engine.enabled."
+        )
 
-    # Create a context manager that does nothing when timer is None
+    if colocated_inference or checkpoint_engine_config is not None:
+        generation_backend = (
+            SGLANG_BACKEND
+            if isinstance(policy_generation, SGLangGeneration)
+            else VLLM_BACKEND
+        )
+        weight_sync = create_weight_synchronizer(
+            policy=policy,
+            generation=policy_generation,
+            generation_backend=generation_backend,
+            colocated=colocated_inference,
+            refit_buffer_size_gb=_refit_buffer_size_gb,
+        )
+        weight_sync.sync_weights(timer=timer, kv_scales=kv_scales)
+        return
+
     timer_context = (
         timer.time("prepare_for_generation/transfer_and_update_weights")
         if timer is not None
         else nullcontext()
     )
     with timer_context:
-        # update weights
-        update_success = False
-        if colocated_inference:
-            # get model param keys, which is grouped by size
-            if _refit_buffer_size_gb is not None:
-                buffer_size_bytes = _refit_buffer_size_gb * (1024**3)
-            else:
-                # Empirically sets ratio as 30% to maximize efficiency.
-                # The remaining 70% is a necessary buffer reserved for the parameter all-gathering across the expert-parallelism dimension.
-                memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.3")
-                buffer_size_bytes = int(
-                    policy.get_free_memory_bytes() * float(memory_ratio)
-                )
-
-            if isinstance(policy_generation, SGLangGeneration):
-                sglang_url_to_gpu_uuids = (
-                    policy_generation.get_sglang_url_to_gpu_uuids()
-                )
-                # Stream weights via HTTP
-                flush_success = policy_generation.invalidate_kv_cache()
-                if not flush_success:
-                    print("SGLang KV cache invalidation failed before weight update. ")
-                futures_train = policy.stream_weights_via_http(
-                    sglang_url_to_gpu_uuids=sglang_url_to_gpu_uuids,
-                )
-                # Wait for all workers to complete
-                ray.get(futures_train)
-                update_success = True
-            else:
-                # Original ZMQ IPC path for vLLM
-                futures_train = policy.stream_weights_via_ipc_zmq(
-                    buffer_size_bytes=buffer_size_bytes
-                )
-                futures_inference = policy_generation.update_weights_via_ipc_zmq()
-                # wait for all futures to complete
-                ray.get(futures_train)
-                results = ray.get(futures_inference)
-                update_success = all(result for result in results if result is not None)
-        else:
-            # update weights through nccl
-            # SGLang haven't implemented non-colocated inference mode.
-            if isinstance(policy_generation, SGLangGeneration):
-                raise NotImplementedError(
-                    "SGLang haven't implemented non-colocated inference mode. "
-                )
-            policy.offload_before_refit()
-            futures_train = policy.broadcast_weights_for_collective(kv_scales=kv_scales)
-            futures_inference = policy_generation.update_weights_from_collective()
-            # wait for all futures to complete
-            ray.get(futures_train)
-            results = ray.get(futures_inference)
-            update_success = all(result for result in results if result is not None)
-            policy.prepare_for_training()
-
-        # check if update is successful
-        if not update_success:
-            error_tag = "cuda-ipc" if colocated_inference else "nccl"
-            error_message = (
-                "❌ Error: Updating weights for the generation policy failed during refit.\n"
-                f"This often indicates an issue with {error_tag} or "
-                "a problem within the generation backend (e.g., vLLM worker).\n"
+        if isinstance(policy_generation, SGLangGeneration):
+            raise NotImplementedError(
+                "SGLang haven't implemented non-colocated inference mode. "
             )
-            raise RuntimeError(error_message)
+        policy.offload_before_refit()
+        futures_train = policy.broadcast_weights_for_collective(kv_scales=kv_scales)
+        futures_inference = policy_generation.update_weights_from_collective()
+        ray.get(futures_train)
+        results = ray.get(futures_inference)
+        update_success = all(result for result in results if result is not None)
+        policy.prepare_for_training()
 
-    if colocated_inference:
-        policy.offload_after_refit()
-        policy_generation.prepare_for_generation(tags=["kv_cache"])
+    if not update_success:
+        raise RuntimeError(
+            "❌ Error: Updating weights for the generation policy failed during refit.\n"
+            "This often indicates an issue with nccl or a problem within the "
+            "generation backend (e.g., vLLM worker).\n"
+        )
 
 
 def _log_mixed_rewards_and_advantages_information(
@@ -2595,7 +2586,7 @@ def grpo_train(
                 .get("vllm_cfg", {})
                 .get("async_engine", False)
             ):
-                for metric_name in metrics.keys():
+                for metric_name in metrics:
                     if metric_name.startswith("histogram/"):
                         logger.log_histogram(
                             metrics[metric_name],
@@ -2625,10 +2616,6 @@ def grpo_train(
             # Display total time first, separately
             total_time = timing_metrics.get("total_step_time", 0)
 
-            number_of_samples_per_step = (
-                master_config.grpo["num_prompts_per_step"]
-                * master_config.grpo["num_generations_per_prompt"]
-            )
             total_num_gpus = (
                 master_config.cluster["num_nodes"]
                 * master_config.cluster["gpus_per_node"]
@@ -3079,7 +3066,7 @@ def async_grpo_train(
     )
 
     # Start trajectory collection in background
-    collection_task = trajectory_collector.start_collection.remote(dataloader)
+    trajectory_collector.start_collection.remote(dataloader)
 
     # Ensure collector knows initial weight version
     trajectory_collector.set_weight_version.remote(weight_version)
@@ -3769,7 +3756,7 @@ def async_grpo_train(
                 .get("vllm_cfg", {})
                 .get("async_engine", False)
             ):
-                for metric_name in metrics.keys():
+                for metric_name in metrics:
                     if metric_name.startswith("histogram/"):
                         logger.log_histogram(
                             metrics[metric_name],

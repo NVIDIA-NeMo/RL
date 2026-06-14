@@ -22,7 +22,6 @@ from typing import Any, Optional, cast
 
 import ray
 import torch
-from transformers import AutoConfig
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
@@ -37,7 +36,11 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generation
-from nemo_rl.models.huggingface.common import ModelFlag
+from nemo_rl.models.huggingface.common import (
+    ModelFlag,
+    apply_hf_config_overrides,
+    get_hf_config_dict,
+)
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
@@ -330,6 +333,65 @@ class BaseVllmGenerationWorker:
                 if need_replace:
                     write_back(content)
 
+        def _patch_vllm_worker_nixl_preinit():
+            """Patch vLLM internal workers to preinit NIXL before worker setup."""
+            checkpoint_cfg = self.cfg.get("checkpoint_engine")
+            if (
+                checkpoint_cfg is None
+                or not checkpoint_cfg["enabled"]
+                or checkpoint_cfg["backend"] != "nixl"
+            ):
+                return
+
+            file_to_patch = _get_vllm_file("v1/worker/worker_base.py")
+            with open(file_to_patch, "r") as f:
+                content = f.read()
+
+            if "maybe_preinit_nixl_for_vllm_worker(" in content:
+                logger.info("vLLM worker NIXL preinit patch already applied.")
+                return
+
+            nixl_kwargs = checkpoint_cfg["engine_kwargs"]["nixl"]
+            preinit_config = {
+                "backend_name": nixl_kwargs["backend_name"],
+                "backend_init_params": nixl_kwargs.get("backend_init_params"),
+            }
+            old_snippet = (
+                "        with set_current_vllm_config(self.vllm_config):\n"
+                "            # To make vLLM config available during worker initialization\n"
+                "            self.worker = worker_class(**kwargs)"
+            )
+            new_snippet = (
+                "        from nemo_rl.models.generation.vllm.vllm_backend import (\n"
+                "            maybe_preinit_nixl_for_vllm_worker,\n"
+                "        )\n"
+                "\n"
+                "        maybe_preinit_nixl_for_vllm_worker(\n"
+                "            self,\n"
+                f"            {preinit_config!r},\n"
+                "        )\n"
+                "\n"
+                "        with set_current_vllm_config(self.vllm_config):\n"
+                "            # To make vLLM config available during worker initialization\n"
+                "            self.worker = worker_class(**kwargs)"
+            )
+
+            if old_snippet not in content:
+                logger.warning(
+                    "Could not apply vLLM worker NIXL preinit patch: "
+                    "expected code snippet not found in %s. "
+                    "The vLLM version may have changed.",
+                    file_to_patch,
+                )
+                return
+
+            content = content.replace(old_snippet, new_snippet, 1)
+
+            with open(file_to_patch, "w") as f:
+                f.write(content)
+
+            logger.info("Successfully patched vLLM worker NIXL preinit.")
+
         def _patch_vllm_llama_eagle3_own_lm_head():
             """Patch LlamaEagle3 to keep truncated draft lm_head ownership."""
             try:
@@ -503,6 +565,7 @@ class BaseVllmGenerationWorker:
         _patch_vllm_init_workers_ray()
         logger.info("Successfully patched vllm _init_workers_ray.")
 
+        _patch_vllm_worker_nixl_preinit()
         _patch_vllm_llama_eagle3_own_lm_head()
         _patch_vllm_hermes_tool_parser_thread_safety()
         log_gpu_memory_diagnostics(
@@ -604,44 +667,13 @@ class BaseVllmGenerationWorker:
             # overriden by quant config, however vllm complains if this not passed
             self.precision = "bfloat16"
 
-        if not isinstance(vllm_kwargs.get("hf_overrides"), dict):
-            vllm_kwargs["hf_overrides"] = {}
-
-        # Override HF config for gpt-oss models to ensure compatibility with megatron
-        # The megatron --> hf export is done in bf16, so we disable quantization
-        hf_config = AutoConfig.from_pretrained(self.model_name, trust_remote_code=True)
-        if "GptOssForCausalLM" in getattr(hf_config, "architectures", []):
-            if "quantization_config" in hf_config:
-                assert load_format == "dummy", (
-                    "Loading quantized GPT-OSS models is currently only supported with load_format='dummy'."
-                )
-                # disable quantization
-                vllm_kwargs["hf_overrides"]["quantization_config"] = {}
-        elif any(
-            arch in getattr(hf_config, "architectures", [])
-            for arch in (
-                "Gemma3ForConditionalGeneration",
-                "Qwen3_5ForConditionalGeneration",
-                "Qwen3_5MoeForConditionalGeneration",
-            )
-        ):
-            detected_arch = [
-                arch
-                for arch in getattr(hf_config, "architectures", [])
-                if arch
-                in (
-                    "Gemma3ForConditionalGeneration",
-                    "Qwen3_5ForConditionalGeneration",
-                    "Qwen3_5MoeForConditionalGeneration",
-                )
-            ]
-            if self.cfg["vllm_cfg"]["skip_tokenizer_init"]:
-                print(
-                    f"Detected {detected_arch} which may crash when skip_tokenizer_init is True. "
-                    "NeMo-RL is forcing it to False for this architecture. "
-                    "See https://github.com/NVIDIA-NeMo/RL/issues/1681 for more details."
-                )
-            self.cfg["vllm_cfg"]["skip_tokenizer_init"] = False
+        hf_config = get_hf_config_dict(self.model_name)
+        apply_hf_config_overrides(
+            vllm_kwargs,
+            self.cfg["vllm_cfg"],
+            hf_config,
+            load_format,
+        )
 
         llm_kwargs = dict(
             model=self.model_name,
@@ -795,6 +827,49 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
                 train_world_size,
             ),
         )
+
+    def _checkpoint_engine_rpc(self, method_name: str, *args: Any) -> Any:
+        return self.llm.collective_rpc(method_name, args=args)
+
+    def init_checkpoint_engine(
+        self,
+        backend: str,
+        bucket_size_bytes: int,
+        engine_kwargs: dict[str, Any],
+    ) -> None:
+        self._checkpoint_engine_rpc(
+            "init_checkpoint_engine",
+            backend,
+            bucket_size_bytes,
+            engine_kwargs,
+        )
+
+    def prepare_checkpoint_engine(self) -> list[Any]:
+        return self._checkpoint_engine_rpc("prepare_checkpoint_engine")
+
+    def init_checkpoint_engine_process_group(
+        self,
+        rank_prefix: int,
+        train_world_size: int,
+        rollout_world_size: int,
+        metadata: list[Any],
+    ) -> None:
+        self._checkpoint_engine_rpc(
+            "init_checkpoint_engine_process_group",
+            rank_prefix,
+            train_world_size,
+            rollout_world_size,
+            metadata,
+        )
+
+    def finalize_checkpoint_engine(self) -> None:
+        self._checkpoint_engine_rpc("finalize_checkpoint_engine")
+
+    def update_weights_from_checkpoint_engine(self) -> bool:
+        worker_results = self._checkpoint_engine_rpc(
+            "update_weights_from_checkpoint_engine"
+        )
+        return all(result for result in worker_results if result is not None)
 
     @wrap_with_nvtx_name("vllm_genertion_worker/generate")
     def generate(

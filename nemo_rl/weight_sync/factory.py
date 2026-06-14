@@ -16,16 +16,19 @@
 
 Selects the appropriate weight synchronizer based on the deployment
 topology (colocated vs. non-colocated) and the generation backend
-(vLLM uses IPC/ZMQ, SGLang uses HTTP, non-colocated uses NCCL).
+(vLLM uses IPC/ZMQ, SGLang uses HTTP, non-colocated uses NCCL or a
+configured checkpoint-engine backend).
 """
 
-from typing import Any, Optional
+from collections.abc import Callable
+from typing import Any, Optional, cast
 
 from nemo_rl.models.generation.constants import (
     MEGATRON_BACKEND,
     SGLANG_BACKEND,
     VLLM_BACKEND,
 )
+from nemo_rl.models.generation.interfaces import RefitCheckpointEngineConfig
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
 
@@ -45,8 +48,10 @@ def create_weight_synchronizer(
         generation: Generation object (GenerationInterface).
         generation_backend: Name of the generation backend ("vllm", "sglang", "megatron").
         colocated: Whether policy and generation share the same GPUs.
-        train_cluster: RayVirtualCluster for training workers (required for non-colocated).
-        inference_cluster: RayVirtualCluster for inference workers (required for non-colocated).
+        train_cluster: RayVirtualCluster for training workers (required for
+            non-colocated collective synchronization).
+        inference_cluster: RayVirtualCluster for inference workers (required
+            for non-colocated collective synchronization).
         refit_buffer_size_gb: Optional fixed buffer size for IPC weight staging.
 
     Returns:
@@ -56,11 +61,42 @@ def create_weight_synchronizer(
         NotImplementedError: If the requested configuration is not supported.
         ValueError: If required arguments are missing.
     """
-    _SUPPORTED_BACKENDS = {VLLM_BACKEND, SGLANG_BACKEND, MEGATRON_BACKEND}
-    if generation_backend not in _SUPPORTED_BACKENDS:
+    supported_backends = {VLLM_BACKEND, SGLANG_BACKEND, MEGATRON_BACKEND}
+    if generation_backend not in supported_backends:
         raise ValueError(
             f"Unknown generation backend {generation_backend!r}. "
-            f"Supported backends: {sorted(_SUPPORTED_BACKENDS)}"
+            f"Supported backends: {sorted(supported_backends)}"
+        )
+
+    get_checkpoint_engine_config = cast(
+        Callable[[], RefitCheckpointEngineConfig | None] | None,
+        getattr(generation, "get_checkpoint_engine_config", None),
+    )
+    checkpoint_engine_config = (
+        get_checkpoint_engine_config()
+        if get_checkpoint_engine_config is not None
+        else None
+    )
+    if checkpoint_engine_config is not None and checkpoint_engine_config["enabled"]:
+        if colocated:
+            raise ValueError(
+                "checkpoint-engine refit is only supported for non-colocated "
+                "generation. Set policy.generation.colocated.enabled=false or "
+                "disable policy.generation.checkpoint_engine.enabled."
+            )
+        if generation_backend == SGLANG_BACKEND:
+            raise NotImplementedError(
+                "SGLang does not support checkpoint-engine non-colocated refit."
+            )
+
+        from nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer import (
+            CheckpointEngineWeightSynchronizer,
+        )
+
+        return CheckpointEngineWeightSynchronizer(
+            policy=policy,
+            generation=generation,
+            checkpoint_engine_config=checkpoint_engine_config,
         )
 
     if not colocated:

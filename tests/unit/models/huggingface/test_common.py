@@ -54,3 +54,42 @@ def test_gemma_models(model_name):
 def test_non_gemma_models(model_name):
     assert not is_gemma_model(model_name)
     assert not ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(model_name)
+
+
+@pytest.mark.parametrize("model_type", ["gemma2", "gemma3", "gemma3_text"])
+def test_is_gemma_model_uses_raw_config_model_type(model_type, monkeypatch):
+    calls = []
+
+    def fake_get_config_dict(model_name, **kwargs):
+        calls.append((model_name, kwargs))
+        return {"model_type": model_type}, {}
+
+    monkeypatch.setattr(
+        "nemo_rl.models.huggingface.common.PretrainedConfig.get_config_dict",
+        fake_get_config_dict,
+    )
+
+    assert is_gemma_model("google/gemma-test")
+    assert ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches("google/gemma-test")
+    assert calls == [
+        ("google/gemma-test", {"trust_remote_code": True}),
+        ("google/gemma-test", {"trust_remote_code": True}),
+    ]
+
+
+@pytest.mark.parametrize(
+    "config_dict",
+    [
+        {},
+        {"model_type": "qwen2"},
+        {"architectures": ["Qwen2ForCausalLM"]},
+    ],
+)
+def test_is_gemma_model_handles_non_gemma_raw_configs(config_dict, monkeypatch):
+    monkeypatch.setattr(
+        "nemo_rl.models.huggingface.common.PretrainedConfig.get_config_dict",
+        lambda model_name, **kwargs: (config_dict, {}),
+    )
+
+    assert not is_gemma_model("Qwen/Qwen2.5-0.5B")
+    assert not ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches("Qwen/Qwen2.5-0.5B")

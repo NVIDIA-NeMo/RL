@@ -332,6 +332,27 @@ policy:
       enable_vllm_metrics_logger: true # Set to true to enable vLLM internal metrics logger, turn off for better performance
       vllm_metrics_logger_interval: 0.5 # Interval in seconds to collect vLLM logger metrics
     vllm_kwargs: {}
+    checkpoint_engine:
+      # Optional non-colocated refit transfer backend. Use a built-in backend
+      # name such as "nixl" or a plugin class path like
+      # "my_pkg.my_backend:MyCheckpointEngine".
+      enabled: false
+      backend: "nixl"
+      update_weights_bucket_megabytes: 2048
+      engine_kwargs:
+        # For plugin backends, key kwargs by the exact backend string.
+        nixl:
+          device: cuda
+          cleanup_after_load: true
+          topology: auto
+          transfer_mode: staged
+          buffer_count: 2
+          background_progress: false
+          load_batch_bucket_count: 1
+          direct_min_bytes: 2147483648
+          direct_stripe_count: 1
+          metadata_batch_size: 1
+          backend_name: UCX
     colocated:
       # true: generation shares training GPUs
       # false: uses dedicated generation resources

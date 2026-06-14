@@ -93,6 +93,9 @@ class SglangSpecificArgs(TypedDict):
     enable_fast_load: NotRequired[bool]
     # Server warmup
     skip_server_warmup: NotRequired[bool]
+    # Server startup readiness check
+    startup_health_endpoint: NotRequired[str]
+    server_startup_timeout: NotRequired[int | float]
 
 
 class SGLangConfig(GenerationConfig):

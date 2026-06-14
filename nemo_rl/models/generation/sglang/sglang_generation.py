@@ -31,6 +31,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
+    RefitCheckpointEngineConfig,
 )
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 
@@ -276,6 +277,10 @@ class SGLangGeneration(GenerationInterface):
 
     def update_weights_from_collective(self) -> list[ray.ObjectRef]:
         return []
+
+    def get_checkpoint_engine_config(self) -> RefitCheckpointEngineConfig | None:
+        """Return optional checkpoint-engine refit config."""
+        return self.cfg.get("checkpoint_engine")
 
     def get_sglang_server_urls(self) -> list[str]:
         """Get base URLs of all SGLang servers.

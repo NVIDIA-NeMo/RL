@@ -206,6 +206,40 @@ class ColocatablePolicyInterface(PolicyInterface):
     ) -> list[ray.ObjectRef]:
         pass
 
+    def init_checkpoint_engine(
+        self,
+        *,
+        backend: str,
+        bucket_size_bytes: int,
+        engine_kwargs: dict[str, Any],
+    ) -> list[ray.ObjectRef]:
+        """Initialize checkpoint-engine based refit transfer."""
+        raise NotImplementedError
+
+    def prepare_checkpoint_engine(self) -> list[ray.ObjectRef]:
+        """Prepare checkpoint-engine buffers and return metadata futures."""
+        raise NotImplementedError
+
+    def init_checkpoint_engine_process_group(
+        self,
+        *,
+        metadata: list[Any],
+        train_world_size: int,
+        rollout_world_size: int,
+    ) -> list[ray.ObjectRef]:
+        """Initialize checkpoint-engine process groups."""
+        raise NotImplementedError
+
+    def send_weights_via_checkpoint_engine(
+        self, kv_scales: Optional[dict[str, float]] = None
+    ) -> list[ray.ObjectRef]:
+        """Send weights through the configured checkpoint engine."""
+        raise NotImplementedError
+
+    def finalize_checkpoint_engine(self) -> list[ray.ObjectRef]:
+        """Finalize checkpoint-engine state."""
+        raise NotImplementedError
+
     @abstractmethod
     def prepare_for_lp_inference(self) -> None:
         pass

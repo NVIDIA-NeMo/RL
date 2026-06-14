@@ -18,3 +18,11 @@ NeMo RL supports multiple generation/rollout backends to accommodate different m
 
 For detailed information on backend selection, configuration, and examples, see the [Generation Backends documentation](../design-docs/generation.md).
 
+## Refit Transfer Backends
+
+When generation is non-colocated, NeMo RL can update generation weights through
+a checkpoint-engine transfer backend. The built-in checkpoint-engine backend is
+`nixl`, which can use UCX/RDMA for policy-to-vLLM refit.
+
+For usage, see the [Checkpoint-Engine Refit guide](../guides/checkpoint-engine-refit.md).
+For plugin details, see the [Checkpoint Engine design doc](../design-docs/checkpoint-engines.md).
