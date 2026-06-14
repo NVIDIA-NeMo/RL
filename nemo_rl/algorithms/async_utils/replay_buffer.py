@@ -601,12 +601,23 @@ class TQReplayBuffer:
         sample_ids, fields, tags = pack_payload(
             train_batch, weight_version=weight_version, group_id=group_id
         )
-        meta = await self._call_dp(
+        await self._call_dp(
             "put_samples",
             sample_ids=sample_ids,
             partition_id=self._partition_id,
             fields=fields,
             tags=tags,
+        )
+
+        # mirrors kv_first_write
+        lengths = train_batch["input_lengths"]
+        meta = KVBatchMeta(
+            partition_id=self._partition_id,
+            task_name="train",
+            sample_ids=list(sample_ids),
+            fields=list(fields.keys()),
+            sequence_lengths=[int(s) for s in lengths.tolist()],
+            tags=[dict(t) for t in tags],
         )
 
         self.meta_list.append(meta)
