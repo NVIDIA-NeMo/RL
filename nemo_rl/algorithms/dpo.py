@@ -49,7 +49,9 @@ class DPOSaveState:
     step: int = 0  # Track step within current epoch
     total_steps: int = 0  # Track total number of steps across all epochs
     consumed_samples: int = 0
-    total_valid_tokens: int = 0  # Track total number of non-padding tokens during training
+    total_valid_tokens: int = (
+        0  # Track total number of non-padding tokens during training
+    )
 
 
 def _default_dpo_save_state() -> DPOSaveState:
