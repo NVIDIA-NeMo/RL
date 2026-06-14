@@ -14,9 +14,8 @@
 import os
 import warnings
 from collections import defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from functools import partial
-from typing import Optional
 
 import numpy as np
 import torch
@@ -45,23 +44,11 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 @dataclass
 class DPOSaveState:
-    epoch: int = 0  # Track current epoch
-    step: int = 0  # Track step within current epoch
-    total_steps: int = 0  # Track total number of steps across all epochs
-    consumed_samples: int = 0
-    total_valid_tokens: int = (
-        0  # Track total number of non-padding tokens during training
-    )
-
-
-def _default_dpo_save_state() -> DPOSaveState:
-    return DPOSaveState(
-        epoch=0,
-        step=0,
-        total_steps=0,
-        consumed_samples=0,
-        total_valid_tokens=0,
-    )
+    epoch: int
+    step: int
+    total_steps: int
+    consumed_samples: int
+    total_valid_tokens: int
 
 
 class DPOConfig(BaseModel, extra="allow"):
@@ -182,9 +169,17 @@ def setup(
     checkpointer = CheckpointManager(checkpointing_config)
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
     loaded_state = checkpointer.load_training_info(last_checkpoint_path)
-    dpo_save_state: Optional[DPOSaveState] = (
-        DPOSaveState(**loaded_state) if isinstance(loaded_state, dict) else loaded_state
-    )
+    if isinstance(loaded_state, dict):
+        # Filter to only known DPOSaveState fields; checkpoints may carry
+        # extra keys (e.g. validation metrics from previous runs).
+        known_fields = {f.name for f in fields(DPOSaveState)}
+        dpo_save_state = DPOSaveState(**{k: v for k, v in loaded_state.items() if k in known_fields})
+    elif loaded_state is not None:
+        dpo_save_state = loaded_state
+    else:
+        dpo_save_state = DPOSaveState(
+            epoch=0, step=0, total_steps=0, consumed_samples=0, total_valid_tokens=0
+        )
 
     # ==========================
     #           Data
@@ -368,7 +363,7 @@ def validate(
         logger.log_metrics(asdict(k_val_metrics), step, prefix=prefix)
         logger.log_metrics(k_validation_timings, step, prefix=f"timing/{prefix}")
 
-        for metric_name in DPOValMetrics.__annotations__.keys():
+        for metric_name in [f.name for f in fields(DPOValMetrics)]:
             val_metrics[f"{prefix}_{metric_name}"] = getattr(k_val_metrics, metric_name)
         validation_timings[prefix + "_total_validation_time"] = k_validation_timings[
             "total_validation_time"
@@ -431,7 +426,7 @@ def validate_one_dataset(
                     " This is likely because there were no valid samples."
                 )
             else:
-                for metric_name in DPOValMetrics.__annotations__.keys():
+                for metric_name in [f.name for f in fields(DPOValMetrics)]:
                     reduction = (
                         np.mean
                         if metric_name in {"global_valid_seqs", "global_valid_toks"}
@@ -465,7 +460,7 @@ def validate_one_dataset(
                         ]
                     )
                     / sum_num_valid_samples
-                    for metric_name in DPOValMetrics.__annotations__.keys()
+                    for metric_name in [f.name for f in fields(DPOValMetrics)]
                     if metric_name
                     not in {
                         "num_valid_samples",
@@ -482,7 +477,7 @@ def validate_one_dataset(
             val_metrics = DPOValMetrics(
                 **{
                     metric_name: 0.0
-                    for metric_name in DPOValMetrics.__annotations__.keys()
+                    for metric_name in [f.name for f in fields(DPOValMetrics)]
                 }
             )
 
@@ -495,7 +490,7 @@ def validate_one_dataset(
 
     # Print summary of validation results
     print(f"\n📊 Validation Results for `{dataset_name}` set:")
-    for metric_name in DPOValMetrics.__annotations__.keys():
+    for metric_name in [f.name for f in fields(DPOValMetrics)]:
         print(
             f"    • Validation {metric_name}: {getattr(val_metrics, metric_name):.4f}"
         )
@@ -530,19 +525,10 @@ def dpo_train(
     )
     timeout.start_iterations()
 
-    if dpo_save_state is None:
-        dpo_save_state = _default_dpo_save_state()
-        current_epoch = 0
-        current_step = 0
-        total_steps = 0
-        total_valid_tokens = 0
-    else:
-        current_epoch = dpo_save_state.epoch
-        current_step = dpo_save_state.step
-        total_steps = dpo_save_state.total_steps
-        total_valid_tokens = getattr(
-            dpo_save_state, "total_valid_tokens", 0
-        )  # Default to 0 for backward compatibility with older checkpoints
+    current_epoch = dpo_save_state.epoch
+    current_step = dpo_save_state.step
+    total_steps = dpo_save_state.total_steps
+    total_valid_tokens = dpo_save_state.total_valid_tokens
 
     dpo_config = master_config.dpo
     # Validation configuration
@@ -669,14 +655,13 @@ def dpo_train(
                             and any(
                                 [
                                     key.endswith(f"_{metric_name}")
-                                    for metric_name in DPOValMetrics.__annotations__.keys()
+                                    for metric_name in [f.name for f in fields(DPOValMetrics)]
                                     if metric_name != "num_valid_samples"
                                 ]
                             )
                             and (val_metrics is None or key not in val_metrics)
                         ):
-                            if hasattr(dpo_save_state, key):
-                                delattr(dpo_save_state, key)
+                            delattr(dpo_save_state, key)
                     if val_metrics is not None:
                         for key, val in val_metrics.items():
                             setattr(dpo_save_state, key, val)
@@ -740,7 +725,7 @@ def dpo_train(
             timing_metrics = timer.get_timing_metrics(reduction_op="sum")
 
             print("\n📊 Training Results:")
-            for metric_name in DPOValMetrics.__annotations__.keys():
+            for metric_name in [f.name for f in fields(DPOValMetrics)]:
                 print(f"  • {metric_name}: {float(metrics[metric_name]):.4f}")
             if "total_flops" in train_results:
                 total_tflops = (
