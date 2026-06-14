@@ -581,6 +581,23 @@ class AsyncNemoGymRolloutImpl:
         return rollout_metrics
 
 
+# TODO(SC):
+#   1. Turn RolloutManager into a Ray actor (mirrors SyncRolloutActor /
+#      PolicyTrainerActor).
+#   2. policy_generation lives inside the actor as a plain attribute —
+#      NOT a separate Ray actor. If it were, every rollout payload would
+#      hop through Ray twice (vLLM workers → generation actor → rollout
+#      actor → TQ); co-locating them streams vLLM worker_group outputs
+#      directly into the rollout actor's process.
+#   3. WeightSynchronizer's "generation" arg becomes the rollout actor
+#      handle. The actor exposes forwarding methods
+#      (update_weights_from_collective / prepare_for_generation /
+#      init_collective / ...) that delegate to self._policy_generation.
+#      This is control-only — no rollout payload — so the extra hop is
+#      effectively free.
+#   4. Once landed, setup_handle (driver-side) constructs the rollout
+#      actor and SC just receives the handle; the rollout_manager
+#      construction inside setup_single_controller_component is dropped.
 class RolloutManager:
     """Routes to AsyncRolloutImpl (native async) or AsyncNemoGymRolloutImpl (NeMo-Gym), and pushes results to a TQReplayBuffer."""
 

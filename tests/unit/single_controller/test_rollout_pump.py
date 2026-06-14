@@ -30,13 +30,7 @@ from tensordict import TensorDict
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms.single_controller import SingleControllerActor
-from nemo_rl.algorithms.single_controller_utils import (
-    AdvantageConfig,
-    ConcurrencyConfig,
-    MasterConfig,
-    StalenessConfig,
-    TrainingConfig,
-)
+from nemo_rl.algorithms.single_controller_utils import AsyncRLConfig, MasterConfig
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.experience.rollout_manager import RolloutManager
 
@@ -181,20 +175,19 @@ def test_rollout_pump_writes_expected_tq_data(
     dp_adapter = _SyncDPAdapter(tq_actor)
 
     mc = MasterConfig.model_construct(
-        staleness=StalenessConfig(
+        grpo={
+            "max_num_steps": 1,
+            "max_num_epochs": None,
+            "num_generations_per_prompt": num_generations,
+        },
+        async_rl=AsyncRLConfig(
             max_weight_staleness_versions=0,
             min_prompt_groups_per_batch=1,
-            generations_per_prompt=num_generations,
+            target_prompt_groups_per_step=None,
             batch_selection_strategy="strict_on_policy",
-        ),
-        concurrency=ConcurrencyConfig(
             max_inflight_prompts=max_rollout_prompts,
             max_buffered_rollouts=max_rollout_prompts,
         ),
-        training=TrainingConfig(max_train_steps=1),
-        advantage=AdvantageConfig(enabled=False),
-        partition_id=_PARTITION_ID,
-        diagnostics=False,
     )
     # SingleControllerActor expects a StatefulDataLoader, but the pump only
     # iterates it (`for prompt in self._dataloader`), so any iterable works.
