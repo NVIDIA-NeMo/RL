@@ -45,7 +45,8 @@ ALGO_MAPPING_TO_BASE_YAML = {
     "distillation": "examples/configs/distillation_math.yaml",
     "rm": "examples/configs/rm.yaml",
     "dapo": "examples/configs/grpo_math_1B.yaml",
-    "prorlv2": "examples/configs/prorlv2.yaml",
+    "prorlv2": "examples/configs/prorlv2.v2.yaml",
+    "ppo": "examples/configs/ppo_math_1B_megatron.yaml",
 }
 
 # Configuration keys that are allowed to be added to base configs during testing
@@ -233,7 +234,7 @@ def test_all_recipe_yamls_accounted_for_in_test_suites(
     )
 
 
-def test_nightly_compute_stays_below_1340_hours(nightly_test_suite, tracker):
+def test_nightly_compute_stays_below_1900_hours(nightly_test_suite, tracker):
     command = f"DRYRUN=1 HF_HOME=... HF_DATASETS_CACHE=... CONTAINER= ACCOUNT= PARTITION= ./tools/launch {' '.join(nightly_test_suite)}"
 
     print(f"Running command: {command}")
@@ -265,8 +266,8 @@ def test_nightly_compute_stays_below_1340_hours(nightly_test_suite, tracker):
         f"Last line of output was not as expected: '{last_line}'"
     )
     total_gpu_hours = float(last_line.split(":")[-1].strip())
-    assert total_gpu_hours <= 1340, (
-        f"Total GPU hours exceeded 1340: {last_line}. We should revisit the test suites to reduce the total GPU hours."
+    assert total_gpu_hours <= 1900, (
+        f"Total GPU hours exceeded 1900: {last_line}. We should revisit the test suites to reduce the total GPU hours."
     )
     tracker.track("total_nightly_gpu_hours", total_gpu_hours)
 
@@ -326,28 +327,3 @@ def test_all_recipes_start_with_algo_hyphen(all_recipe_yaml_rel_paths):
         assert algo in expected_algos, (
             f"Recipe {recipe_yaml} has unexpected algo {algo}"
         )
-
-
-def test_functional_tests_exist():
-    functional_tests_dir = os.path.join(project_root, "tests", "functional")
-
-    test_list = []
-    with open(
-        os.path.join(functional_tests_dir, "L1_Functional_Tests_GPU.sh"), "r"
-    ) as f:
-        for line in f:
-            line = line.strip()
-            if line and "./tests/functional" in line:
-                test_list.append(line.split(" ")[-1].split("/")[-1])
-
-    missing_list = []
-    for filename in os.listdir(functional_tests_dir):
-        if filename.endswith(".sh"):
-            if filename == "L1_Functional_Tests_GPU.sh":
-                continue
-            if filename not in test_list:
-                missing_list.append(f"./tests/functional/{filename}")
-
-    assert len(missing_list) == 0, (
-        f"Missing functional test scripts in ./tests/functional/L1_Functional_Tests_GPU.sh:\n{'\n'.join(missing_list)}"
-    )

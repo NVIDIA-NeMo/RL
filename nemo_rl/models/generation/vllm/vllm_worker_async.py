@@ -27,7 +27,12 @@ import uvicorn
 from fastapi import FastAPI
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
+from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_GENERATION_PORT_RANGE_HIGH,
+    DEFAULT_GENERATION_PORT_RANGE_LOW,
+    _get_free_port_local,
+    _get_node_ip_local,
+)
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
@@ -145,6 +150,93 @@ Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"""
 
 
 class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
+    def __init__(
+        self,
+        config,
+        bundle_indices=None,
+        fraction_of_gpus: float = 1.0,
+        seed=None,
+        extra_env_vars: Optional[list[str]] = None,
+        defer_model_load: bool = False,
+    ):
+        """Initialize an async vLLM worker.
+
+        When defer_model_load=True, only stores config and reserves a port for
+        the HTTP server (if expose_http_server is enabled). Call load_model()
+        later to perform the heavy model loading. This enables overlapping vLLM
+        model loading with NeMo Gym init.
+
+        Args:
+            config: Configuration dictionary for the policy
+            bundle_indices: List of local bundle indices within a node for parallelism.
+            fraction_of_gpus: Fraction of GPUs to use for this worker
+            seed: Random seed for initialization
+            extra_env_vars: Additional environment variable names to forward into
+                          the vLLM worker subprocess.
+            defer_model_load: If True, skip model loading and only reserve port
+        """
+        # Deferred-loading state. Always initialized so every instance has a
+        # consistent set of attributes regardless of init path.
+        self._reserved_socket = None
+        self._reserved_port = None
+        self._reserved_node_ip = None
+        self._deferred_bundle_indices = None
+        self._deferred_seed = None
+
+        super().__init__(
+            config,
+            bundle_indices,
+            fraction_of_gpus,
+            seed,
+            extra_env_vars,
+            defer_model_load,
+        )
+
+        if not self.is_model_owner or not defer_model_load:
+            return
+
+        self._deferred_bundle_indices = bundle_indices
+        self._deferred_seed = seed
+
+        if self.cfg["vllm_cfg"].get("expose_http_server"):
+            self._reserve_port()
+
+        self.llm = None
+        self.vllm_device_ids = None
+
+    def _reserve_port(self) -> None:
+        """Bind and listen on a TCP socket to reserve a free port from the OS.
+
+        The socket is held open in LISTENING state and later passed directly to
+        uvicorn via the ``sockets=`` parameter in ``server.serve()``. The socket
+        is never closed and re-opened, so there is zero gap where another process
+        could steal the port.
+        """
+        import socket
+
+        from nemo_rl.distributed.virtual_cluster import _get_node_ip_local
+
+        self._reserved_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._reserved_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._reserved_socket.bind(("", 0))
+        self._reserved_socket.listen(128)
+        self._reserved_socket.setblocking(False)
+        self._reserved_port = self._reserved_socket.getsockname()[1]
+        self._reserved_node_ip = _get_node_ip_local()
+        print(
+            f"Reserved port {self._reserved_port} on {self._reserved_node_ip} "
+            f"for vLLM HTTP server"
+        )
+
+    def load_model(self) -> None:
+        """Load the vLLM model and create the engine.
+
+        Called after a deferred init to perform the heavy model loading.
+        """
+        if not self.is_model_owner:
+            return
+        self._load_model(self._deferred_bundle_indices, self._deferred_seed)
+
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
         from vllm.config import CompilationConfig
         from vllm.engine.arg_utils import AsyncEngineArgs
@@ -184,6 +276,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
         self.server_thread, self.base_url, self.http_server = None, None, None
         if self.cfg["vllm_cfg"].get("expose_http_server"):
+            # Must run after AsyncLLM.from_engine_args and before
+            # _setup_vllm_server spawns the uvicorn thread.
+            self._install_engine_input_socket_lock()
             self.server_thread, self.base_url, self.http_server = (
                 self._setup_vllm_server()
             )
@@ -193,6 +288,24 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         self._vllm_metrics_lock = threading.Lock()
         if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
             self._start_vllm_metrics_logger()
+
+    def _install_engine_input_socket_lock(self) -> None:
+        """Serialise sends on AsyncMPClient.input_socket across OS threads
+        to prevent race conditions that block the vLLM engine (e.g. during
+        in flight weight updates in async grpo).
+        """
+        shadow_sock = self.llm.engine_core.input_socket._shadow_sock
+
+        lock = threading.Lock()
+        original_send_multipart = shadow_sock.send_multipart
+
+        def locked_send_multipart(*args: Any, **kwargs: Any) -> Any:
+            with lock:
+                return original_send_multipart(*args, **kwargs)
+
+        # Replace the bound method on this socket instance only; other zmq
+        # sockets in the process are unaffected.
+        shadow_sock.send_multipart = locked_send_multipart  # type: ignore[assignment]
 
     def _start_vllm_metrics_logger(self) -> None:
         """Start a background thread that periodically collects vLLM logger metrics.
@@ -290,6 +403,12 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
     async def post_init_async(self):
         self.vllm_device_ids = await self.report_device_id_async()
 
+    async def get_reserved_url(self) -> Optional[str]:
+        """Return the URL from the reserved socket, available before model loading."""
+        if self._reserved_socket is not None:
+            return f"http://{self._reserved_node_ip}:{self._reserved_port}/v1"
+        return None
+
     async def report_dp_openai_server_base_url(self) -> Optional[str]:
         return self.base_url
 
@@ -317,15 +436,28 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             TokenizeCompletionRequest,
             TokenizeResponse,
         )
+        from vllm.entrypoints.serve.render.serving import (
+            OpenAIServingRender,
+        )
         from vllm.entrypoints.serve.tokenize.serving import (
             OpenAIServingTokenization,
         )
+        from vllm.exceptions import VLLMValidationError
+        from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
         from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
         from vllm.v1.engine.async_llm import logger as vllm_async_llm_logger
 
         maybe_tool_parser_plugin = self.cfg["vllm_cfg"].get("tool_parser_plugin")
         if maybe_tool_parser_plugin:
             ToolParserManager.import_tool_parser(maybe_tool_parser_plugin)
+
+        maybe_reasoning_parser_plugin = self.cfg["vllm_cfg"].get(
+            "reasoning_parser_plugin"
+        )
+        if maybe_reasoning_parser_plugin:
+            ReasoningParserManager.import_reasoning_parser(
+                maybe_reasoning_parser_plugin
+            )
 
         engine_client = self.llm
         model_config = self.llm_async_engine_args.create_model_config()
@@ -358,7 +490,36 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 return super().model_post_init(context)
 
         class NeMoRLOpenAIServingMixin:
-            async def _preprocess_chat(
+            @staticmethod
+            def _set_max_tokens(request, max_tokens: int) -> None:
+                """Set the request's max output tokens.
+
+                Mutates the request in place. Handles both max_completion_tokens (newer OpenAI API)
+                and max_tokens (deprecated but still supported by vLLM).
+                """
+                if request.max_completion_tokens is not None:
+                    request.max_completion_tokens = max_tokens
+                elif request.max_tokens is not None:
+                    request.max_tokens = max_tokens
+
+            def _clamp_max_tokens(
+                self, request, request_max_tokens: int, prompt_token_ids: list[int]
+            ) -> None:
+                """Clamp the request's max output tokens so that input + output <= max_model_len."""
+                remaining = self.model_config.max_model_len - len(prompt_token_ids)
+                if remaining <= 0:
+                    raise ValueError(
+                        f"Prompt length ({len(prompt_token_ids)}) fills or exceeds "
+                        f"max_model_len ({self.model_config.max_model_len}). "
+                        f"No room for output tokens."
+                    )
+                max_tokens = min(request_max_tokens, remaining)
+                self._set_max_tokens(request, max_tokens)
+
+            # vLLM 0.20 moved chat preprocessing from
+            # OpenAIServing._preprocess_chat to OpenAIServingRender.preprocess_chat,
+            # so this override now applies via the render subclass.
+            async def preprocess_chat(
                 self,
                 request,
                 messages,
@@ -367,18 +528,32 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 default_template_kwargs,
                 tool_dicts=None,
                 tool_parser=None,
+                reasoning_parser=None,
+                *,
+                skip_mm_cache: bool = False,
             ):
-                # Materialize the message tool calls so we can deepcopy below.
                 for message in messages:
                     if message.get("tool_calls"):
                         message["tool_calls"] = list(message["tool_calls"])
 
-                # Deepcopy messages here since _preprocess_chat may be destructive.
                 messages_for_replace_prefix_tokens = deepcopy(messages)
 
-                # res is (conversation, [engine_prompt])
+                # Temporarily set to 1 so vLLM's pre-tokenization length check passes;
+                # the actual value will be set through _clamp_max_tokens later.
+                actual_request_max_tokens = None
+                if isinstance(request, NeMoRLChatCompletionRequest):
+                    actual_request_max_tokens = (
+                        request.max_completion_tokens
+                        if request.max_completion_tokens is not None
+                        else request.max_tokens
+                    )
+                    # If max_completion_tokens or max_tokens is not set, we don't need to do _clamp_max_tokens.
+                    # So we don't need to set the request's max output tokens to 1 here.
+                    if actual_request_max_tokens is not None:
+                        self._set_max_tokens(request, 1)
+
                 try:
-                    res = await super()._preprocess_chat(
+                    res = await super().preprocess_chat(
                         request=request,
                         messages=messages,
                         default_template=default_template,
@@ -386,22 +561,31 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                         default_template_kwargs=default_template_kwargs,
                         tool_dicts=tool_dicts,
                         tool_parser=tool_parser,
+                        reasoning_parser=reasoning_parser,
+                        skip_mm_cache=skip_mm_cache,
                     )
-                except ValueError as e:
+                except (ValueError, VLLMValidationError) as e:
                     if "maximum context length" in str(e):
                         import logging
 
-                        # Print a clean one-liner warning that max model length has been exceeded
-                        # The exception is still raised, but later filtered out by the MaxContextLengthFilter
                         logging.getLogger(__name__).warning(
                             "Prompt exceeds max_model_len: %s", e
                         )
                     raise
 
-                if request.required_prefix_token_ids is None:
+                if (
+                    not hasattr(request, "required_prefix_token_ids")
+                    or request.required_prefix_token_ids is None
+                ):
+                    # Clamp the request's max output tokens so that input + output <= max_model_len.
+                    if actual_request_max_tokens is not None:
+                        self._clamp_max_tokens(
+                            request,
+                            actual_request_max_tokens,
+                            res[1][0]["prompt_token_ids"],
+                        )
                     return res
 
-                # Find the last assistant message
                 last_assistant_message_idx = None
                 for i in reversed(range(len(messages_for_replace_prefix_tokens))):
                     if messages_for_replace_prefix_tokens[i]["role"] == "assistant":
@@ -409,28 +593,21 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                         break
 
                 if last_assistant_message_idx is None:
-                    # If there's no assistant message, we just use the entire thing.
                     messages_to_last_assistant_message = (
                         messages_for_replace_prefix_tokens
                     )
                 else:
-                    # Include the last assistant message itself.
                     messages_to_last_assistant_message = (
                         messages_for_replace_prefix_tokens[
                             : last_assistant_message_idx + 1
                         ]
                     )
 
-                # For the prefix token calculation, we need add_generation_prompt=False
-                # to get tokens up to (and including) the last assistant message only.
-                # add_generation_prompt is a field on the request that gets embedded
-                # into ChatParams via build_chat_params().
                 modified_request = request.model_copy(
                     update={"add_generation_prompt": False}
                 )
 
-                # Call the actual preprocess chat subroutine so we don't miss anything. Whatever they do is whatever we do since we literally do what they do.
-                corresponding_res = await super()._preprocess_chat(
+                corresponding_res = await super().preprocess_chat(
                     request=modified_request,
                     messages=messages_to_last_assistant_message,
                     default_template=default_template,
@@ -438,14 +615,14 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     default_template_kwargs=default_template_kwargs,
                     tool_dicts=tool_dicts,
                     tool_parser=tool_parser,
+                    reasoning_parser=reasoning_parser,
+                    skip_mm_cache=skip_mm_cache,
                 )
                 actual_corresponding_token_ids = corresponding_res[1][0][
                     "prompt_token_ids"
                 ]
 
-                engine_prompt = res[1][
-                    0
-                ]  # We need to modify engine_prompt.prompt_token_ids
+                engine_prompt = res[1][0]
 
                 final_prompt_token_ids = _replace_prefix_tokens(
                     tokenizer=self.renderer.tokenizer,
@@ -455,6 +632,14 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 )
 
                 engine_prompt["prompt_token_ids"] = final_prompt_token_ids
+
+                # Clamp after prefix replacement since the prompt length may have changed.
+                if actual_request_max_tokens is not None:
+                    self._clamp_max_tokens(
+                        request,
+                        actual_request_max_tokens,
+                        final_prompt_token_ids,
+                    )
 
                 return res
 
@@ -468,8 +653,13 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         ):
             required_prefix_token_ids: Optional[List[int]] = None
 
-        # This MRO is necessary i.e. NeMoRLOpenAIServingMixin > OpenAIServingChat
-        class NeMoRLOpenAIServingChat(NeMoRLOpenAIServingMixin, OpenAIServingChat):
+        # vLLM 0.20 routes both /v1/chat/completions and /tokenize through
+        # OpenAIServingRender.preprocess_chat, so the prefix-token override
+        # belongs on the render subclass.
+        class NeMoRLOpenAIServingChat(OpenAIServingChat):
+            pass
+
+        class NeMoRLOpenAIServingRender(NeMoRLOpenAIServingMixin, OpenAIServingRender):
             pass
 
         serving_chat_default_kwargs = dict(
@@ -477,14 +667,27 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             request_logger=None,
             chat_template=None,
             chat_template_content_format="auto",
+            enable_auto_tools=True,
         )
         serving_chat_kwargs = serving_chat_default_kwargs | self.cfg["vllm_cfg"].get(
             "http_server_serving_chat_kwargs", dict()
+        )
+        openai_serving_render = NeMoRLOpenAIServingRender(
+            model_config=engine_client.model_config,
+            renderer=engine_client.renderer,
+            model_registry=openai_serving_models.registry,
+            request_logger=serving_chat_kwargs["request_logger"],
+            chat_template=serving_chat_kwargs["chat_template"],
+            chat_template_content_format=serving_chat_kwargs[
+                "chat_template_content_format"
+            ],
+            enable_auto_tools=serving_chat_kwargs["enable_auto_tools"],
         )
         serving_chat_kwargs.update(
             dict(
                 engine_client=engine_client,
                 models=openai_serving_models,
+                openai_serving_render=openai_serving_render,
                 return_tokens_as_token_ids=True,
             )
         )
@@ -509,9 +712,25 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             assert request.temperature == generation_config["temperature"]
             assert request.top_p == generation_config["top_p"]
 
-            generator = await openai_serving_chat.create_chat_completion(
-                request, raw_request
-            )
+            try:
+                generator = await openai_serving_chat.create_chat_completion(
+                    request, raw_request
+                )
+            except VLLMValidationError as e:
+                # vLLM 0.20 raises VLLMValidationError for prompts exceeding
+                # max_model_len during tokenization, instead of returning an
+                # ErrorResponse. Convert to HTTP 400 so the Gym proxy can
+                # detect context-length overflow and handle it gracefully.
+                return JSONResponse(
+                    content={
+                        "error": {
+                            "message": str(e),
+                            "type": "invalid_request_error",
+                            "code": 400,
+                        }
+                    },
+                    status_code=400,
+                )
 
             if isinstance(generator, ErrorResponse):
                 return JSONResponse(
@@ -537,10 +756,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             TokenizeCompletionRequest, NeMoRLTokenizeChatRequest
         ]
 
-        # This MRO is necessary i.e. NeMoRLOpenAIServingMixin > OpenAIServingTokenization
-        class NeMoRLOpenAIServingTokenization(
-            NeMoRLOpenAIServingMixin, OpenAIServingTokenization
-        ):
+        # Tokenize path delegates to OpenAIServingRender.preprocess_chat in
+        # vLLM 0.20, where the prefix-token override lives.
+        class NeMoRLOpenAIServingTokenization(OpenAIServingTokenization):
             pass
 
         serving_tokenization_kwargs = dict(
@@ -551,6 +769,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             ],
             engine_client=serving_chat_kwargs["engine_client"],
             models=serving_chat_kwargs["models"],
+            openai_serving_render=openai_serving_render,
         )
         openai_serving_tokenization = NeMoRLOpenAIServingTokenization(
             **serving_tokenization_kwargs
@@ -629,8 +848,24 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         # Server spinup
         ########################################
 
-        node_ip = _get_node_ip_local()
-        free_port = _get_free_port_local()
+        if self._reserved_socket is not None:
+            # Use the socket reserved during __init__ (deferred model load path).
+            # Pass it directly to uvicorn via sockets= — zero gap, the socket is
+            # never closed and re-opened, so no other process can steal the port.
+            node_ip = self._reserved_node_ip
+            free_port = self._reserved_port
+            reserved_sock = self._reserved_socket
+            self._reserved_socket = None  # Transfer ownership to uvicorn
+        else:
+            node_ip = _get_node_ip_local()
+            port_range_low = self.cfg.get(
+                "port_range_low", DEFAULT_GENERATION_PORT_RANGE_LOW
+            )
+            port_range_high = self.cfg.get(
+                "port_range_high", DEFAULT_GENERATION_PORT_RANGE_HIGH
+            )
+            free_port = _get_free_port_local(port_range_low, port_range_high)
+            reserved_sock = None
 
         base_url = f"http://{node_ip}:{free_port}/v1"
         print(f"Starting server on {base_url}")
@@ -655,7 +890,19 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         uvicorn_logger = getLogger("uvicorn.access")
         uvicorn_logger.addFilter(No200Filter())
 
-        thread = threading.Thread(target=server.run, daemon=True)
+        if reserved_sock is not None:
+            # Hand the pre-bound listening socket directly to uvicorn's asyncio
+            # server via server.serve(sockets=). No close-and-rebind needed.
+            import asyncio
+
+            def _run_with_socket():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(server.serve(sockets=[reserved_sock]))
+
+            thread = threading.Thread(target=_run_with_socket, daemon=True)
+        else:
+            thread = threading.Thread(target=server.run, daemon=True)
         thread.start()
 
         return thread, base_url, server

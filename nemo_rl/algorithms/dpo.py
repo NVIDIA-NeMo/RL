@@ -19,6 +19,7 @@ from typing import Optional, TypedDict, cast
 
 import numpy as np
 import torch
+from pydantic import BaseModel
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer
 
@@ -27,7 +28,11 @@ from nemo_rl.algorithms.utils import maybe_pad_last_batch, set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import preference_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
-from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
+from nemo_rl.data.utils import load_dataloader_state
+from nemo_rl.distributed.virtual_cluster import (
+    ClusterConfig,
+    RayVirtualCluster,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import PolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
@@ -79,7 +84,7 @@ class DPOConfig(TypedDict):
     sft_loss_weight: float
 
 
-class MasterConfig(TypedDict):
+class MasterConfig(BaseModel, extra="allow"):
     policy: PolicyConfig
     data: DataConfig
     dpo: DPOConfig
@@ -124,23 +129,31 @@ def setup(
     Returns:
         Tuple of policy, cluster, dataloader, tokenizer, loss_fn, math_env, master_config, logger
     """
+    set_seed(master_config.dpo["seed"])
+
+    # Extract individual configs for easier access
+    policy_config = master_config.policy
+    data_config = master_config.data
+    dpo_config = master_config.dpo
+    logger_config = master_config.logger
+    cluster_config = master_config.cluster
+    checkpointing_config = master_config.checkpointing
+
+    checkpointing_pretrained = checkpointing_config.get("pretrained_checkpoint")
+    if checkpointing_pretrained is not None:
+        policy_config["pretrained_checkpoint"] = checkpointing_pretrained
+
     # Make sure we are not using dynamic batching or sequence packing.
     # Anything that changes the order of data within a batch is currently incompatible with DPO.
-    assert not master_config["policy"]["dynamic_batching"]["enabled"], (
+    assert not policy_config["dynamic_batching"]["enabled"], (
         "Dynamic batching is currently not supported with DPO. "
         "See https://github.com/NVIDIA-NeMo/RL/issues/719"
     )
-    assert not master_config["policy"]["sequence_packing"]["enabled"], (
+    assert not policy_config["sequence_packing"]["enabled"], (
         "Sequence packing is currently not supported with DPO. "
         "See https://github.com/NVIDIA-NeMo/RL/issues/719"
     )
 
-    policy_config = master_config["policy"]
-    checkpointing_pretrained = master_config.get("checkpointing", {}).get(
-        "pretrained_checkpoint"
-    )
-    if checkpointing_pretrained is not None:
-        policy_config["pretrained_checkpoint"] = checkpointing_pretrained
     # Add a guardrail for linear CE fusion loss: if sequence packing is enabled for DPO in the future,
     # we need to validate the fusion path with cu_seqlens-based logprob aggregation first and then remove this guardrail.
     if policy_config["sequence_packing"]["enabled"]:
@@ -152,24 +165,16 @@ def setup(
             "The fusion path has not been validated with cu_seqlens-based logprob aggregation."
         )
 
-    set_seed(master_config["dpo"]["seed"])
-
-    # Extract individual configs for easier access
-    data_config = master_config["data"]
-    logger_config = master_config["logger"]
-    cluster_config = master_config["cluster"]
-    dpo_config = master_config["dpo"]
-
     # ==========================
     #         Logger
     # ==========================
     logger = Logger(logger_config)
-    logger.log_hyperparams(master_config)
+    logger.log_hyperparams(master_config.model_dump())
 
     # ==========================
     #      Checkpointing
     # ==========================
-    checkpointer = CheckpointManager(master_config["checkpointing"])
+    checkpointer = CheckpointManager(checkpointing_config)
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
     dpo_save_state: Optional[DPOSaveState] = cast(
         Optional[DPOSaveState], checkpointer.load_training_info(last_checkpoint_path)
@@ -196,10 +201,7 @@ def setup(
     )
 
     if last_checkpoint_path is not None:
-        dataloader_state_dict = torch.load(
-            os.path.join(last_checkpoint_path, "train_dataloader.pt")
-        )
-        train_dataloader.load_state_dict(dataloader_state_dict)
+        load_dataloader_state(train_dataloader, last_checkpoint_path, data_config)
 
     val_dataloader = {
         k: StatefulDataLoader(
@@ -231,6 +233,8 @@ def setup(
         use_gpus=True,
         num_gpus_per_node=cluster_config["gpus_per_node"],
         max_colocated_worker_groups=1,
+        port_range_low=cluster_config.get("master_port_range_low"),
+        port_range_high=cluster_config.get("master_port_range_high"),
     )
     print(f"  ✓ Ray cluster initialized with {cluster_config['num_nodes']} nodes")
 
@@ -266,7 +270,7 @@ def setup(
     policy.print_node_ip_and_gpu_id()
 
     loss_fn = DPOLossFn(
-        master_config["dpo"],
+        master_config.dpo,
         use_linear_ce_fusion=policy_config["megatron_cfg"]["enabled"]
         and policy_config["megatron_cfg"]["use_linear_ce_fusion_loss"],
     )
@@ -296,9 +300,9 @@ def add_ref_logprobs_to_data(dataloader, policy, master_config, is_val=False):
             batch = next(dataloader_iter)
 
             micro_batch_size = (
-                master_config["dpo"]["val_micro_batch_size"] * 2
+                master_config.dpo["val_micro_batch_size"] * 2
                 if is_val
-                else master_config["policy"]["train_micro_batch_size"] * 2
+                else master_config.policy["train_micro_batch_size"] * 2
             )
 
             # when running validation with drop_last=False, we might end up with a partial batch.
@@ -389,7 +393,7 @@ def validate_one_dataset(
 ):
     """Run validation on one validation dataset."""
     if val_dataloader is None:
-        assert val_dataloader is not None or master_config["dpo"]["val_period"] == 0, (
+        assert val_dataloader is not None or master_config.dpo["val_period"] == 0, (
             "val_dataloader is None, so dpo.val_period must be 0"
         )
         print("  ⚠️ No validation dataloader provided, skipping validation")
@@ -520,7 +524,7 @@ def dpo_train(
     # Run dpo training
     timer = Timer()
     timeout = TimeoutChecker(
-        timeout=master_config["checkpointing"]["checkpoint_must_save_by"],
+        timeout=master_config.checkpointing["checkpoint_must_save_by"],
         fit_last_save_time=True,
     )
     timeout.start_iterations()
@@ -539,7 +543,7 @@ def dpo_train(
             "total_valid_tokens", 0
         )  # Default to 0 for backward compatibility with older checkpoints
 
-    dpo_config = master_config["dpo"]
+    dpo_config = master_config.dpo
     # Validation configuration
     val_period = dpo_config["val_period"]
     val_at_start = dpo_config["val_at_start"]
@@ -570,13 +574,13 @@ def dpo_train(
 
     while (
         current_epoch < max_num_epochs
-        and total_steps < master_config["dpo"]["max_num_steps"]
+        and total_steps < master_config.dpo["max_num_steps"]
     ):
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
 
         for batch in add_ref_logprobs_to_data(train_dataloader, policy, master_config):
             print(
-                f"\n{'=' * 25} Step {current_step + 1}/{min(len(train_dataloader), master_config['dpo']['max_num_steps'])} {'=' * 25}"
+                f"\n{'=' * 25} Step {current_step + 1}/{min(len(train_dataloader), master_config.dpo['max_num_steps'])} {'=' * 25}"
             )
             maybe_gpu_profile_step(policy, total_steps + 1)
             val_metrics, validation_timings = None, None
@@ -590,12 +594,12 @@ def dpo_train(
                         eval_mode=False,
                         ## NOTE: we double the batch size here because each preference example corresponds to a pair of
                         ## examples, chosen and rejected, and the pair needs to be processed as part of the same microbatch.
-                        gbs=master_config["policy"]["train_global_batch_size"] * 2,
-                        mbs=master_config["policy"]["train_micro_batch_size"] * 2,
+                        gbs=master_config.policy["train_global_batch_size"] * 2,
+                        mbs=master_config.policy["train_micro_batch_size"] * 2,
                         timer=timer,
                     )
 
-                is_last_step = total_steps + 1 >= master_config["dpo"][
+                is_last_step = total_steps + 1 >= master_config.dpo[
                     "max_num_steps"
                 ] or (
                     current_epoch + 1 == max_num_epochs
@@ -639,21 +643,21 @@ def dpo_train(
                 total_valid_tokens += metrics["global_valid_toks"]
 
                 ## Checkpointing
-                dpo_save_state["consumed_samples"] += master_config["policy"][
+                dpo_save_state["consumed_samples"] += master_config.policy[
                     "train_global_batch_size"
                 ]
                 timeout.mark_iteration()
 
                 should_save_by_step = (
                     is_last_step
-                    or (total_steps + 1) % master_config["checkpointing"]["save_period"]
+                    or (total_steps + 1) % master_config.checkpointing["save_period"]
                     == 0
                 )
                 # +1 because step is 0-indexed
                 # Check if timeout-based checkpointing is enabled in config.
                 should_save_by_timeout = timeout.check_save()
 
-                if master_config["checkpointing"]["enabled"] and (
+                if master_config.checkpointing["enabled"] and (
                     should_save_by_step or should_save_by_timeout
                 ):
                     dpo_save_state["step"] = (current_step + 1) % len(train_dataloader)
@@ -677,7 +681,7 @@ def dpo_train(
                     if val_metrics is not None:
                         dpo_save_state.update(val_metrics)
 
-                    full_metric_name = master_config["checkpointing"]["metric_name"]
+                    full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
                         assert full_metric_name.startswith(
                             "train:"
@@ -723,7 +727,7 @@ def dpo_train(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
-                            checkpointing_cfg=master_config["checkpointing"],
+                            checkpointing_cfg=master_config.checkpointing,
                         )
                         torch.save(
                             train_dataloader.state_dict(),
@@ -766,8 +770,8 @@ def dpo_train(
                     print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
             total_num_gpus = (
-                master_config["cluster"]["num_nodes"]
-                * master_config["cluster"]["gpus_per_node"]
+                master_config.cluster["num_nodes"]
+                * master_config.cluster["gpus_per_node"]
             )
             timing_metrics["valid_tokens_per_sec_per_gpu"] = (
                 metrics["global_valid_toks"] / total_time / total_num_gpus
@@ -782,7 +786,7 @@ def dpo_train(
             if should_save_by_timeout:
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
-            if total_steps >= master_config["dpo"]["max_num_steps"]:
+            if total_steps >= master_config.dpo["max_num_steps"]:
                 print(
                     "Max number of steps has been reached, stopping training early",
                     flush=True,

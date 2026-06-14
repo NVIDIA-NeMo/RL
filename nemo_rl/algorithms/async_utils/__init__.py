@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_rl.algorithms.async_utils.replay_buffer import ReplayBuffer, ReplayBufferNew
+from nemo_rl.algorithms.async_utils.replay_buffer import ReplayBuffer
 from nemo_rl.algorithms.async_utils.trajectory_collector import AsyncTrajectoryCollector
 
 __all__ = [
     "ReplayBuffer",
-    "ReplayBufferNew",
     "AsyncTrajectoryCollector",
 ]

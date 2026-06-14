@@ -13,9 +13,10 @@
 # limitations under the License.
 import logging
 import os
+import socket
 import sys
 import time
-from typing import Optional, TypedDict
+from typing import NotRequired, Optional, TypedDict
 
 import ray
 from ray.util.placement_group import (
@@ -33,6 +34,14 @@ logger = logging.getLogger(__name__)
 class ClusterConfig(TypedDict):
     gpus_per_node: int
     num_nodes: int
+    # Port range for the distributed master address (TCPStore / NCCL rendezvous)
+    # and per-worker available ports used by RayVirtualCluster.  These ports are
+    # kept below the OS ephemeral range (32768-60999 on stock Linux) to avoid
+    # TOCTOU collisions with kernel-assigned source ports.  When absent,
+    # RayVirtualCluster falls back to DEFAULT_MASTER_PORT_RANGE_LOW/HIGH
+    # (25000-28000).  See ray.sub for the full port layout.
+    master_port_range_low: NotRequired[int]
+    master_port_range_high: NotRequired[int]
 
 
 # Get the directory path of the current module and the root of the package
@@ -65,9 +74,35 @@ class PY_EXECUTABLES:
     SGLANG = f"uv run --locked --extra sglang --directory {git_root}"
 
 
+# Default port ranges — kept below the OS ephemeral range (32768-60999 on
+# stock Linux) to avoid TOCTOU collisions.  See ray.sub for the full layout
+# including Ray's own GCS / worker gRPC ports.
+#
+#   11001-15000  vLLM / SGLang HTTP servers  (policy.generation.port_range_low/high)
+#   15001-20000  NeMo Gym HTTP servers       (env.nemo_gym.port_range_low/high)
+#   20001+       vLLM TP/DP rendezvous       (VLLM_PORT env var, 100-port spacing)
+#   25000-28000  Master address / TCPStore    (cluster.master_port_range_low/high)
+DEFAULT_GENERATION_PORT_RANGE_LOW = 11001
+DEFAULT_GENERATION_PORT_RANGE_HIGH = 15000
+DEFAULT_GYM_PORT_RANGE_LOW = 15001
+DEFAULT_GYM_PORT_RANGE_HIGH = 20000
+# vLLM TP/DP rendezvous ports.  Each engine gets PORTS_PER_ENGINE ports
+# starting at LOW + engine_index * PORTS_PER_ENGINE.  The effective upper
+# bound is LOW + max_engines_per_node * PORTS_PER_ENGINE.  With 8 GPUs and
+# TP=1 (8 engines): 20001 + 8*100 = 20801.  There is no fixed ceiling —
+# ensure the range does not overlap with MASTER (25000+) on very large nodes.
+DEFAULT_VLLM_PORT_RANGE_LOW = 20001
+DEFAULT_VLLM_PORTS_PER_ENGINE = 100
+DEFAULT_MASTER_PORT_RANGE_LOW = 25000
+DEFAULT_MASTER_PORT_RANGE_HIGH = 28000
+
+
 @ray.remote  # pragma: no cover
-def _get_node_ip_and_free_port() -> tuple[str, int]:
-    return _get_node_ip_local(), _get_free_port_local()
+def _get_node_ip_and_free_port(
+    port_range_low: int = DEFAULT_MASTER_PORT_RANGE_LOW,
+    port_range_high: int = DEFAULT_MASTER_PORT_RANGE_HIGH,
+) -> tuple[str, int]:
+    return _get_node_ip_local(), _get_free_port_local(port_range_low, port_range_high)
 
 
 def _get_node_ip_local() -> str:
@@ -77,13 +112,38 @@ def _get_node_ip_local() -> str:
     return node_ip
 
 
-def _get_free_port_local() -> int:
-    import socket
+def _bind_socket_in_range(
+    sock: socket.socket,
+    port_range_low: int,
+    port_range_high: int,
+    max_retries: int = 50,
+) -> int:
+    """Try to bind *sock* to a random port in [port_range_low, port_range_high).
 
+    Raises ``RuntimeError`` after *max_retries* failed attempts.
+    """
+    import random
+
+    for _ in range(max_retries):
+        port = random.randint(port_range_low, port_range_high - 1)
+        try:
+            sock.bind(("", port))
+            return port
+        except OSError:
+            continue
+    raise RuntimeError(
+        f"Could not find a free port in range [{port_range_low}, {port_range_high}) "
+        f"after {max_retries} attempts."
+    )
+
+
+def _get_free_port_local(
+    port_range_low: int = DEFAULT_MASTER_PORT_RANGE_LOW,
+    port_range_high: int = DEFAULT_MASTER_PORT_RANGE_HIGH,
+) -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))  # Bind to port 0 to get a random free port
+        port = _bind_socket_in_range(s, port_range_low, port_range_high)
         s.listen(1)
-        port = s.getsockname()[1]
 
     return port
 
@@ -210,6 +270,8 @@ class RayVirtualCluster:
         num_gpus_per_node: int = 8,
         name: str = "",
         placement_group_strategy: str = "SPREAD",
+        port_range_low: Optional[int] = None,
+        port_range_high: Optional[int] = None,
     ):
         """Initialize a virtual cluster using Ray placement groups.
 
@@ -221,6 +283,10 @@ class RayVirtualCluster:
             num_gpus_per_node: Number of GPUs per node
             name: Name prefix for placement groups
             placement_group_strategy: Ray placement group strategy ("STRICT_PACK", "PACK", or "SPREAD")
+            port_range_low: Lower bound (inclusive) of the port range for master address allocation.
+                Falls back to DEFAULT_MASTER_PORT_RANGE_LOW if None.
+            port_range_high: Upper bound (exclusive) of the port range for master address allocation.
+                Falls back to DEFAULT_MASTER_PORT_RANGE_HIGH if None.
         """
         self._bundle_ct_per_node_list = bundle_ct_per_node_list
         self._world_size = sum(self._bundle_ct_per_node_list)
@@ -236,6 +302,17 @@ class RayVirtualCluster:
         self.max_colocated_worker_groups = max_colocated_worker_groups
         self.name = name
         self.placement_group_strategy = placement_group_strategy
+        self.port_range_low = (
+            port_range_low
+            if port_range_low is not None
+            else DEFAULT_MASTER_PORT_RANGE_LOW
+        )
+        self.port_range_high = (
+            port_range_high
+            if port_range_high is not None
+            else DEFAULT_MASTER_PORT_RANGE_HIGH
+        )
+        self._allocated_master_ports: set[int] = set()
 
     def _init_placement_groups(
         self, strategy: str | None = None, use_unified_pg: bool = False
@@ -406,7 +483,7 @@ class RayVirtualCluster:
                     ),
                     # Need to explicitly set to 0 since it's possible for this to be unschedulable if all CPUs are already in use.
                     num_cpus=0,
-                ).remote()
+                ).remote(self.port_range_low, self.port_range_high)
             )
             return addr, port
 
@@ -417,6 +494,11 @@ class RayVirtualCluster:
     def get_master_address_and_port(self) -> tuple[str, int]:
         """Gets the master address and port for the distributed training setup.
 
+        Each call returns a unique port that has not been returned by previous
+        calls on this cluster instance.  This prevents NCCL process-group
+        collisions when multiple worker groups (e.g. policy and value) share the
+        same cluster and node.
+
         Returns:
             Tuple of (address, port)
         """
@@ -424,14 +506,22 @@ class RayVirtualCluster:
         if not self._node_placement_groups:
             self.get_placement_groups()
 
-        # If sorted bundle indices are available, get the address and port for the first bundle index
         if self._sorted_bundle_indices is not None:
-            return self.get_available_address_and_port(
-                pg_idx=0, bundle_idx=self._sorted_bundle_indices[0]
-            )
+            pg_idx, bundle_idx = 0, self._sorted_bundle_indices[0]
+        else:
+            pg_idx, bundle_idx = 0, 0
 
-        # Otherwise, get the address and port for bundle index 0
-        return self.get_available_address_and_port(pg_idx=0, bundle_idx=0)
+        max_retries = 10
+        for _ in range(max_retries):
+            addr, port = self.get_available_address_and_port(pg_idx, bundle_idx)
+            if port not in self._allocated_master_ports:
+                self._allocated_master_ports.add(port)
+                return addr, port
+
+        raise RuntimeError(
+            f"Failed to find a unique master port after {max_retries} retries. "
+            f"Already allocated ports: {self._allocated_master_ports}"
+        )
 
     def _get_sorted_bundle_indices(self) -> Optional[list[int]]:
         """Gets the sorted bundle indices for the placement groups."""

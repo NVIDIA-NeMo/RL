@@ -25,7 +25,12 @@ import requests
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
+from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_GENERATION_PORT_RANGE_HIGH,
+    DEFAULT_GENERATION_PORT_RANGE_LOW,
+    _get_free_port_local,
+    _get_node_ip_local,
+)
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
@@ -178,7 +183,13 @@ class SGLangGenerationWorker:
 
         # Get current node IP and a free port for the server
         node_ip = _get_node_ip_local()
-        free_port = _get_free_port_local()
+        port_range_low = self.cfg.get(
+            "port_range_low", DEFAULT_GENERATION_PORT_RANGE_LOW
+        )
+        port_range_high = self.cfg.get(
+            "port_range_high", DEFAULT_GENERATION_PORT_RANGE_HIGH
+        )
+        free_port = _get_free_port_local(port_range_low, port_range_high)
 
         # Build SGLang server arguments
         kwargs = {
@@ -428,9 +439,9 @@ class SGLangGenerationWorker:
             stop_string: Optional stop string for this sample
 
         Returns:
-            Tuple of (generated_tokens, logprobs):
-                - generated_tokens: List of generated token IDs
-                - logprobs: List of log probabilities for generated tokens
+            Tuple of (``generated_tokens``, ``logprobs``):
+                - ``generated_tokens``: List of generated token IDs
+                - ``logprobs``: List of log probabilities for generated tokens
         """
         # Prepare payload for SGLang API
         # Note: stop should be in sampling_params, not in payload top level
@@ -562,10 +573,10 @@ class SGLangGenerationWorker:
 
         Returns:
             BatchedDataDict conforming to GenerationOutputSpec:
-                - output_ids: input + generated token IDs with proper padding
-                - logprobs: Log probabilities for tokens
-                - generation_lengths: Lengths of each response
-                - unpadded_sequence_lengths: Lengths of each input + generated sequence
+                - ``output_ids``: input + generated token IDs with proper padding
+                - ``logprobs``: Log probabilities for tokens
+                - ``generation_lengths``: Lengths of each response
+                - ``unpadded_sequence_lengths``: Lengths of each input + generated sequence
         """
         # Handle empty input case
         if len(data["input_ids"]) == 0:

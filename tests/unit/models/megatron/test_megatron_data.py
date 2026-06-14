@@ -269,6 +269,251 @@ class TestProcessMicrobatch:
 
         assert "input_lengths not found in data_dict" in str(exc_info.value)
 
+    @patch("nemo_rl.models.megatron.data._pack_sequences_for_megatron")
+    @patch("nemo_rl.models.megatron.data._prepare_vlm_batch_for_megatron")
+    def test_process_microbatch_delegate_pack_to_model(self, mock_prepare, mock_pack):
+        """Test that delegate_pack_to_model routes packing to the VLM helper.
+
+        When the model self-packs (mbridge VLM wrappers), process_microbatch must
+        call _prepare_vlm_batch_for_megatron instead of _pack_sequences_for_megatron,
+        and must surface the bool attention_mask while keeping position_ids None.
+        """
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        mock_input_ids = torch.tensor([[1, 2, 3, 4, 5]])
+        mock_cp_sharded = torch.tensor([[1, 2, 3, 0, 0], [4, 5, 0, 0, 0]])
+        mock_attention_mask = torch.tensor(
+            [[True, True, True, False, False], [True, True, False, False, False]]
+        )
+        mock_packed_seq_params = MagicMock()
+        mock_cu_seqlens_padded = torch.tensor([0, 3, 5], dtype=torch.int32)
+        mock_prepare.return_value = (
+            mock_input_ids,
+            mock_cp_sharded,
+            mock_attention_mask,
+            mock_packed_seq_params,
+            None,
+            mock_cu_seqlens_padded,
+        )
+
+        input_ids = torch.tensor([[1, 2, 3, 0, 0], [4, 5, 0, 0, 0]])
+        seq_lengths = torch.tensor([3, 2])
+        data_dict = MagicMock()
+        data_dict.__getitem__ = MagicMock(
+            side_effect=lambda k: input_ids if k == "input_ids" else seq_lengths
+        )
+        data_dict.__contains__ = MagicMock(return_value=True)
+
+        result = process_microbatch(
+            data_dict,
+            seq_length_key="input_lengths",
+            pack_sequences=True,
+            delegate_pack_to_model=True,
+            pad_full_seq_to=8,
+            straggler_timer=MagicMock(),
+        )
+
+        # VLM helper was used, and the classic packer was NOT invoked (guards
+        # against a regression silently routing to _pack_sequences_for_megatron).
+        mock_prepare.assert_called_once()
+        mock_pack.assert_not_called()
+        # pad_full_seq_to must be forwarded to the helper
+        assert mock_prepare.call_args[1]["pad_full_seq_to"] == 8
+
+        # The bool attention_mask is surfaced (unlike the classic packing path,
+        # which returns None), and position_ids stays None.
+        assert torch.equal(result.attention_mask, mock_attention_mask)
+        assert result.position_ids is None
+        assert result.packed_seq_params == mock_packed_seq_params
+        assert torch.equal(result.input_ids, mock_input_ids)
+        assert torch.equal(result.input_ids_cp_sharded, mock_cp_sharded)
+        assert torch.equal(result.cu_seqlens_padded, mock_cu_seqlens_padded)
+
+
+@pytest.mark.mcore
+class TestPrepareVlmBatchForMegatron:
+    """Tests for _prepare_vlm_batch_for_megatron.
+
+    This is the VLM + CP self-packing path: NeMo-RL only pads each sequence and
+    builds an attention_mask / cu_seqlens, leaving the actual pack + CP-shard to
+    the model's own preprocess_packed_seqs. The function is pure CPU tensor logic.
+    """
+
+    def test_basic_no_extra_padding(self):
+        """align=1, no pad_full_seq_to: mask matches lengths, packed view is concat."""
+        from nemo_rl.models.megatron.data import _prepare_vlm_batch_for_megatron
+
+        input_ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
+        seq_lengths = torch.tensor([3, 2])
+
+        (
+            packed_input_ids,
+            input_ids_2d,
+            attention_mask,
+            packed_seq_params,
+            cu_seqlens,
+            cu_seqlens_padded,
+        ) = _prepare_vlm_batch_for_megatron(
+            input_ids, seq_lengths, pad_individual_seqs_to_multiple_of=1
+        )
+
+        # No alignment padding -> [B, S] layout is unchanged for the model forward.
+        assert torch.equal(input_ids_2d, input_ids)
+
+        # attention_mask is bool and follows the (padded) sequence lengths.
+        assert attention_mask.dtype == torch.bool
+        assert torch.equal(
+            attention_mask,
+            torch.tensor([[True, True, True], [True, True, False]]),
+        )
+
+        # cu_seqlens_padded is the cumulative sum of padded lengths, int32.
+        assert cu_seqlens_padded.dtype == torch.int32
+        assert torch.equal(
+            cu_seqlens_padded, torch.tensor([0, 3, 5], dtype=torch.int32)
+        )
+
+        # cu_seqlens (unpadded) is unused on this path.
+        assert cu_seqlens is None
+
+        # packed view concatenates per-seq padded slices into [1, total].
+        assert torch.equal(packed_input_ids, torch.tensor([[1, 2, 3, 4, 5]]))
+
+        # PackedSeqParams describes the full (pre-shard) packed layout.
+        assert packed_seq_params.qkv_format == "thd"
+        assert packed_seq_params.max_seqlen_q == 3
+        assert torch.equal(packed_seq_params.cu_seqlens_q, cu_seqlens_padded)
+        assert torch.equal(packed_seq_params.cu_seqlens_q_padded, cu_seqlens_padded)
+
+    def test_alignment_padding_rounds_up_and_truncates(self):
+        """align=4 rounds each length up; over-wide input_ids are truncated to padded_max."""
+        from nemo_rl.models.megatron.data import _prepare_vlm_batch_for_megatron
+
+        # Width 8 input, lengths [3, 2] padded up to [4, 4] -> padded_max 4.
+        input_ids = torch.arange(1, 17).reshape(2, 8)
+        seq_lengths = torch.tensor([3, 2])
+
+        (
+            packed_input_ids,
+            input_ids_2d,
+            attention_mask,
+            packed_seq_params,
+            _,
+            cu_seqlens_padded,
+        ) = _prepare_vlm_batch_for_megatron(
+            input_ids, seq_lengths, pad_individual_seqs_to_multiple_of=4
+        )
+
+        # Truncated to padded_max = 4 columns.
+        assert input_ids_2d.shape == (2, 4)
+        assert torch.equal(input_ids_2d, input_ids[:, :4])
+
+        # padded_lens are [4, 4] so every column is "valid".
+        assert attention_mask.all()
+        assert torch.equal(
+            cu_seqlens_padded, torch.tensor([0, 4, 8], dtype=torch.int32)
+        )
+        assert packed_seq_params.max_seqlen_q == 4
+        assert packed_input_ids.shape == (1, 8)
+
+    def test_alignment_padding_pads_narrow_input(self):
+        """When input is narrower than padded_max, rows are zero-padded on the right."""
+        from nemo_rl.models.megatron.data import _prepare_vlm_batch_for_megatron
+
+        # Width 3 input, lengths [3, 3] padded up to [4, 4] -> padded_max 4 > 3.
+        input_ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
+        seq_lengths = torch.tensor([3, 3])
+
+        (
+            packed_input_ids,
+            input_ids_2d,
+            attention_mask,
+            _,
+            _,
+            cu_seqlens_padded,
+        ) = _prepare_vlm_batch_for_megatron(
+            input_ids, seq_lengths, pad_individual_seqs_to_multiple_of=4
+        )
+
+        assert input_ids_2d.shape == (2, 4)
+        assert torch.equal(input_ids_2d, torch.tensor([[1, 2, 3, 0], [4, 5, 6, 0]]))
+        assert torch.equal(
+            cu_seqlens_padded, torch.tensor([0, 4, 8], dtype=torch.int32)
+        )
+        assert torch.equal(packed_input_ids, torch.tensor([[1, 2, 3, 0, 4, 5, 6, 0]]))
+
+    def test_pad_full_seq_to_extends_last_sequence(self):
+        """pad_full_seq_to (PP>1) absorbs the deficit into the last sequence's length."""
+        from nemo_rl.models.megatron.data import _prepare_vlm_batch_for_megatron
+
+        # natural padded sum = 3 + 2 = 5; pad_full_seq_to=8 -> last grows by 3 to 5.
+        input_ids = torch.tensor([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]])
+        seq_lengths = torch.tensor([3, 2])
+
+        (
+            packed_input_ids,
+            input_ids_2d,
+            attention_mask,
+            packed_seq_params,
+            _,
+            cu_seqlens_padded,
+        ) = _prepare_vlm_batch_for_megatron(
+            input_ids,
+            seq_lengths,
+            pad_individual_seqs_to_multiple_of=1,
+            pad_full_seq_to=8,
+        )
+
+        # Total packed length now equals pad_full_seq_to.
+        assert int(cu_seqlens_padded[-1]) == 8
+        assert torch.equal(
+            cu_seqlens_padded, torch.tensor([0, 3, 8], dtype=torch.int32)
+        )
+
+        # The extended last sequence's tail positions are marked "valid" (they are
+        # masked out at the loss layer, not here); the first sequence keeps its mask.
+        assert torch.equal(
+            attention_mask,
+            torch.tensor(
+                [
+                    [True, True, True, False, False],
+                    [True, True, True, True, True],
+                ]
+            ),
+        )
+        assert packed_seq_params.max_seqlen_q == 5
+        assert packed_input_ids.shape == (1, 8)
+
+    def test_pad_full_seq_to_too_small_raises(self):
+        """pad_full_seq_to below the natural padded sum is a hard error."""
+        from nemo_rl.models.megatron.data import _prepare_vlm_batch_for_megatron
+
+        input_ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
+        seq_lengths = torch.tensor([3, 2])  # natural padded sum = 5
+
+        with pytest.raises(AssertionError, match="increase pad_full_seq_to"):
+            _prepare_vlm_batch_for_megatron(
+                input_ids,
+                seq_lengths,
+                pad_individual_seqs_to_multiple_of=1,
+                pad_full_seq_to=4,
+            )
+
+    def test_pad_full_seq_to_deficit_not_multiple_of_align_raises(self):
+        """The pad_full_seq_to deficit must be divisible by the per-seq alignment."""
+        from nemo_rl.models.megatron.data import _prepare_vlm_batch_for_megatron
+
+        input_ids = torch.arange(1, 9).reshape(2, 4)
+        seq_lengths = torch.tensor([4, 4])  # align=4 -> padded sum = 8
+
+        with pytest.raises(AssertionError, match="must be a multiple"):
+            _prepare_vlm_batch_for_megatron(
+                input_ids,
+                seq_lengths,
+                pad_individual_seqs_to_multiple_of=4,
+                pad_full_seq_to=10,  # deficit = 2, not a multiple of 4
+            )
+
 
 @pytest.mark.mcore
 class TestProcessGlobalBatch:
@@ -872,6 +1117,7 @@ def test_get_pack_sequence_parameters_for_megatron(get_pack_sequence_parameters_
     for test_name in [
         "run_all_get_pack_sequence_parameters_for_megatron_tests",
         "run_all_get_pack_sequence_parameters_for_megatron_fp8_tests",
+        "run_all_get_pack_sequence_parameters_for_megatron_hybridep_tests",
     ]:
         # Run all tests in a single call to the actor
         futures = worker_group.run_all_workers_single_data(test_name)

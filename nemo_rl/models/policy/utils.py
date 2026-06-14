@@ -66,6 +66,7 @@ AUTOMODEL_FACTORY: Dict[str, Any] = {
     "llava": AutoModelForImageTextToText,
     "internvl": AutoModelForImageTextToText,
     "gemma3": AutoModelForImageTextToText,
+    "gemma4": AutoModelForImageTextToText,
     "smolvlm": AutoModelForImageTextToText,
     "mistral3": AutoModelForImageTextToText,
     "llama4": AutoModelForImageTextToText,
@@ -82,6 +83,7 @@ if NEMO_AUTOMODEL_AVAILABLE:
         "llava": NeMoAutoModelForImageTextToText,
         "internvl": NeMoAutoModelForImageTextToText,
         "gemma3": NeMoAutoModelForImageTextToText,
+        "gemma4": NeMoAutoModelForImageTextToText,
         "smolvlm": NeMoAutoModelForImageTextToText,
         "mistral3": NeMoAutoModelForImageTextToText,
         "llama4": NeMoAutoModelForImageTextToText,
@@ -315,8 +317,10 @@ def stream_weights_via_ipc_zmq_impl(
     def pack_tensor(buffer, tensor, used_bytes) -> int:
         """Pack tensor into buffer and return new used_bytes."""
         tensor_bytes = tensor.nbytes
+        # reshape(-1) (not view(-1)): the params iterator may yield
+        # non-contiguous tensors and view would raise on incompatible stride.
         buffer[used_bytes : used_bytes + tensor_bytes].data.copy_(
-            tensor.data.view(-1).view(dtype=torch.uint8), non_blocking=True
+            tensor.data.reshape(-1).view(dtype=torch.uint8), non_blocking=True
         )
         return used_bytes + calculate_aligned_size(tensor_bytes)
 

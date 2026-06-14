@@ -15,7 +15,7 @@ The following workflow + quantization recipe combinations have been validated en
 | Workflow | Quantization | Recipe | Status | Example Config |
 |---|---|---|---|---|
 | QA-Distillation | W4A4 | `NVFP4_DEFAULT_CFG` (NVFP4 weights + NVFP4 activations) | ✅ Converges | `examples/modelopt/qa_distillation_math_megatron.yaml` |
-| QA-GRPO | W4A16 | `examples/modelopt/quant_configs/nvfp4_a16.yaml` (NVFP4 weights, native-dtype activations) | ✅ Converges | `examples/modelopt/qa_grpo_llama8b_megatron.yaml` |
+| QA-GRPO | W4A16 | `examples/modelopt/quant_configs/nvfp4_a16.yaml` (NVFP4 weights, native-dtype activations) | ✅ Converges | `examples/modelopt/qa_grpo_llama8b_megatron.v2.yaml` |
 | QA-GRPO | W4A4 | `NVFP4_DEFAULT_CFG` | ⚠️ Known convergence issue | `examples/modelopt/qa_grpo_math_megatron.yaml` |
 
 The `nvfp4_a16.yaml` custom YAML enables NVFP4 e2m1 weight quantization (with dynamic e4m3 micro-block scales) and leaves activations unquantized; weights are still exercised through both Megatron training and vLLM generation.
@@ -27,7 +27,7 @@ The `nvfp4_a16.yaml` custom YAML enables NVFP4 e2m1 weight quantization (with dy
 The QA-GRPO config extends the standard Megatron GRPO config by adding quantization parameters. See [Verified Configurations](#verified-configurations) for the status of W4A4 vs W4A16 on GRPO.
 
 ```yaml
-# examples/modelopt/qa_grpo_llama8b_megatron.yaml
+# examples/modelopt/qa_grpo_llama8b_megatron.v2.yaml
 defaults: "../configs/grpo_math_8B_megatron.yaml"
 
 policy:
@@ -47,7 +47,7 @@ policy:
 
 ```bash
 uv run examples/run_grpo.py \
-  --config examples/modelopt/qa_grpo_llama8b_megatron.yaml \
+  --config examples/modelopt/qa_grpo_llama8b_megatron.v2.yaml \
   policy.model_name=meta-llama/Llama-3.1-8B-Instruct
 ```
 
@@ -55,7 +55,7 @@ uv run examples/run_grpo.py \
 
 ```bash
 COMMAND="uv run examples/run_grpo.py \
-  --config examples/modelopt/qa_grpo_llama8b_megatron.yaml \
+  --config examples/modelopt/qa_grpo_llama8b_megatron.v2.yaml \
   policy.model_name=meta-llama/Llama-3.1-8B-Instruct \
   checkpointing.checkpoint_dir=results/qa_grpo" \
 CONTAINER=YOUR_CONTAINER \
@@ -144,16 +144,17 @@ From within the NeMo RL container:
 ```bash
 cd /opt/nemo-rl
 
-PYTHONPATH=$PWD/3rdparty/Megatron-LM-workspace/Megatron-LM:${PYTHONPATH:-} \
+PYTHONPATH=$PWD/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM:${PYTHONPATH:-} \
 uv run --extra mcore --extra modelopt \
   torchrun --nproc_per_node <pipeline-parallel-size> \
-  3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/examples/quantization/export.py \
+  examples/modelopt/export_quantized_to_hf.py \
   --hf-model-id <hf-model-name-or-path> \
   --megatron-load-path <path-to-megatron-checkpoint>/policy/weights \
   --export-dir <output-hf-directory> \
   --tp 1 --pp <pipeline-parallel-size>
 ```
 
+- `examples/modelopt/export_quantized_to_hf.py` is a thin wrapper around `Megatron-Bridge/examples/quantization/export.py` that registers `nemo_rl.` as an allowed `_target_` prefix so the saved layer-spec callback in QARL checkpoints can be instantiated during export. All CLI flags pass through to the upstream script unchanged.
 - `--hf-model-id` should point to the original (pre-training) HuggingFace model so that the exporter knows the model architecture and tokenizer.
 - The `PYTHONPATH` prefix exposes Megatron-LM's `megatron.training` to the bridge script.
 - **`--tp 1` is required**: modelopt currently does not support TP>1 at export time. Training at TP>1 is fine; the bridge re-shards on load via `mp_overrides`.

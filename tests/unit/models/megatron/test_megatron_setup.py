@@ -24,6 +24,7 @@ nemo_rl.models.megatron.setup, focusing on:
 - Model path validation
 """
 
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -619,6 +620,216 @@ class TestApplyMoeConfig:
         assert model_cfg.moe_token_dispatcher_type == "alltoall"
         assert model_cfg.moe_shared_expert_overlap is True
 
+    @staticmethod
+    def _base_moe_megatron_cfg() -> dict:
+        return {
+            "expert_tensor_parallel_size": 2,
+            "expert_model_parallel_size": 4,
+            "moe_router_dtype": "float32",
+            "moe_router_load_balancing_type": "none",
+            "moe_router_bias_update_rate": 0.0,
+            "moe_permute_fusion": True,
+            "moe_enable_deepep": False,
+            "moe_token_dispatcher_type": "alltoall",
+            "moe_shared_expert_overlap": True,
+        }
+
+    @staticmethod
+    def _base_moe_cfg(**overrides):
+        cfg = {
+            "expert_tensor_parallel_size": 1,
+            "expert_model_parallel_size": 8,
+            "moe_router_dtype": "float32",
+            "moe_router_load_balancing_type": "none",
+            "moe_router_bias_update_rate": 0.0,
+            "moe_permute_fusion": True,
+            "moe_enable_deepep": False,
+            "moe_token_dispatcher_type": "flex",
+            "moe_shared_expert_overlap": True,
+        }
+        cfg.update(overrides)
+        return {"megatron_cfg": cfg}
+
+    @pytest.mark.parametrize("moe_grouped_gemm", [True, False])
+    def test_moe_grouped_gemm_explicit(self, moe_grouped_gemm):
+        """moe_grouped_gemm is applied when present in config."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        model_cfg = MagicMock()
+        megatron_cfg = self._base_moe_megatron_cfg()
+        megatron_cfg["moe_grouped_gemm"] = moe_grouped_gemm
+        config = {"megatron_cfg": megatron_cfg}
+
+        _apply_moe_config(model_cfg, config)
+
+        assert model_cfg.moe_grouped_gemm is moe_grouped_gemm
+
+    def test_moe_grouped_gemm_absent_keeps_default(self):
+        """Absent key leaves the attr unset on the model cfg."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        # spec lists everything _apply_moe_config writes so we can detect
+        # whether the moe_grouped_gemm branch fires.
+        model_cfg = MagicMock(
+            spec=[
+                "expert_tensor_parallel_size",
+                "expert_model_parallel_size",
+                "moe_router_dtype",
+                "moe_router_load_balancing_type",
+                "moe_router_bias_update_rate",
+                "moe_permute_fusion",
+                "moe_enable_deepep",
+                "moe_token_dispatcher_type",
+                "moe_shared_expert_overlap",
+            ]
+        )
+        config = {"megatron_cfg": self._base_moe_megatron_cfg()}
+
+        _apply_moe_config(model_cfg, config)
+
+        assert not hasattr(model_cfg, "moe_grouped_gemm")
+
+    def test_hybridep_env_vars_auto_set_with_warning(self, monkeypatch):
+        """HybridEP backend with no env config: auto-set env vars and emit warnings."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        monkeypatch.delenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", raising=False)
+        monkeypatch.delenv("USE_MNNVL", raising=False)
+
+        model_cfg = MagicMock()
+        config = self._base_moe_cfg(
+            expert_model_parallel_size=8,
+            moe_flex_dispatcher_backend="hybridep",
+            moe_hybridep_num_sms=32,
+        )
+
+        with pytest.warns(UserWarning) as warn_records:
+            _apply_moe_config(model_cfg, config)
+
+        assert model_cfg.moe_flex_dispatcher_backend == "hybridep"
+        assert model_cfg.moe_hybridep_num_sms == 32
+        # min(ep_size=8, 64) == 8
+        assert os.environ["NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"] == "8"
+        # int(ep_size=8 > 4) == 1
+        assert os.environ["USE_MNNVL"] == "1"
+        warn_messages = [str(w.message) for w in warn_records]
+        assert any(
+            "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN not configured" in m
+            for m in warn_messages
+        )
+        assert any("USE_MNNVL not configured" in m for m in warn_messages)
+
+    def test_hybridep_env_vars_from_explicit_config(self, monkeypatch):
+        """Explicit hybridep_* config keys override defaults without warnings."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        monkeypatch.delenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", raising=False)
+        monkeypatch.delenv("USE_MNNVL", raising=False)
+
+        model_cfg = MagicMock()
+        config = self._base_moe_cfg(
+            expert_model_parallel_size=128,
+            moe_flex_dispatcher_backend="hybridep",
+            moe_hybridep_num_sms=24,
+            hybridep_num_ranks_per_nvlink_domain=72,
+            hybridep_use_mnnvl=True,
+        )
+
+        import warnings as _warnings
+
+        with _warnings.catch_warnings(record=True) as caught:
+            _warnings.simplefilter("always")
+            _apply_moe_config(model_cfg, config)
+
+        assert os.environ["NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"] == "72"
+        assert os.environ["USE_MNNVL"] == "1"
+        # Bool False path also tested in dedicated test below; here ensure no auto warning fired.
+        hybridep_warns = [w for w in caught if "HybridEP" in str(w.message)]
+        assert hybridep_warns == []
+
+    def test_hybridep_use_mnnvl_explicit_false(self, monkeypatch):
+        """hybridep_use_mnnvl=False → USE_MNNVL='0'."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        monkeypatch.delenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", raising=False)
+        monkeypatch.delenv("USE_MNNVL", raising=False)
+
+        model_cfg = MagicMock()
+        config = self._base_moe_cfg(
+            expert_model_parallel_size=4,
+            moe_flex_dispatcher_backend="hybridep",
+            hybridep_num_ranks_per_nvlink_domain=4,
+            hybridep_use_mnnvl=False,
+        )
+
+        _apply_moe_config(model_cfg, config)
+
+        assert os.environ["USE_MNNVL"] == "0"
+
+    def test_hybridep_preserves_preexisting_env(self, monkeypatch):
+        """Pre-existing env vars must not be overwritten when config is absent."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        monkeypatch.setenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", "16")
+        monkeypatch.setenv("USE_MNNVL", "1")
+
+        model_cfg = MagicMock()
+        config = self._base_moe_cfg(
+            expert_model_parallel_size=64,
+            moe_flex_dispatcher_backend="hybridep",
+        )
+
+        _apply_moe_config(model_cfg, config)
+
+        assert os.environ["NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"] == "16"
+        assert os.environ["USE_MNNVL"] == "1"
+
+    def test_hybridep_skipped_when_backend_not_hybridep(self, monkeypatch):
+        """Non-hybridep backend leaves env vars untouched and skips num_sms gate."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        monkeypatch.delenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", raising=False)
+        monkeypatch.delenv("USE_MNNVL", raising=False)
+
+        model_cfg = MagicMock()
+        # backend present but not "hybridep"
+        config = self._base_moe_cfg(
+            expert_model_parallel_size=8,
+            moe_flex_dispatcher_backend="alltoall",
+        )
+
+        _apply_moe_config(model_cfg, config)
+
+        assert model_cfg.moe_flex_dispatcher_backend == "alltoall"
+        assert "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN" not in os.environ
+        assert "USE_MNNVL" not in os.environ
+
+    def test_hybridep_keys_absent_no_setattr(self, monkeypatch):
+        """When neither moe_flex_dispatcher_backend nor moe_hybridep_num_sms is in cfg,
+        the corresponding model_cfg attributes must not be set."""
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        monkeypatch.delenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", raising=False)
+        monkeypatch.delenv("USE_MNNVL", raising=False)
+
+        # Use a SimpleNamespace-like object (not MagicMock) so we can detect
+        # missing attribute access cleanly.
+        class _Cfg:
+            expert_model_parallel_size = 4
+
+        model_cfg = _Cfg()
+        config = self._base_moe_cfg(
+            expert_model_parallel_size=4,
+            moe_token_dispatcher_type="alltoall",
+        )
+
+        _apply_moe_config(model_cfg, config)
+
+        assert not hasattr(model_cfg, "moe_flex_dispatcher_backend")
+        assert not hasattr(model_cfg, "moe_hybridep_num_sms")
+        assert "NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN" not in os.environ
+        assert "USE_MNNVL" not in os.environ
+
 
 @pytest.mark.mcore
 class TestApplyPrecisionConfig:
@@ -770,28 +981,91 @@ class TestApplyPerformanceConfig:
         assert model_cfg.fp8_recipe == "default"
         assert model_cfg.fp8_param is False
 
-    def test_fp8_param_warning(self):
-        """Test that fp8_param=True generates a warning."""
+    def test_recompute_granularity_full_explicit(self):
+        """granularity='full' sets uniform method with 1 layer."""
         from nemo_rl.models.megatron.setup import _apply_performance_config
 
         model_cfg = MagicMock()
         model_cfg.gated_linear_unit = True
         config = {
             "megatron_cfg": {
-                "activation_checkpointing": False,
+                "activation_checkpointing": True,
+                "recompute_granularity": "full",
                 "apply_rope_fusion": False,
                 "bias_activation_fusion": False,
                 "gradient_accumulation_fusion": False,
-                "fp8_cfg": {
-                    "enabled": True,
-                    "fp8": "e4m3",
-                    "fp8_recipe": "default",
-                    "fp8_param": True,
-                },
             }
         }
 
-        with pytest.warns(UserWarning, match="fp8_param=True sometimes causes NaN"):
+        _apply_performance_config(model_cfg, config)
+
+        assert model_cfg.recompute_granularity == "full"
+        assert model_cfg.recompute_method == "uniform"
+        assert model_cfg.recompute_num_layers == 1
+
+    def test_recompute_granularity_selective_with_modules(self):
+        """granularity='selective' with explicit modules sets recompute_modules."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = MagicMock()
+        model_cfg.gated_linear_unit = True
+        modules = ["core_attn", "moe_act"]
+        config = {
+            "megatron_cfg": {
+                "activation_checkpointing": True,
+                "recompute_granularity": "selective",
+                "recompute_modules": modules,
+                "apply_rope_fusion": False,
+                "bias_activation_fusion": False,
+                "gradient_accumulation_fusion": False,
+            }
+        }
+
+        _apply_performance_config(model_cfg, config)
+
+        assert model_cfg.recompute_granularity == "selective"
+        assert model_cfg.recompute_modules == modules
+
+    def test_recompute_granularity_selective_without_modules_uses_mcore_default(self):
+        """granularity='selective' without recompute_modules leaves attr untouched (MCore default applies)."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = MagicMock(spec=["gated_linear_unit"])
+        model_cfg.gated_linear_unit = True
+        config = {
+            "megatron_cfg": {
+                "activation_checkpointing": True,
+                "recompute_granularity": "selective",
+                "apply_rope_fusion": False,
+                "bias_activation_fusion": False,
+                "gradient_accumulation_fusion": False,
+            }
+        }
+
+        _apply_performance_config(model_cfg, config)
+
+        assert model_cfg.recompute_granularity == "selective"
+        assert not hasattr(model_cfg, "recompute_modules")
+        assert not hasattr(model_cfg, "recompute_method")
+        assert not hasattr(model_cfg, "recompute_num_layers")
+
+    def test_recompute_granularity_invalid_raises(self):
+        """Invalid granularity raises ValueError with a helpful message."""
+        from nemo_rl.models.megatron.setup import _apply_performance_config
+
+        model_cfg = MagicMock()
+        model_cfg.gated_linear_unit = True
+        config = {
+            "megatron_cfg": {
+                "activation_checkpointing": True,
+                "recompute_granularity": "block",
+                "apply_rope_fusion": False,
+                "bias_activation_fusion": False,
+                "gradient_accumulation_fusion": False,
+            }
+        }
+
+        with pytest.raises(ValueError, match="Invalid recompute_granularity"):
             _apply_performance_config(model_cfg, config)
 
 

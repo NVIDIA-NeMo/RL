@@ -15,7 +15,7 @@
 from typing import Any, Optional, Protocol
 
 
-class ReplayBufferProtocol(Protocol):
+class ReplayBufferProtocol(Protocol):  # pragma: no cover
     """Interface for the replay buffer used in async RL training."""
 
     def add(
@@ -51,14 +51,42 @@ class ReplayBufferProtocol(Protocol):
         """
         ...
 
-    def evict(self) -> None:
-        """Evict old trajectories."""
-        ...
-
     def size(self) -> int:
         """Return current buffer size."""
         ...
 
     def clear(self) -> None:
         """Clear the buffer."""
+        ...
+
+    def state_dict(self) -> dict[str, Any]:
+        """Return serializable state for checkpointing."""
+        ...
+
+    def load_state_dict(
+        self,
+        state: dict[str, Any],
+        num_prompts_per_step: int | None = None,
+        current_training_step: int | None = None,
+        max_age_steps: int | None = None,
+    ) -> None:
+        """Restore state produced by ``state_dict``."""
+        ...
+
+    def get_trajectories_needed(
+        self,
+        target_step: int,
+        num_prompts_per_step: int,
+        max_age_steps: int | None = None,
+    ) -> int:
+        """Return additional trajectories needed for ``target_step``."""
+        ...
+
+    def has_complete_batch(
+        self,
+        target_step: int,
+        num_prompts_per_step: int,
+        max_age_steps: int | None = None,
+    ) -> bool:
+        """Return whether ``target_step`` has enough trajectories to train."""
         ...

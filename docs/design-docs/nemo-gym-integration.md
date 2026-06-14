@@ -1,6 +1,6 @@
 # NeMo Gym Integration
 
-This document describes how NeMo RL integrates with [NeMo Gym](https://docs.nvidia.com/nemo/gym/latest/index.html) for multi-step and multi-turn reinforcement learning training.
+This document describes how NeMo RL integrates with [NeMo Gym](https://docs.nvidia.com/nemo/gym/v0.2.1/index.html) for multi-step and multi-turn rollout collection. NeMo Gym rollouts are supported by GRPO and on-policy distillation.
 
 ## Overview
 
@@ -9,6 +9,10 @@ NeMo Gym provides HTTP-based training environments for LLMs. **NeMo Gym is CPU-o
 - **Decoupled architecture**: Environments don't need direct access to model internals
 - **Multi-step/multi-turn support**: Agents can orchestrate complex interactions with tools
 - **Refit compatibility**: NeMo RL's weight synchronization works transparently
+
+The same NeMo Gym rollout path is used by GRPO and on-policy distillation when `env.should_use_nemo_gym` is enabled. Distillation uses the generated NeMo Gym conversations as the student on-policy samples before computing teacher logits and the distillation loss.
+
+For on-policy distillation, NeMo Gym controls the rollout turn count from its environment and agent configuration. The standard distillation `distillation.max_rollout_turns` setting is not used by the NeMo Gym rollout path.
 
 ## Configuration
 
@@ -31,7 +35,7 @@ env:
       - responses_api_agents/simple_agent/configs/simple_agent.yaml
 ```
 
-For a complete example, see `examples/nemo_gym/` and its associated configs.
+For complete examples, see `examples/nemo_gym/run_grpo_nemo_gym.py`, `examples/nemo_gym/run_distillation_nemo_gym.py`, and their associated configs under `examples/nemo_gym/`.
 
 ### Version Requirements
 
@@ -43,7 +47,7 @@ NeMo Gym runs as a Ray actor within NeMo RL's Ray cluster, so the same Ray and P
 %%{init: {'theme': 'default', 'themeVariables': { 'lineColor': '#5c6bc0', 'primaryTextColor': '#333'}}}%%
 flowchart LR
     subgraph RL["NeMo RL"]
-        GRPO["GRPO Loop"]
+        Loop["Training Loop<br/>(GRPO or Distillation)"]
         vLLM["vLLM + HTTP"]
         Bridge["NemoGym Actor"]
     end
@@ -54,8 +58,8 @@ flowchart LR
         Resources["Resources"]
     end
     
-    GRPO -->|refit| vLLM
-    GRPO -->|run_rollouts| Bridge
+    Loop -->|refit| vLLM
+    Loop -->|run_rollouts| Bridge
     Bridge -->|spawns| Gym
     Agent <--> Model
     Agent <--> Resources
@@ -83,7 +87,7 @@ The integration is handled by the `NemoGym` Ray actor at `nemo_rl/environments/n
 %%{init: {'theme': 'default', 'themeVariables': { 'lineColor': '#5c6bc0', 'primaryTextColor': '#333'}}}%%
 flowchart LR
     subgraph RL["NeMo RL"]
-        GRPO["GRPO Loop"]
+        Loop["Training Loop<br/>(GRPO or Distillation)"]
         Actor["NemoGym Actor"]
     end
     
@@ -92,18 +96,18 @@ flowchart LR
         Agent["Agent Server"]
     end
     
-    GRPO --> Actor
+    Loop --> Actor
     Actor --> Agent
     Agent --> RCH
     RCH --> Actor
-    Actor --> GRPO
+    Actor --> Loop
 
     style RL fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
     style Gym fill:#fff3e0,stroke:#ef6c00,stroke-width:2px
 ```
 
 The flow is:
-1. GRPO Loop calls `run_rollouts.remote(batch)` on the NemoGym Actor
+1. The GRPO or distillation loop calls `run_rollouts.remote(batch)` on the NemoGym Actor
 2. Actor sends `POST /run` to the Agent Server
 3. Agent Server orchestrates the rollout via RolloutCollectionHelper
 4. Results return to the Actor
@@ -155,7 +159,7 @@ sequenceDiagram
 sequenceDiagram
     autonumber
     box rgb(227, 242, 253) NeMo RL
-        participant GRPO as GRPO Loop
+        participant Loop as Training Loop
         participant Policy as Policy Workers
         participant vLLM as vLLM HTTP
         participant Bridge as NemoGym Actor
@@ -166,9 +170,9 @@ sequenceDiagram
         participant Resource as Resource Server
     end
     
-    GRPO->>Policy: Refit (trigger weight sync)
+    Loop->>Policy: Refit (trigger weight sync)
     Policy->>vLLM: Sync weights to vLLM
-    GRPO->>Bridge: run_rollouts.remote(batch)
+    Loop->>Bridge: run_rollouts.remote(batch)
     Bridge->>Agent: POST /run
     Agent->>Model: POST /v1/responses
     Model->>vLLM: POST /v1/chat/completions
@@ -177,11 +181,11 @@ sequenceDiagram
     Agent->>Resource: Execute tool / compute reward
     Resource-->>Agent: Tool result / reward
     Agent-->>Bridge: Results + rewards
-    Bridge-->>GRPO: Token IDs, logprobs, rewards
-    GRPO->>Policy: Compute loss and train
+    Bridge-->>Loop: Token IDs, logprobs, rewards
+    Loop->>Policy: Compute loss and train
 ```
 
-> **NeMo Gym server types** (see [Core Components](https://docs.nvidia.com/nemo/gym/latest/about/concepts/core-components.html)):
+> **NeMo Gym server types** (see [Core Components](https://docs.nvidia.com/nemo/gym/v0.2.1/about/concepts/core-components/)):
 > - **Agent Server**: Orchestrates the rollout loop
 > - **Model Server**: HTTP proxy to vLLM; translates Responses API ↔ Chat Completions
 > - **Resource Server**: Provides tools and rewards
@@ -191,7 +195,7 @@ sequenceDiagram
 | Step | Location | Description |
 |------|----------|-------------|
 | **Refit** | NeMo RL | Synchronizes policy weights to vLLM workers. For async RL, refit timing may differ—see {doc}`generation` for details. |
-| **run_rollouts.remote()** | NeMo RL | Ray remote call from GRPO loop to the NemoGym actor |
+| **run_rollouts.remote()** | NeMo RL | Ray remote call from the training loop to the NemoGym actor |
 | **POST /run** | NeMo RL → NeMo Gym | HTTP request from NemoGym actor to Agent Server subprocess |
 | **Rollout orchestration** | NeMo Gym | Agent calls Model Server and Resources Server via HTTP |
 | **POST /v1/chat/completions** | NeMo Gym → NeMo RL | Model Server proxies to NeMo RL's vLLM HTTP endpoint |
@@ -254,4 +258,4 @@ Token IDs are extracted at the NeMo RL vLLM layer via the `/tokenize` endpoint. 
 - Tokenization matches the exact model and tokenizer used for generation
 - No re-tokenization drift between generation and training
 
-For details on on-policy token ID handling, see {doc}`../guides/environments` and the [NeMo Gym on-policy corrections documentation](https://docs.nvidia.com/nemo/gym/latest/contribute/rl-framework-integration/openai-compatible-http-server-on-policy-correction.html).
+For details on on-policy token ID handling, see {doc}`../guides/environments` and the [NeMo Gym on-policy corrections documentation](https://docs.nvidia.com/nemo/gym/v0.2.1/contribute/rl-framework-integration/openai-compatible-http-server-on-policy-correction.html).

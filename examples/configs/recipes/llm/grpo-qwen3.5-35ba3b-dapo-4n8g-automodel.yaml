@@ -11,6 +11,7 @@ grpo:
 loss_fn:
   reference_policy_kl_penalty: 0.0
   use_importance_sampling_correction: true
+  truncated_importance_sampling_type: "tis"
   truncated_importance_sampling_ratio: 2
   ratio_clip_max: 0.28
   ratio_clip_c: 10
@@ -24,9 +25,14 @@ policy:
   logprob_chunk_size: 4096
   offload_optimizer_for_logprob: true
   optimizer:
+    name: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
     kwargs:
       lr: 1.0e-06
       weight_decay: 0.1
+      master_weights: true
+      store_param_remainders: true
+      exp_avg_dtype: torch.bfloat16
+      exp_avg_sq_dtype: torch.bfloat16
   scheduler:
   - name: torch.optim.lr_scheduler.LinearLR
     kwargs:
@@ -48,10 +54,15 @@ policy:
         attn: sdpa
         linear: torch
         rms_norm: torch
-        enable_deepep: true
+        experts: gmm
+        dispatcher: deepep
         fake_balanced_gate: false
         rope_fusion: false
         enable_hf_state_dict_adapter: true
+      freeze_config:
+        freeze_vision_tower: true
+        freeze_audio_tower: true
+        freeze_language_model: false
   sequence_packing:
     enabled: false
   dynamic_batching:
@@ -59,8 +70,9 @@ policy:
   generation:
     max_new_tokens: 8192
     vllm_cfg:
-      tensor_parallel_size: 4
+      tensor_parallel_size: 8
       gpu_memory_utilization: 0.5
+      enforce_eager: true
 data:
   max_input_seq_length: 2048
   train:

@@ -288,6 +288,48 @@ def test_basic_worker_creation_and_method_calls(register_test_actor, virtual_clu
     worker_group.shutdown(force=True)
 
 
+def test_initializer_pool_is_per_node_single_node(worker_group_1d_sharding):
+    """One IsolatedWorkerInitializer is pooled per node (pg_idx), not per worker.
+
+    The 1d fixture places 2 workers on a single node, so the pool holds a
+    single initializer even though there are 2 workers.
+    """
+    worker_group = worker_group_1d_sharding
+    assert len(worker_group.workers) == 2
+    assert len(worker_group._initializer_pool) == 1
+    assert set(worker_group._initializer_pool.keys()) == {0}
+
+
+def test_initializer_pool_is_per_node_multi_node(worker_group_2d_sharding):
+    """The pool holds one initializer per unique pg_idx across multiple nodes.
+
+    The 2d fixture spans 2 nodes with 4 workers total, so the pool holds 2
+    initializers — a per-node count, not the per-worker count of 4.
+    """
+    worker_group = worker_group_2d_sharding
+    assert len(worker_group.workers) == 4
+    assert len(worker_group._initializer_pool) == 2
+    assert set(worker_group._initializer_pool.keys()) == {0, 1}
+
+
+def test_shutdown_clears_initializer_pool(
+    register_test_actor, virtual_cluster_4_bundles
+):
+    """shutdown() kills the pooled initializers and clears the pool."""
+    builder = RayWorkerBuilder(register_test_actor)
+    sharding = NamedSharding(layout=[[0, 1], [2, 3]], names=["dp", "tp"])
+    worker_group = RayWorkerGroup(
+        cluster=virtual_cluster_4_bundles,
+        remote_worker_builder=builder,
+        workers_per_node=None,
+        sharding_annotations=sharding,
+    )
+    assert len(worker_group._initializer_pool) == 2
+
+    assert worker_group.shutdown(force=True) is True
+    assert worker_group._initializer_pool == {}
+
+
 def test_actor_initialization_with_args_kwargs(register_test_actor, virtual_cluster):
     actor_fqn = register_test_actor
     init_args = ("arg1", 123)

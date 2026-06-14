@@ -22,11 +22,13 @@ import math
 import statistics
 import warnings
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 
 import ray
 import torch
+from pydantic import BaseModel
 from transformers import PreTrainedTokenizerBase
 from wandb import Histogram, Table
 
@@ -53,6 +55,108 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
+
+
+class EffortLevelsConfig(BaseModel, extra="allow"):
+    """Controls length-based reward shaping for low-effort prompts.
+
+    When a prompt contains ``low_string``, the final reward is adjusted by a
+    length-reward term that penalises overly long responses.  The reward formula
+    is::
+
+        length_reward = min(1, low_weight * (1 - response_len / low_ub))
+        new_reward    = orig_reward
+                      + orig_reward * max(length_reward, 0)
+                      + low_penalty * min(length_reward, 0)
+
+    Setting ``low_weight = 0`` or leaving ``low_string`` empty disables the
+    shaping entirely.
+    """
+
+    low_weight: float = 0.0
+    """Weight applied to the length-reward term.  Set to 0 to disable."""
+    low_penalty: float = 1.0
+    """Coefficient for the negative length-reward penalty."""
+    low_ub: int = 64000
+    """Response-length upper bound (in tokens) used to normalise the term."""
+    low_string: str = ""
+    """Substring that must appear in the user prompt to trigger shaping."""
+
+
+@dataclass
+class _EffortShapingMetrics:
+    length_rewards_low: list[float]
+    rewards_low: list[float]
+    low_lengths: list[int]
+    high_lengths: list[int]
+
+
+def _apply_effort_shaping(
+    results: list[dict],
+    nemo_gym_rows: list[dict],
+    effort_config: Optional[EffortLevelsConfig],
+) -> _EffortShapingMetrics:
+    """Apply length-based reward shaping for low-effort prompts.
+
+    Modifies ``results[i]["full_result"]["reward"]`` in place for samples whose
+    last user-turn prompt contains ``effort_config.low_string``.  Returns per-sample
+    tracking lists used to populate rollout metrics.
+
+    No-ops (returns empty lists) when ``effort_config`` is ``None``,
+    ``low_weight`` is zero, or ``low_string`` is empty.
+    """
+    length_rewards_low: list[float] = []
+    rewards_low: list[float] = []
+    low_lengths: list[int] = []
+    high_lengths: list[int] = []
+
+    if (
+        effort_config is None
+        or effort_config.low_weight <= 0
+        or not effort_config.low_string
+    ):
+        return _EffortShapingMetrics(
+            length_rewards_low, rewards_low, low_lengths, high_lengths
+        )
+
+    lengths = [
+        len(r["message_log"][-1]["token_ids"])
+        if r["message_log"][-1]["role"] == "assistant"
+        else 0
+        for r in results
+    ]
+    orig_rewards = [r["full_result"]["reward"] for r in results]
+    for i, result in enumerate(results):
+        prompt = next(
+            (
+                msg["content"]
+                for msg in reversed(
+                    nemo_gym_rows[i]["responses_create_params"]["input"]
+                )
+                if msg.get("role") == "user" and "content" in msg
+            ),
+            "",
+        )
+        if effort_config.low_string in prompt:
+            length_reward = min(
+                1.0,
+                effort_config.low_weight * (1.0 - lengths[i] / effort_config.low_ub),
+            )
+            new_reward = (
+                orig_rewards[i]
+                + orig_rewards[i] * max(length_reward, 0.0)
+                + effort_config.low_penalty * min(length_reward, 0.0)
+            )
+            result["full_result"]["reward"] = new_reward
+            length_rewards_low.append(length_reward)
+            rewards_low.append(new_reward)
+            low_lengths.append(lengths[i])
+        else:
+            high_lengths.append(lengths[i])
+
+    return _EffortShapingMetrics(
+        length_rewards_low, rewards_low, low_lengths, high_lengths
+    )
 
 
 def generate_responses(
@@ -1079,7 +1183,7 @@ class AsyncNemoGymRolloutResult:
 
 
 def _calculate_single_metric(
-    values: list[float], batch_size: int, key_name: str
+    values: Sequence[float | int], batch_size: int, key_name: str
 ) -> dict:
     return {
         f"{key_name}/mean": sum(values) / batch_size,
@@ -1100,6 +1204,7 @@ def run_async_nemo_gym_rollout(
     max_seq_len: Optional[int] = None,
     max_rollout_turns: Optional[int] = None,
     greedy: bool = False,
+    effort_config: Optional[EffortLevelsConfig] = None,
 ) -> AsyncNemoGymRolloutResult:
     """Run multi-turn rollouts with NeMo-Gym. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters."""
     # We accept max_seq_len for API parity with the other rollout paths, but NeMo-Gym
@@ -1143,15 +1248,15 @@ def run_async_nemo_gym_rollout(
         responses_create_params = row["responses_create_params"]
         responses_create_params["temperature"] = generation_config["temperature"]
         responses_create_params["top_p"] = generation_config["top_p"]
-        if generation_config["max_new_tokens"] is not None:
-            existing_max_output_tokens = responses_create_params.get(
-                "max_output_tokens"
-            )
-            responses_create_params["max_output_tokens"] = (
-                min(existing_max_output_tokens, generation_config["max_new_tokens"])
-                if existing_max_output_tokens is not None
-                else generation_config["max_new_tokens"]
-            )
+
+        # Configure max_output_tokens to respect the max_new_tokens setting.
+        # Will clamp max_output_tokens in vllm_worker_async.py so that input + output <= max_seq_len
+        existing_max_output_tokens = responses_create_params.get("max_output_tokens")
+        responses_create_params["max_output_tokens"] = (
+            min(existing_max_output_tokens, generation_config["max_new_tokens"])
+            if existing_max_output_tokens is not None
+            else generation_config["max_new_tokens"]
+        )
 
         row["_rowidx"] = rowidx
 
@@ -1171,6 +1276,13 @@ def run_async_nemo_gym_rollout(
                 [m for m in r["message_log"] if m["role"] == "assistant"],
                 "generation_logprobs",
             )
+
+    # Length-based reward shaping for low-effort prompts
+    shaping = _apply_effort_shaping(results, nemo_gym_rows, effort_config)
+    length_rewards_low = shaping.length_rewards_low
+    rewards_low = shaping.rewards_low
+    low_lengths = shaping.low_lengths
+    high_lengths = shaping.high_lengths
 
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
@@ -1304,6 +1416,19 @@ def run_async_nemo_gym_rollout(
             ),
         }
     )
+
+    if length_rewards_low:
+        rollout_metrics["mean_length_reward_low"] = sum(length_rewards_low) / len(
+            length_rewards_low
+        )
+    if rewards_low:
+        rollout_metrics["mean_reward_low"] = sum(rewards_low) / len(rewards_low)
+    if low_lengths:
+        rollout_metrics["mean_length_low"] = sum(low_lengths) / len(low_lengths)
+        rollout_metrics["median_length_low"] = float(statistics.median(low_lengths))
+    if high_lengths:
+        rollout_metrics["mean_length_high"] = sum(high_lengths) / len(high_lengths)
+        rollout_metrics["median_length_high"] = float(statistics.median(high_lengths))
 
     return AsyncNemoGymRolloutResult(
         input_ids=input_ids,

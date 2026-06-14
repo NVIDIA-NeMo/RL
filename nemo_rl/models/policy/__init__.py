@@ -99,6 +99,8 @@ class DTensorConfig(TypedDict):
     tensor_parallel_size: int
     context_parallel_size: int
     expert_parallel_size: NotRequired[int]
+    # Size of the HSDP replicate dimension within the data-parallel axis (DTensor v2 only).
+    dp_replicate_size: NotRequired[int]
     # Distributed config options (mirrors Automodel's FSDP2Config)
     sequence_parallel: bool
     activation_checkpointing: bool
@@ -192,6 +194,25 @@ class MegatronDDPConfig(TypedDict):
     data_parallel_sharding_strategy: str
 
 
+class Fp8Config(TypedDict):
+    # Master switch for FP8 training. When False, all other fields are ignored.
+    enabled: bool
+    # FP8 format used for the GEMMs (e.g. "e4m3").
+    fp8: NotRequired[str]
+    # FP8 scaling recipe (e.g. "blockwise").
+    fp8_recipe: NotRequired[str]
+    # When True, keep parameters in FP8. Can cause NaN token_mult_prob_error;
+    # use with caution (see https://github.com/NVIDIA-NeMo/RL/issues/1164).
+    fp8_param: NotRequired[bool]
+    # When True, clear Transformer Engine's per-module _fp8_workspaces scratch
+    # buffers in offload_before_refit (before weight transfer to the inference
+    # engine). These FP8 workspace tensors anchor large CUDA segments and
+    # aggravate allocator fragmentation across the train->offload->refit->generate
+    # cycle. Useful for FP8 training runs that observe growing reserved GPU memory
+    # after offload.
+    force_clear_fp8_caches: NotRequired[bool]
+
+
 # Type exists to be lax if not specified
 class MegatronConfigDisabled(TypedDict):
     enabled: Literal[False]
@@ -204,6 +225,16 @@ class MegatronConfig(TypedDict):
     # Setting to 0 is faster, but you are more likely to run out of GPU memory. In SFT/DPO, the default is 0.
     empty_unused_memory_level: int
     activation_checkpointing: bool
+    # Recompute granularity: "full" recomputes all activations, "selective" recomputes
+    # only specific modules (see recompute_modules). "selective" typically saves ~10-18GB
+    # for MoE models while retaining higher throughput than "full".
+    recompute_granularity: NotRequired[Literal["full", "selective"]]
+    # Modules to selectively recompute when recompute_granularity="selective".
+    # MCore valid options: ["core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe", "shared_experts"].
+    # Defaults to ["core_attn"] when None. Full list and per-module constraints:
+    # https://github.com/NVIDIA/Megatron-LM/blob/d30c3ae5469fe3f6a64d4fd2e63b6e7f7844ea81/megatron/core/transformer/transformer_config.py#L483
+    # when None. Use ["moe"] to recompute only expert activations (production-proven config).
+    recompute_modules: NotRequired[list[str] | None]
     tensor_model_parallel_size: int
     pipeline_model_parallel_size: int
     num_layers_in_first_pipeline_stage: int | None
@@ -237,6 +268,18 @@ class MegatronConfig(TypedDict):
     moe_token_dispatcher_type: str
     # Can be used only with 'alltoall' token dispatcher
     moe_shared_expert_overlap: bool
+    # Enable grouped GEMM for MoE experts via CUTLASS. Significant throughput
+    # gain when multiple experts are assigned per rank (num_local_experts > 1).
+    # Requires TE >= 1.11.0 for FP8 and Ampere (sm_80) or newer.
+    moe_grouped_gemm: NotRequired[bool]
+    # HybridEP settings for MoE expert parallelism (requires moe_token_dispatcher_type='flex')
+    # See: https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep
+    moe_flex_dispatcher_backend: NotRequired[str]
+    moe_hybridep_num_sms: NotRequired[int]
+    # Number of HybridEP ranks per NVLink domain (default: min(expert_model_parallel_size, 64))
+    hybridep_num_ranks_per_nvlink_domain: NotRequired[int]
+    # Enable multi-node NVLink support (default: expert_model_parallel_size > 4)
+    hybridep_use_mnnvl: NotRequired[bool]
     peft: NotRequired[MegatronPeftConfig | MegatronPeftConfigDisabled]
     optimizer: MegatronOptimizerConfig
     scheduler: MegatronSchedulerConfig
@@ -253,6 +296,14 @@ class MegatronConfig(TypedDict):
     linear_ce_fusion_chunk_size: NotRequired[int]
     # When mtp_num_layers=0, Multi-Token Prediction is disabled.
     mtp_num_layers: NotRequired[int]
+    # When True, clear the RotaryEmbedding LRU cache and MoE token dispatcher
+    # routing tensors in offload_before_refit (before weight transfer to the
+    # inference engine). Useful when training and logprob runs use different
+    # sequence lengths (rope cache) or for MoE models with activation recompute
+    # (dispatcher reference cycles).
+    clear_memory_caches_before_refit: NotRequired[bool]
+    # FP8 quantization settings for the Megatron training backend.
+    fp8_cfg: NotRequired[Fp8Config]
 
 
 class DraftConfigDisabled(TypedDict):
