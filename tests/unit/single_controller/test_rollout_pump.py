@@ -28,11 +28,15 @@ import ray
 import torch
 from tensordict import TensorDict
 
-from nemo_rl.algorithms.single_controller import (
-    SingleControllerActor,
-    SingleControllerConfig,
+from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
+from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.algorithms.single_controller_utils import (
+    AsyncRLConfig,
+    MasterConfig,
+    SingleControllerBundle,
 )
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
+from nemo_rl.experience.rollout_manager import RolloutManager
 
 # Reuse fixtures from the experience tests; same shape as test_async_rollout_manager.
 from tests.unit.experience.test_rollouts import (
@@ -174,34 +178,56 @@ def test_rollout_pump_writes_expected_tq_data(
     )
     dp_adapter = _SyncDPAdapter(tq_actor)
 
-    cfg = SingleControllerConfig(
-        max_train_steps=1,
-        min_prompt_groups_per_batch=1,
-        generations_per_prompt=num_generations,
-        max_buffered_rollouts=max_rollout_prompts,
-        max_inflight_prompts=max_rollout_prompts,
-        max_weight_staleness_versions=0,
-        advantage_enabled=False,
-        diagnostics=False,
-        partition_id=_PARTITION_ID,
-        rollout_max_seq_len=max_seq_len,
-        rollout_max_turns=max_rollout_turns,
-        use_nemo_gym=False,
+    mc = MasterConfig.model_construct(
+        grpo={
+            "max_num_steps": 1,
+            "max_num_epochs": None,
+            "num_generations_per_prompt": num_generations,
+        },
+        async_rl=AsyncRLConfig(
+            max_weight_staleness_versions=0,
+            min_prompt_groups_per_batch=1,
+            target_prompt_groups_per_step=None,
+            batch_selection_strategy="strict_on_policy",
+            max_inflight_prompts=max_rollout_prompts,
+            max_buffered_rollouts=max_rollout_prompts,
+        ),
     )
     # SingleControllerActor expects a StatefulDataLoader, but the pump only
     # iterates it (`for prompt in self._dataloader`), so any iterable works.
     dataloader = [input_sample] * max_rollout_prompts
 
-    ctrl = SingleControllerActor.remote(
-        cfg=cfg,
-        dp_client=dp_adapter,
+    tq_buffer = TQReplayBuffer(
+        dp_adapter,
+        partition_id=mc.partition_id,
+        pad_value_dict={"token_ids": int(tokenizer.pad_token_id or 0)},
+    )
+    rollout_manager = RolloutManager(
+        tokenizer=tokenizer,
+        env_handles=env_handles,
+        num_generations_per_prompt=num_generations,
+        max_seq_len=max_seq_len,
+        max_rollout_turns=max_rollout_turns,
+        policy_generation=vllm_generation,
+        use_nemo_gym=False,
+        tq_buffer=tq_buffer,
+    )
+    bundle = SingleControllerBundle(
         gen_handle=vllm_generation,
         trainer_handle=object(),
         env_handles=env_handles,
+        train_cluster=None,
+        inference_cluster=None,
+        dp_client=dp_adapter,
         dataloader=dataloader,
         weight_synchronizer=object(),
-        tokenizer=tokenizer,
+        advantage_estimator=None,
+        loss_fn=None,
+        rollout_manager=rollout_manager,
+        tq_buffer=tq_buffer,
+        partition_id=_PARTITION_ID,
     )
+    ctrl = SingleControllerActor.remote(master_config=mc, bundle=bundle)
 
     vllm_generation.prepare_for_generation()
 

@@ -491,7 +491,7 @@ class TQPolicy(Policy):
             gbs=batch_size,
             mbs=micro_batch_size,
         )
-        self.worker_group.get_all_worker_results(futures)
+        ray.get(futures)
 
     def train_microbatch_from_meta(
         self,
@@ -563,7 +563,7 @@ class TQPolicy(Policy):
             "finish_train_step_presharded",
             step_id=step_id,
         )
-        results = self.worker_group.get_all_worker_results(futures)
+        results = ray.get(futures)
         aggregated_results = _aggregate_train_results(results)
 
         if self.flops_tracker is not None:
@@ -578,7 +578,7 @@ class TQPolicy(Policy):
             "abort_train_step_presharded",
             step_id=step_id,
         )
-        self.worker_group.get_all_worker_results(futures)
+        ray.get(futures)
 
         if self.flops_tracker is not None:
             self.flops_tracker.reset()

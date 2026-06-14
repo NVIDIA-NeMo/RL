@@ -49,12 +49,50 @@ os.environ["RAY_TMPDIR"] = _RAY_TEMP
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms.async_utils.staleness_sampler import StalenessSampler
-from nemo_rl.algorithms.single_controller import (
-    SingleControllerActor,
-    SingleControllerConfig,
+from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.algorithms.single_controller_utils import (
+    AsyncRLConfig,
+    MasterConfig,
+    SingleControllerBundle,
 )
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
+
+
+def _make_test_master_config(
+    *,
+    max_num_steps: int = 3,
+    max_num_epochs: int | None = None,
+    min_prompt_groups_per_batch: int = 1,
+    target_prompt_groups_per_step: int | None = None,
+    num_generations_per_prompt: int = 1,
+    batch_selection_strategy: str = "staleness_window",
+    max_weight_staleness_versions: int = 1,
+    max_inflight_prompts: int = 4,
+    max_buffered_rollouts: int = 4,
+) -> MasterConfig:
+    """Build a MasterConfig for tests with only grpo + async_rl filled.
+
+    Cross-cutting components (policy/data/cluster/...) are required by pydantic but
+    unused when a hand-built SingleControllerBundle is injected, so we use
+    model_construct to skip validation. SC-specific knobs live on the top-level
+    async_rl section (an AsyncRLConfig BaseModel).
+    """
+    grpo_subset = {
+        "max_num_steps": max_num_steps,
+        "max_num_epochs": max_num_epochs,
+        "num_generations_per_prompt": num_generations_per_prompt,
+    }
+    async_rl = AsyncRLConfig(
+        max_weight_staleness_versions=max_weight_staleness_versions,
+        min_prompt_groups_per_batch=min_prompt_groups_per_batch,
+        target_prompt_groups_per_step=target_prompt_groups_per_step,
+        batch_selection_strategy=batch_selection_strategy,
+        max_inflight_prompts=max_inflight_prompts,
+        max_buffered_rollouts=max_buffered_rollouts,
+    )
+    return MasterConfig.model_construct(grpo=grpo_subset, async_rl=async_rl)
+
 
 # ── Fake in-memory DataPlane ──────────────────────────────────────────────
 
@@ -524,19 +562,15 @@ class TestSingleControllerDryRun:
         max_buffered_rollouts=4,
         max_inflight_prompts=4,
         max_weight_staleness_versions=1,
-        advantage_enabled=False,
         advantage_estimator=None,
-        diagnostics=False,
     ):
-        cfg = SingleControllerConfig(
-            max_train_steps=max_train_steps,
+        mc = _make_test_master_config(
+            max_num_steps=max_train_steps,
             min_prompt_groups_per_batch=min_prompt_groups_per_batch,
-            generations_per_prompt=generations_per_prompt,
+            num_generations_per_prompt=generations_per_prompt,
             max_buffered_rollouts=max_buffered_rollouts,
             max_inflight_prompts=max_inflight_prompts,
             max_weight_staleness_versions=max_weight_staleness_versions,
-            advantage_enabled=advantage_enabled,
-            diagnostics=diagnostics,
         )
 
         # SC expects a StatefulDataLoader, but the pump only iterates it
@@ -545,25 +579,29 @@ class TestSingleControllerDryRun:
 
         tq_buffer = TQReplayBuffer(
             dp_client,
-            partition_id=cfg.partition_id,
+            partition_id="rollout_data",
             pad_value_dict={"token_ids": 0},
         )
         rollout_manager = DryRunRolloutManager(gen, tq_buffer)
         if weight_sync is None:
             weight_sync = DryRunWeightSynchronizer()
 
-        return SingleControllerActor.remote(
-            cfg=cfg,
-            dp_client=dp_client,
+        bundle = SingleControllerBundle(
             gen_handle=gen,
-            env_handles={},
             trainer_handle=trainer,
+            env_handles={},
+            train_cluster=None,
+            inference_cluster=None,
+            dp_client=dp_client,
             dataloader=dataloader,
             weight_synchronizer=weight_sync,
             advantage_estimator=advantage_estimator,
+            loss_fn=None,
             rollout_manager=rollout_manager,
             tq_buffer=tq_buffer,
+            partition_id="rollout_data",
         )
+        return SingleControllerActor.remote(master_config=mc, bundle=bundle)
 
     def test_dry_run_completes(self, ray_init):
         """SC completes N train steps without deadlock on CPU."""
@@ -601,7 +639,6 @@ class TestSingleControllerDryRun:
             max_train_steps=1,
             min_prompt_groups_per_batch=2,
             generations_per_prompt=1,
-            advantage_enabled=True,
             advantage_estimator=DryRunAdvantageEstimator(),
         )
 
@@ -811,68 +848,6 @@ class TestSingleControllerDryRun:
         assert [m.sample_ids[0] for m in buf.meta_list] == ["g1_g0"]
 
 
-@ray.remote(num_cpus=0)
-class _ReapInFlightHelperActor:
-    """Tiny Ray actor exposing SingleControllerActor._reap_in_flight_nonblocking."""
-
-    async def reap(self, refs):
-        if not refs:
-            return []
-        ref_to_task = {ref: asyncio.ensure_future(ref) for ref in refs}
-        await asyncio.wait(ref_to_task.values(), timeout=0.05)
-        pending = []
-        for ref, task in ref_to_task.items():
-            if task.done():
-                task.result()
-            else:
-                task.cancel()
-                pending.append(ref)
-        return pending
-
-
-@ray.remote
-def _sleep_then_return(seconds: float, value: int = 0) -> int:
-    time.sleep(seconds)
-    return value
-
-
-@ray.remote
-def _raise_after(seconds: float) -> None:
-    time.sleep(seconds)
-    raise RuntimeError("boom")
-
-
-class TestReapInFlightNonblocking:
-    """Validate _reap_in_flight_nonblocking helper semantics."""
-
-    def test_reap_empty_list_returns_empty(self, ray_init):
-        helper = _ReapInFlightHelperActor.remote()
-        result = ray.get(helper.reap.remote([]))
-        assert result == []
-
-    def test_reap_drains_completed_and_returns_pending(self, ray_init):
-        helper = _ReapInFlightHelperActor.remote()
-        # One finishes immediately, two stay pending
-        done_ref = _sleep_then_return.remote(0.0, 1)
-        pending1 = _sleep_then_return.remote(10.0, 2)
-        pending2 = _sleep_then_return.remote(10.0, 3)
-        # Give Ray a moment to mark done_ref as ready
-        time.sleep(0.5)
-        result = ray.get(helper.reap.remote([done_ref, pending1, pending2]))
-        # Only the still-pending refs are returned
-        assert len(result) == 2
-        result_set = {r.hex() for r in result}
-        assert pending1.hex() in result_set
-        assert pending2.hex() in result_set
-
-    def test_reap_surfaces_exception_from_completed(self, ray_init):
-        helper = _ReapInFlightHelperActor.remote()
-        bad_ref = _raise_after.remote(0.0)
-        time.sleep(0.5)
-        with pytest.raises(Exception):
-            ray.get(helper.reap.remote([bad_ref]))
-
-
 class TestDryRunTrainerSplitAPI:
     """Smoke test for DryRunTrainer split-API methods."""
 
@@ -931,11 +906,11 @@ class TestStreamingTrainPump:
         batch_selection_strategy="staleness_window",
         max_num_epochs=1,
     ):
-        cfg = SingleControllerConfig(
-            max_train_steps=max_train_steps,
+        mc = _make_test_master_config(
+            max_num_steps=max_train_steps,
             min_prompt_groups_per_batch=min_prompt_groups_per_batch,
             target_prompt_groups_per_step=target_prompt_groups_per_step,
-            generations_per_prompt=generations_per_prompt,
+            num_generations_per_prompt=generations_per_prompt,
             max_buffered_rollouts=max_buffered_rollouts,
             max_inflight_prompts=max_inflight_prompts,
             max_weight_staleness_versions=max_weight_staleness_versions,
@@ -952,23 +927,27 @@ class TestStreamingTrainPump:
 
         tq_buffer = TQReplayBuffer(
             dp_client,
-            partition_id=cfg.partition_id,
+            partition_id="rollout_data",
             pad_value_dict={"token_ids": 0},
         )
         rollout_manager = DryRunRolloutManager(gen, tq_buffer)
 
-        return SingleControllerActor.remote(
-            cfg=cfg,
-            dp_client=dp_client,
+        bundle = SingleControllerBundle(
             gen_handle=gen,
-            env_handles={},
             trainer_handle=trainer,
+            env_handles={},
+            train_cluster=None,
+            inference_cluster=None,
+            dp_client=dp_client,
             dataloader=dataloader,
             weight_synchronizer=weight_sync,
+            advantage_estimator=None,
+            loss_fn=None,
             rollout_manager=rollout_manager,
             tq_buffer=tq_buffer,
-            advantage_estimator=None,
+            partition_id="rollout_data",
         )
+        return SingleControllerActor.remote(master_config=mc, bundle=bundle)
 
     def test_streaming_dispatches_in_arrival_order(self, ray_init):
         """SC dispatches train_microbatch in order groups commit at DP."""

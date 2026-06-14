@@ -851,6 +851,7 @@ class MegatronPolicyWorkerImpl(
             "total_num_microbatches": 0,
             # Saved across the step so we can restore at finish/abort.
             "saved_grad_sync_func": None,
+            "saved_no_sync_func": None,
             "no_sync_active": False,
         }
 
@@ -897,21 +898,27 @@ class MegatronPolicyWorkerImpl(
             step_id=step_id, loss_fn=loss_fn, gbs=gbs, mbs=mbs
         )
 
-        # Suppress the PP scheduler's direct ``grad_sync_func`` call (which
-        # bypasses ``no_sync``). Save the existing value so we can restore
-        # at finish/abort. PP=1's ``forward_backward_no_pipelining`` doesn't
-        # invoke this; nulling it is a no-op there.
-        # Read "config" via getattr-by-string so the token stays out of
-        # begin_train_step.__code__.co_names; otherwise cloudpickle matches
-        # torch.distributed.config (a non-pickleable ConfigModuleInstance).
+        # Null both mcore hooks that would fire a mid-step DP reduce:
+        #   grad_sync_func — PP scheduler's direct call on last-MB boundaries.
+        #   no_sync_func   — forward_backward_no_pipelining wraps inner MBs
+        #                    in it and runs the LAST MB OUTSIDE, leaking
+        #                    per_param_grad_ready_counts past our outer
+        #                    no_sync. Override to nullcontext so only the
+        #                    outer no_sync in train_microbatch governs
+        #                    is_last_microbatch.
+        # getattr-by-string keeps "config" out of __code__.co_names so
+        # cloudpickle doesn't grab torch.distributed.config.
         model_config = getattr(self.model, "config", None)
         if model_config is not None:
             state["saved_grad_sync_func"] = getattr(
                 model_config, "grad_sync_func", None
             )
+            state["saved_no_sync_func"] = getattr(model_config, "no_sync_func", None)
             model_config.grad_sync_func = None
+            model_config.no_sync_func = nullcontext
         else:
             state["saved_grad_sync_func"] = None
+            state["saved_no_sync_func"] = None
 
         self._train_step_state = state
 
@@ -1088,11 +1095,12 @@ class MegatronPolicyWorkerImpl(
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 2:
             torch.cuda.empty_cache()
 
-        # Restore grad_sync_func before scheduler.step / further state.
+        # Restore the mcore hooks we nulled in begin_train_step.
         # See begin_train_step for why .config is accessed by string.
         finish_model_config = getattr(self.model, "config", None)
         if finish_model_config is not None:
             finish_model_config.grad_sync_func = state["saved_grad_sync_func"]
+            finish_model_config.no_sync_func = state["saved_no_sync_func"]
 
         # Scheduler increment matches sync path's ``increment=gbs``.
         self.scheduler.step(increment=state["gbs"])
@@ -1167,12 +1175,13 @@ class MegatronPolicyWorkerImpl(
                 f"abort_train_step({step_id!r}) does not match open step "
                 f"{state['step_id']!r}"
             )
-        # Restore grad_sync_func first so the model is back to a normal
-        # state before zero_grad_buffer touches anything.
+        # Restore the mcore hooks we nulled in begin_train_step before
+        # zero_grad_buffer touches anything.
         # See begin_train_step for why .config is accessed by string.
         abort_model_config = getattr(self.model, "config", None)
         if abort_model_config is not None:
             abort_model_config.grad_sync_func = state["saved_grad_sync_func"]
+            abort_model_config.no_sync_func = state["saved_no_sync_func"]
         self.model.zero_grad_buffer()
         self.optimizer.zero_grad()
         self._train_step_state = None
