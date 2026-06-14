@@ -31,12 +31,8 @@ import pprint
 import ray
 from omegaconf import OmegaConf
 
-from nemo_rl.algorithms.grpo import MasterConfig
-from nemo_rl.algorithms.single_controller import (
-    SingleControllerActor,
-    SingleControllerConfig,
-)
-from nemo_rl.algorithms.single_controller_setup import setup_handle
+from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.algorithms.single_controller_utils import MasterConfig, setup_handle
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.virtual_cluster import init_ray
@@ -61,35 +57,6 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     return args, overrides
 
 
-def _build_sc_config(master_config: MasterConfig) -> SingleControllerConfig:
-    """Lift the SC-facing knobs out of the master config.
-
-    Most fields fall back to dataclass defaults; the few that have a
-    natural home in the existing config (max_train_steps,
-    generations_per_prompt) are pulled from ``grpo.*``. SC-specific
-    knobs (batch_selection_strategy, staleness, advantage_*) can be
-    overridden via a ``single_controller:`` section on the master
-    config — anything in there is forwarded as a kwarg to
-    :class:`SingleControllerConfig`, with unknown keys parked under
-    ``extra`` to avoid pydantic strictness.
-    """
-    grpo_config = master_config.grpo
-    sc_overrides: dict = getattr(master_config, "single_controller", None) or {}
-
-    base_kwargs: dict = {
-        "max_train_steps": int(grpo_config["max_num_steps"]),
-        "max_num_epochs": int(grpo_config.get("max_num_epochs") or 0) or None,
-        "generations_per_prompt": int(grpo_config["num_generations_per_prompt"]),
-    }
-    base_kwargs.update(sc_overrides)
-    known_fields = {f.name for f in SingleControllerConfig.__dataclass_fields__.values()}
-    cfg_kwargs = {k: v for k, v in base_kwargs.items() if k in known_fields}
-    extra = {k: v for k, v in base_kwargs.items() if k not in known_fields}
-    if extra:
-        cfg_kwargs["extra"] = extra
-    return SingleControllerConfig(**cfg_kwargs)
-
-
 def main() -> None:
     """Main entry point."""
     register_omegaconf_resolvers()
@@ -111,7 +78,7 @@ def main() -> None:
     config = MasterConfig(**config)
     print("Applied CLI overrides")
 
-    dp_cfg = config.data_plane or {}
+    dp_cfg = config.data_plane
     if not dp_cfg.get("enabled", False):
         raise ValueError(
             "run_grpo_single_controller requires data_plane.enabled=true. "
@@ -153,13 +120,9 @@ def main() -> None:
         env_handles=task_to_env,
     )
 
-    sc_cfg = _build_sc_config(config)
-    print("SingleController config:")
-    pprint.pprint(sc_cfg)
-
     print("🚀 Launching SingleControllerActor")
     sc = SingleControllerActor.remote(
-        cfg=sc_cfg,
+        master_config=config,
         handles=handles,
         tokenizer=tokenizer,
     )

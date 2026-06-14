@@ -42,10 +42,11 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms.grpo import (
-    MasterConfig,
+    MasterConfig as GRPOMasterConfig,
     _create_advantage_estimator,
     setup as grpo_setup,
 )
+from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.utils import setup_response_data
@@ -153,6 +154,11 @@ def setup_handle(
     def _make_tq_policy(**kwargs):
         return TQPolicy(**kwargs, dp_cfg=dp_cfg)
 
+    # ``grpo.setup`` is typed against its own MasterConfig. We're not
+    # subclassing it, so re-emit our config under that schema (the SC
+    # specific fields ride along via ``extra="allow"`` and are ignored).
+    grpo_mc = GRPOMasterConfig(**master_config.model_dump())
+
     (
         policy,
         policy_generation,
@@ -164,9 +170,9 @@ def setup_handle(
         _logger,
         _checkpointer,
         _grpo_save_state,
-        master_config,
+        _grpo_mc_out,
     ) = grpo_setup(
-        master_config,
+        grpo_mc,
         tokenizer,
         dataset,
         val_dataset,

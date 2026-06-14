@@ -29,13 +29,15 @@ import torch
 from tensordict import TensorDict
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
-from nemo_rl.algorithms.single_controller import (
-    SingleControllerActor,
-    SingleControllerConfig,
-)
-from nemo_rl.algorithms.single_controller_setup import (
+from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.algorithms.single_controller_utils import (
+    AdvantageConfig,
+    ConcurrencyConfig,
+    MasterConfig,
     SingleControllerComponents,
     SingleControllerHandles,
+    StalenessConfig,
+    TrainingConfig,
 )
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.experience.rollout_manager import RolloutManager
@@ -180,16 +182,21 @@ def test_rollout_pump_writes_expected_tq_data(
     )
     dp_adapter = _SyncDPAdapter(tq_actor)
 
-    cfg = SingleControllerConfig(
-        max_train_steps=1,
-        min_prompt_groups_per_batch=1,
-        generations_per_prompt=num_generations,
-        max_buffered_rollouts=max_rollout_prompts,
-        max_inflight_prompts=max_rollout_prompts,
-        max_weight_staleness_versions=0,
-        advantage_enabled=False,
-        diagnostics=False,
+    mc = MasterConfig.model_construct(
+        staleness=StalenessConfig(
+            max_weight_staleness_versions=0,
+            min_prompt_groups_per_batch=1,
+            generations_per_prompt=num_generations,
+            batch_selection_strategy="strict_on_policy",
+        ),
+        concurrency=ConcurrencyConfig(
+            max_inflight_prompts=max_rollout_prompts,
+            max_buffered_rollouts=max_rollout_prompts,
+        ),
+        training=TrainingConfig(max_train_steps=1),
+        advantage=AdvantageConfig(enabled=False),
         partition_id=_PARTITION_ID,
+        diagnostics=False,
     )
     # SingleControllerActor expects a StatefulDataLoader, but the pump only
     # iterates it (`for prompt in self._dataloader`), so any iterable works.
@@ -197,7 +204,7 @@ def test_rollout_pump_writes_expected_tq_data(
 
     tq_buffer = TQReplayBuffer(
         dp_adapter,
-        partition_id=cfg.partition_id,
+        partition_id=mc.partition_id,
         pad_value_dict={"token_ids": int(tokenizer.pad_token_id or 0)},
     )
     rollout_manager = RolloutManager(
@@ -231,7 +238,7 @@ def test_rollout_pump_writes_expected_tq_data(
         tq_buffer=tq_buffer,
     )
     ctrl = SingleControllerActor.remote(
-        cfg=cfg,
+        master_config=mc,
         handles=handles,
         tokenizer=tokenizer,
         components=components,

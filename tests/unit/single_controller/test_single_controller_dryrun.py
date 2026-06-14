@@ -49,16 +49,65 @@ os.environ["RAY_TMPDIR"] = _RAY_TEMP
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms.async_utils.staleness_sampler import StalenessSampler
-from nemo_rl.algorithms.single_controller import (
-    SingleControllerActor,
-    SingleControllerConfig,
-)
-from nemo_rl.algorithms.single_controller_setup import (
+from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.algorithms.single_controller_utils import (
+    AdvantageConfig,
+    ConcurrencyConfig,
+    MasterConfig,
     SingleControllerComponents,
     SingleControllerHandles,
+    StalenessConfig,
+    TrainingConfig,
 )
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
+
+
+def _make_test_master_config(
+    *,
+    max_train_steps: int = 3,
+    max_num_epochs: int | None = None,
+    min_prompt_groups_per_batch: int = 1,
+    target_prompt_groups_per_step: int | None = None,
+    generations_per_prompt: int = 1,
+    batch_selection_strategy: str = "staleness_window",
+    max_weight_staleness_versions: int = 1,
+    max_inflight_prompts: int = 4,
+    max_buffered_rollouts: int = 4,
+    advantage_enabled: bool = False,
+    diagnostics: bool = False,
+    partition_id: str = "rollout_data",
+) -> MasterConfig:
+    """Build a MasterConfig for tests with only the SC-specific sections filled.
+
+    Cross-cutting components (policy/data/cluster/...) are required by
+    pydantic but unused when ``components=`` is injected, so we hand the
+    constructor empty dicts via ``model_construct`` to skip validation.
+    """
+    sc_subset = {
+        "staleness": StalenessConfig(
+            max_weight_staleness_versions=max_weight_staleness_versions,
+            min_prompt_groups_per_batch=min_prompt_groups_per_batch,
+            target_prompt_groups_per_step=target_prompt_groups_per_step,
+            generations_per_prompt=generations_per_prompt,
+            batch_selection_strategy=batch_selection_strategy,
+        ),
+        "concurrency": ConcurrencyConfig(
+            max_inflight_prompts=max_inflight_prompts,
+            max_buffered_rollouts=max_buffered_rollouts,
+        ),
+        "training": TrainingConfig(
+            max_train_steps=max_train_steps,
+            max_num_epochs=max_num_epochs,
+        ),
+        "advantage": AdvantageConfig(enabled=advantage_enabled),
+        "partition_id": partition_id,
+        "diagnostics": diagnostics,
+    }
+    # model_construct skips validation of the required cross-cutting components
+    # (policy, data, cluster, …) — fine for dry-run tests that drive SC via
+    # injected components.
+    return MasterConfig.model_construct(**sc_subset)
 
 
 def _make_test_handles(
@@ -578,7 +627,7 @@ class TestSingleControllerDryRun:
         advantage_estimator=None,
         diagnostics=False,
     ):
-        cfg = SingleControllerConfig(
+        mc = _make_test_master_config(
             max_train_steps=max_train_steps,
             min_prompt_groups_per_batch=min_prompt_groups_per_batch,
             generations_per_prompt=generations_per_prompt,
@@ -595,7 +644,7 @@ class TestSingleControllerDryRun:
 
         tq_buffer = TQReplayBuffer(
             dp_client,
-            partition_id=cfg.partition_id,
+            partition_id=mc.partition_id,
             pad_value_dict={"token_ids": 0},
         )
         rollout_manager = DryRunRolloutManager(gen, tq_buffer)
@@ -611,7 +660,7 @@ class TestSingleControllerDryRun:
             advantage_estimator=advantage_estimator,
         )
         return SingleControllerActor.remote(
-            cfg=cfg,
+            master_config=mc,
             handles=handles,
             components=components,
         )
@@ -984,7 +1033,7 @@ class TestStreamingTrainPump:
         batch_selection_strategy="staleness_window",
         max_num_epochs=1,
     ):
-        cfg = SingleControllerConfig(
+        mc = _make_test_master_config(
             max_train_steps=max_train_steps,
             min_prompt_groups_per_batch=min_prompt_groups_per_batch,
             target_prompt_groups_per_step=target_prompt_groups_per_step,
@@ -1005,7 +1054,7 @@ class TestStreamingTrainPump:
 
         tq_buffer = TQReplayBuffer(
             dp_client,
-            partition_id=cfg.partition_id,
+            partition_id=mc.partition_id,
             pad_value_dict={"token_ids": 0},
         )
         rollout_manager = DryRunRolloutManager(gen, tq_buffer)
@@ -1019,7 +1068,7 @@ class TestStreamingTrainPump:
             advantage_estimator=None,
         )
         return SingleControllerActor.remote(
-            cfg=cfg,
+            master_config=mc,
             handles=handles,
             components=components,
         )
