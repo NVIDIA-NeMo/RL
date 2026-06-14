@@ -195,6 +195,8 @@ class AsyncRolloutImpl:
             )
 
             # Update reward and termination statistics
+            # Per-prompt rollouts always use single-reward (Tensor), not dict.
+            assert isinstance(env_output.rewards, torch.Tensor)
             total_reward += float(env_output.rewards[0].item())
             terminated = env_output.terminateds[0].item()
             env_obs_content = env_output.observations[0]["content"]
