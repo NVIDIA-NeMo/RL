@@ -56,6 +56,16 @@ STRING_TO_DTYPE = {
 }
 
 
+def _use_trust_remote_code(model_name: str) -> bool:
+    """Whether to load ``model_name`` with ``trust_remote_code=True``.
+
+    phi-4-mini ships a remote modeling file whose LongRoPE buffer update is
+    incompatible with FSDP2 meta-device init, so it must be loaded via
+    transformers' in-tree implementation. All other models keep remote code.
+    """
+    return model_name.lower() != "microsoft/phi-4-mini-instruct"
+
+
 def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
     """Validate and maybe auto-set force_hf based on adapter compatibility.
 
@@ -303,7 +313,7 @@ def validate_and_prepare_config(
     model_config = AutoConfig.from_pretrained(
         model_name,
         torch_dtype=torch.float32,  # Always load in float32 for master weights
-        trust_remote_code=True,
+        trust_remote_code=_use_trust_remote_code(model_name),
         attn_implementation="flash_attention_2" if enable_seq_packing else None,
         **hf_config_overrides,
     )
@@ -669,7 +679,7 @@ def setup_model_and_optimizer(
         peft_config=peft_config,
         attn_implementation=attn_impl,
         torch_dtype=str(model_config.torch_dtype),
-        trust_remote_code=True,
+        trust_remote_code=_use_trust_remote_code(model_name),
         sdpa_method=sdpa_method,
         **from_pretrained_kwargs,
         **automodel_kwargs,

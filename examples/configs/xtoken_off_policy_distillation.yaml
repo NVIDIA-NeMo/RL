@@ -1,8 +1,12 @@
-# Single-teacher cross-tokenizer off-policy distillation.
+# Multi-teacher cross-tokenizer off-policy distillation.
 #
-# Defaults: Llama-3.2-1B (student) <- Qwen3-4B (teacher), arrow-text corpus,
-# P-KL loss mode (gold_loss=false, xtoken_loss=false). Override the model
-# names, tokenizers, and data_files via Hydra CLI for other pairs.
+# Defaults: Llama-3.2-1B (student) <- one teacher, Qwen3-4B, arrow-text corpus,
+# P-KL loss mode (gold_loss=false, xtoken_loss=false). `teachers:` is a list —
+# add more entries for multi-teacher. Each teacher carries its own
+# `projection_matrix_path` (null => same-tokenizer teacher: direct KL, no
+# projection / no alignment) and `weight`. Override the model names,
+# tokenizers, projection paths, and data_files via Hydra CLI for other pairs,
+# e.g. teachers.0.projection_matrix_path=/path/to/projection_matrix.pt
 
 defaults: distillation_math.yaml
 
@@ -16,12 +20,13 @@ distillation:
   val_at_end: false
 
 loss_fn:
-  # Path to the (student, teacher) projection matrix .pt file. Override via
-  # Hydra CLI per run, e.g.
-  #   loss_fn.projection_matrix_path=/path/to/projection_matrix.pt
-  # See docs/guides/xtoken-off-policy-distillation.md for how to produce this file.
-  projection_matrix_path: null
-  # Loss-mode selection:
+  # NOTE: the per-(student, teacher) projection matrix path now lives on each
+  # `teachers[i].projection_matrix_path` (see below), not here. The knobs in
+  # this block are shared across all teachers.
+  # See docs/guides/xtoken-off-policy-distillation.md for how to produce the
+  # projection file.
+  # Loss-mode selection (shared default; override per teacher via
+  # teachers[i].gold_loss / .xtoken_loss in `sum` mode):
   #   gold_loss=false                    -> P-KL: full-vocab teacher logits
   #     transported via IPC; the loss derives a microbatch-global top-k
   #     (size `vocab_topk`) inside, projects student to teacher vocab via
@@ -44,6 +49,19 @@ loss_fn:
   kl_loss_weight: 1.0         # P-KL only
   ce_loss_scale: 0.1          # P-KL only
   dynamic_loss_scaling: true  # P-KL only
+  # ---- Multi-teacher aggregation (defaults reproduce single-teacher) ----
+  # kd_loss_mode: how per-teacher KD terms are combined.
+  #   "sum"             -> total_kd = Σ_i weight_i * KD_i  (default)
+  #   "averaged_logits" -> average same-vocab teacher logits, then one KL
+  #   "select_teacher"  -> use only the lowest-CE teacher
+  kd_loss_mode: "sum"
+  # sum_weights_metric: null = static per-teacher `weight`; otherwise replace
+  # with a dynamic sequence-level softmax weight from "ce" | "entropy" |
+  # "max_prob".
+  sum_weights_metric: null
+  token_level_weights: false  # per-token dynamic weights (not yet supported)
+  alpha: 1.0                  # softmax temperature on dynamic teacher weights
+  normalize_teacher_by_vocab: false  # rescale by log(V_t_i)/log(min_j V_t_j)
 
 checkpointing:
   enabled: false
@@ -111,48 +129,58 @@ policy:
         eta_min: 0.0
     - milestones: [250]
 
-teacher:
-  model_name: "Qwen/Qwen3-4B"
-  tokenizer:
-    name: "Qwen/Qwen3-4B"
-  train_global_batch_size: 64
-  train_micro_batch_size: 1
-  logprob_batch_size: 1
-  max_total_sequence_length: 2048
-  make_sequence_length_divisible_by: 1
-  precision: "bfloat16"
-  logprob_chunk_size: null
-  offload_optimizer_for_logprob: false
-  dtensor_cfg:
-    enabled: true
-    _v2: true
-    cpu_offload: false
-    sequence_parallel: false
-    activation_checkpointing: true
-    tensor_parallel_size: 1
-    context_parallel_size: 1
-    custom_parallel_plan: null
-  max_grad_norm: 1.0
-  dynamic_batching:
-    enabled: false
-    train_mb_tokens: 2048
-    logprob_mb_tokens: 2048
-    sequence_length_round: 64
-  sequence_packing:
-    enabled: false
-    train_mb_tokens: 2048
-    logprob_mb_tokens: 2048
-    algorithm: "modified_first_fit_decreasing"
-    sequence_length_round: 64
-  optimizer:
-    name: "torch.optim.AdamW"
-    kwargs:
-      lr: 5.0e-5
-      weight_decay: 0.001
-      betas: [0.9, 0.95]
-      eps: 1e-8
-      foreach: false
-      fused: false
+# One entry per teacher. Add more list items for multi-teacher distillation.
+teachers:
+  - model_name: "Qwen/Qwen3-4B"
+    # ---- per-teacher cross-tokenizer knobs ----
+    # projection_matrix_path: this teacher's student->teacher projection .pt.
+    # null => same-tokenizer teacher (direct KL, no projection / no alignment).
+    # Override per run, e.g.
+    #   teachers.0.projection_matrix_path=/path/to/projection_matrix.pt
+    projection_matrix_path: null
+    weight: 1.0                  # static loss weight in kd_loss_mode=sum
+    # gold_loss / xtoken_loss (optional): per-teacher overrides of the loss_fn
+    # globals, honored only in kd_loss_mode=sum. Omit to use the globals.
+    tokenizer:
+      name: "Qwen/Qwen3-4B"
+    train_global_batch_size: 64
+    train_micro_batch_size: 1
+    logprob_batch_size: 1
+    max_total_sequence_length: 2048
+    make_sequence_length_divisible_by: 1
+    precision: "bfloat16"
+    logprob_chunk_size: null
+    offload_optimizer_for_logprob: false
+    dtensor_cfg:
+      enabled: true
+      _v2: true
+      cpu_offload: false
+      sequence_parallel: false
+      activation_checkpointing: true
+      tensor_parallel_size: 1
+      context_parallel_size: 1
+      custom_parallel_plan: null
+    max_grad_norm: 1.0
+    dynamic_batching:
+      enabled: false
+      train_mb_tokens: 2048
+      logprob_mb_tokens: 2048
+      sequence_length_round: 64
+    sequence_packing:
+      enabled: false
+      train_mb_tokens: 2048
+      logprob_mb_tokens: 2048
+      algorithm: "modified_first_fit_decreasing"
+      sequence_length_round: 64
+    optimizer:
+      name: "torch.optim.AdamW"
+      kwargs:
+        lr: 5.0e-5
+        weight_decay: 0.001
+        betas: [0.9, 0.95]
+        eps: 1e-8
+        foreach: false
+        fused: false
 
 data:
   max_input_seq_length: 2048
