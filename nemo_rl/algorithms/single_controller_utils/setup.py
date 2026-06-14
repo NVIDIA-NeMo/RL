@@ -23,13 +23,12 @@ Two factories split along the SC actor boundary:
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-
-import ray
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms.grpo import _create_advantage_estimator
@@ -208,27 +207,24 @@ def setup_handle(
         )
 
     train_cluster, inference_cluster = _build_clusters(master_config)
-    # vLLM prefers a clean GPU at load time; generation first in colocated mode.
-    generation = _build_generation(inference_cluster, master_config)
-    policy = _build_trainer(train_cluster, master_config, tokenizer, processor)
-
-    # Non-colocated paths must rendezvous policy + generation via NCCL.
-    if not master_config.policy["generation"]["colocated"]["enabled"]:
-        ip, port = train_cluster.get_master_address_and_port()
-        train_world_size = train_cluster.world_size()
-        inference_world_size = inference_cluster.world_size()
-        world_size = train_world_size + inference_world_size
-        ray.get(
-            policy.init_collective(
-                ip, port, world_size, train_world_size=train_world_size
+    colocated = master_config.policy["generation"]["colocated"]["enabled"]
+    if colocated:
+        # Colocated: vLLM prefers a clean GPU at load time, so generation
+        # comes up before the policy.
+        generation = _build_generation(inference_cluster, master_config)
+        policy = _build_trainer(train_cluster, master_config, tokenizer, processor)
+    else:
+        # Non-colocated: generation + policy run on disjoint GPUs, so
+        # bring them up in parallel.
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            gen_future = executor.submit(
+                _build_generation, inference_cluster, master_config
             )
-            + generation.init_collective(
-                ip, port, world_size, train_world_size=train_world_size
+            policy_future = executor.submit(
+                _build_trainer, train_cluster, master_config, tokenizer, processor
             )
-        )
-
-    state_dict_info = policy.prepare_refit_info()
-    generation.prepare_refit_info(state_dict_info)
+            generation = gen_future.result()
+            policy = policy_future.result()
 
     if env_handles is None:
         env_handles = _build_env_handles(master_config)
@@ -246,6 +242,23 @@ def setup_handle(
         train_cluster,
         inference_cluster,
     )
+
+
+def _generation_max_seq_len(generation_config) -> int:
+    """Return the per-backend max sequence length.
+
+    vllm uses vllm_cfg.max_model_len; sglang uses sglang_cfg.context_length;
+    megatron generation has no dedicated field and routes max_new_tokens
+    through as max_sequence_length on the inference worker.
+    """
+    backend = generation_config["backend"]
+    if backend == "vllm":
+        return generation_config["vllm_cfg"]["max_model_len"]
+    if backend == "sglang":
+        return generation_config["sglang_cfg"]["context_length"]
+    if backend == "megatron":
+        return generation_config["max_new_tokens"]
+    raise ValueError(f"Unknown generation backend: {backend!r}")
 
 
 def setup_single_controller_component(
@@ -314,6 +327,7 @@ def setup_single_controller_component(
     )
 
     # ── weight synchronizer ────────────────────────────────────────────
+    # TODO: weight synchronizer not validated yet, this is a placeholder for now
     colocated = generation_config["colocated"]["enabled"]
     backend = generation_config["backend"]
     refit_buffer_size_gb = (
@@ -345,7 +359,7 @@ def setup_single_controller_component(
         tokenizer=tokenizer,
         env_handles=env_handles,
         num_generations_per_prompt=grpo_config["num_generations_per_prompt"],
-        max_seq_len=master_config.policy["max_total_sequence_length"],
+        max_seq_len=_generation_max_seq_len(generation_config),
         max_rollout_turns=grpo_config.get("max_rollout_turns"),
         policy_generation=gen_handle,
         generation_config=generation_config,
