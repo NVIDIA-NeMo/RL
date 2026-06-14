@@ -1476,7 +1476,7 @@ def refit_policy_generation(
     policy: ColocatablePolicyInterface,
     policy_generation: GenerationInterface,
     colocated_inference: bool,
-    _refit_buffer_size_gb: Optional[int] = None,
+    _refit_buffer_size_gb: Optional[float] = None,
     timer: Optional[Timer] = None,
     kv_scales: Optional[dict[str, float]] = None,
 ) -> None:
@@ -1485,9 +1485,8 @@ def refit_policy_generation(
     Args:
         policy: The policy to provide weights to the inference engine.
         policy_generation: The inference engine to refit.
-        _refit_buffer_size_gb: The size of the buffer to use for refitting.
-            If it is None, the buffer size will be computed by the remaining memory.
-            This parameter is primarily used for testing.
+        _refit_buffer_size_gb: Fixed refit buffer size in GiB. If it is None,
+            the buffer size is computed from remaining memory.
         timer: Optional Timer used to time the prepare/transfer/update phase
         kv_scales: Optional dictionary of KV cache scales for FP8 quantization.
     """
@@ -1507,7 +1506,7 @@ def refit_policy_generation(
         if colocated_inference:
             # get model param keys, which is grouped by size
             if _refit_buffer_size_gb is not None:
-                buffer_size_bytes = _refit_buffer_size_gb * (1024**3)
+                buffer_size_bytes = int(_refit_buffer_size_gb * (1024**3))
             else:
                 # Empirically sets ratio as 30% to maximize efficiency.
                 # The remaining 70% is a necessary buffer reserved for the parameter all-gathering across the expert-parallelism dimension.
@@ -1787,6 +1786,7 @@ def grpo_train(
     val_at_end = master_config.grpo["val_at_end"]
     val_period = master_config.grpo["val_period"]
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
+    refit_buffer_size_gb = master_config.policy.get("refit_buffer_size_gb")
 
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
@@ -1798,7 +1798,12 @@ def grpo_train(
         memory_tracker.snapshot_start_of_stage("Initial validation", dir())
 
         if NEED_REFIT and POLICY_GENERATION_STALE:
-            refit_policy_generation(policy, policy_generation, colocated_inference)
+            refit_policy_generation(
+                policy,
+                policy_generation,
+                colocated_inference,
+                _refit_buffer_size_gb=refit_buffer_size_gb,
+            )
             POLICY_GENERATION_STALE = False
         else:
             policy_generation.prepare_for_generation()
@@ -1912,6 +1917,7 @@ def grpo_train(
                             policy,
                             policy_generation,
                             colocated_inference,
+                            _refit_buffer_size_gb=refit_buffer_size_gb,
                             timer=timer,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
@@ -2332,6 +2338,7 @@ def grpo_train(
                             policy,
                             policy_generation,
                             colocated_inference,
+                            _refit_buffer_size_gb=refit_buffer_size_gb,
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
                         POLICY_GENERATION_STALE = False

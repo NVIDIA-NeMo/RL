@@ -11,9 +11,9 @@
 # ``metadata:`` section is informational.
 #
 # Defines W4A16: NVFP4 (e2m1, dynamic e4m3 micro-block scales) on weights
-# only; activations stay in the model's native dtype (BF16/FP16). Sensitive
-# layers (lm_head, MoE gate/router, BatchNorm, etc.) are disabled to match
-# the built-in defaults.
+# only; activations stay in the model's native dtype (BF16/FP16). Attention
+# and other sensitive layers (lm_head, MoE gate/router, BatchNorm, etc.) are
+# disabled to match the real-quant vLLM rollout ignore set.
 #
 # Recommended for QA-GRPO, where W4A4 (NVFP4 on both weights and
 # activations) has shown convergence issues. For QA-Distillation, the
@@ -38,6 +38,10 @@ quantize:
           type: dynamic
           scale_bits: e4m3
         num_bits: e2m1
+    - quantizer_name: '*self_attention*'
+      enable: false
+    - quantizer_name: '*self_attn*'
+      enable: false
     - quantizer_name: '*lm_head*'
       enable: false
     - quantizer_name: '*output_layer*'
