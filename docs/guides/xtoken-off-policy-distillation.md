@@ -1,4 +1,4 @@
-# Cross-Tokenizer (X-Token) Off-Policy Distillation
+# Cross-Tokenizer (X-Token)
 
 NeMo RL supports off-policy distillation between a student and a teacher that
 **do not share a tokenizer** — for example, distilling a Qwen3-4B teacher into
@@ -102,9 +102,8 @@ weight thresholds, hand-picked intermediate filenames, etc.).
 - **Teacher logits travel via CUDA IPC**, so student and teacher policies must
   be colocated on the same node. No remote-Ray transport for x-token logits.
 
-Future work will ease these requirements. A transport such as TransferQueue,
-for instance, would carry teacher logits across nodes — removing the
-colocation requirement and the dependence on CUDA IPC.
+Future work will ease these requirements — we are actively working on
+improving cross-tokenizer distillation support.
 
 ## Step 1 — Build multi-token mappings
 
@@ -130,14 +129,13 @@ Pass `--num-examples 50` to print a sample of student→teacher mappings after
 the matrix is built — useful for spot-checking that special tokens, numerals,
 and punctuation map to sensible teacher tokens.
 
-When `--enable-scale-trick` is set, the script records `enable_scale_trick=True`
-in the saved `.pt` so Step 3 can auto-enable `--preserve_last`.
-
 ## Step 2 (optional) — Reapply exact-token map
 
-Some token pairs are *literally identical* (e.g., common punctuation, single
-ASCII characters). `reapply_exact_map.py` pins those to 1-to-1 mappings with
-weight 1.0, overwriting whatever Step 1 produced for them.
+Tokenizers built with a similar algorithm (for example, BPE) typically share
+a sizable set of identical tokens — common punctuation, single ASCII
+characters, and frequent subwords. `reapply_exact_map.py` pins those
+overlapping tokens to 1-to-1 mappings with weight 1.0, overwriting whatever
+Step 1 produced for them.
 
 ```bash
 uv run python -m tools.x_token.reapply_exact_map \
@@ -150,8 +148,12 @@ Output is written next to the input as `<basename>_exact_map_remapped.pt`.
 
 ## Step 3 — Sort and trim to runtime `top_k`
 
-The training loss only needs a small `top_k` per row (typical: 4–8). This
-step sorts each row by weight and trims to the chosen runtime cap.
+The projection map is very sparse — each student token maps to at most 4–5
+teacher tokens. This step sorts each row by weight, trims to the chosen
+runtime `top_k`, and stores the result as a sparse `[V_student, top_k]`
+representation (per-row indices plus weights). That sparse format is what the
+training loss consumes, and it avoids materializing a computationally
+expensive dense projection matrix of size `[student_vocab, teacher_vocab]`.
 
 ```bash
 uv run python -m tools.x_token.sort_and_cut_projection_matrix \
@@ -159,11 +161,6 @@ uv run python -m tools.x_token.sort_and_cut_projection_matrix \
     --top_k 4 \
     --output_path cross_tokenizer_data/projection_matrix_llama_qwen_top4.pt
 ```
-
-`--preserve_last` is `argparse.BooleanOptionalAction` with default `None`. When
-unspecified, the script reads `enable_scale_trick` from the input matrix's
-metadata (set in Step 1) and auto-enables preservation of the last column
-slot. Pass `--preserve_last` or `--no-preserve_last` to override.
 
 ## Step 4 — Launch x-token distillation
 
@@ -198,7 +195,7 @@ to train on your own `.arrow`/`.parquet`/`.json`/`.txt` corpus.
 
 | `gold_loss` | `xtoken_loss` | Behavior |
 |---|---|---|
-| `false` | (inert) | **P-KL** — full-vocab teacher logits via CUDA IPC; the loss derives a microbatch-global top-k inside, projects the student into teacher vocab via the projection matrix, and chunk-averages KL on the top-k subset. CE term is added. |
+| `false` | (inert) | **P-KL** — full-vocab teacher logits; the loss derives a microbatch-global top-k inside, projects the student into teacher vocab via the projection matrix, and chunk-averages KL on the top-k subset. CE term is added. |
 | `true` | `false` | **Gold loss** — split the vocab into an *exact-token-mapped* common set (KL) and an *uncommon* tail (sorted L1). |
 | `true` | `true`  | **H-KL (gold + xtoken)** — same as gold, but relax the exact-map threshold to `>= 0.6` and allow multi-token projections to count as exact maps via a collision-replacement rule. |
 
