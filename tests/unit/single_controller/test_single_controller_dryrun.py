@@ -50,62 +50,44 @@ os.environ["RAY_TMPDIR"] = _RAY_TEMP
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.algorithms.async_utils.staleness_sampler import StalenessSampler
 from nemo_rl.algorithms.single_controller import SingleControllerActor
-from nemo_rl.algorithms.single_controller_utils import (
-    AdvantageConfig,
-    ConcurrencyConfig,
-    MasterConfig,
-    StalenessConfig,
-    TrainingConfig,
-)
+from nemo_rl.algorithms.single_controller_utils import AsyncRLConfig, MasterConfig
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 
 
 def _make_test_master_config(
     *,
-    max_train_steps: int = 3,
+    max_num_steps: int = 3,
     max_num_epochs: int | None = None,
     min_prompt_groups_per_batch: int = 1,
     target_prompt_groups_per_step: int | None = None,
-    generations_per_prompt: int = 1,
+    num_generations_per_prompt: int = 1,
     batch_selection_strategy: str = "staleness_window",
     max_weight_staleness_versions: int = 1,
     max_inflight_prompts: int = 4,
     max_buffered_rollouts: int = 4,
-    advantage_enabled: bool = False,
-    diagnostics: bool = False,
-    partition_id: str = "rollout_data",
 ) -> MasterConfig:
-    """Build a MasterConfig for tests with only the SC-specific sections filled.
+    """Build a MasterConfig for tests with only grpo + async_rl filled.
 
     Cross-cutting components (policy/data/cluster/...) are required by
-    pydantic but unused when ``components=`` is injected, so we hand the
-    constructor empty dicts via ``model_construct`` to skip validation.
+    pydantic but unused when ``components=`` is injected, so we use
+    ``model_construct`` to skip validation. SC-specific knobs live on
+    the top-level ``async_rl`` section (an AsyncRLConfig BaseModel).
     """
-    sc_subset = {
-        "staleness": StalenessConfig(
-            max_weight_staleness_versions=max_weight_staleness_versions,
-            min_prompt_groups_per_batch=min_prompt_groups_per_batch,
-            target_prompt_groups_per_step=target_prompt_groups_per_step,
-            generations_per_prompt=generations_per_prompt,
-            batch_selection_strategy=batch_selection_strategy,
-        ),
-        "concurrency": ConcurrencyConfig(
-            max_inflight_prompts=max_inflight_prompts,
-            max_buffered_rollouts=max_buffered_rollouts,
-        ),
-        "training": TrainingConfig(
-            max_train_steps=max_train_steps,
-            max_num_epochs=max_num_epochs,
-        ),
-        "advantage": AdvantageConfig(enabled=advantage_enabled),
-        "partition_id": partition_id,
-        "diagnostics": diagnostics,
+    grpo_subset = {
+        "max_num_steps": max_num_steps,
+        "max_num_epochs": max_num_epochs,
+        "num_generations_per_prompt": num_generations_per_prompt,
     }
-    # model_construct skips validation of the required cross-cutting components
-    # (policy, data, cluster, …) — fine for dry-run tests that drive SC via
-    # injected components.
-    return MasterConfig.model_construct(**sc_subset)
+    async_rl = AsyncRLConfig(
+        max_weight_staleness_versions=max_weight_staleness_versions,
+        min_prompt_groups_per_batch=min_prompt_groups_per_batch,
+        target_prompt_groups_per_step=target_prompt_groups_per_step,
+        batch_selection_strategy=batch_selection_strategy,
+        max_inflight_prompts=max_inflight_prompts,
+        max_buffered_rollouts=max_buffered_rollouts,
+    )
+    return MasterConfig.model_construct(grpo=grpo_subset, async_rl=async_rl)
 
 
 # ── Fake in-memory DataPlane ──────────────────────────────────────────────
@@ -576,19 +558,15 @@ class TestSingleControllerDryRun:
         max_buffered_rollouts=4,
         max_inflight_prompts=4,
         max_weight_staleness_versions=1,
-        advantage_enabled=False,
         advantage_estimator=None,
-        diagnostics=False,
     ):
         mc = _make_test_master_config(
-            max_train_steps=max_train_steps,
+            max_num_steps=max_train_steps,
             min_prompt_groups_per_batch=min_prompt_groups_per_batch,
-            generations_per_prompt=generations_per_prompt,
+            num_generations_per_prompt=generations_per_prompt,
             max_buffered_rollouts=max_buffered_rollouts,
             max_inflight_prompts=max_inflight_prompts,
             max_weight_staleness_versions=max_weight_staleness_versions,
-            advantage_enabled=advantage_enabled,
-            diagnostics=diagnostics,
         )
 
         # SC expects a StatefulDataLoader, but the pump only iterates it
@@ -597,7 +575,7 @@ class TestSingleControllerDryRun:
 
         tq_buffer = TQReplayBuffer(
             dp_client,
-            partition_id=mc.partition_id,
+            partition_id="rollout_data",
             pad_value_dict={"token_ids": 0},
         )
         rollout_manager = DryRunRolloutManager(gen, tq_buffer)
@@ -657,7 +635,6 @@ class TestSingleControllerDryRun:
             max_train_steps=1,
             min_prompt_groups_per_batch=2,
             generations_per_prompt=1,
-            advantage_enabled=True,
             advantage_estimator=DryRunAdvantageEstimator(),
         )
 
@@ -990,10 +967,10 @@ class TestStreamingTrainPump:
         max_num_epochs=1,
     ):
         mc = _make_test_master_config(
-            max_train_steps=max_train_steps,
+            max_num_steps=max_train_steps,
             min_prompt_groups_per_batch=min_prompt_groups_per_batch,
             target_prompt_groups_per_step=target_prompt_groups_per_step,
-            generations_per_prompt=generations_per_prompt,
+            num_generations_per_prompt=generations_per_prompt,
             max_buffered_rollouts=max_buffered_rollouts,
             max_inflight_prompts=max_inflight_prompts,
             max_weight_staleness_versions=max_weight_staleness_versions,
@@ -1010,7 +987,7 @@ class TestStreamingTrainPump:
 
         tq_buffer = TQReplayBuffer(
             dp_client,
-            partition_id=mc.partition_id,
+            partition_id="rollout_data",
             pad_value_dict={"token_ids": 0},
         )
         rollout_manager = DryRunRolloutManager(gen, tq_buffer)

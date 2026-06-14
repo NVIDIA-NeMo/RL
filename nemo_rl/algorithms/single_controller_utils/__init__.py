@@ -16,10 +16,8 @@
 
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
-    ConcurrencyConfig,
+    AsyncRLConfig,
     MasterConfig,
-    StalenessConfig,
-    TrainingConfig,
     WeightSyncConfig,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import (
@@ -29,10 +27,8 @@ from nemo_rl.algorithms.single_controller_utils.setup import (
 
 __all__ = [
     "AdvantageConfig",
-    "ConcurrencyConfig",
+    "AsyncRLConfig",
     "MasterConfig",
-    "StalenessConfig",
-    "TrainingConfig",
     "WeightSyncConfig",
     "setup_handle",
     "setup_single_controller_component",
