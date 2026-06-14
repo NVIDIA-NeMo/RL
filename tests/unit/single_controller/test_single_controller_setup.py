@@ -175,7 +175,14 @@ class TestSetupSingleControllerComponent:
         ):
             result = setup_single_controller_component(mc, tokenizer, **kwargs)
 
-        dp_client, dataloader, weight_sync, advantage_estimator, rollout_manager, tq_buffer = result
+        (
+            dp_client,
+            dataloader,
+            weight_sync,
+            advantage_estimator,
+            rollout_manager,
+            tq_buffer,
+        ) = result
         assert dp_client is fake_dp_client
         assert dataloader is not None
         assert weight_sync is not None
@@ -205,9 +212,7 @@ class TestSetupSingleControllerComponent:
             ),
             pytest.raises(NotImplementedError, match="use_multiple_dataloader"),
         ):
-            setup_single_controller_component(
-                mc, MagicMock(pad_token_id=0), **kwargs
-            )
+            setup_single_controller_component(mc, MagicMock(pad_token_id=0), **kwargs)
 
     def test_weight_sync_factory_args(self):
         """create_weight_synchronizer receives the right policy/generation/topology."""

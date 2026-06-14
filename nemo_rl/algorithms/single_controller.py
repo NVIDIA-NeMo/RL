@@ -100,10 +100,10 @@ class SingleControllerActor:
         # components arg is a test-only escape hatch that injects fakes
         # built CPU-side.
         if components is None:
-            from nemo_rl.algorithms.utils import get_tokenizer
             from nemo_rl.algorithms.single_controller_utils.setup import (
                 setup_single_controller_component,
             )
+            from nemo_rl.algorithms.utils import get_tokenizer
 
             tokenizer = get_tokenizer(master_config.policy["tokenizer"])
             components = setup_single_controller_component(
@@ -151,8 +151,13 @@ class SingleControllerActor:
             )
 
         if stale_cfg.target_prompt_groups_per_step is None:
-            stale_cfg.target_prompt_groups_per_step = stale_cfg.min_prompt_groups_per_batch
-        if stale_cfg.target_prompt_groups_per_step < stale_cfg.min_prompt_groups_per_batch:
+            stale_cfg.target_prompt_groups_per_step = (
+                stale_cfg.min_prompt_groups_per_batch
+            )
+        if (
+            stale_cfg.target_prompt_groups_per_step
+            < stale_cfg.min_prompt_groups_per_batch
+        ):
             raise ValueError(
                 f"target_prompt_groups_per_step ({stale_cfg.target_prompt_groups_per_step}) "
                 f"must be >= min_prompt_groups_per_batch ({stale_cfg.min_prompt_groups_per_batch})"

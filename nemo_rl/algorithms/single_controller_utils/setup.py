@@ -179,11 +179,11 @@ def setup_handle(
     processor: Optional[AutoProcessor] = None,
     env_handles: Optional[dict[str, EnvironmentInterface]] = None,
 ) -> tuple[
-    Any,                                # gen_handle
-    Any,                                # trainer_handle
-    dict[str, EnvironmentInterface],    # env_handles
-    RayVirtualCluster,                  # train_cluster
-    RayVirtualCluster,                  # inference_cluster
+    Any,  # gen_handle
+    Any,  # trainer_handle
+    dict[str, EnvironmentInterface],  # env_handles
+    RayVirtualCluster,  # train_cluster
+    RayVirtualCluster,  # inference_cluster
 ]:
     """Build the three remote handles + two clusters SC drives.
 
@@ -277,10 +277,10 @@ def setup_single_controller_component(
     inference_cluster: RayVirtualCluster,
     partition_id: str = "rollout_data",
 ) -> tuple[
-    Any,                 # dp_client
+    Any,  # dp_client
     StatefulDataLoader,
     WeightSynchronizer,
-    Any,                 # advantage_estimator
+    Any,  # advantage_estimator
     RolloutManager,
     TQReplayBuffer,
 ]:
