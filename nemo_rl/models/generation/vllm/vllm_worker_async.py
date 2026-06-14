@@ -402,6 +402,10 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
     async def post_init_async(self):
         self.vllm_device_ids = await self.report_device_id_async()
+        if self._mtp_load_from_disk:
+            await self.llm.collective_rpc(
+                "load_mtp_weights_from_disk", args=(self.model_name,)
+            )
 
     async def get_reserved_url(self) -> Optional[str]:
         """Return the URL from the reserved socket, available before model loading."""
