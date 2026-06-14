@@ -206,38 +206,58 @@ Other relevant fields:
 - `loss_fn.uncommon_topk` — cap on the L1 uncommon-tail sort in the gold path (defaults to 8192).
 - `loss_fn.reverse_kl` — compute `KL(student || teacher)` instead of `KL(teacher || student)`.
 
-## Results — 100-step P-KL run
+## Results — 100-step multi-teacher run
 
-A P-KL run (Llama-3.2-1B student ← Qwen3-4B teacher; default config — global
-batch 96, micro-batch 1, sequence length 2048, 100 steps, 2 nodes — on the
-default Nemotron-Pretraining-Specialized-v1.1 / Formal-Logic corpus) shows the
-distillation objective converging and the student tracking the teacher more
-closely over training:
+This run distills a `meta-llama/Llama-3.2-1B` student from two teachers at
+once: `microsoft/Phi-4-mini-instruct` (a cross-tokenizer teacher, projected
+through its projection matrix) and `meta-llama/Llama-3.2-3B` (which shares the
+student's tokenizer, so it contributes a direct full-vocab KL with no
+projection). The per-teacher objectives are summed (`loss_fn.kd_loss_mode=sum`,
+`loss_fn.kl_type=mixed`). Config: global batch 96, micro-batch 1, sequence
+length 2048, 100 steps, 2 nodes (8 GPUs each), on the default
+Nemotron-Pretraining-Specialized-v1.1 / Formal-Logic corpus. The distillation
+objective converges and the student tracks both teachers more closely over
+training:
 
-<img src="../assets/xtoken_pkl_smoke_curves.png" alt="train/loss, train/kl_loss, train/ce_loss, and train/accuracy over 100 P-KL distillation steps" width="900">
+<img src="../assets/xtoken_mt_curves.png" alt="train/loss, train/kl_loss, train/ce_loss, and train/accuracy over 100 multi-teacher distillation steps" width="900">
 
-- **Loss** falls from ≈1.51 to ≈0.78.
-- **KL loss** falls from ≈2.67 to ≈0.78 — the projected student distribution
-  moves toward the teacher's.
-- **CE loss** falls from ≈0.75 to ≈0.39.
-- **Top-1 accuracy** rises from ≈0.82 to ≈0.88.
+- **Loss** falls from ≈1.51 to ≈0.70.
+- **KL loss** (summed over both teachers) falls from ≈4.89 to ≈1.97. Almost
+  all of it comes from the cross-tokenizer Phi-4-mini teacher (≈4.75 → ≈1.76);
+  the same-tokenizer Llama-3.2-3B teacher's direct KL is already small and
+  stays there (≈0.14 → ≈0.21).
+- **CE loss** falls from ≈0.75 to ≈0.35.
+- **Top-1 accuracy** rises from ≈0.82 to ≈0.91.
+
+### Downstream evaluation
+
+Benchmark scores of the distilled student against the undistilled
+`meta-llama/Llama-3.2-1B` base model:
+
+| Task | Base Llama-3.2-1B | Distilled |
+|---|---|---|
+| MMLU | 32.05 | 40.24 |
+| GSM8K | 5.69 | 5.76 |
+| HellaSwag | 65.08 | 62.53 |
+| Winogrande | 61.48 | 61.48 |
+| MATH | 5.48 | 4.52 |
+| **Avg** | **33.96** | **34.91** |
 
 ### Throughput and memory
 
-Measured on the same run (per training step, P-KL, micro-batch 1, sequence
-length 2048):
+Measured on the same run (per training step, micro-batch 1, sequence length
+2048, with the two teachers forwarded serially):
 
 | Metric | Value |
 |---|---|
-| Mean step time | 4.07 s (min 3.66 s) |
-| Training throughput | ≈48k valid tokens/s (global batch ÷ mean step time) |
-| Peak GPU memory | 29.5 GB per GPU |
-| Teacher-logit IPC tray | ≈0.6 GB per sample-step — `[T_t≈2048, V_t≈151,936]` bf16 |
+| Mean step time | 6.65 s (min 6.22 s) |
+| Teacher forward (both teachers) | 4.94 s mean — the dominant per-step cost |
+| Training throughput | ≈29.5k valid tokens/s (196,512 tokens/step ÷ mean step time) |
 
-The full-vocab teacher logits never cross the network: the producer publishes
-a single rank-level `[B_r, T_t, V_t]` bf16 tray and hands the student a CUDA
-IPC handle to it (same node), so the per-step transport cost is the ≈0.6 GB
-tray allocation rather than a host round-trip.
+Each teacher's full-vocab logits stay on-node: the producer publishes a
+rank-level `[B_r, T_t, V_t]` bf16 tray and hands the student a CUDA IPC handle
+to it, so teacher logits never cross the network even with two teachers in
+play.
 
 ## Where files live
 
