@@ -112,7 +112,14 @@ def main() -> None:
         tokenizer, config.data, config.env
     )
 
-    handles = setup_handle(
+    (
+        dp_client,
+        gen_handle,
+        trainer_handle,
+        env_handles,
+        train_cluster,
+        inference_cluster,
+    ) = setup_handle(
         config,
         tokenizer,
         dataset,
@@ -123,8 +130,13 @@ def main() -> None:
     print("🚀 Launching SingleControllerActor")
     sc = SingleControllerActor.remote(
         master_config=config,
-        handles=handles,
-        tokenizer=tokenizer,
+        dp_client=dp_client,
+        gen_handle=gen_handle,
+        trainer_handle=trainer_handle,
+        env_handles=env_handles,
+        train_cluster=train_cluster,
+        inference_cluster=inference_cluster,
+        dataset=dataset,
     )
     result = ray.get(sc.run.remote())
     print(f"SC run complete: {result}")

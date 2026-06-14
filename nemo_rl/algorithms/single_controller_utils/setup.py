@@ -18,22 +18,17 @@ to match SC's actor model:
 
   - :func:`setup_handle`               — builds the four *remote* handles SC
     needs (``dp_client``, ``gen_handle``, ``trainer_handle``,
-    ``env_handles``). These live in actor processes (or hold actor
-    handles).
-  - :func:`setup_single_controller_component` — builds the six *local*
+    ``env_handles``) plus the two Ray clusters. Driver-side; cheap to
+    cross the actor boundary (handles are already Ray references).
+  - :func:`setup_single_controller_component` — builds the five *local*
     components SC owns inside its actor process (``dataloader``,
-    ``weight_synchronizer``, ``advantage_estimator``, ``tokenizer``,
-    ``rollout_manager``, ``tq_buffer``).
-
-Both are pure factories: no Ray init, no cluster bootstrap of their own.
-The caller (``examples/run_grpo_single_controller.py``) is responsible
-for ``init_ray``, config loading, and tokenizer / dataset construction
-before invoking these.
+    ``weight_synchronizer``, ``advantage_estimator``,
+    ``rollout_manager``, ``tq_buffer``). Called from inside SC so the
+    heavy Python objects never ride through Ray's cloudpickle.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Optional
 
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -50,58 +45,10 @@ from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.utils import setup_response_data
-from nemo_rl.data_plane import DataPlaneClient
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollout_manager import RolloutManager
-from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
-
-
-@dataclass
-class SingleControllerHandles:
-    """The four remote handles SC needs to drive the RL loop.
-
-    ``trainer_handle`` is expected to expose the split-API train methods
-    (``begin_train_step``, ``train_microbatch_from_meta``,
-    ``finish_train_step``, ``prepare_logprobs_from_meta``) via Ray
-    ``.remote(...)`` — i.e. a :class:`~nemo_rl.models.policy.policy_trainer_actor.PolicyTrainerActor`
-    (introduced in PR #2692). Until that wrapper lands on this branch
-    the field is typed ``Any`` and SC will fail at the first
-    ``.remote(...)`` call if a plain :class:`TQPolicy` is passed.
-
-    Extra fields (clusters, loss_fn, datasets, master_config) are
-    carried forward so :func:`setup_single_controller_component` can
-    build the local components without re-running all of
-    :func:`grpo.setup`.
-    """
-
-    dp_client: DataPlaneClient
-    gen_handle: GenerationInterface
-    trainer_handle: Any
-    env_handles: dict[str, EnvironmentInterface]
-
-    # Carry-forward state used by setup_single_controller_component.
-    # Not part of the four documented "handles"; kept on the same object
-    # so callers don't have to thread a second context through.
-    train_cluster: RayVirtualCluster
-    inference_cluster: RayVirtualCluster
-    loss_fn: Any
-    dataset: Any
-    val_dataset: Optional[Any]
-    master_config: MasterConfig
-
-
-@dataclass
-class SingleControllerComponents:
-    """The six local components SC owns inside its actor process."""
-
-    dataloader: StatefulDataLoader
-    weight_synchronizer: WeightSynchronizer
-    advantage_estimator: Any
-    tokenizer: Any
-    rollout_manager: RolloutManager
-    tq_buffer: TQReplayBuffer
 
 
 def setup_handle(
@@ -109,12 +56,20 @@ def setup_handle(
     tokenizer: PreTrainedTokenizerBase,
     dataset: AllTaskProcessedDataset | dict[str, AllTaskProcessedDataset],
     val_dataset: Optional[AllTaskProcessedDataset],
+    *,
     processor: Optional[AutoProcessor] = None,
     env_handles: Optional[dict[str, EnvironmentInterface]] = None,
-) -> SingleControllerHandles:
-    """Build the four remote handles SC drives.
+) -> tuple[
+    Any,                                # dp_client
+    Any,                                # gen_handle
+    Any,                                # trainer_handle
+    dict[str, EnvironmentInterface],    # env_handles
+    RayVirtualCluster,                  # train_cluster
+    RayVirtualCluster,                  # inference_cluster
+]:
+    """Build the four remote handles + two clusters SC drives.
 
-    Delegates the cluster / policy / generation / dataloader bring-up to
+    Delegates the cluster / policy / generation bring-up to
     :func:`nemo_rl.algorithms.grpo.setup` (with a TQ-mediated policy
     factory) so the async path stays in sync with the sync trainer. The
     returned :class:`TQPolicy` is exposed as ``trainer_handle``; in
@@ -123,10 +78,9 @@ def setup_handle(
     :class:`PolicyTrainerActor` (PR #2692).
 
     Args:
-        master_config: Resolved master config (already coerced to
-            :class:`MasterConfig`).
-        tokenizer: Tokenizer used by both the policy and the rollout
-            manager.
+        master_config: Resolved SC MasterConfig.
+        tokenizer: Tokenizer used by the policy + by setup_response_data
+            for env_handles.
         dataset: Train dataset.
         val_dataset: Optional validation dataset.
         processor: Optional ``AutoProcessor`` for VLM paths.
@@ -135,15 +89,16 @@ def setup_handle(
             from the data + env configs.
 
     Returns:
-        :class:`SingleControllerHandles` carrying the four handles plus
-        the extra state needed by
-        :func:`setup_single_controller_component`.
+        Tuple ``(dp_client, gen_handle, trainer_handle, env_handles,
+        train_cluster, inference_cluster)``. Unpacked by the launcher
+        and passed flat to :class:`SingleControllerActor`.
     """
     dp_cfg = master_config.data_plane
     if dp_cfg is None or not dp_cfg.get("enabled", False):
         raise ValueError(
-            "single_controller_setup requires master_config.data_plane.enabled=True. "
-            "The async-RL SingleController path is built on the TransferQueue data plane."
+            "single_controller_utils.setup_handle requires "
+            "master_config.data_plane.enabled=True. The async-RL "
+            "SingleController path is built on the TransferQueue data plane."
         )
 
     # TQ-mediated policy factory — same wiring as run_grpo.py uses for the
@@ -166,7 +121,7 @@ def setup_handle(
         clusters,
         _dataloader,
         _val_dataloader,
-        loss_fn,
+        _loss_fn,
         _logger,
         _checkpointer,
         _grpo_save_state,
@@ -181,10 +136,6 @@ def setup_handle(
     )
     train_cluster, inference_cluster = clusters
 
-    # env_handles: prefer caller-supplied; otherwise derive from data + env
-    # configs via setup_response_data. We re-call setup_response_data here
-    # rather than threading task_to_env through grpo_setup so this module
-    # owns one self-contained path.
     if env_handles is None:
         _ds, _vds, env_handles, _val_env_handles = setup_response_data(
             tokenizer,
@@ -197,62 +148,75 @@ def setup_handle(
     # invoke SC.run() will hit AttributeError on `.remote(...)`; surface
     # the policy here so the rest of the wiring can be inspected.
     trainer_handle: Any = policy
-
-    return SingleControllerHandles(
-        dp_client=policy.dp_client,
-        gen_handle=policy_generation,
-        trainer_handle=trainer_handle,
-        env_handles=env_handles,
-        train_cluster=train_cluster,
-        inference_cluster=inference_cluster,
-        loss_fn=loss_fn,
-        dataset=dataset,
-        val_dataset=val_dataset,
-        master_config=master_config,
+    return (
+        policy.dp_client,
+        policy_generation,
+        trainer_handle,
+        env_handles,
+        train_cluster,
+        inference_cluster,
     )
 
 
 def setup_single_controller_component(
-    handles: SingleControllerHandles,
+    master_config: MasterConfig,
     tokenizer: PreTrainedTokenizerBase,
     *,
+    dp_client: Any,
+    gen_handle: Any,
+    trainer_handle: Any,
+    env_handles: dict[str, EnvironmentInterface],
+    train_cluster: RayVirtualCluster,
+    inference_cluster: RayVirtualCluster,
+    dataset: Any,
     partition_id: str = "rollout_data",
-) -> SingleControllerComponents:
-    """Build the six local components SC owns inside its actor process.
+) -> tuple[
+    StatefulDataLoader,
+    WeightSynchronizer,
+    Any,                 # advantage_estimator
+    RolloutManager,
+    TQReplayBuffer,
+]:
+    """Build the five local components SC owns inside its actor process.
 
-    All six are plain Python objects — they live in SC's process and are
+    All five are plain Python objects — they live in SC's process and are
     not Ray actors. SC drives them directly via method calls.
 
     Args:
-        handles: Output of :func:`setup_handle`.
+        master_config: SC MasterConfig.
         tokenizer: Tokenizer shared with the policy. Passed through to
             ``RolloutManager`` and used to derive the ``input_ids`` pad
             value for ``TQReplayBuffer``.
+        dp_client: DataPlane client handle.
+        gen_handle: Generation backend (VllmGeneration / SGLangGeneration).
+        trainer_handle: Trainer Ray actor handle (or the bare TQPolicy
+            until PolicyTrainerActor lands).
+        env_handles: ``task_name -> EnvironmentInterface`` mapping.
+        train_cluster: Training cluster — used by the weight synchronizer
+            for non-colocated NCCL bring-up.
+        inference_cluster: Inference cluster — same.
+        dataset: Train dataset, wrapped here in a ``StatefulDataLoader``.
         partition_id: TQ partition the rollout writer + sampler share.
 
     Returns:
-        :class:`SingleControllerComponents` with dataloader,
-        weight_synchronizer, advantage_estimator, tokenizer,
-        rollout_manager and tq_buffer.
+        Tuple ``(dataloader, weight_synchronizer, advantage_estimator,
+        rollout_manager, tq_buffer)``.
     """
-    master_config = handles.master_config
     data_config = master_config.data
     grpo_config = master_config.grpo
     generation_config = master_config.policy["generation"]
     assert generation_config is not None, (
-        "single_controller_setup requires policy.generation in master_config"
+        "single_controller_utils.setup_single_controller_component requires "
+        "policy.generation in master_config"
     )
 
-    # ── dataloader ─────────────────────────────────────────────────────
-    # Single-dataloader path only; the SC rollout pump iterates one
-    # dataloader. Multi-dataloader wrapping would mean threading the
-    # MultipleDataloaderWrapper through SC — out of scope for now.
     if data_config["use_multiple_dataloader"]:
         raise NotImplementedError(
-            "single_controller_setup does not support data.use_multiple_dataloader=True yet."
+            "single_controller_utils does not support "
+            "data.use_multiple_dataloader=True yet."
         )
     dataloader = StatefulDataLoader(
-        handles.dataset,
+        dataset,
         batch_size=grpo_config["num_prompts_per_step"],
         shuffle=data_config["shuffle"],
         collate_fn=rl_collate_fn,
@@ -260,7 +224,6 @@ def setup_single_controller_component(
         num_workers=data_config["num_workers"],
     )
 
-    # ── weight synchronizer ────────────────────────────────────────────
     colocated = generation_config["colocated"]["enabled"]
     backend = generation_config["backend"]
     refit_buffer_size_gb = (
@@ -269,43 +232,34 @@ def setup_single_controller_component(
         .get("refit_buffer_size_gb")
     )
     weight_synchronizer = create_weight_synchronizer(
-        policy=handles.trainer_handle,
-        generation=handles.gen_handle,
+        policy=trainer_handle,
+        generation=gen_handle,
         generation_backend=backend,
         colocated=colocated,
-        train_cluster=handles.train_cluster,
-        inference_cluster=handles.inference_cluster,
+        train_cluster=train_cluster,
+        inference_cluster=inference_cluster,
         refit_buffer_size_gb=refit_buffer_size_gb,
     )
 
-    # ── advantage estimator ───────────────────────────────────────────
     advantage_estimator = _create_advantage_estimator(master_config)
 
-    # ── TQ buffer + rollout manager ───────────────────────────────────
     pad_id = int(getattr(tokenizer, "pad_token_id", 0) or 0)
     tq_buffer = TQReplayBuffer(
-        handles.dp_client,
+        dp_client,
         partition_id=partition_id,
         pad_value_dict={"token_ids": pad_id, "input_ids": pad_id},
     )
 
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
-        env_handles=handles.env_handles,
+        env_handles=env_handles,
         num_generations_per_prompt=grpo_config["num_generations_per_prompt"],
         max_seq_len=master_config.policy["max_total_sequence_length"],
         max_rollout_turns=grpo_config.get("max_rollout_turns"),
-        policy_generation=handles.gen_handle,
+        policy_generation=gen_handle,
         generation_config=generation_config,
         use_nemo_gym=False,
         tq_buffer=tq_buffer,
     )
 
-    return SingleControllerComponents(
-        dataloader=dataloader,
-        weight_synchronizer=weight_synchronizer,
-        advantage_estimator=advantage_estimator,
-        tokenizer=tokenizer,
-        rollout_manager=rollout_manager,
-        tq_buffer=tq_buffer,
-    )
+    return (dataloader, weight_synchronizer, advantage_estimator, rollout_manager, tq_buffer)

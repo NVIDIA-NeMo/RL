@@ -7,27 +7,22 @@ shape of the contract, not the underlying initialization. The full path
 is covered by the functional test at
 ``tests/functional/grpo_dp_single_controller.sh``.
 
-setup_single_controller_component takes a fully built
-``SingleControllerHandles`` so it is exercised directly with fakes.
+setup_single_controller_component takes flat kwargs (no wrapper); the
+tests build the inputs directly and unpack the returned tuple.
 """
 
 from __future__ import annotations
 
-from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from nemo_rl.algorithms.single_controller_utils import (
-    SingleControllerComponents,
-    SingleControllerHandles,
+    MasterConfig,
     setup_handle,
     setup_single_controller_component,
 )
 from nemo_rl.algorithms.single_controller_utils import setup as setup_module
-
-
-from nemo_rl.algorithms.single_controller_utils import MasterConfig
 
 
 def _make_master_config(
@@ -67,36 +62,16 @@ def _make_master_config(
     )
 
 
-def _make_handles(
-    *,
-    master_config: Any | None = None,
-) -> SingleControllerHandles:
-    if master_config is None:
-        master_config = _make_master_config()
-    return SingleControllerHandles(
-        dp_client=MagicMock(),
-        gen_handle=MagicMock(),
-        trainer_handle=MagicMock(),
-        env_handles={},
-        train_cluster=MagicMock(),
-        inference_cluster=MagicMock(),
-        loss_fn=MagicMock(),
-        dataset=[1, 2, 3, 4, 5, 6, 7, 8],
-        val_dataset=None,
-        master_config=master_config,
-    )
-
-
 class TestSetupHandle:
-    """``setup_handle`` arg validation + handle assembly."""
+    """``setup_handle`` arg validation + return-tuple assembly."""
 
     def test_raises_when_data_plane_disabled(self):
         mc = _make_master_config(dp_enabled=False)
         with pytest.raises(ValueError, match="data_plane.enabled=True"):
             setup_handle(mc, MagicMock(), object(), None)
 
-    def test_passes_dp_cfg_to_tq_policy_and_returns_handles(self):
-        """setup_handle wires grpo.setup with a TQPolicy factory and packs the four handles."""
+    def test_passes_dp_cfg_to_tq_policy_and_returns_six_tuple(self):
+        """setup_handle wires grpo.setup with a TQPolicy factory and returns the 6-tuple."""
         mc = _make_master_config(dp_enabled=True)
         policy = MagicMock()
         policy.dp_client = MagicMock(name="dp_client_handle")
@@ -119,12 +94,10 @@ class TestSetupHandle:
         )
         env_handles = {"math": MagicMock(name="math_env")}
 
-        # Patch grpo.setup so we don't bootstrap clusters / vLLM. The
-        # patched return value is the 11-tuple grpo.setup produces.
         with patch.object(
             setup_module, "grpo_setup", return_value=fake_grpo_setup_return
         ) as mock_grpo_setup:
-            handles = setup_handle(
+            result = setup_handle(
                 mc,
                 tokenizer=MagicMock(),
                 dataset=object(),
@@ -132,21 +105,17 @@ class TestSetupHandle:
                 env_handles=env_handles,
             )
 
-        # grpo_setup was called once with a policy_factory kwarg.
         assert mock_grpo_setup.call_count == 1
         _, call_kwargs = mock_grpo_setup.call_args
         assert callable(call_kwargs["policy_factory"])
 
-        # Handles are wired from the grpo_setup return values.
-        assert isinstance(handles, SingleControllerHandles)
-        assert handles.dp_client is policy.dp_client
-        assert handles.gen_handle is policy_generation
-        assert handles.trainer_handle is policy
-        assert handles.env_handles is env_handles
-        assert handles.train_cluster is train_cluster
-        assert handles.inference_cluster is inference_cluster
-        assert handles.loss_fn is loss_fn
-        assert handles.master_config is mc
+        dp_client, gen_handle, trainer_handle, returned_env_handles, tc, ic = result
+        assert dp_client is policy.dp_client
+        assert gen_handle is policy_generation
+        assert trainer_handle is policy
+        assert returned_env_handles is env_handles
+        assert tc is train_cluster
+        assert ic is inference_cluster
 
     def test_builds_env_handles_when_not_passed(self):
         """When env_handles is None, setup_response_data is invoked."""
@@ -181,46 +150,60 @@ class TestSetupHandle:
                 return_value=(object(), None, derived_env_handles, {}),
             ) as mock_setup_data,
         ):
-            handles = setup_handle(mc, MagicMock(), object(), None, env_handles=None)
+            _, _, _, returned_env_handles, _, _ = setup_handle(
+                mc, MagicMock(), object(), None, env_handles=None
+            )
 
         mock_setup_data.assert_called_once()
-        assert handles.env_handles is derived_env_handles
+        assert returned_env_handles is derived_env_handles
+
+
+def _component_kwargs(*, dp_client=None, master_config=None, **overrides):
+    """Common kwargs for setup_single_controller_component tests."""
+    kwargs = dict(
+        dp_client=dp_client or MagicMock(),
+        gen_handle=MagicMock(),
+        trainer_handle=MagicMock(),
+        env_handles={},
+        train_cluster=MagicMock(),
+        inference_cluster=MagicMock(),
+        dataset=[1, 2, 3, 4, 5, 6, 7, 8],
+    )
+    kwargs.update(overrides)
+    return master_config or _make_master_config(), kwargs
 
 
 class TestSetupSingleControllerComponent:
-    """``setup_single_controller_component`` assembles the six locals."""
+    """``setup_single_controller_component`` assembles the five locals."""
 
-    def test_returns_all_six_components(self):
-        handles = _make_handles()
-        tokenizer = MagicMock()
-        tokenizer.pad_token_id = 0
+    def test_returns_five_tuple(self):
+        mc, kwargs = _component_kwargs()
+        tokenizer = MagicMock(pad_token_id=0)
 
         with patch.object(
             setup_module,
             "create_weight_synchronizer",
             return_value=MagicMock(name="weight_sync"),
         ):
-            components = setup_single_controller_component(handles, tokenizer)
+            result = setup_single_controller_component(mc, tokenizer, **kwargs)
 
-        assert isinstance(components, SingleControllerComponents)
-        # Six fields populated.
-        assert components.dataloader is not None
-        assert components.weight_synchronizer is not None
-        assert components.advantage_estimator is not None
-        assert components.tokenizer is tokenizer
-        assert components.rollout_manager is not None
-        assert components.tq_buffer is not None
+        dataloader, weight_sync, advantage_estimator, rollout_manager, tq_buffer = result
+        assert dataloader is not None
+        assert weight_sync is not None
+        assert advantage_estimator is not None
+        assert rollout_manager is not None
+        assert tq_buffer is not None
 
-        # tq_buffer shares the partition_id default and the dp_client.
-        assert components.tq_buffer._dp_client is handles.dp_client
-        assert components.tq_buffer._partition_id == "rollout_data"
+        # tq_buffer wires dp_client + default partition.
+        assert tq_buffer._dp_client is kwargs["dp_client"]
+        assert tq_buffer._partition_id == "rollout_data"
 
-        # rollout_manager binds the same tq_buffer instance (so add/sampler share state).
-        assert components.rollout_manager._tq_buffer is components.tq_buffer
+        # rollout_manager binds the same tq_buffer so writer + sampler share state.
+        assert rollout_manager._tq_buffer is tq_buffer
 
     def test_multiple_dataloader_not_supported(self):
         mc = _make_master_config(use_multiple_dataloader=True)
-        handles = _make_handles(master_config=mc)
+        _, kwargs = _component_kwargs(master_config=mc)
 
         with (
             patch.object(
@@ -230,12 +213,14 @@ class TestSetupSingleControllerComponent:
             ),
             pytest.raises(NotImplementedError, match="use_multiple_dataloader"),
         ):
-            setup_single_controller_component(handles, MagicMock(pad_token_id=0))
+            setup_single_controller_component(
+                mc, MagicMock(pad_token_id=0), **kwargs
+            )
 
     def test_weight_sync_factory_args(self):
         """create_weight_synchronizer receives the right policy/generation/topology."""
         mc = _make_master_config(colocated=False, backend="vllm")
-        handles = _make_handles(master_config=mc)
+        _, kwargs = _component_kwargs(master_config=mc)
         tokenizer = MagicMock(pad_token_id=0)
 
         with patch.object(
@@ -243,18 +228,18 @@ class TestSetupSingleControllerComponent:
             "create_weight_synchronizer",
             return_value=MagicMock(),
         ) as mock_factory:
-            setup_single_controller_component(handles, tokenizer)
+            setup_single_controller_component(mc, tokenizer, **kwargs)
 
-        _, kwargs = mock_factory.call_args
-        assert kwargs["policy"] is handles.trainer_handle
-        assert kwargs["generation"] is handles.gen_handle
-        assert kwargs["generation_backend"] == "vllm"
-        assert kwargs["colocated"] is False
-        assert kwargs["train_cluster"] is handles.train_cluster
-        assert kwargs["inference_cluster"] is handles.inference_cluster
+        _, factory_kwargs = mock_factory.call_args
+        assert factory_kwargs["policy"] is kwargs["trainer_handle"]
+        assert factory_kwargs["generation"] is kwargs["gen_handle"]
+        assert factory_kwargs["generation_backend"] == "vllm"
+        assert factory_kwargs["colocated"] is False
+        assert factory_kwargs["train_cluster"] is kwargs["train_cluster"]
+        assert factory_kwargs["inference_cluster"] is kwargs["inference_cluster"]
 
     def test_custom_partition_id(self):
-        handles = _make_handles()
+        mc, kwargs = _component_kwargs()
         tokenizer = MagicMock(pad_token_id=7)
 
         with patch.object(
@@ -262,10 +247,9 @@ class TestSetupSingleControllerComponent:
             "create_weight_synchronizer",
             return_value=MagicMock(),
         ):
-            components = setup_single_controller_component(
-                handles, tokenizer, partition_id="custom_partition"
+            _, _, _, _, tq_buffer = setup_single_controller_component(
+                mc, tokenizer, partition_id="custom_partition", **kwargs
             )
 
-        assert components.tq_buffer._partition_id == "custom_partition"
-        # pad value derived from tokenizer.pad_token_id.
-        assert components.tq_buffer._pad_value_dict == {"token_ids": 7, "input_ids": 7}
+        assert tq_buffer._partition_id == "custom_partition"
+        assert tq_buffer._pad_value_dict == {"token_ids": 7, "input_ids": 7}

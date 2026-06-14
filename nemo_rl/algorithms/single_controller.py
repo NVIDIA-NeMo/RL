@@ -36,7 +36,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import TYPE_CHECKING, Any
+from typing import Any, Optional
 
 import ray
 import torch
@@ -46,12 +46,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import StalenessSampler
 from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import KVBatchMeta
-
-if TYPE_CHECKING:
-    from nemo_rl.algorithms.single_controller_utils.setup import (
-        SingleControllerComponents,
-        SingleControllerHandles,
-    )
+from nemo_rl.environments.interfaces import EnvironmentInterface
 
 log = logging.getLogger(__name__)
 
@@ -71,10 +66,32 @@ class SingleControllerActor:
     def __init__(
         self,
         master_config: MasterConfig,
-        handles: "SingleControllerHandles",
-        tokenizer: Any | None = None,
-        components: "SingleControllerComponents | None" = None,
+        *,
+        dp_client: Any,
+        gen_handle: Any,
+        trainer_handle: Any,
+        env_handles: dict[str, EnvironmentInterface],
+        train_cluster: Any,
+        inference_cluster: Any,
+        dataset: Any,
+        components: Optional[tuple] = None,
     ) -> None:
+        """Initialize the SingleController actor.
+
+        Args:
+            master_config: SC MasterConfig.
+            dp_client: DataPlane client handle.
+            gen_handle: Generation backend.
+            trainer_handle: Trainer Ray actor handle.
+            env_handles: ``task_name -> EnvironmentInterface`` mapping.
+            train_cluster: Training Ray cluster (weight-sync rendezvous).
+            inference_cluster: Inference Ray cluster.
+            dataset: Train dataset wrapped into a StatefulDataLoader here.
+            components: Test-only escape hatch — a tuple
+                ``(dataloader, weight_synchronizer, advantage_estimator,
+                rollout_manager, tq_buffer)`` that bypasses the in-actor
+                setup. Production callers leave this ``None``.
+        """
         import logging as _logging
 
         _logging.basicConfig(
@@ -82,30 +99,50 @@ class SingleControllerActor:
             format="[%(asctime)s] %(levelname)s %(filename)s:%(lineno)d: %(message)s",
         )
 
-        # Build the six local components if the caller did not supply them.
-        # Tests inject fakes via ``components=``; production goes through
-        # :func:`setup_single_controller_component`.
+        # Build tokenizer + components inside the actor so the heavy
+        # Python objects never ride through Ray cloudpickle. The
+        # ``components`` arg is a test-only escape hatch that injects
+        # fakes built CPU-side.
         if components is None:
+            from nemo_rl.algorithms.utils import get_tokenizer
             from nemo_rl.algorithms.single_controller_utils.setup import (
                 setup_single_controller_component,
             )
 
+            tokenizer = get_tokenizer(master_config.policy["tokenizer"])
             components = setup_single_controller_component(
-                handles, tokenizer, partition_id=master_config.partition_id
+                master_config,
+                tokenizer,
+                dp_client=dp_client,
+                gen_handle=gen_handle,
+                trainer_handle=trainer_handle,
+                env_handles=env_handles,
+                train_cluster=train_cluster,
+                inference_cluster=inference_cluster,
+                dataset=dataset,
+                partition_id=master_config.partition_id,
             )
 
+        (
+            dataloader,
+            weight_synchronizer,
+            advantage_estimator,
+            rollout_manager,
+            tq_buffer,
+        ) = components
+
         self._mc = master_config
-        self._dp_client = handles.dp_client
-        self._gen = handles.gen_handle
-        self._trainer = handles.trainer_handle
-        self._dataloader = components.dataloader
-        self._weight_synchronizer = components.weight_synchronizer
-        self._advantage_estimator = components.advantage_estimator
-        self._buffer = components.tq_buffer
-        self._rollout_manager = components.rollout_manager
-        # Tests pass a separately constructed rollout_manager and tq_buffer
-        # as distinct cloudpickle blobs; rebind so the writer and the
-        # sampler always share one buffer.
+        self._dp_client = dp_client
+        self._gen = gen_handle
+        self._trainer = trainer_handle
+        self._dataloader = dataloader
+        self._weight_synchronizer = weight_synchronizer
+        self._advantage_estimator = advantage_estimator
+        self._buffer = tq_buffer
+        self._rollout_manager = rollout_manager
+        # When tests pass rollout_manager + tq_buffer as separate
+        # cloudpickle blobs, Ray deserializes them into distinct buffer
+        # instances. Rebind so the writer and the sampler share one.
         self._rollout_manager._tq_buffer = self._buffer
 
         adv_cfg = master_config.advantage
