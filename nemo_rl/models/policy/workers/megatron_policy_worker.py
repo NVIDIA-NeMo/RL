@@ -1533,8 +1533,20 @@ class MegatronPolicyWorkerImpl(
         no_grad.__enter__()
         self.model = self.move_model(self.model, "cpu")
         self.model.eval()
+        # Offload grad buffers (params already on CPU from the move above).
+        self.model = self.move_model(
+            self.model, "cpu", move_params=False, move_grads=True
+        )
         torch.randn(1).cuda()  # wake up torch allocator
-        self.offload_before_refit()  # rerun the old offload function
+        if (
+            hasattr(self, "optimizer")
+            and self.optimizer is not None
+            and not self.optimizer_cpu_offload
+        ):
+            self.move_optimizer("cpu")
+
+        gc.collect()
+        torch.cuda.empty_cache()
 
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
         reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
@@ -1598,22 +1610,128 @@ class MegatronPolicyWorkerImpl(
             optimizer_state = self.optimizer.state
         else:
             optimizer_state = self.optimizer._get_state()
+
+        use_pinned = self.cfg["use_pinned_optimizer_offload"]
+        use_coalesced = self.cfg["use_coalesced_optimizer_offload"]
+        if use_coalesced and not use_pinned:
+            raise ValueError(
+                "use_coalesced_optimizer_offload requires use_pinned_optimizer_offload=True."
+            )
+
+        if device == "cpu":
+            if use_coalesced:
+                self._coalesced_optimizer_to_cpu(optimizer_state)
+            elif use_pinned:
+                self._pinned_optimizer_to_cpu(optimizer_state)
+            else:
+                self._optimizer_to_cpu(optimizer_state)
+        elif device == "cuda":
+            if use_coalesced:
+                self._coalesced_optimizer_to_cuda(optimizer_state)
+            elif use_pinned:
+                self._pinned_optimizer_to_cuda(optimizer_state)
+            else:
+                self._optimizer_to_cuda(optimizer_state)
+        else:
+            raise ValueError(
+                f"Invalid device: {device}. Only strings 'cpu' and 'cuda' are supported."
+            )
+
+    def _optimizer_to_cpu(self, optimizer_state):
+        """Offload optimizer state tensors to CPU using default pageable memory."""
         for _, state in optimizer_state.items():
-            # Iterate through the state items (e.g., momentum, variance) for a parameter
             for k, v in state.items():
-                # Check if the item is a tensor
-                if torch.is_tensor(v):
-                    # Move the tensor to device and update the state dictionary
-                    if device == "cpu":
-                        if v.is_cuda:
-                            state[k] = v.to("cpu")
-                    elif device == "cuda":
-                        if not v.is_cuda:
-                            state[k] = v.to("cuda")
-                    else:
-                        raise ValueError(
-                            f"Invalid device: {device}. Only strings 'cpu' and 'cuda' are supported."
-                        )
+                if torch.is_tensor(v) and v.is_cuda:
+                    state[k] = v.to("cpu")
+
+    def _optimizer_to_cuda(self, optimizer_state):
+        """Reload optimizer state tensors to CUDA."""
+        for _, state in optimizer_state.items():
+            for k, v in state.items():
+                if torch.is_tensor(v) and not v.is_cuda:
+                    state[k] = v.to("cuda")
+
+    def _pinned_optimizer_to_cpu(self, optimizer_state):
+        """Offload optimizer state tensors to CPU using per-tensor pinned memory.
+
+        Each tensor gets its own pinned CPU allocation. Avoids the single large
+        contiguous pinned buffer used by the coalesced path, at the cost of more
+        host allocations.
+        """
+        for _, state in optimizer_state.items():
+            for k, v in state.items():
+                if not torch.is_tensor(v) or not v.is_cuda:
+                    continue
+                if v.dim() == 0:
+                    state[k] = v.cpu()
+                    continue
+                dst = torch.empty(v.shape, dtype=v.dtype, device="cpu", pin_memory=True)
+                dst.copy_(v, non_blocking=True)
+                state[k] = dst
+        torch.cuda.synchronize()
+
+    def _pinned_optimizer_to_cuda(self, optimizer_state):
+        """Reload optimizer state tensors from per-tensor pinned CPU memory to CUDA."""
+        for _, state in optimizer_state.items():
+            for k, v in state.items():
+                if torch.is_tensor(v) and not v.is_cuda:
+                    state[k] = v.to("cuda", non_blocking=True)
+        torch.cuda.synchronize()
+
+    def _get_or_alloc_pinned_buf(
+        self, attr_name: str, total_bytes: int
+    ) -> torch.Tensor:
+        """Return a cached pinned CPU buffer, allocating only on first use or resize."""
+        buf = getattr(self, attr_name, None)
+        if buf is None or buf.numel() < total_bytes:
+            buf = torch.empty(
+                total_bytes, device="cpu", dtype=torch.uint8, pin_memory=True
+            )
+            setattr(self, attr_name, buf)
+        return buf
+
+    def _coalesced_optimizer_to_cpu(self, optimizer_state):
+        """Offload all optimizer state tensors to CPU via a cached pinned buffer.
+
+        Packs all CUDA tensors into a single pre-allocated pinned CPU buffer,
+        eliminating per-tensor cudaHostAlloc overhead. The pinned buffer is
+        allocated once on first call and reused across iterations.
+        """
+        ALIGN = 512
+        entries = []
+        total_bytes = 0
+
+        for _, state in optimizer_state.items():
+            for k, v in state.items():
+                if not torch.is_tensor(v) or not v.is_cuda:
+                    continue
+                if v.dim() == 0:
+                    state[k] = v.cpu()
+                    continue
+                offset = (total_bytes + ALIGN - 1) // ALIGN * ALIGN
+                nbytes = v.numel() * v.element_size()
+                entries.append((state, k, v, offset, nbytes))
+                total_bytes = offset + nbytes
+
+        if not entries:
+            return
+
+        cpu_buf = self._get_or_alloc_pinned_buf("_optimizer_pinned_buf", total_bytes)
+
+        for state, k, v, offset, nbytes in entries:
+            dst = cpu_buf[offset : offset + nbytes].view(v.dtype).reshape(v.shape)
+            dst.copy_(v, non_blocking=True)
+            state[k] = dst
+
+        torch.cuda.synchronize()
+
+    def _coalesced_optimizer_to_cuda(self, optimizer_state):
+        """Reload all optimizer state tensors back to CUDA."""
+        for _, state in optimizer_state.items():
+            for k, v in state.items():
+                if torch.is_tensor(v) and not v.is_cuda:
+                    state[k] = v.to("cuda", non_blocking=True)
+        torch.cuda.synchronize()
 
     def save_checkpoint(
         self,
