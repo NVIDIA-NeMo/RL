@@ -1,11 +1,11 @@
-"""Unit tests for ``nemo_rl.algorithms.single_controller_setup``.
+"""Unit tests for ``nemo_rl.algorithms.single_controller_utils.setup``.
 
 setup_handle is heavy (calls ``grpo.setup`` which spins up Ray clusters,
 policies, and generation backends) so it's exercised through
 monkey-patching rather than as a real e2e — the unit tests cover the
 shape of the contract, not the underlying initialization. The full path
 is covered by the functional test at
-``tests/test_suites/llm/sc-grpo-llama3.2-1b-instruct-1n8g-fsdp2tp1.sh``.
+``tests/functional/grpo_dp_single_controller.sh``.
 
 setup_single_controller_component takes a fully built
 ``SingleControllerHandles`` so it is exercised directly with fakes.
@@ -18,13 +18,16 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from nemo_rl.algorithms import single_controller_setup
-from nemo_rl.algorithms.single_controller_setup import (
+from nemo_rl.algorithms.single_controller_utils import (
     SingleControllerComponents,
     SingleControllerHandles,
     setup_handle,
     setup_single_controller_component,
 )
+from nemo_rl.algorithms.single_controller_utils import setup as setup_module
+
+
+from nemo_rl.algorithms.single_controller_utils import MasterConfig
 
 
 def _make_master_config(
@@ -33,29 +36,35 @@ def _make_master_config(
     use_multiple_dataloader: bool = False,
     colocated: bool = True,
     backend: str = "vllm",
-) -> Any:
-    """Return a MagicMock master_config with just the fields the helpers read."""
-    mc = MagicMock()
-    mc.data_plane = {"enabled": dp_enabled, "impl": "transfer_queue"}
-    mc.data = {
-        "use_multiple_dataloader": use_multiple_dataloader,
-        "shuffle": False,
-        "num_workers": 0,
-    }
-    mc.grpo = {
-        "num_prompts_per_step": 4,
-        "num_generations_per_prompt": 2,
-        "max_rollout_turns": 1,
-    }
-    mc.policy = {
-        "max_total_sequence_length": 32,
-        "generation": {
-            "backend": backend,
-            "colocated": {"enabled": colocated, "resources": {}},
+) -> MasterConfig:
+    """Build a partially-populated MasterConfig for unit tests.
+
+    Cross-cutting components (policy/data/cluster/...) are required by
+    pydantic for normal load but unused here — ``model_construct``
+    skips validation, and we hand-fill only the dict-shaped fields the
+    setup helpers read.
+    """
+    return MasterConfig.model_construct(
+        data_plane={"enabled": dp_enabled, "impl": "transfer_queue"},
+        data={
+            "use_multiple_dataloader": use_multiple_dataloader,
+            "shuffle": False,
+            "num_workers": 0,
         },
-    }
-    mc.env = {}
-    return mc
+        grpo={
+            "num_prompts_per_step": 4,
+            "num_generations_per_prompt": 2,
+            "max_rollout_turns": 1,
+        },
+        policy={
+            "max_total_sequence_length": 32,
+            "generation": {
+                "backend": backend,
+                "colocated": {"enabled": colocated, "resources": {}},
+            },
+        },
+        env={},
+    )
 
 
 def _make_handles(
@@ -113,7 +122,7 @@ class TestSetupHandle:
         # Patch grpo.setup so we don't bootstrap clusters / vLLM. The
         # patched return value is the 11-tuple grpo.setup produces.
         with patch.object(
-            single_controller_setup, "grpo_setup", return_value=fake_grpo_setup_return
+            setup_module, "grpo_setup", return_value=fake_grpo_setup_return
         ) as mock_grpo_setup:
             handles = setup_handle(
                 mc,
@@ -162,12 +171,12 @@ class TestSetupHandle:
 
         with (
             patch.object(
-                single_controller_setup,
+                setup_module,
                 "grpo_setup",
                 return_value=fake_grpo_setup_return,
             ),
             patch.object(
-                single_controller_setup,
+                setup_module,
                 "setup_response_data",
                 return_value=(object(), None, derived_env_handles, {}),
             ) as mock_setup_data,
@@ -187,7 +196,7 @@ class TestSetupSingleControllerComponent:
         tokenizer.pad_token_id = 0
 
         with patch.object(
-            single_controller_setup,
+            setup_module,
             "create_weight_synchronizer",
             return_value=MagicMock(name="weight_sync"),
         ):
@@ -215,7 +224,7 @@ class TestSetupSingleControllerComponent:
 
         with (
             patch.object(
-                single_controller_setup,
+                setup_module,
                 "create_weight_synchronizer",
                 return_value=MagicMock(),
             ),
@@ -230,7 +239,7 @@ class TestSetupSingleControllerComponent:
         tokenizer = MagicMock(pad_token_id=0)
 
         with patch.object(
-            single_controller_setup,
+            setup_module,
             "create_weight_synchronizer",
             return_value=MagicMock(),
         ) as mock_factory:
@@ -249,7 +258,7 @@ class TestSetupSingleControllerComponent:
         tokenizer = MagicMock(pad_token_id=7)
 
         with patch.object(
-            single_controller_setup,
+            setup_module,
             "create_weight_synchronizer",
             return_value=MagicMock(),
         ):

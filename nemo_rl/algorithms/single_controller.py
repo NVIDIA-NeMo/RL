@@ -36,73 +36,24 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, Optional
+from typing import TYPE_CHECKING, Any
 
 import ray
 import torch
 from tensordict import TensorDict
 
 from nemo_rl.algorithms.async_utils.staleness_sampler import StalenessSampler
+from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import KVBatchMeta
 
 if TYPE_CHECKING:
-    from nemo_rl.algorithms.single_controller_setup import (
+    from nemo_rl.algorithms.single_controller_utils.setup import (
         SingleControllerComponents,
         SingleControllerHandles,
     )
 
 log = logging.getLogger(__name__)
-
-
-@dataclass
-class SingleControllerConfig:
-    """Configuration for SingleController."""
-
-    # Staleness
-    max_weight_staleness_versions: int = 1
-    min_prompt_groups_per_batch: int = 2
-    target_prompt_groups_per_step: Optional[int] = None
-    generations_per_prompt: int = 4
-    batch_selection_strategy: Literal[
-        "strict_on_policy",
-        "staleness_window",
-    ] = "strict_on_policy"
-
-    # Concurrency limits
-    max_inflight_prompts: int = 8
-    max_buffered_rollouts: int = 8  # _buffer_capacity semaphore size
-
-    # Training
-    max_train_steps: int = 10
-    # Cap on dataloader passes; None means unbounded (cycle until cancelled).
-    max_num_epochs: Optional[int] = None
-
-    # DataPlane partition
-    partition_id: str = "rollout_data"
-
-    # Advantage calculation
-    advantage_enabled: bool = False
-    advantage_output_field: str = "advantages"
-    advantage_prompt_ids_field: str = "prompt_ids_for_adv"
-    advantage_reward_field: str = "total_reward"
-    advantage_token_mask_field: str = "token_mask"
-    advantage_sample_mask_field: str = "sample_mask"
-    advantage_repeated_batch_fields: list[str] = field(default_factory=list)
-    advantage_policy_logprobs_field: str | None = None
-    advantage_reference_logprobs_field: str | None = None
-
-    # Diagnostics
-    diagnostics: bool = False
-
-    # Weight transport backend ("stub" for dry-run, "nccl" for production)
-    weight_transport: str = "stub"
-    weight_nccl_addr: str = "127.0.0.1"
-    weight_nccl_port: Optional[int] = None
-
-    # Extra fields passed through to avoid TypedDict issues
-    extra: dict = field(default_factory=dict)
 
 
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
@@ -119,7 +70,7 @@ class SingleControllerActor:
 
     def __init__(
         self,
-        cfg: SingleControllerConfig,
+        master_config: MasterConfig,
         handles: "SingleControllerHandles",
         tokenizer: Any | None = None,
         components: "SingleControllerComponents | None" = None,
@@ -135,15 +86,15 @@ class SingleControllerActor:
         # Tests inject fakes via ``components=``; production goes through
         # :func:`setup_single_controller_component`.
         if components is None:
-            from nemo_rl.algorithms.single_controller_setup import (
+            from nemo_rl.algorithms.single_controller_utils.setup import (
                 setup_single_controller_component,
             )
 
             components = setup_single_controller_component(
-                handles, tokenizer, partition_id=cfg.partition_id
+                handles, tokenizer, partition_id=master_config.partition_id
             )
 
-        self._cfg = cfg
+        self._mc = master_config
         self._dp_client = handles.dp_client
         self._gen = handles.gen_handle
         self._trainer = handles.trainer_handle
@@ -157,34 +108,33 @@ class SingleControllerActor:
         # sampler always share one buffer.
         self._rollout_manager._tq_buffer = self._buffer
 
-        if cfg.advantage_enabled and self._advantage_estimator is None:
+        adv_cfg = master_config.advantage
+        stale_cfg = master_config.staleness
+        conc_cfg = master_config.concurrency
+        ws_cfg = master_config.weight_sync
+
+        if adv_cfg.enabled and self._advantage_estimator is None:
             raise ValueError(
-                "advantage_enabled=True requires an advantage_estimator instance"
+                "advantage.enabled=True requires an advantage_estimator instance"
             )
 
-        if cfg.target_prompt_groups_per_step is None:
-            cfg.target_prompt_groups_per_step = cfg.min_prompt_groups_per_batch
-        if cfg.target_prompt_groups_per_step < cfg.min_prompt_groups_per_batch:
+        if stale_cfg.target_prompt_groups_per_step is None:
+            stale_cfg.target_prompt_groups_per_step = stale_cfg.min_prompt_groups_per_batch
+        if stale_cfg.target_prompt_groups_per_step < stale_cfg.min_prompt_groups_per_batch:
             raise ValueError(
-                f"target_prompt_groups_per_step ({cfg.target_prompt_groups_per_step}) "
-                f"must be >= min_prompt_groups_per_batch ({cfg.min_prompt_groups_per_batch})"
+                f"target_prompt_groups_per_step ({stale_cfg.target_prompt_groups_per_step}) "
+                f"must be >= min_prompt_groups_per_batch ({stale_cfg.min_prompt_groups_per_batch})"
             )
 
-        # Initialize sampler
-        assert cfg.batch_selection_strategy in [
-            "strict_on_policy",
-            "staleness_window",
-        ], f"Unknown batch_selection_strategy: {cfg.batch_selection_strategy}"
-
-        if cfg.batch_selection_strategy == "strict_on_policy":
-            cfg.max_weight_staleness_versions = 0
+        if stale_cfg.batch_selection_strategy == "strict_on_policy":
+            stale_cfg.max_weight_staleness_versions = 0
             print(
                 "Using strict_on_policy, auto setting max_weight_staleness_versions to 0."
             )
 
         self._sampler = StalenessSampler(
             self._buffer,
-            max_staleness_versions=cfg.max_weight_staleness_versions,
+            max_staleness_versions=stale_cfg.max_weight_staleness_versions,
         )
 
         # ── asyncio state ──────────────────────────────────────────────────
@@ -199,7 +149,7 @@ class SingleControllerActor:
         # Acquired before each rollout dispatch; released when the buffer
         # drops a group (sampler.evict or post-train buffer.remove).
         self._buffer_capacity: asyncio.Semaphore = asyncio.Semaphore(
-            cfg.max_buffered_rollouts
+            conc_cfg.max_buffered_rollouts
         )
 
         self._trainer_version: int = 0
@@ -208,10 +158,10 @@ class SingleControllerActor:
 
         log.info(
             "SingleControllerActor: staleness_cap=%d buffer=%d inflight=%d transport=%s",
-            cfg.max_weight_staleness_versions,
-            cfg.max_buffered_rollouts,
-            cfg.max_inflight_prompts,
-            cfg.weight_transport,
+            stale_cfg.max_weight_staleness_versions,
+            conc_cfg.max_buffered_rollouts,
+            conc_cfg.max_inflight_prompts,
+            ws_cfg.transport,
         )
 
     # ── public API ─────────────────────────────────────────────────────────
@@ -298,14 +248,14 @@ class SingleControllerActor:
              TQReplayBuffer.add (→ dp_client.put_samples + meta append)
           5. Decrement _inflight_rollouts
         """
-        sem = asyncio.Semaphore(self._cfg.max_inflight_prompts)
+        sem = asyncio.Semaphore(self._mc.concurrency.max_inflight_prompts)
         log.info("rollout_pump: starting")
 
         async def _dispatch_one_prompt(prompt: DatumSpec) -> None:
             self._inflight_rollouts += 1
             try:
                 await self._rollout_manager.generate_and_push(prompt)
-                if self._cfg.diagnostics:
+                if self._mc.diagnostics:
                     content = ""
                     for i in range(len(prompt["message_log"])):
                         if prompt["message_log"][i]["role"] == "user":
@@ -317,7 +267,7 @@ class SingleControllerActor:
                 sem.release()
 
         # TODO: limit max_train_steps to max_num_epochs * len(dataloader) when setup
-        max_epochs = self._cfg.max_num_epochs
+        max_epochs = self._mc.training.max_num_epochs
         epoch = 0
         while max_epochs is None or epoch < max_epochs:
             for prompt in self._dataloader:
@@ -347,17 +297,21 @@ class SingleControllerActor:
           5. dp_client.clear_samples on consumed sample_ids; release _buffer_capacity
              per dropped group, then sync.
         """
+        adv_cfg = self._mc.advantage
+        stale_cfg = self._mc.staleness
+        train_cfg = self._mc.training
+
         logprobs_required = (
-            self._cfg.advantage_policy_logprobs_field is not None
-            or self._cfg.advantage_reference_logprobs_field is not None
+            adv_cfg.policy_logprobs_field is not None
+            or adv_cfg.reference_logprobs_field is not None
         )
 
-        while self._train_steps < self._cfg.max_train_steps:
+        while self._train_steps < train_cfg.max_train_steps:
             step_id = f"sc-step-{self._train_steps:06d}"
             # __init__ coerces None → min_prompt_groups_per_batch (int);
             # the assert narrows the Optional[int] type for pyrefly.
-            assert self._cfg.target_prompt_groups_per_step is not None
-            target_groups: int = self._cfg.target_prompt_groups_per_step
+            assert stale_cfg.target_prompt_groups_per_step is not None
+            target_groups: int = stale_cfg.target_prompt_groups_per_step
             groups_dispatched = 0
             in_flight: list[ray.ObjectRef] = []
             step_open = False
@@ -377,7 +331,7 @@ class SingleControllerActor:
                 # need to add a max_prompt_groups_per_batch
                 train_meta, num_groups = await self._sampler.select(
                     current_train_weight=self._trainer_version,
-                    min_prompt_groups=self._cfg.min_prompt_groups_per_batch,
+                    min_prompt_groups=stale_cfg.min_prompt_groups_per_batch,
                 )
 
                 if train_meta is None:
@@ -422,7 +376,7 @@ class SingleControllerActor:
             await self._call_dp(
                 "clear_samples",
                 sample_ids=list(consumed_ids),
-                partition_id=self._cfg.partition_id,
+                partition_id=self._mc.partition_id,
             )
 
             self._trainer_version = result["trainer_version"]
@@ -431,7 +385,7 @@ class SingleControllerActor:
             log.info(
                 "train step %d/%d  trainer_v=%d  lag=%d  batch_size=%d",
                 self._train_steps + 1,
-                self._cfg.max_train_steps,
+                train_cfg.max_train_steps,
                 self._trainer_version,
                 lag,
                 len(consumed_ids),
@@ -484,7 +438,8 @@ class SingleControllerActor:
         only the configured advantage input columns and writes the computed
         ``advantages`` column back under the same ``sample_ids``.
         """
-        if not self._cfg.advantage_enabled:
+        adv_cfg = self._mc.advantage
+        if not adv_cfg.enabled:
             return meta
         assert self._advantage_estimator is not None
 
@@ -495,34 +450,34 @@ class SingleControllerActor:
             select_fields=self._advantage_input_fields(),
         )
 
-        prompt_ids = _tensor_field(data, self._cfg.advantage_prompt_ids_field)
+        prompt_ids = _tensor_field(data, adv_cfg.prompt_ids_field)
         rewards = _squeeze_trailing_unit_dim(
-            _tensor_field(data, self._cfg.advantage_reward_field)
+            _tensor_field(data, adv_cfg.reward_field)
         ).float()
-        token_mask = _tensor_field(data, self._cfg.advantage_token_mask_field).float()
+        token_mask = _tensor_field(data, adv_cfg.token_mask_field).float()
         sample_mask = _squeeze_trailing_unit_dim(
-            _tensor_field(data, self._cfg.advantage_sample_mask_field)
+            _tensor_field(data, adv_cfg.sample_mask_field)
         ).float()
         mask = token_mask * sample_mask.unsqueeze(-1)
 
         repeated_batch: dict[str, torch.Tensor] = {
             "total_reward": rewards,
         }
-        for field_name in self._cfg.advantage_repeated_batch_fields:
+        for field_name in adv_cfg.repeated_batch_fields:
             repeated_batch[field_name] = _squeeze_trailing_unit_dim(
                 _tensor_field(data, field_name)
             )
 
         kwargs: dict[str, torch.Tensor] = {}
-        if self._cfg.advantage_policy_logprobs_field is not None:
+        if adv_cfg.policy_logprobs_field is not None:
             kwargs["logprobs_policy"] = _tensor_field(
                 data,
-                self._cfg.advantage_policy_logprobs_field,
+                adv_cfg.policy_logprobs_field,
             )
-        if self._cfg.advantage_reference_logprobs_field is not None:
+        if adv_cfg.reference_logprobs_field is not None:
             kwargs["logprobs_reference"] = _tensor_field(
                 data,
-                self._cfg.advantage_reference_logprobs_field,
+                adv_cfg.reference_logprobs_field,
             )
 
         advantages = self._advantage_estimator.compute_advantage(
@@ -539,25 +494,26 @@ class SingleControllerActor:
             partition_id=meta.partition_id,
             fields=_fields_for_put(
                 meta,
-                {self._cfg.advantage_output_field: advantages},
+                {adv_cfg.output_field: advantages},
             ),
         )
-        return meta.with_fields([self._cfg.advantage_output_field])
+        return meta.with_fields([adv_cfg.output_field])
 
     # ── utility helpers ────────────────────────────────────────────────────
 
     def _advantage_input_fields(self) -> list[str]:
+        adv_cfg = self._mc.advantage
         fields = [
-            self._cfg.advantage_prompt_ids_field,
-            self._cfg.advantage_reward_field,
-            self._cfg.advantage_token_mask_field,
-            self._cfg.advantage_sample_mask_field,
-            *self._cfg.advantage_repeated_batch_fields,
+            adv_cfg.prompt_ids_field,
+            adv_cfg.reward_field,
+            adv_cfg.token_mask_field,
+            adv_cfg.sample_mask_field,
+            *adv_cfg.repeated_batch_fields,
         ]
-        if self._cfg.advantage_policy_logprobs_field is not None:
-            fields.append(self._cfg.advantage_policy_logprobs_field)
-        if self._cfg.advantage_reference_logprobs_field is not None:
-            fields.append(self._cfg.advantage_reference_logprobs_field)
+        if adv_cfg.policy_logprobs_field is not None:
+            fields.append(adv_cfg.policy_logprobs_field)
+        if adv_cfg.reference_logprobs_field is not None:
+            fields.append(adv_cfg.reference_logprobs_field)
         return list(dict.fromkeys(fields))
 
 
