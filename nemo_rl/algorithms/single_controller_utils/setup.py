@@ -35,12 +35,10 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
+import ray
+
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
-from nemo_rl.algorithms.grpo import (
-    MasterConfig as GRPOMasterConfig,
-    _create_advantage_estimator,
-    setup as grpo_setup,
-)
+from nemo_rl.algorithms.grpo import _create_advantage_estimator
 from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.utils import setup_response_data
@@ -48,6 +46,8 @@ from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.utils import create_env
 from nemo_rl.experience.rollout_manager import RolloutManager
+from nemo_rl.models.generation.sglang import SGLangGeneration
+from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
 
 
@@ -59,6 +59,128 @@ def _build_env_handles(
         env_name: create_env(env_name=env_name, env_config=env_config)
         for env_name, env_config in master_config.env.items()
     }
+
+
+def _build_clusters(
+    master_config: MasterConfig,
+) -> tuple[RayVirtualCluster, RayVirtualCluster]:
+    """Allocate the Ray cluster(s) the policy + generation workers run on.
+
+    Colocated mode (the common case) places policy and generation on the
+    same GPUs and returns the same cluster twice. Non-colocated mode
+    splits the node into separate train and inference clusters.
+    """
+    cluster_config = master_config.cluster
+    generation_config = master_config.policy["generation"]
+    colocated = generation_config["colocated"]["enabled"]
+    backend = generation_config["backend"]
+    num_nodes = cluster_config["num_nodes"]
+    gpus_per_node = cluster_config["gpus_per_node"]
+    port_range_low = cluster_config.get("master_port_range_low")
+    port_range_high = cluster_config.get("master_port_range_high")
+
+    if colocated:
+        # Policy + generation share GPUs — one cluster.
+        cluster = RayVirtualCluster(
+            name="sc_policy_cluster",
+            bundle_ct_per_node_list=[gpus_per_node] * num_nodes,
+            use_gpus=True,
+            num_gpus_per_node=gpus_per_node,
+            max_colocated_worker_groups=1 if backend == "megatron" else 2,
+            port_range_low=port_range_low,
+            port_range_high=port_range_high,
+        )
+        return cluster, cluster
+
+    # Non-colocated: split node into train + inference clusters.
+    assert backend != "megatron", (
+        "Non-colocated inference is not supported for Megatron generation backends."
+    )
+    inference_resources = generation_config["colocated"]["resources"]
+    inference_gpus_per_node = inference_resources["gpus_per_node"]
+    inference_nodes = inference_resources["num_nodes"] or 1
+    if num_nodes == 1:
+        train_gpus_per_node = gpus_per_node - inference_gpus_per_node
+        train_nodes = 1
+        assert train_gpus_per_node > 0, (
+            f"Not enough GPUs for training: {gpus_per_node} - {inference_gpus_per_node} = {train_gpus_per_node}"
+        )
+    else:
+        train_gpus_per_node = gpus_per_node
+        train_nodes = num_nodes - inference_nodes
+        assert train_nodes > 0, (
+            f"train_nodes must be > 0: {num_nodes} - {inference_nodes} = {train_nodes}"
+        )
+
+    train_cluster = RayVirtualCluster(
+        name="sc_train_cluster",
+        bundle_ct_per_node_list=[train_gpus_per_node] * train_nodes,
+        use_gpus=True,
+        num_gpus_per_node=train_gpus_per_node,
+        max_colocated_worker_groups=1,
+        port_range_low=port_range_low,
+        port_range_high=port_range_high,
+    )
+    inference_cluster = RayVirtualCluster(
+        name="sc_inference_cluster",
+        bundle_ct_per_node_list=[inference_gpus_per_node] * inference_nodes,
+        use_gpus=True,
+        num_gpus_per_node=inference_gpus_per_node,
+        max_colocated_worker_groups=1,
+        port_range_low=port_range_low,
+        port_range_high=port_range_high,
+    )
+    return train_cluster, inference_cluster
+
+
+def _build_generation(
+    inference_cluster: RayVirtualCluster,
+    master_config: MasterConfig,
+):
+    """Spin up the generation backend (vLLM or SGLang)."""
+    generation_config = master_config.policy["generation"]
+    generation_config["model_name"] = master_config.policy["model_name"]
+    backend = generation_config["backend"]
+    if backend == "vllm":
+        generation_config["vllm_kwargs"]["hf_overrides"] = master_config.policy.get(
+            "hf_config_overrides", {}
+        )
+        gen = VllmGeneration(cluster=inference_cluster, config=generation_config)
+    elif backend == "sglang":
+        generation_config["sglang_cfg"].setdefault(
+            "model_path", master_config.policy["model_name"]
+        )
+        gen = SGLangGeneration(cluster=inference_cluster, config=generation_config)
+    else:
+        raise ValueError(
+            f"single_controller_utils.setup_handle only supports vllm or sglang generation; got {backend!r}"
+        )
+    gen.finish_generation()
+    return gen
+
+
+def _build_trainer(
+    train_cluster: RayVirtualCluster,
+    master_config: MasterConfig,
+    tokenizer,
+    processor,
+):
+    """Build the TQ-mediated trainer (driver-side TQPolicy)."""
+    from nemo_rl.models.policy.tq_policy import TQPolicy
+
+    loss_config = master_config.loss_fn
+    init_reference_model = loss_config.reference_policy_kl_penalty > 0
+    return TQPolicy(
+        cluster=train_cluster,
+        config=master_config.policy,
+        tokenizer=tokenizer,
+        processor=processor,
+        weights_path=None,
+        optimizer_path=None,
+        init_optimizer=True,
+        init_reference_model=init_reference_model,
+        dp_cfg=master_config.data_plane,
+    )
 
 
 def setup_handle(
@@ -77,10 +199,12 @@ def setup_handle(
 ]:
     """Build the four remote handles + two clusters SC drives.
 
-    Delegates the cluster / policy / generation bring-up to
-    :func:`nemo_rl.algorithms.grpo.setup` (with a TQ-mediated policy
-    factory) so the async path stays in sync with the sync trainer. The
-    returned :class:`TQPolicy` is exposed as ``trainer_handle``; in
+    Inlines the cluster / policy / generation bring-up SC needs from
+    :func:`nemo_rl.algorithms.grpo.setup` (without the sync-trainer
+    plumbing the SC path doesn't use — checkpoint resume, NeMo Gym,
+    parallel init, reward-model envs, Megatron generation).
+
+    The returned :class:`TQPolicy` is exposed as ``trainer_handle``; in
     production it must be wrapped in a Ray actor that exposes the
     split-API ``.remote(...)`` calls SC issues — see
     :class:`PolicyTrainerActor` (PR #2692).
@@ -107,47 +231,28 @@ def setup_handle(
             "SingleController path is built on the TransferQueue data plane."
         )
 
-    # TQ-mediated policy factory — same wiring as run_grpo.py uses for the
-    # sync trainer. The TQPolicy ctor bootstraps the data plane controller
-    # and attaches it to worker actors.
-    from nemo_rl.models.policy.tq_policy import TQPolicy
+    train_cluster, inference_cluster = _build_clusters(master_config)
+    # vLLM prefers a clean GPU at load time; generation first in colocated mode.
+    generation = _build_generation(inference_cluster, master_config)
+    policy = _build_trainer(train_cluster, master_config, tokenizer, processor)
 
-    def _make_tq_policy(**kwargs):
-        return TQPolicy(**kwargs, dp_cfg=dp_cfg)
+    # Non-colocated paths must rendezvous policy + generation via NCCL.
+    if not master_config.policy["generation"]["colocated"]["enabled"]:
+        ip, port = train_cluster.get_master_address_and_port()
+        train_world_size = train_cluster.world_size()
+        inference_world_size = inference_cluster.world_size()
+        world_size = train_world_size + inference_world_size
+        ray.get(
+            policy.init_collective(
+                ip, port, world_size, train_world_size=train_world_size
+            )
+            + generation.init_collective(
+                ip, port, world_size, train_world_size=train_world_size
+            )
+        )
 
-    # grpo.setup loads the train dataset itself; setup_single_controller_component
-    # rebuilds the dataset from scratch when SC needs it, so we hand grpo.setup a
-    # throw-away dataset here just to satisfy its signature.
-    placeholder_dataset, placeholder_val_dataset = setup_response_data(
-        tokenizer, master_config.data
-    )
-
-    # ``grpo.setup`` is typed against its own MasterConfig. We're not
-    # subclassing it, so re-emit our config under that schema (the SC
-    # specific fields ride along via ``extra="allow"`` and are ignored).
-    grpo_mc = GRPOMasterConfig(**master_config.model_dump())
-
-    (
-        policy,
-        policy_generation,
-        _nemo_gym,
-        clusters,
-        _dataloader,
-        _val_dataloader,
-        _loss_fn,
-        _logger,
-        _checkpointer,
-        _grpo_save_state,
-        _grpo_mc_out,
-    ) = grpo_setup(
-        grpo_mc,
-        tokenizer,
-        placeholder_dataset,
-        placeholder_val_dataset,
-        processor=processor,
-        policy_factory=_make_tq_policy,
-    )
-    train_cluster, inference_cluster = clusters
+    state_dict_info = policy.prepare_refit_info()
+    generation.prepare_refit_info(state_dict_info)
 
     if env_handles is None:
         env_handles = _build_env_handles(master_config)
@@ -159,7 +264,7 @@ def setup_handle(
     trainer_handle: Any = policy
     return (
         policy.dp_client,
-        policy_generation,
+        generation,
         trainer_handle,
         env_handles,
         train_cluster,
