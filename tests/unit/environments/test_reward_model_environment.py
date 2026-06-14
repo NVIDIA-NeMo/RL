@@ -210,6 +210,12 @@ class TestRewardModelEnvironment:
         assert output.rewards is not None
         assert output.rewards.shape == (2,)
         assert output.rewards.dtype == torch.float32
-        # Verify expected reward values (with tolerance for floating point precision)
-        expected_rewards = torch.tensor([-5.2500, 2.6094])
+        # Verify expected reward values (with tolerance for floating point precision).
+        # The incorrect-answer score is sensitive to the transformers/torch/kernel build
+        # (observed -5.2500 / -5.3750 / -5.4062 across environments); -5.2500 is what the
+        # CI build produces. The version-robust correct>incorrect invariant below is the
+        # primary check.
+        expected_rewards = torch.tensor([-5.2500, 2.6719])
         assert torch.allclose(output.rewards, expected_rewards, atol=1e-1)
+        # Version-robust invariant: correct answer must out-score the incorrect one.
+        assert output.rewards[1] > output.rewards[0]
