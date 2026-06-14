@@ -41,27 +41,30 @@ Therefore, the return batch of `run_multi_turn_rollout` in rollouts.py would hav
 # Add total rewards to the final batch
 current_batch["total_reward"] = total_rewards
 current_batch["truncated"] = sample_truncated
-# Expose per-component rewards (reward1, reward2, ...) for multi-reward envs only; GRPO uses total_reward
+# Expose per-component rewards for multi-reward envs (e.g. GDPO advantage calculation).
 if multi_rewards is not None:
-    num_reward_components = multi_rewards.shape[1]
-    for i in range(num_reward_components):
-        current_batch[f"reward{i + 1}"] = multi_rewards[:, i].clone()
+    for name, reward_tensor in multi_rewards.items():
+        current_batch[name] = reward_tensor
 ```
 
 ### Multi-reward support (GDPO)
 
-Environments can expose a **single reward** (standard GRPO) or **multiple reward components** (for GDPO).
+Environments can expose a **single reward** (standard GRPO) or **multiple named reward components** (for GDPO).
 
-- **Single-reward**: Your env’s `step` returns `rewards` with shape `(batch_size,)`. The rollout stores only `total_reward`. Use `grpo.adv_estimator.name: "grpo"` (default).
-- **Multi-reward**: Your env’s `step` returns `rewards` with shape `(batch_size, num_components)` (e.g. one column per objective). The rollout stores `total_reward` (sum across components) and per-component keys `reward1`, `reward2`, … so GDPO can compute per-component baselines and combine advantages.
+- **Single-reward**: Your env’s `step` returns `rewards` as a `Tensor` of shape `(batch_size,)`. The rollout stores only `total_reward`. Use `grpo.adv_estimator.name: "grpo"` (default).
+- **Multi-reward**: Your env’s `step` returns `rewards` as a `dict[str, Tensor]` mapping component names to per-sample tensors of shape `(batch_size,)`. Each key must use the `reward/` prefix (e.g. `reward/correctness`). The rollout stores `total_reward` (sum across components) and each named component so GDPO can compute per-component baselines and combine advantages.
 
 **Returning multi-reward from the environment**
 
-Return a 2D tensor of shape `(batch_size, num_reward_components)`:
+Return a dict of named reward tensors:
 
 ```python
-# rewards: shape (batch_size, num_reward_components), e.g. (N, 3) for three objectives
-rewards = torch.tensor(results).T.cpu()
+# rewards: dict mapping reward component names to Tensor[batch_size]
+rewards = {
+    "reward/correctness": torch.tensor(correctness_scores, dtype=torch.float32),
+    "reward/integer": torch.tensor(integer_scores, dtype=torch.float32),
+    "reward/format": torch.tensor(format_scores, dtype=torch.float32),
+}
 
 return EnvironmentReturn(
     observations=observations,
@@ -75,19 +78,18 @@ return EnvironmentReturn(
 
 **How the rollout uses it**
 
-When the environment returns 2D rewards, `run_multi_turn_rollout` in `rollouts.py` keeps `total_reward` and also exposes each component as `reward1`, `reward2`, … in the batch. Single-reward envs do not get `reward1` keys; only `total_reward` is stored:
+When the environment returns a dict of rewards, `run_multi_turn_rollout` in `rollouts.py` keeps `total_reward` (sum of all components) and also exposes each named component in the batch. Single-reward envs only store `total_reward`:
 
 ```python
 # Add total rewards to the final batch
 current_batch["total_reward"] = total_rewards
 current_batch["truncated"] = sample_truncated
-# Expose per-component rewards (reward1, reward2, ...) for multi-reward envs only; GRPO uses total_reward
+# Expose per-component rewards for multi-reward envs (e.g. GDPO advantage calculation).
 if multi_rewards is not None:
-    num_reward_components = multi_rewards.shape[1]
-    for i in range(num_reward_components):
-        current_batch[f"reward{i + 1}"] = multi_rewards[:, i].clone()
+    for name, reward_tensor in multi_rewards.items():
+        current_batch[name] = reward_tensor
 ```
-For instance, when running `examples/configs/gdpo_math_1B.yaml`, `reward1` maps to `correctness_reward`, `reward2` to `int_reward`, and `reward3` to `format_reward`. More details can be found in `HFMultiRewardVerifyWorker`. Users can also implement their own environments that support multi-reward GDPO training by following this example.
+For instance, when running `examples/configs/gdpo_math_1B.yaml`, the batch will contain `reward/correctness`, `reward/integer`, and `reward/format`. More details can be found in `HFMultiRewardVerifyWorker`. Users can implement their own multi-reward environments by returning a dict from `step()` with keys using the `reward/` prefix.
 
 ## Code Environment
 

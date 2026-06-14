@@ -14,7 +14,6 @@
 
 import math
 import random
-import re
 import warnings
 from functools import partial, wraps
 from typing import Any, Optional
@@ -32,10 +31,11 @@ from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.utils.logger import Logger
 
 
-def get_gdpo_reward_component_keys(batch) -> list:
-    """Return batch keys that are reward components (reward1, reward2, ...) in sorted order."""
-    keys = [k for k in batch.keys() if re.match(r"reward\d+$", str(k))]
-    return sorted(keys, key=lambda k: int(re.search(r"\d+", str(k)).group()))
+def get_gdpo_reward_component_keys(batch) -> list[str]:
+    """Return batch keys that are named reward components (e.g. reward/correctness) in sorted order."""
+    return sorted(
+        k for k in batch.keys() if isinstance(k, str) and k.startswith("reward/")
+    )
 
 
 def calculate_kl(

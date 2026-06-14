@@ -394,7 +394,8 @@ def calculate_rewards(
         future_to_indices[future] = indices
 
     results = ray.get(futures)
-    all_rewards = []
+    all_rewards: list = []  # list of per-sample scalars/tensors OR None (set below for dict rewards)
+    all_dict_rewards: dict[str, list] | None = None  # for dict-based multi-reward envs
     all_env_observations = []
     all_terminateds = []
     all_next_stop_strings = []
@@ -413,15 +414,29 @@ def calculate_rewards(
             terminateds,
             answers,
         ) = result
+
+        is_dict_rewards = isinstance(task_rewards, dict)
+        num_samples = (
+            len(next(iter(task_rewards.values())))
+            if is_dict_rewards
+            else len(task_rewards)
+        )
+
         if next_stop_strings is None:
-            next_stop_strings = [None] * len(task_rewards)
+            next_stop_strings = [None] * num_samples
         if answers is None:
-            answers = [None] * len(task_rewards)
+            answers = [None] * num_samples
 
         # Store results with their original indices
         for i, idx in enumerate(indices):
             all_indices_order.append(idx)
-            all_rewards.append(task_rewards[i])
+            if is_dict_rewards:
+                if all_dict_rewards is None:
+                    all_dict_rewards = {name: [] for name in task_rewards}
+                for name in task_rewards:
+                    all_dict_rewards[name].append(task_rewards[name][i])
+            else:
+                all_rewards.append(task_rewards[i])
             all_env_observations.append(env_observations[i])
             all_terminateds.append(terminateds[i])
             all_next_stop_strings.append(next_stop_strings[i])
@@ -433,8 +448,13 @@ def calculate_rewards(
         range(len(all_indices_order)), key=lambda k: all_indices_order[k]
     )
 
-    # Stack rewards: each element may be scalar (single-reward env) or 1d (multi-reward env).
-    if len(all_rewards) > 0 and isinstance(all_rewards[0], torch.Tensor):
+    # Build rewards: dict-based for multi-reward envs, tensor for single-reward.
+    if all_dict_rewards is not None:
+        rewards: torch.Tensor | dict[str, torch.Tensor] = {
+            name: torch.stack([vals[i] for i in sorted_indices])
+            for name, vals in all_dict_rewards.items()
+        }
+    elif len(all_rewards) > 0 and isinstance(all_rewards[0], torch.Tensor):
         rewards = torch.stack([all_rewards[i] for i in sorted_indices])
     else:
         rewards = torch.tensor([all_rewards[i] for i in sorted_indices])
@@ -485,9 +505,8 @@ def run_multi_turn_rollout(
     active_indices = torch.arange(batch_size)
     total_rewards = torch.zeros(batch_size, dtype=torch.float32)
 
-    # Multi_rewards: number of components inferred from first env_output (1 for single-reward envs)
-    number_of_rewards: int | None = None
-    multi_rewards: torch.Tensor | None = None
+    # Multi-reward accumulator: dict of {name: Tensor[B]} for multi-reward envs (e.g. GDPO), None for single-reward.
+    multi_rewards: dict[str, torch.Tensor] | None = None
 
     # Initialize stop_strings from the initial batch if present
     current_stop_strings = current_batch.get("stop_strings", [None] * batch_size)
@@ -576,23 +595,20 @@ def run_multi_turn_rollout(
         # Calculate rewards and get environment feedback
         env_output: EnvironmentReturn = calculate_rewards(active_batch, task_to_env)
 
-        # Infer number of reward components on first turn (supports single- and multi-reward envs)
-        if number_of_rewards is None:
-            if env_output.rewards.ndim >= 2:
-                number_of_rewards = int(env_output.rewards.shape[1])
-                multi_rewards = torch.zeros(
-                    batch_size, number_of_rewards, dtype=torch.float32
-                )
-            else:
-                number_of_rewards = 1
-                # multi_rewards left None: GRPO uses total_reward only; multi_rewards unused
-
-        # Accumulate rewards: env may return shape (N,) or (N, K)
-        if number_of_rewards > 1:
+        # Accumulate rewards: env returns dict[str, Tensor] for multi-reward, Tensor for single-reward.
+        if isinstance(env_output.rewards, dict):
+            # Initialize accumulators on first encounter
+            if multi_rewards is None:
+                multi_rewards = {
+                    name: torch.zeros(batch_size, dtype=torch.float32)
+                    for name in env_output.rewards
+                }
             # this assert is to infer the type of multi_rewards for pyrefly
             assert multi_rewards is not None
-            multi_rewards[active_indices] += env_output.rewards
-            total_rewards[active_indices] += env_output.rewards.sum(dim=1)
+            reward_dict: dict[str, torch.Tensor] = multi_rewards
+            for name, r in env_output.rewards.items():
+                reward_dict[name][active_indices] += r
+            total_rewards[active_indices] += sum(env_output.rewards.values())
         else:
             total_rewards[active_indices] += env_output.rewards
 
@@ -671,11 +687,10 @@ def run_multi_turn_rollout(
     # Add total rewards to the final batch
     current_batch["total_reward"] = total_rewards
     current_batch["truncated"] = sample_truncated
-    # Expose per-component rewards (reward1, reward2, ...) for multi-reward envs only; GRPO uses total_reward
+    # Expose per-component rewards for multi-reward envs (e.g. GDPO advantage calculation).
     if multi_rewards is not None:
-        num_reward_components = multi_rewards.shape[1]
-        for i in range(num_reward_components):
-            current_batch[f"reward{i + 1}"] = multi_rewards[:, i].clone()
+        for name, reward_tensor in multi_rewards.items():
+            current_batch[name] = reward_tensor
 
     # Calculate aggregate metrics
     rollout_metrics = {
@@ -806,9 +821,7 @@ async def run_sample_multi_turn_rollout(
 
     # Sample-level metrics
     total_reward = 0.0
-    reward_acc_list: list[
-        float
-    ] = []  # per-component rewards, length set on first multi-reward
+    reward_acc_dict: dict[str, float] = {}  # per-component reward accumulators (named)
     multi_reward_seen = False
     turn_count = 0
     token_count = 0
@@ -889,15 +902,14 @@ async def run_sample_multi_turn_rollout(
         env_output = await asyncio.to_thread(
             calculate_rewards, sample_batch, task_to_env
         )
-        # Update total reward and optional per-reward signals (reward1, reward2, ... rewardN)
-        if env_output.rewards.ndim == 2 and env_output.rewards.shape[1] >= 1:
+        # Update total reward and optional per-component reward signals.
+        if isinstance(env_output.rewards, dict):
             multi_reward_seen = True
-            n = env_output.rewards.shape[1]
-            if len(reward_acc_list) == 0:
-                reward_acc_list = [0.0] * n
-            total_reward += float(env_output.rewards[0].sum().item())
-            for j in range(n):
-                reward_acc_list[j] += float(env_output.rewards[0, j].item())
+            for name, r in env_output.rewards.items():
+                reward_acc_dict[name] = reward_acc_dict.get(name, 0.0) + float(
+                    r[0].item()
+                )
+            total_reward += sum(float(r[0].item()) for r in env_output.rewards.values())
         else:
             total_reward += float(env_output.rewards[0].item())
         # Check termination
@@ -950,8 +962,8 @@ async def run_sample_multi_turn_rollout(
         "idx": sample_idx,
     }
     if multi_reward_seen:
-        for j in range(len(reward_acc_list)):
-            final_sample_state[f"reward{j + 1}"] = torch.tensor(reward_acc_list[j])
+        for name, acc in reward_acc_dict.items():
+            final_sample_state[name] = torch.tensor(acc)
 
     # Sample metrics
     sample_metrics = {
@@ -1075,19 +1087,15 @@ def run_async_multi_turn_rollout(
             }
         )
 
-        # Expose per-component rewards (reward1, reward2, ...) for multi-reward envs for GDPO advantage calculation.
-        # Collect all reward component keys from any sample state (samples may come from different envs).
+        # Expose per-component rewards for multi-reward envs (GDPO advantage calculation).
+        # Collect named reward keys (e.g. "reward/correctness") from sample states.
         reward_component_keys = sorted(
             set(
                 k
                 for state in final_sample_states
                 for k in state
-                if isinstance(k, str)
-                and k.startswith("reward")
-                and len(k) > 6
-                and k[6:].isdigit()
-            ),
-            key=lambda k: int(k[6:]),
+                if isinstance(k, str) and k.startswith("reward/")
+            )
         )
         for key in reward_component_keys:
             # Stack per-sample values; use 0.0 for samples that did not have this component (e.g. single-reward env)

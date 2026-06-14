@@ -32,7 +32,6 @@ from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     calculate_kl,
-    get_gdpo_reward_component_keys,
     masked_mean,
     masked_var,
 )
@@ -103,29 +102,33 @@ class GDPOAdvantageEstimator:
         Args:
             prompt_ids: Tensor identifying which prompt each sample belongs to (for per-prompt baselines).
             rewards: Unused; for interface consistency.
-            repeated_batch: Batch containing reward1, reward2, ... keys.
+            repeated_batch: Batch containing named reward component keys (e.g. reward/correctness, reward/format).
             mask: Response token mask of shape [batch_size, seq_len], 1 for valid response tokens, 0 for padding.
             **kwargs: Additional arguments (unused).
 
         Returns:
             Advantages tensor of shape [batch_size, seq_len].
         """
-        reward_component_keys = get_gdpo_reward_component_keys(repeated_batch)
-        if len(reward_component_keys) < 2:
+        reward_components = {
+            k: repeated_batch[k]
+            for k in repeated_batch
+            if isinstance(k, str) and k.startswith("reward/")
+        }
+        if len(reward_components) < 2:
             raise ValueError(
-                f"GDPO requires multiple reward components (reward1, reward2, ...). "
-                f"This batch has {len(reward_component_keys)} component(s). "
+                f"GDPO requires multiple reward components (reward/name1, reward/name2, ...). "
+                f"This batch has {len(reward_components)} component(s): {list(reward_components.keys())}. "
                 "Switch to GRPO by setting grpo.adv_estimator.name to 'grpo' in your config."
             )
-        valid = torch.ones_like(repeated_batch[reward_component_keys[0]])
+        first_reward = next(iter(reward_components.values()))
+        valid = torch.ones_like(first_reward)
         leave_one_out = self.use_leave_one_out_baseline
         assert prompt_ids.shape[0] == valid.shape[0], (
             "prompt_ids must match reward batch size; "
             f"got {prompt_ids.shape[0]} vs {valid.shape[0]}"
         )
         advantage_parts = []
-        for key in reward_component_keys:
-            r = repeated_batch[key]
+        for key, r in sorted(reward_components.items()):
             base, std_k = calculate_baseline_and_std_per_prompt(
                 prompt_ids,
                 r,
