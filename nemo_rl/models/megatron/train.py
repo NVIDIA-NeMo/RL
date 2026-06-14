@@ -218,6 +218,9 @@ def forward_with_post_processing_fn(
                 use_linear_ce_fusion_loss=use_linear_ce_fusion_loss,
             )
     except Exception:
+        # The forward above armed the router-replay action (set_router_replay_forward);
+        # if it raised, clear that armed state so stale replay action/indices do not
+        # leak into the next microbatch, then re-raise the original error unchanged.
         if use_router_replay:
             clear_router_replay(model)
         raise

@@ -112,7 +112,12 @@ def _torch_rank_info() -> dict[str, Any]:
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             info["rank"] = int(torch.distributed.get_rank())
             info["world_size"] = int(torch.distributed.get_world_size())
-    except Exception:
+    except (ImportError, RuntimeError):
+        # Best-effort rank annotation for the (default-off) diagnostic traces:
+        # torch may be absent (it is imported lazily so this module loads in
+        # torch-free contexts), or the process group may be torn down between
+        # the is_initialized() check and get_rank(). Trace writing must never
+        # fail over optional metadata, so fall open.
         pass
     return info
 

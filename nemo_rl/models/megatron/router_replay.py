@@ -317,8 +317,6 @@ def _install_missing_route_fallback_patch() -> None:
         target_topk_idx = target_topk_idx.to(scores.device)
         fallback_mask = target_topk_idx.eq(_MISSING_ROUTE_SENTINEL).all(dim=-1)
         if not bool(fallback_mask.any().item()):
-            setattr(replay_instance, "_nrl_last_router_replay_fallback_mask", None)
-            setattr(replay_instance, "_nrl_last_router_replay_effective_topk_idx", None)
             return original_get_replay_topk(
                 replay_instance,
                 scores,
@@ -350,16 +348,6 @@ def _install_missing_route_fallback_patch() -> None:
         else:
             getattr(replay_instance, "replay_backward_list").pop(0)
 
-        setattr(
-            replay_instance,
-            "_nrl_last_router_replay_fallback_mask",
-            fallback_mask.detach(),
-        )
-        setattr(
-            replay_instance,
-            "_nrl_last_router_replay_effective_topk_idx",
-            effective_topk_idx.detach(),
-        )
         return probs, effective_topk_idx
 
     setattr(wrapped_get_replay_topk, _MISSING_ROUTE_FALLBACK_PATCH_ATTR, True)

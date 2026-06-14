@@ -403,7 +403,7 @@ class MegatronPolicyWorkerImpl(
     def _disable_forward_pre_hook_until_next_train_step(self) -> None:
         assert isinstance(self.model, DistributedDataParallel)
         if self._forward_pre_hook_enabled():
-            self.model.disable_forward_pre_hook(param_sync=False)
+            self.disable_forward_pre_hook(param_sync=False)
         model_config = get_model_config(self.model)
         self._first_train_step_param_sync_func = model_config.param_sync_func
         model_config.param_sync_func = None
