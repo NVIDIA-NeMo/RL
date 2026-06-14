@@ -13,14 +13,18 @@
 # limitations under the License.
 
 
-import functools
 import os
+from functools import partial
 from pathlib import Path
 
 import modelopt.torch.quantization as mtq
 import torch
 import torch.nn as nn
 from megatron.bridge.models.gpt_provider import transformer_engine_layer_spec
+from megatron.bridge.models.mamba.mamba_provider import (
+    modelopt_mamba_stack_spec,
+    transformer_engine_mamba_stack_spec,
+)
 from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
 from modelopt.torch.quantization.config import need_calibration
 from modelopt.torch.utils.dataset_utils import (
@@ -164,17 +168,31 @@ def get_modelopt_checkpoint_dir() -> str:
     return modelopt_checkpoint_dir
 
 
-def get_quantization_layer_spec():
-    """Build the ModelOpt quantization transformer-layer spec as a portable target.
+def get_quantization_layer_spec(
+    disable_modelopt_layer_spec: bool = False,
+):
+    """Return a checkpoint-serializable GPT layer-spec callback.
 
-    Returns `partial` function to allow Megatron-Bridge's allowlist to accept the layer spec.
+    Megatron-Bridge serializes ``transformer_layer_spec`` as the callback's
+    importable target. Return Megatron functions/partials directly so saved
+    configs stay within the built-in target allowlist. The partial keeps the
+    sequence-packing requirement of disabling arbitrary attention masks.
     """
-    if int(os.environ.get("DISABLE_MODELOPT_LAYER_SPEC", "0")):
+    if disable_modelopt_layer_spec:
         return transformer_engine_layer_spec
-    return functools.partial(
+    return partial(
         get_gpt_modelopt_spec,
         local_core_attention=False,
         remap_te_layernorm=True,
         real_quant_cfg="None",
         use_arbitrary_attention_mask=False,
     )
+
+
+def get_quantization_mamba_stack_spec(
+    disable_modelopt_layer_spec: bool = False,
+):
+    """Return a checkpoint-serializable Mamba stack-spec callback."""
+    if disable_modelopt_layer_spec:
+        return transformer_engine_mamba_stack_spec
+    return modelopt_mamba_stack_spec

@@ -1,0 +1,75 @@
+# Nano3 Quantization-Aware RL (QARL) with Megatron, vLLM, and ModelOpt.
+#
+# This config layers Nano3 NVFP4 weight-only quantization onto a full-parameter
+# Nano3 Megatron GRPO setup. LoRA/PEFT is intentionally out of scope here.
+#
+# Example usage:
+#   uv run examples/run_grpo.py --config examples/modelopt/qa_grpo_nano3_megatron.yaml
+
+defaults: "../configs/grpo_math_1B.yaml"
+
+grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 8
+
+policy:
+  model_name: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16"
+  tokenizer:
+    name: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
+  train_global_batch_size: 16
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 2048
+  disable_modelopt_layer_spec: true
+
+  # Nano3 is a hybrid MoE/Mamba model. This recipe keeps attention and the
+  # known Nano3-sensitive layers in BF16, while applying NVFP4 to weights.
+  quant_cfg: "examples/modelopt/quant_configs/nano3_nvfp4_weightonly.yaml"
+  quant_calib_data: "cnn_dailymail"
+  quant_calib_size: 512
+  quant_batch_size: 1
+  quant_sequence_length: 2048
+
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    bias_activation_fusion: false
+    tensor_model_parallel_size: 2
+    expert_model_parallel_size: 8
+    sequence_parallel: true
+    # ModelOpt quantization is incompatible with gradient accumulation fusion.
+    gradient_accumulation_fusion: false
+  sequence_packing:
+    enabled: false
+
+  # Nano3 GRPO uses sequence parallelism with TP=2 in the base recipe, so
+  # rollout/logprob batches must pad sequence length to the TP multiple.
+  make_sequence_length_divisible_by: ${.megatron_cfg.tensor_model_parallel_size}
+
+  generation:
+    # Match the student's quantization recipe during vLLM rollouts.
+    quant_cfg: "examples/modelopt/quant_configs/nano3_nvfp4_weightonly.yaml"
+    vllm_cfg:
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.7
+    vllm_kwargs:
+      # Nano3 Mamba cache is numerically safer in FP32 during generation.
+      mamba_ssm_cache_dtype: "float32"
+      compilation_config:
+        backend: "eager"
+
+checkpointing:
+  checkpoint_dir: "results/qa_grpo_nano3_megatron"
+
+logger:
+  log_dir: "logs/qa_grpo_nano3_megatron"
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: "nemo-rl"
+    name: "qa-grpo-nano3-megatron"
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2
