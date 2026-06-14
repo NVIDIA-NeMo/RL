@@ -14,14 +14,10 @@
 
 """Async GRPO launcher driven by the SingleController actor.
 
-Wires together :func:`setup_handle` (the four remote handles) and
-:class:`SingleControllerActor` (which builds the six local components
-internally via :func:`setup_single_controller_component`). Mirrors
-``run_grpo.py`` for the synchronous path; everything before
-``setup_handle`` is identical so the same YAML configs apply.
-
-``data_plane.enabled=true`` is mandatory — SC is built on the
-TransferQueue data plane.
+Wires together setup_handle (the four remote handles) and
+SingleControllerActor (which builds the local components inside its
+actor process). Mirrors run_grpo.py up to setup_handle so the same YAML
+configs apply. data_plane.enabled=true is mandatory.
 """
 
 import argparse

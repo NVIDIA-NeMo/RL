@@ -14,17 +14,11 @@
 
 """Configuration schema for the SingleController async-RL path.
 
-Sibling to :class:`nemo_rl.algorithms.grpo.MasterConfig` — *not* a
-subclass. Both top-level configs share the same set of cross-cutting
-component sub-configs (policy, data, cluster, …) because the underlying
-machinery is the same, but the SC entrypoint owns its own root so
-SC-specific knobs aren't bolted onto the sync trainer's config and
-vice versa.
-
-Follows the v2 (BaseModel) convention from
-``docs/design-docs/design-and-philosophy.md``: SC-specific sub-configs
-declared here carry their defaults on the field, with ``extra="allow"``
-so older configs that don't yet name every key continue to load.
+Sibling of nemo_rl.algorithms.grpo.MasterConfig — not a subclass. SC
+owns its own root so SC-specific knobs don't bolt onto the sync
+trainer's config. Sub-configs follow the v2 BaseModel convention from
+docs/design-docs/design-and-philosophy.md: defaults live on the field,
+extra="allow" tolerates older YAMLs.
 """
 
 from __future__ import annotations
@@ -48,9 +42,7 @@ from nemo_rl.utils.checkpoint import CheckpointingConfig
 class StalenessConfig(BaseModel, extra="allow"):
     """Selection-window + on-policy enforcement knobs.
 
-    The sampler reads these to decide which buffered prompt groups are
-    eligible for the next train step. ``strict_on_policy`` forces
-    ``max_weight_staleness_versions`` to 0 at SC start-up.
+    strict_on_policy forces max_weight_staleness_versions=0 at SC start-up.
     """
 
     max_weight_staleness_versions: int = 1
@@ -66,9 +58,9 @@ class StalenessConfig(BaseModel, extra="allow"):
 class ConcurrencyConfig(BaseModel, extra="allow"):
     """Pump-level concurrency caps.
 
-    ``max_inflight_prompts`` bounds rollouts in flight at once;
-    ``max_buffered_rollouts`` sizes the backpressure semaphore so the
-    rollout pump blocks once that many groups sit in DataPlane unread.
+    max_inflight_prompts bounds rollouts in flight; max_buffered_rollouts
+    sizes the backpressure semaphore so rollouts block once that many
+    unread groups sit in DataPlane.
     """
 
     max_inflight_prompts: int = 8
@@ -78,8 +70,8 @@ class ConcurrencyConfig(BaseModel, extra="allow"):
 class TrainingConfig(BaseModel, extra="allow"):
     """Outer training loop limits.
 
-    ``max_num_epochs=None`` lets the rollout pump cycle the dataloader
-    until SC is cancelled.
+    max_num_epochs=None lets the rollout pump cycle the dataloader until
+    SC is cancelled.
     """
 
     max_train_steps: int = 10
@@ -89,9 +81,9 @@ class TrainingConfig(BaseModel, extra="allow"):
 class AdvantageConfig(BaseModel, extra="allow"):
     """SC's prompt-group-scoped advantage stage.
 
-    SC owns this stage because the selected ``KVBatchMeta`` still
-    contains whole prompt groups before the trainer's DP sharding. Field
-    names address columns in DataPlane.
+    SC owns this stage because the selected KVBatchMeta still contains
+    whole prompt groups before the trainer's DP sharding. Field names
+    address columns in DataPlane.
     """
 
     enabled: bool = False
@@ -108,9 +100,9 @@ class AdvantageConfig(BaseModel, extra="allow"):
 class WeightSyncConfig(BaseModel, extra="allow"):
     """Weight-transport backend selection.
 
-    ``transport="stub"`` is the dry-run sentinel; ``"nccl"`` is the
-    production collective path. NCCL coordinates rendezvous via
-    ``nccl_addr`` + ``nccl_port`` (port=None lets the cluster pick).
+    transport=stub is the dry-run sentinel; nccl is the production
+    collective path. NCCL rendezvous on nccl_addr + nccl_port (port=None
+    lets the cluster pick).
     """
 
     transport: str = "stub"
@@ -122,19 +114,15 @@ class WeightSyncConfig(BaseModel, extra="allow"):
 
 
 class MasterConfig(BaseModel, extra="allow"):
-    """Top-level config for ``examples/run_grpo_single_controller.py``.
+    """Top-level config for examples/run_grpo_single_controller.py.
 
-    Independent of :class:`nemo_rl.algorithms.grpo.MasterConfig` —
-    they're peers, not parent/child. Cross-cutting components
-    (``policy``, ``loss_fn``, ``data``, ``cluster``, ``checkpointing``,
-    ``data_plane``) are reused via the same TypedDict schemas the sync
-    trainer uses; SC-specific knobs (``staleness``, ``concurrency``,
-    ``training``, ``advantage``, ``weight_sync``) hang off the root in
-    per-component sub-configs so users can override individual sections
-    via Hydra without touching the others.
+    Peer of grpo.MasterConfig — not a subclass. Cross-cutting components
+    (policy, loss_fn, data, cluster, checkpointing, data_plane) reuse the
+    sync trainer's schemas; SC-specific knobs (staleness, concurrency,
+    training, advantage, weight_sync) hang off the root per-component so
+    individual sections override via Hydra without touching the others.
 
-    ``data_plane`` is required (no ``Optional``) — SC is built on the
-    TransferQueue data plane.
+    data_plane is required (no Optional) — SC is built on the TQ data plane.
     """
 
     # Cross-cutting components (same shape as grpo.MasterConfig).
