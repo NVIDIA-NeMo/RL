@@ -23,8 +23,6 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     WeightSyncConfig,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import (
-    SingleControllerComponents,
-    SingleControllerHandles,
     setup_handle,
     setup_single_controller_component,
 )
@@ -33,8 +31,6 @@ __all__ = [
     "AdvantageConfig",
     "ConcurrencyConfig",
     "MasterConfig",
-    "SingleControllerComponents",
-    "SingleControllerHandles",
     "StalenessConfig",
     "TrainingConfig",
     "WeightSyncConfig",

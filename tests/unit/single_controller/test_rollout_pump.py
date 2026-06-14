@@ -34,8 +34,6 @@ from nemo_rl.algorithms.single_controller_utils import (
     AdvantageConfig,
     ConcurrencyConfig,
     MasterConfig,
-    SingleControllerComponents,
-    SingleControllerHandles,
     StalenessConfig,
     TrainingConfig,
 )
@@ -217,31 +215,16 @@ def test_rollout_pump_writes_expected_tq_data(
         use_nemo_gym=False,
         tq_buffer=tq_buffer,
     )
-    handles = SingleControllerHandles(
+    ctrl = SingleControllerActor.remote(
+        master_config=mc,
         dp_client=dp_adapter,
         gen_handle=vllm_generation,
         trainer_handle=object(),
         env_handles=env_handles,
-        train_cluster=None,  # type: ignore[arg-type]
-        inference_cluster=None,  # type: ignore[arg-type]
-        loss_fn=None,
+        train_cluster=None,
+        inference_cluster=None,
         dataset=None,
-        val_dataset=None,
-        master_config=None,  # type: ignore[arg-type]
-    )
-    components = SingleControllerComponents(
-        dataloader=dataloader,
-        weight_synchronizer=object(),
-        advantage_estimator=None,
-        tokenizer=tokenizer,
-        rollout_manager=rollout_manager,
-        tq_buffer=tq_buffer,
-    )
-    ctrl = SingleControllerActor.remote(
-        master_config=mc,
-        handles=handles,
-        tokenizer=tokenizer,
-        components=components,
+        components=(dataloader, object(), None, rollout_manager, tq_buffer),
     )
 
     vllm_generation.prepare_for_generation()

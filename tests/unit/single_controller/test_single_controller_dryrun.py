@@ -54,8 +54,6 @@ from nemo_rl.algorithms.single_controller_utils import (
     AdvantageConfig,
     ConcurrencyConfig,
     MasterConfig,
-    SingleControllerComponents,
-    SingleControllerHandles,
     StalenessConfig,
     TrainingConfig,
 )
@@ -108,52 +106,6 @@ def _make_test_master_config(
     # (policy, data, cluster, …) — fine for dry-run tests that drive SC via
     # injected components.
     return MasterConfig.model_construct(**sc_subset)
-
-
-def _make_test_handles(
-    dp_client,
-    gen,
-    trainer,
-    env_handles,
-):
-    """Bundle the test-side stubs into a SingleControllerHandles.
-
-    The optional carry-forward fields (clusters / loss_fn / dataset /
-    val_dataset / master_config) are unused when ``components`` is also
-    supplied, so we pass ``None``.
-    """
-    return SingleControllerHandles(
-        dp_client=dp_client,
-        gen_handle=gen,
-        trainer_handle=trainer,
-        env_handles=env_handles,
-        train_cluster=None,  # type: ignore[arg-type]
-        inference_cluster=None,  # type: ignore[arg-type]
-        loss_fn=None,
-        dataset=None,
-        val_dataset=None,
-        master_config=None,  # type: ignore[arg-type]
-    )
-
-
-def _make_test_components(
-    *,
-    dataloader,
-    weight_synchronizer,
-    rollout_manager,
-    tq_buffer,
-    advantage_estimator=None,
-    tokenizer=None,
-):
-    """Bundle the test-side fakes into a SingleControllerComponents."""
-    return SingleControllerComponents(
-        dataloader=dataloader,
-        weight_synchronizer=weight_synchronizer,
-        advantage_estimator=advantage_estimator,
-        tokenizer=tokenizer,
-        rollout_manager=rollout_manager,
-        tq_buffer=tq_buffer,
-    )
 
 # ── Fake in-memory DataPlane ──────────────────────────────────────────────
 
@@ -651,18 +603,22 @@ class TestSingleControllerDryRun:
         if weight_sync is None:
             weight_sync = DryRunWeightSynchronizer()
 
-        handles = _make_test_handles(dp_client, gen, trainer, env_handles={})
-        components = _make_test_components(
-            dataloader=dataloader,
-            weight_synchronizer=weight_sync,
-            rollout_manager=rollout_manager,
-            tq_buffer=tq_buffer,
-            advantage_estimator=advantage_estimator,
-        )
         return SingleControllerActor.remote(
             master_config=mc,
-            handles=handles,
-            components=components,
+            dp_client=dp_client,
+            gen_handle=gen,
+            trainer_handle=trainer,
+            env_handles={},
+            train_cluster=None,
+            inference_cluster=None,
+            dataset=None,
+            components=(
+                dataloader,
+                weight_sync,
+                advantage_estimator,
+                rollout_manager,
+                tq_buffer,
+            ),
         )
 
     def test_dry_run_completes(self, ray_init):
@@ -1059,18 +1015,16 @@ class TestStreamingTrainPump:
         )
         rollout_manager = DryRunRolloutManager(gen, tq_buffer)
 
-        handles = _make_test_handles(dp_client, gen, trainer, env_handles={})
-        components = _make_test_components(
-            dataloader=dataloader,
-            weight_synchronizer=weight_sync,
-            rollout_manager=rollout_manager,
-            tq_buffer=tq_buffer,
-            advantage_estimator=None,
-        )
         return SingleControllerActor.remote(
             master_config=mc,
-            handles=handles,
-            components=components,
+            dp_client=dp_client,
+            gen_handle=gen,
+            trainer_handle=trainer,
+            env_handles={},
+            train_cluster=None,
+            inference_cluster=None,
+            dataset=None,
+            components=(dataloader, weight_sync, None, rollout_manager, tq_buffer),
         )
 
     def test_streaming_dispatches_in_arrival_order(self, ray_init):
