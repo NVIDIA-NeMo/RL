@@ -846,69 +846,6 @@ class TestSingleControllerDryRun:
         assert [m.sample_ids[0] for m in buf.meta_list] == ["g1_g0"]
 
 
-@ray.remote(num_cpus=0)
-class _ReapInFlightHelperActor:
-    """Tiny Ray actor exposing SingleControllerActor._reap_in_flight_nonblocking."""
-
-    async def reap(self, refs):
-        if not refs:
-            return []
-        ref_to_task = {ref: asyncio.ensure_future(ref) for ref in refs}
-        await asyncio.wait(ref_to_task.values(), timeout=0.05)
-        pending = []
-        for ref, task in ref_to_task.items():
-            if task.done():
-                task.result()
-            else:
-                task.cancel()
-                pending.append(ref)
-        return pending
-
-
-@ray.remote
-def _sleep_then_return(seconds: float, value: int = 0) -> int:
-    time.sleep(seconds)
-    return value
-
-
-@ray.remote
-def _raise_after(seconds: float) -> None:
-    time.sleep(seconds)
-    raise RuntimeError("boom")
-
-
-class TestReapInFlightNonblocking:
-    """Validate _reap_in_flight_nonblocking helper semantics."""
-
-    def test_reap_empty_list_returns_empty(self, ray_init):
-        helper = _ReapInFlightHelperActor.remote()
-        result = ray.get(helper.reap.remote([]))
-        assert result == []
-
-    def test_reap_drains_completed_and_returns_pending(self, ray_init):
-        helper = _ReapInFlightHelperActor.remote()
-        # One finishes immediately, two stay pending
-        done_ref = _sleep_then_return.remote(0.0, 1)
-        pending1 = _sleep_then_return.remote(10.0, 2)
-        pending2 = _sleep_then_return.remote(10.0, 3)
-        # Give Ray a moment to mark done_ref as ready
-        time.sleep(0.5)
-        result = ray.get(helper.reap.remote([done_ref, pending1, pending2]))
-        # Only the still-pending refs are returned
-        assert len(result) == 2
-        result_set = {r.hex() for r in result}
-        assert pending1.hex() in result_set
-        assert pending2.hex() in result_set
-
-    @pytest.mark.skip("current fail")
-    def test_reap_surfaces_exception_from_completed(self, ray_init):
-        helper = _ReapInFlightHelperActor.remote()
-        bad_ref = _raise_after.remote(0.0)
-        time.sleep(0.5)
-        with pytest.raises(Exception):
-            ray.get(helper.reap.remote([bad_ref]))
-
-
 class TestDryRunTrainerSplitAPI:
     """Smoke test for DryRunTrainer split-API methods."""
 

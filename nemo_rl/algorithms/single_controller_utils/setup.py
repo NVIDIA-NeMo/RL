@@ -45,7 +45,7 @@ from nemo_rl.environments.utils import create_env
 from nemo_rl.experience.rollout_manager import RolloutManager
 from nemo_rl.models.generation.sglang import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
-from nemo_rl.models.policy.tq_policy import TQPolicyActor
+from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
 
 
@@ -161,7 +161,7 @@ def _build_trainer(
     """Build the TQ-mediated trainer (driver-side TQPolicy)."""
     loss_config = master_config.loss_fn
     init_reference_model = loss_config.reference_policy_kl_penalty > 0
-    return TQPolicyActor.remote(
+    return TQPolicy(
         cluster=train_cluster,
         config=master_config.policy,
         tokenizer=tokenizer,
@@ -237,6 +237,7 @@ def setup_handle(
     if env_handles is None:
         env_handles = _build_env_handles(master_config)
     
+    # TODO: Use TQPolicy instead of TQPolicy once #2692 lands.
     return (
         generation,
         policy,

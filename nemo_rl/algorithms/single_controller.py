@@ -152,6 +152,10 @@ class SingleControllerActor:
         # instances. Rebind so the writer and the sampler share one.
         self._rollout_manager._tq_buffer = self._buffer
 
+        # Pin clusters so RayVirtualCluster.__del__ doesn't remove the PGs.
+        self._train_cluster = train_cluster
+        self._inference_cluster = inference_cluster
+
         if self._async_cfg.target_prompt_groups_per_step is None:
             self._async_cfg.target_prompt_groups_per_step = (
                 self._async_cfg.min_prompt_groups_per_batch
@@ -239,29 +243,6 @@ class SingleControllerActor:
         """Await a Ray ObjectRef without blocking the asyncio event loop."""
         return await obj_ref
 
-    async def _reap_in_flight_nonblocking(
-        self, refs: list[ray.ObjectRef]
-    ) -> list[ray.ObjectRef]:
-        """Drain completed refs without blocking; return still-pending refs.
-
-        Uses ``asyncio.wait`` with ``timeout=0`` so Ray ObjectRefs are checked
-        through their awaitable interface (which is accurate in async actors).
-        ``ray.wait(timeout=0)`` does not always reflect cross-process ref
-        readiness from an async actor, so we avoid it here.
-        """
-        if not refs:
-            return []
-        ref_to_task = {ref: asyncio.ensure_future(ref) for ref in refs}
-        await asyncio.wait(ref_to_task.values(), timeout=0.05)
-        pending: list[ray.ObjectRef] = []
-        for ref, task in ref_to_task.items():
-            if task.done():
-                task.result()  # surface exceptions; payload ignored
-            else:
-                task.cancel()
-                pending.append(ref)
-        return pending
-
     async def _call_dp(self, method_name: str, **kwargs) -> Any:
         """Call a DataPlaneClient method or a Ray actor exposing that method."""
         method = getattr(self._dp_client, method_name)
@@ -337,9 +318,14 @@ class SingleControllerActor:
              buffer; DP rows survive so the trainer can read them. Already trainable —
              buffer wrote training-shaped rows at rollout time.
           3. _advantage_pump(train_meta).
-          4. trainer.train_on_meta(train_meta, dp_client).
+          4. trainer.train_microbatch_from_meta + finish_train_step.
           5. dp_client.clear_samples on consumed sample_ids; release _buffer_capacity
              per dropped group, then sync.
+
+        Train microbatches run synchronously inside the asyncio event loop:
+        driver-side TQPolicy blocks on worker results. Restore in-flight
+        reaping for rollout/train overlap once PR #2692 lands an async
+        variant of train_microbatch_from_meta.
         """
         adv_cfg = self._advantage_cfg
         grpo_cfg = self._master_config.grpo
@@ -356,7 +342,6 @@ class SingleControllerActor:
             assert self._async_cfg.target_prompt_groups_per_step is not None
             target_groups: int = self._async_cfg.target_prompt_groups_per_step
             groups_dispatched = 0
-            in_flight: list[ray.ObjectRef] = []
             step_open = False
 
             evicted = await self._sampler.evict(
@@ -385,39 +370,26 @@ class SingleControllerActor:
                     self._buffer_capacity.release()
 
                 if logprobs_required:
-                    await self._ray_get(
-                        self._trainer.prepare_logprobs_from_meta.remote(train_meta)
-                    )
+                    self._trainer.prepare_logprobs_from_meta(train_meta)
 
                 train_meta = await self._advantage_pump(train_meta)
 
                 if not step_open:
-                    await self._ray_get(
-                        self._trainer.begin_train_step.remote(
-                            step_id, loss_fn=self._loss_fn
-                        )
-                    )
+                    self._trainer.begin_train_step(step_id, loss_fn=self._loss_fn)
                     step_open = True
 
-                future = self._trainer.train_microbatch_from_meta.remote(
-                    step_id, train_meta
-                )
-                in_flight.append(future)
+                # Driver-side TQPolicy blocks until worker results land; we drop
+                # the per-microbatch dict and surface aggregated metrics from
+                # finish_train_step instead.
+                self._trainer.train_microbatch_from_meta(step_id, train_meta)
                 groups_dispatched += num_groups
                 self._step_consumed_sample_ids.extend(train_meta.sample_ids)
-
-                in_flight = await self._reap_in_flight_nonblocking(in_flight)
-
-            for fut in in_flight:
-                await self._ray_get(fut)
 
             if not step_open:
                 log.info("train_pump: rollout exhausted before any group ready")
                 break
 
-            result = await self._ray_get(
-                self._trainer.finish_train_step.remote(step_id)
-            )
+            result = self._trainer.finish_train_step(step_id)
             consumed_ids = list(self._step_consumed_sample_ids)
             self._step_consumed_sample_ids = []
             await self._call_dp(

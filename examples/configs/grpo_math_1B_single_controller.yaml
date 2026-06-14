@@ -98,7 +98,7 @@ policy:
 
   dtensor_cfg:
     _v2: true
-    enabled: true
+    enabled: false
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: false
@@ -119,7 +119,7 @@ policy:
       use_triton: true
 
   megatron_cfg:
-    enabled: false
+    enabled: true
     force_reconvert_from_hf: False
     empty_unused_memory_level: 1
     activation_checkpointing: false
@@ -276,10 +276,10 @@ policy:
       vllm_metrics_logger_interval: 0.5
     vllm_kwargs: {}
     colocated:
-      enabled: true
+      enabled: false
       resources:
-        gpus_per_node: null
-        num_nodes: null
+        gpus_per_node: 1
+        num_nodes: 1
 
 data:
   max_input_seq_length: ${policy.max_total_sequence_length}
@@ -325,12 +325,6 @@ logger:
     collection_interval: 10
     flush_interval: 10
 
-cluster:
-  gpus_per_node: 1
-  num_nodes: 1
-  master_port_range_low: 25000
-  master_port_range_high: 28000
-
 # TransferQueue data plane — required by the SingleController path.
 data_plane:
   enabled: true
@@ -350,3 +344,9 @@ async_rl:
   batch_selection_strategy: "strict_on_policy"  # or "staleness_window"
   max_inflight_prompts: 8
   max_buffered_rollouts: 8
+
+cluster:
+  gpus_per_node: 2
+  num_nodes: 1
+  master_port_range_low: 25000
+  master_port_range_high: 28000

@@ -563,10 +563,3 @@ class TQPolicy(Policy):
 
         if self.flops_tracker is not None:
             self.flops_tracker.reset()
-
-
-# TODO: Remove this once PR #2692 lands.
-@ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
-class TQPolicyActor(TQPolicy):
-    """Ray-actor wrapper around TQPolicy."""
-    pass
