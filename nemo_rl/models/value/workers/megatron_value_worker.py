@@ -276,6 +276,31 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
         else:
             return f"{self.__class__.__qualname__}"
 
+    @staticmethod
+    def configure_worker(
+        num_gpus: int | float,
+        bundle_indices: Optional[tuple[int, list[int]]] = None,
+    ) -> tuple[dict[str, Any], dict[str, str], dict[str, Any]]:
+        """Worker-controlled Ray actor configuration.
+
+        Mirrors `MegatronPolicyWorker` to ensure NVLS communication functions correctly.
+
+        Args:
+            num_gpus: Original GPU allocation for this worker based on the placement group
+            bundle_indices: Tuple of (node_idx, local_bundle_indices) for this server
+
+        Returns:
+            tuple with complete worker configuration:
+              - 'resources': Resource allocation (e.g., num_gpus)
+              - 'env_vars': Environment variables for this worker
+              - 'init_kwargs': Parameters to pass to __init__ of the worker
+        """
+        del num_gpus, bundle_indices  # Megatron value workers are always parallel.
+        resources: dict[str, Any] = {"num_gpus": 0}
+        env_vars: dict[str, str] = {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}
+        init_kwargs: dict[str, Any] = {}
+        return resources, env_vars, init_kwargs
+
     def __init__(
         self,
         config: ValueConfig,
@@ -297,6 +322,12 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
             init_optimizer: Whether to initialize the optimizer.
             worker_sharding_annotations: Sharding topology for distributed training.
         """
+        # Must be the first CUDA-touching call in this process.
+        # With `RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1` (set by `configure_worker()`),
+        # all node GPUs are visible to this actor; LOCAL_RANK selects ours.
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+
         apply_transformer_engine_patch()
 
         self.cfg = config
