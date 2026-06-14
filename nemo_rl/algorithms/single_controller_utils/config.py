@@ -35,7 +35,6 @@ from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 
-
 # ── SC-specific component sub-configs ────────────────────────────────────
 
 

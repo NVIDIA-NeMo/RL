@@ -107,6 +107,7 @@ def _make_test_master_config(
     # injected components.
     return MasterConfig.model_construct(**sc_subset)
 
+
 # ── Fake in-memory DataPlane ──────────────────────────────────────────────
 
 
