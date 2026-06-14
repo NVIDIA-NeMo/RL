@@ -1,0 +1,25 @@
+# FULL 53-env super config on the SAME lineage as the lean/bisect family: onpolicy_4node (clean
+# sync, standard logprobs, inductor) + colocated gen. Identical to the lean 6-env config EXCEPT it
+# keeps the full super-v3 gym (no env trim, judges intact). This makes the gym/data the ONLY variable
+# across the whole bisect family (lean 6-env <1.05; this = full stack).
+#
+# Used for the necessity test (feed rlvr1_no_tooluse) and, if wanted, the same-base >1.05 reference
+# (feed full rlvr1). Full stack -> GPU judges spin up -> num_gpu_nodes 2 (inherited) ->
+# SBATCH_NUM_NODES = cluster.num_nodes(1) + 2 = 3.
+defaults: "small_stage1_rlvr_nano30b_onpolicy_4node.yaml"
+
+grpo:
+  max_num_steps: 5   # quick decisive test; token_mult shows within the first steps
+
+policy:
+  generation:
+    colocated:
+      enabled: true          # onpolicy_4node is non-colocated; re-enable colocated gen (matches lean)
+      resources:
+        gpus_per_node: null
+        num_nodes: null
+    vllm_cfg:
+      gpu_memory_utilization: 0.5   # colocated: leave room for the training model on the shared GPUs
+
+cluster:
+  num_nodes: 1   # colocated train+gen; SBATCH_NUM_NODES = 1 + num_gpu_nodes(2 judges) = 3

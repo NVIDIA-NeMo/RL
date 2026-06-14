@@ -1,0 +1,17 @@
+# Strict synchronous diagnostic for the nano no-offload RLVR smoke test.
+#
+# This keeps the no-offload fp32 optimizer setup unchanged and disables async
+# GRPO entirely. Async mode cannot use max_trajectory_age_steps=0 because the
+# replay-buffer capacity is derived from that value.
+defaults: "small_stage1_rlvr_nano30b_nooffload_5node.yaml"
+
+grpo:
+  async_grpo:
+    enabled: false
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: false
+    recompute_kv_cache_after_weight_updates: false
+
+# super_launch.sh reads this directly before Hydra resolves defaults.
+cluster:
+  num_nodes: 3

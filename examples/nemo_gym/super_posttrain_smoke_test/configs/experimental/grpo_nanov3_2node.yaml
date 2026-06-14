@@ -1,0 +1,32 @@
+# Smaller-node SMOKE variant of grpo_nanov3.yaml (the known-good upstream nano-v3 RLVR config,
+# before the super-v3 changes). Purpose: cheaply check vLLM<->Megatron logprob alignment
+# (token_mult_prob_error) on the clean baseline, without the super-v3 judge/config stack.
+#
+# Preserves the WORKING shape that affects logprob alignment — TP2 x EP8 x CP4 x PP2 (16 GPUs =
+# one DP replica), colocated generation, synchronous GRPO (async disabled), fp32 master
+# (optimizer_cpu_offload: false), max_total_sequence_length: 49152 (kept — context length drives
+# the metric, so don't shrink it). Only the SCALE changes: DP 16 -> 1 and a tiny step.
+#
+# No separate GPU judges (math_with_judge is policy-as-judge w/ should_use_judge:false; code_gen
+# etc. are CPU/rule-based) -> SBATCH_NUM_NODES = cluster.num_nodes = 2.
+# Set policy.model_name (or MODEL_PATH at launch) to the Nano-30B checkpoint.
+defaults: "grpo_nanov3.yaml"
+
+grpo:
+  # Tiny step: just enough trajectories to log token_mult_prob_error. The metric is per-token,
+  # so batch size doesn't affect it. 2 prompts x 4 generations = 8 trajectories (>=2 gens keeps
+  # the GRPO leave-one-out baseline valid).
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 4
+
+policy:
+  train_global_batch_size: 8   # = num_prompts_per_step(2) * num_generations_per_prompt(4)
+
+data:
+  # Required by the super-v3 container code (it reads data["use_multiple_dataloader"] as a hard
+  # dict access — KeyError without it). Upstream grpo_nanov3.yaml predates this key, hence the
+  # "Container/Code Version Mismatch" warning. false = single-dataloader path.
+  use_multiple_dataloader: false
+
+cluster:
+  num_nodes: 2   # was 32; DP=1. One TP2*PP2*CP4 = 16-GPU replica + colocated gen. SBATCH_NUM_NODES=2.

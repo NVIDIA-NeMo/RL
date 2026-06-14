@@ -1,0 +1,29 @@
+# BISECT step 1: lean 6-env config + single_step_tool_use_with_argument_comparison.
+#
+# The lean 6-env config (this file's parent) gives token_mult < 1.05; the full super stack (53-env,
+# rlvr1) gives > 1.05. single_step_tool_use is the dominant non-lean agent in rlvr1 (40k train / 26
+# val samples) and a tool-SIMULATION agent (simulated tool responses inserted into the trajectory) —
+# prime suspect for a generation-vs-recompute token mismatch. Its agent runs on policy_model (NO GPU
+# judge), so this stays 1 node.
+#
+# Feed it the tool-use-ONLY subset (data/bisect_tooluse) so token_mult reflects PURELY tool-use
+# trajectories (the 6 lean servers load but idle — no data routed to them). If token_mult jumps
+# > 1.05 here, the tool-simulation trajectory assembly/retokenization is the cause.
+defaults: "small_stage1_rlvr_nano30b_colocated_6env_lean_1node.yaml"
+
+env:
+  nemo_gym:
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/math_with_judge/configs/math_with_judge.yaml
+    - resources_servers/code_gen/configs/code_gen.yaml
+    - resources_servers/workplace_assistant/configs/workplace_assistant.yaml
+    - resources_servers/mcqa/configs/mcqa.yaml
+    - resources_servers/instruction_following/configs/instruction_following.yaml
+    - resources_servers/structured_outputs/configs/structured_outputs_json.yaml
+    - resources_servers/single_step_tool_use_with_argument_comparison/configs/single_step_tool_use_with_argument_comparison.yaml
+
+# super_launch.sh reads cluster.num_nodes directly (flat, before Hydra resolves defaults), so it must
+# be set explicitly here even though the parent (lean) already sets it.
+cluster:
+  num_nodes: 1

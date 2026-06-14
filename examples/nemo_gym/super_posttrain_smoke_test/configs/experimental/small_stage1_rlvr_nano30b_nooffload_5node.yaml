@@ -1,0 +1,25 @@
+# Offload-OFF variant of the nano fp32 + matched-TP2 config, to test yifu's hypothesis that the
+# (untested) optimizer_cpu_offload path inflates token_mult_prob_error (consistently > 1.05).
+#
+# Keeps fp32 master + gen/train TP2 from the base; the only changes are:
+#   - optimizer_cpu_offload: true -> false  (Adam states back ON-GPU; prod-faithful path)
+#   - +1 training node so the fp32 Adam state (12 B/param) shards across DP8 / EDP2 and fits 80GB
+#     (1 train node OOM'd at the optimizer step even with the lighter bf16 optimizer; fp32 is ~2x).
+#
+#   - Policy train: 2 nodes -> TP2 x EP8 x CP1  (world16: DP8, EDP2)
+#   - Policy gen:   1 node  -> vLLM TP2
+#   - cluster.num_nodes = 3 (2 train + 1 gen);  SBATCH_NUM_NODES=5 (+2 Gym judge nodes).
+#
+# NOTE: 2 train nodes (EDP2) is the minimal try and may still OOM at the fp32 optimizer step
+# (it's near the same per-GPU optimizer footprint as the bf16-1-node run that OOM'd). If so,
+# bump cluster.num_nodes to 4 (3 train nodes -> EDP3, comfortable) -> SBATCH_NUM_NODES=6.
+defaults: "small_stage1_rlvr_nano30b_4node.yaml"
+
+policy:
+  megatron_cfg:
+    optimizer:
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+
+cluster:
+  num_nodes: 3   # 2 train (TP2*EP8, DP8/EDP2) + 1 gen (TP2). SBATCH_NUM_NODES=5 (+2 judge nodes).

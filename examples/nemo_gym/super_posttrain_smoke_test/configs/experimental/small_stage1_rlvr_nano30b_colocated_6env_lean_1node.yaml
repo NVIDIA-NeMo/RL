@@ -1,0 +1,68 @@
+# Lean 6-env super config — cuts the super-v3 gym (53 servers) down to grpo_nanov3's exact 6 envs
+# so it can be fed nano_data, as a TRUE single-variable test of whether the super-v3 gym envs/data
+# are what inflate token_mult_prob_error.
+#
+# Inherits the clean SYNC base (onpolicy_4node: async disabled, standard logprobs, inductor) and
+# re-adds colocated gen, matching the colocated_eager config's lineage. The gym is then CUT to
+# grpo_nanov3's 6 envs: config_paths trimmed to the 6 (math/code/workplace/mcqa/IF/structured) + the
+# vllm_model, the other ~16 config_paths dropped, and the 8 inline super-v3 server blocks nulled
+# (null -> not a DictConfig -> filter_for_server_instance_configs skips them; verified in
+# nemo_gym/config_types.py:maybe_get_server_instance_config). math_with_judge is flipped to
+# policy-as-judge (should_use_judge:false, judge->policy_model) like grpo_nanov3, otherwise it would
+# reference the now-nulled nl2bash_judge_model and validate_and_populate_defaults would assert.
+#
+# Result: 7 servers (6 envs + policy vllm_model), NO GPU judges -> num_gpu_nodes 0 ->
+# SBATCH_NUM_NODES = cluster.num_nodes(1) = 1 node (colocated gen on the train node).
+# Feed nano_data at launch. token_mult readout (vs the 53-env/rlvr1 super runs, >1.05):
+#   <1.05 -> the super-v3 gym envs/data were the cause;  >1.05 -> NOT the envs/data.
+defaults: "small_stage1_rlvr_nano30b_onpolicy_4node.yaml"
+
+grpo:
+  max_num_steps: 5   # quick decisive test; token_mult shows within the first steps
+
+policy:
+  generation:
+    colocated:
+      enabled: true          # onpolicy_4node is non-colocated; re-enable colocated gen (1-node run)
+      resources:
+        gpus_per_node: null
+        num_nodes: null
+    vllm_cfg:
+      gpu_memory_utilization: 0.5   # colocated: leave room for the training model on the shared GPUs
+
+env:
+  nemo_gym:
+    num_gpu_nodes: 0   # no GPU judges needed for the 6 simple envs -> SBATCH = cluster.num_nodes = 1
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml   # required (the policy proxy)
+    - resources_servers/math_with_judge/configs/math_with_judge.yaml
+    - resources_servers/code_gen/configs/code_gen.yaml
+    - resources_servers/workplace_assistant/configs/workplace_assistant.yaml
+    - resources_servers/mcqa/configs/mcqa.yaml
+    - resources_servers/instruction_following/configs/instruction_following.yaml
+    - resources_servers/structured_outputs/configs/structured_outputs_json.yaml
+    # Flip math to policy-as-judge (was should_use_judge:true -> nl2bash_judge_model, which is nulled below).
+    math_with_judge:
+      resources_servers:
+        math_with_judge:
+          judge_model_server:
+            name: policy_model
+          should_use_judge: false
+    # Null the super-v3 inline server blocks so they don't spin up as servers.
+    jailbreak_detection: null
+    safety_judge_model: null
+    inverse_if: null
+    multichallenge: null
+    equivalence_llm_judge: null
+    genrm_compare_resources_server: null
+    genrm_model: null
+    lc_judge: null
+    # These two are inline blocks from the intermediate 14node/nano30b configs (not stage1_rlvr):
+    # nl2bash_judge_model is a GPU judge -> with num_gpu_nodes 0 it hangs forever ("14/15 servers
+    # ready, waiting for nl2bash_judge_model"); policy_model_reasoning_off is an extra proxy. Neither
+    # is referenced by the 6 kept envs, so null both -> true 7-server set (6 envs + policy_model).
+    nl2bash_judge_model: null
+    policy_model_reasoning_off: null
+
+cluster:
+  num_nodes: 1

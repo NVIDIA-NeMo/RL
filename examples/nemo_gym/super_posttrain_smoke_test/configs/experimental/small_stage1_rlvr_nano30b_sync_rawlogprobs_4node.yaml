@@ -1,0 +1,20 @@
+# Strict synchronous nano RLVR smoke test using raw vLLM logprobs.
+#
+# The sync/on-policy run still shows token_mult_prob_error > 1.05, which means
+# the issue is not async trajectory staleness. This variant checks whether the
+# mismatch comes from comparing vLLM processed logprobs against Megatron raw
+# recomputed logprobs.
+defaults: "small_stage1_rlvr_nano30b_onpolicy_4node.yaml"
+
+grpo:
+  max_num_steps: 5
+  seq_logprob_error_threshold: 2.0
+
+policy:
+  generation:
+    vllm_kwargs:
+      logprobs_mode: "raw_logprobs"
+
+# super_launch.sh reads this directly before Hydra resolves defaults.
+cluster:
+  num_nodes: 2

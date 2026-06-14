@@ -1,0 +1,36 @@
+# backend:eager test (colocated) — the leading suspect for token_mult_prob_error > 1.05.
+#
+# Runtime-confirmed difference: super-v3 vLLM generation compiles with compilation_config.backend
+# = inductor (custom_ops ['none'] -> torch.compile/Triton kernels), while the GOOD grpo_nanov3 run
+# forces backend = eager (custom_ops ['all'] -> custom CUDA kernels, per vLLM convergence issue
+# #998 "better accuracy"). The Triton kernels' numerics drift from Megatron's recompute -> elevated
+# token_mult. This is the one numerically-decisive generation-side knob that differs and is
+# invariant to async/refit/offload/raw-logprobs (everything else already ruled out). stage1_rlvr.yaml
+# sets only cudagraph_capture_sizes and never backend:eager; no smoke child adds it back.
+#
+# Clean SYNC base (onpolicy_4node: async disabled, standard logprobs) + COLOCATED gen + backend:eager.
+# Compare token_mult to the prior colocated run (inductor, >1.05): if it drops below ~1.05, the
+# missing backend:eager was the cause and the fix is to carry it in the super-v3 config stack.
+#
+# Colocated => gen shares the train node: cluster.num_nodes 2->1, SBATCH_NUM_NODES = 1 + judges(2) = 3.
+# If gen OOMs, lower gpu_memory_utilization (0.5 -> 0.4) or set cluster.num_nodes: 2.
+defaults: "small_stage1_rlvr_nano30b_onpolicy_4node.yaml"
+
+grpo:
+  max_num_steps: 5   # quick decisive test; token_mult shows within the first steps
+
+policy:
+  generation:
+    colocated:
+      enabled: true
+      resources:
+        gpus_per_node: null   # colocated: generation shares the cluster GPUs
+        num_nodes: null
+    vllm_kwargs:
+      compilation_config:
+        backend: eager         # was inductor (default); custom CUDA kernels align with Megatron recompute (vLLM #998)
+    vllm_cfg:
+      gpu_memory_utilization: 0.5   # colocated: leave room for the training model on the shared GPUs
+
+cluster:
+  num_nodes: 1   # gen colocated on the train node (was 2). SBATCH_NUM_NODES=3 (+2 Gym judge nodes).

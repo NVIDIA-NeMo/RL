@@ -1,0 +1,30 @@
+# A/B test: flip the super-v3 nano SYNC run from NON-colocated to COLOCATED generation, to isolate
+# whether the cross-node weight-refit path leaves vLLM in a different model state than Megatron
+# (i.e. whether token_mult_prob_error > 1.05 in sync is a refit issue, not staleness or engine fuzz).
+#
+#   non-colocated (current): separate gen node, weights pushed via update_weights_from_collective
+#   colocated (this):        gen shares the training GPUs, weights via update_weights_via_ipc (local)
+#
+# Everything else is held constant via the sync base: sync GRPO, raw logprobs, TP2, EP8, CP1,
+# 20480 ctx, fp32 master + offload, rlvr1 data. The ONLY change is the colocation (+ the node-count
+# consequence + gpu_mem headroom for sharing).
+#
+# Colocated => the dedicated gen node folds into the train node:
+#   cluster.num_nodes 2 -> 1 (train+gen, DP4 on 8 GPUs).  SBATCH_NUM_NODES = 1 + num_gpu_nodes(2) = 3.
+#
+# If it OOMs during generation (vLLM now shares the train GPUs), lower gpu_memory_utilization
+# further (0.5 -> 0.4) or set cluster.num_nodes: 2 (colocated, DP8 -> more room, but changes DP).
+defaults: "small_stage1_rlvr_nano30b_sync_rawlogprobs_4node.yaml"
+
+policy:
+  generation:
+    colocated:
+      enabled: true          # was false (non-colocated dedicated gen node + collective refit)
+      resources:
+        gpus_per_node: null   # colocated: generation shares the cluster GPUs
+        num_nodes: null
+    vllm_cfg:
+      gpu_memory_utilization: 0.5   # leave room for the training model on the shared GPUs
+
+cluster:
+  num_nodes: 1   # gen colocated on the train node (was 2). SBATCH_NUM_NODES=3 (+2 Gym judge nodes).
