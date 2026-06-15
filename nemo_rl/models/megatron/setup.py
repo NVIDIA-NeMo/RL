@@ -15,6 +15,7 @@
 import hashlib
 import json
 import os
+import threading
 import time
 import warnings
 from typing import Any, Callable, Optional, TypeVar
@@ -1035,6 +1036,36 @@ def _create_draft_pre_wrap_hook(
     return draft_pre_wrap_hook
 
 
+_BRIDGE_SIGNAL_HANDLER_PATCHED = False
+
+
+def _patch_bridge_signal_handler_for_worker_threads() -> None:
+    """Make Megatron-Bridge's signal-handler install safe off the main thread.
+
+    See https://github.com/NVIDIA-NeMo/Megatron-Bridge/pull/4375
+
+    TODO: Remove this hotfix once Megatron-Bridge is bumped.
+    """
+    global _BRIDGE_SIGNAL_HANDLER_PATCHED
+    if _BRIDGE_SIGNAL_HANDLER_PATCHED:
+        return
+
+    from megatron.bridge.training.utils import sig_utils
+
+    original_enter = sig_utils.DistributedSignalHandler.__enter__
+
+    def main_thread_only_enter(self):
+        if threading.current_thread() is not threading.main_thread():
+            self._signal_received = False
+            # Nothing was installed, so release()/__exit__ become no-ops.
+            self.released = True
+            return self
+        return original_enter(self)
+
+    sig_utils.DistributedSignalHandler.__enter__ = main_thread_only_enter
+    _BRIDGE_SIGNAL_HANDLER_PATCHED = True
+
+
 def setup_model_and_optimizer(
     policy_cfg: PolicyConfig,
     megatron_cfg: ConfigContainer,
@@ -1045,6 +1076,7 @@ def setup_model_and_optimizer(
     additional_pre_wrap_hooks: Optional[list[Callable]] = None,
 ):
     state = GlobalState()
+    _patch_bridge_signal_handler_for_worker_threads()
     state.cfg = megatron_cfg
     # TODO: Freeze state.cfg
 
