@@ -3,14 +3,9 @@ policy:
   megatron_cfg:
     tensor_model_parallel_size: 4
     expert_model_parallel_size: 16
-    pipeline_model_parallel_size: 4
-    context_parallel_size: 2
-    num_layers_in_first_pipeline_stage: 15
-    num_layers_in_last_pipeline_stage: 14
-  make_sequence_length_divisible_by: 16
-  generation:
-    vllm_cfg:
-      tensor_parallel_size: 16
+    # DeepEP is supported for Ampere, Hopper, and Blackwell (B200/B300) GPUs
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "alltoall"
 checkpointing:
   checkpoint_dir: results/grpo-dapomath17k-dsv3-32n4g-megatron
 logger:

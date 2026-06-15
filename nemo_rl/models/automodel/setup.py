@@ -283,6 +283,12 @@ def validate_and_prepare_config(
     # Get HF config overrides
     hf_config_overrides = config.get("hf_config_overrides", {}) or {}
 
+    rope_scaling = hf_config_overrides.get("rope_scaling") or {}
+    assert rope_scaling.get("rope_type") != "yarn", (
+        "YaRN RoPE scaling is not supported with the automodel (DTensor) backend. "
+        "Please use the Megatron backend (policy.megatron_cfg.enabled=True) for YaRN."
+    )
+
     # NeMoAutoModelForCausalLM uses flash_attention_2 by default
     # so we need to set it to None if sequence packing is disabled
     # See https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
@@ -422,7 +428,18 @@ def setup_distributed(
     tp_size = config["dtensor_cfg"].get("tensor_parallel_size", 1)
     cp_size = config["dtensor_cfg"].get("context_parallel_size", 1)
     ep_size = config["dtensor_cfg"].get("expert_parallel_size", 1)
+    dp_replicate_size = config["dtensor_cfg"].get("dp_replicate_size", 1)
     sequence_parallel_enabled = config["dtensor_cfg"]["sequence_parallel"]
+
+    # HSDP requires the data-parallel axis to evenly contain the replicate dim.
+    model_parallel_size = tp_size * cp_size * ep_size
+    dp_size = world_size // model_parallel_size
+    if dp_size % dp_replicate_size != 0:
+        raise ValueError(
+            f"Data parallel size ({dp_size}) must be divisible by "
+            f"dp_replicate_size ({dp_replicate_size}). "
+            "Please adjust your cluster size or parallelism parameters."
+        )
 
     # Build tp_plan from custom_parallel_plan config if set, else None (auto-select)
     tp_plan = config["dtensor_cfg"].get("custom_parallel_plan", None)
@@ -456,6 +473,7 @@ def setup_distributed(
     # Create device meshes (dp_size is derived from world_size / (tp * cp * ep))
     device_mesh, moe_mesh = create_device_mesh(
         fsdp2_config,
+        dp_replicate_size=dp_replicate_size,
         tp_size=tp_size,
         pp_size=1,
         cp_size=cp_size,
@@ -477,6 +495,49 @@ def setup_distributed(
         tp_size=resolved_tp_size,
         cp_size=resolved_cp_size,
     )
+
+
+# AUTOMODEL-WORKAROUND(restore-dtype): TEMPORARY. Remove when the automodel pin includes
+# NVIDIA-NeMo/Automodel PR #2419 (rewrites _restore_loaded_model_dtype to honor an explicit
+# torch_dtype via promote_types). Currently pinned at automodel 6de0c361 (pre-#2419).
+def _disable_automodel_checkpoint_dtype_restore() -> None:
+    """No-op Automodel's ``_restore_loaded_model_dtype`` on the HF/force_hf load path.
+
+    NeMo-RL loads policy models with ``torch_dtype=float32`` to keep fp32 master weights
+    for the optimizer. Automodel's ``_restore_loaded_model_dtype`` (added after automodel
+    ``92635e74``) re-casts each loaded parameter back to the bf16 checkpoint dtype, silently
+    downgrading the master weights so AdamW updates underflow and the model fails to learn
+    (e.g. grpo-nano-v2-12b reward stuck ~0.18). Disable it so the requested fp32 load is
+    honored. Tracked by NVIDIA-NeMo/Automodel#2419; remove once the automodel pin includes it.
+    See ``test_automodel_dtype_restore_workaround_still_needed`` for the removal tripwire.
+    """
+    from nemo_automodel._transformers import model_init as _model_init
+
+    # Removal tripwire: if Automodel drops/renames this symbol (the likely shape of the
+    # upstream fix), the workaround is obsolete -> warn loudly and self-deactivate.
+    restore = getattr(_model_init, "_restore_loaded_model_dtype", None)
+    if restore is None:
+        import warnings
+
+        warnings.warn(
+            "Automodel no longer defines _restore_loaded_model_dtype; NeMo-RL's fp32 "
+            "master-weight workaround is obsolete - remove "
+            "_disable_automodel_checkpoint_dtype_restore() in setup.py.",
+            stacklevel=2,
+        )
+        return
+    if getattr(restore, "_nrl_disabled", False):
+        return
+
+    def _noop(*args, **kwargs) -> None:  # pragma: no cover
+        return None
+
+    _noop._nrl_disabled = True
+    # Stash the genuine function so the removal tripwire test
+    # (test_automodel_dtype_restore_workaround_still_needed) can exercise Automodel's
+    # real behavior even after this no-op has globally replaced the symbol process-wide.
+    _noop._nrl_original = restore
+    _model_init._restore_loaded_model_dtype = _noop
 
 
 def setup_model_and_optimizer(
@@ -549,6 +610,21 @@ def setup_model_and_optimizer(
             raise AssertionError(
                 "Context parallel is yet not supported for VLM models. Please set cp_size = 1 to train VLM models."
             )
+
+        if model_config.model_type == "qwen3_5":
+            raise AssertionError(
+                "Context parallel is not supported for Qwen3.5 dense models (only torch attention backend is available). "
+                "Please set cp_size = 1. For Qwen3.5 MoE models, CP is supported with the TE backend."
+            )
+
+        if model_config.model_type == "qwen3_5_moe":
+            try:
+                import fla  # noqa: F401
+            except ImportError:
+                raise ImportError(
+                    "Qwen3.5 MoE requires flash-linear-attention for context parallel. "
+                    "Please install it in your Automodel venv: pip install flash-linear-attention"
+                )
 
     # LoRA configuration
     lora_cfg = config["dtensor_cfg"].get("lora_cfg", None)
@@ -624,6 +700,10 @@ def setup_model_and_optimizer(
     # HF conversion (required for weight syncing).
     _maybe_set_force_hf(automodel_kwargs, model_config)
 
+    # Keep fp32 master weights: stop Automodel from restoring loaded params to the bf16
+    # checkpoint dtype, which would break optimizer master-weight precision (see helper).
+    _disable_automodel_checkpoint_dtype_restore()
+
     # Create model via from_pretrained - handles meta device init, parallelization,
     # LoRA, and base weight loading internally
     model = model_class.from_pretrained(
@@ -663,14 +743,7 @@ def setup_model_and_optimizer(
         getattr(model, "config", {}), "tie_word_embeddings", False
     )
     if is_tied_lm_head:
-        embed_tokens_weight = None
-        for name, param in model.named_parameters():
-            if "embed_tokens" in name and name.endswith(".weight"):
-                embed_tokens_weight = param
-                break
-
-        if embed_tokens_weight is not None:
-            model.lm_head.weight = embed_tokens_weight
+        model.tie_weights()
 
     # CPU offload if needed
     if cpu_offload:
@@ -683,7 +756,20 @@ def setup_model_and_optimizer(
     optimizer = None
     if init_optimizer:
         optimizer_cls = get_class(config["optimizer"]["name"])
-        optimizer = optimizer_cls(model.parameters(), **config["optimizer"]["kwargs"])
+        optimizer_kwargs = dict(config["optimizer"]["kwargs"])
+        # Resolve string-valued torch dtypes (e.g. "torch.bfloat16" -> torch.bfloat16)
+        for key, value in optimizer_kwargs.items():
+            if isinstance(value, str) and value.startswith("torch."):
+                optimizer_kwargs[key] = getattr(torch, value.removeprefix("torch."))
+        # Only pass trainable params to the optimizer. TE FusedAdam's step()
+        # allocates per-param state (exp_avg/exp_avg_sq/master_param) before the
+        # p.grad-is-None check, so passing frozen params (e.g. the visual
+        # encoder in text-only training) causes DCP to save unused state that
+        # later fails to reshard on resume.
+        optimizer = optimizer_cls(
+            (p for p in model.parameters() if p.requires_grad),
+            **optimizer_kwargs,
+        )
 
     # Initialize scheduler
     scheduler = None

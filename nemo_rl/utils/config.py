@@ -192,5 +192,7 @@ def register_omegaconf_resolvers() -> None:
     """Register shared OmegaConf resolvers used in configs."""
     if not OmegaConf.has_resolver("mul"):
         OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
+    if not OmegaConf.has_resolver("div"):
+        OmegaConf.register_new_resolver("div", lambda a, b: a / b)
     if not OmegaConf.has_resolver("max"):
         OmegaConf.register_new_resolver("max", lambda a, b: max(a, b))

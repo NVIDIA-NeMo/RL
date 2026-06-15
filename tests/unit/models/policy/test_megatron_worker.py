@@ -11,9 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import ast
 import os
 import tempfile
 import time
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 
 import numpy as np
@@ -39,22 +42,93 @@ from tests.unit.test_utils import SimpleLossFn
 
 pytestmark = pytest.mark.mcore
 
-basic_pg_loss_test_config: ClippedPGLossConfig = {
-    "ratio_clip_min": 0.2,
-    "ratio_clip_max": 0.2,
-    "ratio_clip_c": None,
-    "reference_policy_kl_penalty": 0.1,
-    "reference_policy_kl_type": "k3",
-    "kl_input_clamp_value": 20.0,
-    "kl_output_clamp_value": 10.0,
-    "disable_ppo_ratio": False,
-    "use_on_policy_kl_approximation": False,
-    "use_importance_sampling_correction": False,
-    "truncated_importance_sampling_ratio": None,
-    "sequence_level_importance_ratios": False,
-    "token_level_loss": True,
-    "force_on_policy_ratio": False,
-}
+
+class _FakeTrainableModel:
+    def __init__(self):
+        self.train_called = False
+
+    def train(self):
+        self.train_called = True
+
+
+def test_megatron_prepare_for_training_restores_optimizer():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    model = _FakeTrainableModel()
+    restored_devices = []
+
+    worker.model = model
+    worker.optimizer = object()
+    worker.optimizer_cpu_offload = False
+    worker.cfg = {"megatron_cfg": {"empty_unused_memory_level": 0}}
+    worker.move_model = lambda model, device, move_grads, move_params: model
+    worker.move_optimizer = lambda device: restored_devices.append(device)
+
+    MegatronPolicyWorkerImpl.prepare_for_training(worker)
+
+    assert model.train_called
+    assert restored_devices == ["cuda"]
+
+
+def test_disable_forward_pre_hook_until_next_step_uses_worker_override():
+    source_path = (
+        Path(__file__).parents[4]
+        / "nemo_rl/models/policy/workers/megatron_policy_worker.py"
+    )
+    tree = ast.parse(source_path.read_text())
+    method = next(
+        node
+        for class_node in tree.body
+        if isinstance(class_node, ast.ClassDef)
+        and class_node.name == "MegatronPolicyWorkerImpl"
+        for node in class_node.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_disable_forward_pre_hook_until_next_train_step"
+    )
+
+    class_kwargs = {
+        "name": "_Worker",
+        "bases": [],
+        "keywords": [],
+        "body": [method],
+        "decorator_list": [],
+    }
+    if "type_params" in ast.ClassDef._fields:
+        class_kwargs["type_params"] = []
+    test_module = ast.Module(
+        body=[ast.ClassDef(**class_kwargs)],
+        type_ignores=[],
+    )
+    ast.fix_missing_locations(test_module)
+
+    class FakeDDP:
+        def disable_forward_pre_hook(self, param_sync=True):
+            raise AssertionError("raw DDP hook disable should not be called directly")
+
+    model_config = SimpleNamespace(param_sync_func="sync")
+    namespace = {
+        "DistributedDataParallel": FakeDDP,
+        "get_model_config": lambda _: model_config,
+    }
+    exec(compile(test_module, str(source_path), "exec"), namespace)
+
+    worker = namespace["_Worker"]()
+    worker.model = FakeDDP()
+    worker._forward_pre_hook_enabled = lambda: True
+    disable_calls = []
+    worker.disable_forward_pre_hook = lambda param_sync=True: disable_calls.append(
+        param_sync
+    )
+
+    worker._disable_forward_pre_hook_until_next_train_step()
+
+    assert disable_calls == [False]
+    assert worker._first_train_step_param_sync_func == "sync"
+    assert model_config.param_sync_func is None
+    assert worker._first_train_step_forward_pre_hook_disabled is True
 
 
 def create_megatron_test_config(
@@ -65,7 +139,6 @@ def create_megatron_test_config(
     activation_checkpointing: bool = False,
     generation_backend: str = "megatron",
     sequence_parallel: bool = False,
-    converter_type: str = "LlamaForCausalLM",
     logprob_chunk_size: Optional[int] = None,
     defer_fp32_logits: Optional[bool] = None,
     attention_backend: Optional[str] = None,
@@ -120,7 +193,6 @@ def create_megatron_test_config(
             "enabled": True,
             "empty_unused_memory_level": 0,
             "activation_checkpointing": activation_checkpointing,
-            "converter_type": converter_type,
             "tensor_model_parallel_size": tp,
             "expert_tensor_parallel_size": 1,
             "expert_model_parallel_size": 1,
@@ -144,6 +216,7 @@ def create_megatron_test_config(
             "defer_fp32_logits": defer_fp32_logits,
             "use_linear_ce_fusion_loss": False,
             "linear_ce_fusion_chunk_size": 256,
+            "gradient_accumulation_fusion": False,
             "train_iters": 100,  # Required for Megatron training
             "optimizer": {
                 "optimizer": "adam",
@@ -296,17 +369,10 @@ def training_setup(request):
         )
 
         # Determine converter type based on model
-        converter_type = "LlamaForCausalLM"
-        if "qwen" in model_name.lower():
-            converter_type = "Qwen2ForCausalLM"
-        elif "gemma" in model_name.lower():
-            converter_type = "GemmaForCausalLM"
-
         config = create_megatron_test_config(
             model_name=model_name,
             tp=tp,
             pp=pp,
-            converter_type=converter_type,
         )
 
         # Apply config updates
@@ -668,17 +734,10 @@ def logprob_setup(request):
         )
 
         # Determine converter type based on model
-        converter_type = "LlamaForCausalLM"
-        if "qwen" in model_name.lower():
-            converter_type = "Qwen2ForCausalLM"
-        elif "gemma" in model_name.lower():
-            converter_type = "GemmaForCausalLM"
-
         config = create_megatron_test_config(
             model_name=model_name,
             tp=tp,
             pp=pp,
-            converter_type=converter_type,
             logprob_chunk_size=logprob_chunk_size,
             defer_fp32_logits=defer_fp32_logits,
         )
@@ -846,7 +905,7 @@ def test_megatron_loss_independent_of_microbatch_size(tiny_llama_model_path):
 
     # Test loss functions
     nll_loss_fn = NLLLossFn()
-    pg_loss_fn = ClippedPGLossFn(basic_pg_loss_test_config)
+    pg_loss_fn = ClippedPGLossFn(ClippedPGLossConfig())
 
     policy1.prepare_for_training()
     mbs1_nll_results = policy1.train(data, nll_loss_fn)
@@ -1276,7 +1335,7 @@ def test_megatron_checkpoint_save_kill_and_restore(
             restore_config = deepcopy(initial_config)
 
             # Check if the optimizer exists in the checkpoint
-            # checkpointer = CheckpointManager(restore_config["checkpointing"])
+            # checkpointer = CheckpointManager(restore_config.checkpointing)
             weights_path, optimizer_path = CheckpointManager.get_resume_paths(
                 checkpoint_dir
             )
@@ -1522,17 +1581,10 @@ def topk_setup(request):
         )
 
         # Determine converter type based on model
-        converter_type = "LlamaForCausalLM"
-        if "qwen" in model_name.lower():
-            converter_type = "Qwen2ForCausalLM"
-        elif "gemma" in model_name.lower():
-            converter_type = "GemmaForCausalLM"
-
         config = create_megatron_test_config(
             model_name=model_name,
             tp=tp,
             pp=pp,
-            converter_type=converter_type,
             logprob_chunk_size=logprob_chunk_size,
             defer_fp32_logits=defer_fp32_logits,
         )
@@ -2422,7 +2474,7 @@ def test_megatron_context_parallel_training_agreement(tiny_llama_model_path):
     )
 
     # Create ClippedPG loss function
-    loss_fn = ClippedPGLossFn(basic_pg_loss_test_config)
+    loss_fn = ClippedPGLossFn(ClippedPGLossConfig())
 
     # Train non-CP model
     policy_no_cp.prepare_for_training()

@@ -40,6 +40,7 @@ from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.generation.vllm.utils import (
     aggregate_spec_decode_counters,
     compute_spec_decode_metrics,
+    resolve_generation_worker_cls,
 )
 
 
@@ -50,10 +51,25 @@ class VllmGeneration(GenerationInterface):
         config: VllmConfig,
         name_prefix: str = "vllm_policy",
         workers_per_node: Optional[Union[int, list[int]]] = None,
+        defer_model_load: bool = False,
     ):
-        """Initialize a vLLM policy with distributed workers."""
+        """Initialize a vLLM policy with distributed workers.
+
+        When defer_model_load=True, workers only reserve ports (seconds) and
+        dp_openai_server_base_urls is populated immediately from reserved ports.
+        Call load_and_start() later to perform heavy model loading. This enables
+        overlapping vLLM model loading with NeMo Gym init.
+
+        Args:
+            cluster: Virtual cluster for worker placement
+            config: VllmConfig dictionary
+            name_prefix: Prefix for Ray actor names
+            workers_per_node: Workers per node override
+            defer_model_load: If True, defer model loading for overlapped init
+        """
         # Store config
         self.cfg = config
+        self._defer_model_load = defer_model_load
         self.tp_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
         self.pp_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
         self.ep_size = self.cfg["vllm_cfg"]["expert_parallel_size"]
@@ -143,10 +159,20 @@ class VllmGeneration(GenerationInterface):
             worker_cls = (
                 "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker"
             )
-        worker_builder = RayWorkerBuilder(worker_cls, config)
+        worker_cls = resolve_generation_worker_cls(worker_cls, self.cfg)
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            worker_builder = RayWorkerBuilder(
+                worker_cls, config, defer_model_load=defer_model_load
+            )
+        else:
+            worker_builder = RayWorkerBuilder(worker_cls, config)
 
         # It's necessary to set env_vars here to ensure that vllm non-leader workers also have these env_vars
         env_vars = {}
+        # User-supplied per-recipe env vars (e.g. vllm_cfg.env_vars in the yaml).
+        # Scoped to this generation config so it does not impact other test cases.
+        for k, v in self.cfg["vllm_cfg"].get("env_vars", {}).items():
+            env_vars[str(k)] = str(v)
         # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
         # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
         if not self.cfg["colocated"]["enabled"]:
@@ -190,13 +216,6 @@ class VllmGeneration(GenerationInterface):
                 env_vars=env_vars,
             )
 
-        # Call some collective rpc functions in VllmGenerationWorker when initializing the vLLM engine
-        # This is necessary for async engine to work
-        self._post_init()
-
-        # dp_openai_server_base_urls is only returned by Async vLLM flow when http server is active
-        self.dp_openai_server_base_urls = self._report_dp_openai_server_base_urls()
-
         # Number of data parallel groups is the number of tied worker groups
         assert self.dp_size == self.worker_group.dp_size, (
             f"Data parallel size mismatch. Expected {self.dp_size}, got {self.worker_group.dp_size}"
@@ -205,8 +224,20 @@ class VllmGeneration(GenerationInterface):
         # Used to track the round-robin selection of worker groups for generate_async
         self.current_generate_dp_shard_idx = 0
 
-        # Save the device uuids for the workers
-        self.device_uuids = self._report_device_id()
+        if defer_model_load:
+            # Workers only reserved ports — collect URLs immediately and defer
+            # the heavy model loading (and HTTP server start) to load_and_start().
+            self.dp_openai_server_base_urls = self._collect_reserved_urls()
+            self.device_uuids = None
+        else:
+            # Full init: call some collective rpc functions in the worker when
+            # initializing the vLLM engine (necessary for async engine to work),
+            # then report server URLs and device ids.
+            self._post_init()
+            # dp_openai_server_base_urls is only returned by the async vLLM flow
+            # when the http server is active.
+            self.dp_openai_server_base_urls = self._report_dp_openai_server_base_urls()
+            self.device_uuids = self._report_device_id()
 
         self._step_metrics_snapshot: dict[str | tuple[str, int], float] | None = None
 
@@ -354,6 +385,45 @@ class VllmGeneration(GenerationInterface):
         # Wait for all futures to complete
         results = ray.get(futures)
         return results
+
+    def _collect_reserved_urls(self) -> list[Optional[str]]:
+        """Collect reserved URLs from DP leaders before model loading.
+
+        Only called when defer_model_load=True. Workers have bound ports
+        during __init__ and can report their reserved URLs immediately.
+        """
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            return [None]
+
+        futures = self.worker_group.run_all_workers_single_data(
+            "get_reserved_url",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        results = ray.get(futures)
+        return results
+
+    def load_and_start(self) -> None:
+        """Load models on all workers and start HTTP servers.
+
+        Called after a deferred init (defer_model_load=True) to perform the
+        heavy model loading. Updates dp_openai_server_base_urls with the actual
+        running server URLs and populates device_uuids.
+        """
+        # Call load_model() on all model-owner workers
+        futures = self.worker_group.run_all_workers_single_data(
+            "load_model",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        ray.get(futures)
+
+        # Post-init (collective rpc functions needed for async engine)
+        self._post_init()
+
+        # Refresh URLs from the actual running servers
+        self.dp_openai_server_base_urls = self._report_dp_openai_server_base_urls()
+
+        # Save device UUIDs
+        self.device_uuids = self._report_device_id()
 
     def _post_init(self):
         # Choose the appropriate method based on async_engine setting
@@ -587,6 +657,13 @@ class VllmGeneration(GenerationInterface):
         if not data_validation_fn(data):
             return
 
+        # VllmAsyncGenerationWorker.generate_async: one sample per call.
+        assert data.size == 1, (
+            f"{method_name} is restricted to handle only single samples, "
+            f"but received batch_size={data.size}. Please handle batching "
+            f"outside this method."
+        )
+
         # Determine the leader worker for the current data parallel shard
         leader_worker_idx = self.worker_group.get_dp_leader_worker_idx(
             self.current_generate_dp_shard_idx
@@ -601,88 +678,42 @@ class VllmGeneration(GenerationInterface):
         )
 
         # Increment the round-robin worker group index
-        self.current_generate_dp_shard_idx += 1
-        self.current_generate_dp_shard_idx %= self.worker_group.dp_size
+        self.current_generate_dp_shard_idx = (
+            self.current_generate_dp_shard_idx + 1
+        ) % self.worker_group.dp_size
 
-        # Create a queue to collect sample results from the worker as they complete
-        result_queue = asyncio.Queue()
-        finished = False
-
-        async def consume_worker_generator(worker_idx, worker_gen):
-            """Consume a single worker generator and put sample results in the queue."""
-            nonlocal finished
-            worker_name = f"Worker-{worker_idx}"
-            try:
-                async for sample_result_ref in worker_gen:
-                    sample_result = await sample_result_ref
-                    # sample_result is a tuple: (original_idx, BatchedDataDict)
-                    # Tag the result with worker index for downstream attribution
-                    original_idx, result_batch = sample_result
-                    # Use a length-one list so BatchedDataDict.from_batches can merge without shape errors
-                    result_batch["gen_leader_worker_idx"] = [int(worker_idx)]
-                    sample_result = (original_idx, result_batch)
-                    await result_queue.put(("sample", sample_result))
-            except Exception as e:
-                # Log the error before putting it in the queue for better debugging
-                import traceback
-
-                print(f"Exception in worker {worker_name}")
-                traceback.print_exc()
-                await result_queue.put(("error", e))
-            finally:
-                finished = True
-                await result_queue.put(("worker_done", None))
-
-        # Start the task to consume the worker generator
-        worker_task = asyncio.create_task(
-            consume_worker_generator(leader_worker_idx, worker_gen_proxy)
-        )
-
-        # Yield sample results as they become available from the worker
         timeout_seconds = float(
-            os.environ.get("NRL_VLLM_ASYNC_TIMEOUT_SECONDS", "600")
-        )  # Default 10 minutes
+            os.environ.get("NRL_VLLM_ASYNC_TIMEOUT_SECONDS", "900")
+        )  # Default 15 minutes
 
-        while not finished:
-            try:
-                msg_type, item = await asyncio.wait_for(
-                    result_queue.get(), timeout=timeout_seconds
-                )
-            except asyncio.TimeoutError:
-                print(
-                    f"Timeout waiting for results after {timeout_seconds}s. Worker has not finished."
-                )
-                print(
-                    f"For longer sequences, increase the timeout by setting: export NRL_VLLM_ASYNC_TIMEOUT_SECONDS={int(timeout_seconds * 2)}"
-                )
-                # Cancel the task
-                if not worker_task.done():
-                    worker_task.cancel()
-                await asyncio.gather(worker_task, return_exceptions=True)
-                raise RuntimeError(
-                    f"Timeout waiting for worker results after {timeout_seconds}s. "
-                    f"For longer sequences, increase timeout by setting: export NRL_VLLM_ASYNC_TIMEOUT_SECONDS={int(timeout_seconds * 2)}"
-                )
+        try:
+            sample_result_ref = await anext(worker_gen_proxy)
+        except StopAsyncIteration:
+            raise RuntimeError(
+                f"Worker produced no output for the given sample {data}."
+            )
 
-            if msg_type == "sample":
-                # Yield individual sample result immediately
-                yield item
-            elif msg_type == "error":
-                # Cancel the task and propagate error
-                if not worker_task.done():
-                    worker_task.cancel()
-                await asyncio.gather(worker_task, return_exceptions=True)
-                raise item
-            elif msg_type == "worker_done":
-                # Worker finished, just continue the loop
-                pass
-            else:
-                raise RuntimeError(f"Unexpected message type: {msg_type}")
+        # Materialize the result from Ray's object store. ``anext`` above
+        # resolves when the worker yields, but the object bytes have not yet
+        # crossed the network to the driver — this is where that happens, and
+        # where a Ray deadlock / unreachable worker would manifest, hence the
+        # timeout.
+        try:
+            sample_result = await asyncio.wait_for(
+                sample_result_ref, timeout=timeout_seconds
+            )
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"Timeout waiting for worker results after {timeout_seconds}s. "
+                f"For longer sequences, increase timeout by setting: "
+                f"export NRL_VLLM_ASYNC_TIMEOUT_SECONDS="
+                f"{int(timeout_seconds * 2)}"
+            )
 
-        # Verify the task is actually done
-        assert worker_task.done(), (
-            f"Worker task {leader_worker_idx} should be done but isn't"
-        )
+        # sample_result is a tuple: (original_idx, BatchedDataDict).
+        original_idx, result_batch = sample_result
+        result_batch["gen_leader_worker_idx"] = [int(leader_worker_idx)]
+        yield (original_idx, result_batch)
 
     async def generate_text_async(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False

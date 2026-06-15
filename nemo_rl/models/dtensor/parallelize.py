@@ -581,14 +581,7 @@ def _parallelize_model(
 
     # Handle different model structures
     if model_cls == Gemma3ForConditionalGeneration:
-        # layers: torch.nn.ModuleList = model.language_model.layers  # type: ignore
-        layers: list = []
-        for layer in model.language_model.layers:
-            layers.append(layer)
-        # siglip encoder also has the same structure as clip encoder (being the same model after all)
-        for layer in model.vision_tower.vision_model.encoder.layers:
-            layers.append(layer)
-        layers: torch.nn.ModuleList = model.language_model.layers  # type: ignore
+        layers: torch.nn.ModuleList = model.model.language_model.layers  # type: ignore
         num_attention_heads = model.config.text_config.num_attention_heads
         num_key_value_heads = model.config.text_config.num_key_value_heads
 
@@ -611,7 +604,7 @@ def _parallelize_model(
         Qwen2VLForConditionalGeneration,
     ]:
         # VL models have the language model at model.language_model
-        layers: list = []
+        layers: list = []  # type: ignore
         # append language model layers
         for layer in model.language_model.layers:
             layers.append(layer)
@@ -623,7 +616,7 @@ def _parallelize_model(
         num_key_value_heads = model.language_model.config.num_key_value_heads
 
     elif model_cls == SmolVLMForConditionalGeneration:
-        layers: list = []
+        layers: list = []  # type: ignore
         for layer in model.model.text_model.layers:
             layers.append(layer)
         for layer in model.model.vision_model.encoder.layers:
@@ -637,7 +630,7 @@ def _parallelize_model(
         LlavaNextVideoForConditionalGeneration,
         LlavaOnevisionForConditionalGeneration,
     ]:
-        layers: list = []
+        layers: list = []  # type: ignore
         for layer in model.model.language_model.layers:
             layers.append(layer)
         for layer in model.vision_tower.vision_model.encoder.layers:
@@ -646,7 +639,7 @@ def _parallelize_model(
         num_key_value_heads = model.language_model.config.num_key_value_heads
 
     elif model_cls == Mistral3ForConditionalGeneration:
-        layers: list = []
+        layers: list = []  # type: ignore
         for layer in model.model.language_model.layers:
             layers.append(layer)
         for layer in model.model.vision_tower.transformer.layers:
@@ -655,7 +648,7 @@ def _parallelize_model(
         num_key_value_heads = model.model.language_model.config.num_key_value_heads
 
     elif model_cls == Llama4ForConditionalGeneration:
-        layers: list = []
+        layers: list = []  # type: ignore
         for layer in model.language_model.model.layers:
             layers.append(layer)
         for layer in model.vision_model.model.layers:

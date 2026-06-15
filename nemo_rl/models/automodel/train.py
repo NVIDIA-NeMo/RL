@@ -31,6 +31,10 @@ import torch
 from nemo_automodel.components.distributed.tensor_utils import to_local_if_dtensor
 from torch import nn
 from torch.distributed.tensor import DTensor, Shard
+from transformers.models.gemma3.modeling_gemma3 import (
+    Gemma3ForCausalLM,
+    Gemma3ForConditionalGeneration,
+)
 
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
@@ -54,8 +58,29 @@ PostProcessingFunction = Union[
     "LossPostProcessor",
     "LogprobsPostProcessor",
     "TopkLogitsPostProcessor",
+    "FullLogitsPostProcessor",
     "ScorePostProcessor",
 ]
+
+
+def _needs_kv_cache_for_shared_layers(model: nn.Module) -> bool:
+    """Check if the model uses KV sharing and needs use_cache=True for correct inference.
+
+    Models with num_kv_shared_layers > 0 (e.g. Gemma4 E2B) rely on DynamicCache
+    to pass K/V from anchor layers to shared layers. When use_cache=False,
+    past_key_values is None and shared layers cannot retrieve shared K/V,
+    producing incorrect outputs.
+
+    TODO: remove this workaround once upgraded to transformers>=5.5.2
+    (https://github.com/huggingface/transformers/pull/45312), which fixes
+    KV sharing without requiring use_cache=True.
+    """
+    model_config = getattr(model, "config", None)
+    text_config = (
+        getattr(model_config, "text_config", model_config) if model_config else None
+    )
+    num_kv_shared_layers = getattr(text_config, "num_kv_shared_layers", 0)
+    return isinstance(num_kv_shared_layers, int) and num_kv_shared_layers > 0
 
 
 def model_forward(
@@ -63,6 +88,7 @@ def model_forward(
     processed_inputs: ProcessedInputs,
     is_reward_model: bool = False,
     allow_flash_attn_args: bool = True,
+    use_cache: bool = False,
 ) -> torch.Tensor:
     """Perform a single forward pass through the model.
 
@@ -71,6 +97,9 @@ def model_forward(
         processed_inputs: ProcessedInputs containing all tensors for forward pass
         is_reward_model: Whether this is a reward model
         allow_flash_attn_args: Whether to pass flash_attn_kwargs to model
+        use_cache: Whether to use KV cache. Must be True for inference on models
+            with KV sharing (num_kv_shared_layers > 0). Must be False for training
+            (backward pass / gradient checkpointing).
 
     Returns:
         torch.Tensor: Output tensor from the model (logits)
@@ -79,7 +108,7 @@ def model_forward(
         input_ids=processed_inputs.input_ids,
         attention_mask=processed_inputs.attention_mask,
         position_ids=processed_inputs.position_ids,
-        use_cache=False,
+        use_cache=use_cache,
     )
 
     # Add flash attention kwargs if applicable
@@ -92,6 +121,19 @@ def model_forward(
         # flash_attn_kwargs is not supported for multimodal
         if "flash_attn_kwargs" in model_args:
             del model_args["flash_attn_kwargs"]
+
+    is_gemma3 = isinstance(model, Gemma3ForCausalLM) or isinstance(
+        model, Gemma3ForConditionalGeneration
+    )
+    if is_gemma3 and "token_type_ids" not in model_args:
+        model_args["token_type_ids"] = torch.zeros_like(processed_inputs.input_ids)
+
+    # Gemma 4 requires mm_token_type_ids even for text-only inputs
+    if getattr(getattr(model, "config", None), "model_type", None) == "gemma4":
+        if "mm_token_type_ids" not in model_args:
+            model_args["mm_token_type_ids"] = torch.zeros_like(
+                processed_inputs.input_ids
+            )
 
     # Reward models don't support flash_attn_kwargs
     if is_reward_model:
@@ -297,12 +339,22 @@ def forward_with_post_processing_fn(
     data_dict = processed_mb.data_dict
     processed_inputs = processed_mb.processed_inputs
 
+    # Models with KV sharing (num_kv_shared_layers > 0, e.g. Gemma4 E2B) need
+    # use_cache=True so that DynamicCache is created and shared layers can
+    # retrieve K/V from anchor layers. Without it, shared layers fall back to
+    # untrained K/V projections and produce garbage.
+    # This is compatible with activation checkpointing: Automodel's parallelizer
+    # keeps use_cache=True for KV-sharing models under activation checkpointing
+    # (NVIDIA-NeMo/Automodel#1705).
+    use_cache = _needs_kv_cache_for_shared_layers(model)
+
     # Model forward pass
     outputs = model_forward(
         model,
         processed_inputs,
         is_reward_model=is_reward_model,
         allow_flash_attn_args=allow_flash_attn_args,
+        use_cache=use_cache,
     )
 
     # Extract logits from model outputs
@@ -313,7 +365,12 @@ def forward_with_post_processing_fn(
     # Score computations should use unscaled logits
     if isinstance(
         post_processing_fn,
-        (LossPostProcessor, LogprobsPostProcessor, TopkLogitsPostProcessor),
+        (
+            LossPostProcessor,
+            LogprobsPostProcessor,
+            TopkLogitsPostProcessor,
+            FullLogitsPostProcessor,
+        ),
     ):
         # Temperature scaling is element-wise, directly applying it here.
         # Other sampling parameters like top-k and top-p need the logits from whole vocabulary,
@@ -331,7 +388,8 @@ def forward_with_post_processing_fn(
             sequence_dim=sequence_dim,
         )
     elif isinstance(
-        post_processing_fn, (LogprobsPostProcessor, TopkLogitsPostProcessor)
+        post_processing_fn,
+        (LogprobsPostProcessor, TopkLogitsPostProcessor),
     ):
         result = post_processing_fn(
             logits=logits,
@@ -346,6 +404,16 @@ def forward_with_post_processing_fn(
         else:
             vals, idx = result
             metrics = {"topk_logits": vals, "topk_indices": idx}
+    elif isinstance(post_processing_fn, FullLogitsPostProcessor):
+        result = post_processing_fn(
+            logits=logits,
+            data_dict=data_dict,
+            processed_inputs=processed_inputs,
+            original_batch_size=processed_mb.original_batch_size,
+            original_seq_len=processed_mb.original_seq_len,
+            sequence_dim=sequence_dim,
+        )
+        metrics = {"full_logits": result}
     elif isinstance(post_processing_fn, ScorePostProcessor):
         result = post_processing_fn(logits=logits)
         metrics = {"scores": result}
@@ -917,6 +985,80 @@ class TopkLogitsPostProcessor:
             idx = unpacked_idx
 
         return vals, idx
+
+
+class FullLogitsPostProcessor:
+    """Post-processor that returns the full teacher vocab logits unchanged.
+
+    Used by cross-tokenizer distillation: the loss fn needs the entire
+    ``[B, S, V_t]`` teacher logits tensor — no vocab reduction is done at
+    the worker. The loss fn either (a) derives a microbatch-global top-k
+    subset internally (``gold_loss=False`` path, matching PT
+    ``global_top_indices`` math) or (b) operates on full vocab directly
+    (``gold_loss=True`` path, matching PT gold). Doing the reduction in
+    the loss fn (not here) keeps transport faithful to the PT reference.
+
+    Output:
+        logits: ``[B, S, V_t]`` raw teacher logits cast to ``float32``.
+
+    v0 limitation: only the no-TP, no-CP, no-seq-packing path is
+    implemented. Asserts on the unsupported configurations — distributed
+    full-vocab gather requires TP-aware reduction not on the smoke path.
+    """
+
+    def __init__(
+        self,
+        cfg: PolicyConfig,
+        device_mesh: Any,
+        cp_mesh: Any,
+        tp_mesh: Any,
+        cp_size: int,
+        enable_seq_packing: bool = False,
+    ):
+        self.cfg = cfg
+        self.device_mesh = device_mesh
+        self.cp_mesh = cp_mesh
+        self.tp_mesh = tp_mesh
+        self.cp_size = cp_size
+        self.enable_seq_packing = enable_seq_packing
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        data_dict: BatchedDataDict[Any],
+        processed_inputs: Any,
+        original_batch_size: int,
+        original_seq_len: int,
+        sequence_dim: int = 1,
+    ) -> torch.Tensor:
+        if self.cp_size > 1:
+            raise NotImplementedError(
+                "FullLogitsPostProcessor: context_parallel_size > 1 is "
+                "not supported in v0."
+            )
+        if self.enable_seq_packing:
+            raise NotImplementedError(
+                "FullLogitsPostProcessor: sequence packing is not supported in v0."
+            )
+        if isinstance(logits, DTensor):
+            tp_group = self.tp_mesh.get_group() if self.tp_mesh is not None else None
+            tp_size = (
+                torch.distributed.get_world_size(tp_group)
+                if tp_group is not None
+                else 1
+            )
+            if tp_size > 1:
+                raise NotImplementedError(
+                    "FullLogitsPostProcessor: tensor_parallel_size > 1 "
+                    "is not supported in v0."
+                )
+            logits = logits.to_local()
+
+        # Teacher is frozen (init_optimizer=False) and the consumer does not
+        # backprop into these logits; downstream log_softmax/KL kernels upcast
+        # to fp32 internally where they need it. Ship native compute dtype
+        # (bf16 under autocast) to halve the IPC buffer footprint.
+        return logits  # [B, S, V_t]
 
 
 class ScorePostProcessor:

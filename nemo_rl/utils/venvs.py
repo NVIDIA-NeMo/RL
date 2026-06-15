@@ -158,8 +158,13 @@ def create_local_venv_on_each_node(py_executable: str, venv_name: str):
     Returns:
         str: Path to the python executable in the created virtual environment
     """
-    # Determine the number of alive Ray nodes
-    nodes = [n for n in ray.nodes() if n.get("Alive", False)]
+    # Skip nodes with 0 CPUs (e.g. unschedulable head nodes) — including them
+    # makes the STRICT_SPREAD placement group infeasible.
+    nodes = [
+        n
+        for n in ray.nodes()
+        if n.get("Alive", False) and n.get("Resources", {}).get("CPU", 0) > 0
+    ]
     num_nodes = len(nodes)
     # Reserve one CPU on each node using a STRICT_SPREAD placement group
     bundles = [{"CPU": 1} for _ in range(num_nodes)]
@@ -186,3 +191,35 @@ def create_local_venv_on_each_node(py_executable: str, venv_name: str):
     ray.util.remove_placement_group(pg)
     # Return mapping from node IP to venv python path
     return paths[0]
+
+
+def make_actor_runtime_env(actor_class_fqn: str) -> dict:
+    """Build a Ray ``runtime_env`` for one of our registered actors.
+
+    Resolves the actor's tier-specific py_executable via the registry,
+    materializes a per-node venv when uv-managed, and packages it with
+    ``VIRTUAL_ENV`` / ``UV_PROJECT_ENVIRONMENT`` env vars so workers see
+    the same interpreter as the driver.
+
+    Used by ReplayBuffer, AsyncTrajectoryCollector, and
+    SyncRolloutActor — three actors that need the VLLM tier's
+    venv on every node.
+    """
+    # Local import — venvs.py is dep-light; the registry imports
+    # PY_EXECUTABLES which transitively pulls heavier deps.
+    from nemo_rl.distributed.ray_actor_environment_registry import (
+        get_actor_python_env,
+    )
+
+    py_exec = get_actor_python_env(actor_class_fqn)
+    if py_exec.startswith("uv"):
+        py_exec = create_local_venv_on_each_node(py_exec, actor_class_fqn)
+    venv = os.path.dirname(os.path.dirname(py_exec))  # strip bin/python
+    return {
+        "py_executable": py_exec,
+        "env_vars": {
+            **os.environ,
+            "VIRTUAL_ENV": venv,
+            "UV_PROJECT_ENVIRONMENT": venv,
+        },
+    }

@@ -22,11 +22,12 @@ mlruns/
 # Test
 coverage.json
 .coverage*
-unit_results.json
-unit_results/
 test_assets/
+actual_test_nemo_gym_sanity.json
 .nrl_remote_map.json
 .nrl_remote_state.json
+# Test biproducts
+tests/functional/*/
 
 # Cache
 uv_cache/
@@ -34,10 +35,6 @@ hf_home/
 hf_datasets_cache/
 *logs/
 /datasets/
-docker/*
-!docker/Dockerfile
-!docker/Dockerfile.ngc_pytorch
-!docker/README.md
 wandb/
 checkpoints/
 results/

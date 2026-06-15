@@ -1,0 +1,365 @@
+# Ultra V3 GRPO pipeclean — 48-node GB300 NVL72.
+#
+# Converted from launch_ultra_pipeclean.sh (internal/ultra-v3-posttraining).
+# 48 nodes × 4 GPUs = 192 GPUs. Job shape:
+#   - 42 actor nodes (32 training + 10 generation, non-colocated)
+#   - 6 judge nodes (2 genrm + 2 llm_judge + 1 safety + 1 gym_extra)
+#
+# The sandbox (nemo-skills) runs as a K8s Deployment alongside the RayCluster.
+# Gym discovers it via NEMO_SKILLS_SANDBOX_HOST / NEMO_SKILLS_SANDBOX_PORT env vars.
+#
+# Prereqs:
+#   - rl-workspace PVC with ultra assets at /mnt/rl-workspace/terryk/ultra_assets/
+#   - Container images pushed to nvcr.io/nvidian/nemo-rl
+#   - KAI scheduler with gb300-topology
+#
+# Usage:
+#   RECIPE=examples/configs/grpo_ultra_48n4g_pipeclean.yaml
+#   INFRA=infra/nrl_k8s/examples/ultra_48n_pipeclean.gb300.infra.yaml
+#
+#   nrl-k8s check $RECIPE --infra $INFRA
+#   nrl-k8s run $RECIPE --infra $INFRA --raycluster --wait
+
+_shared:
+  headNodeSelector: &head_node_selector
+    nodeGroup: customer-cpu
+  workerNodeSelector: &worker_node_selector
+    nvidia.com/gpu.product: NVIDIA-GB300
+  userSecretEnvFrom: &user_secret_env_from
+    - secretRef:
+        name: ${user:}-secrets
+        optional: true
+  headEnv: &shared_head_env
+    - {name: HF_HOME,                        value: "/mnt/rl-workspace/${user:}/hf-cache"}
+    - {name: NCCL_DEBUG,                      value: WARN}
+    - {name: RAY_memory_monitor_refresh_ms,   value: "0"}
+    # Sandbox discovery — Gym reads these to connect to the nemo-skills Deployment
+    - {name: NEMO_SKILLS_SANDBOX_HOST,        value: "${user:}-ultra-pipeclean-ns-tools"}
+    - {name: NEMO_SKILLS_SANDBOX_PORT,        value: "6000"}
+  workerEnv: &shared_worker_env
+    - {name: HF_HOME,                        value: "/mnt/rl-workspace/${user:}/hf-cache"}
+    - {name: NCCL_DEBUG,                      value: WARN}
+    - {name: NCCL_MNNVL_ENABLE,              value: "1"}
+    - {name: RAY_memory_monitor_refresh_ms,   value: "0"}
+    # Sandbox discovery for workers too (Gym subprocesses may run on workers)
+    - {name: NEMO_SKILLS_SANDBOX_HOST,        value: "${user:}-ultra-pipeclean-ns-tools"}
+    - {name: NEMO_SKILLS_SANDBOX_PORT,        value: "6000"}
+  headResources: &head_resources
+    limits:   {cpu: "60", memory: "240Gi"}
+    requests: {cpu: "48", memory: "200Gi"}
+  gpuWorkerResources: &gpu_worker_resources
+    limits:
+      cpu: "144"
+      memory: "900Gi"
+      nvidia.com/gpu: "4"
+    requests:
+      cpu: "120"
+      memory: "850Gi"
+      nvidia.com/gpu: "4"
+    claims:
+      - {name: compute-domain-channel}
+      - {name: roce-channel}
+  gpuHeadPorts: &gpu_head_ports
+    - {containerPort: 6379,  name: gcs-server}
+    - {containerPort: 8265,  name: dashboard}
+    - {containerPort: 10001, name: client}
+  # PVC mounts: code at /opt/nemo-rl, data/checkpoints/models at /mnt/rl-workspace
+  codeMounts: &code_mounts
+    - {mountPath: /dev/shm, name: dshm}
+    # MOUNTED BY DEFAULT:
+    - {mountPath: /opt/nemo-rl/nemo_rl, name: rl-workspace, subPath: "${user:}/nemo-rl-ultra/nemo_rl"}
+    - {mountPath: /opt/nemo-rl/examples/configs, name: rl-workspace, subPath: "${user:}/nemo-rl-ultra/examples/configs"}
+    # OPT-IN ONLY (set the env var to enable <E2><80><94> overlaying these shadows prebuilt
+    # venvs and compiled artifacts inside the container, forcing expensive
+    # re-creation at startup):
+    - {mountPath: /opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM, name: rl-workspace, subPath: "${user:}/nemo-rl-ultra/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM"}
+    - {mountPath: /opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge, name: rl-workspace, subPath: "${user:}/nemo-rl-ultra/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge"}
+    - {mountPath: /opt/nemo-rl/3rdparty/Gym-workspace/Gym, name: rl-workspace, subPath: "${user:}/nemo-rl-ultra/3rdparty/Gym-workspace/Gym"}
+    # Use vllm inside container unless you need to swap something in
+    # - {mountPath: /opt/nemo-rl/3rdparty/vllm, name: rl-workspace, subPath: "${user:}/nemo-rl-ultra/3rdparty/vllm"}
+    - {mountPath: /mnt/rl-workspace, name: rl-workspace}
+  headVolumes: &head_volumes
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 32Gi}
+    - name: rl-workspace
+      persistentVolumeClaim: {claimName: rl-workspace}
+  workerVolumes: &worker_volumes
+    # Setting to linux kernel default (50% of gb300)
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 448Gi}
+    - name: rl-workspace
+      persistentVolumeClaim: {claimName: rl-workspace}
+
+# -- Ultra container (squash converted to docker image)
+image: nvcr.io/nvidian/nemo-rl:nightly-ultra-49267394
+imagePullSecrets: [nvcr-secret]
+serviceAccount: nemo-rl-endpoint-registry
+
+labels:
+  nrl-k8s/owner: ${user:}
+
+submit:
+  submitter: portForward
+
+launch:
+  mode: attach
+  runMode: batch
+  codeSource: image
+  codePath: /opt/nemo-rl
+  attach:
+    training: ${user:}-ultra-pipeclean-training
+  peerWatcher: false
+  env: {}
+  # Adapted from TRAIN_CMD in launch_ultra_pipeclean.sh.
+  # All Lustre paths remapped to PVC at /mnt/rl-workspace/terryk/ultra_assets/.
+  # Persistent caches at /mnt/rl-workspace/terryk/ultra_persistent_cache/.
+  entrypoint: |
+    set -eu
+    cd /opt/nemo-rl
+
+    # Source vLLM env if present
+    if [ -f /opt/nemo-rl/3rdparty/vllm/nemo-rl.env ]; then
+      source /opt/nemo-rl/3rdparty/vllm/nemo-rl.env
+    fi
+
+    # -- Asset paths (PVC-based) --
+    NRL_MODEL_PATH=/mnt/rl-workspace/terryk/ultra_assets/models/ultra-v3-sft-hsg-mainfeb19merge-mxfp8_fixed-hf_converted
+    NRL_TRAIN_PATH=/mnt/rl-workspace/terryk/ultra_assets/data/curriculum_v29_warping-muskox.no-swerl.max16k.train.jsonl
+    NRL_VAL_PATH=/mnt/rl-workspace/terryk/ultra_assets/data/curriculum_v29_warping-muskox.no-swerl.max16k.val.jsonl
+    NRL_GENRM_MODEL_PATH=/mnt/rl-workspace/terryk/ultra_assets/models/qwen235b_principle_comparison_genrm_step1230
+    # TODO: FP8 model doesn't work on GB300 without CUDA 13 container; switch to BF16 ckpt in interim
+    #NRL_NL2BASH_JUDGE_MODEL_PATH=/mnt/rl-workspace/terryk/ultra_assets/models/Qwen3-235B-A22B-Instruct-2507-FP8
+    NRL_NL2BASH_JUDGE_MODEL_PATH=/mnt/rl-workspace/terryk/ultra_assets/models/Qwen3-235B-A22B-Instruct-2507
+    NRL_SAFETY_MODEL_PATH=/mnt/rl-workspace/terryk/ultra_assets/models/Nemotron-Content-Safety-Reasoning-4B
+
+    # -- Persistent cache directories (created at runtime, not pre-downloaded) --
+    PERSISTENT_CACHE=/mnt/rl-workspace/terryk/ultra_persistent_cache
+    CACHE_READ_DIR=\${PERSISTENT_CACHE}/cache_read
+    CACHE_WRITE_DIR=\${PERSISTENT_CACHE}/cache_write
+    LUSTRE_VLLM_CACHE=\${CACHE_WRITE_DIR}/vllm_compile_cache_bf16
+    LUSTRE_INDUCTOR_CACHE=\${PERSISTENT_CACHE}/inductor_cache
+    LUSTRE_TRITON_CACHE=\${PERSISTENT_CACHE}/triton_cache
+    NRL_VLLM_LOCAL_CACHE_DIR=/tmp/nemo_rl_vllm_cache
+    NRL_VLLM_CACHE_SEED_DIR=/tmp/nemo_rl_vllm_cache_warm
+    INDUCTOR_CACHE_DIR=/tmp/nemo_rl_inductor_cache
+    TRITON_CACHE_DIR=/tmp/nemo_rl_triton_cache
+
+    mkdir -p \${PERSISTENT_CACHE} \${CACHE_READ_DIR} \${CACHE_WRITE_DIR}
+
+    # -- Checkpoint & logging --
+    CHECKPOINT_DIR=/mnt/rl-workspace/${user:}/results/ultra-v3-grpo-pipeclean
+    WANDB_NAME=ultra-v3-grpo-pipeclean-$(date +%Y%m%d-%H%M%S)
+    TIMESTAMP=$(date -u +%Y%m%d-%H%M%S-%N)
+    LOG_DIR=/mnt/rl-workspace/${user:}/driver_logs
+    NEMO_GYM_LOG_DIR=/mnt/rl-workspace/terryk/gym_logs/${user:}-ultra-pipeclean-training-\${TIMESTAMP}
+    LOG=\${LOG_DIR}/${user:}-ultra-pipeclean-training-\${TIMESTAMP}.log
+    mkdir -p "\${LOG_DIR}" "\${CHECKPOINT_DIR}" "\${NEMO_GYM_LOG_DIR}"
+
+    export RAY_enable_infeasible_task_early_exit=true
+    export PYTHONPATH=.:3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM
+
+    OMP_NUM_THREADS=16 \
+    RAY_DEDUP_LOGS=1 \
+    NRL_VLLM_USE_V1=1 \
+    VLLM_CACHE_ROOT=\${NRL_VLLM_LOCAL_CACHE_DIR} \
+    NRL_VLLM_CACHE_SEED_DIR=\${NRL_VLLM_CACHE_SEED_DIR} \
+    DG_JIT_CACHE_DIR=\${NRL_VLLM_LOCAL_CACHE_DIR}/deep_gemm \
+    TORCHINDUCTOR_CACHE_DIR=\${INDUCTOR_CACHE_DIR} \
+    TRITON_CACHE_DIR=\${TRITON_CACHE_DIR} \
+    UV_CACHE_DIR=\${PERSISTENT_CACHE}/uv \
+    RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 \
+    UV_HTTP_TIMEOUT=10 \
+    VLLM_USE_PRECOMPILED=1 \
+    VLLM_USE_FLASHINFER_MOE_FP8=1 \
+    VLLM_FLASHINFER_MOE_BACKEND=latency \
+    NRL_VLLM_ASYNC_TIMEOUT_SECONDS=1800 \
+    NRL_WG_USE_RAY_REF=1 \
+    NRL_USE_FASTOKENS=1 \
+    python ./examples/nemo_gym/run_grpo_nemo_gym.py \
+      --config examples/configs/grpo_ultra_64n4g_pipeclean.yaml \
+      policy.model_name=\${NRL_MODEL_PATH} \
+      cluster.gpus_per_node=4 \
+      cluster.num_nodes=42 \
+      cluster.segment_size=${kuberay.training.segmentSize} \
+      policy.generation.colocated.enabled=False \
+      policy.generation.colocated.resources.num_nodes=10 \
+      policy.generation.colocated.resources.gpus_per_node=4 \
+      env.nemo_gym.nemo_gym_log_dir=\${NEMO_GYM_LOG_DIR} \
+      env.nemo_gym.genrm_model.responses_api_models.genrm_model.model=\${NRL_GENRM_MODEL_PATH} \
+      env.nemo_gym.nl2bash_judge_model.responses_api_models.local_vllm_model.model=\${NRL_NL2BASH_JUDGE_MODEL_PATH} \
+      env.nemo_gym.safety_judge_model.responses_api_models.local_vllm_model.model=\${NRL_SAFETY_MODEL_PATH} \
+      data.train.data_path=\${NRL_TRAIN_PATH} \
+      data.validation.data_path=\${NRL_VAL_PATH} \
+      checkpointing.checkpoint_dir=\${CHECKPOINT_DIR} \
+      logger.log_dir=\${CHECKPOINT_DIR}/logs \
+      logger.wandb_enabled=True \
+      logger.wandb.name=\${WANDB_NAME} \
+      logger.wandb.project=grpo-ultra-v3-pipeclean \
+      2>&1 | tee -a "\${LOG}"
+
+kuberay:
+  training:
+    name: ${user:}-ultra-pipeclean-training
+    segmentSize: 16
+    annotations:
+      ray.io/overwrite-container-cmd: "true"
+    labels:
+      disagg.nemo-rl/cluster: ultra-pipeclean
+      disagg.nemo-rl/run: ultra-v3-grpo-pipeclean
+      kai.scheduler/queue: backfill
+    spec:
+      rayVersion: "2.52.0"
+      headGroupSpec:
+        rayStartParams:
+          dashboard-host: "0.0.0.0"
+          no-monitor: "true"
+          num-gpus: "0"
+          num-cpus: "0"  # This is important b/c NeMoGym class can accidentally schedule on head w/ no GPUs and error
+          object-store-memory: "200000000"
+        template:
+          spec:
+            schedulerName: kai-scheduler
+            dnsPolicy: ClusterFirst
+            nodeSelector: *head_node_selector
+            containers:
+              - name: ray-head
+                command: ["/bin/bash", "-lc", "--"]
+                args: ["ulimit -n 65536; $KUBERAY_GEN_RAY_START_CMD"]
+                env: *shared_head_env
+                envFrom: *user_secret_env_from
+                resources: *head_resources
+                ports: *gpu_head_ports
+                volumeMounts: *code_mounts
+            volumes: *head_volumes
+      workerGroupSpecs:
+        - groupName: gpu-workers
+          replicas: 48
+          minReplicas: ${.replicas}
+          maxReplicas: ${.replicas}
+          numOfHosts: 1
+          # rayStartParams are consumed by KubeRay to build the full
+          # `ray start` command (--address, --block, --num-cpus, --memory,
+          # --metrics-export-port, --dashboard-agent-listen-port, plus
+          # whatever we list here).  We set the overwrite-container-cmd
+          # annotation below so KubeRay does NOT inject that command
+          # directly — instead it is available in KUBERAY_GEN_RAY_START_CMD
+          # which our custom entrypoint eval's after the topology probe.
+          # This keeps rayStartParams as the single source of truth for
+          # Ray flags while letting us prepend the NVLink domain probe.
+          rayStartParams:
+            num-gpus: "4"
+            object-store-memory: "200000000"
+          template:
+            metadata:
+              annotations:
+                kai.scheduler/topology: gb300-topology
+                kai.scheduler/topology-required-placement: nvidia.com/gpu.clique
+            spec:
+              schedulerName: kai-scheduler
+              dnsPolicy: ClusterFirst
+              nodeSelector: *worker_node_selector
+              tolerations:
+                - operator: Exists
+              resourceClaims:
+                - name: compute-domain-channel
+                  resourceClaimTemplateName: compute-domain-ultra-pipeclean
+                - name: roce-channel
+                  resourceClaimTemplateName: roce-ultra-pipeclean
+              containers:
+                - name: ray-worker
+                  # Topology probe — K8s equivalent of ray.sub's
+                  # topology_probe.sh.  Registers nvlink_domain_<UUID>
+                  # and topo_rank as Ray custom resources so
+                  # virtual_cluster.py can do segment-aware rank
+                  # assignment.
+                  #
+                  # ray.io/overwrite-container-cmd (set on the
+                  # RayCluster metadata above) tells KubeRay not to
+                  # inject its generated command but still populate
+                  # KUBERAY_GEN_RAY_START_CMD from rayStartParams.
+                  # We eval that env var so we inherit all standard
+                  # flags (--block, --metrics-export-port, --num-cpus,
+                  # --memory, etc.) and only append --resources.
+                  # ulimit is required per Ray docs — it is NOT
+                  # included in KUBERAY_GEN_RAY_START_CMD.
+                  # See: docs.ray.io/en/latest/cluster/kubernetes/user-guides/pod-command.html
+                  command: ["/bin/bash", "-lc", "--"]
+                  args:
+                    - |
+                      ulimit -n 65536
+
+                      CLUSTER_UUID=$(nvidia-smi -q 2>/dev/null | grep 'ClusterUUID' | head -1 | awk -F: '{print $2}' | tr -d ' ')
+                      # topo_rank just needs to be unique per node (ordering within NVL domain doesn't matter)
+                      TOPO_RANK=$(hostname -i | tr -d '.')
+                      RAY_RESOURCES='{'
+                      if [[ -n "$CLUSTER_UUID" ]]; then
+                        RAY_RESOURCES+="\"nvlink_domain_\${CLUSTER_UUID}\": 1"
+                        [[ -n "$TOPO_RANK" ]] && RAY_RESOURCES+=", "
+                      fi
+                      if [[ -n "$TOPO_RANK" ]]; then
+                        RAY_RESOURCES+="\"topo_rank\": $TOPO_RANK"
+                      fi
+                      RAY_RESOURCES+='}'
+                      echo "[topo-probe] CLUSTER_UUID=\${CLUSTER_UUID:-<none>} TOPO_RANK=\${TOPO_RANK:-<none>}"
+                      echo "[topo-probe] resources=$RAY_RESOURCES"
+
+                      export NRL_GPU_CPU_AFFINITY_FILE="/tmp/nrl_gpu_cpu_affinity"
+                      nvidia-smi topo -m 2>/dev/null | awk '/^GPU[0-9]/ { gpu = $1; sub(/GPU/, "", gpu); print gpu ":" $(NF-2) }' > "$NRL_GPU_CPU_AFFINITY_FILE" || true
+
+                      eval "$KUBERAY_GEN_RAY_START_CMD --resources='$RAY_RESOURCES'"
+                  env: *shared_worker_env
+                  envFrom: *user_secret_env_from
+                  resources: *gpu_worker_resources
+                  securityContext:
+                    capabilities:
+                      add: [IPC_LOCK]
+                  volumeMounts: *code_mounts
+              volumes: *worker_volumes
+
+deployments:
+  nemo_skills:
+    name: ${user:}-ultra-pipeclean-ns-tools
+    labels:
+      nrl-k8s/component: ns-tools
+    # nrl-k8s auto-creates a ClusterIP Service with the same name.
+    # DNS: ${user}-ultra-pipeclean-ns-tools.<namespace>.svc.cluster.local:6000
+    spec:
+      replicas: 1
+      selector:
+        matchLabels:
+          app: ultra-pipeclean-ns-tools
+          nrl-k8s/owner: ${user:}
+      template:
+        metadata:
+          labels:
+            app: ultra-pipeclean-ns-tools
+            nrl-k8s/owner: ${user:}
+        spec:
+          # Sandbox image — placeholder, replace with actual skills sandbox image
+          containers:
+            - name: sandbox
+              image: nvcr.io/nvidian/nemo-rl:skills-sandbox-latest
+              command: ["/start-with-nginx.sh"]
+              ports:
+                - containerPort: 6000
+                  name: http
+              resources:
+                limits:
+                  cpu: "4"
+                  memory: "20Gi"
+                requests:
+                  cpu: "2"
+                  memory: "10Gi"
+              volumeMounts:
+                - {mountPath: /dev/shm, name: dshm}
+          volumes:
+            - name: dshm
+              emptyDir: {medium: Memory, sizeLimit: 4Gi}
+          affinity:
+            nodeAffinity:
+              preferredDuringSchedulingIgnoredDuringExecution:
+                - weight: 100
+                  preference:
+                    matchExpressions:
+                      - key: nvidia.com/gpu.product
+                        operator: DoesNotExist

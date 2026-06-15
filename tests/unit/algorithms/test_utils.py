@@ -18,6 +18,7 @@ from datetime import datetime
 import pytest
 import torch
 
+from nemo_rl.algorithms.grpo import MasterConfig
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     get_tokenizer,
@@ -224,9 +225,9 @@ def test_maybe_pad_last_batch():
 
 
 def _base_master_config(colocated: bool):
-    return {
-        "cluster": {"num_nodes": 2, "gpus_per_node": 8},
-        "policy": {
+    return MasterConfig.model_construct(
+        cluster={"num_nodes": 2, "gpus_per_node": 8},
+        policy={
             "generation": {
                 "temperature": 1.0,
                 "top_p": 1.0,
@@ -237,8 +238,8 @@ def _base_master_config(colocated: bool):
                 },
             }
         },
-        "grpo": {"num_prompts_per_step": 8, "num_generations_per_prompt": 10},
-    }
+        grpo={"num_prompts_per_step": 8, "num_generations_per_prompt": 10},
+    )
 
 
 def test_sync_colocated_throughput_flops_and_imbalance(capsys):
@@ -312,7 +313,7 @@ def test_sync_colocated_throughput_flops_and_imbalance(capsys):
 
 def test_async_non_colocated_idle_ratio_and_generation_time(capsys):
     master_config = _base_master_config(colocated=False)
-    master_config["async_grpo"] = {"enabled": True}
+    master_config.grpo["async_grpo"] = {"enabled": True}
 
     timing_metrics = {
         "policy_and_reference_logprobs": 2.0,

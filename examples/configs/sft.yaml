@@ -12,6 +12,7 @@ sft:
   val_at_start: true
   val_at_end: false
   seed: 42
+  only_unmask_final: false
 
 checkpointing:
   enabled: true
@@ -22,6 +23,11 @@ checkpointing:
   save_period: 10
   checkpoint_must_save_by: null
   save_optimizer: true
+  # pretrained_checkpoint: load weights from an existing megatron-bridge or
+  # Megatron-LM checkpoint instead of converting from HuggingFace.
+  # pretrained_checkpoint:
+  #   path: "/path/to/checkpoint"  # iter dir or checkpoint root
+  #   format: "megatron_bridge"    # or "megatron_lm"
 
 policy:
   model_name: "meta-llama/Llama-3.2-1B"
@@ -46,6 +52,9 @@ policy:
     activation_checkpointing: false
     tensor_parallel_size: 1
     context_parallel_size: 1
+    # HSDP replicate dimension size for Automodel DTensor v2.
+    # Typically set to the number of nodes; set to 1 to disable HSDP.
+    dp_replicate_size: 1
     custom_parallel_plan: null
 
     # Automodel kwargs passed to from_pretrained.
@@ -101,9 +110,21 @@ policy:
     enabled: false
     use_linear_ce_fusion_loss: false
     linear_ce_fusion_chunk_size: 256
+    force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
     env_vars: {}
     empty_unused_memory_level: 1
     activation_checkpointing: false
+    # recompute_granularity controls activation checkpointing depth.
+    # "full": recompute all activations (default, max memory savings).
+    # "selective": recompute only specific modules (see recompute_modules).
+    # Only takes effect when activation_checkpointing: true.
+    recompute_granularity: "full"
+    # Modules to selectively recompute when recompute_granularity="selective".
+    # MCore options: ["core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe", "shared_experts"].
+    # Null defaults to ["core_attn"]. Full list and per-module constraints:
+    # https://github.com/NVIDIA/Megatron-LM/blob/d30c3ae5469fe3f6a64d4fd2e63b6e7f7844ea81/megatron/core/transformer/transformer_config.py#L483
+    # Use ["moe"] for MoE models to recompute expert activations only.
+    recompute_modules: null
     tensor_model_parallel_size: 1
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 1
@@ -117,7 +138,7 @@ policy:
     moe_router_dtype: null
     moe_router_load_balancing_type: "aux_loss"
     moe_router_bias_update_rate: 1e-3
-    moe_permute_fusion: false
+    moe_permute_fusion: true
     #gives ~20% training perf speedup with sequence packing 
     apply_rope_fusion: True
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
@@ -127,6 +148,7 @@ policy:
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
+    gradient_accumulation_fusion: false
 
     peft:
       enabled: false

@@ -53,8 +53,8 @@ FP8 generations are recommended to be configured with the following settings:
                 num_first_layers_in_bf16: 0
                 # Use FP32 scaling factors. Rounding scaling factors to the nearest pow2 may improve quantization 
                 # fidelity however this feature is still under research.
-                use_weight_pow2_scale: False
-                use_activation_pow2_scale: False
+                pow2_weight_scaling_factors: False
+                pow2_activation_scaling_factors: False
 ```
 
 To train with FP8, you need to set the Megatron path and configure it using the following settings:
@@ -93,4 +93,4 @@ The above results are from Llama-3.1-8B-Instruct GRPO experiments. You can run t
 * For FP8: `examples/configs/grpo_math_8B_megatron_fp8.yaml`
 
 In the experiment in this figure, enabling FP8 rollout and training gives 15%-25% decrease in step time, and the validation accuracy curves match up to 1000 steps.
-Efforts are ongoing to performs longer runs and further optimize performance.
+Efforts are ongoing to perform longer runs and further optimize performance.

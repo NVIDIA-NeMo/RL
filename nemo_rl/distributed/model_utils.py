@@ -12,15 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
-from megatron.core.models.gpt import GPTModel
-from megatron.core.parallel_state import (
-    get_tensor_model_parallel_group,
-    get_tensor_model_parallel_rank,
-)
-from megatron.core.utils import deprecate_inference_params, get_pg_size
 from torch.distributed.tensor import DTensor, distribute_tensor
 
 from nemo_rl.algorithms.logits_sampling_utils import (
@@ -28,6 +22,11 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     apply_top_k_top_p,
     need_top_k_or_top_p_filtering,
 )
+
+if TYPE_CHECKING:
+    # megatron-core (optional "mcore" extra) is imported lazily below so this
+    # module imports without mcore installed.
+    from megatron.core.models.gpt import GPTModel
 
 
 @torch.no_grad()
@@ -1216,7 +1215,7 @@ def _get_tokens_on_this_cp_rank(
 
     for ind in shard_inds:
         slices[seq_dim] = slice(ind * shard_size, (ind + 1) * shard_size)
-        ids_chunks.append(input_ids[slices])
+        ids_chunks.append(input_ids[tuple(slices)])
 
     ids = torch.cat(ids_chunks, dim=seq_dim)
     return ids
@@ -1833,7 +1832,6 @@ class ChunkedDistributedEntropy(torch.autograd.Function):
 def from_parallel_hidden_states_to_logprobs(
     tensor_parallel_hidden_states: torch.Tensor,
     output_weight_layer: torch.Tensor,
-    output_weight: torch.Tensor,
     runtime_gather_output: bool,
     target: torch.Tensor,
     vocab_start_index: int,
@@ -2045,6 +2043,8 @@ class ChunkedDistributedHiddenStatesToLogprobs(torch.autograd.Function):
 
 
 def patch_gpt_model_forward_for_linear_ce_fusion(*, chunk_size: int) -> None:
+    from megatron.core.models.gpt import GPTModel
+
     if getattr(GPTModel, "_linear_ce_fusion_forward_patched", False):
         GPTModel._linear_ce_fusion_chunk_size = chunk_size
         return
@@ -2055,7 +2055,7 @@ def patch_gpt_model_forward_for_linear_ce_fusion(*, chunk_size: int) -> None:
 
 
 def _gpt_forward_with_linear_ce_fusion(
-    self: GPTModel,
+    self: "GPTModel",
     input_ids: torch.Tensor,
     position_ids: torch.Tensor,
     attention_mask: torch.Tensor,
@@ -2071,6 +2071,12 @@ def _gpt_forward_with_linear_ce_fusion(
     padding_mask: Optional[torch.Tensor] = None,
     return_logprobs_for_linear_ce_fusion: bool = False,
 ) -> torch.Tensor:
+    from megatron.core.parallel_state import (
+        get_tensor_model_parallel_group,
+        get_tensor_model_parallel_rank,
+    )
+    from megatron.core.utils import deprecate_inference_params, get_pg_size
+
     if not return_logprobs_for_linear_ce_fusion:
         return self._original_forward_for_linear_ce_fusion(
             input_ids=input_ids,
@@ -2151,13 +2157,17 @@ def _gpt_forward_with_linear_ce_fusion(
     # calculate the logprobs for the last token and then return the logprobs
     vocab_start_index = tp_rank * (self.vocab_size // tp_size)
     vocab_end_index = min((tp_rank + 1) * (self.vocab_size // tp_size), self.vocab_size)
-    output_weight_layer = self.output_layer.weight
+    # For models with tied embeddings (e.g. Qwen3), self.output_layer.weight is None —
+    # the real weight lives on the embedding and must be fetched via
+    # shared_embedding_or_output_weight().
+    output_weight_layer = (
+        self.shared_embedding_or_output_weight()
+        if self.share_embeddings_and_output_weights
+        else self.output_layer.weight
+    )
     logprobs = from_parallel_hidden_states_to_logprobs(
         hidden_states,  # .transpose(0, 1).contiguous(),
         output_weight_layer,
-        self.shared_embedding_or_output_weight()
-        if self.share_embeddings_and_output_weights
-        else self.output_layer.weight,
         runtime_gather_output,
         labels,
         vocab_start_index=vocab_start_index,

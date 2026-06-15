@@ -30,6 +30,8 @@ class VllmSpecificArgs(TypedDict):
     precision: NotRequired[str]
     kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3"]
     enforce_eager: NotRequired[bool]
+    # Whether to show a tqdm progress bar during generation. Defaults to vLLM's own default (True) when absent. Only applies when async_engine is False.
+    use_tqdm: NotRequired[bool]
     # By default, NeMo RL only has a Python handle to the vllm.LLM generation engine. The expose_http_server flag here will expose that generation engine as an HTTP server.
     # Exposing vLLM as a server is useful in instances where the multi-turn rollout is performed with utilities outside of NeMo RL, but the user still wants to take advantage of the refit logic in NeMo RL that keeps the policy and generation up to date.
     # Currently it will expose the /tokenize and /v1/chat/completions endpoints. Later on we may expose /v1/completions or /v1/responses.
@@ -39,8 +41,17 @@ class VllmSpecificArgs(TypedDict):
     # Miscellaneous top level vLLM HTTP server arguments.
     # A filepath that can be imported to register a vLLM tool parser
     tool_parser_plugin: NotRequired[str]
+    # Extra environment variables forwarded to every vLLM worker process. Useful
+    # for per-recipe knobs (e.g. forcing a specific fused-MoE backend) without
+    # affecting other test cases.
+    env_vars: NotRequired[dict[str, str]]
+    # A filepath that can be imported to register a vLLM reasoning parser
+    reasoning_parser_plugin: NotRequired[str]
 
 
 class VllmConfig(GenerationConfig):
     vllm_cfg: VllmSpecificArgs
     vllm_kwargs: NotRequired[dict[str, Any]]
+
+    # quantization config
+    quant_cfg: NotRequired[str | None]

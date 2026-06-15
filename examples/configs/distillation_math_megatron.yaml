@@ -39,7 +39,17 @@ policy: &POLICY_BASE
         enabled: true
         empty_unused_memory_level: 0
         activation_checkpointing: false
-        converter_type: "Qwen3ForCausalLM"
+        # recompute_granularity controls activation checkpointing depth.
+        # "full": recompute all activations (default, max memory savings).
+        # "selective": recompute only specific modules (see recompute_modules).
+        # Only takes effect when activation_checkpointing: true.
+        recompute_granularity: "full"
+        # Modules to selectively recompute when recompute_granularity="selective".
+        # MCore options: ["core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe", "shared_experts"].
+        # Null defaults to ["core_attn"]. Full list and per-module constraints:
+        # https://github.com/NVIDIA/Megatron-LM/blob/d30c3ae5469fe3f6a64d4fd2e63b6e7f7844ea81/megatron/core/transformer/transformer_config.py#L483
+        # Use ["moe"] for MoE models to recompute expert activations only.
+        recompute_modules: null
         tensor_model_parallel_size: 2
         expert_tensor_parallel_size: 1
         expert_model_parallel_size: 1
@@ -53,7 +63,7 @@ policy: &POLICY_BASE
         moe_router_dtype: "fp64"
         moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
         moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
-        moe_permute_fusion: false
+        moe_permute_fusion: true
         #gives ~20% training perf speedup with sequence packing 
         apply_rope_fusion: True
         bias_activation_fusion: True
@@ -145,6 +155,7 @@ policy: &POLICY_BASE
             num_last_layers_in_bf16: 0
             num_first_layers_in_bf16: 0
             distributed_executor_backend: null
+        vllm_kwargs: {}
 
         colocated:
             # true: generation shares training GPUs

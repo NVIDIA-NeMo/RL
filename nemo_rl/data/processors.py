@@ -379,8 +379,7 @@ def math_data_processor(
     return output
 
 
-# TODO: @yukih: unify to math_hf_data_processor once https://github.com/NVIDIA-NeMo/RL/issues/2060 is resolved.
-def math_gdpo_data_processor(
+def math_hf_data_processor(
     datum_dict: dict[str, Any],
     task_data_spec: TaskDataSpec,
     tokenizer: TokenizerType,
@@ -394,7 +393,6 @@ def math_gdpo_data_processor(
 
     # merge system prompt and user prompt
     message_list = []
-    # system prompt
     if task_data_spec.system_prompt:
         message_list.append(
             {
@@ -402,10 +400,10 @@ def math_gdpo_data_processor(
                 "content": task_data_spec.system_prompt,
             }
         )
-    # user prompt
-    if task_data_spec.prompt:
-        problem = task_data_spec.prompt.format(problem)
-    message_list.append({"role": "user", "content": problem})
+    formatted_content = (
+        task_data_spec.prompt.format(problem) if task_data_spec.prompt else problem
+    )
+    message_list.append({"role": "user", "content": formatted_content})
 
     message: str = tokenizer.apply_chat_template(  # type: ignore
         message_list,
@@ -413,70 +411,15 @@ def math_gdpo_data_processor(
         add_generation_prompt=True,
         add_special_tokens=False,
     )
-    token_ids = tokenizer(message, return_tensors="pt", add_special_tokens=False)[
-        "input_ids"
-    ][0]
 
-    message_log: LLMMessageLogType = [
-        {"role": "user", "content": message, "token_ids": token_ids}
-    ]
-
-    length = sum(len(m["token_ids"]) for m in message_log)
-
-    loss_multiplier = 1.0
-    if length > max_seq_length:
-        # make smaller and mask out
-        for chat_message in message_log:
-            chat_message["token_ids"] = chat_message["token_ids"][
-                : min(4, max_seq_length // len(message_log))
-            ]
-        loss_multiplier = 0.0
-
-    output: DatumSpec = {
-        "message_log": message_log,
-        "length": length,
-        "extra_env_info": extra_env_info,
-        "loss_multiplier": loss_multiplier,
-        "idx": idx,
-        "task_name": datum_dict["task_name"],
-    }
-    return output
-
-
-def math_hf_data_processor(
-    datum_dict: dict[str, Any],
-    task_data_spec: TaskDataSpec,
-    tokenizer: TokenizerType,
-    max_seq_length: int,
-    idx: int,
-) -> DatumSpec:
-    """Process a datum dictionary (directly loaded from data/hf_datasets/openmathinstruct2.py) into a DatumSpec for the Reward Model Environment."""
-    user_message = datum_dict["messages"]
-    problem = user_message[0]["content"]
-    extra_env_info = {"ground_truth": user_message[1]["content"]}
-
-    message_log: LLMMessageLogType = []
-    formatted_content = (
-        task_data_spec.prompt.format(problem) if task_data_spec.prompt else problem
-    )
-    user_message = {
-        "role": "user",
-        "content": formatted_content,
-    }
-    message: list[str] = tokenizer.apply_chat_template(  # type: ignore
-        [user_message],
-        tokenize=False,
-        add_generation_prompt=True,
-        add_special_tokens=False,
-    )
-
-    user_message["token_ids"] = tokenizer(
+    token_ids = tokenizer(
         message,
         return_tensors="pt",
         add_special_tokens=False,
     )["input_ids"][0]
-    user_message["content"] = message
-    message_log.append(user_message)
+    message_log: LLMMessageLogType = [
+        {"role": "user", "content": message, "token_ids": token_ids}
+    ]
 
     length = sum(len(m["token_ids"]) for m in message_log)
 
@@ -529,29 +472,32 @@ def vlm_hf_data_processor(
         datum_dict = format_refcoco_dataset(datum_dict)
     elif datum_dict["task_name"] == "geometry3k":
         datum_dict = format_geometry3k_dataset(datum_dict)
+    elif datum_dict["task_name"] == "avqa":
+        pass  # AVQA data is already formatted by AVQADataset.format_data
+    elif datum_dict["task_name"] == "audiomcq":
+        pass  # AudioMCQ data is already formatted by AudioMCQDataset.format_data
+    elif datum_dict["task_name"] == "mmau":
+        pass  # MMAU data is already formatted by MMAUDataset.format_data
     else:
         raise ValueError(f"No data processor for task {datum_dict['task_name']}")
 
     user_message = datum_dict["messages"]
     problem = user_message[0]["content"]
     extra_env_info = {"ground_truth": user_message[1]["content"]}
+    if "choices" in datum_dict:
+        extra_env_info["choices"] = datum_dict["choices"]
 
     message_log: VLMMessageLogType = []
     ### only one round of interaction is assumed, this can easily be extended to a conversational setting
     user_message: dict[str, Any] = {"role": "user", "content": []}
     #
     images = []
+    audios = []
     if isinstance(problem, list):
         for content in problem:
-            # for image, video, just append it
+            # for image, video, audio, just append it
             # for text, format the prompt to the problem
-            if content["type"] != "text":
-                user_message["content"].append(content)
-                if content["type"] == "image":
-                    images.append(content["image"])
-                else:
-                    raise ValueError(f"Unsupported content type: {content['type']}")
-            elif content["type"] == "text":
+            if content["type"] == "text":
                 user_message["content"].append(
                     {
                         "type": "text",
@@ -560,6 +506,17 @@ def vlm_hf_data_processor(
                         else content["text"],
                     }
                 )
+            elif content["type"] == "image":
+                user_message["content"].append(content)
+                images.append(content["image"])
+            elif content["type"] == "audio":
+                user_message["content"].append(content)
+                # Store as (audio_array, sample_rate) tuple for vLLM
+                audios.append(
+                    (content["audio"], processor.feature_extractor.sampling_rate)
+                )
+            else:
+                raise ValueError(f"Unsupported content type: {content['type']}")
     else:
         # conversation consists of a text-only message
         user_message["content"] = task_data_spec.prompt.format(problem)
@@ -618,6 +575,7 @@ def vlm_hf_data_processor(
         vllm_kwargs = {
             "vllm_content": None,
             "vllm_images": [],
+            "vllm_audios": [],
         }
 
         # make smaller and mask out
@@ -630,11 +588,11 @@ def vlm_hf_data_processor(
                     chat_message[key] = PackedTensor.empty_like(value)
         loss_multiplier = 0.0
     else:
-        # get the prompt content! (use this for vllm-backend that needs formatted dialog and list of images) for the entire conversation
-        # add images for vllm serving
+        # get the prompt content! (use this for vllm-backend that needs formatted dialog and list of images/audios) for the entire conversation
         vllm_kwargs = {
             "vllm_content": string_formatted_dialog,
             "vllm_images": images,
+            "vllm_audios": audios,
         }
 
     output: DatumSpec = {
@@ -751,6 +709,33 @@ def nemo_gym_data_processor(
     return output
 
 
+def kd_data_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer: TokenizerType,
+    max_seq_length: int | None,
+    idx: int,
+) -> DatumSpec:
+    """Process a raw-text datum for cross-tokenizer distillation.
+
+    Tokenization is deferred to the collator, so the text is carried forward
+    as a single assistant message in ``message_log``.
+    """
+    output: DatumSpec = {
+        # Defensive shallow-per-message copy so downstream mutation (e.g.
+        # adding token_ids) doesn't leak back into the dataset row.
+        "message_log": [dict(m) for m in datum_dict["messages"]],
+        "loss_multiplier": 1.0,
+        "idx": idx,
+        # fake keys (not used for cross-tokenizer distillation)
+        "length": 0,
+        "extra_env_info": None,
+    }
+    if "task_name" in datum_dict:
+        output["task_name"] = datum_dict["task_name"]
+    return output
+
+
 # Processor registry. Key is the processor name, value is the processor function.
 # Note: We cast the literal dict to Dict[str, TaskDataProcessFnCallable] because
 # type checkers see each concrete function's signature as a distinct callable type.
@@ -762,9 +747,9 @@ PROCESSOR_REGISTRY: Dict[str, TaskDataProcessFnCallable] = cast(
     {
         "default": math_hf_data_processor,
         "helpsteer3_data_processor": helpsteer3_data_processor,
+        "kd_data_processor": kd_data_processor,
         "math_data_processor": math_data_processor,
         "math_hf_data_processor": math_hf_data_processor,
-        "math_gdpo_data_processor": math_gdpo_data_processor,
         "multichoice_qa_processor": multichoice_qa_processor,
         "sft_processor": sft_processor,
         "vlm_hf_data_processor": vlm_hf_data_processor,
