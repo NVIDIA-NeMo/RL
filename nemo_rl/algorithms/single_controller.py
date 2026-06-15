@@ -240,7 +240,7 @@ class SingleControllerActor:
         while max_epochs is None or epoch < max_epochs:
             for prompt_batch in self._dataloader:
                 for prompt_idx in range(prompt_batch.size):
-                    prompt: DatumSpec = {
+                    prompt: DatumSpec = {  # type: ignore
                         k: v[prompt_idx] for k, v in prompt_batch.items()
                     }
 
