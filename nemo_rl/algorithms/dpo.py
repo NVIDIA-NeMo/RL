@@ -704,7 +704,7 @@ def dpo_train(
                     with timer.time("checkpointing"):
                         print(f"Saving checkpoint for step {total_steps + 1}...")
                         checkpoint_path = checkpointer.init_tmp_checkpoint(
-                            total_steps + 1, dpo_save_state, master_config
+                            total_steps + 1, vars(dpo_save_state), master_config
                         )
                         policy.save_checkpoint(
                             weights_path=os.path.join(
