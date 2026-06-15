@@ -22,7 +22,10 @@ import pytest
 
 def _load_refit_helpers():
     """Load the small refit helpers without importing Megatron/Ray/Torch."""
-    source = Path("nemo_rl/models/policy/workers/megatron_policy_worker.py")
+    source = (
+        Path(__file__).resolve().parents[4]
+        / "nemo_rl/models/policy/workers/megatron_policy_worker.py"
+    )
     module = ast.parse(source.read_text())
     helper_names = {
         "_should_merge_adapter_weights_for_refit",

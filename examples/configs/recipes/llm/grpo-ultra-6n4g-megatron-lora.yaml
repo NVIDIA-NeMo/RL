@@ -172,7 +172,6 @@ policy:
     sequence_parallel: true
 
     # MoE
-    # PEFT currently does not support freezing the MoE router in this path.
     freeze_moe_router: false
     moe_router_dtype: "fp32"
     moe_router_load_balancing_type: "none"

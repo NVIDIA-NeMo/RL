@@ -794,11 +794,11 @@ def setup_model_and_optimizer(
         peft_cfg = policy_cfg["megatron_cfg"].get("peft", {})
         if "dim" not in peft_cfg or peft_cfg["dim"] is None:
             raise ValueError(
-                "If megtatron_cfg.peft.enabled is True, dim must be set in peft_cfg"
+                "If megatron_cfg.peft.enabled is True, dim must be set in peft_cfg"
             )
         if "alpha" not in peft_cfg or peft_cfg["alpha"] is None:
             raise ValueError(
-                "If megtatron_cfg.peft.enabled is True, alpha must be set in peft_cfg"
+                "If megatron_cfg.peft.enabled is True, alpha must be set in peft_cfg"
             )
         peft = LoRA(
             target_modules=peft_cfg["target_modules"],
@@ -972,11 +972,11 @@ def setup_reference_model_state(
         peft_cfg = config["megatron_cfg"].get("peft", {})
         if "dim" not in peft_cfg or peft_cfg["dim"] is None:
             raise ValueError(
-                "If megtatron_cfg.peft.enabled is True, dim must be set in peft_cfg"
+                "If megatron_cfg.peft.enabled is True, dim must be set in peft_cfg"
             )
         if "alpha" not in peft_cfg or peft_cfg["alpha"] is None:
             raise ValueError(
-                "If megtatron_cfg.peft.enabled is True, alpha must be set in peft_cfg"
+                "If megatron_cfg.peft.enabled is True, alpha must be set in peft_cfg"
             )
         peft = LoRA(
             target_modules=peft_cfg["target_modules"],

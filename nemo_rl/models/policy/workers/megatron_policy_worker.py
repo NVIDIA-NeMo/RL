@@ -118,6 +118,11 @@ def _validate_merged_refit_weight_name(name: str) -> None:
         )
 
 
+def _apply_state_dict_to_model(model: torch.nn.Module, state_dict: dict[str, Any]) -> None:
+    """Apply a state dict with strict key validation and full module state handling."""
+    model.load_state_dict(state_dict, strict=True)
+
+
 def _iter_refit_base_weights(
     *,
     megatron_bridge: Any,
@@ -630,10 +635,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                         )
                     model_state_dict[name] = item
 
-                # Swap reference model state_dict to self.model
-                for k, v in self.model.state_dict().items():
-                    if isinstance(v, torch.Tensor):
-                        v.copy_(self.reference_state_dict[k])
+                _apply_state_dict_to_model(self.model, self.reference_state_dict)
 
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
                     gc.collect()
@@ -645,9 +647,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
             finally:
                 # Restore original references and device placement
-                for k, v in self.model.state_dict().items():
-                    if isinstance(v, torch.Tensor):
-                        v.copy_(model_state_dict[k])
+                _apply_state_dict_to_model(self.model, model_state_dict)
 
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
                     gc.collect()
