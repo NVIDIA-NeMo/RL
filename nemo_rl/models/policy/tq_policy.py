@@ -339,6 +339,35 @@ class TQPolicy(Policy):
             common_kwargs={"micro_batch_size": micro_batch_size},
         )
 
+    def prepare_logprobs_from_meta(
+        self,
+        meta: KVBatchMeta,
+        *,
+        refresh_policy_logprobs: bool = False,
+        refresh_reference_logprobs: bool = False,
+        micro_batch_size: Optional[int] = None,
+        timer: Optional[Timer] = None,
+    ) -> None:
+        """Refresh policy and/or reference logprobs for ``meta``.
+
+        Thin dispatcher over :meth:`get_logprobs_from_meta` and
+        :meth:`get_reference_policy_logprobs_from_meta` exposing a single
+        entrypoint for SingleController's per-group logprob refresh hook.
+        Workers write the per-token tensors back into the TQ partition;
+        the Ray return is None. No-op if both flags are False.
+
+        ``PolicyTrainerActor`` wraps this as an actor-callable method so
+        SC can invoke it via ``self._trainer.prepare_logprobs_from_meta.remote``.
+        """
+        if refresh_policy_logprobs:
+            self.get_logprobs_from_meta(
+                meta, micro_batch_size=micro_batch_size, timer=timer
+            )
+        if refresh_reference_logprobs:
+            self.get_reference_policy_logprobs_from_meta(
+                meta, micro_batch_size=micro_batch_size, timer=timer
+            )
+
     def train_from_meta(
         self,
         meta: KVBatchMeta,

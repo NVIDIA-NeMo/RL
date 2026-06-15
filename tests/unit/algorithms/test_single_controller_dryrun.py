@@ -30,7 +30,6 @@ Key questions answered:
 from __future__ import annotations
 
 import asyncio
-import os
 import threading
 import time
 from typing import Any
@@ -39,13 +38,6 @@ import pytest
 import ray
 import torch
 from tensordict import TensorDict
-
-# ── Ray temp dir: must be SHORT on macOS (AF_UNIX path limit = 103 bytes) ─
-# Use a fixed short path under /tmp to avoid hitting the socket length limit.
-_RAY_TEMP = "/tmp/nrl_sc_test"
-os.makedirs(_RAY_TEMP, exist_ok=True)
-os.environ["RAY_TEMP_DIR"] = _RAY_TEMP
-os.environ["RAY_TMPDIR"] = _RAY_TEMP
 
 from nemo_rl.algorithms.single_controller import (
     SingleControllerActor,
@@ -281,6 +273,8 @@ class DryRunTrainer:
         self._microbatch_calls: list[tuple[str, list[str], float]] = []
         self._finish_calls: list[str] = []
         self._abort_calls: list[str] = []
+        # (sample_ids, refresh_policy, refresh_reference) per call
+        self._prepare_logprobs_calls: list[tuple[list[str], bool, bool]] = []
 
     async def begin_train_step(
         self,
@@ -333,17 +327,31 @@ class DryRunTrainer:
         self._open_step_id = None
         self._trainer_version += 1
         self._train_count += 1
-        return {
-            "loss": 1.0 / (self._trainer_version + 1),
-            "trainer_version": self._trainer_version,
-        }
+        # NOTE: real backends (TQPolicy, MegatronPolicyWorker) do not emit a
+        # trainer_version key — SC owns that counter. Stub keeps its own
+        # _trainer_version only for assertions in tests.
+        return {"loss": 1.0 / (self._trainer_version + 1)}
 
     async def abort_train_step(self, step_id: str) -> None:
         self._abort_calls.append(step_id)
         self._open_step_id = None
 
-    async def prepare_logprobs_from_meta(self, meta: KVBatchMeta) -> None:
-        del meta
+    async def prepare_logprobs_from_meta(
+        self,
+        meta: KVBatchMeta,
+        *,
+        refresh_policy_logprobs: bool = False,
+        refresh_reference_logprobs: bool = False,
+    ) -> None:
+        # Record (sample_ids, flags) per call so tests can assert the SC
+        # logprob-refresh hook fires with the right config-driven flags.
+        self._prepare_logprobs_calls.append(
+            (
+                list(meta.sample_ids),
+                refresh_policy_logprobs,
+                refresh_reference_logprobs,
+            )
+        )
         return None
 
     def get_open_step_id(self) -> str | None:
@@ -357,6 +365,11 @@ class DryRunTrainer:
 
     def get_abort_calls(self) -> list[str]:
         return list(self._abort_calls)
+
+    def get_prepare_logprobs_calls(
+        self,
+    ) -> list[tuple[list[str], bool, bool]]:
+        return list(self._prepare_logprobs_calls)
 
     async def train_from_meta(self, meta: KVBatchMeta) -> dict:
         """Simulate a training step."""
@@ -482,6 +495,8 @@ class TestSingleControllerDryRun:
         max_weight_staleness_versions=1,
         advantage_enabled=False,
         advantage_estimator=None,
+        advantage_policy_logprobs_field=None,
+        advantage_reference_logprobs_field=None,
         diagnostics=False,
     ):
         cfg = SingleControllerConfig(
@@ -493,6 +508,8 @@ class TestSingleControllerDryRun:
             max_inflight_prompts=max_inflight_prompts,
             max_weight_staleness_versions=max_weight_staleness_versions,
             advantage_enabled=advantage_enabled,
+            advantage_policy_logprobs_field=advantage_policy_logprobs_field,
+            advantage_reference_logprobs_field=advantage_reference_logprobs_field,
             diagnostics=diagnostics,
         )
         if weight_sync is None:
@@ -505,6 +522,7 @@ class TestSingleControllerDryRun:
             gen,
             trainer,
             weight_sync,
+            None,  # loss_fn stub — DryRunTrainer ignores it
             advantage_estimator,
         )
 
@@ -529,6 +547,81 @@ class TestSingleControllerDryRun:
         result = ray.get(ctrl.run.remote(), timeout=30)
         assert result["train_steps"] == 3
         assert result["trainer_version"] == 3
+
+    def test_prepare_logprobs_called_before_advantage_pump(self, ray_init):
+        """SC fires prepare_logprobs_from_meta with config-driven flags.
+
+        When ``advantage_policy_logprobs_field`` / ``advantage_reference_logprobs_field``
+        are set on the config, the train_pump must call
+        ``trainer.prepare_logprobs_from_meta(meta, refresh_policy_logprobs=...,
+        refresh_reference_logprobs=...)`` exactly once per consumed group,
+        before advantage estimation. With both fields None, the hook must
+        not fire at all.
+        """
+        # Case 1: both flags set
+        dp_client = FakeDataPlaneActor.remote()
+        gen = DryRunGenWorker.remote(gen_latency_s=0.01)
+        trainer = DryRunTrainer.remote(dp_client, train_latency_s=0.01)
+
+        ctrl = self._make_controller(
+            dp_client,
+            gen,
+            trainer,
+            max_train_steps=1,
+            max_rollout_prompts=2,
+            min_prompt_groups_per_batch=2,
+            generations_per_prompt=1,
+            advantage_policy_logprobs_field="policy_logprobs",
+            advantage_reference_logprobs_field="reference_logprobs",
+        )
+        ray.get(ctrl.run.remote(), timeout=30)
+        calls = ray.get(trainer.get_prepare_logprobs_calls.remote())
+        assert len(calls) == 2, f"expected 2 logprob refresh calls, got {calls}"
+        for sample_ids, refresh_policy, refresh_ref in calls:
+            assert refresh_policy is True
+            assert refresh_ref is True
+            assert len(sample_ids) > 0
+
+        # Case 2: only policy field set
+        dp_client2 = FakeDataPlaneActor.remote()
+        gen2 = DryRunGenWorker.remote(gen_latency_s=0.01)
+        trainer2 = DryRunTrainer.remote(dp_client2, train_latency_s=0.01)
+        ctrl2 = self._make_controller(
+            dp_client2,
+            gen2,
+            trainer2,
+            max_train_steps=1,
+            max_rollout_prompts=2,
+            min_prompt_groups_per_batch=2,
+            generations_per_prompt=1,
+            advantage_policy_logprobs_field="policy_logprobs",
+        )
+        ray.get(ctrl2.run.remote(), timeout=30)
+        calls2 = ray.get(trainer2.get_prepare_logprobs_calls.remote())
+        assert len(calls2) == 2
+        for _, refresh_policy, refresh_ref in calls2:
+            assert refresh_policy is True
+            assert refresh_ref is False
+
+        # Case 3: neither field set → hook must not fire
+        dp_client3 = FakeDataPlaneActor.remote()
+        gen3 = DryRunGenWorker.remote(gen_latency_s=0.01)
+        trainer3 = DryRunTrainer.remote(dp_client3, train_latency_s=0.01)
+        ctrl3 = self._make_controller(
+            dp_client3,
+            gen3,
+            trainer3,
+            max_train_steps=1,
+            max_rollout_prompts=2,
+            min_prompt_groups_per_batch=2,
+            generations_per_prompt=1,
+        )
+        ray.get(ctrl3.run.remote(), timeout=30)
+        calls3 = ray.get(trainer3.get_prepare_logprobs_calls.remote())
+        assert calls3 == [], (
+            "prepare_logprobs_from_meta must not be called when both "
+            f"advantage_*_logprobs_field are None; got {calls3}"
+        )
 
     def test_advantage_pump_writes_advantages_before_train(self, ray_init):
         """SC computes advantages from DataPlane inputs and writes them back."""
@@ -961,6 +1054,7 @@ class TestStreamingTrainPump:
             gen,
             trainer,
             weight_sync,
+            None,  # loss_fn stub — DryRunTrainer ignores it
             None,
         )
 
