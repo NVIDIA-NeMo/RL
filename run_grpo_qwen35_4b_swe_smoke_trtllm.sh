@@ -30,10 +30,16 @@ CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-${REPO_ROOT}/results}"
 # lyris-covered subsets (only instances with a present .sif): 11 train / 182 val.
 # Full blends barely overlap the lyris gym_sifs (11/921, 182/405) + shuffle is off, so the
 # full files would fail on the first uncovered instance. Use the subsets for the smoke.
-TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-${REPO_ROOT}/balanced_language_lyris_subset.jsonl}"
+# 2026-06-11: switched train to SWE-bench_Verified instances with a present SIF (202 tasks,
+# all SIF-backed) so a 50-step run has distinct tasks (the old subset had only 10 -> cycled).
+# Built by make_swebench_jsonl.py (format-validated against gym data/example.jsonl). See
+# run_logs_lyris.md "Train jsonl: SWE-bench_Verified all-SIF". Old subset (10 tasks):
+#   ${REPO_ROOT}/balanced_language_lyris_subset.jsonl
+TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-${REPO_ROOT}/swebench_verified_lyris_sif.jsonl}"
 VAL_DATA_PATH="${VAL_DATA_PATH:-${REPO_ROOT}/swe_public_datasets_val_swebench_lyris_subset.jsonl}"
-# lyris: Qwen3.5-4B from erinh's models (oci-hsg path was ruit/hf_models)
-DEFAULT_MODEL_PATH="/lustre/fsw/coreai_comparch_trtllm/erinh/llm-models/Qwen/Qwen3.5-4B"
+# lyris: swapped from Qwen3.5-4B (Qwen3-Next GDN/MoE -> trtllm partial-weight-refit
+# unsupported, see run_logs_lyris.md) to dense Qwen3-4B-Instruct-2507 for trtllm pipe-clean.
+DEFAULT_MODEL_PATH="/lustre/fsw/coreai_comparch_trtllm/erinh/llm-models/Qwen3-4B-Instruct-2507"
 MODEL_PATH="${1:-${MODEL_PATH:-${DEFAULT_MODEL_PATH}}}"
 
 # ================ Container and mount config ================
@@ -67,13 +73,39 @@ NUM_GENERATION_NODES=${NUM_GEN_NODES:-1}           # only used in async (non-col
 # ============================ Parallelism ============================
 TP=2
 EP=1
+# 2026-06-11: 0611h/0611i OOM'd at the logprob log-softmax (`_compute_distributed_log_softmax`,
+# vocab_parallel_logits.exp()) on long SWE-bench trajectories — ~29GB spike, killed at step 12-14.
+# max_total_sequence_length does NOT shrink the logprob forward (only masks loss), so seqlen caps
+# were ineffective (29.5GB at 65k ≈ 28GB at 131k). Context parallelism shards the sequence dim
+# across CP GPUs → ~halves the per-GPU logits. Train world = 1 node x 4 GPU; TP2 x CP2 = 4 (DP1).
+# 2026-06-11 REVERTED to CP=1: CP requires sequence_packing, and packing bin = max_total_seq_len/CP,
+# so CP halves the bin → an 83k SWE-bench trajectory can't fit unless seqlen is raised, which re-OOMs
+# the per-rank logprob (circular on 4 GPUs; CP=4 impossible at tp2). Proven CP1/no-packing reaches
+# step ~14; cap MAX_NUM_STEPS below that for a clean e2e verification. Full 50-step long-context
+# training needs more GPUs (CP4/PP) or chunked-logprob — a supervised effort.
 CP=1
 PP=1
 VLLM_TP=1
 MAKE_SEQ_DIVISIBLE_BY=8
 
 # ===================== Sequence length & packing =====================
-SEQLEN=65536
+# 2026-06-11: 65536 FAILED on real SWE-bench_Verified prompts — TRT-LLM raised
+# `RequestError: prompt length (66042) should not exceed max_num_tokens (65536)` → 500 loop
+# (see run_logs_lyris.md). Bumped to 131072 per project memory (SWE-bench agent rollouts need
+# max_num_tokens=max_seq_len=131k; 32k/65k fail late). NOTE: TRT-LLM's max_num_tokens does NOT
+# derive from max_seq_len (default stays 65536) — it must be set EXPLICITLY via
+# trtllm_cfg.max_num_tokens=${SEQLEN} (added to the overrides below); bumping max_model_len alone
+# is insufficient (verified: 0611g had max_seq_len=131072 but max_num_tokens=65536 → same crash).
+SEQLEN=131072
+# 2026-06-11: training-side logprob logits OOM'd at 131k (tp2). Fix = CP=2 + sequence_packing (below),
+# which shards the forward across CP GPUs. With packing, max_total_sequence_length is the PACK BIN and
+# must be >= the longest trajectory; generation caps trajectories at 131072, so set the bin to 131072
+# (fits all — a 65k bin rejected an 83016-token trajectory in 0611k). CP=2 shards ~65k/GPU → fits.
+TRAIN_SEQLEN=131072
+# 2026-06-11: required True for CP=2 (0611j died: "Sequence Packing must be enabled to use Context
+# Parallelism with MCore"). Also caps the forward at the pack size (max_total_sequence_length), which
+# with CP=2 shards the logprob logits → fixes the long-SWE-bench-trajectory OOM (steps 12-14).
+# 2026-06-11 REVERTED to False (CP reverted to 1; see CP comment). Proven regime.
 SEQUENCE_PACKING=False
 
 # ================= Sync/Async mode & async GRPO settings =================
@@ -128,7 +160,7 @@ AGENT_TIMEOUT="${AGENT_TIMEOUT:-1800}"
 
 # ============================== Logging ==============================
 WANDB_PROJ="${WANDB_PROJ:-nemo-rl-swe-benchmark-smoke-erinh}"
-WANDB_GROUP="${WANDB_GROUP:-qwen3.5-4b-gb200-swe-smoke}"
+WANDB_GROUP="${WANDB_GROUP:-qwen3-4b-2507-gb200-swe-smoke}"
 LOG_GYM_RESPONSES=true
 
 # ========================= SLURM submission =========================
@@ -143,7 +175,7 @@ if [ "${ASYNC_GRPO_ENABLED}" = "True" ]; then
 else
   SYNC_MODE="sync"
 fi
-EXP_SUFFIX="${EXP_SUFFIX:-qwen3.5-4b-gb200-swe-smoke-trtllm-${SYNC_MODE}-64k-steps${MAX_NUM_STEPS}-turns${AGENT_MAX_TURNS}-nodes${NUM_ACTOR_NODES}-gen${NUM_GENERATION_NODES}-tp${TP}-pps${PPS}-gpp${GPP}-gbs${GBS}-lr${LR}}"
+EXP_SUFFIX="${EXP_SUFFIX:-qwen3-4b-2507-gb200-swe-smoke-trtllm-${SYNC_MODE}-64k-steps${MAX_NUM_STEPS}-turns${AGENT_MAX_TURNS}-nodes${NUM_ACTOR_NODES}-gen${NUM_GENERATION_NODES}-tp${TP}-pps${PPS}-gpp${GPP}-gbs${GBS}-lr${LR}}"
 WANDB_NAME="${EXP_SUFFIX}"
 CHECKPOINT_DIR="${CHECKPOINT_ROOT}/${EXP_SUFFIX}"
 LOG_DIR="logs/exp_${EXP_SUFFIX}"
@@ -313,7 +345,7 @@ export COMMAND="NRL_WG_USE_RAY_REF=1 \
   policy.generation.colocated.resources.num_nodes=${NUM_GENERATION_NODES} \
   policy.generation.colocated.resources.gpus_per_node=${NUM_GPU} \
   policy.model_name=${MODEL_PATH} \
-  policy.max_total_sequence_length=${SEQLEN} \
+  policy.max_total_sequence_length=${TRAIN_SEQLEN} \
   policy.dynamic_batching.enabled=False \
   policy.train_global_batch_size=${GBS} \
   policy.train_micro_batch_size=1 \
@@ -338,6 +370,7 @@ export COMMAND="NRL_WG_USE_RAY_REF=1 \
   policy.generation.trtllm_cfg.tensor_parallel_size=${VLLM_TP} \
   policy.generation.trtllm_cfg.gpu_memory_utilization=${VLLM_GPU_UTIL} \
   policy.generation.trtllm_cfg.max_model_len=${SEQLEN} \
+  policy.generation.trtllm_cfg.max_num_tokens=${SEQLEN} \
   policy.generation.trtllm_cfg.async_engine=True \
   policy.generation.trtllm_cfg.expose_http_server=True \
   policy.generation.trtllm_cfg.in_flight_weight_updates=${INFLIGHT_WEIGHT_UPDATE} \
