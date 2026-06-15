@@ -8,20 +8,22 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
-# Resolve python and ffmpeg — PATH is often minimal inside srun containers
+# Resolve uv and ffmpeg — PATH is often minimal inside srun containers
 # ---------------------------------------------------------------------------
-PYTHON=""
-for candidate in /opt/nemo_rl_venv/bin/python python3 python /usr/bin/python3 /usr/local/bin/python3 /opt/conda/bin/python3 /opt/conda/bin/python; do
+UV=""
+for candidate in uv /usr/local/bin/uv /opt/conda/bin/uv ~/.cargo/bin/uv; do
     if command -v "$candidate" &>/dev/null; then
-        PYTHON="$candidate"
+        UV="$candidate"
         break
     fi
 done
-if [[ -z "$PYTHON" ]]; then
-    echo "ERROR: no Python interpreter found. Tried: /opt/nemo_rl_venv/bin/python python3 python /usr/bin/python3 /usr/local/bin/python3 /opt/conda/bin/python3"
+if [[ -z "$UV" ]]; then
+    echo "ERROR: uv not found. Tried: uv /usr/local/bin/uv /opt/conda/bin/uv ~/.cargo/bin/uv"
     exit 1
 fi
-echo "Using Python: $PYTHON ($(command -v "$PYTHON"))"
+echo "Using uv: $UV ($(command -v "$UV"))"
+# Convenience wrapper — use run_python instead of "$PYTHON" throughout
+run_python() { "$UV" run python "$@"; }
 
 FFMPEG=""
 for candidate in ffmpeg /usr/bin/ffmpeg /usr/local/bin/ffmpeg /opt/conda/bin/ffmpeg; do
@@ -62,7 +64,7 @@ section() {
 py_provenance() {
     local import_name="$1"
     local pip_name="$2"
-    "$PYTHON" - <<PYEOF
+    run_python - <<PYEOF
 import importlib, subprocess, sys
 
 try:
@@ -152,7 +154,7 @@ fi
 # 4. Compression codecs — Python stdlib
 # ---------------------------------------------------------------------------
 section "COMPRESSION CODECS (Python stdlib)"
-"$PYTHON" - <<'EOF'
+run_python - <<'EOF'
 import sys, importlib
 for mod in ["zlib", "bz2", "lzma", "gzip", "zipfile"]:
     try:
@@ -169,7 +171,7 @@ EOF
 section "COMPRESSION CODECS (third-party Python)"
 
 echo "[blosc]"
-"$PYTHON" - <<'EOF'
+run_python - <<'EOF'
 try:
     import blosc
     print("  codecs:", blosc.compressor_list())
@@ -180,7 +182,7 @@ py_provenance blosc blosc
 
 echo ""
 echo "[numcodecs]"
-"$PYTHON" - <<'EOF'
+run_python - <<'EOF'
 try:
     import numcodecs
     print("  codecs:", numcodecs.available_codecs())
@@ -191,7 +193,7 @@ py_provenance numcodecs numcodecs
 
 echo ""
 echo "[pyarrow]"
-"$PYTHON" - <<'EOF'
+run_python - <<'EOF'
 try:
     import pyarrow
     supported = [c for c in ['lz4','zstd','snappy','brotli','gzip','bz2'] if pyarrow.Codec.is_available(c)]
@@ -203,7 +205,7 @@ py_provenance pyarrow pyarrow
 
 echo ""
 echo "[zarr]"
-"$PYTHON" - <<'EOF'
+run_python - <<'EOF'
 try:
     import zarr
     reg = list(zarr.codec_registry.keys()) if hasattr(zarr, 'codec_registry') else 'N/A'
@@ -215,7 +217,7 @@ py_provenance zarr zarr
 
 echo ""
 echo "[h5py]"
-"$PYTHON" - <<'EOF'
+run_python - <<'EOF'
 try:
     import h5py
     print(f"  h5py {h5py.__version__} | HDF5 {h5py.version.hdf5_version}")
@@ -228,7 +230,7 @@ py_provenance h5py h5py
 # 6. Image codecs — Pillow
 # ---------------------------------------------------------------------------
 section "IMAGE CODECS (Pillow)"
-"$PYTHON" - <<'EOF'
+run_python - <<'EOF'
 try:
     from PIL import features
     features.pilinfo()
@@ -241,7 +243,7 @@ py_provenance PIL Pillow
 # 7. Image codecs — OpenCV (highlights codec-relevant lines)
 # ---------------------------------------------------------------------------
 section "IMAGE CODECS (OpenCV)"
-CV2_OUT=$("$PYTHON" - <<'EOF'
+CV2_OUT=$(run_python - <<'EOF'
 try:
     import cv2
     print(cv2.getBuildInformation())
@@ -257,7 +259,7 @@ py_provenance cv2 opencv-python
 # 8. Image codecs — imagecodecs
 # ---------------------------------------------------------------------------
 section "IMAGE CODECS (imagecodecs)"
-"$PYTHON" - <<'EOF'
+run_python - <<'EOF'
 try:
     import imagecodecs
     print(imagecodecs.available())
@@ -270,7 +272,7 @@ py_provenance imagecodecs imagecodecs
 # 9. Image codecs — imageio
 # ---------------------------------------------------------------------------
 section "IMAGE CODECS (imageio)"
-"$PYTHON" - <<'EOF'
+run_python - <<'EOF'
 try:
     import imageio
     print(imageio.formats.show())
@@ -283,7 +285,7 @@ py_provenance imageio imageio
 # 10. Video codecs — PyAV
 # ---------------------------------------------------------------------------
 section "VIDEO CODECS (PyAV)"
-PYAV_OUT=$("$PYTHON" - <<'EOF'
+PYAV_OUT=$(run_python - <<'EOF'
 try:
     import av
     print("available codecs:", sorted(av.codec.codecs_available))
@@ -299,7 +301,7 @@ py_provenance av av
 # 11. Video codecs — decord
 # ---------------------------------------------------------------------------
 section "VIDEO CODECS (decord)"
-"$PYTHON" - <<'EOF'
+run_python - <<'EOF'
 try:
     import decord
     print("version:", decord.__version__)
@@ -312,7 +314,7 @@ py_provenance decord decord
 # 12. TIFF codecs — tifffile
 # ---------------------------------------------------------------------------
 section "IMAGE CODECS (tifffile)"
-"$PYTHON" - <<'EOF'
+run_python - <<'EOF'
 try:
     import tifffile
     print("TIFF compressions:", list(tifffile.TIFF.COMPRESSION.__members__.keys()))
@@ -342,7 +344,7 @@ fi
 #     e.g. av.libs/libx264-*.so, opencv_python.libs/libavcodec-*.so
 # ---------------------------------------------------------------------------
 section "BUNDLED .SO LIBS IN PYTHON WHEEL PACKAGES (auditwheel)"
-"$PYTHON" - <<'PYEOF'
+run_python - <<'PYEOF'
 import sys, os, re, subprocess
 
 site_dirs = [p for p in sys.path if "site-packages" in p and os.path.isdir(p)]
@@ -371,7 +373,7 @@ if not found_any:
 PYEOF
 
 # Flag royalty-bearing .so names specifically
-PYEOF_OUT=$("$PYTHON" - <<'PYEOF'
+PYEOF_OUT=$(run_python - <<'PYEOF'
 import sys, os
 
 site_dirs = [p for p in sys.path if "site-packages" in p and os.path.isdir(p)]
