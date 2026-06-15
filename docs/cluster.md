@@ -182,6 +182,16 @@ sbatch ray.sub \
 
 This guide outlines the process of migrating NemoRL training jobs from a Slurm environment to a Kubernetes cluster utilizing Ray orchestration and NVIDIA GPUs.
 
+Two entrypoint patterns are supported. Choose based on which Kubernetes operator your cluster uses:
+
+| Pattern | Operator | Script |
+|---|---|---|
+| [KubeRay RayCluster / RayJob](#kubernetesk8s-entry) | KubeRay | `k8s_entry.sh` or direct `uv run` |
+| [KubeFlow PyTorchJob](#kubeflow-pytorchjob) | kubeflow/training-operator | `k8s_entry.sh` |
+
+`k8s_entry.sh` (repo root) auto-detects which pattern applies and takes the
+appropriate role. It is the Kubernetes equivalent of `ray.sub` for Slurm.
+
 ---
 
 ## Prerequisites
@@ -525,6 +535,110 @@ logger:
 ### 5. Monitoring
 * **Console:** Watch job progress directly in the terminal where you ran `uv run`.
 * **WandB:** If enabled, check the Weights & Biases web interface.
+
+---
+
+(kubernetesk8s-entry)=
+## Using k8s_entry.sh
+
+`k8s_entry.sh` is a single entrypoint script that handles both KubeRay and
+PyTorchJob environments.  It auto-detects which mode applies:
+
+* **KubeRay** — Ray is already running (detected via `RAY_ADDRESS` or a live
+  `ray status`).  The script skips cluster setup and executes the training
+  command with `ray.init(address="auto")`.
+* **PyTorchJob** — `RANK` and `MASTER_ADDR` are present (injected by the
+  kubeflow/training-operator).  The script sets up Ray across all pods and
+  runs the training command on rank 0.
+
+### KubeRay RayJob example
+
+Use `k8s_entry.sh` as the `spec.entrypoint` of a `RayJob`, or simply run
+`uv run` directly — both work because Ray is already set up by KubeRay:
+
+```yaml
+# RayJob spec (excerpt)
+spec:
+  entrypoint: >
+    bash /opt/nemo-rl/k8s_entry.sh
+    uv run --locked examples/run_grpo.py
+    --config examples/configs/grpo_math_1B.yaml
+    cluster.num_nodes=2
+```
+
+Alternatively, skip `k8s_entry.sh` entirely and call `uv run` directly in
+`spec.entrypoint` — the result is identical because KubeRay already owns
+the cluster lifecycle.
+
+(kubeflow-pytorchjob)=
+## KubeFlow PyTorchJob
+
+> [!NOTE]
+> The [KubeFlow training-operator](https://github.com/kubeflow/training-operator)
+> must be installed on your cluster to use this pattern.
+
+In a PyTorchJob every pod runs the **same** container command.  The operator
+injects `RANK`, `MASTER_ADDR`, and `WORLD_SIZE` into each pod, which is
+exactly what `k8s_entry.sh` uses to assign roles:
+
+* **Rank 0 (Master replica):** starts the Ray head, waits for all workers to
+  join, runs the training command, then calls `ray stop` to signal shutdown.
+* **Rank N (Worker replicas):** connect to the Ray cluster and block until the
+  head stops, then exit with code 0 so the job reports success.
+
+### Example manifest
+
+A ready-to-run manifest is provided at
+[`infra/examples/pytorchjob-grpo.yaml`](https://github.com/NVIDIA-NeMo/RL/blob/main/infra/examples/pytorchjob-grpo.yaml).
+Both replicas run the identical command — `k8s_entry.sh` uses `RANK` to decide
+whether a pod is the Ray head (rank 0) or a worker. Set `Worker.replicas` to
+`num_nodes - 1` and update the image / PVC to match your cluster:
+
+```yaml
+# infra/examples/pytorchjob-grpo.yaml (excerpt)
+command: ["bash", "-c"]
+args:
+  - |
+    bash k8s_entry.sh uv run --locked examples/run_grpo.py \
+      --config examples/configs/grpo_math_1B.yaml \
+      cluster.num_nodes=${WORLD_SIZE} cluster.gpus_per_node=${GPUS_PER_NODE}
+```
+
+**Apply and monitor:**
+
+```bash
+kubectl apply -f infra/examples/pytorchjob-grpo.yaml
+
+# Watch pod status
+kubectl get pods -l training.kubeflow.org/job-name=grpo-job -w
+
+# Stream driver logs from the Master pod
+kubectl logs -f -l training.kubeflow.org/replica-type=master
+```
+
+### PyTorchJob environment variables
+
+All variables from the [Slurm environment table](#slurm-environment-variables)
+that control Ray ports and resources apply to the PyTorchJob path as well.
+The most commonly overridden ones are:
+
+``````{list-table}
+:header-rows: 1
+
+* - Variable (default)
+  - Description
+* - `GPUS_PER_NODE=8`
+  - GPUs per node reported to Ray as `worker_units`. Match your node shape.
+* - `RAY_PORT=6379`
+  - Ray GCS port. Change if 6379 is in use.
+* - `COMMAND`
+  - Training command string. Equivalent to passing positional args.
+``````
+
+> [!TIP]
+> The NeMo-RL config option `cluster.num_nodes` must equal the total number
+> of pods (Master + Worker replicas).  For the example above (1 Master + 1 Worker)
+> set `cluster.num_nodes=2`.
 
 ---
 
