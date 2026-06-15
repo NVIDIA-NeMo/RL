@@ -39,7 +39,6 @@ from nemo_rl.data.utils import setup_response_data
 from nemo_rl.data_plane import build_data_plane_client
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.utils import create_env
 from nemo_rl.experience.rollout_manager import RolloutManager
 from nemo_rl.models.generation.sglang import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
@@ -68,16 +67,6 @@ class SingleControllerBundle:
     rollout_manager: RolloutManager
     tq_buffer: TQReplayBuffer
     partition_id: str
-
-
-def _build_env_handles(
-    master_config: MasterConfig,
-) -> dict[str, EnvironmentInterface]:
-    """Build env_name -> EnvironmentInterface from master_config.env."""
-    return {
-        env_name: create_env(env_name=env_name, env_config=env_config)
-        for env_name, env_config in master_config.env.items()
-    }
 
 
 def _build_clusters(
@@ -241,7 +230,6 @@ def setup(
     tokenizer: PreTrainedTokenizerBase,
     *,
     processor: Optional[AutoProcessor] = None,
-    env_handles: Optional[dict[str, EnvironmentInterface]] = None,
     partition_id: str = "rollout_data",
 ) -> SingleControllerBundle:
     """Build the full SC bundle driver-side.
@@ -250,8 +238,6 @@ def setup(
         master_config: SC MasterConfig.
         tokenizer: Tokenizer used by the policy.
         processor: Optional AutoProcessor for VLM paths.
-        env_handles: Pre-built env_name -> EnvironmentInterface mapping;
-            constructed from master_config.env if None.
         partition_id: TQ partition the rollout writer + sampler share.
 
     Returns:
@@ -278,10 +264,13 @@ def setup(
             "data.use_multiple_dataloader=True yet."
         )
 
-    # Dataset + dataloader first so we know len(dataloader) before any
-    # trainer config injection runs.
+    # ==========================
+    # Setup Dataset & Environments
+    # ==========================
     # TODO: add validate dataset wiring.
-    dataset, _val_dataset = setup_response_data(tokenizer, data_config)
+    dataset, _val_dataset, env_handles, _val_env_handles = setup_response_data(
+        tokenizer, data_config, env_configs=master_config.env
+    )
     dataloader = StatefulDataLoader(
         dataset,
         batch_size=grpo_config["num_prompts_per_step"],
@@ -293,6 +282,9 @@ def setup(
 
     _maybe_inject_megatron_train_iters(master_config, dataloader)
 
+    # ==========================
+    # Setup Clusters & Workers
+    # ==========================
     train_cluster, inference_cluster = _build_clusters(master_config)
     colocated = generation_config["colocated"]["enabled"]
     if colocated:
@@ -313,9 +305,9 @@ def setup(
             generation = gen_future.result()
             policy = policy_future.result()
 
-    if env_handles is None:
-        env_handles = _build_env_handles(master_config)
-
+    # ==========================
+    # Setup Data Plane Client & Weight Sync
+    # ==========================
     # Connect-only DP client; TQPolicy already bootstrapped the controller.
     dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
 
@@ -336,6 +328,9 @@ def setup(
         refit_buffer_size_gb=refit_buffer_size_gb,
     )
 
+    # ==========================
+    # Setup Algorithm + Rollout Wiring
+    # ==========================
     advantage_estimator = _create_advantage_estimator(master_config)
     loss_fn: LossFunction = ClippedPGLossFn(master_config.loss_fn)
 

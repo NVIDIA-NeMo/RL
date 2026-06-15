@@ -76,12 +76,13 @@ def patched_factories():
     fake_dataloader = MagicMock(name="dataloader")
     # len(dataloader) used by the Megatron train_iters injection.
     fake_dataloader.__len__ = MagicMock(return_value=4)
+    fake_env_handles = {"math": MagicMock(name="math_env")}
 
     with (
         patch.object(
             setup_module,
             "setup_response_data",
-            return_value=(fake_dataset, None),
+            return_value=(fake_dataset, None, fake_env_handles, {}),
         ) as mock_setup_response,
         patch.object(
             setup_module,
@@ -137,6 +138,7 @@ def patched_factories():
             "_create_advantage_estimator": mock_adv,
             "ClippedPGLossFn": mock_loss,
             "dataloader": fake_dataloader,
+            "env_handles": fake_env_handles,
         }
 
 
@@ -156,14 +158,13 @@ class TestSetup:
     def test_returns_bundle(self, patched_factories):
         mc = _make_master_config(colocated=True)
         tokenizer = MagicMock(pad_token_id=0)
-        env_handles = {"math": MagicMock(name="math_env")}
 
-        bundle = setup(mc, tokenizer, env_handles=env_handles)
+        bundle = setup(mc, tokenizer)
 
         assert isinstance(bundle, SingleControllerBundle)
         assert bundle.gen_handle is patched_factories["_build_generation"].return_value
         assert bundle.trainer_handle is patched_factories["_build_trainer"].return_value
-        assert bundle.env_handles is env_handles
+        assert bundle.env_handles is patched_factories["env_handles"]
         assert (
             bundle.dp_client
             is patched_factories["build_data_plane_client"].return_value
@@ -186,28 +187,23 @@ class TestSetup:
         assert bundle.partition_id == "rollout_data"
         assert bundle.tq_buffer._partition_id == "rollout_data"
 
-    def test_env_handles_built_from_config_when_not_passed(self, patched_factories):
+    def test_env_handles_sourced_from_setup_response_data(self, patched_factories):
+        """setup_response_data receives master_config.env and supplies env handles."""
         math_env_cfg = {"some": "value"}
         mc = _make_master_config(env={"math": math_env_cfg})
-        fake_math_env = MagicMock(name="math_env")
 
-        with patch.object(
-            setup_module, "create_env", return_value=fake_math_env
-        ) as mock_create_env:
-            bundle = setup(mc, MagicMock(pad_token_id=0), env_handles=None)
+        bundle = setup(mc, MagicMock(pad_token_id=0))
 
-        mock_create_env.assert_called_once_with(
-            env_name="math", env_config=math_env_cfg
-        )
-        assert bundle.env_handles == {"math": fake_math_env}
+        _, call_kwargs = patched_factories["setup_response_data"].call_args
+        assert call_kwargs["env_configs"] == {"math": math_env_cfg}
+        assert bundle.env_handles is patched_factories["env_handles"]
 
     def test_weight_sync_factory_args(self, patched_factories):
         """create_weight_synchronizer receives policy / generation / topology."""
         mc = _make_master_config(colocated=False, backend="vllm")
         tokenizer = MagicMock(pad_token_id=0)
-        env_handles = {"math": MagicMock()}
 
-        setup(mc, tokenizer, env_handles=env_handles)
+        setup(mc, tokenizer)
 
         _, factory_kwargs = patched_factories["create_weight_synchronizer"].call_args
         assert (
@@ -224,7 +220,7 @@ class TestSetup:
         mc = _make_master_config()
         tokenizer = MagicMock(pad_token_id=7)
 
-        bundle = setup(mc, tokenizer, env_handles={}, partition_id="custom_partition")
+        bundle = setup(mc, tokenizer, partition_id="custom_partition")
 
         assert bundle.partition_id == "custom_partition"
         assert bundle.tq_buffer._partition_id == "custom_partition"
@@ -241,7 +237,7 @@ class TestSetup:
             max_num_epochs=1,
         )
         # patched dataloader has len() == 4, so the min picks max_num_steps.
-        setup(mc, MagicMock(pad_token_id=0), env_handles={})
+        setup(mc, MagicMock(pad_token_id=0))
 
         assert mc.policy["megatron_cfg"]["train_iters"] == 2
 
@@ -253,12 +249,12 @@ class TestSetup:
             max_num_epochs=2,
         )
         # patched dataloader has len() == 4 → 2 * 4 = 8 < 1000.
-        setup(mc, MagicMock(pad_token_id=0), env_handles={})
+        setup(mc, MagicMock(pad_token_id=0))
 
         assert mc.policy["megatron_cfg"]["train_iters"] == 8
 
     def test_megatron_train_iters_not_set_when_disabled(self, patched_factories):
         mc = _make_master_config(megatron_enabled=False)
-        setup(mc, MagicMock(pad_token_id=0), env_handles={})
+        setup(mc, MagicMock(pad_token_id=0))
 
         assert "train_iters" not in mc.policy.get("megatron_cfg", {})
