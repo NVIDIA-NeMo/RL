@@ -73,7 +73,7 @@ class SingleControllerActor:
 
         Args:
             master_config: SC MasterConfig.
-            bundle: Pre-built bundle from single_controller_utils.setup. Tests can
+            bundle: Pre-built bundle from setup_single_controller. Tests can
                 construct a bundle by hand (or with fakes) to bypass the real factories.
         """
         self._advantage_cfg = AdvantageConfig()

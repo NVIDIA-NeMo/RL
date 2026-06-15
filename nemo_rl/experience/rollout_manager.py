@@ -585,7 +585,7 @@ class AsyncNemoGymRolloutImpl:
 #   1. Turn RolloutManager into a Ray actor.
 #   2. Keep policy_generation driver-constructed and pass it in (don't
 #      build it inside the rollout actor — avoids nested Ray actors).
-#   3. Construct the rollout actor in single_controller_utils.setup and
+#   3. Construct the rollout actor in setup_single_controller and
 #      drop the inline RolloutManager construction there.
 class RolloutManager:
     """Routes to AsyncRolloutImpl (native async) or AsyncNemoGymRolloutImpl (NeMo-Gym), and pushes results to a TQReplayBuffer."""
