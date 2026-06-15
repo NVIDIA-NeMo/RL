@@ -31,6 +31,7 @@ from nemo_rl.environments.metrics import (
 )
 from nemo_rl.environments.rewards import (
     bbox_giou_reward,
+    combine_reward_functions,
     exact_answer_alphanumeric_reward,
     exact_answer_alphanumeric_with_fallback_reward,
     format_reward,
@@ -55,98 +56,70 @@ def _mute_output():
         yield
 
 
-def _build_named_reward_functions(
-    cfg: VLMEnvConfig,
-) -> list[tuple[str, Callable[[str, str], tuple[float, Optional[bool]]], float]]:
-    """Resolve ``cfg['reward_functions']`` into a list of (name, fn, weight) tuples."""
-    resolved: list[
-        tuple[str, Callable[[str, str], tuple[float, Optional[bool]]], float]
-    ] = []
-    for reward_func_cfg in cfg["reward_functions"]:
-        reward_func_name: str = reward_func_cfg["name"]
-        reward_func_weight: float = reward_func_cfg["weight"]
-        reward_func_kwargs: Optional[dict] = reward_func_cfg.get("kwargs", None)
-        reward_func: Callable[[str, str], tuple[float, Optional[bool]]]
-        if reward_func_name == "format":
-            reward_func = format_reward
-        elif reward_func_name == "exact_alnum":
-            reward_func = exact_answer_alphanumeric_reward
-        elif reward_func_name == "exact_alnum_with_fallback":
-            reward_func = exact_answer_alphanumeric_with_fallback_reward
-        elif reward_func_name == "math_expr":
-            reward_func = math_expression_reward
-        elif reward_func_name == "bbox_giou":
-            reward_func = bbox_giou_reward
-        else:
-            raise ValueError(f"Invalid reward function: {reward_func_name}")
-
-        if reward_func_kwargs is not None:
-            reward_func = partial(reward_func, **reward_func_kwargs)
-
-        resolved.append((reward_func_name, reward_func, reward_func_weight))
-    if len(resolved) == 0:
-        raise ValueError("No reward functions provided")
-    return resolved
-
-
 @ray.remote
 class VLMVerifyWorker:
     def __init__(self, cfg: VLMEnvConfig) -> None:
         logging.getLogger("vlm_worker").setLevel(logging.CRITICAL)
-        named = _build_named_reward_functions(cfg)
-        self._reward_names: list[str] = [name for name, _, _ in named]
-        self._reward_fns: list[Callable[[str, str], tuple[float, Optional[bool]]]] = [
-            fn for _, fn, _ in named
-        ]
-        weights = [w for _, _, w in named]
-        # Same renormalization as combine_reward_functions: the combined
-        # reward equals sum(weight_i * raw_i) with weights summing to 1.
-        weight_arr = [w / sum(weights) for w in weights]
-        self._reward_weights: list[float] = weight_arr
+        # this is a simple reward function that rewards the agent for correct answer and correct format
+        reward_functions = []
+        # loop over all configs
+        for reward_func_cfg in cfg["reward_functions"]:
+            # get name and weight
+            reward_func_name: str = reward_func_cfg["name"]
+            reward_func_weight: float = reward_func_cfg["weight"]
+            reward_func_kwargs: Optional[dict] = reward_func_cfg.get("kwargs", None)
+            reward_func: Callable[[str, str], tuple[float, Optional[bool]]]
+            if reward_func_name == "format":
+                reward_func = format_reward
+            elif reward_func_name == "exact_alnum":
+                reward_func = exact_answer_alphanumeric_reward
+            elif reward_func_name == "exact_alnum_with_fallback":
+                reward_func = exact_answer_alphanumeric_with_fallback_reward
+            elif reward_func_name == "math_expr":
+                reward_func = math_expression_reward
+            elif reward_func_name == "bbox_giou":
+                reward_func = bbox_giou_reward
+            else:
+                raise ValueError(f"Invalid reward function: {reward_func_name}")
 
-    def reward_names(self) -> list[str]:
-        """Return the ordered list of configured reward-function names."""
-        return list(self._reward_names)
+            # check for additional kwargs
+            if reward_func_kwargs is not None:
+                reward_func = partial(reward_func, **reward_func_kwargs)
 
-    def verify_with_components(
-        self, pred_responses: list[str], ground_truths: list[str]
-    ) -> tuple[list[float], list[list[float]]]:
-        """Score each (response, ground_truth) and return both totals and components.
+            reward_functions.append((reward_func, reward_func_weight))
 
-        Returns:
-            (combined, components) where ``combined[i]`` is the weighted total
-            reward for sample ``i`` (matching the historical ``verify`` return)
-            and ``components[i]`` is a list of weighted per-function scores in
-            the same order as ``reward_names()``. Summing ``components[i]`` ==
-            ``combined[i]`` (modulo float error) by construction.
-        """
-        combined: list[float] = []
-        components: list[list[float]] = []
-        for response, ground_truth in zip(pred_responses, ground_truths):
-            sample_components = [0.0] * len(self._reward_fns)
-            try:
-                with _mute_output():
-                    for idx, (fn, w) in enumerate(
-                        zip(self._reward_fns, self._reward_weights)
-                    ):
-                        try:
-                            raw, _ = fn(ground_truth, response)
-                        except Exception as e:
-                            raw = 0.0
-                            print(f"Error in reward fn {self._reward_names[idx]}: {e}")
-                        sample_components[idx] = float(raw) * float(w)
-            except Exception as e:
-                print(f"Error in verify_with_components: {e}")
-            combined.append(float(sum(sample_components)))
-            components.append(sample_components)
-        return combined, components
+        if len(reward_functions) == 0:
+            raise ValueError("No reward functions provided")
+
+        # combine the reward functions
+        self.verify_func = combine_reward_functions(reward_functions)
 
     def verify(
         self, pred_responses: list[str], ground_truths: list[str]
     ) -> list[float]:
-        """Backward-compat scalar reward (sum of weighted components)."""
-        combined, _ = self.verify_with_components(pred_responses, ground_truths)
-        return combined
+        """Verify the correctness of the predicted responses against the ground truth.
+
+        Args:
+            pred_responses: list[str]. The predicted responses from the LLM.
+            ground_truths: list[str]. The ground truth responses.
+
+        Returns:
+            list[float]. The rewards for each predicted response.
+        """
+        results = []
+        for response, ground_truth in zip(pred_responses, ground_truths):
+            try:
+                with _mute_output():
+                    try:
+                        ret_score, _ = self.verify_func(ground_truth, response)
+                    except Exception as e:
+                        ret_score = 0.0
+                        print(f"Error in verify_func: {e}")
+                results.append(float(ret_score))
+            except Exception as e:
+                print(f"Error in verify: {e}")
+                results.append(0.0)
+        return results
 
 
 class VLMEnvironmentMetadata(TypedDict):
@@ -164,22 +137,6 @@ class VLMEnvironment(EnvironmentInterface):
             ).remote(cfg)
             for _ in range(self.num_workers)
         ]
-        # Names of the configured reward functions, in the order
-        # `step()` returns them as columns of `EnvironmentReturn.rewards`.
-        # Used by the validation loop in `nemo_rl/algorithms/grpo.py::validate`
-        # to label per-component reward metrics.
-        self._reward_component_names: list[str] = [
-            entry["name"] for entry in cfg["reward_functions"]
-        ]
-
-    def reward_component_names(self) -> list[str]:
-        """Public Ray-callable accessor for the per-component reward names.
-
-        Returns the same ordering used by the K-column rewards tensor that
-        ``step()`` emits, so callers can map ``rewards[:, i]`` back to the
-        configured reward function name (e.g. ``"format"``, ``"exact_alnum"``).
-        """
-        return list(self._reward_component_names)
 
     def shutdown(self) -> None:
         # shutdown all workers
@@ -224,45 +181,31 @@ class VLMEnvironment(EnvironmentInterface):
         )
         chunked_ground_truths = chunk_list_to_workers(ground_truths, self.num_workers)
 
-        # Use verify_with_components so per-reward-function scores survive
-        # back to the rollout layer; the rollout's existing multi-reward
-        # plumbing turns the (N, K) tensor into per-component ``reward<i+1>``
-        # batch columns, and validation reads those for per-component logging.
+        # # Process each chunk in parallel
         futures = [
-            self.workers[i].verify_with_components.remote(chunk, ground_truth_chunk)
+            self.workers[i].verify.remote(chunk, ground_truth_chunk)
             for i, (chunk, ground_truth_chunk) in enumerate(
                 zip(chunked_assistant_response_batch, chunked_ground_truths)
             )
         ]
 
-        chunk_results = ray.get(futures)
+        results = ray.get(futures)
 
-        combined: list[float] = []
-        components: list[list[float]] = []
-        for chunk_combined, chunk_components in chunk_results:
-            combined.extend(chunk_combined)
-            components.extend(chunk_components)
-
+        # flatten the results
+        results = [item for sublist in results for item in sublist]
         observations = [
             {
                 "role": "environment",
                 "content": "Environment: correct"
-                if score
+                if result
                 else "Environment: incorrect",
             }
-            for score in combined
+            for result in results
         ]
 
-        # Build a (N, K) rewards tensor of weighted components. Summing along
-        # dim=1 reproduces the historical scalar `total_reward` GRPO uses for
-        # advantage computation.
-        if len(components) > 0 and len(components[0]) > 0:
-            rewards = torch.tensor(components, dtype=torch.float32).cpu()
-        else:
-            # K=0 (no reward fns configured) is rejected at worker init, but
-            # keep the fallback for type stability if `combined` ends up empty.
-            rewards = torch.tensor(combined, dtype=torch.float32).cpu()
-        done = torch.ones(rewards.shape[0], dtype=rewards.dtype).cpu()
+        # create a tensor of rewards and done flags
+        rewards = torch.tensor(results).cpu()
+        done = torch.ones_like(rewards).cpu()
 
         next_stop_strings = [None] * len(message_log_batch)
 

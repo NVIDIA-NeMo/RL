@@ -2569,11 +2569,6 @@ def validate(
         total_rewards = []
         total_lengths = []
         all_message_logs = []  # Collect all message logs
-        # Per-component reward accumulators. Populated when the rollout layer
-        # surfaces multi-reward columns (`reward1`, `reward2`, ...) on the
-        # val batch — currently only the VLM environment does this. Keys are
-        # the configured reward function names (e.g. "format", "exact_alnum").
-        component_rewards_by_name: dict[str, list[float]] = {}
 
         max_batches = (
             master_config.grpo["max_val_samples"]
@@ -2626,45 +2621,6 @@ def validate(
             total_rewards.extend(val_batch["total_reward"].tolist())
             total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
 
-            # If the env returned per-component rewards (multi-reward path in
-            # nemo_rl/experience/rollouts.py), the val batch carries
-            # `reward1`, `reward2`, ... columns. Map them to their human
-            # names via the env's `reward_component_names()` accessor (added
-            # by VLMEnvironment) and accumulate per-component values for the
-            # validation summary.
-            reward_columns = [
-                key
-                for key in val_batch.keys()
-                if isinstance(key, str)
-                and key.startswith("reward")
-                and key[len("reward") :].isdigit()
-            ]
-            if reward_columns and val_task_to_env:
-                # Use the first env that exposes named components; in
-                # practice the validation set has one task → one env.
-                component_names: list[str] = []
-                for env in val_task_to_env.values():
-                    accessor = getattr(env, "reward_component_names", None)
-                    if accessor is None:
-                        continue
-                    try:
-                        component_names = ray.get(accessor.remote())  # type: ignore[union-attr]
-                    except Exception:
-                        component_names = []
-                    if component_names:
-                        break
-                # Sort columns by their numeric suffix so reward1 < reward2 < ...
-                reward_columns.sort(
-                    key=lambda c: int(c[len("reward") :])  # noqa: E731
-                )
-                for idx, column in enumerate(reward_columns):
-                    name = (
-                        component_names[idx] if idx < len(component_names) else column
-                    )
-                    component_rewards_by_name.setdefault(name, []).extend(
-                        val_batch[column].tolist()
-                    )
-
             # Collect message logs for later display
             to_env = [
                 get_keys_from_message_log(
@@ -2687,20 +2643,9 @@ def validate(
             sum(total_lengths) / len(total_lengths) if len(total_lengths) > 0 else 0.0
         )
 
-        # Per-component reward averages (e.g. "reward/format", "reward/exact_alnum")
-        # are emitted alongside the combined accuracy when the env returned
-        # multi-reward columns this validation pass.
-        component_reward_means: dict[str, float] = {}
-        for name, values in component_rewards_by_name.items():
-            if values:
-                component_reward_means[f"reward/{name}"] = float(
-                    sum(values) / len(values)
-                )
-
         val_metrics = {
             "accuracy": accuracy,
             "avg_length": avg_length,
-            **component_reward_means,
             **additional_metrics_to_report,
         }
 
@@ -2728,12 +2673,6 @@ def validate(
     print(f"    • Accuracy: {accuracy:.4f}")
     print(f"    • Average response length: {avg_length:.1f} tokens")
     print(f"    • Samples processed: {len(total_rewards)}", flush=True)
-    if component_reward_means:
-        print("    • Per-component reward (weighted):", flush=True)
-        for key, value in sorted(component_reward_means.items()):
-            # key looks like "reward/format" — strip the prefix for readability
-            display_name = key.split("/", 1)[1] if "/" in key else key
-            print(f"        - {display_name}: {value:.4f}", flush=True)
 
     # Print timing information
     print("\n  ⏱️  Validation Timing:")
@@ -2746,10 +2685,6 @@ def validate(
             "content": all_message_logs,
             "rewards": total_rewards,
         }
-        # Surface per-sample reward components so downstream eyeballing /
-        # plotting can split format vs answer-correctness signal.
-        for name, values in component_rewards_by_name.items():
-            val_log_data[f"reward/{name}"] = values
         logger.log_batched_dict_as_jsonl(val_log_data, f"val_data_step{step}.jsonl")
 
     # Make sure to reset the timer after validation
