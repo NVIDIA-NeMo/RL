@@ -5,6 +5,31 @@
 
 set -euo pipefail
 
+# ---------------------------------------------------------------------------
+# Resolve python and ffmpeg — PATH is often minimal inside srun containers
+# ---------------------------------------------------------------------------
+PYTHON=""
+for candidate in python3 python /usr/bin/python3 /usr/local/bin/python3 /opt/conda/bin/python3 /opt/conda/bin/python; do
+    if command -v "$candidate" &>/dev/null; then
+        PYTHON="$candidate"
+        break
+    fi
+done
+if [[ -z "$PYTHON" ]]; then
+    echo "ERROR: no Python interpreter found. Tried: python3 python /usr/bin/python3 /usr/local/bin/python3 /opt/conda/bin/python3"
+    exit 1
+fi
+echo "Using Python: $PYTHON ($(command -v "$PYTHON"))"
+
+FFMPEG=""
+for candidate in ffmpeg /usr/bin/ffmpeg /usr/local/bin/ffmpeg /opt/conda/bin/ffmpeg; do
+    if command -v "$candidate" &>/dev/null; then
+        FFMPEG="$candidate"
+        break
+    fi
+done
+[[ -z "$FFMPEG" ]] && echo "ffmpeg not found on PATH or common locations — video codec sections will be skipped"
+
 section() {
     echo ""
     echo "========================================"
@@ -17,7 +42,7 @@ section() {
 py_provenance() {
     local import_name="$1"
     local pip_name="$2"
-    python3 - <<PYEOF
+    "$PYTHON" - <<PYEOF
 import importlib, subprocess, sys
 
 # File path
@@ -60,20 +85,20 @@ PYEOF
 # 1. Video / Audio codecs (ffmpeg)
 # ---------------------------------------------------------------------------
 section "VIDEO/AUDIO CODECS (ffmpeg)"
-if command -v ffmpeg &>/dev/null; then
-    echo "  path: $(command -v ffmpeg)"
+if [[ -n "$FFMPEG" ]]; then
+    echo "  path: $FFMPEG"
     echo ""
     echo "--- All codecs ---"
-    ffmpeg -codecs 2>/dev/null || true
+    "$FFMPEG" -codecs 2>/dev/null || true
     echo ""
     echo "--- Encoders ---"
-    ffmpeg -encoders 2>/dev/null || true
+    "$FFMPEG" -encoders 2>/dev/null || true
     echo ""
     echo "--- Decoders ---"
-    ffmpeg -decoders 2>/dev/null || true
+    "$FFMPEG" -decoders 2>/dev/null || true
     echo ""
     echo "--- Container formats ---"
-    ffmpeg -formats 2>/dev/null || true
+    "$FFMPEG" -formats 2>/dev/null || true
 else
     echo "ffmpeg not found — skipping"
 fi
@@ -103,7 +128,7 @@ fi
 # 4. Compression codecs — Python stdlib
 # ---------------------------------------------------------------------------
 section "COMPRESSION CODECS (Python stdlib)"
-python3 - <<'EOF'
+"$PYTHON" - <<'EOF'
 import sys, importlib
 for mod in ["zlib", "bz2", "lzma", "gzip", "zipfile"]:
     try:
@@ -120,7 +145,7 @@ EOF
 section "COMPRESSION CODECS (third-party Python)"
 
 echo "[blosc]"
-python3 - <<'EOF'
+"$PYTHON" - <<'EOF'
 try:
     import blosc
     print("  codecs:", blosc.compressor_list())
@@ -131,7 +156,7 @@ py_provenance blosc blosc
 
 echo ""
 echo "[numcodecs]"
-python3 - <<'EOF'
+"$PYTHON" - <<'EOF'
 try:
     import numcodecs
     print("  codecs:", numcodecs.available_codecs())
@@ -142,7 +167,7 @@ py_provenance numcodecs numcodecs
 
 echo ""
 echo "[pyarrow]"
-python3 - <<'EOF'
+"$PYTHON" - <<'EOF'
 try:
     import pyarrow
     supported = [c for c in ['lz4','zstd','snappy','brotli','gzip','bz2'] if pyarrow.Codec.is_available(c)]
@@ -154,7 +179,7 @@ py_provenance pyarrow pyarrow
 
 echo ""
 echo "[zarr]"
-python3 - <<'EOF'
+"$PYTHON" - <<'EOF'
 try:
     import zarr
     reg = list(zarr.codec_registry.keys()) if hasattr(zarr, 'codec_registry') else 'N/A'
@@ -166,7 +191,7 @@ py_provenance zarr zarr
 
 echo ""
 echo "[h5py]"
-python3 - <<'EOF'
+"$PYTHON" - <<'EOF'
 try:
     import h5py
     print(f"  h5py {h5py.__version__} | HDF5 {h5py.version.hdf5_version}")
@@ -179,7 +204,7 @@ py_provenance h5py h5py
 # 6. Image codecs — Pillow
 # ---------------------------------------------------------------------------
 section "IMAGE CODECS (Pillow)"
-python3 - <<'EOF'
+"$PYTHON" - <<'EOF'
 try:
     from PIL import features
     features.pilinfo()
@@ -192,7 +217,7 @@ py_provenance PIL Pillow
 # 7. Image codecs — OpenCV
 # ---------------------------------------------------------------------------
 section "IMAGE CODECS (OpenCV)"
-python3 - <<'EOF'
+"$PYTHON" - <<'EOF'
 try:
     import cv2
     print(cv2.getBuildInformation())
@@ -205,7 +230,7 @@ py_provenance cv2 opencv-python
 # 8. Image codecs — imagecodecs
 # ---------------------------------------------------------------------------
 section "IMAGE CODECS (imagecodecs)"
-python3 - <<'EOF'
+"$PYTHON" - <<'EOF'
 try:
     import imagecodecs
     print(imagecodecs.available())
@@ -218,7 +243,7 @@ py_provenance imagecodecs imagecodecs
 # 9. Image codecs — imageio
 # ---------------------------------------------------------------------------
 section "IMAGE CODECS (imageio)"
-python3 - <<'EOF'
+"$PYTHON" - <<'EOF'
 try:
     import imageio
     print(imageio.formats.show())
@@ -231,7 +256,7 @@ py_provenance imageio imageio
 # 10. Video codecs — PyAV
 # ---------------------------------------------------------------------------
 section "VIDEO CODECS (PyAV)"
-python3 - <<'EOF'
+"$PYTHON" - <<'EOF'
 try:
     import av
     print("available codecs:", sorted(av.codec.codecs_available))
@@ -244,7 +269,7 @@ py_provenance av av
 # 11. Video codecs — decord
 # ---------------------------------------------------------------------------
 section "VIDEO CODECS (decord)"
-python3 - <<'EOF'
+"$PYTHON" - <<'EOF'
 try:
     import decord
     print("version:", decord.__version__)
@@ -257,7 +282,7 @@ py_provenance decord decord
 # 12. TIFF codecs — tifffile
 # ---------------------------------------------------------------------------
 section "IMAGE CODECS (tifffile)"
-python3 - <<'EOF'
+"$PYTHON" - <<'EOF'
 try:
     import tifffile
     print("TIFF compressions:", list(tifffile.TIFF.COMPRESSION.__members__.keys()))
