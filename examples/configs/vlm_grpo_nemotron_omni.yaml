@@ -45,7 +45,8 @@ policy:
       freeze_config:
         freeze_vision_tower: true     # NemotronOmni: freeze RADIO vision tower (also covers patch_generator.video_embedder on image-only data)
         freeze_audio_tower: true      # NemotronOmni: freeze sound_encoder/sound_projection on image-only data
-        freeze_language_model: false  generation:
+        freeze_language_model: false
+  generation:
     max_new_tokens: 4096
     bad_words: ["<image>", "<img>", "</img>", "<so_embedding>", "<so_start>", "<so_end>"]
     vllm_cfg:
