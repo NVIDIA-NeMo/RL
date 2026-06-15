@@ -34,7 +34,6 @@ Data flow:
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 from typing import Any
 
@@ -51,8 +50,6 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerBundle
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import KVBatchMeta
-
-log = logging.getLogger(__name__)
 
 
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
@@ -79,13 +76,6 @@ class SingleControllerActor:
             bundle: Pre-built bundle from single_controller_utils.setup. Tests can
                 construct a bundle by hand (or with fakes) to bypass the real factories.
         """
-        import logging as _logging
-
-        _logging.basicConfig(
-            level=_logging.INFO,
-            format="[%(asctime)s] %(levelname)s %(filename)s:%(lineno)d: %(message)s",
-        )
-
         self._advantage_cfg = AdvantageConfig()
         self._weight_sync_cfg = WeightSyncConfig()
         self._partition_id: str = bundle.partition_id
@@ -126,7 +116,8 @@ class SingleControllerActor:
         if self._async_cfg.batch_selection_strategy == "strict_on_policy":
             self._async_cfg.max_weight_staleness_versions = 0
             print(
-                "Using strict_on_policy, auto setting max_weight_staleness_versions to 0."
+                "Using strict_on_policy, auto setting max_weight_staleness_versions to 0.",
+                flush=True,
             )
 
         self._sampler = StalenessSampler(
@@ -153,12 +144,13 @@ class SingleControllerActor:
         self._train_steps: int = 0
         self._step_consumed_sample_ids: list[str] = []
 
-        log.info(
-            "SingleControllerActor: staleness_cap=%d buffer=%d inflight=%d transport=%s",
-            self._async_cfg.max_weight_staleness_versions,
-            self._async_cfg.max_buffered_rollouts,
-            self._async_cfg.max_inflight_prompts,
-            self._weight_sync_cfg.transport,
+        print(
+            f"SingleControllerActor: "
+            f"staleness_cap={self._async_cfg.max_weight_staleness_versions} "
+            f"buffer={self._async_cfg.max_buffered_rollouts} "
+            f"inflight={self._async_cfg.max_inflight_prompts} "
+            f"transport={self._weight_sync_cfg.transport}",
+            flush=True,
         )
 
     # ── public API ─────────────────────────────────────────────────────────
@@ -210,6 +202,8 @@ class SingleControllerActor:
 
     # ── the three pumps + advantage helper ────────────────────────────────
 
+    # TODO @yukih: rollout_pump only gates on buffer_capacity, not on the current step's group quota.
+    # e.g. max_staleness_versions=0, gbs=16, groups generated past the step's 16 become stale at the next weight sync and get evicted — wasted GPU.
     async def _rollout_pump(self) -> None:
         """Continuously dispatch rollout tasks until cancellation.
 
@@ -223,7 +217,7 @@ class SingleControllerActor:
           5. Decrement _inflight_rollouts
         """
         sem = asyncio.Semaphore(self._async_cfg.max_inflight_prompts)
-        log.info("rollout_pump: starting")
+        print("rollout_pump: starting", flush=True)
 
         async def _dispatch_one_prompt(prompt: DatumSpec) -> None:
             self._inflight_rollouts += 1
@@ -235,7 +229,7 @@ class SingleControllerActor:
                         if prompt["message_log"][i]["role"] == "user":
                             content = prompt["message_log"][i]["content"]
                             break
-                    log.info("  rollout done for prompt='%s...'", content[:20])
+                    print(f"  rollout done for prompt='{content[:20]}...'", flush=True)
             finally:
                 self._inflight_rollouts -= 1
                 sem.release()
@@ -261,7 +255,7 @@ class SingleControllerActor:
                     asyncio.create_task(_dispatch_one_prompt(prompt))
             epoch += 1
 
-        log.info("rollout_pump: completed %d epoch(s)", epoch)
+        print(f"rollout_pump: completed {epoch} epoch(s)", flush=True)
 
     async def _train_pump(self) -> None:
         """Drain stale groups, sample, train, drop.
@@ -279,10 +273,9 @@ class SingleControllerActor:
         adv_cfg = self._advantage_cfg
         grpo_cfg = self._master_config.grpo
 
-        logprobs_required = (
-            adv_cfg.policy_logprobs_field is not None
-            or adv_cfg.reference_logprobs_field is not None
-        )
+        # TODO: fix the compute_prev_logprobs and compute_reference_logprobs logic
+        compute_prev_logprobs = adv_cfg.policy_logprobs_field is not None
+        compute_reference_logprobs = adv_cfg.reference_logprobs_field is not None
 
         while self._train_steps < grpo_cfg["max_num_steps"]:
             step_id = f"sc-step-{self._train_steps:06d}"
@@ -293,16 +286,17 @@ class SingleControllerActor:
             groups_dispatched = 0
             step_open = False
 
-            evicted = await self._sampler.evict(
-                current_train_weight=self._trainer_version,
-            )
-            if evicted:
-                log.info("  evicted %d stale prompt group(s)", evicted)
-                for _ in range(evicted):
-                    self._buffer_capacity.release()
-
             while groups_dispatched < target_groups:
                 await asyncio.sleep(0)
+
+                # evict stale groups
+                evicted = await self._sampler.evict(
+                    current_train_weight=self._trainer_version,
+                )
+                if evicted:
+                    print(f"  evicted {evicted} stale prompt group(s)", flush=True)
+                    for _ in range(evicted):
+                        self._buffer_capacity.release()
 
                 # TODO @yukih: wait train pump merged, now always return min_prompt_groups_per_batch
                 # need to add a max_prompt_groups_per_batch
@@ -318,8 +312,12 @@ class SingleControllerActor:
                 for _ in range(num_groups):
                     self._buffer_capacity.release()
 
-                if logprobs_required:
-                    self._trainer.prepare_logprobs_from_meta(train_meta)
+                # Compute prev_logprobs / ref_logprobs
+                if compute_prev_logprobs:
+                    self._trainer.get_logprobs_from_meta(train_meta)
+
+                if compute_reference_logprobs:
+                    self._trainer.get_reference_policy_logprobs_from_meta(train_meta)
 
                 train_meta = await self._advantage_pump(train_meta)
 
@@ -335,9 +333,12 @@ class SingleControllerActor:
                 self._step_consumed_sample_ids.extend(train_meta.sample_ids)
 
             if not step_open:
-                log.info("train_pump: rollout exhausted before any group ready")
+                print(
+                    "train_pump: rollout exhausted before any group ready", flush=True
+                )
                 break
 
+            # TODO: add log
             result = self._trainer.finish_train_step(step_id)
             consumed_ids = list(self._step_consumed_sample_ids)
             self._step_consumed_sample_ids = []
@@ -347,20 +348,19 @@ class SingleControllerActor:
                 partition_id=self._partition_id,
             )
 
-            self._trainer_version = result["trainer_version"]
             min_sample_version = min(t["weight_version"] for t in train_meta.tags)  # type: ignore
             lag = self._trainer_version - min_sample_version
-            log.info(
-                "train step %d/%d  trainer_v=%d  lag=%d  batch_size=%d",
-                self._train_steps + 1,
-                grpo_cfg["max_num_steps"],
-                self._trainer_version,
-                lag,
-                len(consumed_ids),
+            print(
+                f"train step {self._train_steps + 1}/{grpo_cfg['max_num_steps']}  "
+                f"trainer_v={self._trainer_version}  "
+                f"lag={lag}  "
+                f"batch_size={len(consumed_ids)}",
+                flush=True,
             )
 
-            await self._sync_weights()
+            self._trainer_version += 1
             self._train_steps += 1
+            await self._sync_weights()
 
     async def _sync_weights(self) -> None:
         """Drain in-flight rollouts then synchronize weights.
@@ -383,17 +383,18 @@ class SingleControllerActor:
             await asyncio.sleep(0.005)
 
         drain_elapsed = time.monotonic() - drain_start
-        log.info(
-            "  _sync_weights: drained in %.3fs, syncing weights v%d",
-            drain_elapsed,
-            self._trainer_version,
+        print(
+            f"  _sync_weights: drained in {drain_elapsed:.3f}s, "
+            f"syncing weights v{self._trainer_version}",
+            flush=True,
         )
 
         t0 = time.monotonic()
-        await self._weight_synchronizer.sync_weights(self._trainer_version)
+        # TODO: currently sync_weights is not implemented, comment out for now
+        # await self._weight_synchronizer.sync_weights()
         elapsed = time.monotonic() - t0
 
-        log.info("  _sync_weights: sync done in %.3fs", elapsed)
+        print(f"  _sync_weights: sync done in {elapsed:.3f}s", flush=True)
         self._rollout_manager.set_weight_version(self._trainer_version)
         self._rollout_permitted.set()
 
