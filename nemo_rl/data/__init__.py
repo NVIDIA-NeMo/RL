@@ -177,6 +177,32 @@ class MMAUEvalDataConfig(TypedDict):
     env_name: NotRequired[str]
 
 
+class DailyOmniEvalDataConfig(TypedDict):
+    """Config for the Daily-Omni audio-visual eval dataset.
+
+    Mirrors the MMAU multimodal schema but with its own ``dataset_name`` literal
+    so the eval-config union resolves daily-omni unambiguously. Kept as a
+    ``TypedDict`` for consistency with the other (still v1) eval-data configs in
+    this union, whose consumers access the resolved config by key
+    (``config.data["dataset_name"]``).
+
+    Fields:
+        max_input_seq_length: Max prompt length passed to the generation backend.
+        dataset_name: Must be ``"daily-omni"``.
+        split: HuggingFace split to load.
+        prompt_file: Optional prompt template path.
+        system_prompt_file: Optional system prompt path.
+        env_name: Reward/eval environment name (e.g. ``"vlm"``).
+    """
+
+    max_input_seq_length: int
+    dataset_name: Literal["daily-omni"]
+    split: NotRequired[str | None]
+    prompt_file: NotRequired[str | None]
+    system_prompt_file: NotRequired[str | None]
+    env_name: NotRequired[str]
+
+
 # Union type for all eval dataset configs
 EvalDataConfigType = Union[
     MMLUEvalDataConfig,
@@ -185,5 +211,6 @@ EvalDataConfigType = Union[
     GPQAEvalDataConfig,
     MathEvalDataConfig,
     MMAUEvalDataConfig,
+    DailyOmniEvalDataConfig,
     LocalMathEvalDataConfig,
 ]

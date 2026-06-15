@@ -17,17 +17,18 @@
 defaults: "grpo_math_1B_megatron.yaml"
 
 grpo:
-  num_prompts_per_step: 8
+  num_prompts_per_step: 32
   num_generations_per_prompt: 8
   max_num_steps: 1000
-  max_val_samples: 32
+  val_at_start: false
+  max_val_samples: 256
   val_batch_size: 32
 
 checkpointing:
   enabled: true
   checkpoint_dir: results/intent_grpo_3B_megatron
   keep_top_k: 10
-  save_period: 400
+  save_period: 50
 
 policy:
   model_name: Qwen/Qwen2.5-Omni-3B
@@ -36,13 +37,24 @@ policy:
   generation_batch_size: 32
   logprob_batch_size: 4
   # Audio + video at 16 frames per prompt produces materially more tokens than
-  # the audio-only recipe; raise the budget to keep loss_multiplier > 0.
-  # If the smoke run shows truncation, bump this further.
+  # the audio-only recipe (~5.7k video + ~1.5k audio ≈ 7.3k prompt tokens);
+  # this budget keeps loss_multiplier > 0 with a little headroom. The video
+  # frame count (tokenizer.video.num_frames) is the dominant lever on prompt
+  # length -- do not raise it (or switch to fps) without raising this too.
   max_total_sequence_length: 8192
 
   tokenizer:
     video:
-      # Frame count for Qwen2.5-Omni's video processor. Matches sft_avlm.yaml.
+      # Fixed 16-frame sampling for Qwen2.5-Omni's video processor. Matches
+      # sft_avlm.yaml. DO NOT switch this to fps-based sampling: at fps=2 the
+      # IntentBench/IntentTrain clips expand to ~43k video tokens (vs ~5.7k at
+      # 16 frames), which blows past max_total_sequence_length (8192) and
+      # vLLM max_model_len (8192). vlm_hf_data_processor then hits its
+      # length>=max_seq_length guard, drops vllm_content to None + empties the
+      # multimodal items + sets loss_multiplier=0, so the model generates from
+      # an empty prompt (off-topic text, zero reward, no gradient). 16 frames
+      # keeps the prompt at ~7.3k tokens, just under the budget.
+      # fps and num_frames are mutually exclusive.
       num_frames: 16
 
   sequence_packing:
@@ -94,17 +106,20 @@ env:
   vlm:
     num_workers: 8
     reward_functions:
-    # The Qwen2.5-Omni base model often emits a bare letter (e.g. "B") instead
-    # of "<answer>B</answer>" -- with the strict exact_alnum reward both
-    # rewards stay 0 and GRPO has no learning signal. The "with_fallback"
-    # variant accepts the whole response when no <answer> tag is present so
-    # the model gets credit for bare-letter answers; once it's reliably right
-    # we keep the format_reward in the mix to nudge it toward the wrapped
-    # form and unlock <think>/<answer> structure.
+    # Strict two-signal reward, same structure as the HumanOmniV2 reference
+    # (format + accuracy). The IntentDataset prompt explicitly instructs the
+    # model to reason between <think> </think> and commit the answer between
+    # <answer> </answer> tags, so we score it accordingly:
+    #   * format    -- rewards the <think> ... </think> <answer> ... </answer>
+    #                  structure (does not gate correctness).
+    #   * exact_alnum -- case-insensitive exact match on the <answer> content;
+    #                  unlike the "with_fallback" variant it returns 0 when the
+    #                  <answer> tag is missing, so the model must actually emit
+    #                  the wrapped form to earn the accuracy signal.
     - name: format
-      weight: 0.1
-    - name: exact_alnum_with_fallback
-      weight: 0.9
+      weight: 0.2
+    - name: exact_alnum
+      weight: 0.8
 
 logger:
   wandb_enabled: true

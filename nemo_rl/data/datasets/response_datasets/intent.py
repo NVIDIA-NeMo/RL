@@ -29,6 +29,7 @@ rejected that path during Round 1 testing (see BitLesson
 BL-20260428-omni-use-audio-in-video).
 """
 
+import ast
 import json
 import logging
 import os
@@ -79,6 +80,28 @@ _TYPE_TEMPLATE = {
         "example: <think>your reasoning</think><answer>your answer</answer>"
     ),
 }
+
+
+def _format_options(options: Any) -> str:
+    """Render a record's multiple-choice options into the prompt text.
+
+    IntentTrain/IntentBench manifests store ``options`` as a list of strings
+    like ``["A.first choice", "B.second choice", ...]`` (occasionally as a
+    string repr of that list). These MUST be appended to the prompt: without
+    them the model only sees the question stem and has to emit a bare option
+    letter blind (capping accuracy near chance). Mirrors HumanOmniV2's prompt
+    construction. Returns an empty string when no options are present.
+    """
+    if not options:
+        return ""
+    if isinstance(options, str):
+        try:
+            options = ast.literal_eval(options)
+        except (ValueError, SyntaxError):
+            return f" Options:\n{options}"
+    if isinstance(options, (list, tuple)):
+        return " Options:\n" + "\n".join(str(o) for o in options)
+    return f" Options:\n{options}"
 
 # Per-split HF repo + manifest filenames for the HumanOmniV2 IntentTrain /
 # IntentBench releases. Each split downloads a videos.zip and one or more JSON
@@ -299,6 +322,7 @@ class IntentDataset(RawDataset):
                     "problem": record.get("problem", ""),
                     "problem_type": problem_type,
                     "answer": record.get("answer", ""),
+                    "options": record.get("options"),
                     "video_path": local_path,
                 }
             )
@@ -323,7 +347,8 @@ class IntentDataset(RawDataset):
         explicit time alignment hint.
         """
         instruction = _TYPE_TEMPLATE.get(data["problem_type"], "")
-        prompt_text = f"{data['problem']}{instruction}"
+        options_text = _format_options(data.get("options"))
+        prompt_text = f"{data['problem']}{options_text}{instruction}"
         audio_array = _load_audio_from_video(data["video_path"])
         user_content = [
             {"type": "video", "video": data["video_path"]},

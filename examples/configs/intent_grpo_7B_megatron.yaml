@@ -2,8 +2,8 @@
 #
 # Same recipe as intent_grpo_3B_megatron.yaml (PhilipC/IntentTrain →
 # PhilipC/IntentBench, audio+video as independent <|VIDEO|> + <|AUDIO|>
-# multimodal items, format(0.1)+exact_alnum_with_fallback(0.9) reward,
-# multiple-choice problem_type only) but for Qwen/Qwen2.5-Omni-7B.
+# multimodal items, num_frames=16 video sampling, format(0.2)+exact_alnum(0.8)
+# reward, multiple-choice problem_type only) but for Qwen/Qwen2.5-Omni-7B.
 #
 # 7B requires more aggressive sharding than 3B to fit on 80 GB H100s
 # alongside vLLM rollout memory:
@@ -23,19 +23,40 @@
 # stay identical to the 3B recipe.
 defaults: "intent_grpo_3B_megatron.yaml"
 
+
 grpo:
-  num_prompts_per_step: 4
-  num_generations_per_prompt: 4
+  # Full-throughput rollout (same as 3B): 32 prompts × 8 generations = 256
+  # rollouts per step → 256 / train_global_batch_size(32) = 8 gradient updates
+  # per step. num_prompts_per_step does NOT affect per-forward batch (that is
+  # governed by train_micro_batch_size / logprob_batch_size below), so it is
+  # unrelated to the Qwen2.5-Omni rope IndexError.
+  num_prompts_per_step: 32
 
 policy:
   model_name: Qwen/Qwen2.5-Omni-7B
-  train_global_batch_size: 4
+  # PER-FORWARD batch must be exactly 1 sample/rank, else the Qwen2.5-Omni
+  # get_rope_index path crashes with "IndexError: index 1 is out of bounds for
+  # dimension 0 with size 1" (input_ids batch > attention_mask batch). That is
+  # controlled by train_micro_batch_size=1 (train forward) and
+  # logprob_batch_size=1 (log-prob forward, which crashed at step 1 when it was
+  # 4). train_global_batch_size=32 only sets gradient accumulation and is
+  # independent of the rope constraint (must stay divisible by micro × DP;
+  # 32 % (1 × DP=4) == 0).
+  train_global_batch_size: 32
   train_micro_batch_size: 1
-  generation_batch_size: 4
+  generation_batch_size: 32
   logprob_batch_size: 1
-  # Multimodal token budget for video (4 frames) + audio + text. Bump if
-  # loss_multiplier truncates many samples in early validation.
-  max_total_sequence_length: 4096
+
+  tokenizer:
+    video:
+      # 7B override: 8 frames (vs the 3B base's 16) to roughly halve the
+      # prompt length (~7.3k → ~4.5k tokens: 8×360 video + ~1.5k audio + text)
+      # and thus the training-forward activation memory. The TP=4 OOM was in
+      # the multimodal encoder forward with the GPU ~100% full; fewer frames
+      # frees LLM activation headroom. NOTE: this is a stopgap -- the proper
+      # fix (matching HumanOmniV2, which only trains the LLM) is to FREEZE the
+      # vision/audio encoders, which needs a code hook (no YAML knob exists).
+      num_frames: 8
 
   generation:
     vllm_cfg:
@@ -45,16 +66,23 @@ policy:
 
   megatron_cfg:
     activation_checkpointing: true
-    # Shard the model across two ranks. With cluster.gpus_per_node=8 this
-    # gives DP=4. train_global_batch_size=4 + micro=1 satisfies Megatron's
-    # divisibility check (4 % (1 * 4) == 0) AND keeps the per-rank batch
-    # at exactly 1 sample per forward, which is what the Qwen2.5-Omni rope
-    # path requires.
+    # TP=2 (DP=4 on 8 GPUs) -- 2x the data-parallel throughput of TP=4. Valid
+    # TP values are 1/2/4 (num_attention_heads=28 must be divisible by TP; TP=8
+    # fails). TP=2 OOM'd EARLIER, but that was at num_frames=16 (~7.3k-token
+    # sequence); now that num_frames=8 cuts the sequence to ~4.5k tokens, the
+    # logits/activation memory is ~40% smaller and TP=2 may fit. If it OOMs,
+    # fall back to tensor_model_parallel_size=4 (proven to run at 8 frames).
     tensor_model_parallel_size: 2
 
-  tokenizer:
-    video:
-      num_frames: 4
+checkpointing:
+  # save_period 20 (vs the 3B base's 50): a 1-epoch (85-step) 7B run is slow
+  # (~6 min/step) and previously hit the Slurm time limit at ~step 30 with the
+  # checkpoints/ dir still EMPTY (nothing at step 50). 20 lands a checkpoint at
+  # steps 20/40/60/80. checkpoint_must_save_by additionally forces a save once
+  # 3h45m of wall-clock have elapsed, so progress survives the job time limit
+  # regardless of which step we're on (format DD:HH:MM:SS).
+  save_period: 20
+  checkpoint_must_save_by: "00:03:45:00"
 
 logger:
   wandb:

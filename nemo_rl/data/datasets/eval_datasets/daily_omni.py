@@ -60,6 +60,10 @@ class DailyOmniEvalDataset:
 
     def _format_for_eval(self, data: dict[str, Any]) -> dict[str, Any]:
         out = self._base.format_data(data)
-        text_item = out["messages"][0]["content"][1]
+        # Content order is [video, audio, text]; locate the text item by type
+        # rather than a fixed index so it stays correct as media items change.
+        text_item = next(
+            item for item in out["messages"][0]["content"] if item["type"] == "text"
+        )
         text_item["text"] = _SINGLE_LETTER_LINE.sub("", text_item["text"])
         return out

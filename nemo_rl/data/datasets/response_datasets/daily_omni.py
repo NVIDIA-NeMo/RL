@@ -15,6 +15,7 @@
 import os
 from typing import Any
 
+import numpy as np
 from huggingface_hub import snapshot_download
 
 from nemo_rl.data.datasets.raw_dataset import RawDataset
@@ -22,6 +23,28 @@ from nemo_rl.data.datasets.utils import (
     get_huggingface_cache_path,
     load_dataset_from_path,
 )
+
+
+def _load_audio_16k_mono(path: str) -> np.ndarray:
+    """Decode an audio file as a 1-D float32 array at 16 kHz mono.
+
+    Daily-Omni ships each clip's audio track as a sibling ``*_audio.wav`` next
+    to ``*_video.mp4``. We feed it as an independent ``{type: audio}`` content
+    item (mirroring the IntentTrain training path) so the Qwen2.5-Omni chat
+    template renders an ``<|AUDIO|>`` placeholder and vLLM populates
+    ``multi_modal_data["audio"]``. The benchmark is audio-visual, so video
+    frames alone leave audio-dependent questions unanswerable. Uses decord
+    (already a project dependency for video decoding) for the same 16 kHz mono
+    pipeline the training path uses.
+    """
+    import decord
+
+    reader = decord.AudioReader(path, sample_rate=16000, mono=True)
+    # Shape: (channels, T). With mono=True channels=1; squeeze to (T,).
+    audio = reader[:].asnumpy()
+    if audio.ndim > 1:
+        audio = audio[0]
+    return audio.astype(np.float32)
 
 
 class DailyOmniDataset(RawDataset):
@@ -116,20 +139,16 @@ class DailyOmniDataset(RawDataset):
         return prompt
 
     def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
+        video_dir = os.path.join(self.hf_cache_dir, "Videos", data["video_id"])
+        video_path = os.path.join(video_dir, data["video_id"] + "_video.mp4")
+        audio_path = os.path.join(video_dir, data["video_id"] + "_audio.wav")
+        # Audio + video flow as two independent content items so the
+        # Qwen2.5-Omni chat template renders both <|VIDEO|> and <|AUDIO|>
+        # placeholders (Daily-Omni is an audio-visual benchmark).
         user_content = [
-            {
-                "type": "video",
-                "video": os.path.join(
-                    self.hf_cache_dir,
-                    "Videos",
-                    data["video_id"],
-                    data["video_id"] + "_video.mp4",
-                ),
-            },
-            {
-                "type": "text",
-                "text": self.get_prompt(data),
-            },
+            {"type": "video", "video": video_path},
+            {"type": "audio", "audio": _load_audio_16k_mono(audio_path)},
+            {"type": "text", "text": self.get_prompt(data)},
         ]
         return {
             "messages": [

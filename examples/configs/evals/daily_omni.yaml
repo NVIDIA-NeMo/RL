@@ -21,15 +21,32 @@ generation:
     tensor_parallel_size: 1
     pipeline_parallel_size: 1
     expert_parallel_size: 1
-    gpu_memory_utilization: 0.9
-    max_model_len: 16000
+    # 0.9 -> 0.5: with 32 video frames + audio, the Qwen2.5-Omni vision/audio
+    # encoder forward needs a large chunk of *transient activation* memory that
+    # lives outside vLLM's KV-cache budget. At 0.9 the KV cache claims almost
+    # all VRAM (56+ GiB) and the first multimodal forward OOM-crashes the vLLM
+    # workers (hard EOF, no graceful torch OOM). 0.5 leaves ample headroom; KV
+    # cache is still ~1M tokens, far more than eval needs.
+    gpu_memory_utilization: 0.5
+    # Bumped from 16000 to fit 32 video frames + the 16 kHz audio track
+    # without truncating the multimodal prompt (truncation silently masks
+    # samples out and collapses their reward to 0).
+    max_model_len: 32000
     enforce_eager: False
     skip_tokenizer_init: False
     limit_mm_per_prompt:
       video: 1
+      audio: 1
   vllm_kwargs:
     # Disable mm processor cache to avoid vLLM cache eviction during eval.
     mm_processor_cache_gb: 0
+    # Cap concurrent sequences so the Qwen2.5-Omni vision/audio encoder only
+    # processes a few clips per step. With audio + 32 video frames, vLLM
+    # otherwise batches ~66 clips into one encoder forward and OOM-crashes the
+    # workers (kv_cache_usage was ~2% at crash -> it is encoder *activation*
+    # memory, not KV cache). 8 keeps the encoder batch small; eval throughput
+    # is not a concern.
+    max_num_seqs: 8
   colocated:
     enabled: true
     resources:
@@ -41,7 +58,9 @@ tokenizer:
   chat_template: "default"
   chat_template_kwargs: null
   video:
-    num_frames: 16
+    # 16 -> 32 frames: 60s clips at 16 frames is ~1 frame / 3.75s, too sparse
+    # for fine-grained temporal (Event Sequence) questions.
+    num_frames: 32
 
 data:
   max_input_seq_length: ${generation.vllm_cfg.max_model_len}

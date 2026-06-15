@@ -1,3 +1,1 @@
-{}
-
-You MUST wrap your chosen letter in <answer> </answer> tags. For example: <answer>A</answer>
+{} First reason briefly between <think> </think> tags, then output only the single option letter (e.g., A, B, C, D, ...) between <answer> </answer> tags. Format example: <think>your reasoning</think><answer>A</answer>
