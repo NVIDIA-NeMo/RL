@@ -1646,6 +1646,14 @@ class MegatronPolicyWorkerImpl(
         misc_meta = OrderedDict()
         _xfer_bytes = _bcast_bytes = 0  # full-tensor payload routed to each path
 
+        # Handle tied LM head.
+        from megatron.core.utils import unwrap_model
+
+        _model0 = self.model[0] if isinstance(self.model, list) else self.model
+        tie_lm_head = bool(
+            getattr(unwrap_model(_model0), "share_embeddings_and_output_weights", False)
+        )
+
         # Iterates all the params to construct the state_dict_metadata (xferdtensor path)
         # state_dict_metadata[hf_name] -> [shape, dtype]
         # At the same time, filter the params to the misc subset (packed_broadcast path).
@@ -1660,6 +1668,10 @@ class MegatronPolicyWorkerImpl(
                 # Whitelist: only known-shardable params take the nccl-xfer path;
                 # everything else (incl. unknown/new params) -> misc (packed_broadcast).
                 if is_nccl_xfer_param(name, qkv_to_misc=qkv_to_misc):
+                    if tie_lm_head and name == "lm_head.weight":
+                        # Tied to embed_tokens (transferred); no standalone tensor
+                        # to source, and the gen backend has none either.
+                        continue
                     state_dict_metadata[name] = meta
                     _xfer_bytes += _nbytes
                 else:
