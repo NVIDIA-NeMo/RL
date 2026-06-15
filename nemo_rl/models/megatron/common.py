@@ -191,7 +191,7 @@ def get_mtp_metrics() -> dict[str, Any]:
         for i in range(mtp_num_layers):
             metrics[f"mtp_{i + 1}_loss"] = float(mtp_losses[i].item())
             # Compute acceptance rate as percentage
-            acceptance_rate = (mtp_corrects[i] / max(mtp_totals[i], 1)) * 100.0
+            acceptance_rate = (mtp_corrects[i] / mtp_totals[i].clamp(min=1)) * 100.0
             metrics[f"mtp_{i + 1}_acceptance_rate"] = float(acceptance_rate.item())
 
         MTPLossLoggingHelper.clean_metrics_in_tracker()
