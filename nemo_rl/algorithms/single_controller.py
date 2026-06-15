@@ -42,11 +42,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
 
 import ray
 import torch
+from pydantic import BaseModel, Field
 from tensordict import TensorDict
 
 from nemo_rl.algorithms.staleness_sampler import (
@@ -59,9 +59,23 @@ from nemo_rl.data_plane import KVBatchMeta
 log = logging.getLogger(__name__)
 
 
-@dataclass
-class SingleControllerConfig:
-    """Configuration for SingleController."""
+# TQ partition schema field names — cross-component protocol with the rollout
+# actor. These are not user-tunable: changing them in SC would also need to
+# change the rollout writer. Treated as fixed conventions, not config.
+ADVANTAGE_OUTPUT_FIELD = "advantages"
+PROMPT_IDS_FIELD = "prompt_ids_for_adv"
+REWARD_FIELD = "total_reward"
+TOKEN_MASK_FIELD = "token_mask"
+SAMPLE_MASK_FIELD = "sample_mask"
+
+
+class SingleControllerConfig(BaseModel, extra="allow"):
+    """Configuration for SingleController.
+
+    ``extra="allow"`` accepts unknown keys so YAML-loaded configs can carry
+    forward fields the runtime doesn't (yet) consume. Literal-typed fields
+    are validated at construction by pydantic — no runtime assert needed.
+    """
 
     # Staleness
     max_weight_staleness_versions: int = 1
@@ -84,30 +98,28 @@ class SingleControllerConfig:
     # DataPlane partition
     partition_id: str = "rollout_data"
     consumer_task_name: str = "train"
-    claim_required_fields: list[str] = field(default_factory=lambda: ["input_ids"])
+    claim_required_fields: list[str] = Field(default_factory=lambda: ["input_ids"])
     max_claim_prompt_groups: int = 8
 
-    # Advantage calculation
+    # Advantage calculation. The TQ partition column names for prompt_ids /
+    # reward / token_mask / sample_mask / advantages are fixed conventions
+    # (see module-level *_FIELD constants); only the real toggles live here.
     advantage_enabled: bool = False
-    advantage_output_field: str = "advantages"
-    advantage_prompt_ids_field: str = "prompt_ids_for_adv"
-    advantage_reward_field: str = "total_reward"
-    advantage_token_mask_field: str = "token_mask"
-    advantage_sample_mask_field: str = "sample_mask"
-    advantage_repeated_batch_fields: list[str] = field(default_factory=list)
+    advantage_repeated_batch_fields: list[str] = Field(default_factory=list)
     advantage_policy_logprobs_field: str | None = None
     advantage_reference_logprobs_field: str | None = None
 
     # Diagnostics
     diagnostics: bool = False
 
-    # Weight transport backend ("stub" for dry-run, "nccl" for production)
+    # Weight transport backend ("stub" for dry-run, "nccl" for production).
+    # NOTE: weight_nccl_addr / weight_nccl_port currently have no readers;
+    # they're reserved for the NCCL transport that lands with weight_sync
+    # wiring in a follow-up PR. Kept here so the config surface doesn't
+    # churn when that arrives.
     weight_transport: str = "stub"
     weight_nccl_addr: str = "127.0.0.1"
     weight_nccl_port: Optional[int] = None
-
-    # Extra fields passed through to avoid TypedDict issues
-    extra: dict = field(default_factory=dict)
 
 
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
@@ -130,6 +142,7 @@ class SingleControllerActor:
         gen_handle: Any,
         trainer_handle: Any,
         weight_synchronizer: Any,
+        loss_fn: Any,
         advantage_estimator: Any | None = None,
     ) -> None:
         import logging as _logging
@@ -145,6 +158,7 @@ class SingleControllerActor:
         self._gen = gen_handle
         self._trainer = trainer_handle
         self._weight_synchronizer = weight_synchronizer
+        self._loss_fn = loss_fn
         self._advantage_estimator = advantage_estimator
 
         if cfg.advantage_enabled and self._advantage_estimator is None:
@@ -152,16 +166,13 @@ class SingleControllerActor:
                 "advantage_enabled=True requires an advantage_estimator instance"
             )
 
-        # Initialize sampler
-        assert cfg.batch_selection_strategy in [
-            "strict_on_policy",
-            "staleness_window",
-        ], f"Unknown batch_selection_strategy: {cfg.batch_selection_strategy}"
-
+        # batch_selection_strategy is Literal-typed; pydantic rejects unknown
+        # values at config construction, so no runtime assert is needed here.
         if cfg.batch_selection_strategy == "strict_on_policy":
             cfg.max_weight_staleness_versions = 0
-            print(
-                "Using strict_on_policy, auto setting max_weight_staleness_versions to 0."
+            log.info(
+                "Using strict_on_policy, auto setting "
+                "max_weight_staleness_versions to 0."
             )
         if cfg.target_prompt_groups_per_step is None:
             cfg.target_prompt_groups_per_step = cfg.min_prompt_groups_per_batch
@@ -249,7 +260,9 @@ class SingleControllerActor:
         if not refs:
             return []
         ref_to_task = {ref: asyncio.ensure_future(ref) for ref in refs}
-        await asyncio.wait(ref_to_task.values(), timeout=0.05)
+        # timeout=0.0 is the non-blocking peek — yields control once so newly-
+        # scheduled Tasks can step their ObjectRef awaitables, then returns.
+        await asyncio.wait(ref_to_task.values(), timeout=0.0)
         pending: list[ray.ObjectRef] = []
         for ref, task in ref_to_task.items():
             if task.done():
@@ -324,11 +337,27 @@ class SingleControllerActor:
             ``_advantage_pump`` → ``train_microbatch_from_meta`` (queued).
           - End-of-step: drain in-flight → ``finish_train_step`` →
             single ``clear_samples`` → ``_sync_weights``.
+
+        Concurrency contract
+        --------------------
+        SC submits ``train_microbatch_from_meta`` calls without awaiting
+        each result so the sampling loop stays decoupled from GPU pace.
+        Serialization is provided by the trainer actor's mailbox, which
+        requires ``max_concurrency=1`` on ``self._trainer``. The worker's
+        ``_train_step_state`` accumulators (``local_valid_seqs +=``,
+        ``mb_losses.append``, ``all_mb_metrics.append``) are not
+        concurrency-safe; an async actor or ``max_concurrency>1`` would
+        race them. ``in_flight`` retains ObjectRefs only so
+        ``_reap_in_flight_nonblocking`` can surface exceptions promptly
+        (fast-fail) without blocking the loop.
         """
-        logprobs_required = (
+        refresh_policy_logprobs = (
             self._cfg.advantage_policy_logprobs_field is not None
-            or self._cfg.advantage_reference_logprobs_field is not None
         )
+        refresh_reference_logprobs = (
+            self._cfg.advantage_reference_logprobs_field is not None
+        )
+        logprobs_required = refresh_policy_logprobs or refresh_reference_logprobs
 
         while self._train_steps < self._cfg.max_train_steps:
             step_id = f"sc-step-{self._train_steps:06d}"
@@ -341,87 +370,145 @@ class SingleControllerActor:
             step_open = False
             step_min_weight_version: int | None = None
 
-            while groups_dispatched < target_groups:
-                await asyncio.sleep(0)
-                await self._claim_available_meta()
-                evicted_meta = await self._evict_stale_claimed()
-                if evicted_meta is not None:
-                    evicted_groups = count_prompt_groups(
-                        evicted_meta,
-                        generations_per_prompt=self._cfg.generations_per_prompt,
-                    )
-                    for _ in range(evicted_groups):
-                        self._buffer_capacity.release()
+            # Per-step error path: if any worker call raises (microbatch OOM,
+            # NaN-guard trip, prepare_logprobs failure, begin/finish failure),
+            # bail out of the inner loop, drop any partial worker state via
+            # abort_train_step, clear the consumed-ids ledger, and re-raise.
+            # TODO(sc): retry policy is not yet wired — current behavior fails
+            # the SC actor after a clean abort. A follow-up should add bounded
+            # retry (e.g. retry the step N times, abort the run on exhaustion).
+            try:
+                while groups_dispatched < target_groups:
+                    await asyncio.sleep(0)
+                    await self._claim_available_meta()
+                    evicted_meta = await self._evict_stale_claimed()
+                    if evicted_meta is not None:
+                        evicted_groups = count_prompt_groups(
+                            evicted_meta,
+                            generations_per_prompt=self._cfg.generations_per_prompt,
+                        )
+                        for _ in range(evicted_groups):
+                            self._buffer_capacity.release()
 
-                group_indices = None
-                if self._claimed_meta is not None and self._claimed_meta.size > 0:
-                    group_indices = self._sampler.select_one_group(
-                        self._claimed_meta,
-                        trainer_version=self._trainer_version,
-                        generations_per_prompt=self._cfg.generations_per_prompt,
-                    )
+                    group_indices = None
+                    if self._claimed_meta is not None and self._claimed_meta.size > 0:
+                        group_indices = self._sampler.select_one_group(
+                            self._claimed_meta,
+                            trainer_version=self._trainer_version,
+                            generations_per_prompt=self._cfg.generations_per_prompt,
+                        )
 
-                if group_indices is None:
+                    if group_indices is None:
+                        in_flight = await self._reap_in_flight_nonblocking(in_flight)
+                        if (
+                            self._rollout_done
+                            and len(in_flight) == 0
+                            and (
+                                self._claimed_meta is None
+                                or self._claimed_meta.size == 0
+                            )
+                        ):
+                            break
+                        await asyncio.sleep(0.005)
+                        continue
+
+                    group_meta = self._claimed_meta.subset(group_indices)
+                    self._claimed_meta = self._claimed_meta.drop(group_indices)
+
+                    if logprobs_required:
+                        # Trainer writes refreshed prev_lp / ref_lp back to the
+                        # TQ partition under the configured field names. Block
+                        # here: advantage estimation downstream may read them.
+                        await self._ray_get(
+                            self._trainer.prepare_logprobs_from_meta.remote(
+                                group_meta,
+                                refresh_policy_logprobs=refresh_policy_logprobs,
+                                refresh_reference_logprobs=refresh_reference_logprobs,
+                            )
+                        )
+
+                    group_meta = await self._advantage_pump(group_meta)
+
+                    if not step_open:
+                        # gbs/mbs default to worker-side cfg when None; SC owns
+                        # only loss_fn (stable across the whole training run).
+                        await self._ray_get(
+                            self._trainer.begin_train_step.remote(
+                                step_id, self._loss_fn
+                            )
+                        )
+                        step_open = True
+
+                    future = self._trainer.train_microbatch_from_meta.remote(
+                        step_id, group_meta
+                    )
+                    in_flight.append(future)
+                    groups_dispatched += 1
+                    self._buffer_capacity.release()
+                    self._step_consumed_sample_ids.extend(group_meta.sample_ids)
+                    group_min_v = min_weight_version(group_meta)
+                    if group_min_v is not None:
+                        step_min_weight_version = (
+                            group_min_v
+                            if step_min_weight_version is None
+                            else min(step_min_weight_version, group_min_v)
+                        )
+
                     in_flight = await self._reap_in_flight_nonblocking(in_flight)
-                    if (
-                        self._rollout_done
-                        and len(in_flight) == 0
-                        and (self._claimed_meta is None or self._claimed_meta.size == 0)
-                    ):
-                        break
-                    await asyncio.sleep(0.005)
-                    continue
 
-                group_meta = self._claimed_meta.subset(group_indices)
-                self._claimed_meta = self._claimed_meta.drop(group_indices)
-
-                if logprobs_required:
-                    await self._ray_get(
-                        self._trainer.prepare_logprobs_from_meta.remote(group_meta)
-                    )
-
-                group_meta = await self._advantage_pump(group_meta)
+                for fut in in_flight:
+                    await self._ray_get(fut)
 
                 if not step_open:
-                    await self._ray_get(self._trainer.begin_train_step.remote(step_id))
-                    step_open = True
-
-                future = self._trainer.train_microbatch_from_meta.remote(
-                    step_id, group_meta
-                )
-                in_flight.append(future)
-                groups_dispatched += 1
-                self._buffer_capacity.release()
-                self._step_consumed_sample_ids.extend(group_meta.sample_ids)
-                group_min_v = min_weight_version(group_meta)
-                if group_min_v is not None:
-                    step_min_weight_version = (
-                        group_min_v
-                        if step_min_weight_version is None
-                        else min(step_min_weight_version, group_min_v)
+                    log.info(
+                        "train_pump: rollout exhausted before any group ready"
                     )
+                    break
 
-                in_flight = await self._reap_in_flight_nonblocking(in_flight)
+                # finish_train_step returns step metrics; SC ignores them for
+                # version bookkeeping. The trainer_version counter is driver-
+                # owned (workers don't emit it) and bumps after this call
+                # returns successfully (see below). The new value propagates
+                # to rollouts via _sync_weights below.
+                await self._ray_get(
+                    self._trainer.finish_train_step.remote(step_id)
+                )
+            except Exception:
+                # Worker may be left with a half-open step (train_microbatch
+                # partially mutated _train_step_state, or begin/finish itself
+                # raised). Best-effort: tell the worker to drop state so the
+                # next attempt can begin cleanly. We swallow abort errors here
+                # so the original exception still surfaces — masking it would
+                # be worse than a noisy log.
+                if step_open:
+                    try:
+                        await self._ray_get(
+                            self._trainer.abort_train_step.remote(step_id)
+                        )
+                    except Exception:
+                        log.exception(
+                            "abort_train_step failed during error recovery "
+                            "(step=%s)",
+                            step_id,
+                        )
+                self._step_consumed_sample_ids = []
+                raise
 
-            for fut in in_flight:
-                await self._ray_get(fut)
+            # finish_train_step succeeded → opt.step ran on the worker, model
+            # weights are advanced. Bump the version *immediately* so SC's
+            # counter reflects worker state even if clear_samples below
+            # raises — otherwise a clear_samples failure would leave SC stuck
+            # on the old version while the trainer is one ahead.
+            prev_trainer_version = self._trainer_version
+            self._trainer_version += 1
 
-            if not step_open:
-                log.info("train_pump: rollout exhausted before any group ready")
-                break
-
-            result = await self._ray_get(
-                self._trainer.finish_train_step.remote(step_id)
-            )
             consumed_ids = list(self._step_consumed_sample_ids)
+            self._step_consumed_sample_ids = []
             await self._call_dp(
                 "clear_samples",
                 sample_ids=consumed_ids,
                 partition_id=self._cfg.partition_id,
             )
-            self._step_consumed_sample_ids = []
-            prev_trainer_version = self._trainer_version
-            self._trainer_version = result["trainer_version"]
             lag = (
                 prev_trainer_version - step_min_weight_version
                 if step_min_weight_version is not None
@@ -493,13 +580,13 @@ class SingleControllerActor:
             select_fields=self._advantage_input_fields(),
         )
 
-        prompt_ids = _tensor_field(data, self._cfg.advantage_prompt_ids_field)
+        prompt_ids = _tensor_field(data, PROMPT_IDS_FIELD)
         rewards = _squeeze_trailing_unit_dim(
-            _tensor_field(data, self._cfg.advantage_reward_field)
+            _tensor_field(data, REWARD_FIELD)
         ).float()
-        token_mask = _tensor_field(data, self._cfg.advantage_token_mask_field).float()
+        token_mask = _tensor_field(data, TOKEN_MASK_FIELD).float()
         sample_mask = _squeeze_trailing_unit_dim(
-            _tensor_field(data, self._cfg.advantage_sample_mask_field)
+            _tensor_field(data, SAMPLE_MASK_FIELD)
         ).float()
         mask = token_mask * sample_mask.unsqueeze(-1)
 
@@ -537,10 +624,10 @@ class SingleControllerActor:
             partition_id=meta.partition_id,
             fields=_fields_for_put(
                 meta,
-                {self._cfg.advantage_output_field: advantages},
+                {ADVANTAGE_OUTPUT_FIELD: advantages},
             ),
         )
-        return meta.with_fields([self._cfg.advantage_output_field])
+        return meta.with_fields([ADVANTAGE_OUTPUT_FIELD])
 
     # ── utility helpers ────────────────────────────────────────────────────
 
@@ -578,10 +665,10 @@ class SingleControllerActor:
 
     def _advantage_input_fields(self) -> list[str]:
         fields = [
-            self._cfg.advantage_prompt_ids_field,
-            self._cfg.advantage_reward_field,
-            self._cfg.advantage_token_mask_field,
-            self._cfg.advantage_sample_mask_field,
+            PROMPT_IDS_FIELD,
+            REWARD_FIELD,
+            TOKEN_MASK_FIELD,
+            SAMPLE_MASK_FIELD,
             *self._cfg.advantage_repeated_batch_fields,
         ]
         if self._cfg.advantage_policy_logprobs_field is not None:
