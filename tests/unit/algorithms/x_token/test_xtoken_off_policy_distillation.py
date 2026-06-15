@@ -215,7 +215,7 @@ def mock_xtoken_components():
     }
 
     teacher_policy = MagicMock()
-    teacher_policy.get_full_logits_ipc.return_value = [{"shape": (4, 32)}]
+    teacher_policy.get_teacher_logits_ipc.return_value = [{"rank_logits_ipc": (4, 32)}]
 
     train_dataloader = _mock_dataloader(num_batches=10)
     val_dataloader = _mock_dataloader(num_batches=2)
@@ -607,10 +607,12 @@ def test_skip_keys_builder_cross_and_same_vocab():
     # Student-seq alignment keys ([B, T_s]) and num_chunks ([B]) are NOT skipped.
     assert "alignment_0_student_chunk_id" not in keys
     assert "alignment_0_num_chunks" not in keys
-    # Same-vocab top-K teacher 1 contributes nothing (its topk tensors are
-    # [B, T_s, k], student-seq-aligned at dim 1).
-    assert not any("_1_" in k or k.endswith("_1") for k in keys)
+    # Same-vocab top-K teacher 1 now ships top-K over IPC, so its handle-list
+    # key (a non-tensor) is skipped; it has no other seq-axis keys.
+    assert "teacher_1_topk_ipc" in keys
     assert "teacher_1_full_logits_ipc" not in keys
+    assert not any(k.startswith("alignment_1_") for k in keys)
+    assert "teacher_1_input_ids" not in keys
 
 
 def test_skip_keys_builder_same_vocab_full_logits():
@@ -625,21 +627,21 @@ def test_skip_keys_builder_same_vocab_full_logits():
 
 
 def test_run_teacher_forwards_packs_indexed_keys_and_runs_serially():
-    # teacher 0 cross-tokenizer (full-logits IPC); teacher 1 same-vocab top-K.
+    # teacher 0 cross-tokenizer (full-logits IPC); teacher 1 same-vocab top-K
+    # IPC. Both ship over the unified get_teacher_logits_ipc producer.
     loss_fn = _FakeLossFn(
         projection_matrix_paths=["/p0.pt", None],
         teacher_ships_full=[True, False],
         vocab_topk=8,
     )
     t0 = MagicMock()
-    t0.get_full_logits_ipc.return_value = [{"h": 0}]
+    t0.get_teacher_logits_ipc.return_value = [{"rank_logits_ipc": 0}]
     t1 = MagicMock()
-    t1.get_topk_logits.return_value = {
-        "topk_logits": torch.zeros(1, 4, 8),
-        "topk_indices": torch.zeros(1, 4, 8, dtype=torch.long),
-    }
+    t1.get_teacher_logits_ipc.return_value = [
+        {"rank_topk_vals_ipc": 0, "rank_topk_idx_ipc": 1}
+    ]
     # Cross-tokenizer teacher 0 needs teacher_0_*/alignment_0_*; same-vocab
-    # teacher 1 reuses the student tokenization (no teacher_1_* keys).
+    # teacher 1 reuses the student tokenization (no teacher_1_* token keys).
     batch = _make_batch(num_teachers=1)
 
     train_data = _run_teacher_forwards_and_pack([t0, t1], loss_fn, batch)
@@ -648,13 +650,19 @@ def test_run_teacher_forwards_packs_indexed_keys_and_runs_serially():
     assert "teacher_0_full_logits_ipc" in train_data
     assert "alignment_0_pair_valid" in train_data
     assert "teacher_0_input_ids" in train_data
-    # Same-vocab teacher 1 -> top-K tensors, no projection/alignment keys.
-    assert "teacher_1_topk_logits" in train_data
-    assert "teacher_1_topk_indices" in train_data
+    # Same-vocab teacher 1 -> top-K IPC handle list, no dense tensors, no
+    # projection/alignment keys.
+    assert "teacher_1_topk_ipc" in train_data
+    assert "teacher_1_topk_logits" not in train_data
+    assert "teacher_1_topk_indices" not in train_data
     assert "alignment_1_pair_valid" not in train_data
     assert "teacher_1_full_logits_ipc" not in train_data
-    t0.get_full_logits_ipc.assert_called_once()
-    t1.get_topk_logits.assert_called_once()
+    # Unified producer: full mode for teacher 0, top-K mode (with k) for 1.
+    t0.get_teacher_logits_ipc.assert_called_once()
+    assert t0.get_teacher_logits_ipc.call_args.kwargs["mode"] == "full"
+    t1.get_teacher_logits_ipc.assert_called_once()
+    assert t1.get_teacher_logits_ipc.call_args.kwargs["mode"] == "topk"
+    assert t1.get_teacher_logits_ipc.call_args.kwargs["k"] == 8
     # Serial collocated execution: each teacher onloaded then offloaded.
     for t in (t0, t1):
         t.prepare_for_lp_inference.assert_called_once()

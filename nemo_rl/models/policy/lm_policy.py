@@ -656,6 +656,69 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             all_handles.extend(wr["per_sample_handles"])
         return all_handles
 
+    def get_teacher_logits_ipc(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        *,
+        mode: str = "full",
+        k: Optional[int] = None,
+        micro_batch_size: Optional[int] = None,
+        timer: Optional[Timer] = None,
+    ) -> list[dict[str, Any]]:
+        """Ship teacher logits to the student via CUDA IPC (full or top-K).
+
+        Unified driver-side dispatch mirroring :meth:`get_full_logits_ipc` but
+        selecting the transport via ``mode``: ``"full"`` keeps full-vocab
+        logits; ``"topk"`` ships per-position top-``k`` logits + indices (``k``
+        required). Returns a flat ``list[B]`` of per-sample IPC handle dicts;
+        the per-entry structure depends on ``mode`` (see
+        :meth:`nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2.get_teacher_logits_ipc`).
+
+        Caller must invoke :meth:`release_ipc_buffer` after the student
+        finishes consuming the handles.
+
+        v0 limitation: no dynamic batching, no sequence packing.
+        """
+        if self.use_dynamic_batches or self.use_sequence_packing:
+            raise NotImplementedError(
+                "get_teacher_logits_ipc does not support dynamic batching "
+                "or sequence packing in v0."
+            )
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        with (
+            timer.time("get_teacher_logits_ipc/shard_data") if timer else nullcontext()
+        ):
+            sharded_data = data.shard_by_batch_size(  # type: ignore
+                dp_size,
+                batch_size=None,
+            )
+        with timer.time("get_teacher_logits_ipc/submit") if timer else nullcontext():
+            futures = self.worker_group.run_all_workers_sharded_data(
+                "get_teacher_logits_ipc",
+                data=sharded_data,
+                in_sharded_axes=["data_parallel"],
+                replicate_on_axes=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                output_is_replicated=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                common_kwargs={
+                    "mode": mode,
+                    "k": k,
+                    "micro_batch_size": micro_batch_size,
+                },
+            )
+        worker_results = self.worker_group.get_all_worker_results(futures)
+        all_handles: list[dict[str, Any]] = []
+        for wr in worker_results:
+            all_handles.extend(wr["per_sample_handles"])
+        return all_handles
+
     def release_ipc_buffer(self) -> None:
         """Tell all workers to drop their stashed IPC tensors."""
         futures = self.worker_group.run_all_workers_single_data("release_ipc_buffer")

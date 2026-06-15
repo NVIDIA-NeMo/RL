@@ -1569,9 +1569,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             )
             loss = kl_scale * total_kd + ce_loss
         else:
-            kl_scale = torch.tensor(
-                1.0, device=total_kd.device, dtype=total_kd.dtype
-            )
+            kl_scale = torch.tensor(1.0, device=total_kd.device, dtype=total_kd.dtype)
             loss = self.kl_loss_weight * total_kd + self.ce_loss_scale * ce_loss
 
         # Student next-token accuracy (quick per-step signal), masked to valid
@@ -1653,9 +1651,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         prefix = f"alignment_{i}_"
         gold, xtoken = self._resolve_gold_xtoken(i, use_per_teacher_flags)
         if xtoken and not gold:
-            raise ValueError(
-                f"teacher {i}: xtoken_loss=True requires gold_loss=True."
-            )
+            raise ValueError(f"teacher {i}: xtoken_loss=True requires gold_loss=True.")
 
         if gold:
             kd, kl_common, l1_uncommon, num_valid_chunks, top1 = self._compute_gold(
@@ -1773,7 +1769,9 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         T = self.temperature
         student_log_probs = torch.log_softmax(logits.float() / T, dim=-1)
         teacher_log_probs = torch.log_softmax(topk_logits.float() / T, dim=-1)
-        student_gathered = torch.gather(student_log_probs, -1, topk_indices)
+        # Indices arrive int32 over IPC (or int64 on the legacy path); gather
+        # requires int64.
+        student_gathered = torch.gather(student_log_probs, -1, topk_indices.long())
         student_log_probs_k = student_gathered - torch.logsumexp(
             student_gathered, dim=-1, keepdim=True
         )
@@ -1842,9 +1840,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             if self.normalize_teacher_by_vocab:
                 v_scale = (
                     torch.log(
-                        torch.tensor(
-                            float(self.teacher_vocab_sizes[i]), device=device
-                        )
+                        torch.tensor(float(self.teacher_vocab_sizes[i]), device=device)
                     )
                     / temp_weight
                 )

@@ -127,24 +127,31 @@ def prepare_loss_input(
             "H_all": H_all,
         }
     elif loss_fn.input_type == LossInputType.DISTILLATION_CROSS_TOKENIZER:
-        # Materialize the teacher-side loss input: for every teacher that ships
-        # full-vocab logits (all cross-tokenizer teachers + same-vocab teachers
-        # with send_full_logits), rebuild the microbatch's logits from the CUDA
-        # IPC handles. Same-vocab top-K teachers ship plain teacher_{i}_topk_*
-        # tensors on the data dict and need no rebuild. The student logits pass
-        # straight through; the loss fn does the projection / chunk-average /
-        # direct-KL reductions per teacher.
+        # Materialize the teacher-side loss input: every teacher's logits now
+        # arrive over CUDA IPC. Full-logits teachers (all cross-tokenizer
+        # teachers + same-vocab teachers with send_full_logits) rebuild a
+        # [mb_B, T, V_t] view passed via teacher_full_logits_by_idx. Same-vocab
+        # top-K teachers rebuild [mb_B, T, k] value/index views and place them
+        # on the data dict under the keys the loss fn reads. The student logits
+        # pass straight through; the loss fn does the projection / chunk-average
+        # / direct-KL reductions per teacher.
         from nemo_rl.algorithms.x_token.loss_utils import (
             rebuild_teacher_full_logits_from_ipc,
+            rebuild_teacher_topk_from_ipc,
         )
 
-        teacher_full_logits_by_idx = {
-            i: rebuild_teacher_full_logits_from_ipc(
-                data, key=f"teacher_{i}_full_logits_ipc"
-            )
-            for i in range(loss_fn.num_teachers)
-            if loss_fn.teacher_ships_full[i]
-        }
+        teacher_full_logits_by_idx = {}
+        for i in range(loss_fn.num_teachers):
+            if loss_fn.teacher_ships_full[i]:
+                teacher_full_logits_by_idx[i] = rebuild_teacher_full_logits_from_ipc(
+                    data, key=f"teacher_{i}_full_logits_ipc"
+                )
+            else:
+                topk_logits, topk_indices = rebuild_teacher_topk_from_ipc(
+                    data, key=f"teacher_{i}_topk_ipc"
+                )
+                data[f"teacher_{i}_topk_logits"] = topk_logits
+                data[f"teacher_{i}_topk_indices"] = topk_indices
         loss_input = {
             "logits": logits,
             "teacher_full_logits_by_idx": teacher_full_logits_by_idx,

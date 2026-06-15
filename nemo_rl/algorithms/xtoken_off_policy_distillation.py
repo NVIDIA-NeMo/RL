@@ -18,9 +18,10 @@ Training-loop layout mirrors ``run_distillation.py`` /
 rollout, no generation). Per step:
 
     1. Pull a collated batch (student & teacher token ids + alignment).
-    2. Run teacher forward via ``Policy.get_topk_logits`` on TEACHER token
-       ids — gives top-k teacher logits at teacher positions.
-    3. Pack alignment payload + teacher topk into a student-side
+    2. Run each teacher forward via ``Policy.get_teacher_logits_ipc`` —
+       cross-tokenizer teachers ship full-vocab logits, same-vocab teachers
+       ship top-k logits, both over CUDA IPC (no driver round-trip).
+    3. Pack alignment payload + teacher IPC handles into a student-side
        ``train_data`` dict.
     4. ``student_policy.train(train_data, loss_fn)`` — student forward +
        loss + backward + optimizer step happens inside the dtensor v2
@@ -60,6 +61,7 @@ from nemo_rl.utils.logger import Logger, LoggerConfig
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
+
 def xtoken_non_student_seq_keys(
     loss_fn: "CrossTokenizerDistillationLossFn",
 ) -> frozenset[str]:
@@ -76,8 +78,8 @@ def xtoken_non_student_seq_keys(
         ``teacher_{i}_token_mask`` (``[B, T_t]``), and the teacher-seq /
         max_pairs ``alignment_{i}_*`` keys.
       - same-vocab + full logits: ``teacher_{i}_full_logits_ipc`` only.
-      - same-vocab + top-K: nothing (``teacher_{i}_topk_*`` are ``[B, T_s, k]``,
-        student-seq-aligned at dim 1).
+      - same-vocab + top-K: ``teacher_{i}_topk_ipc`` (a list of CUDA IPC handle
+        dicts, not a tensor).
 
     ``alignment_{i}_student_*`` are ``[B, T_s]`` and ``alignment_{i}_num_chunks``
     is ``[B]``, so they follow the student-seq invariant and are NOT skipped.
@@ -87,6 +89,10 @@ def xtoken_non_student_seq_keys(
         same_vocab = loss_fn.projection_matrix_paths[i] is None
         if loss_fn.teacher_ships_full[i]:
             keys.add(f"teacher_{i}_full_logits_ipc")
+        else:
+            # Same-vocab top-K teacher: top-K logits/indices ride as a CUDA IPC
+            # handle list (not [B, T_s, k] tensors), so the key is non-tensor.
+            keys.add(f"teacher_{i}_topk_ipc")
         if not same_vocab:
             keys.add(f"teacher_{i}_input_ids")
             keys.add(f"teacher_{i}_token_mask")
@@ -95,6 +101,7 @@ def xtoken_non_student_seq_keys(
             keys.add(f"alignment_{i}_teacher_exact_partition_mask")
             keys.add(f"alignment_{i}_teacher_chunk_id")
     return frozenset(keys)
+
 
 # ===============================================================================
 # Configuration
@@ -163,8 +170,9 @@ class TeacherConfig(BaseModel, extra="allow"):
         xtoken_loss: Optional per-teacher override of ``loss_fn.xtoken_loss``,
             same semantics as ``gold_loss``.
         send_full_logits: Same-tokenizer teachers only. ``False`` (default)
-            ships top-K logits via ``Policy.get_topk_logits`` (memory-light);
-            ``True`` ships full-vocab logits via ``get_full_logits_ipc``.
+            ships top-K logits via ``get_teacher_logits_ipc(mode="topk")``
+            (memory-light); ``True`` ships full-vocab logits via
+            ``get_teacher_logits_ipc(mode="full")``. Both go over CUDA IPC.
             Ignored for cross-tokenizer teachers, which always ship full
             logits (the projection needs the full teacher distribution).
     """
@@ -356,9 +364,7 @@ def setup(
         teacher_tokenizers=list(teacher_tokenizers),
         aligners=aligners,
         ctx_length_student=policy_config["max_total_sequence_length"],
-        ctx_length_teachers=[
-            tc["max_total_sequence_length"] for tc in teacher_configs
-        ],
+        ctx_length_teachers=[tc["max_total_sequence_length"] for tc in teacher_configs],
         make_seq_div_by_student=policy_config["make_sequence_length_divisible_by"],
         make_seq_div_by_teachers=[
             tc["make_sequence_length_divisible_by"] for tc in teacher_configs
@@ -506,12 +512,13 @@ def _run_teacher_forwards_and_pack(
     """Serially run each teacher's forward and pack the student ``train_data``.
 
     Teachers run one at a time (collocated): each is onloaded for inference,
-    forwarded, then offloaded. Cross-tokenizer teachers and same-vocab teachers
-    with ``send_full_logits`` export full-vocab logits via CUDA IPC
-    (``teacher_{i}_full_logits_ipc``); same-vocab top-K teachers export
-    ``teacher_{i}_topk_logits`` / ``teacher_{i}_topk_indices``. Full-logits IPC
-    buffers stay resident on the teacher GPUs until released by the caller
-    after ``student.train``.
+    forwarded, then offloaded. All teachers export their logits over CUDA IPC
+    via ``Policy.get_teacher_logits_ipc``: cross-tokenizer teachers and
+    same-vocab teachers with ``send_full_logits`` ship full-vocab logits
+    (``teacher_{i}_full_logits_ipc``); same-vocab top-K teachers ship top-K
+    value/index buffers (``teacher_{i}_topk_ipc``). The persistent IPC buffers
+    stay resident on the teacher GPUs until released by the caller after
+    ``student.train``.
 
     Shared by the train loop and ``validate`` so the forward+pack sequence
     can't drift between them.
@@ -556,15 +563,16 @@ def _run_teacher_forwards_and_pack(
 
         teacher_policy.prepare_for_lp_inference()
         if loss_fn.teacher_ships_full[i]:
-            handles = teacher_policy.get_full_logits_ipc(teacher_data, timer=timer)
+            handles = teacher_policy.get_teacher_logits_ipc(
+                teacher_data, mode="full", timer=timer
+            )
             train_data[f"teacher_{i}_full_logits_ipc"] = handles
         else:
-            topk = teacher_policy.get_topk_logits(
-                teacher_data, k=loss_fn.vocab_topk, timer=timer
+            handles = teacher_policy.get_teacher_logits_ipc(
+                teacher_data, mode="topk", k=loss_fn.vocab_topk, timer=timer
             )
-            train_data[f"teacher_{i}_topk_logits"] = topk["topk_logits"]
-            train_data[f"teacher_{i}_topk_indices"] = topk["topk_indices"]
-        # Free the teacher's PARAMS to CPU; full-logits IPC buffers persist in
+            train_data[f"teacher_{i}_topk_ipc"] = handles
+        # Free the teacher's PARAMS to CPU; the persistent IPC buffers live in
         # worker state and survive this call.
         teacher_policy.offload_after_refit()
 

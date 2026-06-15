@@ -129,6 +129,58 @@ def rebuild_teacher_full_logits_from_ipc(
     return rank_view[mb_start:mb_end]  # [mb_B, T_t, V_t] view, no copy
 
 
+def rebuild_teacher_topk_from_ipc(
+    data: Mapping[str, Any], key: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """View-only rebuild of the microbatch's top-K logits + indices from IPC.
+
+    The two-buffer counterpart of :func:`rebuild_teacher_full_logits_from_ipc`:
+    the producer keeps persistent ``[B_r, T, k]`` value and index buffers and
+    refills them each step (``DTensorPolicyWorkerV2.get_teacher_logits_ipc`` with
+    ``mode="topk"``). Each per-sample entry carries the same two rank-level
+    handles plus its rank-local ``sample_idx_within_rank``; we rebuild the
+    handles once and slice ``[mb_start:mb_end]`` for the current microbatch --
+    zero allocation on the consumer.
+
+    Values are shipped in native compute dtype (bf16); indices in int32 (the
+    loss casts to int64 at the gather). Both are lossless relative to the bf16
+    teacher forward.
+
+    Args:
+        data: The loss data dict carrying the IPC handle list under ``key``.
+        key: Data-dict key holding the per-sample top-K IPC handle list (e.g.
+            ``f"teacher_{i}_topk_ipc"``).
+
+    Returns:
+        ``(topk_logits, topk_indices)`` -- ``[mb_B, T, k]`` views into the
+        producer's GPU memory (no copy).
+    """
+    from nemo_rl.models.policy.utils import rebuild_cuda_tensor_from_ipc
+
+    entries = data[key]
+    consumer_device = torch.cuda.current_device()
+
+    first = entries[0]
+    last = entries[-1]
+    vals_view = rebuild_cuda_tensor_from_ipc(
+        first["rank_topk_vals_ipc"], consumer_device
+    )  # [B_r, T, k] view into producer GPU memory
+    idx_view = rebuild_cuda_tensor_from_ipc(
+        first["rank_topk_idx_ipc"], consumer_device
+    )  # [B_r, T, k] view into producer GPU memory
+
+    mb_start = first["sample_idx_within_rank"]
+    mb_end = last["sample_idx_within_rank"] + 1
+    # Same contiguity contract as the full-logits rebuild: advanced indexing
+    # would copy and defeat the zero-copy win, so assert loudly instead.
+    assert mb_end - mb_start == len(entries), (
+        "expected contiguous monotonic sample_idx_within_rank within a "
+        f"microbatch; got entries with indices "
+        f"{[e['sample_idx_within_rank'] for e in entries]}"
+    )
+    return vals_view[mb_start:mb_end], idx_view[mb_start:mb_end]
+
+
 class Fp32SparseMM(torch.autograd.Function):
     """FP32 ``M.t() @ dense`` (sparse-dense matmul) ignoring surrounding autocast.
 
