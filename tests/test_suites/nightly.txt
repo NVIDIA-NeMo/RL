@@ -223,3 +223,6 @@ tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron.sh
 
 # Megatron PPO with value sequence parallelism (TP2+SP) and dynamic batching
 tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron-valuetp2sp-dynbatch.sh
+
+# Megatron PPO with value pipeline parallelism (TP2+PP2)
+tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron-valuetp2pp2.sh
