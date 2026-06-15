@@ -125,7 +125,7 @@ Train Qwen2.5-Omni-3B with GRPO on AVQA and evaluate on MMAU, following the R1-A
 :link: guides/grpo-audio-visual
 :link-type: doc
 
-Train Qwen2.5-Omni-3B with GRPO on PhilipC/IntentTrain (audio-visual intent recognition) and validate on PhilipC/IntentBench, following HumanOmniV2's joint audio+video setup.
+Train Qwen2.5-Omni-7B with GRPO on PhilipC/IntentTrain (audio-visual intent recognition) and evaluate on Daily-Omni, following HumanOmniV2's joint audio+video setup.
 :::
 
 :::{grid-item-card} {octicon}`plus-circle` Adding New Models

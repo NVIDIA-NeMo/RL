@@ -1,8 +1,8 @@
-# Audio+Video Intent GRPO on IntentTrain / IntentBench
+# Audio-Visual GRPO with Qwen2.5-Omni-7B
 
-This guide explains how to use NeMo RL to train [Qwen2.5-Omni-7B](https://huggingface.co/Qwen/Qwen2.5-Omni-7B) with GRPO on the [PhilipC/IntentTrain](https://huggingface.co/datasets/PhilipC/IntentTrain) audio-visual intent-recognition dataset and validate on [PhilipC/IntentBench](https://huggingface.co/datasets/PhilipC/IntentBench), following the dataset structure used in the [HumanOmniV2 reference](https://github.com/HumanMLLM/HumanOmniV2).
+This guide explains how to use NeMo RL to train [Qwen2.5-Omni-7B](https://huggingface.co/Qwen/Qwen2.5-Omni-7B) with GRPO on the [PhilipC/IntentTrain](https://huggingface.co/datasets/PhilipC/IntentTrain) audio-visual intent-recognition dataset and evaluate on [Daily-Omni](https://huggingface.co/datasets/liarliar/Daily-Omni), following the dataset structure used in [HumanOmniV2](https://arxiv.org/abs/2506.21277).
 
-Each training sample feeds the Qwen2.5-Omni processor both the video stream (8 frames) and the audio track decoded from the same file at 16 kHz mono. Audio and video flow as two **independent multimodal items** per prompt: the dataset emits `{type: video}` + `{type: audio}` content items, the Qwen2.5-Omni chat template renders both `<|VIDEO|>` and `<|AUDIO|>` placeholders, and vLLM rollouts populate `multi_modal_data["video"]` and `multi_modal_data["audio"]` from the same sample. The explicit time-alignment hint `use_audio_in_video=True` is **not** used because the installed transformers + vLLM Qwen2.5-Omni stack rejected that path; both modalities still reach the model, just without that alignment hint.
+Each training sample feeds the Qwen2.5-Omni processor both the video stream (8 frames) and the audio track decoded from the same file at 16 kHz mono. Audio and video flow as two **independent multimodal items** per prompt: the dataset emits `{type: video}` + `{type: audio}` content items, the Qwen2.5-Omni chat template renders both `<|VIDEO|>` and `<|AUDIO|>` placeholders, and vLLM rollouts populate `multi_modal_data["video"]` and `multi_modal_data["audio"]` from the same sample.
 
 ## 1. Train the Model
 
@@ -38,7 +38,6 @@ Only `problem_type == "multiple choice"` samples are used. The allow-list is con
 
 ### 7B training notes
 
-- **Per-forward batch must be exactly 1 sample/rank** (`train_micro_batch_size=1`, `logprob_batch_size=1`). Otherwise the Qwen2.5-Omni `get_rope_index` path crashes with `IndexError: index 1 is out of bounds for dimension 0 with size 1`. `train_global_batch_size=32` only sets gradient accumulation and must stay divisible by `micro × data_parallel_size` (32 % (1 × 4) == 0).
 - **8 video frames** keep the prompt around ~4.5k tokens (8×360 video + ~1.5k audio + text), under `max_total_sequence_length=8192`, and roughly halve the training-forward activation memory versus 16 frames. Do **not** switch to fps-based sampling — at fps=2 the clips expand to ~43k video tokens, blow past the token budget, and `vlm_hf_data_processor` then empties the multimodal items and sets `loss_multiplier=0`.
 - **`activation_checkpointing: true` + `gpu_memory_utilization: 0.4`** keep the Megatron forward inside the memory vLLM leaves resident after sleep mode. If `tensor_model_parallel_size=2` OOMs, fall back to `tensor_model_parallel_size=4` (proven to run at 8 frames).
 - If `loss_multiplier` is logged at 0 for many samples, the multimodal prompt is exceeding `max_total_sequence_length`; bump it until validation samples consistently produce non-zero loss.
@@ -84,4 +83,4 @@ Daily-Omni accuracy (1197 questions, greedy decoding) for the base Qwen2.5-Omni-
 | Inference | 0.714 | 0.760 |
 | Reasoning | 0.651 | 0.766 |
 
-GRPO lifts overall Daily-Omni accuracy by ~9 points, with gains across every question category. The largest relative gains are on the reasoning-style questions; AV Event Alignment (which most depends on precise audio↔video synchronization) improves but remains the weakest category, consistent with the recipe not using the `use_audio_in_video` time-alignment path.
+GRPO lifts overall Daily-Omni accuracy by ~9 points, with gains across every question category. The largest relative gains are on the reasoning-style questions.
