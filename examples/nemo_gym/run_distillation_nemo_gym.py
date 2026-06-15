@@ -21,7 +21,6 @@ import wandb.util
 
 wandb.util.VALUE_BYTES_LIMIT = 10_000_000
 
-import ray
 from omegaconf import OmegaConf
 
 from nemo_rl.algorithms.distillation import (
@@ -34,10 +33,8 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.nemo_gym import (
-    NemoGymConfig,
     setup_nemo_gym_config,
 )
-from nemo_rl.environments.utils import create_env
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import (
     load_config,
@@ -147,6 +144,7 @@ The validation set you pass in will directly be used for validation with no addi
         student_policy,
         teacher_policy,
         student_generation,
+        nemo_gym,
         dataloader,
         val_dataloader,
         loss_fn,
@@ -158,21 +156,8 @@ The validation set you pass in will directly be used for validation with no addi
 
     if student_generation is None:
         raise ValueError("NeMo-Gym distillation requires a vLLM generation backend")
-
-    invalid_tool_call_patterns = config.env["nemo_gym"].pop(
-        "invalid_tool_call_patterns", None
-    )
-    thinking_tags = config.env["nemo_gym"].pop("thinking_tags", None)
-    nemo_gym_config = NemoGymConfig(
-        model_name=student_generation.cfg["model_name"],
-        base_urls=student_generation.dp_openai_server_base_urls,
-        invalid_tool_call_patterns=invalid_tool_call_patterns,
-        thinking_tags=thinking_tags,
-        initial_global_config_dict=config.env["nemo_gym"],
-    )
-    nemo_gym = create_env(env_name="nemo_gym", env_config=nemo_gym_config)
-    # Blocking wait for NeMo-Gym to spin up
-    ray.get(nemo_gym._spinup.remote())
+    if nemo_gym is None:
+        raise ValueError("NeMo-Gym distillation setup did not initialize Nemo-Gym")
 
     # Bind task_to_env and val_task_to_env for nemo_gym env
     # Hardcode here to match `run_async_nemo_gym_rollout`
