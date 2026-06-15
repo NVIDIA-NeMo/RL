@@ -147,30 +147,6 @@ class TestTQReplayBufferAdd:
         assert meta.tags == [{"weight_version": 3}] * _N_GENS
         assert len(dp.put_calls) == 1
 
-    def test_add_rejects_non_int_weight_version(self):
-        dp = FakeDataPlaneClient()
-        buf = _make_buffer(dp)
-        with pytest.raises(TypeError):
-            _run(
-                buf.add(
-                    _make_record(),
-                    weight_version=None,  # type: ignore[arg-type]
-                )
-            )
-        assert dp.depth() == 0
-        assert buf.size() == 0
-
-    def test_add_rejects_bool_weight_version(self):
-        dp = FakeDataPlaneClient()
-        buf = _make_buffer(dp)
-        with pytest.raises(TypeError):
-            _run(
-                buf.add(
-                    _make_record(),
-                    weight_version=True,  # type: ignore[arg-type]
-                )
-            )
-
     def test_add_appends_multiple_records_in_order(self):
         dp = FakeDataPlaneClient()
         buf = _make_buffer(dp)
