@@ -1080,6 +1080,53 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             traceback.print_exc()
             return False
 
+    def init_per_pp_refit_comm_group(
+        self,
+        rank_prefix: int,
+        pp_ips: list[str],
+        pp_ports: list[int],
+        pp_size: int,
+        train_ranks_per_stage: int,
+        sub_world_size: int,
+    ) -> None:
+        """Forward per-PP-stage comm group init to vLLM backend workers."""
+        self.llm.collective_rpc(
+            "init_per_pp_refit_comm_group",
+            args=(
+                rank_prefix,
+                pp_ips,
+                pp_ports,
+                pp_size,
+                train_ranks_per_stage,
+                sub_world_size,
+            ),
+        )
+
+    def prepare_nccl_xfer_refit_info(self, refit_info: dict) -> None:
+        """Forward refit info to vLLM backend workers."""
+        self.llm.collective_rpc("prepare_nccl_xfer_refit_info", args=(refit_info,))
+
+    def nccl_xfer_refit(self) -> bool:
+        """Receive weights from training workers via nccl_xfer (xferdtensor)."""
+        try:
+            assert self.llm is not None, (
+                "Attempting to update weights with either an uninitialized vLLM or non-model-owner"
+            )
+
+            result_or_coro = self.llm.collective_rpc("nccl_xfer_refit", args=tuple())
+            worker_result = result_or_coro[0]
+
+            if not worker_result:
+                print(f"Error: Worker failed nccl_xfer_refit. Result: {worker_result}")
+                return False
+            return True
+        except Exception as e:
+            print(f"Exception during nccl_xfer_refit: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return False
+
     def reset_prefix_cache(self):
         """Reset the prefix cache of vLLM engine."""
         assert self.llm is not None, (
