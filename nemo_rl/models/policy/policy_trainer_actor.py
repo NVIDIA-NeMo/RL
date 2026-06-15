@@ -22,7 +22,8 @@ its own actor process (CPU-only — the GPUs live on the worker_group actors
 that ``TQPolicy`` fans out to). It exposes only the SC-facing surface:
 
   - ``train_from_meta(meta)``                — full-step training (sync proxy).
-  - ``prepare_logprobs_from_meta(meta)``     — prev_lp + ref_lp via TQ.
+  - ``prepare_logprobs_from_meta(meta, *, refresh_policy_logprobs=False,
+    refresh_reference_logprobs=False)`` — refresh prev_lp / ref_lp into TQ.
   - ``begin_train_step``                     — open a split-API step.
   - ``train_microbatch_from_meta``           — one microbatch worth of fwd+bwd.
   - ``finish_train_step``                    — close the step, opt.step.
@@ -87,14 +88,30 @@ class PolicyTrainerActor:
 
     # ── logprob preparation ────────────────────────────────────────────────
 
-    def prepare_logprobs_from_meta(self, meta: KVBatchMeta) -> None:
-        """Compute prev_lp + ref_lp and commit them to TQ under ``meta.sample_ids``.
+    def prepare_logprobs_from_meta(
+        self,
+        meta: KVBatchMeta,
+        *,
+        refresh_policy_logprobs: bool = False,
+        refresh_reference_logprobs: bool = False,
+    ) -> None:
+        """Refresh policy and/or reference logprobs and commit them to TQ.
 
+        SC decides which fields to refresh based on its own config
+        (``advantage_policy_logprobs_field`` / ``advantage_reference_logprobs_field``).
         Workers write the per-token tensors back through TQ directly (no Ray
-        return payload); this just dispatches and waits.
+        return payload); this just dispatches and waits. No-op if both flags
+        are False.
+
+        NOTE: inlined here rather than delegating to
+        ``TQPolicy.prepare_logprobs_from_meta`` so this PR is self-contained.
+        Once the TQPolicy helper from #2700 lands together with this PR, this
+        can collapse to a one-line delegate.
         """
-        self._policy.get_logprobs_from_meta(meta)
-        self._policy.get_reference_policy_logprobs_from_meta(meta)
+        if refresh_policy_logprobs:
+            self._policy.get_logprobs_from_meta(meta)
+        if refresh_reference_logprobs:
+            self._policy.get_reference_policy_logprobs_from_meta(meta)
 
     # ── current full-step training ─────────────────────────────────────────
 
