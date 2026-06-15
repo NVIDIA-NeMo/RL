@@ -374,6 +374,15 @@ Reference example for training to play a Sliding Puzzle Game:
 uv run python examples/run_grpo_sliding_puzzle.py
 ```
 
+## Distillation
+
+NeMo RL supports two distillation recipes:
+
+| Recipe | Multi-teacher | Asynchronous | Policy | Loss | Tokenizer | Backend |
+|---|---|---|---|---|---|---|
+| MOPD | Yes | Yes | On-policy | Top-1 sampled (RL-style) | Same | Megatron |
+| xToken | Yes | No (sync) | Off-policy | Full-logit (KL) | Same or different | DTensor V2 |
+
 ## On-policy Distillation
 
 We provide an example on-policy distillation experiment using the [DeepScaler dataset](https://huggingface.co/agentica-org/DeepScaleR-1.5B-Preview).
