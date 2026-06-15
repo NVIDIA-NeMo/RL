@@ -173,7 +173,9 @@ def setup(
         # Filter to only known DPOSaveState fields; checkpoints may carry
         # extra keys (e.g. validation metrics from previous runs).
         known_fields = {f.name for f in fields(DPOSaveState)}
-        dpo_save_state = DPOSaveState(**{k: v for k, v in loaded_state.items() if k in known_fields})
+        dpo_save_state = DPOSaveState(
+            **{k: v for k, v in loaded_state.items() if k in known_fields}
+        )
     elif loaded_state is not None:
         dpo_save_state = loaded_state
     else:
@@ -655,7 +657,9 @@ def dpo_train(
                             and any(
                                 [
                                     key.endswith(f"_{metric_name}")
-                                    for metric_name in [f.name for f in fields(DPOValMetrics)]
+                                    for metric_name in [
+                                        f.name for f in fields(DPOValMetrics)
+                                    ]
                                     if metric_name != "num_valid_samples"
                                 ]
                             )
