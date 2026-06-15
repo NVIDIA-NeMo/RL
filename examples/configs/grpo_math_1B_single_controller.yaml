@@ -343,7 +343,12 @@ async_rl:
   target_prompt_groups_per_step: null   # falls back to min_prompt_groups_per_batch
   batch_selection_strategy: "strict_on_policy"  # or "staleness_window"
   max_inflight_prompts: 8
+  # When over_sampling=false this must equal
+  # target_prompt_groups_per_step * (max_weight_staleness_versions + 1).
   max_buffered_rollouts: 8
+  # True : over-generates and wastes rollouts that age past the staleness window;
+  # False: enforces per-weight-version dispatch quota.
+  over_sampling: true
 
 cluster:
   gpus_per_node: 2

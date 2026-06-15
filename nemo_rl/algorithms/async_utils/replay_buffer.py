@@ -558,10 +558,10 @@ class ReplayBuffer(ReplayBufferImpl):
 
 
 class TQReplayBuffer:
-    """Meta cache + TQ writer for prompt-group records.
+    """Meta cache + TQ writer with reserve-then-commit slot semantics.
 
-    add tensorizes one record and writes its N rows to TQ as a single group;
-    meta_list / weight_list keep one entry per group for sampler reads.
+    meta_list, weight_list, ready_list, _group_ids are parallel; a slot stays
+    ready=False until commit fills it.
     """
 
     def __init__(
@@ -574,32 +574,56 @@ class TQReplayBuffer:
         self._dp_client = dp_client
         self._partition_id = partition_id
         self._pad_value_dict = dict(pad_value_dict)
-        self.meta_list: list[KVBatchMeta] = []
-        self.weight_list: list[int] = []
+        self.meta_list: list[Optional[KVBatchMeta]] = []
+        self.start_weight_list: list[int] = []
+        self.end_weight_list: list[int] = []
+        self.ready_list: list[bool] = []
+        self._group_ids: list[str] = []
 
-    async def add(
-        self,
-        record: PromptGroupRecord,
-        *,
-        weight_version: int,
-        group_id: Optional[str] = None,
-    ) -> KVBatchMeta:
-        """Tensorize record and write its N rows to TQ as one group.
+    def reserve(self, *, weight_version: int, group_id: Optional[str] = None) -> str:
+        """Append an unready slot tagged with weight_version.
 
         Args:
-            record: PromptGroupRecord with N completions to tensorize.
-            weight_version: Trainer weight version stamped on every row's tag; must be int.
+            weight_version: Weight version stamped on the slot.
             group_id: Per-group sample_id prefix; defaults to a fresh uuid4.
 
         Returns:
-            KVBatchMeta for the newly written group.
+            group_id used by the matching commit.
         """
         if group_id is None:
             group_id = str(uuid.uuid4())
+        self.meta_list.append(None)
+        self.start_weight_list.append(weight_version)
+        self.end_weight_list.append(-1)
+        self.ready_list.append(False)
+        self._group_ids.append(group_id)
+        return group_id
 
+    async def commit(
+        self,
+        group_id: str,
+        record: PromptGroupRecord,
+        start_weight_version: int,
+        end_weight_version: int,
+    ) -> KVBatchMeta:
+        """Tensorize record, write N rows to TQ, and mark the slot ready.
+
+        Args:
+            group_id: group_id returned by the matching reserve call.
+            record: PromptGroupRecord to tensorize.
+            start_weight_version: Weight version stamped on the slot before rollout.
+                The same as the one from reserve, passed again to avoid race condition when lookup.
+            end_weight_version: Weight version stamped on the slot after rollout.
+
+        Returns:
+            KVBatchMeta for the committed group.
+
+        Raises:
+            ValueError: group_id has no live slot (removed or never reserved).
+        """
         train_batch = record_to_train_batch(record, pad_value_dict=self._pad_value_dict)
         sample_ids, fields, tags = pack_payload(
-            train_batch, weight_version=weight_version, group_id=group_id
+            train_batch, weight_version=start_weight_version, group_id=group_id
         )
         await self._call_dp(
             "put_samples",
@@ -620,8 +644,10 @@ class TQReplayBuffer:
             tags=[dict(t) for t in tags],
         )
 
-        self.meta_list.append(meta)
-        self.weight_list.append(weight_version)
+        idx = self._group_ids.index(group_id)
+        self.meta_list[idx] = meta
+        self.end_weight_list[idx] = end_weight_version
+        self.ready_list[idx] = True
         return meta
 
     async def remove(self, idxs: list[int], remove_in_dp: bool) -> int:
@@ -646,9 +672,14 @@ class TQReplayBuffer:
 
         dropped_sample_ids: list[str] = []
         for i in drop_idxs:
-            dropped_sample_ids.extend(self.meta_list[i].sample_ids)
+            meta = self.meta_list[i]
+            if meta is not None:
+                dropped_sample_ids.extend(meta.sample_ids)
             del self.meta_list[i]
-            del self.weight_list[i]
+            del self.start_weight_list[i]
+            del self.end_weight_list[i]
+            del self.ready_list[i]
+            del self._group_ids[i]
 
         if remove_in_dp:
             await self._call_dp(

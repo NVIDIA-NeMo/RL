@@ -29,11 +29,20 @@ class FakeBuffer:
 
     def __init__(self, partition_id: str = "rollout_data") -> None:
         self._partition_id = partition_id
-        self.meta_list: list[KVBatchMeta] = []
-        self.weight_list: list[int] = []
+        self.meta_list: list[KVBatchMeta | None] = []
+        self.start_weight_list: list[int] = []
+        self.end_weight_list: list[int] = []
+        self.ready_list: list[bool] = []
         self.remove_calls: list[tuple[list[int], bool]] = []
 
-    def add(self, group_id: str, weight: int, group_size: int = 1) -> KVBatchMeta:
+    def add(
+        self,
+        group_id: str,
+        weight: int,
+        group_size: int = 1,
+        ready: bool = True,
+        end_weight: int | None = None,
+    ) -> KVBatchMeta:
         sample_ids = [f"{group_id}_g{i}" for i in range(group_size)]
         meta = KVBatchMeta(
             partition_id=self._partition_id,
@@ -41,15 +50,19 @@ class FakeBuffer:
             sample_ids=sample_ids,
             tags=[{"weight_version": weight, "group_id": group_id}] * group_size,
         )
-        self.meta_list.append(meta)
-        self.weight_list.append(weight)
+        self.meta_list.append(meta if ready else None)
+        self.start_weight_list.append(weight)
+        self.end_weight_list.append(weight if end_weight is None else end_weight)
+        self.ready_list.append(ready)
         return meta
 
     async def remove(self, idxs: list[int], remove_in_dp: bool) -> int:
         self.remove_calls.append((list(idxs), remove_in_dp))
         for i in sorted(idxs, reverse=True):
             del self.meta_list[i]
-            del self.weight_list[i]
+            del self.start_weight_list[i]
+            del self.end_weight_list[i]
+            del self.ready_list[i]
         return len(idxs)
 
 
@@ -186,7 +199,7 @@ class TestStalenessSamplerSelect:
         assert first_meta is not None
         assert first_meta.sample_ids == ["g0_g0"]
         assert first_num_groups == 1
-        assert buf.weight_list == [5, 5]
+        assert buf.start_weight_list == [5, 5]
         # remove_in_dp=False; DP rows kept for trainer.
         assert buf.remove_calls[-1][1] is False
 
@@ -215,7 +228,7 @@ class TestStalenessSamplerEvict:
         dropped = _run(sampler.evict(current_train_weight=5))
 
         assert dropped == 3
-        assert buf.weight_list == [4, 5]
+        assert buf.start_weight_list == [4, 5]
         # Survivors' sample_ids
         assert [m.sample_ids[0] for m in buf.meta_list] == ["g2_g0", "g3_g0"]
 
@@ -234,7 +247,7 @@ class TestStalenessSamplerEvict:
         sampler = StalenessSampler(buf, max_staleness_versions=0)
 
         assert _run(sampler.evict(current_train_weight=5)) == 0
-        assert buf.weight_list == [7]
+        assert buf.start_weight_list == [7]
 
     def test_evict_drops_whole_group(self):
         buf = FakeBuffer()
@@ -246,7 +259,7 @@ class TestStalenessSamplerEvict:
 
         assert dropped == 1
         assert buf.remove_calls == [([0], True)]
-        assert buf.weight_list == [5]
+        assert buf.start_weight_list == [5]
         assert [m.sample_ids[0] for m in buf.meta_list] == ["fresh_g0"]
 
 
@@ -255,3 +268,100 @@ class TestStalenessSamplerInit:
         buf = FakeBuffer()
         with pytest.raises(ValueError):
             StalenessSampler(buf, max_staleness_versions=-1)
+
+    def test_rejects_require_order_with_freshest_first(self):
+        buf = FakeBuffer()
+        with pytest.raises(ValueError):
+            StalenessSampler(
+                buf,
+                max_staleness_versions=0,
+                sample_freshest_first=True,
+                require_order=True,
+            )
+
+
+class TestStalenessSamplerReady:
+    def test_default_mode_skips_unready_slots(self):
+        buf = FakeBuffer()
+        buf.add("g0", weight=5, ready=False)
+        buf.add("g1", weight=5, ready=True)
+        sampler = StalenessSampler(buf, max_staleness_versions=0)
+
+        selected, num_groups = _run(
+            sampler.select(current_train_weight=5, min_prompt_groups=1)
+        )
+
+        assert selected is not None
+        assert selected.sample_ids == ["g1_g0"]
+        assert num_groups == 1
+
+    def test_default_mode_waits_when_too_few_ready(self):
+        buf = FakeBuffer()
+        buf.add("g0", weight=5, ready=False)
+        buf.add("g1", weight=5, ready=True)
+        sampler = StalenessSampler(buf, max_staleness_versions=0)
+
+        result = _run(sampler.select(current_train_weight=5, min_prompt_groups=2))
+        assert result == (None, 0)
+
+
+class TestStalenessSamplerRequireOrder:
+    def test_consumes_oldest_batch_first(self):
+        buf = FakeBuffer()
+        # Two complete batches: v=4 then v=5; require_order must take v=4 first.
+        for i, w in enumerate((4, 4, 5, 5)):
+            buf.add(f"v{w}_{i}", weight=w)
+        sampler = StalenessSampler(buf, max_staleness_versions=1, require_order=True)
+
+        selected, num_groups = _run(
+            sampler.select(current_train_weight=5, min_prompt_groups=2)
+        )
+
+        assert selected is not None
+        # Insertion-order FIFO inside the oldest batch.
+        assert selected.sample_ids == ["v4_0_g0", "v4_1_g0"]
+        assert num_groups == 2
+        assert buf.start_weight_list == [5, 5]
+
+    def test_waits_when_oldest_batch_partially_ready(self):
+        buf = FakeBuffer()
+        # Oldest batch v=4 has 1 ready + 1 unready; v=5 batch is fully ready.
+        # require_order must NOT skip ahead to v=5.
+        buf.add("v4_a", weight=4, ready=True)
+        buf.add("v4_b", weight=4, ready=False)
+        buf.add("v5_a", weight=5, ready=True)
+        buf.add("v5_b", weight=5, ready=True)
+        sampler = StalenessSampler(buf, max_staleness_versions=1, require_order=True)
+
+        result = _run(sampler.select(current_train_weight=5, min_prompt_groups=2))
+        assert result == (None, 0)
+        # Buffer untouched: nothing removed.
+        assert buf.start_weight_list == [4, 4, 5, 5]
+        assert buf.ready_list == [True, False, True, True]
+
+    def test_returns_none_when_oldest_batch_not_filled(self):
+        buf = FakeBuffer()
+        buf.add("v4_a", weight=4, ready=True)
+        # Only 1 ready in oldest batch; need 2.
+        sampler = StalenessSampler(buf, max_staleness_versions=1, require_order=True)
+
+        result = _run(sampler.select(current_train_weight=5, min_prompt_groups=2))
+        assert result == (None, 0)
+
+    def test_ignores_future_versions_when_picking_target(self):
+        buf = FakeBuffer()
+        # Trainer at 5, staleness 1: window is [4, 5]; v=7 (future) must not
+        # become the oldest target.
+        buf.add("v7", weight=7, ready=True)
+        buf.add("v5_a", weight=5, ready=True)
+        buf.add("v5_b", weight=5, ready=True)
+        sampler = StalenessSampler(buf, max_staleness_versions=1, require_order=True)
+
+        selected, num_groups = _run(
+            sampler.select(current_train_weight=5, min_prompt_groups=2)
+        )
+
+        assert selected is not None
+        assert selected.sample_ids == ["v5_a_g0", "v5_b_g0"]
+        assert num_groups == 2
+        assert buf.start_weight_list == [7]

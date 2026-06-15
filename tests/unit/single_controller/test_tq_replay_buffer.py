@@ -124,37 +124,118 @@ def _make_buffer(dp: FakeDataPlaneClient) -> TQReplayBuffer:
     )
 
 
-def _add_group(buf: TQReplayBuffer, weight: int) -> KVBatchMeta:
-    return _run(buf.add(_make_record(), weight_version=weight))
+def _add_group(
+    buf: TQReplayBuffer, weight: int, end_weight: int | None = None
+) -> KVBatchMeta:
+    if end_weight is None:
+        end_weight = weight
+    group_id = buf.reserve(weight_version=weight)
+    return _run(
+        buf.commit(
+            group_id,
+            _make_record(),
+            start_weight_version=weight,
+            end_weight_version=end_weight,
+        )
+    )
 
 
-class TestTQReplayBufferAdd:
-    def test_add_writes_tq_then_appends_meta(self):
+class TestTQReplayBufferReserveCommit:
+    def test_reserve_appends_placeholder_unready(self):
         dp = FakeDataPlaneClient()
         buf = _make_buffer(dp)
 
-        meta = _run(buf.add(_make_record(), weight_version=3))
+        group_id = buf.reserve(weight_version=3)
+
+        assert isinstance(group_id, str) and group_id
+        assert buf.size() == 1
+        assert buf.start_weight_list == [3]
+        assert buf.end_weight_list == [-1]
+        assert buf.ready_list == [False]
+        assert buf.meta_list == [None]
+        assert dp.depth() == 0
+        assert dp.put_calls == []
+
+    def test_commit_writes_tq_then_fills_meta(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+
+        group_id = buf.reserve(weight_version=3)
+        meta = _run(
+            buf.commit(
+                group_id,
+                _make_record(),
+                start_weight_version=3,
+                end_weight_version=4,
+            )
+        )
 
         # pack_payload stamps sample_ids as ``{group_uuid}_g{i}``.
         assert len(meta.sample_ids) == _N_GENS
-        group_uuid, _, idx = meta.sample_ids[0].rpartition("_g")
-        assert group_uuid and idx == "0"
-        assert all(sid.startswith(group_uuid + "_g") for sid in meta.sample_ids)
+        head, _, idx = meta.sample_ids[0].rpartition("_g")
+        assert head == group_id and idx == "0"
+        assert all(sid.startswith(group_id + "_g") for sid in meta.sample_ids)
         assert dp.depth() == _N_GENS
         assert buf.size() == 1
-        assert buf.weight_list == [3]
+        assert buf.start_weight_list == [3]
+        assert buf.end_weight_list == [4]
+        assert buf.ready_list == [True]
         assert buf.meta_list[0].sample_ids == meta.sample_ids
+        # TQ tag uses start_weight_version (dispatch time).
         assert meta.tags == [{"weight_version": 3}] * _N_GENS
         assert len(dp.put_calls) == 1
 
-    def test_add_appends_multiple_records_in_order(self):
+    def test_commit_raises_for_unknown_group_id(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        buf.reserve(weight_version=3)
+
+        with pytest.raises(ValueError):
+            _run(
+                buf.commit(
+                    "not-a-real-id",
+                    _make_record(),
+                    start_weight_version=3,
+                    end_weight_version=3,
+                )
+            )
+
+    def test_reserve_then_commit_preserves_dispatch_order(self):
+        """Reserve in dispatch order, commit out of order; insertion order holds."""
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+
+        weights = (1, 2, 3)
+        gids = [buf.reserve(weight_version=w) for w in weights]
+        # Commit out of order: 2, 0, 1 — buffer order must still match reserve order.
+        for i in (2, 0, 1):
+            _run(
+                buf.commit(
+                    gids[i],
+                    _make_record(),
+                    start_weight_version=weights[i],
+                    end_weight_version=weights[i],
+                )
+            )
+
+        assert buf.size() == 3
+        assert buf.start_weight_list == [1, 2, 3]
+        assert buf.end_weight_list == [1, 2, 3]
+        assert buf.ready_list == [True, True, True]
+        # sample_id head equals reserved group_id at each slot.
+        for i, gid in enumerate(gids):
+            assert buf.meta_list[i] is not None
+            assert buf.meta_list[i].sample_ids[0].startswith(gid + "_g")
+
+    def test_commit_appends_multiple_records_in_order(self):
         dp = FakeDataPlaneClient()
         buf = _make_buffer(dp)
 
         metas = [_add_group(buf, weight=w) for w in (1, 2, 3)]
 
         assert buf.size() == 3
-        assert buf.weight_list == [1, 2, 3]
+        assert buf.start_weight_list == [1, 2, 3]
+        assert buf.end_weight_list == [1, 2, 3]
         assert [m.sample_ids for m in buf.meta_list] == [
             list(metas[0].sample_ids),
             list(metas[1].sample_ids),
@@ -172,7 +253,8 @@ class TestTQReplayBufferRemove:
 
         assert n == 2
         assert buf.size() == 1
-        assert buf.weight_list == [1]
+        assert buf.start_weight_list == [1]
+        assert buf.end_weight_list == [1]
         assert buf.meta_list[0].sample_ids == list(metas[1].sample_ids)
         assert dp.depth() == _N_GENS
         assert set(dp._rows) == set(metas[1].sample_ids)
@@ -186,7 +268,8 @@ class TestTQReplayBufferRemove:
 
         assert n == 1
         assert buf.size() == 1
-        assert buf.weight_list == [1]
+        assert buf.start_weight_list == [1]
+        assert buf.end_weight_list == [1]
         assert buf.meta_list[0].sample_ids == list(metas[1].sample_ids)
         assert dp.clear_calls == []
         assert dp.depth() == 2 * _N_GENS

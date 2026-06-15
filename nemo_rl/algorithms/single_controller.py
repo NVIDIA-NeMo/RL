@@ -20,8 +20,9 @@ metadata only — model tensors still move through DataPlane or NCCL.
 
 Data flow:
   _rollout_pump  → rollout_manager.generate_and_push(prompt)
-                     → TQReplayBuffer.add tensorizes the record and writes
-                       N training rows to TQ as one prompt-group.
+                     → TQReplayBuffer.reserve claims a slot at dispatch time;
+                       run_rollout runs; TQReplayBuffer.commit tensorizes the
+                       record, writes N training rows to TQ, and marks ready.
   _train_pump    → sampler.evict → buffer.remove (stale groups, with DP clear).
                  → sampler.select → drops chosen groups from buffer, returns
                    KVBatchMeta of K groups (or None); meta is already trainable.
@@ -57,7 +58,8 @@ class SingleControllerActor:
     """CPU-only Ray actor that orchestrates the RL training loop.
 
     Owns three concurrent asyncio tasks:
-      - _rollout_pump: dispatches prompts via RolloutManager → TQReplayBuffer.add
+      - _rollout_pump: dispatches prompts via RolloutManager; reserve+commit in
+        TQReplayBuffer preserves dispatch order
       - _train_pump:   evicts stale groups, samples a batch, trains, drops it
       - _sync_weights: drain gate + weight synchronization
 
@@ -120,9 +122,22 @@ class SingleControllerActor:
                 flush=True,
             )
 
+        if not self._async_cfg.over_sampling:
+            expected_buffer = self._async_cfg.target_prompt_groups_per_step * (
+                self._async_cfg.max_weight_staleness_versions + 1
+            )
+            if self._async_cfg.max_buffered_rollouts != expected_buffer:
+                raise ValueError(
+                    f"over_sampling=False requires max_buffered_rollouts "
+                    f"({self._async_cfg.max_buffered_rollouts}) == "
+                    f"target_prompt_groups_per_step * (max_weight_staleness_versions + 1) "
+                    f"({expected_buffer})"
+                )
+
         self._sampler = StalenessSampler(
             self._buffer,
             max_staleness_versions=self._async_cfg.max_weight_staleness_versions,
+            require_order=not self._async_cfg.over_sampling,
         )
 
         # ── asyncio state ──────────────────────────────────────────────────
@@ -132,6 +147,10 @@ class SingleControllerActor:
 
         # Count of in-flight generate_and_push calls
         self._inflight_rollouts: int = 0
+
+        # over_sampling=False batch gate: farthest trainer_version covered by
+        # already-dispatched batches.
+        self._max_rollout_version: int = -1
 
         # Backpressure valve: max unconsumed rollout groups allowed in DataPlane.
         # Acquired before each rollout dispatch; released when the buffer
@@ -149,6 +168,7 @@ class SingleControllerActor:
             f"staleness_cap={self._async_cfg.max_weight_staleness_versions} "
             f"buffer={self._async_cfg.max_buffered_rollouts} "
             f"inflight={self._async_cfg.max_inflight_prompts} "
+            f"over_sampling={self._async_cfg.over_sampling} "
             f"transport={self._weight_sync_cfg.transport}",
             flush=True,
         )
@@ -202,21 +222,25 @@ class SingleControllerActor:
 
     # ── the three pumps + advantage helper ────────────────────────────────
 
-    # TODO @yukih: rollout_pump only gates on buffer_capacity, not on the current step's group quota.
-    # e.g. max_staleness_versions=0, gbs=16, groups generated past the step's 16 become stale at the next weight sync and get evicted — wasted GPU.
     async def _rollout_pump(self) -> None:
         """Continuously dispatch rollout tasks until cancellation.
 
-        Flow per prompt:
+        Per batch (over_sampling=False):
+          0. Wait while _max_rollout_version >= trainer_version + max_staleness,
+             then claim the next step by incrementing _max_rollout_version.
+
+        Per prompt:
           1. Acquire _buffer_capacity slot (backpressure)
           2. Acquire sem (cap concurrent in-flight rollouts)
           3. Wait for _rollout_permitted (paused during weight sync)
           4. Call rollout_manager.generate_and_push(prompt) — local async
-             RolloutManager runs the rollout and writes the group via
-             TQReplayBuffer.add (→ dp_client.put_samples + meta append)
+             RolloutManager reserves a slot, runs the rollout, then commits the
+             group via TQReplayBuffer (→ dp_client.put_samples + mark ready)
           5. Decrement _inflight_rollouts
         """
         sem = asyncio.Semaphore(self._async_cfg.max_inflight_prompts)
+        over_sampling = self._async_cfg.over_sampling
+        max_staleness = self._async_cfg.max_weight_staleness_versions
         print("rollout_pump: starting", flush=True)
 
         async def _dispatch_one_prompt(prompt: DatumSpec) -> None:
@@ -239,6 +263,15 @@ class SingleControllerActor:
         epoch = 0
         while max_epochs is None or epoch < max_epochs:
             for prompt_batch in self._dataloader:
+                # over_sampling=False: batch-level gate on max_rollout_version.
+                if not over_sampling:
+                    while (
+                        self._max_rollout_version
+                        >= self._trainer_version + max_staleness
+                    ):
+                        await asyncio.sleep(0.005)
+                    self._max_rollout_version += 1
+
                 for prompt_idx in range(prompt_batch.size):
                     prompt: DatumSpec = {  # type: ignore
                         k: v[prompt_idx] for k, v in prompt_batch.items()
@@ -375,19 +408,20 @@ class SingleControllerActor:
         """
         self._rollout_permitted.clear()
 
-        # Drain: wait for all in-flight rollouts to complete before NCCL
-        # Critical: if GenWorker has queued calls when NCCL init is dispatched,
-        # the init sits behind them — trainer blocks in rendezvous → deadlock
-        drain_start = time.monotonic()
-        while self._inflight_rollouts > 0:
-            await asyncio.sleep(0.005)
+        # TODO: currently sync_weights is not implemented, comment out for now
+        # # Drain: wait for all in-flight rollouts to complete before NCCL
+        # # Critical: if GenWorker has queued calls when NCCL init is dispatched,
+        # # the init sits behind them — trainer blocks in rendezvous → deadlock
+        # drain_start = time.monotonic()
+        # while self._inflight_rollouts > 0:
+        #     await asyncio.sleep(0.005)
 
-        drain_elapsed = time.monotonic() - drain_start
-        print(
-            f"  _sync_weights: drained in {drain_elapsed:.3f}s, "
-            f"syncing weights v{self._trainer_version}",
-            flush=True,
-        )
+        # drain_elapsed = time.monotonic() - drain_start
+        # print(
+        #     f"  _sync_weights: drained in {drain_elapsed:.3f}s, "
+        #     f"syncing weights v{self._trainer_version}",
+        #     flush=True,
+        # )
 
         t0 = time.monotonic()
         # TODO: currently sync_weights is not implemented, comment out for now
