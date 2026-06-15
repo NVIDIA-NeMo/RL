@@ -53,9 +53,6 @@ FLASHINFER_CUBIN_CACHE="${PERSISTENT_CACHE}/flashinfer_cubins"
 FLASHINFER_WS_BASE="${PERSISTENT_CACHE}/flashinfer_workspace"
 GYM_VENV_DIR="${GYM_VENV_DIR:-${PERSISTENT_CACHE}/gym_venvs}"
 HF_MODULES_CACHE_DIR="${HF_MODULES_CACHE:-${PERSISTENT_CACHE}/hf_modules/${EXP_NAME}}"
-# NEMO_RL_VENV_DIR="${NEMO_RL_VENV_DIR:-${PERSISTENT_CACHE}/ray_venvs}"
-# RAY_CLI="${RAY_CLI:-${NEMO_RL_VENV_DIR}/nemo_rl.environments.nemo_gym.NemoGym/bin/ray}"
-# UV_CACHE_DIR_OVERRIDE="${UV_CACHE_DIR_OVERRIDE:-${PERSISTENT_CACHE}/uv_cache}"
 UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-300}"
 NRL_FORCE_REBUILD_VENVS="${NRL_FORCE_REBUILD_VENVS:-false}"
 
@@ -74,9 +71,6 @@ echo " Cache root : ${PERSISTENT_CACHE}"
 echo " HF locks   : ${MEGATRON_CONFIG_LOCK_DIR}"
 echo " HF modules : ${HF_MODULES_CACHE_DIR}"
 echo " Gym venvs  : ${GYM_VENV_DIR}"
-# echo " Ray venvs  : ${NEMO_RL_VENV_DIR}"
-# echo " Ray CLI    : ${RAY_CLI}"
-# echo " UV cache   : ${UV_CACHE_DIR_OVERRIDE}"
 echo " Rebuild Ray venvs: ${NRL_FORCE_REBUILD_VENVS}"
 echo " Partition  : ${SLURM_PARTITION}"
 echo " Account    : ${SLURM_ACCOUNT}"
@@ -84,13 +78,10 @@ echo " Refresh snapshot: ${REFRESH_CODE_SNAPSHOT}"
 echo "========================================"
 
 # ---- Create cache dirs ----
-mkdir -p "${VLLM_CACHE_DIR}" "${FLASHINFER_CUBIN_CACHE}" "${FLASHINFER_WS_BASE}" "${MEGATRON_CONFIG_LOCK_DIR}" "${HF_MODULES_CACHE_DIR}" # "${NEMO_RL_VENV_DIR}" "${UV_CACHE_DIR_OVERRIDE}" "${GYM_VENV_DIR}"
+mkdir -p "${VLLM_CACHE_DIR}" "${FLASHINFER_CUBIN_CACHE}" "${FLASHINFER_WS_BASE}" "${MEGATRON_CONFIG_LOCK_DIR}" "${HF_MODULES_CACHE_DIR}"
 
 
 export OMP_NUM_THREADS=16
-# export NEMO_RL_VENV_DIR
-# export RAY_CLI
-# export UV_CACHE_DIR_OVERRIDE
 
 # ---- Code snapshot ----
 SNAPSHOT_DIR=$(realpath "$(bash "${CODE_DIR}/tools/code_snapshot.sh" "${EXP_NAME}")")

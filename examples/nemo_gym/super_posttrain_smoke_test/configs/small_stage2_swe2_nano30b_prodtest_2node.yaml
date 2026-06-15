@@ -1,0 +1,81 @@
+# Nano-30B-A3B 2-node smoke test of stage2_swe2 (SWE-bench OpenHands, thinking). Inherits
+# stage2_swe2.yaml directly and shrinks the policy footprint + context + agent fan-out for a cheap
+# pipeline check before the 17-node super prodtest. swe2 rewards come from SWE-bench test execution
+# in CPU .sif sandboxes, so there are no GPU judges: SBATCH_NUM_NODES == cluster.num_nodes = 2.
+#
+# STILL REQUIRED (inherited from base, set at launch): SIF_DIR + the instance-specific .sif
+# container_formatter images, the apptainer sandbox setup, and the gym-side policy_model
+# enable_thinking/truncate_history_thinking override (kept in base for token-in-token-out history).
+#
+# Topology: 1 train node (TP2 x PP1 x EP8 x CP1 -> DP4) + 1 policy-vLLM node (TP2).
+# Context is capped hard (196608 -> 32768): this TRUNCATES real multi-turn SWE trajectories, which is
+# fine for a "does the pipeline run" smoke but NOT representative of SWE-bench solve behavior. Agent
+# turns/concurrency are also reduced so the smoke completes quickly.
+#
+# Set MODEL_PATH=/lustre/fs1/portfolios/coreai/users/yifuw/checkpoints/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+defaults: "stage2_swe2.yaml"
+
+checkpointing:
+  checkpoint_dir: "results/super_v3_smoke_swe2_nano30b_2node"
+  # optimizer_cpu_offload (below) KeyErrors on optimizer load_state_dict during resume on this
+  # build. Push save_period past the smoke length so an auto-resume never triggers.
+  save_period: 1000
+
+grpo:
+  num_prompts_per_step: 8   # base 16
+  num_generations_per_prompt: 4   # base 32; gbs = 8*4 = 32
+
+data:
+  max_input_seq_length: 24576   # cap below max_total_sequence_length (32768)
+
+policy:
+  train_global_batch_size: 32   # base 512; 8 prompts * 4 generations
+  max_total_sequence_length: 32768   # base 196608 (truncates long SWE trajectories -- smoke only)
+  generation:
+    max_new_tokens: 8192          # base inherits ${max_total_sequence_length}
+    colocated:
+      resources:
+        num_nodes: 1              # base 32; 1 dedicated policy-vLLM node
+    vllm_cfg:
+      tensor_parallel_size: 2     # base 8; match train TP2
+    vllm_kwargs:
+      max_num_seqs: 16
+  megatron_cfg:
+    # Nano-30B divisibility on 1 node: 32 attn / TP2, 2 KV / TP2, 64 mamba / TP2, 8 n_groups / TP2,
+    # 128 experts / EP8 = 16.
+    tensor_model_parallel_size: 2    # base 8
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 8    # base 8 (explicit; EP8 = DP4 * TP2)
+    context_parallel_size: 1         # base 8
+    optimizer:
+      # fp32 master + precision-aware optimizer inherited; offload Adam states to host RAM.
+      # (If init errors, set params_dtype bf16 + use_precision_aware_optimizer false.)
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 1.0
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+
+env:
+  nemo_gym:
+    # Shrink the SWE-bench agent fan-out so the 2-node smoke finishes fast (prod: 768 / 200 turns).
+    swe_agents_train:
+      responses_api_agents:
+        swe_agents:
+          agent_max_turns: 50
+          concurrency: 64
+          # Absolute .sif image search paths (no SIF_DIR needed); replaces the base list.
+          # swe_agents_val inherits this via the base ${...container_formatter} reference.
+          container_formatter:
+          - "/lustre/fsw/portfolios/llmservice/users/igitman/images/swe-bench/swebench_sweb.eval.x86_64.{instance_id}.sif"
+          - "/lustre/fsw/portfolios/llmservice/users/sdevare/swe_sweapro/images_train/sweap.{instance_id}.sif"
+          - "/lustre/fsw/portfolios/llmservice/users/igitman/images/swe-bench/namanjain12_{instance_id}.sif"
+          - "/lustre/fsw/portfolios/llmservice/users/sdevare/swe_sweapro/images_train/sweap.{instance_id}.sif"
+          - "/lustre/fsw/portfolios/llmservice/users/igitman/images/swe-bench/swebench_sweb.eval.x86_64{instance_id}.sif"
+    swe_agents_val:
+      responses_api_agents:
+        swe_agents:
+          agent_max_turns: 50
+          concurrency: 64
+
+cluster:
+  num_nodes: 2   # base 64; 1 train + 1 policy-vLLM. No judges -> SBATCH_NUM_NODES=2.

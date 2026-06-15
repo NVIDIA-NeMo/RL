@@ -1,0 +1,56 @@
+# Nano-30B-A3B 2-node smoke test of stage2_swe1 (SWE-pivot single-step tool use). Inherits
+# stage2_swe1.yaml directly and shrinks the policy footprint + context for a cheap pipeline check
+# before the 9-node super prodtest. swe1 has no GPU judges (programmatic argument comparison), so
+# SBATCH_NUM_NODES == cluster.num_nodes = 2.
+#
+# Topology: 1 train node (TP2 x PP1 x EP8 x CP1 -> DP4, EP8 = DP*TP) + 1 policy-vLLM node (TP2).
+# Context is capped well below prod (131072 -> 32768): swe1 is single-step (max_rollout_turns=1),
+# so 24576 in + 8192 gen is plenty to exercise the plumbing.
+#
+# Set MODEL_PATH=/lustre/fs1/portfolios/coreai/users/yifuw/checkpoints/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+defaults: "stage2_swe1.yaml"
+
+checkpointing:
+  checkpoint_dir: "results/super_v3_smoke_swe1_nano30b_2node"
+  # optimizer_cpu_offload (below) KeyErrors on optimizer load_state_dict during resume on this
+  # build. Push save_period past the smoke length so an auto-resume never triggers.
+  save_period: 1000
+
+grpo:
+  num_prompts_per_step: 8   # base 64
+  num_generations_per_prompt: 4   # base 16; gbs = 8*4 = 32
+
+data:
+  max_input_seq_length: 24576   # cap below max_total_sequence_length (32768) so long prompts are
+                                # filtered at the dataloader, not rejected by vLLM (-> collector stall)
+
+policy:
+  train_global_batch_size: 32   # base 1024; 8 prompts * 4 generations
+  max_total_sequence_length: 32768   # base 131072
+  generation:
+    max_new_tokens: 8192          # base inherits ${max_total_sequence_length}
+    colocated:
+      resources:
+        num_nodes: 1              # base 32; 1 dedicated policy-vLLM node
+    vllm_cfg:
+      tensor_parallel_size: 2     # base 8; match train TP2
+    vllm_kwargs:
+      max_num_seqs: 16
+  megatron_cfg:
+    # Nano-30B divisibility on 1 node: 32 attn / TP2, 2 KV / TP2, 64 mamba / TP2, 8 n_groups / TP2,
+    # 128 experts / EP8 = 16.
+    tensor_model_parallel_size: 2    # base 8
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 8    # base 8 (explicit; EP8 = DP4 * TP2)
+    context_parallel_size: 1         # base 8 (32768 ctx fits at CP1 on a 30B with activation ckpt)
+    optimizer:
+      # fp32 master + precision-aware optimizer inherited from base; offload Adam states to host RAM
+      # -> GPU mem ~unchanged, no extra nodes. (If init errors, set params_dtype bf16 +
+      # use_precision_aware_optimizer false.)
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 1.0
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+
+cluster:
+  num_nodes: 2   # base 64; 1 train + 1 policy-vLLM. No judges -> SBATCH_NUM_NODES=2.

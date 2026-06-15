@@ -399,6 +399,36 @@ env:
           judge_responses_create_params:
             max_output_tokens: 8192
 
+    # The training policy server. vllm_model_for_training.yaml (config_paths) provides the bare
+    # `policy_model`; this augments it with the Nemotron-specific reasoning behavior. Mirrors the
+    # policy_model override in ultra-v3 examples/configs/ultra/student_rlvr1.yaml. Reasoning is kept
+    # ON and NOT truncated from multi-turn history so the trajectory grows monotonically for
+    # token-in-token-out RL. (ultra-v3 also sets `num_groups_nemo_rl: ${add:...}` here, but that
+    # field has no consumer in this pinned Gym build, so it is omitted.)
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          num_workers: 16
+          chat_template_kwargs:
+            enable_thinking: true
+            truncate_history_thinking: false
+          sequential_reasoning_allowed: false
+
+    # genrm_compare.yaml (loaded via config_paths) declares a `genrm_simple_agent_reasoning_off`
+    # agent that references the `policy_model_reasoning_off` server. That server is defined nowhere
+    # else, so Gym's validate_and_populate_defaults asserts ("Could not find
+    # policy_model_reasoning_off ...") at startup unless we define it here. `_copy: policy_model`
+    # deep-merges over policy_model (global_config.py:365), so it inherits truncate_history_thinking
+    # and sequential_reasoning_allowed from above and only flips `enable_thinking` -> false.
+    # num_workers is lowered to 4 for this secondary proxy. Matches ultra-v3 student_rlvr1.yaml.
+    policy_model_reasoning_off:
+      _copy: policy_model
+      responses_api_models:
+        vllm_model:
+          num_workers: 4
+          chat_template_kwargs:
+            enable_thinking: false
+
     # RENAMED top-level key `genrm_compare` -> `genrm_compare_resources_server` to match the
     # block name in main's Gym (1a4912e), which the agents reference as
     # `name: genrm_compare_resources_server`. Without this rename the override never merges
@@ -432,11 +462,7 @@ env:
           top_percentile: 0.2
           group_reasoning_length_penalty_coeff: 0.1
           group_answer_length_penalty_coeff: 0.1
-          # group_style_penalty_coeff is a super-v3-ONLY field (style-density penalty, lives in
-          # Gym super-v3 utils.py). Main's Gym (1a4912e) has no such field or logic, so it would
-          # be ignored (or rejected) -> commented out. NOTE: it is a distinct penalty, NOT a
-          # rename of group_reasoning_length_penalty_coeff (which is kept above).
-          # group_style_penalty_coeff: 0.1
+          group_style_penalty_coeff: 0.1
           default_score: 3.0
           default_ranking: 3.5
 
@@ -466,7 +492,6 @@ env:
               cudagraph_capture_sizes: [1,2,4,8,16,32]
           debug: false
 
-
     lc_judge:
       resources_servers:
         equivalence_llm_judge:
@@ -490,6 +515,13 @@ env:
           unit_test_timeout_secs: 10
           debug: false
 
+    # NeMo-RL-side effort shaping; NemoGym._spinup strips it before forwarding Gym config.
+    effort_levels:
+      low_weight: 0.0   # Weight on the length-reward bonus term (0 disables upside)
+      low_penalty: 1.0  # Coefficient for the length-reward penalty term
+      low_ub: 64000     # Response-length upper bound in tokens
+      low_string: ""    # Prompt substring that triggers shaping; "" applies to all
+
 logger:
   log_dir: "logs"
   num_val_samples_to_print: 0
@@ -512,10 +544,3 @@ logger:
 cluster:
   gpus_per_node: 8
   num_nodes: 109
-
-# this might need to go inside gym based on https://github.com/NVIDIA-NeMo/RL/pull/2770
-effort_levels:
-  low_string: "{reasoning effort: low}"
-  low_weight: 0.2
-  low_penalty: 1
-  low_ub: 3000

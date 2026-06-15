@@ -1,0 +1,59 @@
+# Prod-test of stage1_rlvr on H100 (80GB), one DP step UP from the 8-node minimum: 8 train nodes
+# instead of 4. Same model/context/batch/judges as small_stage1_rlvr_prodtest_8node_h100.yaml
+# (including the batch reduction to 128; group size num_generations=16 preserved).
+#
+# Why 8 train nodes (not 5, 6, 7): DP must divide train_global_batch_size (128) -> DP must be a
+# power of 2 (megatron_policy_worker.py local_gbs = gbs // dp_size). With TP4*CP8*PP1=32 GPUs/replica:
+#   4 train nodes -> DP1, EDP2 (the 8-node file; optimizer barely sharded -> OOM-tight)
+#   8 train nodes -> DP2, EDP4 (this file; per-rank fp32 optimizer ~halved, no offload needed)
+#   16 train nodes -> DP4, EDP8 (next valid step if 8 still OOMs)
+# EDP = world/(EP*ETP*PP) = 64/16 = 4 is what shards the expert optimizer (99% of params).
+#
+# SBATCH_NUM_NODES=12 == cluster.num_nodes=9 (8 train + 1 gen) + num_gpu_nodes=3 (judges).
+# MODEL_PATH stays the prod Super checkpoint (rs-feb5_iter350), set at launch.
+defaults: "stage1_rlvr.yaml"
+
+grpo:
+  num_prompts_per_step: 8   # base 256; reduced further (16->8) so a step assembles/completes quickly
+                            # under 1 gen node (num_generations_per_prompt stays 16 -> group size unchanged)
+
+policy:
+  train_global_batch_size: 128   # = num_prompts_per_step(8) * num_generations_per_prompt(16);
+                                 # force_on_policy_ratio:true requires this equality (grpo.py:417)
+  # Base sets this to ${tensor_model_parallel_size}=4, but megatron sequence-packing requires it to
+  # be a multiple of cp_size*2*tp_size = 8*2*4 = 64 (else AssertionError in
+  # _get_pack_sequence_parameters_for_megatron, which silently stalls the run). Override to 64.
+  make_sequence_length_divisible_by: 64
+  generation:
+    colocated:
+      resources:
+        num_nodes: 1            # base 72; 1 dedicated H100 gen node (gpus_per_node=8 inherited)
+    vllm_cfg:
+      tensor_parallel_size: 8   # base 4; 231GB bf16 won't fit on 4x80GB, TP8 = 1 node
+  megatron_cfg:
+    expert_model_parallel_size: 16   # base 8; shard 512 experts 16-ways to fit 80GB
+
+env:
+  nemo_gym:
+    num_gpu_nodes: 3   # base 5; genrm TP8 (1 node) + nl2bash TP8 (1 node) + safety TP1 -> 17 GPUs -> 3 nodes
+    genrm_model:
+      responses_api_models:
+        genrm_model:
+          hf_home: "${oc.env:PERSISTENT_CACHE}/hf_judge_models"
+          vllm_serve_kwargs:
+            data_parallel_size: 1   # base 2; one replica for the test (keep TP8)
+    nl2bash_judge_model:
+      responses_api_models:
+        local_vllm_model:
+          hf_home: "${oc.env:PERSISTENT_CACHE}/hf_judge_models"
+          vllm_serve_kwargs:
+            data_parallel_size: 1   # base 2 (keep TP8)
+    safety_judge_model:
+      responses_api_models:
+        local_vllm_model:
+          hf_home: "${oc.env:PERSISTENT_CACHE}/hf_judge_models"
+          vllm_serve_kwargs:
+            data_parallel_size: 1   # base 8 (keep TP1)
+
+cluster:
+  num_nodes: 9   # base 109; 8 train (TP4*CP8*PP1=32, DP2) + 1 gen (TP8). +3 judge nodes -> SBATCH=12.

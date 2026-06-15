@@ -1,0 +1,72 @@
+# Prod-test of stage3_rlhf (RLHF + GenRM, with reference-policy KL) on H100 (80GB) at near-minimum
+# nodes, keeping prod context (49152), batch (2048), and data. Base stage3_rlhf.yaml is tuned for
+# B200 (192GB) at 72 nodes. Overrides parallelism + node/replica counts only.
+#
+# stage3 is the MEMORY-HEAVIEST stage: reference_policy_kl_penalty=1e-4 (inherited) loads a full
+# reference policy (235B) ON THE TRAIN CLUSTER alongside the trained policy -> ~2x weight memory.
+# An earlier 10-node run OOM'd at prepare_refit_info (NCCL "Failed to CUDA calloc 16 bytes" = GPU
+# full) because policy + reference + fp32 Adam exceeded 80GB. Fix applied: optimizer_cpu_offload
+# (below) moves the ~20-25GB/rank fp32 Adam to host RAM. If it STILL OOMs, go to 16 train nodes
+# (SBATCH 18; DP8/EDP8 shards weights+optimizer further -- CP does NOT, it only shards activations).
+#
+# World = TP*PP*CP*DP (EP carved via EDP = world/(ETP*EP*PP)). TP4*CP4*PP1 = 16 GPUs/replica;
+# 8 train nodes = 64 GPUs -> DP4, EDP = 64/(32*1*1) = 2.
+#
+# H100 topology changes vs prod (B200):
+#   - EP 8 -> 32: shard the 512 experts 32-ways (16/rank) so policy+reference weights fit 80GB.
+#   - gen vLLM TP 4 -> 8: 231GB bf16 won't fit on 4x80GB; TP8 = 1 node.
+#   - GenRM DP 8 -> 1 (same prod 235B, single replica, keep TP8) -> num_gpu_nodes 8 -> 1.
+#
+# SBATCH_NUM_NODES=10 == cluster.num_nodes=9 (8 train + 1 gen) + num_gpu_nodes=1 (genrm TP8).
+# MODEL_PATH = prod Super checkpoint.
+defaults: "stage3_rlhf.yaml"
+
+checkpointing:
+  # optimizer_cpu_offload (below) KeyErrors on optimizer load_state_dict during resume on this build;
+  # push save_period past the smoke length so an auto-resume never triggers.
+  save_period: 1000
+
+grpo:
+  num_prompts_per_step: 8   # base 128; reduced so a step assembles/completes quickly under 1 gen node
+                            # (num_generations_per_prompt stays 16 -> GRPO group size unchanged)
+
+policy:
+  train_global_batch_size: 128   # base 2048; = num_prompts_per_step(8) * num_generations_per_prompt(16);
+                                 # force_on_policy_ratio:true requires this equality (grpo.py:417). DP4 | 128 ok.
+  # base sets make_sequence_length_divisible_by: ${tensor_model_parallel_size}=4, but megatron
+  # sequence-packing requires a multiple of cp_size*2*tp_size = 4*2*4 = 32 (else AssertionError in
+  # _get_pack_sequence_parameters_for_megatron, which silently stalls the run). Override to 32.
+  make_sequence_length_divisible_by: 32
+  generation:
+    colocated:
+      resources:
+        num_nodes: 1            # base 32; 1 dedicated H100 gen node (gpus_per_node=8 inherited)
+    vllm_cfg:
+      tensor_parallel_size: 8   # base 4; 231GB bf16 won't fit on 4x80GB, TP8 = 1 node
+  megatron_cfg:
+    # base 8 -> 32 (not 16 like the other stages). stage3 holds BOTH the policy AND a frozen
+    # reference policy on the train GPUs; GPU_DIAG showed reference load taking allocated 37GB -> 73GB
+    # (~35GB/rank), leaving ~5GB and OOMing the refit gather. Experts are ~99% of params and shard by
+    # EP, so EP32 (512 experts -> 16/rank) ~halves BOTH models' weights/rank. EDP = 64/(32*1*1) = 2.
+    # NOTE: more train nodes would NOT help -- DP replicates the model; only TP/EP/PP shard weights.
+    expert_model_parallel_size: 32
+    optimizer:
+      # The frozen reference policy (RLHF KL) sits on the train GPUs alongside the policy; at refit
+      # the fp32 Adam state tipped it OOM. Offload Adam to host RAM (~20-25GB/rank freed) to fit 80GB.
+      # Compatible with the inherited use_precision_aware_optimizer (-> HybridDeviceOptimizer, fp32 master).
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 1.0
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+
+env:
+  nemo_gym:
+    num_gpu_nodes: 1   # base 8; GenRM TP8 DP1 = 8 GPUs = 1 node (stage3 has no other GPU judges)
+    genrm_model:
+      responses_api_models:
+        genrm_model:
+          vllm_serve_kwargs:
+            data_parallel_size: 1   # base 8; one replica for the test (keep TP8 235B)
+
+cluster:
+  num_nodes: 9   # base 72; 8 train (TP4*CP4*PP1=16/replica, DP4) + 1 gen (TP8). +1 genrm node -> SBATCH=10.

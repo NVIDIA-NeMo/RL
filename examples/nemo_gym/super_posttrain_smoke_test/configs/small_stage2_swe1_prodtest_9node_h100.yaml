@@ -1,0 +1,46 @@
+# Prod-test of stage2_swe1 (SWE-pivot single-step tool use) on H100 (80GB) at MINIMUM nodes,
+# keeping prod context (131072), global batch (1024), and data. Base stage2_swe1.yaml is tuned for
+# B200 (192GB) at 64 nodes. Overrides ONLY parallelism + node counts.
+#
+# swe1 has NO GPU judge models -- the reward is a programmatic argument comparison (swe_pivot
+# single_step_tool_use_with_argument_comparison). So SBATCH_NUM_NODES == cluster.num_nodes; no
+# extra judge nodes.
+#
+# World = TP*PP*CP*DP (EP carved via EDP = world/(ETP*EP*PP)). One DP=1 replica:
+#   TP8 * CP8 * PP1 = 64 GPUs = 8 train nodes. (TP8 is the mamba cap; CP8 holds the 131072-tok
+#   activations at 16384 tok/rank.)
+#
+# H100 topology changes vs prod (B200):
+#   - EP 8 -> 16: shard the 512 experts 16-ways so weights+grads fit 80GB.
+#   - gen vLLM stays TP8 (already prod) but num_nodes 32 -> 1: one gen replica is enough for a smoke.
+#
+# Tightness: DP1 / EDP4 (=64/16). The expert optimizer shards 4-ways (better than stage1's 8-node
+# EDP2), but the dense optimizer is unsharded at DP1 (~14GB). If it OOMs at init/first step, go to
+# 16 train nodes (DP2/EDP8; 1024/2 still integer) -> cluster.num_nodes=17, SBATCH=17. Avoid offload
+# (KeyErrors on resume on this build).
+#
+# SBATCH_NUM_NODES=9 == cluster.num_nodes=9 (8 train + 1 gen). MODEL_PATH = prod Super checkpoint.
+defaults: "stage2_swe1.yaml"
+
+grpo:
+  num_prompts_per_step: 8   # base 64; reduced so a step assembles/completes quickly under 1 gen node
+                            # (num_generations_per_prompt stays 16 -> GRPO group size unchanged)
+
+policy:
+  train_global_batch_size: 128   # base 1024; = num_prompts_per_step(8) * num_generations_per_prompt(16);
+                                 # force_on_policy_ratio:true requires this equality (grpo.py:417)
+  # base stage2_swe1.yaml sets make_sequence_length_divisible_by: 8, but megatron sequence-packing
+  # requires a multiple of cp_size*2*tp_size = 8*2*8 = 128 (else AssertionError in
+  # _get_pack_sequence_parameters_for_megatron, which silently stalls the run). Override to 128.
+  make_sequence_length_divisible_by: 128
+  generation:
+    colocated:
+      resources:
+        num_nodes: 1            # base 32; 1 dedicated H100 gen node (gpus_per_node=8 inherited)
+  megatron_cfg:
+    expert_model_parallel_size: 16   # base 8; shard 512 experts 16-ways to fit 80GB
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+
+cluster:
+  num_nodes: 9   # base 64; 8 train (TP8*CP8*PP1=64 GPUs, DP1) + 1 gen (TP8). No judges -> SBATCH=9.

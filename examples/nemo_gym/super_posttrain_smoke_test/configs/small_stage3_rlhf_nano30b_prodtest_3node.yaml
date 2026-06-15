@@ -1,0 +1,83 @@
+# Nano-30B-A3B 3-node smoke test of stage3_rlhf (RLHF + GenRM, reference-policy KL). Inherits
+# stage3_rlhf.yaml directly; shrinks policy footprint + context + batch and downsizes the GenRM judge
+# for a cheap pipeline check before the super prodtest. stage3's only GPU judge is GenRM (no
+# nl2bash/safety), so SBATCH_NUM_NODES = cluster.num_nodes(2) + num_gpu_nodes(1) = 3.
+#
+# NOTE: reference_policy_kl_penalty=1e-4 (inherited) loads a reference policy (another nano-30B) on
+# the train node -> ~2x weight memory; optimizer_cpu_offload (below) keeps it within 80GB.
+# CP=1 here, so the inherited make_sequence_length_divisible_by=${TP}=2 is valid (no CP pad factor).
+#
+# Topology: 1 train node (TP2 x PP1 x EP8 x CP1 -> DP4) + 1 policy-vLLM node (TP2) + 1 GenRM node.
+# Set MODEL_PATH=/lustre/fs1/portfolios/coreai/users/yifuw/checkpoints/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+# Run cache_judge_models.sh first to prefetch the 32B GenRM weights.
+defaults: "stage3_rlhf.yaml"
+
+checkpointing:
+  checkpoint_dir: "results/super_v3_smoke_stage3_nano30b_3node"
+  # optimizer_cpu_offload (below) KeyErrors on optimizer load_state_dict during resume on this build.
+  # Push save_period past the smoke length so an auto-resume never triggers.
+  save_period: 1000
+
+grpo:
+  num_prompts_per_step: 8    # base 128
+  num_generations_per_prompt: 4   # base 16; gbs = 8*4 = 32; MUST equal genrm num_rollouts_per_prompt
+
+data:
+  max_input_seq_length: 16384   # cap below max_total_sequence_length (20480)
+
+policy:
+  train_global_batch_size: 32   # base 2048; 8 prompts * 4 generations
+  max_total_sequence_length: 20480   # base 49152
+  generation:
+    max_new_tokens: 4096          # base inherits ${max_total_sequence_length}
+    colocated:
+      resources:
+        num_nodes: 1              # base 32; 1 dedicated policy-vLLM node
+    vllm_cfg:
+      tensor_parallel_size: 2     # base 4; match train TP2
+    vllm_kwargs:
+      max_num_seqs: 16
+  megatron_cfg:
+    # Nano-30B divisibility on 1 node: 32 attn / TP2, 2 KV / TP2, 64 mamba / TP2, 8 n_groups / TP2,
+    # 128 experts / EP8 = 16.
+    tensor_model_parallel_size: 2    # base 4
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 8    # base 8 (explicit; EP8 = DP4 * TP2)
+    context_parallel_size: 1         # base 4
+    optimizer:
+      # fp32 master + the reference policy on 80GB -> offload Adam states to host RAM.
+      # (If init errors, set params_dtype bf16 + use_precision_aware_optimizer false.)
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 1.0
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+
+env:
+  nemo_gym:
+    num_gpu_nodes: 1   # base 8; only GenRM, downsized to 32B (TP2 DP1 = 2 GPUs)
+    genrm_compare_resources_server:
+      resources_servers:
+        genrm_compare:
+          num_rollouts_per_prompt: 4   # base 16; MUST equal grpo.num_generations_per_prompt
+          # 32B GenRM ctx is 40960; with the inherited max_output_tokens 16384 max input is only
+          # 24576. 8192 -> max input 32768.
+          genrm_responses_create_params:
+            max_output_tokens: 8192
+
+    # --- GenRM: 235B -> 32B principle-based sibling (same role, supports principle role) ---
+    genrm_model:
+      responses_api_models:
+        genrm_model:
+          model: "nvidia/Qwen3-Nemotron-32B-GenRM-Principle"
+          hf_home: "${oc.env:PERSISTENT_CACHE}/hf_judge_models"
+          # VERIFY this 32B variant emits <think> (inherits uses_reasoning_parser=true,
+          # reasoning_parser=deepseek_r1). If genrm_compare returns only default_score (3.0),
+          # flip uses_reasoning_parser -> false and drop reasoning_parser.
+          vllm_serve_kwargs:
+            data_parallel_size: 1    # base 8
+            tensor_parallel_size: 2  # base 8
+            max_model_len: 40960     # Qwen3-32B native ctx; 60000 would need YARN
+            max_num_seqs: 16
+
+cluster:
+  num_nodes: 2   # base 72; 1 train + 1 policy-vLLM. +1 GenRM node -> SBATCH_NUM_NODES=3.
