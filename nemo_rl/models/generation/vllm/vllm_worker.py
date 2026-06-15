@@ -52,10 +52,6 @@ def _resolve_enable_prefix_caching(vllm_cfg: dict[str, Any]) -> bool:
 
 # Use a base class to share some functions to avoid code duplication.
 class BaseVllmGenerationWorker:
-    # Default for instances created via __new__ (e.g. unit tests that bypass
-    # __init__). Normal init paths overwrite this per-instance.
-    _force_level1_sleep: bool = False
-
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
 

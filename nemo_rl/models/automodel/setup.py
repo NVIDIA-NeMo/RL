@@ -752,10 +752,7 @@ def setup_model_and_optimizer(
             v.data = v.data.to("cpu")
         model = model.to("cpu")
 
-    # Initialize optimizer — only on parameters that require grad so that frozen
-    # modules (e.g. audio towers on image-only data) don't sit in param_groups
-    # without optimizer state, which otherwise breaks resume via dcp.load
-    # ("Missing key in checkpoint state_dict").
+    # Initialize optimizer
     optimizer = None
     if init_optimizer:
         optimizer_cls = get_class(config["optimizer"]["name"])
