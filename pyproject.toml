@@ -499,8 +499,6 @@ requires-dist = [
   "diffusers>=0.36.0",
   "peft>=0.18.0",
   "einops",
-  "imageio",
-  "imageio-ffmpeg",
   "omegaconf>=2.3.0",
   "tensorboard>=2.19.0",
   "typing-extensions",
@@ -521,8 +519,6 @@ requires-dist = [
   "torch>=2.6.0",
   "flashinfer-python==0.6.8.post1",
   "flashinfer-cubin==0.6.8.post1",
-  # megatron-core omitted here: it's a workspace member and already a direct dep of the mcore extra.
-  # Non-workspace path deps cannot depend on workspace members (uv name-shadowing restriction).
 ]
 
 # Override logsage metadata to:
