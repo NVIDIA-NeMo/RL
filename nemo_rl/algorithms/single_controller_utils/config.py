@@ -42,6 +42,9 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     # Pump concurrency caps.
     max_inflight_prompts: int = 8
     max_buffered_rollouts: int = 8
+    # True : over-generates and wastes rollouts that age past the staleness window;
+    # False: enforces per-weight-version dispatch quota.
+    over_sampling: bool = True
 
 
 class MasterConfig(BaseModel, extra="allow"):

@@ -21,7 +21,9 @@ from nemo_rl.data_plane import KVBatchMeta
 class StalenessSampler:
     """Pick complete prompt groups inside a version staleness window.
 
-    Defaults to FIFO (sample_freshest_first=False); pass True to prefer smallest lag.
+    sample_freshest_first prefers smallest lag; require_order takes only from
+    the oldest weight_version present and waits for its batch to fill. Unready
+    slots are always skipped.
     """
 
     def __init__(
@@ -29,15 +31,21 @@ class StalenessSampler:
         buffer: TQReplayBuffer,
         max_staleness_versions: int,
         sample_freshest_first: bool = False,
+        require_order: bool = False,
     ) -> None:
         if max_staleness_versions < 0:
             raise ValueError(
                 f"max_staleness_versions must be non-negative, got "
                 f"{max_staleness_versions}"
             )
+        if require_order and sample_freshest_first:
+            raise ValueError(
+                "require_order and sample_freshest_first are mutually exclusive"
+            )
         self._buffer = buffer
         self.max_staleness_versions = max_staleness_versions
         self.sample_freshest_first = sample_freshest_first
+        self.require_order = require_order
 
     async def select(
         self,
@@ -45,38 +53,54 @@ class StalenessSampler:
         current_train_weight: int,
         min_prompt_groups: int,
     ) -> tuple[KVBatchMeta | None, int]:
-        """Return a concat of the first min_prompt_groups eligible groups, or None.
+        """Concat the first min_prompt_groups eligible groups and drop them from the buffer.
 
-        Freshest-first (smallest lag, ties by insertion order) when
-        sample_freshest_first is set, else insertion-order FIFO.
-        Selected entries are dropped from the buffer locally; DataPlane rows survive
-        for the trainer and are cleared by the caller at step boundary.
+        Eligibility = ready and weight in
+        [current_train_weight - max_staleness_versions, current_train_weight].
+        DataPlane rows survive the local drop; caller clears them at step boundary.
 
         Args:
-            current_train_weight: Current trainer weight version. Eligibility window is
-                [current_train_weight - max_staleness_versions, current_train_weight].
+            current_train_weight: Current trainer weight version.
             min_prompt_groups: Minimum groups required; returns (None, 0) below this.
 
         Returns:
-            meta: Concatenated KVBatchMeta covering num_groups groups, or None.
+            meta: Concatenated KVBatchMeta, or None if not enough groups.
             num_groups: Number of prompt groups in meta; 0 when meta is None.
         """
         if min_prompt_groups < 1:
             raise ValueError(f"min_prompt_groups must be >= 1, got {min_prompt_groups}")
 
         min_valid_version = max(0, current_train_weight - self.max_staleness_versions)
-        valid_idxs = [
-            i
-            for i, weight in enumerate(self._buffer.weight_list)
-            if min_valid_version <= weight <= current_train_weight
-        ]
+
+        if self.require_order:
+            in_window = [
+                weight
+                for weight in self._buffer.start_weight_list
+                if min_valid_version <= weight <= current_train_weight
+            ]
+            if not in_window:
+                return None, 0
+            target_version = min(in_window)
+            valid_idxs = [
+                i
+                for i, weight in enumerate(self._buffer.start_weight_list)
+                if weight == target_version and self._buffer.ready_list[i]
+            ]
+        else:
+            valid_idxs = [
+                i
+                for i, weight in enumerate(self._buffer.start_weight_list)
+                if min_valid_version <= weight <= current_train_weight
+                and self._buffer.ready_list[i]
+            ]
+
         if len(valid_idxs) < min_prompt_groups:
             return None, 0
 
         if self.sample_freshest_first:
             valid_idxs.sort(
                 key=lambda i: (
-                    current_train_weight - self._buffer.weight_list[i],
+                    current_train_weight - self._buffer.start_weight_list[i],
                     i,
                 )
             )
@@ -87,7 +111,7 @@ class StalenessSampler:
         await self._buffer.remove(selected_idxs, remove_in_dp=False)
 
         return (
-            selected_metas[0].concat(*selected_metas[1:]),
+            selected_metas[0].concat(*selected_metas[1:]),  # type: ignore
             len(selected_idxs),
         )
 
@@ -106,7 +130,7 @@ class StalenessSampler:
         min_valid_version = max(0, current_train_weight - self.max_staleness_versions)
         stale_idxs = [
             i
-            for i, weight in enumerate(self._buffer.weight_list)
+            for i, weight in enumerate(self._buffer.start_weight_list)
             if weight < min_valid_version
         ]
         if not stale_idxs:
