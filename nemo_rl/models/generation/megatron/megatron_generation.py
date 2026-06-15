@@ -35,6 +35,29 @@ if TYPE_CHECKING:
 class MegatronGeneration(GenerationInterface):
     """Generation interface backed by Megatron (colocated or non-colocated)."""
 
+    @staticmethod
+    def init_cluster_placement_groups(
+        cluster: RayVirtualCluster,
+        config: PolicyConfig,
+    ) -> None:
+        """Pre-initialize the inference cluster's placement groups.
+
+        Args:
+            cluster: The inference `RayVirtualCluster`.
+            config: The full `PolicyConfig` (megatron parallelism + colocation).
+        """
+        megatron_cfg = config["megatron_cfg"]
+        model_parallel_size = (
+            megatron_cfg["tensor_model_parallel_size"]
+            * megatron_cfg["pipeline_model_parallel_size"]
+            * megatron_cfg["context_parallel_size"]
+        )
+        colocated = config["generation"]["colocated"]["enabled"]
+        cluster._init_placement_groups(
+            strategy=None if colocated else "PACK",
+            use_unified_pg=model_parallel_size > cluster.num_gpus_per_node,
+        )
+
     def __init__(
         self,
         config: PolicyConfig,
@@ -81,6 +104,8 @@ class MegatronGeneration(GenerationInterface):
         # Stand up a dedicated inference-only policy.
         self._owns_policy = True
         self._policy_config["megatron_cfg"].update(self.cfg["mcore_generation_config"])
+        # Reserve GPUs before Policy workers grab them, to prevent disjoint NVLS domains.
+        self.init_cluster_placement_groups(cluster, self._policy_config)
         self._policy = Policy(
             cluster=cluster,
             config=self._policy_config,

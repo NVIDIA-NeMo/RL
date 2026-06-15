@@ -295,8 +295,8 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
               - 'env_vars': Environment variables for this worker
               - 'init_kwargs': Parameters to pass to __init__ of the worker
         """
-        del num_gpus, bundle_indices  # Megatron value workers are always parallel.
-        resources: dict[str, Any] = {"num_gpus": 0}
+        del bundle_indices  # one GPU per worker; no per-bundle seeding needed
+        resources: dict[str, Any] = {"num_gpus": num_gpus}
         env_vars: dict[str, str] = {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}
         init_kwargs: dict[str, Any] = {}
         return resources, env_vars, init_kwargs
@@ -324,8 +324,9 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
         """
         # Must be the first CUDA-touching call in this process.
         # With `RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1` (set by `configure_worker()`),
-        # all node GPUs are visible to this actor; LOCAL_RANK selects ours.
-        local_rank = int(os.environ["LOCAL_RANK"])
+        gpu_ids = ray.get_gpu_ids()
+        local_rank = int(gpu_ids[0])
+        os.environ["LOCAL_RANK"] = str(local_rank)
         torch.cuda.set_device(local_rank)
 
         apply_transformer_engine_patch()
