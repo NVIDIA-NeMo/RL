@@ -4,6 +4,8 @@ We provide a reference GRPO configuration for math benchmarks using the [OpenIns
 
 You can read about the details of the GRPO implementation [here](../../guides/grpo.md).
 
+Related GRPO-family objectives are documented in [DAPO](dapo.md) and [CISPO](cispo.md).
+
 ## GRPO Single Node
 
 To run GRPO on a single GPU for `Qwen/Qwen2.5-1.5B`:

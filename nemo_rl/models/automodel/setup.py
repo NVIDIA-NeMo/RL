@@ -497,6 +497,49 @@ def setup_distributed(
     )
 
 
+# AUTOMODEL-WORKAROUND(restore-dtype): TEMPORARY. Remove when the automodel pin includes
+# NVIDIA-NeMo/Automodel PR #2419 (rewrites _restore_loaded_model_dtype to honor an explicit
+# torch_dtype via promote_types). Currently pinned at automodel 6de0c361 (pre-#2419).
+def _disable_automodel_checkpoint_dtype_restore() -> None:
+    """No-op Automodel's ``_restore_loaded_model_dtype`` on the HF/force_hf load path.
+
+    NeMo-RL loads policy models with ``torch_dtype=float32`` to keep fp32 master weights
+    for the optimizer. Automodel's ``_restore_loaded_model_dtype`` (added after automodel
+    ``92635e74``) re-casts each loaded parameter back to the bf16 checkpoint dtype, silently
+    downgrading the master weights so AdamW updates underflow and the model fails to learn
+    (e.g. grpo-nano-v2-12b reward stuck ~0.18). Disable it so the requested fp32 load is
+    honored. Tracked by NVIDIA-NeMo/Automodel#2419; remove once the automodel pin includes it.
+    See ``test_automodel_dtype_restore_workaround_still_needed`` for the removal tripwire.
+    """
+    from nemo_automodel._transformers import model_init as _model_init
+
+    # Removal tripwire: if Automodel drops/renames this symbol (the likely shape of the
+    # upstream fix), the workaround is obsolete -> warn loudly and self-deactivate.
+    restore = getattr(_model_init, "_restore_loaded_model_dtype", None)
+    if restore is None:
+        import warnings
+
+        warnings.warn(
+            "Automodel no longer defines _restore_loaded_model_dtype; NeMo-RL's fp32 "
+            "master-weight workaround is obsolete - remove "
+            "_disable_automodel_checkpoint_dtype_restore() in setup.py.",
+            stacklevel=2,
+        )
+        return
+    if getattr(restore, "_nrl_disabled", False):
+        return
+
+    def _noop(*args, **kwargs) -> None:  # pragma: no cover
+        return None
+
+    _noop._nrl_disabled = True
+    # Stash the genuine function so the removal tripwire test
+    # (test_automodel_dtype_restore_workaround_still_needed) can exercise Automodel's
+    # real behavior even after this no-op has globally replaced the symbol process-wide.
+    _noop._nrl_original = restore
+    _model_init._restore_loaded_model_dtype = _noop
+
+
 def setup_model_and_optimizer(
     config: PolicyConfig,
     tokenizer: AutoTokenizer,
@@ -657,6 +700,10 @@ def setup_model_and_optimizer(
     # HF conversion (required for weight syncing).
     _maybe_set_force_hf(automodel_kwargs, model_config)
 
+    # Keep fp32 master weights: stop Automodel from restoring loaded params to the bf16
+    # checkpoint dtype, which would break optimizer master-weight precision (see helper).
+    _disable_automodel_checkpoint_dtype_restore()
+
     # Create model via from_pretrained - handles meta device init, parallelization,
     # LoRA, and base weight loading internally
     model = model_class.from_pretrained(
@@ -697,20 +744,6 @@ def setup_model_and_optimizer(
     )
     if is_tied_lm_head:
         model.tie_weights()
-
-    # Freeze visual encoder when not doing VLM training.
-    # Without this, the optimizer creates state entries for visual params that never
-    # receive gradients, causing a key mismatch when resuming from checkpoint.
-    # Note: visual encoder is nested under model.model (e.g. model.model.visual for
-    # Qwen3_5MoeForConditionalGeneration), not directly on model.
-    visual_module = getattr(getattr(model, "model", None), "visual", None) or getattr(
-        model, "visual", None
-    )
-    if not is_vlm and visual_module is not None:
-        for param in visual_module.parameters():
-            param.requires_grad_(False)
-        if rank == 0:
-            print("Froze visual encoder parameters for text-only training")
 
     # CPU offload if needed
     if cpu_offload:
