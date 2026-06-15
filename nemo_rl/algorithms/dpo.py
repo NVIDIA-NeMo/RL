@@ -651,7 +651,7 @@ def dpo_train(
                     dpo_save_state.epoch = current_epoch
                     dpo_save_state.total_valid_tokens = total_valid_tokens
                     # Remove outdated validation metrics
-                    for key in list(vars(dpo_save_state).keys()):
+                    for key in list(vars(dpo_save_state)):
                         if (
                             key.startswith("val")
                             and any(
