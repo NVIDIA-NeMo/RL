@@ -38,6 +38,7 @@ import pytest
 import ray
 import torch
 
+from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.models.policy.lm_policy import Policy
 
 # Reuse the existing v2 worker test fixtures for config + cluster setup.
@@ -73,8 +74,12 @@ def _drive_split_path(
     Calls backend methods directly on the worker actors (bypassing
     ``TQWorkerMixin.*_presharded`` so this test doesn't need a TQ
     DataPlane setup). Returns per-worker results from ``finish_train_step``.
+
+    Mirrors ``Policy.train()``'s sharding: ``_shard_for_train`` populates
+    ``micro_batch_indices`` per DP shard, which the worker iterators need.
     """
     workers = policy.worker_group.workers
+    sharded_data = policy._shard_for_train(data, gbs)
 
     # begin on every rank
     ray.get(
@@ -89,9 +94,25 @@ def _drive_split_path(
         ]
     )
 
-    # One train_microbatch call carrying the whole batch — the worker's
-    # internal bin iteration handles the per-mb fwd+bwd.
-    ray.get([w.train_microbatch.remote(step_id=step_id, data=data) for w in workers])
+    # One train_microbatch call per rank, carrying that rank's DP shard.
+    # The worker's internal bin iteration handles the per-mb fwd+bwd.
+    futures = policy.worker_group.run_all_workers_sharded_data(
+        "train_microbatch",
+        data=sharded_data,
+        in_sharded_axes=["data_parallel"],
+        replicate_on_axes=[
+            "context_parallel",
+            "tensor_parallel",
+            "pipeline_parallel",
+        ],
+        output_is_replicated=[
+            "context_parallel",
+            "tensor_parallel",
+            "pipeline_parallel",
+        ],
+        common_kwargs={"step_id": step_id},
+    )
+    policy.worker_group.get_all_worker_results(futures)
 
     # finish on every rank — drives the 1/N rescale + opt.step + sched.step
     results = ray.get([w.finish_train_step.remote(step_id=step_id) for w in workers])
@@ -127,7 +148,7 @@ def test_split_train_step_parity_token_level(
 
     # ── sync path ──────────────────────────────────────────────────────
     policy_sync = Policy(
-        tokenizer=None,
+        tokenizer=get_tokenizer(config["tokenizer"]),
         config=config,
         init_optimizer=True,
         init_reference_model=False,
@@ -143,7 +164,7 @@ def test_split_train_step_parity_token_level(
 
     # ── split path on a fresh policy with same init seed ──────────────
     policy_split = Policy(
-        tokenizer=None,
+        tokenizer=get_tokenizer(config["tokenizer"]),
         config=config,
         init_optimizer=True,
         init_reference_model=False,
@@ -215,9 +236,20 @@ def test_split_train_step_parity_seq_packing(
         cp=1,
         dtensor_v2=dtensor_v2,
         sequence_packing_enabled=True,
+        # FlashAttention (which seq-packing uses) requires fp16/bf16.
+        precision="bfloat16",
     )
     # Force dynamic_batching off so the seq-packing path is taken.
     config["dynamic_batching"]["enabled"] = False
+    # LMPolicy reads config["make_sequence_length_divisible_by"] and
+    # config["sequence_packing"]["algorithm"] when seq packing is enabled;
+    # create_test_config doesn't set either. Fill in production defaults.
+    config["make_sequence_length_divisible_by"] = 1
+    config["sequence_packing"]["algorithm"] = "modified_first_fit_decreasing"
+    config["sequence_packing"]["sequence_length_round"] = 64
+    config["sequence_packing"]["logprob_mb_tokens"] = config["sequence_packing"][
+        "train_mb_tokens"
+    ]
 
     data = create_test_batch(
         batch_size=config["train_global_batch_size"],
@@ -226,7 +258,7 @@ def test_split_train_step_parity_seq_packing(
     loss_fn = SimpleLossFn()
 
     policy_sync = Policy(
-        tokenizer=None,
+        tokenizer=get_tokenizer(config["tokenizer"]),
         config=config,
         init_optimizer=True,
         init_reference_model=False,
@@ -241,7 +273,7 @@ def test_split_train_step_parity_seq_packing(
         policy_sync.shutdown()
 
     policy_split = Policy(
-        tokenizer=None,
+        tokenizer=get_tokenizer(config["tokenizer"]),
         config=config,
         init_optimizer=True,
         init_reference_model=False,
@@ -302,7 +334,7 @@ def test_split_state_machine_lifecycle(
         dtensor_v2=dtensor_v2,
     )
     policy = Policy(
-        tokenizer=None,
+        tokenizer=get_tokenizer(config["tokenizer"]),
         config=config,
         init_optimizer=True,
         init_reference_model=False,
