@@ -1817,8 +1817,8 @@ def grpo_train(
 
     if master_config.data["use_multiple_dataloader"]:
         warnings.warn(
-            "When using multiple dataloaders, MultipleDataloaderWrapper operates as an infinite iterator. "
-            "As a result, grpo.max_num_epochs will be ignored, and only grpo.max_num_steps will be used. "
+            "When using multiple dataloaders, MultipleDataloaderWrapper operates as an infinite iterator."
+            "As a result, grpo.max_num_epochs will be ignored, and only grpo.max_num_steps will be used."
             "See https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/grpo.md#multiple-dataloaders for more details."
         )
 
