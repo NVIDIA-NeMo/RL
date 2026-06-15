@@ -74,7 +74,7 @@ env:
   vlm:
     num_workers: 8
     reward_functions:
-    - name: exact_alnum_with_fallback
+    - name: exact_alnum
       weight: 1.0
 
 cluster:

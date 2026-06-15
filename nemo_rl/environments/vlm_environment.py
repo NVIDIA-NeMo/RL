@@ -33,7 +33,6 @@ from nemo_rl.environments.rewards import (
     bbox_giou_reward,
     combine_reward_functions,
     exact_answer_alphanumeric_reward,
-    exact_answer_alphanumeric_with_fallback_reward,
     format_reward,
     math_expression_reward,
 )
@@ -73,8 +72,6 @@ class VLMVerifyWorker:
                 reward_func = format_reward
             elif reward_func_name == "exact_alnum":
                 reward_func = exact_answer_alphanumeric_reward
-            elif reward_func_name == "exact_alnum_with_fallback":
-                reward_func = exact_answer_alphanumeric_with_fallback_reward
             elif reward_func_name == "math_expr":
                 reward_func = math_expression_reward
             elif reward_func_name == "bbox_giou":
