@@ -36,6 +36,7 @@ from nemo_rl.algorithms.single_controller_utils import (
     SingleControllerBundle,
 )
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollout_manager import RolloutManager
 
 # Reuse fixtures from the experience tests; same shape as test_async_rollout_manager.
@@ -193,13 +194,13 @@ def test_rollout_pump_writes_expected_tq_data(
             max_buffered_rollouts=max_rollout_prompts,
         ),
     )
-    # SingleControllerActor expects a StatefulDataLoader, but the pump only
-    # iterates it (`for prompt in self._dataloader`), so any iterable works.
-    dataloader = [input_sample] * max_rollout_prompts
+    # Wrap each value in a single-element list so size==1 and v[0] returns the original field.
+    batched_sample = BatchedDataDict({k: [v] for k, v in input_sample.items()})
+    dataloader = [batched_sample] * max_rollout_prompts
 
     tq_buffer = TQReplayBuffer(
         dp_adapter,
-        partition_id=mc.partition_id,
+        partition_id=_PARTITION_ID,
         pad_value_dict={"token_ids": int(tokenizer.pad_token_id or 0)},
     )
     rollout_manager = RolloutManager(

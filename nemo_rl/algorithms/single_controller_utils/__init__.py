@@ -22,7 +22,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 )
 from nemo_rl.algorithms.single_controller_utils.setup import (
     SingleControllerBundle,
-    setup,
+    setup_single_controller,
 )
 
 __all__ = [
@@ -31,5 +31,5 @@ __all__ = [
     "MasterConfig",
     "SingleControllerBundle",
     "WeightSyncConfig",
-    "setup",
+    "setup_single_controller",
 ]

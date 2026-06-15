@@ -48,7 +48,7 @@ from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
 
 @dataclass
 class SingleControllerBundle:
-    """All inputs SingleControllerActor needs, built driver-side by setup().
+    """All inputs SingleControllerActor needs, built driver-side by setup_single_controller().
 
     Passed as a single arg to SingleControllerActor.remote so the actor's __init__ does
     no construction work — every heavy object is cloudpickled in.
@@ -225,7 +225,7 @@ def _maybe_inject_megatron_train_iters(
     )
 
 
-def setup(
+def setup_single_controller(
     master_config: MasterConfig,
     tokenizer: PreTrainedTokenizerBase,
     *,

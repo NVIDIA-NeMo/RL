@@ -1,9 +1,10 @@
-"""Unit tests for nemo_rl.algorithms.single_controller_utils.setup.
+"""Unit tests for setup_single_controller.
 
-setup is heavy (it spins up Ray clusters, TQPolicy, generation backend, ...) so it's
-exercised through monkey-patching rather than as a real e2e — the unit tests cover the
-shape of the contract, not the underlying initialization. The full path is covered by
-the functional test at tests/functional/grpo_dp_single_controller.sh.
+setup_single_controller is heavy (it spins up Ray clusters, TQPolicy, generation
+backend, ...) so it's exercised through monkey-patching rather than as a real e2e —
+the unit tests cover the shape of the contract, not the underlying initialization.
+The full path is covered by the functional test at
+tests/functional/grpo_dp_single_controller.sh.
 """
 
 from __future__ import annotations
@@ -12,12 +13,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import nemo_rl.algorithms.single_controller_utils.setup as sc_setup_mod
+from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.single_controller_utils import (
     MasterConfig,
     SingleControllerBundle,
-    setup,
+    setup_single_controller,
 )
-from nemo_rl.algorithms.single_controller_utils import setup as setup_module
 
 
 def _make_master_config(
@@ -61,6 +63,7 @@ def _make_master_config(
                 "colocated": {"enabled": colocated, "resources": {}},
             },
         },
+        loss_fn=ClippedPGLossConfig(),
         env=env if env is not None else {},
     )
 
@@ -80,17 +83,17 @@ def patched_factories():
 
     with (
         patch.object(
-            setup_module,
+            sc_setup_mod,
             "setup_response_data",
             return_value=(fake_dataset, None, fake_env_handles, {}),
         ) as mock_setup_response,
         patch.object(
-            setup_module,
+            sc_setup_mod,
             "StatefulDataLoader",
             return_value=fake_dataloader,
         ) as mock_dataloader,
         patch.object(
-            setup_module,
+            sc_setup_mod,
             "_build_clusters",
             return_value=(
                 MagicMock(name="train_cluster"),
@@ -98,31 +101,31 @@ def patched_factories():
             ),
         ) as mock_clusters,
         patch.object(
-            setup_module, "_build_generation", return_value=MagicMock(name="gen")
+            sc_setup_mod, "_build_generation", return_value=MagicMock(name="gen")
         ) as mock_gen,
         patch.object(
-            setup_module, "_build_trainer", return_value=MagicMock(name="policy")
+            sc_setup_mod, "_build_trainer", return_value=MagicMock(name="policy")
         ) as mock_trainer,
         patch.object(
-            setup_module,
+            sc_setup_mod,
             "build_data_plane_client",
             return_value=MagicMock(name="dp_client"),
         ) as mock_dp_client,
         patch.object(
-            setup_module,
+            sc_setup_mod,
             "create_weight_synchronizer",
             return_value=MagicMock(name="weight_sync"),
         ) as mock_weight_sync,
         patch.object(
-            setup_module,
+            sc_setup_mod,
             "_create_advantage_estimator",
             return_value=MagicMock(name="adv"),
         ) as mock_adv,
         patch.object(
-            setup_module, "ClippedPGLossFn", return_value=MagicMock(name="loss_fn")
+            sc_setup_mod, "ClippedPGLossFn", return_value=MagicMock(name="loss_fn")
         ) as mock_loss,
         patch.object(
-            setup_module,
+            sc_setup_mod,
             "_generation_max_seq_len",
             return_value=32,
         ),
@@ -148,18 +151,18 @@ class TestSetup:
     def test_raises_when_data_plane_disabled(self):
         mc = _make_master_config(dp_enabled=False)
         with pytest.raises(ValueError, match="data_plane.enabled=True"):
-            setup(mc, MagicMock())
+            setup_single_controller(mc, MagicMock())
 
     def test_multiple_dataloader_not_supported(self):
         mc = _make_master_config(use_multiple_dataloader=True)
         with pytest.raises(NotImplementedError, match="use_multiple_dataloader"):
-            setup(mc, MagicMock(pad_token_id=0))
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
 
     def test_returns_bundle(self, patched_factories):
         mc = _make_master_config(colocated=True)
         tokenizer = MagicMock(pad_token_id=0)
 
-        bundle = setup(mc, tokenizer)
+        bundle = setup_single_controller(mc, tokenizer)
 
         assert isinstance(bundle, SingleControllerBundle)
         assert bundle.gen_handle is patched_factories["_build_generation"].return_value
@@ -192,7 +195,7 @@ class TestSetup:
         math_env_cfg = {"some": "value"}
         mc = _make_master_config(env={"math": math_env_cfg})
 
-        bundle = setup(mc, MagicMock(pad_token_id=0))
+        bundle = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         _, call_kwargs = patched_factories["setup_response_data"].call_args
         assert call_kwargs["env_configs"] == {"math": math_env_cfg}
@@ -203,7 +206,7 @@ class TestSetup:
         mc = _make_master_config(colocated=False, backend="vllm")
         tokenizer = MagicMock(pad_token_id=0)
 
-        setup(mc, tokenizer)
+        setup_single_controller(mc, tokenizer)
 
         _, factory_kwargs = patched_factories["create_weight_synchronizer"].call_args
         assert (
@@ -220,7 +223,7 @@ class TestSetup:
         mc = _make_master_config()
         tokenizer = MagicMock(pad_token_id=7)
 
-        bundle = setup(mc, tokenizer, partition_id="custom_partition")
+        bundle = setup_single_controller(mc, tokenizer, partition_id="custom_partition")
 
         assert bundle.partition_id == "custom_partition"
         assert bundle.tq_buffer._partition_id == "custom_partition"
@@ -237,7 +240,7 @@ class TestSetup:
             max_num_epochs=1,
         )
         # patched dataloader has len() == 4, so the min picks max_num_steps.
-        setup(mc, MagicMock(pad_token_id=0))
+        setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         assert mc.policy["megatron_cfg"]["train_iters"] == 2
 
@@ -249,12 +252,12 @@ class TestSetup:
             max_num_epochs=2,
         )
         # patched dataloader has len() == 4 → 2 * 4 = 8 < 1000.
-        setup(mc, MagicMock(pad_token_id=0))
+        setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         assert mc.policy["megatron_cfg"]["train_iters"] == 8
 
     def test_megatron_train_iters_not_set_when_disabled(self, patched_factories):
         mc = _make_master_config(megatron_enabled=False)
-        setup(mc, MagicMock(pad_token_id=0))
+        setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         assert "train_iters" not in mc.policy.get("megatron_cfg", {})

@@ -14,7 +14,7 @@
 
 """Async GRPO launcher driven by the SingleController actor.
 
-Builds the full SC bundle driver-side via single_controller_utils.setup and hands it
+Builds the full SC bundle driver-side via setup_single_controller and hands it
 to SingleControllerActor. Mirrors run_grpo.py for config loading so the same YAML
 files apply. data_plane.enabled=true is mandatory.
 """
@@ -27,7 +27,10 @@ import ray
 from omegaconf import OmegaConf
 
 from nemo_rl.algorithms.single_controller import SingleControllerActor
-from nemo_rl.algorithms.single_controller_utils import MasterConfig, setup
+from nemo_rl.algorithms.single_controller_utils import (
+    MasterConfig,
+    setup_single_controller,
+)
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.models.generation import configure_generation_config
@@ -104,7 +107,7 @@ def main() -> None:
         has_refit_draft_weights=has_refit_draft_weights,
     )
 
-    bundle = setup(config, tokenizer)
+    bundle = setup_single_controller(config, tokenizer)
 
     print("🚀 Launching SingleControllerActor")
     sc = SingleControllerActor.remote(master_config=config, bundle=bundle)
