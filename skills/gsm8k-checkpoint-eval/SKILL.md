@@ -32,10 +32,10 @@ For diffuGRPO/native NeMo-RL checkpoints, set the same uv tag/env/cache family u
 ```bash
 cd /home/snorouzi/diffusion_RL/RL
 
-ENV_TAG=diffu_grpo \
+ENV_TAG=mb_3rdparty_sglagn_local_fork \
 UV_PROJECT_ENVIRONMENT=/lustre/fsw/portfolios/coreai/users/snorouzi/nemorl_uv_driver_envs/diffusion_RL_RL_diffu_grpo \
 UV_CACHE_DIR=/lustre/fsw/portfolios/coreai/users/snorouzi/uv_cache_diffu_grpo \
-NEMOTRON_UV_PROJECT_ENVIRONMENT=/lustre/fsw/portfolios/coreai/users/snorouzi/nemorl_uv_driver_envs/diffusion_RL_RL_diffu_grpo \
+NEMOTRON_UV_PROJECT_ENVIRONMENT=/lustre/fsw/portfolios/coreai/users/snorouzi/nemorl_uv_driver_envs/diffusion_RL_RL_mb_3rdparty_sglagn_local_fork \
 NEMOTRON_UV_CACHE_DIR=/lustre/fsw/portfolios/coreai/users/snorouzi/uv_cache_diffu_grpo \
 NEMOTRON_HF_HOME=/lustre/fsw/portfolios/coreai/users/snorouzi/hf_home \
 STEP_DIR=/path/to/run/checkpoints/step_N \
@@ -72,17 +72,7 @@ ls -l "${OUT}"/config.json \
 
 ## Step 2: Evaluate Converted Checkpoint
 
-Default evaluation uses the NemoSkills pipeline in the `yonggon-rl` clone:
-
-```bash
-cd /home/snorouzi/code/yonggon-rl
-```
-
-Use `xp/examples/run_llada_eval_pipeline_gpu_only.sh`. This starts the Nemotron/LLaDA API server, runs the NemoSkills client against `localhost:8000/v1`, and writes a generated `.gpu_only_cmd_*.sh` script into the output directory for exact reruns.
-
-Set `SERVER_MODEL_PATH` to the converted Hugging Face checkpoint directory from Step 1. Set `SERVER_TOKENIZER` to the known 3B base checkpoint/tokenizer path, not to the raw `step_N` Megatron checkpoint directory.
-
-Important path rule for NemoSkills: use the canonical `/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/snorouzi/...` path family for `SERVER_MODEL_PATH`, `SERVER_TOKENIZER`, and `SEQ_EVAL_OUTPUT_DIR`. The shorter `/lustre/fsw/portfolios/coreai/users/snorouzi/...` path may resolve correctly on the login node, but the NemoSkills container can fail to load an otherwise valid HF checkpoint from that path with an error like "Can't load the configuration".
+Default evaluation must be standlone No-Ray NemoRL validation.
 
 ### 1. Standalone No-Ray NeMoRL Validation Replication
 
@@ -145,6 +135,12 @@ The wrapper uses `/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_llm/users
 If a converted HF checkpoint is a symlink-heavy directory and fails inside the container with a missing custom-code file such as `configuration_ministral_dlm.py`, create an eval-only materialized copy with real files and the intended `config.json`, then point `CKPT` at that materialized directory. Do not patch the original converted checkpoint in place unless the user explicitly asks.
 
 ### 2. GSM8K NemoSkills Diffusion Eval
+
+Use `xp/examples/run_llada_eval_pipeline_gpu_only.sh`. This starts the Nemotron/LLaDA API server, runs the NemoSkills client against `localhost:8000/v1`, and writes a generated `.gpu_only_cmd_*.sh` script into the output directory for exact reruns.
+
+Set `SERVER_MODEL_PATH` to the converted Hugging Face checkpoint directory from Step 1. Set `SERVER_TOKENIZER` to the known 3B base checkpoint/tokenizer path, not to the raw `step_N` Megatron checkpoint directory.
+
+Important path rule for NemoSkills: use the canonical `/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/snorouzi/...` path family for `SERVER_MODEL_PATH`, `SERVER_TOKENIZER`, and `SEQ_EVAL_OUTPUT_DIR`. The shorter `/lustre/fsw/portfolios/coreai/users/snorouzi/...` path may resolve correctly on the login node, but the NemoSkills container can fail to load an otherwise valid HF checkpoint from that path with an error like "Can't load the configuration".
 
 ```bash
 HF_MODEL=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/snorouzi/checkpoints/<name>_step_N_hf
