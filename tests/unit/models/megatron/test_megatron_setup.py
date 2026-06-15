@@ -1094,6 +1094,89 @@ class TestApplyPerformanceConfig:
 
 
 @pytest.mark.mcore
+class TestApplyMcoreConfigOverrides:
+    """Tests for _apply_mcore_config_overrides function."""
+
+    def test_applies_requested_overrides_and_logs_effective_values(self, capsys):
+        from nemo_rl.models.megatron.setup import _apply_mcore_config_overrides
+
+        config = {
+            "megatron_cfg": {
+                "dsa_indexer_rope_interleaved": True,
+                "dsa_indexer_rotate_activation": False,
+                "dsa_indexer_k_norm_epsilon": 1.0e-6,
+                "dsa_kernel_backend": "tilelang",
+                "dsa_indexer_loss_coeff": 0.0,
+                "dsa_indexer_use_sparse_loss": False,
+                "deallocate_pipeline_outputs": True,
+                "persist_layer_norm": True,
+                "bias_dropout_fusion": True,
+            }
+        }
+        model_cfg = SimpleNamespace(
+            dsa_indexer_rope_interleaved=False,
+            dsa_indexer_rotate_activation=True,
+            dsa_indexer_k_norm_epsilon=None,
+            dsa_kernel_backend="none",
+            dsa_indexer_loss_coeff=None,
+            dsa_indexer_use_sparse_loss=True,
+            moe_router_dtype="fp32",
+            moe_shared_expert_overlap=False,
+            gradient_accumulation_fusion=True,
+            moe_permute_fusion=True,
+            moe_grouped_gemm=True,
+            bias_activation_fusion=True,
+            cp_comm_type="all_gather",
+            deallocate_pipeline_outputs=False,
+            persist_layer_norm=False,
+            bias_dropout_fusion=False,
+        )
+
+        applied = _apply_mcore_config_overrides(model_cfg, config, rank=0)
+
+        assert applied is True
+        assert model_cfg.dsa_indexer_rope_interleaved is True
+        assert model_cfg.dsa_indexer_rotate_activation is False
+        assert model_cfg.dsa_indexer_k_norm_epsilon == 1.0e-6
+        assert model_cfg.dsa_kernel_backend == "tilelang"
+        assert model_cfg.dsa_indexer_loss_coeff == 0.0
+        assert model_cfg.dsa_indexer_use_sparse_loss is False
+        assert model_cfg.deallocate_pipeline_outputs is True
+        assert model_cfg.persist_layer_norm is True
+        assert model_cfg.bias_dropout_fusion is True
+
+        captured = capsys.readouterr()
+        assert "Effective MCore config overrides at rank 0" in captured.out
+        assert "dsa_kernel_backend='tilelang'" in captured.out
+        assert "cp_comm_type='all_gather'" in captured.out
+
+    def test_returns_false_when_no_overrides_are_set(self, capsys):
+        from nemo_rl.models.megatron.setup import _apply_mcore_config_overrides
+
+        model_cfg = SimpleNamespace()
+
+        applied = _apply_mcore_config_overrides(
+            model_cfg, {"megatron_cfg": {}}, rank=0
+        )
+
+        assert applied is False
+        assert capsys.readouterr().out == ""
+
+    def test_missing_model_config_field_raises(self):
+        from nemo_rl.models.megatron.setup import _apply_mcore_config_overrides
+
+        config = {
+            "megatron_cfg": {
+                "dsa_kernel_backend": "tilelang",
+            }
+        }
+        model_cfg = SimpleNamespace()
+
+        with pytest.raises(ValueError, match="not present on this model config"):
+            _apply_mcore_config_overrides(model_cfg, config, rank=0)
+
+
+@pytest.mark.mcore
 class TestValidateOptimizerConfig:
     """Tests for _validate_optimizer_config function."""
 
@@ -1584,6 +1667,7 @@ class TestSetupModelConfig:
         "nemo_rl.models.megatron.setup._validate_chunking_config",
         "nemo_rl.models.megatron.setup._validate_optimizer_config",
         "nemo_rl.models.megatron.setup._validate_dtype_config",
+        "nemo_rl.models.megatron.setup._apply_mcore_config_overrides",
         "nemo_rl.models.megatron.setup._apply_performance_config",
         "nemo_rl.models.megatron.setup._apply_precision_config",
         "nemo_rl.models.megatron.setup._apply_mtp_config",
@@ -1598,6 +1682,8 @@ class TestSetupModelConfig:
             name = target.rsplit(".", 1)[-1]
             p = patch(target)
             mocks[name] = p.start()
+            if name == "_apply_mcore_config_overrides":
+                mocks[name].return_value = False
             request.addfinalizer(p.stop)
         return mocks
 
