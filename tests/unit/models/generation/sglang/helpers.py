@@ -32,39 +32,6 @@ import os
 # shared host other processes may already hold memory on some of our GPUs.
 os.environ.setdefault("SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK", "false")
 
-# ---------------------------------------------------------------------------
-# Stub heavy modules NOT installed in the sglang test environment.
-# sglang is NOT stubbed — we test against a real server.
-# ---------------------------------------------------------------------------
-import importlib.machinery
-import sys
-from unittest.mock import MagicMock
-
-_STUB_MODULES = [
-    "decord",
-    "vllm",
-    "vllm.sampling_params",
-    "vllm.lora",
-    "vllm.lora.request",
-    "wandb",
-    # TE meta package raises RuntimeError on import in this venv; stub to
-    # bypass so the sglang import chain can complete without real TE.
-    "transformer_engine",
-    "transformer_engine.common",
-    "transformer_engine.pytorch",
-]
-for _mod in _STUB_MODULES:
-    if _mod in sys.modules:
-        continue
-    stub = MagicMock()
-    # importlib.util.find_spec requires __spec__ to be a real ModuleSpec.
-    stub.__spec__ = importlib.machinery.ModuleSpec(_mod, loader=None)
-    stub.__name__ = _mod
-    sys.modules[_mod] = stub
-
-# ---------------------------------------------------------------------------
-# nemo_rl imports — must come after the stub install above.
-# ---------------------------------------------------------------------------
 import ray
 
 from nemo_rl.models.generation.sglang.sglang_worker import SGLangGenerationWorker
