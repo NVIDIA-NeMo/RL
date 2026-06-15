@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -1237,7 +1237,11 @@ class MegatronPolicyWorkerImpl(
         if mtp_num_layers is not None and mtp_num_layers > 0:
             from nemo_rl.models.megatron.common import get_mtp_metrics
 
+            # MTP layers live only on the last pipeline stage, so the tracker is
+            # populated there alone. Broadcast to all stages so downstream metric
+            # aggregation (which reads rank 0's results) sees them when PP > 1.
             mtp_metrics = get_mtp_metrics()
+            mtp_metrics = broadcast_loss_metrics_from_last_stage(mtp_metrics)
             if mtp_metrics:
                 metrics["mtp_metrics"] = mtp_metrics
 

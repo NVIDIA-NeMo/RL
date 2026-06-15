@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -58,6 +58,8 @@ class ProcessedMicrobatch:
         position_ids: Position IDs tensor (None for packed sequences)
         packed_seq_params: PackedSeqParams for sequence packing (None if not packing)
         cu_seqlens_padded: Padded cumulative sequence lengths (None if not packing)
+        mtp_loss_mask: Pre-computed MTP loss mask (token_mask × sample_mask).
+            None when MTP is disabled or token/sample masks are absent.
     """
 
     data_dict: BatchedDataDict[Any]
@@ -269,6 +271,12 @@ def process_microbatch(
             seq_lengths = data_dict[seq_length_key]
 
             if delegate_pack_to_model:
+                # The VLM packing path does not pack or propagate mtp_loss_mask,
+                # so MTP training would be silently dropped here. Fail loudly
+                # instead of producing wrong results.
+                assert "mtp_loss_mask" not in data_dict, (
+                    "MTP training is not supported with VLM sequence packing"
+                )
                 # VLM path: model (e.g. mbridge Qwen3VL) does its own
                 # preprocess_packed_seqs; NeMo-RL must NOT pre-pack + CP-shard,
                 # or the double-processing produces shape mismatches downstream

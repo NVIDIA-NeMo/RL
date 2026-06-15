@@ -283,10 +283,14 @@ class TestProcessMicrobatch:
         """With packing, mtp_loss_mask is packed like input_ids and propagated."""
         from nemo_rl.models.megatron.data import process_microbatch
 
-        packed = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]])
+        # Distinct tensors at index 0 and 1 so the assertion below can catch an
+        # off-by-one read (the implementation must take index 1, the CP-sharded
+        # packed tensor, not index 0).
+        packed_idx0 = torch.zeros(1, 8, dtype=torch.long)
+        packed_idx1 = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]])
         mock_pack.return_value = (
-            packed,
-            packed,
+            packed_idx0,
+            packed_idx1,
             MagicMock(),
             torch.tensor([0, 5, 8], dtype=torch.int32),
             torch.tensor([0, 5, 8], dtype=torch.int32),
@@ -313,7 +317,7 @@ class TestProcessMicrobatch:
         assert mock_pack.call_count == 2
         # mtp_loss_mask takes the packed tensor (index 1 of the pack return tuple).
         assert result.mtp_loss_mask is not None
-        assert torch.equal(result.mtp_loss_mask, packed)
+        assert torch.equal(result.mtp_loss_mask, packed_idx1)
 
     def test_process_microbatch_packing_requires_seq_length_key(self):
         """Test that packing requires seq_length_key."""
