@@ -64,13 +64,9 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.megatron_cfg.context_parallel_size=1 \
     policy.megatron_cfg.sequence_parallel=false \
     policy.generation.backend=megatron \
+    policy.generation.mcore_generation_config.async_engine=true \
     policy.generation.mcore_generation_config.expose_http_server=true \
     policy.generation.mcore_generation_config.enable_prefix_caching=true \
-    policy.generation.mcore_generation_config.tensor_model_parallel_size=1 \
-    policy.generation.mcore_generation_config.pipeline_model_parallel_size=1 \
-    policy.generation.mcore_generation_config.expert_model_parallel_size=1 \
-    policy.generation.mcore_generation_config.context_parallel_size=1 \
-    policy.generation.mcore_generation_config.sequence_parallel=false \
     policy.max_total_sequence_length=512 \
     policy.generation.max_new_tokens=128 \
     policy.generation.colocated.enabled=false \
