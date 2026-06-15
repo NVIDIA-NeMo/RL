@@ -351,9 +351,7 @@ class SingleControllerActor:
         ``_reap_in_flight_nonblocking`` can surface exceptions promptly
         (fast-fail) without blocking the loop.
         """
-        refresh_policy_logprobs = (
-            self._cfg.advantage_policy_logprobs_field is not None
-        )
+        refresh_policy_logprobs = self._cfg.advantage_policy_logprobs_field is not None
         refresh_reference_logprobs = (
             self._cfg.advantage_reference_logprobs_field is not None
         )
@@ -460,9 +458,7 @@ class SingleControllerActor:
                     await self._ray_get(fut)
 
                 if not step_open:
-                    log.info(
-                        "train_pump: rollout exhausted before any group ready"
-                    )
+                    log.info("train_pump: rollout exhausted before any group ready")
                     break
 
                 # finish_train_step returns step metrics; SC ignores them for
@@ -470,9 +466,7 @@ class SingleControllerActor:
                 # owned (workers don't emit it) and bumps after this call
                 # returns successfully (see below). The new value propagates
                 # to rollouts via _sync_weights below.
-                await self._ray_get(
-                    self._trainer.finish_train_step.remote(step_id)
-                )
+                await self._ray_get(self._trainer.finish_train_step.remote(step_id))
             except Exception:
                 # Worker may be left with a half-open step (train_microbatch
                 # partially mutated _train_step_state, or begin/finish itself
@@ -487,8 +481,7 @@ class SingleControllerActor:
                         )
                     except Exception:
                         log.exception(
-                            "abort_train_step failed during error recovery "
-                            "(step=%s)",
+                            "abort_train_step failed during error recovery (step=%s)",
                             step_id,
                         )
                 self._step_consumed_sample_ids = []
@@ -581,9 +574,7 @@ class SingleControllerActor:
         )
 
         prompt_ids = _tensor_field(data, PROMPT_IDS_FIELD)
-        rewards = _squeeze_trailing_unit_dim(
-            _tensor_field(data, REWARD_FIELD)
-        ).float()
+        rewards = _squeeze_trailing_unit_dim(_tensor_field(data, REWARD_FIELD)).float()
         token_mask = _tensor_field(data, TOKEN_MASK_FIELD).float()
         sample_mask = _squeeze_trailing_unit_dim(
             _tensor_field(data, SAMPLE_MASK_FIELD)
