@@ -318,6 +318,10 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
         self.megatron_cfg.validate()
 
         # Step 4: Setup Megatron model and components
+        # The value head is an independent hidden->1 head, not tied to the input
+        # embedding. Untie before building so PP>1 does not set up an embedding/
+        # output-weight grad all-reduce that mismatches the [1, hidden] head and hangs.
+        self.megatron_cfg.model.share_embeddings_and_output_weights = False
         # Replace output_layer with a hidden->1 value head before DDP wrapping, so grad
         # sync, the optimizer, dist-checkpoint save/load, PP, and SP are all inherited.
         value_head_hook = make_value_head_hook(
