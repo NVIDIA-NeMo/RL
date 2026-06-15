@@ -109,8 +109,3 @@ sbatch \
 ```
 
 To run on a different node count, change `NUM_NODES` and the `--nodes` flag.
-
-## Caveats
-
-- **vLLM kernel config.** Both configs disable the flashinfer MoE autotuner and force the triton MoE backend (`kernel_config: {enable_flashinfer_autotune: false, moe_backend: triton}`). Tactic 36 of the flashinfer autotuner fails with "Invalid activation type" on V3 + bf16 + tp=8, leaving the GPU in a bad state and causing a CUDA illegal-instruction during generation post-refit. `enable_prefix_caching: false` is also set so cached KV from old weights can't leak into the next step.
-- **`NRL_MAMBA_PREFILL_DECODE_SYNC=1`.** Required for Nemotron-Omni on vLLM 0.20. The flag triggers a runtime patch in `nemo_rl/models/generation/vllm/vllm_worker.py` that inserts `torch.cuda.synchronize()` between Mamba2 SSM-state writeback (prefill) and the decode read in the same step. Without it, the prefill→decode handoff produces an async CUDA fault. This is a narrow fence — unlike `CUDA_LAUNCH_BLOCKING`, it doesn't serialize all kernels.
