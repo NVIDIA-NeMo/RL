@@ -581,12 +581,6 @@ class AsyncNemoGymRolloutImpl:
         return rollout_metrics
 
 
-# TODO(SC):
-#   1. Turn RolloutManager into a Ray actor.
-#   2. Keep policy_generation driver-constructed and pass it in (don't
-#      build it inside the rollout actor — avoids nested Ray actors).
-#   3. Construct the rollout actor in setup_single_controller and
-#      drop the inline RolloutManager construction there.
 class RolloutManager:
     """Routes to AsyncRolloutImpl (native async) or AsyncNemoGymRolloutImpl (NeMo-Gym), and pushes results to a TQReplayBuffer."""
 
@@ -645,7 +639,7 @@ class RolloutManager:
         return await self._impl.run_rollout(input_sample)
 
     async def generate_and_push(self, input_sample: DatumSpec) -> None:
-        """Run one prompt's rollout and write the N completions through the buffer.
+        """Reserve a buffer slot, run one prompt's rollout, then commit the slot.
 
         Args:
             input_sample: A single prompt (one DatumSpec entry).
@@ -653,6 +647,15 @@ class RolloutManager:
         assert self._tq_buffer is not None, (
             "generate_and_push requires tq_buffer to be set at __init__"
         )
+        start_version = self._weight_version
+        group_id = self._tq_buffer.reserve(weight_version=start_version)
+
         record = await self.run_rollout(input_sample)
-        # TODO @yukih: record start and end weight version of the rollout instead of just end
-        await self._tq_buffer.add(record, weight_version=self._weight_version)
+        end_version = self._weight_version
+
+        await self._tq_buffer.commit(
+            group_id,
+            record,
+            start_weight_version=start_version,
+            end_weight_version=end_version,
+        )
