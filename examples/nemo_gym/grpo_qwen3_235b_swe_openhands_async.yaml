@@ -27,6 +27,14 @@ grpo:
   overlong_filtering: true          # zero loss for trajectories truncated at 80k
   max_val_samples: null             # gym requires null; inferred from val dataset size
   val_batch_size: null              # set at runtime to len(val dataset)
+  # DETERMINISTIC VALIDATION: the gym path always passes greedy=False, so val is normally
+  # sampled (temperature 1.0) -> noisy val curve. validation_generation temporarily overrides
+  # sampling params to temperature 0 (greedy) during validation only; training rollouts keep
+  # policy.generation (temp 1.0). The temp flows into the gym's responses_create_params, so the
+  # OpenHands agent issues temp-0 chat completions -> identical val rollouts across runs.
+  validation_generation:
+    temperature: 0.0
+    top_p: 1.0
   use_dynamic_sampling: false
   dynamic_sampling_max_gen_batches: 10
   batch_multiplier: 1

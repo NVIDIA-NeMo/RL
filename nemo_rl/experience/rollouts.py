@@ -53,6 +53,54 @@ from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
 
+_NEMO_RL_REQUEST_TYPE_METADATA_KEY = "_nemo_rl_request_type"
+_NEMO_RL_VALIDATION_REQUEST_TYPE = "validation"
+_NEMO_GYM_CHAT_TEMPLATE_KWARGS_METADATA_KEY = "chat_template_kwargs"
+
+
+def _get_nemo_gym_chat_template_kwargs(metadata: dict[str, Any]) -> dict[str, Any]:
+    chat_template_kwargs_str = metadata.get(
+        _NEMO_GYM_CHAT_TEMPLATE_KWARGS_METADATA_KEY, "{}"
+    )
+    assert isinstance(chat_template_kwargs_str, str), (
+        "NeMo-Gym responses_create_params.metadata.chat_template_kwargs must be a JSON string."
+    )
+
+    chat_template_kwargs = json.loads(chat_template_kwargs_str)
+    assert isinstance(chat_template_kwargs, dict), (
+        "NeMo-Gym responses_create_params.metadata.chat_template_kwargs must decode to a dict."
+    )
+    return chat_template_kwargs
+
+
+def _set_nemo_rl_request_type(
+    responses_create_params: dict[str, Any], request_type: str | None
+) -> None:
+    metadata = responses_create_params.get("metadata") or {}
+    assert isinstance(metadata, dict), (
+        "NeMo-Gym responses_create_params.metadata must be a dict."
+    )
+    metadata = dict(metadata)
+    metadata.pop(_NEMO_RL_REQUEST_TYPE_METADATA_KEY, None)
+
+    chat_template_kwargs = _get_nemo_gym_chat_template_kwargs(metadata)
+    if request_type is None:
+        chat_template_kwargs.pop(_NEMO_RL_REQUEST_TYPE_METADATA_KEY, None)
+    else:
+        chat_template_kwargs[_NEMO_RL_REQUEST_TYPE_METADATA_KEY] = request_type
+
+    if chat_template_kwargs:
+        metadata[_NEMO_GYM_CHAT_TEMPLATE_KWARGS_METADATA_KEY] = json.dumps(
+            chat_template_kwargs
+        )
+    else:
+        metadata.pop(_NEMO_GYM_CHAT_TEMPLATE_KWARGS_METADATA_KEY, None)
+
+    if metadata:
+        responses_create_params["metadata"] = metadata
+    else:
+        responses_create_params.pop("metadata", None)
+
 
 def generate_responses(
     policy_generation: GenerationInterface,
@@ -1090,6 +1138,7 @@ def run_async_nemo_gym_rollout(
     max_seq_len: Optional[int] = None,
     max_rollout_turns: Optional[int] = None,
     greedy: bool = False,
+    mark_validation_request: bool = False,
 ) -> AsyncNemoGymRolloutResult:
     """Run multi-turn rollouts with NeMo-Gym. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters."""
     # We leverage the same `extra_env_info` key as `run_async_multi_turn_rollout`.
@@ -1126,6 +1175,13 @@ def run_async_nemo_gym_rollout(
         responses_create_params = row["responses_create_params"]
         responses_create_params["temperature"] = generation_config["temperature"]
         responses_create_params["top_p"] = generation_config["top_p"]
+
+        if mark_validation_request:
+            _set_nemo_rl_request_type(
+                responses_create_params, _NEMO_RL_VALIDATION_REQUEST_TYPE
+            )
+        else:
+            _set_nemo_rl_request_type(responses_create_params, None)
 
         # Configure max_output_tokens to respect the max_new_tokens setting.
         # vllm_worker_async._clamp_max_tokens further clamps it so input + output <= max_model_len.
