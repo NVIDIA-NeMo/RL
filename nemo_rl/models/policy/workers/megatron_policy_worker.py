@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import copy
 import gc
 import os
 import re
@@ -42,6 +43,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.utils import get_model_config
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
@@ -66,6 +68,7 @@ from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_obj_from_pp_rank,
     broadcast_tensors_from_last_stage,
 )
+from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.megatron.setup import (
     finalize_megatron_setup,
     handle_model_import,
@@ -86,6 +89,7 @@ from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
     LogprobOutputSpec,
+    ReferenceLogprobOutputSpec,
 )
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
@@ -93,8 +97,46 @@ from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+from nemo_rl.utils.r3_trace import maybe_r3_trace_stage
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+
+
+def _should_use_router_replay(
+    *,
+    enabled: bool,
+    data: BatchedDataDict[Any],
+    stage: str,
+    require: bool,
+) -> bool:
+    if not enabled or not require:
+        return False
+    if "routed_experts" in data:
+        return True
+    raise RuntimeError(
+        "policy.router_replay.enabled=true requires routed_experts for "
+        f"{stage}, but the fetched batch does not contain that field. This "
+        "usually means the TQ schema, field selection, or rollout write path "
+        "stopped carrying routed_experts. Reference-logprob intentionally skips "
+        "routed_experts; prev-logprob and train must not."
+    )
+
+
+def _model_self_packs_for_cp(model: Any) -> bool:
+    """Whether the model packs sequences + CP-shards inside its own forward.
+
+    Such models (mbridge VLM wrappers) call ``preprocess_packed_seqs`` in their
+    forward, so NeMo-RL must hand them an unpacked ``[B, S]`` batch instead of
+    pre-packing + CP-sharding itself. The only such model today is mbridge's
+    Qwen3VL, which is also the only mbridge VLM that supports context
+    parallelism; classic mcore GPTModel and other VLMs do not self-pack.
+    """
+    from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
+    from megatron.core.utils import unwrap_model
+
+    unwrapped = unwrap_model(model)
+    chunks = unwrapped if isinstance(unwrapped, (list, tuple)) else [unwrapped]
+    return any(isinstance(chunk, Qwen3VLModel) for chunk in chunks)
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
@@ -193,6 +235,7 @@ class MegatronPolicyWorkerImpl(
         apply_transformer_engine_patch()
 
         self.cfg = config
+        self._router_replay_enabled = router_replay_enabled(config)
 
         # Set rank for non-collocated to check which ranks to broadcast from
         self.rank = get_rank_safe()
@@ -280,7 +323,7 @@ class MegatronPolicyWorkerImpl(
 
         # Set the param sync function for the model if needed
         if param_sync_func is not None:
-            self.megatron_cfg.param_sync_func = param_sync_func
+            get_model_config(self.model).param_sync_func = param_sync_func
 
         # Step 5: Setup reference model if needed
         if init_reference_model:
@@ -312,6 +355,15 @@ class MegatronPolicyWorkerImpl(
             self.model,
             self.optimizer,
         )
+        self._first_train_step_forward_pre_hook_disabled = False
+        self._first_train_step_param_sync_func = None
+        if self.should_disable_forward_pre_hook and self._forward_pre_hook_enabled():
+            self._disable_forward_pre_hook_until_next_train_step()
+
+        # Whether the model packs sequences + CP-shards inside its own forward
+        # (mbridge VLM wrappers like Qwen3VL). If so, NeMo-RL must hand it an
+        # unpacked [B, S] batch rather than pre-packing + CP-sharding itself.
+        self.delegate_pack_to_model = _model_self_packs_for_cp(self.model)
 
         # vars used for refit
         ## will be initialized in prepare_refit_info
@@ -332,11 +384,76 @@ class MegatronPolicyWorkerImpl(
 
     def enable_forward_pre_hook(self):
         assert isinstance(self.model, DistributedDataParallel)
-        self.model.enable_forward_pre_hook()
+        if not self._forward_pre_hook_enabled():
+            self.model.enable_forward_pre_hook()
 
     def disable_forward_pre_hook(self, param_sync=True):
         assert isinstance(self.model, DistributedDataParallel)
+        if not self._forward_pre_hook_enabled():
+            return
+        if param_sync:
+            self._copy_main_params_to_param_buffer(zero_grad_buffer=True)
         self.model.disable_forward_pre_hook(param_sync=param_sync)
+
+    def _forward_pre_hook_enabled(self) -> bool:
+        if not isinstance(self.model, DistributedDataParallel):
+            return False
+        return len(getattr(self.model, "remove_forward_pre_hook_handles", {})) > 0
+
+    def _disable_forward_pre_hook_until_next_train_step(self) -> None:
+        assert isinstance(self.model, DistributedDataParallel)
+        if self._forward_pre_hook_enabled():
+            self.disable_forward_pre_hook(param_sync=False)
+        model_config = get_model_config(self.model)
+        self._first_train_step_param_sync_func = model_config.param_sync_func
+        model_config.param_sync_func = None
+        self._first_train_step_forward_pre_hook_disabled = True
+
+    def _copy_main_params_to_param_buffer(self, zero_grad_buffer: bool = False) -> None:
+        if not isinstance(self.model, DistributedDataParallel):
+            return
+
+        if not self._uses_mxfp8_overlap_shared_param_buffer():
+            return
+
+        if not self._forward_pre_hook_enabled():
+            return
+
+        if zero_grad_buffer:
+            self.model.zero_grad_buffer()
+
+        optimizers = (
+            self.optimizer.chained_optimizers
+            if isinstance(self.optimizer, ChainedOptimizer)
+            else [self.optimizer]
+        )
+        for optim_instance in optimizers:
+            if hasattr(optim_instance, "_copy_main_params_to_param_buffer"):
+                optim_instance._copy_main_params_to_param_buffer()
+
+    def _uses_mxfp8_overlap_shared_param_buffer(self) -> bool:
+        return getattr(
+            self.megatron_cfg.optimizer, "reuse_grad_buf_for_mxfp8_param_ag", False
+        ) and getattr(self.megatron_cfg.ddp, "overlap_param_gather", False)
+
+    def _get_model_extra_state_dict(self) -> dict[str, Any]:
+        fp8_enabled = self.fp8_cfg and self.fp8_cfg.get("enabled", False)
+        if not fp8_enabled:
+            return {}
+        extra_state = {}
+        for key, value in self.model.state_dict().items():
+            if "._extra_state" not in key:
+                continue
+            if isinstance(value, torch.Tensor):
+                extra_state[key] = value.detach().clone()
+            else:
+                extra_state[key] = copy.deepcopy(value)
+        return extra_state
+
+    def _restore_model_extra_state_dict(self, extra_state: dict[str, Any]) -> None:
+        if not extra_state:
+            return
+        self.model.load_state_dict(extra_state, strict=False)
 
     @wrap_with_nvtx_name("megatron_policy_worker/train")
     def train(
@@ -387,10 +504,19 @@ class MegatronPolicyWorkerImpl(
         if eval_mode:
             ctx: AbstractContextManager[Any] = torch.no_grad()
             self.model.eval()
+            saved_extra_state = self._get_model_extra_state_dict()
+            reenable_forward_pre_hook_after_eval = (
+                self.should_disable_forward_pre_hook
+                and self._forward_pre_hook_enabled()
+            )
+            if reenable_forward_pre_hook_after_eval:
+                self.disable_forward_pre_hook()
         else:
             ctx = nullcontext()
             # Ensure model is in training mode
             self.model.train()
+            saved_extra_state = None
+            reenable_forward_pre_hook_after_eval = False
 
         with ctx:
             all_mb_metrics = []
@@ -419,6 +545,7 @@ class MegatronPolicyWorkerImpl(
                     self.cfg,
                     mbs,
                     straggler_timer=self.mcore_state.straggler_timer,
+                    delegate_pack_to_model=self.delegate_pack_to_model,
                 )
                 # Track total microbatches for MoE aux-loss averaging
                 total_num_microbatches += int(num_microbatches)
@@ -433,31 +560,46 @@ class MegatronPolicyWorkerImpl(
 
                 rerun_state_machine = get_rerun_state_machine()
                 while rerun_state_machine.should_run_forward_backward(data_iterator):
-                    # Set grad to zero.
-                    self.model.zero_grad_buffer()
-                    self.optimizer.zero_grad()
+                    # Set grad to zero. For MXFP8 overlap eval, the param and
+                    # grad buffers are shared and pre-hooks are disabled above.
+                    # Avoid zeroing the shared param buffer before forward-only eval.
+                    if not (
+                        eval_mode and self._uses_mxfp8_overlap_shared_param_buffer()
+                    ):
+                        self.model.zero_grad_buffer()
+                        self.optimizer.zero_grad()
+                        self._copy_main_params_to_param_buffer()
 
                     # Forward pass.
                     draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
-                    losses_reduced = megatron_forward_backward(
-                        model=self.model,
-                        data_iterator=data_iterator,
-                        num_microbatches=num_microbatches,
-                        seq_length=padded_seq_length,
-                        mbs=micro_batch_size,
-                        post_processing_fn=loss_post_processor,
-                        forward_only=eval_mode,
-                        defer_fp32_logits=self.defer_fp32_logits,
-                        global_valid_seqs=global_valid_seqs,
-                        global_valid_toks=global_valid_toks,
-                        sampling_params=self.sampling_params,
-                        straggler_timer=self.mcore_state.straggler_timer,
-                        draft_model=self.draft_model,
-                        enable_hidden_capture=draft_enabled,
-                        use_linear_ce_fusion_loss=self.cfg["megatron_cfg"].get(
-                            "use_linear_ce_fusion_loss", False
-                        ),
+                    use_router_replay = _should_use_router_replay(
+                        enabled=self._router_replay_enabled,
+                        data=batch,
+                        stage="train",
+                        require=True,
                     )
+                    with maybe_r3_trace_stage("train", enabled=use_router_replay):
+                        losses_reduced = megatron_forward_backward(
+                            model=self.model,
+                            data_iterator=data_iterator,
+                            num_microbatches=num_microbatches,
+                            seq_length=padded_seq_length,
+                            mbs=micro_batch_size,
+                            post_processing_fn=loss_post_processor,
+                            forward_only=eval_mode,
+                            defer_fp32_logits=self.defer_fp32_logits,
+                            global_valid_seqs=global_valid_seqs,
+                            global_valid_toks=global_valid_toks,
+                            sampling_params=self.sampling_params,
+                            straggler_timer=self.mcore_state.straggler_timer,
+                            draft_model=self.draft_model,
+                            enable_hidden_capture=draft_enabled,
+                            use_linear_ce_fusion_loss=self.cfg["megatron_cfg"].get(
+                                "use_linear_ce_fusion_loss", False
+                            ),
+                            use_router_replay=use_router_replay,
+                            router_replay_train=not eval_mode,
+                        )
 
                 # Empty unused memory.
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
@@ -486,6 +628,17 @@ class MegatronPolicyWorkerImpl(
                 num_zeros_in_grad: float = reduce_max_stat_across_model_parallel_group(
                     num_zeros_in_grad, mp_group=pg_collection.mp
                 )
+                if (
+                    not eval_mode
+                    and self._first_train_step_forward_pre_hook_disabled
+                    and update_successful
+                ):
+                    self.enable_forward_pre_hook()
+                    get_model_config(
+                        self.model
+                    ).param_sync_func = self._first_train_step_param_sync_func
+                    self._first_train_step_param_sync_func = None
+                    self._first_train_step_forward_pre_hook_disabled = False
 
                 # Empty unused memory.
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 2:
@@ -523,6 +676,14 @@ class MegatronPolicyWorkerImpl(
 
                 all_mb_metrics.extend(gb_loss_metrics)
                 losses.append(torch.tensor(mb_losses).sum().item())
+
+        if saved_extra_state is not None:
+            self._restore_model_extra_state_dict(saved_extra_state)
+        if reenable_forward_pre_hook_after_eval:
+            # A forced param sync leaves the next training step with no pending
+            # param AG to finish. Keep hooks disabled for that one step so grad
+            # accumulation starts from a clean shared param/grad buffer.
+            self._disable_forward_pre_hook_until_next_train_step()
 
         if not eval_mode:
             # Step LR scheduler once per train() call, not per global batch.
@@ -562,9 +723,31 @@ class MegatronPolicyWorkerImpl(
                 metrics["moe_metrics"] = moe_metrics
         return metrics
 
+    @wrap_with_nvtx_name("megatron_policy_worker/get_reference_policy_logprobs")
+    def get_reference_policy_logprobs(
+        self,
+        *,
+        data: BatchedDataDict[Any],
+        micro_batch_size: Optional[int] = None,
+    ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
+        with self.use_reference_model():
+            reference_logprobs = self.get_logprobs(
+                data=data,
+                micro_batch_size=micro_batch_size,
+                require_router_replay=False,
+            )
+
+        return_data = BatchedDataDict[ReferenceLogprobOutputSpec]()
+        return_data["reference_logprobs"] = reference_logprobs["logprobs"].cpu()
+        return return_data
+
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs")
     def get_logprobs(
-        self, *, data: BatchedDataDict[Any], micro_batch_size: Optional[int] = None
+        self,
+        *,
+        data: BatchedDataDict[Any],
+        micro_batch_size: Optional[int] = None,
+        require_router_replay: bool = True,
     ) -> BatchedDataDict[LogprobOutputSpec]:
         """Get the logprobs of the model for a batch of data.
 
@@ -600,6 +783,7 @@ class MegatronPolicyWorkerImpl(
             self.cfg,
             logprob_batch_size,
             straggler_timer=self.mcore_state.straggler_timer,
+            delegate_pack_to_model=self.delegate_pack_to_model,
         )
 
         use_linear_ce_fusion = self.cfg["megatron_cfg"].get(
@@ -610,20 +794,29 @@ class MegatronPolicyWorkerImpl(
             sampling_params=self.sampling_params,
             use_linear_ce_fusion=use_linear_ce_fusion,
         )
-
-        list_of_logprobs = megatron_forward_backward(
-            model=self.model,
-            data_iterator=mb_iterator,
-            seq_length=padded_seq_length,
-            mbs=micro_batch_size,
-            num_microbatches=num_microbatches,
-            post_processing_fn=logprobs_post_processor,
-            forward_only=True,
-            defer_fp32_logits=self.defer_fp32_logits,
-            sampling_params=self.sampling_params,
-            straggler_timer=self.mcore_state.straggler_timer,
-            use_linear_ce_fusion_loss=use_linear_ce_fusion,
+        use_router_replay = _should_use_router_replay(
+            enabled=self._router_replay_enabled,
+            data=data,
+            stage="prev-logprob",
+            require=require_router_replay,
         )
+
+        with maybe_r3_trace_stage("prev-logprob", enabled=use_router_replay):
+            list_of_logprobs = megatron_forward_backward(
+                model=self.model,
+                data_iterator=mb_iterator,
+                seq_length=padded_seq_length,
+                mbs=micro_batch_size,
+                num_microbatches=num_microbatches,
+                post_processing_fn=logprobs_post_processor,
+                forward_only=True,
+                defer_fp32_logits=self.defer_fp32_logits,
+                sampling_params=self.sampling_params,
+                straggler_timer=self.mcore_state.straggler_timer,
+                use_linear_ce_fusion_loss=use_linear_ce_fusion,
+                use_router_replay=use_router_replay,
+                router_replay_train=False,
+            )
 
         if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
             all_log_probs_padded = []
@@ -804,6 +997,7 @@ class MegatronPolicyWorkerImpl(
             self.cfg,
             logprob_batch_size,
             straggler_timer=self.mcore_state.straggler_timer,
+            delegate_pack_to_model=self.delegate_pack_to_model,
         )
 
         list_of_outputs = megatron_forward_backward(
@@ -1724,9 +1918,15 @@ class MegatronPolicyWorkerImpl(
                     )
                     raise
 
-        # Run a forward pass to trigger hooks (reuse get_logprobs forward path)
+        # Run a forward pass to trigger hooks (reuse get_logprobs forward path).
+        # Calibration batches are prompt-only model inputs, not rollout replay
+        # batches, so they intentionally do not carry routed_experts.
         try:
-            _ = self.get_logprobs(data=data, micro_batch_size=micro_batch_size)
+            _ = self.get_logprobs(
+                data=data,
+                micro_batch_size=micro_batch_size,
+                require_router_replay=False,
+            )
         finally:
             for h in hook_handles:
                 try:

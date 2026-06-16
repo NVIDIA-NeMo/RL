@@ -11,9 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import ast
 import os
 import tempfile
 import time
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 
 import numpy as np
@@ -68,6 +71,64 @@ def test_megatron_prepare_for_training_restores_optimizer():
 
     assert model.train_called
     assert restored_devices == ["cuda"]
+
+
+def test_disable_forward_pre_hook_until_next_step_uses_worker_override():
+    source_path = (
+        Path(__file__).parents[4]
+        / "nemo_rl/models/policy/workers/megatron_policy_worker.py"
+    )
+    tree = ast.parse(source_path.read_text())
+    method = next(
+        node
+        for class_node in tree.body
+        if isinstance(class_node, ast.ClassDef)
+        and class_node.name == "MegatronPolicyWorkerImpl"
+        for node in class_node.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_disable_forward_pre_hook_until_next_train_step"
+    )
+
+    class_kwargs = {
+        "name": "_Worker",
+        "bases": [],
+        "keywords": [],
+        "body": [method],
+        "decorator_list": [],
+    }
+    if "type_params" in ast.ClassDef._fields:
+        class_kwargs["type_params"] = []
+    test_module = ast.Module(
+        body=[ast.ClassDef(**class_kwargs)],
+        type_ignores=[],
+    )
+    ast.fix_missing_locations(test_module)
+
+    class FakeDDP:
+        def disable_forward_pre_hook(self, param_sync=True):
+            raise AssertionError("raw DDP hook disable should not be called directly")
+
+    model_config = SimpleNamespace(param_sync_func="sync")
+    namespace = {
+        "DistributedDataParallel": FakeDDP,
+        "get_model_config": lambda _: model_config,
+    }
+    exec(compile(test_module, str(source_path), "exec"), namespace)
+
+    worker = namespace["_Worker"]()
+    worker.model = FakeDDP()
+    worker._forward_pre_hook_enabled = lambda: True
+    disable_calls = []
+    worker.disable_forward_pre_hook = lambda param_sync=True: disable_calls.append(
+        param_sync
+    )
+
+    worker._disable_forward_pre_hook_until_next_train_step()
+
+    assert disable_calls == [False]
+    assert worker._first_train_step_param_sync_func == "sync"
+    assert model_config.param_sync_func is None
+    assert worker._first_train_step_forward_pre_hook_disabled is True
 
 
 def create_megatron_test_config(

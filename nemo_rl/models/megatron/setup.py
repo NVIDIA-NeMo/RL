@@ -82,6 +82,11 @@ from nemo_rl.models.megatron.draft.utils import (
     find_draft_owner_chunk,
     get_attached_draft_model,
 )
+from nemo_rl.models.megatron.router_replay import (
+    clear_global_router_replay_instances,
+    router_replay_enabled,
+    validate_router_replay_config,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
@@ -412,6 +417,7 @@ def setup_model_config(
     """Handle all the model configuration logic."""
     pretrained_ckpt = config.get("pretrained_checkpoint")
     fmt = pretrained_ckpt["format"] if pretrained_ckpt is not None else None
+    validate_router_replay_config(config)
 
     if fmt == "megatron_lm":
         # For megatron_lm format: build the model config from the HF architecture.
@@ -506,9 +512,29 @@ def setup_model_config(
     if fmt == "megatron_lm":
         model_cfg.finalize()
 
+    # Derive fp8_param_enabled once from the config dict so that load_main_params_from_ckpt
+    # and _create_megatron_config both use the same canonical check (fp8 enabled AND fp8_param).
+    fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
+    fp8_param_enabled = bool(
+        fp8_cfg and fp8_cfg.get("enabled", False) and fp8_cfg.get("fp8_param", False)
+    )
+
+    # When fp8_param starts from a pretrained checkpoint, model params may already
+    # be quantized before optimizer main params are initialized. Load main params
+    # from the checkpoint state dict to preserve the original checkpoint precision.
+    load_main_params_from_ckpt = (
+        fp8_param_enabled
+        and pretrained_path is not None
+        and weights_path is None
+        and optimizer_path is None
+    )
+
     # Create checkpoint configs
     checkpoint_config = _create_checkpoint_config(
-        pretrained_path, weights_path, optimizer_path
+        pretrained_path,
+        weights_path,
+        optimizer_path,
+        load_main_params_from_ckpt,
     )
 
     # Validate training configuration
@@ -516,7 +542,7 @@ def setup_model_config(
 
     # Create final megatron config
     megatron_cfg = _create_megatron_config(
-        model_cfg, checkpoint_config, config, hf_model_name, dtype
+        model_cfg, checkpoint_config, config, hf_model_name, dtype, fp8_param_enabled
     )
 
     _validate_dtype_config(dtype, megatron_cfg.model, megatron_cfg.optimizer)
@@ -542,8 +568,12 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.context_parallel_size = config["megatron_cfg"]["context_parallel_size"]
 
     if model_cfg.context_parallel_size > 1:
+        # Either NeMo-RL does the packing+CP-sharding itself (classic mcore
+        # GPTModel path) OR the model does it internally (mbridge VLM wrappers
+        # like Qwen3VL, auto-detected at model build). Both paths require
+        # cu_seqlens to flow via PackedSeqParams, so sequence_packing must be on.
         assert config["sequence_packing"]["enabled"], (
-            "Sequence Packing must be enabled to use Context Parallelism with MCore"
+            "Sequence Packing must be enabled to use Context Parallelism with MCore."
         )
         assert not config["megatron_cfg"].get("use_linear_ce_fusion_loss", False), (
             "Context Parallelism is not supported with linear CE fusion loss, please set use_linear_ce_fusion_loss to false"
@@ -633,6 +663,7 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
 
     if "moe_grouped_gemm" in config["megatron_cfg"]:
         model_cfg.moe_grouped_gemm = config["megatron_cfg"]["moe_grouped_gemm"]
+    model_cfg.moe_enable_routing_replay = router_replay_enabled(config)
 
 
 def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
@@ -730,12 +761,6 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
         except KeyError as e:
             raise KeyError(f"Missing key in fp8_cfg: {e}")
 
-        if model_cfg.fp8_param:
-            warnings.warn(
-                "Setting fp8_param=True sometimes causes NaN token_mult_prob_error, please use with caution. "
-                "Refer to https://github.com/NVIDIA-NeMo/RL/issues/1164 for latest updates with this issue."
-            )
-
 
 def _validate_optimizer_config(config: PolicyConfig) -> None:
     """Validate optimizer configuration."""
@@ -765,7 +790,10 @@ def _validate_chunking_config(config: PolicyConfig) -> None:
 
 
 def _create_checkpoint_config(
-    pretrained_path: str, weights_path: Optional[str], optimizer_path: Optional[str]
+    pretrained_path: str,
+    weights_path: Optional[str],
+    optimizer_path: Optional[str],
+    load_main_params_from_ckpt: bool = False,
 ) -> CheckpointConfig:
     """Create checkpoint configurations."""
     return CheckpointConfig(
@@ -778,6 +806,7 @@ def _create_checkpoint_config(
         fully_parallel_save=True,
         fully_parallel_load=True,
         load_rng=False,
+        load_main_params_from_ckpt=load_main_params_from_ckpt,
     )
 
 
@@ -845,8 +874,26 @@ def _create_megatron_config(
     config: PolicyConfig,
     hf_model_name: str,
     dtype: torch.dtype,
+    fp8_param_enabled: bool = False,
 ) -> ConfigContainer:
     """Create the final Megatron configuration container."""
+    # fp8_param_gather and reuse_grad_buf_for_mxfp8_param_ag are derived: both are
+    # only valid when fp8 is enabled, fp8_param=True, and recipe is mxfp8. Mcore's
+    # DDP __post_init__ asserts they remain in sync, so we centralize the derivation
+    # rather than exposing two redundant YAML knobs that can disagree.
+    fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
+    reuse_grad_buf_for_mxfp8_param_ag = (
+        fp8_param_enabled and fp8_cfg.get("fp8_recipe") == "mxfp8"
+    )
+    overlap_param_gather = config["megatron_cfg"]["distributed_data_parallel_config"][
+        "overlap_param_gather"
+    ]
+    optimizer_kwargs = {
+        **config["megatron_cfg"]["optimizer"],
+        "overlap_param_gather": overlap_param_gather,
+        "reuse_grad_buf_for_mxfp8_param_ag": reuse_grad_buf_for_mxfp8_param_ag,
+    }
+
     return ConfigContainer(
         model=model_cfg,
         checkpoint=checkpoint_config,
@@ -856,7 +903,7 @@ def _create_megatron_config(
             global_batch_size=config["train_global_batch_size"],  # ignored
             train_iters=config["megatron_cfg"]["train_iters"],
         ),
-        optimizer=OptimizerConfig(**config["megatron_cfg"]["optimizer"]),
+        optimizer=OptimizerConfig(**optimizer_kwargs),
         ddp=DistributedDataParallelConfig(
             check_for_nan_in_grad=True,
             grad_reduce_in_fp32=config["megatron_cfg"][
@@ -865,9 +912,7 @@ def _create_megatron_config(
             overlap_grad_reduce=config["megatron_cfg"][
                 "distributed_data_parallel_config"
             ]["overlap_grad_reduce"],
-            overlap_param_gather=config["megatron_cfg"][
-                "distributed_data_parallel_config"
-            ]["overlap_param_gather"],
+            overlap_param_gather=overlap_param_gather,
             # we need to set average_in_collective=False with calculate_per_token_loss=T
             # otherwise, mcore throws an assertion error.
             average_in_collective=False,  # Required with calculate_per_token_loss=True
@@ -877,6 +922,8 @@ def _create_megatron_config(
             data_parallel_sharding_strategy=config["megatron_cfg"][
                 "distributed_data_parallel_config"
             ]["data_parallel_sharding_strategy"],
+            reuse_grad_buf_for_mxfp8_param_ag=reuse_grad_buf_for_mxfp8_param_ag,
+            fp8_param_gather=fp8_param_enabled,
         ),
         scheduler=SchedulerConfig(**config["megatron_cfg"]["scheduler"]),
         dataset=None,
@@ -1332,55 +1379,61 @@ def setup_reference_model_state(
 
         ref_pre_wrap_hooks.extend([composed_peft_hook])
 
-    reference_model = get_model(
-        megatron_cfg.model,
-        megatron_cfg.ddp,
-        use_torch_fsdp2=megatron_cfg.dist.use_torch_fsdp2,
-        overlap_param_gather_with_optimizer_step=megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
-        data_parallel_random_init=megatron_cfg.rng.data_parallel_random_init,
-        pre_wrap_hook=ref_pre_wrap_hooks,
-        mixed_precision_wrapper=ref_mixed_precision_wrapper,
-        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
-    )
-
-    # If use_peft, the pretrained checkpoint weights are already loaded inside of the pre_wrap_hook
-    # so they only need to be loaded here if use_peft is False
-    should_load_checkpoint = (
-        not use_peft
-        and ref_checkpoint_config.pretrained_checkpoint is not None
-        and checkpoint_exists(ref_checkpoint_config.pretrained_checkpoint)
-    )
-
-    print("Loading the Reference Model")
-
-    if should_load_checkpoint:
-        if pre_load_checkpoint_hook is not None:
-            pre_load_checkpoint_hook(ref_state, reference_model)
-        load_checkpoint(
-            ref_state,
-            reference_model,
-            None,  # no optimizer
-            None,  # no scheduler
-            checkpointing_context=ref_ckpt_context,
-            skip_load_to_model_and_opt=HAVE_FSDP2 and megatron_cfg.dist.use_torch_fsdp2,
+    try:
+        reference_model = get_model(
+            megatron_cfg.model,
+            megatron_cfg.ddp,
+            use_torch_fsdp2=megatron_cfg.dist.use_torch_fsdp2,
+            overlap_param_gather_with_optimizer_step=megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
+            data_parallel_random_init=megatron_cfg.rng.data_parallel_random_init,
+            pre_wrap_hook=ref_pre_wrap_hooks,
+            mixed_precision_wrapper=ref_mixed_precision_wrapper,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
-    reference_state_dict = {}
+        # If use_peft, the pretrained checkpoint weights are already loaded inside of the pre_wrap_hook
+        # so they only need to be loaded here if use_peft is False
+        should_load_checkpoint = (
+            not use_peft
+            and ref_checkpoint_config.pretrained_checkpoint is not None
+            and checkpoint_exists(ref_checkpoint_config.pretrained_checkpoint)
+        )
 
-    if should_load_checkpoint or use_peft:
-        reference_model = reference_model[0]
-        reference_model.eval()
-        # Store reference state dict on CPU
-        for name, item in reference_model.state_dict().items():
-            if isinstance(item, torch.Tensor):
-                cpu_item = item.detach().to(device="cpu", non_blocking=True, copy=True)
-                del item
-            else:
-                cpu_item = item
-            reference_state_dict[name] = cpu_item
-        print("Reference model loaded")
-    else:
-        print("Reference model not loaded")
+        print("Loading the Reference Model")
+
+        if should_load_checkpoint:
+            if pre_load_checkpoint_hook is not None:
+                pre_load_checkpoint_hook(ref_state, reference_model)
+            load_checkpoint(
+                ref_state,
+                reference_model,
+                None,  # no optimizer
+                None,  # no scheduler
+                checkpointing_context=ref_ckpt_context,
+                skip_load_to_model_and_opt=HAVE_FSDP2
+                and megatron_cfg.dist.use_torch_fsdp2,
+            )
+
+        reference_state_dict = {}
+
+        if should_load_checkpoint or use_peft:
+            reference_model = reference_model[0]
+            reference_model.eval()
+            # Store reference state dict on CPU
+            for name, item in reference_model.state_dict().items():
+                if isinstance(item, torch.Tensor):
+                    cpu_item = item.detach().to(
+                        device="cpu", non_blocking=True, copy=True
+                    )
+                    del item
+                else:
+                    cpu_item = item
+                reference_state_dict[name] = cpu_item
+            print("Reference model loaded")
+        else:
+            print("Reference model not loaded")
+    finally:
+        clear_global_router_replay_instances()
 
     return reference_state_dict
 

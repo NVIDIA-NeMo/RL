@@ -215,6 +215,10 @@ class GenerationOutputSpec(TypedDict):
         torch.Tensor
     )  # Length of full valid sequence (input + generated response)
     logprobs: torch.Tensor
+    routed_experts: NotRequired[torch.Tensor]
+    r3_routed_experts_missing_routes: NotRequired[torch.Tensor]
+    r3_routed_experts_expected_routes: NotRequired[torch.Tensor]
+    r3_routed_experts_actual_routes: NotRequired[torch.Tensor]
     truncated: NotRequired[
         torch.Tensor
     ]  # Whether each sequence was truncated and hit max_tokens without stop token
