@@ -8,6 +8,15 @@ vocabulary mismatch by routing student logits through a precomputed
 most plausibly corresponds to, projecting the student into the teacher's
 vocab space so the two distributions can be compared.
 
+Tokenizer vocabularies overlap only partially, which is what makes the
+projection necessary. The table below reports the pairwise overlap
+(intersection divided by the smaller vocabulary, on canonical token forms)
+across several model tokenizers; the off-diagonal entries sit well below
+`1.0` — that shared-vocabulary gap is exactly what the projection matrix
+bridges.
+
+![Cross-tokenizer similarity: pairwise vocabulary overlap (intersection over min vocab size) across model tokenizers](../assets/tokenizer_overlap_matrix.png)
+
 This guide explains how to:
 
 1. Produce the projection matrix from a (student, teacher) tokenizer pair
