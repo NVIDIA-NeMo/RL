@@ -99,6 +99,50 @@ from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
+# Per-metric normalization tags for the split-API ``finish_train_step``
+# rescale. The sync path runs the loss with the true global_valid_*; the
+# split path runs each microbatch with global_valid_*=1 (raw sums) and
+# applies the 1/N rescale once at finish, but different metrics need
+# different N. See ClippedPGLossFn (nemo_rl/algorithms/loss/loss_functions.py)
+# and PR #2683 review on lines 789/845 for the catalog.
+#
+# - "toks": divide partial sum by global_valid_toks
+# - "seqs": divide partial sum by global_valid_seqs
+# - "loss_type": pick toks or seqs based on loss_type (matches gradient
+#                normalization). Used for ``loss`` and ``kl_penalty``.
+# - "none":  raw count metric; sum across microbatches downstream is the
+#            correct value. Do NOT scale.
+# - "skip":  handled separately (min/max guard, or stamped after the loop).
+#
+# Metrics not listed default to "loss_type" — preserves prior behavior
+# for any unknown metric and matches the canonical case (loss-derived).
+_METRIC_NORMALIZATION_KIND: dict[str, str] = {
+    # ClippedPGLossFn metrics always normalized by token count regardless
+    # of loss_type (see L281-588 in loss_functions.py):
+    "token_mult_prob_error": "toks",
+    "gen_kl_error": "toks",
+    "policy_kl_error": "toks",
+    "js_divergence_error": "toks",
+    "approx_entropy": "toks",
+    "probs_ratio": "toks",
+    "probs_ratio_clamped": "toks",
+    # Loss-type-aware metrics (use the same N as the gradient normalization):
+    "loss": "loss_type",
+    "kl_penalty": "loss_type",
+    # Flag-dependent (sequence_level_importance_ratios / sequence_level_loss_mask
+    # toggles inside the loss). For now use loss_type as the best default;
+    # the seq-mask-tis + token-level combo mismatches here. TODO: thread
+    # the flags through so finish can pick correctly.
+    "sampling_importance_ratio": "loss_type",
+    "is_oob_ratio": "loss_type",
+    # Raw counts — must NOT be scaled. The sync path passes these through
+    # via `/num_global_batches`=1 → identity, and grpo.py's downstream
+    # reducer sums across microbatches to get the global count.
+    "num_valid_samples": "none",
+    "num_unmasked_tokens": "none",
+}
+
+
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
 class MegatronPolicyWorkerImpl(
@@ -900,9 +944,41 @@ class MegatronPolicyWorkerImpl(
         # Scheduler increment matches sync path's ``increment=gbs``.
         self.scheduler.step(increment=state["gbs"])
 
-        # Per-mb metrics were computed with N=1; rescale to match what the
-        # sync path produces. ``masked_mean`` is linear in 1/N so a single
-        # scalar multiply per metric recovers the normalized value.
+        # Per-mb metrics were computed with global_valid_*=1 (raw sums);
+        # rescale to match what the sync path produces. Different metrics
+        # use different denominators — see _METRIC_NORMALIZATION_KIND at
+        # module top. masked_mean is linear in 1/N so per-metric scalar
+        # multiplies recover the right normalized values.
+        n_toks_safe = (
+            global_valid_toks
+            if global_valid_toks.item() > 0
+            else torch.tensor(1.0, device="cuda")
+        )
+        n_seqs_safe = (
+            global_valid_seqs
+            if global_valid_seqs.item() > 0
+            else torch.tensor(1.0, device="cuda")
+        )
+        inv_toks = float((1.0 / n_toks_safe).item())
+        inv_seqs = float((1.0 / n_seqs_safe).item())
+
+        def _scale_metric(name: str, value: Any) -> Any:
+            """Apply per-metric N according to _METRIC_NORMALIZATION_KIND."""
+            kind = _METRIC_NORMALIZATION_KIND.get(name, "loss_type")
+            if kind == "none":
+                return value
+            if kind == "toks":
+                scale = inv_toks
+            elif kind == "seqs":
+                scale = inv_seqs
+            else:  # "loss_type" → same as gradient normalization
+                scale = inv_n
+            return (
+                value.detach() * scale
+                if isinstance(value, torch.Tensor)
+                else value * scale
+            )
+
         rescaled_metrics: list[dict[str, Any]] = []
         curr_lr = self.scheduler.get_lr(self.optimizer.param_groups[0])
         curr_wd = self.scheduler.get_wd()
@@ -914,10 +990,8 @@ class MegatronPolicyWorkerImpl(
             for k, v in m.items():
                 if "_min" in k or "_max" in k:
                     out[k] = v
-                elif isinstance(v, torch.Tensor):
-                    out[k] = v.detach() * inv_n
                 else:
-                    out[k] = v * inv_n
+                    out[k] = _scale_metric(k, v)
             out["lr"] = curr_lr
             out["wd"] = curr_wd
             out["global_valid_seqs"] = global_valid_seqs_f
