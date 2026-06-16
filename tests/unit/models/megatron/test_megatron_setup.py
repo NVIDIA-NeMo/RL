@@ -2342,28 +2342,44 @@ class TestForceSyncOptimizerFp32FromModel:
         stub_mod = sys.modules[pkg_path]
         monkeypatch.setattr(stub_mod, "HybridDeviceOptimizer", hdo_cls, raising=False)
 
-    def _make_distrib_opt(self, hdo_cls):
+    def _make_distrib_opt(
+        self, hdo_cls, *, param_start=0, param_end=4, shard_is_none=False, with_hdo_attrs=True
+    ):
         """Build a fake distributed optimizer wrapping a HybridDeviceOptimizer.
 
-        - Level 1: one BF16 model param (value 7.0) and a stale FP32 GPU shard
-          (value 0.0) covering the full param range.
-        - Level 2: a CPU clone (stale 0.0) mapped from a GPU param (value 9.0).
+        - Level 1: a BF16 model param with distinct per-element values (so a
+          partial shard slice is genuinely exercised) and a stale FP32 GPU shard
+          (zeros) covering ``[param_start:param_end]``.
+        - Level 2: a CPU clone (stale zeros) keyed by a GPU *model* param holding
+          its loaded weights -- mirroring the real
+          ``gpu_params_map_cpu_copy`` semantic where the key IS the model param,
+          so after the sync the clone must hold those loaded weights.
         - Level 3: tracked via update_fp32_param_by_new_param() being called.
-        """
-        model_param = torch.full((4,), 7.0)
-        shard_main_param = torch.zeros(4)  # stale "random init"
 
-        gpu_param = torch.full((4,), 9.0)
-        cpu_clone = torch.zeros(4)  # stale "random init"
+        shard_is_none      -> Level 1 shard param is None (must be skipped).
+        with_hdo_attrs=False -> HDO exposes neither gpu_params_map_cpu_copy nor
+                                update_fp32_param_by_new_param (levels 2 & 3 skip).
+        """
+        model_param = torch.tensor([10.0, 11.0, 12.0, 13.0])
+        shard_len = param_end - param_start
+        shard_main_param = None if shard_is_none else torch.zeros(shard_len)
+
+        # The dict key is a GPU model param holding loaded weights; the helper
+        # copies key.data -> clone, so the clone must end up == these weights.
+        gpu_model_param = torch.tensor([20.0, 21.0])
+        cpu_clone = torch.zeros(2)  # stale "random init"
 
         level3_called = {"count": 0}
 
         class _HDO(hdo_cls):
             def __init__(self):
-                self.gpu_params_map_cpu_copy = {gpu_param: cpu_clone}
+                if with_hdo_attrs:
+                    self.gpu_params_map_cpu_copy = {gpu_model_param: cpu_clone}
 
-            def update_fp32_param_by_new_param(self):
-                level3_called["count"] += 1
+            if with_hdo_attrs:
+
+                def update_fp32_param_by_new_param(self):
+                    level3_called["count"] += 1
 
         hdo = _HDO()
 
@@ -2374,13 +2390,15 @@ class TestForceSyncOptimizerFp32FromModel:
                 self.shard_fp32_from_float16_groups = [[shard_main_param]]
 
             def _get_model_param_range_map(self, param):
-                return {"param": SimpleNamespace(start=0, end=4)}
+                return {"param": SimpleNamespace(start=param_start, end=param_end)}
 
         return SimpleNamespace(
             distrib_opt=_DistribOpt(),
             model_param=model_param,
             shard_main_param=shard_main_param,
-            gpu_param=gpu_param,
+            param_start=param_start,
+            param_end=param_end,
+            gpu_model_param=gpu_model_param,
             cpu_clone=cpu_clone,
             level3_called=level3_called,
         )
@@ -2399,12 +2417,79 @@ class TestForceSyncOptimizerFp32FromModel:
             fake.distrib_opt, model=MagicMock()
         )
 
-        # Level 1: GPU FP32 shard now matches the BF16 model param (7.0, not 0.0).
-        torch.testing.assert_close(fake.shard_main_param, fake.model_param)
-        # Level 2: CPU clone now matches its GPU param (9.0, not 0.0).
-        torch.testing.assert_close(fake.cpu_clone, fake.gpu_param)
+        # Level 1: GPU FP32 shard now matches the model param slice (not zeros).
+        torch.testing.assert_close(
+            fake.shard_main_param, fake.model_param[fake.param_start : fake.param_end]
+        )
+        # Level 2: CPU clone now holds the loaded weights from its model param key.
+        torch.testing.assert_close(fake.cpu_clone, fake.gpu_model_param)
         # Level 3: the extra FP32 working-copy refresh hook fired exactly once.
         assert fake.level3_called["count"] == 1
+
+    def test_syncs_partial_shard_slice(self, monkeypatch):
+        """A non-trivial per-DP-rank shard range must copy the right model slice.
+
+        The whole point of the distributed optimizer is partial shards; the
+        helper slices ``model_param.view(-1)[start:end]``. A full-range-only
+        test would pass even if the offset arithmetic were wrong.
+        """
+        from nemo_rl.models.megatron import setup as setup_mod
+
+        class _HybridDeviceOptimizer:
+            pass
+
+        self._patch_hdo_class(monkeypatch, _HybridDeviceOptimizer)
+        fake = self._make_distrib_opt(_HybridDeviceOptimizer, param_start=2, param_end=4)
+
+        setup_mod._force_sync_optimizer_fp32_from_model(
+            fake.distrib_opt, model=MagicMock()
+        )
+
+        # shard covers elements [2:4] -> must be [12.0, 13.0], not [10.0, 11.0].
+        torch.testing.assert_close(fake.shard_main_param, torch.tensor([12.0, 13.0]))
+
+    def test_skips_none_shard_param(self, monkeypatch):
+        """A None FP32 shard param is skipped without crashing; levels 2/3 run."""
+        from nemo_rl.models.megatron import setup as setup_mod
+
+        class _HybridDeviceOptimizer:
+            pass
+
+        self._patch_hdo_class(monkeypatch, _HybridDeviceOptimizer)
+        fake = self._make_distrib_opt(_HybridDeviceOptimizer, shard_is_none=True)
+
+        # Must not raise on the None shard, and must still sync levels 2 & 3.
+        setup_mod._force_sync_optimizer_fp32_from_model(
+            fake.distrib_opt, model=MagicMock()
+        )
+
+        torch.testing.assert_close(fake.cpu_clone, fake.gpu_model_param)
+        assert fake.level3_called["count"] == 1
+
+    def test_skips_absent_hdo_attrs(self, monkeypatch):
+        """If the HDO lacks the level-2/3 members, those levels are safely skipped.
+
+        Level 1 (on the distributed optimizer) must still run.
+        """
+        from nemo_rl.models.megatron import setup as setup_mod
+
+        class _HybridDeviceOptimizer:
+            pass
+
+        self._patch_hdo_class(monkeypatch, _HybridDeviceOptimizer)
+        fake = self._make_distrib_opt(_HybridDeviceOptimizer, with_hdo_attrs=False)
+
+        setup_mod._force_sync_optimizer_fp32_from_model(
+            fake.distrib_opt, model=MagicMock()
+        )
+
+        # Level 1 still applied; levels 2/3 silently skipped (no clone sync, no
+        # level-3 call) and no crash.
+        torch.testing.assert_close(
+            fake.shard_main_param, fake.model_param[fake.param_start : fake.param_end]
+        )
+        torch.testing.assert_close(fake.cpu_clone, torch.zeros(2))
+        assert fake.level3_called["count"] == 0
 
     def test_handles_chained_optimizers(self, monkeypatch):
         """A ChainedOptimizer is walked sub-optimizer by sub-optimizer."""
@@ -2424,8 +2509,11 @@ class TestForceSyncOptimizerFp32FromModel:
         setup_mod._force_sync_optimizer_fp32_from_model(chained, model=MagicMock())
 
         for fake in (a, b):
-            torch.testing.assert_close(fake.shard_main_param, fake.model_param)
-            torch.testing.assert_close(fake.cpu_clone, fake.gpu_param)
+            torch.testing.assert_close(
+                fake.shard_main_param,
+                fake.model_param[fake.param_start : fake.param_end],
+            )
+            torch.testing.assert_close(fake.cpu_clone, fake.gpu_model_param)
             assert fake.level3_called["count"] == 1
 
     def test_noop_when_not_hybrid_device_optimizer(self, monkeypatch):
@@ -2471,3 +2559,49 @@ class TestForceSyncOptimizerFp32FromModel:
         setup_mod._force_sync_optimizer_fp32_from_model(fake_opt, model=MagicMock())
 
         torch.testing.assert_close(shard_main_param, torch.zeros(4))
+
+    def test_megatron_internals_have_not_drifted(self):
+        """Tripwire: fail loudly if Megatron renames the internals we depend on.
+
+        The helper guards every access with isinstance/hasattr, so if upstream
+        renames any of these members it silently becomes a no-op -- the bug
+        returns while every stub-based test above stays green. This is the one
+        test that catches that, by asserting the real classes still expose the
+        exact names the helper reads. Instance attributes are set in __init__
+        (so not visible on the class object); we assert their names still appear
+        in the class source. Skips when mcore/Megatron is unavailable.
+        """
+        import inspect
+
+        pytest.importorskip(
+            "megatron.core.optimizer.cpu_offloading.hybrid_optimizer",
+            reason="requires the mcore extra (real Megatron)",
+        )
+        from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import (
+            HybridDeviceOptimizer,
+        )
+        from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+
+        # Methods -- directly checkable on the class object.
+        assert hasattr(HybridDeviceOptimizer, "update_fp32_param_by_new_param"), (
+            "HybridDeviceOptimizer.update_fp32_param_by_new_param was renamed/removed; "
+            "_force_sync_optimizer_fp32_from_model's level-3 sync is now a silent no-op."
+        )
+        assert hasattr(DistributedOptimizer, "_get_model_param_range_map"), (
+            "DistributedOptimizer._get_model_param_range_map was renamed/removed; "
+            "_force_sync_optimizer_fp32_from_model's level-1 slicing will break."
+        )
+
+        # Instance attributes -- assert their names still appear in the source.
+        hdo_src = inspect.getsource(HybridDeviceOptimizer)
+        for name in ("gpu_params_map_cpu_copy", "param_to_fp32_param"):
+            assert name in hdo_src, (
+                f"HybridDeviceOptimizer no longer references {name!r}; "
+                "_force_sync_optimizer_fp32_from_model's level-2/3 sync is now a silent no-op."
+            )
+        do_src = inspect.getsource(DistributedOptimizer)
+        for name in ("model_float16_groups", "shard_fp32_from_float16_groups"):
+            assert name in do_src, (
+                f"DistributedOptimizer no longer references {name!r}; "
+                "_force_sync_optimizer_fp32_from_model's level-1 sync is now a silent no-op."
+            )
