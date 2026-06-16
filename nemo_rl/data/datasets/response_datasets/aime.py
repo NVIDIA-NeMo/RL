@@ -26,15 +26,9 @@ AIMEVariant = Literal["2024", "2025", "2026"]
 class AIMEDataset(RawDataset):
     """Wrapper around an AIME competition dataset with a train split.
 
-    Mirrors nemo_rl.data.datasets.eval_datasets.aime.AIMEDataset so the same
-    year can be referenced both as a validation dataset during training and
-    as an eval dataset.
-
     Args:
         variant: Which AIME edition to load: "2024" (default), "2025", or "2026".
-        repeat: Number of times to repeat the dataset, default is 16. This
-            matches the variance-reduction recipe used by the original
-            AIME2024 entry.
+        repeat: Number of times to repeat the dataset, default is 16.
     """
 
     def __init__(

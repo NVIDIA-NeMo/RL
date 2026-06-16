@@ -217,6 +217,8 @@ def test_build_in_dataset(dataset_name, tokenizer):
         assert first_example["messages"][1]["content"] == "540"
     elif dataset_name == "DeepScaler":
         assert first_example["messages"][1]["content"] == "-\\frac{2}{3}"
+    elif dataset_name == "squad":
+        assert first_example["messages"][2]["content"] == "Saint Bernadette Soubirous"
     elif dataset_name == "AIME2024":
         assert first_example["messages"][1]["content"] == "204"
         assert len(dataset.dataset) == 480
@@ -226,8 +228,6 @@ def test_build_in_dataset(dataset_name, tokenizer):
     elif dataset_name == "AIME2026":
         assert first_example["messages"][1]["content"] == "277"
         assert len(dataset.dataset) == 480
-    elif dataset_name == "squad":
-        assert first_example["messages"][2]["content"] == "Saint Bernadette Soubirous"
 
     # check the combined message
     chat_template = "{% for message in messages %}{%- if message['role'] == 'system'  %}{{'Context: ' + message['content'].strip()}}{%- elif message['role'] == 'user'  %}{{' Question: ' + message['content'].strip() + ' Answer:'}}{%- elif message['role'] == 'assistant'  %}{{' ' + message['content'].strip()}}{%- endif %}{% endfor %}"
