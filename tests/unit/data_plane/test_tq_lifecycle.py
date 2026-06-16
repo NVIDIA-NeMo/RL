@@ -34,6 +34,7 @@ from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
+
 def test_register_partition_uses_unique_schema_warmup_key(monkeypatch) -> None:
     from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
 
