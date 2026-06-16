@@ -167,6 +167,15 @@ def _apply_config_updates(config: ValueConfig, config_updates: dict) -> None:
                 "logprob_mb_tokens": lbt,
                 "sequence_length_round": 64,
             }
+        elif k == "sequence_packing":
+            mbt = config["max_total_sequence_length"] * config["train_micro_batch_size"]
+            config["sequence_packing"] = {
+                "enabled": v,
+                "train_mb_tokens": mbt,
+                "logprob_mb_tokens": mbt,
+                "algorithm": "modified_first_fit_decreasing",
+                "sequence_length_round": 64,
+            }
         else:
             raise ValueError(f"Unknown config_updates key: {k!r}")
 
@@ -341,8 +350,14 @@ def test_value_worker_train_step(value_setup):
         (2, {"sequence_parallel": True}),
         (1, {"dynamic_batching": True}),
         (1, {"pipeline_model_parallel_size": 2}),
+        (1, {"sequence_packing": True}),
     ],
-    ids=["sequence_parallel", "dynamic_batching", "pipeline_parallel"],
+    ids=[
+        "sequence_parallel",
+        "dynamic_batching",
+        "pipeline_parallel",
+        "sequence_packing",
+    ],
 )
 def test_value_worker_parallelism_equivalence(
     tiny_qwen2_model_path, tmp_path, tp, feature_updates
@@ -361,6 +376,8 @@ def test_value_worker_parallelism_equivalence(
       * pipeline parallelism — guards the head output broadcasts from the last
         pipeline stage to all ranks, and the value head reshards across a
         save@pp1 / load@pp2 checkpoint.
+      * sequence packing — guards the packed [1, T] -> [B, S] unpack + per-sequence
+        shift round-trips back to the unpacked layout.
     """
     cluster = None
     ref = None

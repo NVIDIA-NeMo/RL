@@ -41,6 +41,8 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
 from megatron.core.models.gpt import GPTModel
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.parallel_state import (
+    get_context_parallel_group,
+    get_context_parallel_world_size,
     get_pipeline_model_parallel_group,
     get_pipeline_model_parallel_last_rank,
     is_pipeline_last_stage,
@@ -51,6 +53,7 @@ from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.model_utils import allgather_cp_sharded_tensor
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.megatron.common import (
     broadcast_tensor,
@@ -126,20 +129,28 @@ def forward_step_value(
             **additional_kwargs,
         )
 
-    # Head-owning stage returns [B, S, 1] values; others pass hidden states through.
-    if is_pipeline_last_stage(ignore_virtual=True):
-        values = output_tensor.squeeze(-1)  # [B, S]
-        # Shift right by 1 (values[t] = V(state before token t)); must match get_values.
-        values = torch.cat([torch.zeros_like(values[:, :1]), values[:, :-1]], dim=1)
-        output_tensor = values
+    is_packed = pack_sequences and packed_seq_params is not None
 
-    # Handle packed sequences
-    if pack_sequences and packed_seq_params is not None:
+    # Head-owning stage returns values; others pass hidden states through.
+    if is_pipeline_last_stage(ignore_virtual=True):
+        if is_packed:
+            # Packed [1, T // CP, 1] -> [1, T // CP]. The per-sequence shift (and CP
+            # all-gather) happens in the loss wrapper's prepare_fn below.
+            output_tensor = output_tensor.squeeze(-1)
+        else:
+            # [B, S]: shift right by 1 so values[t] = V(state before token t).
+            values = output_tensor.squeeze(-1)
+            output_tensor = torch.cat(
+                [torch.zeros_like(values[:, :1]), values[:, :-1]], dim=1
+            )
+
+    if is_packed:
         loss_fn = SequencePackingLossWrapper(
             loss_fn=loss_fn,
-            prepare_fn=lambda logits, data: (logits, data),
+            prepare_fn=_value_packed_loss_prepare_fn,
             cu_seqlens_q=packed_seq_params.cu_seqlens_q,
             cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
+            context_parallel_group=get_context_parallel_group(),
         )
 
     loss_data = data_dict
@@ -216,6 +227,79 @@ def make_value_head_hook(hidden_size: int, sequence_parallel: bool):
         return model
 
     return hook
+
+
+def _unpack_value_sequences(
+    values: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+    unpacked_seqlen: int,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """Unpack packed (and CP-sharded) per-token values back to ``[B, S]``.
+
+    ``values`` is the value head output for a packed microbatch, shape ``[1, T // CP]``
+    (SP/TP already gathered inside the head). For each sequence delimited by
+    ``cu_seqlens_padded`` (indices into the full, non-CP-adjusted packed layout) the local
+    CP shard is all-gathered to the full sequence, then shifted right by one so
+    ``values[t] = V(state before token t)`` — matching the unpacked path.
+    """
+    cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
+    batch_size = cu_seqlens_padded.shape[0] - 1
+    values = values.squeeze(0)  # [T // CP]
+
+    if cp_size > 1:
+        full = torch.zeros(
+            values.shape[0] * cp_size, dtype=values.dtype, device=values.device
+        )
+        for i in range(batch_size):
+            start = cu_seqlens_padded[i].item()
+            end = cu_seqlens_padded[i + 1].item()
+            full[start:end] = allgather_cp_sharded_tensor(
+                values[start // cp_size : end // cp_size], cp_group, seq_dim=0
+            )
+        values = full
+
+    out = torch.zeros(
+        (batch_size, unpacked_seqlen), dtype=values.dtype, device=values.device
+    )
+    for i in range(batch_size):
+        start = cu_seqlens_padded[i].item()
+        end = cu_seqlens_padded[i + 1].item()
+        seq_values = values[start:end]
+        seq_values = torch.cat(
+            [torch.zeros_like(seq_values[:1]), seq_values[:-1]], dim=0
+        )
+        seq_len = min(seq_values.shape[0], unpacked_seqlen)
+        out[i, :seq_len] = seq_values[:seq_len]
+    return out
+
+
+def _value_packed_loss_prepare_fn(
+    logits: torch.Tensor,
+    data: BatchedDataDict[Any],
+    loss_fn: Optional[LossFunction] = None,
+    vocab_parallel_rank: Optional[int] = None,
+    vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> tuple[dict[str, torch.Tensor], BatchedDataDict[Any]]:
+    """Prepare one packed sequence's value-head output for ``MseValueLossFn``.
+
+    ``SequencePackingLossWrapper`` hands us a single sequence's CP-sharded value
+    slice ``[1, padded_len // CP]``. All-gather across CP to ``[1, padded_len]``,
+    shift right by one (``values[t] = V(state before token t)``), and truncate to
+    the sequence's unpadded length so it lines up with ``data["returns"]``.
+    """
+    values = logits
+    cp_size = (
+        1
+        if context_parallel_group is None
+        else torch.distributed.get_world_size(context_parallel_group)
+    )
+    if cp_size > 1:
+        values = allgather_cp_sharded_tensor(values, context_parallel_group, seq_dim=1)
+    values = torch.cat([torch.zeros_like(values[:, :1]), values[:, :-1]], dim=1)
+    values = values[:, : data["returns"].shape[1]]
+    return {"values": values}, data
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
@@ -700,21 +784,30 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
             )
 
             def collection_fn(output_tensor):
-                # On the last PP stage the value head returns [B, S, 1] per-token
-                # values (sequence-parallel shards already gathered inside the
-                # head). Earlier PP stages return intermediate hidden states; their
+                # The head-owning stage returns per-token values (SP/TP already
+                # gathered in the head); other stages return hidden states whose
                 # collection output is discarded (values are broadcast from the
                 # last stage below).
-                if is_pipeline_last_stage(ignore_virtual=True):
-                    values = output_tensor.squeeze(-1)  # [B, S]
-                    # Prepend a 0 value for the first token (shift right by 1) so
-                    # values[t] = V(state before token t).
+                if not is_pipeline_last_stage(ignore_virtual=True):
+                    values = torch.zeros(1, device=output_tensor.device)
+                    return torch.tensor(0.0, device=values.device), {"values": values}
+
+                if processed_mb.cu_seqlens_padded is not None:
+                    # Packed (and possibly CP-sharded) [1, T // CP, 1] -> [B, S],
+                    # per-sequence shift + CP all-gather.
+                    cp_size = get_context_parallel_world_size()
+                    values = _unpack_value_sequences(
+                        output_tensor.squeeze(-1),
+                        processed_mb.cu_seqlens_padded,
+                        seq_length,
+                        cp_group=get_context_parallel_group() if cp_size > 1 else None,
+                    )
+                else:
+                    # [B, S]: shift right by 1 so values[t] = V(state before token t).
+                    values = output_tensor.squeeze(-1)
                     values = torch.cat(
                         [torch.zeros_like(values[:, :1]), values[:, :-1]], dim=1
                     )
-                else:
-                    values = torch.zeros(1, device=output_tensor.device)
-
                 return torch.tensor(0.0, device=values.device), {"values": values}
 
             return output_tensor, collection_fn

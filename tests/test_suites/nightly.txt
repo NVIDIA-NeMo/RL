@@ -233,3 +233,6 @@ tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron-valuetp2sp-dynbatch.s
 
 # Megatron PPO with value pipeline parallelism (TP2+PP2) (Qwen2.5-1.5B, GSM8K)
 tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron-valuetp2pp2.sh
+
+# Megatron PPO with value sequence packing + context parallelism (TP2+CP2) (Qwen2.5-1.5B, GSM8K)
+tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron-valuepack-cp2.sh
