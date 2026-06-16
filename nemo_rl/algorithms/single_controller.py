@@ -651,10 +651,15 @@ class SingleControllerActor:
         SC owns the drain gate (when to sync); WeightSynchronizer owns how.
 
         Flow:
-          1. _rollout_permitted.clear()  — no new dispatches
-          2. drain _inflight_rollouts → 0  (5ms poll)
-          3. weight_synchronizer.sync_weights(trainer_version)
-          4. _rollout_permitted.set()   — resume
+          1. _rollout_permitted.clear()           — no new dispatches
+          2. drain _inflight_rollouts → 0          (5ms poll)
+          3. weight_synchronizer.sync_weights()    — production interface,
+             no version arg; transport (IPC/HTTP/NCCL) handles the transfer.
+          4. gen.set_weight_version(trainer_version)
+             — explicitly stamp the rollout side with the new version so
+             new rollouts are tagged accordingly (mirrors grpo.py's
+             trajectory_collector.set_weight_version + Yuki's #2819 path).
+          5. _rollout_permitted.set()              — resume
         """
         self._rollout_permitted.clear()
 
@@ -673,8 +678,24 @@ class SingleControllerActor:
         )
 
         t0 = time.monotonic()
-        await self._weight_synchronizer.sync_weights(self._trainer_version)
+        # Match WeightSynchronizer.sync_weights canonical signature
+        # (no trainer_version arg; transport-specific impl handles transfer).
+        await self._weight_synchronizer.sync_weights()
         elapsed = time.monotonic() - t0
+
+        # Propagate the new version to the rollout actor so newly-produced
+        # samples carry the right weight_version tag in their KVBatchMeta.
+        # Best-effort: log + continue if the rollout actor lacks the setter
+        # (older interfaces or stubs without it).
+        set_version = getattr(self._gen, "set_weight_version", None)
+        if set_version is not None:
+            try:
+                await self._ray_get(set_version.remote(self._trainer_version))
+            except Exception:
+                log.exception(
+                    "  _sync_weights: gen.set_weight_version(%d) failed",
+                    self._trainer_version,
+                )
 
         log.info("  _sync_weights: sync done in %.3fs", elapsed)
         self._rollout_permitted.set()

@@ -427,22 +427,25 @@ class DryRunAdvantageEstimator:
 class DryRunWeightSynchronizer:
     """Stub WeightSynchronizer — just sleeps.
 
-    In production this would call WeightSynchronizer.sync_weights() which
-    dispatches to IPC/HTTP/NCCL based on deployment config.
+    Matches the production ``WeightSynchronizer.sync_weights`` signature
+    (no version arg; transport-specific impl handles the transfer). Version
+    propagation to the rollout actor is now SC's responsibility — done via
+    ``gen.set_weight_version.remote(trainer_version)`` AFTER sync_weights
+    returns. This stub no longer touches gen_handle; ``gen_handle`` is
+    retained as a constructor arg only so existing test fixtures don't
+    have to change.
     """
 
     def __init__(self, sync_latency_s: float = 0.05, gen_handle: Any = None):
+        del gen_handle  # retained for fixture compat; SC drives set_weight_version
         self._sync_latency_s = sync_latency_s
-        self._gen_handle = gen_handle
         self._sync_count = 0
         self._sync_timestamps: list[float] = []
 
-    async def sync_weights(self, trainer_version: int) -> None:
+    async def sync_weights(self) -> None:
         self._sync_count += 1
         self._sync_timestamps.append(time.monotonic())
         await asyncio.sleep(self._sync_latency_s)
-        if self._gen_handle is not None:
-            await self._gen_handle.set_weight_version.remote(trainer_version)
 
 
 # ── pytest fixtures ───────────────────────────────────────────────────────
