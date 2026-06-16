@@ -42,6 +42,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from contextlib import nullcontext
 from typing import Any, Literal, Optional
 
 import ray
@@ -55,6 +56,7 @@ from nemo_rl.algorithms.staleness_sampler import (
     min_weight_version,
 )
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.utils.timer import Timer
 
 log = logging.getLogger(__name__)
 
@@ -152,6 +154,7 @@ class SingleControllerActor:
         weight_synchronizer: Any,
         loss_fn: Any,
         advantage_estimator: Any | None = None,
+        logger: Any | None = None,
     ) -> None:
         import logging as _logging
 
@@ -168,6 +171,11 @@ class SingleControllerActor:
         self._weight_synchronizer = weight_synchronizer
         self._loss_fn = loss_fn
         self._advantage_estimator = advantage_estimator
+        # Logger + timer for W&B / TB / jsonl. Mirrors grpo_sync's
+        # observability surface — same logger.log_metrics calls per opt.step.
+        # None in dryrun tests; production passes a nemo_rl.utils.logger.Logger.
+        self._logger = logger
+        self._timer: Timer | None = Timer() if logger is not None else None
 
         if cfg.advantage_enabled and self._advantage_estimator is None:
             raise ValueError(
@@ -248,6 +256,13 @@ class SingleControllerActor:
             cfg.max_inflight_prompts,
             cfg.weight_transport,
         )
+
+    def _timed(self, label: str) -> Any:
+        """Context manager that wraps a code block with the SC Timer if a
+        logger is attached, else a no-op. Use as
+        ``with self._timed("phase"): ...``.
+        """
+        return self._timer.time(label) if self._timer is not None else nullcontext()
 
     # ── public API ─────────────────────────────────────────────────────────
 
@@ -472,16 +487,18 @@ class SingleControllerActor:
                             # Trainer writes refreshed prev_lp / ref_lp back to
                             # the TQ partition under the configured field names.
                             # Block here: advantage estimation downstream reads them.
-                            await self._ray_get(
-                                self._trainer.prepare_logprobs_from_meta.remote(
-                                    group_meta,
-                                    refresh_policy_logprobs=refresh_policy_logprobs,
-                                    refresh_reference_logprobs=refresh_reference_logprobs,
+                            with self._timed("prepare_logprobs"):
+                                await self._ray_get(
+                                    self._trainer.prepare_logprobs_from_meta.remote(
+                                        group_meta,
+                                        refresh_policy_logprobs=refresh_policy_logprobs,
+                                        refresh_reference_logprobs=refresh_reference_logprobs,
+                                    )
                                 )
-                            )
 
                         # Advantage pump
-                        group_meta = await self._advantage_pump(group_meta)
+                        with self._timed("advantage_pump"):
+                            group_meta = await self._advantage_pump(group_meta)
 
                         if not step_open:
                             # gbs/mbs default to worker-side cfg when None; SC
@@ -526,14 +543,15 @@ class SingleControllerActor:
                         )
                         break
 
-                    # finish_train_step returns step metrics; SC ignores them
-                    # for version bookkeeping. trainer_version is driver-owned
-                    # (workers don't emit it) and bumps after this call
-                    # returns successfully. The new value propagates to
-                    # rollouts via _sync_weights at the end of the outer step.
-                    await self._ray_get(
-                        self._trainer.finish_train_step.remote(step_id)
-                    )
+                    # finish_train_step returns step metrics. trainer_version
+                    # is driver-owned (workers don't emit it) and bumps after
+                    # this call succeeds. The new value propagates to rollouts
+                    # via _sync_weights at end of the outer step. Capture
+                    # train_results for the logger emit below.
+                    with self._timed("policy_training"):
+                        train_results = await self._ray_get(
+                            self._trainer.finish_train_step.remote(step_id)
+                        )
                 except Exception:
                     # Worker may be left with a half-open step (train_microbatch
                     # partially mutated _train_step_state, or begin/finish
@@ -563,11 +581,12 @@ class SingleControllerActor:
 
                 consumed_ids = list(self._step_consumed_sample_ids)
                 self._step_consumed_sample_ids = []
-                await self._call_dp(
-                    "clear_samples",
-                    sample_ids=consumed_ids,
-                    partition_id=self._cfg.partition_id,
-                )
+                with self._timed("clear_samples"):
+                    await self._call_dp(
+                        "clear_samples",
+                        sample_ids=consumed_ids,
+                        partition_id=self._cfg.partition_id,
+                    )
                 lag = (
                     prev_trainer_version - step_min_weight_version
                     if step_min_weight_version is not None
@@ -584,6 +603,31 @@ class SingleControllerActor:
                     len(consumed_ids),
                 )
 
+                # Per-opt.step observability: mirror grpo_sync's W&B logging
+                # surface (train metrics + timing under the same step
+                # counter). No-op if no logger was attached.
+                if self._logger is not None:
+                    try:
+                        self._logger.log_metrics(
+                            train_results,
+                            step=self._trainer_version,
+                            prefix="train",
+                        )
+                        if self._timer is not None:
+                            self._logger.log_metrics(
+                                self._timer.get_timing_metrics(),
+                                step=self._trainer_version,
+                                prefix="timing/train",
+                                step_finished=True,
+                            )
+                            self._timer.reset()
+                    except Exception:
+                        log.exception(
+                            "logger.log_metrics raised at step %d / mb %d",
+                            self._train_steps + 1,
+                            mb_idx,
+                        )
+
                 if rollout_exhausted:
                     # Inner loop terminated early due to rollout exhaustion;
                     # the cycle still completed (step_open was True), so we
@@ -597,7 +641,8 @@ class SingleControllerActor:
                 break
 
             # One sync per outer step covers all opt.steps in this iteration.
-            await self._sync_weights()
+            with self._timed("sync_weights"):
+                await self._sync_weights()
             self._train_steps += 1
 
     async def _sync_weights(self) -> None:
