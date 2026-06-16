@@ -339,6 +339,35 @@ class TQPolicy(Policy):
             common_kwargs={"micro_batch_size": micro_batch_size},
         )
 
+    def prepare_logprobs_from_meta(
+        self,
+        meta: KVBatchMeta,
+        *,
+        refresh_policy_logprobs: bool = False,
+        refresh_reference_logprobs: bool = False,
+        micro_batch_size: Optional[int] = None,
+        timer: Optional[Timer] = None,
+    ) -> None:
+        """Refresh policy and/or reference logprobs for ``meta``.
+
+        Thin dispatcher over :meth:`get_logprobs_from_meta` and
+        :meth:`get_reference_policy_logprobs_from_meta` exposing a single
+        entrypoint for SingleController's per-group logprob refresh hook.
+        Workers write the per-token tensors back into the TQ partition;
+        the Ray return is None. No-op if both flags are False.
+
+        ``PolicyTrainerActor`` wraps this as an actor-callable method so
+        SC can invoke it via ``self._trainer.prepare_logprobs_from_meta.remote``.
+        """
+        if refresh_policy_logprobs:
+            self.get_logprobs_from_meta(
+                meta, micro_batch_size=micro_batch_size, timer=timer
+            )
+        if refresh_reference_logprobs:
+            self.get_reference_policy_logprobs_from_meta(
+                meta, micro_batch_size=micro_batch_size, timer=timer
+            )
+
     def train_from_meta(
         self,
         meta: KVBatchMeta,
@@ -438,3 +467,128 @@ class TQPolicy(Policy):
                 warnings.warn(f"Error getting theoretical flops: {e}")
 
         return aggregated_results
+
+    # ── split-API fanout (SC async path) ───────────────────────────────────
+    #
+    # Counterpart to :meth:`train_from_meta`, exposed to ``PolicyTrainerActor``
+    # so :class:`SingleControllerActor` can stream microbatches without
+    # forcing a full-step optimizer.step on every dispatch.
+    #
+    # Lifecycle:
+    #   begin_train_step                  — open step; broadcast loss_fn/gbs/mbs
+    #   train_microbatch_from_meta (N×)   — DP-sharded fwd/bwd, grads accumulate
+    #   finish_train_step                 — all_reduce + opt.step + sched.step
+    #   abort_train_step                  — drop accumulators, no opt.step
+    #
+    # ``train_from_meta`` is unchanged and remains the sync entrypoint.
+
+    def begin_train_step(
+        self,
+        step_id: str,
+        loss_fn: LossFunction,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+    ) -> None:
+        """Open a logical train step on every worker."""
+        batch_size = gbs or self.cfg["train_global_batch_size"]
+        micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
+        if self.flops_tracker is not None:
+            self.flops_tracker.reset()
+        futures = self.worker_group.run_all_workers_single_data(
+            "begin_train_step_presharded",
+            step_id=step_id,
+            loss_fn=loss_fn,
+            gbs=batch_size,
+            mbs=micro_batch_size,
+        )
+        self.worker_group.get_all_worker_results(futures)
+
+    def train_microbatch_from_meta(
+        self,
+        step_id: str,
+        meta: KVBatchMeta,
+        timer: Optional[Timer] = None,
+    ) -> dict[str, Any]:
+        """Dispatch one microbatch (DP-sharded) into an open train step.
+
+        Mirrors the sharding logic of :meth:`train_from_meta` but without
+        a logical-batch sizing constraint: this routes ``meta`` to DP
+        ranks and runs forward+backward; gradients accumulate in
+        ``.grad``. The optimizer step happens at :meth:`finish_train_step`.
+        """
+        self._stamp_pad_seqlen(meta)
+        spa, dba = self._packing_args("train_mb_tokens")
+        train_meta = replace(
+            meta,
+            fields=list(DP_TRAIN_FIELDS),
+            task_name="train",
+        )
+        with timer.time("policy_training/shard_meta") if timer else nullcontext():
+            dp_metas, _ = shard_meta_for_dp(
+                train_meta,
+                dp_world=self.sharding_annotations.get_axis_size("data_parallel"),
+                batch_size=None,
+                sequence_packing_args=spa,
+                dynamic_batching_args=dba,
+            )
+
+        if self.flops_tracker is not None:
+            for m in dp_metas:
+                self.flops_tracker.track_batch(list(m.sequence_lengths or []))
+
+        with (
+            timer.time("policy_training/submit_microbatch_futures")
+            if timer
+            else nullcontext()
+        ):
+            futures = self.worker_group.run_all_workers_sharded_data(
+                "train_microbatch_presharded",
+                meta=dp_metas,
+                in_sharded_axes=["data_parallel"],
+                replicate_on_axes=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                output_is_replicated=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                common_kwargs={"step_id": step_id},
+            )
+        results = self.worker_group.get_all_worker_results(futures)
+        # Per-microbatch metrics: pass through DP-rank-0 by convention,
+        # backend may aggregate later if needed. Surface as-is for now.
+        return results[0] if results else {}
+
+    def finish_train_step(self, step_id: str) -> dict[str, Any]:
+        """Close an open train step: all_reduce, rescale, optimizer.step.
+
+        Aggregates per-rank step results into the same shape as
+        :meth:`train_from_meta` so callers don't have to special-case
+        the split path.
+        """
+        futures = self.worker_group.run_all_workers_single_data(
+            "finish_train_step_presharded",
+            step_id=step_id,
+        )
+        results = self.worker_group.get_all_worker_results(futures)
+        aggregated_results = _aggregate_train_results(results)
+
+        if self.flops_tracker is not None:
+            aggregated_results["total_flops"] = self.flops_tracker.total_flops
+            aggregated_results["num_ranks"] = self.worker_group.cluster.world_size()
+
+        return aggregated_results
+
+    def abort_train_step(self, step_id: str) -> None:
+        """Drop partial step state on every worker. No optimizer.step."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "abort_train_step_presharded",
+            step_id=step_id,
+        )
+        self.worker_group.get_all_worker_results(futures)
+
+        if self.flops_tracker is not None:
+            self.flops_tracker.reset()
