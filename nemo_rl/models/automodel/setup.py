@@ -27,10 +27,13 @@ from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components._peft.lora import PeftConfig
 from nemo_automodel.components.config.loader import _resolve_target
-from nemo_automodel.components.distributed.config import FSDP2Config
-from nemo_automodel.components.distributed.mesh_utils import create_device_mesh
+from nemo_automodel.components.distributed.config import (
+    DistributedSetup,
+    FSDP2Config,
+    MoEParallelizerConfig,
+)
+from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismSizes
 from nemo_automodel.components.distributed.tensor_utils import get_cpu_state_dict
-from nemo_automodel.components.moe.config import MoEParallelizerConfig
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 from transformers import (
     AutoConfig,
@@ -456,7 +459,6 @@ def setup_distributed(
         offload_policy=CPUOffloadPolicy(pin_memory=False) if cpu_offload else None,
         activation_checkpointing=config["dtensor_cfg"]["activation_checkpointing"],
         defer_fsdp_grad_sync=config["dtensor_cfg"].get("defer_fsdp_grad_sync", True),
-        backend="nccl",
     )
 
     # Create MoEParallelizerConfig from nested moe_parallelizer options
@@ -470,16 +472,20 @@ def setup_distributed(
             "If you need this feature, please file an issue on https://github.com/NVIDIA-NeMo/Automodel."
         )
 
-    # Create device meshes (dp_size is derived from world_size / (tp * cp * ep))
-    device_mesh, moe_mesh = create_device_mesh(
+    # Create device meshes (dp_size is derived from world_size / (tp * cp * ep)).
+    # automodel 2d946b0 replaced create_device_mesh() with MeshContext.build().
+    mesh_context = MeshContext.build(
         fsdp2_config,
-        dp_replicate_size=dp_replicate_size,
-        tp_size=tp_size,
-        pp_size=1,
-        cp_size=cp_size,
-        ep_size=ep_size,
+        ParallelismSizes(
+            dp_replicate_size=dp_replicate_size,
+            tp_size=tp_size,
+            pp_size=1,
+            cp_size=cp_size,
+            ep_size=ep_size,
+        ),
         world_size=world_size,
     )
+    device_mesh, moe_mesh = mesh_context.device_mesh, mesh_context.moe_mesh
 
     # Derive sizes from mesh
     resolved_dp_size = device_mesh["dp"].size()
@@ -495,49 +501,6 @@ def setup_distributed(
         tp_size=resolved_tp_size,
         cp_size=resolved_cp_size,
     )
-
-
-# AUTOMODEL-WORKAROUND(restore-dtype): TEMPORARY. Remove when the automodel pin includes
-# NVIDIA-NeMo/Automodel PR #2419 (rewrites _restore_loaded_model_dtype to honor an explicit
-# torch_dtype via promote_types). Currently pinned at automodel 6de0c361 (pre-#2419).
-def _disable_automodel_checkpoint_dtype_restore() -> None:
-    """No-op Automodel's ``_restore_loaded_model_dtype`` on the HF/force_hf load path.
-
-    NeMo-RL loads policy models with ``torch_dtype=float32`` to keep fp32 master weights
-    for the optimizer. Automodel's ``_restore_loaded_model_dtype`` (added after automodel
-    ``92635e74``) re-casts each loaded parameter back to the bf16 checkpoint dtype, silently
-    downgrading the master weights so AdamW updates underflow and the model fails to learn
-    (e.g. grpo-nano-v2-12b reward stuck ~0.18). Disable it so the requested fp32 load is
-    honored. Tracked by NVIDIA-NeMo/Automodel#2419; remove once the automodel pin includes it.
-    See ``test_automodel_dtype_restore_workaround_still_needed`` for the removal tripwire.
-    """
-    from nemo_automodel._transformers import model_init as _model_init
-
-    # Removal tripwire: if Automodel drops/renames this symbol (the likely shape of the
-    # upstream fix), the workaround is obsolete -> warn loudly and self-deactivate.
-    restore = getattr(_model_init, "_restore_loaded_model_dtype", None)
-    if restore is None:
-        import warnings
-
-        warnings.warn(
-            "Automodel no longer defines _restore_loaded_model_dtype; NeMo-RL's fp32 "
-            "master-weight workaround is obsolete - remove "
-            "_disable_automodel_checkpoint_dtype_restore() in setup.py.",
-            stacklevel=2,
-        )
-        return
-    if getattr(restore, "_nrl_disabled", False):
-        return
-
-    def _noop(*args, **kwargs) -> None:  # pragma: no cover
-        return None
-
-    _noop._nrl_disabled = True
-    # Stash the genuine function so the removal tripwire test
-    # (test_automodel_dtype_restore_workaround_still_needed) can exercise Automodel's
-    # real behavior even after this no-op has globally replaced the symbol process-wide.
-    _noop._nrl_original = restore
-    _model_init._restore_loaded_model_dtype = _noop
 
 
 def setup_model_and_optimizer(
@@ -700,19 +663,23 @@ def setup_model_and_optimizer(
     # HF conversion (required for weight syncing).
     _maybe_set_force_hf(automodel_kwargs, model_config)
 
-    # Keep fp32 master weights: stop Automodel from restoring loaded params to the bf16
-    # checkpoint dtype, which would break optimizer master-weight precision (see helper).
-    _disable_automodel_checkpoint_dtype_restore()
+    # Bundle distributed topology + policies into a single DistributedSetup. automodel
+    # 2d946b0's from_pretrained rejects the old separate distributed kwargs
+    # (device_mesh/moe_mesh/distributed_config/moe_config/activation_checkpointing) and
+    # requires them via distributed_setup. pipeline_config=None: PP is not used here.
+    distributed_setup = DistributedSetup(
+        mesh_context=MeshContext.from_meshes(device_mesh, moe_mesh),
+        strategy_config=fsdp2_config,
+        pipeline_config=None,
+        moe_parallel_config=moe_config if ep_size > 1 else None,
+        activation_checkpointing=config["dtensor_cfg"]["activation_checkpointing"],
+    )
 
     # Create model via from_pretrained - handles meta device init, parallelization,
     # LoRA, and base weight loading internally
     model = model_class.from_pretrained(
         model_name,
-        device_mesh=device_mesh,
-        moe_mesh=moe_mesh,
-        distributed_config=fsdp2_config,
-        moe_config=moe_config if ep_size > 1 else None,
-        activation_checkpointing=config["dtensor_cfg"]["activation_checkpointing"],
+        distributed_setup=distributed_setup,
         peft_config=peft_config,
         attn_implementation=attn_impl,
         torch_dtype=str(model_config.torch_dtype),
