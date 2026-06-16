@@ -1415,6 +1415,63 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             traceback.print_exc()
             return False
 
+    async def init_per_pp_refit_comm_group_async(
+        self,
+        rank_prefix: int,
+        pp_ips: list[str],
+        pp_ports: list[int],
+        pp_size: int,
+        train_ranks_per_stage: int,
+        sub_world_size: int,
+    ) -> None:
+        """Async version of init_per_pp_refit_comm_group."""
+        await self.llm.collective_rpc(
+            "init_per_pp_refit_comm_group",
+            args=(
+                rank_prefix,
+                pp_ips,
+                pp_ports,
+                pp_size,
+                train_ranks_per_stage,
+                sub_world_size,
+            ),
+        )
+
+    async def prepare_nccl_xfer_refit_info_async(self, refit_info: dict) -> None:
+        """Async version of prepare_nccl_xfer_refit_info."""
+        await self.llm.collective_rpc(
+            "prepare_nccl_xfer_refit_info", args=(refit_info,)
+        )
+
+    async def nccl_xfer_refit_async(self) -> bool:
+        """Async version of nccl_xfer_refit."""
+        try:
+            assert self.llm is not None, (
+                "Attempting to update weights with either an uninitialized vLLM or non-model-owner"
+            )
+
+            result_or_coro = await self.llm.collective_rpc(
+                "nccl_xfer_refit", args=tuple()
+            )
+
+            if asyncio.iscoroutine(result_or_coro):
+                worker_results = await result_or_coro
+            else:
+                worker_results = result_or_coro
+
+            worker_result = worker_results[0]
+
+            if not worker_result:
+                print(f"Error: Worker failed nccl_xfer_refit. Result: {worker_result}")
+                return False
+            return True
+        except Exception as e:
+            print(f"Exception during nccl_xfer_refit: {e}", flush=True)
+            import traceback
+
+            traceback.print_exc()
+            return False
+
     async def reset_prefix_cache_async(self):
         """Async version of reset_prefix_cache."""
         assert self.llm is not None, (

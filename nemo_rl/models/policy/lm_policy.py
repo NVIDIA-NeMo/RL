@@ -989,6 +989,55 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # this function should co-work with vllm, so we should wait for all futures to complete outside
         return futures
 
+    def init_per_pp_refit_comm_group(
+        self,
+        pp_ips: list[str],
+        pp_ports: list[int],
+        pp_size: int,
+        pp_stages: list[int],
+        sub_world_size: int,
+        ranks_in_group: list[int],
+    ) -> list[ray.ObjectRef]:
+        """Initialize per-PP-stage comm groups on all train workers."""
+        futures = self.worker_group.run_all_workers_multiple_data(
+            "init_per_pp_refit_comm_group",
+            my_pp_stage=pp_stages,
+            my_rank_in_group=ranks_in_group,
+            common_kwargs={
+                "pp_ips": pp_ips,
+                "pp_ports": pp_ports,
+                "pp_size": pp_size,
+                "sub_world_size": sub_world_size,
+            },
+        )
+        return futures
+
+    def prepare_nccl_xfer_refit_info(
+        self,
+        train_parallelism,
+        gen_parallelism,
+        train_world_size,
+        gen_world_size,
+    ):
+        """Prepare per-layer param metadata for nccl_xfer refit."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "prepare_nccl_xfer_refit_info",
+            train_parallelism=train_parallelism,
+            gen_parallelism=gen_parallelism,
+            train_world_size=train_world_size,
+            gen_world_size=gen_world_size,
+        )
+        results = ray.get(futures)
+        return results[0]
+
+    def nccl_xfer_refit(self, kv_scales=None) -> list[ray.ObjectRef]:
+        """Transfer weights to gen workers via nccl_xfer (xferdtensor)."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "nccl_xfer_refit",
+            kv_scales=kv_scales,
+        )
+        return futures
+
     def offload_before_refit(self) -> None:
         """Offload the optimizer and buffers to the CPU."""
         futures = self.worker_group.run_all_workers_single_data("offload_before_refit")
