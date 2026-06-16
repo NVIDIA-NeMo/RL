@@ -35,7 +35,7 @@ Generated audit of every test function under `tests/unit/data_plane/` with a one
 - `test_promote_1d_leaves_unsqueezes_1d` — `_promote_1d_leaves` turns 1D `(N,)` leaves into `(N, 1)` for mooncake wire.
 - `test_promote_1d_roundtrip_via_from_wire` — `_promote_1d_leaves` + `_from_wire` restores original `(N,)` shape and values.
 - `test_pack_per_token_field_truncates_sp_padding` — pack_per_token_field slices each row to its own length, dropping SP padding.
-- `test_pack_per_token_field_exact_fit_equals_maybe_pack_jagged` — At exact fit, `pack_per_token_field` ≡ `maybe_pack_jagged`.
+- `test_pack_per_token_field_exact_fit_matches_to_nested_by_length` — At exact fit, `pack_per_token_field` matches `to_nested_by_length`.
 
 ## `test_codec_wire_stripped.py` (5 tests)
 
