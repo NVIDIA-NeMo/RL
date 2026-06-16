@@ -8,22 +8,21 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
-# Resolve uv and ffmpeg — PATH is often minimal inside srun containers
+# Resolve python and ffmpeg — PATH is often minimal inside srun containers
 # ---------------------------------------------------------------------------
-UV=""
-for candidate in uv /usr/local/bin/uv /opt/conda/bin/uv ~/.cargo/bin/uv; do
-    if command -v "$candidate" &>/dev/null; then
-        UV="$candidate"
+PYTHON=""
+for candidate in /opt/nemo_rl_venv/bin/python /opt/nemo_rl_venv/bin/python3 python3 python /usr/bin/python3 /usr/local/bin/python3 /opt/conda/bin/python3 /opt/conda/bin/python; do
+    if [[ -x "$candidate" ]] || command -v "$candidate" &>/dev/null; then
+        PYTHON="$candidate"
         break
     fi
 done
-if [[ -z "$UV" ]]; then
-    echo "ERROR: uv not found. Tried: uv /usr/local/bin/uv /opt/conda/bin/uv ~/.cargo/bin/uv"
+if [[ -z "$PYTHON" ]]; then
+    echo "ERROR: no Python interpreter found."
     exit 1
 fi
-echo "Using uv: $UV ($(command -v "$UV"))"
-# Convenience wrapper — use run_python instead of "$PYTHON" throughout
-run_python() { "$UV" run python "$@"; }
+echo "Using Python: $PYTHON"
+run_python() { "$PYTHON" "$@"; }
 
 FFMPEG=""
 for candidate in ffmpeg /usr/bin/ffmpeg /usr/local/bin/ffmpeg /opt/conda/bin/ffmpeg; do
