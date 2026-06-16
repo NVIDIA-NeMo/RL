@@ -10,6 +10,8 @@
 </div>
 
 ## 📣 News
+* [06/12/2026] [Minimax-M3](https://github.com/NVIDIA-NeMo/RL/tree/minimax-m3) Day 0 support by NeMo RL! More details on the [accuracy verifications](https://github.com/NVIDIA-NeMo/RL/blob/minimax-m3/docs/guides/minimax-m3.md). Thank you [vLLM for the shoutout](https://x.com/vllm_project/status/2065445062423826534
+).
 * [06/04/2026] [Nemotron-3-Ultra](https://research.nvidia.com/labs/nemotron/Nemotron-3-Ultra/) was trained with NeMo-RL! Follow [this guide](https://github.com/NVIDIA-NeMo/RL/blob/ultra-v3/docs/guides/nemotron-3-ultra.md) to explore the post-training recipe.
 * [04/30/2026] [Release v0.6.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.6.0)
     * Sglang backend, Muon Optimizer, Speculative Decoding, Yarn long-context training, Chunked Cross Entropy Loss, top-p/top-k training
