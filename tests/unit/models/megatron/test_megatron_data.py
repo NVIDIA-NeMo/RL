@@ -284,6 +284,8 @@ class TestProcessMicrobatch:
         data_dict.__getitem__ = MagicMock(
             side_effect=lambda k: input_ids if k == "input_ids" else seq_lengths
         )
+        # This fixture provides neither mtp_loss_mask nor routed_experts, so those
+        # optional packing branches must not fire.
         data_dict.__contains__ = MagicMock(
             side_effect=lambda k: k in {"input_ids", "input_lengths"}
         )
@@ -305,6 +307,92 @@ class TestProcessMicrobatch:
 
         # Verify pack was called
         mock_pack.assert_called_once()
+
+    @patch("nemo_rl.models.megatron.data.get_ltor_masks_and_position_ids")
+    def test_process_microbatch_no_packing_propagates_mtp_loss_mask(
+        self, mock_get_masks
+    ):
+        """Without packing, a precomputed mtp_loss_mask is passed through."""
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        mock_get_masks.return_value = (
+            torch.ones(1, 4),
+            None,
+            torch.arange(4).unsqueeze(0),
+        )
+        input_ids = torch.tensor([[1, 2, 3, 4]])
+        mtp_loss_mask = torch.tensor([[1, 1, 0, 0]])
+        data_dict = {"input_ids": input_ids, "mtp_loss_mask": mtp_loss_mask}
+
+        result = process_microbatch(
+            data_dict, pack_sequences=False, straggler_timer=MagicMock()
+        )
+        assert result.mtp_loss_mask is not None
+        assert torch.equal(result.mtp_loss_mask, mtp_loss_mask)
+
+    @patch("nemo_rl.models.megatron.data.get_ltor_masks_and_position_ids")
+    def test_process_microbatch_no_packing_mtp_loss_mask_absent(self, mock_get_masks):
+        """mtp_loss_mask defaults to None when not provided."""
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        mock_get_masks.return_value = (
+            torch.ones(1, 4),
+            None,
+            torch.arange(4).unsqueeze(0),
+        )
+        data_dict = {"input_ids": torch.tensor([[1, 2, 3, 4]])}
+
+        result = process_microbatch(
+            data_dict, pack_sequences=False, straggler_timer=MagicMock()
+        )
+        assert result.mtp_loss_mask is None
+
+    @patch("nemo_rl.models.megatron.data.get_context_parallel_rank", return_value=0)
+    @patch(
+        "nemo_rl.models.megatron.data.get_context_parallel_world_size", return_value=1
+    )
+    @patch("nemo_rl.models.megatron.data._pack_sequences_for_megatron")
+    def test_process_microbatch_with_packing_packs_mtp_loss_mask(
+        self, mock_pack, mock_cp_world, mock_cp_rank
+    ):
+        """With packing, mtp_loss_mask is packed like input_ids and propagated."""
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        # Distinct tensors at index 0 and 1 so the assertion below can catch an
+        # off-by-one read (the implementation must take index 1, the CP-sharded
+        # packed tensor, not index 0).
+        packed_idx0 = torch.zeros(1, 8, dtype=torch.long)
+        packed_idx1 = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]])
+        mock_pack.return_value = (
+            packed_idx0,
+            packed_idx1,
+            MagicMock(),
+            torch.tensor([0, 5, 8], dtype=torch.int32),
+            torch.tensor([0, 5, 8], dtype=torch.int32),
+        )
+
+        data_dict = {
+            "input_ids": torch.tensor(
+                [[1, 2, 3, 4, 5, 0, 0, 0], [6, 7, 8, 0, 0, 0, 0, 0]]
+            ),
+            "input_lengths": torch.tensor([5, 3]),
+            "mtp_loss_mask": torch.tensor(
+                [[1, 1, 1, 1, 1, 0, 0, 0], [1, 1, 1, 0, 0, 0, 0, 0]]
+            ),
+        }
+
+        result = process_microbatch(
+            data_dict,
+            seq_length_key="input_lengths",
+            pack_sequences=True,
+            straggler_timer=MagicMock(),
+        )
+
+        # _pack_sequences_for_megatron is called once for input_ids and once for mtp_loss_mask.
+        assert mock_pack.call_count == 2
+        # mtp_loss_mask takes the packed tensor (index 1 of the pack return tuple).
+        assert result.mtp_loss_mask is not None
+        assert torch.equal(result.mtp_loss_mask, packed_idx1)
 
     @patch("nemo_rl.models.megatron.data.get_context_parallel_rank", return_value=0)
     @patch(

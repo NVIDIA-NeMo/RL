@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -2391,6 +2391,10 @@ def grpo_train(
                     metrics.update(
                         {f"moe/{k}": v for k, v in train_results["moe_metrics"].items()}
                     )
+                if "mtp_metrics" in train_results:
+                    metrics.update(
+                        {f"mtp/{k}": v for k, v in train_results["mtp_metrics"].items()}
+                    )
                 if master_config.grpo["use_dynamic_sampling"]:
                     metrics["filtered_reward"] = rewards.numpy()
                     metrics["reward"] = repeated_batch["total_reward"].numpy()
@@ -3594,6 +3598,10 @@ def async_grpo_train(
                 if "moe_metrics" in train_results:
                     metrics.update(
                         {f"moe/{k}": v for k, v in train_results["moe_metrics"].items()}
+                    )
+                if "mtp_metrics" in train_results:
+                    metrics.update(
+                        {f"mtp/{k}": v for k, v in train_results["mtp_metrics"].items()}
                     )
                 metrics.update(train_results["all_mb_metrics"])
                 for k, v in metrics.items():

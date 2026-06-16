@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -729,6 +729,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         }
         if "moe_metrics" in results[0]:
             aggregated_results["moe_metrics"] = results[0]["moe_metrics"]
+        if "mtp_metrics" in results[0]:
+            aggregated_results["mtp_metrics"] = results[0]["mtp_metrics"]
 
         if self.flops_tracker is not None:
             aggregated_results["total_flops"] = self.flops_tracker.total_flops
