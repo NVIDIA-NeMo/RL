@@ -1,0 +1,25 @@
+# Smoke-test recipe layered on grpo_math_1B.yaml — switches to GSM8K and runs
+# 10 steps so users can validate their install end-to-end more quickly.
+#
+# Usage:
+#   uv run examples/run_grpo.py --config examples/configs/recipes/llm/grpo-smoke.yaml
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 4
+  max_num_steps: 10
+  val_period: -1
+  val_at_start: false
+  val_at_end: false
+checkpointing:
+  enabled: false
+policy:
+  model_name: Qwen/Qwen3-0.6B
+  train_global_batch_size: 8
+  train_micro_batch_size: 8
+data:
+  train:
+    dataset_name: gsm8k
+cluster:
+  gpus_per_node: 1
+  num_nodes: 1
