@@ -47,3 +47,5 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     training.max_train_steps=2 \
     $@ \
     2>&1 | tee $RUN_LOG
+
+# TODO: add metrics
