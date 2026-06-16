@@ -57,7 +57,7 @@ The MMPR-Tiny recipe uses [`examples/configs/vlm_grpo_nemotron_omni_mmpr.yaml`](
 | `data.train.download_dir` | local cache dir for MMPR-Tiny (loader auto-downloads from HF) |
 | `data.train.split_validation_size` | `0.008` (val split carved out of train) |
 | `policy.max_total_sequence_length` | 10000 |
-| `env.mmpr-tiny.reward_functions` | `verl_geo3k` (1.0, `format_score: 0.1`) |
+| `env.mmpr-tiny.reward_functions` | `geo3k` (1.0, `format_score: 0.1`) |
 
 
 ### Launch (4-node Slurm)

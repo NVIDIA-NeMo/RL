@@ -142,12 +142,14 @@ def bbox_giou_reward(
     return giou, giou > 0.5
 
 
-def verl_geo3k_reward(
+def geo3k_reward(
     ground_truth: str,
     response: str,
     format_score: float = 0.1,
 ) -> tuple[float, bool]:
-    r"""Reward function for MMPR-Tiny task following verl's geo3k implementation.
+    r"""Reward function for the MMPR-Tiny task.
+
+    Has the same behavior as the geo3k reward function in verl.
 
     Combines format checking and accuracy checking in a single function.
     Format check looks for </think> tag and \\boxed{} pattern.

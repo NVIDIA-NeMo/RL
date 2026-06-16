@@ -126,7 +126,7 @@ env:
   mmpr-tiny:
     num_workers: 8
     reward_functions:
-    - name: verl_geo3k
+    - name: geo3k
       weight: 1.0
       kwargs:
         format_score: 0.1
