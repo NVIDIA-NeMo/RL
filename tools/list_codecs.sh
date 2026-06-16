@@ -10,7 +10,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Resolve python and ffmpeg — PATH is often minimal inside srun containers
 # ---------------------------------------------------------------------------
-PYTHON=/opt/nemo_rl_venv/bin/python3
+PYTHON=/opt/nemo_rl_venv/bin/python3.13
 echo "Using Python: $PYTHON"
 run_python() { "$PYTHON" "$@"; }
 
