@@ -1219,6 +1219,12 @@ def grpo_train_sync(
                         "vllm_metrics_logger_interval"
                     ],
                     logger,
+                    log_scalars=master_config.policy["generation"]["vllm_cfg"].get(
+                        "vllm_metrics_log_scalars", False
+                    ),
+                    log_timeline_plots=master_config.policy["generation"][
+                        "vllm_cfg"
+                    ].get("vllm_metrics_log_timeline_plots", True),
                 )
 
             if (

@@ -340,16 +340,53 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         stop_event = threading.Event()
         self._vllm_metrics_logger_stop_event = stop_event
 
+        # Gauges (instantaneous readings) -- logged as sampled.
         self.inflight_batch_sizes: list[int] = []
         self.num_pending_samples: list[int] = []
         self.kv_cache_usage_perc: list[float] = []
+        # vLLM exposes generation_tokens / prefix_cache_queries / prefix_cache_hits /
+        # num_preemptions as CUMULATIVE counters (monotonic from engine start). We log per-interval
+        # DELTAS rather than the lifetime totals so each step's series reflects that step's activity
+        # (a lifetime total would just ramp with runtime and never be step-comparable).
+        # prefix_cache_hit_rate is derived from the query/hit deltas. _prev_counters holds the last
+        # raw cumulative readings and PERSISTS across clear_vllm_logger_metrics() so the deltas stay
+        # correct across steps; _windowed_delta() clamps a negative delta (engine restart -> counter
+        # reset to 0) to 0 and re-baselines.
         self.generation_tokens: list[int] = []
+        self.prefix_cache_queries: list[int] = []
+        self.prefix_cache_hits: list[int] = []
+        self.num_preemptions: list[int] = []
+        self.prefix_cache_hit_rate: list[float] = []
+        self._prev_counters: dict[str, int] = {
+            "generation_tokens": 0,
+            "prefix_cache_queries": 0,
+            "prefix_cache_hits": 0,
+            "num_preemptions": 0,
+        }
+
+        def _windowed_delta(raw: int, counter_name: str) -> int:
+            """Per-interval delta of a cumulative vLLM counter.
+
+            Returns raw - previous-reading and re-baselines. A negative delta means the
+            engine restarted (counter reset to 0), so clamp to 0 instead of logging a large
+            negative spike. _prev_counters persist across clear_vllm_logger_metrics() so
+            deltas stay correct across steps.
+            """
+            delta = raw - self._prev_counters[counter_name]
+            self._prev_counters[counter_name] = raw
+            return delta if delta >= 0 else 0
 
         def _logger_loop():
             # Delay a little to let engine settle
             time.sleep(min(2.0, interval_s))
             while True:
                 try:
+                    # Gauges are appended as sampled; cumulative counters are captured raw here
+                    # and converted to per-interval deltas after the snapshot pass.
+                    raw_generation_tokens: int | None = None
+                    raw_prefix_cache_queries: int | None = None
+                    raw_prefix_cache_hits: int | None = None
+                    raw_num_preemptions: int | None = None
                     for m in get_metrics_snapshot():
                         with self._vllm_metrics_lock:
                             if isinstance(m, Gauge):
@@ -364,7 +401,39 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                                     self.kv_cache_usage_perc.append(float(m.value))
                             elif isinstance(m, Counter):
                                 if m.name == "vllm:generation_tokens":
-                                    self.generation_tokens.append(int(m.value))
+                                    raw_generation_tokens = int(m.value)
+                                elif m.name == "vllm:prefix_cache_queries":
+                                    raw_prefix_cache_queries = int(m.value)
+                                elif m.name == "vllm:prefix_cache_hits":
+                                    raw_prefix_cache_hits = int(m.value)
+                                elif m.name == "vllm:num_preemptions":
+                                    raw_num_preemptions = int(m.value)
+                    # Convert cumulative counters to per-interval deltas (step-comparable), and
+                    # derive the windowed prefix-cache hit-rate from the same query/hit deltas.
+                    with self._vllm_metrics_lock:
+                        if raw_generation_tokens is not None:
+                            self.generation_tokens.append(
+                                _windowed_delta(
+                                    raw_generation_tokens, "generation_tokens"
+                                )
+                            )
+                        dq = dh = None
+                        if raw_prefix_cache_queries is not None:
+                            dq = _windowed_delta(
+                                raw_prefix_cache_queries, "prefix_cache_queries"
+                            )
+                            self.prefix_cache_queries.append(dq)
+                        if raw_prefix_cache_hits is not None:
+                            dh = _windowed_delta(
+                                raw_prefix_cache_hits, "prefix_cache_hits"
+                            )
+                            self.prefix_cache_hits.append(dh)
+                        if raw_num_preemptions is not None:
+                            self.num_preemptions.append(
+                                _windowed_delta(raw_num_preemptions, "num_preemptions")
+                            )
+                        if dq is not None and dh is not None and dq > 0:
+                            self.prefix_cache_hit_rate.append(dh / dq)
                 except Exception:
                     print(
                         "⚠️[vLLM Metric Logger] Exception in vLLM metrics logger",
@@ -393,6 +462,10 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 "num_pending_samples": copy.deepcopy(self.num_pending_samples),
                 "kv_cache_usage_perc": copy.deepcopy(self.kv_cache_usage_perc),
                 "generation_tokens": copy.deepcopy(self.generation_tokens),
+                "prefix_cache_queries": copy.deepcopy(self.prefix_cache_queries),
+                "prefix_cache_hits": copy.deepcopy(self.prefix_cache_hits),
+                "prefix_cache_hit_rate": copy.deepcopy(self.prefix_cache_hit_rate),
+                "num_preemptions": copy.deepcopy(self.num_preemptions),
             }
         return metric
 
@@ -404,7 +477,14 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             self.inflight_batch_sizes = []
             self.num_pending_samples = []
             self.kv_cache_usage_perc = []
+            # NOTE: clear only the per-step series; do NOT reset _prev_counters (handled in
+            # _windowed_delta) — they track the monotonic cumulative counters across steps so the
+            # next step's deltas (and the hit-rate) stay correct after a clear.
             self.generation_tokens = []
+            self.prefix_cache_queries = []
+            self.prefix_cache_hits = []
+            self.prefix_cache_hit_rate = []
+            self.num_preemptions = []
 
     async def post_init_async(self):
         self.vllm_device_ids = await self.report_device_id_async()
