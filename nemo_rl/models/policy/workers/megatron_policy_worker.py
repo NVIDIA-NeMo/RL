@@ -1638,9 +1638,11 @@ class MegatronPolicyWorkerImpl(
         # for the code simplicity.
         train_tp = train_parallelism.get("tp_size", 1)
         gen_tp = gen_parallelism.get("tp_size", 1)
-        qkv_to_misc = self.megatron_bridge.transformer_config.num_query_groups < max(
-            train_tp, gen_tp
-        )
+
+        # We are curretly forcing the QKV to the misc path
+        # QKV weights are only 1-2% of the total weights but brings a lot of complexity
+        # to be handled from the xfer-refit path.
+        qkv_to_misc = True
 
         state_dict_metadata = {}
         misc_meta = OrderedDict()
