@@ -104,6 +104,8 @@ class MegatronGeneration(GenerationInterface):
         # Stand up a dedicated inference-only policy.
         self._owns_policy = True
         self._policy_config["megatron_cfg"].update(self.cfg["mcore_generation_config"])
+        # Activation checkpointing is not compatible or useful in inference.
+        self._policy_config["megatron_cfg"]["activation_checkpointing"] = False
         # Reserve GPUs before Policy workers grab them, to prevent disjoint NVLS domains.
         self.init_cluster_placement_groups(cluster, self._policy_config)
         self._policy = Policy(
