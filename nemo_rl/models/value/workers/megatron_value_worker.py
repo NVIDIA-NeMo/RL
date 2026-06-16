@@ -93,6 +93,7 @@ def forward_step_value(
     pack_sequences=False,
     defer_fp32_logits=None,
     cp_normalize=True,
+    num_microbatches=1,
     policy_cfg=None,
 ):
     """Forward step for the value model.
@@ -173,6 +174,18 @@ def forward_step_value(
             return loss / cp_size, metrics
 
         loss_fn_wrapped = _div_by_cp_size
+
+    # Counteract Megatron schedules.py's default (* cp_size / num_microbatches) loss
+    # averaging so per-microbatch losses (each normalized by global_valid_toks) are
+    # summed, not averaged. Mirrors the policy LossPostProcessor.
+    cp_size = parallel_state.get_context_parallel_world_size()
+    loss_fn_before_mcore_scaling = loss_fn_wrapped
+
+    def _counteract_mcore_loss_averaging(*args, **kwargs):
+        loss, metrics = loss_fn_before_mcore_scaling(*args, **kwargs)
+        return loss * num_microbatches / cp_size, metrics
+
+    loss_fn_wrapped = _counteract_mcore_loss_averaging
 
     return output_tensor, loss_fn_wrapped
 
@@ -600,6 +613,7 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
                                 "enabled", False
                             ),
                             defer_fp32_logits=self.defer_fp32_logits,
+                            num_microbatches=num_microbatches,
                         ),
                         data_iterator=data_iterator,
                         model=self.model,

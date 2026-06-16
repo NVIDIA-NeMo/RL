@@ -147,7 +147,7 @@ def _create_value_test_config(
 
 
 def _apply_config_updates(config: ValueConfig, config_updates: dict) -> None:
-    """Apply test config overrides in place (precision / SP / PP / dynamic batching)."""
+    """Apply test config overrides in place (precision / SP / PP / dynamic batching / sequence packing)."""
     for k, v in config_updates.items():
         if k == "precision":
             config["precision"] = v
