@@ -83,7 +83,10 @@ from nemo_rl.experience.rollouts import (
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.sglang import SGLangConfig, SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
-from nemo_rl.models.megatron.router_replay import configure_vllm_for_router_replay
+from nemo_rl.models.megatron.router_replay import (
+    configure_vllm_for_router_replay,
+    router_replay_enabled,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
@@ -2152,6 +2155,18 @@ def grpo_train(
                         as_tensors=False
                     )
                     train_data.update(extra_multimodal_data)
+                    # Router replay (R3) on the legacy data_plane.enabled=false
+                    # driver path: routed_experts already rides flat_messages
+                    # (attached to message_log during rollout, then batched into
+                    # a [B, S, L, K] tensor by batched_message_log_to_flat_message),
+                    # but the train_data whitelist above drops it. Copy it back so
+                    # the Megatron worker's train-stage router-replay guard finds
+                    # it. Mirrors the TQ producer (sync_rollout_actor.py).
+                    if (
+                        router_replay_enabled(master_config.policy)
+                        and "routed_experts" in flat_messages
+                    ):
+                        train_data["routed_experts"] = flat_messages["routed_experts"]
                     train_data.to("cpu")
 
                     metrics_logging_data["content"] = flat_messages["content"]
@@ -2195,6 +2210,18 @@ def grpo_train(
                             **extra_multimodal_data,
                         }
                     )
+                    # Router replay (R3): the prev-logprobs forward replays the
+                    # recorded routed_experts, so logprob_data must carry the
+                    # field too (it is a separate whitelist from train_data). The
+                    # reference-policy logprobs call reuses logprob_data but
+                    # intentionally ignores routed_experts (require_router_replay
+                    # =False short-circuits before the field is read), so a
+                    # present-but-unused field here is safe.
+                    if (
+                        router_replay_enabled(master_config.policy)
+                        and "routed_experts" in flat_messages
+                    ):
+                        logprob_data["routed_experts"] = flat_messages["routed_experts"]
 
                     if not skip_prev_logprobs:
                         train_data["prev_logprobs"] = policy.get_logprobs(
