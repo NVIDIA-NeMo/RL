@@ -169,15 +169,13 @@ def setup(
     checkpointer = CheckpointManager(checkpointing_config)
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
     loaded_state = checkpointer.load_training_info(last_checkpoint_path)
-    if isinstance(loaded_state, dict):
+    if loaded_state is not None:
         # Filter to only known DPOSaveState fields; checkpoints may carry
         # extra keys (e.g. validation metrics from previous runs).
         known_fields = {f.name for f in fields(DPOSaveState)}
         dpo_save_state = DPOSaveState(
             **{k: v for k, v in loaded_state.items() if k in known_fields}
         )
-    elif loaded_state is not None:
-        dpo_save_state = loaded_state
     else:
         dpo_save_state = DPOSaveState(
             epoch=0, step=0, total_steps=0, consumed_samples=0, total_valid_tokens=0
