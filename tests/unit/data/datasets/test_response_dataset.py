@@ -353,7 +353,8 @@ def test_dailyomni_dataset():
     # check the content
     assert first_example["messages"][0]["role"] == "user"
     assert first_example["messages"][0]["content"][0]["type"] == "video"
-    assert first_example["messages"][0]["content"][1]["type"] == "text"
+    assert first_example["messages"][0]["content"][1]["type"] == "audio"
+    assert first_example["messages"][0]["content"][2]["type"] == "text"
     assert first_example["messages"][1]["role"] == "assistant"
 
     assert first_example["messages"][1]["content"] == "B"
