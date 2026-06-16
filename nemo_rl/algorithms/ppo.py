@@ -1577,6 +1577,7 @@ def ppo_train(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "value", "tokenizer"
                             ),
+                            checkpointing_cfg=master_config.checkpointing,
                         )
                         value_model.finish_training()
 

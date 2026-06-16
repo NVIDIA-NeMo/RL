@@ -13,6 +13,7 @@ defaults: ../../ppo_math_1B_megatron.yaml
 ppo:
   num_prompts_per_step: 1024
   num_generations_per_prompt: 1
+  ppo_epochs: 1
   steps_per_epoch: 1
   max_num_epochs: 15
   # bg51717's reference .sh injects `ppo.max_num_steps=100` from the CLI and
@@ -34,8 +35,10 @@ ppo:
 loss_fn:
   ratio_clip_max: 0.2
   ratio_clip_c: 3
-  value_loss_scale: 1.0
-  value_cliprange: 0.5
+
+value_loss_fn:
+  scale: 1.0
+  cliprange: 0.5
 
 checkpointing:
   checkpoint_dir: results/ppo-qwen2.5-1.5b-gsm8k-1n8g-dtensor
@@ -151,7 +154,7 @@ value:
 
 env:
   math:
-    math_verify_impl: gsm8k_verify
+    math_verify_impl: hf_math_verify
 
 data:
   max_input_seq_length: 512
