@@ -946,7 +946,10 @@ class TestDryRunTrainerSplitAPI:
         ray.get(trainer.train_microbatch_from_meta.remote("step-1", meta))
         ray.get(trainer.train_microbatch_from_meta.remote("step-1", meta))
         result = ray.get(trainer.finish_train_step.remote("step-1"))
-        assert result["trainer_version"] == 1
+        # finish_train_step no longer returns trainer_version (SC owns the
+        # counter); assert against the stub's internal counter instead.
+        assert "loss" in result
+        assert ray.get(trainer.get_trainer_version.remote()) == 1
         assert ray.get(trainer.get_open_step_id.remote()) is None
         assert ray.get(trainer.get_finish_calls.remote()) == ["step-1"]
         mbs = ray.get(trainer.get_microbatch_calls.remote())
@@ -1108,7 +1111,10 @@ class TestStreamingTrainPump:
         assert ray.get(trainer.get_trainer_version.remote()) == 1
         # finish was called exactly once
         finishes = ray.get(trainer.get_finish_calls.remote())
-        assert finishes == ["sc-step-000000"]
+        # SC step_id now carries a mini-batch suffix. With the default
+        # train_global_batch_size (coerced to samples_per_step), there's
+        # exactly one mini-batch per outer step → suffix "-mb-00".
+        assert finishes == ["sc-step-000000-mb-00"]
         mbs = ray.get(trainer.get_microbatch_calls.remote())
         assert len(mbs) == 4
 
