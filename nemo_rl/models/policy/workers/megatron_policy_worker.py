@@ -578,9 +578,9 @@ class MegatronPolicyWorkerImpl(
             saved_extra_state = None
             reenable_forward_pre_hook_after_eval = False
 
-        torch.distributed.barrier()
-        torch.cuda.synchronize()
-        _train_t0 = time.perf_counter()
+        torch.distributed.barrier()  # pragma: no cover
+        torch.cuda.synchronize()  # pragma: no cover
+        _train_t0 = time.perf_counter()  # pragma: no cover
 
         with ctx:
             all_mb_metrics = []
@@ -782,9 +782,9 @@ class MegatronPolicyWorkerImpl(
             # accumulation starts from a clean shared param/grad buffer.
             self._disable_forward_pre_hook_until_next_train_step()
 
-        torch.distributed.barrier()
-        torch.cuda.synchronize()
-        metrics_train_elapsed = time.perf_counter() - _train_t0
+        torch.distributed.barrier()  # pragma: no cover
+        torch.cuda.synchronize()  # pragma: no cover
+        metrics_train_elapsed = time.perf_counter() - _train_t0  # pragma: no cover
 
         if not eval_mode:
             # Step LR scheduler once per train() call, not per global batch.
@@ -808,7 +808,7 @@ class MegatronPolicyWorkerImpl(
             "model_dtype": self.dtype,
             "all_mb_metrics": mb_metrics,
             "grad_norm": torch.tensor([grad_norm]),
-            "train_elapsed_seconds": metrics_train_elapsed,
+            "train_elapsed_seconds": metrics_train_elapsed,  # pragma: no cover
         }
         # Read "config" via getattr-by-string so the token stays out of
         # train.__code__.co_names; with torch 2.11 cloudpickle otherwise

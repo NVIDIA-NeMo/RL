@@ -15,6 +15,7 @@
 import pytest
 import torch
 
+from nemo_rl.models.policy.lm_policy import _aggregate_megatron_flops_metrics
 from nemo_rl.utils.flops_formulas import FLOPSConfig, qwen3
 from nemo_rl.utils.flops_tracker import get_theoretical_tflops, is_using_tf32
 
@@ -53,14 +54,7 @@ def test_qwen3_flops_wide_attention():
 
 
 def test_worker_total_flops_aggregation_megatron_path():
-    """Verify the aggregation logic for total_flops and theoretical_tflops from Megatron workers.
-
-    The Megatron worker returns gpu_name, model_dtype, total_flops, and num_ranks.
-    The elif branch in lm_policy.py computes theoretical_tflops from gpu_name/model_dtype,
-    mirroring the FSDP/dtensor pattern.
-    """
-    import warnings
-
+    """Verify _aggregate_megatron_flops_metrics for the basic case (no train_elapsed_seconds)."""
     world_size = 8
     results = [
         {
@@ -71,24 +65,59 @@ def test_worker_total_flops_aggregation_megatron_path():
         }
     ]
 
-    aggregated_results: dict = {}
-    # Mirrors the elif branch in lm_policy.py
-    if results and "total_flops" in results[0]:
-        aggregated_results["total_flops"] = results[0]["total_flops"]
-        aggregated_results["num_ranks"] = results[0].get("num_ranks", world_size)
-        try:
-            aggregated_results["theoretical_tflops"] = aggregated_results[
-                "num_ranks"
-            ] * get_theoretical_tflops(
-                results[0]["gpu_name"], results[0]["model_dtype"]
-            )
-        except Exception as e:
-            warnings.warn(f"Error getting theoretical flops: {e}")
+    aggregated_results = _aggregate_megatron_flops_metrics(results, world_size)
 
     assert aggregated_results["total_flops"] == pytest.approx(1.0e15)
     assert aggregated_results["num_ranks"] == 8
+    assert "train_elapsed_seconds" not in aggregated_results
     # 8 GPUs × (1979/2 TFLOPS) for H100 bfloat16
     assert aggregated_results["theoretical_tflops"] == pytest.approx(8 * 1979 / 2)
+
+
+def test_worker_total_flops_aggregation_megatron_path_with_elapsed():
+    """Verify train_elapsed_seconds is forwarded when present in worker results."""
+    world_size = 4
+    results = [
+        {
+            "total_flops": 2.0e15,
+            "num_ranks": world_size,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "model_dtype": torch.bfloat16,
+            "train_elapsed_seconds": 3.5,
+        }
+    ]
+
+    aggregated_results = _aggregate_megatron_flops_metrics(results, world_size)
+
+    assert aggregated_results["total_flops"] == pytest.approx(2.0e15)
+    assert aggregated_results["num_ranks"] == 4
+    assert aggregated_results["train_elapsed_seconds"] == pytest.approx(3.5)
+    assert aggregated_results["theoretical_tflops"] == pytest.approx(4 * 1979 / 2)
+
+
+def test_worker_total_flops_aggregation_unknown_gpu_warns():
+    """Verify a warning is emitted and theoretical_tflops is absent for unknown GPUs."""
+    world_size = 2
+    results = [
+        {
+            "total_flops": 1.0e14,
+            "num_ranks": world_size,
+            "gpu_name": "NVIDIA UNKNOWN GPU XYZ",
+            "model_dtype": torch.bfloat16,
+        }
+    ]
+
+    import warnings
+
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        aggregated_results = _aggregate_megatron_flops_metrics(results, world_size)
+
+    assert aggregated_results["total_flops"] == pytest.approx(1.0e14)
+    assert aggregated_results["num_ranks"] == 2
+    assert "theoretical_tflops" not in aggregated_results
+    assert len(w) == 1
+    assert "theoretical flops" in str(w[0].message).lower()
 
 
 @pytest.mark.parametrize(
