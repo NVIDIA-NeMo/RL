@@ -1006,7 +1006,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         tokenizer_path: Optional[str] = None,
         checkpointing_cfg: Optional[CheckpointingConfig] = None,
     ) -> None:
-        """Save a checkpoint of the model."""
+        """Save a checkpoint of the model.
+
+        With Megatron async_save=True, this returns after D2H staging. The caller
+        must call finalize_async_save() before renaming the checkpoint directory.
+        """
         # Only pass checkpointing_cfg for DTensor v2
         use_v2 = self.cfg.get("dtensor_cfg", {}).get("_v2", False)
 
@@ -1032,6 +1036,15 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 optimizer_path=optimizer_path,
                 tokenizer_path=tokenizer_path,
             )
+        ray.get(futures)
+
+    def finalize_async_save(self) -> None:
+        """Block until all workers' in-flight async checkpoint writes complete.
+
+        No-op when async_save is disabled. Must be called before the checkpoint
+        directory is renamed from tmp_step_N/ to step_N/.
+        """
+        futures = self.worker_group.run_all_workers_single_data("finalize_async_save")
         ray.get(futures)
 
     def shutdown(self) -> bool:

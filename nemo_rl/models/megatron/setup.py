@@ -535,6 +535,7 @@ def setup_model_config(
         weights_path,
         optimizer_path,
         load_main_params_from_ckpt,
+        ckpt_cfg=config["megatron_cfg"].get("checkpoint"),
     )
 
     # Validate training configuration
@@ -794,20 +795,50 @@ def _create_checkpoint_config(
     weights_path: Optional[str],
     optimizer_path: Optional[str],
     load_main_params_from_ckpt: bool = False,
+    ckpt_cfg: Optional[dict[str, Any]] = None,
 ) -> CheckpointConfig:
-    """Create checkpoint configurations."""
-    return CheckpointConfig(
+    """Create checkpoint configurations.
+
+    Args:
+        pretrained_path: Path to the pretrained checkpoint.
+        weights_path: Path to save/load training weights.
+        optimizer_path: Path to the optimizer state (None if not resuming optimizer).
+        load_main_params_from_ckpt: Load optimizer main params from the checkpoint.
+        ckpt_cfg: Optional MegatronCheckpointConfig dict from YAML.
+    """
+    cfg = ckpt_cfg or {}
+    async_save = cfg.get("async_save", False)
+
+    # Megatron-Bridge requires checkpoint.save != None when async_save is enabled.
+    # On a fresh run (no prior checkpoint), weights_path is None, so fall back to
+    # pretrained_path as a placeholder — save_checkpoint() overwrites it with the
+    # real path before each write.
+    save_path = weights_path
+    if async_save and save_path is None:
+        save_path = pretrained_path
+
+    kwargs: dict[str, Any] = dict(
         save_interval=100,
-        save=weights_path,
+        save=save_path,
         load=weights_path,
         load_optim=optimizer_path is not None,
         pretrained_checkpoint=pretrained_path,
-        async_save=False,
+        async_save=async_save,
         fully_parallel_save=True,
         fully_parallel_load=True,
         load_rng=False,
         load_main_params_from_ckpt=load_main_params_from_ckpt,
+        ckpt_assume_constant_structure=cfg.get("ckpt_assume_constant_structure", False),
     )
+    _optional_ckpt_fields = (
+        "ckpt_fully_parallel_save_process_group",
+        "ckpt_fully_parallel_load_process_group",
+        "ckpt_fully_parallel_load_exchange_algo",
+    )
+    for field in _optional_ckpt_fields:
+        if field in cfg:
+            kwargs[field] = cfg[field]
+    return CheckpointConfig(**kwargs)
 
 
 def _validate_training_config(config: PolicyConfig, model_cfg: Any) -> None:
@@ -1007,6 +1038,18 @@ def setup_model_and_optimizer(
     state = GlobalState()
     state.cfg = megatron_cfg
     # TODO: Freeze state.cfg
+
+    # Must be called before initialize_megatron (before CUDA init) so the
+    # persistent async-checkpoint worker subprocess is spawned in a clean process.
+    # Bridge hardcodes mp_mode='spawn', the only safe option inside Ray actors
+    # (fork with Ray is an anti-pattern). Guard for older megatron-core that
+    # lacks this hook.
+    _init_async_ckpt_worker = getattr(state, "initialize_async_checkpoint_worker", None)
+    if _init_async_ckpt_worker is not None:
+        try:
+            _init_async_ckpt_worker()
+        except AttributeError:
+            pass
 
     megatron_cfg.dist.external_gpu_device_mapping = True
     initialize_megatron(

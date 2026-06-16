@@ -11,6 +11,9 @@ policy:
     enabled: false
   megatron_cfg:
     enabled: true
+    checkpoint:
+      async_save: true
+      ckpt_assume_constant_structure: true
     activation_checkpointing: true
     peft:
       enabled: true

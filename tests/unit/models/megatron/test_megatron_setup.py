@@ -1216,6 +1216,77 @@ class TestCreateCheckpointConfig:
         assert checkpoint_config.fully_parallel_load is True
         assert checkpoint_config.load_rng is False
 
+    def test_no_ckpt_cfg_uses_safe_defaults(self, tmp_path):
+        """Omitting ckpt_cfg keeps async_save off and constant-structure off."""
+        from nemo_rl.models.megatron.setup import _create_checkpoint_config
+
+        checkpoint_config = _create_checkpoint_config(
+            str(tmp_path / "pretrained"),
+            str(tmp_path / "weights"),
+            str(tmp_path / "optimizer"),
+            ckpt_cfg=None,
+        )
+
+        assert checkpoint_config.async_save is False
+        assert checkpoint_config.ckpt_assume_constant_structure is False
+
+    def test_async_save_config_wired_through(self, tmp_path):
+        """async_save / ckpt_assume_constant_structure / parallel-IO fields propagate."""
+        from nemo_rl.models.megatron.setup import _create_checkpoint_config
+
+        ckpt_cfg = {
+            "async_save": True,
+            "ckpt_assume_constant_structure": True,
+            "ckpt_fully_parallel_save_process_group": "ep_dp",
+            "ckpt_fully_parallel_load_process_group": "ep_dp",
+            "ckpt_fully_parallel_load_exchange_algo": "broadcast",
+        }
+
+        checkpoint_config = _create_checkpoint_config(
+            str(tmp_path / "pretrained"),
+            str(tmp_path / "weights"),
+            str(tmp_path / "optimizer"),
+            ckpt_cfg=ckpt_cfg,
+        )
+
+        assert checkpoint_config.async_save is True
+        assert checkpoint_config.ckpt_assume_constant_structure is True
+        assert checkpoint_config.ckpt_fully_parallel_save_process_group == "ep_dp"
+        assert checkpoint_config.ckpt_fully_parallel_load_process_group == "ep_dp"
+        assert checkpoint_config.ckpt_fully_parallel_load_exchange_algo == "broadcast"
+
+    def test_cold_start_save_falls_back_to_pretrained(self, tmp_path):
+        """With async_save and no weights_path (cold start), save falls back to pretrained."""
+        from nemo_rl.models.megatron.setup import _create_checkpoint_config
+
+        pretrained_path = str(tmp_path / "pretrained")
+
+        checkpoint_config = _create_checkpoint_config(
+            pretrained_path,
+            None,  # cold start: no prior checkpoint
+            None,
+            ckpt_cfg={"async_save": True},
+        )
+
+        # Megatron-Bridge requires save != None when async_save is enabled.
+        assert checkpoint_config.save == pretrained_path
+        assert checkpoint_config.load is None
+        assert checkpoint_config.async_save is True
+
+    def test_cold_start_no_fallback_when_sync(self, tmp_path):
+        """Without async_save, a None weights_path leaves save=None (no fallback)."""
+        from nemo_rl.models.megatron.setup import _create_checkpoint_config
+
+        checkpoint_config = _create_checkpoint_config(
+            str(tmp_path / "pretrained"),
+            None,
+            None,
+            ckpt_cfg={"async_save": False},
+        )
+
+        assert checkpoint_config.save is None
+        assert checkpoint_config.async_save is False
+
 
 @pytest.mark.mcore
 class TestValidateTrainingConfig:

@@ -11,6 +11,9 @@ policy:
   optimizer: null
   megatron_cfg:
     enabled: true
+    checkpoint:
+      async_save: true
+      ckpt_assume_constant_structure: true
     optimizer:
       lr: 5.0e-07
       min_lr: 5.0e-08

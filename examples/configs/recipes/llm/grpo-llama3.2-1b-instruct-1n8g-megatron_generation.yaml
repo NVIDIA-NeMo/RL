@@ -12,6 +12,9 @@ policy:
   optimizer: null
   megatron_cfg:
     enabled: true
+    checkpoint:
+      async_save: true
+      ckpt_assume_constant_structure: true
     scheduler:
       lr_warmup_iters: 50
   dtensor_cfg:
