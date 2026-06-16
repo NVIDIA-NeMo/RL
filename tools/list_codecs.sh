@@ -10,17 +10,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Resolve python and ffmpeg — PATH is often minimal inside srun containers
 # ---------------------------------------------------------------------------
-PYTHON=""
-for candidate in /opt/nemo_rl_venv/bin/python3.13 /opt/nemo_rl_venv/bin/python /opt/nemo_rl_venv/bin/python3 python3 python /usr/bin/python3 /usr/local/bin/python3 /opt/conda/bin/python3 /opt/conda/bin/python; do
-    if [[ -x "$candidate" ]] || command -v "$candidate" &>/dev/null; then
-        PYTHON="$candidate"
-        break
-    fi
-done
-if [[ -z "$PYTHON" ]]; then
-    echo "ERROR: no Python interpreter found."
-    exit 1
-fi
+PYTHON=/opt/nemo_rl_venv/bin/python3
 echo "Using Python: $PYTHON"
 run_python() { "$PYTHON" "$@"; }
 
