@@ -297,3 +297,53 @@ def test_get_teacher_routing_metrics():
     )
     assert metrics["on_policy_distillation/teacher_alias_unique"] == 3.0
     assert metrics["on_policy_distillation/teacher_model_unique"] == 2.0
+
+
+# ---------------------------------------------------------------------------
+# teacher_seq_pad_multiple: teacher pre-pad multiple + packing-mode guard
+# ---------------------------------------------------------------------------
+
+
+def _twg(packed, pad_multiple=1):
+    """TeacherWorkerGroup stand-in with the two attrs the helper reads."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        use_sequence_packing=packed, sequence_length_pad_multiple=pad_multiple
+    )
+
+
+def test_teacher_seq_pad_multiple_no_teachers_is_one():
+    from nemo_rl.algorithms.opd import teacher_seq_pad_multiple
+
+    assert teacher_seq_pad_multiple({}, 8) == 1
+
+
+def test_teacher_seq_pad_multiple_all_packed_is_one():
+    from nemo_rl.algorithms.opd import teacher_seq_pad_multiple
+
+    assert teacher_seq_pad_multiple({"a": _twg(True), "b": _twg(True)}, 8) == 1
+
+
+def test_teacher_seq_pad_multiple_mixed_packing_raises():
+    from nemo_rl.algorithms.opd import teacher_seq_pad_multiple
+
+    with pytest.raises(ValueError, match="same sequence-packing mode"):
+        teacher_seq_pad_multiple({"a": _twg(True), "b": _twg(False)}, 8)
+
+
+def test_teacher_seq_pad_multiple_non_packed_uses_policy_divisor():
+    # Non-packed teachers pre-pad to the policy divisor when it is a multiple of
+    # every teacher's requirement (here 2 and 4 both divide 8).
+    from nemo_rl.algorithms.opd import teacher_seq_pad_multiple
+
+    teachers = {"a": _twg(False, pad_multiple=2), "b": _twg(False, pad_multiple=4)}
+    assert teacher_seq_pad_multiple(teachers, 8) == 8
+
+
+def test_teacher_seq_pad_multiple_non_packed_incompatible_divisor_raises():
+    # policy divisor 8 is not a multiple of the teacher requirement 16.
+    from nemo_rl.algorithms.opd import teacher_seq_pad_multiple
+
+    with pytest.raises(ValueError, match="make_sequence_length_divisible_by"):
+        teacher_seq_pad_multiple({"a": _twg(False, pad_multiple=16)}, 8)

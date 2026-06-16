@@ -23,6 +23,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.grpo import MasterConfig
+from nemo_rl.algorithms.opd import teacher_seq_pad_multiple
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -62,6 +63,10 @@ class AsyncTrajectoryCollector:
         self.alias_to_group_alias = alias_to_group_alias or {}
         self.on_policy_distillation_cfg = on_policy_distillation_cfg or {}
         self._has_non_colocated_teachers = bool(self.teacher_worker_groups)
+        self._teacher_seq_pad_multiple = teacher_seq_pad_multiple(
+            self.teacher_worker_groups,
+            self.master_config.policy["make_sequence_length_divisible_by"],
+        )
         # Per-teacher locks to serialize get_logprobs calls. Concurrent calls
         # to the same teacher cause NCCL collective desync across workers
         # (different workers may receive requests in different order → SeqNum
@@ -738,13 +743,10 @@ class AsyncTrajectoryCollector:
                 if isinstance(agent_refs, list):
                     from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 
-                    # Packed teachers pad via their own packing multiple, so no pre-pad here
-                    # (a pre-pad would corrupt the packed mamba seq_idx). Non-packed teachers
-                    # are not supported yet (they'd need pre-pad to a TP multiple).
                     flat_for_teacher, teacher_input_lengths = batched_message_log_to_flat_message(
                         final_batch_cpu["message_log"],
                         pad_value_dict={"token_ids": self.tokenizer.pad_token_id},
-                        make_sequence_length_divisible_by=1,
+                        make_sequence_length_divisible_by=self._teacher_seq_pad_multiple,
                     )
                     teacher_logprobs, teacher_logprob_time = self._compute_teacher_logprobs(
                         flat_for_teacher["token_ids"], agent_refs,

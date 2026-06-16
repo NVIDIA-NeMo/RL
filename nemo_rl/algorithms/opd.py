@@ -127,6 +127,31 @@ def get_teacher_routing_metrics(
 # ---------------------------------------------------------------------------
 
 
+def teacher_seq_pad_multiple(
+    teacher_worker_groups: dict[str, Any], policy_make_seq_div_by: int
+) -> int:
+    """Sequence divisor to pre-pad teacher logprob inputs to.
+
+    Packed teachers re-pad internally, so no pre-pad is needed (1). Non-packed
+    teachers need the ``[B, S]`` forward pre-padded to the policy divisor, which
+    must be a multiple of every teacher's ``sequence_length_pad_multiple``. All
+    teachers must share one packing mode.
+    """
+    packing_modes = {twg.use_sequence_packing for twg in teacher_worker_groups.values()}
+    if len(packing_modes) > 1:
+        raise ValueError("All teachers must use the same sequence-packing mode.")
+    if packing_modes != {False}:
+        return 1  # no teachers, or all packed (they re-pad internally)
+    for alias, twg in teacher_worker_groups.items():
+        if policy_make_seq_div_by % twg.sequence_length_pad_multiple:
+            raise ValueError(
+                f"policy.make_sequence_length_divisible_by ({policy_make_seq_div_by}) "
+                f"must be a multiple of teacher '{alias}'s pad requirement "
+                f"({twg.sequence_length_pad_multiple})."
+            )
+    return policy_make_seq_div_by
+
+
 def create_teacher_worker_groups(
     master_config: Any,
     policy_config: dict[str, Any],
@@ -188,6 +213,11 @@ def create_teacher_worker_groups(
                 f"Original error: {e}"
             ) from e
     print("  ✓ All teacher workers healthy", flush=True)
+
+    # Reject a mixed/incompatible teacher packing config (raises).
+    teacher_seq_pad_multiple(
+        teacher_worker_groups, policy_config["make_sequence_length_divisible_by"]
+    )
 
     # Build alias -> group_alias mapping for deduplication
     teacher_model_by_agent_name = dict(opd_cfg.get("teacher_model_by_agent_name", {}))

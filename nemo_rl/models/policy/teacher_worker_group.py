@@ -225,13 +225,14 @@ class TeacherWorkerGroup:
         # Set up sequence packing / dynamic batching (mirrors lm_policy.py)
         self.use_sequence_packing = cfg["sequence_packing"]["enabled"]
         self.use_dynamic_batches = cfg["dynamic_batching"]["enabled"]
+        # SP-forward divisor; the collector reads it to pre-pad non-packed inputs.
+        self.sequence_length_pad_multiple = cp * 2 * tp if cp > 1 else tp
         if self.use_sequence_packing:
-            sequence_length_pad_multiple = cp * 2 * tp if cp > 1 else tp
             self.sequence_packing_args: SequencePackingArgs = {
                 "algorithm": cfg["sequence_packing"]["algorithm"],
                 "input_key": "input_ids",
                 "input_lengths_key": "input_lengths",
-                "sequence_length_pad_multiple": sequence_length_pad_multiple,
+                "sequence_length_pad_multiple": self.sequence_length_pad_multiple,
             }
 
     def get_logprobs(
