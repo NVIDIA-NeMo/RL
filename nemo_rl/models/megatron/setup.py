@@ -1379,7 +1379,19 @@ def setup_model_and_optimizer(
         # See _force_sync_optimizer_fp32_from_model: required when
         # optimizer_cpu_offload=True so the first optimizer step does Adam on the
         # loaded HF weights instead of stale random init in the FP32 master copies.
-        if optimizer is not None:
+        #
+        # Gate on finetune: this is only safe (and only needed) when the
+        # optimizer state was NOT loaded from the checkpoint, i.e. the FP32
+        # master copies are freshly-built random init. megatron-bridge loads
+        # optimizer state iff `not finetune` (checkpointing.py: "not finetune
+        # and load_optim"), and auto-sets finetune=True on an HF-import /
+        # pretrained load. On a genuine resume (finetune=False) the masters are
+        # restored from the checkpoint at full FP32 precision -- force-copying
+        # the BF16 model params over them would silently round-trip the masters
+        # through BF16 and lose precision, so we must skip the sync there.
+        # state.cfg is megatron_cfg (set above), so this reads the value the
+        # bridge may have just mutated during load_checkpoint.
+        if optimizer is not None and megatron_cfg.checkpoint.finetune:
             _force_sync_optimizer_fp32_from_model(optimizer, model)
     torch.distributed.barrier()
 
