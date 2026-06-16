@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import logging
 import os
 import re
 import warnings
 from collections import defaultdict
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Iterator, Optional, TypeVar, cast
+
+log = logging.getLogger(__name__)
 
 import ray
 import torch
@@ -579,7 +582,7 @@ class MegatronPolicyWorkerImpl(
             "total_num_microbatches": 0,
             # Saved across the step so we can restore at finish/abort.
             "saved_grad_sync_func": None,
-            "no_sync_active": False,
+            "saved_no_sync_func": None,
         }
 
     def _assert_step_open(self, step_id: str) -> dict[str, Any]:
@@ -593,6 +596,21 @@ class MegatronPolicyWorkerImpl(
                 f"step_id mismatch: open step is {state['step_id']!r}, got {step_id!r}"
             )
         return state
+
+    def _restore_saved_grad_sync_func(self, state: dict[str, Any]) -> None:
+        """Restore the mcore hooks nulled in ``begin_train_step``.
+
+        Restores both ``grad_sync_func`` and ``no_sync_func`` from the
+        saved values on the open-step state. Idempotent on those values;
+        safe to call from the happy-path finish/abort or from a try/except
+        cleanup in train_microbatch / finish_train_step when those raise
+        mid-body. See begin_train_step for why ``.config`` is read via
+        getattr-by-string.
+        """
+        model_config = getattr(self.model, "config", None)
+        if model_config is not None:
+            model_config.grad_sync_func = state.get("saved_grad_sync_func")
+            model_config.no_sync_func = state.get("saved_no_sync_func")
 
     @wrap_with_nvtx_name("megatron_policy_worker/begin_train_step")
     def begin_train_step(
@@ -625,10 +643,18 @@ class MegatronPolicyWorkerImpl(
             step_id=step_id, loss_fn=loss_fn, gbs=gbs, mbs=mbs
         )
 
-        # Suppress the PP scheduler's direct ``grad_sync_func`` call (which
-        # bypasses ``no_sync``). Save the existing value so we can restore
-        # at finish/abort. PP=1's ``forward_backward_no_pipelining`` doesn't
-        # invoke this; nulling it is a no-op there.
+        # Null both mcore hooks that would fire a mid-step DP reduce:
+        #   grad_sync_func — PP scheduler's direct call on last-MB boundaries
+        #                    (PP>1 path).
+        #   no_sync_func   — ``forward_backward_no_pipelining`` (PP=1, the
+        #                    common case) wraps inner microbatches in this
+        #                    context and runs the LAST microbatch OUTSIDE
+        #                    of it. Without overriding, ``register_grad_ready``
+        #                    leaks per-param counts past the outer
+        #                    ``model.no_sync()`` we apply in train_microbatch,
+        #                    triggering an assertion on the next begin/microbatch
+        #                    pair (typically step 2).
+        # Save both so finish/abort restores them.
         # Read "config" via getattr-by-string so the token stays out of
         # begin_train_step.__code__.co_names; otherwise cloudpickle matches
         # torch.distributed.config (a non-pickleable ConfigModuleInstance).
@@ -637,9 +663,12 @@ class MegatronPolicyWorkerImpl(
             state["saved_grad_sync_func"] = getattr(
                 model_config, "grad_sync_func", None
             )
+            state["saved_no_sync_func"] = getattr(model_config, "no_sync_func", None)
             model_config.grad_sync_func = None
+            model_config.no_sync_func = nullcontext
         else:
             state["saved_grad_sync_func"] = None
+            state["saved_no_sync_func"] = None
 
         self._train_step_state = state
 
@@ -657,6 +686,29 @@ class MegatronPolicyWorkerImpl(
         explicitly in ``finish_train_step``.
         """
         state = self._assert_step_open(step_id)
+        try:
+            return self._train_microbatch_body(state, data)
+        except Exception:
+            # The body left ``grad_sync_func`` nulled when begin_train_step
+            # opened the step. If we propagate without restoring, future
+            # steps run with the PP scheduler bypass disabled. Restore here;
+            # the caller is still expected to invoke abort_train_step
+            # (idempotent on the saved value) to drop ``_train_step_state``.
+            try:
+                self._restore_saved_grad_sync_func(state)
+            except Exception:
+                log.exception(
+                    "failed to restore grad_sync_func after train_microbatch "
+                    "error (step=%s)",
+                    step_id,
+                )
+            raise
+
+    def _train_microbatch_body(
+        self,
+        state: dict[str, Any],
+        data: BatchedDataDict[Any],
+    ) -> dict[str, Any]:
         loss_fn = state["loss_fn"]
 
         # Accumulate local mask sums for the finish-time all_reduce.
@@ -767,9 +819,27 @@ class MegatronPolicyWorkerImpl(
 
     @wrap_with_nvtx_name("megatron_policy_worker/finish_train_step")
     def finish_train_step(self, step_id: str) -> dict[str, Any]:
-        from nemo_rl.algorithms.loss.interfaces import LossType
-
         state = self._assert_step_open(step_id)
+        try:
+            return self._finish_train_step_body(state)
+        except Exception:
+            # Mid-finish failure: state machine is in a partial state and
+            # ``grad_sync_func`` may still be nulled (or restored, depending
+            # on how far the body got). Restore unconditionally so future
+            # steps run with the right config. Leave ``_train_step_state``
+            # for the caller's abort_train_step to clear.
+            try:
+                self._restore_saved_grad_sync_func(state)
+            except Exception:
+                log.exception(
+                    "failed to restore grad_sync_func after finish_train_step "
+                    "error (step=%s)",
+                    step_id,
+                )
+            raise
+
+    def _finish_train_step_body(self, state: dict[str, Any]) -> dict[str, Any]:
+        from nemo_rl.algorithms.loss.interfaces import LossType
 
         # All-reduce accumulated mask sums across DP to recover true N.
         to_reduce = torch.stack(
@@ -825,10 +895,7 @@ class MegatronPolicyWorkerImpl(
             torch.cuda.empty_cache()
 
         # Restore grad_sync_func before scheduler.step / further state.
-        # See begin_train_step for why .config is accessed by string.
-        finish_model_config = getattr(self.model, "config", None)
-        if finish_model_config is not None:
-            finish_model_config.grad_sync_func = state["saved_grad_sync_func"]
+        self._restore_saved_grad_sync_func(state)
 
         # Scheduler increment matches sync path's ``increment=gbs``.
         self.scheduler.step(increment=state["gbs"])
@@ -905,10 +972,7 @@ class MegatronPolicyWorkerImpl(
             )
         # Restore grad_sync_func first so the model is back to a normal
         # state before zero_grad_buffer touches anything.
-        # See begin_train_step for why .config is accessed by string.
-        abort_model_config = getattr(self.model, "config", None)
-        if abort_model_config is not None:
-            abort_model_config.grad_sync_func = state["saved_grad_sync_func"]
+        self._restore_saved_grad_sync_func(state)
         self.model.zero_grad_buffer()
         self.optimizer.zero_grad()
         self._train_step_state = None
