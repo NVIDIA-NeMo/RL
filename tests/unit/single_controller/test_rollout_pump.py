@@ -40,13 +40,15 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollout_manager import RolloutManager
 
 # Reuse fixtures from the experience tests; same shape as test_async_rollout_manager.
+from tests.unit.experience.test_rollout_manager import (
+    single_multi_step_calculator_input_sample,  # noqa: F401
+)
 from tests.unit.experience.test_rollouts import (
     initial_multi_step_calculator_batch,  # noqa: F401
     multi_step_calculator_environment,  # noqa: F401
     multi_step_setup_vllm_async,  # noqa: F401
     rollout_cluster,  # noqa: F401
     rollout_tokenizer,  # noqa: F401
-    single_multi_step_calculator_input_sample,  # noqa: F401
 )
 
 _PARTITION_ID = "rollout_data"
