@@ -103,6 +103,7 @@ def _format_options(options: Any) -> str:
         return " Options:\n" + "\n".join(str(o) for o in options)
     return f" Options:\n{options}"
 
+
 # Per-split HF repo + manifest filenames for the HumanOmniV2 IntentTrain /
 # IntentBench releases. Each split downloads a videos.zip and one or more JSON
 # manifests; manifest entries point at relative paths inside the extracted
