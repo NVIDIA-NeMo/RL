@@ -44,11 +44,17 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 @dataclass
 class DPOSaveState:
-    epoch: int
-    step: int
-    total_steps: int
+    epoch: int  # Track current epoch
+    step: int  # Track step within current epoch
+    total_steps: int  # Track total number of steps across all epochs
     consumed_samples: int
-    total_valid_tokens: int
+    total_valid_tokens: int  # Track total number of non-padding tokens during training
+
+
+def _initial_dpo_save_state() -> DPOSaveState:
+    return DPOSaveState(
+        epoch=0, step=0, total_steps=0, consumed_samples=0, total_valid_tokens=0
+    )
 
 
 class DPOConfig(BaseModel, extra="allow"):
@@ -172,14 +178,14 @@ def setup(
     if loaded_state is not None:
         # Filter to only known DPOSaveState fields; checkpoints may carry
         # extra keys (e.g. validation metrics from previous runs).
+        # Backcompat: checkpoints saved before total_valid_tokens was added.
+        loaded_state.setdefault("total_valid_tokens", 0)
         known_fields = {f.name for f in fields(DPOSaveState)}
         dpo_save_state = DPOSaveState(
             **{k: v for k, v in loaded_state.items() if k in known_fields}
         )
     else:
-        dpo_save_state = DPOSaveState(
-            epoch=0, step=0, total_steps=0, consumed_samples=0, total_valid_tokens=0
-        )
+        dpo_save_state = _initial_dpo_save_state()
 
     # ==========================
     #           Data
