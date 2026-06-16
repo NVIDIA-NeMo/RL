@@ -42,6 +42,53 @@ from ._rollout_shapes import mooncake_available
 # ── fixtures ──────────────────────────────────────────────────────────────────
 
 
+def test_register_partition_uses_unique_schema_warmup_key(monkeypatch) -> None:
+    from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
+
+    put_calls = []
+    clear_calls = []
+
+    def fake_put(**kwargs):
+        put_calls.append(kwargs)
+
+    def fake_clear(**kwargs):
+        clear_calls.append(kwargs)
+
+    monkeypatch.setattr(tq_adapter.tq, "kv_batch_put", fake_put)
+    monkeypatch.setattr(tq_adapter.tq, "kv_clear", fake_clear)
+
+    client = object.__new__(tq_adapter.TQDataPlaneClient)
+    client.register_partition(
+        partition_id="obj-backend",
+        fields=["msg_log"],
+        num_samples=8,
+        consumer_tasks=["read"],
+    )
+    client.register_partition(
+        partition_id="obj-backend",
+        fields=["msg_log"],
+        num_samples=8,
+        consumer_tasks=["read"],
+    )
+
+    assert len(put_calls) == 2
+    schema_keys = [call["keys"][0] for call in put_calls]
+    assert len(set(schema_keys)) == 2
+    assert all(key.startswith("__schema__:obj-backend:") for key in schema_keys)
+    assert [call["partition_id"] for call in put_calls] == [
+        "obj-backend",
+        "obj-backend",
+    ]
+    assert [list(call["fields"].keys()) for call in put_calls] == [
+        ["msg_log"],
+        ["msg_log"],
+    ]
+    assert clear_calls == [
+        {"keys": [schema_keys[0]], "partition_id": "obj-backend"},
+        {"keys": [schema_keys[1]], "partition_id": "obj-backend"},
+    ]
+
+
 @pytest.fixture
 def tq_client():
     import ray
