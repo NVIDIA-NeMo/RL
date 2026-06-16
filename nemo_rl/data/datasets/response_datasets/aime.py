@@ -12,25 +12,40 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""AIME dataset."""
+"""AIME response dataset (2024/2025/2026 variants)."""
 
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 from datasets import concatenate_datasets, load_dataset
 
-from nemo_rl.data import processors
-from nemo_rl.data.interfaces import TaskDataSpec
+from nemo_rl.data.datasets.raw_dataset import RawDataset
 
 AIMEVariant = Literal["2024", "2025", "2026"]
 
 
-class AIMEDataset:
+class AIMEDataset(RawDataset):
+    """Wrapper around an AIME competition dataset with a train split.
+
+    Mirrors nemo_rl.data.datasets.eval_datasets.aime.AIMEDataset so the same
+    year can be referenced both as a validation dataset during training and
+    as an eval dataset.
+
+    Args:
+        variant: Which AIME edition to load: "2024" (default), "2025", or "2026".
+        repeat: Number of times to repeat the dataset, default is 16. This
+            matches the variance-reduction recipe used by the original
+            AIME2024 entry.
+    """
+
     def __init__(
         self,
-        variant: AIMEVariant = "2025",
-        prompt_file: Optional[str] = None,
-        system_prompt_file: Optional[str] = None,
-    ):
+        variant: AIMEVariant = "2024",
+        repeat: int = 16,
+        **kwargs,
+    ) -> None:
+        self.task_name = f"AIME{variant}"
+
+        # load from huggingface
         if variant == "2024":
             ds = load_dataset("HuggingFaceH4/aime_2024", split="train")
             self.input_key = "problem"
@@ -43,19 +58,23 @@ class AIMEDataset:
             ds = load_dataset("MathArena/aime_2026", split="train")
             self.input_key = "problem"
         else:
-            raise ValueError(f"Invalid variant for aime dataset: aime{variant}")
+            raise ValueError(f"Invalid AIME variant: {variant!r}")
 
-        self.rekeyed_ds = ds.map(self._rekey, remove_columns=ds.column_names)
-        self.task_spec = TaskDataSpec(
-            task_name=f"aime{variant}",
-            prompt_file=prompt_file,
-            system_prompt_file=system_prompt_file,
+        # format the dataset
+        self.dataset = ds.map(
+            self.format_data,
+            remove_columns=ds.column_names,
         )
-        self.processor = processors.math_data_processor
 
-    def _rekey(self, data: dict[str, Any]):
+        # repeat the dataset
+        self.dataset = self.dataset.repeat(repeat)
+
+    def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
         # MathArena/aime_2026 stores `answer` as int64; cast to keep the schema uniform.
         return {
-            "problem": data[self.input_key],
-            "expected_answer": str(data["answer"]),
+            "messages": [
+                {"role": "user", "content": data[self.input_key]},
+                {"role": "assistant", "content": str(data["answer"])},
+            ],
+            "task_name": self.task_name,
         }

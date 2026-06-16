@@ -187,7 +187,15 @@ def test_open_assistant_dataset():
 
 @pytest.mark.parametrize(
     "dataset_name",
-    ["DAPOMath17K", "DAPOMathAIME2024", "DeepScaler", "AIME2024", "squad"],
+    [
+        "DAPOMath17K",
+        "DAPOMathAIME2024",
+        "DeepScaler",
+        "squad",
+        "AIME2024",
+        "AIME2025",
+        "AIME2026",
+    ],
 )
 def test_build_in_dataset(dataset_name, tokenizer):
     # load the dataset
@@ -211,6 +219,12 @@ def test_build_in_dataset(dataset_name, tokenizer):
         assert first_example["messages"][1]["content"] == "-\\frac{2}{3}"
     elif dataset_name == "AIME2024":
         assert first_example["messages"][1]["content"] == "204"
+        assert len(dataset.dataset) == 480
+    elif dataset_name == "AIME2025":
+        assert first_example["messages"][1]["content"] == "70"
+        assert len(dataset.dataset) == 480
+    elif dataset_name == "AIME2026":
+        assert first_example["messages"][1]["content"] == "277"
         assert len(dataset.dataset) == 480
     elif dataset_name == "squad":
         assert first_example["messages"][2]["content"] == "Saint Bernadette Soubirous"

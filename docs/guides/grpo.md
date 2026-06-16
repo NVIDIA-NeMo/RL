@@ -122,6 +122,8 @@ data:
     ...
 ```
 
+`AIME2025` and `AIME2026` are registered alongside `AIME2024` and accept the same config keys (e.g. `repeat`), so any of them can drop into the `validation:` list above.
+
 ##### Custom datasets defined outside NeMo RL
 
 If you want to plug in a dataset class that lives outside the `nemo_rl`
