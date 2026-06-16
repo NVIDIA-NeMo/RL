@@ -582,7 +582,14 @@ class MegatronPolicyWorkerImpl(
 
     # ── split-API train-step state machine (SingleController async path) ──
     #
-    # Mirrors the v1/v2 implementations, adapted for mcore. Key differences:
+    # SC drives one ``begin / train_microbatch×N / finish`` cycle per
+    # optimizer step. The worker exposes:
+    #   begin_train_step      — open the step (zero grads, null mcore sync hooks)
+    #   train_microbatch      — one DP slice of fwd/bwd, grads accumulate locally
+    #   finish_train_step     — all_reduce + opt.step + scheduler.step
+    #   abort_train_step      — drop partial state (no opt.step)
+    #
+    # Key mcore-specific details:
     #
     # 1. mcore DDP accumulates ``param.main_grad`` per backward and dispatches
     #    a cross-DP reduce when ``is_last_microbatch=True`` (one per
@@ -941,6 +948,11 @@ class MegatronPolicyWorkerImpl(
         # Restore grad_sync_func before scheduler.step / further state.
         self._restore_saved_grad_sync_func(state)
 
+        # Capture lr/wd BEFORE scheduler.step so the per-mb metrics carry
+        # the value of THIS step, not the next one. (terrykong, #2683:832).
+        curr_lr = self.scheduler.get_lr(self.optimizer.param_groups[0])
+        curr_wd = self.scheduler.get_wd()
+
         # Scheduler increment matches sync path's ``increment=gbs``.
         self.scheduler.step(increment=state["gbs"])
 
@@ -980,8 +992,7 @@ class MegatronPolicyWorkerImpl(
             )
 
         rescaled_metrics: list[dict[str, Any]] = []
-        curr_lr = self.scheduler.get_lr(self.optimizer.param_groups[0])
-        curr_wd = self.scheduler.get_wd()
+        # curr_lr/curr_wd captured pre-scheduler.step above.
         global_valid_seqs_f = float(global_valid_seqs.item())
         global_valid_toks_f = float(global_valid_toks.item())
 
