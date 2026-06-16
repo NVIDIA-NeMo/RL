@@ -1,0 +1,12 @@
+# Leftmost (left-to-right reveal) dLLM generation config for BlockJustGRPO at
+# block_size=16. Same FastDiffuser engine as diffugrpo, but selection_policy is
+# "leftmost" (deterministic left-to-right within each block) instead of
+# "confidence". block_size/max_steps kept in sync with the policy model
+# block_size (policy.hf_config_overrides) and the SGLang model override.
+algorithm: FastDiffuser
+block_size: 16
+max_steps: 16
+causal_context: true
+temperature: 1.0
+threshold: null
+selection_policy: leftmost
