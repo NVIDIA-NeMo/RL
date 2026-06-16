@@ -738,16 +738,13 @@ class AsyncTrajectoryCollector:
                 if isinstance(agent_refs, list):
                     from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 
-                    # Pad to the same divisor the training path uses so the
-                    # teacher's get_logprobs forward (which runs with TP+SP
-                    # enabled in mcore) satisfies reduce_scatter's first-dim%TP
-                    # divisibility assertion.
+                    # Packed teachers pad via their own packing multiple, so no pre-pad here
+                    # (a pre-pad would corrupt the packed mamba seq_idx). Non-packed teachers
+                    # are not supported yet (they'd need pre-pad to a TP multiple).
                     flat_for_teacher, teacher_input_lengths = batched_message_log_to_flat_message(
                         final_batch_cpu["message_log"],
                         pad_value_dict={"token_ids": self.tokenizer.pad_token_id},
-                        make_sequence_length_divisible_by=self.master_config.policy.get(
-                            "make_sequence_length_divisible_by", 1
-                        ),
+                        make_sequence_length_divisible_by=1,
                     )
                     teacher_logprobs, teacher_logprob_time = self._compute_teacher_logprobs(
                         flat_for_teacher["token_ids"], agent_refs,

@@ -1355,6 +1355,9 @@ def run_async_nemo_gym_rollout(
         for agent_name, agent_results in agent_to_results.items():
             keys = agent_results[0].keys()
             for key in keys:
+                # `id` is a row identifier echoed from the request body, not a metric
+                if key == "id":
+                    continue
                 values = [
                     float(r[key])
                     for r in agent_results

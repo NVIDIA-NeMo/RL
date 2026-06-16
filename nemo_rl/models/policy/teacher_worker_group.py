@@ -20,7 +20,6 @@ in inference-only mode for a single teacher model checkpoint.
 
 from __future__ import annotations
 
-import os
 from copy import deepcopy
 from typing import Any, NotRequired, Optional, TypedDict
 
@@ -227,9 +226,7 @@ class TeacherWorkerGroup:
         self.use_sequence_packing = cfg["sequence_packing"]["enabled"]
         self.use_dynamic_batches = cfg["dynamic_batching"]["enabled"]
         if self.use_sequence_packing:
-            sequence_length_pad_multiple = (
-                cp * 2 * tp if cp > 1 else tp
-            )
+            sequence_length_pad_multiple = cp * 2 * tp if cp > 1 else tp
             self.sequence_packing_args: SequencePackingArgs = {
                 "algorithm": cfg["sequence_packing"]["algorithm"],
                 "input_key": "input_ids",

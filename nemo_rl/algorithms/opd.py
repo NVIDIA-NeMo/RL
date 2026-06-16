@@ -53,11 +53,12 @@ def _opd_cfg(master_config: Any) -> dict[str, Any]:
     """Return the on_policy_distillation sub-config as a plain dict.
 
     Accepts either a Pydantic MasterConfig (main's `setup()` passes this) or a
-    plain dict (which ultra-side callers used).
+    plain dict (which ultra-side callers used). Non-OPD recipes (e.g. math) have
+    no `on_policy_distillation` field at all, so we must not assume it exists.
     """
-    if hasattr(master_config, "on_policy_distillation"):
-        return getattr(master_config, "on_policy_distillation", None) or {}
-    return master_config.get("on_policy_distillation", {})
+    if isinstance(master_config, dict):
+        return master_config.get("on_policy_distillation", {}) or {}
+    return getattr(master_config, "on_policy_distillation", None) or {}
 
 
 def is_opd_enabled(master_config: Any) -> bool:
