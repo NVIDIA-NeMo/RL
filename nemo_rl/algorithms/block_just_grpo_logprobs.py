@@ -70,19 +70,23 @@ def count_reveal_levels(
     response_lengths: torch.Tensor,
     max_reveal_levels: int | None,
 ) -> int:
-    """Number of reveal-level passes needed.
+    """Number of reveal-level passes.
 
-    Only ``min(block_size, longest_block_present)`` levels are required: a block
-    shorter than ``block_size`` contributes nothing past its length, and the
-    longest block present caps how many within-block offsets exist.
-    ``max_reveal_levels`` further caps it.
+    MUST be identical across all data-parallel ranks. The worker issues one
+    forward pass (and its collectives) per reveal level, so if ranks computed
+    different counts they would desync and deadlock at the DP process group
+    (observed as a 60-min NCCL collective timeout at 16-node scale). It is
+    therefore purely ``block_size`` (capped by ``max_reveal_levels``) and does
+    NOT depend on ``response_lengths`` — a per-rank, batch-dependent quantity.
+    Levels past a sample's response length simply harvest nothing (zero mask),
+    which is correct and keeps all ranks in lockstep.
+
+    ``response_lengths`` is accepted for signature stability but only used to
+    short-circuit the empty case.
     """
     if response_lengths.numel() == 0:
         return 0
-    max_resp = int(response_lengths.max().item())
-    if max_resp <= 0:
-        return 0
-    num_levels = min(int(block_size), max_resp)
+    num_levels = int(block_size)
     if max_reveal_levels is not None:
         num_levels = min(num_levels, int(max_reveal_levels))
     return int(num_levels)

@@ -44,7 +44,7 @@ policy:
       # config's block_size, so no separate json_model_override_args is needed.
       # dllm_algorithm stays "FastDiffuser" (inherited); leftmost is the
       # selection_policy inside this config.
-      dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL-block-reveal/tools/nemotron_diffusion/block_just_grpo_leftmost_dllm_bs16.yaml"
+      dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL/tools/nemotron_diffusion/block_just_grpo_leftmost_dllm_bs16.yaml"
 
 checkpointing:
   checkpoint_dir: "results/grpo-nemotron-diffusion-3b-block-just-grpo-deepscaler-megatron"
@@ -53,3 +53,6 @@ logger:
   log_dir: "logs/grpo-nemotron-diffusion-3b-block-just-grpo-deepscaler-megatron-sglang"
   wandb:
     name: "grpo-nemotron-diffusion-3b-block-just-grpo-deepscaler-megatron-sglang"
+
+cluster:
+  num_nodes: 16
