@@ -138,6 +138,24 @@ data:
     ...
 ```
 
+### Custom datasets defined outside NeMo RL
+
+If you want to plug in a dataset class that lives outside the `nemo_rl`
+package (so you don't have to edit the built-in registry), set
+`dataset_name` to a fully qualified dotted import path. The dispatcher
+will import the module and resolve the class. The class must accept the
+same kwargs as the built-in datasets (i.e. the full data config) and
+implement `set_task_spec` and `set_processor`.
+
+```yaml
+data:
+  default:
+    dataset_name: my_pkg.my_module.MyDataset  # importable from PYTHONPATH
+```
+
+The class must be importable — install it as a package or add its
+parent directory to `PYTHONPATH` before launching training.
+
 We support using a single dataset for both train and validation by using `split_validation_size` to set the ratio of validation.
 [OpenAssistant](../../nemo_rl/data/datasets/response_datasets/oasst.py), [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py), [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py), [Tulu3SftMixtureDataset](../../nemo_rl/data/datasets/response_datasets/tulu3.py) are supported for this feature.
 If you want to support this feature for your custom datasets or other built-in datasets, you can simply add the code to the dataset like [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py).

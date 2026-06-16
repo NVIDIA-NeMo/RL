@@ -91,6 +91,7 @@ def _make_tq_cfg(backend: str) -> dict:
 
 
 @pytest.fixture(
+    scope="module",
     params=["simple", "mooncake_cpu"],
     ids=["simple", "mooncake_cpu"],
 )
@@ -99,6 +100,14 @@ def tq_client(request):
 
     mooncake_cpu is skipped when the mooncake wheel is not installed.
     Set NEMO_RL_REQUIRE_MOONCAKE=1 to promote the skip to a loud failure.
+
+    Module-scoped so the mooncake_master + Transfer Engine survive across
+    the test cases in this file: each test uses its own ``partition_id``
+    ("seqpack-eq" / "dynbatch-eq" / "nopack-eq") so no cross-test data
+    leak is possible, and reusing one client avoids the close→re-init
+    race in mooncake's C++ mount registry (upstream ``transfer_queue``
+    leaks the master process on close; the C++ engine then keeps stale
+    endpoint references that 404 against the next run's fresh master).
 
     Relies on parent autouse ``init_ray_cluster`` for the Ray runtime.
     """

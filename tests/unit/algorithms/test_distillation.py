@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -162,6 +164,11 @@ def mock_components():
             "data": {
                 "dataset_name": "test_dataset",
             },
+            "env": {
+                "math": {
+                    "num_workers": 1,
+                },
+            },
             "logger": {
                 "num_val_samples_to_print": 5,
             },
@@ -218,6 +225,61 @@ def test_distillation_train_max_steps(mock_components):
     )
 
     assert mock_components["student_policy"].train.call_count == 5
+
+
+def test_distillation_train_uses_nemo_gym_rollout_when_enabled(mock_components):
+    master_config = mock_components["master_config"]
+    master_config.distillation["max_num_steps"] = 1
+    master_config.distillation["max_num_epochs"] = 1
+    master_config.distillation["val_period"] = 0
+    master_config.env["should_use_nemo_gym"] = True
+    master_config.policy["generation"]["backend"] = "vllm"
+    master_config.policy["generation"]["vllm_cfg"] = {
+        "async_engine": True,
+        "expose_http_server": True,
+    }
+
+    mock_rollout_result = SimpleNamespace(
+        final_batch=next(iter(mock_components["train_dataloader"])),
+        rollout_metrics={"mean_gen_tokens_per_sample": 3.0},
+    )
+
+    with (
+        patch(
+            "nemo_rl.algorithms.distillation.run_async_nemo_gym_rollout",
+            return_value=mock_rollout_result,
+        ) as mock_nemo_gym_rollout,
+        patch(
+            "nemo_rl.algorithms.distillation.run_async_multi_turn_rollout"
+        ) as mock_async_rollout,
+        patch("nemo_rl.algorithms.distillation.run_multi_turn_rollout") as mock_rollout,
+    ):
+        distillation_train(
+            mock_components["student_policy"],
+            mock_components["teacher_policy"],
+            mock_components["student_generation"],
+            mock_components["train_dataloader"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            mock_components["task_to_env"],
+            mock_components["val_task_to_env"],
+            mock_components["logger"],
+            mock_components["checkpointer"],
+            _default_distillation_save_state(),
+            master_config,
+        )
+
+    mock_nemo_gym_rollout.assert_called_once()
+    mock_async_rollout.assert_not_called()
+    mock_rollout.assert_not_called()
+    train_metric_calls = [
+        call
+        for call in mock_components["logger"].log_metrics.call_args_list
+        if call.kwargs.get("prefix") == "train"
+    ]
+    assert train_metric_calls
+    assert train_metric_calls[-1].args[0]["mean_gen_tokens_per_sample"] == 3.0
 
 
 def test_exit_on_timeout(mock_components, capsys):
@@ -295,6 +357,83 @@ def test_validate_function(mock_components):
     # For distillation, we don't need environment interaction since max_rollout_turns=0
     # The validation focuses on generation and teacher-student knowledge transfer
     # Note: validate() function itself doesn't call logger.log_metrics - that's done by the caller
+
+
+def test_validate_uses_nemo_gym_rollout_when_enabled(mock_components):
+    master_config = mock_components["master_config"]
+    master_config.distillation["max_val_samples"] = 1
+    master_config.distillation["val_batch_size"] = 1
+    master_config.env["should_use_nemo_gym"] = True
+    master_config.env["should_log_nemo_gym_responses"] = False
+    master_config.policy["generation"]["backend"] = "vllm"
+    master_config.policy["generation"]["vllm_cfg"] = {
+        "async_engine": True,
+        "expose_http_server": True,
+    }
+
+    final_batch = BatchedDataDict[DatumSpec](
+        {
+            "message_log": [
+                [
+                    {
+                        "token_ids": torch.tensor([1, 2]),
+                        "role": "user",
+                        "content": "What is 1+1?",
+                    },
+                    {
+                        "token_ids": torch.tensor([3, 4]),
+                        "role": "assistant",
+                        "content": "2",
+                    },
+                ]
+            ],
+            "total_reward": torch.tensor([1.0]),
+        }
+    )
+    mock_rollout_result = SimpleNamespace(
+        final_batch=final_batch,
+        rollout_metrics={
+            "mean_gen_tokens_per_sample": 2.0,
+            "score": 0.5,
+            "full_result_debug": {"large_response": True},
+        },
+    )
+
+    with (
+        patch(
+            "nemo_rl.algorithms.distillation.run_async_nemo_gym_rollout",
+            return_value=mock_rollout_result,
+        ) as mock_nemo_gym_rollout,
+        patch(
+            "nemo_rl.algorithms.distillation.run_async_multi_turn_rollout"
+        ) as mock_async_rollout,
+        patch("nemo_rl.algorithms.distillation.run_multi_turn_rollout") as mock_rollout,
+    ):
+        val_metrics, validation_timings = validate(
+            mock_components["student_generation"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["val_task_to_env"],
+            step=0,
+            master_config=master_config,
+        )
+
+    mock_nemo_gym_rollout.assert_called_once()
+    rollout_kwargs = mock_nemo_gym_rollout.call_args.kwargs
+    assert rollout_kwargs["policy_generation"] is mock_components["student_generation"]
+    assert rollout_kwargs["task_to_env"] is mock_components["val_task_to_env"]
+    assert rollout_kwargs["generation_config"] is master_config.policy["generation"]
+    assert rollout_kwargs["max_seq_len"] is None
+    assert rollout_kwargs["max_rollout_turns"] is None
+    assert rollout_kwargs["greedy"] is False
+    mock_async_rollout.assert_not_called()
+    mock_rollout.assert_not_called()
+    assert val_metrics["accuracy"] == 1.0
+    assert val_metrics["avg_length"] == 2.0
+    assert val_metrics["mean_gen_tokens_per_sample"] == 2.0
+    assert val_metrics["score"] == 0.5
+    assert "full_result_debug" not in val_metrics
+    assert isinstance(validation_timings, dict)
 
 
 def test_check_vocab_equality_pass(monkeypatch):
@@ -594,6 +733,8 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch):
         patch.object(distil_mod, "StatefulDataLoader"),
         patch.object(distil_mod, "Policy", DummyPolicy),
         patch.object(distil_mod, "VllmGeneration", DummyVllmGeneration),
+        patch.object(distil_mod, "get_nemo_gym_uv_cache_dir") as mock_uv_cache_dir,
+        patch.object(distil_mod, "get_nemo_gym_venv_dir") as mock_uv_venv_dir,
         patch.object(distil_mod, "ray") as mock_ray,
     ):
         mock_ckpt_mgr.return_value.get_latest_checkpoint_path.return_value = None
@@ -605,6 +746,302 @@ def test_distillation_setup_non_colocated_smoke(monkeypatch):
 
         # Basic shape check of returned tuple
         assert isinstance(result, tuple)
+        assert result[3] is None
+        mock_uv_cache_dir.assert_not_called()
+        mock_uv_venv_dir.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    (
+        "configured_uv_cache_dir",
+        "configured_uv_venv_dir",
+        "expected_uv_cache_dir",
+        "expected_uv_venv_dir",
+    ),
+    [
+        (
+            None,
+            None,
+            "/opt/nemo-gym/.uv-cache",
+            "/opt/nemo-gym/venvs",
+        ),
+        (
+            "/custom/cache",
+            "/custom/venvs",
+            "/custom/cache",
+            "/custom/venvs",
+        ),
+    ],
+)
+def test_distillation_setup_nemo_gym_uses_deferred_vllm(
+    monkeypatch,
+    configured_uv_cache_dir,
+    configured_uv_venv_dir,
+    expected_uv_cache_dir,
+    expected_uv_venv_dir,
+):
+    import nemo_rl.algorithms.distillation as distil_mod
+
+    nemo_gym_config = {
+        "num_gpu_nodes": 1,
+        "invalid_tool_call_patterns": ["bad_call"],
+        "thinking_tags": ["<think>"],
+        "config_paths": ["gym.yaml"],
+    }
+    if configured_uv_cache_dir is not None:
+        nemo_gym_config["uv_cache_dir"] = configured_uv_cache_dir
+    if configured_uv_venv_dir is not None:
+        nemo_gym_config["uv_venv_dir"] = configured_uv_venv_dir
+
+    master_config = MasterConfig.model_construct(
+        **{
+            "policy": {
+                "model_name": "test-policy",
+                "generation": {
+                    "temperature": 1.0,
+                    "top_p": 1.0,
+                    "top_k": None,
+                    "backend": "vllm",
+                    "vllm_kwargs": {},
+                    "vllm_cfg": {
+                        "async_engine": True,
+                        "expose_http_server": True,
+                    },
+                    "colocated": {
+                        "enabled": True,
+                    },
+                },
+                "dtensor_cfg": {
+                    "enabled": False,
+                },
+            },
+            "teacher": {
+                "model_name": "test-teacher",
+                "dtensor_cfg": {
+                    "enabled": False,
+                },
+            },
+            "loss_fn": {
+                "kl_type": "forward",
+                "mixed_kl_weight": 0.5,
+                "zero_outside_topk": False,
+            },
+            "distillation": {
+                "seed": 42,
+                "topk_logits_k": 64,
+                "num_prompts_per_step": 1,
+                "max_num_epochs": 1,
+                "max_num_steps": 1,
+                "val_period": 0,
+                "val_at_start": False,
+                "val_at_end": False,
+            },
+            "data": {"shuffle": False},
+            "env": {
+                "should_use_nemo_gym": True,
+                "nemo_gym": nemo_gym_config,
+            },
+            "logger": {},
+            "checkpointing": {},
+            "cluster": {"num_nodes": 1, "gpus_per_node": 1},
+        }
+    )
+
+    tokenizer = MagicMock()
+    dataset = MagicMock()
+    dataset.__len__ = MagicMock(return_value=1)
+    monkeypatch.setenv("NRL_SKIP_DISTILLATION_TOKENIZER_CHECK", "1")
+    nemo_gym_env_before = copy.deepcopy(master_config.env["nemo_gym"])
+
+    created_vllm = []
+
+    class DummyCluster:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class DummyPolicy:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def offload_after_refit(self):
+            return None
+
+        def prepare_refit_info(self):
+            return {}
+
+    class DummyVllmGeneration:
+        def __init__(self, cluster, config, defer_model_load=False):
+            self.cfg = config
+            self.defer_model_load = defer_model_load
+            self.dp_openai_server_base_urls = ["http://reserved-vllm"]
+            self.load_and_start_called = False
+            self.finish_generation_called = False
+            self.prepare_refit_info_called = False
+            created_vllm.append(self)
+
+        def load_and_start(self):
+            self.load_and_start_called = True
+
+        def finish_generation(self):
+            self.finish_generation_called = True
+
+        def prepare_refit_info(self, *args, **kwargs):
+            self.prepare_refit_info_called = True
+
+    nemo_gym_actor = MagicMock()
+    nemo_gym_actor._spinup.remote.return_value = "spinup-ref"
+    nemo_gym_cls = MagicMock()
+    nemo_gym_cls.options.return_value.remote.return_value = nemo_gym_actor
+    runtime_env = {
+        "py_executable": "/venv/bin/python",
+        "env_vars": {
+            "VIRTUAL_ENV": "/venv",
+            "UV_PROJECT_ENVIRONMENT": "/venv",
+        },
+    }
+
+    with (
+        patch.object(distil_mod, "RayVirtualCluster", DummyCluster),
+        patch.object(distil_mod, "Logger"),
+        patch.object(distil_mod, "CheckpointManager") as mock_ckpt_mgr,
+        patch.object(distil_mod, "StatefulDataLoader"),
+        patch.object(distil_mod, "Policy", DummyPolicy),
+        patch.object(distil_mod, "VllmGeneration", DummyVllmGeneration),
+        patch.object(distil_mod, "NemoGym", nemo_gym_cls),
+        patch.object(
+            distil_mod,
+            "make_actor_runtime_env",
+            return_value=runtime_env,
+        ) as mock_runtime_env,
+        patch.object(
+            distil_mod,
+            "get_nemo_gym_uv_cache_dir",
+            return_value="/opt/nemo-gym/.uv-cache",
+        ),
+        patch.object(
+            distil_mod,
+            "get_nemo_gym_venv_dir",
+            return_value="/opt/nemo-gym/venvs",
+        ),
+        patch.object(distil_mod, "ray") as mock_ray,
+    ):
+        mock_ckpt_mgr.return_value.get_latest_checkpoint_path.return_value = None
+        mock_ckpt_mgr.return_value.get_resume_paths.return_value = (None, None)
+        mock_ray.get_runtime_context.return_value.get_node_id.return_value = "a" * 56
+        mock_ray.get.return_value = None
+
+        result = distil_mod.setup(master_config, tokenizer, dataset, None)
+
+    assert created_vllm
+    assert created_vllm[0].defer_model_load is True
+    assert created_vllm[0].load_and_start_called
+    assert created_vllm[0].finish_generation_called
+    assert created_vllm[0].prepare_refit_info_called
+    assert result[2] is created_vllm[0]
+    assert result[3] is nemo_gym_actor
+
+    mock_runtime_env.assert_called_once_with("nemo_rl.environments.nemo_gym.NemoGym")
+    nemo_gym_options_kwargs = nemo_gym_cls.options.call_args.kwargs
+    assert nemo_gym_options_kwargs["runtime_env"] == runtime_env
+    assert isinstance(
+        nemo_gym_options_kwargs["scheduling_strategy"],
+        distil_mod.NodeAffinitySchedulingStrategy,
+    )
+    nemo_gym_cfg = nemo_gym_cls.options.return_value.remote.call_args.args[0]
+    assert nemo_gym_cfg["model_name"] == "test-policy"
+    assert nemo_gym_cfg["base_urls"] == ["http://reserved-vllm"]
+    assert nemo_gym_cfg["invalid_tool_call_patterns"] == ["bad_call"]
+    assert nemo_gym_cfg["thinking_tags"] == ["<think>"]
+    assert nemo_gym_cfg["initial_global_config_dict"] == {
+        "num_gpu_nodes": 1,
+        "config_paths": ["gym.yaml"],
+        "uv_cache_dir": expected_uv_cache_dir,
+        "uv_venv_dir": expected_uv_venv_dir,
+    }
+    assert master_config.env["nemo_gym"] == nemo_gym_env_before
+    nemo_gym_actor._spinup.remote.assert_called_once_with()
+    mock_ray.get.assert_called_once_with("spinup-ref")
+
+
+def test_nemo_gym_distillation_runner_uses_setup_actor():
+    from examples.nemo_gym import run_distillation_nemo_gym as runner
+
+    config_dict = {
+        "policy": {
+            "tokenizer": {"name": "test-tokenizer"},
+            "generation": {"backend": "vllm"},
+        },
+        "teacher": {},
+        "loss_fn": {},
+        "distillation": {"max_val_samples": None},
+        "data": {},
+        "env": {"should_use_nemo_gym": True, "nemo_gym": {}},
+        "logger": {"log_dir": "/tmp/logs"},
+        "checkpointing": {"enabled": False},
+        "cluster": {},
+    }
+    tokenizer = MagicMock()
+    student_policy = MagicMock()
+    teacher_policy = MagicMock()
+    student_generation = MagicMock()
+    nemo_gym_actor = MagicMock()
+    dataloader = MagicMock()
+    loss_fn = MagicMock()
+    logger = MagicMock()
+    checkpointer = MagicMock()
+    distillation_state = MagicMock()
+    master_config = MasterConfig.model_construct(**copy.deepcopy(config_dict))
+
+    with (
+        patch.object(runner, "register_omegaconf_resolvers"),
+        patch.object(
+            runner,
+            "parse_args",
+            return_value=(SimpleNamespace(config="config.yaml"), []),
+        ),
+        patch.object(runner, "load_config", return_value=config_dict),
+        patch.object(runner, "parse_hydra_overrides", side_effect=lambda cfg, _: cfg),
+        patch.object(runner, "OmegaConf") as mock_omegaconf,
+        patch.object(
+            runner,
+            "MasterConfig",
+            lambda **kwargs: MasterConfig.model_construct(**kwargs),
+        ),
+        patch.object(runner, "get_next_experiment_dir", return_value="/tmp/logs/exp"),
+        patch.object(runner, "get_tokenizer", return_value=tokenizer),
+        patch.object(
+            runner,
+            "configure_generation_config",
+            side_effect=lambda cfg, _: cfg,
+        ),
+        patch.object(runner, "setup_nemo_gym_config"),
+        patch.object(runner, "_should_use_nemo_gym", return_value=True),
+        patch.object(runner, "setup_response_data", return_value=(MagicMock(), None)),
+        patch.object(runner, "init_ray"),
+        patch.object(runner, "setup") as mock_setup,
+        patch.object(runner, "distillation_train") as mock_train,
+    ):
+        mock_omegaconf.to_container.side_effect = lambda cfg, resolve=True: cfg
+        mock_setup.return_value = (
+            student_policy,
+            teacher_policy,
+            student_generation,
+            nemo_gym_actor,
+            dataloader,
+            None,
+            loss_fn,
+            logger,
+            checkpointer,
+            distillation_state,
+            master_config,
+        )
+
+        runner.main()
+
+    mock_setup.assert_called_once()
+    train_args = mock_train.call_args.args
+    assert train_args[7] == {"nemo_gym": nemo_gym_actor}
+    assert train_args[8] is train_args[7]
 
 
 def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node():

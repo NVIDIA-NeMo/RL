@@ -288,6 +288,48 @@ def test_basic_worker_creation_and_method_calls(register_test_actor, virtual_clu
     worker_group.shutdown(force=True)
 
 
+def test_initializer_pool_is_per_node_single_node(worker_group_1d_sharding):
+    """One IsolatedWorkerInitializer is pooled per node (pg_idx), not per worker.
+
+    The 1d fixture places 2 workers on a single node, so the pool holds a
+    single initializer even though there are 2 workers.
+    """
+    worker_group = worker_group_1d_sharding
+    assert len(worker_group.workers) == 2
+    assert len(worker_group._initializer_pool) == 1
+    assert set(worker_group._initializer_pool.keys()) == {0}
+
+
+def test_initializer_pool_is_per_node_multi_node(worker_group_2d_sharding):
+    """The pool holds one initializer per unique pg_idx across multiple nodes.
+
+    The 2d fixture spans 2 nodes with 4 workers total, so the pool holds 2
+    initializers — a per-node count, not the per-worker count of 4.
+    """
+    worker_group = worker_group_2d_sharding
+    assert len(worker_group.workers) == 4
+    assert len(worker_group._initializer_pool) == 2
+    assert set(worker_group._initializer_pool.keys()) == {0, 1}
+
+
+def test_shutdown_clears_initializer_pool(
+    register_test_actor, virtual_cluster_4_bundles
+):
+    """shutdown() kills the pooled initializers and clears the pool."""
+    builder = RayWorkerBuilder(register_test_actor)
+    sharding = NamedSharding(layout=[[0, 1], [2, 3]], names=["dp", "tp"])
+    worker_group = RayWorkerGroup(
+        cluster=virtual_cluster_4_bundles,
+        remote_worker_builder=builder,
+        workers_per_node=None,
+        sharding_annotations=sharding,
+    )
+    assert len(worker_group._initializer_pool) == 2
+
+    assert worker_group.shutdown(force=True) is True
+    assert worker_group._initializer_pool == {}
+
+
 def test_actor_initialization_with_args_kwargs(register_test_actor, virtual_cluster):
     actor_fqn = register_test_actor
     init_args = ("arg1", 123)
@@ -1079,6 +1121,102 @@ def test_get_nsight_config_if_pattern_matches():
 
         result = get_nsight_config_if_pattern_matches("other_worker")
         assert result == {}
+
+
+def test_get_nsight_config_extra_options():
+    """NRL_NSYS_EXTRA_OPTIONS should merge into the nsight config (user wins on conflict)."""
+    from unittest.mock import patch
+
+    from nemo_rl.distributed.worker_group_utils import (
+        get_nsight_config_if_pattern_matches,
+    )
+
+    # Test 1: extras add new flags without disturbing defaults.
+    with (
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_WORKER_PATTERNS",
+            "*policy*",
+        ),
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_PROFILE_STEP_RANGE", "2:3"
+        ),
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_EXTRA_OPTIONS",
+            {"gpu-metrics-device": "all", "cuda-memory-usage": "true"},
+        ),
+    ):
+        result = get_nsight_config_if_pattern_matches("megatron_policy_worker")
+        assert "nsight" in result
+        nsight = result["nsight"]
+        # Defaults still present
+        assert nsight["t"] == "cuda,cudnn,cublas,nvtx"
+        assert nsight["o"] == "'megatron_policy_worker_2:3_%p'"
+        assert nsight["capture-range"] == "cudaProfilerApi"
+        # User extras applied
+        assert nsight["gpu-metrics-device"] == "all"
+        assert nsight["cuda-memory-usage"] == "true"
+
+    # Test 2: extras override built-in defaults on key conflict.
+    with (
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_WORKER_PATTERNS",
+            "*policy*",
+        ),
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_PROFILE_STEP_RANGE", "1:2"
+        ),
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_EXTRA_OPTIONS",
+            {"capture-range": "none", "cuda-graph-trace": "graph"},
+        ),
+    ):
+        result = get_nsight_config_if_pattern_matches("dtensor_policy_worker")
+        assert "nsight" in result
+        nsight = result["nsight"]
+        assert nsight["capture-range"] == "none"
+        assert nsight["cuda-graph-trace"] == "graph"
+
+    # Test 3: empty NRL_NSYS_EXTRA_OPTIONS leaves the config untouched.
+    with (
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_WORKER_PATTERNS",
+            "*policy*",
+        ),
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_PROFILE_STEP_RANGE", "1:2"
+        ),
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_EXTRA_OPTIONS",
+            {},
+        ),
+    ):
+        result = get_nsight_config_if_pattern_matches("policy_worker")
+        assert "nsight" in result
+        # The default keys are exactly the documented set.
+        assert set(result["nsight"].keys()) == {
+            "t",
+            "o",
+            "stop-on-exit",
+            "capture-range",
+            "capture-range-end",
+            "cuda-graph-trace",
+        }
+
+
+def test_nrl_nsys_extra_options_parsing():
+    """_parse_extra_options accepts an empty string, rejects non-JSON and non-dict payloads."""
+    import pytest
+
+    from nemo_rl.utils.nsys import _parse_extra_options
+
+    assert _parse_extra_options("") == {}
+    assert _parse_extra_options('{"gpu-metrics-device": "all"}') == {
+        "gpu-metrics-device": "all"
+    }
+    with pytest.raises(ValueError, match="Failed to parse NRL_NSYS_EXTRA_OPTIONS"):
+        _parse_extra_options("not-json")
+    with pytest.raises(ValueError, match="must be a JSON object"):
+        _parse_extra_options('["a", "b"]')
 
 
 def test_get_nsight_config_output_format():
