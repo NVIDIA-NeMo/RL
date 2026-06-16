@@ -135,6 +135,13 @@ Train Qwen2.5-Omni-7B with GRPO on PhilipC/IntentTrain (audio-visual intent reco
 Learn how to add support for new model architectures in NeMo RL.
 :::
 
+:::{grid-item-card} {octicon}`pulse` LoRA
+:link: guides/lora
+:link-type: doc
+
+Parameter-efficient fine-tuning with LoRA: backend support, DTensor vs Megatron schema comparison, config examples, and recipes.
+:::
+
 :::{grid-item-card} {octicon}`arrow-both` YaRN Long-Context Training
 :link: guides/yarn-long-context
 :link-type: doc
@@ -251,6 +258,7 @@ adding-new-models.md
 guides/sft.md
 guides/dpo.md
 guides/dapo.md
+guides/lora.md
 guides/cispo.md
 guides/prorlv2.md
 guides/grpo.md
@@ -269,6 +277,7 @@ guides/quantization-aware-rl.md
 guides/eagle3-speculative-decoding.md
 guides/yarn-long-context.md
 guides/xtoken-off-policy-distillation.md
+guides/router-replay.md
 guides/muon-optimizer.md
 guides/dtensor-tp-accuracy.md
 guides/ft-launcher-guide.md
