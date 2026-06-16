@@ -94,6 +94,14 @@ class SingleControllerConfig(BaseModel, extra="allow"):
     # Training
     max_train_steps: int = 10
     max_rollout_prompts: int = 32
+    # Worker-side optimizer mini-batch size, in samples. SC opens one
+    # begin / microbatch×K / finish cycle (= one opt.step) per
+    # ``train_global_batch_size`` worth of samples. Number of opt.steps per
+    # outer SC step is
+    # ``target_prompt_groups_per_step * generations_per_prompt // train_global_batch_size``.
+    # If None, coerced at __init__ to one mini-batch per outer step
+    # (samples_per_step), preserving single-opt.step-per-outer-step behavior.
+    train_global_batch_size: Optional[int] = None
 
     # DataPlane partition
     partition_id: str = "rollout_data"
@@ -181,6 +189,36 @@ class SingleControllerActor:
                 f"target_prompt_groups_per_step ({cfg.target_prompt_groups_per_step}) "
                 f"must be >= min_prompt_groups_per_batch ({cfg.min_prompt_groups_per_batch})"
             )
+
+        # Mini-batching contract: SC opens one begin / microbatch×N / finish
+        # cycle (= one opt.step) per train_global_batch_size worth of samples.
+        # Matches the sync path's gb_idx loop in the worker (one opt.step
+        # per gbs slice). When unset, coerce to a single mini-batch per
+        # outer step so behavior matches the pre-mini-batch design.
+        samples_per_step = (
+            cfg.target_prompt_groups_per_step * cfg.generations_per_prompt
+        )
+        if cfg.train_global_batch_size is None:
+            cfg.train_global_batch_size = samples_per_step
+        if cfg.train_global_batch_size <= 0:
+            raise ValueError(
+                f"train_global_batch_size must be > 0, "
+                f"got {cfg.train_global_batch_size}"
+            )
+        if samples_per_step % cfg.train_global_batch_size != 0:
+            raise ValueError(
+                f"target_prompt_groups_per_step ({cfg.target_prompt_groups_per_step}) "
+                f"* generations_per_prompt ({cfg.generations_per_prompt}) "
+                f"= {samples_per_step} samples must be divisible by "
+                f"train_global_batch_size ({cfg.train_global_batch_size})"
+            )
+        if cfg.train_global_batch_size % cfg.generations_per_prompt != 0:
+            raise ValueError(
+                f"train_global_batch_size ({cfg.train_global_batch_size}) must "
+                f"be divisible by generations_per_prompt "
+                f"({cfg.generations_per_prompt}) so a mini-batch contains "
+                f"whole prompt groups"
+            )
         self._sampler = StalenessSampler(cfg.max_weight_staleness_versions)
 
         # ── asyncio state ──────────────────────────────────────────────────
@@ -260,8 +298,10 @@ class SingleControllerActor:
         if not refs:
             return []
         ref_to_task = {ref: asyncio.ensure_future(ref) for ref in refs}
-        # timeout=0.0 is the non-blocking peek — yields control once so newly-
-        # scheduled Tasks can step their ObjectRef awaitables, then returns.
+        # Yield once so newly-scheduled Tasks can step their ObjectRef
+        # awaitables (asyncio.wait(timeout=0) by itself may return before
+        # the Tasks ever run). Then peek non-blockingly.
+        await asyncio.sleep(0)
         await asyncio.wait(ref_to_task.values(), timeout=0.0)
         pending: list[ray.ObjectRef] = []
         for ref, task in ref_to_task.items():
@@ -358,164 +398,205 @@ class SingleControllerActor:
         logprobs_required = refresh_policy_logprobs or refresh_reference_logprobs
 
         while self._train_steps < self._cfg.max_train_steps:
-            step_id = f"sc-step-{self._train_steps:06d}"
             # __init__ coerces None → min_prompt_groups_per_batch (int);
             # the assert narrows the Optional[int] type for pyrefly.
             assert self._cfg.target_prompt_groups_per_step is not None
+            assert self._cfg.train_global_batch_size is not None
             target_groups: int = self._cfg.target_prompt_groups_per_step
-            groups_dispatched = 0
-            in_flight: list[ray.ObjectRef] = []
-            step_open = False
-            step_min_weight_version: int | None = None
+            # Mini-batch aggregation: K groups per begin/finish cycle, where
+            # K * generations_per_prompt == train_global_batch_size. Each
+            # cycle is one opt.step. Mirrors sync's gb_idx loop in the worker.
+            groups_per_minibatch = (
+                self._cfg.train_global_batch_size // self._cfg.generations_per_prompt
+            )
+            num_minibatches = target_groups // groups_per_minibatch
+            rollout_exhausted = False
 
-            # Per-step error path: if any worker call raises (microbatch OOM,
-            # NaN-guard trip, prepare_logprobs failure, begin/finish failure),
-            # bail out of the inner loop, drop any partial worker state via
-            # abort_train_step, clear the consumed-ids ledger, and re-raise.
-            # TODO(sc): retry policy is not yet wired — current behavior fails
-            # the SC actor after a clean abort. A follow-up should add bounded
-            # retry (e.g. retry the step N times, abort the run on exhaustion).
-            try:
-                while groups_dispatched < target_groups:
-                    await asyncio.sleep(0)
-                    await self._claim_available_meta()
-                    evicted_meta = await self._evict_stale_claimed()
-                    if evicted_meta is not None:
-                        evicted_groups = count_prompt_groups(
-                            evicted_meta,
-                            generations_per_prompt=self._cfg.generations_per_prompt,
-                        )
-                        for _ in range(evicted_groups):
-                            self._buffer_capacity.release()
+            for mb_idx in range(num_minibatches):
+                step_id = f"sc-step-{self._train_steps:06d}-mb-{mb_idx:02d}"
+                groups_dispatched = 0
+                in_flight: list[ray.ObjectRef] = []
+                step_open = False
+                step_min_weight_version: int | None = None
 
-                    group_indices = None
-                    if self._claimed_meta is not None and self._claimed_meta.size > 0:
-                        group_indices = self._sampler.select_one_group(
-                            self._claimed_meta,
-                            trainer_version=self._trainer_version,
-                            generations_per_prompt=self._cfg.generations_per_prompt,
-                        )
+                # Per-cycle error path: a mid-cycle worker failure
+                # (microbatch OOM, NaN-guard trip, prepare_logprobs failure,
+                # begin/finish failure) calls abort_train_step on the worker
+                # to drop partial state, clears the consumed-ids ledger,
+                # then re-raises. TODO(sc): retry policy is a follow-up.
+                try:
+                    while groups_dispatched < groups_per_minibatch:
+                        await asyncio.sleep(0)
+                        await self._claim_available_meta()
+                        evicted_meta = await self._evict_stale_claimed()
+                        if evicted_meta is not None:
+                            evicted_groups = count_prompt_groups(
+                                evicted_meta,
+                                generations_per_prompt=self._cfg.generations_per_prompt,
+                            )
+                            for _ in range(evicted_groups):
+                                self._buffer_capacity.release()
 
-                    if group_indices is None:
-                        in_flight = await self._reap_in_flight_nonblocking(in_flight)
+                        group_indices = None
                         if (
-                            self._rollout_done
-                            and len(in_flight) == 0
-                            and (
-                                self._claimed_meta is None
-                                or self._claimed_meta.size == 0
-                            )
+                            self._claimed_meta is not None
+                            and self._claimed_meta.size > 0
                         ):
-                            break
-                        await asyncio.sleep(0.005)
-                        continue
-
-                    group_meta = self._claimed_meta.subset(group_indices)
-                    self._claimed_meta = self._claimed_meta.drop(group_indices)
-
-                    if logprobs_required:
-                        # Trainer writes refreshed prev_lp / ref_lp back to the
-                        # TQ partition under the configured field names. Block
-                        # here: advantage estimation downstream may read them.
-                        await self._ray_get(
-                            self._trainer.prepare_logprobs_from_meta.remote(
-                                group_meta,
-                                refresh_policy_logprobs=refresh_policy_logprobs,
-                                refresh_reference_logprobs=refresh_reference_logprobs,
+                            group_indices = self._sampler.select_one_group(
+                                self._claimed_meta,
+                                trainer_version=self._trainer_version,
+                                generations_per_prompt=self._cfg.generations_per_prompt,
                             )
+
+                        if group_indices is None:
+                            in_flight = await self._reap_in_flight_nonblocking(
+                                in_flight
+                            )
+                            if (
+                                self._rollout_done
+                                and len(in_flight) == 0
+                                and (
+                                    self._claimed_meta is None
+                                    or self._claimed_meta.size == 0
+                                )
+                            ):
+                                rollout_exhausted = True
+                                break
+                            await asyncio.sleep(0.005)
+                            continue
+
+                        group_meta = self._claimed_meta.subset(group_indices)
+                        self._claimed_meta = self._claimed_meta.drop(group_indices)
+
+                        if logprobs_required:
+                            # Trainer writes refreshed prev_lp / ref_lp back to
+                            # the TQ partition under the configured field names.
+                            # Block here: advantage estimation downstream reads them.
+                            await self._ray_get(
+                                self._trainer.prepare_logprobs_from_meta.remote(
+                                    group_meta,
+                                    refresh_policy_logprobs=refresh_policy_logprobs,
+                                    refresh_reference_logprobs=refresh_reference_logprobs,
+                                )
+                            )
+
+                        # Advantage pump
+                        group_meta = await self._advantage_pump(group_meta)
+
+                        if not step_open:
+                            # gbs/mbs default to worker-side cfg when None; SC
+                            # owns only loss_fn (stable across the whole run).
+                            await self._ray_get(
+                                self._trainer.begin_train_step.remote(
+                                    step_id, self._loss_fn
+                                )
+                            )
+                            step_open = True
+
+                        future = self._trainer.train_microbatch_from_meta.remote(
+                            step_id, group_meta
+                        )
+                        in_flight.append(future)
+                        groups_dispatched += 1
+                        self._buffer_capacity.release()
+                        self._step_consumed_sample_ids.extend(group_meta.sample_ids)
+                        group_min_v = min_weight_version(group_meta)
+                        if group_min_v is not None:
+                            step_min_weight_version = (
+                                group_min_v
+                                if step_min_weight_version is None
+                                else min(step_min_weight_version, group_min_v)
+                            )
+
+                        in_flight = await self._reap_in_flight_nonblocking(
+                            in_flight
                         )
 
-                    group_meta = await self._advantage_pump(group_meta)
+                    for fut in in_flight:
+                        await self._ray_get(fut)
 
                     if not step_open:
-                        # gbs/mbs default to worker-side cfg when None; SC owns
-                        # only loss_fn (stable across the whole training run).
-                        await self._ray_get(
-                            self._trainer.begin_train_step.remote(
-                                step_id, self._loss_fn
-                            )
+                        # No groups consumed this mini-batch — either rollouts
+                        # exhausted before any group arrived, or the outer
+                        # loop broke without dispatching. Skip finish/cleanup.
+                        log.info(
+                            "train_pump: rollout exhausted at mb %d "
+                            "(no groups for this opt.step)",
+                            mb_idx,
                         )
-                        step_open = True
+                        break
 
-                    future = self._trainer.train_microbatch_from_meta.remote(
-                        step_id, group_meta
+                    # finish_train_step returns step metrics; SC ignores them
+                    # for version bookkeeping. trainer_version is driver-owned
+                    # (workers don't emit it) and bumps after this call
+                    # returns successfully. The new value propagates to
+                    # rollouts via _sync_weights at the end of the outer step.
+                    await self._ray_get(
+                        self._trainer.finish_train_step.remote(step_id)
                     )
-                    in_flight.append(future)
-                    groups_dispatched += 1
-                    self._buffer_capacity.release()
-                    self._step_consumed_sample_ids.extend(group_meta.sample_ids)
-                    group_min_v = min_weight_version(group_meta)
-                    if group_min_v is not None:
-                        step_min_weight_version = (
-                            group_min_v
-                            if step_min_weight_version is None
-                            else min(step_min_weight_version, group_min_v)
-                        )
+                except Exception:
+                    # Worker may be left with a half-open step (train_microbatch
+                    # partially mutated _train_step_state, or begin/finish
+                    # itself raised). Best-effort: tell the worker to drop
+                    # state so the next attempt can begin cleanly. Swallow
+                    # abort errors so the original exception still surfaces.
+                    if step_open:
+                        try:
+                            await self._ray_get(
+                                self._trainer.abort_train_step.remote(step_id)
+                            )
+                        except Exception:
+                            log.exception(
+                                "abort_train_step failed during error recovery "
+                                "(step=%s)",
+                                step_id,
+                            )
+                    self._step_consumed_sample_ids = []
+                    raise
 
-                    in_flight = await self._reap_in_flight_nonblocking(in_flight)
+                # finish_train_step succeeded → opt.step ran on the worker,
+                # model weights are advanced. Bump the version immediately so
+                # SC's counter reflects worker state even if clear_samples
+                # below raises.
+                prev_trainer_version = self._trainer_version
+                self._trainer_version += 1
 
-                for fut in in_flight:
-                    await self._ray_get(fut)
+                consumed_ids = list(self._step_consumed_sample_ids)
+                self._step_consumed_sample_ids = []
+                await self._call_dp(
+                    "clear_samples",
+                    sample_ids=consumed_ids,
+                    partition_id=self._cfg.partition_id,
+                )
+                lag = (
+                    prev_trainer_version - step_min_weight_version
+                    if step_min_weight_version is not None
+                    else 0
+                )
+                log.info(
+                    "train step %d/%d  mb %d/%d  trainer_v=%d  lag=%d  batch_size=%d",
+                    self._train_steps + 1,
+                    self._cfg.max_train_steps,
+                    mb_idx + 1,
+                    num_minibatches,
+                    self._trainer_version,
+                    lag,
+                    len(consumed_ids),
+                )
 
-                if not step_open:
-                    log.info("train_pump: rollout exhausted before any group ready")
+                if rollout_exhausted:
+                    # Inner loop terminated early due to rollout exhaustion;
+                    # the cycle still completed (step_open was True), so we
+                    # finished and logged above. Exit the mini-batch loop now
+                    # — no more groups are coming.
                     break
 
-                # finish_train_step returns step metrics; SC ignores them for
-                # version bookkeeping. The trainer_version counter is driver-
-                # owned (workers don't emit it) and bumps after this call
-                # returns successfully (see below). The new value propagates
-                # to rollouts via _sync_weights below.
-                await self._ray_get(self._trainer.finish_train_step.remote(step_id))
-            except Exception:
-                # Worker may be left with a half-open step (train_microbatch
-                # partially mutated _train_step_state, or begin/finish itself
-                # raised). Best-effort: tell the worker to drop state so the
-                # next attempt can begin cleanly. We swallow abort errors here
-                # so the original exception still surfaces — masking it would
-                # be worse than a noisy log.
-                if step_open:
-                    try:
-                        await self._ray_get(
-                            self._trainer.abort_train_step.remote(step_id)
-                        )
-                    except Exception:
-                        log.exception(
-                            "abort_train_step failed during error recovery (step=%s)",
-                            step_id,
-                        )
-                self._step_consumed_sample_ids = []
-                raise
+            if rollout_exhausted:
+                # No more rollouts; stop the outer training loop entirely
+                # rather than running empty mini-batches.
+                break
 
-            # finish_train_step succeeded → opt.step ran on the worker, model
-            # weights are advanced. Bump the version *immediately* so SC's
-            # counter reflects worker state even if clear_samples below
-            # raises — otherwise a clear_samples failure would leave SC stuck
-            # on the old version while the trainer is one ahead.
-            prev_trainer_version = self._trainer_version
-            self._trainer_version += 1
-
-            consumed_ids = list(self._step_consumed_sample_ids)
-            self._step_consumed_sample_ids = []
-            await self._call_dp(
-                "clear_samples",
-                sample_ids=consumed_ids,
-                partition_id=self._cfg.partition_id,
-            )
-            lag = (
-                prev_trainer_version - step_min_weight_version
-                if step_min_weight_version is not None
-                else 0
-            )
-            log.info(
-                "train step %d/%d  trainer_v=%d  lag=%d  batch_size=%d",
-                self._train_steps + 1,
-                self._cfg.max_train_steps,
-                self._trainer_version,
-                lag,
-                len(consumed_ids),
-            )
-
+            # One sync per outer step covers all opt.steps in this iteration.
             await self._sync_weights()
             self._train_steps += 1
 
