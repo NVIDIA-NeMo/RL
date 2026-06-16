@@ -794,8 +794,16 @@ class MegatronPolicyWorkerImpl(
         # Either way, opt.step sees the right-normalized gradient.
         self.model.scale_gradients(inv_n)
 
-        # The ONE true cross-DP reduce for the entire step.
-        self.model.start_grad_sync()
+        # Cross-DP grad reduce. Megatron-core's BucketGroup.finish_grad_sync,
+        # when overlap_grad_reduce=False, internally dispatches the synchronous
+        # collective via start_grad_sync(force_all_reduce=...). So calling
+        # both unconditionally double-reduces the grads (scales by world_size).
+        # Mirror the contract: only fire start_grad_sync ourselves when the
+        # overlap path needs it; finish_grad_sync handles the rest.
+        if self.cfg["megatron_cfg"]["distributed_data_parallel_config"][
+            "overlap_grad_reduce"
+        ]:
+            self.model.start_grad_sync()
         self.model.finish_grad_sync()
 
         # opt.step clips internally (clip_grad config); operates on the

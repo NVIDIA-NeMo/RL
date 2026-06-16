@@ -109,6 +109,12 @@ def _make_worker(loss_type):
             "empty_unused_memory_level": 0,
             "moe_per_layer_logging": False,
             "use_linear_ce_fusion_loss": False,
+            # overlap_grad_reduce=False matches the production default and
+            # the sync-GRPO path. finish_train_step relies on this to gate
+            # the explicit start_grad_sync call.
+            "distributed_data_parallel_config": {
+                "overlap_grad_reduce": False,
+            },
         },
     }
     w.dp_size = 2
@@ -422,14 +428,23 @@ class TestFinish:
         arg = w.model.scale_gradients.call_args.args[0]
         assert 0 < arg <= 1.0
 
-    def test_start_then_finish_grad_sync_called_after_rescale(
-        self, mock_module_symbols
+    @pytest.mark.parametrize("overlap_grad_reduce", [False, True])
+    def test_grad_sync_call_order_after_rescale(
+        self, mock_module_symbols, overlap_grad_reduce
     ):
-        """Call order matters: scale_gradients -> start_grad_sync ->
-        finish_grad_sync -> optimizer.step."""
+        """Call order matters: scale_gradients -> [start_grad_sync when
+        overlap=True] -> finish_grad_sync -> optimizer.step.
+
+        With overlap=False, Megatron's finish_grad_sync internally calls
+        start_grad_sync(force_all_reduce=True), so calling start_grad_sync
+        ourselves would double-reduce.
+        """
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = self._setup_open_step(mock_module_symbols, LossType.TOKEN_LEVEL)
+        w.cfg["megatron_cfg"]["distributed_data_parallel_config"][
+            "overlap_grad_reduce"
+        ] = overlap_grad_reduce
         # Record call order via a shared list
         order: list[str] = []
         w.model.scale_gradients.side_effect = lambda s: order.append("scale")
@@ -439,7 +454,10 @@ class TestFinish:
             order.append("opt_step") or (True, 0.5, 0)
         )
         w.finish_train_step("s0")
-        assert order == ["scale", "start_sync", "finish_sync", "opt_step"]
+        if overlap_grad_reduce:
+            assert order == ["scale", "start_sync", "finish_sync", "opt_step"]
+        else:
+            assert order == ["scale", "finish_sync", "opt_step"]
 
     def test_picks_global_valid_toks_for_token_level_loss(self, mock_module_symbols):
         """N selection: TOKEN_LEVEL → N = global_valid_toks (not seqs)."""
