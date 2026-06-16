@@ -385,6 +385,14 @@ class DynamicBatchingConfig(TypedDict):
     sequence_length_round: int
 
 
+class RouterReplayConfigDisabled(TypedDict):
+    enabled: Literal[False]
+
+
+class RouterReplayConfig(TypedDict):
+    enabled: Literal[True]
+
+
 class PolicyConfig(TypedDict):
     model_name: str
     tokenizer: TokenizerConfig
@@ -405,6 +413,7 @@ class PolicyConfig(TypedDict):
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
     draft: NotRequired[DraftConfig | DraftConfigDisabled]
     pretrained_checkpoint: NotRequired[PretrainedCheckpointConfig]
+    router_replay: NotRequired[RouterReplayConfig | RouterReplayConfigDisabled]
     hf_config_overrides: NotRequired[dict[str, Any]]
     dynamic_batching: DynamicBatchingConfig | DynamicBatchingConfigDisabled
     sequence_packing: NotRequired[SequencePackingConfig | SequencePackingConfigDisabled]

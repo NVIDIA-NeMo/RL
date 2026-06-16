@@ -83,6 +83,11 @@ from nemo_rl.models.megatron.draft.utils import (
     find_draft_owner_chunk,
     get_attached_draft_model,
 )
+from nemo_rl.models.megatron.router_replay import (
+    clear_global_router_replay_instances,
+    router_replay_enabled,
+    validate_router_replay_config,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
@@ -416,6 +421,7 @@ def setup_model_config(
     """Handle all the model configuration logic."""
     pretrained_ckpt = config.get("pretrained_checkpoint")
     fmt = pretrained_ckpt["format"] if pretrained_ckpt is not None else None
+    validate_router_replay_config(config)
 
     if fmt == "megatron_lm":
         # For megatron_lm format: build the model config from the HF architecture.
@@ -683,6 +689,7 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
 
     if "moe_grouped_gemm" in config["megatron_cfg"]:
         model_cfg.moe_grouped_gemm = config["megatron_cfg"]["moe_grouped_gemm"]
+    model_cfg.moe_enable_routing_replay = router_replay_enabled(config)
 
 
 def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
@@ -1452,55 +1459,61 @@ def setup_reference_model_state(
 
         ref_pre_wrap_hooks.extend([composed_peft_hook])
 
-    reference_model = get_model(
-        megatron_cfg.model,
-        megatron_cfg.ddp,
-        use_torch_fsdp2=megatron_cfg.dist.use_torch_fsdp2,
-        overlap_param_gather_with_optimizer_step=megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
-        data_parallel_random_init=megatron_cfg.rng.data_parallel_random_init,
-        pre_wrap_hook=ref_pre_wrap_hooks,
-        mixed_precision_wrapper=ref_mixed_precision_wrapper,
-        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
-    )
-
-    # If use_peft, the pretrained checkpoint weights are already loaded inside of the pre_wrap_hook
-    # so they only need to be loaded here if use_peft is False
-    should_load_checkpoint = (
-        not use_peft
-        and ref_checkpoint_config.pretrained_checkpoint is not None
-        and checkpoint_exists(ref_checkpoint_config.pretrained_checkpoint)
-    )
-
-    print("Loading the Reference Model")
-
-    if should_load_checkpoint:
-        if pre_load_checkpoint_hook is not None:
-            pre_load_checkpoint_hook(ref_state, reference_model)
-        load_checkpoint(
-            ref_state,
-            reference_model,
-            None,  # no optimizer
-            None,  # no scheduler
-            checkpointing_context=ref_ckpt_context,
-            skip_load_to_model_and_opt=HAVE_FSDP2 and megatron_cfg.dist.use_torch_fsdp2,
+    try:
+        reference_model = get_model(
+            megatron_cfg.model,
+            megatron_cfg.ddp,
+            use_torch_fsdp2=megatron_cfg.dist.use_torch_fsdp2,
+            overlap_param_gather_with_optimizer_step=megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
+            data_parallel_random_init=megatron_cfg.rng.data_parallel_random_init,
+            pre_wrap_hook=ref_pre_wrap_hooks,
+            mixed_precision_wrapper=ref_mixed_precision_wrapper,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
-    reference_state_dict = {}
+        # If use_peft, the pretrained checkpoint weights are already loaded inside of the pre_wrap_hook
+        # so they only need to be loaded here if use_peft is False
+        should_load_checkpoint = (
+            not use_peft
+            and ref_checkpoint_config.pretrained_checkpoint is not None
+            and checkpoint_exists(ref_checkpoint_config.pretrained_checkpoint)
+        )
 
-    if should_load_checkpoint or use_peft:
-        reference_model = reference_model[0]
-        reference_model.eval()
-        # Store reference state dict on CPU
-        for name, item in reference_model.state_dict().items():
-            if isinstance(item, torch.Tensor):
-                cpu_item = item.detach().to(device="cpu", non_blocking=True, copy=True)
-                del item
-            else:
-                cpu_item = item
-            reference_state_dict[name] = cpu_item
-        print("Reference model loaded")
-    else:
-        print("Reference model not loaded")
+        print("Loading the Reference Model")
+
+        if should_load_checkpoint:
+            if pre_load_checkpoint_hook is not None:
+                pre_load_checkpoint_hook(ref_state, reference_model)
+            load_checkpoint(
+                ref_state,
+                reference_model,
+                None,  # no optimizer
+                None,  # no scheduler
+                checkpointing_context=ref_ckpt_context,
+                skip_load_to_model_and_opt=HAVE_FSDP2
+                and megatron_cfg.dist.use_torch_fsdp2,
+            )
+
+        reference_state_dict = {}
+
+        if should_load_checkpoint or use_peft:
+            reference_model = reference_model[0]
+            reference_model.eval()
+            # Store reference state dict on CPU
+            for name, item in reference_model.state_dict().items():
+                if isinstance(item, torch.Tensor):
+                    cpu_item = item.detach().to(
+                        device="cpu", non_blocking=True, copy=True
+                    )
+                    del item
+                else:
+                    cpu_item = item
+                reference_state_dict[name] = cpu_item
+            print("Reference model loaded")
+        else:
+            print("Reference model not loaded")
+    finally:
+        clear_global_router_replay_instances()
 
     return reference_state_dict
 

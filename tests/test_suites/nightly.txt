@@ -68,6 +68,9 @@ tests/test_suites/llm/grpo-math-qwen3-30ba3b-megatron-tp4-32k.sh
 # CISPO async lag-1 high-off-policy run (Qwen3-30B-A3B, Megatron + non-colocated vLLM)
 tests/test_suites/llm/grpo-cispo-mm1-async-lag1-highoffpolicy-qwen3-30ba3b-3n8g-megatron-cispo.sh
 
+# R3 router replay regression guard (Qwen3-30B-A3B, Megatron CP2 + EP4) — short 10-step smoke
+tests/test_suites/llm/grpo-qwen3-30ba3b-8n8g-megatron-cp2-r3.sh
+
 # FP8
 tests/test_suites/llm/grpo-llama3.1-8b-instruct-1n8g-megatron-fp8-rollouts.v3.sh
 tests/test_suites/llm/grpo-llama3.1-8b-instruct-2n8g-megatron-fp8-e2e.sh
