@@ -87,6 +87,7 @@ from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
     get_megatron_checkpoint_dir,
 )
+from nemo_rl.models.value.config import ValueConfig
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
@@ -505,9 +506,29 @@ def setup_model_config(
     if fmt == "megatron_lm":
         model_cfg.finalize()
 
+    # Derive fp8_param_enabled once from the config dict so that load_main_params_from_ckpt
+    # and _create_megatron_config both use the same canonical check (fp8 enabled AND fp8_param).
+    fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
+    fp8_param_enabled = bool(
+        fp8_cfg and fp8_cfg.get("enabled", False) and fp8_cfg.get("fp8_param", False)
+    )
+
+    # When fp8_param starts from a pretrained checkpoint, model params may already
+    # be quantized before optimizer main params are initialized. Load main params
+    # from the checkpoint state dict to preserve the original checkpoint precision.
+    load_main_params_from_ckpt = (
+        fp8_param_enabled
+        and pretrained_path is not None
+        and weights_path is None
+        and optimizer_path is None
+    )
+
     # Create checkpoint configs
     checkpoint_config = _create_checkpoint_config(
-        pretrained_path, weights_path, optimizer_path
+        pretrained_path,
+        weights_path,
+        optimizer_path,
+        load_main_params_from_ckpt,
     )
 
     # Validate training configuration
@@ -515,7 +536,7 @@ def setup_model_config(
 
     # Create final megatron config
     megatron_cfg = _create_megatron_config(
-        model_cfg, checkpoint_config, config, hf_model_name, dtype
+        model_cfg, checkpoint_config, config, hf_model_name, dtype, fp8_param_enabled
     )
 
     _validate_dtype_config(dtype, megatron_cfg.model, megatron_cfg.optimizer)
@@ -541,8 +562,12 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.context_parallel_size = config["megatron_cfg"]["context_parallel_size"]
 
     if model_cfg.context_parallel_size > 1:
+        # Either NeMo-RL does the packing+CP-sharding itself (classic mcore
+        # GPTModel path) OR the model does it internally (mbridge VLM wrappers
+        # like Qwen3VL, auto-detected at model build). Both paths require
+        # cu_seqlens to flow via PackedSeqParams, so sequence_packing must be on.
         assert config["sequence_packing"]["enabled"], (
-            "Sequence Packing must be enabled to use Context Parallelism with MCore"
+            "Sequence Packing must be enabled to use Context Parallelism with MCore."
         )
         assert not config["megatron_cfg"].get("use_linear_ce_fusion_loss", False), (
             "Context Parallelism is not supported with linear CE fusion loss, please set use_linear_ce_fusion_loss to false"
@@ -729,12 +754,6 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
         except KeyError as e:
             raise KeyError(f"Missing key in fp8_cfg: {e}")
 
-        if model_cfg.fp8_param:
-            warnings.warn(
-                "Setting fp8_param=True sometimes causes NaN token_mult_prob_error, please use with caution. "
-                "Refer to https://github.com/NVIDIA-NeMo/RL/issues/1164 for latest updates with this issue."
-            )
-
 
 def _validate_optimizer_config(config: PolicyConfig) -> None:
     """Validate optimizer configuration."""
@@ -764,7 +783,10 @@ def _validate_chunking_config(config: PolicyConfig) -> None:
 
 
 def _create_checkpoint_config(
-    pretrained_path: str, weights_path: Optional[str], optimizer_path: Optional[str]
+    pretrained_path: str,
+    weights_path: Optional[str],
+    optimizer_path: Optional[str],
+    load_main_params_from_ckpt: bool = False,
 ) -> CheckpointConfig:
     """Create checkpoint configurations."""
     return CheckpointConfig(
@@ -777,6 +799,7 @@ def _create_checkpoint_config(
         fully_parallel_save=True,
         fully_parallel_load=True,
         load_rng=False,
+        load_main_params_from_ckpt=load_main_params_from_ckpt,
     )
 
 
@@ -844,8 +867,26 @@ def _create_megatron_config(
     config: PolicyConfig,
     hf_model_name: str,
     dtype: torch.dtype,
+    fp8_param_enabled: bool = False,
 ) -> ConfigContainer:
     """Create the final Megatron configuration container."""
+    # fp8_param_gather and reuse_grad_buf_for_mxfp8_param_ag are derived: both are
+    # only valid when fp8 is enabled, fp8_param=True, and recipe is mxfp8. Mcore's
+    # DDP __post_init__ asserts they remain in sync, so we centralize the derivation
+    # rather than exposing two redundant YAML knobs that can disagree.
+    fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
+    reuse_grad_buf_for_mxfp8_param_ag = (
+        fp8_param_enabled and fp8_cfg.get("fp8_recipe") == "mxfp8"
+    )
+    overlap_param_gather = config["megatron_cfg"]["distributed_data_parallel_config"][
+        "overlap_param_gather"
+    ]
+    optimizer_kwargs = {
+        **config["megatron_cfg"]["optimizer"],
+        "overlap_param_gather": overlap_param_gather,
+        "reuse_grad_buf_for_mxfp8_param_ag": reuse_grad_buf_for_mxfp8_param_ag,
+    }
+
     return ConfigContainer(
         model=model_cfg,
         checkpoint=checkpoint_config,
@@ -855,7 +896,7 @@ def _create_megatron_config(
             global_batch_size=config["train_global_batch_size"],  # ignored
             train_iters=config["megatron_cfg"]["train_iters"],
         ),
-        optimizer=OptimizerConfig(**config["megatron_cfg"]["optimizer"]),
+        optimizer=OptimizerConfig(**optimizer_kwargs),
         ddp=DistributedDataParallelConfig(
             check_for_nan_in_grad=True,
             grad_reduce_in_fp32=config["megatron_cfg"][
@@ -864,9 +905,7 @@ def _create_megatron_config(
             overlap_grad_reduce=config["megatron_cfg"][
                 "distributed_data_parallel_config"
             ]["overlap_grad_reduce"],
-            overlap_param_gather=config["megatron_cfg"][
-                "distributed_data_parallel_config"
-            ]["overlap_param_gather"],
+            overlap_param_gather=overlap_param_gather,
             # we need to set average_in_collective=False with calculate_per_token_loss=T
             # otherwise, mcore throws an assertion error.
             average_in_collective=False,  # Required with calculate_per_token_loss=True
@@ -876,6 +915,8 @@ def _create_megatron_config(
             data_parallel_sharding_strategy=config["megatron_cfg"][
                 "distributed_data_parallel_config"
             ]["data_parallel_sharding_strategy"],
+            reuse_grad_buf_for_mxfp8_param_ag=reuse_grad_buf_for_mxfp8_param_ag,
+            fp8_param_gather=fp8_param_enabled,
         ),
         scheduler=SchedulerConfig(**config["megatron_cfg"]["scheduler"]),
         dataset=None,
@@ -954,6 +995,7 @@ def setup_model_and_optimizer(
     get_embedding_ranks=None,  # TODO @sahilj: What is this?
     get_position_embedding_ranks=None,
     pre_load_checkpoint_hook: Optional[Callable] = None,
+    additional_pre_wrap_hooks: Optional[list[Callable]] = None,
 ):
     state = GlobalState()
     state.cfg = megatron_cfg
@@ -1093,6 +1135,9 @@ def setup_model_and_optimizer(
             preload_policy_from_pretrained=preload_policy_from_pretrained_for_draft,
         )
         pre_wrap_hook.extend([draft_pre_wrap_hook])
+
+    if additional_pre_wrap_hooks:
+        pre_wrap_hook.extend(additional_pre_wrap_hooks)
 
     # Model, optimizer, and learning rate.
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -1468,3 +1513,111 @@ class MoEFloat16Module(Float16Module):
                     router, "_maintain_float32_expert_bias"
                 ):
                     router._maintain_float32_expert_bias()
+
+
+def make_policy_like_config(config: ValueConfig) -> dict:
+    """Adapt a ValueConfig to look like a PolicyConfig for reusing setup functions.
+
+    The Megatron setup functions expect PolicyConfig fields. This builds a
+    compatible dict from the ValueConfig with the same shape as a PolicyConfig.
+
+    The output is deterministic for a given input — callers should cache the
+    result rather than rebuilding on every call.
+    """
+    megatron_cfg = dict(config["megatron_cfg"])
+
+    # Ensure required fields have defaults
+    megatron_cfg.setdefault("empty_unused_memory_level", 1)
+    megatron_cfg.setdefault("freeze_moe_router", False)
+    megatron_cfg.setdefault("moe_per_layer_logging", False)
+    megatron_cfg.setdefault("moe_enable_deepep", False)
+    megatron_cfg.setdefault("moe_token_dispatcher_type", "allgather")
+    megatron_cfg.setdefault("moe_shared_expert_overlap", False)
+    megatron_cfg.setdefault("moe_permute_fusion", False)
+    megatron_cfg.setdefault("moe_router_load_balancing_type", "none")
+    megatron_cfg.setdefault("moe_router_bias_update_rate", 0.0)
+    megatron_cfg.setdefault("moe_router_dtype", None)
+    megatron_cfg.setdefault("num_layers_in_first_pipeline_stage", None)
+    megatron_cfg.setdefault("num_layers_in_last_pipeline_stage", None)
+    megatron_cfg.setdefault("apply_rope_fusion", True)
+    megatron_cfg.setdefault("bias_activation_fusion", True)
+    megatron_cfg.setdefault("gradient_accumulation_fusion", False)
+    megatron_cfg.setdefault("defer_fp32_logits", False)
+    megatron_cfg.setdefault("force_overwrite_initial_ckpt", False)
+
+    return {
+        "model_name": config["model_name"],
+        "tokenizer": config["tokenizer"],
+        "train_global_batch_size": config["train_global_batch_size"],
+        "train_micro_batch_size": config["train_micro_batch_size"],
+        "logprob_batch_size": config.get(
+            "logprob_batch_size", config["train_micro_batch_size"]
+        ),
+        "precision": config["precision"],
+        "megatron_cfg": megatron_cfg,
+        "dynamic_batching": config["dynamic_batching"],
+        "sequence_packing": config.get("sequence_packing", {"enabled": False}),
+        "make_sequence_length_divisible_by": config[
+            "make_sequence_length_divisible_by"
+        ],
+        "max_total_sequence_length": config["max_total_sequence_length"],
+        "max_grad_norm": config.get("max_grad_norm", 1.0),
+        "hf_config_overrides": config.get("hf_config_overrides", {}),
+        "offload_optimizer_for_logprob": False,
+        # Value models don't use generation or reference models
+        "generation": None,
+    }
+
+
+def setup_value_head(
+    hidden_size: int,
+    dtype: torch.dtype,
+    config: ValueConfig,
+    weights_path: Optional[str],
+) -> torch.nn.Module:
+    """Create the value head module and load its weights.
+
+    Prefers a training checkpoint at ``<weights_path>/value_head.pt``; falls
+    back to the HF model's ``score`` weights when ``config.load_value_head_from_model``
+    is true. Returns the constructed ``ValueHead`` on CUDA.
+    """
+    # Lazy import to avoid a circular dependency between this module and the
+    # value worker that defines ValueHead.
+    from nemo_rl.models.value.workers.megatron_value_worker import ValueHead
+
+    value_head = ValueHead(hidden_size, dtype).cuda()
+
+    # 1) Try a training checkpoint first.
+    value_head_loaded = False
+    if weights_path is not None:
+        ckpt_path = os.path.join(weights_path, "value_head.pt")
+        if os.path.exists(ckpt_path):
+            value_head.load_state_dict(
+                torch.load(ckpt_path, map_location="cuda", weights_only=True)
+            )
+            print(f"Loaded value head weights from {ckpt_path}")
+            value_head_loaded = True
+
+    # 2) Fall back to HF model's score weights when requested.
+    if not value_head_loaded and config.get("load_value_head_from_model", False):
+        from nemo_rl.models.megatron.community_import import (
+            extract_value_head_from_hf_checkpoint,
+        )
+
+        score_weights = extract_value_head_from_hf_checkpoint(config["model_name"])
+        if "score.weight" in score_weights:
+            value_head.linear.weight.data.copy_(score_weights["score.weight"])
+            print(f"Loaded value head score.weight from {config['model_name']}")
+        if "score.bias" in score_weights:
+            if value_head.linear.bias is None:
+                value_head.linear.bias = torch.nn.Parameter(
+                    torch.zeros(
+                        value_head.linear.out_features,
+                        dtype=value_head.dtype,
+                        device=value_head.linear.weight.device,
+                    )
+                )
+            value_head.linear.bias.data.copy_(score_weights["score.bias"])
+            print(f"Loaded value head score.bias from {config['model_name']}")
+
+    return value_head
