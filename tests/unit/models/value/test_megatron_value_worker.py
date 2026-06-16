@@ -174,7 +174,6 @@ def _apply_config_updates(config: ValueConfig, config_updates: dict) -> None:
                 "train_mb_tokens": mbt,
                 "logprob_mb_tokens": mbt,
                 "algorithm": "modified_first_fit_decreasing",
-                "sequence_length_round": 64,
             }
         else:
             raise ValueError(f"Unknown config_updates key: {k!r}")
@@ -316,9 +315,16 @@ def test_value_worker_init_and_get_values(value_setup):
         (2, 2, 1, 1, {}),
         (2, 2, 1, 1, {"sequence_parallel": True}),
         (2, 1, 1, 1, {"dynamic_batching": True}),
+        (2, 1, 1, 1, {"sequence_packing": True}),
     ],
     indirect=True,
-    ids=["2gpu_dp2", "2gpu_tp2", "2gpu_tp2sp", "2gpu_dp2_dynbatch"],
+    ids=[
+        "2gpu_dp2",
+        "2gpu_tp2",
+        "2gpu_tp2sp",
+        "2gpu_dp2_dynbatch",
+        "2gpu_dp2_seqpack",
+    ],
 )
 def test_value_worker_train_step(value_setup):
     """One `train()` call should produce a finite, non-negative MSE value loss."""
@@ -435,6 +441,37 @@ def test_value_worker_parallelism_equivalence(
             feat.shutdown()
         if cluster is not None:
             cluster.shutdown()
+
+
+@pytest.mark.mcore
+def test_unpack_value_sequences_variable_lengths():
+    """`_unpack_value_sequences` unpacks packed [1, T] values to [B, S] with a
+    per-sequence right-shift. Runs CPU-only (cp_group=None) and uses variable
+    lengths to cover what the uniform-length GPU equivalence test does not.
+    """
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        _unpack_value_sequences,
+    )
+
+    seqs = [
+        torch.tensor([1.0, 2.0, 3.0]),
+        torch.tensor([10.0, 20.0, 30.0, 40.0, 50.0]),
+        torch.tensor([7.0, 8.0]),
+    ]
+    packed = torch.cat(seqs).unsqueeze(0)  # [1, 10]
+    cu_seqlens_padded = torch.tensor([0, 3, 8, 10], dtype=torch.int32)
+    unpacked_seqlen = 5
+
+    out = _unpack_value_sequences(
+        packed, cu_seqlens_padded, unpacked_seqlen, cp_group=None
+    )
+
+    assert out.shape == (3, unpacked_seqlen)
+    expected = torch.zeros(3, unpacked_seqlen)
+    for i, v in enumerate(seqs):
+        # values[t] = V(state before token t): prepend 0, drop last.
+        expected[i, : v.shape[0]] = torch.cat([torch.zeros(1), v[:-1]])
+    torch.testing.assert_close(out, expected)
 
 
 @pytest.mark.hf_gated
