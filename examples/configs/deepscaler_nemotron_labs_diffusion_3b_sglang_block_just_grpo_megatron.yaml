@@ -1,0 +1,55 @@
+# BlockJustGRPO on Nemotron-Labs-Diffusion-3B, DeepScaleR train / AIME 2024 val.
+#
+# Same leftmost-reveal logprob objective as just_grpo_leftmost_reveal, but scored
+# in block_size passes via DiffuGRPO's asymmetric [noisy|clean] block-diffusion
+# layout (see nemo_rl/algorithms/block_just_grpo_logprobs.py) -- forward passes
+# scale with block_size, not response length, which is what makes long context
+# tractable.
+#
+# Inherits the DiffuGRPO config for the shared diffusion-model setup: SGLang
+# FastDiffuser generation, max_new_tokens=3744 (divisible by block_size 32 and 16),
+# 4096 sequence budget, KL off, and the production grpo batch / cluster numbers
+# (bf16 policy, train_micro_batch_size=2 / logprob_batch_size=2). Only the policy
+# worker and the logprob estimator are swapped to block-reveal.
+#
+# block_size is overridden to 16 (default checkpoint is 32) and kept consistent
+# across the three places it matters: the Megatron policy model
+# (policy.hf_config_overrides.block_size -> triggers a fresh HF->mcore conversion),
+# the SGLang generation model (sglang_cfg.json_model_override_args), and the
+# FastDiffuser decoding block (dllm_algorithm_config). The block-reveal logprob
+# estimator inherits the model's block_size, so it follows automatically.
+defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_diffugrpo_megatron.yaml"
+
+policy:
+  worker_cls_fqn: "nemo_rl.models.policy.workers.block_just_grpo_megatron_policy_worker.BlockJustGRPOMegatronPolicyWorker"
+
+  # Megatron policy model block size (block-diffusion attention). Overriding this
+  # re-runs the one-time HF->mcore conversion under a separate cache path.
+  hf_config_overrides:
+    block_size: 16
+
+  logprob_estimation:
+    type: "just_grpo_block_reveal"
+    mask_token_id: 100
+    exclude_mask_token_from_logits: true
+    # block_size omitted -> inherits the model module config.block_size (now 16),
+    # so reveal levels stay consistent with the attention blocking.
+    # max_reveal_levels: 16  # optional cap on reveal-level passes
+    # Microbatching uses the inherited logprob_batch_size / train_micro_batch_size.
+
+  generation:
+    sglang_cfg:
+      # Leftmost (left-to-right reveal) semi-AR decoding at block_size 16. The
+      # FastDiffuser engine derives the generation block structure from this
+      # config's block_size, so no separate json_model_override_args is needed.
+      # dllm_algorithm stays "FastDiffuser" (inherited); leftmost is the
+      # selection_policy inside this config.
+      dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL-block-reveal/tools/nemotron_diffusion/block_just_grpo_leftmost_dllm_bs16.yaml"
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nemotron-diffusion-3b-block-just-grpo-deepscaler-megatron"
+
+logger:
+  log_dir: "logs/grpo-nemotron-diffusion-3b-block-just-grpo-deepscaler-megatron-sglang"
+  wandb:
+    name: "grpo-nemotron-diffusion-3b-block-just-grpo-deepscaler-megatron-sglang"

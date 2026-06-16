@@ -37,6 +37,7 @@ ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
     "nemo_rl.models.policy.workers.nemotron_diffusion_megatron_policy_worker.NemotronDiffusionMegatronPolicyWorker": MCORE_EXECUTABLE,
     "nemo_rl.models.policy.workers.just_grpo_megatron_policy_worker.JustGRPOMegatronPolicyWorker": MCORE_EXECUTABLE,
     "nemo_rl.models.policy.workers.diffu_grpo_megatron_policy_worker.DiffuGRPOMegatronPolicyWorker": MCORE_EXECUTABLE,
+    "nemo_rl.models.policy.workers.block_just_grpo_megatron_policy_worker.BlockJustGRPOMegatronPolicyWorker": MCORE_EXECUTABLE,
     "nemo_rl.environments.math_environment.MathEnvironment": PY_EXECUTABLES.SYSTEM,
     "nemo_rl.environments.math_environment.MathMultiRewardEnvironment": PY_EXECUTABLES.SYSTEM,
     "nemo_rl.environments.vlm_environment.VLMEnvironment": PY_EXECUTABLES.SYSTEM,

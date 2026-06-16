@@ -339,9 +339,32 @@ class DiffuGRPOLogprobEstimationConfig(TypedDict):
     exclude_mask_token_from_logits: NotRequired[bool]
 
 
+class BlockJustGRPOLogprobEstimationConfig(TypedDict):
+    """Estimate JustGRPO leftmost-reveal logprobs in ``block_size`` passes.
+
+    Produces the same per-token leftmost-reveal logprobs as
+    ``just_grpo_leftmost_reveal`` but uses DiffuGRPO's asymmetric
+    ``[noisy | clean]`` block-diffusion layout to score one token per block per
+    forward pass, so the number of forward passes is ``block_size`` (capped by
+    ``max_reveal_levels``) instead of the response length.
+    """
+
+    type: Literal["just_grpo_block_reveal"]
+    mask_token_id: int
+    # If omitted, the model module's ``config.block_size`` is used.
+    block_size: NotRequired[int]
+    # Cap on reveal-level passes; defaults to the (effective) block size.
+    max_reveal_levels: NotRequired[int]
+    # Drop the MASK token from the scored logits (matches DiffuGRPO default).
+    exclude_mask_token_from_logits: NotRequired[bool]
+    # Microbatching reuses the standard policy.logprob_batch_size (logprobs) and
+    # policy.train_micro_batch_size (training); no block-reveal-specific knob.
+
+
 LogprobEstimationConfig = Union[
     JustGRPOLeftmostRevealLogprobEstimationConfig,
     DiffuGRPOLogprobEstimationConfig,
+    BlockJustGRPOLogprobEstimationConfig,
 ]
 
 

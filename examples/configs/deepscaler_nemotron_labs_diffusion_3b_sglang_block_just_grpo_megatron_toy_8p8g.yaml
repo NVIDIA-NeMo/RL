@@ -1,0 +1,19 @@
+# BlockJustGRPO DeepScaleR Megatron toy smoke config.
+# Runs only 8 prompts x 8 generations per prompt (64 samples) for a fast read.
+# Inherits the BlockJustGRPO production config and shrinks the grpo batch.
+defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_block_just_grpo_megatron.yaml"
+
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
+
+policy:
+  train_global_batch_size: 64
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nemotron-diffusion-3b-block-just-grpo-deepscaler-megatron-toy-8p8g"
+
+logger:
+  log_dir: "logs/grpo-nemotron-diffusion-3b-block-just-grpo-deepscaler-megatron-sglang-toy-8p8g"
+  wandb:
+    name: "grpo-nemotron-diffusion-3b-block-just-grpo-deepscaler-megatron-sglang-toy-8p8g"
