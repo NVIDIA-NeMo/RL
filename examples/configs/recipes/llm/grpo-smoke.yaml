@@ -9,8 +9,6 @@ grpo:
   num_generations_per_prompt: 4
   max_num_steps: 10
   val_period: -1
-  val_at_start: false
-  val_at_end: false
 checkpointing:
   enabled: false
 policy:
@@ -20,6 +18,3 @@ policy:
 data:
   train:
     dataset_name: gsm8k
-cluster:
-  gpus_per_node: 1
-  num_nodes: 1
