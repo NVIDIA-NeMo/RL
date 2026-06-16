@@ -128,6 +128,13 @@ Train Qwen2.5-Omni-3B with GRPO on AVQA and evaluate on MMAU, following the R1-A
 Learn how to add support for new model architectures in NeMo RL.
 :::
 
+:::{grid-item-card} {octicon}`pulse` LoRA
+:link: guides/lora
+:link-type: doc
+
+Parameter-efficient fine-tuning with LoRA: backend support, DTensor vs Megatron schema comparison, config examples, and recipes.
+:::
+
 :::{grid-item-card} {octicon}`arrow-both` YaRN Long-Context Training
 :link: guides/yarn-long-context
 :link-type: doc
@@ -244,6 +251,7 @@ adding-new-models.md
 guides/sft.md
 guides/dpo.md
 guides/dapo.md
+guides/lora.md
 guides/cispo.md
 guides/prorlv2.md
 guides/grpo.md
