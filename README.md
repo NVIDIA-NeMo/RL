@@ -201,7 +201,7 @@ uv venv</code></pre>
 > [!TIP]
 > **Smoke test:** to validate your install end-to-end more quickly, run the smoke recipe — it switches to GSM8K and caps the run at 10 steps:
 > ```sh
-> uv run examples/run_grpo.py --config examples/configs/recipes/llm/grpo-smoke.yaml
+> uv run examples/run_grpo.py --config examples/configs/grpo-smoke.yaml
 > ```
 
 ## Prerequisites

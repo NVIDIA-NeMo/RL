@@ -2,8 +2,8 @@
 # 10 steps so users can validate their install end-to-end more quickly.
 #
 # Usage:
-#   uv run examples/run_grpo.py --config examples/configs/recipes/llm/grpo-smoke.yaml
-defaults: ../../grpo_math_1B.yaml
+#   uv run examples/run_grpo.py --config examples/configs/grpo-smoke.yaml
+defaults: grpo_math_1B.yaml
 grpo:
   num_prompts_per_step: 2
   num_generations_per_prompt: 4
