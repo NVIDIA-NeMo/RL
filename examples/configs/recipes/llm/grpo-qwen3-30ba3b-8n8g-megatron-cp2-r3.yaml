@@ -27,7 +27,6 @@ policy:
       enable_prefix_caching: false
     vllm_kwargs:
       enable_chunked_prefill: false
-      moe_backend: triton
 data:
   max_input_seq_length: 2048
 data_plane:
