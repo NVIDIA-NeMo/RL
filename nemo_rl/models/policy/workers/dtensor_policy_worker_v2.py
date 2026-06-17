@@ -382,6 +382,12 @@ class DTensorPolicyWorkerV2Impl(
     def _get_refit_target_dtype(self, name: str, src_dtype: torch.dtype) -> torch.dtype:
         return _resolve_refit_transfer_dtype(name, src_dtype, self.dtype)
 
+    def _update_moe_gate_bias_if_supported(self) -> None:
+        """Update the non-gradient MoE routing bias after the optimizer step."""
+        update_moe_gate_bias = getattr(self.model, "update_moe_gate_bias", None)
+        if update_moe_gate_bias is not None:
+            update_moe_gate_bias()
+
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/train")
     def train(
         self,
@@ -541,8 +547,9 @@ class DTensorPolicyWorkerV2Impl(
                         grad_norm, device="cpu", dtype=torch.float32
                     )
 
-                    # Update parameters
+                    # Update parameters and the non-gradient MoE routing bias.
                     self.optimizer.step()
+                    self._update_moe_gate_bias_if_supported()
 
                 losses.append(torch.tensor(mb_losses).sum().item())
 
