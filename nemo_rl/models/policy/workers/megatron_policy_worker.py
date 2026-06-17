@@ -679,8 +679,8 @@ class MegatronPolicyWorkerImpl(
                             straggler_timer=self.mcore_state.straggler_timer,
                             draft_model=self.draft_model,
                             enable_hidden_capture=draft_enabled,
-                            use_linear_ce_fusion_loss=self.cfg["megatron_cfg"].get(
-                                "use_linear_ce_fusion_loss", False
+                            use_fused_linear_logprobs=self.cfg["megatron_cfg"].get(
+                                "use_fused_linear_logprobs", False
                             ),
                             use_router_replay=use_router_replay,
                             router_replay_train=not eval_mode,
@@ -898,13 +898,13 @@ class MegatronPolicyWorkerImpl(
             delegate_pack_to_model=self.delegate_pack_to_model,
         )
 
-        use_linear_ce_fusion = self.cfg["megatron_cfg"].get(
-            "use_linear_ce_fusion_loss", False
+        use_fused_linear_logprobs = self.cfg["megatron_cfg"].get(
+            "use_fused_linear_logprobs", False
         )
         logprobs_post_processor = LogprobsPostProcessor(
             cfg=self.cfg,
             sampling_params=self.sampling_params,
-            use_linear_ce_fusion=use_linear_ce_fusion,
+            use_fused_linear_logprobs=use_fused_linear_logprobs,
         )
         use_router_replay = _should_use_router_replay(
             enabled=self._router_replay_enabled,
@@ -925,7 +925,7 @@ class MegatronPolicyWorkerImpl(
                 defer_fp32_logits=self.defer_fp32_logits,
                 sampling_params=self.sampling_params,
                 straggler_timer=self.mcore_state.straggler_timer,
-                use_linear_ce_fusion_loss=use_linear_ce_fusion,
+                use_fused_linear_logprobs=use_fused_linear_logprobs,
                 use_router_replay=use_router_replay,
                 router_replay_train=False,
             )

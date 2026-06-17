@@ -420,21 +420,22 @@ def setup(
     # ==========================
     #        Loss Function
     # ==========================
-    # Linear CE fusion loss computes next-token logprobs directly from hidden states
-    # (chunked over the sequence) and never materializes the full
+    # Fused linear logprobs compute next-token logprobs directly from hidden states
+    # (chunked over the sequence) and never materialize the full
     # [batch, seq_len, vocab_size] logit tensor, which significantly reduces peak
     # memory. It is only available on the Megatron backend.
-    use_linear_ce_fusion = policy_config["megatron_cfg"]["enabled"] and policy_config[
-        "megatron_cfg"
-    ].get("use_linear_ce_fusion_loss", False)
-    if use_linear_ce_fusion:
+    use_fused_linear_logprobs = (
+        policy_config["megatron_cfg"]["enabled"]
+        and policy_config["megatron_cfg"]["use_fused_linear_logprobs"]
+    )
+    if use_fused_linear_logprobs:
         # Sequence packing is not yet validated with the fused path: the fused
         # forward rolls labels over the whole (packed) sequence and would mix
         # tokens across packed-sequence boundaries.
         assert not policy_config["sequence_packing"]["enabled"], (
             "Linear CE fusion loss is not supported with sequence packing for GRPO. "
             "The fused path has not been validated with cu_seqlens-based logprob "
-            "aggregation. Set policy.megatron_cfg.use_linear_ce_fusion_loss=false "
+            "aggregation. Set policy.megatron_cfg.use_fused_linear_logprobs=false "
             "or policy.sequence_packing.enabled=false."
         )
         # The fused forward gathers the logprob of the realized token from the raw
@@ -449,12 +450,14 @@ def setup(
         ), (
             "Linear CE fusion loss is not supported with top-k/top-p training-time "
             "filtering for GRPO. The fused path computes logprobs from unfiltered "
-            "logits. Set policy.megatron_cfg.use_linear_ce_fusion_loss=false, or "
+            "logits. Set policy.megatron_cfg.use_fused_linear_logprobs=false, or "
             "disable filtering (policy.generation.top_k=null, "
             "policy.generation.top_p=1.0)."
         )
 
-    loss_fn = ClippedPGLossFn(loss_config, use_linear_ce_fusion=use_linear_ce_fusion)
+    loss_fn = ClippedPGLossFn(
+        loss_config, use_fused_linear_logprobs=use_fused_linear_logprobs
+    )
 
     # Validate force_on_policy_ratio
     if loss_config.force_on_policy_ratio:

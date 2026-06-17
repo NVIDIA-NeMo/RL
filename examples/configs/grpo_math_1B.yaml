@@ -150,8 +150,8 @@ policy:
     # [batch, seq_len, vocab_size] logit tensor. Reduces peak memory and extends
     # the maximum trainable sequence length. Not compatible with context
     # parallelism, sequence packing, or top-k/top-p training-time filtering.
-    use_linear_ce_fusion_loss: false
-    linear_ce_fusion_chunk_size: 256
+    use_fused_linear_logprobs: false
+    fused_linear_logprobs_chunk_size: 256
     force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
     empty_unused_memory_level: 1  # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation. Setting to 0 is faster, but you are more likely to run out of GPU memory.
     activation_checkpointing: false

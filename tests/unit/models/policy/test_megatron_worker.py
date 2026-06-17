@@ -304,8 +304,8 @@ def create_megatron_test_config(
             "moe_token_dispatcher_type": "alltoall",
             "moe_shared_expert_overlap": False,
             "defer_fp32_logits": defer_fp32_logits,
-            "use_linear_ce_fusion_loss": False,
-            "linear_ce_fusion_chunk_size": 256,
+            "use_fused_linear_logprobs": False,
+            "fused_linear_logprobs_chunk_size": 256,
             "gradient_accumulation_fusion": False,
             "use_fused_weighted_squared_relu": False,
             "train_iters": 100,  # Required for Megatron training
@@ -2140,15 +2140,15 @@ def test_megatron_sft_linear_ce_fusion_agreement(tiny_qwen2_model_path):
         max_colocated_worker_groups=1,
     )
     config_fuse = create_megatron_test_config(tiny_qwen2_model_path)
-    config_fuse["megatron_cfg"]["use_linear_ce_fusion_loss"] = True
-    config_fuse["megatron_cfg"]["linear_ce_fusion_chunk_size"] = 256
+    config_fuse["megatron_cfg"]["use_fused_linear_logprobs"] = True
+    config_fuse["megatron_cfg"]["fused_linear_logprobs_chunk_size"] = 256
     policy_fuse = Policy(
         cluster=cluster_fuse,
         config=config_fuse,
         tokenizer=tokenizer,
         init_reference_model=False,
     )
-    sft_loss_fuse = NLLLossFn(use_linear_ce_fusion=True)
+    sft_loss_fuse = NLLLossFn(use_fused_linear_logprobs=True)
 
     try:
         policy_fuse.prepare_for_training()
@@ -2242,15 +2242,15 @@ def test_megatron_dpo_linear_ce_fusion_agreement(tiny_qwen2_model_path):
         max_colocated_worker_groups=1,
     )
     config_fuse = create_megatron_test_config(tiny_qwen2_model_path)
-    config_fuse["megatron_cfg"]["use_linear_ce_fusion_loss"] = True
-    config_fuse["megatron_cfg"]["linear_ce_fusion_chunk_size"] = 256
+    config_fuse["megatron_cfg"]["use_fused_linear_logprobs"] = True
+    config_fuse["megatron_cfg"]["fused_linear_logprobs_chunk_size"] = 256
     policy_fuse = Policy(
         cluster=cluster_fuse,
         config=config_fuse,
         tokenizer=tokenizer,
         init_reference_model=False,
     )
-    dpo_loss_fuse = DPOLossFn(dpo_cfg, use_linear_ce_fusion=True)
+    dpo_loss_fuse = DPOLossFn(dpo_cfg, use_fused_linear_logprobs=True)
 
     try:
         policy_fuse.prepare_for_training()
@@ -2346,15 +2346,15 @@ def test_megatron_grpo_linear_ce_fusion_agreement(tiny_qwen2_model_path):
         max_colocated_worker_groups=1,
     )
     config_fuse = create_megatron_test_config(tiny_qwen2_model_path)
-    config_fuse["megatron_cfg"]["use_linear_ce_fusion_loss"] = True
-    config_fuse["megatron_cfg"]["linear_ce_fusion_chunk_size"] = 256
+    config_fuse["megatron_cfg"]["use_fused_linear_logprobs"] = True
+    config_fuse["megatron_cfg"]["fused_linear_logprobs_chunk_size"] = 256
     policy_fuse = Policy(
         cluster=cluster_fuse,
         config=config_fuse,
         tokenizer=tokenizer,
         init_reference_model=False,
     )
-    pg_loss_fuse = ClippedPGLossFn(pg_cfg, use_linear_ce_fusion=True)
+    pg_loss_fuse = ClippedPGLossFn(pg_cfg, use_fused_linear_logprobs=True)
 
     try:
         policy_fuse.prepare_for_training()

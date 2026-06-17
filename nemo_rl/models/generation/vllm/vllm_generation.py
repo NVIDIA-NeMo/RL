@@ -201,13 +201,6 @@ class VllmGeneration(GenerationInterface):
 
         # It's necessary to set env_vars here to ensure that vllm non-leader workers also have these env_vars
         env_vars = {}
-        # vLLM 0.20 auto-selects the FlashInfer CUTLASS/TRTLLM fused-MoE backend for
-        # MoE models (e.g. Qwen3-30B-A3B). Those kernels produce incorrect outputs
-        # (0% accuracy / gibberish) for several Qwen3 MoE configs, see vLLM issues
-        # #34892, #37591, #37758. Force the reference Triton MoE backend instead.
-        # (Set before the per-recipe env_vars loop so a yaml can still override.)
-        env_vars["VLLM_USE_FLASHINFER_MOE_FP16"] = "0"
-        env_vars["VLLM_USE_FLASHINFER_MOE_FP8"] = "0"
         # User-supplied per-recipe env vars (e.g. vllm_cfg.env_vars in the yaml).
         # Scoped to this generation config so it does not impact other test cases.
         for k, v in self.cfg["vllm_cfg"].get("env_vars", {}).items():

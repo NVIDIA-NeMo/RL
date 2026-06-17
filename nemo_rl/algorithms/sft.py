@@ -227,8 +227,8 @@ def setup(
     policy.print_node_ip_and_gpu_id()
 
     loss_fn = NLLLossFn(
-        use_linear_ce_fusion=policy_config["megatron_cfg"]["enabled"]
-        and policy_config["megatron_cfg"]["use_linear_ce_fusion_loss"]
+        use_fused_linear_logprobs=policy_config["megatron_cfg"]["enabled"]
+        and policy_config["megatron_cfg"]["use_fused_linear_logprobs"]
     )
     print("  ✓ Model initialized")
 
