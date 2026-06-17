@@ -33,6 +33,16 @@ from nemo_rl.data.llm_message_utils import (
     message_log_to_flat_messages,
 )
 
+# Template that raises if a render has no user turn (mirrors Qwen3 / kanana's
+# "No user query found"); used to exercise deferral of leading system turns.
+_REQUIRES_USER_CHAT_TEMPLATE = (
+    "{%- if not messages | selectattr('role', 'equalto', 'user') | list -%}"
+    "{{ raise_exception('No user query found in messages.') }}{%- endif -%}"
+    "{%- for m in messages -%}"
+    "<|im_start|>{{ m['role'] }}\n{{ m['content'] }}<|im_end|>\n"
+    "{%- endfor -%}"
+)
+
 
 @pytest.fixture
 def simple_message_log() -> LLMMessageLogType:
@@ -528,6 +538,40 @@ def test_get_formatted_message_log_qwen3_enable_thinking(
     actual_text = [m["content"] for m in result]
 
     assert actual_text == expected_text
+
+
+def test_get_formatted_message_log_leading_system_requires_user() -> None:
+    """Templates that refuse to render a prefix without a user turn (e.g. Qwen3,
+    kanana) must still tokenize a system-led conversation; the leading system turn
+    is deferred and folds into the first user turn's chunk."""
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+    tokenizer.chat_template = _REQUIRES_USER_CHAT_TEMPLATE
+
+    message_log = [
+        {"role": "system", "content": "SYS"},
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+    ]
+    result = get_formatted_message_log(
+        [dict(m) for m in message_log],
+        tokenizer,
+        TaskDataSpec(task_name="test"),
+        add_bos_token=False,
+        add_eos_token=False,
+        add_generation_prompt=False,
+    )
+
+    ## the leading system turn is deferred (empty) and its tokens fold into the
+    ## first user turn's chunk; the concatenation still equals the full render
+    assert len(result[0]["token_ids"]) == 0
+    full = "".join(m["content"] for m in result)
+    assert "<|im_start|>system\nSYS<|im_end|>" in full
+    assert full == tokenizer.apply_chat_template(
+        message_log,
+        tokenize=False,
+        add_generation_prompt=False,
+        add_special_tokens=False,
+    )
 
 
 @pytest.mark.hf_gated
