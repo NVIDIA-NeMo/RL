@@ -1,0 +1,27 @@
+defaults: ../../sft.yaml
+policy:
+  model_name: moonshotai/Moonlight-16B-A3B-Instruct
+  train_global_batch_size: 128
+  train_micro_batch_size: 8
+  max_total_sequence_length: 512
+  sequence_packing:
+    enabled: true
+  dtensor_cfg:
+    expert_parallel_size: 8
+    automodel_kwargs:
+      backend:
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
+        attn: te
+        linear: te
+        rms_norm: te
+        enable_deepep: true
+        rope_fusion: false
+        enable_hf_state_dict_adapter: true
+        enable_fsdp_optimizations: false
+  make_sequence_length_divisible_by: 4
+sft:
+  val_at_start: false
+checkpointing:
+  enabled: false
+cluster:
+  gpus_per_node: 8

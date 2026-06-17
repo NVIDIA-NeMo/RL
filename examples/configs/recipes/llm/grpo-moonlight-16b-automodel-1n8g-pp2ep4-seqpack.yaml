@@ -1,0 +1,10 @@
+defaults: ./grpo-moonlight-16b-automodel-1n8g-pp2ep4.yaml
+policy:
+  max_total_sequence_length: 2048
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: 2048
+data:
+  max_input_seq_length: 2048
+checkpointing:
+  checkpoint_dir: results/grpo-moonlight-16b-automodel-1n8g-pp2ep4-seqpack
