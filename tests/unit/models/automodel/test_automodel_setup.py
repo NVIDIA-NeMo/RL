@@ -32,6 +32,8 @@ from nemo_rl.models.automodel.setup import (
     ModelAndOptimizerState,
     RuntimeConfig,
     _maybe_set_force_hf,
+    _has_optimizer_fp32_master,
+    _requires_fp32_model_load,
     get_tokenizer,
     setup_distributed,
     setup_model_and_optimizer,
@@ -81,6 +83,59 @@ def mock_autoconfig():
     config.torch_dtype = "float32"
     return config
 
+
+@pytest.mark.automodel
+class TestModelLoadDtypeSelection:
+    """Test suite for optimizer-aware model load dtype selection."""
+
+    FUSED_ADAM = {
+        "name": "transformer_engine.pytorch.optimizers.fused_adam.FusedAdam",
+        "kwargs": {"master_weights": True, "store_param_remainders": True},
+    }
+    FUSED_ADAM_REEXPORT = {
+        "name": "transformer_engine.pytorch.optimizers.FusedAdam",
+        "kwargs": {"master_weights": True, "store_param_remainders": True},
+    }
+    ADAMW = {"name": "torch.optim.AdamW", "kwargs": {"lr": 1e-4}}
+
+    def test_te_fused_adam_with_master_uses_optimizer_fp32_master(self):
+        assert _has_optimizer_fp32_master(self.FUSED_ADAM, init_optimizer=True) is True
+        assert _requires_fp32_model_load(self.FUSED_ADAM, init_optimizer=True) is False
+
+    def test_te_fused_adam_reexport_with_master_uses_optimizer_fp32_master(self):
+        assert (
+            _has_optimizer_fp32_master(self.FUSED_ADAM_REEXPORT, init_optimizer=True)
+            is True
+        )
+        assert (
+            _requires_fp32_model_load(
+                self.FUSED_ADAM_REEXPORT, init_optimizer=True
+            )
+            is False
+        )
+
+    def test_adamw_requires_fp32_model_load(self):
+        assert _has_optimizer_fp32_master(self.ADAMW, init_optimizer=True) is False
+        assert _requires_fp32_model_load(self.ADAMW, init_optimizer=True) is True
+
+    def test_inference_worker_uses_compute_dtype(self):
+        assert _requires_fp32_model_load(self.ADAMW, init_optimizer=False) is False
+
+    def test_missing_optimizer_config_uses_compute_dtype(self):
+        assert _requires_fp32_model_load(None, init_optimizer=True) is False
+
+    def test_te_fused_adam_without_master_requires_fp32_model_load(self):
+        cfg = {
+            "name": "transformer_engine.pytorch.optimizers.fused_adam.FusedAdam",
+            "kwargs": {"master_weights": False},
+        }
+        assert _has_optimizer_fp32_master(cfg, init_optimizer=True) is False
+        assert _requires_fp32_model_load(cfg, init_optimizer=True) is True
+
+    def test_non_te_optimizer_master_weights_kwarg_does_not_count(self):
+        cfg = {"name": "torch.optim.AdamW", "kwargs": {"master_weights": True}}
+        assert _has_optimizer_fp32_master(cfg, init_optimizer=True) is False
+        assert _requires_fp32_model_load(cfg, init_optimizer=True) is True
 
 @pytest.mark.automodel
 class TestValidateAndPrepareConfig:

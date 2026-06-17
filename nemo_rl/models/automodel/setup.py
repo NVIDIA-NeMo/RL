@@ -58,6 +58,40 @@ STRING_TO_DTYPE = {
     "float16": torch.float16,
 }
 
+# TE exposes FusedAdam both from the package and from its implementation module.
+TE_FUSED_ADAM_OPTIMIZER_NAMES = frozenset(
+    {
+        "transformer_engine.pytorch.optimizers.FusedAdam",
+        "transformer_engine.pytorch.optimizers.fused_adam.FusedAdam",
+    }
+)
+
+
+def _has_optimizer_fp32_master(
+    optimizer_cfg: Optional[dict[str, Any]], init_optimizer: bool
+) -> bool:
+    """Whether the optimizer keeps the trainable fp32 master weights internally."""
+    if not init_optimizer or not optimizer_cfg:
+        return False
+
+    optimizer_name = optimizer_cfg["name"]
+    if optimizer_name not in TE_FUSED_ADAM_OPTIMIZER_NAMES:
+        return False
+
+    optimizer_kwargs = optimizer_cfg.get("kwargs") or {}
+    return optimizer_kwargs.get("master_weights") is True
+
+
+def _requires_fp32_model_load(
+    optimizer_cfg: Optional[dict[str, Any]], init_optimizer: bool
+) -> bool:
+    """Whether resident model params must be fp32 for optimizer precision."""
+    return bool(
+        init_optimizer
+        and optimizer_cfg
+        and not _has_optimizer_fp32_master(optimizer_cfg, init_optimizer)
+    )
+
 
 def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
     """Validate and maybe auto-set force_hf based on adapter compatibility.
@@ -305,7 +339,7 @@ def validate_and_prepare_config(
     # Load model config
     model_config = AutoConfig.from_pretrained(
         model_name,
-        torch_dtype=torch.float32,  # Always load in float32 for master weights
+        torch_dtype=dtype,
         trust_remote_code=True,
         attn_implementation="flash_attention_2" if enable_seq_packing else None,
         **hf_config_overrides,
@@ -674,6 +708,17 @@ def setup_model_and_optimizer(
         moe_parallel_config=moe_config if ep_size > 1 else None,
         activation_checkpointing=config["dtensor_cfg"]["activation_checkpointing"],
     )
+
+    optimizer_cfg = config.get("optimizer")
+    use_fp32_model_load = _requires_fp32_model_load(optimizer_cfg, init_optimizer)
+    load_dtype = torch.float32 if use_fp32_model_load else runtime_config.dtype
+    model_config.torch_dtype = load_dtype
+    if rank == 0:
+        opt_name = (optimizer_cfg or {}).get("name", "<none>")
+        print(
+            f"[Rank {rank}] model load dtype={load_dtype} "
+            f"(compute dtype={runtime_config.dtype}, optimizer={opt_name})"
+        )
 
     # Create model via from_pretrained - handles meta device init, parallelization,
     # LoRA, and base weight loading internally
