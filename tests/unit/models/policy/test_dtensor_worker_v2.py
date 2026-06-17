@@ -669,8 +669,8 @@ class TestDTensorParamsGenerator:
             )
             assert tensor.is_contiguous(), f"Tensor {name} should be contiguous"
 
-    def test_dtype_conversion(self):
-        """Test that tensors are converted to target dtype."""
+    def test_fp32_source_dtype_is_preserved(self):
+        """Test that existing fp32 tensors are preserved during refit."""
         # Arrange
         model = nn.Linear(10, 5)
         # Initialize with float32
@@ -681,6 +681,18 @@ class TestDTensorParamsGenerator:
         results = list(dtensor_params_generator(model, target_dtype))
 
         # Assert
+        for name, tensor in results:
+            assert tensor.dtype == torch.float32, (
+                f"Tensor {name} should preserve its fp32 source dtype"
+            )
+
+    def test_non_fp32_source_uses_target_dtype(self):
+        """Test that non-fp32 floating tensors use the base transfer dtype."""
+        model = nn.Linear(10, 5).to(torch.float16)
+        target_dtype = torch.bfloat16
+
+        results = list(dtensor_params_generator(model, target_dtype))
+
         for name, tensor in results:
             assert tensor.dtype == target_dtype, (
                 f"Tensor {name} should be converted to {target_dtype}"
