@@ -288,12 +288,12 @@ Add the following to your Megatron config in your YAML file:
 policy:
   megatron_cfg:
     enabled: true
-    use_linear_ce_fusion_loss: true
-    linear_ce_fusion_chunk_size: 256  # tokens per chunk; smaller = less memory, larger = more throughput
+    use_fused_linear_logprobs: true
+    fused_linear_logprobs_chunk_size: 256  # tokens per chunk; smaller = less memory, larger = more throughput
 ```
 
 **Notes:**
 
 - This optimization applies to SFT training with `NLLLoss` and DPO training. See the [DPO guide](dpo.md#chunked-linear-cross-entropy-fusion-loss) for DPO-specific details.
 - Context parallelism is not supported when linear CE fusion is enabled.
-- The `linear_ce_fusion_chunk_size` parameter controls the trade-off between memory savings and compute throughput. The default value of 256 is a good starting point.
+- The `fused_linear_logprobs_chunk_size` parameter controls the trade-off between memory savings and compute throughput. The default value of 256 is a good starting point.

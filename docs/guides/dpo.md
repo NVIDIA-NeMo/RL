@@ -243,15 +243,15 @@ Add the following to your Megatron config in your YAML file:
 policy:
   megatron_cfg:
     enabled: true
-    use_linear_ce_fusion_loss: true
-    linear_ce_fusion_chunk_size: 256  # tokens per chunk; smaller = less memory, larger = more throughput
+    use_fused_linear_logprobs: true
+    fused_linear_logprobs_chunk_size: 256  # tokens per chunk; smaller = less memory, larger = more throughput
 ```
 
 **Notes:**
 
 - Context parallelism is not supported when linear CE fusion is enabled.
 - Sequence packing is not supported with DPO regardless of this setting (see [#719](https://github.com/NVIDIA-NeMo/RL/issues/719)).
-- The `linear_ce_fusion_chunk_size` parameter controls the trade-off between memory savings and compute throughput. The default value of 256 is a good starting point.
+- The `fused_linear_logprobs_chunk_size` parameter controls the trade-off between memory savings and compute throughput. The default value of 256 is a good starting point.
 
 ## Evaluate the Trained Model
 
