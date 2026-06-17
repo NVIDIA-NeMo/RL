@@ -559,10 +559,7 @@ def get_formatted_message_log(
             formatted_message,
         )
 
-        # Pull out the current turn candidate. Some chat templates (reasoning
-        # variants) are not monotonic-prefix renders across turns, so a raw
-        # string diff can re-include previous assistant content. Strip the
-        # largest text overlap against what we've already emitted.
+        # Drop overlap with already-emitted text (for non-monotonic templates).
         raw_message_chunk = formatted_message[prev_message_len_no_eos:]
         overlap = _get_longest_suffix_prefix_overlap(
             accumulated_text, raw_message_chunk
@@ -629,10 +626,7 @@ def get_formatted_message_log(
         new_message = message.copy()
         # extend this if statement to check for all(len(modality)) == 0 when adding other modalities
         if len(media_cur_message) == 0:
-            # Tokenize in conversation context instead of tokenizing each chunk
-            # in isolation. This avoids sentencepiece "leading space" artifacts
-            # and keeps append-only token IDs stable when templates re-render
-            # history differently across turns.
+            # Tokenize in accumulated context, then keep only newly appended ids.
             context_text = accumulated_text + message_chunk
             context_ids = tokenizer(
                 text=context_text, return_tensors="pt", add_special_tokens=False

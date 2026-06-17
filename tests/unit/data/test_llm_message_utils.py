@@ -719,8 +719,7 @@ class _DummyReasoningTokenizer:
             if role == "user":
                 out += f"<|user|>{content}"
             elif role == "assistant":
-                # Keep think tags only on last assistant turn, strip on history
-                # turns. This breaks monotonic-prefix assumption (issue #2821).
+                # Keep <think> only on latest assistant turn (#2821 repro).
                 if idx == len(messages) - 1:
                     out += f"<|assistant|>{content}"
                 else:
@@ -731,10 +730,8 @@ class _DummyReasoningTokenizer:
         return out
 
     def _encode(self, text: str) -> list[int]:
-        # Toy sentencepiece-like quirk:
-        # - standalone "The" at string start gets "space-prefixed" token (900)
-        # - "\nThe" in-context gets normal token (901)
-        # This reproduces issue #2844 without external model downloads.
+        # Toy sentencepiece behavior for #2844 repro:
+        # standalone "The" -> 900, in-context "\nThe" -> 901
         ids: list[int] = []
         i = 0
         while i < len(text):
@@ -796,8 +793,7 @@ def test_get_formatted_message_log_uses_context_tokenization_for_assistant_leadi
         add_generation_prompt=True,
     )
     assistant_ids = cast(torch.Tensor, out[-1]["token_ids"])
-    # With context-aware tokenization, leading token after "<|assistant|>\n"
-    # should be the in-context form (901), not standalone "space-prefixed" 900.
+    # Must use in-context token (901), not standalone chunk token (900).
     assert assistant_ids[0].item() == 901
 
 
