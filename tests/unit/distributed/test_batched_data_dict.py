@@ -646,6 +646,89 @@ def test_from_batches_pads_3d_tensors_along_sequence_dim():
     assert torch.equal(stacked_logits, expected)
 
 
+def test_from_batches_pads_4d_tensors_along_sequence_dim():
+    pad_value = -1
+    batch1 = BatchedDataDict(
+        {
+            "routed_experts": torch.arange(2 * 3 * 4 * 2, dtype=torch.int32).reshape(
+                2, 3, 4, 2
+            )
+        }
+    )
+    batch2 = BatchedDataDict(
+        {
+            "routed_experts": torch.arange(
+                100, 100 + 1 * 5 * 4 * 2, dtype=torch.int32
+            ).reshape(1, 5, 4, 2)
+        }
+    )
+
+    stacked = BatchedDataDict.from_batches(
+        [batch1, batch2], pad_value_dict={"routed_experts": pad_value}
+    )
+
+    routed_experts = stacked["routed_experts"]
+    assert routed_experts.shape == (3, 5, 4, 2)
+    assert torch.equal(routed_experts[:2, :3], batch1["routed_experts"])
+    assert torch.equal(
+        routed_experts[:2, 3:],
+        torch.full((2, 2, 4, 2), pad_value, dtype=torch.int32),
+    )
+    assert torch.equal(routed_experts[2:], batch2["routed_experts"])
+
+
+def test_from_batches_keeps_optional_keys_missing_only_from_empty_batches():
+    empty_batch = BatchedDataDict(
+        {
+            "output_ids": torch.zeros((0, 0), dtype=torch.long),
+            "generation_lengths": torch.zeros(0, dtype=torch.long),
+        }
+    )
+    routed_experts = torch.arange(1 * 3 * 2 * 2, dtype=torch.int32).reshape(1, 3, 2, 2)
+    non_empty_batch = BatchedDataDict(
+        {
+            "output_ids": torch.tensor([[1, 2, 3]], dtype=torch.long),
+            "generation_lengths": torch.tensor([3], dtype=torch.long),
+            "routed_experts": routed_experts,
+        }
+    )
+
+    stacked = BatchedDataDict.from_batches(
+        [empty_batch, non_empty_batch], pad_value_dict={"output_ids": 0}
+    )
+
+    assert stacked["output_ids"].shape == (1, 3)
+    assert torch.equal(stacked["generation_lengths"], torch.tensor([3]))
+    assert torch.equal(stacked["routed_experts"], routed_experts)
+
+    non_empty_missing_optional_key = BatchedDataDict(
+        {
+            "output_ids": torch.tensor([[4, 5, 6]], dtype=torch.long),
+            "generation_lengths": torch.tensor([3], dtype=torch.long),
+        }
+    )
+    with pytest.raises(KeyError, match="non-empty batches"):
+        BatchedDataDict.from_batches([non_empty_batch, non_empty_missing_optional_key])
+
+
+def test_from_batches_keeps_keys_missing_from_empty_mapping():
+    empty_batch = BatchedDataDict()
+    routed_experts = torch.arange(1 * 3 * 2 * 2, dtype=torch.int32).reshape(1, 3, 2, 2)
+    non_empty_batch = BatchedDataDict(
+        {
+            "output_ids": torch.tensor([[1, 2, 3]], dtype=torch.long),
+            "generation_lengths": torch.tensor([3], dtype=torch.long),
+            "routed_experts": routed_experts,
+        }
+    )
+
+    stacked = BatchedDataDict.from_batches([empty_batch, non_empty_batch])
+
+    assert torch.equal(stacked["output_ids"], non_empty_batch["output_ids"])
+    assert torch.equal(stacked["generation_lengths"], torch.tensor([3]))
+    assert torch.equal(stacked["routed_experts"], routed_experts)
+
+
 @pytest.mark.parametrize("pad_to_multiple_of", [1, 32, 64, 256])
 def test_sequence_packing_microbatch_boundaries(pad_to_multiple_of):
     """Test that microbatch boundaries are correctly maintained across chunks with random sequences."""

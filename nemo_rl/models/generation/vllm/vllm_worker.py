@@ -14,6 +14,7 @@
 
 import copy
 import gc
+import logging
 import os
 import sys
 from contextlib import contextmanager
@@ -36,11 +37,16 @@ from nemo_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
-from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generation
+from nemo_rl.models.generation.vllm.utils import (
+    format_prompt_for_vllm_generation,
+    pad_and_align_routed_expert_indices,
+)
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _resolve_enable_prefix_caching(vllm_cfg: dict[str, Any]) -> bool:
@@ -621,6 +627,7 @@ class BaseVllmGenerationWorker:
             arch in getattr(hf_config, "architectures", [])
             for arch in (
                 "Gemma3ForConditionalGeneration",
+                "Gemma4ForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
                 "Qwen3_5MoeForConditionalGeneration",
             )
@@ -631,6 +638,7 @@ class BaseVllmGenerationWorker:
                 if arch
                 in (
                     "Gemma3ForConditionalGeneration",
+                    "Gemma4ForConditionalGeneration",
                     "Qwen3_5ForConditionalGeneration",
                     "Qwen3_5MoeForConditionalGeneration",
                 )
@@ -724,6 +732,7 @@ class BaseVllmGenerationWorker:
             stop_token_ids=self.cfg["stop_token_ids"],
             stop=stop_strings,
             include_stop_str_in_output=True,
+            ignore_eos=self.cfg.get("ignore_eos", False),
         )
 
     def start_gpu_profiling(self) -> None:
@@ -854,10 +863,17 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         # Process the outputs - but preserve the original input padding structure
         output_ids_list = []
         logprobs_list = []
+        routed_experts_list = []
+        r3_missing_routes = []
+        r3_expected_routes = []
+        r3_actual_routes = []
         generation_lengths = []
         unpadded_sequence_lengths = []
         truncated_list = []  # Track if response was truncated (hit max_tokens)
         max_length = 0
+        return_routed_experts = bool(
+            self.cfg.get("vllm_kwargs", {}).get("enable_return_routed_experts", False)
+        )
         for output in outputs:
             max_length = max(max_length, len(output.outputs[0].token_ids))
 
@@ -901,6 +917,27 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             logprobs_list.append(full_logprobs)
 
             response_length = sequence_length + len(generated_tokens)
+            full_routed_experts, r3_stats = pad_and_align_routed_expert_indices(
+                output,
+                generation,
+                valid_length=response_length,
+                padded_length=total_length,
+                device=input_ids.device,
+                require_complete_routed_experts=return_routed_experts,
+                return_stats=True,
+            )
+            if return_routed_experts and full_routed_experts is None:
+                raise RuntimeError(
+                    "vLLM was asked to return routed experts but the generation output "
+                    "did not include routed_experts."
+                )
+            if return_routed_experts:
+                r3_missing_routes.append(r3_stats["missing_routes"])
+                r3_expected_routes.append(r3_stats["expected_routes"])
+                r3_actual_routes.append(r3_stats["actual_routes"])
+            if full_routed_experts is not None:
+                routed_experts_list.append(full_routed_experts)
+
             generation_lengths.append(len(generated_tokens))
             unpadded_sequence_lengths.append(response_length)
 
@@ -915,6 +952,23 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         # Create return data conforming to GenerationOutputSpec
         output_ids = torch.stack(output_ids_list)
         logprobs = torch.stack(logprobs_list)
+        if r3_missing_routes and sum(r3_missing_routes) > 0:
+            bad_samples = [
+                f"{idx}:missing={missing},actual={actual},expected={expected}"
+                for idx, (missing, actual, expected) in enumerate(
+                    zip(r3_missing_routes, r3_actual_routes, r3_expected_routes)
+                )
+                if missing > 0
+            ][:8]
+            LOGGER.warning(
+                "R3 router replay fallback: vLLM returned incomplete routed_experts "
+                "for %d/%d samples, missing_token_routes=%d. Megatron will use its "
+                "own router for those missing token routes. samples=[%s]",
+                sum(1 for missing in r3_missing_routes if missing > 0),
+                len(r3_missing_routes),
+                sum(r3_missing_routes),
+                "; ".join(bad_samples),
+            )
 
         return_data = BatchedDataDict[GenerationOutputSpec](
             {
@@ -929,6 +983,18 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
                 "truncated": torch.tensor(truncated_list, dtype=torch.bool),
             }
         )
+        if routed_experts_list:
+            return_data["routed_experts"] = torch.stack(routed_experts_list)
+        if r3_missing_routes:
+            return_data["r3_routed_experts_missing_routes"] = torch.tensor(
+                r3_missing_routes, dtype=torch.long
+            )
+            return_data["r3_routed_experts_expected_routes"] = torch.tensor(
+                r3_expected_routes, dtype=torch.long
+            )
+            return_data["r3_routed_experts_actual_routes"] = torch.tensor(
+                r3_actual_routes, dtype=torch.long
+            )
 
         return return_data
 

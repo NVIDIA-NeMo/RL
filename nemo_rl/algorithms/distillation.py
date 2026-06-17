@@ -13,12 +13,14 @@
 # limitations under the License.
 import os
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
 import ray
 import torch
 from pydantic import BaseModel
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoConfig, AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -51,6 +53,12 @@ from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemo_gym import (
+    NemoGym,
+    NemoGymConfig,
+    get_nemo_gym_uv_cache_dir,
+    get_nemo_gym_venv_dir,
+)
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
@@ -71,6 +79,7 @@ from nemo_rl.utils.logger import (
 )
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
+from nemo_rl.utils.venvs import make_actor_runtime_env
 
 # ===============================================================================
 # Configuration
@@ -172,6 +181,7 @@ def setup(
     ColocatablePolicyInterface,  # student_policy
     ColocatablePolicyInterface,  # teacher_policy
     Optional[GenerationInterface],  # student_generation
+    Optional[EnvironmentInterface],  # nemo_gym
     StatefulDataLoader,
     Optional[StatefulDataLoader],
     DistillationLossFn,
@@ -183,7 +193,7 @@ def setup(
     """Main entry point for distillation algorithm.
 
     Returns:
-        tuple of student_policy, teacher_policy, student_generation,
+        tuple of student_policy, teacher_policy, student_generation, nemo_gym,
         train_dataloader, val_dataloader,
         loss_fn, logger, checkpointer, distillation_save_state, master_config
     """
@@ -193,6 +203,7 @@ def setup(
     teacher_config = master_config.teacher
     loss_config = master_config.loss_fn
     data_config = master_config.data
+    env_configs = getattr(master_config, "env", {}) or {}
     distillation_config = master_config.distillation
     logger_config = master_config.logger
     cluster_config = master_config.cluster
@@ -294,6 +305,14 @@ def setup(
     # ==========================
     print("\n▶ Setting up compute cluster...", flush=True)
     colocated_inference = generation_config["colocated"]["enabled"]
+    enable_nemo_gym = bool(env_configs) and _should_use_nemo_gym(master_config)
+    nemo_gym_actor: Optional[EnvironmentInterface] = None
+    if enable_nemo_gym:
+        nemo_gym_num_nodes = env_configs.get("nemo_gym", {}).get("num_gpu_nodes", 0)
+        ray_cur_node_id = ray.get_runtime_context().get_node_id()
+    else:
+        nemo_gym_num_nodes = 0
+        ray_cur_node_id = None
 
     if colocated_inference:
         cluster = RayVirtualCluster(
@@ -432,10 +451,77 @@ def setup(
             generation_config["vllm_kwargs"]["hf_overrides"] = policy_config.get(
                 "hf_config_overrides", {}
             )
-        student_generation = VllmGeneration(
-            cluster=inference_cluster, config=generation_config
-        )
-        student_generation.finish_generation()
+        if enable_nemo_gym:
+            deferred_vllm = VllmGeneration(
+                cluster=inference_cluster,
+                config=generation_config,
+                defer_model_load=True,
+            )
+
+            def init_vllm_deferred():
+                deferred_vllm.load_and_start()
+                deferred_vllm.finish_generation()
+                return deferred_vllm
+
+            def init_nemo_gym():
+                nemo_gym_dict = dict(env_configs["nemo_gym"])
+                # These are NeMo-RL-side fields consumed by NemoGymConfig, not
+                # NeMo-Gym global config entries.
+                invalid_tool_call_patterns = nemo_gym_dict.pop(
+                    "invalid_tool_call_patterns", None
+                )
+                thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
+                # Pass prebuilt cache + venv dirs through the global config so the
+                # gym reuses image-baked venvs instead of rebuilding them.
+                uv_cache_dir = get_nemo_gym_uv_cache_dir()
+                if uv_cache_dir is not None:
+                    nemo_gym_dict.setdefault("uv_cache_dir", uv_cache_dir)
+                uv_venv_dir = get_nemo_gym_venv_dir()
+                if uv_venv_dir is not None:
+                    nemo_gym_dict.setdefault("uv_venv_dir", uv_venv_dir)
+                nemo_gym_cfg = NemoGymConfig(
+                    model_name=generation_config["model_name"],
+                    base_urls=deferred_vllm.dp_openai_server_base_urls,
+                    invalid_tool_call_patterns=invalid_tool_call_patterns,
+                    thinking_tags=thinking_tags,
+                    initial_global_config_dict=nemo_gym_dict,
+                )
+                nemo_gym_opts = {
+                    "runtime_env": make_actor_runtime_env(
+                        "nemo_rl.environments.nemo_gym.NemoGym"
+                    )
+                }
+                if nemo_gym_num_nodes:
+                    nemo_gym_opts["scheduling_strategy"] = (
+                        NodeAffinitySchedulingStrategy(
+                            node_id=ray_cur_node_id,
+                            soft=True,
+                        )
+                    )
+                actor = NemoGym.options(**nemo_gym_opts).remote(nemo_gym_cfg)
+                ray.get(actor._spinup.remote())
+                return actor
+
+            init_tasks = {
+                "vllm": init_vllm_deferred,
+                "nemo_gym": init_nemo_gym,
+            }
+
+            print(
+                f"  ⚡ Init tasks: {', '.join(init_tasks.keys())}",
+                flush=True,
+            )
+            with ThreadPoolExecutor(max_workers=len(init_tasks)) as executor:
+                submitted = {k: executor.submit(fn) for k, fn in init_tasks.items()}
+                results = {k: f.result() for k, f in submitted.items()}
+
+            student_generation = cast(GenerationInterface, results["vllm"])
+            nemo_gym_actor = cast(EnvironmentInterface, results["nemo_gym"])
+        else:
+            student_generation = VllmGeneration(
+                cluster=inference_cluster, config=generation_config
+            )
+            student_generation.finish_generation()
         print(
             f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}",
             flush=True,
@@ -499,6 +585,7 @@ def setup(
         student_policy,
         teacher_policy,
         student_generation,
+        nemo_gym_actor,
         dataloader,
         val_dataloader,
         loss_fn,
