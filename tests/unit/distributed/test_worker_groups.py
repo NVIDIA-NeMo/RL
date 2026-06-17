@@ -1050,7 +1050,8 @@ def test_get_nsight_config_if_pattern_matches():
     ):
         result = get_nsight_config_if_pattern_matches("dtensor_policy_worker")
         assert "nsight" in result
-        assert result["nsight"]["t"] == "cuda,cudnn,cublas,nvtx"
+        assert result["nsight"]["t"] == "cuda,nvtx"
+        assert result["nsight"]["s"] == "none"
         assert result["nsight"]["o"] == "'dtensor_policy_worker_1:5_%p'"
         assert result["nsight"]["stop-on-exit"] == "true"
 
