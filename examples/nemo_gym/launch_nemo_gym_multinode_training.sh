@@ -14,8 +14,9 @@
 
 set -euo pipefail
 # ----- PARAMETERS -----
-# WANDB_API_KEY, HF_TOKEN, EXP_NAME, RECIPE, TRAIN_NODES, GEN_NODES,
-# HF_CKPT_PATH, NEMO_GYM_SWE_TRAIN_DATA_PATH,
+# Optional: WANDB_API_KEY, HF_TOKEN
+# Required: EXP_NAME, RECIPE, TRAIN_NODES, GEN_NODES, HF_CKPT_PATH,
+# NEMO_GYM_SWE_TRAIN_DATA_PATH,
 # NEMO_GYM_SWE_VALIDATION_DATA_PATH, NEMO_GYM_SWE_SIF_DIR, REPO_LOCATION,
 # CONTAINER_IMAGE_PATH, SLURM_ACCOUNT, SLURM_PARTITION
 
@@ -73,8 +74,6 @@ require_env "REPO_LOCATION" "Host checkout path where ray.sub will be submitted.
 require_env "CONTAINER_IMAGE_PATH" "Container image path passed to sbatch/ray.sub."
 require_env "SLURM_ACCOUNT" "Slurm account for the allocation."
 require_env "SLURM_PARTITION" "Slurm partition for the allocation."
-require_env "HF_TOKEN" "Hugging Face token forwarded into the training container."
-require_env "WANDB_API_KEY" "Weights & Biases API key forwarded into the training container."
 require_env "HF_CKPT_PATH" "Host path to the HF checkpoint directory mounted as policy.model_name."
 require_env "NRL_MEGATRON_CHECKPOINT_DIR" "Host path to the preconverted Megatron checkpoint cache. A conversion is performed the first time, so this can be an empty dir."
 require_env "NEMO_GYM_SWE_TRAIN_DATA_PATH" "Host path to the SWE training JSONL."
@@ -115,8 +114,8 @@ cd ${CONTAINER_REPO_LOCATION}
 HF_HOME=${CONTAINER_REPO_LOCATION}/.cache \
 HF_HUB_OFFLINE=1 \
 TRANSFORMERS_OFFLINE=1 \
-HF_TOKEN=$HF_TOKEN \
-WANDB_API_KEY=$WANDB_API_KEY \
+HF_TOKEN="${HF_TOKEN:-}" \
+WANDB_API_KEY="${WANDB_API_KEY:-}" \
 HF_CKPT_PATH="${CONTAINER_HF_CKPT_PATH}" \
 NRL_MEGATRON_CHECKPOINT_DIR="${CONTAINER_NRL_MEGATRON_CHECKPOINT_DIR}" \
 NEMO_GYM_SWE_WORKSPACE_ROOT=/logs/nemo_gym/workspace \
