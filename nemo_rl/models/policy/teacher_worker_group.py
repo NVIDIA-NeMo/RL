@@ -36,8 +36,6 @@ from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
 
 
-
-
 class TeacherConfig(TypedDict):
     """Configuration for a single non-colocated teacher."""
 
@@ -85,9 +83,14 @@ def create_teacher_configs_from_opd_config(
 
         # Collect any extra keys as megatron_cfg_overrides.
         _known_keys = {
-            "tensor_model_parallel_size", "pipeline_model_parallel_size",
-            "context_parallel_size", "expert_model_parallel_size",
-            "num_nodes", "gpus_per_node", "precision", "micro_batch_size",
+            "tensor_model_parallel_size",
+            "pipeline_model_parallel_size",
+            "context_parallel_size",
+            "expert_model_parallel_size",
+            "num_nodes",
+            "gpus_per_node",
+            "precision",
+            "micro_batch_size",
             "megatron_cfg_overrides",
         }
         extra_overrides = {k: v for k, v in merged.items() if k not in _known_keys}
@@ -106,9 +109,7 @@ def create_teacher_configs_from_opd_config(
                 pipeline_model_parallel_size=int(
                     merged.get("pipeline_model_parallel_size", 1)
                 ),
-                context_parallel_size=int(
-                    merged.get("context_parallel_size", 1)
-                ),
+                context_parallel_size=int(merged.get("context_parallel_size", 1)),
                 expert_model_parallel_size=int(
                     merged.get("expert_model_parallel_size", 1)
                 ),

@@ -80,14 +80,17 @@ def _make_collector(**overrides):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("batch_size,dp_size", [
-    (1, 4),   # the exact bug: 1 sample, dp=4
-    (2, 4),   # 2 samples, dp=4
-    (3, 4),   # 3 samples, dp=4
-    (4, 4),   # already aligned
-    (1, 8),   # extreme: 1 sample, dp=8
-    (5, 4),   # 5 samples → pad to 8
-])
+@pytest.mark.parametrize(
+    "batch_size,dp_size",
+    [
+        (1, 4),  # the exact bug: 1 sample, dp=4
+        (2, 4),  # 2 samples, dp=4
+        (3, 4),  # 3 samples, dp=4
+        (4, 4),  # already aligned
+        (1, 8),  # extreme: 1 sample, dp=8
+        (5, 4),  # 5 samples → pad to 8
+    ],
+)
 def test_compute_teacher_logprobs_dp_padding(batch_size, dp_size):
     """Teacher logprob computation must pad batch to dp_size multiple."""
     twg = _MockTeacherWorkerGroup(fill_value=2.0, dp_size=dp_size)
@@ -198,14 +201,16 @@ def test_reorder_data_vs_direct_gather():
     # --- WRONG: direct gather (the old bug) ---
     wrong = sorted_results["logprobs"][forward_perm]
     # wrong[0] = sorted_results[3] = 10  (should be 0 for orig 0)
-    assert not torch.equal(wrong, torch.tensor([[0.0], [10.0], [20.0], [30.0]])), \
+    assert not torch.equal(wrong, torch.tensor([[0.0], [10.0], [20.0], [30.0]])), (
         "Direct gather should NOT produce the correct original order"
+    )
 
     # --- CORRECT: reorder_data (inverse permutation) ---
     correct = BatchedDataDict({"logprobs": sorted_results["logprobs"].clone()})
     correct.reorder_data(forward_perm)
-    assert torch.equal(correct["logprobs"], torch.tensor([[0.0], [10.0], [20.0], [30.0]])), \
-        "reorder_data should restore the original sample order"
+    assert torch.equal(
+        correct["logprobs"], torch.tensor([[0.0], [10.0], [20.0], [30.0]])
+    ), "reorder_data should restore the original sample order"
 
 
 # ---------------------------------------------------------------------------
@@ -230,12 +235,14 @@ def test_reorder_data_inverse_permutation_various():
     # Non-trivial: simulate 4 samples reordered as [2, 3, 0, 1]
     bdd = BatchedDataDict({"x": torch.tensor([[20.0], [30.0], [0.0], [10.0]])})
     bdd.reorder_data([2, 3, 0, 1])
-    assert torch.equal(bdd["x"], torch.tensor([[0.0], [10.0], [20.0], [30.0]])),  \
+    assert torch.equal(bdd["x"], torch.tensor([[0.0], [10.0], [20.0], [30.0]])), (
         "After reorder_data, row i should hold the result for original sample i"
+    )
 
 
 def test_is_opd_enabled():
     from nemo_rl.algorithms.opd import is_opd_enabled
+
     assert is_opd_enabled({"on_policy_distillation": {"enabled": True}})
     assert not is_opd_enabled({"on_policy_distillation": {"enabled": False}})
     assert not is_opd_enabled({})
@@ -249,31 +256,44 @@ def test_is_opd_enabled_object_config():
     from nemo_rl.algorithms.opd import is_opd_enabled
 
     assert is_opd_enabled(SimpleNamespace(on_policy_distillation={"enabled": True}))
-    assert not is_opd_enabled(SimpleNamespace(on_policy_distillation={"enabled": False}))
+    assert not is_opd_enabled(
+        SimpleNamespace(on_policy_distillation={"enabled": False})
+    )
     assert not is_opd_enabled(SimpleNamespace())
     assert not is_opd_enabled(SimpleNamespace(on_policy_distillation=None))
 
 
 def test_is_non_colocated_teachers_enabled():
     from nemo_rl.algorithms.opd import is_non_colocated_teachers_enabled
-    assert is_non_colocated_teachers_enabled({
-        "on_policy_distillation": {"enabled": True, "non_colocated_teachers": {"enabled": True}}
-    })
-    assert not is_non_colocated_teachers_enabled({
-        "on_policy_distillation": {"enabled": True, "non_colocated_teachers": {"enabled": False}}
-    })
+
+    assert is_non_colocated_teachers_enabled(
+        {
+            "on_policy_distillation": {
+                "enabled": True,
+                "non_colocated_teachers": {"enabled": True},
+            }
+        }
+    )
+    assert not is_non_colocated_teachers_enabled(
+        {
+            "on_policy_distillation": {
+                "enabled": True,
+                "non_colocated_teachers": {"enabled": False},
+            }
+        }
+    )
 
 
 def test_resolve_reference_aliases_bad_agent_ref():
     from nemo_rl.algorithms.opd import resolve_reference_aliases
+
     with pytest.raises(KeyError):
-        resolve_reference_aliases(
-            [{"not_name": "oops"}], {"math": "/ckpt/math"}
-        )
+        resolve_reference_aliases([{"not_name": "oops"}], {"math": "/ckpt/math"})
 
 
 def test_resolve_reference_aliases_fallback():
     from nemo_rl.algorithms.opd import resolve_reference_aliases
+
     aliases = resolve_reference_aliases(
         [{"name": "math_agent"}, {"name": "unknown"}, {"name": "code_agent"}],
         {"math_agent": "/ckpt/math", "code_agent": "/ckpt/code"},
@@ -284,6 +304,7 @@ def test_resolve_reference_aliases_fallback():
 
 def test_resolve_reference_aliases_strict_raises():
     from nemo_rl.algorithms.opd import resolve_reference_aliases
+
     with pytest.raises(ValueError, match="No teacher model mapping"):
         resolve_reference_aliases(
             [{"name": "unknown"}], {"math": "/ckpt/math"}, strict_agent_name_match=True
@@ -292,6 +313,7 @@ def test_resolve_reference_aliases_strict_raises():
 
 def test_get_teacher_routing_metrics():
     from nemo_rl.algorithms.opd import get_teacher_routing_metrics
+
     metrics = get_teacher_routing_metrics(
         ["math_a", "math_b", "if", "math_a"],
         {"math_a": "t_math", "math_b": "t_math", "if": "t_if"},

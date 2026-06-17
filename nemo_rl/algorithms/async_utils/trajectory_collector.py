@@ -33,7 +33,7 @@ from nemo_rl.experience.rollouts import (
 from nemo_rl.models.generation.interfaces import GenerationInterface
 
 if TYPE_CHECKING:
-    from nemo_rl.models.policy.teacher_worker_group import TeacherWorkerGroup
+    pass
 
 TokenizerType = PreTrainedTokenizerBase
 
@@ -603,6 +603,7 @@ class AsyncTrajectoryCollector:
             input_ids: [B, S] tokenized input tensor
             agent_refs: list of B agent reference dicts
             input_lengths: [B] per-sample lengths (required for sequence packing)
+
         Returns:
             ([B, S] teacher logprobs tensor, total_time_seconds)
         """
@@ -619,7 +620,8 @@ class AsyncTrajectoryCollector:
         strict = opd_cfg.get("strict_agent_name_match", False)
 
         reference_aliases = resolve_reference_aliases(
-            agent_refs, teacher_model_by_agent_name,
+            agent_refs,
+            teacher_model_by_agent_name,
             default_teacher_alias=default_teacher_alias,
             strict_agent_name_match=strict,
         )
@@ -634,7 +636,9 @@ class AsyncTrajectoryCollector:
 
         B, S = input_ids.shape
         result = torch.zeros(B, S, dtype=torch.float32)
-        if not group_to_indices:  # 0-sample batch: nothing to route (avoid max_workers=0)
+        if (
+            not group_to_indices
+        ):  # 0-sample batch: nothing to route (avoid max_workers=0)
             return result, 0.0
 
         def _get_logprobs_for_group(group_key, indices):
@@ -682,7 +686,9 @@ class AsyncTrajectoryCollector:
 
         # Fan out to teachers in parallel
         t_total_start = time.time()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(group_to_indices)) as executor:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(group_to_indices)
+        ) as executor:
             futures = {
                 executor.submit(_get_logprobs_for_group, gk, idxs): gk
                 for gk, idxs in group_to_indices.items()
@@ -691,7 +697,9 @@ class AsyncTrajectoryCollector:
                 indices, logprobs = future.result()
                 result[indices] = logprobs
         total_time = time.time() - t_total_start
-        print(f"[teacher_logprob] total={total_time:.2f}s for {B} samples across {len(group_to_indices)} teacher(s)")
+        print(
+            f"[teacher_logprob] total={total_time:.2f}s for {B} samples across {len(group_to_indices)} teacher(s)"
+        )
 
         return result, total_time
 
@@ -743,16 +751,23 @@ class AsyncTrajectoryCollector:
             if self._has_non_colocated_teachers and "agent_ref" in final_batch_cpu:
                 agent_refs = final_batch_cpu["agent_ref"]
                 if isinstance(agent_refs, list):
-                    from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
-
-                    flat_for_teacher, teacher_input_lengths = batched_message_log_to_flat_message(
-                        final_batch_cpu["message_log"],
-                        pad_value_dict={"token_ids": self.tokenizer.pad_token_id},
-                        make_sequence_length_divisible_by=self._teacher_seq_pad_multiple,
+                    from nemo_rl.data.llm_message_utils import (
+                        batched_message_log_to_flat_message,
                     )
-                    teacher_logprobs, teacher_logprob_time = self._compute_teacher_logprobs(
-                        flat_for_teacher["token_ids"], agent_refs,
-                        input_lengths=teacher_input_lengths,
+
+                    flat_for_teacher, teacher_input_lengths = (
+                        batched_message_log_to_flat_message(
+                            final_batch_cpu["message_log"],
+                            pad_value_dict={"token_ids": self.tokenizer.pad_token_id},
+                            make_sequence_length_divisible_by=self._teacher_seq_pad_multiple,
+                        )
+                    )
+                    teacher_logprobs, teacher_logprob_time = (
+                        self._compute_teacher_logprobs(
+                            flat_for_teacher["token_ids"],
+                            agent_refs,
+                            input_lengths=teacher_input_lengths,
+                        )
                     )
                     # Store inside batch dict so from_batches handles
                     # variable-length padding across prompt groups

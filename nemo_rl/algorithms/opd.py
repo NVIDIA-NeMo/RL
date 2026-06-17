@@ -82,7 +82,9 @@ def is_non_colocated_teachers_enabled(master_config: Any) -> bool:
     """Whether OPD is enabled with non-colocated (separate-GPU) teachers."""
     if not is_opd_enabled(master_config):
         return False
-    return bool(_opd_cfg(master_config).get("non_colocated_teachers", {}).get("enabled", False))
+    return bool(
+        _opd_cfg(master_config).get("non_colocated_teachers", {}).get("enabled", False)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +114,9 @@ def resolve_reference_aliases(
                 f"Available: {sorted(teacher_model_by_agent_name.keys())}"
             )
         elif default_teacher_alias:
-            print(f"[OPD] Agent '{name}' not in teacher mapping, falling back to '{default_teacher_alias}'")
+            print(
+                f"[OPD] Agent '{name}' not in teacher mapping, falling back to '{default_teacher_alias}'"
+            )
             aliases.append(default_teacher_alias)
         else:
             raise ValueError(
@@ -125,8 +129,11 @@ def get_teacher_routing_metrics(
     reference_aliases: list[str],
     teacher_model_by_agent_name: dict[str, str],
 ) -> dict[str, float]:
-    """Routing diagnostics: unique aliases, unique models, and the alias→model
-    compression ratio (how many aliases share each underlying teacher model)."""
+    """Compute teacher-routing diagnostics.
+
+    Reports unique aliases, unique underlying models, and the alias→model
+    compression ratio (how many aliases share each underlying teacher model).
+    """
     alias_unique = len(set(reference_aliases))
     unique_models: set[str] = set()
     for alias in reference_aliases:

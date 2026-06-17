@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
 import torch
 
 from nemo_rl.algorithms.advantage_estimator import OPDAdvantageEstimator
@@ -90,10 +89,21 @@ def test_opd_metrics_returned():
         prompt_ids, rewards, mask, teacher_logprobs=teacher_lp, prev_logprobs=student_lp
     )
 
-    assert "on_policy_distillation/teacher_student_logprob_gap_mean" in estimator.last_metrics
+    assert (
+        "on_policy_distillation/teacher_student_logprob_gap_mean"
+        in estimator.last_metrics
+    )
     assert "on_policy_distillation/adv_mean" in estimator.last_metrics
     assert "on_policy_distillation/adv_std" in estimator.last_metrics
     # teacher - student = 0 - (-1) = 1.0
-    assert abs(estimator.last_metrics["on_policy_distillation/teacher_student_logprob_gap_mean"] - 1.0) < 1e-5
+    assert (
+        abs(
+            estimator.last_metrics[
+                "on_policy_distillation/teacher_student_logprob_gap_mean"
+            ]
+            - 1.0
+        )
+        < 1e-5
+    )
     assert abs(estimator.last_metrics["on_policy_distillation/adv_mean"] - 1.0) < 1e-5
     assert abs(estimator.last_metrics["on_policy_distillation/adv_std"]) < 1e-5
