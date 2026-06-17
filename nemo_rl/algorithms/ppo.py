@@ -229,32 +229,18 @@ def setup(
         "A generation config in the PolicyConfig is required for PPO"
     )
 
-    # Value model on Megatron does not yet support sequence packing, dynamic
-    # batching, or context parallelism in the training-path forward
-    # (forward_step_for_value lacks the CP-allgather + unpack-from-packed
-    # logic that the inference-path get_values already has). Reject up front
-    # rather than crashing inside a Megatron forward.
+    # Value model on Megatron does not yet support sequence packing or context
+    # parallelism in the training-path forward. Reject up front rather than
+    # crashing inside a Megatron forward.
     # Tracked at https://github.com/NVIDIA-NeMo/RL/issues/2687.
     if value_config.get("megatron_cfg", {}).get("enabled", False):
         assert not value_config["sequence_packing"]["enabled"], (
             "Sequence packing is currently not supported for the Megatron PPO "
             "value model. See https://github.com/NVIDIA-NeMo/RL/issues/2687"
         )
-        assert not value_config["dynamic_batching"]["enabled"], (
-            "Dynamic batching is currently not supported for the Megatron PPO "
-            "value model. See https://github.com/NVIDIA-NeMo/RL/issues/2687"
-        )
         assert value_config["megatron_cfg"]["context_parallel_size"] == 1, (
             "Context parallelism (CP>1) is currently not supported for the "
             "Megatron PPO value model. See "
-            "https://github.com/NVIDIA-NeMo/RL/issues/2687"
-        )
-        assert not (
-            value_config["megatron_cfg"]["tensor_model_parallel_size"] > 1
-            and value_config["megatron_cfg"]["sequence_parallel"]
-        ), (
-            "Sequence parallelism (TP>1 + sequence_parallel=True) is currently "
-            "not supported for the Megatron PPO value model. See "
             "https://github.com/NVIDIA-NeMo/RL/issues/2687"
         )
 
