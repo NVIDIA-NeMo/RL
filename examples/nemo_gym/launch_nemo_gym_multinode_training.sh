@@ -15,10 +15,10 @@
 set -euo pipefail
 # ----- PARAMETERS -----
 # Optional: WANDB_API_KEY, HF_TOKEN
-# Required: EXP_NAME, RECIPE, TRAIN_NODES, GEN_NODES, HF_CKPT_PATH,
-# NEMO_GYM_SWE_TRAIN_DATA_PATH,
-# NEMO_GYM_SWE_VALIDATION_DATA_PATH, NEMO_GYM_SWE_SIF_DIR, REPO_LOCATION,
-# CONTAINER_IMAGE_PATH, SLURM_ACCOUNT, SLURM_PARTITION
+# Required: EXP_NAME, GPUS_PER_NODE, HF_CKPT_PATH, NEMO_GYM_SWE_TRAIN_DATA_PATH,
+# NEMO_GYM_SWE_VALIDATION_DATA_PATH, NEMO_GYM_SWE_SIF_DIR,
+# NRL_MEGATRON_CHECKPOINT_DIR, REPO_LOCATION, CONTAINER_IMAGE_PATH,
+# SLURM_ACCOUNT, SLURM_PARTITION
 
 require_env() {
     local name="$1"
@@ -74,6 +74,7 @@ require_env "REPO_LOCATION" "Host checkout path where ray.sub will be submitted.
 require_env "CONTAINER_IMAGE_PATH" "Container image path passed to sbatch/ray.sub."
 require_env "SLURM_ACCOUNT" "Slurm account for the allocation."
 require_env "SLURM_PARTITION" "Slurm partition for the allocation."
+require_env "GPUS_PER_NODE" "Number of GPUs to request and advertise per Slurm node."
 require_env "HF_CKPT_PATH" "Host path to the HF checkpoint directory mounted as policy.model_name."
 require_env "NRL_MEGATRON_CHECKPOINT_DIR" "Host path to the preconverted Megatron checkpoint cache. A conversion is performed the first time, so this can be an empty dir."
 require_env "NEMO_GYM_SWE_TRAIN_DATA_PATH" "Host path to the SWE training JSONL."
@@ -85,6 +86,11 @@ require_path "NRL_MEGATRON_CHECKPOINT_DIR" "dir" "This directory is mounted as t
 require_path "NEMO_GYM_SWE_TRAIN_DATA_PATH" "file" "This JSONL is mounted as the training dataset inside the container."
 require_path "NEMO_GYM_SWE_VALIDATION_DATA_PATH" "file" "This JSONL is mounted as the validation dataset inside the container."
 require_path "NEMO_GYM_SWE_SIF_DIR" "dir" "This directory is mounted as the SWE task SIF directory inside the container."
+if ! [[ "${GPUS_PER_NODE}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: GPUS_PER_NODE must be a positive integer." >&2
+    echo "  Current value: ${GPUS_PER_NODE}" >&2
+    exit 1
+fi
 
 TRAIN_NODES="${TRAIN_NODES:-16}"
 GEN_NODES="${GEN_NODES:-24}"
@@ -125,7 +131,9 @@ NEMO_GYM_SWE_SIF_DIR="${CONTAINER_NEMO_GYM_SWE_SIF_DIR}" \
 uv run examples/nemo_gym/run_grpo_nemo_gym.py \
     --config ${RECIPE} \
     ++cluster.num_nodes=$NODES \
+    ++cluster.gpus_per_node=$GPUS_PER_NODE \
     ++policy.generation.colocated.resources.num_nodes=$GEN_NODES \
+    ++policy.generation.colocated.resources.gpus_per_node=$GPUS_PER_NODE \
     ++logger.wandb.name=$EXP_NAME \
     ++logger.log_dir=/logs \
     ++checkpointing.checkpoint_dir=/checkpoint \
@@ -157,13 +165,14 @@ MOUNTS=$MOUNTS \
 COMMAND=$COMMAND \
 CONTAINER=$CONTAINER_IMAGE_PATH \
 CONTAINER_WORKDIR=$CONTAINER_REPO_LOCATION \
+GPUS_PER_NODE=$GPUS_PER_NODE \
 sbatch \
     --nodes=$NODES \
     --account=$SLURM_ACCOUNT \
     --partition=$SLURM_PARTITION \
     --time=${SLURM_TIME:-1:0:0} \
     --job-name=$EXP_NAME \
-    --gres=gpu:8 \
+    --gres=gpu:$GPUS_PER_NODE \
     --comment="$SLURM_COMMENT" \
     ${SLURM_EXCLUDE:+--exclude=$SLURM_EXCLUDE} \
     ray.sub
