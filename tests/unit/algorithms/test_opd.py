@@ -17,7 +17,6 @@ import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
-
 # ---------------------------------------------------------------------------
 # Mock teacher worker group for _compute_teacher_logprobs tests
 # ---------------------------------------------------------------------------
