@@ -129,6 +129,9 @@ policy:
         eta_min: 0.0
     - milestones: [250]
 
+# Inherited from distillation_math, it is not used in xtoken.
+teacher: null
+
 # One entry per teacher. Add more list items for multi-teacher distillation.
 teachers:
   - model_name: "Qwen/Qwen3-4B"

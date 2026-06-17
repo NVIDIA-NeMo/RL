@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Single-teacher cross-tokenizer off-policy distillation.
+"""Multi-teacher cross-tokenizer off-policy distillation.
 
 Training-loop layout mirrors ``run_distillation.py`` /
 ``nemo_rl/algorithms/distillation.py`` minus the on-policy bits (no env, no
@@ -577,9 +577,6 @@ def _run_teacher_forwards_and_pack(
         teacher_policy.offload_after_refit()
 
     packed: BatchedDataDict[Any] = BatchedDataDict(train_data)
-    # No-op on the IPC handle lists; moves any GPU tensors (top-K logits) to
-    # CPU before the student re-shards them.
-    packed.to("cpu")
     return packed
 
 

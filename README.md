@@ -140,7 +140,7 @@ For detailed information on backend selection, configuration, and examples, see 
     |-|-|-|
     |[GRPO](#grpo)|[GRPO Single Node](#grpo-single-node)|[GRPO Multi-node](#grpo-multi-node): [GRPO Qwen2.5-32B](#grpo-qwen25-32b), [GRPO Multi-Turn](#grpo-multi-turn)|
     |[On-policy Distillation](#on-policy-distillation)|[Distillation Single Node](#on-policy-distillation-single-node)|[Distillation Multi-node](#on-policy-distillation-multi-node)|
-    |[X-Token Distillation](#x-token-distillation)|[X-Token Distillation Single Node](#x-token-distillation-single-node)|[X-Token Distillation Multi-node](#x-token-distillation-multi-node)|
+    |[X-Token Off-Policy Distillation](#x-token-off-policy-distillation)|[X-Token Distillation Single Node](#x-token-distillation-single-node)|[X-Token Distillation Multi-node](#x-token-distillation-multi-node)|
     |[SFT](#supervised-fine-tuning-sft)|[SFT Single Node](#sft-single-node)|[SFT Multi-node](#sft-multi-node)|
     |[DPO](#dpo)|[DPO Single Node](#dpo-single-node)|[DPO Multi-node](#dpo-multi-node)|
     |[RM](#rm)|[RM Single Node](#rm-single-node)|[RM Multi-node](#rm-multi-node)|
@@ -426,7 +426,7 @@ sbatch \
 > [!NOTE]
 > For GB200 systems with 4 GPUs per node, use `--gres=gpu:4` instead.
 
-## X-Token Distillation
+## X-Token Off-Policy Distillation
 
 We support distillation between a student and a teacher that **do not share a tokenizer** (cross-tokenizer, or "x-token", distillation) — for example, distilling a `Qwen/Qwen3-4B` teacher into a `meta-llama/Llama-3.2-1B` student. The reference recipe trains on the ungated, CC-BY-4.0 [Nemotron-Pretraining-Specialized-v1.1](https://huggingface.co/datasets/nvidia/Nemotron-Pretraining-Specialized-v1.1) corpus (`Nemotron-Pretraining-Formal-Logic` subset).
 

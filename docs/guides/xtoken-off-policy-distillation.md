@@ -1,4 +1,4 @@
-# Cross-Tokenizer (X-Token)
+# Cross-Tokenizer (X-Token) Off-Policy Distillation
 
 NeMo RL supports off-policy distillation between a student and a teacher that
 **do not share a tokenizer** — for example, distilling a Qwen3-4B teacher into
