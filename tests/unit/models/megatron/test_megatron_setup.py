@@ -1577,13 +1577,20 @@ class TestSetupModelConfig:
             request.addfinalizer(p.stop)
         return mocks
 
+    @staticmethod
+    def _make_model_cfg_mock() -> MagicMock:
+        """Mock megatron provider that tolerates __post_init__()."""
+        model_cfg = MagicMock()
+        model_cfg.__post_init__ = MagicMock()
+        return model_cfg
+
     def test_megatron_lm_passes_hf_config_overrides_to_autoconfig(self, request):
         """hf_config_overrides must be forwarded to AutoConfig.from_pretrained for megatron_lm."""
         from nemo_rl.models.megatron.setup import setup_model_config
 
         self._apply_patches(request)
 
-        mock_model_cfg = MagicMock()
+        mock_model_cfg = self._make_model_cfg_mock()
         mock_provider = MagicMock()
         mock_provider.to_megatron_provider.return_value = mock_model_cfg
 
@@ -1622,7 +1629,7 @@ class TestSetupModelConfig:
         self._apply_patches(request)
 
         mock_provider = MagicMock()
-        mock_provider.to_megatron_provider.return_value = MagicMock()
+        mock_provider.to_megatron_provider.return_value = self._make_model_cfg_mock()
 
         config = {
             "pretrained_checkpoint": {"format": "megatron_lm", "path": "/ckpt"},
@@ -1665,7 +1672,7 @@ class TestSetupModelConfig:
         }
 
         mock_cfg = MagicMock()
-        mock_cfg.model = MagicMock()
+        mock_cfg.model = self._make_model_cfg_mock()
 
         with patch("nemo_rl.models.megatron.setup.ConfigContainer") as mock_cc:
             mock_cc.from_yaml.return_value = mock_cfg
@@ -1701,7 +1708,7 @@ class TestSetupModelConfig:
         }
 
         mock_cfg = MagicMock()
-        mock_cfg.model = MagicMock()
+        mock_cfg.model = self._make_model_cfg_mock()
 
         with patch("nemo_rl.models.megatron.setup.ConfigContainer") as mock_cc:
             mock_cc.from_yaml.return_value = mock_cfg

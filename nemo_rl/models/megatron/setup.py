@@ -15,6 +15,7 @@
 import hashlib
 import json
 import os
+import threading
 import time
 import warnings
 from typing import Any, Callable, Optional, TypeVar
@@ -57,7 +58,7 @@ from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
-from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from transformers import PreTrainedTokenizerBase
@@ -156,8 +157,11 @@ def setup_distributed() -> None:
     configure_dynamo_cache()
     # Ensure clean slate before import
     destroy_parallel_state()
-    # Need to initialize the process group before calling into Megatron-Bridge, otherwise Megatron-Bridge will try to set an incorrect device
-    torch.distributed.init_process_group("nccl")
+    # Pin the communicator to the correct GPU explicitly.
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.distributed.init_process_group(
+        "nccl", device_id=torch.device(f"cuda:{local_rank}")
+    )
 
 
 def validate_and_set_config(
@@ -512,6 +516,8 @@ def setup_model_config(
     if fmt == "megatron_lm":
         model_cfg.finalize()
 
+    model_cfg.__post_init__()
+
     # Derive fp8_param_enabled once from the config dict so that load_main_params_from_ckpt
     # and _create_megatron_config both use the same canonical check (fp8 enabled AND fp8_param).
     fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
@@ -612,6 +618,26 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.moe_token_dispatcher_type = config["megatron_cfg"][
         "moe_token_dispatcher_type"
     ]
+    if "inference_moe_token_dispatcher_type" in config["megatron_cfg"]:
+        model_cfg.inference_moe_token_dispatcher_type = config["megatron_cfg"][
+            "inference_moe_token_dispatcher_type"
+        ]
+    if "inference_grouped_gemm_backend" in config["megatron_cfg"]:
+        model_cfg.inference_grouped_gemm_backend = config["megatron_cfg"][
+            "inference_grouped_gemm_backend"
+        ]
+    if "moe_router_num_groups" in config["megatron_cfg"]:
+        model_cfg.moe_router_num_groups = config["megatron_cfg"][
+            "moe_router_num_groups"
+        ]
+    if "moe_router_group_topk" in config["megatron_cfg"]:
+        model_cfg.moe_router_group_topk = config["megatron_cfg"][
+            "moe_router_group_topk"
+        ]
+    if "moe_pad_experts_for_cuda_graph_inference" in config["megatron_cfg"]:
+        model_cfg.moe_pad_experts_for_cuda_graph_inference = config["megatron_cfg"][
+            "moe_pad_experts_for_cuda_graph_inference"
+        ]
     model_cfg.moe_shared_expert_overlap = config["megatron_cfg"][
         "moe_shared_expert_overlap"
     ]
@@ -761,6 +787,28 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
                 f"Invalid attention backend: {attention_backend}. "
                 f"Available backends are: {list(AttnBackend.__members__.keys())}"
             )
+
+    # These overrides need to be applied before the workers spawn.
+    if "transformer_impl" in config["megatron_cfg"]:
+        model_cfg.transformer_impl = config["megatron_cfg"]["transformer_impl"]
+    if "cuda_graph_impl" in config["megatron_cfg"]:
+        model_cfg.cuda_graph_impl = config["megatron_cfg"]["cuda_graph_impl"]
+        if model_cfg.cuda_graph_impl != "none":
+            model_cfg.use_te_rng_tracker = True
+        if "inference_cuda_graph_scope" in config["megatron_cfg"]:
+            model_cfg.inference_cuda_graph_scope = InferenceCudaGraphScope[
+                config["megatron_cfg"]["inference_cuda_graph_scope"]
+            ]
+
+    # Use the graph-safe TE RNG tracker for either training graphs or inference graphs.
+    if "generation" in config and config["generation"] is not None:
+        generation_cfg = config["generation"]
+        if (
+            generation_cfg["backend"] == "megatron"
+            and generation_cfg["colocated"]["enabled"]
+            and generation_cfg["mcore_generation_config"]["cuda_graph_impl"] != "none"
+        ):
+            model_cfg.use_te_rng_tracker = True
 
     # FP8 configuration
     fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
@@ -1006,6 +1054,36 @@ def _create_draft_pre_wrap_hook(
     return draft_pre_wrap_hook
 
 
+_BRIDGE_SIGNAL_HANDLER_PATCHED = False
+
+
+def _patch_bridge_signal_handler_for_worker_threads() -> None:
+    """Make Megatron-Bridge's signal-handler install safe off the main thread.
+
+    See https://github.com/NVIDIA-NeMo/Megatron-Bridge/pull/4375
+
+    TODO: Remove this hotfix once Megatron-Bridge is bumped.
+    """
+    global _BRIDGE_SIGNAL_HANDLER_PATCHED
+    if _BRIDGE_SIGNAL_HANDLER_PATCHED:
+        return
+
+    from megatron.bridge.training.utils import sig_utils
+
+    original_enter = sig_utils.DistributedSignalHandler.__enter__
+
+    def main_thread_only_enter(self):
+        if threading.current_thread() is not threading.main_thread():
+            self._signal_received = False
+            # Nothing was installed, so release()/__exit__ become no-ops.
+            self.released = True
+            return self
+        return original_enter(self)
+
+    sig_utils.DistributedSignalHandler.__enter__ = main_thread_only_enter
+    _BRIDGE_SIGNAL_HANDLER_PATCHED = True
+
+
 def setup_model_and_optimizer(
     policy_cfg: PolicyConfig,
     megatron_cfg: ConfigContainer,
@@ -1016,6 +1094,7 @@ def setup_model_and_optimizer(
     additional_pre_wrap_hooks: Optional[list[Callable]] = None,
 ):
     state = GlobalState()
+    _patch_bridge_signal_handler_for_worker_threads()
     state.cfg = megatron_cfg
     # TODO: Freeze state.cfg
 
@@ -1173,6 +1252,7 @@ def setup_model_and_optimizer(
         pre_wrap_hook=pre_wrap_hook,
         mixed_precision_wrapper=mixed_precision_wrapper,
         pg_collection=pg_collection,
+        wrap_with_ddp=load_optimizer,
     )
 
     if load_optimizer:

@@ -149,6 +149,13 @@ def import_model_from_hf_name(
 
     megatron.core.rerun_state_machine.destroy_rerun_state_machine()
 
+    # The seeding above created the global RNG tracker with default flags.
+    # Such a stale tracker will ignore flags that the real model build requests later.
+    from megatron.core.tensor_parallel import random as mcore_random
+
+    mcore_random._CUDA_RNG_STATE_TRACKER = None
+    mcore_random._CUDA_RNG_STATE_TRACKER_INITIALIZED = False
+
 
 def export_model_from_megatron(
     hf_model_name: str,
