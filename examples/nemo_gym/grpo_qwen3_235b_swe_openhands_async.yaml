@@ -1,0 +1,345 @@
+# GRPO + NeMo-Gym (OpenHands SWE agent) on Qwen3-235B-A22B-Instruct-2507.
+#
+# Derived from the Qwen3-30B-A3B SWE run (16 prompts x 32 generations, 80k ctx,
+# force_on_policy_ratio), re-parallelized for 235B. Key schema is aligned with
+# THIS checkout's working gym recipe (grpo_workplace_assistant_nemotron_nano_v2_9b.yaml)
+# -- fork-only keys from the original run (best_at_k, invalid_tool_call_strategy,
+# num_val_generations_per_prompt, data.*_jsonl_fpath, ...) have been removed/translated.
+# Assumes H100/H200 nodes with 8 GPUs.
+#
+# GPU math (training): one model replica = TP4 x CP4 x PP8 = 128 GPUs = 16 nodes.
+#   cluster.num_nodes=16 -> DP=1 (minimum). 32 nodes -> DP=2 (~2x throughput).
+# GPU math (generation, colocated): vLLM TP16 -> 128/16 = 8 engines at 16 nodes.
+#
+# Search for "FILL" to find everything you must set before launching.
+
+grpo:
+  max_num_epochs: 100
+  num_prompts_per_step: 16          # LEARNING: distinct SWE tasks per step (gradient diversity)
+  num_generations_per_prompt: 8     # ASYNC: 16*8=128 batch; DP1 training so keep per-replica load modest
+  max_rollout_turns: 1              # unused on the NeMo-Gym path (gym handles multi-turn)
+  max_num_steps: 50                 # LEARNING: upper bound; walltime will cut it off
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  val_period: 5                     # LEARNING: validate every 5 steps -> ~the curve
+  val_at_start: true                # SMOKE-TEST: was false (run one validation pass up front to check the score)
+  val_at_end: true                  # SMOKE-TEST: was false (also score after the 2 training steps)
+  overlong_filtering: true          # zero loss for trajectories truncated at 80k
+  max_val_samples: null             # gym requires null; inferred from val dataset size
+  val_batch_size: null              # set at runtime to len(val dataset)
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 128
+    overlong_buffer_penalty: 1
+    max_response_length: ${policy.max_total_sequence_length}
+  adv_estimator:
+    name: "grpo"
+    normalize_rewards: ${grpo.normalize_rewards}
+    use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
+    minus_baseline: true            # reinforce_plus_plus-only; inert for "grpo"
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
+  # KL penalty is 0, so skip the reference-policy forward pass entirely --
+  # saves a full 235B logprob pass every step.
+  skip_reference_policy_logprobs_calculation: true
+  # Mask sequences whose vLLM-vs-Megatron prob disagreement exceeds 2x.
+  # Important safety net for MoE + very long sequences.
+  seq_logprob_error_threshold: 2
+  async_grpo:
+    enabled: true     # ASYNC: 1-step-off non-colocated for throughput
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: false  # ASYNC: OFF -- in-flight MoE expert-weight updates during generation caused illegal-memory-access in EXPERT_DATA_PARALLEL; 1-step-off still overlaps next-batch gen with training
+    recompute_kv_cache_after_weight_updates: false
+
+loss_fn:
+  reference_policy_kl_penalty: 0    # no KL anchor / reference model
+  reference_policy_kl_type: "k3"
+  kl_input_clamp_value: null
+  kl_output_clamp_value: null
+  # NOTE: with force_on_policy_ratio=true the PPO ratio is pinned to 1.0, so these
+  # clip values are inert. They only matter if you turn force_on_policy_ratio off
+  # (required if you ever make >1 optimizer update per rollout batch).
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: true   # inert while kl_penalty == 0
+  truncated_importance_sampling_ratio: null  # match proven async exemplar: no truncated IS (rely on ratio_clip + use_importance_sampling_correction)
+  use_importance_sampling_correction: true   # corrects vLLM-vs-Megatron numerics
+  sequence_level_importance_ratios: false    # token-level GRPO/DAPO, not GSPO
+  token_level_loss: true
+  # REINFORCE-style truly-on-policy update; valid only because
+  # num_prompts_per_step * num_generations_per_prompt == train_global_batch_size.
+  force_on_policy_ratio: false   # ASYNC: rollouts are 1-step stale -> use IS-corrected PPO ratio
+
+checkpointing:
+  enabled: false    # TUNED: on, so we can resume after the 4h walltime
+  checkpoint_dir: "results/grpo-qwen3-235b-swe-openhands"  # launcher overrides per-experiment
+  metric_name: "val:total_reward/mean"  # use "train:total_reward/mean" if val_period is large
+  higher_is_better: true
+  # A 235B checkpoint with distributed optimizer state is multi-TB.
+  # The 30B run used keep_top_k=100 -- do NOT do that here.
+  keep_top_k: 2
+  save_period: 5
+  checkpoint_must_save_by: null  # launcher sets ~25min under the sbatch walltime
+  save_optimizer: true
+
+policy:
+  # The launcher mounts HF_CKPT_PATH to a stable container path and exports that
+  # mounted path here. NRL_MEGATRON_CHECKPOINT_DIR is mounted separately for the
+  # pre-converted Megatron checkpoint cache.
+  model_name: ${oc.env:HF_CKPT_PATH}
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs: null
+  hf_config_overrides: {}
+  # Tied to the GRPO step size -> exactly 1 optimizer update per rollout batch,
+  # which is what licenses loss_fn.force_on_policy_ratio.
+  train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}
+  train_micro_batch_size: 1
+  generation_batch_size: 64         # only used by HF backend; inert with vLLM
+  logprob_batch_size: 1             # 235B at 80k: keep at 1
+  max_total_sequence_length: 98304  # 96k: training-memory-safe (128k OOM'd the train step's grad reduce-scatter -> NCCL error). Rare agent context overflows past this are now NON-FATAL (nemo_gym.py substitutes a placeholder for empty rollouts), so we don't need to chase the cliff with more headroom.
+  precision: "bfloat16"
+  logprob_chunk_size: 2048          # chunk logits over seq dim to bound fp32 vocab memory
+
+  dtensor_cfg:
+    _v2: false
+    enabled: false
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 2
+    context_parallel_size: 1
+    custom_parallel_plan: null
+    clear_cache_every_n_steps: null
+
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 1
+    train_iters: 100000             # must cover all training steps (mcore requirement)
+    activation_checkpointing: true
+    bias_activation_fusion: false
+    # --- parallelism: replica = TP4 x CP4 x PP8 = 128 GPUs (16 nodes) ---
+    tensor_model_parallel_size: 4
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 16  # 128 experts / 16 = 8 per GPU
+    pipeline_model_parallel_size: 8
+    # 94 layers over PP8: 11 + 6x12 + 11 (end stages lighter for embed/loss)
+    num_layers_in_first_pipeline_stage: 11
+    num_layers_in_last_pipeline_stage: 11
+    context_parallel_size: 4        # needed for 80k activations
+    pipeline_dtype: ${policy.precision}
+    sequence_parallel: true
+    # --- MoE stability for RL ---
+    freeze_moe_router: true
+    moe_router_dtype: "fp64"        # routing ties are model-identity critical
+    moe_router_load_balancing_type: "none"  # disables aux loss; "seq_aux_loss" diverges logprobs
+    moe_router_bias_update_rate: 0.0
+    moe_permute_fusion: false   # v0.6.0 exemplar flipped this off for the release
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "alltoall"
+    moe_shared_expert_overlap: false
+    moe_per_layer_logging: false  # required key; per-layer MoE aux metrics off (megatron_policy_worker.train reads it)
+    gradient_accumulation_fusion: false
+    apply_rope_fusion: true
+    defer_fp32_logits: true
+
+    optimizer:
+      optimizer: "adam"
+      # 30B SWE run used 3e-6; official 235B math recipe used 5e-7.
+      # 1e-6 is a deliberate middle ground -- tune from here.
+      lr: 5.0e-6
+      min_lr: 4.999e-6
+      weight_decay: 0.0
+      bf16: true
+      fp16: false
+      params_dtype: "float32"
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1e-8
+      sgd_momentum: 0.9
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+      clip_grad: ${policy.max_grad_norm}
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"
+      lr_decay_iters: 100000        # must be > lr_warmup_iters
+      lr_warmup_iters: 3
+      lr_warmup_init: 0.0
+      override_opt_param_scheduler: true
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: true
+      overlap_param_gather: false
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: "optim_grads_params"
+
+    env_vars: null
+
+  draft:
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    num_layers: null
+    aux_layer_indices: null
+
+  dynamic_batching:
+    enabled: false                  # exclusive with sequence packing
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: true                   # required for mcore context parallelism
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  # 2 x TP x CP = 32 (SP needs seq % TP == 0; CP load balancing needs seq % 2CP == 0)
+  make_sequence_length_divisible_by: 32
+  max_grad_norm: 1.0
+  offload_optimizer_for_logprob: false  # only useful for non-colocated generation
+
+  optimizer: null
+
+  scheduler:
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: []
+
+  generation:
+    backend: "vllm"
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: true
+      kv_cache_dtype: "auto"
+      precision: ${policy.precision}
+      # 235B bf16 weights ~470 GB -> TP16 (~29 GB/GPU) is the minimum that
+      # coexists with training at gpu_memory_utilization 0.6 on 80 GB GPUs.
+      tensor_parallel_size: 16
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.6   # lower toward 0.5 if refit/generation OOMs
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: false
+      use_deep_gemm: false
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      expose_http_server: true      # required for NeMo-Gym
+      skip_tokenizer_init: false
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: hermes         # Qwen3-235B-A22B-Instruct-2507 tool-call format
+        # For the Thinking variant add:  reasoning_parser: deepseek_r1
+    vllm_kwargs:
+      enable_chunked_prefill: true  # 80k prompts must not stall decode
+      compilation_config:
+        # accuracy mitigation for torch.compile kernels, see NVIDIA-NeMo/RL issue #998
+        backend: eager
+    colocated:
+      enabled: false   # ASYNC: non-colocated (required; colocated unsupported for async)
+      resources:
+        gpus_per_node: 8
+        num_nodes: 32   # 64-node split: 32 vLLM inference nodes; remaining 32 = 2 training replicas (DP2)
+
+data:
+  # Gym manages the full trajectory; max_input_seq_length is unused on this path.
+  max_input_seq_length: null
+  shuffle: false   # train file is pre-shuffled/curriculum-ordered; preserve order
+  num_workers: 0
+  use_multiple_dataloader: false
+  train:
+    data_path: ${oc.env:NEMO_GYM_SWE_TRAIN_DATA_PATH}
+  validation:
+    data_path: ${oc.env:NEMO_GYM_SWE_VALIDATION_DATA_PATH}
+  default:
+    dataset_name: NemoGymDataset
+    env_name: "nemo_gym"
+    prompt_file: null
+    system_prompt_file: null
+    processor: "nemo_gym_data_processor"
+
+sif_dir: ${oc.env:NEMO_GYM_SWE_SIF_DIR}
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: false
+  nemo_gym:
+    skip_venv_if_present: true
+    rollout_max_attempts_to_avoid_lp_nan: 1
+    is_trajectory_collection: false
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml  # required, *for_training
+    - responses_api_agents/swe_agents/configs/swebench_openhands_training.yaml
+    use_absolute_ip: true
+    # Overrides merged into the Gym server configs above:
+    swe_agents_train:
+      responses_api_agents:
+        swe_agents:
+          agent_max_turns: 15       # 15 is empirically safe on easy_l20; 20 grew context past 80k -> vLLM rejected a turn -> empty rollout -> ValueError crash
+          swebench_agent_timeout: 1200
+          # 512 concurrent agent sessions ~= 64 per vLLM engine at 16 nodes.
+          # Drop to 256 if generation thrashes on KV-cache preemption.
+          concurrency: 128          # LEARNING: keep rollout wall-time down at bigger batch
+          base_results_dir: /logs/nemo_gym/swe_agents_train
+          dataset_path: ${data.train.data_path}     # FILL (same as data.train.data_path)
+          # The launcher passes NEMO_GYM_SWE_SIF_DIR into the training process.
+          container_formatter:
+           - "${sif_dir}/swebench_sweb.eval.x86_64.{instance_id}.sif"
+           - "${sif_dir}/swegym_sweb.eval.x86_64.{instance_id}.sif"
+           - "${sif_dir}/r2egym_{instance_id}.sif"
+    swe_agents_val:
+      responses_api_agents:
+        swe_agents:
+          agent_max_turns: 15       # 15 is empirically safe on easy_l20; 20 grew context past 80k -> vLLM rejected a turn -> empty rollout -> ValueError crash
+          swebench_agent_timeout: 1200
+          concurrency: 128          # LEARNING: keep rollout wall-time down at bigger batch
+          base_results_dir: /logs/nemo_gym/swe_agents_val
+          dataset_path: ${data.validation.data_path}       # FILL (same as data.validation.data_path)
+          container_formatter: ${env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.container_formatter}
+
+logger:
+  # Most basic setup: all external backends off. Step metrics still print to
+  # stdout (captured in the Slurm .out), and log_dir keeps run artifacts.
+  # For local persistent metrics with no account/key, flip
+  # tensorboard_enabled: true and view with `tensorboard --logdir logs`.
+  log_dir: "logs"
+  num_val_samples_to_print: 0
+  wandb_enabled: false
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: false
+  wandb:
+    project: "grpo-dev"
+    name: "grpo-qwen3-235b-swe-openhands"
+  tensorboard: {}
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 16   # 16 = DP1 minimum; 32 = DP2 for ~2x training throughput
+

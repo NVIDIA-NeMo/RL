@@ -1,0 +1,63 @@
+diff --git a/responses_api_agents/swe_agents/app.py b/responses_api_agents/swe_agents/app.py
+index 98c01b4c..f23434ff 100644
+--- a/responses_api_agents/swe_agents/app.py
++++ b/responses_api_agents/swe_agents/app.py
+@@ -141,6 +141,10 @@ class SWEBenchWrapperConfig(BaseResponsesAPIAgentConfig):
+ 
+     openhands_should_log: bool = False
+     debug: bool = False
++    base_results_dir: Optional[Path] = Field(
++        default=None,
++        description="Directory for SWE run artifacts. Use a shared filesystem for multinode Ray runs.",
++    )
+ 
+ 
+ class SWEBenchWrapperServerConfig(BaseModel):
+@@ -1170,7 +1174,7 @@ class RunOpenHandsAgent(BaseModel):
+     ) -> ActiveContainerCommand:
+         # Stream output to log file as it appears
+         logs_dir = self.config.persistent_dir / "apptainer_logs"
+-        logs_dir.mkdir(exist_ok=True)
++        logs_dir.mkdir(parents=True, exist_ok=True)
+         log_file_path = logs_dir / f"{self.config.instance_id}_{command.mode}.log"
+         log_file = open(log_file_path, "w")
+ 
+@@ -1366,9 +1370,12 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
+     def model_post_init(self, context: Any) -> None:
+         run_session_id = f"{int(time.time() * 1000)}_{str(uuid.uuid4())[:8]}"
+         workspace_root = Path(__file__).parent
++        results_root = self.config.base_results_dir or workspace_root
++        base_results_dir = Path(results_root) / f"swebench_results_{run_session_id}"
++        base_results_dir.mkdir(parents=True, exist_ok=True)
+         self._swe_bench_wrapper_server_config = SWEBenchWrapperServerConfig(
+             run_session_id=run_session_id,
+-            base_results_dir=workspace_root / f"swebench_results_{run_session_id}",
++            base_results_dir=base_results_dir,
+             ng_global_config_dict_str=shlex.quote(OmegaConf.to_yaml(get_global_config_dict())),
+             model_server_name=self.config.model_server.name,
+             openhands_setup_dir=OpenHandsHarnessProcessor(config=self.config).setup(),
+@@ -1730,7 +1737,7 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
+         base_mounted_dir = Path("/trajectories_mount")
+ 
+         params: SWEBenchWrapperInstanceConfig = SWEBenchWrapperInstanceConfig(
+-            **self.config.model_dump(),
++            **self.config.model_dump(exclude={"base_results_dir"}),
+             **self._swe_bench_wrapper_server_config.model_dump(),
+             problem_info=problem_info,
+             body=body,
+diff --git a/responses_api_agents/swe_agents/setup_scripts/r2e_gym.sh b/responses_api_agents/swe_agents/setup_scripts/r2e_gym.sh
+index a97eb7df..34617775 100755
+--- a/responses_api_agents/swe_agents/setup_scripts/r2e_gym.sh
++++ b/responses_api_agents/swe_agents/setup_scripts/r2e_gym.sh
+@@ -52,9 +52,10 @@ uv venv --python 3.12 venv
+ 
+ echo "Installing R2E-Gym in editable mode..."
+ uv pip install -p $r2e_gym_dir/venv/bin/python -e . --no-cache
++uv pip install -p $r2e_gym_dir/venv/bin/python --reinstall cffi cryptography
+ 
+ echo "Verifying installation..."
+-$r2e_gym_dir/venv/bin/python -c "import r2egym; print('✓ r2egym installed successfully')"
++$r2e_gym_dir/venv/bin/python -c "import r2egym; import kubernetes; print('✓ r2egym installed successfully')"
+ 
+ if [ -d venv ] && [ -f venv/bin/python ]; then
+     echo "✓ venv created at $(pwd)/venv"

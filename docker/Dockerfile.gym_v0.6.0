@@ -1,0 +1,152 @@
+# syntax=docker/dockerfile:1
+# Overlay the SWE/NeMo-Gym pieces on top of the published NeMo-RL v0.6.0 image.
+#
+# Example:
+#   docker buildx build \
+#     --platform linux/amd64 \
+#     -t <registry>/nemo-rl:v0.6.0-gym \
+#     --push \
+#     -f docker/Dockerfile.gym_v0.6.0 .
+#
+# NeMo-Gym venv prefetch runs during every build. Override the config list with:
+#   --build-arg NEMO_GYM_PREFETCH_CONFIGS="examples/nemo_gym/other.yaml"
+#
+# Optional vLLM wheel override for the Gym venvs:
+#   --build-arg NEMO_GYM_VLLM_VERSION=0.17.0 --build-arg NEMO_GYM_CUDA=cu129
+
+ARG BASE_IMAGE=nvcr.io/nvidia/nemo-rl:v0.6.0
+FROM ${BASE_IMAGE}
+
+USER root
+WORKDIR /opt/nemo-rl
+
+ENV NRL_CONTAINER=1
+ENV RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
+ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
+ENV NEMO_GYM_VENV_DIR=/opt/gym_venvs
+
+COPY docker/gym/mlperf-gym.patch /tmp/mlperf-gym.patch
+COPY docker/gym/prefetch_venvs.py /opt/nemo-rl/examples/nemo_gym/prefetch_venvs.py
+
+# Install Apptainer in an architecture-aware way. The older Dockerfile.gym used an
+# amd64 .deb directly; the PPA path is what upstream main now uses and works with
+# Docker buildx --platform for both amd64 and arm64 when packages are available.
+RUN <<"EOF" bash -exu -o pipefail
+export DEBIAN_FRONTEND=noninteractive
+
+apt-get update
+apt-get install -y --no-install-recommends \
+    ca-certificates \
+    software-properties-common
+add-apt-repository -y ppa:apptainer/ppa
+apt-get update
+apt-get install -y --no-install-recommends apptainer
+ln -sf /usr/bin/apptainer /usr/bin/singularity
+
+apt-get clean
+rm -rf /var/lib/apt/lists/*
+EOF
+
+# Bake the current checkout into the image so the source, configs, and workspace
+# dependencies used by uv match what was used during this build.
+COPY . /opt/nemo-rl
+
+# Carry the SWE-agent fixes from origin/main's Dockerfile.gym:
+# - shared base_results_dir support for multinode runs
+# - parent directory creation for apptainer logs
+# - R2E-Gym dependency repair
+RUN <<"EOF" bash -exu
+cd /opt/nemo-rl/3rdparty/Gym-workspace/Gym
+if git apply --check /tmp/mlperf-gym.patch; then
+    git apply /tmp/mlperf-gym.patch
+elif git apply --reverse --check /tmp/mlperf-gym.patch; then
+    echo "mlperf-gym.patch is already applied"
+else
+    git apply --check /tmp/mlperf-gym.patch
+fi
+EOF
+
+ARG TARGETARCH
+ARG NEMO_GYM_PREFETCH_CONFIGS=examples/nemo_gym/grpo_qwen3_235b_swe_openhands_async.yaml
+ARG NEMO_GYM_CUDA=
+ARG NEMO_GYM_VLLM_VERSION=
+
+# Pre-bake the Gym server venvs. If NEMO_GYM_VLLM_VERSION is set, use an
+# architecture-aware vLLM wheel URL so the same Dockerfile can be built for
+# linux/amd64 or linux/arm64.
+RUN <<"EOF" bash -exu -o pipefail
+if [[ -z "${NEMO_GYM_CUDA:-}" ]]; then
+    NEMO_GYM_CUDA=$(uv run python -c "import pathlib,tomllib; indexes=tomllib.loads(pathlib.Path('pyproject.toml').read_text())['tool']['uv']['index']; print(next(i['name'].removeprefix('pytorch-') for i in indexes if i['name'].startswith('pytorch-')))")
+fi
+
+UV_OVERRIDE_ARGS=()
+if [[ -n "${NEMO_GYM_VLLM_VERSION:-}" ]]; then
+    case "${TARGETARCH:-amd64}" in
+        arm64) WHEEL_ARCH=aarch64 ;;
+        *) WHEEL_ARCH=x86_64 ;;
+    esac
+    GYM_VLLM_OVERRIDE=/tmp/gym-vllm-override.txt
+    printf 'vllm @ https://github.com/vllm-project/vllm/releases/download/v%s/vllm-%s+%s-cp38-abi3-manylinux_2_35_%s.whl\n' \
+        "${NEMO_GYM_VLLM_VERSION}" "${NEMO_GYM_VLLM_VERSION}" "${NEMO_GYM_CUDA}" "${WHEEL_ARCH}" > "${GYM_VLLM_OVERRIDE}"
+    UV_OVERRIDE_ARGS=(UV_OVERRIDE="${GYM_VLLM_OVERRIDE}")
+fi
+
+env \
+    UV_TORCH_BACKEND="${NEMO_GYM_CUDA}" \
+    UV_LINK_MODE=hardlink \
+    "${UV_OVERRIDE_ARGS[@]}" \
+    uv run --extra nemo_gym python examples/nemo_gym/prefetch_venvs.py ${NEMO_GYM_PREFETCH_CONFIGS}
+
+rm -f "${GYM_VLLM_OVERRIDE:-}"
+EOF
+
+RUN <<"EOF" bash -exu -o pipefail
+SWE_AGENTS_DIR=/opt/nemo-rl/3rdparty/Gym-workspace/Gym/responses_api_agents/swe_agents
+
+SETUP_DIR="${SWE_AGENTS_DIR}/swe_openhands_setup"
+mkdir -p "${SETUP_DIR}"
+SETUP_DIR="${SETUP_DIR}" \
+    MINIFORGE_DIR="${SETUP_DIR}/miniforge3" \
+    OPENHANDS_DIR="${SETUP_DIR}/OpenHands" \
+    AGENT_FRAMEWORK_REPO="https://github.com/sdevare-nv/nv-OpenHands.git" \
+    AGENT_FRAMEWORK_COMMIT="0d766ad06b2be64a42e6f0175b9ebcc4a06599d9" \
+        "${SWE_AGENTS_DIR}/setup_scripts/openhands.sh"
+
+SETUP_DIR="${SWE_AGENTS_DIR}/swe_swebench_setup"
+mkdir -p "${SETUP_DIR}"
+SETUP_DIR="${SETUP_DIR}" \
+    UV_DIR="${SETUP_DIR}/uv" \
+    PYTHON_DIR="${SETUP_DIR}/python" \
+    SWEBENCH_DIR="${SETUP_DIR}/SWE-bench" \
+    SWEBENCH_REPO="https://github.com/HeyyyyyyG/SWE-bench.git" \
+    SWEBENCH_COMMIT="HEAD" \
+        "${SWE_AGENTS_DIR}/setup_scripts/swebench.sh"
+
+SETUP_DIR="${SWE_AGENTS_DIR}/swe_swebench_multilingual_setup"
+mkdir -p "${SETUP_DIR}"
+SETUP_DIR="${SETUP_DIR}" \
+    UV_DIR="${SETUP_DIR}/uv" \
+    PYTHON_DIR="${SETUP_DIR}/python" \
+    SWEBENCH_DIR="${SETUP_DIR}/SWE-bench_Multilingual" \
+    SWEBENCH_REPO="https://github.com/Kipok/SWE-bench.git" \
+    SWEBENCH_COMMIT="HEAD" \
+        "${SWE_AGENTS_DIR}/setup_scripts/swebench_multilingual.sh"
+
+SETUP_DIR="${SWE_AGENTS_DIR}/swe_r2e_gym_setup"
+mkdir -p "${SETUP_DIR}"
+SETUP_DIR="${SETUP_DIR}" \
+    UV_DIR="${SETUP_DIR}/uv" \
+    PYTHON_DIR="${SETUP_DIR}/python" \
+    R2E_GYM_DIR="${SETUP_DIR}/R2E-Gym" \
+    EVAL_HARNESS_REPO="https://github.com/sdevare-nv/nv-R2E-Gym.git" \
+    EVAL_HARNESS_COMMIT="local-eval" \
+        "${SWE_AGENTS_DIR}/setup_scripts/r2e_gym.sh"
+
+SETUP_DIR="${SWE_AGENTS_DIR}/swe_rebench_setup"
+mkdir -p "${SETUP_DIR}"
+SETUP_DIR="${SETUP_DIR}" \
+    REBENCH_DIR="${SETUP_DIR}/SWE-rebench-V2" \
+        "${SWE_AGENTS_DIR}/setup_scripts/swe_rebench.sh"
+EOF
+
+RUN python tools/generate_fingerprint.py > /opt/nemo_rl_container_fingerprint

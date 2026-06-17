@@ -185,6 +185,12 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             self.llm_async_engine_args, stat_loggers=self.stat_loggers
         )
 
+        # NeMo-RL #2513: serialise sends on the engine input socket to prevent a
+        # zmq race that BLOCKS the vLLM engine during in-flight weight updates in
+        # async GRPO -- the root of refit-time NCCL TP-group hangs. Must run after
+        # from_engine_args and before _setup_vllm_server spawns the uvicorn thread.
+        self._install_engine_input_socket_lock()
+
         self.server_thread, self.base_url, self.http_server = None, None, None
         if self.cfg["vllm_cfg"].get("expose_http_server"):
             self.server_thread, self.base_url, self.http_server = (
@@ -196,6 +202,33 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         self._vllm_metrics_lock = threading.Lock()
         if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
             self._start_vllm_metrics_logger()
+
+    def _install_engine_input_socket_lock(self) -> None:
+        """Serialise sends on AsyncMPClient.input_socket across OS threads to prevent
+        zmq races that block the vLLM engine (e.g. during in-flight weight updates in
+        async GRPO). Ports NeMo-RL #2513, which landed on vLLM 0.20; we run 0.17.1, so
+        locate the shadow socket defensively and no-op with a clear warning if the
+        internal layout differs (a no-op leaves in-flight refits at risk of the original
+        hang, but never crashes worker init)."""
+        try:
+            shadow_sock = self.llm.engine_core.input_socket._shadow_sock
+        except AttributeError:
+            warnings.warn(
+                "vllm_worker_async: could not locate engine_core.input_socket."
+                "_shadow_sock; skipping the in-flight weight-update zmq lock (#2513). "
+                "In-flight refits may hang on this vLLM version (0.17.1).",
+                stacklevel=2,
+            )
+            return
+
+        lock = threading.Lock()
+        original_send_multipart = shadow_sock.send_multipart
+
+        def locked_send_multipart(*args: Any, **kwargs: Any) -> Any:
+            with lock:
+                return original_send_multipart(*args, **kwargs)
+
+        shadow_sock.send_multipart = locked_send_multipart  # type: ignore[assignment]
 
     def _start_vllm_metrics_logger(self) -> None:
         """Start a background thread that periodically collects vLLM logger metrics.
@@ -361,6 +394,27 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 return super().model_post_init(context)
 
         class NeMoRLOpenAIServingMixin:
+            @staticmethod
+            def _set_max_tokens(request, max_tokens: int) -> None:
+                """Set the request's max output tokens in place.
+
+                Handles both max_completion_tokens (newer OpenAI API) and the deprecated
+                max_tokens (still supported by vLLM).
+                """
+                if request.max_completion_tokens is not None:
+                    request.max_completion_tokens = max_tokens
+                elif request.max_tokens is not None:
+                    request.max_tokens = max_tokens
+
+            def _clamp_max_tokens(
+                self, request, request_max_tokens: int, prompt_token_ids: list
+            ) -> None:
+                """Clamp the request's max output tokens so input + output <= max_model_len."""
+                remaining = max(
+                    0, self.model_config.max_model_len - len(prompt_token_ids)
+                )
+                self._set_max_tokens(request, min(request_max_tokens, remaining))
+
             async def _preprocess_chat(
                 self,
                 request,
@@ -378,6 +432,17 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
                 # Deepcopy messages here since _preprocess_chat may be destructive.
                 messages_for_replace_prefix_tokens = deepcopy(messages)
+
+                # Temporarily set max output tokens to 1 so vLLM's pre-tokenization length
+                # check passes; the real value is set via _clamp_max_tokens once the prompt
+                # length is known, so input + output <= max_model_len.
+                actual_request_max_tokens = None
+                if isinstance(request, NeMoRLChatCompletionRequest):
+                    actual_request_max_tokens = (
+                        request.max_completion_tokens or request.max_tokens
+                    )
+                    if actual_request_max_tokens is not None:
+                        self._set_max_tokens(request, 1)
 
                 # res is (conversation, [engine_prompt])
                 try:
@@ -402,6 +467,13 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                     raise
 
                 if request.required_prefix_token_ids is None:
+                    # Clamp max output tokens so input + output <= max_model_len.
+                    if actual_request_max_tokens is not None:
+                        self._clamp_max_tokens(
+                            request,
+                            actual_request_max_tokens,
+                            res[1][0]["prompt_token_ids"],
+                        )
                     return res
 
                 # Find the last assistant message
@@ -458,6 +530,14 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 )
 
                 engine_prompt["prompt_token_ids"] = final_prompt_token_ids
+
+                # Clamp after prefix replacement since the prompt length may have changed.
+                if actual_request_max_tokens is not None:
+                    self._clamp_max_tokens(
+                        request,
+                        actual_request_max_tokens,
+                        final_prompt_token_ids,
+                    )
 
                 return res
 

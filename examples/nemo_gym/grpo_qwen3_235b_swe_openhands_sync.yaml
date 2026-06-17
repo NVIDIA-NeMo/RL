@@ -1,0 +1,53 @@
+# GRPO + NeMo-Gym (OpenHands SWE agent) on Qwen3-235B-A22B-Instruct-2507.
+#
+# Synchronous/colocated variant of grpo_qwen3_235b_swe_openhands_async.yaml.
+# It inherits the same SWE data, OpenHands/R2E Gym settings, shared /logs
+# artifact paths, and 235B model topology, then disables async GRPO.
+#
+# GPU math:
+#   - One training replica is TP4 x CP4 x PP8 = 128 GPUs = 16 nodes.
+#   - Generation is colocated, so no separate generation nodes are required.
+
+defaults: "grpo_qwen3_235b_swe_openhands_async.yaml"
+
+grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 4
+  max_num_steps: 2
+  val_period: 1000
+  val_at_start: true
+  val_at_end: true
+  async_grpo:
+    enabled: false
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: false
+    recompute_kv_cache_after_weight_updates: false
+
+loss_fn:
+  truncated_importance_sampling_ratio: null
+  force_on_policy_ratio: true
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: "results/grpo-qwen3-235b-swe-openhands-sync"
+  keep_top_k: 3
+  save_period: 2
+  checkpoint_must_save_by: null
+
+policy:
+  max_total_sequence_length: 98304
+  generation:
+    colocated:
+      enabled: true
+      resources:
+        gpus_per_node: null
+        num_nodes: null
+
+logger:
+  tensorboard_enabled: false
+  wandb:
+    name: "grpo-qwen3-235b-swe-openhands-sync"
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 16

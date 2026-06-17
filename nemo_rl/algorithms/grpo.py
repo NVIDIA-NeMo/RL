@@ -1094,6 +1094,71 @@ def _extract_prompt_only_messages(message_logs: list) -> list:
     return prompt_only_message_logs
 
 
+def _stable_group_ids(prompt_ids_for_adv, num_generations_per_prompt):
+    """Stable per-prompt grouping key for GRPO advantage computation.
+
+    GRPO groups samples by prompt (torch.unique) to compute the leave-one-out baseline. The default
+    key is the rendered prompt token-ids, but for agentic gym rollouts each generation's first-turn
+    prompt tokenizes slightly differently (observed on Qwen3-Instruct + hermes: every generation
+    becomes its own singleton group -> leave-one-out baseline == reward -> advantage == 0 -> zero
+    gradient; Exp 26). The training batch is laid out as contiguous num_gen blocks per prompt
+    (async: BatchedDataDict.from_batches of per-prompt groups; sync: repeat_interleave), so the
+    correct, model-agnostic group id is positional: index // num_gen. Falls back to the original
+    token-id grouping if the batch is not an exact multiple of num_gen (e.g. dynamic sampling).
+    """
+    n = int(prompt_ids_for_adv.shape[0])
+    g = int(num_generations_per_prompt)
+    if g <= 0 or n % g != 0:
+        return prompt_ids_for_adv
+    return (torch.arange(n, device=prompt_ids_for_adv.device) // g).unsqueeze(1)
+
+
+def _maybe_log_adv_grouping_diag(
+    prompt_ids_for_adv,
+    sample_mask,
+    token_mask,
+    rewards,
+    num_generations_per_prompt,
+    pad_token_id,
+) -> None:
+    """Debug logging for GRPO advantage grouping; enabled by env var ``NRL_GRPO_DIAG``.
+
+    Surfaces the zero-advantage failure mode (Exp 26): rendered prompt token-ids that collapse to
+    one group per sample. Logs n_samples vs unique prompt-token-id groups, valid-mask counts, and
+    per-group prompt divergence (lengths + first differing column). No-op unless NRL_GRPO_DIAG is set.
+    """
+    if not os.environ.get("NRL_GRPO_DIAG"):
+        return
+    try:
+        _ngroups = int(torch.unique(prompt_ids_for_adv, dim=0).shape[0])
+    except Exception as e:  # noqa: BLE001 - diagnostics only
+        _ngroups = f"err:{e}"
+    print(
+        f"  [GRPO-DIAG] adv-inputs: n_samples={prompt_ids_for_adv.shape[0]} "
+        f"unique_prompt_groups={_ngroups} "
+        f"sample_mask_valid={float(sample_mask.sum())}/{sample_mask.numel()} "
+        f"token_mask_valid_tokens={float(token_mask.sum())} "
+        f"reward_mean={float(rewards.float().mean()):.4f} reward_std={float(rewards.float().std()):.4f}",
+        flush=True,
+    )
+    try:
+        g = int(num_generations_per_prompt)
+        g0 = prompt_ids_for_adv[:g]
+        lens = [int((row != pad_token_id).sum()) for row in g0]
+        uniq0 = int(torch.unique(g0, dim=0).shape[0])
+        fd = -1
+        if g >= 2:
+            diff = (g0[0] != g0[1]).nonzero()
+            fd = int(diff[0]) if diff.numel() else -1
+        print(
+            f"  [GRPO-DIAG] grp0: G={g} unique_in_grp0={uniq0} nonpad_lens={lens} "
+            f"first_diff_col(g0,g1)={fd} padded_width={int(prompt_ids_for_adv.shape[1])}",
+            flush=True,
+        )
+    except Exception as e:  # noqa: BLE001 - diagnostics only
+        print(f"  [GRPO-DIAG] grp0 err: {e}", flush=True)
+
+
 def refit_policy_generation(
     policy: ColocatablePolicyInterface,
     policy_generation: GenerationInterface,
@@ -1169,6 +1234,12 @@ def refit_policy_generation(
                 raise NotImplementedError(
                     "SGLang haven't implemented non-colocated inference mode. "
                 )
+            # NOTE: #2672 added policy.offload_before_refit()/prepare_for_training() here,
+            # but in NON-colocated mode generation lives on separate GPUs, so offloading the
+            # optimizer for refit is unnecessary -- and the offload->reload round-trip
+            # corrupted the TE precision-aware fused-adam state, causing an illegal-memory
+            # access in the NEXT optimizer step (multi_tensor_apply.cuh:92). Reverted for
+            # our Megatron/TE stack; the optimizer stays put on the dedicated training GPUs.
             futures_train = policy.broadcast_weights_for_collective(kv_scales=kv_scales)
             futures_inference = policy_generation.update_weights_from_collective()
             # wait for all futures to complete
@@ -1781,8 +1852,20 @@ def grpo_train(
                     sample_mask = train_data["sample_mask"]
                     mask = token_mask * sample_mask.unsqueeze(-1)
 
+                    _maybe_log_adv_grouping_diag(
+                        prompt_ids_for_adv,
+                        sample_mask,
+                        token_mask,
+                        rewards,
+                        master_config["grpo"]["num_generations_per_prompt"],
+                        tokenizer.pad_token_id,
+                    )
+
                     train_data["advantages"] = adv_estimator.compute_advantage(
-                        prompt_ids=prompt_ids_for_adv,
+                        prompt_ids=_stable_group_ids(
+                            prompt_ids_for_adv,
+                            master_config["grpo"]["num_generations_per_prompt"],
+                        ),
                         rewards=rewards,
                         mask=mask,
                         repeated_batch=repeated_batch,
@@ -2818,8 +2901,20 @@ def async_grpo_train(
                     sample_mask = train_data["sample_mask"]
                     mask = token_mask * sample_mask.unsqueeze(-1)
 
+                    _maybe_log_adv_grouping_diag(
+                        prompt_ids_for_adv,
+                        sample_mask,
+                        token_mask,
+                        rewards,
+                        master_config["grpo"]["num_generations_per_prompt"],
+                        tokenizer.pad_token_id,
+                    )
+
                     train_data["advantages"] = adv_estimator.compute_advantage(
-                        prompt_ids=prompt_ids_for_adv,
+                        prompt_ids=_stable_group_ids(
+                            prompt_ids_for_adv,
+                            master_config["grpo"]["num_generations_per_prompt"],
+                        ),
                         rewards=rewards,
                         mask=mask,
                         repeated_batch=repeated_batch,

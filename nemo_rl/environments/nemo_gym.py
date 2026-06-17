@@ -11,9 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 from pathlib import Path
 from typing import Any, Dict, List, TypedDict
 
+import aiohttp
 import ray
 import torch
 from transformers import PreTrainedTokenizerBase
@@ -129,8 +131,23 @@ Depending on your data shape, you may want to change these values."""
             nemo_rl_rowidxs = []
             nemo_rl_results = []
             for task in nemo_gym_result_iterator:
-                with timer.time(label=f"{timer_prefix}/await_results"):
-                    nemo_gym_row, nemo_gym_result = await task
+                try:
+                    with timer.time(label=f"{timer_prefix}/await_results"):
+                        nemo_gym_row, nemo_gym_result = await task
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    # A single rollout's gym /run failed at the transport/HTTP layer (a flaky instance
+                    # returned 500, a connection dropped, or it timed out). Don't abort the whole batch
+                    # over one instance -- the failed row is left as an empty slot in the rowidx-sorted
+                    # array below and back-filled there with a zero-reward degenerate trajectory (same
+                    # path as the no-generation-data case). We can't recover the row's _rowidx from the
+                    # failed task, so the back-fill works off the empty slots instead. Logged loudly so
+                    # a SYSTEMIC failure (many rows failing -> ~0 mean reward) stays visible.
+                    print(
+                        f"  [nemo_gym] WARNING: rollout failed ({type(e).__name__}: {e}); "
+                        f"will back-fill as a zero-reward trajectory instead of aborting the batch.",
+                        flush=True,
+                    )
+                    continue
 
                 with timer.time(label=f"{timer_prefix}/postprocess_results"):
                     nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
@@ -163,6 +180,25 @@ Depending on your data shape, you may want to change these values."""
         nemo_rl_sort_results = [None] * nemo_gym_num_rows
         for rowidx, result in zip(nemo_rl_rowidxs, nemo_rl_results):
             nemo_rl_sort_results[rowidx] = result
+        # Back-fill rows whose rollout failed above (left as None) with a zero-reward degenerate
+        # trajectory, so batch/group counts stay intact (force_on_policy_ratio needs the full
+        # num_prompts*num_generations batch). We synthesize an empty gym result and run it through
+        # the same postprocess path the no-generation-data case uses (builds a fresh, masked,
+        # reward-0 trajectory per slot -- no aliasing, since downstream mutates message_log in place).
+        num_failed = sum(1 for r in nemo_rl_sort_results if r is None)
+        if num_failed:
+            print(
+                f"  [nemo_gym] WARNING: back-filling {num_failed}/{nemo_gym_num_rows} failed "
+                f"rollout(s) as zero-reward trajectories (batch counts preserved).",
+                flush=True,
+            )
+            for i in range(nemo_gym_num_rows):
+                if nemo_rl_sort_results[i] is None:
+                    nemo_rl_sort_results[i] = (
+                        self._postprocess_nemo_gym_to_nemo_rl_result(
+                            {"response": {"output": []}}, tokenizer
+                        )
+                    )
         nemo_rl_results = nemo_rl_sort_results
 
         timer.stop("_run_rollouts_total")
@@ -209,6 +245,21 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                     ),
                 }
             )
+            # Flag a dropped/unparseable tool call so GRPO can apply
+            # grpo.invalid_tool_call_strategy. When the tool parser (e.g. hermes) successfully
+            # parses an assistant tool call, vLLM strips the <tool_call>...</tool_call> tags out
+            # of the message `content` and moves the call into the structured tool_calls field. If
+            # those raw tags survive in `content`, the parser failed (e.g. the model stuffed an
+            # un-escaped code patch into the JSON args -- the hermes-on-Instruct failure mode) and
+            # the call was dropped. The marker is hermes-specific; XML parsers (qwen3_coder) never
+            # emit these tags, so it stays False there and the strategy is inert.
+            is_invalid_tool_call = False
+            content = output_item_dict.get("content")
+            if content and isinstance(content[0], dict) and content[0].get("text"):
+                assistant_text = content[0]["text"]
+                if "<tool_call>" in assistant_text or "</tool_call>" in assistant_text:
+                    is_invalid_tool_call = True
+
             nemo_rl_message_log.append(
                 {
                     "role": "assistant",
@@ -217,6 +268,7 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                     "generation_logprobs": torch.tensor(
                         output_item_dict["generation_log_probs"]
                     ),
+                    "is_invalid_tool_call": is_invalid_tool_call,
                 }
             )
 
@@ -232,19 +284,52 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
             )
             output_item_dict.pop("generation_log_probs")
 
+        n_invalid_tool_calls = sum(
+            1 for m in nemo_rl_message_log if m.get("is_invalid_tool_call")
+        )
+        if n_invalid_tool_calls:
+            print(
+                f"  [invalid-tool-call] rollout produced {n_invalid_tool_calls} "
+                f"unparseable tool-call turn(s) (<tool_call> tags survived in content; "
+                f"flagged for grpo.invalid_tool_call_strategy)",
+                flush=True,
+            )
+
         if not nemo_rl_message_log:
-            input_messages = nemo_gym_result["responses_create_params"]["input"]
-            prompt_token_ids = tokenizer.apply_chat_template(
-                input_messages, tokenize=True
+            # A rollout came back with no assistant generation (the agent/container failed to produce
+            # a usable turn -- empirically ~0.3% of rollouts). This used to raise and abort the ENTIRE
+            # batch, which is fatal during validation where one flaky instance among many kills the run
+            # (and produces no val score). Instead, emit a degenerate ZERO-REWARD trajectory so the
+            # batch/group counts stay intact (num_gen per prompt-group; full val set) and the instance
+            # simply scores 0. The single placeholder assistant token carries NO generation_logprobs,
+            # so downstream GRPO masking (add_grpo_token_loss_masks_and_generation_logprobs) marks it
+            # non-trainable -> it cannot pollute the gradient.
+            # The degenerate trajectory's content is irrelevant (it's a masked, zero-reward sample),
+            # so use a minimal placeholder token rather than re-tokenizing the prompt -- apply_chat_template
+            # can return a tokenizers.Encoding that torch.tensor() can't consume.
+            fallback_token = (
+                tokenizer.pad_token_id
+                if tokenizer.pad_token_id is not None
+                else (tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0)
             )
-            raise ValueError(
-                f"NeMo Gym returned a result with no generation data. "
-                f"This typically means the prompt for the first turn already exceeds the vLLM max_model_len, "
-                f"so vLLM rejected the request before any tokens could be generated.\n"
-                f"  Prompt length: {len(prompt_token_ids)} tokens.\n"
-                f"  → Fix: increase `policy.max_total_sequence_length` and `policy.generation.vllm_cfg.max_model_len` "
-                f"to a value larger than {len(prompt_token_ids)}."
+            print(
+                "  [nemo_gym] WARNING: returned no generation data for a rollout; "
+                "treating as a zero-reward trajectory instead of aborting the batch.",
+                flush=True,
             )
+            nemo_rl_message_log = [
+                {
+                    "role": "user",
+                    "content": "",
+                    "token_ids": torch.tensor([fallback_token, fallback_token]),
+                },
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "token_ids": torch.tensor([fallback_token]),
+                },
+            ]
+            nemo_gym_result["reward"] = 0.0
 
         return {
             "message_log": nemo_rl_message_log,

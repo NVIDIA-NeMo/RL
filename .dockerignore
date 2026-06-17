@@ -1,37 +1,70 @@
-# Adding to .gitignore helps reduce the size of your working_dir
+# Keep the Docker build context small. The Gym overlay Dockerfile bakes the
+# current checkout into /opt/nemo-rl, but only needs source, workspace
+# dependencies, selected examples/configs, and Docker build support files.
+**
 
-# Note: removing .git from .dockerignore since it is valuable to have the git history to
-#       know where this container was built
-# .git
-*.out
-*.log
-*.tar
-*.tar.gz
-.venv
-venv
-venvs
-__pycache__/
-_build/
-build/
-apidocs/
-dist/
-*.egg-info/
-*.vscode/
-release_run*
-ckpts/
+# Top-level package metadata and lockfiles.
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE
+!LICENSES/
+!LICENSES/**
 
-# Test
-coverage.json
-.coverage*
-test_assets/
+# Git metadata is used by tools/generate_fingerprint.py to record submodule SHAs.
+!.git/
+!.git/**
+!.gitmodules
 
-# Cache
-uv_cache/
-hf_home/
-hf_datasets_cache/
-*logs/
-datasets/
-wandb/
-checkpoints/
-results/
-code_snapshots/
+# Runtime source and required workspace members.
+!nemo_rl/
+!nemo_rl/**
+!3rdparty/
+!3rdparty/**
+!research/
+!research/template_project/
+!research/template_project/**
+
+# Build/runtime tools used by the Dockerfile and dependency setup.
+!tools/
+!tools/**
+
+# NeMo-Gym config and runner used by this image.
+!examples/
+!examples/nemo_gym/
+!examples/nemo_gym/grpo_qwen3_235b_swe_openhands_async.yaml
+!examples/nemo_gym/grpo_qwen3_235b_swe_openhands_sync.yaml
+!examples/nemo_gym/launch_nemo_gym_multinode_training.sh
+!examples/nemo_gym/run_grpo_nemo_gym.py
+
+# Dockerfile and support files.
+!docker/
+!docker/Dockerfile.gym_v0.6.0
+!docker/gym/
+!docker/gym/**
+
+# Always drop generated/local-heavy files, even inside included directories.
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.ruff_cache/
+**/.mypy_cache/
+**/.venv/
+**/venv/
+**/venvs/
+**/.uv-cache/
+**/uv_cache/
+**/hf_home/
+**/hf_datasets_cache/
+**/*logs/
+**/wandb/
+**/checkpoints/
+**/results/
+**/code_snapshots/
+**/datasets/
+**/docker_wheels/
+**/*.out
+**/*.log
+**/*.tar
+**/*.tar.gz
+**/*.whl
