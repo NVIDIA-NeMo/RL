@@ -99,6 +99,13 @@ class ReplayBuffer:
         with self._lock:
             return set(self.target_weight_versions)
 
+    def _remove_indices(self, indices: list[int]) -> None:
+        """Remove trajectories by index in-place."""
+        for idx in sorted(indices, reverse=True):
+            self.trajectory_versions.pop(idx)
+            self.target_weight_versions.pop(idx)
+            self.trajectories.pop(idx)
+
     def sample(
         self,
         num_prompt_groups: int,
@@ -107,7 +114,7 @@ class ReplayBuffer:
     ) -> Optional[dict[str, Any]]:
         """Sample per-prompt trajectory groups intended for the current training step.
 
-        Only returns trajectories with target_weight_version == current_weight_version.
+        Only returns trajectories with target_weight_version >= current_weight_version.
         If insufficient trajectories are available, returns None to stall training
         until the remaining trajectories are generated. This ensures no trajectory
         loses its last chance to be used for its intended training step.
@@ -137,12 +144,15 @@ class ReplayBuffer:
 
             # Check for unexpected old trajectories
             old_trajectories = [
-                v for v in self.trajectory_versions if v < min_valid_version
+                (i, v)
+                for i, v in enumerate(self.trajectory_versions)
+                if v < min_valid_version
             ]
             if old_trajectories:
-                raise ValueError(
+                print(
                     f"Found {len(old_trajectories)} trajectories older than min_valid_version {min_valid_version}"
                 )
+                self._remove_indices([idx for idx, _version in old_trajectories])
 
             # Filter for valid trajectories without modifying the buffer
             valid_indices = [
@@ -169,7 +179,7 @@ class ReplayBuffer:
             intended_indices = [
                 i
                 for i in valid_indices
-                if self.target_weight_versions[i] == current_weight_version
+                if self.target_weight_versions[i] >= current_weight_version
             ]
 
             print(
