@@ -51,14 +51,14 @@ policy:
       ignore_router_for_ac: true
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
-      NRL_DEBUG_PICKLE: '1'
     automodel_kwargs:
       backend:
         _target_: nemo_automodel.components.models.common.utils.BackendConfig
         attn: sdpa
         linear: torch
         rms_norm: torch_fp32
-        enable_deepep: true
+        dispatcher: deepep
+        experts: torch_mm
         fake_balanced_gate: false
         rope_fusion: false
         enable_hf_state_dict_adapter: true
