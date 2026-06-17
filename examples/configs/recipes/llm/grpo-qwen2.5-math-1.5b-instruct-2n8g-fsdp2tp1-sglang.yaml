@@ -33,21 +33,18 @@ policy:
       max_running_requests: null
       mem_fraction_static: 0.6
       skip_server_warmup: true
-      # Piecewise CUDA graph currently crashes with "illegal memory access"
-      # (likely torch 2.10 + sglang incompatibility). Keep disabled until upstream fix.
       disable_piecewise_cuda_graph: true
       disable_cuda_graph: false
       sglang_server_config:
         needs_offload: true
         cpu_weight_backup: true
         sglang_server_concurrency: 1024
-        # pause generation has no effect here
         pause_generation_mode: retract
         num_gpus: 16
-        # Equal to tp_size today; will diverge once PD-disaggregation is supported.
         num_gpus_per_engine: ${policy.generation.sglang_cfg.tp_size}
       sglang_router_config:
         use_external_router: false
+        use_distributed_post: true
 
 data:
   max_input_seq_length: 512

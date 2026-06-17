@@ -40,6 +40,7 @@ policy:
         num_gpus_per_engine: ${policy.generation.sglang_cfg.tp_size}
       sglang_router_config:
         use_external_router: false
+        use_distributed_post: true
 data:
   max_input_seq_length: 512
 logger:
