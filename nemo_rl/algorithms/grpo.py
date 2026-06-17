@@ -465,6 +465,7 @@ def setup(
             nemo_gym_py_exec = create_local_venv_on_each_node(
                 nemo_gym_py_exec, "nemo_rl.environments.nemo_gym.NemoGym"
             )
+        nemo_gym_venv = os.path.dirname(os.path.dirname(nemo_gym_py_exec))
         nemo_gym_dict = env_configs["nemo_gym"]
         # NeMo-RL-side detection knobs are top-level NemoGymConfig fields
         # (where the detector reads them), not part of Gym's global config.
@@ -497,8 +498,8 @@ def setup(
             "py_executable": nemo_gym_py_exec,
             "env_vars": {
                 **os.environ,
-                "VIRTUAL_ENV": nemo_gym_py_exec,
-                "UV_PROJECT_ENVIRONMENT": nemo_gym_py_exec,
+                "VIRTUAL_ENV": nemo_gym_venv,
+                "UV_PROJECT_ENVIRONMENT": nemo_gym_venv,
             },
         }
         actor = NemoGym.options(**nemo_gym_opts).remote(nemo_gym_cfg)

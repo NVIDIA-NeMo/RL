@@ -13,6 +13,7 @@
 # limitations under the License.
 import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, NotRequired, TypedDict
 
@@ -36,6 +37,30 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
     "</function_call>",
 ]
 DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
+
+
+def _ensure_nemo_gym_package_precedence() -> None:
+    """Prefer the third-party NeMo-Gym package over examples/nemo_gym."""
+    repo_root = Path(__file__).resolve().parents[2]
+    gym_workspace = repo_root / "3rdparty" / "Gym-workspace" / "Gym"
+    gym_init = gym_workspace / "nemo_gym" / "__init__.py"
+    if not gym_init.exists():
+        return
+
+    gym_workspace_str = str(gym_workspace)
+    if sys.path[:1] != [gym_workspace_str]:
+        sys.path[:] = [p for p in sys.path if p != gym_workspace_str]
+        sys.path.insert(0, gym_workspace_str)
+
+    shadowed_module = sys.modules.get("nemo_gym")
+    if (
+        shadowed_module is not None
+        and getattr(shadowed_module, "__file__", None) is None
+        and not hasattr(shadowed_module, "PARENT_DIR")
+    ):
+        for module_name in list(sys.modules):
+            if module_name == "nemo_gym" or module_name.startswith("nemo_gym."):
+                del sys.modules[module_name]
 
 
 def get_nemo_gym_uv_cache_dir() -> str | None:
@@ -157,6 +182,8 @@ class NemoGym(EnvironmentInterface):
         _gym_port_low = self.cfg.get("port_range_low", DEFAULT_GYM_PORT_RANGE_LOW)
         _gym_port_high = self.cfg.get("port_range_high", DEFAULT_GYM_PORT_RANGE_HIGH)
         self.head_server_port = _get_free_port_local(_gym_port_low, _gym_port_high)
+
+        _ensure_nemo_gym_package_precedence()
 
         from nemo_gym.cli import GlobalConfigDictParserConfig, RunHelper
         from nemo_gym.rollout_collection import RolloutCollectionHelper
