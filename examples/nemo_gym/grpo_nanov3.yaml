@@ -206,7 +206,7 @@ policy:
     vllm_cfg:
       # NB: can re-enable prefix cache on vllm >= 0.11.2.
       # enable_prefix_caching: false
-      async_engine: false
+      async_engine: true
       kv_cache_dtype: auto
       precision: ${policy.precision}
       tensor_parallel_size: 4
