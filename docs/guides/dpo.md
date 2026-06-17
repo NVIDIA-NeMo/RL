@@ -225,9 +225,9 @@ For the full reference — backend support, the DTensor vs Megatron schema compa
 
 ## Optimizations
 
-### Chunked Linear Cross-Entropy Fusion Loss
+### Chunked Fused Linear Logprobs
 
-During standard DPO training the model materializes a full logit tensor of shape `[batch_size, seq_length, vocab_size]` for both the policy forward-backward pass and the reference model logprob computation. This can cause out-of-memory (OOM) errors for long sequences or large vocabularies. The **chunked linear cross-entropy fusion loss** avoids this by computing log probabilities directly from the hidden states: it chunks the sequence dimension, projects each chunk to logits on the fly, gathers per-token log probabilities, and discards the logits before moving to the next chunk.
+During standard DPO training the model materializes a full logit tensor of shape `[batch_size, seq_length, vocab_size]` for both the policy forward-backward pass and the reference model logprob computation. This can cause out-of-memory (OOM) errors for long sequences or large vocabularies. The **chunked fused linear logprobs** path avoids this by computing log probabilities directly from the hidden states with a fused linear cross-entropy kernel: it chunks the sequence dimension, projects each chunk to logits on the fly, gathers per-token log probabilities, and discards the logits before moving to the next chunk. (DPO consumes these per-token logprobs to form its preference loss; the kernel itself does not compute the DPO loss.)
 
 **Benefits:**
 
@@ -249,7 +249,7 @@ policy:
 
 **Notes:**
 
-- Context parallelism is not supported when linear CE fusion is enabled.
+- Context parallelism is not supported when fused linear logprobs are enabled.
 - Sequence packing is not supported with DPO regardless of this setting (see [#719](https://github.com/NVIDIA-NeMo/RL/issues/719)).
 - The `fused_linear_logprobs_chunk_size` parameter controls the trade-off between memory savings and compute throughput. The default value of 256 is a good starting point.
 

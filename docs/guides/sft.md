@@ -294,6 +294,6 @@ policy:
 
 **Notes:**
 
-- This optimization applies to SFT training with `NLLLoss` and DPO training. See the [DPO guide](dpo.md#chunked-linear-cross-entropy-fusion-loss) for DPO-specific details.
-- Context parallelism is not supported when linear CE fusion is enabled.
+- This optimization applies to SFT training with `NLLLoss` and DPO training. See the [DPO guide](dpo.md#chunked-fused-linear-logprobs) for DPO-specific details.
+- Context parallelism is not supported when fused linear logprobs are enabled.
 - The `fused_linear_logprobs_chunk_size` parameter controls the trade-off between memory savings and compute throughput. The default value of 256 is a good starting point.
