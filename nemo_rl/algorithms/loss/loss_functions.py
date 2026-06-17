@@ -1866,10 +1866,16 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         static-weight sum (no dynamic weights, no ``normalize_teacher_by_vocab``).
         """
         full = [teacher_full_logits_by_idx.get(i) for i in range(self.num_teachers)]
+        # Direct per-position KL is only valid when every teacher shares the
+        # student's tokenizer (no projection matrix) *and* ships full logits of
+        # identical shape. Two cross-tokenizer teachers can have matching shapes
+        # yet still need the projection/alignment path, so the shape check alone
+        # is insufficient.
+        same_tokenizer = all(p is None for p in self.projection_matrix_paths)
         same_shape = all(f is not None for f in full) and (
             len({tuple(f.shape) for f in full}) == 1
         )
-        if not same_shape:
+        if not (same_tokenizer and same_shape):
             total_kd: Optional[torch.Tensor] = None
             per_metrics: dict[str, Any] = {}
             for i in range(self.num_teachers):

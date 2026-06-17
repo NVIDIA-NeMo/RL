@@ -31,6 +31,7 @@ import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 import nemo_rl.algorithms.xtoken_off_policy_distillation as xt_mod
+from nemo_rl.algorithms.loss.loss_functions import CrossTokenizerDistillationLossFn
 from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     MasterConfig,
     TeacherConfig,
@@ -753,3 +754,76 @@ def test_setup_rejects_same_vocab_teacher_with_mismatched_vocab():
         )
     # The check fires before any cluster/policy construction.
     assert mock_cluster.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# averaged_logits direct-KL guard
+# ---------------------------------------------------------------------------
+
+
+def _bare_averaged_logits_loss_fn(projection_matrix_paths):
+    """A ``CrossTokenizerDistillationLossFn`` carrying only the attrs the
+    ``averaged_logits`` guard reads, built via ``__new__`` to skip the heavy
+    config-driven ``__init__``."""
+    fn = CrossTokenizerDistillationLossFn.__new__(CrossTokenizerDistillationLossFn)
+    fn.num_teachers = len(projection_matrix_paths)
+    fn.projection_matrix_paths = list(projection_matrix_paths)
+    fn.teacher_weights = [1.0] * fn.num_teachers
+    return fn
+
+
+def test_averaged_logits_cross_tokenizer_skips_direct_kl_fast_path():
+    # Two cross-tokenizer teachers (non-null projection paths) whose logits
+    # happen to share a shape must NOT take the direct per-position KL fast
+    # path: it assumes the student's tokenizer and would mismatch the
+    # student's token_mask when the teacher length differs (T_t != T_s).
+    fn = _bare_averaged_logits_loss_fn(["t0_proj.pt", "t1_proj.pt"])
+
+    fallback_calls = []
+
+    def _fallback(i, *args, **kwargs):
+        fallback_calls.append(i)
+        return torch.tensor(0.0), {}
+
+    def _fast_path(*args, **kwargs):
+        raise AssertionError("direct_full_vocab_kl reached for cross-tokenizer teachers")
+
+    fn._compute_teacher_kd = _fallback
+    fn._direct_full_vocab_kl = _fast_path
+
+    # Equal-shaped teacher logits (the misleading signal) but teacher length 13
+    # vs the student's length 10.
+    teacher_logits = torch.zeros(2, 13, 24)
+    teacher_full = {0: teacher_logits, 1: teacher_logits.clone()}
+    student_logits = torch.zeros(2, 10, 32)
+
+    total_kd, _ = fn._averaged_logits_kd(
+        student_logits, {}, teacher_full, torch.tensor(20.0)
+    )
+    assert fallback_calls == [0, 1]  # per-teacher fallback path, one call each
+    assert total_kd is not None
+
+
+def test_averaged_logits_same_tokenizer_takes_direct_kl_fast_path():
+    # All-null projection paths => genuine same-tokenizer teachers, so the
+    # averaging + single direct-KL fast path is the correct branch.
+    fn = _bare_averaged_logits_loss_fn([None, None])
+
+    fast_calls = []
+
+    def _fast_path(*args, **kwargs):
+        fast_calls.append(1)
+        return torch.tensor(1.23)
+
+    fn._direct_full_vocab_kl = _fast_path
+    fn._compute_teacher_kd = MagicMock(
+        side_effect=AssertionError("fallback reached for same-tokenizer teachers")
+    )
+
+    logits = torch.zeros(2, 10, 32)
+    teacher_full = {0: logits.clone(), 1: logits.clone()}
+
+    kd, metrics = fn._averaged_logits_kd(logits, {}, teacher_full, torch.tensor(20.0))
+    assert fast_calls == [1]  # fast path taken exactly once
+    assert "kl_loss" in metrics
+    assert kd.item() == pytest.approx(1.23)
