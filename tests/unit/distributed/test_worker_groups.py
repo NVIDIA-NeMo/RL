@@ -1198,6 +1198,7 @@ def test_get_nsight_config_extra_options():
         assert set(result["nsight"].keys()) == {
             "t",
             "o",
+            "s",
             "stop-on-exit",
             "capture-range",
             "capture-range-end",
