@@ -55,9 +55,10 @@ def get_nsight_config_if_pattern_matches(worker_name: str) -> dict[str, Any]:
                 f"Nsight profiling enabled for worker '{worker_name}' (matched pattern '{pattern}')"
             )
             nsight_config: dict[str, Any] = {
-                "t": "cuda,cudnn,cublas,nvtx",
+                "t": "cuda,nvtx",
                 "o": f"'{worker_name}_{NRL_NSYS_PROFILE_STEP_RANGE}_%p'",
                 "stop-on-exit": "true",
+                "s": "none",
                 # Capture range is required to control the scope of the profile
                 # Profile will only start/stop when torch.cuda.profiler.start()/stop() is called
                 "capture-range": "cudaProfilerApi",
