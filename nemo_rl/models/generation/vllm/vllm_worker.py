@@ -14,6 +14,7 @@
 
 import copy
 import gc
+import logging
 import os
 import sys
 from contextlib import contextmanager
@@ -36,11 +37,16 @@ from nemo_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
-from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generation
+from nemo_rl.models.generation.vllm.utils import (
+    format_prompt_for_vllm_generation,
+    pad_and_align_routed_expert_indices,
+)
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _resolve_enable_prefix_caching(vllm_cfg: dict[str, Any]) -> bool:
@@ -62,7 +68,7 @@ class BaseVllmGenerationWorker:
     @staticmethod
     def configure_worker(
         num_gpus: int | float, bundle_indices: Optional[tuple[int, list[int]]] = None
-    ) -> tuple[dict[str, Any], dict[str, str], dict[str, Any]]:
+    ) -> tuple[dict[str, Any], dict[str, str], dict[str, Any], dict[str, Any]]:
         """Provides complete worker configuration for vLLM tensor and pipeline parallelism.
 
         This method configures the worker based on its role in tensor and pipeline parallelism,
@@ -77,11 +83,13 @@ class BaseVllmGenerationWorker:
               - 'resources': Resource allocation (e.g., num_gpus)
               - 'env_vars': Environment variables for this worker
               - 'init_kwargs': Parameters to pass to __init__ of the worker
+              - 'runtime_env': Additional runtime_env options (e.g., nsight config)
         """
         # Initialize configuration
         resources: dict[str, Any] = {"num_gpus": num_gpus}
         init_kwargs: dict[str, Any] = {}
         env_vars: dict[str, str] = {}
+        runtime_env: dict[str, Any] = {}
 
         local_bundle_indices = None
         if bundle_indices is not None:
@@ -139,12 +147,18 @@ class BaseVllmGenerationWorker:
             resources["num_gpus"] = 0
             env_vars["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
             init_kwargs["fraction_of_gpus"] = num_gpus
+        else:
+            # TP=1: profile the outer worker directly since it runs the engine in-process.
+            # When TP>1, nsight is NOT applied here to avoid interfering with Ray's compiled
+            # DAG used by the internal vLLM TP workers. Instead, ray_workers_use_nsight is
+            # set in _create_engine_from_config to profile the internal workers.
+            runtime_env = get_nsight_config_if_pattern_matches("vllm_generation_worker")
 
         env_vars["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         # Skip vllm P2P check and rely on driver to report peer to peer capability.
         env_vars["VLLM_SKIP_P2P_CHECK"] = "1"
 
-        return resources, env_vars, init_kwargs
+        return resources, env_vars, init_kwargs, runtime_env
 
     def __init__(
         self,
@@ -584,12 +598,13 @@ class BaseVllmGenerationWorker:
             and vllm_kwargs["distributed_executor_backend"] == "ray"
         ):
             logger.warning(
-                "Nsight profiling is enabled for vllm generation worker through the vllm ray distributed executor. "
-                "The nsight command-line args and output file names are automatically picked by the ray distributed "
-                "executor. Refer to https://github.com/vllm-project/vllm/blob/7e3a8dc90670fd312ce1e0d4eba9bf11c571e3ad/vllm/executor/ray_distributed_executor.py#L136 "
-                "for more information."
+                "Nsight profiling is enabled for vllm internal TP workers via ray_workers_use_nsight. "
+                "The outer VllmGenerationWorker is NOT profiled to avoid interfering with Ray's compiled DAG. "
+                "vLLM's default nsight config is overridden with capture-range=cudaProfilerApi so that "
+                "profiling is deferred until start_gpu_profiling() is called."
             )
             vllm_kwargs["ray_workers_use_nsight"] = True
+            self._patch_vllm_nsight_config()
 
         # Call init_fp8 when precision is fp8
         # (kv_cache_dtype can be fp8/fp8_e4m3 or auto, validated in init_fp8)
@@ -621,6 +636,7 @@ class BaseVllmGenerationWorker:
             arch in getattr(hf_config, "architectures", [])
             for arch in (
                 "Gemma3ForConditionalGeneration",
+                "Gemma4ForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
                 "Qwen3_5MoeForConditionalGeneration",
             )
@@ -631,6 +647,7 @@ class BaseVllmGenerationWorker:
                 if arch
                 in (
                     "Gemma3ForConditionalGeneration",
+                    "Gemma4ForConditionalGeneration",
                     "Qwen3_5ForConditionalGeneration",
                     "Qwen3_5MoeForConditionalGeneration",
                 )
@@ -724,6 +741,7 @@ class BaseVllmGenerationWorker:
             stop_token_ids=self.cfg["stop_token_ids"],
             stop=stop_strings,
             include_stop_str_in_output=True,
+            ignore_eos=self.cfg.get("ignore_eos", False),
         )
 
     def start_gpu_profiling(self) -> None:
@@ -737,6 +755,43 @@ class BaseVllmGenerationWorker:
         torch.cuda.profiler.stop()
         if self.llm is not None:
             self.llm.collective_rpc("stop_gpu_profiling", args=tuple())
+
+    @staticmethod
+    def _patch_vllm_nsight_config() -> None:
+        """Override vLLM's nsight config for internal TP workers to use deferred capture.
+
+        vLLM's default _configure_ray_workers_use_nsight applies an always-on nsight
+        config (no capture-range, cuda-graph-trace=node) which causes significant
+        overhead and hangs Ray's compiled DAG. This patch replaces it with NeMo RL's
+        lighter config that uses capture-range=cudaProfilerApi, deferring actual
+        tracing until start_gpu_profiling() triggers cudaProfilerStart() on each
+        internal worker via collective_rpc.
+        """
+        from nemo_rl.utils.nsys import NRL_NSYS_PROFILE_STEP_RANGE
+
+        nsight_config = {
+            "t": "cuda,cudnn,cublas,nvtx",
+            "o": f"'vllm_tp_worker_{NRL_NSYS_PROFILE_STEP_RANGE}_%p'",
+            "stop-on-exit": "true",
+            "s": "none",
+            "capture-range": "cudaProfilerApi",
+            "capture-range-end": "repeat",
+            "cuda-graph-trace": "node",
+        }
+
+        try:
+            from vllm.v1.executor.ray_executor import RayDistributedExecutor
+        except ImportError:
+            from vllm.executor.ray_distributed_executor import (
+                RayDistributedExecutor,
+            )
+
+        def _patched_configure(self, ray_remote_kwargs):
+            runtime_env = ray_remote_kwargs.setdefault("runtime_env", {})
+            runtime_env.update({"nsight": nsight_config})
+            return ray_remote_kwargs
+
+        RayDistributedExecutor._configure_ray_workers_use_nsight = _patched_configure
 
     def _get_raw_spec_counters(self) -> dict[str, float | list[float]]:
         """Get speculative decoding metrics from the vLLM engine.
@@ -854,10 +909,17 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         # Process the outputs - but preserve the original input padding structure
         output_ids_list = []
         logprobs_list = []
+        routed_experts_list = []
+        r3_missing_routes = []
+        r3_expected_routes = []
+        r3_actual_routes = []
         generation_lengths = []
         unpadded_sequence_lengths = []
         truncated_list = []  # Track if response was truncated (hit max_tokens)
         max_length = 0
+        return_routed_experts = bool(
+            self.cfg.get("vllm_kwargs", {}).get("enable_return_routed_experts", False)
+        )
         for output in outputs:
             max_length = max(max_length, len(output.outputs[0].token_ids))
 
@@ -901,6 +963,27 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             logprobs_list.append(full_logprobs)
 
             response_length = sequence_length + len(generated_tokens)
+            full_routed_experts, r3_stats = pad_and_align_routed_expert_indices(
+                output,
+                generation,
+                valid_length=response_length,
+                padded_length=total_length,
+                device=input_ids.device,
+                require_complete_routed_experts=return_routed_experts,
+                return_stats=True,
+            )
+            if return_routed_experts and full_routed_experts is None:
+                raise RuntimeError(
+                    "vLLM was asked to return routed experts but the generation output "
+                    "did not include routed_experts."
+                )
+            if return_routed_experts:
+                r3_missing_routes.append(r3_stats["missing_routes"])
+                r3_expected_routes.append(r3_stats["expected_routes"])
+                r3_actual_routes.append(r3_stats["actual_routes"])
+            if full_routed_experts is not None:
+                routed_experts_list.append(full_routed_experts)
+
             generation_lengths.append(len(generated_tokens))
             unpadded_sequence_lengths.append(response_length)
 
@@ -915,6 +998,23 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         # Create return data conforming to GenerationOutputSpec
         output_ids = torch.stack(output_ids_list)
         logprobs = torch.stack(logprobs_list)
+        if r3_missing_routes and sum(r3_missing_routes) > 0:
+            bad_samples = [
+                f"{idx}:missing={missing},actual={actual},expected={expected}"
+                for idx, (missing, actual, expected) in enumerate(
+                    zip(r3_missing_routes, r3_actual_routes, r3_expected_routes)
+                )
+                if missing > 0
+            ][:8]
+            LOGGER.warning(
+                "R3 router replay fallback: vLLM returned incomplete routed_experts "
+                "for %d/%d samples, missing_token_routes=%d. Megatron will use its "
+                "own router for those missing token routes. samples=[%s]",
+                sum(1 for missing in r3_missing_routes if missing > 0),
+                len(r3_missing_routes),
+                sum(r3_missing_routes),
+                "; ".join(bad_samples),
+            )
 
         return_data = BatchedDataDict[GenerationOutputSpec](
             {
@@ -929,6 +1029,18 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
                 "truncated": torch.tensor(truncated_list, dtype=torch.bool),
             }
         )
+        if routed_experts_list:
+            return_data["routed_experts"] = torch.stack(routed_experts_list)
+        if r3_missing_routes:
+            return_data["r3_routed_experts_missing_routes"] = torch.tensor(
+                r3_missing_routes, dtype=torch.long
+            )
+            return_data["r3_routed_experts_expected_routes"] = torch.tensor(
+                r3_expected_routes, dtype=torch.long
+            )
+            return_data["r3_routed_experts_actual_routes"] = torch.tensor(
+                r3_actual_routes, dtype=torch.long
+            )
 
         return return_data
 

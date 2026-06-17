@@ -36,6 +36,7 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.utils.checkpoint import CheckpointManager
@@ -165,13 +166,22 @@ def create_megatron_test_config(
             "stop_token_ids": None,
             "stop_strings": None,
             "mcore_generation_config": {
+                "async_engine": False,
+                "max_model_len": 1024,
                 "buffer_size_gb": 2,
                 "num_cuda_graphs": 16,
                 "block_size_tokens": 1024,
                 "use_cuda_graphs_for_non_decode_steps": True,
                 "enable_chunked_prefill": True,
-                "unified_memory_level": 0,
                 "max_tokens": 65536,
+                "cuda_graph_impl": "local",
+                "enable_prefix_caching": False,
+                "kv_cache_management_mode": "persist",
+                "materialize_only_last_token_logits": True,
+                "num_speculative_tokens": 0,
+                "refit_backend": "gloo",  # not nvshmem: its NVLS multicast init is unavailable in CI
+                "parsers": [],
+                "expose_http_server": False,
             },
             "colocated": {
                 "enabled": True,
@@ -599,6 +609,10 @@ def generation_setup(request, tiny_llama_model_path):
             init_reference_model=False,
         )
 
+        generation = MegatronGeneration(
+            config=config, tokenizer=tokenizer, policy=policy
+        )
+
         # Create test data
         print("Creating test batch...")
         torch.manual_seed(42)
@@ -628,7 +642,7 @@ def generation_setup(request, tiny_llama_model_path):
             }
         )
 
-        yield policy, cluster, data, prompts
+        yield policy, generation, cluster, data, prompts
 
     except Exception as e:
         print(f"Error during generation setup: {e}")
@@ -654,7 +668,7 @@ def generation_setup(request, tiny_llama_model_path):
 )
 def test_megatron_policy_generation(generation_setup):
     """Test Megatron policy generation with different backends."""
-    policy, cluster, data, prompts = generation_setup
+    policy, generation, cluster, data, prompts = generation_setup
 
     # Verify resources were created properly
     assert policy is not None, "Generation policy was not created properly"
@@ -663,11 +677,11 @@ def test_megatron_policy_generation(generation_setup):
 
     # Call prepare_for_generation
     print("Preparing for generation...")
-    policy.prepare_for_generation()
+    generation.prepare_for_generation()
 
     # Generate text
     print("Generating text...")
-    results = policy.generate(data, greedy=True)
+    results = generation.generate(data, greedy=True)
 
     # Verify results
     assert "output_ids" in results, "Generation results should contain 'output_ids'"
@@ -687,7 +701,7 @@ def test_megatron_policy_generation(generation_setup):
 
     # Call finish_generation
     print("Finishing generation...")
-    policy.finish_generation()
+    generation.finish_generation()
 
 
 @pytest.fixture

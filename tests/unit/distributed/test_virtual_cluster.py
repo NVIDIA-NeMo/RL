@@ -362,7 +362,7 @@ class TestVllmPortAssignment:
             BaseVllmGenerationWorker,
         )
 
-        _, env_vars, _ = BaseVllmGenerationWorker.configure_worker(
+        _, env_vars, _, _ = BaseVllmGenerationWorker.configure_worker(
             num_gpus=1, bundle_indices=bundle_indices
         )
         assert env_vars["VLLM_PORT"] == str(expected_port)
@@ -372,5 +372,5 @@ class TestVllmPortAssignment:
             BaseVllmGenerationWorker,
         )
 
-        _, env_vars, _ = BaseVllmGenerationWorker.configure_worker(num_gpus=1)
+        _, env_vars, _, _ = BaseVllmGenerationWorker.configure_worker(num_gpus=1)
         assert "VLLM_PORT" not in env_vars
