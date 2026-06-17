@@ -88,8 +88,8 @@ def _resolve_refit_transfer_dtype(
     """Pick the dtype used to transfer a tensor during refit."""
     if not src_dtype.is_floating_point:
         return src_dtype
-    if name.endswith(".gate.weight") or name.endswith(".e_score_correction_bias"):
-        return torch.float32
+    if src_dtype == torch.float32:
+        return src_dtype
     return base_dtype
 
 
