@@ -76,9 +76,3 @@ tests/test_suites/llm/distillation-qwen3-32b-to-4b-base-2n8g-fsdp2tp2-seqpack.v1
 
 # Megatron PPO with GAE and value model (DeepSeek-R1-Distill-Qwen-7B, DAPO Math, 8 nodes)
 tests/test_suites/llm/ppo-dsr1-7b-math-8n8g-megatron.sh
-
-# Megatron PPO with value sequence parallelism (TP2+SP) and dynamic batching
-tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron-valuetp2sp-dynbatch.sh
-
-# Megatron PPO with value pipeline parallelism (TP2+PP2)
-tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron-valuetp2pp2.sh

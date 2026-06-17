@@ -147,7 +147,7 @@ def _create_value_test_config(
 
 
 def _apply_config_updates(config: ValueConfig, config_updates: dict) -> None:
-    """Apply test config overrides in place (precision / SP / dynamic batching)."""
+    """Apply test config overrides in place (precision / SP / PP / dynamic batching)."""
     for k, v in config_updates.items():
         if k == "precision":
             config["precision"] = v
@@ -156,6 +156,8 @@ def _apply_config_updates(config: ValueConfig, config_updates: dict) -> None:
             config["megatron_cfg"]["optimizer"]["fp16"] = v == "float16"
         elif k == "sequence_parallel":
             config["megatron_cfg"]["sequence_parallel"] = v
+        elif k == "pipeline_model_parallel_size":
+            config["megatron_cfg"]["pipeline_model_parallel_size"] = v
         elif k == "dynamic_batching":
             mbt = config["max_total_sequence_length"] * config["train_micro_batch_size"]
             lbt = config["max_total_sequence_length"] * config["logprob_batch_size"]
@@ -338,8 +340,9 @@ def test_value_worker_train_step(value_setup):
     [
         (2, {"sequence_parallel": True}),
         (1, {"dynamic_batching": True}),
+        (1, {"pipeline_model_parallel_size": 2}),
     ],
-    ids=["sequence_parallel", "dynamic_batching"],
+    ids=["sequence_parallel", "dynamic_batching", "pipeline_parallel"],
 )
 def test_value_worker_parallelism_equivalence(
     tiny_qwen2_model_path, tmp_path, tp, feature_updates
@@ -354,7 +357,10 @@ def test_value_worker_parallelism_equivalence(
         reassembles the sequence correctly (a wrong gather still yields finite
         values, so finiteness alone would not catch it);
       * dynamic batching — guards the microbatch reorder + ``reorder_data``
-        restore round-trips back to the original sample order.
+        restore round-trips back to the original sample order;
+      * pipeline parallelism — guards the head output broadcasts from the last
+        pipeline stage to all ranks, and the value head reshards across a
+        save@pp1 / load@pp2 checkpoint.
     """
     cluster = None
     ref = None

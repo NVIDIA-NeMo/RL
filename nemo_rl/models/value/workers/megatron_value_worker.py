@@ -126,8 +126,7 @@ def forward_step_value(
         )
 
     # Head-owning stage returns [B, S, 1] values; others pass hidden states through.
-    # ignore_virtual=False so only the head-owning vp chunk is gated under VPP.
-    if is_pipeline_last_stage(ignore_virtual=False):
+    if is_pipeline_last_stage(ignore_virtual=True):
         values = output_tensor.squeeze(-1)  # [B, S]
         # Shift right by 1 (values[t] = V(state before token t)); must match get_values.
         values = torch.cat([torch.zeros_like(values[:, :1]), values[:, :-1]], dim=1)
@@ -316,6 +315,14 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
 
         # Validate configuration
         self.megatron_cfg.validate()
+
+        assert self.megatron_cfg.model.virtual_pipeline_model_parallel_size in (
+            None,
+            1,
+        ), (
+            "Virtual pipeline parallelism (VPP) is not supported for the "
+            "Megatron PPO value model."
+        )
 
         # Step 4: Setup Megatron model and components
         # The value head is an independent hidden->1 head, not tied to the input

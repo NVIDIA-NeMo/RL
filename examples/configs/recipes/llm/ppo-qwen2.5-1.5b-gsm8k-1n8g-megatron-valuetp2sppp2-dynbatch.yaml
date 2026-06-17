@@ -20,7 +20,7 @@ value_loss_fn:
   scale: 1.0
   cliprange: 0.5
 checkpointing:
-  checkpoint_dir: results/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron
+  checkpoint_dir: results/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron-valuetp2sppp2-dynbatch
 policy:
   model_name: Qwen/Qwen2.5-1.5B-Instruct
   tokenizer:
@@ -49,8 +49,12 @@ value:
   tokenizer:
     name: Qwen/Qwen2.5-1.5B-Instruct
   train_micro_batch_size: 4
+  dynamic_batching:
+    enabled: true
   megatron_cfg:
     tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 2
+    sequence_parallel: true
     optimizer:
       lr: 1.0e-05
       weight_decay: 0.01
@@ -70,9 +74,9 @@ data:
   default:
     system_prompt_file: examples/prompts/gsm8k.txt
 logger:
-  log_dir: logs/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron
+  log_dir: logs/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron-valuetp2sppp2-dynbatch
   wandb:
     project: nemo-rl
-    name: ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron
+    name: ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron-valuetp2sppp2-dynbatch
 cluster:
   gpus_per_node: 8
