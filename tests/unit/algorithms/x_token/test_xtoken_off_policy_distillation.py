@@ -827,3 +827,63 @@ def test_averaged_logits_same_tokenizer_takes_direct_kl_fast_path():
     assert fast_calls == [1]  # fast path taken exactly once
     assert "kl_loss" in metrics
     assert kd.item() == pytest.approx(1.23)
+
+
+# ---------------------------------------------------------------------------
+# teacher weight-metric score masking
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("metric", ["ce", "entropy", "max_prob"])
+def test_teacher_weight_score_ignores_padded_positions(metric):
+    # The per-teacher weight/selection score must exclude padded positions:
+    # padding logits are near-uniform noise and would otherwise dominate the
+    # score on long-padded batches. Corrupting everything in the padded tail
+    # must not change the score.
+    fn = CrossTokenizerDistillationLossFn.__new__(CrossTokenizerDistillationLossFn)
+    fn.sum_weights_metric = metric
+
+    torch.manual_seed(0)
+    batch, seqlen, vocab = 2, 5, 8
+    logits = torch.randn(batch, seqlen, vocab)
+    ids = torch.randint(0, vocab, (batch, seqlen))
+    # Last two positions of each sample are padding.
+    token_mask = torch.tensor(
+        [[1, 1, 1, 0, 0], [1, 1, 1, 0, 0]], dtype=torch.float32
+    )
+    sample_mask = torch.ones(batch)
+
+    score = fn._teacher_weight_score(logits, ids, token_mask, sample_mask)
+
+    # Corrupt the padded tail; a properly masked score must not move.
+    logits_corrupt = logits.clone()
+    logits_corrupt[:, 3:, :] = 1e4
+    ids_corrupt = ids.clone()
+    ids_corrupt[:, 3:] = 0
+    score_corrupt = fn._teacher_weight_score(
+        logits_corrupt, ids_corrupt, token_mask, sample_mask
+    )
+
+    assert torch.allclose(score, score_corrupt, atol=1e-5)
+
+
+def test_teacher_weight_score_masks_dropped_samples():
+    # sample_mask=0 rows must not contribute either.
+    fn = CrossTokenizerDistillationLossFn.__new__(CrossTokenizerDistillationLossFn)
+    fn.sum_weights_metric = "max_prob"
+
+    torch.manual_seed(0)
+    logits = torch.randn(2, 4, 8)
+    ids = torch.randint(0, 8, (2, 4))
+    token_mask = torch.ones(2, 4)
+    sample_mask = torch.tensor([1.0, 0.0])  # second sample dropped
+
+    score = fn._teacher_weight_score(logits, ids, token_mask, sample_mask)
+
+    logits_corrupt = logits.clone()
+    logits_corrupt[1] = 1e4  # corrupt the dropped sample
+    score_corrupt = fn._teacher_weight_score(
+        logits_corrupt, ids, token_mask, sample_mask
+    )
+
+    assert torch.allclose(score, score_corrupt, atol=1e-5)

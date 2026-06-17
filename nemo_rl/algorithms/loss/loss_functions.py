@@ -1916,15 +1916,18 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         with torch.no_grad():
             ces: list[float] = []
             for i in range(self.num_teachers):
-                t_logits, t_ids = self._teacher_score_inputs(
+                t_logits, t_ids, t_mask = self._teacher_score_inputs(
                     i, data, teacher_full_logits_by_idx
                 )
-                ce_i = torch.nn.functional.cross_entropy(
+                ce_pos = torch.nn.functional.cross_entropy(
                     t_logits[:, :-1].reshape(-1, t_logits.shape[-1]).float(),
                     t_ids[:, 1:].reshape(-1),
-                    reduction="mean",
+                    reduction="none",
                 )
-                ces.append(ce_i.item())
+                mask = (
+                    t_mask[:, 1:].float() * data["sample_mask"].unsqueeze(-1).float()
+                ).reshape(-1)
+                ces.append(masked_mean(ce_pos, mask).item())
             best = int(min(range(self.num_teachers), key=lambda j: ces[j]))
 
         kd, m = self._compute_teacher_kd(
@@ -1944,9 +1947,12 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         i: int,
         data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
         teacher_full_logits_by_idx: dict[int, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """``(logits, input_ids)`` for teacher ``i``'s CE / weight-metric scores.
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``(logits, input_ids, token_mask)`` for teacher ``i``'s CE /
+        weight-metric scores.
 
+        The token mask is over the tokenization the score is computed on: the
+        student's for a same-vocab teacher, teacher ``i``'s own otherwise.
         Requires full logits; raises for a same-vocab top-K teacher (the
         metrics need the full teacher distribution).
         """
@@ -1958,9 +1964,11 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             )
         if self._teacher_is_same_vocab(i):
             ids = data["input_ids"]
+            token_mask = data["token_mask"]
         else:
             ids = data[f"teacher_{i}_input_ids"]
-        return teacher_full_logits_by_idx[i], ids
+            token_mask = data[f"teacher_{i}_token_mask"]
+        return teacher_full_logits_by_idx[i], ids, token_mask
 
     def _compute_dynamic_weights(
         self,
@@ -1981,10 +1989,12 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             )
         scores: list[torch.Tensor] = []
         for i in range(self.num_teachers):
-            t_logits, t_ids = self._teacher_score_inputs(
+            t_logits, t_ids, t_mask = self._teacher_score_inputs(
                 i, data, teacher_full_logits_by_idx
             )
-            score = self._teacher_weight_score(t_logits, t_ids)
+            score = self._teacher_weight_score(
+                t_logits, t_ids, t_mask, data["sample_mask"]
+            )
             if self.normalize_teacher_by_vocab:
                 v_log = torch.log(
                     torch.tensor(float(self.teacher_vocab_sizes[i]), device=device)
@@ -1995,23 +2005,34 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         return [weights[i] for i in range(self.num_teachers)]
 
     def _teacher_weight_score(
-        self, t_logits: torch.Tensor, t_ids: torch.Tensor
+        self,
+        t_logits: torch.Tensor,
+        t_ids: torch.Tensor,
+        t_mask: torch.Tensor,
+        sample_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Scalar weight-metric score for one teacher (higher = more trusted)."""
+        """Scalar weight-metric score for one teacher (higher = more trusted).
+
+        Padded positions and masked-out samples are excluded, so long-padded
+        batches don't let near-uniform padding logits dominate the score.
+        """
+        samp = sample_mask.unsqueeze(-1).float()
         if self.sum_weights_metric == "ce":
-            ce = torch.nn.functional.cross_entropy(
+            ce_pos = torch.nn.functional.cross_entropy(
                 t_logits[:, :-1].reshape(-1, t_logits.shape[-1]).float(),
                 t_ids[:, 1:].reshape(-1),
-                reduction="mean",
+                reduction="none",
             )
-            return -ce
+            mask = (t_mask[:, 1:].float() * samp).reshape(-1)
+            return -masked_mean(ce_pos, mask)
+        mask = t_mask.float() * samp
         if self.sum_weights_metric == "entropy":
             probs = torch.softmax(t_logits.float(), dim=-1)
             entropy = -(probs * torch.log(probs + 1e-10)).sum(dim=-1)
-            return -entropy.mean()
+            return -masked_mean(entropy, mask)
         if self.sum_weights_metric == "max_prob":
             probs = torch.softmax(t_logits.float(), dim=-1)
-            return probs.max(dim=-1).values.mean()
+            return masked_mean(probs.max(dim=-1).values, mask)
         raise ValueError(f"Unknown sum_weights_metric: {self.sum_weights_metric!r}")
 
     # ------------------------------------------------------------------ #
