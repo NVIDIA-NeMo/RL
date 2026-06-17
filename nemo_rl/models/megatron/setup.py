@@ -667,8 +667,19 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
 
 
 def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
-    if "mtp_num_layers" in config["megatron_cfg"]:
-        model_cfg.mtp_num_layers = config["megatron_cfg"]["mtp_num_layers"]
+    """Apply Multi-Token Prediction settings onto the mcore model config."""
+    megatron_cfg = config["megatron_cfg"]
+    if "mtp_num_layers" in megatron_cfg:
+        # In mcore, mtp_num_layers is both the number of MTP layers (when
+        # mtp_use_repeated_layer is False) and the number of times the MTP layer
+        # is repeated (when mtp_use_repeated_layer is True).
+        model_cfg.mtp_num_layers = megatron_cfg["mtp_num_layers"]
+    if "mtp_loss_scaling_factor" in megatron_cfg:
+        model_cfg.mtp_loss_scaling_factor = megatron_cfg["mtp_loss_scaling_factor"]
+    if "mtp_use_repeated_layer" in megatron_cfg:
+        model_cfg.mtp_use_repeated_layer = megatron_cfg["mtp_use_repeated_layer"]
+    if "mtp_detach_heads" in megatron_cfg:
+        model_cfg.mtp_detach_heads = megatron_cfg["mtp_detach_heads"]
 
 
 def _apply_precision_config(
