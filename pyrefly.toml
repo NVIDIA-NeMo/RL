@@ -171,6 +171,7 @@ project-includes = [
   "nemo_rl/models/policy/workers/patches.py",
   "nemo_rl/models/value/__init__.py",
   "nemo_rl/models/value/config.py",
+  "nemo_rl/models/value/temporal_shift.py",
   "nemo_rl/models/value/workers/__init__.py",
   "nemo_rl/utils/__init__.py",
   "nemo_rl/utils/checkpoint.py",
