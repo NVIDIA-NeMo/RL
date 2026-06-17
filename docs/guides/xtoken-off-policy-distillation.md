@@ -51,11 +51,11 @@ single `.pt` file. The final step is the actual distillation training loop.
                                              │
                                              ▼  projection_matrix.pt
                         ┌────────────────────────────────────────────────────┐
-                        │  4. examples/                                        │
-                        │     run_xtoken_off_policy_distillation.py            │
-                        │     — align student & teacher tokens, then           │
-                        │       teacher forward + student forward,             │
-                        │       then x-token KD loss                           │
+                        │  4. examples/                                      │
+                        │     run_xtoken_off_policy_distillation.py          │
+                        │     — align student & teacher tokens, then         │
+                        │       teacher forward + student forward,           │
+                        │       then x-token KD loss                         │
                         └────────────────────────────────────────────────────┘
 ```
 
