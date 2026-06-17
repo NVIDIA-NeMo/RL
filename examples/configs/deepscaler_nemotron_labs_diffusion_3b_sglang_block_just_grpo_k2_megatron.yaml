@@ -1,0 +1,36 @@
+# BlockJustGRPO (k=2) on Nemotron-Labs-Diffusion-3B, DeepScaleR train / AIME 2024 val.
+#
+# Same as deepscaler_..._block_just_grpo_megatron.yaml but unmasks/harvests k=2
+# tokens per reveal level instead of 1 (the block-parallel semi-AR objective).
+# This HALVES the number of reveal-level forward passes from block_size (16) to
+# ceil(block_size / k) = 8, for both logprob estimation and the training schedule.
+#
+# REQUIRED PAIRING: the SGLang generation must unmask the same k tokens per step
+# so the rollout logprobs match the block-reveal estimate (gen_kl ~ 0). For
+# selection_policy=leftmost that is controlled by `tokens_per_step` in the
+# dllm_algorithm_config (NOT max_steps) -- see block_just_grpo_leftmost_dllm_bs16_k2.yaml
+# (tokens_per_step: 2). Verified on the 8p8g toy: gen_kl ~0.0008 at k=2 vs ~0.0003
+# at k=1 (mis-pairing k with max_steps gave gen_kl 1.41).
+#
+# Everything else (16-node cluster, 4096 sequence budget, max_new_tokens=3744,
+# KL off, batch sizes, block_size=16) is inherited from the k=1 production config.
+defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_block_just_grpo_megatron.yaml"
+
+policy:
+  logprob_estimation:
+    # k: tokens revealed + harvested per block per reveal-level forward.
+    reveal_tokens_per_level: 2
+
+  generation:
+    sglang_cfg:
+      # Must match reveal_tokens_per_level via tokens_per_step=2 (block_size/k=8
+      # leftmost steps, both tokens per step scored from the same forward).
+      dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL-block-justgrpo-reveal-k/tools/nemotron_diffusion/block_just_grpo_leftmost_dllm_bs16_k2.yaml"
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nemotron-diffusion-3b-block-just-grpo-k2-deepscaler-megatron"
+
+logger:
+  log_dir: "logs/grpo-nemotron-diffusion-3b-block-just-grpo-k2-deepscaler-megatron-sglang"
+  wandb:
+    name: "grpo-nemotron-diffusion-3b-block-just-grpo-k2-deepscaler-megatron-sglang"

@@ -1,0 +1,17 @@
+# Leftmost (left-to-right reveal) dLLM generation config for BlockJustGRPO at
+# block_size=16, unmasking k=2 tokens per diffusion step via tokens_per_step=2.
+#
+# NOTE: for selection_policy=leftmost the per-step reveal count is controlled by
+# `tokens_per_step` (FastDiffuser.run, line ~651), NOT by max_steps. max_steps
+# only bounds the denoising loop; with tokens_per_step=2 the 16-token block is
+# revealed in 8 steps (2 leftmost positions per step), and both positions in a
+# step are scored from the SAME forward pass (context = pre-step prefix), which
+# matches policy.logprob_estimation.reveal_tokens_per_level=2.
+algorithm: FastDiffuser
+block_size: 16
+max_steps: 16
+causal_context: true
+temperature: 1.0
+threshold: null
+selection_policy: leftmost
+tokens_per_step: 2

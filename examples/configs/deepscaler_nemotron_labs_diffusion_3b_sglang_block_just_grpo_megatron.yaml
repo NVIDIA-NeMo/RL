@@ -35,6 +35,9 @@ policy:
     # block_size omitted -> inherits the model module config.block_size (now 16),
     # so reveal levels stay consistent with the attention blocking.
     # max_reveal_levels: 16  # optional cap on reveal-level passes
+    # reveal_tokens_per_level: 1  # k: tokens revealed+harvested per block per
+    #   forward (default 1 = per-token leftmost reveal). Set k>1 for block-parallel
+    #   estimation; to match generation set the dllm config max_steps = block_size / k.
     # Microbatching uses the inherited logprob_batch_size / train_micro_batch_size.
 
   generation:

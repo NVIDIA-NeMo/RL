@@ -1,0 +1,18 @@
+# BlockJustGRPO k=2 block-parallel smoke (8 prompts x 8 gens, 1 node).
+# Verifies the reveal_tokens_per_level=2 logprob estimate matches generation that
+# unmasks 2 tokens per diffusion step: train/token_mult_prob_error should stay
+# ~1.0 (generation logprobs == block-reveal estimate). Shortens max_new_tokens to
+# 512 for a fast read and pins a single node.
+defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_block_just_grpo_megatron_toy_8p8g.yaml"
+
+policy:
+  generation:
+    max_new_tokens: 512
+    sglang_cfg:
+      dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL-block-justgrpo-reveal-k/tools/nemotron_diffusion/block_just_grpo_leftmost_dllm_bs16_k2.yaml"
+  logprob_estimation:
+    reveal_tokens_per_level: 2
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 8

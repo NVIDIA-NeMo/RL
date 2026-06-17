@@ -22,12 +22,22 @@ passes instead of one-pass-per-response-token, by reusing DiffuGRPO's asymmetric
 ``NemotronLabsDiffusionAttention.set_asymmetric_ar_metadata``).
 
 Design: a single fully-masked completion ``base`` (N rows) is built once. Each
-*reveal level* ``j`` is then a cheap derived **view** of that base in which every
-block reveals its first ``j`` tokens (the rest stay MASK); the view contributes
-the logprob of each block's ``j``-th token (its "harvest" positions). The worker
-iterates levels ``j = 0 .. num_levels-1`` (a Python for-loop), so only one level
-(N rows) is materialized at a time -- the number of forward passes is
-``block_size`` (capped by ``max_reveal_levels``), independent of sequence length.
+*reveal level* ``l`` is then a cheap derived **view** of that base in which every
+block reveals its first ``l * k`` tokens (the rest stay MASK); the view
+contributes the logprobs of that block's next ``k`` tokens -- the "harvest"
+window at within-block offsets ``[l*k, (l+1)*k)``. The worker iterates levels
+``l = 0 .. num_levels-1`` (a Python for-loop), so only one level (N rows) is
+materialized at a time -- the number of forward passes is ``ceil(block_size /
+k)`` (capped by ``max_reveal_levels``), independent of sequence length.
+
+``k`` (``reveal_tokens_per_level``) is the semi-autoregressive reveal width: how
+many tokens each block reveals (and harvests) per forward. ``k = 1`` is the exact
+per-token leftmost-reveal objective. ``k > 1`` is the block-parallel
+generalization: the ``k`` tokens harvested at a level are each conditioned only
+on the ``l*k`` real tokens revealed before the window (the others stay MASK in
+this pass), matching generation that unmasks ``k`` tokens per diffusion step
+(SGLang ``max_steps = block_size / k``); it no longer reproduces the per-token
+leftmost-reveal logprobs once ``k > 1``.
 
 The worker uses ``build_block_reveal_base`` (one fully-masked base) +
 ``make_reveal_level_view`` (per-level reveal) in an explicit loop for logprobs,
@@ -69,6 +79,7 @@ def count_reveal_levels(
     block_size: int,
     response_lengths: torch.Tensor,
     max_reveal_levels: int | None,
+    reveal_tokens_per_level: int = 1,
 ) -> int:
     """Number of reveal-level passes.
 
@@ -86,7 +97,8 @@ def count_reveal_levels(
     """
     if response_lengths.numel() == 0:
         return 0
-    num_levels = int(block_size)
+    k = max(1, int(reveal_tokens_per_level))
+    num_levels = (int(block_size) + k - 1) // k  # ceil(block_size / k)
     if max_reveal_levels is not None:
         num_levels = min(num_levels, int(max_reveal_levels))
     return int(num_levels)
@@ -100,6 +112,7 @@ def build_block_reveal_base(
     pad_to_length: int | None = None,
     include_loss: bool = False,
     max_reveal_levels: int | None = None,
+    reveal_tokens_per_level: int = 1,
 ) -> tuple[BatchedDataDict[Any], int, int]:
     """Build the fully-masked completion ``base`` (N rows) + level count.
 
@@ -128,7 +141,10 @@ def build_block_reveal_base(
         )
     num_samples = base["input_ids"].shape[0]
     num_levels = count_reveal_levels(
-        block_size, base["diffu_grpo_response_lengths"], max_reveal_levels
+        block_size,
+        base["diffu_grpo_response_lengths"],
+        max_reveal_levels,
+        reveal_tokens_per_level=reveal_tokens_per_level,
     )
     return base, num_samples, num_levels
 
@@ -138,6 +154,7 @@ def make_reveal_level_view(
     level: int,
     block_size: int,
     harvest_keys: tuple[str, ...],
+    reveal_tokens_per_level: int = 1,
 ) -> BatchedDataDict[Any]:
     """Derive the reveal-level-``level`` view (N rows) from a fully-masked base.
 
@@ -163,10 +180,15 @@ def make_reveal_level_view(
     within_block_off = torch.remainder(rel.clamp_min(0), int(block_size))
     in_response = (rel >= 0) & (rel < response_lengths.unsqueeze(1))
 
-    reveal = in_response & (within_block_off < level)
+    k = max(1, int(reveal_tokens_per_level))
+    reveal_upto = level * k
+    reveal = in_response & (within_block_off < reveal_upto)
     ids = torch.where(reveal, target_ids, base["input_ids"].to(device))
     harvest = (
-        in_response & (within_block_off == level) & (score_mask > 0.5)
+        in_response
+        & (within_block_off >= reveal_upto)
+        & (within_block_off < reveal_upto + k)
+        & (score_mask > 0.5)
     ).to(dtype=score_mask.dtype)
 
     view = BatchedDataDict[Any]()
@@ -202,11 +224,17 @@ class BlockJustGRPORevealSchedule(BatchedDataDict[Any]):
     """
 
     def configure(
-        self, *, num_levels: int, block_size: int, harvest_keys: tuple[str, ...]
+        self,
+        *,
+        num_levels: int,
+        block_size: int,
+        harvest_keys: tuple[str, ...],
+        reveal_tokens_per_level: int = 1,
     ) -> "BlockJustGRPORevealSchedule":
         self._br_num_levels = int(num_levels)
         self._br_block_size = int(block_size)
         self._br_harvest_keys = tuple(harvest_keys)
+        self._br_reveal_tokens_per_level = max(1, int(reveal_tokens_per_level))
         return self
 
     def _sample_count(self) -> int:
@@ -227,7 +255,11 @@ class BlockJustGRPORevealSchedule(BatchedDataDict[Any]):
     ) -> Iterator[BatchedDataDict[Any]]:
         for level in range(self._br_num_levels):
             level_view = make_reveal_level_view(
-                self, level, self._br_block_size, self._br_harvest_keys
+                self,
+                level,
+                self._br_block_size,
+                self._br_harvest_keys,
+                self._br_reveal_tokens_per_level,
             )
             # Sample microbatching is the standard BatchedDataDict mechanism.
             yield from level_view.make_microbatch_iterator(microbatch_size)

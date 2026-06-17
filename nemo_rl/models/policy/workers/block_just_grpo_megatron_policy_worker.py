@@ -57,6 +57,10 @@ class BlockJustGRPOMegatronPolicyWorkerImpl(DiffuGRPOMegatronPolicyWorkerImpl):
         cfg = self._block_reveal_cfg()
         return int(cfg.get("block_size") or self._diffusion_block_size())
 
+    def _block_reveal_tokens_per_level(self) -> int:
+        cfg = self._block_reveal_cfg()
+        return max(1, int(cfg.get("reveal_tokens_per_level") or 1))
+
     # ---- training: lazy reveal-level iterator (one optimizer step) ----------
     def _build_training_megatron_batch(
         self,
@@ -65,6 +69,7 @@ class BlockJustGRPOMegatronPolicyWorkerImpl(DiffuGRPOMegatronPolicyWorkerImpl):
     ) -> tuple[BatchedDataDict[Any], PolicyConfig, int, dict[str, Any]]:
         cfg = self._block_reveal_cfg()
         block_size = self._block_reveal_block_size()
+        reveal_k = self._block_reveal_tokens_per_level()
         self._maybe_print_diffusion_block_size("block_reveal_train", block_size)
         base, _num_samples, num_levels = build_block_reveal_base(
             data,
@@ -74,6 +79,7 @@ class BlockJustGRPOMegatronPolicyWorkerImpl(DiffuGRPOMegatronPolicyWorkerImpl):
             pad_to_length=self._diffu_grpo_sequence_length_round(),
             include_loss=True,
             max_reveal_levels=cfg.get("max_reveal_levels"),
+            reveal_tokens_per_level=reveal_k,
         )
         # One forward per reveal level; samples within a level are microbatched the
         # standard way by train_micro_batch_size (passed in as ``mbs``). A single
@@ -83,6 +89,7 @@ class BlockJustGRPOMegatronPolicyWorkerImpl(DiffuGRPOMegatronPolicyWorkerImpl):
             num_levels=num_levels,
             block_size=block_size,
             harvest_keys=("diffu_grpo_score_mask", "diffu_grpo_loss_mask"),
+            reveal_tokens_per_level=reveal_k,
         )
         return (
             schedule,
@@ -101,6 +108,7 @@ class BlockJustGRPOMegatronPolicyWorkerImpl(DiffuGRPOMegatronPolicyWorkerImpl):
         self._validate_diffusion_algorithm_support()
         cfg = self._block_reveal_cfg()
         block_size = self._block_reveal_block_size()
+        reveal_k = self._block_reveal_tokens_per_level()
         reveal_mbs = (
             micro_batch_size
             if micro_batch_size is not None
@@ -114,6 +122,7 @@ class BlockJustGRPOMegatronPolicyWorkerImpl(DiffuGRPOMegatronPolicyWorkerImpl):
             pad_to_length=self._diffu_grpo_sequence_length_round(),
             include_loss=False,
             max_reveal_levels=cfg.get("max_reveal_levels"),
+            reveal_tokens_per_level=reveal_k,
         )
         original_seq_len = int(data["input_ids"].shape[1])
         if num_levels == 0:
@@ -125,6 +134,7 @@ class BlockJustGRPOMegatronPolicyWorkerImpl(DiffuGRPOMegatronPolicyWorkerImpl):
         # (zero elsewhere). Summing across levels yields the full [N, S] logprobs.
         self._br_base = base
         self._br_block_size_cur = block_size
+        self._br_reveal_k = reveal_k
         self._br_reveal_mbs = reveal_mbs
         self._br_num_samples = num_samples
         self._br_original_seq_len = original_seq_len
@@ -156,7 +166,11 @@ class BlockJustGRPOMegatronPolicyWorkerImpl(DiffuGRPOMegatronPolicyWorkerImpl):
         # the level currently selected by the outer loop.
         base = self._br_base
         view = make_reveal_level_view(
-            base, self._br_level, self._br_block_size_cur, ("diffu_grpo_score_mask",)
+            base,
+            self._br_level,
+            self._br_block_size_cur,
+            ("diffu_grpo_score_mask",),
+            self._br_reveal_k,
         )
         level_mbs = (
             micro_batch_size if micro_batch_size is not None else self._br_reveal_mbs

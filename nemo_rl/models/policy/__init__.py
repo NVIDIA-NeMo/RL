@@ -355,6 +355,12 @@ class BlockJustGRPOLogprobEstimationConfig(TypedDict):
     block_size: NotRequired[int]
     # Cap on reveal-level passes; defaults to the (effective) block size.
     max_reveal_levels: NotRequired[int]
+    # Semi-autoregressive reveal width ``k``: how many tokens each block reveals
+    # (and harvests) per forward pass. Default 1 == per-token leftmost reveal
+    # (identical to ``just_grpo_leftmost_reveal``). ``k > 1`` is the block-parallel
+    # objective matching generation that unmasks ``k`` tokens per step (SGLang
+    # ``max_steps = block_size / k``); forward passes drop to ``ceil(block_size / k)``.
+    reveal_tokens_per_level: NotRequired[int]
     # Drop the MASK token from the scored logits (matches DiffuGRPO default).
     exclude_mask_token_from_logits: NotRequired[bool]
     # Microbatching reuses the standard policy.logprob_batch_size (logprobs) and
