@@ -615,7 +615,14 @@ class BaseVllmGenerationWorker:
                 self.cfg["vllm_cfg"], self.model_name, model_parallel_size
             )
 
+            # Pop hf_overrides before update() so we can merge instead of
+            # replacing: fp8 sets quantization_config as its base, but
+            # user-supplied overrides (e.g. max_position_embeddings) must
+            # survive and take precedence.
+            fp8_hf_overrides = fp8_kwargs.pop("hf_overrides", {})
             vllm_kwargs.update(fp8_kwargs)
+            existing_hf_overrides = vllm_kwargs.get("hf_overrides") or {}
+            vllm_kwargs["hf_overrides"] = {**fp8_hf_overrides, **existing_hf_overrides}
             # overriden by quant config, however vllm complains if this not passed
             self.precision = "bfloat16"
 
