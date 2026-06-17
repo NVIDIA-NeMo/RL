@@ -11,12 +11,6 @@
 defaults: "grpo_qwen3_235b_swe_openhands_async.yaml"
 
 grpo:
-  num_prompts_per_step: 2
-  num_generations_per_prompt: 4
-  max_num_steps: 2
-  val_period: 1000
-  val_at_start: true
-  val_at_end: true
   async_grpo:
     enabled: false
     max_trajectory_age_steps: 1
@@ -35,7 +29,6 @@ checkpointing:
   checkpoint_must_save_by: null
 
 policy:
-  max_total_sequence_length: 98304
   generation:
     colocated:
       enabled: true
@@ -44,7 +37,6 @@ policy:
         num_nodes: null
 
 logger:
-  tensorboard_enabled: false
   wandb:
     name: "grpo-qwen3-235b-swe-openhands-sync"
 
