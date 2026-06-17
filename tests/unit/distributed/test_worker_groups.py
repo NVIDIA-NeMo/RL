@@ -1151,7 +1151,7 @@ def test_get_nsight_config_extra_options():
         assert "nsight" in result
         nsight = result["nsight"]
         # Defaults still present
-        assert nsight["t"] == "cuda,cudnn,cublas,nvtx"
+        assert nsight["t"] == "cuda,nvtx"
         assert nsight["o"] == "'megatron_policy_worker_2:3_%p'"
         assert nsight["capture-range"] == "cudaProfilerApi"
         # User extras applied
@@ -1251,7 +1251,7 @@ def test_get_nsight_config_output_format():
         assert "env_vars" in combined_runtime_env
         assert "py_executable" in combined_runtime_env
         assert "nsight" in combined_runtime_env
-        assert combined_runtime_env["nsight"]["t"] == "cuda,cudnn,cublas,nvtx"
+        assert combined_runtime_env["nsight"]["t"] == "cuda,nvtx"
 
         # Test with no match
         no_match_config = get_nsight_config_if_pattern_matches("no_match_worker")
