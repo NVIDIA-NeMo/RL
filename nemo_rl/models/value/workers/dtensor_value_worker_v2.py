@@ -34,6 +34,7 @@ from transformers import (
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
 from nemo_rl.models.automodel.data import (
     check_sequence_dim,
     get_microbatch_iterator,
@@ -63,11 +64,6 @@ from nemo_rl.models.value.temporal_shift import (
     RightShiftLossWrapper,
     right_shift_values,
 )
-
-# NOTE(ppo-dtensor port): bg51717/ppo originally imported AutomodelCheckpointManager
-# from nemo_rl.utils.automodel_checkpoint, but in this fork the module lives at
-# nemo_rl.models.automodel.checkpoint. Re-pointed to match.
-from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
