@@ -252,25 +252,24 @@ class TestValidateAndPrepareConfig:
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
     @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
-    def test_context_parallel_with_sequence_packing_raises_error(
+    def test_context_parallel_with_sequence_packing_accepted(
         self,
         mock_dynamo,
         mock_resolve_class,
         mock_autoconfig_class,
         mock_config,
     ):
-        """Test that CP with sequence packing raises ValueError."""
+        """Test that CP with sequence packing is accepted (supported via TE THD)."""
         mock_config["sequence_packing"]["enabled"] = True
         mock_config["dtensor_cfg"]["context_parallel_size"] = 2
 
-        with pytest.raises(
-            ValueError, match="Context parallel is not supported for sequence packing"
-        ):
-            validate_and_prepare_config(
-                config=mock_config,
-                processor=None,
-                rank=0,
-            )
+        # Should not raise — CP+seqpack is supported via TE's THD dual-chunk-swap
+        result = validate_and_prepare_config(
+            config=mock_config,
+            processor=None,
+            rank=0,
+        )
+        assert result.enable_seq_packing is True
 
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
@@ -554,7 +553,6 @@ class TestValidateAndPrepareConfig:
 
         captured = capsys.readouterr()
         assert "[Rank 0] Sequence packing is enabled for model gpt2" in captured.out
-        assert "[Rank 0] Using FlashAttention2 for sequence packing" in captured.out
         assert result.enable_seq_packing is True
 
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
@@ -617,17 +615,16 @@ class TestSetupReferenceModelState:
         self, mock_get_cpu_state_dict
     ):
         """Test that setup_reference_model_state calls get_cpu_state_dict correctly."""
-        mock_model = MagicMock()
-        mock_state_dict = {
+        # Use spec=torch.nn.Module so ModelHandle doesn't detect it as PP
+        mock_model = MagicMock(spec=torch.nn.Module)
+        mock_model.state_dict.return_value = {
             "weight1": torch.tensor([1.0]),
             "weight2": torch.tensor([2.0]),
         }
-        mock_model.state_dict.return_value = mock_state_dict
         mock_get_cpu_state_dict.return_value = {"weight1": torch.tensor([1.0])}
 
         result = setup_reference_model_state(mock_model)
 
-        mock_model.state_dict.assert_called_once()
         mock_get_cpu_state_dict.assert_called_once()
         # Verify pin_memory=True was passed
         call_kwargs = mock_get_cpu_state_dict.call_args[1]
@@ -637,7 +634,7 @@ class TestSetupReferenceModelState:
     @patch("nemo_rl.models.automodel.setup.get_cpu_state_dict")
     def test_setup_reference_model_state_returns_dict(self, mock_get_cpu_state_dict):
         """Test that setup_reference_model_state returns a dictionary."""
-        mock_model = MagicMock()
+        mock_model = MagicMock(spec=torch.nn.Module)
         mock_model.state_dict.return_value = {}
         expected_result = {"param": torch.zeros(10)}
         mock_get_cpu_state_dict.return_value = expected_result
@@ -898,6 +895,8 @@ class TestSetupModelAndOptimizer:
             dp_size=1,
             tp_size=1,
             cp_size=1,
+            pp_size=1,
+            pp_mesh=None,
         )
 
     @pytest.fixture
@@ -1215,8 +1214,8 @@ class TestSetupModelAndOptimizer:
             init_optimizer=False,
         )
 
-        assert result.optimizer is None
-        assert result.scheduler is None
+        assert result.optimizers is None
+        assert result.schedulers is None
 
     @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
@@ -1347,7 +1346,7 @@ class TestSetupModelAndOptimizer:
             checkpoint_manager=mock_checkpoint_manager,
         )
 
-        assert result.scheduler is not None
+        assert result.schedulers is not None
 
     @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.SequentialLR")
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
@@ -1368,6 +1367,9 @@ class TestSetupModelAndOptimizer:
         mock_sequential_lr.return_value = MagicMock()
 
         mock_model = MagicMock()
+        # One model part so ModelHandle yields a single optimizer/scheduler
+        # (setup builds optimizers/schedulers per model part).
+        mock_model.parts = [mock_model]
         mock_model.state_dict.return_value = {}
         mock_model.config = MagicMock()
         mock_model.config.pad_token_id = 0
@@ -1401,7 +1403,7 @@ class TestSetupModelAndOptimizer:
             checkpoint_manager=mock_checkpoint_manager,
         )
 
-        assert result.scheduler is not None
+        assert result.schedulers is not None
         mock_sequential_lr.assert_called_once()
 
     @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
@@ -1423,6 +1425,8 @@ class TestSetupModelAndOptimizer:
         mock_lambda_lr.return_value = MagicMock()
 
         mock_model = MagicMock()
+        # One model part so the per-part pad_token_id loop runs on mock_model.
+        mock_model.parts = [mock_model]
         mock_model.state_dict.return_value = {}
         mock_model.config = MagicMock()
         mock_model.config.pad_token_id = None  # Initially None
@@ -1462,6 +1466,8 @@ class TestSetupModelAndOptimizer:
         mock_lambda_lr.return_value = MagicMock()
 
         mock_model = MagicMock()
+        # One model part so ModelHandle.state_dict_keys() sees the keys below.
+        mock_model.parts = [mock_model]
         # Include "expert" in state dict keys to trigger MoE detection
         mock_model.state_dict.return_value = {
             "layer.expert.weight": torch.zeros(10),
@@ -1508,6 +1514,8 @@ class TestSetupModelAndOptimizer:
             dp_size=1,
             tp_size=1,
             cp_size=2,  # CP enabled
+            pp_size=1,
+            pp_mesh=None,
         )
 
         mock_model = MagicMock()
@@ -1552,6 +1560,8 @@ class TestSetupModelAndOptimizer:
             dp_size=1,
             tp_size=2,  # TP enabled
             cp_size=2,  # CP enabled
+            pp_size=1,
+            pp_mesh=None,
         )
 
         mock_model = MagicMock()
@@ -1596,6 +1606,8 @@ class TestSetupModelAndOptimizer:
             dp_size=1,
             tp_size=1,
             cp_size=2,  # CP enabled
+            pp_size=1,
+            pp_mesh=None,
         )
 
         # Set model_type to gemma3 to trigger validation
@@ -1839,10 +1851,10 @@ class TestSetupModelAndOptimizer:
         )
 
         mock_buffer = MagicMock()
-        mock_buffer.data = MagicMock()
-        mock_buffer.data.to.return_value = mock_buffer.data
 
         mock_model = MagicMock()
+        # One model part so ModelHandle.move_buffers_to / to() operate on it.
+        mock_model.parts = [mock_model]
         mock_model.state_dict.return_value = {}
         mock_model.config = MagicMock()
         mock_model.config.pad_token_id = 0
@@ -1853,17 +1865,20 @@ class TestSetupModelAndOptimizer:
         mock_optimizer = MagicMock()
         mock_get_class.return_value = MagicMock(return_value=mock_optimizer)
 
-        setup_model_and_optimizer(
-            config=mock_config,
-            tokenizer=mock_tokenizer,
-            runtime_config=runtime_config,
-            distributed_context=mock_distributed_context,
-            checkpoint_manager=mock_checkpoint_manager,
-        )
+        # ModelHandle.move_buffers_to uses torch.utils.swap_tensors with real
+        # tensors; patch it so the MagicMock buffer can flow through.
+        with patch("nemo_rl.models.automodel.model_handle.torch.utils.swap_tensors"):
+            setup_model_and_optimizer(
+                config=mock_config,
+                tokenizer=mock_tokenizer,
+                runtime_config=runtime_config,
+                distributed_context=mock_distributed_context,
+                checkpoint_manager=mock_checkpoint_manager,
+            )
 
-        # Verify buffers were moved to CPU
-        mock_buffer.data.to.assert_called_with("cpu")
-        # Verify model was moved to CPU
+        # Verify buffers were moved to CPU (ModelHandle calls v.to(device))
+        mock_buffer.to.assert_called_with("cpu")
+        # Verify model part was moved to CPU
         mock_model.to.assert_called_with("cpu")
 
 
