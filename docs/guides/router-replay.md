@@ -96,7 +96,7 @@ The main metrics to inspect are:
 - `train/token_mult_prob_error`
 - `train/js_divergence_error`
 
-Validation report: <https://api.wandb.ai/links/nvidia-nemo-fw-public/9jgg5vrf>
+Validation report: <https://api.wandb.ai/links/nvidia-nemo-fw-public/lxoovk60>
 
 ## Other Notes
 

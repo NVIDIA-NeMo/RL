@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from functools import partial
+
 from nemo_rl.data import ResponseDatasetConfig
-from nemo_rl.data.datasets.response_datasets.aime24 import AIME2024Dataset
+from nemo_rl.data.datasets.response_datasets.aime import AIMEDataset
 from nemo_rl.data.datasets.response_datasets.arrow_text_dataset import ArrowTextDataset
 from nemo_rl.data.datasets.response_datasets.audiomcq import AudioMCQDataset
 from nemo_rl.data.datasets.response_datasets.avqa import AVQADataset
@@ -53,7 +55,9 @@ DATASET_REGISTRY = {
     "audiomcq": AudioMCQDataset,
     "arrow_text": ArrowTextDataset,
     "avqa": AVQADataset,
-    "AIME2024": AIME2024Dataset,
+    "AIME2024": partial(AIMEDataset, variant="2024"),
+    "AIME2025": partial(AIMEDataset, variant="2025"),
+    "AIME2026": partial(AIMEDataset, variant="2026"),
     "clevr-cogent": CLEVRCoGenTDataset,
     "daily-omni": DailyOmniDataset,
     "general-conversation-jsonl": GeneralConversationsJsonlDataset,
@@ -123,7 +127,7 @@ __all__ = [
     "AudioMCQDataset",
     "ArrowTextDataset",
     "AVQADataset",
-    "AIME2024Dataset",
+    "AIMEDataset",
     "CLEVRCoGenTDataset",
     "DailyOmniDataset",
     "GeneralConversationsJsonlDataset",

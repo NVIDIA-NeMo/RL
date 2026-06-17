@@ -173,6 +173,47 @@ class _EagleModelLayout:
         return {layer.layer_index: layer for layer in self.layers}
 
 
+def _qkv_head_dims(config: TransformerConfig) -> tuple[int, int, int]:
+    """Return ``(num_attention_heads, num_query_groups, head_dim)`` for the qkv weight."""
+    nh = int(config.num_attention_heads)
+    ng = int(getattr(config, "num_query_groups", None) or nh)
+    hd = int(getattr(config, "kv_channels", None) or int(config.hidden_size) // nh)
+    return nh, ng, hd
+
+
+def _interleave_qkv(
+    q: Tensor, k: Tensor, v: Tensor, config: TransformerConfig
+) -> Tensor:
+    """Reorder HF ``[all_q; all_k; all_v]`` into Megatron's interleaved qkv layout.
+
+    Megatron's ``SelfAttention`` reads ``linear_qkv`` per query group as
+    ``[g0: q.. k v | g1: q.. k v | ...]`` (shape ``[num_query_groups,
+    (heads_per_group + 2) * head_dim, in]``), so a naive ``cat([q, k, v])`` is
+    silently mis-read for GQA (``num_query_groups < num_attention_heads``).
+    """
+    nh, ng, hd = _qkv_head_dims(config)
+    r = nh // ng
+    fused = torch.cat(
+        [q.reshape(ng, r * hd, -1), k.reshape(ng, hd, -1), v.reshape(ng, hd, -1)],
+        dim=1,
+    )
+    return fused.reshape(-1, q.shape[1]).contiguous()
+
+
+def _deinterleave_qkv(
+    fused: Tensor, config: TransformerConfig
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Inverse of :func:`_interleave_qkv`: recover HF ``(q, k, v)`` projections."""
+    nh, ng, hd = _qkv_head_dims(config)
+    r = nh // ng
+    g = fused.reshape(ng, (r + 2) * hd, -1)
+    return (
+        g[:, : r * hd].reshape(nh * hd, -1).contiguous(),
+        g[:, r * hd : (r + 1) * hd].reshape(ng * hd, -1).contiguous(),
+        g[:, (r + 1) * hd :].reshape(ng * hd, -1).contiguous(),
+    )
+
+
 def _combine_or_shard_weight_parts(
     *,
     parameter_name: str,
@@ -253,17 +294,27 @@ class _PendingLayerWeights:
         layer: _EagleLayerLayout,
         model_state: Mapping[str, Tensor],
         tp_rank: int,
+        config: TransformerConfig,
     ) -> None:
-        qkv_weight = _combine_or_shard_weight_parts(
-            parameter_name=layer.qkv_weight_key,
-            fused_weight=self.qkv_weight,
-            component_weights=(self.q_weight, self.k_weight, self.v_weight),
-            target=model_state.get(layer.qkv_weight_key),
-            tp_rank=tp_rank,
-            incomplete_error=(
+        if self.qkv_weight is not None:
+            # Pre-fused checkpoint qkv is assumed to already be Megatron-interleaved.
+            qkv_weight: Tensor | None = self.qkv_weight
+        elif (
+            self.q_weight is not None
+            and self.k_weight is not None
+            and self.v_weight is not None
+        ):
+            # Separate HF q/k/v are head-major; reorder to Megatron's interleaved
+            # layout (_shard_to_local_tp applies the dim-0 TP chunk afterwards).
+            qkv_weight = _interleave_qkv(
+                self.q_weight, self.k_weight, self.v_weight, config
+            )
+        elif self.q_weight is None and self.k_weight is None and self.v_weight is None:
+            qkv_weight = None
+        else:
+            raise RuntimeError(
                 "[draft] Incomplete QKV tensors. Expected q_proj, k_proj, and v_proj."
-            ),
-        )
+            )
         if qkv_weight is not None:
             mapped_state[layer.qkv_weight_key] = qkv_weight
 
@@ -310,38 +361,22 @@ def _all_gather_tp_shards(local_weight: Tensor) -> list[Tensor]:
 
 def _gather_tp_qkv_weight(
     local_fused_weight: Tensor,
-    q_dim: int,
-    kv_dim: int,
+    config: TransformerConfig,
 ) -> tuple[Tensor, Tensor, Tensor]:
+    """Gather TP shards of the Megatron fused qkv weight and split into HF q/k/v.
+
+    Each TP rank owns a contiguous, group-aligned dim-0 chunk, so all-gathering
+    and concatenating in rank order reconstructs the full interleaved weight,
+    which is de-interleaved back into HF ``(q, k, v)`` (inverse of the load-time
+    :func:`_interleave_qkv`).
+    """
     shards = _all_gather_tp_shards(local_fused_weight)
-    if len(shards) == 1 and local_fused_weight.shape[0] == q_dim + 2 * kv_dim:
-        return local_fused_weight.split([q_dim, kv_dim, kv_dim], dim=0)
-
-    tp_world_size = len(shards)
-    if q_dim % tp_world_size != 0 or kv_dim % tp_world_size != 0:
-        raise RuntimeError(
-            "QKV dimensions are not divisible by the tensor-parallel world size."
-        )
-
-    q_shards = []
-    k_shards = []
-    v_shards = []
-    local_q_dim = q_dim // tp_world_size
-    local_kv_dim = kv_dim // tp_world_size
-    for shard in shards:
-        q_local, k_local, v_local = shard.split(
-            [local_q_dim, local_kv_dim, local_kv_dim],
-            dim=0,
-        )
-        q_shards.append(q_local)
-        k_shards.append(k_local)
-        v_shards.append(v_local)
-
-    return (
-        torch.cat(q_shards, dim=0).contiguous(),
-        torch.cat(k_shards, dim=0).contiguous(),
-        torch.cat(v_shards, dim=0).contiguous(),
+    full_fused = (
+        local_fused_weight
+        if len(shards) == 1
+        else torch.cat(shards, dim=0).contiguous()
     )
+    return _deinterleave_qkv(full_fused, config)
 
 
 def _gather_tp_gate_up_weight(
@@ -809,6 +844,7 @@ def _map_hf_state_to_eagle_state(
     model_state: Mapping[str, Tensor],
     layout: _EagleModelLayout,
     checkpoint_source: str,
+    config: TransformerConfig,
 ) -> StateDict:
     mapped_state: StateDict = {}
     pending_weights_by_layer = {
@@ -872,6 +908,7 @@ def _map_hf_state_to_eagle_state(
             layer,
             model_state=model_state,
             tp_rank=tp_rank,
+            config=config,
         )
 
     if not mapped_state:
@@ -911,6 +948,7 @@ def load_hf_weights_to_eagle(
         model_state=model_state,
         layout=layout,
         checkpoint_source=model_name,
+        config=unwrap_model(model).config,
     )
 
     return model.load_state_dict(new_state, strict=False)
@@ -955,8 +993,7 @@ def _export_layer_weights_to_hf(
     *,
     source_state: Mapping[str, Tensor],
     layer: _EagleLayerLayout,
-    q_dim: int,
-    kv_dim: int,
+    config: TransformerConfig,
     hidden_size: int,
     ffn_hidden_size: int,
 ) -> list[tuple[str, Tensor]]:
@@ -981,8 +1018,7 @@ def _export_layer_weights_to_hf(
 
     q_proj, k_proj, v_proj = _gather_tp_qkv_weight(
         _require_state_tensor(source_state, layer.qkv_weight_key),
-        q_dim=q_dim,
-        kv_dim=kv_dim,
+        config=config,
     )
     hf_state.append((f"{layer_prefix}.self_attn.q_proj.weight", q_proj))
     hf_state.append((f"{layer_prefix}.self_attn.k_proj.weight", k_proj))
@@ -1029,8 +1065,6 @@ def export_eagle_weights_to_hf(
     config = unwrapped_model.config
     layout = _EagleModelLayout.detect(source_state)
 
-    q_dim = config.num_attention_heads * config.kv_channels
-    kv_dim = config.num_query_groups * config.kv_channels
     ffn_hidden_size = config.ffn_hidden_size
     num_aux_hidden_states = _get_num_aux_hidden_states(config)
 
@@ -1049,8 +1083,7 @@ def export_eagle_weights_to_hf(
             _export_layer_weights_to_hf(
                 source_state=source_state,
                 layer=layer,
-                q_dim=q_dim,
-                kv_dim=kv_dim,
+                config=config,
                 hidden_size=config.hidden_size,
                 ffn_hidden_size=ffn_hidden_size,
             )
