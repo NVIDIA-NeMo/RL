@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 import pytest
 import torch
