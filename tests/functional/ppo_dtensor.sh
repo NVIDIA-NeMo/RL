@@ -1,0 +1,58 @@
+#!/bin/bash
+
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
+PROJECT_ROOT=$(realpath $SCRIPT_DIR/../..)
+# Mark the current repo as safe, since wandb fetches metadata about the repo
+git config --global --add safe.directory $PROJECT_ROOT
+
+set -eou pipefail
+
+EXP_NAME=$(basename $0 .sh)
+EXP_DIR=$SCRIPT_DIR/$EXP_NAME
+LOG_DIR=$EXP_DIR/logs
+JSON_METRICS=$EXP_DIR/metrics.json
+RUN_LOG=$EXP_DIR/run.log
+export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
+
+rm -rf $EXP_DIR $LOG_DIR
+mkdir -p $EXP_DIR $LOG_DIR
+
+cd $PROJECT_ROOT
+uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
+    $PROJECT_ROOT/examples/run_ppo.py \
+    --config $PROJECT_ROOT/examples/configs/recipes/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-dtensor.yaml \
+    policy.model_name=Qwen/Qwen2.5-0.5B \
+    policy.tokenizer.name=Qwen/Qwen2.5-0.5B \
+    value.model_name=Qwen/Qwen2.5-0.5B \
+    value.tokenizer.name=Qwen/Qwen2.5-0.5B \
+    data.max_input_seq_length=128 \
+    ppo.num_prompts_per_step=2 \
+    ppo.num_generations_per_prompt=4 \
+    ppo.ppo_epochs=1 \
+    policy.train_global_batch_size=4 \
+    policy.logprob_batch_size=1 \
+    policy.train_micro_batch_size=1 \
+    policy.max_total_sequence_length=256 \
+    policy.generation.max_new_tokens=128 \
+    policy.generation.vllm_cfg.max_model_len=256 \
+    value.train_global_batch_size=4 \
+    value.train_micro_batch_size=1 \
+    value.max_total_sequence_length=256 \
+    cluster.gpus_per_node=2 \
+    ppo.max_num_steps=2 \
+    logger.tensorboard_enabled=true \
+    logger.log_dir=$LOG_DIR \
+    logger.wandb_enabled=false \
+    logger.monitor_gpus=true \
+    checkpointing.enabled=false \
+    $@ \
+    2>&1 | tee $RUN_LOG
+
+uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
+
+uv run tests/check_metrics.py $JSON_METRICS \
+    'max(data["train/token_mult_prob_error"]) < 1.05' \
+    'min(data["train/probs_ratio_clamped_min"]) > 0.0' \
+    'max(data["train/probs_ratio_clamped_max"]) < 10.0' \
+    'min(data["train/critic/loss"]) >= 0' \
+    'max(data["train/critic/explained_var"]) <= 1.0001'

@@ -1,0 +1,45 @@
+#!/bin/bash
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
+source $SCRIPT_DIR/common.env
+
+# ===== BEGIN CONFIG =====
+NUM_NODES=1
+STEPS_PER_RUN=40
+MAX_STEPS=40
+NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
+NUM_MINUTES=90
+# ===== END CONFIG =====
+
+exit_if_max_steps_reached
+
+# Run the experiment
+cd $PROJECT_ROOT
+uv run examples/run_ppo.py \
+    --config $CONFIG_PATH \
+    ppo.max_num_steps=$MAX_STEPS \
+    policy.train_micro_batch_size=4 \
+    policy.logprob_batch_size=4 \
+    value.train_micro_batch_size=4 \
+    logger.log_dir=$LOG_DIR \
+    logger.wandb_enabled=True \
+    logger.wandb.project=nemo-rl \
+    logger.wandb.name=$EXP_NAME \
+    logger.monitor_gpus=True \
+    logger.tensorboard_enabled=True \
+    checkpointing.enabled=True \
+    checkpointing.checkpoint_dir=$CKPT_DIR \
+    $@ \
+    2>&1 | tee $RUN_LOG
+
+# Convert tensorboard logs to json
+uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
+
+# Only run metrics if the target step is reached
+if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
+    uv run tests/check_metrics.py $JSON_METRICS \
+        'data["train/reward"]["40"] > 0.75' \
+        'data["validation/accuracy"]["40"] > 0.65'
+
+    # Clean up checkpoint directory after successful run to save space.
+    rm -rf "$CKPT_DIR"
+fi
