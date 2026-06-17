@@ -52,12 +52,18 @@ from nemo_rl.models.automodel.train import (
     forward_with_post_processing_fn,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
+
 # NOTE(ppo-dtensor port): apply_torch_aten_alias_tensor_patch isn't exported
 # from policy.workers.patches in this fork; the corresponding policy worker
 # (dtensor_policy_worker_v2.py) also omits this call, so drop the import + call.
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.interfaces import ValueOutputSpec
+from nemo_rl.models.value.temporal_shift import (
+    RightShiftLossWrapper,
+    right_shift_values,
+)
+
 # NOTE(ppo-dtensor port): bg51717/ppo originally imported AutomodelCheckpointManager
 # from nemo_rl.utils.automodel_checkpoint, but in this fork the module lives at
 # nemo_rl.models.automodel.checkpoint. Re-pointed to match.
@@ -101,75 +107,6 @@ def get_runtime_env_for_value_worker(worker_type: str) -> dict:
 
     # Reuse policy worker runtime env
     return get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
-
-
-
-
-# ---------------------------------------------------------------------------
-# Right-shift helpers (megatron parity).
-#
-# The HF AutoModelForTokenClassification score head produces values where
-# `values[t]` predicts V(state AFTER token t), i.e. V(s_{t+1}). The PPO
-# algorithm (compute_advantages, MseValueLossFn, value clipping) and the
-# megatron value worker both expect `values[t] = V(s_t)`, so without a fix
-# the GAE math is off by one across the entire trajectory and the policy
-# learns from a systematically biased advantage signal.
-#
-# Megatron's value worker fixes this with an explicit right-shift in both
-# train() and get_values() (see megatron_value_worker.py:210-213 train path
-# and :892-895 inference path). We mirror that convention here so DTensor
-# and Megatron backends are A/B comparable.
-#
-# In train(), values are produced inside automodel_forward_backward (via
-# the HF score head) and reach us only through LossPostProcessor. Wrapping
-# loss_fn with _RightShiftLossWrapper lets us shift values right before
-# they enter the loss without touching the upstream automodel_forward_backward
-# plumbing or modifying MseValueLossFn.
-#
-# In get_values(), the inference path returns `values` directly, so a single
-# call to _right_shift_values() after the forward is enough.
-# ---------------------------------------------------------------------------
-
-
-def _right_shift_values(values: torch.Tensor) -> torch.Tensor:
-    """Shift values right by 1 along the sequence dim (V(s_{t+1}) -> V(s_t)).
-
-    Aligns with megatron_value_worker's right-shift convention so GAE
-    (rewards, returns) / value-targets / value clipping see the same
-    V(s_t) semantics across DTensor and Megatron backends. Preserves the
-    input tensor shape: the first column becomes zeros and column t (t>=1)
-    takes the value from column t-1.
-    """
-    return torch.cat([torch.zeros_like(values[:, :1]), values[:, :-1]], dim=1)
-
-
-class _RightShiftLossWrapper:
-    """Wrap a LossFunction so its `logits` (value) input is right-shifted
-    before the inner loss is computed.
-
-    This is the train()-side companion to _right_shift_values; together they
-    give the DTensor value worker the same V(s_t) semantics as the megatron
-    value worker without modifying MseValueLossFn or LossPostProcessor.
-    All other attribute accesses delegate to the wrapped loss function so
-    LossPostProcessor's protocol checks (input_type, aggregation_type, ...)
-    still see the right answers.
-    """
-
-    def __init__(self, inner: LossFunction):
-        self._inner = inner
-
-    def __call__(self, *args, logits=None, **kwargs):
-        if logits is not None:
-            logits = _right_shift_values(logits)
-            return self._inner(*args, logits=logits, **kwargs)
-        return self._inner(*args, **kwargs)
-
-    def __getattr__(self, name):
-        # __getattr__ is only called when normal attribute lookup fails, so
-        # _inner itself is still found through __dict__. Everything else
-        # (input_type, aggregation_type, etc.) delegates to the wrapped
-        # loss function.
-        return getattr(self._inner, name)
 
 
 @ray.remote(
@@ -362,10 +299,10 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
             self.model.train()
 
         # Create loss post-processor.
-        # _RightShiftLossWrapper aligns the value head's temporal semantics
+        # RightShiftLossWrapper aligns the value head's temporal semantics
         # with the megatron value worker (V[t]=V(s_t) instead of V(s_{t+1}))
         # so GAE / MseValueLossFn / value clipping are self-consistent.
-        wrapped_loss_fn = _RightShiftLossWrapper(loss_fn)
+        wrapped_loss_fn = RightShiftLossWrapper(loss_fn)
         loss_post_processor = LossPostProcessor(
             loss_fn=wrapped_loss_fn,
             cfg=self.cfg,
@@ -571,7 +508,7 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
                     )
                     # Mirror train()'s right-shift so GAE / value clipping /
                     # value targets all see V(s_t) semantics (megatron parity).
-                    values = _right_shift_values(values)
+                    values = right_shift_values(values)
 
                 # Skip dummy batches
                 if batch_idx >= iterator_len:

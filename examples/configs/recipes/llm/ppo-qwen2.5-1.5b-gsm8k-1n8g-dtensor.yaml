@@ -1,26 +1,10 @@
-# PPO Qwen2.5-1.5B on GSM8K — 1 node × 8 GPU, DTensor backend.
-#
-# DTensor twin of bg51717's `ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron.yaml` recipe.
-# Inherits the SAME base (`ppo_math_1B_megatron.yaml`) and flips the backend
-# for both policy and value workers to DTensor V2. Same scope as upstream
-# (1n8g) — sanity-check recipe, not full-scale.
-#
-# Enabled by the `ppo-dtensor` branch's port of Nemo-RL-ppo (PR #2027)'s
-# value-worker dispatch into `lm_value.py`. See the README in
-# `Nemo-RL-PPO-GuoBin/PPO/` for the migration story.
 defaults: ../../ppo_math_1B_megatron.yaml
-
 ppo:
   num_prompts_per_step: 1024
   num_generations_per_prompt: 1
   ppo_epochs: 1
   steps_per_epoch: 1
   max_num_epochs: 15
-  # bg51717's reference .sh injects `ppo.max_num_steps=100` from the CLI and
-  # its check_metrics asserts metrics at step 100, so we set 100 here too.
-  # With num_prompts_per_step=1024 and GSM8K train=7473 samples → ~7
-  # batches/epoch, so 100 steps ≈ 14 epochs; max_num_epochs=15 leaves a small
-  # safety margin.
   max_num_steps: 100
   val_period: 1
   overlong_filtering: true
@@ -31,131 +15,81 @@ ppo:
   adv_estimator:
     gae_lambda_policy: 1
     gae_lambda_value: 1.0
-
 loss_fn:
   ratio_clip_max: 0.2
   ratio_clip_c: 3
-
 value_loss_fn:
   scale: 1.0
   cliprange: 0.5
-
 checkpointing:
   checkpoint_dir: results/ppo-qwen2.5-1.5b-gsm8k-1n8g-dtensor
-
 policy:
   model_name: Qwen/Qwen2.5-1.5B-Instruct
   tokenizer:
     name: Qwen/Qwen2.5-1.5B-Instruct
   train_global_batch_size: 256
-  # DTensor expects per-GPU micro batches; 1.5B at seq=1024 on 8 GPUs is
-  # comfortable at mbs=1 (matches Nemo-RL-ppo's DTensor twin).
   train_micro_batch_size: 1
   logprob_batch_size: 1
   max_total_sequence_length: 1024
-  # Override the base's megatron-TP reference; under DTensor we divide by
-  # the DTensor TP. TP=1 means divisible by 1 (trivial).
   make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
-
-  # Flip the backend: DTensor V2 ON, Megatron OFF.
   dtensor_cfg:
-    _v2: true
     enabled: true
-    cpu_offload: false
-    sequence_parallel: false
-    activation_checkpointing: false
-    tensor_parallel_size: 1
-    context_parallel_size: 1
-    custom_parallel_plan: null
-
   megatron_cfg:
     enabled: false
-
-  # DTensor-side optimizer / scheduler — the base config has these as null
-  # (it's Megatron-only), so we populate them here. Schema is consumed by
-  # nemo_rl/models/automodel/setup.py via config["optimizer"]["name"] +
-  # config["optimizer"]["kwargs"].
   optimizer:
-    name: "torch.optim.AdamW"
+    name: torch.optim.AdamW
     kwargs:
-      # Mirrors megatron `policy.megatron_cfg.optimizer.lr` (inherited from base
-      # ppo_math_1B_megatron.yaml:153 == 1.0e-6). A previous draft of this file
-      # had `lr: 5.0e-7` (half of megatron's effective LR); training was
-      # numerically stable but the reward curve trended ~2x slower than the
-      # megatron A/B twin — classic "policy LR too small" signature. See
-      # PORT_NOTES C4. Upstream Nemo-RL-ppo/RL/examples/configs/recipes/llm/
-      # ppo-qwen2.5-1.5b-gsm8k-1n8g-dtensor.yaml also leaves this at 1e-6
-      # (inherited from ppo_math_1B.yaml:215).
-      lr: 1.0e-6
+      lr: 1.0e-06
       weight_decay: 0.01
-      betas: [0.9, 0.999]
-      eps: 1.0e-8
-      # DTensor requires foreach=False and fused=False
+      betas:
+      - 0.9
+      - 0.999
+      eps: 1.0e-08
       foreach: false
       fused: false
-
   scheduler:
-    - name: "torch.optim.lr_scheduler.ConstantLR"
-      kwargs:
-        factor: 1.0
-        total_iters: 10000000000
-    - milestones: []
-
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones: []
   generation:
     max_new_tokens: 512
     vllm_cfg:
       max_model_len: 1024
       gpu_memory_utilization: 0.4
-
 value:
   model_name: Qwen/Qwen2.5-1.5B-Instruct
   tokenizer:
     name: Qwen/Qwen2.5-1.5B-Instruct
-  # Same divisibility override on the value side.
   make_sequence_length_divisible_by: ${value.dtensor_cfg.tensor_parallel_size}
-
-  # The DTensorValueWorkerV2 constructor coerces this to enabled=true,
-  # regression internally, but we set it explicitly so the config is
-  # self-documenting and round-trips losslessly through pydantic.
   reward_model_cfg:
     enabled: true
-    reward_model_type: regression
     only_head_unfreeze: false
-
   dtensor_cfg:
-    _v2: true
     enabled: true
-    cpu_offload: false
-    sequence_parallel: false
-    activation_checkpointing: false
-    tensor_parallel_size: 1
-    context_parallel_size: 1
-    custom_parallel_plan: null
-
   megatron_cfg:
     enabled: false
-
   optimizer:
-    name: "torch.optim.AdamW"
+    name: torch.optim.AdamW
     kwargs:
-      lr: 1.0e-5
+      lr: 1.0e-05
       weight_decay: 0.01
-      betas: [0.9, 0.999]
-      eps: 1.0e-8
+      betas:
+      - 0.9
+      - 0.999
+      eps: 1.0e-08
       foreach: false
       fused: false
-
   scheduler:
-    - name: "torch.optim.lr_scheduler.ConstantLR"
-      kwargs:
-        factor: 1.0
-        total_iters: 10000000000
-    - milestones: []
-
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones: []
 env:
   math:
     math_verify_impl: hf_math_verify
-
 data:
   max_input_seq_length: 512
   train:
@@ -166,23 +100,13 @@ data:
     split: test
   default:
     system_prompt_file: examples/prompts/gsm8k.txt
-
 logger:
   log_dir: logs/ppo-qwen2.5-1.5b-gsm8k-1n8g-dtensor
   wandb_enabled: true
   wandb:
-    # Project / run names kept free of any personal names; isolated from the
-    # sibling Nemo-RL-ppo (PR #2027) worktree so runs don't collide in the
-    # wandb UI. Override via `logger.wandb.project=...` CLI or the
-    # WANDB_PROJECT env in run_ppo_inside_container.sh.
     project: nemo-rl-ppo-port-v1
     name: ppo-qwen2.5-1.5b-gsm8k-1n8g-dtensor-port
-    # stable id (no dots — wandb id only allows [A-Za-z0-9_-]) so every Slurm
-    # resubmit `wandb.init()` resumes the SAME run instead of creating a new
-    # one. `resume: allow` = resume if exists, create if not.
     id: ppo-qwen2_5-1p5b-gsm8k-1n8g-dtensor-port
     resume: allow
-
 cluster:
   gpus_per_node: 8
-  num_nodes: 1
