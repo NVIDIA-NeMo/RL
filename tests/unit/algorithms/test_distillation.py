@@ -341,6 +341,14 @@ def test_exit_on_timeout(mock_components, capsys):
 
 def test_validate_function(mock_components):
     """Test independent validation function to ensure validation logic correctness."""
+    logged_data = {}
+
+    def capture_log(data, filename):
+        logged_data["data"] = data
+        logged_data["filename"] = filename
+
+    mock_components["logger"].log_batched_dict_as_jsonl = MagicMock(side_effect=capture_log)
+
     # Run validation
     val_metrics, validation_timings = validate(
         mock_components["student_generation"],
@@ -349,14 +357,19 @@ def test_validate_function(mock_components):
         mock_components["val_task_to_env"],
         step=0,
         master_config=mock_components["master_config"],
+        logger=mock_components["logger"],
     )
 
     # Verify validation results
     assert isinstance(val_metrics, dict)
     assert isinstance(validation_timings, dict)
+    mock_components["logger"].log_batched_dict_as_jsonl.assert_called_once()
+    assert logged_data["filename"] == "val_data_step0.jsonl"
+    assert "content" in logged_data["data"]
+    assert "rewards" in logged_data["data"]
     # For distillation, we don't need environment interaction since max_rollout_turns=0
     # The validation focuses on generation and teacher-student knowledge transfer
-    # Note: validate() function itself doesn't call logger.log_metrics - that's done by the caller
+    # Note: validate() still doesn't call logger.log_metrics - that's done by the caller
 
 
 def test_validate_uses_nemo_gym_rollout_when_enabled(mock_components):
