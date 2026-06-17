@@ -15,20 +15,20 @@
 set -euo pipefail
 
 # =============================================================================
-# launch_mopd_nanov3_3n8g_smoke.sh
+# launch_mopd_nanov3_3n8g.sh
 #
-# MOPD smoke check on H100: 3 nodes x 8 GPUs (24 GPUs total).
+# Multi-Teacher On-Policy Distillation (MOPD) on H100: 3 nodes x 8 GPUs (24 GPUs total).
 # Non-colocated layout (yaml-defined):
 #   * 1 policy training node  (TP=2 PP=1 CP=1 EP=2 -> DP=4)
 #   * 1 vLLM generation node  (TP=4 -> 2 replicas)
 #   * 1 non-colocated teacher (TP=2 PP=1 CP=1 EP=2 -> DP=4)
 #
-# Static config: examples/nemo_gym/mopd_nanov3_3n8g_smoke.yaml
+# Static config: examples/nemo_gym/mopd_nanov3_3n8g.yaml
 #
 # Defaults to teacher == student (both = public Nano v3 30B-A3B BF16) so the
 # OPD loss should land at ~0 within a couple of steps. Override to run the real
 # distillation:
-#   NRL_MODEL_PATH=<base-model-path> ./launch_mopd_nanov3_3n8g_smoke.sh
+#   NRL_MODEL_PATH=<base-model-path> ./launch_mopd_nanov3_3n8g.sh
 #
 # (NRL_TEACHER_MODEL_PATH defaults to NRL_MODEL_PATH; override separately
 # only when student != teacher.)
@@ -38,13 +38,13 @@ set -euo pipefail
 # pre-built mcore-conversion cache, otherwise the container defaults apply.
 #
 # Usage:
-#   ./launch_mopd_nanov3_3n8g_smoke.sh                              # batch SLURM
-#   NRL_MAX_STEPS=2 ./launch_mopd_nanov3_3n8g_smoke.sh              # even shorter
-#   USE_WORKTREE=1 ./launch_mopd_nanov3_3n8g_smoke.sh               # overlay local code
+#   ./launch_mopd_nanov3_3n8g.sh                              # batch SLURM
+#   NRL_MAX_STEPS=2 ./launch_mopd_nanov3_3n8g.sh              # even shorter
+#   USE_WORKTREE=1 ./launch_mopd_nanov3_3n8g.sh               # overlay local code
 #
 # Interactive debugging (reuse allocation across runs):
-#   INTERACTIVE=1 ./launch_mopd_nanov3_3n8g_smoke.sh
-#   INTERACTIVE=1 INTERACTIVE_WAIT=0 ./launch_mopd_nanov3_3n8g_smoke.sh
+#   INTERACTIVE=1 ./launch_mopd_nanov3_3n8g.sh
+#   INTERACTIVE=1 INTERACTIVE_WAIT=0 ./launch_mopd_nanov3_3n8g.sh
 # =============================================================================
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
@@ -96,8 +96,8 @@ NUM_VLLM_NODES="${NUM_VLLM_NODES:-1}"
 NUM_TOTAL_NODES="${NUM_TOTAL_NODES:-$((NUM_POLICY_NODES + NUM_TEACHER_NODES + NUM_VLLM_NODES))}"
 
 # ---------- W&B ----------
-WANDB_PROJ="${WANDB_PROJ:-mopd-smoke}"
-WANDB_NAME="${WANDB_NAME:-mopd-nanov3-${NUM_TOTAL_NODES}n${GPUS_PER_NODE}g-smoke-$(date +%Y%m%d-%H%M%S)}"
+WANDB_PROJ="${WANDB_PROJ:-mopd}"
+WANDB_NAME="${WANDB_NAME:-mopd-nanov3-${NUM_TOTAL_NODES}n${GPUS_PER_NODE}g-$(date +%Y%m%d-%H%M%S)}"
 export WANDB_API_KEY="${WANDB_API_KEY:-}"
 
 # ---------- Model and data paths ----------
@@ -108,9 +108,9 @@ NRL_TEACHER_MODEL_PATH="${NRL_TEACHER_MODEL_PATH:-${NRL_MODEL_PATH}}"
 # nemo_gym train + validation jsonl (environment-specific; set before running).
 NRL_TRAIN_PATH="${NRL_TRAIN_PATH:?set NRL_TRAIN_PATH to the nemo_gym train jsonl}"
 NRL_VAL_PATH="${NRL_VAL_PATH:?set NRL_VAL_PATH to the nemo_gym validation jsonl}"
-CONFIG_FILE="${CONFIG_FILE:-examples/nemo_gym/mopd_nanov3_3n8g_smoke.yaml}"
+CONFIG_FILE="${CONFIG_FILE:-examples/nemo_gym/mopd_nanov3_3n8g.yaml}"
 
-EXP_SUFFIX="${EXP_SUFFIX:-mopd-nanov3-3n8g-smoke}"
+EXP_SUFFIX="${EXP_SUFFIX:-mopd-nanov3-3n8g}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-results/${EXP_SUFFIX}}"
 mkdir -p "${CHECKPOINT_DIR}"
 CHECKPOINT_DIR="$(cd "${CHECKPOINT_DIR}" && pwd)"

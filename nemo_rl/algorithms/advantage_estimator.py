@@ -20,7 +20,7 @@ This module provides different advantage estimation strategies:
 - ReinforcePlusPlusAdvantageEstimator: Reinforce++ with optional baseline subtraction (minus_baseline) and KL penalty in reward
 - RawRewardAdvantageEstimator: Raw reward as advantage with optional batch normalization (no baseline, no value model)
 - GeneralizedAdvantageEstimator: Generalized Advantage Estimation (GAE) with temporal bootstrapping
-- OPDAdvantageEstimator: On-Policy Distillation (MOPD) token-level distillation advantages
+- OPDAdvantageEstimator: Multi-Teacher On-Policy Distillation (MOPD) token-level distillation advantages
 Reference papers:
 - ProRLv2: https://developer.nvidia.com/blog/scaling-llm-reinforcement-learning-with-prolonged-training-using-prorl-v2/
 - Reinforce++: https://arxiv.org/abs/2501.03262
@@ -512,7 +512,7 @@ class GeneralizedAdvantageEstimator:
 
 
 class OPDAdvantageEstimator:
-    """On-Policy Distillation advantage estimator (MOPD, arXiv:2601.02780).
+    """Multi-Teacher On-Policy Distillation (MOPD) advantage estimator (arXiv:2601.02780).
 
     Computes token-level distillation advantages:
         Â_MOPD,t = sg[log π_teacher - log π_student]

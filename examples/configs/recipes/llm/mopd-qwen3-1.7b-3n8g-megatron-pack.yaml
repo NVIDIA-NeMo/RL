@@ -1,23 +1,27 @@
-# MOPD smoke / nightly check on H100 (3 nodes x 8 GPUs).
+# Multi-Teacher On-Policy Distillation (MOPD) on 3 nodes x 8 GPUs.
+#
+# Dense Qwen3-1.7B self-distill: the teacher path equals the student path, so
+# the OPD distillation signal should be ~0 every step. This is a wiring/health
+# check for the gym-coupled MOPD pipeline, not a convergence run.
 #
 # Cluster shape (1 policy + 1 vLLM + 1 teacher = 3 nodes):
-#   * 1 policy node   (training,                 TP=2 PP=1 CP=1 EP=2 -> DP=4)
-#   * 1 vLLM node     (non-colocated generation, TP=4 -> 2 replicas)
-#   * 1 teacher node  (non-colocated logprobs,   TP=2 PP=1 CP=1 EP=2 -> DP=4)
+#   * 1 policy node   (training,                 TP=2 PP=1 CP=1 -> DP=4)
+#   * 1 vLLM node     (non-colocated generation, TP=2 -> 4 replicas)
+#   * 1 teacher node  (non-colocated logprobs,   TP=2 PP=1 CP=1 -> DP=4)
 #
-# Same model on student and teacher so the OPD loss should be ~0 every step.
-# To run the real training (base student / trained teacher), override
-# `policy.model_name=<base-model-path>` from the launcher and leave the
-# teacher path alone.
+# MOPD is gym-only by design: teacher routing relies on nemo_gym's agent_ref /
+# multi-env multi-teacher machinery, so the nemo_gym entrypoint and dataset are
+# required. The baked gym venvs and the real nemo_gym train/validation datasets
+# are provided by the test harness at runtime (see PR #2855); the data_path
+# fields below are placeholders that the driver overrides via NRL_TRAIN_PATH /
+# NRL_VAL_PATH.
 #
-# Sequence packing is enabled; PP=1 on both student and teacher because mamba
-# sequence-packing crashes under PP>1 in the logprob forward. Sized for fast
-# iteration:
-#   * max_num_steps         5
-#   * max_total_sequence_length 32768
-#   * num_prompts_per_step  8
+# Sequence packing is enabled. Sized for fast iteration:
+#   * max_num_steps              5
+#   * max_total_sequence_length  32768
+#   * num_prompts_per_step       8
 #   * num_generations_per_prompt 4
-#   * train_global_batch_size 32  (= 8 * 4, no grad accum)
+#   * train_global_batch_size    32  (= 8 * 4, no grad accum)
 
 grpo:
   num_prompts_per_step: 8
@@ -75,15 +79,15 @@ loss_fn:
   truncated_importance_sampling_type: "icepop"
   sequence_level_importance_ratios: false
   token_level_loss: true
-  # Off for the smoke so prev_logprobs are computed (required by
-  # seq_logprob_error_threshold). Hard requirement when true:
+  # Off so prev_logprobs are computed (required by seq_logprob_error_threshold).
+  # Hard requirement when true:
   #   train_global_batch_size == num_prompts_per_step * num_generations_per_prompt
   force_on_policy_ratio: false
   use_kl_in_reward: false
 
 checkpointing:
   enabled: false
-  checkpoint_dir: "results/mopd-nanov3-smoke"
+  checkpoint_dir: "results/mopd-qwen3-1.7b-3n8g-megatron-pack"
   metric_name: "val:total_reward/mean"
   higher_is_better: true
   keep_top_k: 1
@@ -92,7 +96,7 @@ checkpointing:
   save_optimizer: false
 
 policy:
-  model_name: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"   # public default; launcher may override (student)
+  model_name: "Qwen/Qwen3-1.7B"   # student (launcher may override)
   tokenizer:
     name: ${policy.model_name}
   train_global_batch_size: 32
@@ -118,33 +122,25 @@ policy:
     empty_unused_memory_level: 1
     activation_checkpointing: true
     bias_activation_fusion: false
-    # Policy on 1 node: TP=2 PP=1 CP=1 EP=2 -> world 2, DP=4.
-    # PP=1: mamba sequence-packing crashes under PP>1 in the forward.
+    # Policy on 1 node: TP=2 PP=1 CP=1 -> world 2, DP=4.
     tensor_model_parallel_size: 2
-    expert_tensor_parallel_size: 1
-    expert_model_parallel_size: 2
     pipeline_model_parallel_size: 1
     num_layers_in_first_pipeline_stage: null
     num_layers_in_last_pipeline_stage: null
     context_parallel_size: 1
     pipeline_dtype: ${policy.precision}
-    # mcore MoE requires sequence parallelism when TP>1.
     sequence_parallel: true
-    freeze_moe_router: true
-    moe_router_dtype: "fp32"
-    moe_router_load_balancing_type: "none"
-    moe_router_bias_update_rate: 1e-3
-    moe_permute_fusion: true
-    moe_enable_deepep: false
-    moe_token_dispatcher_type: "alltoall"
-    moe_aux_loss_coeff: 0.0
-    moe_router_enable_expert_bias: true
     apply_rope_fusion: true
     defer_fp32_logits: true
-    track_moe_metrics: true
-    moe_per_layer_logging: true
-    moe_shared_expert_overlap: false
     gradient_accumulation_fusion: false
+    # Dense model: expert/MoE knobs kept at no-op defaults (EP=1).
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 1
+    freeze_moe_router: true
+    moe_per_layer_logging: false
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "alltoall"
+    moe_shared_expert_overlap: false
 
     optimizer:
       optimizer: "adam"
@@ -196,7 +192,7 @@ policy:
     algorithm: "modified_first_fit_decreasing"
     sequence_length_round: 64
 
-  # CP=2 with TP=2 needs make_sequence_length_divisible_by >= cp_size*2*tp_size = 8.
+  # TP=2 with sequence packing needs make_sequence_length_divisible_by >= 2*tp_size = 8.
   make_sequence_length_divisible_by: 8
   max_grad_norm: 1.0
 
@@ -208,10 +204,6 @@ policy:
   generation:
     backend: "vllm"
     # vLLM rejects with HTTP 400 if prompt + max_new_tokens > max_model_len.
-    # nano-v3 chat prompts in this dataset can exceed 8K tokens with full
-    # system + user + tool content; an 8192 cap stalled the buffer because
-    # too many prompts were filtered. 32K matches the prior green-smoke
-    # sizing (max_new_tokens=2048 -> prompts can run up to ~30K).
     max_new_tokens: 2048
     temperature: 1.0
     top_p: 1.0
@@ -222,7 +214,7 @@ policy:
       async_engine: true
       kv_cache_dtype: auto
       precision: ${policy.precision}
-      tensor_parallel_size: 4
+      tensor_parallel_size: 2
       pipeline_parallel_size: 1
       expert_parallel_size: 1
       gpu_memory_utilization: 0.5
@@ -234,13 +226,8 @@ policy:
       expose_http_server: true
       http_server_serving_chat_kwargs:
         enable_auto_tools: true
-        tool_parser: qwen3_coder
-        reasoning_parser: deepseek_r1
-
-    vllm_kwargs:
-      mamba_ssm_cache_dtype: "float32"
-      compilation_config:
-        backend: eager
+        tool_parser: hermes
+        reasoning_parser: qwen3
 
     colocated:
       # Async GRPO requires non-colocated inference (MOPD requires async).
@@ -251,8 +238,6 @@ policy:
 
 data:
   max_input_seq_length: null
-  # Nano-v3 training jsonl is sorted by a curriculum (length / difficulty); MOPD
-  # doesn't benefit from that ordering, so shuffle to get a representative mix.
   shuffle: true
   num_workers: 1
   use_multiple_dataloader: false
@@ -273,23 +258,12 @@ env:
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
     - resources_servers/math_with_judge/configs/math_with_judge.yaml
-    - resources_servers/code_gen/configs/code_gen.yaml
-    - resources_servers/workplace_assistant/configs/workplace_assistant.yaml
-    - resources_servers/mcqa/configs/mcqa.yaml
-    - resources_servers/instruction_following/configs/instruction_following.yaml
-    - resources_servers/structured_outputs/configs/structured_outputs_json.yaml
     math_with_judge:
       resources_servers:
         math_with_judge:
           judge_model_server:
             name: policy_model
           should_use_judge: false
-    code_gen:
-      resources_servers:
-        code_gen:
-          num_processes: 1024
-          unit_test_timeout_secs: 10
-          debug: false
 
 logger:
   log_dir: "logs"
@@ -300,12 +274,12 @@ logger:
   monitor_gpus: true
   swanlab_enabled: false
   wandb:
-    project: "mopd-smoke"
-    name: "mopd-nanov3-4n8g-smoke"
+    project: "mopd"
+    name: "mopd-qwen3-1.7b-3n8g-megatron-pack"
   tensorboard: {}
   mlflow:
-    experiment_name: "mopd-smoke"
-    run_name: "mopd-nanov3-4n8g-smoke"
+    experiment_name: "mopd"
+    run_name: "mopd-qwen3-1.7b-3n8g-megatron-pack"
   gpu_monitoring:
     collection_interval: 10
     flush_interval: 10
@@ -317,11 +291,11 @@ cluster:
   num_nodes: 3
 
 # MOPD: on-policy distillation with non-colocated teachers.
-# For the sanity check, the teacher path equals the student path -> loss ~= 0.
+# For the sanity check the teacher path equals the student path -> loss ~= 0.
 on_policy_distillation:
   enabled: true
   teacher_model_by_agent_name:
-    default_teacher: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"   # == student -> OPD loss ~0 (launcher may override)
+    default_teacher: "Qwen/Qwen3-1.7B"   # == student -> OPD loss ~0 (launcher may override)
   default_teacher_alias: default_teacher
   strict_agent_name_match: false
   deduplicate_shared_teacher_checkpoints: true
@@ -329,9 +303,7 @@ on_policy_distillation:
     enabled: true
     default_teacher_cfg:
       tensor_model_parallel_size: 2
-      # PP=1: mamba sequence-packing crashes under PP>1 in the logprob forward.
       pipeline_model_parallel_size: 1
-      expert_model_parallel_size: 2
       context_parallel_size: 1
       num_nodes: 1
       gpus_per_node: 8

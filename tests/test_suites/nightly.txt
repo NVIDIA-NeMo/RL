@@ -217,10 +217,11 @@ tests/test_suites/llm/distillation-qwen3-32b-to-1.7b-base-1n8g-megatron-tp2pp2cp
 # healthy. Self-distill Qwen3-1.7B-Base, ~20 min on 1n8g.
 tests/test_suites/llm/distillation-qwen3-1.7b-1n8g-megatron-qa-nvfp4.sh
 
-# MOPD (on-policy distillation via nemo_gym, non-colocated teacher). Student ==
-# teacher so the OPD loss stays ~0. Sequence packing on, 3 nodes. Requires
+# MOPD (on-policy distillation via nemo_gym, non-colocated teacher). Dense
+# Qwen3-1.7B self-distill: student == teacher so the OPD loss stays ~0.
+# Sequence packing on, 3 nodes (1 policy + 1 vLLM + 1 teacher). Requires
 # NRL_TRAIN_PATH / NRL_VAL_PATH (nemo_gym jsonl) in the environment.
-tests/test_suites/llm/mopd-nanov3-30ba3b-3n8g-megatron-pack.sh
+tests/test_suites/llm/mopd-qwen3-1.7b-3n8g-megatron-pack.sh
 
 #######
 # PPO #
