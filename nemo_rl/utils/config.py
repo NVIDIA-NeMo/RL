@@ -190,6 +190,10 @@ def parse_hydra_overrides(cfg: DictConfig, overrides: list[str]) -> DictConfig:
 
 def register_omegaconf_resolvers() -> None:
     """Register shared OmegaConf resolvers used in configs."""
+    if not OmegaConf.has_resolver("add"):
+        OmegaConf.register_new_resolver("add", lambda a, b: a + b)
+    if not OmegaConf.has_resolver("sub"):
+        OmegaConf.register_new_resolver("sub", lambda a, b: a - b)
     if not OmegaConf.has_resolver("mul"):
         OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
     if not OmegaConf.has_resolver("div"):
