@@ -21,8 +21,8 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 
 from nemo_rl.algorithms.dpo import (
     DPOConfig,
-    DPOSaveState,
     MasterConfig,
+    _initial_dpo_save_state,
     add_ref_logprobs_to_data,
     dpo_train,
 )
@@ -228,9 +228,7 @@ def test_exit_on_max_steps(mock_dpo_components):
     # Set max steps to 12, which is less than len(train_dataloader) * max_num_epochs
     mock_dpo_components["master_config"].dpo.max_num_steps = 12
 
-    dpo_save_state = DPOSaveState(
-        epoch=0, step=0, total_steps=0, consumed_samples=0, total_valid_tokens=0
-    )
+    dpo_save_state = _initial_dpo_save_state()
 
     # Run training
     dpo_train(
@@ -255,9 +253,7 @@ def test_exit_on_max_epochs(mock_dpo_components):
     mock_dpo_components["master_config"].dpo.max_num_epochs = 2
     mock_dpo_components["master_config"].dpo.max_num_steps = 100
 
-    dpo_save_state = DPOSaveState(
-        epoch=0, step=0, total_steps=0, consumed_samples=0, total_valid_tokens=0
-    )
+    dpo_save_state = _initial_dpo_save_state()
 
     # Run training
     dpo_train(
@@ -282,9 +278,7 @@ def test_exit_on_timeout(mock_dpo_components, capsys):
     mock_dpo_components["master_config"].dpo.max_num_steps = 100
     mock_dpo_components["master_config"].dpo.max_num_epochs = 10
 
-    dpo_save_state = DPOSaveState(
-        epoch=0, step=0, total_steps=0, consumed_samples=0, total_valid_tokens=0
-    )
+    dpo_save_state = _initial_dpo_save_state()
 
     # Mock TimeoutChecker to return False for first 7 checks, then True (timeout)
     with patch("nemo_rl.algorithms.dpo.TimeoutChecker") as mock_timeout_class:
