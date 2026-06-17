@@ -29,6 +29,7 @@ from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms import opd as opd_module
+from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.advantage_estimator import (
     GDPOAdvantageEstimator,
     GRPOAdvantageEstimator,
@@ -234,6 +235,7 @@ class MasterConfig(BaseModel, extra="allow"):
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
     data_plane: Optional[DataPlaneConfig] = None
+    on_policy_distillation: Optional[OnPolicyDistillationConfig] = None
 
 
 # ===============================================================================
@@ -260,14 +262,17 @@ def setup(
     CheckpointManager,
     GRPOSaveState,
     MasterConfig,
+    dict[str, Any],
+    dict[str, str],
 ]:
     """Main entry point for running GRPO algorithm.
 
     Returns:
-        An 11-tuple, in order:
+        A 13-tuple, in order:
             policy, policy_generation, nemo_gym (the NeMo-Gym env actor, or None
             when not enabled), cluster, dataloader, val_dataloader, loss_fn,
-            logger, checkpointer, grpo_save_state, master_config.
+            logger, checkpointer, grpo_save_state, master_config,
+            teacher_worker_groups, alias_to_group_alias.
     """
     # Start timing the entire setup process
     setup_start_time = time.perf_counter()
@@ -484,7 +489,7 @@ def setup(
             create_teacher_configs_from_opd_config,
         )
 
-        opd_cfg = getattr(master_config, "on_policy_distillation", None) or {}
+        opd_cfg = opd_module._opd_cfg(master_config)
         teacher_configs = create_teacher_configs_from_opd_config(opd_cfg)
         for tcfg in teacher_configs:
             opd_teacher_nodes += tcfg.get("num_nodes", 1)
@@ -1460,6 +1465,28 @@ def _get_effort_config(master_config: MasterConfig) -> Optional[EffortLevelsConf
     return EffortLevelsConfig.model_validate(effort_dict)
 
 
+def _pad_teacher_logprobs(teacher_logprobs: torch.Tensor, train_S: int) -> torch.Tensor:
+    """Right-zero-pad teacher logprobs ``[B, teacher_S]`` to ``train_S``.
+
+    ``from_batches`` pads teacher logprobs to ``max(S_i)``; ``train_data`` may be
+    longer due to ``make_sequence_length_divisible_by``. Zero-pad is safe because
+    the mask zeros padding in advantage computation. ``teacher_S > train_S`` is
+    unexpected (teacher pads to a finer grid than the student) and raises.
+    """
+    teacher_S = teacher_logprobs.shape[1]
+    if teacher_S > train_S:
+        raise ValueError(
+            f"Teacher logprobs seq length ({teacher_S}) > train_data seq length ({train_S}). "
+            "Teacher logprobs are padded to max(S_i) by from_batches, "
+            "and train_data is padded to roundup(max(S_i), make_sequence_length_divisible_by)."
+        )
+    if teacher_S < train_S:
+        teacher_logprobs = torch.nn.functional.pad(
+            teacher_logprobs, (0, train_S - teacher_S), value=0.0
+        )
+    return teacher_logprobs
+
+
 def _create_advantage_estimator(master_config: MasterConfig):
     """Create and return an advantage estimator based on configuration.
 
@@ -1498,13 +1525,7 @@ def _create_advantage_estimator(master_config: MasterConfig):
         adv_estimator = GRPOAdvantageEstimator(adv_estimator_config, loss_config)
         print("  ✓ Using GRPO advantage estimator")
     elif adv_estimator_name == "opd":
-        opd_cfg = getattr(master_config, "on_policy_distillation", None) or {}
-        opd_estimator_config = {
-            "name": "opd",
-            "use_orm_advantage": opd_cfg.get("use_orm_advantage", False),
-            "orm_advantage_weight": opd_cfg.get("orm_advantage_weight", 0.0),
-        }
-        adv_estimator = OPDAdvantageEstimator(opd_estimator_config, loss_config)
+        adv_estimator = OPDAdvantageEstimator({"name": "opd"}, loss_config)
         print("  ✓ Using OPD advantage estimator")
         # Warn if loss_fn is not configured per MOPD paper recommendations.
         if not loss_config.disable_ppo_ratio:
@@ -3153,9 +3174,7 @@ def async_grpo_train(
         start_step=step,
         teacher_worker_groups=teacher_worker_groups,
         alias_to_group_alias=alias_to_group_alias,
-        on_policy_distillation_cfg=dict(
-            getattr(master_config, "on_policy_distillation", None) or {}
-        ),
+        on_policy_distillation_cfg=opd_module._opd_cfg(master_config),
     )
 
     # Start trajectory collection in background
@@ -3525,24 +3544,10 @@ def async_grpo_train(
                         ] = seq_logprob_error_metrics.pop("num_masked_seqs")
 
                 # Pad teacher logprobs to match train_data sequence length.
-                # from_batches pads to max(S_i); train_data may be longer due to
-                # make_sequence_length_divisible_by. Zero-pad is safe because
-                # the mask zeros out padding in advantage computation.
                 if trajectory_teacher_logprobs is not None:
-                    train_S = train_data["input_ids"].shape[1]
-                    teacher_S = trajectory_teacher_logprobs.shape[1]
-                    if teacher_S > train_S:
-                        raise ValueError(
-                            f"Teacher logprobs seq length ({teacher_S}) > train_data seq length ({train_S}). "
-                            "Teacher logprobs are padded to max(S_i) by from_batches, "
-                            "and train_data is padded to roundup(max(S_i), make_sequence_length_divisible_by)."
-                        )
-                    if teacher_S < train_S:
-                        trajectory_teacher_logprobs = torch.nn.functional.pad(
-                            trajectory_teacher_logprobs,
-                            (0, train_S - teacher_S),
-                            value=0.0,
-                        )
+                    trajectory_teacher_logprobs = _pad_teacher_logprobs(
+                        trajectory_teacher_logprobs, train_data["input_ids"].shape[1]
+                    )
 
                 # Compute advantages with adv_estimator using correct mask and logprobs
                 with timer.time("advantage_calculation"):

@@ -1,15 +1,18 @@
-# MOPD smoke check on H100 (4 nodes x 8 GPUs).
+# MOPD smoke / nightly check on H100 (3 nodes x 8 GPUs).
 #
-# Cluster shape:
-#   * 2 policy nodes (training + colocated vLLM)         -> TP=2, PP=2, CP=4, EP=8
-#   * 2 teacher nodes (non-colocated inference workers)  -> TP=2, PP=2, CP=4, EP=8
+# Cluster shape (1 policy + 1 vLLM + 1 teacher = 3 nodes):
+#   * 1 policy node   (training,                 TP=2 PP=1 CP=1 EP=2 -> DP=4)
+#   * 1 vLLM node     (non-colocated generation, TP=4 -> 2 replicas)
+#   * 1 teacher node  (non-colocated logprobs,   TP=2 PP=1 CP=1 EP=2 -> DP=4)
 #
 # Same model on student and teacher so the OPD loss should be ~0 every step.
 # To run the real training (base student / trained teacher), override
 # `policy.model_name=<base-model-path>` from the launcher and leave the
 # teacher path alone.
 #
-# Sized for fast iteration:
+# Sequence packing is enabled; PP=1 on both student and teacher because mamba
+# sequence-packing crashes under PP>1 in the logprob forward. Sized for fast
+# iteration:
 #   * max_num_steps         5
 #   * max_total_sequence_length 32768
 #   * num_prompts_per_step  8
@@ -89,7 +92,7 @@ checkpointing:
   save_optimizer: false
 
 policy:
-  model_name: "/path/to/hf_checkpoint"   # set by launcher (student)
+  model_name: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"   # public default; launcher may override (student)
   tokenizer:
     name: ${policy.model_name}
   train_global_batch_size: 32
@@ -115,26 +118,17 @@ policy:
     empty_unused_memory_level: 1
     activation_checkpointing: true
     bias_activation_fusion: false
-    # Non-colocated layout on 4 H100 nodes (VARIANT A — DP=2, CP=1):
-    #   teacher: 1 node  (8 GPUs, TP=2 PP=2 CP=1 EP=2)
-    #   vLLM:    1 node  (8 GPUs, TP=4 -> 2 replicas)
-    #   policy:  2 nodes (16 GPUs, TP=2 PP=2 CP=1 EP=2 = world 4, DP=4)
-    # CP=1 because sequence_packing is temporarily disabled (transitive
-    # mamba-ssm in mcore extra got the PyPI version, broken against
-    # transformers v5 — fix tracked separately). mcore enforces
-    # "Sequence Packing must be enabled to use Context Parallelism".
+    # Policy on 1 node: TP=2 PP=1 CP=1 EP=2 -> world 2, DP=4.
+    # PP=1: mamba sequence-packing crashes under PP>1 in the forward.
     tensor_model_parallel_size: 2
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 2
-    pipeline_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
     num_layers_in_first_pipeline_stage: null
     num_layers_in_last_pipeline_stage: null
     context_parallel_size: 1
     pipeline_dtype: ${policy.precision}
-    # Re-enabled: with make_sequence_length_divisible_by=8 applied to BOTH
-    # policy training and teacher logprob paths (fix in
-    # trajectory_collector.py:595), reduce_scatter_to_sequence_parallel_region
-    # gets a TP-divisible seq dim. mcore MoE also requires SP when TP>1.
+    # mcore MoE requires sequence parallelism when TP>1.
     sequence_parallel: true
     freeze_moe_router: true
     moe_router_dtype: "fp32"
@@ -195,16 +189,8 @@ policy:
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
     sequence_length_round: 64
 
-  # Temporarily disabled: with sequence_packing=true on Mamba layers,
-  # mamba_mixer._ssm_training invokes _check_mamba_sequence_packing_support
-  # which imports mamba_ssm. The mcore venv's PyPI mamba_ssm 2.2.6.post3 is
-  # incompatible with transformers v5 (uses removed GreedySearchDecoderOnlyOutput).
-  # Root cause: tool.uv.sources git-rev override on mamba-ssm doesn't apply to
-  # transitive deps (mcore pulls mamba-ssm only via megatron-bridge's static metadata).
-  # Fix is to add "mamba-ssm" directly to the mcore extra in pyproject.toml; tracked
-  # separately. Disabling packing here is a workaround.
   sequence_packing:
-    enabled: false
+    enabled: true
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
     algorithm: "modified_first_fit_decreasing"
@@ -326,16 +312,16 @@ logger:
 
 cluster:
   gpus_per_node: 8
-  num_nodes: 4   # TOTAL nodes in the Ray cluster; MOPD subtracts opd_teacher_nodes (2) to get policy_nodes (2)
+  # Total Ray nodes. MOPD reserves opd_teacher_nodes (1) -> policy allocation 2;
+  # the non-colocated vLLM carves 1 of those -> 1 policy + 1 vLLM + 1 teacher.
+  num_nodes: 3
 
 # MOPD: on-policy distillation with non-colocated teachers.
 # For the sanity check, the teacher path equals the student path -> loss ~= 0.
 on_policy_distillation:
   enabled: true
-  use_orm_advantage: false
-  orm_advantage_weight: 0.0
   teacher_model_by_agent_name:
-    default_teacher: "/path/to/hf_checkpoint"   # set by launcher (teacher)
+    default_teacher: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"   # == student -> OPD loss ~0 (launcher may override)
   default_teacher_alias: default_teacher
   strict_agent_name_match: false
   deduplicate_shared_teacher_checkpoints: true
@@ -343,10 +329,9 @@ on_policy_distillation:
     enabled: true
     default_teacher_cfg:
       tensor_model_parallel_size: 2
-      pipeline_model_parallel_size: 2
+      # PP=1: mamba sequence-packing crashes under PP>1 in the logprob forward.
+      pipeline_model_parallel_size: 1
       expert_model_parallel_size: 2
-      # CP=1 because sequence_packing is disabled (see policy.megatron_cfg).
-      # mcore enforces "Sequence Packing must be enabled to use CP".
       context_parallel_size: 1
       num_nodes: 1
       gpus_per_node: 8

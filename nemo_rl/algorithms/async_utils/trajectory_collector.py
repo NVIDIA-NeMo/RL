@@ -634,6 +634,8 @@ class AsyncTrajectoryCollector:
 
         B, S = input_ids.shape
         result = torch.zeros(B, S, dtype=torch.float32)
+        if not group_to_indices:  # 0-sample batch: nothing to route (avoid max_workers=0)
+            return result, 0.0
 
         def _get_logprobs_for_group(group_key, indices):
             twg = self.teacher_worker_groups[group_key]

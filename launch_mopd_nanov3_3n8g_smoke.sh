@@ -1,22 +1,34 @@
 #!/bin/bash
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 set -euo pipefail
 
 # =============================================================================
-# launch_mopd_nanov3_4n8g_smoke.sh
+# launch_mopd_nanov3_3n8g_smoke.sh
 #
-# MOPD smoke check on cw-dfw H100: 4 nodes x 8 GPUs (32 GPUs total).
+# MOPD smoke check on H100: 3 nodes x 8 GPUs (24 GPUs total).
 # Non-colocated layout (yaml-defined):
-#   * 2 policy training nodes (DP=2, TP=2 PP=2 CP=1 EP=2)
-#   * 1 vLLM generation node     (TP=4 -> 2 replicas)
-#   * 1 non-colocated teacher    (TP=2 PP=2 CP=1 EP=2)
+#   * 1 policy training node  (TP=2 PP=1 CP=1 EP=2 -> DP=4)
+#   * 1 vLLM generation node  (TP=4 -> 2 replicas)
+#   * 1 non-colocated teacher (TP=2 PP=1 CP=1 EP=2 -> DP=4)
 #
-# Static config: examples/nemo_gym/mopd_nanov3_4n8g_smoke.yaml
+# Static config: examples/nemo_gym/mopd_nanov3_3n8g_smoke.yaml
 #
-# Defaults to teacher == student (both = trained Nano v3 30B-A3B BF16) so the
-# OPD loss should land at ~0 within a couple of steps. Last verified green
-# run (student==teacher): train/loss ≈ -3e-3, teacher_student_logprob_gap ≈
-# 7e-5, token_mult_prob_error ≈ 1.025. Override to run the real distillation:
-#   NRL_MODEL_PATH=<base-model-path> ./launch_mopd_nanov3_4n8g_smoke.sh
+# Defaults to teacher == student (both = public Nano v3 30B-A3B BF16) so the
+# OPD loss should land at ~0 within a couple of steps. Override to run the real
+# distillation:
+#   NRL_MODEL_PATH=<base-model-path> ./launch_mopd_nanov3_3n8g_smoke.sh
 #
 # (NRL_TEACHER_MODEL_PATH defaults to NRL_MODEL_PATH; override separately
 # only when student != teacher.)
@@ -26,13 +38,13 @@ set -euo pipefail
 # pre-built mcore-conversion cache, otherwise the container defaults apply.
 #
 # Usage:
-#   ./launch_mopd_nanov3_4n8g_smoke.sh                              # batch SLURM
-#   NRL_MAX_STEPS=2 ./launch_mopd_nanov3_4n8g_smoke.sh              # even shorter
-#   USE_WORKTREE=1 ./launch_mopd_nanov3_4n8g_smoke.sh               # overlay local code
+#   ./launch_mopd_nanov3_3n8g_smoke.sh                              # batch SLURM
+#   NRL_MAX_STEPS=2 ./launch_mopd_nanov3_3n8g_smoke.sh              # even shorter
+#   USE_WORKTREE=1 ./launch_mopd_nanov3_3n8g_smoke.sh               # overlay local code
 #
 # Interactive debugging (reuse allocation across runs):
-#   INTERACTIVE=1 ./launch_mopd_nanov3_4n8g_smoke.sh
-#   INTERACTIVE=1 INTERACTIVE_WAIT=0 ./launch_mopd_nanov3_4n8g_smoke.sh
+#   INTERACTIVE=1 ./launch_mopd_nanov3_3n8g_smoke.sh
+#   INTERACTIVE=1 INTERACTIVE_WAIT=0 ./launch_mopd_nanov3_3n8g_smoke.sh
 # =============================================================================
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
@@ -53,7 +65,7 @@ WALLTIME="${WALLTIME:-4:00:00}"
 export CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/coreai/users/terryk/enroot-images/nvcr.io/nvidian/nemo-rl:nightly.squashfs}"
 MOUNTS="/lustre:/lustre"
 
-# 4 nodes x 8 H100 GPUs = 32 GPUs total (2 policy + 2 teacher).
+# 3 nodes x 8 H100 GPUs = 24 GPUs total (1 policy + 1 vLLM + 1 teacher).
 export GPUS_PER_NODE=8
 export CPUS_PER_WORKER="${CPUS_PER_WORKER:-16}"
 
@@ -78,7 +90,7 @@ NRL_MAX_STEPS="${NRL_MAX_STEPS:-}"
 # NUM_POLICY_NODES/NUM_TEACHER_NODES are kept for header-comment math; only
 # NUM_TOTAL_NODES is used downstream by sbatch (Ray scheduler places workers
 # per the yaml's cluster.num_nodes and on_policy_distillation.non_colocated_teachers.*).
-NUM_POLICY_NODES="${NUM_POLICY_NODES:-2}"
+NUM_POLICY_NODES="${NUM_POLICY_NODES:-1}"
 NUM_TEACHER_NODES="${NUM_TEACHER_NODES:-1}"
 NUM_VLLM_NODES="${NUM_VLLM_NODES:-1}"
 NUM_TOTAL_NODES="${NUM_TOTAL_NODES:-$((NUM_POLICY_NODES + NUM_TEACHER_NODES + NUM_VLLM_NODES))}"
@@ -89,17 +101,16 @@ WANDB_NAME="${WANDB_NAME:-mopd-nanov3-${NUM_TOTAL_NODES}n${GPUS_PER_NODE}g-smoke
 export WANDB_API_KEY="${WANDB_API_KEY:-}"
 
 # ---------- Model and data paths ----------
-# Trained Nano v3 BF16 — student (this run) AND teacher (always) by default.
-# Points at the HF Hub snapshot under our HF_HOME (matches the green smoke).
-# For the real distillation, set NRL_MODEL_PATH to the base checkpoint, e.g.
-#   /lustre/fsw/portfolios/llmservice/users/igitman/hf_models/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16
-NRL_MODEL_PATH="${NRL_MODEL_PATH:-/lustre/fs1/portfolios/coreai/users/yifuw/hf_home/hub/models--nvidia--NVIDIA-Nemotron-3-Nano-30B-A3B-BF16/snapshots/cbd3fa9f933d55ef16a84236559f4ee2a0526848}"
+# Student == teacher by default (public Nano v3 30B-A3B BF16) -> OPD loss ~0.
+# For real distillation, set NRL_MODEL_PATH to the base checkpoint.
+NRL_MODEL_PATH="${NRL_MODEL_PATH:-nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16}"
 NRL_TEACHER_MODEL_PATH="${NRL_TEACHER_MODEL_PATH:-${NRL_MODEL_PATH}}"
-NRL_TRAIN_PATH="${NRL_TRAIN_PATH:-/lustre/fs1/portfolios/coreai/users/yifuw/code/nano-v3-data/nano_data/data/train-split.jsonl}"
-NRL_VAL_PATH="${NRL_VAL_PATH:-/lustre/fs1/portfolios/coreai/users/yifuw/code/nano-v3-data/nano_data/data/val-split.jsonl}"
-CONFIG_FILE="${CONFIG_FILE:-examples/nemo_gym/mopd_nanov3_4n8g_smoke.yaml}"
+# nemo_gym train + validation jsonl (environment-specific; set before running).
+NRL_TRAIN_PATH="${NRL_TRAIN_PATH:?set NRL_TRAIN_PATH to the nemo_gym train jsonl}"
+NRL_VAL_PATH="${NRL_VAL_PATH:?set NRL_VAL_PATH to the nemo_gym validation jsonl}"
+CONFIG_FILE="${CONFIG_FILE:-examples/nemo_gym/mopd_nanov3_3n8g_smoke.yaml}"
 
-EXP_SUFFIX="${EXP_SUFFIX:-mopd-nanov3-4n8g-smoke}"
+EXP_SUFFIX="${EXP_SUFFIX:-mopd-nanov3-3n8g-smoke}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-results/${EXP_SUFFIX}}"
 mkdir -p "${CHECKPOINT_DIR}"
 CHECKPOINT_DIR="$(cd "${CHECKPOINT_DIR}" && pwd)"

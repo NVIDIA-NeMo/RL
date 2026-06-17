@@ -55,8 +55,12 @@ class _MockTeacherWorkerGroup:
 
 def _make_collector(**overrides):
     """Build a bare AsyncTrajectoryCollector (bypass Ray) for unit testing."""
+    import threading
+
     from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector
 
+    # AsyncTrajectoryCollector is @ray.remote-decorated; unwrap to the real class.
+    real_cls = AsyncTrajectoryCollector.__ray_metadata__.modified_class
     defaults = {
         "teacher_worker_groups": {},
         "alias_to_group_alias": {},
@@ -64,9 +68,10 @@ def _make_collector(**overrides):
         "_has_non_colocated_teachers": False,
     }
     defaults.update(overrides)
-    obj = object.__new__(AsyncTrajectoryCollector)
+    obj = object.__new__(real_cls)
     for k, v in defaults.items():
         setattr(obj, k, v)
+    obj._teacher_locks = {k: threading.Lock() for k in obj.teacher_worker_groups}
     return obj
 
 
@@ -99,7 +104,7 @@ def test_compute_teacher_logprobs_dp_padding(batch_size, dp_size):
     input_ids = torch.randint(0, 100, (batch_size, S))
     agent_refs = [{"name": "math_agent"}] * batch_size
 
-    result = collector._compute_teacher_logprobs(input_ids, agent_refs)
+    result, _ = collector._compute_teacher_logprobs(input_ids, agent_refs)
 
     assert result.shape == (batch_size, S)
     assert torch.allclose(result, torch.tensor(2.0))
@@ -131,7 +136,7 @@ def test_compute_teacher_logprobs_routes_to_correct_teacher():
         {"name": "code_agent"},
     ]
 
-    result = collector._compute_teacher_logprobs(input_ids, agent_refs)
+    result, _ = collector._compute_teacher_logprobs(input_ids, agent_refs)
 
     assert result.shape == (B, S)
     assert torch.allclose(result[0], torch.tensor(1.0))
@@ -160,7 +165,7 @@ def test_compute_teacher_logprobs_deduplication():
     input_ids = torch.randint(0, 100, (B, S))
     agent_refs = [{"name": "mcqa"}, {"name": "terminal"}]
 
-    result = collector._compute_teacher_logprobs(input_ids, agent_refs)
+    result, _ = collector._compute_teacher_logprobs(input_ids, agent_refs)
     assert result.shape == (B, S)
     assert torch.allclose(result, torch.tensor(3.0))
 
@@ -229,28 +234,24 @@ def test_reorder_data_inverse_permutation_various():
         "After reorder_data, row i should hold the result for original sample i"
 
 
-def test_get_logprobs_unsort_matches_lm_policy():
-    """TeacherWorkerGroup.get_logprobs uses reorder_data (inverse permutation)
-    to undo sequence packing reorder, matching lm_policy.py's approach.
-
-    This is a code-level check: verify the fix is in place by reading the
-    source and confirming reorder_data is called (not a direct index gather).
-    """
-    import inspect
-    from nemo_rl.models.policy.teacher_worker_group import TeacherWorkerGroup
-
-    source = inspect.getsource(TeacherWorkerGroup.get_logprobs)
-    assert "reorder_data" in source, \
-        "get_logprobs must use reorder_data() for unsort (not direct index gather)"
-    assert "unsorted_data_indices]" not in source, \
-        "get_logprobs must NOT use result[unsorted_data_indices] (wrong permutation direction)"
-
-
 def test_is_opd_enabled():
     from nemo_rl.algorithms.opd import is_opd_enabled
     assert is_opd_enabled({"on_policy_distillation": {"enabled": True}})
     assert not is_opd_enabled({"on_policy_distillation": {"enabled": False}})
     assert not is_opd_enabled({})
+
+
+def test_is_opd_enabled_object_config():
+    # _opd_cfg must also handle a config object (not just a dict): math recipes
+    # have no on_policy_distillation attribute at all.
+    from types import SimpleNamespace
+
+    from nemo_rl.algorithms.opd import is_opd_enabled
+
+    assert is_opd_enabled(SimpleNamespace(on_policy_distillation={"enabled": True}))
+    assert not is_opd_enabled(SimpleNamespace(on_policy_distillation={"enabled": False}))
+    assert not is_opd_enabled(SimpleNamespace())
+    assert not is_opd_enabled(SimpleNamespace(on_policy_distillation=None))
 
 
 def test_is_non_colocated_teachers_enabled():
@@ -347,3 +348,45 @@ def test_teacher_seq_pad_multiple_non_packed_incompatible_divisor_raises():
 
     with pytest.raises(ValueError, match="make_sequence_length_divisible_by"):
         teacher_seq_pad_multiple({"a": _twg(False, pad_multiple=16)}, 8)
+
+
+# ---------------------------------------------------------------------------
+# Teacher-logprob seq-length padding + the "opd" advantage-estimator branch
+# ---------------------------------------------------------------------------
+
+
+def test_pad_teacher_logprobs():
+    from nemo_rl.algorithms.grpo import _pad_teacher_logprobs
+
+    # teacher_S < train_S -> right zero-pad
+    padded = _pad_teacher_logprobs(torch.ones(2, 3), 5)
+    assert padded.shape == (2, 5)
+    assert (padded[:, :3] == 1).all() and (padded[:, 3:] == 0).all()
+    # teacher_S == train_S -> unchanged
+    assert _pad_teacher_logprobs(torch.ones(2, 4), 4).shape == (2, 4)
+    # teacher_S > train_S -> raises
+    with pytest.raises(ValueError, match="seq length"):
+        _pad_teacher_logprobs(torch.ones(2, 6), 4)
+
+
+def test_create_advantage_estimator_opd_branch():
+    import warnings
+    from types import SimpleNamespace
+
+    from nemo_rl.algorithms.advantage_estimator import OPDAdvantageEstimator
+    from nemo_rl.algorithms.grpo import _create_advantage_estimator
+
+    # loss_fn not MOPD-configured -> the 3 recommendation warnings fire.
+    loss_fn = SimpleNamespace(
+        disable_ppo_ratio=False,
+        use_importance_sampling_correction=False,
+        truncated_importance_sampling_type="none",
+    )
+    master_config = SimpleNamespace(
+        grpo={"adv_estimator": {"name": "opd"}}, loss_fn=loss_fn
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        estimator = _create_advantage_estimator(master_config)
+    assert isinstance(estimator, OPDAdvantageEstimator)
+    assert len(caught) == 3

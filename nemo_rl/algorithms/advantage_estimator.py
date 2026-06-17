@@ -531,13 +531,9 @@ class OPDAdvantageEstimator:
     Required kwargs in compute_advantage:
         teacher_logprobs: [B, S] teacher model log probabilities
         prev_logprobs: [B, S] student training-engine log probabilities
-    Optional kwargs:
-        orm_advantages: [B, S] ORM advantages to blend in (Equation 9)
     """
 
     def __init__(self, estimator_config: dict, loss_config: dict):
-        self.use_orm_advantage = bool(estimator_config.get("use_orm_advantage", False))
-        self.orm_advantage_weight = float(estimator_config.get("orm_advantage_weight", 0.0))
         self.last_metrics: dict[str, float] = {}
 
     def compute_advantage(
@@ -547,7 +543,6 @@ class OPDAdvantageEstimator:
         mask,
         teacher_logprobs=None,
         prev_logprobs=None,
-        orm_advantages=None,
         **kwargs,
     ):
         """Compute OPD distillation advantages.
@@ -558,7 +553,6 @@ class OPDAdvantageEstimator:
             mask: [B, S] token mask
             teacher_logprobs: [B, S] teacher model logprobs (required)
             prev_logprobs: [B, S] student training-engine logprobs (required)
-            orm_advantages: [B, S] ORM advantages (optional, Equation 9)
 
         Returns:
             [B, S] token-level distillation advantages (stop-gradient)
@@ -571,14 +565,8 @@ class OPDAdvantageEstimator:
         # Â_MOPD,t = sg[log π_teacher - log π_student]  (Equation 8)
         distill_advantages = (teacher_logprobs - prev_logprobs).detach()
 
-        # Optional ORM blending (Equation 9)
-        if self.use_orm_advantage and orm_advantages is not None:
-            combined = distill_advantages + self.orm_advantage_weight * orm_advantages.detach()
-        else:
-            combined = distill_advantages
-
         # Apply mask
-        advantages = combined * mask
+        advantages = distill_advantages * mask
 
         # Metrics
         self._compute_metrics(distill_advantages, advantages, mask)

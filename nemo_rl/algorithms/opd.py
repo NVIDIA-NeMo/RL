@@ -21,27 +21,33 @@ IS truncation lives in loss_functions.ClippedPGLoss (ICE-POP mode).
 
 from __future__ import annotations
 
-from typing import Any, NotRequired, Optional, TypedDict
+from typing import Any, Optional
+
+from pydantic import BaseModel, Field
 
 
 # ---------------------------------------------------------------------------
-# Config TypedDicts
+# Config schemas
 # ---------------------------------------------------------------------------
 
 
-class NonColocatedTeachersConfig(TypedDict):
-    enabled: bool
-    default_teacher_cfg: NotRequired[dict[str, Any]]
-    teacher_overrides: NotRequired[dict[str, dict[str, Any]]]
+class NonColocatedTeachersConfig(BaseModel, extra="allow"):
+    """Non-colocated (separate-GPU) teacher resourcing for on-policy distillation."""
+
+    enabled: bool = False
+    default_teacher_cfg: dict[str, Any] = Field(default_factory=dict)
+    teacher_overrides: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
-class OnPolicyDistillationConfig(TypedDict):
-    enabled: bool
-    teacher_model_by_agent_name: NotRequired[dict[str, str]]
-    default_teacher_alias: NotRequired[Optional[str]]
-    strict_agent_name_match: NotRequired[bool]
-    deduplicate_shared_teacher_checkpoints: NotRequired[bool]
-    non_colocated_teachers: NotRequired[NonColocatedTeachersConfig]
+class OnPolicyDistillationConfig(BaseModel, extra="allow"):
+    """User-facing config for the top-level ``on_policy_distillation`` block."""
+
+    enabled: bool = False
+    teacher_model_by_agent_name: dict[str, str] = Field(default_factory=dict)
+    default_teacher_alias: Optional[str] = None
+    strict_agent_name_match: bool = False
+    deduplicate_shared_teacher_checkpoints: bool = True
+    non_colocated_teachers: Optional[NonColocatedTeachersConfig] = None
 
 
 # ---------------------------------------------------------------------------
@@ -52,20 +58,28 @@ class OnPolicyDistillationConfig(TypedDict):
 def _opd_cfg(master_config: Any) -> dict[str, Any]:
     """Return the on_policy_distillation sub-config as a plain dict.
 
-    Accepts either a Pydantic MasterConfig (main's `setup()` passes this) or a
-    plain dict (which ultra-side callers used). Non-OPD recipes (e.g. math) have
-    no `on_policy_distillation` field at all, so we must not assume it exists.
+    Accepts a MasterConfig (where the field is an OnPolicyDistillationConfig
+    BaseModel), a plain dict, or a config object missing the field (non-OPD
+    recipes like math). Downstream code reads the result dict-style.
     """
     if isinstance(master_config, dict):
-        return master_config.get("on_policy_distillation", {}) or {}
-    return getattr(master_config, "on_policy_distillation", None) or {}
+        cfg = master_config.get("on_policy_distillation")
+    else:
+        cfg = getattr(master_config, "on_policy_distillation", None)
+    if cfg is None:
+        return {}
+    if isinstance(cfg, BaseModel):
+        return cfg.model_dump(exclude_none=True)
+    return cfg
 
 
 def is_opd_enabled(master_config: Any) -> bool:
+    """Whether on-policy distillation is enabled in the config."""
     return bool(_opd_cfg(master_config).get("enabled", False))
 
 
 def is_non_colocated_teachers_enabled(master_config: Any) -> bool:
+    """Whether OPD is enabled with non-colocated (separate-GPU) teachers."""
     if not is_opd_enabled(master_config):
         return False
     return bool(_opd_cfg(master_config).get("non_colocated_teachers", {}).get("enabled", False))
@@ -82,6 +96,11 @@ def resolve_reference_aliases(
     default_teacher_alias: Optional[str] = None,
     strict_agent_name_match: bool = False,
 ) -> list[str]:
+    """Map each agent_ref to a teacher alias.
+
+    Unmapped agents fall back to ``default_teacher_alias``; with
+    ``strict_agent_name_match`` an unmapped agent raises instead.
+    """
     aliases: list[str] = []
     for ref in agent_refs:
         name = ref["name"]
@@ -106,6 +125,8 @@ def get_teacher_routing_metrics(
     reference_aliases: list[str],
     teacher_model_by_agent_name: dict[str, str],
 ) -> dict[str, float]:
+    """Routing diagnostics: unique aliases, unique models, and the alias→model
+    compression ratio (how many aliases share each underlying teacher model)."""
     alias_unique = len(set(reference_aliases))
     unique_models: set[str] = set()
     for alias in reference_aliases:

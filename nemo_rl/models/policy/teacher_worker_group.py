@@ -299,4 +299,4 @@ class TeacherWorkerGroup:
     def __del__(self) -> None:
         """Safety net for cleanup."""
         if hasattr(self, "worker_group"):
-            self.worker_group.shutdown(cleanup_method="shutdown")
+            self.shutdown()

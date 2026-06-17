@@ -18,13 +18,8 @@ import torch
 from nemo_rl.algorithms.advantage_estimator import OPDAdvantageEstimator
 
 
-def _make_estimator(use_orm_advantage=False, orm_advantage_weight=0.0):
-    estimator_config = {
-        "use_orm_advantage": use_orm_advantage,
-        "orm_advantage_weight": orm_advantage_weight,
-    }
-    loss_config = {}
-    return OPDAdvantageEstimator(estimator_config, loss_config)
+def _make_estimator():
+    return OPDAdvantageEstimator({"name": "opd"}, {})
 
 
 def test_opd_basic_positive_distill_advantage():
@@ -59,31 +54,6 @@ def test_opd_teacher_equals_student():
     )
 
     torch.testing.assert_close(adv, torch.zeros(B, S))
-
-
-def test_opd_with_orm_advantage():
-    """ORM blending with weight=0.5."""
-    estimator = _make_estimator(use_orm_advantage=True, orm_advantage_weight=0.5)
-    B, S = 2, 4
-    teacher_lp = torch.zeros(B, S)
-    student_lp = torch.full((B, S), -2.0)
-    orm_adv = torch.ones(B, S) * 4.0  # constant ORM advantage
-    mask = torch.ones(B, S)
-    prompt_ids = torch.arange(B)
-    rewards = torch.zeros(B)
-
-    adv = estimator.compute_advantage(
-        prompt_ids,
-        rewards,
-        mask,
-        teacher_logprobs=teacher_lp,
-        prev_logprobs=student_lp,
-        orm_advantages=orm_adv,
-    )
-
-    # distill = 0 - (-2) = 2.0; orm contribution = 0.5 * 4.0 = 2.0; total = 4.0
-    expected = torch.full((B, S), 4.0)
-    torch.testing.assert_close(adv, expected)
 
 
 def test_opd_mask_applied():
