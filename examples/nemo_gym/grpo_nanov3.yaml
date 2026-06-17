@@ -196,6 +196,42 @@ policy:
     top_k: null
     stop_token_ids: null
     stop_strings: null
+    mcore_generation_config:
+      # Scoped to generation workers only; training keeps its own defaults
+      # via the base yaml. The mcore_generation_config block is merged into
+      # megatron_cfg for inference workers before model setup runs.
+      max_model_len: ${policy.max_total_sequence_length}
+      transformer_impl: "inference_optimized"
+      cuda_graph_impl: "local"
+      inference_cuda_graph_scope: "block"
+      activation_checkpointing: false
+      mamba_inference_ssm_states_dtype: "float32"
+      inference_moe_token_dispatcher_type: "nccl"  # Fall back to NCCL for now
+      inference_grouped_gemm_backend: "vllm"
+      moe_router_num_groups: null  # InferenceTopKRouter requires num_groups=None
+      moe_router_group_topk: null  # paired with moe_router_num_groups=null
+      pipeline_model_parallel_size: 1
+      expert_tensor_parallel_size: 1
+      expert_model_parallel_size: 8
+      sequence_parallel: True
+      context_parallel_size: 1
+      tensor_model_parallel_size: 2
+      buffer_size_gb: 20  # Total GPU memory (in GB) allocated for KV cache buffers
+      num_cuda_graphs: -1  # Number of CUDA graphs to pre-compile for different batch sizes
+      block_size_tokens: 256  # Size of each KV cache block in tokens (affects memory granularity)
+      use_cuda_graphs_for_non_decode_steps: true  # Enable CUDA graphs for prefill/context processing
+      enable_chunked_prefill: true
+      max_tokens: 16384 # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens
+      kv_cache_management_mode: "persist"  # KV cache lifecycle across suspend/resume. Options: "persist", "offload". To select "recompute", set grpo.async_grpo.recompute_kv_cache_after_weight_updates=true.
+      materialize_only_last_token_logits: true
+      num_speculative_tokens: 0
+      refit_backend: "nvshmem"  # Copy-service backend for non-colocated megatron weight refit. Options: "gloo" or "nvshmem".
+      async_engine: true
+      expose_http_server: true
+      enable_prefix_caching: true
+      parsers:
+        - deepseek-r1-reasoning
+        - qwen3-coder-tool
     vllm_cfg:
       # NB: can re-enable prefix cache on vllm >= 0.11.2.
       # enable_prefix_caching: false
