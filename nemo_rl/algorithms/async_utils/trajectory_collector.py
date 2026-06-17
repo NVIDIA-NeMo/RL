@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import threading as _threading
 import time
-from typing import TYPE_CHECKING, Any, Optional
+from typing import Any, Optional
 
 import ray
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -31,9 +31,6 @@ from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
-
-if TYPE_CHECKING:
-    pass
 
 TokenizerType = PreTrainedTokenizerBase
 
