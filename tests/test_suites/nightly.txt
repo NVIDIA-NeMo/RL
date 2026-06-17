@@ -42,6 +42,10 @@ tests/test_suites/vlm/vlm_grpo-qwen2.5-omni-3b-avqa-1n8g-megatron.v1.sh
 tests/test_suites/vlm/vlm_grpo-qwen2.5-omni-7b-audiomcq-1n8g-megatron.v1.sh
 tests/test_suites/vlm/vlm_grpo-qwen3-omni-30ba3b-audiomcq-4n8g-megatron.v1.sh
 
+# Functional Nemotron-Omni 30B-A3B VLM GRPO runs (AutoModel EP=8)
+tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v1.sh
+tests/test_suites/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-automodel-ep8.v1.sh
+
 # Functional Qwen3.5-35B VLM GRPO run
 # Disable this due to known vLLM crash issue with Qwen3.5: https://github.com/vllm-project/vllm/issues/36237
 # tests/test_suites/vlm/vlm_grpo-qwen3.5-35ba3b-geo3k-2n8g-automodel-ep16.sh
@@ -224,5 +228,8 @@ tests/test_suites/llm/distillation-qwen3-1.7b-1n8g-megatron-qa-nvfp4.sh
 # PPO #
 #######
 
-# Megatron PPO with GAE and value model (Qwen2.5-1.5B, GSM8K)
-tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron.sh
+# Megatron PPO with value sequence parallelism (TP2+SP) and dynamic batching (Qwen2.5-1.5B, GSM8K)
+tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron-valuetp2sp-dynbatch.sh
+
+# Megatron PPO with value pipeline parallelism (TP2+PP2) (Qwen2.5-1.5B, GSM8K)
+tests/test_suites/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron-valuetp2pp2.sh

@@ -51,7 +51,13 @@ class AutomodelBackendConfig(TypedDict):
     linear: NotRequired[str]
     # RMSNorm implementation: "te" (Transformer Engine), etc.
     rms_norm: NotRequired[str]
-    # Enable DeepEP (Deep Expert Parallelism) for MoE models
+    # MoE expert GEMM backend: "torch" (per-expert loop), "te" (TE GroupedLinear),
+    # "gmm" (grouped_gemm.ops.gmm), "torch_mm" (torch._grouped_mm).
+    experts: NotRequired[str]
+    # MoE token dispatcher: "torch" (DTensor all-gather/reduce-scatter), "deepep", etc.
+    dispatcher: NotRequired[str]
+    # Enable DeepEP (Deep Expert Parallelism) for MoE models.
+    # Deprecated upstream: use dispatcher="deepep" and experts="gmm"/"torch_mm" instead.
     enable_deepep: NotRequired[bool]
     # Use fake balanced gate for testing/debugging MoE
     fake_balanced_gate: NotRequired[bool]
@@ -64,11 +70,24 @@ class AutomodelBackendConfig(TypedDict):
     gate_precision: NotRequired[str]
 
 
+class AutomodelFreezeConfig(TypedDict):
+    """Which sub-modules of a multi-modal Automodel to freeze during training.
+
+    Used when setting freeze_config in automodel_kwargs in your config.
+    """
+
+    freeze_vision_tower: NotRequired[bool]
+    freeze_audio_tower: NotRequired[bool]
+    freeze_language_model: NotRequired[bool]
+
+
 class AutomodelKwargs(TypedDict):
     # Whether to use Liger kernel optimizations (default: false)
     use_liger_kernel: NotRequired[bool]
     # Backend configuration for MoE models
     backend: NotRequired[AutomodelBackendConfig]
+    # Freeze configuration for multi-modal models (vision/audio/language towers)
+    freeze_config: NotRequired[AutomodelFreezeConfig]
     # Force the HuggingFace model implementation instead of the custom one.
     # Set to true if the custom model's state_dict_adapter doesn't implement
     # convert_single_tensor_to_hf (required for weight syncing). This is
