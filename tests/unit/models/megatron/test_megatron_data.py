@@ -76,6 +76,8 @@ class TestProcessedMicrobatchDataclass:
         assert torch.equal(microbatch.position_ids, mock_position_ids)
         assert microbatch.packed_seq_params == mock_packed_seq_params
         assert torch.equal(microbatch.cu_seqlens_padded, mock_cu_seqlens_padded)
+        assert microbatch.routed_experts is None
+        assert microbatch.routed_experts_cp_sharded is None
 
 
 @pytest.mark.mcore
@@ -181,6 +183,76 @@ class TestProcessMicrobatch:
         # Verify get_ltor_masks_and_position_ids was called
         mock_get_masks.assert_called_once()
 
+    @patch("nemo_rl.models.megatron.data.get_ltor_masks_and_position_ids")
+    def test_process_microbatch_repairs_routed_experts_padding_without_packing(
+        self, mock_get_masks
+    ):
+        """Materialized jagged padding must remain valid router replay data."""
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        mock_get_masks.return_value = (
+            torch.ones(2, 4),
+            None,
+            torch.arange(4).unsqueeze(0).expand(2, -1),
+        )
+
+        routed_experts = torch.tensor(
+            [
+                [
+                    [[4, 5], [6, 7]],
+                    [[8, 9], [10, 11]],
+                    [[0, 0], [0, 0]],
+                    [[0, 0], [0, 0]],
+                ],
+                [
+                    [[12, 13], [14, 15]],
+                    [[16, 17], [18, 19]],
+                    [[20, 21], [22, 23]],
+                    [[0, 0], [0, 0]],
+                ],
+            ],
+            dtype=torch.int32,
+        )
+        data_dict = {
+            "input_ids": torch.tensor([[1, 2, 0, 0], [3, 4, 5, 0]]),
+            "input_lengths": torch.tensor([2, 3]),
+            "routed_experts": routed_experts,
+        }
+
+        result = process_microbatch(
+            data_dict,
+            pack_sequences=False,
+            straggler_timer=MagicMock(),
+        )
+
+        expected = routed_experts.clone()
+        default_route = torch.tensor([0, 1], dtype=torch.int32)
+        expected[0, 2:] = default_route.view(1, 1, 2).expand(2, 2, 2)
+        expected[1, 3:] = default_route.view(1, 1, 2).expand(1, 2, 2)
+        assert torch.equal(result.routed_experts, expected)
+        assert torch.equal(result.routed_experts_cp_sharded, expected)
+
+    @patch("nemo_rl.models.megatron.data.get_ltor_masks_and_position_ids")
+    def test_process_microbatch_requires_lengths_for_dense_routed_experts(
+        self, mock_get_masks
+    ):
+        """Dense routed_experts padding repair needs original sequence lengths."""
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        data_dict = {
+            "input_ids": torch.tensor([[1, 2, 0, 0], [3, 4, 5, 0]]),
+            "routed_experts": torch.zeros(2, 4, 2, 2, dtype=torch.int32),
+        }
+
+        with pytest.raises(ValueError, match="routed_experts requires input_lengths"):
+            process_microbatch(
+                data_dict,
+                pack_sequences=False,
+                straggler_timer=MagicMock(),
+            )
+
+        mock_get_masks.assert_not_called()
+
     @patch("nemo_rl.models.megatron.data.get_context_parallel_rank", return_value=0)
     @patch(
         "nemo_rl.models.megatron.data.get_context_parallel_world_size", return_value=1
@@ -212,7 +284,11 @@ class TestProcessMicrobatch:
         data_dict.__getitem__ = MagicMock(
             side_effect=lambda k: input_ids if k == "input_ids" else seq_lengths
         )
-        data_dict.__contains__ = MagicMock(return_value=True)
+        # This fixture provides neither mtp_loss_mask nor routed_experts, so those
+        # optional packing branches must not fire.
+        data_dict.__contains__ = MagicMock(
+            side_effect=lambda k: k in {"input_ids", "input_lengths"}
+        )
 
         result = process_microbatch(
             data_dict,
@@ -231,6 +307,161 @@ class TestProcessMicrobatch:
 
         # Verify pack was called
         mock_pack.assert_called_once()
+
+    @patch("nemo_rl.models.megatron.data.get_ltor_masks_and_position_ids")
+    def test_process_microbatch_no_packing_propagates_mtp_loss_mask(
+        self, mock_get_masks
+    ):
+        """Without packing, a precomputed mtp_loss_mask is passed through."""
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        mock_get_masks.return_value = (
+            torch.ones(1, 4),
+            None,
+            torch.arange(4).unsqueeze(0),
+        )
+        input_ids = torch.tensor([[1, 2, 3, 4]])
+        mtp_loss_mask = torch.tensor([[1, 1, 0, 0]])
+        data_dict = {"input_ids": input_ids, "mtp_loss_mask": mtp_loss_mask}
+
+        result = process_microbatch(
+            data_dict, pack_sequences=False, straggler_timer=MagicMock()
+        )
+        assert result.mtp_loss_mask is not None
+        assert torch.equal(result.mtp_loss_mask, mtp_loss_mask)
+
+    @patch("nemo_rl.models.megatron.data.get_ltor_masks_and_position_ids")
+    def test_process_microbatch_no_packing_mtp_loss_mask_absent(self, mock_get_masks):
+        """mtp_loss_mask defaults to None when not provided."""
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        mock_get_masks.return_value = (
+            torch.ones(1, 4),
+            None,
+            torch.arange(4).unsqueeze(0),
+        )
+        data_dict = {"input_ids": torch.tensor([[1, 2, 3, 4]])}
+
+        result = process_microbatch(
+            data_dict, pack_sequences=False, straggler_timer=MagicMock()
+        )
+        assert result.mtp_loss_mask is None
+
+    @patch("nemo_rl.models.megatron.data.get_context_parallel_rank", return_value=0)
+    @patch(
+        "nemo_rl.models.megatron.data.get_context_parallel_world_size", return_value=1
+    )
+    @patch("nemo_rl.models.megatron.data._pack_sequences_for_megatron")
+    def test_process_microbatch_with_packing_packs_mtp_loss_mask(
+        self, mock_pack, mock_cp_world, mock_cp_rank
+    ):
+        """With packing, mtp_loss_mask is packed like input_ids and propagated."""
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        # Distinct tensors at index 0 and 1 so the assertion below can catch an
+        # off-by-one read (the implementation must take index 1, the CP-sharded
+        # packed tensor, not index 0).
+        packed_idx0 = torch.zeros(1, 8, dtype=torch.long)
+        packed_idx1 = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]])
+        mock_pack.return_value = (
+            packed_idx0,
+            packed_idx1,
+            MagicMock(),
+            torch.tensor([0, 5, 8], dtype=torch.int32),
+            torch.tensor([0, 5, 8], dtype=torch.int32),
+        )
+
+        data_dict = {
+            "input_ids": torch.tensor(
+                [[1, 2, 3, 4, 5, 0, 0, 0], [6, 7, 8, 0, 0, 0, 0, 0]]
+            ),
+            "input_lengths": torch.tensor([5, 3]),
+            "mtp_loss_mask": torch.tensor(
+                [[1, 1, 1, 1, 1, 0, 0, 0], [1, 1, 1, 0, 0, 0, 0, 0]]
+            ),
+        }
+
+        result = process_microbatch(
+            data_dict,
+            seq_length_key="input_lengths",
+            pack_sequences=True,
+            straggler_timer=MagicMock(),
+        )
+
+        # _pack_sequences_for_megatron is called once for input_ids and once for mtp_loss_mask.
+        assert mock_pack.call_count == 2
+        # mtp_loss_mask takes the packed tensor (index 1 of the pack return tuple).
+        assert result.mtp_loss_mask is not None
+        assert torch.equal(result.mtp_loss_mask, packed_idx1)
+
+    @patch("nemo_rl.models.megatron.data.get_context_parallel_rank", return_value=0)
+    @patch(
+        "nemo_rl.models.megatron.data.get_context_parallel_world_size", return_value=2
+    )
+    @patch("nemo_rl.models.megatron.data._shard_routed_experts_for_cp")
+    @patch("nemo_rl.models.megatron.data._pack_sequences_for_megatron")
+    def test_process_microbatch_packs_routed_experts_with_tokens(
+        self, mock_pack, mock_shard, mock_cp_world, mock_cp_rank
+    ):
+        """Test routed_experts follows the same per-seq zigzag CP path as tokens."""
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        input_ids = torch.tensor([[1, 2, 3, 0], [4, 5, 0, 0]])
+        seq_lengths = torch.tensor([3, 2])
+        routed_experts = torch.arange(2 * 4 * 3 * 2, dtype=torch.int32).reshape(
+            2, 4, 3, 2
+        )
+        # Each sequence is padded to a multiple of cp*2 (=4), packed to 8 tokens.
+        # The CP shard for rank 0 / cp_size 2 is the per-seq zigzag selection.
+        packed_tokens = torch.tensor([[1, 2, 3, 0, 4, 5, 0, 0]])
+        packed_routed_experts = torch.arange(1 * 8 * 3 * 2, dtype=torch.int32).reshape(
+            1, 8, 3, 2
+        )
+        # zigzag for cp_rank=0, cp_size=2 over a 4-token seq selects positions {0, 3}
+        cp_tokens = torch.tensor([[1, 0, 4, 0]])
+        cp_routed_experts = packed_routed_experts[:, [0, 3, 4, 7]]
+        cu_seqlens = torch.tensor([0, 3, 5], dtype=torch.int32)
+        cu_seqlens_padded = torch.tensor([0, 4, 8], dtype=torch.int32)
+        # Main's packer returns the 5-tuple (input_ids only); the routed expert CP
+        # sharding is delegated to the standalone helper.
+        mock_pack.return_value = (
+            packed_tokens,
+            cp_tokens,
+            MagicMock(),
+            cu_seqlens,
+            cu_seqlens_padded,
+        )
+        mock_shard.return_value = (
+            packed_routed_experts,
+            cp_routed_experts,
+            None,
+            None,
+        )
+
+        data_dict = {
+            "input_ids": input_ids,
+            "input_lengths": seq_lengths,
+            "routed_experts": routed_experts,
+        }
+
+        result = process_microbatch(
+            data_dict,
+            seq_length_key="input_lengths",
+            pack_sequences=True,
+            straggler_timer=MagicMock(),
+        )
+
+        # Main's packer is called with input_ids only (no routed_experts kwarg).
+        pack_args = mock_pack.call_args
+        assert torch.equal(pack_args.args[0], input_ids)
+        assert "routed_experts" not in pack_args.kwargs
+        # The helper does the routed expert CP sharding.
+        shard_args = mock_shard.call_args
+        assert torch.equal(shard_args.args[0], routed_experts)
+        assert torch.equal(result.input_ids, packed_tokens)
+        assert torch.equal(result.input_ids_cp_sharded, cp_tokens)
+        assert torch.equal(result.routed_experts, packed_routed_experts)
+        assert torch.equal(result.routed_experts_cp_sharded, cp_routed_experts)
 
     def test_process_microbatch_packing_requires_seq_length_key(self):
         """Test that packing requires seq_length_key."""
@@ -302,7 +533,12 @@ class TestProcessMicrobatch:
         data_dict.__getitem__ = MagicMock(
             side_effect=lambda k: input_ids if k == "input_ids" else seq_lengths
         )
-        data_dict.__contains__ = MagicMock(return_value=True)
+        # A self-packing VLM batch carries no routed_experts; membership must
+        # reflect the real keys so process_microbatch does not mis-read a 1-D
+        # tensor as routed_experts.
+        data_dict.__contains__ = MagicMock(
+            side_effect=lambda k: k in {"input_ids", "input_lengths"}
+        )
 
         result = process_microbatch(
             data_dict,
@@ -1021,6 +1257,97 @@ def test_pack_sequences_with_context_parallel(pack_sequences_setup):
                     print(f"  {test_name}: {status}")
                     if not test_result["success"]:
                         print(f"    Error: {test_result['error']}")
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize("cp_size", [1, 2], ids=["cp1", "cp2"])
+def test_shard_routed_experts_for_cp_matches_input_ids_zigzag(cp_size):
+    """_shard_routed_experts_for_cp selects the SAME tokens as the input_ids zigzag.
+
+    Pure CPU tensor ops: no Ray/GPU/mcore-runtime needed (the @pytest.mark.mcore
+    marker only gates that nemo_rl.models.megatron.data is importable). The routed
+    expert [.,.,0,0] channel encodes each token's packed value; after the helper
+    re-derives the per-seq padded boundaries from cu_seqlens_padded and applies the
+    same per-seq zigzag, the CP-sharded routed channel must equal the CP-sharded
+    input_ids on every layer.
+    """
+    from nemo_rl.models.megatron.data import (
+        _pack_sequences_for_megatron,
+        _shard_routed_experts_for_cp,
+    )
+
+    pad_to_multiple = cp_size * 2  # per-seq pad factor; zigzag requires 2*cp alignment
+    num_layers = 3
+    topk = 2
+    batch_size = 2
+    seq_lengths = torch.tensor([3, 5], dtype=torch.int32)
+    max_seq_len = int(seq_lengths.max())
+
+    # Encode each token's value as a unique nonzero code so the zigzag SELECTION
+    # (which source positions land on this rank) is observable. Padding stays 0.
+    input_ids = torch.zeros(batch_size, max_seq_len, dtype=torch.long)
+    routed_experts = torch.zeros(
+        batch_size, max_seq_len, num_layers, topk, dtype=torch.int32
+    )
+    for b in range(batch_size):
+        for t in range(int(seq_lengths[b])):
+            code = 100 * b + t + 1  # nonzero, unique per (b, t)
+            input_ids[b, t] = code
+            # [.,.,*,0] = the token code on every layer; [.,.,*,1] = a valid 2nd route
+            routed_experts[b, t, :, 0] = code
+            routed_experts[b, t, :, 1] = code + 1000
+
+    (
+        _all_input_ids,
+        input_ids_cp_sharded,
+        _packed_seq_params,
+        cu_seqlens,
+        cu_seqlens_padded,
+    ) = _pack_sequences_for_megatron(
+        input_ids,
+        seq_lengths,
+        pad_individual_seqs_to_multiple_of=pad_to_multiple,
+        cp_rank=0,
+        cp_size=cp_size,
+    )
+
+    (
+        routed_packed,
+        routed_cp_sharded,
+        identity_packed,
+        identity_cp_sharded,
+    ) = _shard_routed_experts_for_cp(
+        routed_experts,
+        None,
+        seq_lengths,
+        cu_seqlens,
+        cu_seqlens_padded,
+        cp_rank=0,
+        cp_size=cp_size,
+    )
+
+    # token_identity was None -> both identity outputs are None.
+    assert identity_packed is None
+    assert identity_cp_sharded is None
+
+    # (a) routed CP token axis length matches the input_ids CP token axis length.
+    assert routed_cp_sharded.shape[1] == input_ids_cp_sharded.shape[1]
+
+    # (b) the CP-sharded routed positions equal the CP-sharded input_ids positions
+    #     (identical zigzag selection) on every MoE layer.
+    for layer in range(num_layers):
+        assert torch.equal(
+            routed_cp_sharded[0, :, layer, 0].to(torch.long),
+            input_ids_cp_sharded[0].to(torch.long),
+        )
+
+    # (c) pad rows in the packed (pre-shard) routed buffer are arange(topk).
+    #     seq 0 has length 3 padded to pad_to_multiple, so any trailing rows are pads.
+    expected_route = torch.arange(topk, dtype=routed_packed.dtype)
+    seq0_padded_len = int(cu_seqlens_padded[1] - cu_seqlens_padded[0])
+    for pad_pos in range(int(seq_lengths[0]), seq0_padded_len):
+        for layer in range(num_layers):
+            assert torch.equal(routed_packed[0, pad_pos, layer], expected_route)
 
 
 GET_PACK_SEQUENCE_PARAMETERS_TEST_ACTOR_FQN = f"{GetPackSequenceParametersTestActor.__module__}.GetPackSequenceParametersTestActor"

@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -28,6 +28,10 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
 from nemo_rl.models.megatron.common import _round_up_to_multiple
+from nemo_rl.utils.r3_trace import (
+    r3_trace_verify_forward_enabled,
+    trace_cp_routed_experts,
+)
 
 
 @dataclass
@@ -40,6 +44,9 @@ class ProcessedInputs:
     position_ids: Optional[torch.Tensor]
     packed_seq_params: Optional[PackedSeqParams]
     cu_seqlens_padded: Optional[torch.Tensor]
+    mtp_loss_mask: Optional[torch.Tensor] = None
+    routed_experts: Optional[torch.Tensor] = None
+    routed_experts_cp_sharded: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -57,6 +64,10 @@ class ProcessedMicrobatch:
         position_ids: Position IDs tensor (None for packed sequences)
         packed_seq_params: PackedSeqParams for sequence packing (None if not packing)
         cu_seqlens_padded: Padded cumulative sequence lengths (None if not packing)
+        mtp_loss_mask: Pre-computed MTP loss mask (token_mask × sample_mask).
+            None when MTP is disabled or token/sample masks are absent.
+        routed_experts: Optional token-aligned routed expert ids
+        routed_experts_cp_sharded: Context-parallel sharded routed expert ids
     """
 
     data_dict: BatchedDataDict[Any]
@@ -66,6 +77,9 @@ class ProcessedMicrobatch:
     position_ids: Optional[torch.Tensor]
     packed_seq_params: Optional[PackedSeqParams]
     cu_seqlens_padded: Optional[torch.Tensor]
+    mtp_loss_mask: Optional[torch.Tensor] = None
+    routed_experts: Optional[torch.Tensor] = None
+    routed_experts_cp_sharded: Optional[torch.Tensor] = None
 
 
 def make_processed_microbatch_iterator(
@@ -121,6 +135,9 @@ def make_processed_microbatch_iterator(
             position_ids=processed_inputs.position_ids,
             packed_seq_params=processed_inputs.packed_seq_params,
             cu_seqlens_padded=processed_inputs.cu_seqlens_padded,
+            mtp_loss_mask=processed_inputs.mtp_loss_mask,
+            routed_experts=processed_inputs.routed_experts,
+            routed_experts_cp_sharded=processed_inputs.routed_experts_cp_sharded,
         )
 
 
@@ -230,14 +247,7 @@ def process_microbatch(
     pack_sequences: bool = False,
     delegate_pack_to_model: bool = False,
     straggler_timer: Optional[StragglerDetector] = None,
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    Optional[torch.Tensor],
-    Optional[torch.Tensor],
-    Optional[PackedSeqParams],
-    Optional[torch.Tensor],
-]:
+) -> ProcessedInputs:
     """Process a microbatch for Megatron model forward pass."""
     ctx = straggler_timer(bdata=True) if straggler_timer is not None else nullcontext()
     with ctx:
@@ -245,12 +255,23 @@ def process_microbatch(
         attention_mask = None
         position_ids = None
         packed_seq_params = None
+        routed_experts = (
+            data_dict["routed_experts"] if "routed_experts" in data_dict else None
+        )
+        token_identity_cp_sharded = None
+        if routed_experts is not None and routed_experts.dim() != 4:
+            raise ValueError(
+                "routed_experts must have shape [batch, seq, num_moe_layers, topk] "
+                f"before Megatron packing; got {tuple(routed_experts.shape)}"
+            )
+        routed_experts_cp_sharded = routed_experts
 
         original_batch_size = input_ids.shape[0]
         original_seq_length = input_ids.shape[1]
         seq_lengths = None  # Will be set if using packed sequences
         cu_seqlens = None
         cu_seqlens_padded = None
+        mtp_loss_mask = None
 
         if pack_sequences:
             # For packed sequences with padded input, we need sequence lengths
@@ -265,11 +286,27 @@ def process_microbatch(
             seq_lengths = data_dict[seq_length_key]
 
             if delegate_pack_to_model:
+                # The VLM packing path does not pack or propagate mtp_loss_mask,
+                # so MTP training would be silently dropped here. Fail loudly
+                # instead of producing wrong results.
+                assert "mtp_loss_mask" not in data_dict, (
+                    "MTP training is not supported with VLM sequence packing"
+                )
                 # VLM path: model (e.g. mbridge Qwen3VL) does its own
                 # preprocess_packed_seqs; NeMo-RL must NOT pre-pack + CP-shard,
                 # or the double-processing produces shape mismatches downstream
                 # (GDN/RoPE/MoE). We only pad each sequence individually and
                 # hand the model [B, max_seq] + bool attention_mask + cu_seqlens.
+                if routed_experts is not None:
+                    # Router replay needs routed_experts CP-sharded into the
+                    # model's local token order, but a self-packing model packs
+                    # and CP-shards internally, so NeMo-RL cannot build a matching
+                    # layout here. Fail loudly rather than feed misaligned routes.
+                    raise NotImplementedError(
+                        "Router replay (routed_experts) is not supported with "
+                        "models that pack and context-parallel shard internally "
+                        "(delegate_pack_to_model=True)."
+                    )
                 (
                     input_ids,
                     input_ids_cp_sharded,
@@ -285,7 +322,13 @@ def process_microbatch(
                 )
                 position_ids = None
             else:
-                # Pack sequences
+                token_identity = None
+                if routed_experts is not None and r3_trace_verify_forward_enabled():
+                    token_identity = _make_r3_trace_token_identity(
+                        input_ids, seq_lengths
+                    )
+
+                # Pack sequences on main's per-sequence zigzag CP layout.
                 (
                     input_ids,
                     input_ids_cp_sharded,
@@ -301,13 +344,105 @@ def process_microbatch(
                     cp_rank=get_context_parallel_rank(),
                     cp_size=get_context_parallel_world_size(),
                 )
+                # routed_experts and the R3 trace token identity ride the SAME
+                # per-seq zigzag CP sharding as input_ids, re-derived from
+                # cu_seqlens_padded.
+                if routed_experts is not None:
+                    (
+                        routed_experts,
+                        routed_experts_cp_sharded,
+                        _token_identity_packed,
+                        token_identity_cp_sharded,
+                    ) = _shard_routed_experts_for_cp(
+                        routed_experts,
+                        token_identity,
+                        seq_lengths,
+                        cu_seqlens,
+                        cu_seqlens_padded,
+                        get_context_parallel_rank(),
+                        get_context_parallel_world_size(),
+                    )
+                if (
+                    routed_experts_cp_sharded is not None
+                    and routed_experts_cp_sharded.dim() != 4
+                ):
+                    raise ValueError(
+                        "CP-sharded routed_experts must have shape [1, tokens, "
+                        "num_moe_layers, topk] after Megatron packing; got "
+                        f"{tuple(routed_experts_cp_sharded.shape)}"
+                    )
+                verified_token_count = _verify_r3_trace_cp_token_alignment(
+                    source_input_ids=data_dict["input_ids"],
+                    source_routed_experts=data_dict.get("routed_experts"),
+                    input_ids_cp_sharded=input_ids_cp_sharded,
+                    routed_experts_cp_sharded=routed_experts_cp_sharded,
+                    token_identity_cp_sharded=token_identity_cp_sharded,
+                )
+                trace_cp_routed_experts(
+                    routed_experts_cp_sharded=routed_experts_cp_sharded,
+                    token_identity_cp_sharded=token_identity_cp_sharded,
+                    input_ids_cp_sharded=input_ids_cp_sharded,
+                    cp_token_identity_verified_count=verified_token_count,
+                    cp_rank=get_context_parallel_rank(),
+                    cp_size=get_context_parallel_world_size(),
+                )
+
+                # Pack pre-computed mtp_loss_mask the same way as input_ids
+                if "mtp_loss_mask" in data_dict:
+                    (
+                        _,
+                        mtp_loss_mask,
+                        _,
+                        _,
+                        _,
+                    ) = _pack_sequences_for_megatron(
+                        data_dict["mtp_loss_mask"],
+                        seq_lengths,
+                        pad_individual_seqs_to_multiple_of,
+                        pad_packed_seq_to_multiple_of,
+                        pad_full_seq_to,
+                        cp_rank=get_context_parallel_rank(),
+                        cp_size=get_context_parallel_world_size(),
+                    )
 
                 # For packed sequences, position_ids and attention_mask are typically None
                 # The PackedSeqParams handles all necessary sequence information
                 position_ids = None
                 attention_mask = None
         else:
+            if routed_experts is not None:
+                if "input_lengths" not in data_dict:
+                    raise ValueError(
+                        "routed_experts requires input_lengths when sequence packing "
+                        "is disabled so padding rows can be repaired before router "
+                        "replay."
+                    )
+                routed_experts = _fill_routed_experts_padding(
+                    routed_experts,
+                    data_dict["input_lengths"],
+                )
+                routed_experts_cp_sharded = routed_experts
+                if r3_trace_verify_forward_enabled():
+                    token_identity_cp_sharded = _make_r3_trace_token_identity(
+                        input_ids,
+                        data_dict["input_lengths"],
+                    )
             input_ids_cp_sharded = input_ids
+            verified_token_count = _verify_r3_trace_cp_token_alignment(
+                source_input_ids=data_dict["input_ids"],
+                source_routed_experts=data_dict.get("routed_experts"),
+                input_ids_cp_sharded=input_ids_cp_sharded,
+                routed_experts_cp_sharded=routed_experts_cp_sharded,
+                token_identity_cp_sharded=token_identity_cp_sharded,
+            )
+            trace_cp_routed_experts(
+                routed_experts_cp_sharded=routed_experts_cp_sharded,
+                token_identity_cp_sharded=token_identity_cp_sharded,
+                input_ids_cp_sharded=input_ids_cp_sharded,
+                cp_token_identity_verified_count=verified_token_count,
+                cp_rank=get_context_parallel_rank(),
+                cp_size=get_context_parallel_world_size(),
+            )
             attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
                 data=input_ids,
                 eod_token=0,  # used for loss_mask, which we don't use
@@ -317,6 +452,8 @@ def process_microbatch(
                 eod_mask_loss=False,
                 pad_mask_loss=False,
             )
+            if "mtp_loss_mask" in data_dict:
+                mtp_loss_mask = data_dict["mtp_loss_mask"]
     return ProcessedInputs(
         input_ids=input_ids,
         input_ids_cp_sharded=input_ids_cp_sharded,
@@ -324,7 +461,160 @@ def process_microbatch(
         position_ids=position_ids,
         packed_seq_params=packed_seq_params,
         cu_seqlens_padded=cu_seqlens_padded,
+        mtp_loss_mask=mtp_loss_mask,
+        routed_experts=routed_experts,
+        routed_experts_cp_sharded=routed_experts_cp_sharded,
     )
+
+
+def _make_r3_trace_token_identity(
+    input_ids: torch.Tensor,
+    seq_lengths: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Build debug-only ``[batch_idx, token_pos, valid]`` token identities."""
+    batch_size, seq_len = input_ids.shape[:2]
+    batch_idx = torch.arange(
+        batch_size,
+        dtype=torch.int32,
+        device=input_ids.device,
+    ).view(batch_size, 1, 1)
+    token_pos = torch.arange(
+        seq_len,
+        dtype=torch.int32,
+        device=input_ids.device,
+    ).view(1, seq_len, 1)
+    if seq_lengths is None:
+        valid = torch.ones(
+            batch_size,
+            seq_len,
+            1,
+            dtype=torch.int32,
+            device=input_ids.device,
+        )
+    else:
+        valid = (
+            token_pos.expand(batch_size, seq_len, 1)
+            < seq_lengths.to(device=input_ids.device, dtype=torch.int32).view(
+                batch_size,
+                1,
+                1,
+            )
+        ).to(dtype=torch.int32)
+    return torch.cat(
+        (
+            batch_idx.expand(batch_size, seq_len, 1),
+            token_pos.expand(batch_size, seq_len, 1),
+            valid,
+        ),
+        dim=-1,
+    )
+
+
+def _verify_r3_trace_cp_token_alignment(
+    *,
+    source_input_ids: torch.Tensor,
+    source_routed_experts: Optional[torch.Tensor],
+    input_ids_cp_sharded: torch.Tensor,
+    routed_experts_cp_sharded: Optional[torch.Tensor],
+    token_identity_cp_sharded: Optional[torch.Tensor],
+) -> Optional[int]:
+    """Verify debug identities line up with CP-local tokens and routed experts."""
+    if not r3_trace_verify_forward_enabled() or token_identity_cp_sharded is None:
+        return None
+    if source_routed_experts is None or routed_experts_cp_sharded is None:
+        raise RuntimeError(
+            "R3 forward verifier expected routed_experts and token identity tensors "
+            "to be present together."
+        )
+    if token_identity_cp_sharded.shape[-1] != 3:
+        raise RuntimeError(
+            "R3 token identity must have trailing [batch_idx, token_pos, valid] "
+            f"dimension; got {tuple(token_identity_cp_sharded.shape)}"
+        )
+
+    flat_identity = token_identity_cp_sharded.reshape(-1, 3).to(dtype=torch.long)
+    flat_tokens = input_ids_cp_sharded.reshape(-1)
+    flat_routed = routed_experts_cp_sharded.reshape(
+        -1,
+        *routed_experts_cp_sharded.shape[2:],
+    )
+    if (
+        flat_identity.shape[0] != flat_tokens.shape[0]
+        or flat_identity.shape[0] != flat_routed.shape[0]
+    ):
+        raise RuntimeError(
+            "R3 token identity, input_ids, and routed_experts CP slices have "
+            "different token counts: "
+            f"identity={flat_identity.shape[0]} tokens={flat_tokens.shape[0]} "
+            f"routed={flat_routed.shape[0]}"
+        )
+
+    valid_mask = flat_identity[:, 2] == 1
+    checked = int(valid_mask.sum().item())
+    if checked == 0:
+        return 0
+
+    source_rows = flat_identity[valid_mask, 0]
+    source_cols = flat_identity[valid_mask, 1]
+    expected_tokens = source_input_ids[source_rows, source_cols].to(
+        device=flat_tokens.device,
+        dtype=flat_tokens.dtype,
+    )
+    actual_tokens = flat_tokens[valid_mask]
+    if not bool(torch.equal(actual_tokens, expected_tokens)):
+        raise RuntimeError(
+            "R3 CP token identity verifier found input_ids that do not match "
+            "their source [batch_idx, token_pos] identities."
+        )
+
+    expected_routed = source_routed_experts[source_rows, source_cols].to(
+        device=flat_routed.device,
+        dtype=flat_routed.dtype,
+    )
+    actual_routed = flat_routed[valid_mask]
+    if not bool(torch.equal(actual_routed, expected_routed)):
+        raise RuntimeError(
+            "R3 CP token identity verifier found routed_experts that do not match "
+            "their source [batch_idx, token_pos] identities."
+        )
+
+    return checked
+
+
+def _fill_routed_experts_padding(
+    routed_experts: torch.Tensor,
+    seq_lengths: torch.Tensor,
+) -> torch.Tensor:
+    """Replace materialized jagged padding with a valid dummy top-k route."""
+    if routed_experts.dim() != 4:
+        raise ValueError(
+            "routed_experts must have shape [batch, seq, num_moe_layers, topk]; "
+            f"got {tuple(routed_experts.shape)}"
+        )
+    if seq_lengths.shape != (routed_experts.shape[0],):
+        raise ValueError(
+            "seq_lengths must have one entry per routed_experts row; "
+            f"got {tuple(seq_lengths.shape)} for batch={routed_experts.shape[0]}"
+        )
+
+    seq_lengths = seq_lengths.to(device=routed_experts.device, dtype=torch.long)
+    seq_positions = torch.arange(
+        routed_experts.shape[1],
+        device=routed_experts.device,
+    ).unsqueeze(0)
+    padding_mask = seq_positions >= seq_lengths.unsqueeze(1)
+    if not bool(padding_mask.any().item()):
+        return routed_experts
+
+    repaired = routed_experts.clone()
+    default_route = torch.arange(
+        routed_experts.shape[-1],
+        dtype=routed_experts.dtype,
+        device=routed_experts.device,
+    ).view(1, 1, 1, routed_experts.shape[-1])
+    default_routes = default_route.expand_as(repaired)
+    repaired[padding_mask] = default_routes[padding_mask]
+    return repaired
 
 
 def process_global_batch(
@@ -695,6 +985,117 @@ def _pack_sequences_for_megatron(
         cu_seqlens,
         cu_seqlens_padded,
     )
+
+
+def _shard_routed_experts_for_cp(
+    routed_experts: Optional[torch.Tensor],  # [B, S, L, K] or None
+    token_identity: Optional[
+        torch.Tensor
+    ],  # [B, S, 3] or None (R3 forward verifier, debug)
+    seq_lengths: torch.Tensor,  # [B]
+    cu_seqlens: torch.Tensor,  # [B+1] valid cumulative (from _pack_sequences_for_megatron)
+    cu_seqlens_padded: Optional[
+        torch.Tensor
+    ],  # [B+1] padded cumulative (None when no padding)
+    cp_rank: int,
+    cp_size: int,
+) -> tuple[
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+]:
+    """CP-shard routed_experts / token_identity onto main's per-seq packed layout.
+
+    Mirrors _pack_sequences_for_megatron's per-sequence zigzag for input_ids: each
+    sequence is padded to its padded length (from cu_seqlens_padded, so boundaries are
+    IDENTICAL to input_ids) then sharded with _get_tokens_on_this_cp_rank(seq_dim=0).
+    routed_experts pad rows use arange(topk) (a valid top-k route; mcore
+    _validate_replay_tensor rejects 0/dup/-1). token_identity pads with 0 (verifier skips).
+    No roll (these are per-token, not next-token targets).
+    Returns (routed_packed, routed_cp_sharded, identity_packed, identity_cp_sharded),
+    each [1, T(/cp), ...] or None.
+
+    This additive helper is the only routed_experts-specific CP code path.
+    """
+    batch_size = seq_lengths.shape[0]
+
+    all_routed = [] if routed_experts is not None else None
+    cp_routed = [] if routed_experts is not None else None
+    all_identity = [] if token_identity is not None else None
+    cp_identity = [] if token_identity is not None else None
+    topk = routed_experts.shape[-1] if routed_experts is not None else None
+
+    for b in range(batch_size):
+        seq_len = int(seq_lengths[b])
+        if cu_seqlens_padded is not None:
+            padded_len = int(cu_seqlens_padded[b + 1] - cu_seqlens_padded[b])
+        else:
+            padded_len = int(cu_seqlens[b + 1] - cu_seqlens[b])
+
+        if routed_experts is not None:
+            # [seq_len, num_moe_layers, topk] padded to the SAME padded_len boundary as
+            # input_ids so the routes ride the same per-seq zigzag.
+            re = routed_experts[b, :seq_len]
+            if padded_len > seq_len:
+                # mcore _validate_replay_tensor rejects zero/duplicate/-1 routes,
+                # so pad each row with a valid top-k route arange(topk).
+                default_route = torch.arange(
+                    topk,
+                    dtype=re.dtype,
+                    device=re.device,
+                ).view(1, 1, topk)
+                pad_rows = default_route.expand(
+                    padded_len - seq_len,
+                    re.shape[1],
+                    topk,
+                )
+                re = torch.cat((re, pad_rows), dim=0)
+            all_routed.append(re)
+            re_cp = (
+                _get_tokens_on_this_cp_rank(re, cp_rank, cp_size, seq_dim=0)
+                if cp_size > 1
+                else re
+            )
+            cp_routed.append(re_cp)
+
+        if token_identity is not None:
+            # [seq_len, 3] padded to the SAME padded_len boundary
+            id = token_identity[b, :seq_len]
+            if padded_len > seq_len:
+                # pad rows with valid=0 so the verifier skips them
+                id = torch.nn.functional.pad(
+                    id,
+                    (0, 0, 0, padded_len - seq_len),
+                    value=0,
+                )
+            all_identity.append(id)
+            id_cp = (
+                _get_tokens_on_this_cp_rank(id, cp_rank, cp_size, seq_dim=0)
+                if cp_size > 1
+                else id
+            )
+            cp_identity.append(id_cp)
+
+    routed_packed = (
+        torch.cat(all_routed, dim=0).unsqueeze(0)
+        if routed_experts is not None
+        else None
+    )
+    routed_cp_sharded = (
+        torch.cat(cp_routed, dim=0).unsqueeze(0) if routed_experts is not None else None
+    )
+    identity_packed = (
+        torch.cat(all_identity, dim=0).unsqueeze(0)
+        if token_identity is not None
+        else None
+    )
+    identity_cp_sharded = (
+        torch.cat(cp_identity, dim=0).unsqueeze(0)
+        if token_identity is not None
+        else None
+    )
+    return routed_packed, routed_cp_sharded, identity_packed, identity_cp_sharded
 
 
 def _get_pack_sequence_parameters_for_megatron(
