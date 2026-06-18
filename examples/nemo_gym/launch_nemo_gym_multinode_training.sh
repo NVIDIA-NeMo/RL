@@ -131,6 +131,7 @@ NEMO_GYM_SWE_SIF_DIR="${CONTAINER_NEMO_GYM_SWE_SIF_DIR}" \
 uv run examples/nemo_gym/run_grpo_nemo_gym.py \
     --config ${RECIPE} \
     ++logger.mlperf_enabled=True \
+    ++logger.mlperf.log_file=${OUT_DIR}/logs/mllogger.log \
     ++logger.mlperf.benchmark=grpo_nemo_gym \
     ++logger.mlperf.target_accuracy=${MLPERF_TARGET_ACCURACY:-1.0} \
     ++logger.mlperf.force_success_status=False \
