@@ -12,5 +12,4 @@ python /workspace/build_swe_sif_images.py \
     --max-workers $MAX_WORKERS \
     --sif-dir $SIF_DIR \
     --work-dir $WORK_DIR \
-    --registry $DOCKER_REGISTRY \
-    $@
+    --registry $DOCKER_REGISTRY
