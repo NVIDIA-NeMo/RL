@@ -41,6 +41,8 @@ docker/*
 !docker/README.md
 !docker/gym/
 !docker/gym/*
+!docker/dataset-processing-container/
+!docker/dataset-processing-container/*
 wandb/
 checkpoints/
 results/
