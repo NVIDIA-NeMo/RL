@@ -1,0 +1,15 @@
+defaults: ../../ppo_gsm8k_1.5B_megatron.yaml
+value:
+  make_sequence_length_divisible_by: 8
+  megatron_cfg:
+    pipeline_model_parallel_size: 2
+    context_parallel_size: 2
+    sequence_parallel: true
+  sequence_packing:
+    enabled: true
+checkpointing:
+  checkpoint_dir: results/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron-valuetp2sp-pp2cp2-pack
+logger:
+  log_dir: logs/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron-valuetp2sp-pp2cp2-pack
+  wandb:
+    name: ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron-valuetp2sp-pp2cp2-pack
