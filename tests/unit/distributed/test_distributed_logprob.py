@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for DistributedLogprob and ChunkedDistributedLogprob using mp.spawn.
+"""Tests for distributed logprob kernels and logprob adapters.
 
-These tests use the distributed_test_runner fixture (torch.multiprocessing.spawn)
-so that code coverage is captured by pytest-cov, unlike the Ray actor-based tests
-in test_model_utils.py where execution happens in separate Ray worker processes.
+Most distributed kernel tests use the distributed_test_runner fixture
+(torch.multiprocessing.spawn) so that code coverage is captured by pytest-cov,
+unlike the Ray actor-based tests in test_model_utils.py where execution happens
+in separate Ray worker processes.
 """
 
 import functools
@@ -24,12 +25,17 @@ import functools
 import pytest
 import torch
 
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    apply_top_k_top_p,
+)
 from nemo_rl.distributed.model_utils import (
     ChunkedDistributedEntropy,
     ChunkedDistributedGatherLogprob,
     ChunkedDistributedLogprob,
     DistributedLogprob,
     _compute_distributed_log_softmax,
+    get_next_token_logprobs_from_logits,
 )
 
 
@@ -40,6 +46,95 @@ def _torch_baseline_logprob(full_logits, target):
     target_mask = target >= 0
     log_probs = log_probs * target_mask.float()
     return log_probs
+
+
+def test_get_next_token_logprobs_from_logits_local_matches_torch_cpu():
+    """Test the backend-neutral local logits adapter on CPU tensors."""
+    input_ids = torch.tensor(
+        [
+            [0, 3, 1, 4],
+            [2, 0, 2, 1],
+        ],
+        dtype=torch.long,
+    )
+    logits = torch.tensor(
+        [
+            [
+                [0.2, 0.4, 0.1, 1.2, -0.5],
+                [1.0, 1.4, 0.2, -0.1, 0.5],
+                [0.0, 0.3, 0.7, 0.9, 1.3],
+                [0.5, 0.6, 0.7, 0.8, 0.9],
+            ],
+            [
+                [2.0, 0.1, -0.2, 0.4, 0.3],
+                [0.2, 0.9, 1.7, 0.3, -0.4],
+                [0.0, 2.1, 0.5, 0.7, 0.1],
+                [0.4, 0.2, 0.1, 0.3, 0.5],
+            ],
+        ],
+        dtype=torch.float32,
+    )
+
+    actual = get_next_token_logprobs_from_logits(
+        input_ids=input_ids,
+        next_token_logits=logits,
+    )
+
+    expected_logprobs = torch.nn.functional.log_softmax(logits[:, :-1], dim=-1)
+    expected = expected_logprobs.gather(
+        dim=-1, index=input_ids[:, 1:].unsqueeze(-1)
+    ).squeeze(-1)
+
+    assert actual.device == logits.device
+    torch.testing.assert_close(actual, expected)
+
+
+def test_get_next_token_logprobs_from_logits_local_with_top_k_matches_filtering():
+    """Test local logits adapter with top-k filtering on CPU tensors."""
+    input_ids = torch.tensor(
+        [
+            [0, 3, 1, 4],
+            [2, 0, 2, 1],
+        ],
+        dtype=torch.long,
+    )
+    logits = torch.tensor(
+        [
+            [
+                [0.0, 1.0, 2.0, 4.0, 3.0],
+                [0.0, 4.0, 1.0, 3.0, 2.0],
+                [2.0, 1.0, 0.0, 3.0, 4.0],
+                [0.5, 0.6, 0.7, 0.8, 0.9],
+            ],
+            [
+                [5.0, 1.0, 0.5, 3.0, 2.0],
+                [0.0, 1.0, 5.0, 3.0, 2.0],
+                [2.0, 5.0, 0.0, 3.0, 4.0],
+                [0.4, 0.2, 0.1, 0.3, 0.5],
+            ],
+        ],
+        dtype=torch.float32,
+    )
+    sampling_params = TrainingSamplingParams(top_k=2)
+
+    actual = get_next_token_logprobs_from_logits(
+        input_ids=input_ids,
+        next_token_logits=logits,
+        sampling_params=sampling_params,
+    )
+
+    filtered_logits, _ = apply_top_k_top_p(
+        logits[:, :-1],
+        top_k=sampling_params.top_k,
+        top_p=sampling_params.top_p,
+    )
+    expected_logprobs = torch.nn.functional.log_softmax(filtered_logits, dim=-1)
+    expected = expected_logprobs.gather(
+        dim=-1, index=input_ids[:, 1:].unsqueeze(-1)
+    ).squeeze(-1)
+
+    assert actual.device == logits.device
+    torch.testing.assert_close(actual, expected)
 
 
 def _run_logprob_forward_and_backward(rank, world_size, tp_size, chunk_size):
