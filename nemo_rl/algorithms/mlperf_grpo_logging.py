@@ -172,6 +172,7 @@ class MLPerfGRPOLogger:
         optimizer_cfg = megatron_cfg.get("optimizer", {})
         scheduler_cfg = megatron_cfg.get("scheduler", {})
         generation_cfg = policy_cfg.get("generation", {})
+        backend_cfg = generation_cfg.get("vllm_cfg", {})
 
         benchmark = str(self.mlperf_config.get("benchmark", "grpo_nemo_gym"))
 
@@ -192,14 +193,13 @@ class MLPerfGRPOLogger:
         if eval_samples is None:
             eval_samples = grpo_cfg.get("max_val_samples")
 
+        # fmt: off
         logging_configs = {
             self.constants.SEED: grpo_cfg.get("seed"),
             self.constants.MAX_STEPS: grpo_cfg.get("max_num_steps"),
             self.constants.GLOBAL_BATCH_SIZE: self.global_batch_size,
             self.constants.MICRO_BATCH_SIZE: policy_cfg.get("train_micro_batch_size"),
-            self.constants.MAX_SEQUENCE_LENGTH: policy_cfg.get(
-                "max_total_sequence_length"
-            ),
+            self.constants.MAX_SEQUENCE_LENGTH: policy_cfg.get("max_total_sequence_length"),
             self.constants.TRAIN_SAMPLES: train_samples,
             self.constants.EVAL_SAMPLES: eval_samples,
             self.constants.INIT_CHECKPOINT_STEP: 0,
@@ -214,31 +214,25 @@ class MLPerfGRPOLogger:
             self.constants.OPT_LR_WARMUP_STEPS: scheduler_cfg.get("lr_warmup_iters"),
             self.constants.OPT_LR_DECAY_STEPS: scheduler_cfg.get("lr_decay_iters"),
             self.constants.OPT_LR_DECAY_SCHEDULE: scheduler_cfg.get("lr_decay_style"),
-            self.constants.TENSOR_PARALLELISM: megatron_cfg.get(
-                "tensor_model_parallel_size"
-            ),
-            self.constants.PIPELINE_PARALLELISM: megatron_cfg.get(
-                "pipeline_model_parallel_size"
-            ),
-            self.constants.CONTEXT_PARALLELISM: megatron_cfg.get(
-                "context_parallel_size"
-            ),
-            self.constants.EXPERT_PARALLELISM: megatron_cfg.get(
-                "expert_model_parallel_size"
-            ),
-            "training_rollout_temperature": generation_cfg.get("temperature"),
-            "training_rollout_top_p": generation_cfg.get("top_p"),
-            "validation_rollout_temperature": grpo_cfg.get(
-                "validation_generation", {}
-            ).get("temperature"),
-            "validation_rollout_top_p": grpo_cfg.get("validation_generation", {}).get(
-                "top_p"
-            ),
+            # Training step parallelism
+            self.constants.TENSOR_PARALLELISM: megatron_cfg.get("tensor_model_parallel_size"),
+            self.constants.PIPELINE_PARALLELISM: megatron_cfg.get("pipeline_model_parallel_size"),
+            self.constants.CONTEXT_PARALLELISM: megatron_cfg.get("context_parallel_size"),
+            self.constants.EXPERT_PARALLELISM: megatron_cfg.get("expert_model_parallel_size"),
+            # Generation parallelism
+            "generation_backend": generation_cfg.get("backend"),
+            "generation_tensor_parallelism": backend_cfg.get("tensor_parallel_size"),
+            "generation_pipeline_parallelism": backend_cfg.get("pipeline_parallel_size"),
+            "generation_expert_parallelism": backend_cfg.get("expert_parallel_size"),
+            "generation_training_rollout_temperature": generation_cfg.get("temperature"),
+            "generation_training_rollout_top_p": generation_cfg.get("top_p"),
+            "generation_validation_rollout_temperature": grpo_cfg.get("validation_generation", {}).get("temperature"),
+            "generation_validation_rollout_top_p": grpo_cfg.get("validation_generation", {}).get( "top_p"),
             "num_prompts_per_step": grpo_cfg.get("num_prompts_per_step"),
             "num_generations_per_prompt": grpo_cfg.get("num_generations_per_prompt"),
             "target_accuracy": self.target_accuracy,
-            "generation_backend": generation_cfg.get("backend"),
         }
+        # fmt: on
 
         for key, value in logging_configs.items():
             if value is not None:
