@@ -46,11 +46,14 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 uv python install --default python3.12
 EOF
 
+RUN <<'EOF'
+git clone --branch mlperf-grpo https://github.com/filaretov/r2e-gym-arm-build /workspace/repos/r2e-gym-arm-build
+EOF
+
 COPY --chmod=0755 run-r2e-gym-build-images.sh .
 COPY --chmod=0755 run-build-sif-images.sh .
 COPY --chmod=0755 entrypoint.sh .
 COPY --chmod=0666 r2e-gym-instances-to-build.txt .
-COPY --chmod=0666 build_r2e_gym_images.py .
 COPY --chmod=0666 build_swe_sif_images.py .
 
 ENTRYPOINT ["/workspace/entrypoint.sh"]
