@@ -762,12 +762,15 @@ def setup_model_and_optimizer(
 
     # Bundle distributed topology + policies into a single DistributedSetup. automodel
     # 2d946b0's from_pretrained rejects the old separate distributed kwargs
-    # (device_mesh/moe_mesh/distributed_config/moe_config/activation_checkpointing) and
-    # requires them via distributed_setup. pipeline_config=None: PP is not used here.
+    # (device_mesh/moe_mesh/distributed_config/moe_config/activation_checkpointing/
+    # pipeline_config) and requires them via distributed_setup. Thread the resolved
+    # pipeline_config (built above when pipeline_parallel_size > 1) through
+    # distributed_setup and pop it out of automodel_kwargs so it is not also splatted
+    # below as a separate (rejected) kwarg into from_pretrained.
     distributed_setup = DistributedSetup(
         mesh_context=MeshContext.from_meshes(device_mesh, moe_mesh),
         strategy_config=fsdp2_config,
-        pipeline_config=None,
+        pipeline_config=automodel_kwargs.pop("pipeline_config", None),
         moe_parallel_config=moe_config if ep_size > 1 else None,
         activation_checkpointing=config["dtensor_cfg"]["activation_checkpointing"],
     )
