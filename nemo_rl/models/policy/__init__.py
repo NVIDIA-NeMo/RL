@@ -236,7 +236,33 @@ class MegatronConfig(TypedDict):
     moe_token_dispatcher_type: str
     # Can be used only with 'alltoall' token dispatcher
     moe_shared_expert_overlap: bool
+    # Flex dispatcher backend when moe_token_dispatcher_type='flex'.
+    # Options: 'deepep' (Megatron-LM default, fails on GB200) | 'hybridep'.
+    moe_flex_dispatcher_backend: NotRequired[str]
+    # Cap per-expert token count to bound activation memory of the grouped
+    # expert GEMM. Useful when the router is frozen
+    # (moe_router_load_balancing_type='none'). Absent = unlimited capacity.
+    moe_expert_capacity_factor: NotRequired[float]
+    # Pad expert input to capacity. Requires moe_expert_capacity_factor to be set.
+    moe_pad_expert_input_to_capacity: NotRequired[bool]
+    # Token drop policy when capacity is exceeded. Options: 'probs' | 'position'.
+    moe_token_drop_policy: NotRequired[str]
+    # Recompute MoE layers during the backward pass when activation
+    # checkpointing is enabled.
+    moe_layer_recompute: NotRequired[bool]
+    # Activation recompute settings, only used when activation_checkpointing is
+    # True. Absent values fall back to full/uniform/1 respectively.
+    recompute_granularity: NotRequired[str]
+    recompute_method: NotRequired[str]
+    recompute_num_layers: NotRequired[int]
+    # Initial process-group rendezvous timeout in minutes. Useful when many Ray
+    # actors with slow imports start concurrently. Absent = c10d default.
+    init_pg_timeout_minutes: NotRequired[int]
+    # When True, checkpoint shards are flushed to storage on a background thread
+    # while training continues. Absent = False (synchronous save).
+    async_save: NotRequired[bool]
     peft: NotRequired[MegatronPeftConfig | MegatronPeftConfigDisabled]
+
     optimizer: MegatronOptimizerConfig
     scheduler: MegatronSchedulerConfig
     distributed_data_parallel_config: MegatronDDPConfig

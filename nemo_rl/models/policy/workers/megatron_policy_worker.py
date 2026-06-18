@@ -130,7 +130,11 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         self.rank = get_rank_safe()
 
         # Step 1: Setup distributed
-        setup_distributed()
+        setup_distributed(
+            init_pg_timeout_minutes=self.cfg["megatron_cfg"].get(
+                "init_pg_timeout_minutes", None
+            )
+        )
 
         # Step 2: Validate and setup model paths
         hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(

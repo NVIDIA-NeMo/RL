@@ -17,6 +17,7 @@ import json
 import os
 import time
 import warnings
+from datetime import timedelta
 from typing import Any, Callable, Optional, TypeVar
 
 import torch
@@ -143,15 +144,29 @@ def destroy_parallel_state():
         pass
 
 
-def setup_distributed() -> None:
-    """Handle NCCL settings, dtype mapping, and basic config setup."""
+def setup_distributed(init_pg_timeout_minutes: Optional[int] = None) -> None:
+    """Handle NCCL settings, dtype mapping, and basic config setup.
+
+    Args:
+        init_pg_timeout_minutes: Optional process-group rendezvous timeout in
+            minutes. When provided, it is applied both to the initial NCCL
+            process group and to the c10d default timeout (so Gloo and other
+            sub-groups created later inherit it). The default c10d timeout can
+            be too short when many Ray actors with slow imports rendezvous
+            concurrently. When None, the c10d defaults are left unchanged.
+    """
     # Disable dynamo autotune_local_cache to avoid crash when there's already a cache
     # with different order of node_bundles
     configure_dynamo_cache()
     # Ensure clean slate before import
     destroy_parallel_state()
     # Need to initialize the process group before calling into Megatron-Bridge, otherwise Megatron-Bridge will try to set an incorrect device
-    torch.distributed.init_process_group("nccl")
+    if init_pg_timeout_minutes is not None:
+        timeout = timedelta(minutes=init_pg_timeout_minutes)
+        torch.distributed.init_process_group("nccl", timeout=timeout)
+        torch.distributed.distributed_c10d.default_pg_timeout = timeout
+    else:
+        torch.distributed.init_process_group("nccl")
 
 
 def validate_and_set_config(
@@ -352,7 +367,7 @@ def setup_model_config(
 
     # Create checkpoint configs
     checkpoint_config = _create_checkpoint_config(
-        pretrained_path, weights_path, optimizer_path
+        pretrained_path, weights_path, optimizer_path, config
     )
 
     # Validate training configuration
@@ -426,11 +441,41 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.moe_token_dispatcher_type = config["megatron_cfg"][
         "moe_token_dispatcher_type"
     ]
+    # Flex dispatcher backend ("deepep" | "hybridep"). Megatron-LM's
+    # TransformerConfig defaults this to "deepep", which fails on GB200, so we
+    # override it only when the user explicitly sets it.
+    if "moe_flex_dispatcher_backend" in config["megatron_cfg"]:
+        model_cfg.moe_flex_dispatcher_backend = config["megatron_cfg"][
+            "moe_flex_dispatcher_backend"
+        ]
     model_cfg.moe_shared_expert_overlap = config["megatron_cfg"][
         "moe_shared_expert_overlap"
     ]
 
     model_cfg.moe_permute_fusion = config["megatron_cfg"]["moe_permute_fusion"]
+
+    # MoE expert capacity. With moe_router_load_balancing_type="none" (used in
+    # DPO/RL to keep the router frozen so logprobs stay consistent) expert load
+    # is skewed, so a few EP ranks receive far more tokens than average and can
+    # OOM the grouped expert GEMM. Capping per-expert tokens by router prob
+    # bounds the activation memory without touching the router, so it does not
+    # affect logprob consistency. These keys are optional; when absent the
+    # Megatron defaults (unlimited capacity) are preserved.
+    if "moe_expert_capacity_factor" in config["megatron_cfg"]:
+        model_cfg.moe_expert_capacity_factor = config["megatron_cfg"][
+            "moe_expert_capacity_factor"
+        ]
+    if "moe_pad_expert_input_to_capacity" in config["megatron_cfg"]:
+        assert model_cfg.moe_expert_capacity_factor is not None, (
+            "moe_pad_expert_input_to_capacity requires moe_expert_capacity_factor to be set."
+        )
+        model_cfg.moe_pad_expert_input_to_capacity = config["megatron_cfg"][
+            "moe_pad_expert_input_to_capacity"
+        ]
+    if "moe_token_drop_policy" in config["megatron_cfg"]:
+        model_cfg.moe_token_drop_policy = config["megatron_cfg"][
+            "moe_token_drop_policy"
+        ]
 
 
 def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
@@ -466,11 +511,24 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     """Apply performance optimization configuration."""
     model_cfg.parallel_output = True
 
-    # Activation checkpointing
+    # Activation checkpointing. The granularity/method/num_layers default to
+    # full/uniform/1 (the previous hard-coded values); they are only overridden
+    # when explicitly set in the config. moe_layer_recompute is optional and
+    # left untouched when absent.
     if config["megatron_cfg"]["activation_checkpointing"]:
-        model_cfg.recompute_granularity = "full"
-        model_cfg.recompute_method = "uniform"
-        model_cfg.recompute_num_layers = 1
+        model_cfg.recompute_granularity = config["megatron_cfg"].get(
+            "recompute_granularity", "full"
+        )
+        model_cfg.recompute_method = config["megatron_cfg"].get(
+            "recompute_method", "uniform"
+        )
+        model_cfg.recompute_num_layers = config["megatron_cfg"].get(
+            "recompute_num_layers", 1
+        )
+        if "moe_layer_recompute" in config["megatron_cfg"]:
+            model_cfg.moe_layer_recompute = config["megatron_cfg"][
+                "moe_layer_recompute"
+            ]
 
     # Activation function validation
     if not model_cfg.gated_linear_unit:
@@ -543,16 +601,23 @@ def _validate_chunking_config(config: PolicyConfig) -> None:
 
 
 def _create_checkpoint_config(
-    pretrained_path: str, weights_path: Optional[str], optimizer_path: Optional[str]
+    pretrained_path: str,
+    weights_path: Optional[str],
+    optimizer_path: Optional[str],
+    config: PolicyConfig,
 ) -> CheckpointConfig:
     """Create checkpoint configurations."""
+    # async_save lets Megatron-Bridge flush checkpoint shards to storage on a
+    # background thread while training continues. It is optional and defaults to
+    # the previous synchronous behavior (False) when unset.
+    async_save = config["megatron_cfg"].get("async_save", False)
     return CheckpointConfig(
         save_interval=100,
         save=weights_path,
         load=weights_path,
         load_optim=optimizer_path is not None,
         pretrained_checkpoint=pretrained_path,
-        async_save=False,
+        async_save=async_save,
         fully_parallel_save=True,
         fully_parallel_load=True,
         load_rng=False,
