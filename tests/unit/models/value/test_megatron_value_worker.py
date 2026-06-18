@@ -316,6 +316,7 @@ def test_value_worker_init_and_get_values(value_setup):
         (2, 2, 1, 1, {"sequence_parallel": True}),
         (2, 1, 1, 1, {"dynamic_batching": True}),
         (2, 1, 1, 1, {"sequence_packing": True}),
+        (2, 1, 2, 1, {"sequence_packing": True}),
     ],
     indirect=True,
     ids=[
@@ -324,6 +325,7 @@ def test_value_worker_init_and_get_values(value_setup):
         "2gpu_tp2sp",
         "2gpu_dp2_dynbatch",
         "2gpu_dp2_seqpack",
+        "2gpu_pp2_seqpack",
     ],
 )
 def test_value_worker_train_step(value_setup):

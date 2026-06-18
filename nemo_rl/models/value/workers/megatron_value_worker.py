@@ -584,7 +584,7 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
                 (
                     data_iterator,
                     num_microbatches,
-                    micro_batch_size,
+                    micro_batch_size_actual,
                     seq_length,
                     padded_seq_length,
                 ) = get_microbatch_iterator(
@@ -619,7 +619,7 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
                         model=self.model,
                         num_microbatches=num_microbatches,
                         seq_length=padded_seq_length,
-                        micro_batch_size=mbs,
+                        micro_batch_size=micro_batch_size_actual,
                         decoder_seq_length=padded_seq_length,
                         forward_only=eval_mode,
                     )
