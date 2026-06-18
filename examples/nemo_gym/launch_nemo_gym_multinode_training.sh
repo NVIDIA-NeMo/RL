@@ -156,7 +156,12 @@ SLURM_COMMENT="${SLURM_COMMENT:-{\"OccupiedIdleGPUsJobReaper\":{\"exemptIdleTime
 
 
 # Host paths above are mounted to stable container paths consumed by the YAML.
-MOUNTS="${HOST_HF_HOME}:${CONTAINER_REPO_LOCATION}/.cache,${OUT_DIR}/checkpoint:/checkpoint,${OUT_DIR}/logs:/logs"
+# The logs dir is ALSO identity-mounted (host path -> same path in container)
+# because ray.sub uses the host-side BASE_LOG_DIR=${OUT_DIR}/logs as $LOG_DIR
+# both on the host (-o redirects, mkdir) and inside the head container
+# (`touch $LOG_DIR/STARTED_RAY_HEAD`). Without the identity mount that touch
+# fails and the launcher waits forever for the cluster to come up.
+MOUNTS="${OUT_DIR}/logs:${OUT_DIR}/logs,${HOST_HF_HOME}:${CONTAINER_REPO_LOCATION}/.cache,${OUT_DIR}/checkpoint:/checkpoint,${OUT_DIR}/logs:/logs"
 MOUNTS="${MOUNTS},${HF_CKPT_PATH}:${CONTAINER_HF_CKPT_PATH}"
 MOUNTS="${MOUNTS},${NRL_MEGATRON_CHECKPOINT_DIR}:${CONTAINER_NRL_MEGATRON_CHECKPOINT_DIR}"
 MOUNTS="${MOUNTS},${NEMO_GYM_SWE_TRAIN_DATA_PATH}:${CONTAINER_NEMO_GYM_SWE_TRAIN_DATA_PATH}"
@@ -177,7 +182,6 @@ sbatch \
     --partition=$SLURM_PARTITION \
     --time=${SLURM_TIME:-1:0:0} \
     --job-name=$EXP_NAME \
-    --gres=gpu:$GPUS_PER_NODE \
     --comment="$SLURM_COMMENT" \
     ${SLURM_EXCLUDE:+--exclude=$SLURM_EXCLUDE} \
     ray.sub
