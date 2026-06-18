@@ -93,28 +93,10 @@ checkpointing:
   save_optimizer: false
 
 policy:
-  # Keep this as the HF *repo id* (NOT a local snapshot path). Two separate caches
-  # depend on the model identity, and a local path silently breaks one of them:
-  #
-  #   1. HF->mcore conversion cache. Set NRL_MEGATRON_CHECKPOINT_DIR to a dir holding a
-  #      pre-converted checkpoint (e.g. .../mcore_ckpt_cache, which contains
-  #      Qwen/Qwen3-235B-A22B-Instruct-2507/iter_0000000). The cache subdir is keyed by
-  #      model_name: the repo id maps to ".../Qwen/Qwen3-235B-A22B-Instruct-2507", but a
-  #      local path maps to ".../model_<mangled_path>" -> cache MISS -> a multi-hour
-  #      HF download + reconversion. So leave this as the repo id to hit the cache.
-  #      (launch_nemo_gym_multinode_training.sh forwards NRL_MEGATRON_CHECKPOINT_DIR.)
-  #
-  #   2. Refit weight mapping. Even when (1) hits, megatron setup still calls
-  #      AutoBridge.from_hf_pretrained(model_name) (nemo_rl/models/megatron/setup.py),
-  #      which snapshot_downloads the FULL HF repo (~470 GB) to build the megatron->vLLM
-  #      mapping. With an empty HF_HOME this triggers a 470 GB pull and, across all
-  #      policy workers at once, an HTTP 429 storm. Avoid it by PRE-STAGING the model
-  #      into HF_HOME ($PWD/.cache) before launch. Easiest: run the symlink stager
-  #      (instant, copies no weights) from the repo root before launching:
-  #          bash examples/nemo_gym/prestage_hf_model.sh
-  #      (override MODEL / SRC_HUB / HF_HOME env vars as needed). Once any run finishes
-  #      the download into $PWD/.cache, later runs from the same dir reuse it for free.
-  model_name: "Qwen/Qwen3-235B-A22B-Instruct-2507"
+  # The launcher mounts HF_CKPT_PATH to a stable container path and exports that
+  # mounted path here. NRL_MEGATRON_CHECKPOINT_DIR is mounted separately for the
+  # pre-converted Megatron checkpoint cache.
+  model_name: ${oc.env:HF_CKPT_PATH}
   tokenizer:
     name: ${policy.model_name}
     chat_template_kwargs: null
@@ -291,9 +273,9 @@ data:
   num_workers: 0
   use_multiple_dataloader: false
   train:
-    data_path: "/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/cgomes/grpo-studies/data_swe/r2e_easy_l20_train.jsonl"
+    data_path: ${oc.env:NEMO_GYM_SWE_TRAIN_DATA_PATH}
   validation:
-    data_path: "/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/cgomes/grpo-studies/data_swe/r2e_easy_l20_val.jsonl"
+    data_path: ${oc.env:NEMO_GYM_SWE_VALIDATION_DATA_PATH}
   default:
     dataset_name: NemoGymDataset
     env_name: "nemo_gym"
@@ -301,7 +283,7 @@ data:
     system_prompt_file: null
     processor: "nemo_gym_data_processor"
 
-sif_dir: "/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/lukaszp/data/sif"
+sif_dir: ${oc.env:NEMO_GYM_SWE_SIF_DIR}
 env:
   should_use_nemo_gym: true
   should_log_nemo_gym_responses: false
@@ -325,23 +307,21 @@ env:
           concurrency: 128          # LEARNING: keep rollout wall-time down at bigger batch
           base_results_dir: /logs/nemo_gym/swe_agents_train
           dataset_path: ${data.train.data_path}     # FILL (same as data.train.data_path)
-          # FILL: apptainer image path template for task containers, e.g.
-          # /PATH/TO/sif_images/xingyaoww_sweb.eval.x86_64.{instance_id}.sif
+          # The launcher passes NEMO_GYM_SWE_SIF_DIR into the training process.
           container_formatter:
            - "${sif_dir}/swebench_sweb.eval.x86_64.{instance_id}.sif"
            - "${sif_dir}/swegym_sweb.eval.x86_64.{instance_id}.sif"
            - "${sif_dir}/r2egym_{instance_id}.sif"
-           - "${sif_dir}/r2egym/{instance_id}.sif"
     swe_agents_val:
       responses_api_agents:
         swe_agents:
-          agent_max_turns: ${env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.agent_max_turns}    # 15 is empirically safe on easy_l20; 20 grew context past 80k -> vLLM rejected a turn -> empty rollout -> ValueError crash
+          agent_max_turns: ${env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.agent_max_turns} 
           swebench_agent_timeout: ${env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.swebench_agent_timeout}
           swebench_tests_timeout: 180
           concurrency: 128          # LEARNING: keep rollout wall-time down at bigger batch
           base_results_dir: /logs/nemo_gym/swe_agents_val
           dataset_path: ${data.validation.data_path}       # FILL (same as data.validation.data_path)
-          container_formatter: ${env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.container_formatter}  # FILL
+          container_formatter: ${env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.container_formatter}
 
 logger:
   # Most basic setup: all external backends off. Step metrics still print to
