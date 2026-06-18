@@ -25,6 +25,7 @@ import ray
 from omegaconf import OmegaConf
 from wandb import Table
 
+from nemo_rl.algorithms.mlperf_grpo_logging import create_mlperf_logger
 from nemo_rl.algorithms.grpo import (
     ColocatablePolicyInterface,
     EnvironmentInterface,
@@ -147,6 +148,10 @@ def main() -> None:
             f"📊 Using checkpoint directory: {config['checkpointing']['checkpoint_dir']}"
         )
 
+    mlperf_logger = create_mlperf_logger(config)
+    if mlperf_logger is not None:
+        mlperf_logger.log_init_start()
+
     # setup tokenizer
     tokenizer = get_tokenizer(config["policy"]["tokenizer"])
     assert config["policy"]["generation"] is not None, (
@@ -185,6 +190,9 @@ The validation set you pass in will directly be used for validation with no addi
         config["grpo"]["max_val_samples"] = len(val_dataset)
         config["grpo"]["val_batch_size"] = config["grpo"]["max_val_samples"]
 
+    if mlperf_logger is not None:
+        mlperf_logger.log_hyperparams(train_dataset, val_dataset)
+
     # Print config
     print("Final config:")
     pprint.pprint(config)
@@ -222,15 +230,21 @@ The validation set you pass in will directly be used for validation with no addi
     val_task_to_env = task_to_env
 
     if is_trajectory_collection:
-        collect_trajectories(
-            policy=policy,
-            policy_generation=policy_generation,
-            val_dataloader=val_dataloader,
-            tokenizer=tokenizer,
-            val_task_to_env=val_task_to_env,
-            logger=logger,
-            master_config=master_config,
-        )
+        if mlperf_logger is not None:
+            mlperf_logger.log_init_stop_run_start()
+        try:
+            collect_trajectories(
+                policy=policy,
+                policy_generation=policy_generation,
+                val_dataloader=val_dataloader,
+                tokenizer=tokenizer,
+                val_task_to_env=val_task_to_env,
+                logger=logger,
+                master_config=master_config,
+            )
+        finally:
+            if mlperf_logger is not None:
+                mlperf_logger.finalize()
     # Check if async mode is enabled
     elif "async_grpo" in config["grpo"] and config["grpo"]["async_grpo"]["enabled"]:
         # Async GRPO does not support dynamic sampling, reward scaling, or reward shaping (DAPO features)
@@ -267,39 +281,51 @@ The validation set you pass in will directly be used for validation with no addi
 
         async_config = config["grpo"]["async_grpo"]
         # Run async GRPO training
-        async_grpo_train(
-            policy=policy,
-            policy_generation=policy_generation,
-            dataloader=dataloader,
-            val_dataloader=val_dataloader,
-            tokenizer=tokenizer,
-            loss_fn=loss_fn,
-            task_to_env=task_to_env,
-            val_task_to_env=val_task_to_env,
-            logger=logger,
-            checkpointer=checkpointer,
-            grpo_save_state=grpo_state,
-            master_config=master_config,
-            max_trajectory_age_steps=async_config["max_trajectory_age_steps"],
-        )
+        try:
+            async_grpo_train(
+                policy=policy,
+                policy_generation=policy_generation,
+                dataloader=dataloader,
+                val_dataloader=val_dataloader,
+                tokenizer=tokenizer,
+                loss_fn=loss_fn,
+                task_to_env=task_to_env,
+                val_task_to_env=val_task_to_env,
+                logger=logger,
+                checkpointer=checkpointer,
+                grpo_save_state=grpo_state,
+                master_config=master_config,
+                max_trajectory_age_steps=async_config["max_trajectory_age_steps"],
+                mlperf_logger=mlperf_logger,
+            )
+        except Exception:
+            if mlperf_logger is not None:
+                mlperf_logger.finalize()
+            raise
     else:
         print("🚀 Running synchronous GRPO training")
 
         # Run standard GRPO training
-        grpo_train(
-            policy,
-            policy_generation,
-            dataloader,
-            val_dataloader,
-            tokenizer,
-            loss_fn,
-            task_to_env,
-            val_task_to_env,
-            logger,
-            checkpointer,
-            grpo_state,
-            master_config,
-        )
+        try:
+            grpo_train(
+                policy,
+                policy_generation,
+                dataloader,
+                val_dataloader,
+                tokenizer,
+                loss_fn,
+                task_to_env,
+                val_task_to_env,
+                logger,
+                checkpointer,
+                grpo_state,
+                master_config,
+                mlperf_logger=mlperf_logger,
+            )
+        except Exception:
+            if mlperf_logger is not None:
+                mlperf_logger.finalize()
+            raise
 
 
 if __name__ == "__main__":

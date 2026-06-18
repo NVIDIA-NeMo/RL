@@ -130,6 +130,11 @@ NEMO_GYM_SWE_VALIDATION_DATA_PATH="${CONTAINER_NEMO_GYM_SWE_VALIDATION_DATA_PATH
 NEMO_GYM_SWE_SIF_DIR="${CONTAINER_NEMO_GYM_SWE_SIF_DIR}" \
 uv run examples/nemo_gym/run_grpo_nemo_gym.py \
     --config ${RECIPE} \
+    ++logger.mlperf_enabled=True \
+    ++logger.mlperf.log_file=${OUT_DIR}/logs/mllogger.log \
+    ++logger.mlperf.benchmark=grpo_nemo_gym \
+    ++logger.mlperf.target_accuracy=${MLPERF_TARGET_ACCURACY:-1.0} \
+    ++logger.mlperf.force_success_status=False \
     ++cluster.num_nodes=$NODES \
     ++cluster.gpus_per_node=$GPUS_PER_NODE \
     ++policy.generation.colocated.resources.num_nodes=$GEN_NODES \
