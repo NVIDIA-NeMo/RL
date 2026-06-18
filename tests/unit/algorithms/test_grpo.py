@@ -26,9 +26,12 @@ from nemo_rl.algorithms.advantage_estimator import (
 )
 from nemo_rl.algorithms.grpo import (
     _default_grpo_save_state,
+    add_grpo_token_loss_masks_and_generation_logprobs,
+    aggregate_rollout_metrics,
     async_grpo_train,
     compute_and_apply_seq_logprob_error_masking,
     dynamic_sampling,
+    extract_initial_prompt_messages,
     grpo_train,
     validate,
 )
@@ -2474,3 +2477,186 @@ class TestComputeAndApplySeqLogprobErrorMasking:
         # At least sequence 2 should be masked
         assert num_masked >= 1, "At least one sequence should be masked"
         assert train_data["sample_mask"][0] == 1.0, "Sequence 0 should be kept"
+
+
+class TestMultiTurnPromptHelpers:
+    """Tests for GRPO multi-turn prompt extraction and loss masking."""
+
+    def test_prompt_extraction_with_multi_turn_history(self):
+        original_prompt_messages = [
+            {
+                "role": "user",
+                "content": "What is 2+2?",
+                "token_ids": torch.tensor([1, 2]),
+            },
+            {
+                "role": "assistant",
+                "content": "4",
+                "token_ids": torch.tensor([3, 4]),
+            },
+            {
+                "role": "user",
+                "content": "Now what is 3+3?",
+                "token_ids": torch.tensor([5, 6]),
+            },
+        ]
+        generated_message = {
+            "role": "assistant",
+            "content": "6",
+            "token_ids": torch.tensor([7, 8]),
+        }
+        full_message_log = original_prompt_messages + [generated_message]
+        original_prompt_length = sum(
+            len(message["token_ids"]) for message in original_prompt_messages
+        )
+
+        result = extract_initial_prompt_messages(
+            [full_message_log], torch.tensor([original_prompt_length])
+        )
+
+        assert [message["role"] for message in result[0]] == [
+            "user",
+            "assistant",
+            "user",
+        ]
+        assert generated_message not in result[0]
+
+    def test_prompt_extraction_with_system_message(self):
+        original_prompt_messages = [
+            {
+                "role": "system",
+                "content": "You are a math tutor.",
+                "token_ids": torch.tensor([1, 2, 3]),
+            },
+            {
+                "role": "user",
+                "content": "What is 2+2?",
+                "token_ids": torch.tensor([4, 5]),
+            },
+        ]
+        generated_message = {
+            "role": "assistant",
+            "content": "4",
+            "token_ids": torch.tensor([6, 7]),
+        }
+        full_message_log = original_prompt_messages + [generated_message]
+        original_prompt_length = sum(
+            len(message["token_ids"]) for message in original_prompt_messages
+        )
+
+        result = extract_initial_prompt_messages(
+            [full_message_log], torch.tensor([original_prompt_length])
+        )
+
+        assert [message["role"] for message in result[0]] == ["system", "user"]
+        assert generated_message not in result[0]
+
+    def test_grpo_loss_mask_excludes_assistant_prompt_history(self):
+        message_log = [
+            {
+                "role": "user",
+                "content": "What is 2+2?",
+                "token_ids": torch.tensor([1, 2]),
+            },
+            {
+                "role": "assistant",
+                "content": "4",
+                "token_ids": torch.tensor([3, 4]),
+            },
+            {
+                "role": "user",
+                "content": "Now what is 3+3?",
+                "token_ids": torch.tensor([5, 6]),
+            },
+            {
+                "role": "assistant",
+                "content": "6",
+                "token_ids": torch.tensor([7, 8]),
+                "generation_logprobs": torch.tensor([0.1, 0.2]),
+            },
+        ]
+
+        add_grpo_token_loss_masks_and_generation_logprobs([message_log])
+
+        assert torch.equal(message_log[0]["token_loss_mask"], torch.tensor([0, 0]))
+        assert torch.equal(message_log[1]["token_loss_mask"], torch.tensor([0, 0]))
+        assert torch.equal(message_log[2]["token_loss_mask"], torch.tensor([0, 0]))
+        assert torch.equal(message_log[3]["token_loss_mask"], torch.tensor([1, 1]))
+
+    def test_grpo_loss_mask_uses_generation_logprobs_marker(self):
+        message_log = [
+            {
+                "role": "assistant",
+                "content": "prompt history",
+                "token_ids": torch.tensor([1, 2]),
+            },
+            {
+                "role": "user",
+                "content": "next question",
+                "token_ids": torch.tensor([3, 4]),
+                "generation_logprobs": torch.tensor([0.3, 0.4]),
+            },
+            {
+                "role": "assistant",
+                "content": "generated response",
+                "token_ids": torch.tensor([5, 6]),
+                "generation_logprobs": torch.tensor([0.5, 0.6]),
+            },
+        ]
+
+        add_grpo_token_loss_masks_and_generation_logprobs([message_log])
+
+        assert torch.equal(message_log[0]["token_loss_mask"], torch.tensor([0, 0]))
+        assert torch.equal(
+            message_log[0]["generation_logprobs"], torch.tensor([0.0, 0.0])
+        )
+        assert torch.equal(message_log[1]["token_loss_mask"], torch.tensor([0, 0]))
+        assert torch.equal(message_log[2]["token_loss_mask"], torch.tensor([1, 1]))
+
+
+class TestAggregateRolloutMetrics:
+    """Tests for semantic rollout metric aggregation."""
+
+    def test_min_metrics_take_minimum(self):
+        metrics = {
+            "gen_tokens/min": [10, 5, 8],
+            "min_reward": [0.3, 0.1, 0.5],
+        }
+        result = aggregate_rollout_metrics(metrics)
+        assert result["gen_tokens/min"] == 5
+        assert result["min_reward"] == 0.1
+
+    def test_max_metrics_take_maximum(self):
+        metrics = {
+            "gen_tokens/max": [10, 50, 30],
+            "max_reward": [0.3, 0.9, 0.5],
+        }
+        result = aggregate_rollout_metrics(metrics)
+        assert result["gen_tokens/max"] == 50
+        assert result["max_reward"] == 0.9
+
+    def test_rate_suffix_excluded_from_min_max(self):
+        metrics = {
+            "min_completion_rate": [0.2, 0.8, 0.5],
+            "max_completion_rate": [0.3, 0.9, 0.6],
+        }
+        result = aggregate_rollout_metrics(metrics)
+        assert result["min_completion_rate"] == pytest.approx(0.5)
+        assert result["max_completion_rate"] == pytest.approx(0.6)
+
+    def test_total_turns_summed(self):
+        result = aggregate_rollout_metrics({"total_turns": [10, 20, 30]})
+        assert result["total_turns"] == 60
+
+    def test_mean_metrics_averaged(self):
+        metrics = {
+            "mean_gen_tokens_per_sample": [100, 200, 300],
+            "reward/mean": [0.5, 0.7, 0.9],
+        }
+        result = aggregate_rollout_metrics(metrics)
+        assert result["mean_gen_tokens_per_sample"] == pytest.approx(200.0)
+        assert result["reward/mean"] == pytest.approx(0.7)
+
+    def test_non_numeric_passed_through(self):
+        result = aggregate_rollout_metrics({"some_list_metric": [["a"], ["b"]]})
+        assert result["some_list_metric"] == [["a"], ["b"]]

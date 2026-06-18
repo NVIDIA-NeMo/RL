@@ -98,10 +98,6 @@ NODES="${NODES:-$((TRAIN_NODES + GEN_NODES))}"
 CONTAINER_REPO_LOCATION="${CONTAINER_REPO_LOCATION:-/opt/nemo-rl}"
 RECIPE="${RECIPE:-examples/nemo_gym/grpo_qwen3_235b_swe_openhands_async.yaml}"
 CONTAINER_INPUT_ROOT="${CONTAINER_INPUT_ROOT:-/inputs/nemo_gym}"
-# Defaults to an identity mount (host path == container path). This keeps
-# policy.model_name a stable host path so the megatron HF->mcore conversion
-# cache (keyed by model_name) hits, and lets relative HF snapshot symlinks
-# (../../blobs/...) resolve within the mounted model dir without mounting /lustre.
 CONTAINER_HF_CKPT_PATH="${CONTAINER_HF_CKPT_PATH:-${HF_CKPT_PATH}}"
 CONTAINER_NRL_MEGATRON_CHECKPOINT_DIR="${CONTAINER_NRL_MEGATRON_CHECKPOINT_DIR:-${CONTAINER_INPUT_ROOT}/mcore_ckpt}"
 CONTAINER_NEMO_GYM_SWE_TRAIN_DATA_PATH="${CONTAINER_NEMO_GYM_SWE_TRAIN_DATA_PATH:-${CONTAINER_INPUT_ROOT}/data/train.jsonl}"
@@ -135,6 +131,11 @@ NEMO_GYM_SWE_VALIDATION_DATA_PATH="${CONTAINER_NEMO_GYM_SWE_VALIDATION_DATA_PATH
 NEMO_GYM_SWE_SIF_DIR="${CONTAINER_NEMO_GYM_SWE_SIF_DIR}" \
 uv run examples/nemo_gym/run_grpo_nemo_gym.py \
     --config ${RECIPE} \
+    ++logger.mlperf_enabled=True \
+    ++logger.mlperf.log_file=${OUT_DIR}/logs/mllogger.log \
+    ++logger.mlperf.benchmark=grpo_nemo_gym \
+    ++logger.mlperf.target_accuracy=${MLPERF_TARGET_ACCURACY:-1.0} \
+    ++logger.mlperf.force_success_status=False \
     ++cluster.num_nodes=$NODES \
     ++cluster.gpus_per_node=$GPUS_PER_NODE \
     ++policy.generation.colocated.resources.num_nodes=$GEN_NODES \
@@ -162,11 +163,6 @@ SLURM_COMMENT="${SLURM_COMMENT:-{\"OccupiedIdleGPUsJobReaper\":{\"exemptIdleTime
 # (`touch $LOG_DIR/STARTED_RAY_HEAD`). Without the identity mount that touch
 # fails and the launcher waits forever for the cluster to come up.
 MOUNTS="${OUT_DIR}/logs:${OUT_DIR}/logs,${HOST_HF_HOME}:${CONTAINER_REPO_LOCATION}/.cache,${OUT_DIR}/checkpoint:/checkpoint,${OUT_DIR}/logs:/logs"
-# Identity-mount the HF checkpoint/model dir (host path == container path) so
-# model_name resolves at the same path used to key the mcore conversion cache,
-# and so relative HF snapshot symlinks (../../blobs/...) resolve within this one
-# mounted tree. CONTAINER_HF_CKPT_PATH (policy.model_name) must be HF_CKPT_PATH
-# or a subpath of it (e.g. its snapshots/<rev> dir).
 MOUNTS="${MOUNTS},${HF_CKPT_PATH}:${HF_CKPT_PATH}"
 MOUNTS="${MOUNTS},${NRL_MEGATRON_CHECKPOINT_DIR}:${CONTAINER_NRL_MEGATRON_CHECKPOINT_DIR}"
 MOUNTS="${MOUNTS},${NEMO_GYM_SWE_TRAIN_DATA_PATH}:${CONTAINER_NEMO_GYM_SWE_TRAIN_DATA_PATH}"

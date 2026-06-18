@@ -37,6 +37,7 @@ from nemo_rl.algorithms.loss import (
     ClippedPGLossFn,
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.mlperf_grpo_logging import MLPerfGRPOLogger
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_reward_shaping,
@@ -52,7 +53,7 @@ from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.dataloader import MultipleDataloaderWrapper
 from nemo_rl.data.datasets import AllTaskProcessedDataset
-from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType, VLMMessageLogType
 from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
@@ -1072,26 +1073,66 @@ def _create_advantage_estimator(master_config: MasterConfig):
     return adv_estimator
 
 
-def _extract_prompt_only_messages(message_logs: list) -> list:
-    """Extract only prompt messages (user/system) from message logs.
+def extract_initial_prompt_messages(
+    message_logs: list,
+    original_prompt_lengths: torch.Tensor,
+) -> list:
+    """Extract the original prompt messages from message logs using token length.
 
-    This is used to get prompt IDs for advantage estimation, excluding
-    any assistant responses.
+    This correctly identifies original prompt messages even when the prompt
+    contains assistant messages, as in multi-turn conversation history.
 
     Args:
         message_logs: List of message logs, where each log is a list of messages.
+        original_prompt_lengths: Tensor of original prompt token lengths per sample.
 
     Returns:
-        List of message logs containing only user and system messages.
+        List of message logs containing only the original prompt messages.
     """
-    prompt_only_message_logs = []
-    for message_log in message_logs:
-        prompt_only_log = []
+    initial_prompt_message_logs = []
+    for i, message_log in enumerate(message_logs):
+        initial_prompt_log = []
+        cumulative_length = 0
+        target_length = original_prompt_lengths[i].item()
+
         for message in message_log:
-            if message["role"] == "user" or message["role"] == "system":
-                prompt_only_log.append(message)
-        prompt_only_message_logs.append(prompt_only_log)
-    return prompt_only_message_logs
+            if cumulative_length >= target_length:
+                break
+            initial_prompt_log.append(message)
+            cumulative_length += len(message["token_ids"])
+
+        initial_prompt_message_logs.append(initial_prompt_log)
+
+    return initial_prompt_message_logs
+
+
+def add_grpo_token_loss_masks_and_generation_logprobs(
+    message_logs: list[LLMMessageLogType | VLMMessageLogType],
+) -> None:
+    """Add GRPO loss masks and ensure generation logprobs exist in message logs.
+
+    Assistant messages can be part of the original multi-turn prompt history. Only
+    generated assistant messages have generation_logprobs, so use that field as the
+    trainable-token marker.
+
+    Args:
+        message_logs: Batch of tokenized message logs. Messages that already contain
+            ``generation_logprobs`` are treated as rollout-generated messages.
+    """
+    for message_log in message_logs:
+        for message in message_log:
+            role = cast(str, message["role"])
+            token_ids = cast(torch.Tensor, message["token_ids"])
+
+            if role == "assistant" and "generation_logprobs" in message:
+                message["token_loss_mask"] = torch.ones_like(token_ids)
+            else:
+                message["token_loss_mask"] = torch.zeros_like(token_ids)
+
+            if "generation_logprobs" not in message:
+                message["generation_logprobs"] = torch.zeros_like(
+                    token_ids, dtype=torch.float32
+                )
 
 
 def _stable_group_ids(prompt_ids_for_adv, num_generations_per_prompt):
@@ -1387,6 +1428,7 @@ def grpo_train(
     checkpointer: CheckpointManager,
     grpo_save_state: GRPOSaveState,
     master_config: MasterConfig,
+    mlperf_logger: Optional[MLPerfGRPOLogger] = None,
 ) -> None:
     """Run GRPO training algorithm."""
     timer = Timer()
@@ -1441,6 +1483,9 @@ def grpo_train(
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
 
+    if mlperf_logger is not None:
+        mlperf_logger.log_init_stop_run_start()
+
     # Run validation at the start if configured
     # TODO: Add validation with kv scales if needed
     if val_at_start and current_step == 0:
@@ -1452,18 +1497,31 @@ def grpo_train(
             POLICY_GENERATION_STALE = False
         else:
             policy_generation.prepare_for_generation()
-        val_metrics, validation_timings = validate(
-            policy_generation,
-            val_dataloader,
-            tokenizer,
-            val_task_to_env,
-            step=0,
-            master_config=master_config,
-            logger=logger,
-        )
+        if mlperf_logger is not None:
+            mlperf_logger.start_eval(0)
+        try:
+            val_metrics, validation_timings = validate(
+                policy_generation,
+                val_dataloader,
+                tokenizer,
+                val_task_to_env,
+                step=0,
+                master_config=master_config,
+                logger=logger,
+            )
+        except Exception:
+            if mlperf_logger is not None:
+                mlperf_logger.end_eval_with_error(0)
+            raise
+        if mlperf_logger is not None:
+            mlperf_logger.end_eval(0, val_metrics, validation_timings)
         policy_generation.finish_generation()
         logger.log_metrics(val_metrics, current_step, prefix="validation")
         logger.log_metrics(validation_timings, current_step, prefix="timing/validation")
+        if mlperf_logger is not None and mlperf_logger.target_reached:
+            return
+    elif mlperf_logger is not None:
+        mlperf_logger.start_train_block(total_steps)
 
     if master_config["data"]["use_multiple_dataloader"]:
         warnings.warn(
@@ -1648,6 +1706,10 @@ def grpo_train(
                         rollout_metrics["mean_gen_tokens_per_sample"]
                     )
                     logger.log_metrics(rollout_metrics, total_steps + 1, prefix="train")
+                    if mlperf_logger is not None:
+                        mlperf_logger.observe_metrics(
+                            rollout_metrics, total_steps + 1, prefix="train"
+                        )
 
                 repeated_batch = scale_rewards(
                     repeated_batch, master_config["grpo"]["reward_scaling"]
@@ -1726,16 +1788,18 @@ def grpo_train(
                     # Save baseline for logging (before deletion)
                     baseline_for_log = baseline.clone()
 
-                    # Extract prompt-only messages for advantage estimation
-                    prompt_only_message_logs = _extract_prompt_only_messages(
-                        repeated_batch["message_log"]
+                    # Extract original prompt messages using the length field.
+                    # This correctly handles multi-turn prompts that contain assistant messages.
+                    initial_prompt_message_logs = extract_initial_prompt_messages(
+                        repeated_batch["message_log"],
+                        repeated_batch["length"],
                     )
                     prompt_batched_flat, _ = batched_message_log_to_flat_message(
-                        prompt_only_message_logs,
+                        initial_prompt_message_logs,
                         pad_value_dict={"token_ids": tokenizer.pad_token_id},
                     )
                     prompt_ids_for_adv = prompt_batched_flat["token_ids"]
-                    del prompt_only_message_logs
+                    del initial_prompt_message_logs
                     del prompt_batched_flat
                     del input_ids
                     del baseline
@@ -1752,21 +1816,9 @@ def grpo_train(
 
                         loss_multiplier[truncated] = 0
                         repeated_batch["loss_multiplier"] = loss_multiplier
-                    # Add loss mask to each message in LLMMessageLogType
-                    for i, message_log in enumerate(repeated_batch["message_log"]):
-                        for j, message in enumerate(message_log):
-                            if message["role"] == "assistant":
-                                message["token_loss_mask"] = torch.ones_like(
-                                    message["token_ids"]
-                                )
-                            else:
-                                message["token_loss_mask"] = torch.zeros_like(
-                                    message["token_ids"]
-                                )
-                            if "generation_logprobs" not in message:
-                                message["generation_logprobs"] = torch.zeros_like(
-                                    message["token_ids"], dtype=torch.float32
-                                )
+                    add_grpo_token_loss_masks_and_generation_logprobs(
+                        repeated_batch["message_log"]
+                    )
 
                     # Convert updated LLMMessageLogType to FlatMessagesType for training
                     flat_messages, input_lengths = batched_message_log_to_flat_message(
@@ -1935,15 +1987,27 @@ def grpo_train(
                         if colocated_inference:
                             policy.offload_after_refit()  # unload optimizer to make space for generation
                         policy_generation.prepare_for_generation()
-                    val_metrics, validation_timings = validate(
-                        policy_generation,
-                        val_dataloader,
-                        tokenizer,
-                        val_task_to_env,
-                        step=total_steps + 1,
-                        master_config=master_config,
-                        logger=logger,
-                    )
+                    validation_step = total_steps + 1
+                    if mlperf_logger is not None:
+                        mlperf_logger.start_eval(validation_step)
+                    try:
+                        val_metrics, validation_timings = validate(
+                            policy_generation,
+                            val_dataloader,
+                            tokenizer,
+                            val_task_to_env,
+                            step=validation_step,
+                            master_config=master_config,
+                            logger=logger,
+                        )
+                    except Exception:
+                        if mlperf_logger is not None:
+                            mlperf_logger.end_eval_with_error(validation_step)
+                        raise
+                    if mlperf_logger is not None:
+                        mlperf_logger.end_eval(
+                            validation_step, val_metrics, validation_timings
+                        )
                     policy_generation.finish_generation()
                     logger.log_metrics(
                         validation_timings, total_steps + 1, prefix="timing/validation"
@@ -1951,6 +2015,8 @@ def grpo_train(
                     logger.log_metrics(
                         val_metrics, total_steps + 1, prefix="validation"
                     )
+                    if mlperf_logger is not None and mlperf_logger.target_reached:
+                        return
 
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
@@ -2247,6 +2313,10 @@ def grpo_train(
             )
 
             logger.log_metrics(metrics, total_steps + 1, prefix="train")
+            if mlperf_logger is not None:
+                mlperf_logger.observe_metrics(
+                    metrics, total_steps + 1, prefix="train"
+                )
             logger.log_metrics(
                 performance_metrics, total_steps + 1, prefix="performance"
             )
@@ -2257,6 +2327,13 @@ def grpo_train(
                 prefix="timing/train",
                 step_finished=True,
             )
+            if mlperf_logger is not None:
+                mlperf_logger.observe_metrics(
+                    timing_metrics,
+                    total_steps + 1,
+                    prefix="timing/train",
+                    step_finished=True,
+                )
 
             # Reset the batch and set dynamic_sampling_num_gen_batches to 0
             batch_cache = None
@@ -2279,10 +2356,14 @@ def grpo_train(
             total_steps += 1
             if should_save_by_timeout:
                 memory_tracker.snapshot_start_of_stage("", dir())
+                if mlperf_logger is not None:
+                    mlperf_logger.finalize()
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
             if total_steps >= max_num_steps:
                 memory_tracker.snapshot_start_of_stage("", dir())
+                if mlperf_logger is not None:
+                    mlperf_logger.finalize()
                 print(
                     "Max number of steps has been reached, stopping training early",
                     flush=True,
@@ -2291,6 +2372,9 @@ def grpo_train(
 
         current_epoch += 1
         current_step = 0  # Reset step counter for new epoch
+
+    if mlperf_logger is not None:
+        mlperf_logger.finalize()
 
 
 def validate(
@@ -2445,6 +2529,25 @@ def validate(
     return val_metrics, timing_metrics
 
 
+def aggregate_rollout_metrics(
+    per_group_metrics: dict[str, list],
+) -> dict[str, Any]:
+    """Aggregate rollout metrics from multiple trajectory groups."""
+    aggregated = {}
+    for k, v in per_group_metrics.items():
+        if not isinstance(v[0], (int, float)):
+            aggregated[k] = v
+        elif k.endswith("/min") or (k.startswith("min_") and not k.endswith("_rate")):
+            aggregated[k] = min(v)
+        elif k.endswith("/max") or (k.startswith("max_") and not k.endswith("_rate")):
+            aggregated[k] = max(v)
+        elif k == "total_turns":
+            aggregated[k] = sum(v)
+        else:
+            aggregated[k] = sum(v) / len(v)
+    return aggregated
+
+
 def async_grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -2459,6 +2562,7 @@ def async_grpo_train(
     grpo_save_state: GRPOSaveState,
     master_config: MasterConfig,
     max_trajectory_age_steps: int = 1,
+    mlperf_logger: Optional[MLPerfGRPOLogger] = None,
 ) -> None:
     """Run asynchronous GRPO training with replay buffer.
 
@@ -2476,6 +2580,7 @@ def async_grpo_train(
         grpo_save_state: Training state
         master_config: Master configuration
         max_trajectory_age_steps: Maximum age (in training steps) for trajectories to be used in training
+        mlperf_logger: Optional MLPerf GRPO logger
     """
     # Ensure we are running with a compatible async generation backend
     assert _should_use_async_rollouts(master_config), (
@@ -2527,6 +2632,11 @@ def async_grpo_train(
 
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
+
+    if mlperf_logger is not None:
+        mlperf_logger.log_init_stop_run_start()
+        if not (val_at_start and step == 0):
+            mlperf_logger.start_train_block(step)
 
     assert not colocated_inference, (
         "Colocated inference is not supported for async GRPO. Please use non-colocated inference."
@@ -2634,6 +2744,8 @@ def async_grpo_train(
             import traceback
 
             traceback.print_exc()
+            if mlperf_logger is not None:
+                mlperf_logger.finalize()
             return
     else:
         print("🔄 Preparing policy generation for inference...")
@@ -2645,6 +2757,8 @@ def async_grpo_train(
             import traceback
 
             traceback.print_exc()
+            if mlperf_logger is not None:
+                mlperf_logger.finalize()
             return
 
     print("✅ Policy generation setup complete, proceeding to validation...")
@@ -2656,6 +2770,8 @@ def async_grpo_train(
         trajectory_collector.pause.remote()
 
         try:
+            if mlperf_logger is not None:
+                mlperf_logger.start_eval(0)
             val_metrics, validation_timings = validate(
                 policy_generation,
                 val_dataloader,
@@ -2665,11 +2781,15 @@ def async_grpo_train(
                 master_config=master_config,
                 logger=logger,
             )
+            if mlperf_logger is not None:
+                mlperf_logger.end_eval(0, val_metrics, validation_timings)
             policy_generation.finish_generation()
             logger.log_metrics(val_metrics, step, prefix="validation")
             logger.log_metrics(validation_timings, step, prefix="timing/validation")
             print("✅ Initial validation completed successfully")
         except Exception as e:
+            if mlperf_logger is not None:
+                mlperf_logger.end_eval_with_error(0)
             print(f"❌ Initial validation failed: {e}")
             import traceback
 
@@ -2678,6 +2798,17 @@ def async_grpo_train(
         finally:
             # Resume trajectory collection after initial validation
             trajectory_collector.resume.remote()
+
+        if mlperf_logger is not None and mlperf_logger.target_reached:
+            try:
+                ray.kill(trajectory_collector)
+            except Exception as e:
+                print(f"Error stopping trajectory collector: {e}")
+            try:
+                ray.kill(replay_buffer)
+            except Exception as e:
+                print(f"Error stopping replay buffer: {e}")
+            return
 
     print("✅ All setup complete, starting buffer wait...")
     # Clear logger metrics at start of training
@@ -2771,16 +2902,11 @@ def async_grpo_train(
                     # Concatenate per-prompt groups into a single training batch
                     per_prompt_batches = [t["batch"] for t in trajectories]
                     repeated_batch = BatchedDataDict.from_batches(per_prompt_batches)
-                    # Aggregate rollout metrics across groups (simple mean where applicable)
-                    rollout_metrics = {}
+                    per_group_metrics = {}
                     for t in trajectories:
                         for k, v in t["rollout_metrics"].items():
-                            rollout_metrics.setdefault(k, []).append(v)
-                    # TODO: this simple averaging might cause misleading information for such data as max_gen_tokens, etc.
-                    rollout_metrics = {
-                        k: (sum(v) / len(v) if isinstance(v[0], (int, float)) else v)
-                        for k, v in rollout_metrics.items()
-                    }
+                            per_group_metrics.setdefault(k, []).append(v)
+                    rollout_metrics = aggregate_rollout_metrics(per_group_metrics)
 
                 # Enforce fixed training batch: num_prompts_per_step * num_generations_per_prompt
                 expected_batch_size = (
@@ -2805,16 +2931,18 @@ def async_grpo_train(
 
                 print("▶ Processing rewards...")
                 with timer.time("reward_calculation"):
-                    # Extract prompt-only messages for advantage estimation
-                    prompt_only_message_logs = _extract_prompt_only_messages(
-                        repeated_batch["message_log"]
+                    # Extract original prompt messages using the length field.
+                    # This correctly handles multi-turn prompts that contain assistant messages.
+                    initial_prompt_message_logs = extract_initial_prompt_messages(
+                        repeated_batch["message_log"],
+                        repeated_batch["length"],
                     )
                     prompt_batched_flat, _ = batched_message_log_to_flat_message(
-                        prompt_only_message_logs,
+                        initial_prompt_message_logs,
                         pad_value_dict={"token_ids": tokenizer.pad_token_id},
                     )
                     prompt_ids_for_adv = prompt_batched_flat["token_ids"]
-                    del prompt_only_message_logs
+                    del initial_prompt_message_logs
                     del prompt_batched_flat
 
                     rewards = repeated_batch["total_reward"]
@@ -2825,21 +2953,9 @@ def async_grpo_train(
 
                 # Prepare training data (same as sync version)
                 with timer.time("data_processing"):
-                    # Add loss mask to each message
-                    for i, message_log in enumerate(repeated_batch["message_log"]):
-                        for j, message in enumerate(message_log):
-                            if message["role"] == "assistant":
-                                message["token_loss_mask"] = torch.ones_like(
-                                    message["token_ids"]
-                                )
-                            else:
-                                message["token_loss_mask"] = torch.zeros_like(
-                                    message["token_ids"]
-                                )
-                            if "generation_logprobs" not in message:
-                                message["generation_logprobs"] = torch.zeros_like(
-                                    message["token_ids"], dtype=torch.float32
-                                )
+                    add_grpo_token_loss_masks_and_generation_logprobs(
+                        repeated_batch["message_log"]
+                    )
 
                     # Convert to flat format for training
                     flat_messages, input_lengths = batched_message_log_to_flat_message(
@@ -2996,20 +3112,34 @@ def async_grpo_train(
                         POLICY_GENERATION_STALE = False
                     else:
                         policy_generation.prepare_for_generation()
-                    val_metrics, validation_timings = validate(
-                        policy_generation,
-                        val_dataloader,
-                        tokenizer,
-                        val_task_to_env,
-                        step=step + 1,
-                        master_config=master_config,
-                        logger=logger,
-                    )
+                    validation_step = step + 1
+                    if mlperf_logger is not None:
+                        mlperf_logger.start_eval(validation_step)
+                    try:
+                        val_metrics, validation_timings = validate(
+                            policy_generation,
+                            val_dataloader,
+                            tokenizer,
+                            val_task_to_env,
+                            step=validation_step,
+                            master_config=master_config,
+                            logger=logger,
+                        )
+                    except Exception:
+                        if mlperf_logger is not None:
+                            mlperf_logger.end_eval_with_error(validation_step)
+                        raise
+                    if mlperf_logger is not None:
+                        mlperf_logger.end_eval(
+                            validation_step, val_metrics, validation_timings
+                        )
                     policy_generation.finish_generation()
                     logger.log_metrics(
                         validation_timings, step + 1, prefix="timing/validation"
                     )
                     logger.log_metrics(val_metrics, step + 1, prefix="validation")
+                    if mlperf_logger is not None and mlperf_logger.target_reached:
+                        return
 
                     # Explicit GPU memory cleanup after validation in async mode
                     import gc
@@ -3257,7 +3387,13 @@ def async_grpo_train(
 
             logger.log_metrics(performance_metrics, step + 1, prefix="performance")
             logger.log_metrics(metrics, step + 1, prefix="train")
+            if mlperf_logger is not None:
+                mlperf_logger.observe_metrics(metrics, step + 1, prefix="train")
             logger.log_metrics(timing_metrics, step + 1, prefix="timing/train")
+            if mlperf_logger is not None:
+                mlperf_logger.observe_metrics(
+                    timing_metrics, step + 1, prefix="timing/train"
+                )
 
             timer.reset()
             step += 1
@@ -3278,6 +3414,9 @@ def async_grpo_train(
         traceback.print_exc()
 
     finally:
+        if mlperf_logger is not None:
+            mlperf_logger.finalize()
+
         # Clean up
         print("🛑 Stopping trajectory collection...")
         try:

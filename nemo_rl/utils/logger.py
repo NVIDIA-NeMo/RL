@@ -75,6 +75,14 @@ class GPUMonitoringConfig(TypedDict):
     flush_interval: int | float
 
 
+class MLPerfLoggerConfig(TypedDict):
+    enabled: NotRequired[bool]
+    benchmark: NotRequired[str]
+    target_accuracy: NotRequired[float]
+    force_success_status: NotRequired[bool]
+    log_file: NotRequired[str]
+
+
 class LoggerConfig(TypedDict):
     log_dir: str
     wandb_enabled: bool
@@ -88,6 +96,8 @@ class LoggerConfig(TypedDict):
     monitor_gpus: bool
     gpu_monitoring: GPUMonitoringConfig
     num_val_samples_to_print: NotRequired[int]
+    mlperf_enabled: NotRequired[bool]
+    mlperf: NotRequired[MLPerfLoggerConfig]
 
 
 class LoggerInterface(ABC):

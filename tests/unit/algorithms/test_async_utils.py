@@ -260,18 +260,23 @@ class TestReplayBuffer:
             )
         )
 
-        # Sample with current_weight_version=3 and max_age_steps=1
-        # This should filter out the trajectory with weight_version=0 (too old)
-        with pytest.raises(
-            ValueError, match="Found .* trajectories older than min_valid_version"
-        ):
-            ray.get(
-                buffer.sample.remote(
-                    num_prompt_groups=1,
-                    current_weight_version=3,
-                    max_age_steps=1,
-                )
+        # Sample with current_weight_version=3 and max_age_steps=1.
+        # This should remove the trajectory with weight_version=0 (too old)
+        # and still return the recent trajectory.
+        sample_result = ray.get(
+            buffer.sample.remote(
+                num_prompt_groups=1,
+                current_weight_version=3,
+                max_age_steps=1,
             )
+        )
+
+        assert sample_result is not None
+        assert sample_result["trajectories"][0]["batch"]["data"] == "recent"
+
+        debug_info = ray.get(buffer.get_debug_info.remote())
+        assert debug_info["trajectory_versions"] == []
+        assert debug_info["target_weight_versions"] == []
 
         ray.kill(buffer)
 
@@ -312,6 +317,33 @@ class TestReplayBuffer:
         assert sample_result is not None
         assert len(sample_result["trajectories"]) == 1
         assert sample_result["trajectories"][0]["batch"]["data"] == "for_step_1"
+
+        ray.kill(buffer)
+
+    def test_replay_buffer_future_target_weight_matching(self):
+        """Test that sampling can use trajectories intended for a future step."""
+        buffer = ReplayBuffer.remote(max_size=10)
+
+        trajectory = {
+            "batch": {"data": "for_future_step"},
+            "rollout_metrics": {"reward": 1.0},
+        }
+        ray.get(
+            buffer.push_with_wait_signal.remote(
+                trajectory, weight_version=1, target_weight_version=3
+            )
+        )
+
+        sample_result = ray.get(
+            buffer.sample.remote(
+                num_prompt_groups=1,
+                current_weight_version=2,
+                max_age_steps=1,
+            )
+        )
+
+        assert sample_result is not None
+        assert sample_result["trajectories"][0]["batch"]["data"] == "for_future_step"
 
         ray.kill(buffer)
 

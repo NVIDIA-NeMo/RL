@@ -93,6 +93,10 @@ checkpointing:
   save_optimizer: false
 
 policy:
+  # The launcher mounts CONTAINER_HF_CKPT_PATH to a stable container path and exports that
+  # mounted path here. NRL_MEGATRON_CHECKPOINT_DIR is mounted separately for the
+  # pre-converted Megatron checkpoint cache.
+  model_name: ${oc.env:CONTAINER_HF_CKPT_PATH}
   tokenizer:
     name: ${policy.model_name}
     chat_template_kwargs: null
