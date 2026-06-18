@@ -2221,6 +2221,22 @@ def grpo_train(
                 with timer.time("data_processing"):
                     use_overlong_filtering = master_config.grpo["overlong_filtering"]
                     if use_overlong_filtering:
+                        if "truncated" not in repeated_batch:
+                            # Surface a clear error for rollout backends that
+                            # didn't populate ``truncated``. The previous bare
+                            # ``repeated_batch["truncated"]`` produced an
+                            # opaque ``KeyError`` deep in the train loop —
+                            # see issue #2163.
+                            raise RuntimeError(
+                                "grpo.overlong_filtering=true requires the "
+                                "rollout backend to populate a per-sample "
+                                "``truncated`` field on the rollout batch, "
+                                "but the current batch is missing it. "
+                                "Either disable overlong_filtering or update "
+                                "the rollout backend to set ``truncated`` "
+                                "(see ``nemo_rl/experience/rollouts.py`` for "
+                                "examples). Refs issue #2163."
+                            )
                         loss_multiplier = repeated_batch["loss_multiplier"].clone()
                         truncated = repeated_batch["truncated"]
 
