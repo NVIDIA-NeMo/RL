@@ -235,7 +235,7 @@ policy:
       kv_cache_dtype: "auto"
       expose_http_server: true
       skip_tokenizer_init: false
-      # tool_parser_plugin: ???  # This is set to the path for Nemotron Nano v2
+      tool_parser_plugin: nemo_rl/models/generation/vllm/tool_parsers/nemotron_json.py
       http_server_serving_chat_kwargs:
         # Workplace assistant uses 26 tools, so we enable auto_tools.
         # For Nemotron Nano v2, we use the dedicated `nemotron_json` tool parser
