@@ -104,6 +104,11 @@ CONTAINER_NEMO_GYM_SWE_TRAIN_DATA_PATH="${CONTAINER_NEMO_GYM_SWE_TRAIN_DATA_PATH
 CONTAINER_NEMO_GYM_SWE_VALIDATION_DATA_PATH="${CONTAINER_NEMO_GYM_SWE_VALIDATION_DATA_PATH:-${CONTAINER_INPUT_ROOT}/data/validation.jsonl}"
 CONTAINER_NEMO_GYM_SWE_SIF_DIR="${CONTAINER_NEMO_GYM_SWE_SIF_DIR:-${CONTAINER_INPUT_ROOT}/sif}"
 
+# Pick a fresh random seed every launch unless one is provided explicitly via GRPO_SEED.
+# Combine two $RANDOM draws (each 0-32767) into a wider 0..~2^30 range.
+GRPO_SEED="${GRPO_SEED:-$(( (RANDOM << 15) | RANDOM ))}"
+echo "Using grpo.seed=${GRPO_SEED}"
+
 # ray.sub is submitted from the host checkout, but training runs from the
 # baked checkout inside the container.
 cd "${REPO_LOCATION}"
@@ -143,6 +148,7 @@ uv run examples/nemo_gym/run_grpo_nemo_gym.py \
     ++logger.wandb.name=$EXP_NAME \
     ++logger.log_dir=/logs \
     ++checkpointing.checkpoint_dir=/checkpoint \
+    ++grpo.seed=${GRPO_SEED} \
     $@
 EOF
 )
