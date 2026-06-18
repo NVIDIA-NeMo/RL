@@ -850,12 +850,12 @@ class PreferenceLossFn(LossFunction):
         }
 
 
-class DPOLossConfig(TypedDict):
-    reference_policy_kl_penalty: float
-    preference_loss_weight: float
-    sft_loss_weight: float
-    preference_average_log_probs: bool
-    sft_average_log_probs: bool
+class DPOLossConfig(BaseModel, extra="allow"):
+    reference_policy_kl_penalty: float = 0.05
+    preference_loss_weight: float = 1.0
+    sft_loss_weight: float = 0.0
+    preference_average_log_probs: bool = False
+    sft_average_log_probs: bool = False
 
 
 class DPOLossDataDict(TypedDict):
@@ -926,12 +926,14 @@ class DPOLossFn(PreferenceLossFn):
     loss_type = LossType.SEQUENCE_LEVEL
     input_type = LossInputType.LOGPROB
 
-    def __init__(self, cfg: DPOLossConfig, use_linear_ce_fusion: bool = False):
-        self.reference_policy_kl_penalty = cfg["reference_policy_kl_penalty"]
-        self.preference_loss_weight = cfg["preference_loss_weight"]
-        self.sft_loss_weight = cfg["sft_loss_weight"]
-        self.preference_average_log_probs = cfg["preference_average_log_probs"]
-        self.sft_average_log_probs = cfg["sft_average_log_probs"]
+    def __init__(self, cfg: DPOLossConfig | dict, use_linear_ce_fusion: bool = False):
+        if isinstance(cfg, dict):
+            cfg = DPOLossConfig(**cfg)
+        self.reference_policy_kl_penalty = cfg.reference_policy_kl_penalty
+        self.preference_loss_weight = cfg.preference_loss_weight
+        self.sft_loss_weight = cfg.sft_loss_weight
+        self.preference_average_log_probs = cfg.preference_average_log_probs
+        self.sft_average_log_probs = cfg.sft_average_log_probs
         self.use_linear_ce_fusion = use_linear_ce_fusion
         self.sft_loss = NLLLossFn(use_linear_ce_fusion=use_linear_ce_fusion)
 
@@ -1010,10 +1012,10 @@ class DPOLossFn(PreferenceLossFn):
         }
 
 
-class DistillationLossConfig(TypedDict):
-    kl_type: str
-    mixed_kl_weight: float
-    zero_outside_topk: bool
+class DistillationLossConfig(BaseModel, extra="allow"):
+    kl_type: str = "mixed"
+    mixed_kl_weight: float = 0.5
+    zero_outside_topk: bool = False
 
 
 class DistillationLossDataDict(TypedDict):
@@ -1032,9 +1034,9 @@ class DistillationLossFn(LossFunction):
     input_type = LossInputType.DISTILLATION
 
     def __init__(self, cfg: DistillationLossConfig):
-        self.kl_type = cfg["kl_type"]
-        self.mixed_kl_weight = cfg["mixed_kl_weight"]
-        self.zero_outside_topk = cfg["zero_outside_topk"]
+        self.kl_type = cfg.kl_type
+        self.mixed_kl_weight = cfg.mixed_kl_weight
+        self.zero_outside_topk = cfg.zero_outside_topk
         self.log_infinitesimal = -100
 
         assert self.kl_type in ["forward", "reverse", "mixed"], "Invalid KL type"

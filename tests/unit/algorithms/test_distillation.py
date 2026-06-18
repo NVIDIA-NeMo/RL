@@ -28,7 +28,7 @@ from nemo_rl.algorithms.distillation import (
     distillation_train,
     validate,
 )
-from nemo_rl.algorithms.loss import DistillationLossFn
+from nemo_rl.algorithms.loss import DistillationLossConfig, DistillationLossFn
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
@@ -109,11 +109,11 @@ def mock_components():
     tokenizer.pad_token_id = 0
 
     loss_fn = DistillationLossFn(
-        {
-            "kl_type": "forward",
-            "mixed_kl_weight": 0.5,
-            "zero_outside_topk": False,
-        }
+        DistillationLossConfig(
+            kl_type="forward",
+            mixed_kl_weight=0.5,
+            zero_outside_topk=False,
+        )
     )
 
     logger = MagicMock()
