@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Optional
 
 
-WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
+WORKSPACE_ROOT = Path().cwd()
 DEFAULT_INSTANCE_FILE = WORKSPACE_ROOT / "r2e_gym_instance_ids.txt"
 DEFAULT_CONTEXTS_DIR = WORKSPACE_ROOT / ".arm64_build_contexts"
 DEFAULT_REPO_CACHE_DIR = WORKSPACE_ROOT / ".arm64_repo_cache"
