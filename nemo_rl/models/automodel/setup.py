@@ -17,6 +17,7 @@
 import importlib
 import inspect
 import os
+from contextlib import contextmanager
 from functools import partial
 from typing import Any, Optional, Union
 
@@ -54,6 +55,28 @@ STRING_TO_DTYPE = {
     "bfloat16": torch.bfloat16,
     "float16": torch.float16,
 }
+
+
+@contextmanager
+def _force_shard_before_load(enabled: bool):
+    if not enabled:
+        yield
+        return
+
+    import nemo_automodel._transformers.infrastructure as automodel_infrastructure
+
+    original_should_load_before_shard = automodel_infrastructure._should_load_before_shard
+
+    def _always_load_after_shard(**_kwargs: Any) -> bool:
+        return False
+
+    automodel_infrastructure._should_load_before_shard = _always_load_after_shard
+    try:
+        yield
+    finally:
+        automodel_infrastructure._should_load_before_shard = (
+            original_should_load_before_shard
+        )
 
 
 def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
@@ -639,7 +662,11 @@ def setup_model_and_optimizer(
         cfg_dict_with_dtype = {**lora_cfg, "lora_dtype": "torch.float32"}
         peft_config = PeftConfig.from_dict(cfg_dict_with_dtype)
 
-    print(f"[Rank {rank}] Initializing model via from_pretrained...")
+    shard_before_load = bool(config["dtensor_cfg"].get("shard_before_load", False))
+    print(
+        f"[Rank {rank}] Initializing model via from_pretrained "
+        f"(shard_before_load={shard_before_load})..."
+    )
 
     # Prepare automodel kwargs
     automodel_kwargs = config["dtensor_cfg"].get("automodel_kwargs", {})
@@ -706,21 +733,22 @@ def setup_model_and_optimizer(
 
     # Create model via from_pretrained - handles meta device init, parallelization,
     # LoRA, and base weight loading internally
-    model = model_class.from_pretrained(
-        model_name,
-        device_mesh=device_mesh,
-        moe_mesh=moe_mesh,
-        distributed_config=fsdp2_config,
-        moe_config=moe_config if ep_size > 1 else None,
-        activation_checkpointing=config["dtensor_cfg"]["activation_checkpointing"],
-        peft_config=peft_config,
-        attn_implementation=attn_impl,
-        torch_dtype=str(model_config.torch_dtype),
-        trust_remote_code=True,
-        sdpa_method=sdpa_method,
-        **from_pretrained_kwargs,
-        **automodel_kwargs,
-    )
+    with _force_shard_before_load(shard_before_load):
+        model = model_class.from_pretrained(
+            model_name,
+            device_mesh=device_mesh,
+            moe_mesh=moe_mesh,
+            distributed_config=fsdp2_config,
+            moe_config=moe_config if ep_size > 1 else None,
+            activation_checkpointing=config["dtensor_cfg"]["activation_checkpointing"],
+            peft_config=peft_config,
+            attn_implementation=attn_impl,
+            torch_dtype=str(model_config.torch_dtype),
+            trust_remote_code=True,
+            sdpa_method=sdpa_method,
+            **from_pretrained_kwargs,
+            **automodel_kwargs,
+        )
 
     print(model)
 
