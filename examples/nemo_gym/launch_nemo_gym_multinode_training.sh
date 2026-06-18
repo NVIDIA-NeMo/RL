@@ -98,11 +98,16 @@ NODES="${NODES:-$((TRAIN_NODES + GEN_NODES))}"
 CONTAINER_REPO_LOCATION="${CONTAINER_REPO_LOCATION:-/opt/nemo-rl}"
 RECIPE="${RECIPE:-examples/nemo_gym/grpo_qwen3_235b_swe_openhands_async.yaml}"
 CONTAINER_INPUT_ROOT="${CONTAINER_INPUT_ROOT:-/inputs/nemo_gym}"
-CONTAINER_HF_CKPT_PATH="${CONTAINER_HF_CKPT_PATH:-${CONTAINER_INPUT_ROOT}/hf_ckpt}"
+CONTAINER_HF_CKPT_PATH="${CONTAINER_HF_CKPT_PATH:-${HF_CKPT_PATH}}"
 CONTAINER_NRL_MEGATRON_CHECKPOINT_DIR="${CONTAINER_NRL_MEGATRON_CHECKPOINT_DIR:-${CONTAINER_INPUT_ROOT}/mcore_ckpt}"
 CONTAINER_NEMO_GYM_SWE_TRAIN_DATA_PATH="${CONTAINER_NEMO_GYM_SWE_TRAIN_DATA_PATH:-${CONTAINER_INPUT_ROOT}/data/train.jsonl}"
 CONTAINER_NEMO_GYM_SWE_VALIDATION_DATA_PATH="${CONTAINER_NEMO_GYM_SWE_VALIDATION_DATA_PATH:-${CONTAINER_INPUT_ROOT}/data/validation.jsonl}"
 CONTAINER_NEMO_GYM_SWE_SIF_DIR="${CONTAINER_NEMO_GYM_SWE_SIF_DIR:-${CONTAINER_INPUT_ROOT}/sif}"
+
+# Pick a fresh random seed every launch unless one is provided explicitly via GRPO_SEED.
+# Combine two $RANDOM draws (each 0-32767) into a wider 0..~2^30 range.
+GRPO_SEED="${GRPO_SEED:-$(( (RANDOM << 15) | RANDOM ))}"
+echo "Using grpo.seed=${GRPO_SEED}"
 
 # ray.sub is submitted from the host checkout, but training runs from the
 # baked checkout inside the container.
@@ -123,6 +128,7 @@ TRANSFORMERS_OFFLINE=1 \
 HF_TOKEN="${HF_TOKEN:-}" \
 WANDB_API_KEY="${WANDB_API_KEY:-}" \
 HF_CKPT_PATH="${CONTAINER_HF_CKPT_PATH}" \
+CONTAINER_HF_CKPT_PATH="${CONTAINER_HF_CKPT_PATH}" \
 NRL_MEGATRON_CHECKPOINT_DIR="${CONTAINER_NRL_MEGATRON_CHECKPOINT_DIR}" \
 NEMO_GYM_SWE_WORKSPACE_ROOT=/logs/nemo_gym/workspace \
 NEMO_GYM_SWE_TRAIN_DATA_PATH="${CONTAINER_NEMO_GYM_SWE_TRAIN_DATA_PATH}" \
@@ -142,6 +148,7 @@ uv run examples/nemo_gym/run_grpo_nemo_gym.py \
     ++logger.wandb.name=$EXP_NAME \
     ++logger.log_dir=/logs \
     ++checkpointing.checkpoint_dir=/checkpoint \
+    ++grpo.seed=${GRPO_SEED} \
     $@
 EOF
 )
@@ -162,7 +169,7 @@ SLURM_COMMENT="${SLURM_COMMENT:-{\"OccupiedIdleGPUsJobReaper\":{\"exemptIdleTime
 # (`touch $LOG_DIR/STARTED_RAY_HEAD`). Without the identity mount that touch
 # fails and the launcher waits forever for the cluster to come up.
 MOUNTS="${OUT_DIR}/logs:${OUT_DIR}/logs,${HOST_HF_HOME}:${CONTAINER_REPO_LOCATION}/.cache,${OUT_DIR}/checkpoint:/checkpoint,${OUT_DIR}/logs:/logs"
-MOUNTS="${MOUNTS},${HF_CKPT_PATH}:${CONTAINER_HF_CKPT_PATH}"
+MOUNTS="${MOUNTS},${HF_CKPT_PATH}:${HF_CKPT_PATH}"
 MOUNTS="${MOUNTS},${NRL_MEGATRON_CHECKPOINT_DIR}:${CONTAINER_NRL_MEGATRON_CHECKPOINT_DIR}"
 MOUNTS="${MOUNTS},${NEMO_GYM_SWE_TRAIN_DATA_PATH}:${CONTAINER_NEMO_GYM_SWE_TRAIN_DATA_PATH}"
 MOUNTS="${MOUNTS},${NEMO_GYM_SWE_VALIDATION_DATA_PATH}:${CONTAINER_NEMO_GYM_SWE_VALIDATION_DATA_PATH}"

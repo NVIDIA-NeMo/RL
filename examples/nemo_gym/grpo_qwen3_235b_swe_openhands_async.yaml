@@ -93,10 +93,10 @@ checkpointing:
   save_optimizer: false
 
 policy:
-  # The launcher mounts HF_CKPT_PATH to a stable container path and exports that
+  # The launcher mounts CONTAINER_HF_CKPT_PATH to a stable container path and exports that
   # mounted path here. NRL_MEGATRON_CHECKPOINT_DIR is mounted separately for the
   # pre-converted Megatron checkpoint cache.
-  model_name: ${oc.env:HF_CKPT_PATH}
+  model_name: ${oc.env:CONTAINER_HF_CKPT_PATH}
   tokenizer:
     name: ${policy.model_name}
     chat_template_kwargs: null
@@ -311,7 +311,7 @@ env:
           container_formatter:
            - "${sif_dir}/swebench_sweb.eval.x86_64.{instance_id}.sif"
            - "${sif_dir}/swegym_sweb.eval.x86_64.{instance_id}.sif"
-           - "${sif_dir}/r2egym_{instance_id}.sif"
+           - "${sif_dir}/r2egym/{instance_id}.sif"
     swe_agents_val:
       responses_api_agents:
         swe_agents:
