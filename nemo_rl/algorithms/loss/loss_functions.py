@@ -1450,6 +1450,16 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 "threshold and adds collision resolution) and is undefined "
                 "in the P-KL path."
             )
+        # Dynamic teacher weighting (sum_weights_metric) is only applied in
+        # kd_loss_mode="sum"; averaged_logits and select_teacher use static
+        # per-teacher weights. Reject the combo instead of silently dropping
+        # the metric.
+        if cfg.get("sum_weights_metric") is not None and cfg["kd_loss_mode"] != "sum":
+            raise ValueError(
+                f"sum_weights_metric={cfg['sum_weights_metric']!r} is only "
+                f"applied in kd_loss_mode='sum'; it is ignored by "
+                f"'{cfg['kd_loss_mode']}'. Unset one of them."
+            )
         # Global loss knobs (shared across all teachers).
         self.gold_loss = cfg["gold_loss"]
         self.xtoken_loss = cfg["xtoken_loss"]

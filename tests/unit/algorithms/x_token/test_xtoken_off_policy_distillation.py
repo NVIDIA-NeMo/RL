@@ -887,3 +887,24 @@ def test_teacher_weight_score_masks_dropped_samples():
     )
 
     assert torch.allclose(score, score_corrupt, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# sum_weights_metric is a sum-mode-only knob
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mode", ["averaged_logits", "select_teacher"])
+def test_sum_weights_metric_rejected_outside_sum_mode(mode):
+    # Dynamic weighting is only applied in kd_loss_mode="sum" (matching the
+    # reference). Combining sum_weights_metric with another mode used to be
+    # silently dropped; it must now fail loudly at construction.
+    with pytest.raises(ValueError, match="sum_weights_metric"):
+        CrossTokenizerDistillationLossFn(
+            {
+                "xtoken_loss": False,
+                "gold_loss": False,
+                "kd_loss_mode": mode,
+                "sum_weights_metric": "ce",
+            }
+        )
