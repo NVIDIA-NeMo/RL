@@ -311,7 +311,7 @@ env:
           container_formatter:
            - "${sif_dir}/swebench_sweb.eval.x86_64.{instance_id}.sif"
            - "${sif_dir}/swegym_sweb.eval.x86_64.{instance_id}.sif"
-           - "${sif_dir}/r2egym_{instance_id}.sif"
+           - "${sif_dir}/r2egym/{instance_id}.sif"
     swe_agents_val:
       responses_api_agents:
         swe_agents:
