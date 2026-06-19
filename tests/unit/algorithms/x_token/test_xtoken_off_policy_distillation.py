@@ -908,3 +908,24 @@ def test_sum_weights_metric_rejected_outside_sum_mode(mode):
                 "sum_weights_metric": "ce",
             }
         )
+
+
+# ---------------------------------------------------------------------------
+# DP-global teacher score (cross-rank agreement primitive)
+# ---------------------------------------------------------------------------
+
+
+def test_dp_global_masked_mean_single_process_is_local_masked_mean():
+    # Without a process group the DP all-reduce is a no-op, so the global
+    # masked mean reduces to the plain masked mean: padded positions excluded,
+    # and the result is detached (it gates selection / weighting, never
+    # back-propagated). Cross-rank agreement is verified separately with a
+    # 2-rank gloo run.
+    fn = CrossTokenizerDistillationLossFn.__new__(CrossTokenizerDistillationLossFn)
+    values = torch.tensor([[1.0, 2.0, 100.0]], requires_grad=True)
+    mask = torch.tensor([[1.0, 1.0, 0.0]])
+
+    out = fn._dp_global_masked_mean(values, mask)
+
+    assert out.item() == pytest.approx(1.5)  # (1+2)/2; padded 100.0 excluded
+    assert not out.requires_grad  # detached

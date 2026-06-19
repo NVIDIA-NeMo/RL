@@ -1915,6 +1915,26 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         kd = self._direct_full_vocab_kl(logits, data, avg, global_valid_toks)
         return kd, {"kl_loss": kd.item()}
 
+    def _dp_global_masked_mean(
+        self, values: torch.Tensor, mask: torch.Tensor
+    ) -> torch.Tensor:
+        """Masked mean of ``values`` over the *DP-global* valid count.
+
+        Teacher selection / dynamic weighting must be identical on every DP
+        rank. A rank-local mean is computed on that rank's shard only, so
+        ranks can pick a different teacher / different weights; the per-teacher
+        KD's ``dp_all_reduce_sum`` then sees divergent participation across
+        ranks (deadlock when one rank's choice fires a collective another's
+        does not, or a mixed reduction otherwise). All-reduce the masked sum
+        and the mask count across DP so every rank gets the same score
+        (mirrors the ``global_valid_toks`` convention). The result is detached
+        (it gates selection / weighting and is not back-propagated, matching
+        the reference's ``no_grad`` scoring).
+        """
+        num = dp_all_reduce_sum((values * mask).sum())
+        den = dp_all_reduce_sum(mask.sum()).clamp(min=1.0)
+        return num / den
+
     def _select_teacher_kd(
         self,
         logits: torch.Tensor,
@@ -1937,7 +1957,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 mask = (
                     t_mask[:, 1:].float() * data["sample_mask"].unsqueeze(-1).float()
                 ).reshape(-1)
-                ces.append(masked_mean(ce_pos, mask).item())
+                ces.append(self._dp_global_masked_mean(ce_pos, mask).item())
             best = int(min(range(self.num_teachers), key=lambda j: ces[j]))
 
         kd, m = self._compute_teacher_kd(
@@ -2034,15 +2054,15 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 reduction="none",
             )
             mask = (t_mask[:, 1:].float() * samp).reshape(-1)
-            return -masked_mean(ce_pos, mask)
+            return -self._dp_global_masked_mean(ce_pos, mask)
         mask = t_mask.float() * samp
         if self.sum_weights_metric == "entropy":
             probs = torch.softmax(t_logits.float(), dim=-1)
             entropy = -(probs * torch.log(probs + 1e-10)).sum(dim=-1)
-            return -masked_mean(entropy, mask)
+            return -self._dp_global_masked_mean(entropy, mask)
         if self.sum_weights_metric == "max_prob":
             probs = torch.softmax(t_logits.float(), dim=-1)
-            return masked_mean(probs.max(dim=-1).values, mask)
+            return self._dp_global_masked_mean(probs.max(dim=-1).values, mask)
         raise ValueError(f"Unknown sum_weights_metric: {self.sum_weights_metric!r}")
 
     # ------------------------------------------------------------------ #
