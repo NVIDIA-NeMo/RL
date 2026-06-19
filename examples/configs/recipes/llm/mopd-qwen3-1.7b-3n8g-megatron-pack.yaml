@@ -85,12 +85,17 @@ data:
   max_input_seq_length: null
   train:
     data_path: /path/to/train.jsonl
+    # grpo_math_1B.yaml sets data.train.dataset_name: OpenMathInstruct-2 and per-split
+    # keys win over data.default, so this override is required for the gym wrapping.
+    dataset_name: NemoGymDataset
   validation:
     data_path: /path/to/validation.jsonl
+    dataset_name: NemoGymDataset
   default:
     dataset_name: NemoGymDataset
     env_name: nemo_gym
     prompt_file: null
+    system_prompt_file: null
     processor: nemo_gym_data_processor
 env:
   should_use_nemo_gym: true
@@ -98,12 +103,23 @@ env:
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
     - resources_servers/math_with_judge/configs/math_with_judge.yaml
+    - resources_servers/code_gen/configs/code_gen.yaml
+    - resources_servers/workplace_assistant/configs/workplace_assistant.yaml
+    - resources_servers/mcqa/configs/mcqa.yaml
+    - resources_servers/instruction_following/configs/instruction_following.yaml
+    - resources_servers/structured_outputs/configs/structured_outputs_json.yaml
     math_with_judge:
       resources_servers:
         math_with_judge:
           judge_model_server:
             name: policy_model
           should_use_judge: false
+    code_gen:
+      resources_servers:
+        code_gen:
+          num_processes: 1024
+          unit_test_timeout_secs: 10
+          debug: false
 logger:
   tensorboard_enabled: true
   wandb:
