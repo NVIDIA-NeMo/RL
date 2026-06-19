@@ -737,6 +737,11 @@ def setup_model_and_optimizer(
     # checkpoint dtype, which would break optimizer master-weight precision (see helper).
     _disable_automodel_checkpoint_dtype_restore()
 
+    # Recipe-level attn_implementation wins; pop it so it doesn't collide with
+    # the explicit attn_implementation kwarg passed to from_pretrained() below.
+    if "attn_implementation" in automodel_kwargs:
+        attn_impl = automodel_kwargs.pop("attn_implementation")
+
     # Create model via from_pretrained - handles meta device init, parallelization,
     # LoRA, and base weight loading internally
     model = model_class.from_pretrained(

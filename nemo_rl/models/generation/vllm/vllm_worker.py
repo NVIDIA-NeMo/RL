@@ -361,6 +361,7 @@ class BaseVllmGenerationWorker:
             for arch in (
                 "Gemma3ForConditionalGeneration",
                 "Gemma4ForConditionalGeneration",
+                "Mistral3ForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
                 "Qwen3_5MoeForConditionalGeneration",
             )
@@ -372,6 +373,7 @@ class BaseVllmGenerationWorker:
                 in (
                     "Gemma3ForConditionalGeneration",
                     "Gemma4ForConditionalGeneration",
+                    "Mistral3ForConditionalGeneration",
                     "Qwen3_5ForConditionalGeneration",
                     "Qwen3_5MoeForConditionalGeneration",
                 )
@@ -383,6 +385,30 @@ class BaseVllmGenerationWorker:
                     "See https://github.com/NVIDIA-NeMo/RL/issues/1681 for more details."
                 )
             self.cfg["vllm_cfg"]["skip_tokenizer_init"] = False
+
+        # Mistral 3.5 (Mistral3ForConditionalGeneration) integration.
+        if "Mistral3ForConditionalGeneration" in getattr(
+            hf_config, "architectures", []
+        ):
+            # Mistral 3.5 ships FP8 on disk, but NeMo-RL refits bf16 weights via
+            # ZMQ (load_format='dummy'). Clear the auto-detected quantization_config
+            # so vLLM allocates bf16 buffers instead of building Fp8Config.
+            if hasattr(hf_config, "quantization_config"):
+                assert load_format == "dummy", (
+                    "Loading FP8-quantized Mistral3 in vLLM is only supported "
+                    "with load_format='dummy' (NeMo-RL refits bf16 weights via "
+                    "ZMQ). Got load_format=%r." % load_format
+                )
+                vllm_kwargs["quantization"] = None
+                vllm_kwargs["hf_overrides"]["quantization_config"] = {}
+
+            # Force the HF config parser. Auto-detect picks Mistral-native format
+            # and remaps architectures to Pixtral, whose weight loader is
+            # incompatible with NeMo-RL's HF-format ZMQ refit keys.
+            vllm_kwargs["config_format"] = "hf"
+
+            # Text-only runs additionally set generation.vllm_kwargs.language_model_only
+            # in the recipe YAML to skip vLLM's multimodal preflight.
 
         llm_kwargs = dict(
             model=self.model_name,
