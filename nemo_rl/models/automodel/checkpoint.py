@@ -240,9 +240,15 @@ class AutomodelCheckpointManager:
             ConsolidatedHFAddon,
             PeftAddon,
         )
+        from nemo_automodel.components.checkpoint.checkpointing import (
+            _should_write_hf_metadata,
+        )
 
+        # _should_write_hf_metadata is a module-level helper in automodel that
+        # takes the config (see Checkpointer.__init__), not a Checkpointer method.
+        # Mirror that __init__ logic exactly when rebuilding the addons list.
         self.checkpointer._addons = []
-        if self.checkpointer._should_write_hf_metadata():
+        if _should_write_hf_metadata(self.checkpointer.config):
             self.checkpointer._addons.append(ConsolidatedHFAddon())
         if self.checkpointer.config.is_peft:
             self.checkpointer._addons.append(PeftAddon())
