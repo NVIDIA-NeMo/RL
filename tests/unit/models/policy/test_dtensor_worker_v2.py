@@ -960,3 +960,76 @@ class TestGetTrainContext:
             sequence_dim,
         ], "sequence_dim should be replicated for each buffer"
         assert len(call_kwargs["cp_seq_dims"]) == 3
+
+
+class _RefitReached(Exception):
+    """Sentinel raised after the patched move_to_cuda line has executed."""
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(
+    not NEMO_AUTOMODEL_AVAILABLE,
+    reason="nemo_automodel not available",
+)
+class TestRefitOnloadModelOnCuda:
+    """Regression tests ensuring DTensorPolicyWorkerV2 refit entrypoints
+    re-onload the model to cuda before iterating its DTensor params.
+
+    Covers the fix for DAPO dynamic-sampling re-entry where
+    offload_after_refit() left the model on CPU and the next refit
+    started without an intervening prepare_for_* onload.
+    """
+
+    def _make_worker(self, cpu_offload: bool = False) -> DTensorPolicyWorkerV2Impl:
+        """Build a worker instance bypassing __init__ and seed required attrs."""
+        worker = DTensorPolicyWorkerV2Impl.__new__(DTensorPolicyWorkerV2Impl)
+        worker.model = MagicMock(name="model")
+        worker.cpu_offload = cpu_offload
+        worker.dtype = torch.float32
+        worker.rank = 0
+        worker.zmq_socket = MagicMock(name="zmq_socket")
+        worker.model_update_group = MagicMock(name="model_update_group")
+        worker.maybe_init_zmq = MagicMock(name="maybe_init_zmq")
+        worker.report_device_id = MagicMock(return_value="GPU-uuid")
+        # move_to_cuda is the patched call we want to assert was invoked.
+        worker.move_to_cuda = MagicMock(side_effect=lambda m: m)
+        worker.move_to_cpu = MagicMock(side_effect=lambda m: m)
+        return worker
+
+    @pytest.mark.parametrize("cpu_offload", [True, False])
+    def test_stream_weights_via_ipc_zmq_onloads_unconditionally(self, cpu_offload):
+        worker = self._make_worker(cpu_offload=cpu_offload)
+        with patch(
+            "nemo_rl.models.policy.utils.stream_weights_via_ipc_zmq_impl",
+            side_effect=_RefitReached,
+        ):
+            with pytest.raises(_RefitReached):
+                DTensorPolicyWorkerV2Impl.stream_weights_via_ipc_zmq(worker)
+        worker.maybe_init_zmq.assert_called_once()
+        worker.move_to_cuda.assert_called_once_with(worker.model)
+
+    @pytest.mark.parametrize("cpu_offload", [True, False])
+    def test_stream_weights_via_http_onloads_unconditionally(self, cpu_offload):
+        worker = self._make_worker(cpu_offload=cpu_offload)
+        with patch(
+            "nemo_rl.models.policy.utils.stream_weights_via_http_impl",
+            side_effect=_RefitReached,
+        ):
+            with pytest.raises(_RefitReached):
+                DTensorPolicyWorkerV2Impl.stream_weights_via_http(
+                    worker, sglang_url_to_gpu_uuids={"http://x:1": ["GPU-uuid"]}
+                )
+        worker.move_to_cuda.assert_called_once_with(worker.model)
+
+    @pytest.mark.parametrize("cpu_offload", [True, False])
+    def test_broadcast_weights_for_collective_onloads_unconditionally(
+        self, cpu_offload
+    ):
+        worker = self._make_worker(cpu_offload=cpu_offload)
+        with patch(
+            "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.packed_broadcast_producer",
+            side_effect=_RefitReached,
+        ):
+            with pytest.raises(_RefitReached):
+                DTensorPolicyWorkerV2Impl.broadcast_weights_for_collective(worker)
+        worker.move_to_cuda.assert_called_once_with(worker.model)

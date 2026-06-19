@@ -1107,9 +1107,13 @@ class DTensorPolicyWorkerV2Impl(
             )
 
         self.maybe_init_zmq()
-        # Manually move model to cuda for cpu offload case
-        if self.cpu_offload:
-            self.model = self.move_to_cuda(self.model)
+        # Ensure the model is on cuda before iterating its DTensor params.
+        # offload_after_refit() unconditionally moves the model to CPU, and
+        # with DAPO dynamic sampling the per-step refit_policy_generation can
+        # be re-entered without an intervening prepare_for_* call (which is
+        # what normally re-onloads the model). Re-onloading here is a no-op
+        # when the model is already on cuda.
+        self.model = self.move_to_cuda(self.model)
 
         from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
 
@@ -1133,9 +1137,10 @@ class DTensorPolicyWorkerV2Impl(
         Args:
             sglang_url_to_gpu_uuids: Dict mapping SGLang server URL to list of GPU UUIDs it uses
         """
-        # Manually move model to cuda for cpu offload case
-        if self.cpu_offload:
-            self.model = self.move_to_cuda(self.model)
+        # Ensure the model is on cuda before iterating its DTensor params.
+        # See stream_weights_via_ipc_zmq for the rationale (DAPO dynamic
+        # sampling can re-enter refit without an intervening onload).
+        self.model = self.move_to_cuda(self.model)
 
         from nemo_rl.models.policy.utils import stream_weights_via_http_impl
 
@@ -1179,13 +1184,15 @@ class DTensorPolicyWorkerV2Impl(
                 "FP8 kvcache is not currently supported for DTensor path, we will support it in the future."
             )
 
-        # Manually move model to cuda for cpu offload case
+        # Ensure the model is on cuda before iterating its DTensor params.
+        # See stream_weights_via_ipc_zmq for the rationale (DAPO dynamic
+        # sampling can re-enter refit without an intervening onload).
         if self.cpu_offload:
             print(
                 "[WARNING]: Unless you are lacking of memory, it is not recommended to enable cpu_offload when "
                 "using non-colocated generation since it will have an extra onload and offload at refit stage."
             )
-            self.model = self.move_to_cuda(self.model)
+        self.model = self.move_to_cuda(self.model)
 
         # param_iterator will return (name, tensor), we only need tensor
         dtensor_post_iter_func = lambda x: x[1]
