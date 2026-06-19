@@ -1564,7 +1564,12 @@ def test_setup_auto_enables_skip_reference_policy_logprobs_when_kl_penalty_zero(
         def prepare_refit_info(self):
             return {}
 
+        def set_rollout_num_gpus_per_engine(self, _num_gpus_per_engine):
+            pass
+
     class DummySGLangGeneration:
+        num_gpus_per_engine = 1
+
         def finish_generation(self):
             pass
 
