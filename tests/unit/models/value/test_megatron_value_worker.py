@@ -147,7 +147,7 @@ def _create_value_test_config(
 
 
 def _apply_config_updates(config: ValueConfig, config_updates: dict) -> None:
-    """Apply test config overrides in place (precision / SP / PP / dynamic batching / sequence packing)."""
+    """Apply test config overrides in place (precision / SP / PP / CP / dynamic batching / sequence packing)."""
     for k, v in config_updates.items():
         if k == "precision":
             config["precision"] = v
@@ -175,6 +175,13 @@ def _apply_config_updates(config: ValueConfig, config_updates: dict) -> None:
                 "logprob_mb_tokens": mbt,
                 "algorithm": "modified_first_fit_decreasing",
             }
+        elif k == "context_parallel_size":
+            config["megatron_cfg"]["context_parallel_size"] = v
+            # CP splits each packed sequence into 2*CP load-balanced chunks, so
+            # the padded sequence length must be divisible by 2*CP*TP.
+            config["make_sequence_length_divisible_by"] = (
+                2 * v * config["megatron_cfg"]["tensor_model_parallel_size"]
+            )
         else:
             raise ValueError(f"Unknown config_updates key: {k!r}")
 
@@ -436,6 +443,83 @@ def test_value_worker_parallelism_equivalence(
         values_feat = feat.get_values(data)["values"].detach().cpu()
 
         torch.testing.assert_close(values_feat, values_ref, rtol=1e-3, atol=1e-3)
+    finally:
+        if ref is not None:
+            ref.shutdown()
+        if feat is not None:
+            feat.shutdown()
+        if cluster is not None:
+            cluster.shutdown()
+
+
+@pytest.mark.hf_gated
+@pytest.mark.timeout(420)
+def test_value_worker_context_parallel_equivalence(tiny_qwen2_model_path, tmp_path):
+    """Context parallelism must not change values.
+
+    CP needs bf16 (TransformerEngine has no fp32 CP + THD attention backend) and
+    sequence packing, so compare ``get_values`` between CP=1 and CP=2 — both
+    bf16 + packed — with the value head pinned via save/reload. Guards the
+    packed-sequence CP all-gather, which de-interleaves the 2*CP load-balanced
+    shards and reassembles per-token values (a wrong gather still yields finite
+    values, so finiteness alone would not catch it).
+    """
+    cluster = None
+    ref = None
+    feat = None
+    try:
+        cluster = RayVirtualCluster(
+            name="test-megatron-value-equiv-context_parallel",
+            bundle_ct_per_node_list=[2],
+            use_gpus=True,
+            num_gpus_per_node=2,
+            max_colocated_worker_groups=1,
+        )
+
+        torch.manual_seed(42)
+        batch, seq_len = 8, 64
+        data = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 151000, (batch, seq_len)),
+                "input_lengths": torch.full((batch,), seq_len, dtype=torch.int32),
+                "attention_mask": torch.ones(batch, seq_len),
+            }
+        )
+
+        # Reference: CP=1, bf16, packed.
+        ref_config = _create_value_test_config(
+            model_name=tiny_qwen2_model_path, tp=1, precision="bfloat16"
+        )
+        _apply_config_updates(ref_config, {"sequence_packing": True})
+        tokenizer = get_tokenizer(ref_config["tokenizer"])
+        ref = Value(cluster=cluster, config=ref_config, tokenizer=tokenizer)
+        values_ref = ref.get_values(data)["values"].detach().cpu()
+
+        # Save weights, then reload into the CP=2 worker (same weights).
+        weights_path = os.path.join(str(tmp_path), "value", "weights")
+        ref.prepare_for_inference()
+        ref.save_checkpoint(weights_path=weights_path)
+        ref.shutdown()
+        ref = None
+
+        # Feature: CP=2, bf16, packed.
+        feat_config = _create_value_test_config(
+            model_name=tiny_qwen2_model_path, tp=1, precision="bfloat16"
+        )
+        _apply_config_updates(
+            feat_config, {"context_parallel_size": 2, "sequence_packing": True}
+        )
+        feat = Value(
+            cluster=cluster,
+            config=feat_config,
+            tokenizer=tokenizer,
+            weights_path=Path(weights_path),
+            name_prefix="lm_value_feat",
+        )
+        values_feat = feat.get_values(data)["values"].detach().cpu()
+
+        # bf16 tolerance, matching the policy CP equivalence test.
+        torch.testing.assert_close(values_feat, values_ref, rtol=1e-3, atol=1e-2)
     finally:
         if ref is not None:
             ref.shutdown()
