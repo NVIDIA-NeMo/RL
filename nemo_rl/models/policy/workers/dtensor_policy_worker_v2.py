@@ -1306,6 +1306,51 @@ class DTensorPolicyWorkerV2Impl(
         ret["topk_indices"] = result["topk_indices"].cpu()
         return ret
 
+    def _build_pp_refit_plan(self):
+        """Precompute and cache the per-rank PP refit plan: ordered names, per-param owner, adapted name/shape/dtype, and PP ranks."""
+        cached = getattr(self, "_pp_refit_plan", None)
+        if cached is not None:
+            return cached
+
+        pp_group = self.pp_mesh.get_group()
+        pp_ranks = torch.distributed.get_process_group_ranks(pp_group)
+
+        # Local plan: record each owned param's adapted name/shape/dtype, discarding the gathered tensor.
+        local_plan: list[tuple[str, list[tuple[str, list[int], str]]]] = []
+        seen_local: set[str] = set()
+        for part in self.model_handle.parts:
+            sd = part.state_dict()
+            for name in sd.keys():
+                if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
+                    continue
+                if name in seen_local:
+                    continue
+                seen_local.add(name)
+                tensor = sd[name]
+                gathered = (
+                    tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
+                )
+                adapted = _maybe_adapt_tensor_to_hf(part, name, gathered)
+                meta = [(an, list(at.shape), str(at.dtype)) for an, at in adapted]
+                local_plan.append((name, meta))
+                del gathered, adapted
+
+        all_plans: list = [None] * self.pp_size  # type: ignore[list-item]
+        torch.distributed.all_gather_object(all_plans, local_plan, group=pp_group)
+
+        ordered_names: list[str] = []
+        name_to_owner: dict[str, int] = {}
+        meta_by_name: dict[str, list[tuple[str, list[int], str]]] = {}
+        for pp_r, rank_plan in enumerate(all_plans):
+            for name, meta in rank_plan:
+                if name not in name_to_owner:
+                    name_to_owner[name] = pp_r
+                    ordered_names.append(name)
+                    meta_by_name[name] = meta
+
+        self._pp_refit_plan = (ordered_names, name_to_owner, meta_by_name, pp_ranks)
+        return self._pp_refit_plan
+
     def _all_params_generator(self):
         """Yield (name, tensor) pairs for ALL model params, gathering across PP ranks.
 
@@ -1319,75 +1364,47 @@ class DTensorPolicyWorkerV2Impl(
             yield from dtensor_params_generator(self.model, self.dtype)
             return
 
-        # Phase 1: build a lazy local param lookup (name → part index).
-        # We don't materialise all tensors yet to save memory.
-        local_names: set[str] = set()
-        for part in self.model_handle.parts:
-            for name in part.state_dict().keys():
-                if not (
-                    name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight")
-                ):
-                    local_names.add(name)
-
-        # Phase 2: all-gather the name lists to build a global ordering.
-        pp_group = self.pp_mesh.get_group()
-        pp_ranks = torch.distributed.get_process_group_ranks(pp_group)
-        all_names_list: list[list[str]] = [None] * self.pp_size  # type: ignore[list-item]
-        torch.distributed.all_gather_object(
-            all_names_list, sorted(local_names), group=pp_group
+        # PP path: stream params in the cached plan's order via bare tensor broadcasts only (no per-param object collective in the hot loop, which deadlocked the refit).
+        ordered_names, name_to_owner, meta_by_name, pp_ranks = (
+            self._build_pp_refit_plan()
         )
-
-        name_to_owner: dict[str, int] = {}
-        for pp_r, names in enumerate(all_names_list):
-            for n in names:
-                name_to_owner[n] = pp_r
-
+        pp_group = self.pp_mesh.get_group()
         my_pp_rank = self.pp_mesh.get_local_rank()
 
-        # Phase 3: iterate all params in sorted order. Owner broadcasts one
-        # tensor at a time; others allocate a receive buffer and receive.
-        for name in sorted(name_to_owner.keys()):
+        for name in ordered_names:
             owner_pp_rank = name_to_owner[name]
             owner_global_rank = pp_ranks[owner_pp_rank]
 
-            # Owner adapts the (name, tensor) pairs and broadcasts the adapted
-            # list along with metadata + tensor data; non-owners receive and
-            # yield without re-adapting (the owner's adapter is authoritative).
             if my_pp_rank == owner_pp_rank:
+                # Owner: materialise + adapt locally, then broadcast each tensor at its original adapted dtype.
                 tensor, owning_part = self._get_local_param_tensor(name)
                 tensor = tensor.cuda()
-                adapted_pairs = list(
-                    _maybe_adapt_tensor_to_hf(owning_part, name, tensor)
-                )
-                meta = [(an, list(at.shape), str(at.dtype)) for an, at in adapted_pairs]
-                torch.distributed.broadcast_object_list(
-                    [meta], src=owner_global_rank, group=pp_group
-                )
-                for _, adapted_tensor in adapted_pairs:
+                adapted_pairs = _maybe_adapt_tensor_to_hf(owning_part, name, tensor)
+                for adapted_name, adapted_tensor in adapted_pairs:
                     contig = adapted_tensor.contiguous()
                     torch.distributed.broadcast(
                         contig, src=owner_global_rank, group=pp_group
                     )
-                for adapted_name, adapted_tensor in adapted_pairs:
+                    # Cast to the consumer's recorded transfer dtype so packed-buffer byte counts match.
+                    target_dtype = self._get_refit_target_dtype(
+                        adapted_name, contig.dtype
+                    )
                     yield (
                         adapted_name,
-                        adapted_tensor.to(self.dtype, non_blocking=True).contiguous(),
+                        contig.to(target_dtype, non_blocking=True).contiguous(),
                     )
             else:
-                meta_list = [None]
-                torch.distributed.broadcast_object_list(
-                    meta_list, src=owner_global_rank, group=pp_group
-                )
-                meta = meta_list[0]
-                for adapted_name, shape, dtype_str in meta:
+                # Non-owner: allocate receive buffers from the cached plan and receive.
+                for adapted_name, shape, dtype_str in meta_by_name[name]:
                     dtype = getattr(torch, dtype_str.replace("torch.", ""))
                     buf = torch.empty(shape, dtype=dtype, device="cuda")
                     torch.distributed.broadcast(
                         buf, src=owner_global_rank, group=pp_group
                     )
+                    target_dtype = self._get_refit_target_dtype(adapted_name, buf.dtype)
                     yield (
                         adapted_name,
-                        buf.to(self.dtype, non_blocking=True).contiguous(),
+                        buf.to(target_dtype, non_blocking=True).contiguous(),
                     )
 
     def _get_local_param_tensor(self, name: str) -> tuple[torch.Tensor, nn.Module]:
@@ -1501,6 +1518,8 @@ class DTensorPolicyWorkerV2Impl(
             state_dict_info = {}
             for info in all_infos:
                 state_dict_info.update(info)
+            # Warm the cached PP refit plan at setup so its all_gather_object runs outside the streamed broadcast loop.
+            self._build_pp_refit_plan()
             return state_dict_info
 
         return local_info
