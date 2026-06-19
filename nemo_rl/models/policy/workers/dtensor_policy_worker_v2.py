@@ -312,6 +312,9 @@ class DTensorPolicyWorkerV2Impl(
         distributed_context = setup_distributed(
             config=config,
             runtime_config=runtime_config,
+            # Threaded so the PP FSDP output_dtype can match the optimizer-decided
+            # load dtype (FusedAdam→bf16 / AdamW→fp32); see setup_distributed.
+            init_optimizer=init_optimizer,
         )
         # Set instance attributes from distributed context
         self.rank = torch.distributed.get_rank()

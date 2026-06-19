@@ -435,6 +435,7 @@ def setup_reference_model_state(
 def setup_distributed(
     config: PolicyConfig,
     runtime_config: RuntimeConfig,
+    init_optimizer: bool = True,
 ) -> DistributedContext:
     """Set up distributed training environment and create device meshes.
 
@@ -478,6 +479,26 @@ def setup_distributed(
     # Build tp_plan from custom_parallel_plan config if set, else None (auto-select)
     tp_plan = config["dtensor_cfg"].get("custom_parallel_plan", None)
 
+    # FSDP2 casts every wrapped module's forward output to output_dtype. Under PP,
+    # each pipeline stage is an FSDP-wrapped module and torch.distributed.pipelining
+    # validates the stage output against the LOADED PARAM dtype (the stage metadata
+    # is derived from it), so output_dtype must equal that loaded dtype — otherwise
+    # FSDP upcasts the inter-stage hidden to output_dtype and the first stage
+    # boundary trips PipeliningShapeError ("expected bf16 actual fp32").
+    # The loaded param dtype is optimizer-dependent and must mirror
+    # setup_model_and_optimizer's load_dtype: FusedAdam keeps an fp32 master
+    # internally -> params load bf16; AdamW has none -> params load fp32. For non-PP
+    # keep fp32 outputs (residual/logits numerical stability), which is unconstrained
+    # because there is no stage-output dtype contract without PP.
+    if pp_size > 1:
+        fsdp_output_dtype = (
+            torch.float32
+            if _requires_fp32_model_load(config.get("optimizer"), init_optimizer)
+            else dtype
+        )
+    else:
+        fsdp_output_dtype = torch.float32
+
     # Create FSDP2Config
     fsdp2_config = FSDP2Config(
         sequence_parallel=sequence_parallel_enabled,
@@ -485,7 +506,7 @@ def setup_distributed(
         mp_policy=MixedPrecisionPolicy(
             param_dtype=dtype,
             reduce_dtype=torch.float32,
-            output_dtype=torch.float32,
+            output_dtype=fsdp_output_dtype,
         ),
         offload_policy=CPUOffloadPolicy(pin_memory=False) if cpu_offload else None,
         activation_checkpointing=config["dtensor_cfg"]["activation_checkpointing"],
