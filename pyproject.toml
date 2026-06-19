@@ -54,6 +54,8 @@ dependencies = [
   # Floor raised to 5.5.0 for Gemma 4 support.
   "transformers>=5.5.0,<5.9.0",
   "num2words>=0.5.14",                                                                                                       # for SmolVLM
+  "timm",
+  "open-clip-torch>=3.2.0",
   "mlflow>=3.13.0",
   "nvidia-nvshmem-cu13>=3.6.5; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
   "swanlab",
