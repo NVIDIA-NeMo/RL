@@ -132,6 +132,21 @@ _qwen35_append_extra_mount() {
     esac
 }
 
+_qwen35_stage_tree() {
+    local host_root="$1"
+    local stage_root="$2"
+    local description="$3"
+
+    if [[ ! -d "${host_root}" ]]; then
+        echo "Error: ${description} directory does not exist: ${host_root}" >&2
+        exit 1
+    fi
+
+    mkdir -p "${stage_root}"
+    cp -a "${host_root}/." "${stage_root}/"
+    echo "Staged ${description}: ${host_root} -> ${stage_root}"
+}
+
 _qwen35_mount_tree() {
     local host_root="$1"
     local container_root="$2"
@@ -169,8 +184,13 @@ esac
 if [[ "${_qwen35_should_mount}" == "1" ]]; then
     QWEN35_CONFIG_DIR="${QWEN35_CONFIG_DIR:-${REPO_LOCATION}/qwen_35/configs}"
     QWEN35_OVERLAY_DIR="${QWEN35_OVERLAY_DIR:-${REPO_LOCATION}/qwen_35/overrides}"
-    _qwen35_mount_tree "${QWEN35_CONFIG_DIR}" "${CONTAINER_REPO_LOCATION}/qwen_35/configs" "Qwen 3.5 config"
-    _qwen35_mount_tree "${QWEN35_OVERLAY_DIR}" "${CONTAINER_REPO_LOCATION}" "Qwen 3.5 overlay"
+    QWEN35_MOUNT_STAGE_DIR="${QWEN35_MOUNT_STAGE_DIR:-${OUT_DIR}/qwen_35_mounts}"
+    QWEN35_STAGED_CONFIG_DIR="${QWEN35_MOUNT_STAGE_DIR}/configs"
+    QWEN35_STAGED_OVERLAY_DIR="${QWEN35_MOUNT_STAGE_DIR}/overrides"
+    _qwen35_stage_tree "${QWEN35_CONFIG_DIR}" "${QWEN35_STAGED_CONFIG_DIR}" "Qwen 3.5 config"
+    _qwen35_stage_tree "${QWEN35_OVERLAY_DIR}" "${QWEN35_STAGED_OVERLAY_DIR}" "Qwen 3.5 overlay"
+    _qwen35_mount_tree "${QWEN35_STAGED_CONFIG_DIR}" "${CONTAINER_REPO_LOCATION}/qwen_35/configs" "Qwen 3.5 staged config"
+    _qwen35_mount_tree "${QWEN35_STAGED_OVERLAY_DIR}" "${CONTAINER_REPO_LOCATION}" "Qwen 3.5 staged overlay"
 
     # Defaults consumed by the Qwen-only overlay files. They are harmless for
     # non-Qwen jobs because the overlay is not mounted for those recipes.
@@ -179,7 +199,7 @@ if [[ "${_qwen35_should_mount}" == "1" ]]; then
     export NEMO_RL_QWEN35_FORCE_TORCH_GDN="${NEMO_RL_QWEN35_FORCE_TORCH_GDN:-${QWEN35_FORCE_TORCH_GDN:-0}}"
 fi
 unset _qwen35_overlay_mode _qwen35_recipe _qwen35_should_mount
-unset -f _qwen35_append_extra_mount _qwen35_mount_tree
+unset -f _qwen35_append_extra_mount _qwen35_stage_tree _qwen35_mount_tree
 
 # Construct the command
 COMMAND=$(cat <<EOF

@@ -37,10 +37,17 @@ examples/nemo_gym/launch_nemo_gym_multinode_training.sh <optional Hydra override
 ```
 
 When `RECIPE` points under `qwen_35/`,
-`examples/nemo_gym/launch_nemo_gym_multinode_training.sh` automatically mounts:
+`examples/nemo_gym/launch_nemo_gym_multinode_training.sh` automatically stages
+Qwen-specific files under `${OUT_DIR}/qwen_35_mounts/` and mounts the staged
+copies:
 
-- `qwen_35/configs` to `/opt/nemo-rl/qwen_35/configs`
-- every file under `qwen_35/overrides` to its matching path under `/opt/nemo-rl`
+- `${OUT_DIR}/qwen_35_mounts/configs` to `/opt/nemo-rl/qwen_35/configs`
+- every file under `${OUT_DIR}/qwen_35_mounts/overrides` to its matching path under `/opt/nemo-rl`
+
+The staging step is intentional: the running container should not bind directly
+to mutable files in the live Git checkout. Otherwise a `git pull` or local edit
+can invalidate the mounted inode and produce errors such as `OSError: [Errno 116]
+Stale file handle` while the job is starting.
 
 For example:
 
