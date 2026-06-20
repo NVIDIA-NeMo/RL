@@ -1,0 +1,41 @@
+# Qwen 3.5 SWE/OpenHands wrapper.
+#
+# This config inherits the Carlos/grpo-studies Qwen3-235B SWE recipe and only
+# changes model-family-specific settings needed for Qwen3.5-397B-A17B. Runtime
+# paths, node counts, data, and experiment names are still provided by
+# examples/nemo_gym/launch_nemo_gym_multinode_training.sh and CLI overrides.
+#
+# Selecting this recipe from the launcher automatically mounts qwen_35/configs
+# and qwen_35/overrides into the container.
+
+# Relative to qwen_35/configs/.
+defaults: ../../examples/nemo_gym/grpo_qwen3_235b_swe_openhands_async.yaml
+
+policy:
+  megatron_cfg:
+    apply_rope_fusion: false
+    gradient_accumulation_fusion: false
+  generation:
+    vllm_cfg:
+      http_server_serving_chat_kwargs:
+        tool_parser: qwen3_xml
+        reasoning_parser: qwen3
+        reasoning_parser_plugin: null
+
+# Qwen 3.5 chat-template/token handling used by the qwen_35 overlay.
+env:
+  nemo_gym:
+    allow_noncontiguous_message_tokens: true
+
+token_ids:
+  eos: 248046
+  think_open: 248068
+  think_close: 248069
+
+# SWE reward comes from NeMo-Gym test pass/fail. These scalar response-shape
+# penalties are tuned for Nemotron/Nano response conventions and can incorrectly
+# zero otherwise valid Qwen trajectories.
+penalize_duplicated_reasoning: false
+penalize_empty_final_answer: false
+penalize_eos_token: false
+penalize_malformed_think_tag: false

@@ -119,6 +119,68 @@ HOST_HF_HOME="${HF_HOME:-$(pwd)/.cache}"
 export BASE_LOG_DIR="${OUT_DIR}/logs"
 mkdir -p "${OUT_DIR}/logs" "${OUT_DIR}/checkpoint" "${HOST_HF_HOME}"
 
+
+# Qwen 3.5 support lives in qwen_35/ so non-Qwen recipes keep the baked
+# container code. Selecting a recipe under qwen_35/ automatically mounts the
+# Qwen-specific config and file overlay into the container. Set QWEN35_OVERLAY=0
+# to disable, or QWEN35_OVERLAY=1 to force the overlay for another recipe.
+_qwen35_append_extra_mount() {
+    local mount="$1"
+    case ",${EXTRA_MOUNTS:-}," in
+        *",${mount},"*) ;;
+        *) export EXTRA_MOUNTS="${EXTRA_MOUNTS:+${EXTRA_MOUNTS},}${mount}" ;;
+    esac
+}
+
+_qwen35_mount_tree() {
+    local host_root="$1"
+    local container_root="$2"
+    local description="$3"
+
+    if [[ ! -d "${host_root}" ]]; then
+        echo "Error: ${description} directory does not exist: ${host_root}" >&2
+        exit 1
+    fi
+
+    local src rel
+    while IFS= read -r -d '' src; do
+        rel="${src#${host_root}/}"
+        _qwen35_append_extra_mount "${src}:${container_root}/${rel}"
+    done < <(find "${host_root}" -type f -print0)
+}
+
+_qwen35_overlay_mode="${QWEN35_OVERLAY:-auto}"
+_qwen35_recipe="${RECIPE#./}"
+_qwen35_should_mount=0
+case "${_qwen35_overlay_mode}" in
+    0|false|False|no|NO) _qwen35_should_mount=0 ;;
+    1|true|True|yes|YES) _qwen35_should_mount=1 ;;
+    auto)
+        if [[ "${_qwen35_recipe}" == qwen_35/* ]]; then
+            _qwen35_should_mount=1
+        fi
+        ;;
+    *)
+        echo "Error: QWEN35_OVERLAY must be auto, 0, or 1; got '${_qwen35_overlay_mode}'." >&2
+        exit 1
+        ;;
+esac
+
+if [[ "${_qwen35_should_mount}" == "1" ]]; then
+    QWEN35_CONFIG_DIR="${QWEN35_CONFIG_DIR:-${REPO_LOCATION}/qwen_35/configs}"
+    QWEN35_OVERLAY_DIR="${QWEN35_OVERLAY_DIR:-${REPO_LOCATION}/qwen_35/overrides}"
+    _qwen35_mount_tree "${QWEN35_CONFIG_DIR}" "${CONTAINER_REPO_LOCATION}/qwen_35/configs" "Qwen 3.5 config"
+    _qwen35_mount_tree "${QWEN35_OVERLAY_DIR}" "${CONTAINER_REPO_LOCATION}" "Qwen 3.5 overlay"
+
+    # Defaults consumed by the Qwen-only overlay files. They are harmless for
+    # non-Qwen jobs because the overlay is not mounted for those recipes.
+    export NEMO_RL_ALLOW_NONCONTIGUOUS_MESSAGE_TOKENS="${NEMO_RL_ALLOW_NONCONTIGUOUS_MESSAGE_TOKENS:-true}"
+    export NEMO_RL_QWEN35_TRUNCATE_PROMPT_TOKENS="${NEMO_RL_QWEN35_TRUNCATE_PROMPT_TOKENS:-${QWEN35_TRUNCATE_PROMPT_TOKENS:-none}}"
+    export NEMO_RL_QWEN35_FORCE_TORCH_GDN="${NEMO_RL_QWEN35_FORCE_TORCH_GDN:-${QWEN35_FORCE_TORCH_GDN:-0}}"
+fi
+unset _qwen35_overlay_mode _qwen35_recipe _qwen35_should_mount
+unset -f _qwen35_append_extra_mount _qwen35_mount_tree
+
 # Construct the command
 COMMAND=$(cat <<EOF
 cd ${CONTAINER_REPO_LOCATION}
