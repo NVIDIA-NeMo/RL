@@ -386,8 +386,7 @@ def get_tokenizer(
                 )
                 if additional_special_tokens:
                     tokenizer.add_special_tokens(
-                        {"additional_special_tokens": additional_special_tokens},
-                        replace_additional_special_tokens=False,
+                        {"additional_special_tokens": additional_special_tokens}
                     )
 
                 chat_template = qwen_tokenizer_config.get("chat_template")
