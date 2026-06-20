@@ -204,7 +204,6 @@ bash examples/nemo_gym/launch_nemo_gym_multinode_training.sh \
   "checkpointing.enabled=false" \
   "++checkpointing.save_optimizer=false" \
   "checkpointing.save_period=1000000" \
-  "checkpointing.ft_save_period=1000000" \
   "checkpointing.checkpoint_must_save_by=null" \
   "env.nemo_gym.num_gpu_nodes=0" \
   "env.nemo_gym.skip_venv_if_present=true" \
