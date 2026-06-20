@@ -21,8 +21,10 @@ policy:
   megatron_cfg:
     apply_rope_fusion: false
     gradient_accumulation_fusion: false
+    mtp_loss_scaling_factor: 0.0
     mtp_num_layers: 0
     mtp_use_repeated_layer: false
+    mtp_detach_heads: true
     moe_flex_dispatcher_backend: alltoall
     moe_hybridep_num_sms: 32
   generation:
