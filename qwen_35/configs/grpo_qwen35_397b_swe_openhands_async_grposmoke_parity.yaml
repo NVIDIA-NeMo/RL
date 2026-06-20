@@ -11,6 +11,12 @@ defaults: grpo_qwen35_397b_swe_openhands_async.yaml
 
 policy:
   max_total_sequence_length: 65536
+  megatron_cfg:
+    # The inherited Qwen3-235B SWE recipe uses PP8-specific 11/11 edge-stage
+    # hints. With PP2 there are no middle pipeline stages, so leave the layer
+    # split to Megatron instead.
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
   generation:
     max_new_tokens: ${policy.max_total_sequence_length}
     vllm_cfg:
