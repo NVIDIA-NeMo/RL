@@ -24,6 +24,7 @@ policy:
     mtp_num_layers: 0
     mtp_use_repeated_layer: false
     moe_flex_dispatcher_backend: alltoall
+    moe_hybridep_num_sms: 32
   generation:
     vllm_cfg:
       http_server_serving_chat_kwargs:
