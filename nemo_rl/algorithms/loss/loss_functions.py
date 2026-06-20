@@ -1294,11 +1294,6 @@ class CrossTokenizerDistillationLossConfig(TypedDict):
             sparse projection file) keeps V_s in lockstep with
             ``logits.shape[-1]`` when the file's highest student ids happen
             to be absent.
-        teacher_vocab_size: Full teacher tokenizer vocab size, used to size
-            the projection matrix's teacher-side (V_t) axis. Runtime-injected
-            symmetrically to ``student_vocab_size`` from
-            ``len(teacher_tokenizer)``; not a user knob in YAML. Multi-teacher
-            runs inject a per-teacher list via ``teacher_vocab_sizes``.
         kd_loss_mode: Multi-teacher aggregation strategy. ``"sum"`` (default)
             sums per-teacher weighted KL; ``"averaged_logits"`` averages
             same-vocab teacher logits then takes one KL; ``"select_teacher"``
@@ -1314,9 +1309,9 @@ class CrossTokenizerDistillationLossConfig(TypedDict):
         normalize_teacher_by_vocab: Rescale both the weight-metric scores and
             each teacher's KL by ``log(V_t_i) / log(min_j V_t_j)`` so
             larger-vocab teachers are not under-weighted.
-        teacher_vocab_sizes: Per-teacher full vocab sizes (multi-teacher).
-            Runtime-injected; parallels ``teachers``. ``teacher_vocab_size``
-            stays for the single-teacher path.
+        teacher_vocab_sizes: Per-teacher full vocab sizes, one per
+            ``teachers[i]``. Runtime-injected by ``setup`` from
+            ``len(teacher_tokenizer)``; not a user knob in YAML.
         projection_matrix_paths: Per-teacher projection paths (multi-teacher);
             ``None`` entry marks a same-tokenizer teacher. Runtime-injected.
         teacher_weights: Per-teacher static loss weights (multi-teacher).
@@ -1328,11 +1323,6 @@ class CrossTokenizerDistillationLossConfig(TypedDict):
             semantics as ``teacher_gold_loss``.
     """
 
-    # Legacy single-teacher knob: the per-teacher projection path now lives on
-    # each ``teachers[i]`` entry. Kept only as the back-compat shim source for
-    # configs that still use a single ``teacher:`` block. NotRequired so new
-    # ``teachers:`` configs need not carry it.
-    projection_matrix_path: NotRequired[Optional[str]]
     gold_loss: bool
     xtoken_loss: bool
     temperature: float
@@ -1349,7 +1339,6 @@ class CrossTokenizerDistillationLossConfig(TypedDict):
     alpha: float
     normalize_teacher_by_vocab: bool
     student_vocab_size: NotRequired[int]
-    teacher_vocab_size: NotRequired[int]
     # Per-teacher metadata injected at runtime by
     # ``xtoken_off_policy_distillation.setup`` (parallel to ``teachers``).
     teacher_vocab_sizes: NotRequired[list[int]]
@@ -1479,26 +1468,14 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         self.token_level_weights = cfg["token_level_weights"]
         self.alpha = cfg["alpha"]
         self.normalize_teacher_by_vocab = cfg["normalize_teacher_by_vocab"]
-        # Per-teacher metadata. ``setup`` injects parallel lists; otherwise
-        # fall back to a single-element list built from the single-teacher
-        # fields (the single-teacher path is just N=1).
-        if "projection_matrix_paths" in cfg:
-            self.projection_matrix_paths = list(cfg["projection_matrix_paths"])
-            self.teacher_vocab_sizes = list(cfg["teacher_vocab_sizes"])
-            self.teacher_weights = list(cfg["teacher_weights"])
-            self.teacher_send_full_logits = list(cfg["teacher_send_full_logits"])
-            self.teacher_gold_loss = list(cfg["teacher_gold_loss"])
-            self.teacher_xtoken_loss = list(cfg["teacher_xtoken_loss"])
-        else:
-            # Single-teacher fallback (direct-dict construction without the
-            # injected lists). projection_matrix_path is NotRequired -> None
-            # marks a same-vocab teacher.
-            self.projection_matrix_paths = [cfg.get("projection_matrix_path")]
-            self.teacher_vocab_sizes = [cfg["teacher_vocab_size"]]
-            self.teacher_weights = [1.0]
-            self.teacher_send_full_logits = [False]
-            self.teacher_gold_loss = [None]
-            self.teacher_xtoken_loss = [None]
+        # Per-teacher metadata: parallel lists (one entry per ``teachers[i]``),
+        # injected by ``xtoken_off_policy_distillation.setup``.
+        self.projection_matrix_paths = list(cfg["projection_matrix_paths"])
+        self.teacher_vocab_sizes = list(cfg["teacher_vocab_sizes"])
+        self.teacher_weights = list(cfg["teacher_weights"])
+        self.teacher_send_full_logits = list(cfg["teacher_send_full_logits"])
+        self.teacher_gold_loss = list(cfg["teacher_gold_loss"])
+        self.teacher_xtoken_loss = list(cfg["teacher_xtoken_loss"])
         self.num_teachers = len(self.projection_matrix_paths)
         # A teacher ships full-vocab logits via IPC iff it is cross-tokenizer
         # (projection needs them) or it is same-vocab with send_full_logits.

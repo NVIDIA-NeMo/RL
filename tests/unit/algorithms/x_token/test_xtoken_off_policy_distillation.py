@@ -539,44 +539,6 @@ def test_ipc_buffer_released_on_student_train_failure(mock_xtoken_components):
 
 
 # ---------------------------------------------------------------------------
-# Back-compat shim: legacy single `teacher:` block -> `teachers:` list
-# ---------------------------------------------------------------------------
-
-
-def test_normalize_multi_teacher_config_shim():
-    from nemo_rl.algorithms.xtoken_off_policy_distillation import (
-        normalize_multi_teacher_config,
-    )
-
-    # Legacy single `teacher:` + loss_fn.projection_matrix_path -> 1-element
-    # teachers list; projection path moves onto the teacher, weight defaults 1.
-    raw = {
-        "teacher": {
-            "model_name": "Qwen/Qwen3-4B",
-            "tokenizer": {"name": "Qwen/Qwen3-4B"},
-        },
-        "loss_fn": {"projection_matrix_path": "/p.pt"},
-    }
-    out = normalize_multi_teacher_config(raw)
-    assert len(out["teachers"]) == 1
-    t0 = out["teachers"][0]
-    assert t0["projection_matrix_path"] == "/p.pt"
-    assert t0["weight"] == 1.0
-    assert t0["model_name"] == "Qwen/Qwen3-4B"
-
-    # An already-`teachers:` config passes through untouched.
-    raw2 = {"teachers": [{"model_name": "A"}, {"model_name": "B"}]}
-    assert normalize_multi_teacher_config(raw2)["teachers"] == [
-        {"model_name": "A"},
-        {"model_name": "B"},
-    ]
-
-    # Neither `teachers:` nor `teacher:` -> error.
-    with pytest.raises(ValueError, match="teachers"):
-        normalize_multi_teacher_config({"loss_fn": {}})
-
-
-# ---------------------------------------------------------------------------
 # Multi-teacher wiring (CPU-only, no GPU loss math)
 # ---------------------------------------------------------------------------
 

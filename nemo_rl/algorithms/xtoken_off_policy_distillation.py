@@ -210,31 +210,6 @@ class MasterConfig(BaseModel, extra="allow"):
     checkpointing: CheckpointingConfig
 
 
-def normalize_multi_teacher_config(raw_config: dict[str, Any]) -> dict[str, Any]:
-    """Fold a legacy single ``teacher:`` block into the ``teachers:`` list.
-
-    Runs on the raw (pre-validation) config dict so older single-teacher
-    configs keep working without edits. If ``teachers`` is already present it
-    is left untouched. Otherwise a legacy ``teacher:`` block is wrapped into a
-    1-element ``teachers`` list, sourcing ``projection_matrix_path`` from the
-    single-teacher ``loss_fn.projection_matrix_path`` knob and defaulting
-    ``weight`` to ``1.0``. Mutates and returns ``raw_config``.
-    """
-    if raw_config.get("teachers"):
-        return raw_config
-    teacher = raw_config.get("teacher")
-    if teacher is None:
-        raise ValueError(
-            "xtoken distillation config must define `teachers:` (a list of "
-            "teacher blocks) or a legacy `teacher:` block."
-        )
-    proj_path = raw_config.get("loss_fn", {}).get("projection_matrix_path")
-    raw_config["teachers"] = [
-        {**teacher, "projection_matrix_path": proj_path, "weight": 1.0}
-    ]
-    return raw_config
-
-
 # ===============================================================================
 # Setup
 # ===============================================================================
@@ -464,10 +439,8 @@ def setup(
     # `teachers`). `len(tokenizer)` is what HF treats as the embedding /
     # lm_head dim, so it sizes the projection matrix's V_s / V_t axes exactly
     # (vs recovering them from the highest ids in the sparse projection file).
-    # Per-teacher sizes/paths/weights are injected as parallel lists; the loss
-    # fn reads `teacher_vocab_sizes` (NOT a single size). The singular
-    # `teacher_vocab_size` is only the loss fn's legacy single-teacher
-    # fallback (unused once the lists are present), so it is not injected here.
+    # Per-teacher sizes/paths/weights are injected as parallel lists, one entry
+    # per `teachers[i]`; the loss fn reads these lists directly.
     loss_config = {
         **loss_config,
         "student_vocab_size": len(student_tokenizer),

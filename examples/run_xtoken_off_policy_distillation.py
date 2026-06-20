@@ -24,7 +24,6 @@ from omegaconf import OmegaConf
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     MasterConfig,
-    normalize_multi_teacher_config,
     setup,
     xtoken_off_policy_distillation_train,
 )
@@ -65,8 +64,6 @@ def main() -> None:
         config = parse_hydra_overrides(config, overrides)
 
     config = OmegaConf.to_container(config, resolve=True)
-    # Back-compat: fold a legacy single `teacher:` block into `teachers:`.
-    config = normalize_multi_teacher_config(config)
     config = MasterConfig(**config)
 
     # Per-teacher same-vocab vs cross-tokenizer is determined solely by

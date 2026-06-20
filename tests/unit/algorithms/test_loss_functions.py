@@ -2260,8 +2260,9 @@ def _write_ct_projection(tmp_path):
 
 
 def _ct_loss_cfg(projection_path, *, gold_loss):
+    # Per-teacher metadata as ``setup`` injects it: parallel lists, one entry
+    # per teacher (here a single teacher).
     return {
-        "projection_matrix_path": projection_path,
         "gold_loss": gold_loss,
         "xtoken_loss": False,
         "temperature": _CT_TEMPERATURE,
@@ -2272,8 +2273,17 @@ def _ct_loss_cfg(projection_path, *, gold_loss):
         "kl_loss_weight": 1.0,
         "ce_loss_scale": 1.0,
         "dynamic_loss_scaling": False,
+        "kd_loss_mode": "sum",
+        "token_level_weights": False,
+        "alpha": 1.0,
+        "normalize_teacher_by_vocab": False,
         "student_vocab_size": _CT_V_STUDENT,
-        "teacher_vocab_size": _CT_V_TEACHER,
+        "projection_matrix_paths": [projection_path],
+        "teacher_vocab_sizes": [_CT_V_TEACHER],
+        "teacher_weights": [1.0],
+        "teacher_send_full_logits": [False],
+        "teacher_gold_loss": [None],
+        "teacher_xtoken_loss": [None],
     }
 
 
