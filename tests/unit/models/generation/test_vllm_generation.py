@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import importlib.util
 import json
 import os
@@ -19,7 +20,7 @@ import sys
 import types
 from copy import deepcopy
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import ray
@@ -342,6 +343,62 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
     assert openai_serving_chat.instances[0].kwargs["reasoning_parser"] == "nano_v3"
     # make sure that the config attribute does not leak into `http_server_serving_chat_kwargs`
     assert "reasoning_parser_plugin" not in openai_serving_chat.instances[0].kwargs
+
+
+def _setup_fake_openai_chat_completion_route(monkeypatch):
+    (
+        _tool_parser_manager,
+        _reasoning_parser_manager,
+        openai_serving_chat,
+    ) = _install_fake_vllm_openai_modules(monkeypatch)
+
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "vllm_cfg": {
+            "http_server_serving_chat_kwargs": {},
+        },
+    }
+    worker.llm = MagicMock(model_config="model-config", renderer="renderer")
+    model_config = MagicMock(served_model_name="served-model", model="model-path")
+    worker.llm_async_engine_args = MagicMock()
+    worker.llm_async_engine_args.create_model_config.return_value = model_config
+
+    app = _FakeFastAPIApp()
+    worker._setup_vllm_openai_api_server(app)
+    route = next(func for path, func in app.routes if path == "/v1/chat/completions")
+    return route, openai_serving_chat.instances[0]
+
+
+def test_vllm_async_chat_completion_maps_context_value_error_to_400(monkeypatch):
+    route, openai_serving_chat = _setup_fake_openai_chat_completion_route(monkeypatch)
+    openai_serving_chat.create_chat_completion = AsyncMock(
+        side_effect=ValueError(
+            "Prompt length (8551) fills or exceeds max_model_len (8192). "
+            "No room for output tokens."
+        )
+    )
+
+    request = types.SimpleNamespace(top_k=None, temperature=1.0, top_p=1.0)
+    response = asyncio.run(route(request, MagicMock()))
+
+    assert response.status_code == 400
+    body = json.loads(response.body.decode())
+    assert body["error"]["code"] == 400
+    assert body["error"]["type"] == "invalid_request_error"
+    assert "max_model_len" in body["error"]["message"]
+
+
+def test_vllm_async_chat_completion_reraises_unrelated_value_error(monkeypatch):
+    route, openai_serving_chat = _setup_fake_openai_chat_completion_route(monkeypatch)
+    openai_serving_chat.create_chat_completion = AsyncMock(
+        side_effect=ValueError("unexpected internal validation failure")
+    )
+
+    request = types.SimpleNamespace(top_k=None, temperature=1.0, top_p=1.0)
+    with pytest.raises(ValueError, match="unexpected internal validation failure"):
+        asyncio.run(route(request, MagicMock()))
 
 
 def test_nano_v3_reasoning_parser_swaps_reasoning_when_thinking_disabled(
