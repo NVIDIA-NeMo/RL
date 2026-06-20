@@ -335,6 +335,31 @@ def get_tokenizer(
             tokenizer_json = os.path.join(tokenizer_path, "tokenizer.json")
             tokenizer_config_json = os.path.join(tokenizer_path, "tokenizer_config.json")
 
+            if not (
+                os.path.exists(tokenizer_json)
+                and os.path.exists(tokenizer_config_json)
+            ):
+                for env_var in ("CONTAINER_HF_CKPT_PATH", "HF_CKPT_PATH"):
+                    candidate = os.environ.get(env_var)
+                    if not candidate:
+                        continue
+                    candidate_tokenizer_json = os.path.join(candidate, "tokenizer.json")
+                    candidate_tokenizer_config_json = os.path.join(
+                        candidate, "tokenizer_config.json"
+                    )
+                    if os.path.exists(candidate_tokenizer_json) and os.path.exists(
+                        candidate_tokenizer_config_json
+                    ):
+                        print(
+                            "Qwen 3.5 tokenizer path fallback: "
+                            f"policy.tokenizer.name={tokenizer_name!r}, "
+                            f"using ${env_var}={candidate}"
+                        )
+                        tokenizer_path = candidate
+                        tokenizer_json = candidate_tokenizer_json
+                        tokenizer_config_json = candidate_tokenizer_config_json
+                        break
+
             if os.path.exists(tokenizer_json) and os.path.exists(tokenizer_config_json):
                 with open(tokenizer_config_json, "r", encoding="utf-8") as f:
                     qwen_tokenizer_config = json.load(f)
