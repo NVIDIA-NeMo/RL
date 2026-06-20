@@ -12,6 +12,12 @@
 defaults: ../../examples/nemo_gym/grpo_qwen3_235b_swe_openhands_async.yaml
 
 policy:
+  # Pin tokenizer to the mounted Qwen 3.5 snapshot. The inherited Qwen3 config
+  # also points tokenizer.name at policy.model_name, but pinning it here avoids
+  # Hydra/override ambiguity and guarantees the qwen_35 tokenizer overlay sees
+  # the local tokenizer.json file instead of a hub model id.
+  tokenizer:
+    name: ${oc.env:CONTAINER_HF_CKPT_PATH}
   megatron_cfg:
     apply_rope_fusion: false
     gradient_accumulation_fusion: false
