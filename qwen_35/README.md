@@ -182,7 +182,6 @@ bash examples/nemo_gym/launch_nemo_gym_multinode_training.sh \
   "grpo.val_period=5" \
   "grpo.val_at_start=true" \
   "grpo.val_at_end=false" \
-  "cluster.segment_size=null" \
   "policy.megatron_cfg.tensor_model_parallel_size=4" \
   "policy.megatron_cfg.expert_model_parallel_size=64" \
   "policy.megatron_cfg.expert_tensor_parallel_size=1" \
