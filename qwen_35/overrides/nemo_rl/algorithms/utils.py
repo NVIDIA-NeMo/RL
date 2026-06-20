@@ -320,16 +320,58 @@ def get_tokenizer(
         )
         if force_qwen2_fast:
             # Qwen 3.5 checkpoints advertise Qwen2Tokenizer in tokenizer_config.json.
-            # In the current container, AutoTokenizer then tries a slow->fast
-            # conversion path that needs tiktoken in /opt/nemo_rl_venv, and this
-            # Transformers build does not expose Qwen2TokenizerFast. The checkpoint
-            # already ships tokenizer.json, so load the generic fast tokenizer
-            # directly from that serialized backend.
+            # In the current container, AutoTokenizer / PreTrainedTokenizerFast
+            # from_pretrained still tries a slow->fast conversion path that needs
+            # tiktoken in /opt/nemo_rl_venv. The checkpoint already ships a
+            # serialized tokenizer.json, so build the fast tokenizer directly from
+            # that backend and copy the HF tokenizer metadata we need.
+            import json
+            import os
+
+            from tokenizers import Tokenizer
             from transformers import PreTrainedTokenizerFast
 
-            tokenizer = PreTrainedTokenizerFast.from_pretrained(
-                tokenizer_name, trust_remote_code=True
-            )
+            tokenizer_path = str(tokenizer_name)
+            tokenizer_json = os.path.join(tokenizer_path, "tokenizer.json")
+            tokenizer_config_json = os.path.join(tokenizer_path, "tokenizer_config.json")
+
+            if os.path.exists(tokenizer_json) and os.path.exists(tokenizer_config_json):
+                with open(tokenizer_config_json, "r", encoding="utf-8") as f:
+                    qwen_tokenizer_config = json.load(f)
+
+                init_kwargs = {
+                    "tokenizer_object": Tokenizer.from_file(tokenizer_json),
+                    "clean_up_tokenization_spaces": qwen_tokenizer_config.get(
+                        "clean_up_tokenization_spaces", False
+                    ),
+                }
+                for token_key in ("bos_token", "eos_token", "unk_token", "pad_token"):
+                    token_value = qwen_tokenizer_config.get(token_key)
+                    if token_value is not None:
+                        init_kwargs[token_key] = token_value
+                if qwen_tokenizer_config.get("model_max_length") is not None:
+                    init_kwargs["model_max_length"] = qwen_tokenizer_config[
+                        "model_max_length"
+                    ]
+
+                tokenizer = PreTrainedTokenizerFast(**init_kwargs)
+
+                additional_special_tokens = qwen_tokenizer_config.get(
+                    "additional_special_tokens"
+                )
+                if additional_special_tokens:
+                    tokenizer.add_special_tokens(
+                        {"additional_special_tokens": additional_special_tokens},
+                        replace_additional_special_tokens=False,
+                    )
+
+                chat_template = qwen_tokenizer_config.get("chat_template")
+                if chat_template:
+                    tokenizer.chat_template = chat_template
+            else:
+                tokenizer = PreTrainedTokenizerFast.from_pretrained(
+                    tokenizer_name, trust_remote_code=True
+                )
         else:
             tokenizer = AutoTokenizer.from_pretrained(
                 tokenizer_name, trust_remote_code=True
