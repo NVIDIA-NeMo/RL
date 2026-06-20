@@ -49,7 +49,10 @@ env:
     policy_model:
       responses_api_models:
         vllm_model:
-          uses_reasoning_parser: false
+          # Keep this in sync with policy.generation.vllm_cfg.http_server_serving_chat_kwargs.
+          # If vLLM is configured with a reasoning parser, the NeMo-Gym policy
+          # server must expect reasoning fields in chat-completion responses.
+          uses_reasoning_parser: true
           extra_body:
             chat_template_kwargs:
               enable_thinking: false
