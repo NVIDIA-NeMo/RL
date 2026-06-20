@@ -487,6 +487,7 @@ def test_validate_emits_pkl_metrics_only(mock_xtoken_components):
         c.val_dataloader,
         c.loss_fn,
         c.master_config,
+        skip_keys=xtoken_non_student_seq_keys(c.loss_fn),
     )
 
     assert "loss" in metrics
@@ -511,6 +512,7 @@ def test_validate_collects_only_aggregate_metrics(mock_xtoken_components):
         c.val_dataloader,
         c.loss_fn,
         c.master_config,
+        skip_keys=xtoken_non_student_seq_keys(c.loss_fn),
     )
 
     assert "loss" in metrics
