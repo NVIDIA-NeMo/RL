@@ -258,6 +258,80 @@ Notes:
 - The Ray driver log appears under
   `${REPO_LOCATION}/results/${EXP_NAME}/logs/<jobid>-logs/ray-driver.log`.
 
+## Resolved 3465015 parity config
+
+For config-to-config comparison against the optimized `grpo-smoke` run that
+reached CUDA-Graph training, use:
+
+```bash
+qwen_35/configs/grpo_qwen35_397b_swe_openhands_async_grposmoke_3465015_resolved.yaml
+```
+
+That file folds the final Hydra values from optimized job `3465015` into YAML:
+
+- 64k context: `policy.max_total_sequence_length`,
+  `policy.generation.max_new_tokens`, and
+  `policy.generation.vllm_cfg.max_model_len`
+- CUDA Graph path: `enforce_eager: false`, `backend: inductor`, and
+  `cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 64]`
+- policy parallelism: TP4, PP2, CP1, EP64
+- generation parallelism: vLLM TP8, PP1, EP8
+- R2E `easy_l20` train/validation JSONL files and the two R2E SIF formatter
+  paths
+- 30 SWE turns, train timeout 360s, validation timeout 180s
+- async GRPO with max trajectory age 1 and no in-flight weight updates
+- Qwen parser settings and direct `enable_thinking: false`
+
+The launcher still injects run metadata (`logger.log_dir`,
+`checkpointing.checkpoint_dir`, `cluster.num_nodes`, seed, etc.). To run the
+resolved config without any extra user Hydra overrides, set only launch/mount
+environment and invoke the launcher with no trailing arguments:
+
+```bash
+cd /lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/arigazzi/grpo-studies-qwen35
+git checkout arigazzi/qwen35
+git pull --ff-only origin arigazzi/qwen35
+
+stamp=$(date +%Y%m%d-%H%M%S)
+export EXP_NAME="swe-qwen35-r2e-grposmoke3465015-resolved-${stamp}"
+export REPO_LOCATION="$PWD"
+export RECIPE=qwen_35/configs/grpo_qwen35_397b_swe_openhands_async_grposmoke_3465015_resolved.yaml
+export CONTAINER_IMAGE_PATH=/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/containers/nemorl_v0.6_prebaked_arm_clean_w_logging.sqsh
+
+export SLURM_ACCOUNT=coreai_mlperf_training
+export SLURM_PARTITION=batch
+export SLURM_QOS=short
+export SBATCH_QOS=short
+export SBATCH_GRES=gpu:4
+export SLURM_TIME=1:00:00
+
+export GPUS_PER_NODE=4
+export TRAIN_NODES=32
+export GEN_NODES=32
+export NODES=64
+
+export HF_CKPT_PATH=/lustre/fsw/portfolios/coreai/projects/coreai_mlperf_training/users/arigazzi/nemotron3_ultra_550b/hf_home/hub/models--Qwen--Qwen3.5-397B-A17B/snapshots/8472618112abcbd45acbcdc58436aff4233c23f7
+export CONTAINER_HF_CKPT_PATH="$HF_CKPT_PATH"
+export NRL_MEGATRON_CHECKPOINT_DIR=/lustre/fsw/portfolios/coreai/projects/coreai_mlperf_training/users/arigazzi/nemotron3_ultra_550b/mcore_ckpt_cache
+export CONTAINER_NRL_MEGATRON_CHECKPOINT_DIR="$NRL_MEGATRON_CHECKPOINT_DIR"
+
+export NEMO_GYM_SWE_TRAIN_DATA_PATH=/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/arigazzi/grpo-studies/data_swe/r2e_easy_l20_train.with_sifs.jsonl
+export NEMO_GYM_SWE_VALIDATION_DATA_PATH=/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/arigazzi/grpo-studies/data_swe/r2e_easy_l20_val.with_sifs.jsonl
+export CONTAINER_NEMO_GYM_SWE_TRAIN_DATA_PATH="$NEMO_GYM_SWE_TRAIN_DATA_PATH"
+export CONTAINER_NEMO_GYM_SWE_VALIDATION_DATA_PATH="$NEMO_GYM_SWE_VALIDATION_DATA_PATH"
+
+export NEMO_GYM_SWE_SIF_DIR=/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/swe-gym
+export CONTAINER_NEMO_GYM_SWE_SIF_DIR="$NEMO_GYM_SWE_SIF_DIR"
+export EXTRA_MOUNTS="/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/nemotron-ultra-swe/r2e_gym:/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/nemotron-ultra-swe/r2e_gym,/dev/fuse:/dev/fuse"
+
+export QWEN35_TRUNCATE_PROMPT_TOKENS=65536
+export NEMO_RL_QWEN35_TRUNCATE_PROMPT_TOKENS=65536
+export QWEN35_FORCE_TORCH_GDN=1
+export NEMO_RL_QWEN35_FORCE_TORCH_GDN=1
+
+bash examples/nemo_gym/launch_nemo_gym_multinode_training.sh
+```
+
 ## Safety boundary
 
 Non-Qwen runs are unaffected unless `QWEN35_OVERLAY=1` is set explicitly. The
