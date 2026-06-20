@@ -1,0 +1,67 @@
+# Qwen 3.5 R2E config using the current grpo-smoke parity baseline plus
+# training hyperparameters copied from cgomes's Ptyche Qwen3 run:
+#
+#   /lustre/fsw/coreai_mlperf_training/users/cgomes/mlperf-rl/results/
+#   coreai_mlperf_training-grpo.grpo-235b-swe-async_gbs512_lr5.0e-6_mt30_r1
+#
+# Keep Qwen 3.5-specific runtime/model/cluster settings from the working OCI-HSG
+# test config. Do not copy Ptyche-only model paths, 32-node topology,
+# Qwen3 parallelism, or 98k context. The goal is to copy training HPs while
+# preserving the currently working Qwen 3.5 setup.
+
+defaults: grpo_qwen35_397b_swe_openhands_async_grposmoke_3465015_resolved.yaml
+
+grpo:
+  # Ptyche final config: num_prompts_per_step=16, num_generations_per_prompt=16,
+  # train_global_batch_size=256. The job name said gbs512, but the resolved
+  # config and MLLOG reported 256 effective train GBS.
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 16
+  max_num_steps: 16
+  val_batch_size: 52
+  max_val_samples: 52
+  val_at_start: true
+  val_period: 5
+  val_at_end: true
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: false
+
+checkpointing:
+  enabled: false
+  save_optimizer: false
+  save_period: 1000000
+  ft_save_period: 1000000
+  checkpoint_must_save_by: null
+
+policy:
+  train_global_batch_size: 256
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  generation_batch_size: 64
+  megatron_cfg:
+    optimizer:
+      lr: 5.0e-6
+      min_lr: 5.0e-6
+    scheduler:
+      lr_warmup_iters: 3
+      lr_decay_iters: 100000
+      lr_decay_style: constant
+
+env:
+  nemo_gym:
+    swe_agents_train:
+      responses_api_agents:
+        swe_agents:
+          agent_max_turns: 30
+          concurrency: 128
+          swebench_agent_timeout: 720
+          swebench_tests_timeout: 300
+    swe_agents_val:
+      responses_api_agents:
+        swe_agents:
+          agent_max_turns: 30
+          concurrency: 128
+          swebench_agent_timeout: 720
+          swebench_tests_timeout: 180

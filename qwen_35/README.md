@@ -102,6 +102,24 @@ These are intentionally under `qwen_35/overrides` instead of directly modifying
 the base tree. That makes it clear which files are Qwen 3.5-specific and keeps
 base grpo-studies behavior visible.
 
+
+## Ptyche training-HP variant
+
+`qwen_35/configs/grpo_qwen35_397b_swe_openhands_async_grposmoke_3465015_ptyche_hps.yaml`
+keeps the working OCI-HSG Qwen 3.5 test config as its base, then copies the
+training hyperparameters observed in Carlos's Ptyche run:
+
+```text
+/lustre/fsw/coreai_mlperf_training/users/cgomes/mlperf-rl/results/coreai_mlperf_training-grpo.grpo-235b-swe-async_gbs512_lr5.0e-6_mt30_r1
+```
+
+Important detail: despite the run-name `gbs512`, the final resolved Ptyche config
+and MLLOG reported `train_global_batch_size=256`, `num_prompts_per_step=16`, and
+`num_generations_per_prompt=16`. The variant therefore uses GBS 256, LR `5e-6`,
+30 OpenHands turns, validation at start/every 5 steps/at end, and the same R2E
+runtime shape as the current Qwen 3.5 test config. It does not copy Ptyche-only
+model paths, Qwen3 parallelism, 32-node topology, or 98k context.
+
 ## Escape hatches
 
 - `QWEN35_OVERLAY=0`: disable automatic Qwen overlay mounting.
