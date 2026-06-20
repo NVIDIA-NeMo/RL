@@ -160,7 +160,7 @@ export NEMO_RL_QWEN35_TRUNCATE_PROMPT_TOKENS=none
 Then launch:
 
 ```bash
-R2E_FORMATTERS='["/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/swe-gym/r2egym/{instance_id}.sif","/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/nemotron-ultra-swe/r2e_gym/{instance_id}.sif"]'
+R2E_FORMATTERS='[\"/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/swe-gym/r2egym/{instance_id}.sif\",\"/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/nemotron-ultra-swe/r2e_gym/{instance_id}.sif\"]'
 
 bash examples/nemo_gym/launch_nemo_gym_multinode_training.sh \
   "policy.model_name=${HF_CKPT_PATH}" \
@@ -250,6 +250,10 @@ Notes:
 
 - `SBATCH_GRES=gpu:4` is required on OCI-HSG `batch`; without it Slurm rejects
   the job because no GPU TRES is requested.
+- Keep the escaped quotes in `R2E_FORMATTERS`. The launcher interpolates
+  overrides into a shell command, and unescaped quotes are consumed before
+  Hydra sees the list. Without escaping, Hydra rejects the `{instance_id}`
+  placeholder in the formatter paths.
 - The result directory is `${REPO_LOCATION}/results/${EXP_NAME}`.
 - The Ray driver log appears under
   `${REPO_LOCATION}/results/${EXP_NAME}/logs/<jobid>-logs/ray-driver.log`.
