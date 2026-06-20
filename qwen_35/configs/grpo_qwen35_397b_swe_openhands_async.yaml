@@ -26,6 +26,8 @@ policy:
     mtp_use_repeated_layer: false
     mtp_detach_heads: true
     first_last_layers_bf16: true
+    num_layers_at_start_in_bf16: 1
+    num_layers_at_end_in_bf16: 1
     moe_flex_dispatcher_backend: alltoall
     moe_hybridep_num_sms: 32
   generation:
