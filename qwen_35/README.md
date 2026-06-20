@@ -106,6 +106,154 @@ base grpo-studies behavior visible.
   truncation fallback used by the Qwen vLLM async worker patch.
 - `NEMO_RL_QWEN35_FORCE_TORCH_GDN=1`: forces the torch GatedDeltaNet fallback.
 
+## OCI-HSG R2E study example
+
+The following is the 64-node R2E/Qwen 3.5 study shape used for the
+`swe-qwen35-r2e-wlogging-64k-30turn-pp2real-32train32gen-1h-*` runs on
+OCI-HSG. It is intentionally verbose so the run can be reproduced without
+depending on local shell wrappers.
+
+Run from the grpo-studies checkout on branch `arigazzi/qwen35`:
+
+```bash
+cd /lustre/fsw/portfolios/coreai/projects/coreai_mlperf_training/users/arigazzi/grpo-studies-qwen35
+git checkout arigazzi/qwen35
+git pull --ff-only origin arigazzi/qwen35
+
+stamp=$(date +%Y%m%d-%H%M%S)
+export EXP_NAME="swe-qwen35-r2e-wlogging-64k-30turn-pp2real-32train32gen-1h-qwen35branch-${stamp}"
+
+export REPO_LOCATION="$PWD"
+export RECIPE=qwen_35/configs/grpo_qwen35_397b_swe_openhands_async.yaml
+export CONTAINER_IMAGE_PATH=/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/containers/nemorl_v0.6_prebaked_arm_clean_w_logging.sqsh
+
+export SLURM_ACCOUNT=coreai_mlperf_training
+export SLURM_PARTITION=batch
+export SLURM_QOS=short
+export SBATCH_QOS=short
+export SBATCH_GRES=gpu:4
+export SLURM_TIME=1:00:00
+
+export GPUS_PER_NODE=4
+export TRAIN_NODES=32
+export GEN_NODES=32
+export NODES=64
+
+export HF_CKPT_PATH=/lustre/fsw/portfolios/coreai/projects/coreai_mlperf_training/users/arigazzi/nemotron3_ultra_550b/hf_home/hub/models--Qwen--Qwen3.5-397B-A17B/snapshots/8472618112abcbd45acbcdc58436aff4233c23f7
+export CONTAINER_HF_CKPT_PATH="$HF_CKPT_PATH"
+export NRL_MEGATRON_CHECKPOINT_DIR=/lustre/fsw/portfolios/coreai/projects/coreai_mlperf_training/users/arigazzi/nemotron3_ultra_550b/mcore_ckpt_cache
+export CONTAINER_NRL_MEGATRON_CHECKPOINT_DIR="$NRL_MEGATRON_CHECKPOINT_DIR"
+
+export NEMO_GYM_SWE_TRAIN_DATA_PATH=/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/arigazzi/grpo-studies/data_swe/r2e_easy_l20_train.with_sifs.jsonl
+export NEMO_GYM_SWE_VALIDATION_DATA_PATH=/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/arigazzi/grpo-studies/data_swe/r2e_easy_l20_val.with_sifs.jsonl
+export CONTAINER_NEMO_GYM_SWE_TRAIN_DATA_PATH="$NEMO_GYM_SWE_TRAIN_DATA_PATH"
+export CONTAINER_NEMO_GYM_SWE_VALIDATION_DATA_PATH="$NEMO_GYM_SWE_VALIDATION_DATA_PATH"
+
+export NEMO_GYM_SWE_SIF_DIR=/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/swe-gym
+export CONTAINER_NEMO_GYM_SWE_SIF_DIR="$NEMO_GYM_SWE_SIF_DIR"
+export EXTRA_MOUNTS="/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/nemotron-ultra-swe/r2e_gym:/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/nemotron-ultra-swe/r2e_gym,/dev/fuse:/dev/fuse"
+
+export QWEN35_TRUNCATE_PROMPT_TOKENS=none
+export NEMO_RL_QWEN35_TRUNCATE_PROMPT_TOKENS=none
+```
+
+Then launch:
+
+```bash
+R2E_FORMATTERS='["/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/swe-gym/r2egym/{instance_id}.sif","/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/nemotron-ultra-swe/r2e_gym/{instance_id}.sif"]'
+
+bash examples/nemo_gym/launch_nemo_gym_multinode_training.sh \
+  "policy.model_name=${HF_CKPT_PATH}" \
+  "data.train.data_path=${NEMO_GYM_SWE_TRAIN_DATA_PATH}" \
+  "data.validation.data_path=${NEMO_GYM_SWE_VALIDATION_DATA_PATH}" \
+  "sif_dir=${NEMO_GYM_SWE_SIF_DIR}" \
+  "logger.wandb_enabled=False" \
+  "logger.wandb.project=nemotron-3-ultra" \
+  "policy.train_global_batch_size=128" \
+  "policy.train_micro_batch_size=1" \
+  "policy.logprob_batch_size=1" \
+  "policy.generation_batch_size=64" \
+  "grpo.num_prompts_per_step=16" \
+  "grpo.num_generations_per_prompt=8" \
+  "grpo.val_batch_size=null" \
+  "grpo.max_num_steps=50" \
+  "grpo.async_grpo.enabled=true" \
+  "grpo.async_grpo.max_trajectory_age_steps=1" \
+  "grpo.val_period=5" \
+  "grpo.val_at_start=true" \
+  "grpo.val_at_end=false" \
+  "cluster.segment_size=null" \
+  "policy.megatron_cfg.tensor_model_parallel_size=4" \
+  "policy.megatron_cfg.expert_model_parallel_size=64" \
+  "policy.megatron_cfg.expert_tensor_parallel_size=1" \
+  "policy.megatron_cfg.context_parallel_size=1" \
+  "policy.megatron_cfg.pipeline_model_parallel_size=2" \
+  "policy.megatron_cfg.sequence_parallel=true" \
+  "policy.megatron_cfg.mtp_num_layers=0" \
+  "policy.megatron_cfg.mtp_use_repeated_layer=false" \
+  "policy.megatron_cfg.moe_token_dispatcher_type=alltoall" \
+  "policy.megatron_cfg.moe_flex_dispatcher_backend=alltoall" \
+  "policy.megatron_cfg.apply_rope_fusion=false" \
+  "++policy.megatron_cfg.gradient_accumulation_fusion=false" \
+  "++policy.megatron_cfg.checkpoint.async_strategy=mcore" \
+  "policy.generation.vllm_cfg.tensor_parallel_size=8" \
+  "policy.generation.vllm_cfg.pipeline_parallel_size=1" \
+  "policy.generation.vllm_cfg.expert_parallel_size=8" \
+  "policy.generation.vllm_cfg.gpu_memory_utilization=0.55" \
+  "policy.generation.vllm_cfg.max_model_len=65536" \
+  "policy.max_total_sequence_length=65536" \
+  "policy.generation.max_new_tokens=65536" \
+  "data.max_input_seq_length=null" \
+  "++data.use_multiple_dataloader=false" \
+  "checkpointing.enabled=false" \
+  "++checkpointing.save_optimizer=false" \
+  "checkpointing.save_period=1000000" \
+  "checkpointing.ft_save_period=1000000" \
+  "checkpointing.checkpoint_must_save_by=null" \
+  "env.nemo_gym.num_gpu_nodes=0" \
+  "env.nemo_gym.skip_venv_if_present=true" \
+  "env.nemo_gym.policy_model.responses_api_models.vllm_model.chat_template_kwargs.enable_thinking=false" \
+  "env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.agent_max_turns=30" \
+  "env.nemo_gym.swe_agents_val.responses_api_agents.swe_agents.agent_max_turns=30" \
+  "env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.concurrency=128" \
+  "env.nemo_gym.swe_agents_val.responses_api_agents.swe_agents.concurrency=128" \
+  "env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.swebench_agent_timeout=360" \
+  "env.nemo_gym.swe_agents_val.responses_api_agents.swe_agents.swebench_agent_timeout=180" \
+  "env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.container_formatter=${R2E_FORMATTERS}" \
+  "env.nemo_gym.swe_agents_val.responses_api_agents.swe_agents.container_formatter=${R2E_FORMATTERS}" \
+  "policy.generation.vllm_cfg.http_server_serving_chat_kwargs.tool_parser=qwen3_xml" \
+  "policy.generation.vllm_cfg.http_server_serving_chat_kwargs.reasoning_parser=qwen3" \
+  "policy.generation.vllm_cfg.http_server_serving_chat_kwargs.reasoning_parser_plugin=null" \
+  "token_ids.eos=248046" \
+  "token_ids.think_open=248068" \
+  "token_ids.think_close=248069" \
+  "penalize_duplicated_reasoning=false" \
+  "penalize_empty_final_answer=false" \
+  "penalize_eos_token=false" \
+  "penalize_malformed_think_tag=false" \
+  "++env.nemo_gym.allow_noncontiguous_message_tokens=true" \
+  "policy.sequence_packing.enabled=false" \
+  "policy.generation.temperature=1.0" \
+  "policy.generation.top_p=1.0" \
+  "policy.megatron_cfg.optimizer.lr=5.0e-6" \
+  "policy.megatron_cfg.optimizer.min_lr=4.999e-6" \
+  "policy.megatron_cfg.scheduler.lr_warmup_iters=3" \
+  "policy.megatron_cfg.scheduler.lr_decay_iters=100000" \
+  "grpo.overlong_filtering=true" \
+  "++grpo.skip_reference_policy_logprobs_calculation=true" \
+  "grpo.max_val_samples=null" \
+  "+policy.generation.mcore_generation_config.buffer_size_gb=8" \
+  "grpo.async_grpo.in_flight_weight_updates=false"
+```
+
+Notes:
+
+- `SBATCH_GRES=gpu:4` is required on OCI-HSG `batch`; without it Slurm rejects
+  the job because no GPU TRES is requested.
+- The result directory is `${REPO_LOCATION}/results/${EXP_NAME}`.
+- The Ray driver log appears under
+  `${REPO_LOCATION}/results/${EXP_NAME}/logs/<jobid>-logs/ray-driver.log`.
+
 ## Safety boundary
 
 Non-Qwen runs are unaffected unless `QWEN35_OVERLAY=1` is set explicitly. The
