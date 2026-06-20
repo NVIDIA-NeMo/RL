@@ -158,7 +158,11 @@ export CONTAINER_NEMO_GYM_SWE_VALIDATION_DATA_PATH="$NEMO_GYM_SWE_VALIDATION_DAT
 
 export NEMO_GYM_SWE_SIF_DIR=/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/swe-gym
 export CONTAINER_NEMO_GYM_SWE_SIF_DIR="$NEMO_GYM_SWE_SIF_DIR"
-export EXTRA_MOUNTS="/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/nemotron-ultra-swe/r2e_gym:/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/nemotron-ultra-swe/r2e_gym,/dev/fuse:/dev/fuse"
+export EXTRA_MOUNTS="/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/nemotron-ultra-swe/r2e_gym:/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/nemotron-ultra-swe/r2e_gym"
+
+# Some systems, such as Ptyche, need `/dev/fuse:/dev/fuse` appended to
+# EXTRA_MOUNTS for nested SIF execution. OCI-HSG has not required it in this
+# recipe; add it only if the target cluster reports FUSE/apptainer mount errors.
 
 export QWEN35_TRUNCATE_PROMPT_TOKENS=none
 export NEMO_RL_QWEN35_TRUNCATE_PROMPT_TOKENS=none
@@ -322,7 +326,11 @@ export CONTAINER_NEMO_GYM_SWE_VALIDATION_DATA_PATH="$NEMO_GYM_SWE_VALIDATION_DAT
 
 export NEMO_GYM_SWE_SIF_DIR=/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/swe-gym
 export CONTAINER_NEMO_GYM_SWE_SIF_DIR="$NEMO_GYM_SWE_SIF_DIR"
-export EXTRA_MOUNTS="/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/nemotron-ultra-swe/r2e_gym:/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/nemotron-ultra-swe/r2e_gym,/dev/fuse:/dev/fuse"
+export EXTRA_MOUNTS="/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/nemotron-ultra-swe/r2e_gym:/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/nemotron-ultra-swe/r2e_gym"
+
+# Some systems, such as Ptyche, need `/dev/fuse:/dev/fuse` appended to
+# EXTRA_MOUNTS for nested SIF execution. OCI-HSG has not required it in this
+# recipe; add it only if the target cluster reports FUSE/apptainer mount errors.
 
 export QWEN35_TRUNCATE_PROMPT_TOKENS=65536
 export NEMO_RL_QWEN35_TRUNCATE_PROMPT_TOKENS=65536
