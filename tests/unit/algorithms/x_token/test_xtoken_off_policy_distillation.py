@@ -932,3 +932,48 @@ def test_dp_global_masked_mean_single_process_is_local_masked_mean():
 
     assert out.item() == pytest.approx(1.5)  # (1+2)/2; padded 100.0 excluded
     assert not out.requires_grad  # detached
+
+
+# ---------------------------------------------------------------------------
+# select_teacher chooses the lowest-CE teacher
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("better", [0, 1])
+def test_select_teacher_picks_lowest_ce_teacher(better):
+    # select_teacher must use the teacher with the lowest next-token CE on its
+    # own tokens. Two same-vocab teachers: the "better" one peaks on the true
+    # next token (CE ~ 0); the other is uniform (CE = log V). Parametrized over
+    # which index is better so it can't pass by always returning 0.
+    fn = CrossTokenizerDistillationLossFn.__new__(CrossTokenizerDistillationLossFn)
+    fn.num_teachers = 2
+    fn.projection_matrix_paths = [None, None]  # same-vocab: scored on student ids
+
+    vocab, seqlen = 8, 4
+    input_ids = torch.tensor([[1, 2, 3, 0]])
+    data = {
+        "input_ids": input_ids,
+        "token_mask": torch.ones(1, seqlen),
+        "sample_mask": torch.ones(1),
+    }
+
+    confident = torch.full((1, seqlen, vocab), -10.0)
+    for t in range(seqlen - 1):
+        confident[0, t, input_ids[0, t + 1]] = 10.0  # peak on the true next token
+    uniform = torch.zeros(1, seqlen, vocab)
+    teacher_full = {better: confident, 1 - better: uniform}
+
+    selected = []
+
+    def _fake_kd(i, *args, **kwargs):
+        selected.append(i)
+        return torch.tensor(0.0), {"kl_loss": 0.0}
+
+    fn._compute_teacher_kd = _fake_kd
+
+    _kd, metrics = fn._select_teacher_kd(
+        torch.zeros(1, seqlen, vocab), data, teacher_full, torch.tensor(3.0)
+    )
+
+    assert metrics["selected_teacher"] == better
+    assert selected == [better]  # KD computed only for the selected teacher
