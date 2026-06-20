@@ -527,17 +527,45 @@ def test_validate_collects_only_aggregate_metrics(mock_xtoken_components):
 # ---------------------------------------------------------------------------
 
 
-def test_ipc_buffer_released_on_student_train_failure(mock_xtoken_components):
+@pytest.mark.parametrize("num_teachers", [1, 2])
+def test_ipc_buffer_released_for_every_teacher_on_train_failure(
+    mock_xtoken_components, num_teachers
+):
     c = mock_xtoken_components
     c.student_policy.train.side_effect = RuntimeError("boom")
     c.master_config.distillation["max_num_steps"] = 1
+    # No validation passes, so release is driven solely by the failing train
+    # step's finally (one release per teacher).
+    c.master_config.distillation["val_at_start"] = False
+    c.master_config.distillation["val_period"] = 0
+    c.master_config.distillation["val_at_end"] = False
+
+    # N same-vocab teachers: the release loop is teacher-type-agnostic, and
+    # same-vocab teachers reuse the student tokenization (the mock batch only
+    # carries teacher_0_* keys, so this stays valid for any N).
+    teacher_policies = [MagicMock() for _ in range(num_teachers)]
+    c.loss_fn.num_teachers = num_teachers
+    c.loss_fn.projection_matrix_paths = [None] * num_teachers
+    c.loss_fn.teacher_ships_full = [True] * num_teachers
 
     with pytest.raises(RuntimeError):
-        _run_train(c)
+        xtoken_off_policy_distillation_train(
+            c.student_policy,
+            teacher_policies,
+            c.train_dataloader,
+            c.val_dataloader,
+            c.loss_fn,
+            c.logger,
+            c.checkpointer,
+            c.save_state,
+            c.master_config,
+        )
 
-    # Even though student.train raised, the try/finally must have invoked
-    # teacher_policy.release_ipc_buffer.
-    assert c.teacher_policy.release_ipc_buffer.call_count >= 1
+    # The finally must release EVERY teacher's IPC buffer, not just the first
+    # (a misplaced finally / early break that frees only teacher 0 would pass a
+    # `>= 1` check while leaking the rest).
+    for t in teacher_policies:
+        assert t.release_ipc_buffer.call_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -599,9 +627,15 @@ def test_run_teacher_forwards_packs_indexed_keys_and_runs_serially():
         teacher_ships_full=[True, False],
         vocab_topk=8,
     )
+    # Attach both teacher mocks to one parent so their calls land in a single
+    # ordered list (lets us assert the serial interleaving below). Configure
+    # the child return values after attaching.
+    parent = MagicMock()
     t0 = MagicMock()
-    t0.get_teacher_logits_ipc.return_value = [{"rank_logits_ipc": 0}]
     t1 = MagicMock()
+    parent.attach_mock(t0, "t0")
+    parent.attach_mock(t1, "t1")
+    t0.get_teacher_logits_ipc.return_value = [{"rank_logits_ipc": 0}]
     t1.get_teacher_logits_ipc.return_value = [
         {"rank_topk_vals_ipc": 0, "rank_topk_idx_ipc": 1}
     ]
@@ -628,10 +662,15 @@ def test_run_teacher_forwards_packs_indexed_keys_and_runs_serially():
     t1.get_teacher_logits_ipc.assert_called_once()
     assert t1.get_teacher_logits_ipc.call_args.kwargs["mode"] == "topk"
     assert t1.get_teacher_logits_ipc.call_args.kwargs["k"] == 8
-    # Serial collocated execution: each teacher onloaded then offloaded.
+    # Serial collocated execution: each teacher onloaded then offloaded, AND
+    # teacher 0 is offloaded before teacher 1 is onloaded (never both resident).
     for t in (t0, t1):
         t.prepare_for_lp_inference.assert_called_once()
         t.offload_after_refit.assert_called_once()
+    call_names = [c[0] for c in parent.mock_calls]
+    assert call_names.index("t0.offload_after_refit") < call_names.index(
+        "t1.prepare_for_lp_inference"
+    )
 
 
 def test_setup_builds_one_policy_per_teacher():
