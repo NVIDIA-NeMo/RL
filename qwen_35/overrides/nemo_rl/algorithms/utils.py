@@ -394,8 +394,28 @@ def get_tokenizer(
                 if chat_template:
                     tokenizer.chat_template = chat_template
             else:
-                tokenizer = PreTrainedTokenizerFast.from_pretrained(
-                    tokenizer_name, trust_remote_code=True
+                diagnostic_paths = {
+                    "policy.tokenizer.name": tokenizer_path,
+                    "CONTAINER_HF_CKPT_PATH": os.environ.get("CONTAINER_HF_CKPT_PATH"),
+                    "HF_CKPT_PATH": os.environ.get("HF_CKPT_PATH"),
+                }
+                diagnostic = []
+                for label, path in diagnostic_paths.items():
+                    tokenizer_json_candidate = (
+                        os.path.join(path, "tokenizer.json") if path else None
+                    )
+                    tokenizer_config_candidate = (
+                        os.path.join(path, "tokenizer_config.json") if path else None
+                    )
+                    diagnostic.append(
+                        f"{label}={path!r}, "
+                        f"tokenizer_json_exists={os.path.exists(tokenizer_json_candidate) if tokenizer_json_candidate else False}, "
+                        f"tokenizer_config_exists={os.path.exists(tokenizer_config_candidate) if tokenizer_config_candidate else False}"
+                    )
+                raise FileNotFoundError(
+                    "Qwen 3.5 fast-tokenizer direct load failed; refusing to fall "
+                    "back to slow tokenizer conversion in this container. "
+                    + "; ".join(diagnostic)
                 )
         else:
             tokenizer = AutoTokenizer.from_pretrained(
