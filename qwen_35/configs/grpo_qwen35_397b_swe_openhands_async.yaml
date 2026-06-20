@@ -15,6 +15,9 @@ policy:
   megatron_cfg:
     apply_rope_fusion: false
     gradient_accumulation_fusion: false
+    mtp_num_layers: 0
+    mtp_use_repeated_layer: false
+    moe_flex_dispatcher_backend: alltoall
   generation:
     vllm_cfg:
       http_server_serving_chat_kwargs:
