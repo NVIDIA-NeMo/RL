@@ -321,14 +321,13 @@ def get_tokenizer(
         if force_qwen2_fast:
             # Qwen 3.5 checkpoints advertise Qwen2Tokenizer in tokenizer_config.json.
             # In the current container, AutoTokenizer then tries a slow->fast
-            # conversion path that needs tiktoken in /opt/nemo_rl_venv. The
-            # checkpoint already ships tokenizer.json, so load the fast tokenizer
-            # class directly and avoid that converter dependency.
-            from transformers.models.qwen2.tokenization_qwen2_fast import (
-                Qwen2TokenizerFast,
-            )
+            # conversion path that needs tiktoken in /opt/nemo_rl_venv, and this
+            # Transformers build does not expose Qwen2TokenizerFast. The checkpoint
+            # already ships tokenizer.json, so load the generic fast tokenizer
+            # directly from that serialized backend.
+            from transformers import PreTrainedTokenizerFast
 
-            tokenizer = Qwen2TokenizerFast.from_pretrained(
+            tokenizer = PreTrainedTokenizerFast.from_pretrained(
                 tokenizer_name, trust_remote_code=True
             )
         else:
