@@ -543,6 +543,18 @@ Output prompt token IDs summary: {_summarize_token_ids(output_item_dict["prompt_
 
         if not nemo_rl_message_log:
             input_messages = nemo_gym_result["responses_create_params"]["input"]
+            if isinstance(input_messages, list):
+                input_summary = {
+                    "len": len(input_messages),
+                    "roles": [
+                        m.get("role") for m in input_messages[:12] if isinstance(m, dict)
+                    ],
+                    "tail_roles": [
+                        m.get("role") for m in input_messages[-6:] if isinstance(m, dict)
+                    ],
+                }
+            else:
+                input_summary = {"type": type(input_messages).__name__}
             try:
                 prompt_token_ids = tokenizer.apply_chat_template(
                     input_messages, tokenize=True
@@ -576,18 +588,43 @@ Output prompt token IDs summary: {_summarize_token_ids(output_item_dict["prompt_
                         if isinstance(text, str):
                             summary["summary0_text_preview"] = text[:256]
                 output_item_summaries.append(summary)
-            raise ValueError(
-                f"NeMo Gym returned a result with no generation data. "
-                f"Possible causes: (1) the prompt for the first turn already exceeds the vLLM max_model_len, "
-                f"so vLLM rejected the request before any tokens could be generated; "
-                f"(2) all response output items were reasoning/tool-call items with no assistant generation.\n"
-                f"  Prompt length: {prompt_len_str}.\n"
-                f"  response.output item types ({len(output_item_types)} items): {output_item_types}.\n"
-                f"  First response.output item summaries: {output_item_summaries}.\n"
-                f"  → If (1): increase `policy.max_total_sequence_length` and `policy.generation.vllm_cfg.max_model_len` "
-                f"above the prompt length above.\n"
-                f"  → If (2): inspect why no assistant content was produced for this rollout."
+            response = nemo_gym_result.get("response", {})
+            response_keys = sorted(response.keys()) if isinstance(response, dict) else []
+            create_params = nemo_gym_result.get("responses_create_params", {})
+            create_param_keys = (
+                sorted(create_params.keys()) if isinstance(create_params, dict) else []
             )
+            print(
+                "  [nemo_gym] WARNING: returned no generation data for a rollout; "
+                "treating as a masked zero-reward trajectory instead of aborting the batch.\n"
+                f"    Prompt length: {prompt_len_str}.\n"
+                f"    input summary: {input_summary}.\n"
+                f"    result keys: {sorted(nemo_gym_result.keys())}.\n"
+                f"    response keys: {response_keys}.\n"
+                f"    responses_create_params keys: {create_param_keys}.\n"
+                f"    response.output item types ({len(output_item_types)} items): {output_item_types}.\n"
+                f"    First response.output item summaries: {output_item_summaries}.",
+                flush=True,
+            )
+
+            fallback_token = (
+                tokenizer.pad_token_id
+                if tokenizer.pad_token_id is not None
+                else (tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0)
+            )
+            nemo_rl_message_log = [
+                {
+                    "role": "user",
+                    "content": "",
+                    "token_ids": torch.tensor([fallback_token, fallback_token]),
+                },
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "token_ids": torch.tensor([fallback_token]),
+                },
+            ]
+            nemo_gym_result["reward"] = 0.0
 
         return {
             "message_log": nemo_rl_message_log,
