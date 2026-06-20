@@ -188,8 +188,8 @@ bash examples/nemo_gym/launch_nemo_gym_multinode_training.sh \
   "policy.megatron_cfg.context_parallel_size=1" \
   "policy.megatron_cfg.pipeline_model_parallel_size=2" \
   "policy.megatron_cfg.sequence_parallel=true" \
-  "policy.megatron_cfg.mtp_num_layers=0" \
-  "policy.megatron_cfg.mtp_use_repeated_layer=false" \
+  "+policy.megatron_cfg.mtp_num_layers=0" \
+  "+policy.megatron_cfg.mtp_use_repeated_layer=false" \
   "policy.megatron_cfg.moe_token_dispatcher_type=alltoall" \
   "policy.megatron_cfg.moe_flex_dispatcher_backend=alltoall" \
   "policy.megatron_cfg.apply_rope_fusion=false" \
