@@ -127,6 +127,14 @@ env:
     num_gpu_nodes: 0
     skip_venv_if_present: true
     allow_noncontiguous_message_tokens: true
+    invalid_tool_call_patterns:
+      - <tool_call>
+      - </tool_call>
+      - <function_call>
+      - </function_call>
+    thinking_tags:
+      - <think>
+      - </think>
     policy_model:
       responses_api_models:
         vllm_model:
@@ -141,6 +149,8 @@ env:
           agent_max_turns: 30
           concurrency: 128
           swebench_agent_timeout: 360
+          apptainer_memory_limit_mb: 65536
+          run_with_mixed_prompts: true
           container_formatter:
             - /lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/swe-gym/r2egym/{instance_id}.sif
             - /lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/nemotron-ultra-swe/r2e_gym/{instance_id}.sif
@@ -150,6 +160,7 @@ env:
           agent_max_turns: 30
           concurrency: 128
           swebench_agent_timeout: 180
+          apptainer_memory_limit_mb: 65536
           container_formatter:
             - /lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/swe-gym/r2egym/{instance_id}.sif
             - /lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/nemotron-ultra-swe/r2e_gym/{instance_id}.sif
