@@ -53,9 +53,10 @@ env:
           # If vLLM is configured with a reasoning parser, the NeMo-Gym policy
           # server must expect reasoning fields in chat-completion responses.
           uses_reasoning_parser: true
-          extra_body:
-            chat_template_kwargs:
-              enable_thinking: false
+          chat_template_kwargs:
+            enable_thinking: false
+            truncate_history_thinking: false
+          sequential_reasoning_allowed: false
 
 token_ids:
   eos: 248046
