@@ -133,9 +133,8 @@ env:
           uses_reasoning_parser: true
           chat_template_kwargs:
             enable_thinking: false
-          extra_body:
-            chat_template_kwargs:
-              enable_thinking: false
+            truncate_history_thinking: false
+          sequential_reasoning_allowed: false
     swe_agents_train:
       responses_api_agents:
         swe_agents:
