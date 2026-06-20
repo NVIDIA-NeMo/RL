@@ -206,7 +206,6 @@ bash examples/nemo_gym/launch_nemo_gym_multinode_training.sh \
   "checkpointing.save_period=1000000" \
   "checkpointing.checkpoint_must_save_by=null" \
   "env.nemo_gym.skip_venv_if_present=true" \
-  "env.nemo_gym.policy_model.responses_api_models.vllm_model.chat_template_kwargs.enable_thinking=false" \
   "env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.agent_max_turns=30" \
   "env.nemo_gym.swe_agents_val.responses_api_agents.swe_agents.agent_max_turns=30" \
   "env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.concurrency=128" \

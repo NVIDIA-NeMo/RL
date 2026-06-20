@@ -29,6 +29,11 @@ policy:
 env:
   nemo_gym:
     allow_noncontiguous_message_tokens: true
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          chat_template_kwargs:
+            enable_thinking: false
 
 token_ids:
   eos: 248046
