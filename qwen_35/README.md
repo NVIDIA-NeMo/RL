@@ -13,7 +13,8 @@ selected.
 Qwen 3.5 support currently needs more than YAML values:
 
 - Megatron Bridge must recognize the HF architecture/model type
-  `Qwen3_5MoeForConditionalGeneration` / `qwen3_5_moe`.
+  `Qwen3_5MoeForConditionalGeneration` / `qwen3_5_moe`; the required
+  container already carries that support.
 - The Megatron setup path needs Qwen 3.5 compatibility for the GatedDeltaNet
   code path used by the current container stack.
 - The vLLM async worker needs Qwen 3.5 prompt/prefix repair and parser handling
@@ -82,10 +83,9 @@ variables and Hydra overrides.
 
 The current overlay files are:
 
-- `nemo_rl/models/megatron/qwen35_bridge_patch.py`
-  - Registers Qwen 3.5 MoE with Megatron Bridge.
 - `nemo_rl/models/megatron/community_import.py`
-  - Imports the Qwen 3.5 bridge patch during Megatron setup.
+  - Carries the random-init and Megatron import compatibility used by the
+    known-good Qwen 3.5 smoke path.
 - `nemo_rl/models/megatron/setup.py`
   - Adds Qwen 3.5 Megatron setup compatibility, including GatedDeltaNet handling.
 - `nemo_rl/models/policy/workers/megatron_policy_worker.py`
@@ -102,12 +102,17 @@ These are intentionally under `qwen_35/overrides` instead of directly modifying
 the base tree. That makes it clear which files are Qwen 3.5-specific and keeps
 base grpo-studies behavior visible.
 
+The launcher also stages the base repository copy of
+`3rdparty/Gym-workspace/Gym/responses_api_models/vllm_model/app.py` into the
+container for Qwen 3.5 runs. That file is not duplicated under
+`qwen_35/overrides` because Carlos's branch already carries the required Gym
+Responses API behavior.
 
-## Ptyche training-HP variant
 
-`qwen_35/configs/grpo_qwen35_397b_swe_openhands_async_grposmoke_3465015_ptyche_hps.yaml`
-keeps the working OCI-HSG Qwen 3.5 test config as its base, then copies the
-training hyperparameters observed in Carlos's Ptyche run:
+## Ptyche training HPs
+
+Carlos's Ptyche Qwen3 run used ordinary training hyperparameters on top of a
+different model/topology:
 
 ```text
 /lustre/fsw/coreai_mlperf_training/users/cgomes/mlperf-rl/results/coreai_mlperf_training-grpo.grpo-235b-swe-async_gbs512_lr5.0e-6_mt30_r1
@@ -115,10 +120,29 @@ training hyperparameters observed in Carlos's Ptyche run:
 
 Important detail: despite the run-name `gbs512`, the final resolved Ptyche config
 and MLLOG reported `train_global_batch_size=256`, `num_prompts_per_step=16`, and
-`num_generations_per_prompt=16`. The variant therefore uses GBS 256, LR `5e-6`,
-30 OpenHands turns, validation at start/every 5 steps/at end, and the same R2E
-runtime shape as the current Qwen 3.5 test config. It does not copy Ptyche-only
-model paths, Qwen3 parallelism, 32-node topology, or 98k context.
+`num_generations_per_prompt=16`. We do not keep a separate YAML for this because
+the useful parts are simple overrides:
+
+```bash
+"policy.train_global_batch_size=256" \
+"grpo.num_prompts_per_step=16" \
+"grpo.num_generations_per_prompt=16" \
+"grpo.max_num_steps=16" \
+"grpo.val_batch_size=52" \
+"grpo.max_val_samples=52" \
+"grpo.val_at_start=true" \
+"grpo.val_period=5" \
+"grpo.val_at_end=true" \
+"policy.megatron_cfg.optimizer.lr=5.0e-6" \
+"policy.megatron_cfg.optimizer.min_lr=5.0e-6" \
+"policy.megatron_cfg.scheduler.lr_warmup_iters=3" \
+"policy.megatron_cfg.scheduler.lr_decay_iters=100000" \
+"policy.megatron_cfg.scheduler.lr_decay_style=constant" \
+"env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.swebench_agent_timeout=720" \
+"env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.swebench_tests_timeout=300" \
+"env.nemo_gym.swe_agents_val.responses_api_agents.swe_agents.swebench_agent_timeout=720" \
+"env.nemo_gym.swe_agents_val.responses_api_agents.swe_agents.swebench_tests_timeout=180"
+```
 
 ## Escape hatches
 
@@ -134,19 +158,19 @@ model paths, Qwen3 parallelism, 32-node topology, or 98k context.
 ## OCI-HSG R2E study example
 
 The following is the 64-node R2E/Qwen 3.5 study shape used for the
-`swe-qwen35-r2e-wlogging-64k-30turn-pp2real-32train32gen-1h-*` runs on
+`swe-qwen35-r2e-wlogging-64k-30turn-pp2real-32train32gen-4h-*` runs on
 OCI-HSG. It is intentionally verbose so the run can be reproduced without
 depending on local shell wrappers.
 
-Run from the grpo-studies checkout on branch `arigazzi/qwen35`:
+Run from the grpo-studies checkout on branch `arigazz/qwen35-clobber`:
 
 ```bash
 cd /lustre/fsw/portfolios/coreai/projects/coreai_mlperf_training/users/arigazzi/grpo-studies-qwen35
-git checkout arigazzi/qwen35
-git pull --ff-only origin arigazzi/qwen35
+git checkout arigazz/qwen35-clobber
+git pull --ff-only origin arigazz/qwen35-clobber
 
 stamp=$(date +%Y%m%d-%H%M%S)
-export EXP_NAME="swe-qwen35-r2e-wlogging-64k-30turn-pp2real-32train32gen-1h-qwen35branch-${stamp}"
+export EXP_NAME="swe-qwen35-r2e-wlogging-64k-30turn-pp2real-32train32gen-4h-qwen35branch-${stamp}"
 
 export REPO_LOCATION="$PWD"
 export RECIPE=qwen_35/configs/grpo_qwen35_397b_swe_openhands_async.yaml
@@ -157,7 +181,7 @@ export SLURM_PARTITION=batch
 export SLURM_QOS=short
 export SBATCH_QOS=short
 export SBATCH_GRES=gpu:4
-export SLURM_TIME=1:00:00
+export SLURM_TIME=4:00:00
 
 export GPUS_PER_NODE=4
 export TRAIN_NODES=32
@@ -279,84 +303,6 @@ Notes:
 - The result directory is `${REPO_LOCATION}/results/${EXP_NAME}`.
 - The Ray driver log appears under
   `${REPO_LOCATION}/results/${EXP_NAME}/logs/<jobid>-logs/ray-driver.log`.
-
-## Resolved 3465015 parity config
-
-For config-to-config comparison against the optimized `grpo-smoke` run that
-reached CUDA-Graph training, use:
-
-```bash
-qwen_35/configs/grpo_qwen35_397b_swe_openhands_async_grposmoke_3465015_resolved.yaml
-```
-
-That file folds the final Hydra values from optimized job `3465015` into YAML:
-
-- 64k context: `policy.max_total_sequence_length`,
-  `policy.generation.max_new_tokens`, and
-  `policy.generation.vllm_cfg.max_model_len`
-- CUDA Graph path: `enforce_eager: false`, `backend: inductor`, and
-  `cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 64]`
-- policy parallelism: TP4, PP2, CP1, EP64
-- generation parallelism: vLLM TP8, PP1, EP8
-- R2E `easy_l20` train/validation JSONL files and the two R2E SIF formatter
-  paths
-- 30 SWE turns, train timeout 360s, validation timeout 180s
-- async GRPO with max trajectory age 1 and no in-flight weight updates
-- Qwen parser settings and direct `enable_thinking: false`
-
-The launcher still injects run metadata (`logger.log_dir`,
-`checkpointing.checkpoint_dir`, `cluster.num_nodes`, seed, etc.). To run the
-resolved config without any extra user Hydra overrides, set only launch/mount
-environment and invoke the launcher with no trailing arguments:
-
-```bash
-cd /lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/arigazzi/grpo-studies-qwen35
-git checkout arigazzi/qwen35
-git pull --ff-only origin arigazzi/qwen35
-
-stamp=$(date +%Y%m%d-%H%M%S)
-export EXP_NAME="swe-qwen35-r2e-grposmoke3465015-resolved-${stamp}"
-export REPO_LOCATION="$PWD"
-export RECIPE=qwen_35/configs/grpo_qwen35_397b_swe_openhands_async_grposmoke_3465015_resolved.yaml
-export CONTAINER_IMAGE_PATH=/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/containers/nemorl_v0.6_prebaked_arm_clean_w_logging.sqsh
-
-export SLURM_ACCOUNT=coreai_mlperf_training
-export SLURM_PARTITION=batch
-export SLURM_QOS=short
-export SBATCH_QOS=short
-export SBATCH_GRES=gpu:4
-export SLURM_TIME=1:00:00
-
-export GPUS_PER_NODE=4
-export TRAIN_NODES=32
-export GEN_NODES=32
-export NODES=64
-
-export HF_CKPT_PATH=/lustre/fsw/portfolios/coreai/projects/coreai_mlperf_training/users/arigazzi/nemotron3_ultra_550b/hf_home/hub/models--Qwen--Qwen3.5-397B-A17B/snapshots/8472618112abcbd45acbcdc58436aff4233c23f7
-export CONTAINER_HF_CKPT_PATH="$HF_CKPT_PATH"
-export NRL_MEGATRON_CHECKPOINT_DIR=/lustre/fsw/portfolios/coreai/projects/coreai_mlperf_training/users/arigazzi/nemotron3_ultra_550b/mcore_ckpt_cache
-export CONTAINER_NRL_MEGATRON_CHECKPOINT_DIR="$NRL_MEGATRON_CHECKPOINT_DIR"
-
-export NEMO_GYM_SWE_TRAIN_DATA_PATH=/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/arigazzi/grpo-studies/data_swe/r2e_easy_l20_train.with_sifs.jsonl
-export NEMO_GYM_SWE_VALIDATION_DATA_PATH=/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/arigazzi/grpo-studies/data_swe/r2e_easy_l20_val.with_sifs.jsonl
-export CONTAINER_NEMO_GYM_SWE_TRAIN_DATA_PATH="$NEMO_GYM_SWE_TRAIN_DATA_PATH"
-export CONTAINER_NEMO_GYM_SWE_VALIDATION_DATA_PATH="$NEMO_GYM_SWE_VALIDATION_DATA_PATH"
-
-export NEMO_GYM_SWE_SIF_DIR=/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/swe-gym
-export CONTAINER_NEMO_GYM_SWE_SIF_DIR="$NEMO_GYM_SWE_SIF_DIR"
-export EXTRA_MOUNTS="/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/nemotron-ultra-swe/r2e_gym:/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/nemotron-ultra-swe/r2e_gym"
-
-# Some systems, such as Ptyche, need `/dev/fuse:/dev/fuse` appended to
-# EXTRA_MOUNTS for nested SIF execution. OCI-HSG has not required it in this
-# recipe; add it only if the target cluster reports FUSE/apptainer mount errors.
-
-export QWEN35_TRUNCATE_PROMPT_TOKENS=65536
-export NEMO_RL_QWEN35_TRUNCATE_PROMPT_TOKENS=65536
-export QWEN35_FORCE_TORCH_GDN=1
-export NEMO_RL_QWEN35_FORCE_TORCH_GDN=1
-
-bash examples/nemo_gym/launch_nemo_gym_multinode_training.sh
-```
 
 ## Safety boundary
 

@@ -239,7 +239,6 @@ if [[ "${_qwen35_should_mount}" == "1" ]]; then
                 "nemo_rl/models/megatron/community_import.py"
                 "nemo_rl/models/megatron/setup.py"
                 "nemo_rl/models/policy/workers/megatron_policy_worker.py"
-                "3rdparty/Gym-workspace/Gym/responses_api_models/vllm_model/app.py"
             )
             for _qwen35_dst_rel in "${_qwen35_overlay_dsts[@]}"; do
                 _qwen35_stage_file "${QWEN35_OVERLAY_DIR}/${_qwen35_dst_rel}" "${QWEN35_STAGED_OVERLAY_DIR}" "${_qwen35_dst_rel}" "Qwen 3.5 overlay"
@@ -255,7 +254,6 @@ if [[ "${_qwen35_should_mount}" == "1" ]]; then
                 "nemo_rl/models/megatron/community_import.py:nemo_rl/models/megatron/community_import.py"
                 "nemo_rl/models/megatron/setup.py:nemo_rl/models/megatron/setup.py"
                 "nemo_rl/models/policy/workers/megatron_policy_worker.py:nemo_rl/models/policy/workers/megatron_policy_worker.py"
-                "qwen_35/overrides/3rdparty/Gym-workspace/Gym/responses_api_models/vllm_model/app.py:3rdparty/Gym-workspace/Gym/responses_api_models/vllm_model/app.py"
             )
             for _qwen35_pair in "${_qwen35_clobber_pairs[@]}"; do
                 _qwen35_src_rel="${_qwen35_pair%%:*}"
@@ -270,6 +268,17 @@ if [[ "${_qwen35_should_mount}" == "1" ]]; then
             exit 1
             ;;
     esac
+
+    _qwen35_base_pairs=(
+        "3rdparty/Gym-workspace/Gym/responses_api_models/vllm_model/app.py:3rdparty/Gym-workspace/Gym/responses_api_models/vllm_model/app.py"
+    )
+    for _qwen35_pair in "${_qwen35_base_pairs[@]}"; do
+        _qwen35_src_rel="${_qwen35_pair%%:*}"
+        _qwen35_dst_rel="${_qwen35_pair#*:}"
+        _qwen35_stage_file "${REPO_LOCATION}/${_qwen35_src_rel}" "${QWEN35_CLOBBER_STAGE_DIR}" "${_qwen35_dst_rel}" "Qwen 3.5 base clobber"
+        _qwen35_mount_file "${QWEN35_CLOBBER_STAGE_DIR}/${_qwen35_dst_rel}" "${CONTAINER_REPO_LOCATION}/${_qwen35_dst_rel}" "Qwen 3.5 base clobber"
+    done
+    unset _qwen35_pair _qwen35_src_rel _qwen35_dst_rel _qwen35_base_pairs
 
     # Defaults consumed by the Qwen-only files. They are harmless for
     # non-Qwen jobs because these files are not mounted for those recipes.

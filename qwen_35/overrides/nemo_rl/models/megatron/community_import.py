@@ -13,11 +13,6 @@ from megatron.bridge import AutoBridge
 
 from nemo_rl.models.policy import MegatronConfig
 
-try:
-    from nemo_rl.models.megatron import qwen35_bridge_patch  # noqa: F401
-except Exception:
-    pass
-
 
 def _use_random_init() -> bool:
     return os.environ.get("NRL_RANDOM_INIT", "0") == "1"
