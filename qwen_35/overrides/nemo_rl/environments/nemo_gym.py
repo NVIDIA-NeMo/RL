@@ -594,37 +594,17 @@ Output prompt token IDs summary: {_summarize_token_ids(output_item_dict["prompt_
             create_param_keys = (
                 sorted(create_params.keys()) if isinstance(create_params, dict) else []
             )
-            print(
-                "  [nemo_gym] WARNING: returned no generation data for a rollout; "
-                "treating as a masked zero-reward trajectory instead of aborting the batch.\n"
+            raise ValueError(
+                "NeMo Gym returned a result with no generation data. This is treated "
+                "as a hard error for Qwen 3.5 debugging, not as a zero-reward sample.\n"
                 f"    Prompt length: {prompt_len_str}.\n"
                 f"    input summary: {input_summary}.\n"
                 f"    result keys: {sorted(nemo_gym_result.keys())}.\n"
                 f"    response keys: {response_keys}.\n"
                 f"    responses_create_params keys: {create_param_keys}.\n"
                 f"    response.output item types ({len(output_item_types)} items): {output_item_types}.\n"
-                f"    First response.output item summaries: {output_item_summaries}.",
-                flush=True,
+                f"    First response.output item summaries: {output_item_summaries}."
             )
-
-            fallback_token = (
-                tokenizer.pad_token_id
-                if tokenizer.pad_token_id is not None
-                else (tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0)
-            )
-            nemo_rl_message_log = [
-                {
-                    "role": "user",
-                    "content": "",
-                    "token_ids": torch.tensor([fallback_token, fallback_token]),
-                },
-                {
-                    "role": "assistant",
-                    "content": "",
-                    "token_ids": torch.tensor([fallback_token]),
-                },
-            ]
-            nemo_gym_result["reward"] = 0.0
 
         return {
             "message_log": nemo_rl_message_log,
