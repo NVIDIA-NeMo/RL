@@ -211,6 +211,7 @@ class ColocatablePolicyInterface(PolicyInterface):
         *,
         version: int,
         mx_config: Any,
+        kv_scales: Optional[dict[str, float]] = None,
     ) -> list[ray.ObjectRef]:
         """Stream model weights to inference via NIXL RDMA + ModelExpress (v2).
 
@@ -223,6 +224,8 @@ class ColocatablePolicyInterface(PolicyInterface):
             version: monotonic version (== training step) for this publish.
                 Inference receivers filter on ``version >= last_seen``.
             mx_config: an :class:`nemo_rl.distributed.mx_helpers.MxConfig`.
+            kv_scales: Optional vLLM-named FP8 Q/K/V scale values to publish
+                alongside weights for FP8 KV-cache refit.
 
         Returns:
             List of Ray ObjectRefs — one per trainer worker. The driver

@@ -175,6 +175,21 @@ def test_prepare_refit_info_is_noop(in_k8s, stub_namespace):
     assert g.prepare_refit_info({}) is None
 
 
+def test_requires_kv_scale_sync_follows_vllm_cfg(monkeypatch):
+    monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+    cfg = _base_config(frontend_url="http://my-dgd.example.com:8000/v1")
+    assert DynamoGeneration(cluster=None, config=cfg).requires_kv_scale_sync is False
+
+    cfg["vllm_cfg"] = {"kv_cache_dtype": "auto"}  # type: ignore[typeddict-item]
+    assert DynamoGeneration(cluster=None, config=cfg).requires_kv_scale_sync is False
+
+    cfg["vllm_cfg"] = {"kv_cache_dtype": "fp8"}  # type: ignore[typeddict-item]
+    assert DynamoGeneration(cluster=None, config=cfg).requires_kv_scale_sync is True
+
+    cfg["vllm_cfg"] = {"kv_cache_dtype": "fp8_e4m3"}  # type: ignore[typeddict-item]
+    assert DynamoGeneration(cluster=None, config=cfg).requires_kv_scale_sync is True
+
+
 def test_pickle_roundtrip(in_k8s, stub_namespace):
     g = DynamoGeneration(cluster=None, config=_base_config(frontend_port=8123))
     expected_url = g.dp_openai_server_base_urls[0]
@@ -256,7 +271,7 @@ def test_generate_builds_non_greedy_payload_and_vllm_sync_tensors(
         assert payload["temperature"] == 0.7
         assert payload["top_p"] == 0.9
         assert payload["top_k"] == 50
-        assert payload["logprobs"] == 0
+        assert "logprobs" not in payload
         assert payload["n"] == 1
         assert payload["return_tokens_as_token_ids"] is True
         assert payload["include_stop_str_in_output"] is True

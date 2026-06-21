@@ -1408,6 +1408,58 @@ def test_refit_policy_generation_sglang_non_colocated_raises(monkeypatch):
         )
 
 
+def test_refit_policy_generation_mx_passes_kv_scales(monkeypatch):
+    from nemo_rl.algorithms import grpo as grpo_mod
+
+    calls = {}
+
+    class DummyMxConfig:
+        enabled = True
+
+    class DummyPolicy:
+        def stream_weights_via_mx(self, *, version, mx_config, kv_scales=None):
+            calls["publish"] = {
+                "version": version,
+                "mx_config": mx_config,
+                "kv_scales": kv_scales,
+            }
+            return ["train"]
+
+    class DummyDynamoGeneration:
+        def update_weights_via_mx(self, *, version, mx_config):
+            calls["receive"] = {"version": version, "mx_config": mx_config}
+            return ["infer"]
+
+    def fake_ray_get(refs):
+        if refs == ["infer"]:
+            return [True]
+        return refs
+
+    mx_config = DummyMxConfig()
+    kv_scales = {
+        "model.layers.0.self_attn.k_scale": 1.25,
+        "model.layers.0.self_attn.v_scale": 1.5,
+    }
+    monkeypatch.setattr(grpo_mod.ray, "get", fake_ray_get)
+
+    grpo_mod.refit_policy_generation(
+        policy=DummyPolicy(),
+        policy_generation=DummyDynamoGeneration(),
+        colocated_inference=False,
+        kv_scales=kv_scales,
+        weight_sync_method="mx",
+        mx_config=mx_config,
+        refit_version=7,
+    )
+
+    assert calls["publish"] == {
+        "version": 7,
+        "mx_config": mx_config,
+        "kv_scales": kv_scales,
+    }
+    assert calls["receive"] == {"version": 7, "mx_config": mx_config}
+
+
 def test_grpo_train_collects_generation_logger_metrics(
     monkeypatch, mock_grpo_components
 ):

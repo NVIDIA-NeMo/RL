@@ -1862,6 +1862,7 @@ class DTensorPolicyWorkerImpl(
         *,
         version: int,
         mx_config: Any,
+        kv_scales: Optional[dict[str, float]] = None,
     ) -> None:
         """Publish local DTensor shards to ModelExpress for RDMA refit (v2).
 
@@ -1878,9 +1879,9 @@ class DTensorPolicyWorkerImpl(
         leading axis is divisible by ``ep_world_size``) — override via
         the ``NRL_MX_EXPERT_TENSOR_PATTERN`` env var.
         """
-        if kv_scales := getattr(self, "_kv_scales_for_mx", None):
+        if kv_scales is not None:
             raise NotImplementedError(
-                "FP8 kvcache scales are not yet supported on the MX path"
+                "FP8 kvcache scales are only supported on the Megatron MX path"
             )
 
         if self.cpu_offload:
@@ -2043,9 +2044,11 @@ class DTensorPolicyWorkerImpl(
         torch.cuda.empty_cache()
 
     def start_gen_benchmark_keepalive(self) -> None:
-        """Benchmark-only: keep this training GPU non-idle while real training is
-        skipped (gen_benchmark_skip_training), so the cluster's idle-GPU reaper does
-        not kill the job. Spawns one daemon thread doing a tiny periodic matmul.
+        """Keep this training GPU non-idle for generation benchmark runs.
+
+        When real training is skipped (gen_benchmark_skip_training), this prevents
+        the cluster's idle-GPU reaper from killing the job. Spawns one daemon thread
+        doing a tiny periodic matmul.
 
         The matmul is a purely local op (no collectives), so it cannot desync the
         weight-sync NCCL collectives that still run every step.
