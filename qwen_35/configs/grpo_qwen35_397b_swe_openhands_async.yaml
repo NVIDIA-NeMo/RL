@@ -32,15 +32,22 @@ policy:
     moe_hybridep_num_sms: 32
   generation:
     vllm_cfg:
-      # Qwen 3.5 FLA layernorm currently trips vLLM/TorchDynamo during engine
-      # memory profiling under the compile/CUDA-graph path. Keep this scoped to
-      # the Qwen 3.5 wrapper; other SWE recipes continue to inherit their
-      # original vLLM execution mode.
-      enforce_eager: true
+      # Keep Qwen 3.5 on the CUDA-graph path used by the known-good smoke run.
+      enforce_eager: false
       http_server_serving_chat_kwargs:
         tool_parser: qwen3_xml
         reasoning_parser: qwen3
         reasoning_parser_plugin: null
+    vllm_kwargs:
+      attention_backend: FLASH_ATTN
+      compilation_config:
+        backend: inductor
+        cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 64]
+        pass_config:
+          fuse_norm_quant: false
+          fuse_act_quant: false
+          fuse_attn_quant: false
+          fuse_allreduce_rms: false
 
 # Qwen 3.5 chat-template/token handling used by the qwen_35 overlay.
 env:

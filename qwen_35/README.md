@@ -252,13 +252,6 @@ bash examples/nemo_gym/launch_nemo_gym_multinode_training.sh \
   "policy.generation.vllm_cfg.max_model_len=65536" \
   "policy.max_total_sequence_length=65536" \
   "policy.generation.max_new_tokens=65536" \
-  "+policy.generation.vllm_kwargs.attention_backend=FLASH_ATTN" \
-  "+policy.generation.vllm_kwargs.compilation_config.backend=inductor" \
-  "+policy.generation.vllm_kwargs.compilation_config.cudagraph_capture_sizes=[1,2,4,8,16,32,64]" \
-  "+policy.generation.vllm_kwargs.compilation_config.pass_config.fuse_norm_quant=false" \
-  "+policy.generation.vllm_kwargs.compilation_config.pass_config.fuse_act_quant=false" \
-  "+policy.generation.vllm_kwargs.compilation_config.pass_config.fuse_attn_quant=false" \
-  "+policy.generation.vllm_kwargs.compilation_config.pass_config.fuse_allreduce_rms=false" \
   "data.max_input_seq_length=null" \
   "++data.use_multiple_dataloader=false" \
   "checkpointing.enabled=false" \
