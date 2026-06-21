@@ -296,62 +296,6 @@ def _get_gpu_id_info() -> tuple[int, str, int]:  # pragma: no cover
     return gpu_id, nvlink_domain, topo_rank
 
 
-@ray.remote(num_gpus=1)
-class GetGPUIDActor:  # pragma: no cover
-    """Util actor class to return GPU id of the current worker."""
-
-    def get_gpu_id(self):
-        return ray.get_gpu_ids()[0]
-
-
-def get_reordered_bundle(
-    pg: PlacementGroup,
-) -> tuple[list[int], list[int]]:
-    """Return bundle indices and GPU IDs sorted by (node_id, gpu_id).
-
-    Uses ``GetGPUIDActor`` to discover the physical GPU ID assigned to each
-    bundle.
-
-    Returns:
-        (reordered_bundle_indices, reordered_gpu_ids)
-    """
-    pg_data = placement_group_table(pg)
-    num_bundles = len(pg_data["bundles"])
-    bundle_to_node_ids = pg_data["bundles_to_node_id"]
-
-    info_actors = []
-    for i in range(num_bundles):
-        info_actors.append(
-            GetGPUIDActor.options(
-                num_cpus=0.01,
-                num_gpus=0.01,
-                scheduling_strategy=PlacementGroupSchedulingStrategy(
-                    placement_group=pg,
-                    placement_group_bundle_index=i,
-                ),
-            ).remote()
-        )
-
-    gpu_ids = ray.get([actor.get_gpu_id.remote() for actor in info_actors])
-    for actor in info_actors:
-        ray.kill(actor)
-
-    bundle_infos = [(i, bundle_to_node_ids[i], gpu_ids[i]) for i in range(num_bundles)]
-    sorted_infos = sorted(bundle_infos, key=lambda x: (x[1], x[2]))
-
-    reordered_bundle_indices = [info[0] for info in sorted_infos]
-    reordered_gpu_ids = [gpu_ids[info[0]] for info in sorted_infos]
-
-    for i, info in enumerate(sorted_infos):
-        actual_idx = info[0]
-        logger.info(
-            f"  bundle {i:4}, actual_bundle_index: {actual_idx:4}, "
-            f"node: {info[1]}, gpu: {gpu_ids[actual_idx]}"
-        )
-
-    return reordered_bundle_indices, reordered_gpu_ids
-
-
 class ResourceInsufficientError(Exception):
     """Exception raised when the cluster does not have enough resources to satisfy the requested configuration."""
 
@@ -623,6 +567,39 @@ def _sort_bundle_indices_by_topology(
     return indices
 
 
+def model_parallel_groups_straddling_domains(
+    ordered_bundle_indices: list[int],
+    nvlink_domain_per_bundle_index: tuple[str, ...] | None,
+    group_size: int,
+) -> list[tuple[int, list[str]]]:
+    """Find model-parallel groups whose bundles straddle multiple NVLink domains.
+    Args:
+        ordered_bundle_indices: Topology-sorted bundle indices.
+        nvlink_domain_per_bundle_index: Per-bundle NVLink domain indexed by the bundle index.
+        group_size: Number of bundles (GPUs) per model-parallel group.
+
+    Returns:
+        `(group_index, sorted_domains)` for each straddling group, in order.
+    """
+    straddling: list[tuple[int, list[str]]] = []
+    if group_size <= 0 or nvlink_domain_per_bundle_index is None:
+        return straddling
+    num_groups = len(ordered_bundle_indices) // group_size
+    for group_index in range(num_groups):
+        group = ordered_bundle_indices[
+            group_index * group_size : (group_index + 1) * group_size
+        ]
+        domains: set[str] = set()
+        for bundle_index in group:
+            if 0 <= bundle_index < len(nvlink_domain_per_bundle_index):
+                domain = nvlink_domain_per_bundle_index[bundle_index]
+                if domain != NVLINK_DOMAIN_UNKNOWN:
+                    domains.add(domain)
+        if len(domains) > 1:
+            straddling.append((group_index, sorted(domains)))
+    return straddling
+
+
 class RayVirtualCluster:
     """Creates a virtual distributed cluster using Ray placement groups.
 
@@ -681,6 +658,7 @@ class RayVirtualCluster:
         self._world_size = sum(self._bundle_ct_per_node_list)
         self._node_placement_groups: Optional[list[PlacementGroup]] = None
         self._sorted_bundle_indices: Optional[list[int]] = None
+        self._sorted_gpu_ids: Optional[list[int]] = None
         self._nvlink_domain_per_bundle_index: Optional[tuple[str, ...]] = None
 
         self.num_gpus_per_node = num_gpus_per_node
@@ -932,10 +910,12 @@ class RayVirtualCluster:
 
         if not self.use_gpus:
             self._nvlink_domain_per_bundle_index = None
+            self._sorted_gpu_ids = None
             return None
 
         if len(self._node_placement_groups) != 1:
             self._nvlink_domain_per_bundle_index = None
+            self._sorted_gpu_ids = None
             return None
 
         pg = self._node_placement_groups[0]
@@ -986,6 +966,7 @@ class RayVirtualCluster:
             f"into each domain's node count and that node_resource_constraints are set "
             f"to pin nodes to complete segments before creating this cluster."
         )
+        self._sorted_gpu_ids = [gpu_ids[i] for i in pg_reordered_bundle_indices]
         return pg_reordered_bundle_indices
 
     def shutdown(self) -> bool:
@@ -1007,6 +988,7 @@ class RayVirtualCluster:
             # Reset internal state
             self._node_placement_groups = None
             self._sorted_bundle_indices = None
+            self._sorted_gpu_ids = None
             self._nvlink_domain_per_bundle_index = None
 
         return True

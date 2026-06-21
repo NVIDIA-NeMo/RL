@@ -755,6 +755,8 @@ def setup(
                 MegatronGeneration.init_cluster_placement_groups(
                     inference_cluster, policy_config
                 )
+            elif generation_config["backend"] == "sglang":
+                SGLangGeneration.init_cluster_placement_groups(inference_cluster)
             else:
                 VllmGeneration.init_cluster_placement_groups(
                     inference_cluster, generation_config

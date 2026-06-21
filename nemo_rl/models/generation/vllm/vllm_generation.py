@@ -30,7 +30,10 @@ from ray.util.placement_group import PlacementGroup
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SlicedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
-from nemo_rl.distributed.virtual_cluster import NVLINK_DOMAIN_UNKNOWN, RayVirtualCluster
+from nemo_rl.distributed.virtual_cluster import (
+    RayVirtualCluster,
+    model_parallel_groups_straddling_domains,
+)
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
@@ -381,32 +384,29 @@ class VllmGeneration(GenerationInterface):
                 unique_nodes = sorted(set(bundle_to_node.values()))
                 node_idx = {nid: idx for idx, nid in enumerate(unique_nodes)}
 
+                if sorted_bundle_indices is not None:
+                    for (
+                        group_index,
+                        domains,
+                    ) in model_parallel_groups_straddling_domains(
+                        flat, nvlink_domain_per_bundle_index, model_parallel_size
+                    ):
+                        logger.warning(
+                            "[TOPOLOGY] Model-parallel group %s (TP*PP=%s) spans %s NVLink "
+                            "domains %s; cross-domain collectives may use slower links (e.g. "
+                            "IB). Prefer TP*PP that divides usable GPUs per domain, or adjust "
+                            "segment/domain allocation.",
+                            group_index,
+                            model_parallel_size,
+                            len(domains),
+                            domains,
+                        )
+
                 groups: list[tuple[int, list[int]]] = []
                 for i in range(num_groups):
                     slice_ = flat[
                         i * model_parallel_size : (i + 1) * model_parallel_size
                     ]
-                    if (
-                        nvlink_domain_per_bundle_index is not None
-                        and sorted_bundle_indices is not None
-                    ):
-                        domains: set[str] = set()
-                        for bidx in slice_:
-                            if 0 <= bidx < len(nvlink_domain_per_bundle_index):
-                                d = nvlink_domain_per_bundle_index[bidx]
-                                if d != NVLINK_DOMAIN_UNKNOWN:
-                                    domains.add(d)
-                        if len(domains) > 1:
-                            logger.warning(
-                                "[TOPOLOGY] Model-parallel group %s (TP*PP=%s) spans %s NVLink "
-                                "domains %s; cross-domain collectives may use slower links (e.g. "
-                                "IB). Prefer TP*PP that divides usable GPUs per domain, or adjust "
-                                "segment/domain allocation.",
-                                i,
-                                model_parallel_size,
-                                len(domains),
-                                sorted(domains),
-                            )
                     first_node = bundle_to_node[slice_[0]]
                     groups.append((node_idx[first_node], slice_))
 

@@ -25,7 +25,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.ray_actor_environment_registry import SGLANG_EXECUTABLE
 from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
-    get_reordered_bundle,
+    model_parallel_groups_straddling_domains,
 )
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.interfaces import (
@@ -65,6 +65,15 @@ class SGLangGeneration(GenerationInterface):
     router + [[p, ..., p] [d, ..., d]] or router + [[tp = 2, ... tp = 2], ..., [tp = 8, ..., tp = 8]]
     """
 
+    @staticmethod
+    def init_cluster_placement_groups(cluster: RayVirtualCluster) -> None:
+        """Pre-initialize the placement groups SGLang expects.
+
+        Args:
+            cluster: The inference `RayVirtualCluster`.
+        """
+        cluster._init_placement_groups(strategy="PACK", use_unified_pg=True)
+
     def __init__(
         self,
         cluster: RayVirtualCluster,
@@ -80,9 +89,15 @@ class SGLangGeneration(GenerationInterface):
             use_unified_pg=True,
         )
         self.pg = pgs[0]
-        self.pg_reordered_bundle_indices, self.pg_reordered_gpu_ids = (
-            get_reordered_bundle(self.pg)
+        # Ensure that engine placement is NVLink-aware.
+        sorted_bundle_indices = cluster._sorted_bundle_indices
+        sorted_gpu_ids = cluster._sorted_gpu_ids
+        assert sorted_bundle_indices is not None and sorted_gpu_ids is not None, (
+            "SGLang requires a unified GPU placement group with topology-sorted "
+            "bundles, but the virtual cluster did not produce one."
         )
+        self.pg_reordered_bundle_indices = list(sorted_bundle_indices)
+        self.pg_reordered_gpu_ids = list(sorted_gpu_ids)
         self._http_client = HttpClient(sglang_cfg)
 
         # --- Engine topology (formerly ``ServerGroup``) ------------------
@@ -100,6 +115,24 @@ class SGLangGeneration(GenerationInterface):
         self.gpu_offset: int = 0
         self.needs_offload: bool = sglang_server_cfg["needs_offload"]
         self.model_path: str | None = sglang_cfg["sglang_cfg"]["model_path"]
+
+        # Warn when engine topology inappropriately straddles multiple NVLink domains.
+        straddling_engines = model_parallel_groups_straddling_domains(
+            self.pg_reordered_bundle_indices,
+            cluster._nvlink_domain_per_bundle_index,
+            self.num_gpus_per_engine,
+        )
+        for engine_index, domains in straddling_engines:
+            logger.warning(
+                "[TOPOLOGY] SGLang engine %s (num_gpus_per_engine=%s) spans %s "
+                "NVLink domains %s; cross-domain collectives may use slower links "
+                "(e.g. IB). Prefer num_gpus_per_engine that divides usable GPUs "
+                "per domain, or adjust segment/domain allocation.",
+                engine_index,
+                self.num_gpus_per_engine,
+                len(domains),
+                domains,
+            )
 
         # --- Router bootstrap --------------------------------------------
         # Resolved router endpoint is held only on the instance; we don't
