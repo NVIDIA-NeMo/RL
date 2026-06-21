@@ -207,14 +207,24 @@ def _generation_max_seq_len(generation_config) -> int:
     raise ValueError(f"Unknown generation backend: {backend!r}")
 
 
+def _clamp_max_num_steps(
+    master_config: MasterConfig, dataloader: StatefulDataLoader
+) -> None:
+    """Clamp grpo.max_num_steps to max_num_epochs * len(dataloader)."""
+    grpo_config = master_config.grpo
+    max_num_epochs = grpo_config.get("max_num_epochs")
+    if max_num_epochs is None:
+        return
+    grpo_config["max_num_steps"] = min(
+        grpo_config["max_num_steps"],
+        max_num_epochs * len(dataloader),
+    )
+
+
 def _maybe_inject_megatron_train_iters(
     master_config: MasterConfig, dataloader: StatefulDataLoader
 ) -> None:
-    """Mirror grpo_sync's train_iters formula for the Megatron backend.
-
-    Megatron's LR scheduler reads train_iters at TQPolicy.__init__, so
-    this must run before _build_trainer.
-    """
+    """Set megatron_cfg.train_iters; must run before _build_trainer."""
     policy_config = master_config.policy
     if not policy_config.get("megatron_cfg", {}).get("enabled", False):
         return
@@ -280,6 +290,7 @@ def setup_single_controller(
         num_workers=data_config["num_workers"],
     )
 
+    _clamp_max_num_steps(master_config, dataloader)
     _maybe_inject_megatron_train_iters(master_config, dataloader)
 
     # ==========================

@@ -258,7 +258,6 @@ class SingleControllerActor:
                 self._inflight_rollouts -= 1
                 sem.release()
 
-        # TODO: limit max_train_steps to max_num_epochs * len(dataloader) when setup
         max_epochs = self._master_config.grpo["max_num_epochs"]
         epoch = 0
         while max_epochs is None or epoch < max_epochs:
