@@ -1,0 +1,697 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_PATH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -n "${NEMO_RL_DIR:-}" ]]; then
+  SCRIPT_DIR="${NEMO_RL_DIR}"
+elif [[ -f "${SCRIPT_PATH_DIR}/../../examples/run_grpo.py" ]]; then
+  SCRIPT_DIR="$(cd "${SCRIPT_PATH_DIR}/../.." && pwd)"
+elif [[ -f "${SCRIPT_PATH_DIR}/examples/run_grpo.py" ]]; then
+  SCRIPT_DIR="${SCRIPT_PATH_DIR}"
+else
+  echo "ERROR: set NEMO_RL_DIR to a NeMo-RL checkout with examples/run_grpo.py" >&2
+  exit 2
+fi
+
+MODEL_LABEL="${MODEL_LABEL:?MODEL_LABEL is required}"
+CONFIG_FILE="${CONFIG_FILE:?CONFIG_FILE is required}"
+TARGET_MODEL_ID="${TARGET_MODEL_ID:?TARGET_MODEL_ID is required}"
+DRAFT_MODEL="${DRAFT_MODEL:-}"
+TOKENIZER_NAME="${TOKENIZER_NAME:-${TARGET_MODEL_ID}}"
+NRL_MEGATRON_TOKENIZER_MODEL="${NRL_MEGATRON_TOKENIZER_MODEL:-${TOKENIZER_NAME}}"
+
+NUM_NODES="${NUM_NODES:-4}"
+GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
+PARTITION="${PARTITION:-batch}"
+ACCOUNT="${ACCOUNT:-coreai_dlalgo_nemorl}"
+if [[ -z "${GRES_FLAG+x}" ]]; then
+  case "${PARTITION}" in
+    gb200*|gb300*)
+      GRES_FLAG=""
+      ;;
+    *)
+      GRES_FLAG="--gres=gpu:${GPUS_PER_NODE}"
+      ;;
+  esac
+fi
+if [[ -z "${SEGMENT+x}" ]]; then
+  SEGMENT="${NUM_NODES}"
+fi
+CPUS_PER_WORKER="${CPUS_PER_WORKER:-$((GPUS_PER_NODE * 16))}"
+SBATCH_RESOURCE_ARGS="${SBATCH_RESOURCE_ARGS:---ntasks-per-node=1 --cpus-per-task=${CPUS_PER_WORKER} --mem=0}"
+SBATCH_EXTRA_ARGS="${SBATCH_EXTRA_ARGS:-}"
+BASE_LOG_DIR="${BASE_LOG_DIR:-${SCRIPT_DIR}}"
+RUN_CACHE_ROOT="${RUN_CACHE_ROOT:-${BASE_LOG_DIR}/cache}"
+NODE_LOCAL_CACHE_ROOT="${NODE_LOCAL_CACHE_ROOT:-/tmp/${USER:-sna}/nemorl_${MODEL_LABEL}}"
+# Keep this empty by default. The nightly container's /opt/nemo_rl_venv has
+# symlinks into /root/.cache/uv/archive-v0; mounting a fresh host cache over
+# /root/.cache/uv breaks packages such as transformers before uv run starts.
+UV_CACHE_DIR_OVERRIDE="${UV_CACHE_DIR_OVERRIDE:-}"
+PIP_CACHE_DIR="${PIP_CACHE_DIR:-${RUN_CACHE_ROOT}/pip}"
+TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-${NODE_LOCAL_CACHE_ROOT}/torch_extensions}"
+XDG_CACHE_HOME="${XDG_CACHE_HOME:-${NODE_LOCAL_CACHE_ROOT}/xdg}"
+VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-${NODE_LOCAL_CACHE_ROOT}/vllm}"
+FLASHINFER_CACHE_DIR="${FLASHINFER_CACHE_DIR:-${NODE_LOCAL_CACHE_ROOT}/flashinfer}"
+TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${NODE_LOCAL_CACHE_ROOT}/triton}"
+TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-${NODE_LOCAL_CACHE_ROOT}/torchinductor}"
+CUDA_CACHE_PATH="${CUDA_CACHE_PATH:-${NODE_LOCAL_CACHE_ROOT}/cuda}"
+PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-${NODE_LOCAL_CACHE_ROOT}/pycache}"
+PYTHONDONTWRITEBYTECODE="${PYTHONDONTWRITEBYTECODE:-1}"
+MEGATRON_DATASET_HELPERS_BUILD_DIR="${MEGATRON_DATASET_HELPERS_BUILD_DIR:-${NODE_LOCAL_CACHE_ROOT}/megatron_dataset_helpers}"
+NODE_LOCAL_SETUP_COMMAND="mkdir -p ${TORCH_EXTENSIONS_DIR} ${XDG_CACHE_HOME} ${VLLM_CACHE_ROOT} ${FLASHINFER_CACHE_DIR} ${TRITON_CACHE_DIR} ${TORCHINDUCTOR_CACHE_DIR} ${CUDA_CACHE_PATH} ${PYTHONPYCACHEPREFIX} ${MEGATRON_DATASET_HELPERS_BUILD_DIR}"
+if [[ -z "${SETUP_COMMAND:-}" ]]; then
+  SETUP_COMMAND="${NODE_LOCAL_SETUP_COMMAND}"
+else
+  SETUP_COMMAND="${SETUP_COMMAND}; ${NODE_LOCAL_SETUP_COMMAND}"
+fi
+SBATCH_SEGMENT_ARGS=()
+if [[ -n "${SEGMENT}" ]]; then
+  SBATCH_SEGMENT_ARGS=(--segment "${SEGMENT}")
+fi
+DRY_RUN="${DRY_RUN:-false}"
+CONTAINER="${CONTAINER:-${SCRIPT_DIR}/nemo_rl_nightly.sqsh}"
+HF_HOME="${HF_HOME:-/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/hf_home}"
+HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/cache}"
+MOUNTS="${MOUNTS:-/lustre:/lustre}"
+WANDB_PROJECT="${WANDB_PROJECT:-sync-grpo-gb200_oci-benchmark}"
+WANDB_ENABLED="${WANDB_ENABLED:-true}"
+UV_PYTHON="${UV_PYTHON:-3.13.13}"
+UV_LOCK_MODE="${UV_LOCK_MODE:-}"
+USE_SYSTEM_ENV="${USE_SYSTEM_ENV:-true}"
+USE_UV_RUN="${USE_UV_RUN:-false}"
+PYTHON_RUNNER_OVERRIDE="${PYTHON_RUNNER_OVERRIDE:-}"
+RAY_VERSION="${RAY_VERSION:-2.49.2}"
+RAY_PYTHON_VERSION="${RAY_PYTHON_VERSION:-}"
+RAY_PYTHON_SPEC="${RAY_PYTHON_SPEC:-${RAY_PYTHON_VERSION}}"
+RAY_USE_EXISTING_ENV="${RAY_USE_EXISTING_ENV:-true}"
+CONTAINER_REMAP_ROOT="${CONTAINER_REMAP_ROOT:-false}"
+NEMO_RL_VENV_DIR="${NEMO_RL_VENV_DIR:-}"
+RAY_CGRAPH_GET_TIMEOUT="${RAY_CGRAPH_GET_TIMEOUT:-7200}"
+DRIVER_UV_PROJECT_ENVIRONMENT="${DRIVER_UV_PROJECT_ENVIRONMENT:-${SCRIPT_DIR}/.driver_venvs/${MODEL_LABEL}_online_draft_py312}"
+NRL_FORCE_REBUILD_VENVS="${NRL_FORCE_REBUILD_VENVS:-false}"
+NRL_FORCE_REBUILD_ACTOR_VENVS="${NRL_FORCE_REBUILD_ACTOR_VENVS:-false}"
+NRL_ACTOR_VENV_CACHE_SUFFIX="${NRL_ACTOR_VENV_CACHE_SUFFIX:-}"
+NRL_ACTOR_UV_LOCK_MODE="${NRL_ACTOR_UV_LOCK_MODE:---locked}"
+NRL_SERIALIZE_ACTOR_VENV_CREATION="${NRL_SERIALIZE_ACTOR_VENV_CREATION:-false}"
+NRL_FORCE_LOCAL_TRANSFORMER_SPEC="${NRL_FORCE_LOCAL_TRANSFORMER_SPEC:-false}"
+NRL_FORCE_DRAFT_TORCH_RMSNORM="${NRL_FORCE_DRAFT_TORCH_RMSNORM:-false}"
+DRIVER_SRUN_CPUS_PER_TASK="${DRIVER_SRUN_CPUS_PER_TASK:-8}"
+DRIVER_SRUN_MEM="${DRIVER_SRUN_MEM:-128G}"
+MAX_JOBS="${MAX_JOBS:-4}"
+CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-4}"
+NVTE_BUILD_MAX_JOBS="${NVTE_BUILD_MAX_JOBS:-4}"
+NINJAFLAGS="${NINJAFLAGS:--j4}"
+MAKEFLAGS="${MAKEFLAGS:--j4}"
+NRL_MEGATRON_CHECKPOINT_DIR="${NRL_MEGATRON_CHECKPOINT_DIR:-${SCRIPT_DIR}/nrl_megatron_ckpts_online_draft_${MODEL_LABEL}}"
+NRL_MEGATRON_NCCL_TIMEOUT_SECONDS="${NRL_MEGATRON_NCCL_TIMEOUT_SECONDS:-1800}"
+FORCE_RECONVERT_FROM_HF="${FORCE_RECONVERT_FROM_HF:-false}"
+SOURCE_VLLM_SITE="${SOURCE_VLLM_SITE:-}"
+ARCTIC_SITE="${ARCTIC_SITE:-}"
+PARD2_OFFICIAL_VLLM_PATCH_DIR="${PARD2_OFFICIAL_VLLM_PATCH_DIR:-}"
+PARD2_OFFICIAL_VLLM_SITE="${PARD2_OFFICIAL_VLLM_SITE:-${SCRIPT_DIR}/.container_cache/vllm_pard2_official_target_feat}"
+PARD2_VLLM_PATCH_PYTHON="${PARD2_VLLM_PATCH_PYTHON:-}"
+PARD2_VLLM_SOURCE_SITE="${PARD2_VLLM_SOURCE_SITE:-}"
+
+validate_arctic_site() {
+  local site="$1"
+  if [[ -z "${site}" ]]; then
+    echo "ERROR: DRAFT_FORMAT=suffix requires SOURCE_VLLM_SITE or ARCTIC_SITE pointing at arctic-inference" >&2
+    exit 2
+  fi
+  if [[ ! -d "${site}/arctic_inference/suffix_decoding" ]]; then
+    echo "ERROR: arctic-inference suffix module not found under: ${site}" >&2
+    echo "Expected: ${site}/arctic_inference/suffix_decoding" >&2
+    exit 2
+  fi
+}
+
+DRAFT_FORMAT="${DRAFT_FORMAT:-auto}"
+if [[ "${DRAFT_FORMAT}" == "pard" && -z "${SPECDEC_METHOD:-}" ]]; then
+  SPECDEC_METHOD="draft_model"
+elif [[ "${DRAFT_FORMAT}" == "pard2" && -z "${SPECDEC_METHOD:-}" ]]; then
+  SPECDEC_METHOD="pard2"
+elif [[ "${DRAFT_FORMAT}" == "suffix" && -z "${SPECDEC_METHOD:-}" ]]; then
+  SPECDEC_METHOD="suffix"
+elif [[ ("${DRAFT_FORMAT}" == "ngram" || "${DRAFT_FORMAT}" == "pld") && -z "${SPECDEC_METHOD:-}" ]]; then
+  SPECDEC_METHOD="ngram"
+fi
+SPECDEC_METHOD="${SPECDEC_METHOD:-eagle3}"
+NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-1}"
+DRAFT_TP="${DRAFT_TP:-1}"
+INCLUDE_DRAFT_TP="${INCLUDE_DRAFT_TP:-true}"
+if [[ -z "${SPECDEC_PARALLEL_DRAFTING+x}" ]]; then
+  if [[ "${DRAFT_FORMAT}" == "pard" || "${DRAFT_FORMAT}" == "pard2" ]]; then
+    SPECDEC_PARALLEL_DRAFTING="true"
+  else
+    SPECDEC_PARALLEL_DRAFTING="false"
+  fi
+fi
+PROMPT_LOOKUP_MAX="${PROMPT_LOOKUP_MAX:-}"
+PROMPT_LOOKUP_MIN="${PROMPT_LOOKUP_MIN:-}"
+SUFFIX_DECODING_MAX_TREE_DEPTH="${SUFFIX_DECODING_MAX_TREE_DEPTH:-}"
+SUFFIX_DECODING_MAX_CACHED_REQUESTS="${SUFFIX_DECODING_MAX_CACHED_REQUESTS:-}"
+SUFFIX_DECODING_MAX_SPEC_FACTOR="${SUFFIX_DECODING_MAX_SPEC_FACTOR:-}"
+SUFFIX_DECODING_MIN_TOKEN_PROB="${SUFFIX_DECODING_MIN_TOKEN_PROB:-}"
+DRAFT_LOSS_WEIGHT="${DRAFT_LOSS_WEIGHT:-1.0}"
+POLICY_DRAFT_ENABLED="${POLICY_DRAFT_ENABLED:-true}"
+POLICY_DRAFT_TYPE="${POLICY_DRAFT_TYPE:-eagle3}"
+POLICY_DRAFT_PP="${POLICY_DRAFT_PP:-1}"
+POLICY_DRAFT_LOSS_PROVIDED="true"
+if [[ -z "${POLICY_DRAFT_LOSS+x}" ]]; then
+  POLICY_DRAFT_LOSS_PROVIDED="false"
+  if [[ "${POLICY_DRAFT_TYPE}" == "pard2" ]]; then
+    POLICY_DRAFT_LOSS="pard2"
+  else
+    POLICY_DRAFT_LOSS="hard_ce"
+  fi
+fi
+POLICY_DRAFT_CAT_WEIGHTING_PROVIDED="true"
+if [[ -z "${POLICY_DRAFT_CAT_WEIGHTING+x}" ]]; then
+  POLICY_DRAFT_CAT_WEIGHTING_PROVIDED="false"
+  if [[ "${POLICY_DRAFT_LOSS}" == "pard2" || "${POLICY_DRAFT_LOSS}" == "pard2_cat" ]]; then
+    POLICY_DRAFT_CAT_WEIGHTING="true"
+  else
+    POLICY_DRAFT_CAT_WEIGHTING="false"
+  fi
+fi
+POLICY_DRAFT_CAT_MODE="${POLICY_DRAFT_CAT_MODE:-prefix_product}"
+POLICY_DRAFT_CAT_LOGPROB_KEY="${POLICY_DRAFT_CAT_LOGPROB_KEY:-prev_logprobs}"
+POLICY_DRAFT_DROP_TOKEN_RATIO="${POLICY_DRAFT_DROP_TOKEN_RATIO:-0.0}"
+POLICY_DRAFT_NORMALIZE_LOSS_BY_DRAFT_TOKENS="${POLICY_DRAFT_NORMALIZE_LOSS_BY_DRAFT_TOKENS:-true}"
+POLICY_DRAFT_MAX_TRAINING_SEQUENCE_LENGTH="${POLICY_DRAFT_MAX_TRAINING_SEQUENCE_LENGTH:-0}"
+POLICY_DRAFT_TRAINING_WINDOW="${POLICY_DRAFT_TRAINING_WINDOW:-tail}"
+POLICY_DRAFT_TRAIN_INTERVAL="${POLICY_DRAFT_TRAIN_INTERVAL:-1}"
+POLICY_DRAFT_REFIT_INTERVAL="${POLICY_DRAFT_REFIT_INTERVAL:-${POLICY_DRAFT_TRAIN_INTERVAL}}"
+POLICY_DRAFT_TRAIN_START_STEP="${POLICY_DRAFT_TRAIN_START_STEP:-1}"
+POLICY_DRAFT_REFIT_START_STEP="${POLICY_DRAFT_REFIT_START_STEP:-${POLICY_DRAFT_TRAIN_START_STEP}}"
+POLICY_DRAFT_ALLOW_GENERIC_PARD2_FALLBACK="${POLICY_DRAFT_ALLOW_GENERIC_PARD2_FALLBACK:-false}"
+PARD_ONLINE_TRAINING="${PARD_ONLINE_TRAINING:-false}"
+PARD_TRAINING_MODE="${PARD_TRAINING_MODE:-sequential}"
+ENABLE_VLLM_SPECDEC="${ENABLE_VLLM_SPECDEC:-true}"
+GATE_MODE="${GATE_MODE:-always}"
+GATE_BATCH_SIZE="${GATE_BATCH_SIZE:-8}"
+GATE_TOKEN_THRESHOLD="${GATE_TOKEN_THRESHOLD:-0}"
+GATE_LOG_INTERVAL="${GATE_LOG_INTERVAL:-64}"
+VLLM_SPECDEC_DYNAMIC_DRAFT_TOKENS="${VLLM_SPECDEC_DYNAMIC_DRAFT_TOKENS:-false}"
+VLLM_SPECDEC_DYNAMIC_DRAFT_SMALL_REQUEST_THRESHOLD="${VLLM_SPECDEC_DYNAMIC_DRAFT_SMALL_REQUEST_THRESHOLD:-0}"
+VLLM_SPECDEC_DYNAMIC_DRAFT_MEDIUM_REQUEST_THRESHOLD="${VLLM_SPECDEC_DYNAMIC_DRAFT_MEDIUM_REQUEST_THRESHOLD:-0}"
+VLLM_SPECDEC_DYNAMIC_DRAFT_SMALL_TOKEN_THRESHOLD="${VLLM_SPECDEC_DYNAMIC_DRAFT_SMALL_TOKEN_THRESHOLD:-0}"
+VLLM_SPECDEC_DYNAMIC_DRAFT_MEDIUM_TOKEN_THRESHOLD="${VLLM_SPECDEC_DYNAMIC_DRAFT_MEDIUM_TOKEN_THRESHOLD:-0}"
+VLLM_SPECDEC_DYNAMIC_DRAFT_SMALL_TOKENS="${VLLM_SPECDEC_DYNAMIC_DRAFT_SMALL_TOKENS:-}"
+VLLM_SPECDEC_DYNAMIC_DRAFT_MEDIUM_TOKENS="${VLLM_SPECDEC_DYNAMIC_DRAFT_MEDIUM_TOKENS:-}"
+VLLM_SPECDEC_DYNAMIC_DRAFT_LARGE_TOKENS="${VLLM_SPECDEC_DYNAMIC_DRAFT_LARGE_TOKENS:-}"
+VLLM_PRECISION="${VLLM_PRECISION:-bfloat16}"
+VLLM_KV_CACHE_DTYPE="${VLLM_KV_CACHE_DTYPE:-auto}"
+VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-TRITON_ATTN}"
+VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-false}"
+PRESERVE_RECIPE_ASYNC="${PRESERVE_RECIPE_ASYNC:-false}"
+PRESERVE_RECIPE_SEQUENCE_PACKING="${PRESERVE_RECIPE_SEQUENCE_PACKING:-false}"
+NRL_VLLM_OMIT_GENERATION_LOGPROBS="${NRL_VLLM_OMIT_GENERATION_LOGPROBS:-true}"
+NRL_VLLM_DISABLE_LOG_STATS="${NRL_VLLM_DISABLE_LOG_STATS:-false}"
+NRL_VLLM_GENERATION_MIN_TOKENS="${NRL_VLLM_GENERATION_MIN_TOKENS:-}"
+NRL_VLLM_GENERATION_IGNORE_EOS="${NRL_VLLM_GENERATION_IGNORE_EOS:-}"
+NRL_VLLM_GENERATION_DISABLE_STOP_STRINGS="${NRL_VLLM_GENERATION_DISABLE_STOP_STRINGS:-}"
+NRL_VLLM_GENERATION_DISABLE_STOP_TOKEN_IDS="${NRL_VLLM_GENERATION_DISABLE_STOP_TOKEN_IDS:-}"
+NRL_STOP_AFTER_GENERATION="${NRL_STOP_AFTER_GENERATION:-false}"
+NRL_STOP_AFTER_GENERATION_AFTER_STEP="${NRL_STOP_AFTER_GENERATION_AFTER_STEP:-}"
+NRL_ALLOW_SPECDEC_LOGPROB_REPAIR_WITH_SAMPLER_MISMATCH="${NRL_ALLOW_SPECDEC_LOGPROB_REPAIR_WITH_SAMPLER_MISMATCH:-false}"
+NRL_ALLOW_SPECDEC_WITHOUT_BEHAVIOR_LOGPROBS="${NRL_ALLOW_SPECDEC_WITHOUT_BEHAVIOR_LOGPROBS:-false}"
+NRL_VLLM_SPECDEC_REQUEST_LOGPROBS="${NRL_VLLM_SPECDEC_REQUEST_LOGPROBS:-false}"
+NRL_ALLOW_SPECDEC_REQUEST_LOGPROBS="${NRL_ALLOW_SPECDEC_REQUEST_LOGPROBS:-false}"
+NRL_DEBUG_DRAFT_REFIT="${NRL_DEBUG_DRAFT_REFIT:-false}"
+VLLM_RAY_EXTRA_ENV_VARS_TO_COPY="${VLLM_RAY_EXTRA_ENV_VARS_TO_COPY:-}"
+CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
+CUDA_DEVICE_MAX_CONNECTIONS_ENV_ASSIGNMENT=""
+if [[ -n "${CUDA_DEVICE_MAX_CONNECTIONS}" ]]; then
+  CUDA_DEVICE_MAX_CONNECTIONS_ENV_ASSIGNMENT="CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS}"
+  case ",${VLLM_RAY_EXTRA_ENV_VARS_TO_COPY}," in
+    *,CUDA_DEVICE_MAX_CONNECTIONS,*) ;;
+    ,) VLLM_RAY_EXTRA_ENV_VARS_TO_COPY="CUDA_DEVICE_MAX_CONNECTIONS" ;;
+    *) VLLM_RAY_EXTRA_ENV_VARS_TO_COPY="${VLLM_RAY_EXTRA_ENV_VARS_TO_COPY},CUDA_DEVICE_MAX_CONNECTIONS" ;;
+  esac
+fi
+LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+NUM_PROMPTS="${NUM_PROMPTS:-64}"
+NUM_GENERATIONS="${NUM_GENERATIONS:-32}"
+TRAIN_GLOBAL_BATCH_SIZE="${TRAIN_GLOBAL_BATCH_SIZE:-$((NUM_PROMPTS * NUM_GENERATIONS))}"
+MAX_STEPS="${MAX_STEPS:-20}"
+WALLTIME="${WALLTIME:-04:00:00}"
+JOB_TAG="${JOB_TAG:-${MODEL_LABEL}-online-draft-k${NUM_SPECULATIVE_TOKENS}-${GATE_MODE}}"
+WANDB_NAME="${WANDB_NAME:-${MODEL_LABEL}_online_draft_k${NUM_SPECULATIVE_TOKENS}_${GATE_MODE}_${MAX_STEPS}step}"
+ONLINE_EXTRA_OVERRIDES="${ONLINE_EXTRA_OVERRIDES:-${EXTRA_OVERRIDES:-}}"
+RUNTIME_SPECDEC_GATE_ENABLED="false"
+RUNTIME_SPECDEC_GATE_BATCH_SIZE="0"
+RUNTIME_SPECDEC_GATE_TOKEN_THRESHOLD="0"
+SPECDEC_OVERRIDES=""
+
+case "${DRAFT_FORMAT}" in
+  auto)
+    if [[ "${SPECDEC_METHOD}" == "draft_model" ]] &&
+       [[ "${POLICY_DRAFT_ENABLED}" == "true" || "${POLICY_DRAFT_ENABLED}" == "True" ]]; then
+      echo "ERROR: SPECDEC_METHOD=draft_model is a static vLLM draft-model/PARD path." >&2
+      echo "Set DRAFT_FORMAT=pard or POLICY_DRAFT_ENABLED=false to avoid building the EAGLE online draft module." >&2
+      exit 2
+    fi
+    ;;
+  eagle3)
+    if [[ "${SPECDEC_METHOD}" != "eagle3" ]]; then
+      echo "ERROR: DRAFT_FORMAT=eagle3 requires SPECDEC_METHOD=eagle3, got ${SPECDEC_METHOD}" >&2
+      exit 2
+    fi
+    if [[ -z "${DRAFT_MODEL}" ]]; then
+      echo "ERROR: DRAFT_FORMAT=eagle3 requires DRAFT_MODEL" >&2
+      exit 2
+    fi
+    ;;
+  pard|pard2)
+    expected_specdec_method="draft_model"
+    if [[ "${DRAFT_FORMAT}" == "pard2" ]]; then
+      expected_specdec_method="pard2"
+    fi
+    if [[ "${SPECDEC_METHOD}" != "${expected_specdec_method}" ]]; then
+      echo "ERROR: DRAFT_FORMAT=${DRAFT_FORMAT} requires SPECDEC_METHOD=${expected_specdec_method}, got ${SPECDEC_METHOD}" >&2
+      exit 2
+    fi
+    if [[ -z "${DRAFT_MODEL}" ]]; then
+      echo "ERROR: DRAFT_FORMAT=${DRAFT_FORMAT} requires DRAFT_MODEL" >&2
+      exit 2
+    fi
+    if [[ "${DRAFT_FORMAT}" == "pard2" ]]; then
+      if [[ -z "${SOURCE_VLLM_SITE}" && -n "${PARD2_OFFICIAL_VLLM_PATCH_DIR}" ]]; then
+        SOURCE_VLLM_SITE="${PARD2_OFFICIAL_VLLM_SITE}"
+      fi
+      if [[ -z "${SOURCE_VLLM_SITE}" ]]; then
+        echo "ERROR: DRAFT_FORMAT=pard2 requires SOURCE_VLLM_SITE with official PARD-2 vLLM support or PARD2_OFFICIAL_VLLM_PATCH_DIR to build one." >&2
+        exit 2
+      fi
+    fi
+    if [[ "${POLICY_DRAFT_ENABLED}" == "true" || "${POLICY_DRAFT_ENABLED}" == "True" ]]; then
+      if [[ "${PARD_ONLINE_TRAINING}" == "true" || "${PARD_ONLINE_TRAINING}" == "True" || "${POLICY_DRAFT_TYPE}" == "pard" || "${POLICY_DRAFT_TYPE}" == "pard2" ]]; then
+        if [[ "${POLICY_DRAFT_TYPE}" != "pard" && "${POLICY_DRAFT_TYPE}" != "pard2" ]]; then
+          POLICY_DRAFT_TYPE="${DRAFT_FORMAT}"
+        fi
+        if [[ "${POLICY_DRAFT_LOSS_PROVIDED}" == "false" ]]; then
+          if [[ "${POLICY_DRAFT_TYPE}" == "pard2" ]]; then
+            POLICY_DRAFT_LOSS="pard2"
+          else
+            POLICY_DRAFT_LOSS="hard_ce"
+          fi
+        fi
+        if [[ "${POLICY_DRAFT_CAT_WEIGHTING_PROVIDED}" == "false" ]]; then
+          if [[ "${POLICY_DRAFT_LOSS}" == "pard2" || "${POLICY_DRAFT_LOSS}" == "pard2_cat" ]]; then
+            POLICY_DRAFT_CAT_WEIGHTING="true"
+          else
+            POLICY_DRAFT_CAT_WEIGHTING="false"
+          fi
+        fi
+        if [[ "${PARD_TRAINING_MODE}" == "k_slot" ]]; then
+          if ! [[ "${POLICY_DRAFT_MAX_TRAINING_SEQUENCE_LENGTH}" =~ ^[0-9]+$ ]] || (( POLICY_DRAFT_MAX_TRAINING_SEQUENCE_LENGTH <= 0 )); then
+            echo "ERROR: PARD/PARD2 k_slot online training requires POLICY_DRAFT_MAX_TRAINING_SEQUENCE_LENGTH>0." >&2
+            echo "The k_slot path expands the draft sequence by K and uses a dense draft attention mask; uncapped full sequence training can OOM." >&2
+            exit 2
+          fi
+        fi
+        echo "INFO: DRAFT_FORMAT=${DRAFT_FORMAT} with online PARD draft training enabled."
+      else
+        echo "INFO: DRAFT_FORMAT=${DRAFT_FORMAT} uses vLLM static draft weights; disabling policy.draft online EAGLE module."
+        POLICY_DRAFT_ENABLED=false
+      fi
+    fi
+    ;;
+  suffix)
+    if [[ "${SPECDEC_METHOD}" != "suffix" ]]; then
+      echo "ERROR: DRAFT_FORMAT=suffix requires SPECDEC_METHOD=suffix, got ${SPECDEC_METHOD}" >&2
+      exit 2
+    fi
+    if [[ -z "${SOURCE_VLLM_SITE}" ]]; then
+      if [[ -n "${ARCTIC_SITE}" ]]; then
+        SOURCE_VLLM_SITE="${ARCTIC_SITE}"
+      elif [[ -d "${SCRIPT_DIR}/.container_cache/arctic-inference-0.1.1-py313" ]]; then
+        SOURCE_VLLM_SITE="${SCRIPT_DIR}/.container_cache/arctic-inference-0.1.1-py313"
+      fi
+    fi
+    validate_arctic_site "${SOURCE_VLLM_SITE}"
+    echo "INFO: DRAFT_FORMAT=suffix uses vLLM model-free suffix speculative decoding; disabling policy.draft."
+    POLICY_DRAFT_ENABLED=false
+    SPECDEC_PARALLEL_DRAFTING=false
+    INCLUDE_DRAFT_TP=false
+    DRAFT_MODEL="${DRAFT_MODEL:-${TARGET_MODEL_ID}}"
+    ;;
+  ngram|pld)
+    if [[ "${SPECDEC_METHOD}" != "ngram" ]]; then
+      echo "ERROR: DRAFT_FORMAT=${DRAFT_FORMAT} requires SPECDEC_METHOD=ngram, got ${SPECDEC_METHOD}" >&2
+      exit 2
+    fi
+    echo "INFO: DRAFT_FORMAT=${DRAFT_FORMAT} uses vLLM model-free ngram/PLD speculative decoding; disabling policy.draft."
+    POLICY_DRAFT_ENABLED=false
+    SPECDEC_PARALLEL_DRAFTING=false
+    INCLUDE_DRAFT_TP=false
+    DRAFT_MODEL="${DRAFT_MODEL:-${TARGET_MODEL_ID}}"
+    ;;
+  *)
+    echo "ERROR: DRAFT_FORMAT must be auto, eagle3, pard, pard2, suffix, ngram, or pld; got ${DRAFT_FORMAT}" >&2
+    exit 2
+    ;;
+esac
+
+case "${GATE_MODE}" in
+  always)
+    ;;
+  gated)
+    RUNTIME_SPECDEC_GATE_ENABLED="true"
+    RUNTIME_SPECDEC_GATE_BATCH_SIZE="${GATE_BATCH_SIZE}"
+    RUNTIME_SPECDEC_GATE_TOKEN_THRESHOLD="${GATE_TOKEN_THRESHOLD}"
+    ;;
+  *)
+    echo "ERROR: GATE_MODE must be always or gated, got ${GATE_MODE}" >&2
+    exit 2
+    ;;
+esac
+
+if [[ "${ENABLE_VLLM_SPECDEC}" == "true" || "${ENABLE_VLLM_SPECDEC}" == "True" ]]; then
+  SPECDEC_OVERRIDES="++policy.generation.vllm_kwargs.speculative_config.method=${SPECDEC_METHOD} \
+++policy.generation.vllm_kwargs.speculative_config.num_speculative_tokens=${NUM_SPECULATIVE_TOKENS}"
+  case "${SPECDEC_METHOD}" in
+    draft_model|eagle3|pard2)
+      if [[ -z "${DRAFT_MODEL}" ]]; then
+        echo "ERROR: SPECDEC_METHOD=${SPECDEC_METHOD} requires DRAFT_MODEL" >&2
+        exit 2
+      fi
+      SPECDEC_OVERRIDES="${SPECDEC_OVERRIDES} ++policy.generation.vllm_kwargs.speculative_config.model=${DRAFT_MODEL}"
+      if [[ "${INCLUDE_DRAFT_TP}" == "true" || "${INCLUDE_DRAFT_TP}" == "True" ]]; then
+        SPECDEC_OVERRIDES="${SPECDEC_OVERRIDES} ++policy.generation.vllm_kwargs.speculative_config.draft_tensor_parallel_size=${DRAFT_TP}"
+      fi
+      if [[ "${SPECDEC_PARALLEL_DRAFTING}" == "true" || "${SPECDEC_PARALLEL_DRAFTING}" == "True" ]]; then
+        SPECDEC_OVERRIDES="${SPECDEC_OVERRIDES} ++policy.generation.vllm_kwargs.speculative_config.parallel_drafting=true"
+      fi
+      ;;
+    suffix)
+      if [[ -n "${SUFFIX_DECODING_MAX_TREE_DEPTH}" ]]; then
+        SPECDEC_OVERRIDES="${SPECDEC_OVERRIDES} ++policy.generation.vllm_kwargs.speculative_config.suffix_decoding_max_tree_depth=${SUFFIX_DECODING_MAX_TREE_DEPTH}"
+      fi
+      if [[ -n "${SUFFIX_DECODING_MAX_CACHED_REQUESTS}" ]]; then
+        SPECDEC_OVERRIDES="${SPECDEC_OVERRIDES} ++policy.generation.vllm_kwargs.speculative_config.suffix_decoding_max_cached_requests=${SUFFIX_DECODING_MAX_CACHED_REQUESTS}"
+      fi
+      if [[ -n "${SUFFIX_DECODING_MAX_SPEC_FACTOR}" ]]; then
+        SPECDEC_OVERRIDES="${SPECDEC_OVERRIDES} ++policy.generation.vllm_kwargs.speculative_config.suffix_decoding_max_spec_factor=${SUFFIX_DECODING_MAX_SPEC_FACTOR}"
+      fi
+      if [[ -n "${SUFFIX_DECODING_MIN_TOKEN_PROB}" ]]; then
+        SPECDEC_OVERRIDES="${SPECDEC_OVERRIDES} ++policy.generation.vllm_kwargs.speculative_config.suffix_decoding_min_token_prob=${SUFFIX_DECODING_MIN_TOKEN_PROB}"
+      fi
+      ;;
+    ngram)
+      if [[ -n "${PROMPT_LOOKUP_MAX}" ]]; then
+        SPECDEC_OVERRIDES="${SPECDEC_OVERRIDES} ++policy.generation.vllm_kwargs.speculative_config.prompt_lookup_max=${PROMPT_LOOKUP_MAX}"
+      fi
+      if [[ -n "${PROMPT_LOOKUP_MIN}" ]]; then
+        SPECDEC_OVERRIDES="${SPECDEC_OVERRIDES} ++policy.generation.vllm_kwargs.speculative_config.prompt_lookup_min=${PROMPT_LOOKUP_MIN}"
+      fi
+      ;;
+    *)
+      echo "ERROR: Unsupported SPECDEC_METHOD=${SPECDEC_METHOD}" >&2
+      exit 2
+      ;;
+  esac
+fi
+
+if [[ ! -s "${CONTAINER}" ]]; then
+  echo "ERROR: container not found: ${CONTAINER}" >&2
+  exit 2
+fi
+if [[ ! -s "${SCRIPT_DIR}/ray.sub" ]]; then
+  echo "ERROR: ray.sub not found: ${SCRIPT_DIR}/ray.sub" >&2
+  exit 2
+fi
+if [[ "${POLICY_DRAFT_ENABLED}" == "true" || "${POLICY_DRAFT_ENABLED}" == "True" ]]; then
+  if [[ -z "${DRAFT_MODEL}" ]]; then
+    echo "ERROR: policy.draft.enabled=true requires DRAFT_MODEL" >&2
+    exit 2
+  fi
+  if ! grep -q "draft_enabled" "${SCRIPT_DIR}/nemo_rl/models/policy/workers/megatron_policy_worker.py" 2>/dev/null &&
+     ! grep -q "draft_loss" "${SCRIPT_DIR}/nemo_rl/algorithms/grpo.py" 2>/dev/null; then
+    echo "ERROR: this checkout does not expose online draft training support" >&2
+    exit 2
+  fi
+fi
+if [[ "${DRAFT_FORMAT}" == "pard2" && -n "${PARD2_OFFICIAL_VLLM_PATCH_DIR}" ]]; then
+  for asset in \
+    "${PARD2_OFFICIAL_VLLM_PATCH_DIR}/vllm_pard2_official_target_feat.patch" \
+    "${PARD2_OFFICIAL_VLLM_PATCH_DIR}/apply_pard2_alias_idempotent.py" \
+    "${PARD2_OFFICIAL_VLLM_PATCH_DIR}/check_pard2_official_patch.py" \
+    "${SCRIPT_DIR}/experiments/eagle3_online/prepare_pard2_official_vllm_site.sh"; do
+    if [[ ! -s "${asset}" ]]; then
+      echo "ERROR: missing official PARD-2 vLLM patch asset: ${asset}" >&2
+      exit 2
+    fi
+  done
+fi
+
+mkdir -p "${NRL_MEGATRON_CHECKPOINT_DIR}"
+checkpoint_iter_dir="${NRL_MEGATRON_CHECKPOINT_DIR}/${TARGET_MODEL_ID}/iter_0000000"
+checkpoint_run_config="${checkpoint_iter_dir}/run_config.yaml"
+if [[ -d "${checkpoint_iter_dir}" && ! -s "${checkpoint_run_config}" ]]; then
+  deadline=$((SECONDS + ${NRL_MEGATRON_CHECKPOINT_READY_TIMEOUT_SEC:-1800}))
+  echo "Waiting for existing Megatron checkpoint conversion to finish: ${checkpoint_run_config}"
+  while [[ ! -s "${checkpoint_run_config}" && "${SECONDS}" -lt "${deadline}" ]]; do
+    sleep 10
+  done
+  if [[ ! -s "${checkpoint_run_config}" ]]; then
+    echo "ERROR: Megatron checkpoint directory exists but run_config.yaml is still missing: ${checkpoint_run_config}" >&2
+    exit 2
+  fi
+fi
+
+PYTHON_RUNNER="python"
+if [[ "${USE_UV_RUN}" == "true" || "${USE_UV_RUN}" == "True" ||
+      "${USE_SYSTEM_ENV}" == "false" || "${USE_SYSTEM_ENV}" == "False" ]]; then
+  PYTHON_RUNNER="uv run --python ${UV_PYTHON} ${UV_LOCK_MODE} --extra mcore --directory ${SCRIPT_DIR} python"
+fi
+if [[ -n "${PYTHON_RUNNER_OVERRIDE}" ]]; then
+  PYTHON_RUNNER="${PYTHON_RUNNER_OVERRIDE}"
+fi
+if [[ -z "${NEMO_RL_PY_EXECUTABLES_SYSTEM+x}" ]]; then
+  NEMO_RL_PY_EXECUTABLES_SYSTEM=0
+elif [[ "${NEMO_RL_PY_EXECUTABLES_SYSTEM}" == "true" || "${NEMO_RL_PY_EXECUTABLES_SYSTEM}" == "True" ]]; then
+  NEMO_RL_PY_EXECUTABLES_SYSTEM=1
+elif [[ "${NEMO_RL_PY_EXECUTABLES_SYSTEM}" == "false" || "${NEMO_RL_PY_EXECUTABLES_SYSTEM}" == "False" ]]; then
+  NEMO_RL_PY_EXECUTABLES_SYSTEM=0
+fi
+PARD2_VLLM_PATCH_SETUP=""
+if [[ "${DRAFT_FORMAT}" == "pard2" && -n "${PARD2_OFFICIAL_VLLM_PATCH_DIR}" ]]; then
+  if [[ -z "${PARD2_VLLM_PATCH_PYTHON}" ]]; then
+    PARD2_VLLM_PATCH_PYTHON="${PYTHON_RUNNER_OVERRIDE:-python3}"
+  fi
+  PARD2_VLLM_PATCH_SETUP="SOURCE_VLLM_SITE=${SOURCE_VLLM_SITE} PARD2_OFFICIAL_VLLM_PATCH_DIR=${PARD2_OFFICIAL_VLLM_PATCH_DIR} PARD2_VLLM_PATCH_PYTHON=${PARD2_VLLM_PATCH_PYTHON} PARD2_VLLM_SOURCE_SITE=${PARD2_VLLM_SOURCE_SITE} bash ${SCRIPT_DIR}/experiments/eagle3_online/prepare_pard2_official_vllm_site.sh &&"
+fi
+RUN_GRPO_PATH="${RUN_GRPO_PATH:-${SCRIPT_DIR}/examples/run_grpo.py}"
+CONFIG_PATH="${CONFIG_FILE}"
+if [[ "${CONFIG_PATH}" != /* ]]; then
+  CONFIG_PATH="${SCRIPT_DIR}/${CONFIG_PATH}"
+fi
+
+WORKSPACE_PYTHONPATH="${SOURCE_VLLM_SITE:+${SOURCE_VLLM_SITE}:}${SCRIPT_DIR}:${SCRIPT_DIR}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src:${SCRIPT_DIR}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM:${PYTHONPATH:-}"
+UV_CACHE_ENV_ASSIGNMENTS=""
+if [[ -n "${UV_CACHE_DIR_OVERRIDE}" ]]; then
+  UV_CACHE_ENV_ASSIGNMENTS="UV_CACHE_DIR_OVERRIDE=${UV_CACHE_DIR_OVERRIDE} UV_CACHE_DIR=${UV_CACHE_DIR_OVERRIDE}"
+fi
+SEQUENCE_PACKING_OVERRIDE="policy.sequence_packing.enabled=false"
+if [[ "${PRESERVE_RECIPE_SEQUENCE_PACKING}" == "true" || "${PRESERVE_RECIPE_SEQUENCE_PACKING}" == "True" ]]; then
+  SEQUENCE_PACKING_OVERRIDE=""
+fi
+ASYNC_GRPO_OVERRIDES="policy.generation.vllm_cfg.async_engine=false grpo.async_grpo.enabled=false"
+if [[ "${PRESERVE_RECIPE_ASYNC}" == "true" || "${PRESERVE_RECIPE_ASYNC}" == "True" ]]; then
+  ASYNC_GRPO_OVERRIDES=""
+fi
+
+COMMAND="cd ${SCRIPT_DIR} && \
+mkdir -p ${TORCH_EXTENSIONS_DIR} ${XDG_CACHE_HOME} ${VLLM_CACHE_ROOT} ${FLASHINFER_CACHE_DIR} ${TRITON_CACHE_DIR} ${TORCHINDUCTOR_CACHE_DIR} ${CUDA_CACHE_PATH} ${PYTHONPYCACHEPREFIX} ${MEGATRON_DATASET_HELPERS_BUILD_DIR} && \
+${PARD2_VLLM_PATCH_SETUP} \
+NRL_FORCE_REBUILD_VENVS=${NRL_FORCE_REBUILD_VENVS} \
+NRL_FORCE_REBUILD_ACTOR_VENVS=${NRL_FORCE_REBUILD_ACTOR_VENVS} \
+NRL_ACTOR_VENV_CACHE_SUFFIX=${NRL_ACTOR_VENV_CACHE_SUFFIX} \
+NRL_ACTOR_UV_LOCK_MODE=${NRL_ACTOR_UV_LOCK_MODE} \
+NRL_SERIALIZE_ACTOR_VENV_CREATION=${NRL_SERIALIZE_ACTOR_VENV_CREATION} \
+NRL_FORCE_LOCAL_TRANSFORMER_SPEC=${NRL_FORCE_LOCAL_TRANSFORMER_SPEC} \
+NRL_FORCE_DRAFT_TORCH_RMSNORM=${NRL_FORCE_DRAFT_TORCH_RMSNORM} \
+NEMO_RL_PY_EXECUTABLES_SYSTEM=${NEMO_RL_PY_EXECUTABLES_SYSTEM} \
+NEMO_RL_VENV_DIR=${NEMO_RL_VENV_DIR} \
+NODE_LOCAL_CACHE_ROOT=${NODE_LOCAL_CACHE_ROOT} \
+${UV_CACHE_ENV_ASSIGNMENTS:+${UV_CACHE_ENV_ASSIGNMENTS} }\
+PIP_CACHE_DIR=${PIP_CACHE_DIR} \
+TORCH_EXTENSIONS_DIR=${TORCH_EXTENSIONS_DIR} \
+XDG_CACHE_HOME=${XDG_CACHE_HOME} \
+VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT} \
+FLASHINFER_CACHE_DIR=${FLASHINFER_CACHE_DIR} \
+TRITON_CACHE_DIR=${TRITON_CACHE_DIR} \
+TORCHINDUCTOR_CACHE_DIR=${TORCHINDUCTOR_CACHE_DIR} \
+CUDA_CACHE_PATH=${CUDA_CACHE_PATH} \
+PYTHONPYCACHEPREFIX=${PYTHONPYCACHEPREFIX} \
+PYTHONDONTWRITEBYTECODE=${PYTHONDONTWRITEBYTECODE} \
+MEGATRON_DATASET_HELPERS_BUILD_DIR=${MEGATRON_DATASET_HELPERS_BUILD_DIR} \
+NRL_IGNORE_VERSION_MISMATCH=${NRL_IGNORE_VERSION_MISMATCH:-1} \
+UV_PYTHON=${UV_PYTHON} \
+UV_PROJECT_ENVIRONMENT=${DRIVER_UV_PROJECT_ENVIRONMENT} \
+RAY_CGRAPH_GET_TIMEOUT=${RAY_CGRAPH_GET_TIMEOUT} \
+RAY_CGRAPH_get_timeout=${RAY_CGRAPH_GET_TIMEOUT} \
+PYTHONPATH=${WORKSPACE_PYTHONPATH} \
+LD_LIBRARY_PATH=${LD_LIBRARY_PATH} \
+${CUDA_DEVICE_MAX_CONNECTIONS_ENV_ASSIGNMENT:+${CUDA_DEVICE_MAX_CONNECTIONS_ENV_ASSIGNMENT} }\
+MAX_JOBS=${MAX_JOBS} \
+CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL} \
+NVTE_BUILD_MAX_JOBS=${NVTE_BUILD_MAX_JOBS} \
+NINJAFLAGS=${NINJAFLAGS} \
+MAKEFLAGS=${MAKEFLAGS} \
+NRL_MEGATRON_CHECKPOINT_DIR=${NRL_MEGATRON_CHECKPOINT_DIR} \
+NRL_MEGATRON_NCCL_TIMEOUT_SECONDS=${NRL_MEGATRON_NCCL_TIMEOUT_SECONDS} \
+NRL_MEGATRON_TOKENIZER_MODEL=${NRL_MEGATRON_TOKENIZER_MODEL} \
+VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND} \
+VLLM_RAY_EXTRA_ENV_VARS_TO_COPY=${VLLM_RAY_EXTRA_ENV_VARS_TO_COPY} \
+NRL_VLLM_OMIT_GENERATION_LOGPROBS=${NRL_VLLM_OMIT_GENERATION_LOGPROBS} \
+NRL_VLLM_DISABLE_LOG_STATS=${NRL_VLLM_DISABLE_LOG_STATS} \
+NRL_VLLM_GENERATION_MIN_TOKENS=${NRL_VLLM_GENERATION_MIN_TOKENS} \
+NRL_VLLM_GENERATION_IGNORE_EOS=${NRL_VLLM_GENERATION_IGNORE_EOS} \
+NRL_VLLM_GENERATION_DISABLE_STOP_STRINGS=${NRL_VLLM_GENERATION_DISABLE_STOP_STRINGS} \
+NRL_VLLM_GENERATION_DISABLE_STOP_TOKEN_IDS=${NRL_VLLM_GENERATION_DISABLE_STOP_TOKEN_IDS} \
+NRL_STOP_AFTER_GENERATION=${NRL_STOP_AFTER_GENERATION} \
+NRL_STOP_AFTER_GENERATION_AFTER_STEP=${NRL_STOP_AFTER_GENERATION_AFTER_STEP} \
+NRL_ALLOW_SPECDEC_LOGPROB_REPAIR_WITH_SAMPLER_MISMATCH=${NRL_ALLOW_SPECDEC_LOGPROB_REPAIR_WITH_SAMPLER_MISMATCH} \
+NRL_ALLOW_SPECDEC_WITHOUT_BEHAVIOR_LOGPROBS=${NRL_ALLOW_SPECDEC_WITHOUT_BEHAVIOR_LOGPROBS} \
+NRL_VLLM_SPECDEC_REQUEST_LOGPROBS=${NRL_VLLM_SPECDEC_REQUEST_LOGPROBS} \
+NRL_ALLOW_SPECDEC_REQUEST_LOGPROBS=${NRL_ALLOW_SPECDEC_REQUEST_LOGPROBS} \
+NRL_DEBUG_DRAFT_REFIT=${NRL_DEBUG_DRAFT_REFIT} \
+VLLM_ENABLE_RUNTIME_SPECDEC_BATCH_GATE_PATCH=${RUNTIME_SPECDEC_GATE_ENABLED} \
+VLLM_SPECDEC_BATCH_SIZE_GATE_THRESHOLD=${RUNTIME_SPECDEC_GATE_BATCH_SIZE} \
+VLLM_SPECDEC_BATCH_TOKEN_GATE_THRESHOLD=${RUNTIME_SPECDEC_GATE_TOKEN_THRESHOLD} \
+VLLM_SPECDEC_BATCH_GATE_LOG_INTERVAL=${GATE_LOG_INTERVAL} \
+VLLM_SPECDEC_DYNAMIC_DRAFT_TOKENS=${VLLM_SPECDEC_DYNAMIC_DRAFT_TOKENS} \
+VLLM_SPECDEC_DYNAMIC_DRAFT_SMALL_REQUEST_THRESHOLD=${VLLM_SPECDEC_DYNAMIC_DRAFT_SMALL_REQUEST_THRESHOLD} \
+VLLM_SPECDEC_DYNAMIC_DRAFT_MEDIUM_REQUEST_THRESHOLD=${VLLM_SPECDEC_DYNAMIC_DRAFT_MEDIUM_REQUEST_THRESHOLD} \
+VLLM_SPECDEC_DYNAMIC_DRAFT_SMALL_TOKEN_THRESHOLD=${VLLM_SPECDEC_DYNAMIC_DRAFT_SMALL_TOKEN_THRESHOLD} \
+VLLM_SPECDEC_DYNAMIC_DRAFT_MEDIUM_TOKEN_THRESHOLD=${VLLM_SPECDEC_DYNAMIC_DRAFT_MEDIUM_TOKEN_THRESHOLD} \
+VLLM_SPECDEC_DYNAMIC_DRAFT_SMALL_TOKENS=${VLLM_SPECDEC_DYNAMIC_DRAFT_SMALL_TOKENS} \
+VLLM_SPECDEC_DYNAMIC_DRAFT_MEDIUM_TOKENS=${VLLM_SPECDEC_DYNAMIC_DRAFT_MEDIUM_TOKENS} \
+VLLM_SPECDEC_DYNAMIC_DRAFT_LARGE_TOKENS=${VLLM_SPECDEC_DYNAMIC_DRAFT_LARGE_TOKENS} \
+${PYTHON_RUNNER} ${RUN_GRPO_PATH} \
+--config ${CONFIG_PATH} \
+cluster.num_nodes=${NUM_NODES} \
+cluster.gpus_per_node=${GPUS_PER_NODE} \
+policy.model_name=${TARGET_MODEL_ID} \
+policy.tokenizer.name=${TOKENIZER_NAME} \
+policy.megatron_cfg.enabled=true \
+++policy.megatron_cfg.force_reconvert_from_hf=${FORCE_RECONVERT_FROM_HF} \
+policy.dtensor_cfg.enabled=false \
+${SEQUENCE_PACKING_OVERRIDE} \
+policy.draft.enabled=${POLICY_DRAFT_ENABLED} \
+++policy.draft.type=${POLICY_DRAFT_TYPE} \
+++policy.draft.pipeline_model_parallel_size=${POLICY_DRAFT_PP} \
+policy.draft.model_name=${DRAFT_MODEL} \
+policy.draft.loss_weight=${DRAFT_LOSS_WEIGHT} \
+++policy.draft.loss=${POLICY_DRAFT_LOSS} \
+++policy.draft.cat_weighting=${POLICY_DRAFT_CAT_WEIGHTING} \
+++policy.draft.cat_mode=${POLICY_DRAFT_CAT_MODE} \
+++policy.draft.cat_logprob_key=${POLICY_DRAFT_CAT_LOGPROB_KEY} \
+++policy.draft.drop_token_ratio=${POLICY_DRAFT_DROP_TOKEN_RATIO} \
+++policy.draft.normalize_loss_by_draft_tokens=${POLICY_DRAFT_NORMALIZE_LOSS_BY_DRAFT_TOKENS} \
+++policy.draft.max_training_sequence_length=${POLICY_DRAFT_MAX_TRAINING_SEQUENCE_LENGTH} \
+++policy.draft.training_window=${POLICY_DRAFT_TRAINING_WINDOW} \
+++policy.draft.training_mode=${PARD_TRAINING_MODE} \
+++policy.draft.num_speculative_tokens=${NUM_SPECULATIVE_TOKENS} \
+++policy.draft.train_interval=${POLICY_DRAFT_TRAIN_INTERVAL} \
+++policy.draft.refit_interval=${POLICY_DRAFT_REFIT_INTERVAL} \
+++policy.draft.train_start_step=${POLICY_DRAFT_TRAIN_START_STEP} \
+++policy.draft.refit_start_step=${POLICY_DRAFT_REFIT_START_STEP} \
+++policy.draft.allow_generic_pard2_fallback=${POLICY_DRAFT_ALLOW_GENERIC_PARD2_FALLBACK} \
+policy.generation.vllm_cfg.precision=${VLLM_PRECISION} \
+policy.generation.vllm_cfg.kv_cache_dtype=${VLLM_KV_CACHE_DTYPE} \
+policy.generation.vllm_cfg.enforce_eager=${VLLM_ENFORCE_EAGER} \
+${ASYNC_GRPO_OVERRIDES} \
+grpo.val_period=1000 \
+checkpointing.enabled=false \
+grpo.num_prompts_per_step=${NUM_PROMPTS} \
+grpo.num_generations_per_prompt=${NUM_GENERATIONS} \
+policy.train_global_batch_size=${TRAIN_GLOBAL_BATCH_SIZE} \
+grpo.max_num_steps=${MAX_STEPS} \
+${SPECDEC_OVERRIDES} \
+${ONLINE_EXTRA_OVERRIDES} \
+logger.wandb_enabled=${WANDB_ENABLED} \
+logger.wandb.project='${WANDB_PROJECT}' \
+logger.wandb.name='${WANDB_NAME}'"
+
+if [[ "${DRY_RUN}" == "true" || "${DRY_RUN}" == "True" ]]; then
+  echo "[DRY-RUN] job-name=online-${JOB_TAG}-N${NUM_NODES}xG${GPUS_PER_NODE}"
+  echo "[DRY-RUN] base-log-dir=${BASE_LOG_DIR}"
+  echo "[DRY-RUN] sbatch --nodes=${NUM_NODES} --account=${ACCOUNT} --job-name=online-${JOB_TAG}-N${NUM_NODES}xG${GPUS_PER_NODE} --partition=${PARTITION} --time=${WALLTIME} --output=${BASE_LOG_DIR}/slurm-%j.out ${GRES_FLAG} ${SBATCH_RESOURCE_ARGS} ${SBATCH_EXTRA_ARGS} ${SBATCH_SEGMENT_ARGS[*]} ${SCRIPT_DIR}/ray.sub"
+  echo "[DRY-RUN] COMMAND:"
+  printf "%s\n" "${COMMAND}" | sed -E "s/(WANDB_API_KEY=)[^[:space:]\\\\]*/\\1<redacted>/g"
+  exit 0
+fi
+
+mkdir_paths=(
+  "${BASE_LOG_DIR}" \
+  "${PIP_CACHE_DIR}" \
+  "${TORCH_EXTENSIONS_DIR}" \
+  "${XDG_CACHE_HOME}" \
+  "${VLLM_CACHE_ROOT}" \
+  "${FLASHINFER_CACHE_DIR}" \
+  "${TRITON_CACHE_DIR}" \
+  "${TORCHINDUCTOR_CACHE_DIR}" \
+  "${CUDA_CACHE_PATH}" \
+  "${PYTHONPYCACHEPREFIX}" \
+  "${MEGATRON_DATASET_HELPERS_BUILD_DIR}"
+)
+if [[ -n "${UV_CACHE_DIR_OVERRIDE}" ]]; then
+  mkdir_paths+=("${UV_CACHE_DIR_OVERRIDE}")
+fi
+mkdir -p "${mkdir_paths[@]}"
+
+sbatch_env=(
+  "CONTAINER=${CONTAINER}"
+  "HF_HOME=${HF_HOME}"
+  "HF_DATASETS_CACHE=${HF_DATASETS_CACHE}"
+  "WANDB_API_KEY=${WANDB_API_KEY:-}"
+  "NRL_MEGATRON_CHECKPOINT_DIR=${NRL_MEGATRON_CHECKPOINT_DIR}"
+  "UV_PYTHON=${UV_PYTHON}"
+  "RAY_VERSION=${RAY_VERSION}"
+  "RAY_PYTHON_VERSION=${RAY_PYTHON_VERSION}"
+  "RAY_PYTHON_SPEC=${RAY_PYTHON_SPEC}"
+  "RAY_USE_EXISTING_ENV=${RAY_USE_EXISTING_ENV}"
+  "CONTAINER_REMAP_ROOT=${CONTAINER_REMAP_ROOT}"
+  "NEMO_RL_VENV_DIR=${NEMO_RL_VENV_DIR}"
+  "NODE_LOCAL_CACHE_ROOT=${NODE_LOCAL_CACHE_ROOT}"
+  "UV_CACHE_DIR_OVERRIDE=${UV_CACHE_DIR_OVERRIDE}"
+  "PIP_CACHE_DIR=${PIP_CACHE_DIR}"
+  "TORCH_EXTENSIONS_DIR=${TORCH_EXTENSIONS_DIR}"
+  "XDG_CACHE_HOME=${XDG_CACHE_HOME}"
+  "VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT}"
+  "FLASHINFER_CACHE_DIR=${FLASHINFER_CACHE_DIR}"
+  "TRITON_CACHE_DIR=${TRITON_CACHE_DIR}"
+  "TORCHINDUCTOR_CACHE_DIR=${TORCHINDUCTOR_CACHE_DIR}"
+  "CUDA_CACHE_PATH=${CUDA_CACHE_PATH}"
+  "PYTHONPYCACHEPREFIX=${PYTHONPYCACHEPREFIX}"
+  "PYTHONDONTWRITEBYTECODE=${PYTHONDONTWRITEBYTECODE}"
+  "MEGATRON_DATASET_HELPERS_BUILD_DIR=${MEGATRON_DATASET_HELPERS_BUILD_DIR}"
+  "DRIVER_UV_PROJECT_ENVIRONMENT=${DRIVER_UV_PROJECT_ENVIRONMENT}"
+  "DRIVER_SRUN_CPUS_PER_TASK=${DRIVER_SRUN_CPUS_PER_TASK}"
+  "DRIVER_SRUN_MEM=${DRIVER_SRUN_MEM}"
+  "BASE_LOG_DIR=${BASE_LOG_DIR}"
+  "GPUS_PER_NODE=${GPUS_PER_NODE}"
+  "MOUNTS=${MOUNTS}"
+  "SETUP_COMMAND=${SETUP_COMMAND}"
+  "COMMAND=${COMMAND}"
+)
+if [[ -n "${CUDA_DEVICE_MAX_CONNECTIONS}" ]]; then
+  sbatch_env+=("CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS}")
+fi
+
+env "${sbatch_env[@]}" sbatch \
+  --nodes="${NUM_NODES}" \
+  --account="${ACCOUNT}" \
+  --job-name="online-${JOB_TAG}-N${NUM_NODES}xG${GPUS_PER_NODE}" \
+  --partition="${PARTITION}" \
+  --time="${WALLTIME}" \
+  --output="${BASE_LOG_DIR}/slurm-%j.out" \
+  ${GRES_FLAG} \
+  ${SBATCH_RESOURCE_ARGS} \
+  ${SBATCH_EXTRA_ARGS} \
+  "${SBATCH_SEGMENT_ARGS[@]}" \
+  "${SCRIPT_DIR}/ray.sub"
