@@ -234,20 +234,22 @@ if [[ "${_qwen35_should_mount}" == "1" ]]; then
             _qwen35_mount_tree "${QWEN35_STAGED_OVERLAY_DIR}" "${CONTAINER_REPO_LOCATION}" "Qwen 3.5 staged overlay"
             ;;
         1|true|True|yes|YES)
-            _qwen35_clobber_files=(
-                "nemo_rl/environments/nemo_gym.py"
-                "nemo_rl/models/generation/vllm/__init__.py"
-                "nemo_rl/models/generation/vllm/vllm_worker_async.py"
-                "nemo_rl/models/megatron/community_import.py"
-                "nemo_rl/models/megatron/setup.py"
-                "nemo_rl/models/policy/workers/megatron_policy_worker.py"
-                "3rdparty/Gym-workspace/Gym/responses_api_models/vllm_model/app.py"
+            _qwen35_clobber_pairs=(
+                "nemo_rl/environments/nemo_gym.py:nemo_rl/environments/nemo_gym.py"
+                "nemo_rl/models/generation/vllm/__init__.py:nemo_rl/models/generation/vllm/__init__.py"
+                "nemo_rl/models/generation/vllm/vllm_worker_async.py:nemo_rl/models/generation/vllm/vllm_worker_async.py"
+                "nemo_rl/models/megatron/community_import.py:nemo_rl/models/megatron/community_import.py"
+                "nemo_rl/models/megatron/setup.py:nemo_rl/models/megatron/setup.py"
+                "nemo_rl/models/policy/workers/megatron_policy_worker.py:nemo_rl/models/policy/workers/megatron_policy_worker.py"
+                "qwen_35/overrides/3rdparty/Gym-workspace/Gym/responses_api_models/vllm_model/app.py:3rdparty/Gym-workspace/Gym/responses_api_models/vllm_model/app.py"
             )
-            for _qwen35_rel in "${_qwen35_clobber_files[@]}"; do
-                _qwen35_stage_file "${REPO_LOCATION}/${_qwen35_rel}" "${QWEN35_CLOBBER_STAGE_DIR}" "${_qwen35_rel}" "Qwen 3.5 clobber"
-                _qwen35_mount_file "${QWEN35_CLOBBER_STAGE_DIR}/${_qwen35_rel}" "${CONTAINER_REPO_LOCATION}/${_qwen35_rel}" "Qwen 3.5 clobber"
+            for _qwen35_pair in "${_qwen35_clobber_pairs[@]}"; do
+                _qwen35_src_rel="${_qwen35_pair%%:*}"
+                _qwen35_dst_rel="${_qwen35_pair#*:}"
+                _qwen35_stage_file "${REPO_LOCATION}/${_qwen35_src_rel}" "${QWEN35_CLOBBER_STAGE_DIR}" "${_qwen35_dst_rel}" "Qwen 3.5 clobber"
+                _qwen35_mount_file "${QWEN35_CLOBBER_STAGE_DIR}/${_qwen35_dst_rel}" "${CONTAINER_REPO_LOCATION}/${_qwen35_dst_rel}" "Qwen 3.5 clobber"
             done
-            unset _qwen35_rel _qwen35_clobber_files
+            unset _qwen35_pair _qwen35_src_rel _qwen35_dst_rel _qwen35_clobber_pairs
             ;;
         *)
             echo "Error: QWEN35_CLOBBER_FROM_REPO must be 0 or 1; got '${QWEN35_CLOBBER_FROM_REPO}'." >&2
