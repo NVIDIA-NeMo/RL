@@ -12,12 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""End-to-end test: SC._rollout_pump writes the expected rows to TQ.
-
-Reuses test_async_rollout_manager's fixtures (real vLLM, env, tokenizer,
-DatumSpec). dp_client is a NoOpDataPlaneClient wrapped in a Ray actor so the
-test process can inspect TQ state after the SC actor finishes.
-"""
+"""End-to-end test: SC._rollout_pump writes the expected rows to TQ."""
 
 from __future__ import annotations
 
