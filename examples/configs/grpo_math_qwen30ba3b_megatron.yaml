@@ -15,6 +15,8 @@ policy:
   logprob_batch_size: 4
   max_total_sequence_length: 4096
   precision: "bfloat16"
+  router_replay:
+    enabled: false
 
   dtensor_cfg:
     enabled: false
@@ -29,7 +31,6 @@ policy:
   megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1
-    converter_type: "LlamaForCausalLM"
     tensor_model_parallel_size: 2
     pipeline_model_parallel_size: 1
     context_parallel_size: 1

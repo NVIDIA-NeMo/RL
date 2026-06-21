@@ -17,7 +17,6 @@ policy:
   scheduler: null
   megatron_cfg:
     enabled: true
-    converter_type: Qwen3ForCausalLM
     tensor_model_parallel_size: 4
     optimizer:
       lr: 1.0e-06

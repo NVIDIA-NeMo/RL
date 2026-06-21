@@ -32,7 +32,8 @@ maybe_gres_arg() {
   # Assumes a homogeneous allocation (not a heterogeneous job)
   if sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep -q "gpu:"; then
     # Do a quick assert here that gpus:8 == gpus:$GPUS_PER_NODE. It is probably a user error if someone isn't using GPUS_PER_NODE=8 on our clusters if it supports --gres=gpu:8 or gpu:a100:8
-    if [[ $GPUS_PER_NODE -ne $(sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep "gpu:" | awk -F: '{print $NF}') ]]; then
+    # Some clusters append socket specs like "(S:0-3)" to the GRES string.
+    if [[ $GPUS_PER_NODE -ne $(sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep "gpu:" | cut -d'(' -f1 | awk -F: '{print $NF}') ]]; then
       echo "Error: GPUS_PER_NODE=$GPUS_PER_NODE but GRES detected is $(sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep "gpu:") meaning GPUS_PER_NODE is not set to fully claim the GPUs on the nodes." >&2
       exit 1
     fi
@@ -47,9 +48,11 @@ maybe_gres_arg() {
 ########################################################
 # User defined variables
 ########################################################
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-16}
 CONTAINER=$CONTAINER
 MOUNTS=$MOUNTS
 COMMAND=${COMMAND:-}  # This is a script relative to the SLURM_SUBMIT_DIR. If left empty, it will leave the cluster idle after it's brought up.
+SETUP_COMMAND=${SETUP_COMMAND:-}  # Setup commands to run on all nodes before starting Ray.
 ########################################################
 # Ports for all nodes (should be odd numbers since we place head/worker[0] on the same node) so all workers get the odd ports, but the head will get +1 the ports
 NODE_MANAGER_PORT=${NODE_MANAGER_PORT:-53001}
@@ -123,6 +126,15 @@ BASE_LOG_DIR=${BASE_LOG_DIR:-$SLURM_SUBMIT_DIR}
 LOG_DIR="$BASE_LOG_DIR/$SLURM_JOB_ID-logs"
 mkdir -p $LOG_DIR
 
+# Write setup commands to a file so they can be executed inside each container
+# without heredoc escaping surprises.
+SETUP_COMMAND_FILE=""
+if [[ -n "$SETUP_COMMAND" ]]; then
+  SETUP_COMMAND_FILE="$LOG_DIR/setup_command.sh"
+  echo "$SETUP_COMMAND" > "$SETUP_COMMAND_FILE"
+  chmod +x "$SETUP_COMMAND_FILE"
+fi
+
 # Number of GPUs per worker node
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 
@@ -140,7 +152,7 @@ COMMON_SRUN_ARGS+=" --mpi=pmix"
 COMMON_SRUN_ARGS+=" --container-mounts=$MOUNTS"
 COMMON_SRUN_ARGS+=" --container-image=$CONTAINER"
 COMMON_SRUN_ARGS+=" --container-workdir=$SLURM_SUBMIT_DIR"
-# TODO: delete these (just for debugging)
+# Pass partition/account explicitly for overlapping srun calls.
 COMMON_SRUN_ARGS+=" -p $SLURM_JOB_PARTITION"
 COMMON_SRUN_ARGS+=" -A $SLURM_JOB_ACCOUNT"
 # Number of CPUs per worker node
@@ -301,7 +313,9 @@ head_cmd=$(cat <<EOF
 # Touch a file to indicate that the head node has started
 # Overlapping srun commands will check this file to determine if we can overlap a container command
 touch $LOG_DIR/STARTED_RAY_HEAD
-env
+if [[ "\${RAY_SUB_DEBUG_ENV:-0}" == "1" ]]; then
+  env | grep -viE '(WANDB_API_KEY|HF_TOKEN|API_KEY|TOKEN|SECRET|PASSWORD)=' || true
+fi
 
 exit-dramatically() {
     # Use SIGTERM to forcefully terminate the srun process
@@ -386,6 +400,10 @@ chmod +x /launch-head.sh
 
 count=0
 while [[ \$count -lt $num_retries ]]; do
+  if [[ -n "$SETUP_COMMAND_FILE" ]] && [[ -f "$SETUP_COMMAND_FILE" ]]; then
+    echo "[INFO] Running setup command from $SETUP_COMMAND_FILE..."
+    bash "$SETUP_COMMAND_FILE"
+  fi
   bash /launch-head.sh
   count=\$((count+1))
   echo "Head node failed \$count/$num_retries times, restarting in 5 seconds..."
@@ -408,7 +426,9 @@ for ((i = 1; i < SLURM_JOB_NUM_NODES; i++)); do
   node_i=${nodes_array[$i]}
     
   worker_cmd=$(cat <<EOF
-env
+if [[ "\${RAY_SUB_DEBUG_ENV:-0}" == "1" ]]; then
+  env | grep -viE '(WANDB_API_KEY|HF_TOKEN|API_KEY|TOKEN|SECRET|PASSWORD)=' || true
+fi
 
 exit-dramatically() {
     # Use SIGTERM to forcefully terminate the srun process
@@ -487,6 +507,10 @@ EOFINNER
 
 count=0
 while [[ \$count -lt $num_retries ]]; do
+  if [[ -n "$SETUP_COMMAND_FILE" ]] && [[ -f "$SETUP_COMMAND_FILE" ]]; then
+    echo "[INFO] Running setup command from $SETUP_COMMAND_FILE..."
+    bash "$SETUP_COMMAND_FILE"
+  fi
   bash /launch-worker.sh
   count=\$((count+1))
   echo "Worker failed \$count/$num_retries times, restarting in 5 seconds..."
@@ -506,6 +530,47 @@ while check_srun_processes && ! srun --overlap --nodes=1 --ntasks=1 -w $head_nod
   echo "[INFO][$(date)] Waiting for head node container to start..."
   sleep 2
 done
+
+########################################################
+# Optional sandbox sidecar for NeMo-Skills-backed Gym resources.
+########################################################
+export SLURM_MASTER_NODE=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n1)
+
+if [[ -n "${SANDBOX_CONTAINER:-}" ]] && [[ -n "${SANDBOX_COMMAND:-}" ]]; then
+  SANDBOX_PORTS_DIR="$LOG_DIR/sandbox"
+  mkdir -p "$SANDBOX_PORTS_DIR"
+
+  SANDBOX_MOUNTS="$SANDBOX_PORTS_DIR:$SANDBOX_PORTS_DIR"
+  if [[ -n "${SANDBOX_EXTRA_MOUNTS:-}" ]]; then
+    SANDBOX_MOUNTS="${SANDBOX_EXTRA_MOUNTS},${SANDBOX_MOUNTS}"
+  fi
+
+  SANDBOX_EXPORTS="ALL,SANDBOX_PORTS_DIR=$SANDBOX_PORTS_DIR"
+  if [[ -n "${SANDBOX_ENV_VARS:-}" ]]; then
+    SANDBOX_EXPORTS="${SANDBOX_EXPORTS},${SANDBOX_ENV_VARS}"
+  fi
+
+  echo "[INFO] Starting sandbox sidecars on all allocated nodes (ports_dir=$SANDBOX_PORTS_DIR)..."
+  srun --output "$LOG_DIR/sandbox.log" \
+    --error "$LOG_DIR/sandbox.log" \
+    --container-image="$SANDBOX_CONTAINER" \
+    --container-mounts="$SANDBOX_MOUNTS" \
+    --no-container-mount-home \
+    --mpi=pmix \
+    -A "$SLURM_JOB_ACCOUNT" \
+    -p "$SLURM_JOB_PARTITION" \
+    --wait=60 \
+    --kill-on-bad-exit=1 \
+    --overlap \
+    --nodes="$SLURM_JOB_NUM_NODES" \
+    --ntasks-per-node=1 \
+    --export="$SANDBOX_EXPORTS" \
+    bash -c "$SANDBOX_COMMAND" &
+  SRUN_PIDS["sandbox"]=$!
+  echo "[INFO] Sandbox sidecar started in background (PID: ${SRUN_PIDS["sandbox"]})"
+else
+  echo "[INFO] SANDBOX_CONTAINER or SANDBOX_COMMAND not defined, skipping sandbox startup"
+fi
 
 # At this stage the Ray cluster bringup has started on the physical nodes in the allocation
 # Before we launch a job on this cluster we need to make sure that the bringup is complete

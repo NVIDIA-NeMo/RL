@@ -296,6 +296,62 @@ def _get_gpu_id_info() -> tuple[int, str, int]:  # pragma: no cover
     return gpu_id, nvlink_domain, topo_rank
 
 
+@ray.remote(num_gpus=1)
+class GetGPUIDActor:  # pragma: no cover
+    """Util actor class to return GPU id of the current worker."""
+
+    def get_gpu_id(self):
+        return ray.get_gpu_ids()[0]
+
+
+def get_reordered_bundle(
+    pg: PlacementGroup,
+) -> tuple[list[int], list[int]]:
+    """Return bundle indices and GPU IDs sorted by (node_id, gpu_id).
+
+    Uses ``GetGPUIDActor`` to discover the physical GPU ID assigned to each
+    bundle.
+
+    Returns:
+        (reordered_bundle_indices, reordered_gpu_ids)
+    """
+    pg_data = placement_group_table(pg)
+    num_bundles = len(pg_data["bundles"])
+    bundle_to_node_ids = pg_data["bundles_to_node_id"]
+
+    info_actors = []
+    for i in range(num_bundles):
+        info_actors.append(
+            GetGPUIDActor.options(
+                num_cpus=0.01,
+                num_gpus=0.01,
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=pg,
+                    placement_group_bundle_index=i,
+                ),
+            ).remote()
+        )
+
+    gpu_ids = ray.get([actor.get_gpu_id.remote() for actor in info_actors])
+    for actor in info_actors:
+        ray.kill(actor)
+
+    bundle_infos = [(i, bundle_to_node_ids[i], gpu_ids[i]) for i in range(num_bundles)]
+    sorted_infos = sorted(bundle_infos, key=lambda x: (x[1], x[2]))
+
+    reordered_bundle_indices = [info[0] for info in sorted_infos]
+    reordered_gpu_ids = [gpu_ids[info[0]] for info in sorted_infos]
+
+    for i, info in enumerate(sorted_infos):
+        actual_idx = info[0]
+        logger.info(
+            f"  bundle {i:4}, actual_bundle_index: {actual_idx:4}, "
+            f"node: {info[1]}, gpu: {gpu_ids[actual_idx]}"
+        )
+
+    return reordered_bundle_indices, reordered_gpu_ids
+
+
 class ResourceInsufficientError(Exception):
     """Exception raised when the cluster does not have enough resources to satisfy the requested configuration."""
 
@@ -648,6 +704,7 @@ class RayVirtualCluster:
         )
         self.segment_size = segment_size
         self.node_resource_constraints = node_resource_constraints
+        self._allocated_master_ports: set[int] = set()
 
     def _init_placement_groups(
         self, strategy: str | None = None, use_unified_pg: bool = False
@@ -833,6 +890,11 @@ class RayVirtualCluster:
     def get_master_address_and_port(self) -> tuple[str, int]:
         """Gets the master address and port for the distributed training setup.
 
+        Each call returns a unique port that has not been returned by previous
+        calls on this cluster instance.  This prevents NCCL process-group
+        collisions when multiple worker groups (e.g. policy and value) share the
+        same cluster and node.
+
         Returns:
             Tuple of (address, port)
         """
@@ -840,14 +902,22 @@ class RayVirtualCluster:
         if not self._node_placement_groups:
             self.get_placement_groups()
 
-        # If sorted bundle indices are available, get the address and port for the first bundle index
         if self._sorted_bundle_indices is not None:
-            return self.get_available_address_and_port(
-                pg_idx=0, bundle_idx=self._sorted_bundle_indices[0]
-            )
+            pg_idx, bundle_idx = 0, self._sorted_bundle_indices[0]
+        else:
+            pg_idx, bundle_idx = 0, 0
 
-        # Otherwise, get the address and port for bundle index 0
-        return self.get_available_address_and_port(pg_idx=0, bundle_idx=0)
+        max_retries = 10
+        for _ in range(max_retries):
+            addr, port = self.get_available_address_and_port(pg_idx, bundle_idx)
+            if port not in self._allocated_master_ports:
+                self._allocated_master_ports.add(port)
+                return addr, port
+
+        raise RuntimeError(
+            f"Failed to find a unique master port after {max_retries} retries. "
+            f"Already allocated ports: {self._allocated_master_ports}"
+        )
 
     def _get_sorted_bundle_indices(self) -> Optional[list[int]]:
         """Gets the sorted bundle indices for the placement groups.
