@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any
+from typing import Any, Union
 
 import ray
 import torch
@@ -57,7 +57,12 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 )
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.models.generation.sglang import SGLangGeneration
+from nemo_rl.models.generation.vllm import VllmGeneration
+from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.utils.logger import Logger
+
+Generation = Union[VllmGeneration, SGLangGeneration]
 
 
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
@@ -93,8 +98,8 @@ class SingleControllerActor:
         self._master_config = master_config
         self._async_cfg = master_config.async_rl
         self._dp_client = bundle.dp_client
-        self._gen = bundle.gen_handle
-        self._trainer = bundle.trainer_handle
+        self._gen: Generation = bundle.gen_handle
+        self._trainer: TQPolicy = bundle.trainer_handle
         self._dataloader = bundle.dataloader
         self._weight_synchronizer = bundle.weight_synchronizer
         self._advantage_estimator = bundle.advantage_estimator
@@ -107,7 +112,7 @@ class SingleControllerActor:
 
         # Built here, not on the driver: Logger backends (wandb/tb/...) hold
         # _thread.lock that Ray can't cloudpickle into the actor.
-        self._logger = Logger(master_config.logger)
+        self._logger = Logger(master_config.logger)  # type: ignore
 
         # Pin clusters so RayVirtualCluster.__del__ doesn't remove the PGs.
         self._train_cluster = bundle.train_cluster
@@ -378,22 +383,24 @@ class SingleControllerActor:
                     self._buffer_capacity.release()
 
                 # Compute prev_logprobs / ref_logprobs
+                self._trainer.prepare_for_lp_inference()
                 if compute_prev_logprobs:
                     self._trainer.get_logprobs_from_meta(train_meta)
-
                 if compute_reference_logprobs:
                     self._trainer.get_reference_policy_logprobs_from_meta(train_meta)
 
                 train_meta = await self._advantage_pump(train_meta)
 
+                # Train
+                self._trainer.prepare_for_training()
                 if not step_open:
                     self._trainer.begin_train_step(step_id, loss_fn=self._loss_fn)
                     step_open = True
-
                 # Driver-side TQPolicy blocks until worker results land; we drop
                 # the per-microbatch dict and surface aggregated metrics from
                 # finish_train_step instead.
                 self._trainer.train_microbatch_from_meta(step_id, train_meta)
+
                 groups_dispatched += num_groups
                 self._step_consumed_sample_ids.extend(train_meta.sample_ids)
                 if train_meta.sequence_lengths:
