@@ -1000,11 +1000,9 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         Returns:
             List of (parameter_name, size_in_bytes) tuples.
         """
-        self.refit_conversion_tasks = [
-            task
-            for task in self.megatron_bridge.get_conversion_tasks([self.model])
-            if task is not None
-        ]
+        self.refit_conversion_tasks = self.megatron_bridge.get_conversion_tasks(
+            [self.model]
+        )
         param_info = []
 
         def calculate_size_in_bytes(param, tp_size, ep_size):

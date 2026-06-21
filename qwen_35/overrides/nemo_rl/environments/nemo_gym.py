@@ -543,18 +543,6 @@ Output prompt token IDs summary: {_summarize_token_ids(output_item_dict["prompt_
 
         if not nemo_rl_message_log:
             input_messages = nemo_gym_result["responses_create_params"]["input"]
-            if isinstance(input_messages, list):
-                input_summary = {
-                    "len": len(input_messages),
-                    "roles": [
-                        m.get("role") for m in input_messages[:12] if isinstance(m, dict)
-                    ],
-                    "tail_roles": [
-                        m.get("role") for m in input_messages[-6:] if isinstance(m, dict)
-                    ],
-                }
-            else:
-                input_summary = {"type": type(input_messages).__name__}
             try:
                 prompt_token_ids = tokenizer.apply_chat_template(
                     input_messages, tokenize=True
@@ -567,43 +555,16 @@ Output prompt token IDs summary: {_summarize_token_ids(output_item_dict["prompt_
             output_item_types = [
                 o.get("type") for o in nemo_gym_result["response"]["output"]
             ]
-            output_item_summaries = []
-            for output_item in nemo_gym_result["response"]["output"][:5]:
-                summary = {
-                    "type": output_item.get("type"),
-                    "keys": sorted(output_item.keys()),
-                }
-                content = output_item.get("content")
-                if isinstance(content, list):
-                    summary["content_len"] = len(content)
-                    if content and isinstance(content[0], dict):
-                        text = content[0].get("text")
-                        if isinstance(text, str):
-                            summary["content0_text_preview"] = text[:256]
-                reasoning_summary = output_item.get("summary")
-                if isinstance(reasoning_summary, list):
-                    summary["summary_len"] = len(reasoning_summary)
-                    if reasoning_summary and isinstance(reasoning_summary[0], dict):
-                        text = reasoning_summary[0].get("text")
-                        if isinstance(text, str):
-                            summary["summary0_text_preview"] = text[:256]
-                output_item_summaries.append(summary)
-            response = nemo_gym_result.get("response", {})
-            response_keys = sorted(response.keys()) if isinstance(response, dict) else []
-            create_params = nemo_gym_result.get("responses_create_params", {})
-            create_param_keys = (
-                sorted(create_params.keys()) if isinstance(create_params, dict) else []
-            )
             raise ValueError(
-                "NeMo Gym returned a result with no generation data. This is treated "
-                "as a hard error for Qwen 3.5 debugging, not as a zero-reward sample.\n"
-                f"    Prompt length: {prompt_len_str}.\n"
-                f"    input summary: {input_summary}.\n"
-                f"    result keys: {sorted(nemo_gym_result.keys())}.\n"
-                f"    response keys: {response_keys}.\n"
-                f"    responses_create_params keys: {create_param_keys}.\n"
-                f"    response.output item types ({len(output_item_types)} items): {output_item_types}.\n"
-                f"    First response.output item summaries: {output_item_summaries}."
+                f"NeMo Gym returned a result with no generation data. "
+                f"Possible causes: (1) the prompt for the first turn already exceeds the vLLM max_model_len, "
+                f"so vLLM rejected the request before any tokens could be generated; "
+                f"(2) all response output items were reasoning/tool-call items with no assistant generation.\n"
+                f"  Prompt length: {prompt_len_str}.\n"
+                f"  response.output item types ({len(output_item_types)} items): {output_item_types}.\n"
+                f"  → If (1): increase `policy.max_total_sequence_length` and `policy.generation.vllm_cfg.max_model_len` "
+                f"above the prompt length above.\n"
+                f"  → If (2): inspect why no assistant content was produced for this rollout."
             )
 
         return {

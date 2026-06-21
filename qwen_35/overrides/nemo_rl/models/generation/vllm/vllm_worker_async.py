@@ -142,23 +142,6 @@ def _diagnose_noncontiguous_message_tokens() -> bool:
     ).lower() not in {"0", "false", "no", "off"}
 
 
-def _debug_generation_outputs() -> bool:
-    return os.environ.get("NEMO_RL_DEBUG_GENERATION_OUTPUTS", "0").lower() not in {
-        "0",
-        "false",
-        "no",
-        "off",
-    }
-
-
-def _generation_output_preview_chars() -> int:
-    value = os.environ.get("NEMO_RL_DEBUG_GENERATION_PREVIEW_CHARS", "512")
-    try:
-        return max(0, int(value))
-    except ValueError:
-        return 512
-
-
 def _noncontiguous_message_diagnostic_window() -> int:
     value = os.environ.get("NEMO_RL_NONCONTIGUOUS_MESSAGE_DIAGNOSTIC_WINDOW", "48")
     try:
@@ -1518,23 +1501,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             generation_details = final_request_output.outputs[0]
             generated_token_ids = list(generation_details.token_ids)
             num_generated_tokens = len(generated_token_ids)
-            if _debug_generation_outputs():
-                preview = (generation_details.text or "")[
-                    : _generation_output_preview_chars()
-                ].replace("\n", "\\n")
-                logger.warning(
-                    "Qwen 3.5 generation debug: request_id=%s, sample_idx=%s, "
-                    "prompt_tokens=%s, allowed_new_tokens=%s, generated_tokens=%s, "
-                    "finish_reason=%r, stop_reason=%r, text_preview=%r",
-                    request_id,
-                    sample_idx,
-                    current_input_actual_length,
-                    allowed_new_tokens,
-                    num_generated_tokens,
-                    getattr(generation_details, "finish_reason", None),
-                    getattr(generation_details, "stop_reason", None),
-                    preview,
-                )
 
             original_input_ids_single_row = input_ids_batch[sample_idx]
             final_output_tensor_len = current_input_actual_length + num_generated_tokens
@@ -1788,7 +1754,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 worker_results = await result_or_coro
             else:
                 worker_results = result_or_coro
-
+            
             all_success, exceptions_or_none = _normalize_weight_update_results(
                 worker_results
             )
