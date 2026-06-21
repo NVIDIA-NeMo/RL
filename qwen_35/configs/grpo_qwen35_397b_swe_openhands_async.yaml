@@ -52,7 +52,6 @@ policy:
 # Qwen 3.5 chat-template/token handling used by the qwen_35 overlay.
 env:
   nemo_gym:
-    allow_noncontiguous_message_tokens: false
     policy_model:
       responses_api_models:
         vllm_model:

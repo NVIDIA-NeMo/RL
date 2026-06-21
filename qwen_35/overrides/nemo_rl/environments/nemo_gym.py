@@ -75,7 +75,6 @@ class NemoGymConfig(TypedDict):
     initial_global_config_dict: Dict[str, Any]
     invalid_tool_call_patterns: Optional[List[str]]  # Substrings in assistant text content that indicate an invalid tool call (default: ["<tool_call>", "</tool_call>", "<function_call>", "</function_call>"])
     thinking_tags: Optional[List[str]]  # Thinking tags to check for malformed usage (default: ["<think>", "</think>"])
-    allow_noncontiguous_message_tokens: Optional[bool]  # Qwen reasoning/tool parsing can make template-retokenized history differ from returned prefix IDs.
     diagnose_noncontiguous_message_tokens: Optional[bool]  # Emit decoded token windows around the first mismatch for temporary debugging.
     noncontiguous_message_diagnostic_window: Optional[int]  # Number of tokens to show on each side of the mismatch.
 
@@ -404,22 +403,6 @@ First mismatch index: {mismatch_idx}
 Seen token IDs summary: {_summarize_token_ids(seen_token_ids)}
 Output prompt token IDs summary: {_summarize_token_ids(output_item_dict["prompt_token_ids"])}
 """
-                    allow_noncontiguous = self.cfg.get(
-                        "allow_noncontiguous_message_tokens"
-                    )
-                    if allow_noncontiguous is None:
-                        allow_noncontiguous = os.environ.get(
-                            "NEMO_RL_ALLOW_NONCONTIGUOUS_MESSAGE_TOKENS"
-                        )
-                    if not _bool_flag(allow_noncontiguous, default=False):
-                        raise AssertionError(message)
-
-                    print(
-                        "WARNING: " + message.strip().replace("\n", " ")
-                        + " Collapsing this trajectory to the current turn.",
-                        file=sys.stderr,
-                    )
-
                     diagnose_noncontiguous = self.cfg.get(
                         "diagnose_noncontiguous_message_tokens"
                     )
@@ -451,9 +434,7 @@ Output prompt token IDs summary: {_summarize_token_ids(output_item_dict["prompt_
                             file=sys.stderr,
                         )
 
-                    nemo_rl_message_log = []
-                    seen_token_ids = torch.tensor([], dtype=torch.int64)
-                    n_seen = 0
+                    raise AssertionError(message)
 
             n_seen = len(seen_token_ids)
 

@@ -123,12 +123,6 @@ def _normalize_weight_update_results(worker_results: Any) -> tuple[bool, list[An
     return all(success_flags), exceptions_or_none
 
 
-def _allow_qwen35_monotonic_fallback() -> bool:
-    return os.environ.get(
-        "NEMO_RL_QWEN35_ALLOW_NON_MONOTONIC_PREFIX", "0"
-    ).lower() not in {"0", "false", "no"}
-
-
 def _qwen35_truncate_prompt_tokens() -> Optional[int]:
     value = os.environ.get("NEMO_RL_QWEN35_TRUNCATE_PROMPT_TOKENS", "65535")
     if value.lower() in {"", "0", "false", "none", "no"}:
@@ -367,35 +361,6 @@ def _log_qwen35_pre_replace_context(
     )
 
 
-def _qwen35_fallback_to_template_tokens(
-    tokenizer,
-    reason: str,
-    model_prefix_token_ids: list[int],
-    template_prefix_token_ids: list[int],
-    template_token_ids: list[int],
-) -> Optional[list[int]]:
-    if not _allow_qwen35_monotonic_fallback():
-        return None
-
-    logger.warning(
-        "Qwen 3.5 vLLM monotonic-prefix fallback (%s): using normal chat "
-        "template tokens instead of raising. lengths: model_prefix=%d, "
-        "template_prefix=%d, template=%d",
-        reason,
-        len(model_prefix_token_ids),
-        len(template_prefix_token_ids),
-        len(template_token_ids),
-    )
-    _log_qwen35_prefix_diagnostic(
-        tokenizer=tokenizer,
-        reason=reason,
-        model_prefix_token_ids=model_prefix_token_ids,
-        template_prefix_token_ids=template_prefix_token_ids,
-        template_token_ids=template_token_ids,
-    )
-    return template_token_ids
-
-
 def _find_nth_token_from_end(token_ids: list[int], token_id: int, n: int) -> int:
     if n <= 0:
         return -1
@@ -543,16 +508,13 @@ def _replace_prefix_tokens(
         if repaired_token_ids is not None:
             return repaired_token_ids
 
-        fallback_token_ids = _qwen35_fallback_to_template_tokens(
+        _log_qwen35_prefix_diagnostic(
             tokenizer=tokenizer,
             reason="template_has_no_suffix_after_prefix",
             model_prefix_token_ids=model_prefix_token_ids,
             template_prefix_token_ids=template_prefix_token_ids,
             template_token_ids=template_token_ids,
         )
-        if fallback_token_ids is not None:
-            return fallback_token_ids
-
         error_message = f"""Found possibly non-monotonically increasing trajectory!
 Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}
 
@@ -578,16 +540,13 @@ Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}
     if (
         template_cut_start < 0
     ):
-        fallback_token_ids = _qwen35_fallback_to_template_tokens(
+        _log_qwen35_prefix_diagnostic(
             tokenizer=tokenizer,
             reason="template_prefix_has_no_eos",
             model_prefix_token_ids=model_prefix_token_ids,
             template_prefix_token_ids=template_prefix_token_ids,
             template_token_ids=template_token_ids,
         )
-        if fallback_token_ids is not None:
-            return fallback_token_ids
-
         error_message = f"""No EOS token ID found in the chat-templated messages!
 Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}
 

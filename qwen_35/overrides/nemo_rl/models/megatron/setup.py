@@ -137,32 +137,7 @@ def _patch_qwen35_gdn_cu_seqlens() -> None:
     GatedDeltaNet._resolve_cu_seqlens = _resolve_cu_seqlens_qwen35
 
 
-def _patch_qwen35_gdn_torch_fallback() -> None:
-    if os.environ.get("NEMO_RL_QWEN35_FORCE_TORCH_GDN", "0") != "1":
-        return
-
-    try:
-        from megatron.core.ssm import gated_delta_net as gdn_module
-    except Exception as exc:
-        warnings.warn(f"Could not install Qwen 3.5 GDN torch fallback patch: {exc}")
-        return
-
-    GatedDeltaNet = gdn_module.GatedDeltaNet
-    torch_chunk_gated_delta_rule = gdn_module.torch_chunk_gated_delta_rule
-    original_init = GatedDeltaNet.__init__
-    if getattr(original_init, "_qwen35_torch_gdn_patch", False):
-        return
-
-    def _init_with_torch_gdn(self, *args, **kwargs):
-        original_init(self, *args, **kwargs)
-        self.gated_delta_rule = torch_chunk_gated_delta_rule
-
-    _init_with_torch_gdn._qwen35_torch_gdn_patch = True
-    GatedDeltaNet.__init__ = _init_with_torch_gdn
-
-
 _patch_qwen35_gdn_cu_seqlens()
-_patch_qwen35_gdn_torch_fallback()
 
 
 def destroy_parallel_state():
