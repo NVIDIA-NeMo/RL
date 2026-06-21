@@ -75,8 +75,6 @@ class NemoGymConfig(TypedDict):
     initial_global_config_dict: Dict[str, Any]
     invalid_tool_call_patterns: Optional[List[str]]  # Substrings in assistant text content that indicate an invalid tool call (default: ["<tool_call>", "</tool_call>", "<function_call>", "</function_call>"])
     thinking_tags: Optional[List[str]]  # Thinking tags to check for malformed usage (default: ["<think>", "</think>"])
-    diagnose_noncontiguous_message_tokens: Optional[bool]  # Emit decoded token windows around the first mismatch for temporary debugging.
-    noncontiguous_message_diagnostic_window: Optional[int]  # Number of tokens to show on each side of the mismatch.
 
 
 def _summarize_token_ids(token_ids: Any, limit: int = 32) -> str:
@@ -100,58 +98,6 @@ def _first_token_mismatch(left: torch.Tensor, right: torch.Tensor) -> Optional[i
     if len(left) != len(right):
         return compare_len
     return None
-
-
-def _decode_token_ids(tokenizer: PreTrainedTokenizerBase, token_ids: Any) -> str:
-    if isinstance(token_ids, torch.Tensor):
-        values = token_ids.tolist()
-    else:
-        values = list(token_ids)
-    try:
-        return tokenizer.decode(
-            values,
-            skip_special_tokens=False,
-            clean_up_tokenization_spaces=False,
-        )
-    except TypeError:
-        return tokenizer.decode(values, skip_special_tokens=False)
-    except Exception as exc:
-        return f"<decode failed: {exc!r}>"
-
-
-def _noncontiguous_token_diagnostic(
-    tokenizer: PreTrainedTokenizerBase,
-    seen_token_ids: torch.Tensor,
-    prompt_token_ids: torch.Tensor,
-    mismatch_idx: Optional[int],
-    window: int,
-) -> str:
-    if mismatch_idx is None:
-        mismatch_idx = min(len(seen_token_ids), len(prompt_token_ids))
-
-    start = max(0, mismatch_idx - window)
-    end = min(max(len(seen_token_ids), len(prompt_token_ids)), mismatch_idx + window + 1)
-    seen_window = seen_token_ids[start : min(end, len(seen_token_ids))]
-    prompt_window = prompt_token_ids[start : min(end, len(prompt_token_ids))]
-
-    return "\n".join(
-        [
-            "Non-contiguous message token diagnostic:",
-            f"  mismatch_idx={mismatch_idx}, window=[{start}:{end}), seen_len={len(seen_token_ids)}, prompt_len={len(prompt_token_ids)}",
-            f"  seen_ids={seen_window.tolist()}",
-            f"  prompt_ids={prompt_window.tolist()}",
-            f"  seen_text={_decode_token_ids(tokenizer, seen_window)!r}",
-            f"  prompt_text={_decode_token_ids(tokenizer, prompt_window)!r}",
-        ]
-    )
-
-
-def _bool_flag(value: Any, default: bool = False) -> bool:
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _timer_with_optional_context(context: dict[str, Any]) -> Timer:
@@ -403,37 +349,6 @@ First mismatch index: {mismatch_idx}
 Seen token IDs summary: {_summarize_token_ids(seen_token_ids)}
 Output prompt token IDs summary: {_summarize_token_ids(output_item_dict["prompt_token_ids"])}
 """
-                    diagnose_noncontiguous = self.cfg.get(
-                        "diagnose_noncontiguous_message_tokens"
-                    )
-                    if diagnose_noncontiguous is None:
-                        diagnose_noncontiguous = os.environ.get(
-                            "NEMO_RL_DIAGNOSE_NONCONTIGUOUS_MESSAGE_TOKENS"
-                        )
-                    if _bool_flag(diagnose_noncontiguous, default=False):
-                        diagnostic_window = self.cfg.get(
-                            "noncontiguous_message_diagnostic_window"
-                        )
-                        if diagnostic_window is None:
-                            diagnostic_window = os.environ.get(
-                                "NEMO_RL_NONCONTIGUOUS_MESSAGE_DIAGNOSTIC_WINDOW",
-                                48,
-                            )
-                        try:
-                            diagnostic_window = int(diagnostic_window)
-                        except (TypeError, ValueError):
-                            diagnostic_window = 48
-                        print(
-                            _noncontiguous_token_diagnostic(
-                                tokenizer=tokenizer,
-                                seen_token_ids=seen_token_ids,
-                                prompt_token_ids=prompt_token_ids_tensor,
-                                mismatch_idx=mismatch_idx,
-                                window=max(0, diagnostic_window),
-                            ),
-                            file=sys.stderr,
-                        )
-
                     raise AssertionError(message)
 
             n_seen = len(seen_token_ids)
