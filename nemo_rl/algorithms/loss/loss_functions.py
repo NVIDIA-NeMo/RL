@@ -959,7 +959,7 @@ class DPOLossFn(PreferenceLossFn):
     loss_type = LossType.SEQUENCE_LEVEL
     input_type = LossInputType.LOGPROB
 
-    def __init__(self, cfg: DPOLossConfig, use_linear_ce_fusion: bool = False):
+    def __init__(self, cfg: DPOLossConfig, use_fused_linear_logprobs: bool = False):
         self.reference_policy_kl_penalty = cfg.reference_policy_kl_penalty
         self.preference_loss_weight = cfg.preference_loss_weight
         self.sft_loss_weight = cfg.sft_loss_weight
