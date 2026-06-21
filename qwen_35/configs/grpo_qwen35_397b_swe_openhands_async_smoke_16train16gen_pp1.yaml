@@ -1,0 +1,22 @@
+# Qwen 3.5 SWE/OpenHands smoke config for fast rollout debugging.
+#
+# Inherits the grpo-smoke parity recipe based on optimized job 3465015,
+# but uses 16 training nodes + 16 generation nodes and PP=1 so smoke
+# tests queue faster. Once rollouts are proven real, switch back to the
+# full PP=2 / 32+32-node parity config.
+
+defaults: grpo_qwen35_397b_swe_openhands_async_grposmoke_3465015_resolved.yaml
+
+cluster:
+  num_nodes: 32
+
+policy:
+  megatron_cfg:
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+  generation:
+    colocated:
+      resources:
+        num_nodes: 16
+        gpus_per_node: 4
