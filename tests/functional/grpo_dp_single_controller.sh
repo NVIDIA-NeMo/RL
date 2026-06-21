@@ -38,13 +38,11 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     data_plane.enabled=true \
     data_plane.impl=transfer_queue \
     data_plane.backend=simple \
-    staleness.min_prompt_groups_per_batch=2 \
-    staleness.target_prompt_groups_per_step=2 \
-    staleness.batch_selection_strategy=strict_on_policy \
-    staleness.generations_per_prompt=4 \
-    concurrency.max_inflight_prompts=4 \
-    concurrency.max_buffered_rollouts=4 \
-    training.max_train_steps=2 \
+    async_rl.min_prompt_groups_per_batch=2 \
+    async_rl.target_prompt_groups_per_step=2 \
+    async_rl.batch_selection_strategy=strict_on_policy \
+    async_rl.max_inflight_prompts=4 \
+    async_rl.max_buffered_rollouts=4 \
     $@ \
     2>&1 | tee $RUN_LOG
 
