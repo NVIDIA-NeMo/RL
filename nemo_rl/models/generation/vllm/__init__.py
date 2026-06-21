@@ -11,10 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 from nemo_rl.models.generation.vllm.config import VllmConfig
-from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration
-from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorker
-from nemo_rl.models.generation.vllm.vllm_worker_async import VllmAsyncGenerationWorker
 
 __all__ = [
     "VllmConfig",
@@ -22,3 +20,23 @@ __all__ = [
     "VllmGenerationWorker",
     "VllmAsyncGenerationWorker",
 ]
+
+
+def __getattr__(name):
+    # Qwen 3.5 smoke tests run several Ray actors that only need VllmConfig.
+    # Avoid importing worker modules until a caller explicitly asks for them.
+    if name == "VllmGeneration":
+        from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration
+
+        return VllmGeneration
+    if name == "VllmGenerationWorker":
+        from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorker
+
+        return VllmGenerationWorker
+    if name == "VllmAsyncGenerationWorker":
+        from nemo_rl.models.generation.vllm.vllm_worker_async import (
+            VllmAsyncGenerationWorker,
+        )
+
+        return VllmAsyncGenerationWorker
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -11,24 +11,166 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import asyncio
+import os
+import sys
+import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, TypedDict
+from typing import Any, Dict, List, Optional, TypedDict
 
-import aiohttp
 import ray
 import torch
 from transformers import PreTrainedTokenizerBase
 
-from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
+try:
+    from nemo_rl.distributed.virtual_cluster import (
+        DEFAULT_PORT_RANGE_HIGH,
+        DEFAULT_PORT_RANGE_LOW,
+        _get_free_port_local,
+        _get_node_ip_local,
+    )
+except ImportError:
+    from nemo_rl.distributed.virtual_cluster import (
+        _get_free_port_local as _get_free_port_local_unranged,
+        _get_node_ip_local,
+    )
+
+    DEFAULT_PORT_RANGE_LOW = 11001
+    DEFAULT_PORT_RANGE_HIGH = 15000
+
+    def _get_free_port_local(port_range_low=None, port_range_high=None):
+        return _get_free_port_local_unranged()
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.utils.timer import Timer
+
+
+def get_nemo_gym_uv_cache_dir() -> Optional[str]:
+    """Return the uv cache directory inside a container, or None outside one.
+
+    Inside a container (NRL_CONTAINER=1), returns the uv cache location so Gym
+    stores its caches in the expected shared path. Returns None outside a
+    container, meaning the caller should omit this arg and let Gym create the
+    cache locally (the default when you may not be able to write to /opt).
+    """
+    if not os.environ.get("NRL_CONTAINER"):
+        return None
+    return subprocess.check_output(["uv", "cache", "dir"]).decode().strip()
+
+
+def get_nemo_gym_venv_dir() -> Optional[str]:
+    """Return the NeMo Gym venv directory from NEMO_GYM_VENV_DIR, or None.
+
+    Returns the value of NEMO_GYM_VENV_DIR if set, otherwise None. When None
+    the caller should omit this arg and let Gym create venvs locally (the
+    default when a container is not used since you may not be able to write
+    to /opt).
+    """
+    return os.environ.get("NEMO_GYM_VENV_DIR")
 
 
 class NemoGymConfig(TypedDict):
     model_name: str
     base_urls: List[str]
+    ray_num_gpus_per_node: Optional[int]
+    ray_namespace: Optional[str]
     initial_global_config_dict: Dict[str, Any]
+    invalid_tool_call_patterns: Optional[List[str]]  # Substrings in assistant text content that indicate an invalid tool call (default: ["<tool_call>", "</tool_call>", "<function_call>", "</function_call>"])
+    thinking_tags: Optional[List[str]]  # Thinking tags to check for malformed usage (default: ["<think>", "</think>"])
+    allow_noncontiguous_message_tokens: Optional[bool]  # Qwen reasoning/tool parsing can make template-retokenized history differ from returned prefix IDs.
+    diagnose_noncontiguous_message_tokens: Optional[bool]  # Emit decoded token windows around the first mismatch for temporary debugging.
+    noncontiguous_message_diagnostic_window: Optional[int]  # Number of tokens to show on each side of the mismatch.
+
+
+def _summarize_token_ids(token_ids: Any, limit: int = 32) -> str:
+    """Return a bounded token-id summary for assertion diagnostics."""
+    if isinstance(token_ids, torch.Tensor):
+        values = token_ids.tolist()
+    else:
+        values = list(token_ids)
+
+    length = len(values)
+    if length <= 2 * limit:
+        return f"len={length}, ids={values}"
+    return f"len={length}, head={values[:limit]}, tail={values[-limit:]}"
+
+
+def _first_token_mismatch(left: torch.Tensor, right: torch.Tensor) -> Optional[int]:
+    compare_len = min(len(left), len(right))
+    for idx in range(compare_len):
+        if left[idx].item() != right[idx].item():
+            return idx
+    if len(left) != len(right):
+        return compare_len
+    return None
+
+
+def _decode_token_ids(tokenizer: PreTrainedTokenizerBase, token_ids: Any) -> str:
+    if isinstance(token_ids, torch.Tensor):
+        values = token_ids.tolist()
+    else:
+        values = list(token_ids)
+    try:
+        return tokenizer.decode(
+            values,
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+    except TypeError:
+        return tokenizer.decode(values, skip_special_tokens=False)
+    except Exception as exc:
+        return f"<decode failed: {exc!r}>"
+
+
+def _noncontiguous_token_diagnostic(
+    tokenizer: PreTrainedTokenizerBase,
+    seen_token_ids: torch.Tensor,
+    prompt_token_ids: torch.Tensor,
+    mismatch_idx: Optional[int],
+    window: int,
+) -> str:
+    if mismatch_idx is None:
+        mismatch_idx = min(len(seen_token_ids), len(prompt_token_ids))
+
+    start = max(0, mismatch_idx - window)
+    end = min(max(len(seen_token_ids), len(prompt_token_ids)), mismatch_idx + window + 1)
+    seen_window = seen_token_ids[start : min(end, len(seen_token_ids))]
+    prompt_window = prompt_token_ids[start : min(end, len(prompt_token_ids))]
+
+    return "\n".join(
+        [
+            "Non-contiguous message token diagnostic:",
+            f"  mismatch_idx={mismatch_idx}, window=[{start}:{end}), seen_len={len(seen_token_ids)}, prompt_len={len(prompt_token_ids)}",
+            f"  seen_ids={seen_window.tolist()}",
+            f"  prompt_ids={prompt_window.tolist()}",
+            f"  seen_text={_decode_token_ids(tokenizer, seen_window)!r}",
+            f"  prompt_text={_decode_token_ids(tokenizer, prompt_window)!r}",
+        ]
+    )
+
+
+def _bool_flag(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _timer_with_optional_context(context: dict[str, Any]) -> Timer:
+    try:
+        return Timer(context=context)
+    except TypeError as exc:
+        if "context" not in str(exc):
+            raise
+        return Timer()
+
+
+def _timer_time(timer: Timer, label: str, should_log: bool = False):
+    try:
+        return timer.time(label=label, should_log=should_log)
+    except TypeError as exc:
+        if "should_log" not in str(exc):
+            raise
+        return timer.time(label=label)
 
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
@@ -38,8 +180,11 @@ class NemoGym(EnvironmentInterface):
     def __init__(self, cfg: NemoGymConfig):
         self.cfg = cfg
 
+    def _spinup(self) -> None:
         self.node_ip = _get_node_ip_local()
-        self.head_server_port = _get_free_port_local()
+        port_range_low = self.cfg.get("port_range_low", DEFAULT_PORT_RANGE_LOW)
+        port_range_high = self.cfg.get("port_range_high", DEFAULT_PORT_RANGE_HIGH)
+        self.head_server_port = _get_free_port_local(port_range_low, port_range_high)
 
         from nemo_gym.cli import GlobalConfigDictParserConfig, RunHelper
         from nemo_gym.rollout_collection import RolloutCollectionHelper
@@ -59,6 +204,18 @@ class NemoGym(EnvironmentInterface):
         )
         initial_global_config_dict["policy_base_url"] = self.cfg["base_urls"]
 
+        # Gym servers default to 5000-5999, below the OS ephemeral floor (9000
+        # on OCI-HSG).  See ray.sub port layout comment for the full map.
+        _gym_port_low = self.cfg.get("port_range_low", 5000)
+        _gym_port_high = self.cfg.get("port_range_high", 5999)
+        if _gym_port_low < 5000 or _gym_port_high > 5999:
+            print(
+                f"WARNING: Gym port range [{_gym_port_low}, {_gym_port_high}) is outside "
+                f"the expected 5000-5999 band. Check ray.sub port layout for conflicts."
+            )
+        initial_global_config_dict["port_range_low"] = _gym_port_low
+        initial_global_config_dict["port_range_high"] = _gym_port_high
+
         initial_global_config_dict.setdefault(
             "global_aiohttp_connector_limit_per_host", 16_384
         )
@@ -77,6 +234,16 @@ Depending on your data shape, you may want to change these values."""
 
         initial_global_config_dict["ray_head_node_address"] = ray_context.gcs_address
         print(f"Ray head node address: {ray_context.gcs_address}")
+
+        ray_namespace = self.cfg.get("ray_namespace", None)
+        if ray_namespace is not None:
+            initial_global_config_dict["ray_namespace"] = ray_namespace
+            print(f"Ray namespace: {ray_namespace}")
+
+        ray_num_gpus_per_node = self.cfg.get("ray_num_gpus_per_node")
+        if ray_num_gpus_per_node is not None:
+            initial_global_config_dict["ray_num_gpus_per_node"] = ray_num_gpus_per_node
+            print(f"Ray num GPUs per node: {ray_num_gpus_per_node}")
 
         # Head server
         initial_global_config_dict[HEAD_SERVER_KEY_NAME] = {
@@ -99,7 +266,7 @@ Depending on your data shape, you may want to change these values."""
                 / "nemo_gym_env.yaml",
                 initial_global_config_dict=DictConfig(initial_global_config_dict),
                 skip_load_from_cli=True,
-            )
+            ),
         )
 
         # Setup for rollout collection
@@ -110,6 +277,8 @@ Depending on your data shape, you may want to change these values."""
         self.rch = RolloutCollectionHelper()
 
     def health_check(self) -> bool:
+        if not hasattr(self, "rh"):
+            self._spinup()
         return True
 
     async def run_rollouts(
@@ -117,98 +286,86 @@ Depending on your data shape, you may want to change these values."""
         nemo_gym_examples: list[dict],
         tokenizer: PreTrainedTokenizerBase,
         timer_prefix: str,
-    ) -> list[dict]:
-        timer = Timer()
+    ) -> tuple[list[dict], dict]:
+        import sys
+        from collections import Counter
+
+        try:
+            from nemo_rl.utils.fastokens import maybe_patch_fastokens
+        except ImportError:
+            def maybe_patch_fastokens():
+                return None
+
+        maybe_patch_fastokens()
+
+        if not hasattr(self, "rch"):
+            self._spinup()
+
+        timer = _timer_with_optional_context({"worker": "nemo_gym"})
+
+        counts_left = Counter(r["agent_ref"]["name"] for r in nemo_gym_examples)
 
         timer.start("_run_rollouts_total")
-        max_attempts, trial = self.rollout_max_attempts_to_avoid_lp_nan, 0
-        while trial < max_attempts:
-            nemo_gym_num_rows = len(nemo_gym_examples)
-            nemo_gym_result_iterator = self.rch.run_examples(
-                examples=nemo_gym_examples, head_server_config=self.head_server_config
-            )
+        nemo_gym_result_iterator = self.rch.run_examples(
+            examples=nemo_gym_examples,
+            head_server_config=self.head_server_config,
+        )
 
-            nemo_rl_rowidxs = []
-            nemo_rl_results = []
-            for task in nemo_gym_result_iterator:
+        num_results = 0
+        nemo_rl_rowidxs = []
+        nemo_rl_results = []
+        timing_metrics = {}
+        for task in nemo_gym_result_iterator:
+            with _timer_time(timer, label=f"{timer_prefix}/await_results", should_log=False):
                 try:
-                    with timer.time(label=f"{timer_prefix}/await_results"):
-                        nemo_gym_row, nemo_gym_result = await task
-                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                    # A single rollout's gym /run failed at the transport/HTTP layer (a flaky instance
-                    # returned 500, a connection dropped, or it timed out). Don't abort the whole batch
-                    # over one instance -- the failed row is left as an empty slot in the rowidx-sorted
-                    # array below and back-filled there with a zero-reward degenerate trajectory (same
-                    # path as the no-generation-data case). We can't recover the row's _rowidx from the
-                    # failed task, so the back-fill works off the empty slots instead. Logged loudly so
-                    # a SYSTEMIC failure (many rows failing -> ~0 mean reward) stays visible.
-                    print(
-                        f"  [nemo_gym] WARNING: rollout failed ({type(e).__name__}: {e}); "
-                        f"will back-fill as a zero-reward trajectory instead of aborting the batch.",
-                        flush=True,
-                    )
-                    continue
+                    nemo_gym_row, nemo_gym_result = await task
+                except Exception as e:
+                    # This response content comes from https://github.com/NVIDIA-NeMo/Gym/blob/30f498b1e994679cebcfacfa4ac630190d0e171f/nemo_gym/server_utils.py#L233
+                    if hasattr(e, "response_content"):
+                        print("EXCEPTION RESULT", e.response_content, file=sys.stderr)
+                    raise e
 
-                with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                    nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                        nemo_gym_result, tokenizer
-                    )
-
-                nemo_rl_rowidxs.append(nemo_gym_row["_rowidx"])
-                nemo_rl_results.append(nemo_rl_result)
-
-            # determine if generation_logprobs contain NaN; if not, break;
-            logprob_contains_nan = False
-            for nemo_rl_result in nemo_rl_results:
+            with _timer_time(timer, label=f"{timer_prefix}/postprocess_results", should_log=False):
+                nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
+                    nemo_gym_result, tokenizer
+                )
                 for message in nemo_rl_result["message_log"]:
                     if (
                         "generation_logprobs" in message
                         and message["generation_logprobs"] is not None
                     ):
                         if torch.isnan(message["generation_logprobs"]).any():
-                            logprob_contains_nan = True
-                            break
-            if logprob_contains_nan:
-                trial += 1
-                print(
-                    f"Generation logprobs contain NaN; retrying... (trial {trial}/{max_attempts})"
-                )
-                continue
-            else:
-                break
+                            raise RuntimeError(
+                                f"Generation logprobs contain NaN! Failing loudly"
+                            )
 
-        nemo_rl_sort_results = [None] * nemo_gym_num_rows
+            num_results += 1
+            if num_results == len(nemo_gym_examples):
+                timer.stop("_run_rollouts_total")
+                timing_metrics = timer.get_timing_metrics("sum")
+                total_time = timing_metrics.pop("_run_rollouts_total")
+                timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = (
+                    100 * timing_metrics[f"{timer_prefix}/postprocess_results"] / total_time
+                )
+
+            nemo_rl_rowidxs.append(nemo_gym_row["_rowidx"])
+            nemo_rl_results.append(nemo_rl_result)
+
+            counts_left[nemo_gym_row["agent_ref"]["name"]] -= 1
+            if counts_left[nemo_gym_row["agent_ref"]["name"]] <= 0:
+                counts_left.pop(nemo_gym_row["agent_ref"]["name"])
+            # Print every 10 rollouts
+            if num_results % 10 == 0:
+                # Only print top 5
+                top_left = counts_left.most_common(5)
+                top_left_str = "\n".join(f"{i + 1}. {k}: {v}" for i, (k, v) in enumerate(top_left))
+                print(f"Top 5 NeMo Gym agent refs left in this rollout batch: {top_left_str}", file=sys.stderr)
+
+        nemo_rl_sort_results = [None] * len(nemo_gym_examples)
         for rowidx, result in zip(nemo_rl_rowidxs, nemo_rl_results):
             nemo_rl_sort_results[rowidx] = result
-        # Back-fill rows whose rollout failed above (left as None) with a zero-reward degenerate
-        # trajectory, so batch/group counts stay intact (force_on_policy_ratio needs the full
-        # num_prompts*num_generations batch). We synthesize an empty gym result and run it through
-        # the same postprocess path the no-generation-data case uses (builds a fresh, masked,
-        # reward-0 trajectory per slot -- no aliasing, since downstream mutates message_log in place).
-        num_failed = sum(1 for r in nemo_rl_sort_results if r is None)
-        if num_failed:
-            print(
-                f"  [nemo_gym] WARNING: back-filling {num_failed}/{nemo_gym_num_rows} failed "
-                f"rollout(s) as zero-reward trajectories (batch counts preserved).",
-                flush=True,
-            )
-            for i in range(nemo_gym_num_rows):
-                if nemo_rl_sort_results[i] is None:
-                    nemo_rl_sort_results[i] = (
-                        self._postprocess_nemo_gym_to_nemo_rl_result(
-                            {"response": {"output": []}}, tokenizer
-                        )
-                    )
-        nemo_rl_results = nemo_rl_sort_results
 
-        timer.stop("_run_rollouts_total")
-        timing_metrics = timer.get_timing_metrics("sum")
-        total_time = timing_metrics.pop("_run_rollouts_total")
-        timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = (
-            100 * timing_metrics[f"{timer_prefix}/postprocess_results"] / total_time
-        )
-
-        return nemo_rl_results, timing_metrics
+        return nemo_rl_sort_results, timing_metrics
 
     def _postprocess_nemo_gym_to_nemo_rl_result(
         self, nemo_gym_result: dict, tokenizer: PreTrainedTokenizerBase
@@ -218,7 +375,9 @@ Depending on your data shape, you may want to change these values."""
         )
 
         nemo_rl_message_log = []
-        seen_token_ids: List[int] = []
+        seen_token_ids = torch.tensor([], dtype=torch.int64)
+
+        batch_decode_items = []  # Collect (output_item_dict, prompt_token_ids, generation_token_ids) for batch decode
         for output_item_dict in nemo_gym_result["response"]["output"]:
             # Nemo RL really only has two types of messages: assistant and not assistant since that is all that it is concerned with (i.e. to train or not to train)
             # Here we map all the trainable messages to assistant and all the non-trainable messages to user.
@@ -228,108 +387,185 @@ Depending on your data shape, you may want to change these values."""
             if "generation_token_ids" not in output_item_dict:
                 continue
 
-            assert (
-                seen_token_ids
-                == output_item_dict["prompt_token_ids"][: len(seen_token_ids)]
-            ), f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
-Seen token IDs: {seen_token_ids}
-Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
+            prompt_token_ids_tensor = torch.tensor(
+                output_item_dict["prompt_token_ids"], dtype=torch.int64
+            )
+            n_seen = len(seen_token_ids)
+            if n_seen > 0:
+                is_contiguous = torch.equal(
+                    seen_token_ids, prompt_token_ids_tensor[:n_seen]
+                )
+                if not is_contiguous:
+                    mismatch_idx = _first_token_mismatch(
+                        seen_token_ids, prompt_token_ids_tensor[:n_seen]
+                    )
+                    message = f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
+First mismatch index: {mismatch_idx}
+Seen token IDs summary: {_summarize_token_ids(seen_token_ids)}
+Output prompt token IDs summary: {_summarize_token_ids(output_item_dict["prompt_token_ids"])}
 """
+                    allow_noncontiguous = self.cfg.get(
+                        "allow_noncontiguous_message_tokens"
+                    )
+                    if allow_noncontiguous is None:
+                        allow_noncontiguous = os.environ.get(
+                            "NEMO_RL_ALLOW_NONCONTIGUOUS_MESSAGE_TOKENS"
+                        )
+                    if not _bool_flag(allow_noncontiguous, default=True):
+                        raise AssertionError(message)
+
+                    print(
+                        "WARNING: " + message.strip().replace("\n", " ")
+                        + " Collapsing this trajectory to the current turn.",
+                        file=sys.stderr,
+                    )
+
+                    diagnose_noncontiguous = self.cfg.get(
+                        "diagnose_noncontiguous_message_tokens"
+                    )
+                    if diagnose_noncontiguous is None:
+                        diagnose_noncontiguous = os.environ.get(
+                            "NEMO_RL_DIAGNOSE_NONCONTIGUOUS_MESSAGE_TOKENS"
+                        )
+                    if _bool_flag(diagnose_noncontiguous, default=False):
+                        diagnostic_window = self.cfg.get(
+                            "noncontiguous_message_diagnostic_window"
+                        )
+                        if diagnostic_window is None:
+                            diagnostic_window = os.environ.get(
+                                "NEMO_RL_NONCONTIGUOUS_MESSAGE_DIAGNOSTIC_WINDOW",
+                                48,
+                            )
+                        try:
+                            diagnostic_window = int(diagnostic_window)
+                        except (TypeError, ValueError):
+                            diagnostic_window = 48
+                        print(
+                            _noncontiguous_token_diagnostic(
+                                tokenizer=tokenizer,
+                                seen_token_ids=seen_token_ids,
+                                prompt_token_ids=prompt_token_ids_tensor,
+                                mismatch_idx=mismatch_idx,
+                                window=max(0, diagnostic_window),
+                            ),
+                            file=sys.stderr,
+                        )
+
+                    nemo_rl_message_log = []
+                    seen_token_ids = torch.tensor([], dtype=torch.int64)
+                    n_seen = 0
+
+            n_seen = len(seen_token_ids)
+
+            # Create tensors for new tokens
+            new_prompt_token_ids = torch.tensor(
+                output_item_dict["prompt_token_ids"][n_seen:], dtype=torch.int64
+            )
+            generation_token_ids = torch.tensor(
+                output_item_dict["generation_token_ids"], dtype=torch.int64
+            )
+            generation_logprobs = torch.tensor(
+                output_item_dict["generation_log_probs"], dtype=torch.float32
+            )
+
 
             nemo_rl_message_log.append(
                 {
                     "role": "user",
                     "content": "",
-                    "token_ids": torch.tensor(
-                        output_item_dict["prompt_token_ids"][len(seen_token_ids) :]
-                    ),
+                    "token_ids": new_prompt_token_ids,
                 }
             )
-            # Flag a dropped/unparseable tool call so GRPO can apply
-            # grpo.invalid_tool_call_strategy. When the tool parser (e.g. hermes) successfully
-            # parses an assistant tool call, vLLM strips the <tool_call>...</tool_call> tags out
-            # of the message `content` and moves the call into the structured tool_calls field. If
-            # those raw tags survive in `content`, the parser failed (e.g. the model stuffed an
-            # un-escaped code patch into the JSON args -- the hermes-on-Instruct failure mode) and
-            # the call was dropped. The marker is hermes-specific; XML parsers (qwen3_coder) never
-            # emit these tags, so it stays False there and the strategy is inert.
+            # Valid tool calls go through the structured API (tool_calls field) and get
+            # executed by NeMo-Gym. If tool call patterns appear in the text content instead,
+            # the call was invalid and never executed — flag it so training can penalize it.
+            invalid_tool_call_patterns = self.cfg.get("invalid_tool_call_patterns") or ["<tool_call>", "</tool_call>", "<function_call>", "</function_call>"]
             is_invalid_tool_call = False
-            content = output_item_dict.get("content")
-            if content and isinstance(content[0], dict) and content[0].get("text"):
-                assistant_text = content[0]["text"]
-                if "<tool_call>" in assistant_text or "</tool_call>" in assistant_text:
+
+            # NeMo-Gym only attaches generation_token_ids to the last output item of a
+            # model call (see vllm_model/app.py postprocess_chat_response). So this item
+            # is guaranteed to be the final thing the model produced for this turn.
+            # If it's a reasoning item, the model output only reasoning (no content/tool calls).
+            is_output_message = "content" in output_item_dict and len(output_item_dict["content"]) > 0 and "text" in output_item_dict["content"][0]
+            is_reasoning_message = output_item_dict.get("type") == "reasoning" and len(output_item_dict["summary"]) > 0 and "text" in output_item_dict["summary"][0]
+
+            if is_output_message:
+                assistant_message_content = output_item_dict["content"][0]["text"]
+                if any(pattern in assistant_message_content for pattern in invalid_tool_call_patterns):
+                    is_invalid_tool_call = True
+            elif is_reasoning_message:
+                assistant_message_content = output_item_dict["summary"][0]["text"]
+                if any(pattern in assistant_message_content for pattern in invalid_tool_call_patterns):
                     is_invalid_tool_call = True
 
             nemo_rl_message_log.append(
                 {
                     "role": "assistant",
                     "content": "",
-                    "token_ids": torch.tensor(output_item_dict["generation_token_ids"]),
-                    "generation_logprobs": torch.tensor(
-                        output_item_dict["generation_log_probs"]
-                    ),
+                    "token_ids": generation_token_ids,
+                    "generation_logprobs": generation_logprobs,
                     "is_invalid_tool_call": is_invalid_tool_call,
                 }
             )
 
-            seen_token_ids.extend(nemo_rl_message_log[-2]["token_ids"])
-            seen_token_ids.extend(nemo_rl_message_log[-1]["token_ids"])
+            seen_token_ids = torch.cat(
+                [seen_token_ids, new_prompt_token_ids, generation_token_ids]
+            )
 
             # We pop to remove larger tensors from logging.
-            output_item_dict["prompt_str"] = tokenizer.decode(
-                output_item_dict.pop("prompt_token_ids")
+            prompt_token_ids_for_decode = output_item_dict.pop("prompt_token_ids")
+            generation_token_ids_for_decode = output_item_dict.pop(
+                "generation_token_ids"
             )
-            output_item_dict["generation_str"] = tokenizer.decode(
-                output_item_dict.pop("generation_token_ids")
-            )
+
             output_item_dict.pop("generation_log_probs")
 
-        n_invalid_tool_calls = sum(
-            1 for m in nemo_rl_message_log if m.get("is_invalid_tool_call")
-        )
-        if n_invalid_tool_calls:
-            print(
-                f"  [invalid-tool-call] rollout produced {n_invalid_tool_calls} "
-                f"unparseable tool-call turn(s) (<tool_call> tags survived in content; "
-                f"flagged for grpo.invalid_tool_call_strategy)",
-                flush=True,
+            batch_decode_items.append(
+                (
+                    output_item_dict,
+                    prompt_token_ids_for_decode,
+                    generation_token_ids_for_decode,
+                )
             )
 
+        if batch_decode_items:
+            prompt_token_ids_batch = [item[1] for item in batch_decode_items]
+            generation_token_ids_batch = [item[2] for item in batch_decode_items]
+
+            prompt_strs = tokenizer.batch_decode(prompt_token_ids_batch)
+            generation_strs = tokenizer.batch_decode(generation_token_ids_batch)
+
+            for (output_item_dict, _, _), prompt_str, generation_str in zip(
+                batch_decode_items, prompt_strs, generation_strs
+            ):
+                output_item_dict["prompt_str"] = prompt_str
+                output_item_dict["generation_str"] = generation_str
+
         if not nemo_rl_message_log:
-            # A rollout came back with no assistant generation (the agent/container failed to produce
-            # a usable turn -- empirically ~0.3% of rollouts). This used to raise and abort the ENTIRE
-            # batch, which is fatal during validation where one flaky instance among many kills the run
-            # (and produces no val score). Instead, emit a degenerate ZERO-REWARD trajectory so the
-            # batch/group counts stay intact (num_gen per prompt-group; full val set) and the instance
-            # simply scores 0. The single placeholder assistant token carries NO generation_logprobs,
-            # so downstream GRPO masking (add_grpo_token_loss_masks_and_generation_logprobs) marks it
-            # non-trainable -> it cannot pollute the gradient.
-            # The degenerate trajectory's content is irrelevant (it's a masked, zero-reward sample),
-            # so use a minimal placeholder token rather than re-tokenizing the prompt -- apply_chat_template
-            # can return a tokenizers.Encoding that torch.tensor() can't consume.
-            fallback_token = (
-                tokenizer.pad_token_id
-                if tokenizer.pad_token_id is not None
-                else (tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0)
-            )
-            print(
-                "  [nemo_gym] WARNING: returned no generation data for a rollout; "
-                "treating as a zero-reward trajectory instead of aborting the batch.",
-                flush=True,
-            )
-            nemo_rl_message_log = [
-                {
-                    "role": "user",
-                    "content": "",
-                    "token_ids": torch.tensor([fallback_token, fallback_token]),
-                },
-                {
-                    "role": "assistant",
-                    "content": "",
-                    "token_ids": torch.tensor([fallback_token]),
-                },
+            input_messages = nemo_gym_result["responses_create_params"]["input"]
+            try:
+                prompt_token_ids = tokenizer.apply_chat_template(
+                    input_messages, tokenize=True
+                )
+                prompt_len_str = f"{len(prompt_token_ids)} tokens"
+            except Exception as e:
+                prompt_len_str = (
+                    f"<unknown — apply_chat_template failed: {type(e).__name__}: {e}>"
+                )
+            output_item_types = [
+                o.get("type") for o in nemo_gym_result["response"]["output"]
             ]
-            nemo_gym_result["reward"] = 0.0
+            raise ValueError(
+                f"NeMo Gym returned a result with no generation data. "
+                f"Possible causes: (1) the prompt for the first turn already exceeds the vLLM max_model_len, "
+                f"so vLLM rejected the request before any tokens could be generated; "
+                f"(2) all response output items were reasoning/tool-call items with no assistant generation.\n"
+                f"  Prompt length: {prompt_len_str}.\n"
+                f"  response.output item types ({len(output_item_types)} items): {output_item_types}.\n"
+                f"  → If (1): increase `policy.max_total_sequence_length` and `policy.generation.vllm_cfg.max_model_len` "
+                f"above the prompt length above.\n"
+                f"  → If (2): inspect why no assistant content was produced for this rollout."
+            )
 
         return {
             "message_log": nemo_rl_message_log,
@@ -338,7 +574,8 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
         }
 
     def shutdown(self) -> None:
-        self.rh.shutdown()
+        if hasattr(self, "rh"):
+            self.rh.shutdown()
 
     def step(self, message_log_batch, metadata):
         # This is not used since NeMo-Gym will handle the rollouts entirely.

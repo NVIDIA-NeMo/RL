@@ -126,8 +126,10 @@ mkdir -p "${OUT_DIR}/logs" "${OUT_DIR}/checkpoint" "${HOST_HF_HOME}"
 
 # Qwen 3.5 support lives in qwen_35/ so non-Qwen recipes keep the baked
 # container code. Selecting a recipe under qwen_35/ automatically mounts the
-# Qwen-specific config and file overlay into the container. Set QWEN35_OVERLAY=0
-# to disable, or QWEN35_OVERLAY=1 to force the overlay for another recipe.
+# Qwen-specific config into the container. On the qwen35-clobber branch the
+# default is to stage the real repo files that match the known-working
+# optimized/grpo-smoke path, rather than the qwen_35/overrides tree. Set
+# QWEN35_CLOBBER_FROM_REPO=0 to use the overlay-only mode.
 _qwen35_append_extra_mount() {
     local mount="$1"
     case ",${EXTRA_MOUNTS:-}," in
@@ -168,6 +170,35 @@ _qwen35_mount_tree() {
     done < <(find "${host_root}" -type f -print0)
 }
 
+_qwen35_stage_file() {
+    local host_file="$1"
+    local stage_root="$2"
+    local rel="$3"
+    local description="$4"
+
+    if [[ ! -f "${host_file}" ]]; then
+        echo "Error: ${description} file does not exist: ${host_file}" >&2
+        exit 1
+    fi
+
+    mkdir -p "$(dirname "${stage_root}/${rel}")"
+    cp -a "${host_file}" "${stage_root}/${rel}"
+    echo "Staged ${description}: ${host_file} -> ${stage_root}/${rel}"
+}
+
+_qwen35_mount_file() {
+    local host_file="$1"
+    local container_file="$2"
+    local description="$3"
+
+    if [[ ! -f "${host_file}" ]]; then
+        echo "Error: ${description} staged file does not exist: ${host_file}" >&2
+        exit 1
+    fi
+
+    _qwen35_append_extra_mount "${host_file}:${container_file}"
+}
+
 _qwen35_overlay_mode="${QWEN35_OVERLAY:-auto}"
 _qwen35_recipe="${RECIPE#./}"
 _qwen35_should_mount=0
@@ -188,22 +219,50 @@ esac
 if [[ "${_qwen35_should_mount}" == "1" ]]; then
     QWEN35_CONFIG_DIR="${QWEN35_CONFIG_DIR:-${REPO_LOCATION}/qwen_35/configs}"
     QWEN35_OVERLAY_DIR="${QWEN35_OVERLAY_DIR:-${REPO_LOCATION}/qwen_35/overrides}"
+    QWEN35_CLOBBER_FROM_REPO="${QWEN35_CLOBBER_FROM_REPO:-1}"
     QWEN35_MOUNT_STAGE_DIR="${QWEN35_MOUNT_STAGE_DIR:-${OUT_DIR}/qwen_35_mounts}"
     QWEN35_STAGED_CONFIG_DIR="${QWEN35_MOUNT_STAGE_DIR}/configs"
     QWEN35_STAGED_OVERLAY_DIR="${QWEN35_MOUNT_STAGE_DIR}/overrides"
-    _qwen35_stage_tree "${QWEN35_CONFIG_DIR}" "${QWEN35_STAGED_CONFIG_DIR}" "Qwen 3.5 config"
-    _qwen35_stage_tree "${QWEN35_OVERLAY_DIR}" "${QWEN35_STAGED_OVERLAY_DIR}" "Qwen 3.5 overlay"
-    _qwen35_mount_tree "${QWEN35_STAGED_CONFIG_DIR}" "${CONTAINER_REPO_LOCATION}/qwen_35/configs" "Qwen 3.5 staged config"
-    _qwen35_mount_tree "${QWEN35_STAGED_OVERLAY_DIR}" "${CONTAINER_REPO_LOCATION}" "Qwen 3.5 staged overlay"
+    QWEN35_CLOBBER_STAGE_DIR="${QWEN35_MOUNT_STAGE_DIR}/clobber"
 
-    # Defaults consumed by the Qwen-only overlay files. They are harmless for
-    # non-Qwen jobs because the overlay is not mounted for those recipes.
+    _qwen35_stage_tree "${QWEN35_CONFIG_DIR}" "${QWEN35_STAGED_CONFIG_DIR}" "Qwen 3.5 config"
+    _qwen35_mount_tree "${QWEN35_STAGED_CONFIG_DIR}" "${CONTAINER_REPO_LOCATION}/qwen_35/configs" "Qwen 3.5 staged config"
+
+    case "${QWEN35_CLOBBER_FROM_REPO}" in
+        0|false|False|no|NO)
+            _qwen35_stage_tree "${QWEN35_OVERLAY_DIR}" "${QWEN35_STAGED_OVERLAY_DIR}" "Qwen 3.5 overlay"
+            _qwen35_mount_tree "${QWEN35_STAGED_OVERLAY_DIR}" "${CONTAINER_REPO_LOCATION}" "Qwen 3.5 staged overlay"
+            ;;
+        1|true|True|yes|YES)
+            _qwen35_clobber_files=(
+                "nemo_rl/environments/nemo_gym.py"
+                "nemo_rl/models/generation/vllm/__init__.py"
+                "nemo_rl/models/generation/vllm/vllm_worker_async.py"
+                "nemo_rl/models/megatron/community_import.py"
+                "nemo_rl/models/megatron/setup.py"
+                "nemo_rl/models/policy/workers/megatron_policy_worker.py"
+                "3rdparty/Gym-workspace/Gym/responses_api_models/vllm_model/app.py"
+            )
+            for _qwen35_rel in "${_qwen35_clobber_files[@]}"; do
+                _qwen35_stage_file "${REPO_LOCATION}/${_qwen35_rel}" "${QWEN35_CLOBBER_STAGE_DIR}" "${_qwen35_rel}" "Qwen 3.5 clobber"
+                _qwen35_mount_file "${QWEN35_CLOBBER_STAGE_DIR}/${_qwen35_rel}" "${CONTAINER_REPO_LOCATION}/${_qwen35_rel}" "Qwen 3.5 clobber"
+            done
+            unset _qwen35_rel _qwen35_clobber_files
+            ;;
+        *)
+            echo "Error: QWEN35_CLOBBER_FROM_REPO must be 0 or 1; got '${QWEN35_CLOBBER_FROM_REPO}'." >&2
+            exit 1
+            ;;
+    esac
+
+    # Defaults consumed by the Qwen-only files. They are harmless for
+    # non-Qwen jobs because these files are not mounted for those recipes.
     export NEMO_RL_ALLOW_NONCONTIGUOUS_MESSAGE_TOKENS="${NEMO_RL_ALLOW_NONCONTIGUOUS_MESSAGE_TOKENS:-true}"
     export NEMO_RL_QWEN35_TRUNCATE_PROMPT_TOKENS="${NEMO_RL_QWEN35_TRUNCATE_PROMPT_TOKENS:-${QWEN35_TRUNCATE_PROMPT_TOKENS:-none}}"
     export NEMO_RL_QWEN35_FORCE_TORCH_GDN="${NEMO_RL_QWEN35_FORCE_TORCH_GDN:-${QWEN35_FORCE_TORCH_GDN:-0}}"
 fi
 unset _qwen35_overlay_mode _qwen35_recipe _qwen35_should_mount
-unset -f _qwen35_append_extra_mount _qwen35_stage_tree _qwen35_mount_tree
+unset -f _qwen35_append_extra_mount _qwen35_stage_tree _qwen35_mount_tree _qwen35_stage_file _qwen35_mount_file
 
 # Construct the command
 COMMAND=$(cat <<EOF
