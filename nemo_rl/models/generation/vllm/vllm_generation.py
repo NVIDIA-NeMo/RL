@@ -817,6 +817,9 @@ class VllmGeneration(GenerationInterface):
         try:
             # Use the worker group's shutdown method with the worker's cleanup method
             return self.worker_group.shutdown(cleanup_method="shutdown")
+        except ray.exceptions.RayActorError:
+            # Workers already dead (e.g., shut down via another handle to the same actors).
+            return True
         except Exception as e:
             print(f"Error during policy shutdown: {e}")
             return False
