@@ -148,6 +148,9 @@ class SingleControllerActor:
         # Count of in-flight generate_and_push calls
         self._inflight_rollouts: int = 0
 
+        # Cancellation handles for in-flight rollout dispatches.
+        self._dispatched_rollouts: set[asyncio.Task[None]] = set()
+
         # over_sampling=False batch gate: farthest trainer_version covered by
         # already-dispatched batches.
         self._max_rollout_version: int = -1
@@ -182,11 +185,17 @@ class SingleControllerActor:
 
         await train_task
 
+        # Cancel the rollout pump and any in-flight dispatches so we exit immediately.
         rollout_task.cancel()
         try:
             await rollout_task
         except asyncio.CancelledError:
             pass
+        inflight = list(self._dispatched_rollouts)
+        for task in inflight:
+            task.cancel()
+        if inflight:
+            await asyncio.gather(*inflight, return_exceptions=True)
 
         return {
             "train_steps": self._train_steps,
@@ -284,7 +293,9 @@ class SingleControllerActor:
                     await self._rollout_permitted.wait()
 
                     # dispatch rollout
-                    asyncio.create_task(_dispatch_one_prompt(prompt))
+                    task = asyncio.create_task(_dispatch_one_prompt(prompt))
+                    self._dispatched_rollouts.add(task)
+                    task.add_done_callback(self._dispatched_rollouts.discard)
             epoch += 1
 
         print(f"rollout_pump: completed {epoch} epoch(s)", flush=True)
