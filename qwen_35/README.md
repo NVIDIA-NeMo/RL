@@ -211,11 +211,11 @@ export QWEN35_TRUNCATE_PROMPT_TOKENS=65535
 export NEMO_RL_QWEN35_TRUNCATE_PROMPT_TOKENS=65535
 ```
 
-Then launch:
+Then launch. The recipe owns the R2E SIF formatter list; do not pass it as a
+Hydra CLI override because the `{instance_id}` placeholders are parsed as
+override grammar unless heavily escaped.
 
 ```bash
-R2E_FORMATTERS='[\"/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/swe-gym/r2egym/{instance_id}.sif\",\"/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/nemotron-ultra-swe/r2e_gym/{instance_id}.sif\"]'
-
 bash examples/nemo_gym/launch_nemo_gym_multinode_training.sh \
   "policy.model_name=${HF_CKPT_PATH}" \
   "data.train.data_path=${NEMO_GYM_SWE_TRAIN_DATA_PATH}" \
@@ -266,8 +266,6 @@ bash examples/nemo_gym/launch_nemo_gym_multinode_training.sh \
   "env.nemo_gym.swe_agents_val.responses_api_agents.swe_agents.concurrency=128" \
   "env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.swebench_agent_timeout=360" \
   "env.nemo_gym.swe_agents_val.responses_api_agents.swe_agents.swebench_agent_timeout=180" \
-  "env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.container_formatter=${R2E_FORMATTERS}" \
-  "env.nemo_gym.swe_agents_val.responses_api_agents.swe_agents.container_formatter=${R2E_FORMATTERS}" \
   "policy.generation.vllm_cfg.http_server_serving_chat_kwargs.tool_parser=qwen3_xml" \
   "policy.generation.vllm_cfg.http_server_serving_chat_kwargs.reasoning_parser=qwen3" \
   "policy.generation.vllm_cfg.http_server_serving_chat_kwargs.reasoning_parser_plugin=null" \

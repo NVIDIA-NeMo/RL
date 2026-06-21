@@ -52,6 +52,16 @@ policy:
 # Qwen 3.5 chat-template/token handling used by the qwen_35 overlay.
 env:
   nemo_gym:
+    swe_agents_train:
+      responses_api_agents:
+        swe_agents:
+          container_formatter:
+            - "${sif_dir}/r2egym/{instance_id}.sif"
+            - "/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/nemotron-ultra-swe/r2e_gym/{instance_id}.sif"
+    swe_agents_val:
+      responses_api_agents:
+        swe_agents:
+          container_formatter: ${env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.container_formatter}
     policy_model:
       responses_api_models:
         vllm_model:
