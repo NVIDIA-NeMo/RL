@@ -64,8 +64,11 @@ from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.virtual_cluster import (
+    TOPO_RANK_UNKNOWN,
     ClusterConfig,
     RayVirtualCluster,
+    get_ray_cluster_topology,
+    prepare_segment_topology,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
@@ -506,6 +509,7 @@ def setup(
         return actor, time.perf_counter() - t0
 
     total_nodes = cluster_config["num_nodes"]
+    segment_size = cluster_config.get("segment_size")
     if rm_env_enabled:
         rm_resource = env_configs["reward_model"]["resources"]
         rm_nodes = rm_resource["num_nodes"]
@@ -534,6 +538,9 @@ def setup(
         else:
             policy_gpus_per_node = cluster_config["gpus_per_node"]
 
+        node_resource_constraints, _, _ = prepare_segment_topology(
+            segment_size, policy_nodes
+        )
         cluster = RayVirtualCluster(
             name="grpo_policy_cluster",
             bundle_ct_per_node_list=[policy_gpus_per_node] * policy_nodes,
@@ -544,6 +551,8 @@ def setup(
             else 2,
             port_range_low=cluster_config.get("master_port_range_low"),
             port_range_high=cluster_config.get("master_port_range_high"),
+            segment_size=segment_size,
+            node_resource_constraints=node_resource_constraints,
         )
         train_cluster = cluster
         inference_cluster = cluster
@@ -609,6 +618,102 @@ def setup(
             )
             train_nodes -= inference_nodes
 
+        assert train_nodes > 0 and inference_nodes > 0, (
+            f"Non-colocated mode requires train_nodes > 0 and inference_nodes > 0, "
+            f"got train_nodes={train_nodes}, inference_nodes={inference_nodes}"
+        )
+
+        # Build topology-aware domain constraints for placement groups.
+        # Each selected node's bundles are pinned to a specific NVLink domain so
+        # that EP groups stay within high-bandwidth switch fabrics.
+        #
+        # NOTE: segment_size is also passed to RayVirtualCluster and used later
+        # by _sort_bundle_indices_by_topology to trim incomplete domain segments
+        # when ordering ranks. When constraints successfully pin nodes to
+        # complete segments, that post-placement trimming is a no-op. It serves
+        # as defense-in-depth for the fallback path where constraints are absent.
+        node_resource_constraints = None
+        inference_node_resource_constraints = None
+        inference_segment_size = None
+        if segment_size is not None:
+            topology = get_ray_cluster_topology()
+            num_alive_nodes = len(topology)
+            required_nodes = train_nodes + inference_nodes
+            assert num_alive_nodes >= required_nodes, (
+                f"Not enough alive Ray nodes for all roles: "
+                f"need {required_nodes} (train={train_nodes} + inference={inference_nodes}), "
+                f"but only {num_alive_nodes} alive nodes found"
+            )
+            node_resource_constraints, remaining_node_ids, topology = (
+                prepare_segment_topology(
+                    segment_size, train_nodes, topology=topology, role="training"
+                )
+            )
+            # Warn if any selected training node lacks topo_rank — domain pinning
+            # still works but intra-domain rank ordering will be arbitrary.
+            if node_resource_constraints is not None:
+                training_node_ids = set(topology) - set(remaining_node_ids)
+                nodes_missing_topo_rank = [
+                    nid
+                    for nid in training_node_ids
+                    if topology[nid][1] == TOPO_RANK_UNKNOWN
+                ]
+                if nodes_missing_topo_rank:
+                    print(
+                        f"  ⚠ {len(nodes_missing_topo_rank)} selected training nodes have NVLink domain "
+                        f"info but no topo_rank; intra-domain rank ordering may be suboptimal",
+                        flush=True,
+                    )
+
+                # Inference topology: each inference instance spans
+                # nodes_per_instance nodes; keep those within one domain
+                # so cross-node all-reduce uses NVLink, not InfiniBand.
+                #
+                # For vLLM: total GPUs per instance = TP * PP (separate dimensions).
+                # For SGLang: gpus_per_server already includes all parallelism
+                #   dimensions (TP, DP-attention, PP are internal subdivisions),
+                #   so we use it directly without multiplying by pp_size.
+                # For Megatron: inference reuses the training megatron_cfg
+                #   parallelism, so an instance spans TP * PP * CP GPUs.
+                if generation_config["backend"] == "megatron":
+                    megatron_cfg = policy_config["megatron_cfg"]
+                    gpus_per_instance = (
+                        megatron_cfg["tensor_model_parallel_size"]
+                        * megatron_cfg["pipeline_model_parallel_size"]
+                        * megatron_cfg["context_parallel_size"]
+                    )
+                elif generation_config["backend"] == "vllm":
+                    vllm_cfg = generation_config.get("vllm_cfg", {})
+                    gpus_per_instance = vllm_cfg["tensor_parallel_size"] * vllm_cfg.get(
+                        "pipeline_parallel_size", 1
+                    )
+                else:
+                    sglang_cfg = generation_config.get("sglang_cfg", {})
+                    gpus_per_instance = sglang_cfg.get("gpus_per_server", 1)
+                nodes_per_instance = (
+                    gpus_per_instance + inference_gpus_per_node - 1
+                ) // inference_gpus_per_node
+                if nodes_per_instance > 1 and inference_nodes % nodes_per_instance == 0:
+                    remaining_topology = {
+                        nid: topology[nid] for nid in remaining_node_ids
+                    }
+                    inference_node_resource_constraints, _, _ = (
+                        prepare_segment_topology(
+                            nodes_per_instance,
+                            inference_nodes,
+                            topology=remaining_topology,
+                            role="inference",
+                        )
+                    )
+                    inference_segment_size = nodes_per_instance
+                elif nodes_per_instance > 1:
+                    print(
+                        f"  ⚠ inference_nodes={inference_nodes} is not divisible by "
+                        f"nodes_per_instance={nodes_per_instance} (gpus_per_instance={gpus_per_instance}); "
+                        f"skipping inference topology constraints",
+                        flush=True,
+                    )
+
         # initialize train cluster
         train_cluster = RayVirtualCluster(
             name="grpo_train_cluster",
@@ -618,13 +723,21 @@ def setup(
             max_colocated_worker_groups=1,
             port_range_low=cluster_config.get("master_port_range_low"),
             port_range_high=cluster_config.get("master_port_range_high"),
+            segment_size=segment_size,
+            node_resource_constraints=node_resource_constraints,
         )
+        # When domain constraints are set, eagerly create placement groups
+        # so training claims the constrained nodes before inference can grab them.
+        if node_resource_constraints is not None:
+            train_cluster.get_placement_groups()
         print(
             f"  ✓ Ray train cluster initialized with {train_nodes} nodes with {train_gpus_per_node} GPUs per node",
             flush=True,
         )
 
-        # initialize inference cluster
+        # Create inference cluster with topology constraints so TP groups
+        # stay within NVLink domains. Eagerly initialize PGs when constraints
+        # are set so inference claims domain-aligned nodes first.
         inference_cluster = RayVirtualCluster(
             name="grpo_inference_cluster",
             bundle_ct_per_node_list=[inference_gpus_per_node] * inference_nodes,
@@ -633,7 +746,20 @@ def setup(
             max_colocated_worker_groups=1,
             port_range_low=cluster_config.get("master_port_range_low"),
             port_range_high=cluster_config.get("master_port_range_high"),
+            segment_size=inference_segment_size,
+            node_resource_constraints=inference_node_resource_constraints,
         )
+        if inference_node_resource_constraints is not None:
+            if generation_config["backend"] == "megatron":
+                MegatronGeneration.init_cluster_placement_groups(
+                    inference_cluster, policy_config
+                )
+            elif generation_config["backend"] == "sglang":
+                SGLangGeneration.init_cluster_placement_groups(inference_cluster)
+            else:
+                VllmGeneration.init_cluster_placement_groups(
+                    inference_cluster, generation_config
+                )
         print(
             f"  ✓ Ray inference cluster initialized with {inference_nodes} nodes with {inference_gpus_per_node} GPUs per node",
             flush=True,
