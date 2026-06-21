@@ -40,7 +40,6 @@ from typing import Any
 
 import ray
 import torch
-from tensordict import TensorDict
 
 from nemo_rl.algorithms.async_utils.staleness_sampler import StalenessSampler
 from nemo_rl.algorithms.single_controller_utils.config import (
@@ -49,8 +48,16 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     WeightSyncConfig,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerBundle
+from nemo_rl.algorithms.single_controller_utils.utils import (
+    aggregate_step_metrics,
+    fields_for_put,
+    reduce_advantage_pump_metrics,
+    squeeze_trailing_unit_dim,
+    tensor_field,
+)
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.utils.logger import Logger
 
 
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
@@ -97,6 +104,10 @@ class SingleControllerActor:
         # Rebind so writer and sampler share one buffer instance even
         # when Ray deserializes rollout_manager and tq_buffer separately.
         self._rollout_manager._tq_buffer = self._buffer
+
+        # Built here, not on the driver: Logger backends (wandb/tb/...) hold
+        # _thread.lock that Ray can't cloudpickle into the actor.
+        self._logger = Logger(master_config.logger)
 
         # Pin clusters so RayVirtualCluster.__del__ doesn't remove the PGs.
         self._train_cluster = bundle.train_cluster
@@ -165,6 +176,11 @@ class SingleControllerActor:
         self._trainer_version: int = 0
         self._train_steps: int = 0
         self._step_consumed_sample_ids: list[str] = []
+        self._step_log_dict: dict[str, list] = {
+            "rewards": [],
+            "masked_advantages": [],
+            "sequence_lengths": [],
+        }
 
         print(
             f"SingleControllerActor: "
@@ -189,6 +205,7 @@ class SingleControllerActor:
 
         # Wait until the train pump is done
         await train_task
+        self._logger.finish()
 
         # Cancel the rollout pump and any in-flight dispatches so we exit immediately.
         rollout_task.cancel()
@@ -379,6 +396,10 @@ class SingleControllerActor:
                 self._trainer.train_microbatch_from_meta(step_id, train_meta)
                 groups_dispatched += num_groups
                 self._step_consumed_sample_ids.extend(train_meta.sample_ids)
+                if train_meta.sequence_lengths:
+                    self._step_log_dict["sequence_lengths"].extend(
+                        int(s) for s in train_meta.sequence_lengths
+                    )
 
             if not step_open:
                 print(
@@ -395,8 +416,22 @@ class SingleControllerActor:
                 partition_id=self._partition_id,
             )
 
-            # TODO: add log
-            print(f"{result=}")
+            step_metrics = aggregate_step_metrics(result)
+            step_metrics.update(reduce_advantage_pump_metrics(**self._step_log_dict))
+            self._step_log_dict = {k: [] for k in self._step_log_dict}
+
+            # TODO: wrap _train_pump stages with Timer; emit timing_metrics
+            #   under "timing/train" prefix; add valid_tokens_per_sec_per_gpu
+            #   and print_performance_metrics (see grpo.py:3884-3947).
+            # TODO: checkpointing (save_period/top-k metric_name,
+            #   policy.save_checkpoint, dataloader state, TQReplayBuffer state).
+            # TODO: per-step train_data jsonl dump, vllm metrics logger,
+            #   histogram log, rollout_metrics, seq_logprob_error_metrics,
+            #   pretty-print "Training Results" block.
+            print(f"step_metrics={step_metrics}", flush=True)
+            self._logger.log_metrics(
+                step_metrics, step=self._train_steps + 1, prefix="train"
+            )
 
             min_sample_version = min(t["weight_version"] for t in train_meta.tags)  # type: ignore
             lag = self._trainer_version - min_sample_version
@@ -468,13 +503,14 @@ class SingleControllerActor:
             select_fields=self._advantage_input_fields(),
         )
 
-        prompt_ids = _tensor_field(data, adv_cfg.prompt_ids_field)
-        rewards = _squeeze_trailing_unit_dim(
-            _tensor_field(data, adv_cfg.reward_field)
+        prompt_ids = tensor_field(data, adv_cfg.prompt_ids_field)
+        rewards = squeeze_trailing_unit_dim(
+            tensor_field(data, adv_cfg.reward_field)
         ).float()
-        token_mask = _tensor_field(data, adv_cfg.token_mask_field).float()
-        sample_mask = _squeeze_trailing_unit_dim(
-            _tensor_field(data, adv_cfg.sample_mask_field)
+        self._step_log_dict["rewards"].append(rewards.detach())
+        token_mask = tensor_field(data, adv_cfg.token_mask_field).float()
+        sample_mask = squeeze_trailing_unit_dim(
+            tensor_field(data, adv_cfg.sample_mask_field)
         ).float()
         mask = token_mask * sample_mask.unsqueeze(-1)
 
@@ -482,18 +518,18 @@ class SingleControllerActor:
             "total_reward": rewards,
         }
         for field_name in adv_cfg.repeated_batch_fields:
-            repeated_batch[field_name] = _squeeze_trailing_unit_dim(
-                _tensor_field(data, field_name)
+            repeated_batch[field_name] = squeeze_trailing_unit_dim(
+                tensor_field(data, field_name)
             )
 
         kwargs: dict[str, torch.Tensor] = {}
         if adv_cfg.policy_logprobs_field is not None:
-            kwargs["logprobs_policy"] = _tensor_field(
+            kwargs["logprobs_policy"] = tensor_field(
                 data,
                 adv_cfg.policy_logprobs_field,
             )
         if adv_cfg.reference_logprobs_field is not None:
-            kwargs["logprobs_reference"] = _tensor_field(
+            kwargs["logprobs_reference"] = tensor_field(
                 data,
                 adv_cfg.reference_logprobs_field,
             )
@@ -505,12 +541,15 @@ class SingleControllerActor:
             repeated_batch=repeated_batch,
             **kwargs,
         )
+        self._step_log_dict["masked_advantages"].append(
+            torch.masked_select(advantages.detach(), mask.bool())
+        )
 
         await self._call_dp(
             "put_samples",
             sample_ids=meta.sample_ids,
             partition_id=meta.partition_id,
-            fields=_fields_for_put(
+            fields=fields_for_put(
                 meta,
                 {adv_cfg.output_field: advantages},
             ),
@@ -533,45 +572,3 @@ class SingleControllerActor:
         if adv_cfg.reference_logprobs_field is not None:
             fields.append(adv_cfg.reference_logprobs_field)
         return list(dict.fromkeys(fields))
-
-
-def _tensor_field(data: TensorDict, field_name: str) -> torch.Tensor:
-    value = data[field_name]
-    if not isinstance(value, torch.Tensor):
-        raise TypeError(
-            f"advantage_pump expected tensor field {field_name!r}; got {type(value)}"
-        )
-    if value.is_nested:
-        return torch.nested.to_padded_tensor(value, padding=0)
-    return value
-
-
-def _squeeze_trailing_unit_dim(value: torch.Tensor) -> torch.Tensor:
-    if value.dim() >= 2 and value.shape[-1] == 1:
-        return value.squeeze(-1)
-    return value
-
-
-def _fields_for_put(meta: KVBatchMeta, fields: dict[str, torch.Tensor]) -> TensorDict:
-    packed: dict[str, torch.Tensor] = {}
-    if meta.sequence_lengths is None:
-        for field_name, value in fields.items():
-            packed[field_name] = value.detach().contiguous()
-        # pyrefly: ignore[bad-argument-type]
-        return TensorDict(packed, batch_size=[meta.size])
-
-    lengths = torch.tensor(meta.sequence_lengths, dtype=torch.long)
-    for field_name, value in fields.items():
-        if value.dim() >= 2 and value.shape[1] == int(lengths.max().item()):
-            rows = [
-                value[i, : int(lengths[i].item())].detach().contiguous()
-                for i in range(meta.size)
-            ]
-            packed[field_name] = torch.nested.as_nested_tensor(
-                rows,
-                layout=torch.jagged,
-            )
-        else:
-            packed[field_name] = value.detach().contiguous()
-    # pyrefly: ignore[bad-argument-type]
-    return TensorDict(packed, batch_size=[meta.size])

@@ -14,6 +14,7 @@ set -eou pipefail
 EXP_NAME=$(basename $0 .sh)
 EXP_DIR=$SCRIPT_DIR/$EXP_NAME
 LOG_DIR=$EXP_DIR/logs
+JSON_METRICS=$EXP_DIR/metrics.json
 RUN_LOG=$EXP_DIR/run.log
 export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
 
@@ -46,4 +47,11 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     $@ \
     2>&1 | tee $RUN_LOG
 
-# TODO: add metrics
+uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
+
+uv run tests/check_metrics.py $JSON_METRICS \
+    'max(data["train/gen_kl_error"]) < 0.002' \
+    'min(data["train/probs_ratio_clamped_min"]) > 0.79' \
+    'max(data["train/probs_ratio_clamped_min"]) < 1.21' \
+    'min(data["train/probs_ratio_clamped_max"]) > 0.79' \
+    'max(data["train/probs_ratio_clamped_max"]) < 1.21'
