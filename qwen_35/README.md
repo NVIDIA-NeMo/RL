@@ -268,7 +268,6 @@ bash examples/nemo_gym/launch_nemo_gym_multinode_training.sh \
   "env.nemo_gym.swe_agents_val.responses_api_agents.swe_agents.swebench_agent_timeout=180" \
   "policy.generation.vllm_cfg.http_server_serving_chat_kwargs.tool_parser=qwen3_xml" \
   "policy.generation.vllm_cfg.http_server_serving_chat_kwargs.reasoning_parser=qwen3" \
-  "policy.generation.vllm_cfg.http_server_serving_chat_kwargs.reasoning_parser_plugin=null" \
   "token_ids.eos=248046" \
   "token_ids.think_open=248068" \
   "token_ids.think_close=248069" \

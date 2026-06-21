@@ -48,9 +48,6 @@ def import_model_from_hf_name(
     )
     orig_num_layers_in_last_pipeline_stage = model_provider.num_layers_in_last_pipeline_stage
     orig_pipeline_dtype = model_provider.pipeline_dtype
-    orig_gradient_accumulation_fusion = getattr(
-        model_provider, "gradient_accumulation_fusion", None
-    )
 
     if megatron_config is not None:
         model_provider.tensor_model_parallel_size = megatron_config[
@@ -95,12 +92,6 @@ def import_model_from_hf_name(
     config.num_layers_in_first_pipeline_stage = orig_num_layers_in_first_pipeline_stage
     config.num_layers_in_last_pipeline_stage = orig_num_layers_in_last_pipeline_stage
     config.pipeline_dtype = orig_pipeline_dtype
-    if (
-        orig_gradient_accumulation_fusion is not None
-        and hasattr(config, "gradient_accumulation_fusion")
-    ):
-        config.gradient_accumulation_fusion = orig_gradient_accumulation_fusion
-
     bridge.save_megatron_model(megatron_model, output_path)
 
     import megatron.core.rerun_state_machine

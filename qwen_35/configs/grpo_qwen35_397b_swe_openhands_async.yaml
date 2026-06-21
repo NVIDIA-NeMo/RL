@@ -42,7 +42,6 @@ policy:
       http_server_serving_chat_kwargs:
         tool_parser: qwen3_xml
         reasoning_parser: qwen3
-        reasoning_parser_plugin: null
     vllm_kwargs:
       attention_backend: FLASH_ATTN
       compilation_config:
