@@ -330,6 +330,20 @@ if [[ -n "${EXTRA_MOUNTS:-}" ]]; then
     MOUNTS="${MOUNTS},${EXTRA_MOUNTS}"
 fi
 
+SBATCH_EXTRA_ARGS=()
+SBATCH_QOS_VALUE="${SLURM_QOS:-${SBATCH_QOS:-}}"
+SBATCH_GRES_VALUE="${SLURM_GRES:-${SBATCH_GRES:-}}"
+SBATCH_SEGMENT_VALUE="${SLURM_SEGMENT:-${SBATCH_SEGMENT:-}}"
+if [[ -n "${SBATCH_QOS_VALUE}" ]]; then
+    SBATCH_EXTRA_ARGS+=("--qos=${SBATCH_QOS_VALUE}")
+fi
+if [[ -n "${SBATCH_GRES_VALUE}" ]]; then
+    SBATCH_EXTRA_ARGS+=("--gres=${SBATCH_GRES_VALUE}")
+fi
+if [[ -n "${SBATCH_SEGMENT_VALUE}" ]]; then
+    SBATCH_EXTRA_ARGS+=("--segment=${SBATCH_SEGMENT_VALUE}")
+fi
+
 MOUNTS=$MOUNTS \
 COMMAND=$COMMAND \
 CONTAINER=$CONTAINER_IMAGE_PATH \
@@ -342,5 +356,6 @@ sbatch \
     --time=${SLURM_TIME:-1:0:0} \
     --job-name=$EXP_NAME \
     --comment="$SLURM_COMMENT" \
+    "${SBATCH_EXTRA_ARGS[@]}" \
     ${SLURM_EXCLUDE:+--exclude=$SLURM_EXCLUDE} \
     ray.sub
