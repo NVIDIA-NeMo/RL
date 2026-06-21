@@ -102,11 +102,11 @@ These are intentionally under `qwen_35/overrides` instead of directly modifying
 the base tree. That makes it clear which files are Qwen 3.5-specific and keeps
 base grpo-studies behavior visible.
 
-The launcher also stages the base repository copy of
-`3rdparty/Gym-workspace/Gym/responses_api_models/vllm_model/app.py` into the
-container for Qwen 3.5 runs. That file is not duplicated under
-`qwen_35/overrides` because Carlos's branch already carries the required Gym
-Responses API behavior.
+- `3rdparty/Gym-workspace/Gym/responses_api_models/vllm_model/app.py`
+  - Preserves the Gym Responses API behavior used by the known-good smoke path,
+    including chat-template metadata pass-through. This remains an overlay
+    because some remote checkouts do not have the `3rdparty/Gym-workspace` tree
+    populated.
 
 
 ## Ptyche training HPs
