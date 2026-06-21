@@ -232,6 +232,30 @@ class TestSetup:
             "input_ids": 7,
         }
 
+    def test_max_num_steps_capped_by_self(self, patched_factories):
+        """grpo.max_num_steps stays put when smaller than max_num_epochs * len(dl)."""
+        mc = _make_master_config(
+            megatron_enabled=False,
+            max_num_steps=2,
+            max_num_epochs=1,
+        )
+        # patched dataloader has len() == 4, so the min picks max_num_steps.
+        setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert mc.grpo["max_num_steps"] == 2
+
+    def test_max_num_steps_capped_by_dataloader_epochs(self, patched_factories):
+        """grpo.max_num_steps drops to max_num_epochs * len(dataloader) when smaller."""
+        mc = _make_master_config(
+            megatron_enabled=False,
+            max_num_steps=1000,
+            max_num_epochs=2,
+        )
+        # patched dataloader has len() == 4 → 2 * 4 = 8 < 1000.
+        setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert mc.grpo["max_num_steps"] == 8
+
     def test_megatron_train_iters_capped_by_max_num_steps(self, patched_factories):
         """train_iters = min(max_num_steps, max_num_epochs * len(dataloader))."""
         mc = _make_master_config(
