@@ -128,8 +128,10 @@ mkdir -p "${OUT_DIR}/logs" "${OUT_DIR}/checkpoint" "${HOST_HF_HOME}"
 # container code. Selecting a recipe under qwen_35/ automatically mounts the
 # Qwen-specific config into the container. On the qwen35-clobber branch the
 # default is to stage the real repo files that match the known-working
-# optimized/grpo-smoke path, rather than the qwen_35/overrides tree. Set
-# QWEN35_CLOBBER_FROM_REPO=0 to use the overlay-only mode.
+# optimized/grpo-smoke path. Set QWEN35_CLOBBER_FROM_REPO=0 to source the
+# same runtime file list from qwen_35/overrides instead. Both modes mount the
+# same destination files so differences are isolated to file contents, not
+# the mount surface.
 _qwen35_append_extra_mount() {
     local mount="$1"
     case ",${EXTRA_MOUNTS:-}," in
@@ -230,8 +232,20 @@ if [[ "${_qwen35_should_mount}" == "1" ]]; then
 
     case "${QWEN35_CLOBBER_FROM_REPO}" in
         0|false|False|no|NO)
-            _qwen35_stage_tree "${QWEN35_OVERLAY_DIR}" "${QWEN35_STAGED_OVERLAY_DIR}" "Qwen 3.5 overlay"
-            _qwen35_mount_tree "${QWEN35_STAGED_OVERLAY_DIR}" "${CONTAINER_REPO_LOCATION}" "Qwen 3.5 staged overlay"
+            _qwen35_overlay_dsts=(
+                "nemo_rl/environments/nemo_gym.py"
+                "nemo_rl/models/generation/vllm/__init__.py"
+                "nemo_rl/models/generation/vllm/vllm_worker_async.py"
+                "nemo_rl/models/megatron/community_import.py"
+                "nemo_rl/models/megatron/setup.py"
+                "nemo_rl/models/policy/workers/megatron_policy_worker.py"
+                "3rdparty/Gym-workspace/Gym/responses_api_models/vllm_model/app.py"
+            )
+            for _qwen35_dst_rel in "${_qwen35_overlay_dsts[@]}"; do
+                _qwen35_stage_file "${QWEN35_OVERLAY_DIR}/${_qwen35_dst_rel}" "${QWEN35_STAGED_OVERLAY_DIR}" "${_qwen35_dst_rel}" "Qwen 3.5 overlay"
+                _qwen35_mount_file "${QWEN35_STAGED_OVERLAY_DIR}/${_qwen35_dst_rel}" "${CONTAINER_REPO_LOCATION}/${_qwen35_dst_rel}" "Qwen 3.5 overlay"
+            done
+            unset _qwen35_dst_rel _qwen35_overlay_dsts
             ;;
         1|true|True|yes|YES)
             _qwen35_clobber_pairs=(
