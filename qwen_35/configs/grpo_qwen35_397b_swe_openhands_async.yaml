@@ -25,6 +25,11 @@ policy:
     mtp_num_layers: 0
     mtp_use_repeated_layer: false
     mtp_detach_heads: true
+    # The inherited Qwen3-235B recipe uses custom first/last PP layer counts.
+    # They do not apply to Qwen3.5-397B with the 64-node PP=2 layout; leaving
+    # them set makes Megatron think there are no middle PP stages available.
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
     first_last_layers_bf16: true
     num_layers_at_start_in_bf16: 1
     num_layers_at_end_in_bf16: 1
