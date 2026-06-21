@@ -180,9 +180,14 @@ class SingleControllerActor:
 
     async def run(self) -> dict[str, Any]:
         """Main entry point. Runs until max_train_steps is reached."""
+        # Synchronize weights before starting the pumps
+        await self._sync_weights()
+
+        # Start the rollout and train pumps
         rollout_task = asyncio.create_task(self._rollout_pump())
         train_task = asyncio.create_task(self._train_pump())
 
+        # Wait until the train pump is done
         await train_task
 
         # Cancel the rollout pump and any in-flight dispatches so we exit immediately.
@@ -381,7 +386,6 @@ class SingleControllerActor:
                 )
                 break
 
-            # TODO: add log
             result = self._trainer.finish_train_step(step_id)
             consumed_ids = list(self._step_consumed_sample_ids)
             self._step_consumed_sample_ids = []
@@ -390,6 +394,9 @@ class SingleControllerActor:
                 sample_ids=list(consumed_ids),
                 partition_id=self._partition_id,
             )
+
+            # TODO: add log
+            print(f"{result=}")
 
             min_sample_version = min(t["weight_version"] for t in train_meta.tags)  # type: ignore
             lag = self._trainer_version - min_sample_version
@@ -434,8 +441,7 @@ class SingleControllerActor:
         # )
 
         t0 = time.monotonic()
-        # TODO: currently sync_weights is not implemented, comment out for now
-        # await self._weight_synchronizer.sync_weights()
+        await asyncio.to_thread(self._weight_synchronizer.sync_weights)
         elapsed = time.monotonic() - t0
 
         print(f"  _sync_weights: sync done in {elapsed:.3f}s", flush=True)

@@ -323,12 +323,6 @@ def setup_single_controller(
     dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
 
     backend = generation_config["backend"]
-    refit_buffer_size_gb = (
-        generation_config.get("colocated", {})
-        .get("resources", {})
-        .get("refit_buffer_size_gb")
-    )
-    # TODO: weight synchronizer not validated yet, placeholder wiring.
     weight_synchronizer = create_weight_synchronizer(
         policy=policy,
         generation=generation,
@@ -336,8 +330,8 @@ def setup_single_controller(
         colocated=colocated,
         train_cluster=train_cluster,
         inference_cluster=inference_cluster,
-        refit_buffer_size_gb=refit_buffer_size_gb,
     )
+    weight_synchronizer.init_communicator()
 
     # ==========================
     # Setup Algorithm + Rollout Wiring
