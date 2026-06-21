@@ -61,6 +61,7 @@ from nemo_rl.models.generation.sglang import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.utils.logger import Logger
+from nemo_rl.utils.timer import Timer
 
 Generation = Union[VllmGeneration, SGLangGeneration]
 
@@ -113,6 +114,7 @@ class SingleControllerActor:
         # Built here, not on the driver: Logger backends (wandb/tb/...) hold
         # _thread.lock that Ray can't cloudpickle into the actor.
         self._logger = Logger(master_config.logger)  # type: ignore
+        self._timer = Timer()
 
         # Pin clusters so RayVirtualCluster.__del__ doesn't remove the PGs.
         self._train_cluster = bundle.train_cluster
@@ -356,103 +358,141 @@ class SingleControllerActor:
             groups_dispatched = 0
             step_open = False
 
-            while groups_dispatched < target_groups:
-                await asyncio.sleep(0)
+            with self._timer.time("total_step_time"):
+                while groups_dispatched < target_groups:
+                    await asyncio.sleep(0)
 
-                # evict stale groups
-                evicted = await self._sampler.evict(
-                    current_train_weight=self._trainer_version,
-                )
-                if evicted:
-                    print(f"  evicted {evicted} stale prompt group(s)", flush=True)
-                    for _ in range(evicted):
+                    # evict stale groups
+                    evicted = await self._sampler.evict(
+                        current_train_weight=self._trainer_version,
+                    )
+                    if evicted:
+                        print(f"  evicted {evicted} stale prompt group(s)", flush=True)
+                        for _ in range(evicted):
+                            self._buffer_capacity.release()
+
+                    # TODO @yukih: wait train pump merged, now always return min_prompt_groups_per_batch
+                    # need to add a max_prompt_groups_per_batch
+                    with self._timer.time("exposed_generation"):
+                        train_meta, num_groups = await self._sampler.select(
+                            current_train_weight=self._trainer_version,
+                            min_prompt_groups=self._async_cfg.min_prompt_groups_per_batch,
+                        )
+
+                    if train_meta is None:
+                        await asyncio.sleep(0.05)
+                        continue
+
+                    for _ in range(num_groups):
                         self._buffer_capacity.release()
 
-                # TODO @yukih: wait train pump merged, now always return min_prompt_groups_per_batch
-                # need to add a max_prompt_groups_per_batch
-                train_meta, num_groups = await self._sampler.select(
-                    current_train_weight=self._trainer_version,
-                    min_prompt_groups=self._async_cfg.min_prompt_groups_per_batch,
-                )
+                    # Compute prev_logprobs / ref_logprobs
+                    with self._timer.time("logprob_inference_prep"):
+                        self._trainer.prepare_for_lp_inference()
+                    with self._timer.time("policy_and_reference_logprobs"):
+                        if compute_prev_logprobs:
+                            self._trainer.get_logprobs_from_meta(train_meta)
+                        if compute_reference_logprobs:
+                            self._trainer.get_reference_policy_logprobs_from_meta(
+                                train_meta
+                            )
 
-                if train_meta is None:
-                    await asyncio.sleep(0.05)
-                    continue
+                    with self._timer.time("advantage_calculation"):
+                        train_meta = await self._advantage_pump(train_meta)
 
-                for _ in range(num_groups):
-                    self._buffer_capacity.release()
+                    # Train
+                    with self._timer.time("training_prep"):
+                        self._trainer.prepare_for_training()
+                    with self._timer.time("policy_training"):
+                        if not step_open:
+                            self._trainer.begin_train_step(
+                                step_id, loss_fn=self._loss_fn
+                            )
+                            step_open = True
+                        self._trainer.train_microbatch_from_meta(step_id, train_meta)
 
-                # Compute prev_logprobs / ref_logprobs
-                self._trainer.prepare_for_lp_inference()
-                if compute_prev_logprobs:
-                    self._trainer.get_logprobs_from_meta(train_meta)
-                if compute_reference_logprobs:
-                    self._trainer.get_reference_policy_logprobs_from_meta(train_meta)
+                    groups_dispatched += num_groups
+                    self._step_consumed_sample_ids.extend(train_meta.sample_ids)
+                    if train_meta.sequence_lengths:
+                        self._step_log_dict["sequence_lengths"].extend(
+                            int(s) for s in train_meta.sequence_lengths
+                        )
 
-                train_meta = await self._advantage_pump(train_meta)
-
-                # Train
-                self._trainer.prepare_for_training()
                 if not step_open:
-                    self._trainer.begin_train_step(step_id, loss_fn=self._loss_fn)
-                    step_open = True
-                # Driver-side TQPolicy blocks until worker results land; we drop
-                # the per-microbatch dict and surface aggregated metrics from
-                # finish_train_step instead.
-                self._trainer.train_microbatch_from_meta(step_id, train_meta)
-
-                groups_dispatched += num_groups
-                self._step_consumed_sample_ids.extend(train_meta.sample_ids)
-                if train_meta.sequence_lengths:
-                    self._step_log_dict["sequence_lengths"].extend(
-                        int(s) for s in train_meta.sequence_lengths
+                    print(
+                        "train_pump: rollout exhausted before any group ready",
+                        flush=True,
                     )
+                    break
 
-            if not step_open:
-                print(
-                    "train_pump: rollout exhausted before any group ready", flush=True
+                with self._timer.time("policy_training"):
+                    result = self._trainer.finish_train_step(step_id)
+                consumed_ids = list(self._step_consumed_sample_ids)
+                self._step_consumed_sample_ids = []
+                await self._call_dp(
+                    "clear_samples",
+                    sample_ids=list(consumed_ids),
+                    partition_id=self._partition_id,
                 )
-                break
 
-            result = self._trainer.finish_train_step(step_id)
-            consumed_ids = list(self._step_consumed_sample_ids)
-            self._step_consumed_sample_ids = []
-            await self._call_dp(
-                "clear_samples",
-                sample_ids=list(consumed_ids),
-                partition_id=self._partition_id,
-            )
+                step_metrics = aggregate_step_metrics(result)
+                step_metrics.update(
+                    reduce_advantage_pump_metrics(**self._step_log_dict)
+                )
+                self._step_log_dict = {k: [] for k in self._step_log_dict}
 
-            step_metrics = aggregate_step_metrics(result)
-            step_metrics.update(reduce_advantage_pump_metrics(**self._step_log_dict))
-            self._step_log_dict = {k: [] for k in self._step_log_dict}
+                self._trainer_version += 1
+                self._train_steps += 1
+                with self._timer.time("weight_sync"):
+                    await self._sync_weights()
 
-            # TODO: wrap _train_pump stages with Timer; emit timing_metrics
-            #   under "timing/train" prefix; add valid_tokens_per_sec_per_gpu
-            #   and print_performance_metrics (see grpo.py:3884-3947).
+            timing_metrics: dict[str, float] = self._timer.get_timing_metrics(
+                reduction_op="sum"
+            )  # type: ignore
+
+            total_time = timing_metrics.get("total_step_time", 0.0)
+            cluster_cfg = self._master_config.cluster
+            total_num_gpus = cluster_cfg["num_nodes"] * cluster_cfg["gpus_per_node"]
+            if total_time > 0 and "global_valid_toks" in step_metrics:
+                timing_metrics["valid_tokens_per_sec_per_gpu"] = (
+                    step_metrics["global_valid_toks"] / total_time / total_num_gpus
+                )
+
+            print("\n⏱️  Timing:")
+            print(f"  • Total step time: {total_time:.2f}s")
+            for k, v in sorted(
+                timing_metrics.items(), key=lambda item: item[1], reverse=True
+            ):
+                if k == "total_step_time":
+                    continue
+                percent = (v / total_time * 100) if total_time > 0 else 0.0
+                print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
+
             # TODO: checkpointing (save_period/top-k metric_name,
             #   policy.save_checkpoint, dataloader state, TQReplayBuffer state).
             # TODO: per-step train_data jsonl dump, vllm metrics logger,
             #   histogram log, rollout_metrics, seq_logprob_error_metrics,
-            #   pretty-print "Training Results" block.
+            #   pretty-print "Training Results" block, print_performance_metrics.
             print(f"step_metrics={step_metrics}", flush=True)
             self._logger.log_metrics(
-                step_metrics, step=self._train_steps + 1, prefix="train"
+                step_metrics, step=self._train_steps, prefix="train"
             )
+            self._logger.log_metrics(
+                timing_metrics, step=self._train_steps, prefix="timing/train"
+            )
+            self._timer.reset()
 
+            # min sample version refers to the version each consumed sample was
+            # generated with; lag = current trainer version - oldest sample version.
             min_sample_version = min(t["weight_version"] for t in train_meta.tags)  # type: ignore
             lag = self._trainer_version - min_sample_version
             print(
-                f"train step {self._train_steps + 1}/{grpo_cfg['max_num_steps']}  "
+                f"train step {self._train_steps}/{grpo_cfg['max_num_steps']}  "
                 f"trainer_v={self._trainer_version}  "
                 f"lag={lag}  "
                 f"batch_size={len(consumed_ids)}",
                 flush=True,
             )
-
-            self._trainer_version += 1
-            self._train_steps += 1
-            await self._sync_weights()
 
     async def _sync_weights(self) -> None:
         """Drain in-flight rollouts then synchronize weights.
