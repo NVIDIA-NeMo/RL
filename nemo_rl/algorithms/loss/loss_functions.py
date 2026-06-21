@@ -1357,16 +1357,16 @@ class CrossTokenizerDistillationLossDataDict(TypedDict):
     and can't be enumerated statically here:
 
     - Cross-tokenizer teacher: ``teacher_{i}_full_logits_ipc`` (List[B] of
-      CUDA IPC handle dicts from ``Policy.get_full_logits_ipc``),
+      CUDA IPC handle dicts from ``Policy.get_teacher_logits_ipc(mode="full")``),
       ``teacher_{i}_input_ids`` / ``teacher_{i}_token_mask`` ``[B, T_t]``, and
       ``alignment_{i}_*`` (``pair_valid`` / ``pair_is_correct``
       ``[B, max_pairs]``; ``student_exact_partition_mask`` /
       ``student_chunk_id`` ``[B, T_s]``; ``teacher_exact_partition_mask`` /
       ``teacher_chunk_id`` ``[B, T_t]``; ``num_chunks`` ``[B]``).
     - Same-vocab teacher: either ``teacher_{i}_full_logits_ipc`` (when
-      ``send_full_logits``) or ``teacher_{i}_topk_logits`` /
-      ``teacher_{i}_topk_indices`` ``[B, T_s, k]``; no ``alignment_{i}_*``
-      (it reuses the student tokenization, identity-aligned).
+      ``send_full_logits``) or ``teacher_{i}_topk_ipc`` (List[B] of CUDA IPC
+      handle dicts carrying the top-K value / index buffers); no
+      ``alignment_{i}_*`` (it reuses the student tokenization, identity-aligned).
     """
 
     input_ids: torch.Tensor
