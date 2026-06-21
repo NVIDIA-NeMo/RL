@@ -206,8 +206,10 @@ export EXTRA_MOUNTS="/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_traini
 # EXTRA_MOUNTS for nested SIF execution. OCI-HSG has not required it in this
 # recipe; add it only if the target cluster reports FUSE/apptainer mount errors.
 
-export QWEN35_TRUNCATE_PROMPT_TOKENS=none
-export NEMO_RL_QWEN35_TRUNCATE_PROMPT_TOKENS=none
+# Default is 65535 for a 64k context run, leaving one token of headroom so
+# vLLM does not reject prompts at exactly/just above max_model_len.
+export QWEN35_TRUNCATE_PROMPT_TOKENS=65535
+export NEMO_RL_QWEN35_TRUNCATE_PROMPT_TOKENS=65535
 ```
 
 Then launch:

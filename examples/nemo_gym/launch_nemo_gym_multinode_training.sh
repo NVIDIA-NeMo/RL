@@ -274,7 +274,7 @@ if [[ "${_qwen35_should_mount}" == "1" ]]; then
     # Defaults consumed by the Qwen-only files. They are harmless for
     # non-Qwen jobs because these files are not mounted for those recipes.
     export NEMO_RL_ALLOW_NONCONTIGUOUS_MESSAGE_TOKENS="${NEMO_RL_ALLOW_NONCONTIGUOUS_MESSAGE_TOKENS:-true}"
-    export NEMO_RL_QWEN35_TRUNCATE_PROMPT_TOKENS="${NEMO_RL_QWEN35_TRUNCATE_PROMPT_TOKENS:-${QWEN35_TRUNCATE_PROMPT_TOKENS:-none}}"
+    export NEMO_RL_QWEN35_TRUNCATE_PROMPT_TOKENS="${NEMO_RL_QWEN35_TRUNCATE_PROMPT_TOKENS:-${QWEN35_TRUNCATE_PROMPT_TOKENS:-65535}}"
     export NEMO_RL_QWEN35_FORCE_TORCH_GDN="${NEMO_RL_QWEN35_FORCE_TORCH_GDN:-${QWEN35_FORCE_TORCH_GDN:-0}}"
 fi
 unset _qwen35_overlay_mode _qwen35_recipe _qwen35_should_mount
