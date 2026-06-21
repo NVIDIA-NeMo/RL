@@ -54,7 +54,7 @@ from tests.unit.environments.test_nemo_gym import (
     nemo_gym_vllm_generation,  # noqa: F401
 )
 from tests.unit.experience.test_rollouts import (
-    initial_multi_step_calculator_batch, # noqa: F401
+    initial_multi_step_calculator_batch,  # noqa: F401
     multi_step_calculator_environment,  # noqa: F401
     multi_step_setup_vllm_async,  # noqa: F401
     rollout_cluster,  # noqa: F401
