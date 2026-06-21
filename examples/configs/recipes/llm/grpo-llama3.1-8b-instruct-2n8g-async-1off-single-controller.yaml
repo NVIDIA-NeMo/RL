@@ -1,0 +1,32 @@
+# SingleController variant of grpo-llama3.1-8b-instruct-2n8g-async-1off.yaml.
+# Same training topology and async-1off strategy; the SC path routes
+# everything through the TransferQueue data plane + SingleControllerActor.
+# staleness_window + over_sampling=false replicate the per-version dispatch
+# quota of the original async-grpo path.
+defaults: ./performance/grpo-llama3.1-8b-instruct-2n8g-async-1off.yaml
+
+logger:
+  log_dir: logs/grpo-llama3.1-8b-instruct-2n8g-async-1off-sc
+  wandb:
+    name: grpo-llama3.1-8b-instruct-2n8g-async-1off-sc
+
+checkpointing:
+  checkpoint_dir: results/grpo-llama3.1-8b-instruct-2n8g-async-1off-sc
+
+# TransferQueue data plane is mandatory for the SingleController path.
+data_plane:
+  enabled: true
+
+# SC async-RL runtime knobs.
+async_rl:
+  # Matches grpo.async_grpo.max_trajectory_age_steps=1.
+  max_weight_staleness_versions: 1
+  # One training step consumes grpo.num_prompts_per_step (=64) prompt groups.
+  min_prompt_groups_per_batch: 64
+  batch_selection_strategy: staleness_window
+  max_inflight_prompts: 128
+  # over_sampling=false requires
+  #   max_buffered_rollouts == target_prompt_groups_per_step * (max_weight_staleness_versions + 1)
+  #   64 * (1 + 1) = 128
+  max_buffered_rollouts: 128
+  over_sampling: false
