@@ -154,6 +154,12 @@ the useful parts are simple overrides:
 - `NEMO_RL_QWEN35_TRUNCATE_PROMPT_TOKENS=<N|none>`: controls the prompt
   truncation fallback used by the Qwen vLLM async worker patch.
 - `NEMO_RL_QWEN35_FORCE_TORCH_GDN=1`: forces the torch GatedDeltaNet fallback.
+- `NEMO_RL_QWEN35_ALLOW_NON_MONOTONIC_PREFIX=1`: re-enables the defensive
+  monotonic-prefix fallback. The default is strict because the known-good
+  diagnostic run did not need this path.
+- `NEMO_RL_ALLOW_NONCONTIGUOUS_MESSAGE_TOKENS=true`: re-enables collapsing
+  non-contiguous trajectory history to the current turn. The default is strict
+  because the known-good diagnostic run did not hit this path.
 
 ## OCI-HSG R2E study example
 
@@ -279,7 +285,6 @@ bash examples/nemo_gym/launch_nemo_gym_multinode_training.sh \
   "penalize_empty_final_answer=false" \
   "penalize_eos_token=false" \
   "penalize_malformed_think_tag=false" \
-  "++env.nemo_gym.allow_noncontiguous_message_tokens=true" \
   "policy.sequence_packing.enabled=false" \
   "policy.generation.temperature=1.0" \
   "policy.generation.top_p=1.0" \

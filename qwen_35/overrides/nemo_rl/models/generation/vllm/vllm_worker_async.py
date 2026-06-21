@@ -125,7 +125,7 @@ def _normalize_weight_update_results(worker_results: Any) -> tuple[bool, list[An
 
 def _allow_qwen35_monotonic_fallback() -> bool:
     return os.environ.get(
-        "NEMO_RL_QWEN35_ALLOW_NON_MONOTONIC_PREFIX", "1"
+        "NEMO_RL_QWEN35_ALLOW_NON_MONOTONIC_PREFIX", "0"
     ).lower() not in {"0", "false", "no"}
 
 

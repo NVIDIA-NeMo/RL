@@ -411,7 +411,7 @@ Output prompt token IDs summary: {_summarize_token_ids(output_item_dict["prompt_
                         allow_noncontiguous = os.environ.get(
                             "NEMO_RL_ALLOW_NONCONTIGUOUS_MESSAGE_TOKENS"
                         )
-                    if not _bool_flag(allow_noncontiguous, default=True):
+                    if not _bool_flag(allow_noncontiguous, default=False):
                         raise AssertionError(message)
 
                     print(
