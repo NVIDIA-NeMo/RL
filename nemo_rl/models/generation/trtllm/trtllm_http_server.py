@@ -32,6 +32,7 @@ def create_app(
     llm: Any,
     tokenizer: Any,
     model_name: str,
+    max_seq_len: int = 131072,
 ) -> "FastAPI":
     """Build a FastAPI application backed by *llm* (``tensorrt_llm.LLM``)."""
     from fastapi import FastAPI, Request
@@ -50,10 +51,13 @@ def create_app(
         tools: list[dict] | None = body.get("tools")
         temperature = body.get("temperature", 1.0)
         top_p = body.get("top_p", 1.0)
-        max_tokens = body.get("max_tokens") or body.get("max_completion_tokens") or 4096
         logprobs_requested = body.get("logprobs", False)
 
         prompt_token_ids = _build_prompt_token_ids(messages, tokenizer, tools=tools)
+
+        # Default to the full remaining context window (matching vLLM behavior).
+        # Callers that don't set max_tokens should not be silently capped at 4096.
+        max_tokens = body.get("max_tokens") or body.get("max_completion_tokens") or max(1, max_seq_len - len(prompt_token_ids))
 
         from tensorrt_llm import SamplingParams as TrtSamplingParams
 
@@ -64,11 +68,20 @@ def create_app(
             logprobs=True,
         )
 
-        outputs = await asyncio.to_thread(
-            llm.generate,
-            [{"prompt_token_ids": prompt_token_ids}],
-            sampling_params=sampling,
-        )
+        try:
+            outputs = await asyncio.to_thread(
+                llm.generate,
+                [{"prompt_token_ids": prompt_token_ids}],
+                sampling_params=sampling,
+            )
+        except Exception as e:
+            err = str(e)
+            if "prompt length" in err or "max_num_tokens" in err or "max_seq_len" in err:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": f"context length exceeded: {err}"},
+                )
+            raise
 
         output = outputs[0]
         gen = output.outputs[0]
@@ -239,6 +252,9 @@ def _build_prompt_token_ids(
     template_kwargs: dict[str, Any] = {
         "add_generation_prompt": True,
         "tokenize": True,
+        # Qwen3 thinking models require this to produce "<|im_start|>assistant\n<think>\n"
+        # as the generation prompt.  Without it the model generates EOS immediately.
+        "enable_thinking": True,
     }
     if tools:
         template_kwargs["tools"] = tools
@@ -276,6 +292,7 @@ def start_server(
     model_name: str,
     host: str = "0.0.0.0",
     port: int = 0,
+    max_seq_len: int = 131072,
 ) -> "tuple[threading.Thread, str, Any]":
     """Start the HTTP server in a daemon thread and return (thread, base_url, server)."""
     import uvicorn
@@ -290,7 +307,7 @@ def start_server(
     node_ip = _get_node_ip_local()
     base_url = f"http://{node_ip}:{port}/v1"
 
-    app = create_app(llm, tokenizer, model_name)
+    app = create_app(llm, tokenizer, model_name, max_seq_len=max_seq_len)
     config = uvicorn.Config(app, host=host, port=port, log_level="warning")
     server = uvicorn.Server(config=config)
 

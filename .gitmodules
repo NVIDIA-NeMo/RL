@@ -10,6 +10,6 @@
 	shallow = true
 [submodule "3rdparty/Gym-workspace/Gym"]
 	path = 3rdparty/Gym-workspace/Gym
-	url = https://github.com/NVIDIA-NeMo/Gym.git
-	branch = main
+	url = https://github.com/hchings/Gym.git
+	branch = trtllm-agentic-swe
 	shallow = true
