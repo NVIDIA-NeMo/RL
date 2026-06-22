@@ -11,6 +11,7 @@ policy:
   train_global_batch_size: 64
 
 checkpointing:
+  enabled: false
   checkpoint_dir: "results/grpo-nemotron-diffusion-3b-block-just-grpo-deepscaler-megatron-toy-8p8g"
 
 logger:

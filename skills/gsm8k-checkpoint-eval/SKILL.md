@@ -110,8 +110,8 @@ Key parameters:
 - `TEMP=0.0` always use greedy eval to remove the noise.
 - `MAX_NEW_TOKENS`, `MAX_STEPS`, and `CONTEXT_LENGTH` must be set per benchmark: use `750/32/1024` for GSM8K and `8192/8192/20480` for AIME.
 - AIME standalone eval loads the Nemo Skills AIME JSONLs from `/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/snorouzi/eval_data/nemo_skills_aime/{aime24,aime25}/test.jsonl` by default. Override with `NEMO_SKILLS_AIME_DATA_DIR` if needed; do not commit benchmark JSONLs into the repo.
-- For AIME chat-completions parity with Yonggon/NemoSkills, use `GENERATION_API=chat_completions`, `TOP_P=0.95`, and `PROMPT_FILE=/home/snorouzi/diffusion_RL/RL/examples/prompts/generic_math.txt`.
-- Observed baseline prompt sensitivity for the 3B checkpoint with SGLang/FastDiffuser block size 16, temp 0, high AIME budget: `generic_math.txt` gives AIME24 `4/30 = 13.33%` and AIME25 `3/30 = 10.00%`; `aime_no_cot.txt` gives AIME24 `5/30 = 16.67%` and AIME25 `2/30 = 6.67%`. Use `aime_no_cot.txt` when trying to match the higher observed AIME24 number.
+- For AIME, CoT prompting MUST be used: always set `PROMPT_FILE=/home/snorouzi/diffusion_RL/RL/examples/prompts/generic_math.txt` (the CoT math prompt). Do NOT use `aime_no_cot.txt` for AIME runs. Also set `GENERATION_API=chat_completions` and `TOP_P=0.95` for chat-completions parity with Yonggon/NemoSkills.
+- Observed baseline prompt sensitivity for the 3B checkpoint with SGLang/FastDiffuser block size 16, temp 0, high AIME budget (for reference only): `generic_math.txt` (CoT) gives AIME24 `4/30 = 13.33%` and AIME25 `3/30 = 10.00%`; `aime_no_cot.txt` gives AIME24 `5/30 = 16.67%` and AIME25 `2/30 = 6.67%`. Despite the slightly higher no-CoT AIME24 number, always use the CoT `generic_math.txt` prompt for AIME so results stay consistent and comparable across runs.
 - `NUM_SAMPLES=-1` by default for the full benchmark; set `NUM_SAMPLES=16` for a smoke test.
 
 Examples:

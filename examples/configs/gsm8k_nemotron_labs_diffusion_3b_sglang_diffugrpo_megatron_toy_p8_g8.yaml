@@ -12,6 +12,7 @@ grpo:
   val_batch_size: 8
 
 checkpointing:
+  enabled: false
   save_period: 1
 
 policy:
