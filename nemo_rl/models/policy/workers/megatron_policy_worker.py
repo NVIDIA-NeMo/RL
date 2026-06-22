@@ -1102,6 +1102,10 @@ class MegatronPolicyWorkerImpl(
             finish_model_config.grad_sync_func = state["saved_grad_sync_func"]
             finish_model_config.no_sync_func = state["saved_no_sync_func"]
 
+        # Record the LR/WD before self.scheduler.step() is called.
+        curr_lr = self.scheduler.get_lr(self.optimizer.param_groups[0])
+        curr_wd = self.scheduler.get_wd()
+
         # Scheduler increment matches sync path's ``increment=gbs``.
         self.scheduler.step(increment=state["gbs"])
 
@@ -1109,8 +1113,6 @@ class MegatronPolicyWorkerImpl(
         # sync path produces. ``masked_mean`` is linear in 1/N so a single
         # scalar multiply per metric recovers the normalized value.
         rescaled_metrics: list[dict[str, Any]] = []
-        curr_lr = self.scheduler.get_lr(self.optimizer.param_groups[0])
-        curr_wd = self.scheduler.get_wd()
         global_valid_seqs_f = float(global_valid_seqs.item())
         global_valid_toks_f = float(global_valid_toks.item())
 

@@ -24,7 +24,7 @@ async_rl:
   # One training step consumes grpo.num_prompts_per_step (=64) prompt groups.
   min_prompt_groups_per_batch: 64
   batch_selection_strategy: staleness_window
-  max_inflight_prompts: 128
+  max_inflight_prompts: ${grpo.num_prompts_per_step}  # match grpo-llama3.1-8b-instruct-2n8g-async-1off
   # over_sampling=false requires
   #   max_buffered_rollouts == target_prompt_groups_per_step * (max_weight_staleness_versions + 1)
   #   64 * (1 + 1) = 128
