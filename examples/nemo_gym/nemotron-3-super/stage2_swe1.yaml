@@ -5,7 +5,7 @@ checkpointing:
   higher_is_better: true
   keep_top_k: 100
   save_period: 5
-  checkpoint_must_save_by: "00:03:30:00"
+  checkpoint_must_save_by: null
   model_save_format: "safetensors"
   save_consolidated: false
   save_optimizer: true
@@ -247,6 +247,7 @@ policy:
     vllm_kwargs:
       mamba_ssm_cache_dtype: "float32"
       compilation_config:
+        cudagraph_mode: PIECEWISE
         cudagraph_capture_sizes: [1,2,4,8,16,32,64]
     colocated:
       enabled: false
