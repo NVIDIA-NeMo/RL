@@ -1414,6 +1414,64 @@ def test_clipped_pg_loss_reports_is_oob_ratio_tis():
     assert metrics["is_oob_ratio"] == pytest.approx(1.0 / 3.0)
 
 
+@pytest.mark.parametrize("tis_type", ["tis", "icepop", "seq-mask-tis"])
+def test_clipped_pg_loss_rejects_tis_min_above_max(tis_type):
+    cfg = ClippedPGLossConfig(
+        use_importance_sampling_correction=True,
+        truncated_importance_sampling_type=tis_type,
+        truncated_importance_sampling_ratio=1.0,
+        truncated_importance_sampling_ratio_min=2.0,
+    )
+
+    with pytest.raises(
+        AssertionError,
+        match=(
+            "truncated_importance_sampling_ratio_min must be <= "
+            "truncated_importance_sampling_ratio"
+        ),
+    ):
+        ClippedPGLossFn(cfg)
+
+
+@pytest.mark.parametrize(
+    "tis_min,expected_weights,expected_oob_ratio",
+    [
+        (None, torch.tensor([0.1, 1.0, 2.0]), 1.0 / 3.0),
+        (0.5, torch.tensor([0.5, 1.0, 2.0]), 2.0 / 3.0),
+    ],
+)
+def test_clipped_pg_loss_tis_min_bound_defaults_to_zero(
+    tis_min, expected_weights, expected_oob_ratio
+):
+    device = "cpu"
+    data, _, seq_len, _ = _setup_clipped_pg_test_data(device=device)
+
+    cfg = ClippedPGLossConfig(
+        reference_policy_kl_penalty=0.0,
+        use_importance_sampling_correction=True,
+        force_on_policy_ratio=True,
+        truncated_importance_sampling_type="tis",
+        truncated_importance_sampling_ratio=2.0,
+        truncated_importance_sampling_ratio_min=tis_min,
+    )
+    loss_fn = ClippedPGLossFn(cfg)
+
+    data["advantages"][0, 1:] = torch.ones(3)
+    data["generation_logprobs"][0, 1:] = torch.zeros(3)
+    next_token_logprobs = torch.log(torch.tensor([[0.1, 1.0, 3.0]]))
+
+    loss, metrics = loss_fn(
+        next_token_logprobs=next_token_logprobs,
+        data=data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(data["sample_mask"] * data["token_mask"]),
+    )
+
+    expected_loss = -expected_weights.mean()
+    torch.testing.assert_close(loss, expected_loss)
+    assert metrics["is_oob_ratio"] == pytest.approx(expected_oob_ratio)
+
+
 def test_clipped_pg_loss_seq_mask_tis():
     """Tests ClippedPGLossFn with seq-mask-tis, including nan_to_num on -inf.
 

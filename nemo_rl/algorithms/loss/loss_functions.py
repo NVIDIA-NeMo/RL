@@ -121,12 +121,12 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     use_importance_sampling_correction: bool = False
     # --- Truncated importance sampling ---
     # Type of truncated importance sampling:
-    #   "tis"          – clamp IS weights to max
+    #   "tis"          – clamp IS weights to [min, max], where min defaults to 0
     #   "icepop"       – zero out tokens with IS weight outside [min, max]
     #   "seq-mask-tis" – zero out sequences by geometric-mean IS ratio, non-truncated token IS correction
     truncated_importance_sampling_type: Optional[str] = None
     truncated_importance_sampling_ratio: Optional[float] = None
-    # Lower bound for ICE-POP / seq-mask-tis filtering
+    # Lower bound for TIS clipping, ICE-POP filtering, or seq-mask-tis filtering
     truncated_importance_sampling_ratio_min: Optional[float] = None
 
     # --- On-policy ---
@@ -223,7 +223,7 @@ class ClippedPGLossFn(LossFunction):
         self.truncated_importance_sampling_ratio = (
             cfg.truncated_importance_sampling_ratio
         )
-        # Lower bound for ICE-POP / seq-mask-tis filtering
+        # Lower bound for TIS clipping, ICE-POP filtering, or seq-mask-tis filtering
         self.truncated_importance_sampling_ratio_min = (
             cfg.truncated_importance_sampling_ratio_min
         )
@@ -279,6 +279,14 @@ class ClippedPGLossFn(LossFunction):
                 self.truncated_importance_sampling_ratio is not None
                 and self.truncated_importance_sampling_ratio > 0
             ), "truncated_importance_sampling_ratio should be positive"
+            if self.truncated_importance_sampling_ratio_min is not None:
+                assert (
+                    self.truncated_importance_sampling_ratio_min
+                    <= self.truncated_importance_sampling_ratio
+                ), (
+                    "truncated_importance_sampling_ratio_min must be <= "
+                    "truncated_importance_sampling_ratio"
+                )
             if self.truncated_importance_sampling_type in ("icepop", "seq-mask-tis"):
                 assert self.truncated_importance_sampling_ratio_min is not None, (
                     "truncated_importance_sampling_ratio_min should be set when truncated_importance_sampling_type is 'icepop' or 'seq-mask-tis'"
@@ -498,7 +506,7 @@ class ClippedPGLossFn(LossFunction):
                 actor_importance_weights_expanded, nan=0.0, posinf=0.0, neginf=0.0
             )
         # ---- Truncated Importance Sampling ----
-        # "tis"          – clamp IS weights to [0, max]
+        # "tis"          – clamp IS weights to [min, max], where min defaults to 0
         # "icepop"       – zero out tokens whose IS weight ∉ [min, max]   (ref bounds: 0.5–5)
         # "seq-mask-tis" – zero out entire sequences whose geometric-mean
         #                  IS ratio ∉ [min, max]; retained sequences keep
@@ -510,10 +518,13 @@ class ClippedPGLossFn(LossFunction):
         # count, so the np.sum aggregation in grpo.py recovers the correct global fraction.
         if self.truncated_importance_sampling_ratio is not None:
             if self.truncated_importance_sampling_type == "tis":
+                tis_min = self.truncated_importance_sampling_ratio_min
+                if tis_min is None:
+                    tis_min = 0.0
                 token_oob_mask = (
                     actor_importance_weights_expanded
                     > self.truncated_importance_sampling_ratio
-                )
+                ) | (actor_importance_weights_expanded < tis_min)
                 _is_filter_metrics = {
                     "is_oob_ratio": masked_mean(
                         token_oob_mask.float(),
@@ -523,6 +534,7 @@ class ClippedPGLossFn(LossFunction):
                 }
                 actor_importance_weights_expanded = torch.clamp(
                     actor_importance_weights_expanded,
+                    min=tis_min,
                     max=self.truncated_importance_sampling_ratio,
                 )
             elif self.truncated_importance_sampling_type == "icepop":
