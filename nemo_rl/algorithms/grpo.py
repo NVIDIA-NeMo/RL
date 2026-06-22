@@ -4244,12 +4244,13 @@ def async_grpo_train(
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
     stop_at_validation_threshold = master_config.grpo.stop_at_validation_threshold
     stop_at_validation_metric = master_config.grpo.stop_at_validation_metric
+
+    assert (not colocated_inference) or (
+        isinstance(policy_generation, MegatronGeneration)
+    ), "Colocated async GRPO is unsupported for the desired generation backend."
+
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
-
-    assert not colocated_inference, (
-        "Colocated inference is not supported for async GRPO. Please use non-colocated inference."
-    )
 
     # Calculate minimum buffer size from training requirements
     # In per-prompt buffer mode, one buffer entry is 1 prompt * num_generations_per_prompt
@@ -4383,7 +4384,21 @@ def async_grpo_train(
     )
 
     print("⏳ Preparing policy generation for training...", flush=True)
-    if NEED_REFIT and POLICY_GENERATION_STALE:
+    if colocated_inference:
+        # Colocated mode currently does not support weights refit.
+        print("🔄 Initializing colocated Megatron inference engine...")
+        try:
+            policy.offload_before_refit()
+            policy_generation.prepare_for_generation()
+            POLICY_GENERATION_STALE = False
+            print("✅ Colocated Megatron engine initialized")
+        except Exception as e:
+            print(f"❌ Colocated Megatron engine initialization failed: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return
+    elif NEED_REFIT and POLICY_GENERATION_STALE:
         print("🔄 Refitting policy generation with actual model weights...", flush=True)
         try:
             refit_policy_generation(
@@ -4439,7 +4454,9 @@ def async_grpo_train(
                 processor=processor,
             )
             initial_val_metrics = val_metrics
-            policy_generation.finish_generation()
+            # Colocated engine stays alive across steps (preserves KV cache).
+            if not colocated_inference:
+                policy_generation.finish_generation()
             logger.log_metrics(val_metrics, step, prefix="validation")
             logger.log_metrics(validation_timings, step, prefix="timing/validation")
             if master_config.grpo.debug_payload_metrics:
@@ -4825,6 +4842,17 @@ def async_grpo_train(
                     )
                     train_data.to("cpu")
 
+                generation_logger_metrics = None
+                if colocated_inference:
+                    print("⏸️ Pausing colocated engine + collector for training...")
+                    with timer.time("exposed_generation"):
+                        ray.get(trajectory_collector.prepare_for_refit.remote())
+                    if policy_generation is not None:
+                        generation_logger_metrics = (
+                            policy_generation.get_logger_metrics()
+                        )
+                    policy_generation.finish_generation()
+
                 # Training phase (same as sync version)
                 skip_prev_logprobs, skip_reference_logprobs = (
                     _resolve_logprob_skip_flags(master_config)
@@ -4957,8 +4985,17 @@ def async_grpo_train(
                     )
 
                 print("🔄 Synchronizing policy weights to trajectory collector…")
-                generation_logger_metrics = None
-                if NEED_REFIT:
+                if colocated_inference:
+                    # Colocated mode currently does not support weights refit.
+                    print("🔄 Resuming colocated engine after training step...")
+                    with timer.time("weight_sync"):
+                        policy.offload_before_refit()
+                    policy_generation.prepare_for_generation()
+                    POLICY_GENERATION_STALE = False
+                    weight_version += 1
+                    trajectory_collector.set_weight_version.remote(weight_version)
+                    trajectory_collector.resume_after_refit.remote()
+                elif NEED_REFIT:
                     timer.start("idle/refit_bubble")
 
                     # Measure pending-generation wait as exposed_generation time
@@ -5025,7 +5062,11 @@ def async_grpo_train(
                 # Run validation if it's a validation step or last step with val_at_end
                 if should_run_validation:
                     with timer.time("idle/validation"):
-                        if NEED_REFIT and POLICY_GENERATION_STALE:
+                        if colocated_inference:
+                            # Colocated engine was already resumed post-training;
+                            # no refit path exists in colocated mode.
+                            pass
+                        elif NEED_REFIT and POLICY_GENERATION_STALE:
                             refit_metrics = refit_policy_generation(
                                 policy,
                                 policy_generation,
@@ -5044,7 +5085,8 @@ def async_grpo_train(
                             logger=logger,
                             processor=processor,
                         )
-                        policy_generation.finish_generation()
+                        if not colocated_inference:
+                            policy_generation.finish_generation()
                         logger.log_metrics(
                             validation_timings, step + 1, prefix="timing/validation"
                         )
