@@ -66,16 +66,23 @@ patches into the container.
 examples/nemo_gym/grpo_qwen3_235b_swe_openhands_async.yaml
 ```
 
-It intentionally carries only model-family-specific settings:
+It carries the Qwen 3.5-specific runtime settings and the standard R2E
+study defaults that should not depend on the launch site:
 
 - Qwen 3.5 vLLM tool/reasoning parser defaults.
 - Qwen 3.5 special token IDs used by token-aware checks.
 - Qwen-safe response-penalty defaults.
-- Narrow Megatron/vLLM compatibility values that should travel with Qwen 3.5.
+- Megatron/vLLM compatibility values that should travel with Qwen 3.5.
+- Standard R2E training HPs: GBS 512, 32 prompts x 16 generations, LR 5e-6,
+  64k context, async GRPO age 1, PP=2 policy defaults, and SWE 15-turn
+  timeouts.
+- `policy.sequence_packing.enabled=false`, because Qwen 3.5 GDN currently does
+  not support packed sequences.
 
 It does **not** bake in cluster size, data paths, checkpoint paths, experiment
 names, walltime, or node allocation. Those remain normal launcher environment
-variables and Hydra overrides.
+variables and minimal Hydra overrides. Deliberate shmoo/smoke changes, such as
+PP=1 or smaller GBS, should be explicit overrides.
 
 ## What the overlay changes
 
@@ -229,82 +236,16 @@ bash examples/nemo_gym/launch_nemo_gym_multinode_training.sh \
   "data.train.data_path=${CONTAINER_NEMO_GYM_SWE_TRAIN_DATA_PATH}" \
   "data.validation.data_path=${CONTAINER_NEMO_GYM_SWE_VALIDATION_DATA_PATH}" \
   "sif_dir=${NEMO_GYM_SWE_SIF_DIR}" \
-  "logger.wandb_enabled=False" \
-  "logger.wandb.project=nemotron-3-ultra" \
-  "policy.train_global_batch_size=128" \
-  "policy.train_micro_batch_size=1" \
-  "policy.logprob_batch_size=1" \
-  "policy.generation_batch_size=64" \
-  "grpo.num_prompts_per_step=16" \
-  "grpo.num_generations_per_prompt=8" \
-  "grpo.val_batch_size=null" \
-  "grpo.max_num_steps=50" \
-  "grpo.async_grpo.enabled=true" \
-  "grpo.async_grpo.max_trajectory_age_steps=1" \
-  "grpo.val_period=5" \
-  "grpo.val_at_start=true" \
-  "grpo.val_at_end=false" \
-  "policy.megatron_cfg.tensor_model_parallel_size=4" \
-  "policy.megatron_cfg.expert_model_parallel_size=64" \
-  "policy.megatron_cfg.expert_tensor_parallel_size=1" \
-  "policy.megatron_cfg.context_parallel_size=1" \
-  "policy.megatron_cfg.pipeline_model_parallel_size=2" \
-  "policy.megatron_cfg.sequence_parallel=true" \
-  "policy.megatron_cfg.moe_token_dispatcher_type=alltoall" \
-  "policy.megatron_cfg.apply_rope_fusion=false" \
-  "++policy.megatron_cfg.gradient_accumulation_fusion=false" \
-  "++policy.megatron_cfg.checkpoint.async_strategy=mcore" \
-  "policy.generation.vllm_cfg.tensor_parallel_size=8" \
-  "policy.generation.vllm_cfg.pipeline_parallel_size=1" \
-  "policy.generation.vllm_cfg.expert_parallel_size=8" \
-  "policy.generation.vllm_cfg.gpu_memory_utilization=0.55" \
-  "policy.generation.vllm_cfg.max_model_len=65536" \
-  "policy.max_total_sequence_length=65536" \
-  "policy.generation.max_new_tokens=65536" \
-  "data.max_input_seq_length=null" \
-  "++data.use_multiple_dataloader=false" \
-  "checkpointing.enabled=false" \
-  "++checkpointing.save_optimizer=false" \
-  "checkpointing.save_period=1000000" \
-  "checkpointing.checkpoint_must_save_by=null" \
-  "env.nemo_gym.skip_venv_if_present=true" \
-  "env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.agent_max_turns=30" \
-  "env.nemo_gym.swe_agents_val.responses_api_agents.swe_agents.agent_max_turns=30" \
-  "env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.concurrency=128" \
-  "env.nemo_gym.swe_agents_val.responses_api_agents.swe_agents.concurrency=128" \
-  "env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.swebench_agent_timeout=360" \
-  "env.nemo_gym.swe_agents_val.responses_api_agents.swe_agents.swebench_agent_timeout=180" \
-  "policy.generation.vllm_cfg.http_server_serving_chat_kwargs.tool_parser=qwen3_xml" \
-  "policy.generation.vllm_cfg.http_server_serving_chat_kwargs.reasoning_parser=qwen3" \
-  "token_ids.eos=248046" \
-  "token_ids.think_open=248068" \
-  "token_ids.think_close=248069" \
-  "penalize_duplicated_reasoning=false" \
-  "penalize_empty_final_answer=false" \
-  "penalize_eos_token=false" \
-  "penalize_malformed_think_tag=false" \
-  "policy.sequence_packing.enabled=false" \
-  "policy.generation.temperature=1.0" \
-  "policy.generation.top_p=1.0" \
-  "policy.megatron_cfg.optimizer.lr=5.0e-6" \
-  "policy.megatron_cfg.optimizer.min_lr=4.999e-6" \
-  "policy.megatron_cfg.scheduler.lr_warmup_iters=3" \
-  "policy.megatron_cfg.scheduler.lr_decay_iters=100000" \
-  "grpo.overlong_filtering=true" \
-  "++grpo.skip_reference_policy_logprobs_calculation=true" \
-  "grpo.max_val_samples=null" \
-  "+policy.generation.mcore_generation_config.buffer_size_gb=8" \
-  "grpo.async_grpo.in_flight_weight_updates=false"
+  "logger.wandb_enabled=False"
 ```
 
 Notes:
 
 - `SBATCH_GRES=gpu:4` is required on OCI-HSG `batch`; without it Slurm rejects
   the job because no GPU TRES is requested.
-- Keep the escaped quotes in `R2E_FORMATTERS`. The launcher interpolates
-  overrides into a shell command, and unescaped quotes are consumed before
-  Hydra sees the list. Without escaping, Hydra rejects the `{instance_id}`
-  placeholder in the formatter paths.
+- The Qwen wrapper owns the stable training HPs and R2E SIF formatter list.
+  Do not pass correctness-critical knobs such as sequence packing, parser
+  settings, token IDs, or formatter paths as CLI overrides.
 - The result directory is `${REPO_LOCATION}/results/${EXP_NAME}`.
 - The Ray driver log appears under
   `${REPO_LOCATION}/results/${EXP_NAME}/logs/<jobid>-logs/ray-driver.log`.

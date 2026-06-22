@@ -25,8 +25,41 @@ data:
     data_path: ${oc.env:NEMO_GYM_SWE_TRAIN_DATA_PATH}
   validation:
     data_path: ${oc.env:NEMO_GYM_SWE_VALIDATION_DATA_PATH}
+  max_input_seq_length: null
+  use_multiple_dataloader: false
+
+# Standard Qwen 3.5 R2E study defaults. Cluster size, paths, walltime, and
+# deliberate shmoo changes can still be overridden by launchers. Keep stable
+# correctness/performance defaults here so callers do not need long CLI lists.
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+  max_num_steps: 8
+  val_batch_size: null
+  max_val_samples: null
+  val_period: 5
+  val_at_start: true
+  val_at_end: false
+  overlong_filtering: true
+  skip_reference_policy_logprobs_calculation: true
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: false
+
+checkpointing:
+  enabled: false
+  save_optimizer: false
+  save_period: 1000000
+  checkpoint_must_save_by: null
 
 policy:
+  train_global_batch_size: 512
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  generation_batch_size: 64
+  max_total_sequence_length: 65536
+
   # Qwen 3.5 GDN currently does not support Megatron packed sequences.
   # Keep this in the Qwen wrapper so callers do not need a correctness-critical
   # CLI override.
@@ -40,6 +73,21 @@ policy:
   tokenizer:
     name: ${oc.env:CONTAINER_HF_CKPT_PATH}
   megatron_cfg:
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 2
+    context_parallel_size: 1
+    expert_model_parallel_size: 64
+    expert_tensor_parallel_size: 1
+    sequence_parallel: true
+    moe_token_dispatcher_type: alltoall
+    optimizer:
+      lr: 5.0e-6
+      min_lr: 4.999e-6
+    scheduler:
+      lr_warmup_iters: 3
+      lr_decay_iters: 100000
+    checkpoint:
+      async_strategy: mcore
     apply_rope_fusion: false
     gradient_accumulation_fusion: false
     mtp_loss_scaling_factor: 0.0
@@ -57,7 +105,17 @@ policy:
     moe_flex_dispatcher_backend: alltoall
     moe_hybridep_num_sms: 32
   generation:
+    max_new_tokens: 65536
+    temperature: 1.0
+    top_p: 1.0
+    mcore_generation_config:
+      buffer_size_gb: 8
     vllm_cfg:
+      max_model_len: 65536
+      tensor_parallel_size: 8
+      pipeline_parallel_size: 1
+      expert_parallel_size: 8
+      gpu_memory_utilization: 0.55
       # Keep Qwen 3.5 on the CUDA-graph path used by the known-good smoke run.
       enforce_eager: false
       http_server_serving_chat_kwargs:
@@ -77,15 +135,24 @@ policy:
 # Qwen 3.5 chat-template/token handling used by the qwen_35 overlay.
 env:
   nemo_gym:
+    skip_venv_if_present: true
     swe_agents_train:
       responses_api_agents:
         swe_agents:
+          agent_max_turns: 15
+          concurrency: 128
+          swebench_agent_timeout: 360
+          swebench_tests_timeout: 300
           container_formatter:
             - "${sif_dir}/r2egym/{instance_id}.sif"
             - "${sif_fallback_dir}/r2e_gym/{instance_id}.sif"
     swe_agents_val:
       responses_api_agents:
         swe_agents:
+          agent_max_turns: 15
+          concurrency: 128
+          swebench_agent_timeout: 180
+          swebench_tests_timeout: 180
           container_formatter: ${env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.container_formatter}
     policy_model:
       responses_api_models:
