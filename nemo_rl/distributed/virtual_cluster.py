@@ -298,50 +298,64 @@ def _get_gpu_id_info() -> tuple[int, str, int]:  # pragma: no cover
 
 def get_reordered_bundle(
     pg: PlacementGroup,
-) -> tuple[list[int], list[int]]:
-    """Return bundle indices and GPU IDs sorted by (node_id, gpu_id).
+    segment_size: int | None = None,
+    gpus_per_node: int | None = None,
+) -> tuple[list[int], list[int], tuple[str, ...]]:
+    """Return bundle indices and GPU IDs ordered by physical topology.
 
-    Uses ``GetGPUIDActor`` to discover the physical GPU ID assigned to each
-    bundle.
+    Spins up one short-lived task per bundle (``_get_gpu_id_info``) to discover
+    each bundle's physical GPU ID, NVLink domain, and ``topo_rank``, then orders
+    bundles via ``_sort_bundle_indices_by_topology``:
+
+      * No topology info available -> sort by ``(node_id, gpu_id)``.
+      * Topology info available    -> sort by ``(domain_min_topo_rank, topo_rank, gpu_id)``.
+      * ``segment_size`` set        -> additionally drop bundles from NVLink
+        domains that cannot form a complete ``segment_size``-node segment.
+
+    Args:
+        pg: Placement group whose bundles to reorder.
+        segment_size: Nodes per NVLink domain segment for topology-aware
+            alignment; ``None`` disables segment filtering.
+        gpus_per_node: Required when ``segment_size`` is set.
 
     Returns:
-        (reordered_bundle_indices, reordered_gpu_ids)
+        ``(reordered_bundle_indices, reordered_gpu_ids, nvlink_domain_per_bundle_index)``
+        where ``nvlink_domain_per_bundle_index`` is indexed by *original* bundle index.
     """
     pg_data = placement_group_table(pg)
     num_bundles = len(pg_data["bundles"])
     bundle_to_node_ids = pg_data["bundles_to_node_id"]
 
-    info_actors = []
-    for i in range(num_bundles):
-        info_actors.append(
-            GetGPUIDActor.options(
-                num_cpus=0.01,
-                num_gpus=0.01,
-                scheduling_strategy=PlacementGroupSchedulingStrategy(
-                    placement_group=pg,
-                    placement_group_bundle_index=i,
-                ),
-            ).remote()
-        )
+    # Fire-and-forget tasks to get GPU id + topology info per bundle.
+    # Tasks reuse the raylet's worker pool and avoid GCS actor registrations.
+    info_refs = [
+        _get_gpu_id_info.options(
+            num_cpus=0.01,  # both small to enable assignment in colocated case
+            num_gpus=0.01,
+            resources=None,
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                placement_group=pg,
+                placement_group_bundle_index=i,
+            ),
+        ).remote()
+        for i in range(num_bundles)
+    ]
+    infos = ray.get(info_refs)
+    gpu_ids = [info[0] for info in infos]
+    nvlink_domains = [info[1] for info in infos]
+    topo_ranks = [info[2] for info in infos]
 
-    gpu_ids = ray.get([actor.get_gpu_id.remote() for actor in info_actors])
-    for actor in info_actors:
-        ray.kill(actor)
-
-    bundle_infos = [(i, bundle_to_node_ids[i], gpu_ids[i]) for i in range(num_bundles)]
-    sorted_infos = sorted(bundle_infos, key=lambda x: (x[1], x[2]))
-
-    reordered_bundle_indices = [info[0] for info in sorted_infos]
-    reordered_gpu_ids = [gpu_ids[info[0]] for info in sorted_infos]
-
-    for i, info in enumerate(sorted_infos):
-        actual_idx = info[0]
-        logger.info(
-            f"  bundle {i:4}, actual_bundle_index: {actual_idx:4}, "
-            f"node: {info[1]}, gpu: {gpu_ids[actual_idx]}"
-        )
-
-    return reordered_bundle_indices, reordered_gpu_ids
+    bundle_data = [
+        (gpu_ids[i], nvlink_domains[i], topo_ranks[i], bundle_to_node_ids[i])
+        for i in range(num_bundles)
+    ]
+    reordered_bundle_indices = _sort_bundle_indices_by_topology(
+        bundle_data,
+        segment_size=segment_size,
+        gpus_per_node=gpus_per_node,
+    )
+    reordered_gpu_ids = [gpu_ids[i] for i in reordered_bundle_indices]
+    return reordered_bundle_indices, reordered_gpu_ids, tuple(nvlink_domains)
 
 
 class ResourceInsufficientError(Exception):
@@ -930,55 +944,23 @@ class RayVirtualCluster:
             self._nvlink_domain_per_bundle_index = None
             return None
 
-        pg = self._node_placement_groups[0]
-        pg_data = placement_group_table(pg)
-        num_bundles = len(pg_data["bundles"])
-        bundle_to_node_ids = pg_data["bundles_to_node_id"]
-
-        # Fire-and-forget tasks to get GPU id + topology info per bundle.
-        # Tasks reuse the raylet's worker pool and avoid GCS actor registrations.
-        info_refs = []
-        for i in range(num_bundles):
-            info_refs.append(
-                _get_gpu_id_info.options(
-                    num_cpus=0.01,  # both small to enable assignment in colocated case
-                    num_gpus=0.01,
-                    resources=None,
-                    scheduling_strategy=PlacementGroupSchedulingStrategy(
-                        placement_group=pg,
-                        placement_group_bundle_index=i,
-                    ),
-                ).remote()
+        reordered_bundle_indices, _, nvlink_domain_per_bundle_index = (
+            get_reordered_bundle(
+                self._node_placement_groups[0],
+                segment_size=self.segment_size,
+                gpus_per_node=self.num_gpus_per_node if self.segment_size else None,
             )
-
-        infos = ray.get(info_refs)
-
-        gpu_ids = []
-        nvlink_domains = []
-        topo_ranks = []
-        for info in infos:
-            gpu_ids.append(info[0])
-            nvlink_domains.append(info[1])
-            topo_ranks.append(info[2])
-
-        bundle_data = [
-            (gpu_ids[i], nvlink_domains[i], topo_ranks[i], bundle_to_node_ids[i])
-            for i in range(num_bundles)
-        ]
-        self._nvlink_domain_per_bundle_index = tuple(nvlink_domains)
-        pg_reordered_bundle_indices = _sort_bundle_indices_by_topology(
-            bundle_data,
-            segment_size=self.segment_size,
-            gpus_per_node=self.num_gpus_per_node if self.segment_size else None,
         )
-        assert len(pg_reordered_bundle_indices) == num_bundles, (
-            f"Topology sort returned {len(pg_reordered_bundle_indices)} bundle indices "
+        self._nvlink_domain_per_bundle_index = nvlink_domain_per_bundle_index
+        num_bundles = len(nvlink_domain_per_bundle_index)
+        assert len(reordered_bundle_indices) == num_bundles, (
+            f"Topology sort returned {len(reordered_bundle_indices)} bundle indices "
             f"but the cluster has {num_bundles}. Some NVLink domains had incomplete "
             f"segments and were trimmed. Ensure cluster.segment_size divides evenly "
             f"into each domain's node count and that node_resource_constraints are set "
             f"to pin nodes to complete segments before creating this cluster."
         )
-        return pg_reordered_bundle_indices
+        return reordered_bundle_indices
 
     def shutdown(self) -> bool:
         """Cleans up and releases all resources associated with this virtual cluster.
