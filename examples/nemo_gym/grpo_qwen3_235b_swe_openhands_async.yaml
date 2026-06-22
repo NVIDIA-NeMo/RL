@@ -264,6 +264,7 @@ policy:
         tool_parser: hermes         # Qwen3-235B-A22B-Instruct-2507 tool-call format
         # For the Thinking variant add:  reasoning_parser: deepseek_r1
     vllm_kwargs:
+      attention_backend: FLASH_ATTN
       enable_chunked_prefill: true  # 80k prompts must not stall decode
       compilation_config:
         # accuracy mitigation for torch.compile kernels, see NVIDIA-NeMo/RL issue #998
