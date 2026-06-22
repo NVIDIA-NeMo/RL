@@ -411,6 +411,23 @@ class SGLangGenerationWorker:
         )
         return False
 
+    def reconfigure_dllm(self, overrides=None):
+        """Reconfigure the live FastDiffuser decoding params on this SGLang server.
+
+        Only model-owner workers (TP rank 0) issue the request. Returns the
+        previous attribute values (so the caller can restore them after
+        validation), or None if this worker did not change anything.
+        """
+        if not self.is_model_owner or not overrides:
+            return None
+        result = self._make_request("reconfigure_dllm", {"overrides": overrides})
+        if not result.get("success", False):
+            raise RuntimeError(
+                f"[SGLang Worker] Rank {self.global_rank} reconfigure_dllm failed "
+                f"for overrides {overrides}: {result.get('message')}"
+            )
+        return result.get("previous")
+
     def get_gpu_uuids(self) -> list[str]:
         """Get list of GPU UUIDs used by this SGLang server.
 

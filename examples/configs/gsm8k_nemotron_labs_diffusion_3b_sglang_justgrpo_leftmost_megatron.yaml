@@ -105,6 +105,12 @@ policy:
     top_k: null
     stop_token_ids: null
     stop_strings: null
+    # Validation decodes with FastDiffuser confidence (threshold 0.9) so val
+    # curves are comparable with confidence-based runs, even though rollout uses
+    # leftmost reveal. Remove this block to validate with the rollout policy.
+    sglang_val_dllm_overrides:
+      selection_policy: confidence
+      threshold: 0.9
     sglang_cfg:
       model_path: ${policy.model_name}
       gpus_per_server: 1

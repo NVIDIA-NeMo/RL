@@ -107,3 +107,8 @@ class SGLangConfig(GenerationConfig):
 
     sglang_cfg: SglangSpecificArgs
     sglang_kwargs: NotRequired[dict[str, Any]]
+    # Optional FastDiffuser decoding overrides applied ONLY during validation
+    # (e.g. {"selection_policy": "confidence", "threshold": 0.9}) so validation
+    # curves are comparable across runs with different rollout decoding policies.
+    # Absent/None => validation uses the same decoding as rollout (legacy behavior).
+    sglang_val_dllm_overrides: NotRequired[dict[str, Any] | None]

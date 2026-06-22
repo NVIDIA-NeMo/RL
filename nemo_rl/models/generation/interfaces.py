@@ -265,6 +265,14 @@ class GenerationInterface(ABC):
     def invalidate_kv_cache(self) -> bool:
         return False
 
+    def reconfigure_dllm(self, overrides: dict[str, Any]) -> Any:
+        """Reconfigure decoding params at runtime (SGLang/DLLM only).
+
+        Default no-op for backends without runtime-reconfigurable decoding.
+        Returns the previous values for later restoration, or None.
+        """
+        return None
+
     def clear_logger_metrics(self) -> None:
         """Clear logger metrics for performance reporting.
 

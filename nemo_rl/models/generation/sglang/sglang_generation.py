@@ -382,3 +382,20 @@ class SGLangGeneration(GenerationInterface):
         except Exception as e:
             logger.error(f"[sglang refit] Error flushing SGLang caches: {e}")
             return False
+
+    def reconfigure_dllm(self, overrides):
+        """Reconfigure the live FastDiffuser decoding params on all SGLang servers.
+
+        Returns the previous values (from a model-owner worker) so the caller
+        can restore the rollout configuration later, or None if nothing changed.
+        """
+        if not overrides:
+            return None
+        futures = self.worker_group.run_all_workers_single_data(
+            "reconfigure_dllm",
+            overrides=overrides,
+            run_rank_0_only_axes=["tensor_parallel"],
+        )
+        results = [r for r in ray.get(futures) if r is not None]
+        # All model owners return the same previous config; take the first.
+        return results[0] if results else None

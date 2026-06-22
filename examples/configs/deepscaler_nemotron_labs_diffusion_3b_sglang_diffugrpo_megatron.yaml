@@ -24,6 +24,12 @@ policy:
     # view error). Kept explicit (not inherited) because the divisibility constraint is
     # DiffuGRPO-specific -- AR has no such requirement.
     max_new_tokens: 3744
+    # Validation decodes with FastDiffuser confidence (threshold 0.9) so val
+    # curves are comparable across runs with different rollout decoding policies.
+    # Remove this block to validate with the rollout policy.
+    sglang_val_dllm_overrides:
+      selection_policy: confidence
+      threshold: 0.9
     sglang_cfg:
       max_running_requests: 4
       disable_cuda_graph: true

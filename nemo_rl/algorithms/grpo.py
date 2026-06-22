@@ -2239,62 +2239,103 @@ def validate(
             master_config["grpo"]["max_val_samples"]
             // master_config["grpo"]["val_batch_size"]
         )
-        for batch_idx, val_batch in enumerate(val_dataloader):
-            if batch_idx >= max_batches:
-                break
+        # Optionally switch the generation engine to a fixed decoding policy for
+        # validation so val curves are comparable across runs that roll out with
+        # different policies (e.g. leftmost vs confidence). Only affects the
+        # SGLang FastDiffuser backend; a no-op otherwise. Restored in `finally`.
+        gen_cfg = master_config["policy"]["generation"]
+        val_dllm_overrides = gen_cfg.get("sglang_val_dllm_overrides")
+        restore_dllm_overrides = None
+        if val_dllm_overrides and gen_cfg.get("backend") == "sglang":
+            restore_dllm_overrides = policy_generation.reconfigure_dllm(
+                val_dllm_overrides
+            )
+            print(
+                f"  ↪ validation decoding overrides applied: {val_dllm_overrides} "
+                f"(will restore: {restore_dllm_overrides})",
+                flush=True,
+            )
+        pending_exc = None
+        try:
+            for batch_idx, val_batch in enumerate(val_dataloader):
+                if batch_idx >= max_batches:
+                    break
 
-            additional_metrics_to_report = dict()
-            # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
-            # Use async rollouts if vLLM async engine is enabled
-            # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
-            if _should_use_nemo_gym(master_config):
-                generation_config = master_config["policy"]["generation"]
-                nemo_gym_rollout_result = run_async_nemo_gym_rollout(
-                    policy_generation=policy_generation,
-                    input_batch=val_batch,
-                    tokenizer=tokenizer,
-                    task_to_env=val_task_to_env,
-                    max_seq_len=None,
-                    generation_config=generation_config,
-                    max_rollout_turns=None,
-                    greedy=False,
-                )
-                val_batch = nemo_gym_rollout_result.final_batch
-                gen_metrics = nemo_gym_rollout_result.rollout_metrics
-                additional_metrics_to_report = gen_metrics
-            elif _should_use_async_rollouts(master_config):
-                val_batch, gen_metrics = run_async_multi_turn_rollout(
-                    policy_generation,
-                    val_batch,
-                    tokenizer,
-                    val_task_to_env,
-                    max_seq_len=master_config["policy"]["max_total_sequence_length"],
-                    max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
-                    greedy=False,
-                )
-            else:
-                val_batch, gen_metrics = run_multi_turn_rollout(
-                    policy_generation,
-                    val_batch,
-                    tokenizer,
-                    val_task_to_env,
-                    max_seq_len=master_config["policy"]["max_total_sequence_length"],
-                    max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
-                    greedy=False,
-                )
+                additional_metrics_to_report = dict()
+                # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
+                # Use async rollouts if vLLM async engine is enabled
+                # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
+                if _should_use_nemo_gym(master_config):
+                    generation_config = master_config["policy"]["generation"]
+                    nemo_gym_rollout_result = run_async_nemo_gym_rollout(
+                        policy_generation=policy_generation,
+                        input_batch=val_batch,
+                        tokenizer=tokenizer,
+                        task_to_env=val_task_to_env,
+                        max_seq_len=None,
+                        generation_config=generation_config,
+                        max_rollout_turns=None,
+                        greedy=False,
+                    )
+                    val_batch = nemo_gym_rollout_result.final_batch
+                    gen_metrics = nemo_gym_rollout_result.rollout_metrics
+                    additional_metrics_to_report = gen_metrics
+                elif _should_use_async_rollouts(master_config):
+                    val_batch, gen_metrics = run_async_multi_turn_rollout(
+                        policy_generation,
+                        val_batch,
+                        tokenizer,
+                        val_task_to_env,
+                        max_seq_len=master_config["policy"]["max_total_sequence_length"],
+                        max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
+                        greedy=False,
+                    )
+                else:
+                    val_batch, gen_metrics = run_multi_turn_rollout(
+                        policy_generation,
+                        val_batch,
+                        tokenizer,
+                        val_task_to_env,
+                        max_seq_len=master_config["policy"]["max_total_sequence_length"],
+                        max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
+                        greedy=False,
+                    )
 
-            total_rewards.extend(val_batch["total_reward"].tolist())
-            total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
+                total_rewards.extend(val_batch["total_reward"].tolist())
+                total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
 
-            # Collect message logs for later display
-            to_env = [
-                get_keys_from_message_log(
-                    val_batch["message_log"][i], ["role", "content"]
-                )
-                for i in range(len(val_batch["message_log"]))
-            ]
+                # Collect message logs for later display
+                to_env = [
+                    get_keys_from_message_log(
+                        val_batch["message_log"][i], ["role", "content"]
+                    )
+                    for i in range(len(val_batch["message_log"]))
+                ]
 
-            all_message_logs.extend(to_env)
+                all_message_logs.extend(to_env)
+
+        except Exception as e:
+            # Remember an in-flight validation error so the restore step below can
+            # avoid masking it (see finally).
+            pending_exc = e
+            raise
+        finally:
+            # Always restore the rollout decoding config. If restoration fails we
+            # must NOT silently continue -- leaving the engine on the validation
+            # policy would corrupt subsequent rollouts -- so fail loud. But never
+            # mask an exception already propagating from the validation loop.
+            if restore_dllm_overrides:
+                try:
+                    policy_generation.reconfigure_dllm(restore_dllm_overrides)
+                except Exception as restore_exc:
+                    print(
+                        f"  ❌ Failed to restore rollout decoding config after "
+                        f"validation (engine may be left on the validation "
+                        f"policy): {restore_exc}",
+                        flush=True,
+                    )
+                    if pending_exc is None:
+                        raise
 
         # Calculate validation metrics
         num_samples = len(total_rewards)
