@@ -349,12 +349,14 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
                 num_classes=partition_vocab_size,
             )
 
-            chunk_grad = is_chosen.float().sub_(softmax_output)
-            chunk_grad.mul_(grad_output[:, chunk_start:chunk_end].unsqueeze(dim=-1))
-            grad_input[:, chunk_start:chunk_end, :].copy_(chunk_grad)
+            chunk_grad_fp32 = is_chosen.float().sub_(softmax_output)
+            chunk_grad_fp32.mul_(
+                grad_output[:, chunk_start:chunk_end].unsqueeze(dim=-1)
+            )
+            grad_input[:, chunk_start:chunk_end, :].copy_(chunk_grad_fp32)
 
             # Explicitly free before next iteration allocates
-            del softmax_output, is_chosen, logits, chunk_grad
+            del softmax_output, is_chosen, logits, chunk_grad_fp32
 
         # if you add an argument to the forward method, then you must add a corresponding None here
         return grad_input, None, None, None, None, None, None
