@@ -250,8 +250,8 @@ if [[ "${_qwen35_should_mount}" == "1" ]]; then
         1|true|True|yes|YES)
             _qwen35_clobber_pairs=(
                 "nemo_rl/environments/nemo_gym.py:nemo_rl/environments/nemo_gym.py"
-                "nemo_rl/models/generation/vllm/__init__.py:nemo_rl/models/generation/vllm/__init__.py"
-                "nemo_rl/models/generation/vllm/vllm_worker_async.py:nemo_rl/models/generation/vllm/vllm_worker_async.py"
+                "qwen_35/overrides/nemo_rl/models/generation/vllm/__init__.py:nemo_rl/models/generation/vllm/__init__.py"
+                "qwen_35/overrides/nemo_rl/models/generation/vllm/vllm_worker_async.py:nemo_rl/models/generation/vllm/vllm_worker_async.py"
                 "nemo_rl/models/megatron/community_import.py:nemo_rl/models/megatron/community_import.py"
                 "nemo_rl/models/megatron/setup.py:nemo_rl/models/megatron/setup.py"
                 "nemo_rl/models/policy/workers/megatron_policy_worker.py:nemo_rl/models/policy/workers/megatron_policy_worker.py"
