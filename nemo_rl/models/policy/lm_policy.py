@@ -997,18 +997,37 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         return futures
 
     def stream_weights_via_http(
-        self, sglang_url_to_gpu_uuids: dict[str, list[str]]
+        self,
+        rollout_engine_urls: list[str],
+        buffer_size_bytes: int,
     ) -> list[ray.ObjectRef]:
-        """Send the weights to SGLang servers via HTTP API.
+        """Send the weights to colocated SGLang engines via CUDA IPC over HTTP.
 
         Args:
-            sglang_url_to_gpu_uuids: Dict mapping SGLang server URL to list of GPU UUIDs it uses
+            rollout_engine_urls: ``http://host:port`` base URLs of each
+                engine's ``node_rank=0`` SGLang HTTP server. The caller
+                resolves these once (via ``engine.get_base_url``) and passes
+                them in, so every FSDP rank doesn't redo the Ray RPC.
+            buffer_size_bytes: Max bucket size in bytes before flushing.
+
+        The rollout TP size is captured once via
+        ``set_rollout_num_gpus_per_engine`` and reused by each worker.
         """
         futures = self.worker_group.run_all_workers_single_data(
             "stream_weights_via_http",
-            sglang_url_to_gpu_uuids=sglang_url_to_gpu_uuids,
+            rollout_engine_urls=rollout_engine_urls,
+            buffer_size_bytes=buffer_size_bytes,
         )
         return futures
+
+    def set_rollout_num_gpus_per_engine(self, num_gpus_per_engine: int) -> None:
+        """Broadcast the rollout engine TP size to every policy worker."""
+        ray.get(
+            self.worker_group.run_all_workers_single_data(
+                "set_rollout_num_gpus_per_engine",
+                num_gpus_per_engine=num_gpus_per_engine,
+            )
+        )
 
     def broadcast_weights_for_collective(
         self, kv_scales: Optional[dict[str, float]] = None
