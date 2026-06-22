@@ -159,6 +159,23 @@ class SingleControllerActor:
                 "dispatched batch corresponds to exactly one target training step."
             )
 
+        # SC split path does one optimizer.step per RL step.
+        # TODO: support multi-mini-step (legacy train() does gbs-sized
+        # mini-steps with shared prev_logprobs).
+        rl_step_samples = (
+            self._master_config.grpo["num_prompts_per_step"]
+            * self._master_config.grpo["num_generations_per_prompt"]
+        )
+        train_gbs = self._master_config.policy["train_global_batch_size"]
+        if rl_step_samples != train_gbs:
+            raise ValueError(
+                f"num_prompts_per_step * num_generations_per_prompt "
+                f"({rl_step_samples}) must equal policy.train_global_batch_size "
+                f"({train_gbs}) so that one RL step maps to exactly one "
+                f"optimizer.step. Multi-mini-step inside a single RL step is "
+                f"not supported on the SC split path."
+            )
+
         self._sampler = StalenessSampler(
             self._buffer,
             max_staleness_versions=self._async_cfg.max_weight_staleness_versions,
