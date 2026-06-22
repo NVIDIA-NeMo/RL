@@ -21,6 +21,7 @@ tests/test_suites/llm/grpo-moonlight-16b-automodel-1n8g-ep8.sh
 tests/test_suites/llm/grpo-llama3.2-1b-instruct-1n8g-megatron.sh
 tests/test_suites/llm/grpo-qwen3-1.7b-1n8g-megatron-eagle3.sh
 tests/test_suites/llm/grpo-llama3.2-1b-instruct-1n8g-megatron_generation.sh
+tests/test_suites/llm/grpo-nanov3-30BA3B-2n8g-megatron_async_colocated.sh
 
 # Functional 32b run
 tests/test_suites/llm/grpo-qwen2.5-32b-32n8g-fsdp2tp8-actckpt.v3.sh
