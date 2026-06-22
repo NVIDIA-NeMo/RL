@@ -34,6 +34,7 @@ from nemo_rl.algorithms.grpo import _create_advantage_estimator
 from nemo_rl.algorithms.loss import ClippedPGLossFn
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.utils import setup_response_data
 from nemo_rl.data_plane import build_data_plane_client
@@ -273,6 +274,8 @@ def setup_single_controller(
             "single_controller_utils does not support "
             "data.use_multiple_dataloader=True yet."
         )
+
+    set_seed(grpo_config["seed"])
 
     # ==========================
     # Setup Dataset & Environments

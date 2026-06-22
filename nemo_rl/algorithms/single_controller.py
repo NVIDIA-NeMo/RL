@@ -389,13 +389,16 @@ class SingleControllerActor:
 
                     # Compute prev_logprobs / ref_logprobs
                     with self._timer.time("logprob_inference_prep"):
-                        self._trainer.prepare_for_lp_inference()
+                        await asyncio.to_thread(self._trainer.prepare_for_lp_inference)
                     with self._timer.time("policy_and_reference_logprobs"):
                         if compute_prev_logprobs:
-                            self._trainer.get_logprobs_from_meta(train_meta)
+                            await asyncio.to_thread(
+                                self._trainer.get_logprobs_from_meta, train_meta
+                            )
                         if compute_reference_logprobs:
-                            self._trainer.get_reference_policy_logprobs_from_meta(
-                                train_meta
+                            await asyncio.to_thread(
+                                self._trainer.get_reference_policy_logprobs_from_meta,
+                                train_meta,
                             )
 
                     with self._timer.time("advantage_calculation"):
@@ -403,14 +406,20 @@ class SingleControllerActor:
 
                     # Train
                     with self._timer.time("training_prep"):
-                        self._trainer.prepare_for_training()
+                        await asyncio.to_thread(self._trainer.prepare_for_training)
                     with self._timer.time("policy_training"):
                         if not step_open:
-                            self._trainer.begin_train_step(
-                                step_id, loss_fn=self._loss_fn
+                            await asyncio.to_thread(
+                                self._trainer.begin_train_step,
+                                step_id,
+                                loss_fn=self._loss_fn,
                             )
                             step_open = True
-                        self._trainer.train_microbatch_from_meta(step_id, train_meta)
+                        await asyncio.to_thread(
+                            self._trainer.train_microbatch_from_meta,
+                            step_id,
+                            train_meta,
+                        )
 
                     groups_dispatched += num_groups
                     self._step_consumed_sample_ids.extend(train_meta.sample_ids)
@@ -427,7 +436,9 @@ class SingleControllerActor:
                     break
 
                 with self._timer.time("policy_training"):
-                    result = self._trainer.finish_train_step(step_id)
+                    result = await asyncio.to_thread(
+                        self._trainer.finish_train_step, step_id
+                    )
                 consumed_ids = list(self._step_consumed_sample_ids)
                 self._step_consumed_sample_ids = []
                 await self._call_dp(

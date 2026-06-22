@@ -36,6 +36,8 @@ policy:
     enabled: false
   megatron_cfg:
     enabled: true
+    scheduler:
+      lr_warmup_iters: 50
   generation:
     vllm_cfg:
       async_engine: true
