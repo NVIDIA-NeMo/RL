@@ -211,6 +211,28 @@ def get_tokenizer(
     return tokenizer if processor is None else processor
 
 
+def _optimizer_holds_master_weights(config: PolicyConfig) -> bool:
+    """Whether the configured optimizer maintains its own fp32 master weights.
+
+    Transformer Engine's ``FusedAdam`` keeps an internal fp32 master copy (stored
+    compactly as bf16 params plus an int16 remainder when ``store_param_remainders``
+    is set) whenever ``master_weights`` is enabled. In that case loading the policy
+    in fp32 duplicates the master and roughly doubles both model- and
+    optimizer-state memory. Optimizers without an internal master (e.g.
+    ``torch.optim.AdamW``) still require an fp32 load so their updates do not
+    underflow.
+
+    Args:
+        config: Policy configuration dictionary.
+
+    Returns:
+        ``True`` if the optimizer keeps its own master weights, else ``False``.
+    """
+    optimizer_cfg = config.get("optimizer") or {}
+    optimizer_kwargs = optimizer_cfg.get("kwargs") or {}
+    return bool(optimizer_kwargs.get("master_weights", False))
+
+
 def validate_and_prepare_config(
     config: PolicyConfig,
     processor: Optional[AutoProcessor],
@@ -299,10 +321,19 @@ def validate_and_prepare_config(
         else ("sdpa" if cp_size_cfg > 1 else None)
     )
 
+    # Choose the load dtype based on the optimizer instead of always using fp32.
+    # When the optimizer keeps its own fp32 master (e.g. TE FusedAdam with
+    # master_weights), an fp32 load is redundant: it duplicates the master and
+    # roughly doubles model- and optimizer-state memory. In that case load in the
+    # compute dtype and let the optimizer hold the master; otherwise keep fp32 so
+    # masterless optimizers (e.g. AdamW) do not underflow.
+    # See https://github.com/NVIDIA-NeMo/RL/issues/2865.
+    load_dtype = dtype if _optimizer_holds_master_weights(config) else torch.float32
+
     # Load model config
     model_config = AutoConfig.from_pretrained(
         model_name,
-        torch_dtype=torch.float32,  # Always load in float32 for master weights
+        torch_dtype=load_dtype,
         trust_remote_code=True,
         attn_implementation="flash_attention_2" if enable_seq_packing else None,
         **hf_config_overrides,
@@ -702,7 +733,10 @@ def setup_model_and_optimizer(
 
     # Keep fp32 master weights: stop Automodel from restoring loaded params to the bf16
     # checkpoint dtype, which would break optimizer master-weight precision (see helper).
-    _disable_automodel_checkpoint_dtype_restore()
+    # Only needed on the fp32 load path; when the optimizer holds its own master we
+    # deliberately load in the compute dtype, so the restore is a no-op and is skipped.
+    if not _optimizer_holds_master_weights(config):
+        _disable_automodel_checkpoint_dtype_restore()
 
     # Create model via from_pretrained - handles meta device init, parallelization,
     # LoRA, and base weight loading internally
