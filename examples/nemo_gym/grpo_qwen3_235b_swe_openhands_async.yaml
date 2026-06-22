@@ -308,6 +308,11 @@ env:
     swe_agents_train:
       responses_api_agents:
         swe_agents:
+          agent_prompt_overrides:
+            - user_prompt_template: responses_api_agents/swe_agents/prompts/openhands/user_prompt.j2
+              system_prompt_template: responses_api_agents/swe_agents/prompts/openhands/system_prompt.j2
+              agent_cls: CodeActAgent
+              diversify_tool_names: false
           agent_max_turns: 15       # 15 is empirically safe on easy_l20; 20 grew context past 80k -> vLLM rejected a turn -> empty rollout -> ValueError crash
           swebench_agent_timeout: 360
           swebench_tests_timeout: 300
