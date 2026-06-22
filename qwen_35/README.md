@@ -208,7 +208,8 @@ export NEMO_RL_QWEN35_TRUNCATE_PROMPT_TOKENS=65535
 
 On Lyris, use the cluster-local paths instead. The primary R2E root covers the
 current R2E train/validation JSONL there, so leave
-`NEMO_GYM_SWE_FALLBACK_SIF_DIR` unset unless a future dataset needs it:
+`NEMO_GYM_SWE_FALLBACK_SIF_DIR` unset unless a future dataset needs it. Lyris
+does require `/dev/fuse` for nested R2E SIF execution:
 
 ```bash
 export CONTAINER_IMAGE_PATH=/lustre/fsw/coreai_mlperf_training/users/cgomes/containers/optimized+nemorl_v0.6_prebaked_arm_clean_w_logging
@@ -220,6 +221,7 @@ export NEMO_GYM_SWE_TRAIN_DATA_PATH=/lustre/fsw/coreai_mlperf_training/users/ari
 export NEMO_GYM_SWE_VALIDATION_DATA_PATH=/lustre/fsw/coreai_mlperf_training/users/arigazzi/grpo-studies/data_swe/r2e_easy_l20_val.with_sifs.jsonl
 export NEMO_GYM_SWE_SIF_DIR=/lustre/fsw/coreai_mlperf_training/users/hfilaretov/data
 unset NEMO_GYM_SWE_FALLBACK_SIF_DIR
+export EXTRA_MOUNTS=/dev/fuse:/dev/fuse
 ```
 
 Then launch. The recipe owns the R2E SIF formatter list; do not pass it as a
