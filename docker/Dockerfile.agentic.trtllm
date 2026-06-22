@@ -143,7 +143,10 @@ apt-get update
 apt-get install -y --no-install-recommends software-properties-common python3-apt
 /usr/bin/python3.12 /usr/bin/add-apt-repository -y ppa:apptainer/ppa
 apt-get update
-apt-get install -y apptainer apptainer-suid
+CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME") && \
+    apt-get install -y "apptainer=1.5.0-2-1~${CODENAME}" apptainer-suid \
+    || { echo "pinned apptainer 1.5.0-2-1~${CODENAME} unavailable; installing latest from PPA"; \
+         apt-get install -y apptainer apptainer-suid; }
 ln -sf /usr/bin/apptainer /usr/bin/singularity
 
 # --- Option B (TBD — ALTERNATIVE, amd64 ONLY; do NOT use on aarch64): GitHub .deb ---

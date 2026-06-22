@@ -259,9 +259,21 @@ def init_ray(log_dir: Optional[str] = None) -> None:
         if _k.startswith(("PMIX_", "PMI_", "MPI_", "OMPI_", "SLURM_")):
             os.environ.pop(_k, None)
 
-    # Set up runtime environment
     env_vars = dict(os.environ)
     env_vars.pop("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", None)
+
+    # Prepend mpi_site/ to PYTHONPATH so that Python finds our sitecustomize.py
+    # at startup in ALL Ray workers, including TRT-LLM's inner RayGPUWorker actors.
+    # sitecustomize.py runs before any imports and pops PMI vars from os.environ,
+    # causing OpenMPI/mpi4py to initialize in singleton mode.
+    # NOTE: Ray's runtime_env can only SET env vars, not UNSET them; setting PMI
+    # vars to "" is NOT equivalent to unset — OpenPMIx still finds the SLURM
+    # PMIx server socket in /tmp and fails.  Only truly UNSET vars work.
+    _this_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _mpi_site_dir = os.path.join(_this_dir, "mpi_site")
+    _existing_pp = env_vars.get("PYTHONPATH", "")
+    env_vars["PYTHONPATH"] = f"{_mpi_site_dir}:{_existing_pp}".rstrip(":")
+
     runtime_env = {
         "env_vars": env_vars,  # Pass thru all user environment variables
     }
