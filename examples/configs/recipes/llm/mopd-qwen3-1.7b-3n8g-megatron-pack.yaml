@@ -1,6 +1,3 @@
-# Multi-Teacher On-Policy Distillation (MOPD): dense Qwen3-1.7B self-distill
-# (student == teacher -> OPD loss ~0) on 3 nodes (1 policy + 1 vLLM + 1 teacher).
-# Gym-coupled; the nemo_gym datasets and venvs are provided by the harness at runtime.
 defaults: ../../grpo_math_1B.yaml
 grpo:
   num_prompts_per_step: 8
@@ -85,8 +82,6 @@ data:
   max_input_seq_length: null
   train:
     data_path: /path/to/train.jsonl
-    # grpo_math_1B.yaml sets data.train.dataset_name: OpenMathInstruct-2 and per-split
-    # keys win over data.default, so this override is required for the gym wrapping.
     dataset_name: NemoGymDataset
   validation:
     data_path: /path/to/validation.jsonl
@@ -95,7 +90,6 @@ data:
     dataset_name: NemoGymDataset
     env_name: nemo_gym
     prompt_file: null
-    system_prompt_file: null
     processor: nemo_gym_data_processor
 env:
   should_use_nemo_gym: true
