@@ -45,6 +45,10 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     # True : over-generates and wastes rollouts that age past the staleness window;
     # False: enforces per-weight-version dispatch quota.
     over_sampling: bool = True
+    # Tag rollouts with their dispatch-time target step and require an exact
+    # match at sample time (legacy target_weight semantics). Requires
+    # over_sampling=False.
+    force_in_order: bool = False
 
 
 class MasterConfig(BaseModel, extra="allow"):

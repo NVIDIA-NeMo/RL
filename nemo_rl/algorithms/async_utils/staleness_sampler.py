@@ -19,11 +19,14 @@ from nemo_rl.data_plane import KVBatchMeta
 
 
 class StalenessSampler:
-    """Pick complete prompt groups inside a version staleness window.
+    """Pick complete prompt groups from a TQReplayBuffer.
 
-    sample_freshest_first prefers smallest lag; require_order takes only from
-    the oldest weight_version present and waits for its batch to fill. Unready
-    slots are always skipped.
+    Args:
+        buffer: Shared TQReplayBuffer holding the candidate slots.
+        max_staleness_versions: Max weight-version gap a sample may have from the trainer.
+        sample_freshest_first: Prefer smallest lag when picking from the in-window set.
+        require_order: Take only from the oldest in-window weight_version and wait for its batch to fill.
+        force_in_order: Match each slot's target_step against current_train_weight, ignoring the window; mirrors legacy async_grpo target_weight semantics.
     """
 
     def __init__(
@@ -32,6 +35,7 @@ class StalenessSampler:
         max_staleness_versions: int,
         sample_freshest_first: bool = False,
         require_order: bool = False,
+        force_in_order: bool = False,
     ) -> None:
         if max_staleness_versions < 0:
             raise ValueError(
@@ -46,6 +50,7 @@ class StalenessSampler:
         self.max_staleness_versions = max_staleness_versions
         self.sample_freshest_first = sample_freshest_first
         self.require_order = require_order
+        self.force_in_order = force_in_order
 
     async def select(
         self,
@@ -70,29 +75,38 @@ class StalenessSampler:
         if min_prompt_groups < 1:
             raise ValueError(f"min_prompt_groups must be >= 1, got {min_prompt_groups}")
 
-        min_valid_version = max(0, current_train_weight - self.max_staleness_versions)
-
-        if self.require_order:
-            in_window = [
-                weight
-                for weight in self._buffer.start_weight_list
-                if min_valid_version <= weight <= current_train_weight
-            ]
-            if not in_window:
-                return None, 0
-            target_version = min(in_window)
+        if self.force_in_order:
+            # target_step exact match; staleness window ignored.
             valid_idxs = [
                 i
-                for i, weight in enumerate(self._buffer.start_weight_list)
-                if weight == target_version and self._buffer.ready_list[i]
+                for i, target in enumerate(self._buffer.target_step_list)
+                if target == current_train_weight and self._buffer.ready_list[i]
             ]
         else:
-            valid_idxs = [
-                i
-                for i, weight in enumerate(self._buffer.start_weight_list)
-                if min_valid_version <= weight <= current_train_weight
-                and self._buffer.ready_list[i]
-            ]
+            min_valid_version = max(
+                0, current_train_weight - self.max_staleness_versions
+            )
+            if self.require_order:
+                in_window = [
+                    weight
+                    for weight in self._buffer.start_weight_list
+                    if min_valid_version <= weight <= current_train_weight
+                ]
+                if not in_window:
+                    return None, 0
+                target_version = min(in_window)
+                valid_idxs = [
+                    i
+                    for i, weight in enumerate(self._buffer.start_weight_list)
+                    if weight == target_version and self._buffer.ready_list[i]
+                ]
+            else:
+                valid_idxs = [
+                    i
+                    for i, weight in enumerate(self._buffer.start_weight_list)
+                    if min_valid_version <= weight <= current_train_weight
+                    and self._buffer.ready_list[i]
+                ]
 
         if len(valid_idxs) < min_prompt_groups:
             return None, 0

@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any, Union
+from typing import Any, Optional, Union
 
 import ray
 import torch
@@ -153,10 +153,17 @@ class SingleControllerActor:
                     f"({expected_buffer})"
                 )
 
+        if self._async_cfg.force_in_order and self._async_cfg.over_sampling:
+            raise ValueError(
+                "force_in_order=True requires over_sampling=False so that each "
+                "dispatched batch corresponds to exactly one target training step."
+            )
+
         self._sampler = StalenessSampler(
             self._buffer,
             max_staleness_versions=self._async_cfg.max_weight_staleness_versions,
             require_order=not self._async_cfg.over_sampling,
+            force_in_order=self._async_cfg.force_in_order,
         )
 
         # ── asyncio state ──────────────────────────────────────────────────
@@ -280,12 +287,17 @@ class SingleControllerActor:
         sem = asyncio.Semaphore(self._async_cfg.max_inflight_prompts)
         over_sampling = self._async_cfg.over_sampling
         max_staleness = self._async_cfg.max_weight_staleness_versions
+        force_in_order = self._async_cfg.force_in_order
         print("rollout_pump: starting", flush=True)
 
-        async def _dispatch_one_prompt(prompt: DatumSpec) -> None:
+        async def _dispatch_one_prompt(
+            prompt: DatumSpec, target_step: Optional[int]
+        ) -> None:
             self._inflight_rollouts += 1
             try:
-                await self._rollout_manager.generate_and_push(prompt)
+                await self._rollout_manager.generate_and_push(
+                    prompt, target_step=target_step
+                )
                 if self._diagnostics:
                     content = ""
                     for i in range(len(prompt["message_log"])):
@@ -310,6 +322,9 @@ class SingleControllerActor:
                         await asyncio.sleep(0.005)
                     self._max_rollout_version += 1
 
+                # target_step = batch dispatch index when force_in_order is on.
+                target_step = self._max_rollout_version if force_in_order else None
+
                 for prompt_idx in range(prompt_batch.size):
                     prompt: DatumSpec = {  # type: ignore
                         k: v[prompt_idx] for k, v in prompt_batch.items()
@@ -323,7 +338,9 @@ class SingleControllerActor:
                     await self._rollout_permitted.wait()
 
                     # dispatch rollout
-                    task = asyncio.create_task(_dispatch_one_prompt(prompt))
+                    task = asyncio.create_task(
+                        _dispatch_one_prompt(prompt, target_step)
+                    )
                     self._dispatched_rollouts.add(task)
                     task.add_done_callback(self._dispatched_rollouts.discard)
             epoch += 1

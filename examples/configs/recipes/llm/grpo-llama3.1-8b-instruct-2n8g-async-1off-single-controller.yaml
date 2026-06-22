@@ -30,3 +30,4 @@ async_rl:
   #   64 * (1 + 1) = 128
   max_buffered_rollouts: 128
   over_sampling: false
+  force_in_order: true
