@@ -86,6 +86,9 @@ require_path "NRL_MEGATRON_CHECKPOINT_DIR" "dir" "This directory is mounted as t
 require_path "NEMO_GYM_SWE_TRAIN_DATA_PATH" "file" "This JSONL is mounted as the training dataset inside the container."
 require_path "NEMO_GYM_SWE_VALIDATION_DATA_PATH" "file" "This JSONL is mounted as the validation dataset inside the container."
 require_path "NEMO_GYM_SWE_SIF_DIR" "dir" "This directory is mounted as the SWE task SIF directory inside the container."
+if [[ -n "${NEMO_GYM_SWE_FALLBACK_SIF_DIR:-}" ]]; then
+    require_path "NEMO_GYM_SWE_FALLBACK_SIF_DIR" "dir" "Optional fallback directory for R2E SIF images not present under NEMO_GYM_SWE_SIF_DIR."
+fi
 NEMO_GYM_SWE_TRAIN_DATA_DIR="$(dirname "${NEMO_GYM_SWE_TRAIN_DATA_PATH}")"
 NEMO_GYM_SWE_VALIDATION_DATA_DIR="$(dirname "${NEMO_GYM_SWE_VALIDATION_DATA_PATH}")"
 if ! [[ "${GPUS_PER_NODE}" =~ ^[1-9][0-9]*$ ]]; then
@@ -320,6 +323,9 @@ MOUNTS="${MOUNTS},${NEMO_GYM_SWE_SIF_DIR}:${CONTAINER_NEMO_GYM_SWE_SIF_DIR}"
 # Compatibility mount for configs that pass host-side sif_dir or include
 # absolute host-side container_formatter entries.
 MOUNTS="${MOUNTS},${NEMO_GYM_SWE_SIF_DIR}:${NEMO_GYM_SWE_SIF_DIR}"
+if [[ -n "${NEMO_GYM_SWE_FALLBACK_SIF_DIR:-}" ]]; then
+    MOUNTS="${MOUNTS},${NEMO_GYM_SWE_FALLBACK_SIF_DIR}:${NEMO_GYM_SWE_FALLBACK_SIF_DIR}"
+fi
 if [[ -n "${EXTRA_MOUNTS:-}" ]]; then
     MOUNTS="${MOUNTS},${EXTRA_MOUNTS}"
 fi

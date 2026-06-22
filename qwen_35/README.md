@@ -194,7 +194,7 @@ export CONTAINER_NEMO_GYM_SWE_VALIDATION_DATA_PATH=/inputs/nemo_gym/data/validat
 
 export NEMO_GYM_SWE_SIF_DIR=/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/swe-gym
 export CONTAINER_NEMO_GYM_SWE_SIF_DIR="$NEMO_GYM_SWE_SIF_DIR"
-export EXTRA_MOUNTS="/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/nemotron-ultra-swe/r2e_gym:/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/nemotron-ultra-swe/r2e_gym"
+export NEMO_GYM_SWE_FALLBACK_SIF_DIR=/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/nemotron-ultra-swe
 
 # Some systems, such as Ptyche, need `/dev/fuse:/dev/fuse` appended to
 # EXTRA_MOUNTS for nested SIF execution. OCI-HSG has not required it in this
@@ -204,6 +204,22 @@ export EXTRA_MOUNTS="/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_traini
 # vLLM does not reject prompts at exactly/just above max_model_len.
 export QWEN35_TRUNCATE_PROMPT_TOKENS=65535
 export NEMO_RL_QWEN35_TRUNCATE_PROMPT_TOKENS=65535
+```
+
+On Lyris, use the cluster-local paths instead. The primary R2E root covers the
+current R2E train/validation JSONL there, so leave
+`NEMO_GYM_SWE_FALLBACK_SIF_DIR` unset unless a future dataset needs it:
+
+```bash
+export CONTAINER_IMAGE_PATH=/lustre/fsw/coreai_mlperf_training/users/cgomes/containers/optimized+nemorl_v0.6_prebaked_arm_clean_w_logging
+export HF_CKPT_PATH=/lustre/fsw/coreai_mlperf_training/users/arigazzi/nemotron3_ultra_550b/hf_home/hub/models--Qwen--Qwen3.5-397B-A17B/snapshots/8472618112abcbd45acbcdc58436aff4233c23f7
+export CONTAINER_HF_CKPT_PATH="$HF_CKPT_PATH"
+export NRL_MEGATRON_CHECKPOINT_DIR=/lustre/fsw/coreai_mlperf_training/users/arigazzi/nemotron3_ultra_550b/mcore_ckpt_cache
+export CONTAINER_NRL_MEGATRON_CHECKPOINT_DIR="$NRL_MEGATRON_CHECKPOINT_DIR"
+export NEMO_GYM_SWE_TRAIN_DATA_PATH=/lustre/fsw/coreai_mlperf_training/users/arigazzi/grpo-studies/data_swe/r2e_easy_l20_train.with_sifs.jsonl
+export NEMO_GYM_SWE_VALIDATION_DATA_PATH=/lustre/fsw/coreai_mlperf_training/users/arigazzi/grpo-studies/data_swe/r2e_easy_l20_val.with_sifs.jsonl
+export NEMO_GYM_SWE_SIF_DIR=/lustre/fsw/coreai_mlperf_training/users/hfilaretov/data
+unset NEMO_GYM_SWE_FALLBACK_SIF_DIR
 ```
 
 Then launch. The recipe owns the R2E SIF formatter list; do not pass it as a

@@ -11,6 +11,8 @@
 # Relative to qwen_35/configs/.
 defaults: ../../examples/nemo_gym/grpo_qwen3_235b_swe_openhands_async.yaml
 
+sif_fallback_dir: ${oc.env:NEMO_GYM_SWE_FALLBACK_SIF_DIR,/no-such-r2e-fallback}
+
 policy:
   # Pin tokenizer to the mounted Qwen 3.5 snapshot. The inherited Qwen3 config
   # also points tokenizer.name at policy.model_name, but pinning it here avoids
@@ -61,7 +63,7 @@ env:
         swe_agents:
           container_formatter:
             - "${sif_dir}/r2egym/{instance_id}.sif"
-            - "/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/nemotron-ultra-swe/r2e_gym/{instance_id}.sif"
+            - "${sif_fallback_dir}/r2e_gym/{instance_id}.sif"
     swe_agents_val:
       responses_api_agents:
         swe_agents:
