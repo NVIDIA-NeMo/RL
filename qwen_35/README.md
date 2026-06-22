@@ -51,8 +51,8 @@ Stale file handle` while the job is starting.
 For example:
 
 ```text
-qwen_35/overrides/nemo_rl/models/megatron/community_import.py
-  -> /opt/nemo-rl/nemo_rl/models/megatron/community_import.py
+qwen_35/overrides/nemo_rl/models/megatron/setup.py
+  -> /opt/nemo-rl/nemo_rl/models/megatron/setup.py
 ```
 
 This lets the selected config and only that config bring the Qwen 3.5 runtime
@@ -81,15 +81,10 @@ variables and Hydra overrides.
 
 The current overlay files are:
 
-- `nemo_rl/models/megatron/community_import.py`
-  - Carries the random-init and Megatron import compatibility used by the
-    known-good Qwen 3.5 smoke path.
 - `nemo_rl/models/megatron/setup.py`
   - Carries the Megatron setup compatibility used by the Qwen 3.5 runs.
 - `nemo_rl/models/policy/workers/megatron_policy_worker.py`
   - Carries the policy-worker compatibility used by the Qwen 3.5 runs.
-- `nemo_rl/models/generation/vllm/__init__.py`
-  - Ensures the patched vLLM generation path is selected.
 - `nemo_rl/models/generation/vllm/vllm_worker_async.py`
   - Handles Qwen 3.5 parser, prefix repair, prompt truncation, and related
     multi-turn generation behavior.

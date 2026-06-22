@@ -230,9 +230,7 @@ if [[ "${_qwen35_should_mount}" == "1" ]]; then
 
     _qwen35_overlay_dsts=(
         "nemo_rl/environments/nemo_gym.py"
-        "nemo_rl/models/generation/vllm/__init__.py"
         "nemo_rl/models/generation/vllm/vllm_worker_async.py"
-        "nemo_rl/models/megatron/community_import.py"
         "nemo_rl/models/megatron/setup.py"
         "nemo_rl/models/policy/workers/megatron_policy_worker.py"
         "3rdparty/Gym-workspace/Gym/responses_api_models/vllm_model/app.py"
