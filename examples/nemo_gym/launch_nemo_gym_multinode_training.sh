@@ -350,6 +350,9 @@ if [[ "${NEMO_GYM_SWE_VALIDATION_DATA_DIR}" != "${NEMO_GYM_SWE_TRAIN_DATA_DIR}" 
     MOUNTS="${MOUNTS},${NEMO_GYM_SWE_VALIDATION_DATA_DIR}:${NEMO_GYM_SWE_VALIDATION_DATA_DIR}"
 fi
 MOUNTS="${MOUNTS},${NEMO_GYM_SWE_SIF_DIR}:${CONTAINER_NEMO_GYM_SWE_SIF_DIR}"
+# Compatibility mount for configs that pass host-side sif_dir or include
+# absolute host-side container_formatter entries.
+MOUNTS="${MOUNTS},${NEMO_GYM_SWE_SIF_DIR}:${NEMO_GYM_SWE_SIF_DIR}"
 if [[ -n "${EXTRA_MOUNTS:-}" ]]; then
     MOUNTS="${MOUNTS},${EXTRA_MOUNTS}"
 fi
