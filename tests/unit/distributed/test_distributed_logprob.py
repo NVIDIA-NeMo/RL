@@ -460,3 +460,63 @@ def test_get_next_token_logprobs_chunking_reduces_memory(
 ):
     test_fn = functools.partial(_run_chunk_memory, tp_size=tp_size)
     distributed_test_runner(test_fn, world_size=tp_size)
+
+
+def _run_chunk_equivalence(rank, world_size, tp_size, dtype):
+    """Forward logprobs and backward grad must match between chunk_size=None and chunk_size=32."""
+    tp_group = torch.distributed.new_group(ranks=list(range(tp_size)))
+
+    batch_size, seq_len, full_vocab_size = 2, 128, 2048
+    vocab_part_size = full_vocab_size // tp_size
+    vocab_start_index = rank * vocab_part_size
+    vocab_end_index = (rank + 1) * vocab_part_size
+
+    torch.manual_seed(42)
+    full_logits = torch.randn(
+        batch_size, seq_len, full_vocab_size, device="cuda", dtype=dtype
+    )
+    input_ids = torch.randint(0, full_vocab_size, (batch_size, seq_len), device="cuda")
+
+    def run(cs):
+        logits = (
+            full_logits[:, :, vocab_start_index:vocab_end_index]
+            .detach()
+            .clone()
+            .requires_grad_(True)
+        )
+        logprobs = get_next_token_logprobs_from_logits(
+            input_ids=input_ids,
+            next_token_logits=logits,
+            vocab_parallel_rank=rank,
+            vocab_parallel_group=tp_group,
+            chunk_size=cs,
+        )
+        logprobs.sum().backward()
+        return logprobs.detach(), logits.grad
+
+    logprobs_full, grad_full = run(None)
+    logprobs_chunked, grad_chunked = run(32)
+
+    torch.testing.assert_close(logprobs_chunked, logprobs_full, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(
+        grad_chunked.to(torch.float32),
+        grad_full.to(torch.float32),
+        rtol=1e-6,
+        atol=1e-6 if dtype == torch.float32 else 5e-3,
+    )
+
+
+@pytest.mark.parametrize(
+    "tp_size, dtype",
+    [
+        (1, torch.float32),
+        (2, torch.float32),
+        (1, torch.bfloat16),
+        (2, torch.bfloat16),
+    ],
+)
+def test_get_next_token_logprobs_chunk_equivalence(
+    distributed_test_runner, tp_size, dtype
+):
+    test_fn = functools.partial(_run_chunk_equivalence, tp_size=tp_size, dtype=dtype)
+    distributed_test_runner(test_fn, world_size=tp_size)
