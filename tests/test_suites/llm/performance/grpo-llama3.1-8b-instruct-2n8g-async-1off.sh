@@ -4,10 +4,10 @@ source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=2
-STEPS_PER_RUN=10
-MAX_STEPS=10
+STEPS_PER_RUN=100
+MAX_STEPS=100
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=100
+NUM_MINUTES=240
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
@@ -17,13 +17,14 @@ cd $PROJECT_ROOT
 uv run examples/run_grpo.py \
     --config $CONFIG_PATH \
     grpo.max_num_steps=$MAX_STEPS \
+    grpo.val_period=-1 \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=True \
-    logger.wandb.project=nemo-rl \
+    logger.wandb.project=sc-yukih \
     logger.wandb.name=$EXP_NAME \
     logger.monitor_gpus=True \
     logger.tensorboard_enabled=True \
-    checkpointing.enabled=True \
+    checkpointing.enabled=false \
     checkpointing.checkpoint_dir=$CKPT_DIR \
     $@ \
     2>&1 | tee $RUN_LOG
