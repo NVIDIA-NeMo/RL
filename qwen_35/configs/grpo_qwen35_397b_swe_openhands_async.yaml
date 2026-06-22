@@ -11,6 +11,10 @@
 # Relative to qwen_35/configs/.
 defaults: ../../examples/nemo_gym/grpo_qwen3_235b_swe_openhands_async.yaml
 
+# Keep SIF roots local to this wrapper for the same reason as data paths below:
+# when this file is mounted into a container, the inherited base config may be
+# the image-baked copy rather than the checked-out tree on the host.
+sif_dir: ${oc.env:NEMO_GYM_SWE_SIF_DIR}
 sif_fallback_dir: ${oc.env:NEMO_GYM_SWE_FALLBACK_SIF_DIR,/no-such-r2e-fallback}
 
 # Keep data paths local to this wrapper. The inherited base config may come
