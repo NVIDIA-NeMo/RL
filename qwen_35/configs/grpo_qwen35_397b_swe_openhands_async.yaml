@@ -27,6 +27,12 @@ data:
     data_path: ${oc.env:NEMO_GYM_SWE_VALIDATION_DATA_PATH}
 
 policy:
+  # Qwen 3.5 GDN currently does not support Megatron packed sequences.
+  # Keep this in the Qwen wrapper so callers do not need a correctness-critical
+  # CLI override.
+  sequence_packing:
+    enabled: false
+
   # Pin tokenizer to the mounted Qwen 3.5 snapshot. The inherited Qwen3 config
   # also points tokenizer.name at policy.model_name, but pinning it here avoids
   # Hydra/override ambiguity and guarantees the qwen_35 tokenizer overlay sees
