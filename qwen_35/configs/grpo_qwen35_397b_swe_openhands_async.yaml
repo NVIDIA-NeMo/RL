@@ -13,6 +13,15 @@ defaults: ../../examples/nemo_gym/grpo_qwen3_235b_swe_openhands_async.yaml
 
 sif_fallback_dir: ${oc.env:NEMO_GYM_SWE_FALLBACK_SIF_DIR,/no-such-r2e-fallback}
 
+# Keep data paths local to this wrapper. The inherited base config may come
+# from the container image when this file is mounted, so do not rely on the
+# base recipe for path hygiene.
+data:
+  train:
+    data_path: ${oc.env:NEMO_GYM_SWE_TRAIN_DATA_PATH}
+  validation:
+    data_path: ${oc.env:NEMO_GYM_SWE_VALIDATION_DATA_PATH}
+
 policy:
   # Pin tokenizer to the mounted Qwen 3.5 snapshot. The inherited Qwen3 config
   # also points tokenizer.name at policy.model_name, but pinning it here avoids
