@@ -194,8 +194,8 @@ export CONTAINER_NRL_MEGATRON_CHECKPOINT_DIR="$NRL_MEGATRON_CHECKPOINT_DIR"
 
 export NEMO_GYM_SWE_TRAIN_DATA_PATH=/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/arigazzi/grpo-studies/data_swe/r2e_easy_l20_train.with_sifs.jsonl
 export NEMO_GYM_SWE_VALIDATION_DATA_PATH=/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/arigazzi/grpo-studies/data_swe/r2e_easy_l20_val.with_sifs.jsonl
-export CONTAINER_NEMO_GYM_SWE_TRAIN_DATA_PATH="$NEMO_GYM_SWE_TRAIN_DATA_PATH"
-export CONTAINER_NEMO_GYM_SWE_VALIDATION_DATA_PATH="$NEMO_GYM_SWE_VALIDATION_DATA_PATH"
+export CONTAINER_NEMO_GYM_SWE_TRAIN_DATA_PATH=/inputs/nemo_gym/data/train.jsonl
+export CONTAINER_NEMO_GYM_SWE_VALIDATION_DATA_PATH=/inputs/nemo_gym/data/validation.jsonl
 
 export NEMO_GYM_SWE_SIF_DIR=/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/swe-gym
 export CONTAINER_NEMO_GYM_SWE_SIF_DIR="$NEMO_GYM_SWE_SIF_DIR"
@@ -218,8 +218,8 @@ override grammar unless heavily escaped.
 ```bash
 bash examples/nemo_gym/launch_nemo_gym_multinode_training.sh \
   "policy.model_name=${HF_CKPT_PATH}" \
-  "data.train.data_path=${NEMO_GYM_SWE_TRAIN_DATA_PATH}" \
-  "data.validation.data_path=${NEMO_GYM_SWE_VALIDATION_DATA_PATH}" \
+  "data.train.data_path=${CONTAINER_NEMO_GYM_SWE_TRAIN_DATA_PATH}" \
+  "data.validation.data_path=${CONTAINER_NEMO_GYM_SWE_VALIDATION_DATA_PATH}" \
   "sif_dir=${NEMO_GYM_SWE_SIF_DIR}" \
   "logger.wandb_enabled=False" \
   "logger.wandb.project=nemotron-3-ultra" \
