@@ -1382,6 +1382,11 @@ class MegatronPolicyWorkerImpl(
         gc.collect()
         torch.cuda.empty_cache()
 
+    def shutdown(self) -> bool:
+        """Tear down the inference engine, then run base worker cleanup."""
+        self.shutdown_inference_engine()
+        return super().shutdown()
+
     def _clear_fp8_caches(self):
         """Clear FP8 workspace caches and release fragmented GPU memory.
 
