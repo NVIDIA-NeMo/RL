@@ -62,10 +62,7 @@ def _mock_generation(**overrides):
     gen.prepare_refit_info.return_value = None
     gen.update_weights_via_ipc_zmq.return_value = [MagicMock()]
     gen.update_weights_from_collective.return_value = [MagicMock()]
-    gen.invalidate_kv_cache.return_value = True
-    gen.get_sglang_url_to_gpu_uuids.return_value = {
-        "http://localhost:30000": ["GPU-abc"]
-    }
+    gen.get_rollout_engine_urls.return_value = ["http://localhost:30000"]
     gen.init_collective.return_value = [MagicMock()]
     for k, v in overrides.items():
         setattr(gen, k, v)
@@ -238,24 +235,25 @@ class TestHTTPWeightSynchronizer:
 
         policy.offload_before_refit.assert_called_once()
         gen.prepare_for_generation.assert_any_call(tags=["weights"])
-        gen.get_sglang_url_to_gpu_uuids.assert_called_once()
-        gen.invalidate_kv_cache.assert_called_once()
         policy.stream_weights_via_http.assert_called_once()
+        gen.get_rollout_engine_urls.assert_called_once()
+        call_kwargs = policy.stream_weights_via_http.call_args
+        assert call_kwargs.kwargs["rollout_engine_urls"] == ["http://localhost:30000"]
+        assert call_kwargs.kwargs["buffer_size_bytes"] == int((1024**3) * 0.3)
         policy.offload_after_refit.assert_called_once()
         gen.prepare_for_generation.assert_any_call(tags=["kv_cache"])
 
     @patch("nemo_rl.weight_sync.http_weight_synchronizer.ray")
-    def test_kv_cache_invalidation_failure_does_not_abort(self, mock_ray):
-        """KV cache invalidation failure prints a warning but continues."""
+    def test_fixed_buffer_size(self, mock_ray):
         mock_ray.get.return_value = [True]
         policy = _mock_policy()
         gen = _mock_generation()
-        gen.invalidate_kv_cache.return_value = False
-        sync = HTTPWeightSynchronizer(policy, gen)
+        sync = HTTPWeightSynchronizer(policy, gen, refit_buffer_size_gb=2)
 
         sync.sync_weights()
-        gen.invalidate_kv_cache.assert_called_once()
-        policy.stream_weights_via_http.assert_called_once()
+        call_kwargs = policy.stream_weights_via_http.call_args
+        assert call_kwargs.kwargs["rollout_engine_urls"] == ["http://localhost:30000"]
+        assert call_kwargs.kwargs["buffer_size_bytes"] == 2 * (1024**3)
 
     def test_mark_stale(self):
         policy = _mock_policy()
@@ -290,6 +288,31 @@ class TestHTTPWeightSynchronizer:
         policy.offload_after_refit.assert_called_once()
         gen.prepare_for_generation.assert_any_call(tags=["kv_cache"])
         assert sync.is_stale
+
+    def test_negative_buffer_size_raises(self):
+        policy = _mock_policy()
+        gen = _mock_generation()
+        sync = HTTPWeightSynchronizer(policy, gen, refit_buffer_size_gb=-1)
+        with pytest.raises(ValueError, match="refit_buffer_size_gb must be > 0"):
+            sync._compute_buffer_size()
+
+    @patch("nemo_rl.weight_sync.http_weight_synchronizer.ray")
+    def test_invalid_env_ratio_raises(self, mock_ray, monkeypatch):
+        monkeypatch.setenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "not_a_number")
+        policy = _mock_policy()
+        gen = _mock_generation()
+        sync = HTTPWeightSynchronizer(policy, gen)
+        with pytest.raises(ValueError, match="must be a valid float"):
+            sync._compute_buffer_size()
+
+    @patch("nemo_rl.weight_sync.http_weight_synchronizer.ray")
+    def test_zero_env_ratio_raises(self, mock_ray, monkeypatch):
+        monkeypatch.setenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0")
+        policy = _mock_policy()
+        gen = _mock_generation()
+        sync = HTTPWeightSynchronizer(policy, gen)
+        with pytest.raises(ValueError, match="must be > 0"):
+            sync._compute_buffer_size()
 
 
 # ---------------------------------------------------------------------------

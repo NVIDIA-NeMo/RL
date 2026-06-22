@@ -85,7 +85,8 @@ from nemo_rl.experience.rollouts import (
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.megatron import MegatronGeneration
-from nemo_rl.models.generation.sglang import SGLangConfig, SGLangGeneration
+from nemo_rl.models.generation.sglang.config import SGLangConfig
+from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
@@ -751,7 +752,10 @@ def setup(
     def init_sglang():
         """Initialize SGLang generation workers."""
         t0 = time.perf_counter()
-        pg = SGLangGeneration(cluster=inference_cluster, config=generation_config)
+        pg = SGLangGeneration(
+            cluster=inference_cluster,
+            sglang_cfg=generation_config,
+        )
         pg.finish_generation()
         return pg, time.perf_counter() - t0
 
@@ -985,6 +989,9 @@ def setup(
             colocated_inference=colocated_inference,
             worker_init_timing_metrics=worker_init_timing_metrics,
         )
+
+        # Capture rollout TP size on the policy once; refit calls no longer need it.
+        policy.set_rollout_num_gpus_per_engine(policy_generation.num_gpus_per_engine)
 
         print(
             f"  ✓ Using SGLang backend for generation with {policy_config['model_name']}",
@@ -1478,21 +1485,26 @@ def _apply_configured_message_level_advantage_penalties(
 def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
     """Determine if async rollouts should be used based on the configuration.
 
-    Returns True if async_engine is enabled.
+    SGLang only uses async rollouts when explicitly configured with
+    ``policy.generation.use_async_rollouts``. vLLM and Megatron use async
+    rollouts when their respective ``async_engine`` config is enabled.
     """
     generation_config = master_config.policy["generation"]
     if generation_config is None:
         return False
     backend = generation_config.get("backend", "")
 
+    if backend == "sglang":
+        return bool(generation_config.get("use_async_rollouts", False))
+
     if backend == "vllm":
-        vllm_cfg = generation_config.get("vllm_cfg", {})
-        return vllm_cfg.get("async_engine", False)
-    elif backend == "megatron":
+        return bool(generation_config.get("vllm_cfg", {}).get("async_engine", False))
+
+    if backend == "megatron":
         mcore_cfg = generation_config.get("mcore_generation_config", {})
         return mcore_cfg.get("async_engine", False)
-    else:
-        return False
+
+    return False
 
 
 def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
@@ -1708,15 +1720,10 @@ def refit_policy_generation(
                 )
 
             if isinstance(policy_generation, SGLangGeneration):
-                sglang_url_to_gpu_uuids = (
-                    policy_generation.get_sglang_url_to_gpu_uuids()
-                )
-                # Stream weights via HTTP
-                flush_success = policy_generation.invalidate_kv_cache()
-                if not flush_success:
-                    print("SGLang KV cache invalidation failed before weight update. ")
+                # Stream weights to colocated SGLang engines via CUDA IPC over HTTP.
                 futures_train = policy.stream_weights_via_http(
-                    sglang_url_to_gpu_uuids=sglang_url_to_gpu_uuids,
+                    rollout_engine_urls=policy_generation.get_rollout_engine_urls(),
+                    buffer_size_bytes=buffer_size_bytes,
                 )
                 # Wait for all workers to complete
                 ray.get(futures_train)
@@ -2158,7 +2165,7 @@ def grpo_train(
                                 if "full_result" in key:
                                     rollout_metrics.pop(key)
 
-                    # Use async rollouts if vLLM async engine is enabled
+                    # Use async rollouts when enabled by config/backend defaults.
                     elif _should_use_async_rollouts(master_config):
                         (
                             repeated_batch,
@@ -2962,7 +2969,7 @@ def validate(
 
             additional_metrics_to_report = dict()
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
-            # Use async rollouts if vLLM async engine is enabled
+            # Use async rollouts when enabled by config/backend defaults.
             # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
             if _should_use_nemo_gym(master_config):
                 generation_config = master_config.policy["generation"]
@@ -3147,9 +3154,15 @@ def async_grpo_train(
         master_config: Master configuration
         max_trajectory_age_steps: Maximum age (in training steps) for trajectories to be used in training
     """
-    # Ensure we are running with a compatible async generation backend
-    assert _should_use_async_rollouts(master_config), (
-        "Async GRPO requires an async generation engine. "
+    # Ensure we are running with a compatible async generation backend.
+    # Async GRPO (with in-flight weight updates) supports vLLM and Megatron;
+    # SGLang async rollouts do not support the async GRPO replay path.
+    generation_config = master_config.policy["generation"]
+    backend = generation_config.get("backend", "") if generation_config else ""
+    assert backend in ("vllm", "megatron") and _should_use_async_rollouts(
+        master_config
+    ), (
+        "Async GRPO requires an async vLLM or Megatron generation engine. "
         "Set either policy.generation.vllm_cfg.async_engine=true (vLLM) or "
         "policy.generation.mcore_generation_config.async_engine=true (Megatron)."
     )
