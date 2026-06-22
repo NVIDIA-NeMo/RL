@@ -15,8 +15,6 @@ Qwen 3.5 support currently needs more than YAML values:
 - Megatron Bridge must recognize the HF architecture/model type
   `Qwen3_5MoeForConditionalGeneration` / `qwen3_5_moe`; the required
   container already carries that support.
-- The Megatron setup path needs Qwen 3.5 compatibility for the GatedDeltaNet
-  code path used by the current container stack.
 - The vLLM async worker needs Qwen 3.5 prompt/prefix repair and parser handling
   for multi-turn tool-use trajectories.
 - NeMo-Gym needs Qwen-specific tolerance for token-contiguity issues caused by
@@ -87,7 +85,7 @@ The current overlay files are:
   - Carries the random-init and Megatron import compatibility used by the
     known-good Qwen 3.5 smoke path.
 - `nemo_rl/models/megatron/setup.py`
-  - Adds Qwen 3.5 Megatron setup compatibility, including GatedDeltaNet handling.
+  - Carries the Megatron setup compatibility used by the Qwen 3.5 runs.
 - `nemo_rl/models/policy/workers/megatron_policy_worker.py`
   - Carries the policy-worker compatibility used by the Qwen 3.5 runs.
 - `nemo_rl/models/generation/vllm/__init__.py`
@@ -144,15 +142,12 @@ the useful parts are simple overrides:
 "env.nemo_gym.swe_agents_val.responses_api_agents.swe_agents.swebench_tests_timeout=180"
 ```
 
-## Escape hatches
+## Prompt truncation
 
-- `QWEN35_OVERLAY=0`: disable automatic Qwen overlay mounting.
-- `QWEN35_OVERLAY=1`: force overlay mounting even if `RECIPE` is not under
-  `qwen_35/`.
-- `QWEN35_OVERLAY_DIR=/path/to/overrides`: use a different overlay directory.
-- `QWEN35_CONFIG_DIR=/path/to/configs`: use a different config directory.
-- `NEMO_RL_QWEN35_TRUNCATE_PROMPT_TOKENS=<N|none>`: controls the prompt
-  truncation fallback used by the Qwen vLLM async worker patch.
+`NEMO_RL_QWEN35_TRUNCATE_PROMPT_TOKENS=<N|none>` controls the prompt
+truncation fallback used by the Qwen vLLM async worker patch. The launcher sets
+the default used by the known-good R2E runs; override it only when intentionally
+testing a different context budget.
 
 ## OCI-HSG R2E study example
 
@@ -303,8 +298,7 @@ Notes:
 
 ## Safety boundary
 
-Non-Qwen runs are unaffected unless `QWEN35_OVERLAY=1` is set explicitly. The
-default behavior is:
+The default behavior is:
 
 - recipes under `qwen_35/`: Qwen config and Qwen overlay are mounted.
 - all other recipes: no Qwen overlay is mounted.

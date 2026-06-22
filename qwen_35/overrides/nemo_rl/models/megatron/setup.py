@@ -80,66 +80,6 @@ from nemo_rl.models.policy.utils import (
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
-def _patch_qwen35_gdn_cu_seqlens() -> None:
-    if os.environ.get("NEMO_RL_QWEN35_PATCH_GDN_CU_SEQLENS", "1") != "1":
-        return
-
-    try:
-        from megatron.core.ssm.gated_delta_net import GatedDeltaNet
-    except Exception as exc:
-        warnings.warn(f"Could not install Qwen 3.5 GDN cu_seqlens patch: {exc}")
-        return
-
-    original_resolve = getattr(GatedDeltaNet, "_resolve_cu_seqlens", None)
-    if original_resolve is None:
-        warnings.warn(
-            "Skipping Qwen 3.5 GDN cu_seqlens patch: "
-            "GatedDeltaNet._resolve_cu_seqlens is not available in this container."
-        )
-        return
-
-    if getattr(original_resolve, "_qwen35_cu_seqlens_patch", False):
-        return
-
-    def _resolve_cu_seqlens_qwen35(
-        self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name, cp_size=1
-    ):
-        cu_seqlens = (
-            cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens_actual
-        )
-        tp_size = int(getattr(self, "tp_size", 1) or 1)
-        if cu_seqlens is not None and tp_size > 1 and total_seq_len > 0:
-            total_cu = int(cu_seqlens[-1].detach().cpu().item())
-            if total_cu % total_seq_len == 0 and total_cu // total_seq_len == tp_size:
-                if torch.all(cu_seqlens % tp_size == 0):
-
-                    def _scale(value):
-                        if value is None:
-                            return None
-                        return torch.div(value, tp_size, rounding_mode="floor").to(
-                            dtype=value.dtype
-                        )
-
-                    return original_resolve(
-                        self,
-                        _scale(cu_seqlens_padded),
-                        _scale(cu_seqlens_actual),
-                        total_seq_len,
-                        name,
-                        cp_size,
-                    )
-
-        return original_resolve(
-            self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name, cp_size
-        )
-
-    _resolve_cu_seqlens_qwen35._qwen35_cu_seqlens_patch = True
-    GatedDeltaNet._resolve_cu_seqlens = _resolve_cu_seqlens_qwen35
-
-
-_patch_qwen35_gdn_cu_seqlens()
-
-
 def destroy_parallel_state():
     """Safely destroy parallel state and reset async call tracking.
 
