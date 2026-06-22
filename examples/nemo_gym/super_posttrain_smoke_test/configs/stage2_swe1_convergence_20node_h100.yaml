@@ -1,0 +1,46 @@
+# Convergence test of stage2_swe1 (SWE-pivot single-step tool use) on H100 (80GB) at the ORIGINAL
+# prod batch/context (1024 = 64 prompts x 16 gens, 131072 tokens). This is NOT a smoke. It inherits
+# stage2_swe1.yaml directly; keeps prod data, context, GRPO group size, and train_global_batch_size.
+#
+# swe1 has NO GPU judge models -- the reward is the programmatic SWE-pivot argument comparison
+# (single_step_tool_use_with_argument_comparison). So SBATCH_NUM_NODES == cluster.num_nodes; there
+# are no extra Gym judge nodes to reserve.
+#
+# Node budget:
+#   train : 16 nodes (TP8*CP8*PP1=64 GPUs/replica, DP2, EDP8)
+#   gen   : 4 nodes  (TP8 x 4 DP replicas)
+#   cluster.num_nodes = SBATCH_NUM_NODES = 16 + 4 = 20
+#
+# Why 16 train nodes: the 9-node prodtest used the minimum H100 train footprint (8 train nodes,
+# DP1/EDP4) and lowered batch to 128. Full batch does not materially change train activation/model
+# memory, but DP1 leaves the dense optimizer unsharded and the smoke notes that it is tight. DP2
+# gives a safer convergence run and still divides the inherited train_global_batch_size=1024 cleanly.
+#
+# Why 4 gen nodes: measured stage1 convergence throughput was roughly one TP8 generation replica
+# per ~256 trajectories in 10-16 min. stage2_swe1 full batch is 1024 trajectories, so 4 replicas keep
+# the step time in that same ballpark without using the base B200-sized 32 generation nodes.
+#
+# If generation or the async buffer still lags, increase policy.generation.colocated.resources.num_nodes
+# first. There are no GPU judges to scale in tandem for swe1.
+defaults: "stage2_swe1.yaml"
+
+policy:
+  # base stage2_swe1.yaml sets make_sequence_length_divisible_by: 8, but with CP8+TP8 the megatron
+  # sequence-packing path requires a multiple of cp_size*2*tp_size = 8*2*8 = 128 (else AssertionError
+  # in _get_pack_sequence_parameters_for_megatron, which silently stalls the run).
+  make_sequence_length_divisible_by: 128
+  # Keep the inherited full train batch. This only caps per-generation-replica request pressure.
+  generation_batch_size: 32
+  generation:
+    colocated:
+      resources:
+        num_nodes: 4            # base 32; 4 TP8 H100 gen replicas for the 1024-trajectory step
+    vllm_cfg:
+      gpu_memory_utilization: 0.75   # base 0.8; leave headroom for 131072-token temporaries
+  megatron_cfg:
+    expert_model_parallel_size: 16   # base 8; shard 512 experts 16-ways to fit 80GB H100s
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+
+cluster:
+  num_nodes: 20   # base 64; 16 train (TP8*CP8*PP1=64 GPUs, DP2) + 4 gen (TP8). No judges -> SBATCH=20.

@@ -1,63 +1,63 @@
-# Prod-test of stage1_rlvr on H100 (80GB) at MINIMUM nodes, keeping prod context (65536),
-# global batch (4096), and data. The base stage1_rlvr.yaml is tuned for B200 (192GB) at 109 nodes.
+# Prod-test of stage1_rlvr on H100 (80GB) at MINIMUM nodes, keeping prod context (65536) and data.
+# The base stage1_rlvr.yaml is tuned for B200 (192GB) at 109 nodes. This file overrides parallelism
+# + node/replica counts, plus a reduced batch (4096 -> 128) to start the convergence study -- the
+# GRPO group size (num_generations_per_prompt=16) is preserved; only num_prompts_per_step shrinks.
 #
 # World size = TP * PP * CP * DP  (EP is NOT a multiplicand; experts are carved from this pool via
 # EDP = world / (ETP*EP*PP) -- see megatron/core/parallel_state.py:733,786). So one DP=1 replica:
-#   TP4 * CP8 * PP1 = 32 GPUs = 4 train nodes.
+#   TP4 * CP8 * PP1 = 32 GPUs = 4 train nodes.   (TP4/CP8/PP1/ETP1 are inherited from base unchanged.)
 #
-# H100 adaptations vs prod (B200):
+# H100 topology changes vs prod (B200), each an actual override below:
 #   - EP 8 -> 16: shard the 512 experts (99% of params) 16-ways so weights+grads fit 80GB.
-#   - optimizer_cpu_offload: the ~1.4TB fp32 Adam state can't sit on 80GB; offload to host RAM
-#     (fp32 master / precision-aware optimizer preserved -> numerically identical to prod).
 #   - gen vLLM TP 4 -> 8: 231GB bf16 won't fit on 4x80GB; TP8 = 1 node.
 #   - judges DP -> 1 (same prod 235B models, single replica) -> num_gpu_nodes 5 -> 3.
+# NOT enabled here: optimizer_cpu_offload. The fp32 Adam state is heavy on 80GB, but offload costs
+# ~1.9-4.2x step time (mbridge cpu-offloading.md) -- too much for a time-boxed smoke run. If the run
+# OOMs at init/first step, set policy.megatron_cfg.optimizer.optimizer_cpu_offload=true and
+# optimizer_offload_fraction=1.0 (HybridDeviceOptimizer; checkpoint restore IS supported).
 #
 # SBATCH_NUM_NODES=8  ==  cluster.num_nodes=5 (4 train + 1 gen)  +  num_gpu_nodes=3 (judges).
 # MODEL_PATH stays the prod Super checkpoint (rs-feb5_iter350), set at launch.
 defaults: "stage1_rlvr.yaml"
 
-checkpointing:
-  # CPU-offload optimizer KeyErrors on load_state_dict during resume; push save_period past the
-  # test length so no resumable ckpt is written mid-run.
-  save_period: 1000
+grpo:
+  num_prompts_per_step: 8   # base 256; reduced further (16->8) so a step assembles/completes quickly
+                            # under 1 gen node (num_generations_per_prompt stays 16 -> group size unchanged)
 
 policy:
+  train_global_batch_size: 128   # = num_prompts_per_step(8) * num_generations_per_prompt(16);
+                                 # force_on_policy_ratio:true requires this equality (grpo.py:417)
+  # Base sets this to ${tensor_model_parallel_size}=4, but megatron sequence-packing requires it to
+  # be a multiple of cp_size*2*tp_size = 8*2*4 = 64 (else AssertionError in
+  # _get_pack_sequence_parameters_for_megatron, which silently stalls the run). Override to 64.
+  make_sequence_length_divisible_by: 64
   generation:
     colocated:
       resources:
-        num_nodes: 1            # 1 dedicated H100 node for policy vLLM generation
+        num_nodes: 1            # base 72; 1 dedicated H100 gen node (gpus_per_node=8 inherited)
     vllm_cfg:
-      tensor_parallel_size: 8   # 231GB bf16 won't fit on 4x80GB; TP8 = 1 node (mamba KV is tiny)
+      tensor_parallel_size: 8   # base 4; 231GB bf16 won't fit on 4x80GB, TP8 = 1 node
   megatron_cfg:
-    tensor_model_parallel_size: 4    # keep prod TP4 (mamba n_groups=8 caps TP<=8; dense is ~1% of params)
-    context_parallel_size: 8         # keep prod CP8 for the 65536-token activations (8192 tok/rank)
-    pipeline_model_parallel_size: 1
-    expert_model_parallel_size: 16   # was 8; shard 512 experts 16-ways (28 vs 57 GB expert w+g per rank)
-    expert_tensor_parallel_size: 1
-    optimizer:
-      optimizer_cpu_offload: true    # move the fp32 Adam states off-GPU; keeps prod fp32 master
-      optimizer_offload_fraction: 1.0
-    env_vars:
-      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+    expert_model_parallel_size: 16   # base 8; shard 512 experts 16-ways (28 vs 57 GB expert w+g per rank)
 
 env:
   nemo_gym:
-    num_gpu_nodes: 3   # genrm TP8 (1 node) + nl2bash TP8 (1 node) + safety TP1 -> 17 GPUs -> 3 nodes
+    num_gpu_nodes: 3   # base 5; genrm TP8 (1 node) + nl2bash TP8 (1 node) + safety TP1 -> 17 GPUs -> 3 nodes
     genrm_model:
       responses_api_models:
         genrm_model:
           vllm_serve_kwargs:
-            data_parallel_size: 1   # prod 2; one replica for the test (keep TP8)
+            data_parallel_size: 1   # base 2; one replica for the test (keep TP8)
     nl2bash_judge_model:
       responses_api_models:
         local_vllm_model:
           vllm_serve_kwargs:
-            data_parallel_size: 1   # prod 2 (keep TP8)
+            data_parallel_size: 1   # base 2 (keep TP8)
     safety_judge_model:
       responses_api_models:
         local_vllm_model:
           vllm_serve_kwargs:
-            data_parallel_size: 1   # prod 8 (keep TP1)
+            data_parallel_size: 1   # base 8 (keep TP1)
 
 cluster:
-  num_nodes: 5   # 4 train (TP4*CP8*PP1=32 GPUs) + 1 gen (TP8). +3 judge nodes at launch -> SBATCH=8.
+  num_nodes: 5   # base 109; 4 train (TP4*CP8*PP1=32 GPUs) + 1 gen (TP8). +3 judge nodes -> SBATCH=8.

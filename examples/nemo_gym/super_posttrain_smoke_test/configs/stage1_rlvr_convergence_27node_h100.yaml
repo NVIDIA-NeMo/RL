@@ -1,0 +1,85 @@
+# Convergence test of stage1_rlvr on H100 (80GB) at the ORIGINAL prod batch (4096 = 256 prompts x 16
+# gens) -- this is NOT a smoke. Inherits stage1_rlvr.yaml directly; keeps prod context (65536), batch,
+# data, and GRPO group size. It differs from the prodtest smokes by SCALING GENERATION + JUDGES so a
+# full 4096-trajectory step completes in tractable wall-time (the smokes used 1 gen + DP1 judges,
+# which would be ~2.3h/step at this batch).
+#
+# Throughput basis (measured): 1 TP8 gen replica does ~256 trajectories in ~10-16 min (~33s per
+# prompt-group). 4096 traj => ~140 min/step on 1 replica; 12 replicas -> ~12-15 min/step. GenRM (235B)
+# is the other per-rollout bottleneck (every prompt-group needs a comparison), so it is scaled to DP4.
+#
+# Node budget:
+#   train  : 8 nodes  (TP4*CP8*PP1=32 GPUs/replica, DP2, EDP4) -- batch does NOT change train memory
+#   gen    : 12 nodes (TP8 x 12 DP replicas)                   -- the main throughput lever
+#   cluster.num_nodes = 8 + 12 = 20
+#   judges : GenRM DP4*TP8=32 + nl2bash DP2*TP8=16 + safety DP2*TP1=2 = 50 GPUs -> num_gpu_nodes 7
+#   SBATCH_NUM_NODES = 20 + 7 = 27
+#
+# No optimizer_cpu_offload: stage1 (RLVR) has reference_policy_kl_penalty=0 -> NO reference model, so
+# 8 train nodes fit at DP2/EDP4 (validated; this is what made the stage3 RLHF run, which DOES load a
+# reference, OOM where stage1 didn't). MODEL_PATH = the policy checkpoint to converge from (at launch).
+#
+# Tuning notes: throughput numbers are from the reduced-prompt smoke and assume similar response
+# lengths -- if gen or the buffer lags, bump gen num_nodes and/or GenRM data_parallel_size together
+# (they must scale in tandem; one alone just shifts the bottleneck).
+defaults: "stage1_rlvr.yaml"
+
+# grpo + train_global_batch_size are intentionally NOT overridden -> inherits prod 256 prompts x 16
+# gens = 4096 (the whole point of this run). DP2 divides 4096 cleanly.
+
+policy:
+  # CP8*2*TP4 = 64; base make_sequence_length_divisible_by=${TP}=4 would AssertionError in the
+  # megatron sequence-packing path (and silently stall the run). Override to 64.
+  make_sequence_length_divisible_by: 64
+  # The previous run OOMed in policy vLLM with 63 active requests in CUDA graph replay. Keep prod
+  # train batch intact, but lower per-generation-replica concurrency to reduce transient pressure.
+  generation_batch_size: 32
+  generation:
+    colocated:
+      resources:
+        num_nodes: 12          # base 72; 12 TP8 gen replicas -- the throughput lever for batch 4096
+    vllm_cfg:
+      tensor_parallel_size: 8   # base 4; 231GB bf16 won't fit on 4x80GB, TP8 = 1 node/replica
+      max_num_seqs: 16
+      gpu_memory_utilization: 0.70   # base 0.8; leave headroom for long-sequence temporaries
+      enforce_eager: false   # re-enable vLLM compile/CUDA graph path; constrain graphs below.
+    vllm_kwargs:
+      compilation_config:
+        cudagraph_mode: PIECEWISE
+  megatron_cfg:
+    expert_model_parallel_size: 16   # base 8; shard 512 experts 16-ways to fit 80GB
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+
+env:
+  nemo_gym:
+    num_gpu_nodes: 7   # base 5; GenRM DP4*TP8=32 + nl2bash DP2*TP8=16 + safety DP2*TP1=2 = 50 GPUs -> 7 nodes
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          num_workers: 4   # base 16; reduce Gym proxy fanout to avoid policy vLLM connection storms
+    genrm_model:
+      responses_api_models:
+        genrm_model:
+          debug: true   # diag: dump resolved vLLM args + per-step engine stats (KV-cache usage)
+          vllm_serve_kwargs:
+            data_parallel_size: 4   # base 2; scale the 235B judge to keep up with 12 gen replicas
+    nl2bash_judge_model:
+      responses_api_models:
+        local_vllm_model:
+          debug: true   # diag: surface memory pressure before the worker death seen in 12983422
+          vllm_serve_env_vars:
+            VLLM_RAY_DP_PACK_STRATEGY: strict
+            VLLM_USE_FLASHINFER_MOE_FP16: "0"
+            VLLM_USE_FLASHINFER_MOE_FP8: "0"
+          vllm_serve_kwargs:
+            data_parallel_size: 2   # base 2 (keep TP8)
+    safety_judge_model:
+      responses_api_models:
+        local_vllm_model:
+          debug: true   # diag: dump resolved vLLM args + per-step engine stats (KV-cache usage)
+          vllm_serve_kwargs:
+            data_parallel_size: 2   # base 8; modest -- 4B model, fast, not the bottleneck
+
+cluster:
+  num_nodes: 20   # base 109; 8 train (TP4*CP8*PP1=32 GPUs, DP2) + 12 gen (TP8). +7 judge nodes -> SBATCH=27.

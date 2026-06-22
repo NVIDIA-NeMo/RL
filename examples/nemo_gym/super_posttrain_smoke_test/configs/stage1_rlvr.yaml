@@ -5,7 +5,7 @@ checkpointing:
   higher_is_better: true
   keep_top_k: 1000000
   save_period: 10
-  checkpoint_must_save_by: "00:03:30:00"
+  checkpoint_must_save_by: null
   model_save_format: "safetensors"
   save_consolidated: false
   save_optimizer: true
@@ -237,8 +237,6 @@ policy:
         enable_auto_tools: true
         tool_parser: qwen3_coder
         reasoning_parser: nano_v3
-
-
 
     vllm_kwargs:
       mamba_ssm_cache_dtype: "float32"

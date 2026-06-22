@@ -1,0 +1,63 @@
+# Convergence test of stage3_rlhf (RLHF + GenRM, reference-policy KL) on H100 (80GB) at the
+# ORIGINAL prod batch/context (2048 = 128 prompts x 16 gens, 49152 tokens). This is NOT a smoke.
+# Inherits stage3_rlhf.yaml directly; keeps prod data, context, GRPO group size, and
+# train_global_batch_size.
+#
+# stage3 is the memory-heaviest stage: reference_policy_kl_penalty=1e-4 loads a full frozen
+# reference policy on the train cluster alongside the trained policy. The 10-node prodtest uses the
+# minimum H100 train footprint plus optimizer_cpu_offload to fit. For convergence, use more train
+# nodes instead so normal optimizer checkpointing remains viable and the full batch divides cleanly.
+#
+# Node budget:
+#   train : 16 nodes (TP4*CP4*PP1=16 GPUs/replica, DP8; EP32 for the 512 experts)
+#   gen   : 8 nodes  (TP8 x 8 DP replicas)
+#   cluster.num_nodes = 16 + 8 = 24
+#   judges: GenRM DP4*TP8 = 32 GPUs -> num_gpu_nodes 4
+#   SBATCH_NUM_NODES = 24 + 4 = 28
+#
+# Why 16 train nodes: the near-minimum 8-node H100 prodtest needed optimizer_cpu_offload because the
+# train cluster holds policy + reference + fp32 Adam. DP8 gives a safer convergence footprint without
+# the offload/resume optimizer-state issue noted in the prodtest config.
+#
+# Why 8 gen nodes: measured stage1 convergence throughput was roughly one TP8 generation replica per
+# ~256 trajectories in 10-16 min. stage3 full batch is 2048 trajectories, so 8 replicas keep the step
+# time in that same ballpark.
+#
+# Why GenRM DP4: every prompt-group needs the 235B pairwise GenRM comparison. DP4 keeps the judge
+# scaled with generation so the bottleneck does not simply move from policy vLLM to GenRM.
+defaults: "stage3_rlhf.yaml"
+
+policy:
+  # base stage3_rlhf.yaml sets make_sequence_length_divisible_by: ${tensor_model_parallel_size}=4,
+  # but with CP4+TP4 the megatron sequence-packing path requires a multiple of cp_size*2*tp_size = 32.
+  make_sequence_length_divisible_by: 32
+  # Keep the inherited full train batch. This only caps per-generation-replica request pressure.
+  generation_batch_size: 32
+  generation:
+    colocated:
+      resources:
+        num_nodes: 8            # base 32; 8 TP8 H100 gen replicas for the 2048-trajectory step
+    vllm_cfg:
+      max_num_seqs: 16
+      tensor_parallel_size: 8   # base 4; 231GB bf16 won't fit on 4x80GB, TP8 = 1 node/replica
+      gpu_memory_utilization: 0.75   # base 0.8; leave headroom for long-sequence temporaries
+  megatron_cfg:
+    expert_model_parallel_size: 32   # base 8; stage3 carries policy + reference, so shard experts 32-ways
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+
+env:
+  nemo_gym:
+    num_gpu_nodes: 4   # base 8; GenRM DP4*TP8 = 32 GPUs = 4 nodes
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          num_workers: 4   # base 16; reduce Gym proxy fanout into the 8 TP8 policy gen replicas
+    genrm_model:
+      responses_api_models:
+        genrm_model:
+          vllm_serve_kwargs:
+            data_parallel_size: 4   # base 8; scale the 235B judge with the 8 gen replicas
+
+cluster:
+  num_nodes: 24   # base 72; 16 train (TP4*CP4*PP1=16 GPUs, DP8) + 8 gen (TP8). +4 GenRM nodes -> SBATCH=28.

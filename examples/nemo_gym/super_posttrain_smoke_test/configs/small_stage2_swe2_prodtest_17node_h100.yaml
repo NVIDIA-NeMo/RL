@@ -1,0 +1,74 @@
+# Prod-test of stage2_swe2 (SWE-bench OpenHands, thinking) on H100 (80GB) at MINIMUM nodes, keeping
+# prod context (196608 = 192K) and global batch shape. Base stage2_swe2.yaml is tuned for
+# B200 (192GB) at 64 nodes. Overrides parallelism, node counts, and rollout pressure.
+#
+# swe2 has NO GPU judge models -- the reward is SWE-bench test execution in CPU .sif sandboxes
+# (apptainer/OpenHands). So SBATCH_NUM_NODES == cluster.num_nodes; no extra judge nodes. The
+# instance-specific .sif container_formatter is set explicitly below (absolute paths, no SIF_DIR
+# needed) -- those .sif images must exist on the cluster for rewards to compute.
+#
+# World = TP*PP*CP*DP (EP carved via EDP = world/(ETP*EP*PP)). One DP=1 replica:
+#   TP8 * CP16 * PP1 = 128 GPUs = 16 train nodes. CP is bumped 8 -> 16 (vs swe1) because the 192K
+#   context at CP8 would be 24576 tok/rank -- too much activation on 80GB; CP16 = 12288 tok/rank.
+#
+# H100 topology changes vs prod (B200):
+#   - CP 8 -> 16: halve the 192K-token activation per rank.
+#   - EP 8 -> 16: shard the 512 experts 16-ways so weights+grads fit 80GB.
+#   - gen vLLM stays TP8 but num_nodes 32 -> 1 (one gen replica; mamba KV is tiny even at 192K).
+#
+# Tightness: DP1, EDP8 (=128/16) -> expert optimizer shards 8-ways (comfortable); the 192K activation
+# is the real risk here, which CP16 addresses. If gen OOMs on the 192K KV, bump gen num_nodes to 2.
+# Avoid optimizer offload (KeyErrors on resume on this build).
+#
+# SBATCH_NUM_NODES=17 == cluster.num_nodes=17 (16 train + 1 gen). MODEL_PATH = prod Super checkpoint.
+defaults: "stage2_swe2.yaml"
+
+grpo:
+  num_prompts_per_step: 4   # base 16; reduced so a step assembles/completes quickly under 1 gen node
+  num_generations_per_prompt: 8   # base 32; smaller GRPO group for the test (swe2 has no GenRM, so
+                                  # this isn't pinned to any num_rollouts_per_prompt)
+
+policy:
+  train_global_batch_size: 32   # base 512; = num_prompts_per_step(4) * num_generations_per_prompt(8);
+                                # force_on_policy_ratio:true requires this equality (grpo.py:417)
+  # base stage2_swe2.yaml sets make_sequence_length_divisible_by: 8, but with CP16+TP8 the megatron
+  # packing path requires a multiple of cp_size*2*tp_size = 16*2*8 = 256 (else AssertionError in
+  # _get_pack_sequence_parameters_for_megatron, which silently stalls the run). Override to 256.
+  make_sequence_length_divisible_by: 256
+  generation:
+    colocated:
+      resources:
+        num_nodes: 1            # base 32; 1 dedicated H100 gen node (gpus_per_node=8 inherited)
+    vllm_kwargs:
+      max_num_seqs: 8           # cap active sequences per vLLM engine to reduce 192K logprob pressure
+  megatron_cfg:
+    context_parallel_size: 16        # base 8; 192K context -> 12288 tok/rank (24576 at CP8 OOMs 80GB)
+    expert_model_parallel_size: 16   # base 8; shard 512 experts 16-ways to fit 80GB
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+
+env:
+  nemo_gym:
+    # With Super at 192K, vLLM can occasionally return NaN token logprobs. The HTTP server now
+    # preserves those values so this NeMo-Gym retry loop can discard and re-run affected rollouts.
+    rollout_max_attempts_to_avoid_lp_nan: 3
+    # Absolute .sif image search paths (no SIF_DIR needed). The agent tries each entry per instance
+    # and applies per-dataset instance_id transforms. swe_agents_val inherits this via the base
+    # ${...swe_agents_train...container_formatter} reference. Replaces (not appends to) the base list.
+    swe_agents_train:
+      responses_api_agents:
+        swe_agents:
+          concurrency: 32       # base 768; reduce fan-out against the single 192K-context vLLM node
+          container_formatter:
+          - "/lustre/fsw/portfolios/llmservice/users/igitman/images/swe-bench/swebench_sweb.eval.x86_64.{instance_id}.sif"
+          - "/lustre/fsw/portfolios/llmservice/users/sdevare/swe_sweapro/images_train/sweap.{instance_id}.sif"
+          - "/lustre/fsw/portfolios/llmservice/users/igitman/images/swe-bench/namanjain12_{instance_id}.sif"
+          - "/lustre/fsw/portfolios/llmservice/users/sdevare/swe_sweapro/images_train/sweap.{instance_id}.sif"
+          - "/lustre/fsw/portfolios/llmservice/users/igitman/images/swe-bench/swebench_sweb.eval.x86_64{instance_id}.sif"
+    swe_agents_val:
+      responses_api_agents:
+        swe_agents:
+          concurrency: 32       # base 768; match train fan-out for the prod-test
+
+cluster:
+  num_nodes: 17   # base 64; 16 train (TP8*CP16*PP1=128 GPUs, DP1) + 1 gen (TP8). No judges -> SBATCH=17.
