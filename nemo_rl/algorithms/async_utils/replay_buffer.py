@@ -577,14 +577,23 @@ class TQReplayBuffer:
         self.meta_list: list[Optional[KVBatchMeta]] = []
         self.start_weight_list: list[int] = []
         self.end_weight_list: list[int] = []
+        # Per-slot target training step (set when force_in_order=True, else None).
+        self.target_step_list: list[Optional[int]] = []
         self.ready_list: list[bool] = []
         self._group_ids: list[str] = []
 
-    def reserve(self, *, weight_version: int, group_id: Optional[str] = None) -> str:
+    def reserve(
+        self,
+        *,
+        weight_version: int,
+        target_step: Optional[int] = None,
+        group_id: Optional[str] = None,
+    ) -> str:
         """Append an unready slot tagged with weight_version.
 
         Args:
             weight_version: Weight version stamped on the slot.
+            target_step: Training step this slot targets; only consulted by StalenessSampler.force_in_order.
             group_id: Per-group sample_id prefix; defaults to a fresh uuid4.
 
         Returns:
@@ -595,6 +604,7 @@ class TQReplayBuffer:
         self.meta_list.append(None)
         self.start_weight_list.append(weight_version)
         self.end_weight_list.append(-1)
+        self.target_step_list.append(target_step)
         self.ready_list.append(False)
         self._group_ids.append(group_id)
         return group_id
@@ -678,6 +688,7 @@ class TQReplayBuffer:
             del self.meta_list[i]
             del self.start_weight_list[i]
             del self.end_weight_list[i]
+            del self.target_step_list[i]
             del self.ready_list[i]
             del self._group_ids[i]
 

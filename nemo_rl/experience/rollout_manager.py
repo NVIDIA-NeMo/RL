@@ -638,17 +638,22 @@ class RolloutManager:
     async def run_rollout(self, input_sample: DatumSpec) -> PromptGroupRecord:
         return await self._impl.run_rollout(input_sample)
 
-    async def generate_and_push(self, input_sample: DatumSpec) -> None:
+    async def generate_and_push(
+        self, input_sample: DatumSpec, *, target_step: Optional[int] = None
+    ) -> None:
         """Reserve a buffer slot, run one prompt's rollout, then commit the slot.
 
         Args:
             input_sample: A single prompt (one DatumSpec entry).
+            target_step: Training step this rollout targets; stamped on the buffer slot for StalenessSampler.force_in_order.
         """
         assert self._tq_buffer is not None, (
             "generate_and_push requires tq_buffer to be set at __init__"
         )
         start_version = self._weight_version
-        group_id = self._tq_buffer.reserve(weight_version=start_version)
+        group_id = self._tq_buffer.reserve(
+            weight_version=start_version, target_step=target_step
+        )
 
         record = await self.run_rollout(input_sample)
         end_version = self._weight_version
