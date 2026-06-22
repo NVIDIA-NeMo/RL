@@ -701,6 +701,8 @@ jobs:
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_AutoModel
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+          - script: L1_Functional_Tests_SGLang
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_Gym
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_GRPO_1
@@ -767,6 +769,8 @@ jobs:
           - script: L1_Functional_Tests_Megatron_4
             runner: ${{ vars.GB200_RUNNER }}
           - script: L1_Functional_Tests_AutoModel
+            runner: ${{ vars.GB200_RUNNER }}
+          - script: L1_Functional_Tests_SGLang
             runner: ${{ vars.GB200_RUNNER }}
           - script: L1_Functional_Tests_Gym
             runner: ${{ vars.GB200_RUNNER }}
