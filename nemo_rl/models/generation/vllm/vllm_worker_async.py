@@ -15,11 +15,14 @@
 import asyncio
 import copy
 import gc
+import json
+import math
+import os
 import threading
 import time
 import uuid
 import warnings
-from typing import Any, AsyncGenerator, Optional, cast
+from typing import Any, AsyncGenerator, Iterator, Optional, cast
 
 import ray
 import torch
@@ -41,6 +44,507 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generation
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return default
+
+    return value if value > 0 else default
+
+
+def _nonnegative_int_env(name: str, default: int) -> int:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return default
+
+    return value if value >= 0 else default
+
+
+def _int_set_env(name: str, default: set[int]) -> set[int]:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+
+    values: set[int] = set()
+    for item in raw_value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            values.add(int(item))
+        except ValueError:
+            continue
+    return values if values else default
+
+
+def _iter_nonfinite_floats(value: Any, path: str = "$") -> Iterator[tuple[str, float]]:
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            yield path, value
+        return
+
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(key, str) and key.isidentifier():
+                child_path = f"{path}.{key}"
+            else:
+                child_path = f"{path}[{key!r}]"
+            yield from _iter_nonfinite_floats(item, child_path)
+        return
+
+    if isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            yield from _iter_nonfinite_floats(item, f"{path}[{index}]")
+
+
+def _json_safe_scalar(value: Any) -> Any:
+    if isinstance(value, float):
+        return value if math.isfinite(value) else repr(value)
+    if isinstance(value, (str, int, bool)) or value is None:
+        return value
+    return repr(value)
+
+
+def _json_safe_value(value: Any) -> Any:
+    if isinstance(value, float):
+        return value if math.isfinite(value) else repr(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_value(item) for item in value]
+    if isinstance(value, (str, int, bool)) or value is None:
+        return value
+    return repr(value)
+
+
+def _summarize_vllm_request(request: Any) -> dict[str, Any]:
+    return {
+        "request_id": _json_safe_scalar(getattr(request, "request_id", None)),
+        "model": _json_safe_scalar(getattr(request, "model", None)),
+        "logprobs": _json_safe_scalar(getattr(request, "logprobs", None)),
+        "top_logprobs": _json_safe_scalar(getattr(request, "top_logprobs", None)),
+        "temperature": _json_safe_scalar(getattr(request, "temperature", None)),
+        "top_p": _json_safe_scalar(getattr(request, "top_p", None)),
+        "top_k": _json_safe_scalar(getattr(request, "top_k", None)),
+        "max_tokens": _json_safe_scalar(getattr(request, "max_tokens", None)),
+        "max_completion_tokens": _json_safe_scalar(
+            getattr(request, "max_completion_tokens", None)
+        ),
+    }
+
+
+def _log_vllm_model_dump(
+    payload: dict[str, Any], *, request: Any, response_kind: str
+) -> None:
+    print(
+        "[NRL_VLLM_DEBUG_MODEL_DUMP] "
+        f"response_kind={response_kind} "
+        f"request={_summarize_vllm_request(request)} "
+        f"payload={payload!r}",
+        flush=True,
+    )
+
+
+def _choice_indices_with_nonfinite_logprobs_content(
+    nonfinite_values: list[dict[str, str]],
+) -> list[int]:
+    indices = set()
+    prefix = "$.choices["
+    marker = ".logprobs.content"
+    for nonfinite_value in nonfinite_values:
+        path = nonfinite_value["path"]
+        if not path.startswith(prefix):
+            continue
+        index_text, separator, remainder = path[len(prefix) :].partition("]")
+        if (
+            separator
+            and index_text.isdigit()
+            and remainder.startswith(marker)
+        ):
+            indices.add(int(index_text))
+    return sorted(indices)
+
+
+def _logprob_content_dump_item(item: Any) -> Any:
+    if not isinstance(item, dict):
+        return _json_safe_value(item)
+
+    return {
+        "token": _json_safe_value(item.get("token")),
+        "bytes": _json_safe_value(item.get("bytes")),
+        "logprob": _json_safe_value(item.get("logprob")),
+        "top_logprobs": _json_safe_value(item.get("top_logprobs")),
+    }
+
+
+def _log_nonfinite_logprobs_content(
+    payload: dict[str, Any],
+    nonfinite_values: list[dict[str, str]],
+) -> None:
+    if not _env_flag("NRL_VLLM_DEBUG_NONFINITE_LOGPROBS_CONTENT"):
+        return
+
+    choices = payload.get("choices")
+    if not isinstance(choices, list):
+        return
+
+    max_items = _nonnegative_int_env(
+        "NRL_VLLM_DEBUG_NONFINITE_LOGPROBS_CONTENT_MAX_ITEMS", 0
+    )
+    for choice_index in _choice_indices_with_nonfinite_logprobs_content(
+        nonfinite_values
+    ):
+        if choice_index >= len(choices):
+            continue
+        choice = choices[choice_index]
+        if not isinstance(choice, dict):
+            continue
+        logprobs = choice.get("logprobs")
+        if not isinstance(logprobs, dict):
+            continue
+        content = logprobs.get("content")
+        if not isinstance(content, list):
+            continue
+
+        content_to_dump = content if max_items == 0 else content[:max_items]
+        dump = {
+            "choice_index": choice_index,
+            "content_count": len(content),
+            "truncated": max_items > 0 and len(content) > max_items,
+            "content": [
+                _logprob_content_dump_item(item) for item in content_to_dump
+            ],
+        }
+        print(
+            "[NRL_VLLM_DEBUG_NONFINITE_LOGPROBS_CONTENT] "
+            f"{json.dumps(dump, allow_nan=False)}",
+            flush=True,
+        )
+
+
+def _make_nonfinite_vllm_response(
+    payload: dict[str, Any], *, request: Any, response_kind: str
+) -> tuple[dict[str, Any], int] | None:
+    if not _env_flag("NRL_VLLM_DEBUG_NONFINITE_RESPONSE"):
+        return None
+
+    max_values = _positive_int_env("NRL_VLLM_DEBUG_NONFINITE_RESPONSE_MAX_PATHS", 20)
+    nonfinite_values = []
+    for path, value in _iter_nonfinite_floats(payload):
+        nonfinite_values.append({"path": path, "value": repr(value)})
+        if len(nonfinite_values) >= max_values:
+            break
+
+    if not nonfinite_values:
+        return None
+
+    request_summary = _summarize_vllm_request(request)
+    print(
+        "[NRL_VLLM_DEBUG_NONFINITE_RESPONSE] "
+        f"response_kind={response_kind} "
+        f"count_at_least={len(nonfinite_values)} "
+        f"request={request_summary} "
+        f"values={nonfinite_values}",
+        flush=True,
+    )
+    _log_nonfinite_logprobs_content(payload, nonfinite_values)
+    _log_vllm_model_dump(payload, request=request, response_kind=response_kind)
+
+    status_code = _positive_int_env("NRL_VLLM_NONFINITE_RESPONSE_STATUS_CODE", 500)
+    return (
+        {
+            "error": {
+                "message": (
+                    "vLLM produced a non-finite float in the OpenAI response "
+                    "payload. Enable vLLM logits diagnostics to identify the "
+                    "upstream logits source."
+                ),
+                "type": "nemo_rl_vllm_nonfinite_response",
+                "code": status_code,
+                "response_kind": response_kind,
+                "request": request_summary,
+                "nonfinite_values": nonfinite_values,
+            }
+        },
+        status_code,
+    )
+
+
+_G_VLLM_LOGITS_DIAGNOSTICS_PATCHED = False
+_G_VLLM_LOGITS_DIAGNOSTICS_SEEN: set[str] = set()
+
+
+def _prepare_vllm_logits_diagnostics_env() -> None:
+    """Enable vLLM's built-in logits NaN counter before vLLM caches envs."""
+    if not _env_flag("NRL_VLLM_DEBUG_LOGITS"):
+        return
+
+    os.environ["VLLM_COMPUTE_NANS_IN_LOGITS"] = "1"
+
+
+def _tensor_scalar(value: torch.Tensor) -> int | float | str:
+    scalar = value.item()
+    if isinstance(scalar, float):
+        return scalar if math.isfinite(scalar) else repr(scalar)
+    if isinstance(scalar, int):
+        return scalar
+    return repr(scalar)
+
+
+def _logits_row_summary(logits: torch.Tensor | None, req_index: int) -> dict[str, Any]:
+    if logits is None:
+        return {"available": False, "reason": "logits is None"}
+    if req_index < 0 or req_index >= logits.shape[0]:
+        return {
+            "available": False,
+            "reason": f"req_index {req_index} outside logits batch {logits.shape[0]}",
+        }
+
+    row = logits[req_index].detach().to(torch.float32)
+    finite_mask = torch.isfinite(row)
+    nan_mask = torch.isnan(row)
+    posinf_mask = torch.isposinf(row)
+    neginf_mask = torch.isneginf(row)
+    finite_values = row[finite_mask]
+
+    summary: dict[str, Any] = {
+        "available": True,
+        "shape": list(row.shape),
+        "dtype": str(logits.dtype),
+        "device": str(logits.device),
+        "nan_count": int(nan_mask.sum().item()),
+        "posinf_count": int(posinf_mask.sum().item()),
+        "neginf_count": int(neginf_mask.sum().item()),
+        "finite_count": int(finite_mask.sum().item()),
+    }
+    if finite_values.numel() > 0:
+        summary.update(
+            {
+                "finite_min": _tensor_scalar(finite_values.min()),
+                "finite_max": _tensor_scalar(finite_values.max()),
+                "finite_mean": _tensor_scalar(finite_values.mean()),
+            }
+        )
+    first_nan_index = torch.nonzero(nan_mask, as_tuple=False)
+    if first_nan_index.numel() > 0:
+        summary["first_nan_token_id"] = int(first_nan_index[0].item())
+    first_posinf_index = torch.nonzero(posinf_mask, as_tuple=False)
+    if first_posinf_index.numel() > 0:
+        summary["first_posinf_token_id"] = int(first_posinf_index[0].item())
+    first_neginf_index = torch.nonzero(neginf_mask, as_tuple=False)
+    if first_neginf_index.numel() > 0:
+        summary["first_neginf_token_id"] = int(first_neginf_index[0].item())
+
+    if row.numel() > 0:
+        token0 = row[0]
+        summary["token0_logit"] = _tensor_scalar(token0)
+        if bool(torch.isfinite(token0).item()):
+            summary["token0_rank"] = int((row > token0).sum().item()) + 1
+
+    top_k = min(_positive_int_env("NRL_VLLM_DEBUG_LOGITS_TOP_K", 20), row.numel())
+    if top_k > 0:
+        top_values, top_indices = torch.topk(row, k=top_k)
+        summary["top_logits"] = [
+            {"token_id": int(token_id), "logit": _tensor_scalar(value)}
+            for token_id, value in zip(top_indices, top_values)
+        ]
+    return summary
+
+
+def _logits_row_has_nonfinite(logits: torch.Tensor | None, req_index: int) -> bool:
+    if logits is None or req_index < 0 or req_index >= logits.shape[0]:
+        return False
+
+    row = logits[req_index].detach()
+    return not bool(torch.isfinite(row).all().item())
+
+
+def _sampled_token_ids_for_req(sampled_token_ids: Any, req_index: int) -> list[int] | None:
+    try:
+        if req_index < 0 or req_index >= len(sampled_token_ids):
+            return None
+        sampled_ids = sampled_token_ids[req_index]
+        if torch.is_tensor(sampled_ids):
+            sampled_ids = sampled_ids.detach().cpu().tolist()
+        if isinstance(sampled_ids, int):
+            return [sampled_ids]
+        if isinstance(sampled_ids, (list, tuple)):
+            return [int(token_id) for token_id in sampled_ids]
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
+def _sampled_token_ids_contain(
+    sampled_token_ids: Any, req_index: int, trigger_token_ids: set[int]
+) -> bool:
+    sampled_ids = _sampled_token_ids_for_req(sampled_token_ids, req_index)
+    if sampled_ids is None:
+        return False
+    return any(token_id in trigger_token_ids for token_id in sampled_ids)
+
+
+def _logprob_values_for_req(logprobs_lists: Any, req_index: int) -> Any:
+    if logprobs_lists is None:
+        return None
+    try:
+        _token_ids_lst, logprobs_lst, _ranks_lst, _ = logprobs_lists
+        if req_index >= len(logprobs_lst):
+            return None
+        return _json_safe_value(logprobs_lst[req_index].tolist())
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return None
+
+
+def _logprob_values_have_nonfinite(logprobs_lists: Any, req_index: int) -> bool:
+    if logprobs_lists is None:
+        return False
+    try:
+        _token_ids_lst, logprobs_lst, _ranks_lst, _ = logprobs_lists
+        if req_index < 0 or req_index >= len(logprobs_lst):
+            return False
+        logprobs = logprobs_lst[req_index]
+        if torch.is_tensor(logprobs):
+            return not bool(torch.isfinite(logprobs.detach()).all().item())
+        return any(
+            isinstance(value, float) and not math.isfinite(value)
+            for value in logprobs
+        )
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return False
+
+
+def _log_vllm_logits_diagnostic(
+    *,
+    req_id: str,
+    req_index: int,
+    num_nans: int,
+    trigger_reason: str,
+    sampled_token_ids: list[list[int]],
+    logprobs_lists: Any,
+    logits: torch.Tensor | None,
+) -> None:
+    sampled_ids = _sampled_token_ids_for_req(sampled_token_ids, req_index)
+
+    payload = {
+        "request_id": req_id,
+        "req_index": req_index,
+        "trigger_reason": trigger_reason,
+        "num_nans_in_logits": num_nans,
+        "sampled_token_ids": sampled_ids,
+        "logprobs": _logprob_values_for_req(logprobs_lists, req_index),
+        "logits": _logits_row_summary(logits, req_index),
+    }
+    print(
+        "[NRL_VLLM_DEBUG_LOGITS] "
+        f"{json.dumps(_json_safe_value(payload), allow_nan=False)}",
+        flush=True,
+    )
+
+
+def _install_vllm_logits_diagnostics_patch() -> None:
+    """Patch vLLM to log request-local logits diagnostics on first non-finite value."""
+    if not _env_flag("NRL_VLLM_DEBUG_LOGITS"):
+        return
+
+    global _G_VLLM_LOGITS_DIAGNOSTICS_PATCHED
+    if _G_VLLM_LOGITS_DIAGNOSTICS_PATCHED:
+        return
+
+    try:
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+    except ImportError as e:
+        print(
+            "[NRL_VLLM_DEBUG_LOGITS_PATCH_FAILED] "
+            f"reason={type(e).__name__}: {e}",
+            flush=True,
+        )
+        return
+
+    original_bookkeeping_sync = GPUModelRunner._bookkeeping_sync
+
+    def patched_bookkeeping_sync(self, *args, **kwargs):
+        result = original_bookkeeping_sync(self, *args, **kwargs)
+        if len(args) >= 3:
+            logits = args[2]
+        else:
+            logits = kwargs.get("logits")
+
+        (
+            num_nans_in_logits,
+            logprobs_lists,
+            sampled_token_ids,
+            _prompt_logprobs_dict,
+            _req_ids_output_copy,
+            req_id_to_index_output_copy,
+            _invalid_req_indices,
+        ) = result
+
+        scan_nonfinite = _env_flag("NRL_VLLM_DEBUG_LOGITS_SCAN_NONFINITE")
+        trigger_token_ids = _int_set_env(
+            "NRL_VLLM_DEBUG_LOGITS_TRIGGER_TOKEN_IDS", {0}
+        )
+        candidate_req_ids = dict.fromkeys(
+            [
+                *req_id_to_index_output_copy.keys(),
+                *num_nans_in_logits.keys(),
+            ]
+        )
+        for req_id in candidate_req_ids:
+            if req_id in _G_VLLM_LOGITS_DIAGNOSTICS_SEEN:
+                continue
+            req_index = req_id_to_index_output_copy.get(req_id, -1)
+            num_nans = num_nans_in_logits.get(req_id, 0)
+            if num_nans > 0:
+                trigger_reason = "nan_counter"
+            elif scan_nonfinite and _logits_row_has_nonfinite(logits, req_index):
+                trigger_reason = "nonfinite_scan"
+            elif _logprob_values_have_nonfinite(logprobs_lists, req_index):
+                trigger_reason = "nonfinite_logprobs"
+            elif _sampled_token_ids_contain(
+                sampled_token_ids, req_index, trigger_token_ids
+            ):
+                trigger_reason = "sampled_trigger_token"
+            else:
+                continue
+
+            _G_VLLM_LOGITS_DIAGNOSTICS_SEEN.add(req_id)
+            _log_vllm_logits_diagnostic(
+                req_id=req_id,
+                req_index=req_index,
+                num_nans=num_nans,
+                trigger_reason=trigger_reason,
+                sampled_token_ids=sampled_token_ids,
+                logprobs_lists=logprobs_lists,
+                logits=logits,
+            )
+            if _env_flag("NRL_VLLM_DEBUG_LOGITS_ABORT"):
+                raise RuntimeError(
+                    "vLLM logits diagnostic triggered for request "
+                    f"{req_id}; see [NRL_VLLM_DEBUG_LOGITS]"
+                )
+
+        return result
+
+    GPUModelRunner._bookkeeping_sync = patched_bookkeeping_sync
+    _G_VLLM_LOGITS_DIAGNOSTICS_PATCHED = True
+    print("[NRL_VLLM_DEBUG_LOGITS_PATCHED] enabled=True", flush=True)
 
 
 def _replace_prefix_tokens(
@@ -238,10 +742,14 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         self._load_model(self._deferred_bundle_indices, self._deferred_seed)
 
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
+        _prepare_vllm_logits_diagnostics_env()
+
         from vllm.config import CompilationConfig
         from vllm.engine.arg_utils import AsyncEngineArgs
         from vllm.v1.engine.async_llm import AsyncLLM
         from vllm.v1.metrics.loggers import PrometheusStatLogger
+
+        _install_vllm_logits_diagnostics_patch()
 
         # Workaround: convert compilation_config dict to CompilationConfig object
         # since AsyncEngineArgs doesn't handle the dict-to-pydantic conversion.
@@ -716,15 +1224,22 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 generator = await openai_serving_chat.create_chat_completion(
                     request, raw_request
                 )
-            except VLLMValidationError as e:
+            except (ValueError, VLLMValidationError) as e:
                 # vLLM 0.20 raises VLLMValidationError for prompts exceeding
                 # max_model_len during tokenization, instead of returning an
-                # ErrorResponse. Convert to HTTP 400 so the Gym proxy can
-                # detect context-length overflow and handle it gracefully.
+                # ErrorResponse. Our post-tokenization clamp can raise a local
+                # ValueError for the same condition after prefix replacement.
+                # Convert those cases to HTTP 400 so the Gym proxy can detect
+                # context-length overflow and handle it gracefully.
+                message = str(e)
+                if isinstance(e, ValueError) and not (
+                    "max_model_len" in message or "maximum context length" in message
+                ):
+                    raise
                 return JSONResponse(
                     content={
                         "error": {
-                            "message": str(e),
+                            "message": message,
                             "type": "invalid_request_error",
                             "code": 400,
                         }
@@ -733,12 +1248,26 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 )
 
             if isinstance(generator, ErrorResponse):
+                payload = generator.model_dump()
+                nonfinite_response = _make_nonfinite_vllm_response(
+                    payload, request=request, response_kind="error"
+                )
+                if nonfinite_response is not None:
+                    content, status_code = nonfinite_response
+                    return JSONResponse(content=content, status_code=status_code)
                 return JSONResponse(
-                    content=generator.model_dump(), status_code=generator.error.code
+                    content=payload, status_code=generator.error.code
                 )
 
             elif isinstance(generator, ChatCompletionResponse):
-                return JSONResponse(content=generator.model_dump())
+                payload = generator.model_dump()
+                nonfinite_response = _make_nonfinite_vllm_response(
+                    payload, request=request, response_kind="chat_completion"
+                )
+                if nonfinite_response is not None:
+                    content, status_code = nonfinite_response
+                    return JSONResponse(content=content, status_code=status_code)
+                return JSONResponse(content=payload)
 
             return StreamingResponse(content=generator, media_type="text/event-stream")
 
