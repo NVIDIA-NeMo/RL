@@ -1053,6 +1053,10 @@ def grpo_train_sync(
                         "mean_prompt_length",
                     }:
                         metrics[k] = np.mean(v).item()
+                    elif isinstance(
+                        v, (int, float, np.integer, np.floating)
+                    ) and not isinstance(v, bool):
+                        metrics[k] = float(v)
                     elif isinstance(v, (np.ndarray, list)):
                         metrics[k] = np.sum(v).item()
                     else:
