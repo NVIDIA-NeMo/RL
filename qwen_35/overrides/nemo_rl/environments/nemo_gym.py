@@ -488,7 +488,9 @@ Output prompt token IDs summary: {_summarize_token_ids(output_item_dict["prompt_
 
 
 def setup_nemo_gym_config(config, tokenizer) -> None:
-    generation_config = config["policy"]["generation"]
+    # NeMo RL 0.6 passes a dict-like config; newer NeMo RL passes MasterConfig.
+    policy_config = config.policy if hasattr(config, "policy") else config["policy"]
+    generation_config = policy_config["generation"]
 
     # Enable the http server. Requires both async engine and the expose_http_server flag
     generation_config["vllm_cfg"]["async_engine"] = True
