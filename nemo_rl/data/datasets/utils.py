@@ -208,12 +208,19 @@ def extract_necessary_env_names(data_config: dict) -> list[str]:
     necessary_env_names = set()
     keys = ["train", "validation", "default"]
     for key in keys:
-        if (
-            key in data_config
-            and data_config[key] is not None
-            and "env_name" in data_config[key]
-        ):
-            necessary_env_names.add(data_config[key]["env_name"])
+        if key not in data_config or data_config[key] is None:
+            continue
+        val = data_config[key]
+        # train/validation may be a LIST of datasets (multi-dataset blend used by
+        # use_multiple_dataloader), each with its own env_name; or a single dict
+        # with env_name. The list form was previously ignored, so its per-dataset
+        # env_names were never registered.
+        if isinstance(val, list):
+            for entry in val:
+                if isinstance(entry, dict) and "env_name" in entry:
+                    necessary_env_names.add(entry["env_name"])
+        elif isinstance(val, dict) and "env_name" in val:
+            necessary_env_names.add(val["env_name"])
     return list(necessary_env_names)
 
 
