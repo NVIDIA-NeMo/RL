@@ -101,7 +101,7 @@ class MyTestActor:
         }
         resources = {"num_gpus": num_gpus}
         env_vars_update = {"CONFIGURED_WORKER_CALLED": "1"}
-        return resources, env_vars_update, init_kwargs_update
+        return resources, env_vars_update, init_kwargs_update, {}
 
 
 @ray.remote(
@@ -138,6 +138,7 @@ class PrecedenceActor:
                 "WORKER_VAR": "worker_only",
             },  # env_vars
             {},  # init_kwargs
+            {},  # runtime_env_overrides
         )
 
 
@@ -1049,7 +1050,8 @@ def test_get_nsight_config_if_pattern_matches():
     ):
         result = get_nsight_config_if_pattern_matches("dtensor_policy_worker")
         assert "nsight" in result
-        assert result["nsight"]["t"] == "cuda,cudnn,cublas,nvtx"
+        assert result["nsight"]["t"] == "cuda,nvtx"
+        assert result["nsight"]["s"] == "none"
         assert result["nsight"]["o"] == "'dtensor_policy_worker_1:5_%p'"
         assert result["nsight"]["stop-on-exit"] == "true"
 
@@ -1123,6 +1125,103 @@ def test_get_nsight_config_if_pattern_matches():
         assert result == {}
 
 
+def test_get_nsight_config_extra_options():
+    """NRL_NSYS_EXTRA_OPTIONS should merge into the nsight config (user wins on conflict)."""
+    from unittest.mock import patch
+
+    from nemo_rl.distributed.worker_group_utils import (
+        get_nsight_config_if_pattern_matches,
+    )
+
+    # Test 1: extras add new flags without disturbing defaults.
+    with (
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_WORKER_PATTERNS",
+            "*policy*",
+        ),
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_PROFILE_STEP_RANGE", "2:3"
+        ),
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_EXTRA_OPTIONS",
+            {"gpu-metrics-device": "all", "cuda-memory-usage": "true"},
+        ),
+    ):
+        result = get_nsight_config_if_pattern_matches("megatron_policy_worker")
+        assert "nsight" in result
+        nsight = result["nsight"]
+        # Defaults still present
+        assert nsight["t"] == "cuda,nvtx"
+        assert nsight["o"] == "'megatron_policy_worker_2:3_%p'"
+        assert nsight["capture-range"] == "cudaProfilerApi"
+        # User extras applied
+        assert nsight["gpu-metrics-device"] == "all"
+        assert nsight["cuda-memory-usage"] == "true"
+
+    # Test 2: extras override built-in defaults on key conflict.
+    with (
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_WORKER_PATTERNS",
+            "*policy*",
+        ),
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_PROFILE_STEP_RANGE", "1:2"
+        ),
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_EXTRA_OPTIONS",
+            {"capture-range": "none", "cuda-graph-trace": "graph"},
+        ),
+    ):
+        result = get_nsight_config_if_pattern_matches("dtensor_policy_worker")
+        assert "nsight" in result
+        nsight = result["nsight"]
+        assert nsight["capture-range"] == "none"
+        assert nsight["cuda-graph-trace"] == "graph"
+
+    # Test 3: empty NRL_NSYS_EXTRA_OPTIONS leaves the config untouched.
+    with (
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_WORKER_PATTERNS",
+            "*policy*",
+        ),
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_PROFILE_STEP_RANGE", "1:2"
+        ),
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_EXTRA_OPTIONS",
+            {},
+        ),
+    ):
+        result = get_nsight_config_if_pattern_matches("policy_worker")
+        assert "nsight" in result
+        # The default keys are exactly the documented set.
+        assert set(result["nsight"].keys()) == {
+            "t",
+            "o",
+            "s",
+            "stop-on-exit",
+            "capture-range",
+            "capture-range-end",
+            "cuda-graph-trace",
+        }
+
+
+def test_nrl_nsys_extra_options_parsing():
+    """_parse_extra_options accepts an empty string, rejects non-JSON and non-dict payloads."""
+    import pytest
+
+    from nemo_rl.utils.nsys import _parse_extra_options
+
+    assert _parse_extra_options("") == {}
+    assert _parse_extra_options('{"gpu-metrics-device": "all"}') == {
+        "gpu-metrics-device": "all"
+    }
+    with pytest.raises(ValueError, match="Failed to parse NRL_NSYS_EXTRA_OPTIONS"):
+        _parse_extra_options("not-json")
+    with pytest.raises(ValueError, match="must be a JSON object"):
+        _parse_extra_options('["a", "b"]')
+
+
 def test_get_nsight_config_output_format():
     """Test that the nsight config output can be directly unpacked into runtime_env."""
     from unittest.mock import patch
@@ -1153,7 +1252,7 @@ def test_get_nsight_config_output_format():
         assert "env_vars" in combined_runtime_env
         assert "py_executable" in combined_runtime_env
         assert "nsight" in combined_runtime_env
-        assert combined_runtime_env["nsight"]["t"] == "cuda,cudnn,cublas,nvtx"
+        assert combined_runtime_env["nsight"]["t"] == "cuda,nvtx"
 
         # Test with no match
         no_match_config = get_nsight_config_if_pattern_matches("no_match_worker")

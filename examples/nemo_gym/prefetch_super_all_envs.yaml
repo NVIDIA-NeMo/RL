@@ -1,0 +1,110 @@
+# Prefetch config: union of NeMo Gym environments across the nemotron-3-super stages
+# (RLVR + SWE + RLHF). Pass to the docker build to bake every gym server venv into the image:
+#   docker buildx build -f docker/Dockerfile \
+#     --build-arg NEMO_GYM_PREFETCH_CONFIGS="examples/nemo_gym/prefetch_super_all_envs.yaml" .
+# Only env.nemo_gym is read (dry-run NemoGym._spinup); the dummy values below satisfy the bundled
+# configs' interpolations during the dry run. terminal_pivot is omitted (absent at our Gym pin).
+env:
+  should_use_nemo_gym: true
+  nemo_gym:
+    skip_venv_if_present: true
+    port_range_low: 15001
+    port_range_high: 20000
+
+    # Dummy interpolation values for the bundled configs (unused in the dry run).
+    policy_model_name: dummy-model
+    policy_base_url: http://localhost:8000/v1
+    policy_api_key: dummy
+    judge_model_name: dummy-judge
+    judge_base_url: http://localhost:8000/v1
+    judge_api_key: dummy
+    genrm_model_name: dummy-genrm
+    anthropic_model_name: dummy-anthropic
+    anthropic_base_url: http://localhost:8000/v1
+    anthropic_api_key: dummy
+
+    invalid_tool_call_patterns:
+      - "<tool_call>"
+      - "</tool_call>"
+      - "<function_call>"
+      - "</function_call>"
+    thinking_tags:
+      - "<think>"
+      - "</think>"
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/math_with_judge/configs/math_with_judge.yaml
+    - resources_servers/code_gen/configs/code_gen.yaml
+    - resources_servers/workplace_assistant/configs/workplace_assistant.yaml
+    - resources_servers/mcqa/configs/mcqa.yaml
+    - resources_servers/instruction_following/configs/instruction_following.yaml
+    - resources_servers/structured_outputs/configs/structured_outputs_json.yaml
+    - resources_servers/equivalence_llm_judge/configs/lc_judge.yaml
+    - resources_servers/calendar/configs/calendar.yaml
+    - resources_servers/genrm_compare/configs/genrm_compare.yaml
+    - resources_servers/equivalence_llm_judge/configs/nl2bash-equivalency.yaml
+    - resources_servers/equivalence_llm_judge/configs/equivalence_llm_judge.yaml
+    - resources_servers/single_step_tool_use_with_argument_comparison/configs/single_step_tool_use_with_argument_comparison.yaml
+    - resources_servers/reasoning_gym/configs/reasoning_gym.yaml
+    - resources_servers/ns_tools/configs/ns_tools.yaml
+    - resources_servers/math_formal_lean/configs/math_formal_lean_multi_turn.yaml
+    - resources_servers/swerl_gen/configs/swerl_gen.yaml
+    - resources_servers/jailbreak_detection/configs/jailbreak_detection_nemotron_combined_reward_tp8.yaml
+    - resources_servers/over_refusal_detection/configs/over_refusal_detection_nemotron_tp8.yaml
+    - resources_servers/multichallenge/configs/multichallenge.yaml
+    - resources_servers/inverse_if/configs/inverse_if.yaml
+    - resources_servers/single_step_tool_use_with_argument_comparison/configs/search_pivot_single_step_tool_use_with_argument_comparison.yaml
+    - resources_servers/single_step_tool_use_with_argument_comparison/configs/toolcall_schema_single_step_tool_use_with_argument_comparison.yaml
+    - resources_servers/single_step_tool_use_with_argument_comparison/configs/swe_pivot_single_step_tool_use_with_argument_comparison.yaml
+    - responses_api_agents/swe_agents/configs/swebench_openhands_training.yaml
+
+    # Thin vllm_model clients for the judge refs the bundled configs expect (so refs resolve and
+    # the vllm_model venv builds). genrm_model is already defined by the bundled genrm_compare.yaml.
+    safety_judge_model:
+      responses_api_models:
+        vllm_model:
+          entrypoint: app.py
+          base_url: http://localhost:8000/v1
+          api_key: dummy
+          model: dummy-judge
+          spinup_server: false
+    judge_model:
+      responses_api_models:
+        vllm_model:
+          entrypoint: app.py
+          base_url: http://localhost:8000/v1
+          api_key: dummy
+          model: dummy-judge
+          spinup_server: false
+    # Thin client for the *_reasoning_off agent refs.
+    policy_model_reasoning_off:
+      responses_api_models:
+        vllm_model:
+          entrypoint: app.py
+          base_url: http://localhost:8000/v1
+          api_key: dummy
+          model: dummy-model
+          spinup_server: false
+    # Standalone server defined only to bake the local_vllm_model venv (the runtime GPU judges
+    # use this type). dry_run builds the venv without loading a model.
+    prefetch_local_vllm_model:
+      responses_api_models:
+        local_vllm_model:
+          entrypoint: app.py
+          model: dummy-model
+          vllm_serve_kwargs:
+            tensor_parallel_size: 1
+            data_parallel_size: 1
+            pipeline_parallel_size: 1
+
+    # swe_agents marks container_formatter/dataset_path mandatory; dummies satisfy the dry run.
+    swe_agents_train:
+      responses_api_agents:
+        swe_agents:
+          container_formatter: dummy
+          dataset_path: /dev/null
+    swe_agents_val:
+      responses_api_agents:
+        swe_agents:
+          container_formatter: dummy
+          dataset_path: /dev/null

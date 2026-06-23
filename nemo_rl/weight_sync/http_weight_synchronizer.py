@@ -21,12 +21,12 @@ updates, so the policy streams weights directly to SGLang servers.
 Lifecycle per sync:
   1. policy.offload_before_refit()       -- free GPU for weight staging
   2. generation.prepare_for_generation(tags=["weights"])  -- allocate buffers
-  3. generation.invalidate_kv_cache()    -- clear stale KV cache
-  4. policy.stream_weights_via_http()    -- push weights via HTTP
-  5. policy.offload_after_refit()        -- restore optimizer state
-  6. generation.prepare_for_generation(tags=["kv_cache"]) -- rebuild KV cache
+  3. policy.stream_weights_via_http()    -- push weights via HTTP
+  4. policy.offload_after_refit()        -- restore optimizer state
+  5. generation.prepare_for_generation(tags=["kv_cache"]) -- rebuild KV cache
 """
 
+import os
 from contextlib import nullcontext
 from typing import Any, Optional
 
@@ -44,12 +44,20 @@ class HTTPWeightSynchronizer(WeightSynchronizer):
 
     Args:
         policy: Policy object implementing ColocatablePolicyInterface.
-        generation: SGLangGeneration instance exposing get_sglang_url_to_gpu_uuids().
+        generation: SGLangGeneration instance exposing get_rollout_engine_urls().
+        refit_buffer_size_gb: Fixed buffer size in GB for weight staging.
+            If None, buffer size is computed dynamically from free GPU memory.
     """
 
-    def __init__(self, policy: Any, generation: Any):
+    def __init__(
+        self,
+        policy: Any,
+        generation: Any,
+        refit_buffer_size_gb: Optional[int] = None,
+    ):
         self._policy = policy
         self._generation = generation
+        self._refit_buffer_size_gb = refit_buffer_size_gb
         self._stale = True
 
     def sync_weights(
@@ -69,14 +77,10 @@ class HTTPWeightSynchronizer(WeightSynchronizer):
                 else nullcontext()
             )
             with timer_context:
-                sglang_url_to_gpu_uuids = self._generation.get_sglang_url_to_gpu_uuids()
-
-                flush_success = self._generation.invalidate_kv_cache()
-                if not flush_success:
-                    print("SGLang KV cache invalidation failed before weight update. ")
-
+                buffer_size_bytes = self._compute_buffer_size()
                 futures_train = self._policy.stream_weights_via_http(
-                    sglang_url_to_gpu_uuids=sglang_url_to_gpu_uuids,
+                    rollout_engine_urls=self._generation.get_rollout_engine_urls(),
+                    buffer_size_bytes=buffer_size_bytes,
                 )
                 ray.get(futures_train)
             sync_succeeded = True
@@ -99,3 +103,21 @@ class HTTPWeightSynchronizer(WeightSynchronizer):
 
     def shutdown(self) -> None:
         pass
+
+    def _compute_buffer_size(self) -> int:
+        if self._refit_buffer_size_gb is not None:
+            if self._refit_buffer_size_gb <= 0:
+                raise ValueError("refit_buffer_size_gb must be > 0")
+            return self._refit_buffer_size_gb * (1024**3)
+
+        memory_ratio_raw = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.3")
+        try:
+            memory_ratio = float(memory_ratio_raw)
+        except ValueError as exc:
+            raise ValueError(
+                f"NRL_REFIT_BUFFER_MEMORY_RATIO must be a valid float, got {memory_ratio_raw!r}"
+            ) from exc
+        if memory_ratio <= 0:
+            raise ValueError("NRL_REFIT_BUFFER_MEMORY_RATIO must be > 0")
+
+        return int(self._policy.get_free_memory_bytes() * memory_ratio)

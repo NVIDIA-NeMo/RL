@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -113,7 +113,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             pp_size = config["megatron_cfg"]["pipeline_model_parallel_size"]
             cp_size = config["megatron_cfg"]["context_parallel_size"]
 
-            env_vars = config["megatron_cfg"].get("env_vars", {})
+            env_vars = dict(config["megatron_cfg"].get("env_vars") or {})
 
             if "TORCH_CUDA_ARCH_LIST" not in os.environ:
                 raise RuntimeError(
@@ -372,6 +372,38 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         )
         # this function should co-work with vllm, so we should wait for all futures to complete outside
         return futures
+
+    def init_collective_mcore_generation(
+        self,
+        ip: str,
+        port: int,
+        world_size: int,
+        *,
+        rank_offset: int,
+        refit_backend: str = "gloo",
+    ) -> list[ray.ObjectRef]:
+        """Initialize the megatron refit collective on this policy's workers."""
+        return self.worker_group.run_all_workers_single_data(
+            "init_collective_mcore_generation",
+            ip=ip,
+            port=port,
+            world_size=world_size,
+            rank_offset=rank_offset,
+            refit_backend=refit_backend,
+        )
+
+    def preinit_nvshmem(self) -> list[ray.ObjectRef]:
+        """Pre-initialize NVSHMEM on this policy's workers (no-op when not using nvshmem)."""
+        return self.worker_group.run_all_workers_single_data(
+            "preinit_nvshmem_collective"
+        )
+
+    def swap_weights_via_reshard(self, *, is_source: bool) -> list[ray.ObjectRef]:
+        """Send (`is_source=True`) or receive (`is_source=False`) weights via megatron reshard."""
+        return self.worker_group.run_all_workers_single_data(
+            "swap_weights_via_reshard",
+            is_source=is_source,
+        )
 
     # ── DP-shard helpers ────────────────────────────────────────────────
     # DRY for Policy's logprob/train methods only. The data-plane sibling
@@ -729,6 +761,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         }
         if "moe_metrics" in results[0]:
             aggregated_results["moe_metrics"] = results[0]["moe_metrics"]
+        if "mtp_metrics" in results[0]:
+            aggregated_results["mtp_metrics"] = results[0]["mtp_metrics"]
 
         if self.flops_tracker is not None:
             aggregated_results["total_flops"] = self.flops_tracker.total_flops
@@ -756,13 +790,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
         """Generate a batch of data using the policy."""
-        # Verify input data is right-padded
         assert isinstance(data, BatchedDataDict), (
             f"data must be a BatchedDataDict, got type: {type(data)}"
         )
         assert "input_ids" in data and "input_lengths" in data, (
             "Missing required input fields"
         )
+        assert self.cfg["generation"] is not None, "Generation config is not set"
 
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
         sharded_data = data.shard_by_batch_size(dp_size, batch_size=None)
@@ -774,13 +808,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             output_is_replicated=["tensor_parallel", "pipeline_parallel"],
             common_kwargs={"greedy": greedy},
         )
-        assert self.cfg["generation"] is not None, "Generation config is not set"
-        result: BatchedDataDict[GenerationOutputSpec] = BatchedDataDict.from_batches(
+        result = BatchedDataDict.from_batches(
             self.worker_group.get_all_worker_results(futures),
             pad_value_dict={"output_ids": self.cfg["generation"]["_pad_token_id"]},
         )
 
-        # Verify the output has all required fields
         required_keys = [
             "output_ids",
             "generation_lengths",
@@ -844,6 +876,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # We don't need to do anything here
         return True
 
+    def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
+        # We don't need to do anything here
+        return True
+
     def prepare_for_training(self, *args: Any, **kwargs: Any) -> None:
         # onload everything to the GPU
         futures = self.worker_group.run_all_workers_single_data("prepare_for_training")
@@ -854,10 +890,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             "prepare_for_lp_inference"
         )
         ray.get(futures)
-
-    def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
-        # We don't need to do anything here
-        return True
 
     def invalidate_kv_cache(self, *args: Any, **kwargs: Any) -> bool:
         # We don't need to do anything here
@@ -873,6 +905,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         results = ray.get(futures)
         # Only get the first worker's info since all workers will have the same result
         return results[0]
+
+    def finish_inference(self) -> None:
+        """Offload policy model to CPU after inference."""
+        futures = self.worker_group.run_all_workers_single_data("finish_inference")
+        ray.get(futures)
 
     def finish_training(self, *args: Any, **kwargs: Any) -> None:
         # Placeholder implementation
@@ -960,18 +997,37 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         return futures
 
     def stream_weights_via_http(
-        self, sglang_url_to_gpu_uuids: dict[str, list[str]]
+        self,
+        rollout_engine_urls: list[str],
+        buffer_size_bytes: int,
     ) -> list[ray.ObjectRef]:
-        """Send the weights to SGLang servers via HTTP API.
+        """Send the weights to colocated SGLang engines via CUDA IPC over HTTP.
 
         Args:
-            sglang_url_to_gpu_uuids: Dict mapping SGLang server URL to list of GPU UUIDs it uses
+            rollout_engine_urls: ``http://host:port`` base URLs of each
+                engine's ``node_rank=0`` SGLang HTTP server. The caller
+                resolves these once (via ``engine.get_base_url``) and passes
+                them in, so every FSDP rank doesn't redo the Ray RPC.
+            buffer_size_bytes: Max bucket size in bytes before flushing.
+
+        The rollout TP size is captured once via
+        ``set_rollout_num_gpus_per_engine`` and reused by each worker.
         """
         futures = self.worker_group.run_all_workers_single_data(
             "stream_weights_via_http",
-            sglang_url_to_gpu_uuids=sglang_url_to_gpu_uuids,
+            rollout_engine_urls=rollout_engine_urls,
+            buffer_size_bytes=buffer_size_bytes,
         )
         return futures
+
+    def set_rollout_num_gpus_per_engine(self, num_gpus_per_engine: int) -> None:
+        """Broadcast the rollout engine TP size to every policy worker."""
+        ray.get(
+            self.worker_group.run_all_workers_single_data(
+                "set_rollout_num_gpus_per_engine",
+                num_gpus_per_engine=num_gpus_per_engine,
+            )
+        )
 
     def broadcast_weights_for_collective(
         self, kv_scales: Optional[dict[str, float]] = None
