@@ -46,6 +46,7 @@ constraints = [
     { name = "brotli", specifier = ">=1.2.0" },
     { name = "cbor2", specifier = ">=5.9.0" },
     { name = "cryptography", specifier = ">=46.0.6" },
+    { name = "diffusers", specifier = ">=0.38.0" },
     { name = "dulwich", specifier = ">=1.2.5" },
     { name = "onnx", specifier = ">=1.21.0rc4" },
     { name = "orjson", specifier = ">=3.11.6" },
