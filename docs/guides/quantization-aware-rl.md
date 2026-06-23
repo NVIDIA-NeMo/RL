@@ -147,13 +147,14 @@ cd /opt/nemo-rl
 PYTHONPATH=$PWD/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM:${PYTHONPATH:-} \
 uv run --extra mcore --extra modelopt \
   torchrun --nproc_per_node <pipeline-parallel-size> \
-  3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/examples/quantization/export.py \
+  examples/modelopt/export_quantized_to_hf.py \
   --hf-model-id <hf-model-name-or-path> \
   --megatron-load-path <path-to-megatron-checkpoint>/policy/weights \
   --export-dir <output-hf-directory> \
   --tp 1 --pp <pipeline-parallel-size>
 ```
 
+- `examples/modelopt/export_quantized_to_hf.py` is a thin wrapper around `Megatron-Bridge/examples/quantization/export.py` that registers `nemo_rl.` as an allowed `_target_` prefix so the saved layer-spec callback in QARL checkpoints can be instantiated during export. All CLI flags pass through to the upstream script unchanged.
 - `--hf-model-id` should point to the original (pre-training) HuggingFace model so that the exporter knows the model architecture and tokenizer.
 - The `PYTHONPATH` prefix exposes Megatron-LM's `megatron.training` to the bridge script.
 - **`--tp 1` is required**: modelopt currently does not support TP>1 at export time. Training at TP>1 is fine; the bridge re-shards on load via `mp_overrides`.

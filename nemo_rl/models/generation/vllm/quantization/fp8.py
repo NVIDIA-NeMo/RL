@@ -88,7 +88,7 @@ def monkey_patch_vllm_ray_executor(fp8_config):
     if fp8_config.model_parallel_size > 1:
         # we patch vllm's collective_rpc so that before vllm initalizes the model on each rank, we execute
         # a ray remote that patches each worker with the required fp8 vllm patches
-        from vllm.v1.executor.ray_distributed_executor import RayDistributedExecutor
+        from vllm.v1.executor.ray_executor import RayDistributedExecutor
 
         original_run_workers = RayDistributedExecutor.collective_rpc
 
@@ -548,7 +548,7 @@ def maybe_post_process_fp8_weight_block(layer: torch.nn.Module):
     # requantize the weight and input to the specific scale
     # at the same time.
     should_use_deepgemm = should_use_deepgemm_for_fp8_linear(
-        layer.orig_dtype, layer.weight
+        layer.orig_dtype, layer.weight.shape
     )
     if should_use_deepgemm:
         dg_weight, dg_weight_scale = deepgemm_post_process_fp8_weight_block(
@@ -882,8 +882,8 @@ def process_weights_after_loading_kv(self, layer) -> None:
     else:
         prob_scale = 1.0
 
-    is_singleton_float = (
-        lambda x: isinstance(x, float)
+    is_singleton_float = lambda x: (
+        isinstance(x, float)
         or isinstance(x, torch.Tensor)
         and x.numel() == 1
         and x.is_floating_point()

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import re
 import traceback
 from typing import Any
 
@@ -37,18 +38,14 @@ except ImportError:
     )
 
 
-def fix_gpt_oss_export_transpose(key: str, weight: torch.Tensor) -> torch.Tensor:
-    """Apply GPT-OSS down_proj transpose fix to the weight.
+def fix_gemma3_vision_weight_name(key: str) -> str:
+    """Re-insert the `vision_model` segment into Gemma3 vision-tower weights.
 
-    This is a workaround for the issue that the down_proj layout is not the same across different frameworks.
-        - HF needs [in, out] layout.
-        - Megatron needs [in, out] layout.
-        - vLLM needs [out, in] layout.
-    See https://github.com/NVIDIA-NeMo/Megatron-Bridge/pull/3271 for more details.
+    When performing refit, the vision-tower weight paths are flattened. This unflattens them.
     """
-    if key.endswith("mlp.experts.down_proj"):
-        weight = weight.transpose(-2, -1).contiguous()
-    return weight
+    return re.sub(
+        r"vision_tower\.(?!vision_model\.)", "vision_tower.vision_model.", key
+    )
 
 
 class VllmInternalWorkerExtension:
@@ -214,21 +211,20 @@ class VllmInternalWorkerExtension:
         draft_model.load_weights(weights=draft_weights)
 
     def _load_weights(self, weights):
-        """Load weights with GptOss transpose fix, FP8, and draft-weight support.
+        """Load weights with Gemma3 vision-tower weight name fix, FP8, and draft-weight support.
 
-        Applies GPT-OSS down_proj transpose if needed, splits policy/draft
+        Applies Gemma3 vision-tower weight name fix if needed, splits policy/draft
         weights, applies FP8 conversion if needed, and loads draft weights
         into the drafter model.
         """
         from nemo_rl.models.generation.vllm.quantization import fp8
 
         if (
-            "GptOssForCausalLM"
+            "Gemma3ForConditionalGeneration"
             in self.model_runner.vllm_config.model_config.architectures
         ):
             for idx, (key, weight) in enumerate(weights):
-                weight = fix_gpt_oss_export_transpose(key, weight)
-                weights[idx] = (key, weight)
+                weights[idx] = (fix_gemma3_vision_weight_name(key), weight)
 
         policy_weights, draft_weights = self._split_policy_and_draft_weights(weights)
         if fp8.is_fp8_model(self.model_runner.vllm_config):
@@ -286,12 +282,6 @@ class VllmInternalWorkerExtension:
                         .view(dtype=dtype)
                         .view(shape)
                     )
-                    # apply gpt-oss transpose fix
-                    if (
-                        "GptOssForCausalLM"
-                        in self.model_runner.vllm_config.model_config.architectures
-                    ):
-                        weight = fix_gpt_oss_export_transpose(key, weight)
                     weights.append((key, weight))
 
                     # Move offset to the next weight

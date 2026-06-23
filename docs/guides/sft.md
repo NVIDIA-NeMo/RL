@@ -138,6 +138,26 @@ data:
     ...
 ```
 
+`AIME2025` and `AIME2026` are registered alongside `AIME2024` and accept the same config keys (e.g. `repeat`), so any of them can drop into the `validation:` list above.
+
+### Custom datasets defined outside NeMo RL
+
+If you want to plug in a dataset class that lives outside the `nemo_rl`
+package (so you don't have to edit the built-in registry), set
+`dataset_name` to a fully qualified dotted import path. The dispatcher
+will import the module and resolve the class. The class must accept the
+same kwargs as the built-in datasets (i.e. the full data config) and
+implement `set_task_spec` and `set_processor`.
+
+```yaml
+data:
+  default:
+    dataset_name: my_pkg.my_module.MyDataset  # importable from PYTHONPATH
+```
+
+The class must be importable — install it as a package or add its
+parent directory to `PYTHONPATH` before launching training.
+
 We support using a single dataset for both train and validation by using `split_validation_size` to set the ratio of validation.
 [OpenAssistant](../../nemo_rl/data/datasets/response_datasets/oasst.py), [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py), [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py), [Tulu3SftMixtureDataset](../../nemo_rl/data/datasets/response_datasets/tulu3.py) are supported for this feature.
 If you want to support this feature for your custom datasets or other built-in datasets, you can simply add the code to the dataset like [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py).
@@ -241,110 +261,13 @@ Upon completion of the training process, you can refer to our [evaluation guide]
 
 ## LoRA Configuration
 
-NeMo RL supports LoRA (Low-Rank Adaptation) for parameter-efficient fine-tuning, including Nano‑v3 models. LoRA reduces trainable parameters by using low-rank matrices for weight updates while keeping the base model frozen.
-
-Notes:
-- LoRA is supported with DTensor v2 and Megatron backends. Uses the DTensor backend by default. DTensor v1 does not support LoRA (ensure `policy.dtensor_cfg._v2=true` when using DTensor).
-- Triton kernels are only used in the DTensor v2 path. For `tensor_parallel_size > 1`, Automodel currently does not support Triton kernels (see note below).
-
-### DTensor Configuration Parameters
-
-The LoRA configuration is specified under the `policy.dtensor_cfg.lora_cfg` section:
-
-```yaml
-policy:
-  dtensor_cfg:
-    lora_cfg:
-      enabled: False            # Set to True to enable LoRA fine-tuning
-      target_modules: []        # List of module names to apply LoRA
-      exclude_modules: []       # List of module names to exclude from LoRA
-      match_all_linear: true    # Apply LoRA to all linear layers
-      dim: 8                    # LoRA rank (r): controls adaptation capacity
-      alpha: 32                 # LoRA scaling factor (effective lr = alpha/dim)
-      dropout: 0.0              # Dropout probability for LoRA layers
-      dropout_position: "post"  # Dropout position: "pre" or "post"
-      lora_A_init: "xavier"     # Initialization method: "xavier" or "uniform"
-      use_triton: true          # Use Triton-optimized kernels (DTensor v2 path)
-```
-
-### DTensor (Automodel) Parameter Details
-- **`enabled`** (bool): Whether to enable LoRA training
-- **`target_modules`** (list): Specific module names to apply LoRA. Empty with `match_all_linear=true` applies to all linear layers
-- **`exclude_modules`** (list): Module names to exclude from LoRA
-- **`match_all_linear`** (bool): When `true`, applies LoRA to all linear layers (overrides `target_modules`)
-- **`dim`** (int): LoRA rank (r). Lower values = fewer parameters but less capacity. Typical: 4, 8, 16, 32, 64
-- **`alpha`** (int): LoRA scaling factor. Effective learning rate multiplier = `alpha/dim`. Typical: 16, 32, 64
-- **`dropout`** (float): Dropout probability for regularization
-- **`dropout_position`** (str): Apply dropout before ("pre") or after ("post") LoRA
-- **`lora_A_init`** (str): Initialization method for LoRA A matrix
-- **`use_triton`** (bool): Use Triton-optimized kernels for better performance. Used for DTensor v2 only. **Note**: [Automodel does not support Triton for TP > 1](https://github.com/NVIDIA-NeMo/Automodel/blob/b2db55eee98dfe81a8bfe5e23ac4e57afd8ab261/nemo_automodel/recipes/llm/train_ft.py#L199). Set to `false` when `tensor_parallel_size > 1` to avoid compatibility issues
-
-### DTensor Example Usage
+NeMo RL supports LoRA (Low-Rank Adaptation) for parameter-efficient fine-tuning of SFT models, including Nano‑v3 models, on both the DTensor and Megatron backends. To enable LoRA for SFT on the default DTensor backend:
 
 ```bash
 uv run examples/run_sft.py policy.dtensor_cfg.lora_cfg.enabled=true
 ```
-For the Nano‑v3 SFT LoRA recipe, see:[sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml](../../examples/configs/recipes/llm/sft-nanov3-30BA3B-2n8g-fsdp2-lora.yaml).
 
-### Megatron Configuration Parameters
-
-The LoRA configuration is specified under the `policy.megatron_cfg.peft` section:
-
-```yaml
-policy:
-  megatron_cfg:
-    peft:
-      enabled: false                # Set to True to enable LoRA fine-tuning
-      target_modules: []            # List of module names to apply LoRA, defaults to all linear layers
-      exclude_modules: []           # List of module names not to apply LoRa.
-      dim: 32                       # LoRA rank (r): controls adaptation capacity
-      alpha: 32                     # LoRA scaling factor (effective lr = alpha/dim)
-      dropout: 0.0                  # Dropout probability for LoRA layers
-      dropout_position: "pre"       # Dropout position: "pre" or "post"
-      lora_A_init_method: "xavier"  # Initialization method for lora A: "xavier" or "uniform"
-      lora_B_init_method: "zero"    # Initialization method for lora B: "zero"
-      a2a_experimental: false       # Enables the experimental All-to-All (A2A) communication strategy.
-      lora_dtype: None              # Weight's dtype
-```
-
-### Megatron Parameter Details
-- **`enabled`** (bool): Whether to enable LoRA training
-- **`target_modules`** (list): Specific module names to apply LoRA. Defaults to all linear layers if the list is left empty. Example: ['linear_qkv', 'linear_proj', 'linear_fc1', 'linear_fc2'].
-  - 'linear_qkv': Apply LoRA to the fused linear layer used for query, key, and value projections in self-attention.
-  - 'linear_proj': Apply LoRA to the linear layer used for projecting the output of self-attention.
-  - 'linear_fc1': Apply LoRA to the first fully-connected layer in MLP.
-  - 'linear_fc2': Apply LoRA to the second fully-connected layer in MLP.
-  Target modules can also contain wildcards. For example, you can specify target_modules=['*.layers.0.*.linear_qkv', '*.layers.1.*.linear_qkv'] to add LoRA to only linear_qkv on the first two layers.
-- **`exclude_modules`** (List[str], optional): A list of module names not to apply LoRa. It will match all nn.Linear & nn.Linear-adjacent modules whose name does not match any string in exclude_modules. If used, will require target_modules to be empty list or None.
-- **`dim`** (int): LoRA rank (r). Lower values = fewer parameters but less capacity. Typical: 4, 8, 16, 32, 64
-- **`alpha`** (int): LoRA scaling factor. Effective learning rate multiplier = `alpha/dim`. Typical: 16, 32, 64
-- **`dropout`** (float): Dropout probability for regularization, defaults to 0.0
-- **`dropout_position`** (str): Apply dropout before ("pre") or after ("post") LoRA
-- **`lora_A_init`** (str): Initialization method for lora_A (choices: ['xavier', 'uniform']), defaults to xavier.
-- **`lora_B_init`** (str): Initialization method for the low-rank matrix B. Defaults to "zero".
-- **`a2a_experimental`** (bool): Enables the experimental All-to-All (A2A) communication strategy. Defaults to False.
-- **`lora_dtype`** (torch.dtype): Weight's dtype, by default will use orig_linear's but if they are quantized weights (e.g. 4bit) needs to be specified explicitly.
-
-### Megatron Example Usage
-The config uses DTensor by default, so the megatron backend needs to be explicitly enabled. 
-```sh
-uv run examples/run_sft.py \
-  --config examples/configs/sft.yaml \
-  policy.dtensor_cfg.enabled=false \
-  policy.megatron_cfg.enabled=true \
-  policy.megatron_cfg.peft.enabled=true
-```
-
-For more details on LoRA, see [LoRA: Low-Rank Adaptation of Large Language Models](https://arxiv.org/abs/2106.09685).
-
-### Exporting a LoRA Checkpoint to Hugging Face Format
-
-After training with LoRA on the Megatron backend, the `convert_lora_to_hf.py` script supports two export modes:
-
-- **Merged**: fold the adapter into the base model and export a single standalone HuggingFace checkpoint for inference or evaluation.
-- **Adapter-only**: export only the adapter weights in HuggingFace PEFT format, keeping the base model separate (e.g. for use with vLLM's LoRA support).
-
-See the [Checkpointing documentation](../design-docs/checkpointing.md#converting-megatron-lora-adapter-checkpoints-to-hugging-face-format) for full usage details and examples.
+For the full reference — backend support, the DTensor vs Megatron schema comparison, config examples, parameter details, example recipes, and Hugging Face export — see the dedicated [LoRA guide](lora.md).
 
 ## Optimizations
 

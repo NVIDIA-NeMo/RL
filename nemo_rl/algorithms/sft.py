@@ -32,7 +32,11 @@ from nemo_rl.data.llm_message_utils import (
 )
 from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
+from nemo_rl.distributed.virtual_cluster import (
+    ClusterConfig,
+    RayVirtualCluster,
+    prepare_segment_topology,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import PolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
@@ -73,6 +77,7 @@ class SFTConfig(TypedDict):
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
     val_at_end: bool
     seed: int
+    only_unmask_final: bool
 
 
 class MasterConfig(BaseModel, extra="allow"):
@@ -168,15 +173,21 @@ def setup(
     #          Cluster
     # ==========================
     print("\n▶ Setting up compute cluster...")
+    num_nodes = cluster_config["num_nodes"]
+    segment_size = cluster_config.get("segment_size")
+    node_resource_constraints, _, _ = prepare_segment_topology(segment_size, num_nodes)
     cluster = RayVirtualCluster(
         name="sft_cluster",
-        bundle_ct_per_node_list=[cluster_config["gpus_per_node"]]
-        * cluster_config["num_nodes"],
+        bundle_ct_per_node_list=[cluster_config["gpus_per_node"]] * num_nodes,
         use_gpus=True,
         num_gpus_per_node=cluster_config["gpus_per_node"],
         max_colocated_worker_groups=1,
+        port_range_low=cluster_config.get("master_port_range_low"),
+        port_range_high=cluster_config.get("master_port_range_high"),
+        segment_size=segment_size,
+        node_resource_constraints=node_resource_constraints,
     )
-    print(f"  ✓ Ray cluster initialized with {cluster_config['num_nodes']} nodes")
+    print(f"  ✓ Ray cluster initialized with {num_nodes} nodes")
 
     # ==========================
     #   Training
@@ -271,6 +282,7 @@ def validate(
             add_loss_mask_to_message_log(
                 val_batch["message_log"],
                 roles_to_train_on=["assistant"],
+                only_unmask_final=master_config.sft["only_unmask_final"],
             )
 
             cat_and_padded, input_lengths = batched_message_log_to_flat_message(
@@ -434,6 +446,7 @@ def sft_train(
                     add_loss_mask_to_message_log(
                         batch["message_log"],
                         roles_to_train_on=["assistant"],
+                        only_unmask_final=master_config.sft["only_unmask_final"],
                     )
 
                     cat_and_padded, input_lengths = batched_message_log_to_flat_message(
