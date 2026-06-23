@@ -9,23 +9,16 @@ For the full list of supported Qwen models, see
 
 ## Version Guides
 
-- **[Qwen3.5](qwen3.5.md)** — LLM and VLM recipes for `Qwen3.5-9B-Base`,
+- **[Qwen3.5](qwen3-5.md)** — LLM and VLM recipes for `Qwen3.5-9B-Base`,
   `Qwen3.5-35B-A3B-Base`, and `Qwen3.5-397B-A17B` on the Megatron and AutoModel
-  backends. Covers generation-length defaults for thinking-mode runs, the
-  `flash-linear-attention` performance requirement, and known issues.
+  backends. Covers backend/parallelism support, example recipes, and the
+  `flash-linear-attention` performance requirement.
 
 Subpages for other Qwen versions are added as distinct, recipe-backed guidance
 accumulates. Until then, the GRPO, evaluation, and recipe YAMLs remain the source of
 truth for those models.
 
-## Quick Tips for Qwen Thinking Models
-
-> [!WARNING]
-> Qwen3 and Qwen3.5 thinking models need a large generation budget. Default
-> `max_new_tokens` values from non-thinking baselines (3K–4K) can truncate the
-> reasoning trace before the final answer and make evaluation accuracy appear near
-> zero while training metrics look normal. Set
-> `policy.generation.max_new_tokens >= 8192` and size
-> `policy.max_total_sequence_length` / `policy.generation.vllm_cfg.max_model_len`
-> to match. See [Qwen3.5 → Key Defaults](qwen3.5.md#key-defaults) and
-> [#2725](https://github.com/NVIDIA-NeMo/RL/issues/2725).
+> [!NOTE]
+> Qwen3 and Qwen3.5 thinking models need a large generation budget. See
+> [Qwen3.5 → Example Recipes](qwen3-5.md#example-recipes) for the
+> `max_new_tokens` guidance.
