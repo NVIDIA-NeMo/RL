@@ -339,11 +339,13 @@ infra/DGD YAMLs (GB300):
   descriptors), `UCX_IB_GPU_DIRECT_RDMA=yes`, `UCX_CUDA_COPY_DMABUF=yes`,
   `MX_RDMA_NIC_PIN=auto`.
 - **Images**: `infra/nrl_k8s/dynamo_mx/Dockerfile.nemorl` is the trainer image
-  helper. The DGD worker image is built from the Dynamo repository and must have
-  modelexpress, the UCX-bundled NIXL wheel, tokenize/completion-token support,
-  and `MxRefitWorkerExtension` baked in. The retained manifests do not copy a
-  Dynamo source overlay into pods at runtime. Trainer and worker
-  nixl/modelexpress versions must align.
+  helper. `infra/nrl_k8s/dynamo_mx/Dockerfile` is an optional Dynamo worker image
+  helper that pins the ModelExpress client/NIXL layer on top of a compatible
+  Dynamo integration base image. The DGD worker image must have modelexpress, the
+  UCX-bundled NIXL wheel, tokenize/completion-token support, and
+  `MxRefitWorkerExtension` baked in. The retained manifests do not copy a Dynamo
+  source overlay into pods at runtime. Trainer and worker nixl/modelexpress
+  versions must align.
 
 ## Current State and Limitations
 
@@ -380,7 +382,7 @@ infra/DGD YAMLs (GB300):
 | DGD ingestion / CRUD | `infra/nrl_k8s/src/nrl_k8s/dgd.py` |
 | DGD schema | `infra/nrl_k8s/src/nrl_k8s/schema.py` (`DynamoGraphSpec`, `InfraConfig.dynamo`) |
 | DGD orchestration | `infra/nrl_k8s/src/nrl_k8s/orchestrate.py` (`ensure_dgd`) |
-| MX infra (server, trainer image helper, README) | `infra/nrl_k8s/dynamo_mx/` |
+| MX infra (server, worker/trainer image helpers, README) | `infra/nrl_k8s/dynamo_mx/` |
 | Runnable k8s exemplars | `infra/nrl_k8s/examples/k8s_exemplars/*/*.yaml` |
 | Retained GP and SWE2 examples | `infra/nrl_k8s/examples/grpo_workplace_assistant_dynamo_mx_gp.gb300.infra.yaml`, `infra/nrl_k8s/examples/grpo_swe2_qwen3_30b_dynamo_mx.gb300.infra.yaml` |
 | Unit tests | `tests/unit/models/generation/test_dynamo_generation.py` |

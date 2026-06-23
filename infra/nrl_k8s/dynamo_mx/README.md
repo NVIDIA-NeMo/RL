@@ -14,12 +14,13 @@ in. DGD manifests enable the receiver with `DYN_MX_REFIT_ENABLED=1`.
 | File | Purpose |
 |---|---|
 | `modelexpress-server.yaml` | Deployment and Service for the MX server (`:8001`). |
+| `Dockerfile` | Optional Dynamo worker image helper that pins the ModelExpress client/NIXL layer on top of a Dynamo integration base image. |
 | `Dockerfile.nemorl` | NeMo-RL trainer image helper for MX/NIXL dependencies and SWE sandbox tooling. |
 | `prometheus.yaml` | Prometheus instance used by the GlobalPlanner/GlobalRouter GP example. |
 
-The removed Dynamo worker overlay used to live here. Build the Dynamo image from
-the Dynamo repository instead of copying Python files from a mounted checkout at
-pod startup.
+Build the Dynamo worker image from the Dynamo repository or use `Dockerfile` to
+add the pinned ModelExpress client layer on top of a compatible Dynamo base
+image. Do not copy Dynamo Python files from a mounted checkout at pod startup.
 
 ## Refit Flow
 
