@@ -201,6 +201,23 @@ _qwen35_mount_file() {
     _qwen35_append_extra_mount "${host_file}:${container_file}"
 }
 
+_qwen35_stage_yaml_files() {
+    local host_root="$1"
+    local stage_root="$2"
+    local description="$3"
+
+    if [[ ! -d "${host_root}" ]]; then
+        echo "Error: ${description} directory does not exist: ${host_root}" >&2
+        exit 1
+    fi
+
+    local src rel
+    while IFS= read -r -d '' src; do
+        rel="${src#${host_root}/}"
+        _qwen35_stage_file "${src}" "${stage_root}" "${rel}" "${description}"
+    done < <(find "${host_root}" -maxdepth 1 -type f \( -name '*.yaml' -o -name '*.yml' \) -print0)
+}
+
 _qwen35_overlay_mode="${QWEN35_OVERLAY:-auto}"
 _qwen35_recipe="${RECIPE#./}"
 _qwen35_should_mount=0
@@ -220,13 +237,18 @@ esac
 
 if [[ "${_qwen35_should_mount}" == "1" ]]; then
     QWEN35_CONFIG_DIR="${QWEN35_CONFIG_DIR:-${REPO_LOCATION}/qwen_35/configs}"
+    QWEN35_BASE_CONFIG_DIR="${QWEN35_BASE_CONFIG_DIR:-${REPO_LOCATION}/examples/nemo_gym}"
     QWEN35_OVERLAY_DIR="${QWEN35_OVERLAY_DIR:-${REPO_LOCATION}/qwen_35/overrides}"
     QWEN35_MOUNT_STAGE_DIR="${QWEN35_MOUNT_STAGE_DIR:-${OUT_DIR}/qwen_35_mounts}"
     QWEN35_STAGED_CONFIG_DIR="${QWEN35_MOUNT_STAGE_DIR}/configs"
+    QWEN35_STAGED_BASE_CONFIG_DIR="${QWEN35_MOUNT_STAGE_DIR}/examples_nemo_gym"
     QWEN35_STAGED_OVERLAY_DIR="${QWEN35_MOUNT_STAGE_DIR}/overrides"
 
     _qwen35_stage_tree "${QWEN35_CONFIG_DIR}" "${QWEN35_STAGED_CONFIG_DIR}" "Qwen 3.5 config"
     _qwen35_mount_tree "${QWEN35_STAGED_CONFIG_DIR}" "${CONTAINER_REPO_LOCATION}/qwen_35/configs" "Qwen 3.5 staged config"
+
+    _qwen35_stage_yaml_files "${QWEN35_BASE_CONFIG_DIR}" "${QWEN35_STAGED_BASE_CONFIG_DIR}" "Qwen 3.5 base config"
+    _qwen35_mount_tree "${QWEN35_STAGED_BASE_CONFIG_DIR}" "${CONTAINER_REPO_LOCATION}/examples/nemo_gym" "Qwen 3.5 staged base config"
 
     _qwen35_overlay_dsts=(
         "nemo_rl/environments/nemo_gym.py"
@@ -246,7 +268,7 @@ if [[ "${_qwen35_should_mount}" == "1" ]]; then
     export NEMO_RL_QWEN35_TRUNCATE_PROMPT_TOKENS="${NEMO_RL_QWEN35_TRUNCATE_PROMPT_TOKENS:-${QWEN35_TRUNCATE_PROMPT_TOKENS:-65535}}"
 fi
 unset _qwen35_overlay_mode _qwen35_recipe _qwen35_should_mount
-unset -f _qwen35_append_extra_mount _qwen35_stage_tree _qwen35_mount_tree _qwen35_stage_file _qwen35_mount_file
+unset -f _qwen35_append_extra_mount _qwen35_stage_tree _qwen35_mount_tree _qwen35_stage_file _qwen35_mount_file _qwen35_stage_yaml_files
 
 # Construct the command
 COMMAND=$(cat <<EOF
