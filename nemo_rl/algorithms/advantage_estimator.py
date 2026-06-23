@@ -34,6 +34,7 @@ from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     calculate_kl,
+    get_gdpo_reward_component_keys,
     masked_mean,
     masked_var,
 )
@@ -111,26 +112,22 @@ class GDPOAdvantageEstimator:
         Returns:
             Advantages tensor of shape [batch_size, seq_len].
         """
-        reward_components = {
-            k: repeated_batch[k]
-            for k in repeated_batch
-            if isinstance(k, str) and k.startswith("reward/")
-        }
-        if len(reward_components) < 2:
+        reward_component_keys = get_gdpo_reward_component_keys(repeated_batch)
+        if len(reward_component_keys) < 2:
             raise ValueError(
                 f"GDPO requires multiple reward components (reward/name1, reward/name2, ...). "
-                f"This batch has {len(reward_components)} component(s): {list(reward_components.keys())}. "
+                f"This batch has {len(reward_component_keys)} component(s): {reward_component_keys}. "
                 "Switch to GRPO by setting grpo.adv_estimator.name to 'grpo' in your config."
             )
-        first_reward = next(iter(reward_components.values()))
-        valid = torch.ones_like(first_reward)
+        valid = torch.ones_like(repeated_batch[reward_component_keys[0]])
         leave_one_out = self.use_leave_one_out_baseline
         assert prompt_ids.shape[0] == valid.shape[0], (
             "prompt_ids must match reward batch size; "
             f"got {prompt_ids.shape[0]} vs {valid.shape[0]}"
         )
         advantage_parts = []
-        for key, r in sorted(reward_components.items()):
+        for key in reward_component_keys:
+            r = repeated_batch[key]
             base, std_k = calculate_baseline_and_std_per_prompt(
                 prompt_ids,
                 r,

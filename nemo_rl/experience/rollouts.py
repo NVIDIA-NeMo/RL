@@ -32,6 +32,7 @@ from pydantic import BaseModel
 from transformers import PreTrainedTokenizerBase
 from wandb import Histogram, Table
 
+from nemo_rl.algorithms.utils import get_gdpo_reward_component_keys
 from nemo_rl.data.interfaces import (
     DatumSpec,
     FlatMessagesType,
@@ -510,8 +511,9 @@ def calculate_rewards(
         future_to_indices[future] = indices
 
     results = ray.get(futures)
-    all_rewards: list = []  # list of per-sample scalars/tensors OR None (set below for dict rewards)
+    all_rewards: list = []  # list of per-sample scalars/tensors (single-reward envs)
     all_dict_rewards: dict[str, list] | None = None  # for dict-based multi-reward envs
+    is_dict_rewards = False
     all_env_observations = []
     all_terminateds = []
     all_next_stop_strings = []
@@ -532,23 +534,21 @@ def calculate_rewards(
         ) = result
 
         is_dict_rewards = isinstance(task_rewards, dict)
-        num_samples = (
-            len(next(iter(task_rewards.values())))
-            if is_dict_rewards
-            else len(task_rewards)
-        )
 
         if next_stop_strings is None:
-            next_stop_strings = [None] * num_samples
+            next_stop_strings = [None] * len(terminateds)
         if answers is None:
-            answers = [None] * num_samples
+            answers = [None] * len(terminateds)
+
+        # Initialize dict-reward accumulator on first encounter (outside inner loop).
+        if is_dict_rewards and all_dict_rewards is None:
+            all_dict_rewards = {name: [] for name in task_rewards}
 
         # Store results with their original indices
         for i, idx in enumerate(indices):
             all_indices_order.append(idx)
             if is_dict_rewards:
-                if all_dict_rewards is None:
-                    all_dict_rewards = {name: [] for name in task_rewards}
+                assert all_dict_rewards is not None
                 for name in task_rewards:
                     all_dict_rewards[name].append(task_rewards[name][i])
             else:
@@ -565,7 +565,8 @@ def calculate_rewards(
     )
 
     # Build rewards: dict-based for multi-reward envs, tensor for single-reward.
-    if all_dict_rewards is not None:
+    if is_dict_rewards:
+        assert all_dict_rewards is not None
         rewards: torch.Tensor | dict[str, torch.Tensor] = {
             name: torch.stack([vals[i] for i in sorted_indices])
             for name, vals in all_dict_rewards.items()
@@ -1221,8 +1222,7 @@ def run_async_multi_turn_rollout(
             set(
                 k
                 for state in final_sample_states
-                for k in state
-                if isinstance(k, str) and k.startswith("reward/")
+                for k in get_gdpo_reward_component_keys(state)
             )
         )
         for key in reward_component_keys:

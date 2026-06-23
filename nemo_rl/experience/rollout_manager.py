@@ -196,6 +196,8 @@ class AsyncRolloutImpl:
 
             # Update reward and termination statistics
             # Per-prompt rollouts always use single-reward (Tensor), not dict.
+            # Multi-reward isn't supported in RolloutManager now, see
+            # https://github.com/NVIDIA-NeMo/RL/issues/2625 for more details.
             assert isinstance(env_output.rewards, torch.Tensor)
             total_reward += float(env_output.rewards[0].item())
             terminated = env_output.terminateds[0].item()
