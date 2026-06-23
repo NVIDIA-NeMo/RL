@@ -6,25 +6,40 @@ This guide explains how to post-train the Nemotron 3 Super model using NeMo RL.
 
 ## Container
 
-All training stages use the pre-built NeMo RL container:
+The released NeMo RL base container is:
 
 ```
-nvcr.io/nvidia/nemo-rl:v0.5.0.nemotron_3_super
+nvcr.io/nvidia/nemo-rl:v0.7.0
 ```
 
-**Note:** This container is built for **x86_64 (amd64)** only. To build the container yourself (e.g. for ARM), use the [`docker/Dockerfile`](../../docker/Dockerfile):
+To reduce launch-time setup, prebake the NeMo-Gym virtual environments into a derived image:
 
 ```bash
-docker buildx build --target release \
-    --build-arg MAX_JOBS=4 \
-    --build-arg BUILD_CUSTOM_VLLM=1 \
-    --build-arg SKIP_SGLANG_BUILD=1 \
-    --build-arg BUILD_CUSTOM_VLLM_URL=https://github.com/CentML/vllm.git \
-    --build-arg BUILD_CUSTOM_VLLM_REF=nemotron-h-rl-2-mtp-fix-2 \
-    --build-arg BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION=https://github.com/vllm-project/vllm/releases/download/v0.13.0/vllm-0.13.0-cp38-abi3-manylinux_2_31_x86_64.whl \
-    --build-context nemo-rl=. -f docker/Dockerfile \
-    --tag nemo-rl:v0.5.0.nemotron_3_super .
+docker buildx build \
+  -t your-registry/nemo-rl:v0.7.0.prefetched_venvs \
+  --push \
+  -f- . <<'EOF'
+FROM nvcr.io/nvidia/nemo-rl:v0.7.0
+
+ARG NEMO_GYM_CUDA=cu130
+ARG NEMO_GYM_VLLM_VERSION=0.17.0
+ARG WHEEL_ARCH=x86_64
+RUN <<'RUNEOF' bash -exu -o pipefail
+cd /opt/nemo-rl
+GYM_VLLM_OVERRIDE=/opt/nemo-rl/.gym-vllm-override.txt
+printf 'vllm @ https://github.com/vllm-project/vllm/releases/download/v%s/vllm-%s+%s-cp38-abi3-manylinux_2_35_%s.whl\n' \
+    "${NEMO_GYM_VLLM_VERSION}" "${NEMO_GYM_VLLM_VERSION}" "${NEMO_GYM_CUDA}" "${WHEEL_ARCH}" > "${GYM_VLLM_OVERRIDE}"
+
+UV_TORCH_BACKEND="${NEMO_GYM_CUDA}" \
+UV_OVERRIDE="${GYM_VLLM_OVERRIDE}" \
+UV_LINK_MODE=symlink uv run python examples/nemo_gym/prefetch_venvs.py \
+    examples/nemo_gym/prefetch_super_all_envs.yaml
+rm -f "${GYM_VLLM_OVERRIDE}"
+RUNEOF
+EOF
 ```
+
+Push the derived image to a registry visible to the training cluster and use it as `CONTAINER` in the launch commands below.
 
 ## Download and prepare the data
 
@@ -48,9 +63,8 @@ done
 ```
 
 ## Prepare the code
-Training Nemotron 3 Super currently requires the `super-v3` branch.
 ```bash
-git clone --recursive -b super-v3 https://github.com/NVIDIA-NeMo/RL.git
+git clone --recursive https://github.com/NVIDIA-NeMo/RL.git
 cd RL
 ```
 
@@ -63,8 +77,6 @@ RL training for Nemotron 3 Super consists of 3 main stages:
 3. RLHF with length penalty to reduce verbosity
 
 The RLVR stage consists of 3 sub-stages with different data blends and the SWE RL stage consists of 2 sub-stages, for 6 total stages.
-
-**Note:** vLLM versions prior to 0.17.0 have a bug that causes logprob values to diverge between vLLM and Megatron for certain sequences, which can lead to training instability. To work around this, the recipes below set `seq_logprob_error_threshold: 2` to mask out sequences where the logprob mismatch exceeds the threshold. This bug is fixed in vLLM 0.17.0 and will be incorporated in the Nemotron 3 Ultra release.
 
 ### Build sandbox container
 
@@ -97,7 +109,7 @@ Each stage is launched with `super_launch.sh`. Set the following variables befor
 
 `MODEL_PATH` is the input checkpoint for each stage. Stage 1.1 starts from the SFT checkpoint; every subsequent stage takes the output of the previous one.
 
-The launch examples below use the H100 prod configs. These configs keep the old release train-DP and generation-DP footprint while using H100-compatible TP/CP/EP and vLLM TP settings. For stages with GPU judge servers, set `SBATCH_NUM_NODES` to the total node count so SLURM allocates both the NeMo-RL nodes and the extra NeMo-Gym nodes. Lower-DP H100 variants are available under `examples/nemo_gym/nemotron-3-super/small_scale/`.
+The launch examples below use the H100 prod configs. For stages with GPU judge servers, set `SBATCH_NUM_NODES` to the total node count so SLURM allocates both the NeMo-RL nodes and the extra NeMo-Gym nodes. Lower-DP H100 variants are available under `examples/nemo_gym/nemotron-3-super/small_scale/`.
 
 ### Stage 1 - RLVR
 
@@ -108,7 +120,7 @@ CONFIG_PATH=examples/nemo_gym/nemotron-3-super/stage1_rlvr.yaml \
 MODEL_PATH=/path/to/sft_checkpoint \
 TRAIN_PATH=$DATA_DIR/rlvr1/train-split.jsonl \
 VAL_PATH=$DATA_DIR/rlvr1/val-split.jsonl \
-CONTAINER=nvcr.io/nvidia/nemo-rl:v0.5.0.nemotron_3_super \
+CONTAINER=your-registry/nemo-rl:v0.7.0.prefetched_venvs \
 SANDBOX_CONTAINER=$SANDBOX_CONTAINER \
 PERSISTENT_CACHE=$PERSISTENT_CACHE \
 EXTRA_MOUNTS=$EXTRA_MOUNTS \
@@ -125,7 +137,7 @@ CONFIG_PATH=examples/nemo_gym/nemotron-3-super/stage1_rlvr.yaml \
 MODEL_PATH=/path/to/rlvr1_checkpoint \
 TRAIN_PATH=$DATA_DIR/rlvr2/train-split.jsonl \
 VAL_PATH=$DATA_DIR/rlvr2/val-split.jsonl \
-CONTAINER=nvcr.io/nvidia/nemo-rl:v0.5.0.nemotron_3_super \
+CONTAINER=your-registry/nemo-rl:v0.7.0.prefetched_venvs \
 SANDBOX_CONTAINER=$SANDBOX_CONTAINER \
 PERSISTENT_CACHE=$PERSISTENT_CACHE \
 EXTRA_MOUNTS=$EXTRA_MOUNTS \
@@ -142,7 +154,7 @@ CONFIG_PATH=examples/nemo_gym/nemotron-3-super/stage1_rlvr.yaml \
 MODEL_PATH=/path/to/rlvr2_checkpoint \
 TRAIN_PATH=$DATA_DIR/rlvr3/train-split.jsonl \
 VAL_PATH=$DATA_DIR/rlvr3/val-split.jsonl \
-CONTAINER=nvcr.io/nvidia/nemo-rl:v0.5.0.nemotron_3_super \
+CONTAINER=your-registry/nemo-rl:v0.7.0.prefetched_venvs \
 SANDBOX_CONTAINER=$SANDBOX_CONTAINER \
 PERSISTENT_CACHE=$PERSISTENT_CACHE \
 EXTRA_MOUNTS=$EXTRA_MOUNTS \
@@ -154,31 +166,6 @@ bash super_launch.sh
 
 ### Stage 2 - SWE
 
-#### Rebuild the container for SWE
-
-The SWE stages require additional virtual environments that are not included in the base container. Rebuild the container to pre-fetch them:
-
-```text
-docker buildx build \
-  -t your-registry/nemo-rl:v0.5.0.nemotron_3_super_swe \
-  --push \
-  -f- . <<'EOF'
-FROM nvcr.io/nvidia/nemo-rl:v0.5.0.nemotron_3_super
-
-RUN <<'RUNEOF'
-set -euxo pipefail
-
-UV_TORCH_BACKEND=$(uv run python -c "import tomllib,pathlib; indexes=tomllib.loads(pathlib.Path('pyproject.toml').read_text())['tool']['uv']['index']; print(next(i['name'].removeprefix('pytorch-') for i in indexes if i['name'].startswith('pytorch-')))") \
-UV_LINK_MODE=hardlink uv run python examples/nemo_gym/prefetch_venvs.py \
-    examples/nemo_gym/nemotron-3-super/stage2_swe1.yaml \
-    examples/nemo_gym/nemotron-3-super/stage2_swe2.yaml
-
-RUNEOF
-EOF
-```
-
-Use the resulting image as `$SWE_CONTAINER` in the Stage 2 launch commands below.
-
 #### Stage 2.1 - SWE 1 (64 H100 GPU nodes)
 ```bash
 EXP_NAME=stage2.1-swe1 \
@@ -186,7 +173,7 @@ CONFIG_PATH=examples/nemo_gym/nemotron-3-super/stage2_swe1.yaml \
 MODEL_PATH=/path/to/rlvr3_checkpoint \
 TRAIN_PATH=$DATA_DIR/swe1/train-split.jsonl \
 VAL_PATH=$DATA_DIR/swe1/val-split.jsonl \
-CONTAINER=$SWE_CONTAINER \
+CONTAINER=your-registry/nemo-rl:v0.7.0.prefetched_venvs \
 SANDBOX_CONTAINER=$SANDBOX_CONTAINER \
 PERSISTENT_CACHE=$PERSISTENT_CACHE \
 EXTRA_MOUNTS=$EXTRA_MOUNTS \
@@ -221,7 +208,7 @@ CONFIG_PATH=examples/nemo_gym/nemotron-3-super/stage2_swe2.yaml \
 MODEL_PATH=/path/to/swe1_checkpoint \
 TRAIN_PATH=$DATA_DIR/swe2/train-split.jsonl \
 VAL_PATH=$DATA_DIR/swe2/val-split.jsonl \
-CONTAINER=$SWE_CONTAINER \
+CONTAINER=your-registry/nemo-rl:v0.7.0.prefetched_venvs \
 SANDBOX_CONTAINER=$SANDBOX_CONTAINER \
 PERSISTENT_CACHE=$PERSISTENT_CACHE \
 EXTRA_MOUNTS=$EXTRA_MOUNTS \
@@ -238,7 +225,7 @@ CONFIG_PATH=examples/nemo_gym/nemotron-3-super/stage3_rlhf.yaml \
 MODEL_PATH=/path/to/swe2_checkpoint \
 TRAIN_PATH=$DATA_DIR/rlhf/train-split.jsonl \
 VAL_PATH=$DATA_DIR/rlhf/val-split.jsonl \
-CONTAINER=nvcr.io/nvidia/nemo-rl:v0.5.0.nemotron_3_super \
+CONTAINER=your-registry/nemo-rl:v0.7.0.prefetched_venvs \
 SANDBOX_CONTAINER=$SANDBOX_CONTAINER \
 PERSISTENT_CACHE=$PERSISTENT_CACHE \
 EXTRA_MOUNTS=$EXTRA_MOUNTS \

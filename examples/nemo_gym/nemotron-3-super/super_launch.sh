@@ -20,12 +20,14 @@ while [[ "${MODEL_PATH}" == */ && "${MODEL_PATH}" != "/" ]]; do
 done
 
 # ---- Optional vars with defaults ----
-WANDB_PROJ="${WANDB_PROJ:-super-v3-posttraining}"
+WANDB_PROJ="${WANDB_PROJ:-nemotron-3-super-posttraining}"
 SLURM_TIME_LIMIT="${SLURM_TIME_LIMIT:-4:0:0}"
 DRY_RUN="${DRY_RUN:-false}"
 # Existing code snapshots are reused by tools/code_snapshot.sh. Refresh tracked
 # files so restarts pick up dependency/code changes without deleting old logs.
 REFRESH_CODE_SNAPSHOT="${REFRESH_CODE_SNAPSHOT:-true}"
+# Run directly from the current checkout instead of creating/refreshing a code snapshot.
+SKIP_CODE_SNAPSHOT="${SKIP_CODE_SNAPSHOT:-false}"
 # Override Slurm node count independently of cluster.num_nodes in the config.
 # Use this when Gym judge servers need extra nodes beyond what NeMo-RL allocates
 # (e.g. SBATCH_NUM_NODES=21 with cluster.num_nodes=16 reserves 5 nodes for Gym).
@@ -75,6 +77,7 @@ echo " Rebuild Ray venvs: ${NRL_FORCE_REBUILD_VENVS}"
 echo " Partition  : ${SLURM_PARTITION}"
 echo " Account    : ${SLURM_ACCOUNT}"
 echo " Refresh snapshot: ${REFRESH_CODE_SNAPSHOT}"
+echo " Skip snapshot   : ${SKIP_CODE_SNAPSHOT}"
 echo "========================================"
 
 # ---- Create cache dirs ----
@@ -84,9 +87,14 @@ mkdir -p "${VLLM_CACHE_DIR}" "${FLASHINFER_CUBIN_CACHE}" "${FLASHINFER_WS_BASE}"
 export OMP_NUM_THREADS=16
 
 # ---- Code snapshot ----
-SNAPSHOT_DIR=$(realpath "$(bash "${CODE_DIR}/tools/code_snapshot.sh" "${EXP_NAME}")")
+if [[ "${SKIP_CODE_SNAPSHOT}" == true ]]; then
+    SNAPSHOT_DIR="${CODE_DIR}"
+    echo "Skipping code snapshot; running from current checkout: ${SNAPSHOT_DIR}"
+else
+    SNAPSHOT_DIR=$(realpath "$(bash "${CODE_DIR}/tools/code_snapshot.sh" "${EXP_NAME}")")
+fi
 
-if [[ "${REFRESH_CODE_SNAPSHOT}" == true ]]; then
+if [[ "${SKIP_CODE_SNAPSHOT}" != true && "${REFRESH_CODE_SNAPSHOT}" == true ]]; then
     echo "Refreshing tracked files in code snapshot: ${SNAPSHOT_DIR}"
     (
         cd "${CODE_DIR}"
@@ -96,7 +104,6 @@ fi
 
 cd "${SNAPSHOT_DIR}"
 
-export VLLM_PRECOMPILED_WHEEL_LOCATION="https://github.com/vllm-project/vllm/releases/download/v0.13.0/vllm-0.13.0-cp38-abi3-manylinux_2_31_x86_64.whl"
 export RAY_DEDUP_LOGS=1
 
 # ---- Sandbox configuration ----
@@ -106,29 +113,6 @@ export NEMO_SKILLS_SANDBOX_PORT=6000
 export SANDBOX_CONTAINER
 export SANDBOX_COMMAND="/start-with-nginx.sh"
 export SANDBOX_ENV_VARS="NEMO_SKILLS_SANDBOX_PORT=${NEMO_SKILLS_SANDBOX_PORT}"
-
-# ---- SWeRL Apptainer setup ----
-read -r -d '' SETUP_COMMAND <<'SETUP_EOF' || true
-apt-get update && apt-get install -y git build-essential gcc wget
-RET=1
-while [ $RET -ne 0 ]; do
-  cd /tmp && \
-  wget --no-check-certificate https://github.com/apptainer/apptainer/releases/download/v1.3.1/apptainer_1.3.1_amd64.deb && \
-  apt install -y ./apptainer_1.3.1_amd64.deb && \
-  ln -sf /usr/bin/apptainer /usr/bin/singularity
-  if command -v apptainer >/dev/null 2>&1; then
-    echo "apptainer installed successfully."
-    RET=0
-  else
-    echo "apptainer NOT installed. Retrying in 10 seconds..."
-    sleep 10
-    RET=1
-  fi
-done
-SETUP_EOF
-SETUP_COMMAND="${SETUP_COMMAND}
-cd ${SNAPSHOT_DIR}"
-export SETUP_COMMAND
 
 # ---- Build the run command ----
 export COMMAND="export HF_MODULES_CACHE=${HF_MODULES_CACHE_DIR} ; \
@@ -150,8 +134,6 @@ export COMMAND="export HF_MODULES_CACHE=${HF_MODULES_CACHE_DIR} ; \
     NRL_FORCE_REBUILD_VENVS=${NRL_FORCE_REBUILD_VENVS} \
     RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 \
     UV_HTTP_TIMEOUT=${UV_HTTP_TIMEOUT} \
-    VLLM_USE_PRECOMPILED=1 \
-    VLLM_PRECOMPILED_WHEEL_LOCATION=${VLLM_PRECOMPILED_WHEEL_LOCATION} \
     PYTHONPATH=${SNAPSHOT_DIR}:\${PYTHONPATH:-} \
     python ./examples/nemo_gym/run_grpo_nemo_gym.py \
     --config ${CONFIG_PATH} \
