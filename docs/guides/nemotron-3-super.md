@@ -14,7 +14,7 @@ nvcr.io/nvidia/nemo-rl:v0.7.0
 
 To reduce launch-time setup, prebake the NeMo-Gym virtual environments into a derived image:
 
-```bash
+```text
 docker buildx build \
   -t your-registry/nemo-rl:v0.7.0.prefetched_venvs \
   --push \
