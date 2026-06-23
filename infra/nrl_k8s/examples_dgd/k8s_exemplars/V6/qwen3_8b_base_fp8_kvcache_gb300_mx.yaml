@@ -33,7 +33,7 @@ spec:
             persistentVolumeClaim:
               claimName: rl-workspace
         mainContainer:
-          image: jwillthomson/dynamo-arm-tokenize-endpoint-7da82a91
+          image: jwillthomson/dynamo-arm-tokenize-endpoint-9dd7a80
           workingDir: /workspace
           volumeMounts:
             - mountPath: /mnt/rl-workspace
@@ -83,7 +83,7 @@ spec:
             persistentVolumeClaim:
               claimName: rl-workspace
         mainContainer:
-          image: jwillthomson/dynamo-arm-tokenize-endpoint-7da82a91
+          image: jwillthomson/dynamo-arm-tokenize-endpoint-9dd7a80
           workingDir: /workspace
           volumeMounts:
             - mountPath: /mnt/rl-workspace

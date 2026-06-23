@@ -2,7 +2,7 @@
 # GB300 nodes in this profile expose 4 GPUs, so this k8s smoke runs the
 # source recipe's TP=4 Megatron policy on one 4-GPU node.
 #
-# Run from the V6 worktree:
+# Run from the NeMo-RL repo root:
 #   RECIPE=infra/nrl_k8s/examples/k8s_exemplars/V6/grpo_qwen3_8b_base_fp8_kvcache_dynamo_mx.yaml
 #   INFRA=infra/nrl_k8s/examples/k8s_exemplars/V6/grpo_qwen3_8b_base_fp8_kvcache_dynamo_mx.gb300.infra.yaml
 #   nrl-k8s check $RECIPE --infra $INFRA
@@ -56,7 +56,7 @@ _shared:
     - {containerPort: 10001, name: client}
   codeMounts: &code_mounts
     - {mountPath: /dev/shm,          name: dshm}
-    - {mountPath: /opt/nemo-rl,      name: rl-workspace, subPath: "${user:}/nemo-rl-v6-dynamo-fp8"}
+    - {mountPath: /opt/nemo-rl,      name: rl-workspace, subPath: "${user:}/nemo-rl"}
     - {mountPath: /mnt/rl-workspace, name: rl-workspace}
   headVolumes: &head_volumes
     - name: dshm
