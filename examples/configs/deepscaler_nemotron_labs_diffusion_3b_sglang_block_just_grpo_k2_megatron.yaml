@@ -25,7 +25,7 @@ policy:
     sglang_cfg:
       # Must match reveal_tokens_per_level via tokens_per_step=2 (block_size/k=8
       # leftmost steps, both tokens per step scored from the same forward).
-      dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL-block-justgrpo-reveal-k/tools/nemotron_diffusion/block_just_grpo_leftmost_dllm_bs16_k2.yaml"
+      dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL/tools/nemotron_diffusion/block_just_grpo_leftmost_dllm_bs16_k2.yaml"
 
 checkpointing:
   checkpoint_dir: "results/grpo-nemotron-diffusion-3b-block-just-grpo-k2-deepscaler-megatron"

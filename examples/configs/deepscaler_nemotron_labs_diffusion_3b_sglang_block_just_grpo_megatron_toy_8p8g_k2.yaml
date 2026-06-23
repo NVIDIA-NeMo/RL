@@ -9,7 +9,7 @@ policy:
   generation:
     max_new_tokens: 512
     sglang_cfg:
-      dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL-block-justgrpo-reveal-k/tools/nemotron_diffusion/block_just_grpo_leftmost_dllm_bs16_k2.yaml"
+      dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL/tools/nemotron_diffusion/block_just_grpo_leftmost_dllm_bs16_k2.yaml"
   logprob_estimation:
     reveal_tokens_per_level: 2
 
