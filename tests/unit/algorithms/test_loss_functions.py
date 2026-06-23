@@ -20,6 +20,7 @@ from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
     ClippedPGLossFn,
     DistillationLossFn,
+    DPOLossConfig,
     DPOLossFn,
     NLLLossFn,
     prepare_loss_input,
@@ -133,13 +134,13 @@ def test_dpo_loss():
         batch_size=batch_size,
     )
     loss_fn = DPOLossFn(
-        cfg={
-            "reference_policy_kl_penalty": 0.0,
-            "preference_loss_weight": 1.0,
-            "sft_loss_weight": 0.0,
-            "preference_average_log_probs": False,
-            "sft_average_log_probs": False,
-        }
+        cfg=DPOLossConfig(
+            reference_policy_kl_penalty=0.0,
+            preference_loss_weight=1.0,
+            sft_loss_weight=0.0,
+            preference_average_log_probs=False,
+            sft_average_log_probs=False,
+        )
     )
 
     loss_input, data = prepare_loss_input(next_token_logits, data, loss_fn)
@@ -156,13 +157,13 @@ def test_dpo_loss():
     assert torch.isclose(loss.cpu(), -torch.nn.functional.logsigmoid(torch.tensor(0.0)))
 
     loss_fn_with_sft = DPOLossFn(
-        cfg={
-            "reference_policy_kl_penalty": 0.0,
-            "preference_loss_weight": 1.0,
-            "sft_loss_weight": 0.5,
-            "preference_average_log_probs": False,
-            "sft_average_log_probs": False,
-        }
+        cfg=DPOLossConfig(
+            reference_policy_kl_penalty=0.0,
+            preference_loss_weight=1.0,
+            sft_loss_weight=0.5,
+            preference_average_log_probs=False,
+            sft_average_log_probs=False,
+        )
     )
 
     loss_input, data = prepare_loss_input(next_token_logits, data, loss_fn_with_sft)
@@ -198,22 +199,22 @@ def test_dpo_loss_varying_sequence_lengths():
 
     # Create DPO loss function with preference_average_log_probs=True
     dpo_loss_fn_no_avg = DPOLossFn(
-        {
-            "reference_policy_kl_penalty": 0.1,
-            "preference_loss_weight": 1.0,
-            "sft_loss_weight": 0.5,
-            "preference_average_log_probs": False,
-            "sft_average_log_probs": False,
-        }
+        DPOLossConfig(
+            reference_policy_kl_penalty=0.1,
+            preference_loss_weight=1.0,
+            sft_loss_weight=0.5,
+            preference_average_log_probs=False,
+            sft_average_log_probs=False,
+        )
     )
     dpo_loss_fn_avg = DPOLossFn(
-        {
-            "reference_policy_kl_penalty": 0.1,
-            "preference_loss_weight": 1.0,
-            "sft_loss_weight": 0.5,
-            "preference_average_log_probs": True,
-            "sft_average_log_probs": True,
-        }
+        DPOLossConfig(
+            reference_policy_kl_penalty=0.1,
+            preference_loss_weight=1.0,
+            sft_loss_weight=0.5,
+            preference_average_log_probs=True,
+            sft_average_log_probs=True,
+        )
     )
 
     # Create test data with varying sequence lengths
@@ -336,13 +337,13 @@ def test_dpo_sft_matches_nll_loss():
 
     # Compute DPO loss with preference_loss_weight=0
     dpo_loss_fn = DPOLossFn(
-        cfg={
-            "reference_policy_kl_penalty": 0.0,
-            "preference_loss_weight": 0.0,  # Disable preference loss
-            "sft_loss_weight": 1.0,  # Only use SFT loss
-            "preference_average_log_probs": False,
-            "sft_average_log_probs": False,
-        }
+        cfg=DPOLossConfig(
+            reference_policy_kl_penalty=0.0,
+            preference_loss_weight=0.0,  # Disable preference loss
+            sft_loss_weight=1.0,  # Only use SFT loss
+            preference_average_log_probs=False,
+            sft_average_log_probs=False,
+        )
     )
     loss_input, dpo_data = prepare_loss_input(next_token_logits, dpo_data, dpo_loss_fn)
     dpo_loss, _ = dpo_loss_fn(

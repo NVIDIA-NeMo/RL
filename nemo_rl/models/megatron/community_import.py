@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import os
-from pathlib import Path
 from typing import Any, Callable, Optional
 
 import torch
@@ -155,6 +154,13 @@ def import_model_from_hf_name(
 
     megatron.core.rerun_state_machine.destroy_rerun_state_machine()
 
+    # The seeding above created the global RNG tracker with default flags.
+    # Such a stale tracker will ignore flags that the real model build requests later.
+    from megatron.core.tensor_parallel import random as mcore_random
+
+    mcore_random._CUDA_RNG_STATE_TRACKER = None
+    mcore_random._CUDA_RNG_STATE_TRACKER_INITIALIZED = False
+
 
 def export_model_from_megatron(
     hf_model_name: str,
@@ -200,77 +206,3 @@ def export_model_from_megatron(
     import megatron.core.rerun_state_machine
 
     megatron.core.rerun_state_machine.destroy_rerun_state_machine()
-
-
-def extract_value_head_from_hf_checkpoint(
-    hf_model_path: str,
-) -> dict[str, torch.Tensor]:
-    """Extract value head weights (score.*) from a local HF checkpoint directory.
-
-    Supports both safetensors and pytorch_model.bin formats.
-
-    Note:
-        Unlike most other ``config["model_name"]`` consumers in NeMo-RL (which
-        go through HF ``from_pretrained`` and transparently handle hub IDs),
-        this function reads files directly off disk via ``Path.glob`` and only
-        accepts a local checkpoint directory. If you want to initialize the
-        value head from a hub-only model, run
-        ``huggingface_hub.snapshot_download(repo_id=...)`` first and pass the
-        resulting local directory.
-
-    Args:
-        hf_model_path: Path to a local HuggingFace checkpoint directory.
-
-    Returns:
-        Dict mapping score key names to tensors, e.g.
-        {"score.weight": tensor, "score.bias": tensor}.
-
-    Raises:
-        ValueError: If ``hf_model_path`` is not an existing local directory.
-        FileNotFoundError: If the directory exists but contains no checkpoint files.
-        ValueError: If no score.* keys are found in the checkpoint.
-    """
-    model_path = Path(hf_model_path)
-    if not model_path.is_dir():
-        raise ValueError(
-            f"extract_value_head_from_hf_checkpoint requires a local checkpoint "
-            f"directory; got '{hf_model_path}'. If this is an HF Hub ID, "
-            f"snapshot_download it locally first and pass the resulting path. "
-            f"(Other 'model_name' consumers in NeMo-RL accept hub IDs, but this "
-            f"helper reads files directly off disk.)"
-        )
-    score_weights: dict[str, torch.Tensor] = {}
-
-    # Try safetensors first
-    try:
-        from safetensors import safe_open
-
-        safetensor_files = sorted(model_path.glob("*.safetensors"))
-        if safetensor_files:
-            for sf_file in safetensor_files:
-                with safe_open(str(sf_file), framework="pt", device="cpu") as f:
-                    for key in f.keys():
-                        if key.startswith("score."):
-                            score_weights[key] = f.get_tensor(key)
-            if score_weights:
-                return score_weights
-    except ImportError:
-        pass
-
-    # Fall back to pytorch_model.bin
-    bin_path = model_path / "pytorch_model.bin"
-    if bin_path.exists():
-        state_dict = torch.load(str(bin_path), map_location="cpu", weights_only=True)
-        for key, tensor in state_dict.items():
-            if key.startswith("score."):
-                score_weights[key] = tensor
-        if score_weights:
-            return score_weights
-
-    if not list(model_path.glob("*.safetensors")) and not bin_path.exists():
-        raise FileNotFoundError(f"No checkpoint files found in {hf_model_path}")
-
-    raise ValueError(
-        f"No score.* keys found in checkpoint at {hf_model_path}. "
-        "The checkpoint may not contain value head weights."
-    )

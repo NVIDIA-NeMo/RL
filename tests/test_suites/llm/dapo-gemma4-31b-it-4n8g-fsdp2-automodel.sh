@@ -3,11 +3,11 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
-NUM_NODES=1
-STEPS_PER_RUN=500
-MAX_STEPS=500
+NUM_NODES=4
+STEPS_PER_RUN=20
+MAX_STEPS=20
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-NUM_MINUTES=180  # bumped from 120: ~18.5s/step without piecewise CUDA graphs
+NUM_MINUTES=240
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached
@@ -33,11 +33,14 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
+    # Thresholds calibrated from the offpolicy baseline run (wandb project
+    # nemorl-gemma4-support, display name dapo-gemma4-31b-it-4n8g-fsdp2-automodel-offpolicy).
     uv run tests/check_metrics.py $JSON_METRICS \
-        'median(data["train/token_mult_prob_error"]) < 1.1' \
-        'mean(data["timing/train/total_step_time"], 2) < 30'
+        'median(data["train/token_mult_prob_error"]) < 1.05' \
+        'mean(data["train/gen_kl_error"]) < 0.002' \
+        'data["train/reward"]["20"] > 0.1' \
+        'data["train/filtered_reward"]["20"] > -0.35'
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"
 fi
-
