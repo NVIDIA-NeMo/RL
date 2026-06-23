@@ -6,6 +6,13 @@ policy:
     # DeepEP is supported for Ampere, Hopper, and Blackwell (B200/B300) GPUs
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
+  generation:
+    vllm_cfg:
+      # DeepSeek-V3 moe_intermediate_size is 2048; with expert_parallel_size=1
+      # vLLM shards it across TP, and the Blackwell MoE GEMM requires the
+      # per-rank intermediate be a multiple of 128. The inherited TP=32 gives
+      # 2048/32=64 and fails on GB200, so cap TP at 16 (2048/16=128).
+      tensor_parallel_size: 16
 checkpointing:
   checkpoint_dir: results/grpo-dapomath17k-dsv3-32n4g-megatron
 logger:
