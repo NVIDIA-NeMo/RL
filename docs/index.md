@@ -284,7 +284,7 @@ guides/eval.md
 guides/deepseek.md
 guides/models/index.md
 guides/models/qwen/index.md
-guides/models/qwen/qwen3.5.md
+guides/models/qwen/qwen3-5.md
 model-quirks.md
 guides/async-grpo.md
 guides/quantization-aware-rl.md
