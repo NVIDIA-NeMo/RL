@@ -445,7 +445,14 @@ class PolicyConfig(TypedDict):
     make_sequence_length_divisible_by: int
     max_total_sequence_length: int
     offload_optimizer_for_logprob: bool
+    # Pin optimizer state tensors in CPU memory during D2H/H2D transfers so
+    # DMA can overlap with other work. Beneficial for colocated/syncRL runs
+    # that offload the optimizer every step. Adds per-tensor pinned allocations.
     use_pinned_optimizer_offload: bool
+    # Pack all optimizer state into one pre-allocated pinned CPU buffer to
+    # eliminate per-tensor cudaHostAlloc overhead. Requires
+    # use_pinned_optimizer_offload=True. Faster than per-tensor pinning but
+    # allocates a single contiguous region that may OOM on very large models.
     use_coalesced_optimizer_offload: bool
     # This sets the clipping norm for the DTensorPolicyWorkers (Megatron's is called clip_grad)
     max_grad_norm: NotRequired[float | int | None]

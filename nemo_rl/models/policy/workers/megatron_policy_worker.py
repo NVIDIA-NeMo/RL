@@ -271,6 +271,13 @@ class MegatronPolicyWorkerImpl(
         self.cfg = config
         self._router_replay_enabled = router_replay_enabled(config)
 
+        if config.get("use_coalesced_optimizer_offload") and not config.get(
+            "use_pinned_optimizer_offload"
+        ):
+            raise ValueError(
+                "use_coalesced_optimizer_offload requires use_pinned_optimizer_offload=True."
+            )
+
         # Set rank for non-collocated to check which ranks to broadcast from
         self.rank = get_rank_safe()
 
@@ -1406,23 +1413,14 @@ class MegatronPolicyWorkerImpl(
             f"[_clear_fp8_caches] Cleared {workspace_count} workspace modules on rank {self.rank}"
         )
 
-    @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
-    def offload_before_refit(self):
-        """Offload the optimizer and buffers to the CPU."""
-        no_grad = torch.no_grad()
-        no_grad.__enter__()
-        allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
-        reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
-        print(
-            f"GPU Memory before optimizer offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
-        )
-        self.model = self.move_model(
-            self.model, "cpu", move_params=False, move_grads=True
-        )  # get rid of grad buffers
+    def _clear_refit_memory_caches(self):
+        """Clear optional GPU memory caches that can cause creep for fp8/MoE models.
 
+        Called by both offload_before_refit and offload_after_refit so neither
+        diverges from the other on cache-cleanup behaviour.
+        """
         # When True, clear Transformer Engine's per-module _fp8_workspaces scratch
-        # buffers in offload_before_refit (before weight transfer to the inference
-        # engine).
+        # buffers before weight transfer to the inference engine.
         if self.fp8_cfg and self.fp8_cfg.get("force_clear_fp8_caches", False):
             self._clear_fp8_caches()
 
@@ -1478,6 +1476,22 @@ class MegatronPolicyWorkerImpl(
             except Exception:
                 pass
 
+    @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
+    def offload_before_refit(self):
+        """Offload the optimizer and buffers to the CPU."""
+        no_grad = torch.no_grad()
+        no_grad.__enter__()
+        allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
+        reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
+        print(
+            f"GPU Memory before optimizer offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
+        )
+        self.model = self.move_model(
+            self.model, "cpu", move_params=False, move_grads=True
+        )  # get rid of grad buffers
+
+        self._clear_refit_memory_caches()
+
         torch.randn(1).cuda()  # wake up torch allocator
         if (
             hasattr(self, "optimizer")
@@ -1504,10 +1518,9 @@ class MegatronPolicyWorkerImpl(
         no_grad.__enter__()
         self.model = self.move_model(self.model, "cpu")
         self.model.eval()
-        # Offload grad buffers (params already on CPU from the move above).
-        self.model = self.move_model(
-            self.model, "cpu", move_params=False, move_grads=True
-        )
+
+        self._clear_refit_memory_caches()
+
         torch.randn(1).cuda()  # wake up torch allocator
         if (
             hasattr(self, "optimizer")
