@@ -1,23 +1,115 @@
-# Workplace-assistant + Dynamo MX refit smoke, routed through a hierarchical
-# **GlobalPlanner + GlobalRouter** topology.
+# Workplace-assistant + Dynamo MX refit through a hierarchical
+# GlobalPlanner/GlobalRouter topology.
 #
-# The trainer side is byte-for-byte the single-pool MX smoke
-# (grpo_workplace_assistant_dynamo_mx.yaml): DTensor GRPO with
-# cluster.weight_sync.method="mx" + the mx_config block. Nothing about the
-# trainer changes — DynamoGeneration is still a thin HTTP forwarder and MX
-# refit is receiver-side (the pool workers self-poll the MX server), so the
-# trainer is oblivious to the routing topology in front of it.
-#
-# The ONLY difference is where generation lives: instead of one DGD with a
-# Frontend + worker, this run targets a control DGD (Frontend + GlobalRouter +
-# GlobalPlanner) backed by two agg pools. The dgd_name (→ control Frontend) is
-# injected at launch by the paired infra YAML's entrypoint, so this recipe
-# stays topology-agnostic.
-#
-# Run with:
+# Paired infra:
 #   infra/nrl_k8s/examples/grpo_workplace_assistant_dynamo_mx_gp.gb300.infra.yaml
+# Paired DGDs:
+#   infra/nrl_k8s/examples_dgd/qwen3_4b_thinking_gb300_mx_gp_{pool0,pool1,ctrl}.yaml
+#
+# The DGD name and refit worker namespaces are injected by the infra entrypoint.
 
-defaults: grpo_workplace_assistant_dynamo_mx.yaml
+defaults: grpo_workplace_assistant_nemotron_nano_v2_9b.yaml
+
+checkpointing:
+  enabled: false
+
+grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 2
+  max_rollout_turns: 1
+  max_num_steps: 2
+  val_period: 999999
+  val_at_start: false
+  val_at_end: false
+
+policy:
+  model_name: "Qwen/Qwen3-4B-Thinking-2507"
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs: null
+  train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}
+  train_micro_batch_size: 1
+  generation_batch_size: ${policy.train_global_batch_size}
+  logprob_batch_size: 1
+  max_total_sequence_length: 16384
+  precision: "bfloat16"
+
+  megatron_cfg:
+    enabled: false
+
+  dtensor_cfg:
+    _v2: false
+    enabled: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 1.0e-6
+      weight_decay: 0.0
+      betas: [0.9, 0.999]
+      eps: 1e-8
+  scheduler:
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: []
+
+  generation:
+    backend: "dynamo"
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: true
+      precision: ${policy.precision}
+      kv_cache_dtype: "auto"
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      gpu_memory_utilization: 0.75
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: false
+      expose_http_server: true
+    vllm_kwargs: {}
+    dynamo_cfg: {}
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 1
+        num_nodes: 1
+
+env:
+  nemo_gym:
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: true
+          extra_body:
+            chat_template_kwargs:
+              enable_thinking: true
+
+cluster:
+  gpus_per_node: 1
+  num_nodes: 1
+  weight_sync:
+    method: "mx"
+    mx_config:
+      enabled: true
+      mx_server_url: "modelexpress-server.default.svc.cluster.local:8001"
+      timeout_seconds: 300.0
+      same_rank_only: true
+      tree_scale_out: true
+      moe_expert_filter: false
+      nic_pin: "auto"
 
 logger:
-  log_dir: "logs/grpo-workplace-assistant-dynamo-mx-gp-smoke"
+  log_dir: "logs/grpo-workplace-assistant-dynamo-mx-gp"

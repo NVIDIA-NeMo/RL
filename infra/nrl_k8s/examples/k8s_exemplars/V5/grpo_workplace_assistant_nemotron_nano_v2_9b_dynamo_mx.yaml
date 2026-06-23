@@ -57,8 +57,6 @@ policy:
     stop_strings: null
     dynamo_cfg:
       request_timeout_s: 900.0
-      tool_call_parser: "nemotron_deci"
-      reasoning_parser: "nemotron_nano"
     vllm_cfg:
       async_engine: true
       precision: ${policy.precision}
@@ -116,4 +114,3 @@ cluster:
       tree_scale_out: false
       moe_expert_filter: false
       nic_pin: "auto"
-      retain_latest_k: 1

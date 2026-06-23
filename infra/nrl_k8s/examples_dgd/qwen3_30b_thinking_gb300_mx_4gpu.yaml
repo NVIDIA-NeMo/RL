@@ -1,7 +1,7 @@
 # DynamoGraphDeployment for Qwen3-30B-A3B-Thinking on GB300 (arm64), MX-enabled,
 # with KV-cache-aware routing — for the SWE2 async-GRPO replication.
 #
-# Derived from qwen3_4b_thinking_gb300_mx.yaml. Differences:
+# Derived from the standalone 4B MX DGD shape. Differences:
 #   * Model -> Qwen3-30B-A3B-Thinking-2507 (MoE); reasoning parser -> deepseek_r1
 #     (matches the SWE2 baseline, not qwen3).
 #   * **KV routing**: Frontend gets `--router-mode kv` (the one Dynamo feature
@@ -14,7 +14,7 @@
 #     would otherwise trip Hugging Face 429s (parity-run gotcha).
 #
 # MX refit wiring (DYN_MX_REFIT_ENABLED, MODEL_EXPRESS_URL, RoCE DRA, UCX/NIXL
-# env, modelexpress overlay) is unchanged from the 4B MX DGD.
+# env, baked-in modelexpress) is unchanged from the 4B MX DGD.
 #
 # Image expectations: worker image must include modelexpress (kavink @ e45a14f)
 # + bundled-UCX nixl wheel (see memory project_dyn_gp_planner_image_deps).
@@ -202,8 +202,6 @@ spec:
               value: "1"
             - name: TRANSFORMERS_OFFLINE
               value: "1"
-            # 8590c26 image has the venv-bundled UCX nixl; point NIXL at it
-            # (operator default /opt/nvidia/nvda_nixl/lib64/plugins lacks UCX).
             # NIXL_PLUGIN_DIR removed: be735142's nixl wheel bundles the UCX/NIXL
             # plugins and nixl auto-discovers them (probe confirmed the UCX backend
             # instantiates with this unset). The old /opt/dynamo/venv path is gone on

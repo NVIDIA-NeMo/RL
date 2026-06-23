@@ -12,10 +12,10 @@ into NemoRL's existing ColocatablePolicyInterface / GenerationInterface.
 
 Design pillars (see also the design doc):
 
-  1. Rank-to-rank publish — each trainer rank publishes ONLY its local DTensor
-     shard. No `tensor.full_tensor()` allgather. The same-rank inference peer
-     receives directly via NIXL RDMA. This is the lesson from PrimeRL's live
-     debug on GB200 (May 6, 2026), now applied as the default.
+  1. Rank-to-rank publish — each trainer rank publishes its assigned tensor
+     buffers and same-rank inference peers receive directly via NIXL RDMA. This
+     is the lesson from PrimeRL's live debug on GB200 (May 6, 2026), now applied
+     as the default.
 
   2. Tree fan-out — receivers republish themselves as `inference_replica`
      sources after a successful refit. Subsequent receivers can pull from
@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -75,13 +75,8 @@ class MxConfig:
         moe_expert_filter: if True, receivers request only the expert shards
             their EP rank owns. Requires the trainer to set per-layer
             ``owned_expert_ids``.
-        register_self_buffers: explicit list of receive-buffer names to
-            register with NIXL. If empty, the receiver registers all of
-            ``model.named_parameters()``.
         nic_pin: NIC pinning strategy passed to ``pin_local_nic``:
             ``"auto"`` (default) | ``"off"`` | concrete ``"mlx5_<i>"``.
-        retain_latest_k: TensorHub-style retention; not yet enforced server-side
-            but stashed in the trainer's identity for forward compat.
     """
 
     enabled: bool = False
@@ -90,9 +85,7 @@ class MxConfig:
     same_rank_only: bool = True
     tree_scale_out: bool = True
     moe_expert_filter: bool = True
-    register_self_buffers: list[str] = field(default_factory=list)
     nic_pin: str = "auto"
-    retain_latest_k: int = 1
 
     @classmethod
     def from_dict(cls, d: dict[str, Any] | None) -> "MxConfig":
@@ -105,9 +98,7 @@ class MxConfig:
             same_rank_only=bool(d.get("same_rank_only", True)),
             tree_scale_out=bool(d.get("tree_scale_out", True)),
             moe_expert_filter=bool(d.get("moe_expert_filter", True)),
-            register_self_buffers=list(d.get("register_self_buffers", []) or []),
             nic_pin=str(d.get("nic_pin", "auto")),
-            retain_latest_k=int(d.get("retain_latest_k", 1)),
         )
 
 
@@ -193,32 +184,6 @@ def build_v2_receiver(
     )
 
 
-def collect_named_local_shards(
-    model: "torch.nn.Module",
-    *,
-    target_dtype: "torch.dtype | None" = None,
-) -> list[tuple[str, "torch.Tensor"]]:
-    """Yield ``(name, local_shard_tensor)`` from ``model.state_dict()``.
-
-    For DTensors this calls ``tensor.to_local()`` (no allgather). For plain
-    tensors it returns them as-is. Optionally casts to ``target_dtype``.
-    """
-    import torch
-    from torch.distributed.tensor import DTensor
-
-    out: list[tuple[str, torch.Tensor]] = []
-    for name, tensor in model.state_dict().items():
-        if isinstance(tensor, DTensor):
-            local = tensor.to_local()
-        else:
-            local = tensor
-        if target_dtype is not None and local.is_floating_point():
-            local = local.to(target_dtype, non_blocking=True)
-        local = local.contiguous()
-        out.append((name, local))
-    return out
-
-
 def detect_moe_expert_layout(
     model: "torch.nn.Module",
     *,
@@ -259,7 +224,6 @@ __all__ = [
     "MxConfig",
     "build_v2_publisher",
     "build_v2_receiver",
-    "collect_named_local_shards",
     "detect_moe_expert_layout",
     "pin_local_nic",
 ]

@@ -245,10 +245,9 @@ policy:
       vllm_metrics_logger_interval: 0.5
       expose_http_server: true
     vllm_kwargs: {}
-    dynamo_cfg:
-      tool_call_parser: "hermes"
-      reasoning_parser: "deepseek_r1"
-      # frontend_port (8000) + namespace fall through to operator defaults.
+    # The infra entrypoint injects dgd_name. Tool and reasoning parsers live on
+    # the DGD worker via --dyn-tool-call-parser / --dyn-reasoning-parser.
+    dynamo_cfg: {}
     colocated:
       enabled: false
       # Unused on the Dynamo path (gen runs on the DGD), but required by schema.
@@ -358,7 +357,6 @@ cluster:
       # project_tree_scale_out_hurts_refit_perf). Flip on only with autoscaling.
       tree_scale_out: false
       nic_pin: "auto"
-      retain_latest_k: 1
 
 logger:
   log_dir: "logs/grpo-swe2-qwen3-30b-dynamo-mx"
