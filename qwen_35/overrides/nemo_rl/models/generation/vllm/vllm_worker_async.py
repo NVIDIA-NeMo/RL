@@ -615,7 +615,13 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             super().__init__(config, bundle_indices, fraction_of_gpus, seed)
             return
 
-        super().__init__(config, bundle_indices, fraction_of_gpus, seed, defer_model_load)
+        super().__init__(
+            config,
+            bundle_indices,
+            fraction_of_gpus,
+            seed,
+            defer_model_load=defer_model_load,
+        )
 
         if not self.is_model_owner or not defer_model_load:
             return
