@@ -334,6 +334,18 @@ class TestPenalizeEosToken:
         counts = apply_reward_penalties([result], self.CFG)
         assert result["full_result"]["reward"] == 1.0
 
+    def test_terminal_eos_not_penalized(self):
+        result = _make_result(
+            reward=1.0,
+            message_log=[
+                _msg("user", [100, 200]),
+                _msg("assistant", [300, 400, 2]),
+            ],
+        )
+        counts = apply_reward_penalties([result], self.CFG)
+        assert result["full_result"]["reward"] == 1.0
+        assert counts["eos_token"] == 0
+
     def test_eos_in_user_not_penalized(self):
         result = _make_result(
             reward=1.0,
@@ -357,18 +369,33 @@ class TestPenalizeEosToken:
         counts = apply_reward_penalties([result], cfg)
         assert result["full_result"]["reward"] == 0.0
 
-    def test_multi_turn_eos_in_second_turn(self):
+    def test_multi_turn_terminal_eos_not_penalized(self):
         result = _make_result(
             reward=1.0,
             message_log=[
                 _msg("user", [100]),
-                _msg("assistant", [300, 400]),  # turn 1 ok
+                _msg("assistant", [300, 2]),
                 _msg("user", [500]),
-                _msg("assistant", [600, 2]),  # turn 2 has EOS
+                _msg("assistant", [600, 2]),
+            ],
+        )
+        counts = apply_reward_penalties([result], self.CFG)
+        assert result["full_result"]["reward"] == 1.0
+        assert counts["eos_token"] == 0
+
+    def test_multi_turn_internal_eos_penalized(self):
+        result = _make_result(
+            reward=1.0,
+            message_log=[
+                _msg("user", [100]),
+                _msg("assistant", [300, 2]),
+                _msg("user", [500]),
+                _msg("assistant", [600, 2, 700]),
             ],
         )
         counts = apply_reward_penalties([result], self.CFG)
         assert result["full_result"]["reward"] == 0.0
+        assert counts["eos_token"] == 1
 
     def test_empty_generation_not_penalized(self):
         result = _make_result(
@@ -389,7 +416,7 @@ class TestPenalizeEosToken:
             reward=1.0,
             message_log=[
                 _msg("user", [100]),
-                _msg("assistant", [300, 2]),
+                _msg("assistant", [300, 2, 400]),
             ],
         )
         counts = apply_reward_penalties([result], cfg)
@@ -405,7 +432,7 @@ class TestPenalizeEosToken:
             reward=1.0,
             message_log=[
                 _msg("user", [100]),
-                _msg("assistant", [300, 2]),
+                _msg("assistant", [300, 2, 400]),
             ],
         )
         counts = apply_reward_penalties([result], cfg)
