@@ -1484,7 +1484,9 @@ def apply_reward_penalties(
 
       3. penalize_eos_token (token-based)
          The EOS token resolved from config override or tokenizer should never
-         appear in any assistant generation.
+         appear inside any assistant generation. A final EOS token is allowed
+         per assistant turn because vLLM/Gym may include the terminal stop
+         marker in generation_token_ids.
          Data: message_log[i]["token_ids"] where role == "assistant".
 
       4. penalize_malformed_think_tag (message flag + token/string fallback)
@@ -1598,7 +1600,11 @@ def apply_reward_penalties(
         for result in results:
             has_eos = False
             for msg in result["message_log"]:
-                if msg["role"] == "assistant" and eos_token_id in msg["token_ids"]:
+                if msg["role"] != "assistant":
+                    continue
+                # Allow a terminal EOS stop marker on each assistant turn, but
+                # penalize EOS emitted inside the assistant content.
+                if eos_token_id in msg["token_ids"][:-1]:
                     has_eos = True
                     break
             if has_eos:
