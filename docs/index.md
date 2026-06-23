@@ -121,11 +121,25 @@ Configure offline and online Eagle3 draft-model workflows to accelerate rollout 
 Train Qwen2.5-Omni-3B with GRPO on AVQA and evaluate on MMAU, following the R1-AQA approach.
 :::
 
+:::{grid-item-card} {octicon}`terminal` Two-Stage SWE RL (Qwen3 Thinking)
+:link: guides/swe-rl-qwen3
+:link-type: doc
+
+Train Qwen3-30B-A3B-Thinking into a SWE agent with a pivot stage plus end-to-end agentic RL on SWE-bench.
+:::
+
 :::{grid-item-card} {octicon}`plus-circle` Adding New Models
 :link: adding-new-models
 :link-type: doc
 
 Learn how to add support for new model architectures in NeMo RL.
+:::
+
+:::{grid-item-card} {octicon}`pulse` LoRA
+:link: guides/lora
+:link-type: doc
+
+Parameter-efficient fine-tuning with LoRA: backend support, DTensor vs Megatron schema comparison, config examples, and recipes.
 :::
 
 :::{grid-item-card} {octicon}`arrow-both` YaRN Long-Context Training
@@ -240,12 +254,15 @@ guides/sft-openmathinstruct2.md
 :hidden:
 
 guides/nemotron-3-nano.md
+guides/nemotron-3-nano-omni.md
 adding-new-models.md
 guides/sft.md
 guides/dpo.md
 guides/dapo.md
+guides/lora.md
 guides/cispo.md
 guides/prorlv2.md
+guides/swe-rl-qwen3.md
 guides/grpo.md
 guides/ppo.md
 guides/grpo-deepscaler.md
@@ -261,6 +278,7 @@ guides/quantization-aware-rl.md
 guides/eagle3-speculative-decoding.md
 guides/yarn-long-context.md
 guides/xtoken-off-policy-distillation.md
+guides/router-replay.md
 guides/muon-optimizer.md
 guides/dtensor-tp-accuracy.md
 guides/ft-launcher-guide.md
