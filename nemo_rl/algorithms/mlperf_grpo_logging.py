@@ -115,9 +115,6 @@ class MLPerfGRPOLogger:
     def constants(self) -> Any:
         return self.mllogger.constants
 
-    def _constant(self, name: str, fallback: str) -> str:
-        return str(getattr(self.constants, name, fallback))
-
     def _call(self, method_name: str, *args: Any, **kwargs: Any) -> None:
         method = getattr(self.mllogger, method_name)
         try:
@@ -139,7 +136,11 @@ class MLPerfGRPOLogger:
         metadata: Optional[dict[str, Any]] = None,
         unique: Optional[bool] = None,
     ) -> None:
-        kwargs: dict[str, Any] = {"key": key, "value": value, "metadata": metadata or {}}
+        kwargs: dict[str, Any] = {
+            "key": key,
+            "value": value,
+            "metadata": metadata or {},
+        }
         if unique is not None:
             kwargs["unique"] = unique
         self._call("event", **kwargs)
@@ -154,7 +155,7 @@ class MLPerfGRPOLogger:
         return val_period * self.global_batch_size
 
     def log_init_start(self) -> None:
-        self._start(self._constant("INIT_START", "init_start"))
+        self._start(self.constants.INIT_START)
 
     def log_hyperparams(
         self,
@@ -165,19 +166,19 @@ class MLPerfGRPOLogger:
         grpo_cfg = cfg["grpo"]
         policy_cfg = cfg["policy"]
         megatron_cfg = policy_cfg.get("megatron_cfg", {})
-        optimizer_cfg = megatron_cfg.get("optimizer", {}) or policy_cfg.get(
-            "optimizer", {}
-        )
+        optimizer_cfg = megatron_cfg.get("optimizer", {})
         scheduler_cfg = megatron_cfg.get("scheduler", {})
         generation_cfg = policy_cfg.get("generation", {})
+        backend_cfg = generation_cfg.get("vllm_cfg", {})
 
         benchmark = str(self.mlperf_config.get("benchmark", "grpo_nemo_gym"))
-        try:
+
+        if num_nodes := cfg.get("cluster", {}).get("num_nodes"):
             self.mllogger.mlperf_submission_log(
                 benchmark=benchmark,
-                num_nodes=cfg.get("cluster", {}).get("num_nodes"),
+                num_nodes=num_nodes,
             )
-        except TypeError:
+        else:
             self.mllogger.mlperf_submission_log(benchmark)
 
         train_samples = self._dataset_len(train_dataset)
@@ -189,79 +190,46 @@ class MLPerfGRPOLogger:
         if eval_samples is None:
             eval_samples = grpo_cfg.get("max_val_samples")
 
+        # fmt: off
         logging_configs = {
-            self._constant("SEED", "seed"): grpo_cfg.get("seed"),
-            self._constant("MAX_STEPS", "max_steps"): grpo_cfg.get("max_num_steps"),
-            self._constant(
-                "GLOBAL_BATCH_SIZE", "global_batch_size"
-            ): self.global_batch_size,
-            self._constant(
-                "MICRO_BATCH_SIZE", "micro_batch_size"
-            ): policy_cfg.get("train_micro_batch_size"),
-            self._constant(
-                "MAX_SEQUENCE_LENGTH", "max_sequence_length"
-            ): policy_cfg.get("max_total_sequence_length"),
-            self._constant("TRAIN_SAMPLES", "train_samples"): train_samples,
-            self._constant("EVAL_SAMPLES", "eval_samples"): eval_samples,
-            self._constant("INIT_CHECKPOINT_STEP", "init_checkpoint_step"): 0,
-            self._constant("OPT_NAME", "opt_name"): self._constant("ADAMW", "adamw"),
-            self._constant("OPT_BASE_LR", "opt_base_lr"): optimizer_cfg.get("lr"),
-            self._constant("OPT_END_LR", "opt_end_lr"): optimizer_cfg.get("min_lr"),
-            self._constant(
-                "OPT_ADAMW_BETA_1", "opt_adamw_beta_1"
-            ): optimizer_cfg.get("adam_beta1"),
-            self._constant(
-                "OPT_ADAMW_BETA_2", "opt_adamw_beta_2"
-            ): optimizer_cfg.get("adam_beta2"),
-            self._constant(
-                "OPT_ADAMW_EPSILON", "opt_adamw_epsilon"
-            ): optimizer_cfg.get("adam_eps"),
-            self._constant(
-                "OPT_ADAMW_WEIGHT_DECAY", "opt_adamw_weight_decay"
-            ): optimizer_cfg.get("weight_decay"),
-            self._constant(
-                "OPT_GRADIENT_CLIP_NORM", "opt_gradient_clip_norm"
-            ): optimizer_cfg.get("clip_grad") or policy_cfg.get("max_grad_norm"),
-            self._constant(
-                "OPT_LR_WARMUP_STEPS", "opt_lr_warmup_steps"
-            ): scheduler_cfg.get("lr_warmup_iters"),
-            self._constant(
-                "OPT_LR_DECAY_STEPS", "opt_lr_decay_steps"
-            ): scheduler_cfg.get("lr_decay_iters"),
-            self._constant(
-                "OPT_LR_DECAY_SCHEDULE", "opt_lr_decay_schedule"
-            ): scheduler_cfg.get("lr_decay_style"),
-            self._constant(
-                "TENSOR_PARALLELISM", "tensor_parallelism"
-            ): megatron_cfg.get("tensor_model_parallel_size")
-            or policy_cfg.get("dtensor_cfg", {}).get("tensor_parallel_size"),
-            self._constant(
-                "PIPELINE_PARALLELISM", "pipeline_parallelism"
-            ): megatron_cfg.get("pipeline_model_parallel_size"),
-            self._constant(
-                "CONTEXT_PARALLELISM", "context_parallelism"
-            ): megatron_cfg.get("context_parallel_size")
-            or policy_cfg.get("dtensor_cfg", {}).get("context_parallel_size"),
-            self._constant(
-                "EXPERT_PARALLELISM", "expert_parallelism"
-            ): megatron_cfg.get("expert_model_parallel_size")
-            or generation_cfg.get("vllm_cfg", {}).get("expert_parallel_size"),
-            "num_prompts_per_step": grpo_cfg.get("num_prompts_per_step"),
-            "num_generations_per_prompt": grpo_cfg.get(
-                "num_generations_per_prompt"
-            ),
-            "target_accuracy": self.target_accuracy,
+            self.constants.SEED: grpo_cfg.get("seed"),
+            self.constants.MAX_STEPS: grpo_cfg.get("max_num_steps"),
+            self.constants.GLOBAL_BATCH_SIZE: self.global_batch_size,
+            self.constants.MICRO_BATCH_SIZE: policy_cfg.get("train_micro_batch_size"),
+            self.constants.MAX_SEQUENCE_LENGTH: policy_cfg.get("max_total_sequence_length"),
+            self.constants.TRAIN_SAMPLES: train_samples,
+            self.constants.EVAL_SAMPLES: eval_samples,
+            self.constants.INIT_CHECKPOINT_STEP: 0,
+            self.constants.OPT_NAME: self.constants.ADAMW,
+            self.constants.OPT_BASE_LR: optimizer_cfg.get("lr"),
+            self.constants.OPT_END_LR: optimizer_cfg.get("min_lr"),
+            self.constants.OPT_ADAMW_BETA_1: optimizer_cfg.get("adam_beta1"),
+            self.constants.OPT_ADAMW_BETA_2: optimizer_cfg.get("adam_beta2"),
+            self.constants.OPT_ADAMW_EPSILON: optimizer_cfg.get("adam_eps"),
+            self.constants.OPT_ADAMW_WEIGHT_DECAY: optimizer_cfg.get("weight_decay"),
+            self.constants.OPT_GRADIENT_CLIP_NORM: optimizer_cfg.get("clip_grad"),
+            self.constants.OPT_LR_WARMUP_STEPS: scheduler_cfg.get("lr_warmup_iters"),
+            self.constants.OPT_LR_DECAY_STEPS: scheduler_cfg.get("lr_decay_iters"),
+            self.constants.OPT_LR_DECAY_SCHEDULE: scheduler_cfg.get("lr_decay_style"),
+            # Training step parallelism
+            self.constants.TENSOR_PARALLELISM: megatron_cfg.get("tensor_model_parallel_size"),
+            self.constants.PIPELINE_PARALLELISM: megatron_cfg.get("pipeline_model_parallel_size"),
+            self.constants.CONTEXT_PARALLELISM: megatron_cfg.get("context_parallel_size"),
+            self.constants.EXPERT_PARALLELISM: megatron_cfg.get("expert_model_parallel_size"),
+            # Generation parallelism
             "generation_backend": generation_cfg.get("backend"),
-            "lowest_numerical_precision_in_linear": os.environ.get(
-                "MLPERF_LINEAR_PRECISION", str(policy_cfg.get("precision", ""))
-            ),
-            "lowest_numerical_precision_in_attn": os.environ.get(
-                "MLPERF_ATTN_PRECISION", str(policy_cfg.get("precision", ""))
-            ),
-            "lowest_numerical_precision_in_comm": os.environ.get(
-                "MLPERF_COMM_PRECISION", ""
-            ),
+            "generation_tensor_parallelism": backend_cfg.get("tensor_parallel_size"),
+            "generation_pipeline_parallelism": backend_cfg.get("pipeline_parallel_size"),
+            "generation_expert_parallelism": backend_cfg.get("expert_parallel_size"),
+            "generation_training_rollout_temperature": generation_cfg.get("temperature"),
+            "generation_training_rollout_top_p": generation_cfg.get("top_p"),
+            "generation_validation_rollout_temperature": grpo_cfg.get("validation_generation", {}).get("temperature"),
+            "generation_validation_rollout_top_p": grpo_cfg.get("validation_generation", {}).get( "top_p"),
+            "num_prompts_per_step": grpo_cfg.get("num_prompts_per_step"),
+            "num_generations_per_prompt": grpo_cfg.get("num_generations_per_prompt"),
+            "target_accuracy": self.target_accuracy,
         }
+        # fmt: on
 
         for key, value in logging_configs.items():
             if value is not None:
@@ -288,9 +256,9 @@ class MLPerfGRPOLogger:
         self.block_started = True
         self.block_start_step = int(step)
         self._start(
-            self._constant("BLOCK_START", "block_start"),
+            self.constants.BLOCK_START,
             metadata={
-                self._constant("SAMPLES_COUNT", "samples_count"): self.block_size_samples(),
+                self.constants.SAMPLES_COUNT: self.block_size_samples(),
                 "step": int(step),
             },
         )
@@ -302,9 +270,9 @@ class MLPerfGRPOLogger:
         self.last_step = max(self.last_step, step)
         block_samples = max(0, step - self.block_start_step) * self.global_batch_size
         self._end(
-            self._constant("BLOCK_STOP", "block_stop"),
+            self.constants.BLOCK_STOP,
             metadata={
-                self._constant("SAMPLES_COUNT", "samples_count"): block_samples,
+                self.constants.SAMPLES_COUNT: block_samples,
                 "step": step,
             },
         )
@@ -314,11 +282,9 @@ class MLPerfGRPOLogger:
         step = int(step)
         self.stop_train_block(step)
         self._start(
-            self._constant("EVAL_START", "eval_start"),
+            self.constants.EVAL_START,
             metadata={
-                self._constant("SAMPLES_COUNT", "samples_count"): self.sample_count(
-                    step
-                ),
+                self.constants.SAMPLES_COUNT: self.sample_count(step),
                 "step": step,
             },
         )
@@ -347,14 +313,14 @@ class MLPerfGRPOLogger:
                 )
 
         self._event(
-            key=self._constant("EVAL_ACCURACY", "eval_accuracy"),
-            metadata={self._constant("SAMPLES_COUNT", "samples_count"): samples_count},
+            key=self.constants.EVAL_ACCURACY,
+            metadata={self.constants.SAMPLES_COUNT: samples_count},
             value=accuracy,
         )
         self._end(
-            self._constant("EVAL_STOP", "eval_stop"),
+            self.constants.EVAL_STOP,
             metadata={
-                self._constant("SAMPLES_COUNT", "samples_count"): samples_count,
+                self.constants.SAMPLES_COUNT: samples_count,
                 "step": step,
             },
         )
@@ -369,11 +335,9 @@ class MLPerfGRPOLogger:
 
     def end_eval_with_error(self, step: int) -> None:
         self._end(
-            self._constant("EVAL_STOP", "eval_stop"),
+            self.constants.EVAL_STOP,
             metadata={
-                self._constant("SAMPLES_COUNT", "samples_count"): self.sample_count(
-                    int(step)
-                ),
+                self.constants.SAMPLES_COUNT: self.sample_count(int(step)),
                 "step": int(step),
             },
         )
@@ -404,9 +368,7 @@ class MLPerfGRPOLogger:
             self._event(
                 key="tracked_stats",
                 metadata={
-                    self._constant("SAMPLES_COUNT", "samples_count"): self.sample_count(
-                        step
-                    ),
+                    self.constants.SAMPLES_COUNT: self.sample_count(step),
                     "step": step,
                 },
                 value=tracked,
@@ -469,9 +431,9 @@ class MLPerfGRPOLogger:
         if samples_count is None:
             samples_count = self.sample_count(self.last_step)
         self._end(
-            self._constant("RUN_STOP", "run_stop"),
+            self.constants.RUN_STOP,
             metadata={
-                self._constant("SAMPLES_COUNT", "samples_count"): samples_count,
+                self.constants.SAMPLES_COUNT: samples_count,
                 "status": status,
             },
         )

@@ -103,6 +103,8 @@ CONTAINER_NRL_MEGATRON_CHECKPOINT_DIR="${CONTAINER_NRL_MEGATRON_CHECKPOINT_DIR:-
 CONTAINER_NEMO_GYM_SWE_TRAIN_DATA_PATH="${CONTAINER_NEMO_GYM_SWE_TRAIN_DATA_PATH:-${CONTAINER_INPUT_ROOT}/data/train.jsonl}"
 CONTAINER_NEMO_GYM_SWE_VALIDATION_DATA_PATH="${CONTAINER_NEMO_GYM_SWE_VALIDATION_DATA_PATH:-${CONTAINER_INPUT_ROOT}/data/validation.jsonl}"
 CONTAINER_NEMO_GYM_SWE_SIF_DIR="${CONTAINER_NEMO_GYM_SWE_SIF_DIR:-${CONTAINER_INPUT_ROOT}/sif}"
+MLPERF_SUBMISSION_ORG="${MLPERF_SUBMISSION_ORG:-reference}"
+MLPERF_SUBMISSION_PLATFORM="${MLPERF_SUBMISSION_PLATFORM:-reference}"
 
 # Pick a fresh random seed every launch unless one is provided explicitly via GRPO_SEED.
 # Combine two $RANDOM draws (each 0-32767) into a wider 0..~2^30 range.
@@ -134,11 +136,13 @@ NEMO_GYM_SWE_WORKSPACE_ROOT=/logs/nemo_gym/workspace \
 NEMO_GYM_SWE_TRAIN_DATA_PATH="${CONTAINER_NEMO_GYM_SWE_TRAIN_DATA_PATH}" \
 NEMO_GYM_SWE_VALIDATION_DATA_PATH="${CONTAINER_NEMO_GYM_SWE_VALIDATION_DATA_PATH}" \
 NEMO_GYM_SWE_SIF_DIR="${CONTAINER_NEMO_GYM_SWE_SIF_DIR}" \
+MLPERF_SUBMISSION_ORG="${MLPERF_SUBMISSION_ORG}" \
+MLPERF_SUBMISSION_PLATFORM="${MLPERF_SUBMISSION_PLATFORM}" \
 uv run examples/nemo_gym/run_grpo_nemo_gym.py \
     --config ${RECIPE} \
     ++logger.mlperf_enabled=True \
     ++logger.mlperf.log_file=${OUT_DIR}/logs/mllogger.log \
-    ++logger.mlperf.benchmark=grpo_nemo_gym \
+    ++logger.mlperf.benchmark=qwen3_235b_grpo_swe \
     ++logger.mlperf.target_accuracy=${MLPERF_TARGET_ACCURACY:-1.0} \
     ++logger.mlperf.force_success_status=False \
     ++cluster.num_nodes=$NODES \
