@@ -27,6 +27,7 @@ import torch
 from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
     ClippedPGLossFn,
+    DPOLossConfig,
     DPOLossFn,
     NLLLossFn,
 )
@@ -1505,13 +1506,13 @@ def test_megatron_dpo_training(tiny_llama_model_path):
 
     # Create DPO loss function
     dpo_loss_fn = DPOLossFn(
-        {
-            "reference_policy_kl_penalty": 0.1,
-            "preference_loss_weight": 1.0,
-            "sft_loss_weight": 0.5,
-            "preference_average_log_probs": False,
-            "sft_average_log_probs": False,
-        }
+        DPOLossConfig(
+            reference_policy_kl_penalty=0.1,
+            preference_loss_weight=1.0,
+            sft_loss_weight=0.5,
+            preference_average_log_probs=False,
+            sft_average_log_probs=False,
+        )
     )
 
     try:
@@ -2116,13 +2117,13 @@ def test_megatron_dpo_linear_ce_fusion_agreement(tiny_qwen2_model_path):
         }
     )
 
-    dpo_cfg = {
-        "reference_policy_kl_penalty": 0.1,
-        "preference_loss_weight": 1.0,
-        "sft_loss_weight": 0.5,
-        "preference_average_log_probs": False,
-        "sft_average_log_probs": False,
-    }
+    dpo_cfg = DPOLossConfig(
+        reference_policy_kl_penalty=0.1,
+        preference_loss_weight=1.0,
+        sft_loss_weight=0.5,
+        preference_average_log_probs=False,
+        sft_average_log_probs=False,
+    )
 
     # --- Standard DPO (no linear CE fusion) ---
     cluster_std = RayVirtualCluster(
