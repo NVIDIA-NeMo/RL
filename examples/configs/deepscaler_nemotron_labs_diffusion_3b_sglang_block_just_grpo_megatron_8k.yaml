@@ -1,0 +1,28 @@
+# BlockJustGRPO on Nemotron-Labs-Diffusion-3B, DeepScaleR train / AIME 2024 val.
+# 8K-context variant of deepscaler_nemotron_labs_diffusion_3b_sglang_block_just_grpo_megatron.yaml:
+# extends the sequence budget to 8192 total. max_new_tokens=7840 stays divisible by the FastDiffuser
+# block_size (16 here, and also 32) -- a non-multiple crashes generation with a RoPE view error.
+# 350 prompt + 7840 generation = 8190 <= 8192. Micro-batch sizes set to 1 (train_micro_batch_size
+# and logprob_batch_size) to stay well clear of OOM at the doubled sequence length. Inherits
+# block_size=16, the block-reveal worker/logprob estimator, FastDiffuser leftmost decoding, KL off,
+# and val/save interval=10 from the base block config.
+defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_block_just_grpo_megatron.yaml"
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nemotron-diffusion-3b-block-just-grpo-deepscaler-8k-megatron"
+
+policy:
+  max_total_sequence_length: 8192
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  generation:
+    # Divisible by FastDiffuser block_size 16 (and 32). 350 prompt + 7840 gen = 8190 <= 8192.
+    max_new_tokens: 7840
+    sglang_cfg:
+      # KV cache pool must hold the larger 8K context for the concurrent generation requests.
+      max_total_tokens: 40000
+
+logger:
+  log_dir: "logs/grpo-nemotron-diffusion-3b-block-just-grpo-deepscaler-8k-megatron-sglang"
+  wandb:
+    name: "grpo-nemotron-diffusion-3b-block-just-grpo-deepscaler-8k-megatron-sglang"

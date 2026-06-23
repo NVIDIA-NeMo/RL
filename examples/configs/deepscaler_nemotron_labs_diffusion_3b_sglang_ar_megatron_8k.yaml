@@ -1,0 +1,26 @@
+# AR GRPO on Nemotron-Labs-Diffusion-3B, training on DeepScaleR with AIME 2024 as validation.
+# 8K-context variant of deepscaler_nemotron_labs_diffusion_3b_sglang_ar_megatron.yaml: extends the
+# sequence budget to 8192 total (350 prompt + 7842 generation <= 8192). AR has no FastDiffuser
+# block_size constraint, so max_new_tokens does not need to be a multiple of 32.
+# Micro-batch sizes set to 1 (train_micro_batch_size and logprob_batch_size) to stay well clear of OOM
+# since activation memory scales ~linearly with sequence length. KL penalty disabled + reference
+# logprob calc skipped (memory). val/save interval = 10.
+defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_ar_megatron.yaml"
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nemotron-diffusion-3b-ar-deepscaler-8k-megatron"
+
+policy:
+  max_total_sequence_length: 8192
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  generation:
+    max_new_tokens: 7842
+    sglang_cfg:
+      # KV cache pool must hold the larger 8K context for the concurrent generation requests.
+      max_total_tokens: 40000
+
+logger:
+  log_dir: "logs/grpo-nemotron-diffusion-3b-ar-deepscaler-8k-megatron-sglang"
+  wandb:
+    name: "grpo-nemotron-diffusion-3b-ar-deepscaler-8k-megatron-sglang"

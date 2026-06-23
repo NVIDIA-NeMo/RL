@@ -220,12 +220,16 @@ def write_dllm_config(args: argparse.Namespace) -> Path | None:
         "causal_context": args.causal_context,
         "block_size": args.block_size,
         "max_steps": args.max_steps,
-        "threshold": args.threshold,
         "stats_file": str(args.outdir / "stats.jsonl"),
     }
     if args.dllm_algorithm == "FastDiffuser":
         config["selection_policy"] = args.selection_policy
         config["temperature"] = args.temperature
+    # 'threshold' counts globally-confident positions, which is incompatible with the
+    # leftmost selection policy (it reveals positions by index, k=1 per step). Emit it
+    # for every other algorithm/policy combination.
+    if not (args.dllm_algorithm == "FastDiffuser" and args.selection_policy == "leftmost"):
+        config["threshold"] = args.threshold
     with open(config_path, "w", encoding="utf-8") as f:
         for key, value in config.items():
             f.write(f"{key}: {value}\n")

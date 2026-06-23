@@ -81,6 +81,12 @@ The diffugrpo config inherits the data block + 4096 sequence budget from the AR 
 
 For DiffuGRPO, `policy.generation.max_new_tokens` MUST be a multiple of the FastDiffuser `block_size` (32). A non-multiple (e.g. 3746) crashes generation with a RoPE view error (`view size is not compatible with input tensor's size and stride ...` in `rotary_embedding`). Use 3744 (= 117*32). AR mode has no such constraint but is kept at 3744 for consistency. For ar grpo use EXPANDABLE_SEGMENTS flag to avoid OOM(fragmentation OOM). DiffuGRPO did not need it (it does not OOM).
 
+### Block JustGRPO: set EXPANDABLE_SEGMENTS=false (avoids a severe refit slowdown)
+
+For Block JustGRPO runs, submit with `EXPANDABLE_SEGMENTS=false`. With `expandable_segments:True` enabled (which `EXPANDABLE_SEGMENTS=true` injects as `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` on the Megatron policy workers), the per-step weight refit (`prepare_for_generation/transfer_and_update_weights`) becomes pathologically slow and dominates the step. Measured on an otherwise-identical 16-node Block JustGRPO comparison: refit was ~6.9s/step with the flag OFF (4k context) vs ~661s/step with the flag ON (8k context) — roughly a 100x inflation that pushed the step from ~5 min to ~25 min. All other stages (generation, logprob, training) scaled only ~2-3x as expected for the larger context, so the refit was the sole regression. The expandable-segments allocator's virtual-memory map/unmap overhead is hit hard by the refit's large-buffer weight streaming plus optimizer offload. Block JustGRPO does not rely on expandable segments for OOM avoidance (like DiffuGRPO, it does not fragmentation-OOM), so keep the flag off.
+
+Note: AR GRPO still uses `EXPANDABLE_SEGMENTS=true` to avoid fragmentation OOM at long sequence length — this guidance is specific to Block JustGRPO (and the DiffuGRPO family, which also does not need it).
+
 ### Multi-node: set cluster.num_nodes to match NODES
 
 `NODES` only sizes the Slurm allocation; the wrapper does NOT inject `cluster.num_nodes`, and the config defaults to `cluster.num_nodes: 1`. For multi-node runs you MUST override it via `EXTRA_CONFIG_OVERRIDES`, or NeMo-RL runs on a single node:
