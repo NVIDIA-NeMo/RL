@@ -225,6 +225,35 @@ def _expert_index_from_param(name_part: str) -> int | None:
     return None
 
 
+def publish_eagle_draft_weights(
+    *,
+    publisher: Any,
+    draft_model: Any,
+    dtype: Any,
+) -> int:
+    """Publish trainer-owned EAGLE draft weights as replicated MX tensors."""
+    if draft_model is None:
+        return 0
+
+    from nemo_rl.models.megatron.draft import export_eagle_weights_to_hf
+
+    count = 0
+    for name, tensor in export_eagle_weights_to_hf(draft_model):
+        if tensor.is_floating_point():
+            tensor = tensor.to(dtype, non_blocking=True)
+        publisher.add_tensor(
+            name=f"draft.{name}",
+            tensor=tensor.contiguous(),
+            is_expert=False,
+            expert_axis=0,
+            owned_expert_ids=set(),
+            megatron_role=ROLE_REPLICATED,
+            megatron_extras={},
+        )
+        count += 1
+    return count
+
+
 def _enclosing_module(name: str, model: "torch.nn.Module") -> "torch.nn.Module | None":
     """Walk down model attributes to find the module that owns ``name``.
 
