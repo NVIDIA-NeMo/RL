@@ -15,7 +15,6 @@
 import asyncio
 import copy
 import json
-import warnings
 from typing import Any, Optional
 
 import torch
@@ -41,7 +40,7 @@ from nemo_rl.utils.timer import Timer
 TokenizerType = PreTrainedTokenizerBase
 
 
-class AsyncRolloutManager:
+class AsyncRolloutImpl:
     """Manages per-prompt multi-turn rollouts, producing a PromptGroupRecord per call.
 
     Each run_rollout takes one prompt and returns num_generations_per_prompt completions
@@ -50,22 +49,20 @@ class AsyncRolloutManager:
 
     def __init__(
         self,
-        policy_generation: GenerationInterface,
         tokenizer: TokenizerType,
         task_to_env: dict[str, EnvironmentInterface],
-        max_seq_len: int,
         num_generations_per_prompt: int,
+        max_seq_len: int,
+        policy_generation: GenerationInterface,
         max_rollout_turns: int = 999999,
+        **kwargs: Any,
     ) -> None:
-        assert num_generations_per_prompt >= 1, (
-            "num_generations_per_prompt must be >= 1"
-        )
-        self._policy_generation = policy_generation
         self._tokenizer = tokenizer
         self._task_to_env = task_to_env
-        self._max_seq_len = max_seq_len
         self._num_generations_per_prompt = num_generations_per_prompt
+        self._max_seq_len = max_seq_len
         self._max_rollout_turns = max_rollout_turns
+        self._policy_generation = policy_generation
 
     async def run_rollout(self, input_sample: DatumSpec) -> PromptGroupRecord:
         """Run num_generations_per_prompt rollouts for one prompt.
@@ -340,24 +337,14 @@ class AsyncRolloutManager:
         # Aggregate metrics across all samples.
         n = len(all_sample_metrics)
         rollout_metrics: dict[str, Any] = {
-            **self._aggregate_single_metric(
-                "total_reward", total_reward, ["mean", "max", "min"], n
-            ),
+            **_calculate_single_metric(total_reward, n, "total_reward"),
             # turn metrics
             "total_turns": sum(turn_count),
-            **self._aggregate_single_metric(
-                "turns_per_sample", turn_count, ["mean", "max"], n
-            ),
+            **_calculate_single_metric(turn_count, n, "turns_per_sample"),
             # token metrics
-            **self._aggregate_single_metric(
-                "total_tokens_per_sample", total_tokens, ["mean"], n
-            ),
-            **self._aggregate_single_metric(
-                "gen_tokens_per_sample", assistant_tokens, ["mean", "max"], n
-            ),
-            **self._aggregate_single_metric(
-                "env_tokens_per_sample", env_tokens, ["mean"], n
-            ),
+            **_calculate_single_metric(total_tokens, n, "total_tokens_per_sample"),
+            **_calculate_single_metric(assistant_tokens, n, "gen_tokens_per_sample"),
+            **_calculate_single_metric(env_tokens, n, "env_tokens_per_sample"),
             # truncated metrics
             "truncation_rate": sum(truncated) / n,
             "natural_termination_rate": sum(terminated) / n,
@@ -371,7 +358,8 @@ class AsyncRolloutManager:
                     per_worker_token_counts[k] = per_worker_token_counts.get(k, 0) + v
             rollout_metrics["per_worker_token_counts"] = per_worker_token_counts
 
-        # Histogram metrics.
+        # Per-turn token histograms (flat across all turns, distinct from the
+        # per-sample histograms emitted via _calculate_single_metric above).
         rollout_metrics["histogram/gen_tokens_length"] = [
             t for m in all_sample_metrics for t in m["turn_gen_tokens"]
         ]
@@ -382,30 +370,14 @@ class AsyncRolloutManager:
             t for m in all_sample_metrics for t in m["turn_total_tokens"]
         ]
 
+        # Necessary for downstream nemo rl logging/printing.
+        rollout_metrics["mean_gen_tokens_per_sample"] = rollout_metrics[
+            "gen_tokens_per_sample/mean"
+        ]
         return rollout_metrics
 
-    @staticmethod
-    def _aggregate_single_metric(
-        name: str,
-        values: list[float],
-        agg_method: list[str],
-        n: Optional[int] = None,
-    ) -> dict:
-        """Calculate a single metric across a list of values."""
-        metrics = {}
 
-        if "mean" in agg_method:
-            assert n is not None, "n must be provided for mean aggregation"
-            metrics[f"mean_{name}"] = sum(values) / n
-        if "max" in agg_method:
-            metrics[f"max_{name}"] = max(values)
-        if "min" in agg_method:
-            metrics[f"min_{name}"] = min(values)
-
-        return metrics
-
-
-class AsyncNemoGymRolloutManager:
+class AsyncNemoGymRolloutImpl:
     """Manages per-prompt NeMo-Gym rollouts, producing a PromptGroupRecord per call.
 
     Each run_rollout takes one prompt and returns num_generations_per_prompt completions
@@ -416,18 +388,18 @@ class AsyncNemoGymRolloutManager:
         self,
         tokenizer: TokenizerType,
         task_to_env: dict[str, EnvironmentInterface],
-        generation_config: GenerationConfig,
         num_generations_per_prompt: int,
-        max_seq_len: Optional[int] = None,
+        max_seq_len: int,
+        generation_config: GenerationConfig,
         max_rollout_turns: Optional[int] = None,
+        **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
         self._task_to_env = task_to_env
-        self._generation_config = generation_config
         self._num_generations_per_prompt = num_generations_per_prompt
         self._max_seq_len = max_seq_len
         self._max_rollout_turns = max_rollout_turns
-        self._engine_max_model_len = generation_config["vllm_cfg"]["max_model_len"]  # type: ignore
+        self._generation_config = generation_config
 
         self._validate_init_params()
 
@@ -469,26 +441,9 @@ class AsyncNemoGymRolloutManager:
                 f"{key} is not supported in the generation config in NeMo-Gym path!"
             )
 
-        # Validate max_seq_len.
-        if (
-            self._max_seq_len is not None
-            and self._max_seq_len > self._engine_max_model_len
-        ):
-            warnings.warn(
-                f"policy max_total_sequence_length ({self._max_seq_len}) is greater than the "
-                f"generation engine's max_model_len ({self._engine_max_model_len}). The engine "
-                "will truncate sequences to its own limit, so the policy cap will not be "
-                "honored. Lower max_total_sequence_length or raise the engine's max_model_len."
-            )
-
         # Validate max_rollout_turns.
         assert self._max_rollout_turns is None, (
             "`max_rollout_turns` is not supported in NeMo-Gym path!"
-        )
-
-        # Validate num_generations_per_prompt.
-        assert self._num_generations_per_prompt >= 1, (
-            "`num_generations_per_prompt` must be >= 1!"
         )
 
     def _build_inputs(self, input_sample: DatumSpec) -> list[dict]:
@@ -555,8 +510,7 @@ class AsyncNemoGymRolloutManager:
 
         # Calculate truncation.
         truncated = (
-            sum(len(m["token_ids"]) for m in result["message_log"])
-            == self._engine_max_model_len
+            sum(len(m["token_ids"]) for m in result["message_log"]) == self._max_seq_len
         )
 
         return Completion(
@@ -572,42 +526,34 @@ class AsyncNemoGymRolloutManager:
         agent_name: str,
     ) -> dict[str, Any]:
         """Aggregate per-sample and per-agent metrics."""
-        n = len(completions)
+        # Prepare lists of values for each metric.
+        total_reward = [c.reward for c in completions]
+        turn_count = [
+            sum(1 for m in c.message_log if m["role"] == "user") for c in completions
+        ]
+        # token metrics
+        total_tokens = [
+            sum(len(m["token_ids"]) for m in c.message_log) for c in completions
+        ]
+        assistant_tokens = [
+            sum(len(m["token_ids"]) for m in c.message_log if m["role"] == "assistant")
+            for c in completions
+        ]
+        # truncated metrics
+        truncated = [c.truncated for c in completions]
 
-        # Aggregate metrics across all samples
+        # Aggregate metrics across all samples.
+        n = len(completions)
         rollout_metrics: dict[str, Any] = {
-            **_calculate_single_metric(
-                [
-                    sum(1 for m in c.message_log if m["role"] == "user")
-                    for c in completions
-                ],
-                n,
-                "turns_per_sample",
-            ),
-            **_calculate_single_metric(
-                [sum(len(m["token_ids"]) for m in c.message_log) for c in completions],
-                n,
-                "total_tokens_per_sample",
-            ),
-            **_calculate_single_metric(
-                [
-                    sum(
-                        len(m["token_ids"])
-                        for m in c.message_log
-                        if m["role"] == "assistant"
-                    )
-                    for c in completions
-                ],
-                n,
-                "gen_tokens_per_sample",
-            ),
-            **_calculate_single_metric(
-                [c.reward for c in completions],
-                n,
-                "total_reward",
-            ),
-            "natural_termination_rate": sum(not c.truncated for c in completions) / n,
-            "truncation_rate": sum(c.truncated for c in completions) / n,
+            **_calculate_single_metric(total_reward, n, "total_reward"),
+            # turn metrics
+            **_calculate_single_metric(turn_count, n, "turns_per_sample"),
+            # token metrics
+            **_calculate_single_metric(total_tokens, n, "total_tokens_per_sample"),
+            **_calculate_single_metric(assistant_tokens, n, "gen_tokens_per_sample"),
+            # truncated metrics
+            "natural_termination_rate": sum(not t for t in truncated) / n,
+            "truncation_rate": sum(truncated) / n,
         }
 
         # Agent-level metrics.
@@ -632,3 +578,48 @@ class AsyncNemoGymRolloutManager:
             "gen_tokens_per_sample/mean"
         ]
         return rollout_metrics
+
+
+class RolloutManager:
+    """Factory that routes to AsyncRolloutImpl (native async) or AsyncNemoGymRolloutImpl (NeMo-Gym)."""
+
+    def __init__(
+        self,
+        tokenizer: TokenizerType,
+        task_to_env: dict[str, EnvironmentInterface],
+        num_generations_per_prompt: int,
+        max_seq_len: int,
+        max_rollout_turns: Optional[int] = None,
+        policy_generation: Optional[GenerationInterface] = None,
+        generation_config: Optional[GenerationConfig] = None,
+        use_nemo_gym: bool = False,
+    ) -> None:
+        assert num_generations_per_prompt >= 1, (
+            "num_generations_per_prompt must be >= 1"
+        )
+
+        if not use_nemo_gym:
+            rollout_cls = AsyncRolloutImpl
+            assert policy_generation is not None, (
+                "policy_generation is required for the native async path"
+            )
+            if max_rollout_turns is None:
+                max_rollout_turns = 999999  # use AsyncRolloutImpl's default value
+        else:
+            rollout_cls = AsyncNemoGymRolloutImpl
+            assert generation_config is not None, (
+                "generation_config is required for the NeMo-Gym path"
+            )
+
+        self._impl: AsyncRolloutImpl | AsyncNemoGymRolloutImpl = rollout_cls(
+            tokenizer=tokenizer,
+            task_to_env=task_to_env,
+            num_generations_per_prompt=num_generations_per_prompt,
+            max_seq_len=max_seq_len,
+            max_rollout_turns=max_rollout_turns,  # type: ignore
+            policy_generation=policy_generation,  # type: ignore
+            generation_config=generation_config,
+        )
+
+    async def run_rollout(self, input_sample: DatumSpec) -> PromptGroupRecord:
+        return await self._impl.run_rollout(input_sample)

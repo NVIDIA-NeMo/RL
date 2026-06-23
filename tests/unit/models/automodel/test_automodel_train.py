@@ -38,6 +38,7 @@ from nemo_rl.models.automodel.train import (
     LossPostProcessor,
     ScorePostProcessor,
     TopkLogitsPostProcessor,
+    _needs_kv_cache_for_shared_layers,
     apply_temperature_scaling,
     automodel_forward_backward,
     extract_logits,
@@ -202,6 +203,82 @@ class TestModelForward:
         mock_model.assert_called_once()
         call_kwargs = mock_model.call_args[1]
         assert "flash_attn_kwargs" not in call_kwargs
+
+    def test_forward_injects_mm_token_type_ids_for_gemma4(
+        self, mock_model, processed_inputs_no_flash
+    ):
+        # Gemma 4 needs mm_token_type_ids even for text-only inputs.
+        mock_model.config.model_type = "gemma4"
+
+        result = model_forward(mock_model, processed_inputs_no_flash)
+
+        call_kwargs = mock_model.call_args[1]
+        assert "mm_token_type_ids" in call_kwargs
+        assert torch.equal(
+            call_kwargs["mm_token_type_ids"],
+            torch.zeros_like(processed_inputs_no_flash.input_ids),
+        )
+
+    def test_forward_omits_mm_token_type_ids_for_non_gemma4(
+        self, mock_model, processed_inputs_no_flash
+    ):
+        mock_model.config.model_type = "llama"
+
+        result = model_forward(mock_model, processed_inputs_no_flash)
+
+        call_kwargs = mock_model.call_args[1]
+        assert "mm_token_type_ids" not in call_kwargs
+
+
+# ==========================================
+# Test _needs_kv_cache_for_shared_layers
+# ==========================================
+@pytest.mark.automodel
+class TestNeedsKvCacheForSharedLayers:
+    def test_nested_text_config_positive(self):
+        import types
+
+        model = types.SimpleNamespace(
+            config=types.SimpleNamespace(
+                text_config=types.SimpleNamespace(num_kv_shared_layers=4)
+            )
+        )
+        assert _needs_kv_cache_for_shared_layers(model) is True
+
+    def test_flat_config_zero_is_false(self):
+        import types
+
+        model = types.SimpleNamespace(
+            config=types.SimpleNamespace(num_kv_shared_layers=0)
+        )
+        assert _needs_kv_cache_for_shared_layers(model) is False
+
+    def test_missing_config_is_false(self):
+        import types
+
+        assert _needs_kv_cache_for_shared_layers(types.SimpleNamespace()) is False
+
+    def test_workaround_obsolete_tripwire(self):
+        """Tripwire: fires once transformers>=5.5.2 (PR #45312) lands.
+
+        PR #45312 fixes KV sharing without requiring use_cache=True, which makes
+        the _needs_kv_cache_for_shared_layers workaround (and the use_cache
+        plumbing it drives in model_forward / automodel_forward_backward) obsolete.
+        There is no importable symbol/signature to key on, so we key on the
+        transformers version the TODO names. When this assertion fails, remove the
+        workaround in nemo_rl/models/automodel/train.py and this test.
+        """
+        import transformers
+        from packaging.version import Version
+
+        assert Version(transformers.__version__) < Version("5.5.2"), (
+            f"transformers {transformers.__version__} >= 5.5.2 detected "
+            "(PR #45312 fixes KV sharing without use_cache=True). The "
+            "_needs_kv_cache_for_shared_layers workaround in "
+            "nemo_rl/models/automodel/train.py (and the use_cache plumbing in "
+            "model_forward / automodel_forward_backward) is now obsolete - "
+            "remove it and this test."
+        )
 
 
 # =====================

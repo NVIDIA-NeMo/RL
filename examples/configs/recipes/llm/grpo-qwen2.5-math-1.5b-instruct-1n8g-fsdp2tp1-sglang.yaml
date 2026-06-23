@@ -1,11 +1,9 @@
 defaults: ../../grpo_math_1B.yaml
-
 grpo:
   max_num_steps: 450
-
+  val_batch_size: 128
 checkpointing:
   checkpoint_dir: results/grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1-sglang
-
 policy:
   model_name: Qwen/Qwen2.5-Math-1.5B-Instruct
   tokenizer:
@@ -16,28 +14,35 @@ policy:
     enabled: false
   make_sequence_length_divisible_by: 1
   generation:
-    backend: "sglang"
+    backend: sglang
     max_new_tokens: 512
     sglang_cfg:
       model_path: ${policy.model_name}
-      gpus_per_server: 1
       dtype: ${policy.precision}
       context_length: 512
       allow_auto_truncate: true
-      enable_memory_saver: false
+      tp_size: 2
       dp_size: 1
       pp_size: 1
       ep_size: 1
+      random_seed: 42
       max_running_requests: null
-      mem_fraction_static: 0.5
+      mem_fraction_static: 0.6
       skip_server_warmup: true
-      # Piecewise CUDA graphs fail with CUBLAS_STATUS_EXECUTION_FAILED
-      # inside Ray worker forks. See unit test Err 4 for details.
       disable_piecewise_cuda_graph: true
-
+      disable_cuda_graph: false
+      sglang_server_config:
+        needs_offload: true
+        cpu_weight_backup: true
+        sglang_server_concurrency: 1024
+        pause_generation_mode: retract
+        num_gpus: 8
+        num_gpus_per_engine: ${policy.generation.sglang_cfg.tp_size}
+      sglang_router_config:
+        use_external_router: false
+        use_distributed_post: true
 data:
   max_input_seq_length: 512
-
 logger:
   log_dir: logs/grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1-sglang
   wandb_enabled: true
@@ -45,7 +50,5 @@ logger:
   wandb:
     project: nemo-rl
     name: grpo-qwen2.5-math-1.5b-instruct-1n8g-fsdp2tp1-sglang
-
 cluster:
   gpus_per_node: 8
-
