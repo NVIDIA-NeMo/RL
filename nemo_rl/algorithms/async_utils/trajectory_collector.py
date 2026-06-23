@@ -14,16 +14,19 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import threading as _threading
 import time
+from collections import defaultdict
 from typing import Any, Optional
 
 import ray
+import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.grpo import MasterConfig
-from nemo_rl.algorithms.opd import teacher_seq_pad_multiple
+from nemo_rl.algorithms.opd import resolve_reference_aliases, teacher_seq_pad_multiple
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -47,9 +50,9 @@ class AsyncTrajectoryCollector:
         master_config: MasterConfig,
         replay_buffer: Any,
         start_step: int = 0,
-        teacher_worker_groups=None,
-        alias_to_group_alias=None,
-        on_policy_distillation_cfg=None,
+        teacher_worker_groups: Optional[dict[str, Any]] = None,
+        alias_to_group_alias: Optional[dict[str, str]] = None,
+        on_policy_distillation_cfg: Optional[dict[str, Any]] = None,
     ):
         self.policy_generation = policy_generation
         self.tokenizer = tokenizer
@@ -59,7 +62,7 @@ class AsyncTrajectoryCollector:
         self.teacher_worker_groups = teacher_worker_groups or {}
         self.alias_to_group_alias = alias_to_group_alias or {}
         self.on_policy_distillation_cfg = on_policy_distillation_cfg or {}
-        self._has_non_colocated_teachers = bool(self.teacher_worker_groups)
+        self._has_distillation_teachers = bool(self.teacher_worker_groups)
         self._teacher_seq_pad_multiple = teacher_seq_pad_multiple(
             self.teacher_worker_groups,
             self.master_config.policy["make_sequence_length_divisible_by"],
@@ -601,7 +604,12 @@ class AsyncTrajectoryCollector:
                     f"{buffered} buffered)"
                 )
 
-    def _compute_teacher_logprobs(self, input_ids, agent_refs, input_lengths=None):
+    def _compute_teacher_logprobs(
+        self,
+        input_ids: torch.Tensor,
+        agent_refs: list[dict[str, Any]],
+        input_lengths: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, float]:
         """Compute teacher logprobs for non-colocated teachers.
 
         Groups samples by teacher, fans out in parallel, stitches results.
@@ -614,18 +622,15 @@ class AsyncTrajectoryCollector:
         Returns:
             ([B, S] teacher logprobs tensor, total_time_seconds)
         """
-        import concurrent.futures
-        from collections import defaultdict
-
-        import torch
-
-        from nemo_rl.algorithms.opd import resolve_reference_aliases
-
         opd_cfg = self.on_policy_distillation_cfg
         teacher_model_by_agent_name = opd_cfg.get("teacher_model_by_agent_name", {})
         default_teacher_alias = opd_cfg.get("default_teacher_alias")
         strict = opd_cfg.get("strict_agent_name_match", False)
 
+        # Resolve each sample's agent -> the teacher alias it should be distilled
+        # from: the agent name is looked up in teacher_model_by_agent_name; unmapped
+        # agents fall back to default_teacher_alias (or raise if strict_agent_name_match).
+        # Returns one alias per sample, index-aligned with agent_refs.
         reference_aliases = resolve_reference_aliases(
             agent_refs,
             teacher_model_by_agent_name,
@@ -755,7 +760,7 @@ class AsyncTrajectoryCollector:
             del final_batch
 
             # Compute teacher logprobs at collection time (overlapped with async rollouts)
-            if self._has_non_colocated_teachers and "agent_ref" in final_batch_cpu:
+            if self._has_distillation_teachers and "agent_ref" in final_batch_cpu:
                 agent_refs = final_batch_cpu["agent_ref"]
                 if isinstance(agent_refs, list):
                     from nemo_rl.data.llm_message_utils import (

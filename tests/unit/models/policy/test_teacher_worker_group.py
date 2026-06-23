@@ -13,14 +13,14 @@
 # limitations under the License.
 
 
-def test_teacher_config_defaults():
-    from nemo_rl.models.policy.teacher_worker_group import TeacherConfig
+def test_teacher_resource_config_defaults():
+    from nemo_rl.algorithms.opd import TeacherResourceConfig
 
-    cfg = TeacherConfig(
-        alias="math", model_name="/ckpt/math", tensor_model_parallel_size=4
-    )
-    assert cfg["alias"] == "math"
-    assert cfg["tensor_model_parallel_size"] == 4
+    res = TeacherResourceConfig(tensor_model_parallel_size=4)
+    assert res.tensor_model_parallel_size == 4
+    assert res.pipeline_model_parallel_size == 1
+    assert res.gpus_per_node == 8
+    assert res.precision == "bf16"
 
 
 def test_create_teacher_configs_homogeneous():
@@ -37,7 +37,7 @@ def test_create_teacher_configs_homogeneous():
         }
     )
     assert len(configs) == 2
-    assert all(c["tensor_model_parallel_size"] == 4 for c in configs)
+    assert all(c.tensor_model_parallel_size == 4 for c in configs)
 
 
 def test_create_teacher_configs_heterogeneous_override():
@@ -54,8 +54,8 @@ def test_create_teacher_configs_heterogeneous_override():
             },
         }
     )
-    code_cfg = [c for c in configs if c["alias"] == "code"][0]
-    assert code_cfg["tensor_model_parallel_size"] == 8
+    code_cfg = [c for c in configs if c.alias == "code"][0]
+    assert code_cfg.tensor_model_parallel_size == 8
 
 
 def test_create_teacher_configs_deduplicates():

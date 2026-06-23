@@ -64,7 +64,7 @@ def _make_collector(**overrides):
         "teacher_worker_groups": {},
         "alias_to_group_alias": {},
         "on_policy_distillation_cfg": {},
-        "_has_non_colocated_teachers": False,
+        "_has_distillation_teachers": False,
     }
     defaults.update(overrides)
     obj = object.__new__(real_cls)
@@ -99,7 +99,7 @@ def test_compute_teacher_logprobs_dp_padding(batch_size, dp_size):
         on_policy_distillation_cfg={
             "teacher_model_by_agent_name": {"math_agent": "/ckpt/math"},
         },
-        _has_non_colocated_teachers=True,
+        _has_distillation_teachers=True,
     )
 
     S = 16
@@ -126,7 +126,7 @@ def test_compute_teacher_logprobs_routes_to_correct_teacher():
                 "code_agent": "/ckpt/code",
             },
         },
-        _has_non_colocated_teachers=True,
+        _has_distillation_teachers=True,
     )
 
     B, S = 4, 8
@@ -160,7 +160,7 @@ def test_compute_teacher_logprobs_deduplication():
                 "terminal": "/ckpt/shared",
             },
         },
-        _has_non_colocated_teachers=True,
+        _has_distillation_teachers=True,
     )
 
     B, S = 2, 4
@@ -170,6 +170,27 @@ def test_compute_teacher_logprobs_deduplication():
     result, _ = collector._compute_teacher_logprobs(input_ids, agent_refs)
     assert result.shape == (B, S)
     assert torch.allclose(result, torch.tensor(3.0))
+
+
+def test_compute_teacher_logprobs_default_alias_fallback_routes():
+    """Unmapped agent_ref falls back to default_teacher_alias and routes to a valid group."""
+    math_twg = _MockTeacherWorkerGroup(fill_value=7.0, dp_size=1)
+    collector = _make_collector(
+        teacher_worker_groups={"math": math_twg},
+        alias_to_group_alias={"math_agent": "math"},
+        on_policy_distillation_cfg={
+            "teacher_model_by_agent_name": {"math_agent": "/ckpt/math"},
+            "default_teacher_alias": "math_agent",
+        },
+        _has_distillation_teachers=True,
+    )
+    B, S = 2, 5
+    input_ids = torch.randint(0, 100, (B, S))
+    # second agent ("surprise_agent") is unmapped -> must fall back to math_agent
+    agent_refs = [{"name": "math_agent"}, {"name": "surprise_agent"}]
+    result, _ = collector._compute_teacher_logprobs(input_ids, agent_refs)
+    assert result.shape == (B, S)
+    assert torch.allclose(result, torch.tensor(7.0))
 
 
 # ---------------------------------------------------------------------------

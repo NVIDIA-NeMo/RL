@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+import ray
 from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
@@ -30,12 +31,32 @@ from pydantic import BaseModel, Field
 # ---------------------------------------------------------------------------
 
 
+class TeacherResourceConfig(BaseModel, extra="allow"):
+    """Per-teacher resourcing for a non-colocated teacher worker group.
+
+    ``extra="allow"`` keeps the escape hatch for arbitrary megatron settings:
+    any unknown top-level key is folded into ``megatron_cfg_overrides``.
+    """
+
+    tensor_model_parallel_size: int = 1
+    pipeline_model_parallel_size: int = 1
+    context_parallel_size: int = 1
+    expert_model_parallel_size: int = 1
+    num_nodes: int = 1
+    gpus_per_node: int = 8
+    precision: str = "bf16"
+    micro_batch_size: int = 4
+    megatron_cfg_overrides: dict[str, Any] = Field(default_factory=dict)
+
+
 class NonColocatedTeachersConfig(BaseModel, extra="allow"):
     """Non-colocated (separate-GPU) teacher resourcing for on-policy distillation."""
 
     enabled: bool = False
-    default_teacher_cfg: dict[str, Any] = Field(default_factory=dict)
-    teacher_overrides: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    default_teacher_cfg: TeacherResourceConfig = Field(
+        default_factory=TeacherResourceConfig
+    )
+    teacher_overrides: dict[str, TeacherResourceConfig] = Field(default_factory=dict)
 
 
 class OnPolicyDistillationConfig(BaseModel, extra="allow"):
@@ -84,6 +105,31 @@ def is_non_colocated_teachers_enabled(master_config: Any) -> bool:
     return bool(
         _opd_cfg(master_config).get("non_colocated_teachers", {}).get("enabled", False)
     )
+
+
+def _skip_prev_logprobs(master_config: Any) -> bool:
+    """Whether the training loop will zero ``prev_logprobs`` instead of computing it.
+
+    Mirrors the predicate in ``grpo_train``: ``force_on_policy_ratio`` with no
+    ``seq_logprob_error_threshold`` skips the student logprob pass.
+    """
+    force_on_policy_ratio = master_config.loss_fn.force_on_policy_ratio
+    seq_logprob_error_threshold = master_config.grpo.get(
+        "seq_logprob_error_threshold", None
+    )
+    return bool(force_on_policy_ratio and seq_logprob_error_threshold is None)
+
+
+def assert_prev_logprobs_available(master_config: Any) -> None:
+    """OPD's advantage is ``teacher_logprobs - prev_logprobs``, so it needs a real
+    student logprob; raise if the config would zero ``prev_logprobs``.
+    """
+    if is_opd_enabled(master_config) and _skip_prev_logprobs(master_config):
+        raise ValueError(
+            "adv_estimator='opd' requires real prev_logprobs, but the config zeros them "
+            "(loss_fn.force_on_policy_ratio=True with grpo.seq_logprob_error_threshold unset). "
+            "Set seq_logprob_error_threshold or disable force_on_policy_ratio."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -195,14 +241,29 @@ def create_teacher_worker_groups(
     )
 
     opd_cfg = _opd_cfg(master_config)
-    non_coloc_cfg = opd_cfg.get("non_colocated_teachers", {})
+    teacher_model_by_agent_name = dict(opd_cfg.get("teacher_model_by_agent_name", {}))
+
+    # A non-strict run falls back to default_teacher_alias for unmapped agents, so
+    # it must itself be a mapped agent — fail at setup, not with a mid-training KeyError.
+    default_teacher_alias = opd_cfg.get("default_teacher_alias")
+    if (
+        not opd_cfg.get("strict_agent_name_match", False)
+        and default_teacher_alias is not None
+        and default_teacher_alias not in teacher_model_by_agent_name
+    ):
+        raise ValueError(
+            f"default_teacher_alias '{default_teacher_alias}' is not a key in "
+            f"teacher_model_by_agent_name (available: "
+            f"{sorted(teacher_model_by_agent_name.keys())})."
+        )
+
     teacher_configs = create_teacher_configs_from_opd_config(opd_cfg)
 
     teacher_worker_groups: dict[str, Any] = {}
     for tcfg in teacher_configs:
-        alias = tcfg["alias"]
-        num_nodes = tcfg.get("num_nodes", 1)
-        gpus_per_node = tcfg.get("gpus_per_node", 8)
+        alias = tcfg.alias
+        num_nodes = tcfg.num_nodes
+        gpus_per_node = tcfg.gpus_per_node
 
         teacher_cluster = RayVirtualCluster(
             name=f"teacher_{alias}",
@@ -225,8 +286,6 @@ def create_teacher_worker_groups(
 
     # Verify all teacher workers are alive (actor __init__ runs async and
     # failures are otherwise silent until the first remote call).
-    import ray
-
     print("  Verifying teacher workers are healthy...", flush=True)
     for alias, twg in teacher_worker_groups.items():
         try:
@@ -247,11 +306,10 @@ def create_teacher_worker_groups(
     )
 
     # Build alias -> group_alias mapping for deduplication
-    teacher_model_by_agent_name = dict(opd_cfg.get("teacher_model_by_agent_name", {}))
     alias_to_group_alias: dict[str, str] = {}
     model_to_primary: dict[str, str] = {}
     for tcfg in teacher_configs:
-        model_to_primary[tcfg["model_name"]] = tcfg["alias"]
+        model_to_primary[tcfg.model_name] = tcfg.alias
     for alias, model_name in teacher_model_by_agent_name.items():
         alias_to_group_alias[alias] = model_to_primary.get(model_name, alias)
 

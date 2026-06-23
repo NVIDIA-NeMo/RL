@@ -21,11 +21,13 @@ in inference-only mode for a single teacher model checkpoint.
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any, NotRequired, Optional, TypedDict
+from dataclasses import dataclass
+from typing import Any, Optional
 
 import numpy as np
 from transformers import PreTrainedTokenizerBase
 
+from nemo_rl.algorithms.opd import TeacherResourceConfig
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
     SequencePackingArgs,
@@ -36,20 +38,21 @@ from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.models.policy.interfaces import ReferenceLogprobOutputSpec
 
 
-class TeacherConfig(TypedDict):
-    """Configuration for a single non-colocated teacher."""
+@dataclass
+class TeacherConfig:
+    """Resolved config for a single non-colocated teacher (built in-process)."""
 
     alias: str
     model_name: str  # checkpoint path
     tensor_model_parallel_size: int
-    pipeline_model_parallel_size: NotRequired[int]
-    context_parallel_size: NotRequired[int]
-    expert_model_parallel_size: NotRequired[int]
-    num_nodes: NotRequired[int]
-    gpus_per_node: NotRequired[int]
-    precision: NotRequired[str]
-    micro_batch_size: NotRequired[int]
-    megatron_cfg_overrides: NotRequired[dict[str, Any]]
+    pipeline_model_parallel_size: int
+    context_parallel_size: int
+    expert_model_parallel_size: int
+    num_nodes: int
+    gpus_per_node: int
+    precision: str
+    micro_batch_size: int
+    megatron_cfg_overrides: dict[str, Any]
 
 
 def create_teacher_configs_from_opd_config(
@@ -76,47 +79,26 @@ def create_teacher_configs_from_opd_config(
             continue
         seen_models.add(model_name)
 
-        # Merge: defaults <- per-alias override
-        merged = {**default_cfg}
-        if alias in overrides:
-            merged.update(overrides[alias])
+        # defaults <- per-alias override, then validated/typed by the schema.
+        merged = {**default_cfg, **dict(overrides.get(alias, {}))}
+        res = TeacherResourceConfig(**merged)
 
-        # Collect any extra keys as megatron_cfg_overrides.
-        _known_keys = {
-            "tensor_model_parallel_size",
-            "pipeline_model_parallel_size",
-            "context_parallel_size",
-            "expert_model_parallel_size",
-            "num_nodes",
-            "gpus_per_node",
-            "precision",
-            "micro_batch_size",
-            "megatron_cfg_overrides",
-        }
-        extra_overrides = {k: v for k, v in merged.items() if k not in _known_keys}
-        explicit_overrides = dict(merged.get("megatron_cfg_overrides", {}))
-        # extra keys from top-level are merged with explicit megatron_cfg_overrides;
-        # explicit overrides take precedence.
-        all_overrides = {**extra_overrides, **explicit_overrides}
+        # Unknown top-level keys (extra="allow") fold into megatron_cfg_overrides;
+        # explicit megatron_cfg_overrides take precedence.
+        all_overrides = {**(res.model_extra or {}), **res.megatron_cfg_overrides}
 
         configs.append(
             TeacherConfig(
                 alias=alias,
                 model_name=model_name,
-                tensor_model_parallel_size=int(
-                    merged.get("tensor_model_parallel_size", 1)
-                ),
-                pipeline_model_parallel_size=int(
-                    merged.get("pipeline_model_parallel_size", 1)
-                ),
-                context_parallel_size=int(merged.get("context_parallel_size", 1)),
-                expert_model_parallel_size=int(
-                    merged.get("expert_model_parallel_size", 1)
-                ),
-                num_nodes=int(merged.get("num_nodes", 1)),
-                gpus_per_node=int(merged.get("gpus_per_node", 8)),
-                precision=str(merged.get("precision", "bf16")),
-                micro_batch_size=int(merged.get("micro_batch_size", 4)),
+                tensor_model_parallel_size=res.tensor_model_parallel_size,
+                pipeline_model_parallel_size=res.pipeline_model_parallel_size,
+                context_parallel_size=res.context_parallel_size,
+                expert_model_parallel_size=res.expert_model_parallel_size,
+                num_nodes=res.num_nodes,
+                gpus_per_node=res.gpus_per_node,
+                precision=res.precision,
+                micro_batch_size=res.micro_batch_size,
                 megatron_cfg_overrides=all_overrides,
             )
         )
@@ -141,8 +123,8 @@ class TeacherWorkerGroup:
         policy_config: dict[str, Any],
         tokenizer: PreTrainedTokenizerBase,
     ):
-        self.alias = teacher_cfg["alias"]
-        self.model_name = teacher_cfg["model_name"]
+        self.alias = teacher_cfg.alias
+        self.model_name = teacher_cfg.model_name
         self.teacher_cfg = teacher_cfg
 
         # Build a policy config for inference-only use.
@@ -152,27 +134,38 @@ class TeacherWorkerGroup:
         if "megatron_cfg" not in cfg:
             cfg["megatron_cfg"] = {}
         cfg["megatron_cfg"]["enabled"] = True
-        cfg["megatron_cfg"]["tensor_model_parallel_size"] = teacher_cfg[
-            "tensor_model_parallel_size"
-        ]
-        cfg["megatron_cfg"]["pipeline_model_parallel_size"] = teacher_cfg.get(
-            "pipeline_model_parallel_size", 1
+        cfg["megatron_cfg"]["tensor_model_parallel_size"] = (
+            teacher_cfg.tensor_model_parallel_size
         )
-        cfg["megatron_cfg"]["context_parallel_size"] = teacher_cfg.get(
-            "context_parallel_size", 1
+        cfg["megatron_cfg"]["pipeline_model_parallel_size"] = (
+            teacher_cfg.pipeline_model_parallel_size
         )
-        if "expert_model_parallel_size" in teacher_cfg:
-            cfg["megatron_cfg"]["expert_model_parallel_size"] = teacher_cfg[
-                "expert_model_parallel_size"
-            ]
+        cfg["megatron_cfg"]["context_parallel_size"] = teacher_cfg.context_parallel_size
+        cfg["megatron_cfg"]["expert_model_parallel_size"] = (
+            teacher_cfg.expert_model_parallel_size
+        )
 
         # Apply any additional megatron config overrides from teacher config.
-        for key, value in teacher_cfg.get("megatron_cfg_overrides", {}).items():
+        for key, value in teacher_cfg.megatron_cfg_overrides.items():
             cfg["megatron_cfg"][key] = value
 
-        tp = teacher_cfg["tensor_model_parallel_size"]
-        pp = teacher_cfg.get("pipeline_model_parallel_size", 1)
-        cp = teacher_cfg.get("context_parallel_size", 1)
+        # Teachers run Megatron inference-only. Don't let the student's other
+        # backend or parameter-adding features leak onto the frozen teacher.
+        if cfg.get("dtensor_cfg", {}).get("enabled", False):
+            raise ValueError(
+                f"Teacher '{self.alias}': only the Megatron backend is supported "
+                "for teachers, but the policy config has dtensor_cfg.enabled=True."
+            )
+        if "dtensor_cfg" in cfg:
+            cfg["dtensor_cfg"]["enabled"] = False
+        if "peft" in cfg["megatron_cfg"]:
+            cfg["megatron_cfg"]["peft"]["enabled"] = False
+        if "draft" in cfg:
+            cfg["draft"]["enabled"] = False
+
+        tp = teacher_cfg.tensor_model_parallel_size
+        pp = teacher_cfg.pipeline_model_parallel_size
+        cp = teacher_cfg.context_parallel_size
 
         # Validate parallelism fits the cluster (matches lm_policy.py)
         world_size = cluster.world_size()
@@ -221,7 +214,7 @@ class TeacherWorkerGroup:
         )
 
         self.cfg = cfg
-        self._micro_batch_size = teacher_cfg.get("micro_batch_size")
+        self._micro_batch_size = teacher_cfg.micro_batch_size
 
         # Set up sequence packing / dynamic batching (mirrors lm_policy.py)
         self.use_sequence_packing = cfg["sequence_packing"]["enabled"]

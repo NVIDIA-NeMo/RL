@@ -1148,8 +1148,9 @@ def setup_model_and_optimizer(
 
     pre_wrap_hook = []
 
-    # For inference-only workers (no optimizer), freeze all params so DDP
-    # skips gradient buffer allocation — saves ~50 GiB for large MoE models.
+    # Inference-only workers (no optimizer) never train, so freeze all params.
+    # Fires for every init_optimizer=False caller (generation, reward model,
+    # distillation teachers), not just teachers.
     if not load_optimizer:
 
         def freeze_all_params(megatron_model):

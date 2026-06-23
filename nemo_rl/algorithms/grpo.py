@@ -545,7 +545,7 @@ def setup(
         opd_cfg = opd_module._opd_cfg(master_config)
         teacher_configs = create_teacher_configs_from_opd_config(opd_cfg)
         for tcfg in teacher_configs:
-            opd_teacher_nodes += tcfg.get("num_nodes", 1)
+            opd_teacher_nodes += tcfg.num_nodes
         policy_nodes -= opd_teacher_nodes
         assert policy_nodes > 0, (
             "policy_nodes must be > 0 after reserving OPD teacher nodes, but got "
@@ -1617,6 +1617,7 @@ def _create_advantage_estimator(master_config: MasterConfig):
         adv_estimator = GRPOAdvantageEstimator(adv_estimator_config, loss_config)
         print("  ✓ Using GRPO advantage estimator")
     elif adv_estimator_name == "opd":
+        opd_module.assert_prev_logprobs_available(master_config)
         adv_estimator = OPDAdvantageEstimator({"name": "opd"}, loss_config)
         print("  ✓ Using OPD advantage estimator")
         # Warn if loss_fn is not configured per MOPD paper recommendations.
@@ -2381,9 +2382,7 @@ def grpo_train(
                     "seq_logprob_error_threshold", None
                 )
                 force_on_policy_ratio = master_config.loss_fn.force_on_policy_ratio
-                skip_prev_logprobs = (
-                    force_on_policy_ratio and seq_logprob_error_threshold is None
-                )
+                skip_prev_logprobs = opd_module._skip_prev_logprobs(master_config)
                 # todo @jiaqi: is there a better way to skip prev_logprobs computation while still computing the seq-level error metrics?
                 if force_on_policy_ratio and seq_logprob_error_threshold is not None:
                     warnings.warn(
@@ -3617,9 +3616,7 @@ def async_grpo_train(
                     "seq_logprob_error_threshold", None
                 )
                 force_on_policy_ratio = master_config.loss_fn.force_on_policy_ratio
-                skip_prev_logprobs = (
-                    force_on_policy_ratio and seq_logprob_error_threshold is None
-                )
+                skip_prev_logprobs = opd_module._skip_prev_logprobs(master_config)
 
                 # todo @jiaqi: is there a better way to skip prev_logprobs computation while still computing the seq-level error metrics?
                 if force_on_policy_ratio and seq_logprob_error_threshold is not None:
