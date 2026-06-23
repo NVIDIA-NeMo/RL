@@ -198,6 +198,12 @@ uv venv</code></pre>
   </tbody>
 </table>
 
+> [!TIP]
+> **Smoke test:** to validate your install end-to-end more quickly, run the smoke recipe — it switches to GSM8K and caps the run at 10 steps:
+> ```sh
+> uv run examples/run_grpo.py --config examples/configs/grpo-smoke.yaml
+> ```
+
 ## Prerequisites
 
 Clone **NeMo RL**.
@@ -727,7 +733,7 @@ For detailed instructions on how to set up and launch NeMo RL on Slurm or Kubern
 
 - Large amounts of memory fragmentation might occur when running models without support for FlashAttention2.
   If OOM occurs after a few iterations of training, it may help to tweak the allocator settings to reduce memory fragmentation.
-  To do so, specify [`max_split_size_mb`](https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-alloc-conf)
+  To do so, specify [`max_split_size_mb`](https://docs.pytorch.org/docs/2.12/notes/cuda.html#optimizing-memory-usage-with-pytorch-alloc-conf)
   at **either** one of the following places:
   1. Launch training with:
   ```sh

@@ -330,16 +330,35 @@ async def generate_responses_async(
         # Ensure the key exists even if it's None, matching GenerationDatumSpec
         generation_input_data["stop_strings"] = [None] * len(input_lengths)
 
-    # Check if this is vLLM with async_engine enabled
-    use_async_generation = (
-        hasattr(policy_generation, "cfg")
-        and "vllm_cfg" in policy_generation.cfg
-        and policy_generation.cfg["vllm_cfg"]["async_engine"]
-        and hasattr(policy_generation, "generate_async")
-    )
+    # Check if this is a supported inference engine with async generation enabled.
+    # SGLang exposes ``sglang_cfg`` and gates on ``use_async_rollouts``; vLLM and
+    # Megatron expose ``cfg`` and gate on their respective ``async_engine`` flag.
+    vllm_cfg = getattr(policy_generation, "cfg", None)
+    sglang_cfg = getattr(policy_generation, "sglang_cfg", None)
+    generation_config = vllm_cfg or sglang_cfg or {}
+    backend = generation_config.get("backend", "")
 
-    assert use_async_generation, (
-        "Async generation is not enabled. Please enable async generation by setting async_engine=True in the vllm_cfg section of the policy config."
+    if backend == "sglang":
+        use_async_generation = bool(generation_config.get("use_async_rollouts", False))
+    elif backend == "vllm":
+        use_async_generation = bool(
+            generation_config.get("vllm_cfg", {}).get("async_engine", False)
+        )
+    elif backend == "megatron":
+        use_async_generation = bool(
+            generation_config.get("mcore_generation_config", {}).get(
+                "async_engine", False
+            )
+        )
+    else:
+        use_async_generation = False
+
+    assert use_async_generation and hasattr(policy_generation, "generate_async"), (
+        "Async generation is not enabled. For SGLang, set "
+        "policy.generation.use_async_rollouts=True. For vLLM, set "
+        "policy.generation.vllm_cfg.async_engine=True. For Megatron, set "
+        "policy.generation.mcore_generation_config.async_engine=True. The "
+        "generation backend must also implement generate_async."
     )
 
     # Use async generation with per-sample streaming
@@ -1327,7 +1346,14 @@ def run_async_nemo_gym_rollout(
     assert max_rollout_turns is None, (
         "`max_rollout_turns` is not supported in NeMo-Gym path!"
     )
-    engine_max_model_len = policy_generation.cfg["vllm_cfg"]["max_model_len"]
+    if "vllm_cfg" in policy_generation.cfg:
+        engine_max_model_len = policy_generation.cfg["vllm_cfg"]["max_model_len"]
+    elif "mcore_generation_config" in policy_generation.cfg:
+        engine_max_model_len = policy_generation.cfg["mcore_generation_config"][
+            "max_model_len"
+        ]
+    else:
+        engine_max_model_len = policy_generation.cfg["max_total_sequence_length"]
     if max_seq_len is not None and max_seq_len > engine_max_model_len:
         warnings.warn(
             f"policy max_total_sequence_length ({max_seq_len}) is greater than the "
@@ -1396,7 +1422,18 @@ def run_async_nemo_gym_rollout(
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
         batch_size = len(nemo_gym_rows)
-        max_total_tokens_per_sample = policy_generation.cfg["vllm_cfg"]["max_model_len"]
+        if "vllm_cfg" in policy_generation.cfg:
+            max_total_tokens_per_sample = policy_generation.cfg["vllm_cfg"][
+                "max_model_len"
+            ]
+        elif "mcore_generation_config" in policy_generation.cfg:
+            max_total_tokens_per_sample = policy_generation.cfg[
+                "mcore_generation_config"
+            ]["max_model_len"]
+        else:
+            max_total_tokens_per_sample = policy_generation.cfg[
+                "max_total_sequence_length"
+            ]
         all_sample_metrics = [
             {
                 "total_reward": r["full_result"]["reward"],

@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from functools import partial
+
 from nemo_rl.data import ResponseDatasetConfig
-from nemo_rl.data.datasets.response_datasets.aime24 import AIME2024Dataset
+from nemo_rl.data.datasets.response_datasets.aime import AIMEDataset
 from nemo_rl.data.datasets.response_datasets.arrow_text_dataset import ArrowTextDataset
 from nemo_rl.data.datasets.response_datasets.audiomcq import AudioMCQDataset
 from nemo_rl.data.datasets.response_datasets.avqa import AVQADataset
@@ -34,6 +36,7 @@ from nemo_rl.data.datasets.response_datasets.intent import (
     IntentBenchDataset,
     IntentTrainDataset,
 )
+from nemo_rl.data.datasets.response_datasets.mmpr_tiny import MMPRTinyDataset
 from nemo_rl.data.datasets.response_datasets.nemogym_dataset import NemoGymDataset
 from nemo_rl.data.datasets.response_datasets.nemotron_cascade2_sft import (
     NemotronCascade2SFTMathDataset,
@@ -56,7 +59,9 @@ DATASET_REGISTRY = {
     "audiomcq": AudioMCQDataset,
     "arrow_text": ArrowTextDataset,
     "avqa": AVQADataset,
-    "AIME2024": AIME2024Dataset,
+    "AIME2024": partial(AIMEDataset, variant="2024"),
+    "AIME2025": partial(AIMEDataset, variant="2025"),
+    "AIME2026": partial(AIMEDataset, variant="2026"),
     "clevr-cogent": CLEVRCoGenTDataset,
     "daily-omni": DailyOmniDataset,
     "general-conversation-jsonl": GeneralConversationsJsonlDataset,
@@ -65,6 +70,7 @@ DATASET_REGISTRY = {
     "DeepScaler": DeepScalerDataset,
     "GSM8K": GSM8KDataset,
     "geometry3k": Geometry3KDataset,
+    "mmpr-tiny": MMPRTinyDataset,
     "HelpSteer3": HelpSteer3Dataset,
     "intent-train": IntentTrainDataset,
     "intent-bench": IntentBenchDataset,
@@ -127,7 +133,7 @@ __all__ = [
     "AudioMCQDataset",
     "ArrowTextDataset",
     "AVQADataset",
-    "AIME2024Dataset",
+    "AIMEDataset",
     "CLEVRCoGenTDataset",
     "DailyOmniDataset",
     "GeneralConversationsJsonlDataset",
@@ -139,6 +145,7 @@ __all__ = [
     "HelpSteer3Dataset",
     "IntentBenchDataset",
     "IntentTrainDataset",
+    "MMPRTinyDataset",
     "NemoGymDataset",
     "NemotronCascade2SFTMathDataset",
     "OasstDataset",

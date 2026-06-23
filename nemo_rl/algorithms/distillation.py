@@ -673,6 +673,7 @@ def distillation_train(
             val_task_to_env,
             step=total_steps,
             master_config=master_config,
+            logger=logger,
         )
         student_generation.finish_generation()
         logger.log_metrics(val_metrics, total_steps, prefix="validation")
@@ -871,6 +872,7 @@ def distillation_train(
                         val_task_to_env,
                         step=total_steps + 1,
                         master_config=master_config,
+                        logger=logger,
                     )
                     student_generation.finish_generation()
                     logger.log_metrics(
@@ -1080,6 +1082,7 @@ def validate(
     val_task_to_env: Optional[dict[str, EnvironmentInterface]],
     step: int,
     master_config: MasterConfig,
+    logger: Optional[Logger] = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run validation on the validation dataset."""
     if val_dataloader is None:
@@ -1199,6 +1202,14 @@ def validate(
         except Exception as e:
             print(f"\n  ⚠️ Error displaying message samples: {str(e)}")
             print("  ⚠️ Continuing validation without displaying samples...", flush=True)
+
+    # Log validation data to JSONL file
+    if logger is not None:
+        val_log_data = {
+            "content": all_message_logs,
+            "rewards": total_rewards,
+        }
+        logger.log_batched_dict_as_jsonl(val_log_data, f"val_data_step{step}.jsonl")
 
     # Get timing metrics
     timing_metrics = timer.get_timing_metrics(reduction_op="sum")

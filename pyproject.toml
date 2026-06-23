@@ -54,6 +54,8 @@ dependencies = [
   # Floor raised to 5.5.0 for Gemma 4 support.
   "transformers>=5.5.0,<5.9.0",
   "num2words>=0.5.14",                                                                                                       # for SmolVLM
+  "timm",
+  "open-clip-torch>=3.2.0",
   "mlflow>=3.13.0",
   "nvidia-nvshmem-cu13>=3.6.5; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
   "swanlab",
@@ -144,9 +146,19 @@ vllm = [
   "num2words>=0.5.14",
   "flashinfer-python==0.6.8.post1",
   "flashinfer-cubin==0.6.8.post1",
+  "flashinfer-jit-cache==0.6.8.post1",
   "nvidia-cutlass-dsl>=4.5.2",
 ]
-sglang = ["sglang==0.5.12.post1", "sglang-kernel==0.4.2.post2", "kernels<0.15"]
+sglang = [
+  "sglang==0.5.12.post1",
+  "sglang-kernel==0.4.2.post2",         # Direct dep for explicit version control
+  "sglang-router",                      # Used by nemo_rl.models.generation.sglang.sglang_router for multi-engine routing
+  "kernels>=0.12.0,<0.13",
+  "flashinfer-python==0.6.11.post1",
+  "flashinfer-cubin==0.6.11.post1",
+  "flashinfer-jit-cache==0.6.11.post1",
+  "transformers==5.6.0",
+]
 mcore = [
   # also need cudnn (https://developer.nvidia.com/cudnn-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=deb_network)
   # wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-keyring_1.1-1_all.deb
