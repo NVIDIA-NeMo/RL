@@ -76,16 +76,16 @@ spec:
             - -c
             - |
               set -eu
+              DYNAMO_SRC=/mnt/rl-workspace/jothomson/dynamo-eagle-specdec-mx-refit/components/src
+              if [ ! -d "$DYNAMO_SRC/dynamo/vllm/mx_refit" ]; then
+                echo "FATAL: mounted Dynamo source missing: $DYNAMO_SRC" >&2
+                exit 1
+              fi
+              export PYTHONPATH="$DYNAMO_SRC:${PYTHONPATH:-}"
               python3 - <<'PY'
-              import importlib.util
-              import shutil
+              import dynamo.vllm.mx_refit.extension as extension
 
-              src = "/mnt/rl-workspace/jothomson/nemo-rl-qwen3-eagle3-dynamo-mx/infra/nrl_k8s/dynamo_mx/mx_refit_extension_megatron.py"
-              spec = importlib.util.find_spec("dynamo.vllm.mx_refit.extension")
-              if spec is None or spec.origin is None:
-                  raise RuntimeError("Could not locate dynamo.vllm.mx_refit.extension")
-              shutil.copyfile(src, spec.origin)
-              print(f"[mx-debug] overlaid extension.py: {spec.origin}", flush=True)
+              print(f"[mx-debug] using mounted Dynamo MX refit: {extension.__file__}", flush=True)
               PY
               exec python3 -m dynamo.vllm "$@"
             - --
