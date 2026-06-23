@@ -1199,6 +1199,7 @@ class MegatronPolicyWorkerImpl(
         *,
         version: int,
         mx_config: Any,
+        kv_scales: Optional[dict[str, float]] = None,
     ) -> None:
         """Publish per-rank Megatron-native shards to ModelExpress (v2 path).
 
@@ -1211,8 +1212,8 @@ class MegatronPolicyWorkerImpl(
         * classify each parameter into one of seven Megatron roles
           (qkv_column, gated_mlp_column, column, row, vocab_parallel,
           replicated, expert_column / expert_row);
-        * skip replicated tensors on TP ranks > 0 (rank 0 publishes for the
-          replicated set);
+        * skip replicated model tensors on TP ranks > 0 (rank 0 publishes for
+          the replicated set);
         * publish the native shard as-is — Megatron's parameter storage
           already holds only the local TP/PP/EP slice, so no allgather is
           needed.
@@ -1221,16 +1222,12 @@ class MegatronPolicyWorkerImpl(
         receiver-side slice planner that consumes this metadata lives in
         ``modelexpress.nemo_rl_v2`` (PR #421 commit ``12c73a7``).
         """
-        if kv_scales := getattr(self, "_kv_scales_for_mx", None):
-            raise NotImplementedError(
-                "FP8 kvcache scales are not yet supported on the Megatron MX path"
-            )
-
         from megatron.core import parallel_state
 
         from nemo_rl.distributed.mx_helpers import build_v2_publisher
         from nemo_rl.distributed.mx_megatron_helpers import (
             ROLE_COLUMN,
+            ROLE_REPLICATED,
             collect_megatron_publish_set,
         )
 
@@ -1287,21 +1284,26 @@ class MegatronPolicyWorkerImpl(
         # contributing sources, so this is recoverable on the receiver side
         # for matched-TP).
         tcfg = getattr(self.megatron_bridge, "transformer_config", None)
-        num_attention_heads = getattr(tcfg, "num_attention_heads", None) if tcfg else None
+        num_attention_heads = (
+            getattr(tcfg, "num_attention_heads", None) if tcfg else None
+        )
         num_kv_heads = (
             getattr(tcfg, "num_query_groups", None) if tcfg else None
         ) or num_attention_heads
-        head_dim = (
-            getattr(tcfg, "kv_channels", None) if tcfg else None
-        ) or (
-            num_attention_heads and getattr(tcfg, "hidden_size", 0) // num_attention_heads
-            if tcfg else None
+        head_dim = (getattr(tcfg, "kv_channels", None) if tcfg else None) or (
+            num_attention_heads
+            and getattr(tcfg, "hidden_size", 0) // num_attention_heads
+            if tcfg
+            else None
         )
 
         role_overrides = self._mx_megatron_role_overrides_from_sidecar(
             role=ROLE_COLUMN,
         )
         role_overrides.update(getattr(mx_config, "megatron_role_overrides", None) or {})
+        publish_kv_scales_on_all_ranks = bool(
+            getattr(mx_config, "same_rank_only", False) and tp_size > 1
+        )
 
         # ---- Add tensors. ----
         if hasattr(self._mx_publisher, "_registry"):
@@ -1312,13 +1314,19 @@ class MegatronPolicyWorkerImpl(
         # Stamp the publisher's mesh position so the source identity and
         # sidecar will carry tp_rank / pp_rank / ep_rank for receivers.
         self._mx_publisher.set_megatron_mesh_position(
-            tp_rank=tp_rank, pp_rank=pp_rank, ep_rank=ep_rank,
+            tp_rank=tp_rank,
+            pp_rank=pp_rank,
+            ep_rank=ep_rank,
         )
 
         for name, local, spec, extras in collect_megatron_publish_set(
             self.model,
-            tp_size=tp_size, pp_size=pp_size, pp_rank=pp_rank,
-            ep_size=ep_size, ep_rank=ep_rank, tp_rank=tp_rank,
+            tp_size=tp_size,
+            pp_size=pp_size,
+            pp_rank=pp_rank,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            tp_rank=tp_rank,
             num_attention_heads=num_attention_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
@@ -1338,6 +1346,23 @@ class MegatronPolicyWorkerImpl(
                 megatron_role=spec.role,
                 megatron_extras=spec.descriptor_extras,
             )
+
+        if kv_scales and (tp_rank == 0 or publish_kv_scales_on_all_ranks):
+            for name, scale_value in sorted(kv_scales.items()):
+                scale_tensor = torch.tensor(
+                    float(scale_value),
+                    dtype=torch.float32,
+                    device="cuda",
+                ).reshape(1)
+                self._mx_publisher.add_tensor(
+                    name=name,
+                    tensor=scale_tensor,
+                    is_expert=False,
+                    expert_axis=0,
+                    owned_expert_ids=(),
+                    megatron_role=ROLE_REPLICATED,
+                    megatron_extras={"fp8_kv_scale": "1"},
+                )
 
         # ---- Publish + mark ready. ----
         self._mx_publisher.publish(version=int(version))
@@ -1387,9 +1412,7 @@ class MegatronPolicyWorkerImpl(
         tcfg = getattr(self.megatron_bridge, "transformer_config", None)
         if tcfg is not None:
             num_heads = getattr(tcfg, "num_attention_heads", None)
-            kv_groups = (
-                getattr(tcfg, "num_query_groups", None) or num_heads
-            )
+            kv_groups = getattr(tcfg, "num_query_groups", None) or num_heads
             kv_channels = getattr(tcfg, "kv_channels", None)
             if kv_channels is None and num_heads:
                 kv_channels = getattr(tcfg, "hidden_size", 0) // num_heads

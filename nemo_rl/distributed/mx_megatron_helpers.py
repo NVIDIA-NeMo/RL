@@ -90,11 +90,17 @@ ROLE_REPLICATED = "replicated"
 ROLE_EXPERT_COLUMN = "expert_column"
 ROLE_EXPERT_ROW = "expert_row"
 
-_TP_SHARDED_ROLES = frozenset({
-    ROLE_QKV_COLUMN, ROLE_GATED_MLP_COLUMN, ROLE_COLUMN,
-    ROLE_ROW, ROLE_VOCAB_PARALLEL,
-    ROLE_EXPERT_COLUMN, ROLE_EXPERT_ROW,
-})
+_TP_SHARDED_ROLES = frozenset(
+    {
+        ROLE_QKV_COLUMN,
+        ROLE_GATED_MLP_COLUMN,
+        ROLE_COLUMN,
+        ROLE_ROW,
+        ROLE_VOCAB_PARALLEL,
+        ROLE_EXPERT_COLUMN,
+        ROLE_EXPERT_ROW,
+    }
+)
 
 
 @dataclass
@@ -121,7 +127,12 @@ class MegatronRoleSpec:
 _DEFAULT_FUSED_QKV_NAME_PATTERNS = ("linear_qkv", "qkv_proj", "fused_qkv")
 _DEFAULT_FUSED_GATED_MLP_PATTERNS = ("linear_fc1", "gate_up_proj")
 # Vocab / embedding name pattern.
-_DEFAULT_VOCAB_NAME_PATTERNS = ("word_embeddings", "embedding", "lm_head", "output_layer")
+_DEFAULT_VOCAB_NAME_PATTERNS = (
+    "word_embeddings",
+    "embedding",
+    "lm_head",
+    "output_layer",
+)
 
 
 def _bridge_module_type_registry() -> dict[str, set[str]] | None:
@@ -138,6 +149,7 @@ def _bridge_module_type_registry() -> dict[str, set[str]] | None:
         from megatron.bridge.models.conversion.param_mapping import (
             AutoMapping as _AM,
         )
+
         return dict(_AM._MODULE_TYPE_REGISTRY)
     except Exception:
         return None
@@ -167,9 +179,17 @@ def _classify_module_class(mod_class_name: str) -> str | None:
         return "column"
     if "RowParallel" in mod_class_name:
         return "row"
-    if any(needle in mod_class_name for needle in (
-        "Norm", "RMSNorm", "L2Norm", "TopKRouter", "LinearForLastLayer", "IdentityOp",
-    )):
+    if any(
+        needle in mod_class_name
+        for needle in (
+            "Norm",
+            "RMSNorm",
+            "L2Norm",
+            "TopKRouter",
+            "LinearForLastLayer",
+            "IdentityOp",
+        )
+    ):
         return "replicated"
     return None
 
@@ -189,7 +209,7 @@ def _is_param_leaf(name_part: str) -> bool:
         return True
     for base in ("weight", "bias", "scale"):
         if name_part.startswith(base):
-            suffix = name_part[len(base):]
+            suffix = name_part[len(base) :]
             if suffix and suffix.isdigit():
                 return True
     return False
@@ -199,7 +219,7 @@ def _expert_index_from_param(name_part: str) -> int | None:
     """If ``name_part`` is ``weight<N>``/``bias<N>``/etc, return ``N``."""
     for base in ("weight", "bias", "scale"):
         if name_part.startswith(base):
-            suffix = name_part[len(base):]
+            suffix = name_part[len(base) :]
             if suffix and suffix.isdigit():
                 return int(suffix)
     return None
@@ -317,8 +337,7 @@ def detect_megatron_role(
             # full local shard; the receiver runs per_expert assembly.
             mod_class = _module_class_name(_enclosing_module(name, model))
             sub_role = (
-                ROLE_EXPERT_ROW if "RowParallel" in mod_class
-                else ROLE_EXPERT_COLUMN
+                ROLE_EXPERT_ROW if "RowParallel" in mod_class else ROLE_EXPERT_COLUMN
             )
             return MegatronRoleSpec(
                 role=sub_role,
@@ -334,7 +353,11 @@ def detect_megatron_role(
 
     # ---- 2b. EP>1 leading-axis grouped (legacy path: single .weight
     # holds ep_size experts as the leading axis chunk). ----
-    if _is_expert_name(name, expert_pattern=expert_pattern) and ep_size > 1 and param.ndim >= 2:
+    if (
+        _is_expert_name(name, expert_pattern=expert_pattern)
+        and ep_size > 1
+        and param.ndim >= 2
+    ):
         leading = param.shape[0]
         if leading % ep_size == 0:
             chunk = leading // ep_size
@@ -366,7 +389,10 @@ def detect_megatron_role(
 
     # ---- 4. VocabParallelEmbedding / lm_head sharded along rows. ----
     if mod_class == "VocabParallelEmbedding" or (
-        _is_vocab_name(name) and tp_size > 1 and param.ndim >= 2 and parallelism == "column"
+        _is_vocab_name(name)
+        and tp_size > 1
+        and param.ndim >= 2
+        and parallelism == "column"
     ):
         return MegatronRoleSpec(role=ROLE_VOCAB_PARALLEL)
 
@@ -423,9 +449,10 @@ def collect_megatron_publish_set(
 
     For each parameter:
 
-    * Skips replicated tensors when ``tp_rank != 0`` (rank 0 publishes,
-      others have nothing new to add — the trainer's parameters are
-      replicated across TP ranks for these).
+    * Skips replicated tensors when ``tp_rank != 0``. The MX Megatron receiver
+      handles rank-0 replicated model tensors specially; publishing local
+      copies from non-zero TP ranks can make vLLM's rank-local loader treat
+      them as global tensors and slice past the end.
     * Returns the parameter as-is — Megatron stores native shards, so
       the param tensor IS the local shard. No allgather, no Bridge call.
     * ``full_extras`` is the merged ``{megatron_role, tp_rank, tp_size,
@@ -461,17 +488,21 @@ def collect_megatron_publish_set(
         # receiver saw only `expert_column` / `replicated` because
         # every TP-sharded role fell through to the default.)
         name = (
-            raw_name[len("module."):]
-            if raw_name.startswith("module.")
-            else raw_name
+            raw_name[len("module.") :] if raw_name.startswith("module.") else raw_name
         )
 
         spec = detect_megatron_role(
-            raw_name, param, model=model,
-            tp_size=tp_size, ep_size=ep_size, ep_rank=ep_rank,
+            raw_name,
+            param,
+            model=model,
+            tp_size=tp_size,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
             num_attention_heads=num_attention_heads,
-            num_kv_heads=num_kv_heads, head_dim=head_dim,
-            expert_pattern=expert_pattern, role_overrides=role_overrides,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            expert_pattern=expert_pattern,
+            role_overrides=role_overrides,
         )
 
         if spec.role == ROLE_REPLICATED and tp_rank != 0:

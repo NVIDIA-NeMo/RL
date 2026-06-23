@@ -184,6 +184,7 @@ Current runnable exemplars:
 - `infra/nrl_k8s/examples/k8s_exemplars/V2/*.yaml`: Llama 3.1 8B instruct Megatron + Dynamo + MX.
 - `infra/nrl_k8s/examples/k8s_exemplars/V3/*.yaml`: sliding puzzle + Dynamo + MX.
 - `infra/nrl_k8s/examples/k8s_exemplars/V5/*.yaml`: Nemotron Nano v2 workplace-assistant Megatron + Dynamo + MX.
+- `infra/nrl_k8s/examples/k8s_exemplars/V6/*.yaml`: Qwen3-8B-Base Megatron FP8 KV-cache + Dynamo + MX.
 
 ## Rollout Path
 
@@ -355,7 +356,9 @@ infra/DGD YAMLs (GB300):
   still allgathers each DTensor with `full_tensor()` before publish. Megatron
   refit publishes native local shards and currently requires matched trainer TP
   and DGD TP.
-- **FP8 KV-cache scales** are not yet supported on the MX path.
+- **FP8 KV-cache scales** are supported on the Megatron MX matched-TP path used
+  by V6. DTensor MX FP8 KV-cache scales and cross-TP repartitioning remain
+  unsupported.
 - **No collective / IPC weight sync** for the Dynamo backend — MX is the only
   non-colocated refit mechanism.
 

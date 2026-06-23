@@ -157,10 +157,10 @@ _DEFAULT_METRICS_EXCLUDE_PREFIXES = ("python_", "process_")
 # Tier 1 — Dynamo *runtime* metrics (dynamo_component_* / dynamo_work_handler_*),
 # emitted identically by ANY Dynamo engine, so backend-agnostic.
 _DYNAMO_RUNTIME_METRIC_PREFIXES = (
-    "dynamo_component_gpu_cache_usage",            # kv-cache utilization
-    "dynamo_component_inflight_requests",          # inflight (running) requests
-    "dynamo_work_handler_queue_depth",             # pending queue depth
-    "dynamo_component_requests_total",             # request throughput (requests)
+    "dynamo_component_gpu_cache_usage",  # kv-cache utilization
+    "dynamo_component_inflight_requests",  # inflight (running) requests
+    "dynamo_work_handler_queue_depth",  # pending queue depth
+    "dynamo_component_requests_total",  # request throughput (requests)
     "dynamo_work_handler_time_to_first_response",  # time-to-first-response latency
 )
 # Tier 2 — engine-specific passthroughs for high-value signals the Dynamo runtime
@@ -168,9 +168,9 @@ _DYNAMO_RUNTIME_METRIC_PREFIXES = (
 # the only engine wired today; as others are onboarded add their equivalents here
 # (e.g. "sglang:..."), and a non-matching engine just falls back to Tier 1.
 _ENGINE_PASSTHROUGH_METRIC_PREFIXES = (
-    "vllm:generation_tokens",                      # generation throughput (tokens)
-    "vllm:prompt_tokens_total",                    # prompt throughput (tokens)
-    "vllm:inter_token_latency",                    # inter-token (decode) latency
+    "vllm:generation_tokens",  # generation throughput (tokens)
+    "vllm:prompt_tokens_total",  # prompt throughput (tokens)
+    "vllm:inter_token_latency",  # inter-token (decode) latency
 )
 _CURATED_METRICS_INCLUDE_PREFIXES = (
     _DYNAMO_RUNTIME_METRIC_PREFIXES + _ENGINE_PASSTHROUGH_METRIC_PREFIXES
@@ -313,8 +313,12 @@ def _discover_worker_instances(
     try:
         with urllib.request.urlopen(url, timeout=timeout_s) as resp:
             data = json.loads(resp.read())
-    except (urllib.error.HTTPError, urllib.error.URLError,
-            TimeoutError, json.JSONDecodeError):
+    except (
+        urllib.error.HTTPError,
+        urllib.error.URLError,
+        TimeoutError,
+        json.JSONDecodeError,
+    ):
         return []
     instances = data.get("instances", []) if isinstance(data, dict) else []
     if not isinstance(instances, list):
@@ -350,10 +354,12 @@ def _discover_worker_instances(
             continue
         pod_ip = m.group(1)
         seen_ids.add(inst_id)
-        out.append({
-            "instance_id": inst_id,
-            "system_url": f"http://{pod_ip}:{dyn_system_port}",
-        })
+        out.append(
+            {
+                "instance_id": inst_id,
+                "system_url": f"http://{pod_ip}:{dyn_system_port}",
+            }
+        )
     return out
 
 
@@ -409,7 +415,9 @@ def _dispatch_update_weights_via_mx_remote(
         dyn_namespaces = {f"{k8s_namespace}-{dgd_name}"}
     payload = {"version": version, "mx_config": mx_config_dict}
 
-    def _step(sys_url: str, route: str, body: dict[str, Any], timeout_s: float) -> dict[str, Any]:
+    def _step(
+        sys_url: str, route: str, body: dict[str, Any], timeout_s: float
+    ) -> dict[str, Any]:
         return _http_post_json(f"{sys_url}/engine/{route}", body, timeout_s)
 
     refitted_ids: set[Any] = set()
@@ -430,6 +438,7 @@ def _dispatch_update_weights_via_mx_remote(
     # dooms every remaining worker. Bounded by mx_config.timeout_seconds so a
     # genuinely broken refit still surfaces instead of hanging forever.
     import time as _time
+
     _cycle_deadline = _time.monotonic() + float(
         mx_config_dict.get("timeout_seconds", 300.0)
     )
@@ -440,6 +449,7 @@ def _dispatch_update_weights_via_mx_remote(
             # not yet registered in the frontend's discovery system. Retry
             # with backoff before giving up.
             import time as _time
+
             instances = []
             for _attempt in range(20):
                 instances = _discover_worker_instances(
@@ -467,9 +477,7 @@ def _dispatch_update_weights_via_mx_remote(
                 dyn_system_port=dyn_system_port,
             )
 
-        new_instances = [
-            i for i in instances if i["instance_id"] not in refitted_ids
-        ]
+        new_instances = [i for i in instances if i["instance_id"] not in refitted_ids]
         iter_log = {
             "iteration": iteration,
             "discovered": len(instances),
@@ -547,13 +555,11 @@ def _dispatch_update_weights_via_mx_remote(
         wave_idx = 0
         while remaining:
             wave_idx += 1
-            wave_size = min(len(remaining), FANOUT ** wave_idx)
+            wave_size = min(len(remaining), FANOUT**wave_idx)
             wave = remaining[:wave_size]
             remaining = remaining[wave_size:]
             wave_start = _time.monotonic()
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=len(wave)
-            ) as ex:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(wave)) as ex:
                 futures = [ex.submit(_refit_one, inst) for inst in wave]
                 for fut in concurrent.futures.as_completed(futures):
                     inst_id, fmsgs, _steps = fut.result()
@@ -587,7 +593,8 @@ def _dispatch_update_weights_via_mx_remote(
             f"failed: " + " | ".join(failures[:3])
         )
     return {
-        "status": "ok", "version": version,
+        "status": "ok",
+        "version": version,
         "workers_refitted": len(refitted_ids),
         "iterations": iteration_logs,
     }
@@ -942,7 +949,6 @@ class DynamoGeneration(GenerationInterface):
             "temperature": 0.0 if greedy else self.cfg["temperature"],
             "top_p": self.cfg["top_p"],
             "top_k": top_k_val,
-            "logprobs": 0,
             "n": 1,
             "return_tokens_as_token_ids": True,
             "include_stop_str_in_output": True,
@@ -1270,6 +1276,15 @@ class DynamoGeneration(GenerationInterface):
         """
         return
 
+    @property
+    def requires_kv_scale_sync(self) -> bool:
+        """Whether Dynamo/vLLM generation needs FP8 KV-cache scale refit."""
+        vllm_cfg = self.cfg.get("vllm_cfg", None)
+        if vllm_cfg is None:
+            return False
+        kv_cache_dtype = vllm_cfg.get("kv_cache_dtype", None)
+        return kv_cache_dtype is not None and str(kv_cache_dtype).startswith("fp8")
+
     def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
         raise NotImplementedError(
             "DynamoGeneration does not support IPC ZMQ weight sync — use "
@@ -1323,6 +1338,7 @@ class DynamoGeneration(GenerationInterface):
             mx_config_dict = dict(mx_config)
         elif hasattr(mx_config, "__dataclass_fields__"):
             import dataclasses
+
             mx_config_dict = dataclasses.asdict(mx_config)
         else:
             mx_config_dict = {}

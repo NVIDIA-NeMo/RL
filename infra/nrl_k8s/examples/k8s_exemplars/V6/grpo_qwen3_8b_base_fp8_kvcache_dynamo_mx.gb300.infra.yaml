@@ -1,0 +1,238 @@
+# Qwen3-8B-Base Megatron GRPO FP8 KV-cache + Dynamo + MX on GB300.
+# GB300 nodes in this profile expose 4 GPUs, so this k8s smoke runs the
+# source recipe's TP=4 Megatron policy on one 4-GPU node.
+#
+# Run from the V6 worktree:
+#   RECIPE=infra/nrl_k8s/examples/k8s_exemplars/V6/grpo_qwen3_8b_base_fp8_kvcache_dynamo_mx.yaml
+#   INFRA=infra/nrl_k8s/examples/k8s_exemplars/V6/grpo_qwen3_8b_base_fp8_kvcache_dynamo_mx.gb300.infra.yaml
+#   nrl-k8s check $RECIPE --infra $INFRA
+#   nrl-k8s run   $RECIPE --infra $INFRA --raycluster --no-wait --replace
+
+_shared:
+  headNodeSelector: &head_node_selector
+    nodeGroup: customer-cpu
+    kubernetes.io/arch: arm64
+  workerNodeSelector: &worker_node_selector
+    nvidia.com/gpu.product: NVIDIA-GB300
+  sharedPythonPath: &shared_python_path "/opt/nemo-rl:/mnt/rl-workspace/${user:}/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src:/mnt/rl-workspace/${user:}/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM"
+  userSecretEnvFrom: &user_secret_env_from
+    - secretRef:
+        name: ${user:}-secrets
+        optional: true
+  headEnv: &shared_head_env
+    - {name: HF_HOME,                       value: "/mnt/rl-workspace/${user:}/hf-cache"}
+    - {name: PYTHONPATH,                    value: *shared_python_path}
+    - {name: NCCL_DEBUG,                    value: WARN}
+    - {name: RAY_memory_monitor_refresh_ms, value: "0"}
+    - {name: TOKENIZERS_PARALLELISM,        value: "false"}
+  workerEnv: &shared_worker_env
+    - {name: HF_HOME,                       value: "/mnt/rl-workspace/${user:}/hf-cache"}
+    - {name: PYTHONPATH,                    value: *shared_python_path}
+    - {name: NCCL_DEBUG,                    value: WARN}
+    - {name: RAY_memory_monitor_refresh_ms, value: "0"}
+    - {name: TOKENIZERS_PARALLELISM,        value: "false"}
+    - {name: UCX_TLS,                       value: "rc,cuda_copy"}
+    - {name: NIXL_UCX_TLS,                  value: "rc,cuda_copy"}
+    - {name: UCX_IB_GPU_DIRECT_RDMA,        value: "yes"}
+    - {name: UCX_CUDA_COPY_DMABUF,          value: "yes"}
+    - {name: MX_RDMA_NIC_PIN,               value: "auto"}
+  headResources: &head_resources
+    limits:   {cpu: "48", memory: "128Gi"}
+    requests: {cpu: "16", memory: "64Gi"}
+  gpuWorkerResources: &gpu_worker_resources
+    limits:
+      cpu: "128"
+      memory: "900Gi"
+      nvidia.com/gpu: "4"
+    requests:
+      cpu: "96"
+      memory: "700Gi"
+      nvidia.com/gpu: "4"
+    claims:
+      - {name: roce-channel}
+  gpuHeadPorts: &gpu_head_ports
+    - {containerPort: 6379,  name: gcs-server}
+    - {containerPort: 8265,  name: dashboard}
+    - {containerPort: 10001, name: client}
+  codeMounts: &code_mounts
+    - {mountPath: /dev/shm,          name: dshm}
+    - {mountPath: /opt/nemo-rl,      name: rl-workspace, subPath: "${user:}/nemo-rl-v6-dynamo-fp8"}
+    - {mountPath: /mnt/rl-workspace, name: rl-workspace}
+  headVolumes: &head_volumes
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 8Gi}
+    - name: rl-workspace
+      persistentVolumeClaim: {claimName: rl-workspace}
+  workerVolumes: &worker_volumes
+    - name: dshm
+      emptyDir: {medium: Memory, sizeLimit: 128Gi}
+    - name: rl-workspace
+      persistentVolumeClaim: {claimName: rl-workspace}
+
+image: jwillthomson/nemo-rl-mx:06-12
+imagePullSecrets: [nvcr-secret]
+serviceAccount: nemo-rl-endpoint-registry
+
+labels:
+  nrl-k8s/owner: ${user:}
+
+submit:
+  submitter: portForward
+
+launch:
+  mode: attach
+  runMode: batch
+  codeSource: image
+  codePath: /opt/nemo-rl
+  attach:
+    training: ${user:}-rc-qwen3-8b-fp8-kvcache-dyn-mx-v6
+  peerWatcher: false
+  env: {}
+  entrypoint: |
+    set -eu
+    cd /opt/nemo-rl
+    if [ ! -d /mnt/rl-workspace ]; then
+      echo "ERROR: /mnt/rl-workspace not mounted; is the rl-workspace PVC bound?" >&2
+      exit 1
+    fi
+
+    export PYTHONPATH=/opt/nemo-rl:/mnt/rl-workspace/${user:}/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/src:/mnt/rl-workspace/${user:}/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM
+    export MX_RDMA_NIC_PIN=auto
+    export TOKENIZERS_PARALLELISM=false
+
+    python - <<'PY'
+    import importlib.util
+    import modelexpress
+    import modelexpress.megatron_translator as mt
+    import megatron.bridge
+    import megatron.core
+
+    try:
+        transformer_engine_spec = importlib.util.find_spec("transformer_engine.pytorch")
+    except ModuleNotFoundError:
+        transformer_engine_spec = None
+    if transformer_engine_spec is None:
+        raise RuntimeError("transformer_engine.pytorch is required for the Megatron Bridge path")
+    import transformer_engine.pytorch as te
+
+    print("modelexpress:", modelexpress.__file__)
+    print("megatron translator:", mt.__file__)
+    print("megatron.core:", megatron.core.__file__)
+    print("megatron.bridge:", megatron.bridge.__file__)
+    print("transformer_engine.pytorch:", te.__file__)
+    PY
+
+    echo "[probe] Dynamo FP8 completion probe: temperature=1.0 top_p=1.0 top_k=-1"
+    python - <<'PY'
+    import json
+    import urllib.request
+
+    url = "http://${user:}-dyn-q8b-fp8-kv-v6-frontend.default.svc.cluster.local:8000/v1/completions"
+    payload = {
+        "model": "Qwen/Qwen3-8B-Base",
+        "prompt": [0],
+        "max_tokens": 8,
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": -1,
+        "n": 1,
+        "return_tokens_as_token_ids": True,
+        "include_stop_str_in_output": True,
+        "nvext": {"extra_fields": ["completion_token_ids"]},
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=900) as resp:
+        body = json.loads(resp.read().decode("utf-8"))
+    print("[probe] status=ok completion_token_ids=", body.get("nvext", {}).get("completion_token_ids"))
+    PY
+
+    TIMESTAMP=$(date -u +%Y%m%d-%H%M%S-%N)
+    LOG_DIR=/mnt/rl-workspace/${user:}/driver_logs
+    LOG=\${LOG_DIR}/${user:}-qwen3-8b-fp8-kvcache-dyn-mx-v6-\${TIMESTAMP}.log
+    mkdir -p "\${LOG_DIR}"
+
+    PIPE=$(mktemp -u)
+    mkfifo "\${PIPE}"
+    tee "\${LOG}" < "\${PIPE}" &
+    TEE_PID=$!
+
+    RC=0
+    python -u examples/run_grpo.py \
+      --config infra/nrl_k8s/examples/k8s_exemplars/V6/grpo_qwen3_8b_base_fp8_kvcache_dynamo_mx.yaml \
+      +policy.generation.dynamo_cfg.dgd_name=${user:}-dyn-q8b-fp8-kv-v6 \
+      > "\${PIPE}" 2>&1 || RC=$?
+
+    wait "\${TEE_PID}" || true
+    rm -f "\${PIPE}"
+    exit "\${RC}"
+
+kuberay:
+  training:
+    name: ${user:}-rc-qwen3-8b-fp8-kvcache-dyn-mx-v6
+    labels:
+      disagg.nemo-rl/cluster: qwen3-8b-fp8-kvcache-dyn-mx-v6
+      disagg.nemo-rl/run: qwen3-8b-fp8-kvcache-dyn-mx-v6
+      kai.scheduler/queue: backfill
+    spec:
+      rayVersion: "2.52.0"
+      headGroupSpec:
+        rayStartParams:
+          dashboard-host: "0.0.0.0"
+          no-monitor: "true"
+          num-gpus: "0"
+          object-store-memory: "200000000"
+        template:
+          spec:
+            schedulerName: kai-scheduler
+            dnsPolicy: ClusterFirst
+            nodeSelector: *head_node_selector
+            tolerations:
+              - operator: Exists
+            containers:
+              - name: ray-head
+                env: *shared_head_env
+                envFrom: *user_secret_env_from
+                resources: *head_resources
+                ports: *gpu_head_ports
+                volumeMounts: *code_mounts
+            volumes: *head_volumes
+      workerGroupSpecs:
+        - groupName: gpu-workers
+          replicas: 1
+          minReplicas: 1
+          maxReplicas: 1
+          numOfHosts: 1
+          rayStartParams:
+            num-gpus: "4"
+            object-store-memory: "200000000"
+          template:
+            spec:
+              schedulerName: kai-scheduler
+              dnsPolicy: ClusterFirst
+              nodeSelector: *worker_node_selector
+              tolerations:
+                - operator: Exists
+              resourceClaims:
+                - name: roce-channel
+                  resourceClaimTemplateName: roce-mx-trainer-qwen3-8b-fp8-kvcache-v6
+              containers:
+                - name: ray-worker
+                  env: *shared_worker_env
+                  envFrom: *user_secret_env_from
+                  resources: *gpu_worker_resources
+                  securityContext:
+                    capabilities:
+                      add: [IPC_LOCK]
+                  volumeMounts: *code_mounts
+              volumes: *worker_volumes
+
+dynamo:
+  serving:
+    manifest: ../../../examples_dgd/k8s_exemplars/V6/qwen3_8b_base_fp8_kvcache_gb300_mx.yaml
+    name: ${user:}-dyn-q8b-fp8-kv-v6
+    readyTimeoutS: 1800

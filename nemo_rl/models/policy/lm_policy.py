@@ -920,12 +920,14 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         *,
         version: int,
         mx_config: Any,
+        kv_scales: Optional[dict[str, float]] = None,
     ) -> list[ray.ObjectRef]:
         """Publish weights to ModelExpress for NIXL RDMA refit (v2 path)."""
         futures = self.worker_group.run_all_workers_single_data(
             "stream_weights_via_mx",
             version=int(version),
             mx_config=mx_config,
+            kv_scales=kv_scales,
         )
         return futures
 

@@ -1,0 +1,148 @@
+# DynamoGraphDeployment for Qwen/Qwen3-8B-Base on GB300, MX-enabled.
+#
+# Used by the V6 Qwen3-8B FP8 KV-cache k8s smoke. The worker image must
+# include Dynamo's native FP8 MX refit support.
+
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: qwen3-8b-base-fp8-kvcache-gb300-mx
+  annotations:
+    nvidia.com/kai-scheduler-queue: backfill
+spec:
+  services:
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      envFromSecret: jothomson-secrets
+      resources:
+        requests:
+          cpu: "2"
+          memory: "4Gi"
+        limits:
+          cpu: "4"
+          memory: "8Gi"
+      extraPodSpec:
+        nodeSelector:
+          nodeGroup: customer-cpu
+          kubernetes.io/arch: arm64
+        tolerations:
+          - operator: Exists
+        volumes:
+          - name: rl-workspace
+            persistentVolumeClaim:
+              claimName: rl-workspace
+        mainContainer:
+          image: jwillthomson/dynamo-arm-tokenize-endpoint-7da82a91
+          workingDir: /workspace
+          volumeMounts:
+            - mountPath: /mnt/rl-workspace
+              name: rl-workspace
+          command:
+            - python3
+            - -m
+            - dynamo.frontend
+          args:
+            - --router-reset-states
+          env:
+            - name: HF_HOME
+              value: /mnt/rl-workspace/jothomson/hf-cache
+    VllmDecodeWorker:
+      componentType: worker
+      replicas: 1
+      envFromSecret: jothomson-secrets
+      resources:
+        requests:
+          gpu: "4"
+          memory: "256Gi"
+        limits:
+          gpu: "4"
+          memory: "512Gi"
+      extraPodSpec:
+        securityContext:
+          runAsUser: 0
+        nodeSelector:
+          nvidia.com/gpu.product: NVIDIA-GB300
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - key: kubernetes.io/hostname
+                      operator: NotIn
+                      values:
+                        - ip-7-248-83-107.us-east-2.compute.internal
+                        - ip-7-248-83-123.us-east-2.compute.internal
+        tolerations:
+          - operator: Exists
+        resourceClaims:
+          - name: roce-channel
+            resourceClaimTemplateName: roce-mx-qwen3-4b
+        volumes:
+          - name: rl-workspace
+            persistentVolumeClaim:
+              claimName: rl-workspace
+        mainContainer:
+          image: jwillthomson/dynamo-arm-tokenize-endpoint-7da82a91
+          workingDir: /workspace
+          volumeMounts:
+            - mountPath: /mnt/rl-workspace
+              name: rl-workspace
+          command:
+            - python3
+            - -m
+            - dynamo.vllm
+          args:
+            - --model
+            - Qwen/Qwen3-8B-Base
+            - --served-model-name
+            - Qwen/Qwen3-8B-Base
+            - --load-format
+            - mx
+            - --model-express-url
+            - modelexpress-server.default.svc.cluster.local:8001
+            - --tensor-parallel-size
+            - "4"
+            - --dtype
+            - bfloat16
+            - --quantization
+            - fp8
+            - --kv-cache-dtype
+            - fp8
+            - --hf-overrides
+            - '{"quantization_config":{"activation_scheme":"dynamic","fmt":"e4m3","quant_method":"fp8","weight_block_size":[128,128]}}'
+            - --gpu-memory-utilization
+            - "0.8"
+            - --max-model-len
+            - "8192"
+            - --max-num-seqs
+            - "16"
+            - --max-num-batched-tokens
+            - "16384"
+            - --enforce-eager
+          resources:
+            claims:
+              - name: roce-channel
+          env:
+            - name: DYN_HEALTH_CHECK_ENABLED
+              value: "false"
+            - name: DYN_SYSTEM_PORT
+              value: "9090"
+            - name: HF_HOME
+              value: /mnt/rl-workspace/jothomson/hf-cache
+            - name: DYN_MX_REFIT_ENABLED
+              value: "1"
+            - name: MODEL_EXPRESS_URL
+              value: "modelexpress-server.default.svc.cluster.local:8001"
+            - name: UCX_TLS
+              value: "rc,cuda_copy"
+            - name: NIXL_UCX_TLS
+              value: "rc,cuda_copy"
+            - name: UCX_IB_GPU_DIRECT_RDMA
+              value: "yes"
+            - name: UCX_CUDA_COPY_DMABUF
+              value: "yes"
+            - name: UCX_LOG_LEVEL
+              value: "info"
+            - name: MX_RDMA_NIC_PIN
+              value: "auto"

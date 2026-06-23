@@ -1312,16 +1312,16 @@ def refit_policy_generation(
                 # which MUST run trainer-broadcast and receiver-recv
                 # concurrently (a barrier collective) or it deadlocks.
                 futures_train = policy.stream_weights_via_mx(
-                    version=version, mx_config=mx_config
+                    version=version,
+                    mx_config=mx_config,
+                    kv_scales=kv_scales,
                 )
                 ray.get(futures_train)
                 futures_inference = policy_generation.update_weights_via_mx(
                     version=version, mx_config=mx_config
                 )
                 results = ray.get(futures_inference)
-                update_success = all(
-                    result for result in results if result is not None
-                )
+                update_success = all(result for result in results if result is not None)
             else:
                 # update weights through nccl (default non-colocated path)
                 # SGLang haven't implemented non-colocated inference mode.
@@ -1336,9 +1336,7 @@ def refit_policy_generation(
                 # wait for all futures to complete
                 ray.get(futures_train)
                 results = ray.get(futures_inference)
-                update_success = all(
-                    result for result in results if result is not None
-                )
+                update_success = all(result for result in results if result is not None)
 
         # check if update is successful
         if not update_success:
