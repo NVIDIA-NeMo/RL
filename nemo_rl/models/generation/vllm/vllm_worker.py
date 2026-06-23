@@ -828,6 +828,79 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         import vllm
 
         self.llm = vllm.LLM(**llm_kwargs)
+        self._log_effective_vllm_args(llm_kwargs)
+
+    def _log_effective_vllm_args(self, llm_kwargs: dict[str, Any]) -> None:
+        import json
+
+        engine = getattr(self.llm, "llm_engine", None)
+        vllm_config = getattr(engine, "vllm_config", None)
+        scheduler_config = getattr(vllm_config, "scheduler_config", None)
+        cache_config = getattr(vllm_config, "cache_config", None)
+
+        def read_attr(obj: Any, name: str) -> Any:
+            return getattr(obj, name, None) if obj is not None else None
+
+        payload = {
+            "worker": self.__class__.__name__,
+            "pid": os.getpid(),
+            "hostname": os.uname().nodename,
+            "llm_kwargs_enable_prefix_caching": llm_kwargs.get(
+                "enable_prefix_caching"
+            ),
+            "llm_kwargs_enable_chunked_prefill": llm_kwargs.get(
+                "enable_chunked_prefill"
+            ),
+            "llm_kwargs_max_num_batched_tokens": llm_kwargs.get(
+                "max_num_batched_tokens"
+            ),
+            "llm_kwargs_max_num_seqs": llm_kwargs.get("max_num_seqs"),
+            "cache_enable_prefix_caching": read_attr(
+                cache_config, "enable_prefix_caching"
+            ),
+            "scheduler_enable_chunked_prefill": read_attr(
+                scheduler_config, "enable_chunked_prefill"
+            ),
+            "scheduler_max_num_batched_tokens": read_attr(
+                scheduler_config, "max_num_batched_tokens"
+            ),
+            "scheduler_max_num_scheduled_tokens": read_attr(
+                scheduler_config, "max_num_scheduled_tokens"
+            ),
+            "scheduler_max_num_seqs": read_attr(scheduler_config, "max_num_seqs"),
+            "scheduler_max_num_partial_prefills": read_attr(
+                scheduler_config, "max_num_partial_prefills"
+            ),
+            "scheduler_max_long_partial_prefills": read_attr(
+                scheduler_config, "max_long_partial_prefills"
+            ),
+            "scheduler_long_prefill_token_threshold": read_attr(
+                scheduler_config, "long_prefill_token_threshold"
+            ),
+        }
+        message = json.dumps(payload, sort_keys=True, default=str)
+        LOGGER.info("NRL_VLLM_EFFECTIVE_ARGS %s", message)
+
+        probe_path = os.environ.get("NRL_VLLM_ARG_PROBE_JSON")
+        if probe_path:
+            os.makedirs(os.path.dirname(probe_path), exist_ok=True)
+            with open(probe_path, "a", encoding="utf-8") as f:
+                f.write(message + "\n")
+
+        try:
+            import wandb
+
+            if wandb.run is not None:
+                wandb.config.update(
+                    {"vllm_effective_args": payload}, allow_val_change=True
+                )
+                wandb.run.summary.update(
+                    {f"vllm/{k}": v for k, v in payload.items()}
+                )
+        except Exception:
+            LOGGER.debug(
+                "Skipping W&B vLLM effective-arg probe logging", exc_info=True
+            )
 
     def post_init(self):
         self.vllm_device_ids = self.report_device_id()
@@ -885,9 +958,30 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
         input_lengths = data["input_lengths"]
         batch_stop_strings: list[list[str]] = data.get("stop_strings", [])
         stop_strings = self._merge_stop_strings(batch_stop_strings)
+        context_limit = int(
+            self.cfg.get(
+                "_max_total_sequence_length", self.cfg["vllm_cfg"]["max_model_len"]
+            )
+        )
+        spec_config = self.cfg.get("vllm_kwargs", {}).get("speculative_config", {})
+        spec_reserve_tokens = int(spec_config.get("num_speculative_tokens", 0) or 0)
+        if spec_reserve_tokens > 0:
+            # vLLM schedules the accepted token plus speculative draft tokens in
+            # one decode step. Keep a small margin so requests do not hit the
+            # model context boundary while speculative tokens are in flight.
+            spec_reserve_tokens += 1
+        allowed_new_tokens = min(
+            int(self.cfg["max_new_tokens"]),
+            int(
+                torch.clamp(context_limit - input_lengths - spec_reserve_tokens, min=0)
+                .min()
+                .item()
+            ),
+        )
         sampling_params = self._build_sampling_params(
             greedy=greedy,
             stop_strings=stop_strings,
+            max_new_tokens=allowed_new_tokens,
         )
 
         # verify inputs have correct padding
@@ -895,6 +989,22 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
 
         # Original input length with padding
         padded_input_length = input_ids.size(1)
+        if allowed_new_tokens <= 0:
+            return BatchedDataDict[GenerationOutputSpec](
+                {
+                    "output_ids": input_ids.clone(),
+                    "logprobs": torch.zeros(
+                        input_ids.shape, dtype=torch.float32, device=input_ids.device
+                    ),
+                    "generation_lengths": torch.zeros(
+                        input_ids.shape[0], dtype=torch.long, device=input_ids.device
+                    ),
+                    "unpadded_sequence_lengths": input_lengths.clone(),
+                    "truncated": torch.zeros(
+                        input_ids.shape[0], dtype=torch.bool, device=input_ids.device
+                    ),
+                }
+            )
 
         # Convert inputs to vLLM format
         prompts = format_prompt_for_vllm_generation(data)

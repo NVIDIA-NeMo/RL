@@ -36,6 +36,7 @@ select_python_with_vllm() {
       continue
     fi
     if PYTHONPATH="${import_site:+${import_site}:}${PYTHONPATH:-}" "${candidate}" - <<'PY' >/dev/null 2>&1; then
+import cbor2  # noqa: F401
 import vllm
 PY
       printf "%s\n" "${candidate}"

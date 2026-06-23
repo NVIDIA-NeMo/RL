@@ -987,8 +987,21 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 [per_sample_stop_strings] if per_sample_stop_strings else None
             )
 
+            context_limit = int(
+                self.cfg.get(
+                    "_max_total_sequence_length",
+                    self.cfg["vllm_cfg"]["max_model_len"],
+                )
+            )
+            spec_config = self.cfg.get("vllm_kwargs", {}).get("speculative_config", {})
+            spec_reserve_tokens = int(spec_config.get("num_speculative_tokens", 0) or 0)
+            if spec_reserve_tokens > 0:
+                # vLLM schedules the accepted token plus speculative draft tokens in
+                # one decode step. Keep a small margin so requests do not hit the
+                # model context boundary while speculative tokens are in flight.
+                spec_reserve_tokens += 1
             remaining_ctx = (
-                self.cfg["vllm_cfg"]["max_model_len"] - current_input_actual_length
+                context_limit - current_input_actual_length - spec_reserve_tokens
             )
             allowed_new_tokens = max(0, min(self.cfg["max_new_tokens"], remaining_ctx))
 

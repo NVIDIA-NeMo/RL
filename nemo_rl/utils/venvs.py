@@ -30,6 +30,58 @@ DEFAULT_VENV_DIR = os.path.join(git_root, "venvs")
 logger = logging.getLogger(__name__)
 
 
+def _truthy_env(name: str) -> bool:
+    return os.environ.get(name, "false").lower() in {"1", "true", "yes"}
+
+
+def _venv_ready_file(venv_path: Path) -> Path:
+    return venv_path / "FINISHED_ENV_BUILDER"
+
+
+def _venv_python_is_usable(python_path: Path) -> bool:
+    if not python_path.exists():
+        return False
+    try:
+        subprocess.run(
+            [str(python_path), "-c", "import encodings"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return False
+    return True
+
+
+def _ensure_venv_python_is_real_file(venv_path: Path) -> None:
+    """Keep Ray from escaping a uv-managed venv through a symlinked python.
+
+    Ray may resolve py_executable symlinks before launching worker processes.
+    uv-managed venvs commonly create bin/python as a symlink into
+    /root/.local/share/uv/python; if Ray resolves that symlink, Python no
+    longer discovers this venv's pyvenv.cfg and the worker misses packages
+    installed in the actor venv, such as ray/vllm.
+    """
+    if os.environ.get("NRL_COPY_VENV_PYTHON", "true").lower() in {
+        "0",
+        "false",
+        "no",
+    }:
+        return
+
+    python_path = venv_path / "bin" / "python"
+    if not python_path.is_symlink():
+        return
+
+    target = python_path.resolve(strict=True)
+    tmp_path = python_path.with_name(".python.real.tmp")
+    logger.info("Replacing venv python symlink %s -> %s with a copy.", python_path, target)
+    shutil.copy2(target, tmp_path)
+    tmp_path.chmod(0o755)
+    tmp_path.replace(python_path)
+
+
 @lru_cache(maxsize=None)
 def create_local_venv(
     py_executable: str, venv_name: str, force_rebuild: bool = False
@@ -98,8 +150,13 @@ def create_local_venv(
     subprocess.run(exec_cmd, env=env, check=True)
 
     # Return the path to the python executable in the virtual environment
-    python_path = os.path.join(venv_path, "bin", "python")
-    return python_path
+    venv_path_obj = Path(venv_path)
+    _ensure_venv_python_is_real_file(venv_path_obj)
+    python_path = venv_path_obj / "bin" / "python"
+    if not _venv_python_is_usable(python_path):
+        raise RuntimeError(f"Created venv python is not usable: {python_path}")
+    _venv_ready_file(venv_path_obj).touch()
+    return str(python_path)
 
 
 # Ray-based helper to create a virtual environment on each Ray node
@@ -114,11 +171,16 @@ def _env_builder(
     venv_path = Path(NEMO_RL_VENV_DIR) / venv_name
     python_path = venv_path / "bin" / "python"
     started_file = venv_path / "STARTED_ENV_BUILDER"
+    ready_file = _venv_ready_file(venv_path)
 
     # Skip early return if force_rebuild is True
-    if not force_rebuild and python_path.exists():
+    if not force_rebuild and ready_file.exists() and _venv_python_is_usable(python_path):
+        _ensure_venv_python_is_real_file(venv_path)
         logger.info(f"Using existing venv at {venv_path}")
         return str(python_path)
+    if not force_rebuild and python_path.exists() and not started_file.exists():
+        logger.warning("Removing incomplete or unusable venv at %s", venv_path)
+        shutil.rmtree(venv_path)
 
     # Sleep to stagger node startup
     time.sleep(1 * node_idx)
@@ -128,10 +190,13 @@ def _env_builder(
         logger.info(
             f"Node {node_idx}: Another node is building {venv_name}, skipping..."
         )
-        # Wait for the venv to be ready (check for python executable)
-        python_path = venv_path / "bin" / "python"
-        while not python_path.exists():
+        # Wait for the creator to finish uv sync/install. bin/python appears
+        # before the venv is queryable, so using it as readiness is unsafe.
+        while not ready_file.exists():
             time.sleep(1)
+        _ensure_venv_python_is_real_file(venv_path)
+        if not _venv_python_is_usable(python_path):
+            raise RuntimeError(f"Completed venv python is not usable: {python_path}")
         return str(python_path)
 
     # Create the venv directory if needed
@@ -171,7 +236,9 @@ def create_local_venv_on_each_node(py_executable: str, venv_name: str):
     pg = placement_group(bundles=bundles, strategy="STRICT_SPREAD")
     ray.get(pg.ready())
 
-    force_rebuild = os.environ.get("NRL_FORCE_REBUILD_VENVS", "false").lower() == "true"
+    force_rebuild = _truthy_env("NRL_FORCE_REBUILD_VENVS") or _truthy_env(
+        "NRL_FORCE_REBUILD_ACTOR_VENVS"
+    )
     # Launch one actor per node
     actors = [
         _env_builder.options(placement_group=pg).remote(

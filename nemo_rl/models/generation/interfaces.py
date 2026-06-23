@@ -131,6 +131,8 @@ class GenerationConfig(TypedDict):
     port_range_high: NotRequired[int]
     # This isn't meant to be passed by the user, but is populated by nemo_rl.models.generation.__init__.configure_generation_config
     _pad_token_id: NotRequired[int]
+    # Internal policy context cap propagated by the trainer.
+    _max_total_sequence_length: NotRequired[int]
 
 
 class GenerationDatumSpec(TypedDict):

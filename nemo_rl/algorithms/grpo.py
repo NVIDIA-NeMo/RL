@@ -773,6 +773,9 @@ def setup(
     # vllm model loading prefers clean environment, initialize policy_generation before policy in colocated mode
     backend = generation_config["backend"]
     generation_config["model_name"] = policy_config["model_name"]  # Needed for vLLM
+    generation_config["_max_total_sequence_length"] = policy_config[
+        "max_total_sequence_length"
+    ]
 
     # Dictionary to store worker initialization timing stats for logging
     worker_init_timing_metrics = {}
@@ -2679,6 +2682,10 @@ def grpo_train(
                         "mean_prompt_length",
                     }:
                         metrics[k] = np.mean(v).item()
+                    elif isinstance(
+                        v, (int, float, np.integer, np.floating)
+                    ) and not isinstance(v, bool):
+                        metrics[k] = float(v)
                     elif isinstance(v, (np.ndarray, list)):
                         metrics[k] = np.sum(v).item()
                     else:
