@@ -61,6 +61,9 @@ def convert_config_to_flops_config(
             vocab_size=config.vocab_size,
             query_groups=config.num_key_value_heads,
             attention_heads=config.num_attention_heads,
+            # head_dim is set explicitly by Qwen3 and is NOT always hidden_size/num_heads
+            # (e.g. Qwen3-235B-A22B: head_dim=128, num_heads=64, hidden=4096 -> "wide" attention).
+            head_dim=getattr(config, "head_dim", None),
             # for non-MoE models, we use the intermediate size as the ffn hidden size
             moe_ffn_hidden_size=config.intermediate_size,
             moe_router_topk=1,

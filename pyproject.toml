@@ -51,9 +51,12 @@ dependencies = [
   "pillow>=12.1.1",
   "torchvision==0.26.0",
   # Keep the base range broad enough while allowing backend extras to tighten as needed.
-  "transformers>=5.3.0,<5.9.0",
+  # Floor raised to 5.5.0 for Gemma 4 support.
+  "transformers>=5.5.0,<5.9.0",
   "num2words>=0.5.14",                                                                                                       # for SmolVLM
-  "mlflow>=3.12.0",
+  "timm",
+  "open-clip-torch>=3.2.0",
+  "mlflow>=3.13.0",
   "nvidia-nvshmem-cu13>=3.6.5; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')", # for deep_ep build
   "swanlab",
   "pyzmq",
@@ -118,12 +121,13 @@ automodel = [
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
   "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu13torch2.10cxx11abiTRUE-cp313-cp313-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "flash-attn==2.8.1 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
-  "transformers>=5.3.0,<5.4.0",
+  "transformers>=5.5.0,<5.6.0",
+  "mistral-common>=1.11.0",
   "mamba-ssm",
   "causal-conv1d",
   "nv-grouped-gemm",
   "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@v2.14.1",
-  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480 ; platform_machine == 'x86_64'",
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@29d31c095796f3c8ece47ee9cdcc167051bbeed9 ; platform_machine == 'x86_64'",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
 ]
 vllm = [
@@ -132,7 +136,7 @@ vllm = [
   # deep_ep also needs libibverbs-dev
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
-  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480 ; platform_machine == 'x86_64'",
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@29d31c095796f3c8ece47ee9cdcc167051bbeed9 ; platform_machine == 'x86_64'",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
   # Default wheels on GitHub are cu130. See v0.20.0 release assets:
   # https://github.com/vllm-project/vllm/releases/tag/v0.20.0
@@ -142,12 +146,18 @@ vllm = [
   "num2words>=0.5.14",
   "flashinfer-python==0.6.8.post1",
   "flashinfer-cubin==0.6.8.post1",
-  "nvidia-cutlass-dsl>=4.4.0.dev1",
+  "flashinfer-jit-cache==0.6.8.post1",
+  "nvidia-cutlass-dsl>=4.5.2",
 ]
 sglang = [
-  "sglang==0.5.11",
-  "sglang-kernel==0.4.2", # Direct dep for explicit version control
-  "kernels<0.15",
+  "sglang==0.5.12.post1",
+  "sglang-kernel==0.4.2.post2",         # Direct dep for explicit version control
+  "sglang-router",                      # Used by nemo_rl.models.generation.sglang.sglang_router for multi-engine routing
+  "kernels>=0.12.0,<0.13",
+  "flashinfer-python==0.6.11.post1",
+  "flashinfer-cubin==0.6.11.post1",
+  "flashinfer-jit-cache==0.6.11.post1",
+  "transformers==5.6.0",
 ]
 mcore = [
   # also need cudnn (https://developer.nvidia.com/cudnn-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=deb_network)
@@ -176,7 +186,7 @@ mcore = [
   "causal-conv1d",
   "fast-hadamard-transform",
   "emerging-optimizers==0.2.0",
-  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480 ; platform_machine == 'x86_64'",
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@29d31c095796f3c8ece47ee9cdcc167051bbeed9 ; platform_machine == 'x86_64'",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
   "quart",
   "hypercorn",
@@ -268,7 +278,7 @@ nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v
 emerging-optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.2.0" }
 fast-hadamard-transform = { git = "https://github.com/Dao-AILab/fast-hadamard-transform.git" }
 nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "c897fbeaaff66d53d61033f107885b7c5432f235" }
-nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", rev = "6c5f2a13c7688d92a7ac7ee6e464721eb8b7345d" }
+nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", tag = "v0.6.0" }
 flashinfer-jit-cache = { index = "flashinfer-cu130" }
 
 [tool.uv.workspace]
@@ -342,16 +352,19 @@ override-dependencies = [
   "llguidance>=1.3.0,<1.4.0",
   # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2
   "setuptools>=80.10.2",
-  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480 ; platform_machine == 'x86_64'",
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@29d31c095796f3c8ece47ee9cdcc167051bbeed9 ; platform_machine == 'x86_64'",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
-  # Override to >=4.4.1 so uv can resolve to a version satisfying both vllm and sglang.
-  "nvidia-cutlass-dsl[cu13]>=4.4.1",
+  # vLLM 0.20.0 imports CUTLASS CUTE during Qwen3.5 MoE profiling.
+  # 4.5.0 has a broken cutlass.cute import path for increment_coord.
+  "nvidia-cutlass-dsl[cu13]>=4.5.2",
   # Relax megatron-core workspace member's opentelemetry-api ceiling (<1.34) for protobuf 6.x compat with ray
   "opentelemetry-api>=1.33.1",
   # Override sglang's xgrammar==0.1.32 to address CVE GHSA-7rgv-gqhr-fxg3
   "xgrammar==0.1.33",
   # Override dependencies to address CVEs
-  "mlflow>=3.12.0",
+  "mlflow>=3.13.0",
+  # Override langchain-core to address CVE GHSA-qh6h-p6c9-ff54 (path traversal in load_prompt)
+  "langchain-core>=1.2.22",
   # Override outlines for Python 3.13 support
   "outlines>=0.2.0",
   # Upgrade pytest to 9.0.3
@@ -380,7 +393,8 @@ constraint-dependencies = [
   "onnx>=1.21.0rc4",          # Address CVE GHSA-hqmj-h5c6-369m
   "cryptography>=46.0.6",     # Address CVE GHSA-6w46-j5rx-g56g
   "orjson>=3.11.6",           # Address CVE GHSA-hx9q-6w63-j58v
-  "pyjwt>=2.12.0",            # Address CVE GHSA-752w-5fwx-jx9f
+  "pyjwt>=2.13.0",
+  "dulwich>=1.2.5",           # Address CVEs GHSA-897w-fcg9-f6xj, GHSA-9277-mp7x-85jf
 ]
 
 conflicts = [
@@ -457,7 +471,7 @@ requires-dist = ["torch", "packaging", "ninja", "causal-conv1d"]
 [[tool.uv.dependency-metadata]]
 name = "deep_ep"
 # This version has to match the version in the commit/rev/tag used
-version = "v1.2.1+bfded34"
+version = "v1.2.1+29d31c0"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [[tool.uv.dependency-metadata]]
@@ -497,8 +511,6 @@ requires-dist = [
   "diffusers>=0.36.0",
   "peft>=0.18.0",
   "einops",
-  "imageio",
-  "imageio-ffmpeg",
   "omegaconf>=2.3.0",
   "tensorboard>=2.19.0",
   "typing-extensions",
@@ -519,21 +531,22 @@ requires-dist = [
   "torch>=2.6.0",
   "flashinfer-python==0.6.8.post1",
   "flashinfer-cubin==0.6.8.post1",
-  # megatron-core omitted here: it's a workspace member and already a direct dep of the mcore extra.
-  # Non-workspace path deps cannot depend on workspace members (uv name-shadowing restriction).
 ]
 
-# Override logsage metadata to remove numpy<=2.0.2 and pandas<=2.3.3 upper bounds
-# (numpy cap conflicts with onnx>=1.21.0rc4 CVE fix via nvidia-resiliency-ext)
+# Override logsage metadata to:
+# 1. Remove numpy<=2.0.2 and pandas<=2.3.3 upper bounds
+#    (numpy cap conflicts with onnx>=1.21.0rc4 CVE fix via nvidia-resiliency-ext)
+# 2. Bump langchain ecosystem to 1.x to address CVE GHSA-qh6h-p6c9-ff54
+#    (langchain-core path traversal in legacy load_prompt, fix requires >=1.2.22)
 # Tracking: https://github.com/NVIDIA/nvidia-resiliency-ext/issues/301
 [[tool.uv.dependency-metadata]]
 name = "logsage"
 version = "0.1.7"
 requires-dist = [
   "drain3>=0.9.11,<0.10.0",
-  "langchain>=0.3.27,<0.4.0",
-  "langchain-core>=0.3.0,<1.0.0",
-  "langchain-nvidia-ai-endpoints>=0.3.18,<0.4.0",
+  "langchain>=1.2.0,<2.0.0",
+  "langchain-core>=1.2.22,<2.0.0",
+  "langchain-nvidia-ai-endpoints>=1.0.0,<2.0.0",
   "nh3>=0.3.1,<0.4.0",
   "numpy",
   "pandas",

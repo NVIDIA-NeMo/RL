@@ -19,8 +19,11 @@ These run in the default L0 suite. Keep this module free of heavy imports
 
 import pytest
 
+from nemo_rl.environments import nemo_gym as nemo_gym_mod
 from nemo_rl.environments.nemo_gym import (
     _detect_invalid_tool_call_and_malformed_thinking,
+    get_nemo_gym_uv_cache_dir,
+    get_nemo_gym_venv_dir,
 )
 
 
@@ -63,3 +66,34 @@ def test_detect_invalid_tool_call_and_malformed_thinking(
         expected_invalid_tool_call,
         expected_malformed_thinking,
     )
+
+
+def test_get_nemo_gym_venv_dir_returns_env_value(monkeypatch):
+    monkeypatch.setenv("NEMO_GYM_VENV_DIR", "/opt/gym_venvs")
+    assert get_nemo_gym_venv_dir() == "/opt/gym_venvs"
+
+
+def test_get_nemo_gym_venv_dir_none_when_unset(monkeypatch):
+    monkeypatch.delenv("NEMO_GYM_VENV_DIR", raising=False)
+    assert get_nemo_gym_venv_dir() is None
+
+
+def test_get_nemo_gym_uv_cache_dir_none_outside_container(monkeypatch):
+    # Outside a container the caller should omit the arg; uv must not be invoked.
+    monkeypatch.delenv("NRL_CONTAINER", raising=False)
+
+    def _fail(*args, **kwargs):
+        raise AssertionError("uv should not be invoked outside a container")
+
+    monkeypatch.setattr(nemo_gym_mod.subprocess, "check_output", _fail)
+    assert get_nemo_gym_uv_cache_dir() is None
+
+
+def test_get_nemo_gym_uv_cache_dir_uses_uv_inside_container(monkeypatch):
+    monkeypatch.setenv("NRL_CONTAINER", "1")
+    monkeypatch.setattr(
+        nemo_gym_mod.subprocess,
+        "check_output",
+        lambda *args, **kwargs: b"  /root/.cache/uv\n",
+    )
+    assert get_nemo_gym_uv_cache_dir() == "/root/.cache/uv"

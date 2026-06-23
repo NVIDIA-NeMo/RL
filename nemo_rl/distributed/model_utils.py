@@ -326,9 +326,7 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
         seq_size = int(vocab_parallel_logits.shape[1])
         num_chunks = (seq_size + chunk_size - 1) // chunk_size
 
-        grad_input: torch.Tensor = torch.zeros_like(
-            vocab_parallel_logits, dtype=torch.float32
-        )
+        grad_input: torch.Tensor = torch.zeros_like(vocab_parallel_logits)
 
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * chunk_size
@@ -351,18 +349,14 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
                 num_classes=partition_vocab_size,
             )
 
-            # Inplace index into the preallocated grad_input tensor
-            grad_input_chunk = grad_input[:, chunk_start:chunk_end, :]
-
-            grad_input_chunk.copy_(
-                is_chosen.float().sub_(softmax_output)
-            )  # inplace copy
-            grad_input_chunk.mul_(
+            chunk_grad_fp32 = is_chosen.float().sub_(softmax_output)
+            chunk_grad_fp32.mul_(
                 grad_output[:, chunk_start:chunk_end].unsqueeze(dim=-1)
             )
+            grad_input[:, chunk_start:chunk_end, :].copy_(chunk_grad_fp32)
 
             # Explicitly free before next iteration allocates
-            del softmax_output, is_chosen, logits
+            del softmax_output, is_chosen, logits, chunk_grad_fp32
 
         # if you add an argument to the forward method, then you must add a corresponding None here
         return grad_input, None, None, None, None, None, None
@@ -1354,6 +1348,7 @@ def get_next_token_logprobs_from_logits(
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
+    chunk_size: Optional[int] = None,
 ) -> torch.Tensor:
     """Compute token log-probabilities from logits, handling parallel and non-parallel cases.
 
@@ -1370,11 +1365,20 @@ def get_next_token_logprobs_from_logits(
         vocab_parallel_group: Process group for vocab parallelism
         context_parallel_group: Process group for context parallelism
         sampling_params: Sampling parameters for top-k/top-p filtering
+        chunk_size: Sequence-dim chunk size for the vocab-parallel path; only
+            applied without top-k/top-p sampling.
 
     Returns:
         Token log-probabilities of shape [batch_size, seq_len - 1]
     """
-    next_token_logits = next_token_logits.to(torch.float32)
+    # ChunkedDistributedLogprob casts each chunk to float32 internally.
+    use_chunking = (
+        vocab_parallel_group is not None
+        and chunk_size is not None
+        and not need_top_k_or_top_p_filtering(sampling_params)
+    )
+    if not use_chunking:
+        next_token_logits = next_token_logits.to(torch.float32)
 
     if vocab_parallel_group is not None:
         assert vocab_parallel_rank is not None, (
@@ -1389,6 +1393,7 @@ def get_next_token_logprobs_from_logits(
             inference_only=False,
             cp_group=context_parallel_group,
             sampling_params=sampling_params,
+            chunk_size=chunk_size if use_chunking else None,
         )
         # slice off to the correct length to remove potential CP padding
         logprobs = logprobs[:, : input_ids.shape[1] - 1]
