@@ -103,6 +103,7 @@ Each stage is launched with `super_launch.sh`. Set the following variables befor
 * `$SANDBOX_CONTAINER`: The sandbox container image from [Build sandbox container](#build-sandbox-container) (`.sqsh` path or registry URI).
 * `$PERSISTENT_CACHE`: Path to a directory used to store caches for vLLM and FlashInfer.
 * `$EXTRA_MOUNTS`: Comma-separated `host:container` mount pairs for shared filesystems that your data, models, and checkpoints reside on (e.g. `EXTRA_MOUNTS=/scratch:/scratch,/lustre:/lustre`). The launch script only mounts the code snapshot directory by default.
+* `$SKIP_CODE_SNAPSHOT`: Optional. Set to `true` to run from the current checkout instead of creating or refreshing a code snapshot.
 * `$SIF_DIR`: *(Stage 2.2 only)* Path to the directory containing Apptainer `.sif` images for the SWE-bench environments. These are converted Docker images from R2E-Gym, SWE-Gym, and SWE-Bench Verified. See [Stage 2.2](#stage-22---swe-2-64-h100-gpu-nodes) for download instructions.
 * `$SLURM_PARTITION`
 * `$SLURM_ACCOUNT`
