@@ -14,8 +14,6 @@ policy:
     scheduler:
       lr_warmup_iters: 1
   generation:
-    vllm_cfg:
-      gpu_memory_utilization: 0.6
     vllm_kwargs:
       tokenizer: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
 logger:

@@ -52,7 +52,7 @@ policy:
     quant_cfg: "examples/modelopt/quant_configs/nano3_nvfp4_weightonly.yaml"
     vllm_cfg:
       tensor_parallel_size: 4
-      gpu_memory_utilization: 0.7
+      gpu_memory_utilization: 0.6
     vllm_kwargs:
       # Nano3 Mamba cache is numerically safer in FP32 during generation.
       mamba_ssm_cache_dtype: "float32"
