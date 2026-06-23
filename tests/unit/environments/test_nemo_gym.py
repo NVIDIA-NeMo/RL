@@ -299,13 +299,14 @@ _OMIT_TOP_LOGPROBS = object()
 def test_vllm_http_logprobs_contract(nemo_gym_vllm_generation):
     """Pin the vLLM OpenAI HTTP logprobs contract that NeMo-Gym capture depends on.
 
-    NeMo-Gym's vllm_model forwards logprobs=True and return_tokens_as_token_ids=True and
-    pins top_logprobs=0 to extract per-token ids and logprobs for training. vLLM computes
-    `logprobs = top_logprobs if logprobs else None`, so omitting top_logprobs (default 0) or
-    sending 0 returns logprobs, while an explicit null returns none and silently empties the
-    captured token ids. This exercises the real HTTP path where that translation lives (the
-    offline LLM API does not), so a vLLM bump that changes the contract fails here instead of
-    silently freezing training.
+    NeMo-Gym's vllm_model sets logprobs=True and return_tokens_as_token_ids=True to extract
+    per-token ids and logprobs for training (Gym omits top_logprobs on the capture path, so
+    vLLM applies its default; Gym PR #1612 additionally pins top_logprobs=0, which is
+    equivalent). vLLM computes `logprobs = top_logprobs if logprobs else None`, so omitting
+    top_logprobs (default 0) or sending 0 returns logprobs, while an explicit null returns
+    none and silently empties the captured token ids. This exercises the real HTTP path where
+    that translation lives (the offline LLM API does not), so a vLLM bump that changes the
+    contract fails here instead of silently freezing training.
 
     All three cases share the (expensive) vLLM fixture, so they run in a single test rather
     than as separate parametrized cases.
@@ -350,8 +351,8 @@ def test_vllm_http_logprobs_contract(nemo_gym_vllm_generation):
         token_ids = [int(c["token"].removeprefix("token_id:")) for c in content]
         assert len(token_ids) == len(content)
 
-    # Omitting top_logprobs (vLLM default 0) and sending 0 (what Gym pins) must both yield
-    # per-token logprobs whose tokens decode to ints.
+    # Omitting top_logprobs (what Gym does on the capture path; vLLM default 0) and sending 0
+    # (the equivalent explicit pin) must both yield per-token logprobs whose tokens decode to ints.
     _assert_has_token_ids(_chat(_OMIT_TOP_LOGPROBS), "omitted top_logprobs")
     _assert_has_token_ids(_chat(0), "top_logprobs=0")
 
@@ -362,3 +363,10 @@ def test_vllm_http_logprobs_contract(nemo_gym_vllm_generation):
     null_resp = _chat(None)
     if null_resp.status_code == 200:
         assert null_resp.json()["choices"][0].get("logprobs") is None
+    else:
+        # A rejection must be a client-side validation error, not an unrelated server failure
+        # that would let this branch pass vacuously.
+        assert 400 <= null_resp.status_code < 500, (
+            f"expected null top_logprobs accepted-with-None or rejected as 4xx, "
+            f"got {null_resp.status_code}: {null_resp.text}"
+        )
