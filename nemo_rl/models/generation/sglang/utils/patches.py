@@ -58,64 +58,6 @@ def _write_and_verify(
         )
 
 
-def _neutralize_cutlass_dsl_experimental_stub() -> None:
-    """Empty the cute.experimental NotImplementedError stub in nvidia-cutlass-dsl.
-
-    The stub (shipped by wheels >=4.4.0.dev1) detonates under walk_packages
-    in cute.compile and kills sglang workers.
-    Related: https://github.com/NVIDIA/cutlass/issues/3132.
-    """
-    try:
-        spec = find_spec("nvidia_cutlass_dsl")
-    except (ImportError, ValueError):
-        return
-    if spec is None or not spec.submodule_search_locations:
-        return
-
-    base_dir = next(iter(spec.submodule_search_locations))
-    stub_path = os.path.join(
-        base_dir,
-        "python_packages",
-        "cutlass",
-        "cute",
-        "experimental",
-        "__init__.py",
-    )
-    if not os.path.exists(stub_path):
-        return
-
-    try:
-        with open(stub_path, "r") as f:
-            content = f.read()
-    except OSError as e:
-        logger.warning("Could not read cute.experimental stub at %s: %s", stub_path, e)
-        return
-
-    sentinel = "CuTe Experimental module is only supported on Cuda toolkit"
-    if sentinel not in content:
-        return
-
-    replacement = (
-        "# Neutralized by nemo_rl: upstream nvidia-cutlass-dsl wheel ships a\n"
-        "# stub that raises NotImplementedError on CTK<13.1, which detonates\n"
-        "# under pkgutil.walk_packages during every cute.compile. Empty body\n"
-        "# is safe because the wheel ships no real cute.experimental subpackages.\n"
-    )
-    try:
-        _write_and_verify(stub_path, replacement, "Neutralized by nemo_rl")
-    except (OSError, RuntimeError) as e:
-        logger.warning(
-            "Failed to neutralize cute.experimental stub at %s: %s. "
-            "SGLang workers may hit NotImplementedError under cute.compile.",
-            stub_path,
-            e,
-        )
-        return
-    logger.info(
-        "Neutralized nvidia-cutlass-dsl cute.experimental stub at %s.", stub_path
-    )
-
-
 def _patch_sglang_file_replacements(
     relative_path: str,
     replacements: tuple[tuple[str, str, str], ...],
@@ -374,7 +316,6 @@ def _patch_sglang_custom_all_reduce_v2_tms_cudagraph() -> None:
 
 
 def _apply_sglang_compat_patches() -> None:
-    _neutralize_cutlass_dsl_experimental_stub()
     _patch_sglang_safe_unpickler()
     _patch_sglang_custom_all_reduce_v2_tms_cudagraph()
     _override_sglang_imbalance_check_env()
