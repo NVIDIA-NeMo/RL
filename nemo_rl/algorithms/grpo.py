@@ -31,6 +31,7 @@ from nemo_rl.algorithms.advantage_estimator import (
     GRPOAdvantageEstimator,
     ReinforcePlusPlusAdvantageEstimator,
 )
+from nemo_rl.algorithms.coupled_grpo_logprobs import maybe_set_coupled_grpo_seed
 from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
     ClippedPGLossDataDict,
@@ -1303,6 +1304,49 @@ def compute_and_apply_seq_logprob_error_masking(
 # ===============================================================================
 
 
+def _maybe_set_coupled_sglang_kl_logprobs(
+    *,
+    policy: Policy,
+    train_data: BatchedDataDict[Any],
+    master_config: MasterConfig,
+    timer: Optional[Timer] = None,
+) -> None:
+    """CoupledGRPO: stash logprobs recomputed under SGLang's ``final_step`` mask
+    into ``train_data["gen_kl_logprobs"]`` for the loss's KL metrics (logging only).
+
+    No-op unless ``policy.logprob_estimation.verify_gen_kl_with_sglang_mask`` is
+    set. Requires generation in ``logprob_mode=final_step`` so
+    ``generation_logprobs`` is the real (``<= 0``) logprob at final-step positions
+    and a ``+1`` sentinel elsewhere. Runs one extra forward on the (pre-training)
+    policy that masks exactly those positions; ``ClippedPGLoss`` then uses these
+    logprobs in place of ``prev_logprobs`` for ``gen_kl_error`` / ``policy_kl_error``
+    / ``token_mult_prob_error`` / ``js_divergence_error`` (restricting to the
+    final-step positions). The GRPO loss / importance ratio is unaffected.
+    """
+    estimation_cfg = master_config["policy"].get("logprob_estimation", {})
+    if not estimation_cfg.get("verify_gen_kl_with_sglang_mask"):
+        return
+    if "generation_logprobs" not in train_data:
+        return
+    gen_lp = train_data["generation_logprobs"]
+    # 1 at final-step positions (SGLang logprob <= 0); the +1 sentinel -> 0.
+    final_step = (gen_lp < 0.5).to(gen_lp.dtype)
+    verify_data = BatchedDataDict(
+        {
+            "input_ids": train_data["input_ids"],
+            "input_lengths": train_data["input_lengths"],
+            "token_mask": train_data["token_mask"],
+            "sample_mask": train_data["sample_mask"],
+            "coupled_grpo_level0_mask_override": final_step,
+        }
+    )
+    train_data["gen_kl_logprobs"] = policy.get_logprobs(
+        verify_data,
+        timer=timer,
+        worker_method="get_logprobs_with_provided_mask",
+    )["logprobs"]
+
+
 def grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -1735,6 +1779,11 @@ def grpo_train(
                 print("▶ Computing logprobs...", flush=True)
                 with timer.time("policy_and_reference_logprobs"):
                     # Custom create this logprob_data so we avoid Ray comm overheads sending unused data to workers.
+                    # CoupledGRPO: attach the per-row mask seed shared across
+                    # prev/ref/train for this step (no-op for other estimators).
+                    maybe_set_coupled_grpo_seed(
+                        train_data, master_config["policy"], total_steps
+                    )
                     logprob_data = BatchedDataDict[ClippedPGLossDataDict](
                         {
                             "input_ids": train_data["input_ids"],
@@ -1744,6 +1793,10 @@ def grpo_train(
                             **extra_multimodal_data,
                         }
                     )
+                    if "coupled_grpo_seed" in train_data:
+                        logprob_data["coupled_grpo_seed"] = train_data[
+                            "coupled_grpo_seed"
+                        ]
                     train_data["prev_logprobs"] = policy.get_logprobs(
                         logprob_data, timer=timer
                     )["logprobs"]
@@ -1757,6 +1810,13 @@ def grpo_train(
                                 timer=timer,
                             )["reference_logprobs"]
                         )
+
+                    _maybe_set_coupled_sglang_kl_logprobs(
+                        policy=policy,
+                        train_data=train_data,
+                        master_config=master_config,
+                        timer=timer,
+                    )
 
                     del logprob_data
                     del extra_multimodal_data
@@ -2064,6 +2124,13 @@ def grpo_train(
                     "generation_logprobs"
                 ].tolist()
                 log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
+                # CoupledGRPO gen-kl verification: logprobs recomputed under
+                # SGLang's final_step mask (present only when
+                # verify_gen_kl_with_sglang_mask is enabled).
+                if "gen_kl_logprobs" in train_data:
+                    log_data["gen_kl_logprobs"] = train_data[
+                        "gen_kl_logprobs"
+                    ].tolist()
 
                 logger.log_batched_dict_as_jsonl(
                     log_data, f"train_data_step{total_steps + 1}.jsonl"
@@ -2829,6 +2896,12 @@ def async_grpo_train(
                     )
                     train_data.to("cpu")
 
+                    # CoupledGRPO: async feeds train_data directly to prev/ref
+                    # logprobs and training, so seed it once here (see sync path).
+                    maybe_set_coupled_grpo_seed(
+                        train_data, master_config["policy"], step
+                    )
+
                 # Training phase (same as sync version)
                 print("▶ Preparing for logprob inference...")
                 with timer.time("logprob_inference_prep"):
@@ -2846,6 +2919,13 @@ def async_grpo_train(
                     )["reference_logprobs"]
                     train_data["prev_logprobs"] = fprop_logprobs
                     train_data["reference_policy_logprobs"] = reference_logprobs
+
+                    _maybe_set_coupled_sglang_kl_logprobs(
+                        policy=policy,
+                        train_data=train_data,
+                        master_config=master_config,
+                        timer=timer,
+                    )
 
                     (
                         max_seq_mult_prob_error,

@@ -1,0 +1,14 @@
+# FastDiffuser generation for CoupledGRPO gen-KL verification.
+# Same as diffugrpo_fastdiffuser.yaml but logprob_mode=final_step, so SGLang
+# returns the reveal-step logprobs at each block's final denoising step (with a
+# +1 sentinel elsewhere). Megatron then recomputes logprobs under that exact
+# final-step mask; a near-zero gen_kl_error confirms the CoupledGRPO masked-forward
+# logic is implemented correctly.
+algorithm: FastDiffuser
+block_size: 32
+max_steps: 32
+causal_context: true
+temperature: 1.0
+threshold: 0.9
+selection_policy: confidence
+logprob_mode: final_step

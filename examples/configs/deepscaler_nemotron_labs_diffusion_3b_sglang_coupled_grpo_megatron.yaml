@@ -1,0 +1,62 @@
+# CoupledGRPO on Nemotron-Labs-Diffusion-3B, DeepScaleR train / AIME 2024 val.
+#
+# Estimates response logprobs with the LLaDA-1.5 "Coupled-GRPO" antithetic
+# scheme: two complementary masked forward passes over DiffuGRPO's asymmetric
+# [noisy|clean] layout (see nemo_rl/algorithms/coupled_grpo_logprobs.py). Level 0
+# masks a per-sample random subset M of the response (ratio t ~ U(0,1)); level 1
+# masks the exact complement. Each valid response token is masked in exactly one
+# level, so summing the two levels reconstructs the full per-token logprob vector
+# with reduced variance.
+#
+# Inherits the DiffuGRPO config for the shared diffusion-model setup (SGLang
+# FastDiffuser generation, sequence budget, KL setting, batch / cluster numbers,
+# bf16 policy). CoupledGRPO does NOT change generation or the model block_size --
+# only the policy worker and the logprob estimator are swapped. The estimator
+# uses the model's (default) block_size for noisy-side block padding, inherited
+# automatically. The per-row mask seed is set in grpo.py as
+# seed_base + step * 1_000_003 + row_index, so prev/reference/training logprobs
+# share one realization within a step and the mask resamples each step.
+defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_diffugrpo_megatron.yaml"
+
+policy:
+  worker_cls_fqn: "nemo_rl.models.policy.workers.coupled_grpo_megatron_policy_worker.CoupledGRPOMegatronPolicyWorker"
+
+  logprob_estimation:
+    type: "coupled_grpo"
+    mask_token_id: 100
+    exclude_mask_token_from_logits: true
+    # Base offset folded into the per-row mask seed (grpo.py adds step & row).
+    seed_base: 0
+    # Log a *matched* generation KL: run one extra forward under SGLang's
+    # final_step reveal mask and use those logprobs (gen_kl_logprobs) for the
+    # gen_kl/policy_kl/JSD metrics, instead of the half-revealed coupled
+    # prev_logprobs (which makes the standard gen-KL apples-to-oranges and huge).
+    # Requires generation in logprob_mode=final_step (set above).
+    verify_gen_kl_with_sglang_mask: true
+    # Always exactly two complementary forward passes; microbatching uses the
+    # inherited logprob_batch_size / train_micro_batch_size.
+
+  # Generation behavior logprobs: use FastDiffuser final_step (the reveal-step
+  # logprob recorded when each token is committed at its block's last denoising
+  # step) instead of the inherited fully_masked step-0 block score. The fully
+  # masked score is not how the token was actually generated; final_step matches
+  # the diffusion reveal conditioning (and the coupled estimator), so generation
+  # logprobs are comparable to prev/training logprobs. Non-final positions carry a
+  # +1 sentinel (see coupled_grpo loss kl-mask handling).
+  generation:
+    sglang_cfg:
+      dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL-coupled-grpo/tools/nemotron_diffusion/coupled_fastdiffuser_final_step.yaml"
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nemotron-diffusion-3b-coupled-grpo-deepscaler-megatron"
+  # Save a checkpoint every 10 steps (matches the inherited default; set
+  # explicitly here so the coupled-GRPO save cadence is visible).
+  save_period: 10
+
+logger:
+  log_dir: "logs/grpo-nemotron-diffusion-3b-coupled-grpo-deepscaler-megatron-sglang"
+  wandb:
+    name: "grpo-nemotron-diffusion-3b-coupled-grpo-deepscaler-megatron-sglang"
+
+cluster:
+  num_nodes: 8

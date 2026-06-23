@@ -1,0 +1,43 @@
+# CoupledGRPO + sequence-level loss + DiffuCoder-inspired stabilizer recipe
+# (self-contained merge of the former seqloss + seqloss_recipe configs).
+#
+# Inherits the base CoupledGRPO config and applies, in one place:
+#   loss_fn:
+#     token_level_loss: false            # sequence-level loss = length-norm Dr-GRPO fix
+#     reference_policy_kl_penalty: 0.01  # KL anchor (FIXED reference, not DiffuCoder's
+#                                        #   EMA-synced reference -- a known remaining gap)
+#   grpo:
+#     skip_reference_policy_logprobs_calculation: false  # REQUIRED so the reference forward
+#                                        #   runs (KL!=0 raises otherwise). Adds a reference
+#                                        #   forward pass -> watch OOM; drop train_micro_batch_size
+#                                        #   to 1 if needed.
+#     normalize_rewards: false           # Dr-GRPO: advantage = reward - baseline (no / std)
+#   policy:
+#     max_grad_norm: 0.2                 # DiffuCoder tight clip (was 1.0)
+#
+# NOT set here (lives in code): coupled masking ratio bound t in [0.2, 0.8] is hardcoded in
+# nemo_rl/algorithms/coupled_grpo_logprobs.py:_build_level0_mask.
+#
+# Still-open gaps vs DiffuCoder (see tools/nemotron_diffusion/coupled_diffugrpo_gaps.md):
+# EMA-synced reference, num_iterations(mu)=2 + wider epsilon clip, and the coupled logprob
+# 1/t weighting + fully-masked averaging.
+defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_coupled_grpo_megatron.yaml"
+
+loss_fn:
+  token_level_loss: false
+  reference_policy_kl_penalty: 0.01
+
+grpo:
+  skip_reference_policy_logprobs_calculation: false
+  normalize_rewards: false
+
+policy:
+  max_grad_norm: 0.2
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nemotron-diffusion-3b-coupled-grpo-deepscaler-megatron-seqloss-recipe"
+
+logger:
+  log_dir: "logs/grpo-nemotron-diffusion-3b-coupled-grpo-deepscaler-megatron-sglang-seqloss-recipe"
+  wandb:
+    name: "grpo-nemotron-diffusion-3b-coupled-grpo-deepscaler-megatron-sglang-seqloss-recipe"

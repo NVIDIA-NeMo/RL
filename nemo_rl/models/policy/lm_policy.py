@@ -366,8 +366,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         self,
         data: BatchedDataDict[GenerationDatumSpec],
         timer: Optional[Timer] = None,
+        worker_method: str = "get_logprobs",
     ) -> BatchedDataDict[LogprobOutputSpec]:
         """Get the logprobs of the model for a data dict.
+
+        ``worker_method`` selects which worker entry point computes the logprobs
+        (default ``"get_logprobs"``); the sharding / gather is identical either way.
 
         Returns:
           a BatchedDataDict with key "logprobs" and shape [batch_size, sequence_length].
@@ -410,7 +414,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             else nullcontext()
         ):
             futures = self.worker_group.run_all_workers_sharded_data(
-                "get_logprobs",
+                worker_method,
                 data=sharded_data,
                 in_sharded_axes=["data_parallel"],
                 replicate_on_axes=[

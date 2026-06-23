@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterator
 
 import torch
 
@@ -354,6 +354,7 @@ def build_fully_masked_completion_loss_batch(
         "prev_logprobs",
         "generation_logprobs",
         "reference_policy_logprobs",
+        "gen_kl_logprobs",
     ):
         if key in data:
             values = data[key]
@@ -370,3 +371,46 @@ def build_fully_masked_completion_loss_batch(
             )
 
     return batch
+
+
+class RevealLevelSchedule(BatchedDataDict[Any]):
+    """Base microbatch source for a multi-level reveal / coupled schedule.
+
+    Holds the base ``BatchedDataDict`` (N samples) and emits the model inputs for
+    each of ``num_levels`` derived level-views in turn, microbatching each view the
+    *standard* way (delegating to ``BatchedDataDict.make_microbatch_iterator``).
+    Subclasses store any extra per-level config in ``configure`` and implement
+    ``_make_level_view(level)``. Used as the training "batch" so a single
+    ``megatron_forward_backward`` accumulates gradients across all levels before one
+    optimizer step; only one level (N rows) is materialized at a time.
+    """
+
+    def _configure_levels(
+        self, *, num_levels: int, harvest_keys: tuple[str, ...]
+    ) -> None:
+        self._rl_num_levels = int(num_levels)
+        self._rl_harvest_keys = tuple(harvest_keys)
+
+    def _sample_count(self) -> int:
+        if not self.data:
+            return 0
+        value = self.data[next(iter(self.data))]
+        return value.shape[0] if torch.is_tensor(value) else len(value)
+
+    @property
+    def size(self) -> int:
+        # Total microbatch-equivalents Megatron sees: one full sample batch per
+        # level. get_microbatch_iterator divides this by the microbatch size to get
+        # num_microbatches.
+        return self._rl_num_levels * self._sample_count()
+
+    def _make_level_view(self, level: int) -> BatchedDataDict[Any]:
+        raise NotImplementedError
+
+    def make_microbatch_iterator(
+        self, microbatch_size: int
+    ) -> Iterator[BatchedDataDict[Any]]:
+        for level in range(self._rl_num_levels):
+            yield from self._make_level_view(level).make_microbatch_iterator(
+                microbatch_size
+            )

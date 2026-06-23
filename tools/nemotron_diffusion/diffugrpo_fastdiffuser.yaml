@@ -5,3 +5,6 @@ causal_context: true
 temperature: 1.0
 threshold: 0.9
 selection_policy: confidence
+# Score each block from its step-0 all-masked state (the DiffuGRPO default,
+# previously implicit). Made explicit so the logprob estimation mode is visible.
+logprob_mode: fully_masked

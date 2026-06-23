@@ -254,6 +254,7 @@ class ClippedPGLossFn(LossFunction):
         generation_logprobs: Tensor,
         reference_policy_logprobs: Tensor | None = None,
         curr_logprobs_unfiltered: Tensor | None = None,
+        gen_kl_logprobs: Tensor | None = None,
         global_valid_seqs: torch.Tensor | None = None,
         global_valid_toks: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict]:
@@ -325,6 +326,12 @@ class ClippedPGLossFn(LossFunction):
             )
         if curr_logprobs_unfiltered is not None:
             loss_data["curr_logprobs_unfiltered"] = curr_logprobs_unfiltered
+        # CoupledGRPO gen-kl verification: SGLang-final_step-mask logprobs used
+        # by the diagnostic KL metrics in place of prev_logprobs (logging only).
+        if gen_kl_logprobs is not None:
+            loss_data["gen_kl_logprobs"] = torch.cat(
+                [leading_zeros, gen_kl_logprobs], dim=1
+            )
         return self(
             next_token_logprobs=curr_logprobs,
             data=loss_data,
@@ -354,35 +361,44 @@ class ClippedPGLossFn(LossFunction):
 
         mask = token_mask * sample_mask.unsqueeze(-1)
 
+        # CoupledGRPO gen-kl verification: the diagnostic KL/error metrics below use
+        # SGLang-final_step-mask logprobs when provided (else prev_logprobs), and
+        # always drop sentinel positions. The ``< 0.5`` filter is a no-op normally
+        # (real logprobs are <= 0); it only bites in final_step mode, where SGLang
+        # marks non-final positions with a +1 sentinel. The PG loss / importance
+        # ratio further down is unaffected -- it keeps using ``prev_logprobs`` / ``mask``.
+        kl_logprobs = data.get("gen_kl_logprobs", data["prev_logprobs"])[:, 1:]
+        kl_mask = mask * (generation_logprobs < 0.5).to(mask.dtype)
+
         # token_mult_prob_error
         # See more details and other metrics in docs/guides/grpo.md#metrics
-        lp_error = torch.abs(generation_logprobs - prev_logprobs)  # noqa: F841  (precommit ignore for now)
+        lp_error = torch.abs(generation_logprobs - kl_logprobs)  # noqa: F841  (precommit ignore for now)
         # average over all tokens in the microbatch
         mult_prob_error = masked_mean(
-            torch.exp(lp_error * mask),
-            mask,
+            torch.exp(lp_error * kl_mask),
+            kl_mask,
             global_normalization_factor=global_valid_toks,
         ).item()
 
         # gen-kl: kl(P_gen || P_train)
-        # where log_ratio = prev_logprobs - generation_logprobs
+        # where log_ratio = kl_logprobs - generation_logprobs
         gen_kl_error = calculate_kl(
             logprobs=generation_logprobs,
-            logprobs_reference=prev_logprobs,
+            logprobs_reference=kl_logprobs,
             kl_type=self.reference_policy_kl_type,
             input_clamp_value=None,
             output_clamp_value=None,
         )
         gen_kl_error = masked_mean(
             gen_kl_error,
-            mask,
+            kl_mask,
             global_normalization_factor=global_valid_toks,
         ).item()
 
         # policy-kl: kl(P_train || P_gen)
-        # where log_ratio = generation_logprobs - prev_logprobs
+        # where log_ratio = generation_logprobs - kl_logprobs
         policy_kl_error = calculate_kl(
-            logprobs=prev_logprobs,
+            logprobs=kl_logprobs,
             logprobs_reference=generation_logprobs,
             kl_type=self.reference_policy_kl_type,
             input_clamp_value=None,
@@ -390,7 +406,7 @@ class ClippedPGLossFn(LossFunction):
         )
         policy_kl_error = masked_mean(
             policy_kl_error,
-            mask,
+            kl_mask,
             global_normalization_factor=global_valid_toks,
         ).item()
 
@@ -398,11 +414,11 @@ class ClippedPGLossFn(LossFunction):
         # M = 0.5 * (P_train + P_gen)
         # JSD = 0.5 * KL(P_train || M) + 0.5 * KL(P_gen || M)
         log_mixture = torch.log(
-            0.5 * torch.exp(prev_logprobs) + 0.5 * torch.exp(generation_logprobs)
+            0.5 * torch.exp(kl_logprobs) + 0.5 * torch.exp(generation_logprobs)
         )
         # KL(P_train || M)
         kl_prev_to_mixture = (
-            torch.exp(prev_logprobs - log_mixture) - (prev_logprobs - log_mixture) - 1
+            torch.exp(kl_logprobs - log_mixture) - (kl_logprobs - log_mixture) - 1
         )
 
         # KL(P_gen || M)
@@ -414,7 +430,7 @@ class ClippedPGLossFn(LossFunction):
 
         js_divergence_error = masked_mean(
             0.5 * kl_prev_to_mixture + 0.5 * kl_gen_to_mixture,
-            mask,
+            kl_mask,
             global_normalization_factor=global_valid_toks,
         ).item()
 

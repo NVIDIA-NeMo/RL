@@ -367,10 +367,36 @@ class BlockJustGRPOLogprobEstimationConfig(TypedDict):
     # policy.train_micro_batch_size (training); no block-reveal-specific knob.
 
 
+class CoupledGRPOLogprobEstimationConfig(TypedDict):
+    """Estimate response logprobs with two complementary masked forwards.
+
+    CoupledGRPO (LLaDA-1.5 antithetic coupling) reuses DiffuGRPO's asymmetric
+    ``[noisy | clean]`` layout but masks a per-sample random subset ``M`` of the
+    response (ratio ``t ~ U(0, 1)``) in level 0 and the exact complement in
+    level 1. Each valid response token is masked in exactly one level, so summing
+    the two levels' logprobs reconstructs the full per-token vector with reduced
+    variance. The mask is seeded per row from ``data['coupled_grpo_seed']`` (set
+    in grpo.py) so prev / reference / training logprobs share one realization.
+    Always exactly two forward passes (DP-uniform by construction).
+    """
+
+    type: Literal["coupled_grpo"]
+    mask_token_id: int
+    # Drop the MASK token from the scored logits (matches DiffuGRPO default).
+    exclude_mask_token_from_logits: NotRequired[bool]
+    # Base offset folded into the per-row mask seed; defaults to 0.
+    seed_base: NotRequired[int]
+    # Diagnostic: recompute response logprobs under SGLang's final_step
+    # mask and log the gen-KL against the generation logprobs (requires
+    # generation in logprob_mode=final_step). Does not affect training.
+    verify_gen_kl_with_sglang_mask: NotRequired[bool]
+
+
 LogprobEstimationConfig = Union[
     JustGRPOLeftmostRevealLogprobEstimationConfig,
     DiffuGRPOLogprobEstimationConfig,
     BlockJustGRPOLogprobEstimationConfig,
+    CoupledGRPOLogprobEstimationConfig,
 ]
 
 

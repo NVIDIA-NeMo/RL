@@ -324,6 +324,10 @@ class DiffuGRPOLossPostProcessor(LossPostProcessor):
             reference_policy_logprobs = data_dict.get("reference_policy_logprobs", None)
             if reference_policy_logprobs is not None:
                 reference_policy_logprobs = reference_policy_logprobs[:, :noisy_length]
+            # CoupledGRPO gen-kl verification logprobs (logging only); present
+            # only when verify_gen_kl_with_sglang_mask is enabled, which implies
+            # a loss with compute_from_aligned_tensors (the branch below).
+            gen_kl_logprobs = data_dict.get("gen_kl_logprobs", None)
             combined_mask = loss_mask * sample_mask.unsqueeze(-1)
             if need_top_k_or_top_p_filtering(self.sampling_params):
                 token_logprobs = mask_out_neg_inf_logprobs(
@@ -366,6 +370,11 @@ class DiffuGRPOLossPostProcessor(LossPostProcessor):
                     generation_logprobs=generation_logprobs,
                     reference_policy_logprobs=reference_policy_logprobs,
                     curr_logprobs_unfiltered=curr_logprobs_unfiltered,
+                    gen_kl_logprobs=(
+                        gen_kl_logprobs[:, :noisy_length]
+                        if gen_kl_logprobs is not None
+                        else None
+                    ),
                     global_valid_seqs=global_valid_seqs,
                     global_valid_toks=global_valid_toks,
                 )

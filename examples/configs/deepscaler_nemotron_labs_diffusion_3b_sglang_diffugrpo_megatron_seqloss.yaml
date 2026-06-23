@@ -1,0 +1,24 @@
+# DiffuGRPO on Nemotron-Labs-Diffusion-3B with SEQUENCE-LEVEL loss normalization.
+#
+# Control run for the GRPO length-bias fix: identical to the DiffuGRPO config but
+# flips loss_fn.token_level_loss to false. Token-level normalization weights each
+# sample by its length; since wrong responses are ~50% longer than correct ones,
+# the token-weighted advantage is net-negative every step and erodes the policy
+# (verified collapse on both DiffuGRPO and CoupledGRPO). Sequence-level averages
+# each response equally (global_valid_seqs), removing the bias. Pairing this with
+# the CoupledGRPO seqloss run isolates whether the fix generalizes across both.
+defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_diffugrpo_megatron.yaml"
+
+loss_fn:
+  token_level_loss: false
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nemotron-diffusion-3b-diffugrpo-deepscaler-megatron-seqloss"
+
+logger:
+  log_dir: "logs/grpo-nemotron-diffusion-3b-diffugrpo-deepscaler-megatron-sglang-seqloss"
+  wandb:
+    name: "grpo-nemotron-diffusion-3b-diffugrpo-deepscaler-megatron-sglang-seqloss"
+
+cluster:
+  num_nodes: 8

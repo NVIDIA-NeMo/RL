@@ -348,10 +348,15 @@ class DiffusionMegatronPolicyWorkerImpl(MegatronPolicyWorkerImpl, ABC):
         mbs: Optional[int] = None,
     ) -> dict[str, Any]:
         self._validate_diffusion_algorithm_support()
-        if hasattr(loss_fn, "loss_type") and loss_fn.loss_type != LossType.TOKEN_LEVEL:
-            raise NotImplementedError(
-                f"{self.__class__.__name__} currently supports token-level loss only"
-            )
+        # Sequence-level loss verified to flow correctly through the diffusion path
+        # (ClippedPGLoss SEQUENCE_LEVEL branch; global_valid_seqs + per-sample
+        # sample_mask wired via compute_from_aligned_tensors; sequence_packing off
+        # so each row is one sample; context_parallel_size=1). Guard relaxed to
+        # allow token_level_loss=false for the GRPO length-bias fix.
+        # if hasattr(loss_fn, "loss_type") and loss_fn.loss_type != LossType.TOKEN_LEVEL:
+        #     raise NotImplementedError(
+        #         f"{self.__class__.__name__} currently supports token-level loss only"
+        #     )
 
         self._clear_diffusion_inference_state()
 
