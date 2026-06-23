@@ -138,14 +138,16 @@ It is essentially a URL forwarder plus a refit dispatcher:
   | `frontend_url` | Explicit URL (mutually exclusive with `dgd_name`; wins if both set). |
   | `namespace` | K8s namespace (auto-resolved from the pod if omitted). |
   | `frontend_port` | Frontend HTTP port (default `8000`). |
-  | `tool_call_parser`, `reasoning_parser` | Compatibility hints; the actual parsers are configured on the DGD worker via `--dyn-*` flags. |
   | `request_timeout_s` | HTTP timeout for direct `generate()` / `generate_async()` completion requests. |
-  | `dynamo_namespace`, `worker_component` | Legacy endpoint-resolution hints for refit paths; the current DGD dispatcher discovers workers through frontend `/health`. |
 
 - `DynamoConfig(GenerationConfig)` adds `dynamo_cfg` plus `vllm_cfg` /
   `vllm_kwargs` *compatibility shims* — the DGD owns the real inference-engine
   args, but nemo-gym today reads `cfg["vllm_cfg"]["max_model_len"]` directly, so
   those fields are retained (not authoritative).
+
+Tool-call and reasoning parsers are also serving-side concerns. Configure them on
+the DGD worker with `--dyn-tool-call-parser` and `--dyn-reasoning-parser`, not in
+`policy.generation.dynamo_cfg`.
 
 ## nrl-k8s Orchestration
 
@@ -185,6 +187,13 @@ Current runnable exemplars:
 - `infra/nrl_k8s/examples/k8s_exemplars/V3/*.yaml`: sliding puzzle + Dynamo + MX.
 - `infra/nrl_k8s/examples/k8s_exemplars/V5/*.yaml`: Nemotron Nano v2 workplace-assistant Megatron + Dynamo + MX.
 - `infra/nrl_k8s/examples/k8s_exemplars/V6/*.yaml`: Qwen3-8B-Base Megatron FP8 KV-cache + Dynamo + MX.
+- `infra/nrl_k8s/examples/k8s_exemplars/V7/*.yaml`: Qwen3-1.7B Megatron EAGLE3 + Dynamo + MX.
+- `infra/nrl_k8s/examples/grpo_workplace_assistant_dynamo_mx_gp.gb300.infra.yaml`
+  plus `examples/nemo_gym/grpo_workplace_assistant_dynamo_mx_gp.yaml`:
+  GlobalPlanner/GlobalRouter topology with two MX worker pools.
+- `infra/nrl_k8s/examples/grpo_swe2_qwen3_30b_dynamo_mx.gb300.infra.yaml`
+  plus `examples/nemo_gym/grpo_swe2_qwen3_30b_dynamo_mx.yaml`: SWE2
+  Dynamo + MX replication path.
 
 ## Rollout Path
 
@@ -227,10 +236,9 @@ process group. The integration solves this with **ModelExpress v2 (MX)** over
 - **Worker receiver** — each `VllmDecodeWorker` runs `MxRefitWorkerExtension`
   (registered on the dynamo side as `parallel_config.worker_extension_cls`,
   gated by `DYN_MX_REFIT_ENABLED=1`), which builds an `MxV2RefitReceiver`. The
-  current k8s exemplars overlay
-  `infra/nrl_k8s/dynamo_mx/mx_refit_extension_megatron.py` into the Dynamo
-  worker image so the DGD can receive both DTensor/HF-shaped and Megatron-shaped
-  publishes.
+  receiver code is baked into the Dynamo worker image; the retained k8s
+  exemplars no longer copy a Python overlay from the NeMo-RL checkout at pod
+  startup.
 - **Refit dispatcher** — `_dispatch_update_weights_via_mx_remote` (a Ray remote
   in `dynamo_generation.py`) drives the per-worker refit over the workers'
   `/engine/<route>` admin HTTP server.
@@ -250,7 +258,6 @@ because they encode the transfer contract:
 | `tree_scale_out` | `True` | Receivers republish themselves as sources after refit, so later receivers pull from peers instead of the trainer's NIC. |
 | `moe_expert_filter` | `True` | Receivers pull only the expert shards their EP rank owns (no-op for dense models). |
 | `nic_pin` | `auto` | NUMA-local NIC pinning before NIXL init (`auto` / `off` / concrete `mlx5_<i>`). |
-| `retain_latest_k` | `1` | TensorHub-style retention (forward-compat; not yet enforced server-side). |
 
 ### Refit flow
 
@@ -305,14 +312,14 @@ The orchestration lives in `refit_policy_generation`
 
 The Megatron path is separate from the DTensor/HF-shaped receive path. The
 trainer publishes Megatron parameter names and role descriptors, and the DGD
-overlay builds a receiver context from:
+worker builds a receiver context from:
 
 - the target vLLM worker TP rank and TP size;
 - the Megatron-Bridge sidecar (`megatron_transformer_config` and
   `megatron_hf_name_map`);
 - the v2 shape registry and Megatron role metadata in each tensor descriptor.
 
-The current overlay supports **matched TP only** for Megatron refit: the trainer
+The current Dynamo receiver supports **matched TP only** for Megatron refit: the trainer
 TP size must match the DGD vLLM TP size. That keeps the receiver path simple:
 each target TP rank pulls the matching trainer TP rank's buffers, handles
 full-vocab tensors specially, runs the Modelexpress Megatron translator, loads
@@ -331,15 +338,14 @@ infra/DGD YAMLs (GB300):
   picks intra-host transports first and `prep_xfer_dlist` fails for cross-pod
   descriptors), `UCX_IB_GPU_DIRECT_RDMA=yes`, `UCX_CUDA_COPY_DMABUF=yes`,
   `MX_RDMA_NIC_PIN=auto`.
-- **`NIXL_PLUGIN_DIR`** pointed at the venv-installed nixl plugins — the dynamo
-  operator hardcodes a path that only has the GDS plugin, while the UCX plugin
-  ships inside the bundled-UCX nixl wheel.
-- **Images** (`infra/nrl_k8s/dynamo_mx/`): the trainer overlay
-  (`Dockerfile.nemorl`) bakes `nixl` + `modelexpress` + `protobuf>=6` into every
-  venv; the worker image is built from `ai-dynamo/dynamo` with
-  `ENABLE_MODELEXPRESS_P2P=true` and a UCX-bundled nixl wheel. Trainer and worker
-  nixl/modelexpress versions must align. See the directory's `README.md` for the
-  exact build recipe.
+- **Images**: `infra/nrl_k8s/dynamo_mx/Dockerfile.nemorl` is the trainer image
+  helper. `infra/nrl_k8s/dynamo_mx/Dockerfile` is an optional Dynamo worker image
+  helper that pins the ModelExpress client/NIXL layer on top of a compatible
+  Dynamo integration base image. The DGD worker image must have modelexpress, the
+  UCX-bundled NIXL wheel, tokenize/completion-token support, and
+  `MxRefitWorkerExtension` baked in. The retained manifests do not copy a Dynamo
+  source overlay into pods at runtime. Trainer and worker nixl/modelexpress
+  versions must align.
 
 ## Current State and Limitations
 
@@ -350,15 +356,15 @@ infra/DGD YAMLs (GB300):
   supported. `generate_async()` accepts one sample per call.
 - **Dynamo image requirement.** Direct generation and nemo-gym training require a
   Dynamo build that supports `/tokenize`, `required_prefix_token_ids`, and
-  `nvext.completion_token_ids` on `/v1/completions` (the V5 exemplars use the
-  `jthomson04/tokenize-endpoint-merge-main-06-09` lineage).
+  `nvext.completion_token_ids` on `/v1/completions` (the retained MX examples use
+  the `jthomson04/tokenize-endpoint-merge-main-06-09` lineage).
 - **MX refit supports DTensor and Megatron.** DTensor refit is functional but
   still allgathers each DTensor with `full_tensor()` before publish. Megatron
   refit publishes native local shards and currently requires matched trainer TP
   and DGD TP.
 - **FP8 KV-cache scales** are supported on the Megatron MX matched-TP path used
-  by V6. DTensor MX FP8 KV-cache scales and cross-TP repartitioning remain
-  unsupported.
+  by V6. EAGLE lives under V7. DTensor MX FP8 KV-cache scales and cross-TP
+  repartitioning remain unsupported.
 - **No collective / IPC weight sync** for the Dynamo backend — MX is the only
   non-colocated refit mechanism.
 
@@ -373,10 +379,10 @@ infra/DGD YAMLs (GB300):
 | Megatron MX helpers | `nemo_rl/distributed/mx_megatron_helpers.py` |
 | Trainer-side publish | `nemo_rl/models/policy/workers/dtensor_policy_worker.py` and `nemo_rl/models/policy/workers/megatron_policy_worker.py` (`stream_weights_via_mx`) |
 | Refit orchestration | `nemo_rl/algorithms/grpo.py` (`refit_policy_generation`) |
-| DGD Megatron receive overlay | `infra/nrl_k8s/dynamo_mx/mx_refit_extension_megatron.py` |
 | DGD ingestion / CRUD | `infra/nrl_k8s/src/nrl_k8s/dgd.py` |
 | DGD schema | `infra/nrl_k8s/src/nrl_k8s/schema.py` (`DynamoGraphSpec`, `InfraConfig.dynamo`) |
 | DGD orchestration | `infra/nrl_k8s/src/nrl_k8s/orchestrate.py` (`ensure_dgd`) |
-| MX infra (server, images, README) | `infra/nrl_k8s/dynamo_mx/` |
+| MX infra (server, worker/trainer image helpers, README) | `infra/nrl_k8s/dynamo_mx/` |
 | Runnable k8s exemplars | `infra/nrl_k8s/examples/k8s_exemplars/*/*.yaml` |
+| Retained GP and SWE2 examples | `infra/nrl_k8s/examples/grpo_workplace_assistant_dynamo_mx_gp.gb300.infra.yaml`, `infra/nrl_k8s/examples/grpo_swe2_qwen3_30b_dynamo_mx.gb300.infra.yaml` |
 | Unit tests | `tests/unit/models/generation/test_dynamo_generation.py` |

@@ -1,82 +1,54 @@
-# Dynamo + ModelExpress v2 (mid-training weight refit) — infra
+# Dynamo + ModelExpress v2 Infra
 
-This directory holds the pieces needed to run Dynamo as nemo-rl's generation
-backend **with mid-training weight refit via ModelExpress v2 NIXL RDMA**. It's
-the cross-node analog of vLLM's `update_weights_from_collective` — same
-trainer-side `stream_weights_via_mx` (already on `dynamo-k8s-integration` via
-the cherry-pick of `d58dca07`), different receiver: each Dynamo
-`VllmDecodeWorker` pod runs `MxRefitWorkerExtension.update_weights_via_mx`,
-registered as `parallel_config.worker_extension_cls` on the dynamo side.
+This directory contains the shared Kubernetes pieces for running Dynamo as the
+NeMo-RL generation backend with ModelExpress v2 weight refit.
 
-## Layout
+The current integration does not use a Dynamo worker source overlay. The DGD
+worker image is expected to be built from the Dynamo integration branch
+`jthomson04/tokenize-endpoint-merge-main-06-09` with modelexpress, NIXL/UCX, the
+tokenize/completion-token extensions, and the MX refit worker extension baked
+in. DGD manifests enable the receiver with `DYN_MX_REFIT_ENABLED=1`.
 
-```
-infra/nrl_k8s/dynamo_mx/
-├── README.md                 (this file)
-├── modelexpress-server.yaml  Kubernetes Deployment + Service for the MX server
-├── Dockerfile.nemorl         trainer image overlay: nixl + modelexpress + protobuf-6 + wandb 0.26+
-├── Dockerfile                (placeholder) dynamo worker image overlay
-└── DEBUGGING_POSTMORTEM.md   chronology of the bring-up findings (cluster bugs,
-                              version-mismatch failure modes, etc.)
-```
-
-## Architecture
-
-The trainer drives each refit cycle synchronously over HTTP:
-
-1. `GET <dgd-frontend>:8000/health` → enumerate live `VllmDecodeWorker`
-   instances from the `instances[*]` array; pair each pod IP with
-   `DYN_SYSTEM_PORT` (9090) to form `system_url`.
-2. For each new instance:
-     - `POST {system_url}/engine/pause_generation`
-     - `POST {system_url}/engine/update_weights_via_mx` (blocks on NIXL receive)
-     - `POST {system_url}/engine/flush_cache`
-     - `POST {system_url}/engine/resume_generation` (try/finally so always re-enabled)
-3. Re-discover via `/health`; if new `instance_id`s appeared (scale-up
-   mid-cycle), refit those too. Bounded at 5 convergence passes.
-
-Code lives at:
-
-  * `nemo_rl/models/generation/dynamo/dynamo_generation.py` —
-    `_dispatch_update_weights_via_mx_remote` (the dispatcher above)
-  * `components/src/dynamo/vllm/handlers.py` on
-    `jthomson04/tokenize-endpoint-merge-main-05-07` — adds
-    `pause_generation` / `resume_generation` / `flush_cache` handlers
-  * `components/src/dynamo/vllm/worker_factory.py` (same branch) — registers
-    `/engine/<route>` via `runtime.register_engine_route(...)`
-
-## Image expectations
-
-The dynamo worker image must be built from
-`jthomson04/tokenize-endpoint-merge-main-05-07` (commit `8590c2694e` or later)
-with build args:
-
-```bash
-docker buildx build --platform linux/arm64 \
-  --build-arg ENABLE_MODELEXPRESS_P2P=true \
-  --build-arg MODELEXPRESS_REF=8594fd6 \
-  -t <registry>/dynamo-arm-mx:<tag> \
-  -f container/rendered.Dockerfile .
-```
-
-The `8590c2694e` commit bundles UCX into the nixl_cu12 wheel — required because
-the dynamo operator hardcodes `NIXL_PLUGIN_DIR` to a path that only has the GDS
-plugin. The DGD spec sets `NIXL_PLUGIN_DIR` explicitly to point at the
-venv-installed nixl plugins.
-
-The trainer image (`Dockerfile.nemorl`) similarly needs
-`--build-arg NIXL_VERSION=0.10.1 --build-arg MX_REF=8594fd6` to align with the
-worker; otherwise the infra YAML has runtime nixl-downgrade + PYTHONPATH
-modelexpress-shadow workarounds.
-
-## Components
+## Files
 
 | File | Purpose |
 |---|---|
-| `modelexpress-server.yaml` | K8s Deployment + Service for MX server (gRPC :8001) |
-| `Dockerfile.nemorl` | Trainer image overlay (nemo-rl-mx) — pip-installs nixl, modelexpress, protobuf-6, wandb 0.26+ into every venv |
-| `Dockerfile` | Worker image overlay placeholder; superseded by direct rebuild of `ai-dynamo/dynamo` from `jthomson04/tokenize-endpoint-merge-main-05-07` |
-| `DEBUGGING_POSTMORTEM.md` | Bring-up postmortem |
-| `../examples/grpo_workplace_assistant_dynamo_mx.gb300.infra.yaml` | infra YAML pointing at the MX-enabled DGD |
-| `../examples_dgd/qwen3_4b_thinking_gb300_mx.yaml` | Example DGD manifest with `DYN_MX_REFIT_ENABLED=1` + RoCE claim |
-| `../../../examples/nemo_gym/grpo_workplace_assistant_dynamo_mx.yaml` | Recipe with `cluster.weight_sync.method: mx` |
+| `modelexpress-server.yaml` | Deployment and Service for the MX server (`:8001`). |
+| `Dockerfile` | Optional Dynamo worker image helper that pins the ModelExpress client/NIXL layer on top of a Dynamo integration base image. |
+| `Dockerfile.nemorl` | NeMo-RL trainer image helper for MX/NIXL dependencies and SWE sandbox tooling. |
+| `prometheus.yaml` | Prometheus instance used by the GlobalPlanner/GlobalRouter GP example. |
+
+Build the Dynamo worker image from the Dynamo repository or use `Dockerfile` to
+add the pinned ModelExpress client layer on top of a compatible Dynamo base
+image. Do not copy Dynamo Python files from a mounted checkout at pod startup.
+
+## Refit Flow
+
+1. The trainer publishes weights through `stream_weights_via_mx` to the MX
+   server.
+2. `DynamoGeneration` discovers live workers from the DGD frontend `/health`
+   response and calls each worker admin server on `DYN_SYSTEM_PORT`.
+3. Each worker receives `POST /engine/update_weights_via_mx`, pulls weights via
+   NIXL RDMA, then receives `POST /engine/flush_cache`.
+4. The dispatcher re-runs discovery so restarted or newly scaled workers are
+   brought to the same version before the training step continues.
+
+Parser selection is DGD-owned. Set tool/reasoning parsers on the
+`VllmDecodeWorker` args with `--dyn-tool-call-parser` and
+`--dyn-reasoning-parser`; do not put parser fields in
+`policy.generation.dynamo_cfg`.
+
+## Retained Examples
+
+| Path | Purpose |
+|---|---|
+| `infra/nrl_k8s/examples/grpo_workplace_assistant_dynamo_mx_gp.gb300.infra.yaml` | Workplace-assistant GP/GlobalRouter topology. |
+| `examples/nemo_gym/grpo_workplace_assistant_dynamo_mx_gp.yaml` | Trainer recipe for the GP topology. |
+| `infra/nrl_k8s/examples_dgd/qwen3_4b_thinking_gb300_mx_gp_{pool0,pool1,ctrl}.yaml` | Three DGD manifests for the GP topology. |
+| `infra/nrl_k8s/examples/grpo_swe2_qwen3_30b_dynamo_mx.gb300.infra.yaml` | SWE2 GB300 trainer infra. |
+| `examples/nemo_gym/grpo_swe2_qwen3_30b_dynamo_mx.yaml` | SWE2 trainer recipe. |
+| `infra/nrl_k8s/examples_dgd/qwen3_30b_thinking_gb300_mx_4gpu.yaml` | SWE2 DGD manifest. |
+| `infra/nrl_k8s/examples/k8s_exemplars/V1` through `V7` | Versioned Dynamo + MX exemplars. `V6` is FP8 KV cache; `V7` is EAGLE. |
+
+Before launching, apply `modelexpress-server.yaml` in the target namespace and
+ensure the trainer and DGD images carry compatible modelexpress and NIXL builds.

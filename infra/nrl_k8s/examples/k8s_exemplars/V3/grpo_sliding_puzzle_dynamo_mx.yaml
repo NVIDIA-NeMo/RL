@@ -89,4 +89,3 @@ cluster:
       tree_scale_out: false
       moe_expert_filter: false
       nic_pin: "auto"
-      retain_latest_k: 1

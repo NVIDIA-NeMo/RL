@@ -7,12 +7,11 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """Megatron-Core publisher helpers for the MX v2 path (Phase A).
 
-The DTensor MX path (FSDP2) uses ``mx_helpers.collect_named_local_shards``
-+ ``add_tensor`` directly because DTensor's ``Placement`` enum gives
-sharding info in a uniform way. Megatron-Core has no such uniform API;
-sharding lives in the wrapper-class identity (``ColumnParallelLinear``,
-``RowParallelLinear``, ``VocabParallelEmbedding``, fused QKV/MLP, MoE
-expert layers).
+The DTensor MX path uses the generic MX publisher directly because DTensor's
+``Placement`` enum gives sharding info in a uniform way. Megatron-Core has no
+such uniform API; sharding lives in the wrapper-class identity
+(``ColumnParallelLinear``, ``RowParallelLinear``, ``VocabParallelEmbedding``,
+fused QKV/MLP, MoE expert layers).
 
 This module:
 

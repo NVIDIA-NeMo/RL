@@ -3,8 +3,8 @@
 # =============================================================================
 # Union of two proven GB300 infra templates:
 #   * grpo_workplace_assistant_dynamo_mx.gb300.infra.yaml  — MX refit: RoCE DRA
-#     on the trainer, UCX/NIXL env, modelexpress overlay on PYTHONPATH, IPC_LOCK.
-#   * grpo_mini_swe_nemotron_v3.gb300.infra.yaml — multi-node SWE: ComputeDomain
+#     on the trainer, UCX/NIXL env, image-baked modelexpress, IPC_LOCK.
+#   * multi-node SWE infra template — ComputeDomain
 #     DRA + KAI topology gang-scheduling for cross-node NCCL, and the
 #     singularity-container + privileged + /dev/loop setup that swe_agents needs
 #     to `singularity exec` the SWE-bench arm64 .sif sandboxes.
@@ -169,9 +169,8 @@ launch:
     }
     echo "[setup] singularity: $(singularity --version 2>&1 | head -1)"
 
-    # Shadow the image-baked modelexpress with the Lustre tree (e45a14f).
     # DTensor automodel — no Megatron-LM path needed.
-    export PYTHONPATH=/mnt/rl-workspace/${user:}/modelexpress/modelexpress_client/python:.
+    export PYTHONPATH=.
     export MX_RDMA_NIC_PIN=auto
     TIMESTAMP=$(date -u +%Y%m%d-%H%M%S-%N)
     LOG_DIR=/mnt/rl-workspace/${user:}/driver_logs
@@ -188,7 +187,7 @@ launch:
     # swebench_agent_timeout=1800, seqlen 131072). The MX heartbeat fix lets the
     # per-step refit survive past v2 (the old crash point) for a multi-step run.
     python -u examples/nemo_gym/run_grpo_nemo_gym.py \
-      --config examples/nemo_gym/grpo_swe2_qwen3_30b_dynamo_mx_debug.yaml \
+      --config examples/nemo_gym/grpo_swe2_qwen3_30b_dynamo_mx.yaml \
       +policy.generation.dynamo_cfg.dgd_name=${user:}-swe2-q30b-mx \
       grpo.max_num_steps=5 \
       logger.wandb.name=grpo-swe2-q30b-mx-24w-genmetrics \

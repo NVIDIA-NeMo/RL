@@ -39,9 +39,9 @@
 #     KubernetesConnector needs it to read/patch DGDs).
 #   * Cluster Prometheus scraping the LocalRouter pods (the pool Planners read
 #     dynamo_component_router_* with throughput_metrics_source=router).
-#   * The dynamo runtime image must ship dynamo.global_router / dynamo.global_planner
-#     / dynamo.router / dynamo.planner (all present on
-#     jthomson04/tokenize-endpoint-merge-main-05-07).
+#   * The dynamo runtime image must ship dynamo.global_router /
+#     dynamo.global_planner / dynamo.router / dynamo.planner plus the planner
+#     dependencies. No runtime source overlay is used by the paired DGDs.
 #
 # The dgd_name handed to NeMo-RL points at the CONTROL DGD (its Frontend is the
 # public endpoint). nrl-k8s only auto-injects dgd_name when exactly one DGD is
@@ -234,9 +234,8 @@ kuberay:
 # Declaration order = apply order. Pools first (so their LocalRouters are Ready
 # before the GlobalRouter tries to connect), control DGD last.
 dynamo:
-  # Timeouts are generous: the Planner / GlobalPlanner pods pip-install
-  # requirements.planner.txt (pmdarima/prophet/scipy/scikit-learn + a git dep)
-  # at startup before they go Ready, on top of the vLLM+MX worker boot.
+  # Timeouts are generous because the vLLM+MX workers need to load the model and
+  # establish the MX refit path before reporting Ready.
   pool0:
     manifest: ../examples_dgd/qwen3_4b_thinking_gb300_mx_gp_pool0.yaml
     name: jothomson-dyn-gp-p0

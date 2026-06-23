@@ -43,10 +43,9 @@
 #   * Cluster Prometheus scraping the LocalRouter pods (the pool Planners read
 #     `dynamo_component_router_*` from it).
 #
-# Image expectations: the dynamo runtime image must include the
-# dynamo.frontend, dynamo.global_router and dynamo.global_planner modules
-# (all present on jthomson04/tokenize-endpoint-merge-main-05-07). The MX worker
-# image is only needed in the pool DGDs.
+# Image expectations: the Dynamo runtime image must include
+# dynamo.frontend, dynamo.global_router, dynamo.global_planner and the planner
+# dependency set. The MX worker image is only needed in the pool DGDs.
 
 apiVersion: nvidia.com/v1alpha1
 kind: DynamoGraphDeployment
@@ -72,7 +71,7 @@ spec:
           # arm64 — the dynamo image is arm64-only and customer-cpu is mixed-arch.
           kubernetes.io/arch: arm64
         mainContainer:
-          image: jwillthomson/dynamo-arm-tokenize-endpoint-8590c26:latest
+          image: jwillthomson/dynamo-arm-tokenize-endpoint-be735142:latest
           workingDir: /workspace
           command:
             - python3
@@ -101,7 +100,7 @@ spec:
           nodeGroup: customer-cpu
           kubernetes.io/arch: arm64
         mainContainer:
-          image: jwillthomson/dynamo-arm-tokenize-endpoint-8590c26:latest
+          image: jwillthomson/dynamo-arm-tokenize-endpoint-be735142:latest
           workingDir: /workspace
           # The global_router needs a JSON config file. nrl-k8s only applies
           # the DGD doc (not a sibling ConfigMap), so we write the config
@@ -147,37 +146,18 @@ spec:
         nodeSelector:
           nodeGroup: customer-cpu
           kubernetes.io/arch: arm64
-        # rl-workspace PVC so the overlay can read requirements.planner.txt.
-        volumes:
-          - name: rl-workspace
-            persistentVolumeClaim:
-              claimName: rl-workspace
         mainContainer:
-          image: jwillthomson/dynamo-arm-tokenize-endpoint-8590c26:latest
+          image: jwillthomson/dynamo-arm-tokenize-endpoint-be735142:latest
           workingDir: /workspace
-          volumeMounts:
-            - mountPath: /mnt/rl-workspace
-              name: rl-workspace
-          # dynamo.global_planner imports the planner forecasting stack at load
-          # time (predictors.py → pmdarima/prophet/filterpy/...), which the
-          # 8590c26 image doesn't ship. Install requirements.planner.txt inline
-          # before exec, same as the pool Planners.
-          #
           # Implicit management mode: accept scale requests from any caller and
           # count all DGDs in the k8s namespace toward the (unset) GPU budget.
           # DYN_NAMESPACE is injected by the operator as
           # default-jothomson-dyn-gp-ctrl; the pools' Planner configs point
           # global_planner_namespace at it.
           command:
-            - /bin/bash
-            - -c
-            - |
-              set -eu
-              echo "[gp-overlay] pip install requirements.planner.txt $(date -u +%FT%TZ)"
-              /opt/dynamo/venv/bin/pip install -r /mnt/rl-workspace/jothomson/dynamo/container/deps/requirements.planner.txt
-              /opt/dynamo/venv/bin/python -c "import dynamo.global_planner; print('[gp-overlay] dynamo.global_planner OK')"
-              echo "[gp-overlay] handoff to dynamo.global_planner $(date -u +%FT%TZ)"
-              exec python3 -m dynamo.global_planner
+            - python3
+            - -m
+            - dynamo.global_planner
           env:
             # KubernetesConnector targets this k8s namespace for DGD patches.
             - name: POD_NAMESPACE
