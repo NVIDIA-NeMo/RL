@@ -14,7 +14,7 @@
 """Sync GRPO rollout actor — sibling of ``async_utils``.
 
 Houses :class:`SyncRolloutActor`, the Ray actor that owns the multi-turn
-rollout loop AND the post-rollout flatten / mask / prompt extraction /
+rollout loop AND the post-rollout flatten / mask / prompt grouping /
 reward shaping / baseline-std for a sync GRPO step. The driver dispatches
 a per-step prompt batch + uids; the actor runs ``run_multi_turn_rollout``
 (or async / nemo_gym variants), then writes the bulk schema to TQ via
@@ -65,35 +65,24 @@ OPT_IN_CARRY_KEYS: tuple[str, ...] = ("turn_roles", "turn_contents")
 
 def _flatten_rollout_message_log_for_tq(
     message_logs: list[Any],
-    prompt_lengths: torch.Tensor,
     *,
     pad_token_id: int,
     make_sequence_length_divisible_by: int,
-) -> tuple[BatchedDataDict[Any], torch.Tensor, BatchedDataDict[Any]]:
+) -> tuple[BatchedDataDict[Any], torch.Tensor]:
     """Prepare rollout message logs for the TQ payload and driver carry."""
     from nemo_rl.algorithms.grpo import (
         add_grpo_token_loss_masks_and_generation_logprobs,
-        extract_initial_prompt_messages,
     )
     from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 
     pad = {"pad_value_dict": {"token_ids": pad_token_id}}
-    prompt_message_logs = extract_initial_prompt_messages(
-        message_logs,
-        prompt_lengths,
-    )
-    prompt_flat, _ = batched_message_log_to_flat_message(
-        prompt_message_logs,
-        **pad,
-    )
-
     add_grpo_token_loss_masks_and_generation_logprobs(message_logs)
     flat, input_lengths = batched_message_log_to_flat_message(
         message_logs,
         **pad,
         make_sequence_length_divisible_by=make_sequence_length_divisible_by,
     )
-    return flat, input_lengths, prompt_flat
+    return flat, input_lengths
 
 
 @ray.remote  # pragma: no cover
@@ -206,6 +195,7 @@ class SyncRolloutActor:
         from nemo_rl.algorithms.grpo import (
             _should_use_async_rollouts,
             _should_use_nemo_gym,
+            get_idx_grouping,
         )
         from nemo_rl.algorithms.utils import get_gdpo_reward_component_keys
         from nemo_rl.data.llm_message_utils import (
@@ -265,17 +255,20 @@ class SyncRolloutActor:
         fb = final_batch.to("cpu")
         del final_batch
 
-        # Flatten message_log → bulk tensors + extract original prompt ids.
+        # Flatten message_log → bulk tensors.
         # GRPO masks only generated assistant turns, even if the dataset
         # prompt itself contains assistant messages as conversation history.
-        flat, input_lengths, prompt_flat = _flatten_rollout_message_log_for_tq(
+        flat, input_lengths = _flatten_rollout_message_log_for_tq(
             fb["message_log"],
-            fb["length"],
             pad_token_id=self.tokenizer.pad_token_id,
             make_sequence_length_divisible_by=cfg.policy[
                 "make_sequence_length_divisible_by"
             ],
         )
+        # Composite (task_name, idx) grouping key for advantage estimation —
+        # groups responses from the same prompt without relying on prompt
+        # token sequences (which collide across turns/datasets).
+        prompt_ids_for_adv = get_idx_grouping(fb)
 
         # TQ bulk payload — DP_TRAIN_FIELDS + multimodal extras.
         bulk_batch = BatchedDataDict[Any](
@@ -332,7 +325,7 @@ class SyncRolloutActor:
             "truncated": truncated,
             "length": length,
             "input_lengths": input_lengths,
-            "prompt_ids_for_adv": prompt_flat["token_ids"],
+            "prompt_ids_for_adv": prompt_ids_for_adv,
             # Computed by decompose_message_log above; feeds
             # apply_reward_shaping on the driver without a TQ fetch.
             "response_token_lengths": decomposed["response_token_lengths"],
