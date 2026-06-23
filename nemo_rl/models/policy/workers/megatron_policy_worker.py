@@ -1229,6 +1229,7 @@ class MegatronPolicyWorkerImpl(
             ROLE_COLUMN,
             ROLE_REPLICATED,
             collect_megatron_publish_set,
+            publish_eagle_draft_weights,
         )
 
         tp_size = parallel_state.get_tensor_model_parallel_world_size()
@@ -1333,6 +1334,10 @@ class MegatronPolicyWorkerImpl(
             role_overrides=role_overrides,
             target_dtype=self.dtype,
         ):
+            if self.draft_model is not None and name.startswith(
+                ("draft_model.", "module.draft_model.")
+            ):
+                continue
             # Per-tensor megatron metadata goes into the registry via
             # the new add_tensor kwargs (megatron_role, megatron_extras).
             # The per-source mesh position was already stamped above and
@@ -1363,6 +1368,17 @@ class MegatronPolicyWorkerImpl(
                     megatron_role=ROLE_REPLICATED,
                     megatron_extras={"fp8_kv_scale": "1"},
                 )
+
+        draft_count = publish_eagle_draft_weights(
+            publisher=self._mx_publisher,
+            draft_model=self.draft_model,
+            dtype=self.dtype,
+        )
+        if draft_count:
+            print(
+                f"[mx-megatron] published {draft_count} EAGLE draft tensors",
+                flush=True,
+            )
 
         # ---- Publish + mark ready. ----
         self._mx_publisher.publish(version=int(version))
@@ -1469,6 +1485,8 @@ class MegatronPolicyWorkerImpl(
                 return unique
 
             for task in tasks:
+                if task is None:
+                    continue
                 m_name = task.global_param_name or task.param_name
                 # Each task's mapping declares 1 or more HF names. Resolve
                 # via the mapping's hf_param attribute (str or dict).

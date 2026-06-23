@@ -1,0 +1,138 @@
+# DynamoGraphDeployment for Qwen/Qwen3-1.7B with EAGLE3 specdec on GB300.
+
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: qwen3-1-7b-eagle3-gb300-mx
+  annotations:
+    nvidia.com/kai-scheduler-queue: backfill
+spec:
+  services:
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      resources:
+        requests:
+          cpu: "2"
+          memory: "4Gi"
+        limits:
+          cpu: "4"
+          memory: "8Gi"
+      extraPodSpec:
+        nodeSelector:
+          nodeGroup: customer-cpu
+          kubernetes.io/arch: arm64
+        tolerations:
+          - operator: Exists
+        volumes:
+          - name: rl-workspace
+            persistentVolumeClaim:
+              claimName: rl-workspace
+        mainContainer:
+          image: jwillthomson/dynamo-arm-tokenize-endpoint-7da82a91
+          workingDir: /workspace
+          volumeMounts:
+            - mountPath: /mnt/rl-workspace
+              name: rl-workspace
+          command:
+            - python3
+            - -m
+            - dynamo.frontend
+          args:
+            - --router-reset-states
+          env:
+            - name: HF_HOME
+              value: /mnt/rl-workspace/jothomson/hf-cache
+    VllmDecodeWorker:
+      componentType: worker
+      replicas: 1
+      envFromSecret: jothomson-secrets
+      resources:
+        requests:
+          gpu: "1"
+          memory: "96Gi"
+        limits:
+          gpu: "1"
+          memory: "192Gi"
+      extraPodSpec:
+        securityContext:
+          runAsUser: 0
+        nodeSelector:
+          nvidia.com/gpu.product: NVIDIA-GB300
+        tolerations:
+          - operator: Exists
+        volumes:
+          - name: rl-workspace
+            persistentVolumeClaim:
+              claimName: rl-workspace
+        mainContainer:
+          image: jwillthomson/dynamo-arm-tokenize-endpoint-7da82a91
+          workingDir: /workspace
+          volumeMounts:
+            - mountPath: /mnt/rl-workspace
+              name: rl-workspace
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -eu
+              python3 - <<'PY'
+              import importlib.util
+              import shutil
+
+              src = "/mnt/rl-workspace/jothomson/nemo-rl-qwen3-eagle3-dynamo-mx/infra/nrl_k8s/dynamo_mx/mx_refit_extension_megatron.py"
+              spec = importlib.util.find_spec("dynamo.vllm.mx_refit.extension")
+              if spec is None or spec.origin is None:
+                  raise RuntimeError("Could not locate dynamo.vllm.mx_refit.extension")
+              shutil.copyfile(src, spec.origin)
+              print(f"[mx-debug] overlaid extension.py: {spec.origin}", flush=True)
+              PY
+              exec python3 -m dynamo.vllm "$@"
+            - --
+          args:
+            - --model
+            - Qwen/Qwen3-1.7B
+            - --served-model-name
+            - Qwen/Qwen3-1.7B
+            - --load-format
+            - auto
+            - --model-express-url
+            - modelexpress-server.default.svc.cluster.local:8001
+            - --tensor-parallel-size
+            - "1"
+            - --dtype
+            - bfloat16
+            - --gpu-memory-utilization
+            - "0.8"
+            - --max-model-len
+            - "512"
+            - --max-num-seqs
+            - "16"
+            - --max-num-batched-tokens
+            - "1024"
+            - --enforce-eager
+            - --speculative-config
+            - '{"method":"eagle3","model":"AngelSlim/Qwen3-1.7B_eagle3","num_speculative_tokens":3,"draft_tensor_parallel_size":1}'
+          env:
+            - name: DYN_HEALTH_CHECK_ENABLED
+              value: "false"
+            - name: DYN_SYSTEM_PORT
+              value: "9090"
+            - name: HF_HOME
+              value: /mnt/rl-workspace/jothomson/hf-cache
+            - name: DYN_MX_REFIT_ENABLED
+              value: "1"
+            - name: MODEL_EXPRESS_URL
+              value: "modelexpress-server.default.svc.cluster.local:8001"
+            - name: UCX_TLS
+              value: "tcp,cuda_copy"
+            - name: NIXL_UCX_TLS
+              value: "tcp,cuda_copy"
+            - name: UCX_IB_GPU_DIRECT_RDMA
+              value: "yes"
+            - name: UCX_CUDA_COPY_DMABUF
+              value: "yes"
+            - name: UCX_LOG_LEVEL
+              value: "info"
+            - name: MX_RDMA_NIC_PIN
+              value: "off"

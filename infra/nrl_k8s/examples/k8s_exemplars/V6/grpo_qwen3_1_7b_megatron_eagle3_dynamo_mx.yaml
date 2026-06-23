@@ -1,0 +1,72 @@
+# GRPO Qwen3-1.7B Megatron EAGLE3 smoke with Dynamo + ModelExpress.
+#
+# Minimal k8s port of:
+# examples/configs/recipes/llm/grpo-qwen3-1.7b-1n8g-megatron-eagle3.yaml
+#
+# The source recipe trains an EAGLE3 draft model with Megatron. This variant
+# keeps that path and moves generation to an MX-refit DynamoGraphDeployment.
+
+defaults: ../../../../../examples/configs/recipes/llm/grpo-qwen3-1.7b-1n8g-megatron-eagle3.yaml
+
+grpo:
+  max_num_steps: 2
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo-qwen3-1.7b-megatron-eagle3-dynamo-mx
+
+policy:
+  generation:
+    backend: "dynamo"
+    dynamo_cfg:
+      request_timeout_s: 900.0
+      metrics_include_prefixes:
+        - dynamo_component_gpu_cache_usage
+        - dynamo_component_inflight_requests
+        - dynamo_work_handler_queue_depth
+        - dynamo_component_requests_total
+        - dynamo_work_handler_time_to_first_response
+        - vllm:generation_tokens
+        - vllm:prompt_tokens_total
+        - vllm:inter_token_latency
+        - vllm:spec_decode
+    vllm_cfg:
+      async_engine: false
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.8
+      max_model_len: ${policy.max_total_sequence_length}
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 0.5
+    vllm_kwargs: {}
+    colocated:
+      enabled: false
+
+logger:
+  log_dir: "logs/grpo-qwen3-1.7b-megatron-eagle3-dynamo-mx"
+  wandb_enabled: false
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: false
+  wandb:
+    name: "grpo-qwen3-1.7b-megatron-eagle3-dynamo-mx"
+
+cluster:
+  gpus_per_node: 1
+  num_nodes: 1
+  weight_sync:
+    method: "mx"
+    mx_config:
+      enabled: true
+      mx_server_url: "modelexpress-server.default.svc.cluster.local:8001"
+      timeout_seconds: 300.0
+      same_rank_only: true
+      tree_scale_out: false
+      moe_expert_filter: false
+      nic_pin: "off"
+      retain_latest_k: 1
