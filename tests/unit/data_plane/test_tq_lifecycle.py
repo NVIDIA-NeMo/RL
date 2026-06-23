@@ -150,6 +150,28 @@ def tq_client_backends(request):
             "local_buffer_size": 1073741824,  # 1 GiB
         }
     )
+
+    if backend == "mooncake_cpu":
+        # Probe that the mooncake store actually works at runtime.
+        # Installed-but-broken mooncake (e.g. no RDMA / SHM init failure)
+        # returns non-zero error codes from batch_upsert_from; skip rather
+        # than fail the test suite in that environment.
+        try:
+            _probe_id = "__mooncake_probe__"
+            client.register_partition(_probe_id, ["_x"], 1, ["_probe"])
+            client.put_samples(
+                ["_a"],
+                _probe_id,
+                TensorDict({"_x": torch.zeros(1, dtype=torch.float32)}, batch_size=[1]),
+            )
+            client.clear_samples(sample_ids=None, partition_id=_probe_id)
+        except RuntimeError as e:
+            client.close()
+            pytest.skip(
+                f"mooncake installed but not functional ({e}) — "
+                "skipping mooncake_cpu backend"
+            )
+
     yield client
     client.close()
 
