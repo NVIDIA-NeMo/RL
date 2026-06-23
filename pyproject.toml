@@ -35,7 +35,7 @@ dependencies = [
   "nvidia-ml-py",
   "hydra-core",
   "mlperf-common @ git+https://github.com/NVIDIA/mlperf-common.git@c02c93c0414071400a10716d9cd5cb8f668b78d4",
-  "mlperf-logging @ git+https://github.com/mlcommons/logging.git@6.0.0-rc3",
+  "mlperf-logging @ git+https://github.com/mlcommons/logging.git@6.0.0-rc6",
   "tiktoken",
   "blobfile",
   "debugpy",
