@@ -194,7 +194,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         self.server_thread = None
         self.base_url = None
         self.http_server = None
-        
+
         super().__init__(
             config,
             bundle_indices,
