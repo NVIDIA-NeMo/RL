@@ -291,6 +291,21 @@ if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
     rm -f "${GYM_VLLM_OVERRIDE}"
 fi
 EOF
+# Remove royalty-obligating codec libraries bundled by decord2 and av (PyAV).
+# H.264 (libx264, libopenh264) and H.265 (libx265) carry MPEG LA / HEVC Advance
+# royalty obligations on distribution. libmp3lame (MP3) is removed as a precaution
+# even though its patents expired in 2017. These libs are not used by NeMo-RL at
+# runtime; removing them does not affect functionality.
+# libopenh264 note: Cisco's royalty-free promise only applies when the binary is
+# downloaded from Cisco's CDN at runtime — bundling it directly incurs royalties.
+RUN find /opt/nemo_rl_venv /opt/ray_venvs \
+        \( -name "libx264*" \
+        -o -name "libx265*" \
+        -o -name "libopenh264*" \
+        -o -name "libmp3lame*" \) \
+        -delete && \
+    echo "Royalty-obligating codec libs removed."
+
 # Generate container fingerprint for frozen environment support
 # Store outside /opt/nemo-rl to avoid being overwritten by user mounts
 RUN python tools/generate_fingerprint.py > /opt/nemo_rl_container_fingerprint
