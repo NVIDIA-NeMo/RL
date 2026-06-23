@@ -115,9 +115,6 @@ class MLPerfGRPOLogger:
     def constants(self) -> Any:
         return self.mllogger.constants
 
-    def _constant(self, name: str, fallback: str) -> str:
-        return str(getattr(self.constants, name, fallback))
-
     def _call(self, method_name: str, *args: Any, **kwargs: Any) -> None:
         method = getattr(self.mllogger, method_name)
         try:
@@ -158,7 +155,7 @@ class MLPerfGRPOLogger:
         return val_period * self.global_batch_size
 
     def log_init_start(self) -> None:
-        self._start(self._constant("INIT_START", "init_start"))
+        self._start(self.constants.INIT_START)
 
     def log_hyperparams(
         self,
@@ -259,11 +256,9 @@ class MLPerfGRPOLogger:
         self.block_started = True
         self.block_start_step = int(step)
         self._start(
-            self._constant("BLOCK_START", "block_start"),
+            self.constants.BLOCK_START,
             metadata={
-                self._constant(
-                    "SAMPLES_COUNT", "samples_count"
-                ): self.block_size_samples(),
+                self.constants.SAMPLES_COUNT: self.block_size_samples(),
                 "step": int(step),
             },
         )
@@ -275,9 +270,9 @@ class MLPerfGRPOLogger:
         self.last_step = max(self.last_step, step)
         block_samples = max(0, step - self.block_start_step) * self.global_batch_size
         self._end(
-            self._constant("BLOCK_STOP", "block_stop"),
+            self.constants.BLOCK_STOP,
             metadata={
-                self._constant("SAMPLES_COUNT", "samples_count"): block_samples,
+                self.constants.SAMPLES_COUNT: block_samples,
                 "step": step,
             },
         )
@@ -287,11 +282,9 @@ class MLPerfGRPOLogger:
         step = int(step)
         self.stop_train_block(step)
         self._start(
-            self._constant("EVAL_START", "eval_start"),
+            self.constants.EVAL_START,
             metadata={
-                self._constant("SAMPLES_COUNT", "samples_count"): self.sample_count(
-                    step
-                ),
+                self.constants.SAMPLES_COUNT: self.sample_count(step),
                 "step": step,
             },
         )
@@ -320,14 +313,14 @@ class MLPerfGRPOLogger:
                 )
 
         self._event(
-            key=self._constant("EVAL_ACCURACY", "eval_accuracy"),
-            metadata={self._constant("SAMPLES_COUNT", "samples_count"): samples_count},
+            key=self.constants.EVAL_ACCURACY,
+            metadata={self.constants.SAMPLES_COUNT: samples_count},
             value=accuracy,
         )
         self._end(
-            self._constant("EVAL_STOP", "eval_stop"),
+            self.constants.EVAL_STOP,
             metadata={
-                self._constant("SAMPLES_COUNT", "samples_count"): samples_count,
+                self.constants.SAMPLES_COUNT: samples_count,
                 "step": step,
             },
         )
@@ -342,11 +335,9 @@ class MLPerfGRPOLogger:
 
     def end_eval_with_error(self, step: int) -> None:
         self._end(
-            self._constant("EVAL_STOP", "eval_stop"),
+            self.constants.EVAL_STOP,
             metadata={
-                self._constant("SAMPLES_COUNT", "samples_count"): self.sample_count(
-                    int(step)
-                ),
+                self.constants.SAMPLES_COUNT: self.sample_count(int(step)),
                 "step": int(step),
             },
         )
@@ -377,9 +368,7 @@ class MLPerfGRPOLogger:
             self._event(
                 key="tracked_stats",
                 metadata={
-                    self._constant("SAMPLES_COUNT", "samples_count"): self.sample_count(
-                        step
-                    ),
+                    self.constants.SAMPLES_COUNT: self.sample_count(step),
                     "step": step,
                 },
                 value=tracked,
@@ -442,9 +431,9 @@ class MLPerfGRPOLogger:
         if samples_count is None:
             samples_count = self.sample_count(self.last_step)
         self._end(
-            self._constant("RUN_STOP", "run_stop"),
+            self.constants.RUN_STOP,
             metadata={
-                self._constant("SAMPLES_COUNT", "samples_count"): samples_count,
+                self.constants.SAMPLES_COUNT: samples_count,
                 "status": status,
             },
         )
