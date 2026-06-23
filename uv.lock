@@ -70,7 +70,7 @@ overrides = [
     { name = "nvidia-cublas", marker = "sys_platform != 'darwin'", specifier = "==13.5.1.27" },
     { name = "nvidia-cudnn-cu13", marker = "sys_platform != 'darwin'", specifier = "==9.20.0.48" },
     { name = "nvidia-cudnn-frontend", specifier = "==1.23.0" },
-    { name = "nvidia-cutlass-dsl", extras = ["cu13"], specifier = ">=4.5.2" },
+    { name = "nvidia-cutlass-dsl", extras = ["cu13"], specifier = ">=4.5.2,<4.6" },
     { name = "nvidia-modelopt", extras = ["torch"], git = "https://github.com/NVIDIA/Model-Optimizer?rev=c3b913b9cc1d82d5a0af9fa77b4db87829e6f158" },
     { name = "nvidia-nvshmem-cu13", marker = "sys_platform != 'darwin'", specifier = ">=3.6.5" },
     { name = "opencv-python-headless", specifier = ">=4.11.0" },
