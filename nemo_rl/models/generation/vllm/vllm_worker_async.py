@@ -194,12 +194,6 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         self.server_thread = None
         self.base_url = None
         self.http_server = None
-
-        # Defaults for HTTP server state; overwritten by _create_engine()
-        # when the worker is a model owner and the model is actually loaded.
-        self.server_thread = None
-        self.base_url = None
-        self.http_server = None
         
         super().__init__(
             config,
