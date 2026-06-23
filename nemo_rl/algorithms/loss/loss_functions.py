@@ -34,7 +34,7 @@ from nemo_rl.algorithms.x_token.loss_utils import (
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     DistributedCrossEntropy,
-    dp_all_reduce_sum,
+    group_all_reduce_sum,
     vocab_parallel_full_log_softmax,
     vocab_parallel_log_softmax,
 )
@@ -1496,10 +1496,13 @@ class CrossTokenizerDistillationLossFn(LossFunction):
 
         # Next-token accuracy on the student side, masked to valid tokens.
         # Quick per-step signal on the student's next-token prediction quality.
+        # Feed the contiguous student logits / input_ids / token_mask
+        # (CP-relaid in prepare_loss_input) so the CP-aware next-token shift
+        # pairs predictors with the right labels under load-balanced sharding.
         accuracy = next_token_accuracy(
-            logits,
-            input_ids=data["input_ids"],
-            token_mask=data["token_mask"],
+            student_logits_contig,
+            input_ids=align.student_input_ids,
+            token_mask=align.student_token_mask,
             sample_mask=data["sample_mask"],
             tp_group=tp_group,
             cp_group=cp_group,
@@ -1653,7 +1656,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         # mirrors the `global_valid_toks` convention used by CE.
         sample_mask_bool = align.sample_mask.bool()
         valid_bool = chunk_mask & sample_mask_bool.unsqueeze(-1)
-        global_valid_chunks = dp_all_reduce_sum(valid_bool.sum())
+        global_valid_chunks = group_all_reduce_sum(valid_bool.sum())
         if global_valid_chunks.item() == 0:
             zero = torch.zeros((), device=device, dtype=proj_log_chunks.dtype)
             return (
@@ -1786,7 +1789,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         # both `kl_common` and `l1_uncommon` use this as their denom so
         # the loss is normalized by `sum(global_valid_chunks)`, not a
         # per-rank mean.
-        global_valid_chunks = dp_all_reduce_sum(valid_chunk.sum())
+        global_valid_chunks = group_all_reduce_sum(valid_chunk.sum())
         if global_valid_chunks.item() == 0:
             zero = torch.zeros((), device=device, dtype=zero_dtype)
             return (

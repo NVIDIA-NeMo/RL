@@ -1382,16 +1382,22 @@ def cp_shift_next(
     return out
 
 
-def dp_all_reduce_sum(local: torch.Tensor) -> torch.Tensor:
-    """Sum a scalar over the worker's default (full-mesh DP×CP×TP) group, no grad.
+def group_all_reduce_sum(
+    local: torch.Tensor,
+    group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """Sum a scalar over ``group`` (default ``None`` = WORLD, the full DP×CP×TP mesh), no grad.
 
-    The TP-replication inflation is intentional: normalizers whose numerator sums
-    over the same mesh cancel it, so the result stays parallelism-invariant. Returns
-    a fresh float32 scalar (falls back to a local copy when dist is uninitialized).
+    Note the default group is WORLD, not DP: the reduction spans every rank,
+    including TP replicas. That TP-replication inflation is intentional —
+    normalizers whose numerator sums over the same group cancel it, so the
+    result stays parallelism-invariant. Pass an explicit ``group`` to reduce
+    over a narrower scope. Returns a fresh float32 scalar (falls back to a local
+    copy when dist is uninitialized).
     """
     out = local.detach().to(torch.float32).clone()
     if torch.distributed.is_initialized():
-        torch.distributed.all_reduce(out)
+        torch.distributed.all_reduce(out, group=group)
     return out
 
 

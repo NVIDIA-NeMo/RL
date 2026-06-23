@@ -918,21 +918,21 @@ class DTensorPolicyWorkerV2Impl(
                         vals, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0.0
                     )
                 batch_size_mb, seq_len_mb, local_vocab_size = vals.shape
-                if storage is None:
-                    self._teacher_ipc_storage, self._teacher_ipc_handle = (
-                        ensure_teacher_ipc_buffer(
-                            self._teacher_ipc_storage,
-                            self._teacher_ipc_handle,
-                            iterator_len,
-                            batch_size_mb,
-                            target_local_seq,
-                            local_vocab_size,
-                            vals.dtype,
-                            vals.device,
-                        )
+
+                self._teacher_ipc_storage, self._teacher_ipc_handle = (
+                    ensure_teacher_ipc_buffer(
+                        self._teacher_ipc_storage,
+                        self._teacher_ipc_handle,
+                        iterator_len,
+                        batch_size_mb,
+                        target_local_seq,
+                        local_vocab_size,
+                        vals.dtype,
+                        vals.device,
                     )
-                    storage = self._teacher_ipc_storage
-                    payload_ipc = self._teacher_ipc_handle
+                )
+                storage = self._teacher_ipc_storage
+                payload_ipc = self._teacher_ipc_handle
                 storage[buf_idx, :batch_size_mb, :seq_len_mb, :local_vocab_size].copy_(
                     vals
                 )

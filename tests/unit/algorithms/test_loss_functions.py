@@ -2294,7 +2294,7 @@ def test_distillation_loss_fn_call():
 # gold path (KL on the exact-mapped common partition + L1 on the uncommon
 # tail) and the next-token CE term. Unlike the DistillationLossFn tests
 # above, these run on CPU: the gold and CE paths use no GPU-pinned ops, and
-# ``dp_all_reduce_sum`` falls back to the local sum when torch.distributed
+# ``group_all_reduce_sum`` falls back to the local sum when torch.distributed
 # is not initialized.
 # ---------------------------------------------------------------------------
 

@@ -536,6 +536,29 @@ class TestZeroCopyTeacherLogits:
         assert out is not None and out.data_ptr() == storage.data_ptr()
         assert torch.equal(out, storage[0, :2])
 
+    def test_fastpath_applies_cp_seq_offset(self, monkeypatch):
+        # student_cp_size=2, rank=1: the view must be sliced to this rank's
+        # contiguous seq window [T//2 : T], not the whole sequence. With
+        # cp_size=1 (above) seq_lo/seq_hi collapse to [0:T], so this case is
+        # what guards the `student_seq_start - teacher_seq_start` offset.
+        storage = torch.arange(2 * 4 * 5, dtype=torch.float32).reshape(1, 2, 4, 5)
+        monkeypatch.setattr(
+            "nemo_rl.models.policy.utils.rebuild_cuda_tensor_from_ipc",
+            lambda h, d: storage,
+        )
+        out = _try_zero_copy_teacher_logits(
+            [self._entry(0), self._entry(1)],
+            student_cp_rank=1,
+            student_cp_size=2,
+            device=0,
+        )
+        # full_seq_len=4 -> rank 1 owns seq [2:4]; teacher_seq_start=0. Still a
+        # zero-copy view, but starting at the seq-offset row (so its data_ptr
+        # matches the offset slice, not storage's base pointer).
+        expected = storage[0, :2, 2:4, :]
+        assert out is not None and out.data_ptr() == expected.data_ptr()
+        assert torch.equal(out, expected)
+
     def test_none_when_vocab_sharded(self):
         e = self._entry(0)
         e["teacher_shards"][0]["vocab_end_index"] = 3

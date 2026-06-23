@@ -21,7 +21,8 @@ Used by both :mod:`token_aligner` and
 - Chunk aggregation: :func:`chunk_log_prob_sums` / :func:`chunk_average_finalize`
   / :func:`chunk_average_log_probs` / :func:`valid_chunk_mask` (the
   partial/finalize split lets callers insert a CP all-reduce between), plus
-  :func:`dp_all_reduce_sum` for the global valid-chunk denominator.
+  :func:`nemo_rl.distributed.model_utils.group_all_reduce_sum` for the global
+  valid-chunk denominator.
 - Teacher-logit IPC: :func:`rebuild_teacher_full_logits_from_ipc`,
   :func:`assemble_teacher_logits_from_shards`,
   :func:`collect_overlapping_teacher_shards` reassemble full-vocab teacher
@@ -265,6 +266,8 @@ class LocalizedAlignment:
     pair_valid: torch.Tensor
     pair_is_correct: torch.Tensor
     sample_mask: torch.Tensor
+    student_input_ids: Optional[torch.Tensor] = None
+    student_token_mask: Optional[torch.Tensor] = None
 
 
 def localize_alignment(
@@ -276,9 +279,12 @@ def localize_alignment(
     """Localize the chunk-alignment data-dict fields for the local CP shard.
 
     Unwraps the ``alignment_*`` / ``sample_mask`` entries from DTensor to their
-    local tensors. Student-seq fields (``student_chunk_id``) are contiguously
-    CP-sharded via ``cp_buffers`` (rank r holds the r-th contiguous seq slice);
-    the teacher-seq ``teacher_chunk_id`` is full, so it is sliced contiguously to
+    local tensors. Student-seq fields (``student_chunk_id``) come from
+    ``cp_buffers`` in PyTorch's *load-balanced* (``2*cp`` interleaved) CP layout,
+    not contiguous — the caller
+    (:func:`prepare_xtoken_cross_tokenizer_loss_input`) must relayout them to this
+    rank's contiguous window via :func:`cp_load_balanced_to_contiguous` before use.
+    The teacher-seq ``teacher_chunk_id`` is full, so it is sliced contiguously to
     this CP rank's ``teacher_seq_len`` window to match the IPC consumer's
     contiguous teacher-logit slice.
     """
@@ -318,7 +324,7 @@ def student_next_token_ce(
         next_token_logprobs = get_logprobs_from_vocab_parallel_logits(
             logits, input_ids, seq_index=seq_index
         )
-        return -next_token_logprobs[:, :-1]  # drop CP-roll wrap-around
+        return -next_token_logprobs
     shift_logits = logits[:, :-1].contiguous()
     shift_labels = input_ids[:, 1:].contiguous()
     return torch.nn.functional.cross_entropy(
@@ -951,8 +957,9 @@ def prepare_xtoken_cross_tokenizer_loss_input(
 
     Rebuilds the teacher full-vocab logits from the per-rank CUDA IPC handles and
     does the shared CP-resolution the P-KL and gold paths need (contiguous student
-    logits + localized, next-token-shifted alignment). TP/CP groups come from the
-    student ``logits``' device mesh, falling back to the passed groups for
+    logits + localized, next-token-shifted alignment), plus the contiguous student
+    ``input_ids`` / ``token_mask`` the accuracy metric consumes. TP/CP groups come
+    from the student ``logits``' device mesh, falling back to the passed groups for
     non-DTensor logits.
 
     Returns:
@@ -982,4 +989,14 @@ def prepare_xtoken_cross_tokenizer_loss_input(
         fill=-1,
     )
     align.teacher_chunk_id = cp_shift_next(align.teacher_chunk_id, cp_group, fill=-1)
+    # Relay the student input_ids / token_mask from CP load-balanced to this
+    # rank's contiguous window so the next-token accuracy metric (which applies
+    # its own contiguous next-token shift) stays consistent with the contiguous
+    # student logits. Unshifted here: the metric does the shift itself.
+    align.student_input_ids = cp_load_balanced_to_contiguous(
+        data["input_ids"], cp_group=cp_group
+    )
+    align.student_token_mask = cp_load_balanced_to_contiguous(
+        data["token_mask"], cp_group=cp_group
+    )
     return teacher_full_logits, student_logits, align, tp_group, cp_group
