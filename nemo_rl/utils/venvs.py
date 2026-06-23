@@ -76,8 +76,26 @@ def create_local_venv(
 
     logger.info(f"Creating new venv at {venv_path}")
 
+    # Resolve the interpreter version the project is pinned to (.python-version
+    # at the git root). The venv is created by a Ray actor whose cwd is *not*
+    # the git root, so `uv venv` cannot discover the pin on its own and would
+    # silently fall back to whatever system interpreter it finds (e.g. 3.12).
+    # That mismatch makes uv re-resolve dependencies for the wrong Python and
+    # can pull in different package versions than the base venv -- most notably
+    # a different `ray`, which then fails Ray worker startup across nodes with
+    # "connect() got an unexpected keyword argument". Pin the version explicitly
+    # so every per-actor venv matches the driver/base venv.
+    python_version_file = os.path.join(git_root, ".python-version")
+    pinned_python_version = ""
+    if os.path.exists(python_version_file):
+        with open(python_version_file) as f:
+            pinned_python_version = f.read().strip()
+
     # Create the virtual environment
-    uv_venv_cmd = ["uv", "venv", "--allow-existing", venv_path]
+    uv_venv_cmd = ["uv", "venv", "--allow-existing"]
+    if pinned_python_version:
+        uv_venv_cmd += ["--python", pinned_python_version]
+    uv_venv_cmd.append(venv_path)
     subprocess.run(uv_venv_cmd, check=True)
 
     # Execute the command with the virtual environment
@@ -86,6 +104,7 @@ def create_local_venv(
     #  one call to this in the driver. It is not safe to use this in a multi-process
     #  context.
     #  https://docs.astral.sh/uv/concepts/projects/config/#project-environment-path
+
     env["UV_PROJECT_ENVIRONMENT"] = venv_path
 
     # Split the py_executable into command and arguments
