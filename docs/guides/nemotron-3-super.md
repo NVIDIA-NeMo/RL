@@ -91,17 +91,17 @@ Each stage is launched with `super_launch.sh`. Set the following variables befor
 * `$SANDBOX_CONTAINER`: The sandbox container image from [Build sandbox container](#build-sandbox-container) (`.sqsh` path or registry URI).
 * `$PERSISTENT_CACHE`: Path to a directory used to store caches for vLLM and FlashInfer.
 * `$EXTRA_MOUNTS`: Comma-separated `host:container` mount pairs for shared filesystems that your data, models, and checkpoints reside on (e.g. `EXTRA_MOUNTS=/scratch:/scratch,/lustre:/lustre`). The launch script only mounts the code snapshot directory by default.
-* `$SIF_DIR`: *(Stage 2.2 only)* Path to the directory containing Apptainer `.sif` images for the SWE-bench environments. These are converted Docker images from R2E-Gym, SWE-Gym, and SWE-Bench Verified. See [Stage 2.2](#stage-22---swe-2-64-nodes) for download instructions.
+* `$SIF_DIR`: *(Stage 2.2 only)* Path to the directory containing Apptainer `.sif` images for the SWE-bench environments. These are converted Docker images from R2E-Gym, SWE-Gym, and SWE-Bench Verified. See [Stage 2.2](#stage-22---swe-2-64-h100-gpu-nodes) for download instructions.
 * `$SLURM_PARTITION`
 * `$SLURM_ACCOUNT`
 
 `MODEL_PATH` is the input checkpoint for each stage. Stage 1.1 starts from the SFT checkpoint; every subsequent stage takes the output of the previous one.
 
-Node counts listed below (from `cluster.num_nodes` in each config) assume B200 nodes with 8 GPUs each and may need adjustment for other GPU types.
+The launch examples below use the H100 prod configs. These configs keep the old release train-DP and generation-DP footprint while using H100-compatible TP/CP/EP and vLLM TP settings. For stages with GPU judge servers, set `SBATCH_NUM_NODES` to the total node count so SLURM allocates both the NeMo-RL nodes and the extra NeMo-Gym nodes. Lower-DP H100 variants are available under `examples/nemo_gym/nemotron-3-super/small_scale/`.
 
 ### Stage 1 - RLVR
 
-#### Stage 1.1 - RLVR 1 (109 nodes)
+#### Stage 1.1 - RLVR 1 (183 H100 GPU nodes)
 ```bash
 EXP_NAME=stage1.1-rlvr1 \
 CONFIG_PATH=examples/nemo_gym/nemotron-3-super/stage1_rlvr.yaml \
@@ -114,10 +114,11 @@ PERSISTENT_CACHE=$PERSISTENT_CACHE \
 EXTRA_MOUNTS=$EXTRA_MOUNTS \
 SLURM_PARTITION=$SLURM_PARTITION \
 SLURM_ACCOUNT=$SLURM_ACCOUNT \
+SBATCH_NUM_NODES=183 \
 bash super_launch.sh
 ```
 
-#### Stage 1.2 - RLVR 2 (109 nodes)
+#### Stage 1.2 - RLVR 2 (183 H100 GPU nodes)
 ```bash
 EXP_NAME=stage1.2-rlvr2 \
 CONFIG_PATH=examples/nemo_gym/nemotron-3-super/stage1_rlvr.yaml \
@@ -130,10 +131,11 @@ PERSISTENT_CACHE=$PERSISTENT_CACHE \
 EXTRA_MOUNTS=$EXTRA_MOUNTS \
 SLURM_PARTITION=$SLURM_PARTITION \
 SLURM_ACCOUNT=$SLURM_ACCOUNT \
+SBATCH_NUM_NODES=183 \
 bash super_launch.sh
 ```
 
-#### Stage 1.3 - RLVR 3 (109 nodes)
+#### Stage 1.3 - RLVR 3 (183 H100 GPU nodes)
 ```bash
 EXP_NAME=stage1.3-rlvr3 \
 CONFIG_PATH=examples/nemo_gym/nemotron-3-super/stage1_rlvr.yaml \
@@ -146,6 +148,7 @@ PERSISTENT_CACHE=$PERSISTENT_CACHE \
 EXTRA_MOUNTS=$EXTRA_MOUNTS \
 SLURM_PARTITION=$SLURM_PARTITION \
 SLURM_ACCOUNT=$SLURM_ACCOUNT \
+SBATCH_NUM_NODES=183 \
 bash super_launch.sh
 ```
 
@@ -176,7 +179,7 @@ EOF
 
 Use the resulting image as `$SWE_CONTAINER` in the Stage 2 launch commands below.
 
-#### Stage 2.1 - SWE 1 (64 nodes)
+#### Stage 2.1 - SWE 1 (64 H100 GPU nodes)
 ```bash
 EXP_NAME=stage2.1-swe1 \
 CONFIG_PATH=examples/nemo_gym/nemotron-3-super/stage2_swe1.yaml \
@@ -192,7 +195,7 @@ SLURM_ACCOUNT=$SLURM_ACCOUNT \
 bash super_launch.sh
 ```
 
-#### Stage 2.2 - SWE 2 (64 nodes)
+#### Stage 2.2 - SWE 2 (64 H100 GPU nodes)
 
 This stage requires Apptainer images for the SWE Gym environments.
 
@@ -228,7 +231,7 @@ SIF_DIR=/path/to/sif \
 bash super_launch.sh
 ```
 
-### Stage 3 - RLHF (72 nodes)
+### Stage 3 - RLHF (100 H100 GPU nodes)
 ```bash
 EXP_NAME=stage3-rlhf \
 CONFIG_PATH=examples/nemo_gym/nemotron-3-super/stage3_rlhf.yaml \
@@ -241,5 +244,6 @@ PERSISTENT_CACHE=$PERSISTENT_CACHE \
 EXTRA_MOUNTS=$EXTRA_MOUNTS \
 SLURM_PARTITION=$SLURM_PARTITION \
 SLURM_ACCOUNT=$SLURM_ACCOUNT \
+SBATCH_NUM_NODES=100 \
 bash super_launch.sh
 ```

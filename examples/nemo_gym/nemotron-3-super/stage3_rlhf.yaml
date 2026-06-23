@@ -109,7 +109,7 @@ policy:
     activation_checkpointing: true
     tensor_model_parallel_size: 4
     expert_tensor_parallel_size: 1
-    expert_model_parallel_size: 8
+    expert_model_parallel_size: 32
     pipeline_model_parallel_size: 1
     num_layers_in_first_pipeline_stage: null
     num_layers_in_last_pipeline_stage: null
@@ -132,9 +132,9 @@ policy:
     moe_per_layer_logging: True
     gradient_accumulation_fusion: False
 
-    mtp_loss_scaling_factor: 0.0
+    mtp_loss_scaling_factor: 0.3
     mtp_use_repeated_layer: true
-    mtp_num_layers: 0
+    mtp_num_layers: 5
     mtp_detach_heads: true
 
     optimizer:
@@ -219,7 +219,7 @@ policy:
       async_engine: true
       precision: ${policy.precision}
       kv_cache_dtype: "auto"
-      tensor_parallel_size: 4
+      tensor_parallel_size: 8
       pipeline_parallel_size: 1
       expert_parallel_size: 1
       gpu_memory_utilization: 0.8
@@ -250,7 +250,7 @@ policy:
       enabled: false
       resources:
         gpus_per_node: 8
-        num_nodes: 32
+        num_nodes: 64
 
 data:
   use_multiple_dataloader: false
@@ -273,7 +273,7 @@ env:
   nemo_gym:
     uv_venv_dir: "${oc.env:PERSISTENT_CACHE}/gym_venvs"  # overridden by super_launch.sh to $GYM_VENV_DIR
     skip_venv_if_present: true
-    num_gpu_nodes: 8
+    num_gpu_nodes: 4
     port_range_low: 15001
     port_range_high: 20000
     invalid_tool_call_patterns:
@@ -337,7 +337,7 @@ env:
           vllm_serve_env_vars:
             VLLM_RAY_DP_PACK_STRATEGY: strict
           vllm_serve_kwargs:
-            data_parallel_size: 8
+            data_parallel_size: 4
             tensor_parallel_size: 8
             pipeline_parallel_size: 1
             reasoning_parser: deepseek_r1
@@ -372,4 +372,4 @@ logger:
 
 cluster:
   gpus_per_node: 8
-  num_nodes: 72
+  num_nodes: 96

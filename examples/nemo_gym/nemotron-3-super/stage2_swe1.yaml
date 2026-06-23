@@ -109,7 +109,7 @@ policy:
     activation_checkpointing: true
     tensor_model_parallel_size: 8
     expert_tensor_parallel_size: 1
-    expert_model_parallel_size: 8
+    expert_model_parallel_size: 16
     pipeline_model_parallel_size: 1
     num_layers_in_first_pipeline_stage: null
     num_layers_in_last_pipeline_stage: null
@@ -132,9 +132,9 @@ policy:
     moe_per_layer_logging: True
     gradient_accumulation_fusion: False
 
-    mtp_loss_scaling_factor: 0.0
+    mtp_loss_scaling_factor: 0.3
     mtp_use_repeated_layer: true
-    mtp_num_layers: 0
+    mtp_num_layers: 5
     mtp_detach_heads: true
 
     optimizer:
