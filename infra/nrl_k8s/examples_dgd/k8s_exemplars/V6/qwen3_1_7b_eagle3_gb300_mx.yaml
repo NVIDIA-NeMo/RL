@@ -29,7 +29,7 @@ spec:
             persistentVolumeClaim:
               claimName: rl-workspace
         mainContainer:
-          image: jwillthomson/dynamo-arm-tokenize-endpoint-7da82a91
+          image: jwillthomson/dynamo-arm-tokenize-endpoint-9dd7a80
           workingDir: /workspace
           volumeMounts:
             - mountPath: /mnt/rl-workspace
@@ -66,29 +66,15 @@ spec:
             persistentVolumeClaim:
               claimName: rl-workspace
         mainContainer:
-          image: jwillthomson/dynamo-arm-tokenize-endpoint-7da82a91
+          image: jwillthomson/dynamo-arm-tokenize-endpoint-9dd7a80
           workingDir: /workspace
           volumeMounts:
             - mountPath: /mnt/rl-workspace
               name: rl-workspace
           command:
-            - /bin/bash
-            - -c
-            - |
-              set -eu
-              DYNAMO_SRC=/mnt/rl-workspace/jothomson/dynamo-eagle-specdec-mx-refit/components/src
-              if [ ! -d "$DYNAMO_SRC/dynamo/vllm/mx_refit" ]; then
-                echo "FATAL: mounted Dynamo source missing: $DYNAMO_SRC" >&2
-                exit 1
-              fi
-              export PYTHONPATH="$DYNAMO_SRC:${PYTHONPATH:-}"
-              python3 - <<'PY'
-              import dynamo.vllm.mx_refit.extension as extension
-
-              print(f"[mx-debug] using mounted Dynamo MX refit: {extension.__file__}", flush=True)
-              PY
-              exec python3 -m dynamo.vllm "$@"
-            - --
+            - python3
+            - -m
+            - dynamo.vllm
           args:
             - --model
             - Qwen/Qwen3-1.7B
