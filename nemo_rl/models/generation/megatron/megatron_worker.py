@@ -556,7 +556,7 @@ class MegatronGenerationMixin:
 
         results = await asyncio.gather(*coros)
         print(f"[Rank {dist_rank}] Completed {len(results)} requests")
-        return list(results)
+        return results
 
 
 class MegatronGenerationRefitMixin:
