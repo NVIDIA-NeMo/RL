@@ -188,3 +188,4 @@ logger:
 cluster:
     gpus_per_node: 8
     num_nodes: 1
+    segment_size: null  # Nodes per NVLink domain segment for topology-aware alignment; null to disable
