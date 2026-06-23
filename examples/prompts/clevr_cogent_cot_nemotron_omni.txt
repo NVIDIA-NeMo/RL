@@ -1,0 +1,4 @@
+Solve the following problem step by step. When you are done thinking, provide your final answer wrapped in <answer> </answer> tags.
+Your final answer must only contain a single numerical output (e.g. 2, 12, 45) for numerical solutions, and only the strings "yes" or "no" for yes/no type questions.
+
+{}

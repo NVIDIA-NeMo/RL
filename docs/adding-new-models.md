@@ -390,3 +390,31 @@ AssertionError: FAIL: 2047/2048 logprobs are NaN on iteration 2 (prefix caching 
 Note: the `ERROR ... Engine core proc EngineCore_DP0 died unexpectedly` message that may appear after the assertion is just vLLM's engine shutting down ungracefully after the process exits — it is not a separate issue.
 
 The script generates from a counting prompt, appends the output back into the prompt, and generates again. On the second generation, prefix caching reuses the KV cache from the first request's prefix. The bug causes the cached prefix to produce corrupted activations, resulting in `token_id=0` (`<unk>`) with `logprob=nan` for all tokens after the first.
+
+## [6.vllm_routed_experts_completeness.py](https://github.com/NVIDIA-NeMo/RL/blob/main/tools/model_diagnostics/6.vllm_routed_experts_completeness.py)
+
+Checks that vLLM returns a routed-experts record for **every** generated route, which router replay (R3) relies on for MoE models. Requires a vLLM build that supports `enable_return_routed_experts`. It reproduces rare omissions seen with prefix caching plus chunked prefill, where a few samples come back missing routed-expert rows even though most are complete.
+
+```sh
+# Baseline — expect num_failures: 0
+uv run --extra vllm tools/model_diagnostics/6.vllm_routed_experts_completeness.py Qwen/Qwen3-30B-A3B
+
+# Stress the known failure mode (prefix caching + chunked prefill)
+uv run --extra vllm tools/model_diagnostics/6.vllm_routed_experts_completeness.py \
+    Qwen/Qwen3-30B-A3B --enable-prefix-caching --enable-chunked-prefill
+```
+
+For each prompt it compares the number of returned routed-expert rows (prompt + completion) against the expected `valid_length - 1`, and reports any sample with missing or surplus routes. It prints a JSON summary and exits non-zero if any sample is incomplete:
+
+```
+{
+  "enable_chunked_prefill": false,
+  "enable_prefix_caching": false,
+  "failures": [],
+  "model": "Qwen/Qwen3-30B-A3B",
+  "num_failures": 0,
+  "num_outputs": 128
+}
+```
+
+A non-zero `num_failures` (with per-sample `actual_routes` < `expected_routes`) means the generation backend dropped routed experts for some tokens; router replay falls back to the model's own routing for those rows.

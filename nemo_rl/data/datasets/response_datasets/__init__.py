@@ -12,8 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from functools import partial
+
 from nemo_rl.data import ResponseDatasetConfig
-from nemo_rl.data.datasets.response_datasets.aime24 import AIME2024Dataset
+from nemo_rl.data.datasets.response_datasets.aime import AIMEDataset
+from nemo_rl.data.datasets.response_datasets.arrow_text_dataset import ArrowTextDataset
+from nemo_rl.data.datasets.response_datasets.audiomcq import AudioMCQDataset
 from nemo_rl.data.datasets.response_datasets.avqa import AVQADataset
 from nemo_rl.data.datasets.response_datasets.clevr import CLEVRCoGenTDataset
 from nemo_rl.data.datasets.response_datasets.daily_omni import DailyOmniDataset
@@ -28,6 +32,7 @@ from nemo_rl.data.datasets.response_datasets.general_conversations_dataset impor
 from nemo_rl.data.datasets.response_datasets.geometry3k import Geometry3KDataset
 from nemo_rl.data.datasets.response_datasets.gsm8k import GSM8KDataset
 from nemo_rl.data.datasets.response_datasets.helpsteer3 import HelpSteer3Dataset
+from nemo_rl.data.datasets.response_datasets.mmpr_tiny import MMPRTinyDataset
 from nemo_rl.data.datasets.response_datasets.nemogym_dataset import NemoGymDataset
 from nemo_rl.data.datasets.response_datasets.nemotron_cascade2_sft import (
     NemotronCascade2SFTMathDataset,
@@ -43,18 +48,25 @@ from nemo_rl.data.datasets.response_datasets.refcoco import RefCOCODataset
 from nemo_rl.data.datasets.response_datasets.response_dataset import ResponseDataset
 from nemo_rl.data.datasets.response_datasets.squad import SquadDataset
 from nemo_rl.data.datasets.response_datasets.tulu3 import Tulu3SftMixtureDataset
+from nemo_rl.data.datasets.utils import resolve_external_dataset_class
 
 DATASET_REGISTRY = {
     # built-in datasets
+    "audiomcq": AudioMCQDataset,
+    "arrow_text": ArrowTextDataset,
     "avqa": AVQADataset,
-    "AIME2024": AIME2024Dataset,
+    "AIME2024": partial(AIMEDataset, variant="2024"),
+    "AIME2025": partial(AIMEDataset, variant="2025"),
+    "AIME2026": partial(AIMEDataset, variant="2026"),
     "clevr-cogent": CLEVRCoGenTDataset,
     "daily-omni": DailyOmniDataset,
     "general-conversation-jsonl": GeneralConversationsJsonlDataset,
     "DAPOMath17K": DAPOMath17KDataset,
     "DAPOMathAIME2024": DAPOMathAIME2024Dataset,
     "DeepScaler": DeepScalerDataset,
+    "GSM8K": GSM8KDataset,
     "geometry3k": Geometry3KDataset,
+    "mmpr-tiny": MMPRTinyDataset,
     "HelpSteer3": HelpSteer3Dataset,
     "open_assistant": OasstDataset,
     "OpenMathInstruct-2": OpenMathInstruct2Dataset,
@@ -71,21 +83,37 @@ DATASET_REGISTRY = {
 
 
 def load_response_dataset(data_config: ResponseDatasetConfig):
-    """Loads response dataset."""
+    """Loads response dataset.
+
+    Resolution order for ``data_config["dataset_name"]``:
+
+    1. If the name matches a key in ``DATASET_REGISTRY``, use the built-in
+       class.
+    2. Otherwise, if the name contains a ``.``, treat it as a fully qualified
+       dotted import path (e.g. ``my_pkg.my_module.MyDataset``) and import
+       the class dynamically. This lets users register custom datasets
+       without editing ``nemo_rl``.
+    3. Otherwise, raise ``ValueError`` with a helpful message.
+    """
     dataset_name = data_config["dataset_name"]
 
     # load dataset
     if dataset_name in DATASET_REGISTRY:
         dataset_class = DATASET_REGISTRY[dataset_name]
-        dataset = dataset_class(
-            **data_config  # pyrefly: ignore[missing-argument]  `data_path` is required for some classes
-        )
+    elif "." in dataset_name:
+        dataset_class = resolve_external_dataset_class(dataset_name)
     else:
         raise ValueError(
-            f"Unsupported {dataset_name=}. "
-            "Please either use a built-in dataset "
-            "or set dataset_name=ResponseDataset to load from local JSONL file or HuggingFace."
+            f"Unsupported {dataset_name=}. Please set dataset_name to one of: "
+            "(1) a built-in dataset name, "
+            "(2) 'ResponseDataset' to load from a local JSONL file or HuggingFace, or "
+            "(3) an importable dotted path to a dataset class "
+            "(ensure it is installed and importable from PYTHONPATH)."
         )
+
+    dataset = dataset_class(
+        **data_config  # pyrefly: ignore[missing-argument]  `data_path` is required for some classes
+    )
 
     # bind prompt, system prompt and data processor
     dataset.set_task_spec(data_config)
@@ -96,8 +124,10 @@ def load_response_dataset(data_config: ResponseDatasetConfig):
 
 
 __all__ = [
+    "AudioMCQDataset",
+    "ArrowTextDataset",
     "AVQADataset",
-    "AIME2024Dataset",
+    "AIMEDataset",
     "CLEVRCoGenTDataset",
     "DailyOmniDataset",
     "GeneralConversationsJsonlDataset",
@@ -107,6 +137,7 @@ __all__ = [
     "DeepScalerDataset",
     "Geometry3KDataset",
     "HelpSteer3Dataset",
+    "MMPRTinyDataset",
     "NemoGymDataset",
     "NemotronCascade2SFTMathDataset",
     "OasstDataset",

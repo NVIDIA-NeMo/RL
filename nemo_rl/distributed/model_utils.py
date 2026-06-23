@@ -12,15 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
-from megatron.core.models.gpt import GPTModel
-from megatron.core.parallel_state import (
-    get_tensor_model_parallel_group,
-    get_tensor_model_parallel_rank,
-)
-from megatron.core.utils import deprecate_inference_params, get_pg_size
 from torch.distributed.tensor import DTensor, distribute_tensor
 
 from nemo_rl.algorithms.logits_sampling_utils import (
@@ -28,6 +22,11 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     apply_top_k_top_p,
     need_top_k_or_top_p_filtering,
 )
+
+if TYPE_CHECKING:
+    # megatron-core (optional "mcore" extra) is imported lazily below so this
+    # module imports without mcore installed.
+    from megatron.core.models.gpt import GPTModel
 
 
 @torch.no_grad()
@@ -327,9 +326,7 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
         seq_size = int(vocab_parallel_logits.shape[1])
         num_chunks = (seq_size + chunk_size - 1) // chunk_size
 
-        grad_input: torch.Tensor = torch.zeros_like(
-            vocab_parallel_logits, dtype=torch.float32
-        )
+        grad_input: torch.Tensor = torch.zeros_like(vocab_parallel_logits)
 
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * chunk_size
@@ -352,18 +349,14 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
                 num_classes=partition_vocab_size,
             )
 
-            # Inplace index into the preallocated grad_input tensor
-            grad_input_chunk = grad_input[:, chunk_start:chunk_end, :]
-
-            grad_input_chunk.copy_(
-                is_chosen.float().sub_(softmax_output)
-            )  # inplace copy
-            grad_input_chunk.mul_(
+            chunk_grad_fp32 = is_chosen.float().sub_(softmax_output)
+            chunk_grad_fp32.mul_(
                 grad_output[:, chunk_start:chunk_end].unsqueeze(dim=-1)
             )
+            grad_input[:, chunk_start:chunk_end, :].copy_(chunk_grad_fp32)
 
             # Explicitly free before next iteration allocates
-            del softmax_output, is_chosen, logits
+            del softmax_output, is_chosen, logits, chunk_grad_fp32
 
         # if you add an argument to the forward method, then you must add a corresponding None here
         return grad_input, None, None, None, None, None, None
@@ -1216,7 +1209,7 @@ def _get_tokens_on_this_cp_rank(
 
     for ind in shard_inds:
         slices[seq_dim] = slice(ind * shard_size, (ind + 1) * shard_size)
-        ids_chunks.append(input_ids[slices])
+        ids_chunks.append(input_ids[tuple(slices)])
 
     ids = torch.cat(ids_chunks, dim=seq_dim)
     return ids
@@ -1355,6 +1348,7 @@ def get_next_token_logprobs_from_logits(
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
+    chunk_size: Optional[int] = None,
 ) -> torch.Tensor:
     """Compute token log-probabilities from logits, handling parallel and non-parallel cases.
 
@@ -1371,11 +1365,20 @@ def get_next_token_logprobs_from_logits(
         vocab_parallel_group: Process group for vocab parallelism
         context_parallel_group: Process group for context parallelism
         sampling_params: Sampling parameters for top-k/top-p filtering
+        chunk_size: Sequence-dim chunk size for the vocab-parallel path; only
+            applied without top-k/top-p sampling.
 
     Returns:
         Token log-probabilities of shape [batch_size, seq_len - 1]
     """
-    next_token_logits = next_token_logits.to(torch.float32)
+    # ChunkedDistributedLogprob casts each chunk to float32 internally.
+    use_chunking = (
+        vocab_parallel_group is not None
+        and chunk_size is not None
+        and not need_top_k_or_top_p_filtering(sampling_params)
+    )
+    if not use_chunking:
+        next_token_logits = next_token_logits.to(torch.float32)
 
     if vocab_parallel_group is not None:
         assert vocab_parallel_rank is not None, (
@@ -1390,6 +1393,7 @@ def get_next_token_logprobs_from_logits(
             inference_only=False,
             cp_group=context_parallel_group,
             sampling_params=sampling_params,
+            chunk_size=chunk_size if use_chunking else None,
         )
         # slice off to the correct length to remove potential CP padding
         logprobs = logprobs[:, : input_ids.shape[1] - 1]
@@ -2044,6 +2048,8 @@ class ChunkedDistributedHiddenStatesToLogprobs(torch.autograd.Function):
 
 
 def patch_gpt_model_forward_for_linear_ce_fusion(*, chunk_size: int) -> None:
+    from megatron.core.models.gpt import GPTModel
+
     if getattr(GPTModel, "_linear_ce_fusion_forward_patched", False):
         GPTModel._linear_ce_fusion_chunk_size = chunk_size
         return
@@ -2054,7 +2060,7 @@ def patch_gpt_model_forward_for_linear_ce_fusion(*, chunk_size: int) -> None:
 
 
 def _gpt_forward_with_linear_ce_fusion(
-    self: GPTModel,
+    self: "GPTModel",
     input_ids: torch.Tensor,
     position_ids: torch.Tensor,
     attention_mask: torch.Tensor,
@@ -2070,6 +2076,12 @@ def _gpt_forward_with_linear_ce_fusion(
     padding_mask: Optional[torch.Tensor] = None,
     return_logprobs_for_linear_ce_fusion: bool = False,
 ) -> torch.Tensor:
+    from megatron.core.parallel_state import (
+        get_tensor_model_parallel_group,
+        get_tensor_model_parallel_rank,
+    )
+    from megatron.core.utils import deprecate_inference_params, get_pg_size
+
     if not return_logprobs_for_linear_ce_fusion:
         return self._original_forward_for_linear_ce_fusion(
             input_ids=input_ids,
