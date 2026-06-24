@@ -1,0 +1,34 @@
+# Qwen 3.5 SWE/OpenHands benchmark wrapper.
+#
+# This inherits the standard Qwen 3.5 config and changes only benchmark-shape
+# knobs. Keep runtime paths, node counts, and site-specific values in the
+# launcher environment or explicit Hydra overrides.
+
+defaults: grpo_qwen35_397b_swe_openhands_async.yaml
+
+grpo:
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 8
+  max_num_steps: 20
+  val_batch_size: 256
+  max_val_samples: 256
+  val_period: 2
+  val_at_start: true
+  val_at_end: true
+
+policy:
+  train_global_batch_size: 128
+  megatron_cfg:
+    expert_model_parallel_size: 16
+    optimizer:
+      lr: 2.0e-6
+      min_lr: 2.0e-6
+    scheduler:
+      lr_warmup_iters: 2
+
+env:
+  nemo_gym:
+    swe_agents_val:
+      responses_api_agents:
+        swe_agents:
+          swebench_agent_timeout: 360

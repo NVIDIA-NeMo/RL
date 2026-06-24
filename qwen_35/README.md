@@ -64,6 +64,13 @@ export RECIPE=qwen_35/configs/grpo_qwen35_397b_swe_openhands_async.yaml
 examples/nemo_gym/launch_nemo_gym_multinode_training.sh <optional Hydra overrides>
 ```
 
+For the benchmark-shaped variant, use:
+
+```bash
+export RECIPE=qwen_35/configs/grpo_qwen35_397b_swe_openhands_async_benchmark.yaml
+examples/nemo_gym/launch_nemo_gym_multinode_training.sh <optional Hydra overrides>
+```
+
 When `RECIPE` points under `qwen_35/`,
 `examples/nemo_gym/launch_nemo_gym_multinode_training.sh` automatically stages
 Qwen-specific files under `${OUT_DIR}/qwen_35_mounts/` and mounts the staged
@@ -95,7 +102,7 @@ Before submitting a training job, set these environment variables:
 | --- | --- |
 | `EXP_NAME` | Result directory name under `${REPO_LOCATION}/results`. |
 | `REPO_LOCATION` | Host path to this RL checkout. Usually `"$PWD"`. |
-| `RECIPE` | Must be `qwen_35/configs/grpo_qwen35_397b_swe_openhands_async.yaml`. |
+| `RECIPE` | Qwen 3.5 recipe under `qwen_35/configs/`, usually the standard or benchmark config. |
 | `CONTAINER_IMAGE_PATH` | Gym-capable container image built above or provided by the site. |
 | `SLURM_ACCOUNT`, `SLURM_PARTITION` | Slurm allocation. |
 | `GPUS_PER_NODE` | GPUs per node requested by the job. |
@@ -148,6 +155,13 @@ It does **not** bake in cluster size, data paths, checkpoint paths, experiment
 names, walltime, or node allocation. Those remain normal launcher environment
 variables and minimal Hydra overrides. Deliberate shmoo/smoke changes, such as
 PP=1 or smaller GBS, should be explicit overrides.
+
+`qwen_35/configs/grpo_qwen35_397b_swe_openhands_async_benchmark.yaml` inherits
+the standard config and overrides only benchmark-shape knobs: 16 prompts x 8
+generations, 20 steps, validation every 2 steps with 256 validation samples,
+GBS 128, LR/min-LR 2e-6, warmup 2, training EP 16, and validation agent timeout
+360 seconds. The vLLM parallelism and other Qwen 3.5 defaults remain inherited
+from the standard config.
 
 ## What the overlay changes
 
