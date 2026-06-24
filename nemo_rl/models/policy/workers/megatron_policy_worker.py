@@ -93,6 +93,7 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 from nemo_rl.utils.r3_trace import maybe_r3_trace_stage
+from nemo_rl.utils.timer import Timer
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
@@ -273,6 +274,7 @@ class MegatronPolicyWorkerImpl(
 
         # Set rank for non-collocated to check which ranks to broadcast from
         self.rank = get_rank_safe()
+        self.timer = Timer(context={"worker": "megatron_policy", "rank": self.rank})
 
         # Step 1: Setup distributed
         setup_distributed()
@@ -535,6 +537,7 @@ class MegatronPolicyWorkerImpl(
             "check_dim_skip_keys is only supported by the v2 DTensor worker; "
             "Megatron does not run cross-tokenizer distillation."
         )
+        self.timer.start("train")
         # Note: zero_grad_buffer is called at the start of each global batch iteration
         # in the loop below, so we don't need to call it here.
         if hasattr(self.model, "inference_params"):
@@ -816,6 +819,7 @@ class MegatronPolicyWorkerImpl(
         # Collect MTP metrics (kept out of train()'s body so cloudpickle does not
         # pull an unpicklable torch ConfigModuleInstance into the worker actor).
         self._collect_mtp_metrics(metrics)
+        self.timer.stop("train")
         return metrics
 
     def _compute_moe_grad_scale(self, global_valid_toks):
@@ -874,6 +878,7 @@ class MegatronPolicyWorkerImpl(
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
+        self.timer.start("get_logprobs")
         no_grad = torch.no_grad()
         no_grad.__enter__()
         logprob_batch_size = (
@@ -948,6 +953,7 @@ class MegatronPolicyWorkerImpl(
         logprobs = broadcast_tensors_from_last_stage(tensors)["logprobs"]
 
         no_grad.__exit__(None, None, None)
+        self.timer.stop("get_logprobs")
         return BatchedDataDict[LogprobOutputSpec](logprobs=logprobs).to("cpu")
 
     def _apply_state_dict_to_model(
