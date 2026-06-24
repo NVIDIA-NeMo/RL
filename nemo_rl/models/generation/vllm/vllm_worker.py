@@ -309,10 +309,12 @@ class BaseVllmGenerationWorker:
         # those layers are loaded directly from the checkpoint after engine init
         # (see VllmInternalWorkerExtension.load_mtp_weights_from_disk).
         spec_cfg = self.cfg.get("vllm_kwargs", {}).get("speculative_config")
+        mtp_weights_from_refit = bool(self.cfg.get("_mtp_weights_from_refit"))
         self._mtp_load_from_disk: bool = (
             load_format == "dummy"
             and spec_cfg is not None
             and spec_cfg.get("method") in ("deepseek_mtp", "mtp")
+            and not mtp_weights_from_refit
         )
 
         if (
