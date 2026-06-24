@@ -115,16 +115,6 @@ from nemo_rl.utils.timer import Timer
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
-def _megatron_forward_backward_compat(**kwargs):
-    try:
-        return megatron_forward_backward(**kwargs)
-    except TypeError as exc:
-        if "unexpected keyword argument 'cfg'" not in str(exc):
-            raise
-        kwargs.pop("cfg", None)
-        return megatron_forward_backward(**kwargs)
-
-
 @ray.remote(
     runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker")
 )  # pragma: no cover
@@ -389,9 +379,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                     self._set_mtp_grad_scale_func(lambda: mtp_scale)
 
                     # Forward pass.
-                    losses_reduced = _megatron_forward_backward_compat(
+                    losses_reduced = megatron_forward_backward(
                         model=self.model,
-                        cfg=self.cfg,
                         data_iterator=data_iterator,
                         num_microbatches=num_microbatches,
                         seq_length=padded_seq_length,
@@ -567,9 +556,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             straggler_timer=self.mcore_state.straggler_timer,
         )
 
-        list_of_logprobs = _megatron_forward_backward_compat(
+        list_of_logprobs = megatron_forward_backward(
             model=self.model,
-            cfg=self.cfg,
             data_iterator=mb_iterator,
             seq_length=padded_seq_length,
             mbs=micro_batch_size,
@@ -698,9 +686,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             straggler_timer=self.mcore_state.straggler_timer,
         )
 
-        list_of_outputs = _megatron_forward_backward_compat(
+        list_of_outputs = megatron_forward_backward(
             model=self.model,
-            cfg=self.cfg,
             data_iterator=mb_iterator,
             seq_length=padded_seq_length,
             mbs=micro_batch_size,
