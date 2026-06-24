@@ -83,7 +83,10 @@ policy:
     expert_model_parallel_size: 16
     expert_tensor_parallel_size: 1
     sequence_parallel: true
-    moe_enable_deepep: true
+    # With the flex dispatcher, the backend must be selected only through
+    # moe_flex_dispatcher_backend. Leaving the legacy DeepEP boolean enabled
+    # makes Megatron validate two active backends and abort.
+    moe_enable_deepep: false
     moe_token_dispatcher_type: flex
     optimizer:
       lr: 5.0e-6
