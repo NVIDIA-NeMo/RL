@@ -75,6 +75,24 @@ def _first_token_mismatch(left: torch.Tensor, right: torch.Tensor) -> Optional[i
     return None
 
 
+def _timer_with_optional_context(context: dict[str, Any]) -> Timer:
+    try:
+        return Timer(context=context)
+    except TypeError as exc:
+        if "context" not in str(exc):
+            raise
+        return Timer()
+
+
+def _timer_time(timer: Timer, label: str, should_log: bool = False):
+    try:
+        return timer.time(label=label, should_log=should_log)
+    except TypeError as exc:
+        if "should_log" not in str(exc):
+            raise
+        return timer.time(label=label)
+
+
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
 class NemoGym(EnvironmentInterface):
     """This environment class isn't really used for training. It's really meant as an integration wrapper around NeMo-Gym that hooks into the existing NeMo RL resource management via ray. So there is still one source of truth for resource management in NeMo RL."""
@@ -194,7 +212,7 @@ Depending on your data shape, you may want to change these values."""
         if not hasattr(self, "rch"):
             self._spinup()
 
-        timer = Timer()
+        timer = _timer_with_optional_context({"worker": "nemo_gym"})
 
         timer.start("_run_rollouts_total")
         max_attempts, trial = self.rollout_max_attempts_to_avoid_lp_nan, 0
@@ -211,7 +229,9 @@ Depending on your data shape, you may want to change these values."""
             nemo_rl_results = []
             logprob_contains_nan = False
             for task in nemo_gym_result_iterator:
-                with timer.time(f"{timer_prefix}/await_results"):
+                with _timer_time(
+                    timer, label=f"{timer_prefix}/await_results", should_log=False
+                ):
                     try:
                         nemo_gym_row, nemo_gym_result = await task
                     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
@@ -227,7 +247,9 @@ Depending on your data shape, you may want to change these values."""
                             print("EXCEPTION RESULT", e.response_content, file=sys.stderr)
                         raise e
 
-                with timer.time(f"{timer_prefix}/postprocess_results"):
+                with _timer_time(
+                    timer, label=f"{timer_prefix}/postprocess_results", should_log=False
+                ):
                     nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
                         nemo_gym_result, tokenizer
                     )
