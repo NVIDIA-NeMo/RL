@@ -474,15 +474,16 @@ class RayWorkerGroup:
         placement_groups = self.cluster.get_placement_groups()
 
         # Get available address and port for each worker
-        available_addresses = []
-        available_ports = []
-        for group_idx, (pg_idx, local_bundle_indices) in enumerate(bundle_indices_list):
-            for local_rank, bundle_idx in enumerate(local_bundle_indices):
-                addr, port = self.cluster.get_available_address_and_port(
-                    pg_idx, bundle_idx
-                )
-                available_addresses.append(addr)
-                available_ports.append(port)
+        pg_bundle_pairs = [
+            (pg_idx, bundle_idx)
+            for pg_idx, local_bundle_indices in bundle_indices_list
+            for bundle_idx in local_bundle_indices
+        ]
+        addr_port_results = self.cluster.get_available_addresses_and_ports_batch(
+            pg_bundle_pairs
+        )
+        available_addresses = [addr for addr, _ in addr_port_results]
+        available_ports = [port for _, port in addr_port_results]
 
         # Pool one IsolatedWorkerInitializer per unique pg_idx instead of one
         # per worker. All workers on a node share the same py_executable, so
