@@ -232,7 +232,7 @@ def setup(
     # Context parallelism for the Megatron value model requires sequence packing,
     # matching Megatron-Core (CP shards are produced/reassembled per packed sequence).
     if (
-        value_config.get("megatron_cfg", {}).get("enabled", False)
+        value_config["megatron_cfg"]["enabled"]
         and value_config["megatron_cfg"]["context_parallel_size"] > 1
     ):
         assert value_config["sequence_packing"]["enabled"], (

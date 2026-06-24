@@ -156,7 +156,7 @@ def forward_step_value(
 
     loss_data = data_dict
 
-    # MseValueLossFn only accepts (values, data, global_valid_seqs, global_valid_toks).
+    # MseValueLossFn only accepts (logits, data, global_valid_seqs, global_valid_toks).
     # Unlike ClippedPGLossFn, it does not need vocab_parallel or context_parallel args.
     loss_fn_wrapped = partial(
         loss_fn,
@@ -312,7 +312,7 @@ def _value_packed_loss_prepare_fn(
         values = allgather_cp_sharded_tensor(values, context_parallel_group, seq_dim=1)
     values = torch.cat([torch.zeros_like(values[:, :1]), values[:, :-1]], dim=1)
     values = values[:, : data["returns"].shape[1]]
-    return {"values": values}, data
+    return {"logits": values}, data
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
