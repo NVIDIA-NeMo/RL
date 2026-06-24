@@ -4113,4 +4113,33 @@ def async_grpo_train(
         except Exception as e:
             print(f"Error stopping replay buffer: {e}")
 
+        # Environments must be shut down before generation workers because
+        # they may have in-flight HTTP requests to vLLM HTTP endpoints.
+        # Killing generation first leaves environments retrying dead connections.
+        for env_dict in (task_to_env, val_task_to_env):
+            if env_dict is None:
+                continue
+            for task_name, env in env_dict.items():
+                print(f"🛑 Shutting down environment {task_name}...")
+                try:
+                    ray.get(env.shutdown.remote(), timeout=10)
+                except Exception:
+                    try:
+                        ray.kill(env)
+                    except Exception as e:
+                        print(f"Error shutting down environment {task_name}: {e}")
+
+        print("🛑 Shutting down generation workers...")
+        try:
+            policy_generation.shutdown()
+        except Exception as e:
+            print(f"Error shutting down generation workers: {e}")
+
+        if policy is not policy_generation:
+            print("🛑 Shutting down policy workers...")
+            try:
+                policy.shutdown()
+            except Exception as e:
+                print(f"Error shutting down policy workers: {e}")
+
         print("Async GRPO training complete!")
