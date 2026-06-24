@@ -114,6 +114,17 @@ uv sync --link-mode symlink --locked --inexact --extra mcore --no-install-projec
 uv sync --link-mode symlink --locked --inexact --extra automodel --no-install-project $UV_NO_INSTALL_PACKAGES
 uv sync --link-mode symlink --locked --inexact --extra modelopt --no-install-project $UV_NO_INSTALL_PACKAGES
 uv sync --link-mode symlink --locked --inexact --all-groups --no-install-project $UV_NO_INSTALL_PACKAGES
+
+# Workaround for https://github.com/NVIDIA/cutlass/issues/3259: the
+# cutlass-dsl libs-base and libs-cu13 wheels overlap. Force a reinstall so
+# libs-cu13 is the last writer. copy link-mode materializes the file
+# in-place instead of re-pointing the symlink at the libs-base cache entry.
+if uv pip show nvidia-cutlass-dsl-libs-cu13 >/dev/null 2>&1; then
+    cutlass_version=$(uv pip show nvidia-cutlass-dsl-libs-cu13 | awk '/^Version: /{print $2}')
+    UV_LINK_MODE=copy uv pip install \
+        --reinstall-package nvidia-cutlass-dsl-libs-cu13 \
+        --no-deps "nvidia-cutlass-dsl-libs-cu13==${cutlass_version}"
+fi
 EOF
 
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
@@ -157,6 +168,15 @@ COPY --from=nemo-rl . /opt/nemo-rl
 # so do a quick check before trying to unshallow.
 RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
 RUN UV_LINK_MODE=symlink uv sync --locked --inexact $UV_NO_INSTALL_PACKAGES
+# Re-apply the cutlass-dsl libs-cu13 workaround after the release-stage
+# uv sync (which re-links wheels and can undo the hermetic-stage fix).
+# See https://github.com/NVIDIA/cutlass/issues/3259.
+RUN if uv pip show nvidia-cutlass-dsl-libs-cu13 >/dev/null 2>&1; then \
+        cutlass_version=$(uv pip show nvidia-cutlass-dsl-libs-cu13 | awk '/^Version: /{print $2}') && \
+        UV_LINK_MODE=copy uv pip install \
+            --reinstall-package nvidia-cutlass-dsl-libs-cu13 \
+            --no-deps "nvidia-cutlass-dsl-libs-cu13==${cutlass_version}" ; \
+    fi
 # NOTICES.txt file points to where the OSS source code is archived
 RUN echo "This distribution includes open source which is archived at the following URL: https://opensource.nvidia.com/oss/teams/nvidia/nemo-rl/${RC_DATE}:linux-${TARGETARCH}/index.html" > NOTICES.txt && \
     echo "For further inquiries or assistance, contact us at oss-requests@nvidia.com" >> NOTICES.txt
