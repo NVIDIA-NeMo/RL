@@ -258,7 +258,6 @@ export CONTAINER_NEMO_GYM_SWE_SIF_DIR="${CONTAINER_NEMO_GYM_SWE_SIF_DIR:-/inputs
 
 # Default is 65535 for a 64k context run, leaving one token of headroom so
 # vLLM does not reject prompts at exactly/just above max_model_len.
-export QWEN35_TRUNCATE_PROMPT_TOKENS=65535
 export NEMO_RL_QWEN35_TRUNCATE_PROMPT_TOKENS=65535
 ```
 
