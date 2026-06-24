@@ -223,6 +223,69 @@ def test_nemo_gym_postprocess_uses_batch_decode():
     assert nemo_gym_result["response"]["output"][1]["generation_str"] == "6 7"
 
 
+def test_nemo_gym_postprocess_no_generation_data_raises():
+    """When no output item carries generation data, the postprocess should raise a
+    ValueError that reports the prompt length and the response.output item types."""
+
+    class _Tokenizer:
+        def apply_chat_template(self, input_messages, tokenize=True):
+            # Pretend the prompt is 1234 tokens long.
+            return list(range(1234))
+
+    nemo_gym_result = {
+        "response": {
+            "output": [
+                {"type": "reasoning"},
+                {"type": "function_call"},
+            ]
+        },
+        "responses_create_params": {"input": [{"role": "user", "content": "hi"}]},
+    }
+
+    class _MockSelf:
+        cfg = {}
+
+    with pytest.raises(ValueError) as excinfo:
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), nemo_gym_result, _Tokenizer()
+        )
+
+    msg = str(excinfo.value)
+    assert "no generation data" in msg
+    assert "1234 tokens" in msg
+    # The error surfaces the response.output item types to help diagnose case (2).
+    assert "['reasoning', 'function_call']" in msg
+
+
+def test_nemo_gym_postprocess_no_generation_data_chat_template_failure():
+    """If apply_chat_template itself fails while building the error message, the
+    postprocess should still raise the original 'no generation data' ValueError with
+    the prompt length reported as unknown rather than masking it with a new error."""
+
+    class _Tokenizer:
+        def apply_chat_template(self, input_messages, tokenize=True):
+            raise RuntimeError("boom")
+
+    nemo_gym_result = {
+        "response": {"output": [{"type": "reasoning"}]},
+        "responses_create_params": {"input": [{"role": "user", "content": "hi"}]},
+    }
+
+    class _MockSelf:
+        cfg = {}
+
+    with pytest.raises(ValueError) as excinfo:
+        NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result(
+            _MockSelf(), nemo_gym_result, _Tokenizer()
+        )
+
+    msg = str(excinfo.value)
+    assert "no generation data" in msg
+    assert "apply_chat_template failed" in msg
+    assert "RuntimeError" in msg
+    assert "['reasoning']" in msg
+
+
 @pytest.mark.nemo_gym
 def test_nemo_gym_sanity(
     nemo_gym,
