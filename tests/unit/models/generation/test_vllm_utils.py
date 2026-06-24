@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -21,6 +22,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.vllm.utils import (
     R3_MISSING_ROUTE_SENTINEL,
     aggregate_spec_decode_counters,
+    attach_routed_experts_to_chat_response_choices,
     compute_spec_decode_metrics,
     format_prompt_for_vllm_generation,
     pad_and_align_routed_expert_indices,
@@ -295,6 +297,68 @@ def test_normalize_routed_experts_strict_mode_rejects_surplus_routes():
             padded_length=3,
             device=torch.device("cpu"),
             require_complete_routed_experts=True,
+        )
+
+
+def test_attach_routed_experts_to_chat_response_choices_reassociates_by_choice_index():
+    final_res = SimpleNamespace(
+        prompt_token_ids=[101, 102, 103],
+        prompt_routed_experts=torch.tensor([[[10]], [[11]]], dtype=torch.int32),
+        outputs=[
+            SimpleNamespace(
+                index=1,
+                token_ids=[201, 202],
+                routed_experts=torch.tensor([[[31]], [[32]]], dtype=torch.int32),
+            ),
+            SimpleNamespace(
+                index=0,
+                token_ids=[200],
+                routed_experts=torch.tensor([[[30]]], dtype=torch.int32),
+            ),
+        ],
+    )
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(index=0, message=SimpleNamespace()),
+            SimpleNamespace(index=1, message=SimpleNamespace()),
+        ]
+    )
+
+    attach_routed_experts_to_chat_response_choices(
+        response,
+        final_res,
+        device=torch.device("cpu"),
+    )
+
+    assert response.choices[0].message.routed_experts == [
+        [[10]],
+        [[11]],
+        [[30]],
+        [[0]],
+    ]
+    assert response.choices[1].message.routed_experts == [
+        [[10]],
+        [[11]],
+        [[31]],
+        [[32]],
+        [[0]],
+    ]
+
+
+def test_attach_routed_experts_to_chat_response_choices_requires_routed_experts():
+    final_res = SimpleNamespace(
+        prompt_token_ids=[101, 102],
+        outputs=[SimpleNamespace(index=0, token_ids=[200])],
+    )
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(index=0, message=SimpleNamespace())]
+    )
+
+    with pytest.raises(RuntimeError, match="did not include routed_experts"):
+        attach_routed_experts_to_chat_response_choices(
+            response,
+            final_res,
+            device=torch.device("cpu"),
         )
 
 

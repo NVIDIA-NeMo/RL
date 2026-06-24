@@ -192,6 +192,65 @@ def pad_and_align_routed_expert_indices(
     return (full, stats) if return_stats else full
 
 
+def attach_routed_experts_to_chat_response_choices(
+    response: Any,
+    final_request_output: Any,
+    *,
+    device: torch.device,
+    logger: Any = None,
+) -> Any:
+    """Attach aligned routed experts to OpenAI chat response choices."""
+    outputs_by_index = {
+        output.index: output for output in getattr(final_request_output, "outputs", [])
+    }
+    prompt_token_count = len(
+        getattr(final_request_output, "prompt_token_ids", []) or []
+    )
+
+    for choice in getattr(response, "choices", []):
+        generation_details = outputs_by_index.get(choice.index)
+        if generation_details is None:
+            continue
+
+        generation_token_count = len(getattr(generation_details, "token_ids", []) or [])
+        routed_result = pad_and_align_routed_expert_indices(
+            final_request_output,
+            generation_details,
+            valid_length=prompt_token_count + generation_token_count,
+            padded_length=prompt_token_count + generation_token_count,
+            device=device,
+            require_complete_routed_experts=True,
+            return_stats=True,
+        )
+        if not isinstance(routed_result, tuple):
+            raise RuntimeError(
+                "Expected routed_experts alignment to return stats for the "
+                "OpenAI-compatible chat endpoint."
+            )
+        routed_experts, r3_stats = routed_result
+        if routed_experts is None:
+            raise RuntimeError(
+                "vLLM was asked to return routed experts for the "
+                "OpenAI-compatible chat endpoint but the generation "
+                "output did not include routed_experts."
+            )
+        if r3_stats["missing_routes"] > 0 and logger is not None:
+            logger.warning(
+                "R3 router replay fallback: vLLM returned incomplete "
+                "routed_experts for chat choice_idx=%d, "
+                "missing_token_routes=%d, actual_routes=%d, "
+                "expected_routes=%d. Megatron will use its own router "
+                "for those missing token routes.",
+                choice.index,
+                r3_stats["missing_routes"],
+                r3_stats["actual_routes"],
+                r3_stats["expected_routes"],
+            )
+        choice.message.routed_experts = routed_experts.to(dtype=torch.int32).tolist()
+
+    return response
+
+
 def aggregate_spec_decode_counters(
     worker_metrics: list[dict[str, float | list[float]]],
 ) -> dict[str | tuple[str, int], float]:
