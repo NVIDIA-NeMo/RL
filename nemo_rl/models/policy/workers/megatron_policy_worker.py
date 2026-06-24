@@ -686,8 +686,8 @@ class MegatronPolicyWorkerImpl(
                 # it doesn't get serialized in the run_config.yaml when saving
                 self._set_mtp_grad_scale_func(None)
 
-                    # Clear moe_grad_scale_func after the forward-backward pass
-                    self._set_moe_grad_scale_func(None)
+                # Clear moe_grad_scale_func after the forward-backward pass
+                self._set_moe_grad_scale_func(None)
 
                 # Empty unused memory.
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
@@ -828,6 +828,7 @@ class MegatronPolicyWorkerImpl(
         config = self._get_model_config()
         if config is not None:
             config.moe_grad_scale_func = func
+
     @wrap_with_nvtx_name("megatron_policy_worker/get_reference_policy_logprobs")
     def get_reference_policy_logprobs(
         self,
