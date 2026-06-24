@@ -850,12 +850,12 @@ class PreferenceLossFn(LossFunction):
         }
 
 
-class DPOLossConfig(TypedDict):
-    reference_policy_kl_penalty: float
-    preference_loss_weight: float
-    sft_loss_weight: float
-    preference_average_log_probs: bool
-    sft_average_log_probs: bool
+class DPOLossConfig(BaseModel, extra="allow"):
+    reference_policy_kl_penalty: float = 0.05
+    preference_loss_weight: float = 1.0
+    sft_loss_weight: float = 0.0
+    preference_average_log_probs: bool = False
+    sft_average_log_probs: bool = False
 
 
 class DPOLossDataDict(TypedDict):
@@ -927,11 +927,11 @@ class DPOLossFn(PreferenceLossFn):
     input_type = LossInputType.LOGPROB
 
     def __init__(self, cfg: DPOLossConfig, use_linear_ce_fusion: bool = False):
-        self.reference_policy_kl_penalty = cfg["reference_policy_kl_penalty"]
-        self.preference_loss_weight = cfg["preference_loss_weight"]
-        self.sft_loss_weight = cfg["sft_loss_weight"]
-        self.preference_average_log_probs = cfg["preference_average_log_probs"]
-        self.sft_average_log_probs = cfg["sft_average_log_probs"]
+        self.reference_policy_kl_penalty = cfg.reference_policy_kl_penalty
+        self.preference_loss_weight = cfg.preference_loss_weight
+        self.sft_loss_weight = cfg.sft_loss_weight
+        self.preference_average_log_probs = cfg.preference_average_log_probs
+        self.sft_average_log_probs = cfg.sft_average_log_probs
         self.use_linear_ce_fusion = use_linear_ce_fusion
         self.sft_loss = NLLLossFn(use_linear_ce_fusion=use_linear_ce_fusion)
 

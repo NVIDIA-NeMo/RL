@@ -35,6 +35,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
     ClusterConfig,
     RayVirtualCluster,
+    prepare_segment_topology,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import PolicyInterface
@@ -172,17 +173,21 @@ def setup(
     #          Cluster
     # ==========================
     print("\n▶ Setting up compute cluster...")
+    num_nodes = cluster_config["num_nodes"]
+    segment_size = cluster_config.get("segment_size")
+    node_resource_constraints, _, _ = prepare_segment_topology(segment_size, num_nodes)
     cluster = RayVirtualCluster(
         name="sft_cluster",
-        bundle_ct_per_node_list=[cluster_config["gpus_per_node"]]
-        * cluster_config["num_nodes"],
+        bundle_ct_per_node_list=[cluster_config["gpus_per_node"]] * num_nodes,
         use_gpus=True,
         num_gpus_per_node=cluster_config["gpus_per_node"],
         max_colocated_worker_groups=1,
         port_range_low=cluster_config.get("master_port_range_low"),
         port_range_high=cluster_config.get("master_port_range_high"),
+        segment_size=segment_size,
+        node_resource_constraints=node_resource_constraints,
     )
-    print(f"  ✓ Ray cluster initialized with {cluster_config['num_nodes']} nodes")
+    print(f"  ✓ Ray cluster initialized with {num_nodes} nodes")
 
     # ==========================
     #   Training

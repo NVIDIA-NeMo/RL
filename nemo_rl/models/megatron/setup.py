@@ -15,6 +15,7 @@
 import hashlib
 import json
 import os
+import threading
 import time
 import warnings
 from typing import Any, Callable, Optional, TypeVar
@@ -57,7 +58,7 @@ from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
-from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from transformers import PreTrainedTokenizerBase
@@ -81,6 +82,11 @@ from nemo_rl.models.megatron.draft.utils import (
     build_draft_model,
     find_draft_owner_chunk,
     get_attached_draft_model,
+)
+from nemo_rl.models.megatron.router_replay import (
+    clear_global_router_replay_instances,
+    router_replay_enabled,
+    validate_router_replay_config,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.utils import (
@@ -151,8 +157,11 @@ def setup_distributed() -> None:
     configure_dynamo_cache()
     # Ensure clean slate before import
     destroy_parallel_state()
-    # Need to initialize the process group before calling into Megatron-Bridge, otherwise Megatron-Bridge will try to set an incorrect device
-    torch.distributed.init_process_group("nccl")
+    # Pin the communicator to the correct GPU explicitly.
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.distributed.init_process_group(
+        "nccl", device_id=torch.device(f"cuda:{local_rank}")
+    )
 
 
 def validate_and_set_config(
@@ -412,6 +421,7 @@ def setup_model_config(
     """Handle all the model configuration logic."""
     pretrained_ckpt = config.get("pretrained_checkpoint")
     fmt = pretrained_ckpt["format"] if pretrained_ckpt is not None else None
+    validate_router_replay_config(config)
 
     if fmt == "megatron_lm":
         # For megatron_lm format: build the model config from the HF architecture.
@@ -505,6 +515,8 @@ def setup_model_config(
     # was saved to run_config.yaml, so finalize() is not called here for those paths.)
     if fmt == "megatron_lm":
         model_cfg.finalize()
+
+    model_cfg.__post_init__()
 
     # Derive fp8_param_enabled once from the config dict so that load_main_params_from_ckpt
     # and _create_megatron_config both use the same canonical check (fp8 enabled AND fp8_param).
@@ -606,6 +618,26 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.moe_token_dispatcher_type = config["megatron_cfg"][
         "moe_token_dispatcher_type"
     ]
+    if "inference_moe_token_dispatcher_type" in config["megatron_cfg"]:
+        model_cfg.inference_moe_token_dispatcher_type = config["megatron_cfg"][
+            "inference_moe_token_dispatcher_type"
+        ]
+    if "inference_grouped_gemm_backend" in config["megatron_cfg"]:
+        model_cfg.inference_grouped_gemm_backend = config["megatron_cfg"][
+            "inference_grouped_gemm_backend"
+        ]
+    if "moe_router_num_groups" in config["megatron_cfg"]:
+        model_cfg.moe_router_num_groups = config["megatron_cfg"][
+            "moe_router_num_groups"
+        ]
+    if "moe_router_group_topk" in config["megatron_cfg"]:
+        model_cfg.moe_router_group_topk = config["megatron_cfg"][
+            "moe_router_group_topk"
+        ]
+    if "moe_pad_experts_for_cuda_graph_inference" in config["megatron_cfg"]:
+        model_cfg.moe_pad_experts_for_cuda_graph_inference = config["megatron_cfg"][
+            "moe_pad_experts_for_cuda_graph_inference"
+        ]
     model_cfg.moe_shared_expert_overlap = config["megatron_cfg"][
         "moe_shared_expert_overlap"
     ]
@@ -657,11 +689,23 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
 
     if "moe_grouped_gemm" in config["megatron_cfg"]:
         model_cfg.moe_grouped_gemm = config["megatron_cfg"]["moe_grouped_gemm"]
+    model_cfg.moe_enable_routing_replay = router_replay_enabled(config)
 
 
 def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
-    if "mtp_num_layers" in config["megatron_cfg"]:
-        model_cfg.mtp_num_layers = config["megatron_cfg"]["mtp_num_layers"]
+    """Apply Multi-Token Prediction settings onto the mcore model config."""
+    megatron_cfg = config["megatron_cfg"]
+    if "mtp_num_layers" in megatron_cfg:
+        # In mcore, mtp_num_layers is both the number of MTP layers (when
+        # mtp_use_repeated_layer is False) and the number of times the MTP layer
+        # is repeated (when mtp_use_repeated_layer is True).
+        model_cfg.mtp_num_layers = megatron_cfg["mtp_num_layers"]
+    if "mtp_loss_scaling_factor" in megatron_cfg:
+        model_cfg.mtp_loss_scaling_factor = megatron_cfg["mtp_loss_scaling_factor"]
+    if "mtp_use_repeated_layer" in megatron_cfg:
+        model_cfg.mtp_use_repeated_layer = megatron_cfg["mtp_use_repeated_layer"]
+    if "mtp_detach_heads" in megatron_cfg:
+        model_cfg.mtp_detach_heads = megatron_cfg["mtp_detach_heads"]
 
 
 def _apply_precision_config(
@@ -743,6 +787,28 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
                 f"Invalid attention backend: {attention_backend}. "
                 f"Available backends are: {list(AttnBackend.__members__.keys())}"
             )
+
+    # These overrides need to be applied before the workers spawn.
+    if "transformer_impl" in config["megatron_cfg"]:
+        model_cfg.transformer_impl = config["megatron_cfg"]["transformer_impl"]
+    if "cuda_graph_impl" in config["megatron_cfg"]:
+        model_cfg.cuda_graph_impl = config["megatron_cfg"]["cuda_graph_impl"]
+        if model_cfg.cuda_graph_impl != "none":
+            model_cfg.use_te_rng_tracker = True
+        if "inference_cuda_graph_scope" in config["megatron_cfg"]:
+            model_cfg.inference_cuda_graph_scope = InferenceCudaGraphScope[
+                config["megatron_cfg"]["inference_cuda_graph_scope"]
+            ]
+
+    # Use the graph-safe TE RNG tracker for either training graphs or inference graphs.
+    if "generation" in config and config["generation"] is not None:
+        generation_cfg = config["generation"]
+        if (
+            generation_cfg["backend"] == "megatron"
+            and generation_cfg["colocated"]["enabled"]
+            and generation_cfg["mcore_generation_config"]["cuda_graph_impl"] != "none"
+        ):
+            model_cfg.use_te_rng_tracker = True
 
     # FP8 configuration
     fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
@@ -983,6 +1049,36 @@ def _create_draft_pre_wrap_hook(
     return draft_pre_wrap_hook
 
 
+_BRIDGE_SIGNAL_HANDLER_PATCHED = False
+
+
+def _patch_bridge_signal_handler_for_worker_threads() -> None:
+    """Make Megatron-Bridge's signal-handler install safe off the main thread.
+
+    See https://github.com/NVIDIA-NeMo/Megatron-Bridge/pull/4375
+
+    TODO: Remove this hotfix once Megatron-Bridge is bumped.
+    """
+    global _BRIDGE_SIGNAL_HANDLER_PATCHED
+    if _BRIDGE_SIGNAL_HANDLER_PATCHED:
+        return
+
+    from megatron.bridge.training.utils import sig_utils
+
+    original_enter = sig_utils.DistributedSignalHandler.__enter__
+
+    def main_thread_only_enter(self):
+        if threading.current_thread() is not threading.main_thread():
+            self._signal_received = False
+            # Nothing was installed, so release()/__exit__ become no-ops.
+            self.released = True
+            return self
+        return original_enter(self)
+
+    sig_utils.DistributedSignalHandler.__enter__ = main_thread_only_enter
+    _BRIDGE_SIGNAL_HANDLER_PATCHED = True
+
+
 def setup_model_and_optimizer(
     policy_cfg: PolicyConfig,
     megatron_cfg: ConfigContainer,
@@ -993,6 +1089,7 @@ def setup_model_and_optimizer(
     additional_pre_wrap_hooks: Optional[list[Callable]] = None,
 ):
     state = GlobalState()
+    _patch_bridge_signal_handler_for_worker_threads()
     state.cfg = megatron_cfg
     # TODO: Freeze state.cfg
 
@@ -1150,6 +1247,7 @@ def setup_model_and_optimizer(
         pre_wrap_hook=pre_wrap_hook,
         mixed_precision_wrapper=mixed_precision_wrapper,
         pg_collection=pg_collection,
+        wrap_with_ddp=load_optimizer,
     )
 
     if load_optimizer:
@@ -1223,6 +1321,7 @@ def handle_model_import(
     pt_checkpoint_exists: bool,
     model_post_wrap_hook: Optional[Callable] = None,
     transformer_layer_spec: Optional[Any] = None,
+    mamba_stack_spec: Optional[Any] = None,
 ) -> None:
     """Convert and cache the initial model checkpoint if it does not yet exist.
 
@@ -1255,6 +1354,9 @@ def handle_model_import(
         transformer_layer_spec: Optional Megatron ``ModuleSpec`` (or callable
             returning one) overriding the default layer spec from the model
             provider.
+        mamba_stack_spec: Optional Megatron ``ModuleSpec`` (or callable
+            returning one) overriding the default stack spec from Mamba model
+            providers.
     """
     pretrained_ckpt = config.get("pretrained_checkpoint")
     fmt = pretrained_ckpt["format"] if pretrained_ckpt is not None else "hf"
@@ -1279,6 +1381,7 @@ def handle_model_import(
         config["megatron_cfg"],
         model_post_wrap_hook=model_post_wrap_hook,
         transformer_layer_spec=transformer_layer_spec,
+        mamba_stack_spec=mamba_stack_spec,
         **hf_config_overrides,
     )
 
@@ -1367,55 +1470,61 @@ def setup_reference_model_state(
 
         ref_pre_wrap_hooks.extend([composed_peft_hook])
 
-    reference_model = get_model(
-        megatron_cfg.model,
-        megatron_cfg.ddp,
-        use_torch_fsdp2=megatron_cfg.dist.use_torch_fsdp2,
-        overlap_param_gather_with_optimizer_step=megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
-        data_parallel_random_init=megatron_cfg.rng.data_parallel_random_init,
-        pre_wrap_hook=ref_pre_wrap_hooks,
-        mixed_precision_wrapper=ref_mixed_precision_wrapper,
-        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
-    )
-
-    # If use_peft, the pretrained checkpoint weights are already loaded inside of the pre_wrap_hook
-    # so they only need to be loaded here if use_peft is False
-    should_load_checkpoint = (
-        not use_peft
-        and ref_checkpoint_config.pretrained_checkpoint is not None
-        and checkpoint_exists(ref_checkpoint_config.pretrained_checkpoint)
-    )
-
-    print("Loading the Reference Model")
-
-    if should_load_checkpoint:
-        if pre_load_checkpoint_hook is not None:
-            pre_load_checkpoint_hook(ref_state, reference_model)
-        load_checkpoint(
-            ref_state,
-            reference_model,
-            None,  # no optimizer
-            None,  # no scheduler
-            checkpointing_context=ref_ckpt_context,
-            skip_load_to_model_and_opt=HAVE_FSDP2 and megatron_cfg.dist.use_torch_fsdp2,
+    try:
+        reference_model = get_model(
+            megatron_cfg.model,
+            megatron_cfg.ddp,
+            use_torch_fsdp2=megatron_cfg.dist.use_torch_fsdp2,
+            overlap_param_gather_with_optimizer_step=megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
+            data_parallel_random_init=megatron_cfg.rng.data_parallel_random_init,
+            pre_wrap_hook=ref_pre_wrap_hooks,
+            mixed_precision_wrapper=ref_mixed_precision_wrapper,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
-    reference_state_dict = {}
+        # If use_peft, the pretrained checkpoint weights are already loaded inside of the pre_wrap_hook
+        # so they only need to be loaded here if use_peft is False
+        should_load_checkpoint = (
+            not use_peft
+            and ref_checkpoint_config.pretrained_checkpoint is not None
+            and checkpoint_exists(ref_checkpoint_config.pretrained_checkpoint)
+        )
 
-    if should_load_checkpoint or use_peft:
-        reference_model = reference_model[0]
-        reference_model.eval()
-        # Store reference state dict on CPU
-        for name, item in reference_model.state_dict().items():
-            if isinstance(item, torch.Tensor):
-                cpu_item = item.detach().to(device="cpu", non_blocking=True, copy=True)
-                del item
-            else:
-                cpu_item = item
-            reference_state_dict[name] = cpu_item
-        print("Reference model loaded")
-    else:
-        print("Reference model not loaded")
+        print("Loading the Reference Model")
+
+        if should_load_checkpoint:
+            if pre_load_checkpoint_hook is not None:
+                pre_load_checkpoint_hook(ref_state, reference_model)
+            load_checkpoint(
+                ref_state,
+                reference_model,
+                None,  # no optimizer
+                None,  # no scheduler
+                checkpointing_context=ref_ckpt_context,
+                skip_load_to_model_and_opt=HAVE_FSDP2
+                and megatron_cfg.dist.use_torch_fsdp2,
+            )
+
+        reference_state_dict = {}
+
+        if should_load_checkpoint or use_peft:
+            reference_model = reference_model[0]
+            reference_model.eval()
+            # Store reference state dict on CPU
+            for name, item in reference_model.state_dict().items():
+                if isinstance(item, torch.Tensor):
+                    cpu_item = item.detach().to(
+                        device="cpu", non_blocking=True, copy=True
+                    )
+                    del item
+                else:
+                    cpu_item = item
+                reference_state_dict[name] = cpu_item
+            print("Reference model loaded")
+        else:
+            print("Reference model not loaded")
+    finally:
+        clear_global_router_replay_instances()
 
     return reference_state_dict
 
@@ -1562,57 +1671,3 @@ def make_policy_like_config(config: ValueConfig) -> dict:
         # Value models don't use generation or reference models
         "generation": None,
     }
-
-
-def setup_value_head(
-    hidden_size: int,
-    dtype: torch.dtype,
-    config: ValueConfig,
-    weights_path: Optional[str],
-) -> torch.nn.Module:
-    """Create the value head module and load its weights.
-
-    Prefers a training checkpoint at ``<weights_path>/value_head.pt``; falls
-    back to the HF model's ``score`` weights when ``config.load_value_head_from_model``
-    is true. Returns the constructed ``ValueHead`` on CUDA.
-    """
-    # Lazy import to avoid a circular dependency between this module and the
-    # value worker that defines ValueHead.
-    from nemo_rl.models.value.workers.megatron_value_worker import ValueHead
-
-    value_head = ValueHead(hidden_size, dtype).cuda()
-
-    # 1) Try a training checkpoint first.
-    value_head_loaded = False
-    if weights_path is not None:
-        ckpt_path = os.path.join(weights_path, "value_head.pt")
-        if os.path.exists(ckpt_path):
-            value_head.load_state_dict(
-                torch.load(ckpt_path, map_location="cuda", weights_only=True)
-            )
-            print(f"Loaded value head weights from {ckpt_path}")
-            value_head_loaded = True
-
-    # 2) Fall back to HF model's score weights when requested.
-    if not value_head_loaded and config.get("load_value_head_from_model", False):
-        from nemo_rl.models.megatron.community_import import (
-            extract_value_head_from_hf_checkpoint,
-        )
-
-        score_weights = extract_value_head_from_hf_checkpoint(config["model_name"])
-        if "score.weight" in score_weights:
-            value_head.linear.weight.data.copy_(score_weights["score.weight"])
-            print(f"Loaded value head score.weight from {config['model_name']}")
-        if "score.bias" in score_weights:
-            if value_head.linear.bias is None:
-                value_head.linear.bias = torch.nn.Parameter(
-                    torch.zeros(
-                        value_head.linear.out_features,
-                        dtype=value_head.dtype,
-                        device=value_head.linear.weight.device,
-                    )
-                )
-            value_head.linear.bias.data.copy_(score_weights["score.bias"])
-            print(f"Loaded value head score.bias from {config['model_name']}")
-
-    return value_head

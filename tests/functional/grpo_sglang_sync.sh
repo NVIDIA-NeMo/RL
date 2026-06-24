@@ -26,8 +26,12 @@ uv run --group test coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --
     grpo.num_generations_per_prompt=4 \
     policy.train_global_batch_size=4 \
     policy.train_micro_batch_size=1 \
-    cluster.gpus_per_node=1 \
-    policy.generation.sglang_cfg.gpus_per_server=1 \
+    cluster.gpus_per_node=2 \
+    policy.generation.colocated.enabled=true \
+    policy.generation.use_async_rollouts=false \
+    policy.generation.sglang_cfg.tp_size=1 \
+    policy.generation.sglang_cfg.sglang_server_config.num_gpus=2 \
+    policy.generation.sglang_cfg.sglang_server_config.num_gpus_per_engine=1 \
     grpo.max_num_steps=2 \
     logger.tensorboard_enabled=true \
     logger.log_dir=$LOG_DIR \
@@ -41,4 +45,3 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 uv run tests/check_metrics.py $JSON_METRICS \
     'max(data["train/token_mult_prob_error"]) < 1.05'
-

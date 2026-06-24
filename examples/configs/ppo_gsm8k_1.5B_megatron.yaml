@@ -1,4 +1,4 @@
-defaults: ../../ppo_math_1B_megatron.yaml
+defaults: ppo_math_1B_megatron.yaml
 ppo:
   num_prompts_per_step: 1024
   num_generations_per_prompt: 1

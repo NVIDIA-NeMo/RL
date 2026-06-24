@@ -11,10 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from nemo_rl.models.generation.sglang.config import SGLangConfig
-from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
+
+from nemo_rl.models.generation.megatron.config import (
+    MCoreGenerationConfig,
+    MCoreGenerationSpecificArgs,
+)
+from nemo_rl.models.generation.megatron.megatron_generation import (
+    MegatronGeneration,
+)
 
 __all__ = [
-    "SGLangConfig",
-    "SGLangGeneration",
+    "MCoreGenerationConfig",
+    "MCoreGenerationSpecificArgs",
+    "MegatronGeneration",
 ]
