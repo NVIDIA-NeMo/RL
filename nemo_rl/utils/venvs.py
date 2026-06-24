@@ -87,10 +87,11 @@ def create_local_venv(
     #  context.
     #  https://docs.astral.sh/uv/concepts/projects/config/#project-environment-path
     env["UV_PROJECT_ENVIRONMENT"] = venv_path
-    # Serialize installs to avoid the nvidia-cutlass-dsl parallel-install race
-    # (its -libs-base / -libs-cu13 wheels ship overlapping files), which can
-    # corrupt the cutlass.cute import that vLLM's FA4/MLA path relies on.
-    env.setdefault("UV_CONCURRENT_INSTALLS", "1")
+    if force_rebuild:
+        # Serialize installs to avoid the nvidia-cutlass-dsl parallel-install race
+        # (its -libs-base / -libs-cu13 wheels ship overlapping files), which can
+        # corrupt the cutlass.cute import that vLLM's FA4/MLA path relies on.
+        env.setdefault("UV_CONCURRENT_INSTALLS", "1")
 
     # Split the py_executable into command and arguments
     exec_cmd = shlex.split(py_executable)
