@@ -249,10 +249,10 @@ export GEN_NODES="${GEN_NODES:-32}"
 export NODES="${NODES:-$((TRAIN_NODES + GEN_NODES))}"
 export SLURM_TIME="${SLURM_TIME:-4:00:00}"
 export SBATCH_GRES="${SBATCH_GRES:-gpu:${GPUS_PER_NODE}}"
-# Keep one full Qwen35 training replica inside a segment. Standard training
-# replica size is TP4 * PP2 * CP1 * EP16 = 128 GPUs; vLLM is TP8 * PP1 = 8 GPUs,
-# so the training replica dominates.
-export SBATCH_SEGMENT="${SBATCH_SEGMENT:-$(((128 + GPUS_PER_NODE - 1) / GPUS_PER_NODE))}"
+# SBATCH_SEGMENT is a node count. Keep one full model-parallel group inside a
+# segment. Standard training is TP4 * PP2 * CP1 = 8 GPUs, and vLLM generation is
+# TP8 * PP1 = 8 GPUs, so both need ceil(8 / GPUS_PER_NODE) nodes.
+export SBATCH_SEGMENT="${SBATCH_SEGMENT:-$(((8 + GPUS_PER_NODE - 1) / GPUS_PER_NODE))}"
 
 : "${HF_CKPT_PATH:?set to the host Qwen 3.5 HF checkpoint directory}"
 export CONTAINER_HF_CKPT_PATH="${CONTAINER_HF_CKPT_PATH:-${HF_CKPT_PATH}}"
