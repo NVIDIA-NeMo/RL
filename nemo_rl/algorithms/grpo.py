@@ -518,6 +518,9 @@ def setup(
 
     total_nodes = cluster_config["num_nodes"]
     segment_size = cluster_config.get("segment_size")
+    # Topology of nodes left over after policy/inference placement; non-colocated
+    # OPD teachers are placed within it so their collectives stay on NVLink.
+    teacher_segment_topology: Optional[dict[str, tuple[str, int]]] = None
     if rm_env_enabled:
         rm_resource = env_configs["reward_model"]["resources"]
         rm_nodes = rm_resource["num_nodes"]
@@ -571,9 +574,13 @@ def setup(
         else:
             policy_gpus_per_node = cluster_config["gpus_per_node"]
 
-        node_resource_constraints, _, _ = prepare_segment_topology(
-            segment_size, policy_nodes
+        node_resource_constraints, policy_remaining_ids, policy_topology = (
+            prepare_segment_topology(segment_size, policy_nodes)
         )
+        if segment_size is not None:
+            teacher_segment_topology = {
+                nid: policy_topology[nid] for nid in policy_remaining_ids
+            }
         cluster = RayVirtualCluster(
             name="grpo_policy_cluster",
             bundle_ct_per_node_list=[policy_gpus_per_node] * policy_nodes,
@@ -682,6 +689,11 @@ def setup(
                     segment_size, train_nodes, topology=topology, role="training"
                 )
             )
+            # Teachers default to the nodes left after training; narrowed further
+            # below if a non-colocated inference cluster is also pinned.
+            teacher_segment_topology = {
+                nid: topology[nid] for nid in remaining_node_ids
+            }
             # Warn if any selected training node lacks topo_rank — domain pinning
             # still works but intra-domain rank ordering will be arbitrary.
             if node_resource_constraints is not None:
@@ -721,15 +733,20 @@ def setup(
                     remaining_topology = {
                         nid: topology[nid] for nid in remaining_node_ids
                     }
-                    inference_node_resource_constraints, _, _ = (
-                        prepare_segment_topology(
-                            nodes_per_instance,
-                            inference_nodes,
-                            topology=remaining_topology,
-                            role="inference",
-                        )
+                    (
+                        inference_node_resource_constraints,
+                        inference_remaining_ids,
+                        _,
+                    ) = prepare_segment_topology(
+                        nodes_per_instance,
+                        inference_nodes,
+                        topology=remaining_topology,
+                        role="inference",
                     )
                     inference_segment_size = nodes_per_instance
+                    teacher_segment_topology = {
+                        nid: topology[nid] for nid in inference_remaining_ids
+                    }
                 elif nodes_per_instance > 1:
                     print(
                         f"  ⚠ inference_nodes={inference_nodes} is not divisible by "
@@ -1168,7 +1185,11 @@ def setup(
         t0 = time.perf_counter()
         teacher_worker_groups, alias_to_group_alias = (
             opd_module.create_teacher_worker_groups(
-                master_config, policy_config, tokenizer
+                master_config,
+                policy_config,
+                tokenizer,
+                segment_size=segment_size,
+                teacher_segment_topology=teacher_segment_topology,
             )
         )
         worker_init_timing_metrics["teacher_init_time_s"] = time.perf_counter() - t0

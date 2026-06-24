@@ -121,8 +121,10 @@ def _skip_prev_logprobs(master_config: Any) -> bool:
 
 
 def assert_prev_logprobs_available(master_config: Any) -> None:
-    """OPD's advantage is ``teacher_logprobs - prev_logprobs``, so it needs a real
-    student logprob; raise if the config would zero ``prev_logprobs``.
+    """Raise if OPD is enabled but the config would zero ``prev_logprobs``.
+
+    OPD's advantage is ``teacher_logprobs - prev_logprobs``, so it needs a real
+    student logprob.
     """
     if is_opd_enabled(master_config) and _skip_prev_logprobs(master_config):
         raise ValueError(
@@ -229,12 +231,26 @@ def create_teacher_worker_groups(
     master_config: Any,
     policy_config: dict[str, Any],
     tokenizer: Any,
+    *,
+    segment_size: Optional[int] = None,
+    teacher_segment_topology: Optional[dict[str, tuple[str, int]]] = None,
 ) -> tuple[dict[str, Any], dict[str, str]]:
     """Create TeacherWorkerGroup instances for non-colocated teachers.
 
+    Args:
+        segment_size: NVLink-domain segment size from the cluster config; when
+            set, each teacher is placed topology-aware so its TP/PP/CP stays
+            within an NVLink domain.
+        teacher_segment_topology: Topology of the nodes left after policy /
+            inference placement, used to pin teacher nodes (see
+            ``prepare_segment_topology``).
+
     Returns (teacher_worker_groups, alias_to_group_alias).
     """
-    from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+    from nemo_rl.distributed.virtual_cluster import (
+        RayVirtualCluster,
+        prepare_segment_topology,
+    )
     from nemo_rl.models.policy.teacher_worker_group import (
         TeacherWorkerGroup,
         create_teacher_configs_from_opd_config,
@@ -259,11 +275,32 @@ def create_teacher_worker_groups(
 
     teacher_configs = create_teacher_configs_from_opd_config(opd_cfg)
 
+    # Running topology of still-free nodes; each teacher consumes a segment and
+    # passes the remainder to the next so teachers don't collide.
+    running_topology = (
+        dict(teacher_segment_topology) if teacher_segment_topology else None
+    )
+
     teacher_worker_groups: dict[str, Any] = {}
     for tcfg in teacher_configs:
         alias = tcfg.alias
         num_nodes = tcfg.num_nodes
         gpus_per_node = tcfg.gpus_per_node
+
+        # Pin each teacher within one NVLink domain (its whole node span is one
+        # segment) so its TP/PP/CP collectives stay on NVLink, not InfiniBand.
+        teacher_segment_size = None
+        node_resource_constraints = None
+        if segment_size is not None:
+            teacher_segment_size = num_nodes
+            node_resource_constraints, remaining_ids, _ = prepare_segment_topology(
+                num_nodes,
+                num_nodes,
+                topology=running_topology,
+                role=f"teacher:{alias}",
+            )
+            if running_topology is not None:
+                running_topology = {nid: running_topology[nid] for nid in remaining_ids}
 
         teacher_cluster = RayVirtualCluster(
             name=f"teacher_{alias}",
@@ -271,7 +308,12 @@ def create_teacher_worker_groups(
             use_gpus=True,
             num_gpus_per_node=gpus_per_node,
             max_colocated_worker_groups=1,
+            segment_size=teacher_segment_size,
+            node_resource_constraints=node_resource_constraints,
         )
+        # Eagerly claim domain-aligned nodes before the next teacher selects.
+        if node_resource_constraints is not None:
+            teacher_cluster.get_placement_groups()
         twg = TeacherWorkerGroup(
             teacher_cfg=tcfg,
             cluster=teacher_cluster,
