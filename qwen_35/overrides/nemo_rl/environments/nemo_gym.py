@@ -249,63 +249,73 @@ Depending on your data shape, you may want to change these values."""
 
         timer = _timer_with_optional_context({"worker": "nemo_gym"})
 
-        counts_left = Counter(r["agent_ref"]["name"] for r in nemo_gym_examples)
-
         timer.start("_run_rollouts_total")
-        nemo_gym_result_iterator = self.rch.run_examples(
-            examples=nemo_gym_examples,
-            head_server_config=self.head_server_config,
-        )
+        max_attempts, trial = self.rollout_max_attempts_to_avoid_lp_nan, 0
+        while trial < max_attempts:
+            counts_left = Counter(r["agent_ref"]["name"] for r in nemo_gym_examples)
+            nemo_gym_result_iterator = self.rch.run_examples(
+                examples=nemo_gym_examples,
+                head_server_config=self.head_server_config,
+            )
 
-        nemo_gym_num_rows = len(nemo_gym_examples)
-        num_results = 0
-        nemo_rl_rowidxs = []
-        nemo_rl_results = []
-        for task in nemo_gym_result_iterator:
-            with _timer_time(timer, label=f"{timer_prefix}/await_results", should_log=False):
-                try:
-                    nemo_gym_row, nemo_gym_result = await task
-                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                    print(
-                        f"  [nemo_gym] WARNING: rollout failed ({type(e).__name__}: {e}); "
-                        "will back-fill as a zero-reward trajectory instead of aborting the batch.",
-                        flush=True,
+            nemo_gym_num_rows = len(nemo_gym_examples)
+            num_results = 0
+            nemo_rl_rowidxs = []
+            nemo_rl_results = []
+            logprob_contains_nan = False
+            for task in nemo_gym_result_iterator:
+                with _timer_time(timer, label=f"{timer_prefix}/await_results", should_log=False):
+                    try:
+                        nemo_gym_row, nemo_gym_result = await task
+                    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                        print(
+                            f"  [nemo_gym] WARNING: rollout failed ({type(e).__name__}: {e}); "
+                            "will back-fill as a zero-reward trajectory instead of aborting the batch.",
+                            flush=True,
+                        )
+                        continue
+                    except Exception as e:
+                        # This response content comes from https://github.com/NVIDIA-NeMo/Gym/blob/30f498b1e994679cebcfacfa4ac630190d0e171f/nemo_gym/server_utils.py#L233
+                        if hasattr(e, "response_content"):
+                            print("EXCEPTION RESULT", e.response_content, file=sys.stderr)
+                        raise e
+
+                with _timer_time(timer, label=f"{timer_prefix}/postprocess_results", should_log=False):
+                    nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
+                        nemo_gym_result, tokenizer
                     )
-                    continue
-                except Exception as e:
-                    # This response content comes from https://github.com/NVIDIA-NeMo/Gym/blob/30f498b1e994679cebcfacfa4ac630190d0e171f/nemo_gym/server_utils.py#L233
-                    if hasattr(e, "response_content"):
-                        print("EXCEPTION RESULT", e.response_content, file=sys.stderr)
-                    raise e
 
-            with _timer_time(timer, label=f"{timer_prefix}/postprocess_results", should_log=False):
-                nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                    nemo_gym_result, tokenizer
-                )
                 for message in nemo_rl_result["message_log"]:
                     if (
                         "generation_logprobs" in message
                         and message["generation_logprobs"] is not None
                     ):
                         if torch.isnan(message["generation_logprobs"]).any():
-                            raise RuntimeError(
-                                "Generation logprobs contain NaN! Failing loudly"
-                            )
+                            logprob_contains_nan = True
+                            break
 
-            num_results += 1
+                num_results += 1
 
-            nemo_rl_rowidxs.append(nemo_gym_row["_rowidx"])
-            nemo_rl_results.append(nemo_rl_result)
+                nemo_rl_rowidxs.append(nemo_gym_row["_rowidx"])
+                nemo_rl_results.append(nemo_rl_result)
 
-            counts_left[nemo_gym_row["agent_ref"]["name"]] -= 1
-            if counts_left[nemo_gym_row["agent_ref"]["name"]] <= 0:
-                counts_left.pop(nemo_gym_row["agent_ref"]["name"])
-            # Print every 10 rollouts
-            if num_results % 10 == 0:
-                # Only print top 5
-                top_left = counts_left.most_common(5)
-                top_left_str = "\n".join(f"{i + 1}. {k}: {v}" for i, (k, v) in enumerate(top_left))
-                print(f"Top 5 NeMo Gym agent refs left in this rollout batch: {top_left_str}", file=sys.stderr)
+                counts_left[nemo_gym_row["agent_ref"]["name"]] -= 1
+                if counts_left[nemo_gym_row["agent_ref"]["name"]] <= 0:
+                    counts_left.pop(nemo_gym_row["agent_ref"]["name"])
+                # Print every 10 rollouts
+                if num_results % 10 == 0:
+                    # Only print top 5
+                    top_left = counts_left.most_common(5)
+                    top_left_str = "\n".join(f"{i + 1}. {k}: {v}" for i, (k, v) in enumerate(top_left))
+                    print(f"Top 5 NeMo Gym agent refs left in this rollout batch: {top_left_str}", file=sys.stderr)
+
+            if logprob_contains_nan:
+                trial += 1
+                print(
+                    f"Generation logprobs contain NaN; retrying... (trial {trial}/{max_attempts})"
+                )
+                continue
+            break
 
         nemo_rl_sort_results = [None] * len(nemo_gym_examples)
         for rowidx, result in zip(nemo_rl_rowidxs, nemo_rl_results):
