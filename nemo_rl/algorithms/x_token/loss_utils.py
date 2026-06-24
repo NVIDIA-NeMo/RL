@@ -46,10 +46,10 @@ from torch.distributed.tensor import DTensor
 
 from nemo_rl.algorithms.x_token.token_aligner import AlignmentBatch
 from nemo_rl.distributed.model_utils import (
-    AllReduceSum,
     cp_load_balanced_to_contiguous,
     cp_shift_next,
     get_logprobs_from_vocab_parallel_logits,
+    group_all_reduce_sum_with_grad,
     vocab_parallel_argmax,
 )
 from nemo_rl.models.dtensor.parallelize import to_local_if_dtensor
@@ -106,8 +106,8 @@ def chunk_log_prob_sums(
     """Local bmm + bucket count, no division.
 
     Output is summable across CP; callers that need cross-rank chunks to
-    aggregate correctly should ``AllReduceSum`` both tensors before
-    :func:`chunk_average_finalize`. ``chunk_id == -1`` contributes to no
+    aggregate correctly should ``group_all_reduce_sum_with_grad`` both tensors
+    before :func:`chunk_average_finalize`. ``chunk_id == -1`` contributes to no
     bucket.
     """
     device = log_probs.device
@@ -140,8 +140,8 @@ def chunk_average_log_probs(
 
     Builds a one-hot chunk mask from ``chunk_id`` (``-1`` = no chunk), then
     ``bmm``-aggregates and divides by chunk sizes. When ``cp_group`` has world
-    > 1, the per-chunk sums are ``AllReduceSum``'d across CP ranks before the
-    divide (mean is non-linear, so the reduce must precede it).
+    > 1, the per-chunk sums are ``group_all_reduce_sum_with_grad``'d across CP
+    ranks before the divide (mean is non-linear, so the reduce must precede it).
 
     Args:
         log_probs: ``[B, T, V]`` log-probabilities.
@@ -155,8 +155,8 @@ def chunk_average_log_probs(
     """
     chunk_sums, chunk_sizes = chunk_log_prob_sums(log_probs, chunk_id, max_chunks)
     if cp_group is not None and torch.distributed.get_world_size(cp_group) > 1:
-        chunk_sums = AllReduceSum.apply(chunk_sums, cp_group)
-        chunk_sizes = AllReduceSum.apply(chunk_sizes, cp_group)
+        chunk_sums = group_all_reduce_sum_with_grad(chunk_sums, cp_group)
+        chunk_sizes = group_all_reduce_sum_with_grad(chunk_sizes, cp_group)
     return chunk_average_finalize(chunk_sums, chunk_sizes)
 
 
@@ -204,9 +204,9 @@ def project_student_to_teacher_vocab(
     ``sparse_projection`` is the full ``[V_s, V_t]`` sparse-COO matrix. With
     ``tp_group`` world > 1 the student probs cover only this rank's ``V_s/TP``
     rows, so the matrix is row-sliced to that range, the sparse matmul produces a
-    partial teacher-vocab sum, and an ``AllReduceSum`` over the TP group combines
-    the partials into the full ``V_s`` contraction. Otherwise a single sparse
-    matmul over the full matrix is used.
+    partial teacher-vocab sum, and a ``group_all_reduce_sum_with_grad`` over the
+    TP group combines the partials into the full ``V_s`` contraction. Otherwise a
+    single sparse matmul over the full matrix is used.
     """
     batch_size, seq_len, local_vocab_size = student_probs.shape
     flat = student_probs.reshape(batch_size * seq_len, local_vocab_size)
@@ -221,7 +221,9 @@ def project_student_to_teacher_vocab(
             row_end=(tp_rank + 1) * rows_per_rank,
         )
         projected_partial = Fp32SparseMM.apply(local_projection, flat.t()).t()
-        projected = AllReduceSum.apply(projected_partial.contiguous(), tp_group)
+        projected = group_all_reduce_sum_with_grad(
+            projected_partial.contiguous(), tp_group
+        )
     else:
         # Fp32SparseMM internally computes M.t() @ dense; passing M (not M.t())
         # avoids a sparse ``.t()`` on a saved tensor in backward.
@@ -266,6 +268,9 @@ class LocalizedAlignment:
     pair_valid: torch.Tensor
     pair_is_correct: torch.Tensor
     sample_mask: torch.Tensor
+    # Filled post-construction by prepare_xtoken_cross_tokenizer_loss_input (None when
+    # built via localize_alignment); read only by the P-KL next-token-accuracy metric --
+    # the gold path leaves them unset.
     student_input_ids: Optional[torch.Tensor] = None
     student_token_mask: Optional[torch.Tensor] = None
 
@@ -442,6 +447,12 @@ def assemble_teacher_logits_from_shards(
         raise ValueError("teacher_shards must be non-empty")
     full_seq_len = int(teacher_shards[0]["full_seq_len"])
     full_vocab_size = int(teacher_shards[0]["full_vocab_size"])
+    # CP seq-padding guarantees this; assert it so the contiguous-window math
+    # below (and the `dest` size) can't silently go out of bounds if a caller
+    # ever passes an unpadded length.
+    assert full_seq_len % student_cp_size == 0, (
+        f"full_seq_len={full_seq_len} not divisible by student_cp_size={student_cp_size}"
+    )
     local_seq_len = full_seq_len // student_cp_size
 
     dest = torch.zeros(

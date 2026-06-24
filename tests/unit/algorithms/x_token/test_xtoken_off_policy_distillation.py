@@ -112,6 +112,7 @@ def _make_master_config(
                 "val_period": val_period,
                 "val_at_start": val_at_start,
                 "val_at_end": val_at_end,
+                "val_teacher_micro_batch_size": 1,
             },
             "policy": {
                 "dtensor_cfg": {

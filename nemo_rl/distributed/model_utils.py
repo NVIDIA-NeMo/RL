@@ -1233,14 +1233,20 @@ def allgather_cp_sharded_tensor(
     return AllGatherCPTensor.apply(tensor, cp_group, seq_dim)  # , unpadded_seqlen)
 
 
-class AllReduceSum(torch.autograd.Function):
-    """Autograd-aware SUM all-reduce; forward clones + reduces, backward is identity.
+class _AllReduceSum(torch.autograd.Function):
+    """Autograd-aware SUM all-reduce primitive; forward clones + reduces, backward is identity.
 
     Math: ``y = Σ_r x_r`` ⇒ ``dy/dx_r = 1``. Every rank holds the same
     ``y`` after forward, so the upstream grad is identical across ranks
     — passing it back as ``grad_x_r`` lets the rank-local chain rule
     route gradients to each rank's own input shard with no cross-rank
     coupling.
+
+    Use the functional wrappers :func:`group_all_reduce_sum_with_grad` (keeps
+    the gradient) and :func:`group_all_reduce_sum` (no gradient) rather than
+    calling ``.apply`` directly. A ``group`` of ``None`` (or world size <= 1,
+    or an uninitialized process group) is a no-op so single-process / CPU paths
+    work unchanged.
     """
 
     @staticmethod
@@ -1250,7 +1256,11 @@ class AllReduceSum(torch.autograd.Function):
         group: Optional[torch.distributed.ProcessGroup],
     ) -> torch.Tensor:
         ctx.group = group
-        if group is None or torch.distributed.get_world_size(group) <= 1:
+        if (
+            group is None
+            or not torch.distributed.is_initialized()
+            or torch.distributed.get_world_size(group) <= 1
+        ):
             return x
         out = x.clone()
         torch.distributed.all_reduce(
@@ -1263,6 +1273,37 @@ class AllReduceSum(torch.autograd.Function):
         ctx: Any, grad_out: torch.Tensor
     ) -> tuple[torch.Tensor, None]:
         return grad_out, None
+
+
+def group_all_reduce_sum_with_grad(
+    x: torch.Tensor,
+    group: Optional[torch.distributed.ProcessGroup],
+) -> torch.Tensor:
+    """Differentiable SUM all-reduce of ``x`` over ``group``.
+
+    Gradients flow back through the reduce (backward is identity), so this is
+    the variant for forward-path reductions whose result feeds the loss — e.g.
+    CP chunk-sum aggregation and TP projection-partial combination. ``group``
+    of ``None`` (or world size <= 1, or dist uninitialized) is a no-op.
+    """
+    return _AllReduceSum.apply(x, group)
+
+
+def group_all_reduce_sum(
+    x: torch.Tensor,
+    group: Optional[torch.distributed.ProcessGroup],
+) -> torch.Tensor:
+    """Non-differentiable variant of :func:`group_all_reduce_sum_with_grad`.
+
+    Same reduction, but no gradient flows through it — use for normalizers /
+    denominators that must be treated as constants (e.g. the global
+    valid-token or valid-chunk counts). Pass an explicit ``group`` (e.g.
+    ``torch.distributed.group.WORLD`` to reduce over the full DP×CP×TP mesh, or
+    a narrower process group); ``None`` (or world size <= 1, or dist
+    uninitialized) is a no-op that returns the local value.
+    """
+    with torch.no_grad():
+        return _AllReduceSum.apply(x, group)
 
 
 class AllGatherCPTensor(torch.autograd.Function):
@@ -1379,25 +1420,6 @@ def cp_shift_next(
     gathered = [torch.empty_like(first) for _ in range(cp_size)]
     torch.distributed.all_gather(gathered, first, group=cp_group)
     out[:, -1] = gathered[cp_rank + 1] if cp_rank < cp_size - 1 else fill
-    return out
-
-
-def group_all_reduce_sum(
-    local: torch.Tensor,
-    group: Optional[torch.distributed.ProcessGroup] = None,
-) -> torch.Tensor:
-    """Sum a scalar over ``group`` (default ``None`` = WORLD, the full DP×CP×TP mesh), no grad.
-
-    Note the default group is WORLD, not DP: the reduction spans every rank,
-    including TP replicas. That TP-replication inflation is intentional —
-    normalizers whose numerator sums over the same group cancel it, so the
-    result stays parallelism-invariant. Pass an explicit ``group`` to reduce
-    over a narrower scope. Returns a fresh float32 scalar (falls back to a local
-    copy when dist is uninitialized).
-    """
-    out = local.detach().to(torch.float32).clone()
-    if torch.distributed.is_initialized():
-        torch.distributed.all_reduce(out, group=group)
     return out
 
 

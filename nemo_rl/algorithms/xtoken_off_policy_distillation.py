@@ -107,9 +107,9 @@ class OffPolicyDistillationConfig(TypedDict):
         val_at_start: Run validation before training begins.
         val_at_end: Run validation on the final step.
         val_teacher_micro_batch_size: Teacher microbatch size used for the
-            validation logits export. Defaults to the teacher's
-            ``train_micro_batch_size``; tune independently for val
-            memory/throughput.
+            validation logits export. The exemplar defaults it to
+            ``teacher.train_micro_batch_size`` via interpolation; override with a
+            literal to tune the val export independently of training.
     """
 
     num_prompts_per_step: int
@@ -119,7 +119,7 @@ class OffPolicyDistillationConfig(TypedDict):
     val_period: int
     val_at_start: bool
     val_at_end: bool
-    val_teacher_micro_batch_size: NotRequired[int]
+    val_teacher_micro_batch_size: int
 
 
 class OffPolicyDistillationSaveState(TypedDict):
@@ -324,9 +324,7 @@ def setup(
     # assert_teacher_student_batch_grid checks both (GBS agreement + tiling).
     student_dp = student_policy.data_parallel_size
     teacher_dp = teacher_policy.data_parallel_size
-    val_teacher_mbs = distillation_config.get(
-        "val_teacher_micro_batch_size", teacher_config["train_micro_batch_size"]
-    )
+    val_teacher_mbs = distillation_config["val_teacher_micro_batch_size"]
     # Training grid.
     assert_teacher_student_batch_grid(
         global_batch_size=distillation_config["num_prompts_per_step"],
@@ -748,10 +746,7 @@ def validate(
     student_dp = student_policy.data_parallel_size
     teacher_dp = teacher_policy.data_parallel_size
     student_mbs = master_config.policy["train_micro_batch_size"]
-    val_teacher_mbs = distill_cfg.get(
-        "val_teacher_micro_batch_size",
-        master_config.teacher["train_micro_batch_size"],
-    )
+    val_teacher_mbs = distill_cfg["val_teacher_micro_batch_size"]
     pad_quantum = math.lcm(student_dp * student_mbs, teacher_dp * val_teacher_mbs)
 
     with timer.time("validation_total"):

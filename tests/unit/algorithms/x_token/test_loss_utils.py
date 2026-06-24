@@ -37,6 +37,7 @@ from nemo_rl.algorithms.x_token.loss_utils import (
     _TOPK_PROJECTION_CACHE,
     _try_zero_copy_teacher_logits,
     alignment_from_flat_batch,
+    assemble_teacher_logits_from_shards,
     build_exact_token_map,
     chunk_average_log_probs,
     collect_overlapping_teacher_shards,
@@ -47,7 +48,7 @@ from nemo_rl.algorithms.x_token.loss_utils import (
     valid_chunk_mask,
 )
 from nemo_rl.algorithms.x_token.token_aligner import AlignmentBatch
-from nemo_rl.distributed.model_utils import AllReduceSum
+from nemo_rl.distributed.model_utils import group_all_reduce_sum_with_grad
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.ray_actor_environment_registry import (
     ACTOR_ENVIRONMENT_REGISTRY,
@@ -581,6 +582,87 @@ class TestZeroCopyTeacherLogits:
         )
 
 
+class TestAssembleTeacherLogitsFromShards:
+    """CPU coverage of the heterogeneous teacher-TP/CP -> student-CP reassembly.
+
+    Monkeypatches ``rebuild_cuda_tensor_from_ipc`` so the IPC slice-write logic
+    (the #2682 path) is exercised without GPUs/IPC. A known full teacher-logit
+    tensor is split into a teacher TP2xCP2 grid (4 shards); each student CP rank
+    must reassemble exactly its ``[T_t/CP_s, V_t]`` contiguous-seq, full-vocab
+    window.
+    """
+
+    @staticmethod
+    def _build_tp2cp2(full):
+        """Split ``full`` [T, V] into a teacher TP2xCP2 grid -> (shards, storage_map)."""
+        full_seq_len, full_vocab_size = full.shape
+        seq_mid, vocab_mid = full_seq_len // 2, full_vocab_size // 2
+        storage_map = {}
+        shards = []
+        for cp, (s0, s1) in enumerate([(0, seq_mid), (seq_mid, full_seq_len)]):
+            for tp, (v0, v1) in enumerate(
+                [(0, vocab_mid), (vocab_mid, full_vocab_size)]
+            ):
+                payload = (f"cp{cp}tp{tp}",)
+                # Producer storage layout: [N_microbatches, B_mb, T_local, V_local].
+                storage_map[payload] = (
+                    full[s0:s1, v0:v1].clone().reshape(1, 1, s1 - s0, v1 - v0)
+                )
+                shards.append(
+                    {
+                        "payload_ipc": payload,
+                        "buf_idx": 0,
+                        "sample_index_in_buf": 0,
+                        "vocab_start_index": v0,
+                        "vocab_end_index": v1,
+                        "global_seq_start": s0,
+                        "actual_shape": (s1 - s0, v1 - v0),
+                        "full_seq_len": full_seq_len,
+                        "full_vocab_size": full_vocab_size,
+                    }
+                )
+        return shards, storage_map
+
+    @pytest.mark.parametrize("student_cp_rank", [0, 1])
+    def test_tp2cp2_reassembly(self, monkeypatch, student_cp_rank):
+        full = torch.arange(8 * 6, dtype=torch.float32).reshape(8, 6)
+        shards, storage_map = self._build_tp2cp2(full)
+        monkeypatch.setattr(
+            "nemo_rl.models.policy.utils.rebuild_cuda_tensor_from_ipc",
+            lambda payload, device: storage_map[payload],
+        )
+        out = assemble_teacher_logits_from_shards(
+            shards,
+            student_cp_rank=student_cp_rank,
+            student_cp_size=2,
+            device="cpu",
+        )
+        lo, hi = student_cp_rank * 4, (student_cp_rank + 1) * 4
+        assert out.shape == (4, 6)
+        assert torch.equal(out, full[lo:hi, :])
+
+    def test_non_divisible_seq_len_asserts(self):
+        # full_seq_len=7 not divisible by student_cp_size=2 -> guard fires before
+        # the out-of-bounds dest write the assert protects against.
+        shards = [
+            {
+                "payload_ipc": ("x",),
+                "buf_idx": 0,
+                "sample_index_in_buf": 0,
+                "vocab_start_index": 0,
+                "vocab_end_index": 6,
+                "global_seq_start": 0,
+                "actual_shape": (7, 6),
+                "full_seq_len": 7,
+                "full_vocab_size": 6,
+            }
+        ]
+        with pytest.raises(AssertionError):
+            assemble_teacher_logits_from_shards(
+                shards, student_cp_rank=0, student_cp_size=2, device="cpu"
+            )
+
+
 # ---------------------------------------------------------------------------
 # Real multi-GPU (NCCL) tests for the TP/CP loss helpers.
 #
@@ -694,7 +776,7 @@ class XtokenShardTestActor:
             torch.testing.assert_close(sizes, ref_sizes)
 
             x = torch.full((3,), float(rank + 1), device="cuda", requires_grad=True)
-            y = AllReduceSum.apply(x, cp)
+            y = group_all_reduce_sum_with_grad(x, cp)
             torch.testing.assert_close(
                 y, torch.full((3,), float(ws * (ws + 1) // 2), device="cuda")
             )

@@ -1656,7 +1656,9 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         # mirrors the `global_valid_toks` convention used by CE.
         sample_mask_bool = align.sample_mask.bool()
         valid_bool = chunk_mask & sample_mask_bool.unsqueeze(-1)
-        global_valid_chunks = group_all_reduce_sum(valid_bool.sum())
+        global_valid_chunks = group_all_reduce_sum(
+            valid_bool.sum().to(torch.float32), group=torch.distributed.group.WORLD
+        )
         if global_valid_chunks.item() == 0:
             zero = torch.zeros((), device=device, dtype=proj_log_chunks.dtype)
             return (
@@ -1789,7 +1791,9 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         # both `kl_common` and `l1_uncommon` use this as their denom so
         # the loss is normalized by `sum(global_valid_chunks)`, not a
         # per-rank mean.
-        global_valid_chunks = group_all_reduce_sum(valid_chunk.sum())
+        global_valid_chunks = group_all_reduce_sum(
+            valid_chunk.sum().to(torch.float32), group=torch.distributed.group.WORLD
+        )
         if global_valid_chunks.item() == 0:
             zero = torch.zeros((), device=device, dtype=zero_dtype)
             return (

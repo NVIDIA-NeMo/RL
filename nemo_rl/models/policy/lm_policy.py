@@ -649,16 +649,20 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     ) -> list[dict[str, Any]]:
         """Ship the teacher's full-vocab logits to the student via CUDA IPC.
 
-        Used by cross-tokenizer distillation. Returns a flat ``list[B]`` of
-        per-sample IPC handle dicts; each entry's ``logits_ipc``
-        reconstructs a ``[T_t, V_t]`` CUDA tensor on the consumer device.
-        The loss fn then either (a) derives a microbatch-global top-k
-        subset internally to match the PT non-gold path, or (b) uses the
-        full vocab end-to-end to match the PT gold path.
+        Used by cross-tokenizer distillation; supports heterogeneous teacher
+        TP/CP. Gathers each worker's ``{"dp_rank", "per_sample_handles"}`` and
+        returns the global-batch-ordered list produced by
+        :func:`aggregate_per_sample_handles`: a length-``gbs`` list where
+        element ``i`` is ``{"teacher_shards": [shard, ...]}`` holding every
+        TP×CP shard of global sample ``i``. Each shard carries the IPC payload
+        plus the ``buf_idx`` / ``sample_index_in_buf`` slot index and the TP/CP
+        shard metadata; the loss consumer reassembles the full ``[T_t, V_t]``
+        teacher logits (or its CP-local window) from these shards.
 
-        Caller must invoke :meth:`release_ipc_buffer` after the student
-        finishes consuming the handles — otherwise the producer-side
-        CUDA tensors leak.
+        The producer-side IPC storage is persistent and reused across calls
+        (via ``copy_``); the caller releases it once via
+        :meth:`release_ipc_buffer` at the end of training / validation (and on
+        error), not per call.
 
         v0 limitation: no dynamic batching, no sequence packing.
         """
