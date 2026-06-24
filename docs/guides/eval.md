@@ -105,6 +105,7 @@ score=0.1000 (3.0/30)
 
 - [AIME-2024, AIME-2025, and AIME-2026](../../nemo_rl/data/datasets/eval_datasets/aime.py): the corresponding `data.dataset_name` are `"aime2024"`, `"aime2025"`, and `"aime2026"`.
 - [GPQA and GPQA-diamond](../../nemo_rl/data/datasets/eval_datasets/gpqa.py): the corresponding `data.dataset_name` are `"gpqa"` and `"gpqa_diamond"`.
+- [HMMT-2025-Feb, HMMT-2025-Nov, and HMMT-2026-Feb](../../nemo_rl/data/datasets/eval_datasets/hmmt.py): the corresponding `data.dataset_name` are `"hmmt2025_feb"`, `"hmmt2025_nov"`, and `"hmmt2026_feb"`.
 - [MATH and MATH-500](../../nemo_rl/data/datasets/eval_datasets/math.py): the corresponding `data.dataset_name` are `"math"` and `"math500"`.
 - [MMLU](../../nemo_rl/data/datasets/eval_datasets/mmlu.py): this also includes MMMLU (Multilingual MMLU), a total of 14 languages. When `data.dataset_name` is set to `mmlu`, the English version is used. If one wants to run evaluation on another language, `data.dataset_name` should be set to `mmlu_{language}` where `language` is one of following 14 values, `["AR-XY", "BN-BD", "DE-DE", "ES-LA", "FR-FR", "HI-IN", "ID-ID", "IT-IT", "JA-JP", "KO-KR", "PT-BR", "ZH-CN", "SW-KE", "YO-NG"]`.
 - [MMLU-Pro](../../nemo_rl/data/datasets/eval_datasets/mmlu_pro.py): the corresponding `data.dataset_name` is `"mmlu_pro"`.
