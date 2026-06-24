@@ -48,6 +48,8 @@ def mock_config():
         "precision": "bfloat16",
         "max_grad_norm": 1.0,
         "offload_optimizer_for_logprob": False,
+        "use_pinned_optimizer_offload": False,
+        "use_coalesced_optimizer_offload": False,
         "sequence_packing": {"enabled": False},
         "dtensor_cfg": {
             "cpu_offload": False,
