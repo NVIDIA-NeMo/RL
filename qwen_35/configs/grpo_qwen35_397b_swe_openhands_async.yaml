@@ -1,8 +1,8 @@
 # Qwen 3.5 SWE/OpenHands wrapper.
 #
-# This config inherits the Carlos/grpo-studies Qwen3-235B SWE recipe and only
-# changes model-family-specific settings needed for Qwen3.5-397B-A17B. Runtime
-# paths, node counts, data, and experiment names are still provided by
+# This config inherits the base Qwen3-235B SWE recipe and only changes
+# model-family-specific settings needed for Qwen3.5-397B-A17B. Runtime paths,
+# node counts, data, and experiment names are still provided by
 # examples/nemo_gym/launch_nemo_gym_multinode_training.sh and CLI overrides.
 #
 # Selecting this recipe from the launcher automatically mounts qwen_35/configs

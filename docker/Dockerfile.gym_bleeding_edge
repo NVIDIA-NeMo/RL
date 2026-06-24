@@ -1,18 +1,21 @@
 # syntax=docker/dockerfile:1
 # Apply the bleeding-edge NeMo RL refresh directly to a Gym v0.6.0 image.
 #
+# Example image prefix:
+#   IMAGE_PREFIX=registry.example.com/my-team/nemo-rl
+#
 # Build the base Gym image first:
 #   docker buildx build \
 #     --platform linux/amd64 \
-#     -t <registry>/nemo-rl:v0.6.0-gym \
+#     -t "${IMAGE_PREFIX}:v0.6.0-gym" \
 #     --push \
 #     -f docker/Dockerfile.gym_v0.6.0 .
 #
 # Then build this image from that artifact:
 #   docker buildx build \
 #     --platform linux/amd64 \
-#     --build-arg BASE_IMAGE=<registry>/nemo-rl:v0.6.0-gym \
-#     -t <registry>/nemo-rl:gym-bleeding-edge \
+#     --build-arg BASE_IMAGE="${IMAGE_PREFIX}:v0.6.0-gym" \
+#     -t "${IMAGE_PREFIX}:gym-bleeding-edge" \
 #     --push \
 #     -f docker/Dockerfile.gym_bleeding_edge .
 #

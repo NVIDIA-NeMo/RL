@@ -151,8 +151,8 @@ class NemoGym(EnvironmentInterface):
         )
         initial_global_config_dict["policy_base_url"] = self.cfg["base_urls"]
 
-        # Gym servers default to 5000-5999, below the OS ephemeral floor (9000
-        # on OCI-HSG).  See ray.sub port layout comment for the full map.
+        # Gym servers default to 5000-5999, below the OS ephemeral port floor on
+        # the target clusters. See ray.sub port layout comment for the full map.
         _gym_port_low = self.cfg.get("port_range_low", 5000)
         _gym_port_high = self.cfg.get("port_range_high", 5999)
         if _gym_port_low < 5000 or _gym_port_high > 5999:

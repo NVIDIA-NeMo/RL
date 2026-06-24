@@ -165,7 +165,7 @@ The current overlay files are:
 
 These are intentionally under `qwen_35/overrides` instead of directly modifying
 the base tree. That makes it clear which files are Qwen 3.5-specific and keeps
-base grpo-studies behavior visible.
+base behavior visible.
 
 - `3rdparty/Gym-workspace/Gym/responses_api_models/vllm_model/app.py`
   - Preserves the Gym Responses API behavior used by the known-good smoke path,
@@ -174,19 +174,11 @@ base grpo-studies behavior visible.
     populated.
 
 
-## Ptyche training HPs
+## Optional shmoo overrides
 
-Carlos's Ptyche Qwen3 run used ordinary training hyperparameters on top of a
-different model/topology:
-
-```text
-/lustre/fsw/coreai_mlperf_training/users/cgomes/mlperf-rl/results/coreai_mlperf_training-grpo.grpo-235b-swe-async_gbs512_lr5.0e-6_mt30_r1
-```
-
-Important detail: despite the run-name `gbs512`, the final resolved Ptyche config
-and MLLOG reported `train_global_batch_size=256`, `num_prompts_per_step=16`, and
-`num_generations_per_prompt=16`. We do not keep a separate YAML for this because
-the useful parts are simple overrides:
+Use explicit Hydra overrides for intentional smoke/shmoo runs instead of baking
+site- or run-specific values into the Qwen wrapper. For example, a smaller
+training shape can be launched with:
 
 ```bash
 "policy.train_global_batch_size=256" \
@@ -216,82 +208,58 @@ truncation fallback used by the Qwen vLLM async worker patch. The launcher sets
 the default used by the known-good R2E runs; override it only when intentionally
 testing a different context budget.
 
-## OCI-HSG R2E study example
+## Training launch template
 
-The following is the 64-node R2E/Qwen 3.5 study shape used for the
-`swe-qwen35-r2e-wlogging-64k-30turn-pp2real-32train32gen-4h-*` runs on
-OCI-HSG. It is intentionally verbose so the run can be reproduced without
-depending on local shell wrappers.
+The following template is site-neutral. Fill in the required host paths and
+Slurm values in the environment before launching; the `:?` guards fail early if
+a required value is missing.
 
-Run from the GitHub RL checkout on branch `arigazzi/qwen35-PR-clean`:
+Run from an RL checkout that contains this directory:
 
 ```bash
-cd /path/to/RL
-git fetch origin
-git checkout arigazzi/qwen35-PR-clean
-git pull --ff-only origin arigazzi/qwen35-PR-clean
+: "${RL_CHECKOUT_DIR:?set to the host RL checkout path}"
+cd "${RL_CHECKOUT_DIR}"
 
 stamp=$(date +%Y%m%d-%H%M%S)
-export EXP_NAME="swe-qwen35-r2e-wlogging-64k-30turn-pp2real-32train32gen-4h-qwen35branch-${stamp}"
+export EXP_NAME="${EXP_NAME:-swe-qwen35-r2e-${stamp}}"
 
 export REPO_LOCATION="$PWD"
 export RECIPE=qwen_35/configs/grpo_qwen35_397b_swe_openhands_async.yaml
-# Use a site-local image built from docker/Dockerfile.gym_bleeding_edge, or an
-# equivalent Gym-capable NeMo RL image.
-export CONTAINER_IMAGE_PATH=/path/to/nemo-rl-gym-bleeding-edge.sqsh
 
-export SLURM_ACCOUNT=coreai_mlperf_training
-export SLURM_PARTITION=batch
-export SLURM_QOS=short
-export SBATCH_QOS=short
-export SBATCH_GRES=gpu:4
-export SLURM_TIME=4:00:00
+: "${CONTAINER_IMAGE_PATH:?set to a Gym-capable NeMo RL image}"
+: "${SLURM_ACCOUNT:?set to the Slurm account}"
+: "${SLURM_PARTITION:?set to the Slurm partition}"
+export GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
+export TRAIN_NODES="${TRAIN_NODES:-32}"
+export GEN_NODES="${GEN_NODES:-32}"
+export NODES="${NODES:-$((TRAIN_NODES + GEN_NODES))}"
+export SLURM_TIME="${SLURM_TIME:-4:00:00}"
+export SBATCH_GRES="${SBATCH_GRES:-gpu:${GPUS_PER_NODE}}"
 
-export GPUS_PER_NODE=4
-export TRAIN_NODES=32
-export GEN_NODES=32
-export NODES=64
+: "${HF_CKPT_PATH:?set to the host Qwen 3.5 HF checkpoint directory}"
+export CONTAINER_HF_CKPT_PATH="${CONTAINER_HF_CKPT_PATH:-${HF_CKPT_PATH}}"
 
-export HF_CKPT_PATH=/lustre/fsw/portfolios/coreai/projects/coreai_mlperf_training/users/arigazzi/nemotron3_ultra_550b/hf_home/hub/models--Qwen--Qwen3.5-397B-A17B/snapshots/8472618112abcbd45acbcdc58436aff4233c23f7
-export CONTAINER_HF_CKPT_PATH="$HF_CKPT_PATH"
-export NRL_MEGATRON_CHECKPOINT_DIR=/lustre/fsw/portfolios/coreai/projects/coreai_mlperf_training/users/arigazzi/nemotron3_ultra_550b/mcore_ckpt_cache
-export CONTAINER_NRL_MEGATRON_CHECKPOINT_DIR="$NRL_MEGATRON_CHECKPOINT_DIR"
+: "${NRL_MEGATRON_CHECKPOINT_DIR:?set to the host Megatron checkpoint directory}"
+export CONTAINER_NRL_MEGATRON_CHECKPOINT_DIR="${CONTAINER_NRL_MEGATRON_CHECKPOINT_DIR:-/inputs/nemo_gym/mcore_ckpt}"
 
-export NEMO_GYM_SWE_TRAIN_DATA_PATH=/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/arigazzi/grpo-studies/data_swe/r2e_easy_l20_train.with_sifs.jsonl
-export NEMO_GYM_SWE_VALIDATION_DATA_PATH=/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/arigazzi/grpo-studies/data_swe/r2e_easy_l20_val.with_sifs.jsonl
-export CONTAINER_NEMO_GYM_SWE_TRAIN_DATA_PATH=/inputs/nemo_gym/data/train.jsonl
-export CONTAINER_NEMO_GYM_SWE_VALIDATION_DATA_PATH=/inputs/nemo_gym/data/validation.jsonl
+: "${NEMO_GYM_SWE_TRAIN_DATA_PATH:?set to the host SWE train JSONL}"
+: "${NEMO_GYM_SWE_VALIDATION_DATA_PATH:?set to the host SWE validation JSONL}"
+export CONTAINER_NEMO_GYM_SWE_TRAIN_DATA_PATH="${CONTAINER_NEMO_GYM_SWE_TRAIN_DATA_PATH:-/inputs/nemo_gym/data/train.jsonl}"
+export CONTAINER_NEMO_GYM_SWE_VALIDATION_DATA_PATH="${CONTAINER_NEMO_GYM_SWE_VALIDATION_DATA_PATH:-/inputs/nemo_gym/data/validation.jsonl}"
 
-export NEMO_GYM_SWE_SIF_DIR=/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/swe-gym
-export CONTAINER_NEMO_GYM_SWE_SIF_DIR="$NEMO_GYM_SWE_SIF_DIR"
-export NEMO_GYM_SWE_FALLBACK_SIF_DIR=/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/users/hfilaretov/data/nemotron-ultra-swe
+: "${NEMO_GYM_SWE_SIF_DIR:?set to the host directory containing SWE task SIF images}"
+export CONTAINER_NEMO_GYM_SWE_SIF_DIR="${CONTAINER_NEMO_GYM_SWE_SIF_DIR:-/inputs/nemo_gym/sif}"
 
-# Some systems, such as Ptyche, need `/dev/fuse:/dev/fuse` appended to
-# EXTRA_MOUNTS for nested SIF execution. OCI-HSG has not required it in this
-# recipe; add it only if the target cluster reports FUSE/apptainer mount errors.
+# Optional: set when the dataset references SIF images outside the primary SIF root.
+# export NEMO_GYM_SWE_FALLBACK_SIF_DIR="${FALLBACK_SIF_ROOT:?set to the fallback SIF root}"
+
+# Optional: some clusters need FUSE for nested SIF execution.
+# export EXTRA_MOUNTS="${EXTRA_MOUNTS:+${EXTRA_MOUNTS},}/dev/fuse:/dev/fuse"
 
 # Default is 65535 for a 64k context run, leaving one token of headroom so
 # vLLM does not reject prompts at exactly/just above max_model_len.
 export QWEN35_TRUNCATE_PROMPT_TOKENS=65535
 export NEMO_RL_QWEN35_TRUNCATE_PROMPT_TOKENS=65535
-```
-
-On Lyris, use the cluster-local paths instead. The primary R2E root covers the
-current R2E train/validation JSONL there, so leave
-`NEMO_GYM_SWE_FALLBACK_SIF_DIR` unset unless a future dataset needs it. Lyris
-does require `/dev/fuse` for nested R2E SIF execution:
-
-```bash
-export CONTAINER_IMAGE_PATH=/lustre/fsw/coreai_mlperf_training/users/${USER}/containers/nemo-rl-gym-bleeding-edge
-export HF_CKPT_PATH=/lustre/fsw/coreai_mlperf_training/users/arigazzi/nemotron3_ultra_550b/hf_home/hub/models--Qwen--Qwen3.5-397B-A17B/snapshots/8472618112abcbd45acbcdc58436aff4233c23f7
-export CONTAINER_HF_CKPT_PATH="$HF_CKPT_PATH"
-export NRL_MEGATRON_CHECKPOINT_DIR=/lustre/fsw/coreai_mlperf_training/users/arigazzi/nemotron3_ultra_550b/mcore_ckpt_cache
-export CONTAINER_NRL_MEGATRON_CHECKPOINT_DIR="$NRL_MEGATRON_CHECKPOINT_DIR"
-export NEMO_GYM_SWE_TRAIN_DATA_PATH=/lustre/fsw/coreai_mlperf_training/users/arigazzi/grpo-studies/data_swe/r2e_easy_l20_train.with_sifs.jsonl
-export NEMO_GYM_SWE_VALIDATION_DATA_PATH=/lustre/fsw/coreai_mlperf_training/users/arigazzi/grpo-studies/data_swe/r2e_easy_l20_val.with_sifs.jsonl
-export NEMO_GYM_SWE_SIF_DIR=/lustre/fsw/coreai_mlperf_training/users/hfilaretov/data
-unset NEMO_GYM_SWE_FALLBACK_SIF_DIR
-export EXTRA_MOUNTS=/dev/fuse:/dev/fuse
 ```
 
 Then launch. The recipe owns the R2E SIF formatter list; do not pass it as a
@@ -307,8 +275,8 @@ bash examples/nemo_gym/launch_nemo_gym_multinode_training.sh \
 
 Notes:
 
-- `SBATCH_GRES=gpu:4` is required on OCI-HSG `batch`; without it Slurm rejects
-  the job because no GPU TRES is requested.
+- Some Slurm partitions require `SBATCH_GRES` or `SLURM_GRES`; without a GPU
+  TRES request, the scheduler may reject the job.
 - The Qwen wrapper owns the stable training HPs and R2E SIF formatter list.
   Do not pass correctness-critical knobs such as sequence packing, parser
   settings, token IDs, or formatter paths as CLI overrides.
