@@ -990,9 +990,11 @@ class TestTopkLogitsPostProcessor:
 
         mock_data_dict = MagicMock()
         mock_data_dict.__getitem__ = MagicMock(
-            side_effect=lambda key: torch.tensor([[1, 2, 3, 4, 5]])
-            if key == "input_ids"
-            else torch.tensor([5])
+            side_effect=lambda key: (
+                torch.tensor([[1, 2, 3, 4, 5]])
+                if key == "input_ids"
+                else torch.tensor([5])
+            )
         )
 
         mock_topk_vals = torch.randn(1, 5, k)
@@ -1034,9 +1036,11 @@ class TestTopkLogitsPostProcessor:
 
         mock_data_dict = MagicMock()
         mock_data_dict.__getitem__ = MagicMock(
-            side_effect=lambda key: torch.tensor([[1, 2, 3, 4, 5, 0, 0, 0]])
-            if key == "input_ids"
-            else torch.tensor([5])
+            side_effect=lambda key: (
+                torch.tensor([[1, 2, 3, 4, 5, 0, 0, 0]])
+                if key == "input_ids"
+                else torch.tensor([5])
+            )
         )
 
         mock_topk_vals = torch.randn(1, 8, k)
@@ -1082,9 +1086,9 @@ class TestTopkLogitsPostProcessor:
 
         mock_data_dict = MagicMock()
         mock_data_dict.__getitem__ = MagicMock(
-            side_effect=lambda key: torch.tensor([[1, 2, 3]])
-            if key == "input_ids"
-            else torch.tensor([3])
+            side_effect=lambda key: (
+                torch.tensor([[1, 2, 3]]) if key == "input_ids" else torch.tensor([3])
+            )
         )
 
         mock_topk.return_value = (
@@ -1130,9 +1134,11 @@ class TestTopkLogitsPostProcessor:
 
         mock_data_dict = MagicMock()
         mock_data_dict.__getitem__ = MagicMock(
-            side_effect=lambda key: torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]])
-            if key == "input_ids"
-            else torch.tensor([8])
+            side_effect=lambda key: (
+                torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]])
+                if key == "input_ids"
+                else torch.tensor([8])
+            )
         )
 
         # distributed_vocab_topk returns local (CP-sharded) results
@@ -1196,9 +1202,11 @@ class TestTopkLogitsPostProcessor:
 
         mock_data_dict = MagicMock()
         mock_data_dict.__getitem__ = MagicMock(
-            side_effect=lambda key: torch.zeros(2, unpacked_seqlen, dtype=torch.long)
-            if key == "input_ids"
-            else torch.tensor([seq1_len, seq2_len])
+            side_effect=lambda key: (
+                torch.zeros(2, unpacked_seqlen, dtype=torch.long)
+                if key == "input_ids"
+                else torch.tensor([seq1_len, seq2_len])
+            )
         )
 
         # distributed_vocab_topk returns local (CP-sharded) results
