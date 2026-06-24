@@ -460,3 +460,6 @@ class PolicyConfig(TypedDict):
     quant_calib_size: NotRequired[int | None]
     quant_batch_size: NotRequired[int | None]
     quant_sequence_length: NotRequired[int | None]
+    # If true, use standard Megatron layer specs while keeping ModelOpt
+    # quantization enabled. Useful for faster QARL runs and logged in configs.
+    disable_modelopt_layer_spec: NotRequired[bool]
