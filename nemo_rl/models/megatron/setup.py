@@ -1148,20 +1148,6 @@ def setup_model_and_optimizer(
 
     pre_wrap_hook = []
 
-    # Inference-only workers (no optimizer) never train, so freeze all params.
-    # Fires for every init_optimizer=False caller (generation, reward model,
-    # distillation teachers), not just teachers.
-    if not load_optimizer:
-
-        def freeze_all_params(megatron_model):
-            if not isinstance(megatron_model, list):
-                megatron_model = [megatron_model]
-            for model_module in megatron_model:
-                for param in model_module.parameters():
-                    param.requires_grad = False
-
-        pre_wrap_hook.append(freeze_all_params)
-
     use_peft = policy_cfg["megatron_cfg"].get("peft", {}).get("enabled", False)
     draft_enabled = "draft" in policy_cfg and policy_cfg["draft"]["enabled"]
     resume_checkpoint_exists = (

@@ -2,9 +2,11 @@
 
 Multi-Teacher On-Policy Distillation (MOPD) distills one or more teacher models
 into the policy by replacing GRPO's reward-based advantage with a token-level
-teacher-minus-student log-probability gap. The student generates on-policy
-rollouts (optionally through NeMo Gym), each token is scored by a teacher, and
-the policy is updated to close the gap with the teacher.
+distillation advantage ([MiMo-V2-Flash Technical Report](https://arxiv.org/abs/2601.02780)).
+MOPD runs on async GRPO and collects rollouts through NeMo Gym, so the agent
+loop drives multi-turn / multi-step interaction. Each token of the resulting
+student rollout is scored by a teacher, and the policy is updated to close the
+gap with the teacher.
 
 Unlike the teacher-logit knowledge distillation in
 [On-policy Distillation](on-policy-distillation.md) (`run_distillation.py`), MOPD
@@ -14,8 +16,8 @@ collection.
 
 ## Advantage
 
-For each token `t`, the advantage is the stop-gradient teacher-minus-student
-gap:
+For each token `t`, the distillation advantage is the stop-gradient
+teacher-minus-student log-probability gap:
 
 ```
 Â_t = sg[ log π_teacher(t) − log π_student(t) ]
@@ -33,6 +35,9 @@ Enable MOPD in two places: select the advantage estimator and add the
 
 ```yaml
 grpo:
+  # MOPD runs on async GRPO with NeMo Gym rollouts.
+  async_grpo:
+    enabled: true
   adv_estimator:
     name: opd
   # OPD subtracts a real prev_logprobs, so it must not be skipped.
@@ -105,3 +110,9 @@ The reference recipe self-distills `Qwen/Qwen3-1.7B` (student == teacher) across
 3 nodes (1 policy + 1 vLLM + 1 teacher) with sequence packing enabled. Because
 student and teacher are identical, the OPD loss stays near zero — it is a
 correctness smoke test, not a demonstration of distillation gains.
+
+## References
+
+- LLM-Core Xiaomi, *MiMo-V2-Flash Technical Report*, which introduces the
+  multi-teacher on-policy distillation paradigm:
+  [arxiv.org/abs/2601.02780](https://arxiv.org/abs/2601.02780)
