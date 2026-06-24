@@ -244,7 +244,7 @@ def create_teacher_worker_groups(
     teacher_model_by_agent_name = dict(opd_cfg.get("teacher_model_by_agent_name", {}))
 
     # A non-strict run falls back to default_teacher_alias for unmapped agents, so
-    # it must itself be a mapped agent — fail at setup, not with a mid-training KeyError.
+    # it must itself be a mapped agent.
     default_teacher_alias = opd_cfg.get("default_teacher_alias")
     if (
         not opd_cfg.get("strict_agent_name_match", False)

@@ -24,9 +24,16 @@ teacher-minus-student log-probability gap:
 ```
 
 `log π_student` is the policy's `prev_logprobs` and `log π_teacher` is computed
-by the teacher worker group at collection time. Because the advantage subtracts
-a real `prev_logprobs`, MOPD requires the student log-probabilities to actually
-be computed — see [Configuration](#configuration).
+by the teacher worker group at collection time. Maximizing this advantage is
+reverse-KL minimization — it pushes the student toward the teacher's token
+distribution — but, unlike forward-KL logit distillation, it needs only the
+teacher's log-probability for the *sampled* token rather than the full
+vocabulary distribution.
+
+The advantage is applied only to trained (assistant) tokens via the loss mask;
+tool / environment tokens contribute zero. Because the advantage subtracts a
+real `prev_logprobs`, MOPD requires the student log-probabilities to actually be
+computed — see [Configuration](#configuration).
 
 ## Configuration
 
@@ -44,10 +51,15 @@ grpo:
   seq_logprob_error_threshold: 2.0
 
 loss_fn:
-  # REINFORCE-style update recommended by the MOPD paper.
+  # REINFORCE form (drop the PPO probability-ratio clipping); on-policy
+  # correction is handled by the ICE-POP gate below instead.
   disable_ppo_ratio: true
+  # ICE-POP hard gate: zero tokens whose train/inference importance-sampling
+  # weight falls outside bounds, correcting async off-policy drift.
   use_importance_sampling_correction: true
   truncated_importance_sampling_type: icepop
+  # Teacher distillation is the entire learning signal — no reference-policy KL.
+  reference_policy_kl_penalty: 0.0
 
 on_policy_distillation:
   enabled: true
@@ -86,12 +98,29 @@ on_policy_distillation:
 > `grpo.seq_logprob_error_threshold`), because the advantage would silently
 > degrade to `teacher_logprobs − 0`.
 
+### Teacher routing
+
+Each rollout sample carries its NeMo Gym `agent_ref`. At collection time the
+agent name is resolved to a teacher alias (`teacher_model_by_agent_name`, falling
+back to `default_teacher_alias`), samples are grouped by teacher, and each group
+is scored by exactly one teacher — there is no ensemble averaging across
+teachers. When several aliases map to the same checkpoint,
+`deduplicate_shared_teacher_checkpoints` collapses them onto a single worker
+group so they share GPUs.
+
 ### Resourcing
 
-Non-colocated teachers run on their own nodes, reserved from the policy's node
-budget: with a total of `total_nodes`, the teacher worker groups take
-`sum(num_nodes)` nodes and the policy uses the remainder. Size the cluster so
-the policy, generation, and teacher groups all fit.
+Non-colocated teachers each get their own Ray cluster on dedicated GPUs (they
+are queried every rollout group, so time-sharing with the policy/generation
+would serialize and destroy the async overlap). Their nodes are reserved from
+the policy's budget: with `total_nodes` total, the teacher groups take
+`sum(num_nodes)` and the policy uses the remainder (setup fails if nothing is
+left for the policy). Deduplicated teachers share one group's nodes.
+
+For example, the reference 3-node recipe lays out: 1 node policy (student,
+trainable) + 1 node vLLM generation (frozen) + 1 node teacher (frozen). Ten
+distinct teachers at 1 node each would instead add 10 nodes on top of the
+policy and generation nodes.
 
 ## Running MOPD
 
