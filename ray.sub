@@ -298,10 +298,13 @@ export NRL_GPU_CPU_AFFINITY_FILE="/tmp/nrl_gpu_cpu_affinity"
 # nvidia-smi topo -m's CPU Affinity column is unreliable on GB200 (empty for
 # GPUs not directly attached to the socket). Use NUMA Affinity (always
 # populated, at field NF-1 since GPU NUMA ID is last) and look up the
-# node-local CPU list from sysfs.
+# node-local CPU list from sysfs. On GB200 the NUMA Affinity column can be a
+# list like "0,2-17" (the GPU-local CPU NUMA node plus the GPU's HBM NUMA
+# nodes); take the first entry, which is the local CPU NUMA node.
 nvidia-smi topo -m 2>/dev/null | awk '/^GPU[0-9]/ {
   gpu = \$1; sub(/GPU/, "", gpu)
   numa = \$(NF-1)
+  sub(/[,-].*/, "", numa)
   if (numa ~ /^[0-9]+\$/) print gpu, numa
 }' | while read -r _gpu _numa; do
   _cpulist=\$(cat "/sys/devices/system/node/node\${_numa}/cpulist" 2>/dev/null)
