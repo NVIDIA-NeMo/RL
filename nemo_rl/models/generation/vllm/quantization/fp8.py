@@ -144,6 +144,12 @@ def apply_fp8_patches(self, fp8_config):
         )
         fp8_state.vllm_patches.append(
             patch(
+                "vllm.model_executor.layers.quantization.modelopt.ModelOptMxFp8FusedMoE.create_weights",
+                create_weights_mxfp8_moe,
+            )
+        )
+        fp8_state.vllm_patches.append(
+            patch(
                 "vllm.model_executor.layers.quantization.modelopt.ModelOptMxFp8FusedMoE.process_weights_after_loading",
                 process_weights_after_loading_mxfp8_moe,
             )
@@ -598,7 +604,6 @@ def process_weights_after_loading(self, layer) -> None:
 
 def process_weights_after_loading_mxfp8_linear(self, layer) -> None:
     from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
-        Mxfp8LinearBackend,
         swizzle_mxfp8_scale,
     )
     from vllm.model_executor.parameter import ModelWeightParameter
@@ -607,7 +612,28 @@ def process_weights_after_loading_mxfp8_linear(self, layer) -> None:
         raise ValueError(
             f"MXFP8 linear layer weight must be 2D, but got {layer.weight.ndim}D"
         )
-    assert self.backend == Mxfp8LinearBackend.FLASHINFER_CUTLASS
+
+    backend = getattr(self, "backend", None)
+    if backend is not None:
+        try:
+            from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+                Mxfp8LinearBackend,
+            )
+        except ImportError:
+            if "FLASHINFER_CUTLASS" not in str(backend):
+                raise AssertionError(
+                    f"Unsupported MXFP8 linear backend for refit: {backend}"
+                )
+        else:
+            assert backend == Mxfp8LinearBackend.FLASHINFER_CUTLASS
+    else:
+        kernel = getattr(self, "kernel", None)
+        kernel_name = type(kernel).__name__ if kernel is not None else None
+        if "FlashInferCutlass" not in str(kernel_name):
+            raise AssertionError(
+                f"Unsupported MXFP8 linear kernel for refit: {kernel_name}"
+            )
+
     weight = layer.weight.data  # [N, K]
     N, K = weight.shape
 
@@ -636,6 +662,110 @@ def process_weights_after_loading_mxfp8_linear(self, layer) -> None:
         weight_scale_2d = weight_scale[:N, :scale_k].contiguous()
         weight_scale_swizzled = swizzle_mxfp8_scale(weight_scale_2d, M=N, K=K)
         layer.weight_scale.copy_(weight_scale_swizzled.contiguous())
+
+
+def create_weights_mxfp8_moe(
+    self,
+    layer: torch.nn.Module,
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size_per_partition: int,
+    params_dtype: torch.dtype,
+    **extra_weight_attrs,
+):
+    """Create ModelOpt MXFP8 MoE weights without assigning read-only vLLM attrs.
+
+    vLLM 0.20.0's ModelOpt MXFP8 path writes hidden/intermediate sizes onto
+    FusedMoE, but those are read-only properties backed by moe_config. Keep the
+    upstream allocation behavior while relying on those existing properties.
+    """
+    from vllm.model_executor.layers.fused_moe.layer import (
+        FusedMoeWeightScaleSupported,
+    )
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+        MXFP8_BLOCK_SIZE,
+        MXFP8_SCALE_DTYPE,
+        MXFP8_VALUE_DTYPE,
+    )
+    from vllm.model_executor.parameter import ModelWeightParameter
+    from vllm.model_executor.utils import set_weight_attrs
+
+    layer.orig_dtype = params_dtype
+    if hidden_size % MXFP8_BLOCK_SIZE != 0:
+        raise ValueError(
+            f"MXFP8 MoE requires hidden_size divisible by {MXFP8_BLOCK_SIZE}, "
+            f"got {hidden_size}."
+        )
+    if intermediate_size_per_partition % MXFP8_BLOCK_SIZE != 0:
+        raise ValueError(
+            "MXFP8 MoE requires intermediate_size_per_partition divisible by "
+            f"{MXFP8_BLOCK_SIZE}, got {intermediate_size_per_partition}."
+        )
+
+    layer.num_experts = num_experts
+    weight_loader = extra_weight_attrs.get("weight_loader")
+    w13_num_shards = 2 if self.moe.is_act_and_mul else 1
+
+    w13_weight = ModelWeightParameter(
+        data=torch.empty(
+            num_experts,
+            w13_num_shards * intermediate_size_per_partition,
+            hidden_size,
+            dtype=MXFP8_VALUE_DTYPE,
+        ),
+        input_dim=2,
+        output_dim=1,
+        weight_loader=weight_loader,
+    )
+    layer.register_parameter("w13_weight", w13_weight)
+
+    w2_weight = ModelWeightParameter(
+        data=torch.empty(
+            num_experts,
+            hidden_size,
+            intermediate_size_per_partition,
+            dtype=MXFP8_VALUE_DTYPE,
+        ),
+        input_dim=2,
+        output_dim=1,
+        weight_loader=weight_loader,
+    )
+    layer.register_parameter("w2_weight", w2_weight)
+
+    w13_weight_scale = ModelWeightParameter(
+        data=torch.empty(
+            num_experts,
+            w13_num_shards * intermediate_size_per_partition,
+            hidden_size // MXFP8_BLOCK_SIZE,
+            dtype=MXFP8_SCALE_DTYPE,
+        ),
+        input_dim=2,
+        output_dim=1,
+        weight_loader=weight_loader,
+    )
+    layer.register_parameter("w13_weight_scale", w13_weight_scale)
+
+    w2_weight_scale = ModelWeightParameter(
+        data=torch.empty(
+            num_experts,
+            hidden_size,
+            intermediate_size_per_partition // MXFP8_BLOCK_SIZE,
+            dtype=MXFP8_SCALE_DTYPE,
+        ),
+        input_dim=2,
+        output_dim=1,
+        weight_loader=weight_loader,
+    )
+    layer.register_parameter("w2_weight_scale", w2_weight_scale)
+
+    set_weight_attrs(
+        layer.w13_weight_scale,
+        {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value},
+    )
+    set_weight_attrs(
+        layer.w2_weight_scale,
+        {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value},
+    )
 
 
 def process_weights_after_loading_moe(self, layer) -> None:
