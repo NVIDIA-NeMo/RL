@@ -89,8 +89,9 @@ on_policy_distillation:
 
 > [!NOTE]
 > Teachers run the Megatron backend in inference-only mode. A DTensor-configured
-> policy is rejected for the teacher, and PEFT / draft modules are stripped from
-> the teacher config so adapters are never attached to the frozen teacher.
+> policy is rejected for the teacher; PEFT / draft modules are stripped so
+> adapters are never attached to the frozen teacher; and teachers run
+> unquantized (a policy `quant_cfg` is ignored, with a warning).
 
 > [!NOTE]
 > `adv_estimator: opd` fails fast at setup if the config would zero

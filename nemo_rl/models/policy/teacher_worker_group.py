@@ -20,6 +20,7 @@ in inference-only mode for a single teacher model checkpoint.
 
 from __future__ import annotations
 
+import warnings
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -162,6 +163,14 @@ class TeacherWorkerGroup:
             cfg["megatron_cfg"]["peft"]["enabled"] = False
         if "draft" in cfg:
             cfg["draft"]["enabled"] = False
+        # The teacher uses the plain Megatron worker, so a student-side quant_cfg
+        # would be silently ignored. Drop it explicitly and warn instead.
+        if cfg.get("quant_cfg") is not None:
+            warnings.warn(
+                f"Teacher '{self.alias}': quantization is not supported for teachers; "
+                "running the teacher unquantized (ignoring the policy's quant_cfg)."
+            )
+            cfg["quant_cfg"] = None
 
         tp = teacher_cfg.tensor_model_parallel_size
         pp = teacher_cfg.pipeline_model_parallel_size
