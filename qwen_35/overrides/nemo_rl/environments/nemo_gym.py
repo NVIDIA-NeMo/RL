@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
-import os
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TypedDict
@@ -45,30 +43,6 @@ from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.utils.timer import Timer
 
 
-def get_nemo_gym_uv_cache_dir() -> Optional[str]:
-    """Return the uv cache directory inside a container, or None outside one.
-
-    Inside a container (NRL_CONTAINER=1), returns the uv cache location so Gym
-    stores its caches in the expected shared path. Returns None outside a
-    container, meaning the caller should omit this arg and let Gym create the
-    cache locally (the default when you may not be able to write to /opt).
-    """
-    if not os.environ.get("NRL_CONTAINER"):
-        return None
-    return subprocess.check_output(["uv", "cache", "dir"]).decode().strip()
-
-
-def get_nemo_gym_venv_dir() -> Optional[str]:
-    """Return the NeMo Gym venv directory from NEMO_GYM_VENV_DIR, or None.
-
-    Returns the value of NEMO_GYM_VENV_DIR if set, otherwise None. When None
-    the caller should omit this arg and let Gym create venvs locally (the
-    default when a container is not used since you may not be able to write
-    to /opt).
-    """
-    return os.environ.get("NEMO_GYM_VENV_DIR")
-
-
 class NemoGymConfig(TypedDict):
     model_name: str
     base_urls: List[str]
@@ -76,7 +50,6 @@ class NemoGymConfig(TypedDict):
     ray_namespace: Optional[str]
     initial_global_config_dict: Dict[str, Any]
     invalid_tool_call_patterns: Optional[List[str]]  # Substrings in assistant text content that indicate an invalid tool call (default: ["<tool_call>", "</tool_call>", "<function_call>", "</function_call>"])
-    thinking_tags: Optional[List[str]]  # Thinking tags to check for malformed usage (default: ["<think>", "</think>"])
 
 
 def _summarize_token_ids(token_ids: Any, limit: int = 32) -> str:
@@ -100,24 +73,6 @@ def _first_token_mismatch(left: torch.Tensor, right: torch.Tensor) -> Optional[i
     if len(left) != len(right):
         return compare_len
     return None
-
-
-def _timer_with_optional_context(context: dict[str, Any]) -> Timer:
-    try:
-        return Timer(context=context)
-    except TypeError as exc:
-        if "context" not in str(exc):
-            raise
-        return Timer()
-
-
-def _timer_time(timer: Timer, label: str, should_log: bool = False):
-    try:
-        return timer.time(label=label, should_log=should_log)
-    except TypeError as exc:
-        if "should_log" not in str(exc):
-            raise
-        return timer.time(label=label)
 
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
@@ -236,18 +191,10 @@ Depending on your data shape, you may want to change these values."""
     ) -> tuple[list[dict], dict]:
         from collections import Counter
 
-        try:
-            from nemo_rl.utils.fastokens import maybe_patch_fastokens
-        except ImportError:
-            def maybe_patch_fastokens():
-                return None
-
-        maybe_patch_fastokens()
-
         if not hasattr(self, "rch"):
             self._spinup()
 
-        timer = _timer_with_optional_context({"worker": "nemo_gym"})
+        timer = Timer()
 
         timer.start("_run_rollouts_total")
         max_attempts, trial = self.rollout_max_attempts_to_avoid_lp_nan, 0
@@ -264,7 +211,7 @@ Depending on your data shape, you may want to change these values."""
             nemo_rl_results = []
             logprob_contains_nan = False
             for task in nemo_gym_result_iterator:
-                with _timer_time(timer, label=f"{timer_prefix}/await_results", should_log=False):
+                with timer.time(f"{timer_prefix}/await_results"):
                     try:
                         nemo_gym_row, nemo_gym_result = await task
                     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
@@ -280,7 +227,7 @@ Depending on your data shape, you may want to change these values."""
                             print("EXCEPTION RESULT", e.response_content, file=sys.stderr)
                         raise e
 
-                with _timer_time(timer, label=f"{timer_prefix}/postprocess_results", should_log=False):
+                with timer.time(f"{timer_prefix}/postprocess_results"):
                     nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
                         nemo_gym_result, tokenizer
                     )
