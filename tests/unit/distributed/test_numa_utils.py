@@ -85,7 +85,10 @@ def _write_affinity_file_from_topo() -> str | None:
             continue
         parts = line.split()
         gpu_idx = parts[0].replace("GPU", "")
-        numa = parts[-2]  # NUMA Affinity column (ray.sub parses $(NF-1))
+        # NUMA Affinity column (ray.sub parses $(NF-1)). On GB200 this is a list
+        # like "0,2-17" (the GPU-local CPU NUMA node plus the GPU's HBM NUMA
+        # nodes); take the first entry, which is the local CPU NUMA node.
+        numa = parts[-2].split(",")[0].split("-")[0]
         if not numa.isdigit():
             continue
         try:
