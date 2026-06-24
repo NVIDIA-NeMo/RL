@@ -40,6 +40,7 @@ def prepare_loss_input(
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
     d2t: Optional[torch.Tensor] = None,
+    chunk_size: Optional[int] = None,
 ) -> tuple[dict[str, Any], BatchedDataDict[Any]]:
     """Prepare loss input for a loss function.
 
@@ -52,6 +53,9 @@ def prepare_loss_input(
         context_parallel_group: Context parallel group.
         sampling_params: Sampling parameters.
         d2t: Draft to target token mapping.
+        chunk_size: Sequence-dim chunk size for the vocab-parallel logprob
+            computation (policy.logprob_chunk_size); avoids materializing
+            full-size float32 logits during training.
 
     Notes:
         vocab_parallel_rank, vocab_parallel_group, context_parallel_group are only used for megatron policy worker.
@@ -80,6 +84,7 @@ def prepare_loss_input(
                 vocab_parallel_group=vocab_parallel_group,
                 context_parallel_group=context_parallel_group,
                 sampling_params=sampling_params,
+                chunk_size=chunk_size,
             )
 
         # handle top-k/top-p filtering for logprobs, only used for ClippedPGLossFn now
@@ -102,6 +107,8 @@ def prepare_loss_input(
                     vocab_parallel_group=vocab_parallel_group,
                     context_parallel_group=context_parallel_group,
                     sampling_params=None,  # no filtering
+                    # Only reachable with top-k/top-p sampling active that has its own kernel path so don't chunk here
+                    chunk_size=None,
                 )
 
         loss_input = {"next_token_logprobs": logprobs}
@@ -282,6 +289,7 @@ def prepare_packed_loss_input(
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
+    chunk_size: Optional[int] = None,
 ) -> tuple[dict[str, Any], BatchedDataDict[Any]]:
     """Prepare loss input from packed logits in a single fused pass.
 
@@ -301,6 +309,9 @@ def prepare_packed_loss_input(
         vocab_parallel_group: Vocab parallel group.
         context_parallel_group: Context parallel group.
         sampling_params: Sampling parameters.
+        chunk_size: Sequence-dim chunk size for the logprob computation
+            (policy.logprob_chunk_size); avoids materializing full-size
+            float32 logits during training.
 
     Returns:
         tuple(loss_input, maybe_updated_data)
@@ -340,8 +351,15 @@ def prepare_packed_loss_input(
         roll_shift=-1,
     )
 
+    # With chunking, keep logits in their original dtype: the chunked logprob
+    # kernel casts each chunk to float32 internally.
+    use_chunking = chunk_size is not None and not need_top_k_or_top_p_filtering(
+        sampling_params
+    )
+    logits_for_logprobs = logits if use_chunking else logits.to(torch.float32)
+
     logprobs = from_parallel_logits_to_logprobs_packed_sequences(
-        logits.to(torch.float32),
+        logits_for_logprobs,
         packed_rolled_targets,
         cu_seqlens_q_padded,
         unpacked_seqlen,
@@ -351,6 +369,7 @@ def prepare_packed_loss_input(
         inference_only=False,
         cp_group=context_parallel_group,
         sampling_params=sampling_params,
+        chunk_size=chunk_size if use_chunking else None,
         target_is_pre_rolled=True,
     )
 
@@ -366,7 +385,7 @@ def prepare_packed_loss_input(
         ):
             data["curr_logprobs_unfiltered"] = (
                 from_parallel_logits_to_logprobs_packed_sequences(
-                    logits.to(torch.float32),
+                    logits_for_logprobs,
                     packed_rolled_targets,
                     cu_seqlens_q_padded,
                     unpacked_seqlen,
@@ -376,6 +395,7 @@ def prepare_packed_loss_input(
                     inference_only=False,
                     cp_group=context_parallel_group,
                     sampling_params=None,
+                    chunk_size=chunk_size if use_chunking else None,
                     target_is_pre_rolled=True,
                 )
             )
