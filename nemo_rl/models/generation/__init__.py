@@ -61,7 +61,7 @@ def configure_generation_config(
                 config["vllm_cfg"]["load_format"] = "auto"
 
         # MTP draft weights arrive via refit if the trainer trains the MTP layer.
-        # If the trainer does not train the MTP layer, the weights need to be 
+        # If the trainer does not train the MTP layer, the weights need to be
         # loaded from the checkpoint.
         config["_mtp_weights_from_refit"] = trains_mtp
 
