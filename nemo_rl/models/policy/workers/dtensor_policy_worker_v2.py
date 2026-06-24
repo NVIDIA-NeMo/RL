@@ -231,6 +231,13 @@ class DTensorPolicyWorkerV2Impl(
         # Apply TE patch until TE is upgraded to 2.10.0
         apply_transformer_engine_patch()
 
+        from nemo_rl.distributed.numa_utils import bind_to_gpu_numa
+
+        # Pin this worker to its GPU's NUMA-local CPUs/memory before model load
+        # (mirrors the Megatron and vLLM workers). FSDP's D2H paths — weight
+        # refit, optimizer/checkpoint offload — benefit too.
+        bind_to_gpu_numa()
+
         # Store configuration
         self.cfg = config
 
