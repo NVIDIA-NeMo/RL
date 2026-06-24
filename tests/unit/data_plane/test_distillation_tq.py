@@ -18,7 +18,10 @@ from types import SimpleNamespace
 
 import torch
 
+import pytest
+
 from nemo_rl.algorithms import distillation_sync
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.column_io import kv_first_write, read_columns, write_columns
 from nemo_rl.data_plane.interfaces import KVBatchMeta
@@ -31,7 +34,9 @@ from nemo_rl.data_plane.schema import (
 )
 from nemo_rl.data_plane.transport_metrics import (
     add_byte_metric_derivatives,
+    tensor_nbytes,
     topk_payload_nbytes,
+    valid_token_tensor_nbytes,
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -404,3 +409,165 @@ def test_topk_payload_metrics_account_for_valid_lengths() -> None:
 
     assert metrics["teacher_topk_payload_gib"] == 300 / float(1024**3)
     assert metrics["teacher_topk_payload_bytes_per_token"] == 10
+
+
+def test_dedupe_fields_preserves_first_occurrence_order() -> None:
+    assert distillation_sync._dedupe_fields() == []
+    assert distillation_sync._dedupe_fields(["a", "a", "b"]) == ["a", "b"]
+    # First occurrence across groups wins; tuples and lists interoperate.
+    assert distillation_sync._dedupe_fields(["a", "b"], ("b", "c"), ["a", "d"]) == [
+        "a",
+        "b",
+        "c",
+        "d",
+    ]
+
+
+def test_as_row_aligned_tensor_branches() -> None:
+    rows = 3
+    valid = torch.arange(rows * 4, dtype=torch.float32).reshape(rows, 4)
+
+    # Row-aligned 2D tensor is returned unchanged.
+    assert distillation_sync._as_row_aligned_tensor(valid, rows) is valid
+    # Non-tensors are not TQ-storable.
+    assert distillation_sync._as_row_aligned_tensor([1, 2, 3], rows) is None
+    # Scalar (0-dim) tensors carry no row axis.
+    assert distillation_sync._as_row_aligned_tensor(torch.tensor(1.0), rows) is None
+    # Row-count mismatch is rejected.
+    assert distillation_sync._as_row_aligned_tensor(valid, rows + 1) is None
+    # PackedTensor is unwrapped via as_tensor() before the row check.
+    packed = PackedTensor(valid, dim_to_pack=0)
+    result = distillation_sync._as_row_aligned_tensor(packed, rows)
+    assert result is not None and result.shape == (rows, 4)
+
+
+def test_aggregate_teacher_topk_transport_results_skips_empty_and_none() -> None:
+    metrics = distillation_sync._aggregate_teacher_topk_transport_results([{}, None])
+    assert metrics["teacher_topk_payload_bytes"] == 0
+    assert metrics["driver_teacher_topk_bytes_avoided"] == 0
+    assert metrics["tq_teacher_topk_write_ms_max"] == 0.0
+
+
+def test_aggregate_teacher_topk_transport_results_sums_and_maxes() -> None:
+    metrics = distillation_sync._aggregate_teacher_topk_transport_results(
+        [
+            {
+                "teacher_topk_payload_bytes": 100,
+                "tq_teacher_topk_write_num_samples": 2,
+                "tq_teacher_topk_write_ms": 1.5,
+            },
+            {
+                "teacher_topk_payload_bytes": 200,
+                "tq_teacher_topk_write_num_samples": 4,
+                "tq_teacher_topk_write_ms": 0.5,
+            },
+        ]
+    )
+    assert metrics["teacher_topk_payload_bytes"] == 300
+    assert metrics["tq_teacher_topk_write_num_samples"] == 6
+    assert metrics["tq_teacher_topk_write_ms_sum"] == 2.0
+    assert metrics["tq_teacher_topk_write_ms_max"] == 1.5
+    # Avoided driver bytes are twice the resident payload (RX + TX hop).
+    assert metrics["driver_teacher_topk_bytes_avoided"] == 600
+
+
+def test_aggregate_teacher_topk_transport_results_rejects_non_mapping() -> None:
+    with pytest.raises(RuntimeError, match="scalar metric acks"):
+        distillation_sync._aggregate_teacher_topk_transport_results([("not", "a map")])
+
+
+def test_aggregate_teacher_topk_transport_results_rejects_tensor_payloads() -> None:
+    with pytest.raises(RuntimeError, match="tensor payloads"):
+        distillation_sync._aggregate_teacher_topk_transport_results(
+            [{"teacher_topk_payload_bytes": torch.zeros(2)}]
+        )
+
+
+def test_packing_args_for_policy_selects_branch() -> None:
+    dynamic_policy = SimpleNamespace(
+        use_dynamic_batches=True,
+        use_sequence_packing=False,
+        dynamic_batching_args={"sequence_length_round": 8},
+        cfg={"dynamic_batching": {"logprob_mb_tokens": 512}},
+    )
+    spa, dba = distillation_sync._packing_args_for_policy(
+        dynamic_policy, "logprob_mb_tokens"
+    )
+    assert spa is None
+    assert dba == {"sequence_length_round": 8, "max_tokens_per_microbatch": 512}
+
+    packing_policy = SimpleNamespace(
+        use_dynamic_batches=False,
+        use_sequence_packing=True,
+        sequence_packing_args={"algorithm": "first_fit"},
+        cfg={"sequence_packing": {"logprob_mb_tokens": 256}},
+    )
+    spa, dba = distillation_sync._packing_args_for_policy(
+        packing_policy, "logprob_mb_tokens"
+    )
+    assert dba is None
+    assert spa == {"algorithm": "first_fit", "max_tokens_per_microbatch": 256}
+
+    plain_policy = SimpleNamespace(
+        use_dynamic_batches=False, use_sequence_packing=False
+    )
+    assert distillation_sync._packing_args_for_policy(
+        plain_policy, "logprob_mb_tokens"
+    ) == (None, None)
+
+
+def test_stamp_policy_pad_seqlen_uses_pad_to_multiple_for_plain_policy() -> None:
+    policy = SimpleNamespace(use_dynamic_batches=False, use_sequence_packing=False)
+    meta = KVBatchMeta(
+        partition_id="train",
+        task_name="train",
+        sample_ids=["u0", "u1"],
+        fields=list(DISTILLATION_TRAIN_FIELDS),
+        sequence_lengths=[5, 7],
+        extra_info={"pad_to_multiple": 4},
+    )
+    distillation_sync._stamp_policy_pad_seqlen(
+        policy, meta, mb_tokens_key="logprob_mb_tokens"
+    )
+    # round_up(max(5, 7), max(4, 1)) == 8
+    assert meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] == 8
+
+
+def test_stamp_policy_pad_seqlen_honors_dynamic_sequence_length_round() -> None:
+    policy = SimpleNamespace(
+        use_dynamic_batches=True,
+        use_sequence_packing=False,
+        dynamic_batching_args={"sequence_length_round": 16},
+        cfg={"dynamic_batching": {"logprob_mb_tokens": 512}},
+    )
+    meta = KVBatchMeta(
+        partition_id="train",
+        task_name="train",
+        sample_ids=["u0"],
+        fields=list(DISTILLATION_TRAIN_FIELDS),
+        sequence_lengths=[5],
+    )
+    distillation_sync._stamp_policy_pad_seqlen(
+        policy, meta, mb_tokens_key="logprob_mb_tokens"
+    )
+    # round_up(5, max(1, 16)) == 16
+    assert meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] == 16
+
+
+def test_tensor_nbytes_counts_only_tensors() -> None:
+    assert tensor_nbytes("not a tensor") == 0
+    assert tensor_nbytes(torch.zeros((2, 3), dtype=torch.float32)) == 2 * 3 * 4
+    assert tensor_nbytes(torch.zeros((4,), dtype=torch.int64)) == 4 * 8
+
+
+def test_valid_token_tensor_nbytes_accounts_for_valid_prefix() -> None:
+    tensor = torch.zeros((2, 5, 3), dtype=torch.float32)
+    # No lengths -> full tensor.
+    assert valid_token_tensor_nbytes(tensor, None) == 2 * 5 * 3 * 4
+    # Lengths clamped to [0, max_seq_len]; trailing dims multiply through.
+    assert valid_token_tensor_nbytes(tensor, [5, 9]) == (5 + 5) * 3 * 4
+    assert valid_token_tensor_nbytes(tensor, [2, -1]) == (2 + 0) * 3 * 4
+    # Row-count mismatch falls back to the full tensor byte count.
+    assert valid_token_tensor_nbytes(tensor, [5]) == 2 * 5 * 3 * 4
+    # 1D tensors have no sequence axis -> full byte count.
+    assert valid_token_tensor_nbytes(torch.zeros((4,)), [2]) == 4 * 4
