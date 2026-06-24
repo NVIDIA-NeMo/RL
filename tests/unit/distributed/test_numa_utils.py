@@ -148,6 +148,21 @@ def _patch_affinity_path(path: str):
     return old
 
 
+def _split_available_cpus() -> tuple[list[int], list[int]] | tuple[None, None]:
+    """Split the CPUs available to this process into two non-empty groups.
+
+    Lets the CPU-binding tests exercise a real ``os.sched_setaffinity`` on any
+    host instead of hard-coding a 144-CPU (GB200) layout that fails on smaller
+    machines. Returns ``(group0, group1)`` as sorted lists, or ``(None, None)``
+    when there are fewer than 2 available CPUs to split.
+    """
+    avail = sorted(os.sched_getaffinity(0))
+    if len(avail) < 2:
+        return None, None
+    mid = len(avail) // 2
+    return avail[:mid], avail[mid:]
+
+
 # ---------------------------------------------------------------------------
 # Pure unit tests (no GPU or libnuma required)
 # ---------------------------------------------------------------------------
@@ -222,8 +237,17 @@ class TestBindToGpuNuma:
         monkeypatch.delenv("NRL_DISABLE_NUMA_BINDING", raising=False)
         monkeypatch.setenv("NRL_DISABLE_NUMA_MEMBIND", "1")
 
+        # Derive the cpulist from the CPUs actually available to this process so
+        # the test is host-portable. GPUs 0/1 map to the first CPU group, GPUs
+        # 2/3 to the second; binding GPU 2 should land us on the second group.
+        group0, group1 = _split_available_cpus()
+        if group1 is None:
+            pytest.skip("need >= 2 available CPUs to exercise NUMA CPU binding")
+        cpus0 = ",".join(map(str, group0))
+        cpus1 = ",".join(map(str, group1))
+
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
-            f.write("0:0-71\n1:0-71\n2:72-143\n3:72-143\n")
+            f.write(f"0:{cpus0}\n1:{cpus0}\n2:{cpus1}\n3:{cpus1}\n")
             f.flush()
 
             old_path = _patch_affinity_path(f.name)
@@ -231,7 +255,7 @@ class TestBindToGpuNuma:
                 result = bind_to_gpu_numa()
                 assert result is True
                 bound_cpus = os.sched_getaffinity(0)
-                assert bound_cpus == set(range(72, 144))
+                assert bound_cpus == set(group1)
             finally:
                 _patch_affinity_path(old_path)
                 os.unlink(f.name)
@@ -243,8 +267,15 @@ class TestBindToGpuNuma:
         monkeypatch.delenv("NRL_DISABLE_NUMA_BINDING", raising=False)
         monkeypatch.setenv("NRL_DISABLE_NUMA_MEMBIND", "1")
 
+        # Host-portable cpulist (see test_successful_cpu_binding).
+        group0, group1 = _split_available_cpus()
+        if group1 is None:
+            pytest.skip("need >= 2 available CPUs to exercise NUMA CPU binding")
+        cpus0 = ",".join(map(str, group0))
+        cpus1 = ",".join(map(str, group1))
+
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
-            f.write("0:0-71\n1:0-71\n2:72-143\n3:72-143\n")
+            f.write(f"0:{cpus0}\n1:{cpus0}\n2:{cpus1}\n3:{cpus1}\n")
             f.flush()
 
             old_path = _patch_affinity_path(f.name)
@@ -252,7 +283,7 @@ class TestBindToGpuNuma:
                 result = bind_to_gpu_numa()
                 assert result is True
                 bound_cpus = os.sched_getaffinity(0)
-                assert bound_cpus == set(range(72, 144))
+                assert bound_cpus == set(group1)
             finally:
                 _patch_affinity_path(old_path)
                 os.unlink(f.name)
