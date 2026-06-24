@@ -126,6 +126,7 @@ policy:
         tool_parser: qwen3_xml
         reasoning_parser: qwen3
     vllm_kwargs:
+      generation_config: vllm
       attention_backend: FLASH_ATTN
       compilation_config:
         backend: inductor
