@@ -77,7 +77,7 @@ policy:
     tensor_model_parallel_size: 4
     pipeline_model_parallel_size: 2
     context_parallel_size: 1
-    expert_model_parallel_size: 64
+    expert_model_parallel_size: 8
     expert_tensor_parallel_size: 1
     sequence_parallel: true
     moe_token_dispatcher_type: alltoall
