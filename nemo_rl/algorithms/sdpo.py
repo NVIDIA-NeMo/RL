@@ -34,6 +34,7 @@ import re
 from typing import Any, NotRequired, Optional, TypedDict, TypeVar, Union
 
 import torch
+from pydantic import BaseModel
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
@@ -45,6 +46,7 @@ from nemo_rl.algorithms.grpo import (
 )
 from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
 from nemo_rl.algorithms.loss import (
+    ClippedPGLossConfig,
     SDPOHybridLossConfig,
     SDPOHybridLossFn,
     SDPOLossConfig,
@@ -177,10 +179,11 @@ def _default_sdpo_save_state() -> SDPOSaveState:
     }
 
 
-class MasterConfig(TypedDict):
+class MasterConfig(BaseModel, extra="allow"):
     policy: PolicyConfig
     # SDPOLossConfig for pure SDPO; SDPOHybridLossConfig (carrying grpo_weight,
-    # nested sdpo/grpo blocks) for the SDPO+GRPO hybrid.
+    # nested sdpo/grpo blocks) for the SDPO+GRPO hybrid. The two are disambiguated
+    # by their required fields (success_reward_threshold vs grpo_weight).
     loss_fn: Union[SDPOLossConfig, SDPOHybridLossConfig]
     env: dict[str, Any]
     data: DataConfig
@@ -722,11 +725,10 @@ def setup(
         (policy, policy_generation, cluster, dataloader, val_dataloader,
          loss_fn, logger, checkpointer, sdpo_save_state, master_config)
     """
-    import copy
     from nemo_rl.algorithms.grpo import setup as grpo_setup
 
-    sdpo_config = master_config["sdpo"]
-    loss_config = master_config["loss_fn"]
+    sdpo_config = master_config.sdpo
+    loss_config = master_config.loss_fn
 
     # Build a GRPO-compatible master config by mapping shared fields.
     # grpo.setup only reads grpo_config for: num_prompts_per_step,
@@ -783,20 +785,31 @@ def setup(
         "use_importance_sampling_correction": False,
         "truncated_importance_sampling_ratio": None,
         "truncated_importance_sampling_ratio_min": None,
-        "truncated_importance_sampling_type": "tis",
+        "truncated_importance_sampling_type": None,
         "sequence_level_importance_ratios": False,
         "token_level_loss": True,
         "force_on_policy_ratio": False,
         "use_kl_in_reward": False,
     }
 
-    grpo_master_config = copy.copy(master_config)
-    grpo_master_config["grpo"] = grpo_config_stub
-    grpo_master_config["loss_fn"] = grpo_loss_fn_stub
+    # grpo.setup reads everything by attribute (master_config.policy, .loss_fn,
+    # .grpo, ...) and calls master_config.model_dump(), so it needs a Pydantic
+    # model, not a dict. model_copy gives a MasterConfig carrying the original
+    # policy/env/data/logger/cluster/checkpointing plus the injected GRPO blocks.
+    # The grpo block stays a plain dict (GRPOConfig is still a TypedDict, read via
+    # subscript), while loss_fn must be a ClippedPGLossConfig model because
+    # grpo.setup reads loss_config.force_on_policy_ratio / ClippedPGLossFn(cfg).
+    grpo_master_config = master_config.model_copy(
+        update={
+            "grpo": grpo_config_stub,
+            "loss_fn": ClippedPGLossConfig(**grpo_loss_fn_stub),
+        }
+    )
 
     (
         policy,
         policy_generation,
+        _nemo_gym,  # discard: SDPO uses task_to_env, not NeMo-Gym
         cluster,
         dataloader,
         val_dataloader,
@@ -808,8 +821,8 @@ def setup(
     ) = grpo_setup(grpo_master_config, tokenizer, dataset, val_dataset)
 
     # Replace GRPO loss with SDPO loss (or the SDPO+GRPO hybrid when the
-    # loss_fn config carries grpo_weight).
-    if "grpo_weight" in loss_config:
+    # loss_fn config is the hybrid variant carrying grpo_weight).
+    if isinstance(loss_config, SDPOHybridLossConfig):
         loss_fn: LossFunction = SDPOHybridLossFn(loss_config)
     else:
         loss_fn = SDPOLossFn(loss_config)
@@ -860,7 +873,7 @@ def sdpo_train(
     """Run SDPO training algorithm."""
     timer = Timer()
     timeout = TimeoutChecker(
-        timeout=master_config["checkpointing"]["checkpoint_must_save_by"],
+        timeout=master_config.checkpointing["checkpoint_must_save_by"],
         fit_last_save_time=True,
     )
     timeout.start_iterations()
@@ -872,8 +885,8 @@ def sdpo_train(
     POLICY_GENERATION_STALE = True
     assert policy_generation is not None
 
-    sdpo_cfg = master_config["sdpo"]
-    policy_cfg = master_config["policy"]
+    sdpo_cfg = master_config.sdpo
+    policy_cfg = master_config.policy
 
     current_step = sdpo_save_state["current_step"]
     total_steps = sdpo_save_state["total_steps"]
@@ -910,7 +923,7 @@ def sdpo_train(
         adv_cfg.setdefault("normalize_rewards", True)
         if adv_cfg["name"] != "grpo":
             raise ValueError(f"SDPO+GRPO hybrid only supports adv_estimator name 'grpo', " f"got {adv_cfg['name']!r}.")
-        adv_estimator = GRPOAdvantageEstimator(adv_cfg, master_config["loss_fn"])
+        adv_estimator = GRPOAdvantageEstimator(adv_cfg, master_config.loss_fn)
         print(
             f"  ✓ SDPO+GRPO hybrid: grpo_weight={loss_fn.grpo_weight}, "
             f"adv_estimator=grpo (loo={adv_cfg['use_leave_one_out_baseline']}, "
@@ -926,15 +939,16 @@ def sdpo_train(
             POLICY_GENERATION_STALE = False
         else:
             policy_generation.prepare_for_generation()
-        # grpo.validate() reads master_config["grpo"] for these keys; provide a shim.
-        _validate_cfg = {
-            **master_config,
-            "grpo": {
-                "max_val_samples": sdpo_cfg["max_val_samples"],
-                "val_batch_size": sdpo_cfg["val_batch_size"],
-                "max_rollout_turns": sdpo_cfg["max_rollout_turns"],
-            },
-        }
+        # grpo.validate() reads master_config.grpo for these keys; provide a shim.
+        _validate_cfg = master_config.model_copy(
+            update={
+                "grpo": {
+                    "max_val_samples": sdpo_cfg["max_val_samples"],
+                    "val_batch_size": sdpo_cfg["val_batch_size"],
+                    "max_rollout_turns": sdpo_cfg["max_rollout_turns"],
+                },
+            }
+        )
         val_metrics, _ = validate(
             policy_generation,
             val_dataloader,
@@ -1230,15 +1244,16 @@ def sdpo_train(
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(policy, policy_generation, colocated_inference)
                         POLICY_GENERATION_STALE = False
-                    # grpo.validate() reads master_config["grpo"] for these keys; provide a shim.
-                    _validate_cfg = {
-                        **master_config,
-                        "grpo": {
-                            "max_val_samples": sdpo_cfg["max_val_samples"],
-                            "val_batch_size": sdpo_cfg["val_batch_size"],
-                            "max_rollout_turns": sdpo_cfg["max_rollout_turns"],
-                        },
-                    }
+                    # grpo.validate() reads master_config.grpo for these keys; provide a shim.
+                    _validate_cfg = master_config.model_copy(
+                        update={
+                            "grpo": {
+                                "max_val_samples": sdpo_cfg["max_val_samples"],
+                                "val_batch_size": sdpo_cfg["val_batch_size"],
+                                "max_rollout_turns": sdpo_cfg["max_rollout_turns"],
+                            },
+                        }
+                    )
                     val_metrics, _ = validate(
                         policy_generation,
                         val_dataloader,
@@ -1274,14 +1289,14 @@ def sdpo_train(
                 )
 
                 timeout.mark_iteration()
-                should_save_by_step = is_last_step or total_steps % master_config["checkpointing"]["save_period"] == 0
+                should_save_by_step = is_last_step or total_steps % master_config.checkpointing["save_period"] == 0
                 should_save_by_timeout = timeout.check_save()
 
-                if master_config["checkpointing"]["enabled"] and (should_save_by_step or should_save_by_timeout):
+                if master_config.checkpointing["enabled"] and (should_save_by_step or should_save_by_timeout):
                     policy.prepare_for_training()
 
                     # Track metric for top-k checkpointing
-                    full_metric_name = master_config["checkpointing"]["metric_name"]
+                    full_metric_name = master_config.checkpointing["metric_name"]
                     if ":" in full_metric_name:
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
@@ -1298,7 +1313,7 @@ def sdpo_train(
                             else None
                         ),
                         tokenizer_path=os.path.join(checkpoint_path, "policy", "tokenizer"),
-                        checkpointing_cfg=master_config["checkpointing"],
+                        checkpointing_cfg=master_config.checkpointing,
                     )
                     torch.save(
                         dataloader.state_dict(),

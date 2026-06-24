@@ -42,25 +42,27 @@ def main() -> None:
         print(f"Overrides: {overrides}")
         config = parse_hydra_overrides(config, overrides)
 
-    config: MasterConfig = OmegaConf.to_container(config, resolve=True)
+    config = OmegaConf.to_container(config, resolve=True)
     print("Applied CLI overrides")
 
     print("Final config:")
     pprint.pprint(config)
 
-    config["logger"]["log_dir"] = get_next_experiment_dir(
-        config["logger"]["log_dir"]
+    config: MasterConfig = MasterConfig(**config)
+
+    config.logger["log_dir"] = get_next_experiment_dir(
+        config.logger["log_dir"]
     )
-    print(f"Using log directory: {config['logger']['log_dir']}")
+    print(f"Using log directory: {config.logger['log_dir']}")
 
     init_ray()
 
-    tokenizer = get_tokenizer(config["policy"]["tokenizer"])
-    assert config["policy"]["generation"] is not None, (
+    tokenizer = get_tokenizer(config.policy["tokenizer"])
+    assert config.policy["generation"] is not None, (
         "A generation config is required for SDPO"
     )
-    config["policy"]["generation"] = configure_generation_config(
-        config["policy"]["generation"],
+    config.policy["generation"] = configure_generation_config(
+        config.policy["generation"],
         tokenizer,
         has_refit_draft_weights=False,
     )
@@ -70,7 +72,7 @@ def main() -> None:
         val_dataset,
         task_to_env,
         val_task_to_env,
-    ) = setup_response_data(tokenizer, config["data"], config["env"])
+    ) = setup_response_data(tokenizer, config.data, config.env)
 
     (
         policy,

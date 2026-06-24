@@ -67,7 +67,7 @@ loss_fn:
     use_importance_sampling_correction: false
     truncated_importance_sampling_ratio: null
     truncated_importance_sampling_ratio_min: null
-    truncated_importance_sampling_type: "tis"
+    truncated_importance_sampling_type: null
     sequence_level_importance_ratios: false
     token_level_loss: true
     force_on_policy_ratio: false     # SDPO does one update per rollout; set true for strictly on-policy

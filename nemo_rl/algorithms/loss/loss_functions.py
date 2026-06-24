@@ -1115,7 +1115,7 @@ class DistillationLossFn(LossFunction):
 # ============================================================================
 
 
-class SDPOLossConfig(TypedDict):
+class SDPOLossConfig(BaseModel, extra="allow"):
     """Configuration for the SDPO (Self-Distilled Policy Optimization) loss.
 
     SDPO computes a logit-level KL between a student (current policy on the
@@ -1134,15 +1134,20 @@ class SDPOLossConfig(TypedDict):
         success_reward_threshold: 1.0 - minimum reward to count as "successful" (used by orchestration)
     """
 
-    kl_type: NotRequired[str]
-    mixed_kl_weight: NotRequired[float]
-    zero_outside_topk: NotRequired[bool]
+    # success_reward_threshold is intentionally REQUIRED (no default): it is the
+    # discriminator that distinguishes a pure-SDPO loss_fn from a hybrid one in
+    # the MasterConfig.loss_fn union (SDPOHybridLossConfig has no top-level
+    # success_reward_threshold, but does require grpo_weight). Giving it a default
+    # would let a hybrid block match this model and silently drop grpo_weight.
     success_reward_threshold: float
+    kl_type: str = "reverse"
+    mixed_kl_weight: float = 0.5
+    zero_outside_topk: bool = True
     # When penalty > 0, the loss adds beta * KL(student || ref) summed over
     # response positions, where the KL is estimated by one of Schulman's
     # k1/k2/k3 estimators at the sampled tokens.
-    reference_policy_kl_penalty: NotRequired[float]
-    reference_policy_kl_type: NotRequired[str]
+    reference_policy_kl_penalty: float = 0.0
+    reference_policy_kl_type: str = "k3"
 
 
 class SDPOLossDataDict(TypedDict):
@@ -1183,12 +1188,15 @@ class SDPOLossFn(LossFunction):
     input_type = LossInputType.DISTILLATION
 
     def __init__(self, cfg: SDPOLossConfig):
-        self.kl_type: str = cfg.get("kl_type", "reverse")
-        self.mixed_kl_weight: float = cfg.get("mixed_kl_weight", 0.5)
-        self.zero_outside_topk: bool = cfg.get("zero_outside_topk", True)
+        # Accept a plain dict (e.g. from unit tests) as well as a validated model.
+        if isinstance(cfg, dict):
+            cfg = SDPOLossConfig(**cfg)
+        self.kl_type: str = cfg.kl_type
+        self.mixed_kl_weight: float = cfg.mixed_kl_weight
+        self.zero_outside_topk: bool = cfg.zero_outside_topk
         self.log_infinitesimal: float = -100.0
-        self.reference_policy_kl_penalty: float = cfg.get("reference_policy_kl_penalty", 0.0)
-        self.reference_policy_kl_type: str = cfg.get("reference_policy_kl_type", "k3")
+        self.reference_policy_kl_penalty: float = cfg.reference_policy_kl_penalty
+        self.reference_policy_kl_type: str = cfg.reference_policy_kl_type
 
         if self.kl_type not in {"forward", "reverse", "mixed", "js"}:
             raise ValueError(f"SDPOLossFn: kl_type must be one of forward/reverse/mixed/js, got {self.kl_type}")
@@ -1459,7 +1467,7 @@ class MseValueLossFn(LossFunction):
 # ============================================================================
 
 
-class SDPOHybridLossConfig(TypedDict):
+class SDPOHybridLossConfig(BaseModel, extra="allow"):
     """Configuration for the SDPO+GRPO hybrid loss.
 
     The hybrid blends a clipped policy-gradient (GRPO) term with the SDPO
@@ -1485,6 +1493,8 @@ class SDPOHybridLossConfig(TypedDict):
         grpo: a ClippedPGLossConfig (see ClippedPGLossFn).
     """
 
+    # grpo_weight is REQUIRED (no default) so it discriminates the hybrid from a
+    # pure SDPOLossConfig in the MasterConfig.loss_fn union.
     grpo_weight: float
     sdpo: SDPOLossConfig
     grpo: ClippedPGLossConfig
@@ -1515,12 +1525,15 @@ class SDPOHybridLossFn(LossFunction):
     input_type = LossInputType.DISTILLATION_AND_LOGPROB
 
     def __init__(self, cfg: SDPOHybridLossConfig):
-        self.grpo_weight: float = float(cfg["grpo_weight"])
+        # Accept a plain dict (e.g. from unit tests) as well as a validated model.
+        if isinstance(cfg, dict):
+            cfg = SDPOHybridLossConfig(**cfg)
+        self.grpo_weight: float = float(cfg.grpo_weight)
         if not 0.0 <= self.grpo_weight <= 1.0:
             raise ValueError(f"SDPOHybridLossFn: grpo_weight must be in [0, 1], got {self.grpo_weight}")
         # prepare_loss_input reads .sdpo_loss / .grpo_loss off this object.
-        self.sdpo_loss = SDPOLossFn(cfg["sdpo"])
-        self.grpo_loss = ClippedPGLossFn(cfg["grpo"])
+        self.sdpo_loss = SDPOLossFn(cfg.sdpo)
+        self.grpo_loss = ClippedPGLossFn(cfg.grpo)
 
     def __call__(
         self,
