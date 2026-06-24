@@ -42,6 +42,29 @@ from nemo_rl.models.policy.workers.megatron_policy_worker import (
 )
 
 
+@contextmanager
+def _w4a16_modelopt_exporter():
+    """Temporarily adapt Bridge's NVFP4 exporter for W4A16 rollout metadata.
+
+    Get this removed when Bridge fixed the logic here.
+    """
+    from megatron.bridge.models.conversion import modelopt_utils
+    from modelopt.torch.export.quant_utils import QUANTIZATION_W4A16_NVFP4
+
+    original_get_exporter = modelopt_utils.get_modelopt_quant_exporter
+
+    def _get_modelopt_quant_exporter(quant_mode: str):
+        if quant_mode.lower() == "w4a16_nvfp4":
+            return QUANTIZATION_W4A16_NVFP4, modelopt_utils.quantize_nvfp4_weight
+        return original_get_exporter(quant_mode)
+
+    modelopt_utils.get_modelopt_quant_exporter = _get_modelopt_quant_exporter
+    try:
+        yield
+    finally:
+        modelopt_utils.get_modelopt_quant_exporter = original_get_exporter
+
+
 @ray.remote(
     runtime_env=get_runtime_env_for_policy_worker("megatron_quant_policy_worker")
 )  # pragma: no cover
@@ -353,14 +376,15 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         ignore = generation_cfg.get("real_quant_ignore")
         if ignore is None:
             ignore = DEFAULT_NVFP4_IGNORE
-        yield from self.megatron_bridge.export_hf_weights_modelopt(
-            [self.model],
-            quant_mode="nvfp4",
-            cpu=True,
-            show_progress=False,
-            conversion_tasks=self.refit_conversion_tasks,
-            ignore_patterns=ignore,
-        )
+        with _w4a16_modelopt_exporter():
+            yield from self.megatron_bridge.export_hf_weights_modelopt(
+                [self.model],
+                quant_mode="w4a16_nvfp4",
+                cpu=True,
+                show_progress=False,
+                conversion_tasks=self.refit_conversion_tasks,
+                ignore_patterns=ignore,
+            )
 
         if self.draft_model is not None:
             from nemo_rl.models.megatron.draft import export_eagle_weights_to_hf
