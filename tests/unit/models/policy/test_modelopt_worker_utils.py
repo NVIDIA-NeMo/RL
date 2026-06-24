@@ -51,9 +51,10 @@ def _ensure_module(name):
 def _install_optional_dependency_stubs():
     modelopt_quant = _ensure_package("modelopt.torch.quantization")
     modelopt_quant.quantize = lambda model, cfg, forward_loop: model
+    modelopt_quant.print_quant_summary = lambda model: None
 
     modelopt_config = _ensure_module("modelopt.torch.quantization.config")
-    modelopt_config.normalize_quant_cfg_list = lambda quant_cfg: quant_cfg
+    modelopt_config.need_calibration = lambda cfg: False
 
     dataset_utils = _ensure_module("modelopt.torch.utils.dataset_utils")
     dataset_utils.create_forward_loop = lambda dataloader: (
@@ -119,56 +120,11 @@ def test_get_tokenizer_applies_modelopt_calibration_defaults(monkeypatch):
     assert tokenizer.model_max_length == 128
 
 
-def test_pad_or_truncate_input_ids_truncates_then_pads_to_multiple():
-    input_ids = torch.tensor([[1, 2, 3, 4, 5]])
-
-    output = worker_utils._pad_or_truncate_input_ids(
-        input_ids,
-        max_length=3,
-        multiple=4,
-        pad_token_id=0,
-    )
-
-    torch.testing.assert_close(output, torch.tensor([[1, 2, 3, 0]]))
-    assert output.is_contiguous()
-
-
-def test_pad_or_truncate_input_ids_returns_contiguous_without_padding():
-    input_ids = torch.tensor([[1, 2, 3, 4]])
-    transposed = input_ids.t()
-
-    output = worker_utils._pad_or_truncate_input_ids(
-        transposed,
-        multiple=1,
-        pad_token_id=0,
-    )
-
-    torch.testing.assert_close(output, transposed)
-    assert output.is_contiguous()
-
-
-def test_pad_or_truncate_input_ids_skips_padding_when_already_aligned():
-    input_ids = torch.tensor([[1, 2, 3, 4]])
-
-    output = worker_utils._pad_or_truncate_input_ids(input_ids, multiple=4)
-
-    torch.testing.assert_close(output, input_ids)
-    assert output.is_contiguous()
-
-
-def test_megatron_forward_loop_pads_for_context_parallel(monkeypatch):
+def test_megatron_forward_loop_prefills_batch_input_ids(monkeypatch):
     seen = []
     dataloader = DataLoader(
         worker_utils._DictDataset({"input_ids": torch.tensor([[1, 2, 3]])}),
         batch_size=1,
-    )
-
-    from megatron.core import parallel_state
-
-    monkeypatch.setattr(
-        parallel_state,
-        "get_context_parallel_world_size",
-        lambda: 2,
     )
     monkeypatch.setattr(
         worker_utils,
@@ -182,71 +138,8 @@ def test_megatron_forward_loop_pads_for_context_parallel(monkeypatch):
     loop("model")
 
     assert seen[0][0] == "model"
-    torch.testing.assert_close(seen[0][1], torch.tensor([[1, 2, 3, 0]]))
+    torch.testing.assert_close(seen[0][1], torch.tensor([[1, 2, 3]]))
     assert seen[0][2] is True
-
-
-@pytest.mark.parametrize(
-    ("entries", "expected"),
-    [
-        ([{"quantizer_name": "*weight_quantizer", "cfg": {}}], False),
-        ([{"quantizer_name": "*input_quantizer", "cfg": {"enable": False}}], False),
-        ([{"quantizer_name": "*input_quantizer", "cfg": {"type": "dynamic"}}], False),
-        (
-            [
-                {
-                    "quantizer_name": "*input_quantizer",
-                    "cfg": {"use_constant_amax": True},
-                }
-            ],
-            False,
-        ),
-        ([{"quantizer_name": "*input_quantizer", "cfg": {}}], True),
-        (
-            [
-                {
-                    "quantizer_name": "*input_quantizer",
-                    "cfg": [{"enable": False}, {"enable": True}],
-                }
-            ],
-            True,
-        ),
-    ],
-)
-def test_requires_forward_calibration_for_activation_quantizers(
-    monkeypatch,
-    entries,
-    expected,
-):
-    monkeypatch.setattr(
-        worker_utils,
-        "normalize_quant_cfg_list",
-        lambda quant_cfg: entries,
-    )
-
-    assert (
-        worker_utils._requires_forward_calibration({"quant_cfg": entries}) is expected
-    )
-
-
-def test_requires_forward_calibration_for_non_max_algorithm():
-    assert worker_utils._requires_forward_calibration({"algorithm": "smoothquant"})
-
-
-def test_requires_forward_calibration_honors_entry_level_disable(monkeypatch):
-    monkeypatch.setattr(
-        worker_utils,
-        "normalize_quant_cfg_list",
-        lambda quant_cfg: [
-            {
-                "quantizer_name": "*input_quantizer",
-                "enable": False,
-                "cfg": {},
-            }
-        ],
-    )
-
-    assert not worker_utils._requires_forward_calibration({"quant_cfg": [{}]})
 
 
 def test_quantize_model_skips_forward_loop_for_weight_only_config(monkeypatch):
@@ -258,16 +151,16 @@ def test_quantize_model_skips_forward_loop_for_weight_only_config(monkeypatch):
         "resolve_quant_cfg",
         lambda quant_cfg: {"quant_cfg": [{"name": quant_cfg}]},
     )
-    monkeypatch.setattr(
-        worker_utils, "_requires_forward_calibration", lambda cfg: False
-    )
+    monkeypatch.setattr(worker_utils, "need_calibration", lambda cfg: False)
     monkeypatch.setattr(
         worker_utils.mtq,
         "quantize",
         lambda model_arg, cfg, forward_loop: calls.append(
             (model_arg, cfg, forward_loop)
-        ),
+        )
+        or model_arg,
     )
+    monkeypatch.setattr(worker_utils.mtq, "print_quant_summary", lambda model: None)
 
     worker_utils.quantize_model(
         model,
@@ -284,7 +177,7 @@ def test_quantize_model_skips_forward_loop_for_weight_only_config(monkeypatch):
 def test_quantize_model_requires_calibration_data(monkeypatch):
     model = torch.nn.Linear(1, 1)
     monkeypatch.setattr(worker_utils, "resolve_quant_cfg", lambda quant_cfg: {})
-    monkeypatch.setattr(worker_utils, "_requires_forward_calibration", lambda cfg: True)
+    monkeypatch.setattr(worker_utils, "need_calibration", lambda cfg: True)
 
     with pytest.raises(ValueError, match="policy.quant_calib_data"):
         worker_utils.quantize_model(
@@ -301,7 +194,7 @@ def test_quantize_model_uses_random_calibration_loop(monkeypatch):
     calls = []
 
     monkeypatch.setattr(worker_utils, "resolve_quant_cfg", lambda quant_cfg: {})
-    monkeypatch.setattr(worker_utils, "_requires_forward_calibration", lambda cfg: True)
+    monkeypatch.setattr(worker_utils, "need_calibration", lambda cfg: True)
     monkeypatch.setattr(
         worker_utils,
         "get_forward_loop_func",
@@ -314,8 +207,9 @@ def test_quantize_model_uses_random_calibration_loop(monkeypatch):
     monkeypatch.setattr(
         worker_utils.mtq,
         "quantize",
-        lambda model_arg, cfg, forward_loop: calls.append(forward_loop),
+        lambda model_arg, cfg, forward_loop: calls.append(forward_loop) or model_arg,
     )
+    monkeypatch.setattr(worker_utils.mtq, "print_quant_summary", lambda model: None)
 
     worker_utils.quantize_model(
         model,
@@ -338,7 +232,7 @@ def test_quantize_model_uses_named_calibration_dataset(monkeypatch):
     calls = []
 
     monkeypatch.setattr(worker_utils, "resolve_quant_cfg", lambda quant_cfg: {})
-    monkeypatch.setattr(worker_utils, "_requires_forward_calibration", lambda cfg: True)
+    monkeypatch.setattr(worker_utils, "need_calibration", lambda cfg: True)
     monkeypatch.setattr(
         worker_utils,
         "get_dataset_dataloader",
@@ -358,8 +252,10 @@ def test_quantize_model_uses_named_calibration_dataset(monkeypatch):
         "quantize",
         lambda model_arg, cfg, forward_loop: calls.append(
             ("quantize", model_arg, cfg, forward_loop)
-        ),
+        )
+        or model_arg,
     )
+    monkeypatch.setattr(worker_utils.mtq, "print_quant_summary", lambda model: None)
 
     worker_utils.quantize_model(
         model,
@@ -412,18 +308,14 @@ def test_get_modelopt_checkpoint_dir_falls_back_to_home(monkeypatch):
     )
 
 
-def test_get_quantization_layer_spec_can_be_disabled(monkeypatch):
-    monkeypatch.setenv("DISABLE_MODELOPT_LAYER_SPEC", "1")
-
-    assert worker_utils.get_quantization_layer_spec() is (
+def test_get_quantization_layer_spec_can_be_disabled():
+    assert worker_utils.get_quantization_layer_spec(True) is (
         worker_utils.transformer_engine_layer_spec
     )
 
 
-def test_get_quantization_layer_spec_returns_modelopt_partial(monkeypatch):
-    monkeypatch.delenv("DISABLE_MODELOPT_LAYER_SPEC", raising=False)
-
-    layer_spec = worker_utils.get_quantization_layer_spec()
+def test_get_quantization_layer_spec_returns_modelopt_partial():
+    layer_spec = worker_utils.get_quantization_layer_spec(False)
 
     assert isinstance(layer_spec, partial)
     assert layer_spec.func is worker_utils.get_gpt_modelopt_spec

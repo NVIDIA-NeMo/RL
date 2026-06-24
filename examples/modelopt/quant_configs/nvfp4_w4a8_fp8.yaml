@@ -21,7 +21,6 @@ quantize:
       enable: true
       cfg:
         num_bits: e4m3
-        use_constant_amax: true
     - quantizer_name: '*self_attention*'
       enable: false
     - quantizer_name: '*self_attn*'

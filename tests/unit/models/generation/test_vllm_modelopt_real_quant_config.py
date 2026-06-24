@@ -16,7 +16,6 @@ import importlib
 import os
 import sys
 import types
-from pathlib import Path
 
 import pytest
 import torch
@@ -206,7 +205,7 @@ def test_configure_quant_engine_kwargs_for_real_quant(monkeypatch):
     llm_kwargs = {}
     worker_mod._configure_quant_engine_kwargs(
         {
-            "quant_cfg": "examples/modelopt/quant_configs/nvfp4_a16.yaml",
+            "quant_cfg": "examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml",
             "real_quant": True,
             "real_quant_ignore": ["lm_head"],
         },
@@ -852,7 +851,7 @@ def test_get_quantizer_stats_counts_enabled_positive_amax(monkeypatch):
     }
 
 
-def test_resolve_quant_cfg_accepts_repo_relative_yaml(monkeypatch):
+def test_resolve_quant_cfg_passes_relative_names_to_modelopt(monkeypatch):
     modelopt_recipe = pytest.importorskip("modelopt.recipe")
     captured = {}
 
@@ -867,9 +866,7 @@ def test_resolve_quant_cfg_accepts_repo_relative_yaml(monkeypatch):
         "algorithm": "max",
     }
 
-    config_file = Path(captured["config_file"])
-    assert config_file.is_absolute()
-    assert config_file.name == "nvfp4_a16.yaml"
+    assert captured["config_file"] == "examples/modelopt/quant_configs/nvfp4_a16.yaml"
 
 
 def test_resolve_quant_cfg_accepts_builtin_modelopt_constant(monkeypatch):

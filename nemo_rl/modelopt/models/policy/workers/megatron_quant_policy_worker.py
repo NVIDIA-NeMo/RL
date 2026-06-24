@@ -17,6 +17,7 @@ import os
 from contextlib import contextmanager
 from typing import Generator
 
+import modelopt.torch.quantization as mtq
 import ray
 import torch
 from megatron.bridge.training.post_training.checkpointing import (
@@ -82,6 +83,9 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                     self.reference_state_dict[name] = item.detach().to(
                         device="cpu", non_blocking=True, copy=True
                     )
+        if self.rank == 0:
+            print(f"Quantized model: {self.model}")
+            mtq.print_quant_summary(self.model)
 
     def _quantize(self, model):
         """Quantize the model if the model is not quantized yet."""
@@ -452,6 +456,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 return getattr(self._task, name)
 
         folded_tasks = []
+        skipped_fold = []
         for task in self.refit_conversion_tasks:
             matched_wq = self._find_weight_quantizer(
                 task.megatron_module, task.param_weight
@@ -459,7 +464,20 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             if matched_wq is not None:
                 folded_tasks.append(_FoldedTask(task, matched_wq))
             else:
+                if (
+                    task.param_weight is not None
+                    and isinstance(task.megatron_module, QuantModule)
+                    and next(task.megatron_module.iter_weights_for_calibration(), None)
+                    is not None
+                ):
+                    skipped_fold.append(task.param_name)
                 folded_tasks.append(task)
+
+        if skipped_fold and self.rank == 0:
+            print(
+                f"[QuantFold] Skipped folding {len(skipped_fold)} non-GEMM params "
+                f"that share a module with weight_quantizer: {skipped_fold[:5]}"
+            )
 
         original_tasks = self.refit_conversion_tasks
         self.refit_conversion_tasks = folded_tasks
@@ -468,5 +486,14 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 if "weight_quantizer" in name:
                     continue
                 yield name, tensor
+        except RuntimeError:
+            raise
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed during quantized weight refit iteration. "
+                f"Folded {len(folded_tasks)} tasks, skipped folding for: "
+                f"{skipped_fold[:5] if skipped_fold else 'none'}. "
+                f"Cause: {e}"
+            ) from e
         finally:
             self.refit_conversion_tasks = original_tasks

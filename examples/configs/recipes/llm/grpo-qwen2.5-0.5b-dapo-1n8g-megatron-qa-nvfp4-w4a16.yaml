@@ -2,9 +2,9 @@
 defaults: ./grpo-qwen2.5-0.5b-dapo-1n8g-megatron.yaml
 
 policy:
-  quant_cfg: examples/modelopt/quant_configs/nvfp4_a16.yaml
+  quant_cfg: examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml
   generation:
-    quant_cfg: examples/modelopt/quant_configs/nvfp4_a16.yaml
+    quant_cfg: examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml
     real_quant: true
 
 checkpointing:

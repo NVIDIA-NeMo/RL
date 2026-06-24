@@ -87,7 +87,7 @@ def _make_real_quant_worker():
     worker.cfg = {
         "generation": {
             "backend": "vllm",
-            "quant_cfg": "examples/modelopt/quant_configs/nvfp4_a16.yaml",
+            "quant_cfg": "examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml",
             "real_quant": True,
             "real_quant_ignore": ["lm_head"],
             "vllm_cfg": {},

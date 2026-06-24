@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 from fnmatch import fnmatchcase
-from pathlib import Path
 from typing import Any, Iterator
 
 _QUANT_IGNORE_NAME_SUFFIXES = (
@@ -123,9 +122,9 @@ def resolve_quant_cfg(quant_cfg: str) -> dict[str, Any]:
     a wrapping ``quantize:`` key) is also accepted for convenience. The
     extracted dict — not the full recipe — is returned.
 
-    See ``modelopt_recipes/general/ptq/`` in the TensorRT-Model-Optimizer repo
-    for the canonical format and ``examples/modelopt/quant_configs/`` for a
-    user-authored example.
+    See ``modelopt_recipes/general/ptq/`` in the NVIDIA/Model-Optimizer repo
+    (https://github.com/NVIDIA/Model-Optimizer) for the canonical format and
+    ``examples/modelopt/quant_configs/`` for a user-authored example.
     """
     import modelopt.torch.quantization as mtq
     from modelopt.recipe import load_config
@@ -133,12 +132,6 @@ def resolve_quant_cfg(quant_cfg: str) -> dict[str, Any]:
     builtin = getattr(mtq, quant_cfg, None)
     if builtin is not None:
         return builtin
-
-    config_path = Path(quant_cfg)
-    if not config_path.is_absolute():
-        repo_config_path = Path(__file__).resolve().parents[2] / config_path
-        if repo_config_path.is_file():
-            quant_cfg = str(repo_config_path)
 
     try:
         loaded = load_config(quant_cfg)
