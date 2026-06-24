@@ -1,0 +1,11 @@
+defaults: "../stage2_swe1.yaml"
+
+policy:
+  generation_batch_size: 32
+  generation:
+    colocated:
+      resources:
+        num_nodes: 4            # 4 TP8 H100 gen replicas for the 1024-trajectory step
+
+cluster:
+  num_nodes: 20   # 16 train (TP8*CP8*PP1=64 GPUs, DP2) + 4 gen (TP8). No judges -> SBATCH=20.
