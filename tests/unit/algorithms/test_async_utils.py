@@ -451,6 +451,37 @@ class TestReplayBuffer:
 
         ray.kill(buffer)
 
+    def test_replay_buffer_starvation_diagnostics_nemo_gym_turn_keys(self):
+        """NeMo Gym uses turns_per_sample/* in rollout_metrics; diagnostics must read them."""
+        buffer = ReplayBuffer.remote(max_size=10)
+        t1 = {
+            "batch": {"data": "a"},
+            "rollout_metrics": {
+                "trajectory_duration_s": 10.0,
+                "max_gen_tokens_per_turn/max": 100,
+                "turns_per_sample/max": 3.0,
+                "turns_per_sample/mean": 2.5,
+            },
+        }
+        t2 = {
+            "batch": {"data": "b"},
+            "rollout_metrics": {
+                "trajectory_duration_s": 20.0,
+                "max_gen_tokens_per_turn/max": 200,
+                "turns_per_sample/max": 5.0,
+                "turns_per_sample/mean": 4.0,
+            },
+        }
+        ray.get(buffer.add.remote(t1, weight_version=0, target_weight_version=1))
+        ray.get(buffer.add.remote(t2, weight_version=0, target_weight_version=1))
+        debug_info = ray.get(buffer.get_debug_info.remote())
+        diag = debug_info["starvation_diagnostics"]["turns_per_sample_in_buffer"]
+        assert diag["max"] == 5.0
+        assert diag["mean"] == 4.0
+        assert diag["median"] == 4.0
+        assert diag["p95"] == 5.0
+        ray.kill(buffer)
+
     def test_replay_buffer_age_filtering(self):
         """Test that old trajectories are evicted."""
         buffer = ReplayBuffer.remote(max_size=10)

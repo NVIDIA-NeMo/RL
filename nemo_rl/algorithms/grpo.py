@@ -1596,6 +1596,16 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
 
 
 def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
+    """Whether NeMo Gym is responsible for full response logging (wandb/metrics paths).
+
+    When **True**, we **skip** the expensive per-step ``train_data_step*.jsonl`` dump and
+    **keep** ``full_result``-style keys in rollout metrics (large payloads).
+
+    When **False** (default if unset), we **strip** ``full_result`` from rollout metrics and
+    **write** the ``train_data_step*.jsonl`` file (can be very large for Gym).
+
+    Set via ``env.should_log_nemo_gym_responses`` in the master config.
+    """
     env_config = master_config.env
     should_log_nemo_gym_responses = bool(
         env_config.get("should_log_nemo_gym_responses")
@@ -3133,6 +3143,12 @@ def aggregate_rollout_metrics(
             aggregated[k] = max(v)
         elif k == "total_turns":
             aggregated[k] = sum(v)
+        elif k == "trajectory_duration_s":
+            sorted_v = sorted(v)
+            p95_idx = min(int(len(sorted_v) * 0.95), len(sorted_v) - 1)
+            aggregated[k] = sum(v) / len(v)
+            aggregated["trajectory_duration_s/max"] = max(v)
+            aggregated["trajectory_duration_s/p95"] = sorted_v[p95_idx] if sorted_v else 0
         else:
             aggregated[k] = sum(v) / len(v)
     return aggregated
@@ -3443,6 +3459,19 @@ def async_grpo_train(
                 f"trajectories for step {step}"
             )
 
+        collector_status = ray.get(trajectory_collector.get_status.remote())
+        if (
+            collector_status["data_exhausted"]
+            and not collector_status["running"]
+            and collector_status["inflight_workers"] == 0
+        ):
+            raise RuntimeError(
+                f"Trajectory collector stopped: dataloader exhausted while waiting for initial buffer fill at step={step}. "
+                f"The dataset ran out of data before training could start. "
+                f"Collector status: {collector_status}. "
+                f"Increase data.train.max_num_epochs or use a larger dataset."
+            )
+
         wait_iterations += 1
         time.sleep(1.0)
 
@@ -3500,6 +3529,44 @@ def async_grpo_train(
                             print(f"   Max trajectory age: {max_trajectory_age_steps}")
                             print(
                                 f"   Trajectory versions in buffer: {buffer_debug['trajectory_versions']}"
+                            )
+                            diag = buffer_debug.get("starvation_diagnostics")
+                            if diag:
+                                print(
+                                    "   📊 Buffer starvation diagnostics (long-tail root cause):"
+                                )
+                                print(
+                                    f"      trajectory_duration_s: mean={diag['trajectory_duration_s']['mean']:.1f}s, "
+                                    f"median={diag['trajectory_duration_s']['median']:.1f}s, "
+                                    f"max={diag['trajectory_duration_s']['max']:.1f}s, "
+                                    f"p95={diag['trajectory_duration_s']['p95']:.1f}s"
+                                )
+                                print(
+                                    f"      max_gen_tokens_per_turn: mean={diag['max_gen_tokens_per_turn_in_buffer']['mean']:.0f}, "
+                                    f"median={diag['max_gen_tokens_per_turn_in_buffer']['median']:.0f}, "
+                                    f"max={diag['max_gen_tokens_per_turn_in_buffer']['max']:.0f}, "
+                                    f"p95={diag['max_gen_tokens_per_turn_in_buffer']['p95']:.0f} "
+                                    "(high = long single generations per turn)"
+                                )
+                                print(
+                                    f"      turns_per_sample: mean={diag['turns_per_sample_in_buffer']['mean']:.1f}, "
+                                    f"median={diag['turns_per_sample_in_buffer']['median']:.1f}, "
+                                    f"max={diag['turns_per_sample_in_buffer']['max']:.0f}, "
+                                    f"p95={diag['turns_per_sample_in_buffer']['p95']:.1f} "
+                                    "(high = many turns per trajectory)"
+                                )
+
+                        collector_status = ray.get(trajectory_collector.get_status.remote())
+                        if (
+                            collector_status["data_exhausted"]
+                            and not collector_status["running"]
+                            and collector_status["inflight_workers"] == 0
+                        ):
+                            raise RuntimeError(
+                                f"Trajectory collector stopped: dataloader exhausted at training_step={step}. "
+                                f"The dataset ran out of data before training could complete. "
+                                f"Collector status: {collector_status}. "
+                                f"Increase data.train.max_num_epochs or use a larger dataset."
                             )
 
                         time.sleep(0.5)
@@ -3981,26 +4048,33 @@ def async_grpo_train(
                         checkpointer.finalize_checkpoint(checkpoint_path)
 
             # Logging
-            # Log training data (match sync GRPO logging payload for parity)
-            log_data = {}
-            if "agent_ref" in repeated_batch:
-                log_data["agent_ref"] = repeated_batch["agent_ref"]
-            log_data["content"] = flat_messages_content
-            log_data["rewards"] = rewards.tolist()
-            if master_config.grpo["use_dynamic_sampling"]:
-                # In dynamic sampling, `rewards` corresponds to filtered rewards
-                log_data["filtered_rewards"] = rewards.tolist()
-                log_data["rewards"] = repeated_batch["total_reward"].tolist()
-            log_data["input_lengths"] = input_lengths.tolist()
-            log_data["token_ids"] = train_data["input_ids"].tolist()
-            log_data["token_loss_mask"] = train_data["token_mask"].tolist()
-            log_data["sample_loss_mask"] = train_data["sample_mask"].tolist()
-            log_data["advantages"] = train_data["advantages"].tolist()
-            log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
-            log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
-            logger.log_batched_dict_as_jsonl(
-                log_data, f"train_data_step{step + 1}.jsonl"
-            )
+            # Log training data (match sync GRPO logging payload for parity).
+            # NeMo Gym responses can be very large and expensive to log; when
+            # env.should_log_nemo_gym_responses is true, skip this jsonl (see
+            # _should_log_nemo_gym_responses).
+            if not _should_log_nemo_gym_responses(master_config):
+                log_data = {}
+                if "agent_ref" in repeated_batch:
+                    log_data["agent_ref"] = repeated_batch["agent_ref"]
+                log_data["content"] = flat_messages_content
+                log_data["rewards"] = rewards.tolist()
+                if master_config.grpo["use_dynamic_sampling"]:
+                    # In dynamic sampling, `rewards` corresponds to filtered rewards
+                    log_data["filtered_rewards"] = rewards.tolist()
+                    log_data["rewards"] = repeated_batch["total_reward"].tolist()
+                log_data["input_lengths"] = input_lengths.tolist()
+                log_data["token_ids"] = train_data["input_ids"].tolist()
+                log_data["token_loss_mask"] = train_data["token_mask"].tolist()
+                log_data["sample_loss_mask"] = train_data["sample_mask"].tolist()
+                log_data["advantages"] = train_data["advantages"].tolist()
+                log_data["generation_logprobs"] = train_data[
+                    "generation_logprobs"
+                ].tolist()
+                log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
+                logger.log_batched_dict_as_jsonl(
+                    log_data, f"train_data_step{step + 1}.jsonl"
+                )
+                del log_data
             del train_data
             del flat_messages_content
 
@@ -4071,7 +4145,6 @@ def async_grpo_train(
             performance_metrics = print_performance_metrics(
                 train_results, metrics, timing_metrics, master_config
             )
-
             logger.log_metrics(performance_metrics, step + 1, prefix="performance")
             logger.log_metrics(metrics, step + 1, prefix="train")
             # step_finished=True here since this is the final log of our current step.

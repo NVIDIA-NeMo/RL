@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import statistics
 import threading as _threading
 from collections import Counter
 from typing import Any, Iterable, Optional
@@ -40,6 +41,23 @@ class ReplayBufferImpl(ReplayBufferProtocol):
 
         self.last_target_weight_already_generated = -1
         self._lock = _threading.Lock()
+
+    @staticmethod
+    def _rollout_metrics_turn_count_for_diagnostics(rm: dict[str, Any]) -> Optional[float]:
+        """One scalar turn-depth per buffered trajectory for starvation diagnostics.
+
+        Supports sync multi-turn rollouts (`max_turns_per_sample` / `avg_turns_per_sample`)
+        and NeMo Gym (`turns_per_sample/max` / `turns_per_sample/mean`).
+        """
+        if "max_turns_per_sample" in rm:
+            return float(rm["max_turns_per_sample"])
+        if "avg_turns_per_sample" in rm:
+            return float(rm["avg_turns_per_sample"])
+        if "turns_per_sample/max" in rm:
+            return float(rm["turns_per_sample/max"])
+        if "turns_per_sample/mean" in rm:
+            return float(rm["turns_per_sample/mean"])
+        return None
 
     def add(
         self,
@@ -71,12 +89,65 @@ class ReplayBufferImpl(ReplayBufferProtocol):
 
     def get_debug_info(self) -> dict:
         """Get debug information about buffer state."""
-        return {
+        info = {
             "total_trajectories": len(self.trajectories),
             "trajectory_versions": self.trajectory_versions,
             "target_weight_versions": self.target_weight_versions,
             "max_size": self.max_size,
         }
+        if self.trajectories:
+            durations = []
+            max_gen_tokens_per_turn_list = []
+            turn_counts_list = []
+            for t in self.trajectories:
+                rm = t.get("rollout_metrics", {})
+                if "trajectory_duration_s" in rm:
+                    durations.append(rm["trajectory_duration_s"])
+                if "max_gen_tokens_per_turn/max" in rm:
+                    max_gen_tokens_per_turn_list.append(rm["max_gen_tokens_per_turn/max"])
+                elif "max_gen_tokens_per_turn" in rm:
+                    max_gen_tokens_per_turn_list.append(rm["max_gen_tokens_per_turn"])
+                tc = self._rollout_metrics_turn_count_for_diagnostics(rm)
+                if tc is not None:
+                    turn_counts_list.append(tc)
+
+            def _pct(values: list[float], p: float) -> float:
+                if not values:
+                    return 0.0
+                sorted_v = sorted(values)
+                idx = min(int(len(sorted_v) * p / 100), len(sorted_v) - 1)
+                return float(sorted_v[idx])
+
+            info["starvation_diagnostics"] = {
+                "trajectory_duration_s": {
+                    "mean": sum(durations) / len(durations) if durations else 0,
+                    "median": statistics.median(durations) if durations else 0,
+                    "max": max(durations) if durations else 0,
+                    "p95": _pct(durations, 95),
+                },
+                "max_gen_tokens_per_turn_in_buffer": {
+                    "mean": sum(max_gen_tokens_per_turn_list) / len(max_gen_tokens_per_turn_list)
+                    if max_gen_tokens_per_turn_list
+                    else 0,
+                    "median": statistics.median(max_gen_tokens_per_turn_list)
+                    if max_gen_tokens_per_turn_list
+                    else 0,
+                    "max": max(max_gen_tokens_per_turn_list)
+                    if max_gen_tokens_per_turn_list
+                    else 0,
+                    "p95": _pct(max_gen_tokens_per_turn_list, 95),
+                },
+                "turns_per_sample_in_buffer": {
+                    "mean": sum(turn_counts_list) / len(turn_counts_list)
+                    if turn_counts_list
+                    else 0,
+                    "median": statistics.median(turn_counts_list) if turn_counts_list else 0,
+                    "max": max(turn_counts_list) if turn_counts_list else 0,
+                    "p95": _pct(turn_counts_list, 95),
+                },
+                "num_trajectories_sampled": len(self.trajectories),
+            }
+        return info
 
     def get_last_target_weight_already_generated(self) -> int:
         with self._lock:
