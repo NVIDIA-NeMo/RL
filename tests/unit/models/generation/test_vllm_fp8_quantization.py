@@ -85,9 +85,7 @@ def test_init_fp8_uses_mxfp8_quantization_config(fp8_module, monkeypatch):
         ("pow2_activation_scaling_factors", "only pow2 activation scaling factors"),
     ],
 )
-def test_init_fp8_rejects_non_pow2_mxfp8_scales(
-    fp8_module, monkeypatch, field, error
-):
+def test_init_fp8_rejects_non_pow2_mxfp8_scales(fp8_module, monkeypatch, field, error):
     fp8 = fp8_module
 
     monkeypatch.setattr(
@@ -95,9 +93,7 @@ def test_init_fp8_rejects_non_pow2_mxfp8_scales(
         "from_pretrained",
         lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=4),
     )
-    monkeypatch.setattr(
-        fp8, "monkey_patch_vllm_ray_executor", lambda _fp8_config: None
-    )
+    monkeypatch.setattr(fp8, "monkey_patch_vllm_ray_executor", lambda _fp8_config: None)
 
     with pytest.raises(ValueError, match=error):
         fp8.init_fp8(
@@ -165,9 +161,7 @@ def test_apply_fp8_patches_registers_modelopt_patches_only_for_mxfp8(
     )
 
     assert any("ModelOptMxFp8LinearMethod" in path for path in patched_paths)
-    assert any(
-        "ModelOptMxFp8FusedMoE.create_weights" in path for path in patched_paths
-    )
+    assert any("ModelOptMxFp8FusedMoE.create_weights" in path for path in patched_paths)
     assert any(
         "ModelOptMxFp8FusedMoE.process_weights_after_loading" in path
         for path in patched_paths
