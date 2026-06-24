@@ -1,0 +1,265 @@
+# syntax=docker/dockerfile:1
+# Apply the bleeding-edge NeMo RL refresh directly to a Gym v0.6.0 image.
+#
+# Build the base Gym image first:
+#   docker buildx build \
+#     --platform linux/amd64 \
+#     -t <registry>/nemo-rl:v0.6.0-gym \
+#     --push \
+#     -f docker/Dockerfile.gym_v0.6.0 .
+#
+# Then build this image from that artifact:
+#   docker buildx build \
+#     --platform linux/amd64 \
+#     --build-arg BASE_IMAGE=<registry>/nemo-rl:v0.6.0-gym \
+#     -t <registry>/nemo-rl:gym-bleeding-edge \
+#     --push \
+#     -f docker/Dockerfile.gym_bleeding_edge .
+#
+# Optional git ref overrides:
+#   --build-arg NEMO_RL_REF=main
+#   --build-arg MEGATRON_BRIDGE_REF=main
+#   --build-arg MEGATRON_LM_REF=main
+
+ARG BASE_IMAGE=nemo-rl:v0.6.0-gym
+FROM ${BASE_IMAGE}
+
+USER root
+
+ARG BASE_IMAGE
+ARG NEMO_RL_REF=main
+ARG MEGATRON_BRIDGE_REF=main
+ARG MEGATRON_LM_REF=main
+ARG CONTAINER_ROOT=/opt/nemo-rl
+ARG PYTHON_BIN=/opt/nemo_rl_venv/bin/python
+ARG BLEEDING_EDGE_BUILD_METADATA_DIR=/opt/nemorl_bleeding_edge_build
+
+ENV NRL_CONTAINER=1
+ENV RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
+ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
+ENV CONTAINER_ROOT=${CONTAINER_ROOT}
+ENV PYTHON_BIN=${PYTHON_BIN}
+ENV PATH="/opt/nemo_rl_venv/bin:${PATH}"
+
+WORKDIR /
+
+RUN <<"EOF" bash -exu -o pipefail
+log() {
+  printf '[%s] %s\n' "$(date -Is)" "$*"
+}
+
+is_git_repo() {
+  git -C "$1" rev-parse --is-inside-work-tree >/dev/null 2>&1
+}
+
+pip_install() {
+  if command -v uv >/dev/null 2>&1; then
+    uv pip install --python "$PYTHON_BIN" "$@"
+  else
+    "$PYTHON_BIN" -m pip install "$@"
+  fi
+}
+
+pip_install_for_python() {
+  local python_bin="$1"
+  shift
+  if command -v uv >/dev/null 2>&1; then
+    uv pip install --python "$python_bin" "$@"
+  else
+    "$python_bin" -m pip install "$@"
+  fi
+}
+
+project_venv_root() {
+  dirname "$(dirname "$PYTHON_BIN")"
+}
+
+uv_sync_project() {
+  local venv_root
+  venv_root="$(project_venv_root)"
+  log "Syncing full NeMo RL project dependencies into ${venv_root}"
+  (
+    cd "$CONTAINER_ROOT"
+    export VIRTUAL_ENV="$venv_root"
+    export UV_PROJECT_ENVIRONMENT="$venv_root"
+    export PATH="${venv_root}/bin:${PATH}"
+    uv sync --active
+  )
+}
+
+repair_ray_worker_venvs() {
+  local ray_version
+  ray_version="$("$PYTHON_BIN" - <<'PY'
+import ray
+print(ray.__version__)
+PY
+)"
+
+  local ray_venv_root="${RAY_VENV_ROOT:-/opt/ray_venvs}"
+  if [[ ! -d "$ray_venv_root" ]]; then
+    log "No Ray worker venv root found at ${ray_venv_root}; skipping worker venv repair"
+    return
+  fi
+
+  log "Repairing Ray worker venvs under ${ray_venv_root} to ray[default]==${ray_version}"
+  while IFS= read -r -d '' python_bin; do
+    log "Repairing Ray in ${python_bin}"
+    pip_install_for_python "$python_bin" --reinstall "ray[default]==${ray_version}" simplejson
+    pip_install_for_python "$python_bin" --no-deps tensordict pyvers
+    pip_install_for_python "$python_bin" --no-deps \
+      "nvidia-resiliency-ext @ git+https://github.com/NVIDIA/nvidia-resiliency-ext.git@v0.6.0"
+    "$python_bin" - <<'PY'
+import importlib.metadata
+import ray
+
+print(f"worker ray={ray.__version__} from {getattr(ray, '__file__', '<unknown>')}")
+print(f"worker tensordict={importlib.metadata.version('tensordict')}")
+print(f"worker pyvers={importlib.metadata.version('pyvers')}")
+print(f"worker nvidia-resiliency-ext={importlib.metadata.version('nvidia-resiliency-ext')}")
+PY
+  done < <(find "$ray_venv_root" -mindepth 2 -maxdepth 3 -path '*/bin/python' \( -type f -o -type l \) -print0)
+}
+
+repair_build_backend_metadata() {
+  log "Repairing build backend metadata if the base venv has stale setuptools metadata"
+  mapfile -t site_dirs < <("$PYTHON_BIN" - <<'PY'
+import site
+import sysconfig
+
+paths = set()
+try:
+    paths.update(site.getsitepackages())
+except Exception:
+    pass
+for key in ("purelib", "platlib"):
+    path = sysconfig.get_path(key)
+    if path:
+        paths.add(path)
+for path in sorted(paths):
+    print(path)
+PY
+)
+
+  for site_dir in "${site_dirs[@]}"; do
+    [[ -d "$site_dir" ]] || continue
+    rm -rf \
+      "$site_dir"/setuptools \
+      "$site_dir"/setuptools-*.dist-info \
+      "$site_dir"/pkg_resources \
+      "$site_dir"/wheel \
+      "$site_dir"/wheel-*.dist-info \
+      "$site_dir"/packaging \
+      "$site_dir"/packaging-*.dist-info \
+      "$site_dir"/pybind11 \
+      "$site_dir"/pybind11-*.dist-info
+  done
+}
+
+log "Target NeMo RL ref: ${NEMO_RL_REF}"
+log "Target Megatron-Bridge ref: ${MEGATRON_BRIDGE_REF}"
+log "Target Megatron-LM ref: ${MEGATRON_LM_REF}"
+
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  PYTHON_BIN="$(command -v python3 || command -v python)"
+fi
+if [[ -z "$PYTHON_BIN" ]]; then
+  echo "Could not find python inside the container" >&2
+  exit 1
+fi
+
+mkdir -p "$BLEEDING_EDGE_BUILD_METADATA_DIR"
+{
+  echo "date=$(date -Is)"
+  echo "base_image=${BASE_IMAGE:-<unknown>}"
+  echo "nemo_rl_ref=$NEMO_RL_REF"
+  echo "megatron_bridge_ref=$MEGATRON_BRIDGE_REF"
+  echo "megatron_lm_ref=$MEGATRON_LM_REF"
+  echo "python=$PYTHON_BIN"
+} > "$BLEEDING_EDGE_BUILD_METADATA_DIR/build_metadata.env"
+
+git config --global --add safe.directory '*' || true
+
+if [[ -e "$CONTAINER_ROOT" ]]; then
+  rm -rf "$CONTAINER_ROOT"
+fi
+
+log "Cloning NeMo RL into $CONTAINER_ROOT"
+git clone --depth 1 --branch "$NEMO_RL_REF" https://github.com/NVIDIA-NeMo/RL.git "$CONTAINER_ROOT"
+
+log "Initializing NeMo RL submodules"
+git -C "$CONTAINER_ROOT" submodule update --init --depth 1 \
+  3rdparty/Automodel-workspace/Automodel \
+  3rdparty/Megatron-Bridge-workspace/Megatron-Bridge \
+  3rdparty/Gym-workspace/Gym
+
+bridge_repo="$CONTAINER_ROOT/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge"
+if is_git_repo "$bridge_repo"; then
+  log "Checking out Megatron-Bridge ref $MEGATRON_BRIDGE_REF"
+  git -C "$bridge_repo" fetch --depth 1 origin "$MEGATRON_BRIDGE_REF"
+  git -C "$bridge_repo" checkout --detach FETCH_HEAD
+  git -C "$bridge_repo" submodule update --init --depth 1 3rdparty/Megatron-LM
+fi
+
+mlm_repo="$bridge_repo/3rdparty/Megatron-LM"
+if is_git_repo "$mlm_repo"; then
+  log "Checking out Megatron-LM ref $MEGATRON_LM_REF"
+  git -C "$mlm_repo" fetch --depth 1 origin "$MEGATRON_LM_REF"
+  git -C "$mlm_repo" checkout --detach FETCH_HEAD
+fi
+
+log "Installing editable packages without dependency resolution"
+repair_build_backend_metadata
+pip_install setuptools wheel packaging pybind11
+uv_sync_project
+repair_ray_worker_venvs
+pip_install --no-deps --no-build-isolation -e "$CONTAINER_ROOT"
+
+bridge_ws="$CONTAINER_ROOT/3rdparty/Megatron-Bridge-workspace"
+if [[ -f "$bridge_ws/pyproject.toml" || -f "$bridge_ws/setup.py" ]]; then
+  pip_install --no-deps --no-build-isolation -e "$bridge_ws"
+elif [[ -f "$bridge_repo/pyproject.toml" || -f "$bridge_repo/setup.py" ]]; then
+  pip_install --no-deps --no-build-isolation -e "$bridge_repo"
+else
+  echo "Could not find Megatron-Bridge package root under $bridge_ws" >&2
+  exit 1
+fi
+
+if [[ -f "$mlm_repo/pyproject.toml" || -f "$mlm_repo/setup.py" ]]; then
+  pip_install --no-deps --no-build-isolation -e "$mlm_repo"
+else
+  echo "Could not find Megatron-LM package root under $mlm_repo" >&2
+  exit 1
+fi
+
+log "Recording installed revisions and import smoke"
+{
+  echo "=== git revisions ==="
+  git -C "$CONTAINER_ROOT" rev-parse HEAD
+  git -C "$bridge_repo" rev-parse HEAD
+  git -C "$mlm_repo" rev-parse HEAD
+  echo "=== imports ==="
+  "$PYTHON_BIN" - <<'PY'
+import importlib
+import importlib.util
+
+nemo_rl = importlib.import_module("nemo_rl")
+print(f"nemo_rl: {getattr(nemo_rl, '__file__', '<no file>')}")
+for name in ("megatron", "megatron.bridge"):
+    spec = importlib.util.find_spec(name)
+    print(f"{name}: {spec.origin if spec else '<not found>'}")
+try:
+    import torch
+    print(f"torch: {getattr(torch, '__file__', None)}, Tensor={hasattr(torch, 'Tensor')}")
+except Exception as exc:
+    print(f"torch import failed during build smoke: {exc!r}")
+PY
+} | tee "$BLEEDING_EDGE_BUILD_METADATA_DIR/import_smoke.log"
+
+"$PYTHON_BIN" "$CONTAINER_ROOT/tools/generate_fingerprint.py" > /opt/nemo_rl_container_fingerprint
+EOF
+
+WORKDIR /opt/nemo-rl
+
+# The gym base image appends setup-specific env hooks under /opt/nemo-rl to
+# /root/.profile. Replacing /opt/nemo-rl makes those hooks stale.
+RUN sed -i '\#/opt/nemo-rl/3rdparty/Gym-workspace/Gym/responses_api_agents/swe_agents/.*/uv/env#d' /root/.profile

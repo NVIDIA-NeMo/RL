@@ -36,6 +36,7 @@ hf_datasets_cache/
 /datasets/
 docker/*
 !docker/Dockerfile
+!docker/Dockerfile.gym_bleeding_edge
 !docker/Dockerfile.gym_v0.6.0
 !docker/Dockerfile.ngc_pytorch
 !docker/README.md
