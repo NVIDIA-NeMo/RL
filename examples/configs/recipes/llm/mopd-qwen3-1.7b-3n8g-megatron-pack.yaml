@@ -81,10 +81,10 @@ policy:
 data:
   max_input_seq_length: null
   train:
-    data_path: /path/to/train.jsonl
+    data_path: "${oc.env:HF_HOME}/nanov3_data/train-split.jsonl"
     dataset_name: NemoGymDataset
   validation:
-    data_path: /path/to/validation.jsonl
+    data_path: "${oc.env:HF_HOME}/nanov3_data/val-split.jsonl"
     dataset_name: NemoGymDataset
   default:
     dataset_name: NemoGymDataset

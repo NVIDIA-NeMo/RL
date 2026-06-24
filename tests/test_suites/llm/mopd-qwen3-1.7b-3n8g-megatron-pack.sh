@@ -16,9 +16,7 @@
 # MOPD: dense Qwen3-1.7B student distilled from a Qwen3-1.7B
 # teacher (student == teacher -> OPD loss ~0), sequence packing ON, 3 nodes
 # (1 policy + 1 vLLM + 1 teacher). MOPD is gym-only, so this drives the
-# nemo_gym entrypoint. The baked gym venvs and the real nemo_gym
-# train/validation datasets are provided by the test harness at runtime
-# (see PR #2855); NRL_TRAIN_PATH / NRL_VAL_PATH override the placeholders.
+# nemo_gym entrypoint.
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 
@@ -33,19 +31,11 @@ NUM_MINUTES=15
 
 exit_if_max_steps_reached
 
-# nemo_gym train/validation jsonl (provided by the nightly environment; the
-# config placeholders are overridden here). Use `:-` defaults so a dry run /
-# accounting pass never aborts on unset vars.
-NRL_TRAIN_PATH="${NRL_TRAIN_PATH:-/path/to/train.jsonl}"
-NRL_VAL_PATH="${NRL_VAL_PATH:-/path/to/validation.jsonl}"
-
 # Run the experiment
 cd $PROJECT_ROOT
 uv run examples/nemo_gym/run_grpo_nemo_gym.py \
     --config $CONFIG_PATH \
     grpo.max_num_steps=$MAX_STEPS \
-    data.train.data_path=$NRL_TRAIN_PATH \
-    data.validation.data_path=$NRL_VAL_PATH \
     logger.log_dir=$LOG_DIR \
     logger.wandb_enabled=True \
     logger.wandb.project=nemo-rl \
