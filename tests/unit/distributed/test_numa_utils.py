@@ -41,32 +41,31 @@ from nemo_rl.distributed.numa_utils import (
 def _write_affinity_file_from_topo() -> str | None:
     """Parse nvidia-smi topo and write a GPU→cpulist affinity file.
 
-    This replicates what topology_probe.sh in ray.sub does at node startup:
-      nvidia-smi topo -m | awk '/^GPU[0-9]/ { ... print gpu ":" $(NF-2) }'
+    Mirrors the production probe in ray.sub: the "CPU Affinity" column is
+    unreliable on GB200 (empty for GPUs not directly attached to a socket), so
+    ray.sub reads the "NUMA Affinity" column and looks up the node-local CPU
+    list from sysfs. We do the same here so the benchmark can't drift from
+    production:
+
+      nvidia-smi topo -m | awk '/^GPU[0-9]/ { numa=$(NF-1); ... }'
+        → cat /sys/devices/system/node/node<numa>/cpulist
 
     nvidia-smi topo -m output format (GB200 NVL72 example):
 
-            GPU0  GPU1  GPU2  GPU3  NIC0 ... NIC5  CPU Affinity  NUMA Affinity  GPU NUMA ID
-        GPU0  X    NV18  NV18  NV18  NODE ... SYS   0-71          0              N/A
-        GPU1 NV18   X    NV18  NV18  NODE ... SYS   0-71          0              N/A
-        GPU2 NV18  NV18   X    NV18  SYS  ... NODE  72-143        1              N/A
-        GPU3 NV18  NV18  NV18   X    SYS  ... NODE  72-143        1              N/A
-        NIC0 NODE  NODE  SYS   SYS    X   ... SYS
+            GPU0  ... NIC5  CPU Affinity  NUMA Affinity  GPU NUMA ID
+        GPU0  X   ... SYS   0-71          0              N/A
+        GPU2 ...      NODE   72-143        1              N/A
+        NIC0 ...       X
         ...
 
-    The header row is indented (starts with whitespace), so startswith("GPU")
-    skips it. NIC rows start with "NIC", not "GPU", so they're also skipped.
+    The header row is indented (starts with whitespace) and NIC rows start with
+    "NIC", so startswith("GPU") skips both. On a GPU row the trailing
+    whitespace-split columns are:
+        parts[-3] = CPU Affinity  (unreliable on GB200 — NOT used)
+        parts[-2] = NUMA Affinity (e.g. "0"/"1") ← used; matches ray.sub's $(NF-1)
+        parts[-1] = GPU NUMA ID   (e.g. "N/A")
 
-    The three trailing columns on GPU rows (whitespace-split) are:
-        parts[-3] = CPU Affinity  (e.g. "0-71")    ← what we extract
-        parts[-2] = NUMA Affinity (e.g. "0")
-        parts[-1] = GPU NUMA ID   (e.g. "N/A" or a number like "2")
-
-    The resulting affinity file has one line per GPU:
-        0:0-71
-        1:0-71
-        2:72-143
-        3:72-143
+    The resulting affinity file has one line per GPU, e.g. "2:72-143".
 
     Returns the path to the temp file, or None if parsing fails.
     """
@@ -86,8 +85,15 @@ def _write_affinity_file_from_topo() -> str | None:
             continue
         parts = line.split()
         gpu_idx = parts[0].replace("GPU", "")
-        cpulist = parts[-3]
-        if "-" in cpulist and any(c.isdigit() for c in cpulist):
+        numa = parts[-2]  # NUMA Affinity column (ray.sub parses $(NF-1))
+        if not numa.isdigit():
+            continue
+        try:
+            with open(f"/sys/devices/system/node/node{numa}/cpulist") as nf:
+                cpulist = nf.read().strip()
+        except OSError:
+            continue
+        if cpulist:
             entries.append(f"{gpu_idx}:{cpulist}")
 
     if not entries:
