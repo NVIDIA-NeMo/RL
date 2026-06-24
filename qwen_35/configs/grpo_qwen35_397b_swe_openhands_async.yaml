@@ -83,11 +83,7 @@ policy:
     expert_model_parallel_size: 16
     expert_tensor_parallel_size: 1
     sequence_parallel: true
-    # With the flex dispatcher, the backend must be selected only through
-    # moe_flex_dispatcher_backend. Leaving the legacy DeepEP boolean enabled
-    # makes Megatron validate two active backends and abort.
-    moe_enable_deepep: false
-    moe_token_dispatcher_type: flex
+    moe_token_dispatcher_type: alltoall
     optimizer:
       lr: 5.0e-6
       min_lr: 4.999e-6
@@ -110,7 +106,7 @@ policy:
     first_last_layers_bf16: true
     num_layers_at_start_in_bf16: 1
     num_layers_at_end_in_bf16: 1
-    moe_flex_dispatcher_backend: hybridep
+    moe_flex_dispatcher_backend: alltoall
     moe_hybridep_num_sms: 32
   generation:
     max_new_tokens: 65536
