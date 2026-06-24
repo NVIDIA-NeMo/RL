@@ -149,10 +149,16 @@ fi
 
 export MOUNTS="${EXTRA_MOUNTS:+${EXTRA_MOUNTS},}${BASE_MOUNTS}"
 
-# ---- Read num_nodes from the config's cluster.num_nodes field ----
+# ---- Read num_nodes / gpus_per_node from the config's cluster.* fields ----
 NUM_NODES=$(awk '/^cluster:/{found=1} found && /num_nodes:/{print $2; exit}' "${CONFIG_PATH}")
 if [[ -z "$NUM_NODES" ]]; then
     echo "Error: could not read cluster.num_nodes from ${CONFIG_PATH}"
+    exit 1
+fi
+# GB200 NVL72 has 4 GPUs/node vs 8 on H100; --gres must match the config.
+GPUS_PER_NODE=$(awk '/^cluster:/{found=1} found && /gpus_per_node:/{print $2; exit}' "${CONFIG_PATH}")
+if [[ -z "$GPUS_PER_NODE" ]]; then
+    echo "Error: could not read cluster.gpus_per_node from ${CONFIG_PATH}"
     exit 1
 fi
 
@@ -163,7 +169,7 @@ SBATCH_CMD=(
     --job-name="${WANDB_NAME}"
     --partition="${SLURM_PARTITION}"
     --time="${SLURM_TIME_LIMIT}"
-    --gres=gpu:8
+    --gres=gpu:"${GPUS_PER_NODE}"
     --exclusive
     --dependency=singleton
     --exclude=pool0-00074
