@@ -323,6 +323,7 @@ class MegatronConfig(TypedDict):
     scheduler: MegatronSchedulerConfig
     distributed_data_parallel_config: MegatronDDPConfig
     gradient_accumulation_fusion: NotRequired[bool]
+    # Enable fused weighted squared ReLU when the architecture supports it.
     use_fused_weighted_squared_relu: NotRequired[bool]
     # When True, uses chunked linear cross-entropy fusion loss to compute loss
     # directly from hidden states, avoiding materialization of the full

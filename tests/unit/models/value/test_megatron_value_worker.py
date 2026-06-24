@@ -98,6 +98,7 @@ def _create_value_test_config(
             "moe_shared_expert_overlap": False,
             "defer_fp32_logits": None,
             "gradient_accumulation_fusion": False,
+            "use_fused_weighted_squared_relu": False,
             "train_iters": 100,
             "optimizer": {
                 "optimizer": "adam",

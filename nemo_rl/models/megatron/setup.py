@@ -1649,6 +1649,7 @@ def make_policy_like_config(config: ValueConfig) -> dict:
     megatron_cfg.setdefault("apply_rope_fusion", True)
     megatron_cfg.setdefault("bias_activation_fusion", True)
     megatron_cfg.setdefault("gradient_accumulation_fusion", False)
+    megatron_cfg.setdefault("use_fused_weighted_squared_relu", False)
     megatron_cfg.setdefault("defer_fp32_logits", False)
     megatron_cfg.setdefault("force_overwrite_initial_ckpt", False)
 
