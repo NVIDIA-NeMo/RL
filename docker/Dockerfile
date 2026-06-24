@@ -185,17 +185,6 @@ uv sync --link-mode symlink --locked --extra automodel --no-install-project
 uv sync --link-mode symlink --locked --extra modelopt --no-install-project
 uv sync --link-mode symlink --locked --all-groups --no-install-project
 
-# Workaround for https://github.com/NVIDIA/cutlass/issues/3259: the
-# cutlass-dsl libs-base and libs-cu13 wheels overlap. Force a reinstall so
-# libs-cu13 is the last writer. copy link-mode materializes the file
-# in-place instead of re-pointing the symlink at the libs-base cache entry.
-if uv pip show nvidia-cutlass-dsl-libs-cu13 >/dev/null 2>&1; then
-    cutlass_version=$(uv pip show nvidia-cutlass-dsl-libs-cu13 | awk '/^Version: /{print $2}')
-    UV_LINK_MODE=copy uv pip install \
-        --reinstall-package nvidia-cutlass-dsl-libs-cu13 \
-        --no-deps "nvidia-cutlass-dsl-libs-cu13==${cutlass_version}"
-fi
-
 # Remove the aiohttp in this uv cache dir to fully address CVE GHSA-mqqc-3gqh-h2x8
 # The ray install will include the older aiohttp version in its cache
 find /root/.cache/uv -type d -path "*ray/_private/runtime_env/agent/thirdparty_files/aiohttp*" -exec rm -rf {} +

@@ -99,45 +99,6 @@ def create_local_venv(
 
     # Return the path to the python executable in the virtual environment
     python_path = os.path.join(venv_path, "bin", "python")
-
-    # Workaround for https://github.com/NVIDIA/cutlass/issues/3259: the
-    # cutlass-dsl libs-base and libs-cu13 wheels overlap, so force a
-    # reinstall to make libs-cu13 the last writer. No-op for venvs that
-    # don't pull cutlass-dsl in (e.g. FSDP).
-    pip_list = subprocess.run(
-        ["uv", "pip", "list", "--python", python_path, "--format", "freeze"],
-        env=env,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    cutlass_pin = next(
-        (
-            line
-            for line in pip_list.stdout.splitlines()
-            if line.lower().startswith("nvidia-cutlass-dsl-libs-cu13==")
-        ),
-        None,
-    )
-    if cutlass_pin is not None:
-        subprocess.run(
-            [
-                "uv",
-                "pip",
-                "install",
-                "--python",
-                python_path,
-                "--link-mode",
-                "copy",
-                "--reinstall-package",
-                "nvidia-cutlass-dsl-libs-cu13",
-                "--no-deps",
-                cutlass_pin,
-            ],
-            env=env,
-            check=True,
-        )
-
     return python_path
 
 
