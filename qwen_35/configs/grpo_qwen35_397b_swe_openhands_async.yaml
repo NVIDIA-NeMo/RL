@@ -144,6 +144,11 @@ env:
     swe_agents_train:
       responses_api_agents:
         swe_agents:
+          agent_prompt_overrides:
+            - user_prompt_template: responses_api_agents/swe_agents/prompts/openhands/user_prompt.j2
+              system_prompt_template: responses_api_agents/swe_agents/prompts/openhands/system_prompt.j2
+              agent_cls: CodeActAgent
+              diversify_tool_names: false
           agent_max_turns: 15
           concurrency: 128
           swebench_agent_timeout: 360
