@@ -184,6 +184,7 @@ policy:
     apply_rope_fusion: true
     use_fused_weighted_squared_relu: true
     bias_activation_fusion: false
+    gradient_accumulation_fusion: false
     defer_fp32_logits: true
 
     # Logging
@@ -279,7 +280,7 @@ policy:
     sequence_length_round: 64
     fuse_loss: true
 
-  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  make_sequence_length_divisible_by: ${mul:${policy.megatron_cfg.context_parallel_size}, ${mul:2, ${policy.megatron_cfg.tensor_model_parallel_size}}}
   max_grad_norm: 1.0
   optimizer: null
   scheduler: null
@@ -317,11 +318,11 @@ policy:
       vllm_metrics_logger_interval: 0.5
       expose_http_server: true
       skip_tokenizer_init: false
+      reasoning_parser_plugin: nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py
       http_server_serving_chat_kwargs:
         enable_auto_tools: true
         tool_parser: qwen3_coder
         reasoning_parser: nano_v3
-        reasoning_parser_plugin: nemo_rl/utils/nano_v3_reasoning_parser.py
 
     vllm_kwargs:
       attention_backend: FLASH_ATTN
@@ -344,6 +345,7 @@ data:
   max_input_seq_length: null
   shuffle: false
   num_workers: 1
+  use_multiple_dataloader: false
   train:
     data_path: null
   validation:
@@ -369,6 +371,12 @@ env:
   nemo_gym:
     nemo_gym_log_dir: "logs/nemo_gym"
     skip_venv_if_present: true
+    # NeMo-RL-side effort shaping; stripped before forwarding to Gym.
+    effort_levels:
+      low_string: "{reasoning effort: efficient}"
+      low_weight: 0.1
+      low_penalty: 1
+      low_ub: 15000
     port_range_low: 5000
     port_range_high: 5999
     invalid_tool_call_patterns:
@@ -463,9 +471,9 @@ env:
           debug: true
           vllm_serve_env_vars:
             VLLM_RAY_DP_PACK_STRATEGY: strict
+            VLLM_ATTENTION_BACKEND: TRITON_ATTN
 
           vllm_serve_kwargs:
-            attention_backend: TRITON_ATTN
             tensor_parallel_size: 4
             data_parallel_size: 2
             data_parallel_size_local: 1
@@ -489,9 +497,10 @@ env:
           debug: true
           vllm_serve_env_vars:
             VLLM_RAY_DP_PACK_STRATEGY: strict
+            VLLM_ATTENTION_BACKEND: FLASH_ATTN
+            NCCL_MNNVL_ENABLE: "0"
 
           vllm_serve_kwargs:
-            attention_backend: FLASH_ATTN
             tensor_parallel_size: 4
             data_parallel_size: 4
             data_parallel_size_local: 1
@@ -508,8 +517,6 @@ env:
               num_threads: 112
             compilation_config:
               cudagraph_capture_sizes: [1,2,4,8,16,32]
-          server_env:
-            NCCL_MNNVL_ENABLE: "0"
 
     inverse_if:
       resources_servers:
@@ -576,6 +583,7 @@ env:
           ray_worker_py_executable: /opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker/bin/python
           vllm_serve_env_vars:
             VLLM_RAY_DP_PACK_STRATEGY: strict
+            NCCL_MNNVL_ENABLE: "0"
 
           vllm_serve_kwargs:
             tensor_parallel_size: 4
@@ -593,8 +601,6 @@ env:
             load_format: instanttensor
             compilation_config:
               cudagraph_capture_sizes: [1,2,4,8,16,32]
-          server_env:
-            NCCL_MNNVL_ENABLE: "0"
 
     lc_judge:
       resources_servers:
@@ -646,15 +652,6 @@ logger:
   gpu_monitoring:
     collection_interval: 10
     flush_interval: 10
-
-# =============================================================================
-# Effort Levels
-# =============================================================================
-effort_levels:
-  low_string: "{reasoning effort: efficient}"
-  low_weight: 0.1
-  low_penalty: 1
-  low_ub: 15000
 
 # =============================================================================
 # Token IDs (model-specific)
