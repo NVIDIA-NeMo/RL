@@ -1,8 +1,8 @@
 # Qwen 3.5 runtime overlay
 
 This directory contains the Qwen 3.5-specific recipe and runtime overlay for
-running `Qwen/Qwen3.5-397B-A17B` on top of the Carlos/grpo-studies
-`mlperf-training` branch.
+running `Qwen/Qwen3.5-397B-A17B` on top of the GitHub RL `mlperf-training`
+branch.
 
 The goal is to keep Qwen 3.5 support isolated. Non-Qwen/Nemotron runs should use
 the baked container code and normal recipes unless this directory is explicitly
@@ -25,6 +25,35 @@ Qwen 3.5 support currently needs more than YAML values:
 Hydra config can select model-family values, but it cannot create Pyxis/container
 file mounts. Since these compatibility files must override files inside the baked
 container at `/opt/nemo-rl`, a small launcher hook is required.
+
+## Container image
+
+The Qwen overlay is mounted at launch time, but the job still needs a Gym-capable
+NeMo RL container. Use a site-provided equivalent image, or build and publish the
+bleeding-edge Gym image from this checkout:
+
+```bash
+export IMAGE_PREFIX=registry.example.com/my-team/nemo-rl
+
+docker buildx build --platform linux/amd64 \
+  -t "${IMAGE_PREFIX}:v0.6.0-gym" \
+  --push \
+  -f docker/Dockerfile.gym_v0.6.0 .
+
+docker buildx build --platform linux/amd64 \
+  --build-arg BASE_IMAGE="${IMAGE_PREFIX}:v0.6.0-gym" \
+  --build-arg NEMO_RL_REF=main \
+  --build-arg MEGATRON_BRIDGE_REF=main \
+  --build-arg MEGATRON_LM_REF=main \
+  -t "${IMAGE_PREFIX}:gym-bleeding-edge" \
+  --push \
+  -f docker/Dockerfile.gym_bleeding_edge .
+```
+
+Set `CONTAINER_IMAGE_PATH` to whatever image reference the target Slurm/Pyxis
+site accepts for that image: a registry reference, `.sqsh` path, or other
+site-local image identifier. The Qwen files in this branch do not need to be
+baked into the image; the launcher stages and mounts them under `/opt/nemo-rl`.
 
 ## How selection works
 
@@ -57,6 +86,42 @@ qwen_35/overrides/nemo_rl/models/megatron/setup.py
 
 This lets the selected config and only that config bring the Qwen 3.5 runtime
 patches into the container.
+
+## Required launch inputs
+
+Before submitting a training job, set these environment variables:
+
+| Variable | Purpose |
+| --- | --- |
+| `EXP_NAME` | Result directory name under `${REPO_LOCATION}/results`. |
+| `REPO_LOCATION` | Host path to this RL checkout. Usually `"$PWD"`. |
+| `RECIPE` | Must be `qwen_35/configs/grpo_qwen35_397b_swe_openhands_async.yaml`. |
+| `CONTAINER_IMAGE_PATH` | Gym-capable container image built above or provided by the site. |
+| `SLURM_ACCOUNT`, `SLURM_PARTITION` | Slurm allocation. |
+| `GPUS_PER_NODE` | GPUs per node requested by the job. |
+| `TRAIN_NODES`, `GEN_NODES` | Policy training and generation node counts. |
+| `HF_CKPT_PATH` | Host path to the Qwen 3.5 HF checkpoint. |
+| `NRL_MEGATRON_CHECKPOINT_DIR` | Host path for the Megatron checkpoint cache/output. |
+| `NEMO_GYM_SWE_TRAIN_DATA_PATH` | Host path to the SWE train JSONL. |
+| `NEMO_GYM_SWE_VALIDATION_DATA_PATH` | Host path to the SWE validation JSONL. |
+| `NEMO_GYM_SWE_SIF_DIR` | Host directory containing R2E/SWE SIF images. |
+
+Common optional inputs:
+
+- `SLURM_TIME`, `SLURM_QOS`/`SBATCH_QOS`, and `SBATCH_GRES` or `SLURM_GRES`
+  select cluster-specific queue settings.
+- `NODES` can be set explicitly; if omitted, the launcher computes it from
+  `TRAIN_NODES + GEN_NODES`.
+- `NEMO_GYM_SWE_FALLBACK_SIF_DIR` adds a second host SIF root for datasets that
+  reference images outside `NEMO_GYM_SWE_SIF_DIR`.
+- `EXTRA_MOUNTS` appends site-specific container mounts, for example
+  `/dev/fuse:/dev/fuse` on clusters that need FUSE for nested SIF execution.
+- `CONTAINER_HF_CKPT_PATH`, `CONTAINER_NRL_MEGATRON_CHECKPOINT_DIR`,
+  `CONTAINER_NEMO_GYM_SWE_TRAIN_DATA_PATH`,
+  `CONTAINER_NEMO_GYM_SWE_VALIDATION_DATA_PATH`, and
+  `CONTAINER_NEMO_GYM_SWE_SIF_DIR` override the default in-container paths.
+  Leave them at the launcher defaults unless the site requires a different
+  mount layout.
 
 ## What the config changes
 
@@ -158,19 +223,22 @@ The following is the 64-node R2E/Qwen 3.5 study shape used for the
 OCI-HSG. It is intentionally verbose so the run can be reproduced without
 depending on local shell wrappers.
 
-Run from the grpo-studies checkout on branch `arigazz/qwen35-clobber`:
+Run from the GitHub RL checkout on branch `arigazzi/qwen35-PR-clean`:
 
 ```bash
-cd /lustre/fsw/portfolios/coreai/projects/coreai_mlperf_training/users/arigazzi/grpo-studies-qwen35
-git checkout arigazz/qwen35-clobber
-git pull --ff-only origin arigazz/qwen35-clobber
+cd /path/to/RL
+git fetch origin
+git checkout arigazzi/qwen35-PR-clean
+git pull --ff-only origin arigazzi/qwen35-PR-clean
 
 stamp=$(date +%Y%m%d-%H%M%S)
 export EXP_NAME="swe-qwen35-r2e-wlogging-64k-30turn-pp2real-32train32gen-4h-qwen35branch-${stamp}"
 
 export REPO_LOCATION="$PWD"
 export RECIPE=qwen_35/configs/grpo_qwen35_397b_swe_openhands_async.yaml
-export CONTAINER_IMAGE_PATH=/lustre/fs1/portfolios/coreai/projects/coreai_mlperf_training/containers/nemorl_v0.6_prebaked_arm_clean_w_logging.sqsh
+# Use a site-local image built from docker/Dockerfile.gym_bleeding_edge, or an
+# equivalent Gym-capable NeMo RL image.
+export CONTAINER_IMAGE_PATH=/path/to/nemo-rl-gym-bleeding-edge.sqsh
 
 export SLURM_ACCOUNT=coreai_mlperf_training
 export SLURM_PARTITION=batch
@@ -214,7 +282,7 @@ current R2E train/validation JSONL there, so leave
 does require `/dev/fuse` for nested R2E SIF execution:
 
 ```bash
-export CONTAINER_IMAGE_PATH=/lustre/fsw/coreai_mlperf_training/users/cgomes/containers/optimized+nemorl_v0.6_prebaked_arm_clean_w_logging
+export CONTAINER_IMAGE_PATH=/lustre/fsw/coreai_mlperf_training/users/${USER}/containers/nemo-rl-gym-bleeding-edge
 export HF_CKPT_PATH=/lustre/fsw/coreai_mlperf_training/users/arigazzi/nemotron3_ultra_550b/hf_home/hub/models--Qwen--Qwen3.5-397B-A17B/snapshots/8472618112abcbd45acbcdc58436aff4233c23f7
 export CONTAINER_HF_CKPT_PATH="$HF_CKPT_PATH"
 export NRL_MEGATRON_CHECKPOINT_DIR=/lustre/fsw/coreai_mlperf_training/users/arigazzi/nemotron3_ultra_550b/mcore_ckpt_cache
@@ -228,14 +296,12 @@ export EXTRA_MOUNTS=/dev/fuse:/dev/fuse
 
 Then launch. The recipe owns the R2E SIF formatter list; do not pass it as a
 Hydra CLI override because the `{instance_id}` placeholders are parsed as
-override grammar unless heavily escaped.
+override grammar unless heavily escaped. The recipe also reads the model path,
+data paths, and SIF directory from the `CONTAINER_*` environment variables set
+above, so normal launches do not need path overrides.
 
 ```bash
 bash examples/nemo_gym/launch_nemo_gym_multinode_training.sh \
-  "policy.model_name=${HF_CKPT_PATH}" \
-  "data.train.data_path=${CONTAINER_NEMO_GYM_SWE_TRAIN_DATA_PATH}" \
-  "data.validation.data_path=${CONTAINER_NEMO_GYM_SWE_VALIDATION_DATA_PATH}" \
-  "sif_dir=${NEMO_GYM_SWE_SIF_DIR}" \
   "logger.wandb_enabled=False"
 ```
 
