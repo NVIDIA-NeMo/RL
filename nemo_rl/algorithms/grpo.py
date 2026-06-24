@@ -571,6 +571,20 @@ def setup(
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
     # Define initialization functions that will be used in all paths
+    init_reference_model = loss_config["reference_policy_kl_penalty"] > 0
+
+    # Auto-enable skip_reference_policy_logprobs_calculation when the reference
+    # model is not loaded.
+    if not init_reference_model and not grpo_config.get(
+        "skip_reference_policy_logprobs_calculation"
+    ):
+        grpo_config["skip_reference_policy_logprobs_calculation"] = True
+        print(
+            "Auto-enabling `grpo.skip_reference_policy_logprobs_calculation=True` "
+            "because `loss_fn.reference_policy_kl_penalty == 0` "
+            "(reference model is not loaded)."
+        )
+
     def init_policy():
         """Initialize policy training workers."""
         t0 = time.perf_counter()
@@ -582,6 +596,7 @@ def setup(
             weights_path=weights_path,
             optimizer_path=optimizer_path,
             init_optimizer=True,
+            init_reference_model=init_reference_model,
         )
         return p, time.perf_counter() - t0
 
@@ -1896,6 +1911,10 @@ def grpo_train(
                                 timer=timer,
                             )["reference_logprobs"]
                         )
+                    else:
+                        train_data["reference_policy_logprobs"] = torch.zeros_like(
+                            train_data["prev_logprobs"]
+                        )
 
                     del logprob_data
                     del extra_multimodal_data
@@ -2622,6 +2641,12 @@ def async_grpo_train(
         "Importance sampling correction must be enabled for async GRPO for good convergence due to off-policy samples!"
     )
 
+    if master_config["grpo"].get("skip_reference_policy_logprobs_calculation"):
+        assert master_config["loss_fn"]["reference_policy_kl_penalty"] == 0
+        print(
+            "Reference policy logprob calculation will be skipped since `grpo.skip_reference_policy_logprobs_calculation` is set to True and `loss_fn.reference_policy_kl_penalty` is 0."
+        )
+
     if master_config["grpo"]["async_grpo"]["max_trajectory_age_steps"] > 1:
         if not master_config["grpo"]["async_grpo"].get(
             "in_flight_weight_updates", False
@@ -3021,12 +3046,19 @@ def async_grpo_train(
                         train_data,
                         timer=timer,
                     )["logprobs"]
-                    reference_logprobs = policy.get_reference_policy_logprobs(
-                        train_data,
-                        timer=timer,
-                    )["reference_logprobs"]
                     train_data["prev_logprobs"] = fprop_logprobs
-                    train_data["reference_policy_logprobs"] = reference_logprobs
+                    if not master_config["grpo"].get(
+                        "skip_reference_policy_logprobs_calculation"
+                    ):
+                        reference_logprobs = policy.get_reference_policy_logprobs(
+                            train_data,
+                            timer=timer,
+                        )["reference_logprobs"]
+                        train_data["reference_policy_logprobs"] = reference_logprobs
+                    else:
+                        train_data["reference_policy_logprobs"] = torch.zeros_like(
+                            fprop_logprobs
+                        )
 
                     (
                         max_seq_mult_prob_error,
