@@ -472,8 +472,16 @@ def vlm_hf_data_processor(
         datum_dict = format_refcoco_dataset(datum_dict)
     elif datum_dict["task_name"] == "geometry3k":
         datum_dict = format_geometry3k_dataset(datum_dict)
+    elif datum_dict["task_name"] == "mmpr-tiny":
+        from nemo_rl.data.datasets.response_datasets.mmpr_tiny import (
+            format_mmpr_tiny_dataset,
+        )
+
+        datum_dict = format_mmpr_tiny_dataset(datum_dict)
     elif datum_dict["task_name"] == "avqa":
         pass  # AVQA data is already formatted by AVQADataset.format_data
+    elif datum_dict["task_name"] == "audiomcq":
+        pass  # AudioMCQ data is already formatted by AudioMCQDataset.format_data
     elif datum_dict["task_name"] == "mmau":
         pass  # MMAU data is already formatted by MMAUDataset.format_data
     else:
@@ -521,13 +529,36 @@ def vlm_hf_data_processor(
 
     images = [resolve_to_image(image) for image in images]
 
+    # Detect processors that use <image> placeholder style (e.g., NemotronOmni/InternVL)
+    # vs OpenAI content list style (e.g., Qwen-VL, Gemma).
+    # These processors expand <image> tokens in __call__ but NOT in apply_chat_template,
+    # so we must use processor(text=..., images=...) directly.
+    _PLACEHOLDER_STYLE_PROCESSORS = (
+        "NemotronNanoVLV2Processor",
+        "NemotronH_Nano_Omni_Reasoning_V3Processor",
+    )
+    _uses_image_placeholder = type(processor).__name__ in _PLACEHOLDER_STYLE_PROCESSORS
+
+    if _uses_image_placeholder and images:
+        # Convert content list to <image> placeholder text format
+        image_token = getattr(processor, "image_token", "<image>")
+        text_parts = []
+        for content in user_message["content"]:
+            if content["type"] == "image":
+                text_parts.append(image_token)
+            elif content["type"] == "text":
+                text_parts.append(content["text"])
+        user_message_for_tokenize = {"role": "user", "content": "\n".join(text_parts)}
+    else:
+        user_message_for_tokenize = user_message
+
     # get formatted user message
     if hasattr(processor, "conversation_preprocessor"):
         user_message_for_chat_template = processor.conversation_preprocessor(
             user_message
         )
     else:
-        user_message_for_chat_template = user_message
+        user_message_for_chat_template = user_message_for_tokenize
 
     # this is the string-tokenized conversation template for the generation policy (for vllm)
     string_formatted_dialog = processor.apply_chat_template(
@@ -537,18 +568,35 @@ def vlm_hf_data_processor(
     )
 
     # this is the id-tokenized and image processed conversation template for the policy
-    message: dict = processor.apply_chat_template(
-        [user_message],
-        tokenize=True,
-        add_generation_prompt=True,
-        return_tensors="pt",
-        return_dict=True,
-    )
+    if _uses_image_placeholder and images:
+        # Dynamic-resolution path: keep pixel_values in float32 to match vLLM's
+        # DynamicResolutionImageTiler bit-for-bit. vLLM stores/normalizes in
+        # float32 and only casts at the vision_model boundary; matching that
+        # rounding order tightens rollout/train logprob agreement. The model
+        # forward dispatches on imgs_sizes and handles the bf16 cast.
+        message: dict = processor(
+            text=string_formatted_dialog,
+            images=images,
+            return_tensors="pt",
+        )
+    else:
+        message: dict = processor.apply_chat_template(
+            [user_message_for_tokenize],
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
+            return_dict=True,
+        )
 
     # add this for backward compatibility
     user_message["token_ids"] = message["input_ids"][0]
     # add all keys and values to the user message, and the list of keys
-    multimodal_keys = get_multimodal_keys_from_processor(processor)
+    multimodal_keys = list(get_multimodal_keys_from_processor(processor))
+    # imgs_sizes is not declared in model_input_names by the NemotronOmni
+    # checkpoint's bundled image_processor, so append it explicitly when
+    # present. It packs along dim=0 (per-image).
+    if "imgs_sizes" in message and "imgs_sizes" not in multimodal_keys:
+        multimodal_keys.append("imgs_sizes")
     for key in multimodal_keys:
         if key in message:
             user_message[key] = PackedTensor(
@@ -707,6 +755,33 @@ def nemo_gym_data_processor(
     return output
 
 
+def kd_data_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer: TokenizerType,
+    max_seq_length: int | None,
+    idx: int,
+) -> DatumSpec:
+    """Process a raw-text datum for cross-tokenizer distillation.
+
+    Tokenization is deferred to the collator, so the text is carried forward
+    as a single assistant message in ``message_log``.
+    """
+    output: DatumSpec = {
+        # Defensive shallow-per-message copy so downstream mutation (e.g.
+        # adding token_ids) doesn't leak back into the dataset row.
+        "message_log": [dict(m) for m in datum_dict["messages"]],
+        "loss_multiplier": 1.0,
+        "idx": idx,
+        # fake keys (not used for cross-tokenizer distillation)
+        "length": 0,
+        "extra_env_info": None,
+    }
+    if "task_name" in datum_dict:
+        output["task_name"] = datum_dict["task_name"]
+    return output
+
+
 # Processor registry. Key is the processor name, value is the processor function.
 # Note: We cast the literal dict to Dict[str, TaskDataProcessFnCallable] because
 # type checkers see each concrete function's signature as a distinct callable type.
@@ -718,6 +793,7 @@ PROCESSOR_REGISTRY: Dict[str, TaskDataProcessFnCallable] = cast(
     {
         "default": math_hf_data_processor,
         "helpsteer3_data_processor": helpsteer3_data_processor,
+        "kd_data_processor": kd_data_processor,
         "math_data_processor": math_data_processor,
         "math_hf_data_processor": math_hf_data_processor,
         "multichoice_qa_processor": multichoice_qa_processor,

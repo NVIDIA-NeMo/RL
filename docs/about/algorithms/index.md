@@ -8,9 +8,11 @@ NeMo RL supports multiple training algorithms for post-training large language m
 |------------|-------------|------------|
 | [GRPO](grpo.md) | [GRPO Single Node](grpo.md#grpo-single-node) | [GRPO Multi-node](grpo.md#grpo-multi-node): [GRPO Qwen2.5-32B](grpo.md#grpo-qwen25-32b), [GRPO Multi-Turn](grpo.md#grpo-multi-turn) |
 | [DAPO](dapo.md) | [DAPO Single Node](dapo.md#dapo-single-node) | [DAPO Multi-node](dapo.md#dapo-multi-node) |
+| [CISPO](cispo.md) | [CISPO Configuration](cispo.md#configuration) | [CISPO Async Lag-1 Recipe](cispo.md#async-lag-1-recipe) |
 | [On-policy Distillation](on-policy-distillation.md) | [Distillation Single Node](on-policy-distillation.md#on-policy-distillation-single-node) | [Distillation Multi-node](on-policy-distillation.md#on-policy-distillation-multi-node) |
 | [Supervised Fine-Tuning (SFT)](sft.md) | [SFT Single Node](sft.md#sft-single-node) | [SFT Multi-node](sft.md#sft-multi-node) |
 | [DPO](dpo.md) | [DPO Single Node](dpo.md#dpo-single-node) | [DPO Multi-node](dpo.md#dpo-multi-node) |
+| [PPO](ppo.md) | [PPO Single Node](ppo.md#ppo-single-node) | [PPO Multi-node](ppo.md#ppo-multi-node) |
 | [RM](rm.md) | [RM Single Node](rm.md#rm-single-node) | [RM Multi-node](rm.md#rm-multi-node) |
 
 On-policy distillation is also supported in the PyTorch DTensor path.
@@ -20,6 +22,8 @@ On-policy distillation is also supported in the PyTorch DTensor path.
 
 grpo
 dapo
+cispo
+ppo
 on-policy-distillation
 sft
 dpo

@@ -92,11 +92,11 @@ test -d $WEIGHTS_DIR || { echo "[FAIL] no policy/weights under $STEP_DIR"; exit 
 rm -rf $EXPORT_DIR
 mkdir -p $EXPORT_DIR
 
-MEGATRON_LM_SRC=$PROJECT_ROOT/3rdparty/Megatron-LM-workspace/Megatron-LM
+MEGATRON_LM_SRC=$PROJECT_ROOT/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM
 PYTHONPATH=$MEGATRON_LM_SRC:${PYTHONPATH:-} \
 uv run --extra mcore --extra modelopt \
     torchrun --nproc_per_node 1 \
-    $PROJECT_ROOT/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/examples/quantization/export.py \
+    $PROJECT_ROOT/examples/modelopt/export_quantized_to_hf.py \
     --hf-model-id $HF_MODEL \
     --megatron-load-path $WEIGHTS_DIR \
     --export-dir $EXPORT_DIR \

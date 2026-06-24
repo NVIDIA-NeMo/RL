@@ -179,6 +179,24 @@ Your JSONL files should contain one JSON object per line with the following stru
 }
 ```
 
+### Custom datasets defined outside NeMo RL
+
+If you want to plug in a preference dataset class that lives outside the
+`nemo_rl` package (so you don't have to edit the built-in registry), set
+`dataset_name` to a fully qualified dotted import path. The dispatcher
+will import the module and resolve the class. The class must accept the
+same kwargs as the built-in datasets (i.e. the full data config) and
+implement `set_task_spec`.
+
+```yaml
+data:
+  default:
+    dataset_name: my_pkg.my_module.MyPreferenceDataset  # importable from PYTHONPATH
+```
+
+The class must be importable — install it as a package or add its
+parent directory to `PYTHONPATH` before launching training.
+
 Please note:
 - If you are using a logger, the prefix used for each validation set will be `validation-<NameOfValidationDataset>`. The total validation time, summed across all validation sets, is reported under `timing/validation/total_validation_time`.
 - If you are doing checkpointing, the `metric_name` value in your `checkpointing` config should reflect the metric and validation set to be tracked. For example, `validation-<NameOfValidationDataset1>_loss`.
@@ -194,6 +212,16 @@ The DPO implementation in NeMo RL supports several key parameters that can be ad
 - `dpo.sft_average_log_probs`: Whether to average log probabilities over tokens in the SFT loss term
 
 These parameters can be adjusted in the config file or via command-line overrides to optimize training for your specific use case.
+
+## LoRA Configuration
+
+DPO supports LoRA on both the DTensor and Megatron backends. To enable LoRA on the default DTensor backend:
+
+```bash
+uv run examples/run_dpo.py policy.dtensor_cfg.lora_cfg.enabled=true
+```
+
+For the full reference — backend support, the DTensor vs Megatron schema comparison, config examples, parameter details, and example recipes — see the dedicated [LoRA guide](lora.md).
 
 ## Optimizations
 
