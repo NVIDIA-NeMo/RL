@@ -136,24 +136,25 @@ def apply_fp8_patches(self, fp8_config):
         func2_path = "vllm.model_executor.layers.quantization.fp8.Fp8MoEMethod.process_weights_after_loading"
         patcher2 = patch(func2_path, process_weights_after_loading_moe)
         fp8_state.vllm_patches.append(patcher2)
-        fp8_state.vllm_patches.append(
-            patch(
-                "vllm.model_executor.layers.quantization.modelopt.ModelOptMxFp8LinearMethod.process_weights_after_loading",
-                process_weights_after_loading_mxfp8_linear,
+        if global_fp8_config.is_mx:
+            fp8_state.vllm_patches.append(
+                patch(
+                    "vllm.model_executor.layers.quantization.modelopt.ModelOptMxFp8LinearMethod.process_weights_after_loading",
+                    process_weights_after_loading_mxfp8_linear,
+                )
             )
-        )
-        fp8_state.vllm_patches.append(
-            patch(
-                "vllm.model_executor.layers.quantization.modelopt.ModelOptMxFp8FusedMoE.create_weights",
-                create_weights_mxfp8_moe,
+            fp8_state.vllm_patches.append(
+                patch(
+                    "vllm.model_executor.layers.quantization.modelopt.ModelOptMxFp8FusedMoE.create_weights",
+                    create_weights_mxfp8_moe,
+                )
             )
-        )
-        fp8_state.vllm_patches.append(
-            patch(
-                "vllm.model_executor.layers.quantization.modelopt.ModelOptMxFp8FusedMoE.process_weights_after_loading",
-                process_weights_after_loading_mxfp8_moe,
+            fp8_state.vllm_patches.append(
+                patch(
+                    "vllm.model_executor.layers.quantization.modelopt.ModelOptMxFp8FusedMoE.process_weights_after_loading",
+                    process_weights_after_loading_mxfp8_moe,
+                )
             )
-        )
 
         # These patches add support for pow2, e8 dynamic activation scalings factors which are believed to have higher
         # SNR compared to plain fp32 scaling factors. This feature is still under active research.
@@ -164,7 +165,7 @@ def apply_fp8_patches(self, fp8_config):
             patcher2 = patch(func2_path, per_token_group_quant_fp8)
             patcher3 = patch(func3_path, _per_token_group_quant_fp8)
             patcher4 = patch(func4_path, _per_token_group_quant_fp8_colmajor)
-            fp8_state.vllm_patches.append(patcher2, patcher3, patcher4)
+            fp8_state.vllm_patches.extend([patcher2, patcher3, patcher4])
 
         # Static scales mode: patch process_weights_after_loading to preserve k_scale/v_scale for manual updates
         func5_path = "vllm.model_executor.layers.quantization.kv_cache.BaseKVCacheMethod.process_weights_after_loading"
@@ -198,7 +199,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         )
 
     if use_fp8_weights:
-        is_mx = vllm_cfg.get("is_mx", False)
+        is_mx = bool(vllm_cfg.get("is_mx"))
     else:
         is_mx = False
     fp8_config_kwargs = {
@@ -210,12 +211,12 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     }
     if is_mx:
         fp8_config_kwargs["is_mx"] = True
-        assert vllm_cfg.get("pow2_weight_scaling_factors", True) == True, (
-            "only pow2 weight scaling factors are supported for MXFP8"
-        )
-        assert vllm_cfg.get("pow2_activation_scaling_factors", True) == True, (
-            "only pow2 activation scaling factors are supported for MXFP8"
-        )
+        if vllm_cfg.get("pow2_weight_scaling_factors") is False:
+            raise ValueError("only pow2 weight scaling factors are supported for MXFP8")
+        if vllm_cfg.get("pow2_activation_scaling_factors") is False:
+            raise ValueError(
+                "only pow2 activation scaling factors are supported for MXFP8"
+            )
     else:
         fp8_config_kwargs["is_mx"] = False
         fp8_config_kwargs["use_weight_pow2_scale"] = vllm_cfg.get(
@@ -303,10 +304,18 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
 
 def is_fp8_model(vllm_config):
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
-    from vllm.model_executor.layers.quantization.modelopt import ModelOptMxFp8Config
+
+    try:
+        from vllm.model_executor.layers.quantization.modelopt import (
+            ModelOptMxFp8Config,
+        )
+    except ImportError:
+        quant_config_types = (Fp8Config,)
+    else:
+        quant_config_types = (Fp8Config, ModelOptMxFp8Config)
 
     if hasattr(vllm_config, "quant_config") and isinstance(
-        vllm_config.quant_config, (Fp8Config, ModelOptMxFp8Config)
+        vllm_config.quant_config, quant_config_types
     ):
         if isinstance(vllm_config.quant_config, Fp8Config):
             assert vllm_config.quant_config.weight_block_size is not None, (
@@ -415,10 +424,6 @@ def _is_fp8_weight(name, model):
 
 
 def load_weights(weights, model_runner):
-    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
-        mxfp8_e4m3_quantize,
-    )
-
     global global_fp8_config
     weights_quantized = []
     model = model_runner.model
@@ -429,6 +434,10 @@ def load_weights(weights, model_runner):
             continue
         # Cast the weight into fp8 and its scale factor
         if global_fp8_config.is_mx:
+            from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+                mxfp8_e4m3_quantize,
+            )
+
             param_lp, param_scale = mxfp8_e4m3_quantize(v)
         else:
             param_lp, param_scale = cast_tensor_to_fp8_blockwise(
