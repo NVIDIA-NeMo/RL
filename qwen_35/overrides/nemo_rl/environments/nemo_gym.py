@@ -11,12 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import os
-import sys
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TypedDict
 
+import aiohttp
 import ray
 import torch
 from transformers import PreTrainedTokenizerBase
@@ -232,7 +234,6 @@ Depending on your data shape, you may want to change these values."""
         tokenizer: PreTrainedTokenizerBase,
         timer_prefix: str,
     ) -> tuple[list[dict], dict]:
-        import sys
         from collections import Counter
 
         try:
@@ -256,14 +257,21 @@ Depending on your data shape, you may want to change these values."""
             head_server_config=self.head_server_config,
         )
 
+        nemo_gym_num_rows = len(nemo_gym_examples)
         num_results = 0
         nemo_rl_rowidxs = []
         nemo_rl_results = []
-        timing_metrics = {}
         for task in nemo_gym_result_iterator:
             with _timer_time(timer, label=f"{timer_prefix}/await_results", should_log=False):
                 try:
                     nemo_gym_row, nemo_gym_result = await task
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    print(
+                        f"  [nemo_gym] WARNING: rollout failed ({type(e).__name__}: {e}); "
+                        "will back-fill as a zero-reward trajectory instead of aborting the batch.",
+                        flush=True,
+                    )
+                    continue
                 except Exception as e:
                     # This response content comes from https://github.com/NVIDIA-NeMo/Gym/blob/30f498b1e994679cebcfacfa4ac630190d0e171f/nemo_gym/server_utils.py#L233
                     if hasattr(e, "response_content"):
@@ -281,17 +289,10 @@ Depending on your data shape, you may want to change these values."""
                     ):
                         if torch.isnan(message["generation_logprobs"]).any():
                             raise RuntimeError(
-                                f"Generation logprobs contain NaN! Failing loudly"
+                                "Generation logprobs contain NaN! Failing loudly"
                             )
 
             num_results += 1
-            if num_results == len(nemo_gym_examples):
-                timer.stop("_run_rollouts_total")
-                timing_metrics = timer.get_timing_metrics("sum")
-                total_time = timing_metrics.pop("_run_rollouts_total")
-                timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = (
-                    100 * timing_metrics[f"{timer_prefix}/postprocess_results"] / total_time
-                )
 
             nemo_rl_rowidxs.append(nemo_gym_row["_rowidx"])
             nemo_rl_results.append(nemo_rl_result)
@@ -309,6 +310,29 @@ Depending on your data shape, you may want to change these values."""
         nemo_rl_sort_results = [None] * len(nemo_gym_examples)
         for rowidx, result in zip(nemo_rl_rowidxs, nemo_rl_results):
             nemo_rl_sort_results[rowidx] = result
+
+        num_failed = sum(1 for r in nemo_rl_sort_results if r is None)
+        if num_failed:
+            print(
+                f"  [nemo_gym] WARNING: back-filling {num_failed}/{nemo_gym_num_rows} failed "
+                "rollout(s) as zero-reward trajectories (batch counts preserved).",
+                flush=True,
+            )
+            for i in range(nemo_gym_num_rows):
+                if nemo_rl_sort_results[i] is None:
+                    nemo_rl_sort_results[i] = (
+                        self._postprocess_nemo_gym_to_nemo_rl_result(
+                            {"response": {"output": []}}, tokenizer
+                        )
+                    )
+
+        timer.stop("_run_rollouts_total")
+        timing_metrics = timer.get_timing_metrics("sum")
+        total_time = timing_metrics.pop("_run_rollouts_total")
+        postprocess_time = timing_metrics.get(f"{timer_prefix}/postprocess_results", 0.0)
+        timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = (
+            100 * postprocess_time / total_time if total_time else 0.0
+        )
 
         return nemo_rl_sort_results, timing_metrics
 
@@ -438,12 +462,17 @@ Output prompt token IDs summary: {_summarize_token_ids(output_item_dict["prompt_
                 output_item_dict["generation_str"] = generation_str
 
         if not nemo_rl_message_log:
-            input_messages = nemo_gym_result["responses_create_params"]["input"]
+            input_messages = nemo_gym_result.get("responses_create_params", {}).get(
+                "input"
+            )
             try:
-                prompt_token_ids = tokenizer.apply_chat_template(
-                    input_messages, tokenize=True
-                )
-                prompt_len_str = f"{len(prompt_token_ids)} tokens"
+                if input_messages is None:
+                    prompt_len_str = "<unknown>"
+                else:
+                    prompt_token_ids = tokenizer.apply_chat_template(
+                        input_messages, tokenize=True
+                    )
+                    prompt_len_str = f"{len(prompt_token_ids)} tokens"
             except Exception as e:
                 prompt_len_str = (
                     f"<unknown — apply_chat_template failed: {type(e).__name__}: {e}>"
@@ -451,17 +480,34 @@ Output prompt token IDs summary: {_summarize_token_ids(output_item_dict["prompt_
             output_item_types = [
                 o.get("type") for o in nemo_gym_result["response"]["output"]
             ]
-            raise ValueError(
+            fallback_token = (
+                tokenizer.pad_token_id
+                if tokenizer.pad_token_id is not None
+                else (tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0)
+            )
+            print(
                 f"NeMo Gym returned a result with no generation data. "
                 f"Possible causes: (1) the prompt for the first turn already exceeds the vLLM max_model_len, "
                 f"so vLLM rejected the request before any tokens could be generated; "
                 f"(2) all response output items were reasoning/tool-call items with no assistant generation.\n"
                 f"  Prompt length: {prompt_len_str}.\n"
                 f"  response.output item types ({len(output_item_types)} items): {output_item_types}.\n"
-                f"  → If (1): increase `policy.max_total_sequence_length` and `policy.generation.vllm_cfg.max_model_len` "
-                f"above the prompt length above.\n"
-                f"  → If (2): inspect why no assistant content was produced for this rollout."
+                "  Treating this rollout as a masked zero-reward trajectory instead of aborting the batch.",
+                flush=True,
             )
+            nemo_rl_message_log = [
+                {
+                    "role": "user",
+                    "content": "",
+                    "token_ids": torch.tensor([fallback_token, fallback_token]),
+                },
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "token_ids": torch.tensor([fallback_token]),
+                },
+            ]
+            nemo_gym_result["reward"] = 0.0
 
         return {
             "message_log": nemo_rl_message_log,

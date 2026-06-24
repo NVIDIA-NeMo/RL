@@ -54,6 +54,7 @@ checkpointing:
   checkpoint_must_save_by: null
 
 policy:
+  model_name: ${oc.env:CONTAINER_HF_CKPT_PATH}
   train_global_batch_size: 512
   train_micro_batch_size: 1
   logprob_batch_size: 1

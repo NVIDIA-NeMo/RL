@@ -932,6 +932,23 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 return super().model_post_init(context)
 
         class NeMoRLOpenAIServingMixin:
+            @staticmethod
+            def _set_max_tokens(request, max_tokens: int) -> None:
+                """Set the request's max output tokens in place."""
+                if request.max_completion_tokens is not None:
+                    request.max_completion_tokens = max_tokens
+                elif request.max_tokens is not None:
+                    request.max_tokens = max_tokens
+
+            def _clamp_max_tokens(
+                self, request, request_max_tokens: int, prompt_token_ids: list
+            ) -> None:
+                """Clamp the request's max output tokens so input + output <= max_model_len."""
+                remaining = max(
+                    0, self.model_config.max_model_len - len(prompt_token_ids)
+                )
+                self._set_max_tokens(request, min(request_max_tokens, remaining))
+
             async def _preprocess_chat(
                 self,
                 request,
@@ -967,6 +984,17 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                         update={"truncate_prompt_tokens": truncate_prompt_tokens}
                     )
 
+                # Temporarily set max output tokens to 1 so vLLM's pre-tokenization
+                # length check passes; restore the real clamped value once the
+                # final prompt token ids are known.
+                actual_request_max_tokens = None
+                if isinstance(request, NeMoRLChatCompletionRequest):
+                    actual_request_max_tokens = (
+                        request.max_completion_tokens or request.max_tokens
+                    )
+                    if actual_request_max_tokens is not None:
+                        self._set_max_tokens(request, 1)
+
                 # res is (conversation, [engine_prompt])
                 try:
                     res = await super()._preprocess_chat(
@@ -990,6 +1018,12 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                     raise
 
                 if request.required_prefix_token_ids is None:
+                    if actual_request_max_tokens is not None:
+                        self._clamp_max_tokens(
+                            request,
+                            actual_request_max_tokens,
+                            res[1][0]["prompt_token_ids"],
+                        )
                     return res
 
                 # Copy after vLLM preprocessing so prefix and full-prompt paths
@@ -1081,6 +1115,13 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 )
 
                 engine_prompt["prompt_token_ids"] = final_prompt_token_ids
+
+                if actual_request_max_tokens is not None:
+                    self._clamp_max_tokens(
+                        request,
+                        actual_request_max_tokens,
+                        final_prompt_token_ids,
+                    )
 
                 return res
 
