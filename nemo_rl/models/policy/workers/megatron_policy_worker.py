@@ -640,11 +640,14 @@ class MegatronPolicyWorkerImpl(
                         self.optimizer.zero_grad()
                         self._copy_main_params_to_param_buffer()
 
-                    # Set moe_grad_scale_func for MOE aux loss scaling.
+                    # Set moe_grad_scale_func for MoE aux-loss gradient scaling.
                     # With calculate_per_token_loss=True, the router pre-multiplies
-                    # aux_loss by num_local_tokens. Setting loss_scale = 1/global_valid_toks
-                    # makes the final MOE gradient correctly normalized:
-                    #   (1/G) * N_local * aux_grad -> after DDP SUM -> avg(aux_grad)
+                    # the aux loss by (num_local_tokens * tp_cp_group.size()), and
+                    # MoEAuxLossAutoScaler applies loss_scale to the gradient. Setting
+                    # loss_scale = 1/global_valid_toks (G = global valid token count)
+                    # normalizes the aux gradient consistently with the main per-token
+                    # SFT loss:
+                    #   (1/G) * N_local * tp_cp_size * aux_grad -> DDP SUM -> aux_grad / G
                     moe_scale = 1.0 / global_valid_toks.clamp(min=1).float()
                     self._set_moe_grad_scale_func(lambda: moe_scale)
                     # Set mtp_grad_scale_func for MTP loss scaling (scales by valid tokens)
