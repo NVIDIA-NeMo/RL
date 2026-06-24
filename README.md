@@ -755,6 +755,7 @@ If you use NeMo RL in your research, please cite it using the following BibTeX e
 
 ```bibtex
 @misc{nemo-rl,
+author = {{NVIDIA}},
 title = {NeMo RL: A Scalable and Efficient Post-Training Library},
 howpublished = {\url{https://github.com/NVIDIA-NeMo/RL}},
 year = {2025},
