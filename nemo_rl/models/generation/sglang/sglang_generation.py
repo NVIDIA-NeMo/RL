@@ -22,7 +22,6 @@ import torch
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.ray_actor_environment_registry import SGLANG_EXECUTABLE
 from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
     get_reordered_bundle,
@@ -46,6 +45,7 @@ from nemo_rl.models.generation.sglang.utils.ray_utils import (
     NOSET_VISIBLE_DEVICES_ENV_VARS_LIST,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+from nemo_rl.utils.venvs import make_actor_runtime_env
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -207,15 +207,23 @@ class SGLangGeneration(GenerationInterface):
             if global_cvd:
                 env_vars["CUDA_VISIBLE_DEVICES"] = global_cvd
 
+            # Resolve the SGLang venv on every node and pin VIRTUAL_ENV /
+            # UV_PROJECT_ENVIRONMENT so the actor (and its spawned children)
+            # actually run inside the sglang venv instead of inheriting the
+            # raylet's base venv (e.g. /opt/nemo_rl_venv inside the container).
+            sglang_runtime_env = make_actor_runtime_env(
+                "nemo_rl.models.generation.sglang.sglang_worker.SGLangGenerationWorker"
+            )
+            sglang_runtime_env["env_vars"].update(env_vars)
+            sglang_runtime_env.update(
+                get_nsight_config_if_pattern_matches("sglang_generation_worker")
+            )
+
             actor_options = {
                 "num_cpus": num_cpus,
                 "num_gpus": num_gpus,
                 "scheduling_strategy": scheduling_strategy,
-                "runtime_env": {
-                    "py_executable": SGLANG_EXECUTABLE,
-                    "env_vars": env_vars,
-                    **get_nsight_config_if_pattern_matches("sglang_generation_worker"),
-                },
+                "runtime_env": sglang_runtime_env,
             }
             init_args = (self.num_gpus_per_node, self.sglang_cfg)
             init_kwargs = {
