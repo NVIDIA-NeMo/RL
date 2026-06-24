@@ -101,7 +101,6 @@ policy: &POLICY_BASE
         # https://github.com/NVIDIA/Megatron-LM/blob/d30c3ae5469fe3f6a64d4fd2e63b6e7f7844ea81/megatron/core/transformer/transformer_config.py#L483
         # Use ["moe"] for MoE models to recompute expert activations only.
         recompute_modules: null
-        converter_type: "Qwen3ForCausalLM"
         tensor_model_parallel_size: 2
         expert_tensor_parallel_size: 1
         expert_model_parallel_size: 1
@@ -188,6 +187,10 @@ policy: &POLICY_BASE
         - milestones: [10]
 
     generation:
+        # Port range for vLLM HTTP servers, kept below the OS ephemeral range.
+        # See ray.sub for the full port layout.
+        port_range_low: 11001
+        port_range_high: 15000
         backend: "vllm"
         max_new_tokens: ${..max_total_sequence_length} # refer to local policy/teacher config
         temperature: 1.0
@@ -276,3 +279,5 @@ logger:
 cluster:
     gpus_per_node: 8
     num_nodes: 1
+    master_port_range_low: 25000
+    master_port_range_high: 28000

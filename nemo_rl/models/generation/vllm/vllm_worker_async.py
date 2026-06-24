@@ -15,6 +15,7 @@
 import asyncio
 import copy
 import gc
+import logging
 import threading
 import time
 import uuid
@@ -27,15 +28,25 @@ import uvicorn
 from fastapi import FastAPI
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
+from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_GENERATION_PORT_RANGE_HIGH,
+    DEFAULT_GENERATION_PORT_RANGE_LOW,
+    _get_free_port_local,
+    _get_node_ip_local,
+)
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
     verify_right_padding,
 )
-from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generation
+from nemo_rl.models.generation.vllm.utils import (
+    format_prompt_for_vllm_generation,
+    pad_and_align_routed_expert_indices,
+)
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _replace_prefix_tokens(
@@ -145,6 +156,93 @@ Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"""
 
 
 class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
+    def __init__(
+        self,
+        config,
+        bundle_indices=None,
+        fraction_of_gpus: float = 1.0,
+        seed=None,
+        extra_env_vars: Optional[list[str]] = None,
+        defer_model_load: bool = False,
+    ):
+        """Initialize an async vLLM worker.
+
+        When defer_model_load=True, only stores config and reserves a port for
+        the HTTP server (if expose_http_server is enabled). Call load_model()
+        later to perform the heavy model loading. This enables overlapping vLLM
+        model loading with NeMo Gym init.
+
+        Args:
+            config: Configuration dictionary for the policy
+            bundle_indices: List of local bundle indices within a node for parallelism.
+            fraction_of_gpus: Fraction of GPUs to use for this worker
+            seed: Random seed for initialization
+            extra_env_vars: Additional environment variable names to forward into
+                          the vLLM worker subprocess.
+            defer_model_load: If True, skip model loading and only reserve port
+        """
+        # Deferred-loading state. Always initialized so every instance has a
+        # consistent set of attributes regardless of init path.
+        self._reserved_socket = None
+        self._reserved_port = None
+        self._reserved_node_ip = None
+        self._deferred_bundle_indices = None
+        self._deferred_seed = None
+
+        super().__init__(
+            config,
+            bundle_indices,
+            fraction_of_gpus,
+            seed,
+            extra_env_vars,
+            defer_model_load,
+        )
+
+        if not self.is_model_owner or not defer_model_load:
+            return
+
+        self._deferred_bundle_indices = bundle_indices
+        self._deferred_seed = seed
+
+        if self.cfg["vllm_cfg"].get("expose_http_server"):
+            self._reserve_port()
+
+        self.llm = None
+        self.vllm_device_ids = None
+
+    def _reserve_port(self) -> None:
+        """Bind and listen on a TCP socket to reserve a free port from the OS.
+
+        The socket is held open in LISTENING state and later passed directly to
+        uvicorn via the ``sockets=`` parameter in ``server.serve()``. The socket
+        is never closed and re-opened, so there is zero gap where another process
+        could steal the port.
+        """
+        import socket
+
+        from nemo_rl.distributed.virtual_cluster import _get_node_ip_local
+
+        self._reserved_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._reserved_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._reserved_socket.bind(("", 0))
+        self._reserved_socket.listen(128)
+        self._reserved_socket.setblocking(False)
+        self._reserved_port = self._reserved_socket.getsockname()[1]
+        self._reserved_node_ip = _get_node_ip_local()
+        print(
+            f"Reserved port {self._reserved_port} on {self._reserved_node_ip} "
+            f"for vLLM HTTP server"
+        )
+
+    def load_model(self) -> None:
+        """Load the vLLM model and create the engine.
+
+        Called after a deferred init to perform the heavy model loading.
+        """
+        if not self.is_model_owner:
+            return
+        self._load_model(self._deferred_bundle_indices, self._deferred_seed)
+
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
         from vllm.config import CompilationConfig
         from vllm.engine.arg_utils import AsyncEngineArgs
@@ -311,6 +409,12 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
     async def post_init_async(self):
         self.vllm_device_ids = await self.report_device_id_async()
 
+    async def get_reserved_url(self) -> Optional[str]:
+        """Return the URL from the reserved socket, available before model loading."""
+        if self._reserved_socket is not None:
+            return f"http://{self._reserved_node_ip}:{self._reserved_port}/v1"
+        return None
+
     async def report_dp_openai_server_base_url(self) -> Optional[str]:
         return self.base_url
 
@@ -345,12 +449,21 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             OpenAIServingTokenization,
         )
         from vllm.exceptions import VLLMValidationError
+        from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
         from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
         from vllm.v1.engine.async_llm import logger as vllm_async_llm_logger
 
         maybe_tool_parser_plugin = self.cfg["vllm_cfg"].get("tool_parser_plugin")
         if maybe_tool_parser_plugin:
             ToolParserManager.import_tool_parser(maybe_tool_parser_plugin)
+
+        maybe_reasoning_parser_plugin = self.cfg["vllm_cfg"].get(
+            "reasoning_parser_plugin"
+        )
+        if maybe_reasoning_parser_plugin:
+            ReasoningParserManager.import_reasoning_parser(
+                maybe_reasoning_parser_plugin
+            )
 
         engine_client = self.llm
         model_config = self.llm_async_engine_args.create_model_config()
@@ -741,8 +854,24 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         # Server spinup
         ########################################
 
-        node_ip = _get_node_ip_local()
-        free_port = _get_free_port_local()
+        if self._reserved_socket is not None:
+            # Use the socket reserved during __init__ (deferred model load path).
+            # Pass it directly to uvicorn via sockets= — zero gap, the socket is
+            # never closed and re-opened, so no other process can steal the port.
+            node_ip = self._reserved_node_ip
+            free_port = self._reserved_port
+            reserved_sock = self._reserved_socket
+            self._reserved_socket = None  # Transfer ownership to uvicorn
+        else:
+            node_ip = _get_node_ip_local()
+            port_range_low = self.cfg.get(
+                "port_range_low", DEFAULT_GENERATION_PORT_RANGE_LOW
+            )
+            port_range_high = self.cfg.get(
+                "port_range_high", DEFAULT_GENERATION_PORT_RANGE_HIGH
+            )
+            free_port = _get_free_port_local(port_range_low, port_range_high)
+            reserved_sock = None
 
         base_url = f"http://{node_ip}:{free_port}/v1"
         print(f"Starting server on {base_url}")
@@ -767,7 +896,19 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         uvicorn_logger = getLogger("uvicorn.access")
         uvicorn_logger.addFilter(No200Filter())
 
-        thread = threading.Thread(target=server.run, daemon=True)
+        if reserved_sock is not None:
+            # Hand the pre-bound listening socket directly to uvicorn's asyncio
+            # server via server.serve(sockets=). No close-and-rebind needed.
+            import asyncio
+
+            def _run_with_socket():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(server.serve(sockets=[reserved_sock]))
+
+            thread = threading.Thread(target=_run_with_socket, daemon=True)
+        else:
+            thread = threading.Thread(target=server.run, daemon=True)
         thread.start()
 
         return thread, base_url, server
@@ -921,6 +1062,11 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             generation_details = final_request_output.outputs[0]
             generated_token_ids = list(generation_details.token_ids)
             num_generated_tokens = len(generated_token_ids)
+            return_routed_experts = bool(
+                self.cfg.get("vllm_kwargs", {}).get(
+                    "enable_return_routed_experts", False
+                )
+            )
 
             original_input_ids_single_row = input_ids_batch[sample_idx]
             final_output_tensor_len = current_input_actual_length + num_generated_tokens
@@ -996,15 +1142,58 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 device=original_input_ids_single_row.device,
             )
 
-            result_batch = BatchedDataDict[GenerationOutputSpec](
-                {
-                    "output_ids": output_ids_single_item_batched,
-                    "logprobs": logprobs_single_item,
-                    "generation_lengths": generation_lengths_tensor,
-                    "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
-                    "truncated": truncated_tensor,
-                }
+            result_dict = {
+                "output_ids": output_ids_single_item_batched,
+                "logprobs": logprobs_single_item,
+                "generation_lengths": generation_lengths_tensor,
+                "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
+                "truncated": truncated_tensor,
+            }
+            routed_experts, r3_stats = pad_and_align_routed_expert_indices(
+                final_request_output,
+                generation_details,
+                valid_length=unpadded_total_length,
+                padded_length=final_output_tensor_len,
+                device=original_input_ids_single_row.device,
+                require_complete_routed_experts=return_routed_experts,
+                return_stats=True,
             )
+            if return_routed_experts and routed_experts is None:
+                raise RuntimeError(
+                    "vLLM was asked to return routed experts but the generation output "
+                    "did not include routed_experts."
+                )
+            if return_routed_experts:
+                if r3_stats["missing_routes"] > 0:
+                    LOGGER.warning(
+                        "R3 router replay fallback: vLLM returned incomplete "
+                        "routed_experts for sample_idx=%d, missing_token_routes=%d, "
+                        "actual_routes=%d, expected_routes=%d. Megatron will use its "
+                        "own router for those missing token routes.",
+                        sample_idx,
+                        r3_stats["missing_routes"],
+                        r3_stats["actual_routes"],
+                        r3_stats["expected_routes"],
+                    )
+                result_dict["r3_routed_experts_missing_routes"] = torch.tensor(
+                    [r3_stats["missing_routes"]],
+                    dtype=torch.long,
+                    device=original_input_ids_single_row.device,
+                )
+                result_dict["r3_routed_experts_expected_routes"] = torch.tensor(
+                    [r3_stats["expected_routes"]],
+                    dtype=torch.long,
+                    device=original_input_ids_single_row.device,
+                )
+                result_dict["r3_routed_experts_actual_routes"] = torch.tensor(
+                    [r3_stats["actual_routes"]],
+                    dtype=torch.long,
+                    device=original_input_ids_single_row.device,
+                )
+            if routed_experts is not None:
+                result_dict["routed_experts"] = routed_experts.unsqueeze(0)
+
+            result_batch = BatchedDataDict[GenerationOutputSpec](result_dict)
 
             return (sample_idx, result_batch)
 
@@ -1241,7 +1430,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         gc.collect()
         torch.cuda.empty_cache()
 
-    async def sleep_async(self, discard_weights: bool = False):
+    async def sleep_async(self):
         """Async version of sleep."""
         assert self.llm is not None, (
             "Attempting to sleep with either an uninitialized vLLM or non-model-owner"
@@ -1260,7 +1449,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         # the receiver and sends data=None, causing an assertion error.
         if hasattr(self.llm, "reset_mm_cache"):
             await self.llm.reset_mm_cache()
-        await self.llm.sleep(level=2 if discard_weights else 1)
+        await self.llm.sleep(level=1)
 
         gc.collect()
         torch.cuda.empty_cache()

@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
 import json
 import os
+import sys
+import types
 from copy import deepcopy
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 import ray
@@ -33,7 +36,9 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
-from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorkerImpl
+from nemo_rl.models.generation.vllm.vllm_worker import (
+    _resolve_enable_prefix_caching,
+)
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
     _replace_prefix_tokens,
@@ -132,6 +137,28 @@ basic_dtensor_test_config: PolicyConfig = {
     "generation": deepcopy(basic_vllm_test_config),
 }
 
+
+def test_resolve_enable_prefix_caching_respects_explicit_config(monkeypatch):
+    def raise_if_called():
+        raise AssertionError("CUDA capability should not be queried")
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", raise_if_called)
+
+    assert _resolve_enable_prefix_caching({"enable_prefix_caching": False}) is False
+    assert _resolve_enable_prefix_caching({"enable_prefix_caching": True}) is True
+
+
+def test_resolve_enable_prefix_caching_uses_cuda_capability_for_auto(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (8, 0))
+
+    assert _resolve_enable_prefix_caching({}) is True
+    assert _resolve_enable_prefix_caching({"enable_prefix_caching": None}) is True
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (7, 5))
+
+    assert _resolve_enable_prefix_caching({}) is False
+
+
 basic_lora_test_config: LoRAConfig = {
     "enabled": False,
     "target_modules": [],
@@ -157,83 +184,244 @@ def skip_fp8_known_failures() -> None:
         )
 
 
-@pytest.mark.parametrize(
-    "colocated,async_engine,expected_method,expected_kwargs",
-    [
-        (True, False, "sleep", {"discard_weights": True}),
-        (True, True, "sleep_async", {"discard_weights": True}),
-        (False, False, "reset_prefix_cache", {}),
-        (False, True, "reset_prefix_cache_async", {}),
-    ],
-)
-def test_vllm_finish_generation_routes_discard_weights(
-    monkeypatch, colocated, async_engine, expected_method, expected_kwargs
-):
-    vllm_generation = VllmGeneration.__new__(VllmGeneration)
-    vllm_generation.cfg = {
-        "colocated": {"enabled": colocated},
-        "vllm_cfg": {"async_engine": async_engine},
-    }
-    vllm_generation.worker_group = MagicMock()
-    vllm_generation.worker_group.run_all_workers_single_data.return_value = [
-        "worker_future"
-    ]
-    monkeypatch.setattr(
-        "nemo_rl.models.generation.vllm.vllm_generation.ray.get",
-        lambda futures: [True],
+def _install_fake_vllm_openai_modules(monkeypatch):
+    for module_name in (
+        "vllm",
+        "vllm.entrypoints",
+        "vllm.entrypoints.openai",
+        "vllm.entrypoints.openai.chat_completion",
+        "vllm.entrypoints.openai.engine",
+        "vllm.entrypoints.openai.models",
+        "vllm.entrypoints.serve",
+        "vllm.entrypoints.serve.render",
+        "vllm.entrypoints.serve.tokenize",
+        "vllm.reasoning",
+        "vllm.tool_parsers",
+        "vllm.v1",
+        "vllm.v1.engine",
+    ):
+        monkeypatch.setitem(sys.modules, module_name, types.ModuleType(module_name))
+
+    def make_module(name: str, **attrs):
+        module = types.ModuleType(name)
+        for attr_name, attr_value in attrs.items():
+            setattr(module, attr_name, attr_value)
+        monkeypatch.setitem(sys.modules, name, module)
+        return module
+
+    class BaseModelPath:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class OpenAIServingModels:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.registry = "registry"
+
+    class OpenAIServingRender:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.renderer = kwargs["renderer"]
+
+    class OpenAIServingChat:
+        instances = []
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.instances.append(self)
+
+    class OpenAIServingTokenization:
+        instances = []
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.instances.append(self)
+
+    class VLLMValidationError(Exception):
+        pass
+
+    class ToolParserManager:
+        import_tool_parser = MagicMock()
+
+    class ReasoningParserManager:
+        import_reasoning_parser = MagicMock()
+
+    make_module(
+        "vllm.entrypoints.openai.chat_completion.protocol",
+        ChatCompletionRequest=type("ChatCompletionRequest", (), {}),
+        ChatCompletionResponse=type("ChatCompletionResponse", (), {}),
     )
-
-    assert vllm_generation.finish_generation(discard_weights=True)
-
-    vllm_generation.worker_group.run_all_workers_single_data.assert_called_once_with(
-        expected_method,
-        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        **expected_kwargs,
+    make_module(
+        "vllm.entrypoints.openai.chat_completion.serving",
+        OpenAIServingChat=OpenAIServingChat,
     )
-
-
-def test_vllm_worker_sleep_uses_discard_weight_level(monkeypatch):
-    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
-    worker.cfg = {"vllm_cfg": {"async_engine": False}}
-    worker.llm = MagicMock()
-    monkeypatch.setattr(
-        "nemo_rl.models.generation.vllm.vllm_worker.gc.collect", lambda: None
+    make_module(
+        "vllm.entrypoints.openai.engine.protocol",
+        ErrorResponse=type("ErrorResponse", (), {}),
     )
-    monkeypatch.setattr(
-        "nemo_rl.models.generation.vllm.vllm_worker.torch.cuda.empty_cache",
-        lambda: None,
+    make_module(
+        "vllm.entrypoints.openai.models.protocol",
+        BaseModelPath=BaseModelPath,
     )
+    make_module(
+        "vllm.entrypoints.openai.models.serving",
+        OpenAIServingModels=OpenAIServingModels,
+    )
+    make_module(
+        "vllm.entrypoints.serve.tokenize.protocol",
+        TokenizeChatRequest=type("TokenizeChatRequest", (), {}),
+        TokenizeCompletionRequest=type("TokenizeCompletionRequest", (), {}),
+        TokenizeResponse=type("TokenizeResponse", (), {}),
+    )
+    make_module(
+        "vllm.entrypoints.serve.render.serving",
+        OpenAIServingRender=OpenAIServingRender,
+    )
+    make_module(
+        "vllm.entrypoints.serve.tokenize.serving",
+        OpenAIServingTokenization=OpenAIServingTokenization,
+    )
+    make_module("vllm.exceptions", VLLMValidationError=VLLMValidationError)
+    make_module(
+        "vllm.reasoning.abs_reasoning_parsers",
+        ReasoningParserManager=ReasoningParserManager,
+    )
+    make_module(
+        "vllm.tool_parsers.abstract_tool_parser",
+        ToolParserManager=ToolParserManager,
+    )
+    make_module("vllm.v1.engine.async_llm", logger=MagicMock())
+    return ToolParserManager, ReasoningParserManager, OpenAIServingChat
 
-    worker.sleep(discard_weights=False)
-    worker.llm.sleep.assert_called_once_with(level=1)
 
-    worker.llm.sleep.reset_mock()
-    worker.sleep(discard_weights=True)
-    worker.llm.sleep.assert_called_once_with(level=2)
+class _FakeFastAPIApp:
+    def __init__(self):
+        self.routes = []
+
+    def post(self, path):
+        def decorator(func):
+            self.routes.append((path, func))
+            return func
+
+        return decorator
 
 
-@pytest.mark.asyncio
-async def test_vllm_async_worker_sleep_uses_discard_weight_level(monkeypatch):
+def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
+    (
+        tool_parser_manager,
+        reasoning_parser_manager,
+        openai_serving_chat,
+    ) = _install_fake_vllm_openai_modules(monkeypatch)
+
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
-    worker.cfg = {"vllm_cfg": {"async_engine": True}}
-    worker.llm = MagicMock()
-    worker.llm.reset_prefix_cache = AsyncMock()
-    worker.llm.reset_mm_cache = AsyncMock()
-    worker.llm.sleep = AsyncMock()
-    monkeypatch.setattr(
-        "nemo_rl.models.generation.vllm.vllm_worker_async.gc.collect", lambda: None
+    worker.cfg = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "vllm_cfg": {
+            "tool_parser_plugin": "/plugins/tool_parser.py",
+            "reasoning_parser_plugin": "/plugins/reasoning_parser.py",
+            "http_server_serving_chat_kwargs": {
+                "reasoning_parser": "nano_v3",
+            },
+        },
+    }
+    worker.llm = MagicMock(model_config="model-config", renderer="renderer")
+    model_config = MagicMock(served_model_name="served-model", model="model-path")
+    worker.llm_async_engine_args = MagicMock()
+    worker.llm_async_engine_args.create_model_config.return_value = model_config
+
+    app = _FakeFastAPIApp()
+    assert worker._setup_vllm_openai_api_server(app) is app
+
+    tool_parser_manager.import_tool_parser.assert_called_once_with(
+        "/plugins/tool_parser.py"
     )
-    monkeypatch.setattr(
-        "nemo_rl.models.generation.vllm.vllm_worker_async.torch.cuda.empty_cache",
-        lambda: None,
+    reasoning_parser_manager.import_reasoning_parser.assert_called_once_with(
+        "/plugins/reasoning_parser.py"
+    )
+    assert openai_serving_chat.instances[0].kwargs["reasoning_parser"] == "nano_v3"
+    # make sure that the config attribute does not leak into `http_server_serving_chat_kwargs`
+    assert "reasoning_parser_plugin" not in openai_serving_chat.instances[0].kwargs
+
+
+def test_nano_v3_reasoning_parser_swaps_reasoning_when_thinking_disabled(
+    monkeypatch,
+):
+    registered_reasoning_parsers = {}
+
+    for module_name in (
+        "vllm",
+        "vllm.reasoning",
+    ):
+        monkeypatch.setitem(sys.modules, module_name, types.ModuleType(module_name))
+
+    class ReasoningParserManager:
+        @staticmethod
+        def register_module(name):
+            def decorator(parser_cls):
+                registered_reasoning_parsers[name] = parser_cls
+                return parser_cls
+
+            return decorator
+
+    class DeepSeekR1ReasoningParser:
+        def __init__(self, tokenizer, *args, **kwargs):
+            self.tokenizer = tokenizer
+
+        def extract_reasoning(self, model_output, request):
+            return model_output
+
+    abs_reasoning_parsers = types.ModuleType("vllm.reasoning.abs_reasoning_parsers")
+    abs_reasoning_parsers.ReasoningParserManager = ReasoningParserManager
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.reasoning.abs_reasoning_parsers",
+        abs_reasoning_parsers,
     )
 
-    await worker.sleep_async(discard_weights=False)
-    worker.llm.sleep.assert_awaited_once_with(level=1)
+    deepseek_reasoning_parser = types.ModuleType(
+        "vllm.reasoning.deepseek_r1_reasoning_parser"
+    )
+    deepseek_reasoning_parser.DeepSeekR1ReasoningParser = DeepSeekR1ReasoningParser
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.reasoning.deepseek_r1_reasoning_parser",
+        deepseek_reasoning_parser,
+    )
 
-    worker.llm.sleep.reset_mock()
-    await worker.sleep_async(discard_weights=True)
-    worker.llm.sleep.assert_awaited_once_with(level=2)
+    repo_root = Path(__file__).resolve().parents[4]
+    parser_path = (
+        repo_root
+        / "nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "test_nano_v3_reasoning_parser",
+        parser_path,
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    parser_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(parser_module)
+
+    assert (
+        registered_reasoning_parsers["nano_v3"] is parser_module.NanoV3ReasoningParser
+    )
+    parser = parser_module.NanoV3ReasoningParser(tokenizer=object())
+
+    request = types.SimpleNamespace(chat_template_kwargs={"enable_thinking": False})
+    assert parser.extract_reasoning(("answer", None), request) == (None, "answer")
+
+    request.chat_template_kwargs["enable_thinking"] = True
+    assert parser.extract_reasoning(("reasoning", None), request) == (
+        "reasoning",
+        None,
+    )
+
+    request.chat_template_kwargs["enable_thinking"] = False
+    assert parser.extract_reasoning(("reasoning", "final"), request) == (
+        "reasoning",
+        "final",
+    )
 
 
 def test_configure_generation_config_uses_real_startup_weights_without_draft_refit():
@@ -316,7 +504,6 @@ def get_basic_megatron_test_config(
             "enabled": True,
             "empty_unused_memory_level": empty_unused_memory_level,
             "activation_checkpointing": activation_checkpointing,
-            "converter_type": "Qwen2ForCausalLM",  # Use Qwen2 converter for Qwen3 models (compatible)
             "tensor_model_parallel_size": tp,
             "expert_tensor_parallel_size": 1,
             "expert_model_parallel_size": 1,
@@ -1430,6 +1617,91 @@ def test_vllm_http_server(cluster, tokenizer):
                 max_tokens=1,
             ),
         )
+
+
+def test_vllm_deferred_model_load(cluster, tokenizer):
+    """Test deferred model loading for overlapped initialization.
+
+    Verifies:
+    1. defer_model_load=True returns URLs immediately without loading the model
+    2. Reserved URLs are valid (non-None for each DP rank)
+    3. load_and_start() loads model and starts HTTP server on the reserved port
+    4. Final reported URLs match the reserved URLs (same port)
+    5. HTTP server is functional after load_and_start()
+    """
+    generation_config = configure_http_server_config(tokenizer)
+    generation_config["temperature"] = 0.0
+
+    # Phase 1: Deferred init — only reserve ports, no model loading
+    vllm_generation = VllmGeneration(cluster, generation_config, defer_model_load=True)
+
+    # URLs should be available immediately from reserved ports
+    reserved_urls = vllm_generation.dp_openai_server_base_urls
+    assert len(reserved_urls) == cluster.num_gpus_per_node, (
+        f"Expected {cluster.num_gpus_per_node} URLs, got {len(reserved_urls)}"
+    )
+    for url in reserved_urls:
+        assert url is not None, "Reserved URL should not be None for async engine"
+        assert url.startswith("http://"), f"URL should start with http://, got {url}"
+        assert url.endswith("/v1"), f"URL should end with /v1, got {url}"
+
+    # Model should NOT be loaded yet — device_uuids should be None
+    assert vllm_generation.device_uuids is None, (
+        "device_uuids should be None before load_and_start()"
+    )
+
+    # HTTP server should NOT be running yet
+    try:
+        requests.get(reserved_urls[0], timeout=1)
+        # If we somehow get a response, something is wrong
+        assert False, "HTTP server should not be running before load_and_start()"
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+        pass  # Expected — server is not running yet
+
+    # Phase 2: Load model and start HTTP server
+    vllm_generation.load_and_start()
+
+    # Final URLs should match reserved URLs (same port was used)
+    final_urls = vllm_generation.dp_openai_server_base_urls
+    assert len(final_urls) == len(reserved_urls)
+    for reserved, final in zip(reserved_urls, final_urls):
+        # Extract port from URLs and verify they match
+        reserved_port = reserved.split(":")[-1].split("/")[0]
+        final_port = final.split(":")[-1].split("/")[0]
+        assert reserved_port == final_port, (
+            f"Port mismatch: reserved {reserved_port} != final {final_port}. "
+            f"Reserved URL: {reserved}, Final URL: {final}"
+        )
+
+    # device_uuids should be populated now
+    assert vllm_generation.device_uuids is not None, (
+        "device_uuids should be populated after load_and_start()"
+    )
+
+    # HTTP server should be functional
+    _wait_for_vllm_http_server_spinup(final_urls[0])
+
+    body = dict(
+        model=generation_config["model_name"],
+        messages=[
+            {"role": "user", "content": "count to 5"},
+        ],
+        temperature=generation_config["temperature"],
+        top_p=generation_config["top_p"],
+        logprobs=True,
+        return_tokens_as_token_ids=True,
+        max_tokens=1,
+    )
+    response = requests.post(url=f"{final_urls[0]}/chat/completions", json=body)
+    assert response.status_code == 200, (
+        f"HTTP server returned {response.status_code} after load_and_start()"
+    )
+    result = response.json()
+    assert "choices" in result, "Response should contain choices"
+    assert len(result["choices"]) > 0, "Response should have at least one choice"
+
+    # Clean up
+    vllm_generation.shutdown()
 
 
 def test_VllmAsyncGenerationWorker_replace_prefix_tokens(tokenizer):
@@ -2601,12 +2873,12 @@ def test_vllm_megatron_pipeline_parallel(cluster, tokenizer):
             }
         )
 
-        print("Creating Megatron policy with PP=2...")
-        megatron_policy = Policy(cluster, megatron_config, test_tokenizer)
-
         print("Creating vLLM policy...")
         vllm_policy = VllmGeneration(cluster, vllm_config)
         vllm_policy.finish_generation()
+
+        print("Creating Megatron policy with PP=2...")
+        megatron_policy = Policy(cluster, megatron_config, test_tokenizer)
 
         print("preparing refit info...")
         state_dict_info = megatron_policy.prepare_refit_info()

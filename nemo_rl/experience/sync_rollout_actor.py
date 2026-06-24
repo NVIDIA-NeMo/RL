@@ -45,14 +45,17 @@ import torch
 
 from nemo_rl.data_plane.column_io import kv_first_write
 from nemo_rl.data_plane.interfaces import KVBatchMeta
+from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import (
+    EffortLevelsConfig,
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.utils.r3_trace import trace_rollout_payload
 
 # Carry keys producible by the rollout actor only when the caller opts in.
 # These are np.ndarray(object) per-row arrays from decompose_message_log; the
@@ -242,6 +245,12 @@ class SyncRolloutActor:
                 max_seq_len=None,
                 max_rollout_turns=None,
                 generation_config=cfg.policy["generation"],
+                effort_config=EffortLevelsConfig.model_validate(
+                    cfg.env["nemo_gym"].get("effort_levels")
+                )
+                if "nemo_gym" in cfg.env
+                and cfg.env["nemo_gym"].get("effort_levels") is not None
+                else None,
             )
             final_batch, rollout_metrics = r.final_batch, r.rollout_metrics
         else:
@@ -270,6 +279,17 @@ class SyncRolloutActor:
             ],
         )
 
+        router_replay_enabled = bool(
+            (cfg.policy.get("router_replay") or {}).get("enabled", False)
+        )
+        if router_replay_enabled and ROUTED_EXPERTS_FIELD not in flat:
+            raise RuntimeError(
+                "policy.router_replay.enabled=true requires routed_experts in "
+                "the rollout bulk payload, but rollout flattening did not "
+                "produce that field. Check vLLM routed-expert capture and the "
+                "message-log flattening path."
+            )
+
         # TQ bulk payload — DP_TRAIN_FIELDS + multimodal extras.
         bulk_batch = BatchedDataDict[Any](
             {
@@ -280,6 +300,8 @@ class SyncRolloutActor:
                 "sample_mask": fb["loss_multiplier"],
             }
         )
+        if ROUTED_EXPERTS_FIELD in flat:
+            bulk_batch[ROUTED_EXPERTS_FIELD] = flat[ROUTED_EXPERTS_FIELD]
         for k, v in flat.get_multimodal_dict(as_tensors=False).items():
             if isinstance(v, torch.Tensor):
                 bulk_batch[k] = v
@@ -362,6 +384,7 @@ class SyncRolloutActor:
         n_per_prompt = n_samples // n_prompts
         uids = [str(uuid.uuid4()) for _ in range(n_prompts)]
         sample_ids = [f"{uid}_g{i}" for uid in uids for i in range(n_per_prompt)]
+        trace_rollout_payload(keys=sample_ids, data=bulk_batch)
         meta = kv_first_write(
             bulk_batch,
             sample_ids=sample_ids,

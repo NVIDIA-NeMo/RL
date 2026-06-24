@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@ import os
 import warnings
 from collections import defaultdict
 from contextlib import nullcontext
-from typing import Any, Optional, Union
+from typing import Any, Iterable, Optional, Union
 
 import numpy as np
 import ray
@@ -601,6 +601,66 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         return stacked
 
+    def get_full_logits_ipc(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        micro_batch_size: Optional[int] = None,
+        timer: Optional[Timer] = None,
+    ) -> list[dict[str, Any]]:
+        """Ship the teacher's full-vocab logits to the student via CUDA IPC.
+
+        Used by cross-tokenizer distillation. Returns a flat ``list[B]`` of
+        per-sample IPC handle dicts; each entry's ``logits_ipc``
+        reconstructs a ``[T_t, V_t]`` CUDA tensor on the consumer device.
+        The loss fn then either (a) derives a microbatch-global top-k
+        subset internally to match the PT non-gold path, or (b) uses the
+        full vocab end-to-end to match the PT gold path.
+
+        Caller must invoke :meth:`release_ipc_buffer` after the student
+        finishes consuming the handles — otherwise the producer-side
+        CUDA tensors leak.
+
+        v0 limitation: no dynamic batching, no sequence packing.
+        """
+        if self.use_dynamic_batches or self.use_sequence_packing:
+            raise NotImplementedError(
+                "get_full_logits_ipc does not support dynamic batching "
+                "or sequence packing in v0."
+            )
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        with timer.time("get_full_logits_ipc/shard_data") if timer else nullcontext():
+            sharded_data = data.shard_by_batch_size(  # type: ignore
+                dp_size,
+                batch_size=None,
+            )
+        with timer.time("get_full_logits_ipc/submit") if timer else nullcontext():
+            futures = self.worker_group.run_all_workers_sharded_data(
+                "get_full_logits_ipc",
+                data=sharded_data,
+                in_sharded_axes=["data_parallel"],
+                replicate_on_axes=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                output_is_replicated=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                common_kwargs={"micro_batch_size": micro_batch_size},
+            )
+        worker_results = self.worker_group.get_all_worker_results(futures)
+        all_handles: list[dict[str, Any]] = []
+        for wr in worker_results:
+            all_handles.extend(wr["per_sample_handles"])
+        return all_handles
+
+    def release_ipc_buffer(self) -> None:
+        """Tell all workers to drop their stashed IPC tensors."""
+        futures = self.worker_group.run_all_workers_single_data("release_ipc_buffer")
+        ray.get(futures)
+
     def train(
         self,
         data: BatchedDataDict[Any],
@@ -609,8 +669,17 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
         timer: Optional[Timer] = None,
+        check_dim_skip_keys: Optional[Iterable[str]] = None,
     ) -> dict[str, Any]:
-        """Train the policy on a batch of data with a given loss function."""
+        """Train the policy on a batch of data with a given loss function.
+
+        Args:
+            check_dim_skip_keys: Keys whose tensors are not student-sequence-aligned at
+                dim 1 and must be excluded from the worker's sequence-dim
+                pre-flight check. Used by cross-tokenizer distillation to
+                pass through teacher / alignment auxiliaries that ride on
+                the same data dict.
+        """
         batch_size = gbs or self.cfg["train_global_batch_size"]
         micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
         # Shard and replicate the batch
@@ -648,6 +717,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     "eval_mode": eval_mode,
                     "gbs": batch_size,
                     "mbs": micro_batch_size,
+                    "check_dim_skip_keys": check_dim_skip_keys,
                 },
             )
         results = self.worker_group.get_all_worker_results(futures)
@@ -659,6 +729,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         }
         if "moe_metrics" in results[0]:
             aggregated_results["moe_metrics"] = results[0]["moe_metrics"]
+        if "mtp_metrics" in results[0]:
+            aggregated_results["mtp_metrics"] = results[0]["mtp_metrics"]
 
         if self.flops_tracker is not None:
             aggregated_results["total_flops"] = self.flops_tracker.total_flops
@@ -803,6 +875,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         results = ray.get(futures)
         # Only get the first worker's info since all workers will have the same result
         return results[0]
+
+    def finish_inference(self) -> None:
+        """Offload policy model to CPU after inference."""
+        futures = self.worker_group.run_all_workers_single_data("finish_inference")
+        ray.get(futures)
 
     def finish_training(self, *args: Any, **kwargs: Any) -> None:
         # Placeholder implementation
