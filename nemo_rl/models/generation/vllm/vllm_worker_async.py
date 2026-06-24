@@ -671,8 +671,86 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         # vLLM 0.20 routes both /v1/chat/completions and /tokenize through
         # OpenAIServingRender.preprocess_chat, so the prefix-token override
         # belongs on the render subclass.
+        return_routed_experts = bool(
+            self.cfg.get("vllm_kwargs", {}).get("enable_return_routed_experts", False)
+        )
+
         class NeMoRLOpenAIServingChat(OpenAIServingChat):
-            pass
+            async def chat_completion_full_generator(
+                self,
+                request,
+                result_generator,
+                *args,
+                **kwargs,
+            ):
+                final_res = None
+
+                async def capture_result_generator():
+                    nonlocal final_res
+                    async for res in result_generator:
+                        final_res = res
+                        yield res
+
+                response = await super().chat_completion_full_generator(
+                    request,
+                    capture_result_generator(),
+                    *args,
+                    **kwargs,
+                )
+                if (
+                    not return_routed_experts
+                    or not isinstance(response, ChatCompletionResponse)
+                    or final_res is None
+                ):
+                    return response
+
+                outputs_by_index = {
+                    output.index: output for output in getattr(final_res, "outputs", [])
+                }
+                prompt_token_count = len(
+                    getattr(final_res, "prompt_token_ids", []) or []
+                )
+
+                for choice in response.choices:
+                    generation_details = outputs_by_index.get(choice.index)
+                    if generation_details is None:
+                        continue
+
+                    generation_token_count = len(
+                        getattr(generation_details, "token_ids", []) or []
+                    )
+                    routed_experts, r3_stats = pad_and_align_routed_expert_indices(
+                        final_res,
+                        generation_details,
+                        valid_length=prompt_token_count + generation_token_count,
+                        padded_length=prompt_token_count + generation_token_count,
+                        device=torch.device("cpu"),
+                        require_complete_routed_experts=True,
+                        return_stats=True,
+                    )
+                    if routed_experts is None:
+                        raise RuntimeError(
+                            "vLLM was asked to return routed experts for the "
+                            "OpenAI-compatible chat endpoint but the generation "
+                            "output did not include routed_experts."
+                        )
+                    if r3_stats["missing_routes"] > 0:
+                        LOGGER.warning(
+                            "R3 router replay fallback: vLLM returned incomplete "
+                            "routed_experts for chat choice_idx=%d, "
+                            "missing_token_routes=%d, actual_routes=%d, "
+                            "expected_routes=%d. Megatron will use its own router "
+                            "for those missing token routes.",
+                            choice.index,
+                            r3_stats["missing_routes"],
+                            r3_stats["actual_routes"],
+                            r3_stats["expected_routes"],
+                        )
+                    choice.message.routed_experts = routed_experts.to(
+                        dtype=torch.int32
+                    ).tolist()
+
+                return response
 
         class NeMoRLOpenAIServingRender(NeMoRLOpenAIServingMixin, OpenAIServingRender):
             pass

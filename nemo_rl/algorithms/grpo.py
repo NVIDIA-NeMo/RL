@@ -496,6 +496,7 @@ def setup(
             base_urls=base_urls,
             invalid_tool_call_patterns=invalid_tool_call_patterns,
             thinking_tags=thinking_tags,
+            require_routed_experts=router_replay_enabled(policy_config),
             initial_global_config_dict=nemo_gym_dict,
         )
         nemo_gym_opts = {}
