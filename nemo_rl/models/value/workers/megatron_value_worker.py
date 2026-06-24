@@ -298,6 +298,12 @@ class MegatronValueWorkerImpl(AbstractPolicyWorker):
 
         apply_transformer_engine_patch()
 
+        from nemo_rl.distributed.numa_utils import bind_to_gpu_numa
+
+        # Pin this value worker to its GPU's NUMA-local CPUs/memory before model
+        # load (mirrors the Megatron/DTensor policy workers and vLLM workers).
+        bind_to_gpu_numa()
+
         self.cfg = config
         self.rank = get_rank_safe()
 
