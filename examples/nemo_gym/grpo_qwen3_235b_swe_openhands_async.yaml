@@ -27,6 +27,14 @@ grpo:
   overlong_filtering: true          # zero loss for trajectories truncated at 80k
   max_val_samples: null             # gym requires null; inferred from val dataset size
   val_batch_size: null              # set at runtime to len(val dataset)
+  # DETERMINISTIC VALIDATION: the gym path always passes greedy=False, so val is normally
+  # sampled (temperature 1.0) -> noisy val curve. validation_generation temporarily overrides
+  # sampling params to temperature 0 (greedy) during validation only; training rollouts keep
+  # policy.generation (temp 1.0). The temp flows into the gym's responses_create_params, so the
+  # OpenHands agent issues temp-0 chat completions -> identical val rollouts across runs.
+  validation_generation:
+    temperature: 0.0
+    top_p: 1.0
   use_dynamic_sampling: false
   dynamic_sampling_max_gen_batches: 10
   batch_multiplier: 1
@@ -256,6 +264,7 @@ policy:
         tool_parser: hermes         # Qwen3-235B-A22B-Instruct-2507 tool-call format
         # For the Thinking variant add:  reasoning_parser: deepseek_r1
     vllm_kwargs:
+      attention_backend: FLASH_ATTN
       enable_chunked_prefill: true  # 80k prompts must not stall decode
       compilation_config:
         # accuracy mitigation for torch.compile kernels, see NVIDIA-NeMo/RL issue #998
@@ -299,6 +308,11 @@ env:
     swe_agents_train:
       responses_api_agents:
         swe_agents:
+          agent_prompt_overrides:
+            - user_prompt_template: responses_api_agents/swe_agents/prompts/openhands/user_prompt.j2
+              system_prompt_template: responses_api_agents/swe_agents/prompts/openhands/system_prompt.j2
+              agent_cls: CodeActAgent
+              diversify_tool_names: false
           agent_max_turns: 15       # 15 is empirically safe on easy_l20; 20 grew context past 80k -> vLLM rejected a turn -> empty rollout -> ValueError crash
           swebench_agent_timeout: 360
           swebench_tests_timeout: 300
