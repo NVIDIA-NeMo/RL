@@ -1,0 +1,520 @@
+# =============================================================================
+# Nemotron 3 Ultra — RLHF Teacher
+# =============================================================================
+# General-purpose RLHF teacher trained against GenRM comparison signal with
+# all length-penalty and reasoning/answer-bonus terms zeroed out — the
+# training signal is the pure pairwise GenRM judgment. Starts from the
+# Student RLVR output. Same training shape as the IFBench teacher (GBS=2048,
+# 49k context, lr=2.5e-6, 32+28+20 cluster).
+#
+# Cluster shape (80 nodes × 4 GPUs on GB200 NVL72 = 320 GPUs):
+#   Training 32 / vLLM 28 / Gym 20. Override via NUM_TRAIN_NODES, etc.
+#   Gym is sized at 20 nodes (= 80 GPUs) so GenRM can serve locally
+#   (TP=4 DP=4 = 16 GPUs) alongside the NL2Bash and Safety judges.
+#
+# Training parallelism: TP=8, EP=64, CP=8, PP=1, SP=true.
+# vLLM parallelism: TP=8, EP=8 (EP=TP keeps vllm_dp_size=1; EP>TP is blocked
+# by https://github.com/NVIDIA-NeMo/RL/issues/1101).
+# =============================================================================
+
+# =============================================================================
+# Cluster — read by ultra_launch.sh to size the SLURM allocation
+# =============================================================================
+cluster:
+  gpus_per_node: 4
+  num_nodes: 60
+  segment_size: 16
+
+# =============================================================================
+# Checkpointing — checkpoint_dir is overridden by the launcher
+# =============================================================================
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/ultra_student_rlvr"
+  metric_name: "val:total_reward/mean"
+  higher_is_better: true
+  keep_top_k: 1000000
+  save_period: 10
+  ft_keep_latest_k: 1
+  ft_save_period: 1
+  checkpoint_must_save_by: "00:47:35:00"
+  model_save_format: "safetensors"
+  save_consolidated: false
+
+# =============================================================================
+# GRPO Algorithm
+# =============================================================================
+grpo:
+  num_prompts_per_step: 128
+  num_generations_per_prompt: 16
+  num_val_generations_per_prompt: 2
+  max_rollout_turns: 1
+  max_num_epochs: 1
+  max_num_steps: 1000000
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  advantage_clip_low: -20
+  advantage_clip_high: 20
+  val_period: 10000
+  val_at_start: false
+  val_at_end: false
+  overlong_filtering: false
+  max_val_samples: null
+  val_batch_size: 256
+  seed: 42
+
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1
+
+  penalize_invalid_tool_call: true
+  invalid_tool_call_advantage: -5.0
+
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 128
+    overlong_buffer_penalty: 1
+    max_response_length: ${policy.max_total_sequence_length}
+    stop_properly_penalty_coef: null
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
+
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: false
+
+  use_best_at_k: false
+  best_at_k_k: 8
+  best_at_k_m: 1000
+
+  use_combined_training: false
+  combined_training_weight_mode: "auto"
+  combined_training_best_at_k_weight: 0.2
+  combined_training_pass_at_1_weight: 1.0
+
+  dynamic_sampling_oversample_ratio: 1.0
+  seq_logprob_error_threshold: 2
+
+# =============================================================================
+# Loss Function
+# =============================================================================
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  reference_policy_kl_type: "k3"
+  kl_input_clamp_value: null
+  kl_output_clamp_value: null
+
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: true
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_ratio: 5
+  truncated_importance_sampling_ratio_min: 0.2
+  truncated_importance_sampling_type: tis
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  force_on_policy_ratio: true
+  use_kl_in_reward: false
+
+# =============================================================================
+# Policy — model_name is overridden by the launcher (MODEL_PATH env var)
+# =============================================================================
+policy:
+  model_name: null
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs: null
+  hf_config_overrides: {}
+
+  train_global_batch_size: 2048
+  train_micro_batch_size: 1
+  generation_batch_size: 64
+  logprob_batch_size: 1
+  max_total_sequence_length: 49152
+  precision: "bfloat16"
+  logprob_chunk_size: 2048
+  offload_optimizer_for_logprob: false
+
+  dtensor_cfg:
+    _v2: true
+    enabled: false
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: false
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 2
+    activation_checkpointing: true
+
+    # TP=8 spans 2 GB200 nodes (4 GPUs each) via intra-rack NVLink.
+    tensor_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    # EP=64: 512 experts / 64 = 8 experts per EP rank
+    # All-to-all spans 64 GPUs (16 nodes), fits within one NVLink domain
+    expert_model_parallel_size: 64
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 8
+    pipeline_dtype: ${policy.precision}
+    sequence_parallel: true
+
+    # MoE
+    freeze_moe_router: true
+    moe_router_dtype: "fp32"
+    moe_router_load_balancing_type: "none"
+    moe_router_bias_update_rate: 1.0e-3
+    moe_router_enable_expert_bias: true
+    moe_permute_fusion: true
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "flex"
+    moe_flex_dispatcher_backend: "hybridep"
+    moe_hybridep_num_sms: 32
+    moe_aux_loss_coeff: 0.0
+    moe_shared_expert_overlap: false
+
+    # Compute
+    apply_rope_fusion: true
+    use_fused_weighted_squared_relu: true
+    bias_activation_fusion: false
+    defer_fp32_logits: true
+
+    # Logging
+    track_moe_metrics: true
+    moe_per_layer_logging: true
+    do_not_average_loss: true
+    cp_normalize: true
+    calculate_per_token_loss: true
+    scale_loss_by_dp_cp_size: false
+
+    # MTP — disabled by default; enable via ENABLE_MTP_INFERENCE=1 in the launcher
+    mtp_loss_scaling_factor: 0.3
+    mtp_use_repeated_layer: true
+    mtp_num_layers: 5
+    mtp_detach_heads: true
+
+    optimizer:
+      optimizer: "adam"
+      lr: 2.5e-6
+      min_lr: 2.5e-6
+      weight_decay: 0.0
+      bf16: true
+      fp16: false
+      params_dtype: "float32"
+
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1e-8
+
+      sgd_momentum: 0.9
+
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+
+      clip_grad: ${policy.max_grad_norm}
+
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 4e-7
+      override_opt_param_scheduler: true
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: false
+      overlap_param_gather: true
+      average_in_collective: false
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: "optim_grads_params"
+
+    fp8_cfg:
+      enabled: false
+      fp8: "e4m3"
+      fp8_recipe: "mxfp8"
+      fp8_param: false
+
+    first_last_layers_bf16: true
+    num_layers_at_start_in_bf16: 1
+    num_layers_at_end_in_bf16: 1
+
+    use_gloo_process_groups: false
+
+    checkpoint:
+      async_save: true
+      ckpt_assume_constant_structure: true
+      fully_parallel_save_process_group: "ep_dp"
+      fully_parallel_load_process_group: "ep_dp"
+      fully_parallel_load_exchange_algo: "broadcast"
+
+    env_vars: null
+
+  # ---------------------------------------------------------------------------
+  # Sequence Packing
+  # ---------------------------------------------------------------------------
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+    fuse_loss: true
+
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  max_grad_norm: 1.0
+  optimizer: null
+  scheduler: null
+
+  # ---------------------------------------------------------------------------
+  # Generation (vLLM) — Non-colocated, async
+  # ---------------------------------------------------------------------------
+  generation:
+    port_range_low: 3000
+    port_range_high: 4999
+    backend: "vllm"
+    max_new_tokens: ${policy.max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    # TP=8 EP=8: EP=TP so vllm_dp_size=1, async_engine=true works with NeMo Gym.
+    # Same memory as EP=1 but uses all-to-all for expert routing.
+    # EP > TP blocked by https://github.com/NVIDIA-NeMo/RL/issues/1101.
+    vllm_cfg:
+      async_engine: true
+      precision: ${policy.precision}
+      kv_cache_dtype: "auto"
+      tensor_parallel_size: 8
+      pipeline_parallel_size: 1
+      expert_parallel_size: 8
+      gpu_memory_utilization: 0.85
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: false
+      use_deep_gemm: false
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 0.5
+      expose_http_server: true
+      skip_tokenizer_init: false
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: qwen3_coder
+        reasoning_parser: nano_v3
+        reasoning_parser_plugin: nemo_rl/utils/nano_v3_reasoning_parser.py
+
+    vllm_kwargs:
+      attention_backend: FLASH_ATTN
+      mamba_ssm_cache_dtype: "float32"
+      compilation_config:
+        cudagraph_capture_sizes: [1,2,4,8,16,32,64]
+        pass_config:
+          fuse_allreduce_rms: false
+
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 28   # Overridden by launch script via NUM_GEN_NODES
+
+# =============================================================================
+# Data — data_path is overridden by the launcher (TRAIN_PATH / VAL_PATH)
+# =============================================================================
+data:
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 1
+  train:
+    data_path: null
+  validation:
+    data_path: null
+  default:
+    dataset_name: NemoGymDataset
+    env_name: "nemo_gym"
+    prompt_file: null
+    system_prompt_file: null
+    processor: "nemo_gym_data_processor"
+
+# =============================================================================
+# Environment — NeMo Gym + GenRM (only judge needed for RLHF data)
+#
+# GenRM path/URL is set by the launcher:
+#   - genrm_model.base_url ← GENRM_BASE_URL (remote service)
+#   - genrm_model.model    ← GENRM_MODEL    (local serve)
+# =============================================================================
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true
+  nemo_gym:
+    nemo_gym_log_dir: "logs/nemo_gym"
+    skip_venv_if_present: true
+    port_range_low: 5000
+    port_range_high: 5999
+    invalid_tool_call_patterns:
+      - "<tool_call>"
+      - "</tool_call>"
+      - "<function_call>"
+      - "</function_call>"
+    thinking_tags:
+      - "<think>"
+      - "</think>"
+    # RLHF data only uses genrm_simple_agent and genrm_simple_agent_reasoning_off
+    # → only GenRM compare is needed. Production loads the full ~35-entry
+    # list across teacher stages; we trim to keep gym startup focused.
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - resources_servers/genrm_compare/configs/genrm_compare.yaml
+
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          num_workers: 16
+          num_groups_nemo_rl: ${add:${grpo.async_grpo.max_trajectory_age_steps}, 1}
+          # Model-specific (Nemotron chat template): keep reasoning in multi-turn
+          # history so the trajectory grows monotonically for token-in-token-out RL.
+          chat_template_kwargs:
+            enable_thinking: true
+            truncate_history_thinking: false
+          sequential_reasoning_allowed: false
+    policy_model_reasoning_off:
+      _copy: policy_model
+      responses_api_models:
+        vllm_model:
+          num_workers: 4
+          num_groups_nemo_rl: ${add:${grpo.async_grpo.max_trajectory_age_steps}, 1}
+          chat_template_kwargs:
+            enable_thinking: false
+
+    # GenRM compare: deployed as a separate service; URL set by launcher
+    genrm_compare_resources_server:
+      resources_servers:
+        genrm_compare:
+          num_rollouts_per_prompt: ${grpo.num_generations_per_prompt}
+          genrm_model_server:
+            type: responses_api_models
+            name: genrm_model
+          genrm_responses_create_params:
+            max_output_tokens: 24576
+            temperature: 1.0
+            top_p: 0.95
+          comparison_strategy: "circular"
+          num_judges_per_comparison: 1
+          use_principle: true
+          default_principle: "You will be given one or more evaluation criteria (rubrics).\nEvaluate both responses on EACH criterion individually first, then synthesize an overall judgment.\nCriteria:\n\n1. Please act as an impartial judge and evaluate the quality of the responses provided by two AI assistants to the user prompt. Begin your evaluation by generating your own answer to the prompt. You must provide your answer before judging any answers. When evaluating the assistants' answers, compare both assistants' answers with your answer. You must identify and correct any mistakes or inaccurate information. Then consider if the assistant's answers are helpful, relevant, and concise. Helpful means the answer correctly responds to the prompt or follows the instructions. Note when user prompt has any ambiguity or more than one interpretation, it is more helpful and appropriate to ask for clarifications or more information from the user than providing an answer based on assumptions. Relevant means all parts of the response closely connect or are appropriate to what is being asked. Concise means the response is clear and not verbose or excessive. Then consider the creativity and novelty of the assistant's answers when needed. Finally, identify any missing important information in the assistants' answers that would be beneficial to include when responding to the user prompt."
+          aggregator_method: "simple_tiebreaker"
+          reasoning_bonus: 0.0
+          answer_bonus: 0.0
+          top_percentile: 0.2
+          genrm_parse_retries: 1
+          group_reasoning_length_penalty_coeff: 0.0
+          use_golden_anchor: false
+          group_answer_length_penalty_coeff: 0.0
+          group_style_penalty_coeff: 0.0
+          default_score: 3.0
+          default_ranking: 3.5
+
+    # Launcher sets either `base_url` (route to remote GenRM service) or
+    # `model` (serve locally using vllm_serve_kwargs below). See the guide.
+    genrm_model:
+      responses_api_models:
+        genrm_model:
+          entrypoint: app.py
+          api_key: dummy_key
+          model: null
+          uses_reasoning_parser: true
+          return_token_id_information: false
+          debug: true
+          ray_worker_py_executable: /opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker/bin/python
+          vllm_serve_env_vars:
+            VLLM_RAY_DP_PACK_STRATEGY: strict
+
+          vllm_serve_kwargs:
+            tensor_parallel_size: 4
+            data_parallel_size: 4
+            data_parallel_size_local: 1
+            pipeline_parallel_size: 1
+            reasoning_parser: deepseek_r1
+            gpu_memory_utilization: 0.85
+            max_model_len: 131072
+            enable_prefix_caching: true
+            enable_chunked_prefill: true
+            model_loader_extra_config:
+              enable_multithread_load: true
+              num_threads: 112
+            load_format: instanttensor
+            compilation_config:
+              cudagraph_capture_sizes: [1,2,4,8,16,32]
+          server_env:
+            NCCL_MNNVL_ENABLE: "0"
+
+
+# =============================================================================
+# Logger — log_dir, wandb.name, wandb.project are overridden by the launcher
+# =============================================================================
+logger:
+  log_dir: "logs/ultra_student_rlvr"
+  num_val_samples_to_print: 0
+  wandb_enabled: false
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  monitor_gpus: true
+  swanlab_enabled: false
+  wandb:
+    project: "nemotron-3-ultra"
+    name: "ultra-student-rlvr"
+  tensorboard: {}
+  mlflow:
+    experiment_name: "nemotron-3-ultra"
+    run_name: "ultra-student-rlvr"
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+# =============================================================================
+# Effort Levels
+# =============================================================================
+effort_levels:
+  low_string: "{reasoning effort: efficient}"
+  low_weight: 0.1
+  low_penalty: 1
+  low_ub: 15000
+
+# =============================================================================
+# Token IDs (model-specific)
+# =============================================================================
+token_ids:
+  eos: 2
+  think_open: 12
+  think_close: 13
+
+# =============================================================================
+# Reward Penalties (set reward to 0 when triggered)
+# =============================================================================
+penalize_duplicated_reasoning: true
+penalize_empty_final_answer: true
+penalize_eos_token: true
+penalize_malformed_think_tag: true
