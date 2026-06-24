@@ -19,7 +19,6 @@ grpo:
 policy:
   train_global_batch_size: 128
   megatron_cfg:
-    expert_model_parallel_size: 16
     optimizer:
       lr: 2.0e-6
       min_lr: 2.0e-6

@@ -80,10 +80,11 @@ policy:
     tensor_model_parallel_size: 4
     pipeline_model_parallel_size: 2
     context_parallel_size: 1
-    expert_model_parallel_size: 8
+    expert_model_parallel_size: 16
     expert_tensor_parallel_size: 1
     sequence_parallel: true
-    moe_token_dispatcher_type: alltoall
+    moe_enable_deepep: true
+    moe_token_dispatcher_type: flex
     optimizer:
       lr: 5.0e-6
       min_lr: 4.999e-6
@@ -106,7 +107,7 @@ policy:
     first_last_layers_bf16: true
     num_layers_at_start_in_bf16: 1
     num_layers_at_end_in_bf16: 1
-    moe_flex_dispatcher_backend: alltoall
+    moe_flex_dispatcher_backend: hybridep
     moe_hybridep_num_sms: 32
   generation:
     max_new_tokens: 65536

@@ -146,8 +146,8 @@ study defaults that should not depend on the launch site:
 - Qwen-safe response-penalty defaults.
 - Megatron/vLLM compatibility values that should travel with Qwen 3.5.
 - Standard R2E training HPs: GBS 512, 32 prompts x 16 generations, LR 5e-6,
-  64k context, async GRPO age 1, PP=2 policy defaults, and SWE 15-turn
-  timeouts.
+  64k context, async GRPO age 1, PP=2/EP=16 policy defaults, hybrid-EP MoE
+  routing, and SWE 15-turn timeouts.
 - `policy.sequence_packing.enabled=false`, because Qwen 3.5 GDN currently does
   not support packed sequences.
 
@@ -159,9 +159,9 @@ PP=1 or smaller GBS, should be explicit overrides.
 `qwen_35/configs/grpo_qwen35_397b_swe_openhands_async_benchmark.yaml` inherits
 the standard config and overrides only benchmark-shape knobs: 16 prompts x 8
 generations, 20 steps, validation every 2 steps with 256 validation samples,
-GBS 128, LR/min-LR 2e-6, warmup 2, training EP 16, and validation agent timeout
-360 seconds. The vLLM parallelism and other Qwen 3.5 defaults remain inherited
-from the standard config.
+GBS 128, LR/min-LR 2e-6, warmup 2, and validation agent timeout 360 seconds.
+The training/vLLM parallelism and other Qwen 3.5 defaults remain inherited from
+the standard config.
 
 ## What the overlay changes
 
@@ -249,6 +249,10 @@ export GEN_NODES="${GEN_NODES:-32}"
 export NODES="${NODES:-$((TRAIN_NODES + GEN_NODES))}"
 export SLURM_TIME="${SLURM_TIME:-4:00:00}"
 export SBATCH_GRES="${SBATCH_GRES:-gpu:${GPUS_PER_NODE}}"
+# Keep one full Qwen35 training replica inside a segment. Standard training
+# replica size is TP4 * PP2 * CP1 * EP16 = 128 GPUs; vLLM is TP8 * PP1 = 8 GPUs,
+# so the training replica dominates.
+export SBATCH_SEGMENT="${SBATCH_SEGMENT:-$(((128 + GPUS_PER_NODE - 1) / GPUS_PER_NODE))}"
 
 : "${HF_CKPT_PATH:?set to the host Qwen 3.5 HF checkpoint directory}"
 export CONTAINER_HF_CKPT_PATH="${CONTAINER_HF_CKPT_PATH:-${HF_CKPT_PATH}}"
