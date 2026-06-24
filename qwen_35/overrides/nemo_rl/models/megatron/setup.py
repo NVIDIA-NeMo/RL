@@ -1002,12 +1002,14 @@ def setup_reference_model_state(
     if config["megatron_cfg"].get("freeze_moe_router", False):
         ref_mixed_precision_wrapper = MoEFloat16Module
 
+    ref_pre_wrap_hooks = []
     reference_model = get_model(
         megatron_cfg.model,
         megatron_cfg.ddp,
         use_torch_fsdp2=megatron_cfg.dist.use_torch_fsdp2,
         overlap_param_gather_with_optimizer_step=megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
-        pre_wrap_hook=megatron_cfg.rng.data_parallel_random_init,
+        data_parallel_random_init=megatron_cfg.rng.data_parallel_random_init,
+        pre_wrap_hook=ref_pre_wrap_hooks,
         mixed_precision_wrapper=ref_mixed_precision_wrapper,
         pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
