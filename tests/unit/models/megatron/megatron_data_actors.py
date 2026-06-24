@@ -497,6 +497,25 @@ class PackSequencesTestActor:
                 "error": f"CP wrong qkv_format: expected 'thd', got {packed_seq_params.qkv_format}",
             }
 
+        # Mamba SSM state reset relies on packed_seq_params.seq_idx, which
+        # __post_init__ only builds when total_tokens is set.
+        if packed_seq_params.total_tokens != expected_total_tokens:
+            return {
+                "success": False,
+                "error": f"CP packed_seq_params.total_tokens mismatch: expected {expected_total_tokens}, got {packed_seq_params.total_tokens}",
+            }
+        if packed_seq_params.seq_idx is None:
+            return {
+                "success": False,
+                "error": "CP packed_seq_params.seq_idx is None",
+            }
+        expected_seq_idx_len = int(cu_seqlens_padded[-1].item())
+        if packed_seq_params.seq_idx.shape != (1, expected_seq_idx_len):
+            return {
+                "success": False,
+                "error": f"CP packed_seq_params.seq_idx shape mismatch: expected (1, {expected_seq_idx_len}), got {tuple(packed_seq_params.seq_idx.shape)}",
+            }
+
         # Test 2: CP packing with full sequence padding
         pad_full_seq_to = (batch_size * seq_len) + 8  # Add some padding
         (
@@ -530,6 +549,22 @@ class PackSequencesTestActor:
             return {
                 "success": False,
                 "error": f"CP full padding cu_seqlens_padded mismatch: expected {expected_cu_seqlens_padded_full}, got {cu_seqlens_padded_full}",
+            }
+
+        if packed_seq_params_full.total_tokens != expected_tokens_per_rank_full:
+            return {
+                "success": False,
+                "error": f"CP (full pad) packed_seq_params.total_tokens mismatch: expected {expected_tokens_per_rank_full}, got {packed_seq_params_full.total_tokens}",
+            }
+        if packed_seq_params_full.seq_idx is None:
+            return {
+                "success": False,
+                "error": "CP (full pad) packed_seq_params.seq_idx is None",
+            }
+        if packed_seq_params_full.seq_idx.shape != (1, pad_full_seq_to):
+            return {
+                "success": False,
+                "error": f"CP (full pad) packed_seq_params.seq_idx shape mismatch: expected (1, {pad_full_seq_to}), got {tuple(packed_seq_params_full.seq_idx.shape)}",
             }
 
         correct_ids_0 = torch.tensor(

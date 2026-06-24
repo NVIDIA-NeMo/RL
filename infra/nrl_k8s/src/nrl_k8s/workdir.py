@@ -54,7 +54,7 @@ DEFAULT_RAY_UPLOAD_PATHS = [
     "3rdparty/Gym-workspace/Gym/responses_api_agents/simple_agent",
     "3rdparty/Gym-workspace/Gym/pyproject.toml",
     "3rdparty/Gym-workspace/Gym/uv.lock",
-    "3rdparty/Megatron-LM-workspace/Megatron-LM/megatron",
+    "3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM/megatron",
 ]
 
 
