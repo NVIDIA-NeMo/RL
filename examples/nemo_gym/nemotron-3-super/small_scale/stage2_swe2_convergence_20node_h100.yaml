@@ -1,0 +1,10 @@
+defaults: "../stage2_swe2.yaml"
+
+policy:
+  generation:
+    colocated:
+      resources:
+        num_nodes: 4
+
+cluster:
+  num_nodes: 20   # 16 train (TP8*CP8*PP1=64 GPUs, DP2) + 4 gen (TP8). No judges -> SBATCH=20.
