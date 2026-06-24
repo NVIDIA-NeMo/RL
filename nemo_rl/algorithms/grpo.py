@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import json
 import os
 import time
 import warnings
@@ -54,6 +55,7 @@ from nemo_rl.algorithms.utils import (
     calculate_baseline_and_std_per_prompt,
     get_gdpo_reward_component_keys,
     log_generation_metrics_to_wandb,
+    print_efficiency_summary,
     print_performance_metrics,
     set_seed,
 )
@@ -1859,6 +1861,33 @@ def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
     return should_log_nemo_gym_responses
 
 
+def _write_latest_checkpoint_status(
+    checkpointer: CheckpointManager, last_checkpoint_step: int
+) -> None:
+    """Write a lightweight, top-level ``latest_checkpoint_status.json`` for monitoring.
+
+    Records the wall-clock time and step of the most recent successful checkpoint
+    save so an out-of-band watchdog can poll checkpoint progress on long runs.
+
+    Intentionally distinct from ``CheckpointManager``'s per-step
+    ``step_{N}/training_info.json`` (the resume state): different schema, written
+    at the checkpoint-dir root. There is no in-repo consumer yet. The read is
+    deliberately unguarded so a corrupt file surfaces loudly (signalling
+    corruption) instead of being silently masked.
+    """
+    status_path = os.path.join(
+        str(checkpointer.checkpoint_dir), "latest_checkpoint_status.json"
+    )
+    status: dict[str, Any] = {}
+    if os.path.exists(status_path):
+        with open(status_path) as f:
+            status = json.load(f)
+    status["last_successful_ckpt_save_completion"] = time.time()
+    status["last_checkpoint_step"] = last_checkpoint_step
+    with open(status_path, "w") as f:
+        json.dump(status, f)
+
+
 def _get_effort_config(master_config: MasterConfig) -> Optional[EffortLevelsConfig]:
     """Return the effort-levels reward-shaping config from env.nemo_gym, if set."""
     if "nemo_gym" not in master_config.env:
@@ -2264,7 +2293,7 @@ def grpo_train(
     master_config: MasterConfig,
 ) -> None:
     """Run GRPO training algorithm."""
-    timer = Timer()
+    timer = Timer(context={"worker": "driver"})
     timeout = TimeoutChecker(
         timeout=master_config.checkpointing["checkpoint_must_save_by"],
         fit_last_save_time=True,
@@ -3089,6 +3118,13 @@ def grpo_train(
                             )
                         checkpointer.finalize_checkpoint(checkpoint_path)
 
+                        # Record last-successful-checkpoint time/step for external
+                        # monitoring (parity with async_grpo_train; see
+                        # _write_latest_checkpoint_status).
+                        _write_latest_checkpoint_status(
+                            checkpointer, last_checkpoint_step=total_steps + 1
+                        )
+
             # Logging
             # Log training data
             memory_tracker.snapshot_start_of_stage("Logging", dir())
@@ -3276,7 +3312,7 @@ def validate(
         print("  ⚠️ No validation dataloader provided, skipping validation", flush=True)
         return {}, {}
 
-    timer = Timer()
+    timer = Timer(context={"worker": "validator"})
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step}...", flush=True)
 
@@ -3515,7 +3551,8 @@ def async_grpo_train(
     # Import async utilities only when needed
     from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
 
-    timer = Timer()
+    timer = Timer(context={"worker": "driver"})
+    training_wall_start = time.perf_counter()
     timeout = TimeoutChecker(
         timeout=master_config.checkpointing["checkpoint_must_save_by"],
         fit_last_save_time=True,
@@ -3737,6 +3774,7 @@ def async_grpo_train(
     print(
         f"⏳ Waiting for replay buffer to have sufficient trajectories for step {step}..."
     )
+    timer.start("init/total")
     wait_iterations = 0
     while True:
         buffer_size_current = ray.get(replay_buffer.size.remote())
@@ -3768,6 +3806,7 @@ def async_grpo_train(
         wait_iterations += 1
         time.sleep(1.0)
 
+    timer.stop("init/total")
     print(f"✅ Buffer ready for step {step}! Starting training loop...")
 
     # Main training loop
@@ -3823,8 +3862,8 @@ def async_grpo_train(
                             print(
                                 f"   Trajectory versions in buffer: {buffer_debug['trajectory_versions']}"
                             )
-
-                        time.sleep(0.5)
+                        with timer.time("idle/buffer_starvation"):
+                            time.sleep(0.5)
                         continue
 
                     # Extract trajectories and metadata from sample result
@@ -4097,6 +4136,8 @@ def async_grpo_train(
                 print("🔄 Synchronizing policy weights to trajectory collector…")
                 generation_logger_metrics = None
                 if NEED_REFIT:
+                    timer.start("idle/refit_bubble")
+
                     # Measure pending-generation wait as exposed_generation time
                     print("🔄 Coordinating with trajectory collector before refit...")
                     with timer.time("exposed_generation"):
@@ -4124,6 +4165,8 @@ def async_grpo_train(
                         trajectory_collector.set_weight_version.remote(weight_version)
                         trajectory_collector.resume_after_refit.remote()
 
+                    timer.stop("idle/refit_bubble")
+
                 # Clear logger metrics after each refit (weight sync), starting a new logging cycle
                 if policy_generation is not None:
                     policy_generation.clear_logger_metrics()
@@ -4136,39 +4179,40 @@ def async_grpo_train(
                 if (val_period > 0 and (step + 1) % val_period == 0) or (
                     val_at_end and is_last_step
                 ):
-                    # Pause trajectory collection during validation to reduce memory pressure
-                    trajectory_collector.pause.remote()
+                    with timer.time("idle/validation"):
+                        # Pause trajectory collection during validation to reduce memory pressure
+                        trajectory_collector.pause.remote()
 
-                    if NEED_REFIT and POLICY_GENERATION_STALE:
-                        refit_policy_generation(
-                            policy, policy_generation, colocated_inference
+                        if NEED_REFIT and POLICY_GENERATION_STALE:
+                            refit_policy_generation(
+                                policy, policy_generation, colocated_inference
+                            )
+                            POLICY_GENERATION_STALE = False
+                        else:
+                            policy_generation.prepare_for_generation()
+                        val_metrics, validation_timings = validate(
+                            policy_generation,
+                            val_dataloader,
+                            tokenizer,
+                            val_task_to_env,
+                            step=step + 1,
+                            master_config=master_config,
+                            logger=logger,
                         )
-                        POLICY_GENERATION_STALE = False
-                    else:
-                        policy_generation.prepare_for_generation()
-                    val_metrics, validation_timings = validate(
-                        policy_generation,
-                        val_dataloader,
-                        tokenizer,
-                        val_task_to_env,
-                        step=step + 1,
-                        master_config=master_config,
-                        logger=logger,
-                    )
-                    policy_generation.finish_generation()
-                    logger.log_metrics(
-                        validation_timings, step + 1, prefix="timing/validation"
-                    )
-                    logger.log_metrics(val_metrics, step + 1, prefix="validation")
+                        policy_generation.finish_generation()
+                        logger.log_metrics(
+                            validation_timings, step + 1, prefix="timing/validation"
+                        )
+                        logger.log_metrics(val_metrics, step + 1, prefix="validation")
 
-                    # Explicit GPU memory cleanup after validation in async mode
-                    import gc
+                        # Explicit GPU memory cleanup after validation in async mode
+                        import gc
 
-                    gc.collect()
-                    torch.cuda.empty_cache()
+                        gc.collect()
+                        torch.cuda.empty_cache()
 
-                    # Resume trajectory collection after validation
-                    trajectory_collector.resume.remote()
+                        # Resume trajectory collection after validation
+                        trajectory_collector.resume.remote()
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
                 flat_token_mask = flat_messages["token_loss_mask"]
@@ -4329,6 +4373,12 @@ def async_grpo_train(
                         )
                         checkpointer.finalize_checkpoint(checkpoint_path)
 
+                        # Record last-successful-checkpoint time/step for external
+                        # monitoring (see _write_latest_checkpoint_status).
+                        _write_latest_checkpoint_status(
+                            checkpointer, last_checkpoint_step=step + 1
+                        )
+
             # Logging
             # Log training data (match sync GRPO logging payload for parity).
             # NeMo Gym responses can be very large and expensive to log; when
@@ -4428,8 +4478,31 @@ def async_grpo_train(
                 train_results, metrics, timing_metrics, master_config
             )
 
+            collector_efficiency = ray.get(
+                trajectory_collector.get_efficiency_metrics.remote()
+            )
+            driver_efficiency = {
+                cat: timer.reduce(cat, "sum")
+                for cat in [
+                    "init/total",
+                    "idle/buffer_starvation",
+                    "idle/refit_bubble",
+                    "idle/validation",
+                ]
+                if cat in timer._timers
+            }
+            merged_efficiency = {**driver_efficiency}
+            for cat, dur in collector_efficiency.items():
+                merged_efficiency[cat] = merged_efficiency.get(cat, 0.0) + dur
+
+            total_wall_time = time.perf_counter() - training_wall_start
+            efficiency_loggable = print_efficiency_summary(
+                merged_efficiency, total_wall_time, step + 1
+            )
+
             logger.log_metrics(performance_metrics, step + 1, prefix="performance")
             logger.log_metrics(metrics, step + 1, prefix="train")
+            logger.log_metrics(efficiency_loggable, step + 1, prefix="")
             # step_finished=True here since this is the final log of our current step.
             logger.log_metrics(
                 timing_metrics,

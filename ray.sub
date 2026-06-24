@@ -24,6 +24,9 @@
 
 set -eoux pipefail
 
+# Record job-start epoch so Python can measure pre-Python overhead
+export NRL_JOB_START_EPOCH=$(date +%s.%N)
+
 ########################################################
 # Function to detect if SLURM cluster uses GRES
 ########################################################
@@ -640,6 +643,10 @@ if [[ -n "$DRIVER_COMMAND_FILE" ]]; then
     fi
     sleep 5
   done
+
+  # Record the wall-clock epoch when the Ray cluster became ready so the driver
+  # and training process can measure post-ready initialization timing.
+  export NRL_RAY_READY_EPOCH=\$(date +%s.%N)
 
   set +e
   bash "$DRIVER_COMMAND_FILE" > "$LOG_DIR/ray-driver.log" 2>&1
