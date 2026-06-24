@@ -32,6 +32,8 @@ def resolve_quant_cfg(quant_cfg: str) -> dict[str, Any]:
        ``.yml`` / ``.yaml`` suffix is optional) or the path to a user-authored
        YAML recipe. Resolution is performed by ``modelopt.recipe.load_config``,
        which searches the filesystem first and then the built-in recipe library.
+       For Ray/container workers, use an absolute path for user-authored recipe
+       files; NeMo-RL repo-relative recipe paths are not resolved here.
 
     YAML recipes are expected to follow the standard ModelOpt PTQ recipe layout
     with a top-level ``quantize:`` section in the
@@ -55,8 +57,8 @@ def resolve_quant_cfg(quant_cfg: str) -> dict[str, Any]:
             f"Unknown quant_cfg '{quant_cfg}'. Must be either a built-in "
             f"ModelOpt config name (e.g. 'NVFP4_DEFAULT_CFG'), a built-in "
             f"ModelOpt PTQ recipe name (e.g. "
-            f"'general/ptq/nvfp4_default-fp8_kv'), or a path to a YAML "
-            f"quantization recipe."
+            f"'general/ptq/nvfp4_default-fp8_kv'), or an absolute path to a "
+            f"YAML quantization recipe."
         ) from e
 
     quantize = loaded.get("quantize", loaded)
