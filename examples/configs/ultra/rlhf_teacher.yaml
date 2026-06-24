@@ -188,6 +188,7 @@ policy:
     apply_rope_fusion: true
     use_fused_weighted_squared_relu: true
     bias_activation_fusion: false
+    gradient_accumulation_fusion: false
     defer_fp32_logits: true
 
     # Logging
@@ -283,7 +284,7 @@ policy:
     sequence_length_round: 64
     fuse_loss: true
 
-  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  make_sequence_length_divisible_by: ${mul:${policy.megatron_cfg.context_parallel_size}, ${mul:2, ${policy.megatron_cfg.tensor_model_parallel_size}}}
   max_grad_norm: 1.0
   optimizer: null
   scheduler: null
@@ -321,11 +322,11 @@ policy:
       vllm_metrics_logger_interval: 0.5
       expose_http_server: true
       skip_tokenizer_init: false
+      reasoning_parser_plugin: nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py
       http_server_serving_chat_kwargs:
         enable_auto_tools: true
         tool_parser: qwen3_coder
         reasoning_parser: nano_v3
-        reasoning_parser_plugin: nemo_rl/utils/nano_v3_reasoning_parser.py
 
     vllm_kwargs:
       attention_backend: FLASH_ATTN
@@ -348,6 +349,7 @@ data:
   max_input_seq_length: null
   shuffle: false
   num_workers: 1
+  use_multiple_dataloader: false
   train:
     data_path: null
   validation:
@@ -372,6 +374,12 @@ env:
   nemo_gym:
     nemo_gym_log_dir: "logs/nemo_gym"
     skip_venv_if_present: true
+    # NeMo-RL-side effort shaping; stripped before forwarding to Gym.
+    effort_levels:
+      low_string: "{reasoning effort: efficient}"
+      low_weight: 0.1
+      low_penalty: 1
+      low_ub: 15000
     port_range_low: 5000
     port_range_high: 5999
     invalid_tool_call_patterns:
@@ -426,12 +434,12 @@ env:
           use_principle: true
           default_principle: "You will be given one or more evaluation criteria (rubrics).\nEvaluate both responses on EACH criterion individually first, then synthesize an overall judgment.\nCriteria:\n\n1. Please act as an impartial judge and evaluate the quality of the responses provided by two AI assistants to the user prompt. Begin your evaluation by generating your own answer to the prompt. You must provide your answer before judging any answers. When evaluating the assistants' answers, compare both assistants' answers with your answer. You must identify and correct any mistakes or inaccurate information. Then consider if the assistant's answers are helpful, relevant, and concise. Helpful means the answer correctly responds to the prompt or follows the instructions. Note when user prompt has any ambiguity or more than one interpretation, it is more helpful and appropriate to ask for clarifications or more information from the user than providing an answer based on assumptions. Relevant means all parts of the response closely connect or are appropriate to what is being asked. Concise means the response is clear and not verbose or excessive. Then consider the creativity and novelty of the assistant's answers when needed. Finally, identify any missing important information in the assistants' answers that would be beneficial to include when responding to the user prompt."
           aggregator_method: "simple_tiebreaker"
+          use_golden_anchor: false
           reasoning_bonus: 0.0
           answer_bonus: 0.0
           top_percentile: 0.2
           genrm_parse_retries: 1
           group_reasoning_length_penalty_coeff: 0.0
-          use_golden_anchor: false
           group_answer_length_penalty_coeff: 0.0
           group_style_penalty_coeff: 0.0
           default_score: 3.0
@@ -451,6 +459,7 @@ env:
           ray_worker_py_executable: /opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker/bin/python
           vllm_serve_env_vars:
             VLLM_RAY_DP_PACK_STRATEGY: strict
+            NCCL_MNNVL_ENABLE: "0"
 
           vllm_serve_kwargs:
             tensor_parallel_size: 4
@@ -468,8 +477,6 @@ env:
             load_format: instanttensor
             compilation_config:
               cudagraph_capture_sizes: [1,2,4,8,16,32]
-          server_env:
-            NCCL_MNNVL_ENABLE: "0"
 
 
 # =============================================================================
@@ -493,15 +500,6 @@ logger:
   gpu_monitoring:
     collection_interval: 10
     flush_interval: 10
-
-# =============================================================================
-# Effort Levels
-# =============================================================================
-effort_levels:
-  low_string: "{reasoning effort: efficient}"
-  low_weight: 0.1
-  low_penalty: 1
-  low_ub: 15000
 
 # =============================================================================
 # Token IDs (model-specific)
