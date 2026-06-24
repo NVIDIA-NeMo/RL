@@ -814,15 +814,6 @@ class MegatronPolicyWorkerImpl(
         self._collect_mtp_metrics(metrics)
         return metrics
 
-    def _get_model_config(self):
-        """Get the underlying model config (handle Float16Module wrapper)."""
-        model = self.model
-        if hasattr(model, "module") and hasattr(model.module, "config"):
-            return model.module.config
-        elif hasattr(model, "config"):
-            return model.config
-        return None
-
     def _set_moe_grad_scale_func(self, func):
         """Set moe_grad_scale_func on the model config for MOE aux loss scaling."""
         config = self._get_model_config()
