@@ -107,6 +107,7 @@ project-includes = [
   "nemo_rl/data_plane/observability.py",
   "nemo_rl/data_plane/preshard.py",
   "nemo_rl/data_plane/schema.py",
+  "nemo_rl/data_plane/transport_metrics.py",
   "nemo_rl/data_plane/worker_mixin.py",
   "nemo_rl/distributed/__init__.py",
   "nemo_rl/distributed/collectives.py",
