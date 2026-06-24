@@ -655,9 +655,8 @@ class VllmInternalWorkerExtension:
         Must be called after ``_hf_to_gen_param`` is populated (inside ``nccl_xfer_refit``).
 
         Returns:
-            ``(dst_tensor, dst_placements, post_refit_hook)`` where:
+            ``(dst_tensor, post_refit_hook)`` where:
             - ``dst_tensor``: DTensorRef to pass to xferdtensor
-            - ``dst_placements``: placement list to use (may differ from param_info)
             - ``post_refit_hook``: callable to run after xferdtensor
               (copies the TP-local slice from the temp buffer into the live
               vLLM merged param), or None for direct params
@@ -668,7 +667,6 @@ class VllmInternalWorkerExtension:
             param_name, (None, None)
         )
         global_shape = param_info["global_shape"]
-        dst_placements = param_info["dst_placements"]
 
         if vllm_param is None:
             raise ValueError(
@@ -686,9 +684,9 @@ class VllmInternalWorkerExtension:
             def post_refit_hook(_buf=buf, _region=region):
                 _region.copy_(_buf)
 
-            return DTensorRef(buf, global_shape), dst_placements, post_refit_hook
+            return DTensorRef(buf, global_shape), post_refit_hook
 
-        return DTensorRef(vllm_param.data, global_shape), dst_placements, None
+        return DTensorRef(vllm_param.data, global_shape), None
 
     def nccl_xfer_refit(self) -> bool:
         """Receive weights from training workers via xferdtensor.
@@ -704,7 +702,7 @@ class VllmInternalWorkerExtension:
         from nemo_rl.distributed.xferdtensor import xferdtensor
 
         def _recv_one_param(param_info, group):
-            dst_tensor, dst_placements, post_refit_hook = self.get_dst_dtensor(
+            dst_tensor, post_refit_hook = self.get_dst_dtensor(
                 param_info["name"], param_info
             )
             xferdtensor(
@@ -713,7 +711,7 @@ class VllmInternalWorkerExtension:
                 param_info["src_placements"],
                 dst_tensor,
                 param_info["dst_mesh_info"],
-                dst_placements,
+                param_info["dst_placements"],
                 group,
             )
             if post_refit_hook:
