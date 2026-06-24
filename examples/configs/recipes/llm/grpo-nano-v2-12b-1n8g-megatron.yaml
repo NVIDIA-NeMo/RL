@@ -21,6 +21,10 @@ policy:
       max_model_len: 512
     vllm_kwargs:
       mamba_ssm_cache_dtype: float32  # needed to avoid SSM state overflows in vllm 5.2.0
+      # vLLM 0.20 allocates one Mamba cache block per decode seq; the default
+      # max_num_seqs=1024 exceeds available blocks. Cap to the rollout batch
+      # (num_prompts_per_step * num_generations_per_prompt = 32 * 16 = 512).
+      max_num_seqs: 512
   sequence_packing:
     enabled: false
 data:

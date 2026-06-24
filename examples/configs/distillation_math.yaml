@@ -90,7 +90,17 @@ policy: &POLICY_BASE
         force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
         empty_unused_memory_level: 0
         activation_checkpointing: false
-        converter_type: "Qwen3ForCausalLM"
+        # recompute_granularity controls activation checkpointing depth.
+        # "full": recompute all activations (default, max memory savings).
+        # "selective": recompute only specific modules (see recompute_modules).
+        # Only takes effect when activation_checkpointing: true.
+        recompute_granularity: "full"
+        # Modules to selectively recompute when recompute_granularity="selective".
+        # MCore options: ["core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe", "shared_experts"].
+        # Null defaults to ["core_attn"]. Full list and per-module constraints:
+        # https://github.com/NVIDIA/Megatron-LM/blob/d30c3ae5469fe3f6a64d4fd2e63b6e7f7844ea81/megatron/core/transformer/transformer_config.py#L483
+        # Use ["moe"] for MoE models to recompute expert activations only.
+        recompute_modules: null
         tensor_model_parallel_size: 2
         expert_tensor_parallel_size: 1
         expert_model_parallel_size: 1
@@ -177,6 +187,10 @@ policy: &POLICY_BASE
         - milestones: [10]
 
     generation:
+        # Port range for vLLM HTTP servers, kept below the OS ephemeral range.
+        # See ray.sub for the full port layout.
+        port_range_low: 11001
+        port_range_high: 15000
         backend: "vllm"
         max_new_tokens: ${..max_total_sequence_length} # refer to local policy/teacher config
         temperature: 1.0
@@ -265,3 +279,6 @@ logger:
 cluster:
     gpus_per_node: 8
     num_nodes: 1
+    master_port_range_low: 25000
+    master_port_range_high: 28000
+    segment_size: null  # Nodes per NVLink domain segment for topology-aware alignment; null to disable

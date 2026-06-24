@@ -78,6 +78,7 @@ def mock_components():
             val_micro_batch_size=1,
             val_at_start=False,
             val_at_end=False,
+            only_unmask_final=False,
         ),
         policy={
             "train_global_batch_size": 1,

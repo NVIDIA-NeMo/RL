@@ -47,3 +47,33 @@ export NRL_VLLM_ASYNC_TIMEOUT_SECONDS=1800  # Default: 600 (10 minutes)
 ```
 
 If you encounter timeout errors, the system will suggest doubling the current timeout value.
+
+## AutoModel Parameter Freezing (`freeze_config`)
+
+VLM/omni recipes on the AutoModel (DTensor) backend control which sub-towers
+train via a declarative `freeze_config` under
+`policy.model_kwargs.automodel_kwargs`:
+
+```yaml
+automodel_kwargs:
+  freeze_config:
+    freeze_vision_tower: true
+    freeze_audio_tower: true
+    freeze_language_model: false
+```
+
+AutoModel applies this at build time (`apply_parameter_freezing`, before the
+optimizer is created). Note the following sharp edges:
+
+- **No default auto-freeze.** If `freeze_config` is omitted, *nothing* is
+  frozen. Earlier versions unconditionally froze the visual encoder for
+  text-only training; that implicit safety net is gone. A text-only config run
+  on a vision/audio-capable checkpoint without `freeze_config` will create
+  optimizer state for parameters that never receive gradients, which leads to
+  a **checkpoint-resume key mismatch**.
+- **Typos fail silently.** A misspelled `freeze_*` key is ignored and falls
+  back to the default (unfrozen) — no error is raised. Verify the keys exactly
+  match `freeze_vision_tower` / `freeze_audio_tower` / `freeze_language_model`.
+
+Every shipped recipe sets `freeze_config`, so in-repo recipes are unaffected.
+This matters only for custom configs.

@@ -88,6 +88,7 @@ def calculate_baseline_and_std_per_prompt(
     rewards: torch.Tensor,
     valid_mask: torch.Tensor,
     leave_one_out_baseline: bool = True,
+    std_rewards: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Function to compute a baseline for each (prompt, response) pair in the batch.
 
@@ -99,10 +100,17 @@ def calculate_baseline_and_std_per_prompt(
     valid_mask: tensor (b,)       Vector of 0/1, where 0 is to ignore and 1 is to keep
     leave_one_out_baseline: bool  Compute an unbiased baseline by leaving out the sample that
                                   the baseline is for (from RLOO https://arxiv.org/abs/2402.14740)
+    std_rewards: tensor (b,)      Optional separate reward tensor used only for the std
+                                  calculation. Defaults to `rewards`. Useful for DAPO,
+                                  which needs std on the raw task metric for dynamic
+                                  sampling filtering while keeping baseline on the
+                                  shaped reward.
 
     Returns:
     tensor (b,), tensor (b,) of baselines and std on the same device as 'rewards'
     """
+    if std_rewards is None:
+        std_rewards = rewards
     unique_prompts = torch.unique(prompts, dim=0)
 
     baseline = torch.zeros_like(rewards)
@@ -141,19 +149,28 @@ def calculate_baseline_and_std_per_prompt(
                 )
                 / num_valid
             )
-            prompt_baseline_square = (
+            std_prompt_baseline = (
+                prompt_baseline
+                if std_rewards is rewards
+                else torch.matmul(
+                    baseline_mask_matrix,
+                    std_rewards[prompt_idx] * valid_mask[prompt_idx],
+                )
+                / num_valid
+            )
+            std_prompt_baseline_square = (
                 torch.matmul(
                     baseline_mask_matrix,
-                    torch.pow(rewards[prompt_idx], 2) * valid_mask[prompt_idx],
+                    torch.pow(std_rewards[prompt_idx], 2) * valid_mask[prompt_idx],
                 )
                 / num_valid
             )
 
             baseline[prompt_idx] = prompt_baseline
-            sq_baseline[prompt_idx] = prompt_baseline_square
+            sq_baseline[prompt_idx] = std_prompt_baseline_square
             std[prompt_idx] = (
                 (
-                    (prompt_baseline_square - prompt_baseline.square())
+                    (std_prompt_baseline_square - std_prompt_baseline.square())
                     * (num_valid / (num_valid - 1))
                 )
                 .sqrt()
@@ -220,6 +237,23 @@ def mask_out_neg_inf_logprobs(
     logprobs = torch.where(mask.bool(), logprobs, 0.0)
 
     return logprobs
+
+
+def masked_var(
+    values: torch.Tensor,
+    mask: torch.Tensor,
+    mean: Optional[torch.Tensor | float] = None,
+    unbiased: bool = True,
+) -> torch.Tensor:
+    if mean is None:
+        mean = masked_mean(values, mask)
+    centered_values = values - mean
+    variance = masked_mean(centered_values.pow(2), mask)
+
+    if unbiased:
+        normalization_factor = torch.sum(mask)
+        variance = variance * (normalization_factor / (normalization_factor - 1))
+    return variance
 
 
 def set_seed(seed: int) -> None:
@@ -473,16 +507,27 @@ def print_performance_metrics(
     # =====================================================
     # Generate Token Imbalance Visualization
     # =====================================================
-    def visualize_per_worker_load(per_worker_token_counts: dict[int, int]) -> float:
+    def visualize_per_worker_load(
+        per_worker_token_counts: dict[int, int],
+    ) -> Optional[float]:
         per_worker_token_counts_list = [
             v for k, v in sorted(per_worker_token_counts.items())
         ]
+        print("  • Visualizing Token Imbalance per Generation Worker:")
+        if not per_worker_token_counts_list:
+            print("    - No per-worker generation load data available.")
+            return None
+
+        max_token_count = max(per_worker_token_counts_list)
+        if max_token_count <= 0:
+            print("    - No generated tokens recorded per worker.")
+            return None
+
         per_worker_load_ratio = [
-            v / max(per_worker_token_counts_list) for v in per_worker_token_counts_list
+            v / max_token_count for v in per_worker_token_counts_list
         ]
         max_rows_to_print = 1000
         bar_length = 20
-        print("  • Visualizing Token Imbalance per Generation Worker:")
         for i in range(min(len(per_worker_token_counts_list), max_rows_to_print)):
             print(
                 f"    - Generated Tokens from Worker {i:3.0f}:"
@@ -515,7 +560,8 @@ def print_performance_metrics(
 
         if per_worker_token_counts is not None:
             average_token_imbalance = visualize_per_worker_load(per_worker_token_counts)
-            performance_metrics["average_token_imbalance"] = average_token_imbalance
+            if average_token_imbalance is not None:
+                performance_metrics["average_token_imbalance"] = average_token_imbalance
 
     if "mean_total_tokens_per_sample" in metrics:
         print(
@@ -646,24 +692,26 @@ def print_performance_metrics(
     # Throughputs
     # =====================================================
 
-    policy_and_reference_logprobs_time = timing_metrics["policy_and_reference_logprobs"]
-    policy_training_time = timing_metrics["policy_training"]
+    policy_and_reference_logprobs_time = timing_metrics.get(
+        "policy_and_reference_logprobs", 0
+    )
+    policy_training_time = timing_metrics.get("policy_training", 0)
     total_time = timing_metrics["total_step_time"]
     refit_time = (
         timing_metrics["weight_sync"]
         if "weight_sync" in timing_metrics
-        else timing_metrics["prepare_for_generation/total"]
+        else timing_metrics.get("prepare_for_generation/total", 0)
     )
-    if "generation" in timing_metrics:  # Sync GRPO
+    if "generation" in timing_metrics:  # Sync
         generation_time = timing_metrics["generation"]
-    else:  # Async GRPO
+    else:  # Async
         # If the training time is greater than the generation time, we include the idle time caused by training as part of the generation time.
         # if training time > generation time, generation time = training time
         # if training time < generation time, generation time = training time + exposed generation time
         generation_time = (
-            timing_metrics["exposed_generation"]
-            + timing_metrics["policy_and_reference_logprobs"]
-            + timing_metrics["policy_training"]
+            timing_metrics.get("exposed_generation", 0)
+            + policy_and_reference_logprobs_time
+            + policy_training_time
         )
 
     num_nodes = master_config.cluster["num_nodes"]
@@ -672,11 +720,10 @@ def print_performance_metrics(
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
 
     # Idle Time from Training Worker (Async GRPO only)
-    grpo_config = master_config.grpo
+    grpo_config = getattr(master_config, "grpo", {})
     if (
         "async_grpo" in grpo_config and grpo_config["async_grpo"]["enabled"]
     ) and not colocated_inference:
-        # async grpo
         exposed_generation_time = timing_metrics["exposed_generation"]
         training_worker_idle_time_ratio = (
             0
@@ -696,9 +743,15 @@ def print_performance_metrics(
             training_worker_idle_time_ratio
         )
 
-    number_of_samples_per_step = (
-        grpo_config["num_prompts_per_step"] * grpo_config["num_generations_per_prompt"]
+    # Detect which algorithm config key is being used
+    algo_config = (
+        getattr(master_config, "grpo", None)
+        or getattr(master_config, "ppo", None)
+        or {}
     )
+    number_of_samples_per_step = algo_config.get(
+        "num_prompts_per_step", 1
+    ) * algo_config.get("num_generations_per_prompt", 1)
 
     if colocated_inference:
         training_num_gpus = total_num_gpus
@@ -716,28 +769,39 @@ def print_performance_metrics(
         )
         training_num_gpus = total_num_gpus - generation_num_gpus
 
+    total_num_tokens = metrics.get("total_num_tokens", 0)
+
     e2e_samples_per_sec_per_gpu = (
         number_of_samples_per_step / total_time / total_num_gpus
+        if total_time > 0
+        else 0
     )
 
     e2e_tokens_per_sec_per_gpu = (
-        metrics["total_num_tokens"] / total_time / total_num_gpus
+        total_num_tokens / total_time / total_num_gpus if total_time > 0 else 0
     )
     policy_training_tokens_per_sec_per_gpu = (
-        metrics["total_num_tokens"] / policy_training_time / training_num_gpus
+        total_num_tokens / policy_training_time / training_num_gpus
+        if policy_training_time > 0
+        else 0
     )
     policy_and_reference_logprobs_tokens_per_sec_per_gpu = (
-        metrics["total_num_tokens"]
-        / policy_and_reference_logprobs_time
-        / training_num_gpus
+        total_num_tokens / policy_and_reference_logprobs_time / training_num_gpus
+        if policy_and_reference_logprobs_time > 0
+        else 0
+    )
+    training_worker_group_time = (
+        policy_training_time + policy_and_reference_logprobs_time
     )
     training_worker_group_tokens_per_sec_per_gpu = (
-        metrics["total_num_tokens"]
-        / (policy_training_time + policy_and_reference_logprobs_time)
-        / training_num_gpus
+        total_num_tokens / training_worker_group_time / training_num_gpus
+        if training_worker_group_time > 0
+        else 0
     )
     generation_tokens_per_sec_per_gpu = (
-        metrics["total_num_tokens"] / generation_time / generation_num_gpus
+        total_num_tokens / generation_time / generation_num_gpus
+        if generation_time > 0
+        else 0
     )
 
     print("  • Throughputs (per GPU):")
