@@ -292,7 +292,7 @@ class MegatronPolicyWorkerImpl(
         )
         # Handle model import if needed. Subclasses (e.g. ModelOpt quant
         # worker) may set ``_model_import_post_wrap_hook`` and
-        # ``_transformer_layer_spec`` on ``self`` before calling
+        # layer-spec hooks on ``self`` before calling
         # super().__init__() to inject quantization hooks into HF->Megatron
         # import.
         handle_model_import(
@@ -302,6 +302,7 @@ class MegatronPolicyWorkerImpl(
             pt_checkpoint_exists,
             model_post_wrap_hook=getattr(self, "_model_import_post_wrap_hook", None),
             transformer_layer_spec=getattr(self, "_transformer_layer_spec", None),
+            mamba_stack_spec=getattr(self, "_mamba_stack_spec", None),
         )
         log_gpu_memory_diagnostics(
             label="after_hf_import", worker_type="MegatronPolicyWorker"
@@ -592,9 +593,12 @@ class MegatronPolicyWorkerImpl(
                 global_valid_seqs = gb_result["global_valid_seqs"]
                 global_valid_toks = gb_result["global_valid_toks"]
 
-                # Pre-compute MTP loss mask from token_mask and sample_mask
-                # before microbatch processing, so process_microbatch can pack it
-                if "token_mask" in batch and "sample_mask" in batch:
+                # Pre-compute the MTP loss mask, only when MTP is enabled, so
+                # process_microbatch can pack it.
+                model_config = self._get_model_config()
+                mtp_num_layers = getattr(model_config, "mtp_num_layers", None)
+                mtp_enabled = mtp_num_layers is not None and mtp_num_layers > 0
+                if mtp_enabled and "token_mask" in batch and "sample_mask" in batch:
                     mtp_loss_mask = batch["token_mask"] * batch[
                         "sample_mask"
                     ].unsqueeze(-1)

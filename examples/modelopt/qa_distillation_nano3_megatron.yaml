@@ -1,0 +1,179 @@
+# Nano3 Quantization-Aware Distillation / OPD (QADOPD) with Megatron,
+# vLLM, and ModelOpt.
+#
+# The student policy and rollout worker use Nano3 NVFP4 W4A4 quantization; the
+# teacher stays BF16. This keeps the on-policy distillation target full
+# precision while training the quantized student in the same loop.
+#
+# Example usage:
+#   uv run examples/nemo_gym/run_distillation_nemo_gym.py --config examples/modelopt/qa_distillation_nano3_megatron.yaml
+
+defaults: "./qa_distillation_math_megatron.yaml"
+
+distillation:
+  # Keep the example moderate; scale these for production runs.
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 4
+  max_val_samples: null
+
+loss_fn:
+  # Reverse KL is the usual OPD direction for matching the teacher on student
+  # rollouts while avoiding full support coverage pressure from forward KL.
+  kl_type: "reverse"
+  mixed_kl_weight: 0.0
+
+policy:
+  model_name: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16"
+  tokenizer:
+    name: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
+    chat_template_kwargs: null
+  hf_config_overrides:
+    router_aux_loss_coef: 0
+  train_global_batch_size: 64
+  train_micro_batch_size: 1
+  generation_batch_size: 64
+  logprob_batch_size: 1
+  max_total_sequence_length: 8192
+  logprob_chunk_size: 1024
+  offload_optimizer_for_logprob: true
+  disable_modelopt_layer_spec: true
+  # Keep this example on the non-packed CP=1 path covered by the Nano3
+  # QAD smoke. Re-enable CP>1 only with a targeted Nano3 Mamba+distillation
+  # smoke test.
+  sequence_packing:
+    enabled: false
+
+  # Nano3 is a hybrid MoE/Mamba model. This recipe keeps attention and the
+  # known Nano3-sensitive layers in BF16, while applying NVFP4 to weights and
+  # layer-input activations.
+  quant_cfg: "examples/modelopt/quant_configs/nano3_nvfp4_default.yaml"
+  quant_calib_data: "cnn_dailymail"
+  quant_calib_size: 512
+  quant_batch_size: 1
+  quant_sequence_length: 2048
+
+  megatron_cfg:
+    empty_unused_memory_level: 1
+    activation_checkpointing: true
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 8
+    sequence_parallel: true
+    freeze_moe_router: true
+    moe_router_dtype: "fp32"
+    moe_router_load_balancing_type: "none"
+    moe_router_bias_update_rate: 1e-3
+    moe_permute_fusion: true
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "alltoall"
+    moe_shared_expert_overlap: false
+    apply_rope_fusion: true
+    bias_activation_fusion: false
+    defer_fp32_logits: true
+    gradient_accumulation_fusion: false
+    scheduler:
+      lr_warmup_iters: 20
+
+  make_sequence_length_divisible_by: ${mul:${mul:${.megatron_cfg.tensor_model_parallel_size}, ${.megatron_cfg.context_parallel_size}}, 2}
+
+  generation:
+    max_new_tokens: ${..max_total_sequence_length}
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    quant_cfg: "examples/modelopt/quant_configs/nano3_nvfp4_default.yaml"
+    vllm_cfg:
+      expose_http_server: true
+      tensor_parallel_size: 4
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.6
+      max_model_len: ${...max_total_sequence_length}
+      enforce_eager: false
+    vllm_kwargs:
+      # Nano3 Mamba cache is numerically safer in FP32 during generation.
+      mamba_ssm_cache_dtype: "float32"
+      compilation_config:
+        backend: "eager"
+
+teacher:
+  model_name: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-Base-BF16"
+  tokenizer:
+    name: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
+    chat_template_kwargs: null
+  hf_config_overrides:
+    router_aux_loss_coef: 0
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: ${policy.max_total_sequence_length}
+  logprob_chunk_size: ${policy.logprob_chunk_size}
+  offload_optimizer_for_logprob: true
+  # Keep teacher logprob forwards on the same tested path as policy.
+  sequence_packing:
+    enabled: false
+  megatron_cfg:
+    empty_unused_memory_level: 1
+    activation_checkpointing: true
+    tensor_model_parallel_size: ${policy.megatron_cfg.tensor_model_parallel_size}
+    pipeline_model_parallel_size: ${policy.megatron_cfg.pipeline_model_parallel_size}
+    context_parallel_size: ${policy.megatron_cfg.context_parallel_size}
+    expert_tensor_parallel_size: ${policy.megatron_cfg.expert_tensor_parallel_size}
+    expert_model_parallel_size: ${policy.megatron_cfg.expert_model_parallel_size}
+    sequence_parallel: ${policy.megatron_cfg.sequence_parallel}
+    freeze_moe_router: ${policy.megatron_cfg.freeze_moe_router}
+    moe_router_dtype: ${policy.megatron_cfg.moe_router_dtype}
+    moe_router_load_balancing_type: ${policy.megatron_cfg.moe_router_load_balancing_type}
+    moe_router_bias_update_rate: ${policy.megatron_cfg.moe_router_bias_update_rate}
+    moe_permute_fusion: ${policy.megatron_cfg.moe_permute_fusion}
+    moe_enable_deepep: ${policy.megatron_cfg.moe_enable_deepep}
+    moe_token_dispatcher_type: ${policy.megatron_cfg.moe_token_dispatcher_type}
+    moe_shared_expert_overlap: ${policy.megatron_cfg.moe_shared_expert_overlap}
+    apply_rope_fusion: ${policy.megatron_cfg.apply_rope_fusion}
+    bias_activation_fusion: ${policy.megatron_cfg.bias_activation_fusion}
+    defer_fp32_logits: ${policy.megatron_cfg.defer_fp32_logits}
+    gradient_accumulation_fusion: false
+
+data:
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 0
+  # Existing Gym-format QA fixture. Real training should point to data produced
+  # by `ng_prepare_data`.
+  train:
+    dataset_name: NemoGymDataset
+    data_path: "3rdparty/Gym-workspace/Gym/responses_api_agents/verifiers_agent/data/acereason-math-example.jsonl"
+  validation: null
+  default:
+    dataset_name: NemoGymDataset
+    env_name: "nemo_gym"
+    prompt_file: null
+    system_prompt_file: null
+    processor: "nemo_gym_data_processor"
+
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: false
+  nemo_gym:
+    rollout_max_attempts_to_avoid_lp_nan: 1
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - responses_api_agents/verifiers_agent/configs/acereason-math.yaml
+
+checkpointing:
+  checkpoint_dir: "checkpoints/qa-distillation-nano3-megatron"
+
+logger:
+  log_dir: "logs/qa_distillation_nano3_megatron"
+  wandb:
+    project: "nemo-qa-distillation"
+    name: "qa-distillation-nano3-megatron"
+  tensorboard:
+    log_dir: "tb_logs-qa-distillation-nano3-megatron"
+  mlflow:
+    run_name: "qa-distillation-nano3-megatron"
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 4
