@@ -22,7 +22,7 @@ from nemo_rl.algorithms.loss import PreferenceLossFn
 from nemo_rl.algorithms.rm import (
     MasterConfig,
     RMConfig,
-    _default_rm_save_state,
+    _initial_rm_save_state,
     rm_train,
     setup,
 )
@@ -199,7 +199,7 @@ def test_exit_on_max_steps(mock_components):
     # Set max steps to 12, which is less than len(train_dataloader) * max_num_epochs
     mock_components["master_config"].rm.max_num_steps = 12
 
-    rm_save_state = _default_rm_save_state()
+    rm_save_state = _initial_rm_save_state()
 
     # Run training
     rm_train(
@@ -224,7 +224,7 @@ def test_exit_on_max_epochs(mock_components):
     mock_components["master_config"].rm.max_num_epochs = 2
     mock_components["master_config"].rm.max_num_steps = 100
 
-    rm_save_state = _default_rm_save_state()
+    rm_save_state = _initial_rm_save_state()
 
     # Run training
     rm_train(
@@ -249,7 +249,7 @@ def test_exit_on_timeout(mock_components, capsys):
     mock_components["master_config"].rm.max_num_steps = 100
     mock_components["master_config"].rm.max_num_epochs = 10
 
-    rm_save_state = _default_rm_save_state()
+    rm_save_state = _initial_rm_save_state()
 
     # Mock TimeoutChecker to return False for first 7 checks, then True (timeout)
     with patch("nemo_rl.algorithms.rm.TimeoutChecker") as mock_timeout_class:

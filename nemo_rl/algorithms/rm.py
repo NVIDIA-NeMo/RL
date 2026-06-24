@@ -14,8 +14,8 @@
 import os
 import warnings
 from collections import defaultdict
+from dataclasses import asdict, dataclass, fields
 from functools import partial
-from typing import Optional
 
 import numpy as np
 import torch
@@ -39,18 +39,19 @@ from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 
-class RMSaveState(BaseModel, extra="allow"):
-    epoch: int = 0  # Track current epoch
-    step: int = 0  # Track step within current epoch
-    total_steps: int = 0  # Track total number of steps across all epochs
-    consumed_samples: int = 0
-    total_valid_tokens: int = (
-        0  # Track total number of non-padding tokens during training
+@dataclass
+class RMSaveState:
+    epoch: int  # Track current epoch
+    step: int  # Track step within current epoch
+    total_steps: int  # Track total number of steps across all epochs
+    consumed_samples: int
+    total_valid_tokens: int  # Track total number of non-padding tokens during training
+
+
+def _initial_rm_save_state() -> RMSaveState:
+    return RMSaveState(
+        epoch=0, step=0, total_steps=0, consumed_samples=0, total_valid_tokens=0
     )
-
-
-def _default_rm_save_state() -> RMSaveState:
-    return RMSaveState()
 
 
 class RMConfig(BaseModel, extra="allow"):
@@ -76,12 +77,13 @@ class MasterConfig(BaseModel, extra="allow"):
     checkpointing: CheckpointingConfig
 
 
-class RMValMetrics(BaseModel, extra="allow"):
-    loss: float = 0.0
-    accuracy: float = 0.0
-    rewards_chosen_mean: float = 0.0
-    rewards_rejected_mean: float = 0.0
-    num_valid_samples: float = 0.0
+@dataclass
+class RMValMetrics:
+    loss: float
+    accuracy: float
+    rewards_chosen_mean: float
+    rewards_rejected_mean: float
+    num_valid_samples: float
 
 
 # =======================================================
@@ -149,9 +151,18 @@ def setup(
     checkpointer = CheckpointManager(checkpointing_config)
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
     loaded_state = checkpointer.load_training_info(last_checkpoint_path)
-    rm_save_state: Optional[RMSaveState] = (
-        RMSaveState(**loaded_state) if isinstance(loaded_state, dict) else loaded_state
-    )
+    rm_save_state: RMSaveState
+    if loaded_state is not None:
+        # Filter to only known RMSaveState fields; checkpoints may carry
+        # extra keys (e.g. validation metrics from previous runs).
+        # Backcompat: checkpoints saved before total_valid_tokens was added.
+        loaded_state.setdefault("total_valid_tokens", 0)
+        known_fields = {f.name for f in fields(RMSaveState)}
+        rm_save_state = RMSaveState(
+            **{k: v for k, v in loaded_state.items() if k in known_fields}
+        )
+    else:
+        rm_save_state = _initial_rm_save_state()
 
     # ==========================
     #           Data
@@ -292,7 +303,7 @@ def validate(
         )
         prefix = f"validation-{val_dataset_name}"
 
-        logger.log_metrics(k_val_metrics.model_dump(), step, prefix=prefix)
+        logger.log_metrics(asdict(k_val_metrics), step, prefix=prefix)
         logger.log_metrics(k_validation_timings, step, prefix=f"timing/{prefix}")
 
         for metric_name in RMValMetrics.__annotations__.keys():
@@ -460,19 +471,10 @@ def rm_train(
         fit_last_save_time=True,
     )
     timeout.start_iterations()
-    if rm_save_state is None:
-        rm_save_state = _default_rm_save_state()
-        current_epoch = 0
-        current_step = 0
-        total_steps = 0
-        total_valid_tokens = 0
-    else:
-        current_epoch = rm_save_state.epoch
-        current_step = rm_save_state.step
-        total_steps = rm_save_state.total_steps
-        total_valid_tokens = getattr(
-            rm_save_state, "total_valid_tokens", 0
-        )  # Default to 0 for backward compatibility with older checkpoints
+    current_epoch = rm_save_state.epoch
+    current_step = rm_save_state.step
+    total_steps = rm_save_state.total_steps
+    total_valid_tokens = rm_save_state.total_valid_tokens
 
     rm_config = master_config.rm
     # Validation configuration
@@ -586,7 +588,7 @@ def rm_train(
                     rm_save_state.epoch = current_epoch
                     rm_save_state.total_valid_tokens = total_valid_tokens
                     # Remove outdated validation metrics
-                    for key in list(rm_save_state.model_dump()):
+                    for key in list(vars(rm_save_state)):
                         if (
                             key.startswith("val")
                             and any(
@@ -596,7 +598,7 @@ def rm_train(
                                     if metric_name != "num_valid_samples"
                                 ]
                             )
-                            and (val_metrics is None or not hasattr(val_metrics, key))
+                            and (val_metrics is None or key not in val_metrics)
                         ):
                             delattr(rm_save_state, key)
                     if val_metrics is not None:
@@ -637,7 +639,7 @@ def rm_train(
                     with timer.time("checkpointing"):
                         print(f"Saving checkpoint for step {total_steps + 1}...")
                         checkpoint_path = checkpointer.init_tmp_checkpoint(
-                            total_steps + 1, rm_save_state, master_config
+                            total_steps + 1, vars(rm_save_state), master_config
                         )
                         policy.save_checkpoint(
                             weights_path=os.path.join(
