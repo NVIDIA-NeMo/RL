@@ -181,6 +181,14 @@ policy:
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
+    # Multi-Token Prediction (MTP). mtp_num_layers=0 disables MTP.
+    mtp_num_layers: 0
+    # MTP loss weight added to the main next-token loss (0.0 disables the MTP loss contribution).
+    mtp_loss_scaling_factor: 0.0
+    # When true, repeat one MTP layer mtp_num_layers times instead of using distinct layers.
+    mtp_use_repeated_layer: false
+    # When true, detach MTP heads so MTP loss does not affect main-model gradients.
+    mtp_detach_heads: false
     gradient_accumulation_fusion: false
 
     peft:
@@ -307,13 +315,23 @@ policy:
     stop_token_ids: null
     stop_strings: null
     mcore_generation_config:
-      buffer_size_gb: 10  # Total buffer size is 2x this value (active requests + paused requests)
+      async_engine: false
+      max_model_len: ${policy.max_total_sequence_length}  # Engine-side max sequence length.
+      cuda_graph_impl: "local"  # CUDA-graph implementation. Options: "none", "local", "transformer_engine", "full_iteration".
+      inference_cuda_graph_scope: "block"  # Inference CUDA-graph scope. Options: "none", "layer", "block".
+      buffer_size_gb: 10
       num_cuda_graphs: 4  # Number of CUDA graphs to pre-compile for different batch sizes
       block_size_tokens: 256  # Size of each KV cache block in tokens (affects memory granularity)
       use_cuda_graphs_for_non_decode_steps: true  # Enable CUDA graphs for prefill/context processing
       enable_chunked_prefill: true  # Split long prefills into chunks for better memory management
-      unified_memory_level: 0  # Unified memory usage level (0=disabled, higher values enable more aggressive paging)
+      enable_prefix_caching: false  # Reuse KV blocks across requests sharing a prompt prefix.
       max_tokens: 16384 # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens
+      kv_cache_management_mode: "persist"  # KV cache lifecycle across suspend/resume. Options: "persist", "offload". To select "recompute", set grpo.async_grpo.recompute_kv_cache_after_weight_updates=true.
+      materialize_only_last_token_logits: true
+      num_speculative_tokens: 0
+      refit_backend: "nvshmem"  # Copy-service backend for non-colocated megatron weight refit. Options: "gloo" or "nvshmem".
+      parsers: []  # OpenAI tool-call / response parser names exposed by the HTTP server (only used if expose_http_server=true).
+      expose_http_server: false  # Start an OpenAI-compatible HTTP server alongside the persistent engine. Required for NeMo-Gym.
     vllm_cfg:
       async_engine: false
       precision: ${policy.precision}
@@ -423,6 +441,7 @@ cluster:
   # (32768-60999 on stock Linux).  See ray.sub for the full port layout.
   master_port_range_low: 25000
   master_port_range_high: 28000
+  segment_size: null  # Nodes per NVLink domain segment for topology-aware alignment; null to disable
 
 # TransferQueue-mediated data plane for sync GRPO.
 # Off by default — the legacy grpo_train trainer never engages this.

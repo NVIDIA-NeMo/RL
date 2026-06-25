@@ -10,6 +10,8 @@
 </div>
 
 ## 📣 News
+* [06/12/2026] [Minimax-M3](https://github.com/NVIDIA-NeMo/RL/tree/minimax-m3) Day 0 support by NeMo RL! More details on the [accuracy verifications](https://github.com/NVIDIA-NeMo/RL/blob/minimax-m3/docs/guides/minimax-m3.md). Thank you [vLLM for the shoutout](https://x.com/vllm_project/status/2065445062423826534
+).
 * [06/04/2026] [Nemotron-3-Ultra](https://research.nvidia.com/labs/nemotron/Nemotron-3-Ultra/) was trained with NeMo-RL! Follow [this guide](https://github.com/NVIDIA-NeMo/RL/blob/ultra-v3/docs/guides/nemotron-3-ultra.md) to explore the post-training recipe.
 * [04/30/2026] [Release v0.6.0!](https://github.com/NVIDIA-NeMo/RL/releases/tag/v0.6.0)
     * Sglang backend, Muon Optimizer, Speculative Decoding, Yarn long-context training, Chunked Cross Entropy Loss, top-p/top-k training
@@ -195,6 +197,12 @@ uv venv</code></pre>
     </tr>
   </tbody>
 </table>
+
+> [!TIP]
+> **Smoke test:** to validate your install end-to-end more quickly, run the smoke recipe — it switches to GSM8K and caps the run at 10 steps:
+> ```sh
+> uv run examples/run_grpo.py --config examples/configs/grpo-smoke.yaml
+> ```
 
 ## Prerequisites
 
@@ -725,7 +733,7 @@ For detailed instructions on how to set up and launch NeMo RL on Slurm or Kubern
 
 - Large amounts of memory fragmentation might occur when running models without support for FlashAttention2.
   If OOM occurs after a few iterations of training, it may help to tweak the allocator settings to reduce memory fragmentation.
-  To do so, specify [`max_split_size_mb`](https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-alloc-conf)
+  To do so, specify [`max_split_size_mb`](https://docs.pytorch.org/docs/2.12/notes/cuda.html#optimizing-memory-usage-with-pytorch-alloc-conf)
   at **either** one of the following places:
   1. Launch training with:
   ```sh
