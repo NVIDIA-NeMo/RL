@@ -50,10 +50,6 @@ loss_fn:
 
 # ── AReaL minibatch / refit knobs (AREAL.md §2a) ─────────────────────────────
 async_rl:
-  # == AReaL ppo_n_minibatches: split the full batch into this many minibatches,
-  # ONE optimizer step per minibatch (single pass, each sample used once).
-  # gsm8k uses 1, boba 4. num_minibatches=1 == one optimizer step per train step.
-  num_minibatches: 1
   # AReaL-style interruptible refit: after the weight swap, invalidate the KV
   # cache with reset_running_requests=True so vLLM preempts in-flight requests
   # and reprefills them under the new weights (P4). False keeps stale KV
