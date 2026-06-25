@@ -22,6 +22,9 @@ from nemo_rl.algorithms.logits_sampling_utils import (
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
+from nemo_rl.algorithms.x_token.loss_utils import (
+    prepare_xtoken_cross_tokenizer_loss_input,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     _get_tokens_on_this_cp_rank,
@@ -134,17 +137,25 @@ def prepare_loss_input(
             "H_all": H_all,
         }
     elif loss_fn.input_type == LossInputType.DISTILLATION_CROSS_TOKENIZER:
-        # Materialize the teacher-side loss input: rebuild the microbatch's
-        # full-vocab teacher logits from the CUDA IPC handles shipped on the
-        # data dict. The student logits pass straight through; the loss fn
-        # does the projection / chunk-average / KL reductions on both.
-        from nemo_rl.algorithms.x_token.loss_utils import (
-            rebuild_teacher_full_logits_from_ipc,
+        # Rebuild the full-vocab teacher logits from the per-rank CUDA IPC
+        # handles and do the shared CP-resolution both loss paths need; the loss
+        # fn does the projection / chunk-average / KL reductions. The TP/CP groups
+        # are derived from the student logits' own device mesh.
+        teacher_full_logits, student_logits_contig, align, tp_group, cp_group = (
+            prepare_xtoken_cross_tokenizer_loss_input(
+                logits,
+                data,
+                vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
+            )
         )
-
         loss_input = {
             "logits": logits,
-            "teacher_full_logits": rebuild_teacher_full_logits_from_ipc(data),
+            "teacher_full_logits": teacher_full_logits,
+            "student_logits_contig": student_logits_contig,
+            "align": align,
+            "tp_group": tp_group,
+            "cp_group": cp_group,
         }
     elif loss_fn.input_type == LossInputType.DRAFT:
         from megatron.core.transformer.multi_token_prediction import roll_tensor

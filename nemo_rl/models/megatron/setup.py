@@ -884,14 +884,9 @@ def _validate_training_config(config: PolicyConfig, model_cfg: Any) -> None:
     model_cfg.calculate_per_token_loss = True
     model_cfg.perform_initialization = True
 
-    # MoE aux loss validation
-    assert (
-        "aux_loss" not in model_cfg.moe_router_load_balancing_type
-        or model_cfg.moe_aux_loss_coeff == 0
-    ), (
-        "MoE aux loss is currently not supported due to a known bug in Megatron-LM. "
-        "See https://github.com/NVIDIA/Megatron-LM/issues/1984 for more details."
-    )
+    # MoE aux loss validation - disabled to support aux loss normalization in RL SFT.
+    # The grad scaling is handled via moe_grad_scale_func in megatron_policy_worker.py.
+    # See https://github.com/NVIDIA/Megatron-LM/issues/1984 for the original issue.
 
 
 def _validate_dtype_config(
@@ -1326,6 +1321,7 @@ def handle_model_import(
     pt_checkpoint_exists: bool,
     model_post_wrap_hook: Optional[Callable] = None,
     transformer_layer_spec: Optional[Any] = None,
+    mamba_stack_spec: Optional[Any] = None,
 ) -> None:
     """Convert and cache the initial model checkpoint if it does not yet exist.
 
@@ -1358,6 +1354,9 @@ def handle_model_import(
         transformer_layer_spec: Optional Megatron ``ModuleSpec`` (or callable
             returning one) overriding the default layer spec from the model
             provider.
+        mamba_stack_spec: Optional Megatron ``ModuleSpec`` (or callable
+            returning one) overriding the default stack spec from Mamba model
+            providers.
     """
     pretrained_ckpt = config.get("pretrained_checkpoint")
     fmt = pretrained_ckpt["format"] if pretrained_ckpt is not None else "hf"
@@ -1382,6 +1381,7 @@ def handle_model_import(
         config["megatron_cfg"],
         model_post_wrap_hook=model_post_wrap_hook,
         transformer_layer_spec=transformer_layer_spec,
+        mamba_stack_spec=mamba_stack_spec,
         **hf_config_overrides,
     )
 

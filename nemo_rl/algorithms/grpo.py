@@ -1564,6 +1564,36 @@ def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
     return False
 
 
+def _preserve_router_replay_routed_experts(
+    target: BatchedDataDict,
+    flat_messages: BatchedDataDict,
+    policy_config: PolicyConfig,
+) -> None:
+    """Carry rollout-recorded routes into policy worker inputs when R3 is enabled."""
+    if router_replay_enabled(policy_config) and "routed_experts" in flat_messages:
+        target["routed_experts"] = flat_messages["routed_experts"]
+
+
+def _build_async_grpo_train_data(
+    flat_messages: BatchedDataDict,
+    input_lengths: torch.Tensor,
+    repeated_batch: BatchedDataDict,
+    policy_config: PolicyConfig,
+) -> BatchedDataDict[ClippedPGLossDataDict]:
+    """Build the async no-TQ policy train batch from flattened rollout messages."""
+    train_data = BatchedDataDict[ClippedPGLossDataDict](
+        {
+            "input_ids": flat_messages["token_ids"],
+            "input_lengths": input_lengths,
+            "generation_logprobs": flat_messages["generation_logprobs"],
+            "token_mask": flat_messages["token_loss_mask"],
+            "sample_mask": repeated_batch["loss_multiplier"],
+        }
+    )
+    _preserve_router_replay_routed_experts(train_data, flat_messages, policy_config)
+    return train_data
+
+
 def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
     """Determine if NeMo-Gym should be used for rollouts and validation based on the configuration."""
     env_config = master_config.env
@@ -1766,7 +1796,6 @@ def refit_policy_generation(
             if isinstance(policy_generation, MegatronGeneration):
                 futures_train = policy.swap_weights_via_reshard(is_source=True)
             else:
-                policy.offload_before_refit()
                 futures_train = policy.broadcast_weights_for_collective(
                     kv_scales=kv_scales
                 )
@@ -1775,7 +1804,6 @@ def refit_policy_generation(
             ray.get(futures_train)
             results = ray.get(futures_inference)
             update_success = all(result for result in results if result is not None)
-            policy.prepare_for_training()
 
         # check if update is successful
         if not update_success:
@@ -2383,11 +2411,9 @@ def grpo_train(
                     # but the train_data whitelist above drops it. Copy it back so
                     # the Megatron worker's train-stage router-replay guard finds
                     # it. Mirrors the TQ producer (sync_rollout_actor.py).
-                    if (
-                        router_replay_enabled(master_config.policy)
-                        and "routed_experts" in flat_messages
-                    ):
-                        train_data["routed_experts"] = flat_messages["routed_experts"]
+                    _preserve_router_replay_routed_experts(
+                        train_data, flat_messages, master_config.policy
+                    )
                     train_data.to("cpu")
 
                     metrics_logging_data["content"] = flat_messages["content"]
@@ -2438,11 +2464,9 @@ def grpo_train(
                     # intentionally ignores routed_experts (require_router_replay
                     # =False short-circuits before the field is read), so a
                     # present-but-unused field here is safe.
-                    if (
-                        router_replay_enabled(master_config.policy)
-                        and "routed_experts" in flat_messages
-                    ):
-                        logprob_data["routed_experts"] = flat_messages["routed_experts"]
+                    _preserve_router_replay_routed_experts(
+                        logprob_data, flat_messages, master_config.policy
+                    )
 
                     if not skip_prev_logprobs:
                         train_data["prev_logprobs"] = policy.get_logprobs(
@@ -3185,6 +3209,14 @@ def async_grpo_train(
     assert master_config.loss_fn.use_importance_sampling_correction, (
         "Importance sampling correction must be enabled for async GRPO for good convergence due to off-policy samples!"
     )
+    if router_replay_enabled(master_config.policy) and (
+        master_config.data_plane or {}
+    ).get("enabled", False):
+        raise NotImplementedError(
+            "policy.router_replay.enabled=true with async GRPO is currently "
+            "supported only when data_plane.enabled=false. Async + TQ support "
+            "has not been merged yet."
+        )
 
     if master_config.grpo["async_grpo"]["max_trajectory_age_steps"] > 1:
         if not master_config.grpo["async_grpo"].get("in_flight_weight_updates", False):
@@ -3600,16 +3632,12 @@ def async_grpo_train(
                         ],
                     )
 
-                    # Create training data
-                    # Note: advantages will be computed and added after logprobs are available
-                    train_data = BatchedDataDict[ClippedPGLossDataDict](
-                        {
-                            "input_ids": flat_messages["token_ids"],
-                            "input_lengths": input_lengths,
-                            "generation_logprobs": flat_messages["generation_logprobs"],
-                            "token_mask": flat_messages["token_loss_mask"],
-                            "sample_mask": repeated_batch["loss_multiplier"],
-                        }
+                    # Create training data. Advantages are added after logprobs.
+                    train_data = _build_async_grpo_train_data(
+                        flat_messages,
+                        input_lengths,
+                        repeated_batch,
+                        master_config.policy,
                     )
                     train_data.to("cpu")
 
@@ -4074,7 +4102,13 @@ def async_grpo_train(
 
             logger.log_metrics(performance_metrics, step + 1, prefix="performance")
             logger.log_metrics(metrics, step + 1, prefix="train")
-            logger.log_metrics(timing_metrics, step + 1, prefix="timing/train")
+            # step_finished=True here since this is the final log of our current step.
+            logger.log_metrics(
+                timing_metrics,
+                step + 1,
+                prefix="timing/train",
+                step_finished=True,
+            )
 
             timer.reset()
             step += 1
@@ -4106,5 +4140,34 @@ def async_grpo_train(
             ray.kill(replay_buffer)
         except Exception as e:
             print(f"Error stopping replay buffer: {e}")
+
+        # Environments must be shut down before generation workers because
+        # they may have in-flight HTTP requests to vLLM HTTP endpoints.
+        # Killing generation first leaves environments retrying dead connections.
+        for env_dict in (task_to_env, val_task_to_env):
+            if env_dict is None:
+                continue
+            for task_name, env in env_dict.items():
+                print(f"🛑 Shutting down environment {task_name}...")
+                try:
+                    ray.get(env.shutdown.remote(), timeout=10)
+                except Exception:
+                    try:
+                        ray.kill(env)
+                    except Exception as e:
+                        print(f"Error shutting down environment {task_name}: {e}")
+
+        print("🛑 Shutting down generation workers...")
+        try:
+            policy_generation.shutdown()
+        except Exception as e:
+            print(f"Error shutting down generation workers: {e}")
+
+        if policy is not policy_generation:
+            print("🛑 Shutting down policy workers...")
+            try:
+                policy.shutdown()
+            except Exception as e:
+                print(f"Error shutting down policy workers: {e}")
 
         print("Async GRPO training complete!")

@@ -68,6 +68,7 @@ tests/test_suites/llm/grpo-gspo-deepscaler-1.5b-8K.sh
 
 # GRPO math test run (32K context mcore)
 tests/test_suites/llm/grpo-math-qwen3-30ba3b-megatron-tp4-32k.sh
+tests/test_suites/llm/grpo-qwen3-30ba3b-4n4g-megatron-qa-nvfp4.sh
 
 # CISPO async lag-1 high-off-policy run (Qwen3-30B-A3B, Megatron + non-colocated vLLM)
 tests/test_suites/llm/grpo-cispo-mm1-async-lag1-highoffpolicy-qwen3-30ba3b-3n8g-megatron-cispo.sh
@@ -223,6 +224,13 @@ tests/test_suites/llm/distillation-qwen3-32b-to-1.7b-base-1n8g-megatron-tp2pp2cp
 # integration (Megatron student + co-located vLLM both NVFP4-quantized) stays
 # healthy. Self-distill Qwen3-1.7B-Base, ~20 min on 1n8g.
 tests/test_suites/llm/distillation-qwen3-1.7b-1n8g-megatron-qa-nvfp4.sh
+
+# Nano3 hybrid MoE/Mamba ModelOpt layer-spec smoke. Keeps
+# policy.disable_modelopt_layer_spec=false to cover modelopt_mamba_stack_spec.
+tests/test_suites/llm/distillation-nano3-30ba3b-4n4g-megatron-qa-nvfp4-modelopt-spec.sh
+
+# Cross-tokenizer off-policy distillation (xtoken): Qwen3-4B -> Llama-3.2-1B P-KL, student TP4xCP2 <- teacher TP2xCP2, guards sharded-loss parallelism-invariance.
+tests/test_suites/llm/distillation-xtoken-off-policy-qwen3-4b-to-llama3.2-1b-1n8g-dtensor-tp4cp2.sh
 
 #######
 # PPO #
