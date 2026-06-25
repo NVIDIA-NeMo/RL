@@ -270,3 +270,4 @@ cluster:
     num_nodes: 1
     master_port_range_low: 25000
     master_port_range_high: 28000
+    segment_size: null
