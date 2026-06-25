@@ -13,6 +13,10 @@ policy:
     enabled: true
     use_fused_linear_logprobs: true
     fused_linear_logprobs_chunk_size: 128
+    # Fused linear logprobs are incompatible with overlap_param_gather
+    # (the fused forward bypasses output_layer.forward()); disable it.
+    distributed_data_parallel_config:
+      overlap_param_gather: false
     tensor_model_parallel_size: 4
     pipeline_model_parallel_size: 2
     sequence_parallel: true
@@ -45,10 +49,10 @@ data:
 logger:
   wandb:
     project: nemo-rl
-    name: sft-qwen2.5-math-7b-megatron-chunked-linear-ce-loss-1n8g
+    name: sft-qwen2.5-math-7b-megatron-fused-linear-logprobs-1n8g
   tensorboard:
-    log_dir: tb_logs-sft-qwen2.5-math-7b-megatron-chunked-linear-ce-loss-1n8g
+    log_dir: tb_logs-sft-qwen2.5-math-7b-megatron-fused-linear-logprobs-1n8g
   mlflow:
-    run_name: sft-qwen2.5-math-7b-megatron-chunked-linear-ce-loss-1n8g
+    run_name: sft-qwen2.5-math-7b-megatron-fused-linear-logprobs-1n8g
 cluster:
   gpus_per_node: 8

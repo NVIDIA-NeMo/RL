@@ -24,14 +24,14 @@ policy:
 loss_fn:
   reference_policy_kl_penalty: 0.0
 logger:
-  log_dir: logs/grpo-qwen3-30ba3b-2n8g-megatron_chunked_linear_ce_loss
+  log_dir: logs/grpo-qwen3-30ba3b-2n8g-megatron_fused_linear_logprobs
   tensorboard_enabled: true
   wandb:
     project: nemo-rl
-    name: grpo-qwen3-30ba3b-2n8g-megatron-chunked-linear-ce-loss
+    name: grpo-qwen3-30ba3b-2n8g-megatron-fused-linear-logprobs
   tensorboard:
-    log_dir: tb_logs-grpo-qwen3-30ba3b-2n8g-megatron-chunked-linear-ce-loss
+    log_dir: tb_logs-grpo-qwen3-30ba3b-2n8g-megatron-fused-linear-logprobs
   mlflow:
-    run_name: grpo-qwen3-30ba3b-2n8g-megatron-chunked-linear-ce-loss
+    run_name: grpo-qwen3-30ba3b-2n8g-megatron-fused-linear-logprobs
 cluster:
   num_nodes: 2

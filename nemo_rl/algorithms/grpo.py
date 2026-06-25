@@ -424,9 +424,10 @@ def setup(
     # (chunked over the sequence) and never materialize the full
     # [batch, seq_len, vocab_size] logit tensor, which significantly reduces peak
     # memory. It is only available on the Megatron backend.
-    use_fused_linear_logprobs = (
-        policy_config["megatron_cfg"]["enabled"]
-        and policy_config["megatron_cfg"]["use_fused_linear_logprobs"]
+    # use_fused_linear_logprobs is NotRequired in MegatronConfig, so many megatron
+    # configs (e.g. nemo_gym, modelopt) omit it -- use .get() to avoid a KeyError.
+    use_fused_linear_logprobs = policy_config["megatron_cfg"]["enabled"] and bool(
+        policy_config["megatron_cfg"].get("use_fused_linear_logprobs")
     )
     if use_fused_linear_logprobs:
         # Sequence packing is not yet validated with the fused path: the fused
