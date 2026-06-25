@@ -45,6 +45,39 @@ maybe_gres_arg() {
 }
 
 ########################################################
+# Function to detect the number of CPUs per node from SLURM
+########################################################
+detect_cpus_per_node() {
+  # Query SLURM for the total number of CPUs (CPUTot) on every allocated node.
+  # With --exclusive whole-node allocations (the default for this script) this
+  # is the full CPU count of the node, which is what we want to claim per worker
+  # so Ray sees every CPU. We assert that all allocated nodes report the same
+  # CPUTot: a heterogeneous allocation breaks the single CPUS_PER_WORKER
+  # assumption and is treated as a user error. On any failure we exit (no
+  # heuristic fallback); set CPUS_PER_WORKER explicitly to override.
+  local node raw cpus expected_cpus=""
+  for node in $(scontrol show hostnames "$SLURM_JOB_NODELIST"); do
+    # Parse "CPUTot=<n>" out of the single-line (`-o`) node description using
+    # pure bash parameter expansion (no grep/awk pipeline) so we don't trip
+    # `set -e`/`pipefail` on a non-matching or short-circuited pipe.
+    raw=$(scontrol show node "$node" -o 2>/dev/null || true)
+    cpus=${raw#*CPUTot=}
+    cpus=${cpus%% *}
+    if ! [[ "$cpus" =~ ^[0-9]+$ ]] || [[ "$cpus" -le 0 ]]; then
+      echo "Error: Could not determine CPUTot for node '$node' from SLURM. Set CPUS_PER_WORKER explicitly to override." >&2
+      exit 1
+    fi
+    if [[ -z "$expected_cpus" ]]; then
+      expected_cpus=$cpus
+    elif [[ "$cpus" -ne "$expected_cpus" ]]; then
+      echo "Error: Heterogeneous CPU counts across allocated nodes (node '$node' reports CPUTot=$cpus but expected $expected_cpus). NeMo-RL assumes a homogeneous allocation; set CPUS_PER_WORKER explicitly to override." >&2
+      exit 1
+    fi
+  done
+  echo "$expected_cpus"
+}
+
+########################################################
 # User defined variables
 ########################################################
 CONTAINER=$CONTAINER
@@ -131,8 +164,17 @@ COMMON_SRUN_ARGS+=" --container-workdir=$SLURM_SUBMIT_DIR"
 # TODO: delete these (just for debugging)
 COMMON_SRUN_ARGS+=" -p $SLURM_JOB_PARTITION"
 COMMON_SRUN_ARGS+=" -A $SLURM_JOB_ACCOUNT"
-# Number of CPUs per worker node
-CPUS_PER_WORKER=${CPUS_PER_WORKER:-$((GPUS_PER_NODE * 16))}
+# Number of CPUs per worker node. If the user did not set CPUS_PER_WORKER
+# explicitly, auto-detect it from SLURM so we claim every CPU the node actually
+# has (instead of the old GPUS_PER_NODE * 16 heuristic, which under-claims on
+# nodes with more cores). Detection exits with an error if it cannot determine a
+# single consistent CPU count; set CPUS_PER_WORKER explicitly to override.
+if [[ -n "${CPUS_PER_WORKER:-}" ]]; then
+  echo "[INFO] Using user-provided CPUS_PER_WORKER=$CPUS_PER_WORKER."
+else
+  CPUS_PER_WORKER=$(detect_cpus_per_node)
+  echo "[INFO] Auto-detected CPUS_PER_WORKER=$CPUS_PER_WORKER from SLURM (CPUTot of allocated nodes)."
+fi
 
 num_retries=3
 
