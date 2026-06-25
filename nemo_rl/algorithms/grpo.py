@@ -22,7 +22,7 @@ from typing import Any, Callable, NotRequired, Optional, TypedDict, TypeVar, cas
 import numpy as np
 import ray
 import torch
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
@@ -156,7 +156,7 @@ class AdvEstimatorConfig(TypedDict):
 
 
 class RewardPenaltyTokenIdsConfig(BaseModel, extra="allow"):
-    """Optional tokenizer-derived token ID overrides for reward penalties."""
+    """Optional token IDs for reward penalties."""
 
     eos: int | None = None
     think_open: int | None = None
@@ -170,8 +170,20 @@ class RewardPenaltyConfig(BaseModel, extra="allow"):
     penalize_empty_final_answer: bool = False
     penalize_eos_token: bool = False
     penalize_malformed_think_tag: bool = False
-    # Optional overrides; None infers from tokenizer when possible.
+    # Optional token IDs. eos is required when penalize_eos_token is true;
+    # think-tag IDs are inferred from configured tag strings when possible.
     token_ids: Optional[RewardPenaltyTokenIdsConfig] = None
+
+    @model_validator(mode="after")
+    def _require_eos_token_id_when_penalized(self) -> "RewardPenaltyConfig":
+        if self.penalize_eos_token and (
+            self.token_ids is None or self.token_ids.eos is None
+        ):
+            raise ValueError(
+                "reward_penalties.token_ids.eos must be set when "
+                "reward_penalties.penalize_eos_token is true"
+            )
+        return self
 
 
 class GRPOConfig(TypedDict):

@@ -58,9 +58,9 @@ reward_penalties:
   penalize_empty_final_answer: false
   penalize_eos_token: false
   penalize_malformed_think_tag: false
-  # Optional model/tokenizer-specific overrides. When null, EOS is inferred
-  # from tokenizer.eos_token_id and think tags are inferred only if each tag
-  # encodes to one token. Example: {eos: 2, think_open: 12, think_close: 13}
+  # Optional model/tokenizer-specific token IDs. eos is required when
+  # penalize_eos_token is true; think tags are inferred only if each tag encodes
+  # to one token. Example: {eos: 2, think_open: 12, think_close: 13}
   token_ids: null
 
 loss_fn:

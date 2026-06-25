@@ -1394,9 +1394,9 @@ def resolve_reward_penalty_config(
 ) -> dict[str, Any] | None:
     """Resolve tokenizer-derived reward penalty fields.
 
-    User config can still override token IDs. When absent, infer EOS from the
-    tokenizer and infer think-tag IDs only when each configured tag is exactly
-    one token.
+    User config must explicitly provide EOS when penalize_eos_token is enabled.
+    Think-tag IDs are inferred only when each configured tag is exactly one
+    token.
     """
     if reward_penalty_config is None:
         return None
@@ -1419,9 +1419,10 @@ def resolve_reward_penalty_config(
             token_ids[key] = value
 
     if resolved.get("penalize_eos_token") and "eos" not in token_ids:
-        eos_token_id = getattr(tokenizer, "eos_token_id", None)
-        if eos_token_id is not None:
-            token_ids["eos"] = int(eos_token_id)
+        raise ValueError(
+            "reward_penalties.token_ids.eos must be set when "
+            "reward_penalties.penalize_eos_token is true"
+        )
 
     if resolved.get("penalize_malformed_think_tag"):
         configured_thinking_tags = _get_reward_penalty_config_value(
@@ -1483,10 +1484,10 @@ def apply_reward_penalties(
          Data: full_result["response"]["output"] — message items have content[0]["text"].
 
       3. penalize_eos_token (token-based)
-         The EOS token resolved from config override or tokenizer should never
-         appear inside any assistant generation. A final EOS token is allowed
-         per assistant turn because vLLM/Gym may include the terminal stop
-         marker in generation_token_ids.
+         The explicitly configured EOS token should never appear inside any
+         assistant generation. A final EOS token is allowed per assistant turn
+         because vLLM/Gym may include the terminal stop marker in
+         generation_token_ids.
          Data: message_log[i]["token_ids"] where role == "assistant".
 
       4. penalize_malformed_think_tag (message flag + token/string fallback)

@@ -12,40 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-import re
 import sys
 
 import pytest
 import torch
 
-# apply_reward_penalties only needs torch, but rollouts.py imports ray/vllm/zmq.
-# Extract and exec just the helper and function to avoid the heavy dependency chain.
-try:
-    from nemo_rl.experience.rollouts import (
-        apply_reward_penalties,
-        resolve_reward_penalty_config,
-    )
-except (ImportError, ModuleNotFoundError):
-    _rollouts_path = os.path.normpath(
-        os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "..",
-            "..",
-            "..",
-            "nemo_rl",
-            "experience",
-            "rollouts.py",
-        )
-    )
-    _src = open(_rollouts_path).read()
-    _match = re.search(
-        r"^(def _get_reward_penalty_config_value\(.+?)(?=\ndef run_async_nemo_gym_rollout)",
-        _src,
-        re.DOTALL | re.MULTILINE,
-    )
-    assert _match, "Could not find apply_reward_penalties in rollouts.py"
-    exec("from typing import Any\nfrom pydantic import BaseModel\n" + _match.group(1))
+from nemo_rl.experience.rollouts import (
+    apply_reward_penalties,
+    resolve_reward_penalty_config,
+)
 
 
 # ---- Helpers to build minimal result dicts ----
@@ -408,41 +383,20 @@ class TestPenalizeEosToken:
         counts = apply_reward_penalties([result], self.CFG)
         assert result["full_result"]["reward"] == 1.0
 
-    def test_eos_token_id_inferred_from_tokenizer(self):
-        cfg = resolve_reward_penalty_config(
-            {"penalize_eos_token": True}, _FakeTokenizer(eos_token_id=2)
-        )
-        result = _make_result(
-            reward=1.0,
-            message_log=[
-                _msg("user", [100]),
-                _msg("assistant", [300, 2, 400]),
-            ],
-        )
-        counts = apply_reward_penalties([result], cfg)
-        assert result["full_result"]["reward"] == 0.0
-        assert counts["eos_token"] == 1
+    def test_eos_token_id_must_be_explicit(self):
+        with pytest.raises(ValueError, match="reward_penalties.token_ids.eos"):
+            resolve_reward_penalty_config(
+                {"penalize_eos_token": True}, _FakeTokenizer(eos_token_id=2)
+            )
 
-    def test_null_token_ids_uses_tokenizer_eos(self):
-        cfg = resolve_reward_penalty_config(
-            {"penalize_eos_token": True, "token_ids": None},
-            _FakeTokenizer(eos_token_id=2),
-        )
-        result = _make_result(
-            reward=1.0,
-            message_log=[
-                _msg("user", [100]),
-                _msg("assistant", [300, 2, 400]),
-            ],
-        )
-        counts = apply_reward_penalties([result], cfg)
-        assert result["full_result"]["reward"] == 0.0
-        assert counts["eos_token"] == 1
+    def test_null_token_ids_requires_explicit_eos(self):
+        with pytest.raises(ValueError, match="reward_penalties.token_ids.eos"):
+            resolve_reward_penalty_config(
+                {"penalize_eos_token": True, "token_ids": None},
+                _FakeTokenizer(eos_token_id=2),
+            )
 
-    def test_missing_eos_after_resolution_raises(self):
-        cfg = resolve_reward_penalty_config(
-            {"penalize_eos_token": True}, _FakeTokenizer(eos_token_id=None)
-        )
+    def test_missing_eos_direct_apply_raises(self):
         result = _make_result(
             reward=1.0,
             message_log=[
@@ -451,7 +405,7 @@ class TestPenalizeEosToken:
             ],
         )
         with pytest.raises(ValueError, match="reward_penalties.token_ids.eos"):
-            apply_reward_penalties([result], cfg)
+            apply_reward_penalties([result], {"penalize_eos_token": True})
 
 
 # =====================================================================
@@ -801,7 +755,7 @@ class TestCrossCutting:
             ],
             message_log=[
                 _msg("user", [100]),
-                _msg("assistant", [300, 2]),  # EOS
+                _msg("assistant", [300, 2, 400]),  # EOS internal (not terminal)
             ],
         )
         counts = apply_reward_penalties([result], cfg)
@@ -823,7 +777,7 @@ class TestCrossCutting:
             reward=1.0,
             message_log=[
                 _msg("user", [100]),
-                _msg("assistant", [300, 2]),
+                _msg("assistant", [300, 2, 400]),  # EOS internal (not terminal)
             ],
         )
         counts = apply_reward_penalties([r1, r2], cfg)
