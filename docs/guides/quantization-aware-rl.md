@@ -145,8 +145,14 @@ For Slurm, wrap the same command in `ray.sub` as shown in [Running QA-GRPO](#run
 Real-quant rollout is sensitive to stale Megatron conversion checkpoints. For a clean first-step comparison, move aside or remove both the training checkpoint and the converted Megatron checkpoint before launching:
 
 ```bash
+# Training checkpoint: matches `checkpointing.checkpoint_dir` in your config.
 mv checkpoints/grpo-qwen2.5-0.5b-dapo-1n8g-w4a16 checkpoints/grpo-qwen2.5-0.5b-dapo-1n8g-w4a16.old
-mv /path/to/megatron_ckpt/dapo8b_2n_long_w4a16 /path/to/megatron_ckpt/dapo8b_2n_long_w4a16.old
+
+# Converted Megatron checkpoint: under `$NRL_MEGATRON_CHECKPOINT_DIR` if set,
+# else `$HF_HOME/nemo_rl` or `~/.cache/huggingface/nemo_rl`. The subdirectory is
+# named after the HF model; see "Megatron Checkpoint Directory" below.
+MEGATRON_CKPT_ROOT="${NRL_MEGATRON_CHECKPOINT_DIR:-${HF_HOME:-$HOME/.cache/huggingface}/nemo_rl}"
+mv "$MEGATRON_CKPT_ROOT/<hf-model-subdir>" "$MEGATRON_CKPT_ROOT/<hf-model-subdir>.old"
 ```
 
 If `NRL_MEGATRON_CHECKPOINT_DIR` is set, clear the subdirectory used by the run. On first startup, the log should show that iteration 0 was saved or loaded from a freshly generated conversion checkpoint.

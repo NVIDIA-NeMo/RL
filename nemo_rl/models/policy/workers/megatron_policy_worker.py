@@ -1338,11 +1338,6 @@ class MegatronPolicyWorkerImpl(
         self, buffer_size_bytes: int = 0, kv_scales: Optional[dict[str, float]] = None
     ) -> None:
         """Stream model weights to peer process via ZMQ IPC socket."""
-        self.model = self.move_model(
-            self.model, "cuda", move_params=True, move_grads=False
-        )
-        torch.cuda.current_stream().synchronize()
-
         self.maybe_init_zmq()
 
         from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
@@ -1370,6 +1365,9 @@ class MegatronPolicyWorkerImpl(
             src=0,
             post_iter_func=lambda x: x[1],
         )
+
+    def _use_real_quant_refit(self) -> bool:
+        return False
 
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)

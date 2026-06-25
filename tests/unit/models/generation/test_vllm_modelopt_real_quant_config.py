@@ -880,6 +880,21 @@ def test_resolve_quant_cfg_accepts_builtin_modelopt_constant(monkeypatch):
     assert resolve_quant_cfg("UNIT_TEST_CFG") is sentinel
 
 
+def test_resolve_quant_cfg_defaults_missing_algorithm_to_max(monkeypatch):
+    modelopt_recipe = pytest.importorskip("modelopt.recipe")
+
+    monkeypatch.setattr(
+        modelopt_recipe,
+        "load_config",
+        lambda config_name: {"quant_cfg": [{"name": config_name}]},
+    )
+
+    assert resolve_quant_cfg("unit-test-recipe") == {
+        "quant_cfg": [{"name": "unit-test-recipe"}],
+        "algorithm": "max",
+    }
+
+
 def test_resolve_quant_cfg_extracts_nested_quantize_section(monkeypatch):
     modelopt_recipe = pytest.importorskip("modelopt.recipe")
 

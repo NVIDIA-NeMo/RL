@@ -35,6 +35,8 @@ quantize:
       enable: false
     - quantizer_name: '*gate_up_proj.input_quantizer'
       enable: false
+    - quantizer_name: '*linear_fc1.input_quantizer'
+      enable: false
     - quantizer_name: '*block_sparse_moe.gate*'
       enable: false
     - parent_class: 'nn.BatchNorm1d'

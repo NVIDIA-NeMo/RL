@@ -127,6 +127,10 @@ def quantize_model(
             raise ValueError(
                 "policy.quant_calib_data is required by this quantization config."
             )
+        if calib_size is None:
+            raise ValueError(
+                "policy.quant_calib_size is required by this quantization config."
+            )
         device = (
             model.device
             if hasattr(model, "device")

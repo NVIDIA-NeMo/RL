@@ -170,7 +170,7 @@ def test_iter_real_quant_refit_params_uses_megatron_bridge_export():
     assert output[0][0] == "model.layers.0.mlp.down_proj.weight"
     args, kwargs = worker.megatron_bridge.calls[0]
     assert args == ([worker.model],)
-    assert kwargs["quant_mode"] == "nvfp4"
+    assert kwargs["quant_mode"] == "w4a16_nvfp4"
     assert kwargs["cpu"] is True
     assert kwargs["show_progress"] is False
     assert kwargs["conversion_tasks"] == worker.refit_conversion_tasks
@@ -247,26 +247,21 @@ def test_iter_params_with_optional_kv_scales_exports_input_amax(monkeypatch):
 
 
 @requires_weight_folding
-def test_stream_weights_via_ipc_zmq_uses_real_quant_generator(monkeypatch):
-    from nemo_rl.modelopt.models.policy.workers import megatron_quant_policy_worker
+def test_stream_weights_via_ipc_zmq_uses_real_quant_generator_without_move(
+    monkeypatch,
+):
     from nemo_rl.models.policy import utils as policy_utils
 
     worker = _make_real_quant_worker()
     worker.zmq_socket = object()
-    moved_model = object()
     calls = []
 
     monkeypatch.setattr(worker, "maybe_init_zmq", lambda: calls.append("init_zmq"))
-    monkeypatch.setattr(
-        worker,
-        "move_model",
-        lambda model, device, move_params, move_grads: moved_model,
-    )
-    monkeypatch.setattr(
-        megatron_quant_policy_worker.torch.cuda,
-        "current_stream",
-        lambda: SimpleNamespace(synchronize=lambda: calls.append("sync")),
-    )
+
+    def fail_move_model(*args, **kwargs):
+        raise AssertionError("stream_weights_via_ipc_zmq should not move the model")
+
+    monkeypatch.setattr(worker, "move_model", fail_move_model)
 
     def fake_stream_weights_via_ipc_zmq_impl(**kwargs):
         calls.append(kwargs)
@@ -282,12 +277,51 @@ def test_stream_weights_via_ipc_zmq_uses_real_quant_generator(monkeypatch):
 
     worker.stream_weights_via_ipc_zmq(buffer_size_bytes=123, kv_scales={"scale": 1.0})
 
-    assert calls[0] == "sync"
-    assert calls[1] == "init_zmq"
-    assert worker.model is moved_model
-    assert calls[2]["buffer_size_bytes"] == 123
-    assert calls[2]["zmq_socket"] is worker.zmq_socket
-    assert calls[2]["rank"] == 0
+    assert calls[0] == "init_zmq"
+    assert calls[1]["buffer_size_bytes"] == 123
+    assert calls[1]["zmq_socket"] is worker.zmq_socket
+    assert calls[1]["rank"] == 0
+
+
+@requires_weight_folding
+def test_stream_weights_via_ipc_zmq_does_not_move_without_real_quant(monkeypatch):
+    from nemo_rl.models.policy import utils as policy_utils
+
+    worker = _make_real_quant_worker()
+    worker.cfg["generation"]["real_quant"] = False
+    worker.zmq_socket = object()
+    calls = []
+
+    monkeypatch.setattr(worker, "maybe_init_zmq", lambda: calls.append("init_zmq"))
+
+    def fail_move_model(*args, **kwargs):
+        raise AssertionError("stream_weights_via_ipc_zmq should not move the model")
+
+    monkeypatch.setattr(worker, "move_model", fail_move_model)
+    monkeypatch.setattr(
+        worker,
+        "_iter_params_with_optional_kv_scales",
+        lambda kv_scales=None: iter([("model.weight", torch.ones(1))]),
+    )
+
+    def fake_stream_weights_via_ipc_zmq_impl(**kwargs):
+        calls.append(kwargs)
+        params = list(kwargs["params_generator"])
+        assert params[0][0] == "model.weight"
+        torch.testing.assert_close(params[0][1], torch.ones(1))
+
+    monkeypatch.setattr(
+        policy_utils,
+        "stream_weights_via_ipc_zmq_impl",
+        fake_stream_weights_via_ipc_zmq_impl,
+    )
+
+    worker.stream_weights_via_ipc_zmq(buffer_size_bytes=123, kv_scales={"scale": 1.0})
+
+    assert calls[0] == "init_zmq"
+    assert calls[1]["buffer_size_bytes"] == 123
+    assert calls[1]["zmq_socket"] is worker.zmq_socket
+    assert calls[1]["rank"] == 0
 
 
 def _make_cluster(name):

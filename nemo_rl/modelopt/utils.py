@@ -118,11 +118,13 @@ def resolve_quant_cfg(quant_cfg: str) -> dict[str, Any]:
        files; NeMo-RL repo-relative recipe paths are not resolved here.
 
     YAML recipes are expected to follow the standard ModelOpt PTQ recipe layout
-    with a top-level ``quantize:`` section in the
-    ``{"quant_cfg": [...], "algorithm": ...}`` shape that ``mtq.quantize``
-    expects. A bare ``{"quant_cfg": [...], "algorithm": ...}`` document (without
-    a wrapping ``quantize:`` key) is also accepted for convenience. The
-    extracted dict — not the full recipe — is returned.
+    with a top-level ``quantize:`` section in the ``{"quant_cfg": [...],
+    "algorithm": ...}`` shape that ``mtq.quantize`` expects. A bare
+    ``{"quant_cfg": [...], "algorithm": ...}`` document (without a wrapping
+    ``quantize:`` key) is also accepted for convenience. If ``algorithm`` is
+    omitted, it defaults to ``"max"`` so ModelOpt's calibration helpers see the
+    same normalized config as ``mtq.quantize``. The extracted dict — not the full
+    recipe — is returned.
 
     See ``modelopt_recipes/general/ptq/`` in the NVIDIA/Model-Optimizer repo
     (https://github.com/NVIDIA/Model-Optimizer) for the canonical format and
@@ -131,9 +133,24 @@ def resolve_quant_cfg(quant_cfg: str) -> dict[str, Any]:
     import modelopt.torch.quantization as mtq
     from modelopt.recipe import load_config
 
+    def _normalize_mtq_cfg(config: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(config, dict):
+            raise ValueError(
+                f"Quantization recipe '{quant_cfg}' must resolve to a dict."
+            )
+        mtq_cfg = config.get("quantize", config)
+        if not isinstance(mtq_cfg, dict) or "quant_cfg" not in mtq_cfg:
+            raise ValueError(
+                f"Quantization recipe '{quant_cfg}' must contain a 'quant_cfg' "
+                f"entry (optionally nested under a top-level 'quantize:' section)."
+            )
+        if "algorithm" not in mtq_cfg:
+            mtq_cfg = {**mtq_cfg, "algorithm": "max"}
+        return mtq_cfg
+
     builtin = getattr(mtq, quant_cfg, None)
     if builtin is not None:
-        return builtin
+        return _normalize_mtq_cfg(builtin)
 
     try:
         loaded = load_config(quant_cfg)
@@ -146,10 +163,4 @@ def resolve_quant_cfg(quant_cfg: str) -> dict[str, Any]:
             f"YAML quantization recipe."
         ) from e
 
-    quantize = loaded.get("quantize", loaded)
-    if not isinstance(quantize, dict) or "quant_cfg" not in quantize:
-        raise ValueError(
-            f"Quantization recipe '{quant_cfg}' must contain a 'quant_cfg' "
-            f"entry (optionally nested under a top-level 'quantize:' section)."
-        )
-    return quantize
+    return _normalize_mtq_cfg(loaded)
