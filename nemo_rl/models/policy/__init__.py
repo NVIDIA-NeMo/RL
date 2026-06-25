@@ -335,12 +335,6 @@ class MegatronConfig(TypedDict):
     # Number of tokens per chunk when computing fused linear logprobs.
     # Smaller values reduce peak memory further but may decrease throughput.
     fused_linear_logprobs_chunk_size: NotRequired[int]
-
-    # context parallelism, sequence packing, or top-k/top-p training-time filtering.
-    use_fused_linear_logprobs: NotRequired[bool]
-    # Number of tokens per chunk when computing fused linear logprobs.
-    # Smaller values reduce peak memory further but may decrease throughput.
-    fused_linear_logprobs_chunk_size: NotRequired[int]
     # When mtp_num_layers=0, Multi-Token Prediction is disabled.
     mtp_num_layers: NotRequired[int]
     # MTP loss weight added to the main next-token loss (0.0 disables the MTP loss contribution).
