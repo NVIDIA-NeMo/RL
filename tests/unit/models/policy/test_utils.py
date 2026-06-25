@@ -122,6 +122,94 @@ class TestGetMegatronCheckpointDir:
             assert result == expected_dir
 
 
+class _FakeIpcSocket:
+    def __init__(self):
+        self.sent = []
+
+    def send_pyobj(self, payload):
+        self.sent.append(payload)
+
+    def recv(self):
+        return b""
+
+    def getsockopt(self, _option):
+        return 0
+
+
+def test_stream_weights_via_ipc_zmq_uses_cuda_buffer_for_cpu_tensors(monkeypatch):
+    """CPU-exported tensors should still be packed into CUDA IPC buffers."""
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for CUDA IPC buffer allocation")
+
+    tensor = torch.ones(4, dtype=torch.float32)
+    captured = {}
+
+    def fake_get_handle_from_tensor(tensor):
+        captured["buffer_device"] = tensor.device
+        return ("ipc-handle",)
+
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.utils.get_handle_from_tensor",
+        fake_get_handle_from_tensor,
+    )
+
+    socket = _FakeIpcSocket()
+    stream_weights_via_ipc_zmq_impl(
+        params_generator=iter([("weight", tensor)]),
+        buffer_size_bytes=4096,
+        zmq_socket=socket,
+        rank=0,
+        worker_name="test_worker",
+    )
+
+    assert captured["buffer_device"].type == "cuda"
+    payload = socket.sent[0]
+    assert payload[0] == ("ipc-handle",)
+    assert payload[1] == ["weight"]
+    assert payload[2] == calculate_aligned_size(tensor.nbytes)
+    assert socket.sent[-1] == IPCProtocol.COMPLETE
+
+
+def test_stream_weights_via_ipc_zmq_aligns_cpu_tensor_groups(monkeypatch):
+    """CPU-exported tensor groups report aligned byte offsets."""
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for CUDA IPC buffer allocation")
+
+    tensors = [
+        ("weight", torch.ones(4, dtype=torch.float32)),
+        ("bias", torch.ones(3, dtype=torch.float16)),
+    ]
+    captured = {}
+
+    def fake_get_handle_from_tensor(tensor):
+        captured["buffer_device"] = tensor.device
+        return ("ipc-handle",)
+
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.utils.get_handle_from_tensor",
+        fake_get_handle_from_tensor,
+    )
+
+    socket = _FakeIpcSocket()
+    stream_weights_via_ipc_zmq_impl(
+        params_generator=iter(tensors),
+        buffer_size_bytes=4096,
+        zmq_socket=socket,
+        rank=0,
+        worker_name="test_worker",
+    )
+
+    assert captured["buffer_device"].type == "cuda"
+    payload = socket.sent[0]
+    assert payload[1] == ["weight", "bias"]
+    assert payload[2] == sum(
+        calculate_aligned_size(tensor.nbytes) for _, tensor in tensors
+    )
+    assert socket.sent[-1] == IPCProtocol.COMPLETE
+
+
 def server_process(
     zmq_addr: str,
     known_tensors: list[tuple[str, torch.Tensor]],

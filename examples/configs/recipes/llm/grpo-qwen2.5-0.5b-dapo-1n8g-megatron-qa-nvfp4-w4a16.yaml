@@ -1,0 +1,18 @@
+# DAPO + Qwen2.5-0.5B + NVFP4 W4A16 + Megatron, 1 node x 8 GPUs.
+defaults: ./grpo-qwen2.5-0.5b-dapo-1n8g-megatron.yaml
+
+policy:
+  quant_cfg: examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml
+  generation:
+    quant_cfg: examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml
+    real_quant: true
+
+checkpointing:
+  checkpoint_dir: checkpoints/grpo-qwen2.5-0.5b-dapo-1n8g-w4a16
+
+logger:
+  log_dir: logs/grpo-qwen2.5-0.5b-dapo-1n8g-w4a16
+  wandb:
+    name: grpo-qwen2.5-0.5b-dapo-1n8g-w4a16
+  tensorboard:
+    log_dir: tb_logs-grpo-qwen2.5-0.5b-dapo-1n8g-w4a16

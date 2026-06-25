@@ -2871,6 +2871,7 @@ def test_vllm_megatron_pipeline_parallel(cluster, tokenizer):
     vllm_config["model_name"] = model_name
     vllm_config["tokenizer"]["name"] = model_name
     vllm_config = configure_generation_config(vllm_config, test_tokenizer)
+    vllm_config["vllm_cfg"]["max_model_len"] = 128
 
     megatron_config = get_basic_megatron_test_config(
         tp=1,
