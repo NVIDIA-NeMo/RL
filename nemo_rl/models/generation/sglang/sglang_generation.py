@@ -169,13 +169,21 @@ class SGLangGeneration(GenerationInterface):
         reordered_bundle_indices = self.pg_reordered_bundle_indices
         reordered_gpu_ids = self.pg_reordered_gpu_ids
 
+        # Resolve the SGLang venv ONCE (mirrors the once-per-node RayWorkerBuilder path).
+        sglang_runtime_env_base = make_actor_runtime_env(
+            "nemo_rl.models.generation.sglang.sglang_worker.SGLangGenerationWorker"
+        )
+        sglang_runtime_env_base.update(
+            get_nsight_config_if_pattern_matches("sglang_generation_worker")
+        )
+
         local_all_engines = []
         for i in range(len(self.all_engines)):
             if self.all_engines[i] is not None:
                 continue
 
             global_rank = self.rank_offset + i
-            num_gpus = 0.2
+            num_gpus = min(0.2, 1 / self.cluster.max_colocated_worker_groups)
             num_cpus = num_gpus
 
             gpu_index = self.gpu_offset + i * num_gpu_per_engine
@@ -211,13 +219,10 @@ class SGLangGeneration(GenerationInterface):
             # UV_PROJECT_ENVIRONMENT so the actor (and its spawned children)
             # actually run inside the sglang venv instead of inheriting the
             # raylet's base venv (e.g. /opt/nemo_rl_venv inside the container).
-            sglang_runtime_env = make_actor_runtime_env(
-                "nemo_rl.models.generation.sglang.sglang_worker.SGLangGenerationWorker"
-            )
-            sglang_runtime_env["env_vars"].update(env_vars)
-            sglang_runtime_env.update(
-                get_nsight_config_if_pattern_matches("sglang_generation_worker")
-            )
+            sglang_runtime_env = {
+                **sglang_runtime_env_base,
+                "env_vars": {**sglang_runtime_env_base["env_vars"], **env_vars},
+            }
 
             actor_options = {
                 "num_cpus": num_cpus,
