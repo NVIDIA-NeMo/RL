@@ -10,7 +10,6 @@ grpo:
   num_prompts_per_step: 16
   num_generations_per_prompt: 8
   max_num_steps: 20
-  val_batch_size: 256
   val_period: 2
   val_at_start: true
   val_at_end: true

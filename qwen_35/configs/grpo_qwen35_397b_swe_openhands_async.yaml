@@ -149,8 +149,8 @@ env:
               system_prompt_template: responses_api_agents/swe_agents/prompts/openhands/system_prompt.j2
               agent_cls: CodeActAgent
               diversify_tool_names: false
-          agent_max_turns: 15
-          concurrency: 128
+          agent_max_turns: 30
+          concurrency: 256
           swebench_agent_timeout: 360
           swebench_tests_timeout: 300
           container_formatter:
@@ -159,8 +159,8 @@ env:
     swe_agents_val:
       responses_api_agents:
         swe_agents:
-          agent_max_turns: 15
-          concurrency: 128
+          agent_max_turns: 30
+          concurrency: 256
           swebench_agent_timeout: 180
           swebench_tests_timeout: 180
           container_formatter: ${env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.container_formatter}

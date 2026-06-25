@@ -251,6 +251,8 @@ if [[ "${_qwen35_should_mount}" == "1" ]]; then
     _qwen35_mount_tree "${QWEN35_STAGED_BASE_CONFIG_DIR}" "${CONTAINER_REPO_LOCATION}/examples/nemo_gym" "Qwen 3.5 staged base config"
 
     _qwen35_overlay_dsts=(
+        "nemo_rl/algorithms/grpo.py"
+        "nemo_rl/experience/rollouts.py"
         "nemo_rl/environments/nemo_gym.py"
         "nemo_rl/models/generation/vllm/vllm_worker_async.py"
         "nemo_rl/models/megatron/setup.py"

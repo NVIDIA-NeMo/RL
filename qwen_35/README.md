@@ -145,9 +145,10 @@ study defaults that should not depend on the launch site:
 - Qwen 3.5 special token IDs used by token-aware checks.
 - Qwen-safe response-penalty defaults.
 - Megatron/vLLM compatibility values that should travel with Qwen 3.5.
+- Deterministic validation generation settings: temperature 0.0 and top-p 1.0.
 - Standard R2E training HPs: GBS 512, 32 prompts x 16 generations, LR 5e-6,
-  64k context, async GRPO age 1, PP=2/EP=16 policy defaults, hybrid-EP MoE
-  routing, and SWE 15-turn timeouts.
+  64k context, async GRPO age 1, PP=2/EP=16 policy defaults, alltoall MoE
+  routing, SWE 30-turn limits, and SWE train/validation concurrency 256.
 - `policy.sequence_packing.enabled=false`, because Qwen 3.5 GDN currently does
   not support packed sequences.
 
@@ -158,8 +159,10 @@ PP=1 or smaller GBS, should be explicit overrides.
 
 `qwen_35/configs/grpo_qwen35_397b_swe_openhands_async_benchmark.yaml` inherits
 the standard config and overrides only benchmark-shape knobs: 16 prompts x 8
-generations, 20 steps, validation every 2 steps with 256 validation samples,
-GBS 128, LR/min-LR 2e-6, warmup 2, and validation agent timeout 360 seconds.
+generations, 20 steps, validation every 2 steps, GBS 128, LR/min-LR 2e-6,
+warmup 2, and validation agent timeout 360 seconds. NeMo-Gym sets
+`grpo.max_val_samples` and `grpo.val_batch_size` to the validation dataset
+length at runtime, so the benchmark validation JSONL should contain 256 rows.
 The training/vLLM parallelism and other Qwen 3.5 defaults remain inherited from
 the standard config.
 
@@ -167,6 +170,13 @@ the standard config.
 
 The current overlay files are:
 
+- `nemo_rl/algorithms/grpo.py`
+  - Carries Qwen-run GRPO control-flow compatibility, including deterministic
+    NeMo-Gym validation generation and skipped reference-logprob handling when
+    reference KL is disabled.
+- `nemo_rl/experience/rollouts.py`
+  - Carries deterministic validation request plumbing into NeMo-Gym response
+    creation parameters.
 - `nemo_rl/models/megatron/setup.py`
   - Carries the Megatron setup compatibility used by the Qwen 3.5 runs.
 - `nemo_rl/models/policy/workers/megatron_policy_worker.py`
