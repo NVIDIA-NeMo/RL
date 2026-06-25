@@ -51,6 +51,7 @@ class AsyncTrajectoryCollector:
         self.master_config = master_config
         self.replay_buffer = replay_buffer
         self.running = False
+        self.data_exhausted = False
 
         self._pg_lock: _threading.Lock = _threading.Lock()
 
@@ -221,8 +222,23 @@ class AsyncTrajectoryCollector:
 
         print("Collection thread started, start_collection returning")
 
+    def is_data_exhausted(self) -> bool:
+        """Check if collection stopped because the dataloader ran out of data."""
+        return self.data_exhausted
+
+    def get_status(self) -> dict:
+        """Return a snapshot of the collector's internal state for driver-side diagnostics."""
+        with self._threads_lock:
+            inflight_workers = len(self._inflight_threads)
+        return {
+            "running": self.running,
+            "data_exhausted": self.data_exhausted,
+            "inflight_workers": inflight_workers,
+        }
+
     def _collection_loop(self):
         """Run the collection loop in background thread."""
+        dataloader_exhausted = False
         try:
             for batch in self.dataloader:
                 if not self.running:
@@ -268,6 +284,9 @@ class AsyncTrajectoryCollector:
                     break
 
                 self._process_batch(batch)
+            else:
+                # for-loop completed without break → dataloader iterator exhausted
+                dataloader_exhausted = True
 
         except Exception as e:
             print(f"❌ Error in trajectory collection: {e}")
@@ -276,7 +295,15 @@ class AsyncTrajectoryCollector:
             traceback.print_exc()
         finally:
             self.running = False
-            print("🛑 Trajectory collection stopped")
+            if dataloader_exhausted:
+                self.data_exhausted = True
+                print(
+                    "❌ Trajectory collection stopped: dataloader exhausted "
+                    "(max_num_epochs reached). No more data available for generation. "
+                    "Increase max_num_epochs or use a larger dataset."
+                )
+            else:
+                print("🛑 Trajectory collection stopped")
 
     def _process_batch(self, batch: BatchedDataDict[DatumSpec]) -> None:
         """Process a single batch and generate for one target weight."""
@@ -586,6 +613,7 @@ class AsyncTrajectoryCollector:
         target_weight_version: int,
         prompt_idx: int,
     ) -> None:
+        worker_start = time.perf_counter()
         try:
             # Import here to avoid circular dependency
             from nemo_rl.algorithms.grpo import _should_use_nemo_gym
@@ -622,6 +650,11 @@ class AsyncTrajectoryCollector:
             # Move to CPU and push to buffer (avoid blocking on GC/push)
             final_batch_cpu = final_batch.to("cpu")
             del final_batch
+
+            # Record per-trajectory wall-clock duration for buffer starvation diagnostics
+            trajectory_duration_s = time.perf_counter() - worker_start
+            rollout_metrics = dict(rollout_metrics)
+            rollout_metrics["trajectory_duration_s"] = trajectory_duration_s
 
             trajectory_group = {
                 "batch": final_batch_cpu,

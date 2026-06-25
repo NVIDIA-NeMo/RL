@@ -1081,6 +1081,9 @@ async def run_sample_multi_turn_rollout(
         for j in range(len(reward_acc_list)):
             final_sample_state[f"reward{j + 1}"] = torch.tensor(reward_acc_list[j])
 
+    # max_gen_tokens_per_turn: Diagnostic for long single generations
+    max_gen_tokens_per_turn = max(turn_gen_tokens) if turn_gen_tokens else 0
+
     # Sample metrics
     sample_metrics = {
         "turn_count": turn_count,
@@ -1094,6 +1097,7 @@ async def run_sample_multi_turn_rollout(
         "turn_gen_tokens": turn_gen_tokens,
         "turn_input_tokens": turn_input_tokens,
         "turn_total_tokens": turn_total_tokens,
+        "max_gen_tokens_per_turn": max_gen_tokens_per_turn,
         # Pass-through per-worker per-turn accounting for aggregation at batch level
         "per_worker_token_counts": per_worker_token_counts,
     }
@@ -1233,13 +1237,27 @@ def run_async_multi_turn_rollout(
             if key not in final_batch:
                 final_batch[key] = input_batch[key]
 
+        # Helper for percentile (buffer starvation diagnostics)
+        def _pct(values: list[float], p: float) -> float:
+            if not values:
+                return 0.0
+            sorted_v = sorted(values)
+            idx = min(int(len(sorted_v) * p / 100), len(sorted_v) - 1)
+            return float(sorted_v[idx])
+
+        turn_counts = [m["turn_count"] for m in all_sample_metrics]
+        max_gen_tokens_per_turn_values = [
+            m["max_gen_tokens_per_turn"] for m in all_sample_metrics
+        ]
+
         # Aggregate metrics across all samples
         rollout_metrics = {
             # Overall metrics
-            "total_turns": sum(m["turn_count"] for m in all_sample_metrics),
-            "avg_turns_per_sample": sum(m["turn_count"] for m in all_sample_metrics)
-            / batch_size,
-            "max_turns_per_sample": max(m["turn_count"] for m in all_sample_metrics),
+            "total_turns": sum(turn_counts),
+            "avg_turns_per_sample": sum(turn_counts) / batch_size,
+            "max_turns_per_sample": max(turn_counts),
+            "turns_per_sample/p95": _pct(turn_counts, 95),
+            "turns_per_sample/p99": _pct(turn_counts, 99),
             "natural_termination_rate": sum(m["terminated"] for m in all_sample_metrics)
             / batch_size,
             "truncation_rate": sum(m["truncated"] for m in all_sample_metrics)
@@ -1264,6 +1282,11 @@ def run_async_multi_turn_rollout(
                 m["env_tokens"] for m in all_sample_metrics
             )
             / batch_size,
+            # max_gen_tokens_per_turn: Diagnostic for long single generations
+            "max_gen_tokens_per_turn/max": max(max_gen_tokens_per_turn_values),
+            "max_gen_tokens_per_turn/mean": sum(max_gen_tokens_per_turn_values)
+            / batch_size,
+            "max_gen_tokens_per_turn/p95": _pct(max_gen_tokens_per_turn_values, 95),
             # Reward metrics
             "mean_total_reward": sum(m["total_reward"] for m in all_sample_metrics)
             / batch_size,
@@ -1446,19 +1469,42 @@ def run_async_nemo_gym_rollout(
                 "turn_count": sum(1 for m in r["message_log"] if m["role"] == "user"),
                 "hit_max_tokens": sum(len(m["token_ids"]) for m in r["message_log"])
                 == max_total_tokens_per_sample,
+                # max_gen_tokens_per_turn: Diagnostic for long single generations
+                "max_gen_tokens_per_turn": max(
+                    (
+                        len(m["token_ids"])
+                        for m in r["message_log"]
+                        if m["role"] == "assistant"
+                    ),
+                    default=0,
+                ),
             }
             for r in results
         ]
 
     # Aggregate metrics across all samples
     with timer.time(f"{timer_prefix}/aggregate_metrics"):
+        turn_counts = [m["turn_count"] for m in all_sample_metrics]
+        max_gen_tokens_per_turn_values = [
+            m["max_gen_tokens_per_turn"] for m in all_sample_metrics
+        ]
+
+        def _pct(values: list[float], p: float) -> float:
+            if not values:
+                return 0.0
+            sorted_v = sorted(values)
+            idx = min(int(len(sorted_v) * p / 100), len(sorted_v) - 1)
+            return float(sorted_v[idx])
+
         rollout_metrics = {
             **rollout_loop_timing_metrics,
             **_calculate_single_metric(
-                [m["turn_count"] for m in all_sample_metrics],
+                turn_counts,
                 batch_size,
                 "turns_per_sample",
             ),
+            "turns_per_sample/p95": _pct(turn_counts, 95),
+            "turns_per_sample/p99": _pct(turn_counts, 99),
             **_calculate_single_metric(
                 [m["total_tokens"] for m in all_sample_metrics],
                 batch_size,
@@ -1469,6 +1515,12 @@ def run_async_nemo_gym_rollout(
                 batch_size,
                 "gen_tokens_per_sample",
             ),
+            **_calculate_single_metric(
+                max_gen_tokens_per_turn_values,
+                batch_size,
+                "max_gen_tokens_per_turn",
+            ),
+            "max_gen_tokens_per_turn/p95": _pct(max_gen_tokens_per_turn_values, 95),
             **_calculate_single_metric(
                 [m["total_reward"] for m in all_sample_metrics],
                 batch_size,
