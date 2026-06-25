@@ -14,25 +14,14 @@
 
 """Wrapper around Megatron-Bridge's quantization/export.py for QARL checkpoints.
 
-QARL checkpoints written by ``MegatronQuantPolicyWorker`` store the layer-spec
-callback as ``nemo_rl.modelopt.models.policy.workers.utils.quantization_layer_spec``.
-Megatron-Bridge's instantiator rejects ``_target_`` strings outside its built-in
-allowlist (``megatron.``, ``nemo.``, ``torch.``, ``transformers.``, ``numpy.``,
-``nvidia.``), so the upstream export script fails on these checkpoints. The
-training worker registers ``nemo_rl.`` at ``__init__`` time, but the allowlist
-is process-local — the upstream export script runs in a fresh ``torchrun``
-process and never instantiates the worker.
-
-This wrapper registers ``nemo_rl.`` as an allowed prefix and then delegates to
-``Megatron-Bridge/examples/quantization/export.py`` unchanged. All CLI arguments
-pass through.
+This keeps the NeMo RL example entry point next to the QARL recipes while
+delegating to ``Megatron-Bridge/examples/quantization/export.py`` unchanged.
+All CLI arguments pass through.
 """
 
 import runpy
 import sys
 from pathlib import Path
-
-from megatron.bridge.utils.instantiate_utils import register_allowed_target_prefix
 
 UPSTREAM_EXPORT = (
     Path(__file__).resolve().parents[2]
@@ -46,7 +35,6 @@ UPSTREAM_EXPORT = (
 
 
 def main() -> None:
-    register_allowed_target_prefix("nemo_rl.")
     if not UPSTREAM_EXPORT.is_file():
         raise FileNotFoundError(
             f"Megatron-Bridge export script not found at {UPSTREAM_EXPORT}. "

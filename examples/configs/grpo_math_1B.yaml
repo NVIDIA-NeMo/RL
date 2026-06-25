@@ -442,6 +442,7 @@ cluster:
   # (32768-60999 on stock Linux).  See ray.sub for the full port layout.
   master_port_range_low: 25000
   master_port_range_high: 28000
+  segment_size: null  # Nodes per NVLink domain segment for topology-aware alignment; null to disable
 
 # TransferQueue-mediated data plane for sync GRPO.
 # Off by default — the legacy grpo_train trainer never engages this.

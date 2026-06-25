@@ -80,7 +80,7 @@ class SGLangGeneration(GenerationInterface):
             use_unified_pg=True,
         )
         self.pg = pgs[0]
-        self.pg_reordered_bundle_indices, self.pg_reordered_gpu_ids = (
+        self.pg_reordered_bundle_indices, self.pg_reordered_gpu_ids, _ = (
             get_reordered_bundle(self.pg)
         )
         self._http_client = HttpClient(sglang_cfg)
