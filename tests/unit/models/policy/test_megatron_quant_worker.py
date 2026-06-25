@@ -193,6 +193,60 @@ def test_iter_params_with_optional_kv_scales_uses_real_quant_export(monkeypatch)
 
 
 @requires_weight_folding
+def test_iter_params_with_optional_kv_scales_exports_input_amax(monkeypatch):
+    from nemo_rl.modelopt.models.policy.workers import megatron_quant_policy_worker
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    class FakeTensorQuantizer:
+        def __init__(self, amax):
+            self.is_enabled = True
+            self._amax = amax
+
+    class FakeQuantModule:
+        def __init__(self):
+            self.input_quantizer = FakeTensorQuantizer(torch.tensor([3.0]))
+
+    worker_cls = MegatronQuantPolicyWorker.__ray_metadata__.modified_class
+    worker = object.__new__(worker_cls)
+    worker.cfg = {"generation": {"backend": "vllm", "quant_cfg": "FP8_DEFAULT_CFG"}}
+    worker.rank = 0
+    worker.refit_conversion_tasks = [
+        SimpleNamespace(
+            param_name="decoder.layers.0.mlp.linear_fc2.weight",
+            global_param_name="decoder.layers.0.mlp.linear_fc2.weight",
+            param_weight=torch.ones(2, 2),
+            megatron_module=FakeQuantModule(),
+            mapping=SimpleNamespace(
+                hf_param="model.layers.0.mlp.down_proj.weight",
+            ),
+        )
+    ]
+
+    monkeypatch.setattr(
+        megatron_quant_policy_worker,
+        "TensorQuantizer",
+        FakeTensorQuantizer,
+    )
+    monkeypatch.setattr(
+        MegatronPolicyWorkerImpl,
+        "_iter_params_with_optional_kv_scales",
+        lambda self, kv_scales=None: iter(
+            [("model.layers.0.mlp.down_proj.weight", torch.ones(2, 2))]
+        ),
+    )
+
+    output = list(worker._iter_params_with_optional_kv_scales())
+
+    assert [name for name, _ in output] == [
+        "model.layers.0.mlp.down_proj.weight",
+        "model.layers.0.mlp.down_proj.input_quantizer._amax",
+    ]
+    torch.testing.assert_close(output[1][1], torch.tensor([3.0]))
+
+
+@requires_weight_folding
 def test_stream_weights_via_ipc_zmq_uses_real_quant_generator(monkeypatch):
     from nemo_rl.modelopt.models.policy.workers import megatron_quant_policy_worker
     from nemo_rl.models.policy import utils as policy_utils

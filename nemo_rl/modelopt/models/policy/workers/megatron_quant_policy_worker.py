@@ -440,6 +440,50 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 return wq
         return None
 
+    @staticmethod
+    def _iter_hf_input_amax_names(mapping):
+        hf_param = mapping.hf_param
+        if isinstance(hf_param, str) and hf_param.endswith(".weight"):
+            yield hf_param.removesuffix(".weight") + ".input_quantizer._amax"
+
+    @staticmethod
+    def _get_enabled_input_amax(task):
+        input_quantizer = getattr(task.megatron_module, "input_quantizer", None)
+        if not isinstance(input_quantizer, TensorQuantizer):
+            return None
+        if not input_quantizer.is_enabled:
+            return None
+
+        amax = getattr(input_quantizer, "_amax", None)
+        if amax is None:
+            amax = getattr(input_quantizer, "amax", None)
+        if amax is None:
+            raise RuntimeError(
+                f"Missing input quantizer amax for '{task.global_param_name}'"
+            )
+        if not bool(torch.isfinite(amax).all().item()) or not bool(
+            (amax > 0).all().item()
+        ):
+            raise RuntimeError(
+                f"Invalid input quantizer amax for '{task.global_param_name}'"
+            )
+        return amax.detach()
+
+    def _iter_input_quantizer_amax_params(self, conversion_tasks, existing_names):
+        for task in conversion_tasks:
+            if task.param_weight is None or task.megatron_module is None:
+                continue
+            if not task.global_param_name.endswith(".weight"):
+                continue
+
+            amax = self._get_enabled_input_amax(task)
+            if amax is None:
+                continue
+
+            for name in self._iter_hf_input_amax_names(task.mapping):
+                if name not in existing_names:
+                    yield name, amax
+
     def _iter_params_with_optional_kv_scales(self, kv_scales=None):
         """Pre-fold weights on-the-fly via lazy proxy tasks.
 
@@ -506,10 +550,16 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         original_tasks = self.refit_conversion_tasks
         self.refit_conversion_tasks = folded_tasks
         try:
+            yielded_names = set()
             for name, tensor in super()._iter_params_with_optional_kv_scales(kv_scales):
                 if "weight_quantizer" in name:
                     continue
+                yielded_names.add(name)
                 yield name, tensor
+            yield from self._iter_input_quantizer_amax_params(
+                original_tasks,
+                yielded_names,
+            )
         except RuntimeError:
             raise
         except Exception as e:
