@@ -95,6 +95,8 @@ def build_vllm_modelopt_nvfp4_config(
         },
         "ignore": ignore if ignore is not None else list(DEFAULT_NVFP4_IGNORE),
         "quant_algo": "NVFP4",
+        "quant_mode": "w4a16_nvfp4",
+        "weight_only": True,
         "group_size": 16,
         "producer": {"name": "modelopt"},
     }

@@ -23,6 +23,7 @@ import torch
 from nemo_rl.modelopt.models.generation.vllm_modelopt_patch import (
     _canonicalize_nvfp4_weight_scale,
     _convert_nvfp4_linear_kernel_format,
+    _modelopt_dense_apply,
     _modelopt_dense_process_weights,
     apply_modelopt_nvfp4_patches,
     modelopt_process_weights_after_loading,
@@ -99,6 +100,8 @@ def test_w4a16_real_quant_config_keeps_weight_only_default():
     group = cfg["config_groups"]["group_0"]
     assert cfg["quant_method"] == "modelopt"
     assert cfg["quant_algo"] == "NVFP4"
+    assert cfg["quant_mode"] == "w4a16_nvfp4"
+    assert cfg["weight_only"] is True
     assert cfg["group_size"] == 16
     assert group["input_activations"] is None
     assert group["weights"] == {
@@ -1061,9 +1064,19 @@ def test_apply_modelopt_nvfp4_patches_updates_vllm_method(monkeypatch):
         "vllm.model_executor.layers.quantization.modelopt"
     )
 
+    class FakeModelOptNvFp4Config:
+        @classmethod
+        def _from_config(cls, **kwargs):
+            return types.SimpleNamespace()
+
+    def fake_linear_apply(self, layer, x, bias=None):
+        pass
+
     class FakeModelOptNvFp4LinearMethod:
+        apply = fake_linear_apply
         process_weights_after_loading = None
 
+    modelopt_module.ModelOptNvFp4Config = FakeModelOptNvFp4Config
     modelopt_module.ModelOptNvFp4LinearMethod = FakeModelOptNvFp4LinearMethod
     monkeypatch.setitem(
         sys.modules,
@@ -1075,10 +1088,21 @@ def test_apply_modelopt_nvfp4_patches_updates_vllm_method(monkeypatch):
     apply_modelopt_nvfp4_patches()
     apply_modelopt_nvfp4_patches()
 
+    cfg = FakeModelOptNvFp4Config._from_config(
+        quant_method="NVFP4",
+        kv_cache_quant_method=None,
+        exclude_modules=[],
+        original_config=build_vllm_modelopt_nvfp4_config(),
+        group_size=16,
+    )
+
+    assert getattr(cfg, "_nrl_weight_only_w4a16") is True
+    assert FakeModelOptNvFp4LinearMethod._nrl_original_apply is fake_linear_apply
     assert (
         FakeModelOptNvFp4LinearMethod.process_weights_after_loading
         is _modelopt_dense_process_weights
     )
+    assert FakeModelOptNvFp4LinearMethod.apply is _modelopt_dense_apply
     assert patch_mod._patched is True
 
 
@@ -1154,3 +1178,77 @@ def test_modelopt_dense_process_uses_vllm_kernel_api():
     assert layer._nrl_modelopt_param_meta["weight"]["input_dim"] == 1
     assert layer._nrl_modelopt_param_meta["weight"]["output_dim"] == 0
     assert "weight" in layer._nrl_modelopt_weight_loaders
+
+
+def test_modelopt_dense_process_w4a16_uses_marlin_weight_only(monkeypatch):
+    module_names = [
+        "vllm",
+        "vllm.model_executor",
+        "vllm.model_executor.layers",
+        "vllm.model_executor.layers.quantization",
+        "vllm.model_executor.layers.quantization.utils",
+    ]
+    for module_name in module_names:
+        monkeypatch.setitem(sys.modules, module_name, types.ModuleType(module_name))
+
+    marlin_utils = types.ModuleType(
+        "vllm.model_executor.layers.quantization.utils.marlin_utils_fp4"
+    )
+    calls = []
+
+    def fake_prepare(layer):
+        calls.append(("prepare", layer))
+        layer.workspace = torch.empty(1)
+
+    def fake_apply(**kwargs):
+        calls.append(("apply", kwargs))
+        return "out"
+
+    marlin_utils.prepare_fp4_layer_for_marlin = fake_prepare
+    marlin_utils.apply_fp4_marlin_linear = fake_apply
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.model_executor.layers.quantization.utils.marlin_utils_fp4",
+        marlin_utils,
+    )
+
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(torch.ones(2, 1), requires_grad=False)
+    layer.weight_scale = torch.nn.Parameter(
+        torch.tensor([[1.0, -2.0], [-0.5, 4.0]]),
+        requires_grad=False,
+    )
+    layer.weight_scale_2 = torch.nn.Parameter(torch.tensor([2.0]), requires_grad=False)
+    layer.input_scale = torch.nn.Parameter(torch.tensor([3.0]), requires_grad=False)
+    layer.input_global_scale = torch.nn.Parameter(
+        torch.tensor([4.0]),
+        requires_grad=False,
+    )
+    layer.alpha = torch.nn.Parameter(torch.tensor([5.0]), requires_grad=False)
+    layer.input_global_scale_inv = torch.nn.Parameter(
+        torch.tensor([6.0]),
+        requires_grad=False,
+    )
+    layer.output_size_per_partition = 2
+    layer.input_size_per_partition = 2
+    quant_method = types.SimpleNamespace(
+        quant_config=types.SimpleNamespace(_nrl_weight_only_w4a16=True)
+    )
+
+    _modelopt_dense_process_weights(quant_method, layer)
+    result = _modelopt_dense_apply(quant_method, layer, torch.ones(1, 2))
+
+    assert result == "out"
+    assert calls[0] == ("prepare", layer)
+    assert calls[1][0] == "apply"
+    assert not hasattr(layer, "input_scale")
+    assert not hasattr(layer, "input_global_scale")
+    assert not hasattr(layer, "alpha")
+    assert not hasattr(layer, "input_global_scale_inv")
+    assert not hasattr(layer, "weight_scale_2")
+    torch.testing.assert_close(layer.weight_global_scale, torch.tensor(2.0))
+    torch.testing.assert_close(
+        layer.weight_scale,
+        torch.tensor([[1.0, 2.0], [0.5, 4.0]]),
+    )
+    assert calls[1][1]["weight_global_scale"] is layer.weight_global_scale
