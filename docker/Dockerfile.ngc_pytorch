@@ -33,12 +33,19 @@ apt-get install -y --no-install-recommends \
     vim \
 
 
+# Upgrade rsync to address security vulnerabilities
+apt-get install -y --only-upgrade rsync
+
+# Remove ffmpeg (from base image) to reduce attack surface
+apt-get remove -y --purge ffmpeg || true
+apt-get autoremove -y
+
 apt-get clean
 rm -rf /var/lib/apt/lists/*
 EOF
 
 # Install uv at /usr/local/bin in case the root home directory is bind mounted
-ARG UV_VERSION=0.11.6
+ARG UV_VERSION=0.11.18
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | XDG_BIN_HOME=/usr/local/bin sh
 
 # Disable usage stats by default for users who are sensitive to sharing usage.

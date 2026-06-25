@@ -25,7 +25,9 @@ import zmq
 
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
+    aggregate_per_sample_handles,
     calculate_aligned_size,
+    ensure_teacher_ipc_buffer,
     get_megatron_checkpoint_dir,
     rebuild_cuda_tensor_from_ipc,
     stream_weights_via_ipc_zmq_impl,
@@ -375,3 +377,46 @@ class TestStreamWeightsViaIPC:
 
             if os.path.exists(socket_path):
                 os.unlink(socket_path)
+
+
+class TestAggregatePerSampleHandles:
+    def test_orders_by_dp_rank(self):
+        out = aggregate_per_sample_handles(
+            [
+                {"dp_rank": 1, "per_sample_handles": ["b0", "b1"]},
+                {"dp_rank": 0, "per_sample_handles": ["a0", "a1"]},
+            ]
+        )
+        assert [e["teacher_shards"] for e in out] == [["a0"], ["a1"], ["b0"], ["b1"]]
+
+    def test_collects_replicas_per_sample(self):
+        out = aggregate_per_sample_handles(
+            [
+                {"dp_rank": 0, "per_sample_handles": ["r0s0", "r0s1"]},
+                {"dp_rank": 0, "per_sample_handles": ["r1s0", "r1s1"]},
+            ]
+        )
+        assert [e["teacher_shards"] for e in out] == [
+            ["r0s0", "r1s0"],
+            ["r0s1", "r1s1"],
+        ]
+
+    def test_length_mismatch_raises(self):
+        with pytest.raises(AssertionError):
+            aggregate_per_sample_handles(
+                [
+                    {"dp_rank": 0, "per_sample_handles": ["a0", "a1"]},
+                    {"dp_rank": 0, "per_sample_handles": ["b0"]},
+                ]
+            )
+
+
+class TestEnsureTeacherIpcBuffer:
+    def test_alloc_reuse_and_grow(self):
+        dev = torch.device("cpu")
+        s, h = ensure_teacher_ipc_buffer(None, None, 2, 1, 4, 8, torch.float32, dev)
+        assert s.shape == (2, 1, 4, 8) and h is not None
+        s2, h2 = ensure_teacher_ipc_buffer(s, h, 2, 1, 4, 8, torch.float32, dev)
+        assert s2 is s and h2 is h
+        s3, _ = ensure_teacher_ipc_buffer(s, h, 3, 1, 4, 8, torch.float32, dev)
+        assert s3 is not s and s3.shape == (3, 1, 4, 8)

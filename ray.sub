@@ -32,7 +32,8 @@ maybe_gres_arg() {
   # Assumes a homogeneous allocation (not a heterogeneous job)
   if sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep -q "gpu:"; then
     # Do a quick assert here that gpus:8 == gpus:$GPUS_PER_NODE. It is probably a user error if someone isn't using GPUS_PER_NODE=8 on our clusters if it supports --gres=gpu:8 or gpu:a100:8
-    if [[ $GPUS_PER_NODE -ne $(sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep "gpu:" | awk -F: '{print $NF}') ]]; then
+    # Some clusters append socket specs like "(S:0-3)" to the GRES string.
+    if [[ $GPUS_PER_NODE -ne $(sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep "gpu:" | cut -d'(' -f1 | awk -F: '{print $NF}') ]]; then
       echo "Error: GPUS_PER_NODE=$GPUS_PER_NODE but GRES detected is $(sinfo -p $SLURM_JOB_PARTITION -h -o "%G" | grep "gpu:") meaning GPUS_PER_NODE is not set to fully claim the GPUs on the nodes." >&2
       exit 1
     fi
@@ -80,9 +81,11 @@ detect_cpus_per_node() {
 ########################################################
 # User defined variables
 ########################################################
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-16}
 CONTAINER=$CONTAINER
 MOUNTS=$MOUNTS
 COMMAND=${COMMAND:-}  # This is a script relative to the SLURM_SUBMIT_DIR. If left empty, it will leave the cluster idle after it's brought up.
+SETUP_COMMAND=${SETUP_COMMAND:-}  # Setup commands to run on all nodes before starting Ray.
 ########################################################
 # Ports for all nodes (should be odd numbers since we place head/worker[0] on the same node) so all workers get the odd ports, but the head will get +1 the ports
 NODE_MANAGER_PORT=${NODE_MANAGER_PORT:-53001}
@@ -92,8 +95,9 @@ DASHBOARD_AGENT_GRPC_PORT=${DASHBOARD_AGENT_GRPC_PORT:-53007}
 METRICS_EXPORT_PORT=${METRICS_EXPORT_PORT:-53009}
 
 # Ports for the head node
-PORT=${PORT:-54514}
-RAY_CLIENT_SERVER_PORT=${RAY_CLIENT_SERVER_PORT:-10001}
+# GCS head port and client server port -- kept below ephemeral range (32768-60999).
+PORT=${PORT:-9900}
+RAY_CLIENT_SERVER_PORT=${RAY_CLIENT_SERVER_PORT:-9901}
 #REDIT_SHARD_PORTS=${REDIT_SHARD_PORTS:-"random"} ??
 DASHBOARD_PORT=${DASHBOARD_PORT:-8265}  # Also used by debugger
 DASHBOARD_AGENT_LISTEN_PORT=${DASHBOARD_AGENT_LISTEN_PORT:-52365}
@@ -117,11 +121,22 @@ elif [[ $(ulimit -Hn) != "unlimited" ]] && [[ $(ulimit -Hn) -lt 65535 ]]; then
   echo "[WARNING]: Cannot increase ulimit on file descriptors to 65535 according ray recommendation: https://docs.ray.io/en/latest/cluster/vms/user-guides/large-cluster-best-practices.html. Speak to cluster admins to increase, otherwise ray may crash unexpectedly."
 fi
 
-# On our clusters, the largest port range on an idle worker appeared between 52369-64607
-# (not including the other ports set by this script). So this range is chosen to be
-# somewhere in the middle
-MIN_WORKER_PORT=${MIN_WORKER_PORT:-54001}
-MAX_WORKER_PORT=${MAX_WORKER_PORT:-54513}
+# Worker port range must NOT overlap with the OS ephemeral range (32768-60999)
+# to prevent TOCTOU collisions.  Ray's Raylet uses a probe-and-release pattern
+# (CheckPortFree) that can leave a window where the port is unguarded.
+# If the range overlaps with the ephemeral range, the kernel can assign the same
+# port as an ephemeral source port for outgoing TCP traffic during that window,
+# causing EADDRINUSE when the worker tries to bind.
+#
+# Port layout (all below ephemeral range):
+#   9900-9901    Ray GCS / client server (PORT, RAY_CLIENT_SERVER_PORT above)
+#   10002-11000  Ray worker gRPC (this setting)
+#   11001-15000  vLLM HTTP servers (policy.generation.port_range_low/high)
+#   15001-20000  NeMo Gym HTTP servers (env.nemo_gym.port_range_low/high)
+#   20001+       vLLM TP/DP rendezvous (VLLM_PORT env var, 100-port spacing per engine)
+#   25000-28000  Master address / TCPStore (cluster.master_port_range_low/high)
+MIN_WORKER_PORT=${MIN_WORKER_PORT:-10002}
+MAX_WORKER_PORT=${MAX_WORKER_PORT:-11000}
 ########################################################
 # Number seconds to sync logs from /tmp/ray/session_*/logs to $LOG_DIR/ray/
 RAY_LOG_SYNC_FREQUENCY=${RAY_LOG_SYNC_FREQUENCY:-}
@@ -144,6 +159,15 @@ BASE_LOG_DIR=${BASE_LOG_DIR:-$SLURM_SUBMIT_DIR}
 LOG_DIR="$BASE_LOG_DIR/$SLURM_JOB_ID-logs"
 mkdir -p $LOG_DIR
 
+# Write setup commands to a file so they can be executed inside each container
+# without heredoc escaping surprises.
+SETUP_COMMAND_FILE=""
+if [[ -n "$SETUP_COMMAND" ]]; then
+  SETUP_COMMAND_FILE="$LOG_DIR/setup_command.sh"
+  echo "$SETUP_COMMAND" > "$SETUP_COMMAND_FILE"
+  chmod +x "$SETUP_COMMAND_FILE"
+fi
+
 # Number of GPUs per worker node
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 
@@ -161,7 +185,7 @@ COMMON_SRUN_ARGS+=" --mpi=pmix"
 COMMON_SRUN_ARGS+=" --container-mounts=$MOUNTS"
 COMMON_SRUN_ARGS+=" --container-image=$CONTAINER"
 COMMON_SRUN_ARGS+=" --container-workdir=$SLURM_SUBMIT_DIR"
-# TODO: delete these (just for debugging)
+# Pass partition/account explicitly for overlapping srun calls.
 COMMON_SRUN_ARGS+=" -p $SLURM_JOB_PARTITION"
 COMMON_SRUN_ARGS+=" -A $SLURM_JOB_ACCOUNT"
 # Number of CPUs per worker node. If the user did not set CPUS_PER_WORKER
@@ -242,10 +266,87 @@ for node in $nodes; do
     ip_addresses_array+=("$ip_address")
 done
 
+# Sort nodes alphabetically for deterministic startup order.
+_sorted_pairs=()
+for (( _si = 0; _si < ${#nodes_array[@]}; _si++ )); do
+  _sorted_pairs+=("${nodes_array[$_si]}|${ip_addresses_array[$_si]}")
+done
+IFS=$'\n' _sorted_pairs=($(printf '%s\n' "${_sorted_pairs[@]}" | sort)); unset IFS
+nodes_array=()
+ip_addresses_array=()
+for _pair in "${_sorted_pairs[@]}"; do
+  nodes_array+=("${_pair%%|*}")
+  ip_addresses_array+=("${_pair##*|}")
+done
+unset _sorted_pairs _pair _si
+echo "[INFO] Nodes after hostname sort: ${nodes_array[*]}"
+
 head_node=${nodes_array[0]}
 head_node_ip=${ip_addresses_array[0]}
 
 ip_head=$head_node_ip:$PORT
+
+# Write the topology probe script that runs inside each container.
+# Both head_cmd and worker_cmd source this to avoid duplication.
+# The script sets two variables: CLUSTER_UUID and TOPO_RANK.
+# These are then embedded into the Ray --resources JSON.
+#
+# CLUSTER_UUID: NVLink fabric ClusterUUID parsed directly from `nvidia-smi -q`.
+#   Groups GPUs by NVLink domain (all 72 GPUs in a GB200 NVL72 rack share one UUID).
+#   Empty string on DGX/HGX (no fabric) or if nvidia-smi is unavailable.
+#
+# TOPO_RANK: Topology-aware infrastructure rank.
+#   Fallback chain:
+#   1. SLURM_TOPOLOGY_ADDR (block.node format) -> block_num * 10^10 + node_num
+#   2. SLURM_PROCID (SLURM without topology plugin)
+#   3. Hostname digits (non-SLURM fallback)
+#
+# TODO(ansubramania): Harden the SLURM_TOPOLOGY_ADDR digit-extraction logic for open source.
+#   The current approach (tr -dc '0-9') assumes block/node names contain
+#   unique numeric substrings, which holds on internal clusters but
+#   may produce collisions on other providers with different naming conventions
+#   (e.g., "rack-A1" vs "rack-B1" both yield "1").
+TOPO_PROBE_SCRIPT="$LOG_DIR/topology_probe.sh"
+cat > "$TOPO_PROBE_SCRIPT" <<TOPO_PROBE_EOF
+CLUSTER_UUID=\$(nvidia-smi -q 2>/dev/null | grep 'ClusterUUID' | head -1 | awk -F: '{print \$2}' | tr -d ' ')
+if [[ -z "\$CLUSTER_UUID" ]]; then
+  CLUSTER_UUID=""
+fi
+
+TOPO_RANK=""
+if [[ -n "\${SLURM_TOPOLOGY_ADDR:-}" && "\${SLURM_TOPOLOGY_ADDR_PATTERN:-}" == "block.node" ]]; then
+  _block_part="\${SLURM_TOPOLOGY_ADDR%%.*}"
+  _node_part="\${SLURM_TOPOLOGY_ADDR##*.}"
+  _block_digits=\$(echo "\$_block_part" | tr -dc '0-9')
+  _node_digits=\$(echo "\$_node_part" | tr -dc '0-9')
+  if [[ -n "\$_block_digits" && -n "\$_node_digits" ]]; then
+    # Force base-10 interpretation; leading-zero digits like "08" would otherwise
+    # be parsed as invalid octal by bash arithmetic, silently leaving TOPO_RANK empty.
+    TOPO_RANK=\$(( 10#\$_block_digits * 10000000000 + 10#\$_node_digits ))
+  fi
+elif [[ -n "\${SLURM_PROCID:-}" ]]; then
+  TOPO_RANK=\$(( 10#\$SLURM_PROCID ))
+else
+  _hostname_digits=\$(hostname | tr -dc '0-9')
+  if [[ -n "\$_hostname_digits" ]]; then
+    TOPO_RANK=\$(( 10#\$_hostname_digits ))
+  fi
+fi
+
+# Use \\\" so that when --resources="\$RAY_RESOURCES" expands, we pass valid JSON to ray
+# IMPORTANT: The key names "nvlink_domain_" and "topo_rank" below must stay in sync
+# with the constants NVLINK_DOMAIN_PREFIX and TOPO_RANK_KEY defined in
+# nemo_rl/distributed/virtual_cluster.py.
+RAY_RESOURCES='{\"worker_units\": '"$GPUS_PER_NODE"', \"slurm_managed_ray_cluster\": 1'
+if [[ -n "\$CLUSTER_UUID" ]]; then
+  RAY_RESOURCES+=', \"nvlink_domain_'\${CLUSTER_UUID}'\": 1'
+fi
+if [[ -n "\$TOPO_RANK" ]]; then
+  RAY_RESOURCES+=', \"topo_rank\": '\$TOPO_RANK
+fi
+RAY_RESOURCES+='}'
+export RAY_RESOURCES
+TOPO_PROBE_EOF
 
 # First we start the head of the ray cluster on one of the physical nodes
 # Give the head node actual resources to make it schedulable
@@ -254,7 +355,9 @@ head_cmd=$(cat <<EOF
 # Touch a file to indicate that the head node has started
 # Overlapping srun commands will check this file to determine if we can overlap a container command
 touch $LOG_DIR/STARTED_RAY_HEAD
-env
+if [[ "\${RAY_SUB_DEBUG_ENV:-0}" == "1" ]]; then
+  env | grep -viE '(WANDB_API_KEY|HF_TOKEN|API_KEY|TOKEN|SECRET|PASSWORD)=' || true
+fi
 
 exit-dramatically() {
     # Use SIGTERM to forcefully terminate the srun process
@@ -312,10 +415,12 @@ log-sync-sidecar &
 # Patch nsight.py before starting Ray head
 sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py
 
+source $LOG_DIR/topology_probe.sh
+
 cat <<EOFINNER | tee /launch-head.sh
 ray start --head \
     --disable-usage-stats \
-    --resources="{\"worker_units\": $GPUS_PER_NODE, \"slurm_managed_ray_cluster\": 1}" \
+    --resources="\$RAY_RESOURCES" \
     --node-ip-address="$head_node_ip" \
     --port=${PORT} \
     --ray-client-server-port=${RAY_CLIENT_SERVER_PORT} \
@@ -337,6 +442,10 @@ chmod +x /launch-head.sh
 
 count=0
 while [[ \$count -lt $num_retries ]]; do
+  if [[ -n "$SETUP_COMMAND_FILE" ]] && [[ -f "$SETUP_COMMAND_FILE" ]]; then
+    echo "[INFO] Running setup command from $SETUP_COMMAND_FILE..."
+    bash "$SETUP_COMMAND_FILE"
+  fi
   bash /launch-head.sh
   count=\$((count+1))
   echo "Head node failed \$count/$num_retries times, restarting in 5 seconds..."
@@ -359,7 +468,9 @@ for ((i = 1; i < SLURM_JOB_NUM_NODES; i++)); do
   node_i=${nodes_array[$i]}
     
   worker_cmd=$(cat <<EOF
-env
+if [[ "\${RAY_SUB_DEBUG_ENV:-0}" == "1" ]]; then
+  env | grep -viE '(WANDB_API_KEY|HF_TOKEN|API_KEY|TOKEN|SECRET|PASSWORD)=' || true
+fi
 
 exit-dramatically() {
     # Use SIGTERM to forcefully terminate the srun process
@@ -416,10 +527,12 @@ log-sync-sidecar &
 # Patch nsight.py before starting Ray worker
 sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py
 
+source $LOG_DIR/topology_probe.sh
+
 cat <<EOFINNER | tee /launch-worker.sh
 ray start --address "$ip_head" \
           --disable-usage-stats \
-          --resources="{\"worker_units\": $GPUS_PER_NODE, \"slurm_managed_ray_cluster\": 1}" \
+          --resources="\$RAY_RESOURCES" \
           --min-worker-port=${MIN_WORKER_PORT} \
           --max-worker-port=${MAX_WORKER_PORT} \
           \
@@ -436,6 +549,10 @@ EOFINNER
 
 count=0
 while [[ \$count -lt $num_retries ]]; do
+  if [[ -n "$SETUP_COMMAND_FILE" ]] && [[ -f "$SETUP_COMMAND_FILE" ]]; then
+    echo "[INFO] Running setup command from $SETUP_COMMAND_FILE..."
+    bash "$SETUP_COMMAND_FILE"
+  fi
   bash /launch-worker.sh
   count=\$((count+1))
   echo "Worker failed \$count/$num_retries times, restarting in 5 seconds..."
@@ -455,6 +572,47 @@ while check_srun_processes && ! srun --overlap --nodes=1 --ntasks=1 -w $head_nod
   echo "[INFO][$(date)] Waiting for head node container to start..."
   sleep 2
 done
+
+########################################################
+# Optional sandbox sidecar for NeMo-Skills-backed Gym resources.
+########################################################
+export SLURM_MASTER_NODE=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n1)
+
+if [[ -n "${SANDBOX_CONTAINER:-}" ]] && [[ -n "${SANDBOX_COMMAND:-}" ]]; then
+  SANDBOX_PORTS_DIR="$LOG_DIR/sandbox"
+  mkdir -p "$SANDBOX_PORTS_DIR"
+
+  SANDBOX_MOUNTS="$SANDBOX_PORTS_DIR:$SANDBOX_PORTS_DIR"
+  if [[ -n "${SANDBOX_EXTRA_MOUNTS:-}" ]]; then
+    SANDBOX_MOUNTS="${SANDBOX_EXTRA_MOUNTS},${SANDBOX_MOUNTS}"
+  fi
+
+  SANDBOX_EXPORTS="ALL,SANDBOX_PORTS_DIR=$SANDBOX_PORTS_DIR"
+  if [[ -n "${SANDBOX_ENV_VARS:-}" ]]; then
+    SANDBOX_EXPORTS="${SANDBOX_EXPORTS},${SANDBOX_ENV_VARS}"
+  fi
+
+  echo "[INFO] Starting sandbox sidecars on all allocated nodes (ports_dir=$SANDBOX_PORTS_DIR)..."
+  srun --output "$LOG_DIR/sandbox.log" \
+    --error "$LOG_DIR/sandbox.log" \
+    --container-image="$SANDBOX_CONTAINER" \
+    --container-mounts="$SANDBOX_MOUNTS" \
+    --no-container-mount-home \
+    --mpi=pmix \
+    -A "$SLURM_JOB_ACCOUNT" \
+    -p "$SLURM_JOB_PARTITION" \
+    --wait=60 \
+    --kill-on-bad-exit=1 \
+    --overlap \
+    --nodes="$SLURM_JOB_NUM_NODES" \
+    --ntasks-per-node=1 \
+    --export="$SANDBOX_EXPORTS" \
+    bash -c "$SANDBOX_COMMAND" &
+  SRUN_PIDS["sandbox"]=$!
+  echo "[INFO] Sandbox sidecar started in background (PID: ${SRUN_PIDS["sandbox"]})"
+else
+  echo "[INFO] SANDBOX_CONTAINER or SANDBOX_COMMAND not defined, skipping sandbox startup"
+fi
 
 # At this stage the Ray cluster bringup has started on the physical nodes in the allocation
 # Before we launch a job on this cluster we need to make sure that the bringup is complete

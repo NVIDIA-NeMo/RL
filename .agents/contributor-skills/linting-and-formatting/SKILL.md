@@ -101,3 +101,22 @@ def make_complex(*args):
 def make_complex(x, y):
     return {'x': x, 'y': y}
 ```
+
+## Type Annotations
+
+Annotate new functions and methods — both parameters and return type. When you add a parameter to an
+existing signature, type it, and **match the type already used at the call site** (don't leave a new arg
+untyped while the caller already declares it, e.g. `def __init__(self, teacher_worker_groups=None)` when the
+caller passes `teacher_worker_groups: Optional[dict[str, Any]]`).
+
+When you add a new module under a type-checked area, **add it to `pyrefly.toml` `project-includes`**.
+`pyrefly` checks an explicit allow-list of files, so a new file that isn't listed silently escapes
+type-checking and its annotations are never verified.
+
+## Imports
+
+Put imports at module top. Defer an `import` into a function body ONLY to break a circular import or to avoid
+loading a heavy/optional dependency in a path that shouldn't need it — and when you do, add a one-line comment
+saying which. An in-function `import` with no such reason should move to the top. In particular, deferring
+stdlib (`concurrent.futures`, `collections`, …) or a module that is *already* imported at module top buys
+nothing — hoist it.

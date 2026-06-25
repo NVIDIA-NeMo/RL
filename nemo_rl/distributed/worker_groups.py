@@ -175,10 +175,13 @@ class RayWorkerBuilder:
 
             # Use the worker's configuration interface if available
             if hasattr(worker_class, "configure_worker"):
-                # Get complete worker configuration from the worker class
-                resources, env_vars, init_kwargs = worker_class.configure_worker(
-                    num_gpus=num_gpus,
-                    bundle_indices=bundle_indices,
+                # Get complete worker configuration from the worker class.
+                # Returns (resources, env_vars, init_kwargs, runtime_env_overrides).
+                resources, env_vars, init_kwargs, runtime_env_overrides = (
+                    worker_class.configure_worker(
+                        num_gpus=num_gpus,
+                        bundle_indices=bundle_indices,
+                    )
                 )
 
                 # Apply resource configuration
@@ -193,6 +196,14 @@ class RayWorkerBuilder:
                         options["runtime_env"]["env_vars"] = {}  # type: ignore
                     for k, v in env_vars.items():
                         options["runtime_env"]["env_vars"][k] = v  # type: ignore
+
+                # Apply runtime_env overrides (e.g., nsight config)
+                if runtime_env_overrides:
+                    if "runtime_env" not in options:
+                        options["runtime_env"] = {}
+                    options["runtime_env"] = recursive_merge_options(
+                        options["runtime_env"], runtime_env_overrides
+                    )
 
                 # Apply initialization parameters
                 if init_kwargs:
@@ -473,6 +484,28 @@ class RayWorkerGroup:
                 available_addresses.append(addr)
                 available_ports.append(port)
 
+        # Pool one IsolatedWorkerInitializer per unique pg_idx instead of one
+        # per worker. All workers on a node share the same py_executable, so
+        # the initializer only needs that in its runtime_env — per-worker
+        # env_vars are passed through create_worker(). This reduces GCS actor
+        # registrations from N_workers to N_nodes.
+        unique_pg_indices = sorted({pg_idx for pg_idx, _ in bundle_indices_list})
+        initializer_runtime_env = {"py_executable": py_executable}
+        self._initializer_pool: dict[int, ray.actor.ActorHandle] = {}
+        for pg_idx in unique_pg_indices:
+            # num_cpus=0 so the initializer doesn't consume a CPU slot — it
+            # sits idle after creating workers and only exists for GC lifetime.
+            self._initializer_pool[pg_idx] = (
+                RayWorkerBuilder.IsolatedWorkerInitializer.options(  # type: ignore
+                    num_cpus=0,
+                    runtime_env=initializer_runtime_env,
+                ).remote(
+                    remote_worker_builder.ray_actor_class_fqn,
+                    *remote_worker_builder.args,
+                    **remote_worker_builder.kwargs,
+                )
+            )
+
         for group_idx, (pg_idx, local_bundle_indices) in enumerate(bundle_indices_list):
             current_group = []
 
@@ -527,7 +560,7 @@ class RayWorkerGroup:
                     else 0
                 )
 
-                # Pass these options to the remote_worker_builder
+                # Build the worker's runtime_env with per-worker env_vars
                 runtime_env = {
                     "env_vars": worker_env_vars,
                     "py_executable": py_executable,
@@ -540,18 +573,19 @@ class RayWorkerGroup:
 
                 extra_options = {"runtime_env": runtime_env, "name": name}
 
-                # start worker creation asynchronously
-                worker_future, initializer = remote_worker_builder.create_worker_async(
-                    placement_group=pg,
-                    placement_group_bundle_index=bundle_idx,
-                    num_gpus=num_gpus,
-                    bundle_indices=worker_bundle_indices,
+                # Reuse the pooled initializer for this pg_idx
+                initializer = self._initializer_pool[pg_idx]
+                worker_future = initializer.create_worker.remote(
+                    pg,
+                    bundle_idx,
+                    num_gpus,
+                    worker_bundle_indices,
                     **extra_options,
                 )
 
                 # Store the future and metadata
                 worker_idx = len(worker_futures)
-                worker_futures.append((worker_future, initializer))
+                worker_futures.append(worker_future)
                 worker_info.append(
                     {
                         "group_idx": group_idx,
@@ -570,7 +604,7 @@ class RayWorkerGroup:
 
         # Wait for all workers to initialize with timing and progress bar
         num_workers = len(worker_futures)
-        worker_refs = [future for future, _ in worker_futures]
+        worker_refs = worker_futures
 
         start_time = time.perf_counter()
 
@@ -602,8 +636,7 @@ class RayWorkerGroup:
             flush=True,
         )
 
-        for idx, (worker, (_, initializer)) in enumerate(zip(workers, worker_futures)):
-            worker._RAY_INITIALIZER_ACTOR_REF_TO_AVOID_GC = initializer
+        for idx, worker in enumerate(workers):
             self._workers.append(worker)
 
             # Get the corresponding metadata
@@ -1052,29 +1085,25 @@ class RayWorkerGroup:
         # Even after successful graceful cleanup, actors remain alive in Ray's registry
         # which prevents creating new actors with the same name.
         if True:
-            initializers_to_kill = []
             for worker in self._workers:
-                if hasattr(worker, "_RAY_INITIALIZER_ACTOR_REF_TO_AVOID_GC"):
-                    # Store the initializer ref before the main worker is killed,
-                    # as killing the worker might affect accessibility of this attribute later.
-                    initializer = getattr(
-                        worker, "_RAY_INITIALIZER_ACTOR_REF_TO_AVOID_GC", None
-                    )
-                    if initializer:
-                        initializers_to_kill.append(initializer)
                 try:
                     ray.kill(worker)
                 except Exception as e:
                     success = False
                     print(f"Error killing worker: {e}")
 
-            # Now, explicitly kill the initializer actors
-            # This makes their termination more deterministic than relying solely on Ray's GC.
-            for initializer in initializers_to_kill:
-                try:
-                    ray.kill(initializer)
-                except Exception as e:
-                    print(f"Error killing initializer actor for a worker: {e}")
+            # Kill pooled initializers. These keep workers alive via Ray's owner
+            # lifecycle — kill them after the workers so workers don't get
+            # unexpectedly reaped mid-cleanup.
+            if hasattr(self, "_initializer_pool"):
+                for pg_idx, initializer in self._initializer_pool.items():
+                    try:
+                        ray.kill(initializer)
+                    except Exception as e:
+                        print(
+                            f"Error killing pooled initializer for pg_idx={pg_idx}: {e}"
+                        )
+                self._initializer_pool = {}
 
         # Clear worker lists
         self._workers = []

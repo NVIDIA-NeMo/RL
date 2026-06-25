@@ -18,8 +18,7 @@
 source "$(dirname "${BASH_SOURCE[0]}")/run_unit_shard_common.sh"
 
 SGLANG_PATHS=(
-    "unit/models/generation/test_sglang_generation.py"
-    "unit/models/generation/test_sglang_utils.py"
+    "unit/models/generation/sglang/"
 )
 
 # Base run on sglang files (picks up unmarked tests)
