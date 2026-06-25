@@ -27,10 +27,23 @@ from nemo_rl.data.llm_message_utils import (
     _validate_tensor_consistency,
     add_loss_mask_to_message_log,
     batched_message_log_to_flat_message,
+    _derive_turn_markers,
     get_first_index_that_differs,
     get_formatted_message_log,
     get_keys_from_message_log,
     message_log_to_flat_messages,
+)
+
+# Reasoning template (ChatML-style): renders reasoning_content as <think> only for
+# the last assistant turn and strips it from history turns (mirrors Qwen3 / kanana).
+_REASONING_CHAT_TEMPLATE = (
+    "{%- for m in messages -%}"
+    "{%- if m['role'] == 'user' -%}<|im_start|>user\n{{ m['content'] }}<|im_end|>\n"
+    "{%- elif m['role'] == 'assistant' -%}"
+    "{%- if loop.last and m.reasoning_content is defined and m.reasoning_content -%}"
+    "<|im_start|>assistant\n<think>{{ m.reasoning_content }}</think>{{ m['content'] }}<|im_end|>\n"
+    "{%- else -%}<|im_start|>assistant\n{{ m['content'] }}<|im_end|>\n{%- endif -%}"
+    "{%- endif -%}{%- endfor -%}"
 )
 
 
@@ -603,6 +616,79 @@ def test_get_formatted_message_log_qwen3_enable_thinking(
     actual_text = [m["content"] for m in result]
 
     assert actual_text == expected_text
+
+
+def test_derive_turn_markers() -> None:
+    """Per-role turn-opening markers are derived from the chat template."""
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+    assert _derive_turn_markers(tokenizer) == ["<|im_start|>"]
+
+    tokenizer.chat_template = _REASONING_CHAT_TEMPLATE
+    delattr(tokenizer, "_nemo_rl_turn_markers")  # markers are cached on the tokenizer
+    assert _derive_turn_markers(tokenizer) == ["<|im_start|>"]
+
+
+def test_get_formatted_message_log_multiturn_reasoning_no_duplication() -> None:
+    """Reasoning templates must not duplicate the previous assistant turn's content
+    into the following turn's chunk; each turn keeps its own <think>."""
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+    tokenizer.chat_template = _REASONING_CHAT_TEMPLATE
+
+    message_log = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "ANSWER1", "reasoning_content": "THINK1"},
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": "ANSWER2", "reasoning_content": "THINK2"},
+    ]
+    result = get_formatted_message_log(
+        [dict(m) for m in message_log],
+        tokenizer,
+        TaskDataSpec(task_name="test"),
+        add_bos_token=False,
+        add_eos_token=False,
+        add_generation_prompt=False,
+    )
+
+    full = "".join(m["content"] for m in result)
+    ## each answer and its <think> block appears exactly once
+    assert full.count("ANSWER1") == 1
+    assert full.count("ANSWER2") == 1
+    assert full.count("THINK1") == 1
+    assert full.count("THINK2") == 1
+    assert full == (
+        "<|im_start|>user\nq1<|im_end|>"
+        "<|im_start|>assistant\n<think>THINK1</think>ANSWER1<|im_end|>"
+        "<|im_start|>user\nq2<|im_end|>"
+        "<|im_start|>assistant\n<think>THINK2</think>ANSWER2<|im_end|>"
+    )
+
+
+def test_get_formatted_message_log_multiturn_normal_template_unchanged() -> None:
+    """A non-reasoning template is unaffected: concatenated chunks equal the full
+    chat-template render."""
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+    message_log = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": "a2"},
+    ]
+    result = get_formatted_message_log(
+        [dict(m) for m in message_log],
+        tokenizer,
+        TaskDataSpec(task_name="test"),
+        add_bos_token=False,
+        add_eos_token=False,
+        add_generation_prompt=False,
+    )
+    full = "".join(m["content"] for m in result)
+    expected = tokenizer.apply_chat_template(
+        message_log,
+        tokenize=False,
+        add_generation_prompt=False,
+        add_special_tokens=False,
+    )
+    assert full == expected
 
 
 @pytest.mark.hf_gated
