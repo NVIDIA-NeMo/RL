@@ -364,14 +364,28 @@ def setup(
     # ==========================
     loss_fn = ClippedPGLossFn(loss_config)
 
+    pi_cfg = master_config.get("on_policy_distillation", {}).get(
+        "privileged_information",
+        {},
+    )
+    pi_distill_enabled = bool(pi_cfg.get("enabled", False)) and (
+        pi_cfg.get("mode") == "pi_distill"
+    )
+
     # Validate force_on_policy_ratio
     if loss_config.get("force_on_policy_ratio", False):
-        assert (
+        expected_train_batch_size = (
             grpo_config["num_prompts_per_step"]
             * grpo_config["num_generations_per_prompt"]
-            == policy_config["train_global_batch_size"]
+        )
+        if pi_distill_enabled:
+            expected_train_batch_size *= 2
+        assert (
+            expected_train_batch_size == policy_config["train_global_batch_size"]
         ), (
-            "force_on_policy_ratio requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt"
+            "force_on_policy_ratio requires train_global_batch_size == "
+            "num_prompts_per_step * num_generations_per_prompt"
+            + (" * 2 for pi_distill" if pi_distill_enabled else "")
         )
         os.environ["NRL_IGNORE_TP_ACCURACY_CHECK"] = "1"
         print("  ✓ force_on_policy_ratio enabled")
@@ -1400,10 +1414,23 @@ def _create_advantage_estimator(master_config: MasterConfig):
         print("  ✓ Using Reinforce++ advantage estimator")
     elif adv_estimator_name == "opd":
         opd_cfg = master_config.get("on_policy_distillation", {})
+        pi_cfg = opd_cfg.get("privileged_information", {})
+        pi_mode = opd_module.get_pi_mode(opd_cfg)
         opd_estimator_config = {
             "name": "opd",
             "use_orm_advantage": opd_cfg.get("use_orm_advantage", False),
             "orm_advantage_weight": opd_cfg.get("orm_advantage_weight", 0.0),
+            "pi_mode": pi_mode,
+            "pi_beta": pi_cfg.get("beta", 1.0),
+            "pi_alpha": pi_cfg.get("alpha", 0.5),
+            "pi_task_reward_weight": pi_cfg.get(
+                "task_reward_weight",
+                1.0 if pi_mode in {"opsd", "pi_distill"} else 0.0,
+            ),
+            "use_leave_one_out_baseline": master_config["grpo"][
+                "use_leave_one_out_baseline"
+            ],
+            "normalize_rewards": master_config["grpo"]["normalize_rewards"],
         }
         adv_estimator = OPDAdvantageEstimator(opd_estimator_config, loss_config)
         print("  ✓ Using OPD advantage estimator")
@@ -1448,6 +1475,121 @@ def _extract_prompt_only_messages(message_logs: list) -> list:
                 prompt_only_log.append(message)
         prompt_only_message_logs.append(prompt_only_log)
     return prompt_only_message_logs
+
+
+def _build_pi_distill_training_batch(
+    repeated_batch: BatchedDataDict[DatumSpec],
+) -> BatchedDataDict[DatumSpec]:
+    missing = [
+        key
+        for key in ("pi_teacher_message_log", "pi_student_message_log")
+        if key not in repeated_batch
+    ]
+    if missing:
+        raise ValueError(
+            "PI distill requires paired teacher and student message logs, "
+            f"missing {missing}"
+        )
+
+    teacher_logs = repeated_batch["pi_teacher_message_log"]
+    student_logs = repeated_batch["pi_student_message_log"]
+    if len(teacher_logs) != len(student_logs):
+        raise ValueError(
+            "PI distill expected equal teacher and student batch sizes, got "
+            f"teacher={len(teacher_logs)} student={len(student_logs)}"
+        )
+
+    batch_size = len(teacher_logs)
+    expanded: dict[str, Any] = {}
+    skip_keys = {
+        "message_log",
+        "length",
+        "pi_teacher_message_log",
+        "pi_student_message_log",
+        "pi_teacher_length",
+        "pi_student_length",
+    }
+    for key, value in repeated_batch.items():
+        if key in skip_keys:
+            continue
+        if isinstance(value, torch.Tensor) and value.shape[:1] == (batch_size,):
+            expanded[key] = value.repeat_interleave(2, dim=0)
+        elif isinstance(value, list) and len(value) == batch_size:
+            expanded[key] = [item for item in value for _ in range(2)]
+
+    message_logs = []
+    lengths = []
+    roles = []
+    pair_indices = []
+    teacher_lengths = repeated_batch.get("pi_teacher_length")
+    student_lengths = repeated_batch.get("pi_student_length")
+    for idx, (teacher_log, student_log) in enumerate(zip(teacher_logs, student_logs)):
+        message_logs.extend([teacher_log, student_log])
+        teacher_length = (
+            int(teacher_lengths[idx])
+            if teacher_lengths is not None
+            else len(teacher_log[0]["token_ids"])
+        )
+        student_length = (
+            int(student_lengths[idx])
+            if student_lengths is not None
+            else len(student_log[0]["token_ids"])
+        )
+        lengths.extend([teacher_length, student_length])
+        roles.extend([0, 1])
+        pair_indices.extend([idx, idx])
+
+    expanded["message_log"] = message_logs
+    expanded["length"] = torch.tensor(lengths, dtype=torch.long)
+    expanded["pi_loss_role"] = torch.tensor(roles, dtype=torch.long)
+    expanded["pi_pair_index"] = torch.tensor(pair_indices, dtype=torch.long)
+    return BatchedDataDict[DatumSpec](expanded)
+
+
+def _compute_pi_distill_logprob_gap(
+    message_logs: list[list[dict[str, Any]]],
+    current_logprobs: torch.Tensor,
+    pi_loss_role: torch.Tensor,
+    strict_alignment: bool,
+) -> torch.Tensor:
+    from nemo_rl.algorithms.async_utils import align_pi_teacher_logprobs_to_student
+
+    roles = pi_loss_role.cpu()
+    teacher_indices = torch.nonzero(roles == 0, as_tuple=False).flatten()
+    student_indices = torch.nonzero(roles == 1, as_tuple=False).flatten()
+    if teacher_indices.numel() != student_indices.numel():
+        raise ValueError(
+            "PI distill requires paired teacher and student rows, got "
+            f"teacher={teacher_indices.numel()} student={student_indices.numel()}"
+        )
+
+    teacher_idx_list = teacher_indices.tolist()
+    student_idx_list = student_indices.tolist()
+    teacher_logs = [message_logs[idx] for idx in teacher_idx_list]
+    student_logs = [message_logs[idx] for idx in student_idx_list]
+    teacher_logprobs = current_logprobs[teacher_idx_list]
+    student_logprobs = current_logprobs[student_idx_list]
+    pair_shape = (len(teacher_idx_list), current_logprobs.shape[1])
+
+    student_on_teacher = align_pi_teacher_logprobs_to_student(
+        teacher_logs,
+        student_logs,
+        student_logprobs,
+        pair_shape,
+        strict=strict_alignment,
+    )
+    teacher_on_student = align_pi_teacher_logprobs_to_student(
+        student_logs,
+        teacher_logs,
+        teacher_logprobs,
+        pair_shape,
+        strict=strict_alignment,
+    )
+
+    gap = torch.zeros_like(current_logprobs)
+    gap[teacher_idx_list] = teacher_logprobs - student_on_teacher
+    gap[student_idx_list] = teacher_on_student - student_logprobs
+    return gap
 
 
 def refit_policy_generation(
@@ -1778,6 +1920,9 @@ def grpo_train(
 
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
+    opd_cfg = master_config.get("on_policy_distillation", {})
+    pi_mode = opd_module.get_pi_mode(opd_cfg)
+    pi_cfg = opd_cfg.get("privileged_information", {})
 
     # Run validation at the start if configured
     # TODO: Add validation with kv scales if needed
@@ -2064,6 +2209,16 @@ def grpo_train(
                     # Save baseline for logging (before deletion)
                     baseline_for_log = baseline.clone()
 
+                    train_gbs_override = None
+                    if pi_mode == "pi_distill":
+                        repeated_batch = _build_pi_distill_training_batch(repeated_batch)
+                        train_gbs_override = repeated_batch.size
+                        rewards = repeated_batch["total_reward"]
+                        print(
+                            f"Expanded PI distill batch to paired teacher/student rows "
+                            f"(size: {repeated_batch.size})"
+                        )
+
                     # Extract prompt-only messages for advantage estimation
                     prompt_only_message_logs = _extract_prompt_only_messages(
                         repeated_batch["message_log"]
@@ -2156,6 +2311,12 @@ def grpo_train(
                             as_tensors=False
                         )
                         train_data.update(extra_multimodal_data)
+                        if pi_mode == "pi_distill":
+                            train_data["pi_loss_role"] = repeated_batch["pi_loss_role"]
+                            train_data["pi_pair_index"] = repeated_batch["pi_pair_index"]
+                            train_data["behavior_logprobs"] = flat_messages[
+                                "generation_logprobs"
+                            ]
                         train_data.to("cpu")
 
                     metrics_logging_data["content"] = flat_messages["content"]
@@ -2167,7 +2328,11 @@ def grpo_train(
                     "seq_logprob_error_threshold", None
                 )
                 force_on_policy_ratio = master_config["loss_fn"].get("force_on_policy_ratio", False)
-                skip_prev_logprobs = force_on_policy_ratio and seq_logprob_error_threshold is None
+                skip_prev_logprobs = (
+                    force_on_policy_ratio
+                    and seq_logprob_error_threshold is None
+                    and pi_mode != "pi_distill"
+                )
                 # todo @jiaqi: is there a better way to skip prev_logprobs computation while still computing the seq-level error metrics?
                 if force_on_policy_ratio and seq_logprob_error_threshold is not None:
                     warnings.warn(
@@ -2213,7 +2378,7 @@ def grpo_train(
                     del extra_multimodal_data
 
                 # Seq-level logprob error metrics/masking require real prev_logprobs
-                if skip_prev_logprobs:
+                if skip_prev_logprobs or pi_mode == "pi_distill":
                     # Cannot compute seq-level metrics with placeholder prev_logprobs
                     max_seq_mult_prob_error = 0.0
                     mean_seq_mult_prob_error = 0.0
@@ -2248,6 +2413,14 @@ def grpo_train(
                     token_mask = train_data["token_mask"]
                     sample_mask = train_data["sample_mask"]
                     mask = token_mask * sample_mask.unsqueeze(-1)
+                    pi_logprob_gap = None
+                    if pi_mode == "pi_distill":
+                        pi_logprob_gap = _compute_pi_distill_logprob_gap(
+                            repeated_batch["message_log"],
+                            train_data["prev_logprobs"],
+                            train_data["pi_loss_role"],
+                            strict_alignment=bool(pi_cfg.get("strict_alignment", True)),
+                        )
 
                     train_data["advantages"] = adv_estimator.compute_advantage(
                         prompt_ids=prompt_ids_for_adv,
@@ -2255,6 +2428,11 @@ def grpo_train(
                         mask=mask,
                         logprobs_policy=train_data["prev_logprobs"],
                         logprobs_reference=train_data.get("reference_policy_logprobs"),
+                        prev_logprobs=train_data["prev_logprobs"],
+                        generation_logprobs=train_data["generation_logprobs"],
+                        sample_mask=train_data["sample_mask"],
+                        pi_loss_role=train_data.get("pi_loss_role"),
+                        pi_logprob_gap=pi_logprob_gap,
                     )
                     del prompt_ids_for_adv
 
@@ -2304,6 +2482,7 @@ def grpo_train(
                     train_results = policy.train(
                         train_data,
                         loss_fn,
+                        gbs=train_gbs_override,
                         timer=timer,
                     )
 
@@ -3335,6 +3514,9 @@ def async_grpo_train(
                     # Concatenate per-prompt groups into a single training batch
                     per_prompt_batches = [t["batch"] for t in trajectories]
                     repeated_batch = BatchedDataDict.from_batches(per_prompt_batches)
+                    opd_cfg = master_config.get("on_policy_distillation", {})
+                    pi_mode = opd_module.get_pi_mode(opd_cfg)
+                    pi_cfg = opd_cfg.get("privileged_information", {})
 
                     # Teacher logprobs are stored in batch dict by collection-time
                     # computation and padded by from_batches. Extract here.
@@ -3398,6 +3580,20 @@ def async_grpo_train(
                     )
 
                 print(f"Got trajectory batch (size: {repeated_batch.size})")
+                train_gbs_override = None
+                if pi_mode == "pi_distill":
+                    repeated_batch = _build_pi_distill_training_batch(repeated_batch)
+                    train_gbs_override = repeated_batch.size
+                    if repeated_batch.size % dp_size != 0:
+                        raise AssertionError(
+                            f"PI distill expanded batch size {repeated_batch.size} "
+                            f"must be divisible by data_parallel size {dp_size}."
+                        )
+                    trajectory_teacher_logprobs = None
+                    print(
+                        f"Expanded PI distill batch to paired teacher/student rows "
+                        f"(size: {repeated_batch.size})"
+                    )
 
                 print("▶ Processing rewards...")
                 with timer.time("reward_calculation"):
@@ -3495,6 +3691,12 @@ def async_grpo_train(
                             "sample_mask": repeated_batch["loss_multiplier"],
                         }
                     )
+                    if pi_mode == "pi_distill":
+                        train_data["pi_loss_role"] = repeated_batch["pi_loss_role"]
+                        train_data["pi_pair_index"] = repeated_batch["pi_pair_index"]
+                        train_data["behavior_logprobs"] = flat_messages[
+                            "generation_logprobs"
+                        ]
                     train_data.to("cpu")
 
                 # Pad teacher logprobs to match train_data sequence length.
@@ -3524,7 +3726,11 @@ def async_grpo_train(
                     "seq_logprob_error_threshold", None
                 )
                 force_on_policy_ratio = master_config["loss_fn"].get("force_on_policy_ratio", False)
-                skip_prev_logprobs = force_on_policy_ratio and seq_logprob_error_threshold is None
+                skip_prev_logprobs = (
+                    force_on_policy_ratio
+                    and seq_logprob_error_threshold is None
+                    and pi_mode != "pi_distill"
+                )
 
                 # todo @jiaqi: is there a better way to skip prev_logprobs computation while still computing the seq-level error metrics?
                 if force_on_policy_ratio and seq_logprob_error_threshold is not None:
@@ -3560,7 +3766,7 @@ def async_grpo_train(
                 train_data["reference_policy_logprobs"] = reference_logprobs
 
                 # Seq-level logprob error metrics/masking require real prev_logprobs
-                if skip_prev_logprobs:
+                if skip_prev_logprobs or pi_mode == "pi_distill":
                     # Cannot compute seq-level metrics with placeholder prev_logprobs
                     max_seq_mult_prob_error = 0.0
                     mean_seq_mult_prob_error = 0.0
@@ -3596,6 +3802,16 @@ def async_grpo_train(
                     token_mask = train_data["token_mask"]
                     sample_mask = train_data["sample_mask"]
                     mask = token_mask * sample_mask.unsqueeze(-1)
+                    pi_logprob_gap = None
+                    if pi_mode == "pi_distill":
+                        pi_logprob_gap = _compute_pi_distill_logprob_gap(
+                            repeated_batch["message_log"],
+                            train_data["prev_logprobs"],
+                            train_data["pi_loss_role"],
+                            strict_alignment=bool(
+                                pi_cfg.get("strict_alignment", True)
+                            ),
+                        )
 
                     train_data["advantages"] = adv_estimator.compute_advantage(
                         prompt_ids=prompt_ids_for_adv,
@@ -3608,6 +3824,8 @@ def async_grpo_train(
                         prev_logprobs=train_data["prev_logprobs"],
                         generation_logprobs=train_data["generation_logprobs"],
                         sample_mask=train_data["sample_mask"],
+                        pi_loss_role=train_data.get("pi_loss_role"),
+                        pi_logprob_gap=pi_logprob_gap,
                     )
                     del prompt_ids_for_adv
 
@@ -3656,6 +3874,7 @@ def async_grpo_train(
                     train_results = policy.train(
                         train_data,
                         loss_fn,
+                        gbs=train_gbs_override,
                         timer=timer,
                     )
 

@@ -173,7 +173,36 @@ class OPDAdvantageEstimator:
     def __init__(self, estimator_config: dict, loss_config: dict):
         self.use_orm_advantage = bool(estimator_config.get("use_orm_advantage", False))
         self.orm_advantage_weight = float(estimator_config.get("orm_advantage_weight", 0.0))
+        self.pi_mode = estimator_config.get("pi_mode")
+        self.pi_beta = float(estimator_config.get("pi_beta", 1.0))
+        self.pi_alpha = float(estimator_config.get("pi_alpha", 0.5))
+        self.pi_task_reward_weight = float(
+            estimator_config.get("pi_task_reward_weight", 0.0)
+        )
+        self.use_leave_one_out_baseline = bool(
+            estimator_config.get("use_leave_one_out_baseline", True)
+        )
+        self.normalize_rewards = bool(estimator_config.get("normalize_rewards", True))
         self.last_metrics: dict[str, float] = {}
+
+    def _compute_reward_advantages(self, prompt_ids, rewards, mask, sample_mask=None):
+        if sample_mask is None:
+            sample_mask = torch.ones_like(rewards)
+        baseline, std = calculate_baseline_and_std_per_prompt(
+            prompt_ids,
+            rewards,
+            sample_mask,
+            leave_one_out_baseline=self.use_leave_one_out_baseline,
+        )
+        reward_advantages = rewards - baseline
+        if self.normalize_rewards:
+            epsilon = 1e-6
+            non_zero_std_mask = std > 0
+            reward_advantages[non_zero_std_mask] = (
+                reward_advantages[non_zero_std_mask]
+                / (std[non_zero_std_mask] + epsilon)
+            )
+        return reward_advantages.unsqueeze(-1).expand(mask.shape)
 
     def compute_advantage(
         self,
@@ -183,6 +212,9 @@ class OPDAdvantageEstimator:
         teacher_logprobs=None,
         prev_logprobs=None,
         orm_advantages=None,
+        sample_mask=None,
+        pi_loss_role=None,
+        pi_logprob_gap=None,
         **kwargs,
     ):
         """Compute OPD distillation advantages.
@@ -198,17 +230,53 @@ class OPDAdvantageEstimator:
         Returns:
             [B, S] token-level distillation advantages (stop-gradient)
         """
+        if self.pi_mode == "pi_distill":
+            if pi_loss_role is None:
+                raise ValueError("PI distill requires pi_loss_role")
+            if pi_logprob_gap is None:
+                raise ValueError("PI distill requires pi_logprob_gap")
+            reward_term = (
+                self.pi_task_reward_weight
+                * self._compute_reward_advantages(
+                    prompt_ids,
+                    rewards,
+                    mask,
+                    sample_mask=sample_mask,
+                ).detach()
+            )
+            kl_term = self.pi_beta * pi_logprob_gap.detach()
+            roles = pi_loss_role.unsqueeze(-1).to(mask.device)
+            teacher_advantages = self.pi_alpha * (reward_term - kl_term)
+            student_advantages = (1.0 - self.pi_alpha) * (reward_term + kl_term)
+            advantages = torch.where(roles == 0, teacher_advantages, student_advantages)
+            advantages = advantages * mask
+            self._compute_metrics(kl_term, advantages, mask)
+            return advantages
+
         if teacher_logprobs is None:
             raise ValueError("OPD requires teacher_logprobs")
         if prev_logprobs is None:
             raise ValueError("OPD requires prev_logprobs")
 
-        # Â_MOPD,t = sg[log π_teacher - log π_student]  (Equation 8)
-        distill_advantages = (teacher_logprobs - prev_logprobs).detach()
+        # Reverse-KL dense reward: log teacher minus log student.
+        distill_advantages = self.pi_beta * (teacher_logprobs - prev_logprobs).detach()
 
-        # Optional ORM blending (Equation 9)
-        if self.use_orm_advantage and orm_advantages is not None:
-            combined = distill_advantages + self.orm_advantage_weight * orm_advantages.detach()
+        if self.pi_mode == "opsd" and self.pi_task_reward_weight != 0:
+            reward_advantages = self._compute_reward_advantages(
+                prompt_ids,
+                rewards,
+                mask,
+                sample_mask=sample_mask,
+            )
+            combined = (
+                self.pi_task_reward_weight * reward_advantages.detach()
+                + distill_advantages
+            )
+        elif self.use_orm_advantage and orm_advantages is not None:
+            combined = (
+                distill_advantages
+                + self.orm_advantage_weight * orm_advantages.detach()
+            )
         else:
             combined = distill_advantages
 

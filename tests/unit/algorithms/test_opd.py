@@ -297,3 +297,248 @@ def test_get_teacher_routing_metrics():
     )
     assert metrics["on_policy_distillation/teacher_alias_unique"] == 3.0
     assert metrics["on_policy_distillation/teacher_model_unique"] == 2.0
+
+
+def test_get_pi_mode_accepts_paper_modes_and_legacy_alias():
+    from nemo_rl.algorithms.opd import get_pi_mode
+
+    assert get_pi_mode({"privileged_information": {"enabled": False}}) is None
+    assert get_pi_mode({"privileged_information": {"enabled": True}}) == "opsd"
+    assert (
+        get_pi_mode(
+            {
+                "privileged_information": {
+                    "enabled": True,
+                    "mode": "opsd_teacher_logprobs",
+                }
+            }
+        )
+        == "opsd"
+    )
+    assert (
+        get_pi_mode(
+            {
+                "privileged_information": {
+                    "enabled": True,
+                    "mode": "pi_distill",
+                }
+            }
+        )
+        == "pi_distill"
+    )
+
+
+def test_opd_advantage_estimator_opsd_mixes_reward_and_pi_gap():
+    from nemo_rl.algorithms.advantage_estimator import OPDAdvantageEstimator
+
+    estimator = OPDAdvantageEstimator(
+        {
+            "pi_mode": "opsd",
+            "pi_beta": 0.5,
+            "pi_task_reward_weight": 2.0,
+            "use_leave_one_out_baseline": True,
+            "normalize_rewards": False,
+        },
+        {},
+    )
+    prompt_ids = torch.tensor([[1, 2], [1, 2]])
+    rewards = torch.tensor([1.0, 3.0])
+    mask = torch.ones(2, 3)
+    teacher_logprobs = torch.tensor(
+        [
+            [0.2, 0.4, 0.6],
+            [0.1, 0.3, 0.5],
+        ]
+    )
+    prev_logprobs = torch.tensor(
+        [
+            [0.1, 0.1, 0.1],
+            [0.2, 0.2, 0.2],
+        ]
+    )
+
+    advantages = estimator.compute_advantage(
+        prompt_ids=prompt_ids,
+        rewards=rewards,
+        mask=mask,
+        teacher_logprobs=teacher_logprobs,
+        prev_logprobs=prev_logprobs,
+        sample_mask=torch.ones_like(rewards),
+    )
+
+    reward_part = torch.tensor(
+        [
+            [-4.0, -4.0, -4.0],
+            [4.0, 4.0, 4.0],
+        ]
+    )
+    pi_part = 0.5 * (teacher_logprobs - prev_logprobs)
+    assert torch.allclose(advantages, reward_part + pi_part)
+
+
+def test_opd_advantage_estimator_pi_distill_roles():
+    from nemo_rl.algorithms.advantage_estimator import OPDAdvantageEstimator
+
+    estimator = OPDAdvantageEstimator(
+        {
+            "pi_mode": "pi_distill",
+            "pi_beta": 0.5,
+            "pi_alpha": 0.25,
+            "pi_task_reward_weight": 2.0,
+            "use_leave_one_out_baseline": True,
+            "normalize_rewards": False,
+        },
+        {},
+    )
+    rewards = torch.tensor([1.0, 1.0, 3.0, 3.0])
+    mask = torch.ones(4, 3)
+    gap = torch.tensor(
+        [
+            [0.2, 0.4, 0.6],
+            [0.1, 0.3, 0.5],
+            [0.4, 0.2, 0.0],
+            [0.6, 0.4, 0.2],
+        ]
+    )
+
+    advantages = estimator.compute_advantage(
+        prompt_ids=torch.tensor(
+            [
+                [10, 0],
+                [20, 0],
+                [10, 0],
+                [20, 0],
+            ]
+        ),
+        rewards=rewards,
+        mask=mask,
+        sample_mask=torch.ones_like(rewards),
+        pi_loss_role=torch.tensor([0, 1, 0, 1]),
+        pi_logprob_gap=gap,
+    )
+
+    reward_part = torch.tensor(
+        [
+            [-4.0, -4.0, -4.0],
+            [-4.0, -4.0, -4.0],
+            [4.0, 4.0, 4.0],
+            [4.0, 4.0, 4.0],
+        ]
+    )
+    expected = torch.stack(
+        [
+            0.25 * (reward_part[0] - 0.5 * gap[0]),
+            0.75 * (reward_part[1] + 0.5 * gap[1]),
+            0.25 * (reward_part[2] - 0.5 * gap[2]),
+            0.75 * (reward_part[3] + 0.5 * gap[3]),
+        ]
+    )
+    assert torch.allclose(advantages, expected)
+
+
+def test_build_pi_teacher_message_log_prepends_pi():
+    from nemo_rl.algorithms.async_utils import build_pi_teacher_message_log
+
+    message_log = [
+        {"role": "user", "content": "question", "token_ids": torch.tensor([1])},
+        {
+            "role": "assistant",
+            "content": "answer",
+            "token_ids": torch.tensor([2]),
+            "generation_logprobs": torch.tensor([0.0]),
+        },
+    ]
+
+    teacher_log = build_pi_teacher_message_log(
+        message_log,
+        {"hint": "use tool"},
+        {
+            "role": "system",
+            "template": "PI: {privileged_information}",
+        },
+    )
+
+    assert teacher_log[0]["role"] == "system"
+    assert teacher_log[0]["content"] == 'PI: {"hint":"use tool"}'
+    assert teacher_log[1]["content"] == "question"
+
+
+def test_pi_teacher_conditioning_rejects_unknown_mode():
+    from nemo_rl.algorithms.async_utils import is_pi_teacher_conditioning_enabled
+
+    with pytest.raises(ValueError, match="Unsupported PI mode"):
+        is_pi_teacher_conditioning_enabled(
+            {
+                "privileged_information": {
+                    "enabled": True,
+                    "mode": "unknown",
+                }
+            }
+        )
+
+
+def test_align_pi_teacher_logprobs_to_student_assistant_tokens():
+    from nemo_rl.algorithms.async_utils import align_pi_teacher_logprobs_to_student
+
+    student_logs = [
+        [
+            {"role": "user", "token_ids": torch.tensor([10, 11])},
+            {
+                "role": "assistant",
+                "token_ids": torch.tensor([12, 13]),
+                "generation_logprobs": torch.tensor([0.0, 0.0]),
+            },
+        ]
+    ]
+    teacher_logs = [
+        [
+            {"role": "system", "token_ids": torch.tensor([1, 2, 3])},
+            {"role": "user", "token_ids": torch.tensor([10, 11])},
+            {
+                "role": "assistant",
+                "token_ids": torch.tensor([12, 13]),
+                "generation_logprobs": torch.tensor([0.0, 0.0]),
+            },
+        ]
+    ]
+    teacher_logprobs = torch.tensor([[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]])
+
+    aligned = align_pi_teacher_logprobs_to_student(
+        student_logs,
+        teacher_logs,
+        teacher_logprobs,
+        (1, 4),
+    )
+
+    assert torch.allclose(aligned, torch.tensor([[0.0, 0.0, 0.6, 0.7]]))
+
+
+def test_align_pi_teacher_logprobs_length_mismatch_raises():
+    from nemo_rl.algorithms.async_utils import align_pi_teacher_logprobs_to_student
+
+    student_logs = [
+        [
+            {
+                "role": "assistant",
+                "token_ids": torch.tensor([1, 2]),
+                "generation_logprobs": torch.tensor([0.0, 0.0]),
+            },
+        ]
+    ]
+    teacher_logs = [
+        [
+            {
+                "role": "assistant",
+                "token_ids": torch.tensor([1]),
+                "generation_logprobs": torch.tensor([0.0]),
+            },
+        ]
+    ]
+
+    with pytest.raises(ValueError, match="matching assistant token counts"):
+        align_pi_teacher_logprobs_to_student(
+            student_logs,
+            teacher_logs,
+            torch.tensor([[0.5]]),
+            (1, 2),
+        )

@@ -55,6 +55,66 @@ import numpy as np
 TokenizerType = PreTrainedTokenizerBase
 
 
+def _extract_privileged_information_from_row(row: dict) -> object:
+    for key in ("privileged_information", "privileged_info", "pi"):
+        value = row.get(key)
+        if value is not None and value != "":
+            return value
+    instance_config = row.get("instance_config") or {}
+    for key in ("privileged_information", "privileged_info", "pi"):
+        value = instance_config.get(key)
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def _stringify_privileged_information(value: Any) -> Optional[str]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _append_text_content(content: Any, text: str) -> Any:
+    if isinstance(content, str):
+        return f"{content}\n\n{text}" if content else text
+    if isinstance(content, list):
+        return [*content, {"type": "input_text", "text": text}]
+    if content is None:
+        return text
+    return f"{content}\n\n{text}"
+
+
+def _with_privileged_information_message(
+    input_messages: list[dict],
+    privileged_information: Any,
+    pi_cfg: dict[str, Any],
+) -> list[dict]:
+    pi_text = _stringify_privileged_information(privileged_information)
+    allow_missing = bool(pi_cfg.get("allow_missing", False))
+    if pi_text is None:
+        if allow_missing:
+            return copy.deepcopy(input_messages)
+        raise ValueError("PI rollout conditioning is enabled but PI is missing")
+
+    template = pi_cfg.get(
+        "template",
+        "Privileged information for the teacher only:\n{privileged_information}",
+    )
+    role = pi_cfg.get("role", "system")
+    pi_content = template.format(privileged_information=pi_text)
+    conditioned = copy.deepcopy(input_messages)
+    if role == "system" and conditioned and conditioned[0].get("role") == "system":
+        conditioned[0] = dict(conditioned[0])
+        conditioned[0]["content"] = _append_text_content(
+            conditioned[0].get("content"),
+            pi_content,
+        )
+        return conditioned
+    return [{"role": role, "content": pi_content}, *conditioned]
+
+
 def generate_responses(
     policy_generation: GenerationInterface,
     generation_input_data: BatchedDataDict[GenerationDatumSpec],
@@ -1238,6 +1298,14 @@ async def run_async_nemo_gym_rollout(
     """Run multi-turn rollouts with NeMo-Gym. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters."""
     # We leverage the same `extra_env_info` key as `run_async_multi_turn_rollout`.
     nemo_gym_rows = input_batch["extra_env_info"]
+    pi_mode = None
+    pi_cfg: dict[str, Any] = {}
+    if master_config is not None:
+        from nemo_rl.algorithms.opd import get_pi_mode
+
+        opd_cfg = master_config.get("on_policy_distillation", {})
+        pi_mode = get_pi_mode(opd_cfg)
+        pi_cfg = dict(opd_cfg.get("privileged_information", {}))
 
     # Handle generation parameters up front so we don't hide anything inside here to avoid being unintuitive to the user.
     # NeMo-Gym policy is "What you see is what you get".
@@ -1264,13 +1332,28 @@ async def run_async_nemo_gym_rollout(
     timer_prefix = "timing/rollout"
     timer.start(f"{timer_prefix}/total")
 
+    prepared_nemo_gym_rows = []
     groupidx_to_row = defaultdict(list)
     for rowidx, row in enumerate(nemo_gym_rows):
+        row = copy.deepcopy(row)
         # We may need better handling here. The max tokens set here would be the max new generated tokens, not the total max tokens.
         # Currently, we just rely on the underlying vLLM engine to do the truncation for us using the max model seq len set in the config.
         # row["max_tokens"] = max_seq_len
 
-        responses_create_params = row["responses_create_params"]
+        responses_create_params = dict(row["responses_create_params"])
+        row["responses_create_params"] = responses_create_params
+        if pi_mode == "pi_distill":
+            original_input_messages = copy.deepcopy(responses_create_params["input"])
+            row["_pi_student_input_token_ids"] = tokenizer.apply_chat_template(
+                original_input_messages,
+                tokenize=True,
+            )
+            row["_pi_rollout_conditioned"] = True
+            responses_create_params["input"] = _with_privileged_information_message(
+                original_input_messages,
+                _extract_privileged_information_from_row(row),
+                pi_cfg,
+            )
         responses_create_params["temperature"] = generation_config["temperature"]
         responses_create_params["top_p"] = generation_config["top_p"]
 
@@ -1283,6 +1366,7 @@ async def run_async_nemo_gym_rollout(
         # generation_config["max_new_tokens"]
 
         row["_rowidx"] = rowidx
+        prepared_nemo_gym_rows.append(row)
         # Assume the gym input samples are ordered
         groupidx_to_row[rowidx // num_generations].append(row)
 
@@ -1293,13 +1377,13 @@ async def run_async_nemo_gym_rollout(
     with timer.time(f"{timer_prefix}/run_rollouts"):
         nemo_gym_environment = task_to_env["nemo_gym"]
         for future in nemo_gym_environment.run_rollouts.remote(
-            nemo_gym_rows, tokenizer, timer_prefix
+            prepared_nemo_gym_rows, tokenizer, timer_prefix
         ):
             rowidx, result, timing_metrics = await future
 
             groupidx = rowidx // num_generations
             groupidx_to_rollouts[groupidx].append(result)
-            groupidx_to_agent_refs[groupidx].append(nemo_gym_rows[rowidx]["agent_ref"]["name"])
+            groupidx_to_agent_refs[groupidx].append(prepared_nemo_gym_rows[rowidx]["agent_ref"]["name"])
             groupidx_to_rowidx[groupidx].append(rowidx)
 
             if len(groupidx_to_rollouts[groupidx]) == num_generations:
@@ -1509,10 +1593,35 @@ def _postprocess_single_group(
         "gen_tokens_per_sample/mean"
     ]
 
-    # Convert LLMMessageLogType to FlatMessagesType for generation
+    is_pi_distill = any(row.get("_pi_rollout_conditioned") for row in nemo_gym_rows)
+    pi_student_message_logs = []
+    if is_pi_distill:
+        for row, result in zip(nemo_gym_rows, results):
+            student_log = copy.deepcopy(result["message_log"])
+            student_input_token_ids = row.get("_pi_student_input_token_ids")
+            if student_input_token_ids is not None and student_log:
+                student_log[0] = dict(student_log[0])
+                student_log[0]["token_ids"] = torch.tensor(
+                    student_input_token_ids,
+                    dtype=torch.int64,
+                )
+            pi_student_message_logs.append(student_log)
+
+    message_logs = (
+        pi_student_message_logs
+        if is_pi_distill
+        else [r["message_log"] for r in results]
+    )
+    lengths = (
+        [len(m[0]["token_ids"]) for m in pi_student_message_logs]
+        if is_pi_distill
+        else [len(r["input_message_log"][0]["token_ids"]) for r in results]
+    )
+
+    # Convert prompt-only message logs to FlatMessagesType for prompt grouping.
     input_batch_for_input_ids = BatchedDataDict[DatumSpec](
         {
-            "message_log": [r["input_message_log"] for r in results],
+            "message_log": [message_log[:1] for message_log in message_logs],
         }
     )
     batched_flat, _ = batched_message_log_to_flat_message(
@@ -1524,11 +1633,9 @@ def _postprocess_single_group(
     final_batch = BatchedDataDict[DatumSpec](
         {
             "agent_ref": [r["agent_ref"] for r in results],
-            "message_log": [r["message_log"] for r in results],
+            "message_log": message_logs,
             # length is used downstream for mean_prompt_length
-            "length": torch.tensor(
-                [len(r["input_message_log"][0]["token_ids"]) for r in results]
-            ),
+            "length": torch.tensor(lengths),
             "loss_multiplier": input_batch["loss_multiplier"],
             # Unnecessary parts of the DatumSpec unused by the GRPO algorithm
             # extra_env_info: dict[str, Any]
@@ -1541,7 +1648,7 @@ def _postprocess_single_group(
             "truncated": torch.tensor(
                 [m["hit_max_tokens"] for m in all_sample_metrics], dtype=torch.bool
             ),
-            # Agent/env-driven mask flag — True means this sample should be masked
+            # Agent/env-driven mask flag - True means this sample should be masked
             # from the GRPO gradient (kept for advantage computation).
             "mask_sample": torch.tensor(
                 [
@@ -1569,7 +1676,7 @@ def _postprocess_single_group(
         rollout_metrics['mean_length_high'] = sum(lengths3[2])/len(lengths3[2])
         rollout_metrics['median_length_high'] = float(np.median(lengths3[2]))
 
-    # Penalty metrics — map count keys to (config flag, metric name)
+    # Penalty metrics - map count keys to (config flag, metric name)
     _PENALTY_METRICS = {
         "duplicated_reasoning": ("penalize_duplicated_reasoning", "reasoning_equal_to_final_answer_rate"),
         "empty_final_answer": ("penalize_empty_final_answer", "empty_final_answer_rate"),
@@ -1580,6 +1687,19 @@ def _postprocess_single_group(
         for key, (flag, metric_name) in _PENALTY_METRICS.items():
             if master_config.get(flag, False):
                 rollout_metrics[metric_name] = penalty_counts[key] / len(results)
+
+    final_batch["privileged_information"] = [
+        _extract_privileged_information_from_row(row) for row in nemo_gym_rows
+    ]
+    if is_pi_distill:
+        final_batch["pi_teacher_message_log"] = [r["message_log"] for r in results]
+        final_batch["pi_student_message_log"] = pi_student_message_logs
+        final_batch["pi_teacher_length"] = torch.tensor(
+            [len(r["input_message_log"][0]["token_ids"]) for r in results]
+        )
+        final_batch["pi_student_length"] = torch.tensor(
+            [len(m[0]["token_ids"]) for m in pi_student_message_logs]
+        )
 
     ng_task_index = None
     if nemo_gym_rows and "_ng_task_index" in nemo_gym_rows[0]:

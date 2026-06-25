@@ -23,6 +23,11 @@ from __future__ import annotations
 
 from typing import Any, NotRequired, Optional, TypedDict
 
+_PI_MODE_ALIASES = {
+    "opsd_teacher_logprobs": "opsd",
+}
+_SUPPORTED_PI_MODES = {"opsd", "pi_distill"}
+
 
 # ---------------------------------------------------------------------------
 # Config TypedDicts
@@ -58,6 +63,24 @@ def is_non_colocated_teachers_enabled(master_config: dict[str, Any]) -> bool:
         return False
     opd_cfg = master_config.get("on_policy_distillation", {})
     return bool(opd_cfg.get("non_colocated_teachers", {}).get("enabled", False))
+
+
+def get_pi_mode(opd_cfg: dict[str, Any]) -> Optional[str]:
+    pi_cfg = opd_cfg.get("privileged_information", {})
+    if not bool(pi_cfg.get("enabled", False)):
+        return None
+    mode = pi_cfg.get("mode", "opsd")
+    mode = _PI_MODE_ALIASES.get(mode, mode)
+    if mode not in _SUPPORTED_PI_MODES:
+        raise ValueError(
+            f"Unsupported PI mode {mode!r}. Supported modes: "
+            f"{sorted(_SUPPORTED_PI_MODES)}"
+        )
+    return mode
+
+
+def is_pi_enabled(opd_cfg: dict[str, Any]) -> bool:
+    return get_pi_mode(opd_cfg) is not None
 
 
 # ---------------------------------------------------------------------------

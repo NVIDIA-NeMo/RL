@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import json
 import statistics
 import threading as _threading
 import time
@@ -25,6 +26,7 @@ if TYPE_CHECKING:
     from nemo_rl.models.policy.teacher_worker_group import TeacherWorkerGroup
 
 import ray
+import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PreTrainedTokenizerBase
 
@@ -41,6 +43,193 @@ from nemo_rl.utils.timer import ThreadSafeTimer
 TokenizerType = PreTrainedTokenizerBase
 _NG_TASK_INDEX_KEY = "_ng_task_index"
 _NEXT_NG_TASK_INDEX_KEY = "next_ng_task_index"
+
+
+def _stringify_privileged_information(value: Any) -> Optional[str]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def is_pi_teacher_conditioning_enabled(opd_cfg: dict[str, Any]) -> bool:
+    from nemo_rl.algorithms.opd import get_pi_mode
+
+    return get_pi_mode(opd_cfg) in {"opsd", "pi_distill"}
+
+
+def get_pi_values_for_batch(
+    batch: BatchedDataDict[DatumSpec],
+    pi_cfg: dict[str, Any],
+    batch_size: int,
+) -> list[Any]:
+    pi_batch_key = pi_cfg.get("batch_key", "privileged_information")
+    pi_values = batch.get(pi_batch_key)
+    if pi_values is None:
+        if bool(pi_cfg.get("allow_missing", False)):
+            return [None] * batch_size
+        raise ValueError(
+            "PI is enabled but batch key "
+            f"{pi_batch_key!r} is missing"
+        )
+    if len(pi_values) != batch_size:
+        raise ValueError(
+            "PI expected one value per sample, got "
+            f"pi={len(pi_values)} samples={batch_size}"
+        )
+    return list(pi_values)
+
+
+def build_pi_teacher_message_log(
+    message_log: list[dict[str, Any]],
+    privileged_information: Any,
+    pi_cfg: dict[str, Any],
+    tokenizer: Optional[TokenizerType] = None,
+) -> list[dict[str, Any]]:
+    pi_text = _stringify_privileged_information(privileged_information)
+    allow_missing = bool(pi_cfg.get("allow_missing", False))
+    if pi_text is None:
+        if allow_missing:
+            return message_log
+        raise ValueError("PI teacher conditioning is enabled but PI is missing")
+
+    template = pi_cfg.get(
+        "template",
+        "Privileged information for the teacher only:\n{privileged_information}",
+    )
+    role = pi_cfg.get("role", "system")
+    pi_content = template.format(privileged_information=pi_text)
+
+    stripped_messages: list[dict[str, Any]] = []
+    generated_assistant_flags: list[bool] = []
+    for message in message_log:
+        stripped_messages.append(
+            {
+                "role": message["role"],
+                "content": message.get("content", ""),
+            }
+        )
+        generated_assistant_flags.append(
+            message.get("role") == "assistant" and "generation_logprobs" in message
+        )
+
+    if role == "system" and stripped_messages and stripped_messages[0]["role"] == "system":
+        stripped_messages[0] = {
+            **stripped_messages[0],
+            "content": f"{stripped_messages[0].get('content', '')}\n\n{pi_content}",
+        }
+        teacher_messages = stripped_messages
+        teacher_flags = generated_assistant_flags
+    else:
+        teacher_messages = [{"role": role, "content": pi_content}] + stripped_messages
+        teacher_flags = [False] + generated_assistant_flags
+
+    if tokenizer is None:
+        return teacher_messages
+
+    from nemo_rl.data.interfaces import TaskDataSpec
+    from nemo_rl.data.llm_message_utils import get_formatted_message_log
+
+    tokenized_messages = get_formatted_message_log(
+        teacher_messages,
+        tokenizer,
+        TaskDataSpec(),
+        add_bos_token=True,
+        add_eos_token=True,
+        add_generation_prompt=False,
+    )
+    for message, should_train in zip(tokenized_messages, teacher_flags):
+        if should_train:
+            message["generation_logprobs"] = torch.zeros_like(
+                message["token_ids"],
+                dtype=torch.float32,
+            )
+    return tokenized_messages
+
+
+def _generated_assistant_spans(
+    message_log: list[dict[str, Any]],
+) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    offset = 0
+    for message in message_log:
+        token_ids = message.get("token_ids")
+        if token_ids is None:
+            length = 0
+        elif hasattr(token_ids, "numel"):
+            length = int(token_ids.numel())
+        else:
+            length = len(token_ids)
+
+        if message.get("role") == "assistant" and "generation_logprobs" in message:
+            spans.append((offset, offset + length))
+        offset += length
+    return spans
+
+
+def align_pi_teacher_logprobs_to_student(
+    student_message_logs: list[list[dict[str, Any]]],
+    teacher_message_logs: list[list[dict[str, Any]]],
+    teacher_logprobs: "torch.Tensor",
+    student_shape: tuple[int, int],
+    strict: bool = True,
+) -> "torch.Tensor":
+    import torch
+
+    batch_size, seq_len = student_shape
+    if len(student_message_logs) != batch_size:
+        raise ValueError(
+            "PI teacher alignment got a student log count that does not match "
+            f"student_shape, got logs={len(student_message_logs)} shape={batch_size}"
+        )
+    if len(teacher_message_logs) != batch_size:
+        raise ValueError(
+            "PI teacher alignment got a teacher log count that does not match "
+            f"student_shape, got logs={len(teacher_message_logs)} shape={batch_size}"
+        )
+    if int(teacher_logprobs.shape[0]) != batch_size:
+        raise ValueError(
+            "PI teacher alignment got a teacher logprob batch that does not "
+            f"match student_shape, got logprobs={teacher_logprobs.shape[0]} "
+            f"shape={batch_size}"
+        )
+    aligned = torch.zeros(
+        batch_size,
+        seq_len,
+        dtype=teacher_logprobs.dtype,
+        device=teacher_logprobs.device,
+    )
+    for sample_idx, (student_log, teacher_log) in enumerate(
+        zip(student_message_logs, teacher_message_logs)
+    ):
+        student_spans = _generated_assistant_spans(student_log)
+        teacher_spans = _generated_assistant_spans(teacher_log)
+        if len(student_spans) != len(teacher_spans):
+            raise ValueError(
+                "PI teacher alignment expected the same number of generated "
+                f"assistant turns, got student={len(student_spans)} "
+                f"teacher={len(teacher_spans)}"
+            )
+        for student_span, teacher_span in zip(student_spans, teacher_spans):
+            student_start, student_end = student_span
+            teacher_start, teacher_end = teacher_span
+            student_len = student_end - student_start
+            teacher_len = teacher_end - teacher_start
+            if student_len != teacher_len:
+                if strict:
+                    raise ValueError(
+                        "PI teacher alignment expected matching assistant token "
+                        f"counts, got student={student_len} teacher={teacher_len}"
+                    )
+                copy_len = min(student_len, teacher_len)
+                student_end = student_start + copy_len
+                teacher_end = teacher_start + copy_len
+            aligned[sample_idx, student_start:student_end] = teacher_logprobs[
+                sample_idx,
+                teacher_start:teacher_end,
+            ]
+    return aligned
 
 
 @ray.remote  # pragma: no cover
@@ -1325,20 +1514,65 @@ class AsyncTrajectoryCollector:
             rollout_metrics: dict[str, Any],
             prompt_group_task_index: Optional[int],
         ) -> None:
+            from nemo_rl.algorithms.opd import get_pi_mode
+
+            pi_mode = get_pi_mode(self.on_policy_distillation_cfg)
             # Compute teacher logprobs at collection time (overlapped with async rollouts)
-            if self._has_non_colocated_teachers and "agent_ref" in final_batch_cpu:
+            if (
+                self._has_non_colocated_teachers
+                and pi_mode != "pi_distill"
+                and "agent_ref" in final_batch_cpu
+            ):
                 agent_refs = final_batch_cpu["agent_ref"]
                 if isinstance(agent_refs, list):
                     from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 
+                    student_message_logs = final_batch_cpu["message_log"]
+                    student_flat_for_teacher, _ = batched_message_log_to_flat_message(
+                        student_message_logs,
+                        pad_value_dict={"token_ids": self.tokenizer.pad_token_id},
+                    )
+                    pi_cfg = dict(
+                        self.on_policy_distillation_cfg.get(
+                            "privileged_information", {}
+                        )
+                    )
+                    teacher_message_logs = student_message_logs
+                    if pi_mode is not None:
+                        pi_values = get_pi_values_for_batch(
+                            final_batch_cpu,
+                            pi_cfg,
+                            len(student_message_logs),
+                        )
+                        teacher_message_logs = [
+                            build_pi_teacher_message_log(
+                                message_log,
+                                privileged_information,
+                                pi_cfg,
+                                tokenizer=self.tokenizer,
+                            )
+                            for message_log, privileged_information in zip(
+                                student_message_logs,
+                                pi_values,
+                            )
+                        ]
+
                     flat_for_teacher, teacher_input_lengths = batched_message_log_to_flat_message(
-                        final_batch_cpu["message_log"],
+                        teacher_message_logs,
                         pad_value_dict={"token_ids": self.tokenizer.pad_token_id},
                     )
                     teacher_logprobs, teacher_logprob_time = await self._compute_teacher_logprobs(
                         flat_for_teacher["token_ids"], agent_refs,
                         input_lengths=teacher_input_lengths,
                     )
+                    if pi_mode is not None:
+                        teacher_logprobs = align_pi_teacher_logprobs_to_student(
+                            student_message_logs,
+                            teacher_message_logs,
+                            teacher_logprobs,
+                            tuple(student_flat_for_teacher["token_ids"].shape),
+                            strict=bool(pi_cfg.get("strict_alignment", True)),
+                        )
                     # Store inside batch dict so from_batches handles
                     # variable-length padding across prompt groups
                     final_batch_cpu["teacher_reference_logprobs"] = teacher_logprobs

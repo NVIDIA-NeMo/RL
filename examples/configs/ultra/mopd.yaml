@@ -755,6 +755,17 @@ on_policy_distillation:
   enabled: true
   use_orm_advantage: false
   orm_advantage_weight: 0.0
+  privileged_information:
+    enabled: false
+    mode: opsd
+    beta: 1.0
+    alpha: 0.5
+    task_reward_weight: 1.0
+    batch_key: privileged_information
+    role: system
+    template: "Privileged information for the teacher only:\n{privileged_information}"
+    allow_missing: false
+    strict_alignment: true
   teacher_model_by_agent_name:
     # Reasoning / math / mcqa / equivalence / lc-judge / ns-tools / code
     math_with_judge_simple_agent:            ${_teachers.reasoning}

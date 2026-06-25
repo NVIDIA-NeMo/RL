@@ -75,6 +75,7 @@ class ClippedPGLossDataDict(TypedDict):
     input_ids: torch.Tensor
     advantages: torch.Tensor
     prev_logprobs: torch.Tensor
+    behavior_logprobs: NotRequired[torch.Tensor]
     generation_logprobs: torch.Tensor
     reference_policy_logprobs: torch.Tensor
     token_mask: torch.Tensor
@@ -212,8 +213,15 @@ class ClippedPGLossFn(LossFunction):
         token_mask = data["token_mask"][:, 1:]
         sample_mask = data["sample_mask"]
         advantages = data["advantages"][:, 1:]
+        has_behavior_logprobs = "behavior_logprobs" in data
+        use_forced_on_policy_ratio = self.force_on_policy_ratio and not has_behavior_logprobs
         # Skip loading prev_logprobs when force_on_policy_ratio=True (will use curr_logprobs instead)
-        prev_logprobs = None if self.force_on_policy_ratio else data["prev_logprobs"][:, 1:]
+        if has_behavior_logprobs:
+            prev_logprobs = data["behavior_logprobs"][:, 1:]
+        elif use_forced_on_policy_ratio:
+            prev_logprobs = None
+        else:
+            prev_logprobs = data["prev_logprobs"][:, 1:]
         generation_logprobs = data["generation_logprobs"][:, 1:]
         if self.reference_policy_kl_penalty != 0:
             reference_policy_logprobs = data["reference_policy_logprobs"][:, 1:]
@@ -259,7 +267,7 @@ class ClippedPGLossFn(LossFunction):
 
         # For truly on-policy training, use curr_logprobs as prev_logprobs
         # This avoids computing prev_logprobs upstream
-        if self.force_on_policy_ratio:
+        if use_forced_on_policy_ratio:
             prev_logprobs = curr_logprobs.detach()
 
         # token_mult_prob_error
@@ -363,7 +371,7 @@ class ClippedPGLossFn(LossFunction):
             kl = torch.tensor(0.0)
 
         # Calculate clipped loss function if ppo ratio is enabled.
-        if self.force_on_policy_ratio:
+        if use_forced_on_policy_ratio:
             # Force ratio to 1.0 for truly on-policy behavior
             # Use curr_logprobs twice so ratio=1 but gradients still flow
             log_ratios = curr_logprobs - curr_logprobs.detach()
