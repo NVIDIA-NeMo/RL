@@ -484,6 +484,7 @@ def cast_tensor_to_fp8_blockwise(
     # Convert to target format, but still in original precision container
     return fp_data, descale_fp
 
+
 def _quantize_grouped_experts_blockwise(grouped_moe_expert):
     """Block-FP8 quantize a grouped MoE expert slab expert-by-expert.
 
@@ -563,6 +564,7 @@ def _expand_grouped_moe_expert_to_fp8(key, weight):
             entries.append((name, weight_fp8[expert_id]))
             entries.append((name + "_scale_inv", scale_inv[expert_id]))
     return entries
+
 
 # Ref: https://github.com/vllm-project/vllm/blob/275de34170654274616082721348b7edd9741d32/vllm/model_executor/layers/quantization/utils/fp8_utils.py#L1175
 # Patches this method to not create new torch.nn.Parameter for layer weights

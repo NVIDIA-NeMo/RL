@@ -14,7 +14,10 @@ policy:
   megatron_cfg:
     moe_router_dtype: fp32
     mtp_num_layers: 0
-    freeze_vision_tower: true
+    freeze_config:
+      freeze_vision_model: true
+      freeze_vision_projection: true
+      freeze_language_model: false
     fp8_cfg:
       enabled: true
       fp8: "e4m3"
