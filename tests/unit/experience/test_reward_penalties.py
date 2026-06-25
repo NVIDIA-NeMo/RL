@@ -22,7 +22,6 @@ from nemo_rl.experience.rollouts import (
     resolve_reward_penalty_config,
 )
 
-
 # ---- Helpers to build minimal result dicts ----
 
 
@@ -309,7 +308,8 @@ class TestPenalizeEosToken:
         counts = apply_reward_penalties([result], self.CFG)
         assert result["full_result"]["reward"] == 1.0
 
-    def test_terminal_eos_not_penalized(self):
+    def test_terminal_eos_penalized(self):
+        # A trailing EOS is penalized too — the whole sequence is checked.
         result = _make_result(
             reward=1.0,
             message_log=[
@@ -318,8 +318,8 @@ class TestPenalizeEosToken:
             ],
         )
         counts = apply_reward_penalties([result], self.CFG)
-        assert result["full_result"]["reward"] == 1.0
-        assert counts["eos_token"] == 0
+        assert result["full_result"]["reward"] == 0.0
+        assert counts["eos_token"] == 1
 
     def test_eos_in_user_not_penalized(self):
         result = _make_result(
@@ -344,7 +344,8 @@ class TestPenalizeEosToken:
         counts = apply_reward_penalties([result], cfg)
         assert result["full_result"]["reward"] == 0.0
 
-    def test_multi_turn_terminal_eos_not_penalized(self):
+    def test_multi_turn_terminal_eos_penalized(self):
+        # Trailing EOS in any assistant turn is penalized.
         result = _make_result(
             reward=1.0,
             message_log=[
@@ -355,15 +356,15 @@ class TestPenalizeEosToken:
             ],
         )
         counts = apply_reward_penalties([result], self.CFG)
-        assert result["full_result"]["reward"] == 1.0
-        assert counts["eos_token"] == 0
+        assert result["full_result"]["reward"] == 0.0
+        assert counts["eos_token"] == 1
 
     def test_multi_turn_internal_eos_penalized(self):
         result = _make_result(
             reward=1.0,
             message_log=[
                 _msg("user", [100]),
-                _msg("assistant", [300, 2]),
+                _msg("assistant", [300, 400]),
                 _msg("user", [500]),
                 _msg("assistant", [600, 2, 700]),
             ],
