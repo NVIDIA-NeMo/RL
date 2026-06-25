@@ -50,6 +50,21 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     # over_sampling=False.
     force_in_order: bool = False
 
+    # ── AReaL decoupled-PPO ────────────────────────────────────────────────
+    # == AReaL `ppo_n_minibatches`: split the full batch into this many
+    # minibatches; ONE optimizer step per minibatch (gsm8k recipe uses 1,
+    # boba 4). Split is deterministic / in-order, like AReaL — no shuffle
+    # (single pass, each sample used once). num_minibatches=1 reproduces
+    # today's "one optimizer step per training step".
+    num_minibatches: int = 1
+    # ── refit / interruptible generation (idea borrowed from the legacy
+    #    trajectory_collector prepare/resume_after_refit; implemented natively) ──
+    # AReaL-style: after the weight swap, call
+    # invalidate_kv_cache(reset_running_requests=True) so vLLM preempts
+    # in-flight requests and reprefills them under the new weights;
+    # False keeps stale KV (Magistral-style, cheaper).
+    refit_invalidate_kv_cache: bool = True
+
 
 class MasterConfig(BaseModel, extra="allow"):
     policy: PolicyConfig
