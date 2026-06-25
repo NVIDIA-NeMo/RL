@@ -52,8 +52,7 @@ def _load_vllm_backend_with_fake_vllm(monkeypatch, process_weights_after_loading
 
     module_name = f"_test_vllm_backend_{id(process_weights_after_loading)}"
     module_path = (
-        Path(__file__).parents[4]
-        / "nemo_rl/models/generation/vllm/vllm_backend.py"
+        Path(__file__).parents[4] / "nemo_rl/models/generation/vllm/vllm_backend.py"
     )
     spec = importlib.util.spec_from_file_location(module_name, module_path)
     assert spec is not None
