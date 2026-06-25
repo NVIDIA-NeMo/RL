@@ -207,10 +207,13 @@ def attach_routed_experts_to_chat_response_choices(
         getattr(final_request_output, "prompt_token_ids", []) or []
     )
 
-    for choice in getattr(response, "choices", []):
+    choices = list(getattr(response, "choices", []))
+    attached_choice_indices = set()
+    for choice in choices:
         generation_details = outputs_by_index.get(choice.index)
         if generation_details is None:
             continue
+        attached_choice_indices.add(choice.index)
 
         generation_token_count = len(getattr(generation_details, "token_ids", []) or [])
         routed_result = pad_and_align_routed_expert_indices(
@@ -248,7 +251,34 @@ def attach_routed_experts_to_chat_response_choices(
             )
         choice.message.routed_experts = routed_experts.to(dtype=torch.int32).tolist()
 
+    if len(attached_choice_indices) != len(choices):
+        missing_choice_indices = sorted(
+            choice.index
+            for choice in choices
+            if choice.index not in attached_choice_indices
+        )
+        raise RuntimeError(
+            "vLLM was asked to return routed experts for the "
+            "OpenAI-compatible chat endpoint but response choices could not be "
+            "matched to generation outputs: "
+            f"missing_choice_indices={missing_choice_indices}."
+        )
+
     return response
+
+
+def model_dump_chat_response_with_routed_experts(response: Any) -> dict[str, Any]:
+    """Dump a vLLM OpenAI chat response while preserving dynamic R3 fields."""
+    response_dict = response.model_dump()
+    for choice, choice_dict in zip(
+        getattr(response, "choices", []), response_dict.get("choices", [])
+    ):
+        routed_experts = getattr(
+            getattr(choice, "message", None), "routed_experts", None
+        )
+        if routed_experts is not None:
+            choice_dict.setdefault("message", {})["routed_experts"] = routed_experts
+    return response_dict
 
 
 def aggregate_spec_decode_counters(

@@ -25,6 +25,7 @@ from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     compute_spec_decode_metrics,
     format_prompt_for_vllm_generation,
+    model_dump_chat_response_with_routed_experts,
     pad_and_align_routed_expert_indices,
 )
 
@@ -360,6 +361,33 @@ def test_attach_routed_experts_to_chat_response_choices_requires_routed_experts(
             final_res,
             device=torch.device("cpu"),
         )
+
+
+def test_model_dump_chat_response_with_routed_experts_preserves_dynamic_field():
+    routed_experts = [[[1]], [[2]]]
+
+    class Response:
+        choices = [
+            SimpleNamespace(
+                message=SimpleNamespace(routed_experts=routed_experts),
+            )
+        ]
+
+        def model_dump(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "hello",
+                        }
+                    }
+                ]
+            }
+
+    response_dict = model_dump_chat_response_with_routed_experts(Response())
+
+    assert response_dict["choices"][0]["message"]["routed_experts"] == routed_experts
 
 
 @pytest.mark.vllm
