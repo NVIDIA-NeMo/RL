@@ -1263,8 +1263,12 @@ class TestValidateTrainingConfig:
         assert model_cfg.calculate_per_token_loss is True
         assert model_cfg.perform_initialization is True
 
-    def test_moe_aux_loss_not_supported(self):
-        """Test that MoE aux loss is not supported."""
+    def test_moe_aux_loss_now_supported(self):
+        """Test that MoE aux loss with a non-zero coefficient is now allowed.
+
+        Aux-loss gradient normalization is handled via moe_grad_scale_func in
+        megatron_policy_worker.py, so the previous blocking assertion was removed.
+        """
         from nemo_rl.models.megatron.setup import _validate_training_config
 
         model_cfg = MagicMock()
@@ -1276,10 +1280,11 @@ class TestValidateTrainingConfig:
             },
         }
 
-        with pytest.raises(AssertionError) as exc_info:
-            _validate_training_config(config, model_cfg)
+        # Should not raise now that aux loss is supported.
+        _validate_training_config(config, model_cfg)
 
-        assert "MoE aux loss is currently not supported" in str(exc_info.value)
+        assert model_cfg.calculate_per_token_loss is True
+        assert model_cfg.perform_initialization is True
 
     def test_moe_aux_loss_with_zero_coeff_is_ok(self):
         """Test that MoE aux loss with zero coefficient is allowed."""
