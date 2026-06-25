@@ -23,12 +23,14 @@ Data flow:
                      → TQReplayBuffer.reserve claims a slot at dispatch time;
                        run_rollout runs; TQReplayBuffer.commit tensorizes the
                        record, writes N training rows to TQ, and marks ready.
-  _train_pump    → sampler.evict → buffer.remove (stale groups, with DP clear).
-                 → sampler.select → drops chosen groups from buffer, returns
-                   KVBatchMeta of K groups (or None); meta is already trainable.
-                 → _advantage_pump (get → compute → put).
-                 → trainer.train_on_meta.
-                 → dp_client.clear_samples (trained groups; buffer already dropped).
+  _train_pump    → PHASE 1 (once): _collect_full_batch (evict/select barrier);
+                     freeze π_prox via get_logprobs_from_meta over the whole batch;
+                     _advantage_pump (get → compute → put).
+                 → PHASE 2 (single pass): per minibatch from _iter_minibatches,
+                     begin_train_step → train_microbatch_from_meta →
+                     finish_train_step (one optimizer.step each).
+                 → PUBLISH (once): dp_client.clear_samples; bump trainer_version;
+                     WeightSynchronizer.sync_weights via _sync_weights.
   _sync_weights  → drain _inflight_rollouts → WeightSynchronizer.sync_weights.
 """
 
@@ -127,18 +129,34 @@ class SingleControllerArealActor:
         self._train_cluster = bundle.train_cluster
         self._inference_cluster = bundle.inference_cluster
 
-        if self._async_cfg.target_prompt_groups_per_step is None:
-            self._async_cfg.target_prompt_groups_per_step = (
-                self._async_cfg.min_prompt_groups_per_batch
-            )
-        if (
-            self._async_cfg.target_prompt_groups_per_step
-            < self._async_cfg.min_prompt_groups_per_batch
-        ):
+        # AReaL batch sizing. Each RL step consumes the FULL batch of
+        # num_prompts_per_step prompt groups = rl_step_samples sequences
+        # (rl_step_samples = num_prompts_per_step * num_generations_per_prompt),
+        # split into minibatches of train_global_batch_size, ONE optimizer.step
+        # each (num_minibatches = rl_step_samples // train_global_batch_size).
+        # AReaL collects exactly num_prompts_per_step groups per step; the streaming
+        # knobs target_prompt_groups_per_step / min_prompt_groups_per_batch are NOT
+        # used on this path.
+        self._num_prompt_groups_per_step: int = self._master_config.grpo[
+            "num_prompts_per_step"
+        ]
+        rl_step_samples = (
+            self._num_prompt_groups_per_step
+            * self._master_config.grpo["num_generations_per_prompt"]
+        )
+        train_gbs = self._master_config.policy["train_global_batch_size"]
+        if train_gbs <= 0 or rl_step_samples % train_gbs != 0:
             raise ValueError(
-                f"target_prompt_groups_per_step ({self._async_cfg.target_prompt_groups_per_step}) "
-                f"must be >= min_prompt_groups_per_batch ({self._async_cfg.min_prompt_groups_per_batch})"
+                f"num_prompts_per_step * num_generations_per_prompt "
+                f"({rl_step_samples}) must be a positive multiple of "
+                f"policy.train_global_batch_size ({train_gbs}): each RL step's batch "
+                f"is split into rl_step_samples // train_global_batch_size minibatches "
+                f"of train_global_batch_size, one optimizer.step each."
             )
+        self._train_minibatch_size: int = train_gbs
+        # num_minibatches is DERIVED (not a config knob): how many
+        # train_global_batch_size optimizer steps tile one RL-step batch.
+        self._num_minibatches: int = rl_step_samples // train_gbs
 
         if self._async_cfg.batch_selection_strategy == "strict_on_policy":
             self._async_cfg.max_weight_staleness_versions = 0
@@ -152,25 +170,24 @@ class SingleControllerArealActor:
         # staleness window (η) + the decoupled-PPO π_prox/π_behav reweighting, NOT
         # by over-producing and discarding stragglers that age out (an orthogonal
         # async strategy AReaL avoids). Validate + derive the buffer size from η.
-        self._validate_buffer_config(self._async_cfg)
+        self._validate_buffer_config(
+            self._async_cfg, self._num_prompt_groups_per_step
+        )
         # force_in_order needs over_sampling=False, which _validate_buffer_config
         # now guarantees for the AReaL path, so no separate check is needed.
 
-        # SC split path does one optimizer.step per RL step.
-        # TODO: support multi-mini-step (legacy train() does gbs-sized
-        # mini-steps with shared prev_logprobs).
-        rl_step_samples = (
-            self._master_config.grpo["num_prompts_per_step"]
-            * self._master_config.grpo["num_generations_per_prompt"]
+        # Each minibatch is one train_global_batch_size, DP-sharded independently by
+        # train_microbatch_from_meta -> shard_by_batch_size, which requires
+        # minibatch.size % dp_world == 0. Read the REAL data-parallel size from the
+        # driver-side trainer's existing sharding annotations (no new trainer API).
+        self._dp_world: int = self._trainer.sharding_annotations.get_axis_size(
+            "data_parallel"
         )
-        train_gbs = self._master_config.policy["train_global_batch_size"]
-        if rl_step_samples != train_gbs:
+        if self._dp_world <= 0 or train_gbs % self._dp_world != 0:
             raise ValueError(
-                f"num_prompts_per_step * num_generations_per_prompt "
-                f"({rl_step_samples}) must equal policy.train_global_batch_size "
-                f"({train_gbs}) so that one RL step maps to exactly one "
-                f"optimizer.step. Multi-mini-step inside a single RL step is "
-                f"not supported on the SC split path."
+                f"train_global_batch_size ({train_gbs}) must be a multiple of the "
+                f"data_parallel size ({self._dp_world}); each minibatch is DP-sharded "
+                f"and shard_by_batch_size requires minibatch.size % dp_world == 0."
             )
 
         self._sampler = StalenessSampler(
@@ -223,7 +240,7 @@ class SingleControllerArealActor:
             f"buffer={self._async_cfg.max_buffered_rollouts} "
             f"inflight={self._async_cfg.max_inflight_prompts} "
             f"over_sampling={self._async_cfg.over_sampling} "
-            f"num_minibatches={self._async_cfg.num_minibatches} "
+            f"num_minibatches={self._num_minibatches} "
             f"refit_invalidate_kv_cache={self._async_cfg.refit_invalidate_kv_cache} "
             f"transport={self._weight_sync_cfg.transport}",
             flush=True,
@@ -287,6 +304,8 @@ class SingleControllerArealActor:
         if asyncio.iscoroutine(result):
             return await result
         return result
+
+    # ── the three pumps + advantage helper ────────────────────────────────
 
     async def _rollout_pump(self) -> None:
         """Continuously dispatch rollout tasks until cancellation.
@@ -371,141 +390,145 @@ class SingleControllerArealActor:
         print(f"rollout_pump: completed {epoch} epoch(s)", flush=True)
 
     async def _train_pump(self) -> None:
-        """Drain stale groups, sample, train, drop.
+        """AReaL decoupled-PPO two-phase loop. One pass, each sample used once.
 
         Per step:
-          1. sampler.evict drops stale groups from the buffer and clears their TQ rows.
-          2. sampler.select returns K prompt groups (or None) and drops them from the
-             buffer; DP rows survive so the trainer can read them. Already trainable —
-             buffer wrote training-shaped rows at rollout time.
-          3. _advantage_pump(train_meta).
-          4. trainer.train_microbatch_from_meta + finish_train_step.
-          5. dp_client.clear_samples on consumed sample_ids; release _buffer_capacity
-             per dropped group, then sync.
+          PHASE 1 — full-batch barrier (ONCE):
+            1. ``_collect_full_batch`` accumulates+merges whole prompt groups until
+               the target batch is in hand (or returns None on rollout exhaustion).
+            2. Freeze π_prox over the WHOLE batch: ``prepare_for_lp_inference`` then
+               ``get_logprobs_from_meta`` writes ``prev_logprobs``. Nothing rewrites
+               that field until the next step, so the snapshot stays frozen across
+               every minibatch — this is the decoupled loss's trust-region center.
+            3. GRPO advantages over the full batch via ``_advantage_pump``.
+          PHASE 2 — per-MINIBATCH optimizer steps (single pass):
+            4. For each ``_iter_minibatches`` slice, one ``begin_train_step →
+               train_microbatch_from_meta → finish_train_step`` cycle = one
+               ``optimizer.step``. M minibatches ⇒ exactly M optimizer steps; at
+               ``num_minibatches=1`` that is one step over the whole batch.
+          PUBLISH — ONCE per step, AFTER the minibatch loop:
+            5. ``clear_samples`` frees the DP rows; reduce the M finish results via
+               the EXISTING ``aggregate_step_metrics``; bump ``_trainer_version`` +
+               ``_train_steps``; ``_sync_weights``.
 
-        P0 note: this is a verbatim fork of the base controller loop with the
-        AReaL ``step_results`` scaffolding added — each ``finish_train_step``
-        result is collected into ``step_results`` and reduced through the EXISTING
-        ``aggregate_step_metrics`` helper. At ``num_minibatches=1`` there is a
-        single optimizer step per training step, so ``step_results`` holds exactly
-        one result and the reduced metrics are byte-for-byte identical to the base
-        controller (no behavior change at defaults). P2 replaces this single-step
-        body with the two-phase Phase-1 barrier + per-minibatch Phase-2 loop that
-        appends one result per minibatch to the SAME ``step_results`` list.
+        π_prox = ``prev_logprobs`` (reuse ``get_logprobs_from_meta``), π_behav =
+        ``generation_logprobs``, π_θ = the fresh forward inside ``train_microbatch``.
+        The Phase-1 freeze runs UNCONDITIONALLY (not gated on
+        ``adv_cfg.policy_logprobs_field``) because the decoupled loss always needs
+        π_prox present for the full batch (§3).
         """
         adv_cfg = self._advantage_cfg
         grpo_cfg = self._master_config.grpo
 
-        # TODO: fix the compute_prev_logprobs and compute_reference_logprobs logic
-        compute_prev_logprobs = adv_cfg.policy_logprobs_field is not None
+        # Reference logprobs stay optional/gated; π_prox (prev_logprobs) is always
+        # frozen in Phase 1 below regardless of the advantage config.
         compute_reference_logprobs = adv_cfg.reference_logprobs_field is not None
 
         while self._train_steps < grpo_cfg["max_num_steps"]:
             step_id = f"sc-step-{self._train_steps:06d}"
-            # __init__ coerces None → min_prompt_groups_per_batch (int);
-            # the assert narrows the Optional[int] type for pyrefly.
-            assert self._async_cfg.target_prompt_groups_per_step is not None
-            target_groups: int = self._async_cfg.target_prompt_groups_per_step
-            groups_dispatched = 0
-            step_open = False
-            # AReaL scaffolding: one finish_train_step result per optimizer step.
-            # P0 (num_minibatches=1) appends exactly one; P2's minibatch loop
-            # appends one per minibatch. Reduced via the existing helper below.
+            # AReaL scaffolding: one finish_train_step result per optimizer step,
+            # i.e. one per minibatch. Reduced via the existing helper at step end.
             step_results: list[dict[str, Any]] = []
 
             with self._timer.time("total_step_time"):
-                while groups_dispatched < target_groups:
-                    await asyncio.sleep(0)
-
-                    # evict stale groups
-                    evicted = await self._sampler.evict(
-                        current_train_weight=self._trainer_version,
-                    )
-                    if evicted:
-                        print(f"  evicted {evicted} stale prompt group(s)", flush=True)
-                        for _ in range(evicted):
-                            self._buffer_capacity.release()
-
-                    # TODO @yukih: wait train pump merged, now always return min_prompt_groups_per_batch
-                    # need to add a max_prompt_groups_per_batch
-                    with self._timer.time("exposed_generation"):
-                        train_meta, num_groups = await self._sampler.select(
-                            current_train_weight=self._trainer_version,
-                            min_prompt_groups=self._async_cfg.min_prompt_groups_per_batch,
-                        )
-
-                    if train_meta is None:
-                        await asyncio.sleep(0.05)
-                        continue
-
-                    for _ in range(num_groups):
-                        self._buffer_capacity.release()
-
-                    # Compute prev_logprobs / ref_logprobs
-                    with self._timer.time("logprob_inference_prep"):
-                        await asyncio.to_thread(self._trainer.prepare_for_lp_inference)
-                    with self._timer.time("policy_and_reference_logprobs"):
-                        if compute_prev_logprobs:
-                            await asyncio.to_thread(
-                                self._trainer.get_logprobs_from_meta, train_meta
-                            )
-                        if compute_reference_logprobs:
-                            await asyncio.to_thread(
-                                self._trainer.get_reference_policy_logprobs_from_meta,
-                                train_meta,
-                            )
-
-                    with self._timer.time("advantage_calculation"):
-                        train_meta = await self._advantage_pump(train_meta)
-
-                    # Train
-                    with self._timer.time("training_prep"):
-                        await asyncio.to_thread(self._trainer.prepare_for_training)
-                    with self._timer.time("policy_training"):
-                        if not step_open:
-                            await asyncio.to_thread(
-                                self._trainer.begin_train_step,
-                                step_id,
-                                loss_fn=self._loss_fn,
-                            )
-                            step_open = True
-                        await asyncio.to_thread(
-                            self._trainer.train_microbatch_from_meta,
-                            step_id,
-                            train_meta,
-                        )
-
-                    groups_dispatched += num_groups
-                    self._step_consumed_sample_ids.extend(train_meta.sample_ids)
-                    if train_meta.sequence_lengths:
-                        self._step_log_dict["sequence_lengths"].extend(
-                            int(s) for s in train_meta.sequence_lengths
-                        )
-
-                if not step_open:
+                # ══════════ PHASE 1 — accumulate full batch, freeze π_prox ════════
+                with self._timer.time("exposed_generation"):
+                    batch_meta = await self._collect_full_batch()
+                if batch_meta is None:
                     print(
                         "train_pump: rollout exhausted before any group ready",
                         flush=True,
                     )
                     break
 
-                with self._timer.time("policy_training"):
-                    result = await asyncio.to_thread(
-                        self._trainer.finish_train_step, step_id
+                # π_prox ← current θ: ONE no-grad forward over the WHOLE batch,
+                # writing prev_logprobs (frozen for the entire step). Runs
+                # unconditionally — the decoupled loss requires it.
+                with self._timer.time("logprob_inference_prep"):
+                    await asyncio.to_thread(self._trainer.prepare_for_lp_inference)
+                with self._timer.time("policy_and_reference_logprobs"):
+                    await asyncio.to_thread(
+                        self._trainer.get_logprobs_from_meta, batch_meta
                     )
-                step_results.append(result)
-                consumed_ids = list(self._step_consumed_sample_ids)
-                self._step_consumed_sample_ids = []
+                    if compute_reference_logprobs:
+                        await asyncio.to_thread(
+                            self._trainer.get_reference_policy_logprobs_from_meta,
+                            batch_meta,
+                        )
+
+                # GRPO group-normalized advantages over the full batch.
+                with self._timer.time("advantage_calculation"):
+                    batch_meta = await self._advantage_pump(batch_meta)
+
+                if batch_meta.sequence_lengths:
+                    self._step_log_dict["sequence_lengths"].extend(
+                        int(s) for s in batch_meta.sequence_lengths
+                    )
+
+                # Drop a tail remainder if the collected batch is not a whole
+                # number of train_global_batch_size minibatches (the target%min
+                # over-claim edge; the common case is already exact). Advantages
+                # above were computed over the full batch, so dropped rows just get
+                # no optimizer step; clear_samples below still frees them
+                # (consumed_ids uses the full batch_meta.sample_ids).
+                train_meta, dropped = self._dp_align_batch(
+                    batch_meta, self._train_minibatch_size
+                )
+                if dropped:
+                    print(
+                        f"train_pump: dropped {dropped} tail sample(s) so the batch "
+                        f"is a whole number of {self._train_minibatch_size}-sample "
+                        f"minibatches",
+                        flush=True,
+                    )
+
+                # ══════════ PHASE 2 — per-MINIBATCH optimizer steps (single pass) ══
+                with self._timer.time("training_prep"):
+                    await asyncio.to_thread(self._trainer.prepare_for_training)
+                with self._timer.time("policy_training"):
+                    for j, minibatch_meta in enumerate(
+                        self._iter_minibatches(train_meta)
+                    ):
+                        ep = f"{step_id}-mb{j:03d}"  # ONE optimizer step
+                        # gbs == minibatch size == train_global_batch_size, so
+                        # finish_train_step's scheduler.step(increment=gbs) advances
+                        # the sample-based LR schedule by one train_global_batch_size
+                        # per optimizer step — num_minibatches ticks per RL step.
+                        # At num_minibatches==1 this matches the base controller.
+                        await asyncio.to_thread(
+                            self._trainer.begin_train_step,
+                            ep,
+                            loss_fn=self._loss_fn,
+                            gbs=minibatch_meta.size,
+                        )
+                        try:
+                            await asyncio.to_thread(
+                                self._trainer.train_microbatch_from_meta,
+                                ep,
+                                minibatch_meta,
+                            )
+                            result = await asyncio.to_thread(
+                                self._trainer.finish_train_step, ep
+                            )
+                        except Exception:
+                            await asyncio.to_thread(
+                                self._trainer.abort_train_step, ep
+                            )
+                            raise
+                        step_results.append(result)
+
+                # ══════════ publish (ONCE per training step, after the loop) ═══════
+                consumed_ids = list(batch_meta.sample_ids)
                 await self._call_dp(
                     "clear_samples",
-                    sample_ids=list(consumed_ids),
+                    sample_ids=consumed_ids,
                     partition_id=self._partition_id,
                 )
 
-                # Reduce the per-optimizer-step finish results through the EXISTING
-                # metrics path (no new helper). At num_minibatches=1 step_results
-                # holds one result, so aggregate_step_metrics(step_results[-1])
-                # reproduces the base controller exactly. P2 reduces all M results.
+                # Reduce the per-minibatch finish results through the EXISTING
+                # metrics path (no new helper). The last minibatch's metrics carry
+                # the step-level scalars (lr/wd after the final scheduler.step,
+                # global valid seqs/toks); aggregate_step_metrics flattens them.
                 step_metrics = aggregate_step_metrics(step_results[-1])
                 step_metrics.update(
                     reduce_advantage_pump_metrics(**self._step_log_dict)
@@ -555,12 +578,16 @@ class SingleControllerArealActor:
 
             # min sample version refers to the version each consumed sample was
             # generated with; lag = current trainer version - oldest sample version.
-            min_sample_version = min(t["weight_version"] for t in train_meta.tags)  # type: ignore
-            lag = self._trainer_version - min_sample_version
+            staleness = "n/a"
+            if batch_meta.tags:
+                min_sample_version = min(
+                    t["weight_version"] for t in batch_meta.tags
+                )
+                staleness = self._trainer_version - min_sample_version
             print(
                 f"train step {self._train_steps}/{grpo_cfg['max_num_steps']}  "
                 f"trainer_v={self._trainer_version}  "
-                f"lag={lag}  "
+                f"staleness={staleness}  "
                 f"batch_size={len(consumed_ids)}",
                 flush=True,
             )
@@ -568,7 +595,9 @@ class SingleControllerArealActor:
     # ── AReaL helpers ──────────────────────────────────────────────────────
 
     @staticmethod
-    def _validate_buffer_config(async_cfg: AsyncRLConfig) -> None:
+    def _validate_buffer_config(
+        async_cfg: AsyncRLConfig, num_prompt_groups_per_step: int
+    ) -> None:
         """Require over_sampling=False and DERIVE the buffer size from the window.
 
         AReaL controls off-policyness through the staleness window (η) plus the
@@ -578,23 +607,22 @@ class SingleControllerArealActor:
         is scoped to ``over_sampling=False``.
 
         With ``over_sampling=False`` the buffer size is fully derivable: at most
-        one in-window batch per live weight version, i.e.
+        one full RL-step batch per live weight version, i.e.
 
-            max_buffered_rollouts = target_prompt_groups_per_step
+            max_buffered_rollouts = num_prompt_groups_per_step
                                     * (max_weight_staleness_versions + 1)
 
-        rather than a user knob to set and assert against. This method computes
-        that value and writes it back onto ``async_cfg.max_buffered_rollouts`` so
-        the ``_buffer_capacity`` semaphore and the startup banner both use the
-        derived (auditable) number. If the user also set a conflicting value, we
-        log a one-line note and use the derived value — we do NOT error.
-
-        ``target_prompt_groups_per_step`` must already be coerced from ``None``.
+        (``num_prompt_groups_per_step`` == grpo.num_prompts_per_step — the AReaL
+        path collects exactly that many groups per step and does NOT use the
+        streaming knobs target_prompt_groups_per_step / min_prompt_groups_per_batch).
+        This method computes the value and writes it back onto
+        ``async_cfg.max_buffered_rollouts`` so the ``_buffer_capacity`` semaphore
+        and the startup banner both use the derived (auditable) number. A
+        conflicting configured value is logged and ignored — we do NOT error.
 
         Raises:
             ValueError: if ``over_sampling`` is True (unsupported for AReaL).
         """
-        assert async_cfg.target_prompt_groups_per_step is not None
         if async_cfg.over_sampling:
             raise ValueError(
                 "AReaL controls off-policyness via the staleness window (η) + "
@@ -602,32 +630,50 @@ class SingleControllerArealActor:
                 "async_rl.over_sampling=false."
             )
 
-        derived_buffer = async_cfg.target_prompt_groups_per_step * (
+        derived_buffer = num_prompt_groups_per_step * (
             async_cfg.max_weight_staleness_versions + 1
         )
         if async_cfg.max_buffered_rollouts != derived_buffer:
             print(
                 f"AReaL: deriving max_buffered_rollouts={derived_buffer} "
-                f"(= target_prompt_groups_per_step * "
-                f"(max_weight_staleness_versions + 1)); ignoring the configured "
-                f"value {async_cfg.max_buffered_rollouts}.",
+                f"(= num_prompts_per_step * (max_weight_staleness_versions + 1)); "
+                f"ignoring the configured value {async_cfg.max_buffered_rollouts}.",
                 flush=True,
             )
         async_cfg.max_buffered_rollouts = derived_buffer
 
+    @staticmethod
+    def _dp_align_batch(
+        batch_meta: "KVBatchMeta", minibatch_size: int
+    ) -> "tuple[KVBatchMeta, int]":
+        """Trim a tail remainder so the batch is a whole number of minibatches.
+
+        The full batch is normally exactly ``rl_step_samples == k * minibatch_size``
+        (``minibatch_size == train_global_batch_size``), but the
+        ``target_prompt_groups_per_step % min_prompt_groups_per_batch`` over-claim
+        edge can leave a smaller tail; trim to the largest multiple of
+        ``minibatch_size``. Each kept minibatch is then exactly ``minibatch_size``,
+        which ``__init__`` already verified is a DP multiple. Returns
+        ``(meta_to_train, dropped)``; the dropped tail rows already had advantages
+        computed over the full batch (Phase 1) and are still freed by
+        ``clear_samples`` — they simply receive no optimizer update.
+        """
+        size = minibatch_size
+        usable = (batch_meta.size // size) * size if size > 0 else batch_meta.size
+        dropped = batch_meta.size - usable
+        if dropped <= 0 or usable <= 0:
+            return batch_meta, 0
+        return batch_meta.slice(0, usable), dropped
+
     async def _collect_full_batch(self) -> "KVBatchMeta | None":
         """Phase-1 barrier: drain the staleness sampler until the full batch is claimed.
 
-        Accumulates whole prompt groups until ``target_prompt_groups_per_step``
-        groups are in hand, then merges them into a single ``KVBatchMeta``. This
-        is the structural difference from the base controller's interleaved
+        Accumulates whole prompt groups until ``num_prompts_per_step`` groups are
+        in hand (the full RL-step batch), then merges them into one ``KVBatchMeta``.
+        This is the structural difference from the base controller's interleaved
         loop: the *whole* batch is gathered before any training so that π_prox
         (``get_logprobs_from_meta``) and the GRPO advantages can be defined over
-        a single, consistent batch (§3, §4).
-
-        ACCUMULATE + MERGE ONLY — this method performs no training, no logprob
-        inference, and no advantage computation. P2 wires the call site in
-        ``_train_pump`` and adds those phases around it.
+        a single, consistent batch.
 
         Each loop iteration yields to ``_rollout_pump`` (``asyncio.sleep(0)``) so
         generation of batches i+1..i+η keeps streaming in the background — that
@@ -637,10 +683,10 @@ class SingleControllerArealActor:
 
         Buffer-capacity slots are released as groups leave the buffer (per evicted
         group and per claimed group) so the rollout pump keeps producing during
-        Phase 2; the DataPlane rows stay alive until ``clear_samples`` at step end
-        (§7.4), so the frozen π_prox/advantages survive the whole minibatch loop.
+        Phase 2; the DataPlane rows stay alive until ``clear_samples`` at step end,
+        so the frozen π_prox/advantages survive the whole minibatch loop.
 
-        Exhaustion is tail-safe (§7.10): ``select`` returning ``None`` only ends
+        Exhaustion is tail-safe: ``select`` returning ``None`` only ends
         the loop when the dispatch loop is done (``_rollout_done``) AND nothing is
         still in flight (``_dispatched_rollouts`` empty) — otherwise the last
         in-flight rollouts would be dropped.
@@ -649,10 +695,10 @@ class SingleControllerArealActor:
             The merged full-batch ``KVBatchMeta`` (concat of all claimed groups),
             or ``None`` if rollout is exhausted with nothing left to train.
         """
-        # __init__ coerces None → min_prompt_groups_per_batch (int); the assert
-        # narrows the Optional[int] type for pyrefly.
-        assert self._async_cfg.target_prompt_groups_per_step is not None
-        target: int = self._async_cfg.target_prompt_groups_per_step
+        # AReaL collects exactly num_prompts_per_step groups (the full RL-step
+        # batch) before training; it does NOT use the streaming knobs
+        # target_prompt_groups_per_step / min_prompt_groups_per_batch.
+        target: int = self._num_prompt_groups_per_step
         claimed: list[KVBatchMeta] = []
         n = 0
         while n < target:
@@ -669,7 +715,7 @@ class SingleControllerArealActor:
             # Claim in-window groups (lag ≤ η). select() returns (meta|None, num).
             train_meta, num = await self._sampler.select(
                 current_train_weight=self._trainer_version,
-                min_prompt_groups=self._async_cfg.min_prompt_groups_per_batch,
+                min_prompt_groups=self._num_prompt_groups_per_step,
             )
 
             if train_meta is None:
@@ -694,35 +740,27 @@ class SingleControllerArealActor:
     def _iter_minibatches(
         self, batch_meta: "KVBatchMeta"
     ) -> Iterator["KVBatchMeta"]:
-        """Yield ``num_minibatches`` contiguous slices of the batch, in order.
+        """Yield contiguous minibatches of ``train_global_batch_size`` sequences.
 
-        Each yielded meta is ONE optimizer step (one begin/train_microbatch/
-        finish cycle in Phase 2). Deterministic, no shuffle — matches AReaL,
-        which splits the flat batch into ``ppo_n_minibatches`` in order (single
-        pass, each sample used exactly once). The split is even; the leading
-        minibatches absorb the remainder. ``num_minibatches=1`` yields the whole
-        batch unchanged (one optimizer step per training step).
+        Each yielded meta is ONE optimizer step. The full RL-step batch 
+        (``rl_step_samples``) splits into ``rl_step_samples // train_global_batch_size`` 
+        minibatches — deterministic, in order, no shuffle, each sample used exactly once.
+        A trailing remainder smaller than one minibatch is NOT yielded; 
+        ``_dp_align_batch`` normally trims it first, so in practice there is no remainder.
 
         Args:
             batch_meta: the frozen full-batch ``KVBatchMeta`` (Phase 1 output).
 
         Yields:
-            Contiguous, non-overlapping ``KVBatchMeta`` slices whose union is the
-            full batch. Empty slices (when ``num_minibatches > batch size``) are
-            skipped.
+            Contiguous, non-overlapping ``KVBatchMeta`` slices of
+            ``train_global_batch_size`` sequences each.
         """
-        n = batch_meta.size  # total sequences in the batch
-        m = self._async_cfg.num_minibatches
-        if m < 1:
-            raise ValueError(f"num_minibatches must be >= 1, got {m}")
-        # Even split; the first (n % m) minibatches each take one extra sample.
-        sizes = [n // m + (1 if i < n % m else 0) for i in range(m)]
+        size = self._train_minibatch_size  # one optimizer step == train_gbs
+        n = batch_meta.size  # total sequences in the (full) batch
         start = 0
-        for sz in sizes:
-            if sz == 0:
-                continue
-            yield batch_meta.slice(start, start + sz)
-            start += sz
+        while start + size <= n:
+            yield batch_meta.slice(start, start + size)
+            start += size
 
 
     async def _sync_weights(self) -> None:
