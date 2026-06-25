@@ -1766,7 +1766,6 @@ def refit_policy_generation(
             if isinstance(policy_generation, MegatronGeneration):
                 futures_train = policy.swap_weights_via_reshard(is_source=True)
             else:
-                policy.offload_before_refit()
                 futures_train = policy.broadcast_weights_for_collective(
                     kv_scales=kv_scales
                 )
@@ -1775,7 +1774,6 @@ def refit_policy_generation(
             ray.get(futures_train)
             results = ray.get(futures_inference)
             update_success = all(result for result in results if result is not None)
-            policy.prepare_for_training()
 
         # check if update is successful
         if not update_success:

@@ -48,6 +48,49 @@ def fix_gemma3_vision_weight_name(key: str) -> str:
     )
 
 
+def _read_mtp_layer_weights_from_checkpoint(
+    model_path: str, mtp_layer_indices: set[int]
+) -> list[tuple[str, torch.Tensor]]:
+    """Read only the MTP draft layer weights from a sharded HF safetensors checkpoint.
+
+    Uses the checkpoint's ``model.safetensors.index.json`` to open only the
+    shards that contain the requested transformer layer indices, so the
+    multi-terabyte base-model weights are never read from disk.
+
+    Args:
+        model_path: Path to the HF checkpoint directory.
+        mtp_layer_indices: Transformer layer indices belonging to the MTP module(s).
+
+    Returns:
+        A list of ``(weight_name, tensor)`` pairs for the requested layers, with
+        tensors on CPU.
+    """
+    import json
+    import os
+
+    from safetensors import safe_open
+
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    with open(index_path) as f:
+        weight_map = json.load(f)["weight_map"]
+
+    layer_re = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+    shard_to_names: dict[str, list[str]] = {}
+    for name, shard in weight_map.items():
+        match = layer_re.search(name)
+        if match is not None and int(match.group(1)) in mtp_layer_indices:
+            shard_to_names.setdefault(shard, []).append(name)
+
+    weights: list[tuple[str, torch.Tensor]] = []
+    for shard, names in shard_to_names.items():
+        with safe_open(
+            os.path.join(model_path, shard), framework="pt", device="cpu"
+        ) as reader:
+            for name in names:
+                weights.append((name, reader.get_tensor(name)))
+    return weights
+
+
 class VllmInternalWorkerExtension:
     def init_collective(
         self,
@@ -209,6 +252,63 @@ class VllmInternalWorkerExtension:
             return
         draft_weights = self._trim_vocab_padding(draft_model, draft_weights)
         draft_model.load_weights(weights=draft_weights)
+
+    def load_mtp_weights_from_disk(self, model_path: str) -> bool:
+        """Load only the MTP (multi-token-prediction) draft weights from disk.
+
+        Used when an MTP speculative-decoding policy runs with
+        ``load_format="dummy"``: the main model receives real weights via refit,
+        but the MTP draft layer is not covered by refit (the trainer runs with
+        ``mtp_num_layers=0``), so its weights must come from the checkpoint. Only
+        the MTP layer(s) are read, avoiding a full base-model load (~1.3 TB for
+        DeepSeek-V3) on every inference replica.
+
+        Args:
+            model_path: Path to the HF checkpoint directory.
+
+        Returns:
+            bool: True if MTP weights were loaded.
+        """
+        draft_owner = getattr(self.model_runner, "drafter", None)
+        draft_model = getattr(draft_owner, "model", None) if draft_owner else None
+        if draft_model is None:
+            print("[mtp] Drafter unavailable; cannot load MTP weights from disk.")
+            return False
+
+        predictor = draft_model.model
+        mtp_layer_indices = set(
+            range(
+                predictor.mtp_start_layer_idx,
+                predictor.mtp_start_layer_idx + predictor.num_mtp_layers,
+            )
+        )
+        weights = _read_mtp_layer_weights_from_checkpoint(model_path, mtp_layer_indices)
+        if not weights:
+            raise ValueError(
+                f"No MTP layer weights for layers {sorted(mtp_layer_indices)} "
+                f"found in checkpoint at {model_path}. The checkpoint must "
+                f"include MTP layer weights to run deepseek_mtp speculative decoding."
+            )
+
+        self._load_draft_weights(weights)
+
+        # The MTP block contains MoE experts whose weights need post-load
+        # processing (e.g. grouped-GEMM layout), matching the main-model path.
+        from vllm.config import set_current_vllm_config
+        from vllm.model_executor.model_loader.utils import (
+            process_weights_after_loading,
+        )
+
+        draft_model_config = (
+            self.model_runner.vllm_config.speculative_config.draft_model_config
+        )
+        with set_current_vllm_config(self.model_runner.vllm_config):
+            process_weights_after_loading(draft_model, draft_model_config, self.device)
+        print(
+            f"[mtp] Loaded MTP draft weights for layers "
+            f"{sorted(mtp_layer_indices)} from {model_path}"
+        )
+        return True
 
     def _load_weights(self, weights):
         """Load weights with Gemma3 vision-tower weight name fix, FP8, and draft-weight support.
