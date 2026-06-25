@@ -110,6 +110,35 @@ weight thresholds, hand-picked intermediate filenames, etc.).
   for cross-tokenizer distillation.
 - **Teacher logits travel via CUDA IPC**, so student and teacher policies must
   be colocated on the same node. No remote-Ray transport for x-token logits.
+- **One colocated GPU pool, serial execution.** All teachers and the student
+  share a single `RayVirtualCluster`
+  (`max_colocated_worker_groups = len(teachers) + 1`). There is no separate
+  generation worker (off-policy distillation trains on a fixed dataset) and no
+  colocation toggle. Each step time-slices the shared GPUs: one teacher at a
+  time is onloaded, runs its forward pass, ships its logits to the student over
+  CUDA IPC, then offloads; the student trains last, reading and releasing each
+  teacher's IPC buffer. GPU memory therefore holds exactly one teacher's params
+  *or* the student's at any instant, plus the teachers' resident IPC logit
+  buffers.
+
+```
+   RayVirtualCluster — one GPU pool, shared by every worker group
+   max_colocated_worker_groups = len(teachers) + 1   (no separate
+   generation worker; no colocation toggle)
+
+   Worker groups, all colocated on the SAME GPUs:
+     teacher_0, teacher_1, …, teacher_{N-1}, student
+
+   Per training step — serial time-slice on those GPUs:
+     teacher_0      : onload → forward → ship logits (CUDA IPC) → offload
+     teacher_1      : onload → forward → ship logits (CUDA IPC) → offload
+       ⋮
+     teacher_{N-1}  : onload → forward → ship logits (CUDA IPC) → offload
+     student        : train → read each teacher's IPC buffer → release
+
+   At any instant: exactly ONE teacher's params OR the student's resident,
+   plus the teachers' IPC logit buffers (node-local).
+```
 
 Future work will ease these requirements — we are actively working on
 improving cross-tokenizer distillation support.
