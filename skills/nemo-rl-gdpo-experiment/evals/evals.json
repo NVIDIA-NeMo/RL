@@ -1,0 +1,57 @@
+[
+  {
+    "id": "gdpo-experiment-positive-001",
+    "question": "I have a math task scored on correctness, integer-format, and structure. GRPO seems to ignore the format rewards. How do I train so each reward keeps its own signal?",
+    "expected_skill": "nemo-rl-gdpo-experiment",
+    "ground_truth": "The agent loads the nemo-rl-gdpo-experiment skill, explains that GRPO sums the components into total_reward (advantage collapse), and recommends setting grpo.adv_estimator.name to 'gdpo' with normalize_rewards true and use_leave_one_out_baseline false, using the math_multi_reward environment and the gdpo_math_1B.yaml recipe.",
+    "expected_behavior": [
+      "The agent read nemo-rl-gdpo-experiment/SKILL.md before acting",
+      "The agent explained reward advantage collapse under GRPO in the multi-reward setting",
+      "The agent identified the gdpo advantage estimator config and the math_multi_reward environment"
+    ]
+  },
+  {
+    "id": "gdpo-experiment-positive-002",
+    "question": "How do I set up a fair comparison of GDPO versus GRPO on the same multi-reward setup, and what should I measure?",
+    "expected_skill": "nemo-rl-gdpo-experiment",
+    "ground_truth": "The agent loads the nemo-rl-gdpo-experiment skill and describes running gdpo_math_1B.yaml against the matched control grpo_math_1B_multireward.yaml (identical except adv_estimator.name), measuring per-reward convergence for each component rather than only aggregate reward, and optionally running run_gdpo_grpo_advantage_demo.py as a CPU sanity check.",
+    "expected_behavior": [
+      "The agent read nemo-rl-gdpo-experiment/SKILL.md before acting",
+      "The agent named the matched control config grpo_math_1B_multireward.yaml",
+      "The agent emphasized per-reward convergence as the headline metric"
+    ]
+  },
+  {
+    "id": "gdpo-experiment-positive-003",
+    "question": "I want to use GDPO on a new tool-calling task. What does my environment have to return?",
+    "expected_skill": "nemo-rl-gdpo-experiment",
+    "ground_truth": "The agent loads the nemo-rl-gdpo-experiment skill and explains the environment's step must return a rewards tensor of shape [B, N] so the rollout exposes reward1..rewardN, mirroring HFMultiRewardVerifyWorker, and that GDPO needs at least two components or it raises a ValueError.",
+    "expected_behavior": [
+      "The agent read nemo-rl-gdpo-experiment/SKILL.md before acting",
+      "The agent described the [B, N] multi-reward return contract and reward1..rewardN keys",
+      "The agent noted GDPO requires two or more reward components"
+    ]
+  },
+  {
+    "id": "gdpo-experiment-negative-001",
+    "question": "Fix the bug in GDPOAdvantageEstimator where the per-component std normalization divides by zero on a constant reward.",
+    "expected_skill": null,
+    "should_trigger": false,
+    "ground_truth": "This is a bug fix, not an experiment setup. The agent should investigate advantage_estimator.py and the epsilon/non_zero_std_mask handling directly without loading the experiment playbook.",
+    "expected_behavior": [
+      "The agent did not start a GDPO experiment workflow",
+      "The agent investigated the estimator code directly"
+    ]
+  },
+  {
+    "id": "gdpo-experiment-negative-002",
+    "question": "Run a standard single-reward GRPO training on GSM8K with Qwen2.5-1.5B.",
+    "expected_skill": null,
+    "should_trigger": false,
+    "ground_truth": "This is a single-reward GRPO run with no multi-reward or GDPO component. The agent should use the standard grpo_math_1B.yaml recipe and not load the GDPO experiment skill.",
+    "expected_behavior": [
+      "The agent did not load the nemo-rl-gdpo-experiment skill",
+      "The agent pointed to the standard GRPO recipe"
+    ]
+  }
+]
