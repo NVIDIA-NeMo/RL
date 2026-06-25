@@ -25,6 +25,8 @@ from nemo_rl.algorithms.distillation import MasterConfig as DistillationMasterCo
 from nemo_rl.algorithms.dpo import MasterConfig as DPOMasterConfig
 from nemo_rl.algorithms.grpo import (
     MasterConfig as GRPOMasterConfig,
+)
+from nemo_rl.algorithms.grpo import (
     RewardPenaltyConfig,
 )
 from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
