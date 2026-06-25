@@ -157,7 +157,6 @@ for SCRIPT in $SCRIPTS; do
                 logger.wandb.project=nemo-rl-release
             )
         fi
-
         # TODO: jq install is just to be backward compatible with older containers. Should eventually remove.
 
         GRES_ARG="--gres=gpu:$GPUS_PER_NODE "
@@ -167,14 +166,14 @@ for SCRIPT in $SCRIPTS; do
 
         cat <<EOF >$SNAPSHOT_DIR/continue.sh
 #!/bin/bash
-SCRIPT_DIR=\$( cd -- "\$( dirname -- "\${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
-cd \$SCRIPT_DIR
+cd $PROJECT_ROOT
 
 ${EXTRA_ENV:-} \\
 HF_HOME=$HF_HOME \\
 HF_DATASETS_CACHE=$HF_DATASETS_CACHE \\
 COMMAND="uv run $rel_script ${script_args[@]}" \\
 CONTAINER=$CONTAINER \\
+BASE_LOG_DIR=$SNAPSHOT_DIR \\
 MOUNTS="$SNAPSHOT_DIR:$SNAPSHOT_DIR${MOUNTS}" \\
 SANDBOX_CONTAINER="${SANDBOX_CONTAINER:-}" \\
 SANDBOX_COMMAND="${SANDBOX_COMMAND:-}" \\
