@@ -460,3 +460,11 @@ data_plane:
   local_buffer_size:   68719476736   # 64 GiB  — used when backend == "mooncake_cpu"
   # observability:                    # NotRequired
   #   enabled: false
+
+# Multi-Teacher On-Policy Distillation (MOPD): distills from one or more teacher
+# models into the policy via token-level teacher-minus-student logprob advantages,
+# served by non-colocated teacher worker groups (OPD advantage estimator +
+# nemo_gym). null = disabled (default). See
+# examples/configs/recipes/llm/mopd-qwen3-1.7b-3n8g-megatron-pack.yaml for a full
+# enabled example.
+on_policy_distillation: null
