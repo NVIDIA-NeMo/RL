@@ -46,6 +46,7 @@ from nemo_rl.environments.interfaces import (
     EnvironmentInterface,
     EnvironmentReturn,
 )
+from nemo_rl.environments.nemo_gym import DEFAULT_THINKING_TAGS
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     GenerationDatumSpec,
@@ -1323,6 +1324,383 @@ def _calculate_single_metric(
     }
 
 
+def get_nemo_gym_thinking_tags(env_config: dict[str, Any]) -> list[str]:
+    """Return thinking tags used by the Gym-side detector."""
+    nemo_gym_config = env_config.get("nemo_gym")
+    if isinstance(nemo_gym_config, dict) and nemo_gym_config.get("thinking_tags"):
+        return list(nemo_gym_config["thinking_tags"])
+    return list(DEFAULT_THINKING_TAGS)
+
+
+def _get_reward_penalty_config_value(
+    reward_penalty_config: dict[str, Any] | BaseModel | None,
+    key: str,
+) -> Any:
+    if reward_penalty_config is None:
+        return None
+    if isinstance(reward_penalty_config, dict):
+        return reward_penalty_config.get(key)
+
+    model_extra = getattr(reward_penalty_config, "model_extra", None)
+    if isinstance(model_extra, dict) and key in model_extra:
+        return model_extra[key]
+
+    pydantic_extra = getattr(reward_penalty_config, "__pydantic_extra__", None)
+    if isinstance(pydantic_extra, dict) and key in pydantic_extra:
+        return pydantic_extra[key]
+
+    return getattr(reward_penalty_config, key, None)
+
+
+def _get_reward_penalty_token_id(
+    reward_penalty_config: dict[str, Any] | BaseModel,
+    key: str,
+) -> int | None:
+    token_ids = _get_reward_penalty_config_value(reward_penalty_config, "token_ids")
+    if token_ids is None:
+        return None
+
+    if isinstance(token_ids, dict):
+        value = token_ids.get(key)
+    else:
+        value = getattr(token_ids, key, None)
+
+    if value is None:
+        return None
+    return int(value)
+
+
+def _get_required_reward_penalty_token_id(
+    reward_penalty_config: dict[str, Any] | BaseModel,
+    key: str,
+) -> int:
+    value = _get_reward_penalty_token_id(reward_penalty_config, key)
+    if value is None:
+        raise ValueError(f"reward_penalties.token_ids.{key} must be set")
+    return value
+
+
+def _infer_single_token_id(tokenizer: Any, text: str) -> int | None:
+    token_ids = tokenizer.encode(text, add_special_tokens=False)
+    if len(token_ids) != 1:
+        return None
+    return int(token_ids[0])
+
+
+def resolve_reward_penalty_config(
+    reward_penalty_config: dict[str, Any] | BaseModel | None,
+    tokenizer: Any,
+    thinking_tags: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any] | None:
+    """Resolve tokenizer-derived reward penalty fields.
+
+    User config can still override token IDs. When absent, infer EOS from the
+    tokenizer and infer think-tag IDs only when each configured tag is exactly
+    one token.
+    """
+    if reward_penalty_config is None:
+        return None
+
+    resolved: dict[str, Any] = {}
+    for flag in (
+        "penalize_duplicated_reasoning",
+        "penalize_empty_final_answer",
+        "penalize_eos_token",
+        "penalize_malformed_think_tag",
+    ):
+        value = _get_reward_penalty_config_value(reward_penalty_config, flag)
+        if value is not None:
+            resolved[flag] = value
+
+    token_ids: dict[str, int] = {}
+    for key in ("eos", "think_open", "think_close"):
+        value = _get_reward_penalty_token_id(reward_penalty_config, key)
+        if value is not None:
+            token_ids[key] = value
+
+    if resolved.get("penalize_eos_token") and "eos" not in token_ids:
+        eos_token_id = getattr(tokenizer, "eos_token_id", None)
+        if eos_token_id is not None:
+            token_ids["eos"] = int(eos_token_id)
+
+    if resolved.get("penalize_malformed_think_tag"):
+        configured_thinking_tags = _get_reward_penalty_config_value(
+            reward_penalty_config, "thinking_tags"
+        )
+        tags = tuple(thinking_tags or configured_thinking_tags or DEFAULT_THINKING_TAGS)
+        resolved["thinking_tags"] = tags
+        if len(tags) >= 2:
+            explicit_open = "think_open" in token_ids
+            explicit_close = "think_close" in token_ids
+            inferred_open = None
+            inferred_close = None
+            if not explicit_open:
+                inferred_open = _infer_single_token_id(tokenizer, tags[0])
+            if not explicit_close:
+                inferred_close = _infer_single_token_id(tokenizer, tags[1])
+
+            if explicit_open or explicit_close:
+                if inferred_open is not None:
+                    token_ids["think_open"] = inferred_open
+                if inferred_close is not None:
+                    token_ids["think_close"] = inferred_close
+            elif inferred_open is not None and inferred_close is not None:
+                token_ids["think_open"] = inferred_open
+                token_ids["think_close"] = inferred_close
+
+    if token_ids:
+        resolved["token_ids"] = token_ids
+
+    return resolved
+
+
+def apply_reward_penalties(
+    results: list[dict], reward_penalty_config: dict[str, Any] | BaseModel | None
+) -> dict[str, int]:
+    """Apply reward penalties to results, setting reward to 0.0 when triggered.
+
+    All penalties are gated by reward_penalty_config flags. Returns a dict of penalty
+    counts keyed by penalty name.
+
+    NOTE: These penalties assume Gym-path message_log structure where roles
+    strictly alternate "user" → "assistant". Tool responses are folded into
+    user prompt tokens by _postprocess_nemo_gym_to_nemo_rl_result and never
+    appear as separate message_log entries. Do not call from non-Gym rollout paths.
+
+    Penalties:
+      1. penalize_duplicated_reasoning (text-based)
+         Checks response["output"] items. If a "reasoning" item's summary text
+         exactly matches the next item's content text (after strip), the model
+         is copying its thinking into the final answer verbatim.
+         Data: full_result["response"]["output"] — reasoning has summary[0]["text"],
+         message has content[0]["text"].
+
+      2. penalize_empty_final_answer (text-based)
+         Walks response["output"] in reverse to find the last message-type item.
+         If no message item exists or its content text is empty, the model failed
+         to produce a final answer. Skipped when the last output item is a
+         function_call (model was mid-agentic-loop, not producing an empty answer).
+         Data: full_result["response"]["output"] — message items have content[0]["text"].
+
+      3. penalize_eos_token (token-based)
+         The EOS token resolved from config override or tokenizer should never
+         appear inside any assistant generation. A final EOS token is allowed
+         per assistant turn because vLLM/Gym may include the terminal stop
+         marker in generation_token_ids.
+         Data: message_log[i]["token_ids"] where role == "assistant".
+
+      4. penalize_malformed_think_tag (message flag + token/string fallback)
+         Three complementary checks to catch malformed think tags:
+         a) Existing Gym flag: honors assistant message has_malformed_thinking.
+         b) Token ID check: when think tag IDs are resolved from config override
+            or single-token tokenizer encodings, infers thinking mode from
+            prompt token counts. If prompt has open==close:
+            enable_thinking=False, expect 0 open
+            and 0 close in generation. If prompt has open==close+1:
+            enable_thinking=True, expect 0 open and 1 close in generation.
+            Any other prompt pattern or mismatched generation counts is a violation.
+            This fallback is skipped when the tags do not resolve to one token
+            each.
+         c) String check: the model can spell out thinking tags with piecemeal
+            regular tokens (e.g. "<", "/", "thi", "nk", ">") that bypass special
+            token IDs. Checks generation_str (decoded generation text) per output
+            item: open-tag count must be 0 (always in prompt, never generated),
+            close-tag count must be 0 or 1.
+         Data: message_log pairs for token IDs, full_result output items for strings.
+    """
+    counts = {
+        "duplicated_reasoning": 0,
+        "empty_final_answer": 0,
+        "eos_token": 0,
+        "malformed_think_tag": 0,
+    }
+    if not reward_penalty_config or not results:
+        return counts
+
+    # Guard: penalties rely on Gym-path message_log (strictly alternating user/assistant roles).
+    # Non-Gym paths may have "environment", "tool", or "system" roles which these checks don't handle.
+    any_penalty_enabled = any(
+        _get_reward_penalty_config_value(reward_penalty_config, flag)
+        for flag in (
+            "penalize_duplicated_reasoning",
+            "penalize_empty_final_answer",
+            "penalize_eos_token",
+            "penalize_malformed_think_tag",
+        )
+    )
+    if any_penalty_enabled:
+        for result in results:
+            roles = {msg.get("role") for msg in result["message_log"]}
+            assert roles <= {"user", "assistant"}, (
+                f"apply_reward_penalties requires Gym-path message_log with only 'user' and 'assistant' roles, "
+                f"but found roles: {roles}. These penalties are not supported for non-Gym rollout paths."
+            )
+
+    # --- Penalty 1: Duplicated reasoning / final answer ---
+    if _get_reward_penalty_config_value(
+        reward_penalty_config, "penalize_duplicated_reasoning"
+    ):
+        for result in results:
+            output_items = result["full_result"].get("response", {}).get("output", [])
+            is_duplicated = False
+            for item1, item2 in zip(output_items, output_items[1:]):
+                if item1.get("type") != "reasoning":
+                    continue
+                summary = item1.get("summary", [])
+                if not summary or "text" not in summary[0]:
+                    continue
+                reasoning_text = summary[0]["text"].strip()
+                content = item2.get("content", "")
+                if isinstance(content, list) and content and "text" in content[0]:
+                    chat_text = content[0]["text"].strip()
+                elif isinstance(content, str):
+                    chat_text = content.strip()
+                else:
+                    continue
+                if reasoning_text and chat_text and reasoning_text == chat_text:
+                    is_duplicated = True
+                    break
+            if is_duplicated:
+                result["full_result"]["reward"] = 0.0
+
+                counts["duplicated_reasoning"] += 1
+
+    # --- Penalty 2: Empty final answer ---
+    if _get_reward_penalty_config_value(
+        reward_penalty_config, "penalize_empty_final_answer"
+    ):
+        for result in results:
+            output_items = result["full_result"].get("response", {}).get("output", [])
+            # Skip if the last output item is a function_call — it is legit for model to
+            # produce reasoning and then a function_call as the last output item in PivotRL
+            if output_items and output_items[-1].get("type") == "function_call":
+                continue
+            final_answer_text = None
+            for item in reversed(output_items):
+                # Skip items without content (function_call, function_call_output, etc.)
+                if "content" not in item:
+                    continue
+                content = item["content"]
+                if isinstance(content, list) and content and "text" in content[0]:
+                    final_answer_text = content[0]["text"].strip()
+                    break
+                elif isinstance(content, str):
+                    final_answer_text = content.strip()
+                    break
+            if final_answer_text is None or final_answer_text == "":
+                result["full_result"]["reward"] = 0.0
+
+                counts["empty_final_answer"] += 1
+
+    # --- Penalty 3: EOS token in generation ---
+    if _get_reward_penalty_config_value(reward_penalty_config, "penalize_eos_token"):
+        eos_token_id = _get_required_reward_penalty_token_id(
+            reward_penalty_config, "eos"
+        )
+        for result in results:
+            has_eos = False
+            for msg in result["message_log"]:
+                if msg["role"] != "assistant":
+                    continue
+                # Allow a terminal EOS stop marker on each assistant turn, but
+                # penalize EOS emitted inside the assistant content.
+                if eos_token_id in msg["token_ids"][:-1]:
+                    has_eos = True
+                    break
+            if has_eos:
+                result["full_result"]["reward"] = 0.0
+
+                counts["eos_token"] += 1
+
+    # --- Penalty 4: Malformed think tags (existing flag + optional token ID + string) ---
+    if _get_reward_penalty_config_value(
+        reward_penalty_config, "penalize_malformed_think_tag"
+    ):
+        think_open_token_id = _get_reward_penalty_token_id(
+            reward_penalty_config, "think_open"
+        )
+        think_close_token_id = _get_reward_penalty_token_id(
+            reward_penalty_config, "think_close"
+        )
+        if (think_open_token_id is None) != (think_close_token_id is None):
+            raise ValueError(
+                "reward_penalties.token_ids.think_open and "
+                "reward_penalties.token_ids.think_close must both be set"
+            )
+        for result in results:
+            has_violation = any(
+                msg.get("role") == "assistant"
+                and msg.get("has_malformed_thinking", False)
+                for msg in result["message_log"]
+            )
+
+            # 4a) Token ID check per (user, assistant) turn pair.
+            # Infer thinking mode from prompt token counts:
+            #   enable_thinking=True:  prompt has open=close+1 (trailing <think>), expect asst: 0 open, 1 close
+            #   enable_thinking=False: prompt has open=close (balanced), expect asst: 0 open, 0 close
+            msgs = result["message_log"]
+            if (
+                not has_violation
+                and think_open_token_id is not None
+                and think_close_token_id is not None
+            ):
+                for i in range(len(msgs) - 1):
+                    if msgs[i]["role"] != "user" or msgs[i + 1]["role"] != "assistant":
+                        continue
+                    user_ids = msgs[i]["token_ids"]
+                    asst_ids = msgs[i + 1]["token_ids"]
+                    prompt_open = (user_ids == think_open_token_id).sum().item()
+                    prompt_close = (user_ids == think_close_token_id).sum().item()
+                    asst_open = (asst_ids == think_open_token_id).sum().item()
+                    asst_close = (asst_ids == think_close_token_id).sum().item()
+                    if prompt_open == prompt_close:
+                        # enable_thinking=False: both tags in prompt, none in generation
+                        expected_open, expected_close = 0, 0
+                    elif prompt_open == prompt_close + 1:
+                        # enable_thinking=True: trailing <think> in prompt, expect </think> in generation
+                        expected_open, expected_close = 0, 1
+                    else:
+                        # Unexpected prompt pattern - flag as violation
+                        has_violation = True
+                        break
+                    if asst_open != expected_open or asst_close != expected_close:
+                        has_violation = True
+                        break
+
+            # 4b) String check on generation_str per output item.
+            if not has_violation:
+                thinking_tags = (
+                    _get_reward_penalty_config_value(
+                        reward_penalty_config, "thinking_tags"
+                    )
+                    or DEFAULT_THINKING_TAGS
+                )
+                if len(thinking_tags) < 2:
+                    raise ValueError(
+                        "reward_penalties.thinking_tags must contain open and close tags"
+                    )
+                think_open_text, think_close_text = thinking_tags[:2]
+                output_items = (
+                    result["full_result"].get("response", {}).get("output", [])
+                )
+                for item in output_items:
+                    gen_str = item.get("generation_str", "")
+                    if not gen_str:
+                        continue
+                    if (
+                        gen_str.count(think_open_text) > 0
+                        or gen_str.count(think_close_text) > 1
+                    ):
+                        has_violation = True
+                        break
+            if has_violation:
+                result["full_result"]["reward"] = 0.0
+
+                counts["malformed_think_tag"] += 1
+
+    return counts
+
+
 def run_async_nemo_gym_rollout(
     policy_generation: GenerationInterface,
     input_batch: BatchedDataDict[DatumSpec],
@@ -1333,6 +1711,8 @@ def run_async_nemo_gym_rollout(
     max_rollout_turns: Optional[int] = None,
     greedy: bool = False,
     effort_config: Optional[EffortLevelsConfig] = None,
+    reward_penalty_config: dict[str, Any] | BaseModel | None = None,
+    thinking_tags: list[str] | tuple[str, ...] | None = None,
 ) -> AsyncNemoGymRolloutResult:
     """Run multi-turn rollouts with NeMo-Gym. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters."""
     # We accept max_seq_len for API parity with the other rollout paths, but NeMo-Gym
@@ -1418,6 +1798,11 @@ def run_async_nemo_gym_rollout(
     rewards_low = shaping.rewards_low
     low_lengths = shaping.low_lengths
     high_lengths = shaping.high_lengths
+
+    resolved_reward_penalty_config = resolve_reward_penalty_config(
+        reward_penalty_config, tokenizer, thinking_tags=thinking_tags
+    )
+    penalty_counts = apply_reward_penalties(results, resolved_reward_penalty_config)
 
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
@@ -1575,6 +1960,27 @@ def run_async_nemo_gym_rollout(
     if high_lengths:
         rollout_metrics["mean_length_high"] = sum(high_lengths) / len(high_lengths)
         rollout_metrics["median_length_high"] = float(statistics.median(high_lengths))
+
+    # Penalty metrics — map count keys to (config flag, metric name)
+    _PENALTY_METRICS = {
+        "duplicated_reasoning": (
+            "penalize_duplicated_reasoning",
+            "reasoning_equal_to_final_answer_rate",
+        ),
+        "empty_final_answer": (
+            "penalize_empty_final_answer",
+            "empty_final_answer_rate",
+        ),
+        "eos_token": ("penalize_eos_token", "eos_token_rate"),
+        "malformed_think_tag": (
+            "penalize_malformed_think_tag",
+            "malformed_think_tag_rate",
+        ),
+    }
+    if resolved_reward_penalty_config and results:
+        for key, (flag, metric_name) in _PENALTY_METRICS.items():
+            if _get_reward_penalty_config_value(resolved_reward_penalty_config, flag):
+                rollout_metrics[metric_name] = penalty_counts[key] / len(results)
 
     return AsyncNemoGymRolloutResult(
         input_ids=input_ids,

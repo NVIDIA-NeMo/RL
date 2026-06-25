@@ -725,7 +725,10 @@ class AsyncTrajectoryCollector:
         try:
             # Import here to avoid circular dependency
             from nemo_rl.algorithms.grpo import _should_use_nemo_gym
-            from nemo_rl.experience.rollouts import run_async_nemo_gym_rollout
+            from nemo_rl.experience.rollouts import (
+                get_nemo_gym_thinking_tags,
+                run_async_nemo_gym_rollout,
+            )
 
             # Run rollout for this prompt group
             # Async engine supports concurrent generation; avoid locking
@@ -741,6 +744,8 @@ class AsyncTrajectoryCollector:
                     generation_config=generation_config,
                     max_rollout_turns=None,
                     greedy=False,
+                    reward_penalty_config=self.master_config.reward_penalties,
+                    thinking_tags=get_nemo_gym_thinking_tags(self.master_config.env),
                 )
                 final_batch = nemo_gym_rollout_result.final_batch
                 rollout_metrics = nemo_gym_rollout_result.rollout_metrics
