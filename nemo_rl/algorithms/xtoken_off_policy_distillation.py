@@ -50,6 +50,7 @@ from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.algorithms.x_token import TokenAligner
 from nemo_rl.algorithms.x_token.utils import (
     assert_teacher_student_batch_grid,
+    assert_xtoken_ipc_node_local,
     pad_distillation_val_batch,
 )
 from nemo_rl.data import DataConfig
@@ -345,6 +346,19 @@ def setup(
         teacher_dp=teacher_dp,
         student_mbs=policy_config["train_micro_batch_size"],
         teacher_mbs=val_teacher_mbs,
+    )
+    # The teacher->student logit transport is node-local CUDA IPC; on >1 node it
+    # only works when teacher/student share DP and a node-aligned model-parallel
+    # group, else a student rank must read teacher shards from another node.
+    assert_xtoken_ipc_node_local(
+        num_nodes=cluster_config["num_nodes"],
+        gpus_per_node=cluster_config["gpus_per_node"],
+        student_tp=policy_config["dtensor_cfg"]["tensor_parallel_size"],
+        student_cp=policy_config["dtensor_cfg"]["context_parallel_size"],
+        teacher_tp=teacher_config["dtensor_cfg"]["tensor_parallel_size"],
+        teacher_cp=teacher_config["dtensor_cfg"]["context_parallel_size"],
+        student_dp=student_dp,
+        teacher_dp=teacher_dp,
     )
 
     # ==========================

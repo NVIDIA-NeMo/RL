@@ -74,6 +74,55 @@ def assert_teacher_student_batch_grid(
     )
 
 
+def assert_xtoken_ipc_node_local(
+    *,
+    num_nodes: int,
+    gpus_per_node: int,
+    student_tp: int,
+    student_cp: int,
+    teacher_tp: int,
+    teacher_cp: int,
+    student_dp: int,
+    teacher_dp: int,
+) -> None:
+    """Fail fast if the teacher->student logit transport would cross a node.
+
+    Teacher logits reach the student via CUDA IPC (``cudaIpcOpenMemHandle``),
+    which can only map a buffer created by a process on the SAME physical node.
+    A single-node job is therefore always safe; a multi-node job is only safe
+    when every student rank's required teacher shards live on its own node.
+
+    """
+    if num_nodes <= 1:
+        return
+
+    student_group = student_tp * student_cp
+    teacher_group = teacher_tp * teacher_cp
+    assert teacher_dp == student_dp, (
+        "Multi-node xtoken distillation uses node-local CUDA IPC for the teacher "
+        "logits, which requires teacher and student to share a data_parallel "
+        f"degree (got teacher_dp={teacher_dp}, student_dp={student_dp}); "
+        "otherwise a student rank must read teacher shards from another node. "
+        "Use a single node, or matching DP, or a cross-node transport."
+    )
+    assert teacher_group == student_group, (
+        "Multi-node xtoken distillation requires teacher and student to share "
+        f"the same model-parallel group size tp*cp (got teacher={teacher_group}, "
+        f"student={student_group}); differing sizes imply a non-colocated grid "
+        "whose teacher shards are not node-local."
+    )
+    assert student_group <= gpus_per_node, (
+        f"Multi-node xtoken distillation needs the model-parallel group tp*cp "
+        f"({student_group}) to fit within one node ({gpus_per_node} GPUs); a "
+        "group spanning nodes makes the teacher-logit IPC cross-node."
+    )
+    assert gpus_per_node % student_group == 0, (
+        f"Multi-node xtoken distillation needs gpus_per_node ({gpus_per_node}) "
+        f"to be a multiple of the model-parallel group tp*cp ({student_group}) "
+        "so DP groups are node-aligned and never straddle a node boundary."
+    )
+
+
 def pad_distillation_val_batch(
     batch: BatchedDataDict[Any], target_size: int
 ) -> BatchedDataDict[Any]:

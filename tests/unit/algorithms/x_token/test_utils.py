@@ -20,6 +20,7 @@ import torch
 
 from nemo_rl.algorithms.x_token.utils import (
     assert_teacher_student_batch_grid,
+    assert_xtoken_ipc_node_local,
     pad_distillation_val_batch,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -53,6 +54,49 @@ class TestAssertTeacherStudentBatchGrid:
     def test_not_divisible_by_mbs_raises(self):
         with pytest.raises(AssertionError):
             self._check(student_mbs=3)
+
+
+class TestAssertXtokenIpcNodeLocal:
+    def _check(self, **kw):
+        args = dict(
+            num_nodes=2,
+            gpus_per_node=4,
+            student_tp=2,
+            student_cp=2,
+            teacher_tp=2,
+            teacher_cp=2,
+            student_dp=1,
+            teacher_dp=1,
+        )
+        args.update(kw)
+        assert_xtoken_ipc_node_local(**args)
+
+    def test_single_node_always_ok(self):
+        # Even an otherwise-disallowed multi-node grid passes on one node.
+        self._check(num_nodes=1, student_dp=1, teacher_dp=2, teacher_tp=4, teacher_cp=2)
+
+    def test_multinode_matched_grid_ok(self):
+        self._check()
+
+    def test_multinode_mismatched_dp_raises(self):
+        with pytest.raises(AssertionError):
+            self._check(student_dp=1, teacher_dp=2)
+
+    def test_multinode_mismatched_group_raises(self):
+        with pytest.raises(AssertionError):
+            self._check(student_tp=1, teacher_tp=2)  # groups 2 vs 4
+
+    def test_multinode_group_exceeds_node_raises(self):
+        with pytest.raises(AssertionError):
+            self._check(
+                gpus_per_node=2, student_tp=2, student_cp=2, teacher_tp=2, teacher_cp=2
+            )  # group 4 > 2
+
+    def test_multinode_group_not_node_aligned_raises(self):
+        with pytest.raises(AssertionError):
+            self._check(
+                gpus_per_node=6, student_tp=2, student_cp=2, teacher_tp=2, teacher_cp=2
+            )  # 6 % 4 != 0
 
 
 class TestPadDistillationValBatch:
