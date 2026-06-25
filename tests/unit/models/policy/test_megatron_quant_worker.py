@@ -83,6 +83,35 @@ def create_quant_megatron_test_config(model_name, tp=1, pp=1, precision="float32
     return config
 
 
+@requires_weight_folding
+def test_modelopt_layer_spec_config_selects_layer_specs():
+    from functools import partial
+
+    from megatron.bridge.models.gpt_provider import transformer_engine_layer_spec
+    from megatron.bridge.models.mamba.mamba_provider import (
+        modelopt_mamba_stack_spec,
+        transformer_engine_mamba_stack_spec,
+    )
+    from megatron.core.post_training.modelopt.gpt.model_specs import (
+        get_gpt_modelopt_spec,
+    )
+
+    from nemo_rl.modelopt.models.policy.workers.utils import (
+        get_quantization_layer_spec,
+        get_quantization_mamba_stack_spec,
+    )
+
+    assert get_quantization_layer_spec(True) is transformer_engine_layer_spec
+    assert (
+        get_quantization_mamba_stack_spec(True) is transformer_engine_mamba_stack_spec
+    )
+
+    layer_spec = get_quantization_layer_spec(False)
+    assert isinstance(layer_spec, partial)
+    assert layer_spec.func is get_gpt_modelopt_spec
+    assert get_quantization_mamba_stack_spec(False) is modelopt_mamba_stack_spec
+
+
 def _make_cluster(name):
     return RayVirtualCluster(
         name=name,

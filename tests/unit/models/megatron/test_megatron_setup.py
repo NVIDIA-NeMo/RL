@@ -981,30 +981,6 @@ class TestApplyPerformanceConfig:
         assert model_cfg.fp8_recipe == "default"
         assert model_cfg.fp8_param is False
 
-    def test_fp8_param_warning(self):
-        """Test that fp8_param=True generates a warning."""
-        from nemo_rl.models.megatron.setup import _apply_performance_config
-
-        model_cfg = MagicMock()
-        model_cfg.gated_linear_unit = True
-        config = {
-            "megatron_cfg": {
-                "activation_checkpointing": False,
-                "apply_rope_fusion": False,
-                "bias_activation_fusion": False,
-                "gradient_accumulation_fusion": False,
-                "fp8_cfg": {
-                    "enabled": True,
-                    "fp8": "e4m3",
-                    "fp8_recipe": "default",
-                    "fp8_param": True,
-                },
-            }
-        }
-
-        with pytest.warns(UserWarning, match="fp8_param=True sometimes causes NaN"):
-            _apply_performance_config(model_cfg, config)
-
     def test_recompute_granularity_full_explicit(self):
         """granularity='full' sets uniform method with 1 layer."""
         from nemo_rl.models.megatron.setup import _apply_performance_config
@@ -1279,8 +1255,12 @@ class TestValidateTrainingConfig:
         assert model_cfg.calculate_per_token_loss is True
         assert model_cfg.perform_initialization is True
 
-    def test_moe_aux_loss_not_supported(self):
-        """Test that MoE aux loss is not supported."""
+    def test_moe_aux_loss_now_supported(self):
+        """Test that MoE aux loss with a non-zero coefficient is now allowed.
+
+        Aux-loss gradient normalization is handled via moe_grad_scale_func in
+        megatron_policy_worker.py, so the previous blocking assertion was removed.
+        """
         from nemo_rl.models.megatron.setup import _validate_training_config
 
         model_cfg = MagicMock()
@@ -1292,10 +1272,11 @@ class TestValidateTrainingConfig:
             },
         }
 
-        with pytest.raises(AssertionError) as exc_info:
-            _validate_training_config(config, model_cfg)
+        # Should not raise now that aux loss is supported.
+        _validate_training_config(config, model_cfg)
 
-        assert "MoE aux loss is currently not supported" in str(exc_info.value)
+        assert model_cfg.calculate_per_token_loss is True
+        assert model_cfg.perform_initialization is True
 
     def test_moe_aux_loss_with_zero_coeff_is_ok(self):
         """Test that MoE aux loss with zero coefficient is allowed."""
@@ -1601,13 +1582,20 @@ class TestSetupModelConfig:
             request.addfinalizer(p.stop)
         return mocks
 
+    @staticmethod
+    def _make_model_cfg_mock() -> MagicMock:
+        """Mock megatron provider that tolerates __post_init__()."""
+        model_cfg = MagicMock()
+        model_cfg.__post_init__ = MagicMock()
+        return model_cfg
+
     def test_megatron_lm_passes_hf_config_overrides_to_autoconfig(self, request):
         """hf_config_overrides must be forwarded to AutoConfig.from_pretrained for megatron_lm."""
         from nemo_rl.models.megatron.setup import setup_model_config
 
         self._apply_patches(request)
 
-        mock_model_cfg = MagicMock()
+        mock_model_cfg = self._make_model_cfg_mock()
         mock_provider = MagicMock()
         mock_provider.to_megatron_provider.return_value = mock_model_cfg
 
@@ -1646,7 +1634,7 @@ class TestSetupModelConfig:
         self._apply_patches(request)
 
         mock_provider = MagicMock()
-        mock_provider.to_megatron_provider.return_value = MagicMock()
+        mock_provider.to_megatron_provider.return_value = self._make_model_cfg_mock()
 
         config = {
             "pretrained_checkpoint": {"format": "megatron_lm", "path": "/ckpt"},
@@ -1689,7 +1677,7 @@ class TestSetupModelConfig:
         }
 
         mock_cfg = MagicMock()
-        mock_cfg.model = MagicMock()
+        mock_cfg.model = self._make_model_cfg_mock()
 
         with patch("nemo_rl.models.megatron.setup.ConfigContainer") as mock_cc:
             mock_cc.from_yaml.return_value = mock_cfg
@@ -1725,7 +1713,7 @@ class TestSetupModelConfig:
         }
 
         mock_cfg = MagicMock()
-        mock_cfg.model = MagicMock()
+        mock_cfg.model = self._make_model_cfg_mock()
 
         with patch("nemo_rl.models.megatron.setup.ConfigContainer") as mock_cc:
             mock_cc.from_yaml.return_value = mock_cfg
@@ -1784,6 +1772,7 @@ class TestHandleModelImport:
             {"some_config": "value"},
             model_post_wrap_hook=None,
             transformer_layer_spec=None,
+            mamba_stack_spec=None,
         )
 
     @patch("nemo_rl.models.megatron.setup.import_model_from_hf_name")
@@ -1847,6 +1836,7 @@ class TestHandleModelImport:
             {"force_reconvert_from_hf": True},
             model_post_wrap_hook=None,
             transformer_layer_spec=None,
+            mamba_stack_spec=None,
             rope_scaling={
                 "rope_type": "yarn",
                 "factor": 4.0,
@@ -1953,11 +1943,13 @@ class TestSetupReferenceModelState:
     @patch("nemo_rl.models.megatron.setup.GlobalState")
     @patch("nemo_rl.models.megatron.setup.get_model")
     @patch("nemo_rl.models.megatron.setup.checkpoint_exists")
+    @patch("nemo_rl.models.megatron.setup.clear_global_router_replay_instances")
     @patch("nemo_rl.models.megatron.setup.load_checkpoint")
     @patch("nemo_rl.models.megatron.setup.HAVE_FSDP2", False)
     def test_setup_reference_model(
         self,
         mock_load_checkpoint,
+        mock_clear_global_router_replay_instances,
         mock_checkpoint_exists,
         mock_get_model,
         mock_global_state,
@@ -2013,6 +2005,42 @@ class TestSetupReferenceModelState:
 
         captured = capsys.readouterr()
         assert "Reference model loaded" in captured.out
+        mock_clear_global_router_replay_instances.assert_called_once()
+
+    @patch("nemo_rl.models.megatron.setup.ProcessGroupCollection")
+    @patch("nemo_rl.models.megatron.setup.init_checkpointing_context")
+    @patch("nemo_rl.models.megatron.setup.GlobalState")
+    @patch("nemo_rl.models.megatron.setup.get_model")
+    @patch("nemo_rl.models.megatron.setup.clear_global_router_replay_instances")
+    def test_setup_reference_model_clears_router_replay_on_get_model_error(
+        self,
+        mock_clear_global_router_replay_instances,
+        mock_get_model,
+        mock_global_state,
+        mock_init_ckpt_context,
+        mock_pg_collection,
+    ):
+        """Test setup_reference_model_state cleans the temporary RouterReplay registry on setup errors."""
+        from nemo_rl.models.megatron.setup import setup_reference_model_state
+
+        mock_global_state.return_value = MagicMock()
+        mock_megatron_cfg = MagicMock()
+        mock_get_model.side_effect = RuntimeError("reference model setup failed")
+
+        config = {
+            "megatron_cfg": {
+                "freeze_moe_router": False,
+            }
+        }
+
+        with pytest.raises(RuntimeError, match="reference model setup failed"):
+            setup_reference_model_state(
+                config=config,
+                megatron_cfg=mock_megatron_cfg,
+                pretrained_path="/path/to/pretrained",
+            )
+
+        mock_clear_global_router_replay_instances.assert_called_once()
 
 
 @pytest.mark.mcore

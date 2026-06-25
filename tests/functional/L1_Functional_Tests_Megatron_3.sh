@@ -35,9 +35,11 @@ run_test() {
 }
 
 run_test      uv run --no-sync bash ./tests/functional/distillation_megatron.sh
-run_test      uv run --no-sync bash ./tests/functional/qa_distillation_megatron.sh
+run_test fast uv run --no-sync bash ./tests/functional/qa_distillation_megatron.sh
 run_test      uv run --no-sync bash ./tests/functional/dpo_megatron.sh
 run_test      uv run --no-sync bash ./tests/functional/sft_megatron.sh
 
 cd ${PROJECT_ROOT}/tests
-coverage combine .coverage*
+if compgen -G ".coverage*" > /dev/null; then
+    coverage combine .coverage*
+fi

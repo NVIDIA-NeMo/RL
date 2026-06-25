@@ -30,6 +30,39 @@ from nemo_rl.utils.flops_tracker import FLOPTracker, get_default_hf_config
 from tests.unit.test_utils import SimpleLossFn
 
 
+class _FakeTrainableModel:
+    def __init__(self):
+        self.train_called = False
+
+    def train(self):
+        self.train_called = True
+
+
+def test_dtensor_prepare_for_training_restores_optimizer(monkeypatch):
+    from nemo_rl.models.policy.workers.dtensor_policy_worker import (
+        DTensorPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(DTensorPolicyWorkerImpl)
+    model = _FakeTrainableModel()
+    restored_devices = []
+
+    worker.model = model
+    worker.optimizer = object()
+    worker.cpu_offload = False
+    worker.move_to_cuda = lambda model: model
+    worker.move_optimizer_to_device = lambda device: restored_devices.append(device)
+
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", lambda _name: None)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    DTensorPolicyWorkerImpl.prepare_for_training(worker)
+
+    assert model.train_called
+    assert restored_devices == ["cuda"]
+
+
 def create_test_config(
     model_name: str,
     tp: int = 1,

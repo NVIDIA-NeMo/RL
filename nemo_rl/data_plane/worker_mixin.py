@@ -43,6 +43,7 @@ from nemo_rl.data_plane.schema import (
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+from nemo_rl.utils.r3_trace import trace_tq_fetch_payload
 
 if TYPE_CHECKING:
     from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta
@@ -251,6 +252,11 @@ class TQWorkerMixin:
             # Reconstruct message_log after broadcast so the views alias
             # the per-rank local ``input_ids`` rather than the leader's.
             attach_message_log_view(data)
+            trace_tq_fetch_payload(
+                stage=meta.task_name or "unknown",
+                keys=meta.sample_ids,
+                data=data,
+            )
             if preprocess is not None:
                 data = preprocess(self, data)
             return data
@@ -267,6 +273,11 @@ class TQWorkerMixin:
             pad_to_seqlen=pad_to_seqlen,
         )
         attach_message_log_view(data)
+        trace_tq_fetch_payload(
+            stage=meta.task_name or "unknown",
+            keys=meta.sample_ids,
+            data=data,
+        )
         if preprocess is not None:
             data = preprocess(self, data)
         return data
@@ -375,7 +386,7 @@ class TQWorkerMixin:
     ) -> None:
         """Leader-only ``put_samples(meta.sample_ids, fields=...)``.
 
-        Per-token fields are jagged-packed via :func:`maybe_pack_jagged`
+        Per-token fields are jagged-packed via :func:`pack_per_token_field`
         so they land with the same row lengths as the initial put;
         without this a worker write-back (rectangular ``[N, S]``) would
         mismatch the jagged ``input_ids`` on the next read.

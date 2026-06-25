@@ -12,6 +12,12 @@
 #   Local NeMo RL source override:
 #     docker buildx build --build-context nemo-rl=. -f docker/Dockerfile --tag <registry>/nemo-rl:latest --push .
 #
+#   Custom setup:
+#     docker buildx build --build-context custom-setup=my-setup-dir/ --build-arg CUSTOM_SETUP_FNAME=my_script.sh -f docker/Dockerfile ...
+#
+#   To skip custom setup:
+#     docker buildx build --build-arg CUSTOM_SETUP_FNAME= -f docker/Dockerfile ...
+#
 # Optional build args to skip vLLM or SGLang dependencies:
 #   --build-arg SKIP_VLLM_BUILD=1    # Skip vLLM dependencies
 #   --build-arg SKIP_SGLANG_BUILD=1  # Skip SGLang dependencies
@@ -23,6 +29,11 @@ ADD --keep-git-dir=true https://github.com/NVIDIA-NeMo/RL.git#${NRL_GIT_REF} /
 
 # Empty default; CI overrides with --build-context to inject pre-compiled wheels
 FROM scratch AS uv-cache-seed
+
+# Default custom-setup stage: installs apptainer.
+# Override with: --build-context custom-setup=<your-dir>
+FROM scratch AS custom-setup
+COPY docker/install_apptainer.sh /
 
 FROM ${BASE_IMAGE} AS base
 # An environment variable to indicate that we are in a container.
@@ -55,6 +66,13 @@ apt install -y nsight-systems-cli
 # To fix CVE-2025-68973
 apt install -y --only-upgrade gnupg
 
+# Upgrade rsync to address security vulnerabilities
+apt-get install -y --only-upgrade rsync
+
+# Remove ffmpeg (from base image) to reduce attack surface
+apt-get remove -y --purge ffmpeg || true
+apt-get autoremove -y
+
 apt-get clean
 rm -rf /var/lib/apt/lists/*
 EOF
@@ -72,7 +90,7 @@ RUN GITHUB_ARTIFACTORY=github.com \
     && rm -rf "${CMAKE_INSTALLER}" "${CMAKE_INSTALLER}.tar.gz"
 
 # Install uv and python
-ARG UV_VERSION=0.11.6
+ARG UV_VERSION=0.11.18
 ARG PYTHON_VERSION=3.13.13
 ENV PATH="/root/.local/bin:$PATH"
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh && \
@@ -86,6 +104,7 @@ ENV RAY_USAGE_STATS_ENABLED=0
 # need to be compiled, so NeMo RL has an implementation in nemo_rl/utils/venv.py that does it once per node as opposed to once per task.
 ENV RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
+ENV NEMO_GYM_VENV_DIR=/opt/gym_venvs
 
 
 FROM base AS hermetic
@@ -146,12 +165,13 @@ elif [ -n "$SEED_KEY" ]; then
 fi
 
 uv venv --seed
+# The custom build scripts will alter the pyproject.toml and uv.lock
 if [[ -n "${BUILD_CUSTOM_VLLM:-}" ]]; then
-    bash tools/build-custom-vllm.sh ${BUILD_CUSTOM_VLLM_URL} ${BUILD_CUSTOM_VLLM_REF} ${BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION}
+    UV_LINK_MODE=hardlink bash tools/build-custom-vllm.sh ${BUILD_CUSTOM_VLLM_URL:-} ${BUILD_CUSTOM_VLLM_REF:-} ${BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION:-}
     source 3rdparty/vllm/nemo-rl.env
 fi
 if [[ -n "${BUILD_CUSTOM_FLASHINFER:-}" ]]; then
-    bash tools/build-custom-flashinfer.sh ${BUILD_CUSTOM_FLASHINFER_URL} ${BUILD_CUSTOM_FLASHINFER_REF}
+    bash tools/build-custom-flashinfer.sh ${BUILD_CUSTOM_FLASHINFER_URL:-} ${BUILD_CUSTOM_FLASHINFER_REF:-}
 fi
 # uv sync has a more reliable resolver than simple uv pip install which can fail
 
@@ -160,12 +180,12 @@ fi
 # Do everything in one layer to prevent large layers.
 
 # The venv is symlinked to avoid bloating the layer size
-uv sync --link-mode symlink --locked --no-install-project
+UV_LINK_MODE=hardlink uv sync --locked --no-install-project
 if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
-    uv sync --link-mode symlink --locked --extra vllm --no-install-project
+    UV_LINK_MODE=hardlink uv sync --locked --extra vllm --no-install-project
 fi
 if [[ -z "${SKIP_SGLANG_BUILD:-}" ]]; then
-    uv sync --link-mode symlink --locked --extra sglang --no-install-project
+    UV_LINK_MODE=hardlink uv sync --locked --extra sglang --no-install-project
 fi
 uv sync --link-mode symlink --locked --extra mcore --no-install-project
 uv sync --link-mode symlink --locked --extra automodel --no-install-project
@@ -191,6 +211,18 @@ ENV CUDNN_HOME=/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn
 ENV LD_LIBRARY_PATH="/opt/nemo_rl_venv/lib/python3.13/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH}"
 # Verify with: python -c "import transformer_engine.pytorch as te; print(te.get_cudnn_version())"
 
+# Custom setup layer (override with: --build-context custom-setup=<dir> --build-arg CUSTOM_SETUP_FNAME=<script>)
+# To skip: --build-arg CUSTOM_SETUP_FNAME=
+ARG CUSTOM_SETUP_FNAME=install_apptainer.sh
+RUN --mount=from=custom-setup,src=/,dst=/tmp/custom-setup <<"EOF" bash -exu
+if [[ -z "${CUSTOM_SETUP_FNAME}" ]]; then
+    echo "CUSTOM_SETUP_FNAME is empty, skipping custom setup"
+    exit 0
+fi
+cp /tmp/custom-setup/${CUSTOM_SETUP_FNAME} /opt/${CUSTOM_SETUP_FNAME}
+bash -x /opt/${CUSTOM_SETUP_FNAME}
+EOF
+
 WORKDIR /opt/nemo-rl
 
 FROM hermetic AS release
@@ -198,6 +230,9 @@ FROM hermetic AS release
 # Re-declare build args for this stage
 ARG SKIP_VLLM_BUILD
 ARG SKIP_SGLANG_BUILD
+# Space-separated config paths whose NeMo Gym venvs are prefetched into the image
+# (empty default = skip). Consumed by the gym prefetch RUN below.
+ARG NEMO_GYM_PREFETCH_CONFIGS=
 ARG NEMO_RL_COMMIT
 ARG NVIDIA_BUILD_ID
 ARG NVIDIA_BUILD_REF
@@ -210,6 +245,17 @@ LABEL com.nvidia.build.id="${NVIDIA_BUILD_ID}"
 LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
 
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
+
+# AWS EFA OFI plugin discovery (p4d / p5 / p5en multi-node NCCL via SRD).
+# The host's aws-efa-installer places libnccl-net-ofi.so under
+# /opt/amazon/ofi-nccl/lib and libfabric under /opt/amazon/efa/lib. Without
+# these on the linker search path, NCCL silently falls back to its socket
+# transport. Register both via ld.so.conf.d (so `ldconfig` populates the cache
+# once host paths are mounted at runtime) and LD_LIBRARY_PATH (so NCCL's
+# dlopen resolves the plugin even before `ldconfig` is re-run).
+RUN printf '%s\n' /opt/amazon/ofi-nccl/lib /opt/amazon/efa/lib \
+        > /etc/ld.so.conf.d/aws-efa.conf
+ENV LD_LIBRARY_PATH="/opt/amazon/ofi-nccl/lib:/opt/amazon/efa/lib:${LD_LIBRARY_PATH}"
 
 # Copy in source from build context (defaults to cloned repo, can be overridden)
 # Exclude pyproject.toml and uv.lock since those may be altered by build-custom-vllm.sh
@@ -233,6 +279,25 @@ else
 fi
 EOF
 
+# Prefetch NeMo Gym internal venvs (gym servers like code_gen, math_with_judge, etc.)
+# into the image. Gated on NEMO_GYM_PREFETCH_CONFIGS (no-op by default). Runs after the
+# source COPY above so examples/nemo_gym/prefetch_venvs.py is present.
+# The gym pins vllm==0.17.0 (default PyPI wheel is cu12); pin NEMO_GYM_CUDA and override vllm to
+# vLLM's matching prebuilt cu-wheel so the gym venvs share RL's torch/nvidia stack.
+ARG NEMO_GYM_CUDA=cu130
+ARG NEMO_GYM_VLLM_VERSION=0.17.0
+RUN <<"EOF" bash -exu
+if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
+    case "${TARGETARCH:-amd64}" in arm64) WHEEL_ARCH=aarch64 ;; *) WHEEL_ARCH=x86_64 ;; esac
+    GYM_VLLM_OVERRIDE=/opt/nemo-rl/.gym-vllm-override.txt
+    printf 'vllm @ https://github.com/vllm-project/vllm/releases/download/v%s/vllm-%s+%s-cp38-abi3-manylinux_2_35_%s.whl\n' \
+        "${NEMO_GYM_VLLM_VERSION}" "${NEMO_GYM_VLLM_VERSION}" "${NEMO_GYM_CUDA}" "${WHEEL_ARCH}" > "${GYM_VLLM_OVERRIDE}"
+    UV_TORCH_BACKEND="${NEMO_GYM_CUDA}" \
+    UV_OVERRIDE="${GYM_VLLM_OVERRIDE}" \
+    UV_LINK_MODE=symlink uv run python examples/nemo_gym/prefetch_venvs.py $NEMO_GYM_PREFETCH_CONFIGS
+    rm -f "${GYM_VLLM_OVERRIDE}"
+fi
+EOF
 # Generate container fingerprint for frozen environment support
 # Store outside /opt/nemo-rl to avoid being overwritten by user mounts
 RUN python tools/generate_fingerprint.py > /opt/nemo_rl_container_fingerprint
