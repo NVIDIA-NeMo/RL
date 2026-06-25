@@ -609,9 +609,7 @@ class MathMultiRewardEnvironment(BaseMathEnvironment):
             for name in reward_names:
                 results[name].extend(worker_scores[name])
 
-        # Use the correctness reward component (first key) for observations
-        assert reward_names is not None, "No reward components found from workers"
-        correctness_key = reward_names[0]
+        correctness_key = "reward/correctness"
         observations = [
             {
                 "role": "environment",
