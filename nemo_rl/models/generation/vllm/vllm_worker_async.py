@@ -683,7 +683,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
         # belongs on the render subclass.
         worker_self = self
 
-        class NeMoRLOpenAIServingChat(OpenAIServingChat):
+        class NeMoRLOpenAIServingChatMixin:
             async def chat_completion_full_generator(
                 self,
                 request,
@@ -718,6 +718,9 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     device=torch.device("cpu"),
                     logger=LOGGER,
                 )
+
+        class NeMoRLOpenAIServingChat(NeMoRLOpenAIServingChatMixin, OpenAIServingChat):
+            pass
 
         class NeMoRLOpenAIServingRender(NeMoRLOpenAIServingMixin, OpenAIServingRender):
             pass
