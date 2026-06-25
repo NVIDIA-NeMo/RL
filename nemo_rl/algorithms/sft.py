@@ -136,7 +136,6 @@ def setup(
     checkpointer = CheckpointManager(checkpointing_config)
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
     loaded_state = checkpointer.load_training_info(last_checkpoint_path)
-    sft_save_state: SFTSaveState
     if loaded_state is not None:
         # Filter to only known SFTSaveState fields; checkpoints may carry
         # extra keys (e.g. validation metrics from previous runs).
