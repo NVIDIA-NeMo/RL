@@ -48,6 +48,35 @@ class AbstractPolicyWorker:
         """Check if the worker is alive."""
         return True
 
+    def start_gen_benchmark_keepalive(self, interval_s: float = 60.0) -> None:
+        """Start a daemon thread that issues a tiny local matmul periodically.
+
+        Used only in generation-benchmark mode (``NRL_GEN_BENCHMARK_SKIP_TRAINING``),
+        where ``policy.train()`` is skipped and the policy GPUs would otherwise
+        look idle between refits and risk being reaped. The matmul is purely
+        local (no NCCL collectives), so it cannot desync weight-sync. Idempotent:
+        a second call is a no-op.
+        """
+        import threading
+        import time
+
+        if getattr(self, "_gen_benchmark_keepalive_started", False):
+            return
+        self._gen_benchmark_keepalive_started = True
+
+        device = torch.cuda.current_device()
+
+        def _keepalive_loop() -> None:
+            while True:
+                x = torch.randn(256, 256, device=device)
+                torch.matmul(x, x)
+                torch.cuda.synchronize(device)
+                time.sleep(interval_s)
+
+        threading.Thread(
+            target=_keepalive_loop, name="gen_benchmark_keepalive", daemon=True
+        ).start()
+
     def reset_peak_memory_stats(self) -> None:
         """Reset peak memory statistics."""
         torch.cuda.reset_peak_memory_stats()
