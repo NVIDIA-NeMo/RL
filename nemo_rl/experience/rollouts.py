@@ -548,7 +548,6 @@ def calculate_rewards(
         for i, idx in enumerate(indices):
             all_indices_order.append(idx)
             if is_dict_rewards:
-                assert all_dict_rewards is not None
                 for name in task_rewards:
                     all_dict_rewards[name].append(task_rewards[name][i])
             else:
