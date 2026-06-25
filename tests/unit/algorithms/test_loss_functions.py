@@ -20,6 +20,7 @@ from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
     ClippedPGLossFn,
     DistillationLossFn,
+    DPOLossConfig,
     DPOLossFn,
     NLLLossFn,
     prepare_loss_input,
@@ -133,13 +134,13 @@ def test_dpo_loss():
         batch_size=batch_size,
     )
     loss_fn = DPOLossFn(
-        cfg={
-            "reference_policy_kl_penalty": 0.0,
-            "preference_loss_weight": 1.0,
-            "sft_loss_weight": 0.0,
-            "preference_average_log_probs": False,
-            "sft_average_log_probs": False,
-        }
+        cfg=DPOLossConfig(
+            reference_policy_kl_penalty=0.0,
+            preference_loss_weight=1.0,
+            sft_loss_weight=0.0,
+            preference_average_log_probs=False,
+            sft_average_log_probs=False,
+        )
     )
 
     loss_input, data = prepare_loss_input(next_token_logits, data, loss_fn)
@@ -156,13 +157,13 @@ def test_dpo_loss():
     assert torch.isclose(loss.cpu(), -torch.nn.functional.logsigmoid(torch.tensor(0.0)))
 
     loss_fn_with_sft = DPOLossFn(
-        cfg={
-            "reference_policy_kl_penalty": 0.0,
-            "preference_loss_weight": 1.0,
-            "sft_loss_weight": 0.5,
-            "preference_average_log_probs": False,
-            "sft_average_log_probs": False,
-        }
+        cfg=DPOLossConfig(
+            reference_policy_kl_penalty=0.0,
+            preference_loss_weight=1.0,
+            sft_loss_weight=0.5,
+            preference_average_log_probs=False,
+            sft_average_log_probs=False,
+        )
     )
 
     loss_input, data = prepare_loss_input(next_token_logits, data, loss_fn_with_sft)
@@ -198,22 +199,22 @@ def test_dpo_loss_varying_sequence_lengths():
 
     # Create DPO loss function with preference_average_log_probs=True
     dpo_loss_fn_no_avg = DPOLossFn(
-        {
-            "reference_policy_kl_penalty": 0.1,
-            "preference_loss_weight": 1.0,
-            "sft_loss_weight": 0.5,
-            "preference_average_log_probs": False,
-            "sft_average_log_probs": False,
-        }
+        DPOLossConfig(
+            reference_policy_kl_penalty=0.1,
+            preference_loss_weight=1.0,
+            sft_loss_weight=0.5,
+            preference_average_log_probs=False,
+            sft_average_log_probs=False,
+        )
     )
     dpo_loss_fn_avg = DPOLossFn(
-        {
-            "reference_policy_kl_penalty": 0.1,
-            "preference_loss_weight": 1.0,
-            "sft_loss_weight": 0.5,
-            "preference_average_log_probs": True,
-            "sft_average_log_probs": True,
-        }
+        DPOLossConfig(
+            reference_policy_kl_penalty=0.1,
+            preference_loss_weight=1.0,
+            sft_loss_weight=0.5,
+            preference_average_log_probs=True,
+            sft_average_log_probs=True,
+        )
     )
 
     # Create test data with varying sequence lengths
@@ -336,13 +337,13 @@ def test_dpo_sft_matches_nll_loss():
 
     # Compute DPO loss with preference_loss_weight=0
     dpo_loss_fn = DPOLossFn(
-        cfg={
-            "reference_policy_kl_penalty": 0.0,
-            "preference_loss_weight": 0.0,  # Disable preference loss
-            "sft_loss_weight": 1.0,  # Only use SFT loss
-            "preference_average_log_probs": False,
-            "sft_average_log_probs": False,
-        }
+        cfg=DPOLossConfig(
+            reference_policy_kl_penalty=0.0,
+            preference_loss_weight=0.0,  # Disable preference loss
+            sft_loss_weight=1.0,  # Only use SFT loss
+            preference_average_log_probs=False,
+            sft_average_log_probs=False,
+        )
     )
     loss_input, dpo_data = prepare_loss_input(next_token_logits, dpo_data, dpo_loss_fn)
     dpo_loss, _ = dpo_loss_fn(
@@ -923,6 +924,66 @@ def test_clipped_pg_loss_kl_penalty():
         **loss_input,
     )
     torch.testing.assert_close(actual_loss, expected_loss)
+
+
+@pytest.mark.parametrize("use_on_policy_kl_approximation", [False, True])
+def test_clipped_pg_loss_kl_gradient_includes_sampling_term(
+    use_on_policy_kl_approximation,
+):
+    """Tests that KL gradients include the sampled-policy score term."""
+    curr_logprobs = torch.tensor([[-1.2, -0.7]])
+    prev_logprobs = torch.tensor([[-1.0, -0.8]])
+    generation_logprobs = torch.tensor([[-1.5, -0.4]])
+    reference_policy_logprobs = torch.tensor([[-0.9, -1.1]])
+    advantages = torch.tensor([[0.4, -0.2]])
+    beta = 0.3
+
+    def loss_gradient(reference_policy_kl_penalty):
+        next_token_logprobs = curr_logprobs.clone().requires_grad_(True)
+        data = BatchedDataDict(
+            {
+                "input_ids": torch.zeros((1, 3), dtype=torch.int64),
+                "token_mask": torch.tensor([[0, 1, 1]]),
+                "sample_mask": torch.tensor([1]),
+                "advantages": torch.cat([torch.zeros((1, 1)), advantages], dim=-1),
+                "prev_logprobs": torch.cat(
+                    [torch.zeros((1, 1)), prev_logprobs], dim=-1
+                ),
+                "generation_logprobs": torch.cat(
+                    [torch.zeros((1, 1)), generation_logprobs], dim=-1
+                ),
+                "reference_policy_logprobs": torch.cat(
+                    [torch.zeros((1, 1)), reference_policy_logprobs], dim=-1
+                ),
+            }
+        )
+        cfg = ClippedPGLossConfig(
+            reference_policy_kl_penalty=reference_policy_kl_penalty,
+            use_on_policy_kl_approximation=use_on_policy_kl_approximation,
+        )
+        loss_fn = ClippedPGLossFn(cfg)
+        loss, _ = loss_fn(
+            next_token_logprobs=next_token_logprobs,
+            data=data,
+            global_valid_seqs=torch.sum(data["sample_mask"]),
+            global_valid_toks=torch.sum(
+                data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+            ),
+        )
+        loss.backward()
+        return next_token_logprobs.grad
+
+    actual_kl_gradient = loss_gradient(beta) - loss_gradient(0.0)
+    log_ratio = reference_policy_logprobs - curr_logprobs
+    kl = torch.exp(log_ratio) - 1 - log_ratio
+    kl_gradient = 1 - torch.exp(log_ratio)
+    if use_on_policy_kl_approximation:
+        kl_weight = torch.exp(curr_logprobs - generation_logprobs)
+    else:
+        kl_weight = torch.ones_like(curr_logprobs)
+    expected_kl_gradient = beta * kl_weight * (kl + kl_gradient) / curr_logprobs.numel()
+
+    torch.testing.assert_close(actual_kl_gradient, expected_kl_gradient)
 
 
 # Masking tests - Should work with original Loss Fn if needed, but less critical

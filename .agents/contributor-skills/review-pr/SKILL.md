@@ -100,6 +100,7 @@ After all subagents return: merge results and deduplicate (same file+line+issue 
 - Analyze the diff against all guideline skills
 - For each changed file, read surrounding context locally using `Read` and `Grep` to understand the change in context
 - Cross-reference existing review comments (PR mode only, from step 4) to avoid duplicating points already raised by other reviewers
+- Compare any new component to its nearest existing analog in the repo (a new worker group ↔ `lm_policy.py`, a new advantage estimator ↔ the existing estimators, a new config block ↔ `MasterConfig`) and flag missing affordances: backend dispatch, override hooks (e.g. `resolve_policy_worker_cls`), guards/validation, type annotations, return-shape consistency. "It works for the shipped recipe" is not enough if it silently diverges from the sibling's contract
 - Also apply any patterns from review memory files
 - Categorize findings:
   - **[BUG]** — Logic errors, null refs, race conditions, syntax errors

@@ -393,16 +393,22 @@ class ClippedPGLossFn(LossFunction):
             #   reweighting samples from π_gen_filtered to π_curr_unfiltered
 
             # On-policy KL approximation
+            # KL samples come from the optimized policy, so the KL loss must include
+            # the score-function gradient through the sampling probability; see
+            # https://arxiv.org/abs/2506.09477v1. In the non-IS case,
+            # exp(x - x.detach()) has forward value 1 while preserving that gradient.
             if self.use_on_policy_kl_approximation:
                 # See: docs/guides/grpo.md#on-policy-kl-approximation
                 kl_importance_weights = torch.exp(
                     curr_logprobs_unfiltered - generation_logprobs
-                ).detach()
-                kl_importance_weights = torch.nan_to_num(
-                    kl_importance_weights, nan=0.0, posinf=0.0, neginf=0.0
                 )
             else:
-                kl_importance_weights = torch.ones_like(curr_logprobs_unfiltered)
+                kl_importance_weights = torch.exp(
+                    curr_logprobs_unfiltered - curr_logprobs_unfiltered.detach()
+                )
+            kl_importance_weights = torch.nan_to_num(
+                kl_importance_weights, nan=0.0, posinf=0.0, neginf=0.0
+            )
 
             # Compute KL loss
             kl = (
@@ -850,12 +856,12 @@ class PreferenceLossFn(LossFunction):
         }
 
 
-class DPOLossConfig(TypedDict):
-    reference_policy_kl_penalty: float
-    preference_loss_weight: float
-    sft_loss_weight: float
-    preference_average_log_probs: bool
-    sft_average_log_probs: bool
+class DPOLossConfig(BaseModel, extra="allow"):
+    reference_policy_kl_penalty: float = 0.05
+    preference_loss_weight: float = 1.0
+    sft_loss_weight: float = 0.0
+    preference_average_log_probs: bool = False
+    sft_average_log_probs: bool = False
 
 
 class DPOLossDataDict(TypedDict):
@@ -927,11 +933,11 @@ class DPOLossFn(PreferenceLossFn):
     input_type = LossInputType.LOGPROB
 
     def __init__(self, cfg: DPOLossConfig, use_linear_ce_fusion: bool = False):
-        self.reference_policy_kl_penalty = cfg["reference_policy_kl_penalty"]
-        self.preference_loss_weight = cfg["preference_loss_weight"]
-        self.sft_loss_weight = cfg["sft_loss_weight"]
-        self.preference_average_log_probs = cfg["preference_average_log_probs"]
-        self.sft_average_log_probs = cfg["sft_average_log_probs"]
+        self.reference_policy_kl_penalty = cfg.reference_policy_kl_penalty
+        self.preference_loss_weight = cfg.preference_loss_weight
+        self.sft_loss_weight = cfg.sft_loss_weight
+        self.preference_average_log_probs = cfg.preference_average_log_probs
+        self.sft_average_log_probs = cfg.sft_average_log_probs
         self.use_linear_ce_fusion = use_linear_ce_fusion
         self.sft_loss = NLLLossFn(use_linear_ce_fusion=use_linear_ce_fusion)
 

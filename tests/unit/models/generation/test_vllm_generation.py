@@ -469,6 +469,33 @@ def test_configure_generation_config_keeps_dummy_startup_weights_with_draft_refi
     assert configured["vllm_cfg"]["load_format"] == "dummy"
 
 
+@pytest.mark.parametrize("method", ["deepseek_mtp", "mtp"])
+def test_configure_generation_config_keeps_dummy_startup_weights_for_mtp(method):
+    """MTP keeps dummy startup weights even without draft refit.
+
+    The policy weights arrive via refit and only the MTP draft layer is loaded
+    from disk on the worker, so we must not force load_format="auto" (which would
+    read the full base-model checkpoint).
+    """
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["vllm_kwargs"] = {
+        "speculative_config": {
+            "method": method,
+            "num_speculative_tokens": 1,
+        }
+    }
+    tokenizer = MagicMock(pad_token_id=0, eos_token_id=1)
+
+    configured = configure_generation_config(
+        vllm_config,
+        tokenizer,
+        is_eval=False,
+        has_refit_draft_weights=False,
+    )
+
+    assert configured["vllm_cfg"]["load_format"] == "dummy"
+
+
 def get_basic_megatron_test_config(
     tp: int = 1,
     pp: int = 1,
@@ -942,12 +969,12 @@ def test_vllm_worker_seed_behavior(cluster, tokenizer):
 
         # Override the configure_worker method to always use the same seed
         def configure_worker_fixed_seed(num_gpus, bundle_indices=None):
-            resources, env_vars, init_kwargs = original_configure_worker(
+            resources, env_vars, init_kwargs, runtime_env = original_configure_worker(
                 num_gpus, bundle_indices
             )
             # Override with fixed seed
             init_kwargs["seed"] = 42
-            return resources, env_vars, init_kwargs
+            return resources, env_vars, init_kwargs, runtime_env
 
         VllmGenerationWorker.configure_worker = configure_worker_fixed_seed
 
@@ -2873,12 +2900,12 @@ def test_vllm_megatron_pipeline_parallel(cluster, tokenizer):
             }
         )
 
-        print("Creating Megatron policy with PP=2...")
-        megatron_policy = Policy(cluster, megatron_config, test_tokenizer)
-
         print("Creating vLLM policy...")
         vllm_policy = VllmGeneration(cluster, vllm_config)
         vllm_policy.finish_generation()
+
+        print("Creating Megatron policy with PP=2...")
+        megatron_policy = Policy(cluster, megatron_config, test_tokenizer)
 
         print("preparing refit info...")
         state_dict_info = megatron_policy.prepare_refit_info()

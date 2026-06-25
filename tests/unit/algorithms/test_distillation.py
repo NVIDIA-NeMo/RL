@@ -436,6 +436,126 @@ def test_validate_uses_nemo_gym_rollout_when_enabled(mock_components):
     assert isinstance(validation_timings, dict)
 
 
+def test_validate_logs_data_when_logger_provided(mock_components):
+    """Test that validation data is logged to JSONL when logger is provided."""
+    mock_batch = BatchedDataDict[DatumSpec](
+        {
+            "message_log": [
+                [
+                    {
+                        "role": "user",
+                        "content": "test1",
+                        "token_ids": torch.tensor([1, 2, 3]),
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "response1",
+                        "token_ids": torch.tensor([4, 5, 6]),
+                    },
+                ],
+            ],
+            "total_reward": torch.tensor([1.0]),
+        }
+    )
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 10.0}
+
+    mock_logger = MagicMock()
+    logged_data = {}
+
+    def capture_log(data, filename):
+        logged_data["data"] = data
+        logged_data["filename"] = filename
+
+    mock_logger.log_batched_dict_as_jsonl = MagicMock(side_effect=capture_log)
+
+    master_config = mock_components["master_config"]
+    master_config.distillation["val_batch_size"] = 1
+    master_config.logger["num_val_samples_to_print"] = 1
+
+    with (
+        patch(
+            "nemo_rl.algorithms.distillation.run_multi_turn_rollout",
+            return_value=(mock_batch, mock_rollout_metrics),
+        ),
+        patch(
+            "nemo_rl.algorithms.distillation._should_use_nemo_gym", return_value=False
+        ),
+        patch(
+            "nemo_rl.algorithms.distillation._should_use_async_rollouts",
+            return_value=False,
+        ),
+        patch("nemo_rl.algorithms.distillation.print_message_log_samples"),
+    ):
+        val_metrics, timing = validate(
+            mock_components["student_generation"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["val_task_to_env"],
+            step=5,
+            master_config=master_config,
+            logger=mock_logger,
+        )
+
+    mock_logger.log_batched_dict_as_jsonl.assert_called_once()
+    assert logged_data["filename"] == "val_data_step5.jsonl"
+    assert "content" in logged_data["data"]
+    assert "rewards" in logged_data["data"]
+
+
+def test_validate_works_without_logger(mock_components):
+    """Test that validation works when logger is None (backward compat)."""
+    mock_batch = BatchedDataDict[DatumSpec](
+        {
+            "message_log": [
+                [
+                    {
+                        "role": "user",
+                        "content": "test1",
+                        "token_ids": torch.tensor([1, 2, 3]),
+                    },
+                    {
+                        "role": "assistant",
+                        "content": "response1",
+                        "token_ids": torch.tensor([4, 5, 6]),
+                    },
+                ],
+            ],
+            "total_reward": torch.tensor([1.0]),
+        }
+    )
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 10.0}
+
+    master_config = mock_components["master_config"]
+    master_config.logger["num_val_samples_to_print"] = 1
+
+    with (
+        patch(
+            "nemo_rl.algorithms.distillation.run_multi_turn_rollout",
+            return_value=(mock_batch, mock_rollout_metrics),
+        ),
+        patch(
+            "nemo_rl.algorithms.distillation._should_use_nemo_gym", return_value=False
+        ),
+        patch(
+            "nemo_rl.algorithms.distillation._should_use_async_rollouts",
+            return_value=False,
+        ),
+        patch("nemo_rl.algorithms.distillation.print_message_log_samples"),
+    ):
+        val_metrics, timing = validate(
+            mock_components["student_generation"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["val_task_to_env"],
+            step=5,
+            master_config=master_config,
+            logger=None,
+        )
+
+    assert "accuracy" in val_metrics
+    assert "avg_length" in val_metrics
+
+
 def test_check_vocab_equality_pass(monkeypatch):
     student_tokenizer = MagicMock()
     student_tokenizer.get_vocab.return_value = {"a": 0, "b": 1}
