@@ -44,6 +44,29 @@ EXTRA_MOUNTS="${EXTRA_MOUNTS:-}"
 SIF_DIR="${SIF_DIR:-}"
 CONTAINER_FORMATTER="${CONTAINER_FORMATTER:-}"
 
+# ---- MTP speculative decoding (optional) ----
+# Set ENABLE_MTP_INFERENCE=1 to turn on MTP (multi-token prediction) speculative
+# decoding for vLLM inference. The MTP weights are part of the model and arrive
+# via refit, so no separate draft checkpoint is needed.
+# Tune via NUM_SPECULATIVE_TOKENS / MAX_NUM_BATCHED_TOKENS if needed.
+#   ENABLE_MTP_INFERENCE=1 ./super_launch.sh
+#   ENABLE_MTP_INFERENCE=1 NUM_SPECULATIVE_TOKENS=3 ./super_launch.sh
+ENABLE_MTP_INFERENCE="${ENABLE_MTP_INFERENCE:-0}"
+NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-5}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8480}"
+MTP_EXTRA_ARGS=""
+if [[ "${ENABLE_MTP_INFERENCE}" == "1" ]]; then
+    MTP_EXTRA_ARGS="\
+++policy.generation.vllm_cfg.enable_prefix_caching=true \
+++policy.generation.vllm_kwargs.enable_chunked_prefill=true \
+++policy.generation.vllm_kwargs.max_num_batched_tokens=${MAX_NUM_BATCHED_TOKENS} \
+++policy.generation.vllm_kwargs.mamba_cache_mode=align \
+~policy.generation.vllm_kwargs.compilation_config.cudagraph_capture_sizes \
+++policy.generation.vllm_kwargs.speculative_config.num_speculative_tokens=${NUM_SPECULATIVE_TOKENS} \
+++policy.generation.vllm_kwargs.speculative_config.method=mtp"
+    echo "MTP speculative decoding ENABLED (num_speculative_tokens=${NUM_SPECULATIVE_TOKENS})"
+fi
+
 # ---- Derived paths ----
 CODE_DIR=$(realpath "$PWD")
 WANDB_NAME="${EXP_NAME}"
@@ -154,6 +177,10 @@ fi
 
 if [[ -n "$CONTAINER_FORMATTER" ]]; then
     COMMAND="$COMMAND env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.container_formatter=${CONTAINER_FORMATTER}"
+fi
+
+if [[ -n "$MTP_EXTRA_ARGS" ]]; then
+    COMMAND="$COMMAND ${MTP_EXTRA_ARGS}"
 fi
 
 export CONTAINER
