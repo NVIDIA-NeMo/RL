@@ -1470,9 +1470,7 @@ def distributed_vocab_topk(
         # [B, chunk_size, V_local] (chunk_size driven by logprob_chunk_size).
         logits_chunk = vocab_parallel_logits[:, s0:s1, :].to(dtype=torch.float32)
         # local top-k on this TP rank
-        local_vals, local_idx_local = torch.topk(
-            logits_chunk, min(k, V_local), dim=-1
-        )
+        local_vals, local_idx_local = torch.topk(logits_chunk, min(k, V_local), dim=-1)
         local_idx_global = local_idx_local + int(vocab_start_index)
 
         # gather candidates from all TP ranks
