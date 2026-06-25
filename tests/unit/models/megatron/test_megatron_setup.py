@@ -1591,9 +1591,10 @@ class TestMakePolicyLikeConfig:
 
         assert policy_config["model_name"] == value_config["model_name"]
         assert policy_config["tokenizer"] == value_config["tokenizer"]
-        assert policy_config["logprob_batch_size"] == value_config[
-            "train_micro_batch_size"
-        ]
+        assert (
+            policy_config["logprob_batch_size"]
+            == value_config["train_micro_batch_size"]
+        )
         assert policy_config["sequence_packing"] == {"enabled": False}
         assert policy_config["max_grad_norm"] == 1.0
         assert policy_config["hf_config_overrides"] == {}
