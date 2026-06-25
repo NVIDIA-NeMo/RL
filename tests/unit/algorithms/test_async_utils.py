@@ -1621,7 +1621,6 @@ class TestPromptGrouping:
         assert torch.equal(grouping[0], grouping[2])
         assert not torch.equal(grouping[0], grouping[1])
 
-
     def test_grpo_loss_mask_excludes_assistant_prompt_history(self):
         """Test that assistant messages in the original prompt are not trained on."""
         original_prompt_messages = [
