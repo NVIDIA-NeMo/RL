@@ -53,7 +53,10 @@ policy:
     moe_token_dispatcher_type: allgather
     apply_rope_fusion: false
     mtp_num_layers: 0
-    freeze_vision_tower: true
+    freeze_config:
+      freeze_vision_model: true
+      freeze_vision_projection: true
+      freeze_language_model: false
     activation_checkpointing: true
     defer_fp32_logits: true
     fp8_cfg:
