@@ -62,7 +62,7 @@ from nemo_rl.environments.nemo_gym import (
 )
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
-    run_async_nemo_gym_rollout,
+    run_nemo_gym_rollout_sync,
     run_multi_turn_rollout,
 )
 from nemo_rl.models.generation.interfaces import (
@@ -762,7 +762,7 @@ def distillation_train(
                     # We cascade NeMo-Gym first since NeMo-Gym requires async rollouts.
                     if use_nemo_gym:
                         generation_config = master_config.policy["generation"]
-                        nemo_gym_rollout_result = run_async_nemo_gym_rollout(
+                        nemo_gym_rollout_result = run_nemo_gym_rollout_sync(
                             policy_generation=student_generation,
                             input_batch=repeated_batch,
                             tokenizer=tokenizer,
@@ -1160,7 +1160,7 @@ def validate(
             # We cascade NeMo-Gym first since NeMo-Gym requires async rollouts.
             if use_nemo_gym:
                 generation_config = master_config.policy["generation"]
-                nemo_gym_rollout_result = run_async_nemo_gym_rollout(
+                nemo_gym_rollout_result = run_nemo_gym_rollout_sync(
                     policy_generation=policy_generation,
                     input_batch=val_batch,
                     tokenizer=tokenizer,
