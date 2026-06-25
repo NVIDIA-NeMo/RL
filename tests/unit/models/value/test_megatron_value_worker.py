@@ -324,7 +324,17 @@ def test_value_worker_init_and_get_values(value_setup):
         (2, 1, 1, 1, {"dynamic_batching": True}),
         (2, 1, 1, 1, {"sequence_packing": True}),
         (2, 1, 2, 1, {"sequence_packing": True}),
-        (2, 1, 1, 2, {"sequence_packing": True, "context_parallel_size": 2}),
+        (
+            2,
+            1,
+            1,
+            2,
+            {
+                "sequence_packing": True,
+                "context_parallel_size": 2,
+                "precision": "bfloat16",
+            },
+        ),
     ],
     indirect=True,
     ids=[
