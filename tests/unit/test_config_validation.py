@@ -23,7 +23,10 @@ from pydantic import TypeAdapter, ValidationError
 
 from nemo_rl.algorithms.distillation import MasterConfig as DistillationMasterConfig
 from nemo_rl.algorithms.dpo import MasterConfig as DPOMasterConfig
-from nemo_rl.algorithms.grpo import MasterConfig as GRPOMasterConfig
+from nemo_rl.algorithms.grpo import (
+    MasterConfig as GRPOMasterConfig,
+    RewardPenaltyConfig,
+)
 from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
 from nemo_rl.algorithms.rm import MasterConfig as RMMasterConfig
 from nemo_rl.algorithms.sft import MasterConfig as SFTMasterConfig
@@ -150,6 +153,25 @@ def test_all_config_files_have_required_keys(config_file):
 
     # Validate the entire config using the appropriate MasterConfig
     validate_config_section(config_dict, master_config_class, config_file)
+
+
+def test_reward_penalty_config_requires_explicit_eos_token_id():
+    """EOS penalty requires an explicit token id at config validation time."""
+    with pytest.raises(ValidationError, match="reward_penalties.token_ids.eos"):
+        RewardPenaltyConfig(penalize_eos_token=True)
+
+    with pytest.raises(ValidationError, match="reward_penalties.token_ids.eos"):
+        RewardPenaltyConfig(penalize_eos_token=True, token_ids=None)
+
+    with pytest.raises(ValidationError, match="reward_penalties.token_ids.eos"):
+        RewardPenaltyConfig(penalize_eos_token=True, token_ids={})
+
+    config = RewardPenaltyConfig(
+        penalize_eos_token=True,
+        token_ids={"eos": 2},
+    )
+    assert config.token_ids is not None
+    assert config.token_ids.eos == 2
 
 
 @pytest.mark.parametrize("config_file", config_files)
