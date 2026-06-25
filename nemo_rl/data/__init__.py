@@ -126,9 +126,18 @@ class AIMEEvalDataConfig(TypedDict):
     """Config for AIME datasets."""
 
     max_input_seq_length: int
-    dataset_name: Literal["aime2024", "aime2025", "aime2026"]
+    dataset_name: Literal[
+        "AIME2024",
+        "AIME2025",
+        "AIME2026",
+        "aime2024",
+        "aime2025",
+        "aime2026",
+    ]
     prompt_file: NotRequired[str | None]
     system_prompt_file: NotRequired[str | None]
+    processor: NotRequired[str]
+    repeat: NotRequired[int]
 
 
 class GPQAEvalDataConfig(TypedDict):

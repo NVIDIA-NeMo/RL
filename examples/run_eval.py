@@ -24,6 +24,10 @@ from omegaconf import OmegaConf
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.datasets import AllTaskProcessedDataset, load_eval_dataset
 from nemo_rl.data.datasets.eval_datasets import _is_multimodal_dataset
+from nemo_rl.data.datasets.response_datasets import (
+    DATASET_REGISTRY,
+    load_response_dataset,
+)
 from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.utils import create_env
 from nemo_rl.evals.eval import MasterConfig, run_env_eval, setup
@@ -51,8 +55,12 @@ def setup_data(tokenizer, data_config, env_configs):
     print("Setting up data...")
 
     # load dataset
-    base_dataset = load_eval_dataset(data_config)
-    rekeyed_ds = base_dataset.rekeyed_ds
+    if data_config["dataset_name"] in DATASET_REGISTRY:
+        base_dataset = load_response_dataset(data_config)
+        rekeyed_ds = base_dataset.dataset
+    else:
+        base_dataset = load_eval_dataset(data_config)
+        rekeyed_ds = base_dataset.rekeyed_ds
 
     # Determine env from config: use explicit env_name if provided,
     # otherwise fall back to the single key in env_configs.

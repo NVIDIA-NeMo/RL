@@ -44,7 +44,9 @@ data:
   max_input_seq_length: ${generation.vllm_cfg.max_model_len} # useless since we directly use prompts in evaluation
   prompt_file: null
   system_prompt_file: null
-  dataset_name: "aime2024"
+  dataset_name: "AIME2024" # reuses the response dataset registry (RawDataset path)
+  processor: "math_hf_data_processor" # reads ground_truth from the assistant message
+  repeat: 1 # evaluate each problem once (response AIMEDataset defaults to 16)
 
 env:
   math:
