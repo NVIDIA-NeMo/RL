@@ -236,6 +236,20 @@ a single rank-level `[B_r, T_t, V_t]` bf16 tray and hands the student a CUDA
 IPC handle to it (same node), so the per-step transport cost is the ≈0.6 GB
 tray allocation rather than a host round-trip.
 
+## Evaluation
+
+Downstream benchmark accuracy of the distilled Llama-3.2-1B student
+(← Qwen3-4B, 100-step single-teacher run) against the base model:
+
+| Task | Base Llama-3.2-1B | Distilled |
+|---|---|---|
+| MMLU | 32.05 | 39.23 |
+| GSM8K | 5.69 | 6.14 |
+| HellaSwag | 65.08 | 61.46 |
+| Winogrande | 61.48 | 61.40 |
+| MATH | 5.48 | 4.72 |
+| **Avg** | **33.96** | **34.59** |
+
 ## Where files live
 
 | Stage | Tool | Default output |
