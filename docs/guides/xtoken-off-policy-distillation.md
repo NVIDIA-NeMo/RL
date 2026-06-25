@@ -1,4 +1,4 @@
-# Cross-Tokenizer (X-Token)
+# Cross-Tokenizer (X-Token) Distillation
 
 NeMo RL supports off-policy distillation between a student and a teacher that
 **do not share a tokenizer** — for example, distilling a Qwen3-4B teacher into
@@ -19,8 +19,8 @@ bridges.
 
 This guide explains how to:
 
-1. Produce the projection matrix from a (student, teacher) tokenizer pair
-2. Launch a distillation run that consumes it
+1. Create the projection matrix from a (student, teacher) tokenizer pair.
+2. Launch a distillation with the projection matrix.
 
 ## How it works
 
@@ -39,7 +39,7 @@ single `.pt` file. The final step is the actual distillation training loop.
                         │  └─────────────────┬──────────────────┘      │
                         │                    │                         │
                         │  ┌─────────────────▼──────────────────┐      │
-                        │  │ 2. (optional) reapply_exact_map.py │      │
+                        │  │ 2. reapply_exact_map.py            │      │
                         │  │    — pin exact 1-to-1 matches      │      │
                         │  └─────────────────┬──────────────────┘      │
                         │                    │                         │
@@ -72,15 +72,6 @@ student token that the teacher splits into pieces spreads its weight across
 those pieces (e.g., `201` → `2`, `0`, `1`). Rows are trimmed to the runtime
 `top_k` in Step 3, so low-weight tail entries are dropped (hatched cell).
 
-### Which prep steps are essential?
-
-Of the three prep steps, **Step 1 (multi-token mappings)** and
-**Step 3 (sort and trim)** are required — Step 1 builds the cross-vocab
-mapping itself, and Step 3 produces the runtime-format `.pt` the training
-loss expects. **Step 2 (reapply exact map) is optional** and pins exact
-1-to-1 token mappings on top of Step 1, but we found the best results
-on this branch by running **Steps 1 → 2 → 3**.
-
 ## Quickstart — single command
 
 For the typical case, `tools/x_token/build_projection_matrix.sh` chains
@@ -95,10 +86,8 @@ the prep steps with auto-derived intermediate paths:
 
 The wrapper writes the final matrix to
 `cross_tokenizer_data/projection_matrix_<student>_<teacher>_top<N>.pt`
-(override with `--final-output`). Pass `--skip-exact-map` to skip the
-optional Step 2, or `--no-{scale-trick,reverse-pass,special-token-mapping}`
-to tweak Step 1 defaults. Run `./tools/x_token/build_projection_matrix.sh
---help` for the full flag list.
+(override with `--final-output`). Further tweaks to step 1 defaults can be configured using `--no-{scale-trick,reverse-pass,special-token-mapping}`. Run `./tools/x_token/build_projection_matrix.sh
+--help` for the full list of options.
 
 The per-step recipes below are for advanced customization (non-default
 weight thresholds, hand-picked intermediate filenames, etc.).
@@ -138,7 +127,7 @@ Pass `--num-examples 50` to print a sample of student→teacher mappings after
 the matrix is built — useful for spot-checking that special tokens, numerals,
 and punctuation map to sensible teacher tokens.
 
-## Step 2 (optional) — Reapply exact-token map
+## Step 2 — Reapply exact-token map
 
 Tokenizers built with a similar algorithm (for example, BPE) typically share
 a sizable set of identical tokens — common punctuation, single ASCII
@@ -157,12 +146,11 @@ Output is written next to the input as `<basename>_exact_map_remapped.pt`.
 
 ## Step 3 — Sort and trim to runtime `top_k`
 
-The projection map is very sparse — each student token maps to at most 4–5
+We observe the projection map is very sparse — each student token maps to at most 4–5
 teacher tokens. This step sorts each row by weight, trims to the chosen
 runtime `top_k`, and stores the result as a sparse `[V_student, top_k]`
-representation (per-row indices plus weights). That sparse format is what the
-training loss consumes, and it avoids materializing a computationally
-expensive dense projection matrix of size `[student_vocab, teacher_vocab]`.
+representation (per-row indices plus weights). That sparse format avoids materializing a computationally
+expensive dense projection matrix of size `[student_vocab, teacher_vocab]` during distillation.
 
 ```bash
 uv run python -m tools.x_token.sort_and_cut_projection_matrix \
