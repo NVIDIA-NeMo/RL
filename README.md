@@ -389,7 +389,7 @@ NeMo RL supports two distillation recipes:
 | Recipe | Multi-teacher | Asynchronous | Policy | Loss | Tokenizer | Backend |
 |---|---|---|---|---|---|---|
 | MOPD | Yes | Yes | On-policy | Top-1 sampled (RL-style) | Same | Megatron |
-| xToken | No | No (sync) | Off-policy | Full-logit (KL) | Same or different | DTensor V2 |
+| xToken | Yes | No | Off-policy | Full-logit (KL) | Same or different | DTensor V2 |
 
 ## On-policy Distillation
 
@@ -438,7 +438,7 @@ sbatch \
 
 We support distillation between a student and a teacher that **do not share a tokenizer** (cross-tokenizer, or "x-token", distillation) — for example, distilling a `Qwen/Qwen3-4B` teacher into a `meta-llama/Llama-3.2-1B` student. The reference recipe trains on the ungated, CC-BY-4.0 [Nemotron-Pretraining-Specialized-v1.1](https://huggingface.co/datasets/nvidia/Nemotron-Pretraining-Specialized-v1.1) corpus (`Nemotron-Pretraining-Formal-Logic` subset).
 
-You can read about the details of the x-token distillation implementation [here](docs/guides/xtoken-off-policy-distillation.md) and [here](https://arxiv.org/abs/2605.21699), including how the (student, teacher) projection matrix is built and how the loss modes work.
+For more detais on X-Token, refer to the [guide](docs/guides/xtoken-off-policy-distillation.md) and the accompanying [technical report](https://arxiv.org/abs/2605.21699).
 
 Before launching a run, build the projection matrix for your (student, teacher) tokenizer pair:
 
