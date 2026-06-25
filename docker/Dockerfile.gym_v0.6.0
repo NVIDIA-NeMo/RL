@@ -13,6 +13,9 @@
 #
 # Optional vLLM wheel override for the Gym venvs:
 #   --build-arg NEMO_GYM_VLLM_VERSION=0.17.0 --build-arg NEMO_GYM_CUDA=cu129
+#
+# The default base image is hosted on NGC. Authenticate to NGC before building
+# if your environment does not already have access.
 
 ARG BASE_IMAGE=nvcr.io/nvidia/nemo-rl:v0.6.0
 FROM ${BASE_IMAGE}
