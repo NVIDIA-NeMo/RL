@@ -719,7 +719,7 @@ class MegatronPolicyWorkerImpl(
                     self._first_train_step_forward_pre_hook_disabled = False
 
                 warn_if_inf_grad_norm(grad_norm)
-                
+
                 # Empty unused memory.
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 2:
                     torch.cuda.empty_cache()

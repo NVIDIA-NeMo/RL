@@ -64,7 +64,6 @@ Usage:
 
 import argparse
 import json
-import os
 import shutil
 import sys
 from pathlib import Path
@@ -144,7 +143,9 @@ def describe_token(tokenizer, idx: int) -> str:
         return "?"
 
 
-def load_embedding_tensor_from_shard(shard_path: Path, key: str) -> Optional[torch.Tensor]:
+def load_embedding_tensor_from_shard(
+    shard_path: Path, key: str
+) -> Optional[torch.Tensor]:
     """Load a single tensor from a safetensors shard without loading the whole file."""
     if not HAS_SAFETENSORS:
         return None
@@ -157,9 +158,7 @@ def load_embedding_tensor_from_shard(shard_path: Path, key: str) -> Optional[tor
     return None
 
 
-def find_key_in_shards(
-    index: dict, key: str
-) -> Optional[str]:
+def find_key_in_shards(index: dict, key: str) -> Optional[str]:
     """Return the shard filename that contains *key*, or None."""
     return index.get("weight_map", {}).get(key)
 
@@ -181,7 +180,10 @@ def is_tied_embeddings(ckpt_dir: Path) -> Optional[bool]:
 # Core reinit logic
 # ---------------------------------------------------------------------------
 
-def compute_healthy_std(weights: torch.Tensor, zero_indices: list[int], threshold: float) -> float:
+
+def compute_healthy_std(
+    weights: torch.Tensor, zero_indices: list[int], threshold: float
+) -> float:
     """Estimate std from rows whose norm is >= threshold (i.e. the healthy rows)."""
     norms = weights.float().norm(dim=1)
     healthy_mask = norms >= threshold
@@ -199,9 +201,10 @@ def reinit_near_zero_rows(
     key: str,
     tokenizer=None,
 ) -> tuple[torch.Tensor, list[int]]:
-    """
-    Identify rows with L2-norm < threshold and replace them with random samples
-    drawn from N(0, sigma) where sigma = std of healthy rows.
+    """Identify rows with L2-norm < threshold and replace them.
+
+    Replacement values are random samples drawn from N(0, sigma) where sigma = std
+    of healthy rows.
 
     Returns (patched_weights, list_of_reinitialized_indices).
     """
@@ -213,12 +216,16 @@ def reinit_near_zero_rows(
     zero_indices = zero_mask.nonzero(as_tuple=True)[0].tolist()
 
     if not zero_indices:
-        print(f"  [{key}] No near-zero rows found (threshold={threshold:.2e}). Nothing to do.")
+        print(
+            f"  [{key}] No near-zero rows found (threshold={threshold:.2e}). Nothing to do."
+        )
         return weights, []
 
     sigma = compute_healthy_std(wf, zero_indices, threshold)
-    print(f"  [{key}] Found {len(zero_indices)} near-zero row(s). "
-          f"Reinitializing with N(0, sigma={sigma:.6f})")
+    print(
+        f"  [{key}] Found {len(zero_indices)} near-zero row(s). "
+        f"Reinitializing with N(0, sigma={sigma:.6f})"
+    )
 
     rng = torch.Generator()
     rng.manual_seed(seed)
@@ -228,8 +235,10 @@ def reinit_near_zero_rows(
         token_repr = describe_token(tokenizer, idx)
         new_row = torch.empty(wf.shape[1]).normal_(mean=0.0, std=sigma, generator=rng)
         patched[idx] = new_row
-        print(f"    ID {idx:6d}: {token_repr}  "
-              f"norm_before={norms[idx]:.4e}  norm_after={new_row.norm():.4e}")
+        print(
+            f"    ID {idx:6d}: {token_repr}  "
+            f"norm_before={norms[idx]:.4e}  norm_after={new_row.norm():.4e}"
+        )
 
     # Restore original dtype
     return patched.to(orig_dtype), zero_indices
@@ -238,6 +247,7 @@ def reinit_near_zero_rows(
 # ---------------------------------------------------------------------------
 # Checkpoint I/O
 # ---------------------------------------------------------------------------
+
 
 def load_safetensors_index(ckpt_dir: Path) -> Optional[dict]:
     for name in ["model.safetensors.index.json", "pytorch_model.bin.index.json"]:
@@ -278,14 +288,16 @@ def patch_safetensors_checkpoint(
                 keys_to_patch[key] = weight_map[key]
                 break  # only one output-embedding key expected
     elif tied:
-        print("  Output embeddings are tied to input embeddings – no separate output patch needed.")
+        print(
+            "  Output embeddings are tied to input embeddings – no separate output patch needed."
+        )
 
     if not keys_to_patch:
         # Single-file checkpoint (model.safetensors) – no index
         single = input_dir / "model.safetensors"
         if single.exists():
             keys_to_patch = {}  # will be detected per-tensor below
-            weight_map = {}     # signal single-file mode
+            weight_map = {}  # signal single-file mode
             print("  Single-file safetensors checkpoint detected.")
         else:
             raise FileNotFoundError(
@@ -302,7 +314,9 @@ def patch_safetensors_checkpoint(
             shard_to_keys.setdefault(shard, []).append(key)
     else:
         # Single-file: load all keys from model.safetensors
-        shard_to_keys["model.safetensors"] = list(keys_to_patch.keys()) or _discover_embedding_keys(input_dir / "model.safetensors")
+        shard_to_keys["model.safetensors"] = list(
+            keys_to_patch.keys()
+        ) or _discover_embedding_keys(input_dir / "model.safetensors")
 
     # -------------------------------------------------------------------
     # Process each relevant shard
@@ -328,8 +342,11 @@ def patch_safetensors_checkpoint(
                 continue
             print(f"\n  Checking key: {key}  shape={tuple(all_tensors[key].shape)}")
             patched, changed_ids = reinit_near_zero_rows(
-                all_tensors[key], threshold=threshold, seed=seed,
-                key=key, tokenizer=tokenizer
+                all_tensors[key],
+                threshold=threshold,
+                seed=seed,
+                key=key,
+                tokenizer=tokenizer,
             )
             if changed_ids:
                 all_tensors[key] = patched
@@ -390,6 +407,7 @@ def _discover_embedding_keys(shard_path: Path) -> list[str]:
 # Statistics helper
 # ---------------------------------------------------------------------------
 
+
 def print_embedding_stats(
     weights: torch.Tensor,
     key: str,
@@ -412,11 +430,17 @@ def print_embedding_stats(
     print(f"\n=== {key} ===")
     print(f"  Shape  : {tuple(weights.shape)}")
     print(f"  Dtype  : {weights.dtype}")
-    print(f"  Norm   : min={norms.min():.4e}  mean={norms.mean():.4e}  max={norms.max():.4e}")
-    print(f"  Stats  : mean_abs={wf.abs().mean():.6f}  max_abs={wf.abs().max():.6f}"
-          f"  std_range=[{row_stds.min():.6f}, {row_stds.max():.6f}]")
-    print(f"  Near-zero rows (norm < {threshold:.2e}): {len(zero_indices)}/{total}"
-          f" ({100 * len(zero_indices) / total:.1f}%)")
+    print(
+        f"  Norm   : min={norms.min():.4e}  mean={norms.mean():.4e}  max={norms.max():.4e}"
+    )
+    print(
+        f"  Stats  : mean_abs={wf.abs().mean():.6f}  max_abs={wf.abs().max():.6f}"
+        f"  std_range=[{row_stds.min():.6f}, {row_stds.max():.6f}]"
+    )
+    print(
+        f"  Near-zero rows (norm < {threshold:.2e}): {len(zero_indices)}/{total}"
+        f" ({100 * len(zero_indices) / total:.1f}%)"
+    )
     if zero_indices:
         print(f"  Indices: {format_index_ranges(zero_indices)}")
         print("  Tokens :")
@@ -424,14 +448,18 @@ def print_embedding_stats(
             emb = wf[i]
             first_two = emb[:2].tolist()
             last_two = emb[-2:].tolist()
-            print(f"    ID {i:6d}: {describe_token(tokenizer, i)}  norm={norms[i]:.4e}"
-                  f"  values=[{first_two[0]:.2e},{first_two[1]:.2e},...,"
-                  f"{last_two[0]:.2e},{last_two[1]:.2e}]")
+            print(
+                f"    ID {i:6d}: {describe_token(tokenizer, i)}  norm={norms[i]:.4e}"
+                f"  values=[{first_two[0]:.2e},{first_two[1]:.2e},...,"
+                f"{last_two[0]:.2e},{last_two[1]:.2e}]"
+            )
         if len(zero_indices) > 30:
             print(f"    ... and {len(zero_indices) - 30} more")
 
-    print(f"  Identical rows (std < {identical_threshold:.2e}): {len(identical_indices)}/{total}"
-          f" ({100 * len(identical_indices) / total:.1f}%)")
+    print(
+        f"  Identical rows (std < {identical_threshold:.2e}): {len(identical_indices)}/{total}"
+        f" ({100 * len(identical_indices) / total:.1f}%)"
+    )
     if identical_indices:
         print(f"  Indices: {format_index_ranges(identical_indices)}")
         print("  Tokens :")
@@ -439,9 +467,11 @@ def print_embedding_stats(
             emb = wf[i]
             first_two = emb[:2].tolist()
             last_two = emb[-2:].tolist()
-            print(f"    ID {i:6d}: {describe_token(tokenizer, i)}  std={row_stds[i]:.4e}"
-                  f"  values=[{first_two[0]:.2e},{first_two[1]:.2e},...,"
-                  f"{last_two[0]:.2e},{last_two[1]:.2e}]")
+            print(
+                f"    ID {i:6d}: {describe_token(tokenizer, i)}  std={row_stds[i]:.4e}"
+                f"  values=[{first_two[0]:.2e},{first_two[1]:.2e},...,"
+                f"{last_two[0]:.2e},{last_two[1]:.2e}]"
+            )
         if len(identical_indices) > 30:
             print(f"    ... and {len(identical_indices) - 30} more")
 
@@ -488,7 +518,9 @@ def _find_and_load_embedding(
             continue
         tensor = load_embedding_tensor_from_shard(shard_path, key)
         if tensor is not None:
-            return print_embedding_stats(tensor, key, threshold, tokenizer, identical_threshold)
+            return print_embedding_stats(
+                tensor, key, threshold, tokenizer, identical_threshold
+            )
     return None
 
 
@@ -510,7 +542,12 @@ def run_stats(
 
     # Input embeddings
     summary = _find_and_load_embedding(
-        EMBEDDING_KEY_CANDIDATES, weight_map, input_dir, threshold, tokenizer, identical_threshold
+        EMBEDDING_KEY_CANDIDATES,
+        weight_map,
+        input_dir,
+        threshold,
+        tokenizer,
+        identical_threshold,
     )
     if summary is not None:
         summary["layer_label"] = "Input Embeddings"
@@ -520,7 +557,9 @@ def run_stats(
 
     # Output embeddings (separate analysis only when not tied)
     if tied:
-        print("\nOutput embeddings are tied to input embeddings – skipping separate output analysis.")
+        print(
+            "\nOutput embeddings are tied to input embeddings – skipping separate output analysis."
+        )
     else:
         out_summary = _find_and_load_embedding(
             OUTPUT_EMBEDDING_KEY_CANDIDATES,
@@ -568,7 +607,7 @@ def run_stats(
             else:
                 print("OK - No obvious untrained patterns detected")
 
-        print(f"\n=== Final Summary ===")
+        print("\n=== Final Summary ===")
         print(f"Checkpoint: {input_dir}")
         print("Analysis complete.")
 
@@ -576,6 +615,7 @@ def run_stats(
 # ---------------------------------------------------------------------------
 # Hub resolution
 # ---------------------------------------------------------------------------
+
 
 def resolve_input(input_str: str) -> Path:
     """Return a local Path for *input_str*.
@@ -599,7 +639,9 @@ def resolve_input(input_str: str) -> Path:
         )
         sys.exit(1)
 
-    print(f"'{input_str}' is not a local directory – downloading from HuggingFace Hub ...")
+    print(
+        f"'{input_str}' is not a local directory – downloading from HuggingFace Hub ..."
+    )
     local_dir = snapshot_download(repo_id=input_str)
     print(f"Downloaded to: {local_dir}")
     return Path(local_dir)
@@ -608,6 +650,7 @@ def resolve_input(input_str: str) -> Path:
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -618,20 +661,20 @@ def parse_args() -> argparse.Namespace:
         "--input",
         required=True,
         help="Local path to a HuggingFace checkpoint directory, or a Hub model ID "
-             "(e.g. nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-Base-BF16). "
-             "Hub model IDs are downloaded to the local HF cache automatically.",
+        "(e.g. nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-Base-BF16). "
+        "Hub model IDs are downloaded to the local HF cache automatically.",
     )
     p.add_argument(
         "--output",
         default=None,
         help="Output directory for the patched checkpoint. "
-             "Required unless --in-place or --dry-run is set.",
+        "Required unless --in-place or --dry-run is set.",
     )
     p.add_argument(
         "--in-place",
         action="store_true",
         help="Overwrite the input checkpoint shard files in place. "
-             "Make a backup first!",
+        "Make a backup first!",
     )
     p.add_argument(
         "--dry-run",
@@ -660,14 +703,14 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1e-8,
         help="Std-dev threshold below which a row is considered identical/constant "
-             "(reported in --stats-only mode).",
+        "(reported in --stats-only mode).",
     )
     p.add_argument(
         "--tokenizer",
         default=None,
         help="HuggingFace model name or local path to use as the tokenizer. "
-             "Defaults to --input (checkpoint directories already bundle tokenizer files). "
-             "Only needed if you want to use a different tokenizer than the one in the checkpoint.",
+        "Defaults to --input (checkpoint directories already bundle tokenizer files). "
+        "Only needed if you want to use a different tokenizer than the one in the checkpoint.",
     )
     return p.parse_args()
 
@@ -694,7 +737,12 @@ def main() -> None:
         )
         sys.exit(1)
 
-    if not args.in_place and not args.dry_run and not args.stats_only and args.output is None:
+    if (
+        not args.in_place
+        and not args.dry_run
+        and not args.stats_only
+        and args.output is None
+    ):
         print(
             "ERROR: Specify --output <dir>, --in-place, --dry-run, or --stats-only.",
             file=sys.stderr,
@@ -719,18 +767,28 @@ def main() -> None:
     tokenizer = None
     try:
         from transformers import AutoTokenizer
+
         print(f"Loading tokenizer from {tokenizer_source} ...")
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_source, trust_remote_code=True
+        )
         print(f"Tokenizer loaded. Vocab size: {len(tokenizer)}")
     except Exception as e:
-        print(f"WARNING: Could not load tokenizer ({e}). Token IDs will not be decoded.")
+        print(
+            f"WARNING: Could not load tokenizer ({e}). Token IDs will not be decoded."
+        )
 
     print(f"\nCheckpoint : {input_dir}")
     print(f"Threshold  : {args.threshold:.2e}")
     print(f"Seed       : {args.seed}")
 
     if args.stats_only:
-        run_stats(input_dir, args.threshold, tokenizer, identical_threshold=args.identical_threshold)
+        run_stats(
+            input_dir,
+            args.threshold,
+            tokenizer,
+            identical_threshold=args.identical_threshold,
+        )
         return
 
     patch_safetensors_checkpoint(
