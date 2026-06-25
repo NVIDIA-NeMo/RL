@@ -789,6 +789,12 @@ def setup(
     # Define initialization functions that will be used in all paths
     init_reference_model = loss_config.reference_policy_kl_penalty > 0
 
+    # Benchmark mode performs no training, so there is no KL term and no
+    # reference model to build. The auto-enable block below then turns on
+    # skip_reference_policy_logprobs_calculation.
+    if _gen_benchmark_skip_training():
+        init_reference_model = False
+
     # Auto-enable skip_reference_policy_logprobs_calculation when the reference model is not loaded.
     if not init_reference_model and not grpo_config.get(
         "skip_reference_policy_logprobs_calculation"
@@ -815,7 +821,7 @@ def setup(
             processor=processor,
             weights_path=weights_path,
             optimizer_path=optimizer_path,
-            init_optimizer=True,
+            init_optimizer=not _gen_benchmark_skip_training(),
             init_reference_model=init_reference_model,
         )
         return p, time.perf_counter() - t0
@@ -3136,6 +3142,39 @@ def aggregate_rollout_metrics(
     return aggregated
 
 
+def _gen_benchmark_skip_training() -> bool:
+    """Whether to run async GRPO in generation-benchmark mode.
+
+    Controlled by the ``NRL_GEN_BENCHMARK_SKIP_TRAINING`` environment variable
+    (truthy values: 1/true/yes/on). In this mode the optimizer is not built and
+    policy.train() is replaced with zero-valued metrics, while generation,
+    refit/weight-sync, and the trajectory-collector cadence are preserved so
+    generation throughput can be benchmarked with training pinned to a minimal
+    (e.g. single-GPU) policy cluster. Async GRPO only.
+    """
+    return os.environ.get("NRL_GEN_BENCHMARK_SKIP_TRAINING", "").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _make_benchmark_dummy_train_results() -> dict[str, Any]:
+    """Zero-valued stand-in for policy.train() output in gen-benchmark mode.
+
+    Matches the keys the async metrics path consumes: ``loss`` and ``grad_norm``
+    are CPU tensors (the consumer calls ``.numpy()`` on them) and
+    ``all_mb_metrics`` is an empty dict. ``moe_metrics`` / ``mtp_metrics`` are
+    optional (guarded by ``in`` checks) and intentionally omitted.
+    """
+    return {
+        "loss": torch.zeros(1),
+        "grad_norm": torch.zeros(1),
+        "all_mb_metrics": {},
+    }
+
+
 def async_grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -3342,6 +3381,12 @@ def async_grpo_train(
     trajectory_collector.set_weight_version.remote(weight_version)
 
     print("📦 Started continuous background trajectory collection")
+
+    if _gen_benchmark_skip_training():
+        # Training is skipped, so the policy GPUs would look idle between refits.
+        # Start a tiny NCCL-free keep-alive matmul to avoid idle-GPU reapers.
+        print("🫀 Starting gen-benchmark keep-alive on policy workers")
+        policy.start_gen_benchmark_keepalive()
 
     print(
         f"🚀 Starting async GRPO training with buffer_size={optimal_buffer_size}, max_age={max_trajectory_age_steps} steps"
@@ -3731,18 +3776,27 @@ def async_grpo_train(
                         train_data["advantages"], master_config.grpo
                     )
 
-                print("▶ Preparing for training...")
-                with timer.time("training_prep"):
-                    policy.prepare_for_training()
+                if _gen_benchmark_skip_training():
+                    # Benchmark mode: skip optimizer/forward/backward entirely and
+                    # return zero-valued metrics. Still mark generation stale so the
+                    # refit below runs every step, preserving the real weight-sync
+                    # cadence we want to measure.
+                    print("▶ Skipping training (gen_benchmark_skip_training)...")
                     POLICY_GENERATION_STALE = True
+                    train_results = _make_benchmark_dummy_train_results()
+                else:
+                    print("▶ Preparing for training...")
+                    with timer.time("training_prep"):
+                        policy.prepare_for_training()
+                        POLICY_GENERATION_STALE = True
 
-                print("▶ Training policy...")
-                with timer.time("policy_training"):
-                    train_results = policy.train(
-                        train_data,
-                        loss_fn,
-                        timer=timer,
-                    )
+                    print("▶ Training policy...")
+                    with timer.time("policy_training"):
+                        train_results = policy.train(
+                            train_data,
+                            loss_fn,
+                            timer=timer,
+                        )
 
                 print("🔄 Synchronizing policy weights to trajectory collector…")
                 generation_logger_metrics = None

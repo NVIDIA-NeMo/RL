@@ -405,6 +405,19 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             is_source=is_source,
         )
 
+    def start_gen_benchmark_keepalive(self) -> None:
+        """Start the generation-benchmark keep-alive matmul on all policy workers.
+
+        Used only when ``NRL_GEN_BENCHMARK_SKIP_TRAINING`` is set: training is
+        skipped, so this issues a tiny NCCL-free local matmul on each worker to
+        keep otherwise-idle policy GPUs from being reaped. See
+        ``AbstractPolicyWorker.start_gen_benchmark_keepalive``.
+        """
+        futures = self.worker_group.run_all_workers_single_data(
+            "start_gen_benchmark_keepalive"
+        )
+        ray.get(futures)
+
     # ── DP-shard helpers ────────────────────────────────────────────────
     # DRY for Policy's logprob/train methods only. The data-plane sibling
     # TQPolicy shards KVBatchMeta via ``shard_meta_for_dp``; the
