@@ -73,7 +73,11 @@ def _get_local_node_ip() -> str:
 
 
 def _mooncake_transport_config() -> dict:
-    protocol = os.environ.get("MC_MOONCAKE_PROTOCOL", "tcp")
+    # Default to RDMA so production clusters (RoCE/IB) pick up the
+    # zero-copy MooncakeStore path without needing env tweaks. Hosts
+    # without an mlx5 device fall back to TCP below so the dev path
+    # (laptop, non-RDMA cluster) still works.
+    protocol = os.environ.get("MC_MOONCAKE_PROTOCOL", "rdma")
     if protocol != "rdma":
         return {"protocol": "tcp"}
     device = os.environ.get("MC_MOONCAKE_DEVICE", "")
@@ -84,7 +88,7 @@ def _mooncake_transport_config() -> dict:
                     "sh",
                     "-c",
                     "for d in /sys/class/infiniband/mlx5_*/ports/1/link_layer; do "
-                    "  test -f $d && grep -q Ethernet $d && basename $(dirname $(dirname $d)); "
+                    "  test -f $d && grep -q Ethernet $d && basename $(dirname $(dirname $(dirname $d))); "
                     "done | head -1",
                 ],
                 check=False,
@@ -94,8 +98,16 @@ def _mooncake_transport_config() -> dict:
             device = out or ""
         except Exception:
             device = ""
-    if device:
-        os.environ.setdefault("MC_GID_INDEX", os.environ.get("MC_GID_INDEX", "3"))
+    if not device:
+        warnings.warn(
+            "MC_MOONCAKE_PROTOCOL=rdma requested (default) but no "
+            "RoCE-capable mlx5 device detected under /sys/class/infiniband; "
+            "falling back to TCP. Set MC_MOONCAKE_PROTOCOL=tcp to silence.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return {"protocol": "tcp"}
+    os.environ.setdefault("MC_GID_INDEX", os.environ.get("MC_GID_INDEX", "3"))
     return {"protocol": "rdma", "device_name": device}
 
 
@@ -157,6 +169,17 @@ def _patch_tq_actor_runtime_env() -> None:
     """
     global _TQ_RUNTIME_ENV_PATCHED
     if _TQ_RUNTIME_ENV_PATCHED:
+        return
+
+    # Escape hatch — when the base venv on every node already has TQ (e.g.
+    # `NRL_FORCE_REBUILD_VENVS=true` rebuilt the worker venv from pyproject
+    # before this driver started), the runtime_env injection is pure overhead:
+    # Ray builds a redundant isolated per-actor venv and pip-installs TQ into
+    # it, which at Ray scale can fail the `TransferQueueController` import on
+    # workers. Set NRL_DISABLE_TQ_RUNTIME_ENV=1 to skip the injection and let
+    # actors inherit the base venv.
+    if os.environ.get("NRL_DISABLE_TQ_RUNTIME_ENV", "") == "1":
+        _TQ_RUNTIME_ENV_PATCHED = True
         return
 
     runtime_env = {"pip": [_resolve_tq_pin()]}
