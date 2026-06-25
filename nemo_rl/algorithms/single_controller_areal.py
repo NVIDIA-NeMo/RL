@@ -44,6 +44,7 @@ import torch
 from nemo_rl.algorithms.async_utils.staleness_sampler import StalenessSampler
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
+    AsyncRLConfig,
     MasterConfig,
     WeightSyncConfig,
 )
@@ -147,23 +148,13 @@ class SingleControllerArealActor:
                 flush=True,
             )
 
-        if not self._async_cfg.over_sampling:
-            expected_buffer = self._async_cfg.target_prompt_groups_per_step * (
-                self._async_cfg.max_weight_staleness_versions + 1
-            )
-            if self._async_cfg.max_buffered_rollouts != expected_buffer:
-                raise ValueError(
-                    f"over_sampling=False requires max_buffered_rollouts "
-                    f"({self._async_cfg.max_buffered_rollouts}) == "
-                    f"target_prompt_groups_per_step * (max_weight_staleness_versions + 1) "
-                    f"({expected_buffer})"
-                )
-
-        if self._async_cfg.force_in_order and self._async_cfg.over_sampling:
-            raise ValueError(
-                "force_in_order=True requires over_sampling=False so that each "
-                "dispatched batch corresponds to exactly one target training step."
-            )
+        # AReaL is over_sampling=False ONLY. Off-policyness is controlled by the
+        # staleness window (η) + the decoupled-PPO π_prox/π_behav reweighting, NOT
+        # by over-producing and discarding stragglers that age out (an orthogonal
+        # async strategy AReaL avoids). Validate + derive the buffer size from η.
+        self._validate_buffer_config(self._async_cfg)
+        # force_in_order needs over_sampling=False, which _validate_buffer_config
+        # now guarantees for the AReaL path, so no separate check is needed.
 
         # SC split path does one optimizer.step per RL step.
         # TODO: support multi-mini-step (legacy train() does gbs-sized
@@ -199,6 +190,12 @@ class SingleControllerArealActor:
 
         # Cancellation handles for in-flight rollout dispatches.
         self._dispatched_rollouts: set[asyncio.Task[None]] = set()
+
+        # Set True by _rollout_pump when its epoch loop completes. Makes
+        # _collect_full_batch tail-safe (§4, §7.10): exhaustion is only declared
+        # once the dispatch loop is done AND no rollouts are still in flight, so
+        # the last in-flight rollouts are trained rather than dropped.
+        self._rollout_done: bool = False
 
         # over_sampling=False batch gate: farthest trainer_version covered by
         # already-dispatched batches.
@@ -368,6 +365,9 @@ class SingleControllerArealActor:
                     task.add_done_callback(self._dispatched_rollouts.discard)
             epoch += 1
 
+        # Mark dispatch loop exhausted so _collect_full_batch can declare the
+        # tail batch ready once the remaining in-flight rollouts commit (§7.10).
+        self._rollout_done = True
         print(f"rollout_pump: completed {epoch} epoch(s)", flush=True)
 
     async def _train_pump(self) -> None:
@@ -566,6 +566,130 @@ class SingleControllerArealActor:
             )
 
     # ── AReaL helpers ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _validate_buffer_config(async_cfg: AsyncRLConfig) -> None:
+        """Require over_sampling=False and DERIVE the buffer size from the window.
+
+        AReaL controls off-policyness through the staleness window (η) plus the
+        decoupled-PPO π_prox/π_behav reweighting — NOT through over_sampling
+        ("over-generate and waste stragglers that age out"), which is an
+        orthogonal async strategy AReaL deliberately avoids. So this controller
+        is scoped to ``over_sampling=False``.
+
+        With ``over_sampling=False`` the buffer size is fully derivable: at most
+        one in-window batch per live weight version, i.e.
+
+            max_buffered_rollouts = target_prompt_groups_per_step
+                                    * (max_weight_staleness_versions + 1)
+
+        rather than a user knob to set and assert against. This method computes
+        that value and writes it back onto ``async_cfg.max_buffered_rollouts`` so
+        the ``_buffer_capacity`` semaphore and the startup banner both use the
+        derived (auditable) number. If the user also set a conflicting value, we
+        log a one-line note and use the derived value — we do NOT error.
+
+        ``target_prompt_groups_per_step`` must already be coerced from ``None``.
+
+        Raises:
+            ValueError: if ``over_sampling`` is True (unsupported for AReaL).
+        """
+        assert async_cfg.target_prompt_groups_per_step is not None
+        if async_cfg.over_sampling:
+            raise ValueError(
+                "AReaL controls off-policyness via the staleness window (η) + "
+                "decoupled-PPO reweighting, not over_sampling; set "
+                "async_rl.over_sampling=false."
+            )
+
+        derived_buffer = async_cfg.target_prompt_groups_per_step * (
+            async_cfg.max_weight_staleness_versions + 1
+        )
+        if async_cfg.max_buffered_rollouts != derived_buffer:
+            print(
+                f"AReaL: deriving max_buffered_rollouts={derived_buffer} "
+                f"(= target_prompt_groups_per_step * "
+                f"(max_weight_staleness_versions + 1)); ignoring the configured "
+                f"value {async_cfg.max_buffered_rollouts}.",
+                flush=True,
+            )
+        async_cfg.max_buffered_rollouts = derived_buffer
+
+    async def _collect_full_batch(self) -> "KVBatchMeta | None":
+        """Phase-1 barrier: drain the staleness sampler until the full batch is claimed.
+
+        Accumulates whole prompt groups until ``target_prompt_groups_per_step``
+        groups are in hand, then merges them into a single ``KVBatchMeta``. This
+        is the structural difference from the base controller's interleaved
+        loop: the *whole* batch is gathered before any training so that π_prox
+        (``get_logprobs_from_meta``) and the GRPO advantages can be defined over
+        a single, consistent batch (§3, §4).
+
+        ACCUMULATE + MERGE ONLY — this method performs no training, no logprob
+        inference, and no advantage computation. P2 wires the call site in
+        ``_train_pump`` and adds those phases around it.
+
+        Each loop iteration yields to ``_rollout_pump`` (``asyncio.sleep(0)``) so
+        generation of batches i+1..i+η keeps streaming in the background — that
+        overlap is exactly what η buys. Staleness is enforced entirely by the
+        ``StalenessSampler`` window ``[v-η, v]`` via ``evict``/``select`` (no
+        hand-rolled lag check) and there is NO in-flight drain.
+
+        Buffer-capacity slots are released as groups leave the buffer (per evicted
+        group and per claimed group) so the rollout pump keeps producing during
+        Phase 2; the DataPlane rows stay alive until ``clear_samples`` at step end
+        (§7.4), so the frozen π_prox/advantages survive the whole minibatch loop.
+
+        Exhaustion is tail-safe (§7.10): ``select`` returning ``None`` only ends
+        the loop when the dispatch loop is done (``_rollout_done``) AND nothing is
+        still in flight (``_dispatched_rollouts`` empty) — otherwise the last
+        in-flight rollouts would be dropped.
+
+        Returns:
+            The merged full-batch ``KVBatchMeta`` (concat of all claimed groups),
+            or ``None`` if rollout is exhausted with nothing left to train.
+        """
+        # __init__ coerces None → min_prompt_groups_per_batch (int); the assert
+        # narrows the Optional[int] type for pyrefly.
+        assert self._async_cfg.target_prompt_groups_per_step is not None
+        target: int = self._async_cfg.target_prompt_groups_per_step
+        claimed: list[KVBatchMeta] = []
+        n = 0
+        while n < target:
+            await asyncio.sleep(0)  # yield to _rollout_pump
+
+            # Drop groups that aged past the staleness window [v-η, v]; free
+            # their buffer slots so the rollout pump can keep producing.
+            evicted = await self._sampler.evict(
+                current_train_weight=self._trainer_version,
+            )
+            for _ in range(evicted):
+                self._buffer_capacity.release()
+
+            # Claim in-window groups (lag ≤ η). select() returns (meta|None, num).
+            train_meta, num = await self._sampler.select(
+                current_train_weight=self._trainer_version,
+                min_prompt_groups=self._async_cfg.min_prompt_groups_per_batch,
+            )
+
+            if train_meta is None:
+                # True exhaustion = dispatch loop done AND nothing still in
+                # flight; otherwise the last in-flight rollouts would be dropped.
+                if self._rollout_done and not self._dispatched_rollouts:
+                    break
+                await asyncio.sleep(0.05)
+                continue
+
+            # Free buffer slots for the claimed groups (decoupled from the DP-row
+            # clear, which happens at step end).
+            for _ in range(num):
+                self._buffer_capacity.release()
+            claimed.append(train_meta)
+            n += num
+
+        if not claimed:
+            return None
+        return claimed[0].concat(*claimed[1:])
 
     def _iter_minibatches(
         self, batch_meta: "KVBatchMeta"
