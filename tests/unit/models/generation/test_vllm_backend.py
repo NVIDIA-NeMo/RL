@@ -179,7 +179,10 @@ def test_update_weights_from_collective_returns_false_on_post_load_failure(
     )
     ext, _ = _make_collective_update_extension(backend)
 
-    def packed_broadcast_consumer(_iterator, _group, _src, post_unpack_func):
+    def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
+        assert list(iterator) == [("model.weight", ext.state_dict_info["model.weight"])]
+        assert group is ext.model_update_group
+        assert src == 0
         call_order.append("broadcast")
         post_unpack_func([("model.weight", "weight-value")])
 
