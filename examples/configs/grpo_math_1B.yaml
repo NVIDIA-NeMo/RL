@@ -191,6 +191,7 @@ policy:
     # When true, detach MTP heads so MTP loss does not affect main-model gradients.
     mtp_detach_heads: false
     gradient_accumulation_fusion: false
+    use_fused_weighted_squared_relu: false
 
     peft:
       enabled: false
