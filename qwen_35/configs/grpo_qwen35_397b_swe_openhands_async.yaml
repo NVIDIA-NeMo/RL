@@ -1,189 +1,336 @@
-# Qwen 3.5 SWE/OpenHands wrapper.
+# Qwen 3.5 SWE/OpenHands async GRPO recipe.
 #
-# This config inherits the base Qwen3-235B SWE recipe and only changes
-# model-family-specific settings needed for Qwen3.5-397B-A17B. Runtime paths,
-# node counts, data, and experiment names are still provided by
-# examples/nemo_gym/launch_nemo_gym_multinode_training.sh and CLI overrides.
-#
-# Selecting this recipe from the launcher automatically mounts qwen_35/configs
-# and qwen_35/overrides into the container.
+# Standalone version of the Qwen 3.5 recipe. It intentionally does not inherit
+# from another model recipe, so Qwen 3.5 jobs do not depend on model-family
+# compatibility defaults or comments. Runtime paths, node counts, and experiment
+# names are provided by the Qwen 3.5 launcher environment or explicit Hydra
+# overrides.
 
-# Relative to qwen_35/configs/.
-defaults: ../../examples/nemo_gym/grpo_qwen3_235b_swe_openhands_async.yaml
-
-# Keep SIF roots local to this wrapper for the same reason as data paths below:
-# when this file is mounted into a container, the inherited base config may be
-# the image-baked copy rather than the checked-out tree on the host.
-sif_dir: ${oc.env:NEMO_GYM_SWE_SIF_DIR}
-sif_fallback_dir: ${oc.env:NEMO_GYM_SWE_FALLBACK_SIF_DIR,/no-such-r2e-fallback}
-
-# Keep data paths local to this wrapper. The inherited base config may come
-# from the container image when this file is mounted, so do not rely on the
-# base recipe for path hygiene.
-data:
-  train:
-    data_path: ${oc.env:NEMO_GYM_SWE_TRAIN_DATA_PATH}
-  validation:
-    data_path: ${oc.env:NEMO_GYM_SWE_VALIDATION_DATA_PATH}
-  max_input_seq_length: null
-  use_multiple_dataloader: false
-
-# Standard Qwen 3.5 R2E study defaults. Cluster size, paths, walltime, and
-# deliberate shmoo changes can still be overridden by launchers. Keep stable
-# correctness/performance defaults here so callers do not need long CLI lists.
 grpo:
+  max_num_epochs: 100
   num_prompts_per_step: 32
   num_generations_per_prompt: 16
+  max_rollout_turns: 1
   max_num_steps: 8
-  val_batch_size: null
-  max_val_samples: null
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
   val_period: 5
   val_at_start: true
   val_at_end: false
   overlong_filtering: true
+  max_val_samples: null
+  val_batch_size: null
+  validation_generation:
+    temperature: 0.0
+    top_p: 1.0
+  use_dynamic_sampling: false
+  dynamic_sampling_max_gen_batches: 10
+  batch_multiplier: 1
+  reward_shaping:
+    enabled: false
+    overlong_buffer_length: 128
+    overlong_buffer_penalty: 1
+    max_response_length: ${policy.max_total_sequence_length}
+  adv_estimator:
+    name: grpo
+    normalize_rewards: ${grpo.normalize_rewards}
+    use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
+    minus_baseline: true
+  reward_scaling:
+    enabled: false
+    source_min: 0.0
+    source_max: 1.0
+    target_min: 0.0
+    target_max: 1.0
   skip_reference_policy_logprobs_calculation: true
+  seq_logprob_error_threshold: 2
   async_grpo:
     enabled: true
     max_trajectory_age_steps: 1
     in_flight_weight_updates: false
-  validation_generation:
-    temperature: 0.0
-    top_p: 1.0
-
+    recompute_kv_cache_after_weight_updates: false
+loss_fn:
+  reference_policy_kl_penalty: 0
+  reference_policy_kl_type: k3
+  kl_input_clamp_value: null
+  kl_output_clamp_value: null
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: true
+  truncated_importance_sampling_ratio: 5
+  truncated_importance_sampling_ratio_min: 0.2
+  truncated_importance_sampling_type: tis
+  use_importance_sampling_correction: true
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  force_on_policy_ratio: true
 checkpointing:
   enabled: false
-  save_optimizer: false
+  checkpoint_dir: results/grpo-qwen35-397b-swe-openhands
+  metric_name: val:total_reward/mean
+  higher_is_better: true
+  keep_top_k: 2
   save_period: 1000000
   checkpoint_must_save_by: null
-
+  save_optimizer: false
 policy:
   model_name: ${oc.env:CONTAINER_HF_CKPT_PATH}
-  train_global_batch_size: 512
-  train_micro_batch_size: 1
-  logprob_batch_size: 1
-  generation_batch_size: 64
-  max_total_sequence_length: 65536
-
-  # Qwen 3.5 GDN currently does not support Megatron packed sequences.
-  # Keep this in the Qwen wrapper so callers do not need a correctness-critical
-  # CLI override.
-  sequence_packing:
-    enabled: false
-
-  # Pin tokenizer to the mounted Qwen 3.5 snapshot. The inherited Qwen3 config
-  # also points tokenizer.name at policy.model_name, but pinning it here avoids
-  # Hydra/override ambiguity and guarantees the qwen_35 tokenizer overlay sees
-  # the local tokenizer.json file instead of a hub model id.
   tokenizer:
     name: ${oc.env:CONTAINER_HF_CKPT_PATH}
-  megatron_cfg:
-    tensor_model_parallel_size: 4
-    pipeline_model_parallel_size: 2
+    chat_template_kwargs: null
+  hf_config_overrides: {}
+  train_global_batch_size: 512
+  train_micro_batch_size: 1
+  generation_batch_size: 64
+  logprob_batch_size: 1
+  max_total_sequence_length: 65536
+  precision: bfloat16
+  logprob_chunk_size: 2048
+  dtensor_cfg:
+    _v2: false
+    enabled: false
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 2
     context_parallel_size: 1
-    expert_model_parallel_size: 16
+    custom_parallel_plan: null
+    clear_cache_every_n_steps: null
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 1
+    train_iters: 100000
+    activation_checkpointing: true
+    bias_activation_fusion: false
+    tensor_model_parallel_size: 4
     expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 16
+    pipeline_model_parallel_size: 2
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 1
+    pipeline_dtype: ${policy.precision}
     sequence_parallel: true
+    freeze_moe_router: true
+    moe_router_dtype: fp64
+    moe_router_load_balancing_type: none
+    moe_router_bias_update_rate: 0.0
+    moe_permute_fusion: false
+    moe_enable_deepep: false
     moe_token_dispatcher_type: alltoall
+    moe_shared_expert_overlap: false
+    moe_per_layer_logging: false
+    gradient_accumulation_fusion: false
+    apply_rope_fusion: false
+    defer_fp32_logits: true
     optimizer:
-      lr: 5.0e-6
-      min_lr: 4.999e-6
+      optimizer: adam
+      lr: 5.0e-06
+      min_lr: 4.999e-06
+      weight_decay: 0.0
+      bf16: true
+      fp16: false
+      params_dtype: float32
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1e-8
+      sgd_momentum: 0.9
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+      clip_grad: ${policy.max_grad_norm}
     scheduler:
-      lr_warmup_iters: 3
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: constant
+      lr_decay_style: constant
       lr_decay_iters: 100000
+      lr_warmup_iters: 3
+      lr_warmup_init: 3e-7
+      override_opt_param_scheduler: true
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: true
+      overlap_param_gather: false
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: optim_grads_params
+    env_vars: null
     checkpoint:
       async_strategy: mcore
-    apply_rope_fusion: false
-    gradient_accumulation_fusion: false
     mtp_loss_scaling_factor: 0.0
     mtp_num_layers: 0
     mtp_use_repeated_layer: false
     mtp_detach_heads: true
-    # The inherited Qwen3-235B recipe uses custom first/last PP layer counts.
-    # They do not apply to Qwen3.5-397B with the 64-node PP=2 layout; leaving
-    # them set makes Megatron think there are no middle PP stages available.
-    num_layers_in_first_pipeline_stage: null
-    num_layers_in_last_pipeline_stage: null
     first_last_layers_bf16: true
     num_layers_at_start_in_bf16: 1
     num_layers_at_end_in_bf16: 1
     moe_flex_dispatcher_backend: alltoall
     moe_hybridep_num_sms: 32
+  draft:
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    num_layers: null
+    aux_layer_indices: null
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: modified_first_fit_decreasing
+    sequence_length_round: 64
+  make_sequence_length_divisible_by: 32
+  max_grad_norm: 1.0
+  offload_optimizer_for_logprob: false
+  optimizer: null
+  scheduler:
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones: []
   generation:
+    backend: vllm
     max_new_tokens: 65536
     temperature: 1.0
     top_p: 1.0
-    mcore_generation_config:
-      buffer_size_gb: 8
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
     vllm_cfg:
-      max_model_len: 65536
+      async_engine: true
+      kv_cache_dtype: auto
+      precision: ${policy.precision}
       tensor_parallel_size: 8
       pipeline_parallel_size: 1
       expert_parallel_size: 8
       gpu_memory_utilization: 0.55
-      # Keep Qwen 3.5 on the CUDA-graph path used by the known-good smoke run.
+      max_model_len: 65536
       enforce_eager: false
+      use_deep_gemm: false
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      expose_http_server: true
+      skip_tokenizer_init: false
       http_server_serving_chat_kwargs:
+        enable_auto_tools: true
         tool_parser: qwen3_xml
         reasoning_parser: qwen3
     vllm_kwargs:
-      generation_config: vllm
       attention_backend: FLASH_ATTN
+      enable_chunked_prefill: true
       compilation_config:
         backend: inductor
-        cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 64]
+        cudagraph_capture_sizes:
+        - 1
+        - 2
+        - 4
+        - 8
+        - 16
+        - 32
+        - 64
         pass_config:
           fuse_norm_quant: false
           fuse_act_quant: false
           fuse_attn_quant: false
           fuse_allreduce_rms: false
-
-# Qwen 3.5 chat-template/token handling used by the qwen_35 overlay.
+      generation_config: vllm
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 32
+    mcore_generation_config:
+      buffer_size_gb: 8
+data:
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 0
+  use_multiple_dataloader: false
+  train:
+    data_path: ${oc.env:NEMO_GYM_SWE_TRAIN_DATA_PATH}
+  validation:
+    data_path: ${oc.env:NEMO_GYM_SWE_VALIDATION_DATA_PATH}
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    system_prompt_file: null
+    processor: nemo_gym_data_processor
+sif_dir: ${oc.env:NEMO_GYM_SWE_SIF_DIR}
 env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: false
   nemo_gym:
     skip_venv_if_present: true
+    rollout_max_attempts_to_avoid_lp_nan: 1
+    is_trajectory_collection: false
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - responses_api_agents/swe_agents/configs/swebench_openhands_training.yaml
+    use_absolute_ip: true
     swe_agents_train:
       responses_api_agents:
         swe_agents:
           agent_prompt_overrides:
-            - user_prompt_template: responses_api_agents/swe_agents/prompts/openhands/user_prompt.j2
-              system_prompt_template: responses_api_agents/swe_agents/prompts/openhands/system_prompt.j2
-              agent_cls: CodeActAgent
-              diversify_tool_names: false
+          - user_prompt_template: responses_api_agents/swe_agents/prompts/openhands/user_prompt.j2
+            system_prompt_template: responses_api_agents/swe_agents/prompts/openhands/system_prompt.j2
+            agent_cls: CodeActAgent
+            diversify_tool_names: false
           agent_max_turns: 30
-          concurrency: 256
           swebench_agent_timeout: 360
           swebench_tests_timeout: 300
+          concurrency: 256
+          base_results_dir: /logs/nemo_gym/swe_agents_train
+          dataset_path: ${data.train.data_path}
           container_formatter:
-            - "${sif_dir}/r2egym/{instance_id}.sif"
-            - "${sif_fallback_dir}/r2e_gym/{instance_id}.sif"
+          - ${sif_dir}/r2egym/{instance_id}.sif
     swe_agents_val:
       responses_api_agents:
         swe_agents:
           agent_max_turns: 30
-          concurrency: 256
           swebench_agent_timeout: 180
           swebench_tests_timeout: 180
+          concurrency: 256
+          base_results_dir: /logs/nemo_gym/swe_agents_val
+          dataset_path: ${data.validation.data_path}
           container_formatter: ${env.nemo_gym.swe_agents_train.responses_api_agents.swe_agents.container_formatter}
     policy_model:
       responses_api_models:
         vllm_model:
-          # Keep this in sync with policy.generation.vllm_cfg.http_server_serving_chat_kwargs.
-          # If vLLM is configured with a reasoning parser, the NeMo-Gym policy
-          # server must expect reasoning fields in chat-completion responses.
           uses_reasoning_parser: true
           chat_template_kwargs:
             enable_thinking: false
             truncate_history_thinking: false
           sequential_reasoning_allowed: false
-
+logger:
+  log_dir: logs
+  num_val_samples_to_print: 0
+  wandb_enabled: false
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: grpo-dev
+    name: grpo-qwen35-397b-swe-openhands
+  tensorboard: {}
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+cluster:
+  gpus_per_node: 8
+  num_nodes: 16
 token_ids:
   eos: 248046
   think_open: 248068
   think_close: 248069
-
-# SWE reward comes from NeMo-Gym test pass/fail. These scalar response-shape
-# penalties are tuned for Nemotron/Nano response conventions and can incorrectly
-# zero otherwise valid Qwen trajectories.
 penalize_duplicated_reasoning: false
 penalize_empty_final_answer: false
 penalize_eos_token: false

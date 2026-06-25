@@ -26,6 +26,7 @@ ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 ENV NEMO_GYM_VENV_DIR=/opt/gym_venvs
 
 COPY docker/gym/mlperf-gym.patch /tmp/mlperf-gym.patch
+COPY docker/gym/qwen35-gym-vllm-model.patch /tmp/qwen35-gym-vllm-model.patch
 COPY docker/gym/prefetch_venvs.py /opt/nemo-rl/examples/nemo_gym/prefetch_venvs.py
 
 # Install Apptainer in an architecture-aware way. The older Dockerfile.gym used an
@@ -66,8 +67,20 @@ else
 fi
 EOF
 
+# Carry the Qwen 3.5 vLLM model-server fixes without a runtime source overlay.
+RUN <<"EOF" bash -exu
+cd /opt/nemo-rl/3rdparty/Gym-workspace/Gym
+if git apply --check /tmp/qwen35-gym-vllm-model.patch; then
+    git apply /tmp/qwen35-gym-vllm-model.patch
+elif git apply --reverse --check /tmp/qwen35-gym-vllm-model.patch; then
+    echo "qwen35-gym-vllm-model.patch is already applied"
+else
+    git apply --check /tmp/qwen35-gym-vllm-model.patch
+fi
+EOF
+
 ARG TARGETARCH
-ARG NEMO_GYM_PREFETCH_CONFIGS=examples/nemo_gym/grpo_qwen3_235b_swe_openhands_async.yaml
+ARG NEMO_GYM_PREFETCH_CONFIGS=qwen_35/configs/grpo_qwen35_397b_swe_openhands_async.yaml
 ARG NEMO_GYM_CUDA=
 ARG NEMO_GYM_VLLM_VERSION=
 

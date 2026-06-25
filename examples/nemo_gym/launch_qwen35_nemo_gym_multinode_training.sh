@@ -13,6 +13,8 @@
 # limitations under the License.
 
 set -euo pipefail
+# Qwen 3.5-specific NeMo-Gym launcher. The container is expected to be built
+# from this branch, so no runtime source overlays are mounted.
 # ----- PARAMETERS -----
 # Optional: WANDB_API_KEY, HF_TOKEN
 # Required: EXP_NAME, GPUS_PER_NODE, HF_CKPT_PATH, NEMO_GYM_SWE_TRAIN_DATA_PATH,
@@ -86,6 +88,8 @@ require_path "NRL_MEGATRON_CHECKPOINT_DIR" "dir" "This directory is mounted as t
 require_path "NEMO_GYM_SWE_TRAIN_DATA_PATH" "file" "This JSONL is mounted as the training dataset inside the container."
 require_path "NEMO_GYM_SWE_VALIDATION_DATA_PATH" "file" "This JSONL is mounted as the validation dataset inside the container."
 require_path "NEMO_GYM_SWE_SIF_DIR" "dir" "This directory is mounted as the SWE task SIF directory inside the container."
+NEMO_GYM_SWE_TRAIN_DATA_DIR="$(dirname "${NEMO_GYM_SWE_TRAIN_DATA_PATH}")"
+NEMO_GYM_SWE_VALIDATION_DATA_DIR="$(dirname "${NEMO_GYM_SWE_VALIDATION_DATA_PATH}")"
 if ! [[ "${GPUS_PER_NODE}" =~ ^[1-9][0-9]*$ ]]; then
     echo "Error: GPUS_PER_NODE must be a positive integer." >&2
     echo "  Current value: ${GPUS_PER_NODE}" >&2
@@ -96,9 +100,13 @@ TRAIN_NODES="${TRAIN_NODES:-16}"
 GEN_NODES="${GEN_NODES:-24}"
 NODES="${NODES:-$((TRAIN_NODES + GEN_NODES))}"
 CONTAINER_REPO_LOCATION="${CONTAINER_REPO_LOCATION:-/opt/nemo-rl}"
-RECIPE="${RECIPE:-examples/nemo_gym/grpo_qwen3_235b_swe_openhands_async.yaml}"
+RECIPE="${RECIPE:-qwen_35/configs/grpo_qwen35_397b_swe_openhands_async.yaml}"
 CONTAINER_INPUT_ROOT="${CONTAINER_INPUT_ROOT:-/inputs/nemo_gym}"
 CONTAINER_HF_CKPT_PATH="${CONTAINER_HF_CKPT_PATH:-${HF_CKPT_PATH}}"
+if [[ "${HF_CKPT_PATH}" == */snapshots/* ]]; then
+    HF_MODEL_CACHE_DIR="${HF_MODEL_CACHE_DIR:-$(dirname "$(dirname "${HF_CKPT_PATH}")")}"
+    CONTAINER_HF_MODEL_CACHE_DIR="${CONTAINER_HF_MODEL_CACHE_DIR:-$(dirname "$(dirname "${CONTAINER_HF_CKPT_PATH}")")}"
+fi
 CONTAINER_NRL_MEGATRON_CHECKPOINT_DIR="${CONTAINER_NRL_MEGATRON_CHECKPOINT_DIR:-${CONTAINER_INPUT_ROOT}/mcore_ckpt}"
 CONTAINER_NEMO_GYM_SWE_TRAIN_DATA_PATH="${CONTAINER_NEMO_GYM_SWE_TRAIN_DATA_PATH:-${CONTAINER_INPUT_ROOT}/data/train.jsonl}"
 CONTAINER_NEMO_GYM_SWE_VALIDATION_DATA_PATH="${CONTAINER_NEMO_GYM_SWE_VALIDATION_DATA_PATH:-${CONTAINER_INPUT_ROOT}/data/validation.jsonl}"
@@ -119,6 +127,7 @@ HOST_HF_HOME="${HF_HOME:-$(pwd)/.cache}"
 export BASE_LOG_DIR="${OUT_DIR}/logs"
 mkdir -p "${OUT_DIR}/logs" "${OUT_DIR}/checkpoint" "${HOST_HF_HOME}"
 
+
 # Construct the command
 COMMAND=$(cat <<EOF
 cd ${CONTAINER_REPO_LOCATION}
@@ -129,7 +138,7 @@ HF_HUB_OFFLINE=1 \
 TRANSFORMERS_OFFLINE=1 \
 HF_TOKEN="${HF_TOKEN:-}" \
 WANDB_API_KEY="${WANDB_API_KEY:-}" \
-HF_CKPT_PATH="${CONTAINER_HF_CKPT_PATH}" \
+NEMO_RL_QWEN35_TRUNCATE_PROMPT_TOKENS="${NEMO_RL_QWEN35_TRUNCATE_PROMPT_TOKENS:-65535}" \
 CONTAINER_HF_CKPT_PATH="${CONTAINER_HF_CKPT_PATH}" \
 NRL_MEGATRON_CHECKPOINT_DIR="${CONTAINER_NRL_MEGATRON_CHECKPOINT_DIR}" \
 NEMO_GYM_SWE_WORKSPACE_ROOT=/logs/nemo_gym/workspace \
@@ -142,7 +151,7 @@ uv run examples/nemo_gym/run_grpo_nemo_gym.py \
     --config ${RECIPE} \
     ++logger.mlperf_enabled=True \
     ++logger.mlperf.log_file=${OUT_DIR}/logs/mllogger.log \
-    ++logger.mlperf.benchmark=qwen3_235b_grpo_swe \
+    ++logger.mlperf.benchmark=qwen35_397b_grpo_swe \
     ++logger.mlperf.target_accuracy=${MLPERF_TARGET_ACCURACY:-1.0} \
     ++logger.mlperf.force_success_status=False \
     ++cluster.num_nodes=$NODES \
@@ -173,13 +182,41 @@ SLURM_COMMENT="${SLURM_COMMENT:-{\"OccupiedIdleGPUsJobReaper\":{\"exemptIdleTime
 # (`touch $LOG_DIR/STARTED_RAY_HEAD`). Without the identity mount that touch
 # fails and the launcher waits forever for the cluster to come up.
 MOUNTS="${OUT_DIR}/logs:${OUT_DIR}/logs,${HOST_HF_HOME}:${CONTAINER_REPO_LOCATION}/.cache,${OUT_DIR}/checkpoint:/checkpoint,${OUT_DIR}/logs:/logs"
+if [[ -n "${HF_MODEL_CACHE_DIR:-}" ]]; then
+    MOUNTS="${MOUNTS},${HF_MODEL_CACHE_DIR}:${CONTAINER_HF_MODEL_CACHE_DIR}"
+fi
 MOUNTS="${MOUNTS},${HF_CKPT_PATH}:${HF_CKPT_PATH}"
 MOUNTS="${MOUNTS},${NRL_MEGATRON_CHECKPOINT_DIR}:${CONTAINER_NRL_MEGATRON_CHECKPOINT_DIR}"
 MOUNTS="${MOUNTS},${NEMO_GYM_SWE_TRAIN_DATA_PATH}:${CONTAINER_NEMO_GYM_SWE_TRAIN_DATA_PATH}"
 MOUNTS="${MOUNTS},${NEMO_GYM_SWE_VALIDATION_DATA_PATH}:${CONTAINER_NEMO_GYM_SWE_VALIDATION_DATA_PATH}"
+# Compatibility mount: older launch recipes pass host-side data.train.data_path
+# overrides. Keep the narrow /inputs mounts above as the canonical container
+# paths, but also make the JSONL parent directory visible at the host path so
+# those overrides do not fail inside the container.
+MOUNTS="${MOUNTS},${NEMO_GYM_SWE_TRAIN_DATA_DIR}:${NEMO_GYM_SWE_TRAIN_DATA_DIR}"
+if [[ "${NEMO_GYM_SWE_VALIDATION_DATA_DIR}" != "${NEMO_GYM_SWE_TRAIN_DATA_DIR}" ]]; then
+    MOUNTS="${MOUNTS},${NEMO_GYM_SWE_VALIDATION_DATA_DIR}:${NEMO_GYM_SWE_VALIDATION_DATA_DIR}"
+fi
 MOUNTS="${MOUNTS},${NEMO_GYM_SWE_SIF_DIR}:${CONTAINER_NEMO_GYM_SWE_SIF_DIR}"
+# Compatibility mount for configs that pass host-side sif_dir or include
+# absolute host-side container_formatter entries.
+MOUNTS="${MOUNTS},${NEMO_GYM_SWE_SIF_DIR}:${NEMO_GYM_SWE_SIF_DIR}"
 if [[ -n "${EXTRA_MOUNTS:-}" ]]; then
     MOUNTS="${MOUNTS},${EXTRA_MOUNTS}"
+fi
+
+SBATCH_EXTRA_ARGS=()
+SBATCH_QOS_VALUE="${SLURM_QOS:-${SBATCH_QOS:-}}"
+SBATCH_GRES_VALUE="${SLURM_GRES:-${SBATCH_GRES:-}}"
+SBATCH_SEGMENT_VALUE="${SLURM_SEGMENT:-${SBATCH_SEGMENT:-}}"
+if [[ -n "${SBATCH_QOS_VALUE}" ]]; then
+    SBATCH_EXTRA_ARGS+=("--qos=${SBATCH_QOS_VALUE}")
+fi
+if [[ -n "${SBATCH_GRES_VALUE}" ]]; then
+    SBATCH_EXTRA_ARGS+=("--gres=${SBATCH_GRES_VALUE}")
+fi
+if [[ -n "${SBATCH_SEGMENT_VALUE}" ]]; then
+    SBATCH_EXTRA_ARGS+=("--segment=${SBATCH_SEGMENT_VALUE}")
 fi
 
 MOUNTS=$MOUNTS \
@@ -194,5 +231,6 @@ sbatch \
     --time=${SLURM_TIME:-1:0:0} \
     --job-name=$EXP_NAME \
     --comment="$SLURM_COMMENT" \
+    "${SBATCH_EXTRA_ARGS[@]}" \
     ${SLURM_EXCLUDE:+--exclude=$SLURM_EXCLUDE} \
     ray.sub

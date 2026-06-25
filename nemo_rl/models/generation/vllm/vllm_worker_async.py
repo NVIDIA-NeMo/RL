@@ -15,10 +15,12 @@
 import asyncio
 import copy
 import gc
+import inspect
+import logging
+import os
 import threading
 import time
 import uuid
-import warnings
 from typing import Any, AsyncGenerator, Optional, cast
 
 import ray
@@ -27,7 +29,42 @@ import uvicorn
 from fastapi import FastAPI
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
+try:
+    from nemo_rl.distributed.virtual_cluster import (
+        DEFAULT_PORT_RANGE_HIGH,
+        DEFAULT_PORT_RANGE_LOW,
+        _bind_socket_in_range,
+        _get_free_port_local,
+        _get_node_ip_local,
+    )
+except ImportError:
+    import socket
+
+    from nemo_rl.distributed.virtual_cluster import (
+        _get_free_port_local as _get_free_port_local_unranged,
+        _get_node_ip_local,
+    )
+
+    DEFAULT_PORT_RANGE_LOW = 11001
+    DEFAULT_PORT_RANGE_HIGH = 15000
+
+    def _bind_socket_in_range(sock, port_range_low, port_range_high):
+        for port in range(port_range_low, port_range_high + 1):
+            try:
+                sock.bind(("", port))
+                return port
+            except OSError:
+                continue
+        raise RuntimeError(
+            f"No free port found in range {port_range_low}-{port_range_high}"
+        )
+
+    def _get_free_port_local(port_range_low=None, port_range_high=None):
+        if port_range_low is None or port_range_high is None:
+            return _get_free_port_local_unranged()
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            return _bind_socket_in_range(sock, port_range_low, port_range_high)
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
@@ -41,12 +78,353 @@ _NEMO_RL_REQUEST_TYPE_METADATA_KEY = "_nemo_rl_request_type"
 _NEMO_RL_VALIDATION_REQUEST_TYPE = "validation"
 _NEMO_RL_VALIDATION_GENERATION_CONFIG_KEY = "_validation_generation"
 
+logger = logging.getLogger(__name__)
+
+
+def _normalize_weight_update_results(worker_results: Any) -> tuple[bool, list[Any]]:
+    if isinstance(worker_results, bool):
+        return worker_results, [
+            None if worker_results else "collective_rpc returned False"
+        ]
+
+    if worker_results is None:
+        return True, [None]
+
+    try:
+        result_items = list(worker_results)
+    except TypeError:
+        success = bool(worker_results)
+        return success, [
+            None if success else f"Unexpected collective_rpc result: {worker_results!r}"
+        ]
+
+    if not result_items:
+        return False, ["collective_rpc returned no worker results"]
+
+    success_flags = []
+    exceptions_or_none = []
+    for result in result_items:
+        if isinstance(result, bool):
+            success_flags.append(result)
+            exceptions_or_none.append(None if result else "worker returned False")
+        elif result is None:
+            success_flags.append(True)
+            exceptions_or_none.append(None)
+        elif isinstance(result, (list, tuple)):
+            if not result:
+                success_flags.append(False)
+                exceptions_or_none.append("worker returned an empty result")
+            else:
+                success_flags.append(bool(result[0]))
+                exceptions_or_none.append(result[1] if len(result) > 1 else None)
+        else:
+            success = bool(result)
+            success_flags.append(success)
+            exceptions_or_none.append(
+                None if success else f"Unexpected worker result: {result!r}"
+            )
+
+    return all(success_flags), exceptions_or_none
+
+
+def _qwen35_truncate_prompt_tokens() -> Optional[int]:
+    value = os.environ.get("NEMO_RL_QWEN35_TRUNCATE_PROMPT_TOKENS", "65535")
+    if value.lower() in {"", "0", "false", "none", "no"}:
+        return None
+    return int(value)
+
+
+def _diagnose_noncontiguous_message_tokens() -> bool:
+    return os.environ.get(
+        "NEMO_RL_DIAGNOSE_NONCONTIGUOUS_MESSAGE_TOKENS", "0"
+    ).lower() not in {"0", "false", "no", "off"}
+
+
+def _noncontiguous_message_diagnostic_window() -> int:
+    value = os.environ.get("NEMO_RL_NONCONTIGUOUS_MESSAGE_DIAGNOSTIC_WINDOW", "48")
+    try:
+        return max(0, int(value))
+    except ValueError:
+        return 48
+
+
+def _decode_token_ids(tokenizer, token_ids: list[int]) -> str:
+    try:
+        return tokenizer.decode(
+            token_ids,
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+    except TypeError:
+        return tokenizer.decode(token_ids, skip_special_tokens=False)
+    except Exception as exc:
+        return f"<decode failed: {exc!r}>"
+
+
+def _first_token_mismatch(left: list[int], right: list[int]) -> Optional[int]:
+    compare_len = min(len(left), len(right))
+    for idx in range(compare_len):
+        if left[idx] != right[idx]:
+            return idx
+    if len(left) != len(right):
+        return compare_len
+    return None
+
+
+def _last_token_index(token_ids: list[int], token_id: int) -> Optional[int]:
+    for idx in reversed(range(len(token_ids))):
+        if token_ids[idx] == token_id:
+            return idx
+    return None
+
+
+def _token_window_at_end(token_ids: list[int], window: int) -> tuple[int, int, list[int]]:
+    end = len(token_ids)
+    start = max(0, end - window)
+    return start, end, token_ids[start:end]
+
+
+def _token_window(token_ids: list[int], center_idx: int, window: int) -> tuple[int, int, list[int]]:
+    start = max(0, center_idx - window)
+    end = min(len(token_ids), center_idx + window + 1)
+    return start, end, token_ids[start:end]
+
+
+def _log_qwen35_prefix_diagnostic(
+    tokenizer,
+    reason: str,
+    model_prefix_token_ids: list[int],
+    template_prefix_token_ids: list[int],
+    template_token_ids: list[int],
+) -> None:
+    if not _diagnose_noncontiguous_message_tokens():
+        return
+
+    window = _noncontiguous_message_diagnostic_window()
+    prefix_template_mismatch = _first_token_mismatch(
+        template_prefix_token_ids, template_token_ids
+    )
+    model_template_mismatch = _first_token_mismatch(
+        model_prefix_token_ids, template_prefix_token_ids
+    )
+    model_full_template_mismatch = _first_token_mismatch(
+        model_prefix_token_ids, template_token_ids
+    )
+    eos_token_id = tokenizer.eos_token_id
+    model_last_eos = (
+        _last_token_index(model_prefix_token_ids, eos_token_id)
+        if eos_token_id is not None
+        else None
+    )
+    prefix_last_eos = (
+        _last_token_index(template_prefix_token_ids, eos_token_id)
+        if eos_token_id is not None
+        else None
+    )
+    template_last_eos = (
+        _last_token_index(template_token_ids, eos_token_id)
+        if eos_token_id is not None
+        else None
+    )
+
+    center_idx = prefix_template_mismatch
+    if center_idx is None:
+        center_idx = min(len(template_prefix_token_ids), len(template_token_ids))
+
+    model_start, model_end, model_window = _token_window(
+        model_prefix_token_ids, min(center_idx, len(model_prefix_token_ids)), window
+    )
+    prefix_start, prefix_end, prefix_window = _token_window(
+        template_prefix_token_ids,
+        min(center_idx, len(template_prefix_token_ids)),
+        window,
+    )
+    template_start, template_end, template_window = _token_window(
+        template_token_ids, min(center_idx, len(template_token_ids)), window
+    )
+    model_tail_start, model_tail_end, model_tail_window = _token_window_at_end(
+        model_prefix_token_ids, window
+    )
+    prefix_tail_start, prefix_tail_end, prefix_tail_window = _token_window_at_end(
+        template_prefix_token_ids, window
+    )
+    template_tail_start, template_tail_end, template_tail_window = _token_window_at_end(
+        template_token_ids, window
+    )
+
+    logger.warning(
+        "Qwen 3.5 vLLM monotonic-prefix diagnostic (%s): "
+        "prefix_template_mismatch=%s, model_template_mismatch=%s, "
+        "model_full_template_mismatch=%s, "
+        "template_minus_prefix=%d, template_minus_model_prefix=%d, "
+        "eos=%s, last_eos=(model:%s,prefix:%s,template:%s)\n"
+        "  model_prefix_window=[%d:%d] ids=%s text=%r\n"
+        "  template_prefix_window=[%d:%d] ids=%s text=%r\n"
+        "  template_window=[%d:%d] ids=%s text=%r\n"
+        "  model_prefix_tail=[%d:%d] ids=%s text=%r\n"
+        "  template_prefix_tail=[%d:%d] ids=%s text=%r\n"
+        "  template_tail=[%d:%d] ids=%s text=%r",
+        reason,
+        prefix_template_mismatch,
+        model_template_mismatch,
+        model_full_template_mismatch,
+        len(template_token_ids) - len(template_prefix_token_ids),
+        len(template_token_ids) - len(model_prefix_token_ids),
+        eos_token_id,
+        model_last_eos,
+        prefix_last_eos,
+        template_last_eos,
+        model_start,
+        model_end,
+        model_window,
+        _decode_token_ids(tokenizer, model_window),
+        prefix_start,
+        prefix_end,
+        prefix_window,
+        _decode_token_ids(tokenizer, prefix_window),
+        template_start,
+        template_end,
+        template_window,
+        _decode_token_ids(tokenizer, template_window),
+        model_tail_start,
+        model_tail_end,
+        model_tail_window,
+        _decode_token_ids(tokenizer, model_tail_window),
+        prefix_tail_start,
+        prefix_tail_end,
+        prefix_tail_window,
+        _decode_token_ids(tokenizer, prefix_tail_window),
+        template_tail_start,
+        template_tail_end,
+        template_tail_window,
+        _decode_token_ids(tokenizer, template_tail_window),
+    )
+
+
+def _message_role_summary(messages: list) -> str:
+    roles = []
+    for message in messages:
+        if isinstance(message, dict):
+            role = str(message.get("role", "<missing>"))
+            fields = []
+            for key in ("content", "tool_calls", "tool_call_id"):
+                if key in message and message[key]:
+                    fields.append(key)
+            if "prompt_token_ids" in message:
+                fields.append(f"prompt={len(message['prompt_token_ids'])}")
+            if "generation_token_ids" in message:
+                fields.append(f"gen={len(message['generation_token_ids'])}")
+            if fields:
+                role = f"{role}({','.join(fields)})"
+        else:
+            role = type(message).__name__
+        roles.append(role)
+
+    if len(roles) <= 16:
+        return "[" + ", ".join(roles) + "]"
+    return "[" + ", ".join(roles[:8]) + ", ..., " + ", ".join(roles[-8:]) + "]"
+
+
+def _log_qwen35_pre_replace_context(
+    request,
+    messages: list,
+    messages_to_last_assistant_message: list,
+    last_assistant_message_idx: Optional[int],
+    model_prefix_token_ids: list[int],
+    template_prefix_token_ids: list[int],
+    template_token_ids: list[int],
+) -> None:
+    if not _diagnose_noncontiguous_message_tokens():
+        return
+
+    if len(template_token_ids) > len(template_prefix_token_ids) and len(
+        template_token_ids
+    ) > len(model_prefix_token_ids):
+        return
+
+    logger.warning(
+        "Qwen 3.5 vLLM prefix-repair context: "
+        "messages=%d, prefix_messages=%d, last_assistant_idx=%s, "
+        "truncate_prompt_tokens=%s, add_generation_prompt=%s, max_tokens=%s, "
+        "lengths=(required_prefix:%d, template_prefix:%d, template:%d), "
+        "template_minus_prefix=%d, template_minus_required_prefix=%d, "
+        "roles=%s, prefix_roles=%s",
+        len(messages),
+        len(messages_to_last_assistant_message),
+        last_assistant_message_idx,
+        getattr(request, "truncate_prompt_tokens", None),
+        getattr(request, "add_generation_prompt", None),
+        getattr(request, "max_tokens", None),
+        len(model_prefix_token_ids),
+        len(template_prefix_token_ids),
+        len(template_token_ids),
+        len(template_token_ids) - len(template_prefix_token_ids),
+        len(template_token_ids) - len(model_prefix_token_ids),
+        _message_role_summary(messages),
+        _message_role_summary(messages_to_last_assistant_message),
+    )
+
+
+def _find_nth_token_from_end(token_ids: list[int], token_id: int, n: int) -> int:
+    if n <= 0:
+        return -1
+
+    seen = 0
+    for idx in reversed(range(len(token_ids))):
+        if token_ids[idx] == token_id:
+            seen += 1
+            if seen == n:
+                return idx
+    return -1
+
+
+def _qwen35_replace_prefix_from_suffix_messages(
+    *,
+    eos_token_id: int,
+    model_prefix_token_ids: list[int],
+    template_token_ids: list[int],
+    suffix_message_count: Optional[int],
+) -> Optional[list[int]]:
+    if suffix_message_count is None:
+        return None
+
+    # For a prompt that ends with N non-assistant suffix messages plus the
+    # assistant generation marker, the boundary before those suffix messages is
+    # the (N + 1)-th EOS from the end of the rendered full template.
+    template_cut_start = _find_nth_token_from_end(
+        template_token_ids, eos_token_id, suffix_message_count + 1
+    )
+    if template_cut_start < 0:
+        return None
+
+    model_cut_end = len(model_prefix_token_ids)
+    if model_prefix_token_ids and model_prefix_token_ids[-1] == eos_token_id:
+        model_cut_end -= 1
+
+    if _diagnose_noncontiguous_message_tokens():
+        logger.warning(
+            "Qwen 3.5 vLLM suffix-message prefix repair: "
+            "suffix_messages=%d, template_cut_start=%d, "
+            "lengths=(required_prefix:%d, template:%d, repaired:%d)",
+            suffix_message_count,
+            template_cut_start,
+            len(model_prefix_token_ids),
+            len(template_token_ids),
+            model_cut_end + len(template_token_ids[template_cut_start:]),
+        )
+
+    return (
+        model_prefix_token_ids[:model_cut_end]
+        + template_token_ids[template_cut_start:]
+    )
+
 
 def _replace_prefix_tokens(
     tokenizer,
     model_prefix_token_ids: list[int],
     template_prefix_token_ids: list[int],
     template_token_ids: list[int],
+    suffix_message_count: Optional[int] = None,
 ) -> list[int]:
     """This is a subroutine used inside the vLLM Chat Completion server.
 
@@ -111,10 +489,37 @@ def _replace_prefix_tokens(
         if model_prefix_token_ids[-1] == eos_token_id:
             model_cut_end -= 1
 
+    if _first_token_mismatch(template_prefix_token_ids, template_token_ids) is not None:
+        repaired_token_ids = _qwen35_replace_prefix_from_suffix_messages(
+            eos_token_id=eos_token_id,
+            model_prefix_token_ids=model_prefix_token_ids,
+            template_token_ids=template_token_ids,
+            suffix_message_count=suffix_message_count,
+        )
+        if repaired_token_ids is not None:
+            return repaired_token_ids
+
     # Assert here to prepare for the logic below
-    assert len(template_token_ids) > len(
+    if len(template_token_ids) <= len(
         template_prefix_token_ids
-    ), f"""Found possibly non-monotonically increasing trajectory!
+    ):
+        repaired_token_ids = _qwen35_replace_prefix_from_suffix_messages(
+            eos_token_id=eos_token_id,
+            model_prefix_token_ids=model_prefix_token_ids,
+            template_token_ids=template_token_ids,
+            suffix_message_count=suffix_message_count,
+        )
+        if repaired_token_ids is not None:
+            return repaired_token_ids
+
+        _log_qwen35_prefix_diagnostic(
+            tokenizer=tokenizer,
+            reason="template_has_no_suffix_after_prefix",
+            model_prefix_token_ids=model_prefix_token_ids,
+            template_prefix_token_ids=template_prefix_token_ids,
+            template_token_ids=template_token_ids,
+        )
+        error_message = f"""Found possibly non-monotonically increasing trajectory!
 Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}
 
 Template token IDs (everything that was sent to the model endpoint): {template_token_ids}
@@ -123,6 +528,10 @@ Template prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token
 
 Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}
 """
+        with open(f"non_monotonic_trajectory_{str(uuid.uuid4())}.txt", "w") as f:
+            f.write(error_message)
+
+        raise ValueError(error_message)
 
     # We take everything starting with the EOS token ID.
     template_cut_start = -1
@@ -132,9 +541,17 @@ Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}
             break
 
     # This should never be the case, but
-    assert (
-        template_cut_start >= 0
-    ), f"""No EOS token ID found in the chat-templated messages!
+    if (
+        template_cut_start < 0
+    ):
+        _log_qwen35_prefix_diagnostic(
+            tokenizer=tokenizer,
+            reason="template_prefix_has_no_eos",
+            model_prefix_token_ids=model_prefix_token_ids,
+            template_prefix_token_ids=template_prefix_token_ids,
+            template_token_ids=template_token_ids,
+        )
+        error_message = f"""No EOS token ID found in the chat-templated messages!
 Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}
 
 Template token IDs (everything that was sent to the model endpoint): {template_token_ids}
@@ -142,6 +559,9 @@ Template token IDs (everything that was sent to the model endpoint): {template_t
 Template prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token_ids))}
 
 Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"""
+        with open(f"no_eos_token_id_found_{str(uuid.uuid4())}.txt", "w") as f:
+            f.write(error_message)
+        raise ValueError(error_message)
 
     return (
         model_prefix_token_ids[:model_cut_end] + template_token_ids[template_cut_start:]
@@ -152,32 +572,178 @@ Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"""
     runtime_env={**get_nsight_config_if_pattern_matches("vllm_async_generation_worker")}
 )  # pragma: no cover
 class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
+    def __init__(
+        self,
+        config,
+        bundle_indices=None,
+        fraction_of_gpus: float = 1.0,
+        seed=None,
+        defer_model_load: bool = False,
+    ):
+        """Initialize an async vLLM worker.
+
+        When defer_model_load=True, only stores config and reserves a port
+        for the HTTP server (if expose_http_server is enabled). Call
+        load_model() later to perform the heavy model loading.
+
+        Args:
+            config: Configuration dictionary for the policy
+            bundle_indices: List of local bundle indices within a node for parallelism.
+            fraction_of_gpus: Fraction of GPUs to use for this worker
+            seed: Random seed for initialization
+            defer_model_load: If True, skip model loading and only reserve port
+        """
+        # Deferred-loading state. Always initialized so every instance
+        # has a consistent set of attributes regardless of init path.
+        self._reserved_socket = None
+        self._reserved_port = None
+        self._reserved_node_ip = None
+        self._deferred_bundle_indices = None
+        self._deferred_seed = None
+
+        # Defaults for HTTP server state; overwritten by _create_engine()
+        # when the worker is a model owner and the model is actually loaded.
+        self.server_thread = None
+        self.base_url = None
+        self.http_server = None
+
+        base_init_params = inspect.signature(
+            BaseVllmGenerationWorker.__init__
+        ).parameters
+        if "defer_model_load" not in base_init_params:
+            if defer_model_load:
+                logger.warning(
+                    "BaseVllmGenerationWorker does not support defer_model_load; "
+                    "falling back to eager vLLM model load."
+                )
+            super().__init__(config, bundle_indices, fraction_of_gpus, seed)
+            return
+
+        super().__init__(
+            config,
+            bundle_indices,
+            fraction_of_gpus,
+            seed,
+            defer_model_load=defer_model_load,
+        )
+
+        if not self.is_model_owner or not defer_model_load:
+            return
+
+        self._deferred_bundle_indices = bundle_indices
+        self._deferred_seed = seed
+
+        if self.cfg["vllm_cfg"].get("expose_http_server"):
+            self._reserve_port()
+
+        self.llm = None
+        self.vllm_device_ids = None
+
+    def _reserve_port(self):
+        """Bind and listen on a TCP socket to reserve a free port from the OS.
+
+        The socket is held open in LISTENING state and passed directly to
+        uvicorn via the ``sockets=`` parameter in ``server.serve()``.
+        The socket is never closed and re-opened, so there is zero gap
+        where another process could steal the port.
+        """
+        import socket
+
+        port_range_low = self.cfg.get("port_range_low", DEFAULT_PORT_RANGE_LOW)
+        port_range_high = self.cfg.get("port_range_high", DEFAULT_PORT_RANGE_HIGH)
+
+        self._reserved_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._reserved_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._reserved_port = _bind_socket_in_range(self._reserved_socket, port_range_low, port_range_high)
+        self._reserved_socket.listen(128)
+        self._reserved_socket.setblocking(False)
+        self._reserved_node_ip = _get_node_ip_local()
+        print(
+            f"Reserved port {self._reserved_port} on {self._reserved_node_ip} "
+            f"for vLLM HTTP server"
+        )
+
+    def _seed_vllm_cache(self):
+        """Seed local vLLM compile cache from a warm directory if available.
+
+        Reads NRL_VLLM_CACHE_SEED_DIR and rsyncs it into VLLM_CACHE_ROOT.
+        Both are env vars set by the launch script — keeping them in the
+        same system avoids the inconsistency of mixing env vars and config.
+
+        Retries up to 3 times on transient failures. Timeout is controlled
+        by NRL_VLLM_CACHE_SEED_TIMEOUT (default 300s).
+        """
+        import os
+        import shutil
+        import subprocess
+
+        seed_dir = os.environ.get("NRL_VLLM_CACHE_SEED_DIR", "")
+        local_dst = os.environ.get("VLLM_CACHE_ROOT", "")
+        if not seed_dir or not local_dst or not os.path.isdir(seed_dir):
+            return
+        if not os.listdir(seed_dir):
+            return
+        if not shutil.which("rsync"):
+            print("[CACHE SEED] rsync not found, skipping cache seed", flush=True)
+            return
+
+        timeout = int(os.environ.get("NRL_VLLM_CACHE_SEED_TIMEOUT", "300"))
+        os.makedirs(local_dst, exist_ok=True)
+
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            t0 = time.perf_counter()
+            try:
+                result = subprocess.run(
+                    ["rsync", "-a", "--ignore-existing", "--prune-empty-dirs", f"{seed_dir}/", f"{local_dst}/"],
+                    capture_output=True,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired:
+                elapsed = time.perf_counter() - t0
+                print(
+                    f"[CACHE SEED] rsync timed out after {elapsed:.0f}s "
+                    f"(attempt {attempt}/{max_attempts})",
+                    flush=True,
+                )
+                continue
+
+            elapsed = time.perf_counter() - t0
+            if result.returncode == 0:
+                print(f"[CACHE SEED] vLLM compile cache seeded in {elapsed:.1f}s", flush=True)
+                return
+
+            stderr = result.stderr.decode(errors="replace")[:200]
+            print(
+                f"[CACHE SEED] rsync failed (attempt {attempt}/{max_attempts}, "
+                f"{elapsed:.1f}s): {stderr}",
+                flush=True,
+            )
+
+        print("[CACHE SEED] all attempts failed, proceeding with cold compile", flush=True)
+
+    def load_model(self):
+        """Load the vLLM model and create the engine.
+
+        Called after deferred init to perform the heavy model loading.
+        """
+        if not self.is_model_owner:
+            return
+
+        self._seed_vllm_cache()
+        self._load_model(self._deferred_bundle_indices, self._deferred_seed)
+
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
         from vllm.config import CompilationConfig
         from vllm.engine.arg_utils import AsyncEngineArgs
         from vllm.v1.engine.async_llm import AsyncLLM
         from vllm.v1.metrics.loggers import PrometheusStatLogger
 
-        # Workaround: convert compilation_config dict to CompilationConfig object
-        # since AsyncEngineArgs doesn't handle the dict-to-pydantic conversion.
+        # (TODO: zhiyul) Remove this workaround after upgrading vLLM where the compilation_config passing issue is resolved.
         if llm_kwargs.get("compilation_config", None):
-            compilation_config = dict(llm_kwargs["compilation_config"])
-            # use_inductor was removed in vLLM v0.12+ (https://github.com/vllm-project/vllm/pull/29323)
-            # and replaced by the `backend` field: use_inductor=True -> backend="" (inductor),
-            # use_inductor=False -> backend="eager".
-            if "use_inductor" in compilation_config:
-                use_inductor = compilation_config.pop("use_inductor")
-                if "backend" not in compilation_config:
-                    compilation_config["backend"] = "" if use_inductor else "eager"
-                warnings.warn(
-                    "compilation_config.use_inductor is deprecated in vLLM v0.12+. "
-                    "Use compilation_config.backend instead: "
-                    "use_inductor=True -> backend='inductor', "
-                    "use_inductor=False -> backend='eager'.",
-                    DeprecationWarning,
-                    stacklevel=1,
-                )
-            llm_kwargs["compilation_config"] = CompilationConfig(**compilation_config)
+            llm_kwargs["compilation_config"] = CompilationConfig(
+                **llm_kwargs["compilation_config"]
+            )
 
         self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
         self.stat_loggers = (
@@ -189,13 +755,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             self.llm_async_engine_args, stat_loggers=self.stat_loggers
         )
 
-        # NeMo-RL #2513: serialise sends on the engine input socket to prevent a
-        # zmq race that BLOCKS the vLLM engine during in-flight weight updates in
-        # async GRPO -- the root of refit-time NCCL TP-group hangs. Must run after
-        # from_engine_args and before _setup_vllm_server spawns the uvicorn thread.
-        self._install_engine_input_socket_lock()
-
-        self.server_thread, self.base_url, self.http_server = None, None, None
         if self.cfg["vllm_cfg"].get("expose_http_server"):
             self.server_thread, self.base_url, self.http_server = (
                 self._setup_vllm_server()
@@ -206,33 +765,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         self._vllm_metrics_lock = threading.Lock()
         if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
             self._start_vllm_metrics_logger()
-
-    def _install_engine_input_socket_lock(self) -> None:
-        """Serialise sends on AsyncMPClient.input_socket across OS threads to prevent
-        zmq races that block the vLLM engine (e.g. during in-flight weight updates in
-        async GRPO). Ports NeMo-RL #2513, which landed on vLLM 0.20; we run 0.17.1, so
-        locate the shadow socket defensively and no-op with a clear warning if the
-        internal layout differs (a no-op leaves in-flight refits at risk of the original
-        hang, but never crashes worker init)."""
-        try:
-            shadow_sock = self.llm.engine_core.input_socket._shadow_sock
-        except AttributeError:
-            warnings.warn(
-                "vllm_worker_async: could not locate engine_core.input_socket."
-                "_shadow_sock; skipping the in-flight weight-update zmq lock (#2513). "
-                "In-flight refits may hang on this vLLM version (0.17.1).",
-                stacklevel=2,
-            )
-            return
-
-        lock = threading.Lock()
-        original_send_multipart = shadow_sock.send_multipart
-
-        def locked_send_multipart(*args: Any, **kwargs: Any) -> Any:
-            with lock:
-                return original_send_multipart(*args, **kwargs)
-
-        shadow_sock.send_multipart = locked_send_multipart  # type: ignore[assignment]
 
     def _start_vllm_metrics_logger(self) -> None:
         """Start a background thread that periodically collects vLLM logger metrics.
@@ -330,6 +862,12 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
     async def post_init_async(self):
         self.vllm_device_ids = await self.report_device_id_async()
 
+    async def get_reserved_url(self) -> Optional[str]:
+        """Return the URL from the reserved socket, available before model loading."""
+        if self._reserved_socket is not None:
+            return f"http://{self._reserved_node_ip}:{self._reserved_port}/v1"
+        return None
+
     async def report_dp_openai_server_base_url(self) -> Optional[str]:
         return self.base_url
 
@@ -400,11 +938,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         class NeMoRLOpenAIServingMixin:
             @staticmethod
             def _set_max_tokens(request, max_tokens: int) -> None:
-                """Set the request's max output tokens in place.
-
-                Handles both max_completion_tokens (newer OpenAI API) and the deprecated
-                max_tokens (still supported by vLLM).
-                """
+                """Set the request's max output tokens in place."""
                 if request.max_completion_tokens is not None:
                     request.max_completion_tokens = max_tokens
                 elif request.max_tokens is not None:
@@ -434,12 +968,29 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                     if message.get("tool_calls"):
                         message["tool_calls"] = list(message["tool_calls"])
 
-                # Deepcopy messages here since _preprocess_chat may be destructive.
-                messages_for_replace_prefix_tokens = deepcopy(messages)
+                    if "content" in message:
+                        content = message["content"]
+                        if isinstance(content, (list, str)):
+                            continue
+                        # Convert ValidatorIterator to list to get actual content
+                        try:
+                            message["content"] = list(content)
+                        except Exception:
+                            message["content"] = []
 
-                # Temporarily set max output tokens to 1 so vLLM's pre-tokenization length
-                # check passes; the real value is set via _clamp_max_tokens once the prompt
-                # length is known, so input + output <= max_model_len.
+                truncate_prompt_tokens = _qwen35_truncate_prompt_tokens()
+                if (
+                    truncate_prompt_tokens is not None
+                    and hasattr(request, "truncate_prompt_tokens")
+                    and getattr(request, "truncate_prompt_tokens") is None
+                ):
+                    request = request.model_copy(
+                        update={"truncate_prompt_tokens": truncate_prompt_tokens}
+                    )
+
+                # Temporarily set max output tokens to 1 so vLLM's pre-tokenization
+                # length check passes; restore the real clamped value once the
+                # final prompt token ids are known.
                 actual_request_max_tokens = None
                 if isinstance(request, NeMoRLChatCompletionRequest):
                     actual_request_max_tokens = (
@@ -471,7 +1022,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                     raise
 
                 if request.required_prefix_token_ids is None:
-                    # Clamp max output tokens so input + output <= max_model_len.
                     if actual_request_max_tokens is not None:
                         self._clamp_max_tokens(
                             request,
@@ -479,6 +1029,24 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                             res[1][0]["prompt_token_ids"],
                         )
                     return res
+
+                # Copy after vLLM preprocessing so prefix and full-prompt paths
+                # use the same normalized reasoning/tool-call representation.
+                exclude_fields = {
+                    "prompt_token_ids",
+                    "generation_token_ids",
+                    "generation_log_probs",
+                }
+                messages_for_replace_prefix_tokens = []
+                for msg in messages:
+                    if isinstance(msg, dict):
+                        new_msg = {}
+                        for k, v in msg.items():
+                            if k not in exclude_fields:
+                                new_msg[k] = deepcopy(v)
+                        messages_for_replace_prefix_tokens.append(new_msg)
+                    else:
+                        messages_for_replace_prefix_tokens.append(deepcopy(msg))
 
                 # Find the last assistant message
                 last_assistant_message_idx = None
@@ -492,12 +1060,18 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                     messages_to_last_assistant_message = (
                         messages_for_replace_prefix_tokens
                     )
+                    suffix_message_count = None
                 else:
                     # Include the last assistant message itself.
                     messages_to_last_assistant_message = (
                         messages_for_replace_prefix_tokens[
                             : last_assistant_message_idx + 1
                         ]
+                    )
+                    suffix_message_count = (
+                        len(messages_for_replace_prefix_tokens)
+                        - last_assistant_message_idx
+                        - 1
                     )
 
                 # For the prefix token calculation, we need add_generation_prompt=False
@@ -526,16 +1100,26 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                     0
                 ]  # We need to modify engine_prompt.prompt_token_ids
 
-                final_prompt_token_ids = _replace_prefix_tokens(
-                    tokenizer=self.renderer.tokenizer,
+                _log_qwen35_pre_replace_context(
+                    request=request,
+                    messages=messages,
+                    messages_to_last_assistant_message=messages_to_last_assistant_message,
+                    last_assistant_message_idx=last_assistant_message_idx,
                     model_prefix_token_ids=request.required_prefix_token_ids,
                     template_prefix_token_ids=actual_corresponding_token_ids,
                     template_token_ids=engine_prompt["prompt_token_ids"],
                 )
 
+                final_prompt_token_ids = _replace_prefix_tokens(
+                    tokenizer=self.renderer.tokenizer,
+                    model_prefix_token_ids=request.required_prefix_token_ids,
+                    template_prefix_token_ids=actual_corresponding_token_ids,
+                    template_token_ids=engine_prompt["prompt_token_ids"],
+                    suffix_message_count=suffix_message_count,
+                )
+
                 engine_prompt["prompt_token_ids"] = final_prompt_token_ids
 
-                # Clamp after prefix replacement since the prompt length may have changed.
                 if actual_request_max_tokens is not None:
                     self._clamp_max_tokens(
                         request,
@@ -575,6 +1159,13 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 return_tokens_as_token_ids=True,
             )
         )
+
+        # Load custom reasoning parser plugin if specified
+        reasoning_parser_plugin = serving_chat_kwargs.pop("reasoning_parser_plugin", None)
+        if reasoning_parser_plugin:
+            from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
+            ReasoningParserManager.import_reasoning_parser(reasoning_parser_plugin)
+
         openai_serving_chat = NeMoRLOpenAIServingChat(**serving_chat_kwargs)
 
         generation_config = self.cfg
@@ -726,9 +1317,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         from logging import getLogger as _getLogger
 
-        _getLogger("vllm.entrypoints.openai.engine.protocol").addFilter(
-            CleanLoggingFilter()
-        )
+        _getLogger("vllm.entrypoints.openai.engine.protocol").addFilter(CleanLoggingFilter())
 
         # Suppress the noisy vLLM traceback when a prompt exceeds max_model_len.
         # This is expected during multi-turn rollouts; we log a clean one-line
@@ -764,12 +1353,26 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         # Server spinup
         ########################################
 
-        node_ip = _get_node_ip_local()
-        free_port = _get_free_port_local()
+        if self._reserved_socket:
+            # Use the socket reserved during __init__ (deferred model load path).
+            # Pass it directly to uvicorn via sockets= — zero gap, the socket
+            # is never closed and re-opened.
+            node_ip = self._reserved_node_ip
+            free_port = self._reserved_port
+            reserved_sock = self._reserved_socket
+            self._reserved_socket = None  # Transfer ownership to uvicorn
+        else:
+            node_ip = _get_node_ip_local()
+            port_range_low = self.cfg.get("port_range_low", DEFAULT_PORT_RANGE_LOW)
+            port_range_high = self.cfg.get("port_range_high", DEFAULT_PORT_RANGE_HIGH)
+            free_port = _get_free_port_local(port_range_low, port_range_high)
+            reserved_sock = None
 
         base_url = f"http://{node_ip}:{free_port}/v1"
         print(f"Starting server on {base_url}")
 
+        # When sockets= is used, uvicorn ignores host/port in Config.
+        # We still set them for logging/metadata purposes.
         config = uvicorn.Config(
             app,
             host="0.0.0.0",
@@ -790,7 +1393,19 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         uvicorn_logger = getLogger("uvicorn.access")
         uvicorn_logger.addFilter(No200Filter())
 
-        thread = threading.Thread(target=server.run, daemon=True)
+        if reserved_sock is not None:
+            # Use server.serve(sockets=) to hand the pre-bound listening socket
+            # directly to uvicorn's asyncio server. No close-and-rebind needed.
+            import asyncio
+
+            def _run_with_socket():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(server.serve(sockets=[reserved_sock]))
+
+            thread = threading.Thread(target=_run_with_socket, daemon=True)
+        else:
+            thread = threading.Thread(target=server.run, daemon=True)
         thread.start()
 
         return thread, base_url, server
@@ -1198,11 +1813,13 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             else:
                 worker_results = result_or_coro
 
-            worker_result = worker_results[0]
+            all_success, exceptions_or_none = _normalize_weight_update_results(
+                worker_results
+            )
 
-            if not worker_result:
+            if not all_success:
                 print(
-                    f"Error: Worker failed to update weights. Result: {worker_result}"
+                    f"Error: Worker failed to update weights. Result: {exceptions_or_none}"
                 )
                 return False
             return True
@@ -1234,11 +1851,13 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             else:
                 worker_results = result_or_coro
 
-            worker_result = worker_results[0]
+            all_success, exceptions_or_none = _normalize_weight_update_results(
+                worker_results
+            )
 
-            if not worker_result:
+            if not all_success:
                 print(
-                    f"Error: Worker failed to update weights. Result: {worker_result}"
+                    f"Error: Worker failed to update weights. Result: {exceptions_or_none}"
                 )
                 return False
             return True
@@ -1277,12 +1896,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         # Reset the prefix cache to ensure that prefix cache is not reused after weights are updated
         await self.llm.reset_prefix_cache()
-        # Reset the multimodal processor cache (sender side) so it stays in
-        # sync with the receiver cache that vLLM clears internally during
-        # sleep.  Without this, the sender thinks images are already cached on
-        # the receiver and sends data=None, causing an assertion error.
-        if hasattr(self.llm, "reset_mm_cache"):
-            await self.llm.reset_mm_cache()
         await self.llm.sleep(level=1)
 
         gc.collect()
