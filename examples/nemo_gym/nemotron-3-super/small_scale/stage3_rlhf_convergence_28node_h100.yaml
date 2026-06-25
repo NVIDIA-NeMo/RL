@@ -1,0 +1,18 @@
+defaults: "../stage3_rlhf.yaml"
+
+policy:
+  generation_batch_size: 32
+  generation:
+    colocated:
+      resources:
+        num_nodes: 8            # 8 TP8 H100 gen replicas for the 2048-trajectory step
+
+env:
+  nemo_gym:
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          num_workers: 4
+
+cluster:
+  num_nodes: 24   # 16 train (TP4*CP4*PP1=16 GPUs, DP8) + 8 gen (TP8). +4 GenRM nodes -> SBATCH=28.
