@@ -296,7 +296,9 @@ jobs:
     name: Wait in test approval queue
     needs: [pre-flight, lint-check]
     runs-on: ubuntu-latest
-    environment: test
+    environment:
+      name: test
+      deployment: false
     if: >-
       ${{
         always() &&
@@ -989,7 +991,9 @@ jobs:
     name: Notify nightly test failure
     runs-on: ubuntu-latest
     needs: [CI_QA_Gate]
-    environment: main
+    environment:
+      name: main
+      deployment: false
     if: ${{ always() && github.event_name == 'schedule' && needs.CI_QA_Gate.result == 'failure' }}
     steps:
       - name: Send Slack notification
