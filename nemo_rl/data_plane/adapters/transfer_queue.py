@@ -71,7 +71,11 @@ def _get_local_node_ip() -> str:
 
 
 def _mooncake_transport_config() -> dict:
-    protocol = os.environ.get("MC_MOONCAKE_PROTOCOL", "tcp")
+    # Default to RDMA so production clusters (RoCE/IB) pick up the
+    # zero-copy MooncakeStore path introduced in TQ v0.1.8 without
+    # needing env tweaks. Hosts without an mlx5 device fall back to TCP
+    # below so the dev path (laptop, non-RDMA cluster) still works.
+    protocol = os.environ.get("MC_MOONCAKE_PROTOCOL", "rdma")
     if protocol != "rdma":
         return {"protocol": "tcp"}
     device = os.environ.get("MC_MOONCAKE_DEVICE", "")
@@ -82,7 +86,7 @@ def _mooncake_transport_config() -> dict:
                     "sh",
                     "-c",
                     "for d in /sys/class/infiniband/mlx5_*/ports/1/link_layer; do "
-                    "  test -f $d && grep -q Ethernet $d && basename $(dirname $(dirname $d)); "
+                    "  test -f $d && grep -q Ethernet $d && basename $(dirname $(dirname $(dirname $d))); "
                     "done | head -1",
                 ],
                 check=False,
@@ -92,8 +96,18 @@ def _mooncake_transport_config() -> dict:
             device = out or ""
         except Exception:
             device = ""
-    if device:
-        os.environ.setdefault("MC_GID_INDEX", os.environ.get("MC_GID_INDEX", "3"))
+    if not device:
+        import warnings
+
+        warnings.warn(
+            "MC_MOONCAKE_PROTOCOL=rdma requested (default) but no "
+            "RoCE-capable mlx5 device detected under /sys/class/infiniband; "
+            "falling back to TCP. Set MC_MOONCAKE_PROTOCOL=tcp to silence.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return {"protocol": "tcp"}
+    os.environ.setdefault("MC_GID_INDEX", os.environ.get("MC_GID_INDEX", "3"))
     return {"protocol": "rdma", "device_name": device}
 
 
@@ -157,6 +171,19 @@ def _patch_tq_actor_runtime_env() -> None:
     if _TQ_RUNTIME_ENV_PATCHED:
         return
 
+    # Escape hatch — when the base venv on every node already has TQ
+    # (e.g. `NRL_FORCE_REBUILD_VENVS=true` rebuilt the worker venv from
+    # pyproject before this driver started), the runtime_env injection
+    # is pure overhead: Ray builds a redundant isolated per-actor venv
+    # and pip-installs TQ into it. Under TQ v0.1.8 that isolated pip
+    # install fails the `TransferQueueController` import on the worker
+    # ("RuntimeError: The actor with name TransferQueueController
+    # failed to import on the worker"). Set NRL_DISABLE_TQ_RUNTIME_ENV
+    # =1 to skip the injection and let actors inherit the base venv.
+    if os.environ.get("NRL_DISABLE_TQ_RUNTIME_ENV", "") == "1":
+        _TQ_RUNTIME_ENV_PATCHED = True
+        return
+
     runtime_env = {"pip": [_resolve_tq_pin()]}
 
     def _install(cls) -> bool:
@@ -173,7 +200,10 @@ def _patch_tq_actor_runtime_env() -> None:
 
     patched_any = False
     try:
-        from transfer_queue.storage.simple_backend import SimpleStorageUnit
+        # v0.1.8 moved the underlying module to `simple_storage`; the
+        # class stays re-exported from the package root, so we import
+        # from there to stay forward-compatible across the refactor.
+        from transfer_queue.storage import SimpleStorageUnit
 
         patched_any |= _install(SimpleStorageUnit)
     except ImportError:
@@ -356,13 +386,25 @@ def _promote_1d_leaves(td: TensorDict) -> TensorDict:
 
 
 def _from_wire(td: TensorDict) -> TensorDict:
-    """Inverse of `_promote_1d_leaves`: squeeze trailing 1 back to (N,)."""
-    # Same top-level iteration as `_promote_1d_leaves`: NonTensorData /
-    # NonTensorStack leaves are only visible via td.keys(), not leaves_only.
+    """Inverse of `_promote_1d_leaves`: squeeze trailing 1 back to (N,).
+
+    TQ v0.1.8's MooncakeStore deserialization (`batch_decode_from`)
+    loses 0-D scalar dimensionality on read; per-sample values come back
+    as ``(1,)`` tensors, which cause ``_merge_tensors_to_tensordict`` to
+    use ``as_nested_tensor`` instead of the dense ``torch.stack`` path.
+    Result: 1D-promoted leaves return as nested ``(N, j_uniform_1)``
+    instead of dense ``(N, 1)``. Densify uniformly-1 jagged tensors so
+    the trailing-1 squeeze can fire; leave genuinely ragged fields
+    nested (``to_padded_tensor`` would inject zeros).
+    """
     new_dict: dict[str, Any] = {}
     changed = False
     for k in td.keys():
         v = td.get(k)
+        if isinstance(v, torch.Tensor) and v.is_nested:
+            dense = v.to_padded_tensor(0)
+            if dense.shape[-1] == 1:
+                v = dense
         if (
             isinstance(v, torch.Tensor)
             and not v.is_nested
