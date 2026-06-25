@@ -789,7 +789,9 @@ def test_averaged_logits_cross_tokenizer_skips_direct_kl_fast_path():
         return torch.tensor(0.0), {}
 
     def _fast_path(*args, **kwargs):
-        raise AssertionError("direct_full_vocab_kl reached for cross-tokenizer teachers")
+        raise AssertionError(
+            "direct_full_vocab_kl reached for cross-tokenizer teachers"
+        )
 
     fn._compute_teacher_kd = _fallback
     fn._direct_full_vocab_kl = _fast_path
@@ -851,9 +853,7 @@ def test_teacher_weight_score_ignores_padded_positions(metric):
     logits = torch.randn(batch, seqlen, vocab)
     ids = torch.randint(0, vocab, (batch, seqlen))
     # Last two positions of each sample are padding.
-    token_mask = torch.tensor(
-        [[1, 1, 1, 0, 0], [1, 1, 1, 0, 0]], dtype=torch.float32
-    )
+    token_mask = torch.tensor([[1, 1, 1, 0, 0], [1, 1, 1, 0, 0]], dtype=torch.float32)
     sample_mask = torch.ones(batch)
 
     score = fn._teacher_weight_score(logits, ids, token_mask, sample_mask)

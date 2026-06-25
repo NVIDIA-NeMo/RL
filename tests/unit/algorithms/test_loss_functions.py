@@ -2341,7 +2341,12 @@ def test_cross_tokenizer_gold_loss_matches_reference(tmp_path):
     teacher_logits = torch.randn(1, 3, _CT_V_TEACHER)
 
     loss, kl_common, l1_uncommon, n_valid, _ = loss_fn._compute_gold(
-        logits, data, teacher_logits
+        logits,
+        data,
+        teacher_logits,
+        projection_matrix_path=loss_fn.projection_matrix_paths[0],
+        teacher_vocab_size=loss_fn.teacher_vocab_sizes[0],
+        xtoken_loss=loss_fn.xtoken_loss,
     )
 
     assert torch.isfinite(loss)
@@ -2395,7 +2400,14 @@ def test_cross_tokenizer_gold_loss_all_samples_masked_is_zero(tmp_path):
     logits = torch.randn(1, 3, _CT_V_STUDENT)
     teacher_logits = torch.randn(1, 3, _CT_V_TEACHER)
 
-    loss, _, _, n_valid, _ = loss_fn._compute_gold(logits, data, teacher_logits)
+    loss, _, _, n_valid, _ = loss_fn._compute_gold(
+        logits,
+        data,
+        teacher_logits,
+        projection_matrix_path=loss_fn.projection_matrix_paths[0],
+        teacher_vocab_size=loss_fn.teacher_vocab_sizes[0],
+        xtoken_loss=loss_fn.xtoken_loss,
+    )
     assert n_valid.item() == 0
     assert torch.equal(loss.detach(), torch.zeros(()))
 

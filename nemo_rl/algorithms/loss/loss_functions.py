@@ -1955,8 +1955,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
         teacher_full_logits_by_idx: dict[int, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """``(logits, input_ids, token_mask)`` for teacher ``i``'s CE /
-        weight-metric scores.
+        """Return ``(logits, input_ids, token_mask)`` for teacher ``i``'s CE / weight-metric scores.
 
         The token mask is over the tokenization the score is computed on: the
         student's for a same-vocab teacher, teacher ``i``'s own otherwise.
