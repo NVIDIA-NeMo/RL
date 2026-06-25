@@ -1687,7 +1687,6 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         matches CE: masked next-token mean normalized by ``global_valid_toks``,
         scaled by ``T**2``.
         """
-        T = self.temperature
         if self.teacher_send_full_logits[i]:
             kd = self._direct_full_vocab_kl(
                 logits, data, teacher_full_logits_by_idx[i], global_valid_toks
@@ -1700,7 +1699,6 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 data[f"teacher_{i}_topk_indices"],
                 global_valid_toks,
             )
-        del T  # T applied inside the helpers
         return kd, {"kl_loss": kd.item()}
 
     def _direct_full_vocab_kl(
