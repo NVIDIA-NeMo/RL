@@ -40,8 +40,8 @@ DEFAULT_TEMPERATURE = 1.0
 DEFAULT_TOP_P = 1.0
 DEFAULT_CONTAINER_IMAGE_DIR = "/swe-bench-images"
 DEFAULT_REPO_FORMATTER = "/swe-bench-repos/{repo}"
-OUTPUT_JSONL_FILENAME = "r2e_gym_subset_train.jsonl"
-METRICS_JSON_FILENAME = "r2e_gym_subset_train_conversion_metrics.json"
+OUTPUT_JSONL_FILENAME = "r2e_gym_subset_full.jsonl"
+METRICS_JSON_FILENAME = "r2e_gym_subset_full_conversion_metrics.json"
 BASE_COMMIT_CACHE_FILENAME = "r2e_gym_subset_train_base_commits.json"
 TRAIN_JSONL_FILENAME = "benchmark_r2e_gym_easy_train.jsonl"
 VAL_JSONL_FILENAME = "benchmark_r2e_gym_easy_val.jsonl"
@@ -502,11 +502,13 @@ def split_jsonl_by_instance_ids(
                 if instance_id in train_ids:
                     row["agent_ref"]["name"] = "swe_agents_train"
                     train_file.write(json.dumps(row, separators=(",", ":")))
+                    train_file.write("\n")
                     train_found.add(instance_id)
                     train_rows += 1
                 elif instance_id in val_ids:
                     row["agent_ref"]["name"] = "swe_agents_val"
                     val_file.write(json.dumps(row, separators=(",", ":")))
+                    val_file.write("\n")
                     val_found.add(instance_id)
                     val_rows += 1
                 else:
