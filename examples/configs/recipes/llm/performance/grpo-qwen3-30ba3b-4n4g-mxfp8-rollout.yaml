@@ -6,7 +6,7 @@ loss_fn:
   use_importance_sampling_correction: true
 checkpointing:
   enabled: false
-  checkpoint_dir: results/grpo-qwen3-30ba3b-4n4g-vllm-mxfp8
+  checkpoint_dir: results/grpo-qwen3-30ba3b-4n4g-mxfp8-rollout
 policy:
   model_name: Qwen/Qwen3-30B-A3B
   train_micro_batch_size: 1
@@ -46,12 +46,12 @@ policy:
         - v_proj
         - o_proj
 logger:
-  log_dir: logs/grpo-qwen3-30ba3b-4n4g-vllm-mxfp8
+  log_dir: logs/grpo-qwen3-30ba3b-4n4g-mxfp8-rollout
   wandb_enabled: true
   tensorboard_enabled: true
   wandb:
     project: nemo-rl
-    name: grpo-qwen3-30ba3b-4n4g-vllm-mxfp8
+    name: grpo-qwen3-30ba3b-4n4g-mxfp8-rollout
 cluster:
   gpus_per_node: 4
   num_nodes: 4

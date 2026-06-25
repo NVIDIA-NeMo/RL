@@ -21,5 +21,4 @@ tests/test_suites/llm/performance/grpo-deepseek-v3-64n4g-async-1off.sh
 tests/test_suites/llm/performance/grpo-qwen3-235b-32n4g-async-1off.sh
 
 # GB200 MXFP8
-tests/test_suites/llm/performance/grpo-qwen3-30ba3b-4n4g-mxfp8.sh
-tests/test_suites/llm/performance/grpo-qwen3-30ba3b-4n4g-vllm-mxfp8.sh
+tests/test_suites/llm/performance/grpo-qwen3-30ba3b-4n4g-mxfp8-rollout.sh
