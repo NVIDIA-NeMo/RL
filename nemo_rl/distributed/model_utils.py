@@ -1669,8 +1669,7 @@ def distributed_vocab_topk(
     assert vocab_end_index > vocab_start_index
     world_size = torch.distributed.get_world_size(tp_group)
 
-    logits = vocab_parallel_logits.to(dtype=torch.float32)
-    B, S, V_local = logits.shape
+    B, S, V_local = vocab_parallel_logits.shape
     V_total = V_local * world_size
     K_eff = int(min(k, max(1, V_total)))
 
@@ -1682,10 +1681,11 @@ def distributed_vocab_topk(
 
     for s0 in range(0, S, chunk_size):
         s1 = min(S, s0 + chunk_size)
+        # Upcast only the current slice to bound the fp32 working set to
+        # [B, chunk_size, V_local] (chunk_size driven by logprob_chunk_size).
+        logits_chunk = vocab_parallel_logits[:, s0:s1, :].to(dtype=torch.float32)
         # local top-k on this TP rank
-        local_vals, local_idx_local = torch.topk(
-            logits[:, s0:s1, :], min(k, V_local), dim=-1
-        )
+        local_vals, local_idx_local = torch.topk(logits_chunk, min(k, V_local), dim=-1)
         local_idx_global = local_idx_local + int(vocab_start_index)
 
         # gather candidates from all TP ranks
@@ -1758,22 +1758,23 @@ def gather_logits_at_global_indices(
             global_indices, cp_rank, cp_size, seq_dim=1
         )
 
-    logits = vocab_parallel_logits.to(dtype=torch.float32)
-    B, S, V_local = logits.shape
+    B, S, V_local = vocab_parallel_logits.shape
     if chunk_size is None:
         chunk_size = S
 
     out_chunks: list[torch.Tensor] = []
     for s0 in range(0, S, chunk_size):
         s1 = min(S, s0 + chunk_size)
+        # Upcast only the current slice to bound the fp32 working set to
+        # [B, chunk_size, V_local] (chunk_size driven by logprob_chunk_size).
+        logits_chunk = vocab_parallel_logits[:, s0:s1, :].to(dtype=torch.float32)
         gi = global_indices[:, s0:s1, :]
 
         in_range = (gi >= int(vocab_start_index)) & (gi < int(vocab_end_index))
         # Map global ids to local shard ids and clamp to valid range to avoid OOB gather
-        V_local = logits.shape[-1]
         li = (gi - int(vocab_start_index)).clamp(min=0, max=V_local - 1)
 
-        local_vals = torch.gather(logits[:, s0:s1, :], dim=-1, index=li)
+        local_vals = torch.gather(logits_chunk, dim=-1, index=li)
         local_vals = local_vals * in_range.to(dtype=local_vals.dtype)
 
         if tp_group is not None:
