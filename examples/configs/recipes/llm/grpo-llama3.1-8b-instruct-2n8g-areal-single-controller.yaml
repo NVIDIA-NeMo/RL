@@ -1,0 +1,61 @@
+# AReaL decoupled-PPO exemplar on the SingleController path.
+#
+# Inherits the canonical SC async-1off recipe (same training topology, async
+# staleness-window dispatch, TransferQueue data plane) and overlays the AReaL
+# decoupled-PPO objective + minibatch / refit knobs (AREAL.md §2, §6).
+#
+# AReaL collapses onto existing NeMo-RL machinery (AREAL.md §0): pi_prox is the
+# frozen `prev_logprobs` snapshot, the decoupled loss is
+# ClippedPGLossFn(use_importance_sampling_correction=True,
+# reference_policy_kl_penalty=0). Only the controller loop is new (P1/P2/P4);
+# the loss needs no new code, just this config.
+#
+# NOTE: the two-phase train loop, minibatch split, and interruptible refit are
+# implemented incrementally (P1/P2/P4) on SingleControllerArealActor. At P0 the
+# controller behaves identically to the base SC controller (num_minibatches=1);
+# this recipe documents the target configuration.
+#
+# reference_configs coverage: tests/unit/test_config_v2.py globs only
+# tests/unit/reference_configs/*.yaml and resolves each to a REAL config by
+# basename at examples/configs/<basename> (top level) — it does NOT descend into
+# recipes/ subdirs. Every SingleController recipe under recipes/llm/ (this file
+# and its parent grpo-llama3.1-8b-instruct-2n8g-async-1off-single-controller.yaml)
+# therefore has no reference_configs entry, and adding one would BREAK the test
+# (the basename would resolve to a non-existent top-level real config). This
+# recipe is consistent with that convention; test_config_v2.py is green without
+# an entry (AREAL.md §9 P0).
+defaults: ./grpo-llama3.1-8b-instruct-2n8g-async-1off-single-controller.yaml
+
+logger:
+  log_dir: logs/grpo-llama3.1-8b-instruct-2n8g-areal-sc
+  wandb:
+    name: grpo-llama3.1-8b-instruct-2n8g-areal-sc
+
+checkpointing:
+  checkpoint_dir: results/grpo-llama3.1-8b-instruct-2n8g-areal-sc
+
+# ── AReaL decoupled-PPO loss (AREAL.md §2b, §6) ──────────────────────────────
+# Core mechanism: clip ratio = pi_theta / pi_prox  (prev_logprobs := frozen
+# pi_prox). The decoupled loss has NO KL term — AReaL's KL is a *reward* penalty
+# and its math recipes set it to 0. Staleness reweighting pi_prox / pi_behav is
+# the always-on importance-sampling correction.
+loss_fn:
+  ratio_clip_min: 0.2                          # eps clip (AReaL gsm8k eps_clip=0.4; tune)
+  ratio_clip_max: 0.2
+  reference_policy_kl_penalty: 0.0             # no KL term in the decoupled loss
+  use_importance_sampling_correction: true     # always-on pi_prox/pi_behav reweight
+  # Optional AReaL safety knob (behav_imp_weight_cap; recipe=5.0, default off):
+  # mask tokens whose IS weight exceeds the cap. Left off to match the paper;
+  # realize via NeMo's truncated-IS knob if desired (AREAL.md §6, §10).
+
+# ── AReaL minibatch / refit knobs (AREAL.md §2a) ─────────────────────────────
+async_rl:
+  # == AReaL ppo_n_minibatches: split the full batch into this many minibatches,
+  # ONE optimizer step per minibatch (single pass, each sample used once).
+  # gsm8k uses 1, boba 4. num_minibatches=1 == one optimizer step per train step.
+  num_minibatches: 1
+  # AReaL-style interruptible refit: after the weight swap, invalidate the KV
+  # cache with reset_running_requests=True so vLLM preempts in-flight requests
+  # and reprefills them under the new weights (P4). False keeps stale KV
+  # (Magistral-style, cheaper).
+  refit_invalidate_kv_cache: true
