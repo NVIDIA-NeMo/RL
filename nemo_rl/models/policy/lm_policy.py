@@ -46,7 +46,10 @@ from nemo_rl.models.policy.interfaces import (
     ScoreOutputSpec,
     TopkLogitsOutputSpec,
 )
-from nemo_rl.models.policy.utils import resolve_policy_worker_cls
+from nemo_rl.models.policy.utils import (
+    aggregate_per_sample_handles,
+    resolve_policy_worker_cls,
+)
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.flops_tracker import (
     FLOPTracker,
@@ -321,6 +324,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         self.cfg = config
 
+    @property
+    def data_parallel_size(self) -> int:
+        """Data-parallel degree, read from the policy's sharding annotations."""
+        return self.sharding_annotations.get_axis_size("data_parallel")
+
     def run_all_workers_single_data(self, method_name: str, *args, **kwargs) -> Any:
         """Run a method on all workers in parallel with the same data.
 
@@ -420,7 +428,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         is the inverse permutation needed to undo seqpack/dynbatch reorder
         (``None`` when neither is enabled).
         """
-        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        dp_size = self.data_parallel_size
         if self.use_dynamic_batches:
             self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
                 "dynamic_batching"
@@ -461,7 +469,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         does not return ``unsorted_data_indices`` because train returns
         scalar metrics (no per-row outputs to reorder).
         """
-        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        dp_size = self.data_parallel_size
         if self.use_dynamic_batches:
             self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
                 "dynamic_batching"
@@ -641,16 +649,20 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     ) -> list[dict[str, Any]]:
         """Ship the teacher's full-vocab logits to the student via CUDA IPC.
 
-        Used by cross-tokenizer distillation. Returns a flat ``list[B]`` of
-        per-sample IPC handle dicts; each entry's ``logits_ipc``
-        reconstructs a ``[T_t, V_t]`` CUDA tensor on the consumer device.
-        The loss fn then either (a) derives a microbatch-global top-k
-        subset internally to match the PT non-gold path, or (b) uses the
-        full vocab end-to-end to match the PT gold path.
+        Used by cross-tokenizer distillation; supports heterogeneous teacher
+        TP/CP. Gathers each worker's ``{"dp_rank", "per_sample_handles"}`` and
+        returns the global-batch-ordered list produced by
+        :func:`aggregate_per_sample_handles`: a length-``gbs`` list where
+        element ``i`` is ``{"teacher_shards": [shard, ...]}`` holding every
+        TP×CP shard of global sample ``i``. Each shard carries the IPC payload
+        plus the ``buf_idx`` / ``sample_index_in_buf`` slot index and the TP/CP
+        shard metadata; the loss consumer reassembles the full ``[T_t, V_t]``
+        teacher logits (or its CP-local window) from these shards.
 
-        Caller must invoke :meth:`release_ipc_buffer` after the student
-        finishes consuming the handles — otherwise the producer-side
-        CUDA tensors leak.
+        The producer-side IPC storage is persistent and reused across calls
+        (via ``copy_``); the caller releases it once via
+        :meth:`release_ipc_buffer` at the end of training / validation (and on
+        error), not per call.
 
         v0 limitation: no dynamic batching, no sequence packing.
         """
@@ -659,7 +671,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "get_full_logits_ipc does not support dynamic batching "
                 "or sequence packing in v0."
             )
-        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        dp_size = self.data_parallel_size
         with timer.time("get_full_logits_ipc/shard_data") if timer else nullcontext():
             sharded_data = data.shard_by_batch_size(  # type: ignore
                 dp_size,
@@ -675,18 +687,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     "tensor_parallel",
                     "pipeline_parallel",
                 ],
-                output_is_replicated=[
-                    "context_parallel",
-                    "tensor_parallel",
-                    "pipeline_parallel",
-                ],
+                # Keep every TP × CP output; consumer routes via overlap.
+                output_is_replicated=["pipeline_parallel"],
                 common_kwargs={"micro_batch_size": micro_batch_size},
             )
         worker_results = self.worker_group.get_all_worker_results(futures)
-        all_handles: list[dict[str, Any]] = []
-        for wr in worker_results:
-            all_handles.extend(wr["per_sample_handles"])
-        return all_handles
+        return aggregate_per_sample_handles(worker_results)
 
     def release_ipc_buffer(self) -> None:
         """Tell all workers to drop their stashed IPC tensors."""
@@ -798,7 +804,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         )
         assert self.cfg["generation"] is not None, "Generation config is not set"
 
-        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        dp_size = self.data_parallel_size
         sharded_data = data.shard_by_batch_size(dp_size, batch_size=None)
         futures = self.worker_group.run_all_workers_sharded_data(
             "generate",
@@ -839,7 +845,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             "Missing required input fields"
         )
 
-        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        dp_size = self.data_parallel_size
         sharded_data = data.shard_by_batch_size(dp_size, batch_size=None)
         futures = self.worker_group.run_all_workers_sharded_data(
             "score",
@@ -929,7 +935,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         distributed reduction, returning results merged across ranks. Therefore, we shard the
         input by DP and call in parallel, then take the result from the first worker.
         """
-        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        dp_size = self.data_parallel_size
         if self.use_dynamic_batches:
             self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
                 "dynamic_batching"
