@@ -480,11 +480,19 @@ class AsyncNemoGymRolloutImpl:
         """Dispatch rows to NeMo-Gym and return completions + metrics."""
         nemo_gym_env = self._task_to_env["nemo_gym"]
 
-        # Run generation.
+        # Run generation. run_rollouts is an async generator that streams
+        # (rowidx, result, timing) per completed task; drain it, reassemble in input
+        # (rowidx) order, and keep the aggregated timing (sent only on the final task).
         with timer.time(f"{timer_prefix}/run_rollouts"):
-            results, env_timing_metrics = await nemo_gym_env.run_rollouts.remote(
-                inputs, self._tokenizer, timer_prefix
-            )
+            results: list = [None] * len(inputs)
+            env_timing_metrics: dict[str, Any] = {}
+            async for result_ref in nemo_gym_env.run_rollouts.options(
+                num_returns="streaming"
+            ).remote(inputs, self._tokenizer, timer_prefix):
+                rowidx, result, timing_metrics = await result_ref
+                results[rowidx] = result
+                if timing_metrics is not None:
+                    env_timing_metrics = timing_metrics
             # Convert results to completions.
             completions = [self._result_to_completion(r) for r in results]
 

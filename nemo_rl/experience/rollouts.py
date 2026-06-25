@@ -24,7 +24,7 @@ import warnings
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, AsyncGenerator, Optional
 
 import ray
 import torch
@@ -1304,11 +1304,18 @@ def _tensorize_by_key(message_logs: list, key: str):
         m[key] = torch.tensor(m[key])
 
 
+# Key stamped into each NeMo-Gym `extra_env_info` row (and carried into the buffer)
+# to uniquely identify a prompt group so identical prompts in one batch don't collide.
+_NG_TASK_INDEX_KEY = "_ng_task_index"
+
+
 @dataclass
 class AsyncNemoGymRolloutResult:
     input_ids: torch.Tensor
     final_batch: BatchedDataDict[DatumSpec]
     rollout_metrics: dict[str, Any]
+    # Monotonic per-prompt-group task index (NeMo-Gym path only); None otherwise.
+    ng_task_index: Optional[int]
 
 
 def _calculate_single_metric(
@@ -1701,20 +1708,40 @@ def apply_reward_penalties(
     return counts
 
 
-def run_async_nemo_gym_rollout(
+async def run_async_nemo_gym_rollout(
     policy_generation: GenerationInterface,
     input_batch: BatchedDataDict[DatumSpec],
     tokenizer: TokenizerType,
     task_to_env: dict[str, EnvironmentInterface],
     generation_config: GenerationConfig,
+    num_generations: int,
     max_seq_len: Optional[int] = None,
     max_rollout_turns: Optional[int] = None,
     greedy: bool = False,
     effort_config: Optional[EffortLevelsConfig] = None,
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
-) -> AsyncNemoGymRolloutResult:
-    """Run multi-turn rollouts with NeMo-Gym. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters."""
+    group_num: Optional[int] = None,
+    returns_entire_batch: bool = False,
+) -> AsyncGenerator[AsyncNemoGymRolloutResult, None]:
+    """Run multi-turn rollouts with NeMo-Gym, yielding one result per prompt group.
+
+    The NeMo-Gym actor streams one postprocessed rollout per completed task; we
+    accumulate them into prompt groups of ``num_generations`` and yield each group's
+    ``AsyncNemoGymRolloutResult`` as soon as it is complete. Synchronous callers should
+    use ``run_nemo_gym_rollout_sync`` to drain this generator.
+
+    Args:
+        num_generations: rollouts per prompt group; rows ``i`` and ``j`` belong to the
+            same group iff ``i // num_generations == j // num_generations``.
+        group_num: optional prompt-group partition index, forwarded to NeMo-Gym via
+            ``responses_create_params["metadata"]["group_num"]``.
+        returns_entire_batch: when True the whole batch is treated as a single,
+            possibly heterogeneous group (e.g. validation / synchronous callers); rows
+            are re-sorted into input order and the single-agent check is skipped.
+
+    Please refer to the ``run_async_multi_turn_rollout`` docs for the other parameters.
+    """
     # We accept max_seq_len for API parity with the other rollout paths, but NeMo-Gym
     # still relies on the underlying model server's configured context/window limits.
     # We leverage the same `extra_env_info` key as `run_async_multi_turn_rollout`.
@@ -1753,10 +1780,17 @@ def run_async_nemo_gym_rollout(
         "Top k is not supported in the generation config in NeMo-Gym path!"
     )
 
+    assert not returns_entire_batch or len(nemo_gym_rows) == num_generations, (
+        "returns_entire_batch expects the whole batch to be a single group, but "
+        f"len(rows)={len(nemo_gym_rows)} != num_generations={num_generations}"
+    )
+
     timer = Timer()
     timer_prefix = "timing/rollout"
     timer.start(f"{timer_prefix}/total")
 
+    # Each prompt group's input rows, kept in input (rowidx) order for re-alignment.
+    groupidx_to_row: dict[int, list[dict]] = defaultdict(list)
     for rowidx, row in enumerate(nemo_gym_rows):
         # We do not translate max_seq_len into row-level max_tokens here because that would
         # change semantics from "total sequence length" to "max new tokens".
@@ -1773,25 +1807,101 @@ def run_async_nemo_gym_rollout(
             else generation_config["max_new_tokens"]
         )
 
-        row["_rowidx"] = rowidx
+        # Tag the request with its prompt-group partition so NeMo-Gym resources servers
+        # (e.g. genrm_compare) can scope per-group state.
+        if group_num is not None:
+            metadata = responses_create_params.get("metadata") or dict()
+            metadata["group_num"] = str(group_num)
+            responses_create_params["metadata"] = metadata
 
-    with timer.time(f"{timer_prefix}/run_rollouts"):
-        nemo_gym_environment = task_to_env["nemo_gym"]
-        results, rollout_loop_timing_metrics = ray.get(
-            nemo_gym_environment.run_rollouts.remote(
-                nemo_gym_rows, tokenizer, timer_prefix
-            )
+        row["_rowidx"] = rowidx
+        # Assume gym input rows are ordered; consecutive num_generations rows form a group.
+        groupidx_to_row[rowidx // num_generations].append(row)
+
+    nemo_gym_environment = task_to_env["nemo_gym"]
+    # run_rollouts is an async generator: it streams one postprocessed result per
+    # completed task. Accumulate by prompt group and yield each group as soon as all
+    # of its num_generations rollouts have arrived.
+    groupidx_to_rollouts: dict[int, list[dict]] = defaultdict(list)
+    groupidx_to_rowidx: dict[int, list[int]] = defaultdict(list)
+    rollout_gen = nemo_gym_environment.run_rollouts.options(
+        num_returns="streaming"
+    ).remote(nemo_gym_rows, tokenizer, timer_prefix)
+    for future in rollout_gen:
+        rowidx, result, timing_metrics = await future
+
+        # Tensorize this result's token ids as it arrives.
+        _tensorize_by_key(result["input_message_log"], "token_ids")
+        _tensorize_by_key(result["message_log"], "token_ids")
+        _tensorize_by_key(
+            [m for m in result["message_log"] if m["role"] == "assistant"],
+            "generation_logprobs",
         )
 
-        # Tensorize all token ids
-        for r in results:
-            _tensorize_by_key(r["input_message_log"], "token_ids")
-            _tensorize_by_key(r["message_log"], "token_ids")
-            _tensorize_by_key(
-                [m for m in r["message_log"] if m["role"] == "assistant"],
-                "generation_logprobs",
-            )
+        groupidx = rowidx // num_generations
+        groupidx_to_rollouts[groupidx].append(result)
+        groupidx_to_rowidx[groupidx].append(rowidx)
+        if len(groupidx_to_rollouts[groupidx]) != num_generations:
+            continue
 
+        # Group complete. groupidx_to_row is in input order; rollouts arrived in
+        # completion order.
+        rows = groupidx_to_row.pop(groupidx)
+        rollouts = groupidx_to_rollouts.pop(groupidx)
+        rowidxs = groupidx_to_rowidx.pop(groupidx)
+
+        # A homogeneous prompt group is num_generations copies of one prompt, so all
+        # rows share one agent ref. Heterogeneous batches (returns_entire_batch) skip
+        # this and instead restore input order so rows and rollouts align.
+        agent_names = {row["agent_ref"]["name"] for row in rows}
+        assert returns_entire_batch or len(agent_names) == 1, agent_names
+        if returns_entire_batch:
+            rollouts = [
+                r for _, r in sorted(zip(rowidxs, rollouts), key=lambda p: p[0])
+            ]
+
+        group_result = _postprocess_single_group(
+            rows,
+            list(rollouts),
+            timer,
+            timer_prefix,
+            policy_generation,
+            input_batch.slice(
+                groupidx * num_generations, (groupidx + 1) * num_generations
+            ),
+            tokenizer,
+            effort_config=effort_config,
+            reward_penalty_config=reward_penalty_config,
+            thinking_tags=thinking_tags,
+        )
+        # The gym actor reports aggregated rollout-loop timing only on the final task
+        # of the batch; fold it (plus this side's accumulated timing) into that group.
+        if timing_metrics is not None:
+            timer.stop(f"{timer_prefix}/total")
+            group_result.rollout_metrics |= (
+                timing_metrics | timer.get_timing_metrics("sum")
+            )
+        yield group_result
+
+
+def _postprocess_single_group(
+    nemo_gym_rows: list[dict],
+    results: list[dict],
+    timer: Timer,
+    timer_prefix: str,
+    policy_generation: GenerationInterface,
+    input_batch: BatchedDataDict[DatumSpec],
+    tokenizer: TokenizerType,
+    effort_config: Optional[EffortLevelsConfig] = None,
+    reward_penalty_config: dict[str, Any] | BaseModel | None = None,
+    thinking_tags: list[str] | tuple[str, ...] | None = None,
+) -> AsyncNemoGymRolloutResult:
+    """Postprocess one completed prompt group's rollouts into a rollout result.
+
+    The shared ``timer`` accumulates across groups within a single
+    ``run_async_nemo_gym_rollout`` call; the caller stops ``total`` and folds the
+    summed timing into the final group.
+    """
     # Length-based reward shaping for low-effort prompts
     shaping = _apply_effort_shaping(results, nemo_gym_rows, effort_config)
     length_rewards_low = shaping.length_rewards_low
@@ -1838,7 +1948,6 @@ def run_async_nemo_gym_rollout(
     # Aggregate metrics across all samples
     with timer.time(f"{timer_prefix}/aggregate_metrics"):
         rollout_metrics = {
-            **rollout_loop_timing_metrics,
             **_calculate_single_metric(
                 [m["turn_count"] for m in all_sample_metrics],
                 batch_size,
@@ -1910,8 +2019,6 @@ def run_async_nemo_gym_rollout(
     rollout_metrics["mean_gen_tokens_per_sample"] = rollout_metrics[
         "gen_tokens_per_sample/mean"
     ]
-    timer.stop(f"{timer_prefix}/total")
-    rollout_metrics.update(timer.get_timing_metrics("sum"))
 
     # Convert LLMMessageLogType to FlatMessagesType for generation
     input_batch_for_input_ids = BatchedDataDict[DatumSpec](
@@ -1982,8 +2089,53 @@ def run_async_nemo_gym_rollout(
             if _get_reward_penalty_config_value(resolved_reward_penalty_config, flag):
                 rollout_metrics[metric_name] = penalty_counts[key] / len(results)
 
+    # Per-prompt-group task index (gym-only; stamped into extra_env_info upstream).
+    ng_task_index = None
+    if nemo_gym_rows and _NG_TASK_INDEX_KEY in nemo_gym_rows[0]:
+        ng_task_index = int(nemo_gym_rows[0][_NG_TASK_INDEX_KEY])
+        assert all(
+            _NG_TASK_INDEX_KEY in row and int(row[_NG_TASK_INDEX_KEY]) == ng_task_index
+            for row in nemo_gym_rows
+        ), (
+            "Expected a single prompt-group _ng_task_index, got "
+            f"{[row.get(_NG_TASK_INDEX_KEY) for row in nemo_gym_rows]}"
+        )
+
     return AsyncNemoGymRolloutResult(
         input_ids=input_ids,
         final_batch=final_batch,
         rollout_metrics=rollout_metrics,
+        ng_task_index=ng_task_index,
     )
+
+
+def run_nemo_gym_rollout_sync(**kwargs: Any) -> AsyncNemoGymRolloutResult:
+    """Synchronously run NeMo-Gym rollouts for a whole batch and return one result.
+
+    Drains the ``run_async_nemo_gym_rollout`` async generator for synchronous callers
+    (synchronous GRPO/PPO/distillation, validation, and the TQ rollout actor) that pass
+    an entire batch and want a single combined result. The batch is treated as one group
+    (``num_generations = input_batch.size``) with ``returns_entire_batch=True``, which
+    preserves input (rowidx) ordering so downstream per-prompt grouping stays aligned.
+
+    Accepts the same keyword arguments as ``run_async_nemo_gym_rollout`` (except
+    ``num_generations``/``returns_entire_batch``, which are set here).
+    """
+    import asyncio
+
+    input_batch = kwargs["input_batch"]
+
+    async def _drain() -> AsyncNemoGymRolloutResult:
+        result: Optional[AsyncNemoGymRolloutResult] = None
+        async for result in run_async_nemo_gym_rollout(
+            num_generations=input_batch.size,
+            returns_entire_batch=True,
+            **kwargs,
+        ):
+            pass
+        assert result is not None, (
+            "NeMo Gym rollouts did not return any valid generations for this batch!"
+        )
+        return result
+
+    return asyncio.run(_drain())

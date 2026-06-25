@@ -84,7 +84,7 @@ from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
     get_nemo_gym_thinking_tags,
     run_async_multi_turn_rollout,
-    run_async_nemo_gym_rollout,
+    run_nemo_gym_rollout_sync,
     run_multi_turn_rollout,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
@@ -2357,7 +2357,7 @@ def grpo_train(
                     # Use NeMo-Gym rollouts if enabled. We cascade NeMo-Gym first since NeMo-Gym requires async rollouts.
                     if _should_use_nemo_gym(master_config):
                         generation_config = master_config.policy["generation"]
-                        nemo_gym_rollout_result = run_async_nemo_gym_rollout(
+                        nemo_gym_rollout_result = run_nemo_gym_rollout_sync(
                             policy_generation=policy_generation,
                             input_batch=repeated_batch,
                             tokenizer=tokenizer,
@@ -3189,7 +3189,7 @@ def validate(
             # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
             if _should_use_nemo_gym(master_config):
                 generation_config = master_config.policy["generation"]
-                nemo_gym_rollout_result = run_async_nemo_gym_rollout(
+                nemo_gym_rollout_result = run_nemo_gym_rollout_sync(
                     policy_generation=policy_generation,
                     input_batch=val_batch,
                     tokenizer=tokenizer,
@@ -3491,6 +3491,8 @@ def async_grpo_train(
     )
 
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
+    replay_buffer_state = None
+    rollouts_state = None
     if last_checkpoint_path is not None:
         replay_buffer_path = os.path.join(last_checkpoint_path, "replay_buffer.pt")
         if os.path.exists(replay_buffer_path):
@@ -3512,6 +3514,22 @@ def async_grpo_train(
                 f"⚠️ No replay buffer checkpoint found at {replay_buffer_path}. "
                 "Starting with an empty replay buffer."
             )
+
+        rollouts_path = os.path.join(last_checkpoint_path, "rollouts.pt")
+        if os.path.exists(rollouts_path):
+            rollouts_state = torch.load(rollouts_path, weights_only=False)
+
+    # Resume the monotonic NeMo-Gym task-index counter past anything already buffered or
+    # recorded, so restored trajectories keep distinct task indices after resume.
+    next_ng_task_index = int((rollouts_state or {}).get("next_ng_task_index", 0))
+    if replay_buffer_state is not None:
+        saved_task_indices = [
+            int(trajectory["_ng_task_index"])
+            for trajectory in replay_buffer_state.get("trajectories", [])
+            if trajectory.get("_ng_task_index") is not None
+        ]
+        if saved_task_indices:
+            next_ng_task_index = max(next_ng_task_index, 1 + max(saved_task_indices))
 
     _tc_py_exec = get_actor_python_env(
         "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector"
@@ -3548,6 +3566,7 @@ def async_grpo_train(
         teacher_worker_groups=teacher_worker_groups,
         alias_to_group_alias=alias_to_group_alias,
         on_policy_distillation_cfg=opd_module._opd_cfg(master_config),
+        next_ng_task_index=next_ng_task_index,
     )
 
     # Start trajectory collection in background
@@ -4217,6 +4236,13 @@ def async_grpo_train(
                         print(
                             "✅ Saved replay buffer with "
                             f"{len(replay_buffer_state['trajectories'])} trajectories"
+                        )
+                        rollouts_state = ray.get(
+                            trajectory_collector.get_rollouts_state.remote()
+                        )
+                        torch.save(
+                            rollouts_state,
+                            os.path.join(checkpoint_path, "rollouts.pt"),
                         )
                         checkpointer.finalize_checkpoint(checkpoint_path)
 

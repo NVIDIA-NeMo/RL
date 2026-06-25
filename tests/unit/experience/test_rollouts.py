@@ -45,6 +45,7 @@ from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
+    run_nemo_gym_rollout_sync,
 )
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
@@ -853,19 +854,77 @@ def test_run_async_nemo_gym_rollout_warns_when_max_seq_len_exceeds_engine():
     class _FakePolicyGeneration:
         cfg = {"vllm_cfg": {"max_model_len": 100}}
 
-    # stop_strings is truthy so the function hits the next assert and exits
-    # right after emitting the warning — keeps this test free of any rollout work.
+    # run_async_nemo_gym_rollout is an async generator now; its preamble (the warning
+    # and the stop_strings assert) runs on first iteration. stop_strings is truthy so
+    # it raises right after emitting the warning — no rollout work happens.
+    async def _drive():
+        async for _ in run_async_nemo_gym_rollout(
+            policy_generation=_FakePolicyGeneration(),
+            input_batch={"extra_env_info": []},
+            tokenizer=None,
+            task_to_env={},
+            generation_config={"stop_strings": "x", "max_new_tokens": 50},
+            num_generations=1,
+            max_seq_len=200,
+            max_rollout_turns=None,
+        ):
+            pass
+
     with pytest.warns(UserWarning, match="greater than the"):
         with pytest.raises(AssertionError, match="Stop strings"):
-            run_async_nemo_gym_rollout(
-                policy_generation=_FakePolicyGeneration(),
-                input_batch={"extra_env_info": []},
-                tokenizer=None,
-                task_to_env={},
-                generation_config={"stop_strings": "x", "max_new_tokens": 50},
-                max_seq_len=200,
-                max_rollout_turns=None,
-            )
+            asyncio.run(_drive())
+
+
+def test_run_async_nemo_gym_rollout_stamps_group_num_metadata():
+    """group_num is forwarded into each row's responses_create_params metadata.
+
+    Uses an empty gym stream so the per-row stamping runs without any rollout work.
+    """
+
+    class _FakePolicyGeneration:
+        cfg = {"vllm_cfg": {"max_model_len": 10000}}
+
+    class _EmptyStreamRemote:
+        def options(self, **kwargs):
+            return self
+
+        def remote(self, *args, **kwargs):
+            return iter(())  # no completed tasks → generator yields nothing
+
+    class _FakeNemoGymEnv:
+        run_rollouts = _EmptyStreamRemote()
+
+    rows = [{"responses_create_params": {}} for _ in range(4)]
+    input_batch = {"extra_env_info": rows}
+    generation_config = {
+        "temperature": 0.5,
+        "top_p": 0.9,
+        "max_new_tokens": 16,
+        "stop_strings": None,
+        "stop_token_ids": None,
+        "top_k": None,
+    }
+
+    async def _drive():
+        async for _ in run_async_nemo_gym_rollout(
+            policy_generation=_FakePolicyGeneration(),
+            input_batch=input_batch,
+            tokenizer=None,
+            task_to_env={"nemo_gym": _FakeNemoGymEnv()},
+            generation_config=generation_config,
+            num_generations=2,
+            group_num=7,
+        ):
+            pass
+
+    asyncio.run(_drive())
+
+    for row in rows:
+        assert row["responses_create_params"]["metadata"]["group_num"] == "7"
+        assert (
+            row["responses_create_params"]["max_output_tokens"]
+            == generation_config["max_new_tokens"]
+        )
 
 
 @pytest.mark.nemo_gym
@@ -900,7 +959,7 @@ def test_run_async_nemo_gym_rollout(
     rows[0]["responses_create_params"]["max_output_tokens"] = max_new_tokens + 1
     assert "max_output_tokens" not in rows[1]["responses_create_params"]
 
-    actual_result = run_async_nemo_gym_rollout(
+    actual_result = run_nemo_gym_rollout_sync(
         policy_generation=nemo_gym_vllm_generation,
         input_batch=input_batch,
         tokenizer=nemo_gym_tokenizer,
@@ -934,7 +993,6 @@ def test_run_async_nemo_gym_rollout(
         "rollout_metrics": {
             # core metrics
             "timing/rollout/total": 0.0,
-            "timing/rollout/run_rollouts": 0.0,
             "timing/rollout/await_results": 0.0,
             "timing/rollout/postprocess_results": 0.0,
             "timing/rollout/postprocess_results_pct": 0.0,

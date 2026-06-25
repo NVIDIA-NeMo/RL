@@ -245,11 +245,15 @@ def test_nemo_gym_sanity(
         example["responses_create_params"]["top_p"] = generation_config["top_p"]
         example["_rowidx"] = idx
 
-    actual_result, _ = ray.get(
-        nemo_gym.run_rollouts.remote(
-            nemo_gym_sanity_test_data["input"], nemo_gym_tokenizer, ""
-        )
-    )
+    # run_rollouts is an async generator now: it streams (rowidx, result, timing)
+    # per completed task. Drain the stream and reassemble in input (rowidx) order.
+    num_rows = len(nemo_gym_sanity_test_data["input"])
+    actual_result: list = [None] * num_rows
+    for result_ref in nemo_gym.run_rollouts.options(num_returns="streaming").remote(
+        nemo_gym_sanity_test_data["input"], nemo_gym_tokenizer, ""
+    ):
+        rowidx, nemo_rl_result, _timing_metrics = ray.get(result_ref)
+        actual_result[rowidx] = nemo_rl_result
     expected_result = nemo_gym_sanity_test_data["expected_output"]
 
     # These are tensors originally and we swap them back to a list for comparison below

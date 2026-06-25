@@ -64,7 +64,7 @@ from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
-    run_async_nemo_gym_rollout,
+    run_nemo_gym_rollout_sync,
     run_multi_turn_rollout,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
@@ -1055,7 +1055,7 @@ def ppo_train(
 
                     if _should_use_nemo_gym(master_config):
                         generation_config = master_config.policy["generation"]
-                        nemo_gym_rollout_result = run_async_nemo_gym_rollout(
+                        nemo_gym_rollout_result = run_nemo_gym_rollout_sync(
                             policy_generation=policy_generation,
                             input_batch=repeated_batch,
                             tokenizer=tokenizer,

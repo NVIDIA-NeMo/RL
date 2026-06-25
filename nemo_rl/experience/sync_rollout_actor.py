@@ -52,7 +52,7 @@ from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
     get_nemo_gym_thinking_tags,
     run_async_multi_turn_rollout,
-    run_async_nemo_gym_rollout,
+    run_nemo_gym_rollout_sync,
     run_multi_turn_rollout,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
@@ -241,7 +241,7 @@ class SyncRolloutActor:
 
         # Rollout dispatch (mirrors grpo_sync.py:294-349).
         if _should_use_nemo_gym(cfg):
-            r = run_async_nemo_gym_rollout(
+            r = run_nemo_gym_rollout_sync(
                 **common,
                 max_seq_len=None,
                 max_rollout_turns=None,

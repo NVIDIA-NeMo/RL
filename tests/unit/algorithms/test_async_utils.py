@@ -1109,6 +1109,9 @@ class TestAsyncTrajectoryCollector:
                 "max_total_sequence_length": 512,
                 "make_sequence_length_divisible_by": 1,
             },
+            # _process_batch consults _should_use_nemo_gym(master_config); an empty
+            # env keeps it on the non-gym path (no should_use_nemo_gym key).
+            "env": {},
         }
         return MasterConfig.model_construct(**config)
 
@@ -1346,7 +1349,7 @@ class TestAsyncTrajectoryCollector:
         assert target_weight not in collector._buffered_per_target
 
     def test_process_batch_gap_fill_spawns_only_needed(self, monkeypatch):
-        """Gap-fill generates only the trajectories still needed for a target."""
+        """Gap-fill slices the batch to only the trajectories still needed for a target."""
 
         class RemoteMethod:
             def __init__(self, value):
@@ -1360,34 +1363,39 @@ class TestAsyncTrajectoryCollector:
                 # Batch has 2 prompts, but only 1 more trajectory is needed.
                 self.get_trajectories_needed = RemoteMethod(1)
 
+        slice_calls = []
+
         class FakeBatch:
             size = 2
 
             def slice(self, start, end):
+                slice_calls.append((start, end))
                 return self
 
             def repeat_interleave(self, repeats):
                 return self
 
         started = []
+        target_weight = 7
 
         class RecordingThread:
+            # The batch worker is now spawned as Thread(target=closure) with no args=,
+            # so completion is recorded against the known target_weight directly.
             def __init__(self, *args, **kwargs):
-                self._args = kwargs.get("args", ())
+                pass
 
             def start(self):
-                started.append(self._args)
-                # Simulate the worker finishing and recording completion.
-                target = self._args[2]
+                started.append(True)
+                # Simulate the single batch worker finishing: it completes all the
+                # prompt groups it owns (num_prompts_to_generate == 1 here).
                 with collector._counter_lock:
-                    collector._completed_per_target[target] = (
-                        collector._completed_per_target.get(target, 0) + 1
+                    collector._completed_per_target[target_weight] = (
+                        collector._completed_per_target.get(target_weight, 0) + 1
                     )
 
             def is_alive(self):
                 return False
 
-        target_weight = 7
         collector = self.create_local_collector(replay_buffer=FakeReplayBuffer())
         collector.running = True
 
@@ -1403,13 +1411,40 @@ class TestAsyncTrajectoryCollector:
 
         collector._process_batch(FakeBatch())
 
-        # Only one worker spawned even though the batch holds 2 prompts.
+        # One batch worker spawned, and the batch was gap-filled to only 1 prompt.
         assert len(started) == 1
+        assert (0, 1) in slice_calls
         # Reservation released after spawning closed and the worker completed.
         assert target_weight not in collector._generating_targets
         assert target_weight not in collector._spawning_targets
         assert target_weight not in collector._spawned_per_target
         assert target_weight not in collector._completed_per_target
+
+    def test_rollouts_state_retrieval(self):
+        """Test getting collector rollout state (task-index counter) for checkpointing."""
+        buffer = ReplayBuffer.remote(max_size=10)
+        mock_generation = MockGenerationInterface()
+        mock_tokenizer = mock.MagicMock()
+        mock_env = MockEnvironment.remote(rewards=[1.0, 2.0])
+        task_to_env = {"test": mock_env}
+        master_config = self.create_mock_config()
+
+        collector = AsyncTrajectoryCollector.remote(
+            policy_generation=mock_generation,
+            tokenizer=mock_tokenizer,
+            task_to_env=task_to_env,
+            master_config=master_config,
+            replay_buffer=buffer,
+            start_step=0,
+            next_ng_task_index=123,
+        )
+
+        state = ray.get(collector.get_rollouts_state.remote())
+        assert state == {"next_ng_task_index": 123}
+
+        ray.kill(collector)
+        ray.kill(buffer)
+        ray.kill(mock_env)
 
     def test_dataloader_state_retrieval(self):
         """Test getting dataloader state for checkpointing."""
