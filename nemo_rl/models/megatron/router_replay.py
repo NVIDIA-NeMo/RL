@@ -17,6 +17,7 @@ from __future__ import annotations
 import inspect
 import os
 from collections.abc import Iterable
+from functools import wraps
 from typing import Any, Optional
 
 import torch
@@ -258,8 +259,7 @@ def _install_missing_route_fallback_patch() -> None:
         return
 
     original_get_replay_topk = RouterReplay.get_replay_topk
-    expected_params = [
-        "self",
+    expected_non_receiver_params = [
         "scores",
         "topk",
         "num_groups",
@@ -267,15 +267,18 @@ def _install_missing_route_fallback_patch() -> None:
         "default_compute_topk",
     ]
     actual_params = list(inspect.signature(original_get_replay_topk).parameters)
-    if actual_params != expected_params:
+    actual_non_receiver_params = actual_params[1:]
+    if actual_non_receiver_params != expected_non_receiver_params:
         raise RuntimeError(
             "Unsupported Megatron RouterReplay.get_replay_topk signature for "
             "NeMo RL missing-route fallback patch: "
-            f"expected={expected_params}, actual={actual_params}. "
+            f"expected_non_receiver_params={expected_non_receiver_params}, "
+            f"actual={actual_params}. "
             "Update nemo_rl.models.megatron.router_replay before enabling "
             "policy.router_replay.enabled."
         )
 
+    @wraps(original_get_replay_topk)
     def wrapped_get_replay_topk(
         replay_instance: Any,
         scores: torch.Tensor,
