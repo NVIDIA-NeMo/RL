@@ -11,7 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Temporal alignment helpers for PPO value predictions."""
+"""Temporal alignment helpers for PPO value predictions.
+
+DTensor value training shifts logits inside a loss wrapper, while value
+inference shifts the returned tensor directly. Keeping the shared helper here
+lets both paths use the same alignment logic without importing the heavier
+worker module in lightweight unit tests.
+"""
 
 import torch
 

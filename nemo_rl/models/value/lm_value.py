@@ -101,6 +101,10 @@ class Value(ValueInterface):
                     "training backend (or value.megatron_cfg.enabled=true for "
                     "Megatron-Core)."
                 )
+            if not config["dtensor_cfg"].get("_v2", False):
+                raise ValueError(
+                    "DTensor value models require value.dtensor_cfg._v2=true."
+                )
 
             worker_builder_cls = "nemo_rl.models.value.workers.dtensor_value_worker_v2.DTensorValueWorkerV2"
 

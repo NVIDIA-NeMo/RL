@@ -28,7 +28,10 @@ try:
     from nemo_automodel import NeMoAutoModelForTokenClassification
 except ImportError:
     # Local backport until the pinned Automodel submodule exports
-    # NeMoAutoModelForTokenClassification.
+    # NeMoAutoModelForTokenClassification. The tripwire test in
+    # tests/unit/models/automodel/test_automodel_setup.py should fail once this
+    # shim is no longer needed.
+    # Tracked at https://github.com/NVIDIA-NeMo/RL/issues/2948.
     from nemo_automodel._transformers.auto_model import _BaseNeMoAutoModelClass
     from transformers import AutoModelForTokenClassification
 
