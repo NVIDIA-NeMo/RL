@@ -1,0 +1,8 @@
+defaults: ../../intent_grpo_7B_megatron.yaml
+checkpointing:
+  checkpoint_dir: results/vlm_grpo-qwen2.5-omni-7b-intent-1n8g-megatron.v1
+logger:
+  wandb:
+    name: vlm_grpo-qwen2.5-omni-7b-intent-1n8g-megatron.v1
+  swanlab:
+    name: vlm_grpo-qwen2.5-omni-7b-intent-1n8g-megatron.v1

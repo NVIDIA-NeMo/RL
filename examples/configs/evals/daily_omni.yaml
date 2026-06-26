@@ -1,38 +1,21 @@
-eval:
-  metric: "pass@k"
-  num_tests_per_prompt: 1
-  seed: 42
-  k_value: 1
-  save_path: results/daily_omni_decode.json
+# Daily-Omni audio-visual eval. Inherits the shared eval defaults and only
+# overrides what differs for the Qwen2.5-Omni audio+video setup.
+defaults: "eval.yaml"
 
 generation:
-  backend: "vllm"
-  max_new_tokens: 2048
-  temperature: 0.0
-  top_p: 1.0
-  top_k: -1
-  num_prompts_per_step: -1
-  model_name: "Qwen/Qwen2.5-Omni-3B"
-  stop_token_ids: null
-  stop_strings: null
+  model_name: "Qwen/Qwen2.5-Omni-7B"
   vllm_cfg:
-    async_engine: false
-    precision: "bfloat16"
-    tensor_parallel_size: 1
-    pipeline_parallel_size: 1
-    expert_parallel_size: 1
-    # 0.9 -> 0.5: with 32 video frames + audio, the Qwen2.5-Omni vision/audio
-    # encoder forward needs a large chunk of *transient activation* memory that
-    # lives outside vLLM's KV-cache budget. At 0.9 the KV cache claims almost
-    # all VRAM (56+ GiB) and the first multimodal forward OOM-crashes the vLLM
-    # workers (hard EOF, no graceful torch OOM). 0.5 leaves ample headroom; KV
-    # cache is still ~1M tokens, far more than eval needs.
+    # 0.5 (vs the 0.9 default): with 32 video frames + audio, the Qwen2.5-Omni
+    # vision/audio encoder forward needs a large chunk of *transient
+    # activation* memory outside vLLM's KV-cache budget. At 0.9 the KV cache
+    # claims almost all VRAM and the first multimodal forward OOM-crashes the
+    # workers. 0.5 leaves ample headroom; KV cache is still far more than eval
+    # needs.
     gpu_memory_utilization: 0.5
-    # Bumped from 16000 to fit 32 video frames + the 16 kHz audio track
-    # without truncating the multimodal prompt (truncation silently masks
-    # samples out and collapses their reward to 0).
+    # Fit 32 video frames + the 16 kHz audio track without truncating the
+    # multimodal prompt (truncation silently masks samples out -> reward 0).
     max_model_len: 32000
-    enforce_eager: False
+    # Audio/multimodal models need the tokenizer initialized before generation.
     skip_tokenizer_init: False
     limit_mm_per_prompt:
       video: 1
@@ -40,32 +23,20 @@ generation:
   vllm_kwargs:
     # Disable mm processor cache to avoid vLLM cache eviction during eval.
     mm_processor_cache_gb: 0
-    # Cap concurrent sequences so the Qwen2.5-Omni vision/audio encoder only
-    # processes a few clips per step. With audio + 32 video frames, vLLM
-    # otherwise batches ~66 clips into one encoder forward and OOM-crashes the
-    # workers (kv_cache_usage was ~2% at crash -> it is encoder *activation*
-    # memory, not KV cache). 8 keeps the encoder batch small; eval throughput
-    # is not a concern.
+    # Cap concurrent sequences so the vision/audio encoder only processes a few
+    # clips per step. With audio + 32 frames, vLLM otherwise batches ~66 clips
+    # into one encoder forward and OOM-crashes the workers (encoder *activation*
+    # memory, not KV cache). Eval throughput is not a concern.
     max_num_seqs: 8
-  colocated:
-    enabled: true
-    resources:
-      gpus_per_node: null
-      num_nodes: null
 
 tokenizer:
-  name: ${generation.model_name}
-  chat_template: "default"
-  chat_template_kwargs: null
   video:
-    # 16 -> 32 frames: 60s clips at 16 frames is ~1 frame / 3.75s, too sparse
+    # 32 frames (vs 16): 60s clips at 16 frames is ~1 frame / 3.75s, too sparse
     # for fine-grained temporal (Event Sequence) questions.
     num_frames: 32
 
 data:
-  max_input_seq_length: ${generation.vllm_cfg.max_model_len}
   prompt_file: examples/prompts/daily_omni.txt
-  system_prompt_file: null
   dataset_name: "daily-omni"
   split: "train"
   env_name: vlm
@@ -76,7 +47,3 @@ env:
     reward_functions:
     - name: exact_alnum
       weight: 1.0
-
-cluster:
-  gpus_per_node: 1
-  num_nodes: 1

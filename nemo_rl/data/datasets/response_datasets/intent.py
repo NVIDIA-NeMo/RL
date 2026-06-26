@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -231,6 +231,13 @@ class IntentDataset(RawDataset):
         if split not in _SPLIT_CONFIG:
             raise ValueError(
                 f"Invalid split: {split!r}. Supported: {sorted(_SPLIT_CONFIG.keys())}."
+            )
+        # The think/answer instruction is baked into the user prompt, so a
+        # system prompt is unsupported and would produce undefined behavior.
+        if kwargs.get("system_prompt_file") is not None:
+            raise ValueError(
+                "IntentDataset does not support a system prompt; set "
+                "data.*.system_prompt_file=null."
             )
         self.split = split
         self._cfg = _SPLIT_CONFIG[split]

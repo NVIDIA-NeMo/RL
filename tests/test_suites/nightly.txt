@@ -40,6 +40,7 @@ tests/test_suites/vlm/vlm_grpo-qwen2.5-vl-3b-instruct-clevr-1n8g-dtensor2tp1.v1.
 tests/test_suites/vlm/vlm_grpo-qwen2.5-vl-3b-instruct-clevr-1n8g-megatrontp2.v1.sh
 tests/test_suites/vlm/vlm_grpo-qwen2.5-omni-3b-avqa-1n8g-megatron.v1.sh
 tests/test_suites/vlm/vlm_grpo-qwen2.5-omni-7b-audiomcq-1n8g-megatron.v1.sh
+tests/test_suites/vlm/vlm_grpo-qwen2.5-omni-7b-intent-1n8g-megatron.v1.sh
 tests/test_suites/vlm/vlm_grpo-qwen3-omni-30ba3b-audiomcq-4n8g-megatron.v1.sh
 
 # Functional Nemotron-Omni 30B-A3B VLM GRPO runs (AutoModel EP=8)

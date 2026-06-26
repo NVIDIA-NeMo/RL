@@ -126,6 +126,8 @@ Train Qwen2.5-Omni-3B with GRPO on AVQA and evaluate on MMAU, following the R1-A
 :link-type: doc
 
 Train Qwen2.5-Omni-7B with GRPO on PhilipC/IntentTrain (audio-visual intent recognition) and evaluate on Daily-Omni, following HumanOmniV2's joint audio+video setup.
+:::
+
 :::{grid-item-card} {octicon}`terminal` Two-Stage SWE RL (Qwen3 Thinking)
 :link: guides/swe-rl-qwen3
 :link-type: doc
