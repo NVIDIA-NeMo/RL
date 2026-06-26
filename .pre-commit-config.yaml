@@ -44,7 +44,7 @@ repos:
     hooks:
       - id: pyrefly-typecheck
         name: pyrefly check
-        entry: uv run --group dev pyrefly check
+        entry: uv run --group dev pyrefly check --baseline pyrefly-baseline.json
         types_or: [python, pyi]
         language: system
         pass_filenames: false # Pyrefly reads config & project roots itself.
