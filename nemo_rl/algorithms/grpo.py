@@ -1461,6 +1461,7 @@ def _apply_message_level_advantage_penalties(
         invalid_tool_call_advantage: Advantage value assigned to invalid tool calls.
         malformed_thinking_advantage: Advantage value assigned to malformed thinking.
         log_config: If True, print the configured penalty values once.
+
     Returns:
         Dictionary of penalty metrics if penalties are applied, otherwise None.
     """
