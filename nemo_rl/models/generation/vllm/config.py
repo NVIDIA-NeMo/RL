@@ -56,3 +56,8 @@ class VllmConfig(GenerationConfig):
 
     # quantization config
     quant_cfg: NotRequired[str | None]
+    # When set with ``quant_cfg``, initialize rollout vLLM with real ModelOpt
+    # NVFP4 kernels and stream packed quantized weights instead of fake-quant
+    # modules. This is intended for ModelOpt NVFP4 rollout experiments.
+    real_quant: NotRequired[bool]
+    real_quant_ignore: NotRequired[list[str]]

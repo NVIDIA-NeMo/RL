@@ -774,6 +774,9 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.gradient_accumulation_fusion = config["megatron_cfg"][
         "gradient_accumulation_fusion"
     ]
+    model_cfg.use_fused_weighted_squared_relu = config["megatron_cfg"][
+        "use_fused_weighted_squared_relu"
+    ]
     # Optional explicit attention backend override for environments where
     # TE auto backend probing is unstable.
     attention_backend = config["megatron_cfg"].get("attention_backend")
@@ -1674,6 +1677,7 @@ def make_policy_like_config(config: ValueConfig) -> dict:
     megatron_cfg.setdefault("apply_rope_fusion", True)
     megatron_cfg.setdefault("bias_activation_fusion", True)
     megatron_cfg.setdefault("gradient_accumulation_fusion", False)
+    megatron_cfg.setdefault("use_fused_weighted_squared_relu", False)
     megatron_cfg.setdefault("defer_fp32_logits", False)
     megatron_cfg.setdefault("force_overwrite_initial_ckpt", False)
 

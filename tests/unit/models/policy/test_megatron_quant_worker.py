@@ -15,6 +15,7 @@
 import os
 import tempfile
 from copy import deepcopy
+from types import SimpleNamespace
 
 import pytest
 import ray
@@ -70,6 +71,36 @@ _BATCH_SIZE = 8
 _NUM_GPUS = 2
 
 
+class _FakeModelOptBridge:
+    def __init__(self):
+        self.transformer_config = SimpleNamespace(num_layers=0)
+        self.calls = []
+
+    def export_hf_weights_modelopt(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        yield "model.layers.0.mlp.down_proj.weight", torch.ones(2, 2)
+
+
+def _make_real_quant_worker():
+    worker_cls = MegatronQuantPolicyWorker.__ray_metadata__.modified_class
+    worker = object.__new__(worker_cls)
+    worker.cfg = {
+        "generation": {
+            "backend": "vllm",
+            "quant_cfg": "examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml",
+            "real_quant": True,
+            "real_quant_ignore": ["lm_head"],
+            "vllm_cfg": {},
+        }
+    }
+    worker.model = object()
+    worker.draft_model = None
+    worker.refit_conversion_tasks = ["task"]
+    worker.megatron_bridge = _FakeModelOptBridge()
+    worker.rank = 0
+    return worker
+
+
 def create_quant_megatron_test_config(model_name, tp=1, pp=1, precision="float32"):
     """Wrap the base Megatron test config with quantization fields."""
     config = create_megatron_test_config(
@@ -110,6 +141,187 @@ def test_modelopt_layer_spec_config_selects_layer_specs():
     assert isinstance(layer_spec, partial)
     assert layer_spec.func is get_gpt_modelopt_spec
     assert get_quantization_mamba_stack_spec(False) is modelopt_mamba_stack_spec
+
+
+@requires_weight_folding
+def test_real_quant_refit_detection_requires_vllm_quant_cfg_and_flag():
+    worker = _make_real_quant_worker()
+
+    assert worker._use_real_quant_refit()
+
+    worker.cfg["generation"]["real_quant"] = False
+    assert not worker._use_real_quant_refit()
+
+    worker.cfg["generation"]["real_quant"] = True
+    worker.cfg["generation"]["quant_cfg"] = None
+    assert not worker._use_real_quant_refit()
+
+    worker.cfg["generation"]["quant_cfg"] = "NVFP4_DEFAULT_CFG"
+    worker.cfg["generation"]["backend"] = "megatron"
+    assert not worker._use_real_quant_refit()
+
+
+@requires_weight_folding
+def test_iter_real_quant_refit_params_uses_megatron_bridge_export():
+    worker = _make_real_quant_worker()
+
+    output = list(worker._iter_real_quant_refit_params())
+
+    assert output[0][0] == "model.layers.0.mlp.down_proj.weight"
+    args, kwargs = worker.megatron_bridge.calls[0]
+    assert args == ([worker.model],)
+    assert kwargs["quant_mode"] == "w4a16_nvfp4"
+    assert kwargs["cpu"] is True
+    assert kwargs["show_progress"] is False
+    assert kwargs["conversion_tasks"] == worker.refit_conversion_tasks
+    assert kwargs["ignore_patterns"] == ["lm_head"]
+
+
+@requires_weight_folding
+def test_iter_params_with_optional_kv_scales_uses_real_quant_export(monkeypatch):
+    worker = _make_real_quant_worker()
+    monkeypatch.setattr(
+        worker,
+        "_iter_real_quant_refit_params",
+        lambda kv_scales=None: iter([("real.weight", torch.ones(1))]),
+    )
+
+    output = list(worker._iter_params_with_optional_kv_scales({"scale": 1.0}))
+
+    assert output[0][0] == "real.weight"
+    torch.testing.assert_close(output[0][1], torch.ones(1))
+
+
+@requires_weight_folding
+def test_iter_params_with_optional_kv_scales_exports_input_amax(monkeypatch):
+    from nemo_rl.modelopt.models.policy.workers import megatron_quant_policy_worker
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    class FakeTensorQuantizer:
+        def __init__(self, amax):
+            self.is_enabled = True
+            self._amax = amax
+
+    class FakeQuantModule:
+        def __init__(self):
+            self.input_quantizer = FakeTensorQuantizer(torch.tensor([3.0]))
+
+    worker_cls = MegatronQuantPolicyWorker.__ray_metadata__.modified_class
+    worker = object.__new__(worker_cls)
+    worker.cfg = {"generation": {"backend": "vllm", "quant_cfg": "FP8_DEFAULT_CFG"}}
+    worker.rank = 0
+    worker.refit_conversion_tasks = [
+        SimpleNamespace(
+            param_name="decoder.layers.0.mlp.linear_fc2.weight",
+            global_param_name="decoder.layers.0.mlp.linear_fc2.weight",
+            param_weight=torch.ones(2, 2),
+            megatron_module=FakeQuantModule(),
+            mapping=SimpleNamespace(
+                hf_param="model.layers.0.mlp.down_proj.weight",
+            ),
+        )
+    ]
+
+    monkeypatch.setattr(
+        megatron_quant_policy_worker,
+        "TensorQuantizer",
+        FakeTensorQuantizer,
+    )
+    monkeypatch.setattr(
+        MegatronPolicyWorkerImpl,
+        "_iter_params_with_optional_kv_scales",
+        lambda self, kv_scales=None: iter(
+            [("model.layers.0.mlp.down_proj.weight", torch.ones(2, 2))]
+        ),
+    )
+
+    output = list(worker._iter_params_with_optional_kv_scales())
+
+    assert [name for name, _ in output] == [
+        "model.layers.0.mlp.down_proj.weight",
+        "model.layers.0.mlp.down_proj.input_quantizer._amax",
+    ]
+    torch.testing.assert_close(output[1][1], torch.tensor([3.0]))
+
+
+@requires_weight_folding
+def test_stream_weights_via_ipc_zmq_uses_real_quant_generator_without_move(
+    monkeypatch,
+):
+    from nemo_rl.models.policy import utils as policy_utils
+
+    worker = _make_real_quant_worker()
+    worker.zmq_socket = object()
+    calls = []
+
+    monkeypatch.setattr(worker, "maybe_init_zmq", lambda: calls.append("init_zmq"))
+
+    def fail_move_model(*args, **kwargs):
+        raise AssertionError("stream_weights_via_ipc_zmq should not move the model")
+
+    monkeypatch.setattr(worker, "move_model", fail_move_model)
+
+    def fake_stream_weights_via_ipc_zmq_impl(**kwargs):
+        calls.append(kwargs)
+        assert list(kwargs["params_generator"])[0][0] == (
+            "model.layers.0.mlp.down_proj.weight"
+        )
+
+    monkeypatch.setattr(
+        policy_utils,
+        "stream_weights_via_ipc_zmq_impl",
+        fake_stream_weights_via_ipc_zmq_impl,
+    )
+
+    worker.stream_weights_via_ipc_zmq(buffer_size_bytes=123, kv_scales={"scale": 1.0})
+
+    assert calls[0] == "init_zmq"
+    assert calls[1]["buffer_size_bytes"] == 123
+    assert calls[1]["zmq_socket"] is worker.zmq_socket
+    assert calls[1]["rank"] == 0
+
+
+@requires_weight_folding
+def test_stream_weights_via_ipc_zmq_does_not_move_without_real_quant(monkeypatch):
+    from nemo_rl.models.policy import utils as policy_utils
+
+    worker = _make_real_quant_worker()
+    worker.cfg["generation"]["real_quant"] = False
+    worker.zmq_socket = object()
+    calls = []
+
+    monkeypatch.setattr(worker, "maybe_init_zmq", lambda: calls.append("init_zmq"))
+
+    def fail_move_model(*args, **kwargs):
+        raise AssertionError("stream_weights_via_ipc_zmq should not move the model")
+
+    monkeypatch.setattr(worker, "move_model", fail_move_model)
+    monkeypatch.setattr(
+        worker,
+        "_iter_params_with_optional_kv_scales",
+        lambda kv_scales=None: iter([("model.weight", torch.ones(1))]),
+    )
+
+    def fake_stream_weights_via_ipc_zmq_impl(**kwargs):
+        calls.append(kwargs)
+        params = list(kwargs["params_generator"])
+        assert params[0][0] == "model.weight"
+        torch.testing.assert_close(params[0][1], torch.ones(1))
+
+    monkeypatch.setattr(
+        policy_utils,
+        "stream_weights_via_ipc_zmq_impl",
+        fake_stream_weights_via_ipc_zmq_impl,
+    )
+
+    worker.stream_weights_via_ipc_zmq(buffer_size_bytes=123, kv_scales={"scale": 1.0})
+
+    assert calls[0] == "init_zmq"
+    assert calls[1]["buffer_size_bytes"] == 123
+    assert calls[1]["zmq_socket"] is worker.zmq_socket
+    assert calls[1]["rank"] == 0
 
 
 def _make_cluster(name):
