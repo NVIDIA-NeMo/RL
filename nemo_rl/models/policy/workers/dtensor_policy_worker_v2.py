@@ -1218,8 +1218,13 @@ class DTensorPolicyWorkerV2Impl(
 
         torch.cuda.empty_cache()
 
-    def finish_inference(self, *args, **kwargs) -> None:
-        pass
+    def finish_inference(self, *args: Any, **kwargs: Any) -> None:
+        """Offload policy model parameters after inference."""
+        self.model = self.move_to_cpu(self.model)
+        self.model.eval()
+
+        gc.collect()
+        torch.cuda.empty_cache()
 
     @torch.no_grad()
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/offload_before_refit")

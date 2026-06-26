@@ -542,24 +542,32 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
         torch.cuda.empty_cache()
 
     def prepare_for_inference(self, *args, **kwargs) -> None:
-        """Prepare for inference by setting model to eval mode."""
+        """Prepare for inference by loading model to GPU and setting eval mode."""
+        if not self.cpu_offload:
+            self.move_to_cuda(self.model)
+        else:
+            self.model = self.move_buffer_to_device(self.model, "cuda")
+
         self.model.eval()
         torch.cuda.empty_cache()
 
-    # NOTE(ppo-dtensor port): bg51717/ppo's pre-Path-A worker didn't define
-    # finish_training / finish_inference, but this fork's PPO algorithm loop
-    # (nemo_rl/algorithms/ppo.py L667, L1519, L1617, L1929) calls them on
-    # value_model every step. Without these no-op overrides the run dies at
-    # the first step with:
-    #   AttributeError: 'ActorHandle' object has no attribute 'finish_inference'
-    # Path A's worker has the same no-op overrides; the corresponding
-    # dtensor_policy_worker_v2.py also has them (added in cross-backend
-    # infra fixes commit 3610022).
-    def finish_training(self, *args, **kwargs) -> None:
-        pass
+    def finish_training(self, *args: Any, **kwargs: Any) -> None:
+        """Offload value model and optimizer state after training."""
+        self.model = self.move_to_cpu(self.model)
+        self.model.eval()
 
-    def finish_inference(self, *args, **kwargs) -> None:
-        pass
+        if self.optimizer is not None and not self.cpu_offload:
+            self.move_optimizer_to_device("cpu")
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def finish_inference(self, *args: Any, **kwargs: Any) -> None:
+        """Offload value model parameters after inference."""
+        self.model = self.move_to_cpu(self.model)
+
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def move_optimizer_to_device(self, device: str | torch.device) -> None:
         """Move optimizer state to specified device."""
