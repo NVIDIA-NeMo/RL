@@ -1449,6 +1449,14 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 f"applied in kd_loss_mode='sum'; it is ignored by "
                 f"'{cfg['kd_loss_mode']}'. Unset one of them."
             )
+        # normalize_teacher_by_vocab is likewise only applied in
+        # kd_loss_mode="sum"; reject it elsewhere instead of silently ignoring.
+        if cfg.get("normalize_teacher_by_vocab") and cfg["kd_loss_mode"] != "sum":
+            raise ValueError(
+                f"normalize_teacher_by_vocab is only applied in "
+                f"kd_loss_mode='sum'; it is ignored by '{cfg['kd_loss_mode']}'. "
+                f"Unset one of them."
+            )
         # Global loss knobs (shared across all teachers).
         self.gold_loss = cfg["gold_loss"]
         self.xtoken_loss = cfg["xtoken_loss"]
@@ -1500,6 +1508,22 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             or self.teacher_send_full_logits[i]
             for i in range(self.num_teachers)
         ]
+        # select_teacher and dynamic weighting (sum_weights_metric) score every
+        # teacher from its full vocab distribution, so a same-vocab teacher that
+        # ships only top-K (send_full_logits=False) cannot be scored. Reject at
+        # construction instead of raising NotImplementedError at the first step.
+        if (
+            self.kd_loss_mode == "select_teacher" or self.sum_weights_metric is not None
+        ) and not all(self.teacher_ships_full):
+            offenders = [
+                i for i, ships in enumerate(self.teacher_ships_full) if not ships
+            ]
+            raise ValueError(
+                f"kd_loss_mode={self.kd_loss_mode!r} / sum_weights_metric="
+                f"{self.sum_weights_metric!r} scores every teacher and needs full "
+                f"teacher logits, but teachers {offenders} are same-vocab top-K "
+                "(send_full_logits=False). Set send_full_logits=true for them."
+            )
         # The materialized projection matrix and the derived exact-map
         # partition both live in process-local caches in
         # ``x_token.loss_utils`` (see ``get_sparse_projection_matrix``,

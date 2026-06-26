@@ -2421,6 +2421,27 @@ def test_cross_tokenizer_mismatched_per_teacher_lists_raises(tmp_path):
         CrossTokenizerDistillationLossFn(cfg)
 
 
+def test_normalize_teacher_by_vocab_rejected_outside_sum_mode(tmp_path):
+    """normalize_teacher_by_vocab is a no-op outside sum mode, so reject it there."""
+    cfg = _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
+    cfg["kd_loss_mode"] = "averaged_logits"
+    cfg["normalize_teacher_by_vocab"] = True
+    with pytest.raises(ValueError, match="normalize_teacher_by_vocab"):
+        CrossTokenizerDistillationLossFn(cfg)
+
+
+def test_select_teacher_rejects_same_vocab_topk_teacher(tmp_path):
+    """select_teacher must score every teacher, so a same-vocab top-K teacher
+    (no full logits) is rejected at construction."""
+    cfg = _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
+    cfg["kd_loss_mode"] = "select_teacher"
+    # Same-vocab teacher (no projection) shipping only top-K -> cannot be scored.
+    cfg["projection_matrix_paths"] = [None]
+    cfg["teacher_send_full_logits"] = [False]
+    with pytest.raises(ValueError, match="needs full teacher logits"):
+        CrossTokenizerDistillationLossFn(cfg)
+
+
 def test_cross_tokenizer_ce_uniform_logits_equals_log_vocab(tmp_path):
     """_compute_ce on uniform logits equals log(V_student) per valid token."""
     loss_fn = CrossTokenizerDistillationLossFn(
