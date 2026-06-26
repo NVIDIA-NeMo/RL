@@ -101,7 +101,7 @@ class Value(ValueInterface):
                     "training backend (or value.megatron_cfg.enabled=true for "
                     "Megatron-Core)."
                 )
-            if not config["dtensor_cfg"].get("_v2", False):
+            if not config["dtensor_cfg"]["_v2"]:
                 raise ValueError(
                     "DTensor value models require value.dtensor_cfg._v2=true."
                 )

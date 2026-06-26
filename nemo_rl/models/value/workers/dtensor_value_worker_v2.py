@@ -135,15 +135,12 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
             config["dtensor_cfg"].get("lora_cfg", {}).get("enabled", False)
         )
 
-        if not config["reward_model_cfg"]["enabled"]:
-            raise ValueError(
-                "DTensor value models require value.reward_model_cfg.enabled=true."
-            )
-        if config["reward_model_cfg"].get("reward_model_type") != "regression":
-            raise ValueError(
-                "DTensor value models require "
-                "value.reward_model_cfg.reward_model_type='regression'."
-            )
+        assert (
+            config["reward_model_cfg"]["enabled"]
+            and config["reward_model_cfg"]["reward_model_type"] == "regression"
+        ), (
+            "DTensor value models require reward_model_cfg.enabled=true and reward_model_cfg.reward_model_type='regression'."
+        )
 
         print("Initializing DTensorValueWorkerV2")
 
