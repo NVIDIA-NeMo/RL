@@ -22,12 +22,15 @@ flagged. CPU-only, no Ray, no CUDA.
 
 from __future__ import annotations
 
+import os
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 from pydantic import ValidationError
 from torchdata.stateful_dataloader import StatefulDataLoader
 
@@ -43,6 +46,8 @@ from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     xtoken_non_student_seq_keys,
     xtoken_off_policy_distillation_train,
 )
+
+from .conftest import has_gloo
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -933,8 +938,8 @@ def test_dp_global_masked_mean_single_process_is_local_masked_mean():
     # Without a process group the DP all-reduce is a no-op, so the global
     # masked mean reduces to the plain masked mean: padded positions excluded,
     # and the result is detached (it gates selection / weighting, never
-    # back-propagated). Cross-rank agreement is verified separately with a
-    # 2-rank gloo run.
+    # back-propagated). Cross-rank agreement across DP ranks is verified by
+    # ``test_dp_global_masked_mean_agrees_across_ranks`` below.
     fn = CrossTokenizerDistillationLossFn.__new__(CrossTokenizerDistillationLossFn)
     values = torch.tensor([[1.0, 2.0, 100.0]], requires_grad=True)
     mask = torch.tensor([[1.0, 1.0, 0.0]])
@@ -943,6 +948,54 @@ def test_dp_global_masked_mean_single_process_is_local_masked_mean():
 
     assert out.item() == pytest.approx(1.5)  # (1+2)/2; padded 100.0 excluded
     assert not out.requires_grad  # detached
+
+
+def _dp_global_masked_mean_worker(rank, world_size, init_file, q):
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        fn = CrossTokenizerDistillationLossFn.__new__(CrossTokenizerDistillationLossFn)
+        # Deliberately uneven shards: rank 1's masked-out 1e9 must not leak,
+        # and the mean must combine across ranks (not stay rank-local).
+        if rank == 0:
+            values, mask = torch.tensor([[1.0, 2.0]]), torch.tensor([[1.0, 1.0]])
+        else:
+            values, mask = torch.tensor([[10.0, 1e9]]), torch.tensor([[1.0, 0.0]])
+        q.put((rank, fn._dp_global_masked_mean(values, mask).item()))
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not has_gloo(), reason="gloo backend unavailable")
+def test_dp_global_masked_mean_agrees_across_ranks(tmp_path):
+    """Both DP ranks compute the identical DP-global masked mean = 13/3.
+
+    rank 0 contributes (1+2) over 2 valid positions, rank 1 contributes 10 over
+    1 (its 1e9 is masked out); the all-reduced sum/count give (3+10)/(2+1),
+    proving the score is DP-global (not rank-local) and padding is excluded.
+    """
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    procs = [
+        ctx.Process(
+            target=_dp_global_masked_mean_worker,
+            args=(rank, 2, str(tmp_path / "init"), q),
+        )
+        for rank in range(2)
+    ]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(timeout=60)
+        assert p.exitcode == 0
+    results = dict(q.get() for _ in range(len(procs)))
+    assert results[0] == results[1]
+    assert results[0] == pytest.approx(13.0 / 3.0)
 
 
 # ---------------------------------------------------------------------------
