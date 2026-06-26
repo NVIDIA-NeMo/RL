@@ -1,0 +1,50 @@
+# NVFP4 W4A8 custom quantization recipe for QARL.
+#
+# Defines W4A8: NVFP4 e2m1 weights with FP8 e4m3 input activations.
+metadata:
+  recipe_type: ptq
+  description: NVFP4 weights with FP8 input activations for W4A8 QAT.
+quantize:
+  algorithm: max
+  quant_cfg:
+    - quantizer_name: '*'
+      enable: false
+    - quantizer_name: '*weight_quantizer'
+      enable: true
+      cfg:
+        block_sizes:
+          -1: 16
+          type: dynamic
+          scale_bits: e4m3
+        num_bits: e2m1
+    - quantizer_name: '*input_quantizer'
+      enable: true
+      cfg:
+        num_bits: e4m3
+    - quantizer_name: '*self_attention*'
+      enable: false
+    - quantizer_name: '*self_attn*'
+      enable: false
+    - quantizer_name: '*lm_head*'
+      enable: false
+    - quantizer_name: '*output_layer*'
+      enable: false
+    - quantizer_name: '*router*'
+      enable: false
+    - quantizer_name: '*mlp.gate.*'
+      enable: false
+    - quantizer_name: '*gate_up_proj.input_quantizer'
+      enable: false
+    - quantizer_name: '*linear_fc1.input_quantizer'
+      enable: false
+    - quantizer_name: '*block_sparse_moe.gate*'
+      enable: false
+    - parent_class: 'nn.BatchNorm1d'
+      quantizer_name: '*'
+      enable: false
+    - parent_class: 'nn.BatchNorm2d'
+      quantizer_name: '*'
+      enable: false
+    - parent_class: 'nn.BatchNorm3d'
+      quantizer_name: '*'
+      enable: false

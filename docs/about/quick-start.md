@@ -44,6 +44,6 @@ To validate your install end-to-end more quickly, use the smoke recipe — it sw
 
 ```sh
 uv run examples/run_grpo.py \
-  --config examples/configs/grpo-smoke.yaml
+  --config examples/configs/grpo_smoke.yaml
 ```
 

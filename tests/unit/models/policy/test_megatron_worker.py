@@ -75,6 +75,85 @@ def test_megatron_prepare_for_training_restores_optimizer():
     assert restored_devices == ["cuda"]
 
 
+def test_set_moe_grad_scale_func_sets_and_clears_on_model_config():
+    """_set_moe_grad_scale_func should set/clear moe_grad_scale_func on the config."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    model_config = SimpleNamespace()
+    worker.model = SimpleNamespace(config=model_config)
+
+    def scale():
+        return 0.5
+
+    MegatronPolicyWorkerImpl._set_moe_grad_scale_func(worker, scale)
+    assert model_config.moe_grad_scale_func is scale
+
+    # Clearing after the forward-backward pass restores None.
+    MegatronPolicyWorkerImpl._set_moe_grad_scale_func(worker, None)
+    assert model_config.moe_grad_scale_func is None
+
+
+def test_set_moe_grad_scale_func_handles_float16module_wrapper():
+    """_get_model_config should unwrap a Float16Module-style .module.config."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    inner_config = SimpleNamespace()
+    worker.model = SimpleNamespace(module=SimpleNamespace(config=inner_config))
+
+    def scale():
+        return 2.0
+
+    MegatronPolicyWorkerImpl._set_moe_grad_scale_func(worker, scale)
+    assert inner_config.moe_grad_scale_func is scale
+
+
+def test_set_moe_grad_scale_func_noop_when_no_config():
+    """A model without a resolvable config should be a no-op, not an error."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = SimpleNamespace()  # no .config and no .module
+
+    # Should not raise even though there is no config to set the func on.
+    MegatronPolicyWorkerImpl._set_moe_grad_scale_func(worker, lambda: 1.0)
+
+
+def test_compute_moe_grad_scale_normalizes_by_valid_tokens():
+    """_compute_moe_grad_scale should yield loss_scale = 1/global_valid_toks."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+
+    scale_fn = MegatronPolicyWorkerImpl._compute_moe_grad_scale(
+        worker, torch.tensor(4.0)
+    )
+    assert torch.allclose(scale_fn(), torch.tensor(0.25))
+
+
+def test_compute_moe_grad_scale_clamps_zero_valid_tokens():
+    """clamp(min=1) must guard against division by zero when no valid tokens."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+
+    scale_fn = MegatronPolicyWorkerImpl._compute_moe_grad_scale(
+        worker, torch.tensor(0.0)
+    )
+    assert torch.allclose(scale_fn(), torch.tensor(1.0))
+
+
 def test_disable_forward_pre_hook_until_next_step_uses_worker_override():
     source_path = (
         Path(__file__).parents[4]
@@ -228,6 +307,7 @@ def create_megatron_test_config(
             "use_linear_ce_fusion_loss": False,
             "linear_ce_fusion_chunk_size": 256,
             "gradient_accumulation_fusion": False,
+            "use_fused_weighted_squared_relu": False,
             "train_iters": 100,  # Required for Megatron training
             "optimizer": {
                 "optimizer": "adam",

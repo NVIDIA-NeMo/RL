@@ -1105,7 +1105,10 @@ class TestAsyncTrajectoryCollector:
                 "max_rollout_turns": 1,
                 "async_grpo": {"max_trajectory_age_steps": 2},
             },
-            "policy": {"max_total_sequence_length": 512},
+            "policy": {
+                "max_total_sequence_length": 512,
+                "make_sequence_length_divisible_by": 1,
+            },
         }
         return MasterConfig.model_construct(**config)
 
@@ -1447,7 +1450,10 @@ class TestAsyncUtilsIntegration:
                 "max_rollout_turns": 1,
                 "async_grpo": {"max_trajectory_age_steps": 1},
             },
-            "policy": {"max_total_sequence_length": 512},
+            "policy": {
+                "max_total_sequence_length": 512,
+                "make_sequence_length_divisible_by": 1,
+            },
         }
         return MasterConfig.model_construct(**config)
 

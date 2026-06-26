@@ -62,7 +62,7 @@ Learn about DTensor and Megatron Core training backends, their capabilities, and
 :link: about/algorithms/index
 :link-type: doc
 
-Discover supported algorithms including GRPO, PPO, SFT, DPO, RM, and on-policy distillation with detailed guides and examples.
+Discover supported algorithms including GRPO, PPO, SFT, DPO, RM, on-policy distillation, and multi-teacher on-policy distillation (MOPD) with detailed guides and examples.
 :::
 
 :::{grid-item-card} {octicon}`graph` Evaluation
@@ -188,7 +188,9 @@ Optimize large language models with FP8 quantization for faster training and inf
 :link: guides/quantization-aware-rl
 :link-type: doc
 
-Run quantization aware GRPO and distillation using NVIDIA ModelOpt (NVFP4, FP8).
+Run quantization-aware GRPO and distillation using NVIDIA ModelOpt.
+Includes NVFP4 W4A16 real rollout.
+W4A8 rollout uses fake quantization.
 :::
 
 :::{grid-item-card} {octicon}`container` Docker Containers
