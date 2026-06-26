@@ -267,6 +267,7 @@ def _install_missing_route_fallback_patch() -> None:
         "default_compute_topk",
     ]
     actual_params = list(inspect.signature(original_get_replay_topk).parameters)
+    # Wrapper receiver names are arbitrary; guard only Megatron's callable API.
     actual_non_receiver_params = actual_params[1:]
     if actual_non_receiver_params != expected_non_receiver_params:
         raise RuntimeError(
