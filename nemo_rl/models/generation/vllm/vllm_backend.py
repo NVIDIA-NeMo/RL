@@ -210,6 +210,48 @@ class VllmInternalWorkerExtension:
         draft_weights = self._trim_vocab_padding(draft_model, draft_weights)
         draft_model.load_weights(weights=draft_weights)
 
+    @staticmethod
+    def _reset_moe_weights_for_refit(model: torch.nn.Module) -> None:
+        """Reset FusedMoE layer weights to their pre-transformation 3D shape.
+
+        Some unquantized MoE backends (e.g., FlashInfer TRTLLM on CUDA) transform
+        w13_weight from 3D [E, 2*I, H] to 4D during process_weights_after_loading
+        via convert_to_block_layout. This breaks weight_loader during weight refit
+        since weight_loader expects the pre-transformation 3D shape. We reset to
+        the original 3D format here; process_weights_after_loading (called after all
+        batches are loaded) will re-apply the transformation.
+        """
+        try:
+            from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+            from vllm.model_executor.utils import replace_parameter
+        except ImportError:
+            return
+
+        for module in model.modules():
+            if not isinstance(module, FusedMoE):
+                continue
+            w13 = module.w13_weight
+            w2 = module.w2_weight
+            if w13.ndim == 3 and w2.ndim == 3:
+                continue
+            E = module.local_num_experts
+            hidden_size = module.moe_config.hidden_dim
+            intermediate_size = module.moe_config.intermediate_size_per_partition
+            up_dim = 2 * intermediate_size if module.moe_config.is_act_and_mul else intermediate_size
+            # replace_parameter preserves the weight_loader attribute from the old param
+            if w13.ndim != 3:
+                replace_parameter(
+                    module,
+                    "w13_weight",
+                    torch.empty(E, up_dim, hidden_size, dtype=w13.dtype, device=w13.device),
+                )
+            if w2.ndim != 3:
+                replace_parameter(
+                    module,
+                    "w2_weight",
+                    torch.empty(E, hidden_size, intermediate_size, dtype=w2.dtype, device=w2.device),
+                )
+
     def _load_weights(self, weights):
         """Load weights with Gemma3 vision-tower weight name fix, FP8, and draft-weight support.
 
@@ -246,6 +288,10 @@ class VllmInternalWorkerExtension:
 
         try:
             self.maybe_init_zmq()
+            # Reset any MoE layer weights that were transformed post-load back to
+            # their original 3D shape so weight_loader can write into them correctly.
+            # process_weights_after_loading (called at COMPLETE) will re-transform.
+            self._reset_moe_weights_for_refit(self.model_runner.model)
             while True:
                 # Blocking receive with timeout (this is the main operation)
                 payload = self.zmq_socket.recv_pyobj()
@@ -334,12 +380,26 @@ class VllmInternalWorkerExtension:
         load_model_weight_func = self._load_weights
 
         try:
+            # Reset any MoE layer weights that were transformed post-load back to
+            # their original 3D shape so weight_loader can write into them correctly.
+            # process_weights_after_loading (called below) will re-transform.
+            self._reset_moe_weights_for_refit(self.model_runner.model)
             packed_broadcast_consumer(
                 iterator=iter(self.state_dict_info.items()),
                 group=self.model_update_group,
                 src=0,
                 post_unpack_func=load_model_weight_func,
             )
+
+            from vllm.config import set_current_vllm_config
+            from vllm.model_executor.model_loader.utils import (
+                process_weights_after_loading,
+            )
+
+            with set_current_vllm_config(self.model_runner.vllm_config):
+                process_weights_after_loading(
+                    self.model_runner.model, self.model_config, self.device
+                )
 
             # Process weights after loading for FP8 KV cache
             self._maybe_process_fp8_kv_cache()
