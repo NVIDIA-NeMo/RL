@@ -344,6 +344,11 @@ override-dependencies = [
   # extra composes with mcore/automodel without version-mirroring TQ's
   # requirements.txt. Forward-compatible across TQ minor bumps.
   "numpy>=2.1.0",
+  # fastapi>=0.137 introduces _IncludedRouter (a BaseRoute with no .path)
+  # that breaks prometheus-fastapi-instrumentator's route iteration at startup.
+  # Cap until prometheus-fastapi-instrumentator handles it:
+  # https://github.com/trallnag/prometheus-fastapi-instrumentator/issues/370
+  "fastapi<0.137",
 ]
 
 # CVE fixes
