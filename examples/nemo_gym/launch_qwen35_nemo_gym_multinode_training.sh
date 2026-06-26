@@ -96,8 +96,8 @@ if ! [[ "${GPUS_PER_NODE}" =~ ^[1-9][0-9]*$ ]]; then
     exit 1
 fi
 
-TRAIN_NODES="${TRAIN_NODES:-16}"
-GEN_NODES="${GEN_NODES:-24}"
+TRAIN_NODES="${TRAIN_NODES:-32}"
+GEN_NODES="${GEN_NODES:-32}"
 NODES="${NODES:-$((TRAIN_NODES + GEN_NODES))}"
 CONTAINER_REPO_LOCATION="${CONTAINER_REPO_LOCATION:-/opt/nemo-rl}"
 RECIPE="${RECIPE:-qwen_35/configs/grpo_qwen35_397b_swe_openhands_async.yaml}"
