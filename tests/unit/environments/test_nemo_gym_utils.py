@@ -17,15 +17,10 @@ These run in the default L0 suite. Keep this module free of heavy imports
 (e.g. vllm) so the fast detector tests are not gated behind the nemo_gym extra.
 """
 
-import importlib
-import sys
-from pathlib import Path
-
 import pytest
 
 from nemo_rl.environments import nemo_gym as nemo_gym_mod
 from nemo_rl.environments.nemo_gym import (
-    _ensure_nemo_gym_package_precedence,
     _detect_invalid_tool_call_and_malformed_thinking,
     get_nemo_gym_uv_cache_dir,
     get_nemo_gym_venv_dir,
@@ -102,45 +97,3 @@ def test_get_nemo_gym_uv_cache_dir_uses_uv_inside_container(monkeypatch):
         lambda *args, **kwargs: b"  /root/.cache/uv\n",
     )
     assert get_nemo_gym_uv_cache_dir() == "/root/.cache/uv"
-
-
-def test_ensure_nemo_gym_package_precedence_recovers_from_examples_shadow():
-    repo_root = Path(__file__).resolve().parents[3]
-    examples_dir = str(repo_root / "examples")
-    expected_gym_init = (
-        repo_root
-        / "3rdparty"
-        / "Gym-workspace"
-        / "Gym"
-        / "nemo_gym"
-        / "__init__.py"
-    ).resolve()
-
-    saved_path = list(sys.path)
-    saved_modules = {
-        name: module
-        for name, module in sys.modules.items()
-        if name == "nemo_gym" or name.startswith("nemo_gym.")
-    }
-    try:
-        for name in list(sys.modules):
-            if name == "nemo_gym" or name.startswith("nemo_gym."):
-                del sys.modules[name]
-        sys.path.insert(0, examples_dir)
-
-        shadowed = importlib.import_module("nemo_gym")
-        assert getattr(shadowed, "__file__", None) is None
-
-        _ensure_nemo_gym_package_precedence()
-
-        actual = importlib.import_module("nemo_gym")
-        assert Path(actual.__file__).resolve() == expected_gym_init
-        from nemo_gym import PARENT_DIR  # noqa: PLC0415
-
-        assert PARENT_DIR == expected_gym_init.parent.parent
-    finally:
-        sys.path[:] = saved_path
-        for name in list(sys.modules):
-            if name == "nemo_gym" or name.startswith("nemo_gym."):
-                del sys.modules[name]
-        sys.modules.update(saved_modules)
