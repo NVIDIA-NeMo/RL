@@ -348,7 +348,7 @@ override-dependencies = [
   # that breaks prometheus-fastapi-instrumentator's route iteration at startup.
   # Cap until prometheus-fastapi-instrumentator handles it:
   # https://github.com/trallnag/prometheus-fastapi-instrumentator/issues/370
-  "fastapi<0.137",
+  "fastapi[standard]<0.137",
 ]
 
 # CVE fixes
