@@ -1,0 +1,59 @@
+# AReaL decoupled-PPO end-to-end recipe on the SingleController path, sized for
+# the GB200 2n4g cluster (2 nodes x 4 GPUs = 8 GPUs total; non-colocated:
+# 1 node/4 GPUs vLLM async inference + 1 node/4 GPUs Megatron training, TP=1/PP=1).
+#
+# Built on the proven 2n4g async-1off non-colocated performance recipe, then
+# overlaid with the SingleController data plane + async-RL dispatch knobs and the
+# AReaL decoupled-PPO objective + interruptible-refit knob (AREAL.md §2, §6, §9 P5).
+# Mirrors grpo-llama3.1-8b-instruct-2n8g-areal-single-controller.yaml, retargeted
+# from 2n8g -> 2n4g. Launch with examples/run_grpo_areal.py (SingleControllerArealActor).
+#
+# Recipes under recipes/llm/ have no reference_configs entry (test_config_v2.py
+# globs only tests/unit/reference_configs/*.yaml), matching the SC convention.
+defaults: ./performance/grpo-llama3.1-8b-instruct-2n4g-async-1off.yaml
+
+logger:
+  log_dir: logs/grpo-llama3.1-8b-instruct-2n4g-areal-sc
+  wandb:
+    project: areal
+    name: grpo-llama3.1-8b-instruct-2n4g-areal-sc
+
+checkpointing:
+  checkpoint_dir: results/grpo-llama3.1-8b-instruct-2n4g-areal-sc
+
+# TransferQueue data plane is mandatory for the SingleController path.
+data_plane:
+  enabled: true
+
+# Keep M = num_minibatches = 1 for this smoke run: rl_step_samples
+# (num_prompts_per_step * num_generations_per_prompt = 64 * 32 = 2048) divided by
+# train_global_batch_size == 1. M>1 exercises the still-open LR-tick / throughput
+# deltas (AREAL.md §7.2/§7.6), out of scope for a "does it run end-to-end" test.
+# DP world = 4 train GPUs; 2048 % 4 == 0.
+policy:
+  train_global_batch_size: 2048
+
+# ── AReaL decoupled-PPO loss (AREAL.md §2b, §6) ──────────────────────────────
+# clip ratio = pi_theta / pi_prox (prev_logprobs := frozen pi_prox); NO KL term
+# (AReaL's KL is a reward penalty, math recipes set it 0); always-on pi_prox/pi_behav
+# importance-sampling reweight (the startup assert in single_controller_areal.py
+# requires use_importance_sampling_correction=true).
+loss_fn:
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.2
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+
+# ── SingleController async-RL dispatch + AReaL refit knobs (AREAL.md §2a) ─────
+async_rl:
+  max_weight_staleness_versions: 1            # eta (matches async-1off max_trajectory_age_steps=1)
+  min_prompt_groups_per_batch: 64             # = grpo.num_prompts_per_step
+  batch_selection_strategy: staleness_window
+  max_inflight_prompts: ${grpo.num_prompts_per_step}
+  max_buffered_rollouts: 128                  # 64 * (eta + 1); controller re-derives + overrides anyway
+  over_sampling: false
+  force_in_order: true
+  # AReaL interruptible refit: after the weight swap, invalidate the KV cache with
+  # reset_running_requests=True so vLLM preempts in-flight requests and reprefills
+  # them under the new weights (P4).
+  refit_invalidate_kv_cache: true
