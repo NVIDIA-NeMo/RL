@@ -40,9 +40,6 @@ _DEFAULT_TRACE_SAMPLES = 2
 _DEFAULT_TRACE_MICROBATCHES = 2
 
 _write_lock = threading.Lock()
-_patch_lock = threading.Lock()
-_router_replay_patch_depth = 0
-_original_get_replay_topk: Optional[Any] = None
 _event_counts: dict[str, int] = defaultdict(int)
 _context: contextvars.ContextVar[Optional[dict[str, Any]]] = contextvars.ContextVar(
     "nrl_r3_trace_context",
@@ -283,82 +280,53 @@ def _trace_router_replay_topk_use(
         )
 
 
-@contextmanager
-def _verify_router_replay_forward_context() -> Iterator[None]:
-    global _original_get_replay_topk, _router_replay_patch_depth
+def replay_topk_snapshot(replay_instance: Any) -> Optional[tuple[Any, Any, int]]:
+    """Pre-call hook for the RouterReplay.get_replay_topk wrapper.
 
-    if not r3_trace_verify_forward_enabled():
-        yield
+    Returns (action, expected, backward_len_before) when verification is active,
+    else None. The wrapper in nemo_rl.models.megatron.router_replay calls this
+    before computing the result, then passes the returned ctx to
+    replay_topk_record.
+    """
+    if not r3_trace_verify_forward_enabled() or _current_context() is None:
+        return None
+
+    from megatron.core.transformer.moe.router_replay import RouterReplayAction
+
+    action = getattr(replay_instance, "router_replay_action", None)
+    backward_list = getattr(replay_instance, "replay_backward_list", [])
+    if action == RouterReplayAction.REPLAY_FORWARD:
+        expected = getattr(replay_instance, "target_topk_idx", None)
+    elif action == RouterReplayAction.REPLAY_BACKWARD:
+        expected = backward_list[0] if backward_list else None
+    else:
+        return None
+    return action, expected, len(backward_list)
+
+
+def replay_topk_record(
+    replay_instance: Any,
+    scores: Any,
+    topk: int,
+    ctx: Optional[tuple[Any, Any, int]],
+    actual: Any,
+) -> None:
+    """Post-call hook for the RouterReplay.get_replay_topk wrapper. No-ops when ctx is None."""
+    if ctx is None:
         return
-
-    from megatron.core.transformer.moe.router_replay import (
-        RouterReplay,
-        RouterReplayAction,
+    action, expected, before = ctx
+    _trace_router_replay_topk_use(
+        replay_instance=replay_instance,
+        action=action,
+        scores=scores,
+        topk=topk,
+        expected=expected,
+        actual=actual,
+        backward_list_len_before=before,
+        backward_list_len_after=len(
+            getattr(replay_instance, "replay_backward_list", [])
+        ),
     )
-
-    with _patch_lock:
-        if _router_replay_patch_depth == 0:
-            _original_get_replay_topk = RouterReplay.get_replay_topk
-
-            def wrapped_get_replay_topk(
-                replay_instance: Any,
-                scores: Any,
-                topk: int,
-                num_groups: Optional[int] = None,
-                group_topk: Optional[int] = None,
-                default_compute_topk: Optional[Any] = None,
-            ) -> tuple[Any, Any]:
-                action = getattr(replay_instance, "router_replay_action", None)
-                backward_list = getattr(replay_instance, "replay_backward_list", [])
-                backward_len_before = len(backward_list)
-                expected = None
-                if action == RouterReplayAction.REPLAY_FORWARD:
-                    expected = getattr(replay_instance, "target_topk_idx", None)
-                elif action == RouterReplayAction.REPLAY_BACKWARD:
-                    expected = backward_list[0] if backward_list else None
-
-                assert _original_get_replay_topk is not None
-                probs, top_indices = _original_get_replay_topk(
-                    replay_instance,
-                    scores,
-                    topk,
-                    num_groups,
-                    group_topk,
-                    default_compute_topk,
-                )
-
-                if action in {
-                    RouterReplayAction.REPLAY_FORWARD,
-                    RouterReplayAction.REPLAY_BACKWARD,
-                }:
-                    _trace_router_replay_topk_use(
-                        replay_instance=replay_instance,
-                        action=action,
-                        scores=scores,
-                        topk=topk,
-                        expected=expected,
-                        actual=top_indices,
-                        backward_list_len_before=backward_len_before,
-                        backward_list_len_after=len(
-                            getattr(replay_instance, "replay_backward_list", [])
-                        ),
-                    )
-                return probs, top_indices
-
-            RouterReplay.get_replay_topk = wrapped_get_replay_topk
-        _router_replay_patch_depth += 1
-
-    try:
-        yield
-    finally:
-        with _patch_lock:
-            _router_replay_patch_depth -= 1
-            if (
-                _router_replay_patch_depth == 0
-                and _original_get_replay_topk is not None
-            ):
-                RouterReplay.get_replay_topk = _original_get_replay_topk
-                _original_get_replay_topk = None
 
 
 def trace_rollout_payload(
@@ -457,8 +425,7 @@ def r3_trace_stage(stage: str) -> Iterator[None]:
         }
     )
     try:
-        with _verify_router_replay_forward_context():
-            yield
+        yield
     finally:
         _context.reset(token)
 

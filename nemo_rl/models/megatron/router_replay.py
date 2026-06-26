@@ -23,13 +23,16 @@ import torch
 
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.utils.r3_trace import (
+    replay_topk_record,
+    replay_topk_snapshot,
     trace_router_replay_action,
     trace_router_replay_assignment,
 )
 
 _ROUTER_REPLAY_VALIDATE_ENV = "NRL_ROUTER_REPLAY_VALIDATE"
 _MISSING_ROUTE_SENTINEL = -1
-_MISSING_ROUTE_FALLBACK_PATCH_ATTR = "_nrl_missing_route_fallback_patch"
+
+_original_get_replay_topk: Optional[Any] = None
 
 
 def router_replay_enabled(config: PolicyConfig) -> bool:
@@ -63,7 +66,7 @@ def validate_router_replay_config(config: PolicyConfig) -> None:
         raise ValueError(
             "router_replay.enabled does not support virtual pipeline parallelism yet."
         )
-    _install_missing_route_fallback_patch()
+    _install_get_replay_topk_wrapper()
 
 
 def _iter_model_modules(model: Any) -> Iterable[Any]:
@@ -248,16 +251,102 @@ def _validate_replay_tensor(
         )
 
 
-def _install_missing_route_fallback_patch() -> None:
-    from megatron.core.transformer.moe.router_replay import (
-        RouterReplay,
-        RouterReplayAction,
-    )
+def _compute_get_replay_topk(
+    replay_instance: Any,
+    scores: torch.Tensor,
+    topk: int,
+    num_groups: Optional[int],
+    group_topk: Optional[int],
+    default_compute_topk: Optional[Any],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply the missing-route fallback, else delegate to upstream get_replay_topk."""
+    from megatron.core.transformer.moe.router_replay import RouterReplayAction
 
-    if getattr(RouterReplay.get_replay_topk, _MISSING_ROUTE_FALLBACK_PATCH_ATTR, False):
+    assert _original_get_replay_topk is not None
+
+    action = getattr(replay_instance, "router_replay_action", None)
+    if action not in {
+        RouterReplayAction.REPLAY_FORWARD,
+        RouterReplayAction.REPLAY_BACKWARD,
+    }:
+        return _original_get_replay_topk(
+            replay_instance, scores, topk,
+            num_groups, group_topk, default_compute_topk,
+        )
+
+    if action == RouterReplayAction.REPLAY_FORWARD:
+        target_topk_idx = getattr(replay_instance, "target_topk_idx", None)
+    else:
+        replay_backward_list = getattr(replay_instance, "replay_backward_list", [])
+        target_topk_idx = replay_backward_list[0] if replay_backward_list else None
+
+    if target_topk_idx is None:
+        return _original_get_replay_topk(
+            replay_instance, scores, topk,
+            num_groups, group_topk, default_compute_topk,
+        )
+
+    target_topk_idx = target_topk_idx.to(scores.device)
+    fallback_mask = target_topk_idx.eq(_MISSING_ROUTE_SENTINEL).all(dim=-1)
+    if not bool(fallback_mask.any().item()):
+        return _original_get_replay_topk(
+            replay_instance, scores, topk,
+            num_groups, group_topk, default_compute_topk,
+        )
+
+    if default_compute_topk is None:
+        raise RuntimeError(
+            "RouterReplay missing-route fallback requires default_compute_topk."
+        )
+
+    _, default_indices = default_compute_topk(
+        scores, topk, num_groups=num_groups, group_topk=group_topk,
+    )
+    effective_topk_idx = target_topk_idx.clone()
+    effective_topk_idx[fallback_mask] = default_indices[fallback_mask]
+    probs = scores.gather(1, effective_topk_idx)
+
+    if action == RouterReplayAction.REPLAY_FORWARD:
+        replay_backward_list = getattr(replay_instance, "replay_backward_list", [])
+        if replay_backward_list:
+            replay_backward_list[-1] = effective_topk_idx.detach()
+    else:
+        getattr(replay_instance, "replay_backward_list").pop(0)
+
+    return probs, effective_topk_idx
+
+
+def _wrapped_get_replay_topk(
+    replay_instance: Any,
+    scores: torch.Tensor,
+    topk: int,
+    num_groups: Optional[int] = None,
+    group_topk: Optional[int] = None,
+    default_compute_topk: Optional[Any] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Permanent replacement for Megatron's RouterReplay.get_replay_topk.
+
+    Applies NeMo RL's missing-route fallback and feeds the r3_trace forward
+    verifier in a single pass. Both responsibilities live here so there is no
+    cross-module patch composition.
+    """
+    trace_ctx = replay_topk_snapshot(replay_instance)
+    probs, top_indices = _compute_get_replay_topk(
+        replay_instance, scores, topk,
+        num_groups, group_topk, default_compute_topk,
+    )
+    replay_topk_record(replay_instance, scores, topk, trace_ctx, top_indices)
+    return probs, top_indices
+
+
+def _install_get_replay_topk_wrapper() -> None:
+    """Install the unified RouterReplay.get_replay_topk wrapper. Idempotent."""
+    global _original_get_replay_topk
+    if _original_get_replay_topk is not None:
         return
 
-    original_get_replay_topk = RouterReplay.get_replay_topk
+    from megatron.core.transformer.moe.router_replay import RouterReplay
+
     expected_params = [
         "self",
         "scores",
@@ -266,92 +355,29 @@ def _install_missing_route_fallback_patch() -> None:
         "group_topk",
         "default_compute_topk",
     ]
-    actual_params = list(inspect.signature(original_get_replay_topk).parameters)
+    actual_params = list(inspect.signature(RouterReplay.get_replay_topk).parameters)
     if actual_params != expected_params:
         raise RuntimeError(
             "Unsupported Megatron RouterReplay.get_replay_topk signature for "
-            "NeMo RL missing-route fallback patch: "
+            "NeMo RL router replay wrapper: "
             f"expected={expected_params}, actual={actual_params}. "
             "Update nemo_rl.models.megatron.router_replay before enabling "
             "policy.router_replay.enabled."
         )
 
-    def wrapped_get_replay_topk(
-        replay_instance: Any,
-        scores: torch.Tensor,
-        topk: int,
-        num_groups: Optional[int] = None,
-        group_topk: Optional[int] = None,
-        default_compute_topk: Optional[Any] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        action = getattr(replay_instance, "router_replay_action", None)
-        if action not in {
-            RouterReplayAction.REPLAY_FORWARD,
-            RouterReplayAction.REPLAY_BACKWARD,
-        }:
-            return original_get_replay_topk(
-                replay_instance,
-                scores,
-                topk,
-                num_groups,
-                group_topk,
-                default_compute_topk,
-            )
+    _original_get_replay_topk = RouterReplay.get_replay_topk
+    RouterReplay.get_replay_topk = _wrapped_get_replay_topk
 
-        if action == RouterReplayAction.REPLAY_FORWARD:
-            target_topk_idx = getattr(replay_instance, "target_topk_idx", None)
-        else:
-            replay_backward_list = getattr(replay_instance, "replay_backward_list", [])
-            target_topk_idx = replay_backward_list[0] if replay_backward_list else None
 
-        if target_topk_idx is None:
-            return original_get_replay_topk(
-                replay_instance,
-                scores,
-                topk,
-                num_groups,
-                group_topk,
-                default_compute_topk,
-            )
+def _reset_router_replay_wrapper_for_tests() -> None:
+    """Test-only: restore upstream RouterReplay.get_replay_topk. Not for production."""
+    global _original_get_replay_topk
+    if _original_get_replay_topk is None:
+        return
+    from megatron.core.transformer.moe.router_replay import RouterReplay
 
-        target_topk_idx = target_topk_idx.to(scores.device)
-        fallback_mask = target_topk_idx.eq(_MISSING_ROUTE_SENTINEL).all(dim=-1)
-        if not bool(fallback_mask.any().item()):
-            return original_get_replay_topk(
-                replay_instance,
-                scores,
-                topk,
-                num_groups,
-                group_topk,
-                default_compute_topk,
-            )
-
-        if default_compute_topk is None:
-            raise RuntimeError(
-                "RouterReplay missing-route fallback requires default_compute_topk."
-            )
-
-        _, default_indices = default_compute_topk(
-            scores,
-            topk,
-            num_groups=num_groups,
-            group_topk=group_topk,
-        )
-        effective_topk_idx = target_topk_idx.clone()
-        effective_topk_idx[fallback_mask] = default_indices[fallback_mask]
-        probs = scores.gather(1, effective_topk_idx)
-
-        if action == RouterReplayAction.REPLAY_FORWARD:
-            replay_backward_list = getattr(replay_instance, "replay_backward_list", [])
-            if replay_backward_list:
-                replay_backward_list[-1] = effective_topk_idx.detach()
-        else:
-            getattr(replay_instance, "replay_backward_list").pop(0)
-
-        return probs, effective_topk_idx
-
-    setattr(wrapped_get_replay_topk, _MISSING_ROUTE_FALLBACK_PATCH_ATTR, True)
-    RouterReplay.get_replay_topk = wrapped_get_replay_topk
+    RouterReplay.get_replay_topk = _original_get_replay_topk
+    _original_get_replay_topk = None
 
 
 def _get_tensor_model_parallel_world_size() -> int:
@@ -475,7 +501,7 @@ def build_router_replay_assignments(
 def set_router_replay_forward(model: Any, routed_experts: torch.Tensor) -> None:
     from megatron.core.transformer.moe.router_replay import RouterReplayAction
 
-    _install_missing_route_fallback_patch()
+    _install_get_replay_topk_wrapper()
     for replay_instance, replay_tensor in build_router_replay_assignments(
         model, routed_experts
     ):
