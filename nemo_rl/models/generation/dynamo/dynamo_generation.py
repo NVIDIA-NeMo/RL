@@ -32,6 +32,7 @@ import torch
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation.dynamo.config import DynamoConfig
+from nemo_rl.models.generation.dynamo.token_wrapper import DynamoTokenWrapperServer
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
@@ -324,26 +325,26 @@ def _discover_worker_instances(
     if not isinstance(instances, list):
         return []
 
-    seen_ids: set[Any] = set()
-    out: list[dict[str, Any]] = []
+    seen_by_id: dict[Any, dict[str, Any]] = {}
     # ``transport.tcp`` is ``<pod_ip>:<port>/<channel>/<endpoint>`` with no
     # scheme prefix; we just need the host part.
     tcp_re = re.compile(r"^(?:tcp://)?([^:/]+):")
+    refit_discovery_endpoints = {"update_weights_via_mx", "rl"}
     for inst in instances:
         if not isinstance(inst, dict):
             continue
         if inst.get("namespace") not in dyn_namespaces:
             continue
-        # Only the vLLM worker (component "backend") serves the
-        # /engine/update_weights_via_mx admin route. Filter on that endpoint
-        # so we skip the LocalRouter / Planner / GlobalRouter / GlobalPlanner
-        # pods that also register in these namespaces — POSTing /engine/* to
-        # them resets the connection (they don't serve it). This is correct in
-        # the flat topology too (the single worker registers this endpoint).
-        if inst.get("endpoint") != "update_weights_via_mx":
+        # Only the vLLM worker (component "backend") serves the /engine/*
+        # admin routes. Older Dynamo images expose update_weights_via_mx as a
+        # top-level endpoint; newer --enable-rl images expose a single rl
+        # endpoint whose route descriptors include update_weights_via_mx.
+        if inst.get("component") != "backend":
+            continue
+        if inst.get("endpoint") not in refit_discovery_endpoints:
             continue
         inst_id = inst.get("instance_id")
-        if inst_id is None or inst_id in seen_ids:
+        if inst_id is None:
             continue
         transport = inst.get("transport") or {}
         tcp = transport.get("tcp") if isinstance(transport, dict) else None
@@ -353,14 +354,17 @@ def _discover_worker_instances(
         if not m:
             continue
         pod_ip = m.group(1)
-        seen_ids.add(inst_id)
-        out.append(
+        worker = seen_by_id.setdefault(
+            inst_id,
             {
                 "instance_id": inst_id,
                 "system_url": f"http://{pod_ip}:{dyn_system_port}",
-            }
+                "requires_pause": False,
+            },
         )
-    return out
+        if inst.get("endpoint") == "rl":
+            worker["requires_pause"] = True
+    return list(seen_by_id.values())
 
 
 @ray.remote(num_cpus=0)
@@ -385,12 +389,10 @@ def _dispatch_update_weights_via_mx_remote(
          → enumerate worker pods from ``instances[*]``
          → key by ``instance_id``; system_url = http://<pod_ip>:<DYN_SYSTEM_PORT>
       2. For each NEW worker (not already refitted in this cycle):
-         a. POST /engine/update_weights_via_mx  (real NIXL receive, blocks)
-         b. POST /engine/flush_cache            (drop stale prefix cache)
-         No pause/resume: update_weights_via_mx is a vLLM collective_rpc that
-         runs between engine steps, pausing (not aborting) in-flight requests
-         which resume on the new weights — matching NeMo-RL's direct vLLM
-         backend. See _refit_one for the rationale.
+         a. New --enable-rl workers: pause generation with mode="keep".
+         b. POST /engine/update_weights_via_mx  (real NIXL receive, blocks)
+         c. POST /engine/flush_cache            (drop stale prefix cache)
+         d. New --enable-rl workers: resume generation.
       3. Re-discover via /health. If new instance_ids appeared (a worker
          scaled in or restarted during the cycle), go to step 2.
       4. Once a discovery shows no new instance_ids, return.
@@ -503,16 +505,11 @@ def _dispatch_update_weights_via_mx_remote(
         def _refit_one(inst: dict[str, Any]) -> tuple[Any, list[str], dict[str, Any]]:
             """One pod's refit (with retry) → flush.
 
-            No pause/resume around the refit: ``update_weights_via_mx`` runs as
-            a vLLM ``collective_rpc``, which executes between engine steps and
-            therefore *pauses* (not aborts) any in-flight requests — they resume
-            on the new weights once the receive returns. This matches NeMo-RL's
-            direct vLLM backend (vllm_worker.update_weights_via_mx), which calls
-            the same collective RPC with no surrounding pause/abort. The old
-            pause_generation step defaulted to mode="abort", which *killed*
-            in-flight rollouts → empty completions → downstream crashes
-            (BackendUnknown in the LocalRouter, IndexError on choices[0] in the
-            gym). flush_cache is kept — it mirrors the direct backend's
+            New Dynamo ``--enable-rl`` workers expose a single ``rl`` endpoint
+            and require an explicit pause before weight mutation. Use
+            ``mode="keep"`` so in-flight requests are held rather than aborted.
+            Legacy workers that expose ``update_weights_via_mx`` directly keep
+            the old no-pause path. ``flush_cache`` mirrors the direct backend's
             reset_prefix_cache, dropping prefix-cache entries computed on the
             old weights.
 
@@ -521,32 +518,54 @@ def _dispatch_update_weights_via_mx_remote(
             """
             sys_url = inst["system_url"]
             inst_id = inst["instance_id"]
+            requires_pause = bool(inst.get("requires_pause", False))
             steps: dict[str, Any] = {}
             failure_msgs: list[str] = []
 
+            if requires_pause:
+                r_pause = _step(
+                    sys_url,
+                    "pause_generation",
+                    {"mode": "keep", "clear_cache": False},
+                    admin_timeout_s,
+                )
+                steps["pause"] = r_pause
+                if r_pause.get("status") != "ok":
+                    failure_msgs.append(f"pause@{sys_url}({inst_id}): {r_pause}")
+                    return inst_id, failure_msgs, steps
+
             attempt = 0
             r_refit = {"status": "error", "reason": "not attempted"}
-            while True:
-                attempt += 1
-                r_refit = _step(
-                    sys_url, "update_weights_via_mx", payload, refit_timeout_s
-                )
-                steps["refit"] = r_refit
-                if r_refit.get("status") == "ok":
-                    break
-                if _time.monotonic() >= _cycle_deadline:
-                    failure_msgs.append(
-                        f"refit@{sys_url}({inst_id}) after {attempt} attempts "
-                        f"(deadline exceeded): {r_refit}"
+            try:
+                while True:
+                    attempt += 1
+                    r_refit = _step(
+                        sys_url, "update_weights_via_mx", payload, refit_timeout_s
                     )
-                    break
-                _time.sleep(min(3.0, 0.5 * attempt))
-            steps["refit_attempts"] = attempt
+                    steps["refit"] = r_refit
+                    if r_refit.get("status") == "ok":
+                        break
+                    if _time.monotonic() >= _cycle_deadline:
+                        failure_msgs.append(
+                            f"refit@{sys_url}({inst_id}) after {attempt} attempts "
+                            f"(deadline exceeded): {r_refit}"
+                        )
+                        break
+                    _time.sleep(min(3.0, 0.5 * attempt))
+                steps["refit_attempts"] = attempt
 
-            r_flush = _step(sys_url, "flush_cache", {}, admin_timeout_s)
-            steps["flush"] = r_flush
-            if r_flush.get("status") not in ("ok", None):
-                failure_msgs.append(f"flush@{sys_url}({inst_id}): {r_flush}")
+                r_flush = _step(sys_url, "flush_cache", {}, admin_timeout_s)
+                steps["flush"] = r_flush
+                if r_flush.get("status") not in ("ok", None):
+                    failure_msgs.append(f"flush@{sys_url}({inst_id}): {r_flush}")
+            finally:
+                if requires_pause:
+                    r_resume = _step(sys_url, "resume_generation", {}, admin_timeout_s)
+                    steps["resume"] = r_resume
+                    if r_resume.get("status") != "ok":
+                        failure_msgs.append(
+                            f"resume@{sys_url}({inst_id}): {r_resume}"
+                        )
 
             return inst_id, failure_msgs, steps
 
@@ -662,6 +681,8 @@ class DynamoGeneration(GenerationInterface):
         config: DynamoConfig,
         name_prefix: str = "dynamo",
         workers_per_node: Optional[Union[int, list[int]]] = None,
+        tokenizer: Any | None = None,
+        tokenizer_config: Optional[dict[str, Any]] = None,
     ):
         self.cfg = config
         dynamo_cfg = config.get("dynamo_cfg", {}) or {}
@@ -673,8 +694,51 @@ class DynamoGeneration(GenerationInterface):
                 "Either run inside a pod, or set "
                 "policy.generation.dynamo_cfg.frontend_url to a reachable URL."
             )
-        self.dp_openai_server_base_urls: list[Optional[str]] = [url]
-        print(f"  [Dynamo] Forwarding rollouts to {url}", flush=True)
+        self._dynamo_frontend_base_url = url
+        self._token_wrapper_server: Optional[DynamoTokenWrapperServer] = None
+
+        vllm_cfg = config.get("vllm_cfg") or {}
+        if vllm_cfg.get("expose_http_server"):
+            if tokenizer is None:
+                raise RuntimeError(
+                    "DynamoGeneration requires a tokenizer when exposing an "
+                    "OpenAI-compatible rollout server."
+                )
+            tokenizer_chat_template_kwargs: Optional[dict[str, Any]] = None
+            if (
+                tokenizer_config is not None
+                and "chat_template_kwargs" in tokenizer_config
+                and tokenizer_config["chat_template_kwargs"] is not None
+            ):
+                chat_template_kwargs = tokenizer_config["chat_template_kwargs"]
+                if not isinstance(chat_template_kwargs, dict):
+                    raise RuntimeError(
+                        "policy.tokenizer.chat_template_kwargs must be a dictionary."
+                    )
+                tokenizer_chat_template_kwargs = dict(chat_template_kwargs)
+
+            request_timeout_s: Optional[float] = None
+            if (
+                "request_timeout_s" in dynamo_cfg
+                and dynamo_cfg["request_timeout_s"] is not None
+            ):
+                request_timeout_s = float(dynamo_cfg["request_timeout_s"])
+            self._token_wrapper_server = DynamoTokenWrapperServer(
+                dynamo_frontend_base_url=url,
+                tokenizer=tokenizer,
+                tokenizer_chat_template_kwargs=tokenizer_chat_template_kwargs,
+                request_timeout_s=request_timeout_s,
+            )
+            wrapper_url = self._token_wrapper_server.start()
+            self.dp_openai_server_base_urls: list[Optional[str]] = [wrapper_url]
+            print(
+                "  [Dynamo] Forwarding rollout chat requests through token "
+                f"wrapper {wrapper_url} -> {url}",
+                flush=True,
+            )
+        else:
+            self.dp_openai_server_base_urls = [url]
+            print(f"  [Dynamo] Forwarding rollouts to {url}", flush=True)
 
         # --- Engine-telemetry sampler (Dynamo → nemo-rl generation_metrics/*) ---
         # Gated by vllm_cfg.enable_vllm_metrics_logger — the same flag grpo.py
@@ -682,7 +746,6 @@ class DynamoGeneration(GenerationInterface):
         # single recipe switch turns both the gate and this sampler on together.
         # Worker discovery needs the in-cluster /health path, so a frontend_url /
         # non-k8s construction (local tests) skips the sampler.
-        vllm_cfg = config.get("vllm_cfg") or {}
         self._metrics_enabled = bool(vllm_cfg.get("enable_vllm_metrics_logger", False))
         self._metrics_interval_s = float(
             vllm_cfg.get("vllm_metrics_logger_interval", 0.5) or 0.5
@@ -862,10 +925,13 @@ class DynamoGeneration(GenerationInterface):
     def shutdown(self) -> bool:
         # The DGD lifecycle is owned by Kubernetes (the dynamo operator); we
         # have nothing to tear down on the nemo-rl side — just stop the
-        # telemetry sampler thread if one is running.
+        # telemetry sampler and token-wrapper threads if they are running.
         stop = getattr(self, "_dyn_metrics_stop", None)
         if stop is not None:
             stop.set()
+        token_wrapper_server = getattr(self, "_token_wrapper_server", None)
+        if token_wrapper_server is not None:
+            token_wrapper_server.shutdown()
         return True
 
     # ------------------------------------------------------------------
@@ -876,14 +942,20 @@ class DynamoGeneration(GenerationInterface):
         return {
             "cfg": self.cfg,
             "dp_openai_server_base_urls": self.dp_openai_server_base_urls,
+            "_dynamo_frontend_base_url": self._dynamo_frontend_base_url,
         }
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         self.cfg = state["cfg"]
         self.dp_openai_server_base_urls = state["dp_openai_server_base_urls"]
+        self._dynamo_frontend_base_url = state.get(
+            "_dynamo_frontend_base_url",
+            self.dp_openai_server_base_urls[0],
+        )
+        self._token_wrapper_server = None
 
     def _completion_url(self) -> str:
-        base_url = self.dp_openai_server_base_urls[0]
+        base_url = self._dynamo_frontend_base_url
         if not base_url:
             raise RuntimeError("DynamoGeneration does not have a frontend URL.")
         return f"{base_url.rstrip('/')}/completions"

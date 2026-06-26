@@ -88,6 +88,7 @@ spec:
             - nvidia/NVIDIA-Nemotron-Nano-9B-v2
             - --served-model-name
             - nvidia/NVIDIA-Nemotron-Nano-9B-v2
+            - --enable-rl
             - --load-format
             - mx
             - --model-express-url

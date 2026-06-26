@@ -793,7 +793,12 @@ def setup(
 
         def init_dynamo():
             t0 = time.perf_counter()
-            pg = DynamoGeneration(cluster=inference_cluster, config=generation_config)
+            pg = DynamoGeneration(
+                cluster=inference_cluster,
+                config=generation_config,
+                tokenizer=tokenizer,
+                tokenizer_config=policy_config["tokenizer"],
+            )
             return pg, time.perf_counter() - t0
 
         policy_generation, policy = initialize_generation_with_policy(

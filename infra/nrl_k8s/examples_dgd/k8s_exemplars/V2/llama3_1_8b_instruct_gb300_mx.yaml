@@ -90,6 +90,7 @@ spec:
             - meta-llama/Llama-3.1-8B-Instruct
             - --served-model-name
             - meta-llama/Llama-3.1-8B-Instruct
+            - --enable-rl
             - --load-format
             - mx
             - --model-express-url

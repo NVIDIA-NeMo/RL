@@ -78,6 +78,7 @@ spec:
           args:
             - --model
             - Qwen/Qwen3-4B-Thinking-2507
+            - --enable-rl
             - --tensor-parallel-size
             - "1"
             - --gpu-memory-utilization
