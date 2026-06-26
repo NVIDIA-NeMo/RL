@@ -356,6 +356,11 @@ def setup(
         collate_fn=collator,
         drop_last=True,
         num_workers=data_config["num_workers"],
+        # Keep workers (and their collator: teacher tokenizers + aligner +
+        # projection) alive across epochs. Without this, small datasets looped
+        # via max_num_epochs respawn+re-init all workers at every epoch
+        # boundary, which dominates step time when the epoch is short.
+        persistent_workers=data_config["num_workers"] > 0,
     )
     if last_checkpoint_path:
         load_dataloader_state(train_dataloader, last_checkpoint_path, data_config)
@@ -377,6 +382,7 @@ def setup(
             collate_fn=collator,
             drop_last=False,
             num_workers=data_config["num_workers"],
+            persistent_workers=data_config["num_workers"] > 0,
         )
         print(
             f"  ✓ Validation dataloader loaded with {len(val_dataset)} samples",
