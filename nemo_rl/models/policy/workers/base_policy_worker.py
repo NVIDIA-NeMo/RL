@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 from typing import Any, Optional
 
 import ray
@@ -87,7 +88,18 @@ class AbstractPolicyWorker:
                 zmq.RCVTIMEO, 120000
             )  # set timeout to 120 seconds
             self.zmq_socket.setsockopt(zmq.LINGER, 0)
-            self.zmq_socket.bind(self.get_zmq_address())
+            addr = self.get_zmq_address()
+            # Self-heal stale IPC sockets: an unclean exit (crash, kill -9, OOM) can skip
+            # shutdown(), so the prior run's ipc:// socket file can be left on disk and the
+            # bind below would fail with EADDRINUSE. The address is keyed by GPU UUID and
+            # each GPU maps to exactly one worker, so any existing file is a stale leftover
+            # (never a live binder) and is safe to remove. Runs per-worker, so it self-heals
+            # every node in a multinode run.
+            if addr.startswith("ipc://"):
+                stale_socket_path = addr[len("ipc://") :]
+                if os.path.exists(stale_socket_path):
+                    os.unlink(stale_socket_path)
+            self.zmq_socket.bind(addr)
 
     def get_free_memory_bytes(self) -> int:
         """Get the available free memory."""

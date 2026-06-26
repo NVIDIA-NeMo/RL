@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import datetime
 import hashlib
 import json
 import os
@@ -159,8 +160,16 @@ def setup_distributed() -> None:
     destroy_parallel_state()
     # Pin the communicator to the correct GPU explicitly.
     local_rank = int(os.environ["LOCAL_RANK"])
+    # Provision to raise the default NCCL collective timeout: the HF->Megatron distcp reshard and the
+    # policy->vLLM refit can do very large cross-node collectives that can exceed the default timeout,
+    # especially over the slower Socket NCCL fallback (NCCL_NET=Socket). This sets _DEFAULT_PG_TIMEOUT,
+    # which later new_group() calls (megatron TP/PP/DP/EP/CP groups) inherit. Override via
+    # NRL_DIST_TIMEOUT_MINUTES (default 10 mins).
+    dist_timeout_min = int(os.environ.get("NRL_DIST_TIMEOUT_MINUTES", "10"))
     torch.distributed.init_process_group(
-        "nccl", device_id=torch.device(f"cuda:{local_rank}")
+        "nccl",
+        device_id=torch.device(f"cuda:{local_rank}"),
+        timeout=datetime.timedelta(minutes=dist_timeout_min),
     )
 
 
