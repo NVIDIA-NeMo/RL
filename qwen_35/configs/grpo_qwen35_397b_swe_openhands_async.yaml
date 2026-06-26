@@ -14,7 +14,7 @@ grpo:
   max_num_steps: 8
   normalize_rewards: true
   use_leave_one_out_baseline: true
-  val_period: 5
+  val_period: 2
   val_at_start: true
   val_at_end: false
   overlong_filtering: true
@@ -284,7 +284,7 @@ env:
             agent_cls: CodeActAgent
             diversify_tool_names: false
           agent_max_turns: 30
-          swebench_agent_timeout: 360
+          swebench_agent_timeout: 600
           swebench_tests_timeout: 300
           concurrency: 256
           base_results_dir: /logs/nemo_gym/swe_agents_train
@@ -295,7 +295,7 @@ env:
       responses_api_agents:
         swe_agents:
           agent_max_turns: 30
-          swebench_agent_timeout: 180
+          swebench_agent_timeout: 600
           swebench_tests_timeout: 180
           concurrency: 256
           base_results_dir: /logs/nemo_gym/swe_agents_val

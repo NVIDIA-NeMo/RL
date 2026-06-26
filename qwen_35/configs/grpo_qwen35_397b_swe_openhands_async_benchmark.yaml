@@ -28,4 +28,4 @@ env:
     swe_agents_val:
       responses_api_agents:
         swe_agents:
-          swebench_agent_timeout: 360
+          swebench_agent_timeout: 600
