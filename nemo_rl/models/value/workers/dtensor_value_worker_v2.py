@@ -53,7 +53,6 @@ from nemo_rl.models.automodel.train import (
     forward_with_post_processing_fn,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
-
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.interfaces import ValueOutputSpec
@@ -521,7 +520,7 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
         self.model.eval()
         torch.cuda.empty_cache()
 
-    def finish_training(self, *args: Any, **kwargs: Any) -> None:
+    def finish_training(self) -> None:
         """Offload value model and optimizer state after training."""
         self.model = self.move_to_cpu(self.model)
         self.model.eval()
@@ -532,7 +531,7 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
         gc.collect()
         torch.cuda.empty_cache()
 
-    def finish_inference(self, *args: Any, **kwargs: Any) -> None:
+    def finish_inference(self) -> None:
         """Offload value model parameters after inference."""
         self.model = self.move_to_cpu(self.model)
 

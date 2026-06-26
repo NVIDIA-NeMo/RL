@@ -1218,8 +1218,8 @@ class DTensorPolicyWorkerV2Impl(
 
         torch.cuda.empty_cache()
 
-    def finish_inference(self, *args: Any, **kwargs: Any) -> None:
-        """Offload policy model parameters after inference."""
+    def finish_inference(self) -> None:
+        """Offload model params to CPU after inference. Only used in PPO."""
         self.model = self.move_to_cpu(self.model)
         self.model.eval()
 
