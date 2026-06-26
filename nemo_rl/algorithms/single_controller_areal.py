@@ -31,7 +31,10 @@ Data flow:
                      finish_train_step (one optimizer.step each).
                  → PUBLISH (once): dp_client.clear_samples; bump trainer_version;
                      WeightSynchronizer.sync_weights via _sync_weights.
-  _sync_weights  → drain _inflight_rollouts → WeightSynchronizer.sync_weights.
+  _sync_weights  → AReaL interruptible refit (NO drain): pause _rollout_permitted
+                   → WeightSynchronizer.sync_weights (in-place) → invalidate_kv_cache(
+                   reset_running_requests=True) when refit_invalidate_kv_cache →
+                   set_weight_version → resume.
 """
 
 from __future__ import annotations
@@ -83,7 +86,8 @@ class SingleControllerArealActor:
       - _rollout_pump: dispatches prompts via RolloutManager; reserve+commit in
         TQReplayBuffer preserves dispatch order
       - _train_pump:   evicts stale groups, samples a batch, trains, drops it
-      - _sync_weights: drain gate + weight synchronization
+      - _sync_weights: AReaL interruptible refit (pause→swap→invalidate KV→resume),
+        no in-flight drain
 
     All other actors are passive — they expose methods and wait to be called.
     """
@@ -157,6 +161,25 @@ class SingleControllerArealActor:
         # num_minibatches is DERIVED (not a config knob): how many
         # train_global_batch_size optimizer steps tile one RL-step batch.
         self._num_minibatches: int = rl_step_samples // train_gbs
+
+        # AReaL decoupled-PPO REQUIRES the always-on π_prox/π_behav importance-
+        # sampling reweight (AReaL's unconditional `pg_loss *= behav_imp_weight`,
+        # §6/§11). In NeMo that is loss_fn.use_importance_sampling_correction=True,
+        # and with prev_logprobs := frozen π_prox the loss reproduces AReaL's
+        # decoupled objective exactly. With it False the IS weight is silently
+        # dropped and the loss degrades to a plain clip against prev_logprobs —
+        # NOT the decoupled-PPO objective — which diverges on the off-policy/stale
+        # samples this whole design exists to consume. Fail LOUD here (mirrors the
+        # legacy async entrypoint grpo.py:3062) rather than train a wrong objective.
+        if self._master_config.loss_fn.use_importance_sampling_correction is not True:
+            raise ValueError(
+                "AReaL decoupled-PPO requires "
+                "loss_fn.use_importance_sampling_correction=true: the always-on "
+                "π_prox/π_behav importance-sampling reweight is the decoupled "
+                "objective's staleness correction. With it off the loss degrades "
+                "to plain clip-against-prev_logprobs and diverges on the "
+                "off-policy/stale samples this controller is built to consume."
+            )
 
         if self._async_cfg.batch_selection_strategy == "strict_on_policy":
             self._async_cfg.max_weight_staleness_versions = 0
@@ -422,7 +445,23 @@ class SingleControllerArealActor:
 
         # Reference logprobs stay optional/gated; π_prox (prev_logprobs) is always
         # frozen in Phase 1 below regardless of the advantage config.
-        compute_reference_logprobs = adv_cfg.reference_logprobs_field is not None
+        # Gate on the reference model ACTUALLY existing: setup only builds it when
+        # reference_policy_kl_penalty > 0 (single_controller_utils/setup.py:180).
+        # AReaL's decoupled loss uses KL=0, so the reference forward is skipped
+        # (π_prox = prev_logprobs is the trust-region anchor, not a separate
+        # reference policy). Without the KL gate, reference_logprobs_field defaults
+        # non-None and get_reference_policy_logprobs_from_meta would hit
+        # `MegatronPolicyWorker has no attribute 'reference_state_dict'`.
+        compute_reference_logprobs = (
+            adv_cfg.reference_logprobs_field is not None
+            and self._master_config.loss_fn.reference_policy_kl_penalty > 0
+        )
+        if not compute_reference_logprobs:
+            # Keep the advantage stage consistent: with no reference model the
+            # reference_logprobs field is never written, so _advantage_pump and
+            # _advantage_input_fields must not try to read it (they gate on this
+            # field being None). One source of truth for "no reference logprobs".
+            adv_cfg.reference_logprobs_field = None
 
         while self._train_steps < grpo_cfg["max_num_steps"]:
             step_id = f"sc-step-{self._train_steps:06d}"
@@ -764,40 +803,55 @@ class SingleControllerArealActor:
 
 
     async def _sync_weights(self) -> None:
-        """Drain in-flight rollouts then synchronize weights.
+        """AReaL-style interruptible refit, native to the controller.
 
-        SC owns the drain gate (when to sync); WeightSynchronizer owns how.
+        Idea borrowed from the legacy prepare/resume_after_refit; the code is our
+        own. No per-request abort and NO in-flight drain: pause NEW generation
+        starts, update weights in place while in-flight decode keeps running,
+        optionally invalidate KV so ongoing requests reprefill under the new
+        weights, then resume. Staleness is bounded by the #2819 StalenessSampler
+        at consumption, not by gating production on a drain.
 
         Flow:
-          1. _rollout_permitted.clear()  — no new dispatches
-          2. drain _inflight_rollouts → 0  (5ms poll)
-          3. weight_synchronizer.sync_weights(trainer_version)
-          4. _rollout_permitted.set()   — resume
+          1. _rollout_permitted.clear()           — pause NEW generation starts
+          2. weight_synchronizer.sync_weights     — update_weights_* in place
+          3. invalidate_kv_cache(reset_running_requests=True) when configured
+             — vLLM preempts running requests, frees old-weight KV, reschedules
+               them so they reprefill under the new weights (scheduler.py:2147).
+               Without the flag the reset is a no-op while requests hold KV
+               (block_pool.py:665), leaving stale KV (Magistral-style).
+          4. set_weight_version(trainer_version)
+          5. _rollout_permitted.set()             — resume NEW starts
         """
+        # 1. Pause NEW generation starts. In-flight generate_async() coroutines
+        #    keep decoding with current KV while the weights swap underneath them
+        #    — we do NOT wait for any _inflight_rollouts counter (no drain).
         self._rollout_permitted.clear()
+        try:
+            # 2. In-place weight update. to_thread because the synchronizer fans out
+            #    + ray.gets internally and must stay off the event loop so in-flight
+            #    generate_async() coroutines keep progressing during refit.
+            t0 = time.monotonic()
+            await asyncio.to_thread(self._weight_synchronizer.sync_weights)
+            elapsed = time.monotonic() - t0
+            print(f"  _sync_weights: sync done in {elapsed:.3f}s", flush=True)
 
-        # TODO: currently sync_weights is not implemented, comment out for now
-        # # Drain: wait for all in-flight rollouts to complete before NCCL
-        # # Critical: if GenWorker has queued calls when NCCL init is dispatched,
-        # # the init sits behind them — trainer blocks in rendezvous → deadlock
-        # drain_start = time.monotonic()
-        # while self._inflight_rollouts > 0:
-        #     await asyncio.sleep(0.005)
+            # 3. AReaL-style recompute: reset_running_requests=True makes vLLM PREEMPT
+            #    the running requests, free their old-weight KV, and reschedule them
+            #    -> they REPREFILL under the new weights and resume. invalidate_kv_cache
+            #    is on self._gen (the generation backend handle), NOT the rollout manager.
+            if self._async_cfg.refit_invalidate_kv_cache:
+                await asyncio.to_thread(
+                    self._gen.invalidate_kv_cache, reset_running_requests=True
+                )
 
-        # drain_elapsed = time.monotonic() - drain_start
-        # print(
-        #     f"  _sync_weights: drained in {drain_elapsed:.3f}s, "
-        #     f"syncing weights v{self._trainer_version}",
-        #     flush=True,
-        # )
-
-        t0 = time.monotonic()
-        await asyncio.to_thread(self._weight_synchronizer.sync_weights)
-        elapsed = time.monotonic() - t0
-
-        print(f"  _sync_weights: sync done in {elapsed:.3f}s", flush=True)
-        self._rollout_manager.set_weight_version(self._trainer_version)
-        self._rollout_permitted.set()
+            # 4. Publish the new weight version.
+            self._rollout_manager.set_weight_version(self._trainer_version)
+        finally:
+            # 5. ALWAYS resume NEW starts — even if sync_weights/invalidate_kv_cache
+            #    raised — so the rollout pump can never be left parked forever at
+            #    `await self._rollout_permitted.wait()` (which would hang shutdown).
+            self._rollout_permitted.set()
 
     async def _advantage_pump(self, meta: KVBatchMeta) -> KVBatchMeta:
         """Fetch advantage inputs, compute advantages, and write them back.

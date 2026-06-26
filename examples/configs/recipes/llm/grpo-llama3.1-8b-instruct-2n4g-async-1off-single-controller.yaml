@@ -1,0 +1,41 @@
+# SingleController variant of grpo-llama3.1-8b-instruct-2n4g-async-1off.yaml.
+# Same training topology (2 nodes x 4 GPUs, non-colocated) and async-1off
+# strategy; the SC path routes everything through the TransferQueue data plane
+# + SingleControllerActor. staleness_window + over_sampling=false replicate the
+# per-version dispatch quota of the original async-grpo path.
+defaults: ./performance/grpo-llama3.1-8b-instruct-2n4g-async-1off.yaml
+
+logger:
+  log_dir: logs/grpo-llama3.1-8b-instruct-2n4g-async-1off-sc
+  wandb:
+    project: areal
+    name: grpo-llama3.1-8b-instruct-2n4g-async-1off-sc
+
+checkpointing:
+  checkpoint_dir: results/grpo-llama3.1-8b-instruct-2n4g-async-1off-sc
+
+policy:
+  # The SC/AReaL controller asserts num_prompts_per_step * num_generations_per_prompt
+  # (64 * 32 = 2048) == train_global_batch_size, so each RL-step batch is one
+  # minibatch / one optimizer.step. The 2n4g base leaves train_global_batch_size at
+  # the grpo_math_1B default (512), so set it explicitly here. 2048 % dp_world(=4)==0.
+  train_global_batch_size: 2048
+
+# TransferQueue data plane is mandatory for the SingleController path.
+data_plane:
+  enabled: true
+
+# SC async-RL runtime knobs.
+async_rl:
+  # Matches grpo.async_grpo.max_trajectory_age_steps=1.
+  max_weight_staleness_versions: 1
+  # One training step consumes grpo.num_prompts_per_step (=64) prompt groups.
+  min_prompt_groups_per_batch: 64
+  batch_selection_strategy: staleness_window
+  max_inflight_prompts: ${grpo.num_prompts_per_step}  # match grpo-llama3.1-8b-instruct-2n4g-async-1off
+  # over_sampling=false requires
+  #   max_buffered_rollouts == target_prompt_groups_per_step * (max_weight_staleness_versions + 1)
+  #   64 * (1 + 1) = 128
+  max_buffered_rollouts: 128
+  over_sampling: false
+  force_in_order: true
