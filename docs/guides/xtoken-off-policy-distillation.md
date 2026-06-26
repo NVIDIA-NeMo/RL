@@ -271,10 +271,6 @@ Benchmark scores of the distilled student against the undistilled
 |---|---|---|
 | MMLU | 32.05 | 40.24 |
 | GSM8K | 5.69 | 5.76 |
-| HellaSwag | 65.08 | 62.53 |
-| Winogrande | 61.48 | 61.48 |
-| MATH | 5.48 | 4.52 |
-| **Avg** | **33.96** | **34.91** |
 
 ### Throughput and memory
 
