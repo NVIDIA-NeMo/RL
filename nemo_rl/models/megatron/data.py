@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Iterator, Optional, Tuple
@@ -21,6 +23,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_rank,
     get_context_parallel_world_size,
+    get_expert_tensor_and_model_parallel_group,
 )
 from megatron.core.utils import StragglerDetector
 
@@ -32,6 +35,9 @@ from nemo_rl.utils.r3_trace import (
     r3_trace_verify_forward_enabled,
     trace_cp_routed_experts,
 )
+
+logger = logging.getLogger(__name__)
+_HYBRIDEP_PACKING_LOG_CALLS = 0
 
 
 @dataclass
@@ -45,6 +51,7 @@ class ProcessedInputs:
     packed_seq_params: Optional[PackedSeqParams]
     cu_seqlens_padded: Optional[torch.Tensor]
     mtp_loss_mask: Optional[torch.Tensor] = None
+    padding_mask: Optional[torch.Tensor] = None
     routed_experts: Optional[torch.Tensor] = None
     routed_experts_cp_sharded: Optional[torch.Tensor] = None
 
@@ -66,6 +73,7 @@ class ProcessedMicrobatch:
         cu_seqlens_padded: Padded cumulative sequence lengths (None if not packing)
         mtp_loss_mask: Pre-computed MTP loss mask (token_mask × sample_mask).
             None when MTP is disabled or token/sample masks are absent.
+        padding_mask: Padding mask for packed HybridEP fake tokens.
         routed_experts: Optional token-aligned routed expert ids
         routed_experts_cp_sharded: Context-parallel sharded routed expert ids
     """
@@ -78,6 +86,7 @@ class ProcessedMicrobatch:
     packed_seq_params: Optional[PackedSeqParams]
     cu_seqlens_padded: Optional[torch.Tensor]
     mtp_loss_mask: Optional[torch.Tensor] = None
+    padding_mask: Optional[torch.Tensor] = None
     routed_experts: Optional[torch.Tensor] = None
     routed_experts_cp_sharded: Optional[torch.Tensor] = None
 
@@ -90,6 +99,7 @@ def make_processed_microbatch_iterator(
     pad_packed_seq_to_multiple_of: int,
     straggler_timer: StragglerDetector,
     pad_full_seq_to: Optional[int],
+    pad_packed_seq_for_hybridep: bool = False,
     delegate_pack_to_model: bool = False,
 ) -> Iterator[ProcessedMicrobatch]:
     """Wrap a raw microbatch iterator to yield processed microbatches.
@@ -105,6 +115,8 @@ def make_processed_microbatch_iterator(
         pad_individual_seqs_to_multiple_of: Padding multiple for individual sequences
         pad_packed_seq_to_multiple_of: Padding multiple for packed sequences
         pad_full_seq_to: Target length for full sequence padding (optional)
+        pad_packed_seq_for_hybridep: Pad CP=1 packed sequences to a TPxEP-wide
+            length for HybridEP metadata preprocessing.
 
     Yields:
         ProcessedMicrobatch objects containing processed tensors ready for model forward
@@ -125,6 +137,7 @@ def make_processed_microbatch_iterator(
             pack_sequences=pack_sequences,
             delegate_pack_to_model=delegate_pack_to_model,
             straggler_timer=straggler_timer,
+            pad_packed_seq_for_hybridep=pad_packed_seq_for_hybridep,
         )
 
         yield ProcessedMicrobatch(
@@ -136,6 +149,7 @@ def make_processed_microbatch_iterator(
             packed_seq_params=processed_inputs.packed_seq_params,
             cu_seqlens_padded=processed_inputs.cu_seqlens_padded,
             mtp_loss_mask=processed_inputs.mtp_loss_mask,
+            padding_mask=processed_inputs.padding_mask,
             routed_experts=processed_inputs.routed_experts,
             routed_experts_cp_sharded=processed_inputs.routed_experts_cp_sharded,
         )
@@ -173,6 +187,7 @@ def get_microbatch_iterator(
     pad_factor = 1
     pad_full_seq_to = None
     pad_packed_seq_to_multiple_of = 1
+    pad_packed_seq_for_hybridep = _uses_hybridep_flex_dispatcher(cfg["megatron_cfg"])
 
     _, seq_dim_size = get_and_validate_seqlen(data)
 
@@ -211,6 +226,7 @@ def get_microbatch_iterator(
         pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
         pad_full_seq_to=pad_full_seq_to,
         straggler_timer=straggler_timer,
+        pad_packed_seq_for_hybridep=pad_packed_seq_for_hybridep,
         delegate_pack_to_model=delegate_pack_to_model,
     )
 
@@ -238,6 +254,243 @@ def get_ltor_masks_and_position_ids(*args: Any, **kwargs: Any) -> Any:
     return _impl(*args, **kwargs)
 
 
+def _uses_hybridep_flex_dispatcher(megatron_cfg: dict[str, Any]) -> bool:
+    return (
+        megatron_cfg.get("moe_token_dispatcher_type") == "flex"
+        and megatron_cfg.get("moe_flex_dispatcher_backend") == "hybridep"
+    )
+
+
+def _get_hybridep_aligned_seq_len(
+    local_seq_len: int,
+    multiple: int,
+    device: torch.device,
+) -> int:
+    target = torch.tensor([local_seq_len], dtype=torch.int64, device=device)
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        group = get_expert_tensor_and_model_parallel_group(check_initialized=False)
+        torch.distributed.all_reduce(target, op=torch.distributed.ReduceOp.MAX, group=group)
+
+    target_seq_len = int(target.item())
+    if multiple > 1:
+        target_seq_len = _round_up_to_multiple(target_seq_len, multiple)
+    return target_seq_len
+
+
+def _get_hybridep_local_pad_multiple(
+    pad_packed_seq_to_multiple_of: int,
+    cp_size: int,
+) -> int:
+    """Convert full packed-sequence alignment into CP-local token alignment."""
+    if cp_size == 1:
+        return pad_packed_seq_to_multiple_of
+    if pad_packed_seq_to_multiple_of <= 1:
+        return 1
+    assert pad_packed_seq_to_multiple_of % cp_size == 0, (
+        "HybridEP packed sequence multiple must be divisible by context "
+        f"parallel size; got multiple={pad_packed_seq_to_multiple_of}, "
+        f"cp_size={cp_size}."
+    )
+    return max(1, pad_packed_seq_to_multiple_of // cp_size)
+
+
+def _get_packed_seq_boundaries(
+    cu_seqlens_padded: torch.Tensor,
+) -> list[tuple[int, int]]:
+    cu_vals = cu_seqlens_padded.detach().cpu().tolist()
+    return [(int(cu_vals[idx]), int(cu_vals[idx + 1])) for idx in range(len(cu_vals) - 1)]
+
+
+def _get_valid_seq_lengths(cu_seqlens: torch.Tensor) -> list[int]:
+    cu_vals = cu_seqlens.detach().cpu().tolist()
+    return [
+        int(cu_vals[idx + 1]) - int(cu_vals[idx]) for idx in range(len(cu_vals) - 1)
+    ]
+
+
+def _shard_packed_seq_on_this_cp_rank(
+    packed_tensor: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+    *,
+    cp_rank: int,
+    cp_size: int,
+    seq_dim: int = 1,
+    packed_boundaries: Optional[list[tuple[int, int]]] = None,
+) -> torch.Tensor:
+    """Shard a packed tensor with the same per-sequence CP zigzag as input_ids."""
+    if cp_size == 1:
+        return packed_tensor
+
+    cp_chunks = []
+    if packed_boundaries is None:
+        packed_boundaries = _get_packed_seq_boundaries(cu_seqlens_padded)
+    for start, end in packed_boundaries:
+        seq_len = end - start
+        assert seq_len % (cp_size * 2) == 0, (
+            "Packed sequence length must be divisible by cp_size * 2 before "
+            f"CP zigzag sharding; got seq_len={seq_len}, cp_size={cp_size}."
+        )
+        slices = [slice(None)] * packed_tensor.dim()
+        slices[seq_dim] = slice(start, end)
+        cp_chunks.append(
+            _get_tokens_on_this_cp_rank(
+                packed_tensor[tuple(slices)],
+                cp_rank,
+                cp_size,
+                seq_dim=seq_dim,
+            )
+        )
+
+    return torch.cat(cp_chunks, dim=seq_dim).contiguous()
+
+
+def _replace_packed_seq_total_tokens(
+    packed_seq_params: PackedSeqParams,
+    cu_seqlens_padded: torch.Tensor,
+    total_tokens: int,
+) -> PackedSeqParams:
+    max_last_sequence_len = int(cu_seqlens_padded[-1] - cu_seqlens_padded[-2])
+    max_seqlen = max(int(packed_seq_params.max_seqlen_q), max_last_sequence_len)
+    return PackedSeqParams(
+        cu_seqlens_q=cu_seqlens_padded,
+        cu_seqlens_kv=cu_seqlens_padded,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_kv=max_seqlen,
+        qkv_format=packed_seq_params.qkv_format,
+        total_tokens=total_tokens,
+    )
+
+
+def _pad_packed_seq_for_hybridep(
+    input_ids: torch.Tensor,
+    input_ids_cp_sharded: torch.Tensor,
+    packed_seq_params: PackedSeqParams,
+    cu_seqlens_padded: torch.Tensor,
+    pad_packed_seq_to_multiple_of: int,
+    cp_rank: int,
+    cp_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, PackedSeqParams, torch.Tensor]:
+    global _HYBRIDEP_PACKING_LOG_CALLS
+
+    local_seq_len = input_ids_cp_sharded.shape[1]
+    local_pad_multiple = _get_hybridep_local_pad_multiple(
+        pad_packed_seq_to_multiple_of,
+        cp_size,
+    )
+    target_seq_len = _get_hybridep_aligned_seq_len(
+        local_seq_len,
+        local_pad_multiple,
+        input_ids_cp_sharded.device,
+    )
+    if os.getenv("NEMO_RL_HYBRIDEP_LOG_PACKING", "0") == "1":
+        max_log_calls = int(os.getenv("NEMO_RL_HYBRIDEP_LOG_PACKING_MAX_CALLS", "32"))
+        if _HYBRIDEP_PACKING_LOG_CALLS < max_log_calls:
+            _HYBRIDEP_PACKING_LOG_CALLS += 1
+            rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_available() and torch.distributed.is_initialized()
+                else 0
+            )
+            log_ranks = {
+                int(rank_str)
+                for rank_str in os.getenv("NEMO_RL_HYBRIDEP_LOG_PACKING_RANKS", "0").split(",")
+                if rank_str.strip()
+            }
+            reduce_group = (
+                os.getenv("NEMO_RL_HYBRIDEP_LOG_PACKING_REDUCE", "1") == "1"
+                and torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+            )
+            group_raw_tokens = local_seq_len
+            group_padded_tokens = target_seq_len
+            if reduce_group:
+                group = get_expert_tensor_and_model_parallel_group(check_initialized=False)
+                totals = torch.tensor(
+                    [local_seq_len, target_seq_len],
+                    dtype=torch.int64,
+                    device=input_ids_cp_sharded.device,
+                )
+                torch.distributed.all_reduce(totals, op=torch.distributed.ReduceOp.SUM, group=group)
+                group_raw_tokens = int(totals[0].item())
+                group_padded_tokens = int(totals[1].item())
+
+            local_added_tokens = target_seq_len - local_seq_len
+            group_added_tokens = group_padded_tokens - group_raw_tokens
+            local_overhead_pct = (
+                100.0 * local_added_tokens / local_seq_len if local_seq_len else 0.0
+            )
+            group_overhead_pct = (
+                100.0 * group_added_tokens / group_raw_tokens if group_raw_tokens else 0.0
+            )
+            if rank in log_ranks:
+                logger.warning(
+                    "HybridEP packed sequence padding: rank=%s call=%s local_tokens=%s "
+                    "target_tokens=%s added_tokens=%s overhead_pct=%.4f "
+                    "group_raw_tokens=%s group_padded_tokens=%s group_added_tokens=%s "
+                    "group_overhead_pct=%.4f pad_multiple=%s cp_size=%s reduce_group=%s",
+                    rank,
+                    _HYBRIDEP_PACKING_LOG_CALLS,
+                    local_seq_len,
+                    target_seq_len,
+                    local_added_tokens,
+                    local_overhead_pct,
+                    group_raw_tokens,
+                    group_padded_tokens,
+                    group_added_tokens,
+                    group_overhead_pct,
+                    local_pad_multiple,
+                    cp_size,
+                    reduce_group,
+                )
+    if target_seq_len == local_seq_len:
+        return input_ids, input_ids_cp_sharded, packed_seq_params, cu_seqlens_padded
+
+    local_pad_len = target_seq_len - local_seq_len
+    full_pad_len = local_pad_len * cp_size
+    input_ids = torch.nn.functional.pad(input_ids, (0, full_pad_len), value=0)
+
+    cu_seqlens_padded = cu_seqlens_padded.clone()
+    cu_seqlens_padded[-1] = cu_seqlens_padded[-1] + full_pad_len
+    packed_boundaries = _get_packed_seq_boundaries(cu_seqlens_padded)
+    input_ids_cp_sharded = _shard_packed_seq_on_this_cp_rank(
+        input_ids,
+        cu_seqlens_padded,
+        cp_rank=cp_rank,
+        cp_size=cp_size,
+        seq_dim=1,
+        packed_boundaries=packed_boundaries,
+    )
+    assert input_ids_cp_sharded.shape[1] == target_seq_len, (
+        "HybridEP CP-local input length must match the aligned target length; "
+        f"got {input_ids_cp_sharded.shape[1]} vs {target_seq_len}."
+    )
+    packed_seq_params = _replace_packed_seq_total_tokens(
+        packed_seq_params=packed_seq_params,
+        cu_seqlens_padded=cu_seqlens_padded,
+        total_tokens=input_ids_cp_sharded.shape[1],
+    )
+    return input_ids, input_ids_cp_sharded, packed_seq_params, cu_seqlens_padded
+
+
+def _get_packed_seq_padding_mask(
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+    total_tokens: int,
+    packed_boundaries: Optional[list[tuple[int, int]]] = None,
+    valid_seq_lengths: Optional[list[int]] = None,
+) -> torch.Tensor:
+    padding_mask = torch.ones((1, total_tokens), dtype=torch.bool, device=cu_seqlens.device)
+    if packed_boundaries is None:
+        packed_boundaries = _get_packed_seq_boundaries(cu_seqlens_padded)
+    if valid_seq_lengths is None:
+        valid_seq_lengths = _get_valid_seq_lengths(cu_seqlens)
+    for (valid_start, _), valid_len in zip(packed_boundaries, valid_seq_lengths):
+        padding_mask[:, valid_start : valid_start + valid_len] = False
+    return padding_mask
+
+
 def process_microbatch(
     data_dict: BatchedDataDict[Any],
     seq_length_key: Optional[str] = None,
@@ -247,6 +500,7 @@ def process_microbatch(
     pack_sequences: bool = False,
     delegate_pack_to_model: bool = False,
     straggler_timer: Optional[StragglerDetector] = None,
+    pad_packed_seq_for_hybridep: bool = False,
 ) -> ProcessedInputs:
     """Process a microbatch for Megatron model forward pass."""
     ctx = straggler_timer(bdata=True) if straggler_timer is not None else nullcontext()
@@ -272,6 +526,7 @@ def process_microbatch(
         cu_seqlens = None
         cu_seqlens_padded = None
         mtp_loss_mask = None
+        padding_mask = None
 
         if pack_sequences:
             # For packed sequences with padded input, we need sequence lengths
@@ -344,6 +599,46 @@ def process_microbatch(
                     cp_rank=get_context_parallel_rank(),
                     cp_size=get_context_parallel_world_size(),
                 )
+
+                cp_rank = get_context_parallel_rank()
+                cp_size = get_context_parallel_world_size()
+                if pad_packed_seq_for_hybridep:
+                    assert cu_seqlens is not None
+                    (
+                        input_ids,
+                        input_ids_cp_sharded,
+                        packed_seq_params,
+                        cu_seqlens_padded,
+                    ) = _pad_packed_seq_for_hybridep(
+                        input_ids=input_ids,
+                        input_ids_cp_sharded=input_ids_cp_sharded,
+                        packed_seq_params=packed_seq_params,
+                        cu_seqlens_padded=cu_seqlens_padded,
+                        pad_packed_seq_to_multiple_of=pad_packed_seq_to_multiple_of,
+                        cp_rank=cp_rank,
+                        cp_size=cp_size,
+                    )
+                    packed_boundaries = _get_packed_seq_boundaries(cu_seqlens_padded)
+                    valid_seq_lengths = _get_valid_seq_lengths(cu_seqlens)
+                    full_padding_mask = _get_packed_seq_padding_mask(
+                        cu_seqlens=cu_seqlens,
+                        cu_seqlens_padded=cu_seqlens_padded,
+                        total_tokens=input_ids.shape[1],
+                        packed_boundaries=packed_boundaries,
+                        valid_seq_lengths=valid_seq_lengths,
+                    )
+                    padding_mask = _shard_packed_seq_on_this_cp_rank(
+                        full_padding_mask,
+                        cu_seqlens_padded,
+                        cp_rank=cp_rank,
+                        cp_size=cp_size,
+                        seq_dim=1,
+                        packed_boundaries=packed_boundaries,
+                    )
+                    assert padding_mask.shape == input_ids_cp_sharded.shape, (
+                        f"padding_mask shape {padding_mask.shape} must match "
+                        f"model input shape {input_ids_cp_sharded.shape}"
+                    )
                 # routed_experts and the R3 trace token identity ride the SAME
                 # per-seq zigzag CP sharding as input_ids, re-derived from
                 # cu_seqlens_padded.
@@ -400,10 +695,21 @@ def process_microbatch(
                         seq_lengths,
                         pad_individual_seqs_to_multiple_of,
                         pad_packed_seq_to_multiple_of,
-                        pad_full_seq_to,
+                        (
+                            int(cu_seqlens_padded[-1].item())
+                            if pad_packed_seq_for_hybridep
+                            and cu_seqlens_padded is not None
+                            else pad_full_seq_to
+                        ),
                         cp_rank=get_context_parallel_rank(),
                         cp_size=get_context_parallel_world_size(),
                     )
+                    if mtp_loss_mask.shape[1] < input_ids_cp_sharded.shape[1]:
+                        mtp_loss_mask = torch.nn.functional.pad(
+                            mtp_loss_mask,
+                            (0, input_ids_cp_sharded.shape[1] - mtp_loss_mask.shape[1]),
+                            value=0,
+                        )
 
                 # For packed sequences, position_ids and attention_mask are typically None
                 # The PackedSeqParams handles all necessary sequence information
@@ -462,6 +768,7 @@ def process_microbatch(
         packed_seq_params=packed_seq_params,
         cu_seqlens_padded=cu_seqlens_padded,
         mtp_loss_mask=mtp_loss_mask,
+        padding_mask=padding_mask,
         routed_experts=routed_experts,
         routed_experts_cp_sharded=routed_experts_cp_sharded,
     )
@@ -1018,7 +1325,10 @@ def _shard_routed_experts_for_cp(
 
     This additive helper is the only routed_experts-specific CP code path.
     """
-    batch_size = seq_lengths.shape[0]
+    seq_lengths_list = [int(seq_len) for seq_len in seq_lengths.detach().cpu().tolist()]
+    padded_boundaries = _get_packed_seq_boundaries(
+        cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
+    )
 
     all_routed = [] if routed_experts is not None else None
     cp_routed = [] if routed_experts is not None else None
@@ -1026,12 +1336,9 @@ def _shard_routed_experts_for_cp(
     cp_identity = [] if token_identity is not None else None
     topk = routed_experts.shape[-1] if routed_experts is not None else None
 
-    for b in range(batch_size):
-        seq_len = int(seq_lengths[b])
-        if cu_seqlens_padded is not None:
-            padded_len = int(cu_seqlens_padded[b + 1] - cu_seqlens_padded[b])
-        else:
-            padded_len = int(cu_seqlens[b + 1] - cu_seqlens[b])
+    for b, seq_len in enumerate(seq_lengths_list):
+        start, end = padded_boundaries[b]
+        padded_len = end - start
 
         if routed_experts is not None:
             # [seq_len, num_moe_layers, topk] padded to the SAME padded_len boundary as
