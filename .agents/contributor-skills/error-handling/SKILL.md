@@ -25,3 +25,19 @@ try:
 except FileNotFoundError:
     print("Failed to open file")
 ```
+
+## Fail Loud, Not Silent
+
+When adding a config option or branch, ask: what does the worst plausible misconfiguration do? If it silently
+produces *wrong results* rather than an error, add a setup-time `assert`/`raise` so it fails loudly at startup
+instead of corrupting a run.
+
+**Examples of silent-wrong worth guarding:**
+- An advantage estimator that needs a real `prev_logprobs` while a loss flag zeroes it (advantage degrades to
+  garbage with no error).
+- An agent routed to a teacher alias that has no worker group (cryptic `KeyError` mid-run instead of a
+  setup-time check).
+- A backend/quantization setting silently ignored for a sub-component.
+
+Prefer failing at `setup()` time over a deep-in-the-loop crash; prefer a crash over silent garbage. If you
+truly can't validate, surface a logged warning rather than nothing.

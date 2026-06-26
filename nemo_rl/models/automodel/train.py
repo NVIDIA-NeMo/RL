@@ -47,6 +47,7 @@ from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     allgather_cp_sharded_tensor,
+    cp_load_balanced_to_contiguous,
     distributed_vocab_topk,
     get_logprobs_from_vocab_parallel_logits,
 )
@@ -988,22 +989,15 @@ class TopkLogitsPostProcessor:
 
 
 class FullLogitsPostProcessor:
-    """Post-processor that returns the full teacher vocab logits unchanged.
+    """Export this rank's raw teacher logits (full vocab, no reduction at the worker).
 
-    Used by cross-tokenizer distillation: the loss fn needs the entire
-    ``[B, S, V_t]`` teacher logits tensor — no vocab reduction is done at
-    the worker. The loss fn either (a) derives a microbatch-global top-k
-    subset internally (``gold_loss=False`` path, matching PT
-    ``global_top_indices`` math) or (b) operates on full vocab directly
-    (``gold_loss=True`` path, matching PT gold). Doing the reduction in
-    the loss fn (not here) keeps transport faithful to the PT reference.
-
-    Output:
-        logits: ``[B, S, V_t]`` raw teacher logits cast to ``float32``.
-
-    v0 limitation: only the no-TP, no-CP, no-seq-packing path is
-    implemented. Asserts on the unsupported configurations — distributed
-    full-vocab gather requires TP-aware reduction not on the smoke path.
+    Used by cross-tokenizer distillation; the loss fn does all vocab
+    reduction (none at the worker) so the distributed result matches the
+    single-GPU PyTorch reference. Teacher TP/CP
+    are supported and may differ from the student's: under TP each rank emits
+    its vocab shard, under CP it allgathers and re-emits its contiguous seq
+    slice; the IPC consumer reassembles the global ``[B, T_t, V_t]``.
+    Sequence packing raises ``NotImplementedError``.
     """
 
     def __init__(
@@ -1031,34 +1025,26 @@ class FullLogitsPostProcessor:
         original_seq_len: int,
         sequence_dim: int = 1,
     ) -> torch.Tensor:
-        if self.cp_size > 1:
-            raise NotImplementedError(
-                "FullLogitsPostProcessor: context_parallel_size > 1 is "
-                "not supported in v0."
-            )
         if self.enable_seq_packing:
             raise NotImplementedError(
                 "FullLogitsPostProcessor: sequence packing is not supported in v0."
             )
         if isinstance(logits, DTensor):
-            tp_group = self.tp_mesh.get_group() if self.tp_mesh is not None else None
-            tp_size = (
-                torch.distributed.get_world_size(tp_group)
-                if tp_group is not None
-                else 1
-            )
-            if tp_size > 1:
-                raise NotImplementedError(
-                    "FullLogitsPostProcessor: tensor_parallel_size > 1 "
-                    "is not supported in v0."
-                )
             logits = logits.to_local()
+        # fp32 for the consumer's precision-sensitive log_softmax / top-k /
+        # projection (KL math), and a dtype-consistent IPC buffer producer<->consumer.
+        logits = logits.to(torch.float32)
 
-        # Teacher is frozen (init_optimizer=False) and the consumer does not
-        # backprop into these logits; downstream log_softmax/KL kernels upcast
-        # to fp32 internally where they need it. Ship native compute dtype
-        # (bf16 under autocast) to halve the IPC buffer footprint.
-        return logits  # [B, S, V_t]
+        # context_parallel shards the seq dim load-balanced (interleaved), but the
+        # IPC consumer routes by contiguous ``global_seq_start`` over the teacher CP
+        # group. Restore global order and emit this rank's contiguous slice, else
+        # heterogeneous teacher_cp != student_cp lands teacher data at the wrong
+        # seq positions in the consumer's dest tensor.
+        if self.cp_size > 1 and self.cp_mesh is not None:
+            logits = cp_load_balanced_to_contiguous(
+                logits, cp_group=self.cp_mesh.get_group(), seq_dim=sequence_dim
+            )
+        return logits  # [B, S_local_contiguous, V_t]
 
 
 class ScorePostProcessor:

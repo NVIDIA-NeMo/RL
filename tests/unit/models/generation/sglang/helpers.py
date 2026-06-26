@@ -40,6 +40,7 @@ from nemo_rl.models.generation.sglang.utils.ray_utils import (
     find_available_port,
     get_host_info,
 )
+from nemo_rl.utils.venvs import make_actor_runtime_env
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -120,10 +121,17 @@ def create_worker(router_info, base_gpu_id=0, tp_size=1, rank=0):
         router_port=router_info["port"],
     )
 
+    # Materialize the sglang venv so the actor doesn't inherit the driver's
+    # base venv (e.g. /opt/nemo_rl_venv in CI containers).
+    runtime_env = make_actor_runtime_env(
+        "nemo_rl.models.generation.sglang.sglang_worker.SGLangGenerationWorker"
+    )
+    runtime_env["env_vars"].update(make_actor_env_vars())
+
     worker = SGLangGenerationWorker.options(
         num_cpus=0.2,
         num_gpus=0.2,
-        runtime_env={"env_vars": make_actor_env_vars()},
+        runtime_env=runtime_env,
     ).remote(
         gpus_per_node,
         sglang_cfg,

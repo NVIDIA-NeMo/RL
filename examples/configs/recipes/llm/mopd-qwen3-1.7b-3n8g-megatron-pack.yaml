@@ -1,0 +1,144 @@
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 4
+  num_val_generations_per_prompt: 1
+  max_num_steps: 5
+  val_period: 1000
+  overlong_filtering: true
+  max_val_samples: null
+  val_batch_size: 32
+  async_grpo:
+    enabled: true
+  adv_estimator:
+    name: opd
+  seq_logprob_error_threshold: 2.0
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  kl_input_clamp_value: null
+  kl_output_clamp_value: null
+  ratio_clip_max: 0.28
+  use_on_policy_kl_approximation: true
+  disable_ppo_ratio: true
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_ratio: 5.0
+  truncated_importance_sampling_ratio_min: 0.2
+  truncated_importance_sampling_type: icepop
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/mopd-qwen3-1.7b-3n8g-megatron-pack
+  metric_name: val:total_reward/mean
+  keep_top_k: 1
+  save_period: 1000
+  checkpoint_must_save_by: 00:03:40:00
+  save_optimizer: false
+policy:
+  model_name: Qwen/Qwen3-1.7B
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  generation_batch_size: 64
+  logprob_batch_size: 1
+  max_total_sequence_length: 32768
+  logprob_chunk_size: 2048
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    activation_checkpointing: true
+    bias_activation_fusion: false
+    tensor_model_parallel_size: 2
+    sequence_parallel: true
+    defer_fp32_logits: true
+    optimizer:
+      lr: 3.0e-06
+      min_lr: 3.0e-06
+      weight_decay: 0.0
+    scheduler:
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 3.0e-07
+    distributed_data_parallel_config:
+      average_in_collective: false
+  make_sequence_length_divisible_by: 8
+  optimizer: null
+  scheduler: null
+  generation:
+    max_new_tokens: 2048
+    vllm_cfg:
+      async_engine: true
+      tensor_parallel_size: 2
+      gpu_memory_utilization: 0.5
+      expose_http_server: true
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: hermes
+        reasoning_parser: qwen3
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 1
+data:
+  max_input_seq_length: null
+  train:
+    data_path: "${oc.env:HF_HOME}/nanov3_data/train-split.jsonl"
+    dataset_name: NemoGymDataset
+  validation:
+    data_path: "${oc.env:HF_HOME}/nanov3_data/val-split.jsonl"
+    dataset_name: NemoGymDataset
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    processor: nemo_gym_data_processor
+env:
+  should_use_nemo_gym: true
+  nemo_gym:
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/math_with_judge/configs/math_with_judge.yaml
+    - resources_servers/code_gen/configs/code_gen.yaml
+    - resources_servers/workplace_assistant/configs/workplace_assistant.yaml
+    - resources_servers/mcqa/configs/mcqa.yaml
+    - resources_servers/instruction_following/configs/instruction_following.yaml
+    - resources_servers/structured_outputs/configs/structured_outputs_json.yaml
+    math_with_judge:
+      resources_servers:
+        math_with_judge:
+          judge_model_server:
+            name: policy_model
+          should_use_judge: false
+    code_gen:
+      resources_servers:
+        code_gen:
+          num_processes: 1024
+          unit_test_timeout_secs: 10
+          debug: false
+logger:
+  tensorboard_enabled: true
+  wandb:
+    project: mopd
+    name: mopd-qwen3-1.7b-3n8g-megatron-pack
+  mlflow:
+    experiment_name: mopd
+    run_name: mopd-qwen3-1.7b-3n8g-megatron-pack
+cluster:
+  gpus_per_node: 8
+  num_nodes: 3
+on_policy_distillation:
+  enabled: true
+  teacher_model_by_agent_name:
+    default_teacher: Qwen/Qwen3-1.7B
+  default_teacher_alias: default_teacher
+  strict_agent_name_match: false
+  deduplicate_shared_teacher_checkpoints: true
+  non_colocated_teachers:
+    enabled: true
+    default_teacher_cfg:
+      tensor_model_parallel_size: 2
+      pipeline_model_parallel_size: 1
+      context_parallel_size: 1
+      num_nodes: 1
+      gpus_per_node: 8
+      precision: bf16
+      micro_batch_size: 1

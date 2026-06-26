@@ -143,9 +143,9 @@ All filtering modes require `use_importance_sampling_correction: true`. ICE-POP 
 
 ---
 
-**`"tis"` — Clamp to Max**
+**`"tis"` — Clamp to Bounds**
 
-Clamp IS weights to `<= truncated_importance_sampling_ratio`. Simple but retains biased signal from router-flipped tokens.
+Clamp IS weights to `[truncated_importance_sampling_ratio_min, truncated_importance_sampling_ratio]`. If `truncated_importance_sampling_ratio_min` is unset, the lower bound defaults to `0`. Simple but retains biased signal from router-flipped tokens.
 
 ---
 
@@ -248,7 +248,7 @@ In addition to task rewards/accuracy, a few stability signals are particularly u
 
 - **Dynamic sampling efficiency**: if enabled, watch how often batches need multiple generation rounds (see `dapo.md` for detailed guidance).
 - **Training–generation mismatch**: `token_mult_prob_error`, `gen_kl_error`, `policy_kl_error`, `js_divergence_error` are computed in `ClippedPGLossFn` (see the [GRPO metrics section](grpo.md#metrics)).
-- **IS out-of-bounds ratio** (`is_oob_ratio`): the fraction of tokens (TIS clamped above the max, ICE-POP outside [min, max]) or sequences (seq-mask-tis) whose importance weight falls outside the truncation bounds. A persistently high value suggests large backend mismatch — check precision settings or relax the bounds.
+- **IS out-of-bounds ratio** (`is_oob_ratio`): the fraction of tokens (TIS clamped outside [min, max], ICE-POP outside [min, max]) or sequences (seq-mask-tis) whose importance weight falls outside the truncation bounds. A persistently high value suggests large backend mismatch — check precision settings or relax the bounds.
 - **Truncation rate**: if high, either increase `policy.max_total_sequence_length`/`policy.generation.max_model_len` or relax truncation penalty (`stop_properly_penalty_coef`).
 
 ## References

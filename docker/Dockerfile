@@ -66,6 +66,13 @@ apt install -y nsight-systems-cli
 # To fix CVE-2025-68973
 apt install -y --only-upgrade gnupg
 
+# Upgrade rsync to address security vulnerabilities
+apt-get install -y --only-upgrade rsync
+
+# Remove ffmpeg (from base image) to reduce attack surface
+apt-get remove -y --purge ffmpeg || true
+apt-get autoremove -y
+
 apt-get clean
 rm -rf /var/lib/apt/lists/*
 EOF
