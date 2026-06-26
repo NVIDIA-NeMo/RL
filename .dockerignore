@@ -35,7 +35,12 @@
 !examples/nemo_gym/grpo_qwen3_235b_swe_openhands_async.yaml
 !examples/nemo_gym/grpo_qwen3_235b_swe_openhands_sync.yaml
 !examples/nemo_gym/launch_nemo_gym_multinode_training.sh
+!examples/nemo_gym/launch_qwen35_nemo_gym_multinode_training.sh
 !examples/nemo_gym/run_grpo_nemo_gym.py
+
+# Qwen35 source, configs, and launch-time overlays required by this branch.
+!qwen_35/
+!qwen_35/**
 
 # Dockerfile and support files.
 !docker/
