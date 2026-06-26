@@ -44,15 +44,13 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.lm_value import Value
-from nemo_rl.models.value.workers.dtensor_value_worker_v2 import (
-    RightShiftLossWrapper,
-    right_shift_values,
-)
 
 pytestmark = pytest.mark.automodel
 
 
 def test_right_shift_values_aligns_value_predictions_to_state_tokens():
+    from nemo_rl.models.value.workers.dtensor_value_worker_v2 import right_shift_values
+
     values = torch.tensor(
         [
             [1.0, 2.0, 3.0, 4.0],
@@ -73,6 +71,10 @@ def test_right_shift_values_aligns_value_predictions_to_state_tokens():
 
 
 def test_right_shift_loss_wrapper_shifts_logits_and_delegates_attributes():
+    from nemo_rl.models.value.workers.dtensor_value_worker_v2 import (
+        RightShiftLossWrapper,
+    )
+
     class RecordingLoss:
         loss_type = LossType.TOKEN_LEVEL
         input_type = LossInputType.LOGIT
