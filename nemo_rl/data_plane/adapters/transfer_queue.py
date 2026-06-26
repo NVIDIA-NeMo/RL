@@ -71,7 +71,11 @@ def _get_local_node_ip() -> str:
 
 
 def _mooncake_transport_config() -> dict:
-    protocol = os.environ.get("MC_MOONCAKE_PROTOCOL", "tcp")
+    # Default to RDMA so production clusters (RoCE/IB) pick up the
+    # zero-copy MooncakeStore path introduced in TQ v0.1.8 without
+    # needing env tweaks. Hosts without an mlx5 device fall back to TCP
+    # below so the dev path (laptop, non-RDMA cluster) still works.
+    protocol = os.environ.get("MC_MOONCAKE_PROTOCOL", "rdma")
     if protocol != "rdma":
         return {"protocol": "tcp"}
     device = os.environ.get("MC_MOONCAKE_DEVICE", "")
@@ -82,7 +86,7 @@ def _mooncake_transport_config() -> dict:
                     "sh",
                     "-c",
                     "for d in /sys/class/infiniband/mlx5_*/ports/1/link_layer; do "
-                    "  test -f $d && grep -q Ethernet $d && basename $(dirname $(dirname $d)); "
+                    "  test -f $d && grep -q Ethernet $d && basename $(dirname $(dirname $(dirname $d))); "
                     "done | head -1",
                 ],
                 check=False,
@@ -92,8 +96,18 @@ def _mooncake_transport_config() -> dict:
             device = out or ""
         except Exception:
             device = ""
-    if device:
-        os.environ.setdefault("MC_GID_INDEX", os.environ.get("MC_GID_INDEX", "3"))
+    if not device:
+        import warnings
+
+        warnings.warn(
+            "MC_MOONCAKE_PROTOCOL=rdma requested (default) but no "
+            "RoCE-capable mlx5 device detected under /sys/class/infiniband; "
+            "falling back to TCP. Set MC_MOONCAKE_PROTOCOL=tcp to silence.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return {"protocol": "tcp"}
+    os.environ.setdefault("MC_GID_INDEX", os.environ.get("MC_GID_INDEX", "3"))
     return {"protocol": "rdma", "device_name": device}
 
 
@@ -104,101 +118,6 @@ def _connect_existing() -> None:
     rl-arena/arena/dataplane_client.py's `tq.init()` (no args) call.
     """
     tq.init()
-
-
-_TQ_RUNTIME_ENV_PATCHED = False
-
-
-def _resolve_tq_pin() -> str:
-    """Return the ``TransferQueue`` requirement string from nemo-rl metadata.
-
-    Single source of truth is ``pyproject.toml`` — we read it back via
-    ``importlib.metadata.requires`` so the runtime_env injection cannot
-    drift from the dependency declaration.
-    """
-    from importlib.metadata import requires
-
-    for req in requires("nemo-rl") or []:
-        spec = req.split(";")[0].strip()
-        if spec.lower().startswith("transferqueue"):
-            return spec
-    raise RuntimeError(
-        "Could not resolve TransferQueue dependency from nemo-rl metadata. "
-        "Check pyproject.toml under [project.dependencies]."
-    )
-
-
-def _patch_tq_actor_runtime_env() -> None:
-    """Inject a per-actor ``runtime_env`` pin into TQ's actor ``.options()``.
-
-    TQ spawns ``SimpleStorageUnit`` and ``TransferQueueController`` via
-    ``Cls.options(...).remote(...)`` without a runtime_env, so they
-    inherit the job-level env. In a multi-node container deployment
-    where each node has its own ``/opt/nemo_rl_venv``, the driver's
-    ``uv sync`` only updates ray-head's venv and a worker-node actor
-    fails with ``ModuleNotFoundError``. This monkey-patch makes Ray
-    pip-install TQ into a per-actor runtime_env on first spawn (cached
-    per-node by Ray afterwards). Idempotent. Couples us to TQ's internal
-    class layout — if TQ restructures, this becomes a no-op with a
-    logged warning and we fall back to per-node ``uv sync``.
-
-    The pin is sourced from nemo-rl's installed metadata via
-    :func:`_resolve_tq_pin` so it cannot drift from ``pyproject.toml``.
-
-    TODO(zhiyul): remove this patch once the nightly container image
-    is published with ``TransferQueue`` baked in via ``pyproject.toml``.
-    When every node starts from that image, the base env already has TQ
-    and Ray actors inherit it — this injection then becomes pure
-    overhead (Ray builds a redundant per-actor pip env on top of the
-    container's existing TQ install). Drop the call from
-    ``TQDataPlaneClient.__init__`` and delete this function.
-    """
-    global _TQ_RUNTIME_ENV_PATCHED
-    if _TQ_RUNTIME_ENV_PATCHED:
-        return
-
-    runtime_env = {"pip": [_resolve_tq_pin()]}
-
-    def _install(cls) -> bool:
-        if not hasattr(cls, "options"):
-            return False
-        original = cls.options
-
-        def patched(*args, **kwargs):
-            kwargs.setdefault("runtime_env", runtime_env)
-            return original(*args, **kwargs)
-
-        cls.options = patched  # type: ignore[method-assign]
-        return True
-
-    patched_any = False
-    try:
-        from transfer_queue.storage.simple_backend import SimpleStorageUnit
-
-        patched_any |= _install(SimpleStorageUnit)
-    except ImportError:
-        pass
-    try:
-        from transfer_queue.controller import TransferQueueController
-
-        patched_any |= _install(TransferQueueController)
-    except ImportError:
-        pass
-
-    if not patched_any:
-        # Soft-fail: TQ may have moved its actor classes. The driver will
-        # still work; multi-node TQ may need the per-node `uv sync` workaround.
-        import warnings
-
-        warnings.warn(
-            "Could not patch TQ actor classes for runtime_env injection. "
-            "Multi-node TQ may fail with ModuleNotFoundError: 'transfer_queue' "
-            "on worker nodes. Workaround: run `uv sync` inside each node's "
-            "container before the driver runs.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-    _TQ_RUNTIME_ENV_PATCHED = True
 
 
 def _init_tq(cfg: DataPlaneConfig) -> None:
@@ -292,11 +211,6 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
 
     conf = OmegaConf.merge(base, overlay)
 
-    # Inject runtime_env into TQ's actor spawn so SimpleStorageUnit /
-    # TransferQueueController land on workers with transfer_queue available
-    # — see _patch_tq_actor_runtime_env() docstring for the why.
-    _patch_tq_actor_runtime_env()
-
     # pyrefly: ignore  # bad-argument-type
     tq.init(conf=conf)
 
@@ -356,13 +270,25 @@ def _promote_1d_leaves(td: TensorDict) -> TensorDict:
 
 
 def _from_wire(td: TensorDict) -> TensorDict:
-    """Inverse of `_promote_1d_leaves`: squeeze trailing 1 back to (N,)."""
-    # Same top-level iteration as `_promote_1d_leaves`: NonTensorData /
-    # NonTensorStack leaves are only visible via td.keys(), not leaves_only.
+    """Inverse of `_promote_1d_leaves`: squeeze trailing 1 back to (N,).
+
+    TQ v0.1.8's MooncakeStore deserialization (`batch_decode_from`)
+    loses 0-D scalar dimensionality on read; per-sample values come back
+    as ``(1,)`` tensors, which cause ``_merge_tensors_to_tensordict`` to
+    use ``as_nested_tensor`` instead of the dense ``torch.stack`` path.
+    Result: 1D-promoted leaves return as nested ``(N, j_uniform_1)``
+    instead of dense ``(N, 1)``. Densify uniformly-1 jagged tensors so
+    the trailing-1 squeeze can fire; leave genuinely ragged fields
+    nested (``to_padded_tensor`` would inject zeros).
+    """
     new_dict: dict[str, Any] = {}
     changed = False
     for k in td.keys():
         v = td.get(k)
+        if isinstance(v, torch.Tensor) and v.is_nested:
+            dense = v.to_padded_tensor(0)
+            if dense.shape[-1] == 1:
+                v = dense
         if (
             isinstance(v, torch.Tensor)
             and not v.is_nested
