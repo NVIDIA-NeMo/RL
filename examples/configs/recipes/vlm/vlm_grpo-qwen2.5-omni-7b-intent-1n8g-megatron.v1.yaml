@@ -1,8 +1,79 @@
-defaults: ../../intent_grpo_7B_megatron.yaml
+defaults: ../../grpo_math_1B_megatron.yaml
+grpo:
+  num_generations_per_prompt: 8
+  max_num_steps: 1000
+  val_batch_size: 32
 checkpointing:
+  enabled: true
   checkpoint_dir: results/vlm_grpo-qwen2.5-omni-7b-intent-1n8g-megatron.v1
+  keep_top_k: 10
+  save_period: 20
+  checkpoint_must_save_by: 00:03:45:00
+policy:
+  model_name: Qwen/Qwen2.5-Omni-7B
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  generation_batch_size: 32
+  logprob_batch_size: 1
+  max_total_sequence_length: 8192
+  tokenizer:
+    video:
+      num_frames: 8
+  sequence_packing:
+    enabled: false
+  generation:
+    max_new_tokens: 1024
+    vllm_cfg:
+      skip_tokenizer_init: false
+      gpu_memory_utilization: 0.4
+      limit_mm_per_prompt:
+        video: 1
+        audio: 1
+    vllm_kwargs:
+      mm_processor_cache_gb: 0
+  megatron_cfg:
+    converter_type: Qwen2_5OmniForConditionalGeneration
+    apply_rope_fusion: false
+    activation_checkpointing: true
+    tensor_model_parallel_size: 2
+    optimizer:
+      lr: 1.0e-06
+      min_lr: 1.0e-07
+    scheduler:
+      lr_warmup_iters: 10
+      lr_warmup_init: 1.0e-07
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+data:
+  num_workers: 0
+  train:
+    dataset_name: intent-train
+    split: train
+    allowed_problem_types:
+    - multiple choice
+  validation:
+    dataset_name: intent-bench
+    split: validation
+    allowed_problem_types:
+    - multiple choice
+  default:
+    prompt_file: null
+    processor: vlm_hf_data_processor
+    env_name: vlm
+env:
+  vlm:
+    num_workers: 8
+    reward_functions:
+    - name: format
+      weight: 0.2
+    - name: exact_alnum
+      weight: 0.8
 logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
   wandb:
     name: vlm_grpo-qwen2.5-omni-7b-intent-1n8g-megatron.v1
   swanlab:
     name: vlm_grpo-qwen2.5-omni-7b-intent-1n8g-megatron.v1
+cluster:
+  gpus_per_node: 8

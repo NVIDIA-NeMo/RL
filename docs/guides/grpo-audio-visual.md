@@ -9,10 +9,10 @@ Each training sample feeds the Qwen2.5-Omni processor both the video stream (8 f
 Run GRPO training with the provided config:
 
 ```
-uv run examples/run_vlm_grpo.py --config examples/configs/intent_grpo_7B_megatron.yaml
+uv run examples/run_vlm_grpo.py --config examples/configs/recipes/vlm/vlm_grpo-qwen2.5-omni-7b-intent-1n8g-megatron.v1.yaml
 ```
 
-Config: `examples/configs/intent_grpo_7B_megatron.yaml`
+Config: `examples/configs/recipes/vlm/vlm_grpo-qwen2.5-omni-7b-intent-1n8g-megatron.v1.yaml`
 
 Key hyperparameters:
 
@@ -45,13 +45,13 @@ Only `problem_type == "multiple choice"` samples are used. The allow-list is con
 
 ## 2. Convert Checkpoint (Megatron to HF)
 
-Checkpoints are saved under `results/intent_grpo_7B_megatron` (`checkpointing.checkpoint_dir`), one every `save_period=20` steps. Convert a checkpoint from Megatron to Hugging Face format before evaluating:
+Checkpoints are saved under `results/vlm_grpo-qwen2.5-omni-7b-intent-1n8g-megatron.v1` (`checkpointing.checkpoint_dir`), one every `save_period=20` steps. Convert a checkpoint from Megatron to Hugging Face format before evaluating:
 
 ```
 uv run --extra mcore python examples/converters/convert_megatron_to_hf.py \
-    --config results/intent_grpo_7B_megatron/step_43/config.yaml \
-    --megatron-ckpt-path results/intent_grpo_7B_megatron/step_43/policy/weights/iter_0000000 \
-    --hf-ckpt-path results/intent_grpo_7B_megatron/step_43/hf --no-strict
+    --config results/vlm_grpo-qwen2.5-omni-7b-intent-1n8g-megatron.v1/step_43/config.yaml \
+    --megatron-ckpt-path results/vlm_grpo-qwen2.5-omni-7b-intent-1n8g-megatron.v1/step_43/policy/weights/iter_0000000 \
+    --hf-ckpt-path results/vlm_grpo-qwen2.5-omni-7b-intent-1n8g-megatron.v1/step_43/hf --no-strict
 ```
 
 Replace the step number with the checkpoint you want to evaluate. `--no-strict` is expected here: only the Qwen2.5-Omni *thinker* is trained, so the talker tensors are reported as "not written". The `--extra mcore` flag is required for the Megatron converter.
@@ -64,7 +64,7 @@ For a standalone benchmark, decode the converted HF checkpoint on [Daily-Omni](h
 
 ```
 uv run examples/run_eval.py --config examples/configs/evals/daily_omni.yaml \
-    generation.model_name=results/intent_grpo_7B_megatron/step_43/hf
+    generation.model_name=results/vlm_grpo-qwen2.5-omni-7b-intent-1n8g-megatron.v1/step_43/hf
 ```
 
 The eval config (`examples/configs/evals/daily_omni.yaml`) feeds audio + video (32 frames — eval has no training-forward memory pressure, so it samples more densely than training), uses the same think+answer prompt as training, and scores with `exact_alnum` (case-insensitive exact match on the `<answer>` content).
