@@ -186,7 +186,7 @@ def test_apply_message_level_advantage_penalties_targets_flagged_message_spans()
             ]
         }
     )
-    _apply_message_level_advantage_penalties(
+    penalty_metrics = _apply_message_level_advantage_penalties(
         train_data=train_data,
         message_logs=repeated_batch["message_log"],
         invalid_tool_call_advantage=-5.0,
@@ -200,6 +200,13 @@ def test_apply_message_level_advantage_penalties_targets_flagged_message_spans()
         ]
     )
     torch.testing.assert_close(train_data["advantages"], expected)
+    assert penalty_metrics == {
+        "invalid_tool_call_rate": 0.25,
+        "malformed_thinking_rate": 0.25,
+        "num_invalid_tool_calls": 1,
+        "num_malformed_thinking": 1,
+        "num_assistant_messages": 4,
+    }
 
 
 def test_apply_configured_message_level_advantage_penalties_noops_when_disabled():
@@ -219,11 +226,12 @@ def test_apply_configured_message_level_advantage_penalties_noops_when_disabled(
     master_config = MasterConfig.model_construct(grpo={})
 
     with patch("nemo_rl.algorithms.grpo._should_use_nemo_gym") as should_use_nemo_gym:
-        _apply_configured_message_level_advantage_penalties(
+        penalty_metrics = _apply_configured_message_level_advantage_penalties(
             train_data, message_logs, master_config
         )
 
     should_use_nemo_gym.assert_not_called()
+    assert penalty_metrics == {}
     torch.testing.assert_close(
         train_data["advantages"], torch.tensor([[1.0, 2.0]], dtype=torch.float32)
     )
