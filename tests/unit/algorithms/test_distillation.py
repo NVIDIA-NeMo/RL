@@ -344,11 +344,11 @@ def test_non_colocated_offloads_student_optimizer_before_teacher_inference(
 ):
     """Student optimizer state must be offloaded before the teacher is onloaded.
 
-    In non-colocated mode the non-colocated refit path leaves the student
-    optimizer state on the train GPUs, so the training loop must offload it
-    (offload_before_refit) before each teacher prepare_for_lp_inference call,
-    otherwise the teacher top-k forward OOMs once optimizer state materializes
-    after the first training step.
+    In non-colocated mode the refit path no longer offloads the student
+    optimizer, so it stays on the train GPUs, and the training loop must
+    offload it (offload_before_refit) before each teacher prepare_for_lp_inference
+    call, otherwise the teacher top-k forward OOMs once optimizer state
+    materializes after the first training step.
     """
     mock_components["master_config"].distillation["max_num_steps"] = 2
     assert not mock_components["master_config"].policy["generation"]["colocated"][
