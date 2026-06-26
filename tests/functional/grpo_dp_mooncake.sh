@@ -38,6 +38,8 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     data_plane.enabled=true \
     data_plane.impl=transfer_queue \
     data_plane.backend=mooncake_cpu \
+    data_plane.global_segment_size=4294967296 \
+    data_plane.local_buffer_size=1073741824 \
     $@ \
     2>&1 | tee $RUN_LOG
 

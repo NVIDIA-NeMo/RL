@@ -1,0 +1,39 @@
+defaults: ../../xtoken_off_policy_distillation.yaml
+distillation:
+  num_prompts_per_step: 8
+  max_num_steps: 20
+  val_period: 10
+  val_at_start: true
+data:
+  train:
+    split_validation_size: 64
+    seed: 42
+policy:
+  train_global_batch_size: 8
+  max_total_sequence_length: 1024
+  dtensor_cfg:
+    tensor_parallel_size: 4
+    context_parallel_size: 2
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 0.1
+      end_factor: 1.0
+      total_iters: 5
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones:
+    - 5
+teacher:
+  train_global_batch_size: 8
+  max_total_sequence_length: 1024
+  dtensor_cfg:
+    tensor_parallel_size: 2
+    context_parallel_size: 2
+logger:
+  log_dir: logs/distillation-xtoken-off-policy-qwen3-4b-to-llama3.2-1b-1n8g-dtensor-tp4cp2
+  wandb:
+    project: nemo-rl
+    name: distillation-xtoken-off-policy-qwen3-4b-to-llama3.2-1b-1n8g-dtensor-tp4cp2

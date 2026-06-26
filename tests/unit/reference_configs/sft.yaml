@@ -12,6 +12,7 @@ sft:
   val_at_start: true
   val_at_end: false
   seed: 42
+  only_unmask_final: false
 
 checkpointing:
   enabled: true
@@ -46,6 +47,9 @@ policy:
     activation_checkpointing: false
     tensor_parallel_size: 1
     context_parallel_size: 1
+    # HSDP replicate dimension size for Automodel DTensor v2.
+    # Typically set to the number of nodes; set to 1 to disable HSDP.
+    dp_replicate_size: 1
     custom_parallel_plan: null
 
     # Automodel kwargs passed to from_pretrained.
@@ -131,6 +135,7 @@ policy:
     moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
     gradient_accumulation_fusion: false
+    use_fused_weighted_squared_relu: false
 
     peft:
       enabled: false
@@ -272,3 +277,4 @@ logger:
 cluster:
   gpus_per_node: 1
   num_nodes: 1
+  segment_size: null

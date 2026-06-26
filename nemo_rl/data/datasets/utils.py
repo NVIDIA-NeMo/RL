@@ -13,15 +13,23 @@
 # limitations under the License.
 
 import base64
+import importlib
 import io
 import os
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import torch
-from datasets import DatasetDict, load_dataset, load_from_disk
+from datasets import (
+    Dataset,
+    DatasetDict,
+    concatenate_datasets,
+    load_dataset,
+    load_from_disk,
+)
 from huggingface_hub.utils._cache_manager import _scan_cached_repo
 from PIL import Image
+from torch.utils.data import ConcatDataset
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
 TokenizerType = Union[PreTrainedTokenizerBase, AutoProcessor]
@@ -120,11 +128,69 @@ def load_dataset_from_path(
     return raw_dataset
 
 
+def resolve_external_dataset_class(dataset_name: str) -> type:
+    """Resolve a fully-qualified dotted dataset path to a class.
+
+    Used by both ``load_response_dataset`` and ``load_preference_dataset``
+    to support user-defined datasets that live outside ``nemo_rl`` so users
+    do not have to edit the built-in ``DATASET_REGISTRY`` to plug in their
+    own dataset class. The class must be importable from ``PYTHONPATH`` (or
+    the active virtual environment).
+
+    The caller is expected to have already verified that ``dataset_name``
+    looks like a dotted import path (i.e. contains a ``.``); this helper
+    focuses on the import / attribute-lookup / type-validation steps and
+    raises ``ValueError`` with an actionable message on any failure.
+    """
+    module_path, _, class_name = dataset_name.rpartition(".")
+    try:
+        module = importlib.import_module(module_path)
+    except ImportError as e:
+        raise ValueError(
+            f"Could not import module {module_path!r} for "
+            f"dataset_name={dataset_name!r}. Ensure the module is "
+            "installed and importable from PYTHONPATH."
+        ) from e
+    if not hasattr(module, class_name):
+        raise ValueError(
+            f"Module {module_path!r} has no attribute {class_name!r} "
+            f"(referenced by dataset_name={dataset_name!r})."
+        )
+    dataset_class = getattr(module, class_name)
+    if not isinstance(dataset_class, type):
+        raise ValueError(
+            f"dataset_name={dataset_name!r} resolved to {dataset_class!r}, "
+            "which is not a class. Expected a dataset class."
+        )
+    return dataset_class
+
+
 def update_single_dataset_config(data_config: dict, default_data_config: dict) -> None:
     """Fill the single dataset config with default dataset config."""
     for key in default_data_config.keys():
         if key not in data_config:
             data_config[key] = default_data_config[key]
+
+
+def merge_datasets(datasets: list[Any]) -> Any:
+    """Merge map-style datasets while supporting non-HF wrappers.
+
+    Hugging Face's ``concatenate_datasets`` only accepts HF ``Dataset`` objects.
+    Some response datasets, such as ``PreservingDataset``, intentionally bypass the
+    HF schema machinery to preserve heterogeneous nested structures. When those
+    datasets are present, fall back to a generic concatenation wrapper that still
+    provides ``__len__`` and integer ``__getitem__`` for downstream processing.
+    """
+    if not datasets:
+        raise ValueError("Expected at least one dataset to merge.")
+
+    if len(datasets) == 1:
+        return datasets[0]
+
+    if all(isinstance(dataset, Dataset) for dataset in datasets):
+        return concatenate_datasets(datasets)
+
+    return ConcatDataset(datasets)
 
 
 def extract_necessary_env_names(data_config: dict) -> list[str]:

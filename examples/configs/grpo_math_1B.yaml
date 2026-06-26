@@ -11,6 +11,8 @@ grpo:
   val_at_start: false
   val_at_end: false
   overlong_filtering: false
+  advantage_clip_low: null
+  advantage_clip_high: null
   max_val_samples: 256
   val_batch_size: 256
   seed: 42
@@ -38,6 +40,10 @@ grpo:
     target_min: 0.0
     target_max: 1.0
   seq_logprob_error_threshold: null
+  # Advantage value assigned to invalid tool call tokens (e.g. -5.0 to penalize). null disables.
+  invalid_tool_call_advantage: null
+  # Advantage value assigned to tokens with malformed <think>/</think> tags (e.g. -5.0). null disables.
+  malformed_thinking_advantage: null
 
   async_grpo:
     enabled: false # Set to true to enable async training mode
@@ -61,16 +67,24 @@ loss_fn:
   # Async GRPO requires importance sampling correction enabled
   # Set to true when async_grpo.enabled is true
   use_importance_sampling_correction: false
-  # "tis"          – clamp IS weights to max
+  # "tis"          – clamp IS weights to [min, max], where min defaults to 0
   # "icepop"       – zero out tokens with IS weight outside [min, max]
   # "seq-mask-tis" – zero out sequences by geometric-mean IS ratio, non-truncated token IS correction
   truncated_importance_sampling_type: null
   truncated_importance_sampling_ratio: null
-  truncated_importance_sampling_ratio_min: null  # Lower bound for ICE-POP
+  # TIS lower bound; null means 0 for TIS. Set explicitly for ICE-POP / seq-mask-tis.
+  truncated_importance_sampling_ratio_min: null
   sequence_level_importance_ratios: false
   token_level_loss: true
   force_on_policy_ratio: false  # Set to true to force ratio=1.0 (requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt)
   use_kl_in_reward: false  # Reinforce++: add KL penalty to reward instead of loss
+  use_cispo: false  # CISPO (https://arxiv.org/abs/2506.13585): clipped IS-weight policy optimization
+  # Disable PPO ratio (curr_logprobs - prev_logprobs).exp(); falls back to REINFORCE-style
+  # surrogate loss. Used by REINFORCE/RLOO. See https://arxiv.org/abs/2402.14740
+  disable_ppo_ratio: false
+  # VAPO positive-example NLL loss weight: L = L_PPO + mu * L_NLL(correct samples).
+  # 0.0 disables it. VAPO paper recommends 0.1.
+  positive_example_nll_weight: 0.0
 
 checkpointing:
   enabled: true
@@ -145,7 +159,6 @@ policy:
     # https://github.com/NVIDIA/Megatron-LM/blob/d30c3ae5469fe3f6a64d4fd2e63b6e7f7844ea81/megatron/core/transformer/transformer_config.py#L483
     # Use ["moe"] for MoE models to recompute expert activations only.
     recompute_modules: null
-    converter_type: "Qwen2ForCausalLM"
     tensor_model_parallel_size: 1
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 1
@@ -169,7 +182,16 @@ policy:
     moe_enable_deepep: false
     moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
+    # Multi-Token Prediction (MTP). mtp_num_layers=0 disables MTP.
+    mtp_num_layers: 0
+    # MTP loss weight added to the main next-token loss (0.0 disables the MTP loss contribution).
+    mtp_loss_scaling_factor: 0.0
+    # When true, repeat one MTP layer mtp_num_layers times instead of using distinct layers.
+    mtp_use_repeated_layer: false
+    # When true, detach MTP heads so MTP loss does not affect main-model gradients.
+    mtp_detach_heads: false
     gradient_accumulation_fusion: false
+    use_fused_weighted_squared_relu: false
 
     peft:
       enabled: false
@@ -283,6 +305,10 @@ policy:
     - milestones: [50]
 
   generation:
+    # Port range for vLLM HTTP servers, kept below the OS ephemeral range.
+    # See ray.sub for the full port layout.
+    port_range_low: 11001
+    port_range_high: 15000
     backend: "vllm"
     max_new_tokens: ${policy.max_total_sequence_length}
     temperature: 1.0
@@ -291,13 +317,23 @@ policy:
     stop_token_ids: null
     stop_strings: null
     mcore_generation_config:
-      buffer_size_gb: 10  # Total buffer size is 2x this value (active requests + paused requests)
+      async_engine: false
+      max_model_len: ${policy.max_total_sequence_length}  # Engine-side max sequence length.
+      cuda_graph_impl: "local"  # CUDA-graph implementation. Options: "none", "local", "transformer_engine", "full_iteration".
+      inference_cuda_graph_scope: "block"  # Inference CUDA-graph scope. Options: "none", "layer", "block".
+      buffer_size_gb: 10
       num_cuda_graphs: 4  # Number of CUDA graphs to pre-compile for different batch sizes
       block_size_tokens: 256  # Size of each KV cache block in tokens (affects memory granularity)
       use_cuda_graphs_for_non_decode_steps: true  # Enable CUDA graphs for prefill/context processing
       enable_chunked_prefill: true  # Split long prefills into chunks for better memory management
-      unified_memory_level: 0  # Unified memory usage level (0=disabled, higher values enable more aggressive paging)
+      enable_prefix_caching: false  # Reuse KV blocks across requests sharing a prompt prefix.
       max_tokens: 16384 # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens
+      kv_cache_management_mode: "persist"  # KV cache lifecycle across suspend/resume. Options: "persist", "offload". To select "recompute", set grpo.async_grpo.recompute_kv_cache_after_weight_updates=true.
+      materialize_only_last_token_logits: true
+      num_speculative_tokens: 0
+      refit_backend: "nvshmem"  # Copy-service backend for non-colocated megatron weight refit. Options: "gloo" or "nvshmem".
+      parsers: []  # OpenAI tool-call / response parser names exposed by the HTTP server (only used if expose_http_server=true).
+      expose_http_server: false  # Start an OpenAI-compatible HTTP server alongside the persistent engine. Required for NeMo-Gym.
     vllm_cfg:
       async_engine: false
       precision: ${policy.precision}
@@ -311,6 +347,7 @@ policy:
       # with the flag, vllm will use the custom CUDA kernels instead of the Triton kernels generated by torch.compile
       # for more details, see convergence issue https://github.com/NVIDIA-NeMo/RL/issues/998
       enforce_eager: False
+      use_tqdm: true # Set to false to suppress vLLM generation progress bars. Only applies when async_engine is false
       use_deep_gemm: False
       num_last_layers_in_bf16: 0
       num_first_layers_in_bf16: 0
@@ -401,6 +438,12 @@ logger:
 cluster:
   gpus_per_node: 1
   num_nodes: 1
+  # Port range for the distributed master address (TCPStore / NCCL rendezvous)
+  # and per-worker available ports.  Kept below the OS ephemeral range
+  # (32768-60999 on stock Linux).  See ray.sub for the full port layout.
+  master_port_range_low: 25000
+  master_port_range_high: 28000
+  segment_size: null  # Nodes per NVLink domain segment for topology-aware alignment; null to disable
 
 # TransferQueue-mediated data plane for sync GRPO.
 # Off by default — the legacy grpo_train trainer never engages this.
@@ -417,3 +460,11 @@ data_plane:
   local_buffer_size:   68719476736   # 64 GiB  — used when backend == "mooncake_cpu"
   # observability:                    # NotRequired
   #   enabled: false
+
+# Multi-Teacher On-Policy Distillation (MOPD): distills from one or more teacher
+# models into the policy via token-level teacher-minus-student logprob advantages,
+# served by non-colocated teacher worker groups (OPD advantage estimator +
+# nemo_gym). null = disabled (default). See
+# examples/configs/recipes/llm/mopd-qwen3-1.7b-3n8g-megatron-pack.yaml for a full
+# enabled example.
+on_policy_distillation: null

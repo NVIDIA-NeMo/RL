@@ -32,6 +32,7 @@ from tests.unit.test_utils import SimpleLossFn
 
 try:
     from nemo_rl.models.policy.workers.dtensor_policy_worker_v2 import (
+        DTensorPolicyWorkerV2Impl,
         _maybe_adapt_tensor_to_hf,
         dtensor_params_generator,
         get_train_context,
@@ -40,6 +41,61 @@ try:
     NEMO_AUTOMODEL_AVAILABLE = True
 except ImportError:
     NEMO_AUTOMODEL_AVAILABLE = False
+
+
+class _FakeTrainableModel:
+    def __init__(self):
+        self.train_called = False
+
+    def train(self):
+        self.train_called = True
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_dtensor_v2_prepare_for_training_restores_optimizer(monkeypatch):
+    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    model = _FakeTrainableModel()
+    restored_devices = []
+
+    worker.model = model
+    worker.optimizer = object()
+    worker.cpu_offload = False
+    worker.move_to_cuda = lambda model: model
+    worker.move_optimizer_to_device = lambda device: restored_devices.append(device)
+
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", lambda _name: None)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    DTensorPolicyWorkerV2Impl.prepare_for_training(worker)
+
+    assert model.train_called
+    assert restored_devices == ["cuda"]
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_dtensor_v2_update_moe_gate_bias_called_when_supported():
+    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    worker.model = MagicMock()
+    worker.model.update_moe_gate_bias = MagicMock()
+
+    DTensorPolicyWorkerV2Impl._update_moe_gate_bias_if_supported(worker)
+
+    worker.model.update_moe_gate_bias.assert_called_once_with()
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+def test_dtensor_v2_update_moe_gate_bias_noop_when_unsupported():
+    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    # A real module without the hook: getattr(..., None) must short-circuit so
+    # models that do not expose update_moe_gate_bias are unaffected.
+    worker.model = nn.Linear(1, 1)
+
+    # Should be a no-op and must not raise.
+    DTensorPolicyWorkerV2Impl._update_moe_gate_bias_if_supported(worker)
 
 
 def create_test_config(

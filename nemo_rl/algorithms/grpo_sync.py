@@ -48,6 +48,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
     MasterConfig,
+    _clip_grpo_advantages,
     _create_advantage_estimator,
     _log_mixed_rewards_and_advantages_information,
     _should_log_nemo_gym_responses,
@@ -82,6 +83,36 @@ from nemo_rl.utils.memory_tracker import MemoryTracker
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.venvs import make_actor_runtime_env
+
+
+def _raise_if_message_level_advantage_penalties_enabled(
+    master_config: MasterConfig,
+) -> None:
+    """Raise if message-level advantage penalties are set in the sync trainer.
+
+    Message-level advantage penalties are not supported with
+    ``data_plane.enabled=true``. Raises NotImplementedError listing the
+    offending keys so the user can disable them or switch to the legacy GRPO
+    trainer.
+    """
+    unsupported_keys = [
+        key
+        for key in (
+            "invalid_tool_call_advantage",
+            "malformed_thinking_advantage",
+        )
+        if master_config.grpo.get(key) is not None
+    ]
+    if not unsupported_keys:
+        return
+
+    raise NotImplementedError(
+        "Message-level advantage penalties are not supported with "
+        "data_plane.enabled=true yet. Disable "
+        f"{', '.join(f'grpo.{key}' for key in unsupported_keys)} or use the "
+        "legacy GRPO trainer."
+    )
+
 
 # ── DAPO non-zero-std dynamic sampling, slice-only ─────────────────────
 # Slice-only formulation of nemo_rl.algorithms.grpo.dynamic_sampling: filter
@@ -304,6 +335,38 @@ def validate_sync(
     return val_metrics, timing_metrics
 
 
+def _compute_seq_logprob_error_metrics(
+    *,
+    token_mask: torch.Tensor,
+    sample_mask: torch.Tensor,
+    prev_logprobs: torch.Tensor,
+    generation_logprobs: torch.Tensor,
+    rewards: torch.Tensor,
+    seq_logprob_error_threshold: Optional[float],
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    # Thin BDD for the data-driven masking call: take
+    # the slice you need, transform, write delta back.
+    masking_data = BatchedDataDict[ClippedPGLossDataDict](
+        {
+            "token_mask": token_mask,
+            "sample_mask": sample_mask,
+            "prev_logprobs": prev_logprobs,
+            "generation_logprobs": generation_logprobs,
+        }
+    )
+    seq_error_result = compute_and_apply_seq_logprob_error_masking(
+        train_data=masking_data,
+        rewards=rewards,
+        seq_logprob_error_threshold=seq_logprob_error_threshold,
+    )
+    seq_logprob_error_metrics = seq_error_result
+    if "num_masked_seqs" in seq_logprob_error_metrics:
+        seq_logprob_error_metrics["num_masked_seqs_by_logprob_error"] = (
+            seq_logprob_error_metrics.pop("num_masked_seqs")
+        )
+    return masking_data["sample_mask"], seq_logprob_error_metrics
+
+
 def grpo_train_sync(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -369,8 +432,6 @@ def grpo_train_sync(
     val_period = master_config.grpo["val_period"]
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
 
-    adv_estimator = _create_advantage_estimator(master_config)
-
     # ── Data-plane setup (mandatory in the sync trainer) ───────────────
     # Sync trainer requires a TQ-mediated policy. The TQPolicy actor
     # bootstraps the controller and attaches workers; ``policy.dp_cfg``
@@ -384,6 +445,8 @@ def grpo_train_sync(
             "Use the legacy nemo_rl.algorithms.grpo.grpo_train trainer if you don't "
             "want TransferQueue."
         )
+    _raise_if_message_level_advantage_penalties_enabled(master_config)
+    adv_estimator = _create_advantage_estimator(master_config)
 
     # Driver-side pad-value dict for materialize() — the wire emits
     # jagged tensors for variable-length token fields (input_ids,
@@ -758,31 +821,18 @@ def grpo_train_sync(
                         extras_bdd["reference_policy_logprobs"] if compute_ref else None
                     )
 
-                    # Thin BDD for the data-driven masking call: take
-                    # the slice you need, transform, write delta back.
-                    masking_data = BatchedDataDict[ClippedPGLossDataDict](
-                        {
-                            "token_mask": token_mask,
-                            "sample_mask": loss_multiplier,
-                            "prev_logprobs": prev_logprobs,
-                            "generation_logprobs": generation_logprobs,
-                        }
+                    sample_mask, seq_logprob_error_metrics = (
+                        _compute_seq_logprob_error_metrics(
+                            token_mask=token_mask,
+                            sample_mask=loss_multiplier,
+                            prev_logprobs=prev_logprobs,
+                            generation_logprobs=generation_logprobs,
+                            rewards=rewards,
+                            seq_logprob_error_threshold=master_config.grpo[
+                                "seq_logprob_error_threshold"
+                            ],
+                        )
                     )
-
-                    (
-                        max_seq_mult_prob_error,
-                        num_masked_seqs,
-                        masked_correct_pct,
-                    ) = compute_and_apply_seq_logprob_error_masking(
-                        train_data=masking_data,
-                        rewards=rewards,
-                        seq_logprob_error_threshold=master_config.grpo[
-                            "seq_logprob_error_threshold"
-                        ],
-                    )
-                    # masking may have mutated sample_mask in place —
-                    # capture the post-masking value for delta-write.
-                    sample_mask = masking_data["sample_mask"]
 
                 with timer.time("advantage_calculation"):
                     print("▶ Computing advantages...", flush=True)
@@ -825,6 +875,7 @@ def grpo_train_sync(
                 # ── Driver delta-write: advantages + (post-masking)
                 # sample_mask under the same meta.sample_ids so workers fetch
                 # the union via train_presharded.
+                advantages = _clip_grpo_advantages(advantages, master_config.grpo)
                 policy.write_to_dataplane(
                     meta,
                     fields={
@@ -1011,9 +1062,7 @@ def grpo_train_sync(
                 metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
 
-                metrics["max_seq_mult_prob_error"] = max_seq_mult_prob_error
-                metrics["num_masked_seqs_by_logprob_error"] = num_masked_seqs
-                metrics["masked_correct_pct"] = masked_correct_pct
+                metrics.update(seq_logprob_error_metrics)
 
                 consumed_samples += master_config.grpo["num_prompts_per_step"]
                 timeout.mark_iteration()

@@ -1,0 +1,200 @@
+# Single-teacher cross-tokenizer off-policy distillation.
+#
+# Defaults: Llama-3.2-1B (student) <- Qwen3-4B (teacher), arrow-text corpus,
+# P-KL loss mode (gold_loss=false, xtoken_loss=false). Override the model
+# names, tokenizers, and data_files via Hydra CLI for other pairs.
+
+defaults: distillation_math.yaml
+
+distillation:
+  num_prompts_per_step: 64
+  max_num_steps: 5000
+  max_num_epochs: 1
+  seed: 42
+  val_period: 0               # validation disabled by default
+  val_at_start: false
+  val_at_end: false
+  # Teacher microbatch size for the validation logits export. Defaults to the
+  # teacher's train MBS via interpolation; override with a literal to tune the
+  # val export independently of training.
+  val_teacher_micro_batch_size: ${teacher.train_micro_batch_size}
+
+loss_fn:
+  # Path to the (student, teacher) projection matrix .pt file. Override via
+  # Hydra CLI per run, e.g.
+  #   loss_fn.projection_matrix_path=/path/to/projection_matrix.pt
+  # See docs/guides/xtoken-off-policy-distillation.md for how to produce this file.
+  projection_matrix_path: null
+  # Loss-mode selection:
+  #   gold_loss=false                    -> P-KL: full-vocab teacher logits
+  #     transported via IPC; the loss derives a microbatch-global top-k
+  #     (size `vocab_topk`) inside, projects student to teacher vocab via
+  #     M, and chunk-averages KL on the [k] subset. CE term is added.
+  #   gold_loss=true, xtoken_loss=false  -> gold-loss:
+  #     KL on the exact-mapped common vocab (top-1 weight == 1.0) + L1
+  #     on the uncommon vocab tail (sorted, capped at `uncommon_topk`).
+  #   gold_loss=true, xtoken_loss=true   -> relaxed gold: same partition
+  #     math but exact-map threshold is >= 0.6 and collisions are resolved
+  #     by keeping the higher-weight student.
+  # `xtoken_loss=true` requires `gold_loss=true`.
+  gold_loss: false
+  xtoken_loss: false
+  temperature: 1.0
+  vocab_topk: 8192            # P-KL only; size of the microbatch-global
+                              # top-k derived inside the loss
+  uncommon_topk: 8192         # gold-loss only; caps the L1 uncommon tail
+  reverse_kl: false
+  exact_token_match_only: false
+  kl_loss_weight: 1.0         # P-KL only
+  ce_loss_scale: 0.1          # P-KL only
+  dynamic_loss_scaling: true  # P-KL only
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: "checkpoints/xtoken-off-policy-distillation"
+  metric_name: "train:loss"
+  higher_is_better: false
+  keep_top_k: 3
+  save_period: 600
+  checkpoint_must_save_by: null
+  save_optimizer: true
+  model_save_format: "safetensors"
+  save_consolidated: false
+
+policy:
+  model_name: "meta-llama/Llama-3.2-1B"
+  tokenizer:
+    name: "meta-llama/Llama-3.2-1B"
+  train_global_batch_size: 64
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 2048
+  make_sequence_length_divisible_by: 1
+  precision: "bfloat16"
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: true
+  dtensor_cfg:
+    enabled: true
+    _v2: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+  max_grad_norm: 1.0
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: 2048
+    logprob_mb_tokens: 2048
+    sequence_length_round: 64
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: 2048
+    logprob_mb_tokens: 2048
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 5.0e-5
+      weight_decay: 0.001
+      betas: [0.9, 0.95]
+      eps: 1e-8
+      foreach: false
+      fused: false
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.02
+        end_factor: 1.0
+        total_iters: 250
+    - name: "torch.optim.lr_scheduler.CosineAnnealingLR"
+      kwargs:
+        T_max: 4750
+        eta_min: 0.0
+    - milestones: [250]
+
+teacher:
+  model_name: "Qwen/Qwen3-4B"
+  tokenizer:
+    name: "Qwen/Qwen3-4B"
+  train_global_batch_size: 64
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 2048
+  make_sequence_length_divisible_by: 1
+  precision: "bfloat16"
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: false
+  dtensor_cfg:
+    enabled: true
+    _v2: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+  max_grad_norm: 1.0
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: 2048
+    logprob_mb_tokens: 2048
+    sequence_length_round: 64
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: 2048
+    logprob_mb_tokens: 2048
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 5.0e-5
+      weight_decay: 0.001
+      betas: [0.9, 0.95]
+      eps: 1e-8
+      foreach: false
+      fused: false
+
+data:
+  max_input_seq_length: 2048
+  shuffle: true
+  num_workers: 4
+  train:
+    dataset_name: "arrow_text"
+    processor: "kd_data_processor"
+    # Default: an ungated, CC-BY-4.0 NVIDIA raw-text corpus, pointed straight at
+    # its parquet shards over hf:// so the recipe runs with no auth and no extra
+    # setup. `data_files` accepts a path/glob/URL to .arrow/.parquet/.json/.txt
+    # files (format inferred from the extension) OR a bare HuggingFace dataset id
+    # (loaded by name; in that case set `subset` to pick a config). To train on
+    # your own .arrow corpus, override only:
+    #   data.train.data_files=/path/glob/*.arrow
+    data_files: "hf://datasets/nvidia/Nemotron-Pretraining-Specialized-v1.1/Nemotron-Pretraining-Formal-Logic/*.parquet"
+    split: "train"
+    text_key: "text"
+    characters_per_sample: 16384
+  validation: null
+
+logger:
+  log_dir: "logs/xtoken-off-policy-distillation"
+  num_val_samples_to_print: 0
+  wandb_enabled: false
+  swanlab_enabled: false
+  mlflow_enabled: false
+  tensorboard_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: "x_token"
+    name: "xtoken-off-policy-distillation"
+  tensorboard:
+    log_dir: "tb_logs-xtoken-off-policy-distillation"
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1

@@ -40,6 +40,11 @@ from nemo_rl.models.automodel.setup import (
 )
 
 
+def test_token_classification_backport_still_required():
+    with pytest.raises(ImportError):
+        from nemo_automodel import NeMoAutoModelForTokenClassification  # noqa: F401
+
+
 @pytest.fixture
 def mock_config():
     """Create a mock policy configuration for testing."""
@@ -765,6 +770,7 @@ class TestSetupDistributed:
         mock_fsdp2_config.return_value = MagicMock()
         mock_moe_config.return_value = MagicMock()
         mock_create_mesh.return_value = (mock_device_mesh, None)
+        mock_config["dtensor_cfg"]["dp_replicate_size"] = 2
 
         setup_distributed(mock_config, mock_runtime_config)
 
@@ -780,7 +786,30 @@ class TestSetupDistributed:
         assert mesh_call_kwargs["pp_size"] == 1
         assert mesh_call_kwargs["cp_size"] == 1
         assert mesh_call_kwargs["ep_size"] == 1
+        assert mesh_call_kwargs["dp_replicate_size"] == 2
         assert mesh_call_kwargs["world_size"] == 4
+
+    @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
+    @patch("nemo_rl.models.automodel.setup.create_device_mesh")
+    @patch("nemo_rl.models.automodel.setup.FSDP2Config")
+    @patch("nemo_rl.models.automodel.setup.torch.distributed")
+    def test_setup_distributed_dp_replicate_size_requires_divisible_dp(
+        self,
+        mock_torch_dist,
+        mock_fsdp2_config,
+        mock_create_mesh,
+        mock_moe_config,
+        mock_config,
+        mock_runtime_config,
+    ):
+        """dp_replicate_size must divide the inferred data-parallel size."""
+        mock_torch_dist.get_world_size.return_value = 6
+        mock_fsdp2_config.return_value = MagicMock()
+        mock_moe_config.return_value = MagicMock()
+        mock_config["dtensor_cfg"]["dp_replicate_size"] = 4
+
+        with pytest.raises(ValueError, match="dp_replicate_size"):
+            setup_distributed(mock_config, mock_runtime_config)
 
 
 @pytest.mark.automodel
@@ -2112,3 +2141,72 @@ class TestMaybeSetForceHf:
         config = self._make_config(arch)
         _maybe_set_force_hf(kwargs, config)
         assert "force_hf" not in kwargs
+
+
+@pytest.mark.automodel
+def test_automodel_dtype_restore_workaround_still_needed(monkeypatch):
+    """Tripwire for the temporary fp32 master-weight workaround in setup.py.
+
+    ``_disable_automodel_checkpoint_dtype_restore`` no-ops Automodel's
+    ``_restore_loaded_model_dtype`` because (pre PR #2419) it downgrades an explicitly-fp32
+    load back to the bf16 checkpoint dtype, breaking optimizer master weights. This test
+    reproduces that downgrade against the *live* pinned function (no model/checkpoint load).
+
+    It PASSES while the bug is present. It FAILS — telling us to delete the workaround in
+    ``nemo_rl/models/automodel/setup.py`` (and this test) — once Automodel either removes the
+    function or ships PR #2419 (honors the explicit fp32 via ``promote_types`` so the weight
+    stays fp32).
+    """
+    import inspect
+    import types
+
+    import nemo_automodel.components.checkpoint.utils as ckpt_utils
+    from nemo_automodel._transformers import model_init
+
+    restore = getattr(model_init, "_restore_loaded_model_dtype", None)
+    # An earlier test in this process may have triggered the setup.py workaround
+    # (_disable_automodel_checkpoint_dtype_restore), which globally and irreversibly
+    # replaces this symbol with a no-op. Recover the genuine upstream function it
+    # stashed so this tripwire exercises Automodel's real behavior, not our no-op.
+    restore = getattr(restore, "_nrl_original", restore)
+    if restore is None:
+        pytest.fail(
+            "Automodel removed _restore_loaded_model_dtype - remove the fp32 master-weight "
+            "workaround _disable_automodel_checkpoint_dtype_restore() in "
+            "nemo_rl/models/automodel/setup.py."
+        )
+
+    model = torch.nn.Linear(4, 4).float()
+    assert model.weight.dtype == torch.float32
+
+    # Pretend the checkpoint stored the weight in bf16.
+    monkeypatch.setattr(
+        ckpt_utils,
+        "_get_checkpoint_tensor_dtypes",
+        lambda *args, **kwargs: {"weight": torch.bfloat16},
+    )
+    # Reproduce NeMo-RL's explicit-fp32 load. PR #2419 honors the request ONLY via the
+    # new `requested_dtype` parameter (it ignores hf_config.torch_dtype / load_kwargs in
+    # this function): with requested_dtype=fp32 it promotes the bf16 checkpoint tensor up
+    # to fp32 and leaves the weight unchanged. The current pin predates #2419 and its
+    # signature has no such parameter, so pass it only when the signature accepts it:
+    #   pre-#2419  -> requested_dtype absent -> weight downgraded to bf16 (assert holds, workaround needed)
+    #   post-#2419 -> requested_dtype=fp32   -> weight stays fp32      (assert fails, fires the removal tripwire)
+    hf_config = types.SimpleNamespace(torch_dtype=torch.float32)
+    restore_kwargs = {}
+    if "requested_dtype" in inspect.signature(restore).parameters:
+        restore_kwargs["requested_dtype"] = torch.float32
+    restore(
+        model,
+        "dummy",
+        hf_config,
+        None,
+        {"torch_dtype": "torch.float32"},
+        **restore_kwargs,
+    )
+
+    assert model.weight.dtype == torch.bfloat16, (
+        "Automodel no longer downgrades an explicit-fp32 load (likely PR #2419 landed); the "
+        "_disable_automodel_checkpoint_dtype_restore() workaround in setup.py is obsolete - "
+        "remove it and this test."
+    )

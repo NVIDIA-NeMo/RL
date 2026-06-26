@@ -253,6 +253,7 @@ def main():
     (
         policy,
         policy_generation,
+        _nemo_gym,
         cluster,
         dataloader,
         val_dataloader,
@@ -261,6 +262,8 @@ def main():
         checkpointer,
         grpo_state,
         master_config,
+        _teacher_worker_groups,
+        _alias_to_group_alias,
     ) = setup(config, tokenizer, dataset, val_dataset)
 
     grpo_train(

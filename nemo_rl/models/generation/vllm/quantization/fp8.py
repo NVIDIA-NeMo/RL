@@ -82,7 +82,7 @@ def monkey_patch_vllm_ray_executor(fp8_config):
     if fp8_config.model_parallel_size > 1:
         # we patch vllm's collective_rpc so that before vllm initalizes the model on each rank, we execute
         # a ray remote that patches each worker with the required fp8 vllm patches
-        from vllm.v1.executor.ray_distributed_executor import RayDistributedExecutor
+        from vllm.v1.executor.ray_executor import RayDistributedExecutor
 
         original_run_workers = RayDistributedExecutor.collective_rpc
 
@@ -475,7 +475,7 @@ def maybe_post_process_fp8_weight_block(layer: torch.nn.Module):
     # requantize the weight and input to the specific scale
     # at the same time.
     should_use_deepgemm = should_use_deepgemm_for_fp8_linear(
-        layer.orig_dtype, layer.weight
+        layer.orig_dtype, layer.weight.shape
     )
     if should_use_deepgemm:
         dg_weight, dg_weight_scale = deepgemm_post_process_fp8_weight_block(
@@ -564,9 +564,12 @@ def process_weights_after_loading_moe(self, layer) -> None:
     getattr(layer, f"w13_{self.weight_scale_name}").copy_(w13_scale)
     getattr(layer, f"w2_{self.weight_scale_name}").copy_(w2_scale)
 
-    # Set up the MoE kernel (same as upstream _setup_kernel but without replace_parameter).
+    # Set up the MoE kernel on initial load only (same as upstream _setup_kernel
+    # but without replace_parameter). Gate on is None, not hasattr, because
+    # FusedMoEMethodBase.__init__ always sets moe_kernel=None. Also skips refit
+    # calls (finalize_layerwise_reload) which lack set_current_vllm_config context.
     self.moe_quant_config = self.get_fused_moe_quant_config(layer)
-    if self.moe_quant_config:
+    if self.moe_quant_config and self.moe_kernel is None:
         from vllm.model_executor.layers.quantization.fp8 import make_fp8_moe_kernel
 
         assert self.experts_cls is not None
@@ -644,8 +647,8 @@ def process_weights_after_loading_kv(self, layer) -> None:
     else:
         prob_scale = 1.0
 
-    is_singleton_float = (
-        lambda x: isinstance(x, float)
+    is_singleton_float = lambda x: (
+        isinstance(x, float)
         or isinstance(x, torch.Tensor)
         and x.numel() == 1
         and x.is_floating_point()
