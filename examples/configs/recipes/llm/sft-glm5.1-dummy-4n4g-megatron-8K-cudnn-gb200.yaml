@@ -1,0 +1,108 @@
+defaults: ../../sft.yaml
+
+sft:
+  max_num_steps: 2
+  val_at_start: false
+  val_at_end: false
+  val_period: 100
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/sft-glm5.1-dummy-4n4g-megatron-dsa-cp2-pp1-ep8-seq8192-cudnn-gb200
+  save_period: 2
+
+policy:
+  model_name: /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/songlinj/glm5.1-dummy-model
+  tokenizer:
+    name: /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/songlinj/glm5.1-dummy-model
+    chat_template: default
+  train_global_batch_size: 64
+  train_micro_batch_size: 1
+  max_total_sequence_length: 8192
+  dtensor_cfg:
+    enabled: false
+  sequence_packing:
+    enabled: true
+  make_sequence_length_divisible_by: ${mul:${policy.megatron_cfg.tensor_model_parallel_size},
+    ${mul:2, ${policy.megatron_cfg.context_parallel_size}}}
+  optimizer: null
+  megatron_cfg:
+    enabled: true
+    converter_type: GlmMoeDsaForCausalLM
+    force_reconvert_from_hf: false
+    env_vars:
+      CUDA_DEVICE_MAX_CONNECTIONS: "1"
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 8
+    context_parallel_size: 2
+    cp_comm_type: all_gather
+    sequence_parallel: true
+    activation_checkpointing: false
+    freeze_moe_router: true
+    moe_token_dispatcher_type: allgather
+    apply_rope_fusion: false
+    defer_fp32_logits: true
+    dsa_indexer_rope_interleaved: true
+    dsa_indexer_rotate_activation: false
+    dsa_indexer_k_norm_epsilon: 1.0e-6
+    dsa_kernel_backend: cudnn
+    dsa_indexer_loss_coeff: 0.0
+    dsa_indexer_use_sparse_loss: false
+    moe_router_dtype: fp32
+    moe_router_load_balancing_type: none
+    moe_router_bias_update_rate: 0.0
+    moe_shared_expert_overlap: false
+    gradient_accumulation_fusion: false
+    moe_permute_fusion: true
+    moe_grouped_gemm: true
+    bias_activation_fusion: true
+    deallocate_pipeline_outputs: true
+    persist_layer_norm: true
+    bias_dropout_fusion: true
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+      overlap_param_gather: true
+    peft:
+      enabled: false
+    optimizer:
+      lr: 5.0e-07
+      min_lr: 5.0e-08
+      weight_decay: 0.0
+      adam_beta2: 0.999
+      adam_eps: 1.0e-08
+      use_precision_aware_optimizer: false
+    scheduler:
+      lr_warmup_iters: 2
+      lr_warmup_init: 5.0e-08
+
+data:
+  add_generation_prompt: true
+  num_workers: 8
+  train:
+    dataset_name: OpenMathInstruct-2
+    output_key: generated_solution
+    split: train_1M
+    split_validation_size: 0.05
+    seed: ${sft.seed}
+  validation: null
+  default:
+    prompt_file: examples/prompts/math.txt
+
+logger:
+  log_dir: logs/sft-glm5.1-dummy-4n4g-megatron-dsa-cp2-pp1-ep8-seq8192-cudnn-gb200
+  wandb_enabled: true
+  tensorboard_enabled: true
+  monitor_gpus: true
+  wandb:
+    project: nemo-rl-glm
+    name: sft-glm5.1-dummy-4n4g-megatron-dsa-cp2-pp1-ep8-seq8192-cudnn-gb200
+  tensorboard:
+    log_dir: tb_logs-sft-glm5.1-dummy-4n4g-megatron-dsa-cp2-pp1-ep8-seq8192-cudnn-gb200
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 4

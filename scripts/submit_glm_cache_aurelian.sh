@@ -27,11 +27,13 @@ if [[ -f "$SECRETS_FILE" ]]; then
 fi
 
 RECIPE=${RECIPE:-examples/configs/recipes/llm/grpo-glm5.1-32n8g-megatron.yaml}
+RUN_SCRIPT=${RUN_SCRIPT:-./examples/run_grpo.py}
+MAX_STEPS_KEY=${MAX_STEPS_KEY:-grpo.max_num_steps}
 
-CONTAINER=${CONTAINER:-/lustre/fsw/portfolios/llmservice/projects/llmservice_modelalignment_ppo/users/slikhite/images/nemo-rl-latest.sqsh}
+CONTAINER=${CONTAINER:-/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_genai/users/slikhite/images/nemo-rl-nightly.sqsh}
 ACCOUNT=${ACCOUNT:-coreai_dlalgo_genai}
 PARTITION=${PARTITION:-batch}
-HF_HOME=${HF_HOME:-/lustre/fsw/portfolios/llmservice/users/slikhite/hf_home}
+HF_HOME=${HF_HOME:-/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_genai/users/slikhite/hf_home}
 HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-$HF_HOME/datasets}
 HF_TOKEN=${HF_TOKEN:-xxx}
 WANDB_API_KEY=${WANDB_API_KEY:-xxx}
@@ -57,7 +59,7 @@ for var_name in CONTAINER ACCOUNT PARTITION HF_HOME HF_DATASETS_CACHE; do
 done
 
 RECIPE_NUM_NODES=$(recipe_num_nodes)
-MODEL_NAME=${MODEL_NAME:-/lustre/fsw/portfolios/llmservice/users/slikhite/hf_home/hub/models--zai-org--GLM-5.1/snapshots/442b5279043b5f43f382003e7272731f680e1393}
+MODEL_NAME=${MODEL_NAME:-}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 NUM_NODES=${NUM_NODES:-${RECIPE_NUM_NODES:-8}}
 WALLTIME=${WALLTIME:-4:00:00}
@@ -86,7 +88,7 @@ NEMO_RL_VENV_DIR=${NEMO_RL_VENV_DIR:-$PROJECT_ROOT/venvs-glm51-grpo$GLM51_CACHE_
 UV_CACHE_DIR_OVERRIDE=${UV_CACHE_DIR_OVERRIDE:-$PROJECT_ROOT/.uv-cache-glm51-grpo$GLM51_CACHE_SUFFIX}
 NRL_FORCE_REBUILD_VENVS=${NRL_FORCE_REBUILD_VENVS:-false}
 NRL_REFIT_BUFFER_MEMORY_RATIO=${NRL_REFIT_BUFFER_MEMORY_RATIO:-0.02}
-PYTORCH_ALLOC_CONF=${PYTORCH_ALLOC_CONF:-}
+PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-${PYTORCH_ALLOC_CONF:-}}
 EXTRA_MOUNTS=${EXTRA_MOUNTS:-${MOUNTS:-}}
 EXTRA_OVERRIDES=${EXTRA_OVERRIDES:-}
 
@@ -98,10 +100,13 @@ MOUNTS="$BASE_MOUNTS"
 
 CACHE_SETUP="mkdir -p '$NEMO_RL_VENV_DIR' '$UV_CACHE_DIR_OVERRIDE'; if [[ '$GLM51_SEED_UV_CACHE' == 'true' && ! -f '$UV_CACHE_DIR_OVERRIDE/.nemo_rl_seeded' && -d /root/.cache/uv ]]; then cp -a /root/.cache/uv/. '$UV_CACHE_DIR_OVERRIDE/' && touch '$UV_CACHE_DIR_OVERRIDE/.nemo_rl_seeded'; elif [[ '$GLM51_SEED_UV_CACHE' != 'true' ]]; then touch '$UV_CACHE_DIR_OVERRIDE/.nemo_rl_seeded'; fi"
 RUNTIME_ENV="export NEMO_RL_VENV_DIR='$NEMO_RL_VENV_DIR'; export UV_CACHE_DIR='$UV_CACHE_DIR_OVERRIDE'; export NRL_FORCE_REBUILD_VENVS='$NRL_FORCE_REBUILD_VENVS'; export NRL_REFIT_BUFFER_MEMORY_RATIO='$NRL_REFIT_BUFFER_MEMORY_RATIO';"
-if [[ -n "$PYTORCH_ALLOC_CONF" ]]; then
-    RUNTIME_ENV="$RUNTIME_ENV export PYTORCH_ALLOC_CONF='$PYTORCH_ALLOC_CONF';"
+if [[ -n "$PYTORCH_CUDA_ALLOC_CONF" ]]; then
+    RUNTIME_ENV="$RUNTIME_ENV export PYTORCH_CUDA_ALLOC_CONF='$PYTORCH_CUDA_ALLOC_CONF';"
 fi
-TRAIN_COMMAND="uv run ./examples/run_grpo.py --config $RECIPE policy.model_name=$MODEL_NAME policy.tokenizer.name=$MODEL_NAME grpo.max_num_steps=$MAX_STEPS logger.log_dir=$LOG_DIR logger.wandb_enabled=$WANDB_ENABLED logger.wandb.project=$WANDB_PROJECT logger.wandb.name=$WANDB_NAME logger.monitor_gpus=$MONITOR_GPUS logger.tensorboard_enabled=$TENSORBOARD_ENABLED checkpointing.enabled=$CHECKPOINTING_ENABLED checkpointing.checkpoint_dir=$CKPT_DIR checkpointing.save_period=$CHECKPOINT_SAVE_PERIOD cluster.num_nodes=$NUM_NODES cluster.gpus_per_node=$GPUS_PER_NODE"
+TRAIN_COMMAND="uv run $RUN_SCRIPT --config $RECIPE $MAX_STEPS_KEY=$MAX_STEPS logger.log_dir=$LOG_DIR logger.wandb_enabled=$WANDB_ENABLED logger.wandb.project=$WANDB_PROJECT logger.wandb.name=$WANDB_NAME logger.monitor_gpus=$MONITOR_GPUS logger.tensorboard_enabled=$TENSORBOARD_ENABLED checkpointing.enabled=$CHECKPOINTING_ENABLED checkpointing.checkpoint_dir=$CKPT_DIR checkpointing.save_period=$CHECKPOINT_SAVE_PERIOD cluster.num_nodes=$NUM_NODES cluster.gpus_per_node=$GPUS_PER_NODE"
+if [[ -n "$MODEL_NAME" ]]; then
+    TRAIN_COMMAND="$TRAIN_COMMAND policy.model_name=$MODEL_NAME policy.tokenizer.name=$MODEL_NAME"
+fi
 if [[ -n "${FORCE_RECONVERT_FROM_HF:-}" ]]; then
     TRAIN_COMMAND="$TRAIN_COMMAND policy.megatron_cfg.force_reconvert_from_hf=$FORCE_RECONVERT_FROM_HF"
 fi
@@ -127,7 +132,11 @@ if [[ -n "${DRYRUN:-}" ]]; then
     echo "[DRYRUN] PARTITION=$PARTITION"
     echo "[DRYRUN] HF_HOME=$HF_HOME"
     echo "[DRYRUN] HF_DATASETS_CACHE=$HF_DATASETS_CACHE"
-    echo "[DRYRUN] MODEL_NAME=$MODEL_NAME"
+    if [[ -n "$MODEL_NAME" ]]; then
+        echo "[DRYRUN] MODEL_NAME=$MODEL_NAME"
+    else
+        echo "[DRYRUN] MODEL_NAME=<recipe default>"
+    fi
     echo "[DRYRUN] NUM_NODES=$NUM_NODES"
     echo "[DRYRUN] GPUS_PER_NODE=$GPUS_PER_NODE"
     echo "[DRYRUN] SLURM_COMMENT=$SLURM_COMMENT"
@@ -138,7 +147,10 @@ if [[ -n "${DRYRUN:-}" ]]; then
     echo "[DRYRUN] UV_CACHE_DIR_OVERRIDE=$UV_CACHE_DIR_OVERRIDE"
     echo "[DRYRUN] NRL_FORCE_REBUILD_VENVS=$NRL_FORCE_REBUILD_VENVS"
     echo "[DRYRUN] NRL_REFIT_BUFFER_MEMORY_RATIO=$NRL_REFIT_BUFFER_MEMORY_RATIO"
+    echo "[DRYRUN] PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-<unset>}"
     echo "[DRYRUN] DEEP_GEMM_PREFLIGHT=$DEEP_GEMM_PREFLIGHT"
+    echo "[DRYRUN] RUN_SCRIPT=$RUN_SCRIPT"
+    echo "[DRYRUN] MAX_STEPS_KEY=$MAX_STEPS_KEY"
     if [[ -n "$HF_TOKEN" ]]; then
         echo "[DRYRUN] HF_TOKEN=<set>"
     else

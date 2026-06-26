@@ -179,9 +179,15 @@ mcore = [
   "flashinfer-cubin==0.6.8.post1",
   "flashinfer-jit-cache==0.6.8.post1",
   "flash_mla ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
-  "nvidia-cudnn-frontend[cutedsl]>=1.24.1 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "nvidia-cudnn-frontend==1.25.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "nvidia-cutlass-dsl[cu13]==4.5.2 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "cuda-python",
+  "apache-tvm-ffi",
   "nvshmem4py-cu13>=0.2.1",
   "cupy-cuda13x",
+  # nvidia-cutlass-dsl may inspect/import cupy.testing while generating the
+  # cudnn DSA kernel IR; cupy.testing imports pytest at runtime.
+  "pytest>=9.0.3",
 ]
 modelopt = ["nvidia-modelopt"]
 nvrx = [
@@ -263,7 +269,7 @@ mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "a14b1dff
 nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v1.1.4.post7" }
 emerging-optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.2.0" }
 fast-hadamard-transform = { git = "https://github.com/Dao-AILab/fast-hadamard-transform.git" }
-flash_mla = { git = "https://github.com/deepseek-ai/FlashMLA", rev = "9edee0c022cd0938148a18e334203b0aab43aa19" }
+flash_mla = { git = "https://github.com/deepseek-ai/FlashMLA", branch = "nv_dev" }
 nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "c897fbeaaff66d53d61033f107885b7c5432f235" }
 nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", tag = "v0.6.0" }
 flashinfer-jit-cache = { index = "flashinfer-cu130" }
@@ -329,7 +335,7 @@ override-dependencies = [
   "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@release_v2.15",
   "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",
-  "nvidia-cudnn-frontend[cutedsl]>=1.24.1 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "nvidia-cudnn-frontend==1.25.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "nvidia-nvshmem-cu13>=3.6.5; sys_platform != 'darwin'",
   "opencv-python-headless>=4.11.0",
   "timm<=1.0.22",
@@ -344,7 +350,7 @@ override-dependencies = [
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
   # vLLM 0.20.0 imports CUTLASS CUTE during Qwen3.5 MoE profiling.
   # 4.5.0 has a broken cutlass.cute import path for increment_coord.
-  "nvidia-cutlass-dsl[cu13]>=4.5.2",
+  "nvidia-cutlass-dsl[cu13]==4.5.2",
   # Relax megatron-core workspace member's opentelemetry-api ceiling (<1.34) for protobuf 6.x compat with ray
   "opentelemetry-api>=1.33.1",
   # Override sglang's xgrammar==0.1.32 to address CVE GHSA-7rgv-gqhr-fxg3

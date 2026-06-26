@@ -405,9 +405,18 @@ def stream_weights_via_ipc_zmq_impl(
         if buffer_b is not None:
             del buffer_b
 
-        # Force garbage collection and clear CUDA cache
+        # Force garbage collection and clear CUDA cache.  Cache release is
+        # best-effort cleanup after the IPC stream has already completed; do
+        # not fail refit if the allocator itself raises while emptying cache.
         gc.collect()
-        torch.cuda.empty_cache()
+        try:
+            torch.cuda.empty_cache()
+        except RuntimeError as e:
+            print(
+                f"{worker_name} (rank {rank}): WARNING: "
+                f"torch.cuda.empty_cache() failed during IPC cleanup: {e}",
+                flush=True,
+            )
 
 
 def rebuild_cuda_tensor_from_ipc(
