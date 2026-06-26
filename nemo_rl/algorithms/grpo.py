@@ -4170,18 +4170,18 @@ def async_grpo_train(
                         )
                         checkpointer.finalize_checkpoint(checkpoint_path)
 
-                        cp_info_path = os.path.join(
+                        ckpt_info_path = os.path.join(
                             str(checkpointer.checkpoint_dir),
                             "training_info.json",
                         )
-                        cp_info: dict[str, Any] = {}
-                        if os.path.exists(cp_info_path):
-                            with open(cp_info_path) as f:
-                                cp_info = json.load(f)
-                        cp_info["last_successful_cp_save_completion"] = time.time()
-                        cp_info["last_checkpoint_step"] = step + 1
-                        with open(cp_info_path, "w") as f:
-                            json.dump(cp_info, f)
+                        ckpt_info: dict[str, Any] = {}
+                        if os.path.exists(ckpt_info_path):
+                            with open(ckpt_info_path) as f:
+                                ckpt_info = json.load(f)
+                        ckpt_info["last_successful_cp_save_completion"] = time.time()
+                        ckpt_info["last_checkpoint_step"] = step + 1
+                        with open(ckpt_info_path, "w") as f:
+                            json.dump(ckpt_info, f)
 
             # Logging
             # Log training data (match sync GRPO logging payload for parity)

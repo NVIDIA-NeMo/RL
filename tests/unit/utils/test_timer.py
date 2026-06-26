@@ -315,7 +315,7 @@ class TestTimerLogging:
 
     def test_start_stop_logs(self, caplog):
         timer = Timer(context={"rank": 2, "worker": "policy"})
-        with caplog.at_level(logging.INFO, logger="nemo_rl.utils.timer"):
+        with caplog.at_level(logging.DEBUG, logger="nemo_rl.utils.timer"):
             timer.start("idle/refit_bubble")
             timer.stop("idle/refit_bubble")
 
@@ -329,7 +329,7 @@ class TestTimerLogging:
 
     def test_record_logs(self, caplog):
         timer = Timer(context={"rank": 0, "worker": "generation"})
-        with caplog.at_level(logging.INFO, logger="nemo_rl.utils.timer"):
+        with caplog.at_level(logging.DEBUG, logger="nemo_rl.utils.timer"):
             timer.record("wasted/failed_trajectory", 3.14)
 
         assert len(caplog.records) == 1
@@ -342,7 +342,7 @@ class TestTimerLogging:
 
     def test_mark_logs(self, caplog):
         timer = Timer(context={"rank": 5, "worker": "generation"})
-        with caplog.at_level(logging.INFO, logger="nemo_rl.utils.timer"):
+        with caplog.at_level(logging.DEBUG, logger="nemo_rl.utils.timer"):
             timer.mark("vllm/worker_crashed", metadata={"error": "OOM"})
 
         assert len(caplog.records) == 1
@@ -354,7 +354,7 @@ class TestTimerLogging:
 
     def test_mark_without_metadata_logs(self, caplog):
         timer = Timer(context={"worker": "collector"})
-        with caplog.at_level(logging.INFO, logger="nemo_rl.utils.timer"):
+        with caplog.at_level(logging.DEBUG, logger="nemo_rl.utils.timer"):
             timer.mark("heartbeat")
 
         assert len(caplog.records) == 1
@@ -365,7 +365,7 @@ class TestTimerLogging:
     def test_no_context_still_logs(self, caplog):
         """Without explicit context, log messages still contain hostname, label, event, and UTC timestamp."""
         timer = Timer()
-        with caplog.at_level(logging.INFO, logger="nemo_rl.utils.timer"):
+        with caplog.at_level(logging.DEBUG, logger="nemo_rl.utils.timer"):
             timer.start("x")
             timer.stop("x")
             timer.record("y", 1.0)
@@ -392,7 +392,7 @@ class TestTimerLogging:
 
     def test_context_manager_logs_start_end(self, caplog):
         timer = Timer(context={"rank": 1, "worker": "policy"})
-        with caplog.at_level(logging.INFO, logger="nemo_rl.utils.timer"):
+        with caplog.at_level(logging.DEBUG, logger="nemo_rl.utils.timer"):
             with timer.time("idle/validation"):
                 pass
 
@@ -410,7 +410,7 @@ class TestTimerLogging:
                 "job_id": "slurm-123",
             }
         )
-        with caplog.at_level(logging.INFO, logger="nemo_rl.utils.timer"):
+        with caplog.at_level(logging.DEBUG, logger="nemo_rl.utils.timer"):
             timer.mark("event")
 
         msg = caplog.records[0].message
@@ -425,7 +425,7 @@ class TestTimerLogging:
         import re
 
         timer = Timer(context={"worker": "test"})
-        with caplog.at_level(logging.INFO, logger="nemo_rl.utils.timer"):
+        with caplog.at_level(logging.DEBUG, logger="nemo_rl.utils.timer"):
             timer.start("op")
             timer.stop("op")
 
@@ -453,14 +453,14 @@ class TestTimerLogging:
         timer = Timer(context={"worker": "test", "hostname": "custom-host"})
         assert timer._context["hostname"] == "custom-host"
 
-        with caplog.at_level(logging.INFO, logger="nemo_rl.utils.timer"):
+        with caplog.at_level(logging.DEBUG, logger="nemo_rl.utils.timer"):
             timer.start("op")
         assert "hostname=custom-host" in caplog.records[0].message
 
     def test_thread_safe_timer_logs(self, caplog):
         """ThreadSafeTimer delegates to super() which has the logging calls."""
         timer = ThreadSafeTimer(context={"rank": 3, "worker": "collector"})
-        with caplog.at_level(logging.INFO, logger="nemo_rl.utils.timer"):
+        with caplog.at_level(logging.DEBUG, logger="nemo_rl.utils.timer"):
             timer.record("idle/buffer_full_backoff", 1.23)
 
         assert len(caplog.records) == 1
@@ -476,6 +476,14 @@ class TestThreadSafeTimer:
     @pytest.fixture
     def timer(self):
         return ThreadSafeTimer()
+
+    def test_thread_safe_timer_should_log(self, caplog):
+        """ThreadSafeTimer forwards should_log to the base Timer."""
+        timer = ThreadSafeTimer()
+        with caplog.at_level(logging.DEBUG, logger="nemo_rl.utils.timer"):
+            timer.start("quiet", should_log=False)
+            timer.stop("quiet", should_log=False)
+        assert caplog.records == []
 
     def test_basic_operations(self, timer):
         """Test that ThreadSafeTimer has the same API as Timer."""

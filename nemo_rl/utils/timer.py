@@ -108,7 +108,7 @@ class Timer:
             raise ValueError(f"Timer '{label}' is already running")
         self._start_times[label] = time.perf_counter()
         if should_log:
-            logger.info(self._fmt(label, "start"))
+            logger.debug(self._fmt(label, "start"))
 
     def stop(self, label: str, should_log: bool = True) -> float:
         """Stop timing for the given label and return the elapsed time.
@@ -133,7 +133,7 @@ class Timer:
         self._timers[label].append(elapsed)
         del self._start_times[label]
         if should_log:
-            logger.info(self._fmt(label, f"end elapsed={elapsed:.4f}s"))
+            logger.debug(self._fmt(label, f"end elapsed={elapsed:.4f}s"))
         return elapsed
 
     def record(self, label: str, elapsed: float) -> None:
@@ -149,7 +149,7 @@ class Timer:
         if label not in self._timers:
             self._timers[label] = []
         self._timers[label].append(elapsed)
-        logger.info(self._fmt(label, f"record elapsed={elapsed:.4f}s"))
+        logger.debug(self._fmt(label, f"record elapsed={elapsed:.4f}s"))
 
     def mark(self, label: str, metadata: Optional[dict] = None) -> float:
         """Record a point-in-time event at the current Unix epoch.
@@ -173,7 +173,7 @@ class Timer:
             self._markers[label] = []
         self._markers[label].append((ts, metadata))
         event = f"mark meta={metadata}" if metadata else "mark"
-        logger.info(self._fmt(label, event))
+        logger.debug(self._fmt(label, event))
         return ts
 
     def get_markers(
@@ -348,13 +348,13 @@ class ThreadSafeTimer(Timer):
         super().__init__(context=context)
         self._lock = threading.RLock()
 
-    def start(self, label: str) -> None:
+    def start(self, label: str, should_log: bool = True) -> None:
         with self._lock:
-            super().start(label)
+            super().start(label, should_log)
 
-    def stop(self, label: str) -> float:
+    def stop(self, label: str, should_log: bool = True) -> float:
         with self._lock:
-            return super().stop(label)
+            return super().stop(label, should_log)
 
     def record(self, label: str, elapsed: float) -> None:
         with self._lock:
@@ -371,14 +371,14 @@ class ThreadSafeTimer(Timer):
             return super().get_markers(label)
 
     @contextmanager
-    def time(self, label: str) -> Generator[None, None, None]:
+    def time(self, label: str, should_log: bool = True) -> Generator[None, None, None]:
         # start/stop are individually locked; no need to hold the lock
         # across the yielded block (that would serialize all timed code).
-        self.start(label)
+        self.start(label, should_log)
         try:
             yield
         finally:
-            self.stop(label)
+            self.stop(label, should_log)
 
     def get_elapsed(self, label: str) -> list[float]:
         with self._lock:

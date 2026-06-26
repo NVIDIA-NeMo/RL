@@ -21,6 +21,7 @@ import torch
 from nemo_rl.algorithms.grpo import MasterConfig
 from nemo_rl.algorithms.utils import (
     EFFICIENCY_CATEGORIES,
+    WALL_CLOCK_EFFICIENCY_CATEGORIES,
     calculate_baseline_and_std_per_prompt,
     get_tokenizer,
     maybe_pad_last_batch,
@@ -668,11 +669,12 @@ class TestPrintEfficiencySummary:
 
         for cat in EFFICIENCY_CATEGORIES:
             assert f"efficiency/{cat}_s" in result
-            assert f"efficiency/{cat}_pct" in result
             assert result[f"efficiency/{cat}_s"] == 1.0
+            if cat in WALL_CLOCK_EFFICIENCY_CATEGORIES:
+                assert f"efficiency/{cat}_pct" in result
 
         assert result["efficiency/total_waste_s"] == 8.0
-        assert result["efficiency/efficiency_pct"] == pytest.approx(92.0)
+        assert result["efficiency/efficiency_pct"] == pytest.approx(96.0)
 
     def test_efficiency_with_collector_metrics_merge(self):
         """Test merging driver and collector metrics before computing efficiency."""
@@ -685,68 +687,15 @@ class TestPrintEfficiencySummary:
 
         result = print_efficiency_summary(merged, total_wall_time_s=50.0, step=3)
 
-        assert result["efficiency/total_waste_s"] == 11.0
-        assert result["efficiency/efficiency_pct"] == pytest.approx(78.0)
-
-
-class TestPrintEfficiencySummary:
-    def test_basic_efficiency_calculation(self, capsys):
-        """Test that efficiency is computed correctly from metrics."""
-        metrics = {
-            "init/total": 10.0,
-            "idle/buffer_starvation": 5.0,
-            "idle/refit_bubble": 3.0,
-            "idle/validation": 2.0,
-        }
-        total_wall = 100.0
-
-        result = print_efficiency_summary(metrics, total_wall, step=1)
-
-        assert result["efficiency/total_waste_s"] == 20.0
-        assert result["efficiency/productive_time_s"] == 80.0
-        assert result["efficiency/efficiency_pct"] == pytest.approx(80.0)
-        assert result["efficiency/total_wall_time_s"] == 100.0
-
-        assert result["efficiency/init/total_s"] == 10.0
-        assert result["efficiency/init/total_pct"] == pytest.approx(10.0)
-        assert result["efficiency/idle/buffer_starvation_s"] == 5.0
-
-        assert result["efficiency/idle/buffer_full_backoff_s"] == 0.0
-        assert result["efficiency/wasted/failed_trajectory_s"] == 0.0
-
-        captured = capsys.readouterr()
-        assert "Efficiency Summary (Step 1)" in captured.out
-        assert "80.00%" in captured.out
-
-    def test_zero_wall_time(self):
-        """Test that zero wall time produces 100% efficiency."""
-        result = print_efficiency_summary({}, total_wall_time_s=0.0, step=0)
-        assert result["efficiency/efficiency_pct"] == 100.0
-        assert result["efficiency/total_waste_s"] == 0.0
-
-    def test_all_categories_present(self):
-        """Test that all EFFICIENCY_CATEGORIES appear in the output."""
-        metrics = {cat: 1.0 for cat in EFFICIENCY_CATEGORIES}
-        result = print_efficiency_summary(metrics, total_wall_time_s=100.0, step=5)
-
-        for cat in EFFICIENCY_CATEGORIES:
-            assert f"efficiency/{cat}_s" in result
-            assert f"efficiency/{cat}_pct" in result
-            assert result[f"efficiency/{cat}_s"] == 1.0
-
         assert result["efficiency/total_waste_s"] == 8.0
-        assert result["efficiency/efficiency_pct"] == pytest.approx(92.0)
+        assert result["efficiency/thread_seconds_total_s"] == 3.0
+        assert result["efficiency/efficiency_pct"] == pytest.approx(84.0)
 
-    def test_efficiency_with_collector_metrics_merge(self):
-        """Test merging driver and collector metrics before computing efficiency."""
-        driver = {"init/total": 5.0, "idle/refit_bubble": 3.0}
-        collector = {"idle/buffer_full_backoff": 2.0, "wasted/failed_trajectory": 1.0}
+    def test_wall_waste_clamped_to_wall_time(self):
+        """Wall-clock waste is capped so efficiency stays in [0, 100]."""
+        metrics = {cat: 30.0 for cat in WALL_CLOCK_EFFICIENCY_CATEGORIES}
+        result = print_efficiency_summary(metrics, total_wall_time_s=60.0, step=2)
 
-        merged = {**driver}
-        for cat, dur in collector.items():
-            merged[cat] = merged.get(cat, 0.0) + dur
-
-        result = print_efficiency_summary(merged, total_wall_time_s=50.0, step=3)
-
-        assert result["efficiency/total_waste_s"] == 11.0
-        assert result["efficiency/efficiency_pct"] == pytest.approx(78.0)
+        assert result["efficiency/total_waste_s"] == 60.0
+        assert result["efficiency/productive_time_s"] == 0.0
+        assert result["efficiency/efficiency_pct"] == 0.0
