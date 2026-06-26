@@ -230,19 +230,15 @@ def setup(
         "A generation config in the PolicyConfig is required for PPO"
     )
 
-    # Value model on Megatron does not yet support sequence packing or context
-    # parallelism in the training-path forward. Reject up front rather than
-    # crashing inside a Megatron forward.
-    # Tracked at https://github.com/NVIDIA-NeMo/RL/issues/2687.
-    if value_config.get("megatron_cfg", {}).get("enabled", False):
-        assert not value_config["sequence_packing"]["enabled"], (
-            "Sequence packing is currently not supported for the Megatron PPO "
-            "value model. See https://github.com/NVIDIA-NeMo/RL/issues/2687"
-        )
-        assert value_config["megatron_cfg"]["context_parallel_size"] == 1, (
-            "Context parallelism (CP>1) is currently not supported for the "
-            "Megatron PPO value model. See "
-            "https://github.com/NVIDIA-NeMo/RL/issues/2687"
+    # Context parallelism for the Megatron value model requires sequence packing,
+    # matching Megatron-Core (CP shards are produced/reassembled per packed sequence).
+    if (
+        value_config["megatron_cfg"]["enabled"]
+        and value_config["megatron_cfg"]["context_parallel_size"] > 1
+    ):
+        assert value_config["sequence_packing"]["enabled"], (
+            "Context parallelism (CP>1) for the Megatron PPO value model requires "
+            "value.sequence_packing.enabled=true."
         )
 
     # Set seed for all random number generators

@@ -148,7 +148,7 @@ def _create_value_test_config(
 
 
 def _apply_config_updates(config: ValueConfig, config_updates: dict) -> None:
-    """Apply test config overrides in place (precision / SP / PP / dynamic batching)."""
+    """Apply test config overrides in place (precision / SP / PP / CP / dynamic batching / sequence packing)."""
     for k, v in config_updates.items():
         if k == "precision":
             config["precision"] = v
@@ -168,6 +168,21 @@ def _apply_config_updates(config: ValueConfig, config_updates: dict) -> None:
                 "logprob_mb_tokens": lbt,
                 "sequence_length_round": 64,
             }
+        elif k == "sequence_packing":
+            mbt = config["max_total_sequence_length"] * config["train_micro_batch_size"]
+            config["sequence_packing"] = {
+                "enabled": v,
+                "train_mb_tokens": mbt,
+                "logprob_mb_tokens": mbt,
+                "algorithm": "modified_first_fit_decreasing",
+            }
+        elif k == "context_parallel_size":
+            config["megatron_cfg"]["context_parallel_size"] = v
+            # CP splits each packed sequence into 2*CP load-balanced chunks, so
+            # the padded sequence length must be divisible by 2*CP*TP.
+            config["make_sequence_length_divisible_by"] = (
+                2 * v * config["megatron_cfg"]["tensor_model_parallel_size"]
+            )
         else:
             raise ValueError(f"Unknown config_updates key: {k!r}")
 
@@ -308,9 +323,30 @@ def test_value_worker_init_and_get_values(value_setup):
         (2, 2, 1, 1, {}),
         (2, 2, 1, 1, {"sequence_parallel": True}),
         (2, 1, 1, 1, {"dynamic_batching": True}),
+        (2, 1, 1, 1, {"sequence_packing": True}),
+        (2, 1, 2, 1, {"sequence_packing": True}),
+        (
+            2,
+            1,
+            1,
+            2,
+            {
+                "sequence_packing": True,
+                "context_parallel_size": 2,
+                "precision": "bfloat16",
+            },
+        ),
     ],
     indirect=True,
-    ids=["2gpu_dp2", "2gpu_tp2", "2gpu_tp2sp", "2gpu_dp2_dynbatch"],
+    ids=[
+        "2gpu_dp2",
+        "2gpu_tp2",
+        "2gpu_tp2sp",
+        "2gpu_dp2_dynbatch",
+        "2gpu_dp2_seqpack",
+        "2gpu_pp2_seqpack",
+        "2gpu_cp2_seqpack",
+    ],
 )
 def test_value_worker_train_step(value_setup):
     """One `train()` call should produce a finite, non-negative MSE value loss."""
@@ -342,8 +378,14 @@ def test_value_worker_train_step(value_setup):
         (2, {"sequence_parallel": True}),
         (1, {"dynamic_batching": True}),
         (1, {"pipeline_model_parallel_size": 2}),
+        (1, {"sequence_packing": True}),
     ],
-    ids=["sequence_parallel", "dynamic_batching", "pipeline_parallel"],
+    ids=[
+        "sequence_parallel",
+        "dynamic_batching",
+        "pipeline_parallel",
+        "sequence_packing",
+    ],
 )
 def test_value_worker_parallelism_equivalence(
     tiny_qwen2_model_path, tmp_path, tp, feature_updates
@@ -362,6 +404,8 @@ def test_value_worker_parallelism_equivalence(
       * pipeline parallelism — guards the head output broadcasts from the last
         pipeline stage to all ranks, and the value head reshards across a
         save@pp1 / load@pp2 checkpoint.
+      * sequence packing — guards the packed [1, T] -> [B, S] unpack + per-sequence
+        shift round-trips back to the unpacked layout.
     """
     cluster = None
     ref = None
@@ -419,6 +463,114 @@ def test_value_worker_parallelism_equivalence(
             feat.shutdown()
         if cluster is not None:
             cluster.shutdown()
+
+
+@pytest.mark.hf_gated
+@pytest.mark.timeout(420)
+def test_value_worker_context_parallel_equivalence(tiny_qwen2_model_path, tmp_path):
+    """Context parallelism must not change values.
+
+    CP needs bf16 (TransformerEngine has no fp32 CP + THD attention backend) and
+    sequence packing, so compare ``get_values`` between CP=1 and CP=2 — both
+    bf16 + packed — with the value head pinned via save/reload. Guards the
+    packed-sequence CP all-gather, which de-interleaves the 2*CP load-balanced
+    shards and reassembles per-token values (a wrong gather still yields finite
+    values, so finiteness alone would not catch it).
+    """
+    cluster = None
+    ref = None
+    feat = None
+    try:
+        cluster = RayVirtualCluster(
+            name="test-megatron-value-equiv-context_parallel",
+            bundle_ct_per_node_list=[2],
+            use_gpus=True,
+            num_gpus_per_node=2,
+            max_colocated_worker_groups=1,
+        )
+
+        torch.manual_seed(42)
+        batch, seq_len = 8, 64
+        data = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, 151000, (batch, seq_len)),
+                "input_lengths": torch.full((batch,), seq_len, dtype=torch.int32),
+                "attention_mask": torch.ones(batch, seq_len),
+            }
+        )
+
+        # Reference: CP=1, bf16, packed.
+        ref_config = _create_value_test_config(
+            model_name=tiny_qwen2_model_path, tp=1, precision="bfloat16"
+        )
+        _apply_config_updates(ref_config, {"sequence_packing": True})
+        tokenizer = get_tokenizer(ref_config["tokenizer"])
+        ref = Value(cluster=cluster, config=ref_config, tokenizer=tokenizer)
+        values_ref = ref.get_values(data)["values"].detach().cpu()
+
+        # Save weights, then reload into the CP=2 worker (same weights).
+        weights_path = os.path.join(str(tmp_path), "value", "weights")
+        ref.prepare_for_inference()
+        ref.save_checkpoint(weights_path=weights_path)
+        ref.shutdown()
+        ref = None
+
+        # Feature: CP=2, bf16, packed.
+        feat_config = _create_value_test_config(
+            model_name=tiny_qwen2_model_path, tp=1, precision="bfloat16"
+        )
+        _apply_config_updates(
+            feat_config, {"context_parallel_size": 2, "sequence_packing": True}
+        )
+        feat = Value(
+            cluster=cluster,
+            config=feat_config,
+            tokenizer=tokenizer,
+            weights_path=Path(weights_path),
+            name_prefix="lm_value_feat",
+        )
+        values_feat = feat.get_values(data)["values"].detach().cpu()
+
+        # bf16 tolerance, matching the policy CP equivalence test.
+        torch.testing.assert_close(values_feat, values_ref, rtol=1e-3, atol=1e-2)
+    finally:
+        if ref is not None:
+            ref.shutdown()
+        if feat is not None:
+            feat.shutdown()
+        if cluster is not None:
+            cluster.shutdown()
+
+
+@pytest.mark.mcore
+def test_unpack_value_sequences_variable_lengths():
+    """`_unpack_value_sequences` unpacks packed [1, T] values to [B, S] with a
+    per-sequence right-shift. Runs CPU-only (cp_group=None) and uses variable
+    lengths to cover what the uniform-length GPU equivalence test does not.
+    """
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        _unpack_value_sequences,
+    )
+
+    seqs = [
+        torch.tensor([1.0, 2.0, 3.0]),
+        torch.tensor([10.0, 20.0, 30.0, 40.0, 50.0]),
+        torch.tensor([7.0, 8.0]),
+    ]
+    packed = torch.cat(seqs).unsqueeze(0)  # [1, 10]
+    cu_seqlens_padded = torch.tensor([0, 3, 8, 10], dtype=torch.int32)
+    unpacked_seqlen = 5
+
+    out = _unpack_value_sequences(
+        packed, cu_seqlens_padded, unpacked_seqlen, cp_group=None
+    )
+
+    assert out.shape == (3, unpacked_seqlen)
+    expected = torch.zeros(3, unpacked_seqlen)
+    for i, v in enumerate(seqs):
+        # values[t] = V(state before token t): prepend 0, drop last.
+        expected[i, : v.shape[0]] = torch.cat([torch.zeros(1), v[:-1]])
+    torch.testing.assert_close(out, expected)
 
 
 @pytest.mark.hf_gated

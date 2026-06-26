@@ -1164,15 +1164,16 @@ class MseValueLossFn(LossFunction):
 
     def __call__(
         self,
-        values: torch.Tensor,
+        logits: torch.Tensor,
         data: BatchedDataDict,
         global_valid_seqs: torch.Tensor,
         global_valid_toks: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute Mean Squared Error value loss, optionally with clipping."""
         # Squeeze trailing singleton from value head output: [B, S, 1] -> [B, S]
-        if values.ndim > 2 and values.shape[-1] == 1:
-            values = values.squeeze(-1)
+        if logits.ndim > 2 and logits.shape[-1] == 1:
+            logits = logits.squeeze(-1)
+        values = logits
 
         token_mask = data["token_mask"]
         sample_mask = data["sample_mask"]

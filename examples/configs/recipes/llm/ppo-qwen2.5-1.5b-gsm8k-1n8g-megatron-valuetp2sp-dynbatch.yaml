@@ -1,12 +1,81 @@
-defaults: ../../ppo_gsm8k_1.5B_megatron.yaml
-value:
-  megatron_cfg:
-    sequence_parallel: true
-  dynamic_batching:
-    enabled: true
+defaults: ../../ppo_math_1B_megatron.yaml
+ppo:
+  num_prompts_per_step: 1024
+  num_generations_per_prompt: 1
+  max_num_epochs: 15
+  ppo_epochs: 1
+  val_period: 1
+  overlong_filtering: true
+  reward_shaping:
+    enabled: false
+  adv_estimator:
+    gae_lambda_value: 1.0
+    gae_lambda_policy: 1
+  reward_scaling:
+    enabled: false
+loss_fn:
+  ratio_clip_max: 0.2
+  ratio_clip_c: 3
+value_loss_fn:
+  scale: 1.0
+  cliprange: 0.5
 checkpointing:
   checkpoint_dir: results/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron-valuetp2sp-dynbatch
+policy:
+  model_name: Qwen/Qwen2.5-1.5B-Instruct
+  tokenizer:
+    name: Qwen/Qwen2.5-1.5B-Instruct
+  train_global_batch_size: 256
+  max_total_sequence_length: 1024
+  megatron_cfg:
+    tensor_model_parallel_size: 2
+    context_parallel_size: 2
+    sequence_parallel: true
+    optimizer:
+      weight_decay: 0.01
+    scheduler:
+      start_weight_decay: 0.01
+      end_weight_decay: 0.01
+      lr_warmup_iters: 0
+      lr_warmup_init: 0
+  make_sequence_length_divisible_by: 8
+  generation:
+    max_new_tokens: 512
+    vllm_cfg:
+      gpu_memory_utilization: 0.4
+      max_model_len: 1024
+value:
+  model_name: Qwen/Qwen2.5-1.5B-Instruct
+  tokenizer:
+    name: Qwen/Qwen2.5-1.5B-Instruct
+  train_micro_batch_size: 4
+  megatron_cfg:
+    tensor_model_parallel_size: 2
+    sequence_parallel: true
+    optimizer:
+      lr: 1.0e-05
+      weight_decay: 0.01
+    scheduler:
+      lr_warmup_iters: 0
+  dynamic_batching:
+    enabled: true
+data:
+  max_input_seq_length: 512
+  train:
+    dataset_name: gsm8k
+    split: train
+  validation:
+    dataset_name: gsm8k
+    split: test
+  default:
+    system_prompt_file: examples/prompts/gsm8k.txt
+env:
+  math:
+    math_verify_impl: hf_math_verify
 logger:
   log_dir: logs/ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron-valuetp2sp-dynbatch
   wandb:
+    project: nemo-rl
     name: ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron-valuetp2sp-dynbatch
+cluster:
+  gpus_per_node: 8
