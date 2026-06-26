@@ -28,6 +28,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from pydantic import ValidationError
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 import nemo_rl.algorithms.xtoken_off_policy_distillation as xt_mod
@@ -290,6 +291,16 @@ def _patched_setup_call(master_config, *, student_vocab=32, teacher_vocab=24):
             "loss": mock_loss_cls,
             "checkpointer": mock_cp_cls,
         }
+
+
+def test_empty_teachers_list_rejected_at_config_load():
+    """An empty ``teachers:`` list fails validation at config load."""
+    with pytest.raises(ValidationError) as exc_info:
+        MasterConfig(teachers=[])
+    assert any(
+        e["loc"] == ("teachers",) and e["type"] == "too_short"
+        for e in exc_info.value.errors()
+    )
 
 
 def test_setup_requires_dtensor_v2_student():

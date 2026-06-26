@@ -38,7 +38,7 @@ from typing import Any, NotRequired, Optional, TypedDict, cast
 
 import numpy as np
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
@@ -201,7 +201,7 @@ class TeacherConfig(BaseModel, extra="allow"):
 
 class MasterConfig(BaseModel, extra="allow"):
     policy: PolicyConfig  # student
-    teachers: list[TeacherConfig]
+    teachers: list[TeacherConfig] = Field(min_length=1)
     loss_fn: CrossTokenizerDistillationLossConfig
     data: DataConfig
     distillation: OffPolicyDistillationConfig
