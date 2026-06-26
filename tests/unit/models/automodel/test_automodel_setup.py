@@ -32,6 +32,7 @@ from nemo_rl.models.automodel.setup import (
     ModelAndOptimizerState,
     RuntimeConfig,
     _maybe_set_force_hf,
+    _optimizer_holds_master_weights,
     get_tokenizer,
     setup_distributed,
     setup_model_and_optimizer,
@@ -82,6 +83,46 @@ def mock_autoconfig():
     return config
 
 
+@pytest.fixture
+def fused_adam_optimizer():
+    """Optimizer config for TE FusedAdam holding its own fp32 master weights."""
+    return {
+        "name": "transformer_engine.pytorch.optimizers.fused_adam.FusedAdam",
+        "kwargs": {
+            "lr": 1e-4,
+            "master_weights": True,
+            "store_param_remainders": True,
+        },
+    }
+
+
+@pytest.mark.automodel
+class TestOptimizerHoldsMasterWeights:
+    """Test suite for the _optimizer_holds_master_weights helper."""
+
+    def test_adamw_has_no_internal_master(self, mock_config):
+        """Plain AdamW does not keep its own master weights."""
+        assert _optimizer_holds_master_weights(mock_config) is False
+
+    def test_fused_adam_with_master_weights(self, mock_config, fused_adam_optimizer):
+        """FusedAdam with master_weights=True keeps its own master weights."""
+        mock_config["optimizer"] = fused_adam_optimizer
+        assert _optimizer_holds_master_weights(mock_config) is True
+
+    def test_fused_adam_without_master_weights(self, mock_config):
+        """FusedAdam without master_weights=True is treated as masterless."""
+        mock_config["optimizer"] = {
+            "name": "transformer_engine.pytorch.optimizers.fused_adam.FusedAdam",
+            "kwargs": {"lr": 1e-4},
+        }
+        assert _optimizer_holds_master_weights(mock_config) is False
+
+    def test_missing_optimizer_section(self, mock_config):
+        """A missing optimizer section is treated as masterless."""
+        del mock_config["optimizer"]
+        assert _optimizer_holds_master_weights(mock_config) is False
+
+
 @pytest.mark.automodel
 class TestValidateAndPrepareConfig:
     """Test suite for validate_and_prepare_config function."""
@@ -117,6 +158,49 @@ class TestValidateAndPrepareConfig:
         assert result.model_class is not None
         assert result.model_config is not None
         assert isinstance(result.allow_flash_attn_args, bool)
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_masterless_optimizer_loads_fp32(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+    ):
+        """AdamW (no internal master) loads the model config in fp32."""
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
+
+        validate_and_prepare_config(mock_config, None, 0)
+
+        call_kwargs = mock_autoconfig_class.from_pretrained.call_args[1]
+        assert call_kwargs["torch_dtype"] == torch.float32
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    def test_optimizer_with_master_loads_compute_dtype(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+        fused_adam_optimizer,
+    ):
+        """FusedAdam with master_weights loads the model in the compute dtype."""
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
+        mock_config["optimizer"] = fused_adam_optimizer
+        mock_config["precision"] = "bfloat16"
+
+        validate_and_prepare_config(mock_config, None, 0)
+
+        call_kwargs = mock_autoconfig_class.from_pretrained.call_args[1]
+        assert call_kwargs["torch_dtype"] == torch.bfloat16
 
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")
@@ -907,6 +991,84 @@ class TestSetupModelAndOptimizer:
         )
         # Verify config= is NOT passed (avoids duplicate arg for custom models)
         assert "config" not in call_kwargs
+
+    @patch("nemo_rl.models.automodel.setup._disable_automodel_checkpoint_dtype_restore")
+    @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
+    @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
+    @patch("nemo_rl.models.automodel.setup.get_class")
+    def test_masterless_optimizer_disables_dtype_restore(
+        self,
+        mock_get_class,
+        mock_get_rank,
+        mock_lambda_lr,
+        mock_disable_restore,
+        mock_config,
+        mock_runtime_config,
+        mock_distributed_context,
+        mock_checkpoint_manager,
+        mock_tokenizer,
+    ):
+        """AdamW path keeps the fp32 master-weight restore workaround active."""
+        mock_get_rank.return_value = 0
+        mock_lambda_lr.return_value = MagicMock()
+
+        mock_model = MagicMock()
+        mock_model.state_dict.return_value = {}
+        mock_model.config = MagicMock()
+        mock_model.config.pad_token_id = 0
+        mock_runtime_config.model_class.from_pretrained.return_value = mock_model
+        mock_runtime_config.model_config.architectures = ["GPT2LMHeadModel"]
+        mock_get_class.return_value = MagicMock(return_value=MagicMock())
+
+        setup_model_and_optimizer(
+            config=mock_config,
+            tokenizer=mock_tokenizer,
+            runtime_config=mock_runtime_config,
+            distributed_context=mock_distributed_context,
+            checkpoint_manager=mock_checkpoint_manager,
+        )
+
+        mock_disable_restore.assert_called_once()
+
+    @patch("nemo_rl.models.automodel.setup._disable_automodel_checkpoint_dtype_restore")
+    @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
+    @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
+    @patch("nemo_rl.models.automodel.setup.get_class")
+    def test_optimizer_with_master_skips_dtype_restore(
+        self,
+        mock_get_class,
+        mock_get_rank,
+        mock_lambda_lr,
+        mock_disable_restore,
+        mock_config,
+        mock_runtime_config,
+        mock_distributed_context,
+        mock_checkpoint_manager,
+        mock_tokenizer,
+        fused_adam_optimizer,
+    ):
+        """FusedAdam-with-master path skips the (now unnecessary) restore workaround."""
+        mock_get_rank.return_value = 0
+        mock_lambda_lr.return_value = MagicMock()
+        mock_config["optimizer"] = fused_adam_optimizer
+
+        mock_model = MagicMock()
+        mock_model.state_dict.return_value = {}
+        mock_model.config = MagicMock()
+        mock_model.config.pad_token_id = 0
+        mock_runtime_config.model_class.from_pretrained.return_value = mock_model
+        mock_runtime_config.model_config.architectures = ["GPT2LMHeadModel"]
+        mock_get_class.return_value = MagicMock(return_value=MagicMock())
+
+        setup_model_and_optimizer(
+            config=mock_config,
+            tokenizer=mock_tokenizer,
+            runtime_config=mock_runtime_config,
+            distributed_context=mock_distributed_context,
+            checkpoint_manager=mock_checkpoint_manager,
+        )
+
+        mock_disable_restore.assert_not_called()
 
     @patch("nemo_rl.models.automodel.setup.torch.optim.lr_scheduler.LambdaLR")
     @patch("nemo_rl.models.automodel.setup.torch.distributed.get_rank")
