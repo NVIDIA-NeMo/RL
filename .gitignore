@@ -6,8 +6,10 @@
 *.tar
 *.tar.gz
 .venv
+.venvs/
 venv
 venvs
+venvs-*/
 __pycache__/
 _build/
 build/
@@ -31,6 +33,8 @@ tests/functional/*/
 
 # Cache
 uv_cache/
+.uv-cache/
+.uv-cache-*/
 hf_home/
 hf_datasets_cache/
 *logs/

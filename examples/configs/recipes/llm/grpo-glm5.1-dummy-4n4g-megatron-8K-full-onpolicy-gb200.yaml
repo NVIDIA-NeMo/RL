@@ -1,0 +1,38 @@
+defaults: ./grpo-glm5.1-64n4g-megatron-8K-full-onpolicy-gb200.yaml
+
+checkpointing:
+  checkpoint_dir: results/grpo-glm5.1-dummy-4n4g-megatron-dsa-cp2-pp1-ep8-seq8192-full-onpolicy-gb200
+
+policy:
+  model_name: /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/songlinj/glm5.1-dummy-model
+  tokenizer:
+    name: /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/songlinj/glm5.1-dummy-model
+  megatron_cfg:
+    force_reconvert_from_hf: false
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 8
+    env_vars:
+      CUDA_DEVICE_MAX_CONNECTIONS: "1"
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 4
+      expert_parallel_size: 8
+    vllm_kwargs:
+      enable_chunked_prefill: true
+      attention_config:
+        backend: FLASHMLA_SPARSE
+      kernel_config:
+        moe_backend: flashinfer_cutlass
+
+logger:
+  log_dir: logs/grpo-glm5.1-dummy-4n4g-megatron-dsa-cp2-pp1-ep8-seq8192-full-onpolicy-gb200
+  wandb:
+    name: grpo-glm5.1-dummy-4n4g-megatron-dsa-cp2-pp1-ep8-seq8192-full-onpolicy-gb200
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 4

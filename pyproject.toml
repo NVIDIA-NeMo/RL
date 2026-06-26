@@ -199,8 +199,16 @@ mcore = [
   "flashinfer-python==0.6.8.post1",
   "flashinfer-cubin==0.6.8.post1",
   "flashinfer-jit-cache==0.6.8.post1",
+  "flash_mla ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "nvidia-cudnn-frontend==1.25.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "nvidia-cutlass-dsl[cu13]==4.5.2 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "cuda-python",
+  "apache-tvm-ffi",
   "nvshmem4py-cu13>=0.2.1",
   "cupy-cuda13x",
+  # nvidia-cutlass-dsl may inspect/import cupy.testing while generating the
+  # cudnn DSA kernel IR; cupy.testing imports pytest at runtime.
+  "pytest>=9.0.3",
 ]
 # TRT-LLM is built from source via 3rdparty/TensorRT-LLM-workspace's custom PEP 517
 # backend (_backend.py). The path source lets uv lock resolve the dep graph
@@ -284,6 +292,7 @@ triton = [
 causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", rev = "4f6ae4e26ae5fe8af9372f8d312ab25cc4595223" }
 mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "a14b1dff0454a3bc27d9eb31355dc01e4b2490ec" }
 nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v1.1.4.post7" }
+flash_mla = { git = "https://github.com/deepseek-ai/FlashMLA", branch = "nv_dev" }
 nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "c3b913b9cc1d82d5a0af9fa77b4db87829e6f158" }
 nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", tag = "v0.6.0" }
 flashinfer-jit-cache = { index = "flashinfer-cu130" }
@@ -330,6 +339,7 @@ no-build-isolation-package = [
   "fast-hadamard-transform",
   "deep_gemm",
   "deep_ep",
+  "flash_mla",
   "nv-grouped-gemm",          # from mlm (added here to make sure it's built no isolation since mlm workspace uses setup.py)
   "tensorrt-llm",             # custom PEP 517 backend calls build-custom-trtllm.sh; needs torch/CUDA from main venv
 ]
@@ -353,7 +363,7 @@ override-dependencies = [
   "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@release_v2.15",
   "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",
-  "nvidia-cudnn-frontend==1.23.0",
+  "nvidia-cudnn-frontend==1.25.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # NCCL 2.30.4 fixes a context-parallel hang on GB200 when GPUs are non-contiguous.
   # An override is required because torch 2.11.0+cu130 pins nvidia-nccl-cu13==2.28.9.
   "nvidia-nccl-cu13==2.30.4",
