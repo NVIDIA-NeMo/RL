@@ -45,17 +45,7 @@ from tests.unit.models.generation.sglang.weight_update_actor import MockFSDPWork
 
 from .helpers import make_actor_env_vars, post_and_assert_200
 
-pytestmark = [
-    pytest.mark.sglang,
-    # Temporarily skipped: starts a real SGLang server, which fails during CUDA
-    # graph capture ("CuTe Experimental module is only supported on Cuda toolkit
-    # 13.1 and above!"). Same environment issue as PR #2881 — reproduces on main,
-    # not caused by this branch.
-    pytest.mark.skip(
-        reason="SGLang server CUDA-graph capture fails (CuTe requires CUDA "
-        "toolkit >= 13.1); same env issue as PR #2881, fails on main too."
-    ),
-]
+pytestmark = pytest.mark.sglang
 
 
 @pytest.fixture(scope="module")
