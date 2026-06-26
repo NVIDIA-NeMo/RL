@@ -34,8 +34,8 @@ run_test() {
     fi
 }
 
+run_test fast uv run --no-sync bash ./tests/functional/ppo_automodel.sh
 run_test fast uv run --no-sync bash ./tests/functional/ppo_megatron.sh
-run_test fast uv run --no-sync bash ./tests/functional/ppo_dtensor.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then
