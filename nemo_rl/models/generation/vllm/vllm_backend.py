@@ -27,6 +27,12 @@ from nemo_rl.models.policy.utils import (
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
+from nemo_rl.weight_sync.nccl_reshard_utils import (
+    HFToLocalParamMap,
+    LocalParamSpec,
+    RefitCtx,
+    _extract_layer_prefix,
+)
 
 try:
     import vllm  # noqa: F401
@@ -132,7 +138,45 @@ class VllmInternalWorkerExtension:
         self.model_update_group = StatelessProcessGroup(  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
             master_address=ip, port=port, rank=rank, world_size=world_size
         )
+        # Free cached torch-allocator blocks so NCCL's P2P transport buffers
+        # (raw cudaMalloc at comm init) have headroom; otherwise comm_init OOMs
+        # on memory-tight shapes (mirror the train side).
+        torch.cuda.empty_cache()
         self.model_update_group.init_nccl_communicator(device=self.device)
+
+    def init_nccl_reshard_comm_group(
+        self,
+        rank_prefix: int,
+        pp_ips: list[str],
+        pp_ports: list[int],
+        pp_size: int,
+        train_ranks_per_stage: int,
+        sub_world_size: int,
+    ) -> None:
+        """Bootstrap this gen worker's nccl_reshard bulk-path comm group(s).
+
+        One comm group per PP stage; gen workers join ALL ``pp_size`` groups
+        (they need every stage's layers), created in stage order so the train
+        ranks (each in only their own stage) unblock deterministically.
+        Non-PP is simply ``pp_size == 1`` that contains all the gen ranks.
+        """
+        from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
+
+        local_rank = torch.distributed.get_rank()
+        gen_rank_in_group = train_ranks_per_stage + rank_prefix + local_rank
+
+        # Free cached blocks so NCCL P2P buffers have headroom (see init_collective).
+        torch.cuda.empty_cache()
+        self.pp_comm_groups = {}  # pyrefly: ignore[implicitly-defined-attribute]
+        for stage in range(pp_size):
+            group = StatelessProcessGroup(
+                master_address=pp_ips[stage],
+                port=pp_ports[stage],
+                rank=gen_rank_in_group,
+                world_size=sub_world_size,
+            )
+            group.init_nccl_communicator(device=self.device)
+            self.pp_comm_groups[stage] = group
 
     def report_device_id(self) -> str:
         """Retrieve the UUID of the current CUDA device."""
@@ -520,6 +564,327 @@ class VllmInternalWorkerExtension:
 
     def finish_sparse_delta_refit(self) -> dict[str, Any]:
         return self._get_sparse_delta_applier().finish_sparse_delta_refit()
+
+    def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
+        """Restore per-layer param metadata and build the HF→vLLM mapping.
+
+        Done once ahead of refit; the cached mapping is reused by every
+        ``nccl_reshard_refit`` call.
+        """
+        from nemo_rl.weight_sync.nccl_reshard_utils import (
+            restore_refit_info_placements,
+        )
+
+        self.nccl_reshard_refit_info = (  # pyrefly: ignore[implicitly-defined-attribute]
+            restore_refit_info_placements(refit_info)
+        )
+        # Build HFToLocalParamMap (see nccl_reshard_utils)
+        self.hf_to_local_param_map = self.build_hf_to_local_param_map(  # pyrefly: ignore[implicitly-defined-attribute]
+            self.nccl_reshard_refit_info
+        )
+
+    def build_hf_to_local_param_map(self, refit_info: dict) -> HFToLocalParamMap:
+        """Build the vLLM-backend ``hf_to_local_param_map`` (HFToLocalParamMap).
+
+        Wraps the ``(vllm_param, merged_slice)`` resolution from
+        ``_build_hf_to_gen_backend_mapping`` into ``LocalParamSpec``s:
+        - direct (slice ``None``): ``base`` is the live vLLM param; receive in place.
+        - merged (dense ``gate_up_proj`` / grouped-expert ``w13``): ``pre`` allocs a
+          recv buffer for this component's ``region`` slice, ``post`` copies it back
+          (region recomputed each refit to track live storage).
+        """
+
+        def _merged_param_spec(vllm_param, merged_slice):
+            def pre(_base):
+                region = vllm_param.data[merged_slice]
+                return RefitCtx(buf=torch.empty_like(region), extra={"region": region})
+
+            def post(ctx):
+                ctx.extra["region"].copy_(ctx.buf)
+
+            return LocalParamSpec(base=vllm_param, pre=pre, post=post)
+
+        # Get dict of vllm_param and merged_slice for each hf_name
+        vllm_param_map_and_slices = self._build_hf_to_gen_backend_mapping(refit_info)
+        return HFToLocalParamMap(
+            specs={
+                hf_name: (
+                    LocalParamSpec(base=vllm_param.data)
+                    if merged_slice is None
+                    else _merged_param_spec(vllm_param, merged_slice)
+                )
+                for hf_name, (
+                    vllm_param,
+                    merged_slice,
+                ) in vllm_param_map_and_slices.items()
+            }
+        )
+
+    def _build_hf_to_gen_backend_mapping(self, refit_info):
+        """Map each FFN HF param name to its gen-backend param and slice.
+
+        Only ``gate_proj`` / ``up_proj`` / ``down_proj`` ``.weight``
+        (dense MLP and MoE experts) reach here.
+        Returns ``hf_name -> (vllm_param, merged_param_slice or None)``; the
+        slice (``None`` for a 1:1 direct map) is the local region of a fused
+        vLLM param this HF piece occupies, applied by the LocalParamSpec
+        pre/post hooks.  The three shapes:
+
+          - grouped MoE experts: gate/up -> ``w13_weight`` halves (dim 1),
+            down -> ``w2_weight`` (direct).
+          - dense MLP gate/up    -> ``gate_up_proj`` halves (dim 0).
+          - dense MLP down       -> ``down_proj`` (direct 1:1).
+        """
+        vllm_params = dict(self.model_runner.model.named_parameters())
+        # Module lookup: to detect the selected backend off the FusedMoE layer
+        vllm_modules = dict(self.model_runner.model.named_modules())
+        mapping = {}
+
+        # Collect FFN param names + global shapes from refit_info, plus the
+        # grouped-expert tag (gate_proj/up_proj/down_proj) for MoE params.
+        hf_shapes = {}  # hf_name -> global_shape
+        hf_grouped = {}  # hf_name -> "gate_proj"|"up_proj"|"down_proj" (MoE only)
+        for layer_name in refit_info["layer_names"]:
+            # p is a dict of param info
+            for p in refit_info["per_layer_params"][layer_name]:
+                hf_shapes[p["name"]] = tuple(p["global_shape"])
+                if p.get("grouped_expert_proj"):
+                    hf_grouped[p["name"]] = p["grouped_expert_proj"]
+
+        # Check if this model uses gated MLP layer (e.g., SwiGLU, Gated ReLU^2)
+        has_gate = {
+            name.rsplit(".gate_proj.weight", 1)[0]
+            for name, proj in hf_grouped.items()
+            if proj == "gate_proj"
+        }
+
+        # Resolve an HF FFN name to its vLLM param name.  The two differ only in
+        # the module prefix before ``layers.N`` (e.g. NemotronH's HF ``backbone.``
+        # vs vLLM ``model.``); the layer-relative suffix is identical.  Index the
+        # real vLLM names by that suffix so any prefix rename resolves generically
+        # instead of hardcoding per-model swaps.  Matching-prefix models (most)
+        # hit the exact-name fast path and never touch the index.
+        def _layer_relative(name: str) -> str:
+            prefix = _extract_layer_prefix(name)
+            return name[len(prefix) + 1 :] if prefix else name
+
+        vllm_by_relative = {_layer_relative(n): n for n in vllm_params}
+
+        def _to_vllm_name(n: str) -> str:
+            if n in vllm_params:
+                return n
+            return vllm_by_relative.get(_layer_relative(n), n)
+
+        for hf_name in hf_shapes:
+            # 1) Grouped MoE expert params (gate_proj/up_proj/down_proj, each
+            #    [E, ...]). vLLM fuses them as w13_weight (gate||up on the
+            #    intermediate axis) and w2_weight (down). The received
+            #    Shard(1)/Shard(2) shard is placed into the right w13/w2 region by
+            #    the LocalParamSpec pre/post hooks (for the gated w13 halves).
+            # Caveat: Dispatch on the grouped_expert_proj TAG, NOT the suffix,
+            #   so dense gate_proj/up_proj (-> gate_up_proj, rule below) don't collide.
+            grouped_proj = hf_grouped.get(hf_name)
+            if grouped_proj is not None:
+                # e.g.) expert_prefix = model.layers.3.mlp.experts
+                expert_prefix = hf_name.rsplit(f".{grouped_proj}.weight", 1)[0]
+                vllm_suffix = (
+                    "w2_weight" if grouped_proj == "down_proj" else "w13_weight"
+                )
+                # e.g.) vllm_name = model.layers.3.mlp.experts.w13_weight
+                vllm_name = _to_vllm_name(f"{expert_prefix}.{vllm_suffix}")
+                if vllm_name not in vllm_params:
+                    raise ValueError(
+                        f"_build_hf_to_gen_backend_mapping: grouped expert {hf_name!r} has "
+                        f"no vLLM target {vllm_name!r}; refit would silently drop "
+                        f"the expert weights."
+                    )
+                # vllm_param is a torch.Tensor corresponding to the vllm_name
+                vllm_param = vllm_params[vllm_name]
+                if grouped_proj == "down_proj" or expert_prefix not in has_gate:
+                    # Case for non-gated MLP layer or down_proj (w2)
+                    # Weights are not merged, so the mapping is 1:1
+                    mapping[hf_name] = (vllm_param, None)
+                else:
+                    # Gated MLP: vLLM fuses gate (w1) + up (w3) into w13 along the
+                    # intermediate axis (dim 1).  Standard layout is [gate; up]:
+                    # gate -> [:, :P, :], up -> [:, P:2P, :].  The FlashInfer
+                    # CUTLASS unquantized MoE backend instead stores w13 as
+                    # [w3; w1] = [up; gate]
+                    P = vllm_param.shape[1] // 2
+                    moe_mod = vllm_modules.get(vllm_name.rsplit(".", 1)[0])
+                    backend = getattr(
+                        getattr(moe_mod, "quant_method", None),
+                        "unquantized_backend",
+                        None,
+                    )
+                    backend = getattr(backend, "name", "")
+                    if backend == "FLASHINFER_TRTLLM":
+                        # TRTLLM also block-reorders w13 (beyond the swap);
+                        # Requires more changes to the refit logic to support.
+                        # TODO: need to support TRTLLM backend in the future.
+                        raise ValueError(
+                            f"nccl_reshard refit: gen MoE backend {backend!r} reorders "
+                            "w13 in a way the refit does not reproduce; run gen with "
+                            "the TRITON or FlashInfer CUTLASS MoE backend."
+                        )
+                    if backend == "FLASHINFER_CUTLASS":  # live w13 is [up; gate]
+                        sl = (
+                            slice(P, 2 * P)
+                            if grouped_proj == "gate_proj"
+                            else slice(0, P)
+                        )
+                    else:  # standard [gate; up]
+                        sl = (
+                            slice(0, P)
+                            if grouped_proj == "gate_proj"
+                            else slice(P, 2 * P)
+                        )
+                    mapping[hf_name] = (vllm_param, (slice(None), sl, slice(None)))
+                continue
+
+            # 2) Direct 1:1 (dense down_proj; also non-gated dense up_proj, which
+            #    vLLM keeps unmerged).
+            vllm_direct = _to_vllm_name(hf_name)
+            if vllm_direct in vllm_params:
+                mapping[hf_name] = (vllm_params[vllm_direct], None)
+                continue
+
+            # 3) Gated dense MLP: gate/up fuse into gate_up_proj along dim 0,
+            #    [gate; up] -> gate=[0:I_local], up=[I_local:2*I_local], where
+            #    I_local = intermediate // gen TP (even split, gate==up size).
+            if hf_name.endswith(("gate_proj.weight", "up_proj.weight")):
+                is_gate = hf_name.endswith("gate_proj.weight")
+                suffix = "gate_proj.weight" if is_gate else "up_proj.weight"
+                prefix = hf_name[: -len(suffix)]
+                vllm_name = _to_vllm_name(prefix + "gate_up_proj.weight")
+                if vllm_name in vllm_params:
+                    tp = refit_info.get("gen_tp_size", 1)
+                    gate_local = hf_shapes[prefix + "gate_proj.weight"][0] // tp
+                    up_local = hf_shapes[prefix + "up_proj.weight"][0] // tp
+                    sl = (
+                        slice(0, gate_local)
+                        if is_gate
+                        else slice(gate_local, gate_local + up_local)
+                    )
+                    mapping[hf_name] = (vllm_params[vllm_name], (sl,))
+                    continue
+
+            raise ValueError(
+                f"_build_hf_to_gen_backend_mapping: no vLLM param for {hf_name!r} "
+                f"(no grouped-expert / direct / gate_up-merge match). Only FFN "
+                f"gate/up/down weights should reach the bulk path."
+            )
+
+        return mapping
+
+    def nccl_reshard_refit(self) -> bool:
+        """Receive weights from training workers via xferdtensor.
+
+        Each HF param's ``LocalParamSpec`` (from ``hf_to_local_param_map``,
+        built once in ``prepare_nccl_reshard_refit_info``) provides the dst buffer:
+        for a direct param xferdtensor receives straight into the live vLLM
+        param (no hooks); for a merged param (dense gate_up_proj, grouped w13)
+        ``pre`` allocates a temp recv buffer and ``post`` copies the TP-local
+        slice back into the live merged param.
+        """
+        import os
+        from collections import OrderedDict
+
+        from nemo_rl.weight_sync.xferdtensor import DTensorRef, xferdtensor
+
+        def _recv_one_param(param_info, group, stream):
+            # Coverage guard: every bulk param must have a spec; a missing entry
+            # would silently discard its weights.
+            spec = self.hf_to_local_param_map.get(param_info["name"])
+            assert spec is not None, (
+                f"nccl_reshard_refit: {param_info['name']!r} has no spec in "
+                "hf_to_local_param_map (would silently discard its weights)"
+            )
+            # spec.pre/post run on the caller's current stream (this stage's
+            # stream); xferdtensor should use the same stream.
+            ctx = (
+                spec.pre(spec.base) if spec.pre is not None else RefitCtx(buf=spec.base)
+            )
+            dst_tensor = DTensorRef(ctx.buf, param_info["global_shape"])
+            xferdtensor(
+                None,
+                param_info["src_mesh_info"],
+                param_info["src_placements"],
+                dst_tensor,
+                param_info["dst_mesh_info"],
+                param_info["dst_placements"],
+                group,
+                stream,
+            )
+            if spec.post is not None:
+                spec.post(ctx)
+
+        # Group params by PP stage so different stages' bulk reshards run
+        # concurrently on their own streams.  Non-PP = single stage 0 (params
+        # carry no "pp_stage" key), so this collapses to one stage / one stream.
+        stage_params = OrderedDict()
+        for layer_name in self.nccl_reshard_refit_info["layer_names"]:
+            for p in self.nccl_reshard_refit_info["per_layer_params"][layer_name]:
+                stage_params.setdefault(p.get("pp_stage", 0), []).append(p)
+
+        num_streams = min(
+            int(os.environ.get("NRL_REFIT_NUM_STREAMS", "2")), len(stage_params)
+        )
+
+        streams = [torch.cuda.Stream() for _ in range(num_streams)]
+        events = {}
+        for idx, (stage, params) in enumerate(stage_params.items()):
+            # synchronize the last run in the same stream
+            if (idx - num_streams) in events:
+                events[idx - num_streams].synchronize()
+            stage_stream = streams[idx % num_streams]
+            with torch.cuda.stream(stage_stream):
+                group = self.pp_comm_groups[stage]
+                for p in params:
+                    _recv_one_param(p, group, stage_stream)
+                ev = torch.cuda.Event()
+                ev.record()
+                events[idx] = ev
+
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+        import time
+
+        misc_t0 = time.perf_counter()
+        self._receive_and_load_misc_params()
+        torch.cuda.synchronize()
+        if torch.distributed.get_rank() == 0:
+            print(
+                f"[nccl_reshard_refit] misc recv+load (gen side): "
+                f"{time.perf_counter() - misc_t0:.2f}s",
+                flush=True,
+            )
+        torch.cuda.empty_cache()
+
+        # Finalize FP8 KV-cache per-layer k/v scales after the misc broadcast.
+        self._maybe_process_fp8_kv_cache()
+        return True
+
+    def _receive_and_load_misc_params(self) -> None:
+        """Receive misc params via packed_broadcast and load via vLLM."""
+        from nemo_rl.weight_sync.nccl_reshard_utils import _STR_TO_DTYPE
+
+        misc_meta = self.nccl_reshard_refit_info.get("misc_meta", {})
+        if not misc_meta:
+            return
+
+        misc_state_dict_info = {
+            name: (tuple(meta["shape"]), _STR_TO_DTYPE[meta["dtype"]])
+            for name, meta in misc_meta.items()
+        }
+
+        packed_broadcast_consumer(
+            iterator=iter(misc_state_dict_info.items()),
+            group=self.model_update_group,
+            src=0,
+            post_unpack_func=self._load_weights,
+        )
 
     def cleanup(self) -> None:
         """Shutdown and cleanup resources."""
