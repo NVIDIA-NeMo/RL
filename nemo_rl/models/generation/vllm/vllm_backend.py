@@ -19,6 +19,11 @@ from typing import Any
 import torch
 import zmq
 
+from nemo_rl.distributed.nccl_xfer_utils import (
+    HFToLocalParamMap,
+    LocalParamSpec,
+    RefitCtx,
+)
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
     calculate_aligned_size,
@@ -441,8 +446,46 @@ class VllmInternalWorkerExtension:
         self.nccl_xfer_refit_info = (  # pyrefly: ignore[implicitly-defined-attribute]
             restore_refit_info_placements(refit_info)
         )
-        self._hf_to_gen_param = self._build_hf_to_gen_backend_mapping(  # pyrefly: ignore[implicitly-defined-attribute]
+        # Build HFToLocalParamMap (see nccl_xfer_utils)
+        self.hf_to_local_param_map = self.build_hf_to_local_param_map(  # pyrefly: ignore[implicitly-defined-attribute]
             self.nccl_xfer_refit_info
+        )
+
+    def build_hf_to_local_param_map(self, refit_info: dict) -> HFToLocalParamMap:
+        """Build the vLLM-backend ``hf_to_local_param_map`` (HFToLocalParamMap).
+
+        Wraps the ``(vllm_param, merged_slice)`` resolution from
+        ``_build_hf_to_gen_backend_mapping`` into ``LocalParamSpec``s:
+        - direct (slice ``None``): ``base`` is the live vLLM param; receive in place.
+        - merged (qkv / gate_up / w13 / fused_qkv_a): ``pre`` allocs a recv buffer
+          for this component's ``region`` slice, ``post`` copies it back (region
+          recomputed each refit to track live storage).
+        """
+
+        def _merged_param_spec(vllm_param, merged_slice):
+            def pre(_base):
+                region = vllm_param.data[merged_slice]
+                return RefitCtx(buf=torch.empty_like(region), extra={"region": region})
+
+            def post(ctx):
+                ctx.extra["region"].copy_(ctx.buf)
+
+            return LocalParamSpec(base=vllm_param, pre=pre, post=post)
+
+        # Get dict of vllm_param and merged_slice for each hf_name
+        vllm_param_map_and_slices = self._build_hf_to_gen_backend_mapping(refit_info)
+        return HFToLocalParamMap(
+            specs={
+                hf_name: (
+                    LocalParamSpec(base=vllm_param.data)
+                    if merged_slice is None
+                    else _merged_param_spec(vllm_param, merged_slice)
+                )
+                for hf_name, (
+                    vllm_param,
+                    merged_slice,
+                ) in vllm_param_map_and_slices.items()
+            }
         )
 
     def _build_hf_to_gen_backend_mapping(self, refit_info):
@@ -521,7 +564,7 @@ class VllmInternalWorkerExtension:
             #    [E, ...]). vLLM fuses them as w13_weight (gate||up on the
             #    intermediate axis) and w2_weight (down). The received
             #    Shard(1)/Shard(2) shard is placed into the right w13/w2 region by
-            #    get_dst_dtensor (+ its post_refit_hook for the gated w13 halves).
+            #    the LocalParamSpec pre/post hooks (for the gated w13 halves).
             # Caveat: Dispatch on the grouped_expert_proj TAG, NOT the suffix,
             #   so dense gate_proj/up_proj (-> gate_up_proj, rule below) don't collide.
             grouped_proj = hf_grouped.get(hf_name)
@@ -634,77 +677,33 @@ class VllmInternalWorkerExtension:
 
         return mapping
 
-    def get_dst_dtensor(self, param_name, param_info):
-        """Get destination tensor info for xferdtensor.
-
-        Takes an HF parameter name and returns a tuple suitable for calling
-        the canonical 7-arg xferdtensor. Handles two cases:
-
-        1. **Direct param**: HF name maps 1:1 to a vLLM parameter.
-           Returns DTensorRef wrapping the vLLM param with global shape.
-        2. **Merged param**: HF name is part of a merged vLLM tensor
-           (qkv_proj, gate_up_proj, fused_qkv_a_proj). Returns DTensorRef
-           wrapping a buffer shaped like this component's slice of the merged
-           param, plus a post_refit_hook that copies it in.
-
-        ``_build_hf_to_gen_backend_mapping`` guarantees every bulk param falls
-        into one of these (it raises if a param has no vLLM target), so a param
-        with no mapping entry here is a coverage regression and raises
-        ValueError rather than silently discarding its weights.
-
-        Must be called after ``_hf_to_gen_param`` is populated (inside ``nccl_xfer_refit``).
-
-        Returns:
-            ``(dst_tensor, post_refit_hook)`` where:
-            - ``dst_tensor``: DTensorRef to pass to xferdtensor
-            - ``post_refit_hook``: callable to run after xferdtensor
-              (copies the TP-local slice from the temp buffer into the live
-              vLLM merged param), or None for direct params
-        """
-        from nemo_rl.distributed.xferdtensor import DTensorRef
-
-        vllm_param, merged_param_slice = self._hf_to_gen_param.get(
-            param_name, (None, None)
-        )
-        global_shape = param_info["global_shape"]
-
-        if vllm_param is None:
-            raise ValueError(
-                f"get_dst_dtensor: {param_name!r} has no entry in the HF->gen "
-                f"mapping; _build_hf_to_gen_backend_mapping did not enumerate it. "
-                f"This would silently discard the param's weights."
-            )
-
-        if merged_param_slice is not None:
-            # If the param is a merged param, we need to copy the received data
-            # from the temp buffer into the live generation backend merged param.
-            region = vllm_param.data[merged_param_slice]
-            buf = torch.empty_like(region)
-
-            def post_refit_hook(_buf=buf, _region=region):
-                _region.copy_(_buf)
-
-            return DTensorRef(buf, global_shape), post_refit_hook
-
-        return DTensorRef(vllm_param.data, global_shape), None
-
     def nccl_xfer_refit(self) -> bool:
         """Receive weights from training workers via xferdtensor.
 
-        Uses ``get_dst_dtensor`` to prepare each parameter, then calls the
-        canonical 7-arg ``xferdtensor``. For merged params (qkv_proj,
-        gate_up_proj), a post_refit_hook copies the TP-local slice. The
-        HF→vLLM mapping is built once in ``prepare_nccl_xfer_refit_info``.
+        Each HF param's ``LocalParamSpec`` (from ``hf_to_local_param_map``,
+        built once in ``prepare_nccl_xfer_refit_info``) provides the dst buffer:
+        for a direct param xferdtensor receives straight into the live vLLM
+        param (no hooks); for a merged param (qkv_proj, gate_up_proj, w13)
+        ``pre`` allocates a temp recv buffer and ``post`` copies the TP-local
+        slice back into the live merged param.
         """
         import os
         from collections import OrderedDict
 
-        from nemo_rl.distributed.xferdtensor import xferdtensor
+        from nemo_rl.distributed.xferdtensor import DTensorRef, xferdtensor
 
         def _recv_one_param(param_info, group):
-            dst_tensor, post_refit_hook = self.get_dst_dtensor(
-                param_info["name"], param_info
+            # Coverage guard: every bulk param must have a spec; a missing entry
+            # would silently discard its weights.
+            spec = self.hf_to_local_param_map.get(param_info["name"])
+            assert spec is not None, (
+                f"nccl_xfer_refit: {param_info['name']!r} has no spec in "
+                "hf_to_local_param_map (would silently discard its weights)"
             )
+            ctx = (
+                spec.pre(spec.base) if spec.pre is not None else RefitCtx(buf=spec.base)
+            )
+            dst_tensor = DTensorRef(ctx.buf, param_info["global_shape"])
             xferdtensor(
                 None,
                 param_info["src_mesh_info"],
@@ -714,8 +713,8 @@ class VllmInternalWorkerExtension:
                 param_info["dst_placements"],
                 group,
             )
-            if post_refit_hook:
-                post_refit_hook()
+            if spec.post is not None:
+                spec.post(ctx)
 
         use_per_stage = hasattr(self, "pp_comm_groups") and self.pp_comm_groups
         num_streams = (

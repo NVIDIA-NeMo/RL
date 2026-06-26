@@ -51,6 +51,11 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
+from nemo_rl.distributed.nccl_xfer_utils import (
+    HFToLocalParamMap,
+    LocalParamSpec,
+    RefitCtx,
+)
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
@@ -1706,18 +1711,10 @@ class MegatronPolicyWorkerImpl(
             gen_world_size,
             layer_to_pp_stage=layer_to_pp_stage,
         )
-        # _param_map is a dictionary that holds the pointer to the real local tensor
-        # All of the non-misc params should be in the _param_map.
-        # _param_map[hf_name:str] -> [local_tensor:Torch.Tensor]
-        self._param_map = {
-            name: tensor for name, tensor in self._iter_local_hf_param_shards()
-        }
-        # _expert_groups is a
-        # Dict[(hf_layer_name.layer_id.expert:str, expert_param_suffix:str)]
-        # -> List[local_tensor:Torch.Tensor]   (index-sorted _param_map views)
-        # Later at the refit time, you just need to call torch.stack to
-        # consolidate the expert tensors into one tensor.
-        self._expert_groups = self._build_expert_groups()
+        # Build HFToLocalParamMap (see nccl_xfer_utils)
+        self.hf_to_local_param_map = self.build_hf_to_local_param_map(
+            self.nccl_xfer_refit_info
+        )
 
         # Keep the misc_meta in the nccl_xfer_refit_info
         # misc_meta[hf_name] -> [shape, dtype]
@@ -1744,15 +1741,16 @@ class MegatronPolicyWorkerImpl(
 
         return self.nccl_xfer_refit_info
 
-    def _build_expert_groups(self):
+    def _build_expert_groups(self, param_map):
         """Group this rank's local expert params into stack-ready views.
 
-        Keyed by (prefix, proj_type) and resolved to ordered ``_param_map``
+        Keyed by (prefix, proj_type) and resolved to ordered ``param_map``
         views ready for ``torch.stack``.
 
         Megatron exposes each expert's projection as a separate param; this bins
         them so ``_group_experts`` can stack a layer's experts into one grouped
-        HF tensor per projection.  Built once in ``prepare_nccl_xfer_refit_info``.
+        HF tensor per projection.  Called from ``build_hf_to_local_param_map``
+        with this rank's local ``param_map``.
 
         ``_INDIVIDUAL_EXPERT_RE`` captures three fields from a name like
         ``model.layers.3.mlp.experts.17.gate_proj.weight``:
@@ -1762,14 +1760,14 @@ class MegatronPolicyWorkerImpl(
         so the name keys into ``("model.layers.3.mlp.experts", "gate_proj")``.
 
         Returns ``{(prefix, proj): [tensor_0, tensor_1, ...]}`` — the per-expert
-        ``_param_map`` views sorted by expert index.  Example — a layer with 2
+        ``param_map`` views sorted by expert index.  Example — a layer with 2
         local experts (gated MoE) yields three keys:
           ``(".../experts", "gate_proj"): [view(expert 0), view(expert 1)]``
           ``(".../experts", "up_proj")  : [view(expert 0), view(expert 1)]``
           ``(".../experts", "down_proj"): [view(expert 0), view(expert 1)]``
 
         Resolving names → views here (rather than per refit in ``_group_experts``)
-        costs nothing extra — ``_param_map`` already owns these views and they
+        costs nothing extra — ``param_map`` already owns these views and they
         stay valid across refits (weights are updated in place; the name→view
         mapping is stable), so ``_group_experts`` only has to ``torch.stack``.
         The index sort matters: the views are stacked in this order, so expert 0
@@ -1779,7 +1777,7 @@ class MegatronPolicyWorkerImpl(
         from nemo_rl.distributed.nccl_xfer_utils import _INDIVIDUAL_EXPERT_RE
 
         index_groups: dict[tuple[str, str], list[tuple[int, str]]] = {}
-        for name in self._param_map:
+        for name in param_map:
             # find all the expert params
             m = _INDIVIDUAL_EXPERT_RE.match(name)
             if m:
@@ -1788,17 +1786,17 @@ class MegatronPolicyWorkerImpl(
                 index_groups.setdefault((m.group(1), m.group(3)), []).append(
                     (int(m.group(2)), name)
                 )
-        # Sort by expert index, then resolve each name to its _param_map view once.
+        # Sort by expert index, then resolve each name to its param_map view once.
         return {
-            key: [self._param_map[n] for _, n in sorted(idx_names)]
+            key: [param_map[n] for _, n in sorted(idx_names)]
             for key, idx_names in index_groups.items()
         }
 
     def _group_experts(self, proj, grouped_name, expert_groups):
         """Stack this rank's local experts for one projection into ``[E_local, ...]``.
 
-        Using the pre-calculated expert_groups (=self._expert_groups) it is
-        just calling torch.stack of all the local expert params.
+        Using the pre-calculated ``expert_groups`` (from ``_build_expert_groups``)
+        it is just calling torch.stack of all the local expert params.
         """
         prefix = grouped_name.rsplit(f".{proj}.weight", 1)[0]
         expert_tensors = expert_groups.get((prefix, proj))
@@ -1808,15 +1806,38 @@ class MegatronPolicyWorkerImpl(
         )
         return torch.stack(expert_tensors)
 
-    def _get_src_local_tensor(self, param_info, expert_groups):
-        """Get the TP/EP-local source tensor for one param."""
-        name = param_info["name"]
-        grouped_expert_proj = param_info.get("grouped_expert_proj")
-        if grouped_expert_proj:
-            # expert_groups has pre-calculated pointer to the local expert tensors
-            # which was extracted from the _param_map in _build_expert_groups.
-            return self._group_experts(grouped_expert_proj, name, expert_groups)
-        return self._param_map.get(name)
+    def build_hf_to_local_param_map(self, refit_info: dict) -> HFToLocalParamMap:
+        """Build the Megatron-backend ``hf_to_local_param_map`` (HFToLocalParamMap).
+
+        Wraps this rank's local Megatron shards into ``LocalParamSpec``s:
+        - direct: ``base`` is sharded local tensor view, sent as-is.
+        - grouped MoE expert: ``pre`` stacks the per-expert views into
+          ``[E_local, ...]`` fresh each refit via ``_group_experts``.
+        """
+        # This rank's local TP/EP HF param shards (live views), and the
+        # per-expert views grouped for torch.stack.  Build-time only.
+        param_map = dict(self._iter_local_hf_param_shards())
+        expert_groups = self._build_expert_groups(param_map)
+
+        def _expert_spec(proj, grouped_name):
+            def pre(_base):
+                return RefitCtx(
+                    buf=self._group_experts(proj, grouped_name, expert_groups)
+                )
+
+            return LocalParamSpec(base=None, pre=pre)
+
+        mapping = {}
+        for layer_name in refit_info["layer_names"]:
+            for p in refit_info["per_layer_params"][layer_name]:
+                name = p["name"]
+                proj = p.get("grouped_expert_proj")
+                mapping[name] = (
+                    _expert_spec(proj, name)
+                    if proj
+                    else LocalParamSpec(base=param_map.get(name))
+                )
+        return HFToLocalParamMap(specs=mapping)
 
     @torch.no_grad()
     def nccl_xfer_refit(self, kv_scales=None):
@@ -1833,9 +1854,10 @@ class MegatronPolicyWorkerImpl(
         """
         from nemo_rl.distributed.xferdtensor import DTensorRef, xferdtensor
 
-        # _param_map and _expert_groups are built once in
-        # prepare_nccl_xfer_refit_info; weight values change but the
-        # name → view mapping is stable across refits.
+        # hf_to_local_param_map is built once in prepare_nccl_xfer_refit_info;
+        # weight values change but the name → spec mapping is stable across
+        # refits.
+
         use_per_stage = hasattr(self, "pp_comm_group")
 
         for layer_name in self.nccl_xfer_refit_info["layer_names"]:
@@ -1847,11 +1869,22 @@ class MegatronPolicyWorkerImpl(
                 else:
                     group = self.model_update_group
 
-                # expert stacking is done in _get_src_local_tensor
-                local = self._get_src_local_tensor(param_info, self._expert_groups)
-                assert local is not None, f"no local tensor for {param_info['name']!r}"
+                spec = self.hf_to_local_param_map.get(param_info["name"])
+                assert spec is not None, (
+                    f"no spec for {param_info['name']!r} in hf_to_local_param_map"
+                )
+                # pre stacks grouped MoE experts fresh each refit; a direct
+                # param sends its live TP/EP-local view as-is.
+                ctx = (
+                    spec.pre(spec.base)  # stack grouped MoE experts
+                    if spec.pre is not None
+                    else RefitCtx(buf=spec.base)  # send local shard as-is
+                )
+                assert ctx.buf is not None, (
+                    f"no local tensor for {param_info['name']!r}"
+                )
                 src_tensor = DTensorRef(
-                    local_tensor=local, global_shape=param_info["global_shape"]
+                    local_tensor=ctx.buf, global_shape=param_info["global_shape"]
                 )
                 xferdtensor(
                     src_tensor,
@@ -1862,9 +1895,11 @@ class MegatronPolicyWorkerImpl(
                     param_info["dst_placements"],
                     group,
                 )
+                if spec.post is not None:
+                    spec.post(ctx)
                 # Drop refs to the per-iteration grouped MoE tensor so its CUDA
                 # memory returns to the caching allocator
-                del local, src_tensor
+                del ctx, src_tensor
 
         self._broadcast_misc_params_packed(kv_scales=kv_scales)
 

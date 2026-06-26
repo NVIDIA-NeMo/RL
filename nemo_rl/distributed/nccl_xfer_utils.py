@@ -28,7 +28,8 @@ live in ``nemo_rl/distributed/xferdtensor.py`` — import both from there.
 
 import re
 from collections import OrderedDict
-from typing import Any, Optional
+from dataclasses import dataclass, field
+from typing import Any, Callable, Optional, Protocol, runtime_checkable
 
 import torch
 from torch.distributed._tensor import Shard
@@ -54,6 +55,84 @@ class MeshInfo:
     @property
     def ndim(self):
         return self.mesh.ndim
+
+
+# =========================================================================
+# Per-param refit interface — backend-agnostic
+# =========================================================================
+
+
+@dataclass
+class RefitCtx:
+    """Handoff between a param's ``pre`` and ``post`` refit hooks.
+
+    The transfer API (xferdtensor) reads only ``buf``.
+    ``extra`` is provided for flexible, backend-specific state.
+
+    Use case:
+    - vLLM merged params tracks the merged param slice in ``extra["region"]``
+    """
+
+    buf: torch.Tensor
+    extra: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class LocalParamSpec:
+    """A backend's recipe for transferring one HF param via ``xferdtensor``.
+
+        base: base form of the param tensor.
+        pre:  ``base -> RefitCtx``; materializes the transfer subject/object
+            in RefitCtx.buf. If ``None``, ``RefitCtx(buf=base)`` is used.
+            e.g., stack grouped MoE expert params.
+            e.g., Create a temporary buffer for the merged param.
+        post: ``RefitCtx -> None``; runs after xferdtensor
+            e.g., copy back the received buffer into the merged param.
+
+    TODO: A layout that block-permutes the *assembled* param (e.g. FlashInfer
+    TRTLLM w13) would need a group-level finalize run once after all components
+    land — a future loop-level addition, not a per-param field. ``pre``/``post``
+    covers today's backends (Triton, FlashInfer CUTLASS, Megatron).
+    """
+
+    base: Any
+    pre: Optional[Callable[[Any], "RefitCtx"]] = None
+    post: Optional[Callable[["RefitCtx"], None]] = None
+
+
+@dataclass
+class HFToLocalParamMap:
+    """``hf_name -> LocalParamSpec`` container returned by build_hf_to_local_param_map.
+
+    Holds LocalParamSpec for each HF param name.
+    """
+
+    specs: dict[str, LocalParamSpec] = field(default_factory=dict)
+
+    def get(
+        self, hf_name: str, default: Optional[LocalParamSpec] = None
+    ) -> Optional[LocalParamSpec]:
+        """Spec for ``hf_name`` or ``default`` (``None``); loops assert non-None."""
+        return self.specs.get(hf_name, default)
+
+
+# =========================================================================
+# Per-param refit interface — per-backend protocol
+# =========================================================================
+
+
+@runtime_checkable
+class RefitBuilderInterface(Protocol):
+    """Structural contract for an nccl_xfer refit backend (train src / gen dst).
+
+    A backend builds its ``hf_name -> LocalParamSpec`` map once via
+    :meth:`build_hf_to_local_param_map`, then its ``nccl_xfer_refit`` loop drives
+    each param's transfer through the spec's ``pre``/``post`` hooks.
+    """
+
+    def build_hf_to_local_param_map(self, refit_info: dict) -> HFToLocalParamMap:
+        """Build the unified ``hf_name -> LocalParamSpec`` map for nccl_xfer refit."""
+        ...
 
 
 # =========================================================================
