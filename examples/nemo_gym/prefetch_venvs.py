@@ -55,7 +55,6 @@ def prefetch_nemo_gym_venvs(config_paths: list[str]) -> None:
         nemo_gym_py_exec = create_local_venv_on_each_node(
             nemo_gym_py_exec, "nemo_rl.environments.nemo_gym.NemoGym"
         )
-    nemo_gym_venv = os.path.dirname(os.path.dirname(nemo_gym_py_exec))
 
     succeeded = []
     failed = []
@@ -97,8 +96,8 @@ def prefetch_nemo_gym_venvs(config_paths: list[str]) -> None:
                     "py_executable": nemo_gym_py_exec,
                     "env_vars": {
                         **os.environ,
-                        "VIRTUAL_ENV": nemo_gym_venv,
-                        "UV_PROJECT_ENVIRONMENT": nemo_gym_venv,
+                        "VIRTUAL_ENV": nemo_gym_py_exec,
+                        "UV_PROJECT_ENVIRONMENT": nemo_gym_py_exec,
                     },
                 },
             }
