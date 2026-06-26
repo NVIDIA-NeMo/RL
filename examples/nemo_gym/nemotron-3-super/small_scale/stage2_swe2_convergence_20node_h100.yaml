@@ -5,6 +5,8 @@ policy:
     colocated:
       resources:
         num_nodes: 4
+    vllm_kwargs:
+      max_num_batched_tokens: 8480
 
 cluster:
   num_nodes: 20   # 16 train (TP8*CP8*PP1=64 GPUs, DP2) + 4 gen (TP8). No judges -> SBATCH=20.

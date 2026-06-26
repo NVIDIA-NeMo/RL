@@ -6,6 +6,9 @@ policy:
     colocated:
       resources:
         num_nodes: 12
+    vllm_cfg:
+      max_num_seqs: 16
+      gpu_memory_utilization: 0.70
 
   megatron_cfg:
     env_vars:

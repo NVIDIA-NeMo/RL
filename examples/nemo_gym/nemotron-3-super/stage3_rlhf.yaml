@@ -243,6 +243,7 @@ policy:
 
     vllm_kwargs:
       mamba_ssm_cache_dtype: "float32"
+      mamba_cache_mode: align
       compilation_config:
         cudagraph_mode: PIECEWISE
         cudagraph_capture_sizes: [1,2,4,8,16,32,64]
