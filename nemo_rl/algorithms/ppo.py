@@ -230,29 +230,24 @@ def setup(
         "A generation config in the PolicyConfig is required for PPO"
     )
 
-    # Context parallelism for the Megatron value model requires sequence packing,
-    # matching Megatron-Core (CP shards are produced/reassembled per packed sequence).
-    if (
-        value_config["megatron_cfg"]["enabled"]
-        and value_config["megatron_cfg"]["context_parallel_size"] > 1
-    ):
-        assert value_config["sequence_packing"]["enabled"], (
-            "Context parallelism (CP>1) for the Megatron PPO value model requires "
-            "value.sequence_packing.enabled=true."
+    if value_config["megatron_cfg"]["enabled"]:
+        # Context parallelism for the Megatron value model requires sequence packing,
+        # matching Megatron-Core (CP shards are produced/reassembled per packed sequence).
+        if value_config["megatron_cfg"]["context_parallel_size"] > 1:
+            assert value_config["sequence_packing"]["enabled"], (
+                "Context parallelism (CP>1) for the Megatron PPO value model requires "
+                "value.sequence_packing.enabled=true."
+            )
+    else:
+        # DTensor PPO value model currently doesn't support sequence packing and CP.
+        assert value_config["dtensor_cfg"]["enabled"]
+        assert value_config["sequence_packing"]["enabled"] is False, (
+            "Sequence packing is currently not supported for the DTensor PPO value model. "
+            "See https://github.com/NVIDIA-NeMo/RL/issues/2951."
         )
-        assert not (
-            value_config["megatron_cfg"]["tensor_model_parallel_size"] > 1
-            and value_config["megatron_cfg"]["sequence_parallel"]
-        ), (
-            "Sequence parallelism (TP>1 + sequence_parallel=True) is currently "
-            "not supported for the Megatron PPO value model. See "
-            "https://github.com/NVIDIA-NeMo/RL/issues/2687"
-        )
-    if value_config.get("dtensor_cfg", {}).get("enabled", False):
         assert value_config["dtensor_cfg"]["context_parallel_size"] == 1, (
-            "Context parallelism (CP>1) is currently not supported for the "
-            "DTensor PPO value model. See "
-            "https://github.com/NVIDIA-NeMo/RL/issues/2687"
+            "Context parallelism (CP>1) is currently not supported for the DTensor PPO value model. "
+            "See https://github.com/NVIDIA-NeMo/RL/issues/2951."
         )
 
     # Set seed for all random number generators
