@@ -1,12 +1,15 @@
+diff --git a/responses_api_models/vllm_model/app.py b/responses_api_models/vllm_model/app.py
 --- a/responses_api_models/vllm_model/app.py
 +++ b/responses_api_models/vllm_model/app.py
-@@ -64,0 +65,2 @@
-+# Qwen 3.5: tolerate older nemo_gym.server_utils without fastapi entrypoint helper.
-+# This container uses the worker-based helper, so no compatibility shim is needed.
-@@ -265,0 +268,6 @@
-+                    continue
+@@ -265,4 +265,10 @@ class VLLMModel(SimpleResponsesAPIModel):
+                 if message_dict.get("role") != "assistant" or "content" not in message_dict:
+                     continue
+-
 +
 +                # Qwen 3.5: keep reasoning text in content for assistant tool-call history.
 +                # The Qwen chat template omits reasoning_content on structured tool-call
 +                # messages, which breaks token contiguity with the generated sequence.
 +                if message_dict.get("tool_calls"):
++                    continue
++
+                 content = message_dict["content"]
