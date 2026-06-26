@@ -164,6 +164,7 @@ spec:
             - /mnt/rl-workspace/jothomson/swe_asyncrl_test/model/step_230_hf
             - --served-model-name
             - /mnt/rl-workspace/jothomson/swe_asyncrl_test/model/step_230_hf
+            - --enable-rl
             # MxModelLoader: discover v2 sources at boot, pull via NIXL RDMA;
             # cold start falls through to the disk loader.
             - --load-format

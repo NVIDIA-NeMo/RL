@@ -85,6 +85,7 @@ spec:
             - Qwen/Qwen2.5-1.5B-Instruct
             - --served-model-name
             - Qwen/Qwen2.5-1.5B-Instruct
+            - --enable-rl
             - --load-format
             - mx-target
             - --model-express-url

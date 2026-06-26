@@ -21,6 +21,7 @@ can stand up a DGD.
 """
 
 import asyncio
+import json
 import pickle
 
 import pytest
@@ -112,6 +113,59 @@ def test_explicit_frontend_url_overrides_dgd_name(in_k8s):
     assert g.dp_openai_server_base_urls == ["http://override.example.com:9000/v1"]
 
 
+def test_expose_http_server_routes_gym_rollouts_through_token_wrapper(monkeypatch):
+    cfg = _base_config()
+    cfg["dynamo_cfg"] = {  # type: ignore[typeddict-item]
+        "frontend_url": "http://dynamo.example.com:8000/v1",
+        "request_timeout_s": 30.0,
+    }
+    cfg["vllm_cfg"] = {"expose_http_server": True}  # type: ignore[typeddict-item]
+    created_wrappers = []
+
+    class FakeTokenWrapper:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.shutdown_called = False
+            created_wrappers.append(self)
+
+        def start(self):
+            return "http://wrapper.example.com:9000/v1"
+
+        def shutdown(self):
+            self.shutdown_called = True
+
+    tokenizer = object()
+    monkeypatch.setattr(_dynmod, "DynamoTokenWrapperServer", FakeTokenWrapper)
+
+    g = DynamoGeneration(
+        cluster=None,
+        config=cfg,
+        tokenizer=tokenizer,
+        tokenizer_config={"chat_template_kwargs": {"enable_thinking": False}},
+    )
+
+    assert g.dp_openai_server_base_urls == ["http://wrapper.example.com:9000/v1"]
+    assert g._completion_url() == "http://dynamo.example.com:8000/v1/completions"
+    assert created_wrappers[0].kwargs == {
+        "dynamo_frontend_base_url": "http://dynamo.example.com:8000/v1",
+        "tokenizer": tokenizer,
+        "tokenizer_chat_template_kwargs": {"enable_thinking": False},
+        "request_timeout_s": 30.0,
+    }
+
+    assert g.shutdown() is True
+    assert created_wrappers[0].shutdown_called is True
+
+
+def test_expose_http_server_requires_tokenizer():
+    cfg = _base_config()
+    cfg["dynamo_cfg"] = {"frontend_url": "http://dynamo.example.com:8000/v1"}  # type: ignore[typeddict-item]
+    cfg["vllm_cfg"] = {"expose_http_server": True}  # type: ignore[typeddict-item]
+
+    with pytest.raises(RuntimeError, match="requires a tokenizer"):
+        DynamoGeneration(cluster=None, config=cfg)
+
+
 def test_empty_frontend_url_raises(in_k8s):
     cfg = _base_config(frontend_url="")
     with pytest.raises(RuntimeError, match="frontend_url is set but empty"):
@@ -173,6 +227,112 @@ def test_prepare_refit_info_is_noop(in_k8s, stub_namespace):
     # prepare_refit_info is a deliberate no-op (not NotImplementedError).
     g = DynamoGeneration(cluster=None, config=_base_config())
     assert g.prepare_refit_info({}) is None
+
+
+def test_discover_worker_instances_accepts_legacy_mx_endpoint(monkeypatch):
+    payload = {
+        "instances": [
+            {
+                "namespace": "test-ns-my-dgd",
+                "component": "backend",
+                "endpoint": "update_weights_via_mx",
+                "instance_id": "worker-0",
+                "transport": {"tcp": "10.0.0.5:1234/channel/update_weights_via_mx"},
+            },
+            {
+                "namespace": "test-ns-my-dgd",
+                "component": "backend",
+                "endpoint": "generate",
+                "instance_id": "worker-0",
+                "transport": {"tcp": "10.0.0.5:1234/channel/generate"},
+            },
+        ]
+    }
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(payload).encode()
+
+    def fake_urlopen(url, timeout):
+        assert url == "http://my-dgd-frontend.test-ns.svc.cluster.local:8000/health"
+        assert timeout == 15.0
+        return Response()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    instances = _dynmod._discover_worker_instances(
+        frontend_host="my-dgd-frontend.test-ns.svc.cluster.local",
+        frontend_port=8000,
+        dyn_namespaces={"test-ns-my-dgd"},
+        dyn_system_port=9090,
+    )
+
+    assert instances == [
+        {
+            "instance_id": "worker-0",
+            "system_url": "http://10.0.0.5:9090",
+            "requires_pause": False,
+        }
+    ]
+
+
+def test_discover_worker_instances_accepts_enable_rl_endpoint(monkeypatch):
+    payload = {
+        "instances": [
+            {
+                "namespace": "test-ns-my-dgd",
+                "component": "backend",
+                "endpoint": "rl",
+                "instance_id": "worker-0",
+                "transport": {"tcp": "10.0.0.8:5555/channel/rl"},
+            },
+            {
+                "namespace": "test-ns-my-dgd",
+                "component": "Planner",
+                "endpoint": "rl",
+                "instance_id": "planner",
+                "transport": {"tcp": "10.0.0.9:5555/channel/rl"},
+            },
+            {
+                "namespace": "other-ns-other-dgd",
+                "component": "backend",
+                "endpoint": "rl",
+                "instance_id": "worker-other",
+                "transport": {"tcp": "10.0.0.10:5555/channel/rl"},
+            },
+        ]
+    }
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(payload).encode()
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: Response())
+    instances = _dynmod._discover_worker_instances(
+        frontend_host="my-dgd-frontend.test-ns.svc.cluster.local",
+        frontend_port=8000,
+        dyn_namespaces={"test-ns-my-dgd"},
+        dyn_system_port=9090,
+    )
+
+    assert instances == [
+        {
+            "instance_id": "worker-0",
+            "system_url": "http://10.0.0.8:9090",
+            "requires_pause": True,
+        }
+    ]
 
 
 def test_requires_kv_scale_sync_follows_vllm_cfg(monkeypatch):
