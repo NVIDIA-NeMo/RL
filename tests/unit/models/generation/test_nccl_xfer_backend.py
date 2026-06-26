@@ -32,6 +32,10 @@ import torch
 
 pytest.importorskip("vllm")  # module-top `import vllm` in vllm_backend
 
+from nemo_rl.distributed.nccl_xfer_utils import (  # noqa: E402
+    HFToLocalParamMap,
+    RefitBuilderInterface,
+)
 from nemo_rl.models.generation.vllm.vllm_backend import (  # noqa: E402
     VllmInternalWorkerExtension,
     _fused_param_merge_slice,
@@ -257,3 +261,100 @@ def test_build_mapping_unmapped_param_raises():
     ext = _make_ext({"model.embed_tokens.weight": _param(8, 8)})
     with pytest.raises(ValueError):
         ext._build_hf_to_gen_backend_mapping(refit_info)
+
+
+# --------------------------------------------------------------------------
+# build_hf_to_local_param_map (the unified interface) + RefitCtx pre/post
+# --------------------------------------------------------------------------
+def test_build_hf_to_local_param_map_specs_and_roundtrip():
+    H, E, Pl = 32, 2, 64
+    refit_info = {
+        "gen_tp_size": 4,
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {"name": "model.layers.0.input_layernorm.weight", "global_shape": [H]},
+                {
+                    "name": "model.layers.0.self_attn.q_proj.weight",
+                    "global_shape": [512, H],
+                },
+                {
+                    "name": "model.layers.0.self_attn.k_proj.weight",
+                    "global_shape": [512, H],
+                },
+                {
+                    "name": "model.layers.0.self_attn.v_proj.weight",
+                    "global_shape": [512, H],
+                },
+                {
+                    "name": "model.layers.0.mlp.experts.gate_proj.weight",
+                    "global_shape": [E, 128, H],
+                    "grouped_expert_proj": "gate_proj",
+                },
+                {
+                    "name": "model.layers.0.mlp.experts.up_proj.weight",
+                    "global_shape": [E, 128, H],
+                    "grouped_expert_proj": "up_proj",
+                },
+                {
+                    "name": "model.layers.0.mlp.experts.down_proj.weight",
+                    "global_shape": [E, H, 128],
+                    "grouped_expert_proj": "down_proj",
+                },
+            ]
+        },
+    }
+    layernorm = _param(H)
+    qkv = _param(384, H)  # 512*3/4
+    w13 = _param(E, 2 * Pl, H)
+    w2 = _param(E, H, Pl)
+    ext = _make_ext(
+        {
+            "model.layers.0.input_layernorm.weight": layernorm,
+            "model.layers.0.self_attn.qkv_proj.weight": qkv,
+            "model.layers.0.mlp.experts.w13_weight": w13,
+            "model.layers.0.mlp.experts.w2_weight": w2,
+        }
+    )
+
+    pmap = ext.build_hf_to_local_param_map(refit_info)
+    assert isinstance(pmap, HFToLocalParamMap)
+    assert pmap.get("does.not.exist") is None
+
+    # Direct param: base aliases the live vLLM tensor (vllm_param.data), no
+    # hooks (xferdtensor receives in place). .data is a distinct object sharing
+    # storage, so compare data_ptr, not identity.
+    ln = pmap.get("model.layers.0.input_layernorm.weight")
+    assert ln.base.data_ptr() == layernorm.data_ptr()
+    assert ln.pre is None and ln.post is None
+
+    # Grouped down_proj -> w2 is also direct (1:1, no slice).
+    dn = pmap.get("model.layers.0.mlp.experts.down_proj.weight")
+    assert dn.base.data_ptr() == w2.data_ptr()
+    assert dn.pre is None and dn.post is None
+
+    # Merged q_proj: pre allocates a recv buffer for q's region of qkv (rows
+    # [0:128] at TP=4); post scatters it back into the live merged param.
+    q = pmap.get("model.layers.0.self_attn.q_proj.weight")
+    assert q.pre is not None and q.post is not None
+    ctx = q.pre(q.base)
+    assert ctx.buf.shape == qkv[0:128].shape
+    assert ctx.extra["region"].shape == ctx.buf.shape
+    ctx.buf.fill_(3.0)
+    q.post(ctx)
+    assert torch.equal(qkv[0:128], torch.full_like(qkv[0:128], 3.0))
+
+    # Grouped gate_proj -> w13 gate half (dim-1 region); pre/post round-trip.
+    g = pmap.get("model.layers.0.mlp.experts.gate_proj.weight")
+    assert g.pre is not None and g.post is not None
+    gctx = g.pre(g.base)
+    assert gctx.buf.shape == w13[:, 0:Pl, :].shape
+    gctx.buf.fill_(5.0)
+    g.post(gctx)
+    assert torch.equal(w13[:, 0:Pl, :], torch.full_like(w13[:, 0:Pl, :], 5.0))
+
+
+def test_extension_satisfies_refit_builder_interface():
+    # Structural Protocol conformance (no inheritance — vLLM composes the
+    # extension via worker_extension_cls).
+    assert isinstance(_make_ext({}), RefitBuilderInterface)

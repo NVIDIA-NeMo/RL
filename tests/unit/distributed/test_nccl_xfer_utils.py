@@ -26,7 +26,11 @@ import torch
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from nemo_rl.distributed.nccl_xfer_utils import (
+    HFToLocalParamMap,
+    LocalParamSpec,
     MeshInfo,
+    RefitBuilderInterface,
+    RefitCtx,
     build_mesh_info,
     build_nccl_xfer_refit_info,
     get_placements,
@@ -394,3 +398,47 @@ def test_build_refit_info_groups_experts_and_tags_them():
         for layer in info["layer_names"]
         for p in info["per_layer_params"][layer]
     )
+
+
+# --------------------------------------------------------------------------
+# Per-param refit interface: RefitCtx / LocalParamSpec / HFToLocalParamMap /
+# RefitBuilderInterface  (pure dataclasses + structural protocol; no extras)
+# --------------------------------------------------------------------------
+def test_refit_ctx_defaults_and_per_instance_extra():
+    buf = torch.zeros(2)
+    ctx = RefitCtx(buf=buf)
+    assert ctx.buf is buf
+    assert ctx.extra == {}  # default empty dict
+    # default_factory => each instance gets its own dict (no shared mutable default)
+    ctx.extra["region"] = buf
+    assert RefitCtx(buf=buf).extra == {}
+
+
+def test_local_param_spec_defaults():
+    spec = LocalParamSpec(base="X")
+    assert spec.base == "X"
+    assert spec.pre is None and spec.post is None
+
+
+def test_hf_to_local_param_map_get():
+    spec = LocalParamSpec(base=1)
+    m = HFToLocalParamMap(specs={"a": spec})
+    assert m.get("a") is spec
+    assert m.get("missing") is None  # the loops' coverage guard asserts on this
+    sentinel = LocalParamSpec(base=2)
+    assert m.get("missing", sentinel) is sentinel
+
+
+def test_refit_builder_interface_is_structural():
+    # runtime_checkable Protocol: a backend conforms by HAVING the builder
+    # method (no inheritance) — VllmInternalWorkerExtension can't inherit it
+    # because vLLM composes it via worker_extension_cls.
+    class HasBuilder:
+        def build_hf_to_local_param_map(self, refit_info):
+            return HFToLocalParamMap()
+
+    class LacksBuilder:
+        pass
+
+    assert isinstance(HasBuilder(), RefitBuilderInterface)
+    assert not isinstance(LacksBuilder(), RefitBuilderInterface)
