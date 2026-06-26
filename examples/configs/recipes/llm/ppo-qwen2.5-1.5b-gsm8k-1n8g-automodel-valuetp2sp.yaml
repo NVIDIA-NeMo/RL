@@ -1,0 +1,55 @@
+defaults: ./ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron-valuetp2sp-dynbatch.yaml
+policy:
+  dtensor_cfg:
+    enabled: true
+  megatron_cfg:
+    enabled: false
+  optimizer:
+    name: torch.optim.AdamW
+    kwargs:
+      lr: 1.0e-06
+      weight_decay: 0.01
+      betas:
+      - 0.9
+      - 0.999
+      eps: 1.0e-08
+      foreach: false
+      fused: false
+  scheduler:
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones: []
+value:
+  reward_model_cfg:
+    enabled: true
+  dtensor_cfg:
+    enabled: true
+  megatron_cfg:
+    enabled: false
+  optimizer:
+    name: torch.optim.AdamW
+    kwargs:
+      lr: 1.0e-05
+      weight_decay: 0.01
+      betas:
+      - 0.9
+      - 0.999
+      eps: 1.0e-08
+      foreach: false
+      fused: false
+  scheduler:
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones: []
+  dynamic_batching:
+    enabled: false
+checkpointing:
+  checkpoint_dir: results/ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp
+logger:
+  log_dir: logs/ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp
+  wandb:
+    name: ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp
