@@ -16,9 +16,8 @@ from __future__ import annotations
 from dataclasses import replace
 from types import SimpleNamespace
 
-import torch
-
 import pytest
+import torch
 
 from nemo_rl.algorithms import distillation_sync
 from nemo_rl.data.multimodal_utils import PackedTensor
