@@ -33,8 +33,8 @@ ACCOUNT=${ACCOUNT:-coreai_dlalgo_genai}
 PARTITION=${PARTITION:-batch}
 HF_HOME=${HF_HOME:-/lustre/fsw/portfolios/llmservice/users/slikhite/hf_home}
 HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-$HF_HOME/datasets}
-HF_TOKEN=${HF_TOKEN:-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}
-WANDB_API_KEY=${WANDB_API_KEY:-352c208ed9a288215bf30f9fbb80667cca535f24}
+HF_TOKEN=${HF_TOKEN:-xxx}
+WANDB_API_KEY=${WANDB_API_KEY:-xxx}
 
 require_env() {
     local var_name="$1"
