@@ -44,7 +44,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.lm_value import Value
-from nemo_rl.models.value.value_temporal_shift import (
+from nemo_rl.models.value.workers.dtensor_value_worker_v2 import (
     RightShiftLossWrapper,
     right_shift_values,
 )
