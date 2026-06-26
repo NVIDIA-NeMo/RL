@@ -1900,7 +1900,6 @@ def _apply_message_level_advantage_penalties(
     num_invalid_tool_calls = 0
     num_malformed_thinking = 0
     num_assistant_messages = 0
-
     for i, message_log in enumerate(message_logs):
         token_offset = 0
         for j, message in enumerate(message_log):
