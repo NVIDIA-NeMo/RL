@@ -15,7 +15,14 @@ across several model tokenizers; the off-diagonal entries sit well below
 `1.0` — that shared-vocabulary gap is exactly what the projection matrix
 bridges.
 
-![Cross-tokenizer similarity: pairwise vocabulary overlap (intersection over min vocab size) across model tokenizers](../assets/tokenizer_overlap_matrix.png)
+| Model | Mistral-NeMo-Minitron-8B | Qwen3-8B-Base | Llama-3.2-1B | gemma-3-4b-it | OLMo2-8B-SuperBPE-t160k | gpt-oss-20b |
+|---|---:|---:|---:|---:|---:|---:|
+| Mistral-NeMo-Minitron-8B | 1.0000 | 0.5119 | 0.5525 | 0.7430 | 0.4215 | 0.7591 |
+| Qwen3-8B-Base | 0.5119 | 1.0000 | 0.8481 | 0.6320 | 0.4103 | 0.6462 |
+| Llama-3.2-1B | 0.5525 | 0.8481 | 1.0000 | 0.6739 | 0.4980 | 0.7977 |
+| gemma-3-4b-it | 0.7430 | 0.6320 | 0.6739 | 1.0000 | 0.4918 | 0.6545 |
+| OLMo2-8B-SuperBPE-t160k | 0.4215 | 0.4103 | 0.4980 | 0.4918 | 1.0000 | 0.3657 |
+| gpt-oss-20b | 0.7591 | 0.6462 | 0.7977 | 0.6545 | 0.3657 | 1.0000 |
 
 This guide explains how to:
 
@@ -245,10 +252,6 @@ Downstream benchmark accuracy of the distilled Llama-3.2-1B student
 |---|---|---|
 | MMLU | 32.05 | 39.23 |
 | GSM8K | 5.69 | 6.14 |
-| HellaSwag | 65.08 | 61.46 |
-| Winogrande | 61.48 | 61.40 |
-| MATH | 5.48 | 4.72 |
-| **Avg** | **33.96** | **34.59** |
 
 ## Where files live
 
