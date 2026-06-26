@@ -54,13 +54,10 @@ from nemo_rl.models.automodel.train import (
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 
-# NOTE(ppo-dtensor port): apply_torch_aten_alias_tensor_patch isn't exported
-# from policy.workers.patches in this fork; the corresponding policy worker
-# (dtensor_policy_worker_v2.py) also omits this call, so drop the import + call.
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.interfaces import ValueOutputSpec
-from nemo_rl.models.value.temporal_shift import (
+from nemo_rl.models.value.value_temporal_shift import (
     RightShiftLossWrapper,
     right_shift_values,
 )
@@ -139,16 +136,15 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
             config["dtensor_cfg"].get("lora_cfg", {}).get("enabled", False)
         )
 
-        # Ensure reward model config is set for value models
-        if (
-            "reward_model_cfg" not in config
-            or not config["reward_model_cfg"]["enabled"]
-        ):
-            # Value models use the reward model architecture but predict values instead
-            config["reward_model_cfg"] = {
-                "enabled": True,
-                "reward_model_type": "regression",  # Value is a regression task
-            }
+        if not config["reward_model_cfg"]["enabled"]:
+            raise ValueError(
+                "DTensor value models require value.reward_model_cfg.enabled=true."
+            )
+        if config["reward_model_cfg"].get("reward_model_type") != "regression":
+            raise ValueError(
+                "DTensor value models require "
+                "value.reward_model_cfg.reward_model_type='regression'."
+            )
 
         print("Initializing DTensorValueWorkerV2")
 
@@ -201,28 +197,15 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
             config=config,
             tokenizer=tokenizer,
             runtime_config=runtime_config,
-            # NOTE(ppo-dtensor port): this fork's setup_model_and_optimizer
-            # kwarg is `distributed_context` (was `distributed_manager` in
-            # upstream bg51717/ppo). Pre-fix: TypeError: setup_model_and_optimizer
-            # () got an unexpected keyword argument 'distributed_manager'.
             distributed_context=distributed_manager,
             checkpoint_manager=self.checkpoint_manager,
             is_vlm=False,  # Value models don't use vision
             init_optimizer=init_optimizer,
             weights_path=weights_path,
             optimizer_path=optimizer_path,
-            # optimizer_module_filter=["score."],
         )
 
         # Set instance attributes from model and optimizer state.
-        # NOTE(ppo-dtensor port): bg51717/ppo unpacked an extra
-        # `self.model_state_dict_keys` slot, but this fork's
-        # ModelAndOptimizerState NamedTuple (nemo_rl/models/automodel/config.py)
-        # only has 10 fields and does not include model_state_dict_keys.
-        # Without this fix:
-        #   ValueError: not enough values to unpack (expected 11, got 10)
-        # would fire here. Nothing else in this file reads
-        # self.model_state_dict_keys.
         (
             self.model,
             self.optimizer,
@@ -236,15 +219,8 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
             self.autocast_enabled,
         ) = model_and_optimizer_state
 
-        # Set instance attributes from runtime config.
-        # NOTE(ppo-dtensor port): bg51717/ppo skipped the `sampling_params`
-        # slot here, but RuntimeConfig in this fork
-        # (nemo_rl/models/automodel/config.py) has 13 fields including
-        # sampling_params right before is_reward_model. Without this fix:
-        #   ValueError: too many values to unpack (expected 12)
-        # would fire. bg51717 also stripped all references to
-        # self.sampling_params from train()/get_values(), so we discard the
-        # value into `_runtime_sampling_params` rather than assigning it.
+        # Set instance attributes from runtime config. Value workers do not use
+        # sampling parameters, but RuntimeConfig still carries the field.
         (
             self.model_class,
             self.model_config,
@@ -257,7 +233,7 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
             self.cpu_offload,
             self.offload_optimizer_for_logprob,
             self.is_generation_colocated,
-            _runtime_sampling_params,  # bg51717 stripped this slot
+            _runtime_sampling_params,
             _runtime_is_reward_model,
         ) = runtime_config
 
@@ -364,11 +340,7 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
                     cp_size=self.cp_size,
                 )
 
-                # Use automodel_forward_backward for the training loop
-                # NOTE(ppo-dtensor port): this fork's automodel_forward_backward
-                # no longer accepts a cfg kwarg (it was removed in PR #2027).
-                # Pre-fix: TypeError: automodel_forward_backward() got an
-                # unexpected keyword argument 'cfg'.
+                # Use automodel_forward_backward for the training loop.
                 mb_results = automodel_forward_backward(
                     model=self.model,
                     data_iterator=processed_iterator,
@@ -491,9 +463,7 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
                     dtype=self.dtype,
                     autocast_enabled=self.autocast_enabled,
                 ):
-                    # Use forward_with_post_processing_fn for forward pass
-                    # NOTE(ppo-dtensor port): same cfg-kwarg removal as the train()
-                    # automodel_forward_backward call above (PR #2027).
+                    # Use forward_with_post_processing_fn for forward pass.
                     values, _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
                         post_processing_fn=value_post_processor,
@@ -647,11 +617,6 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
     ) -> None:
         """Initialize the AutomodelCheckpointManager for this worker."""
         if self.checkpoint_manager is None:
-            # NOTE(ppo-dtensor port): bg51717/ppo's worker passed a
-            # `model_state_dict_keys` kwarg that the current
-            # nemo_rl.models.automodel.checkpoint.AutomodelCheckpointManager
-            # signature (dp_mesh, tp_mesh, moe_mesh) does not accept; drop it
-            # so the constructor doesn't raise TypeError at worker startup.
             self.checkpoint_manager = AutomodelCheckpointManager(
                 dp_mesh=self.dp_mesh,
                 tp_mesh=self.tp_mesh,

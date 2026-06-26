@@ -19,7 +19,7 @@ import torch
 
 from nemo_rl.algorithms.loss.interfaces import LossInputType, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.models.value.temporal_shift import (
+from nemo_rl.models.value.value_temporal_shift import (
     RightShiftLossWrapper,
     right_shift_values,
 )

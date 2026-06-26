@@ -95,11 +95,6 @@ class Value(ValueInterface):
 
             env_vars = config["megatron_cfg"].get("env_vars", {})
         else:
-            # Dispatch to DTensorValueWorkerV2. The original baseline raised
-            # NotImplementedError here; the right-shift fix inside
-            # DTensorValueWorkerV2 aligns its temporal semantics with the
-            # MegatronValueWorker (V[t] = V(s_t) rather than V(s_{t+1})), so
-            # GAE / MseValueLossFn / value clipping are self-consistent.
             if not dtensor_enable:
                 raise ValueError(
                     "Please set value.dtensor_cfg.enabled=true to use DTensor "
@@ -107,10 +102,7 @@ class Value(ValueInterface):
                     "Megatron-Core)."
                 )
 
-            worker_builder_cls = (
-                "nemo_rl.models.value.workers."
-                "dtensor_value_worker_v2.DTensorValueWorkerV2"
-            )
+            worker_builder_cls = "nemo_rl.models.value.workers.dtensor_value_worker_v2.DTensorValueWorkerV2"
 
             tp_size = config["dtensor_cfg"]["tensor_parallel_size"]
             # DTensor V2 does not pipeline-parallel; pp_size stays at the

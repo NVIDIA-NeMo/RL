@@ -27,25 +27,8 @@ from nemo_automodel import NeMoAutoModelForSequenceClassification
 try:
     from nemo_automodel import NeMoAutoModelForTokenClassification
 except ImportError:
-    # ----------------------------------------------------------------
-    # Local backport for the bg51717/ppo + ppo-dtensor branches.
-    #
-    # Both worktrees pin the Automodel submodule to commit 92635e74
-    # (v0.3.0rc4-214-g92635e74), which does NOT yet export
-    # NeMoAutoModelForTokenClassification. Upstream Automodel main added
-    # it in commit e1a2f915 (2026-05-19) as a one-liner subclass of
-    # transformers.AutoModelForTokenClassification + the existing
-    # _BaseNeMoAutoModelClass mixin (same recipe as
-    # NeMoAutoModelForSequenceClassification at auto_model.py:709).
-    #
-    # We replicate that one-line subclass here so the value-model path
-    # with reward_model_type='regression' (used by the GSM8K recipe and
-    # ppo_dapo.yaml) imports cleanly without bumping the pinned submodule.
-    # This mirrors the shim already shipped in the sibling Nemo-RL-ppo
-    # PR #2027 worktree (nemo_rl/models/automodel/setup.py:27-56).
-    #
-    # Drop this try/except once Automodel is bumped past e1a2f915.
-    # ----------------------------------------------------------------
+    # Local backport until the pinned Automodel submodule exports
+    # NeMoAutoModelForTokenClassification.
     from nemo_automodel._transformers.auto_model import _BaseNeMoAutoModelClass
     from transformers import AutoModelForTokenClassification
 
@@ -55,6 +38,11 @@ except ImportError:
         """Backport shim - see surrounding comment."""
 
         pass
+else:
+    raise RuntimeError(
+        "Automodel now exports NeMoAutoModelForTokenClassification; remove the "
+        "local backport shim in nemo_rl.models.automodel.setup."
+    )
 
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
@@ -592,7 +580,6 @@ def setup_model_and_optimizer(
     init_optimizer: bool = True,
     weights_path: Optional[str] = None,
     optimizer_path: Optional[str] = None,
-    optimizer_module_filter: Optional[list[str]] = None,
 ) -> ModelAndOptimizerState:
     """Set up model, parallelization, and optimizer.
 
@@ -609,7 +596,6 @@ def setup_model_and_optimizer(
         init_optimizer: Whether to initialize optimizer
         weights_path: Optional path to checkpoint weights to load
         optimizer_path: Optional path to optimizer state to load
-        optimizer_module_filter: Optional list of module names to filter optimizer parameters
 
     Returns:
         ModelAndOptimizerState containing model, optimizer, scheduler, and metadata
@@ -806,14 +792,7 @@ def setup_model_and_optimizer(
             if isinstance(value, str) and value.startswith("torch."):
                 optimizer_kwargs[key] = getattr(torch, value.removeprefix("torch."))
 
-        if optimizer_module_filter is not None:
-            parameters = [
-                p
-                for n, p in model.named_parameters()
-                if p.requires_grad and any(x in n for x in optimizer_module_filter)
-            ]
-        else:
-            parameters = [p for p in model.parameters() if p.requires_grad]
+        parameters = [p for p in model.parameters() if p.requires_grad]
         optimizer = optimizer_cls(parameters, **optimizer_kwargs)
 
     # Initialize scheduler
