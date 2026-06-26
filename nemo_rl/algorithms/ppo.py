@@ -240,7 +240,10 @@ def setup(
             )
     else:
         # DTensor PPO value model currently doesn't support sequence packing and CP.
-        assert value_config["dtensor_cfg"]["enabled"]
+        assert value_config["dtensor_cfg"]["enabled"], (
+            "Exactly one of value.megatron_cfg.enabled or value.dtensor_cfg.enabled "
+            "must be true for the PPO value model."
+        )
         assert value_config["sequence_packing"]["enabled"] is False, (
             "Sequence packing is currently not supported for the DTensor PPO value model. "
             "See https://github.com/NVIDIA-NeMo/RL/issues/2951."

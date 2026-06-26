@@ -52,6 +52,7 @@ from nemo_rl.models.automodel.train import (
     automodel_forward_backward,
     forward_with_post_processing_fn,
 )
+from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.models.value.config import ValueConfig
@@ -121,18 +122,9 @@ def get_train_context(
         yield
 
 
-def get_runtime_env_for_value_worker(worker_type: str) -> dict:
-    """Get runtime environment for value worker."""
-    from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
-
-    # Reuse policy worker runtime env
-    return get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
-
-
-@ray.remote(
-    runtime_env=get_runtime_env_for_value_worker("dtensor_value_worker_v2")
-)  # pragma: no cover
-class DTensorValueWorkerV2(AbstractPolicyWorker):
+# Classes with @ray.remote can't be inherited from, so we split the implementation out.
+# This is useful when using worker extension classes.
+class DTensorValueWorkerV2Impl(AbstractPolicyWorker):
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs."""
         if torch.distributed.is_initialized():
@@ -650,3 +642,10 @@ class DTensorValueWorkerV2(AbstractPolicyWorker):
                 config_updates=config_updates,
                 checkpoint_root=checkpoint_root,
             )
+
+
+@ray.remote(
+    runtime_env=get_runtime_env_for_policy_worker("dtensor_policy_worker_v2")
+)  # pragma: no cover
+class DTensorValueWorkerV2(DTensorValueWorkerV2Impl):
+    pass

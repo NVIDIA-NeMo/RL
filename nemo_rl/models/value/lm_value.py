@@ -437,30 +437,16 @@ class Value(ValueInterface):
                 tokenizer_path=tokenizer_path,
             )
         else:
-            use_v2 = self.cfg.get("dtensor_cfg", {}).get("_v2", False)
-
-            if use_v2:
-                futures = self.worker_group.run_all_workers_single_data(
-                    "save_checkpoint",
-                    weights_path=weights_path,
-                    optimizer_path=optimizer_path,
-                    tokenizer_path=tokenizer_path,
-                    checkpointing_cfg=checkpointing_cfg,
-                )
-            else:
-                if (
-                    checkpointing_cfg is not None
-                    and checkpointing_cfg.get("model_save_format", None) is not None
-                ):
-                    raise ValueError(
-                        "model_save_format must be None or omitted if using DTensorValueWorker (_v2=False)."
-                    )
-                futures = self.worker_group.run_all_workers_single_data(
-                    "save_checkpoint",
-                    weights_path=weights_path,
-                    optimizer_path=optimizer_path,
-                    tokenizer_path=tokenizer_path,
-                )
+            assert self.cfg["dtensor_cfg"]["_v2"], (
+                "DTensor value models only support DTensor V2 backend."
+            )
+            futures = self.worker_group.run_all_workers_single_data(
+                "save_checkpoint",
+                weights_path=weights_path,
+                optimizer_path=optimizer_path,
+                tokenizer_path=tokenizer_path,
+                checkpointing_cfg=checkpointing_cfg,
+            )
         ray.get(futures)
 
     def shutdown(self) -> bool:
