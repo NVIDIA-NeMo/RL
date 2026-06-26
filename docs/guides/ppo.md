@@ -36,7 +36,7 @@ The value model is the key addition in PPO compared to GRPO. It is a language mo
 
 We define a [ValueInterface](../../nemo_rl/models/value/interfaces.py) that contains everything needed to run a Value model. Similar to the policy, the Value object holds a [RayWorkerGroup](../../nemo_rl/distributed/worker_groups.py) of SPMD (1 proc/GPU) processes coordinated so it appears like 1 GPU.
 
-The value model currently supports the **Megatron-Core backend** only (`value.megatron_cfg.enabled: true`). It uses the same architecture and tokenizer as the policy (configured via `value.model_name`), but is trained with a separate MSE loss on GAE returns.
+The value model supports the **Megatron-Core backend** (`value.megatron_cfg.enabled: true`) and the **DTensor backend** (`value.dtensor_cfg.enabled: true`). It uses the same architecture and tokenizer as the policy (configured via `value.model_name`), but is trained with a separate MSE loss on GAE returns.
 
 ### Colocated Architecture
 
@@ -74,6 +74,8 @@ value:
       overlap_param_gather: true
       data_parallel_sharding_strategy: "optim_grads_params"
 ```
+
+For a DTensor PPO recipe, see [ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp.yaml](../../examples/configs/recipes/llm/ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp.yaml).
 
 ## Generalized Advantage Estimation (GAE)
 

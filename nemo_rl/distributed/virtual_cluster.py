@@ -417,6 +417,15 @@ def select_segment_nodes(
 
     domain_nodes: dict[str, list[tuple[str, int]]] = {}
     for nid, (domain, topo_rank) in topology.items():
+        # Skip nodes with no NVLink-domain info. They all collapse into a single
+        # NVLINK_DOMAIN_UNKNOWN pseudo-domain with TOPO_RANK_UNKNOWN (-1), so they
+        # would sort first and be selected — but the resulting placement-group
+        # constraint {NVLINK_DOMAIN_UNKNOWN: 0.001} names a Ray resource that
+        # ray.sub never registers, so the bundle can never schedule. Excluding
+        # them here means we only ever pin to real, registered NVLink domains
+        # (and these nodes fall through to remaining_node_ids).
+        if domain == NVLINK_DOMAIN_UNKNOWN:
+            continue
         domain_nodes.setdefault(domain, []).append((nid, topo_rank))
     for domain in domain_nodes:
         domain_nodes[domain].sort(key=lambda x: x[1])
