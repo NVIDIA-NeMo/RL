@@ -1476,6 +1476,21 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         self.teacher_send_full_logits = list(cfg["teacher_send_full_logits"])
         self.teacher_gold_loss = list(cfg["teacher_gold_loss"])
         self.teacher_xtoken_loss = list(cfg["teacher_xtoken_loss"])
+        # Every per-teacher list must have the same length (one entry per
+        # teacher); a mismatch would otherwise surface as a deep IndexError
+        # mid-training instead of a clear error here.
+        per_teacher_lens = {
+            "projection_matrix_paths": len(self.projection_matrix_paths),
+            "teacher_vocab_sizes": len(self.teacher_vocab_sizes),
+            "teacher_weights": len(self.teacher_weights),
+            "teacher_send_full_logits": len(self.teacher_send_full_logits),
+            "teacher_gold_loss": len(self.teacher_gold_loss),
+            "teacher_xtoken_loss": len(self.teacher_xtoken_loss),
+        }
+        if len(set(per_teacher_lens.values())) != 1:
+            raise ValueError(
+                f"per-teacher lists must be equal length, got {per_teacher_lens}"
+            )
         self.num_teachers = len(self.projection_matrix_paths)
         # A teacher ships full-vocab logits via IPC iff it is cross-tokenizer
         # (projection needs them) or it is same-vocab with send_full_logits.

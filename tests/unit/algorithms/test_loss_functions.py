@@ -2412,6 +2412,15 @@ def test_cross_tokenizer_gold_loss_all_samples_masked_is_zero(tmp_path):
     assert torch.equal(loss.detach(), torch.zeros(()))
 
 
+def test_cross_tokenizer_mismatched_per_teacher_lists_raises(tmp_path):
+    """Unequal-length per-teacher lists fail loudly at construction."""
+    cfg = _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
+    # Two weights but a single entry in every other per-teacher list.
+    cfg["teacher_weights"] = [1.0, 1.0]
+    with pytest.raises(ValueError, match="per-teacher lists must be equal length"):
+        CrossTokenizerDistillationLossFn(cfg)
+
+
 def test_cross_tokenizer_ce_uniform_logits_equals_log_vocab(tmp_path):
     """_compute_ce on uniform logits equals log(V_student) per valid token."""
     loss_fn = CrossTokenizerDistillationLossFn(
