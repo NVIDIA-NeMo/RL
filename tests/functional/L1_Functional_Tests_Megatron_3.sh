@@ -35,9 +35,10 @@ run_test() {
 }
 
 run_test      uv run --no-sync bash ./tests/functional/distillation_megatron.sh
-run_test      uv run --no-sync bash ./tests/functional/qa_distillation_megatron.sh
+run_test fast uv run --no-sync bash ./tests/functional/qa_distillation_megatron.sh
 run_test      uv run --no-sync bash ./tests/functional/dpo_megatron.sh
 run_test      uv run --no-sync bash ./tests/functional/sft_megatron.sh
+run_test      uv run --no-sync bash ./tests/functional/modelopt_quant_rollout.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then

@@ -66,6 +66,7 @@ loss_fn:
   token_level_loss: true
   force_on_policy_ratio: false
   use_kl_in_reward: false  # No KL in reward (KL penalty is 0 anyway)
+  use_cispo: false  # CISPO (https://arxiv.org/abs/2506.13585): clipped IS-weight policy optimization
   # VAPO: NLL loss on correct samples. 0 = disabled.
   positive_example_nll_weight: 0.0  # VAPO: 0.1
 
@@ -146,6 +147,7 @@ policy:
     apply_rope_fusion: True
     bias_activation_fusion: True
     gradient_accumulation_fusion: false
+    use_fused_weighted_squared_relu: false
     defer_fp32_logits: False
     moe_per_layer_logging: False
 
@@ -255,7 +257,6 @@ value:
     name: ${value.model_name}
     chat_template_kwargs: null
   hf_config_overrides: {}
-  load_value_head_from_model: false
 
   train_global_batch_size: ${policy.train_global_batch_size}
   train_micro_batch_size: ${policy.train_micro_batch_size}
@@ -312,6 +313,7 @@ value:
     apply_rope_fusion: True
     bias_activation_fusion: True
     gradient_accumulation_fusion: false
+    use_fused_weighted_squared_relu: false
     defer_fp32_logits: False
     moe_per_layer_logging: False
 

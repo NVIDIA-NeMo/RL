@@ -20,6 +20,7 @@ from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
     ClippedPGLossFn,
     DistillationLossFn,
+    DPOLossConfig,
     DPOLossFn,
     NLLLossFn,
     prepare_loss_input,
@@ -29,9 +30,14 @@ from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.algorithms.x_token.loss_utils import (
     build_exact_token_map,
     chunk_average_log_probs,
+    localize_alignment,
     valid_chunk_mask,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.model_utils import (
+    cp_load_balanced_to_contiguous,
+    cp_shift_next,
+)
 
 
 def setup_dpo_loss_test_data(vocab_size=16, batch_size=1):
@@ -133,13 +139,13 @@ def test_dpo_loss():
         batch_size=batch_size,
     )
     loss_fn = DPOLossFn(
-        cfg={
-            "reference_policy_kl_penalty": 0.0,
-            "preference_loss_weight": 1.0,
-            "sft_loss_weight": 0.0,
-            "preference_average_log_probs": False,
-            "sft_average_log_probs": False,
-        }
+        cfg=DPOLossConfig(
+            reference_policy_kl_penalty=0.0,
+            preference_loss_weight=1.0,
+            sft_loss_weight=0.0,
+            preference_average_log_probs=False,
+            sft_average_log_probs=False,
+        )
     )
 
     loss_input, data = prepare_loss_input(next_token_logits, data, loss_fn)
@@ -156,13 +162,13 @@ def test_dpo_loss():
     assert torch.isclose(loss.cpu(), -torch.nn.functional.logsigmoid(torch.tensor(0.0)))
 
     loss_fn_with_sft = DPOLossFn(
-        cfg={
-            "reference_policy_kl_penalty": 0.0,
-            "preference_loss_weight": 1.0,
-            "sft_loss_weight": 0.5,
-            "preference_average_log_probs": False,
-            "sft_average_log_probs": False,
-        }
+        cfg=DPOLossConfig(
+            reference_policy_kl_penalty=0.0,
+            preference_loss_weight=1.0,
+            sft_loss_weight=0.5,
+            preference_average_log_probs=False,
+            sft_average_log_probs=False,
+        )
     )
 
     loss_input, data = prepare_loss_input(next_token_logits, data, loss_fn_with_sft)
@@ -198,22 +204,22 @@ def test_dpo_loss_varying_sequence_lengths():
 
     # Create DPO loss function with preference_average_log_probs=True
     dpo_loss_fn_no_avg = DPOLossFn(
-        {
-            "reference_policy_kl_penalty": 0.1,
-            "preference_loss_weight": 1.0,
-            "sft_loss_weight": 0.5,
-            "preference_average_log_probs": False,
-            "sft_average_log_probs": False,
-        }
+        DPOLossConfig(
+            reference_policy_kl_penalty=0.1,
+            preference_loss_weight=1.0,
+            sft_loss_weight=0.5,
+            preference_average_log_probs=False,
+            sft_average_log_probs=False,
+        )
     )
     dpo_loss_fn_avg = DPOLossFn(
-        {
-            "reference_policy_kl_penalty": 0.1,
-            "preference_loss_weight": 1.0,
-            "sft_loss_weight": 0.5,
-            "preference_average_log_probs": True,
-            "sft_average_log_probs": True,
-        }
+        DPOLossConfig(
+            reference_policy_kl_penalty=0.1,
+            preference_loss_weight=1.0,
+            sft_loss_weight=0.5,
+            preference_average_log_probs=True,
+            sft_average_log_probs=True,
+        )
     )
 
     # Create test data with varying sequence lengths
@@ -336,13 +342,13 @@ def test_dpo_sft_matches_nll_loss():
 
     # Compute DPO loss with preference_loss_weight=0
     dpo_loss_fn = DPOLossFn(
-        cfg={
-            "reference_policy_kl_penalty": 0.0,
-            "preference_loss_weight": 0.0,  # Disable preference loss
-            "sft_loss_weight": 1.0,  # Only use SFT loss
-            "preference_average_log_probs": False,
-            "sft_average_log_probs": False,
-        }
+        cfg=DPOLossConfig(
+            reference_policy_kl_penalty=0.0,
+            preference_loss_weight=0.0,  # Disable preference loss
+            sft_loss_weight=1.0,  # Only use SFT loss
+            preference_average_log_probs=False,
+            sft_average_log_probs=False,
+        )
     )
     loss_input, dpo_data = prepare_loss_input(next_token_logits, dpo_data, dpo_loss_fn)
     dpo_loss, _ = dpo_loss_fn(
@@ -629,11 +635,12 @@ def test_clipped_pg_loss_force_on_policy_ratio():
 
 
 def test_clipped_pg_loss_force_on_policy_ratio_ignores_prev_logprobs():
-    """Tests that force_on_policy_ratio ignores prev_logprobs from data and uses curr_logprobs instead.
+    """Tests that force_on_policy_ratio ignores prev_logprobs from data.
 
-    When force_on_policy_ratio=True, the loss function should use curr_logprobs.detach()
-    as prev_logprobs, so the actual prev_logprobs in data are irrelevant. This allows
-    skipping the expensive prev_logprobs computation upstream.
+    When force_on_policy_ratio=True, the loss function should use
+    curr_logprobs.detach() as prev_logprobs, so the actual prev_logprobs in
+    data are irrelevant. This allows skipping the expensive prev_logprobs
+    computation upstream.
     """
     if not torch.cuda.is_available():
         pytest.skip("No GPU available")
@@ -682,6 +689,146 @@ def test_clipped_pg_loss_force_on_policy_ratio_ignores_prev_logprobs():
     # Both should produce identical loss and ratios since prev_logprobs is ignored
     torch.testing.assert_close(loss_1, loss_2)
     assert metrics_1["probs_ratio"] == metrics_2["probs_ratio"] == 1.0
+
+
+@pytest.mark.parametrize(
+    "incompatible_config",
+    [
+        {"disable_ppo_ratio": True},
+        {"force_on_policy_ratio": True},
+        {"ratio_clip_c": 3.0},
+        {"sequence_level_importance_ratios": True, "token_level_loss": False},
+    ],
+)
+def test_clipped_pg_loss_cispo_incompatibility_asserts(incompatible_config):
+    """CISPO must reject configs that conflict with its semantics.
+
+    - disable_ppo_ratio removes the pi_theta / pi_theta_old ratio that CISPO
+      uses as the importance weight, so they are mutually exclusive.
+    - force_on_policy_ratio makes every ratio 1.0, removing CISPO's clipped
+      importance-weight behavior.
+    - sequence_level_importance_ratios changes the token-level IS weights that
+      CISPO is defined over.
+    - ratio_clip_c (dual clipping) runs after the CISPO loss assembly inside
+      ClippedPGLossFn and would silently overwrite it.
+    """
+    cfg = ClippedPGLossConfig(
+        reference_policy_kl_penalty=0.0,
+        use_cispo=True,
+        **incompatible_config,
+    )
+    with pytest.raises(AssertionError):
+        ClippedPGLossFn(cfg)
+
+
+def test_clipped_pg_loss_cispo():
+    """Tests CISPO (Clipped IS-weight Policy Optimization) path in ClippedPGLossFn.
+
+    Uses the same data pattern as test_clipped_pg_loss_ppo_clipping: ratios are
+    [0.5, 1.0, 1.5] and clamp to [0.8, 1.0, 1.2]. CISPO formula:
+
+        L = -advantages * clip(ratio, 1-eps, 1+eps).detach() * curr_logprobs
+
+    The IS weight is clipped and stop-gradiented; gradients flow only through
+    curr_logprobs.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+
+    device = "cuda"
+    data, batch_size, seq_len, vocab_size = _setup_clipped_pg_test_data(device=device)
+
+    cfg = ClippedPGLossConfig(reference_policy_kl_penalty=0.0, use_cispo=True)
+    loss_fn = ClippedPGLossFn(cfg)
+
+    adv_masked = torch.tensor([[1.0, -1.0, 2.0]], device=device)
+    prev_lp_masked = torch.tensor([[-1.0, -1.0, -1.0]], device=device)
+    # Target ratios: 0.5, 1.0, 1.5 -> after clip(0.2, 0.2): 0.8, 1.0, 1.2
+    curr_lp_masked = torch.tensor(
+        [[-1.69315, -1.0, -0.59453]], device=device
+    )  # approx log(0.5)-1, log(1)-1, log(1.5)-1
+
+    data["advantages"][0, 1:] = adv_masked
+    data["prev_logprobs"][0, 1:] = prev_lp_masked
+
+    # --- Hand calculation: CISPO loss = -A * clip(r, 1-ε, 1+ε) * curr_lp (ratio stop-grad) ---
+    ratios = torch.exp(curr_lp_masked - prev_lp_masked)  # [0.5, 1.0, 1.5]
+    ratios_clamped = torch.clamp(
+        ratios, 1.0 - cfg.ratio_clip_min, 1.0 + cfg.ratio_clip_max
+    )  # [0.8, 1.0, 1.2]
+    cispo_loss_per_token = -adv_masked * ratios_clamped * curr_lp_masked
+    expected_loss = torch.mean(cispo_loss_per_token)
+
+    input_ids = data["input_ids"]
+    dummy_logits = _create_exact_logits(
+        curr_lp_masked, input_ids, batch_size, seq_len, vocab_size, device
+    )
+    loss_input, data = prepare_loss_input(dummy_logits, data, loss_fn)
+
+    actual_loss, _ = loss_fn(
+        data=data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+        **loss_input,
+    )
+    torch.testing.assert_close(actual_loss, expected_loss, rtol=1e-3, atol=1e-3)
+
+
+def test_clipped_pg_loss_cispo_with_importance_sampling_correction():
+    """Tests CISPO with the off-policy IS correction used by the shipped recipe.
+
+    CISPO builds clip_loss = -A * clip(ratio).detach() * curr_lp. When
+    use_importance_sampling_correction=True, the shared GRPO loss path also
+    multiplies it token-wise by the actor-vs-generation IS weight
+    exp(prev_lp - generation_lp).
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+
+    device = "cuda"
+    data, batch_size, seq_len, vocab_size = _setup_clipped_pg_test_data(device=device)
+
+    cfg = ClippedPGLossConfig(
+        reference_policy_kl_penalty=0.0,
+        use_cispo=True,
+        use_importance_sampling_correction=True,
+    )
+    loss_fn = ClippedPGLossFn(cfg)
+
+    adv_masked = torch.tensor([[1.0, -1.0, 2.0]], device=device)
+    prev_lp_masked = torch.tensor([[-1.0, -1.0, -1.0]], device=device)
+    curr_lp_masked = torch.tensor([[-1.69315, -1.0, -0.59453]], device=device)
+    gen_lp_masked = torch.tensor([[-0.5, -1.5, -0.8]], device=device)
+
+    data["advantages"][0, 1:] = adv_masked
+    data["prev_logprobs"][0, 1:] = prev_lp_masked
+    data["generation_logprobs"][0, 1:] = gen_lp_masked
+
+    ratios = torch.exp(curr_lp_masked - prev_lp_masked)
+    ratios_clamped = torch.clamp(
+        ratios, 1.0 - cfg.ratio_clip_min, 1.0 + cfg.ratio_clip_max
+    )
+    cispo_loss_per_token = -adv_masked * ratios_clamped * curr_lp_masked
+    importance_weights = torch.exp(prev_lp_masked - gen_lp_masked)
+    expected_loss = torch.mean(importance_weights * cispo_loss_per_token)
+
+    input_ids = data["input_ids"]
+    dummy_logits = _create_exact_logits(
+        curr_lp_masked, input_ids, batch_size, seq_len, vocab_size, device
+    )
+    loss_input, data = prepare_loss_input(dummy_logits, data, loss_fn)
+
+    actual_loss, _ = loss_fn(
+        data=data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(
+            data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+        ),
+        **loss_input,
+    )
+    torch.testing.assert_close(actual_loss, expected_loss, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("kl_type", ["k1", "k2", "k3"])
@@ -782,6 +929,66 @@ def test_clipped_pg_loss_kl_penalty():
         **loss_input,
     )
     torch.testing.assert_close(actual_loss, expected_loss)
+
+
+@pytest.mark.parametrize("use_on_policy_kl_approximation", [False, True])
+def test_clipped_pg_loss_kl_gradient_includes_sampling_term(
+    use_on_policy_kl_approximation,
+):
+    """Tests that KL gradients include the sampled-policy score term."""
+    curr_logprobs = torch.tensor([[-1.2, -0.7]])
+    prev_logprobs = torch.tensor([[-1.0, -0.8]])
+    generation_logprobs = torch.tensor([[-1.5, -0.4]])
+    reference_policy_logprobs = torch.tensor([[-0.9, -1.1]])
+    advantages = torch.tensor([[0.4, -0.2]])
+    beta = 0.3
+
+    def loss_gradient(reference_policy_kl_penalty):
+        next_token_logprobs = curr_logprobs.clone().requires_grad_(True)
+        data = BatchedDataDict(
+            {
+                "input_ids": torch.zeros((1, 3), dtype=torch.int64),
+                "token_mask": torch.tensor([[0, 1, 1]]),
+                "sample_mask": torch.tensor([1]),
+                "advantages": torch.cat([torch.zeros((1, 1)), advantages], dim=-1),
+                "prev_logprobs": torch.cat(
+                    [torch.zeros((1, 1)), prev_logprobs], dim=-1
+                ),
+                "generation_logprobs": torch.cat(
+                    [torch.zeros((1, 1)), generation_logprobs], dim=-1
+                ),
+                "reference_policy_logprobs": torch.cat(
+                    [torch.zeros((1, 1)), reference_policy_logprobs], dim=-1
+                ),
+            }
+        )
+        cfg = ClippedPGLossConfig(
+            reference_policy_kl_penalty=reference_policy_kl_penalty,
+            use_on_policy_kl_approximation=use_on_policy_kl_approximation,
+        )
+        loss_fn = ClippedPGLossFn(cfg)
+        loss, _ = loss_fn(
+            next_token_logprobs=next_token_logprobs,
+            data=data,
+            global_valid_seqs=torch.sum(data["sample_mask"]),
+            global_valid_toks=torch.sum(
+                data["sample_mask"].unsqueeze(-1) * data["token_mask"]
+            ),
+        )
+        loss.backward()
+        return next_token_logprobs.grad
+
+    actual_kl_gradient = loss_gradient(beta) - loss_gradient(0.0)
+    log_ratio = reference_policy_logprobs - curr_logprobs
+    kl = torch.exp(log_ratio) - 1 - log_ratio
+    kl_gradient = 1 - torch.exp(log_ratio)
+    if use_on_policy_kl_approximation:
+        kl_weight = torch.exp(curr_logprobs - generation_logprobs)
+    else:
+        kl_weight = torch.ones_like(curr_logprobs)
+    expected_kl_gradient = beta * kl_weight * (kl + kl_gradient) / curr_logprobs.numel()
+
+    torch.testing.assert_close(actual_kl_gradient, expected_kl_gradient)
 
 
 # Masking tests - Should work with original Loss Fn if needed, but less critical
@@ -1270,6 +1477,64 @@ def test_clipped_pg_loss_reports_is_oob_ratio_tis():
     )
 
     assert metrics["is_oob_ratio"] == pytest.approx(1.0 / 3.0)
+
+
+@pytest.mark.parametrize("tis_type", ["tis", "icepop", "seq-mask-tis"])
+def test_clipped_pg_loss_rejects_tis_min_above_max(tis_type):
+    cfg = ClippedPGLossConfig(
+        use_importance_sampling_correction=True,
+        truncated_importance_sampling_type=tis_type,
+        truncated_importance_sampling_ratio=1.0,
+        truncated_importance_sampling_ratio_min=2.0,
+    )
+
+    with pytest.raises(
+        AssertionError,
+        match=(
+            "truncated_importance_sampling_ratio_min must be <= "
+            "truncated_importance_sampling_ratio"
+        ),
+    ):
+        ClippedPGLossFn(cfg)
+
+
+@pytest.mark.parametrize(
+    "tis_min,expected_weights,expected_oob_ratio",
+    [
+        (None, torch.tensor([0.1, 1.0, 2.0]), 1.0 / 3.0),
+        (0.5, torch.tensor([0.5, 1.0, 2.0]), 2.0 / 3.0),
+    ],
+)
+def test_clipped_pg_loss_tis_min_bound_defaults_to_zero(
+    tis_min, expected_weights, expected_oob_ratio
+):
+    device = "cpu"
+    data, _, seq_len, _ = _setup_clipped_pg_test_data(device=device)
+
+    cfg = ClippedPGLossConfig(
+        reference_policy_kl_penalty=0.0,
+        use_importance_sampling_correction=True,
+        force_on_policy_ratio=True,
+        truncated_importance_sampling_type="tis",
+        truncated_importance_sampling_ratio=2.0,
+        truncated_importance_sampling_ratio_min=tis_min,
+    )
+    loss_fn = ClippedPGLossFn(cfg)
+
+    data["advantages"][0, 1:] = torch.ones(3)
+    data["generation_logprobs"][0, 1:] = torch.zeros(3)
+    next_token_logprobs = torch.log(torch.tensor([[0.1, 1.0, 3.0]]))
+
+    loss, metrics = loss_fn(
+        next_token_logprobs=next_token_logprobs,
+        data=data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(data["sample_mask"] * data["token_mask"]),
+    )
+
+    expected_loss = -expected_weights.mean()
+    torch.testing.assert_close(loss, expected_loss)
+    assert metrics["is_oob_ratio"] == pytest.approx(expected_oob_ratio)
 
 
 def test_clipped_pg_loss_seq_mask_tis():
@@ -2087,7 +2352,7 @@ def test_distillation_loss_fn_call():
 # gold path (KL on the exact-mapped common partition + L1 on the uncommon
 # tail) and the next-token CE term. Unlike the DistillationLossFn tests
 # above, these run on CPU: the gold and CE paths use no GPU-pinned ops, and
-# ``dp_all_reduce_sum`` falls back to the local sum when torch.distributed
+# ``group_all_reduce_sum`` falls back to the local sum when torch.distributed
 # is not initialized.
 # ---------------------------------------------------------------------------
 
@@ -2168,6 +2433,22 @@ def _ct_gold_data(student_chunk_id, teacher_chunk_id, pair_valid, sample_mask):
     )
 
 
+def _ct_gold_prep(logits, teacher_logits, data):
+    """Mirror ``prepare_loss_input``'s shared prep for the single-rank (no-CP)
+    gold path: CP-relaid student logits + localized, next-token-shifted align."""
+    student_logits = cp_load_balanced_to_contiguous(logits, cp_group=None)
+    align = localize_alignment(
+        data, teacher_seq_len=teacher_logits.shape[1], cp_group=None
+    )
+    align.student_chunk_id = cp_shift_next(
+        cp_load_balanced_to_contiguous(align.student_chunk_id, cp_group=None),
+        None,
+        fill=-1,
+    )
+    align.teacher_chunk_id = cp_shift_next(align.teacher_chunk_id, None, fill=-1)
+    return student_logits, align
+
+
 def test_cross_tokenizer_gold_loss_matches_reference(tmp_path):
     """Gold path == (KL on common + L1 on uncommon) * T**2, with no CE term.
 
@@ -2189,8 +2470,9 @@ def test_cross_tokenizer_gold_loss_matches_reference(tmp_path):
     logits = torch.randn(1, 3, _CT_V_STUDENT)
     teacher_logits = torch.randn(1, 3, _CT_V_TEACHER)
 
+    student_logits, align = _ct_gold_prep(logits, teacher_logits, data)
     loss, kl_common, l1_uncommon, n_valid, _ = loss_fn._compute_gold(
-        logits, data, teacher_logits
+        student_logits, teacher_logits, align
     )
 
     assert torch.isfinite(loss)
@@ -2244,7 +2526,10 @@ def test_cross_tokenizer_gold_loss_all_samples_masked_is_zero(tmp_path):
     logits = torch.randn(1, 3, _CT_V_STUDENT)
     teacher_logits = torch.randn(1, 3, _CT_V_TEACHER)
 
-    loss, _, _, n_valid, _ = loss_fn._compute_gold(logits, data, teacher_logits)
+    student_logits, align = _ct_gold_prep(logits, teacher_logits, data)
+    loss, _, _, n_valid, _ = loss_fn._compute_gold(
+        student_logits, teacher_logits, align
+    )
     assert n_valid.item() == 0
     assert torch.equal(loss.detach(), torch.zeros(()))
 

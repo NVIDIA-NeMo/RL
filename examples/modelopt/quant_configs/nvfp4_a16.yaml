@@ -6,7 +6,8 @@
 #       quant_cfg: "examples/modelopt/quant_configs/nvfp4_a16.yaml"
 #
 # This recipe uses ModelOpt's standard PTQ recipe layout (see
-# ``modelopt_recipes/general/ptq/`` in the TensorRT-Model-Optimizer repo).
+# ``modelopt_recipes/general/ptq/`` in the NVIDIA/Model-Optimizer repo:
+# https://github.com/NVIDIA/Model-Optimizer).
 # Only the ``quantize:`` section is consumed by ``mtq.quantize``; the
 # ``metadata:`` section is informational.
 #

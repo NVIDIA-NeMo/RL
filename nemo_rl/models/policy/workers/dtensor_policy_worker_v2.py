@@ -68,7 +68,7 @@ from nemo_rl.models.policy.interfaces import (
     ScoreOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
-    get_handle_from_tensor,
+    ensure_teacher_ipc_buffer,
     get_runtime_env_for_policy_worker,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
@@ -258,14 +258,13 @@ class DTensorPolicyWorkerV2Impl(
 
         # Persistent CUDA IPC buffer for cross-tokenizer teacher logits.
         # Allocated once on first ``get_full_logits_ipc`` call (or
-        # reallocated if dims grow), ``.copy_()``-ed into each step, and
-        # exposed via a stable IPC handle captured at allocation. With a
-        # persistent buffer the producer never tries to free between
-        # steps, so the consumer can safely hold a view into the
-        # IPC-imported storage without keeping a now-orphaned producer
-        # allocation pinned via refcount.
-        self._teacher_ipc_buffer: Optional[torch.Tensor] = None
-        self._teacher_ipc_handle: Optional[tuple] = None
+        # reallocated if dims grow), with fresh logits ``.copy_()``-ed into
+        # each microbatch slot per step and exposed via a stable IPC handle
+        # captured at allocation. Persistent storage means the producer never
+        # frees between steps, so the consumer can safely hold a view into the
+        # IPC-imported storage without pinning an orphaned producer allocation.
+        self._teacher_ipc_storage: Optional[torch.Tensor] = None
+        self._teacher_ipc_handle: Optional[tuple[Any, ...]] = None
 
         # Validate configuration and prepare runtime settings
         runtime_config = validate_and_prepare_config(
@@ -351,6 +350,32 @@ class DTensorPolicyWorkerV2Impl(
             self.sampling_params,
             _runtime_is_reward_model,  # Duplicate, already set as _is_reward_model
         ) = runtime_config
+
+        # Rollout topology constant for SGLang colocated refit: set once via
+        # ``set_rollout_num_gpus_per_engine`` after the SGLang generation
+        # handle exists and consumed by ``stream_weights_via_http`` on each
+        # refit. Only initialized on the SGLang colocated path since no other
+        # generation backend uses this attribute.
+        generation_backend = config.get("generation", {}).get("backend")
+        if generation_backend == "sglang":
+            from nemo_rl.models.generation.sglang.utils.train_utils import (
+                monkey_patch_torch_reductions,
+            )
+
+            monkey_patch_torch_reductions()
+            if self.is_generation_colocated:
+                self._rollout_num_gpus_per_engine: Optional[int] = None
+                self._ipc_worker_state: dict = {}
+
+    def _update_moe_gate_bias_if_supported(self) -> None:
+        """Update the non-gradient MoE routing bias after the optimizer step."""
+        update_moe_gate_bias = getattr(self.model, "update_moe_gate_bias", None)
+        if update_moe_gate_bias is not None:
+            update_moe_gate_bias()
+
+    def set_rollout_num_gpus_per_engine(self, num_gpus_per_engine: int) -> None:
+        """Record the rollout engine's TP size for later use in ``stream_weights_via_http``."""
+        self._rollout_num_gpus_per_engine = num_gpus_per_engine
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/train")
     def train(
@@ -511,8 +536,9 @@ class DTensorPolicyWorkerV2Impl(
                         grad_norm, device="cpu", dtype=torch.float32
                     )
 
-                    # Update parameters
+                    # Update parameters and the non-gradient MoE routing bias.
                     self.optimizer.step()
+                    self._update_moe_gate_bias_if_supported()
 
                 losses.append(torch.tensor(mb_losses).sum().item())
 
@@ -812,34 +838,16 @@ class DTensorPolicyWorkerV2Impl(
         data: BatchedDataDict[Any],
         micro_batch_size: Optional[int] = None,
     ) -> dict[str, Any]:
-        """Cross-tokenizer teacher forward; full-vocab logits leave via CUDA IPC.
+        """Teacher forward; full-vocab logits exposed via persistent CUDA IPC storage.
 
-        Used by cross-tokenizer distillation. Returns the full teacher
-        vocab logits ``[T_t, V_t]`` per sample as a CUDA IPC handle so the
-        student worker (a separate Ray actor on the same node) can rebuild
-        the tensor without a CPU round-trip. Both gold-loss and projection-
-        KL paths consume full vocab: PT gold operates on full vocab end to
-        end; PT non-gold computes its ``global_top_indices`` reduction
-        *inside the loss*, not at the worker.
-
-        Lifetime: the source ``[B_r, T_t, V_t]`` CUDA tensor is a
-        **persistent** IPC buffer (``self._teacher_ipc_buffer``)
-        allocated once and reused across every training step. The
-        captured IPC handle (``self._teacher_ipc_handle``) is also
-        stable — each step ``.copy_()``-s fresh logits into the same
-        backing memory. :meth:`release_ipc_buffer` is a no-op kept for
-        driver-side contract compatibility.
-
-        Returns:
-            dict with:
-              - ``per_sample_handles``: ``list[B_r]`` of dicts. Every entry
-                carries the **same** rank-level handle ``rank_logits_ipc``
-                (taken on the whole ``[B_r, T_t, V_t]`` tray) plus its own
-                ``sample_idx_within_rank``. The consumer rebuilds that one
-                handle and slices ``[mb_start:mb_end]`` for the current
-                microbatch — no ``torch.stack``, no extra allocation.
-
-        v0 limitation: TP=1, CP=1, no sequence packing.
+        Used by cross-tokenizer distillation; supports heterogeneous teacher
+        TP/CP. Each microbatch writes into slot
+        ``self._teacher_ipc_storage[buf_idx]`` and shares one cached IPC
+        handle. Returns ``{"per_sample_handles": list, "dp_rank": int}`` where
+        each handle carries ``buf_idx`` and ``sample_index_in_buf`` for the
+        consumer to index the slot view, plus the TP/CP shard metadata
+        (``vocab_start_index``, ``global_seq_start``, ...) the consumer uses to
+        route shards across heterogeneous teacher/student TP/CP.
         """
         forward_batch_size = (
             micro_batch_size
@@ -847,8 +855,10 @@ class DTensorPolicyWorkerV2Impl(
             else self.cfg["logprob_batch_size"]
         )
         sequence_dim, seq_dim_size = check_sequence_dim(data)
+        target_local_seq = (
+            seq_dim_size // self.cp_size if self.cp_size > 1 else seq_dim_size
+        )
 
-        out_vals: list[torch.Tensor] = []
         self.model.eval()
 
         post_processor = FullLogitsPostProcessor(
@@ -860,6 +870,16 @@ class DTensorPolicyWorkerV2Impl(
             enable_seq_packing=self.enable_seq_packing,
         )
 
+        tp_rank = self.tp_mesh.get_local_rank() if self.tp_mesh is not None else 0
+        cp_rank = self.cp_mesh.get_local_rank() if self.cp_mesh is not None else 0
+        dp_rank = self.dp_mesh.get_local_rank() if self.dp_mesh is not None else 0
+        world_rank = torch.distributed.get_rank()
+        full_seq_len = target_local_seq * self.cp_size
+        global_seq_start = cp_rank * full_seq_len // self.cp_size
+
+        per_sample_handles: list[dict[str, Any]] = []
+        storage: Optional[torch.Tensor] = None
+        payload_ipc: Optional[tuple[Any, ...]] = None
         with torch.no_grad():
             data.to("cuda")
             processed_iterator, iterator_len = get_microbatch_iterator(
@@ -870,7 +890,7 @@ class DTensorPolicyWorkerV2Impl(
                 tokenizer=self.tokenizer,
                 cp_size=self.cp_size,
             )
-            for batch_idx, processed_mb in enumerate(processed_iterator):
+            for buf_idx, processed_mb in enumerate(processed_iterator):
                 processed_inputs = processed_mb.processed_inputs
                 with get_train_context(
                     cp_size=self.cp_size,
@@ -889,102 +909,73 @@ class DTensorPolicyWorkerV2Impl(
                         sampling_params=self.sampling_params,
                         sequence_dim=sequence_dim,
                     )
-                if batch_idx >= iterator_len:
+                if buf_idx >= iterator_len:
                     continue
-                # Keep vals on CUDA for IPC; pad seq dim now so the stash
-                # tensor matches the canonical [B_r, T_t, V_t] shape.
-                pad_needed = seq_dim_size - vals.shape[1]
+                # Pad to canonical seq so the cached IPC handle stays shape-stable.
+                pad_needed = target_local_seq - vals.shape[1]
                 if pad_needed > 0:
                     vals = torch.nn.functional.pad(
                         vals, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0.0
                     )
-                out_vals.append(vals.contiguous())
+                batch_size_mb, seq_len_mb, local_vocab_size = vals.shape
 
-        final_vals = (
-            torch.cat(out_vals, dim=0) if len(out_vals) > 1 else out_vals[0]
-        )  # CUDA [B_r, T_t, V_t]
-
-        # Lazy-allocate the persistent IPC buffer (sized at first call,
-        # reallocated only if dims grow). The IPC handle is captured once
-        # at allocation and reused across all training steps — the
-        # consumer's view-only rebuild is safe because this buffer is
-        # never freed between steps.
-        B_r, T_t, V_t = final_vals.shape
-        self._ensure_teacher_ipc_buffer(
-            B_r, T_t, V_t, final_vals.dtype, final_vals.device
-        )
-        self._teacher_ipc_buffer[:B_r, :T_t, :V_t].copy_(final_vals)
-        # The copy_ is async on the current stream; force it to complete
-        # before the IPC handle is consumed by the student process, so the
-        # consumer can't observe a partially written buffer (mirrors the
-        # sync in nemo_rl/models/policy/utils.py before exposing handles).
+                self._teacher_ipc_storage, self._teacher_ipc_handle = (
+                    ensure_teacher_ipc_buffer(
+                        self._teacher_ipc_storage,
+                        self._teacher_ipc_handle,
+                        iterator_len,
+                        batch_size_mb,
+                        target_local_seq,
+                        local_vocab_size,
+                        vals.dtype,
+                        vals.device,
+                    )
+                )
+                storage = self._teacher_ipc_storage
+                payload_ipc = self._teacher_ipc_handle
+                storage[buf_idx, :batch_size_mb, :seq_len_mb, :local_vocab_size].copy_(
+                    vals
+                )
+                del vals
+                full_vocab_size = local_vocab_size * self.tp_size
+                vocab_start_index = tp_rank * local_vocab_size
+                vocab_end_index = (tp_rank + 1) * local_vocab_size
+                for sample_index_in_buf in range(batch_size_mb):
+                    per_sample_handles.append(
+                        {
+                            "payload_ipc": payload_ipc,
+                            "buf_idx": buf_idx,
+                            "sample_index_in_buf": sample_index_in_buf,
+                            "storage_shape": tuple(storage.shape),
+                            "actual_shape": (target_local_seq, local_vocab_size),
+                            "dtype": storage.dtype,
+                            "tp_rank": tp_rank,
+                            "cp_rank": cp_rank,
+                            "tp_size": self.tp_size,
+                            "cp_size": self.cp_size,
+                            "world_rank": world_rank,
+                            "vocab_start_index": vocab_start_index,
+                            "vocab_end_index": vocab_end_index,
+                            "global_seq_start": global_seq_start,
+                            "full_vocab_size": full_vocab_size,
+                            "full_seq_len": full_seq_len,
+                            "vocab_sharded": self.tp_size > 1,
+                            "sequence_sharded": self.cp_size > 1,
+                        }
+                    )
+        # The storage copies above are async on the current stream; force them
+        # to complete before the IPC handles are consumed by the student
+        # process, so the consumer can't observe a partially written buffer
+        # (ports the sync added upstream for the single-buffer export path).
         torch.cuda.synchronize()
-        del (
-            final_vals,
-            out_vals,
-        )  # drop the cat intermediate; only the persistent buffer holds the data now
-
-        # Every per-sample entry carries the same stable rank-level
-        # handle plus its rank-local sample index. The consumer rebuilds
-        # the single handle once and slices into the contiguous
-        # microbatch range — no torch.stack, no allocation.
-        rank_shape = (B_r, T_t, V_t)
-        rank_dtype = self._teacher_ipc_buffer.dtype
-
-        per_sample_handles: list[dict[str, Any]] = [
-            {
-                "rank_logits_ipc": self._teacher_ipc_handle,
-                "rank_shape": rank_shape,
-                "dtype": rank_dtype,
-                "sample_idx_within_rank": i,
-            }
-            for i in range(B_r)
-        ]
-        return {"per_sample_handles": per_sample_handles}
-
-    def _ensure_teacher_ipc_buffer(
-        self,
-        B_r: int,
-        T_t: int,
-        V_t: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> None:
-        """Allocate the persistent teacher-logits IPC buffer if needed.
-
-        On first call: allocates ``[B_r, T_t, V_t]`` on ``device`` with
-        ``dtype`` and captures the IPC handle. On subsequent calls:
-        no-op as long as the existing buffer can hold the requested
-        shape and matches dtype/device. If any dim grew or dtype/device
-        changed, reallocates and re-captures the handle (the consumer
-        will receive the new handle in the next ``get_full_logits_ipc``
-        return value).
-        """
-        if (
-            self._teacher_ipc_buffer is not None
-            and self._teacher_ipc_buffer.shape[0] >= B_r
-            and self._teacher_ipc_buffer.shape[1] >= T_t
-            and self._teacher_ipc_buffer.shape[2] >= V_t
-            and self._teacher_ipc_buffer.dtype == dtype
-            and self._teacher_ipc_buffer.device == device
-        ):
-            return
-        self._teacher_ipc_buffer = torch.empty(
-            (B_r, T_t, V_t), dtype=dtype, device=device
-        )
-        self._teacher_ipc_handle = get_handle_from_tensor(self._teacher_ipc_buffer)
+        return {"per_sample_handles": per_sample_handles, "dp_rank": dp_rank}
 
     def release_ipc_buffer(self) -> None:
-        """No-op under the persistent IPC buffer design.
-
-        The teacher-logits IPC buffer is allocated once on first
-        ``get_full_logits_ipc`` and lives for the worker's lifetime;
-        each step ``.copy_()``-s fresh logits into the same memory
-        backing the same stable IPC handle. The driver still calls
-        this method in its ``finally`` block — keep that contract,
-        but with persistent storage there is nothing to release.
-        """
-        return
+        """Free the persistent teacher-logit IPC storage. Called once at end of training/validation."""
+        self._teacher_ipc_storage = None
+        self._teacher_ipc_handle = None
+        gc.collect()
+        torch.cuda.empty_cache()
 
     @contextmanager
     def use_reference_model(self) -> Generator[None, None, None]:
@@ -1119,47 +1110,42 @@ class DTensorPolicyWorkerV2Impl(
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/stream_weights_via_http")
     def stream_weights_via_http(
         self,
-        sglang_url_to_gpu_uuids: dict[str, list[str]],
+        rollout_engine_urls: list[str],
+        buffer_size_bytes: int,
     ) -> None:
-        """Stream model weights to SGLang servers via HTTP API.
+        """Stream FSDP weights to colocated SGLang engines via CUDA IPC over HTTP.
 
         Args:
-            sglang_url_to_gpu_uuids: Dict mapping SGLang server URL to list of GPU UUIDs it uses
+            rollout_engine_urls: ``http://host:port`` base URLs of each
+                engine's ``node_rank=0`` SGLang HTTP server. The driver
+                resolves these once via ``engine.get_base_url`` and passes
+                them down so every FSDP rank doesn't redo the Ray RPC.
+            buffer_size_bytes: Max bucket size in bytes before flushing.
+
+        ``num_gpus_per_engine`` is recorded once via
+        ``set_rollout_num_gpus_per_engine`` after the SGLang generation handle
+        is created, so the caller doesn't have to pass it on every refit.
         """
+        assert self._rollout_num_gpus_per_engine is not None, (
+            "stream_weights_via_http called before set_rollout_num_gpus_per_engine; "
+            "wire the rollout TP size on the policy after SGLangGeneration is built."
+        )
+
         # Manually move model to cuda for cpu offload case
         if self.cpu_offload:
             self.model = self.move_to_cuda(self.model)
 
         from nemo_rl.models.policy.utils import stream_weights_via_http_impl
 
-        # Get current GPU UUID
-        current_device_uuid = self.report_device_id()
-
-        def dtensor_params_generator():
-            """Generator that yields (name, tensor) pairs, converting DTensors to local tensors."""
-            state_dict_items = sorted(
-                self.model.state_dict().items(), key=lambda x: x[0]
-            )
-            for name, tensor in state_dict_items:
-                if isinstance(tensor, DTensor):
-                    # Convert DTensor to full tensor for streaming
-                    full_tensor = tensor.full_tensor()
-                    # Convert to target dtype
-                    yield (
-                        name,
-                        full_tensor.to(self.dtype, non_blocking=True).contiguous(),
-                    )
-                else:
-                    # Convert to target dtype
-                    yield name, tensor.to(self.dtype, non_blocking=True).contiguous()
-
-        # Use the HTTP implementation
         stream_weights_via_http_impl(
-            params_generator=dtensor_params_generator(),
-            sglang_url_to_gpu_uuids=sglang_url_to_gpu_uuids,
+            params_generator=dtensor_params_generator(self.model, self.dtype),
+            rollout_engine_urls=rollout_engine_urls,
+            num_gpus_per_engine=self._rollout_num_gpus_per_engine,
             rank=self.rank,
+            world_size=torch.distributed.get_world_size(),
             worker_name=str(self),
-            current_device_uuid=current_device_uuid,
+            buffer_size_bytes=buffer_size_bytes,
+            worker_state=self._ipc_worker_state,
         )
 
     @torch.no_grad()

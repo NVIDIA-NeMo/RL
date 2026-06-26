@@ -1,0 +1,116 @@
+defaults: ../../vlm_grpo_3B.yaml
+grpo:
+  num_prompts_per_step: 32
+  overlong_filtering: true
+  seq_logprob_error_threshold: 2
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  kl_input_clamp_value: null
+  kl_output_clamp_value: null
+  ratio_clip_max: 0.28
+  use_on_policy_kl_approximation: true
+  sequence_level_importance_ratios: true
+  token_level_loss: false
+checkpointing:
+  checkpoint_dir: results/vlm_grpo_nemotron_omni_mmpr
+  keep_top_k: 1000000
+  checkpoint_must_save_by: 00:03:45:00
+policy:
+  model_name: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
+  train_global_batch_size: 32
+  logprob_batch_size: 1
+  max_total_sequence_length: 8192
+  logprob_chunk_size: 1024
+  dynamic_batching:
+    enabled: false
+  optimizer:
+    kwargs:
+      lr: 3.0e-06
+      weight_decay: 0.0
+      betas:
+      - 0.9
+      - 0.99
+      foreach: false
+      fused: false
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 0.01
+      end_factor: 1.0
+      total_iters: 10
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones:
+    - 10
+  dtensor_cfg:
+    expert_parallel_size: 8
+    activation_checkpointing: true
+    moe_parallelizer:
+      ignore_router_for_ac: true
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    automodel_kwargs:
+      backend:
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
+        attn: sdpa
+        linear: torch
+        rms_norm: torch_fp32
+        dispatcher: deepep
+        experts: torch_mm
+        fake_balanced_gate: false
+        rope_fusion: false
+        enable_hf_state_dict_adapter: true
+      freeze_config:
+        freeze_vision_tower: true
+        freeze_audio_tower: true
+        freeze_language_model: false
+  generation:
+    max_new_tokens: ${policy.max_total_sequence_length}
+    bad_words:
+    - <image>
+    - <img>
+    - </img>
+    - <so_embedding>
+    - <so_start>
+    - <so_end>
+    vllm_cfg:
+      tensor_parallel_size: 8
+      enforce_eager: true
+      gpu_memory_utilization: 0.5
+      enable_prefix_caching: false
+    vllm_kwargs:
+      limit_mm_per_prompt:
+        image: 2
+      max_num_batched_tokens: 16384
+      mamba_ssm_cache_dtype: float32
+      skip_mm_profiling: true
+      kernel_config:
+        enable_flashinfer_autotune: false
+        moe_backend: triton
+data:
+  train:
+    dataset_name: mmpr-tiny
+    download_dir: results/mmpr_tiny_processed
+    split_validation_size: 0.008
+    seed: 42
+  default:
+    prompt_file: null
+    env_name: mmpr-tiny
+env:
+  mmpr-tiny:
+    num_workers: 8
+    reward_functions:
+    - name: geo3k
+      weight: 1.0
+      kwargs:
+        format_score: 0.1
+logger:
+  wandb_enabled: true
+  wandb:
+    project: grpo-vlm
+    name: nemotron-omni-grpo-mmpr
+cluster:
+  num_nodes: 4
+  gpus_per_node: 8

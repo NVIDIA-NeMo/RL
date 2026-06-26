@@ -164,6 +164,7 @@ policy:
     moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
     gradient_accumulation_fusion: false
+    use_fused_weighted_squared_relu: false
 
     peft:
       enabled: false
@@ -311,3 +312,4 @@ logger:
 cluster:
   gpus_per_node: 1
   num_nodes: 1
+  segment_size: null  # Nodes per NVLink domain segment for topology-aware alignment; null to disable

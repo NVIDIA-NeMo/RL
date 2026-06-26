@@ -118,9 +118,33 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         """
         stacked_dict: Self = cls()
         pad_value_dict = pad_value_dict or {}
+        if not batches:
+            return stacked_dict
 
-        for k in sorted(batches[0]):
-            list_of_tensors = [item[k] for item in batches]
+        def batch_size(item: Mapping[Any, Any]) -> int:
+            if not item:
+                return 0
+            value = next(iter(item.values()))
+            if isinstance(value, PackedTensor):
+                return len(value)
+            if isinstance(value, torch.Tensor):
+                return value.shape[0]
+            return len(value)
+
+        keys = sorted({key for item in batches for key in item})
+        for k in keys:
+            missing_nonempty_batches = [
+                idx
+                for idx, item in enumerate(batches)
+                if k not in item and batch_size(item)
+            ]
+            if missing_nonempty_batches:
+                raise KeyError(
+                    f"Key {k!r} is missing from non-empty batches "
+                    f"{missing_nonempty_batches}."
+                )
+
+            list_of_tensors = [item[k] for item in batches if k in item]
 
             if isinstance(list_of_tensors[0], list):
                 tensor_or_list: list[Any] | torch.Tensor = [
@@ -132,20 +156,16 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 tensor_or_list = torch.cat(list_of_tensors)
             elif isinstance(list_of_tensors[0], torch.Tensor):
                 pad_value = pad_value_dict.get(k, 0)
-                # We now add the following if statement to handle the 3D case in distillation
-                # (i.e., teacher top-k logits and indices); the else branch is the original code.
-                if list_of_tensors[0].ndim == 3:
-                    # For 3D tensors, pad only along the sequence dimension (the 1st dimension here),
-                    # keeping the feature dimension.
+                # Preserve structured per-token fields such as teacher top-k data
+                # [B, S, K] and routed experts [B, S, L, topk].
+                if list_of_tensors[0].ndim >= 3:
                     max_seq_len = max(tensor.shape[1] for tensor in list_of_tensors)
                     padded_tensors = []
                     for tensor in list_of_tensors:
-                        # Pad along the 1st dimension to max_seq_len.
                         pad_length = max_seq_len - tensor.shape[1]
                         padded = torch.nn.functional.pad(
                             tensor,
-                            # Only pad the last two dimensions (sequence length).
-                            (0, 0, 0, pad_length),
+                            (0, 0) * (tensor.ndim - 2) + (0, pad_length),
                             mode="constant",
                             value=pad_value,
                         )

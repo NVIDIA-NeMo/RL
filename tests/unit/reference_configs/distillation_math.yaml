@@ -115,7 +115,8 @@ policy: &POLICY_BASE
         moe_token_dispatcher_type: "alltoall"
         moe_shared_expert_overlap: false
         gradient_accumulation_fusion: false
-        
+        use_fused_weighted_squared_relu: false
+
         optimizer:
             optimizer: "adam"
             lr: 2.00001e-5
@@ -270,3 +271,4 @@ cluster:
     num_nodes: 1
     master_port_range_low: 25000
     master_port_range_high: 28000
+    segment_size: null

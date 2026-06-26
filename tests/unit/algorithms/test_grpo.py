@@ -31,6 +31,7 @@ from nemo_rl.algorithms.grpo import (
     _apply_message_level_advantage_penalties,
     _default_grpo_save_state,
     _resolve_message_level_advantage_penalties,
+    _should_use_async_rollouts,
     aggregate_rollout_metrics,
     async_grpo_train,
     compute_and_apply_seq_logprob_error_masking,
@@ -51,10 +52,19 @@ from nemo_rl.environments.interfaces import (
     EnvironmentReturn,
 )
 from nemo_rl.experience.rollouts import calculate_rewards
+from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.utils.timer import Timer
 from tests.unit.algorithms.utils import (
     create_mock_batch,
 )
+
+
+def _mock_policy_generation() -> MagicMock:
+    """Generation-interface stand-in for grpo_train / async_grpo_train tests."""
+    policy_generation = MagicMock(spec=MegatronGeneration)
+    policy_generation.requires_kv_scale_sync = False
+    policy_generation.get_logger_metrics.return_value = {}
+    return policy_generation
 
 
 @pytest.fixture
@@ -323,6 +333,64 @@ def test_apply_message_level_advantage_penalties_targets_flagged_message_spans()
         ]
     )
     torch.testing.assert_close(train_data["advantages"], expected)
+
+
+def test_apply_message_level_advantage_penalties_materializes_broadcasted_advantages():
+    per_sample_advantages = torch.tensor([[1.0], [10.0]])
+    train_data = BatchedDataDict({"advantages": per_sample_advantages.expand(2, 6)})
+    message_logs = [
+        [
+            {
+                "role": "user",
+                "token_ids": torch.tensor([1]),
+            },
+            {
+                "role": "assistant",
+                "token_ids": torch.tensor([2, 3, 4]),
+                "generation_logprobs": torch.tensor([0.1, 0.2, 0.3]),
+                "is_invalid_tool_call": True,
+            },
+            {
+                "role": "assistant",
+                "token_ids": torch.tensor([5, 6]),
+                "generation_logprobs": torch.tensor([0.4, 0.5]),
+            },
+        ],
+        [
+            {
+                "role": "user",
+                "token_ids": torch.tensor([7, 8]),
+            },
+            {
+                "role": "assistant",
+                "token_ids": torch.tensor([9, 10]),
+                "generation_logprobs": torch.tensor([0.6, 0.7]),
+                "has_malformed_thinking": True,
+            },
+            {
+                "role": "assistant",
+                "token_ids": torch.tensor([11, 12]),
+                "generation_logprobs": torch.tensor([0.8, 0.9]),
+            },
+        ],
+    ]
+
+    _apply_message_level_advantage_penalties(
+        train_data=train_data,
+        message_logs=message_logs,
+        invalid_tool_call_advantage=-5.0,
+        malformed_thinking_advantage=-7.0,
+    )
+
+    expected = torch.tensor(
+        [
+            [1.0, -5.0, -5.0, -5.0, 1.0, 1.0],
+            [10.0, 10.0, -7.0, -7.0, 10.0, 10.0],
+        ]
+    )
+    torch.testing.assert_close(train_data["advantages"], expected)
+    torch.testing.assert_close(per_sample_advantages, torch.tensor([[1.0], [10.0]]))
+    assert train_data["advantages"].stride(-1) != 0
 
 
 def test_apply_configured_message_level_advantage_penalties_noops_when_disabled(
@@ -628,6 +696,20 @@ class StubAsyncTrajectoryCollector:
         return mock
 
     @property
+    def prepare_for_refit(self):
+        """Prepare for refit - returns a remote-callable mock"""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value=MagicMock())
+        return mock
+
+    @property
+    def resume_after_refit(self):
+        """Resume after refit - returns a remote-callable mock"""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value=MagicMock())
+        return mock
+
+    @property
     def stop(self):
         """Stop collection - returns a remote-callable mock"""
         mock = MagicMock()
@@ -746,6 +828,30 @@ def mock_async_grpo_infrastructure(
     )
 
     return stack
+
+
+@pytest.mark.parametrize(
+    ("generation_config", "expected"),
+    [
+        ({"backend": "vllm", "vllm_cfg": {"async_engine": False}}, False),
+        ({"backend": "vllm", "vllm_cfg": {"async_engine": True}}, True),
+        (
+            {
+                "backend": "vllm",
+                "use_async_rollouts": True,
+                "vllm_cfg": {"async_engine": False},
+            },
+            False,
+        ),
+    ],
+)
+def test_should_use_async_rollouts_selects_backend_specific_config(
+    generation_config, expected
+):
+    master_config = MagicMock()
+    master_config.policy = {"generation": generation_config}
+
+    assert _should_use_async_rollouts(master_config) is expected
 
 
 @contextmanager
@@ -1403,136 +1509,6 @@ def test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node(
 
 
 @pytest.mark.parametrize(
-    "colocated_inference, expected_parallel",
-    [(True, 0.0), (False, True)],
-)
-def test_setup_sglang_sets_model_path_and_parallel_flag(
-    monkeypatch, mock_grpo_components, colocated_inference, expected_parallel
-):
-    from nemo_rl.algorithms import grpo as grpo_mod
-
-    logged = {}
-
-    class DummyLogger:
-        def log_hyperparams(self, *_args, **_kwargs):
-            pass
-
-        def log_metrics(self, metrics, *_args, **_kwargs):
-            logged["metrics"] = metrics
-
-    class DummyCheckpointer:
-        def get_latest_checkpoint_path(self):
-            return None
-
-        def load_training_info(self, _path):
-            return None
-
-        def get_resume_paths(self, _path):
-            return None, None
-
-    class DummyLoader:
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-        def __len__(self):
-            return 1
-
-        def load_state_dict(self, _state):
-            pass
-
-    class DummyCluster:
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-        def world_size(self):
-            return 1
-
-        def get_master_address_and_port(self):
-            return "127.0.0.1", 1234
-
-    class DummyPolicy:
-        def print_node_ip_and_gpu_id(self):
-            pass
-
-        def init_collective(self, *_args, **_kwargs):
-            return []
-
-        def prepare_refit_info(self):
-            return {}
-
-    class DummySGLangGeneration:
-        def finish_generation(self):
-            pass
-
-        def prepare_refit_info(self, _state):
-            pass
-
-        def init_collective(self, *_args, **_kwargs):
-            return []
-
-    monkeypatch.setattr(grpo_mod, "Logger", lambda *_args, **_kwargs: DummyLogger())
-    monkeypatch.setattr(
-        grpo_mod, "CheckpointManager", lambda *_args, **_kwargs: DummyCheckpointer()
-    )
-    monkeypatch.setattr(
-        grpo_mod, "ClippedPGLossFn", lambda *_args, **_kwargs: MagicMock()
-    )
-    monkeypatch.setattr(grpo_mod, "StatefulDataLoader", DummyLoader)
-    monkeypatch.setattr(grpo_mod, "RayVirtualCluster", DummyCluster)
-    monkeypatch.setattr(grpo_mod, "Policy", lambda *_args, **_kwargs: DummyPolicy())
-    monkeypatch.setattr(
-        grpo_mod,
-        "SGLangGeneration",
-        lambda *_args, **_kwargs: DummySGLangGeneration(),
-    )
-    monkeypatch.setattr(grpo_mod.ray, "get", lambda x: x)
-
-    generation_resources = {
-        "gpus_per_node": 1,
-        "num_nodes": 1,
-    }
-    if colocated_inference:
-        generation_resources = {"gpus_per_node": None, "num_nodes": None}
-
-    master_config = mock_grpo_components["master_config"]
-    master_config.policy["model_name"] = "fake-model"
-    master_config.policy["dtensor_cfg"] = {"enabled": False}
-    master_config.policy["megatron_cfg"] = {
-        "enabled": False,
-        "pipeline_model_parallel_size": 1,
-    }
-    master_config.policy["generation"]["backend"] = "sglang"
-    master_config.policy["generation"]["colocated"] = {
-        "enabled": colocated_inference,
-        "resources": generation_resources,
-    }
-    master_config.policy["generation"]["sglang_cfg"] = {
-        "gpus_per_server": 1,
-        "dp_size": 1,
-        "pp_size": 1,
-        "ep_size": 1,
-    }
-    master_config.loss_fn = ClippedPGLossConfig(reference_policy_kl_penalty=0.0)
-    master_config.grpo["val_period"] = 0
-    master_config.grpo["batch_multiplier"] = 1
-    master_config.cluster["gpus_per_node"] = 4
-    master_config.data["shuffle"] = False
-    master_config.data["num_workers"] = 0
-
-    tokenizer = MagicMock()
-    dataset = MagicMock()
-    dataset.__len__ = MagicMock(return_value=1)
-
-    grpo_mod.setup(master_config, tokenizer, dataset, None)
-
-    assert (
-        master_config.policy["generation"]["sglang_cfg"]["model_path"]
-        == master_config.policy["model_name"]
-    )
-    assert logged["metrics"]["parallel_init_enabled"] == expected_parallel
-
-
-@pytest.mark.parametrize(
     "initial_skip_flag",
     [None, False],
 )
@@ -1588,7 +1564,12 @@ def test_setup_auto_enables_skip_reference_policy_logprobs_when_kl_penalty_zero(
         def prepare_refit_info(self):
             return {}
 
+        def set_rollout_num_gpus_per_engine(self, _num_gpus_per_engine):
+            pass
+
     class DummySGLangGeneration:
+        num_gpus_per_engine = 1
+
         def finish_generation(self):
             pass
 
@@ -1651,115 +1632,6 @@ def test_setup_auto_enables_skip_reference_policy_logprobs_when_kl_penalty_zero(
     grpo_mod.setup(master_config, tokenizer, dataset, None)
 
     assert master_config.grpo["skip_reference_policy_logprobs_calculation"] is True
-
-
-def test_refit_policy_generation_sglang_colocated_http(monkeypatch):
-    from nemo_rl.algorithms import grpo as grpo_mod
-
-    calls = {
-        "prepare_for_generation_tags": [],
-        "invalidate_kv_cache": 0,
-        "stream_weights_via_http": [],
-        "offload_before_refit": 0,
-        "offload_after_refit": 0,
-    }
-
-    class DummySGLangGeneration:
-        def prepare_for_generation(self, tags=None):
-            calls["prepare_for_generation_tags"].append(tags)
-
-        def get_sglang_url_to_gpu_uuids(self):
-            return {"http://localhost:12345": ["gpu-uuid-0"]}
-
-        def invalidate_kv_cache(self):
-            calls["invalidate_kv_cache"] += 1
-            return True
-
-    class DummyPolicy:
-        def offload_before_refit(self):
-            calls["offload_before_refit"] += 1
-
-        def offload_after_refit(self):
-            calls["offload_after_refit"] += 1
-
-        def get_free_memory_bytes(self):
-            return 1024 * 1024 * 1024
-
-        def stream_weights_via_http(self, sglang_url_to_gpu_uuids):
-            calls["stream_weights_via_http"].append(sglang_url_to_gpu_uuids)
-            return ["ok"]
-
-    monkeypatch.setattr(grpo_mod, "SGLangGeneration", DummySGLangGeneration)
-    monkeypatch.setattr(grpo_mod.ray, "get", lambda x: x)
-
-    grpo_mod.refit_policy_generation(
-        policy=DummyPolicy(),
-        policy_generation=DummySGLangGeneration(),
-        colocated_inference=True,
-    )
-
-    assert calls["offload_before_refit"] == 1
-    assert calls["offload_after_refit"] == 1
-    assert calls["invalidate_kv_cache"] == 1
-    assert calls["stream_weights_via_http"] == [
-        {"http://localhost:12345": ["gpu-uuid-0"]}
-    ]
-    assert calls["prepare_for_generation_tags"] == [["weights"], ["kv_cache"]]
-
-
-def test_refit_policy_generation_sglang_non_colocated_raises(monkeypatch):
-    from nemo_rl.algorithms import grpo as grpo_mod
-
-    class DummySGLangGeneration:
-        pass
-
-    monkeypatch.setattr(grpo_mod, "SGLangGeneration", DummySGLangGeneration)
-
-    with pytest.raises(NotImplementedError):
-        grpo_mod.refit_policy_generation(
-            policy=object(),
-            policy_generation=DummySGLangGeneration(),
-            colocated_inference=False,
-        )
-
-
-def test_refit_policy_generation_non_colocated_offloads_and_restores(monkeypatch):
-    from nemo_rl.algorithms import grpo as grpo_mod
-
-    calls = []
-    kv_scales = {"layer_0": 1.0}
-
-    class DummyPolicy:
-        def offload_before_refit(self):
-            calls.append("offload_before_refit")
-
-        def broadcast_weights_for_collective(self, kv_scales=None):
-            calls.append(("broadcast_weights_for_collective", kv_scales))
-            return ["train-ok"]
-
-        def prepare_for_training(self):
-            calls.append("prepare_for_training")
-
-    class DummyGeneration:
-        def update_weights_from_collective(self):
-            calls.append("update_weights_from_collective")
-            return ["inference-ok"]
-
-    monkeypatch.setattr(grpo_mod.ray, "get", lambda x: x)
-
-    grpo_mod.refit_policy_generation(
-        policy=DummyPolicy(),
-        policy_generation=DummyGeneration(),
-        colocated_inference=False,
-        kv_scales=kv_scales,
-    )
-
-    assert calls == [
-        "offload_before_refit",
-        ("broadcast_weights_for_collective", kv_scales),
-        "update_weights_from_collective",
-        "prepare_for_training",
-    ]
 
 
 def test_grpo_train_collects_generation_logger_and_seq_metrics(
@@ -1917,7 +1789,7 @@ def test_grpo_train_skips_reference_policy_logprobs(mock_grpo_components, train_
         ):
             train_func(
                 policy,
-                None,
+                _mock_policy_generation(),
                 mock_grpo_components["train_dataloader"],
                 mock_grpo_components["val_dataloader"],
                 mock_grpo_components["tokenizer"],
@@ -1947,7 +1819,7 @@ def test_grpo_train_skips_reference_policy_logprobs(mock_grpo_components, train_
         ):
             train_func(
                 policy,
-                None,
+                _mock_policy_generation(),
                 mock_grpo_components["train_dataloader"],
                 mock_grpo_components["val_dataloader"],
                 mock_grpo_components["tokenizer"],
@@ -1987,7 +1859,7 @@ def _run_single_grpo_train_step(mock_grpo_components, train_func, monkeypatch):
         ):
             train_func(
                 policy,
-                None,
+                _mock_policy_generation(),
                 mock_grpo_components["train_dataloader"],
                 mock_grpo_components["val_dataloader"],
                 mock_grpo_components["tokenizer"],
@@ -2017,7 +1889,7 @@ def _run_single_grpo_train_step(mock_grpo_components, train_func, monkeypatch):
         ):
             train_func(
                 policy,
-                None,
+                _mock_policy_generation(),
                 mock_grpo_components["train_dataloader"],
                 mock_grpo_components["val_dataloader"],
                 mock_grpo_components["tokenizer"],
@@ -2141,7 +2013,7 @@ def test_grpo_train_skips_prev_logprobs_when_force_on_policy_ratio(
         ):
             train_func(
                 policy,
-                None,
+                _mock_policy_generation(),
                 mock_grpo_components["train_dataloader"],
                 mock_grpo_components["val_dataloader"],
                 mock_grpo_components["tokenizer"],
@@ -2171,7 +2043,7 @@ def test_grpo_train_skips_prev_logprobs_when_force_on_policy_ratio(
         ):
             train_func(
                 policy,
-                None,
+                _mock_policy_generation(),
                 mock_grpo_components["train_dataloader"],
                 mock_grpo_components["val_dataloader"],
                 mock_grpo_components["tokenizer"],
@@ -2216,7 +2088,7 @@ def test_grpo_exit_on_max_steps(mock_grpo_components, train_func):
         with mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics):
             train_func(
                 mock_grpo_components["policy"],
-                None,  # policy_generation
+                _mock_policy_generation(),
                 mock_grpo_components["train_dataloader"],
                 mock_grpo_components["val_dataloader"],
                 mock_grpo_components["tokenizer"],
@@ -2244,7 +2116,7 @@ def test_grpo_exit_on_max_steps(mock_grpo_components, train_func):
                 ):
                     train_func(
                         mock_grpo_components["policy"],
-                        None,  # policy_generation
+                        _mock_policy_generation(),
                         mock_grpo_components["train_dataloader"],
                         mock_grpo_components["val_dataloader"],
                         mock_grpo_components["tokenizer"],
@@ -2298,7 +2170,7 @@ def test_grpo_exit_on_max_epochs(mock_grpo_components, train_func):
                 # Run training
                 train_func(
                     mock_grpo_components["policy"],
-                    None,  # policy_generation
+                    _mock_policy_generation(),
                     mock_grpo_components["train_dataloader"],
                     mock_grpo_components["val_dataloader"],
                     mock_grpo_components["tokenizer"],
@@ -2349,7 +2221,7 @@ def test_grpo_exit_on_timeout(mock_grpo_components, train_func, capsys):
             with mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics):
                 train_func(
                     mock_grpo_components["policy"],
-                    None,  # policy_generation
+                    _mock_policy_generation(),
                     mock_grpo_components["train_dataloader"],
                     mock_grpo_components["val_dataloader"],
                     mock_grpo_components["tokenizer"],
@@ -2376,7 +2248,7 @@ def test_grpo_exit_on_timeout(mock_grpo_components, train_func, capsys):
                     ):
                         train_func(
                             mock_grpo_components["policy"],
-                            None,  # policy_generation
+                            _mock_policy_generation(),
                             mock_grpo_components["train_dataloader"],
                             mock_grpo_components["val_dataloader"],
                             mock_grpo_components["tokenizer"],
