@@ -19,13 +19,13 @@ import time
 
 import ray
 
-from nemo_rl.distributed.ray_actor_environment_registry import SGLANG_EXECUTABLE
 from nemo_rl.models.generation.sglang.config import SGLangRouterConfig
 from nemo_rl.models.generation.sglang.utils.ip_port_utils import _wrap_ipv6
 from nemo_rl.models.generation.sglang.utils.ray_utils import (
     find_available_port,
     get_host_info,
 )
+from nemo_rl.utils.venvs import make_actor_runtime_env
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +112,9 @@ def _start_router(
         return router_cfg["sglang_router_ip"], router_cfg["sglang_router_port"], None
 
     router_actor = RouterActor.options(
-        runtime_env={"py_executable": SGLANG_EXECUTABLE},
+        runtime_env=make_actor_runtime_env(
+            "nemo_rl.models.generation.sglang.sglang_worker.SGLangGenerationWorker"
+        ),
     ).remote()
     router_ip, router_port = ray.get(router_actor.init.remote(dict(router_cfg)))
     logger.info(f"Router launched at {router_ip}:{router_port}")
