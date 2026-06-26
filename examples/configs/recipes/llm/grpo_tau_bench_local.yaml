@@ -1,0 +1,111 @@
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  num_prompts_per_step: 128
+  max_num_steps: 10000
+  use_leave_one_out_baseline: false
+  val_period: 20
+  max_val_samples: 960
+  val_batch_size: 960
+  max_rollout_turns: 56
+  max_num_epochs: 5000
+  reward_scaling:
+    enabled: true
+    target_min: -1.0
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 2048
+    max_response_length: 14336
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10
+checkpointing:
+  checkpoint_dir: results/grpo-tau-bench-local
+  keep_top_k: 5
+  save_period: 5
+  model_save_format: null
+policy:
+  model_name: Qwen/Qwen2.5-7B-Instruct
+  hf_config_overrides:
+    max_position_embeddings: 16384
+  make_sequence_length_divisible_by: 32
+  train_global_batch_size: 256
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 16384
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    tensor_model_parallel_size: 2
+    context_parallel_size: 4
+    sequence_parallel: true
+    optimizer:
+      lr: 1.0e-06
+      min_lr: 1.0e-06
+      weight_decay: 0.1
+    scheduler:
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 1.0e-07
+  optimizer:
+    kwargs:
+      lr: 1.0e-06
+      weight_decay: 0.1
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 1.0e-08
+      end_factor: 1.0
+      total_iters: 10
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones:
+    - 10
+  generation:
+    max_new_tokens: 1024
+    vllm_cfg:
+      tensor_parallel_size: 2
+      gpu_memory_utilization: 0.7
+cluster:
+  gpus_per_node: 8
+  num_nodes: 16
+env:
+  tau_bench:
+    num_workers: 16
+    env_name: retail
+    task_split: train
+    user_strategy: llm
+    user_model: openai/meta-llama/Llama-3.1-8B-Instruct
+    user_base_url: http://${oc.env:USER_SERVER_HOST,localhost}:8100/v1
+    user_api_key: local
+    max_steps: 15
+    judge_model: openai/meta-llama/Llama-3.1-8B-Instruct
+    judge_base_url: http://${oc.env:USER_SERVER_HOST,localhost}:8100/v1
+    judge_api_key: local
+    judge_weight: 0.3
+    worker_stagger_delay_s: 1.0
+    max_concurrent_api_requests: 8
+data:
+  max_input_seq_length: 16384
+  train:
+    dataset_name: tau_bench
+    tau_bench_env_name: ${env.tau_bench.env_name}
+    split: train
+  validation:
+    dataset_name: tau_bench
+    tau_bench_env_name: ${env.tau_bench.env_name}
+    split: test
+  default:
+    prompt_file: null
+    processor: tau_bench_data_processor
+    env_name: tau_bench
+logger:
+  wandb_enabled: true
+  monitor_gpus: false
+  wandb:
+    name: grpo-tau-bench-local-qwen7b
+  mlflow:
+    run_name: grpo-tau-bench-local

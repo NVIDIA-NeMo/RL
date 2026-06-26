@@ -34,7 +34,7 @@ from nemo_rl.algorithms.grpo import (
     _should_log_nemo_gym_responses,
     _should_use_async_rollouts,
     _should_use_nemo_gym,
-    extract_initial_prompt_messages,
+    get_idx_grouping,
     refit_policy_generation,
     scale_rewards,
 )
@@ -1222,22 +1222,13 @@ def ppo_train(
 
                     policy.finish_inference()
 
-                # Build prompt IDs for advantage estimation (groups responses from same prompt).
-                # Use the token-length-based extractor so multi-turn prompts containing
-                # assistant messages still resolve to the original prompt only.
+                # Build prompt IDs for advantage estimation (groups responses from
+                # the same prompt). Use the composite (task_name, idx) grouping key so
+                # multi-turn prompts that share initial prompt tokens (e.g. tau-bench)
+                # and multi-dataset batches with colliding idx values both group correctly.
                 with timer.time("advantage_calculation"):
                     print("▶ Computing advantages...", flush=True)
-                    initial_prompt_message_logs = extract_initial_prompt_messages(
-                        repeated_batch["message_log"],
-                        repeated_batch["length"],
-                    )
-                    prompt_batched_flat, _ = batched_message_log_to_flat_message(
-                        initial_prompt_message_logs,
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                    )
-                    prompt_ids_for_adv = prompt_batched_flat["token_ids"]
-                    del initial_prompt_message_logs
-                    del prompt_batched_flat
+                    prompt_ids_for_adv = get_idx_grouping(repeated_batch)
 
                     adv_kwargs = dict(
                         prompt_ids=prompt_ids_for_adv,

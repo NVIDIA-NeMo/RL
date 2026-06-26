@@ -1428,37 +1428,34 @@ def scale_rewards(
     return repeated_batch
 
 
-def extract_initial_prompt_messages(
-    message_logs: list,
-    original_prompt_lengths: torch.Tensor,
+def get_idx_grouping(
+    repeated_batch,
 ) -> list:
-    """Extract the original prompt messages from message logs using token length.
+    """Build a composite (task_name_id, idx) grouping key used for both dynamic sampling and advantage estimation.
 
-    This function correctly identifies original prompt messages even when the prompt
-    contains assistant messages (e.g., multi-turn conversation history).
+    Grouping by prompt token sequences is broken for multi-turn
+    environments (e.g. tau-bench) where all tasks share the
+    same initial prompt tokens. Grouping by idx alone is broken
+    for multi-dataset batches where idx values are independent
+    per dataset and can collide. task_name disambiguates both:
+       - single-dataset: all task_names are equal, so grouping
+         reduces to idx alone.
+       - multi-dataset: different task_names get different IDs,
+         preventing cross-dataset idx collisions.
+         task_name is None for processors that don't set it (e.g.
+         math); str() normalises that to "None" so sorting is safe.
 
-    Args:
-        message_logs: List of message logs, where each log is a list of messages.
-        original_prompt_lengths: Tensor of original prompt token lengths per sample.
-
-    Returns:
-        List of message logs containing only the original prompt messages.
     """
-    initial_prompt_message_logs = []
-    for i, message_log in enumerate(message_logs):
-        initial_prompt_log = []
-        cumulative_length = 0
-        target_length = original_prompt_lengths[i].item()
-
-        for message in message_log:
-            if cumulative_length >= target_length:
-                break
-            initial_prompt_log.append(message)
-            cumulative_length += len(message["token_ids"])
-
-        initial_prompt_message_logs.append(initial_prompt_log)
-
-    return initial_prompt_message_logs
+    idx_vals = repeated_batch["idx"]
+    task_names = repeated_batch["task_name"]
+    unique_task_names = sorted(set(str(n) for n in task_names))
+    task_name_to_id = {name: i for i, name in enumerate(unique_task_names)}
+    task_ids = [task_name_to_id[str(n)] for n in task_names]
+    prompt_ids_for_adv = torch.tensor(
+        list(zip(task_ids, idx_vals)),
+        dtype=torch.long,
+    )
+    return prompt_ids_for_adv
 
 
 def add_grpo_token_loss_masks_and_generation_logprobs(
@@ -2264,6 +2261,9 @@ def grpo_train(
                             master_config.grpo["num_generations_per_prompt"]
                         )
                     )
+
+                    prompt_ids_for_adv = get_idx_grouping(repeated_batch)
+
                     # Convert LLMMessageLogType to FlatMessagesType for generation
                     batched_flat, input_lengths = batched_message_log_to_flat_message(
                         repeated_batch["message_log"],
@@ -2434,7 +2434,7 @@ def grpo_train(
                         # Just fix the device id for now
                         device_id = 0
                         baseline, std = calculate_baseline_and_std_per_prompt(
-                            input_ids.cuda(device_id),
+                            prompt_ids_for_adv.cuda(device_id),
                             rewards.cuda(device_id),
                             torch.ones_like(rewards).cuda(device_id),
                             leave_one_out_baseline=master_config.grpo[
@@ -2450,7 +2450,7 @@ def grpo_train(
                         std = std.cpu()
                     else:
                         baseline, std = calculate_baseline_and_std_per_prompt(
-                            input_ids,
+                            prompt_ids_for_adv,
                             rewards,
                             torch.ones_like(rewards),
                             leave_one_out_baseline=master_config.grpo[
@@ -2495,19 +2495,6 @@ def grpo_train(
                     # Save baseline for logging (before deletion)
                     baseline_for_log = baseline.clone()
 
-                    # Extract original prompt messages using the length field
-                    # This correctly handles multi-turn prompts that contain assistant messages
-                    initial_prompt_message_logs = extract_initial_prompt_messages(
-                        repeated_batch["message_log"],
-                        repeated_batch["length"],
-                    )
-                    prompt_batched_flat, _ = batched_message_log_to_flat_message(
-                        initial_prompt_message_logs,
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                    )
-                    prompt_ids_for_adv = prompt_batched_flat["token_ids"]
-                    del initial_prompt_message_logs
-                    del prompt_batched_flat
                     del input_ids
                     del baseline
                     del std
@@ -2852,7 +2839,7 @@ def grpo_train(
 
                 metrics.update(rollout_metrics)
                 metrics["generation_logger_metrics"] = generation_logger_metrics
-                total_valid_tokens += metrics["global_valid_toks"]
+                total_valid_tokens += metrics.get("global_valid_toks", 0)
 
                 # Always log sequence-level error metrics (useful for deciding threshold)
                 metrics.update(seq_logprob_error_metrics)
@@ -2989,7 +2976,7 @@ def grpo_train(
                 reduction_op="sum"
             )  # type: ignore
             # track example with high token mult prob error above 1.05
-            if metrics["token_mult_prob_error"] > 1.05:
+            if metrics.get("token_mult_prob_error", 0.0) > 1.05:
                 logger.log_plot_token_mult_prob_error(
                     {
                         "prompt_lengths": repeated_batch["length"],
@@ -3074,7 +3061,7 @@ def grpo_train(
                     print(f"  • {k}: {v:.2f}s ({percent:.1f}%)", flush=True)
 
             timing_metrics["valid_tokens_per_sec_per_gpu"] = (
-                metrics["global_valid_toks"] / total_time / total_num_gpus
+                metrics.get("global_valid_toks", 0) / total_time / total_num_gpus
             )
             performance_metrics = print_performance_metrics(
                 train_results, metrics, timing_metrics, master_config
@@ -3744,22 +3731,9 @@ def async_grpo_train(
 
                 print("▶ Processing rewards...")
                 with timer.time("reward_calculation"):
-                    # Extract original prompt messages using the length field
-                    # This correctly handles multi-turn prompts that contain assistant messages
-                    initial_prompt_message_logs = extract_initial_prompt_messages(
-                        repeated_batch["message_log"],
-                        repeated_batch["length"],
-                    )
-
-                    prompt_batched_flat, _ = batched_message_log_to_flat_message(
-                        initial_prompt_message_logs,
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                    )
-                    prompt_ids_for_adv = prompt_batched_flat["token_ids"]
-                    del initial_prompt_message_logs
-                    del prompt_batched_flat
-
                     rewards = repeated_batch["total_reward"]
+
+                    prompt_ids_for_adv = get_idx_grouping(repeated_batch)
 
                     print(
                         f"  📊 Rewards stats: min={rewards.min():.4f}, max={rewards.max():.4f}, mean={rewards.mean():.4f}, std={rewards.std():.4f}"
@@ -4099,7 +4073,7 @@ def async_grpo_train(
                 metrics.update(rollout_metrics)
                 if generation_logger_metrics is not None:
                     metrics["generation_logger_metrics"] = generation_logger_metrics
-                total_valid_tokens += metrics["global_valid_toks"]
+                total_valid_tokens += metrics.get("global_valid_toks", 0)
 
                 # Always log sequence-level error metrics (useful for deciding threshold)
                 metrics.update(seq_logprob_error_metrics)
@@ -4281,7 +4255,7 @@ def async_grpo_train(
                 * master_config.cluster["gpus_per_node"]
             )
             timing_metrics["valid_tokens_per_sec_per_gpu"] = (
-                metrics["global_valid_toks"] / total_time / total_num_gpus
+                metrics.get("global_valid_toks", 0) / total_time / total_num_gpus
             )
             performance_metrics = print_performance_metrics(
                 train_results, metrics, timing_metrics, master_config

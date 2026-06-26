@@ -56,6 +56,7 @@ ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
     "nemo_rl.experience.sync_rollout_actor.SyncRolloutActor": PY_EXECUTABLES.VLLM,
     "nemo_rl.environments.tools.retriever.RAGEnvironment": PY_EXECUTABLES.SYSTEM,
     "nemo_rl.environments.nemo_gym.NemoGym": PY_EXECUTABLES.NEMO_GYM,
+    "nemo_rl.environments.tau_bench_environment.TauBenchEnvironment": PY_EXECUTABLES.TAU_BENCH,
 }
 
 from nemo_rl.modelopt.registry import MODELOPT_ACTOR_REGISTRY
