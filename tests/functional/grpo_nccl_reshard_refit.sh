@@ -1,0 +1,82 @@
+#!/bin/bash
+# Functional smoke for the nccl_reshard disaggregated weight-refit path
+# (Megatron train -> vLLM gen on disjoint GPUs).  Runs the default transport
+# with no override: when the real nccl.m2n op is absent (as in the CI
+# container) the dispatcher falls back to the xferdtensor_python exact-transfer
+# reshard -- the same path a user without that op gets.
+#
+# 1T1G disaggregated run on 2 GPUs (1 node): Megatron TP1 (train, 1 GPU) ->
+# vLLM TP1 (gen, 1 GPU), non-colocated.  This is sized for the 2-GPU functional
+# CI runner, so the reshard itself is trivial (fully replicated 1->1), but it
+# still EXERCISES the whole disaggregated nccl_reshard code path end to end:
+# prepare_nccl_reshard_refit_info / build_nccl_reshard_refit_info, the gen-side
+# _build_hf_to_gen_backend_mapping (qkv / gate_up merge slices, lm_head tie),
+# nccl_reshard_refit + get_dst_dtensor, the misc packed_broadcast, and
+# xferdtensor_python_impl -- which is the coverage this smoke is here to add.
+#
+# REAL reshards (TP/EP/PP down- and up-shard, e.g. TP4xDP2 -> TP2xDP4) plus
+# MoE / PP / FP8 / large-model coverage live in the SLURM script/new_refit/
+# matrix (>=16 GPUs); the MoE expert grouping + w13/w2 mapping are covered by
+# the unit tests (tests/unit/weight_sync/test_nccl_reshard_utils.py and
+# tests/unit/models/generation/test_nccl_reshard_backend.py).
+#
+# Requires the mcore + vllm extras and a 2-GPU allocation (the functional CI
+# runner), e.g.:
+#   uv run --extra mcore --extra vllm bash tests/functional/grpo_nccl_reshard_refit.sh
+
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
+PROJECT_ROOT=$(realpath $SCRIPT_DIR/../..)
+# Mark the current repo as safe, since wandb fetches metadata about the repo
+git config --global --add safe.directory $PROJECT_ROOT
+
+set -eou pipefail
+
+EXP_NAME=$(basename $0 .sh)
+EXP_DIR=$SCRIPT_DIR/$EXP_NAME
+LOG_DIR=$EXP_DIR/logs
+JSON_METRICS=$EXP_DIR/metrics.json
+RUN_LOG=$EXP_DIR/run.log
+export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
+
+
+rm -rf $EXP_DIR $LOG_DIR
+mkdir -p $EXP_DIR $LOG_DIR
+
+cd $PROJECT_ROOT
+uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
+    $PROJECT_ROOT/examples/run_grpo.py \
+    --config $PROJECT_ROOT/examples/configs/grpo_math_1B_megatron.yaml \
+    policy.model_name=Qwen/Qwen3-0.6B \
+    grpo.num_prompts_per_step=2 \
+    grpo.num_generations_per_prompt=4 \
+    policy.train_global_batch_size=4 \
+    policy.train_micro_batch_size=1 \
+    policy.logprob_batch_size=1 \
+    policy.max_total_sequence_length=512 \
+    policy.megatron_cfg.enabled=true \
+    policy.megatron_cfg.tensor_model_parallel_size=1 \
+    policy.megatron_cfg.pipeline_model_parallel_size=1 \
+    policy.dtensor_cfg.enabled=false \
+    policy.generation.backend=vllm \
+    policy.generation.colocated.enabled=false \
+    policy.generation.colocated.resources.num_nodes=1 \
+    policy.generation.colocated.resources.gpus_per_node=1 \
+    policy.generation.vllm_cfg.tensor_parallel_size=1 \
+    policy.generation.vllm_cfg.async_engine=true \
+    +policy.nccl_reshard_refit=true \
+    cluster.num_nodes=1 \
+    cluster.gpus_per_node=2 \
+    grpo.max_num_steps=2 \
+    logger.tensorboard_enabled=true \
+    logger.log_dir=$LOG_DIR \
+    logger.wandb_enabled=false \
+    checkpointing.enabled=false \
+    $@ \
+    2>&1 | tee $RUN_LOG
+
+uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
+
+# A broken refit corrupts the gen weights -> the importance-sampling ratio
+# (train vs gen logprobs) explodes; assert it stays sane across the 2 steps.
+uv run tests/check_metrics.py $JSON_METRICS \
+    'max(data["train/token_mult_prob_error"]) < 1.05'
