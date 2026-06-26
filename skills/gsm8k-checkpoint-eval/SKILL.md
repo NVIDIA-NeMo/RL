@@ -82,8 +82,10 @@ Set benchmark-specific budgets explicitly. The wrapper defaults may be tuned for
 
 Recommended standalone budgets:
 
-- `BENCHMARK=gsm8k`: `MAX_NEW_TOKENS=750`, `MAX_STEPS=32`, `CONTEXT_LENGTH=1024`.
-- `BENCHMARK=aime2024`/`aime24` or `BENCHMARK=aime2025`/`aime25`: `MAX_NEW_TOKENS=8192`, `MAX_STEPS=8192`, `CONTEXT_LENGTH=20480`.
+- `BENCHMARK=gsm8k`: `MAX_NEW_TOKENS=750`, `MAX_STEPS=BS` (e.g. `32` for `BS=32`), `CONTEXT_LENGTH=1024`.
+- `BENCHMARK=aime2024`/`aime24` or `BENCHMARK=aime2025`/`aime25`: `MAX_NEW_TOKENS=8192`, `MAX_STEPS=BS` (e.g. `16` for `BS=16`), `CONTEXT_LENGTH=20480`.
+
+CRITICAL — `MAX_STEPS` is the per-BLOCK denoising-step cap, NOT the total token budget. Always set `MAX_STEPS=BS` (equal to the block size). Do NOT set `MAX_STEPS=MAX_NEW_TOKENS`: a block of `BS` tokens can never need more than `BS` denoising steps (worst case = 1 token revealed per step), so a value larger than `BS` is meaningless and writes a misleading `max_steps` into `dllm_config.yaml`. The latest validated AIME24/AIME25 runs used `BS=16` with `MAX_STEPS=16`.
 
 ```bash
 cd /home/snorouzi/diffusion_RL/RL
@@ -107,11 +109,10 @@ Key parameters:
 - `ALG=FastDiffuser` for diffusion/FastDiffuser eval.
 - `ALG=LinearSpec` for linear speculation eval.
 - `BS=16` or `BS=32` for block size.
-- `TEMP=0.0` always use greedy eval to remove the noise.
-- `MAX_NEW_TOKENS`, `MAX_STEPS`, and `CONTEXT_LENGTH` must be set per benchmark: use `750/32/1024` for GSM8K and `8192/8192/20480` for AIME.
+- `TEMP=0.0` or `TEMP=1.0` confirm with the user.
+- `MAX_NEW_TOKENS`, `MAX_STEPS`, and `CONTEXT_LENGTH` must be set per benchmark. Set `MAX_STEPS=BS` (the per-block denoising cap), NOT `MAX_NEW_TOKENS`. Use `MAX_NEW_TOKENS=750`, `MAX_STEPS=BS`, `CONTEXT_LENGTH=1024` for GSM8K and `MAX_NEW_TOKENS=8192`, `MAX_STEPS=BS`, `CONTEXT_LENGTH=20480` for AIME.
 - AIME standalone eval loads the Nemo Skills AIME JSONLs from `/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/snorouzi/eval_data/nemo_skills_aime/{aime24,aime25}/test.jsonl` by default. Override with `NEMO_SKILLS_AIME_DATA_DIR` if needed; do not commit benchmark JSONLs into the repo.
-- For AIME, CoT prompting MUST be used: always set `PROMPT_FILE=/home/snorouzi/diffusion_RL/RL/examples/prompts/generic_math.txt` (the CoT math prompt). Do NOT use `aime_no_cot.txt` for AIME runs. Also set `GENERATION_API=chat_completions` and `TOP_P=0.95` for chat-completions parity with Yonggon/NemoSkills.
-- Observed baseline prompt sensitivity for the 3B checkpoint with SGLang/FastDiffuser block size 16, temp 0, high AIME budget (for reference only): `generic_math.txt` (CoT) gives AIME24 `4/30 = 13.33%` and AIME25 `3/30 = 10.00%`; `aime_no_cot.txt` gives AIME24 `5/30 = 16.67%` and AIME25 `2/30 = 6.67%`. Despite the slightly higher no-CoT AIME24 number, always use the CoT `generic_math.txt` prompt for AIME so results stay consistent and comparable across runs.
+- CoT prompting MUST be used (see the mandatory note at the top of Step 2): always set `PROMPT_FILE=/home/snorouzi/diffusion_RL/RL/examples/prompts/cot.txt`. Do NOT use `generic_math.txt` or `aime_no_cot.txt` — they are NOT the training prompt and lower accuracy. For chat-completions parity with Yonggon/NemoSkills you may add `GENERATION_API=chat_completions` and `TOP_P=0.95`, but to faithfully match NeMo-RL training-time prompt construction use `GENERATION_API=generate` (it applies the same chat template as training).
 - `NUM_SAMPLES=-1` by default for the full benchmark; set `NUM_SAMPLES=16` for a smoke test.
 
 Examples:
@@ -121,16 +122,35 @@ Examples:
 BENCHMARK=gsm8k ALG=FastDiffuser BS=32 TEMP=0 MAX_NEW_TOKENS=750 MAX_STEPS=32 CONTEXT_LENGTH=1024 TAG=<name>_gsm8k_fd_b32_t1 ./submit_standalone_gsm8k_eval.sh
 
 # AIME 2024, FastDiffuser, Yonggon/NemoSkills-style high budget
-BENCHMARK=aime2024 ALG=FastDiffuser BS=16 TEMP=0 MAX_NEW_TOKENS=8192 MAX_STEPS=8192 CONTEXT_LENGTH=20480 GENERATION_API=chat_completions TOP_P=0.95 PROMPT_FILE=/home/snorouzi/diffusion_RL/RL/examples/prompts/generic_math.txt TAG=<name>_aime24_fd_b16_chat ./submit_standalone_gsm8k_eval.sh
+BENCHMARK=aime2024 ALG=FastDiffuser BS=16 TEMP=0 MAX_NEW_TOKENS=8192 MAX_STEPS=16 CONTEXT_LENGTH=20480 GENERATION_API=chat_completions TOP_P=0.95 PROMPT_FILE=/home/snorouzi/diffusion_RL/RL/examples/prompts/cot.txt TAG=<name>_aime24_fd_b16_chat ./submit_standalone_gsm8k_eval.sh
 
 # AIME 2025, FastDiffuser, Yonggon/NemoSkills-style high budget
-BENCHMARK=aime2025 ALG=FastDiffuser BS=16 TEMP=0 MAX_NEW_TOKENS=8192 MAX_STEPS=8192 CONTEXT_LENGTH=20480 GENERATION_API=chat_completions TOP_P=0.95 PROMPT_FILE=/home/snorouzi/diffusion_RL/RL/examples/prompts/generic_math.txt TAG=<name>_aime25_fd_b16_chat ./submit_standalone_gsm8k_eval.sh
+BENCHMARK=aime2025 ALG=FastDiffuser BS=16 TEMP=0 MAX_NEW_TOKENS=8192 MAX_STEPS=16 CONTEXT_LENGTH=20480 GENERATION_API=chat_completions TOP_P=0.95 PROMPT_FILE=/home/snorouzi/diffusion_RL/RL/examples/prompts/cot.txt TAG=<name>_aime25_fd_b16_chat ./submit_standalone_gsm8k_eval.sh
 
 # Linear speculation, block size 32
 BENCHMARK=gsm8k ALG=LinearSpec BS=32 TEMP=0 MAX_NEW_TOKENS=750 MAX_STEPS=32 CONTEXT_LENGTH=1024 TAG=<name>_gsm8k_linearspec_b32_t1 ./submit_standalone_gsm8k_eval.sh
 ```
 
 The wrapper uses `/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_llm/users/sfawzy/nemo-rl-nightly.sqsh`, mounts `/home/snorouzi` and `/lustre`, and writes `metrics.json`, `records.jsonl`, `server.log`, `server_command.txt`, `dllm_config.yaml`, and `slurm-<job>.out` under the output directory.
+
+When submitting MORE THAN ONE standalone eval concurrently, set a UNIQUE `PORT` per job (e.g. `PORT=31001`, `PORT=31002`, ...). The wrapper defaults to a fixed `PORT=32617` for the in-job SGLang server bound on `127.0.0.1`, and Slurm frequently packs several of these single-GPU jobs onto the SAME node. Co-located jobs then collide on `bind 127.0.0.1:32617` ("address already in use"): one server wins and the losers either die or — worse — their client connects to the winning job's server, whose `dllm_config.yaml` bakes in temperature/selection_policy/max_steps, so the loser SILENTLY records results under the wrong decoding config. Because the wrapper uses `PORT` for both the server bind and the client `base_url`, distinct ports fully isolate co-located jobs (each still gets its own GPU). After launch, verify each `server.log` has no `address already in use` and binds its intended `127.0.0.1:<PORT>`. Example submit loop:
+
+```bash
+PORT=31001
+for SEL in confidence leftmost; do
+  for BM in aime2024 aime2025; do
+    for TEMP in 0 1.0; do
+      env ACCOUNT=nvr_lpr_llm PARTITION=batch_short PORT=$PORT \
+        CKPT=... TOKENIZER=... BENCHMARK=$BM ALG=FastDiffuser BS=16 \
+        SELECTION_POLICY=$SEL TEMP=$TEMP TOP_P=1.0 \
+        PROMPT_FILE=examples/prompts/cot.txt MAX_NEW_TOKENS=3744 CONTEXT_LENGTH=4096 \
+        TAG=<name>_${BM}_fd_${SEL}_b16_cot_temp${TEMP/./p} \
+        ./submit_standalone_gsm8k_eval.sh
+      PORT=$((PORT+1))
+    done
+  done
+done
+```
 
 If a converted HF checkpoint is a symlink-heavy directory and fails inside the container with a missing custom-code file such as `configuration_ministral_dlm.py`, create an eval-only materialized copy with real files and the intended `config.json`, then point `CKPT` at that materialized directory. Do not patch the original converted checkpoint in place unless the user explicitly asks.
 
@@ -259,5 +279,5 @@ SBATCH_JOB_NAME=<name>_step_N_sglang_fd_b32 \
 - NemoSkills writes a generated `.gpu_only_cmd_*.sh` script into `SEQ_EVAL_OUTPUT_DIR`; use it as the source of truth for rerunning an exact completed eval.
 - The NemoSkills server worker logs are saved under `${SEQ_EVAL_OUTPUT_DIR}/worker_logs`.
 - GSM8K uses `SEQ_EVAL_TOKENS_TO_GENERATE=750` in the NemoSkills command above and `MAX_NEW_TOKENS=750` in the standalone command.
-- AIME uses the high-budget standalone settings `MAX_NEW_TOKENS=8192`, `MAX_STEPS=8192`, and `CONTEXT_LENGTH=20480`.
+- AIME uses the high-budget standalone settings `MAX_NEW_TOKENS=8192`, `CONTEXT_LENGTH=20480`, and `MAX_STEPS=BS` (the per-block denoising cap; `16` for `BS=16`).
 - If using the optional SGLang fallback, set `SGLANG_COMMIT` to the actual checked-out SGLang commit and use `JSON_MODEL_OVERRIDE_ARGS=` with FastDiffuser so the wrapper does not inject AR mode.

@@ -46,6 +46,23 @@ After submission, explicitly share the exact submission command with the user to
 
 Use PARTITION=batch for all sbatch submissions. The dfw batch partition has a 4-hour limit, so keep TIME at or below 04:00:00. Adjust NODES as needed, but do not submit these experiments to backfill, batch_long, batch_large, or batch_large_long.
 
+## Account Selection (Fair Share)
+
+Pick `ACCOUNT` based on Slurm fair-share: submit under the eligible account with the **highest current FairShare**, since that account gets the best scheduling priority (shortest queue wait).
+
+Check fair-share before submitting:
+
+```bash
+sshare -U -u $USER -o Account,User,RawShares,NormShares,RawUsage,EffectvUsage,FairShare -p
+```
+
+The `FairShare` column is what matters (higher = better priority, range 0-1). Choose the account with the largest value, with two caveats:
+
+- Restrict the choice to accounts compatible with this work: the run dirs and HF cache live under the `coreai` portfolio (`/lustre/fsw/portfolios/coreai/...`), so use a `coreai_dlalgo_*` account. Do not use a non-coreai account such as `nvr_lpr_llm` even if it shows a higher FairShare, since it does not have access to these paths/partition.
+- An account's FairShare drops as its recent usage rises, so the best choice changes over time. Re-check `sshare` for each new submission rather than hardcoding one account.
+
+In practice `coreai_dlalgo_genai` has had a higher FairShare than the wrapper default `coreai_dlalgo_llm` (whose FairShare is depressed by heavy recent usage), so prefer `ACCOUNT=coreai_dlalgo_genai` unless `sshare` says otherwise at submit time.
+
 ## Common Configs
 
 AR GRPO:
