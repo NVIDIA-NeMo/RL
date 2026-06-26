@@ -775,6 +775,91 @@ def test_vllm_policy_generation(policy, test_input_data, tokenizer):
     )
 
 
+@pytest.mark.vllm
+def test_vllm_thinking_token_budget_inserts_reasoning_end(cluster, tokenizer):
+    """A short vLLM thinking budget should close Qwen3 reasoning early."""
+
+    def find_subsequence(sequence: list[int], subsequence: list[int]) -> int:
+        if not subsequence:
+            return 0
+        return next(
+            (
+                idx
+                for idx in range(len(sequence) - len(subsequence) + 1)
+                if sequence[idx : idx + len(subsequence)] == subsequence
+            ),
+            -1,
+        )
+
+    thinking_token_budget = 4
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["max_new_tokens"] = 32
+    vllm_config["thinking_token_budget"] = thinking_token_budget
+    vllm_config["vllm_cfg"]["use_tqdm"] = False
+    vllm_config["vllm_kwargs"] = {
+        "reasoning_config": {
+            "reasoning_parser": "qwen3",
+            "reasoning_start_str": "<think>",
+            "reasoning_end_str": "</think>",
+        }
+    }
+    vllm_config = configure_generation_config(vllm_config, tokenizer, is_eval=True)
+
+    prompt = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "What is 17 + 25? Answer briefly."}],
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=True,
+    )
+    input_ids = tokenizer(
+        prompt,
+        return_tensors="pt",
+        add_special_tokens=False,
+    )["input_ids"]
+    input_lengths = torch.tensor([input_ids.shape[1]], dtype=torch.int32)
+    input_data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+        }
+    )
+
+    vllm_generation = VllmGeneration(cluster, vllm_config)
+    try:
+        outputs = vllm_generation.generate(input_data, greedy=True)
+    finally:
+        vllm_generation.shutdown()
+
+    generated_length = outputs["generation_lengths"][0].item()
+    generated_ids = outputs["output_ids"][
+        0, input_lengths[0].item() : input_lengths[0].item() + generated_length
+    ].tolist()
+    generated_text = tokenizer.decode(generated_ids, skip_special_tokens=False)
+
+    reasoning_start_ids = tokenizer.encode("<think>", add_special_tokens=False)
+    reasoning_end_ids = tokenizer.encode("</think>", add_special_tokens=False)
+    reasoning_end_idx = find_subsequence(generated_ids, reasoning_end_ids)
+
+    assert reasoning_end_idx != -1, (
+        "Expected vLLM to inject </think> when thinking_token_budget is reached. "
+        f"Generated text: {generated_text!r}"
+    )
+
+    reasoning_ids = generated_ids[:reasoning_end_idx]
+    if reasoning_ids[: len(reasoning_start_ids)] == reasoning_start_ids:
+        reasoning_ids = reasoning_ids[len(reasoning_start_ids) :]
+
+    assert len(reasoning_ids) <= thinking_token_budget + 2, (
+        "Expected only a few generated reasoning tokens before </think>. "
+        f"Budget={thinking_token_budget}, reasoning_tokens={len(reasoning_ids)}, "
+        f"generated_text={generated_text!r}"
+    )
+    assert reasoning_end_idx + len(reasoning_end_ids) < len(generated_ids), (
+        "Expected generation to continue with answer content after </think>. "
+        f"Generated text: {generated_text!r}"
+    )
+
+
 async def _generate_async(vllm_policy, tokenizer, test_input_data, greedy=False):
     collected_indexed_outputs = []
     # generate_async is restricted to handle only single samples

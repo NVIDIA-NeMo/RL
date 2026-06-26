@@ -47,6 +47,29 @@ uv run examples/run_vlm_grpo.py --config examples/configs/recipes/vlm/vlm_grpo-n
     cluster.gpus_per_node=8 cluster.num_nodes=1
 ```
 
+### Optional reasoning budget
+
+Nemotron 3 Nano Omni reasoning checkpoints may continue generating inside the
+`<think>` block for the full rollout length if no reasoning budget is applied.
+For vLLM rollouts, set `policy.generation.thinking_token_budget` to bound the
+number of thinking tokens. vLLM also requires a reasoning config so it can
+identify the model's reasoning start and end tokens:
+
+```bash
+uv run examples/run_vlm_grpo.py --config examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n8g-automodel-ep8.v1.yaml \
+    cluster.gpus_per_node=8 \
+    cluster.num_nodes=1 \
+    policy.generation.thinking_token_budget=1024 \
+    ++policy.generation.vllm_kwargs.reasoning_config.reasoning_parser=nemotron_v3 \
+    '++policy.generation.vllm_kwargs.reasoning_config.reasoning_start_str=<think>' \
+    '++policy.generation.vllm_kwargs.reasoning_config.reasoning_end_str=</think>'
+```
+
+`thinking_token_budget` is a hard vLLM generation limit for the reasoning
+segment. If the Hugging Face chat template also accepts a `reasoning_budget`
+argument, treat that as a prompt/template-level soft control rather than a
+replacement for the vLLM sampling parameter.
+
 ## Recipe 2 — MMPR-Tiny (4-node Slurm)
 
 The MMPR-Tiny recipe uses [`examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-automodel-ep8.v1.yaml`](../../examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-mmpr-4n8g-automodel-ep8.v1.yaml). Differences vs. the CLEVR recipe:

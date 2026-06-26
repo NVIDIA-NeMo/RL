@@ -456,17 +456,21 @@ class BaseVllmGenerationWorker:
             max_new_tokens if max_new_tokens is not None else self.cfg["max_new_tokens"]
         )
 
-        return self.SamplingParams(
-            temperature=temperature,
-            top_p=self.cfg["top_p"],
-            top_k=top_k_val,
-            max_tokens=max_tokens,
-            logprobs=0,
-            stop_token_ids=self.cfg["stop_token_ids"],
-            stop=stop_strings,
-            include_stop_str_in_output=True,
-            ignore_eos=self.cfg.get("ignore_eos", False),
-        )
+        sampling_kwargs = {
+            "temperature": temperature,
+            "top_p": self.cfg["top_p"],
+            "top_k": top_k_val,
+            "max_tokens": max_tokens,
+            "logprobs": 0,
+            "stop_token_ids": self.cfg["stop_token_ids"],
+            "stop": stop_strings,
+            "include_stop_str_in_output": True,
+            "ignore_eos": self.cfg.get("ignore_eos", False),
+        }
+        if self.cfg.get("thinking_token_budget") is not None:
+            sampling_kwargs["thinking_token_budget"] = self.cfg["thinking_token_budget"]
+
+        return self.SamplingParams(**sampling_kwargs)
 
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""
