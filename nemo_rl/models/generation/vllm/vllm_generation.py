@@ -969,11 +969,18 @@ class VllmGeneration(GenerationInterface):
         """
         self.shutdown()
 
-    def invalidate_kv_cache(self) -> bool:
+    def invalidate_kv_cache(self, reset_running_requests: bool = False) -> bool:
         """Invalidate reusable caches in vLLM (e.g., prefix/KV cache) after weight updates.
 
         For async_engine, calls reset_prefix_cache_async on workers. For sync, calls reset_prefix_cache.
         Returns True if all workers report success.
+
+        Args:
+            reset_running_requests: AReaL interruptible refit. When True, vLLM
+                preempts in-flight requests, frees their old-weight KV, and
+                reschedules them so they reprefill under the new weights. When
+                False (default), the reset is a no-op while requests hold KV
+                blocks, leaving stale KV (Magistral-style).
         """
         try:
             method_name = (
@@ -984,6 +991,7 @@ class VllmGeneration(GenerationInterface):
             futures = self.worker_group.run_all_workers_single_data(
                 method_name,
                 run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+                reset_running_requests=reset_running_requests,
             )
             results = ray.get(futures)
             return all(result for result in results if result is not None)

@@ -1190,8 +1190,19 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
             traceback.print_exc()
             return False
 
-    def reset_prefix_cache(self):
-        """Reset the prefix cache of vLLM engine."""
+    def reset_prefix_cache(self, reset_running_requests: bool = False):
+        """Reset the prefix cache of vLLM engine.
+
+        Args:
+            reset_running_requests: AReaL interruptible refit. On the ASYNC
+                engine (``reset_prefix_cache_async``), True makes vLLM preempt
+                in-flight requests and reschedule them to reprefill under the
+                new weights. This SYNC path accepts the param only for signature
+                parity with the async version and does NOT forward it: the sync
+                vLLM ``LLMEngine.reset_prefix_cache()`` takes no
+                ``reset_running_requests`` argument (passing it would raise). The
+                SC/AReaL recipe is async-only, so this sync path is parity-only.
+        """
         assert self.llm is not None, (
             "Attempting to reset prefix cache with either an uninitialized vLLM or non-model-owner"
         )
