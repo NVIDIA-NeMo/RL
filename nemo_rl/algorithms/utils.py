@@ -930,3 +930,97 @@ def log_generation_metrics_to_wandb(
             name=generation_metric,
             timeline_interval=timeline_interval,
         )
+
+
+WALL_CLOCK_EFFICIENCY_CATEGORIES = [
+    "init/total",
+    "idle/buffer_starvation",
+    "idle/refit_bubble",
+    "idle/validation",
+]
+
+THREAD_ACCUMULATED_EFFICIENCY_CATEGORIES = [
+    "idle/buffer_full_backoff",
+    "idle/generation_limit_pause",
+    "idle/refit_event_wait",
+    "wasted/failed_trajectory",
+]
+
+EFFICIENCY_CATEGORIES = (
+    WALL_CLOCK_EFFICIENCY_CATEGORIES + THREAD_ACCUMULATED_EFFICIENCY_CATEGORIES
+)
+
+
+def print_efficiency_summary(
+    efficiency_metrics: dict[str, float],
+    total_wall_time_s: float,
+    step: int,
+) -> dict[str, float]:
+    """Print a summary table of efficiency metrics and return loggable dict.
+
+    Wall-clock categories (driver-side idle) are used for the efficiency
+    percentage.  Collector-side categories are summed across concurrent
+    threads and reported separately as thread-seconds so they are not
+    compared directly against a single wall-clock denominator.
+
+    Args:
+        efficiency_metrics: Dict mapping category labels to total seconds spent.
+        total_wall_time_s: Total wall-clock time in seconds since training began.
+        step: Current training step number.
+
+    Returns:
+        Dict of metrics suitable for logging to WandB/TensorBoard, including
+        per-category seconds and percentages, total waste, and efficiency_pct.
+    """
+    print(f"\n📊 Efficiency Summary (Step {step}):")
+    print(f"  {'Category':<35} {'Time (s)':>10} {'% of Wall':>10}")
+    print(f"  {'─' * 57}")
+
+    loggable: dict[str, float] = {}
+
+    for category in WALL_CLOCK_EFFICIENCY_CATEGORIES:
+        duration = efficiency_metrics.get(category, 0.0)
+        pct = (duration / total_wall_time_s * 100) if total_wall_time_s > 0 else 0.0
+        print(f"  {category:<35} {duration:>10.2f} {pct:>9.2f}%")
+        loggable[f"efficiency/{category}_s"] = duration
+        loggable[f"efficiency/{category}_pct"] = pct
+
+    thread_seconds_total = 0.0
+    for category in THREAD_ACCUMULATED_EFFICIENCY_CATEGORIES:
+        duration = efficiency_metrics.get(category, 0.0)
+        thread_seconds_total += duration
+        print(f"  {category + ' (thread-s)':<35} {duration:>10.2f} {'n/a':>10}")
+        loggable[f"efficiency/{category}_s"] = duration
+
+    wall_waste = sum(
+        efficiency_metrics.get(cat, 0.0) for cat in WALL_CLOCK_EFFICIENCY_CATEGORIES
+    )
+    if total_wall_time_s > 0 and wall_waste > total_wall_time_s:
+        wall_waste = total_wall_time_s
+
+    productive = max(0.0, total_wall_time_s - wall_waste)
+    efficiency_pct = (
+        (productive / total_wall_time_s * 100) if total_wall_time_s > 0 else 100.0
+    )
+    efficiency_pct = min(100.0, max(0.0, efficiency_pct))
+    waste_pct = (
+        (wall_waste / total_wall_time_s * 100) if total_wall_time_s > 0 else 0.0
+    )
+    waste_pct = min(100.0, max(0.0, waste_pct))
+
+    print(f"  {'─' * 57}")
+    print(
+        f"  {'Collector thread-seconds (info)':<35} "
+        f"{thread_seconds_total:>10.2f} {'n/a':>10}"
+    )
+    print(f"  {'Wall-clock waste':<35} {wall_waste:>10.2f} {waste_pct:>9.2f}%")
+    print(f"  {'Productive time':<35} {productive:>10.2f} {efficiency_pct:>9.2f}%")
+    print(f"  {'Efficiency':<35} {'':>10} {efficiency_pct:>9.2f}%")
+
+    loggable["efficiency/thread_seconds_total_s"] = thread_seconds_total
+    loggable["efficiency/total_waste_s"] = wall_waste
+    loggable["efficiency/productive_time_s"] = productive
+    loggable["efficiency/efficiency_pct"] = efficiency_pct
+    loggable["efficiency/total_wall_time_s"] = total_wall_time_s
+
+    return loggable

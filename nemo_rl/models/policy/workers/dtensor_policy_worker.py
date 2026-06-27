@@ -93,6 +93,7 @@ from nemo_rl.utils.native_checkpoint import (
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+from nemo_rl.utils.timer import Timer
 
 
 def _attach_context_parallel_hooks(model: nn.Module) -> None:
@@ -232,6 +233,7 @@ class DTensorPolicyWorkerImpl(
         # torch distributed init. Envars for rank, world_size, and master_addr and master_port are set from the ray remote call
         torch.distributed.init_process_group(backend="nccl")
         self.rank = torch.distributed.get_rank()
+        self.timer = Timer(context={"worker": "dtensor_policy", "rank": self.rank})
         world_size = torch.distributed.get_world_size()
         model_name = self.cfg["model_name"]
 
@@ -578,6 +580,7 @@ class DTensorPolicyWorkerImpl(
         check_dim_skip_keys: Optional[Iterable[str]] = None,
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
+        self.timer.start("train")
         if gbs is None:
             gbs = self.cfg["train_global_batch_size"]
         if mbs is None:
@@ -979,6 +982,7 @@ class DTensorPolicyWorkerImpl(
                 "all_mb_metrics": dict(mb_metrics),
             }
 
+            self.timer.stop("train")
             return metrics
 
     # TODO @Rayen Tian: Related Issue: Refactor shared logic between score() and get_logprobs() (https://github.com/NVIDIA-NeMo/RL/issues/1094)
@@ -998,6 +1002,7 @@ class DTensorPolicyWorkerImpl(
           We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
+        self.timer.start("get_logprobs")
         logprob_batch_size = (
             micro_batch_size
             if micro_batch_size is not None
@@ -1300,6 +1305,7 @@ class DTensorPolicyWorkerImpl(
             )
 
         return_data["logprobs"] = token_logprobs.cpu()
+        self.timer.stop("get_logprobs")
         return return_data
 
     # TODO @Rayen Tian: Related Issue: Refactor shared logic between score() and get_logprobs() (https://github.com/NVIDIA-NeMo/RL/issues/1094)
@@ -1447,6 +1453,7 @@ class DTensorPolicyWorkerImpl(
         - Supports context parallelism with proper CP gather.
         - Otherwise, computes local top-k on full-vocab tensor.
         """
+        self.timer.start("get_topk_logits")
         topk_batch_size = (
             micro_batch_size
             if micro_batch_size is not None
@@ -1726,6 +1733,7 @@ class DTensorPolicyWorkerImpl(
             if len(all_topk_idx_padded) > 1
             else all_topk_idx_padded[0]
         ).cpu()
+        self.timer.stop("get_topk_logits")
         return ret
 
     @contextmanager
@@ -1737,6 +1745,7 @@ class DTensorPolicyWorkerImpl(
                   is different from the current policy, making filtered logprobs incompatible.
         On exit: Restores original references and re-flips cuda/cpu, restores sampling_params.
         """
+        self.timer.start("use_reference_model")
         with torch.no_grad():
             # Save train model state_dict
             curr_state_dict = get_cpu_state_dict(
@@ -1774,6 +1783,7 @@ class DTensorPolicyWorkerImpl(
             for k, v in self.model.state_dict().items():
                 val = to_local_if_dtensor(v)
                 val.copy_(curr_state_dict[k])
+            self.timer.stop("use_reference_model")
 
     def _add_noise_to_weights(self) -> None:
         """Add small Gaussian noise to the weights of the model. Note that this is used for testing purposes only."""
@@ -1943,17 +1953,20 @@ class DTensorPolicyWorkerImpl(
     @wrap_with_nvtx_name("dtensor_policy_worker/offload_before_refit")
     def offload_before_refit(self) -> None:
         """Offload the optimizer to the CPU."""
+        self.timer.start("offload_before_refit")
         torch.randn(1).cuda()  # wake up torch allocator
         if self.optimizer is not None:
             self.move_optimizer_to_device("cpu")
 
         gc.collect()
         torch.cuda.empty_cache()
+        self.timer.stop("offload_before_refit")
 
     @torch.no_grad()
     @wrap_with_nvtx_name("dtensor_policy_worker/offload_after_refit")
     def offload_after_refit(self) -> None:
         """Offload as much as possible on the CPU."""
+        self.timer.start("offload_after_refit")
         self.model = self.move_to_cpu(self.model)
         self.model.eval()
         torch.randn(1).cuda()  # wake up torch allocator
@@ -1965,6 +1978,7 @@ class DTensorPolicyWorkerImpl(
         print(
             f"GPU Memory after optimizer offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
         )
+        self.timer.stop("offload_after_refit")
 
     def move_optimizer_to_device(self, device: str | torch.device) -> None:
         for state in self.optimizer.state.values():
@@ -2007,6 +2021,7 @@ class DTensorPolicyWorkerImpl(
 
         the optimizer states are saved only if `optimizer` and `optimizer_path` are provided.
         """
+        self.timer.start("save_checkpoint")
         save_checkpoint(
             model=self.model,
             weights_path=weights_path,
@@ -2016,6 +2031,7 @@ class DTensorPolicyWorkerImpl(
             tokenizer=self.tokenizer if tokenizer_path else None,
             tokenizer_path=tokenizer_path,
         )
+        self.timer.stop("save_checkpoint")
 
     def load_checkpoint(
         self, weights_path: str, optimizer_path: Optional[str] = None
