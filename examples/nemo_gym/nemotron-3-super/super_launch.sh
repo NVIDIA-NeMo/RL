@@ -53,7 +53,7 @@ LOG_DIR="logs/${EXP_NAME}"
 VLLM_CACHE_DIR="${PERSISTENT_CACHE}/vllm_compile_cache"
 FLASHINFER_CUBIN_CACHE="${PERSISTENT_CACHE}/flashinfer_cubins"
 FLASHINFER_WS_BASE="${PERSISTENT_CACHE}/flashinfer_workspace"
-GYM_VENV_DIR="${GYM_VENV_DIR:-${PERSISTENT_CACHE}/gym_venvs}"
+GYM_VENV_DIR="${GYM_VENV_DIR:-/opt/gym_venvs}"
 HF_MODULES_CACHE_DIR="${HF_MODULES_CACHE:-${PERSISTENT_CACHE}/hf_modules/${EXP_NAME}}"
 UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-300}"
 NRL_FORCE_REBUILD_VENVS="${NRL_FORCE_REBUILD_VENVS:-false}"
@@ -161,6 +161,8 @@ export CONTAINER
 # ---- Container mounts ----
 BASE_MOUNTS="${SNAPSHOT_DIR}:${SNAPSHOT_DIR}"
 BASE_MOUNTS+=",${CODE_DIR}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM:${SNAPSHOT_DIR}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM"
+# Mount gym to handle swe venvs
+BASE_MOUNTS+=",${CODE_DIR}/3rdparty/Gym-workspace/Gym:/opt/nemo-rl/3rdparty/Gym-workspace/Gym"
 
 export MOUNTS="${EXTRA_MOUNTS:+${EXTRA_MOUNTS},}${BASE_MOUNTS}"
 

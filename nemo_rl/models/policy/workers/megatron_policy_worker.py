@@ -1411,7 +1411,7 @@ class MegatronPolicyWorkerImpl(
             torch.cuda.empty_cache()
 
     def finish_inference(self) -> None:
-        """Offload model params to CPU after inference."""
+        """Offload model params to CPU after inference. Only used in PPO."""
         self.model = self.move_model(
             self.model, "cpu", move_params=True, move_grads=False
         )
