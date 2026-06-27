@@ -21,17 +21,11 @@ uv run examples/run_ppo.py \
   logger.wandb.name="ppo-math"
 ```
 
-For Megatron-Core backend:
-
-```sh
-uv run examples/run_ppo.py \
-  --config examples/configs/ppo_math_1B_megatron.yaml \
-  policy.model_name="Qwen/Qwen2.5-1.5B" \
-  cluster.gpus_per_node=8 \
-  checkpointing.checkpoint_dir="results/ppo_megatron" \
-  logger.wandb_enabled=True \
-  logger.wandb.name="ppo-megatron"
-```
+> [!NOTE]
+> The training backend is selected by the config, not a command-line flag.
+> `ppo_math_1B_megatron.yaml` runs the Megatron-Core backend because it sets
+> `policy.megatron_cfg.enabled=true` (and `policy.dtensor_cfg.enabled=false`).
+> The value model currently only supports the Megatron-Core backend.
 
 ## PPO Multi-node
 

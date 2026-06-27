@@ -67,12 +67,13 @@ loss_fn:
   # Async GRPO requires importance sampling correction enabled
   # Set to true when async_grpo.enabled is true
   use_importance_sampling_correction: false
-  # "tis"          – clamp IS weights to max
+  # "tis"          – clamp IS weights to [min, max], where min defaults to 0
   # "icepop"       – zero out tokens with IS weight outside [min, max]
   # "seq-mask-tis" – zero out sequences by geometric-mean IS ratio, non-truncated token IS correction
   truncated_importance_sampling_type: null
   truncated_importance_sampling_ratio: null
-  truncated_importance_sampling_ratio_min: null  # Lower bound for ICE-POP
+  # TIS lower bound; null means 0 for TIS. Set explicitly for ICE-POP / seq-mask-tis.
+  truncated_importance_sampling_ratio_min: null
   sequence_level_importance_ratios: false
   token_level_loss: true
   force_on_policy_ratio: false  # Set to true to force ratio=1.0 (requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt)
@@ -190,6 +191,7 @@ policy:
     # When true, detach MTP heads so MTP loss does not affect main-model gradients.
     mtp_detach_heads: false
     gradient_accumulation_fusion: false
+    use_fused_weighted_squared_relu: false
 
     peft:
       enabled: false
@@ -453,3 +455,7 @@ data_plane:
   local_buffer_size:   68719476736   # 64 GiB  — used when backend == "mooncake_cpu"
   # observability:                    # NotRequired
   #   enabled: false
+
+# Multi-Teacher On-Policy Distillation (MOPD); null = disabled (default). Mirrors
+# the field on the GRPO MasterConfig added for MOPD support.
+on_policy_distillation: null

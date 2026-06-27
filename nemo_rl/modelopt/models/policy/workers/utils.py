@@ -39,6 +39,10 @@ from nemo_rl.modelopt.utils import resolve_quant_cfg
 
 MAX_SEQ_LEN = 2048
 MAX_OUTPUT_LEN = 512
+# Calibration dataloader defaults used when the optional
+# policy.quant_batch_size / policy.quant_sequence_length config keys are unset.
+DEFAULT_CALIB_BATCH_SIZE = 32
+DEFAULT_CALIB_SAMPLE_LENGTH = 1024
 
 
 def symlink_pre_quantized_model(src: str, pretrained_path: str) -> None:
@@ -97,9 +101,9 @@ def quantize_model(
     tokenizer,
     calib_size,
     is_megatron: bool = False,
-    batch_size=32,
-    data="cnn_dailymail",
-    max_sample_length=1024,
+    batch_size=None,
+    data=None,
+    max_sample_length=None,
 ):
     """Quantizes the model with the provided calibration dataset.
 
@@ -113,33 +117,49 @@ def quantize_model(
         auto_quantize_bits: The effective bits constraint for auto_quantize.
         data: the name of the calibration dataset.
     """
-    device = (
-        model.device if hasattr(model, "device") else next(model.parameters()).device
-    )
-    if data == "random":
-        calib_size = 1
-        calib_dataloader = DataLoader(
-            _DictDataset({"input_ids": torch.randint(0, 100, (1, 5), device=device)}),
-            batch_size=1,
-        )
-    else:
-        calib_dataloader = get_dataset_dataloader(
-            dataset_name=data,
-            tokenizer=tokenizer,
-            batch_size=batch_size,
-            num_samples=calib_size,
-            device=device,
-            include_labels=False,
-            max_sample_length=max_sample_length,
-        )
-
     mtq_cfg = resolve_quant_cfg(quant_cfg)
-
-    forward_loop = None
     use_calibration = need_calibration(mtq_cfg)
     if not use_calibration:
         print("Dynamic quantization. Calibration skipped.")
+        forward_loop = None
     else:
+        if data is None:
+            raise ValueError(
+                "policy.quant_calib_data is required by this quantization config."
+            )
+        if calib_size is None:
+            raise ValueError(
+                "policy.quant_calib_size is required by this quantization config."
+            )
+        device = (
+            model.device
+            if hasattr(model, "device")
+            else next(model.parameters()).device
+        )
+        if data == "random":
+            calib_size = 1
+            calib_dataloader = DataLoader(
+                _DictDataset(
+                    {"input_ids": torch.randint(0, 100, (1, 5), device=device)}
+                ),
+                batch_size=1,
+            )
+        else:
+            calib_dataloader = get_dataset_dataloader(
+                dataset_name=data,
+                tokenizer=tokenizer,
+                batch_size=batch_size
+                if batch_size is not None
+                else DEFAULT_CALIB_BATCH_SIZE,
+                num_samples=calib_size,
+                device=device,
+                include_labels=False,
+                max_sample_length=(
+                    max_sample_length
+                    if max_sample_length is not None
+                    else DEFAULT_CALIB_SAMPLE_LENGTH
+                ),
+            )
         forward_loop = get_forward_loop_func(is_megatron, calib_dataloader)
 
     model = mtq.quantize(model, mtq_cfg, forward_loop)

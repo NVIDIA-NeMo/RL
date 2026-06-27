@@ -32,6 +32,7 @@ from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.interfaces import ValueInterface, ValueOutputSpec
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.timer import Timer
 
 PathLike = Union[str, "os.PathLike[Any]"]
@@ -94,10 +95,25 @@ class Value(ValueInterface):
 
             env_vars = config["megatron_cfg"].get("env_vars", {})
         else:
-            raise NotImplementedError(
-                "DTensor backend for value model is not yet validated. "
-                "Please use Megatron-Core backend (value.megatron_cfg.enabled=true)."
-            )
+            if not dtensor_enable:
+                raise ValueError(
+                    "Please set value.dtensor_cfg.enabled=true to use DTensor "
+                    "training backend (or value.megatron_cfg.enabled=true for "
+                    "Megatron-Core)."
+                )
+            if not config["dtensor_cfg"]["_v2"]:
+                raise ValueError(
+                    "DTensor value models require value.dtensor_cfg._v2=true."
+                )
+
+            worker_builder_cls = "nemo_rl.models.value.workers.dtensor_value_worker_v2.DTensorValueWorkerV2"
+
+            tp_size = config["dtensor_cfg"]["tensor_parallel_size"]
+            # DTensor V2 does not pipeline-parallel; pp_size stays at the
+            # default of 1 initialised above.
+            cp_size = config["dtensor_cfg"]["context_parallel_size"]
+
+            env_vars = config["dtensor_cfg"].get("env_vars", {})
 
         # Validate world_size compatibility with parallelism configuration
         model_parallel_size = pp_size * cp_size * tp_size
@@ -408,14 +424,29 @@ class Value(ValueInterface):
         weights_path: str,
         optimizer_path: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
+        checkpointing_cfg: Optional[CheckpointingConfig] = None,
     ) -> None:
         """Save a checkpoint of the value model."""
-        futures = self.worker_group.run_all_workers_single_data(
-            "save_checkpoint",
-            weights_path=weights_path,
-            optimizer_path=optimizer_path,
-            tokenizer_path=tokenizer_path,
-        )
+        megatron_enable = bool(self.cfg.get("megatron_cfg", {}).get("enabled", False))
+
+        if megatron_enable:
+            futures = self.worker_group.run_all_workers_single_data(
+                "save_checkpoint",
+                weights_path=weights_path,
+                optimizer_path=optimizer_path,
+                tokenizer_path=tokenizer_path,
+            )
+        else:
+            assert self.cfg["dtensor_cfg"]["_v2"], (
+                "DTensor value models only support DTensor V2 backend."
+            )
+            futures = self.worker_group.run_all_workers_single_data(
+                "save_checkpoint",
+                weights_path=weights_path,
+                optimizer_path=optimizer_path,
+                tokenizer_path=tokenizer_path,
+                checkpointing_cfg=checkpointing_cfg,
+            )
         ray.get(futures)
 
     def shutdown(self) -> bool:
