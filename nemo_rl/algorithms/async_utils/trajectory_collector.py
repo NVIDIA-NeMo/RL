@@ -757,17 +757,31 @@ class AsyncTrajectoryCollector:
         prompt_idx: int,
         num_generations: int,
         group_num: int,
+        retry_count: int = 0,
+        buffered_keys: Optional[set[Any]] = None,
     ) -> None:
         # This worker generates every prompt group in `repeated_batch`. For the gym
         # path it consumes a per-group stream; for the non-gym path it runs one batched
         # rollout and pushes each prompt group's slice. Either way the buffer receives
         # one trajectory group (num_generations rollouts) per push.
+        #
+        # Transient rollout failures (e.g. an HTTP 500 from the gym server mid-stream)
+        # are retried up to MAX_RETRIES with exponential backoff. A batch worker may have
+        # already buffered some groups before a later group fails, so `buffered_keys`
+        # tracks the groups already in the buffer: a retry regenerates the batch but only
+        # re-pushes the groups that never made it, so there are no duplicates.
+        MAX_RETRIES = 3
+        RETRY_DELAY_BASE = 1.0  # seconds
+        _retry_spawned = False  # when True, the retry worker owns the finally cleanup
+        if buffered_keys is None:
+            buffered_keys = set()
         num_prompt_groups = repeated_batch.size // num_generations
 
         async def _run_rollouts_single(
             final_batch_cpu: BatchedDataDict[DatumSpec],
             rollout_metrics: dict[str, Any],
             prompt_group_task_index: Optional[int],
+            dedup_key: Any,
         ) -> None:
             # Compute teacher logprobs at collection time (overlapped with rollouts).
             if self._has_distillation_teachers and "agent_ref" in final_batch_cpu:
@@ -816,6 +830,8 @@ class AsyncTrajectoryCollector:
                         target_weight_version,
                     )
                     if status == "success":
+                        # Record this group so a later retry of the batch skips it.
+                        buffered_keys.add(dedup_key)
                         with self._counter_lock:
                             self._buffered_per_target[target_weight_version] = (
                                 self._buffered_per_target.get(target_weight_version, 0)
@@ -846,6 +862,7 @@ class AsyncTrajectoryCollector:
 
                 traceback.print_exc()
 
+        push_tasks: list = []
         try:
             # Import here to avoid circular dependency
             from nemo_rl.algorithms.grpo import _should_use_nemo_gym
@@ -859,7 +876,6 @@ class AsyncTrajectoryCollector:
                 # Consume the per-group rollout stream and push each group to the buffer
                 # as soon as it completes.
                 generation_config = self.master_config.policy["generation"]
-                push_tasks = []
                 async for nemo_gym_rollout_result in run_async_nemo_gym_rollout(
                     policy_generation=self.policy_generation,
                     input_batch=repeated_batch,
@@ -874,6 +890,15 @@ class AsyncTrajectoryCollector:
                     thinking_tags=get_nemo_gym_thinking_tags(self.master_config.env),
                     group_num=group_num,
                 ):
+                    # _ng_task_index uniquely identifies a prompt group and is always
+                    # stamped on the gym path (see _process_batch); use it as the dedup
+                    # key so a retry doesn't re-push a group an earlier attempt buffered.
+                    dedup_key = nemo_gym_rollout_result.ng_task_index
+                    assert dedup_key is not None, (
+                        "Expected a stamped _ng_task_index on the NeMo-Gym rollout path"
+                    )
+                    if dedup_key in buffered_keys:
+                        continue
                     final_batch_cpu = nemo_gym_rollout_result.final_batch.to("cpu")
                     push_tasks.append(
                         create_task(
@@ -881,6 +906,7 @@ class AsyncTrajectoryCollector:
                                 final_batch_cpu,
                                 nemo_gym_rollout_result.rollout_metrics,
                                 nemo_gym_rollout_result.ng_task_index,
+                                dedup_key,
                             )
                         )
                     )
@@ -903,32 +929,75 @@ class AsyncTrajectoryCollector:
                 )
                 final_batch_cpu = final_batch.to("cpu")
                 del final_batch
-                push_tasks = []
                 for g in range(num_prompt_groups):
+                    # The group index is the dedup key on the non-gym path.
+                    if g in buffered_keys:
+                        continue
                     group_batch = final_batch_cpu.slice(
                         g * num_generations, (g + 1) * num_generations
                     )
                     push_tasks.append(
                         create_task(
-                            _run_rollouts_single(group_batch, rollout_metrics, None)
+                            _run_rollouts_single(group_batch, rollout_metrics, None, g)
                         )
                     )
                 await gather(*push_tasks)
         except Exception as e:
-            print(f"❌ Error in prompt group worker: {e}")
             import traceback
 
+            print(
+                f"❌ Error in prompt group worker (target_weight="
+                f"{target_weight_version}, retry={retry_count}): {e}"
+            )
             traceback.print_exc()
-        finally:
-            with self._counter_lock:
-                self._completed_per_target[target_weight_version] = (
-                    self._completed_per_target.get(target_weight_version, 0)
-                    + num_prompt_groups
-                )
-            self._maybe_release_target(target_weight_version)
 
-            # Detach thread record when finished
-            with self._threads_lock:
-                current = _threading.current_thread()
-                if current in self._inflight_threads:
-                    self._inflight_threads.remove(current)
+            # Let any in-flight pushes settle so buffered_keys reflects every group that
+            # actually reached the buffer before we decide what to retry.
+            if push_tasks:
+                await gather(*push_tasks, return_exceptions=True)
+
+            # Retry transient rollout failures with exponential backoff. The retry worker
+            # regenerates the batch but skips groups already in buffered_keys.
+            if retry_count < MAX_RETRIES and self.running:
+                retry_delay = RETRY_DELAY_BASE * (2**retry_count)
+                print(
+                    f"   🔄 Retrying in {retry_delay:.1f}s "
+                    f"(attempt {retry_count + 1}/{MAX_RETRIES})..."
+                )
+                await asyncio_sleep(retry_delay)
+                # The retry worker takes over completion accounting and thread cleanup.
+                _retry_spawned = True
+                return await self._run_prompt_group_worker(
+                    repeated_batch,
+                    generation_weight_version,
+                    target_weight_version,
+                    prompt_idx,
+                    num_generations,
+                    group_num,
+                    retry_count + 1,
+                    buffered_keys,
+                )
+            else:
+                print(
+                    f"   ⚠️ Max retries ({MAX_RETRIES}) exceeded — "
+                    f"{num_prompt_groups - len(buffered_keys)} prompt group(s) will NOT "
+                    f"be buffered! This may stall training if it expects these "
+                    f"trajectories."
+                )
+        finally:
+            # When a retry worker was spawned it owns the completion accounting and thread
+            # cleanup (it runs its own finally on its final attempt); skip it here so the
+            # batch is counted complete exactly once.
+            if not _retry_spawned:
+                with self._counter_lock:
+                    self._completed_per_target[target_weight_version] = (
+                        self._completed_per_target.get(target_weight_version, 0)
+                        + num_prompt_groups
+                    )
+                self._maybe_release_target(target_weight_version)
+
+                # Detach thread record when finished
+                with self._threads_lock:
+                    current = _threading.current_thread()
+                    if current in self._inflight_threads:
+                        self._inflight_threads.remove(current)

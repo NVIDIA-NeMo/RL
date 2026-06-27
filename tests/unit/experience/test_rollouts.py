@@ -1552,7 +1552,10 @@ def test_async_nemo_gym_rollout_manager_matches_original(
         }
     )
 
-    original_result = run_async_nemo_gym_rollout(
+    # run_async_nemo_gym_rollout is an async generator now; this comparison test
+    # wants a single combined result for the whole batch, so drain it via the sync
+    # wrapper (which sets num_generations/returns_entire_batch and preserves order).
+    original_result = run_nemo_gym_rollout_sync(
         policy_generation=nemo_gym_vllm_generation,
         input_batch=repeated_batch,
         tokenizer=nemo_gym_tokenizer,
