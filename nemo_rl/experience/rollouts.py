@@ -550,6 +550,7 @@ def calculate_rewards(
             if is_dict_rewards:
                 # all_dict_rewards is initialized above whenever is_dict_rewards is
                 # True; assert narrows the Optional for the type checker.
+                assert all_dict_rewards is not None
                 for name in task_rewards:
                     all_dict_rewards[name].append(task_rewards[name][i])
             else:
