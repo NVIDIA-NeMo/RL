@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Callable, NamedTuple, Optional, TypedDict
+from typing import Any, Callable, NamedTuple, Optional
 
 import torch
 from megatron.bridge.training.config import ConfigContainer
@@ -22,25 +22,6 @@ from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer import MegatronModule
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
-
-
-class MegatronGenerationConfig(TypedDict):
-    # Total buffer size is 2x this value (active requests + paused requests)
-    buffer_size_gb: int
-    # Number of CUDA graphs to pre-compile for different batch sizes
-    num_cuda_graphs: int
-    # Size of each KV cache block in tokens (affects memory granularity)
-    block_size_tokens: int
-    # Enable CUDA graphs for prefill/context processing
-    use_cuda_graphs_for_non_decode_steps: bool
-    # Split long prefills into chunks for better memory management
-    enable_chunked_prefill: bool
-    # Unified memory usage level (0=disabled, higher values enable more aggressive paging)
-    unified_memory_level: int
-    # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens.
-    # Can cause OOM if set too high so should be tuned with buffer_size_gb if OOMing. If set too
-    # low, then will only do 512 tokens at a time, which can be slow.
-    max_tokens: int
 
 
 ## returned from validate_and_set_config

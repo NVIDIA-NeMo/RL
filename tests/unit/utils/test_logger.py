@@ -55,6 +55,64 @@ class TestFlattenDict:
         expected = {"a": 1, "b_c": 2, "b_d": 3}
         assert flatten_dict(d, sep="_") == expected
 
+    def test_expand_lists_false_keeps_lists_intact(self):
+        """expand_lists=False keeps each list under a single stable key.
+
+        Regression guard for metric-key cardinality explosion: variable-length
+        per-event lists must not be expanded into one key per index.
+        """
+        d = {"m": {0: [1, 2, 3], 1: [4, 6]}, "scalar": 1}
+        # Default behavior is unchanged: lists are expanded by index.
+        assert flatten_dict(d) == {
+            "m.0.0": 1,
+            "m.0.1": 2,
+            "m.0.2": 3,
+            "m.1.0": 4,
+            "m.1.1": 6,
+            "scalar": 1,
+        }
+        # expand_lists=False keeps each list intact under one stable key.
+        assert flatten_dict(d, expand_lists=False) == {
+            "m.0": [1, 2, 3],
+            "m.1": [4, 6],
+            "scalar": 1,
+        }
+
+    def test_summarize_list(self):
+        """_summarize_list reduces a numeric list to a bounded stat set."""
+        from nemo_rl.utils.logger import _summarize_list
+
+        stats = _summarize_list([1.0, 2.0, 3.0, 4.0])
+        assert stats == {
+            "mean": 2.5,
+            "p50": 2.5,
+            "p90": pytest.approx(3.7),
+            "max": 4.0,
+        }
+        # The key set is fixed and bounded regardless of input length.
+        assert set(_summarize_list([5.0])) == {"mean", "p50", "p90", "max"}
+        # Empty / non-numeric inputs yield no metrics.
+        assert _summarize_list([]) == {}
+        assert _summarize_list(["x", True]) == {}
+        # numpy scalars are accepted (parity with stock MLflow float coercion).
+        import numpy as np
+
+        assert _summarize_list([np.int64(2), np.float64(4)])["mean"] == 3.0
+
+    def test_merge_generation_logger_workers(self):
+        """Per-worker generation-logger lists merge into one list per metric."""
+        from nemo_rl.utils.logger import _merge_generation_logger_workers
+
+        metrics = {
+            "generation_logger_metrics": {"kv": {0: [1, 2], 1: [3]}},
+            "loss": 0.5,
+        }
+        merged = _merge_generation_logger_workers(metrics)
+        assert merged["generation_logger_metrics"] == {"kv": [1, 2, 3]}
+        assert merged["loss"] == 0.5
+        # Input is not mutated (other backends still see per-worker data).
+        assert metrics["generation_logger_metrics"]["kv"] == {0: [1, 2], 1: [3]}
+
 
 class TestTensorboardLogger:
     """Test the TensorboardLogger class."""
@@ -564,6 +622,59 @@ class TestMLflowLogger:
         mock_mlflow.log_metrics.assert_any_call(
             {"train/loss": 0.5, "train/accuracy": 0.8}, step=10, run_id=logger.run_id
         )
+
+    @patch("nemo_rl.utils.logger.mlflow")
+    def test_log_metrics_summarizes_lists(self, mock_mlflow, temp_dir):
+        """List-valued metrics are reduced to bounded per-step summary stats.
+
+        Regression test for metric-key cardinality explosion: per-event async
+        vLLM ``generation_logger_metrics`` (dict[str, dict[int, list]]) and
+        per-sample histograms must not create one MLflow metric key per element.
+        Each list collapses to a fixed set of summary statistics logged at the
+        real training step (so the x-axis matches every other scalar metric).
+        """
+        cfg = {
+            "experiment_name": "test-experiment",
+            "run_name": "test-run",
+            "tracking_uri": None,
+        }
+        logger = MLflowLogger(cfg, log_dir=temp_dir)
+
+        metrics = {
+            "generation_logger_metrics": {
+                "num_pending_samples": {0: [1.0, 2.0, 3.0], 1: [4.0, 6.0]},
+            },
+            "loss": 0.5,
+        }
+        logger.log_metrics(metrics, step=7)
+
+        # A single call at the real training step; no per-element keys and no
+        # synthetic-step history series (MlflowClient.log_batch is never used).
+        mock_mlflow.log_metrics.assert_called_once()
+        mock_mlflow.MlflowClient.assert_not_called()
+        args, kwargs = mock_mlflow.log_metrics.call_args
+        logged = args[0]
+        assert kwargs == {"step": 7, "run_id": logger.run_id}
+
+        # Scalars pass through unchanged.
+        assert logged["loss"] == 0.5
+
+        # Per-worker lists are merged ([1,2,3,4,6]) and summarized under one
+        # "/"-nested key per metric (so the MLflow UI groups them).
+        base = "generation_logger_metrics/num_pending_samples"
+        assert logged[f"{base}/mean"] == pytest.approx(3.2)
+        assert logged[f"{base}/p50"] == 3.0
+        assert logged[f"{base}/max"] == 6.0
+        assert {k for k in logged if k.startswith("generation_logger_metrics")} == {
+            f"{base}/mean",
+            f"{base}/p50",
+            f"{base}/p90",
+            f"{base}/max",
+        }
+
+        # Bounded: 1 scalar + 4 stats; nothing exploded and no per-worker index.
+        assert len(logged) == 1 + 4
+        assert not any(seg.isdigit() for key in logged for seg in key.split("/"))
 
     @patch("nemo_rl.utils.logger.mlflow")
     def test_log_hyperparams(self, mock_mlflow, temp_dir):

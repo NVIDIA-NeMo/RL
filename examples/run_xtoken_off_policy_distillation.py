@@ -67,7 +67,7 @@ def main() -> None:
     config = MasterConfig(**config)
 
     # Per-teacher same-vocab vs cross-tokenizer is determined solely by
-    # `projection_matrix_path` (null => same-vocab direct KL; set =>
+    # `teachers[i].projection_matrix_path` (null => same-vocab direct KL; set =>
     # cross-tokenizer). The consistency check (a same-vocab teacher must
     # actually share the student's vocab) needs the real tokenizers and lives
     # in `setup()` — comparing tokenizer *names* here is wrong, e.g.
@@ -86,7 +86,7 @@ def main() -> None:
     init_ray()
 
     # Student tokenizer + one tokenizer per teacher (same-tokenizer teachers
-    # included — needed for vocab sizing).
+    # included — needed for vocab sizing in setup()).
     student_tokenizer = get_tokenizer(config.policy["tokenizer"])
     teacher_tokenizers = [
         get_tokenizer(teacher.policy_config()["tokenizer"])

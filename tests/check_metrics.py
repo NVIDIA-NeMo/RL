@@ -208,8 +208,8 @@ def main():
     with open(args.json_file, "r") as f:
         data = json.load(f)
 
-    # Initialize rich console
-    console = Console()
+    # Initialize rich console — force wide output so CI logs never truncate columns.
+    console = Console(width=args.table_width or 300)
 
     table = Table(title="Metric Checks", min_width=220, width=args.table_width)
     table.add_column("Status", style="bold")

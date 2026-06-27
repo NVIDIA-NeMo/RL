@@ -68,7 +68,7 @@ from nemo_rl.models.policy.interfaces import (
     ScoreOutputSpec,
 )
 from nemo_rl.models.policy.utils import (
-    get_handle_from_tensor,
+    ensure_teacher_ipc_buffer,
     get_runtime_env_for_policy_worker,
 )
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
@@ -256,19 +256,15 @@ class DTensorPolicyWorkerV2Impl(
         # Initialize checkpoint manager
         self.checkpoint_manager: Optional[AutomodelCheckpointManager] = None
 
-        # Persistent CUDA IPC buffers for teacher logits. The cross-tokenizer
-        # full-vocab transport and the same-vocab top-K transport share this
-        # machinery. Each named buffer is allocated once on the first
-        # ``get_teacher_logits_ipc`` call (or reallocated if dims grow),
-        # ``.copy_()``-ed into each step, and exposed via a stable IPC handle
-        # captured at allocation. With persistent buffers the producer never
-        # tries to free between steps, so the consumer can safely hold a view
-        # into the IPC-imported storage without keeping a now-orphaned producer
-        # allocation pinned via refcount. Buffer names: ``"full_logits"`` (full
-        # mode), ``"topk_vals"`` / ``"topk_idx"`` (top-K mode); a given teacher
-        # worker only ever populates the buffers for its own mode.
-        self._ipc_buffers: dict[str, torch.Tensor] = {}
-        self._ipc_handles: dict[str, Any] = {}
+        # Persistent CUDA IPC buffer for cross-tokenizer teacher logits.
+        # Allocated once on first ``get_full_logits_ipc`` call (or
+        # reallocated if dims grow), with fresh logits ``.copy_()``-ed into
+        # each microbatch slot per step and exposed via a stable IPC handle
+        # captured at allocation. Persistent storage means the producer never
+        # frees between steps, so the consumer can safely hold a view into the
+        # IPC-imported storage without pinning an orphaned producer allocation.
+        self._teacher_ipc_storage: Optional[torch.Tensor] = None
+        self._teacher_ipc_handle: Optional[tuple[Any, ...]] = None
 
         # Validate configuration and prepare runtime settings
         runtime_config = validate_and_prepare_config(
@@ -354,6 +350,32 @@ class DTensorPolicyWorkerV2Impl(
             self.sampling_params,
             _runtime_is_reward_model,  # Duplicate, already set as _is_reward_model
         ) = runtime_config
+
+        # Rollout topology constant for SGLang colocated refit: set once via
+        # ``set_rollout_num_gpus_per_engine`` after the SGLang generation
+        # handle exists and consumed by ``stream_weights_via_http`` on each
+        # refit. Only initialized on the SGLang colocated path since no other
+        # generation backend uses this attribute.
+        generation_backend = config.get("generation", {}).get("backend")
+        if generation_backend == "sglang":
+            from nemo_rl.models.generation.sglang.utils.train_utils import (
+                monkey_patch_torch_reductions,
+            )
+
+            monkey_patch_torch_reductions()
+            if self.is_generation_colocated:
+                self._rollout_num_gpus_per_engine: Optional[int] = None
+                self._ipc_worker_state: dict = {}
+
+    def _update_moe_gate_bias_if_supported(self) -> None:
+        """Update the non-gradient MoE routing bias after the optimizer step."""
+        update_moe_gate_bias = getattr(self.model, "update_moe_gate_bias", None)
+        if update_moe_gate_bias is not None:
+            update_moe_gate_bias()
+
+    def set_rollout_num_gpus_per_engine(self, num_gpus_per_engine: int) -> None:
+        """Record the rollout engine's TP size for later use in ``stream_weights_via_http``."""
+        self._rollout_num_gpus_per_engine = num_gpus_per_engine
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/train")
     def train(
@@ -514,8 +536,9 @@ class DTensorPolicyWorkerV2Impl(
                         grad_norm, device="cpu", dtype=torch.float32
                     )
 
-                    # Update parameters
+                    # Update parameters and the non-gradient MoE routing bias.
                     self.optimizer.step()
+                    self._update_moe_gate_bias_if_supported()
 
                 losses.append(torch.tensor(mb_losses).sum().item())
 
@@ -815,103 +838,48 @@ class DTensorPolicyWorkerV2Impl(
         data: BatchedDataDict[Any],
         micro_batch_size: Optional[int] = None,
     ) -> dict[str, Any]:
-        """Ship the teacher's full-vocab logits to the student via CUDA IPC.
+        """Teacher forward; full-vocab logits exposed via persistent CUDA IPC storage.
 
-        Thin wrapper over :meth:`get_teacher_logits_ipc` with ``mode="full"``,
-        kept for callers (and tests) that pre-date the unified producer. See
-        that method for the lifetime / return contract.
+        Used by cross-tokenizer distillation; supports heterogeneous teacher
+        TP/CP. Each microbatch writes into slot
+        ``self._teacher_ipc_storage[buf_idx]`` and shares one cached IPC
+        handle. Returns ``{"per_sample_handles": list, "dp_rank": int}`` where
+        each handle carries ``buf_idx`` and ``sample_index_in_buf`` for the
+        consumer to index the slot view, plus the TP/CP shard metadata
+        (``vocab_start_index``, ``global_seq_start``, ...) the consumer uses to
+        route shards across heterogeneous teacher/student TP/CP.
         """
-        return self.get_teacher_logits_ipc(
-            data, mode="full", micro_batch_size=micro_batch_size
-        )
-
-    def get_teacher_logits_ipc(
-        self,
-        data: BatchedDataDict[Any],
-        *,
-        mode: str = "full",
-        k: Optional[int] = None,
-        micro_batch_size: Optional[int] = None,
-    ) -> dict[str, Any]:
-        """Ship teacher logits to the student via persistent CUDA IPC buffer(s).
-
-        Unified producer for both transports used by cross-tokenizer
-        distillation, sharing one persistent-buffer design so the student
-        worker (a separate Ray actor on the same node) rebuilds the tensors
-        without a CPU/driver round-trip:
-
-          - ``mode="full"``: full-vocab logits ``[B_r, T, V_t]`` (every
-            cross-tokenizer teacher, plus same-vocab teachers shipping full
-            logits). One buffer in native compute dtype (bf16 under autocast);
-            every per-sample handle carries ``rank_logits_ipc``.
-          - ``mode="topk"``: per-position top-``k`` logits and global indices,
-            each ``[B_r, T, k]`` (same-vocab top-K teachers). Two buffers --
-            values in native compute dtype, indices in int32 -- exposed as
-            ``rank_topk_vals_ipc`` and ``rank_topk_idx_ipc``. Shipping bf16
-            values is lossless (the teacher forward is already bf16) and int32
-            covers any <2^31 vocab; the loss casts indices to int64 at the
-            gather.
-
-        Lifetime mirrors the original full-logits path: the backing tensors are
-        allocated once per buffer name and reused across every training step,
-        with fresh values ``.copy_()``-ed in each step and the IPC handle(s)
-        captured once at allocation. Because the producer never frees the
-        buffers between steps, the consumer can safely hold a view into the
-        IPC-imported storage. :meth:`release_ipc_buffer` is a no-op kept for
-        driver-side contract compatibility.
-
-        Args:
-            data: Teacher-side inputs (``input_ids`` / ``input_lengths`` / ...).
-            mode: ``"full"`` or ``"topk"``.
-            k: Top-``k`` width; required when ``mode="topk"``.
-            micro_batch_size: Forward micro-batch size; defaults to
-                ``cfg["logprob_batch_size"]``.
-
-        Returns:
-            dict with ``per_sample_handles``: ``list[B_r]`` of dicts. Every
-            entry carries the same rank-level handle(s) plus its own
-            ``sample_idx_within_rank``; the consumer rebuilds the handle(s)
-            once and slices ``[mb_start:mb_end]`` for the current microbatch --
-            no ``torch.stack``, no extra allocation.
-
-        v0 limitation: TP=1, CP=1, no sequence packing.
-        """
-        if mode not in ("full", "topk"):
-            raise ValueError(f"mode must be 'full' or 'topk', got {mode!r}")
-        if mode == "topk" and k is None:
-            raise ValueError("get_teacher_logits_ipc(mode='topk') requires k.")
-
         forward_batch_size = (
             micro_batch_size
             if micro_batch_size is not None
             else self.cfg["logprob_batch_size"]
         )
         sequence_dim, seq_dim_size = check_sequence_dim(data)
+        target_local_seq = (
+            seq_dim_size // self.cp_size if self.cp_size > 1 else seq_dim_size
+        )
+
         self.model.eval()
 
-        post_processor: Any
-        if mode == "full":
-            post_processor = FullLogitsPostProcessor(
-                cfg=self.cfg,
-                device_mesh=self.device_mesh,
-                cp_mesh=self.cp_mesh,
-                tp_mesh=self.tp_mesh,
-                cp_size=self.cp_size,
-                enable_seq_packing=self.enable_seq_packing,
-            )
-        else:
-            post_processor = TopkLogitsPostProcessor(
-                cfg=self.cfg,
-                device_mesh=self.device_mesh,
-                cp_mesh=self.cp_mesh,
-                tp_mesh=self.tp_mesh,
-                cp_size=self.cp_size,
-                k=k,
-                enable_seq_packing=self.enable_seq_packing,
-            )
+        post_processor = FullLogitsPostProcessor(
+            cfg=self.cfg,
+            device_mesh=self.device_mesh,
+            cp_mesh=self.cp_mesh,
+            tp_mesh=self.tp_mesh,
+            cp_size=self.cp_size,
+            enable_seq_packing=self.enable_seq_packing,
+        )
 
-        out_vals: list[torch.Tensor] = []
-        out_idx: list[torch.Tensor] = []
+        tp_rank = self.tp_mesh.get_local_rank() if self.tp_mesh is not None else 0
+        cp_rank = self.cp_mesh.get_local_rank() if self.cp_mesh is not None else 0
+        dp_rank = self.dp_mesh.get_local_rank() if self.dp_mesh is not None else 0
+        world_rank = torch.distributed.get_rank()
+        full_seq_len = target_local_seq * self.cp_size
+        global_seq_start = cp_rank * full_seq_len // self.cp_size
+
+        per_sample_handles: list[dict[str, Any]] = []
+        storage: Optional[torch.Tensor] = None
+        payload_ipc: Optional[tuple[Any, ...]] = None
         with torch.no_grad():
             data.to("cuda")
             processed_iterator, iterator_len = get_microbatch_iterator(
@@ -922,7 +890,7 @@ class DTensorPolicyWorkerV2Impl(
                 tokenizer=self.tokenizer,
                 cp_size=self.cp_size,
             )
-            for batch_idx, processed_mb in enumerate(processed_iterator):
+            for buf_idx, processed_mb in enumerate(processed_iterator):
                 processed_inputs = processed_mb.processed_inputs
                 with get_train_context(
                     cp_size=self.cp_size,
@@ -932,7 +900,7 @@ class DTensorPolicyWorkerV2Impl(
                     dtype=self.dtype,
                     autocast_enabled=self.autocast_enabled,
                 ):
-                    result, _metrics, _ = forward_with_post_processing_fn(
+                    vals, _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
                         post_processing_fn=post_processor,
                         processed_mb=processed_mb,
@@ -941,132 +909,73 @@ class DTensorPolicyWorkerV2Impl(
                         sampling_params=self.sampling_params,
                         sequence_dim=sequence_dim,
                     )
-                if batch_idx >= iterator_len:
+                if buf_idx >= iterator_len:
                     continue
-                # Keep tensors on CUDA for IPC; pad the seq dim now so the
-                # stash matches the canonical [B_r, T, *] shape.
-                if mode == "full":
-                    vals = self._pad_logits_seq_dim(result, seq_dim_size)
-                    out_vals.append(vals.contiguous())
-                else:
-                    vals, idx = result
-                    vals = self._pad_logits_seq_dim(vals, seq_dim_size)
-                    # Integer pad value for the index tensor.
-                    idx = self._pad_logits_seq_dim(idx, seq_dim_size, pad_value=0)
-                    # Native compute dtype values + int32 indices halve both
-                    # persistent buffers vs the fp32/int64 driver path, with no
-                    # precision loss (the teacher forward is bf16; vocab < 2^31).
-                    out_vals.append(vals.to(self.dtype).contiguous())
-                    out_idx.append(idx.to(torch.int32).contiguous())
+                # Pad to canonical seq so the cached IPC handle stays shape-stable.
+                pad_needed = target_local_seq - vals.shape[1]
+                if pad_needed > 0:
+                    vals = torch.nn.functional.pad(
+                        vals, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=0.0
+                    )
+                batch_size_mb, seq_len_mb, local_vocab_size = vals.shape
 
-        final_vals = (
-            torch.cat(out_vals, dim=0) if len(out_vals) > 1 else out_vals[0]
-        )  # CUDA [B_r, T, V_t] (full) or [B_r, T, k] (top-K values)
-        B_r, T, last_v = final_vals.shape
-
-        vals_name = "full_logits" if mode == "full" else "topk_vals"
-        self._ensure_ipc_buffer(
-            vals_name, B_r, T, last_v, final_vals.dtype, final_vals.device
-        )
-        self._ipc_buffers[vals_name][:B_r, :T, :last_v].copy_(final_vals)
-        del out_vals, final_vals  # drop cat intermediate; buffer holds the data
-
-        if mode == "topk":
-            final_idx = (
-                torch.cat(out_idx, dim=0) if len(out_idx) > 1 else out_idx[0]
-            )  # CUDA [B_r, T, k]
-            last_i = final_idx.shape[2]
-            self._ensure_ipc_buffer(
-                "topk_idx", B_r, T, last_i, final_idx.dtype, final_idx.device
-            )
-            self._ipc_buffers["topk_idx"][:B_r, :T, :last_i].copy_(final_idx)
-            del out_idx, final_idx
-
-        # The copy_ is async on the current stream; force it to complete before
-        # the IPC handle(s) are consumed by the student process, so the consumer
-        # can't observe a partially written buffer (mirrors the sync in
-        # nemo_rl/models/policy/utils.py before exposing handles).
+                self._teacher_ipc_storage, self._teacher_ipc_handle = (
+                    ensure_teacher_ipc_buffer(
+                        self._teacher_ipc_storage,
+                        self._teacher_ipc_handle,
+                        iterator_len,
+                        batch_size_mb,
+                        target_local_seq,
+                        local_vocab_size,
+                        vals.dtype,
+                        vals.device,
+                    )
+                )
+                storage = self._teacher_ipc_storage
+                payload_ipc = self._teacher_ipc_handle
+                storage[buf_idx, :batch_size_mb, :seq_len_mb, :local_vocab_size].copy_(
+                    vals
+                )
+                del vals
+                full_vocab_size = local_vocab_size * self.tp_size
+                vocab_start_index = tp_rank * local_vocab_size
+                vocab_end_index = (tp_rank + 1) * local_vocab_size
+                for sample_index_in_buf in range(batch_size_mb):
+                    per_sample_handles.append(
+                        {
+                            "payload_ipc": payload_ipc,
+                            "buf_idx": buf_idx,
+                            "sample_index_in_buf": sample_index_in_buf,
+                            "storage_shape": tuple(storage.shape),
+                            "actual_shape": (target_local_seq, local_vocab_size),
+                            "dtype": storage.dtype,
+                            "tp_rank": tp_rank,
+                            "cp_rank": cp_rank,
+                            "tp_size": self.tp_size,
+                            "cp_size": self.cp_size,
+                            "world_rank": world_rank,
+                            "vocab_start_index": vocab_start_index,
+                            "vocab_end_index": vocab_end_index,
+                            "global_seq_start": global_seq_start,
+                            "full_vocab_size": full_vocab_size,
+                            "full_seq_len": full_seq_len,
+                            "vocab_sharded": self.tp_size > 1,
+                            "sequence_sharded": self.cp_size > 1,
+                        }
+                    )
+        # The storage copies above are async on the current stream; force them
+        # to complete before the IPC handles are consumed by the student
+        # process, so the consumer can't observe a partially written buffer
+        # (ports the sync added upstream for the single-buffer export path).
         torch.cuda.synchronize()
-
-        # Every per-sample entry carries the same stable rank-level handle(s)
-        # plus its rank-local sample index; the consumer rebuilds the handle(s)
-        # once and slices the contiguous microbatch range.
-        if mode == "full":
-            per_sample_handles: list[dict[str, Any]] = [
-                {
-                    "rank_logits_ipc": self._ipc_handles["full_logits"],
-                    "rank_shape": (B_r, T, last_v),
-                    "dtype": self._ipc_buffers["full_logits"].dtype,
-                    "sample_idx_within_rank": i,
-                }
-                for i in range(B_r)
-            ]
-        else:
-            per_sample_handles = [
-                {
-                    "rank_topk_vals_ipc": self._ipc_handles["topk_vals"],
-                    "rank_topk_idx_ipc": self._ipc_handles["topk_idx"],
-                    "sample_idx_within_rank": i,
-                }
-                for i in range(B_r)
-            ]
-        return {"per_sample_handles": per_sample_handles}
-
-    @staticmethod
-    def _pad_logits_seq_dim(
-        t: torch.Tensor, seq_dim_size: int, pad_value: float = 0.0
-    ) -> torch.Tensor:
-        """Right-pad dim 1 (sequence) of a ``[B, S, *]`` tensor up to ``seq_dim_size``."""
-        pad_needed = seq_dim_size - t.shape[1]
-        if pad_needed > 0:
-            t = torch.nn.functional.pad(
-                t, (0, 0, 0, pad_needed, 0, 0), mode="constant", value=pad_value
-            )
-        return t
-
-    def _ensure_ipc_buffer(
-        self,
-        name: str,
-        B_r: int,
-        T: int,
-        last: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> None:
-        """Allocate (or grow) the named persistent IPC buffer and capture its handle.
-
-        On first use for ``name``: allocates ``[B_r, T, last]`` on ``device``
-        with ``dtype`` and captures the IPC handle. On later calls: a no-op as
-        long as the existing buffer can hold the requested shape and matches
-        dtype/device. If any dim grew or dtype/device changed, reallocates and
-        re-captures the handle (the consumer receives the new handle in the next
-        ``get_teacher_logits_ipc`` return value).
-        """
-        buf = self._ipc_buffers.get(name)
-        if (
-            buf is not None
-            and buf.shape[0] >= B_r
-            and buf.shape[1] >= T
-            and buf.shape[2] >= last
-            and buf.dtype == dtype
-            and buf.device == device
-        ):
-            return
-        buf = torch.empty((B_r, T, last), dtype=dtype, device=device)
-        self._ipc_buffers[name] = buf
-        self._ipc_handles[name] = get_handle_from_tensor(buf)
+        return {"per_sample_handles": per_sample_handles, "dp_rank": dp_rank}
 
     def release_ipc_buffer(self) -> None:
-        """No-op under the persistent IPC buffer design.
-
-        The teacher-logits IPC buffers are allocated once on first
-        ``get_teacher_logits_ipc`` and live for the worker's lifetime;
-        each step ``.copy_()``-s fresh logits into the same memory
-        backing the same stable IPC handle(s). The driver still calls
-        this method in its ``finally`` block — keep that contract,
-        but with persistent storage there is nothing to release.
-        """
-        return
+        """Free the persistent teacher-logit IPC storage. Called once at end of training/validation."""
+        self._teacher_ipc_storage = None
+        self._teacher_ipc_handle = None
+        gc.collect()
+        torch.cuda.empty_cache()
 
     @contextmanager
     def use_reference_model(self) -> Generator[None, None, None]:
@@ -1201,47 +1110,42 @@ class DTensorPolicyWorkerV2Impl(
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/stream_weights_via_http")
     def stream_weights_via_http(
         self,
-        sglang_url_to_gpu_uuids: dict[str, list[str]],
+        rollout_engine_urls: list[str],
+        buffer_size_bytes: int,
     ) -> None:
-        """Stream model weights to SGLang servers via HTTP API.
+        """Stream FSDP weights to colocated SGLang engines via CUDA IPC over HTTP.
 
         Args:
-            sglang_url_to_gpu_uuids: Dict mapping SGLang server URL to list of GPU UUIDs it uses
+            rollout_engine_urls: ``http://host:port`` base URLs of each
+                engine's ``node_rank=0`` SGLang HTTP server. The driver
+                resolves these once via ``engine.get_base_url`` and passes
+                them down so every FSDP rank doesn't redo the Ray RPC.
+            buffer_size_bytes: Max bucket size in bytes before flushing.
+
+        ``num_gpus_per_engine`` is recorded once via
+        ``set_rollout_num_gpus_per_engine`` after the SGLang generation handle
+        is created, so the caller doesn't have to pass it on every refit.
         """
+        assert self._rollout_num_gpus_per_engine is not None, (
+            "stream_weights_via_http called before set_rollout_num_gpus_per_engine; "
+            "wire the rollout TP size on the policy after SGLangGeneration is built."
+        )
+
         # Manually move model to cuda for cpu offload case
         if self.cpu_offload:
             self.model = self.move_to_cuda(self.model)
 
         from nemo_rl.models.policy.utils import stream_weights_via_http_impl
 
-        # Get current GPU UUID
-        current_device_uuid = self.report_device_id()
-
-        def dtensor_params_generator():
-            """Generator that yields (name, tensor) pairs, converting DTensors to local tensors."""
-            state_dict_items = sorted(
-                self.model.state_dict().items(), key=lambda x: x[0]
-            )
-            for name, tensor in state_dict_items:
-                if isinstance(tensor, DTensor):
-                    # Convert DTensor to full tensor for streaming
-                    full_tensor = tensor.full_tensor()
-                    # Convert to target dtype
-                    yield (
-                        name,
-                        full_tensor.to(self.dtype, non_blocking=True).contiguous(),
-                    )
-                else:
-                    # Convert to target dtype
-                    yield name, tensor.to(self.dtype, non_blocking=True).contiguous()
-
-        # Use the HTTP implementation
         stream_weights_via_http_impl(
-            params_generator=dtensor_params_generator(),
-            sglang_url_to_gpu_uuids=sglang_url_to_gpu_uuids,
+            params_generator=dtensor_params_generator(self.model, self.dtype),
+            rollout_engine_urls=rollout_engine_urls,
+            num_gpus_per_engine=self._rollout_num_gpus_per_engine,
             rank=self.rank,
+            world_size=torch.distributed.get_world_size(),
             worker_name=str(self),
-            current_device_uuid=current_device_uuid,
+            buffer_size_bytes=buffer_size_bytes,
+            worker_state=self._ipc_worker_state,
         )
 
     @torch.no_grad()
@@ -1312,6 +1216,14 @@ class DTensorPolicyWorkerV2Impl(
         if self.optimizer is not None and not self.cpu_offload:
             self.move_optimizer_to_device("cuda")
 
+        torch.cuda.empty_cache()
+
+    def finish_inference(self) -> None:
+        """Offload model params to CPU after inference. Only used in PPO."""
+        self.model = self.move_to_cpu(self.model)
+        self.model.eval()
+
+        gc.collect()
         torch.cuda.empty_cache()
 
     @torch.no_grad()

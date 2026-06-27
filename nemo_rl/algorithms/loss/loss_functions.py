@@ -20,16 +20,26 @@ from pydantic import BaseModel
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType, LossType
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.algorithms.x_token.loss_utils import (
-    Fp32SparseMM,
-    alignment_from_flat_batch,
+    LocalizedAlignment,
     build_exact_token_map,
+    ce_label_mask,
     chunk_average_log_probs,
-    dp_all_reduce_sum,
     get_sparse_projection_matrix,
+    next_token_accuracy,
+    project_student_to_teacher_vocab,
+    select_teacher_topk_indices,
+    student_next_token_ce,
     valid_chunk_mask,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.model_utils import DistributedCrossEntropy
+from nemo_rl.distributed.model_utils import (
+    DistributedCrossEntropy,
+    cp_shift_next,
+    group_all_reduce_sum,
+    vocab_parallel_full_log_softmax,
+    vocab_parallel_log_softmax,
+)
+from nemo_rl.models.dtensor.parallelize import to_local_if_dtensor
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
@@ -121,12 +131,12 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     use_importance_sampling_correction: bool = False
     # --- Truncated importance sampling ---
     # Type of truncated importance sampling:
-    #   "tis"          – clamp IS weights to max
+    #   "tis"          – clamp IS weights to [min, max], where min defaults to 0
     #   "icepop"       – zero out tokens with IS weight outside [min, max]
     #   "seq-mask-tis" – zero out sequences by geometric-mean IS ratio, non-truncated token IS correction
     truncated_importance_sampling_type: Optional[str] = None
     truncated_importance_sampling_ratio: Optional[float] = None
-    # Lower bound for ICE-POP / seq-mask-tis filtering
+    # Lower bound for TIS clipping, ICE-POP filtering, or seq-mask-tis filtering
     truncated_importance_sampling_ratio_min: Optional[float] = None
 
     # --- On-policy ---
@@ -223,7 +233,7 @@ class ClippedPGLossFn(LossFunction):
         self.truncated_importance_sampling_ratio = (
             cfg.truncated_importance_sampling_ratio
         )
-        # Lower bound for ICE-POP / seq-mask-tis filtering
+        # Lower bound for TIS clipping, ICE-POP filtering, or seq-mask-tis filtering
         self.truncated_importance_sampling_ratio_min = (
             cfg.truncated_importance_sampling_ratio_min
         )
@@ -279,6 +289,14 @@ class ClippedPGLossFn(LossFunction):
                 self.truncated_importance_sampling_ratio is not None
                 and self.truncated_importance_sampling_ratio > 0
             ), "truncated_importance_sampling_ratio should be positive"
+            if self.truncated_importance_sampling_ratio_min is not None:
+                assert (
+                    self.truncated_importance_sampling_ratio_min
+                    <= self.truncated_importance_sampling_ratio
+                ), (
+                    "truncated_importance_sampling_ratio_min must be <= "
+                    "truncated_importance_sampling_ratio"
+                )
             if self.truncated_importance_sampling_type in ("icepop", "seq-mask-tis"):
                 assert self.truncated_importance_sampling_ratio_min is not None, (
                     "truncated_importance_sampling_ratio_min should be set when truncated_importance_sampling_type is 'icepop' or 'seq-mask-tis'"
@@ -393,28 +411,31 @@ class ClippedPGLossFn(LossFunction):
             #   reweighting samples from π_gen_filtered to π_curr_unfiltered
 
             # On-policy KL approximation
+            # KL samples come from the optimized policy, so the KL loss must include
+            # the score-function gradient through the sampling probability; see
+            # https://arxiv.org/abs/2506.09477v1. In the non-IS case,
+            # exp(x - x.detach()) has forward value 1 while preserving that gradient.
             if self.use_on_policy_kl_approximation:
                 # See: docs/guides/grpo.md#on-policy-kl-approximation
                 kl_importance_weights = torch.exp(
                     curr_logprobs_unfiltered - generation_logprobs
-                ).detach()
-                kl_importance_weights = torch.nan_to_num(
-                    kl_importance_weights, nan=0.0, posinf=0.0, neginf=0.0
                 )
             else:
-                kl_importance_weights = torch.ones_like(curr_logprobs_unfiltered)
+                kl_importance_weights = torch.exp(
+                    curr_logprobs_unfiltered - curr_logprobs_unfiltered.detach()
+                )
+            kl_importance_weights = torch.nan_to_num(
+                kl_importance_weights, nan=0.0, posinf=0.0, neginf=0.0
+            )
 
             # Compute KL loss
-            kl = (
-                kl_importance_weights
-                * self.reference_policy_kl_penalty
-                * calculate_kl(
-                    logprobs=curr_logprobs_unfiltered,
-                    logprobs_reference=reference_policy_logprobs,
-                    kl_type=self.reference_policy_kl_type,
-                    input_clamp_value=self.kl_input_clamp_value,
-                    output_clamp_value=self.kl_output_clamp_value,
-                )
+            kl = self.reference_policy_kl_penalty * calculate_kl(
+                logprobs=curr_logprobs_unfiltered,
+                logprobs_reference=reference_policy_logprobs,
+                kl_type=self.reference_policy_kl_type,
+                input_clamp_value=self.kl_input_clamp_value,
+                output_clamp_value=self.kl_output_clamp_value,
+                importance_sampling_weights=kl_importance_weights,
             )
 
             # Reduce KL loss
@@ -498,7 +519,7 @@ class ClippedPGLossFn(LossFunction):
                 actor_importance_weights_expanded, nan=0.0, posinf=0.0, neginf=0.0
             )
         # ---- Truncated Importance Sampling ----
-        # "tis"          – clamp IS weights to [0, max]
+        # "tis"          – clamp IS weights to [min, max], where min defaults to 0
         # "icepop"       – zero out tokens whose IS weight ∉ [min, max]   (ref bounds: 0.5–5)
         # "seq-mask-tis" – zero out entire sequences whose geometric-mean
         #                  IS ratio ∉ [min, max]; retained sequences keep
@@ -510,10 +531,13 @@ class ClippedPGLossFn(LossFunction):
         # count, so the np.sum aggregation in grpo.py recovers the correct global fraction.
         if self.truncated_importance_sampling_ratio is not None:
             if self.truncated_importance_sampling_type == "tis":
+                tis_min = self.truncated_importance_sampling_ratio_min
+                if tis_min is None:
+                    tis_min = 0.0
                 token_oob_mask = (
                     actor_importance_weights_expanded
                     > self.truncated_importance_sampling_ratio
-                )
+                ) | (actor_importance_weights_expanded < tis_min)
                 _is_filter_metrics = {
                     "is_oob_ratio": masked_mean(
                         token_oob_mask.float(),
@@ -523,6 +547,7 @@ class ClippedPGLossFn(LossFunction):
                 }
                 actor_importance_weights_expanded = torch.clamp(
                     actor_importance_weights_expanded,
+                    min=tis_min,
                     max=self.truncated_importance_sampling_ratio,
                 )
             elif self.truncated_importance_sampling_type == "icepop":
@@ -850,12 +875,12 @@ class PreferenceLossFn(LossFunction):
         }
 
 
-class DPOLossConfig(TypedDict):
-    reference_policy_kl_penalty: float
-    preference_loss_weight: float
-    sft_loss_weight: float
-    preference_average_log_probs: bool
-    sft_average_log_probs: bool
+class DPOLossConfig(BaseModel, extra="allow"):
+    reference_policy_kl_penalty: float = 0.05
+    preference_loss_weight: float = 1.0
+    sft_loss_weight: float = 0.0
+    preference_average_log_probs: bool = False
+    sft_average_log_probs: bool = False
 
 
 class DPOLossDataDict(TypedDict):
@@ -927,11 +952,11 @@ class DPOLossFn(PreferenceLossFn):
     input_type = LossInputType.LOGPROB
 
     def __init__(self, cfg: DPOLossConfig, use_linear_ce_fusion: bool = False):
-        self.reference_policy_kl_penalty = cfg["reference_policy_kl_penalty"]
-        self.preference_loss_weight = cfg["preference_loss_weight"]
-        self.sft_loss_weight = cfg["sft_loss_weight"]
-        self.preference_average_log_probs = cfg["preference_average_log_probs"]
-        self.sft_average_log_probs = cfg["sft_average_log_probs"]
+        self.reference_policy_kl_penalty = cfg.reference_policy_kl_penalty
+        self.preference_loss_weight = cfg.preference_loss_weight
+        self.sft_loss_weight = cfg.sft_loss_weight
+        self.preference_average_log_probs = cfg.preference_average_log_probs
+        self.sft_average_log_probs = cfg.sft_average_log_probs
         self.use_linear_ce_fusion = use_linear_ce_fusion
         self.sft_loss = NLLLossFn(use_linear_ce_fusion=use_linear_ce_fusion)
 
@@ -1138,15 +1163,16 @@ class MseValueLossFn(LossFunction):
 
     def __call__(
         self,
-        values: torch.Tensor,
+        logits: torch.Tensor,
         data: BatchedDataDict,
         global_valid_seqs: torch.Tensor,
         global_valid_toks: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute Mean Squared Error value loss, optionally with clipping."""
         # Squeeze trailing singleton from value head output: [B, S, 1] -> [B, S]
-        if values.ndim > 2 and values.shape[-1] == 1:
-            values = values.squeeze(-1)
+        if logits.ndim > 2 and logits.shape[-1] == 1:
+            logits = logits.squeeze(-1)
+        values = logits
 
         token_mask = data["token_mask"]
         sample_mask = data["sample_mask"]
@@ -1294,33 +1320,10 @@ class CrossTokenizerDistillationLossConfig(TypedDict):
             sparse projection file) keeps V_s in lockstep with
             ``logits.shape[-1]`` when the file's highest student ids happen
             to be absent.
-        kd_loss_mode: Multi-teacher aggregation strategy. ``"sum"`` (default)
-            sums per-teacher weighted KL; ``"averaged_logits"`` averages
-            same-vocab teacher logits then takes one KL; ``"select_teacher"``
-            uses only the lowest-CE teacher. Inert for a single teacher.
-        sum_weights_metric: When set (``"ce"`` | ``"entropy"`` | ``"max_prob"``)
-            in ``"sum"`` mode, replaces the static per-teacher ``weight`` with
-            a dynamic softmax weight derived from that metric. ``None`` uses
-            the static config weights.
-        token_level_weights: When dynamic weighting is on, compute the softmax
-            weight per token (applied inside each teacher's KL) rather than a
-            single per-teacher scalar.
-        alpha: Softmax temperature on the dynamic teacher-weight scores.
-        normalize_teacher_by_vocab: Rescale both the weight-metric scores and
-            each teacher's KL by ``log(V_t_i) / log(min_j V_t_j)`` so
-            larger-vocab teachers are not under-weighted.
-        teacher_vocab_sizes: Per-teacher full vocab sizes, one per
-            ``teachers[i]``. Runtime-injected by ``setup`` from
+        teacher_vocab_size: Full teacher tokenizer vocab size, used to size
+            the projection matrix's teacher-side (V_t) axis. Runtime-injected
+            symmetrically to ``student_vocab_size`` from
             ``len(teacher_tokenizer)``; not a user knob in YAML.
-        projection_matrix_paths: Per-teacher projection paths (multi-teacher);
-            ``None`` entry marks a same-tokenizer teacher. Runtime-injected.
-        teacher_weights: Per-teacher static loss weights (multi-teacher).
-        teacher_send_full_logits: Per-teacher transport flags (multi-teacher);
-            same-vocab teachers with ``False`` ship top-K logits.
-        teacher_gold_loss: Per-teacher ``gold_loss`` overrides (``None`` =
-            use the global ``gold_loss``); honored only in ``"sum"`` mode.
-        teacher_xtoken_loss: Per-teacher ``xtoken_loss`` overrides, same
-            semantics as ``teacher_gold_loss``.
     """
 
     gold_loss: bool
@@ -1333,40 +1336,45 @@ class CrossTokenizerDistillationLossConfig(TypedDict):
     kl_loss_weight: float
     ce_loss_scale: float
     dynamic_loss_scaling: bool
-    kd_loss_mode: str
-    sum_weights_metric: NotRequired[Optional[str]]
-    token_level_weights: bool
-    alpha: float
-    normalize_teacher_by_vocab: bool
+    # Multi-teacher aggregation (user loss_fn knobs). gold_loss/xtoken_loss above
+    # are the global defaults; teachers[i].gold_loss / .xtoken_loss can override
+    # them per teacher in kd_loss_mode="sum".
+    kd_loss_mode: str  # "sum" | "averaged_logits" | "select_teacher"
+    normalize_teacher_by_vocab: bool  # sum-mode only: scale each teacher's KD by log(V_t_i)/log(min_j V_t_j)
+    alpha: float  # softmax temperature on dynamic teacher-weight scores (sum_weights_metric)
+    sum_weights_metric: NotRequired[
+        Optional[str]
+    ]  # "ce" | "entropy" | "max_prob"; None => static teacher_weights. sum-mode only.
+    # Runtime-injected by xtoken_off_policy_distillation.setup (parallel
+    # per-teacher lists + the student vocab size); not user loss_fn keys.
     student_vocab_size: NotRequired[int]
-    # Per-teacher metadata injected at runtime by
-    # ``xtoken_off_policy_distillation.setup`` (parallel to ``teachers``).
     teacher_vocab_sizes: NotRequired[list[int]]
     projection_matrix_paths: NotRequired[list[Optional[str]]]
     teacher_weights: NotRequired[list[float]]
-    teacher_send_full_logits: NotRequired[list[bool]]
     teacher_gold_loss: NotRequired[list[Optional[bool]]]
     teacher_xtoken_loss: NotRequired[list[Optional[bool]]]
 
 
 class CrossTokenizerDistillationLossDataDict(TypedDict):
-    """Student-side keys are stable; teacher-side keys are teacher-indexed.
+    """Student-side keys are fixed; teacher-side keys are teacher-indexed.
 
-    Only the student keys below are fixed. Each teacher ``i`` contributes a
-    dynamic set of keys produced by ``CrossTokenizerCollator`` / the trainer
-    and can't be enumerated statically here:
+    Only the student keys below are static. Each teacher ``i`` contributes a
+    dynamic set of keys produced by ``CrossTokenizerCollator`` / the trainer and
+    so cannot be enumerated here:
 
-    - Cross-tokenizer teacher: ``teacher_{i}_full_logits_ipc`` (List[B] of
-      CUDA IPC handle dicts from ``Policy.get_teacher_logits_ipc(mode="full")``),
-      ``teacher_{i}_input_ids`` / ``teacher_{i}_token_mask`` ``[B, T_t]``, and
-      ``alignment_{i}_*`` (``pair_valid`` / ``pair_is_correct``
-      ``[B, max_pairs]``; ``student_exact_partition_mask`` /
-      ``student_chunk_id`` ``[B, T_s]``; ``teacher_exact_partition_mask`` /
-      ``teacher_chunk_id`` ``[B, T_t]``; ``num_chunks`` ``[B]``).
-    - Same-vocab teacher: either ``teacher_{i}_full_logits_ipc`` (when
-      ``send_full_logits``) or ``teacher_{i}_topk_ipc`` (List[B] of CUDA IPC
-      handle dicts carrying the top-K value / index buffers); no
-      ``alignment_{i}_*`` (it reuses the student tokenization, identity-aligned).
+    - Every teacher: ``teacher_{i}_full_logits_ipc`` — List[B] of CUDA IPC handle
+      dicts (``payload_ipc`` + ``buf_idx``/``sample_index_in_buf`` + TP/CP shard
+      metadata) from ``Policy.get_full_logits_ipc``.
+      ``rebuild_teacher_full_logits_from_ipc`` (in ``prepare_loss_input``)
+      P2P-reads and reassembles full-vocab teacher logits, routing across
+      heterogeneous teacher/student TP/CP.
+    - Cross-tokenizer teacher only: ``teacher_{i}_input_ids`` /
+      ``teacher_{i}_token_mask`` ``[B, T_t]`` and ``alignment_{i}_*``
+      (``pair_valid`` / ``pair_is_correct`` ``[B, max_pairs]``;
+      ``student_chunk_id`` ``[B, T_s]``; ``teacher_chunk_id`` ``[B, T_t]``;
+      partition masks; ``num_chunks``).
+    - Same-tokenizer teacher: no ``teacher_{i}_input_ids`` / ``alignment_{i}_*``;
+      it reuses the student tokenization (identity 1:1 aligned).
     """
 
     input_ids: torch.Tensor
@@ -1401,21 +1409,24 @@ class CrossTokenizerDistillationLossFn(LossFunction):
     inside the gold path and is undefined for P-KL.
 
     Multi-teacher: ``setup`` injects per-teacher metadata (projection paths,
-    weights, vocab sizes, transport, per-teacher gold/xtoken overrides). The
-    per-teacher KD terms are aggregated by ``kd_loss_mode`` (``sum`` /
-    ``averaged_logits`` / ``select_teacher``) and combined with a single
-    student CE term. A teacher with a ``None`` projection path is a
-    *same-tokenizer* teacher: projection and alignment are skipped and its KD
-    term is a direct per-position KL on the shared vocab (full-vocab or top-K
-    by ``send_full_logits``). The single-teacher path is just ``N == 1``.
+    weights, vocab sizes, per-teacher gold/xtoken overrides). The per-teacher KD
+    terms are aggregated by ``kd_loss_mode`` (``sum`` / ``averaged_logits`` /
+    ``select_teacher``) and combined with a single student CE term. A teacher
+    with a ``None`` projection path is a *same-tokenizer* teacher: projection and
+    alignment are skipped and its KD term is a direct top-k per-position KL on the
+    shared vocab (top-k selected student-side over the reassembled full-vocab
+    teacher logits). The single-teacher path is just ``num_teachers == 1``.
 
     Inputs (via ``LossInputType.DISTILLATION_CROSS_TOKENIZER``):
         logits: ``[B, T_s, V_s]`` raw student logits from the worker forward.
-        teacher_full_logits_by_idx: ``dict[int, [B, T, V_t]]`` full-vocab
-            teacher logits per full-logits teacher, rebuilt from the CUDA IPC
-            handles by ``prepare_loss_input`` (see
+        student_logits_contig: CP-relaid contiguous student logits shared by
+            every teacher's KD term.
+        teacher_full_logits_by_idx: ``dict[int, [B, T, V_t]]`` full-vocab teacher
+            logits per teacher, rebuilt from the CUDA IPC handles by
+            ``prepare_loss_input`` (see
             :func:`nemo_rl.algorithms.x_token.loss_utils.rebuild_teacher_full_logits_from_ipc`).
-            Same-vocab top-K teachers are read from ``data`` instead.
+        aligns_by_idx: ``dict[int, LocalizedAlignment]`` per teacher (cross-tok:
+            localized chunk alignment; same-tok: thin, student fields only).
 
     Inputs (via ``data: BatchedDataDict``):
         See :class:`CrossTokenizerDistillationLossDataDict`.
@@ -1423,9 +1434,9 @@ class CrossTokenizerDistillationLossFn(LossFunction):
     Returns:
         ``(loss, metrics)``. Aggregate metrics: ``loss``, ``kl_loss`` (the
         aggregated KD term), ``ce_loss``, ``kl_loss_scale``, ``accuracy``,
-        ``num_valid_samples``. Per-teacher metrics are suffixed ``_t{i}``
-        (e.g. ``kl_loss_t0``, ``proj_accuracy_t0``, ``weight_t0``);
-        ``select_teacher`` additionally reports ``selected_teacher``.
+        ``num_valid_samples``. Per-teacher metrics are suffixed ``_t{i}`` (e.g.
+        ``kl_loss_t0``, ``proj_accuracy_t0``, ``weight_t0``); ``select_teacher``
+        additionally reports ``selected_teacher``.
     """
 
     loss_type = LossType.TOKEN_LEVEL
@@ -1439,23 +1450,19 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 "threshold and adds collision resolution) and is undefined "
                 "in the P-KL path."
             )
-        # Dynamic teacher weighting (sum_weights_metric) is only applied in
-        # kd_loss_mode="sum"; averaged_logits and select_teacher use static
-        # per-teacher weights. Reject the combo instead of silently dropping
-        # the metric.
+        # Dynamic teacher weighting (sum_weights_metric) and normalize_teacher_by_vocab
+        # are only applied in kd_loss_mode="sum"; reject the combo instead of
+        # silently ignoring them under the other modes.
         if cfg.get("sum_weights_metric") is not None and cfg["kd_loss_mode"] != "sum":
             raise ValueError(
-                f"sum_weights_metric={cfg['sum_weights_metric']!r} is only "
-                f"applied in kd_loss_mode='sum'; it is ignored by "
-                f"'{cfg['kd_loss_mode']}'. Unset one of them."
+                f"sum_weights_metric={cfg['sum_weights_metric']!r} is only applied "
+                f"in kd_loss_mode='sum'; it is ignored by '{cfg['kd_loss_mode']}'. "
+                "Unset one of them."
             )
-        # normalize_teacher_by_vocab is likewise only applied in
-        # kd_loss_mode="sum"; reject it elsewhere instead of silently ignoring.
         if cfg.get("normalize_teacher_by_vocab") and cfg["kd_loss_mode"] != "sum":
             raise ValueError(
-                f"normalize_teacher_by_vocab is only applied in "
-                f"kd_loss_mode='sum'; it is ignored by '{cfg['kd_loss_mode']}'. "
-                f"Unset one of them."
+                "normalize_teacher_by_vocab is only applied in kd_loss_mode='sum'; "
+                f"it is ignored by '{cfg['kd_loss_mode']}'. Unset one of them."
             )
         # Global loss knobs (shared across all teachers).
         self.gold_loss = cfg["gold_loss"]
@@ -1471,17 +1478,17 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         self.student_vocab_size = cfg["student_vocab_size"]
         # Multi-teacher aggregation knobs.
         self.kd_loss_mode = cfg["kd_loss_mode"]
-        # sum_weights_metric is NotRequired -> None means static weights.
-        self.sum_weights_metric = cfg.get("sum_weights_metric")
-        self.token_level_weights = cfg["token_level_weights"]
-        self.alpha = cfg["alpha"]
         self.normalize_teacher_by_vocab = cfg["normalize_teacher_by_vocab"]
+        self.alpha = cfg["alpha"]
+        # sum_weights_metric is NotRequired -> None means static teacher_weights.
+        self.sum_weights_metric = cfg.get("sum_weights_metric")
         # Per-teacher metadata: parallel lists (one entry per ``teachers[i]``),
-        # injected by ``xtoken_off_policy_distillation.setup``.
+        # injected by ``xtoken_off_policy_distillation.setup``. Every teacher ships
+        # full-vocab logits (the loss derives the top-k subset student-side), so
+        # there is no per-teacher ``send_full_logits`` flag.
         self.projection_matrix_paths = list(cfg["projection_matrix_paths"])
         self.teacher_vocab_sizes = list(cfg["teacher_vocab_sizes"])
         self.teacher_weights = list(cfg["teacher_weights"])
-        self.teacher_send_full_logits = list(cfg["teacher_send_full_logits"])
         self.teacher_gold_loss = list(cfg["teacher_gold_loss"])
         self.teacher_xtoken_loss = list(cfg["teacher_xtoken_loss"])
         # Every per-teacher list must have the same length (one entry per
@@ -1491,7 +1498,6 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             "projection_matrix_paths": len(self.projection_matrix_paths),
             "teacher_vocab_sizes": len(self.teacher_vocab_sizes),
             "teacher_weights": len(self.teacher_weights),
-            "teacher_send_full_logits": len(self.teacher_send_full_logits),
             "teacher_gold_loss": len(self.teacher_gold_loss),
             "teacher_xtoken_loss": len(self.teacher_xtoken_loss),
         }
@@ -1500,30 +1506,6 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 f"per-teacher lists must be equal length, got {per_teacher_lens}"
             )
         self.num_teachers = len(self.projection_matrix_paths)
-        # A teacher ships full-vocab logits via IPC iff it is cross-tokenizer
-        # (projection needs them) or it is same-vocab with send_full_logits.
-        # Same-vocab top-K teachers ship teacher_{i}_topk_* tensors instead.
-        self.teacher_ships_full = [
-            (self.projection_matrix_paths[i] is not None)
-            or self.teacher_send_full_logits[i]
-            for i in range(self.num_teachers)
-        ]
-        # select_teacher and dynamic weighting (sum_weights_metric) score every
-        # teacher from its full vocab distribution, so a same-vocab teacher that
-        # ships only top-K (send_full_logits=False) cannot be scored. Reject at
-        # construction instead of raising NotImplementedError at the first step.
-        if (
-            self.kd_loss_mode == "select_teacher" or self.sum_weights_metric is not None
-        ) and not all(self.teacher_ships_full):
-            offenders = [
-                i for i, ships in enumerate(self.teacher_ships_full) if not ships
-            ]
-            raise ValueError(
-                f"kd_loss_mode={self.kd_loss_mode!r} / sum_weights_metric="
-                f"{self.sum_weights_metric!r} scores every teacher and needs full "
-                f"teacher logits, but teachers {offenders} are same-vocab top-K "
-                "(send_full_logits=False). Set send_full_logits=true for them."
-            )
         # The materialized projection matrix and the derived exact-map
         # partition both live in process-local caches in
         # ``x_token.loss_utils`` (see ``get_sparse_projection_matrix``,
@@ -1533,7 +1515,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         # the same worker share one load.
 
     def _teacher_is_same_vocab(self, i: int) -> bool:
-        """A null projection path marks a same-tokenizer teacher."""
+        """A teacher is same-vocab (direct KL, no projection) iff its path is None."""
         return self.projection_matrix_paths[i] is None
 
     def __call__(
@@ -1542,50 +1524,64 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         global_valid_seqs: torch.Tensor,
         global_valid_toks: torch.Tensor,
         logits: torch.Tensor,
+        student_logits_contig: torch.Tensor,
         teacher_full_logits_by_idx: dict[int, torch.Tensor],
+        aligns_by_idx: dict[int, LocalizedAlignment],
+        *,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute the (multi-teacher) cross-tokenizer distillation loss.
 
-        Per-teacher KL terms are aggregated per ``kd_loss_mode`` and combined
+        Per-teacher KD terms are aggregated per ``kd_loss_mode`` and combined
         with a single student next-token CE term — dynamic-scaled when
         ``dynamic_loss_scaling`` is set (KD rescaled to match the detached CE
         magnitude, ``kl_loss_weight`` / ``ce_loss_scale`` ignored), else
-        fixed-weighted.
+        fixed-weighted. The single-teacher path is just ``num_teachers == 1``.
 
-        ``teacher_full_logits_by_idx`` maps teacher index -> rebuilt
-        ``[B, T, V_t]`` full-vocab logits for every full-logits teacher (all
-        cross-tokenizer teachers + same-vocab teachers with
-        ``send_full_logits=True``). Same-vocab top-K teachers are read from the
-        data dict (``teacher_{i}_topk_logits`` / ``_topk_indices``).
+        ``student_logits_contig`` (CP-relaid) and the per-teacher ``aligns_by_idx``
+        / ``teacher_full_logits_by_idx`` are precomputed in ``prepare_loss_input``;
+        the raw ``logits`` is kept for the CE term.
         """
-        if self.token_level_weights:
-            raise NotImplementedError(
-                "token_level_weights=True is not yet supported. Static weights "
-                "and sequence-level dynamic weights (sum_weights_metric with "
-                "token_level_weights=False) are. Token-level weighting requires "
-                "mapping per-chunk KL back to teacher token positions and equal "
-                "sequence lengths across teachers; tracked as follow-up."
-            )
-
         ce_loss = self._compute_ce(logits, data, global_valid_toks)
 
         if self.kd_loss_mode == "sum":
             total_kd, per_teacher_metrics = self._sum_kd(
-                logits, data, teacher_full_logits_by_idx, global_valid_toks
+                student_logits_contig,
+                data,
+                teacher_full_logits_by_idx,
+                aligns_by_idx,
+                global_valid_toks,
+                tp_group=tp_group,
+                cp_group=cp_group,
             )
         elif self.kd_loss_mode == "averaged_logits":
             total_kd, per_teacher_metrics = self._averaged_logits_kd(
-                logits, data, teacher_full_logits_by_idx, global_valid_toks
+                student_logits_contig,
+                data,
+                teacher_full_logits_by_idx,
+                aligns_by_idx,
+                global_valid_toks,
+                tp_group=tp_group,
+                cp_group=cp_group,
             )
         elif self.kd_loss_mode == "select_teacher":
             total_kd, per_teacher_metrics = self._select_teacher_kd(
-                logits, data, teacher_full_logits_by_idx, global_valid_toks
+                student_logits_contig,
+                data,
+                teacher_full_logits_by_idx,
+                aligns_by_idx,
+                global_valid_toks,
+                tp_group=tp_group,
+                cp_group=cp_group,
             )
         else:
             raise ValueError(f"Unknown kd_loss_mode: {self.kd_loss_mode!r}")
 
         # Combine the aggregated KD term with the single student CE term.
         if self.dynamic_loss_scaling:
+            # loss = sg(ce/kd) * kd + ce; user kl_loss_weight / ce_loss_scale
+            # are intentionally ignored in this branch.
             kd_detached = total_kd.detach().abs()
             ce_detached = ce_loss.detach().abs()
             kl_scale = torch.where(
@@ -1595,28 +1591,30 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             )
             loss = kl_scale * total_kd + ce_loss
         else:
-            kl_scale = torch.tensor(1.0, device=total_kd.device, dtype=total_kd.dtype)
+            kl_scale = torch.tensor(
+                1.0, device=total_kd.device, dtype=total_kd.dtype
+            )
             loss = self.kl_loss_weight * total_kd + self.ce_loss_scale * ce_loss
 
-        # Student next-token accuracy (quick per-step signal), masked to valid
-        # tokens.
-        with torch.no_grad():
-            student_argmax = logits[:, :-1].argmax(dim=-1)
-            shift_labels = data["input_ids"][:, 1:]
-            acc_mask = (
-                data["token_mask"][:, 1:].float()
-                * data["sample_mask"].unsqueeze(-1).float()
-            )
-            denom = acc_mask.sum().clamp(min=1.0)
-            accuracy = (
-                (student_argmax == shift_labels).float() * acc_mask
-            ).sum() / denom
+        # Next-token accuracy on the student side (quick per-step signal), masked
+        # to valid tokens. Computed once on the student from the shared CP-relaid
+        # fields (carried on every teacher's align); the CP-aware shift pairs
+        # predictors with the right labels under load-balanced sharding.
+        align0 = aligns_by_idx[0]
+        accuracy = next_token_accuracy(
+            student_logits_contig,
+            input_ids=align0.student_input_ids,
+            token_mask=align0.student_token_mask,
+            sample_mask=data["sample_mask"],
+            tp_group=tp_group,
+            cp_group=cp_group,
+        )
 
         metrics: dict[str, Any] = {
             "loss": loss.item(),
             # Aggregate KD term (kept under ``kl_loss`` so existing trainer
-            # metric handling continues to work); per-teacher terms are
-            # suffixed ``_t{i}``.
+            # metric handling continues to work); per-teacher terms are suffixed
+            # ``_t{i}``.
             "kl_loss": total_kd.item(),
             "ce_loss": ce_loss.item(),
             "kl_loss_scale": kl_scale.item(),
@@ -1653,41 +1651,52 @@ class CrossTokenizerDistillationLossFn(LossFunction):
     def _compute_teacher_kd(
         self,
         i: int,
-        logits: torch.Tensor,
+        student_logits_contig: torch.Tensor,
         data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
         teacher_full_logits_by_idx: dict[int, torch.Tensor],
+        aligns_by_idx: dict[int, LocalizedAlignment],
         global_valid_toks: torch.Tensor,
         *,
         use_per_teacher_flags: bool,
+        tp_group: Optional[torch.distributed.ProcessGroup],
+        cp_group: Optional[torch.distributed.ProcessGroup],
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """KD term for teacher ``i`` plus its (unsuffixed) metrics.
 
-        Dispatches on transport: same-vocab -> direct per-position KL;
-        cross-tokenizer -> P-KL or gold path using teacher ``i``'s projection
-        and ``alignment_{i}_*`` keys.
+        Dispatches on tokenizer kind: same-vocab -> direct top-k per-position KL;
+        cross-tokenizer -> P-KL or gold path using teacher ``i``'s projection and
+        its localized alignment. Both consume the shared CP-relaid student logits
+        and route TP/CP through main's parameterized loss-mode helpers.
         """
         if self._teacher_is_same_vocab(i):
             return self._compute_same_vocab_kl(
-                i, logits, data, teacher_full_logits_by_idx, global_valid_toks
+                i,
+                student_logits_contig,
+                teacher_full_logits_by_idx[i],
+                aligns_by_idx[i],
+                global_valid_toks,
+                tp_group=tp_group,
+                cp_group=cp_group,
             )
 
         teacher_logits = teacher_full_logits_by_idx[i]
+        align = aligns_by_idx[i]
         proj_path = self.projection_matrix_paths[i]
         v_t = self.teacher_vocab_sizes[i]
-        prefix = f"alignment_{i}_"
         gold, xtoken = self._resolve_gold_xtoken(i, use_per_teacher_flags)
         if xtoken and not gold:
             raise ValueError(f"teacher {i}: xtoken_loss=True requires gold_loss=True.")
 
         if gold:
             kd, kl_common, l1_uncommon, num_valid_chunks, top1 = self._compute_gold(
-                logits,
-                data,
+                student_logits_contig,
                 teacher_logits,
+                align,
                 projection_matrix_path=proj_path,
                 teacher_vocab_size=v_t,
                 xtoken_loss=xtoken,
-                alignment_prefix=prefix,
+                tp_group=tp_group,
+                cp_group=cp_group,
             )
             return kd, {
                 "kl_loss": kd.item(),
@@ -1698,12 +1707,13 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             }
 
         kl, num_valid_pairs, proj_acc = self._compute_p_kl(
-            logits,
-            data,
+            student_logits_contig,
             teacher_logits,
+            align,
             projection_matrix_path=proj_path,
             teacher_vocab_size=v_t,
-            alignment_prefix=prefix,
+            tp_group=tp_group,
+            cp_group=cp_group,
         )
         return kl, {
             "kl_loss": kl.item(),
@@ -1714,105 +1724,147 @@ class CrossTokenizerDistillationLossFn(LossFunction):
     def _compute_same_vocab_kl(
         self,
         i: int,
-        logits: torch.Tensor,
-        data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
-        teacher_full_logits_by_idx: dict[int, torch.Tensor],
+        student_logits_contig: torch.Tensor,
+        teacher_full_logits: torch.Tensor,
+        align: LocalizedAlignment,
         global_valid_toks: torch.Tensor,
+        *,
+        tp_group: Optional[torch.distributed.ProcessGroup],
+        cp_group: Optional[torch.distributed.ProcessGroup],
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        """Direct per-position KL for a same-tokenizer teacher.
+        """Direct top-k per-position KL for a same-tokenizer teacher.
 
         Identical tokenizer => teacher tokens == student tokens (identity
-        position alignment), so no projection / no chunk-averaging. Reduction
+        position alignment), so no projection / no chunk-averaging. The reduction
         matches CE: masked next-token mean normalized by ``global_valid_toks``,
         scaled by ``T**2``.
         """
-        if self.teacher_send_full_logits[i]:
-            kd = self._direct_full_vocab_kl(
-                logits, data, teacher_full_logits_by_idx[i], global_valid_toks
-            )
-        else:
-            kd = self._direct_topk_kl(
-                logits,
-                data,
-                data[f"teacher_{i}_topk_logits"],
-                data[f"teacher_{i}_topk_indices"],
-                global_valid_toks,
-            )
+        kd = self._direct_topk_kl(
+            student_logits_contig,
+            teacher_full_logits,
+            align,
+            global_valid_toks,
+            tp_group=tp_group,
+            cp_group=cp_group,
+        )
         return kd, {"kl_loss": kd.item()}
-
-    def _direct_full_vocab_kl(
-        self,
-        logits: torch.Tensor,
-        data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
-        teacher_logits: torch.Tensor,
-        global_valid_toks: torch.Tensor,
-    ) -> torch.Tensor:
-        """Full-vocab per-position KL on a shared vocab (same tokenizer)."""
-        T = self.temperature
-        student_log_probs = torch.log_softmax(logits.float() / T, dim=-1)
-        v_s = student_log_probs.shape[-1]
-        teacher = teacher_logits.float()
-        # HF lm_head may pad out_features beyond len(tokenizer); the shared
-        # tokenizer vocab is the student width, so drop padded columns.
-        if teacher.shape[-1] > v_s:
-            teacher = teacher[..., :v_s]
-        teacher_log_probs = torch.log_softmax(teacher / T, dim=-1)
-        s = student_log_probs[:, :-1, :]
-        t = teacher_log_probs[:, :-1, :]
-        if self.reverse_kl:
-            per_pos = torch.nn.functional.kl_div(
-                t, s, reduction="none", log_target=True
-            ).sum(dim=-1)
-        else:
-            per_pos = torch.nn.functional.kl_div(
-                s, t, reduction="none", log_target=True
-            ).sum(dim=-1)
-        mask = (
-            data["token_mask"][:, 1:].float()
-            * data["sample_mask"].unsqueeze(-1).float()
-        )
-        return (
-            masked_mean(per_pos, mask, global_normalization_factor=global_valid_toks)
-            * T
-            * T
-        )
 
     def _direct_topk_kl(
         self,
-        logits: torch.Tensor,
-        data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
-        topk_logits: torch.Tensor,
-        topk_indices: torch.Tensor,
+        student_logits: torch.Tensor,
+        teacher_full_logits: torch.Tensor,
+        align: LocalizedAlignment,
         global_valid_toks: torch.Tensor,
+        *,
+        tp_group: Optional[torch.distributed.ProcessGroup],
+        cp_group: Optional[torch.distributed.ProcessGroup],
     ) -> torch.Tensor:
-        """Top-K per-position KL on a shared vocab (same tokenizer).
+        """Top-K per-position KL on a shared vocab (same tokenizer), TP/CP-aware.
 
-        Both sides are renormalized within the teacher's top-K support, so the
-        KL is well-defined over a common ``k``-column subset.
+        Top-K columns are selected at the student from the reassembled full-vocab
+        teacher logits (``select_teacher_topk_indices`` MAX-reduces across CP so
+        every CP rank agrees on the same columns). The student is gathered to full
+        vocab across TP (``vocab_parallel_full_log_softmax``) *before* slicing —
+        slicing a TP-local shard would pick the wrong columns. Both sides are
+        renormalized within the K-subset (the teacher's subset-softmax and the
+        student's full-then-renorm are mathematically identical, the full-vocab
+        partition function cancels). The masked next-token mean is normalized by
+        the CP/DP-global valid-token count, exactly like the CE term; at CP=1 the
+        ``cp_shift_next`` mask reduces to the ``token_mask[:, 1:]`` next-token
+        shift.
         """
         T = self.temperature
-        student_log_probs = torch.log_softmax(logits.float() / T, dim=-1)
-        teacher_log_probs = torch.log_softmax(topk_logits.float() / T, dim=-1)
-        # Indices arrive int32 over IPC (or int64 on the legacy path); gather
-        # requires int64.
-        student_gathered = torch.gather(student_log_probs, -1, topk_indices.long())
+        # Drop HF lm_head padding beyond the shared tokenizer vocab.
+        v_s = self.student_vocab_size
+        teacher = teacher_full_logits
+        if teacher.shape[-1] > v_s:
+            teacher = teacher[..., :v_s]
+        vocab_topk = min(self.vocab_topk, teacher.shape[-1])
+        topk_idx = select_teacher_topk_indices(teacher, vocab_topk, cp_group=cp_group)
+
+        student_log_probs = vocab_parallel_full_log_softmax(
+            student_logits, T, tp_group=tp_group
+        )
+        student_gathered = student_log_probs[..., topk_idx]
         student_log_probs_k = student_gathered - torch.logsumexp(
             student_gathered, dim=-1, keepdim=True
         )
-        s = student_log_probs_k[:, :-1, :]
-        t = teacher_log_probs[:, :-1, :]
+        teacher_log_probs_k = torch.log_softmax(
+            teacher[..., topk_idx].float() / T, dim=-1
+        )
         if self.reverse_kl:
             per_pos = torch.nn.functional.kl_div(
-                t, s, reduction="none", log_target=True
+                teacher_log_probs_k,
+                student_log_probs_k,
+                reduction="none",
+                log_target=True,
             ).sum(dim=-1)
         else:
             per_pos = torch.nn.functional.kl_div(
-                s, t, reduction="none", log_target=True
+                student_log_probs_k,
+                teacher_log_probs_k,
+                reduction="none",
+                log_target=True,
             ).sum(dim=-1)
-        mask = (
-            data["token_mask"][:, 1:].float()
-            * data["sample_mask"].unsqueeze(-1).float()
+        return self._same_vocab_masked_kl(per_pos, align, global_valid_toks, cp_group)
+
+    def _direct_full_vocab_kl(
+        self,
+        student_logits: torch.Tensor,
+        teacher_logits: torch.Tensor,
+        align: LocalizedAlignment,
+        global_valid_toks: torch.Tensor,
+        *,
+        tp_group: Optional[torch.distributed.ProcessGroup],
+        cp_group: Optional[torch.distributed.ProcessGroup],
+    ) -> torch.Tensor:
+        """Full-vocab per-position KL on a shared vocab (same tokenizer), TP/CP-aware.
+
+        Used by ``averaged_logits`` over the convex-averaged teacher logits. The
+        student is gathered to full vocab across TP; the teacher (already full
+        vocab) is sliced to the student width to drop HF lm_head padding.
+        """
+        T = self.temperature
+        student_log_probs = vocab_parallel_full_log_softmax(
+            student_logits, T, tp_group=tp_group
         )
+        v_s = student_log_probs.shape[-1]
+        teacher = teacher_logits.float()
+        if teacher.shape[-1] > v_s:
+            teacher = teacher[..., :v_s]
+        teacher_log_probs = torch.log_softmax(teacher / T, dim=-1)
+        if self.reverse_kl:
+            per_pos = torch.nn.functional.kl_div(
+                teacher_log_probs, student_log_probs, reduction="none", log_target=True
+            ).sum(dim=-1)
+        else:
+            per_pos = torch.nn.functional.kl_div(
+                student_log_probs, teacher_log_probs, reduction="none", log_target=True
+            ).sum(dim=-1)
+        return self._same_vocab_masked_kl(per_pos, align, global_valid_toks, cp_group)
+
+    def _same_vocab_masked_kl(
+        self,
+        per_pos: torch.Tensor,
+        align: LocalizedAlignment,
+        global_valid_toks: torch.Tensor,
+        cp_group: Optional[torch.distributed.ProcessGroup],
+    ) -> torch.Tensor:
+        """Masked next-token mean of a per-position KL (same-tokenizer reduction).
+
+        ``per_pos`` is the per-position KL on this CP rank's contiguous window
+        (student and teacher are position-aligned). The CP-aware next-token shift
+        (:func:`cp_shift_next`) selects positions whose target token (p+1) is a
+        valid label — at CP=1 this is the plain ``token_mask[:, 1:]`` shift, the
+        global-last position dropped via ``fill=0``. Reduction matches CE:
+        ``masked_mean`` over ``global_valid_toks``, scaled by ``T**2``.
+        """
+        T = self.temperature
+        next_mask = cp_shift_next(
+            to_local_if_dtensor(align.student_token_mask), cp_group, fill=0
+        )
+        sample_mask = to_local_if_dtensor(align.sample_mask)
+        mask = next_mask.float() * sample_mask.unsqueeze(-1).float()
         return (
             masked_mean(per_pos, mask, global_normalization_factor=global_valid_toks)
             * T
@@ -1821,24 +1873,33 @@ class CrossTokenizerDistillationLossFn(LossFunction):
 
     def _sum_kd(
         self,
-        logits: torch.Tensor,
+        student_logits_contig: torch.Tensor,
         data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
         teacher_full_logits_by_idx: dict[int, torch.Tensor],
+        aligns_by_idx: dict[int, LocalizedAlignment],
         global_valid_toks: torch.Tensor,
+        *,
+        tp_group: Optional[torch.distributed.ProcessGroup],
+        cp_group: Optional[torch.distributed.ProcessGroup],
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Weighted sum: ``total_kd = Σ_i weight_i · KD_i``.
 
-        Weights are static (config ``weight``) or dynamic
-        (``sum_weights_metric``). When ``normalize_teacher_by_vocab`` is set,
-        each teacher's KD is additionally scaled by
-        ``log(V_t_i) / log(min_j V_t_j)``.
+        Weights are static (config ``weight``) or dynamic (``sum_weights_metric``).
+        When ``normalize_teacher_by_vocab`` is set, each teacher's KD is
+        additionally scaled by ``log(V_t_i) / log(min_j V_t_j)``.
         """
-        device = logits.device
+        device = student_logits_contig.device
         if self.sum_weights_metric is not None:
-            weights = self._compute_dynamic_weights(data, teacher_full_logits_by_idx)
+            weights = self._compute_dynamic_weights(
+                data, teacher_full_logits_by_idx, aligns_by_idx
+            )
         else:
             weights = [
-                torch.tensor(self.teacher_weights[i], device=device, dtype=logits.dtype)
+                torch.tensor(
+                    self.teacher_weights[i],
+                    device=device,
+                    dtype=student_logits_contig.dtype,
+                )
                 for i in range(self.num_teachers)
             ]
 
@@ -1850,15 +1911,18 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         total_kd: Optional[torch.Tensor] = None
         per_metrics: dict[str, Any] = {}
         # Deterministic teacher order: each teacher's KD fires its own
-        # dp_all_reduce_sum collective, so the order must match across ranks.
+        # collectives, so the order must match across ranks.
         for i in range(self.num_teachers):
             kd_i, m_i = self._compute_teacher_kd(
                 i,
-                logits,
+                student_logits_contig,
                 data,
                 teacher_full_logits_by_idx,
+                aligns_by_idx,
                 global_valid_toks,
                 use_per_teacher_flags=True,
+                tp_group=tp_group,
+                cp_group=cp_group,
             )
             weighted = kd_i * weights[i]
             if self.normalize_teacher_by_vocab:
@@ -1878,15 +1942,19 @@ class CrossTokenizerDistillationLossFn(LossFunction):
 
     def _averaged_logits_kd(
         self,
-        logits: torch.Tensor,
+        student_logits_contig: torch.Tensor,
         data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
         teacher_full_logits_by_idx: dict[int, torch.Tensor],
+        aligns_by_idx: dict[int, LocalizedAlignment],
         global_valid_toks: torch.Tensor,
+        *,
+        tp_group: Optional[torch.distributed.ProcessGroup],
+        cp_group: Optional[torch.distributed.ProcessGroup],
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Convex-weighted average of teacher logits, then one direct KL.
 
-        Valid only when all teachers ship full logits of identical shape
-        (same-vocab teachers). Otherwise falls back to PT's plain
+        Valid only when all teachers are same-tokenizer (no projection) and ship
+        full logits of identical shape. Otherwise falls back to a plain
         static-weight sum (no dynamic weights, no ``normalize_teacher_by_vocab``).
         """
         full = [teacher_full_logits_by_idx.get(i) for i in range(self.num_teachers)]
@@ -1897,7 +1965,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         # is insufficient.
         same_tokenizer = all(p is None for p in self.projection_matrix_paths)
         same_shape = all(f is not None for f in full) and (
-            len({tuple(f.shape) for f in full}) == 1
+            len({tuple(f.shape) for f in full if f is not None}) == 1
         )
         if not (same_tokenizer and same_shape):
             total_kd: Optional[torch.Tensor] = None
@@ -1905,11 +1973,14 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             for i in range(self.num_teachers):
                 kd_i, m_i = self._compute_teacher_kd(
                     i,
-                    logits,
+                    student_logits_contig,
                     data,
                     teacher_full_logits_by_idx,
+                    aligns_by_idx,
                     global_valid_toks,
                     use_per_teacher_flags=False,
+                    tp_group=tp_group,
+                    cp_group=cp_group,
                 )
                 w = self.teacher_weights[i]
                 weighted = kd_i * w
@@ -1923,45 +1994,59 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         total_w = sum(self.teacher_weights)
         avg: Optional[torch.Tensor] = None
         for i, f in enumerate(full):
+            assert f is not None
             contrib = f.float() * (self.teacher_weights[i] / total_w)
             avg = contrib if avg is None else avg + contrib
         assert avg is not None
-        kd = self._direct_full_vocab_kl(logits, data, avg, global_valid_toks)
+        kd = self._direct_full_vocab_kl(
+            student_logits_contig,
+            avg,
+            aligns_by_idx[0],
+            global_valid_toks,
+            tp_group=tp_group,
+            cp_group=cp_group,
+        )
         return kd, {"kl_loss": kd.item()}
 
     def _dp_global_masked_mean(
         self, values: torch.Tensor, mask: torch.Tensor
     ) -> torch.Tensor:
-        """Masked mean of ``values`` over the *DP-global* valid count.
+        """Masked mean of ``values`` over the *process-global* valid count.
 
-        Teacher selection / dynamic weighting must be identical on every DP
-        rank. A rank-local mean is computed on that rank's shard only, so
-        ranks can pick a different teacher / different weights; the per-teacher
-        KD's ``dp_all_reduce_sum`` then sees divergent participation across
-        ranks (deadlock when one rank's choice fires a collective another's
-        does not, or a mixed reduction otherwise). All-reduce the masked sum
-        and the mask count across DP so every rank gets the same score
-        (mirrors the ``global_valid_toks`` convention). The result is detached
-        (it gates selection / weighting and is not back-propagated, matching
-        the reference's ``no_grad`` scoring).
+        Teacher selection / dynamic weighting must be identical on every rank: a
+        rank-local mean lets ranks pick a different teacher / different weights,
+        and the per-teacher KD's collectives then see divergent participation
+        (deadlock when one rank's choice fires a collective another's does not).
+        All-reduce the masked sum and the mask count over the full group so every
+        rank gets the same score (mirrors ``_compute_p_kl``'s WORLD-reduced
+        denominator). The result is detached (it gates selection / weighting and
+        is not back-propagated).
         """
-        num = dp_all_reduce_sum((values * mask).sum())
-        den = dp_all_reduce_sum(mask.sum()).clamp(min=1.0)
+        num = group_all_reduce_sum(
+            (values * mask).sum(), group=torch.distributed.group.WORLD
+        )
+        den = group_all_reduce_sum(
+            mask.sum(), group=torch.distributed.group.WORLD
+        ).clamp(min=1.0)
         return num / den
 
     def _select_teacher_kd(
         self,
-        logits: torch.Tensor,
+        student_logits_contig: torch.Tensor,
         data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
         teacher_full_logits_by_idx: dict[int, torch.Tensor],
+        aligns_by_idx: dict[int, LocalizedAlignment],
         global_valid_toks: torch.Tensor,
+        *,
+        tp_group: Optional[torch.distributed.ProcessGroup],
+        cp_group: Optional[torch.distributed.ProcessGroup],
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Use only the teacher with the lowest next-token CE on its own tokens."""
         with torch.no_grad():
             ces: list[float] = []
             for i in range(self.num_teachers):
                 t_logits, t_ids, t_mask = self._teacher_score_inputs(
-                    i, data, teacher_full_logits_by_idx
+                    i, data, teacher_full_logits_by_idx, aligns_by_idx
                 )
                 ce_pos = torch.nn.functional.cross_entropy(
                     t_logits[:, :-1].reshape(-1, t_logits.shape[-1]).float(),
@@ -1976,11 +2061,14 @@ class CrossTokenizerDistillationLossFn(LossFunction):
 
         kd, m = self._compute_teacher_kd(
             best,
-            logits,
+            student_logits_contig,
             data,
             teacher_full_logits_by_idx,
+            aligns_by_idx,
             global_valid_toks,
             use_per_teacher_flags=False,
+            tp_group=tp_group,
+            cp_group=cp_group,
         )
         per_metrics: dict[str, Any] = {f"{k}_t{best}": v for k, v in m.items()}
         per_metrics["selected_teacher"] = best
@@ -1991,32 +2079,29 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         i: int,
         data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
         teacher_full_logits_by_idx: dict[int, torch.Tensor],
+        aligns_by_idx: dict[int, LocalizedAlignment],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return ``(logits, input_ids, token_mask)`` for teacher ``i``'s CE / weight-metric scores.
 
         The token mask is over the tokenization the score is computed on: the
-        student's for a same-vocab teacher, teacher ``i``'s own otherwise.
-        Requires full logits; raises for a same-vocab top-K teacher (the
-        metrics need the full teacher distribution).
+        shared student tokens (CP-relaid) for a same-vocab teacher, teacher ``i``'s
+        own otherwise. Every teacher ships full logits, so the full distribution
+        is always available.
         """
-        if i not in teacher_full_logits_by_idx:
-            raise NotImplementedError(
-                f"teacher {i}: select_teacher / dynamic weighting requires full "
-                "teacher logits; a same-vocab top-K teacher (send_full_logits="
-                "False) does not ship them."
-            )
         if self._teacher_is_same_vocab(i):
-            ids = data["input_ids"]
-            token_mask = data["token_mask"]
+            align = aligns_by_idx[i]
+            ids = to_local_if_dtensor(align.student_input_ids)
+            token_mask = to_local_if_dtensor(align.student_token_mask)
         else:
-            ids = data[f"teacher_{i}_input_ids"]
-            token_mask = data[f"teacher_{i}_token_mask"]
+            ids = to_local_if_dtensor(data[f"teacher_{i}_input_ids"])
+            token_mask = to_local_if_dtensor(data[f"teacher_{i}_token_mask"])
         return teacher_full_logits_by_idx[i], ids, token_mask
 
     def _compute_dynamic_weights(
         self,
         data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
         teacher_full_logits_by_idx: dict[int, torch.Tensor],
+        aligns_by_idx: dict[int, LocalizedAlignment],
     ) -> list[torch.Tensor]:
         """Sequence-level dynamic teacher weights via ``sum_weights_metric``.
 
@@ -2033,7 +2118,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         scores: list[torch.Tensor] = []
         for i in range(self.num_teachers):
             t_logits, t_ids, t_mask = self._teacher_score_inputs(
-                i, data, teacher_full_logits_by_idx
+                i, data, teacher_full_logits_by_idx, aligns_by_idx
             )
             score = self._teacher_weight_score(
                 t_logits, t_ids, t_mask, data["sample_mask"]
@@ -2059,7 +2144,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         Padded positions and masked-out samples are excluded, so long-padded
         batches don't let near-uniform padding logits dominate the score.
         """
-        samp = sample_mask.unsqueeze(-1).float()
+        samp = to_local_if_dtensor(sample_mask).unsqueeze(-1).float()
         if self.sum_weights_metric == "ce":
             ce_pos = torch.nn.functional.cross_entropy(
                 t_logits[:, :-1].reshape(-1, t_logits.shape[-1]).float(),
@@ -2083,62 +2168,58 @@ class CrossTokenizerDistillationLossFn(LossFunction):
     # ------------------------------------------------------------------ #
     def _compute_p_kl(
         self,
-        logits: torch.Tensor,
-        data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
+        student_logits: torch.Tensor,
         teacher_full_logits: torch.Tensor,
+        align: LocalizedAlignment,
         *,
-        projection_matrix_path: str,
+        projection_matrix_path: Optional[str],
         teacher_vocab_size: int,
-        alignment_prefix: str = "alignment_",
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """P-KL: chunk-averaged KL over a microbatch-global top-k teacher subset.
+
+        ``student_logits`` (CP-relaid to contiguous) and ``align`` (localized,
+        with next-token-shifted chunk ids) are precomputed in
+        ``prepare_loss_input``.
 
         Steps:
 
         1. Project full-vocab student probs through ``M`` to teacher vocab.
         2. Use the full teacher logits materialized by ``prepare_loss_input``.
-        3. Align each predictor with the token it predicts by shifting the
-           per-position tensors and chunk ids by one (drop the last
-           predictor position and the first chunk label), symmetrically on
-           student and teacher. Matches the next-token shift already used by
-           the CE term.
-        4. Compute one ``global_top_indices [k]`` per microbatch from the
+        3. Compute one ``global_top_indices [k]`` per microbatch from the
            teacher's importance: ``max`` over flat ``(B*T_t)``, ``topk``
            over ``V_t``. Same vocab subset across every sample/position —
            keeps chunk-averaged KL well-defined.
-        5. Slice both the projected student probs and the teacher logits
+        4. Slice both the projected student probs and the teacher logits
            to those ``k`` columns.
-        6. Build per-token chunk masks from ``alignment_*_chunk_id`` and
+        5. Build per-token chunk masks from ``alignment_*_chunk_id`` and
            chunk-average via ``bmm`` (shared helper).
-        7. Renormalize student chunk distributions inside the top-k subset
+        6. Renormalize student chunk distributions inside the top-k subset
            (avg-then-renormalize, log).
-        8. Forward (or reverse) KL between chunk distributions.
+        7. Forward (or reverse) KL between chunk distributions.
         """
         T = self.temperature
-        device = logits.device
+        device = student_logits.device
         eps = 1e-10
 
-        b, t_s, v_s = logits.shape
-        student_log_probs = torch.log_softmax(logits.float() / T, dim=-1)
-        student_probs = student_log_probs.exp()  # [B, T_s, V_s]
+        # Vocab-sharded (TP) students keep the shard with globally-correct
+        # normalization; the result is projected onto the teacher vocab next.
+        student_log_probs = vocab_parallel_log_softmax(
+            student_logits, T, tp_group=tp_group
+        )
+        student_probs = student_log_probs.exp()  # [B, T_s_local, V_s_local]
 
-        # Project to full teacher vocab. Sparse matmul via M.T trick.
-        # `Fp32SparseMM` keeps the op in FP32 on both forward and backward;
-        # `torch.sparse.mm` has no BF16 kernel and the worker's autocast(BF16)
-        # context wraps loss.backward(), so a plain `.float()` cast isn't
-        # enough — the backward kernel is still dispatched as BF16.
-        M = get_sparse_projection_matrix(
+        sparse_projection = get_sparse_projection_matrix(
             projection_matrix_path,
             device,
             student_vocab_size=self.student_vocab_size,
             teacher_vocab_size=teacher_vocab_size,
         )  # [V_s, V_t] sparse COO, fp32
-        flat = student_probs.reshape(b * t_s, v_s)
-        # Fp32SparseMM internally computes M.t() @ dense; passing M (not
-        # M.t()) avoids a sparse `.t()` on a saved tensor in backward.
-        projected_full = Fp32SparseMM.apply(M, flat.t()).t()  # [B*T_s, V_t]
-        v_t = projected_full.shape[-1]
-        projected_full = projected_full.reshape(b, t_s, v_t)  # [B, T_s, V_t]
+        projected_full = project_student_to_teacher_vocab(
+            student_probs, sparse_projection, tp_group=tp_group
+        )  # [B, T_s_local, V_t]
+        full_teacher_vocab_size = projected_full.shape[-1]
 
         # `teacher_full_logits` [B, T_t, V_t_model] is materialized by
         # `prepare_loss_input` (rebuilt from the IPC handles). Same transport
@@ -2147,60 +2228,44 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         # HF models commonly pad lm_head out_features beyond len(tokenizer)
         # for embedding/FFN alignment (e.g. Qwen3: tokenizer 151669,
         # lm_head 151936). The projection matrix is sized to the real
-        # tokenizer vocab (`self.teacher_vocab_size`); the padded
+        # tokenizer vocab (the ``teacher_vocab_size`` arg); the padded
         # columns aren't real tokens and the projection has no entries
         # there. Slice to the projection's V_t to keep the projected
         # student probs and the teacher logits on the same vocab axis.
-        if teacher_full_logits.shape[-1] > v_t:
-            teacher_full_logits = teacher_full_logits[..., :v_t]
+        if teacher_full_logits.shape[-1] > full_teacher_vocab_size:
+            teacher_full_logits = teacher_full_logits[..., :full_teacher_vocab_size]
 
-        # Chunk-alignment data.
-        alignment = alignment_from_flat_batch(data, alignment_prefix)
-        student_chunk_id = alignment.student_chunk_id  # [B, T_s] long
-        teacher_chunk_id = alignment.teacher_chunk_id  # [B, T_t] long
-        pair_valid = alignment.pair_valid  # [B, max_pairs]
+        # Chunk ids (localized + next-token-shifted) come from `prepare_loss_input`.
+        student_chunk_id = align.student_chunk_id
+        teacher_chunk_id = align.teacher_chunk_id
+        pair_valid = align.pair_valid  # [B, max_pairs]
         if self.exact_token_match_only:
-            pair_valid = pair_valid & alignment.pair_is_correct
+            pair_valid = pair_valid & align.pair_is_correct
         max_chunks = pair_valid.shape[1]
 
-        # A model's distribution at position t predicts the token at t+1, so
-        # align each predictor with the token it predicts: drop the last
-        # predictor position (nothing past the sequence to predict) and the
-        # first chunk label (no predictor precedes it). Applied symmetrically
-        # to student and teacher. Same next-token convention the CE term uses.
-        projected_full = projected_full[:, :-1, :]
-        teacher_full_logits = teacher_full_logits[:, :-1, :]
-        student_chunk_id = student_chunk_id[:, 1:]
-        teacher_chunk_id = teacher_chunk_id[:, 1:]
-
-        # global_top_indices: max over flat (B*T_t) → [V_t] → topk → [k].
-        vocab_topk = min(self.vocab_topk, v_t)
-        with torch.no_grad():
-            # reshape (not view): the shift above leaves teacher_full_logits
-            # non-contiguous.
-            teacher_flat = teacher_full_logits.reshape(-1, v_t)
-            global_importance = teacher_flat.max(dim=0).values
-            global_top_indices = torch.topk(
-                global_importance, k=vocab_topk, dim=-1
-            ).indices
-            global_top_indices = global_top_indices.sort().values  # [k]
+        # One microbatch-global top-k teacher subset (CP-reduced so every rank
+        # agrees on the same vocab columns), shared across all samples/positions.
+        vocab_topk = min(self.vocab_topk, full_teacher_vocab_size)
+        global_top_indices = select_teacher_topk_indices(
+            teacher_full_logits, vocab_topk, cp_group=cp_group
+        )  # [k]
 
         # Slice both sides to the shared [k] columns.
-        projected_topk = projected_full[..., global_top_indices]  # [B, T_s-1, k]
+        projected_topk = projected_full[..., global_top_indices]  # [B, T_s, k]
         teacher_topk_logits = teacher_full_logits[
             ..., global_top_indices
-        ]  # [B, T_t-1, k]
+        ]  # [B, T_t, k]
         target_log_probs = torch.log_softmax(
             teacher_topk_logits / T, dim=-1
-        )  # [B, T_t-1, k] (renormalized within the [k] subset).
+        )  # [B, T_t, k] (renormalized within the [k] subset).
 
         # Chunk-average both sides via the shared helper.
         proj_chunks, proj_sizes = chunk_average_log_probs(
-            projected_topk, student_chunk_id, max_chunks
-        )  # [B, C, k] / [B, C]
+            projected_topk, student_chunk_id, max_chunks, cp_group=cp_group
+        )
         tgt_log_chunks, tgt_sizes = chunk_average_log_probs(
-            target_log_probs, teacher_chunk_id, max_chunks
-        )  # [B, C, k] / [B, C]
+            target_log_probs, teacher_chunk_id, max_chunks, cp_group=cp_group
+        )
 
         # Renormalize the projected chunk distribution within the top-k
         # subset, then take log. Teacher side is already log-probs (avg of
@@ -2216,9 +2281,11 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         # global count so the KL is normalized by
         # `sum(global_valid_chunks)` rather than a per-rank mean —
         # mirrors the `global_valid_toks` convention used by CE.
-        sample_mask_bool = data["sample_mask"].bool()
+        sample_mask_bool = align.sample_mask.bool()
         valid_bool = chunk_mask & sample_mask_bool.unsqueeze(-1)
-        global_valid_chunks = dp_all_reduce_sum(valid_bool.sum())
+        global_valid_chunks = group_all_reduce_sum(
+            valid_bool.sum().to(torch.float32), group=torch.distributed.group.WORLD
+        )
         if global_valid_chunks.item() == 0:
             zero = torch.zeros((), device=device, dtype=proj_log_chunks.dtype)
             return (
@@ -2250,30 +2317,35 @@ class CrossTokenizerDistillationLossFn(LossFunction):
                 proj_log_chunks, tgt_log_chunks, reduction="none", log_target=True
             ).sum(dim=-1)
 
-        sample_mask = data["sample_mask"].to(per_chunk_kl.dtype)  # [B]
+        sample_mask = align.sample_mask.to(per_chunk_kl.dtype)  # [B]
         valid = chunk_mask.to(per_chunk_kl.dtype) * sample_mask.unsqueeze(-1)
         denom = global_valid_chunks.to(per_chunk_kl.dtype).clamp(min=1.0)
         kl_loss = (per_chunk_kl * valid).sum() / denom * (T * T)
+
         return kl_loss, valid.sum().detach(), proj_acc.detach()
 
     def _compute_gold(
         self,
-        logits: torch.Tensor,
-        data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
+        student_logits: torch.Tensor,
         teacher_full_logits: torch.Tensor,
+        align: LocalizedAlignment,
         *,
-        projection_matrix_path: str,
+        projection_matrix_path: Optional[str],
         teacher_vocab_size: int,
         xtoken_loss: bool,
-        alignment_prefix: str = "alignment_",
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Gold-loss path: KL on common (exact-mapped) vocab + L1 on uncommon.
 
+        ``student_logits`` (CP-relaid to contiguous) and ``align`` (localized,
+        with next-token-shifted chunk ids) are precomputed in
+        ``prepare_loss_input``.
+
         1. Lazy-build the exact-token map (cached per device).
         2. Use the full teacher logits materialized by ``prepare_loss_input``.
-        3. ``log_softmax`` on full vocab both sides; shift each predictor to
-           the token it predicts (drop the last predictor position, first
-           chunk label); chunk-average via the shared helper.
+        3. ``log_softmax`` on full vocab both sides; chunk-average via the
+           shared helper using the precomputed next-token-shifted chunk ids.
         4. Slice each chunk-averaged tensor to ``common_*`` indices and
            compute (forward or reverse) KL, reduced as
            ``sum / valid_chunk.sum()`` where ``valid_chunk`` is the
@@ -2290,7 +2362,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         Components other than ``loss`` are detached.
         """
         T = self.temperature
-        device = logits.device
+        device = student_logits.device
 
         exact_map = build_exact_token_map(
             projection_matrix_path,
@@ -2314,39 +2386,34 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         if teacher_full_logits.shape[-1] > v_teacher:
             teacher_full_logits = teacher_full_logits[..., :v_teacher]
 
-        student_log_probs = torch.log_softmax(
-            logits.float() / T, dim=-1
-        )  # [B, T_s, V_s]
+        # common_s / uncommon_s are arbitrary V_s indices, so the gold path needs
+        # full-vocab student log-probs (TP-sharded students are all-gathered).
+        student_log_probs = vocab_parallel_full_log_softmax(
+            student_logits, T, tp_group=tp_group
+        )
+        # teacher_full_logits is already vocab-full (consumer-side routing
+        # P2P-concat'd across TP siblings); local log_softmax is correct.
         teacher_log_probs = torch.log_softmax(
             teacher_full_logits / T, dim=-1
-        )  # [B, T_t, V_t]
+        )  # [B, T_t_local, V_t]
 
-        alignment = alignment_from_flat_batch(data, alignment_prefix)
-        student_chunk_id = alignment.student_chunk_id
-        teacher_chunk_id = alignment.teacher_chunk_id
-        pair_valid = alignment.pair_valid
+        # Chunk ids (localized + next-token-shifted) come from `prepare_loss_input`.
+        student_chunk_id = align.student_chunk_id
+        teacher_chunk_id = align.teacher_chunk_id
+        pair_valid = align.pair_valid
         max_chunks = pair_valid.shape[1]
 
-        # A model's distribution at position t predicts the token at t+1, so
-        # align each predictor with the token it predicts: drop the last
-        # predictor position and the first chunk label, symmetrically on
-        # student and teacher. See the matching note in `_compute_p_kl`.
-        student_log_probs = student_log_probs[:, :-1, :]
-        teacher_log_probs = teacher_log_probs[:, :-1, :]
-        student_chunk_id = student_chunk_id[:, 1:]
-        teacher_chunk_id = teacher_chunk_id[:, 1:]
-
         student_chunks, s_sizes = chunk_average_log_probs(
-            student_log_probs, student_chunk_id, max_chunks
-        )  # [B, C, V_s] / [B, C]
+            student_log_probs, student_chunk_id, max_chunks, cp_group=cp_group
+        )
         teacher_chunks, t_sizes = chunk_average_log_probs(
-            teacher_log_probs, teacher_chunk_id, max_chunks
-        )  # [B, C, V_t] / [B, C]
+            teacher_log_probs, teacher_chunk_id, max_chunks, cp_group=cp_group
+        )
 
         chunk_mask = valid_chunk_mask(s_sizes, t_sizes, pair_valid)
         # Match the P-KL path: a chunk only contributes if its alignment is
         # geometrically valid AND its sample isn't masked out by sample_mask.
-        sample_mask = data["sample_mask"]  # [B]
+        sample_mask = align.sample_mask  # [B]
         valid_chunk = chunk_mask & sample_mask.bool().unsqueeze(-1)
         zero_dtype = student_log_probs.dtype
         # Compute the DP-global valid-chunk count BEFORE any potentially
@@ -2354,7 +2421,9 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         # both `kl_common` and `l1_uncommon` use this as their denom so
         # the loss is normalized by `sum(global_valid_chunks)`, not a
         # per-rank mean.
-        global_valid_chunks = dp_all_reduce_sum(valid_chunk.sum())
+        global_valid_chunks = group_all_reduce_sum(
+            valid_chunk.sum().to(torch.float32), group=torch.distributed.group.WORLD
+        )
         if global_valid_chunks.item() == 0:
             zero = torch.zeros((), device=device, dtype=zero_dtype)
             return (
@@ -2475,24 +2544,18 @@ class CrossTokenizerDistillationLossFn(LossFunction):
         data: BatchedDataDict[CrossTokenizerDistillationLossDataDict],
         global_valid_toks: torch.Tensor,
     ) -> torch.Tensor:
-        """Standard next-token CE on the student side.
-
-        Uses ``token_mask[:, 1:]`` so padded tokens don't contribute.
-        """
-        input_ids = data["input_ids"]
-        token_mask = data["token_mask"][:, 1:]
-        sample_mask = data["sample_mask"]
-
-        shift_logits = logits[:, :-1].contiguous()
-        shift_labels = input_ids[:, 1:].contiguous()
-
-        per_token_ce = torch.nn.functional.cross_entropy(
-            shift_logits.reshape(-1, shift_logits.shape[-1]).float(),
-            shift_labels.reshape(-1),
-            reduction="none",
-        ).reshape(shift_labels.shape)
-
-        mask = token_mask.float() * sample_mask.unsqueeze(-1).float()
+        """Next-token CE on the student side (TP/CP handled by the helpers)."""
+        per_token_ce = student_next_token_ce(
+            logits, input_ids=data["input_ids"], seq_index=data.get("seq_index")
+        )
+        label_mask = ce_label_mask(
+            token_mask=data["token_mask"],
+            sample_mask=data["sample_mask"],
+            ce_seq_len=per_token_ce.shape[1],
+            dtype=per_token_ce.dtype,
+        )
         return masked_mean(
-            per_token_ce, mask, global_normalization_factor=global_valid_toks
+            per_token_ce,
+            label_mask,
+            global_normalization_factor=global_valid_toks,
         )

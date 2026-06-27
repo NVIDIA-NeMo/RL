@@ -44,6 +44,7 @@ def calculate_kl(
     kl_type: str = "k3",
     input_clamp_value: float | None = 20.0,
     output_clamp_value: float | None = 10.0,
+    importance_sampling_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Calculates a per-token estimate of the KL Divergence between two logprobs.
 
@@ -57,13 +58,26 @@ def calculate_kl(
                            If None, no clamping is applied.
         output_clamp_value: Optional clamping value for kl to prevent numerical instability.
                            If None, no clamping is applied.
+        importance_sampling_weights: Optional per-token importance weights. When
+                                     provided, weights are multiplied into the KL
+                                     before output clamping. If input clamping
+                                     applies to a token, the corresponding weight
+                                     is detached so the clamp suppresses both KL
+                                     and sampling-weight gradients.
 
     Returns:
         torch.Tensor: Per-token KL penalty values (b, s)
     """
     logr = logprobs_reference - logprobs
     if input_clamp_value is not None:
-        logr = logr.clamp(min=-input_clamp_value, max=input_clamp_value)
+        logr_clamped = logr.clamp(min=-input_clamp_value, max=input_clamp_value)
+        if importance_sampling_weights is not None:
+            importance_sampling_weights = torch.where(
+                logr == logr_clamped,
+                importance_sampling_weights,
+                importance_sampling_weights.detach(),
+            )
+        logr = logr_clamped
 
     if kl_type == "k1":
         kl = -logr
@@ -76,6 +90,9 @@ def calculate_kl(
 
     else:
         raise ValueError(f"Invalid KL type: {kl_type}")
+
+    if importance_sampling_weights is not None:
+        kl = importance_sampling_weights * kl
 
     if output_clamp_value is not None:
         kl = kl.clamp(min=-output_clamp_value, max=output_clamp_value)
@@ -507,16 +524,27 @@ def print_performance_metrics(
     # =====================================================
     # Generate Token Imbalance Visualization
     # =====================================================
-    def visualize_per_worker_load(per_worker_token_counts: dict[int, int]) -> float:
+    def visualize_per_worker_load(
+        per_worker_token_counts: dict[int, int],
+    ) -> Optional[float]:
         per_worker_token_counts_list = [
             v for k, v in sorted(per_worker_token_counts.items())
         ]
+        print("  • Visualizing Token Imbalance per Generation Worker:")
+        if not per_worker_token_counts_list:
+            print("    - No per-worker generation load data available.")
+            return None
+
+        max_token_count = max(per_worker_token_counts_list)
+        if max_token_count <= 0:
+            print("    - No generated tokens recorded per worker.")
+            return None
+
         per_worker_load_ratio = [
-            v / max(per_worker_token_counts_list) for v in per_worker_token_counts_list
+            v / max_token_count for v in per_worker_token_counts_list
         ]
         max_rows_to_print = 1000
         bar_length = 20
-        print("  • Visualizing Token Imbalance per Generation Worker:")
         for i in range(min(len(per_worker_token_counts_list), max_rows_to_print)):
             print(
                 f"    - Generated Tokens from Worker {i:3.0f}:"
@@ -549,7 +577,8 @@ def print_performance_metrics(
 
         if per_worker_token_counts is not None:
             average_token_imbalance = visualize_per_worker_load(per_worker_token_counts)
-            performance_metrics["average_token_imbalance"] = average_token_imbalance
+            if average_token_imbalance is not None:
+                performance_metrics["average_token_imbalance"] = average_token_imbalance
 
     if "mean_total_tokens_per_sample" in metrics:
         print(

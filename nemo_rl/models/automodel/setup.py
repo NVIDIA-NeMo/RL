@@ -23,6 +23,31 @@ from typing import Any, Optional, Union
 import torch
 from hydra.utils import get_class
 from nemo_automodel import NeMoAutoModelForSequenceClassification
+
+try:
+    from nemo_automodel import NeMoAutoModelForTokenClassification
+except ImportError:
+    # Local backport until the pinned Automodel submodule exports
+    # NeMoAutoModelForTokenClassification. The tripwire test in
+    # tests/unit/models/automodel/test_automodel_setup.py should fail once this
+    # shim is no longer needed.
+    # Tracked at https://github.com/NVIDIA-NeMo/RL/issues/2948.
+    from nemo_automodel._transformers.auto_model import _BaseNeMoAutoModelClass
+    from transformers import AutoModelForTokenClassification
+
+    class NeMoAutoModelForTokenClassification(
+        _BaseNeMoAutoModelClass, AutoModelForTokenClassification
+    ):
+        """Backport shim - see surrounding comment."""
+
+        pass
+else:
+    raise RuntimeError(
+        "Automodel now exports NeMoAutoModelForTokenClassification; remove the "
+        "local backport shim in nemo_rl.models.automodel.setup."
+    )
+
+
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components._peft.lora import PeftConfig
@@ -54,16 +79,6 @@ STRING_TO_DTYPE = {
     "bfloat16": torch.bfloat16,
     "float16": torch.float16,
 }
-
-
-def _use_trust_remote_code(model_name: str) -> bool:
-    """Whether to load ``model_name`` with ``trust_remote_code=True``.
-
-    phi-4-mini ships a remote modeling file whose LongRoPE buffer update is
-    incompatible with FSDP2 meta-device init, so it must be loaded via
-    transformers' in-tree implementation. All other models keep remote code.
-    """
-    return model_name.lower() != "microsoft/phi-4-mini-instruct"
 
 
 def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
@@ -313,7 +328,7 @@ def validate_and_prepare_config(
     model_config = AutoConfig.from_pretrained(
         model_name,
         torch_dtype=torch.float32,  # Always load in float32 for master weights
-        trust_remote_code=_use_trust_remote_code(model_name),
+        trust_remote_code=True,
         attn_implementation="flash_attention_2" if enable_seq_packing else None,
         **hf_config_overrides,
     )
@@ -345,6 +360,14 @@ def validate_and_prepare_config(
                 print(
                     "model_config.num_labels is not 1. Setting it to 1 since this value is used as the out_features "
                     "for the linear head of Bradley-Terry reward models."
+                )
+                model_config.num_labels = 1
+        elif rm_type == "regression":
+            model_class = NeMoAutoModelForTokenClassification
+            if model_config.num_labels != 1:
+                print(
+                    "model_config.num_labels is not 1. Setting it to 1 since this value is used as the out_features "
+                    "for the linear head of regression reward models."
                 )
                 model_config.num_labels = 1
         else:
@@ -507,6 +530,49 @@ def setup_distributed(
     )
 
 
+# AUTOMODEL-WORKAROUND(restore-dtype): TEMPORARY. Remove when the automodel pin includes
+# NVIDIA-NeMo/Automodel PR #2419 (rewrites _restore_loaded_model_dtype to honor an explicit
+# torch_dtype via promote_types). Currently pinned at automodel 6de0c361 (pre-#2419).
+def _disable_automodel_checkpoint_dtype_restore() -> None:
+    """No-op Automodel's ``_restore_loaded_model_dtype`` on the HF/force_hf load path.
+
+    NeMo-RL loads policy models with ``torch_dtype=float32`` to keep fp32 master weights
+    for the optimizer. Automodel's ``_restore_loaded_model_dtype`` (added after automodel
+    ``92635e74``) re-casts each loaded parameter back to the bf16 checkpoint dtype, silently
+    downgrading the master weights so AdamW updates underflow and the model fails to learn
+    (e.g. grpo-nano-v2-12b reward stuck ~0.18). Disable it so the requested fp32 load is
+    honored. Tracked by NVIDIA-NeMo/Automodel#2419; remove once the automodel pin includes it.
+    See ``test_automodel_dtype_restore_workaround_still_needed`` for the removal tripwire.
+    """
+    from nemo_automodel._transformers import model_init as _model_init
+
+    # Removal tripwire: if Automodel drops/renames this symbol (the likely shape of the
+    # upstream fix), the workaround is obsolete -> warn loudly and self-deactivate.
+    restore = getattr(_model_init, "_restore_loaded_model_dtype", None)
+    if restore is None:
+        import warnings
+
+        warnings.warn(
+            "Automodel no longer defines _restore_loaded_model_dtype; NeMo-RL's fp32 "
+            "master-weight workaround is obsolete - remove "
+            "_disable_automodel_checkpoint_dtype_restore() in setup.py.",
+            stacklevel=2,
+        )
+        return
+    if getattr(restore, "_nrl_disabled", False):
+        return
+
+    def _noop(*args, **kwargs) -> None:  # pragma: no cover
+        return None
+
+    _noop._nrl_disabled = True
+    # Stash the genuine function so the removal tripwire test
+    # (test_automodel_dtype_restore_workaround_still_needed) can exercise Automodel's
+    # real behavior even after this no-op has globally replaced the symbol process-wide.
+    _noop._nrl_original = restore
+    _model_init._restore_loaded_model_dtype = _noop
+
+
 def setup_model_and_optimizer(
     config: PolicyConfig,
     tokenizer: AutoTokenizer,
@@ -667,6 +733,10 @@ def setup_model_and_optimizer(
     # HF conversion (required for weight syncing).
     _maybe_set_force_hf(automodel_kwargs, model_config)
 
+    # Keep fp32 master weights: stop Automodel from restoring loaded params to the bf16
+    # checkpoint dtype, which would break optimizer master-weight precision (see helper).
+    _disable_automodel_checkpoint_dtype_restore()
+
     # Create model via from_pretrained - handles meta device init, parallelization,
     # LoRA, and base weight loading internally
     model = model_class.from_pretrained(
@@ -679,7 +749,7 @@ def setup_model_and_optimizer(
         peft_config=peft_config,
         attn_implementation=attn_impl,
         torch_dtype=str(model_config.torch_dtype),
-        trust_remote_code=_use_trust_remote_code(model_name),
+        trust_remote_code=True,
         sdpa_method=sdpa_method,
         **from_pretrained_kwargs,
         **automodel_kwargs,
@@ -707,20 +777,6 @@ def setup_model_and_optimizer(
     )
     if is_tied_lm_head:
         model.tie_weights()
-
-    # Freeze visual encoder when not doing VLM training.
-    # Without this, the optimizer creates state entries for visual params that never
-    # receive gradients, causing a key mismatch when resuming from checkpoint.
-    # Note: visual encoder is nested under model.model (e.g. model.model.visual for
-    # Qwen3_5MoeForConditionalGeneration), not directly on model.
-    visual_module = getattr(getattr(model, "model", None), "visual", None) or getattr(
-        model, "visual", None
-    )
-    if not is_vlm and visual_module is not None:
-        for param in visual_module.parameters():
-            param.requires_grad_(False)
-        if rank == 0:
-            print("Froze visual encoder parameters for text-only training")
 
     # CPU offload if needed
     if cpu_offload:

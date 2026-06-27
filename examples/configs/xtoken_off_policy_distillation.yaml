@@ -59,7 +59,6 @@ loss_fn:
   # with a dynamic sequence-level softmax weight from "ce" | "entropy" |
   # "max_prob".
   sum_weights_metric: null
-  token_level_weights: false  # per-token dynamic weights (not yet supported)
   alpha: 1.0                  # softmax temperature on dynamic teacher weights
   normalize_teacher_by_vocab: false  # rescale by log(V_t_i)/log(min_j V_t_j)
 
@@ -188,7 +187,6 @@ teachers:
   - model_name: "meta-llama/Llama-3.2-3B"
     projection_matrix_path: null   # same tokenizer => direct KL, no projection.
     weight: 1.0
-    send_full_logits: false        # ship top-K logits (lighter); true = full vocab.
     tokenizer:
       name: "meta-llama/Llama-3.2-3B"
     train_global_batch_size: 64

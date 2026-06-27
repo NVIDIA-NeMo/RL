@@ -68,7 +68,8 @@ from nemo_rl.experience.rollouts import (
     run_multi_turn_rollout,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
-from nemo_rl.models.generation.sglang import SGLangConfig, SGLangGeneration
+from nemo_rl.models.generation.sglang.config import SGLangConfig
+from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
@@ -229,33 +230,27 @@ def setup(
         "A generation config in the PolicyConfig is required for PPO"
     )
 
-    # Value model on Megatron does not yet support sequence packing, dynamic
-    # batching, or context parallelism in the training-path forward
-    # (forward_step_for_value lacks the CP-allgather + unpack-from-packed
-    # logic that the inference-path get_values already has). Reject up front
-    # rather than crashing inside a Megatron forward.
-    # Tracked at https://github.com/NVIDIA-NeMo/RL/issues/2687.
-    if value_config.get("megatron_cfg", {}).get("enabled", False):
-        assert not value_config["sequence_packing"]["enabled"], (
-            "Sequence packing is currently not supported for the Megatron PPO "
-            "value model. See https://github.com/NVIDIA-NeMo/RL/issues/2687"
+    if value_config["megatron_cfg"]["enabled"]:
+        # Context parallelism for the Megatron value model requires sequence packing,
+        # matching Megatron-Core (CP shards are produced/reassembled per packed sequence).
+        if value_config["megatron_cfg"]["context_parallel_size"] > 1:
+            assert value_config["sequence_packing"]["enabled"], (
+                "Context parallelism (CP>1) for the Megatron PPO value model requires "
+                "value.sequence_packing.enabled=true."
+            )
+    else:
+        # DTensor PPO value model currently doesn't support sequence packing and CP.
+        assert value_config["dtensor_cfg"]["enabled"], (
+            "Exactly one of value.megatron_cfg.enabled or value.dtensor_cfg.enabled "
+            "must be true for the PPO value model."
         )
-        assert not value_config["dynamic_batching"]["enabled"], (
-            "Dynamic batching is currently not supported for the Megatron PPO "
-            "value model. See https://github.com/NVIDIA-NeMo/RL/issues/2687"
+        assert value_config["sequence_packing"]["enabled"] is False, (
+            "Sequence packing is currently not supported for the DTensor PPO value model. "
+            "See https://github.com/NVIDIA-NeMo/RL/issues/2951."
         )
-        assert value_config["megatron_cfg"]["context_parallel_size"] == 1, (
-            "Context parallelism (CP>1) is currently not supported for the "
-            "Megatron PPO value model. See "
-            "https://github.com/NVIDIA-NeMo/RL/issues/2687"
-        )
-        assert not (
-            value_config["megatron_cfg"]["tensor_model_parallel_size"] > 1
-            and value_config["megatron_cfg"]["sequence_parallel"]
-        ), (
-            "Sequence parallelism (TP>1 + sequence_parallel=True) is currently "
-            "not supported for the Megatron PPO value model. See "
-            "https://github.com/NVIDIA-NeMo/RL/issues/2687"
+        assert value_config["dtensor_cfg"]["context_parallel_size"] == 1, (
+            "Context parallelism (CP>1) is currently not supported for the DTensor PPO value model. "
+            "See https://github.com/NVIDIA-NeMo/RL/issues/2951."
         )
 
     # Set seed for all random number generators
@@ -525,7 +520,10 @@ def setup(
     def init_sglang():
         """Initialize SGLang generation workers."""
         t0 = time.perf_counter()
-        pg = SGLangGeneration(cluster=inference_cluster, config=generation_config)
+        pg = SGLangGeneration(
+            cluster=inference_cluster,
+            sglang_cfg=generation_config,
+        )
         pg.finish_generation()
         return pg, time.perf_counter() - t0
 
@@ -1591,6 +1589,7 @@ def ppo_train(
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "value", "tokenizer"
                             ),
+                            checkpointing_cfg=master_config.checkpointing,
                         )
                         value_model.finish_training()
 
