@@ -68,6 +68,7 @@ from nemo_rl.utils.logger import Logger, LoggerConfig
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
+
 # Keys packed into the student-side `train_data` BatchedDataDict whose dim 1
 # is NOT the student sequence axis. They ride along on the dict so the loss
 # fn can index them per-microbatch, but the worker's `check_sequence_dim`
@@ -109,6 +110,7 @@ def xtoken_non_student_seq_keys(
             keys.add(f"alignment_{i}_teacher_exact_partition_mask")
             keys.add(f"alignment_{i}_teacher_chunk_id")
     return frozenset(keys)
+
 
 # ===============================================================================
 # Configuration

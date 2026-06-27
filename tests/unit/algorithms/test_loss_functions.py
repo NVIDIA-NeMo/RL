@@ -2453,14 +2453,12 @@ def _ct_loss_cfg(projection_path, *, gold_loss):
         "ce_loss_scale": 1.0,
         "dynamic_loss_scaling": False,
         "kd_loss_mode": "sum",
-        "token_level_weights": False,
         "alpha": 1.0,
         "normalize_teacher_by_vocab": False,
         "student_vocab_size": _CT_V_STUDENT,
         "projection_matrix_paths": [projection_path],
         "teacher_vocab_sizes": [_CT_V_TEACHER],
         "teacher_weights": [1.0],
-        "teacher_send_full_logits": [False],
         "teacher_gold_loss": [None],
         "teacher_xtoken_loss": [None],
     }
@@ -2624,18 +2622,6 @@ def test_normalize_teacher_by_vocab_rejected_outside_sum_mode(tmp_path):
     cfg["kd_loss_mode"] = "averaged_logits"
     cfg["normalize_teacher_by_vocab"] = True
     with pytest.raises(ValueError, match="normalize_teacher_by_vocab"):
-        CrossTokenizerDistillationLossFn(cfg)
-
-
-def test_select_teacher_rejects_same_vocab_topk_teacher(tmp_path):
-    """select_teacher must score every teacher, so a same-vocab top-K teacher
-    (no full logits) is rejected at construction."""
-    cfg = _ct_loss_cfg(_write_ct_projection(tmp_path), gold_loss=False)
-    cfg["kd_loss_mode"] = "select_teacher"
-    # Same-vocab teacher (no projection) shipping only top-K -> cannot be scored.
-    cfg["projection_matrix_paths"] = [None]
-    cfg["teacher_send_full_logits"] = [False]
-    with pytest.raises(ValueError, match="needs full teacher logits"):
         CrossTokenizerDistillationLossFn(cfg)
 
 

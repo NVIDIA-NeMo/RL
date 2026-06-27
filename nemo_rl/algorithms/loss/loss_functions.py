@@ -1340,7 +1340,9 @@ class CrossTokenizerDistillationLossConfig(TypedDict):
     # are the global defaults; teachers[i].gold_loss / .xtoken_loss can override
     # them per teacher in kd_loss_mode="sum".
     kd_loss_mode: str  # "sum" | "averaged_logits" | "select_teacher"
-    normalize_teacher_by_vocab: bool  # sum-mode only: scale each teacher's KD by log(V_t_i)/log(min_j V_t_j)
+    normalize_teacher_by_vocab: (
+        bool  # sum-mode only: scale each teacher's KD by log(V_t_i)/log(min_j V_t_j)
+    )
     alpha: float  # softmax temperature on dynamic teacher-weight scores (sum_weights_metric)
     sum_weights_metric: NotRequired[
         Optional[str]
@@ -1591,9 +1593,7 @@ class CrossTokenizerDistillationLossFn(LossFunction):
             )
             loss = kl_scale * total_kd + ce_loss
         else:
-            kl_scale = torch.tensor(
-                1.0, device=total_kd.device, dtype=total_kd.dtype
-            )
+            kl_scale = torch.tensor(1.0, device=total_kd.device, dtype=total_kd.dtype)
             loss = self.kl_loss_weight * total_kd + self.ce_loss_scale * ce_loss
 
         # Next-token accuracy on the student side (quick per-step signal), masked

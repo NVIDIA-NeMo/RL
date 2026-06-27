@@ -16,8 +16,14 @@
 Mirrors the style of ``tests/unit/algorithms/test_distillation.py``:
 a single ``mock_xtoken_components`` fixture builds all the Ray/policy/
 data plumbing as ``MagicMock``s, then top-level ``def test_*``
-functions exercise the high-level invariants the PR-2508 reviewer
-flagged. CPU-only, no Ray, no CUDA.
+functions exercise the high-level invariants the reviewer flagged.
+CPU-only, no Ray, no CUDA.
+
+The transport is "always-full": every teacher ships full-vocab logits over
+CUDA IPC (``teacher_{i}_full_logits_ipc``) and the loss derives the
+microbatch-global top-k subset student-side. There is no per-teacher
+``send_full_logits`` flag, no top-K IPC variant, and no ``mode=`` argument on
+the IPC producer.
 """
 
 from __future__ import annotations
@@ -36,18 +42,23 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 
 import nemo_rl.algorithms.xtoken_off_policy_distillation as xt_mod
 from nemo_rl.algorithms.loss.loss_functions import CrossTokenizerDistillationLossFn
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     MasterConfig,
     TeacherConfig,
     _default_off_policy_distillation_save_state,
-    _run_teacher_forwards_and_pack,
+    export_teacher_logits_and_pack,
     setup,
     validate,
     xtoken_non_student_seq_keys,
     xtoken_off_policy_distillation_train,
 )
 
-from .conftest import has_gloo
+
+def has_gloo() -> bool:
+    """Whether torch.distributed has a usable gloo backend."""
+    return torch.distributed.is_available() and torch.distributed.is_gloo_available()
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -103,7 +114,9 @@ def _make_batch(
         batch[f"alignment_{i}_num_chunks"] = torch.tensor(
             [1] * batch_size, dtype=torch.long
         )
-    return batch
+    # validate() pads ragged val batches via BatchedDataDict.size, so the mock
+    # batches must be BatchedDataDict (the train path reads them as a dict too).
+    return BatchedDataDict(batch)
 
 
 def _mock_dataloader(num_batches: int) -> MagicMock:
@@ -149,6 +162,8 @@ def _make_master_config(
                 },
                 "max_total_sequence_length": 64,
                 "make_sequence_length_divisible_by": 8,
+                "train_global_batch_size": 1,
+                "train_micro_batch_size": 1,
                 "tokenizer": {"name": "student-tok"},
             },
             "teachers": [
@@ -164,6 +179,8 @@ def _make_master_config(
                         },
                         "max_total_sequence_length": 64,
                         "make_sequence_length_divisible_by": 8,
+                        "train_global_batch_size": 1,
+                        "train_micro_batch_size": 1,
                         "tokenizer": {"name": "teacher-tok"},
                     }
                 )
@@ -181,7 +198,6 @@ def _make_master_config(
                 "dynamic_loss_scaling": False,
                 "kd_loss_mode": "sum",
                 "sum_weights_metric": None,
-                "token_level_weights": False,
                 "alpha": 1.0,
                 "normalize_teacher_by_vocab": False,
             },
@@ -215,6 +231,7 @@ def _make_tokenizer(vocab_size: int) -> MagicMock:
 @pytest.fixture
 def mock_xtoken_components():
     student_policy = MagicMock()
+    student_policy.data_parallel_size = 1
     student_policy.train.return_value = {
         "loss": torch.tensor(0.5),
         "grad_norm": torch.tensor(1.0),
@@ -222,19 +239,18 @@ def mock_xtoken_components():
     }
 
     teacher_policy = MagicMock()
-    teacher_policy.get_teacher_logits_ipc.return_value = [{"rank_logits_ipc": (4, 32)}]
+    teacher_policy.data_parallel_size = 1
+    teacher_policy.get_full_logits_ipc.return_value = [{"payload_ipc": (4, 32)}]
 
     train_dataloader = _mock_dataloader(num_batches=10)
     val_dataloader = _mock_dataloader(num_batches=2)
 
     # The trainer reads per-teacher metadata off the loss fn to build the
     # skip-keys set and drive the teacher-forward loop. One cross-tokenizer
-    # teacher: non-null projection path, ships full logits.
+    # teacher: non-null projection path (every teacher ships full logits).
     loss_fn = MagicMock()
     loss_fn.num_teachers = 1
     loss_fn.projection_matrix_paths = ["/tmp/dummy-projection.pt"]
-    loss_fn.teacher_ships_full = [True]
-    loss_fn.vocab_topk = 8
     logger = MagicMock()
 
     checkpointer = MagicMock()
@@ -276,12 +292,14 @@ def _patched_setup_call(master_config, *, student_vocab=32, teacher_vocab=24):
         patch.object(xt_mod, "CrossTokenizerCollator"),
         patch.object(xt_mod, "CrossTokenizerDistillationLossFn") as mock_loss_cls,
         patch.object(xt_mod, "StatefulDataLoader") as mock_dl_cls,
+        patch.object(xt_mod, "assert_teacher_student_batch_grid"),
+        patch.object(xt_mod, "assert_xtoken_ipc_node_local"),
     ):
         mock_cp_cls.return_value.get_latest_checkpoint_path.return_value = None
         mock_cp_cls.return_value.load_training_info.return_value = None
         mock_cp_cls.return_value.get_resume_paths.return_value = (None, None)
         mock_dl_cls.side_effect = lambda *a, **kw: MagicMock(spec=StatefulDataLoader)
-        mock_policy_cls.side_effect = lambda *a, **kw: MagicMock()
+        mock_policy_cls.side_effect = lambda *a, **kw: MagicMock(data_parallel_size=1)
 
         result = setup(
             master_config,
@@ -393,12 +411,14 @@ def test_setup_val_dataloader_gating(
         patch.object(xt_mod, "CrossTokenizerCollator"),
         patch.object(xt_mod, "CrossTokenizerDistillationLossFn"),
         patch.object(xt_mod, "StatefulDataLoader") as mock_dl_cls,
+        patch.object(xt_mod, "assert_teacher_student_batch_grid"),
+        patch.object(xt_mod, "assert_xtoken_ipc_node_local"),
     ):
         mock_cp_cls.return_value.get_latest_checkpoint_path.return_value = None
         mock_cp_cls.return_value.load_training_info.return_value = None
         mock_cp_cls.return_value.get_resume_paths.return_value = (None, None)
         mock_dl_cls.side_effect = lambda *a, **kw: MagicMock(spec=StatefulDataLoader)
-        mock_policy_cls.side_effect = lambda *a, **kw: MagicMock()
+        mock_policy_cls.side_effect = lambda *a, **kw: MagicMock(data_parallel_size=1)
 
         (
             _student,
@@ -503,7 +523,6 @@ def test_validate_emits_pkl_metrics_only(mock_xtoken_components):
         c.val_dataloader,
         c.loss_fn,
         c.master_config,
-        skip_keys=xtoken_non_student_seq_keys(c.loss_fn),
     )
 
     assert "loss" in metrics
@@ -515,9 +534,10 @@ def test_validate_emits_pkl_metrics_only(mock_xtoken_components):
 
 def test_validate_collects_only_aggregate_metrics(mock_xtoken_components):
     c = mock_xtoken_components
-    # validate summarizes only the aggregate loss / kl_loss / ce_loss. The
-    # gold path's per-teacher components (kl_common_t{i} / l1_uncommon_t{i})
-    # are not collected here, so they don't appear in the val metrics.
+    # validate summarizes only the aggregate loss / kl_loss / ce_loss / the
+    # aggregate gold path's kl_common / l1_uncommon. The per-teacher suffixed
+    # components (kl_common_t{i} / l1_uncommon_t{i}) are not collected here, so
+    # they don't appear in the val metrics.
     c.student_policy.train.return_value = _make_train_results_with(
         {"kl_common_t0": [0.2], "l1_uncommon_t0": [0.1], "ce_loss": [0.4]}
     )
@@ -528,7 +548,6 @@ def test_validate_collects_only_aggregate_metrics(mock_xtoken_components):
         c.val_dataloader,
         c.loss_fn,
         c.master_config,
-        skip_keys=xtoken_non_student_seq_keys(c.loss_fn),
     )
 
     assert "loss" in metrics
@@ -559,10 +578,16 @@ def test_ipc_buffer_released_for_every_teacher_on_train_failure(
     # N same-vocab teachers: the release loop is teacher-type-agnostic, and
     # same-vocab teachers reuse the student tokenization (the mock batch only
     # carries teacher_0_* keys, so this stays valid for any N).
-    teacher_policies = [MagicMock() for _ in range(num_teachers)]
+    teacher_policies = [MagicMock(data_parallel_size=1) for _ in range(num_teachers)]
+    for t in teacher_policies:
+        t.get_full_logits_ipc.return_value = [{"payload_ipc": (4, 32)}]
     c.loss_fn.num_teachers = num_teachers
     c.loss_fn.projection_matrix_paths = [None] * num_teachers
-    c.loss_fn.teacher_ships_full = [True] * num_teachers
+    # teacher_mbs is derived per entry in master_config.teachers, so it must
+    # have one entry per teacher policy.
+    c.master_config.teachers = [
+        c.master_config.teachers[0] for _ in range(num_teachers)
+    ]
 
     with pytest.raises(RuntimeError):
         xtoken_off_policy_distillation_train(
@@ -590,21 +615,21 @@ def test_ipc_buffer_released_for_every_teacher_on_train_failure(
 
 
 class _FakeLossFn:
-    """Minimal stand-in exposing the per-teacher metadata the trainer reads."""
+    """Minimal stand-in exposing the per-teacher metadata the trainer reads.
 
-    def __init__(self, projection_matrix_paths, teacher_ships_full, vocab_topk=8):
+    Every teacher ships full logits (always-full transport), so the only
+    per-teacher knob the trainer / skip-keys builder need is the projection
+    path (``None`` => same-vocab teacher).
+    """
+
+    def __init__(self, projection_matrix_paths):
         self.num_teachers = len(projection_matrix_paths)
         self.projection_matrix_paths = projection_matrix_paths
-        self.teacher_ships_full = teacher_ships_full
-        self.vocab_topk = vocab_topk
 
 
 def test_skip_keys_builder_cross_and_same_vocab():
-    # teacher 0 cross-tokenizer (full logits); teacher 1 same-vocab top-K.
-    loss_fn = _FakeLossFn(
-        projection_matrix_paths=["/p0.pt", None],
-        teacher_ships_full=[True, False],
-    )
+    # teacher 0 cross-tokenizer (full logits); teacher 1 same-vocab.
+    loss_fn = _FakeLossFn(projection_matrix_paths=["/p0.pt", None])
     keys = xtoken_non_student_seq_keys(loss_fn)
     # Cross-tokenizer teacher 0: IPC handle list + teacher tokens + the
     # teacher-seq / max_pairs alignment keys are skipped.
@@ -616,33 +641,26 @@ def test_skip_keys_builder_cross_and_same_vocab():
     # Student-seq alignment keys ([B, T_s]) and num_chunks ([B]) are NOT skipped.
     assert "alignment_0_student_chunk_id" not in keys
     assert "alignment_0_num_chunks" not in keys
-    # Same-vocab top-K teacher 1 now ships top-K over IPC, so its handle-list
-    # key (a non-tensor) is skipped; it has no other seq-axis keys.
-    assert "teacher_1_topk_ipc" in keys
-    assert "teacher_1_full_logits_ipc" not in keys
+    # Same-vocab teacher 1 also ships full logits over IPC, so its handle-list
+    # key (a non-tensor) is skipped; it reuses the student tokenization, so it
+    # has no teacher-seq token keys and no teacher-indexed alignment keys.
+    assert "teacher_1_full_logits_ipc" in keys
     assert not any(k.startswith("alignment_1_") for k in keys)
     assert "teacher_1_input_ids" not in keys
 
 
 def test_skip_keys_builder_same_vocab_full_logits():
-    loss_fn = _FakeLossFn(
-        projection_matrix_paths=[None],
-        teacher_ships_full=[True],
-    )
+    loss_fn = _FakeLossFn(projection_matrix_paths=[None])
     # Same-vocab full-logits teacher: only the IPC handle list is skipped.
     assert xtoken_non_student_seq_keys(loss_fn) == frozenset(
         {"teacher_0_full_logits_ipc"}
     )
 
 
-def test_run_teacher_forwards_packs_indexed_keys_and_runs_serially():
-    # teacher 0 cross-tokenizer (full-logits IPC); teacher 1 same-vocab top-K
-    # IPC. Both ship over the unified get_teacher_logits_ipc producer.
-    loss_fn = _FakeLossFn(
-        projection_matrix_paths=["/p0.pt", None],
-        teacher_ships_full=[True, False],
-        vocab_topk=8,
-    )
+def test_export_teacher_logits_packs_indexed_keys_and_runs_serially():
+    # teacher 0 cross-tokenizer; teacher 1 same-vocab. Both ship full-vocab
+    # logits over the unified get_full_logits_ipc producer (always-full).
+    loss_fn = _FakeLossFn(projection_matrix_paths=["/p0.pt", None])
     # Attach both teacher mocks to one parent so their calls land in a single
     # ordered list (lets us assert the serial interleaving below). Configure
     # the child return values after attaching.
@@ -651,33 +669,30 @@ def test_run_teacher_forwards_packs_indexed_keys_and_runs_serially():
     t1 = MagicMock()
     parent.attach_mock(t0, "t0")
     parent.attach_mock(t1, "t1")
-    t0.get_teacher_logits_ipc.return_value = [{"rank_logits_ipc": 0}]
-    t1.get_teacher_logits_ipc.return_value = [
-        {"rank_topk_vals_ipc": 0, "rank_topk_idx_ipc": 1}
-    ]
+    t0.get_full_logits_ipc.return_value = [{"payload_ipc": 0}]
+    t1.get_full_logits_ipc.return_value = [{"payload_ipc": 1}]
     # Cross-tokenizer teacher 0 needs teacher_0_*/alignment_0_*; same-vocab
     # teacher 1 reuses the student tokenization (no teacher_1_* token keys).
     batch = _make_batch(num_teachers=1)
 
-    train_data = _run_teacher_forwards_and_pack([t0, t1], loss_fn, batch)
+    train_data = export_teacher_logits_and_pack(
+        [t0, t1], loss_fn, batch, teacher_mbs=[1, 1]
+    )
 
     # Cross-tokenizer teacher 0 -> full-logits IPC + its alignment payload.
     assert "teacher_0_full_logits_ipc" in train_data
     assert "alignment_0_pair_valid" in train_data
     assert "teacher_0_input_ids" in train_data
-    # Same-vocab teacher 1 -> top-K IPC handle list, no dense tensors, no
-    # projection/alignment keys.
-    assert "teacher_1_topk_ipc" in train_data
-    assert "teacher_1_topk_logits" not in train_data
-    assert "teacher_1_topk_indices" not in train_data
+    # Same-vocab teacher 1 -> full-logits IPC handle list, no dense tensors,
+    # no projection/alignment keys (it reuses the student tokenization).
+    assert "teacher_1_full_logits_ipc" in train_data
+    assert "teacher_1_input_ids" not in train_data
     assert "alignment_1_pair_valid" not in train_data
-    assert "teacher_1_full_logits_ipc" not in train_data
-    # Unified producer: full mode for teacher 0, top-K mode (with k) for 1.
-    t0.get_teacher_logits_ipc.assert_called_once()
-    assert t0.get_teacher_logits_ipc.call_args.kwargs["mode"] == "full"
-    t1.get_teacher_logits_ipc.assert_called_once()
-    assert t1.get_teacher_logits_ipc.call_args.kwargs["mode"] == "topk"
-    assert t1.get_teacher_logits_ipc.call_args.kwargs["k"] == 8
+    # Both teachers ship full logits via get_full_logits_ipc with their own MBS.
+    t0.get_full_logits_ipc.assert_called_once()
+    assert t0.get_full_logits_ipc.call_args.kwargs["micro_batch_size"] == 1
+    t1.get_full_logits_ipc.assert_called_once()
+    assert t1.get_full_logits_ipc.call_args.kwargs["micro_batch_size"] == 1
     # Serial collocated execution: each teacher onloaded then offloaded, AND
     # teacher 0 is offloaded before teacher 1 is onloaded (never both resident).
     for t in (t0, t1):
@@ -705,6 +720,8 @@ def test_setup_builds_one_policy_per_teacher():
                 },
                 "max_total_sequence_length": 64,
                 "make_sequence_length_divisible_by": 8,
+                "train_global_batch_size": 1,
+                "train_micro_batch_size": 1,
                 "tokenizer": {"name": "student-tok"},
             }
         )
@@ -723,12 +740,14 @@ def test_setup_builds_one_policy_per_teacher():
         patch.object(xt_mod, "CrossTokenizerCollator"),
         patch.object(xt_mod, "CrossTokenizerDistillationLossFn") as mock_loss_cls,
         patch.object(xt_mod, "StatefulDataLoader") as mock_dl_cls,
+        patch.object(xt_mod, "assert_teacher_student_batch_grid"),
+        patch.object(xt_mod, "assert_xtoken_ipc_node_local"),
     ):
         mock_cp_cls.return_value.get_latest_checkpoint_path.return_value = None
         mock_cp_cls.return_value.load_training_info.return_value = None
         mock_cp_cls.return_value.get_resume_paths.return_value = (None, None)
         mock_dl_cls.side_effect = lambda *a, **kw: MagicMock(spec=StatefulDataLoader)
-        mock_policy_cls.side_effect = lambda *a, **kw: MagicMock()
+        mock_policy_cls.side_effect = lambda *a, **kw: MagicMock(data_parallel_size=1)
 
         (_student, teachers, *_rest) = setup(
             cfg,
@@ -819,7 +838,13 @@ def test_averaged_logits_cross_tokenizer_skips_direct_kl_fast_path():
     student_logits = torch.zeros(2, 10, 32)
 
     total_kd, _ = fn._averaged_logits_kd(
-        student_logits, {}, teacher_full, torch.tensor(20.0)
+        student_logits,
+        {},
+        teacher_full,
+        {},
+        torch.tensor(20.0),
+        tp_group=None,
+        cp_group=None,
     )
     assert fallback_calls == [0, 1]  # per-teacher fallback path, one call each
     assert total_kd is not None
@@ -844,7 +869,15 @@ def test_averaged_logits_same_tokenizer_takes_direct_kl_fast_path():
     logits = torch.zeros(2, 10, 32)
     teacher_full = {0: logits.clone(), 1: logits.clone()}
 
-    kd, metrics = fn._averaged_logits_kd(logits, {}, teacher_full, torch.tensor(20.0))
+    kd, metrics = fn._averaged_logits_kd(
+        logits,
+        {},
+        teacher_full,
+        {0: MagicMock()},
+        torch.tensor(20.0),
+        tp_group=None,
+        cp_group=None,
+    )
     assert fast_calls == [1]  # fast path taken exactly once
     assert "kl_loss" in metrics
     assert kd.item() == pytest.approx(1.23)
@@ -1021,6 +1054,14 @@ def test_select_teacher_picks_lowest_ce_teacher(better):
         "sample_mask": torch.ones(1),
     }
 
+    # Same-vocab teachers are scored on the student tokens via the thin
+    # alignment (``align.student_input_ids`` / ``align.student_token_mask``).
+    align = SimpleNamespace(
+        student_input_ids=input_ids,
+        student_token_mask=torch.ones(1, seqlen),
+    )
+    aligns_by_idx = {0: align, 1: align}
+
     confident = torch.full((1, seqlen, vocab), -10.0)
     for t in range(seqlen - 1):
         confident[0, t, input_ids[0, t + 1]] = 10.0  # peak on the true next token
@@ -1036,7 +1077,13 @@ def test_select_teacher_picks_lowest_ce_teacher(better):
     fn._compute_teacher_kd = _fake_kd
 
     _kd, metrics = fn._select_teacher_kd(
-        torch.zeros(1, seqlen, vocab), data, teacher_full, torch.tensor(3.0)
+        torch.zeros(1, seqlen, vocab),
+        data,
+        teacher_full,
+        aligns_by_idx,
+        torch.tensor(3.0),
+        tp_group=None,
+        cp_group=None,
     )
 
     assert metrics["selected_teacher"] == better
