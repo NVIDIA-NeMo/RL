@@ -568,7 +568,8 @@ def calculate_rewards(
     # Build rewards: dict-based for multi-reward envs, tensor for single-reward.
     if all_dict_rewards is not None:
         assert len(all_rewards) == 0, (
-            "something like different shape reward is not support now"
+            "Mixing dict-based and scalar rewards across environments is not supported. "
+            "All environments must return the same reward format (all dict or all scalar)."
         )
         rewards: torch.Tensor | dict[str, torch.Tensor] = {
             name: torch.stack([vals[i] for i in sorted_indices])
