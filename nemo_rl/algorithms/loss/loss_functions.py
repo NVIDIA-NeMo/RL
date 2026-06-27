@@ -427,16 +427,13 @@ class ClippedPGLossFn(LossFunction):
             )
 
             # Compute KL loss
-            kl = (
-                kl_importance_weights
-                * self.reference_policy_kl_penalty
-                * calculate_kl(
-                    logprobs=curr_logprobs_unfiltered,
-                    logprobs_reference=reference_policy_logprobs,
-                    kl_type=self.reference_policy_kl_type,
-                    input_clamp_value=self.kl_input_clamp_value,
-                    output_clamp_value=self.kl_output_clamp_value,
-                )
+            kl = self.reference_policy_kl_penalty * calculate_kl(
+                logprobs=curr_logprobs_unfiltered,
+                logprobs_reference=reference_policy_logprobs,
+                kl_type=self.reference_policy_kl_type,
+                input_clamp_value=self.kl_input_clamp_value,
+                output_clamp_value=self.kl_output_clamp_value,
+                importance_sampling_weights=kl_importance_weights,
             )
 
             # Reduce KL loss
