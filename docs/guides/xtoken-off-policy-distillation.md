@@ -121,6 +121,7 @@ weight thresholds, hand-picked intermediate filenames, etc.).
    RayVirtualCluster — one GPU pool, shared by every worker group
    max_colocated_worker_groups = len(teachers) + 1   (no separate
    generation worker; no colocation toggle)
+   Shared GPUs = cluster.gpus_per_node × cluster.num_nodes
 
    Worker groups, all colocated on the SAME GPUs:
      teacher_0, teacher_1, …, teacher_{N-1}, student
