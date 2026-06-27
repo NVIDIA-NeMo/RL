@@ -246,7 +246,7 @@ def test_distillation_train_uses_nemo_gym_rollout_when_enabled(mock_components):
 
     with (
         patch(
-            "nemo_rl.algorithms.distillation.run_async_nemo_gym_rollout",
+            "nemo_rl.algorithms.distillation.run_nemo_gym_rollout_sync",
             return_value=mock_rollout_result,
         ) as mock_nemo_gym_rollout,
         patch(
@@ -481,7 +481,7 @@ def test_validate_uses_nemo_gym_rollout_when_enabled(mock_components):
 
     with (
         patch(
-            "nemo_rl.algorithms.distillation.run_async_nemo_gym_rollout",
+            "nemo_rl.algorithms.distillation.run_nemo_gym_rollout_sync",
             return_value=mock_rollout_result,
         ) as mock_nemo_gym_rollout,
         patch(

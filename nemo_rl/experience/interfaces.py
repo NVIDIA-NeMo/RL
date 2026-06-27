@@ -17,6 +17,9 @@ from typing import Any, Optional
 
 from nemo_rl.data.interfaces import LLMMessageLogType, VLMMessageLogType
 
+NG_TASK_INDEX_KEY = "_ng_task_index"
+NEXT_NG_TASK_INDEX_KEY = "next_ng_task_index"
+
 
 @dataclass
 class Completion:
