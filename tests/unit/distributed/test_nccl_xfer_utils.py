@@ -129,13 +129,13 @@ def test_is_expert_param(name, expected):
 @pytest.mark.parametrize(
     "name,expected",
     [
-        ("model.layers.0.self_attn.q_proj.weight", 0),  # column-parallel
-        ("model.layers.0.self_attn.o_proj.weight", 1),  # row-parallel
-        ("model.embed_tokens.weight", 0),  # vocab-parallel
-        ("lm_head.weight", 0),
-        ("model.layers.0.mlp.gate.weight", None),  # MoE router replicated
+        ("model.layers.0.mlp.gate_proj.weight", 0),  # FFN column-parallel
+        ("model.layers.0.mlp.up_proj.weight", 0),  # FFN column-parallel
+        ("model.layers.0.mlp.down_proj.weight", 1),  # FFN row-parallel
+        ("model.layers.0.mlp.gate.weight", None),  # MoE router (misc)
         ("model.layers.0.mlp.experts.0.gate_proj.weight", None),  # EP, not TP
-        ("model.layers.0.input_layernorm.weight", None),  # no shard rule
+        ("model.layers.0.input_layernorm.weight", None),  # non-FFN (misc)
+        ("model.layers.0.self_attn.q_proj.weight", None),  # attention -> misc
     ],
 )
 def test_get_tp_shard_dim(name, expected):
@@ -153,13 +153,14 @@ def _shard_dim_at(placements, dim_map, axis):
 
 def test_get_placements_tp_only_mesh():
     dm = {"tp": 0}
-    # column-parallel -> Shard(0)
-    assert _shard_dim_at(get_placements("a.q_proj.weight", dm, 2), dm, "tp") == 0
-    # row-parallel -> Shard(1)
-    assert _shard_dim_at(get_placements("a.o_proj.weight", dm, 2), dm, "tp") == 1
-    # vocab -> Shard(0)
-    assert (
-        _shard_dim_at(get_placements("model.embed_tokens.weight", dm, 2), dm, "tp") == 0
+    # FFN column-parallel -> Shard(0)
+    assert _shard_dim_at(get_placements("a.mlp.gate_proj.weight", dm, 2), dm, "tp") == 0
+    # FFN row-parallel -> Shard(1)
+    assert _shard_dim_at(get_placements("a.mlp.down_proj.weight", dm, 2), dm, "tp") == 1
+    # non-FFN (attention) -> Replicate (takes the misc path, not bulk-sharded)
+    assert all(
+        isinstance(p, Replicate)
+        for p in get_placements("a.self_attn.q_proj.weight", dm, 2)
     )
     # router gate -> Replicate
     assert all(
@@ -167,13 +168,14 @@ def test_get_placements_tp_only_mesh():
     )
     # 1-D param -> all Replicate regardless of rule
     assert all(
-        isinstance(p, Replicate) for p in get_placements("a.q_proj.weight", dm, 1)
+        isinstance(p, Replicate)
+        for p in get_placements("a.mlp.gate_proj.weight", dm, 1)
     )
 
 
 def test_get_placements_2d_mesh_shards_only_tp_axis():
     dm = {"dp": 0, "tp": 1}
-    placements = get_placements("a.q_proj.weight", dm, 2)
+    placements = get_placements("a.mlp.gate_proj.weight", dm, 2)
     assert len(placements) == 2
     assert isinstance(placements[dm["dp"]], Replicate)
     assert isinstance(placements[dm["tp"]], Shard) and placements[dm["tp"]].dim == 0
@@ -259,25 +261,14 @@ def test_group_expert_params_no_experts_is_identity():
 # --------------------------------------------------------------------------
 # build_nccl_xfer_refit_info
 # --------------------------------------------------------------------------
-def _dense_metadata(hidden=32, vocab=128, inter=64):
+def _dense_metadata(hidden=32, inter=64):
+    # FFN-only: the bulk path carries just gate/up/down (everything else -> misc).
     return {
-        "model.embed_tokens.weight": {
-            "shape": [vocab, hidden],
-            "dtype": "torch.bfloat16",
-        },
-        "model.layers.0.input_layernorm.weight": {
-            "shape": [hidden],
-            "dtype": "torch.bfloat16",
-        },
-        "model.layers.0.self_attn.q_proj.weight": {
-            "shape": [hidden, hidden],
-            "dtype": "torch.bfloat16",
-        },
-        "model.layers.0.self_attn.o_proj.weight": {
-            "shape": [hidden, hidden],
-            "dtype": "torch.bfloat16",
-        },
         "model.layers.0.mlp.gate_proj.weight": {
+            "shape": [inter, hidden],
+            "dtype": "torch.bfloat16",
+        },
+        "model.layers.0.mlp.up_proj.weight": {
             "shape": [inter, hidden],
             "dtype": "torch.bfloat16",
         },
@@ -285,8 +276,6 @@ def _dense_metadata(hidden=32, vocab=128, inter=64):
             "shape": [hidden, inter],
             "dtype": "torch.bfloat16",
         },
-        "model.norm.weight": {"shape": [hidden], "dtype": "torch.bfloat16"},
-        "lm_head.weight": {"shape": [vocab, hidden], "dtype": "torch.bfloat16"},
     }
 
 
@@ -335,35 +324,39 @@ def test_build_refit_info_top_level_and_param_fields():
             assert isinstance(p["src_mesh_info"], MeshInfo)
             assert isinstance(p["dst_mesh_info"], MeshInfo)
 
-    # q_proj is column-parallel -> Shard(0) on both train (TP2) and gen (TP4).
-    q = _find(info, "model.layers.0.self_attn.q_proj.weight")
-    assert q["global_shape"] == (32, 32)
-    assert any(isinstance(p, Shard) and p.dim == 0 for p in q["src_placements"])
-    assert any(isinstance(p, Shard) and p.dim == 0 for p in q["dst_placements"])
-    # 1-D norm is fully replicated on both sides.
-    ln = _find(info, "model.layers.0.input_layernorm.weight")
-    assert all(isinstance(p, Replicate) for p in ln["src_placements"])
-    assert all(isinstance(p, Replicate) for p in ln["dst_placements"])
+    # gate_proj is column-parallel -> Shard(0) on both train (TP2) and gen (TP4).
+    g = _find(info, "model.layers.0.mlp.gate_proj.weight")
+    assert g["global_shape"] == (64, 32)
+    assert any(isinstance(p, Shard) and p.dim == 0 for p in g["src_placements"])
+    assert any(isinstance(p, Shard) and p.dim == 0 for p in g["dst_placements"])
+    # down_proj is row-parallel -> Shard(1) on both sides.
+    d = _find(info, "model.layers.0.mlp.down_proj.weight")
+    assert any(isinstance(p, Shard) and p.dim == 1 for p in d["src_placements"])
+    assert any(isinstance(p, Shard) and p.dim == 1 for p in d["dst_placements"])
 
 
 def test_build_refit_info_sets_pp_stage_when_pp_gt_1():
     md = {
-        "model.embed_tokens.weight": {"shape": [128, 32], "dtype": "torch.bfloat16"},
-        "model.layers.0.self_attn.q_proj.weight": {
-            "shape": [32, 32],
+        "model.layers.0.mlp.gate_proj.weight": {
+            "shape": [64, 32],
             "dtype": "torch.bfloat16",
         },
-        "model.layers.1.self_attn.q_proj.weight": {
-            "shape": [32, 32],
+        "model.layers.0.mlp.down_proj.weight": {
+            "shape": [32, 64],
             "dtype": "torch.bfloat16",
         },
-        "lm_head.weight": {"shape": [128, 32], "dtype": "torch.bfloat16"},
+        "model.layers.1.mlp.gate_proj.weight": {
+            "shape": [64, 32],
+            "dtype": "torch.bfloat16",
+        },
+        "model.layers.1.mlp.down_proj.weight": {
+            "shape": [32, 64],
+            "dtype": "torch.bfloat16",
+        },
     }
     layer_to_pp_stage = {
-        "model.embed_tokens": 0,
         "model.layers.0": 0,
         "model.layers.1": 1,
-        "lm_head": 1,
     }
     info = build_nccl_xfer_refit_info(
         md,
