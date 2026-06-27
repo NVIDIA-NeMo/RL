@@ -601,7 +601,9 @@ def rm_train(
                             and any(
                                 [
                                     key.endswith(f"_{metric_name}")
-                                    for metric_name in [f.name for f in fields(RMValMetrics)]
+                                    for metric_name in [
+                                        f.name for f in fields(RMValMetrics)
+                                    ]
                                     if metric_name != "num_valid_samples"
                                 ]
                             )
