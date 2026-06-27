@@ -92,11 +92,11 @@ def test_build_hf_to_local_param_map_train_side():
 
     w = object.__new__(MegatronPolicyWorkerImpl)  # no __init__ / no megatron state
     prefix = "model.layers.0.mlp.experts"
-    direct = torch.randn(8, 16)  # a non-expert local shard view
+    direct = torch.randn(8, 16)  # a dense FFN down_proj local shard view
     e0 = torch.randn(128, 16)  # this rank's local expert 0 gate_proj
     e1 = torch.randn(128, 16)  # local expert 1 gate_proj
     w._iter_local_hf_param_shards = lambda: [
-        ("model.layers.0.self_attn.o_proj.weight", direct),
+        ("model.layers.0.mlp.down_proj.weight", direct),
         (f"{prefix}.0.gate_proj.weight", e0),
         (f"{prefix}.1.gate_proj.weight", e1),
     ]
@@ -105,7 +105,7 @@ def test_build_hf_to_local_param_map_train_side():
         "per_layer_params": {
             "model.layers.0": [
                 {
-                    "name": "model.layers.0.self_attn.o_proj.weight",
+                    "name": "model.layers.0.mlp.down_proj.weight",
                     "global_shape": [8, 16],
                 },
                 {
@@ -121,7 +121,7 @@ def test_build_hf_to_local_param_map_train_side():
     assert isinstance(pmap, HFToLocalParamMap)
 
     # Direct: base is the live local view, sent as-is (no hooks).
-    d = pmap.get("model.layers.0.self_attn.o_proj.weight")
+    d = pmap.get("model.layers.0.mlp.down_proj.weight")
     assert d.base is direct and d.pre is None and d.post is None
 
     # Grouped expert: pre stacks this rank's per-expert views into [E_local, ...]

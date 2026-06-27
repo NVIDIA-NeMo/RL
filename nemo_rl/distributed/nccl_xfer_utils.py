@@ -139,72 +139,36 @@ class RefitBuilderInterface(Protocol):
 # Placement rules (from xferdtensor/src/placement_rules.py)
 # =========================================================================
 
-# Column-parallel suffixes: TP shards along dim 0 (output dimension).
-# FP8 ``_scale_inv`` siblings are NOT listed here — they take the misc
-# refit path (the ``is_nccl_xfer_param`` whitelist excludes them), so vLLM's
-# load_weights handles the Parameter-specific FP8 blockwise quant layout.
+# FFN column-parallel suffixes: TP shards along dim 0 (output / intermediate).
+# Only FFN gate/up reach the bulk path; everything else (attention, embeddings,
+# scales, ...) takes the misc path (see ``is_nccl_xfer_param``).
 COLUMN_PARALLEL_SUFFIXES = [
-    "q_proj.weight",
-    "k_proj.weight",
-    "v_proj.weight",
     "gate_proj.weight",
     "up_proj.weight",
-    # DeepSeek MLA up-projections (column-parallel on output: num_heads * head_dim)
-    "q_b_proj.weight",
-    "kv_b_proj.weight",
 ]
 
-# DeepSeek MLA down-projections (q_a_proj / kv_a_proj_with_mqa).  In Megatron's
-# TE spec (what nemo-rl uses) these are TELinear with parallel_mode='duplicated'
-# — NOT tensor-parallel, the full weight is replicated on every TP rank at ANY
-# tp_size.  vLLM mirrors this (ReplicatedLinear, or fused into fused_qkv_a_proj
-# with disable_tp=True), so omitting them from COLUMN_PARALLEL_SUFFIXES gives the
-# right "all Replicate" placement on both sides for any TP.
-#
-# WARNING — holds ONLY for the unfused TE spec.  Both of these SHARD the down-
-# projs (ColumnParallelLinear, gather_output=False) and would break this:
-#   * the LOCAL spec (get_gpt_layer_local_spec)
-#   * mla_down_proj_fusion=True (also renames to fused linear_qkv_down_proj)
-# nemo-rl uses neither today (TE backend; fusion defaults False).
-
-# Row-parallel suffixes: TP shards along dim 1 (input dimension).
+# FFN row-parallel suffix: TP shards along dim 1 (input dimension).
 ROW_PARALLEL_SUFFIXES = [
-    "o_proj.weight",
-    "down_proj.weight",  # also grouped MoE expert down_proj (row-parallel, gen-side -> w2_weight)
-    # NemotronH Mamba2 output projection
-    "out_proj.weight",
-]
-
-# Vocabulary-parallel: TP shards along dim 0 (vocab dimension).
-VOCAB_PARALLEL_NAMES = [
-    "embed_tokens.weight",
-    "lm_head.weight",
-    # NemotronH HF token embedding (vLLM: model.embed_tokens.weight).
-    "embeddings.weight",
+    "down_proj.weight",  # dense MLP + grouped MoE expert (gen-side -> w2_weight)
 ]
 
 
 def get_tp_shard_dim(param_name: str) -> Optional[int]:
-    """Return the tensor dimension to shard for TP, or None if replicated."""
-    # MoE expert params use EP, not TP
+    """Return the TP shard dim for an FFN weight, or None if not TP-sharded.
+
+    Only FFN gate/up/down reach the bulk path: gate/up are column-parallel
+    (dim 0), down is row-parallel (dim 1).  MoE experts shard on EP not TP, so
+    they return None here — ``get_placements`` routes experts through
+    ``_get_expert_tp_shard_dim`` instead.
+    """
     if ".experts." in param_name:
         return None
-    # MoE router gate is always replicated
-    if (
-        param_name.endswith("mlp.gate.weight")
-        or "e_score_correction_bias" in param_name
-    ):
-        return None
-
     for suffix in COLUMN_PARALLEL_SUFFIXES:
         if param_name.endswith(suffix):
             return 0
     for suffix in ROW_PARALLEL_SUFFIXES:
         if param_name.endswith(suffix):
             return 1
-    for name in VOCAB_PARALLEL_NAMES:
-        if param_name.endswith(name):
-            return 0
     return None
 
 
@@ -213,58 +177,28 @@ def is_expert_param(param_name: str) -> bool:
     return ".experts." in param_name
 
 
-def is_nccl_xfer_param(param_name: str, qkv_to_misc: bool = False) -> bool:
-    """Return True iff the param takes the xferdtensor reshard path.
+# FFN projection weights (dense MLP + MoE experts) — the ONLY params on the
+# bulk xferdtensor path. For the large (MoE) models this feature targets these
+# are >97% of the refit payload.
+FFN_PROJ_WEIGHT_SUFFIXES = (
+    "gate_proj.weight",
+    "up_proj.weight",
+    "down_proj.weight",
+)
 
-    The nccl-xfer refit path chooses parameters for the nccl-xfer path
-    in a whitelist manner, to remain robust to new model and layer types.
-    Parameters that are not in the whitelist are treated as misc params
-    that falls back to the conventional packed_broadcast path.
 
-    The whitelist is:
-    - Embedding and output projection params.
-    - Most of the QKV weight params unless qkv_to_misc is True.
-    - MoE experts gate/up/down_proj weights.
+def is_nccl_xfer_param(param_name: str) -> bool:
+    """Return True iff the param takes the xferdtensor bulk reshard path.
 
-    Notable params that correctly fall through to misc:
-      * FP8 ``_scale_inv`` siblings and ``.k/v/q_scale`` / ``.weight_scale`` /
-        ``.input_scale`` scales — vLLM load_weights owns the blockwise-FP8 layout.
-      * MoE router/gate (``mlp.gate.weight`` / ``mlp.router.weight`` /
-        ``mixer.gate.weight``) — bf16 in Megatron but fp8 in vLLM; the dtype
-        mismatch would deadlock the bulk collective, so load_weights quantizes it.
-      * NemotronH Mamba2 mixer params (in_proj / conv1d / A_log / A / D / dt_bias
-        / norm) and all replicated params (layernorms, biases, MLA q_a/kv_a
-        down-projections) — no clean uniform TP shard; load_weights handles them.
+    Only the FFN projection weights take the nccl_xfer bulk path:
+    ``gate_proj`` / ``up_proj`` / ``down_proj`` ``.weight``, for both the dense
+    MLP and the MoE experts. This will cover >95% of the refit payload. For the
+    large models.
 
-    ``qkv_to_misc``: by default q/k/v_proj are subjected to the whitelist, but when
-    GQA KV heads can't be cleanly 1/tp-split (num_query_groups < max(train_tp, gen_tp))
-    the local split is impossible, so route fused/split QKV to misc instead.
+    Everything else falls back to the misc packed_broadcast + vLLM
+    ``load_weights`` path, which can cover diversity of parameters.
     """
-    if qkv_to_misc and param_name.endswith(
-        ("q_proj.weight", "k_proj.weight", "v_proj.weight", "linear_qkv.weight")
-    ):
-        return False
-    # MoE experts: the bulk EP-grouping handles ONLY the exact grouped
-    # projections (gate/up/down_proj weight with a numeric expert index).
-    if _INDIVIDUAL_EXPERT_RE.match(param_name):
-        return True
-    # Any OTHER ``.experts.*`` param (bias, scale, router-under-experts, a novel
-    # projection) is not bulk-handled -> misc.  Mirrors get_tp_shard_dim's
-    # ``.experts.`` short-circuit so a suffix match below can't sneak an expert
-    # onto the TP-sharded path.
-    if ".experts." in param_name:
-        return False
-    # Explicitly TP-sharded params: column (q/k/v/o/gate/up/down, MLA up-projs),
-    # row, vocab.
-    for suffix in (
-        COLUMN_PARALLEL_SUFFIXES + ROW_PARALLEL_SUFFIXES + VOCAB_PARALLEL_NAMES
-    ):
-        if param_name.endswith(suffix):
-            return True
-    # Unknown params match nothing in the whitelist -> misc.
-    # Mamba2 mixer params are not in the whitelist. (e.g. in_proj, conv1d,
-    # A_log, A, D, dt_bias, norm)
-    return False
+    return param_name.endswith(FFN_PROJ_WEIGHT_SUFFIXES)
 
 
 def _get_expert_tp_shard_dim(param_name: str) -> Optional[int]:
@@ -515,9 +449,8 @@ def _extract_layer_name(param_name: str) -> str:
     """Extract the layer group name from a parameter name.
 
     Examples:
-        ``model.layers.0.self_attn.q_proj.weight`` -> ``model.layers.0``
-        ``model.embed_tokens.weight`` -> ``model.embed_tokens``
-        ``lm_head.weight`` -> ``lm_head``
+        ``model.layers.0.mlp.gate_proj.weight`` -> ``model.layers.0``
+        ``backbone.layers.3.mlp.down_proj.weight`` -> ``backbone.layers.3``
     """
     m = _LAYER_RE.match(param_name)
     if m:

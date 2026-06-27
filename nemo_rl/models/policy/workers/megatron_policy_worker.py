@@ -1410,82 +1410,44 @@ class MegatronPolicyWorkerImpl(
             yield param_name, scale_tensor
 
     def _iter_local_hf_param_shards(self) -> Iterator[tuple[str, torch.Tensor]]:
-        """Yield (hf_name, local_tp_shard) for locally owned params.
+        """Yield (hf_name, local_tp_shard) for this rank's locally owned FFN params.
 
-        This function is used by the nccl_xfer_refit path, when building the
-        _param_map in build_nccl_xfer_refit_info.
+        Used by the nccl_xfer_refit bulk path (``build_hf_to_local_param_map``).
+        Only the FFN projections (gate/up/down_proj) take the bulk
+        path, so this yields ONLY those. Others. take the misc packed_broadcast path
+        and are skipped here (see ``is_nccl_xfer_param``).
 
-        Unlike ``_iter_params_with_optional_kv_scales`` which does PP broadcast
-        + TP gather via ``export_hf_weights``, this method yields TP-local
-        shards directly from Megatron parameters — no collectives needed.
-
-        Compound mappings (QKV, GatedMLP) are split into individual HF params
-        on the TP-local shard. The returned tensors are views of the model
-        parameters and must not be modified in-place.
-
-        Regarding the EP case, the self.refit_conversion_tasks already contains
-        the local expert weights only.
-
-        For the PP, non-local params, task.param_weight is None from
-        the refit_conversion_tasks.
+        Unlike ``_iter_params_with_optional_kv_scales`` (PP broadcast + TP gather
+        via ``export_hf_weights``), this yields TP-local shards directly from the
+        Megatron params — no collectives.  Returned tensors are views and must
+        not be modified in place.  EP: ``refit_conversion_tasks`` already holds
+        only this rank's local experts; PP non-local params have
+        ``param_weight is None``.
         """
-        from types import SimpleNamespace
+        from megatron.bridge.models.conversion.param_mapping import GatedMLPMapping
 
-        from megatron.bridge.models.conversion.param_mapping import (
-            GatedMLPMapping,
-            QKVMapping,
-            split_qkv_weights,
-        )
+        from nemo_rl.distributed.nccl_xfer_utils import is_nccl_xfer_param
 
-        config = self.megatron_bridge.transformer_config
-
-        # non-local expert weights are not included in the refit_conversion_tasks
         for task in self.refit_conversion_tasks:
-            # task.param_weight is the local tensor of the megatron model
-            local_tensor = task.param_weight
-
+            local_tensor = task.param_weight  # local megatron tensor
             if local_tensor is None:
-                continue  # Non-local PP rank
-
-            # scale tensors are routed to the misc path, so this function should
-            # skip the scale tensors. See is_nccl_xfer_param in nccl_xfer_utils.py
+                continue  # non-local PP rank
+            # FP8 scale siblings take the misc path.
             if task.global_param_name.endswith("_scale_inv"):
                 continue
 
-            hf_param = task.mapping.hf_param
+            if isinstance(task.mapping, GatedMLPMapping):
+                # FFN gate/up fused in linear_fc1 as [gate_shard; up_shard] (dim 0).
+                gate, up = torch.chunk(local_tensor, 2, dim=0)
+                yield task.mapping.hf_param["gate"], gate
+                yield task.mapping.hf_param["up"], up
+                continue
 
-            if isinstance(hf_param, dict):
-                if isinstance(task.mapping, QKVMapping):
-                    # Split interleaved QKV into separate Q, K, V on TP-local shard.
-                    # When tp_size > num_query_groups, we route the QKV to the misc path
-                    # in prepare_nccl_xfer_refit_info since there is too much complication there
-                    tp_size = task.mapping.tp_size
-                    if config.num_query_groups < tp_size:
-                        continue
-                    local_config = SimpleNamespace(
-                        num_attention_heads=config.num_attention_heads // tp_size,
-                        num_query_groups=config.num_query_groups // tp_size,
-                        kv_channels=config.kv_channels,
-                        hidden_size=config.hidden_size,
-                        attention_output_gate=getattr(
-                            config, "attention_output_gate", False
-                        ),
-                    )
-                    q, k, v = split_qkv_weights(local_config, local_tensor)
-                    yield hf_param["q"], q
-                    yield hf_param["k"], k
-                    yield hf_param["v"], v
-                elif isinstance(task.mapping, GatedMLPMapping):
-                    # Each TP shard of linear_fc1 is [gate_shard; up_shard] along dim 0
-                    gate, up = torch.chunk(local_tensor, 2, dim=0)
-                    yield hf_param["gate"], gate
-                    yield hf_param["up"], up
-                else:
-                    raise ValueError(
-                        f"Unsupported compound mapping: {type(task.mapping).__name__}"
-                    )
-            else:
-                # Simple 1→1 mapping
+            # Simple 1:1 mappings: only the FFN down_proj (and any non-gated
+            # simple gate/up) takes hits this branch. QKV (a compound mapping) and
+            # every non-FFN param fall through to misc, so they are skipped.
+            hf_param = task.mapping.hf_param
+            if not isinstance(hf_param, dict) and is_nccl_xfer_param(str(hf_param)):
                 yield str(hf_param), local_tensor
 
     @torch.no_grad()
@@ -1648,11 +1610,10 @@ class MegatronPolicyWorkerImpl(
         train_tp = train_parallelism.get("tp_size", 1)
         gen_tp = gen_parallelism.get("tp_size", 1)
 
-        # We are curretly forcing the QKV to the misc path
-        # QKV weights are only 1-2% of the total weights but brings a lot of complexity
-        # to be handled from the xfer-refit path.
-        qkv_to_misc = True
-
+        # Only the FFN gate/up/down weights take the bulk
+        # xferdtensor path (>97% of payload for the large models this targets);
+        # everything else (attention, embeddings, norms, router, MLA, scales)
+        # goes to the misc packed_broadcast + vLLM load_weights path.
         state_dict_metadata = {}
         misc_meta = OrderedDict()
         _xfer_bytes = _bcast_bytes = 0  # full-tensor payload routed to each path
@@ -1671,18 +1632,18 @@ class MegatronPolicyWorkerImpl(
         # misc_meta[hf_name] -> [shape, dtype]
         with _meta_tensor_alloc_context():
             for name, tensor in self._iter_params_with_optional_kv_scales():
+                if tie_lm_head and name == "lm_head.weight":
+                    # Tied to embed_tokens; no standalone tensor to source
+                    # (embed_tokens carries it; vLLM ties them on load).
+                    continue
                 meta = {
                     "shape": list(tensor.shape),
                     "dtype": str(tensor.dtype),
                 }
                 _nbytes = tensor.numel() * tensor.element_size()
-                # Whitelist: only known-shardable params take the nccl-xfer path;
-                # everything else (incl. unknown/new params) -> misc (packed_broadcast).
-                if is_nccl_xfer_param(name, qkv_to_misc=qkv_to_misc):
-                    if tie_lm_head and name == "lm_head.weight":
-                        # Tied to embed_tokens (transferred); no standalone tensor
-                        # to source, and the gen backend has none either.
-                        continue
+                # Downsized whitelist: only FFN gate/up/down weights take the bulk
+                # nccl-xfer path; everything else -> misc (packed_broadcast).
+                if is_nccl_xfer_param(name):
                     state_dict_metadata[name] = meta
                     _xfer_bytes += _nbytes
                 else:
@@ -1692,7 +1653,7 @@ class MegatronPolicyWorkerImpl(
         _gib = 1024**3
         _tot = _xfer_bytes + _bcast_bytes
         print(
-            f"[xferd-payload] qkv_to_misc={qkv_to_misc} "
+            f"[xferd-payload] ffn_only "
             f"nccl_xfer={_xfer_bytes / _gib:.2f}GiB "
             f"bcast_misc={_bcast_bytes / _gib:.2f}GiB "
             f"total={_tot / _gib:.2f}GiB "
