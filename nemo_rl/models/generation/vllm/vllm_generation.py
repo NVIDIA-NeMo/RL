@@ -1004,6 +1004,10 @@ class VllmGeneration(GenerationInterface):
             "num_pending_samples": {},  # dp_idx -> list[int]
             "kv_cache_usage_perc": {},  # dp_idx -> list[float]
             "generation_tokens": {},  # dp_idx -> list[int]
+            "prefix_cache_queries": {},  # dp_idx -> list[int] (windowed delta)
+            "prefix_cache_hits": {},  # dp_idx -> list[int] (windowed delta)
+            "prefix_cache_hit_rate": {},  # dp_idx -> list[float] (windowed)
+            "num_preemptions": {},  # dp_idx -> list[int] (windowed delta)
         }
 
         for dp_idx, stats in zip(dp_indices, results):
@@ -1023,6 +1027,15 @@ class VllmGeneration(GenerationInterface):
             generation_tokens = stats.get("generation_tokens")
             if generation_tokens:
                 vllm_logger_metrics["generation_tokens"][dp_idx] = generation_tokens
+            for key in (
+                "prefix_cache_queries",
+                "prefix_cache_hits",
+                "prefix_cache_hit_rate",
+                "num_preemptions",
+            ):
+                val = stats.get(key)
+                if val:
+                    vllm_logger_metrics[key][dp_idx] = val
 
         return vllm_logger_metrics
 

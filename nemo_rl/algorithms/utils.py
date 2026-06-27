@@ -913,6 +913,8 @@ def log_generation_metrics_to_wandb(
     step: int,
     timeline_interval: float,
     logger: Logger,
+    log_scalars: bool = False,
+    log_timeline_plots: bool = True,
 ) -> None:
     """Log generation metrics to wandb.
 
@@ -921,12 +923,40 @@ def log_generation_metrics_to_wandb(
         step: Global step value
         timeline_interval: Interval between timeline points (in seconds)
         logger: Logger instance
+        log_scalars: also log per-engine scalar aggregates (mean/max/p95 across time)
+            so the metrics show as trackable line charts, not just per-step Media images.
+        log_timeline_plots: log the per-worker matplotlib timeline IMAGE plots. These are heavy
+            (one figure per metric per step) and slow to upload/render; set False to rely on the
+            lightweight scalars instead.
     """
     for generation_metric in generation_logger_metrics.keys():
-        logger.log_plot_per_worker_timeline_metrics(
-            generation_logger_metrics[generation_metric],
-            step=step,
-            prefix="generation_metrics",
-            name=generation_metric,
-            timeline_interval=timeline_interval,
-        )
+        per_worker = generation_logger_metrics[generation_metric]
+        # Heavy per-step image plots (optional -> can dominate wandb render time).
+        if log_timeline_plots:
+            logger.log_plot_per_worker_timeline_metrics(
+                per_worker,
+                step=step,
+                prefix="generation_metrics",
+                name=generation_metric,
+                timeline_interval=timeline_interval,
+            )
+        # Optional per-engine scalar aggregates -> line charts trackable across steps.
+        if log_scalars:
+            for dp_idx, series in per_worker.items():
+                if series:
+                    arr = np.asarray(series, dtype=float)
+                    logger.log_metrics(
+                        {
+                            f"{generation_metric}/engine_{dp_idx}/mean": float(
+                                arr.mean()
+                            ),
+                            f"{generation_metric}/engine_{dp_idx}/max": float(
+                                arr.max()
+                            ),
+                            f"{generation_metric}/engine_{dp_idx}/p95": float(
+                                np.percentile(arr, 95)
+                            ),
+                        },
+                        step,
+                        prefix="generation_metrics",
+                    )
