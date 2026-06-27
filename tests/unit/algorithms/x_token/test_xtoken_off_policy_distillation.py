@@ -38,38 +38,45 @@ from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     validate,
     xtoken_off_policy_distillation_train,
 )
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _make_batch(batch_size: int = 1, t_student: int = 4, t_teacher: int = 4) -> dict:
+def _make_batch(
+    batch_size: int = 1, t_student: int = 4, t_teacher: int = 4
+) -> BatchedDataDict:
     """Synthetic batch with every key the algo's train_data packer reads."""
-    return {
-        "input_ids": torch.zeros((batch_size, t_student), dtype=torch.long),
-        "input_lengths": torch.full((batch_size,), t_student, dtype=torch.long),
-        "token_mask": torch.ones((batch_size, t_student), dtype=torch.long),
-        "sample_mask": torch.ones((batch_size,), dtype=torch.long),
-        "teacher_input_ids": torch.zeros((batch_size, t_teacher), dtype=torch.long),
-        "teacher_input_lengths": torch.full((batch_size,), t_teacher, dtype=torch.long),
-        "teacher_token_mask": torch.ones((batch_size, t_teacher), dtype=torch.long),
-        "alignment_pair_valid": torch.ones((batch_size, 2), dtype=torch.bool),
-        "alignment_pair_is_correct": torch.ones((batch_size, 2), dtype=torch.bool),
-        "alignment_student_exact_partition_mask": torch.zeros(
-            (batch_size, t_student), dtype=torch.bool
-        ),
-        "alignment_teacher_exact_partition_mask": torch.zeros(
-            (batch_size, t_teacher), dtype=torch.bool
-        ),
-        "alignment_student_chunk_id": torch.zeros(
-            (batch_size, t_student), dtype=torch.long
-        ),
-        "alignment_teacher_chunk_id": torch.zeros(
-            (batch_size, t_teacher), dtype=torch.long
-        ),
-        "alignment_num_chunks": torch.tensor([1] * batch_size, dtype=torch.long),
-    }
+    return BatchedDataDict(
+        {
+            "input_ids": torch.zeros((batch_size, t_student), dtype=torch.long),
+            "input_lengths": torch.full((batch_size,), t_student, dtype=torch.long),
+            "token_mask": torch.ones((batch_size, t_student), dtype=torch.long),
+            "sample_mask": torch.ones((batch_size,), dtype=torch.long),
+            "teacher_input_ids": torch.zeros((batch_size, t_teacher), dtype=torch.long),
+            "teacher_input_lengths": torch.full(
+                (batch_size,), t_teacher, dtype=torch.long
+            ),
+            "teacher_token_mask": torch.ones((batch_size, t_teacher), dtype=torch.long),
+            "alignment_pair_valid": torch.ones((batch_size, 2), dtype=torch.bool),
+            "alignment_pair_is_correct": torch.ones((batch_size, 2), dtype=torch.bool),
+            "alignment_student_exact_partition_mask": torch.zeros(
+                (batch_size, t_student), dtype=torch.bool
+            ),
+            "alignment_teacher_exact_partition_mask": torch.zeros(
+                (batch_size, t_teacher), dtype=torch.bool
+            ),
+            "alignment_student_chunk_id": torch.zeros(
+                (batch_size, t_student), dtype=torch.long
+            ),
+            "alignment_teacher_chunk_id": torch.zeros(
+                (batch_size, t_teacher), dtype=torch.long
+            ),
+            "alignment_num_chunks": torch.tensor([1] * batch_size, dtype=torch.long),
+        }
+    )
 
 
 def _mock_dataloader(num_batches: int) -> MagicMock:
@@ -105,6 +112,7 @@ def _make_master_config(
                 "val_period": val_period,
                 "val_at_start": val_at_start,
                 "val_at_end": val_at_end,
+                "val_teacher_micro_batch_size": 1,
             },
             "policy": {
                 "dtensor_cfg": {
@@ -115,6 +123,8 @@ def _make_master_config(
                 },
                 "max_total_sequence_length": 64,
                 "make_sequence_length_divisible_by": 8,
+                "train_global_batch_size": 1,
+                "train_micro_batch_size": 1,
                 "tokenizer": {"name": "student-tok"},
             },
             "teacher": {
@@ -126,6 +136,8 @@ def _make_master_config(
                 },
                 "max_total_sequence_length": 64,
                 "make_sequence_length_divisible_by": 8,
+                "train_global_batch_size": 1,
+                "train_micro_batch_size": 1,
                 "tokenizer": {"name": "teacher-tok"},
             },
             "loss_fn": {
@@ -176,9 +188,12 @@ def mock_xtoken_components():
         "grad_norm": torch.tensor(1.0),
         "all_mb_metrics": {"global_valid_toks": [10], "kl_loss": [0.3]},
     }
+    # validate() derives the DP degree for the val-batch pad quantum.
+    student_policy.data_parallel_size = 1
 
     teacher_policy = MagicMock()
     teacher_policy.get_full_logits_ipc.return_value = [{"shape": (4, 32)}]
+    teacher_policy.data_parallel_size = 1
 
     train_dataloader = _mock_dataloader(num_batches=10)
     val_dataloader = _mock_dataloader(num_batches=2)
@@ -230,7 +245,15 @@ def _patched_setup_call(master_config, *, student_vocab=32, teacher_vocab=24):
         mock_cp_cls.return_value.load_training_info.return_value = None
         mock_cp_cls.return_value.get_resume_paths.return_value = (None, None)
         mock_dl_cls.side_effect = lambda *a, **kw: MagicMock(spec=StatefulDataLoader)
-        mock_policy_cls.side_effect = lambda *a, **kw: MagicMock()
+
+        def _make_policy(*a, **kw):
+            # Policy.data_parallel_size feeds the diff-DP grid assert in
+            # setup(); it needs a real int, not a MagicMock.
+            policy = MagicMock()
+            policy.data_parallel_size = 1
+            return policy
+
+        mock_policy_cls.side_effect = _make_policy
 
         result = setup(
             master_config,
@@ -336,7 +359,15 @@ def test_setup_val_dataloader_gating(
         mock_cp_cls.return_value.load_training_info.return_value = None
         mock_cp_cls.return_value.get_resume_paths.return_value = (None, None)
         mock_dl_cls.side_effect = lambda *a, **kw: MagicMock(spec=StatefulDataLoader)
-        mock_policy_cls.side_effect = lambda *a, **kw: MagicMock()
+
+        def _make_policy(*a, **kw):
+            # Policy.data_parallel_size feeds the diff-DP grid assert in
+            # setup(); it needs a real int, not a MagicMock.
+            policy = MagicMock()
+            policy.data_parallel_size = 1
+            return policy
+
+        mock_policy_cls.side_effect = _make_policy
 
         (
             _student,
@@ -486,9 +517,24 @@ def test_ipc_buffer_released_on_student_train_failure(mock_xtoken_components):
     with pytest.raises(RuntimeError):
         _run_train(c)
 
-    # Even though student.train raised, the try/finally must have invoked
-    # teacher_policy.release_ipc_buffer.
+    # Even though student.train raised, the except branch must have invoked
+    # teacher_policy.release_ipc_buffer before propagating.
     assert c.teacher_policy.release_ipc_buffer.call_count >= 1
+
+
+def test_ipc_buffer_not_released_on_happy_path(mock_xtoken_components):
+    c = mock_xtoken_components
+    c.master_config.distillation["max_num_steps"] = 3
+    c.master_config.distillation["max_num_epochs"] = 10
+
+    _run_train(c)
+
+    # The teacher reuses one persistent IPC buffer across steps via copy_, so
+    # successful steps must not release it (releasing every step would free +
+    # realloc the large teacher-logits buffer and fragment the GPU into an OOM).
+    # It is released exactly once at termination -- not per step, which the old
+    # try/finally would have done (3 steps + 1 exit = 4 releases).
+    assert c.teacher_policy.release_ipc_buffer.call_count == 1
 
 
 # ---------------------------------------------------------------------------

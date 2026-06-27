@@ -1,0 +1,27 @@
+defaults: "../stage1_rlvr.yaml"
+
+policy:
+  generation_batch_size: 32
+  generation:
+    colocated:
+      resources:
+        num_nodes: 12
+
+  megatron_cfg:
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+
+env:
+  nemo_gym:
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          num_workers: 4
+    safety_judge_model:
+      responses_api_models:
+        local_vllm_model:
+          vllm_serve_kwargs:
+            data_parallel_size: 2
+
+cluster:
+  num_nodes: 20   # 8 train (TP4*CP8*PP1=32 GPUs, DP2) + 12 gen (TP8). +7 judge nodes -> SBATCH=27.

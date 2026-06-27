@@ -304,6 +304,19 @@ class BaseVllmGenerationWorker:
         if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
             load_format = "auto"
 
+        # MTP speculative decoding with load_format="dummy" gets its policy
+        # weights via refit, but the MTP draft layer is not covered by refit, so
+        # those layers are loaded directly from the checkpoint after engine init
+        # (see VllmInternalWorkerExtension.load_mtp_weights_from_disk).
+        spec_cfg = self.cfg.get("vllm_kwargs", {}).get("speculative_config")
+        mtp_weights_from_refit = bool(self.cfg.get("_mtp_weights_from_refit"))
+        self._mtp_load_from_disk: bool = (
+            load_format == "dummy"
+            and spec_cfg is not None
+            and spec_cfg.get("method") in ("deepseek_mtp", "mtp")
+            and not mtp_weights_from_refit
+        )
+
         if (
             len(get_nsight_config_if_pattern_matches("vllm_generation_worker")) > 0
             and vllm_kwargs["distributed_executor_backend"] == "ray"
@@ -542,6 +555,10 @@ class VllmGenerationWorkerImpl(BaseVllmGenerationWorker):
 
     def post_init(self):
         self.vllm_device_ids = self.report_device_id()
+        if self._mtp_load_from_disk:
+            self.llm.collective_rpc(
+                "load_mtp_weights_from_disk", args=(self.model_name,)
+            )
 
     def init_collective(
         self,

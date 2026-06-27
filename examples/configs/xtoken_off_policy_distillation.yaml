@@ -14,6 +14,10 @@ distillation:
   val_period: 0               # validation disabled by default
   val_at_start: false
   val_at_end: false
+  # Teacher microbatch size for the validation logits export. Defaults to the
+  # teacher's train MBS via interpolation; override with a literal to tune the
+  # val export independently of training.
+  val_teacher_micro_batch_size: ${teacher.train_micro_batch_size}
 
 loss_fn:
   # Path to the (student, teacher) projection matrix .pt file. Override via

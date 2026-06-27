@@ -13,7 +13,8 @@
 # limitations under the License.
 import os
 import warnings
-from typing import NotRequired, Optional, TypedDict, cast
+from dataclasses import dataclass, fields
+from typing import Optional
 
 import numpy as np
 import torch
@@ -46,38 +47,34 @@ from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 
-class SFTSaveState(TypedDict):
+@dataclass
+class SFTSaveState:
     epoch: int  # Track current epoch
     step: int  # Track step within current epoch
     total_steps: int  # Track total number of steps across all epochs
-    val_loss: NotRequired[float]  # Optional field - may not be present during training
     consumed_samples: int
     total_valid_tokens: int  # Track total number of non-padding tokens during training
 
 
-def _default_sft_save_state() -> SFTSaveState:
-    return {
-        "epoch": 0,
-        "step": 0,
-        "total_steps": 0,
-        "consumed_samples": 0,
-        "total_valid_tokens": 0,
-    }
+def _initial_sft_save_state() -> SFTSaveState:
+    return SFTSaveState(
+        epoch=0, step=0, total_steps=0, consumed_samples=0, total_valid_tokens=0
+    )
 
 
-class SFTConfig(TypedDict):
-    max_num_steps: int
-    max_num_epochs: int
-    val_period: int
-    val_batches: int
-    val_global_batch_size: int
-    val_micro_batch_size: int
-    val_at_start: bool
+class SFTConfig(BaseModel, extra="allow"):
+    max_num_steps: int = 60
+    max_num_epochs: int = 1
+    val_period: int = 10
+    val_batches: int = 8
+    val_global_batch_size: int = 32
+    val_micro_batch_size: int = 1
+    val_at_start: bool = True
     # Whether to run validation on the last training step. Setting this to True ensures the
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
-    val_at_end: bool
-    seed: int
-    only_unmask_final: bool
+    val_at_end: bool = False
+    seed: int = 42
+    only_unmask_final: bool = False
 
 
 class MasterConfig(BaseModel, extra="allow"):
@@ -113,7 +110,7 @@ def setup(
     Returns:
         Tuple of policy, cluster, dataloader, tokenizer, loss_fn, math_env, master_config, logger
     """
-    set_seed(master_config.sft["seed"])
+    set_seed(master_config.sft.seed)
 
     # Extract individual configs for easier access
     policy_config = master_config.policy
@@ -138,9 +135,18 @@ def setup(
     # ==========================
     checkpointer = CheckpointManager(checkpointing_config)
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
-    sft_save_state: Optional[SFTSaveState] = cast(
-        Optional[SFTSaveState], checkpointer.load_training_info(last_checkpoint_path)
-    )
+    loaded_state = checkpointer.load_training_info(last_checkpoint_path)
+    if loaded_state is not None:
+        # Filter to only known SFTSaveState fields; checkpoints may carry
+        # extra keys (e.g. validation metrics from previous runs).
+        # Backcompat: checkpoints saved before total_valid_tokens was added.
+        loaded_state.setdefault("total_valid_tokens", 0)
+        known_fields = {f.name for f in fields(SFTSaveState)}
+        sft_save_state = SFTSaveState(
+            **{k: v for k, v in loaded_state.items() if k in known_fields}
+        )
+    else:
+        sft_save_state = _initial_sft_save_state()
 
     # ==========================
     #           Data
@@ -160,7 +166,7 @@ def setup(
     if val_dataset is not None:
         val_dataloader = StatefulDataLoader(
             val_dataset,
-            batch_size=sft_config["val_global_batch_size"],
+            batch_size=sft_config.val_global_batch_size,
             shuffle=False,
             collate_fn=rl_collate_fn,
             drop_last=False,
@@ -195,8 +201,8 @@ def setup(
     print("\n▶ Setting up model...")
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
         total_train_iters = min(
-            sft_config["max_num_steps"],
-            sft_config["max_num_epochs"] * len(train_dataloader),
+            sft_config.max_num_steps,
+            sft_config.max_num_epochs * len(train_dataloader),
         )
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
     # check if tokenizer is a processor (e.g. for VLMs)
@@ -259,7 +265,7 @@ def validate(
 ):
     """Run validation on the validation dataset."""
     if val_dataloader is None:
-        assert master_config.sft["val_period"] <= 0, (
+        assert master_config.sft.val_period <= 0, (
             "val_dataloader is None, so sft.val_period must be <= 0"
         )
         print("  ⚠️ No validation dataloader provided, skipping validation")
@@ -282,7 +288,7 @@ def validate(
             add_loss_mask_to_message_log(
                 val_batch["message_log"],
                 roles_to_train_on=["assistant"],
-                only_unmask_final=master_config.sft["only_unmask_final"],
+                only_unmask_final=master_config.sft.only_unmask_final,
             )
 
             cat_and_padded, input_lengths = batched_message_log_to_flat_message(
@@ -384,26 +390,17 @@ def sft_train(
     )
     timeout.start_iterations()
 
-    if sft_save_state is None:
-        sft_save_state = _default_sft_save_state()
-        current_epoch = 0
-        current_step = 0
-        total_steps = 0
-        total_valid_tokens = 0
-    else:
-        current_epoch = sft_save_state["epoch"]
-        current_step = sft_save_state["step"]
-        total_steps = sft_save_state["total_steps"]
-        total_valid_tokens = sft_save_state.get(
-            "total_valid_tokens", 0
-        )  # Default to 0 for backward compatibility with older checkpoints
+    current_epoch = sft_save_state.epoch
+    current_step = sft_save_state.step
+    total_steps = sft_save_state.total_steps
+    total_valid_tokens = sft_save_state.total_valid_tokens
 
     sft_config = master_config.sft
     # Validation configuration
-    val_period = sft_config["val_period"]
-    val_at_start = sft_config["val_at_start"]
-    val_at_end = sft_config["val_at_end"]
-    max_num_epochs = sft_config["max_num_epochs"]
+    val_period = sft_config.val_period
+    val_at_start = sft_config.val_at_start
+    val_at_end = sft_config.val_at_end
+    max_num_epochs = sft_config.max_num_epochs
 
     # Run validation at the start if configured
     if val_at_start and total_steps == 0:
@@ -415,9 +412,9 @@ def sft_train(
             loss_fn,
             step=0,
             master_config=master_config,
-            val_batches=sft_config["val_batches"],
-            val_batch_size=sft_config["val_global_batch_size"],
-            val_mbs=sft_config["val_micro_batch_size"],
+            val_batches=sft_config.val_batches,
+            val_batch_size=sft_config.val_global_batch_size,
+            val_mbs=sft_config.val_micro_batch_size,
         )
 
         logger.log_metrics(val_metrics, total_steps, prefix="validation")
@@ -426,14 +423,13 @@ def sft_train(
     policy.prepare_for_training()
 
     while (
-        current_epoch < max_num_epochs
-        and total_steps < master_config.sft["max_num_steps"]
+        current_epoch < max_num_epochs and total_steps < master_config.sft.max_num_steps
     ):
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
 
         for batch in train_dataloader:
             print(
-                f"\n{'=' * 25} Step {current_step + 1}/{min(len(train_dataloader), master_config.sft['max_num_steps'])} {'=' * 25}"
+                f"\n{'=' * 25} Step {current_step + 1}/{min(len(train_dataloader), master_config.sft.max_num_steps)} {'=' * 25}"
             )
             maybe_gpu_profile_step(policy, total_steps + 1)
             val_metrics, validation_timings = None, None
@@ -446,7 +442,7 @@ def sft_train(
                     add_loss_mask_to_message_log(
                         batch["message_log"],
                         roles_to_train_on=["assistant"],
-                        only_unmask_final=master_config.sft["only_unmask_final"],
+                        only_unmask_final=master_config.sft.only_unmask_final,
                     )
 
                     cat_and_padded, input_lengths = batched_message_log_to_flat_message(
@@ -477,9 +473,7 @@ def sft_train(
                         timer=timer,
                     )
 
-                is_last_step = total_steps + 1 >= master_config.sft[
-                    "max_num_steps"
-                ] or (
+                is_last_step = total_steps + 1 >= master_config.sft.max_num_steps or (
                     current_epoch + 1 == max_num_epochs
                     and current_step + 1 == len(train_dataloader)
                 )
@@ -495,9 +489,9 @@ def sft_train(
                         loss_fn,
                         step=total_steps + 1,
                         master_config=master_config,
-                        val_batches=sft_config["val_batches"],
-                        val_batch_size=sft_config["val_global_batch_size"],
-                        val_mbs=sft_config["val_micro_batch_size"],
+                        val_batches=sft_config.val_batches,
+                        val_batch_size=sft_config.val_global_batch_size,
+                        val_mbs=sft_config.val_micro_batch_size,
                     )
                     logger.log_metrics(
                         validation_timings, total_steps + 1, prefix="timing/validation"
@@ -522,7 +516,7 @@ def sft_train(
                 total_valid_tokens += metrics.get("global_valid_toks", 0)
 
                 ## Checkpointing
-                sft_save_state["consumed_samples"] += master_config.policy[
+                sft_save_state.consumed_samples += master_config.policy[
                     "train_global_batch_size"
                 ]
                 timeout.mark_iteration()
@@ -538,10 +532,10 @@ def sft_train(
                 if master_config.checkpointing["enabled"] and (
                     should_save_by_step or should_save_by_timeout
                 ):
-                    sft_save_state["step"] = (current_step + 1) % len(train_dataloader)
-                    sft_save_state["total_steps"] = total_steps + 1
-                    sft_save_state["epoch"] = current_epoch
-                    sft_save_state["total_valid_tokens"] = total_valid_tokens
+                    sft_save_state.step = (current_step + 1) % len(train_dataloader)
+                    sft_save_state.total_steps = total_steps + 1
+                    sft_save_state.epoch = current_epoch
+                    sft_save_state.total_valid_tokens = total_valid_tokens
 
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
@@ -561,21 +555,23 @@ def sft_train(
                                 "This checkpoint will not be saved as top-k.",
                                 stacklevel=2,
                             )
-                            if full_metric_name in sft_save_state:
-                                del sft_save_state[full_metric_name]
+                            if hasattr(sft_save_state, full_metric_name):
+                                delattr(sft_save_state, full_metric_name)
                         elif metric_name not in metrics_source:
                             raise ValueError(
                                 f"Metric {metric_name} not found in {prefix} metrics"
                             )
                         else:
-                            sft_save_state[full_metric_name] = metrics_source[
-                                metric_name
-                            ]
+                            setattr(
+                                sft_save_state,
+                                full_metric_name,
+                                metrics_source[metric_name],
+                            )
 
                     with timer.time("checkpointing"):
                         print(f"Saving checkpoint for step {total_steps + 1}...")
                         checkpoint_path = checkpointer.init_tmp_checkpoint(
-                            total_steps + 1, sft_save_state, master_config
+                            total_steps + 1, vars(sft_save_state), master_config
                         )
                         policy.save_checkpoint(
                             weights_path=os.path.join(
@@ -650,7 +646,7 @@ def sft_train(
             if should_save_by_timeout:
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
-            if total_steps >= master_config.sft["max_num_steps"]:
+            if total_steps >= master_config.sft.max_num_steps:
                 print(
                     "Max number of steps has been reached, stopping training early",
                     flush=True,
