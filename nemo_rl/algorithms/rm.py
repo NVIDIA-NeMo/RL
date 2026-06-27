@@ -156,7 +156,6 @@ def setup(
     checkpointer = CheckpointManager(checkpointing_config)
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
     loaded_state = checkpointer.load_training_info(last_checkpoint_path)
-    rm_save_state: RMSaveState
     if loaded_state is not None:
         # Filter to only known RMSaveState fields; checkpoints may carry
         # extra keys (e.g. validation metrics from previous runs).
@@ -314,7 +313,7 @@ def validate(
         logger.log_metrics(asdict(k_val_metrics), step, prefix=prefix)
         logger.log_metrics(k_validation_timings, step, prefix=f"timing/{prefix}")
 
-        for metric_name in RMValMetrics.__annotations__.keys():
+        for metric_name in [f.name for f in fields(RMValMetrics)]:
             if metric_name != "num_valid_samples":
                 val_metrics[f"{prefix}_{metric_name}"] = getattr(
                     k_val_metrics, metric_name
@@ -389,7 +388,7 @@ def validate_one_dataset(
                     " This is likely because there were no valid samples."
                 )
             else:
-                for metric_name in RMValMetrics.__annotations__.keys():
+                for metric_name in [f.name for f in fields(RMValMetrics)]:
                     dict_val_metrics[metric_name] += [
                         sum(val_results["all_mb_metrics"][metric_name])
                     ]
@@ -414,7 +413,7 @@ def validate_one_dataset(
                         ]
                     )
                     / sum_num_valid_samples
-                    for metric_name in RMValMetrics.__annotations__.keys()
+                    for metric_name in [f.name for f in fields(RMValMetrics)]
                     if metric_name != "num_valid_samples"
                 },
             )
@@ -426,7 +425,7 @@ def validate_one_dataset(
             val_metrics = RMValMetrics(
                 **{
                     metric_name: 0.0
-                    for metric_name in RMValMetrics.__annotations__.keys()
+                    for metric_name in [f.name for f in fields(RMValMetrics)]
                 }
             )
 
@@ -440,7 +439,7 @@ def validate_one_dataset(
     if num_valid_batches > 0:
         # Print summary of validation results
         print(f"\n📊 Validation Results for `{dataset_name}` set:")
-        for metric_name in RMValMetrics.__annotations__.keys():
+        for metric_name in [f.name for f in fields(RMValMetrics)]:
             if metric_name != "num_valid_samples":
                 print(
                     f"    • Validation {metric_name}: {getattr(val_metrics, metric_name):.4f}"
@@ -602,7 +601,7 @@ def rm_train(
                             and any(
                                 [
                                     key.endswith(f"_{metric_name}")
-                                    for metric_name in RMValMetrics.__annotations__.keys()
+                                    for metric_name in [f.name for f in fields(RMValMetrics)]
                                     if metric_name != "num_valid_samples"
                                 ]
                             )
@@ -672,7 +671,7 @@ def rm_train(
             timing_metrics = timer.get_timing_metrics(reduction_op="sum")
 
             print("\n📊 Training Results:")
-            for metric_name in RMValMetrics.__annotations__.keys():
+            for metric_name in [f.name for f in fields(RMValMetrics)]:
                 if metric_name != "num_valid_samples":
                     print(f"  • {metric_name}: {float(metrics[metric_name]):.4f}")
                 else:
