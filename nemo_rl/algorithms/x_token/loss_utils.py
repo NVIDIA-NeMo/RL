@@ -1057,7 +1057,9 @@ def prepare_xtoken_cross_tokenizer_loss_input(
             cp_group,
             fill=-1,
         )
-        align.teacher_chunk_id = cp_shift_next(align.teacher_chunk_id, cp_group, fill=-1)
+        align.teacher_chunk_id = cp_shift_next(
+            align.teacher_chunk_id, cp_group, fill=-1
+        )
         align.student_input_ids = student_input_ids
         align.student_token_mask = student_token_mask
         aligns_by_idx[i] = align
