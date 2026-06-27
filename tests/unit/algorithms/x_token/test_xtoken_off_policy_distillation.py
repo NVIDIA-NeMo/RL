@@ -42,7 +42,6 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 
 import nemo_rl.algorithms.xtoken_off_policy_distillation as xt_mod
 from nemo_rl.algorithms.loss.loss_functions import CrossTokenizerDistillationLossFn
-from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     MasterConfig,
     TeacherConfig,
@@ -53,6 +52,7 @@ from nemo_rl.algorithms.xtoken_off_policy_distillation import (
     xtoken_non_student_seq_keys,
     xtoken_off_policy_distillation_train,
 )
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
 def has_gloo() -> bool:
