@@ -398,6 +398,13 @@ constraint-dependencies = [
   "diffusers>=0.38.0",
 ]
 
+# Workaround for https://github.com/NVIDIA/cutlass/issues/3259: libs-base
+# and libs-cu13 wheels overlap and race on shared paths. libs-cu13 is a
+# functional superset at 4.5.2, so drop libs-base to make installs deterministic.
+exclude-dependencies = [
+  "nvidia-cutlass-dsl-libs-base",
+]
+
 conflicts = [
   [
     { extra = "fsdp" },
