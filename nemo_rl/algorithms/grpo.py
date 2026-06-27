@@ -2025,9 +2025,6 @@ def refit_policy_generation(
                 # nccl_xfer path: shard-to-shard xferdtensor transfer
                 futures_train = policy.nccl_xfer_refit(kv_scales=kv_scales)
                 futures_inference = policy_generation.nccl_xfer_refit()
-                ray.get(futures_train)
-                results = ray.get(futures_inference)
-                update_success = all(result for result in results if result is not None)
             else:
                 if isinstance(policy_generation, MegatronGeneration):
                     futures_train = policy.swap_weights_via_reshard(is_source=True)
@@ -2036,10 +2033,10 @@ def refit_policy_generation(
                         kv_scales=kv_scales
                     )
                 futures_inference = policy_generation.update_weights_from_collective()
-                # wait for all futures to complete
-                ray.get(futures_train)
-                results = ray.get(futures_inference)
-                update_success = all(result for result in results if result is not None)
+            # wait for all futures to complete
+            ray.get(futures_train)
+            results = ray.get(futures_inference)
+            update_success = all(result for result in results if result is not None)
 
         # check if update is successful
         if not update_success:
