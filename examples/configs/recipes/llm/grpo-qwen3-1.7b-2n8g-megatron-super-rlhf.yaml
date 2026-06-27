@@ -1,0 +1,76 @@
+# Nightly sanity check for the Nemotron 3 Super RLHF pipeline (Stage 3).
+# Uses Qwen3-1.7B (dense) to exercise the genrm_compare reward mechanism
+# at minimal cost.
+#
+# Resource layout (2 nodes total):
+#   - 1 node:  policy training + colocated vllm (Qwen3-1.7B is tiny)
+#   - 1 node:  nemo-gym GenRM judge server (env.nemo_gym.num_gpu_nodes)
+#
+# Data: nvidia/Nemotron-RL-Super-Training-Blends (rlhf split).
+# See docs/guides/nemotron-3-super.md for download instructions.
+defaults: ../../../nemo_gym/nemotron-3-super/stage3_rlhf.yaml
+
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-1.7b-2n8g-megatron-super-rlhf
+
+grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 8
+  async_grpo:
+    enabled: false
+
+policy:
+  model_name: "Qwen/Qwen3-1.7B"
+  train_global_batch_size: 16
+  max_total_sequence_length: 8192
+
+  megatron_cfg:
+    tensor_model_parallel_size: 1
+    context_parallel_size: 1
+    expert_model_parallel_size: 1
+    sequence_parallel: false
+    activation_checkpointing: false
+    mtp_num_layers: 0  # Qwen3-1.7B has no MTP layers; override base stage default of 5
+
+  generation:
+    colocated:
+      enabled: true
+    vllm_cfg:
+      tensor_parallel_size: 1
+      reasoning_parser_plugin: null
+      http_server_serving_chat_kwargs:
+        reasoning_parser: deepseek_r1
+
+data:
+  train:
+    data_path: "${oc.env:HF_HOME}/superv3_data/rlhf/train-split.jsonl"
+  validation:
+    data_path: "${oc.env:HF_HOME}/superv3_data/rlhf/val-split.jsonl"
+
+env:
+  nemo_gym:
+    # 1 dedicated GPU node for the GenRM judge server; base defaults to 8.
+    num_gpu_nodes: 1
+    genrm_compare_resources_server:
+      resources_servers:
+        genrm_compare:
+          num_rollouts_per_prompt: 8
+    genrm_model:
+      responses_api_models:
+        genrm_model:
+          vllm_serve_kwargs:
+            # Scale down to fit 1 gym node (8 GPUs); base uses DP=8 TP=8 = 64 GPUs.
+            data_parallel_size: 1
+            tensor_parallel_size: 8
+
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-qwen3-1.7b-2n8g-megatron-super-rlhf
+
+cluster:
+  # cluster.num_nodes is policy-only; the GenRM gym node is separate.
+  # Total SLURM nodes = cluster.num_nodes (1) + env.nemo_gym.num_gpu_nodes (1) = 2.
+  num_nodes: 1

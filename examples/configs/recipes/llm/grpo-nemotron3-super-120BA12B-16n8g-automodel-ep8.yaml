@@ -1,0 +1,72 @@
+defaults: ../../grpo_math_1B.yaml
+
+grpo:
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 8
+
+checkpointing:
+  checkpoint_dir: results/grpo-nemotron3-super-120BA12B-16n8g-automodel-ep8
+
+policy:
+  model_name: "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
+  tokenizer:
+    name: "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
+  train_global_batch_size: 128
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  logprob_chunk_size: 2048
+  max_total_sequence_length: 8192
+  make_sequence_length_divisible_by: 8
+  optimizer:
+    name: transformer_engine.pytorch.optimizers.fused_adam.FusedAdam
+    kwargs:
+      master_weights: true
+      store_param_remainders: true
+      exp_avg_dtype: torch.bfloat16
+      exp_avg_sq_dtype: torch.bfloat16
+  megatron_cfg:
+    enabled: false
+  dtensor_cfg:
+    enabled: true
+    expert_parallel_size: 8
+    activation_checkpointing: true
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    automodel_kwargs:
+      backend:
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
+        attn: te
+        linear: te
+        rms_norm: te
+        enable_deepep: true
+        fake_balanced_gate: false
+        rope_fusion: false
+        enable_hf_state_dict_adapter: true
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: true
+  generation:
+    vllm_cfg:
+      # TP=8 required: 120B BF16 / 8 = 30 GB/GPU; gpu_memory_utilization=0.6 → 48 GB/GPU for vLLM.
+      # Nemotron-3-Super is a Mamba-hybrid; each decode sequence needs one Mamba cache block.
+      # At gpu_memory_utilization=0.5, only ~878 blocks are available (below the default
+      # max_num_seqs=1024), causing vLLM to abort. 0.6 yields ~1053 blocks, clearing the limit.
+      tensor_parallel_size: 8
+      gpu_memory_utilization: 0.6
+    vllm_kwargs:
+      # vLLM's FlashInfer TRTLLM MoE backend stores bf16 expert weights in a
+      # blocked runtime layout that its load_weights path cannot refit.
+      # Use TRITON to keep the refit-compatible 3D MoE layout.
+      moe_backend: triton
+
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-nemotron3-super-120BA12B-16n8g-automodel-ep8
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 16

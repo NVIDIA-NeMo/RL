@@ -1,0 +1,79 @@
+# Nightly sanity check for the Nemotron 3 Super SWE pipeline (Stage 2.1).
+# Uses Qwen3-1.7B (dense) to exercise the SWE pivot single-step tool-use
+# environment at minimal cost. No Apptainer/Singularity required
+# (Stage 2.2 SWE environments are not tested here).
+#
+# Resource layout (1 node total):
+#   - 1 node: policy training + colocated vllm (Qwen3-1.7B is tiny)
+#   - 0 nodes: SWE judge is CPU-based (no GPU nodes required)
+#
+# Data: nvidia/Nemotron-RL-Super-Training-Blends (swe1 split).
+# See docs/guides/nemotron-3-super.md for download instructions.
+defaults: ../../../nemo_gym/nemotron-3-super/stage2_swe1.yaml
+
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-1.7b-1n8g-megatron-super-swe1
+
+grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 8
+  async_grpo:
+    enabled: false
+
+policy:
+  model_name: "Qwen/Qwen3-1.7B"
+  train_global_batch_size: 16
+  max_total_sequence_length: 81920
+  # Qwen3-1.7B's native max_position_embeddings is 40960; vLLM rejects
+  # max_model_len > that value without this override.
+  hf_config_overrides:
+    max_position_embeddings: 131072
+
+  megatron_cfg:
+    tensor_model_parallel_size: 1
+    expert_model_parallel_size: 1
+    sequence_parallel: false
+    activation_checkpointing: false
+    mtp_num_layers: 0  # Qwen3-1.7B has no MTP layers; override base stage default of 5
+
+  generation:
+    colocated:
+      enabled: true
+    vllm_cfg:
+      tensor_parallel_size: 1
+      reasoning_parser_plugin: null
+      http_server_serving_chat_kwargs:
+        reasoning_parser: deepseek_r1
+
+data:
+  train:
+    data_path: "${oc.env:HF_HOME}/superv3_data/swe1/train-split.jsonl"
+  validation:
+    data_path: "${oc.env:HF_HOME}/superv3_data/swe1/val-split.jsonl"
+
+env:
+  nemo_gym:
+    # The SWE1 training data references agent_ref.name =
+    # "single_step_tool_use_with_argument_comparison_swe", but the base
+    # stage2_swe1.yaml config_paths only register "swe_pivot_*" keys.
+    # Register the expected key here as an alias pointing to the same server.
+    single_step_tool_use_with_argument_comparison_swe:
+      responses_api_agents:
+        tool_simulation_agent:
+          entrypoint: app.py
+          resources_server:
+            type: resources_servers
+            name: swe_pivot_single_step_tool_use_with_argument_comparison_resources_server
+          model_server:
+            type: responses_api_models
+            name: policy_model
+
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-qwen3-1.7b-1n8g-megatron-super-swe1
+
+cluster:
+  num_nodes: 1

@@ -1,0 +1,61 @@
+defaults: ../../grpo_math_1B.yaml
+
+grpo:
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 8
+
+checkpointing:
+  checkpoint_dir: results/grpo-nemotron3-super-120BA12B-16n8g-megatron
+
+policy:
+  model_name: "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
+  tokenizer:
+    name: "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
+  train_global_batch_size: 128
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  logprob_chunk_size: 2048              # Chunk logprob to reduce peak memory; requires defer_fp32_logits
+  max_total_sequence_length: 8192
+  # Divisible by TP=4; use 8 for SP-alignment safety
+  make_sequence_length_divisible_by: 8
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    expert_model_parallel_size: 32
+    sequence_parallel: true
+    activation_checkpointing: true
+    bias_activation_fusion: false       # Required for this model family
+    moe_router_dtype: "fp32"            # Production value; base default is "fp64"
+    moe_router_load_balancing_type: "none"
+    moe_router_bias_update_rate: 1.0e-3 # Production value; base default is 0.0
+    moe_router_enable_expert_bias: true
+    moe_permute_fusion: true
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "alltoall"
+    defer_fp32_logits: true             # Required when logprob_chunk_size is set
+  
+    ## mtp
+    mtp_num_layers: 5
+    mtp_detach_heads: true
+    mtp_use_repeated_layer: true
+    mtp_loss_scaling_factor: 0.3
+
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 8
+      gpu_memory_utilization: 0.5
+
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-nemotron3-super-120BA12B-16n8g-megatron
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 16

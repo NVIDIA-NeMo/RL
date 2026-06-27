@@ -1,0 +1,83 @@
+# Nightly sanity check for the Nemotron 3 Super RLVR pipeline (Stage 1).
+# Uses Qwen3-1.7B (dense) to exercise the full nemo-gym RLVR environment
+# stack at minimal cost. nano-v3 is already covered by other nightly tests.
+#
+# Resource layout (6 nodes total):
+#   - 1 node:  policy training + colocated vllm (Qwen3-1.7B is tiny)
+#   - 5 nodes: nemo-gym judge servers (genrm, nl2bash, safety)
+#              inherited from stage1_rlvr.yaml (env.nemo_gym.num_gpu_nodes: 5)
+#
+# Data: nvidia/Nemotron-RL-Super-Training-Blends (rlvr1 split).
+# See docs/guides/nemotron-3-super.md for download instructions.
+defaults: ../../../nemo_gym/nemotron-3-super/stage1_rlvr.yaml
+
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-1.7b-6n8g-megatron-super-rlvr
+
+grpo:
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 8
+  async_grpo:
+    enabled: false
+
+policy:
+  model_name: "Qwen/Qwen3-1.7B"
+  train_global_batch_size: 128
+  max_total_sequence_length: 32768
+
+  megatron_cfg:
+    tensor_model_parallel_size: 1
+    context_parallel_size: 4
+    expert_model_parallel_size: 1
+    sequence_parallel: false
+    activation_checkpointing: false
+    mtp_num_layers: 0  # Qwen3-1.7B has no MTP layers; override base stage default of 5
+
+  generation:
+    colocated:
+      enabled: true
+    vllm_cfg:
+      tensor_parallel_size: 1
+      reasoning_parser_plugin: null
+      http_server_serving_chat_kwargs:
+        reasoning_parser: deepseek_r1
+
+data:
+  train:
+    data_path: "${oc.env:HF_HOME}/superv3_data/rlvr1/train-split.jsonl"
+  validation:
+    data_path: "${oc.env:HF_HOME}/superv3_data/rlvr1/val-split.jsonl"
+
+env:
+  nemo_gym:
+    genrm_compare_resources_server:
+      resources_servers:
+        genrm_compare:
+          num_rollouts_per_prompt: 8
+    genrm_model:
+      responses_api_models:
+        genrm_model:
+          vllm_serve_kwargs:
+            max_num_seqs: 16
+    nl2bash_judge_model:
+      responses_api_models:
+        local_vllm_model:
+          vllm_serve_kwargs:
+            max_num_seqs: 16
+    safety_judge_model:
+      responses_api_models:
+        local_vllm_model:
+          vllm_serve_kwargs:
+            max_num_seqs: 16
+
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-qwen3-1.7b-6n8g-megatron-super-rlvr
+
+cluster:
+  # cluster.num_nodes is policy-only; the 5 nemo-gym nodes are separate.
+  # Total SLURM nodes = cluster.num_nodes (1) + env.nemo_gym.num_gpu_nodes (5) = 6.
+  num_nodes: 1
