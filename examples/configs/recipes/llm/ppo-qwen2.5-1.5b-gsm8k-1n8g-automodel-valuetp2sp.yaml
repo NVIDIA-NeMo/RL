@@ -23,11 +23,8 @@ checkpointing:
   checkpoint_dir: results/ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp
 policy:
   model_name: Qwen/Qwen2.5-1.5B-Instruct
-  tokenizer:
-    name: Qwen/Qwen2.5-1.5B-Instruct
   train_global_batch_size: 256
   max_total_sequence_length: 1024
-  make_sequence_length_divisible_by: 8
   generation:
     max_new_tokens: 512
     vllm_cfg:
@@ -35,9 +32,10 @@ policy:
       max_model_len: 1024
 value:
   model_name: Qwen/Qwen2.5-1.5B-Instruct
-  tokenizer:
-    name: Qwen/Qwen2.5-1.5B-Instruct
   train_micro_batch_size: 4
+  dtensor_cfg:
+    tensor_parallel_size: 2
+    sequence_parallel: true
 data:
   max_input_seq_length: 512
   train:

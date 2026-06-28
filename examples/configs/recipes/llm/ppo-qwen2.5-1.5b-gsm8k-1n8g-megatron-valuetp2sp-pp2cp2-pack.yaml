@@ -6,6 +6,8 @@ value:
   megatron_cfg:
     pipeline_model_parallel_size: 2
     context_parallel_size: 2
+  dynamic_batching:
+    enabled: false
   sequence_packing:
     enabled: true
 logger:
