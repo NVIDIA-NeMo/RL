@@ -179,6 +179,10 @@ class ColocatablePolicyInterface(PolicyInterface):
         pass
 
     @abstractmethod
+    def offload_to_cpu(self) -> None:
+        pass
+
+    @abstractmethod
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         pass
 
