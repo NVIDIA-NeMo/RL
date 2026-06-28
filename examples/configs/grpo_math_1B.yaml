@@ -311,6 +311,7 @@ policy:
     port_range_high: 15000
     backend: "vllm"
     max_new_tokens: ${policy.max_total_sequence_length}
+    thinking_token_budget: null
     temperature: 1.0
     top_p: 1.0
     top_k: null

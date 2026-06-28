@@ -120,6 +120,7 @@ class GenerationConfig(TypedDict):
 
     backend: str
     max_new_tokens: int
+    thinking_token_budget: NotRequired[int | None]
     temperature: float
     top_p: float
     top_k: int | None
