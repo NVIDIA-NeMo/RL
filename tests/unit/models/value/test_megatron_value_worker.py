@@ -573,6 +573,31 @@ def test_unpack_value_sequences_variable_lengths():
     torch.testing.assert_close(out, expected)
 
 
+def test_value_loss_prepare_fn_shift_and_truncate():
+    """`_value_loss_prepare_fn` (the value-model LossPostProcessor prepare_fn)
+    right-shifts the value-head output (values[t] = V(state before token t)),
+    drops a trailing singleton, and truncates to the returns length. CPU-only
+    (cp_group=None, so the CP all-gather is a no-op).
+    """
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        _value_loss_prepare_fn,
+    )
+
+    logits = torch.tensor([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]])
+    data = BatchedDataDict({"returns": torch.zeros(2, 3)})
+    # Right-shift by one, then truncate to the returns length (3).
+    expected = torch.tensor([[0.0, 1.0, 2.0], [0.0, 5.0, 6.0]])
+
+    out, _ = _value_loss_prepare_fn(logits, data, context_parallel_group=None)
+    torch.testing.assert_close(out["logits"], expected)
+
+    # The value head's trailing singleton [B, S, 1] is squeezed first.
+    out_3d, _ = _value_loss_prepare_fn(
+        logits.unsqueeze(-1), data, context_parallel_group=None
+    )
+    torch.testing.assert_close(out_3d["logits"], expected)
+
+
 @pytest.mark.hf_gated
 @pytest.mark.timeout(300)
 @pytest.mark.parametrize(

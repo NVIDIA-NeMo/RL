@@ -380,12 +380,14 @@ class LossPostProcessor:
         cp_normalize: bool = True,
         sampling_params: Optional[TrainingSamplingParams] = None,
         draft_model: Optional[MegatronModule] = None,
+        prepare_fn: Optional[Callable[..., Any]] = None,
     ):
         self.loss_fn = loss_fn
         self.cfg = cfg
         self.num_microbatches = num_microbatches
         self.cp_normalize = cp_normalize
         self.sampling_params = sampling_params
+        self.prepare_fn = prepare_fn
         if draft_model is not None and draft_model.eagle_module is not None:
             self.d2t = getattr(draft_model.eagle_module, "d2t", None)
         else:
@@ -413,14 +415,17 @@ class LossPostProcessor:
         Returns:
             Callable: Function that takes output tensor and returns (loss, metrics) tuple
         """
-        # wrap prepare_loss_input with sampling_params and optional d2t mapping
+        # A custom prepare_fn (e.g. value models) overrides the default logit prep.
         logprob_chunk_size = self.cfg.get("logprob_chunk_size", None)
-        prepare_loss_input_wrapped = partial(
-            prepare_loss_input,
-            sampling_params=self.sampling_params,
-            d2t=self.d2t,
-            chunk_size=logprob_chunk_size,
-        )
+        if self.prepare_fn is not None:
+            prepare_loss_input_wrapped = self.prepare_fn
+        else:
+            prepare_loss_input_wrapped = partial(
+                prepare_loss_input,
+                sampling_params=self.sampling_params,
+                d2t=self.d2t,
+                chunk_size=logprob_chunk_size,
+            )
 
         # wrap loss function with loss input preparation
         pack_sequences = self.cfg["sequence_packing"]["enabled"]
