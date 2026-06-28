@@ -396,6 +396,8 @@ constraint-dependencies = [
   "pyjwt>=2.13.0",
   "dulwich>=1.2.5",
   "diffusers>=0.38.0",
+  # 8.0.1 fixed _IncludedRouter.path crash on fastapi>=0.137 (github.com/trallnag/prometheus-fastapi-instrumentator/issues/370)
+  "prometheus-fastapi-instrumentator>=8.0.2",
 ]
 
 conflicts = [
