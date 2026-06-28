@@ -44,7 +44,7 @@ from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.nemo_gym import (
     setup_nemo_gym_config,
 )
-from nemo_rl.experience.rollouts import run_async_nemo_gym_rollout
+from nemo_rl.experience.rollouts import run_nemo_gym_rollout_sync
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import (
     load_config,
@@ -88,7 +88,7 @@ def collect_trajectories(
     print("\n🔍 Running trajectory collection...", flush=True)
     generation_config = master_config.policy["generation"]
     for val_batch in val_dataloader:
-        nemo_gym_rollout_result = run_async_nemo_gym_rollout(
+        nemo_gym_rollout_result = run_nemo_gym_rollout_sync(
             policy_generation=policy_generation,
             input_batch=val_batch,
             tokenizer=tokenizer,
@@ -232,7 +232,7 @@ The validation set you pass in will directly be used for validation with no addi
 
     # NeMo-Gym is spun up inside setup() (overlapped with vLLM model load).
     # Bind task_to_env and val_task_to_env for the nemo_gym env.
-    # Hardcode here to match `run_async_nemo_gym_rollout`.
+    # NeMo-Gym is the only environment used by this runner.
     task_to_env = {"nemo_gym": nemo_gym}
     val_task_to_env = task_to_env
 

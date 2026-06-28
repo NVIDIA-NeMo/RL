@@ -102,7 +102,6 @@ openai_model:
       model: ${policy_model_name}
       return_token_id_information: true
       uses_reasoning_parser: true
-rollout_max_attempts_to_avoid_lp_nan: 1
 """
 
     config = NemoGymConfig(
@@ -246,11 +245,12 @@ def test_nemo_gym_sanity(
         example["responses_create_params"]["top_p"] = generation_config["top_p"]
         example["_rowidx"] = idx
 
-    actual_result, _ = ray.get(
-        nemo_gym.run_rollouts.remote(
-            nemo_gym_sanity_test_data["input"], nemo_gym_tokenizer, ""
-        )
-    )
+    actual_result = [None] * len(nemo_gym_sanity_test_data["input"])
+    for result_ref in nemo_gym.run_rollouts.options(num_returns="streaming").remote(
+        nemo_gym_sanity_test_data["input"], nemo_gym_tokenizer, ""
+    ):
+        rowidx, result, _ = ray.get(result_ref)
+        actual_result[rowidx] = result
     expected_result = nemo_gym_sanity_test_data["expected_output"]
 
     # These are tensors originally and we swap them back to a list for comparison below
