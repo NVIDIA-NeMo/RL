@@ -27,7 +27,7 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     policy.model_name=Qwen/Qwen3-0.6B \
     grpo.num_prompts_per_step=2 \
     grpo.num_generations_per_prompt=4 \
-    policy.train_global_batch_size=4 \
+    policy.train_global_batch_size=8 \
     policy.train_micro_batch_size=1 \
     cluster.gpus_per_node=2 \
     grpo.max_num_steps=2 \
@@ -39,10 +39,11 @@ uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJE
     data_plane.enabled=true \
     data_plane.impl=transfer_queue \
     data_plane.backend=simple \
-    async_rl.min_prompt_groups_per_batch=2 \
     async_rl.batch_selection_strategy=strict_on_policy \
-    async_rl.max_inflight_prompts=4 \
-    async_rl.max_buffered_rollouts=4 \
+    async_rl.max_weight_staleness_versions=0 \
+    async_rl.min_prompt_groups_per_batch=2 \
+    async_rl.max_inflight_prompts=2 \
+    async_rl.max_buffered_rollouts=2 \
     $@ \
     2>&1 | tee $RUN_LOG
 

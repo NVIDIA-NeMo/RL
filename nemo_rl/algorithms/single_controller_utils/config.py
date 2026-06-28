@@ -31,13 +31,13 @@ from nemo_rl.utils.checkpoint import CheckpointingConfig
 
 
 class AsyncRLConfig(BaseModel, extra="allow"):
-    # Sampler / on-policy enforcement.
-    max_weight_staleness_versions: int = 1
-    min_prompt_groups_per_batch: int = 2
     batch_selection_strategy: Literal[
         "strict_on_policy",
         "staleness_window",
     ] = "strict_on_policy"
+    # Sampler / on-policy enforcement.
+    max_weight_staleness_versions: int = 1
+    min_prompt_groups_per_batch: int = 2
     # Pump concurrency caps.
     max_inflight_prompts: int = 8
     max_buffered_rollouts: int = 8

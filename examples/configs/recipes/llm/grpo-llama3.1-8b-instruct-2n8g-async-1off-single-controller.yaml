@@ -19,11 +19,11 @@ data_plane:
 
 # SC async-RL runtime knobs.
 async_rl:
+  batch_selection_strategy: staleness_window
   # Matches grpo.async_grpo.max_trajectory_age_steps=1.
   max_weight_staleness_versions: 1
   # One training step consumes grpo.num_prompts_per_step (=64) prompt groups.
   min_prompt_groups_per_batch: 64
-  batch_selection_strategy: staleness_window
   max_inflight_prompts: ${grpo.num_prompts_per_step}  # match grpo-llama3.1-8b-instruct-2n8g-async-1off
   # over_sampling=false requires
   #   max_buffered_rollouts == grpo.num_prompts_per_step * (max_weight_staleness_versions + 1)
