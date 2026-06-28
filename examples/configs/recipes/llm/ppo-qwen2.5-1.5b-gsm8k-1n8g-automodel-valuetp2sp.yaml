@@ -1,55 +1,60 @@
-defaults: ./ppo-qwen2.5-1.5b-gsm8k-1n8g-megatron-valuetp2sp-dynbatch.yaml
-policy:
-  dtensor_cfg:
-    enabled: true
-  megatron_cfg:
+defaults: ../../ppo_math_1B.yaml
+ppo:
+  num_prompts_per_step: 1024
+  num_generations_per_prompt: 1
+  max_num_epochs: 15
+  ppo_epochs: 1
+  val_period: 1
+  overlong_filtering: true
+  reward_shaping:
     enabled: false
-  optimizer:
-    name: torch.optim.AdamW
-    kwargs:
-      lr: 1.0e-06
-      weight_decay: 0.01
-      betas:
-      - 0.9
-      - 0.999
-      eps: 1.0e-08
-      foreach: false
-      fused: false
-  scheduler:
-  - name: torch.optim.lr_scheduler.ConstantLR
-    kwargs:
-      factor: 1.0
-      total_iters: 10000000000
-  - milestones: []
-value:
-  reward_model_cfg:
-    enabled: true
-  dtensor_cfg:
-    enabled: true
-  megatron_cfg:
+  adv_estimator:
+    gae_lambda_value: 1.0
+    gae_lambda_policy: 1
+  reward_scaling:
     enabled: false
-  optimizer:
-    name: torch.optim.AdamW
-    kwargs:
-      lr: 1.0e-05
-      weight_decay: 0.01
-      betas:
-      - 0.9
-      - 0.999
-      eps: 1.0e-08
-      foreach: false
-      fused: false
-  scheduler:
-  - name: torch.optim.lr_scheduler.ConstantLR
-    kwargs:
-      factor: 1.0
-      total_iters: 10000000000
-  - milestones: []
-  dynamic_batching:
-    enabled: false
+loss_fn:
+  ratio_clip_max: 0.2
+  ratio_clip_c: 3
+value_loss_fn:
+  scale: 1.0
+  cliprange: 0.5
 checkpointing:
   checkpoint_dir: results/ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp
+policy:
+  model_name: Qwen/Qwen2.5-1.5B-Instruct
+  tokenizer:
+    name: Qwen/Qwen2.5-1.5B-Instruct
+  train_global_batch_size: 256
+  max_total_sequence_length: 1024
+  make_sequence_length_divisible_by: 8
+  generation:
+    max_new_tokens: 512
+    vllm_cfg:
+      gpu_memory_utilization: 0.4
+      max_model_len: 1024
+value:
+  model_name: Qwen/Qwen2.5-1.5B-Instruct
+  tokenizer:
+    name: Qwen/Qwen2.5-1.5B-Instruct
+  train_micro_batch_size: 4
+data:
+  max_input_seq_length: 512
+  train:
+    dataset_name: gsm8k
+    split: train
+  validation:
+    dataset_name: gsm8k
+    split: test
+  default:
+    system_prompt_file: examples/prompts/gsm8k.txt
+env:
+  math:
+    math_verify_impl: hf_math_verify
 logger:
   log_dir: logs/ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp
   wandb:
+    project: nemo-rl
     name: ppo-qwen2.5-1.5b-gsm8k-1n8g-automodel-valuetp2sp
+cluster:
+  gpus_per_node: 8
