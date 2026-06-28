@@ -50,8 +50,9 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
+    get_nemo_gym_thinking_tags,
     run_async_multi_turn_rollout,
-    run_async_nemo_gym_rollout,
+    run_nemo_gym_rollout_sync,
     run_multi_turn_rollout,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
@@ -240,7 +241,7 @@ class SyncRolloutActor:
 
         # Rollout dispatch (mirrors grpo_sync.py:294-349).
         if _should_use_nemo_gym(cfg):
-            r = run_async_nemo_gym_rollout(
+            r = run_nemo_gym_rollout_sync(
                 **common,
                 max_seq_len=None,
                 max_rollout_turns=None,
@@ -251,6 +252,8 @@ class SyncRolloutActor:
                 if "nemo_gym" in cfg.env
                 and cfg.env["nemo_gym"].get("effort_levels") is not None
                 else None,
+                reward_penalty_config=cfg.reward_penalties,
+                thinking_tags=get_nemo_gym_thinking_tags(cfg.env),
             )
             final_batch, rollout_metrics = r.final_batch, r.rollout_metrics
         else:

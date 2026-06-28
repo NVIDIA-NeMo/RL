@@ -22,7 +22,7 @@ from typing import Any, Callable, NotRequired, Optional, TypedDict, TypeVar, cas
 import numpy as np
 import ray
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
@@ -82,8 +82,9 @@ from nemo_rl.environments.nemo_gym import (
 )
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
+    get_nemo_gym_thinking_tags,
     run_async_multi_turn_rollout,
-    run_async_nemo_gym_rollout,
+    run_nemo_gym_rollout_sync,
     run_multi_turn_rollout,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
@@ -155,6 +156,25 @@ class AdvEstimatorConfig(TypedDict):
     use_leave_one_out_baseline: NotRequired[bool]
     # Reinforce++ specific
     minus_baseline: NotRequired[bool]
+
+
+class RewardPenaltyTokenIdsConfig(BaseModel, extra="allow"):
+    """Optional tokenizer-derived token ID overrides for reward penalties."""
+
+    eos: int | None = None
+    think_open: int | None = None
+    think_close: int | None = None
+
+
+class RewardPenaltyConfig(BaseModel, extra="allow"):
+    """Reward-zeroing penalties applied to NeMo-Gym rollout results."""
+
+    penalize_duplicated_reasoning: bool = False
+    penalize_empty_final_answer: bool = False
+    penalize_eos_token: bool = False
+    penalize_malformed_think_tag: bool = False
+    # Optional overrides; None infers from tokenizer when possible.
+    token_ids: Optional[RewardPenaltyTokenIdsConfig] = None
 
 
 class GRPOConfig(TypedDict):
@@ -242,6 +262,7 @@ class MasterConfig(BaseModel, extra="allow"):
     logger: GRPOLoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
+    reward_penalties: RewardPenaltyConfig = Field(default_factory=RewardPenaltyConfig)
     data_plane: Optional[DataPlaneConfig] = None
     on_policy_distillation: Optional[OnPolicyDistillationConfig] = None
 
@@ -476,7 +497,7 @@ def setup(
             nemo_gym_py_exec = create_local_venv_on_each_node(
                 nemo_gym_py_exec, "nemo_rl.environments.nemo_gym.NemoGym"
             )
-        nemo_gym_dict = env_configs["nemo_gym"]
+        nemo_gym_dict = dict(env_configs["nemo_gym"])
         # NeMo-RL-side detection knobs are top-level NemoGymConfig fields
         # (where the detector reads them), not part of Gym's global config.
         invalid_tool_call_patterns = nemo_gym_dict.pop(
@@ -2336,7 +2357,7 @@ def grpo_train(
                     # Use NeMo-Gym rollouts if enabled. We cascade NeMo-Gym first since NeMo-Gym requires async rollouts.
                     if _should_use_nemo_gym(master_config):
                         generation_config = master_config.policy["generation"]
-                        nemo_gym_rollout_result = run_async_nemo_gym_rollout(
+                        nemo_gym_rollout_result = run_nemo_gym_rollout_sync(
                             policy_generation=policy_generation,
                             input_batch=repeated_batch,
                             tokenizer=tokenizer,
@@ -2348,6 +2369,8 @@ def grpo_train(
                             max_rollout_turns=None,
                             greedy=False,
                             effort_config=_get_effort_config(master_config),
+                            reward_penalty_config=master_config.reward_penalties,
+                            thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                         )
                         input_ids = nemo_gym_rollout_result.input_ids
                         repeated_batch = nemo_gym_rollout_result.final_batch
@@ -3166,7 +3189,7 @@ def validate(
             # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
             if _should_use_nemo_gym(master_config):
                 generation_config = master_config.policy["generation"]
-                nemo_gym_rollout_result = run_async_nemo_gym_rollout(
+                nemo_gym_rollout_result = run_nemo_gym_rollout_sync(
                     policy_generation=policy_generation,
                     input_batch=val_batch,
                     tokenizer=tokenizer,
@@ -3176,6 +3199,8 @@ def validate(
                     max_rollout_turns=None,
                     greedy=False,
                     effort_config=_get_effort_config(master_config),
+                    reward_penalty_config=master_config.reward_penalties,
+                    thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
                 )
                 val_batch = nemo_gym_rollout_result.final_batch
                 gen_metrics = nemo_gym_rollout_result.rollout_metrics
@@ -3466,6 +3491,8 @@ def async_grpo_train(
     )
 
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
+    replay_buffer_state = None
+    rollouts_state = None
     if last_checkpoint_path is not None:
         replay_buffer_path = os.path.join(last_checkpoint_path, "replay_buffer.pt")
         if os.path.exists(replay_buffer_path):
@@ -3487,6 +3514,22 @@ def async_grpo_train(
                 f"⚠️ No replay buffer checkpoint found at {replay_buffer_path}. "
                 "Starting with an empty replay buffer."
             )
+
+        rollouts_path = os.path.join(last_checkpoint_path, "rollouts.pt")
+        if os.path.exists(rollouts_path):
+            rollouts_state = torch.load(rollouts_path, weights_only=False)
+
+    # Resume the monotonic NeMo-Gym task-index counter past anything already buffered or
+    # recorded, so restored trajectories keep distinct task indices after resume.
+    next_ng_task_index = int((rollouts_state or {}).get("next_ng_task_index", 0))
+    if replay_buffer_state is not None:
+        saved_task_indices = [
+            int(trajectory["_ng_task_index"])
+            for trajectory in replay_buffer_state.get("trajectories", [])
+            if trajectory.get("_ng_task_index") is not None
+        ]
+        if saved_task_indices:
+            next_ng_task_index = max(next_ng_task_index, 1 + max(saved_task_indices))
 
     _tc_py_exec = get_actor_python_env(
         "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector"
@@ -3523,6 +3566,7 @@ def async_grpo_train(
         teacher_worker_groups=teacher_worker_groups,
         alias_to_group_alias=alias_to_group_alias,
         on_policy_distillation_cfg=opd_module._opd_cfg(master_config),
+        next_ng_task_index=next_ng_task_index,
     )
 
     # Start trajectory collection in background
@@ -4192,6 +4236,13 @@ def async_grpo_train(
                         print(
                             "✅ Saved replay buffer with "
                             f"{len(replay_buffer_state['trajectories'])} trajectories"
+                        )
+                        rollouts_state = ray.get(
+                            trajectory_collector.get_rollouts_state.remote()
+                        )
+                        torch.save(
+                            rollouts_state,
+                            os.path.join(checkpoint_path, "rollouts.pt"),
                         )
                         checkpointer.finalize_checkpoint(checkpoint_path)
 
