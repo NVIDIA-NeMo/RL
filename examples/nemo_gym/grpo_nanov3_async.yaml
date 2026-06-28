@@ -2,13 +2,13 @@ defaults: "grpo_nanov3.yaml"
 
 grpo:
   async_grpo:
-    # Enables async training so rollout collection can overlap policy updates.
     enabled: true
-    # Limits stale trajectories to one training step before they are discarded.
+    # Limits stale trajectories. Higher values can improve speed, but may be
+    # more aggressive in terms of model accuracy.
     max_trajectory_age_steps: 1
     # Lets generation workers receive weight updates while new rollouts are in flight.
     in_flight_weight_updates: true
-    # Reuses the existing KV cache across weight updates to avoid recompute overhead.
+    # Configurable knob on reusing the existing KV cache across weight updates.
     recompute_kv_cache_after_weight_updates: false
 
 loss_fn:
@@ -18,10 +18,9 @@ loss_fn:
   # Truncates importance weights to reduce sensitivity to train/generation
   # logprob mismatch from the MoE + vLLM backend.
   truncated_importance_sampling_type: tis
+  # If truncated_importance_sampling_type is tis, this cannot be null.
   truncated_importance_sampling_ratio: 5.0
-  # Optional: set to true to force the PPO ratio to 1.0 when running a strictly
-  # on-policy setup where train_global_batch_size == num_prompts_per_step *
-  # num_generations_per_prompt.
+  # Optional: set to true to force the PPO ratio to 1.0
   force_on_policy_ratio: false
 
 policy:
@@ -30,7 +29,6 @@ policy:
       # Uses dedicated generation resources instead of sharing training GPUs.
       enabled: false
       resources:
-        # Assign a full 8-GPU node to each dedicated generation worker group.
         gpus_per_node: 8
-        # Reserve 16 of the 32 nodes for generation and leave the rest for training.
+        # Reserve generation nodes here. Training nodes = total num_nodes - generation nodes.
         num_nodes: 16
