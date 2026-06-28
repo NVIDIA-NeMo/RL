@@ -26,7 +26,7 @@ async_rl:
   max_inflight_prompts: 64
   # strict_on_policy auto-sets max_weight_staleness_versions=0 and
   # over_sampling=False. over_sampling=false requires
-  #   max_buffered_rollouts == target_prompt_groups_per_step * (max_weight_staleness_versions + 1)
+  #   max_buffered_rollouts == grpo.num_prompts_per_step * (max_weight_staleness_versions + 1)
   #   32 * (0 + 1) = 32
   max_buffered_rollouts: 32
   over_sampling: false

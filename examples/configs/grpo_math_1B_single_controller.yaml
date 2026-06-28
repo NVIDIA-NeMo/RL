@@ -337,14 +337,14 @@ data_plane:
   local_buffer_size:   68719476736
 
 # SC-specific async-RL runtime knobs.
+# One training step consumes grpo.num_prompts_per_step prompt groups.
 async_rl:
   max_weight_staleness_versions: 1
   min_prompt_groups_per_batch: 2
-  target_prompt_groups_per_step: null   # falls back to min_prompt_groups_per_batch
   batch_selection_strategy: "strict_on_policy"  # or "staleness_window"
   max_inflight_prompts: 8
   # When over_sampling=false this must equal
-  # target_prompt_groups_per_step * (max_weight_staleness_versions + 1).
+  # grpo.num_prompts_per_step * (max_weight_staleness_versions + 1).
   max_buffered_rollouts: 8
   # True : over-generates and wastes rollouts that age past the staleness window;
   # False: enforces per-weight-version dispatch quota.

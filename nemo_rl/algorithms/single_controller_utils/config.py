@@ -34,7 +34,6 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     # Sampler / on-policy enforcement.
     max_weight_staleness_versions: int = 1
     min_prompt_groups_per_batch: int = 2
-    target_prompt_groups_per_step: Optional[int] = None
     batch_selection_strategy: Literal[
         "strict_on_policy",
         "staleness_window",

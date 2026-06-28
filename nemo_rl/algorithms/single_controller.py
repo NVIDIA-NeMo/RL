@@ -120,17 +120,12 @@ class SingleControllerActor:
         self._train_cluster = bundle.train_cluster
         self._inference_cluster = bundle.inference_cluster
 
-        if self._async_cfg.target_prompt_groups_per_step is None:
-            self._async_cfg.target_prompt_groups_per_step = (
-                self._async_cfg.min_prompt_groups_per_batch
-            )
-        if (
-            self._async_cfg.target_prompt_groups_per_step
-            < self._async_cfg.min_prompt_groups_per_batch
-        ):
+        num_prompts_per_step = self._master_config.grpo["num_prompts_per_step"]
+        if num_prompts_per_step < self._async_cfg.min_prompt_groups_per_batch:
             raise ValueError(
-                f"target_prompt_groups_per_step ({self._async_cfg.target_prompt_groups_per_step}) "
-                f"must be >= min_prompt_groups_per_batch ({self._async_cfg.min_prompt_groups_per_batch})"
+                f"grpo.num_prompts_per_step ({num_prompts_per_step}) "
+                f"must be >= async_rl.min_prompt_groups_per_batch "
+                f"({self._async_cfg.min_prompt_groups_per_batch})"
             )
 
         if self._async_cfg.batch_selection_strategy == "strict_on_policy":
@@ -142,14 +137,14 @@ class SingleControllerActor:
             )
 
         if not self._async_cfg.over_sampling:
-            expected_buffer = self._async_cfg.target_prompt_groups_per_step * (
+            expected_buffer = num_prompts_per_step * (
                 self._async_cfg.max_weight_staleness_versions + 1
             )
             if self._async_cfg.max_buffered_rollouts != expected_buffer:
                 raise ValueError(
                     f"over_sampling=False requires max_buffered_rollouts "
                     f"({self._async_cfg.max_buffered_rollouts}) == "
-                    f"target_prompt_groups_per_step * (max_weight_staleness_versions + 1) "
+                    f"num_prompts_per_step * (max_weight_staleness_versions + 1) "
                     f"({expected_buffer})"
                 )
 
@@ -163,7 +158,7 @@ class SingleControllerActor:
         # TODO: support multi-mini-step (legacy train() does gbs-sized
         # mini-steps with shared prev_logprobs).
         rl_step_samples = (
-            self._master_config.grpo["num_prompts_per_step"]
+            num_prompts_per_step
             * self._master_config.grpo["num_generations_per_prompt"]
         )
         train_gbs = self._master_config.policy["train_global_batch_size"]
@@ -386,15 +381,11 @@ class SingleControllerActor:
 
         while self._train_steps < grpo_cfg["max_num_steps"]:
             step_id = f"sc-step-{self._train_steps:06d}"
-            # __init__ coerces None → min_prompt_groups_per_batch (int);
-            # the assert narrows the Optional[int] type for pyrefly.
-            assert self._async_cfg.target_prompt_groups_per_step is not None
-            target_groups: int = self._async_cfg.target_prompt_groups_per_step
             groups_dispatched = 0
             step_open = False
 
             with self._timer.time("total_step_time"):
-                while groups_dispatched < target_groups:
+                while groups_dispatched < grpo_cfg["num_prompts_per_step"]:
                     await asyncio.sleep(0)
 
                     # evict stale groups
