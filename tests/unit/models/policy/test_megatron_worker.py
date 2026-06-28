@@ -307,6 +307,7 @@ def create_megatron_test_config(
             "use_linear_ce_fusion_loss": False,
             "linear_ce_fusion_chunk_size": 256,
             "gradient_accumulation_fusion": False,
+            "use_fused_weighted_squared_relu": False,
             "train_iters": 100,  # Required for Megatron training
             "optimizer": {
                 "optimizer": "adam",
