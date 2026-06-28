@@ -13,7 +13,7 @@
 # limitations under the License.
 
 #!/bin/bash
-set -xeuo pipefail
+set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 PROJECT_ROOT=$(realpath ${SCRIPT_DIR}/../..)
@@ -34,9 +34,8 @@ run_test() {
     fi
 }
 
-run_test      uv run --no-sync bash ./tests/functional/grpo_rm_env.sh
-run_test fast uv run --no-sync bash ./tests/functional/grpo_topp_topk.sh
-run_test      uv run --no-sync bash ./tests/functional/vlm_grpo.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then
