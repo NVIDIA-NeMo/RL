@@ -26,6 +26,10 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
 
+from nemo_rl.models.generation.vllm.quantization.mxfp8_utils import (
+    pad_flashinfer_scale_k,
+)
+
 FP8_BLOCK_QUANT_KWARGS = {
     "activation_scheme": "dynamic",
     "fmt": "e4m3",
@@ -899,14 +903,18 @@ def process_weights_after_loading_mxfp8_moe(self, layer) -> None:
         w13_weight_shuffled.append(w13_shuffled_i.contiguous().view(MXFP8_VALUE_DTYPE))
         w2_weight_shuffled.append(w2_shuffled_i.contiguous().view(MXFP8_VALUE_DTYPE))
         w13_sf_shuffled_i = shuffle_matrix_sf_a(
-            w13_sf_i.view(torch.uint8).reshape(
-                intermediate_size_factor * layer.intermediate_size_per_partition,
-                -1,
+            pad_flashinfer_scale_k(
+                w13_sf_i.view(torch.uint8).reshape(
+                    intermediate_size_factor * layer.intermediate_size_per_partition,
+                    -1,
+                )
             ),
             epilogue_tile_m,
         )
         w2_sf_shuffled_i = shuffle_matrix_sf_a(
-            w2_scale[i].view(torch.uint8).reshape(layer.hidden_size, -1),
+            pad_flashinfer_scale_k(
+                w2_scale[i].view(torch.uint8).reshape(layer.hidden_size, -1)
+            ),
             epilogue_tile_m,
         )
         w13_scale_shuffled.append(
