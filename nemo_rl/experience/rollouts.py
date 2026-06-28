@@ -1102,6 +1102,177 @@ async def run_sample_multi_turn_rollout(
     return final_sample_state, sample_metrics
 
 
+@dataclass
+class RolloutGroupResult:
+    """One prompt group's rollout batch and metrics."""
+
+    group_index: int
+    final_batch: BatchedDataDict[DatumSpec]
+    rollout_metrics: dict[str, Any]
+
+
+def _aggregate_multi_turn_rollout_metrics(
+    all_sample_metrics: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    """Aggregate native rollout metrics over an arbitrary set of samples."""
+    if not all_sample_metrics:
+        raise ValueError("Cannot aggregate metrics for an empty rollout batch")
+
+    batch_size = len(all_sample_metrics)
+    rollout_metrics = {
+        "total_turns": sum(m["turn_count"] for m in all_sample_metrics),
+        "avg_turns_per_sample": sum(m["turn_count"] for m in all_sample_metrics)
+        / batch_size,
+        "max_turns_per_sample": max(m["turn_count"] for m in all_sample_metrics),
+        "natural_termination_rate": sum(m["terminated"] for m in all_sample_metrics)
+        / batch_size,
+        "truncation_rate": sum(m["truncated"] for m in all_sample_metrics) / batch_size,
+        "max_turns_reached_rate": sum(
+            m["max_turns_reached"] for m in all_sample_metrics
+        )
+        / batch_size,
+        "mean_total_tokens_per_sample": sum(
+            m["total_tokens"] for m in all_sample_metrics
+        )
+        / batch_size,
+        "mean_gen_tokens_per_sample": sum(
+            m["assistant_tokens"] for m in all_sample_metrics
+        )
+        / batch_size,
+        "max_gen_tokens_per_sample": max(
+            m["assistant_tokens"] for m in all_sample_metrics
+        ),
+        "mean_env_tokens_per_sample": sum(m["env_tokens"] for m in all_sample_metrics)
+        / batch_size,
+        "mean_total_reward": sum(m["total_reward"] for m in all_sample_metrics)
+        / batch_size,
+        "max_total_reward": max(m["total_reward"] for m in all_sample_metrics),
+        "min_total_reward": min(m["total_reward"] for m in all_sample_metrics),
+    }
+
+    if "per_worker_token_counts" in all_sample_metrics[0]:
+        per_worker_token_counts = {}
+        for sample_metrics in all_sample_metrics:
+            for worker, token_count in sample_metrics[
+                "per_worker_token_counts"
+            ].items():
+                per_worker_token_counts[worker] = (
+                    per_worker_token_counts.get(worker, 0) + token_count
+                )
+        rollout_metrics["per_worker_token_counts"] = per_worker_token_counts
+
+    rollout_metrics["histogram/gen_tokens_length"] = [
+        token_count
+        for sample_metrics in all_sample_metrics
+        for token_count in sample_metrics["turn_gen_tokens"]
+    ]
+    rollout_metrics["histogram/input_tokens_length"] = [
+        token_count
+        for sample_metrics in all_sample_metrics
+        for token_count in sample_metrics["turn_input_tokens"]
+    ]
+    rollout_metrics["histogram/total_tokens_length"] = [
+        token_count
+        for sample_metrics in all_sample_metrics
+        for token_count in sample_metrics["turn_total_tokens"]
+    ]
+    return rollout_metrics
+
+
+async def _run_multi_turn_rollout_async(
+    policy_generation: GenerationInterface,
+    input_batch: BatchedDataDict[DatumSpec],
+    tokenizer: TokenizerType,
+    task_to_env: dict[str, EnvironmentInterface],
+    max_seq_len: int,
+    max_rollout_turns: int = 999999,
+    greedy: bool = False,
+) -> tuple[BatchedDataDict[DatumSpec], list[dict[str, Any]]]:
+    """Run one native rollout batch and retain metrics at sample granularity."""
+    batch_size = len(input_batch["message_log"])
+
+    sample_initial_states = []
+    for i in range(batch_size):
+        sample_initial_states.append(
+            {
+                "message_log": input_batch["message_log"][i],
+                "extra_env_info": input_batch["extra_env_info"][i],
+                "task_name": input_batch["task_name"][i],
+                "stop_strings": input_batch.get("stop_strings", [None] * batch_size)[i],
+                "idx": input_batch.get("idx", list(range(batch_size)))[i],
+            }
+        )
+
+    async def run_single_sample_with_error_handling(i, sample_state):
+        try:
+            return await run_sample_multi_turn_rollout(
+                sample_idx=i,
+                initial_sample_state=sample_state,
+                policy_generation=policy_generation,
+                tokenizer=tokenizer,
+                task_to_env=task_to_env,
+                max_seq_len=max_seq_len,
+                max_rollout_turns=max_rollout_turns,
+                greedy=greedy,
+            )
+        except Exception as error:
+            raise RuntimeError(f"Error in sample {i} rollout: {error}") from error
+
+    sample_results = await asyncio.gather(
+        *(
+            run_single_sample_with_error_handling(i, sample_state)
+            for i, sample_state in enumerate(sample_initial_states)
+        ),
+        return_exceptions=False,
+    )
+    final_sample_states = [result[0] for result in sample_results]
+    all_sample_metrics = [result[1] for result in sample_results]
+
+    final_batch = BatchedDataDict[DatumSpec](
+        {
+            "message_log": [state["message_log"] for state in final_sample_states],
+            "extra_env_info": [
+                state["extra_env_info"] for state in final_sample_states
+            ],
+            "task_name": [state["task_name"] for state in final_sample_states],
+            "total_reward": torch.stack(
+                [state["total_reward"] for state in final_sample_states]
+            ),
+            "idx": [state.get("idx", i) for i, state in enumerate(final_sample_states)],
+            "truncated": torch.tensor(
+                [metrics["truncated"] for metrics in all_sample_metrics],
+                dtype=torch.bool,
+            ),
+        }
+    )
+
+    reward_component_keys = sorted(
+        set(
+            key
+            for state in final_sample_states
+            for key in state
+            if isinstance(key, str)
+            and key.startswith("reward")
+            and len(key) > 6
+            and key[6:].isdigit()
+        ),
+        key=lambda key: int(key[6:]),
+    )
+    for key in reward_component_keys:
+        final_batch[key] = torch.stack(
+            [
+                state[key] if key in state else torch.tensor(0.0, dtype=torch.float32)
+                for state in final_sample_states
+            ]
+        )
+
+    for key in input_batch.keys():
+        if key not in final_batch:
+            final_batch[key] = input_batch[key]
+
+    return final_batch, all_sample_metrics
+
+
 def run_async_multi_turn_rollout(
     policy_generation: GenerationInterface,
     input_batch: BatchedDataDict[DatumSpec],
@@ -1111,189 +1282,57 @@ def run_async_multi_turn_rollout(
     max_rollout_turns: int = 999999,
     greedy: bool = False,
 ) -> tuple[BatchedDataDict[DatumSpec], dict[str, Any]]:
-    """Run multi-turn rollouts with sample-level processing.
+    """Run a complete native rollout batch from a synchronous call site."""
+    final_batch, sample_metrics = asyncio.run(
+        _run_multi_turn_rollout_async(
+            policy_generation=policy_generation,
+            input_batch=input_batch,
+            tokenizer=tokenizer,
+            task_to_env=task_to_env,
+            max_seq_len=max_seq_len,
+            max_rollout_turns=max_rollout_turns,
+            greedy=greedy,
+        )
+    )
+    return final_batch, _aggregate_multi_turn_rollout_metrics(sample_metrics)
 
-    Each sample in the batch proceeds through its interaction independently.
-    Async generation is used internally when available but the function is synchronous.
 
-    Args:
-        policy_generation: The generation interface (policy)
-        input_batch: The starting batch containing initial message logs
-        tokenizer: The tokenizer
-        task_to_env: Dictionary mapping task names to environment instances
-        max_seq_len: Maximum sequence length allowed
-        max_rollout_turns: Maximum number of agent-environment interaction turns
-        greedy: Whether to use greedy decoding
-
-    Returns:
-        Tuple containing:
-            - BatchedDataDict with the full interaction history and accumulated rewards
-            - Dictionary of rollout metrics
-    """
-
-    async def _async_rollout_implementation():
-        """Internal async implementation."""
-        batch_size = len(input_batch["message_log"])
-
-        # Prepare initial states for each sample
-        sample_initial_states = []
-        for i in range(batch_size):
-            sample_state = {
-                "message_log": input_batch["message_log"][i],
-                "extra_env_info": input_batch["extra_env_info"][i],
-                "task_name": input_batch["task_name"][i],
-                "stop_strings": input_batch.get("stop_strings", [None] * batch_size)[i],
-                "idx": input_batch.get("idx", list(range(batch_size)))[i],
-            }
-            sample_initial_states.append(sample_state)
-
-        # Run all samples concurrently
-        async def run_single_sample_with_error_handling(i, sample_state):
-            """Wrapper to handle errors for individual sample rollouts."""
-            try:
-                result = await run_sample_multi_turn_rollout(
-                    sample_idx=i,
-                    initial_sample_state=sample_state,
-                    policy_generation=policy_generation,
-                    tokenizer=tokenizer,
-                    task_to_env=task_to_env,
-                    max_seq_len=max_seq_len,
-                    max_rollout_turns=max_rollout_turns,
-                    greedy=greedy,
-                )
-                return result
-            except Exception as e:
-                raise RuntimeError(f"Error in sample {i} rollout: {e}") from e
-
-        # Create tasks for all samples and run them concurrently
-        sample_tasks = [
-            run_single_sample_with_error_handling(i, sample_state)
-            for i, sample_state in enumerate(sample_initial_states)
-        ]
-
-        # Execute all sample rollouts concurrently
-        sample_results = await asyncio.gather(*sample_tasks, return_exceptions=False)
-
-        # Process results
-        final_sample_states = []
-        all_sample_metrics = []
-
-        for final_state, sample_metrics in sample_results:
-            final_sample_states.append(final_state)
-            all_sample_metrics.append(sample_metrics)
-
-        # Reconstruct batch from sample results
-        batch_size = len(final_sample_states)
-        final_batch = BatchedDataDict[DatumSpec](
-            {
-                "message_log": [state["message_log"] for state in final_sample_states],
-                "extra_env_info": [
-                    state["extra_env_info"] for state in final_sample_states
-                ],
-                "task_name": [state["task_name"] for state in final_sample_states],
-                "total_reward": torch.stack(
-                    [state["total_reward"] for state in final_sample_states]
-                ),
-                "idx": [
-                    state.get("idx", i) for i, state in enumerate(final_sample_states)
-                ],
-                "truncated": torch.tensor(
-                    [metrics["truncated"] for metrics in all_sample_metrics],
-                    dtype=torch.bool,
-                ),
-            }
+async def run_async_multi_turn_rollout_groups(
+    policy_generation: GenerationInterface,
+    input_batch: BatchedDataDict[DatumSpec],
+    tokenizer: TokenizerType,
+    task_to_env: dict[str, EnvironmentInterface],
+    max_seq_len: int,
+    num_generations: int,
+    max_rollout_turns: int = 999999,
+    greedy: bool = False,
+) -> AsyncGenerator[RolloutGroupResult, None]:
+    """Run one native batch, then yield prompt groups with group-local metrics."""
+    if num_generations <= 0:
+        raise ValueError("num_generations must be greater than zero")
+    if input_batch.size % num_generations != 0:
+        raise ValueError(
+            "Native rollout batch size must be divisible by num_generations"
         )
 
-        # Expose per-component rewards (reward1, reward2, ...) for multi-reward envs for GDPO advantage calculation.
-        # Collect all reward component keys from any sample state (samples may come from different envs).
-        reward_component_keys = sorted(
-            set(
-                k
-                for state in final_sample_states
-                for k in state
-                if isinstance(k, str)
-                and k.startswith("reward")
-                and len(k) > 6
-                and k[6:].isdigit()
+    final_batch, sample_metrics = await _run_multi_turn_rollout_async(
+        policy_generation=policy_generation,
+        input_batch=input_batch,
+        tokenizer=tokenizer,
+        task_to_env=task_to_env,
+        max_seq_len=max_seq_len,
+        max_rollout_turns=max_rollout_turns,
+        greedy=greedy,
+    )
+    for group_index, start in enumerate(range(0, final_batch.size, num_generations)):
+        end = start + num_generations
+        yield RolloutGroupResult(
+            group_index=group_index,
+            final_batch=final_batch.slice(start, end),
+            rollout_metrics=_aggregate_multi_turn_rollout_metrics(
+                sample_metrics[start:end]
             ),
-            key=lambda k: int(k[6:]),
         )
-        for key in reward_component_keys:
-            # Stack per-sample values; use 0.0 for samples that did not have this component (e.g. single-reward env)
-            final_batch[key] = torch.stack(
-                [
-                    state[key]
-                    if key in state
-                    else torch.tensor(0.0, dtype=torch.float32)
-                    for state in final_sample_states
-                ]
-            )
-
-        # Preserve additional fields from the original input_batch
-        for key in input_batch.keys():
-            if key not in final_batch:
-                final_batch[key] = input_batch[key]
-
-        # Aggregate metrics across all samples
-        rollout_metrics = {
-            # Overall metrics
-            "total_turns": sum(m["turn_count"] for m in all_sample_metrics),
-            "avg_turns_per_sample": sum(m["turn_count"] for m in all_sample_metrics)
-            / batch_size,
-            "max_turns_per_sample": max(m["turn_count"] for m in all_sample_metrics),
-            "natural_termination_rate": sum(m["terminated"] for m in all_sample_metrics)
-            / batch_size,
-            "truncation_rate": sum(m["truncated"] for m in all_sample_metrics)
-            / batch_size,
-            "max_turns_reached_rate": sum(
-                m["max_turns_reached"] for m in all_sample_metrics
-            )
-            / batch_size,
-            # Token usage metrics
-            "mean_total_tokens_per_sample": sum(
-                m["total_tokens"] for m in all_sample_metrics
-            )
-            / batch_size,
-            "mean_gen_tokens_per_sample": sum(
-                m["assistant_tokens"] for m in all_sample_metrics
-            )
-            / batch_size,
-            "max_gen_tokens_per_sample": max(
-                m["assistant_tokens"] for m in all_sample_metrics
-            ),
-            "mean_env_tokens_per_sample": sum(
-                m["env_tokens"] for m in all_sample_metrics
-            )
-            / batch_size,
-            # Reward metrics
-            "mean_total_reward": sum(m["total_reward"] for m in all_sample_metrics)
-            / batch_size,
-            "max_total_reward": max(m["total_reward"] for m in all_sample_metrics),
-            "min_total_reward": min(m["total_reward"] for m in all_sample_metrics),
-        }
-
-        # Calculate per-worker token counts
-        if "per_worker_token_counts" in all_sample_metrics[0]:
-            per_worker_token_counts = {}
-            for m in all_sample_metrics:
-                for k, v in m["per_worker_token_counts"].items():
-                    per_worker_token_counts[k] = per_worker_token_counts.get(k, 0) + v
-            rollout_metrics["per_worker_token_counts"] = per_worker_token_counts
-
-        # Collect ISL, OSL, and ISL+OSL metrics for all samples
-        rollout_metrics["histogram/gen_tokens_length"] = [
-            t for m in all_sample_metrics for t in m["turn_gen_tokens"]
-        ]
-        rollout_metrics["histogram/input_tokens_length"] = [
-            t for m in all_sample_metrics for t in m["turn_input_tokens"]
-        ]
-        rollout_metrics["histogram/total_tokens_length"] = [
-            t for m in all_sample_metrics for t in m["turn_total_tokens"]
-        ]
-
-        return final_batch, rollout_metrics
-
-    return asyncio.run(_async_rollout_implementation())
 
 
 def _tensorize_by_key(message_logs: list, key: str):
@@ -1722,7 +1761,6 @@ async def run_async_nemo_gym_rollout(
     effort_config: Optional[EffortLevelsConfig] = None,
     reward_penalty_config: dict[str, Any] | BaseModel | None = None,
     thinking_tags: list[str] | tuple[str, ...] | None = None,
-    group_num: Optional[int] = None,
     returns_entire_batch: bool = False,
 ) -> AsyncGenerator[AsyncNemoGymRolloutResult, None]:
     """Run multi-turn rollouts with NeMo-Gym, yielding one result per prompt group.
@@ -1735,8 +1773,6 @@ async def run_async_nemo_gym_rollout(
     Args:
         num_generations: rollouts per prompt group; rows ``i`` and ``j`` belong to the
             same group iff ``i // num_generations == j // num_generations``.
-        group_num: optional prompt-group partition index, forwarded to NeMo-Gym via
-            ``responses_create_params["metadata"]["group_num"]``.
         returns_entire_batch: when True the whole batch is treated as a single,
             possibly heterogeneous group (e.g. validation / synchronous callers); rows
             are re-sorted into input order and the single-agent check is skipped.
@@ -1808,13 +1844,6 @@ async def run_async_nemo_gym_rollout(
             else generation_config["max_new_tokens"]
         )
 
-        # Tag the request with its prompt-group partition so NeMo-Gym resources servers
-        # (e.g. genrm_compare) can scope per-group state.
-        if group_num is not None:
-            metadata = responses_create_params.get("metadata") or dict()
-            metadata["group_num"] = str(group_num)
-            responses_create_params["metadata"] = metadata
-
         row["_rowidx"] = rowidx
         # Assume gym input rows are ordered; consecutive num_generations rows form a group.
         groupidx_to_row[rowidx // num_generations].append(row)
@@ -1828,7 +1857,7 @@ async def run_async_nemo_gym_rollout(
     rollout_gen = nemo_gym_environment.run_rollouts.options(
         num_returns="streaming"
     ).remote(nemo_gym_rows, tokenizer, timer_prefix)
-    for future in rollout_gen:
+    async for future in rollout_gen:
         rowidx, result, timing_metrics = await future
 
         # Tensorize this result's token ids as it arrives.
@@ -1879,8 +1908,8 @@ async def run_async_nemo_gym_rollout(
         # of the batch; fold it (plus this side's accumulated timing) into that group.
         if timing_metrics is not None:
             timer.stop(f"{timer_prefix}/total")
-            group_result.rollout_metrics |= (
-                timing_metrics | timer.get_timing_metrics("sum")
+            group_result.rollout_metrics |= timing_metrics | timer.get_timing_metrics(
+                "sum"
             )
         yield group_result
 

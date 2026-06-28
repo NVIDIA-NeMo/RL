@@ -16,7 +16,16 @@ import subprocess
 import sys
 from collections import Counter
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, List, NotRequired, Optional, Tuple, TypedDict
+from typing import (
+    Any,
+    AsyncGenerator,
+    Dict,
+    List,
+    NotRequired,
+    Optional,
+    Tuple,
+    TypedDict,
+)
 
 import ray
 import torch
@@ -307,7 +316,9 @@ Depending on your data shape, you may want to change these values."""
                 timing_metrics = timer.get_timing_metrics("sum")
                 total_time = timing_metrics.pop("_run_rollouts_total")
                 timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = (
-                    100 * timing_metrics[f"{timer_prefix}/postprocess_results"] / total_time
+                    100
+                    * timing_metrics[f"{timer_prefix}/postprocess_results"]
+                    / total_time
                 )
 
             yield nemo_gym_row["_rowidx"], nemo_rl_result, timing_metrics

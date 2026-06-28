@@ -24,6 +24,7 @@ import ray
 import torch
 from transformers import AutoTokenizer
 
+import nemo_rl.experience.rollouts as rollouts_mod
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets.response_datasets import NemoGymDataset
 from nemo_rl.data.interfaces import DatumSpec
@@ -43,6 +44,7 @@ from nemo_rl.experience.rollouts import (
     _calculate_single_metric,
     generate_responses_async,
     run_async_multi_turn_rollout,
+    run_async_multi_turn_rollout_groups,
     run_async_nemo_gym_rollout,
     run_multi_turn_rollout,
     run_nemo_gym_rollout_sync,
@@ -875,27 +877,69 @@ def test_run_async_nemo_gym_rollout_warns_when_max_seq_len_exceeds_engine():
             asyncio.run(_drive())
 
 
-def test_run_async_nemo_gym_rollout_stamps_group_num_metadata():
-    """group_num is forwarded into each row's responses_create_params metadata.
-
-    Uses an empty gym stream so the per-row stamping runs without any rollout work.
-    """
+def test_run_async_nemo_gym_rollout_uses_async_stream_iteration(monkeypatch):
+    """The Gym stream must be consumed without blocking the event loop."""
 
     class _FakePolicyGeneration:
         cfg = {"vllm_cfg": {"max_model_len": 10000}}
 
-    class _EmptyStreamRemote:
-        def options(self, **kwargs):
+    class _ReadyRef:
+        def __await__(self):
+            async def _resolve():
+                return (
+                    0,
+                    {
+                        "input_message_log": [{"token_ids": [1]}],
+                        "message_log": [
+                            {
+                                "role": "assistant",
+                                "token_ids": [2],
+                                "generation_logprobs": [-0.1],
+                            }
+                        ],
+                    },
+                    {"remote_timing": 1.0},
+                )
+
+            return _resolve().__await__()
+
+    class _AsyncOnlyStream:
+        def __init__(self):
+            self.done = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self.done:
+                raise StopAsyncIteration
+            self.done = True
+            return _ReadyRef()
+
+    class _RunRolloutsRemote:
+        def options(self, *, num_returns):
+            assert num_returns == "streaming"
             return self
 
         def remote(self, *args, **kwargs):
-            return iter(())  # no completed tasks → generator yields nothing
+            return _AsyncOnlyStream()
 
     class _FakeNemoGymEnv:
-        run_rollouts = _EmptyStreamRemote()
+        run_rollouts = _RunRolloutsRemote()
 
-    rows = [{"responses_create_params": {}} for _ in range(4)]
-    input_batch = {"extra_env_info": rows}
+    rows = [
+        {
+            "responses_create_params": {},
+            "agent_ref": {"name": "agent"},
+        }
+    ]
+    input_batch = BatchedDataDict(
+        {
+            "extra_env_info": rows,
+            "message_log": [[{"role": "user", "content": "prompt"}]],
+            "loss_multiplier": torch.ones(1),
+        }
+    )
     generation_config = {
         "temperature": 0.5,
         "top_p": 0.9,
@@ -905,26 +949,119 @@ def test_run_async_nemo_gym_rollout_stamps_group_num_metadata():
         "top_k": None,
     }
 
+    monkeypatch.setattr(
+        "nemo_rl.experience.rollouts._postprocess_single_group",
+        lambda *args, **kwargs: rollouts_mod.AsyncNemoGymRolloutResult(
+            input_ids=torch.empty(0),
+            final_batch=input_batch,
+            rollout_metrics={},
+            ng_task_index=None,
+        ),
+    )
+
     async def _drive():
-        async for _ in run_async_nemo_gym_rollout(
-            policy_generation=_FakePolicyGeneration(),
-            input_batch=input_batch,
-            tokenizer=None,
-            task_to_env={"nemo_gym": _FakeNemoGymEnv()},
-            generation_config=generation_config,
-            num_generations=2,
-            group_num=7,
-        ):
-            pass
+        return [
+            result
+            async for result in run_async_nemo_gym_rollout(
+                policy_generation=_FakePolicyGeneration(),
+                input_batch=input_batch,
+                tokenizer=None,
+                task_to_env={"nemo_gym": _FakeNemoGymEnv()},
+                generation_config=generation_config,
+                num_generations=1,
+            )
+        ]
 
-    asyncio.run(_drive())
+    results = asyncio.run(_drive())
 
-    for row in rows:
-        assert row["responses_create_params"]["metadata"]["group_num"] == "7"
-        assert (
-            row["responses_create_params"]["max_output_tokens"]
-            == generation_config["max_new_tokens"]
+    assert len(results) == 1
+    assert results[0].rollout_metrics["remote_timing"] == 1.0
+    assert "metadata" not in rows[0]["responses_create_params"]
+    assert (
+        rows[0]["responses_create_params"]["max_output_tokens"]
+        == generation_config["max_new_tokens"]
+    )
+
+
+def test_native_rollout_groups_have_group_local_metrics(monkeypatch):
+    """A batched native rollout is sliced with metrics for each prompt group."""
+
+    async def fake_sample_rollout(sample_idx, initial_sample_state, **kwargs):
+        del kwargs
+        return (
+            {
+                "message_log": initial_sample_state["message_log"],
+                "extra_env_info": initial_sample_state["extra_env_info"],
+                "task_name": initial_sample_state["task_name"],
+                "total_reward": torch.tensor(float(sample_idx)),
+                "idx": initial_sample_state["idx"],
+            },
+            {
+                "turn_count": sample_idx + 1,
+                "total_tokens": sample_idx + 10,
+                "assistant_tokens": sample_idx + 2,
+                "env_tokens": 8,
+                "terminated": sample_idx % 2 == 0,
+                "truncated": False,
+                "max_turns_reached": False,
+                "total_reward": float(sample_idx),
+                "turn_gen_tokens": [sample_idx + 2],
+                "turn_input_tokens": [sample_idx + 10],
+                "turn_total_tokens": [sample_idx + 12],
+                "per_worker_token_counts": {f"worker-{sample_idx}": sample_idx + 1},
+            },
         )
+
+    monkeypatch.setattr(
+        rollouts_mod, "run_sample_multi_turn_rollout", fake_sample_rollout
+    )
+    input_batch = BatchedDataDict(
+        {
+            "message_log": [[{"role": "user", "content": str(i)}] for i in range(4)],
+            "extra_env_info": [{"sample": i} for i in range(4)],
+            "task_name": ["test"] * 4,
+            "idx": [100, 101, 102, 103],
+        }
+    )
+    rollout_kwargs = {
+        "policy_generation": None,
+        "input_batch": input_batch,
+        "tokenizer": None,
+        "task_to_env": {},
+        "max_seq_len": 128,
+    }
+    whole_batch, whole_metrics = run_async_multi_turn_rollout(**rollout_kwargs)
+
+    async def _collect():
+        return [
+            group
+            async for group in run_async_multi_turn_rollout_groups(
+                **rollout_kwargs,
+                num_generations=2,
+            )
+        ]
+
+    groups = asyncio.run(_collect())
+
+    assert [group.group_index for group in groups] == [0, 1]
+    assert [group.final_batch["idx"] for group in groups] == [[100, 101], [102, 103]]
+    assert torch.equal(
+        torch.cat([group.final_batch["total_reward"] for group in groups]),
+        whole_batch["total_reward"],
+    )
+    assert groups[0].rollout_metrics["mean_total_reward"] == 0.5
+    assert groups[1].rollout_metrics["mean_total_reward"] == 2.5
+    assert groups[0].rollout_metrics["total_turns"] == 3
+    assert groups[1].rollout_metrics["total_turns"] == 7
+    assert (
+        sum(group.rollout_metrics["total_turns"] for group in groups)
+        == (whole_metrics["total_turns"])
+    )
+    assert [
+        value
+        for group in groups
+        for value in group.rollout_metrics["histogram/gen_tokens_length"]
+    ] == whole_metrics["histogram/gen_tokens_length"]
 
 
 @pytest.mark.nemo_gym

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import os
 import tempfile
 import threading
@@ -1419,6 +1420,74 @@ class TestAsyncTrajectoryCollector:
         assert target_weight not in collector._spawning_targets
         assert target_weight not in collector._spawned_per_target
         assert target_weight not in collector._completed_per_target
+
+    def test_native_batch_worker_buffers_group_local_metrics(self, monkeypatch):
+        """The native batched path must not duplicate whole-batch metrics."""
+
+        class _ReadyResult:
+            def __init__(self, value):
+                self.value = value
+
+            def __await__(self):
+                async def _resolve():
+                    return self.value
+
+                return _resolve().__await__()
+
+        class _AddRemote:
+            def __init__(self):
+                self.trajectories = []
+
+            def remote(self, trajectory_group, *args):
+                self.trajectories.append(trajectory_group)
+                return _ReadyResult("success")
+
+        class _ReplayBuffer:
+            def __init__(self):
+                self.add = _AddRemote()
+
+        async def fake_native_groups(**kwargs):
+            repeated_batch = kwargs["input_batch"]
+            num_generations = kwargs["num_generations"]
+            for group_index, mean_reward in enumerate((0.5, 2.5)):
+                start = group_index * num_generations
+                yield mock.Mock(
+                    group_index=group_index,
+                    final_batch=repeated_batch.slice(start, start + num_generations),
+                    rollout_metrics={"mean_total_reward": mean_reward},
+                )
+
+        import nemo_rl.experience.rollouts as rollouts_mod
+
+        monkeypatch.setattr(
+            rollouts_mod,
+            "run_async_multi_turn_rollout_groups",
+            fake_native_groups,
+        )
+
+        replay_buffer = _ReplayBuffer()
+        collector = self.create_local_collector(replay_buffer=replay_buffer)
+        collector.running = True
+        target_weight = 13
+        collector._generating_targets.add(target_weight)
+        collector._spawned_per_target[target_weight] = 2
+        repeated_batch = self.create_mock_batch(size=4)
+
+        asyncio.run(
+            collector._run_prompt_group_worker(
+                repeated_batch=repeated_batch,
+                generation_weight_version=3,
+                target_weight_version=target_weight,
+                prompt_idx=0,
+                num_generations=2,
+            )
+        )
+
+        assert [
+            trajectory["rollout_metrics"]["mean_total_reward"]
+            for trajectory in replay_buffer.add.trajectories
+        ] == [0.5, 2.5]
+        assert target_weight not in collector._generating_targets
 
     def test_rollouts_state_retrieval(self):
         """Test getting collector rollout state (task-index counter) for checkpointing."""
