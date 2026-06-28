@@ -333,7 +333,7 @@ class RayWorkerGroup:
         name_prefix: str = "",
         bundle_indices_list: Optional[list[tuple[int, list[int]]]] = None,
         sharding_annotations: Optional[NamedSharding] = None,
-        env_vars: dict[str, str] = {},
+        env_vars: Optional[dict[str, str]] = None,
     ):
         """Initialize a group of distributed Ray workers.
 
@@ -426,7 +426,7 @@ class RayWorkerGroup:
         self,
         remote_worker_builder: RayWorkerBuilder,
         bundle_indices_list: list[tuple[int, list[int]]],
-        env_vars: dict[str, str] = {},
+        env_vars: Optional[dict[str, str]] = None,
     ) -> None:
         """Create workers based on explicit bundle indices for tied worker groups.
 
@@ -440,6 +440,9 @@ class RayWorkerGroup:
         self.master_address, self.master_port = (
             self.cluster.get_master_address_and_port()
         )
+
+        # Copy user-supplied env vars so worker creation never mutates caller state.
+        env_vars = dict(env_vars or {})
 
         # Update env_vars with the current environment variables
         for k, v in os.environ.items():
