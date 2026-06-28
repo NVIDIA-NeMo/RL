@@ -57,7 +57,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 )
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.models.generation.sglang import SGLangGeneration
+from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.utils.logger import Logger

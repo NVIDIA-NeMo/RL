@@ -41,7 +41,7 @@ from nemo_rl.data_plane import build_data_plane_client
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollout_manager import RolloutManager
-from nemo_rl.models.generation.sglang import SGLangGeneration
+from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
 from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
