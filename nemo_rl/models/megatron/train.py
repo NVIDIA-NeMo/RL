@@ -382,6 +382,22 @@ class LossPostProcessor:
         draft_model: Optional[MegatronModule] = None,
         prepare_fn: Optional[Callable[..., Any]] = None,
     ):
+        """Build a per-microbatch loss post-processor for the Megatron train loop.
+
+        Args:
+            loss_fn: Loss function to wrap.
+            cfg: Policy(-like) config; supplies sequence_packing / logprob_chunk_size.
+            num_microbatches: Microbatch count, used to counteract Megatron's
+                per-microbatch loss averaging.
+            cp_normalize: Whether to divide the loss by the context-parallel size.
+            sampling_params: Optional temperature / top-k/p for logprob losses.
+            draft_model: Optional EAGLE draft model for distillation.
+            prepare_fn: Optional override for the default ``prepare_loss_input``.
+                Must accept ``(logits, data, loss_fn, vocab_parallel_rank,
+                vocab_parallel_group, context_parallel_group)`` and return
+                ``(loss_input, data)``; value models pass one that right-shifts
+                and CP-all-gathers the scalar value-head output.
+        """
         self.loss_fn = loss_fn
         self.cfg = cfg
         self.num_microbatches = num_microbatches
