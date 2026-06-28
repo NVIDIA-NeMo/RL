@@ -30,7 +30,7 @@ from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
-from nemo_rl.algorithms.grpo import _create_advantage_estimator
+from nemo_rl.algorithms.grpo import _create_advantage_estimator, _should_use_nemo_gym
 from nemo_rl.algorithms.loss import ClippedPGLossFn
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
@@ -40,6 +40,7 @@ from nemo_rl.data.utils import setup_response_data
 from nemo_rl.data_plane import build_data_plane_client
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemo_gym import spinup_nemo_gym_actor
 from nemo_rl.experience.rollout_manager import RolloutManager
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
@@ -281,9 +282,18 @@ def setup_single_controller(
     # Setup Dataset & Environments
     # ==========================
     # TODO: add validate dataset wiring.
-    dataset, _val_dataset, env_handles, _val_env_handles = setup_response_data(
-        tokenizer, data_config, env_configs=master_config.env
-    )
+    use_nemo_gym = _should_use_nemo_gym(master_config)
+    if use_nemo_gym:
+        # NeMo-Gym creates the env actor outside setup_response_data; we wire
+        # it in after generation is up (it needs the OpenAI server URLs).
+        dataset, _val_dataset = setup_response_data(
+            tokenizer, data_config, env_configs=None
+        )
+        env_handles: dict[str, EnvironmentInterface] = {}
+    else:
+        dataset, _val_dataset, env_handles, _val_env_handles = setup_response_data(
+            tokenizer, data_config, env_configs=master_config.env
+        )
     dataloader = StatefulDataLoader(
         dataset,
         batch_size=grpo_config["num_prompts_per_step"],
@@ -318,6 +328,21 @@ def setup_single_controller(
             )
             generation = gen_future.result()
             policy = policy_future.result()
+
+    # ==========================
+    # NeMo-Gym actor (after generation is up so OpenAI URLs are available)
+    # ==========================
+    if use_nemo_gym:
+        if generation_config["backend"] != "vllm":
+            raise NotImplementedError(
+                "SC NeMo-Gym integration currently supports the vllm backend "
+                f"only; got {generation_config['backend']!r}"
+            )
+        env_handles["nemo_gym"] = spinup_nemo_gym_actor(
+            env_configs=master_config.env,
+            base_urls=generation.dp_openai_server_base_urls,
+            model_name=generation_config["model_name"],
+        )
 
     # ==========================
     # Setup Data Plane Client & Weight Sync
@@ -356,7 +381,7 @@ def setup_single_controller(
         max_rollout_turns=grpo_config.get("max_rollout_turns"),
         policy_generation=generation,
         generation_config=generation_config,
-        use_nemo_gym=False,
+        use_nemo_gym=use_nemo_gym,
         tq_buffer=tq_buffer,
     )
 

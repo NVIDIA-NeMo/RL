@@ -22,7 +22,7 @@ from transformers import PreTrainedTokenizerBase
 from wandb import Table
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
-from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
@@ -392,7 +392,7 @@ class AsyncNemoGymRolloutImpl:
         num_generations_per_prompt: int,
         max_seq_len: int,
         generation_config: GenerationConfig,
-        max_rollout_turns: Optional[int] = None,
+        max_rollout_turns: int,
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
@@ -418,7 +418,7 @@ class AsyncNemoGymRolloutImpl:
         timer.start(f"{timer_prefix}/total")
 
         rollout_inputs = self._build_inputs(input_sample)
-        completions, rollout_metrics = await self._run_rollouts(
+        completions, prompt_message_log, rollout_metrics = await self._run_rollouts(
             rollout_inputs, timer, timer_prefix
         )
 
@@ -427,7 +427,7 @@ class AsyncNemoGymRolloutImpl:
 
         return PromptGroupRecord(
             prompt_idx=input_sample["idx"],
-            prompt=input_sample["message_log"],
+            prompt=prompt_message_log,
             extra_env_info=input_sample["extra_env_info"],
             metadata={"task_name": "nemo_gym"},
             completions=completions,
@@ -443,8 +443,9 @@ class AsyncNemoGymRolloutImpl:
             )
 
         # Validate max_rollout_turns.
-        assert self._max_rollout_turns is None, (
-            "`max_rollout_turns` is not supported in NeMo-Gym path!"
+        assert self._max_rollout_turns == 1, (
+            "`max_rollout_turns` is not supported in NeMo-Gym path! "
+            "Please set `max_rollout_turns` to 1."
         )
 
     def _build_inputs(self, input_sample: DatumSpec) -> list[dict]:
@@ -477,8 +478,8 @@ class AsyncNemoGymRolloutImpl:
 
     async def _run_rollouts(
         self, inputs: list[dict], timer: Timer, timer_prefix: str
-    ) -> tuple[list[Completion], dict[str, Any]]:
-        """Dispatch rows to NeMo-Gym and return completions + metrics."""
+    ) -> tuple[list[Completion], LLMMessageLogType, dict[str, Any]]:
+        """Dispatch rows to NeMo-Gym; return completions, prompt, and metrics."""
         nemo_gym_env = self._env_handles["nemo_gym"]
 
         # Run generation.
@@ -486,6 +487,9 @@ class AsyncNemoGymRolloutImpl:
             results, env_timing_metrics = await nemo_gym_env.run_rollouts.remote(
                 inputs, self._tokenizer, timer_prefix
             )
+            # All N rollouts share the same input prompt; tensorize one copy.
+            prompt_message_log = results[0]["input_message_log"]
+            _tensorize_by_key(prompt_message_log, "token_ids")
             # Convert results to completions.
             completions = [self._result_to_completion(r) for r in results]
 
@@ -497,12 +501,11 @@ class AsyncNemoGymRolloutImpl:
 
         rollout_metrics.update(env_timing_metrics)
 
-        return completions, rollout_metrics
+        return completions, prompt_message_log, rollout_metrics
 
     def _result_to_completion(self, result: dict) -> Completion:
         """Convert one run_rollouts result dict into a Completion."""
         # Tensorize token fields.
-        _tensorize_by_key(result["input_message_log"], "token_ids")
         _tensorize_by_key(result["message_log"], "token_ids")
         _tensorize_by_key(
             [m for m in result["message_log"] if m["role"] == "assistant"],
