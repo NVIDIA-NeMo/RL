@@ -35,7 +35,12 @@ run_test() {
 }
 
 run_test uv run --no-sync bash ./tests/functional/grpo_megatron_generation.sh
-run_test uv run --no-sync bash ./tests/functional/grpo_megatron_generation_non_colocated.sh
+# DISABLED: Non-colocated NVSHMEM refit path fails to initialize on the GB200 runner.
+# NVSHMEM aborts during preinit_nvshmem_collective with `cuMemCreate failed (status 800,
+# CUDA_ERROR_NOT_SUPPORTED)` -> `nvshmem common init failed` (NVSHMEMError status 7). This is a
+# GB200 environment/driver limitation (cuMem VMM allocation path unsupported), not a test bug; it
+# reproduces consistently on rerun. Re-enable once the GB200 CI image supports the NVSHMEM cuMem path.
+# run_test uv run --no-sync bash ./tests/functional/grpo_megatron_generation_non_colocated.sh
 run_test uv run --no-sync bash ./tests/functional/grpo_megatron_generation_async.sh
 run_test uv run --no-sync bash ./tests/functional/grpo_megatron_generation_colocated_async.sh
 run_test uv run --no-sync bash ./tests/functional/grpo_megatron_generation_async_gym.sh
