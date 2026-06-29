@@ -161,7 +161,7 @@ class AdvEstimatorConfig(TypedDict):
 class RewardPenaltyTokenIdsConfig(BaseModel, extra="allow"):
     """Optional token IDs for reward penalties."""
 
-    eos: int | None = None
+    unwanted: list[int] | None = None
     think_open: int | None = None
     think_close: int | None = None
 
@@ -171,20 +171,21 @@ class RewardPenaltyConfig(BaseModel, extra="allow"):
 
     penalize_duplicated_reasoning: bool = False
     penalize_empty_final_answer: bool = False
-    penalize_eos_token: bool = False
+    penalize_unwanted_tokens: bool = False
     penalize_malformed_think_tag: bool = False
-    # Optional token IDs. eos is required when penalize_eos_token is true;
+    # Optional token IDs. token_ids.unwanted is required when
+    # penalize_unwanted_tokens is true;
     # think-tag IDs are inferred from configured tag strings when possible.
     token_ids: Optional[RewardPenaltyTokenIdsConfig] = None
 
     @model_validator(mode="after")
-    def _require_eos_token_id_when_penalized(self) -> "RewardPenaltyConfig":
-        if self.penalize_eos_token and (
-            self.token_ids is None or self.token_ids.eos is None
+    def _require_unwanted_token_ids_when_penalized(self) -> "RewardPenaltyConfig":
+        if self.penalize_unwanted_tokens and (
+            self.token_ids is None or not self.token_ids.unwanted
         ):
             raise ValueError(
-                "reward_penalties.token_ids.eos must be set when "
-                "reward_penalties.penalize_eos_token is true"
+                "reward_penalties.token_ids.unwanted must be set when "
+                "reward_penalties.penalize_unwanted_tokens is true"
             )
         return self
 

@@ -1390,6 +1390,36 @@ def _get_required_reward_penalty_token_id(
     return value
 
 
+def _get_reward_penalty_token_ids(
+    reward_penalty_config: dict[str, Any] | BaseModel,
+    key: str,
+) -> list[int] | None:
+    token_ids = _get_reward_penalty_config_value(reward_penalty_config, "token_ids")
+    if token_ids is None:
+        return None
+
+    if isinstance(token_ids, dict):
+        value = token_ids.get(key)
+    else:
+        value = getattr(token_ids, key, None)
+
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return [int(value)]
+    return [int(token_id) for token_id in value]
+
+
+def _get_required_reward_penalty_token_ids(
+    reward_penalty_config: dict[str, Any] | BaseModel,
+    key: str,
+) -> list[int]:
+    values = _get_reward_penalty_token_ids(reward_penalty_config, key)
+    if not values:
+        raise ValueError(f"reward_penalties.token_ids.{key} must be set")
+    return values
+
+
 def _infer_single_token_id(tokenizer: Any, text: str) -> int | None:
     token_ids = tokenizer.encode(text, add_special_tokens=False)
     if len(token_ids) != 1:
@@ -1404,7 +1434,8 @@ def resolve_reward_penalty_config(
 ) -> dict[str, Any] | None:
     """Resolve tokenizer-derived reward penalty fields.
 
-    User config must explicitly provide EOS when penalize_eos_token is enabled.
+    User config must explicitly provide unwanted token IDs when
+    penalize_unwanted_tokens is enabled.
     Think-tag IDs are inferred only when each configured tag is exactly one
     token.
     """
@@ -1415,23 +1446,29 @@ def resolve_reward_penalty_config(
     for flag in (
         "penalize_duplicated_reasoning",
         "penalize_empty_final_answer",
-        "penalize_eos_token",
+        "penalize_unwanted_tokens",
         "penalize_malformed_think_tag",
     ):
         value = _get_reward_penalty_config_value(reward_penalty_config, flag)
         if value is not None:
             resolved[flag] = value
 
-    token_ids: dict[str, int] = {}
-    for key in ("eos", "think_open", "think_close"):
+    token_ids: dict[str, Any] = {}
+    unwanted_token_ids = _get_reward_penalty_token_ids(
+        reward_penalty_config, "unwanted"
+    )
+    if unwanted_token_ids is not None:
+        token_ids["unwanted"] = unwanted_token_ids
+
+    for key in ("think_open", "think_close"):
         value = _get_reward_penalty_token_id(reward_penalty_config, key)
         if value is not None:
             token_ids[key] = value
 
-    if resolved.get("penalize_eos_token") and "eos" not in token_ids:
+    if resolved.get("penalize_unwanted_tokens") and not token_ids.get("unwanted"):
         raise ValueError(
-            "reward_penalties.token_ids.eos must be set when "
-            "reward_penalties.penalize_eos_token is true"
+            "reward_penalties.token_ids.unwanted must be set when "
+            "reward_penalties.penalize_unwanted_tokens is true"
         )
 
     if resolved.get("penalize_malformed_think_tag"):
@@ -1493,11 +1530,11 @@ def apply_reward_penalties(
          function_call (model was mid-agentic-loop, not producing an empty answer).
          Data: full_result["response"]["output"] — message items have content[0]["text"].
 
-      3. penalize_eos_token (token-based)
-         The explicitly configured EOS token should never appear anywhere in an
-         assistant generation, including as the terminal token. A turn may
-         contain multiple EOS tokens, so the whole assistant token sequence is
-         checked rather than excluding the trailing position.
+      3. penalize_unwanted_tokens (token-based)
+         Currently checks that none of the explicitly configured unwanted
+         token IDs appear anywhere in an assistant generation, including as the terminal
+         token. A turn may contain multiple unwanted tokens, so the whole assistant
+         token sequence is checked rather than excluding the trailing position.
          Data: message_log[i]["token_ids"] where role == "assistant".
 
       4. penalize_malformed_think_tag (message flag + token/string fallback)
@@ -1522,7 +1559,7 @@ def apply_reward_penalties(
     counts = {
         "duplicated_reasoning": 0,
         "empty_final_answer": 0,
-        "eos_token": 0,
+        "unwanted_token": 0,
         "malformed_think_tag": 0,
     }
     if not reward_penalty_config or not results:
@@ -1535,7 +1572,7 @@ def apply_reward_penalties(
         for flag in (
             "penalize_duplicated_reasoning",
             "penalize_empty_final_answer",
-            "penalize_eos_token",
+            "penalize_unwanted_tokens",
             "penalize_malformed_think_tag",
         )
     )
@@ -1603,25 +1640,27 @@ def apply_reward_penalties(
 
                 counts["empty_final_answer"] += 1
 
-    # --- Penalty 3: EOS token in generation ---
-    if _get_reward_penalty_config_value(reward_penalty_config, "penalize_eos_token"):
-        eos_token_id = _get_required_reward_penalty_token_id(
-            reward_penalty_config, "eos"
+    # --- Penalty 3: unwanted token in generation ---
+    if _get_reward_penalty_config_value(
+        reward_penalty_config, "penalize_unwanted_tokens"
+    ):
+        unwanted_token_ids = _get_required_reward_penalty_token_ids(
+            reward_penalty_config, "unwanted"
         )
         for result in results:
-            has_eos = False
+            has_unwanted_token = False
             for msg in result["message_log"]:
                 if msg["role"] != "assistant":
                     continue
-                # Penalize any EOS token in the assistant generation, including
-                # the terminal position — a turn may emit multiple EOS tokens.
-                if eos_token_id in msg["token_ids"]:
-                    has_eos = True
+                # Penalize any configured unwanted token in the assistant generation,
+                # including the terminal position.
+                if any(token_id in msg["token_ids"] for token_id in unwanted_token_ids):
+                    has_unwanted_token = True
                     break
-            if has_eos:
+            if has_unwanted_token:
                 result["full_result"]["reward"] = 0.0
 
-                counts["eos_token"] += 1
+                counts["unwanted_token"] += 1
 
     # --- Penalty 4: Malformed think tags (existing flag + optional token ID + string) ---
     if _get_reward_penalty_config_value(
@@ -1982,7 +2021,7 @@ def run_async_nemo_gym_rollout(
             "penalize_empty_final_answer",
             "empty_final_answer_rate",
         ),
-        "eos_token": ("penalize_eos_token", "eos_token_rate"),
+        "unwanted_token": ("penalize_unwanted_tokens", "unwanted_token_rate"),
         "malformed_think_tag": (
             "penalize_malformed_think_tag",
             "malformed_think_tag_rate",

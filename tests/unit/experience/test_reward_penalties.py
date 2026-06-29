@@ -278,12 +278,12 @@ class TestPenalizeEmptyFinalAnswer:
 
 
 # =====================================================================
-# Penalty 3: penalize_eos_token
+# Penalty 3: penalize_unwanted_tokens
 # =====================================================================
 
 
-class TestPenalizeEosToken:
-    CFG = {"penalize_eos_token": True, "token_ids": {"eos": 2}}
+class TestPenalizeUnwantedTokens:
+    CFG = {"penalize_unwanted_tokens": True, "token_ids": {"unwanted": [2]}}
 
     def test_eos_in_generation_penalized(self):
         result = _make_result(
@@ -295,7 +295,7 @@ class TestPenalizeEosToken:
         )
         counts = apply_reward_penalties([result], self.CFG)
         assert result["full_result"]["reward"] == 0.0
-        assert counts["eos_token"] == 1
+        assert counts["unwanted_token"] == 1
 
     def test_no_eos_not_penalized(self):
         result = _make_result(
@@ -319,7 +319,7 @@ class TestPenalizeEosToken:
         )
         counts = apply_reward_penalties([result], self.CFG)
         assert result["full_result"]["reward"] == 0.0
-        assert counts["eos_token"] == 1
+        assert counts["unwanted_token"] == 1
 
     def test_eos_in_user_not_penalized(self):
         result = _make_result(
@@ -333,7 +333,7 @@ class TestPenalizeEosToken:
         assert result["full_result"]["reward"] == 1.0
 
     def test_custom_eos_token_id(self):
-        cfg = {"penalize_eos_token": True, "token_ids": {"eos": 99}}
+        cfg = {"penalize_unwanted_tokens": True, "token_ids": {"unwanted": [99]}}
         result = _make_result(
             reward=1.0,
             message_log=[
@@ -343,6 +343,19 @@ class TestPenalizeEosToken:
         )
         counts = apply_reward_penalties([result], cfg)
         assert result["full_result"]["reward"] == 0.0
+
+    def test_multiple_unwanted_token_ids(self):
+        cfg = {"penalize_unwanted_tokens": True, "token_ids": {"unwanted": [98, 99]}}
+        result = _make_result(
+            reward=1.0,
+            message_log=[
+                _msg("user", [100]),
+                _msg("assistant", [300, 99, 400]),
+            ],
+        )
+        counts = apply_reward_penalties([result], cfg)
+        assert result["full_result"]["reward"] == 0.0
+        assert counts["unwanted_token"] == 1
 
     def test_multi_turn_terminal_eos_penalized(self):
         # Trailing EOS in any assistant turn is penalized.
@@ -357,7 +370,7 @@ class TestPenalizeEosToken:
         )
         counts = apply_reward_penalties([result], self.CFG)
         assert result["full_result"]["reward"] == 0.0
-        assert counts["eos_token"] == 1
+        assert counts["unwanted_token"] == 1
 
     def test_multi_turn_internal_eos_penalized(self):
         result = _make_result(
@@ -371,7 +384,7 @@ class TestPenalizeEosToken:
         )
         counts = apply_reward_penalties([result], self.CFG)
         assert result["full_result"]["reward"] == 0.0
-        assert counts["eos_token"] == 1
+        assert counts["unwanted_token"] == 1
 
     def test_empty_generation_not_penalized(self):
         result = _make_result(
@@ -384,20 +397,30 @@ class TestPenalizeEosToken:
         counts = apply_reward_penalties([result], self.CFG)
         assert result["full_result"]["reward"] == 1.0
 
-    def test_eos_token_id_must_be_explicit(self):
-        with pytest.raises(ValueError, match="reward_penalties.token_ids.eos"):
+    def test_unwanted_token_ids_must_be_explicit(self):
+        with pytest.raises(ValueError, match="reward_penalties.token_ids.unwanted"):
             resolve_reward_penalty_config(
-                {"penalize_eos_token": True}, _FakeTokenizer(eos_token_id=2)
+                {"penalize_unwanted_tokens": True}, _FakeTokenizer(eos_token_id=2)
             )
 
-    def test_null_token_ids_requires_explicit_eos(self):
-        with pytest.raises(ValueError, match="reward_penalties.token_ids.eos"):
+    def test_null_token_ids_requires_explicit_unwanted(self):
+        with pytest.raises(ValueError, match="reward_penalties.token_ids.unwanted"):
             resolve_reward_penalty_config(
-                {"penalize_eos_token": True, "token_ids": None},
+                {"penalize_unwanted_tokens": True, "token_ids": None},
                 _FakeTokenizer(eos_token_id=2),
             )
 
-    def test_missing_eos_direct_apply_raises(self):
+    def test_empty_unwanted_list_requires_explicit_unwanted(self):
+        with pytest.raises(ValueError, match="reward_penalties.token_ids.unwanted"):
+            resolve_reward_penalty_config(
+                {
+                    "penalize_unwanted_tokens": True,
+                    "token_ids": {"unwanted": []},
+                },
+                _FakeTokenizer(eos_token_id=2),
+            )
+
+    def test_missing_unwanted_direct_apply_raises(self):
         result = _make_result(
             reward=1.0,
             message_log=[
@@ -405,8 +428,8 @@ class TestPenalizeEosToken:
                 _msg("assistant", [300, 2]),
             ],
         )
-        with pytest.raises(ValueError, match="reward_penalties.token_ids.eos"):
-            apply_reward_penalties([result], {"penalize_eos_token": True})
+        with pytest.raises(ValueError, match="reward_penalties.token_ids.unwanted"):
+            apply_reward_penalties([result], {"penalize_unwanted_tokens": True})
 
 
 # =====================================================================
@@ -738,15 +761,15 @@ class TestCrossCutting:
         assert result["full_result"]["reward"] == 1.0
 
     def test_empty_results_no_crash(self):
-        counts = apply_reward_penalties([], {"penalize_eos_token": True})
+        counts = apply_reward_penalties([], {"penalize_unwanted_tokens": True})
         assert all(v == 0 for v in counts.values())
 
     def test_multiple_penalties_stack(self):
-        """A result that triggers both duplicated reasoning and EOS penalty."""
+        """A result that triggers both duplicated reasoning and unwanted-token penalty."""
         cfg = {
             "penalize_duplicated_reasoning": True,
-            "penalize_eos_token": True,
-            "token_ids": {"eos": 2},
+            "penalize_unwanted_tokens": True,
+            "token_ids": {"unwanted": [2]},
         }
         result = _make_result(
             reward=1.0,
@@ -762,11 +785,11 @@ class TestCrossCutting:
         counts = apply_reward_penalties([result], cfg)
         assert result["full_result"]["reward"] == 0.0
         assert counts["duplicated_reasoning"] == 1
-        assert counts["eos_token"] == 1
+        assert counts["unwanted_token"] == 1
 
     def test_batch_of_results_mixed(self):
         """Two results: first is fine, second has EOS."""
-        cfg = {"penalize_eos_token": True, "token_ids": {"eos": 2}}
+        cfg = {"penalize_unwanted_tokens": True, "token_ids": {"unwanted": [2]}}
         r1 = _make_result(
             reward=1.0,
             message_log=[
@@ -784,7 +807,7 @@ class TestCrossCutting:
         counts = apply_reward_penalties([r1, r2], cfg)
         assert r1["full_result"]["reward"] == 1.0
         assert r2["full_result"]["reward"] == 0.0
-        assert counts["eos_token"] == 1
+        assert counts["unwanted_token"] == 1
 
 
 if __name__ == "__main__":
@@ -793,7 +816,7 @@ if __name__ == "__main__":
     test_classes = [
         TestPenalizeDuplicatedReasoning,
         TestPenalizeEmptyFinalAnswer,
-        TestPenalizeEosToken,
+        TestPenalizeUnwantedTokens,
         TestPenalizeMultiEndThink,
         TestCrossCutting,
     ]
