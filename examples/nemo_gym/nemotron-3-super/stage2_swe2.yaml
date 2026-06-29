@@ -131,6 +131,7 @@ policy:
     defer_fp32_logits: True
     moe_per_layer_logging: True
     gradient_accumulation_fusion: False
+    use_fused_weighted_squared_relu: false
 
     mtp_loss_scaling_factor: 0.3
     mtp_use_repeated_layer: true

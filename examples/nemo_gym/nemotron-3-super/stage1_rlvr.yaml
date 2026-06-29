@@ -335,6 +335,8 @@ env:
           vllm_serve_env_vars:
             VLLM_RAY_DP_PACK_STRATEGY: strict
             VLLM_ATTENTION_BACKEND: TRITON_ATTN
+            VLLM_USE_DEEP_GEMM: "0"
+            VLLM_MOE_USE_DEEP_GEMM: "0"
           vllm_serve_kwargs:
             data_parallel_size: 8
             tensor_parallel_size: 1
@@ -358,7 +360,13 @@ env:
           hf_home: null
           vllm_serve_env_vars:
             VLLM_RAY_DP_PACK_STRATEGY: strict
+            VLLM_ATTENTION_BACKEND: TRITON_ATTN
+            VLLM_USE_FLASHINFER_MOE_FP16: "0"
+            VLLM_USE_FLASHINFER_MOE_FP8: "0"
+            VLLM_USE_DEEP_GEMM: "0"
+            VLLM_MOE_USE_DEEP_GEMM: "0"
           vllm_serve_kwargs:
+            attention_backend: TRITON_ATTN
             data_parallel_size: 2
             tensor_parallel_size: 8
             pipeline_parallel_size: 1
@@ -455,7 +463,11 @@ env:
           hf_home: null
           vllm_serve_env_vars:
             VLLM_RAY_DP_PACK_STRATEGY: strict
+            VLLM_ATTENTION_BACKEND: TRITON_ATTN
+            VLLM_USE_DEEP_GEMM: "0"
+            VLLM_MOE_USE_DEEP_GEMM: "0"
           vllm_serve_kwargs:
+            attention_backend: TRITON_ATTN
             data_parallel_size: 4
             tensor_parallel_size: 8
             pipeline_parallel_size: 1
