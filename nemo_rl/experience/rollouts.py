@@ -548,11 +548,8 @@ def calculate_rewards(
         for i, idx in enumerate(indices):
             all_indices_order.append(idx)
             if is_dict_rewards:
-                # all_dict_rewards is initialized above whenever is_dict_rewards is
-                # True; assert narrows the Optional for the type checker.
-                assert all_dict_rewards is not None
                 for name in task_rewards:
-                    all_dict_rewards[name].append(task_rewards[name][i])
+                    all_dict_rewards[name].append(task_rewards[name][i])  # type: ignore
             else:
                 all_rewards.append(task_rewards[i])
             all_env_observations.append(env_observations[i])
