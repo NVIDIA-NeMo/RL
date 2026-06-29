@@ -1,0 +1,132 @@
+defaults: ../../xtoken_off_policy_distillation.yaml
+distillation:
+  num_prompts_per_step: 8
+  max_num_steps: 20
+  val_period: 10
+  val_at_start: true
+data:
+  train:
+    split_validation_size: 64
+    seed: 42
+policy:
+  train_global_batch_size: 8
+  max_total_sequence_length: 1024
+  dtensor_cfg:
+    tensor_parallel_size: 4
+    context_parallel_size: 2
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 0.1
+      end_factor: 1.0
+      total_iters: 5
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones:
+    - 5
+# Two full teacher entries: a teachers: list element is replaced wholesale on
+# merge (OmegaConf does not element-merge lists), so the recipe restates each
+# entry rather than partially overriding it.
+#   teachers[0] Qwen/Qwen3-4B          -> cross-tokenizer (P-KL via projection);
+#       projection_matrix_path is set per-run via the .sh
+#       (teachers.0.projection_matrix_path=...).
+#   teachers[1] meta-llama/Llama-3.2-3B -> SAME tokenizer/vocab as the student,
+#       so projection_matrix_path stays null: direct per-position KL, no
+#       projection and no alignment.
+# kd_loss_mode=sum (inherited from the base config) combines them as
+# total_kd = sum_i weight_i * KD_i, exercising the multi-teacher aggregation
+# and per-teacher CP-buffer sharding under student TP4xCP2.
+teachers:
+  - model_name: "Qwen/Qwen3-4B"
+    projection_matrix_path: null
+    weight: 1.0
+    tokenizer:
+      name: "Qwen/Qwen3-4B"
+    train_global_batch_size: 8
+    train_micro_batch_size: 1
+    logprob_batch_size: 1
+    max_total_sequence_length: 1024
+    make_sequence_length_divisible_by: 1
+    precision: "bfloat16"
+    logprob_chunk_size: null
+    offload_optimizer_for_logprob: false
+    dtensor_cfg:
+      enabled: true
+      _v2: true
+      cpu_offload: false
+      sequence_parallel: false
+      activation_checkpointing: true
+      tensor_parallel_size: 2
+      context_parallel_size: 2
+      custom_parallel_plan: null
+    max_grad_norm: 1.0
+    dynamic_batching:
+      enabled: false
+      train_mb_tokens: 1024
+      logprob_mb_tokens: 1024
+      sequence_length_round: 64
+    sequence_packing:
+      enabled: false
+      train_mb_tokens: 1024
+      logprob_mb_tokens: 1024
+      algorithm: "modified_first_fit_decreasing"
+      sequence_length_round: 64
+    optimizer:
+      name: "torch.optim.AdamW"
+      kwargs:
+        lr: 5.0e-5
+        weight_decay: 0.001
+        betas: [0.9, 0.95]
+        eps: 1e-8
+        foreach: false
+        fused: false
+  - model_name: "meta-llama/Llama-3.2-3B"
+    projection_matrix_path: null
+    weight: 1.0
+    tokenizer:
+      name: "meta-llama/Llama-3.2-3B"
+    train_global_batch_size: 8
+    train_micro_batch_size: 1
+    logprob_batch_size: 1
+    max_total_sequence_length: 1024
+    make_sequence_length_divisible_by: 1
+    precision: "bfloat16"
+    logprob_chunk_size: null
+    offload_optimizer_for_logprob: false
+    dtensor_cfg:
+      enabled: true
+      _v2: true
+      cpu_offload: false
+      sequence_parallel: false
+      activation_checkpointing: true
+      tensor_parallel_size: 2
+      context_parallel_size: 2
+      custom_parallel_plan: null
+    max_grad_norm: 1.0
+    dynamic_batching:
+      enabled: false
+      train_mb_tokens: 1024
+      logprob_mb_tokens: 1024
+      sequence_length_round: 64
+    sequence_packing:
+      enabled: false
+      train_mb_tokens: 1024
+      logprob_mb_tokens: 1024
+      algorithm: "modified_first_fit_decreasing"
+      sequence_length_round: 64
+    optimizer:
+      name: "torch.optim.AdamW"
+      kwargs:
+        lr: 5.0e-5
+        weight_decay: 0.001
+        betas: [0.9, 0.95]
+        eps: 1e-8
+        foreach: false
+        fused: false
+logger:
+  log_dir: logs/xtoken-multiteacher-qwen3-4b-llama3.2-3b-to-llama3.2-1b-1n8g-dtensor-tp4cp2
+  wandb:
+    project: nemo-rl
+    name: xtoken-multiteacher-qwen3-4b-llama3.2-3b-to-llama3.2-1b-1n8g-dtensor-tp4cp2
