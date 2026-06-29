@@ -23,6 +23,31 @@ from typing import Any, Optional, Union
 import torch
 from hydra.utils import get_class
 from nemo_automodel import NeMoAutoModelForSequenceClassification
+
+try:
+    from nemo_automodel import NeMoAutoModelForTokenClassification
+except ImportError:
+    # Local backport until the pinned Automodel submodule exports
+    # NeMoAutoModelForTokenClassification. The tripwire test in
+    # tests/unit/models/automodel/test_automodel_setup.py should fail once this
+    # shim is no longer needed.
+    # Tracked at https://github.com/NVIDIA-NeMo/RL/issues/2948.
+    from nemo_automodel._transformers.auto_model import _BaseNeMoAutoModelClass
+    from transformers import AutoModelForTokenClassification
+
+    class NeMoAutoModelForTokenClassification(
+        _BaseNeMoAutoModelClass, AutoModelForTokenClassification
+    ):
+        """Backport shim - see surrounding comment."""
+
+        pass
+else:
+    raise RuntimeError(
+        "Automodel now exports NeMoAutoModelForTokenClassification; remove the "
+        "local backport shim in nemo_rl.models.automodel.setup."
+    )
+
+
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
 from nemo_automodel._transformers.registry import ModelRegistry
 from nemo_automodel.components._peft.lora import PeftConfig
@@ -335,6 +360,14 @@ def validate_and_prepare_config(
                 print(
                     "model_config.num_labels is not 1. Setting it to 1 since this value is used as the out_features "
                     "for the linear head of Bradley-Terry reward models."
+                )
+                model_config.num_labels = 1
+        elif rm_type == "regression":
+            model_class = NeMoAutoModelForTokenClassification
+            if model_config.num_labels != 1:
+                print(
+                    "model_config.num_labels is not 1. Setting it to 1 since this value is used as the out_features "
+                    "for the linear head of regression reward models."
                 )
                 model_config.num_labels = 1
         else:
