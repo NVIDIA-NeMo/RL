@@ -34,10 +34,10 @@ os.environ.setdefault("SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK", "false")
 
 import ray
 
+from nemo_rl.distributed.virtual_cluster import _get_free_port_local
 from nemo_rl.models.generation.sglang.sglang_worker import SGLangGenerationWorker
 from nemo_rl.models.generation.sglang.utils.ray_utils import (
     NOSET_VISIBLE_DEVICES_ENV_VARS_LIST,
-    find_available_port,
     get_host_info,
 )
 
@@ -133,9 +133,9 @@ def create_worker(router_info, base_gpu_id=0, tp_size=1, rank=0):
     )
 
     host_ip = get_host_info()[1]
-    port = find_available_port(30000 + rank * 1000)
-    nccl_port = find_available_port(40000 + rank * 1000)
-    dist_init_port = find_available_port(50000 + rank * 1000)
+    port = _get_free_port_local(30000 + rank * 1000, 31000 + rank * 1000)
+    nccl_port = _get_free_port_local(40000 + rank * 1000, 41000 + rank * 1000)
+    dist_init_port = _get_free_port_local(50000 + rank * 1000, 51000 + rank * 1000)
 
     ray.get(
         worker.init.remote(

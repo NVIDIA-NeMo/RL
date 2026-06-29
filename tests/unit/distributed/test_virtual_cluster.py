@@ -27,6 +27,7 @@ from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
     ResourceInsufficientError,
     _bind_socket_in_range,
+    _get_free_consecutive_ports_local,
     _get_free_port_local,
     _get_node_ip_and_free_port,
 )
@@ -314,6 +315,55 @@ class TestGetFreePortLocal:
         }
         # With a range of 800 ports, 10 calls should very likely produce multiple unique ports
         assert len(ports) > 1
+
+
+class TestGetFreeConsecutivePortsLocal:
+    """Tests for _get_free_consecutive_ports_local()."""
+
+    def test_single_port_in_range(self):
+        port = _get_free_consecutive_ports_local(14000, 14100, consecutive=1)
+        assert 14000 <= port < 14100
+
+    def test_returns_bindable_contiguous_block(self):
+        n = 5
+        base = _get_free_consecutive_ports_local(14100, 14300, consecutive=n)
+        assert 14100 <= base
+        assert base + n - 1 < 14300
+        # All n ports are simultaneously bindable.
+        socks = []
+        try:
+            for offset in range(n):
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.bind(("", base + offset))
+                socks.append(s)
+        finally:
+            for s in socks:
+                s.close()
+
+    def test_start_port_below_low_is_clamped(self):
+        base = _get_free_consecutive_ports_local(
+            14300, 14400, consecutive=1, start_port=1000
+        )
+        assert base >= 14300
+
+    def test_cursor_advance_yields_non_overlapping_blocks(self):
+        n = 3
+        first = _get_free_consecutive_ports_local(14400, 14600, consecutive=n)
+        second = _get_free_consecutive_ports_local(
+            14400, 14600, consecutive=n, start_port=first + n
+        )
+        assert second >= first + n
+
+    def test_raises_when_range_exhausted(self):
+        # A 3-wide range cannot fit a block of 5.
+        with pytest.raises(RuntimeError, match="consecutive free ports"):
+            _get_free_consecutive_ports_local(14600, 14603, consecutive=5)
+
+    def test_port_is_reusable_after_return(self):
+        base = _get_free_consecutive_ports_local(14700, 14800, consecutive=2)
+        # Sockets are closed before return, so the block can be re-bound.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("", base))
 
 
 class TestRayVirtualClusterPortRange:

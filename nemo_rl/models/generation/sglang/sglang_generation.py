@@ -24,6 +24,8 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.ray_actor_environment_registry import SGLANG_EXECUTABLE
 from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_GENERATION_PORT_RANGE_HIGH,
+    DEFAULT_GENERATION_PORT_RANGE_LOW,
     RayVirtualCluster,
     get_reordered_bundle,
 )
@@ -236,13 +238,20 @@ class SGLangGeneration(GenerationInterface):
         if len(local_all_engines) == 0:
             return [], port_cursors
 
-        base_port = max(port_cursors.values()) if port_cursors else 15000
+        gen_port_low = self.sglang_cfg.get(
+            "port_range_low", DEFAULT_GENERATION_PORT_RANGE_LOW
+        )
+        gen_port_high = self.sglang_cfg.get(
+            "port_range_high", DEFAULT_GENERATION_PORT_RANGE_HIGH
+        )
         addr_and_ports, port_cursors = _allocate_rollout_engine_addr_and_ports_normal(
             gpus_per_node=self.num_gpus_per_node,
             sglang_cfg=self.sglang_cfg,
             local_all_engines=local_all_engines,
             rank_offset=self.rank_offset,
-            base_port=base_port,
+            port_range_low=gen_port_low,
+            port_range_high=gen_port_high,
+            node_port_cursor=port_cursors,
         )
 
         init_handles = [

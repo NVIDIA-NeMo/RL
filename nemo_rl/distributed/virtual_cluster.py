@@ -81,10 +81,12 @@ class PY_EXECUTABLES:
 # stock Linux) to avoid TOCTOU collisions.  See ray.sub for the full layout
 # including Ray's own GCS / worker gRPC ports.
 #
-#   11001-15000  vLLM / SGLang HTTP servers  (policy.generation.port_range_low/high)
+#   11001-15000  vLLM / SGLang HTTP servers + SGLang engine NCCL/dist_init
+#                                              (policy.generation.port_range_low/high)
 #   15001-20000  NeMo Gym HTTP servers       (env.nemo_gym.port_range_low/high)
 #   20001+       vLLM TP/DP rendezvous       (VLLM_PORT env var, 100-port spacing)
 #   25000-28000  Master address / TCPStore    (cluster.master_port_range_low/high)
+#   28001-30000  SGLang router + Prometheus  (dedicated band, see below)
 DEFAULT_GENERATION_PORT_RANGE_LOW = 11001
 DEFAULT_GENERATION_PORT_RANGE_HIGH = 15000
 DEFAULT_GYM_PORT_RANGE_LOW = 15001
@@ -98,6 +100,12 @@ DEFAULT_VLLM_PORT_RANGE_LOW = 20001
 DEFAULT_VLLM_PORTS_PER_ENGINE = 100
 DEFAULT_MASTER_PORT_RANGE_LOW = 25000
 DEFAULT_MASTER_PORT_RANGE_HIGH = 28000
+# SGLang router HTTP + Prometheus ports.  Kept in a dedicated band so the
+# router actor never overlaps the per-node engine port cursor.
+DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW = 28001
+DEFAULT_SGLANG_ROUTER_PORT_RANGE_HIGH = 29000
+DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_LOW = 29000
+DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_HIGH = 30000
 
 # ---------------------------------------------------------------------------
 # Topology resource keys
@@ -181,6 +189,41 @@ def _get_free_port_local(
         s.listen(1)
 
     return port
+
+
+def _get_free_consecutive_ports_local(
+    port_range_low: int,
+    port_range_high: int,
+    consecutive: int = 1,
+    start_port: Optional[int] = None,
+) -> int:
+    """Find ``consecutive`` contiguous bindable ports in [port_range_low,
+    port_range_high), scanning upward from *start_port*, and return the base.
+
+    *start_port* lets a caller thread a per-node cursor so successive blocks do
+    not overlap. Raises ``RuntimeError`` if no such block exists in the range.
+    """
+    base = (
+        port_range_low if start_port is None else max(start_port, port_range_low)
+    )
+    while base + consecutive - 1 < port_range_high:
+        socks: list[socket.socket] = []
+        try:
+            for offset in range(consecutive):
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.bind(("", base + offset))
+                s.listen(1)
+                socks.append(s)
+            return base
+        except OSError:
+            base += 1
+        finally:
+            for s in socks:
+                s.close()
+    raise RuntimeError(
+        f"Could not find {consecutive} consecutive free ports in "
+        f"[{port_range_low}, {port_range_high})."
+    )
 
 
 def init_ray(log_dir: Optional[str] = None) -> None:
