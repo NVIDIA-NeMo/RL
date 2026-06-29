@@ -37,6 +37,14 @@ try:
         NeMoAutoModelForTextToWaveform,
     )
 
+    # Side-effect import: installs the resolver hook that routes FP8-native
+    # Mistral 3.5 configs to Mistral3FP8VLM. Without it, HF's stock FP8Linear
+    # path runs and produces 0-d weight_scale_inv params that FSDP2 rejects.
+    try:
+        import nemo_automodel.components.models.mistral3_vlm  # noqa: F401
+    except ImportError:
+        pass
+
     NEMO_AUTOMODEL_AVAILABLE = True
 except ImportError:
     # nemo_automodel is not installed, classes will be None
@@ -416,8 +424,11 @@ def stream_weights_via_ipc_zmq_impl(
         for name, tensor in params_generator:
             # Initialize device and buffers on first tensor
             if buffer_a is None:
-                buffer_a = allocate_buffer(tensor.device)
-                buffer_b = allocate_buffer(tensor.device)
+                buffer_device = tensor.device
+                if buffer_device.type == "cpu" and torch.cuda.is_available():
+                    buffer_device = torch.device("cuda", torch.cuda.current_device())
+                buffer_a = allocate_buffer(buffer_device)
+                buffer_b = allocate_buffer(buffer_device)
                 current_buffer = buffer_a
 
             aligned_size = calculate_aligned_size(tensor.nbytes)
