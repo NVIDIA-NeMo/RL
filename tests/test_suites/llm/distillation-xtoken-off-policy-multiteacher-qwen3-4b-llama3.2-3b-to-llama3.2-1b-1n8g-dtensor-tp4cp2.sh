@@ -81,14 +81,14 @@ if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | ma
     # falls ~0.068 -> ~0.045. A CP-non-invariance regression in the sharded loss
     # would leave it elevated, which the val checks below catch.
     uv run tests/check_metrics.py $JSON_METRICS \
-        'data["train/loss"]["1"] < 2.2' \
-        'mean(data["train/loss"], -5, -1) < 1.3' \
-        'mean(data["train/loss"], -5, -1) < 0.7 * data["train/loss"]["1"]' \
-        'mean(data["train/accuracy"], -5, -1) > 0.80' \
-        'mean(data["train/kl_loss_t0"], -5, -1) < 0.40' \
-        'mean(data["train/kl_loss_t1"], -5, -1) > 0.05' \
-        'mean(data["train/kl_loss_t1"], -5, -1) < 0.20' \
-        'data["validation/kl_loss"]["100"] < 0.06' \
-        'data["validation/kl_loss"]["100"] < 0.80 * data["validation/kl_loss"]["0"]' \
-        'max(data["ray/node.0.gpu.0.mem_gb"]) < 40'
+        'data["train/loss"]["1"] < 2.0' \
+        'mean(data["train/loss"], -5, -1) < 1.1' \
+        'mean(data["train/loss"], -5, -1) < 0.6 * data["train/loss"]["1"]' \
+        'mean(data["train/accuracy"], -5, -1) > 0.83' \
+        'mean(data["train/kl_loss_t0"], -5, -1) < 0.32' \
+        'mean(data["train/kl_loss_t1"], -5, -1) > 0.08' \
+        'mean(data["train/kl_loss_t1"], -5, -1) < 0.17' \
+        'data["validation/kl_loss"]["100"] < 0.052' \
+        'data["validation/kl_loss"]["100"] < 0.72 * data["validation/kl_loss"]["0"]' \
+        'max(data["ray/node.0.gpu.0.mem_gb"]) < 35'
 fi

@@ -126,7 +126,7 @@ teachers:
         foreach: false
         fused: false
 logger:
-  log_dir: logs/xtoken-multiteacher-qwen3-4b-llama3.2-3b-to-llama3.2-1b-1n8g-dtensor-tp4cp2
+  log_dir: logs/distillation-xtoken-off-policy-multiteacher-qwen3-4b-llama3.2-3b-to-llama3.2-1b-1n8g-dtensor-tp4cp2
   wandb:
     project: nemo-rl
-    name: xtoken-multiteacher-qwen3-4b-llama3.2-3b-to-llama3.2-1b-1n8g-dtensor-tp4cp2
+    name: distillation-xtoken-off-policy-multiteacher-qwen3-4b-llama3.2-3b-to-llama3.2-1b-1n8g-dtensor-tp4cp2
