@@ -22,7 +22,6 @@ import vllm  # noqa: F401
 from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
 
 from nemo_rl.modelopt.utils import (
-    iter_quant_ignore_name_candidates,
     matches_quant_ignore_pattern,
 )
 from nemo_rl.models.generation.vllm.vllm_backend import VllmInternalWorkerExtension
@@ -31,6 +30,109 @@ from nemo_rl.models.policy.utils import (
     calculate_aligned_size,
     rebuild_cuda_tensor_from_ipc,
 )
+
+_FUSED_MODELOPT_MOE_SUFFIXES = {
+    ".experts.up_proj": "up_proj.weight",
+    ".experts.up_proj_scale": "up_proj.weight_scale",
+    ".experts.up_proj_scale_2": "up_proj.weight_scale_2",
+    ".experts.w2_weight": "down_proj.weight",
+    ".experts.w2_weight_scale": "down_proj.weight_scale",
+    ".experts.w2_weight_scale_2": "down_proj.weight_scale_2",
+}
+
+
+def _match_fused_modelopt_moe_weight(name: str) -> tuple[str, str] | None:
+    return next(
+        (
+            (suffix, target)
+            for suffix, target in _FUSED_MODELOPT_MOE_SUFFIXES.items()
+            if name.endswith(suffix)
+        ),
+        None,
+    )
+
+
+def _is_fused_modelopt_moe_weight(name: str) -> bool:
+    return _match_fused_modelopt_moe_weight(name) is not None
+
+
+def _batch_fused_modelopt_moe_weights(
+    weights: list[tuple[str, torch.Tensor]],
+) -> list[tuple[str, torch.Tensor]]:
+    """Map non-gated fused ModelOpt payloads to vLLM checkpoint names.
+
+    Super's large expert weights and block scales stay batched so vLLM can
+    tensor-parallel-shard the full ``[E, ...]`` tensor at once.  Its scalar
+    loader still requires an expert id, so only the tiny per-expert global
+    scales are exposed as scalar views.
+    """
+    batched: list[tuple[str, torch.Tensor]] = []
+    for name, tensor in weights:
+        matched = _match_fused_modelopt_moe_weight(name)
+        if matched is None:
+            batched.append((name, tensor))
+            continue
+
+        suffix, target = matched
+        prefix = name[: -len(suffix)]
+        if tensor.ndim == 0:
+            raise ValueError(
+                f"Fused ModelOpt MoE tensor must have an expert dimension: {name}"
+            )
+
+        if not target.endswith("weight_scale_2"):
+            batched.append((f"{prefix}.experts.0.{target}", tensor))
+            continue
+
+        if tensor.ndim == 1:
+            expert_scales = tensor
+        elif tensor.ndim == 2 and tensor.shape[1] == 1:
+            expert_scales = tensor[:, 0]
+        else:
+            raise ValueError(
+                f"Expected one global scale per expert for {name}, got "
+                f"shape {tuple(tensor.shape)}"
+            )
+
+        batched.extend(
+            (f"{prefix}.experts.{expert_id}.{target}", expert_scale)
+            for expert_id, expert_scale in enumerate(expert_scales.unbind(0))
+        )
+
+    return batched
+
+
+def _supports_batched_modelopt_moe_load(model: torch.nn.Module) -> bool:
+    """Return whether every ModelOpt MoE layer owns the complete expert set."""
+    found_modelopt_moe = False
+    for module in model.modules():
+        quant_method = getattr(module, "quant_method", None)
+        if quant_method.__class__.__name__ != "ModelOptNvFp4FusedMoE":
+            continue
+        found_modelopt_moe = True
+        quant_config = getattr(quant_method, "quant_config", None)
+        backend = getattr(quant_method, "nvfp4_backend", None)
+        if (
+            not getattr(quant_config, "_nrl_weight_only_w4a16", False)
+            or getattr(
+                backend,
+                "value",
+                backend,
+            )
+            != "MARLIN"
+        ):
+            return False
+        if getattr(module, "_expert_map", None) is not None:
+            return False
+        local_num_experts = getattr(module, "local_num_experts", None)
+        global_num_experts = getattr(module, "global_num_experts", None)
+        if (
+            not isinstance(local_num_experts, int)
+            or local_num_experts != global_num_experts
+        ):
+            return False
+    return found_modelopt_moe
+
 
 if os.environ.get("VLLM_MODELOPT_REAL_QUANT", "0") == "1":
     from nemo_rl.modelopt.models.generation.vllm_modelopt_patch import (
@@ -88,10 +190,6 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                 self.model_runner.vllm_config.model_config.hf_config.quantization_config
             )
             ignore_patterns = quant_config.get("ignore", []) or []
-            # Built lazily on first use: only the rare ignored, floating-point
-            # weights (typically just lm_head) need a parameter lookup, so most
-            # refit chunks skip the full named_parameters() scan entirely.
-            params = None
             filtered = []
             for name, weight in weights:
                 suffix = name.rsplit(".", 1)[-1]
@@ -99,25 +197,26 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
                 if ignored and suffix in {"weight_scale", "weight_scale_2"}:
                     continue
 
-                if ignored and suffix == "weight" and weight.is_floating_point():
-                    if params is None:
-                        params = dict(self.model_runner.model.named_parameters())
-                    copied = False
-                    for candidate in iter_quant_ignore_name_candidates(name):
-                        param = params.get(candidate)
-                        if param is not None and tuple(param.shape) == tuple(
-                            weight.shape
-                        ):
-                            param.data.copy_(
-                                weight.to(device=param.device, dtype=param.dtype)
-                            )
-                            copied = True
-                            break
-                    if copied:
-                        continue
-
                 filtered.append((name, weight))
-            weights = filtered
+            if any(_is_fused_modelopt_moe_weight(name) for name, _ in filtered):
+                supports_batched_moe = getattr(
+                    self,
+                    "_nrl_supports_batched_modelopt_moe_load",
+                    None,
+                )
+                if supports_batched_moe is None:
+                    supports_batched_moe = _supports_batched_modelopt_moe_load(
+                        self.model_runner.model
+                    )
+                    self._nrl_supports_batched_modelopt_moe_load = supports_batched_moe
+                if not supports_batched_moe:
+                    raise RuntimeError(
+                        "Fused ModelOpt MoE refits require W4A16 Marlin with all "
+                        "experts local; vLLM expert parallelism is unsupported"
+                    )
+                weights = _batch_fused_modelopt_moe_weights(filtered)
+            else:
+                weights = filtered
             if not weights:
                 return None
             return super()._load_weights(weights)
@@ -141,6 +240,9 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
 
         prepare_modelopt_for_weight_reload(self.model_runner.model, device=self.device)
         self.maybe_init_zmq()
+        buffer = None
+        weight = None
+        weights = None
         while True:
             payload = self.zmq_socket.recv_pyobj()
 
@@ -178,7 +280,13 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             self._load_weights(weights)
             torch.cuda.synchronize()
 
-            del weights, buffer
+            # Match the base vLLM receiver: the loop variable is the final IPC
+            # tensor view and must be dropped together with the list and base
+            # buffer before ACK permits the sender to reuse or release storage.
+            del weight, weights, buffer
+            weight = None
+            weights = None
+            buffer = None
             self.zmq_socket.send(IPCProtocol.ACK.value.encode())
 
         self._maybe_process_fp8_kv_cache()

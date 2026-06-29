@@ -20,20 +20,23 @@ from pathlib import Path
 import modelopt.torch.quantization as mtq
 import torch
 import torch.nn as nn
+from modelopt.torch.quantization.config import need_calibration
+from modelopt.torch.utils.dataset_utils import (
+    create_forward_loop,
+    get_dataset_dataloader,
+)
+from modelopt.torch.utils.plugins import (
+    get_megatron_calibration_forward_loop,
+    megatron_prefill,
+)
+from torch.utils.data import DataLoader, Dataset
+
 from megatron.bridge.models.gpt_provider import transformer_engine_layer_spec
 from megatron.bridge.models.mamba.mamba_provider import (
     modelopt_mamba_stack_spec,
     transformer_engine_mamba_stack_spec,
 )
 from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
-from modelopt.torch.quantization.config import need_calibration
-from modelopt.torch.utils.dataset_utils import (
-    create_forward_loop,
-    get_dataset_dataloader,
-)
-from modelopt.torch.utils.plugins import megatron_prefill
-from torch.utils.data import DataLoader, Dataset
-
 from nemo_rl.algorithms.utils import get_tokenizer as _base_get_tokenizer
 from nemo_rl.modelopt.utils import resolve_quant_cfg
 
@@ -136,6 +139,14 @@ def quantize_model(
             if hasattr(model, "device")
             else next(model.parameters()).device
         )
+        calib_batch_size = (
+            batch_size if batch_size is not None else DEFAULT_CALIB_BATCH_SIZE
+        )
+        calib_sample_length = (
+            max_sample_length
+            if max_sample_length is not None
+            else DEFAULT_CALIB_SAMPLE_LENGTH
+        )
         if data == "random":
             calib_size = 1
             calib_dataloader = DataLoader(
@@ -144,23 +155,33 @@ def quantize_model(
                 ),
                 batch_size=1,
             )
+            forward_loop = get_forward_loop_func(is_megatron, calib_dataloader)
+        elif is_megatron:
+            # ModelOpt owns the Megatron calibration loop so TP/PP/CP/DP use
+            # the same sequence partitioning and data sharding as upstream.
+            forward_loop = get_megatron_calibration_forward_loop(
+                tokenizer,
+                dataset_name=data,
+                batch_size=calib_batch_size,
+                num_samples=calib_size,
+                seq_length=calib_sample_length,
+                device=device,
+                apply_chat_template=False,
+                # Fixed-length packed rows are required by context parallelism
+                # and match Megatron pretraining-style calibration upstream.
+                pack=True,
+            )
         else:
             calib_dataloader = get_dataset_dataloader(
                 dataset_name=data,
                 tokenizer=tokenizer,
-                batch_size=batch_size
-                if batch_size is not None
-                else DEFAULT_CALIB_BATCH_SIZE,
+                batch_size=calib_batch_size,
                 num_samples=calib_size,
                 device=device,
                 include_labels=False,
-                max_sample_length=(
-                    max_sample_length
-                    if max_sample_length is not None
-                    else DEFAULT_CALIB_SAMPLE_LENGTH
-                ),
+                max_sample_length=calib_sample_length,
             )
-        forward_loop = get_forward_loop_func(is_megatron, calib_dataloader)
+            forward_loop = get_forward_loop_func(False, calib_dataloader)
 
     model = mtq.quantize(model, mtq_cfg, forward_loop)
     mtq.print_quant_summary(model)

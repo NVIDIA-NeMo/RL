@@ -1,0 +1,23 @@
+# Qwen3 MoE routed-expert NVFP4 W4A16 recipe for QARL.
+metadata:
+  recipe_type: ptq
+  description: Qwen3 MoE routed-expert NVFP4 W4A16.
+quantize:
+  algorithm: max
+  quant_cfg:
+    - quantizer_name: '*'
+      enable: false
+    # Matches both HF experts.<id>.* projections and Megatron local experts.
+    - quantizer_name: '*mlp.experts*weight_quantizer'
+      enable: true
+      cfg:
+        block_sizes:
+          -1: 16
+          type: dynamic
+          scale_bits: e4m3
+        num_bits: e2m1
+    - quantizer_name: '*router*'
+      enable: false
+    - quantizer_name: '*mlp.gate*'
+      enable: false
+

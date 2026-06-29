@@ -1,0 +1,75 @@
+defaults: ../../../../examples/modelopt/qa_grpo_nano3_megatron.yaml
+grpo:
+  max_num_steps: 1
+  val_period: 0
+checkpointing:
+  checkpoint_dir: results/grpo-nanov3-30ba3b-4n4g-megatron-qa-nvfp4-w4a16-real
+policy:
+  model_name: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_ci/artifacts/model/nvidia_nvidia-nemotron-3-nano-30b-a3b-bf16/hf/hf-cbd3fa9_orig
+  tokenizer:
+    name: ${policy.model_name}
+  quant_calib_size: 16
+  quant_sequence_length: 1024
+  generation:
+    real_quant: true
+    # Nano3-specific paths that stay in BF16 during real-quant rollout.
+    real_quant_ignore:
+      - lm_head
+      - '*output_layer*'
+      - '*mlp.gate'
+      - '*router*'
+      - '*block_sparse_moe.gate*'
+      - '*self_attention*'
+      - '*self_attn*'
+      - '*proj_out.*'
+      - '*.gate.*'
+      - '*mlp.shared_expert_gate.*'
+      - '*linear_attn.conv1d*'
+      - '*mixer.conv1d*'
+      - '*.mixer.in_proj*'
+      - '*.mixer.out_proj*'
+      - '*.shared_expert.*'
+      - '*.shared_experts.*'
+      - '*.norm.*'
+      - '*.q_proj*'
+      - '*.k_proj*'
+      - '*.v_proj*'
+      - '*.o_proj*'
+      - '*.qkv_proj*'
+      - '*.linear_proj*'
+      - '*.linear_qkv*'
+      - '*.layers.4.*'
+      - '*.layers.11.*'
+      - '*.layers.18.*'
+      - '*.layers.25.*'
+      - '*.layers.32.*'
+      - '*.layers.41.*'
+    vllm_cfg:
+      # Keep vLLM conservative because the full-parameter Nano3 policy and
+      # reference model are colocated on these GPUs. With TP=4, this leaves
+      # refit headroom while providing ample KV cache for the 2K smoke workload.
+      gpu_memory_utilization: 0.35
+      enable_prefix_caching: false
+    vllm_kwargs:
+      tokenizer: ${policy.tokenizer.name}
+data:
+  max_input_seq_length: 1024
+  train:
+    dataset_name: DAPOMath17K
+  default:
+    prompt_file: null
+env:
+  dapo:
+    num_workers: 2
+  math:
+    num_workers: 2
+    math_verify_impl: dapo_math_verify
+logger:
+  log_dir: logs/grpo-nanov3-30ba3b-4n4g-megatron-qa-nvfp4-w4a16-real
+  wandb:
+    name: grpo-nanov3-30ba3b-4n4g-megatron-qa-nvfp4-w4a16-real
+  tensorboard:
+    log_dir: tb_logs-grpo-nanov3-30ba3b-4n4g-megatron-qa-nvfp4-w4a16-real
+cluster:
+  gpus_per_node: 4
+  num_nodes: 4

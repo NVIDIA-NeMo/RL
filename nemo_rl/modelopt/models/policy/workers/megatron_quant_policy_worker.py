@@ -13,22 +13,25 @@
 # limitations under the License.
 
 
+import hashlib
+import json
 import os
+import warnings
+from collections.abc import Generator, Mapping
 from contextlib import contextmanager
-from typing import Generator
+from pathlib import Path
 
-import modelopt.torch.quantization as mtq
 import ray
 import torch
+from modelopt.torch.quantization.nn.modules.quant_module import QuantModule
+from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
+
+import nemo_rl.models.policy.workers.megatron_policy_worker as megatron_policy_worker
 from megatron.bridge.training.post_training.checkpointing import (
     has_modelopt_state,
     load_modelopt_state,
 )
 from megatron.core.utils import unwrap_model
-from modelopt.torch.quantization.nn.modules.quant_module import QuantModule
-from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
-
-import nemo_rl.models.policy.workers.megatron_policy_worker as megatron_policy_worker
 from nemo_rl.modelopt.models.policy.workers.utils import (
     get_quantization_layer_spec,
     get_quantization_mamba_stack_spec,
@@ -42,27 +45,97 @@ from nemo_rl.models.policy.workers.megatron_policy_worker import (
 )
 
 
-@contextmanager
-def _w4a16_modelopt_exporter():
-    """Temporarily adapt Bridge's NVFP4 exporter for W4A16 rollout metadata.
+def _quant_checkpoint_cache_suffix(config: Mapping[str, object]) -> str:
+    """Build a short suffix for HF->Megatron checkpoints with ModelOpt state."""
+    keys = (
+        "quant_cfg",
+        "quant_calib_data",
+        "quant_calib_size",
+        "quant_batch_size",
+        "quant_sequence_length",
+        "disable_modelopt_layer_spec",
+    )
+    payload = {key: config.get(key) for key in keys}
+    quant_cfg = payload["quant_cfg"]
+    path = Path(quant_cfg).expanduser() if isinstance(quant_cfg, str) else None
+    if path is not None and path.is_file():
+        payload["quant_cfg"] = {
+            "path": path.resolve().as_posix(),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:12]
+    return f"_modelopt_{digest}"
 
-    Get this removed when Bridge fixed the logic here.
+
+def _find_other_quant_checkpoint_caches(
+    base_pretrained_path: str,
+    selected_pretrained_path: str,
+) -> list[Path]:
+    """Find valid quantized startup caches other than the selected cache."""
+    base_path = Path(base_pretrained_path)
+    parent = base_path.parent
+    if not parent.is_dir():
+        return []
+
+    selected_path = Path(selected_pretrained_path)
+    hashed_prefix = f"{base_path.name}_modelopt_"
+    legacy_name = f"{base_path.name}_quantized"
+    caches = []
+    for candidate in parent.iterdir():
+        if candidate == selected_path or not (
+            candidate.name.startswith(hashed_prefix) or candidate.name == legacy_name
+        ):
+            continue
+        iter0_path = candidate / "iter_0000000"
+        if iter0_path.exists() and has_modelopt_state(iter0_path.as_posix()):
+            caches.append(candidate)
+    return sorted(caches)
+
+
+def _warn_if_other_quant_checkpoint_caches(
+    base_pretrained_path: str,
+    selected_pretrained_path: str,
+) -> None:
+    """Warn when a different quantization config already has a startup cache."""
+    other_caches = _find_other_quant_checkpoint_caches(
+        base_pretrained_path,
+        selected_pretrained_path,
+    )
+    if not other_caches:
+        return
+
+    warnings.warn(
+        "Found quantized startup checkpoint cache(s) created with a different "
+        f"quantization configuration: {', '.join(map(str, other_caches))}. "
+        f"They will not be reused; the selected cache is {selected_pretrained_path}. "
+        "This startup-cache check does not validate resumed training checkpoints. "
+        "When changing an experiment configuration, use a new "
+        "checkpointing.checkpoint_dir.",
+        UserWarning,
+        stacklevel=2,
+    )
+
+
+def _set_quantization_model_specs(model_config, disable_modelopt_layer_spec: bool):
+    """Select quantization-compatible specs across Bridge hybrid API versions.
+
+    Recent Megatron-Bridge revisions load Nemotron-H checkpoints as a
+    ``HybridModelProvider`` and use ``hybrid_stack_spec``.  Older revisions use
+    the deprecated ``mamba_stack_spec`` field.  Setting only the latter leaves
+    the recent provider to infer the local ModelOpt stack when
+    ``restore_modelopt_state=True``; that stack contains ``SequentialMLP`` and
+    cannot restore quantizers with both tensor and expert parallelism enabled.
     """
-    from megatron.bridge.models.conversion import modelopt_utils
-    from modelopt.torch.export.quant_utils import QUANTIZATION_W4A16_NVFP4
-
-    original_get_exporter = modelopt_utils.get_modelopt_quant_exporter
-
-    def _get_modelopt_quant_exporter(quant_mode: str):
-        if quant_mode.lower() == "w4a16_nvfp4":
-            return QUANTIZATION_W4A16_NVFP4, modelopt_utils.quantize_nvfp4_weight
-        return original_get_exporter(quant_mode)
-
-    modelopt_utils.get_modelopt_quant_exporter = _get_modelopt_quant_exporter
-    try:
-        yield
-    finally:
-        modelopt_utils.get_modelopt_quant_exporter = original_get_exporter
+    model_config.transformer_layer_spec = get_quantization_layer_spec(
+        disable_modelopt_layer_spec
+    )
+    stack_spec = get_quantization_mamba_stack_spec(disable_modelopt_layer_spec)
+    if hasattr(model_config, "hybrid_stack_spec"):
+        model_config.hybrid_stack_spec = stack_spec
+    elif hasattr(model_config, "mamba_stack_spec"):
+        model_config.mamba_stack_spec = stack_spec
 
 
 @ray.remote(
@@ -106,9 +179,6 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                     self.reference_state_dict[name] = item.detach().to(
                         device="cpu", non_blocking=True, copy=True
                     )
-        if self.rank == 0:
-            print(f"Quantized model: {self.model}")
-            mtq.print_quant_summary(self.model)
 
     def _quantize(self, model):
         """Quantize the model if the model is not quantized yet."""
@@ -131,8 +201,8 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         """Patch validate_model_paths to handle quantized checkpoint paths.
 
         In cases like distillation where the teacher model is the same as the student model,
-        we need to save an extra quantized checkpoint. This patch checks for modelopt state
-        and redirects to a _quantized suffix path. It also handles pre-quantized model symlinks.
+        we need to save an extra quantized checkpoint. This patch routes auto-converted HF
+        checkpoints to a ModelOpt-specific cache path. It also handles pre-quantized model symlinks.
         """
         if getattr(megatron_policy_worker.validate_model_paths, "_is_patched", False):
             return
@@ -143,11 +213,15 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 original_validate_model_paths(config)
             )
 
+            if config.get("pretrained_checkpoint") is not None:
+                return hf_model_name, pretrained_path, pt_checkpoint_exists
+
+            base_pretrained_path = pretrained_path
+            pretrained_path += _quant_checkpoint_cache_suffix(config)
             iter0_path = os.path.join(pretrained_path, "iter_0000000")
-            if pt_checkpoint_exists and not has_modelopt_state(iter0_path):
-                pretrained_path += "_quantized"
-                iter0_path = os.path.join(pretrained_path, "iter_0000000")
-                pt_checkpoint_exists = os.path.exists(iter0_path)
+            pt_checkpoint_exists = os.path.exists(iter0_path) and has_modelopt_state(
+                iter0_path
+            )
 
             pre_quantized_model_path = os.environ.get(
                 "NRL_PRE_QUANTIZED_MEGATRON_MODEL_PATH"
@@ -155,6 +229,12 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             if pre_quantized_model_path is not None and not pt_checkpoint_exists:
                 symlink_pre_quantized_model(pre_quantized_model_path, pretrained_path)
                 pt_checkpoint_exists = True
+
+            if not pt_checkpoint_exists and self.rank == 0:
+                _warn_if_other_quant_checkpoint_caches(
+                    base_pretrained_path,
+                    pretrained_path,
+                )
 
             return hf_model_name, pretrained_path, pt_checkpoint_exists
 
@@ -183,13 +263,9 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                     "disable_modelopt_layer_spec", False
                 )
                 megatron_cfg.model.restore_modelopt_state = True
-                megatron_cfg.model.transformer_layer_spec = get_quantization_layer_spec(
-                    disable_modelopt_layer_spec
+                _set_quantization_model_specs(
+                    megatron_cfg.model, disable_modelopt_layer_spec
                 )
-                if hasattr(megatron_cfg.model, "mamba_stack_spec"):
-                    megatron_cfg.model.mamba_stack_spec = (
-                        get_quantization_mamba_stack_spec(disable_modelopt_layer_spec)
-                    )
 
             return original_setup_model_and_optimizer(
                 policy_cfg, megatron_cfg, *args, **kwargs
@@ -360,31 +436,33 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             return super().save_checkpoint(*args, **kwargs)
 
     def _use_real_quant_refit(self) -> bool:
-        generation_cfg = self.cfg.get("generation") or {}
+        generation_cfg = self.cfg["generation"]
         return (
-            generation_cfg.get("backend") == "vllm"
+            generation_cfg["backend"] == "vllm"
             and generation_cfg.get("quant_cfg") is not None
             and bool(generation_cfg.get("real_quant"))
         )
 
-    def _iter_real_quant_refit_params(self, kv_scales=None):
+    def _iter_real_quant_refit_params(
+        self,
+        kv_scales: dict[str, float] | None = None,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Export packed NVFP4 weights and scales for real-quant vLLM rollout."""
         from nemo_rl.modelopt.utils import DEFAULT_NVFP4_IGNORE
 
-        generation_cfg = self.cfg.get("generation") or {}
-        vllm_cfg = generation_cfg.get("vllm_cfg", {})
+        generation_cfg = self.cfg["generation"]
+        vllm_cfg = generation_cfg["vllm_cfg"]
         ignore = generation_cfg.get("real_quant_ignore")
         if ignore is None:
             ignore = DEFAULT_NVFP4_IGNORE
-        with _w4a16_modelopt_exporter():
-            yield from self.megatron_bridge.export_hf_weights_modelopt(
-                [self.model],
-                quant_mode="w4a16_nvfp4",
-                cpu=True,
-                show_progress=False,
-                conversion_tasks=self.refit_conversion_tasks,
-                ignore_patterns=ignore,
-            )
+        yield from self.megatron_bridge.export_hf_weights_modelopt(
+            [self.model],
+            quant_mode="w4a16_nvfp4",
+            cpu=True,
+            show_progress=False,
+            conversion_tasks=self.refit_conversion_tasks,
+            ignore_patterns=ignore,
+        )
 
         if self.draft_model is not None:
             from nemo_rl.models.megatron.draft import export_eagle_weights_to_hf
@@ -392,7 +470,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             for name, tensor in export_eagle_weights_to_hf(self.draft_model):
                 yield f"draft.{name}", tensor
 
-        if not vllm_cfg.get("kv_cache_dtype", "").startswith("fp8"):
+        if not vllm_cfg["kv_cache_dtype"].startswith("fp8"):
             return
 
         from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
@@ -417,7 +495,10 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             )
 
     @staticmethod
-    def _find_weight_quantizer(module, param_weight):
+    def _find_weight_quantizer(
+        module: object,
+        param_weight: object,
+    ) -> object | None:
         """Find the enabled weight quantizer that corresponds to ``param_weight``.
 
         Uses ModelOpt's ``QuantModule.iter_weights_for_calibration`` to discover
@@ -431,6 +512,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             return None
         if not isinstance(module, QuantModule):
             return None
+
         for weight, wq in module.iter_weights_for_calibration():
             if (
                 param_weight is weight

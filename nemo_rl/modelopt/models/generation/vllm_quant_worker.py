@@ -30,7 +30,15 @@ from nemo_rl.models.generation.vllm.vllm_worker_async import (
 _EXTRA_ENV_VARS = (
     "VLLM_QUANT_CFG",
     "VLLM_MODELOPT_REAL_QUANT",
+    "PYTHONPATH",
 )
+
+
+def _quant_cfg_for_worker_env(quant_cfg: str) -> str:
+    expanded = os.path.expanduser(quant_cfg)
+    if os.path.isfile(expanded):
+        return os.path.abspath(expanded)
+    return quant_cfg
 
 
 def _configure_quant_engine_kwargs(
@@ -48,6 +56,7 @@ def _configure_quant_engine_kwargs(
         from nemo_rl.modelopt.utils import build_vllm_modelopt_nvfp4_config
 
         apply_modelopt_nvfp4_patches()
+        os.environ.pop("VLLM_QUANT_CFG", None)
         os.environ["VLLM_MODELOPT_REAL_QUANT"] = "1"
 
         hf_overrides = llm_kwargs.setdefault("hf_overrides", {})
@@ -61,8 +70,10 @@ def _configure_quant_engine_kwargs(
         )
         # Expert fakequant needs a decomposed MoE path; explicit user config still wins.
         llm_kwargs.setdefault("moe_backend", "triton")
+        os.environ.pop("VLLM_MODELOPT_REAL_QUANT", None)
+        os.environ.pop("VLLM_QUANT_CFG", None)
         if cfg["quant_cfg"]:
-            os.environ["VLLM_QUANT_CFG"] = cfg["quant_cfg"]
+            os.environ["VLLM_QUANT_CFG"] = _quant_cfg_for_worker_env(cfg["quant_cfg"])
 
 
 @ray.remote(

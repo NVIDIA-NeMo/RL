@@ -66,6 +66,9 @@ def _install_optional_dependency_stubs():
     )
 
     plugins = _ensure_module("modelopt.torch.utils.plugins")
+    plugins.get_megatron_calibration_forward_loop = lambda tokenizer, **kwargs: (
+        lambda model: None
+    )
     plugins.megatron_prefill = lambda model, input_ids, skip_return_logits: None
 
     gpt_provider = _ensure_module("megatron.bridge.models.gpt_provider")
@@ -160,7 +163,11 @@ def test_quantize_model_skips_forward_loop_for_weight_only_config(monkeypatch):
         )
         or model_arg,
     )
-    monkeypatch.setattr(worker_utils.mtq, "print_quant_summary", lambda model: None)
+    monkeypatch.setattr(
+        worker_utils.mtq,
+        "print_quant_summary",
+        lambda model: None,
+    )
 
     worker_utils.quantize_model(
         model,
@@ -209,7 +216,11 @@ def test_quantize_model_uses_random_calibration_loop(monkeypatch):
         "quantize",
         lambda model_arg, cfg, forward_loop: calls.append(forward_loop) or model_arg,
     )
-    monkeypatch.setattr(worker_utils.mtq, "print_quant_summary", lambda model: None)
+    monkeypatch.setattr(
+        worker_utils.mtq,
+        "print_quant_summary",
+        lambda model: None,
+    )
 
     worker_utils.quantize_model(
         model,
@@ -255,7 +266,11 @@ def test_quantize_model_uses_named_calibration_dataset(monkeypatch):
         )
         or model_arg,
     )
-    monkeypatch.setattr(worker_utils.mtq, "print_quant_summary", lambda model: None)
+    monkeypatch.setattr(
+        worker_utils.mtq,
+        "print_quant_summary",
+        lambda model: None,
+    )
 
     worker_utils.quantize_model(
         model,
@@ -280,6 +295,64 @@ def test_quantize_model_uses_named_calibration_dataset(monkeypatch):
         },
     )
     assert calls[1] == ("quantize", model, {}, ("loop", False, dataloader))
+
+
+def test_quantize_model_uses_modelopt_megatron_calibration_loop(monkeypatch):
+    model = torch.nn.Linear(1, 1)
+    calls = []
+
+    monkeypatch.setattr(worker_utils, "resolve_quant_cfg", lambda quant_cfg: {})
+    monkeypatch.setattr(worker_utils, "need_calibration", lambda cfg: True)
+    monkeypatch.setattr(
+        worker_utils,
+        "get_megatron_calibration_forward_loop",
+        lambda tokenizer, **kwargs: calls.append(("calibration", tokenizer, kwargs))
+        or "megatron-loop",
+    )
+    monkeypatch.setattr(
+        worker_utils,
+        "get_dataset_dataloader",
+        lambda **kwargs: pytest.fail(
+            "Megatron calibration must use ModelOpt's CP-aware helper"
+        ),
+    )
+    monkeypatch.setattr(
+        worker_utils.mtq,
+        "quantize",
+        lambda model_arg, cfg, forward_loop: calls.append(
+            ("quantize", model_arg, cfg, forward_loop)
+        )
+        or model_arg,
+    )
+    monkeypatch.setattr(worker_utils.mtq, "print_quant_summary", lambda model: None)
+
+    worker_utils.quantize_model(
+        model,
+        "activation-cfg",
+        tokenizer="tokenizer",
+        calib_size=8,
+        is_megatron=True,
+        batch_size=4,
+        data="calibration.jsonl",
+        max_sample_length=16,
+    )
+
+    assert calls == [
+        (
+            "calibration",
+            "tokenizer",
+            {
+                "dataset_name": "calibration.jsonl",
+                "batch_size": 4,
+                "num_samples": 8,
+                "seq_length": 16,
+                "device": model.weight.device,
+                "apply_chat_template": False,
+                "pack": True,
+            },
+        ),
+        ("quantize", model, {}, "megatron-loop"),
+    ]
 
 
 def test_get_modelopt_checkpoint_dir_env_precedence(monkeypatch):

@@ -1,0 +1,42 @@
+# Nemotron 3 Super routed-expert NVFP4 W4A8 recipe for QARL.
+#
+# Weights use NVFP4 while routed-expert inputs use FP8 e4m3. All non-routed
+# expert paths remain BF16, matching the conservative boundary used by the
+# published Super quantization recipe.
+metadata:
+  recipe_type: ptq
+  description: Nemotron 3 Super routed-expert NVFP4 weights with FP8 inputs.
+quantize:
+  algorithm: max
+  quant_cfg:
+    - quantizer_name: '*'
+      enable: false
+    # Hugging Face / vLLM module names.
+    - quantizer_name: '*mixer.experts.*weight_quantizer'
+      enable: true
+      cfg:
+        block_sizes:
+          -1: 16
+          type: dynamic
+          scale_bits: e4m3
+        num_bits: e2m1
+    - quantizer_name: '*mixer.experts.*input_quantizer'
+      enable: true
+      cfg:
+        num_bits: e4m3
+    # Megatron-Core module names.
+    - quantizer_name: '*mlp.experts*weight_quantizer'
+      enable: true
+      cfg:
+        block_sizes:
+          -1: 16
+          type: dynamic
+          scale_bits: e4m3
+        num_bits: e2m1
+    - quantizer_name: '*mlp.experts*input_quantizer'
+      enable: true
+      cfg:
+        num_bits: e4m3
+    # The repeated MTP block stays BF16 in the published Super recipe.
+    - quantizer_name: '*mtp*'
+      enable: false
