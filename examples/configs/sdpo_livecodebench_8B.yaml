@@ -1,0 +1,303 @@
+# SDPO on LiveCodeBench v6 with Qwen3-8B
+#
+# Reproduces the LCBv6 setup from Hübotter et al. (2026)
+# "Reinforcement Learning via Self-Distillation" (arXiv:2601.20802):
+#   - 131 LCB problems released Feb-May 2025
+#   - Private unit tests split 50/50 into a "public" half (training reward)
+#     and a "private" half (held-out validation)
+#   - Env-feedback teacher: the SDPO teacher conditions on the model's
+#     failed attempt + the runtime/test feedback (paper Table 2), not on a
+#     successful peer rollout.
+
+sdpo:
+  num_prompts_per_step: 32           # paper Table 12: question batch size 32
+  num_generations_per_prompt: 8      # paper Table 12: 8 rollouts per question
+  max_rollout_turns: 1
+  max_num_epochs: 100                # epochs over the 131-problem set
+  max_num_steps: 90                  # paper trains ~80-90 steps
+  val_period: 10
+  val_at_start: false
+  val_at_end: true
+  max_val_samples: 131
+  val_batch_size: 64
+  seed: 42
+  # SDPO-specific
+  success_reward_threshold: 1.0      # all train tests must pass
+  max_reprompt_len: 12288            # teacher prompt may include long error logs
+  topk_logits_k: 20                  # paper Table 12 (Section 4 / LCBv6): K=20
+  remove_thinking_from_demo: true    # strip <think>...</think> from peer demos so {solution} slot stays content-only
+  feedback_source: "combined"        # paper Table 2: peer-rollout demo + env feedback
+  log_sample_every_n_steps: 1        # dump one fail + one pass per step (stdout + W&B Table)
+  log_sample_max_chars: 8000         # raise for inspection so it doesn't trail behind env's 12K max_feedback_chars
+
+loss_fn:
+  success_reward_threshold: 1.0
+  kl_type: "reverse"                 # paper Table 12 (Section 4 / LCBv6): Reverse-KL (JS is only used for Section 3 / math)
+  mixed_kl_weight: 0.5               # unused when kl_type="reverse"
+  zero_outside_topk: true
+  reference_policy_kl_penalty: 0.0   # trust-region anchor disabled (no ref-policy forward pass)
+  reference_policy_kl_type: "k3"     # unused while penalty=0
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "results/sdpo_lcbv6_8b"
+  metric_name: "val:accuracy"
+  higher_is_better: true
+  keep_top_k: 3
+  save_period: 10
+  checkpoint_must_save_by: null
+  model_save_format: "safetensors"
+  save_consolidated: false
+  save_optimizer: true
+
+policy:
+  model_name: "Qwen/Qwen3-8B"
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template_kwargs: {"enable_thinking": false}   # paper Table 12: Thinking off
+  hf_config_overrides: {}
+  train_global_batch_size: 256       # 32 prompts × 8 gens (paper Table 12)
+  train_micro_batch_size: 1
+  generation_batch_size: 16
+  logprob_batch_size: ${policy.train_micro_batch_size}
+  max_total_sequence_length: 32768   # Qwen3-8B native; combined-mode teacher = problem + peer demo + env feedback + response
+  precision: "bfloat16"
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: false
+
+  dtensor_cfg:
+    _v2: true
+    enabled: true
+    cpu_offload: False
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 2
+    context_parallel_size: 1
+    custom_parallel_plan: null
+    automodel_kwargs: {}
+    lora_cfg:
+      enabled: False
+      target_modules: []
+      exclude_modules: []
+      match_all_linear: true
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init: "xavier"
+      use_triton: true
+
+  megatron_cfg:
+    enabled: false
+    force_reconvert_from_hf: False
+    empty_unused_memory_level: 1
+    activation_checkpointing: false
+    converter_type: "Qwen3ForCausalLM"
+    tensor_model_parallel_size: 2
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    context_parallel_size: 1
+    pipeline_dtype: ${policy.precision}
+    sequence_parallel: false
+    freeze_moe_router: true
+    moe_router_dtype: "fp64"
+    moe_router_load_balancing_type: "none"
+    moe_router_bias_update_rate: 0.0
+    moe_permute_fusion: false
+    apply_rope_fusion: True
+    bias_activation_fusion: True
+    defer_fp32_logits: False
+    moe_per_layer_logging: False
+    moe_enable_deepep: false
+    moe_token_dispatcher_type: "alltoall"
+    moe_shared_expert_overlap: false
+
+    peft:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init_method: "xavier"
+      lora_B_init_method: "zero"
+      a2a_experimental: false
+      lora_dtype: None
+
+    optimizer:
+      optimizer: "adam"
+      lr: 1.0e-6                    # paper Table 12 (Section 4 / LCBv6): 1e-6 constant
+      min_lr: 1.0e-6                # constant: min == base
+      weight_decay: 0.01
+      bf16: true
+      fp16: false
+      params_dtype: "float32"
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1e-8
+      sgd_momentum: 0.9
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      clip_grad: ${policy.max_grad_norm}
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+
+    scheduler:
+      start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      end_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
+      weight_decay_incr_style: "constant"
+      lr_decay_style: "constant"
+      lr_decay_iters: 100
+      lr_warmup_iters: 0            # paper Table 12: 0 warmup steps
+      lr_warmup_init: 1.0e-6        # unused with warmup_iters=0; keep == base for safety
+
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: true
+      overlap_param_gather: true
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: "optim_grads_params"
+
+    fp8_cfg:
+      enabled: false
+      fp8: "e4m3"
+      fp8_recipe: "blockwise"
+      fp8_param: false
+
+    env_vars: null
+
+  draft:
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    num_layers: null
+    aux_layer_indices: null
+
+  dynamic_batching:
+    enabled: False
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: True
+    train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
+    logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+  max_grad_norm: 1.0
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 1.0e-6                    # paper Table 12 (Section 4 / LCBv6): 1e-6 constant
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1e-8
+      foreach: False
+      fused: False
+
+  scheduler:
+    # paper Table 12: 0 warmup, constant LR — single Constant phase, no LinearLR
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: []
+
+  generation:
+    backend: "vllm"
+    max_new_tokens: 8192
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    mcore_generation_config:
+      buffer_size_gb: 10
+      num_cuda_graphs: 4
+      block_size_tokens: 256
+      use_cuda_graphs_for_non_decode_steps: true
+      enable_chunked_prefill: true
+      unified_memory_level: 0
+      max_tokens: 32768
+    vllm_cfg:
+      async_engine: false
+      precision: ${policy.precision}
+      kv_cache_dtype: "auto"
+      tensor_parallel_size: 2
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.5
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: False
+      use_deep_gemm: False
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 0.5
+    vllm_kwargs: {}
+    colocated:
+      enabled: true
+      resources:
+        gpus_per_node: null
+        num_nodes: null
+
+data:
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: true
+  num_workers: 1
+  use_multiple_dataloader: false
+  train:
+    dataset_name: livecodebench_v6
+    split: "train"
+  validation:
+    dataset_name: livecodebench_v6
+    split: "validation"
+  default:
+    prompt_file: null
+    system_prompt_file: null
+    processor: "livecodebench_processor"
+    env_name: "livecodebench"
+
+env:
+  livecodebench:
+    num_workers: 16
+    timeout_per_test_seconds: 6.0
+    max_feedback_chars: 12000          # was 4000 — give 5+ full failure blocks room (each with Input/Output/Expected visible)
+    max_failed_tests_in_feedback: 5    # was 3 — broader failure exposure
+    max_input_chars_per_test: 800      # NEW — caps each test's input dump so big atcoder JSON arrays don't crowd out Output/Expected
+    max_input_lines_per_test: 40       # NEW — line cap for vertical inputs (was hardcoded 8)
+
+logger:
+  log_dir: "logs/sdpo_lcbv6_8b"
+  num_val_samples_to_print: 0
+  wandb_enabled: true
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: "sdpo-dev"
+    name: "sdpo-lcbv6-8b"
+  swanlab:
+    project: "sdpo-dev"
+    name: "sdpo-lcbv6-8b"
+  tensorboard: {}
+  mlflow:
+    experiment_name: "sdpo-dev"
+    run_name: "sdpo-lcbv6-8b"
+    tracking_uri: "http://localhost:5000"
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1

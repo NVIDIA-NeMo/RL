@@ -32,6 +32,9 @@ from nemo_rl.data.datasets.response_datasets.general_conversations_dataset impor
 from nemo_rl.data.datasets.response_datasets.geometry3k import Geometry3KDataset
 from nemo_rl.data.datasets.response_datasets.gsm8k import GSM8KDataset
 from nemo_rl.data.datasets.response_datasets.helpsteer3 import HelpSteer3Dataset
+from nemo_rl.data.datasets.response_datasets.livecodebench import (
+    LiveCodeBenchDataset,
+)
 from nemo_rl.data.datasets.response_datasets.mmpr_tiny import MMPRTinyDataset
 from nemo_rl.data.datasets.response_datasets.nemogym_dataset import NemoGymDataset
 from nemo_rl.data.datasets.response_datasets.nemotron_cascade2_sft import (
@@ -68,6 +71,7 @@ DATASET_REGISTRY = {
     "geometry3k": Geometry3KDataset,
     "mmpr-tiny": MMPRTinyDataset,
     "HelpSteer3": HelpSteer3Dataset,
+    "livecodebench_v6": LiveCodeBenchDataset,
     "open_assistant": OasstDataset,
     "OpenMathInstruct-2": OpenMathInstruct2Dataset,
     "refcoco": RefCOCODataset,
@@ -137,6 +141,7 @@ __all__ = [
     "DeepScalerDataset",
     "Geometry3KDataset",
     "HelpSteer3Dataset",
+    "LiveCodeBenchDataset",
     "MMPRTinyDataset",
     "NemoGymDataset",
     "NemotronCascade2SFTMathDataset",
