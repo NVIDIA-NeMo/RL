@@ -85,6 +85,13 @@ from nemo_rl.models.policy.workers.patches import (
 from nemo_rl.utils.checkpoint import CheckpointingConfig
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+from nemo_rl.utils.refit_debug import (
+    REFIT_DEBUG_PREFIX,
+    RefitDebugStats,
+    debug_refit_tensors,
+    refit_debug_enabled,
+    select_refit_debug_names,
+)
 
 
 def _resolve_refit_transfer_dtype(
@@ -1494,6 +1501,7 @@ class DTensorPolicyWorkerV2Impl(
         across PP ranks so every rank returns the full model's metadata.
         """
         local_info = {}
+        local_source_dtypes = {}
         for part in self.model_handle.parts:
             for name, tensor in part.state_dict().items():
                 if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
@@ -1509,6 +1517,7 @@ class DTensorPolicyWorkerV2Impl(
                         adapted_tensor.shape,
                         self._get_refit_target_dtype(adapted_fqn, adapted_tensor.dtype),
                     )
+                    local_source_dtypes[adapted_fqn] = adapted_tensor.dtype
 
         if self.pp_enabled:
             # All-gather param info across PP ranks so all workers return full metadata
@@ -1520,9 +1529,35 @@ class DTensorPolicyWorkerV2Impl(
                 state_dict_info.update(info)
             # Warm the cached PP refit plan at setup so its all_gather_object runs outside the streamed broadcast loop.
             self._build_pp_refit_plan()
-            return state_dict_info
+        else:
+            state_dict_info = local_info
 
-        return local_info
+        if refit_debug_enabled():
+            self._refit_debug_names = select_refit_debug_names(state_dict_info)
+            if self.rank == 0:
+                metadata_stats = RefitDebugStats()
+                for name, (shape, dtype) in state_dict_info.items():
+                    metadata_stats.observe_metadata(name, shape, dtype)
+                print(
+                    f"{REFIT_DEBUG_PREFIX} phase=policy_metadata_summary "
+                    f"rank=policy:{self.rank} {metadata_stats.format()}",
+                    flush=True,
+                )
+                for category, name in self._refit_debug_names.items():
+                    shape, metadata_dtype = state_dict_info[name]
+                    source_dtype = local_source_dtypes.get(name, "remote_pp_owner")
+                    print(
+                        f"{REFIT_DEBUG_PREFIX} phase=policy_metadata "
+                        f"rank=policy:{self.rank} category={category} name={name} "
+                        f"shape={list(shape)} source_dtype={source_dtype} "
+                        f"transfer_dtype={metadata_dtype} "
+                        f"metadata_dtype={metadata_dtype}",
+                        flush=True,
+                    )
+        else:
+            self._refit_debug_names = {}
+
+        return state_dict_info
 
     @torch.no_grad()
     def calibrate_qkv_fp8_scales(
@@ -1558,13 +1593,31 @@ class DTensorPolicyWorkerV2Impl(
 
         from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
 
+        params_generator = self._all_params_generator()
+        debug_stats = None
+        if refit_debug_enabled():
+            debug_stats = RefitDebugStats()
+            params_generator = debug_refit_tensors(
+                params_generator,
+                phase="policy_payload_ipc",
+                selected_names=getattr(self, "_refit_debug_names", {}),
+                rank=f"policy:{self.rank}",
+                stats=debug_stats,
+            )
+
         stream_weights_via_ipc_zmq_impl(
-            params_generator=self._all_params_generator(),
+            params_generator=params_generator,
             buffer_size_bytes=buffer_size_bytes,
             zmq_socket=self.zmq_socket,
             rank=self.rank,
             worker_name=str(self),
         )
+        if debug_stats is not None:
+            print(
+                f"{REFIT_DEBUG_PREFIX} phase=policy_payload_ipc_summary "
+                f"rank=policy:{self.rank} {debug_stats.format()}",
+                flush=True,
+            )
 
     @torch.no_grad()
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/stream_weights_via_http")
@@ -1631,12 +1684,30 @@ class DTensorPolicyWorkerV2Impl(
         # param_iterator will return (name, tensor), we only need tensor
         dtensor_post_iter_func = lambda x: x[1]
 
+        params_generator = self._all_params_generator()
+        debug_stats = None
+        if refit_debug_enabled():
+            debug_stats = RefitDebugStats()
+            params_generator = debug_refit_tensors(
+                params_generator,
+                phase="policy_payload_collective",
+                selected_names=getattr(self, "_refit_debug_names", {}),
+                rank=f"policy:{self.rank}",
+                stats=debug_stats,
+            )
+
         packed_broadcast_producer(
-            iterator=self._all_params_generator(),
+            iterator=params_generator,
             group=self.model_update_group,
             src=0,
             post_iter_func=dtensor_post_iter_func,
         )
+        if debug_stats is not None:
+            print(
+                f"{REFIT_DEBUG_PREFIX} phase=policy_payload_collective_summary "
+                f"rank=policy:{self.rank} {debug_stats.format()}",
+                flush=True,
+            )
 
         # Manually move model to cpu for cpu offload case
         # cpu offload needs model on CPU before model forward

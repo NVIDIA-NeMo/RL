@@ -15,6 +15,7 @@
 import contextlib
 import os
 import tempfile
+from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -776,6 +777,29 @@ class TestDTensorParamsGenerator:
         for name, tensor in results:
             assert tensor.dtype == target_dtype
             assert tensor.is_contiguous()
+
+    def test_prepare_refit_info_logs_fp32_source_and_transfer_dtype(
+        self, monkeypatch, capsys
+    ):
+        monkeypatch.setenv("NRL_REFIT_DEBUG", "1")
+        model = nn.Module()
+        model.model = nn.Module()
+        model.model.embed_tokens = nn.Embedding(4, 2, dtype=torch.float32)
+        worker = object.__new__(DTensorPolicyWorkerV2Impl)
+        worker.model_handle = SimpleNamespace(parts=[model])
+        worker.pp_enabled = False
+        worker.dtype = torch.bfloat16
+        worker.rank = 0
+
+        state_dict_info = DTensorPolicyWorkerV2Impl.prepare_refit_info(worker)
+
+        name = "model.embed_tokens.weight"
+        assert state_dict_info[name][1] == torch.float32
+        captured = capsys.readouterr().out
+        assert "[REFIT_DEBUG] phase=policy_metadata" in captured
+        assert f"name={name}" in captured
+        assert "source_dtype=torch.float32" in captured
+        assert "transfer_dtype=torch.float32" in captured
 
 
 @pytest.mark.automodel

@@ -26,6 +26,15 @@ from nemo_rl.models.policy.utils import (
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
+from nemo_rl.utils.refit_debug import (
+    REFIT_DEBUG_PREFIX,
+    RefitDebugStats,
+    debug_refit_tensors,
+    log_refit_destinations,
+    refit_debug_enabled,
+    refit_debug_rank,
+    select_refit_debug_names,
+)
 
 try:
     import vllm  # noqa: F401
@@ -103,6 +112,18 @@ class VllmInternalWorkerExtension:
                 e.g. {tensor_name: (shape, dtype)}
         """
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
+        if refit_debug_enabled():
+            self._refit_debug_names = select_refit_debug_names(state_dict_info)  # pyrefly: ignore[implicitly-defined-attribute]
+            metadata_stats = RefitDebugStats()
+            for name, (shape, dtype) in state_dict_info.items():
+                metadata_stats.observe_metadata(name, shape, dtype)
+            print(
+                f"{REFIT_DEBUG_PREFIX} phase=vllm_metadata_summary "
+                f"rank=vllm:{refit_debug_rank()} {metadata_stats.format()}",
+                flush=True,
+            )
+        else:
+            self._refit_debug_names = {}  # pyrefly: ignore[implicitly-defined-attribute]
 
     def _maybe_process_fp8_kv_cache(self) -> None:
         """Process weights after loading for FP8 KV cache (static scales)."""
@@ -219,6 +240,23 @@ class VllmInternalWorkerExtension:
         """
         from nemo_rl.models.generation.vllm.quantization import fp8
 
+        debug_enabled = refit_debug_enabled()
+        if debug_enabled:
+            weights = list(weights)
+            debug_stats = getattr(self, "_refit_debug_stats", None)
+            if debug_stats is None:
+                debug_stats = RefitDebugStats()
+                self._refit_debug_stats = debug_stats  # pyrefly: ignore[implicitly-defined-attribute]
+            weights = list(
+                debug_refit_tensors(
+                    iter(weights),
+                    phase="vllm_incoming",
+                    selected_names=getattr(self, "_refit_debug_names", {}),
+                    rank=f"vllm:{refit_debug_rank()}",
+                    stats=debug_stats,
+                )
+            )
+
         if (
             "Gemma3ForConditionalGeneration"
             in self.model_runner.vllm_config.model_config.architectures
@@ -228,11 +266,14 @@ class VllmInternalWorkerExtension:
 
         policy_weights, draft_weights = self._split_policy_and_draft_weights(weights)
         if fp8.is_fp8_model(self.model_runner.vllm_config):
-            fp8.load_weights(policy_weights, self.model_runner)
+            load_result = fp8.load_weights(policy_weights, self.model_runner)
         else:
-            self.model_runner.model.load_weights(weights=policy_weights)
+            load_result = self.model_runner.model.load_weights(weights=policy_weights)
 
         self._load_draft_weights(draft_weights)
+        if debug_enabled and isinstance(load_result, (set, list, tuple)):
+            self._refit_debug_stats.observe_loaded(load_result)  # pyrefly: ignore[missing-attribute]
+        return load_result
 
     @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(self) -> bool:
@@ -243,6 +284,8 @@ class VllmInternalWorkerExtension:
         """
         buffer = None
         weights = None
+        if refit_debug_enabled():
+            self._refit_debug_stats = RefitDebugStats()  # pyrefly: ignore[implicitly-defined-attribute]
 
         try:
             self.maybe_init_zmq()
@@ -311,6 +354,19 @@ class VllmInternalWorkerExtension:
             # Process weights after loading for FP8 KV cache
             self._maybe_process_fp8_kv_cache()
 
+            if refit_debug_enabled():
+                print(
+                    f"{REFIT_DEBUG_PREFIX} phase=vllm_refit_summary transport=ipc "
+                    f"rank=vllm:{refit_debug_rank()} "
+                    f"{self._refit_debug_stats.format()}",  # pyrefly: ignore[missing-attribute]
+                    flush=True,
+                )
+                log_refit_destinations(
+                    self.model_runner.model,
+                    getattr(self, "_refit_debug_names", {}),
+                    rank=f"vllm:{refit_debug_rank()}",
+                )
+
             gc.collect()
             torch.cuda.empty_cache()
             return True
@@ -332,6 +388,8 @@ class VllmInternalWorkerExtension:
         )
 
         load_model_weight_func = self._load_weights
+        if refit_debug_enabled():
+            self._refit_debug_stats = RefitDebugStats()  # pyrefly: ignore[implicitly-defined-attribute]
 
         try:
             packed_broadcast_consumer(
@@ -343,6 +401,19 @@ class VllmInternalWorkerExtension:
 
             # Process weights after loading for FP8 KV cache
             self._maybe_process_fp8_kv_cache()
+
+            if refit_debug_enabled():
+                print(
+                    f"{REFIT_DEBUG_PREFIX} phase=vllm_refit_summary "
+                    f"transport=collective rank=vllm:{refit_debug_rank()} "
+                    f"{self._refit_debug_stats.format()}",  # pyrefly: ignore[missing-attribute]
+                    flush=True,
+                )
+                log_refit_destinations(
+                    self.model_runner.model,
+                    getattr(self, "_refit_debug_names", {}),
+                    rank=f"vllm:{refit_debug_rank()}",
+                )
 
         except Exception as e:
             print(
