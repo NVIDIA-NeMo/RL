@@ -33,6 +33,7 @@ policy:
       lr_warmup_init: 3.0e-08
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+      NCCL_P2P_PXN_LEVEL: "0"
   generation:
     vllm_cfg:
       tensor_parallel_size: 1

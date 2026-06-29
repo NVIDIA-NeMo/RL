@@ -14,3 +14,4 @@ policy:
       attention_backend: TRITON_ATTN
 cluster:
   gpus_per_node: 4
+  segment_size: 8
