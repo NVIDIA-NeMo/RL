@@ -1366,6 +1366,9 @@ class MegatronPolicyWorkerImpl(
             post_iter_func=lambda x: x[1],
         )
 
+    def _use_real_quant_refit(self) -> bool:
+        return False
+
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)
         self.model.eval()
@@ -1408,7 +1411,7 @@ class MegatronPolicyWorkerImpl(
             torch.cuda.empty_cache()
 
     def finish_inference(self) -> None:
-        """Offload model params to CPU after inference."""
+        """Offload model params to CPU after inference. Only used in PPO."""
         self.model = self.move_model(
             self.model, "cpu", move_params=True, move_grads=False
         )

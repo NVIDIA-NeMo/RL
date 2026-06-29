@@ -1218,6 +1218,14 @@ class DTensorPolicyWorkerV2Impl(
 
         torch.cuda.empty_cache()
 
+    def finish_inference(self) -> None:
+        """Offload model params to CPU after inference. Only used in PPO."""
+        self.model = self.move_to_cpu(self.model)
+        self.model.eval()
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
     @torch.no_grad()
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/offload_before_refit")
     def offload_before_refit(self) -> None:
