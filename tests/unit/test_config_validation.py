@@ -161,23 +161,30 @@ def test_all_config_files_have_required_keys(config_file):
     validate_config_section(config_dict, master_config_class, config_file)
 
 
-def test_reward_penalty_config_requires_explicit_eos_token_id():
-    """EOS penalty requires an explicit token id at config validation time."""
-    with pytest.raises(ValidationError, match="reward_penalties.token_ids.eos"):
-        RewardPenaltyConfig(penalize_eos_token=True)
+def test_reward_penalty_config_requires_explicit_unwanted_token_ids():
+    """Unwanted-token penalty requires explicit unwanted-token config.
 
-    with pytest.raises(ValidationError, match="reward_penalties.token_ids.eos"):
-        RewardPenaltyConfig(penalize_eos_token=True, token_ids=None)
+    Validates that token_ids.unwanted is present whenever penalize_unwanted_tokens
+    is enabled.
+    """
+    with pytest.raises(ValidationError, match="reward_penalties.token_ids.unwanted"):
+        RewardPenaltyConfig(penalize_unwanted_tokens=True)
 
-    with pytest.raises(ValidationError, match="reward_penalties.token_ids.eos"):
-        RewardPenaltyConfig(penalize_eos_token=True, token_ids={})
+    with pytest.raises(ValidationError, match="reward_penalties.token_ids.unwanted"):
+        RewardPenaltyConfig(penalize_unwanted_tokens=True, token_ids=None)
+
+    with pytest.raises(ValidationError, match="reward_penalties.token_ids.unwanted"):
+        RewardPenaltyConfig(penalize_unwanted_tokens=True, token_ids={})
+
+    with pytest.raises(ValidationError, match="reward_penalties.token_ids.unwanted"):
+        RewardPenaltyConfig(penalize_unwanted_tokens=True, token_ids={"unwanted": []})
 
     config = RewardPenaltyConfig(
-        penalize_eos_token=True,
-        token_ids={"eos": 2},
+        penalize_unwanted_tokens=True,
+        token_ids={"unwanted": [2]},
     )
     assert config.token_ids is not None
-    assert config.token_ids.eos == 2
+    assert config.token_ids.unwanted == [2]
 
 
 @pytest.mark.parametrize("config_file", config_files)
