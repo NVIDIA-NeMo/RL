@@ -774,6 +774,9 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     model_cfg.gradient_accumulation_fusion = config["megatron_cfg"][
         "gradient_accumulation_fusion"
     ]
+    model_cfg.use_fused_weighted_squared_relu = config["megatron_cfg"][
+        "use_fused_weighted_squared_relu"
+    ]
     # Optional explicit attention backend override for environments where
     # TE auto backend probing is unstable.
     attention_backend = config["megatron_cfg"].get("attention_backend")
@@ -884,14 +887,9 @@ def _validate_training_config(config: PolicyConfig, model_cfg: Any) -> None:
     model_cfg.calculate_per_token_loss = True
     model_cfg.perform_initialization = True
 
-    # MoE aux loss validation
-    assert (
-        "aux_loss" not in model_cfg.moe_router_load_balancing_type
-        or model_cfg.moe_aux_loss_coeff == 0
-    ), (
-        "MoE aux loss is currently not supported due to a known bug in Megatron-LM. "
-        "See https://github.com/NVIDIA/Megatron-LM/issues/1984 for more details."
-    )
+    # MoE aux loss validation - disabled to support aux loss normalization in RL SFT.
+    # The grad scaling is handled via moe_grad_scale_func in megatron_policy_worker.py.
+    # See https://github.com/NVIDIA/Megatron-LM/issues/1984 for the original issue.
 
 
 def _validate_dtype_config(
@@ -1651,6 +1649,7 @@ def make_policy_like_config(config: ValueConfig) -> dict:
     megatron_cfg.setdefault("apply_rope_fusion", True)
     megatron_cfg.setdefault("bias_activation_fusion", True)
     megatron_cfg.setdefault("gradient_accumulation_fusion", False)
+    megatron_cfg.setdefault("use_fused_weighted_squared_relu", False)
     megatron_cfg.setdefault("defer_fp32_logits", False)
     megatron_cfg.setdefault("force_overwrite_initial_ckpt", False)
 

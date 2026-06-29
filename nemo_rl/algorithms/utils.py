@@ -44,6 +44,7 @@ def calculate_kl(
     kl_type: str = "k3",
     input_clamp_value: float | None = 20.0,
     output_clamp_value: float | None = 10.0,
+    importance_sampling_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Calculates a per-token estimate of the KL Divergence between two logprobs.
 
@@ -57,13 +58,26 @@ def calculate_kl(
                            If None, no clamping is applied.
         output_clamp_value: Optional clamping value for kl to prevent numerical instability.
                            If None, no clamping is applied.
+        importance_sampling_weights: Optional per-token importance weights. When
+                                     provided, weights are multiplied into the KL
+                                     before output clamping. If input clamping
+                                     applies to a token, the corresponding weight
+                                     is detached so the clamp suppresses both KL
+                                     and sampling-weight gradients.
 
     Returns:
         torch.Tensor: Per-token KL penalty values (b, s)
     """
     logr = logprobs_reference - logprobs
     if input_clamp_value is not None:
-        logr = logr.clamp(min=-input_clamp_value, max=input_clamp_value)
+        logr_clamped = logr.clamp(min=-input_clamp_value, max=input_clamp_value)
+        if importance_sampling_weights is not None:
+            importance_sampling_weights = torch.where(
+                logr == logr_clamped,
+                importance_sampling_weights,
+                importance_sampling_weights.detach(),
+            )
+        logr = logr_clamped
 
     if kl_type == "k1":
         kl = -logr
@@ -76,6 +90,9 @@ def calculate_kl(
 
     else:
         raise ValueError(f"Invalid KL type: {kl_type}")
+
+    if importance_sampling_weights is not None:
+        kl = importance_sampling_weights * kl
 
     if output_clamp_value is not None:
         kl = kl.clamp(min=-output_clamp_value, max=output_clamp_value)

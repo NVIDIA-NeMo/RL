@@ -146,6 +146,7 @@ policy:
     apply_rope_fusion: True
     bias_activation_fusion: True
     gradient_accumulation_fusion: false
+    use_fused_weighted_squared_relu: false
     defer_fp32_logits: False
     moe_per_layer_logging: False
 
@@ -311,6 +312,7 @@ value:
     apply_rope_fusion: True
     bias_activation_fusion: True
     gradient_accumulation_fusion: false
+    use_fused_weighted_squared_relu: false
     defer_fp32_logits: False
     moe_per_layer_logging: False
 

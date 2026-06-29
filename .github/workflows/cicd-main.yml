@@ -296,7 +296,9 @@ jobs:
     name: Wait in test approval queue
     needs: [pre-flight, lint-check]
     runs-on: ubuntu-latest
-    environment: test
+    environment:
+      name: test
+      deployment: false
     if: >-
       ${{
         always() &&
@@ -840,6 +842,8 @@ jobs:
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_AutoModel
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
+          - script: L1_Functional_Tests_SGLang
+            runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_Gym
             runner: ${{ needs.org-member-pre-flight.outputs.runner_prefix }}
           - script: L1_Functional_Tests_GRPO_1
@@ -989,7 +993,9 @@ jobs:
     name: Notify nightly test failure
     runs-on: ubuntu-latest
     needs: [CI_QA_Gate]
-    environment: main
+    environment:
+      name: main
+      deployment: false
     if: ${{ always() && github.event_name == 'schedule' && needs.CI_QA_Gate.result == 'failure' }}
     steps:
       - name: Send Slack notification
