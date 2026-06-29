@@ -970,7 +970,7 @@ class VllmGeneration(GenerationInterface):
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
 
-    def init_per_pp_refit_comm_group(
+    def init_nccl_xfer_comm_group(
         self,
         pp_ips: list[str],
         pp_ports: list[int],
@@ -978,14 +978,17 @@ class VllmGeneration(GenerationInterface):
         train_ranks_per_stage: int,
         sub_world_size: int,
     ) -> list[ray.ObjectRef]:
-        """Initialize per-PP-stage comm groups on all gen workers."""
+        """Initialize the nccl_xfer bulk-path comm group(s) on all gen workers.
+
+        One group per PP stage (non-PP = ``pp_size`` 1).
+        """
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
 
         method_name = (
-            "init_per_pp_refit_comm_group_async"
+            "init_nccl_xfer_comm_group_async"
             if self.cfg["vllm_cfg"]["async_engine"]
-            else "init_per_pp_refit_comm_group"
+            else "init_nccl_xfer_comm_group"
         )
 
         total_workers = len(self.worker_group.workers)
@@ -1004,6 +1007,7 @@ class VllmGeneration(GenerationInterface):
                 "sub_world_size": sub_world_size,
             },
         )
+        # co-works with lm_policy; wait for all futures to complete outside
         return futures
 
     def prepare_nccl_xfer_refit_info(self, refit_info: dict) -> None:

@@ -1203,45 +1203,48 @@ def setup(
                 "pipeline_parallel_size", 1
             ),
         }
-        # Create per-PP-stage comm groups when PP > 1
+        # Bootstrap the nccl_xfer bulk-path comm group(s): one per PP stage,
+        # each spanning that stage's train ranks + all gen ranks.  Non-PP is
+        # simply pp_size == 1 (a single stage over all train + gen ranks).
+        # Separate NCCL communicator from model_update_group so the bulk FFN
+        # reshard overlaps the misc packed-broadcast (which stays on
+        # model_update_group).
         pp_size = train_parallelism.get("pp_size", 1)
-        if pp_size > 1:
-            train_ranks_per_stage = train_world_size // pp_size
-            sub_world_size = train_ranks_per_stage + inference_world_size
-            pp_stages = [r // train_ranks_per_stage for r in range(train_world_size)]
-            ranks_in_group = [
-                r % train_ranks_per_stage for r in range(train_world_size)
-            ]
-            # Find an IP and free port for each PP stage.
-            pp_ips = []
-            pp_ports = []
-            for stage in range(pp_size):
-                node_idx = stage * train_ranks_per_stage // train_gpus_per_node
-                stage_ip, stage_port = train_cluster.get_available_address_and_port(
-                    pg_idx=node_idx, bundle_idx=0
-                )
-                pp_ips.append(stage_ip)
-                pp_ports.append(stage_port)
-            print(
-                f"Per-PP-stage comm group IPs/ports: {list(zip(pp_ips, pp_ports))}",
-                flush=True,
+        train_ranks_per_stage = train_world_size // pp_size
+        sub_world_size = train_ranks_per_stage + inference_world_size
+        pp_stages = [r // train_ranks_per_stage for r in range(train_world_size)]
+        ranks_in_group = [r % train_ranks_per_stage for r in range(train_world_size)]
+        # Find an IP and free port for each stage's group (one when non-PP).
+        pp_ips = []
+        pp_ports = []
+        for stage in range(pp_size):
+            node_idx = stage * train_ranks_per_stage // train_gpus_per_node
+            stage_ip, stage_port = train_cluster.get_available_address_and_port(
+                pg_idx=node_idx, bundle_idx=0
             )
-            futures_train_pp = policy.init_per_pp_refit_comm_group(
-                pp_ips=pp_ips,
-                pp_ports=pp_ports,
-                pp_size=pp_size,
-                pp_stages=pp_stages,
-                sub_world_size=sub_world_size,
-                ranks_in_group=ranks_in_group,
-            )
-            futures_gen_pp = policy_generation.init_per_pp_refit_comm_group(
-                pp_ips=pp_ips,
-                pp_ports=pp_ports,
-                pp_size=pp_size,
-                train_ranks_per_stage=train_ranks_per_stage,
-                sub_world_size=sub_world_size,
-            )
-            ray.get(futures_train_pp + futures_gen_pp)
+            pp_ips.append(stage_ip)
+            pp_ports.append(stage_port)
+        print(
+            f"nccl_xfer bulk comm group IPs/ports ({pp_size} stage(s)): "
+            f"{list(zip(pp_ips, pp_ports))}",
+            flush=True,
+        )
+        futures_train = policy.init_nccl_xfer_comm_group(
+            pp_ips=pp_ips,
+            pp_ports=pp_ports,
+            pp_size=pp_size,
+            pp_stages=pp_stages,
+            sub_world_size=sub_world_size,
+            ranks_in_group=ranks_in_group,
+        )
+        futures_gen = policy_generation.init_nccl_xfer_comm_group(
+            pp_ips=pp_ips,
+            pp_ports=pp_ports,
+            pp_size=pp_size,
+            train_ranks_per_stage=train_ranks_per_stage,
+            sub_world_size=sub_world_size,
+        )
+        ray.get(futures_train + futures_gen)
 
         # Train-side preparation for nccl_xfer_refit creates required per-layer parameter metadata,
         # required for the nccl-xfer refit execution.

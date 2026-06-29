@@ -1817,22 +1817,43 @@ class MegatronPolicyWorkerImpl(
         excludes ``.k_scale``/``.v_scale``/``.q_scale`` -> misc); the gen side finalizes
         them via ``_maybe_process_fp8_kv_cache``.  No out-of-band channel needed.
         """
-        from nemo_rl.distributed.xferdtensor import DTensorRef, xferdtensor
-
         # hf_to_local_param_map is built once in prepare_nccl_xfer_refit_info;
         # weight values change but the name → spec mapping is stable across
         # refits.
+        # Overlapping broadcast and the nccl-xfer path refits.
+        import concurrent.futures
 
-        use_per_stage = hasattr(self, "pp_comm_group")
+        from nemo_rl.distributed.xferdtensor import DTensorRef, xferdtensor
+
+        # The misc producer requires the worker's CUDA device setting.
+        # Otherwise it defaults to device 0
+        _misc_device = torch.cuda.current_device()
+
+        def _run_misc_broadcast():
+            torch.cuda.set_device(_misc_device)
+            self._broadcast_misc_params_packed(kv_scales=kv_scales)
+
+        # Serialize the bulk reshard and the misc broadcast (bulk -> misc) by
+        # default; both sides must agree (see vllm_backend.nccl_xfer_refit).
+        _parallel_misc = os.environ.get(
+            "NRL_NCCL_XFER_REFIT_PARALLEL_MISC", ""
+        ).lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if _parallel_misc:
+            _misc_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            _misc_future = _misc_pool.submit(_run_misc_broadcast)
 
         for layer_name in self.nccl_xfer_refit_info["layer_names"]:
             for param_info in self.nccl_xfer_refit_info["per_layer_params"][layer_name]:
-                if use_per_stage:
-                    if param_info.get("pp_stage", 0) != self.my_pp_stage:
-                        continue
-                    group = self.pp_comm_group
-                else:
-                    group = self.model_update_group
+                # Each train worker handles only its own PP stage's params
+                # (non-PP = every param is in pp_stage 0).
+                if param_info.get("pp_stage", 0) != self.my_pp_stage:
+                    continue
+                group = self.pp_comm_group
 
                 spec = self.hf_to_local_param_map.get(param_info["name"])
                 assert spec is not None, (
@@ -1866,7 +1887,13 @@ class MegatronPolicyWorkerImpl(
                 # memory returns to the caching allocator
                 del ctx, src_tensor
 
-        self._broadcast_misc_params_packed(kv_scales=kv_scales)
+        # Bulk reshard done.  Default: run misc now (serial, no concurrent
+        # communicators).  Parallel opt-in: join the background misc broadcast.
+        if not _parallel_misc:
+            _run_misc_broadcast()
+        else:
+            _misc_future.result()
+            _misc_pool.shutdown(wait=True)
 
     def _broadcast_misc_params_packed(self, kv_scales=None) -> None:
         """Broadcast misc params via the existing packed_broadcast machinery."""

@@ -1046,7 +1046,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # this function should co-work with vllm, so we should wait for all futures to complete outside
         return futures
 
-    def init_per_pp_refit_comm_group(
+    def init_nccl_xfer_comm_group(
         self,
         pp_ips: list[str],
         pp_ports: list[int],
@@ -1055,9 +1055,9 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         sub_world_size: int,
         ranks_in_group: list[int],
     ) -> list[ray.ObjectRef]:
-        """Initialize per-PP-stage comm groups on all train workers."""
+        """Initialize the nccl_xfer bulk-path comm group on all train workers."""
         futures = self.worker_group.run_all_workers_multiple_data(
-            "init_per_pp_refit_comm_group",
+            "init_nccl_xfer_comm_group",
             my_pp_stage=pp_stages,
             my_rank_in_group=ranks_in_group,
             common_kwargs={
@@ -1067,6 +1067,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "sub_world_size": sub_world_size,
             },
         )
+        # co-works with vllm; wait for all futures to complete outside
         return futures
 
     def prepare_nccl_xfer_refit_info(
