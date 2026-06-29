@@ -17,7 +17,6 @@ from pathlib import Path
 import pytest
 import yaml
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PERF_CONFIG_DIR = PROJECT_ROOT / "examples/configs/recipes/llm/performance"
 PERF_SUITE_DIR = PROJECT_ROOT / "tests/test_suites/llm/performance"
@@ -86,11 +85,7 @@ def _load_yaml(path: Path) -> dict:
 def _deep_merge(base: dict, overlay: dict) -> dict:
     merged = dict(base)
     for key, value in overlay.items():
-        if (
-            key in merged
-            and isinstance(merged[key], dict)
-            and isinstance(value, dict)
-        ):
+        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
             merged[key] = _deep_merge(merged[key], value)
         else:
             merged[key] = value
@@ -178,8 +173,14 @@ def test_qwen3_235b_scripts_append_distributed_timeout_override() -> None:
         script_text = (PERF_SUITE_DIR / f"{case_name}.sh").read_text(encoding="utf-8")
 
         assert "export RAY_CGRAPH_get_timeout=2400" in script_text
-        assert "+policy.generation.vllm_kwargs.distributed_timeout_seconds=2400" in script_text
-        assert "\n    policy.generation.vllm_kwargs.distributed_timeout_seconds=2400 \\" not in script_text
+        assert (
+            "+policy.generation.vllm_kwargs.distributed_timeout_seconds=2400"
+            in script_text
+        )
+        assert (
+            "\n    policy.generation.vllm_kwargs.distributed_timeout_seconds=2400 \\"
+            not in script_text
+        )
 
 
 def test_qwen3_235b_mxfp8_recipes_keep_baseline_runtime_knobs() -> None:
