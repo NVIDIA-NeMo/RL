@@ -30,9 +30,14 @@ from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.algorithms.x_token.loss_utils import (
     build_exact_token_map,
     chunk_average_log_probs,
+    localize_alignment,
     valid_chunk_mask,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.model_utils import (
+    cp_load_balanced_to_contiguous,
+    cp_shift_next,
+)
 
 
 def setup_dpo_loss_test_data(vocab_size=16, batch_size=1):
@@ -867,6 +872,61 @@ def test_calculate_kl(kl_type):
     assert torch.allclose(kl_clamped, expected_kl_clamped[kl_type], rtol=1e-3)
 
 
+def test_calculate_kl_detaches_importance_sampling_when_input_clamped():
+    """Input-clamped KL terms should not keep score-function gradients alive."""
+    logprobs = torch.tensor([[-3.0, -1.0]], requires_grad=True)
+    logprobs_reference = torch.zeros_like(logprobs)
+    importance_sampling_weights = torch.exp(logprobs - logprobs.detach())
+
+    kl = calculate_kl(
+        logprobs=logprobs,
+        logprobs_reference=logprobs_reference,
+        kl_type="k3",
+        input_clamp_value=2.0,
+        output_clamp_value=None,
+        importance_sampling_weights=importance_sampling_weights,
+    )
+
+    expected_kl = torch.tensor([[4.389056, 0.7182818]])
+    torch.testing.assert_close(kl.detach(), expected_kl)
+
+    kl.sum().backward()
+
+    torch.testing.assert_close(
+        logprobs.grad,
+        torch.tensor([[0.0, -1.0]]),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+def test_calculate_kl_output_clamp_includes_importance_sampling_weight():
+    """Output clamping should apply after IS weighting and block IS gradients."""
+    logprobs = torch.tensor([[-1.0]], requires_grad=True)
+    logprobs_reference = torch.zeros_like(logprobs)
+    importance_sampling_weights = 100.0 * torch.exp(logprobs - logprobs.detach())
+
+    kl = calculate_kl(
+        logprobs=logprobs,
+        logprobs_reference=logprobs_reference,
+        kl_type="k3",
+        input_clamp_value=None,
+        output_clamp_value=1.0,
+        importance_sampling_weights=importance_sampling_weights,
+    )
+
+    torch.testing.assert_close(kl.detach(), torch.tensor([[1.0]]))
+
+    kl.sum().backward()
+
+    torch.testing.assert_close(
+        logprobs.grad,
+        torch.zeros_like(logprobs),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
 # Simplified KL Penalty Test using original Loss
 def test_clipped_pg_loss_kl_penalty():
     """Tests KL penalty calculations directly."""
@@ -1472,6 +1532,64 @@ def test_clipped_pg_loss_reports_is_oob_ratio_tis():
     )
 
     assert metrics["is_oob_ratio"] == pytest.approx(1.0 / 3.0)
+
+
+@pytest.mark.parametrize("tis_type", ["tis", "icepop", "seq-mask-tis"])
+def test_clipped_pg_loss_rejects_tis_min_above_max(tis_type):
+    cfg = ClippedPGLossConfig(
+        use_importance_sampling_correction=True,
+        truncated_importance_sampling_type=tis_type,
+        truncated_importance_sampling_ratio=1.0,
+        truncated_importance_sampling_ratio_min=2.0,
+    )
+
+    with pytest.raises(
+        AssertionError,
+        match=(
+            "truncated_importance_sampling_ratio_min must be <= "
+            "truncated_importance_sampling_ratio"
+        ),
+    ):
+        ClippedPGLossFn(cfg)
+
+
+@pytest.mark.parametrize(
+    "tis_min,expected_weights,expected_oob_ratio",
+    [
+        (None, torch.tensor([0.1, 1.0, 2.0]), 1.0 / 3.0),
+        (0.5, torch.tensor([0.5, 1.0, 2.0]), 2.0 / 3.0),
+    ],
+)
+def test_clipped_pg_loss_tis_min_bound_defaults_to_zero(
+    tis_min, expected_weights, expected_oob_ratio
+):
+    device = "cpu"
+    data, _, seq_len, _ = _setup_clipped_pg_test_data(device=device)
+
+    cfg = ClippedPGLossConfig(
+        reference_policy_kl_penalty=0.0,
+        use_importance_sampling_correction=True,
+        force_on_policy_ratio=True,
+        truncated_importance_sampling_type="tis",
+        truncated_importance_sampling_ratio=2.0,
+        truncated_importance_sampling_ratio_min=tis_min,
+    )
+    loss_fn = ClippedPGLossFn(cfg)
+
+    data["advantages"][0, 1:] = torch.ones(3)
+    data["generation_logprobs"][0, 1:] = torch.zeros(3)
+    next_token_logprobs = torch.log(torch.tensor([[0.1, 1.0, 3.0]]))
+
+    loss, metrics = loss_fn(
+        next_token_logprobs=next_token_logprobs,
+        data=data,
+        global_valid_seqs=torch.sum(data["sample_mask"]),
+        global_valid_toks=torch.sum(data["sample_mask"] * data["token_mask"]),
+    )
+
+    expected_loss = -expected_weights.mean()
+    torch.testing.assert_close(loss, expected_loss)
+    assert metrics["is_oob_ratio"] == pytest.approx(expected_oob_ratio)
 
 
 def test_clipped_pg_loss_seq_mask_tis():
@@ -2289,7 +2407,7 @@ def test_distillation_loss_fn_call():
 # gold path (KL on the exact-mapped common partition + L1 on the uncommon
 # tail) and the next-token CE term. Unlike the DistillationLossFn tests
 # above, these run on CPU: the gold and CE paths use no GPU-pinned ops, and
-# ``dp_all_reduce_sum`` falls back to the local sum when torch.distributed
+# ``group_all_reduce_sum`` falls back to the local sum when torch.distributed
 # is not initialized.
 # ---------------------------------------------------------------------------
 
@@ -2370,6 +2488,22 @@ def _ct_gold_data(student_chunk_id, teacher_chunk_id, pair_valid, sample_mask):
     )
 
 
+def _ct_gold_prep(logits, teacher_logits, data):
+    """Mirror ``prepare_loss_input``'s shared prep for the single-rank (no-CP)
+    gold path: CP-relaid student logits + localized, next-token-shifted align."""
+    student_logits = cp_load_balanced_to_contiguous(logits, cp_group=None)
+    align = localize_alignment(
+        data, teacher_seq_len=teacher_logits.shape[1], cp_group=None
+    )
+    align.student_chunk_id = cp_shift_next(
+        cp_load_balanced_to_contiguous(align.student_chunk_id, cp_group=None),
+        None,
+        fill=-1,
+    )
+    align.teacher_chunk_id = cp_shift_next(align.teacher_chunk_id, None, fill=-1)
+    return student_logits, align
+
+
 def test_cross_tokenizer_gold_loss_matches_reference(tmp_path):
     """Gold path == (KL on common + L1 on uncommon) * T**2, with no CE term.
 
@@ -2391,8 +2525,9 @@ def test_cross_tokenizer_gold_loss_matches_reference(tmp_path):
     logits = torch.randn(1, 3, _CT_V_STUDENT)
     teacher_logits = torch.randn(1, 3, _CT_V_TEACHER)
 
+    student_logits, align = _ct_gold_prep(logits, teacher_logits, data)
     loss, kl_common, l1_uncommon, n_valid, _ = loss_fn._compute_gold(
-        logits, data, teacher_logits
+        student_logits, teacher_logits, align
     )
 
     assert torch.isfinite(loss)
@@ -2446,7 +2581,10 @@ def test_cross_tokenizer_gold_loss_all_samples_masked_is_zero(tmp_path):
     logits = torch.randn(1, 3, _CT_V_STUDENT)
     teacher_logits = torch.randn(1, 3, _CT_V_TEACHER)
 
-    loss, _, _, n_valid, _ = loss_fn._compute_gold(logits, data, teacher_logits)
+    student_logits, align = _ct_gold_prep(logits, teacher_logits, data)
+    loss, _, _, n_valid, _ = loss_fn._compute_gold(
+        student_logits, teacher_logits, align
+    )
     assert n_valid.item() == 0
     assert torch.equal(loss.detach(), torch.zeros(()))
 

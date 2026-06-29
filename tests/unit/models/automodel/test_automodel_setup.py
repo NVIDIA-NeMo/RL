@@ -40,6 +40,11 @@ from nemo_rl.models.automodel.setup import (
 )
 
 
+def test_token_classification_backport_still_required():
+    with pytest.raises(ImportError):
+        from nemo_automodel import NeMoAutoModelForTokenClassification  # noqa: F401
+
+
 @pytest.fixture
 def mock_config():
     """Create a mock policy configuration for testing."""

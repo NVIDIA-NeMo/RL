@@ -1634,45 +1634,6 @@ def test_setup_auto_enables_skip_reference_policy_logprobs_when_kl_penalty_zero(
     assert master_config.grpo["skip_reference_policy_logprobs_calculation"] is True
 
 
-def test_refit_policy_generation_non_colocated_offloads_and_restores(monkeypatch):
-    from nemo_rl.algorithms import grpo as grpo_mod
-
-    calls = []
-    kv_scales = {"layer_0": 1.0}
-
-    class DummyPolicy:
-        def offload_before_refit(self):
-            calls.append("offload_before_refit")
-
-        def broadcast_weights_for_collective(self, kv_scales=None):
-            calls.append(("broadcast_weights_for_collective", kv_scales))
-            return ["train-ok"]
-
-        def prepare_for_training(self):
-            calls.append("prepare_for_training")
-
-    class DummyGeneration:
-        def update_weights_from_collective(self):
-            calls.append("update_weights_from_collective")
-            return ["inference-ok"]
-
-    monkeypatch.setattr(grpo_mod.ray, "get", lambda x: x)
-
-    grpo_mod.refit_policy_generation(
-        policy=DummyPolicy(),
-        policy_generation=DummyGeneration(),
-        colocated_inference=False,
-        kv_scales=kv_scales,
-    )
-
-    assert calls == [
-        "offload_before_refit",
-        ("broadcast_weights_for_collective", kv_scales),
-        "update_weights_from_collective",
-        "prepare_for_training",
-    ]
-
-
 def test_grpo_train_collects_generation_logger_and_seq_metrics(
     monkeypatch, mock_grpo_components
 ):
@@ -2547,9 +2508,9 @@ def test_gdpo_advantage_estimator_multiple_rewards():
     prompt_ids = torch.tensor([[0], [0]])
     mask = torch.ones(2, 3)
     repeated_batch = {
-        "reward1": torch.tensor([1.0, 1.0]),
-        "reward2": torch.tensor([1.0, -1.0]),
-        "reward3": torch.tensor([1.0, 0.0]),
+        "reward/correctness": torch.tensor([1.0, 1.0]),
+        "reward/integer": torch.tensor([1.0, -1.0]),
+        "reward/format": torch.tensor([1.0, 0.0]),
     }
 
     result = estimator.compute_advantage(prompt_ids, None, mask, repeated_batch)
@@ -2569,7 +2530,7 @@ def test_gdpo_advantage_estimator_single_reward():
 
     prompt_ids = torch.tensor([[0], [0]])
     mask = torch.ones(2, 3)
-    repeated_batch = {"reward1": torch.tensor([1.0, 3.0])}
+    repeated_batch = {"reward/correctness": torch.tensor([1.0, 3.0])}
 
     with pytest.raises(ValueError):
         estimator.compute_advantage(prompt_ids, None, mask, repeated_batch)

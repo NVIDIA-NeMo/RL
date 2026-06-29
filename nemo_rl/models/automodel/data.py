@@ -283,6 +283,22 @@ def process_microbatch(
         seq_index = torch.arange(seq_len, device=input_ids.device).repeat(1, 1)
         cp_buffers = [input_ids, position_ids, seq_index]
 
+        # Cross-tokenizer distillation rides student-seq-aligned alignment /
+        # mask fields on the same mb. CP-shard the student-seq fields with
+        # the student cp_mesh so the loss sees matching seq dims against
+        # the redistributed student logits. Teacher-seq fields (T_t may
+        # differ from T_s) stay full; the loss slices them contiguously by
+        # student CP rank because the IPC consumer ships contiguous teacher
+        # slices (see FullLogitsPostProcessor un-interleave in train.py).
+        if "alignment_student_chunk_id" in mb:
+            for student_seq_field in (
+                "token_mask",
+                "alignment_student_chunk_id",
+                "alignment_student_exact_partition_mask",
+            ):
+                if student_seq_field in mb:
+                    cp_buffers.append(mb[student_seq_field])
+
     return ProcessedInputs(
         input_ids=input_ids,
         attention_mask=attention_mask,
