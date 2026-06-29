@@ -5,6 +5,11 @@ grpo:
   num_prompts_per_step: 8
   num_generations_per_prompt: 8
   skip_reference_policy_logprobs_calculation: true
+  reward_shaping:
+    max_response_length: 512
+
+data:
+  max_input_seq_length: 130560
 
 loss_fn:
   reference_policy_kl_penalty: 0.0
@@ -13,8 +18,8 @@ loss_fn:
 
 checkpointing:
   enabled: true
-  checkpoint_dir: results/grpo-glm5.1-64n4g-megatron-dsa-cp2-pp4-ep64-seq8192-full-onpolicy
-  save_period: 5
+  checkpoint_dir: results/grpo-glm51-full-64n4g-131k-tp8cp16ep64-vllmtp8ep128-gen512-mbt16k-100step
+  save_period: 10
 
 policy:
   model_name: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/songlinj/glm5_1_hf
@@ -23,7 +28,7 @@ policy:
   train_global_batch_size: 64
   train_micro_batch_size: 1
   logprob_batch_size: 1
-  max_total_sequence_length: 8192
+  max_total_sequence_length: 131072
   logprob_chunk_size: 2048
   dtensor_cfg:
     enabled: false
@@ -36,15 +41,17 @@ policy:
   megatron_cfg:
     enabled: true
     converter_type: GlmMoeDsaForCausalLM
+    env_vars:
+      CUDA_DEVICE_MAX_CONNECTIONS: "1"
     tensor_model_parallel_size: 8
-    pipeline_model_parallel_size: 4
-    num_layers_in_first_pipeline_stage: 19
-    num_layers_in_last_pipeline_stage: 19
+    pipeline_model_parallel_size: 1
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
     expert_model_parallel_size: 64
-    context_parallel_size: 2
+    context_parallel_size: 16
     cp_comm_type: all_gather
     sequence_parallel: true
-    activation_checkpointing: true
+    activation_checkpointing: false
     moe_token_dispatcher_type: allgather
     apply_rope_fusion: false
     defer_fp32_logits: true
@@ -54,10 +61,12 @@ policy:
     dsa_kernel_backend: tilelang
     dsa_indexer_loss_coeff: 0.0
     dsa_indexer_use_sparse_loss: false
+    clear_memory_caches_before_refit: true
+    empty_unused_memory_level: 2
     moe_router_dtype: fp32
     moe_shared_expert_overlap: false
     gradient_accumulation_fusion: false
-    moe_permute_fusion: true
+    moe_permute_fusion: false
     moe_grouped_gemm: true
     bias_activation_fusion: true
     deallocate_pipeline_outputs: true
@@ -76,23 +85,32 @@ policy:
       lr_warmup_iters: 2
       lr_warmup_init: 5.0e-08
   generation:
+    max_new_tokens: 512
     vllm_cfg:
-      tensor_parallel_size: 32
+      tensor_parallel_size: 8
       expert_parallel_size: 128
       gpu_memory_utilization: 0.5
       max_model_len: ${policy.max_total_sequence_length}
       enforce_eager: true
+      env_vars:
+        RAY_CGRAPH_get_timeout: 3600
     vllm_kwargs:
-      max_num_batched_tokens: ${policy.max_total_sequence_length}
+      max_num_batched_tokens: 16384
+      enable_chunked_prefill: true
+      attention_config:
+        backend: FLASHMLA_SPARSE
+      kernel_config:
+        moe_backend: flashinfer_cutlass
+      max_num_seqs: 2
 
 logger:
-  log_dir: logs/grpo-glm5.1-64n4g-megatron-dsa-cp2-pp4-ep64-seq8192-full-onpolicy
+  log_dir: logs/grpo-glm51-full-64n4g-131k-tp8cp16ep64-vllmtp8ep128-gen512-mbt16k-100step
   wandb_enabled: true
   tensorboard_enabled: true
   monitor_gpus: true
   wandb:
-    project: nemo-rl-glm
-    name: grpo-glm5.1-64n4g-megatron-dsa-cp2-pp4-ep64-seq8192-full-onpolicy
+    project: nemo-rl-glm-perf
+    name: grpo-glm51-full-64n4g-131k-tp8cp16ep64-vllmtp8ep128-gen512-mbt16k-100step
 
 cluster:
   gpus_per_node: 4
