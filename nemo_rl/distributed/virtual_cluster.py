@@ -203,9 +203,7 @@ def _get_free_consecutive_ports_local(
     *start_port* lets a caller thread a per-node cursor so successive blocks do
     not overlap. Raises ``RuntimeError`` if no such block exists in the range.
     """
-    base = (
-        port_range_low if start_port is None else max(start_port, port_range_low)
-    )
+    base = port_range_low if start_port is None else max(start_port, port_range_low)
     while base + consecutive - 1 < port_range_high:
         socks: list[socket.socket] = []
         try:

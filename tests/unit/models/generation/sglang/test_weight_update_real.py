@@ -35,13 +35,13 @@ import ray
 import torch
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
-from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_MASTER_PORT_RANGE_HIGH,
     DEFAULT_MASTER_PORT_RANGE_LOW,
+    RayVirtualCluster,
     _get_free_port_local,
 )
+from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.sglang.utils.ray_utils import get_host_info
 from tests.unit.models.generation.sglang.weight_update_actor import MockFSDPWorker
 
