@@ -399,6 +399,15 @@ class BaseVllmGenerationWorker:
                     "with load_format='dummy' (NeMo-RL refits bf16 weights via "
                     "ZMQ). Got load_format=%r." % load_format
                 )
+                # NeMo-RL refits bf16 weights, so we intentionally clear any fp8
+                # quantization here -- including the quantization="fp8" that
+                # init_fp8 set above when precision == "fp8". Warn so a
+                # precision: fp8 Mistral3 config isn't silently downgraded to bf16.
+                if self.cfg["vllm_cfg"]["precision"] == "fp8":
+                    print(
+                        "Mistral3 refits bf16 weights via ZMQ; ignoring "
+                        "precision='fp8' and running vLLM generation in bf16."
+                    )
                 vllm_kwargs["quantization"] = None
                 vllm_kwargs["hf_overrides"]["quantization_config"] = {}
 

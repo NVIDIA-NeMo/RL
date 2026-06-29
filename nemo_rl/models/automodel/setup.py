@@ -688,6 +688,21 @@ def setup_model_and_optimizer(
     if "use_liger_kernel" not in automodel_kwargs:
         automodel_kwargs["use_liger_kernel"] = False
 
+    # Recipe-level attn_implementation wins; pop it so it doesn't collide with
+    # the explicit attn_implementation kwarg passed to from_pretrained() below.
+    if "attn_implementation" in automodel_kwargs:
+        requested = automodel_kwargs.pop("attn_implementation")
+        # Sequence packing relies on flash_attention_2 to honor cu_seqlens; any
+        # other backend would silently run cross-document attention. Packing with
+        # cp_size > 1 is already rejected above (see the cp_size/enable_seq_packing
+        # check), so enable_seq_packing here implies cp_size == 1 -> flash_attention_2.
+        if runtime_config.enable_seq_packing and requested != "flash_attention_2":
+            raise ValueError(
+                "sequence_packing requires attn_implementation='flash_attention_2', "
+                f"but the recipe set automodel_kwargs.attn_implementation={requested!r}."
+            )
+        attn_impl = requested
+
     # Determine SDPA method for activation checkpointing and CP
     from torch.nn.attention import SDPBackend
 
@@ -736,11 +751,6 @@ def setup_model_and_optimizer(
     # Keep fp32 master weights: stop Automodel from restoring loaded params to the bf16
     # checkpoint dtype, which would break optimizer master-weight precision (see helper).
     _disable_automodel_checkpoint_dtype_restore()
-
-    # Recipe-level attn_implementation wins; pop it so it doesn't collide with
-    # the explicit attn_implementation kwarg passed to from_pretrained() below.
-    if "attn_implementation" in automodel_kwargs:
-        attn_impl = automodel_kwargs.pop("attn_implementation")
 
     # Create model via from_pretrained - handles meta device init, parallelization,
     # LoRA, and base weight loading internally
